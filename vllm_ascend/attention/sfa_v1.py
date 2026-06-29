@@ -229,6 +229,39 @@ def _dsa_kv_trace_to_2d_indices(topk_indices: torch.Tensor) -> torch.Tensor:
     return topk_indices.reshape(topk_indices.shape[0], -1)
 
 
+def _dsa_build_compact_target_slots(
+    block_table: torch.Tensor,
+    remapped_topk: torch.Tensor,
+    num_decode_tokens: int,
+    block_size: int,
+) -> torch.Tensor | None:
+    if block_table is None or remapped_topk is None:
+        return None
+    topk_2d = _dsa_kv_trace_to_2d_indices(remapped_topk)
+    if topk_2d.numel() == 0:
+        return None
+    rows = min(int(num_decode_tokens), int(topk_2d.shape[0]), int(block_table.shape[0]))
+    if rows <= 0:
+        return None
+    cols = int(topk_2d.shape[1])
+    if cols <= 0:
+        return None
+    block_table_rows = block_table[:rows].to(torch.long)
+    logical = torch.arange(cols, device=block_table_rows.device, dtype=torch.long)
+    logical = logical.view(1, cols).expand(rows, cols)
+    logical_blocks = logical // int(block_size)
+    offsets = logical % int(block_size)
+    num_logical_blocks = int(block_table_rows.shape[1])
+    if num_logical_blocks <= 0:
+        return None
+    safe_logical_blocks = torch.clamp(
+        logical_blocks, min=0, max=max(num_logical_blocks - 1, 0)
+    )
+    physical_blocks = block_table_rows.gather(1, safe_logical_blocks)
+    slots = physical_blocks * int(block_size) + offsets
+    return slots.to(torch.long)
+
+
 def _dsa_env_flag(name: str, default: bool = False) -> bool:
     value = os.environ.get(name)
     if value is None:
@@ -2600,6 +2633,16 @@ class AscendSFAImpl(MLAAttentionImpl):
                 # decode rows come first in the reordered batch; the adapter
                 # iterates exactly the sparse-decode requests in row order.
                 _selected_for_wait = _sel_packed[: attn_metadata.num_decode_tokens]
+                _target_slot_mapping_for_wait = (
+                    _dsa_build_compact_target_slots(
+                        attn_metadata.block_table,
+                        topk_indices,
+                        attn_metadata.num_decode_tokens,
+                        kv_cache[0].shape[1],
+                    )
+                    if _dsa_kv_debug_enabled()
+                    else None
+                )
                 self._maybe_check_lmcache_selected_tokens(
                     layer_name=layer_name,
                     original_topk=_topk_before_remap,
@@ -2629,6 +2672,8 @@ class AscendSFAImpl(MLAAttentionImpl):
                         "[DSA_SHRINK_CHECK] wait_precheck layer=%s "
                         "selected_shape=%s selected_dtype=%s selected_device=%s "
                         "selected_sample=%s selected_minmax_count=%s "
+                        "target_slot_shape=%s target_slot_sample=%s "
+                        "target_slot_minmax_count=%s "
                         "has_kv_group=%s is_v1_kv_group=%s forward_context_id=%s "
                         "attn_metadata=%s attn_state=%s num_decode_tokens=%s "
                         "wait_fn_has_trace=%s",
@@ -2638,6 +2683,10 @@ class AscendSFAImpl(MLAAttentionImpl):
                         _selected_for_wait.device,
                         _dsa_debug_sample(_selected_for_wait),
                         _dsa_debug_minmax_count(_selected_for_wait),
+                        tuple(_target_slot_mapping_for_wait.shape)
+                        if _target_slot_mapping_for_wait is not None else None,
+                        _dsa_debug_sample(_target_slot_mapping_for_wait),
+                        _dsa_debug_minmax_count(_target_slot_mapping_for_wait),
                         _has_kv_group,
                         _is_v1_kv_group,
                         id(_wait_fc),
@@ -2658,17 +2707,21 @@ class AscendSFAImpl(MLAAttentionImpl):
                     )
                     logger.warning(
                         "[DSA_SHRINK_CHECK] calling_connector_wait layer=%s "
-                        "selected_shape=%s selected_dtype=%s selected_device=%s",
+                        "selected_shape=%s selected_dtype=%s selected_device=%s "
+                        "target_slot_shape=%s",
                         layer_name,
                         tuple(_selected_for_wait.shape),
                         _selected_for_wait.dtype,
                         _selected_for_wait.device,
+                        tuple(_target_slot_mapping_for_wait.shape)
+                        if _target_slot_mapping_for_wait is not None else None,
                     )
                 _wait_fn = wait_for_kv_layer_from_connector
                 with _dsa_prof.section("lmc_retrieve"):
                     _wait_fn(
                         layer_name,
                         selected_tokens=_selected_for_wait,
+                        target_slot_mapping=_target_slot_mapping_for_wait,
                     )
                 if _dsa_wait_log:
                     logger.warning(

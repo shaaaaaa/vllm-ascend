@@ -2,6 +2,7 @@ from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import Any
 
+import os
 import torch
 import torch.nn.functional as F
 from vllm.config import VllmConfig, get_current_vllm_config
@@ -287,9 +288,15 @@ def _debug_tensor_shape(value: Any) -> Any:
 
 
 def _should_log_dsa_wait(layer_name: str, selected_tokens: Any = None) -> bool:
-    if not envs.VLLM_ASCEND_DSA_SHRINK_DEBUG:
+    kv_debug = os.environ.get("VLLM_ASCEND_DSA_KV_DEBUG", "0").lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+    if not envs.VLLM_ASCEND_DSA_SHRINK_DEBUG and not kv_debug:
         return False
-    if envs.VLLM_ASCEND_DSA_SHRINK_DEBUG_MODE not in (
+    if not kv_debug and envs.VLLM_ASCEND_DSA_SHRINK_DEBUG_MODE not in (
         "summary",
         "trace",
         "verbose",
@@ -344,6 +351,7 @@ def wait_for_kv_layer_from_connector(
     layer_name: str,
     selected_tokens=None,
     token_start_index=None,
+    target_slot_mapping=None,
 ):
     trace_wait = _should_log_dsa_wait(layer_name, selected_tokens)
     has_group = has_kv_transfer_group()
@@ -352,6 +360,7 @@ def wait_for_kv_layer_from_connector(
         vllm_logger.warning(
             "DSA wait trace enter: layer=%s selected_none=%s selected_shape=%s "
             "selected_dtype=%s selected_device=%s token_start_index=%s "
+            "target_slot_shape=%s target_slot_sample=%s "
             "has_group=%s is_v1_group=%s",
             layer_name,
             selected_tokens is None,
@@ -359,6 +368,8 @@ def wait_for_kv_layer_from_connector(
             getattr(selected_tokens, "dtype", None),
             getattr(selected_tokens, "device", None),
             token_start_index,
+            _debug_tensor_shape(target_slot_mapping),
+            _debug_tensor_sample(target_slot_mapping),
             has_group,
             is_v1_group,
         )
@@ -427,24 +438,38 @@ def wait_for_kv_layer_from_connector(
         if trace_wait:
             vllm_logger.warning(
                 "DSA wait dispatch selected: layer=%s selected_shape=%s "
-                "selected_dtype=%s selected_device=%s selected_sample=%s "
-                "selected_minmax_count=%s token_start_index=%s "
-                "request_ids_len=%s request_ids_preview=%s connector=%s",
-                layer_name,
-                _debug_tensor_shape(selected_tokens),
-                getattr(selected_tokens, "dtype", None),
-                getattr(selected_tokens, "device", None),
-                _debug_tensor_sample(selected_tokens),
-                _debug_tensor_minmax(selected_tokens),
-                token_start_index,
-                len(request_ids) if request_ids is not None else None,
-                request_ids[:4] if request_ids is not None else None,
-                connector.__class__.__name__,
-            )
+            "selected_dtype=%s selected_device=%s selected_sample=%s "
+            "selected_minmax_count=%s token_start_index=%s "
+            "target_slot_shape=%s target_slot_sample=%s "
+            "target_slot_minmax_count=%s "
+            "request_ids_len=%s request_ids_preview=%s connector=%s",
+            layer_name,
+            _debug_tensor_shape(selected_tokens),
+            getattr(selected_tokens, "dtype", None),
+            getattr(selected_tokens, "device", None),
+            _debug_tensor_sample(selected_tokens),
+            _debug_tensor_minmax(selected_tokens),
+            token_start_index,
+            _debug_tensor_shape(target_slot_mapping),
+            _debug_tensor_sample(target_slot_mapping),
+            _debug_tensor_minmax(target_slot_mapping),
+            len(request_ids) if request_ids is not None else None,
+            request_ids[:4] if request_ids is not None else None,
+            connector.__class__.__name__,
+        )
         try:
-            connector.wait_for_layer_load(
-                layer_name, selected_tokens, token_start_index, request_ids
-            )
+            if target_slot_mapping is None:
+                connector.wait_for_layer_load(
+                    layer_name, selected_tokens, token_start_index, request_ids
+                )
+            else:
+                connector.wait_for_layer_load(
+                    layer_name,
+                    selected_tokens,
+                    token_start_index,
+                    request_ids,
+                    target_slot_mapping=target_slot_mapping,
+                )
         except Exception:
             if trace_wait:
                 vllm_logger.exception(
