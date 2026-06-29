@@ -1818,6 +1818,40 @@ class AscendSFAImpl(MLAAttentionImpl):
                 scratch_key_rope_delta_max = None
                 pre_kv_cmp = None
                 pre_key_rope_cmp = None
+                pre_kv_abs_max = None
+                pre_key_rope_abs_max = None
+                current_kv_abs_max = (
+                    float(current_kv_cmp.float().abs().max().item())
+                    if current_kv_cmp.numel() else 0.0
+                )
+                current_key_rope_abs_max = (
+                    float(current_key_rope_cmp.float().abs().max().item())
+                    if current_key_rope_cmp.numel() else 0.0
+                )
+                expected_kv_abs_max = (
+                    float(expected_kv_cmp.float().abs().max().item())
+                    if expected_kv_cmp.numel() else 0.0
+                )
+                expected_key_rope_abs_max = (
+                    float(expected_key_rope_cmp.float().abs().max().item())
+                    if expected_key_rope_cmp.numel() else 0.0
+                )
+                current_kv_nonzero = (
+                    int((current_kv_cmp != 0).sum().item())
+                    if current_kv_cmp.numel() else 0
+                )
+                current_key_rope_nonzero = (
+                    int((current_key_rope_cmp != 0).sum().item())
+                    if current_key_rope_cmp.numel() else 0
+                )
+                expected_kv_nonzero = (
+                    int((expected_kv_cmp != 0).sum().item())
+                    if expected_kv_cmp.numel() else 0
+                )
+                expected_key_rope_nonzero = (
+                    int((expected_key_rope_cmp != 0).sum().item())
+                    if expected_key_rope_cmp.numel() else 0
+                )
                 if (
                     isinstance(pre_scratch, dict)
                     and pre_scratch.get("layer_name") == layer_name
@@ -1836,6 +1870,14 @@ class AscendSFAImpl(MLAAttentionImpl):
                         pre_key_rope_cpu = pre_scratch["key_rope"][:num_rows]
                         pre_kv_cmp = pre_kv_cpu[shadow_valid]
                         pre_key_rope_cmp = pre_key_rope_cpu[shadow_valid]
+                        pre_kv_abs_max = (
+                            float(pre_kv_cmp.float().abs().max().item())
+                            if pre_kv_cmp.numel() else 0.0
+                        )
+                        pre_key_rope_abs_max = (
+                            float(pre_key_rope_cmp.float().abs().max().item())
+                            if pre_key_rope_cmp.numel() else 0.0
+                        )
                         scratch_kv_delta = (
                             current_kv_cmp.float() - pre_kv_cmp.float()
                         ).abs()
@@ -1900,6 +1942,16 @@ class AscendSFAImpl(MLAAttentionImpl):
                             "scratch_key_rope_delta_max_abs": (
                                 scratch_key_rope_delta_max
                             ),
+                            "pre_kv_abs_max": pre_kv_abs_max,
+                            "pre_key_rope_abs_max": pre_key_rope_abs_max,
+                            "current_kv_abs_max": current_kv_abs_max,
+                            "current_key_rope_abs_max": current_key_rope_abs_max,
+                            "expected_kv_abs_max": expected_kv_abs_max,
+                            "expected_key_rope_abs_max": expected_key_rope_abs_max,
+                            "current_kv_nonzero": current_kv_nonzero,
+                            "current_key_rope_nonzero": current_key_rope_nonzero,
+                            "expected_kv_nonzero": expected_kv_nonzero,
+                            "expected_key_rope_nonzero": expected_key_rope_nonzero,
                         },
                         "topk_indices": topk_cpu,
                         "expected_remapped_topk": expected_remapped_topk.detach().to(
@@ -1941,6 +1993,11 @@ class AscendSFAImpl(MLAAttentionImpl):
                     "scratch_changed=%s scratch_slots_match=%s "
                     "scratch_kv_delta_max_abs=%s "
                     "scratch_key_rope_delta_max_abs=%s "
+                    "pre_kv_abs_max=%s pre_key_rope_abs_max=%s "
+                    "current_kv_abs_max=%s current_key_rope_abs_max=%s "
+                    "expected_kv_abs_max=%s expected_key_rope_abs_max=%s "
+                    "current_kv_nonzero=%s current_key_rope_nonzero=%s "
+                    "expected_kv_nonzero=%s expected_key_rope_nonzero=%s "
                     "topk_sample=%s expected_remapped_topk_sample=%s "
                     "original_topk_sample=%s current_slots_sample=%s "
                     "shadow_slots_sample=%s prompt_lens_sample=%s dump_path=%s",
@@ -1957,6 +2014,16 @@ class AscendSFAImpl(MLAAttentionImpl):
                     scratch_slots_match,
                     scratch_kv_delta_max,
                     scratch_key_rope_delta_max,
+                    pre_kv_abs_max,
+                    pre_key_rope_abs_max,
+                    current_kv_abs_max,
+                    current_key_rope_abs_max,
+                    expected_kv_abs_max,
+                    expected_key_rope_abs_max,
+                    current_kv_nonzero,
+                    current_key_rope_nonzero,
+                    expected_kv_nonzero,
+                    expected_key_rope_nonzero,
                     _dsa_debug_sample(topk_cpu),
                     _dsa_debug_sample(expected_remapped_topk),
                     _dsa_debug_sample(original_2d),
