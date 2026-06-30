@@ -18,6 +18,7 @@
 #
 
 import math
+import os
 import sys
 from collections import defaultdict
 from contextlib import contextmanager, nullcontext
@@ -1418,7 +1419,15 @@ class NPUModelRunner(GPUModelRunner):
         # forward context whenever a DSA sparse path needs them: the offload manager
         # (Option A), the shrink-latent LMCache path (keys selected-token rows by
         # req_id), AND the adapter latent cache.
-        if dsa_offload_manager is not None or self.dsa_shrink_latent or dsa_adapter_cache is not None:
+        sfa_kv_debug_mode = os.environ.get(
+            "VLLM_ASCEND_SFA_KV_DEBUG_MODE", "off"
+        ).strip().lower()
+        if (
+            dsa_offload_manager is not None
+            or self.dsa_shrink_latent
+            or dsa_adapter_cache is not None
+            or sfa_kv_debug_mode in ("save", "replay")
+        ):
             num_reqs = self.input_batch.num_reqs
             dsa_req_ids = self.input_batch.req_ids[:num_reqs]
             dsa_prompt_lens = torch.from_numpy(self.input_batch.num_prompt_tokens[:num_reqs])

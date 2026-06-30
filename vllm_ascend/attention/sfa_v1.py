@@ -269,6 +269,79 @@ def _dsa_env_flag(name: str, default: bool = False) -> bool:
     return value.strip().lower() in ("1", "true", "yes", "on")
 
 
+def _sfa_kv_debug_mode() -> str:
+    return os.environ.get("VLLM_ASCEND_SFA_KV_DEBUG_MODE", "off").strip().lower()
+
+
+def _sfa_kv_debug_save_enabled() -> bool:
+    return _sfa_kv_debug_mode() == "save"
+
+
+def _sfa_kv_debug_replay_enabled() -> bool:
+    return _sfa_kv_debug_mode() == "replay"
+
+
+def _sfa_kv_debug_dir() -> str:
+    return os.environ.get("VLLM_ASCEND_SFA_KV_DEBUG_DIR", "/tmp/sfa_kv_debug")
+
+
+def _sfa_kv_debug_mask() -> int:
+    try:
+        return int(os.environ.get("VLLM_ASCEND_SFA_KV_DEBUG_MASK", "7"), 0)
+    except ValueError:
+        return 7
+
+
+def _sfa_kv_debug_sync_enabled() -> bool:
+    return _dsa_env_flag("VLLM_ASCEND_SFA_KV_DEBUG_SYNC", True)
+
+
+def _sfa_kv_debug_layer_enabled(layer_name: str) -> bool:
+    layer_filter = os.environ.get("VLLM_ASCEND_SFA_KV_DEBUG_LAYER", "").strip()
+    if not layer_filter:
+        return True
+    return any(
+        part.strip() and part.strip() in layer_name
+        for part in layer_filter.split(",")
+    )
+
+
+def _sfa_kv_debug_is_prefill(attn_metadata: Any) -> bool:
+    return getattr(attn_metadata, "attn_state", None) not in (
+        AscendAttentionState.DecodeOnly,
+        AscendAttentionState.SpecDecoding,
+    )
+
+
+def _sfa_kv_debug_path(layer_name: str) -> str:
+    return os.path.join(
+        _sfa_kv_debug_dir(),
+        _dsa_kv_trace_rank_tag(),
+        _dsa_kv_trace_layer_key(layer_name),
+        "prefill_kv.pt",
+    )
+
+
+def _sfa_kv_debug_error_allowed(owner: object) -> bool:
+    limit = _dsa_kv_trace_int_env("VLLM_ASCEND_SFA_KV_DEBUG_MAX_ERRORS", 20)
+    count = getattr(owner, "_sfa_kv_debug_error_count", 0)
+    if limit >= 0 and count >= limit:
+        return False
+    setattr(owner, "_sfa_kv_debug_error_count", count + 1)
+    return True
+
+
+def _sfa_kv_debug_to_cpu_long(value: Any) -> torch.Tensor | None:
+    if value is None:
+        return None
+    if isinstance(value, torch.Tensor):
+        return value.detach().to(device="cpu", dtype=torch.long)
+    try:
+        return torch.as_tensor(value, dtype=torch.long, device="cpu")
+    except Exception:
+        return None
+
+
 def _dsa_kv_debug_enabled() -> bool:
     return _dsa_env_flag("VLLM_ASCEND_DSA_KV_DEBUG")
 
@@ -2287,6 +2360,401 @@ class AscendSFAImpl(MLAAttentionImpl):
                     trace_label,
                 )
 
+    def _sfa_kv_debug_prefill_rows_and_lengths(
+        self,
+        attn_metadata,
+        *,
+        require_complete: bool,
+    ) -> tuple[list[int], list[int]]:
+        if not _sfa_kv_debug_is_prefill(attn_metadata):
+            return [], []
+
+        block_table = getattr(attn_metadata, "block_table", None)
+        if block_table is None:
+            return [], []
+
+        fc = get_forward_context()
+        req_ids = getattr(fc, "dsa_req_ids", None)
+        if req_ids is None:
+            req_ids = getattr(attn_metadata, "req_ids", None)
+
+        prompt_lens = _sfa_kv_debug_to_cpu_long(
+            getattr(fc, "dsa_prompt_lens", None)
+        )
+        seq_lens_src = getattr(attn_metadata, "seq_lens_cpu", None)
+        if seq_lens_src is None:
+            seq_lens_src = getattr(attn_metadata, "seq_lens", None)
+        seq_lens = _sfa_kv_debug_to_cpu_long(seq_lens_src)
+
+        row_count = int(block_table.shape[0])
+        if req_ids is not None:
+            row_count = min(row_count, len(req_ids))
+        if seq_lens is not None:
+            row_count = min(row_count, int(seq_lens.numel()))
+        if prompt_lens is not None:
+            row_count = min(row_count, int(prompt_lens.numel()))
+        if row_count <= 0:
+            return [], []
+
+        # Mixed decode+prefill batches are decode-row-first. Save/replay only the
+        # prefill request rows; pure prefill has num_decode_tokens == 0.
+        prefill_start = min(
+            int(getattr(attn_metadata, "num_decode_tokens", 0) or 0),
+            row_count,
+        )
+
+        rows: list[int] = []
+        lengths: list[int] = []
+        missing_prompt_lens = prompt_lens is None
+        for row in range(prefill_start, row_count):
+            if seq_lens is None:
+                continue
+            seq_len = int(seq_lens[row].item())
+            if seq_len <= 0:
+                continue
+            if prompt_lens is not None:
+                prompt_len = int(prompt_lens[row].item())
+                if prompt_len <= 0:
+                    continue
+                if require_complete and seq_len < prompt_len:
+                    continue
+                seq_len = min(seq_len, prompt_len)
+            rows.append(row)
+            lengths.append(seq_len)
+
+        if require_complete and missing_prompt_lens and rows:
+            logger.warning_once(
+                "[SFA_KV_DEBUG] dsa_prompt_lens is unavailable; saving each "
+                "prefill chunk by overwrite, so only a completed request leaves a "
+                "complete final snapshot."
+            )
+        return rows, lengths
+
+    def _sfa_kv_debug_collect_cache_rows(
+        self,
+        *,
+        cache: torch.Tensor,
+        block_table: torch.Tensor,
+        rows: list[int],
+        lengths: list[int],
+    ) -> list[dict[str, Any]]:
+        block_size = int(cache.shape[1])
+        max_logical_blocks = int(block_table.shape[1])
+        max_physical_blocks = int(cache.shape[0])
+        row_payloads: list[dict[str, Any]] = []
+
+        for row, length in zip(rows, lengths, strict=False):
+            num_blocks = min(
+                (int(length) + block_size - 1) // block_size,
+                max_logical_blocks,
+            )
+            if num_blocks <= 0:
+                continue
+
+            block_ids = block_table[row, :num_blocks].to(torch.long)
+            valid = (block_ids >= 0) & (block_ids < max_physical_blocks)
+            if not bool(valid.detach().to(device="cpu").any().item()):
+                continue
+
+            safe_block_ids = torch.clamp(
+                block_ids,
+                min=0,
+                max=max(max_physical_blocks - 1, 0),
+            ).to(device=cache.device)
+            data = cache.index_select(0, safe_block_ids)
+            row_payloads.append(
+                {
+                    "row": int(row),
+                    "length": int(length),
+                    "block_ids": block_ids.detach().to(
+                        device="cpu", dtype=torch.long
+                    ),
+                    "valid": valid.detach().to(device="cpu"),
+                    "data": data.detach().to(device="cpu", copy=True),
+                }
+            )
+
+        return row_payloads
+
+    def _maybe_save_sfa_prefill_kv_debug(
+        self,
+        *,
+        layer_name: str,
+        kv_cache,
+        attn_metadata,
+    ) -> None:
+        if not _sfa_kv_debug_save_enabled():
+            return
+        if not _sfa_kv_debug_layer_enabled(layer_name):
+            return
+        if kv_cache is None or len(kv_cache) < 3:
+            return
+
+        rows, lengths = self._sfa_kv_debug_prefill_rows_and_lengths(
+            attn_metadata,
+            require_complete=True,
+        )
+        if not rows:
+            return
+
+        try:
+            if _sfa_kv_debug_sync_enabled() and hasattr(torch, "npu"):
+                torch.npu.synchronize()
+
+            block_table = attn_metadata.block_table
+            indexer_block_table = (
+                attn_metadata.indexer_block_table
+                if attn_metadata.indexer_block_table is not None
+                else block_table
+            )
+            fc = get_forward_context()
+            req_ids = getattr(fc, "dsa_req_ids", None)
+            prompt_lens = _sfa_kv_debug_to_cpu_long(
+                getattr(fc, "dsa_prompt_lens", None)
+            )
+
+            cache_specs = (
+                (0, kv_cache[0], block_table, "block_table"),
+                (1, kv_cache[1], block_table, "block_table"),
+                (2, kv_cache[2], indexer_block_table, "indexer_block_table"),
+            )
+            caches: dict[int, dict[str, Any]] = {}
+            total_blocks = 0
+            for cache_idx, cache, table, table_name in cache_specs:
+                cache_rows = self._sfa_kv_debug_collect_cache_rows(
+                    cache=cache,
+                    block_table=table,
+                    rows=rows,
+                    lengths=lengths,
+                )
+                total_blocks += sum(
+                    int(row_payload["data"].shape[0])
+                    for row_payload in cache_rows
+                )
+                caches[cache_idx] = {
+                    "block_table": table_name,
+                    "shape": tuple(cache.shape),
+                    "dtype": str(cache.dtype),
+                    "rows": cache_rows,
+                }
+
+            req_id_rows = None
+            if req_ids is not None:
+                req_id_rows = [str(req_ids[row]) for row in rows if row < len(req_ids)]
+
+            payload = {
+                "meta": {
+                    "layer_name": layer_name,
+                    "rank_tag": _dsa_kv_trace_rank_tag(),
+                    "attn_state": _dsa_kv_trace_attn_state(attn_metadata),
+                    "rows": rows,
+                    "lengths": lengths,
+                    "req_ids": req_id_rows,
+                    "prompt_lens": (
+                        None if prompt_lens is None else prompt_lens[rows]
+                    ),
+                    "block_size": int(kv_cache[0].shape[1]),
+                    "block_table_shape": tuple(block_table.shape),
+                    "indexer_block_table_shape": tuple(indexer_block_table.shape),
+                },
+                "caches": caches,
+            }
+
+            path = _sfa_kv_debug_path(layer_name)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            tmp_path = f"{path}.tmp"
+            torch.save(payload, tmp_path)
+            os.replace(tmp_path, path)
+            logger.info(
+                "[SFA_KV_DEBUG] saved prefill kv layer=%s rows=%s "
+                "cache_blocks=%s path=%s",
+                layer_name,
+                rows,
+                total_blocks,
+                path,
+            )
+        except Exception:
+            if _sfa_kv_debug_error_allowed(self):
+                logger.exception("[SFA_KV_DEBUG] save failed layer=%s", layer_name)
+
+    def _sfa_kv_debug_load_payload(self, layer_name: str) -> dict[str, Any] | None:
+        payload_cache = getattr(self, "_sfa_kv_debug_payload_cache", None)
+        if payload_cache is None:
+            payload_cache = {}
+            self._sfa_kv_debug_payload_cache = payload_cache
+
+        path = _sfa_kv_debug_path(layer_name)
+        if path in payload_cache:
+            return payload_cache[path]
+
+        if not os.path.exists(path):
+            if _sfa_kv_debug_error_allowed(self):
+                logger.error(
+                    "[SFA_KV_DEBUG] replay payload missing layer=%s path=%s",
+                    layer_name,
+                    path,
+                )
+            payload_cache[path] = None
+            return None
+
+        try:
+            payload = torch.load(path, map_location="cpu")
+            payload_cache[path] = payload
+            return payload
+        except Exception:
+            if _sfa_kv_debug_error_allowed(self):
+                logger.exception(
+                    "[SFA_KV_DEBUG] replay payload load failed layer=%s path=%s",
+                    layer_name,
+                    path,
+                )
+            payload_cache[path] = None
+            return None
+
+    def _sfa_kv_debug_replay_cache_rows(
+        self,
+        *,
+        cache_idx: int,
+        cache: torch.Tensor,
+        block_table: torch.Tensor,
+        target_rows: list[int],
+        target_lengths: list[int],
+        cache_payload: dict[str, Any],
+    ) -> int:
+        saved_rows = cache_payload.get("rows") or []
+        if not saved_rows:
+            return 0
+
+        block_size = int(cache.shape[1])
+        max_logical_blocks = int(block_table.shape[1])
+        max_physical_blocks = int(cache.shape[0])
+        num_rows = min(len(saved_rows), len(target_rows), len(target_lengths))
+        copied_blocks = 0
+
+        for idx in range(num_rows):
+            row = target_rows[idx]
+            target_len = target_lengths[idx]
+            saved = saved_rows[idx]
+            saved_data = saved.get("data")
+            if not isinstance(saved_data, torch.Tensor) or saved_data.numel() == 0:
+                continue
+
+            num_blocks = min(
+                int(saved_data.shape[0]),
+                (int(target_len) + block_size - 1) // block_size,
+                max_logical_blocks,
+            )
+            if num_blocks <= 0:
+                continue
+
+            target_block_ids = block_table[row, :num_blocks].detach().to(
+                device="cpu", dtype=torch.long
+            )
+            target_valid = (
+                (target_block_ids >= 0)
+                & (target_block_ids < max_physical_blocks)
+            )
+            saved_valid = saved.get("valid")
+            if isinstance(saved_valid, torch.Tensor):
+                target_valid = target_valid & saved_valid[:num_blocks].to(torch.bool)
+            if not bool(target_valid.any().item()):
+                continue
+
+            target_ids = target_block_ids[target_valid].to(device=cache.device)
+            source = saved_data[:num_blocks][target_valid].to(
+                device=cache.device,
+                dtype=cache.dtype,
+            )
+            cache.index_copy_(0, target_ids, source)
+            copied_blocks += int(target_ids.numel())
+
+        if cache_idx == 2 and self.use_sparse_c8_indexer and len(cache_payload) > 0:
+            logger.warning_once(
+                "[SFA_KV_DEBUG] sparse-c8 indexer also reads kv_cache[3] "
+                "dequant scale; mask bit 2 only replays kv_cache[2]."
+            )
+        return copied_blocks
+
+    def _maybe_replay_sfa_prefill_kv_debug(
+        self,
+        *,
+        layer_name: str | None,
+        kv_cache,
+        attn_metadata,
+        cache_indices: tuple[int, ...],
+        site: str,
+    ) -> None:
+        if not _sfa_kv_debug_replay_enabled():
+            return
+        if layer_name is None:
+            return
+        if not _sfa_kv_debug_layer_enabled(layer_name):
+            return
+        if kv_cache is None:
+            return
+        if not _sfa_kv_debug_is_prefill(attn_metadata):
+            return
+
+        mask = _sfa_kv_debug_mask()
+        cache_indices = tuple(idx for idx in cache_indices if mask & (1 << idx))
+        if not cache_indices:
+            return
+
+        rows, lengths = self._sfa_kv_debug_prefill_rows_and_lengths(
+            attn_metadata,
+            require_complete=False,
+        )
+        if not rows:
+            return
+
+        payload = self._sfa_kv_debug_load_payload(layer_name)
+        if payload is None:
+            return
+
+        try:
+            caches = payload.get("caches", {})
+            block_table = attn_metadata.block_table
+            indexer_block_table = (
+                attn_metadata.indexer_block_table
+                if attn_metadata.indexer_block_table is not None
+                else block_table
+            )
+            copied: dict[int, int] = {}
+            for cache_idx in cache_indices:
+                if cache_idx >= len(kv_cache):
+                    continue
+                cache_payload = caches.get(cache_idx) or caches.get(str(cache_idx))
+                if not cache_payload:
+                    continue
+                table = indexer_block_table if cache_idx == 2 else block_table
+                copied_blocks = self._sfa_kv_debug_replay_cache_rows(
+                    cache_idx=cache_idx,
+                    cache=kv_cache[cache_idx],
+                    block_table=table,
+                    target_rows=rows,
+                    target_lengths=lengths,
+                    cache_payload=cache_payload,
+                )
+                copied[cache_idx] = copied_blocks
+
+            if copied:
+                logger.info(
+                    "[SFA_KV_DEBUG] replayed prefill kv layer=%s site=%s "
+                    "rows=%s copied_blocks=%s mask=%s",
+                    layer_name,
+                    site,
+                    rows,
+                    copied,
+                    mask,
+                )
+        except Exception:
+            if _sfa_kv_debug_error_allowed(self):
+                logger.exception(
+                    "[SFA_KV_DEBUG] replay failed layer=%s site=%s",
+                    layer_name,
+                    site,
+                )
+
     def _execute_sparse_flash_attention_process(
         self,
         ql_nope,
@@ -2313,6 +2781,14 @@ class AscendSFAImpl(MLAAttentionImpl):
             block_table = attn_metadata.block_table
             kv = kv_cache[0]
             key_rope = kv_cache[1]
+
+            self._maybe_replay_sfa_prefill_kv_debug(
+                layer_name=layer_name,
+                kv_cache=kv_cache,
+                attn_metadata=attn_metadata,
+                cache_indices=(0, 1),
+                site="before_sparse_flash_attention",
+            )
 
         self._maybe_trace_sparse_attention_kv(
             layer_name=layer_name,
@@ -2447,7 +2923,13 @@ class AscendSFAImpl(MLAAttentionImpl):
             # would advance the per-request layerwise retriever TWICE per layer
             # (this one with a dense arange) and desync it — skip whenever the
             # batch has decode rows (mixed steps included).
-            if not (self.dsa_shrink_latent and attn_metadata.num_decode_tokens > 0):
+            if (
+                not (
+                    _sfa_kv_debug_replay_enabled()
+                    and _sfa_kv_debug_is_prefill(attn_metadata)
+                )
+                and not (self.dsa_shrink_latent and attn_metadata.num_decode_tokens > 0)
+            ):
                 wait_for_kv_layer_from_connector(layer_name)
 
             if self.enable_dsa_cp:
@@ -2575,6 +3057,20 @@ class AscendSFAImpl(MLAAttentionImpl):
                 )
             if self.is_kv_producer:
                 attn_metadata.reshape_cache_event.record()
+
+        self._maybe_save_sfa_prefill_kv_debug(
+            layer_name=layer_name,
+            kv_cache=kv_cache,
+            attn_metadata=attn_metadata,
+        )
+
+        self._maybe_replay_sfa_prefill_kv_debug(
+            layer_name=layer_name,
+            kv_cache=kv_cache,
+            attn_metadata=attn_metadata,
+            cache_indices=(2,),
+            site="before_indexer",
+        )
 
         self._maybe_capture_prefill_shadow_kv(
             layer_name=layer_name,
@@ -2783,13 +3279,23 @@ class AscendSFAImpl(MLAAttentionImpl):
                         tuple(_target_slot_mapping_for_wait.shape)
                         if _target_slot_mapping_for_wait is not None else None,
                     )
-                _wait_fn = wait_for_kv_layer_from_connector
-                with _dsa_prof.section("lmc_retrieve"):
-                    _wait_fn(
+                if (
+                    _sfa_kv_debug_replay_enabled()
+                    and _sfa_kv_debug_is_prefill(attn_metadata)
+                ):
+                    logger.info(
+                        "[SFA_KV_DEBUG] skip LMCache selected load in replay "
+                        "mode layer=%s",
                         layer_name,
-                        selected_tokens=_selected_for_wait,
-                        target_slot_mapping=_target_slot_mapping_for_wait,
                     )
+                else:
+                    _wait_fn = wait_for_kv_layer_from_connector
+                    with _dsa_prof.section("lmc_retrieve"):
+                        _wait_fn(
+                            layer_name,
+                            selected_tokens=_selected_for_wait,
+                            target_slot_mapping=_target_slot_mapping_for_wait,
+                        )
                 if _dsa_wait_log:
                     logger.warning(
                         "[DSA_SHRINK_CHECK] connector_wait_returned layer=%s",
