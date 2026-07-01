@@ -3,6 +3,7 @@ from typing import TYPE_CHECKING, Any, TypeVar
 
 import os
 import re
+import shutil
 import scipy  # type: ignore
 import numpy as np
 import torch
@@ -71,6 +72,8 @@ if TYPE_CHECKING:
 
 # token count limits within bmm_transpose operator
 BMM_TRANS_MAX_SUPPORTED_TOKENS = 1024
+
+_SFA_KV_DEBUG_MIXED_PREPARED_RANKS: set[str] = set()
 
 
 def _dsa_debug_layer_enabled(layer_name: str) -> bool:
@@ -293,6 +296,10 @@ def _sfa_kv_debug_dir() -> str:
     return os.environ.get("VLLM_ASCEND_SFA_KV_DEBUG_DIR", "/tmp/sfa_kv_debug")
 
 
+def _sfa_kv_debug_mixed_dir() -> str:
+    return os.path.join(_sfa_kv_debug_dir(), "mixed")
+
+
 def _sfa_kv_debug_mask() -> int:
     try:
         return int(os.environ.get("VLLM_ASCEND_SFA_KV_DEBUG_MASK", "7"), 0)
@@ -322,8 +329,13 @@ def _sfa_kv_debug_is_prefill(attn_metadata: Any) -> bool:
 
 
 def _sfa_kv_debug_path(layer_name: str) -> str:
+    debug_dir = (
+        _sfa_kv_debug_mixed_dir()
+        if _sfa_kv_debug_mixed_enabled()
+        else _sfa_kv_debug_dir()
+    )
     return os.path.join(
-        _sfa_kv_debug_dir(),
+        debug_dir,
         _dsa_kv_trace_rank_tag(),
         _dsa_kv_trace_layer_key(layer_name),
         "prefill_kv.pt",
@@ -2438,6 +2450,73 @@ class AscendSFAImpl(MLAAttentionImpl):
             )
         return rows, lengths
 
+    def _sfa_kv_debug_prepare_mixed_dir(self) -> None:
+        if not _sfa_kv_debug_mixed_enabled():
+            return
+        rank_tag = _dsa_kv_trace_rank_tag()
+        if rank_tag in _SFA_KV_DEBUG_MIXED_PREPARED_RANKS:
+            return
+        rank_dir = os.path.join(_sfa_kv_debug_mixed_dir(), rank_tag)
+        shutil.rmtree(rank_dir, ignore_errors=True)
+        os.makedirs(rank_dir, exist_ok=True)
+        _SFA_KV_DEBUG_MIXED_PREPARED_RANKS.add(rank_tag)
+        self._sfa_kv_debug_payload_cache = {}
+        logger.info("[SFA_KV_DEBUG] prepared mixed debug dir path=%s", rank_dir)
+
+    def _sfa_kv_debug_filter_mixed_rows(
+        self,
+        *,
+        layer_name: str,
+        attn_metadata,
+        rows: list[int],
+        lengths: list[int],
+        action: str,
+    ) -> tuple[list[int], list[int]]:
+        if not _sfa_kv_debug_mixed_enabled():
+            return rows, lengths
+
+        fc = get_forward_context()
+        req_ids = getattr(fc, "dsa_req_ids", None)
+        if req_ids is None:
+            req_ids = getattr(attn_metadata, "req_ids", None)
+        if req_ids is None:
+            logger.warning_once(
+                "[SFA_KV_DEBUG] mixed mode requires dsa_req_ids; skip "
+                f"{action} to avoid treating prefill chunks as new requests."
+            )
+            return [], []
+
+        decisions = getattr(self, "_sfa_kv_debug_mixed_req_decisions", None)
+        if decisions is None:
+            decisions = {}
+            self._sfa_kv_debug_mixed_req_decisions = decisions
+
+        next_indices = getattr(self, "_sfa_kv_debug_mixed_next_req_indices", None)
+        if next_indices is None:
+            next_indices = {}
+            self._sfa_kv_debug_mixed_next_req_indices = next_indices
+
+        next_index = int(next_indices.get(layer_name, 0))
+        filtered_rows: list[int] = []
+        filtered_lengths: list[int] = []
+
+        for row, length in zip(rows, lengths, strict=False):
+            if row >= len(req_ids):
+                continue
+            req_id = str(req_ids[row])
+            decision_key = (layer_name, req_id)
+            decision = decisions.get(decision_key)
+            if decision is None:
+                decision = "save" if next_index == 0 else "load"
+                decisions[decision_key] = decision
+                next_index += 1
+            if decision == action:
+                filtered_rows.append(row)
+                filtered_lengths.append(length)
+
+        next_indices[layer_name] = next_index
+        return filtered_rows, filtered_lengths
+
     def _sfa_kv_debug_collect_cache_rows(
         self,
         *,
@@ -2491,16 +2570,26 @@ class AscendSFAImpl(MLAAttentionImpl):
         kv_cache,
         attn_metadata,
     ) -> None:
-        if not _sfa_kv_debug_save_enabled():
+        if not (_sfa_kv_debug_save_enabled() or _sfa_kv_debug_mixed_enabled()):
             return
         if not _sfa_kv_debug_layer_enabled(layer_name):
             return
         if kv_cache is None or len(kv_cache) < 3:
             return
+        self._sfa_kv_debug_prepare_mixed_dir()
 
         rows, lengths = self._sfa_kv_debug_prefill_rows_and_lengths(
             attn_metadata,
             require_complete=True,
+        )
+        if not rows:
+            return
+        rows, lengths = self._sfa_kv_debug_filter_mixed_rows(
+            layer_name=layer_name,
+            attn_metadata=attn_metadata,
+            rows=rows,
+            lengths=lengths,
+            action="save",
         )
         if not rows:
             return
@@ -2526,6 +2615,14 @@ class AscendSFAImpl(MLAAttentionImpl):
                 (1, kv_cache[1], block_table, "block_table"),
                 (2, kv_cache[2], indexer_block_table, "indexer_block_table"),
             )
+            if _sfa_kv_debug_mixed_enabled():
+                mask = _sfa_kv_debug_mask()
+                cache_specs = tuple(
+                    spec for spec in cache_specs if mask & (1 << spec[0])
+                )
+                if not cache_specs:
+                    return
+
             caches: dict[int, dict[str, Any]] = {}
             total_blocks = 0
             for cache_idx, cache, table, table_name in cache_specs:
@@ -2554,6 +2651,8 @@ class AscendSFAImpl(MLAAttentionImpl):
                 "meta": {
                     "layer_name": layer_name,
                     "rank_tag": _dsa_kv_trace_rank_tag(),
+                    "mode": _sfa_kv_debug_mode(),
+                    "mask": _sfa_kv_debug_mask(),
                     "attn_state": _dsa_kv_trace_attn_state(attn_metadata),
                     "rows": rows,
                     "lengths": lengths,
@@ -2574,10 +2673,12 @@ class AscendSFAImpl(MLAAttentionImpl):
             torch.save(payload, tmp_path)
             os.replace(tmp_path, path)
             logger.info(
-                "[SFA_KV_DEBUG] saved prefill kv layer=%s rows=%s "
-                "cache_blocks=%s path=%s",
+                "[SFA_KV_DEBUG] saved prefill kv mode=%s layer=%s rows=%s "
+                "cache_indices=%s cache_blocks=%s path=%s",
+                _sfa_kv_debug_mode(),
                 layer_name,
                 rows,
+                sorted(caches),
                 total_blocks,
                 path,
             )
@@ -2691,6 +2792,8 @@ class AscendSFAImpl(MLAAttentionImpl):
         attn_metadata,
         cache_indices: tuple[int, ...],
         site: str,
+        block_table_override: torch.Tensor | None = None,
+        indexer_block_table_override: torch.Tensor | None = None,
     ) -> None:
         if not _sfa_kv_debug_override_enabled():
             return
@@ -2702,6 +2805,7 @@ class AscendSFAImpl(MLAAttentionImpl):
             return
         if not _sfa_kv_debug_is_prefill(attn_metadata):
             return
+        self._sfa_kv_debug_prepare_mixed_dir()
 
         mask = _sfa_kv_debug_mask()
         cache_indices = tuple(idx for idx in cache_indices if mask & (1 << idx))
@@ -2714,19 +2818,39 @@ class AscendSFAImpl(MLAAttentionImpl):
         )
         if not rows:
             return
+        rows, lengths = self._sfa_kv_debug_filter_mixed_rows(
+            layer_name=layer_name,
+            attn_metadata=attn_metadata,
+            rows=rows,
+            lengths=lengths,
+            action="load",
+        )
+        if not rows:
+            return
 
         payload = self._sfa_kv_debug_load_payload(layer_name)
         if payload is None:
             return
 
         try:
+            if (
+                _sfa_kv_debug_mixed_enabled()
+                and _sfa_kv_debug_sync_enabled()
+                and hasattr(torch, "npu")
+            ):
+                torch.npu.synchronize()
             caches = payload.get("caches", {})
-            block_table = attn_metadata.block_table
-            indexer_block_table = (
-                attn_metadata.indexer_block_table
-                if attn_metadata.indexer_block_table is not None
-                else block_table
+            block_table = (
+                block_table_override
+                if block_table_override is not None
+                else attn_metadata.block_table
             )
+            if indexer_block_table_override is not None:
+                indexer_block_table = indexer_block_table_override
+            elif attn_metadata.indexer_block_table is not None:
+                indexer_block_table = attn_metadata.indexer_block_table
+            else:
+                indexer_block_table = block_table
             copied: dict[int, int] = {}
             for cache_idx in cache_indices:
                 if cache_idx >= len(kv_cache):
@@ -2786,6 +2910,16 @@ class AscendSFAImpl(MLAAttentionImpl):
             block_table = block_table_override
             kv = kv_override
             key_rope = key_rope_override
+
+            if key_rope_override is not None and block_table_override is not None:
+                self._maybe_replay_sfa_prefill_kv_debug(
+                    layer_name=layer_name,
+                    kv_cache=(kv_override, key_rope_override),
+                    attn_metadata=attn_metadata,
+                    cache_indices=(0, 1),
+                    site="before_sparse_flash_attention_override",
+                    block_table_override=block_table_override,
+                )
         else:
             block_table = attn_metadata.block_table
             kv = kv_cache[0]
