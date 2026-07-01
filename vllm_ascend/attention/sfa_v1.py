@@ -281,6 +281,14 @@ def _sfa_kv_debug_replay_enabled() -> bool:
     return _sfa_kv_debug_mode() == "replay"
 
 
+def _sfa_kv_debug_mixed_enabled() -> bool:
+    return _sfa_kv_debug_mode() == "mixed"
+
+
+def _sfa_kv_debug_override_enabled() -> bool:
+    return _sfa_kv_debug_replay_enabled() or _sfa_kv_debug_mixed_enabled()
+
+
 def _sfa_kv_debug_dir() -> str:
     return os.environ.get("VLLM_ASCEND_SFA_KV_DEBUG_DIR", "/tmp/sfa_kv_debug")
 
@@ -2590,7 +2598,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         if not os.path.exists(path):
             if _sfa_kv_debug_error_allowed(self):
                 logger.error(
-                    "[SFA_KV_DEBUG] replay payload missing layer=%s path=%s",
+                    "[SFA_KV_DEBUG] override payload missing layer=%s path=%s",
                     layer_name,
                     path,
                 )
@@ -2604,7 +2612,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         except Exception:
             if _sfa_kv_debug_error_allowed(self):
                 logger.exception(
-                    "[SFA_KV_DEBUG] replay payload load failed layer=%s path=%s",
+                    "[SFA_KV_DEBUG] override payload load failed layer=%s path=%s",
                     layer_name,
                     path,
                 )
@@ -2684,7 +2692,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         cache_indices: tuple[int, ...],
         site: str,
     ) -> None:
-        if not _sfa_kv_debug_replay_enabled():
+        if not _sfa_kv_debug_override_enabled():
             return
         if layer_name is None:
             return
@@ -2739,8 +2747,9 @@ class AscendSFAImpl(MLAAttentionImpl):
 
             if copied:
                 logger.info(
-                    "[SFA_KV_DEBUG] replayed prefill kv layer=%s site=%s "
-                    "rows=%s copied_blocks=%s mask=%s",
+                    "[SFA_KV_DEBUG] overrode prefill kv mode=%s layer=%s "
+                    "site=%s rows=%s copied_blocks=%s mask=%s",
+                    _sfa_kv_debug_mode(),
                     layer_name,
                     site,
                     rows,

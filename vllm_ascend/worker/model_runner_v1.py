@@ -1426,7 +1426,7 @@ class NPUModelRunner(GPUModelRunner):
             dsa_offload_manager is not None
             or self.dsa_shrink_latent
             or dsa_adapter_cache is not None
-            or sfa_kv_debug_mode in ("save", "replay")
+            or sfa_kv_debug_mode in ("save", "replay", "mixed")
         ):
             num_reqs = self.input_batch.num_reqs
             dsa_req_ids = self.input_batch.req_ids[:num_reqs]
