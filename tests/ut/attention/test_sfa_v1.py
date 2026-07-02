@@ -16,7 +16,8 @@ from vllm_ascend.attention.sfa_v1 import (AscendSFABackend, AscendSFAImpl,
                                            AscendSFAMetadata,
                                            AscendSFAMetadataBuilder,
                                            _dense_prefix_compare_build_sample,
-                                           _dense_prefix_compare_diff)
+                                           _dense_prefix_compare_diff,
+                                           _dense_prefix_compare_direct_call)
 from vllm_ascend.utils import enable_dsa_cp
 
 
@@ -130,6 +131,62 @@ class TestDensePrefixCompareHelpers(TestBase):
         self.assertFalse(diff["match"])
         self.assertEqual(diff["max_abs_diff"], 3.0)
         self.assertEqual(diff["first_diff_flat_index"], 0)
+
+    def test_dense_prefix_compare_direct_call_logs_path_before_compare(self):
+        class Owner:
+            pass
+
+        owner = Owner()
+        metadata = MagicMock()
+        metadata.attn_state = AscendAttentionState.DecodeOnly
+        metadata.num_actual_tokens = 1
+        metadata.num_decode_tokens = 1
+        metadata.seq_lens = torch.tensor([8])
+        metadata.prompt_lens = None
+        metadata.block_table = torch.tensor([[0, 1]], dtype=torch.long)
+        kv_cache = [
+            torch.zeros(2, 4, 1, 2),
+            torch.zeros(2, 4, 1, 2),
+            torch.zeros(2, 4, 1, 2),
+        ]
+        forward_context = MagicMock()
+        forward_context.lmcache_dense_prefix_loaded = True
+        forward_context.lmcache_dense_prefix_loaded_reqs = [
+            {"req_id": "r0", "token_count": 8}
+        ]
+
+        env = {
+            "LMCACHE_DENSE_PREFIX_DIAG": "1",
+            "VLLM_ASCEND_DENSE_PREFIX_COMPARE_LAYER": "all",
+        }
+        with (
+            patch.dict(os.environ, env, clear=True),
+            patch(
+                "vllm_ascend.attention.sfa_v1.get_forward_context",
+                return_value=forward_context,
+            ),
+            patch(
+                "vllm_ascend.attention.sfa_v1._dense_prefix_compare_cache"
+            ) as compare_cache,
+            patch("vllm_ascend.attention.sfa_v1.logger") as mock_logger,
+        ):
+            _dense_prefix_compare_direct_call(
+                owner,
+                note="before_attention",
+                stage="compare_before_attention",
+                layer_name="model.layers.0.self_attn.attn",
+                kv_cache=kv_cache,
+                attn_metadata=metadata,
+                include_latent=True,
+                include_index=True,
+            )
+
+        mock_logger.warning.assert_called_once()
+        self.assertIn(
+            "[DENSE_PREFIX_COMPARE_PATH] direct_call",
+            mock_logger.warning.call_args.args[0],
+        )
+        compare_cache.assert_called_once()
 
 
 class TestAscendSFAMetadataBuilder(TestBase):

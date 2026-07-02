@@ -1016,6 +1016,74 @@ def _dense_prefix_compare_cache(
         )
 
 
+def _dense_prefix_compare_direct_call(
+    owner: object,
+    *,
+    note: str,
+    stage: str,
+    layer_name: str,
+    kv_cache: tuple[torch.Tensor, ...] | list[torch.Tensor] | None,
+    attn_metadata: Any,
+    include_latent: bool,
+    include_index: bool,
+) -> None:
+    if not _dense_prefix_compare_enabled():
+        return
+
+    forward_context = None
+    try:
+        forward_context = get_forward_context()
+    except Exception:
+        pass
+
+    lmcache_loaded = bool(
+        getattr(forward_context, "lmcache_dense_prefix_loaded", False)
+    )
+    should_probe = (
+        lmcache_loaded
+        or _dense_prefix_compare_should_compare(attn_metadata)
+        or _dense_prefix_compare_allow_no_lmcache_load()
+    )
+    if should_probe and _dense_prefix_compare_log_allowed(
+        owner, "direct_call", layer_name, f"{note}:{stage}"
+    ):
+        logger.warning(
+            "[DENSE_PREFIX_COMPARE_PATH] direct_call note=%s stage=%s "
+            "layer=%s forward_context_id=%s lmcache_loaded=%s "
+            "allow_no_lmcache_load=%s stage_enabled=%s layer_enabled=%s "
+            "should_compare=%s loaded_reqs=%s attn_state=%s "
+            "num_actual_tokens=%s num_decode_tokens=%s seq_len=%s "
+            "kv_cache_len=%s include_latent=%s include_index=%s",
+            note,
+            stage,
+            layer_name,
+            id(forward_context) if forward_context is not None else None,
+            lmcache_loaded,
+            _dense_prefix_compare_allow_no_lmcache_load(),
+            _dense_prefix_compare_stage_enabled(stage),
+            _dense_prefix_compare_layer_enabled(layer_name),
+            _dense_prefix_compare_should_compare(attn_metadata),
+            getattr(forward_context, "lmcache_dense_prefix_loaded_reqs", None),
+            getattr(attn_metadata, "attn_state", None),
+            getattr(attn_metadata, "num_actual_tokens", None),
+            getattr(attn_metadata, "num_decode_tokens", None),
+            _dense_prefix_compare_seq_len(attn_metadata),
+            len(kv_cache) if kv_cache is not None else None,
+            include_latent,
+            include_index,
+        )
+
+    _dense_prefix_compare_cache(
+        owner,
+        stage=stage,
+        layer_name=layer_name,
+        kv_cache=kv_cache,
+        attn_metadata=attn_metadata,
+        include_latent=include_latent,
+        include_index=include_index,
+    )
+
+
 def _dsa_expected_lmcache_selected(
     original_topk: torch.Tensor,
     prompt_lens: torch.Tensor,
@@ -3213,8 +3281,9 @@ class AscendSFAImpl(MLAAttentionImpl):
             # batch has decode rows (mixed steps included).
             if not (self.dsa_shrink_latent and attn_metadata.num_decode_tokens > 0):
                 wait_for_kv_layer_from_connector(layer_name)
-                _dense_prefix_compare_cache(
+                _dense_prefix_compare_direct_call(
                     self,
+                    note="after_latent_load",
                     stage="compare_after_latent_load",
                     layer_name=layer_name,
                     kv_cache=kv_cache,
@@ -3350,8 +3419,9 @@ class AscendSFAImpl(MLAAttentionImpl):
                 )
                 with _dsa_prof.section("lmc_index_retrieve"):
                     wait_for_kv_layer_from_connector(index_layer_name)
-                _dense_prefix_compare_cache(
+                _dense_prefix_compare_direct_call(
                     self,
+                    note="after_index_load",
                     stage="compare_after_index_load",
                     layer_name=layer_name,
                     kv_cache=kv_cache,
@@ -3720,29 +3790,9 @@ class AscendSFAImpl(MLAAttentionImpl):
             )
 
         attn_output = None
-        if (
-            _dense_prefix_compare_enabled()
-            and _dense_prefix_compare_lmcache_loaded()
-            and _dense_prefix_compare_log_allowed(
-                self, "path", layer_name, "sfa_before_attention"
-            )
-        ):
-            _fc_path = get_forward_context()
-            logger.warning(
-                "[DENSE_PREFIX_COMPARE_PATH] sfa_before_attention "
-                "layer=%s forward_context_id=%s loaded_reqs=%s "
-                "attn_state=%s num_actual_tokens=%s num_decode_tokens=%s "
-                "kv_cache_len=%s",
-                layer_name,
-                id(_fc_path),
-                getattr(_fc_path, "lmcache_dense_prefix_loaded_reqs", None),
-                getattr(attn_metadata, "attn_state", None),
-                getattr(attn_metadata, "num_actual_tokens", None),
-                getattr(attn_metadata, "num_decode_tokens", None),
-                len(kv_cache) if kv_cache is not None else None,
-            )
-        _dense_prefix_compare_cache(
+        _dense_prefix_compare_direct_call(
             self,
+            note="before_attention",
             stage="compare_before_attention",
             layer_name=layer_name,
             kv_cache=kv_cache,
@@ -4001,15 +4051,16 @@ class AscendSFAImpl(MLAAttentionImpl):
         # its dataclass default 0 on every step, prefill included), so gating on it
         # skipped the save unconditionally. Gate on attn_state instead, which the
         # builder does set: pure-decode steps are DecodeOnly/SpecDecoding.
-        _dense_prefix_compare_cache(
-            self,
-            stage="capture_before_store",
-            layer_name=layer_name,
-            kv_cache=kv_cache,
-            attn_metadata=attn_metadata,
-            include_latent=True,
-            include_index=True,
-        )
+        if not _is_pure_decode:
+            _dense_prefix_compare_cache(
+                self,
+                stage="capture_before_store",
+                layer_name=layer_name,
+                kv_cache=kv_cache,
+                attn_metadata=attn_metadata,
+                include_latent=True,
+                include_index=True,
+            )
         _skip_decode_save = (
             bool(self.dsa_shrink_latent)
             and _is_pure_decode
