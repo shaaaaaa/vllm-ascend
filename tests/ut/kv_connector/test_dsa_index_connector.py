@@ -3,6 +3,8 @@ import types
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import pytest
+
 fake_mooncake = types.ModuleType("mooncake")
 fake_engine = types.ModuleType("mooncake.engine")
 fake_engine.TransferEngine = MagicMock()  # type: ignore[attr-defined]
@@ -45,6 +47,16 @@ def _remote_index_params(remote_block_ids=None):
         "remote_port": 29000,
         "remote_request_id": "remote-req-1",
     }
+
+
+def test_lmcache_ascend_connector_advertises_dsa_index_support():
+    pytest.importorskip("lmcache_ascend")
+
+    from vllm_ascend.distributed.kv_transfer.kv_pool.lmcache_ascend_connector import (  # noqa: E501
+        LMCacheConnectorV1,
+    )
+
+    assert getattr(LMCacheConnectorV1, "supports_dsa_index_lmcache", False) is True
 
 
 def test_ascend_multi_init_supports_legacy_child_connector_signature(monkeypatch):
