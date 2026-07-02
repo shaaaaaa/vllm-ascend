@@ -935,16 +935,22 @@ def _dense_prefix_compare_seq_len(attn_metadata: Any) -> int | None:
 
 
 def _dense_prefix_compare_positions(seq_len: int) -> list[int]:
-    if seq_len <= 0:
+    # On a full-prefix hit vLLM still schedules the final prompt token to
+    # produce first-token logits. Exclude that recalc position so this diagnostic
+    # compares only the prefix slots that should be restored from LMCache.
+    comparable_len = seq_len - 1
+    if comparable_len <= 0:
         return []
     sample_count = max(
-        1, _dense_prefix_compare_int_env("VLLM_ASCEND_DENSE_PREFIX_COMPARE_SAMPLES", 8)
+        1, _dense_prefix_compare_int_env("VLLM_ASCEND_DENSE_PREFIX_COMPARE_SAMPLES", 16)
     )
     head_count = max(1, sample_count // 2)
     tail_count = max(0, sample_count - head_count)
-    positions = list(range(min(head_count, seq_len)))
+    positions = list(range(min(head_count, comparable_len)))
     if tail_count > 0:
-        positions.extend(range(max(0, seq_len - tail_count), seq_len))
+        positions.extend(
+            range(max(0, comparable_len - tail_count), comparable_len)
+        )
     deduped: list[int] = []
     seen: set[int] = set()
     for pos in positions:

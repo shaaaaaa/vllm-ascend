@@ -92,7 +92,7 @@ class TestAscendSFAMetadata(TestBase):
 
 class TestDensePrefixCompareHelpers(TestBase):
 
-    def test_dense_prefix_compare_build_sample_uses_logical_head_tail_slots(self):
+    def test_dense_prefix_compare_build_sample_excludes_recalc_last_slot(self):
         cache = torch.arange(3 * 4 * 1 * 2, dtype=torch.float32).reshape(3, 4, 1, 2)
         block_table = torch.tensor([[0, 1, 2]], dtype=torch.long)
 
@@ -101,8 +101,8 @@ class TestDensePrefixCompareHelpers(TestBase):
 
         self.assertIsNone(error)
         assert sample is not None
-        self.assertEqual(sample["positions"], [0, 1, 2, 3, 6, 7, 8, 9])
-        self.assertEqual(sample["slots"], [0, 1, 2, 3, 6, 7, 8, 9])
+        self.assertEqual(sample["positions"], [0, 1, 2, 3, 5, 6, 7, 8])
+        self.assertEqual(sample["slots"], [0, 1, 2, 3, 5, 6, 7, 8])
         expected = cache.reshape(-1, 1, 2).index_select(
             0, torch.tensor(sample["slots"], dtype=torch.long)
         )
