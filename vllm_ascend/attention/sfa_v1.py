@@ -533,6 +533,17 @@ def _dense_prefix_compare_enabled() -> bool:
     )
 
 
+def _dense_prefix_compare_allow_no_lmcache_load() -> bool:
+    return _dsa_env_flag("VLLM_ASCEND_DENSE_PREFIX_COMPARE_ALLOW_NO_LMCACHE_LOAD")
+
+
+def _dense_prefix_compare_lmcache_loaded() -> bool:
+    try:
+        return bool(getattr(get_forward_context(), "lmcache_dense_prefix_loaded", False))
+    except Exception:
+        return False
+
+
 def _dense_prefix_compare_int_env(name: str, default: int) -> int:
     try:
         return int(os.environ.get(name, str(default)))
@@ -898,6 +909,12 @@ def _dense_prefix_compare_cache(
     include_index: bool,
 ) -> None:
     if not _dense_prefix_compare_enabled():
+        return
+    if (
+        stage != "capture_before_store"
+        and not _dense_prefix_compare_allow_no_lmcache_load()
+        and not _dense_prefix_compare_lmcache_loaded()
+    ):
         return
     if not _dense_prefix_compare_layer_enabled(layer_name):
         _dense_prefix_compare_gate_log(

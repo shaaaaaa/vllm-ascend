@@ -78,6 +78,8 @@ def set_ascend_forward_context(
         forward_context.dsa_prompt_lens = dsa_prompt_lens
         # Adapter-backed latent hot cache (None unless VLLM_ASCEND_DSA_USE_ADAPTER_CACHE).
         forward_context.dsa_adapter_cache = dsa_adapter_cache
+        forward_context.lmcache_dense_prefix_loaded = False
+        forward_context.lmcache_dense_prefix_loaded_reqs = []
 
         from vllm_ascend.ops.fused_moe.moe_comm_method import get_moe_comm_method
 

@@ -215,9 +215,10 @@ def _env_flag(name: str) -> bool:
 
 
 def _dense_prefix_compare_force_eager() -> bool:
-    return _env_flag("VLLM_ASCEND_DENSE_PREFIX_COMPARE") and not _env_flag(
-        "VLLM_ASCEND_DENSE_PREFIX_COMPARE_ALLOW_ACLGRAPH"
-    )
+    return (
+        _env_flag("VLLM_ASCEND_DENSE_PREFIX_COMPARE")
+        or _env_flag("LMCACHE_DENSE_PREFIX_DIAG")
+    ) and not _env_flag("VLLM_ASCEND_DENSE_PREFIX_COMPARE_ALLOW_ACLGRAPH")
 
 
 class ExecuteModelState(NamedTuple):
@@ -1288,7 +1289,7 @@ class NPUModelRunner(GPUModelRunner):
                 dense_prefix_compare_force_eager = _dense_prefix_compare_force_eager()
                 if dense_prefix_compare_force_eager:
                     logger.warning_once(
-                        "VLLM_ASCEND_DENSE_PREFIX_COMPARE is enabled; forcing "
+                        "Dense prefix compare/diag is enabled; forcing "
                         "CUDAGraphMode.NONE so Python-side dense prefix compare "
                         "hooks execute instead of ACL graph replay."
                     )
