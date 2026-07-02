@@ -3720,6 +3720,27 @@ class AscendSFAImpl(MLAAttentionImpl):
             )
 
         attn_output = None
+        if (
+            _dense_prefix_compare_enabled()
+            and _dense_prefix_compare_lmcache_loaded()
+            and _dense_prefix_compare_log_allowed(
+                self, "path", layer_name, "sfa_before_attention"
+            )
+        ):
+            _fc_path = get_forward_context()
+            logger.warning(
+                "[DENSE_PREFIX_COMPARE_PATH] sfa_before_attention "
+                "layer=%s forward_context_id=%s loaded_reqs=%s "
+                "attn_state=%s num_actual_tokens=%s num_decode_tokens=%s "
+                "kv_cache_len=%s",
+                layer_name,
+                id(_fc_path),
+                getattr(_fc_path, "lmcache_dense_prefix_loaded_reqs", None),
+                getattr(attn_metadata, "attn_state", None),
+                getattr(attn_metadata, "num_actual_tokens", None),
+                getattr(attn_metadata, "num_decode_tokens", None),
+                len(kv_cache) if kv_cache is not None else None,
+            )
         _dense_prefix_compare_cache(
             self,
             stage="compare_before_attention",

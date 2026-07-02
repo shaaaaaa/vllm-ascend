@@ -1,5 +1,6 @@
 from dataclasses import dataclass, field
 from functools import lru_cache
+import sys
 from typing import Any
 
 import torch
@@ -14,6 +15,50 @@ from vllm_ascend import envs
 from vllm_ascend.utils import AscendDeviceType, get_ascend_config, get_ascend_device_type
 
 logger = init_logger(__name__)
+
+
+def _dense_prefix_diag_bool() -> bool:
+    import os
+
+    return os.environ.get("LMCACHE_DENSE_PREFIX_DIAG", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _maybe_log_dense_prefix_wait_path(
+    *,
+    layer_name: str,
+    selected_tokens,
+    forward_context: ForwardContext,
+    attn_metadata,
+) -> None:
+    if not _dense_prefix_diag_bool():
+        return
+    if not bool(getattr(forward_context, "lmcache_dense_prefix_loaded", False)):
+        return
+    if getattr(forward_context, "_lmcache_dense_prefix_wait_path_logged", False):
+        return
+    forward_context._lmcache_dense_prefix_wait_path_logged = True
+    caller = sys._getframe(2)
+    vllm_logger.warning(
+        "[DENSE_PREFIX_COMPARE_PATH] wait_for_kv_layer_from_connector "
+        "caller_file=%s caller_func=%s caller_line=%s layer=%s "
+        "selected_none=%s forward_context_id=%s loaded_reqs=%s "
+        "attn_state=%s num_actual_tokens=%s num_decode_tokens=%s",
+        caller.f_code.co_filename,
+        caller.f_code.co_name,
+        caller.f_lineno,
+        layer_name,
+        selected_tokens is None,
+        id(forward_context),
+        getattr(forward_context, "lmcache_dense_prefix_loaded_reqs", None),
+        getattr(attn_metadata, "attn_state", None),
+        getattr(attn_metadata, "num_actual_tokens", None),
+        getattr(attn_metadata, "num_decode_tokens", None),
+    )
 
 
 def ascend_chunked_prefill_workspace_size(vllm_config: VllmConfig) -> int:
@@ -391,6 +436,12 @@ def wait_for_kv_layer_from_connector(
     forward_context: ForwardContext = get_forward_context()
     attn_metadata = forward_context.attn_metadata
     dsa_req_ids = getattr(forward_context, "dsa_req_ids", None)
+    _maybe_log_dense_prefix_wait_path(
+        layer_name=layer_name,
+        selected_tokens=selected_tokens,
+        forward_context=forward_context,
+        attn_metadata=attn_metadata,
+    )
     if trace_wait:
         vllm_logger.warning(
             "DSA wait trace context: layer=%s forward_context_id=%s "
