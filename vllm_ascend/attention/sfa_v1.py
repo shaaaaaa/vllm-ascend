@@ -842,6 +842,7 @@ def _dense_prefix_compare_enabled() -> bool:
     return (
         _dsa_env_flag("VLLM_ASCEND_DENSE_PREFIX_COMPARE")
         or _dsa_env_flag("LMCACHE_DENSE_PREFIX_DIAG")
+        or _sfa_path_trace_enabled()
     )
 
 
@@ -1078,6 +1079,17 @@ def _dense_prefix_compare_gate_log(
 ) -> None:
     if not _dense_prefix_compare_log_allowed(owner, "gate", layer_name, reason):
         return
+    _sfa_force_print(
+        "[DENSE_PREFIX_COMPARE_GATE] "
+        f"reason={reason} layer={layer_name} "
+        f"layer_filter={os.environ.get('VLLM_ASCEND_DENSE_PREFIX_COMPARE_LAYER', '')} "
+        f"attn_state={getattr(attn_metadata, 'attn_state', None)} "
+        f"num_actual_tokens={getattr(attn_metadata, 'num_actual_tokens', None)} "
+        f"num_decode_tokens={getattr(attn_metadata, 'num_decode_tokens', None)} "
+        f"seq_len={_dense_prefix_compare_seq_len(attn_metadata)} "
+        f"kv_cache_len={len(kv_cache) if kv_cache is not None else None} "
+        f"include_latent={include_latent} include_index={include_index}"
+    )
     logger.warning(
         "[DENSE_PREFIX_COMPARE_GATE] reason=%s layer=%s layer_filter=%s "
         "attn_state=%s num_actual_tokens=%s num_decode_tokens=%s "
@@ -1116,6 +1128,13 @@ def _dense_prefix_compare_cache_tensor(
     )
     if sample is None:
         if _dense_prefix_compare_log_allowed(owner, stage, layer_name, label):
+            _sfa_force_print(
+                "[DENSE_PREFIX_COMPARE] "
+                f"stage={stage} layer={layer_name} label={label} "
+                f"sample_error={error} "
+                f"attn_state={getattr(attn_metadata, 'attn_state', None)} "
+                f"num_actual_tokens={getattr(attn_metadata, 'num_actual_tokens', None)}"
+            )
             logger.warning(
                 "[DENSE_PREFIX_COMPARE] stage=%s layer=%s label=%s "
                 "sample_error=%s attn_state=%s num_actual_tokens=%s",
@@ -1139,6 +1158,12 @@ def _dense_prefix_compare_cache_tensor(
             _dense_prefix_compare_log_baseline()
             and _dense_prefix_compare_log_allowed(owner, stage, layer_name, label)
         ):
+            _sfa_force_print(
+                "[DENSE_PREFIX_COMPARE] "
+                f"stage={stage} layer={layer_name} label={label} "
+                f"seq_len={sample['seq_len']} positions={sample['positions']} "
+                f"slots={sample['slots']} summary={sample['summary']}"
+            )
             logger.warning(
                 "[DENSE_PREFIX_COMPARE] stage=%s layer=%s label=%s "
                 "seq_len=%s positions=%s slots=%s summary=%s",
@@ -1164,6 +1189,15 @@ def _dense_prefix_compare_cache_tensor(
         if _dense_prefix_compare_log_allowed(
             owner, "gate", layer_name, f"baseline_missing:{label}"
         ):
+            _sfa_force_print(
+                "[DENSE_PREFIX_COMPARE_GATE] "
+                f"reason=baseline_missing stage={stage} layer={layer_name} "
+                f"label={label} seq_len={sample['seq_len']} "
+                f"positions={sample['positions']} slots={sample['slots']} "
+                f"summary={sample['summary']} "
+                f"attn_state={getattr(attn_metadata, 'attn_state', None)} "
+                f"num_actual_tokens={getattr(attn_metadata, 'num_actual_tokens', None)}"
+            )
             logger.warning(
                 "[DENSE_PREFIX_COMPARE_GATE] reason=baseline_missing "
                 "stage=%s layer=%s label=%s seq_len=%s positions=%s "
@@ -1187,6 +1221,19 @@ def _dense_prefix_compare_cache_tensor(
     diff = _dense_prefix_compare_diff(baseline, sample)
     log_fn = logger.warning if diff.get("match") else logger.error
     if _dense_prefix_compare_log_allowed(owner, stage, layer_name, label):
+        _sfa_force_print(
+            "[DENSE_PREFIX_COMPARE] "
+            f"stage={stage} layer={layer_name} label={label} "
+            f"match={diff.get('match')} diff={diff} "
+            f"baseline_seq_len={baseline['seq_len']} "
+            f"current_seq_len={sample['seq_len']} "
+            f"baseline_positions={baseline['positions']} "
+            f"current_positions={sample['positions']} "
+            f"baseline_slots={baseline['slots']} "
+            f"current_slots={sample['slots']} "
+            f"attn_state={getattr(attn_metadata, 'attn_state', None)} "
+            f"num_actual_tokens={getattr(attn_metadata, 'num_actual_tokens', None)}"
+        )
         log_fn(
             "[DENSE_PREFIX_COMPARE] stage=%s layer=%s label=%s "
             "match=%s diff=%s baseline_seq_len=%s current_seq_len=%s "
@@ -1359,6 +1406,23 @@ def _dense_prefix_compare_direct_call(
     if should_probe and _dense_prefix_compare_log_allowed(
         owner, "direct_call", layer_name, f"{note}:{stage}"
     ):
+        _sfa_force_print(
+            "[DENSE_PREFIX_COMPARE_PATH] direct_call "
+            f"note={note} stage={stage} layer={layer_name} "
+            f"forward_context_id={id(forward_context) if forward_context is not None else None} "
+            f"lmcache_loaded={lmcache_loaded} "
+            f"allow_no_lmcache_load={_dense_prefix_compare_allow_no_lmcache_load()} "
+            f"stage_enabled={_dense_prefix_compare_stage_enabled(stage)} "
+            f"layer_enabled={_dense_prefix_compare_layer_enabled(layer_name)} "
+            f"should_compare={_dense_prefix_compare_should_compare(attn_metadata)} "
+            f"loaded_reqs={getattr(forward_context, 'lmcache_dense_prefix_loaded_reqs', None)} "
+            f"attn_state={getattr(attn_metadata, 'attn_state', None)} "
+            f"num_actual_tokens={getattr(attn_metadata, 'num_actual_tokens', None)} "
+            f"num_decode_tokens={getattr(attn_metadata, 'num_decode_tokens', None)} "
+            f"seq_len={_dense_prefix_compare_seq_len(attn_metadata)} "
+            f"kv_cache_len={len(kv_cache) if kv_cache is not None else None} "
+            f"include_latent={include_latent} include_index={include_index}"
+        )
         logger.warning(
             "[DENSE_PREFIX_COMPARE_PATH] direct_call note=%s stage=%s "
             "layer=%s forward_context_id=%s lmcache_loaded=%s "
