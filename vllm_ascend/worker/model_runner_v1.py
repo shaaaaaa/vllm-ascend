@@ -18,6 +18,7 @@
 #
 
 import math
+import os
 import sys
 from collections import defaultdict
 from contextlib import contextmanager, nullcontext
@@ -202,6 +203,21 @@ def graph_capture(device: torch.device):
 
 def get_tp_context(drafter):
     return getattr(drafter, "tp_group_context", nullcontext())
+
+
+def _env_flag(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _dense_prefix_compare_force_eager() -> bool:
+    return _env_flag("VLLM_ASCEND_DENSE_PREFIX_COMPARE") and not _env_flag(
+        "VLLM_ASCEND_DENSE_PREFIX_COMPARE_ALLOW_ACLGRAPH"
+    )
 
 
 class ExecuteModelState(NamedTuple):
@@ -1269,6 +1285,14 @@ class NPUModelRunner(GPUModelRunner):
                         scheduler_output.num_common_prefix_blocks,
                     )
 
+                dense_prefix_compare_force_eager = _dense_prefix_compare_force_eager()
+                if dense_prefix_compare_force_eager:
+                    logger.warning_once(
+                        "VLLM_ASCEND_DENSE_PREFIX_COMPARE is enabled; forcing "
+                        "CUDAGraphMode.NONE so Python-side dense prefix compare "
+                        "hooks execute instead of ACL graph replay."
+                    )
+
                 (
                     cudagraph_mode,
                     batch_desc,
@@ -1281,7 +1305,10 @@ class NPUModelRunner(GPUModelRunner):
                     num_scheduled_tokens_np=num_scheduled_tokens_np,
                     max_num_scheduled_tokens=max_num_scheduled_tokens,
                     use_cascade_attn=cascade_attn_prefix_lens is not None,
-                    force_eager=self.model_config.enforce_eager,
+                    force_eager=(
+                        self.model_config.enforce_eager
+                        or dense_prefix_compare_force_eager
+                    ),
                     num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
                 )
 

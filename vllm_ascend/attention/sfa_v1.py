@@ -721,6 +721,35 @@ def _dense_prefix_compare_should_compare(attn_metadata: Any) -> bool:
     return int(getattr(attn_metadata, "num_actual_tokens", 0)) <= max_tokens
 
 
+def _dense_prefix_compare_gate_log(
+    owner: object,
+    *,
+    reason: str,
+    layer_name: str,
+    kv_cache: tuple[torch.Tensor, ...] | list[torch.Tensor] | None,
+    attn_metadata: Any,
+    include_latent: bool,
+    include_index: bool,
+) -> None:
+    if not _dense_prefix_compare_log_allowed(owner, "gate", layer_name, reason):
+        return
+    logger.warning(
+        "[DENSE_PREFIX_COMPARE_GATE] reason=%s layer=%s layer_filter=%s "
+        "attn_state=%s num_actual_tokens=%s num_decode_tokens=%s "
+        "seq_len=%s kv_cache_len=%s include_latent=%s include_index=%s",
+        reason,
+        layer_name,
+        os.environ.get("VLLM_ASCEND_DENSE_PREFIX_COMPARE_LAYER", ""),
+        getattr(attn_metadata, "attn_state", None),
+        getattr(attn_metadata, "num_actual_tokens", None),
+        getattr(attn_metadata, "num_decode_tokens", None),
+        _dense_prefix_compare_seq_len(attn_metadata),
+        len(kv_cache) if kv_cache is not None else None,
+        include_latent,
+        include_index,
+    )
+
+
 def _dense_prefix_compare_cache_tensor(
     owner: object,
     *,
@@ -823,17 +852,53 @@ def _dense_prefix_compare_cache(
     if not _dense_prefix_compare_enabled():
         return
     if not _dense_prefix_compare_layer_enabled(layer_name):
+        _dense_prefix_compare_gate_log(
+            owner,
+            reason="layer_filtered",
+            layer_name=layer_name,
+            kv_cache=kv_cache,
+            attn_metadata=attn_metadata,
+            include_latent=include_latent,
+            include_index=include_index,
+        )
         return
     if kv_cache is None:
+        _dense_prefix_compare_gate_log(
+            owner,
+            reason="kv_cache_missing",
+            layer_name=layer_name,
+            kv_cache=kv_cache,
+            attn_metadata=attn_metadata,
+            include_latent=include_latent,
+            include_index=include_index,
+        )
         return
     if getattr(attn_metadata, "attn_state", None) in (
         AscendAttentionState.DecodeOnly,
         AscendAttentionState.SpecDecoding,
     ):
+        _dense_prefix_compare_gate_log(
+            owner,
+            reason="decode_state",
+            layer_name=layer_name,
+            kv_cache=kv_cache,
+            attn_metadata=attn_metadata,
+            include_latent=include_latent,
+            include_index=include_index,
+        )
         return
 
     seq_len = _dense_prefix_compare_seq_len(attn_metadata)
     if seq_len is None:
+        _dense_prefix_compare_gate_log(
+            owner,
+            reason="seq_len_missing",
+            layer_name=layer_name,
+            kv_cache=kv_cache,
+            attn_metadata=attn_metadata,
+            include_latent=include_latent,
+            include_index=include_index,
+        )
         return
 
     if include_latent and len(kv_cache) >= 2:
