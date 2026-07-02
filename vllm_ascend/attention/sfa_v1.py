@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING, Any, TypeVar
 
 import os
 import re
+import sys
 import scipy  # type: ignore
 import numpy as np
 import torch
@@ -76,6 +77,16 @@ if TYPE_CHECKING:
 
 # token count limits within bmm_transpose operator
 BMM_TRANS_MAX_SUPPORTED_TOKENS = 1024
+
+print(
+    "[SFA_V1_IMPORT_TRACE] imported "
+    f"file={__file__} pid={os.getpid()} "
+    f"path_trace_env={os.environ.get('VLLM_ASCEND_SFA_V1_PATH_TRACE')} "
+    f"lmcache_diag_env={os.environ.get('LMCACHE_DENSE_PREFIX_DIAG')} "
+    f"compare_env={os.environ.get('VLLM_ASCEND_DENSE_PREFIX_COMPARE')}",
+    file=sys.stderr,
+    flush=True,
+)
 
 
 def _dsa_debug_layer_enabled(layer_name: str) -> bool:
@@ -488,15 +499,16 @@ _SFA_V1_PATH_TRACE_EXCLUDED_PREFIXES = (
 )
 _SFA_V1_PATH_TRACE_EXCLUDED_NAMES = {
     "_dsa_env_flag",
+    "_sfa_force_print",
 }
 
 
 def _sfa_path_trace_enabled() -> bool:
-    return (
-        _dsa_env_flag("VLLM_ASCEND_SFA_V1_PATH_TRACE")
-        or _dsa_env_flag("LMCACHE_DENSE_PREFIX_DIAG")
-        or _dsa_env_flag("VLLM_ASCEND_DENSE_PREFIX_COMPARE")
-    )
+    return not _dsa_env_flag("VLLM_ASCEND_SFA_V1_PATH_TRACE_DISABLE")
+
+
+def _sfa_force_print(message: str) -> None:
+    print(message, file=sys.stderr, flush=True)
 
 
 def _sfa_path_trace_limit() -> int:
@@ -587,13 +599,23 @@ def _sfa_path_trace_log_entry(
         return
     attn_metadata = _sfa_trace_find_attn_metadata(args, kwargs)
     fc_id, lmcache_loaded, loaded_reqs = _sfa_trace_forward_context()
+    layer_name = _sfa_trace_find_layer(args, kwargs)
+    _sfa_force_print(
+        "[SFA_V1_PATH_TRACE] enter "
+        f"func={name} layer={layer_name} "
+        f"attn_state={getattr(attn_metadata, 'attn_state', None)} "
+        f"num_actual_tokens={getattr(attn_metadata, 'num_actual_tokens', None)} "
+        f"num_decode_tokens={getattr(attn_metadata, 'num_decode_tokens', None)} "
+        f"forward_context_id={fc_id} lmcache_loaded={lmcache_loaded} "
+        f"loaded_reqs={loaded_reqs}"
+    )
     logger.warning(
         "[SFA_V1_PATH_TRACE] enter func=%s layer=%s "
         "attn_state=%s num_actual_tokens=%s num_decode_tokens=%s "
         "forward_context_id=%s lmcache_loaded=%s loaded_reqs=%s "
         "args=%s kwargs=%s",
         name,
-        _sfa_trace_find_layer(args, kwargs),
+        layer_name,
         getattr(attn_metadata, "attn_state", None),
         getattr(attn_metadata, "num_actual_tokens", None),
         getattr(attn_metadata, "num_decode_tokens", None),
@@ -693,6 +715,11 @@ def _sfa_path_trace_install() -> None:
         __name__,
         _sfa_path_trace_limit(),
     )
+    _sfa_force_print(
+        "[SFA_V1_PATH_TRACE] installed "
+        f"module={__name__} file={__file__} pid={os.getpid()} "
+        f"limit_per_function={_sfa_path_trace_limit()}"
+    )
 
 
 def _sfa_trace_lmcache_call(
@@ -718,6 +745,24 @@ def _sfa_trace_lmcache_call(
         except Exception as exc:
             connector_has_metadata = f"error:{type(exc).__name__}"
     fc_id, lmcache_loaded, loaded_reqs = _sfa_trace_forward_context()
+    _sfa_force_print(
+        "[SFA_V1_LMCACHE_TRACE] "
+        f"site={site} note={note} layer={layer_name} "
+        f"index_layer={index_layer_name} has_kv_group={has_group} "
+        f"is_v1_group={is_v1_group} "
+        f"connector={connector.__class__.__name__ if connector is not None else None} "
+        f"connector_has_metadata={connector_has_metadata} "
+        f"supports_dsa_index_lmcache="
+        f"{getattr(connector, 'supports_dsa_index_lmcache', None) if connector is not None else None} "
+        f"attn_state={getattr(attn_metadata, 'attn_state', None)} "
+        f"num_actual_tokens={getattr(attn_metadata, 'num_actual_tokens', None)} "
+        f"num_decode_tokens={getattr(attn_metadata, 'num_decode_tokens', None)} "
+        f"kv_cache_len={len(kv_cache) if kv_cache is not None else None} "
+        f"selected={_sfa_trace_value(selected_tokens)} "
+        f"target_slot={_sfa_trace_value(target_slot_mapping)} "
+        f"forward_context_id={fc_id} lmcache_loaded={lmcache_loaded} "
+        f"loaded_reqs={loaded_reqs}"
+    )
     logger.warning(
         "[SFA_V1_LMCACHE_TRACE] site=%s note=%s layer=%s index_layer=%s "
         "has_kv_group=%s is_v1_group=%s connector=%s "

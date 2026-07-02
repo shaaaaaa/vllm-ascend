@@ -185,10 +185,16 @@ class TestDensePrefixCompareHelpers(TestBase):
                 include_index=True,
             )
 
-        mock_logger.warning.assert_called_once()
-        self.assertIn(
-            "[DENSE_PREFIX_COMPARE_PATH] direct_call",
-            mock_logger.warning.call_args.args[0],
+        warning_messages = [
+            call.args[0]
+            for call in mock_logger.warning.call_args_list
+            if call.args
+        ]
+        self.assertTrue(
+            any(
+                "[DENSE_PREFIX_COMPARE_PATH] direct_call" in message
+                for message in warning_messages
+            )
         )
         compare_cache.assert_called_once()
 
