@@ -1053,6 +1053,14 @@ def _dense_prefix_compare_diff(
         if first.numel() > 0:
             first_idx = int(first[0].item())
             result["first_diff_flat_index"] = first_idx
+            per_position_numel = int(base_values[0].numel())
+            if per_position_numel > 0:
+                first_position_idx = first_idx // per_position_numel
+                result["first_diff_sample_index"] = first_position_idx
+                if first_position_idx < len(current["positions"]):
+                    result["first_diff_position"] = current["positions"][
+                        first_position_idx
+                    ]
             result["baseline_value"] = float(base_values.reshape(-1)[first_idx].item())
             result["current_value"] = float(cur_values.reshape(-1)[first_idx].item())
     return result
