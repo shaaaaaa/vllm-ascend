@@ -840,8 +840,10 @@ def _dense_prefix_compare_cache_tensor(
             )
         return
 
-    if stage != "capture_before_store" and not _dense_prefix_compare_should_compare(
-        attn_metadata
+    if (
+        stage != "capture_before_store"
+        and not _dense_prefix_compare_lmcache_loaded()
+        and not _dense_prefix_compare_should_compare(attn_metadata)
     ):
         return
 
@@ -938,13 +940,17 @@ def _dense_prefix_compare_cache(
             include_index=include_index,
         )
         return
+    lmcache_loaded = _dense_prefix_compare_lmcache_loaded()
     attn_state = getattr(attn_metadata, "attn_state", None)
     if attn_state in (
         AscendAttentionState.DecodeOnly,
         AscendAttentionState.SpecDecoding,
     ) and not (
         stage != "capture_before_store"
-        and _dense_prefix_compare_should_compare(attn_metadata)
+        and (
+            lmcache_loaded
+            or _dense_prefix_compare_should_compare(attn_metadata)
+        )
     ):
         _dense_prefix_compare_gate_log(
             owner,
