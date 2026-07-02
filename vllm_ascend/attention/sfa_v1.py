@@ -523,6 +523,7 @@ def _dsa_req_id_key(req_id: object) -> str:
 
 _DENSE_PREFIX_COMPARE_BASELINE: dict[tuple[str, str], dict[str, Any]] = {}
 _DENSE_PREFIX_COMPARE_LOCKED_KEYS: set[tuple[str, str]] = set()
+_DENSE_PREFIX_COMPARE_EMITTED_KEYS: set[tuple[str, str, str]] = set()
 
 
 def _dense_prefix_compare_enabled() -> bool:
@@ -549,6 +550,27 @@ def _dense_prefix_compare_layer_enabled(layer_name: str) -> bool:
         part.strip() and part.strip() in layer_name
         for part in layer_filter.split(",")
     )
+
+
+def _dense_prefix_compare_stage_enabled(stage: str) -> bool:
+    if stage == "capture_before_store":
+        return True
+    stage_filter = os.environ.get(
+        "VLLM_ASCEND_DENSE_PREFIX_COMPARE_STAGE",
+        "compare_before_attention",
+    ).strip()
+    if not stage_filter:
+        return stage == "compare_before_attention"
+    if stage_filter.lower() in ("*", "all"):
+        return True
+    return any(
+        part.strip() and part.strip() == stage
+        for part in stage_filter.split(",")
+    )
+
+
+def _dense_prefix_compare_log_baseline() -> bool:
+    return _dsa_env_flag("VLLM_ASCEND_DENSE_PREFIX_COMPARE_LOG_BASELINE")
 
 
 def _dense_prefix_compare_log_allowed(
@@ -714,7 +736,7 @@ def _dense_prefix_compare_diff(
 
 def _dense_prefix_compare_should_compare(attn_metadata: Any) -> bool:
     max_tokens = _dense_prefix_compare_int_env(
-        "VLLM_ASCEND_DENSE_PREFIX_COMPARE_HIT_MAX_TOKENS", 4
+        "VLLM_ASCEND_DENSE_PREFIX_COMPARE_HIT_MAX_TOKENS", 1
     )
     if max_tokens < 0:
         return True
@@ -762,6 +784,8 @@ def _dense_prefix_compare_cache_tensor(
     attn_metadata: Any,
 ) -> None:
     key = (layer_name, label)
+    if not _dense_prefix_compare_stage_enabled(stage):
+        return
     sample, error = _dense_prefix_compare_build_sample(
         cache_layer=cache_layer,
         block_table=block_table,
@@ -788,7 +812,10 @@ def _dense_prefix_compare_cache_tensor(
         if previous is not None and int(previous["seq_len"]) > int(sample["seq_len"]):
             return
         _DENSE_PREFIX_COMPARE_BASELINE[key] = sample
-        if _dense_prefix_compare_log_allowed(owner, stage, layer_name, label):
+        if (
+            _dense_prefix_compare_log_baseline()
+            and _dense_prefix_compare_log_allowed(owner, stage, layer_name, label)
+        ):
             logger.warning(
                 "[DENSE_PREFIX_COMPARE] stage=%s layer=%s label=%s "
                 "seq_len=%s positions=%s slots=%s summary=%s",
@@ -802,14 +829,35 @@ def _dense_prefix_compare_cache_tensor(
             )
         return
 
-    baseline = _DENSE_PREFIX_COMPARE_BASELINE.get(key)
-    if baseline is None:
-        return
-    if (
-        int(baseline["seq_len"]) != int(sample["seq_len"])
-        and not _dense_prefix_compare_should_compare(attn_metadata)
+    if stage != "capture_before_store" and not _dense_prefix_compare_should_compare(
+        attn_metadata
     ):
         return
+
+    baseline = _DENSE_PREFIX_COMPARE_BASELINE.get(key)
+    if baseline is None:
+        if _dense_prefix_compare_log_allowed(
+            owner, "gate", layer_name, f"baseline_missing:{label}"
+        ):
+            logger.warning(
+                "[DENSE_PREFIX_COMPARE_GATE] reason=baseline_missing "
+                "stage=%s layer=%s label=%s seq_len=%s positions=%s "
+                "slots=%s summary=%s attn_state=%s num_actual_tokens=%s",
+                stage,
+                layer_name,
+                label,
+                sample["seq_len"],
+                sample["positions"],
+                sample["slots"],
+                sample["summary"],
+                getattr(attn_metadata, "attn_state", None),
+                getattr(attn_metadata, "num_actual_tokens", None),
+            )
+        return
+    emitted_key = (stage, layer_name, label)
+    if emitted_key in _DENSE_PREFIX_COMPARE_EMITTED_KEYS:
+        return
+    _DENSE_PREFIX_COMPARE_EMITTED_KEYS.add(emitted_key)
     _DENSE_PREFIX_COMPARE_LOCKED_KEYS.add(key)
     diff = _dense_prefix_compare_diff(baseline, sample)
     log_fn = logger.warning if diff.get("match") else logger.error
@@ -873,9 +921,13 @@ def _dense_prefix_compare_cache(
             include_index=include_index,
         )
         return
-    if getattr(attn_metadata, "attn_state", None) in (
+    attn_state = getattr(attn_metadata, "attn_state", None)
+    if attn_state in (
         AscendAttentionState.DecodeOnly,
         AscendAttentionState.SpecDecoding,
+    ) and not (
+        stage != "capture_before_store"
+        and _dense_prefix_compare_should_compare(attn_metadata)
     ):
         _dense_prefix_compare_gate_log(
             owner,
@@ -3645,6 +3697,15 @@ class AscendSFAImpl(MLAAttentionImpl):
             )
 
         attn_output = None
+        _dense_prefix_compare_cache(
+            self,
+            stage="compare_before_attention",
+            layer_name=layer_name,
+            kv_cache=kv_cache,
+            attn_metadata=attn_metadata,
+            include_latent=True,
+            include_index=True,
+        )
         if _adapter_supported:
             # Adapter-backed latent hot cache: FA reads the resident pool in place
             # (zero-copy), the adapter owns residency (hit/miss) + eviction.
@@ -3836,15 +3897,6 @@ class AscendSFAImpl(MLAAttentionImpl):
                     attn_output = pool_out
 
         if attn_output is None:
-            _dense_prefix_compare_cache(
-                self,
-                stage="compare_before_attention",
-                layer_name=layer_name,
-                kv_cache=kv_cache,
-                attn_metadata=attn_metadata,
-                include_latent=True,
-                include_index=True,
-            )
             with _dsa_prof.section("fa"):
                 attn_output = self._execute_sparse_flash_attention_process(
                     ql_nope, q_pe, kv_cache, topk_indices, attn_metadata,
