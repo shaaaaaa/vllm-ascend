@@ -521,6 +521,361 @@ def _dsa_req_id_key(req_id: object) -> str:
     return str(req_id)
 
 
+_DENSE_PREFIX_COMPARE_BASELINE: dict[tuple[str, str], dict[str, Any]] = {}
+_DENSE_PREFIX_COMPARE_LOCKED_KEYS: set[tuple[str, str]] = set()
+
+
+def _dense_prefix_compare_enabled() -> bool:
+    return (
+        _dsa_env_flag("VLLM_ASCEND_DENSE_PREFIX_COMPARE")
+        or _dsa_env_flag("LMCACHE_DENSE_PREFIX_DIAG")
+    )
+
+
+def _dense_prefix_compare_int_env(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, str(default)))
+    except ValueError:
+        return default
+
+
+def _dense_prefix_compare_layer_enabled(layer_name: str) -> bool:
+    layer_filter = os.environ.get("VLLM_ASCEND_DENSE_PREFIX_COMPARE_LAYER", "").strip()
+    if not layer_filter:
+        return "layers.0." in layer_name
+    if layer_filter.lower() in ("*", "all"):
+        return True
+    return any(
+        part.strip() and part.strip() in layer_name
+        for part in layer_filter.split(",")
+    )
+
+
+def _dense_prefix_compare_log_allowed(
+    owner: object,
+    stage: str,
+    layer_name: str,
+    label: str,
+) -> bool:
+    limit = _dense_prefix_compare_int_env(
+        "VLLM_ASCEND_DENSE_PREFIX_COMPARE_LOG_LIMIT", 8
+    )
+    if limit <= 0:
+        return False
+    counts = getattr(owner, "_dense_prefix_compare_log_counts", None)
+    if counts is None:
+        counts = {}
+        setattr(owner, "_dense_prefix_compare_log_counts", counts)
+    key = (stage, layer_name, label)
+    count = counts.get(key, 0)
+    if count >= limit:
+        return False
+    counts[key] = count + 1
+    return True
+
+
+def _dense_prefix_compare_seq_len(attn_metadata: Any) -> int | None:
+    seq_lens = getattr(attn_metadata, "seq_lens", None)
+    if isinstance(seq_lens, torch.Tensor) and seq_lens.numel() > 0:
+        return int(seq_lens.reshape(-1)[0].detach().to(device="cpu").item())
+    prompt_lens = getattr(attn_metadata, "prompt_lens", None)
+    if isinstance(prompt_lens, torch.Tensor) and prompt_lens.numel() > 0:
+        return int(prompt_lens.reshape(-1)[0].detach().to(device="cpu").item())
+    return None
+
+
+def _dense_prefix_compare_positions(seq_len: int) -> list[int]:
+    if seq_len <= 0:
+        return []
+    sample_count = max(
+        1, _dense_prefix_compare_int_env("VLLM_ASCEND_DENSE_PREFIX_COMPARE_SAMPLES", 8)
+    )
+    head_count = max(1, sample_count // 2)
+    tail_count = max(0, sample_count - head_count)
+    positions = list(range(min(head_count, seq_len)))
+    if tail_count > 0:
+        positions.extend(range(max(0, seq_len - tail_count), seq_len))
+    deduped: list[int] = []
+    seen: set[int] = set()
+    for pos in positions:
+        if pos not in seen:
+            deduped.append(pos)
+            seen.add(pos)
+    return deduped
+
+
+def _dense_prefix_compare_summary(values: torch.Tensor) -> dict[str, Any]:
+    flat = values.reshape(-1)
+    if flat.numel() == 0:
+        return {"shape": tuple(values.shape), "numel": 0, "head": []}
+    head = flat[:8].to(device="cpu").tolist()
+    return {
+        "shape": tuple(values.shape),
+        "numel": int(flat.numel()),
+        "sum": float(flat.sum().item()),
+        "abs_sum": float(flat.abs().sum().item()),
+        "min": float(flat.min().item()),
+        "max": float(flat.max().item()),
+        "head": head,
+    }
+
+
+def _dense_prefix_compare_build_sample(
+    cache_layer: torch.Tensor | None,
+    block_table: torch.Tensor | None,
+    seq_len: int,
+) -> tuple[dict[str, Any] | None, str | None]:
+    if cache_layer is None:
+        return None, "cache_layer_missing"
+    if block_table is None:
+        return None, "block_table_missing"
+    if not isinstance(cache_layer, torch.Tensor) or cache_layer.dim() < 2:
+        return None, f"bad_cache_layer_shape={getattr(cache_layer, 'shape', None)}"
+    if not isinstance(block_table, torch.Tensor) or block_table.numel() == 0:
+        return None, f"bad_block_table_shape={getattr(block_table, 'shape', None)}"
+
+    positions = _dense_prefix_compare_positions(seq_len)
+    if not positions:
+        return None, f"bad_seq_len={seq_len}"
+
+    block_size = int(cache_layer.shape[1])
+    max_slots = int(cache_layer.shape[0]) * block_size
+    rows = block_table.reshape(block_table.shape[0], -1).to(torch.long)
+    if rows.shape[0] <= 0 or rows.shape[1] <= 0:
+        return None, f"bad_block_table_shape={tuple(block_table.shape)}"
+
+    pos = torch.tensor(positions, dtype=torch.long, device=rows.device)
+    logical_blocks = pos // block_size
+    offsets = pos % block_size
+    max_logical_block = int(logical_blocks.max().detach().to(device="cpu").item())
+    if max_logical_block >= int(rows.shape[1]):
+        return None, (
+            f"logical_block_oob max_logical_block={max_logical_block} "
+            f"block_table_cols={int(rows.shape[1])} seq_len={seq_len} "
+            f"block_size={block_size}"
+        )
+
+    physical_blocks = rows[0].index_select(0, logical_blocks)
+    slots = physical_blocks * block_size + offsets
+    valid = (physical_blocks >= 0) & (slots >= 0) & (slots < max_slots)
+    if not bool(valid.all().detach().to(device="cpu").item()):
+        return None, (
+            f"invalid_slots positions={positions} "
+            f"slots={slots.detach().to(device='cpu').tolist()} "
+            f"physical_blocks={physical_blocks.detach().to(device='cpu').tolist()} "
+            f"max_slots={max_slots}"
+        )
+
+    flat_cache = cache_layer.reshape(-1, *cache_layer.shape[2:])
+    values = flat_cache.index_select(
+        0, slots.to(device=cache_layer.device, dtype=torch.long)
+    )
+    values_cpu = values.detach().to(device="cpu", dtype=torch.float32, copy=True)
+    return {
+        "seq_len": int(seq_len),
+        "positions": positions,
+        "slots": slots.detach().to(device="cpu", dtype=torch.long).tolist(),
+        "values": values_cpu,
+        "summary": _dense_prefix_compare_summary(values_cpu),
+    }, None
+
+
+def _dense_prefix_compare_diff(
+    baseline: dict[str, Any],
+    current: dict[str, Any],
+) -> dict[str, Any]:
+    base_values = baseline["values"]
+    cur_values = current["values"]
+    same_shape = tuple(base_values.shape) == tuple(cur_values.shape)
+    result: dict[str, Any] = {
+        "same_shape": same_shape,
+        "same_positions": baseline["positions"] == current["positions"],
+        "same_slots": baseline["slots"] == current["slots"],
+    }
+    if not same_shape:
+        result["match"] = False
+        return result
+
+    equal = torch.equal(base_values, cur_values)
+    result["match"] = bool(
+        equal and result["same_positions"]
+    )
+    if not equal:
+        diff = (base_values - cur_values).abs()
+        result["max_abs_diff"] = float(diff.max().item())
+        first = diff.reshape(-1).nonzero(as_tuple=False)
+        if first.numel() > 0:
+            first_idx = int(first[0].item())
+            result["first_diff_flat_index"] = first_idx
+            result["baseline_value"] = float(base_values.reshape(-1)[first_idx].item())
+            result["current_value"] = float(cur_values.reshape(-1)[first_idx].item())
+    return result
+
+
+def _dense_prefix_compare_should_compare(attn_metadata: Any) -> bool:
+    max_tokens = _dense_prefix_compare_int_env(
+        "VLLM_ASCEND_DENSE_PREFIX_COMPARE_HIT_MAX_TOKENS", 4
+    )
+    if max_tokens < 0:
+        return True
+    return int(getattr(attn_metadata, "num_actual_tokens", 0)) <= max_tokens
+
+
+def _dense_prefix_compare_cache_tensor(
+    owner: object,
+    *,
+    stage: str,
+    layer_name: str,
+    label: str,
+    cache_layer: torch.Tensor | None,
+    block_table: torch.Tensor | None,
+    seq_len: int,
+    attn_metadata: Any,
+) -> None:
+    key = (layer_name, label)
+    sample, error = _dense_prefix_compare_build_sample(
+        cache_layer=cache_layer,
+        block_table=block_table,
+        seq_len=seq_len,
+    )
+    if sample is None:
+        if _dense_prefix_compare_log_allowed(owner, stage, layer_name, label):
+            logger.warning(
+                "[DENSE_PREFIX_COMPARE] stage=%s layer=%s label=%s "
+                "sample_error=%s attn_state=%s num_actual_tokens=%s",
+                stage,
+                layer_name,
+                label,
+                error,
+                getattr(attn_metadata, "attn_state", None),
+                getattr(attn_metadata, "num_actual_tokens", None),
+            )
+        return
+
+    if stage == "capture_before_store":
+        if key in _DENSE_PREFIX_COMPARE_LOCKED_KEYS:
+            return
+        previous = _DENSE_PREFIX_COMPARE_BASELINE.get(key)
+        if previous is not None and int(previous["seq_len"]) > int(sample["seq_len"]):
+            return
+        _DENSE_PREFIX_COMPARE_BASELINE[key] = sample
+        if _dense_prefix_compare_log_allowed(owner, stage, layer_name, label):
+            logger.warning(
+                "[DENSE_PREFIX_COMPARE] stage=%s layer=%s label=%s "
+                "seq_len=%s positions=%s slots=%s summary=%s",
+                stage,
+                layer_name,
+                label,
+                sample["seq_len"],
+                sample["positions"],
+                sample["slots"],
+                sample["summary"],
+            )
+        return
+
+    baseline = _DENSE_PREFIX_COMPARE_BASELINE.get(key)
+    if baseline is None:
+        return
+    if (
+        int(baseline["seq_len"]) != int(sample["seq_len"])
+        and not _dense_prefix_compare_should_compare(attn_metadata)
+    ):
+        return
+    _DENSE_PREFIX_COMPARE_LOCKED_KEYS.add(key)
+    diff = _dense_prefix_compare_diff(baseline, sample)
+    log_fn = logger.warning if diff.get("match") else logger.error
+    if _dense_prefix_compare_log_allowed(owner, stage, layer_name, label):
+        log_fn(
+            "[DENSE_PREFIX_COMPARE] stage=%s layer=%s label=%s "
+            "match=%s diff=%s baseline_seq_len=%s current_seq_len=%s "
+            "baseline_positions=%s current_positions=%s "
+            "baseline_slots=%s current_slots=%s "
+            "baseline_summary=%s current_summary=%s "
+            "attn_state=%s num_actual_tokens=%s",
+            stage,
+            layer_name,
+            label,
+            diff.get("match"),
+            diff,
+            baseline["seq_len"],
+            sample["seq_len"],
+            baseline["positions"],
+            sample["positions"],
+            baseline["slots"],
+            sample["slots"],
+            baseline["summary"],
+            sample["summary"],
+            getattr(attn_metadata, "attn_state", None),
+            getattr(attn_metadata, "num_actual_tokens", None),
+        )
+
+
+def _dense_prefix_compare_cache(
+    owner: object,
+    *,
+    stage: str,
+    layer_name: str,
+    kv_cache: tuple[torch.Tensor, ...] | list[torch.Tensor] | None,
+    attn_metadata: Any,
+    include_latent: bool,
+    include_index: bool,
+) -> None:
+    if not _dense_prefix_compare_enabled():
+        return
+    if not _dense_prefix_compare_layer_enabled(layer_name):
+        return
+    if kv_cache is None:
+        return
+    if getattr(attn_metadata, "attn_state", None) in (
+        AscendAttentionState.DecodeOnly,
+        AscendAttentionState.SpecDecoding,
+    ):
+        return
+
+    seq_len = _dense_prefix_compare_seq_len(attn_metadata)
+    if seq_len is None:
+        return
+
+    if include_latent and len(kv_cache) >= 2:
+        _dense_prefix_compare_cache_tensor(
+            owner,
+            stage=stage,
+            layer_name=layer_name,
+            label="latent_nope",
+            cache_layer=kv_cache[0],
+            block_table=getattr(attn_metadata, "block_table", None),
+            seq_len=seq_len,
+            attn_metadata=attn_metadata,
+        )
+        _dense_prefix_compare_cache_tensor(
+            owner,
+            stage=stage,
+            layer_name=layer_name,
+            label="latent_pe",
+            cache_layer=kv_cache[1],
+            block_table=getattr(attn_metadata, "block_table", None),
+            seq_len=seq_len,
+            attn_metadata=attn_metadata,
+        )
+
+    if include_index and len(kv_cache) >= 3:
+        indexer_block_table = (
+            getattr(attn_metadata, "indexer_block_table", None)
+            if getattr(attn_metadata, "indexer_block_table", None) is not None
+            else getattr(attn_metadata, "block_table", None)
+        )
+        _dense_prefix_compare_cache_tensor(
+            owner,
+            stage=stage,
+            layer_name=layer_name,
+            label="dsa_index",
+            cache_layer=kv_cache[2],
+            block_table=indexer_block_table,
+            seq_len=seq_len,
+            attn_metadata=attn_metadata,
+        )
+
+
 def _dsa_expected_lmcache_selected(
     original_topk: torch.Tensor,
     prompt_lens: torch.Tensor,
@@ -2718,6 +3073,15 @@ class AscendSFAImpl(MLAAttentionImpl):
             # batch has decode rows (mixed steps included).
             if not (self.dsa_shrink_latent and attn_metadata.num_decode_tokens > 0):
                 wait_for_kv_layer_from_connector(layer_name)
+                _dense_prefix_compare_cache(
+                    self,
+                    stage="compare_after_latent_load",
+                    layer_name=layer_name,
+                    kv_cache=kv_cache,
+                    attn_metadata=attn_metadata,
+                    include_latent=True,
+                    include_index=False,
+                )
 
             if self.enable_dsa_cp:
                 assert slot_mapping_cp is not None
@@ -2846,6 +3210,15 @@ class AscendSFAImpl(MLAAttentionImpl):
                 )
                 with _dsa_prof.section("lmc_index_retrieve"):
                     wait_for_kv_layer_from_connector(index_layer_name)
+                _dense_prefix_compare_cache(
+                    self,
+                    stage="compare_after_index_load",
+                    layer_name=layer_name,
+                    kv_cache=kv_cache,
+                    attn_metadata=attn_metadata,
+                    include_latent=False,
+                    include_index=True,
+                )
 
             if self.is_kv_producer:
                 attn_metadata.reshape_cache_event = torch.npu.Event()
@@ -3398,6 +3771,15 @@ class AscendSFAImpl(MLAAttentionImpl):
                     attn_output = pool_out
 
         if attn_output is None:
+            _dense_prefix_compare_cache(
+                self,
+                stage="compare_before_attention",
+                layer_name=layer_name,
+                kv_cache=kv_cache,
+                attn_metadata=attn_metadata,
+                include_latent=True,
+                include_index=True,
+            )
             with _dsa_prof.section("fa"):
                 attn_output = self._execute_sparse_flash_attention_process(
                     ql_nope, q_pe, kv_cache, topk_indices, attn_metadata,
@@ -3458,6 +3840,15 @@ class AscendSFAImpl(MLAAttentionImpl):
         # its dataclass default 0 on every step, prefill included), so gating on it
         # skipped the save unconditionally. Gate on attn_state instead, which the
         # builder does set: pure-decode steps are DecodeOnly/SpecDecoding.
+        _dense_prefix_compare_cache(
+            self,
+            stage="capture_before_store",
+            layer_name=layer_name,
+            kv_cache=kv_cache,
+            attn_metadata=attn_metadata,
+            include_latent=True,
+            include_index=True,
+        )
         _skip_decode_save = (
             bool(self.dsa_shrink_latent)
             and _is_pure_decode

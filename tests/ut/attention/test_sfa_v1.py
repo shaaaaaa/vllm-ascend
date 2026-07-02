@@ -1,3 +1,4 @@
+import os
 import sys
 from unittest.mock import MagicMock, patch
 
@@ -12,8 +13,10 @@ if 'torch_npu._inductor' not in sys.modules:
     sys.modules['torch_npu._inductor'] = MagicMock()
 
 from vllm_ascend.attention.sfa_v1 import (AscendSFABackend, AscendSFAImpl,
-                                          AscendSFAMetadata,
-                                          AscendSFAMetadataBuilder)
+                                           AscendSFAMetadata,
+                                           AscendSFAMetadataBuilder,
+                                           _dense_prefix_compare_build_sample,
+                                           _dense_prefix_compare_diff)
 from vllm_ascend.utils import enable_dsa_cp
 
 
@@ -80,6 +83,53 @@ class TestAscendSFAMetadata(TestBase):
         self.assertIs(metadata.head_dim, head_dim)
         self.assertIs(metadata.attn_mask, attn_mask)
         self.assertEqual(metadata.attn_state, attn_state)
+
+
+class TestDensePrefixCompareHelpers(TestBase):
+
+    def test_dense_prefix_compare_build_sample_uses_logical_head_tail_slots(self):
+        cache = torch.arange(3 * 4 * 1 * 2, dtype=torch.float32).reshape(3, 4, 1, 2)
+        block_table = torch.tensor([[0, 1, 2]], dtype=torch.long)
+
+        with patch.dict(os.environ, {"VLLM_ASCEND_DENSE_PREFIX_COMPARE_SAMPLES": "8"}):
+            sample, error = _dense_prefix_compare_build_sample(cache, block_table, 10)
+
+        self.assertIsNone(error)
+        assert sample is not None
+        self.assertEqual(sample["positions"], [0, 1, 2, 3, 6, 7, 8, 9])
+        self.assertEqual(sample["slots"], [0, 1, 2, 3, 6, 7, 8, 9])
+        expected = cache.reshape(-1, 1, 2).index_select(
+            0, torch.tensor(sample["slots"], dtype=torch.long)
+        )
+        self.assertTrue(torch.equal(sample["values"], expected))
+
+    def test_dense_prefix_compare_diff_detects_loaded_value_mismatch(self):
+        cache = torch.arange(2 * 4 * 1 * 2, dtype=torch.float32).reshape(2, 4, 1, 2)
+        block_table = torch.tensor([[0, 1]], dtype=torch.long)
+
+        with patch.dict(os.environ, {"VLLM_ASCEND_DENSE_PREFIX_COMPARE_SAMPLES": "4"}):
+            baseline, error = _dense_prefix_compare_build_sample(cache, block_table, 8)
+            current, current_error = _dense_prefix_compare_build_sample(
+                cache.clone(), block_table, 8
+            )
+
+        self.assertIsNone(error)
+        self.assertIsNone(current_error)
+        assert baseline is not None
+        assert current is not None
+        self.assertTrue(_dense_prefix_compare_diff(baseline, current)["match"])
+
+        current["slots"] = [slot + 100 for slot in current["slots"]]
+        moved_slots_diff = _dense_prefix_compare_diff(baseline, current)
+        self.assertTrue(moved_slots_diff["match"])
+        self.assertFalse(moved_slots_diff["same_slots"])
+
+        current["values"] = current["values"].clone()
+        current["values"].reshape(-1)[0] += 3.0
+        diff = _dense_prefix_compare_diff(baseline, current)
+        self.assertFalse(diff["match"])
+        self.assertEqual(diff["max_abs_diff"], 3.0)
+        self.assertEqual(diff["first_diff_flat_index"], 0)
 
 
 class TestAscendSFAMetadataBuilder(TestBase):
