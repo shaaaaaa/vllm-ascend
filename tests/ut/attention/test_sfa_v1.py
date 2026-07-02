@@ -15,9 +15,13 @@ if 'torch_npu._inductor' not in sys.modules:
 from vllm_ascend.attention.sfa_v1 import (AscendSFABackend, AscendSFAImpl,
                                            AscendSFAMetadata,
                                            AscendSFAMetadataBuilder,
+                                           _dense_prefix_compare_enabled,
                                            _dense_prefix_compare_build_sample,
                                            _dense_prefix_compare_diff,
-                                           _dense_prefix_compare_direct_call)
+                                           _dense_prefix_compare_direct_call,
+                                           _dsa_env_flag,
+                                           _sfa_path_trace_should_wrap,
+                                           _sfa_trace_lmcache_call)
 from vllm_ascend.utils import enable_dsa_cp
 
 
@@ -187,6 +191,45 @@ class TestDensePrefixCompareHelpers(TestBase):
             mock_logger.warning.call_args.args[0],
         )
         compare_cache.assert_called_once()
+
+    def test_sfa_path_trace_does_not_wrap_env_flag_helper(self):
+        self.assertFalse(_sfa_path_trace_should_wrap("_dsa_env_flag", _dsa_env_flag))
+        self.assertTrue(
+            _sfa_path_trace_should_wrap(
+                "_dense_prefix_compare_enabled",
+                _dense_prefix_compare_enabled,
+            )
+        )
+
+    def test_sfa_trace_lmcache_call_logs_when_path_trace_enabled(self):
+        metadata = MagicMock()
+        metadata.attn_state = AscendAttentionState.DecodeOnly
+        metadata.num_actual_tokens = 1
+        metadata.num_decode_tokens = 1
+
+        with (
+            patch.dict(
+                os.environ,
+                {"VLLM_ASCEND_SFA_V1_PATH_TRACE": "1"},
+                clear=True,
+            ),
+            patch(
+                "vllm_ascend.attention.sfa_v1.has_kv_transfer_group",
+                return_value=False,
+            ),
+            patch("vllm_ascend.attention.sfa_v1.logger") as mock_logger,
+        ):
+            _sfa_trace_lmcache_call(
+                site="before_dense_latent_wait",
+                layer_name="model.layers.0.self_attn.attn",
+                attn_metadata=metadata,
+            )
+
+        mock_logger.warning.assert_called_once()
+        self.assertIn(
+            "[SFA_V1_LMCACHE_TRACE]",
+            mock_logger.warning.call_args.args[0],
+        )
 
 
 class TestAscendSFAMetadataBuilder(TestBase):

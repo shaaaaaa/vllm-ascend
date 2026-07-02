@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from functools import wraps
 from typing import TYPE_CHECKING, Any, TypeVar
 
 import os
@@ -478,6 +479,272 @@ def _dsa_env_flag(name: str, default: bool = False) -> bool:
     if value is None:
         return default
     return value.strip().lower() in ("1", "true", "yes", "on")
+
+
+_SFA_V1_PATH_TRACE_COUNTS: dict[str, int] = {}
+_SFA_V1_PATH_TRACE_EXCLUDED_PREFIXES = (
+    "_sfa_path_trace",
+    "_sfa_trace",
+)
+_SFA_V1_PATH_TRACE_EXCLUDED_NAMES = {
+    "_dsa_env_flag",
+}
+
+
+def _sfa_path_trace_enabled() -> bool:
+    return (
+        _dsa_env_flag("VLLM_ASCEND_SFA_V1_PATH_TRACE")
+        or _dsa_env_flag("LMCACHE_DENSE_PREFIX_DIAG")
+        or _dsa_env_flag("VLLM_ASCEND_DENSE_PREFIX_COMPARE")
+    )
+
+
+def _sfa_path_trace_limit() -> int:
+    try:
+        return int(os.environ.get("VLLM_ASCEND_SFA_V1_PATH_TRACE_LIMIT", "64"))
+    except ValueError:
+        return 64
+
+
+def _sfa_path_trace_allowed(name: str) -> bool:
+    limit = _sfa_path_trace_limit()
+    if limit <= 0:
+        return False
+    count = _SFA_V1_PATH_TRACE_COUNTS.get(name, 0)
+    if count >= limit:
+        return False
+    _SFA_V1_PATH_TRACE_COUNTS[name] = count + 1
+    return True
+
+
+def _sfa_trace_tensor(value: torch.Tensor) -> str:
+    return (
+        f"Tensor(shape={tuple(value.shape)}, dtype={value.dtype}, "
+        f"device={value.device})"
+    )
+
+
+def _sfa_trace_value(value: Any, depth: int = 0) -> Any:
+    if isinstance(value, torch.Tensor):
+        return _sfa_trace_tensor(value)
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, (list, tuple)):
+        if depth >= 1:
+            return f"{type(value).__name__}(len={len(value)})"
+        return {
+            "type": type(value).__name__,
+            "len": len(value),
+            "head": [_sfa_trace_value(v, depth + 1) for v in value[:3]],
+        }
+    if isinstance(value, dict):
+        return {
+            "type": "dict",
+            "len": len(value),
+            "keys": [str(k) for k in list(value.keys())[:4]],
+        }
+    return type(value).__name__
+
+
+def _sfa_trace_find_layer(args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:
+    if "layer_name" in kwargs:
+        return kwargs["layer_name"]
+    for value in args:
+        if isinstance(value, str) and "layer" in value:
+            return value
+    return None
+
+
+def _sfa_trace_find_attn_metadata(
+    args: tuple[Any, ...], kwargs: dict[str, Any]
+) -> Any:
+    if "attn_metadata" in kwargs:
+        return kwargs["attn_metadata"]
+    for value in list(args) + list(kwargs.values()):
+        if hasattr(value, "attn_state") and hasattr(value, "num_actual_tokens"):
+            return value
+    return None
+
+
+def _sfa_trace_forward_context() -> tuple[Any, Any, Any]:
+    try:
+        fc = get_forward_context()
+    except Exception:
+        return None, None, None
+    return (
+        id(fc),
+        getattr(fc, "lmcache_dense_prefix_loaded", None),
+        getattr(fc, "lmcache_dense_prefix_loaded_reqs", None),
+    )
+
+
+def _sfa_path_trace_log_entry(
+    name: str,
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+) -> None:
+    if not _sfa_path_trace_enabled() or not _sfa_path_trace_allowed(name):
+        return
+    attn_metadata = _sfa_trace_find_attn_metadata(args, kwargs)
+    fc_id, lmcache_loaded, loaded_reqs = _sfa_trace_forward_context()
+    logger.warning(
+        "[SFA_V1_PATH_TRACE] enter func=%s layer=%s "
+        "attn_state=%s num_actual_tokens=%s num_decode_tokens=%s "
+        "forward_context_id=%s lmcache_loaded=%s loaded_reqs=%s "
+        "args=%s kwargs=%s",
+        name,
+        _sfa_trace_find_layer(args, kwargs),
+        getattr(attn_metadata, "attn_state", None),
+        getattr(attn_metadata, "num_actual_tokens", None),
+        getattr(attn_metadata, "num_decode_tokens", None),
+        fc_id,
+        lmcache_loaded,
+        loaded_reqs,
+        [_sfa_trace_value(v) for v in args[:4]],
+        {k: _sfa_trace_value(v) for k, v in list(kwargs.items())[:6]},
+    )
+
+
+def _sfa_path_trace_wrap(func: Any, name: str) -> Any:
+    if getattr(func, "_sfa_path_trace_wrapped", False):
+        return func
+
+    @wraps(func)
+    def wrapped(*args, **kwargs):
+        _sfa_path_trace_log_entry(name, args, kwargs)
+        return func(*args, **kwargs)
+
+    wrapped._sfa_path_trace_wrapped = True
+    return wrapped
+
+
+def _sfa_path_trace_should_wrap(name: str, value: Any) -> bool:
+    if name.startswith("__"):
+        return False
+    if name in _SFA_V1_PATH_TRACE_EXCLUDED_NAMES:
+        return False
+    if any(name.startswith(prefix) for prefix in _SFA_V1_PATH_TRACE_EXCLUDED_PREFIXES):
+        return False
+    return (
+        getattr(value, "__module__", None) == __name__
+        and hasattr(value, "__code__")
+    )
+
+
+def _sfa_path_trace_install_class(cls: type) -> None:
+    for attr_name, attr_value in list(cls.__dict__.items()):
+        if attr_name.startswith("__"):
+            continue
+        if any(
+            attr_name.startswith(prefix)
+            for prefix in _SFA_V1_PATH_TRACE_EXCLUDED_PREFIXES
+        ):
+            continue
+        if isinstance(attr_value, staticmethod):
+            func = attr_value.__func__
+            if _sfa_path_trace_should_wrap(attr_name, func):
+                setattr(
+                    cls,
+                    attr_name,
+                    staticmethod(
+                        _sfa_path_trace_wrap(
+                            func, f"{cls.__name__}.{attr_name}"
+                        )
+                    ),
+                )
+        elif isinstance(attr_value, classmethod):
+            func = attr_value.__func__
+            if _sfa_path_trace_should_wrap(attr_name, func):
+                setattr(
+                    cls,
+                    attr_name,
+                    classmethod(
+                        _sfa_path_trace_wrap(
+                            func, f"{cls.__name__}.{attr_name}"
+                        )
+                    ),
+                )
+        elif _sfa_path_trace_should_wrap(attr_name, attr_value):
+            setattr(
+                cls,
+                attr_name,
+                _sfa_path_trace_wrap(attr_value, f"{cls.__name__}.{attr_name}"),
+            )
+
+
+def _sfa_path_trace_install() -> None:
+    if not _sfa_path_trace_enabled():
+        return
+    for name, value in list(globals().items()):
+        if _sfa_path_trace_should_wrap(name, value):
+            globals()[name] = _sfa_path_trace_wrap(value, name)
+    for cls_name in (
+        "AscendSFABackend",
+        "DSACPContext",
+        "AscendSFAMetadata",
+        "AscendSFAMetadataBuilder",
+        "AscendSFAImpl",
+    ):
+        cls = globals().get(cls_name)
+        if isinstance(cls, type):
+            _sfa_path_trace_install_class(cls)
+    logger.warning(
+        "[SFA_V1_PATH_TRACE] installed module=%s limit_per_function=%s",
+        __name__,
+        _sfa_path_trace_limit(),
+    )
+
+
+def _sfa_trace_lmcache_call(
+    *,
+    site: str,
+    layer_name: str | None,
+    index_layer_name: str | None = None,
+    kv_cache: tuple[torch.Tensor, ...] | list[torch.Tensor] | None = None,
+    attn_metadata: Any = None,
+    selected_tokens: torch.Tensor | None = None,
+    target_slot_mapping: torch.Tensor | None = None,
+    note: str | None = None,
+) -> None:
+    if not _sfa_path_trace_enabled():
+        return
+    has_group = has_kv_transfer_group()
+    is_v1_group = is_v1_kv_transfer_group() if has_group else False
+    connector = get_kv_transfer_group() if has_group else None
+    connector_has_metadata = None
+    if connector is not None and hasattr(connector, "has_connector_metadata"):
+        try:
+            connector_has_metadata = connector.has_connector_metadata()
+        except Exception as exc:
+            connector_has_metadata = f"error:{type(exc).__name__}"
+    fc_id, lmcache_loaded, loaded_reqs = _sfa_trace_forward_context()
+    logger.warning(
+        "[SFA_V1_LMCACHE_TRACE] site=%s note=%s layer=%s index_layer=%s "
+        "has_kv_group=%s is_v1_group=%s connector=%s "
+        "connector_has_metadata=%s supports_dsa_index_lmcache=%s "
+        "attn_state=%s num_actual_tokens=%s num_decode_tokens=%s "
+        "kv_cache_len=%s selected=%s target_slot=%s "
+        "forward_context_id=%s lmcache_loaded=%s loaded_reqs=%s",
+        site,
+        note,
+        layer_name,
+        index_layer_name,
+        has_group,
+        is_v1_group,
+        connector.__class__.__name__ if connector is not None else None,
+        connector_has_metadata,
+        getattr(connector, "supports_dsa_index_lmcache", None)
+        if connector is not None else None,
+        getattr(attn_metadata, "attn_state", None),
+        getattr(attn_metadata, "num_actual_tokens", None),
+        getattr(attn_metadata, "num_decode_tokens", None),
+        len(kv_cache) if kv_cache is not None else None,
+        _sfa_trace_value(selected_tokens),
+        _sfa_trace_value(target_slot_mapping),
+        fc_id,
+        lmcache_loaded,
+        loaded_reqs,
+    )
 
 
 def _dsa_kv_debug_enabled() -> bool:
@@ -3280,7 +3547,21 @@ class AscendSFAImpl(MLAAttentionImpl):
             # (this one with a dense arange) and desync it — skip whenever the
             # batch has decode rows (mixed steps included).
             if not (self.dsa_shrink_latent and attn_metadata.num_decode_tokens > 0):
+                _sfa_trace_lmcache_call(
+                    site="before_dense_latent_wait",
+                    layer_name=layer_name,
+                    kv_cache=kv_cache,
+                    attn_metadata=attn_metadata,
+                    note="non_shrink_dense_load",
+                )
                 wait_for_kv_layer_from_connector(layer_name)
+                _sfa_trace_lmcache_call(
+                    site="after_dense_latent_wait",
+                    layer_name=layer_name,
+                    kv_cache=kv_cache,
+                    attn_metadata=attn_metadata,
+                    note="non_shrink_dense_load",
+                )
                 _dense_prefix_compare_direct_call(
                     self,
                     note="after_latent_load",
@@ -3418,7 +3699,23 @@ class AscendSFAImpl(MLAAttentionImpl):
                     tuple(kv_cache[2].shape) if len(kv_cache) >= 3 else None,
                 )
                 with _dsa_prof.section("lmc_index_retrieve"):
+                    _sfa_trace_lmcache_call(
+                        site="before_dsa_index_wait",
+                        layer_name=layer_name,
+                        index_layer_name=index_layer_name,
+                        kv_cache=kv_cache,
+                        attn_metadata=attn_metadata,
+                        note="dense_index_load",
+                    )
                     wait_for_kv_layer_from_connector(index_layer_name)
+                    _sfa_trace_lmcache_call(
+                        site="after_dsa_index_wait",
+                        layer_name=layer_name,
+                        index_layer_name=index_layer_name,
+                        kv_cache=kv_cache,
+                        attn_metadata=attn_metadata,
+                        note="dense_index_load",
+                    )
                 _dense_prefix_compare_direct_call(
                     self,
                     note="after_index_load",
@@ -3722,11 +4019,29 @@ class AscendSFAImpl(MLAAttentionImpl):
                         target_slot_mapping=_target_slot_mapping_for_wait,
                     )
                 with _dsa_prof.section("lmc_retrieve"):
+                    _sfa_trace_lmcache_call(
+                        site="before_sparse_selected_wait",
+                        layer_name=layer_name,
+                        kv_cache=kv_cache,
+                        attn_metadata=attn_metadata,
+                        selected_tokens=_selected_for_wait,
+                        target_slot_mapping=_target_slot_mapping_for_wait,
+                        note="shrink_decode_selected_load",
+                    )
                     _wait_fn(
                         layer_name,
                         selected_tokens=_selected_for_wait,
                         target_slot_mapping=_target_slot_mapping_for_wait,
                         request_ids=_request_ids_for_wait,
+                    )
+                    _sfa_trace_lmcache_call(
+                        site="after_sparse_selected_wait",
+                        layer_name=layer_name,
+                        kv_cache=kv_cache,
+                        attn_metadata=attn_metadata,
+                        selected_tokens=_selected_for_wait,
+                        target_slot_mapping=_target_slot_mapping_for_wait,
+                        note="shrink_decode_selected_load",
                     )
                 if (
                     _target_slot_mapping_for_wait is not None
@@ -4067,7 +4382,21 @@ class AscendSFAImpl(MLAAttentionImpl):
         )
         if not _skip_decode_save:
             if self.dsa_offload_unbundle and len(kv_cache) >= 2:
+                _sfa_trace_lmcache_call(
+                    site="before_save_latent",
+                    layer_name=layer_name,
+                    kv_cache=[kv_cache[0], kv_cache[1]],
+                    attn_metadata=attn_metadata,
+                    note="save_mla_latent_group",
+                )
                 maybe_save_kv_layer_to_connector(layer_name, [kv_cache[0], kv_cache[1]])
+                _sfa_trace_lmcache_call(
+                    site="after_save_latent",
+                    layer_name=layer_name,
+                    kv_cache=[kv_cache[0], kv_cache[1]],
+                    attn_metadata=attn_metadata,
+                    note="save_mla_latent_group",
+                )
                 if (
                     len(kv_cache) >= 3
                     and index_layer_name is not None
@@ -4085,9 +4414,42 @@ class AscendSFAImpl(MLAAttentionImpl):
                         attn_metadata.num_decode_tokens,
                         tuple(kv_cache[2].shape),
                     )
+                    _sfa_trace_lmcache_call(
+                        site="before_save_dsa_index",
+                        layer_name=layer_name,
+                        index_layer_name=index_layer_name,
+                        kv_cache=[kv_cache[2]],
+                        attn_metadata=attn_metadata,
+                        note="save_dsa_index_group",
+                    )
                     maybe_save_kv_layer_to_connector(index_layer_name, [kv_cache[2]])
+                    _sfa_trace_lmcache_call(
+                        site="after_save_dsa_index",
+                        layer_name=layer_name,
+                        index_layer_name=index_layer_name,
+                        kv_cache=[kv_cache[2]],
+                        attn_metadata=attn_metadata,
+                        note="save_dsa_index_group",
+                    )
             else:
+                _sfa_trace_lmcache_call(
+                    site="before_save_bundle",
+                    layer_name=layer_name,
+                    kv_cache=list(kv_cache),
+                    attn_metadata=attn_metadata,
+                    note="save_bundled_group",
+                )
                 maybe_save_kv_layer_to_connector(layer_name, list(kv_cache))
+                _sfa_trace_lmcache_call(
+                    site="after_save_bundle",
+                    layer_name=layer_name,
+                    kv_cache=list(kv_cache),
+                    attn_metadata=attn_metadata,
+                    note="save_bundled_group",
+                )
 
         _dsa_prof.end(_sfa_t)
         return output_padded
+
+
+_sfa_path_trace_install()
