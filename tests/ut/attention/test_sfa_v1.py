@@ -198,6 +198,69 @@ class TestDensePrefixCompareHelpers(TestBase):
         )
         compare_cache.assert_called_once()
 
+    def test_dense_prefix_compare_direct_call_can_suppress_path_log(self):
+        class Owner:
+            pass
+
+        owner = Owner()
+        metadata = MagicMock()
+        metadata.attn_state = AscendAttentionState.DecodeOnly
+        metadata.num_actual_tokens = 1
+        metadata.num_decode_tokens = 1
+        metadata.seq_lens = torch.tensor([8])
+        metadata.prompt_lens = None
+        metadata.block_table = torch.tensor([[0, 1]], dtype=torch.long)
+        kv_cache = [
+            torch.zeros(2, 4, 1, 2),
+            torch.zeros(2, 4, 1, 2),
+            torch.zeros(2, 4, 1, 2),
+        ]
+        forward_context = MagicMock()
+        forward_context.lmcache_dense_prefix_loaded = True
+        forward_context.lmcache_dense_prefix_loaded_reqs = [
+            {"req_id": "r0", "token_count": 8}
+        ]
+
+        env = {
+            "LMCACHE_DENSE_PREFIX_DIAG": "1",
+            "VLLM_ASCEND_DENSE_PREFIX_COMPARE_LAYER": "all",
+            "VLLM_ASCEND_DENSE_PREFIX_COMPARE_PATH_LOG_DISABLE": "1",
+        }
+        with (
+            patch.dict(os.environ, env, clear=True),
+            patch(
+                "vllm_ascend.attention.sfa_v1.get_forward_context",
+                return_value=forward_context,
+            ),
+            patch(
+                "vllm_ascend.attention.sfa_v1._dense_prefix_compare_cache"
+            ) as compare_cache,
+            patch("vllm_ascend.attention.sfa_v1.logger") as mock_logger,
+        ):
+            _dense_prefix_compare_direct_call(
+                owner,
+                note="before_attention",
+                stage="compare_before_attention",
+                layer_name="model.layers.0.self_attn.attn",
+                kv_cache=kv_cache,
+                attn_metadata=metadata,
+                include_latent=True,
+                include_index=True,
+            )
+
+        warning_messages = [
+            call.args[0]
+            for call in mock_logger.warning.call_args_list
+            if call.args
+        ]
+        self.assertFalse(
+            any(
+                "[DENSE_PREFIX_COMPARE_PATH] direct_call" in message
+                for message in warning_messages
+            )
+        )
+        compare_cache.assert_called_once()
+
     def test_sfa_path_trace_does_not_wrap_env_flag_helper(self):
         self.assertFalse(_sfa_path_trace_should_wrap("_dsa_env_flag", _dsa_env_flag))
         self.assertTrue(

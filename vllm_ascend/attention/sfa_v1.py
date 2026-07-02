@@ -897,6 +897,10 @@ def _dense_prefix_compare_log_baseline() -> bool:
     return _dsa_env_flag("VLLM_ASCEND_DENSE_PREFIX_COMPARE_LOG_BASELINE")
 
 
+def _dense_prefix_compare_path_log_enabled() -> bool:
+    return not _dsa_env_flag("VLLM_ASCEND_DENSE_PREFIX_COMPARE_PATH_LOG_DISABLE")
+
+
 def _dense_prefix_compare_log_allowed(
     owner: object,
     stage: str,
@@ -1411,8 +1415,12 @@ def _dense_prefix_compare_direct_call(
         or _dense_prefix_compare_should_compare(attn_metadata)
         or _dense_prefix_compare_allow_no_lmcache_load()
     )
-    if should_probe and _dense_prefix_compare_log_allowed(
-        owner, "direct_call", layer_name, f"{note}:{stage}"
+    if (
+        should_probe
+        and _dense_prefix_compare_path_log_enabled()
+        and _dense_prefix_compare_log_allowed(
+            owner, "direct_call", layer_name, f"{note}:{stage}"
+        )
     ):
         _sfa_force_print(
             "[DENSE_PREFIX_COMPARE_PATH] direct_call "
