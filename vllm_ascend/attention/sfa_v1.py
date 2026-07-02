@@ -504,7 +504,10 @@ _SFA_V1_PATH_TRACE_EXCLUDED_NAMES = {
 
 
 def _sfa_path_trace_enabled() -> bool:
-    return not _dsa_env_flag("VLLM_ASCEND_SFA_V1_PATH_TRACE_DISABLE")
+    return (
+        _dsa_env_flag("VLLM_ASCEND_SFA_V1_PATH_TRACE")
+        and not _dsa_env_flag("VLLM_ASCEND_SFA_V1_PATH_TRACE_DISABLE")
+    )
 
 
 def _sfa_force_print(message: str) -> None:
@@ -842,7 +845,6 @@ def _dense_prefix_compare_enabled() -> bool:
     return (
         _dsa_env_flag("VLLM_ASCEND_DENSE_PREFIX_COMPARE")
         or _dsa_env_flag("LMCACHE_DENSE_PREFIX_DIAG")
-        or _sfa_path_trace_enabled()
     )
 
 

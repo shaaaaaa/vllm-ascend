@@ -20,6 +20,7 @@ from vllm_ascend.attention.sfa_v1 import (AscendSFABackend, AscendSFAImpl,
                                            _dense_prefix_compare_diff,
                                            _dense_prefix_compare_direct_call,
                                            _dsa_env_flag,
+                                           _sfa_path_trace_enabled,
                                            _sfa_path_trace_should_wrap,
                                            _sfa_trace_lmcache_call)
 from vllm_ascend.utils import enable_dsa_cp
@@ -135,6 +136,19 @@ class TestDensePrefixCompareHelpers(TestBase):
         self.assertFalse(diff["match"])
         self.assertEqual(diff["max_abs_diff"], 3.0)
         self.assertEqual(diff["first_diff_flat_index"], 0)
+
+    def test_diagnostics_are_opt_in_by_default(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertFalse(_sfa_path_trace_enabled())
+            self.assertFalse(_dense_prefix_compare_enabled())
+
+        with patch.dict(os.environ, {"VLLM_ASCEND_SFA_V1_PATH_TRACE": "1"}, clear=True):
+            self.assertTrue(_sfa_path_trace_enabled())
+            self.assertFalse(_dense_prefix_compare_enabled())
+
+        with patch.dict(os.environ, {"VLLM_ASCEND_DENSE_PREFIX_COMPARE": "1"}, clear=True):
+            self.assertFalse(_sfa_path_trace_enabled())
+            self.assertTrue(_dense_prefix_compare_enabled())
 
     def test_dense_prefix_compare_direct_call_logs_path_before_compare(self):
         class Owner:
