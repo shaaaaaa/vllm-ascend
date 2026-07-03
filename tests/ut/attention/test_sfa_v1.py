@@ -1,5 +1,6 @@
 import os
 import sys
+import tempfile
 from unittest.mock import MagicMock, patch
 
 import torch
@@ -12,17 +13,30 @@ from vllm.distributed.parallel_state import GroupCoordinator
 if 'torch_npu._inductor' not in sys.modules:
     sys.modules['torch_npu._inductor'] = MagicMock()
 
-from vllm_ascend.attention.sfa_v1 import (AscendSFABackend, AscendSFAImpl,
-                                           AscendSFAMetadata,
-                                           AscendSFAMetadataBuilder,
-                                           _dense_prefix_compare_enabled,
-                                           _dense_prefix_compare_build_sample,
-                                           _dense_prefix_compare_diff,
-                                           _dense_prefix_compare_direct_call,
-                                           _dsa_env_flag,
-                                           _sfa_path_trace_enabled,
-                                           _sfa_path_trace_should_wrap,
-                                           _sfa_trace_lmcache_call)
+from vllm_ascend.attention.sfa_v1 import (
+    AscendSFABackend,
+    AscendSFAImpl,
+    AscendSFAMetadata,
+    AscendSFAMetadataBuilder,
+    _dense_prefix_capture_loaded_snapshot,
+    _dense_prefix_compare_build_sample,
+    _dense_prefix_compare_cache,
+    _dense_prefix_compare_diff,
+    _dense_prefix_compare_direct_call,
+    _dense_prefix_compare_enabled,
+    _dense_prefix_compare_load_sample,
+    _dense_prefix_compare_save_sample,
+    _dense_prefix_full_snapshot_build,
+    _dense_prefix_full_snapshot_diff,
+    _dense_prefix_full_snapshot_load,
+    _dense_prefix_full_snapshot_replay,
+    _dense_prefix_full_snapshot_save_payload,
+    _dense_prefix_replay_dev_lmy_if_loaded_mismatch,
+    _dsa_env_flag,
+    _sfa_path_trace_enabled,
+    _sfa_path_trace_should_wrap,
+    _sfa_trace_lmcache_call,
+)
 from vllm_ascend.utils import enable_dsa_cp
 
 
@@ -136,6 +150,459 @@ class TestDensePrefixCompareHelpers(TestBase):
         self.assertFalse(diff["match"])
         self.assertEqual(diff["max_abs_diff"], 3.0)
         self.assertEqual(diff["first_diff_flat_index"], 0)
+
+    def test_dense_prefix_compare_sample_uses_rank_aware_file(self):
+        sample = {
+            "seq_len": 4,
+            "positions": [0, 1],
+            "slots": [0, 1],
+            "values": torch.tensor([[1.0], [2.0]]),
+            "summary": {"shape": (2, 1)},
+        }
+
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            patch.dict(
+                os.environ,
+                {
+                    "VLLM_ASCEND_DENSE_PREFIX_FILE_DIR": tmpdir,
+                    "RANK": "3",
+                    "LOCAL_RANK": "3",
+                    "WORLD_SIZE": "8",
+                },
+                clear=False,
+            ),
+            patch(
+                "vllm_ascend.attention.sfa_v1.get_tensor_model_parallel_world_size",
+                return_value=8,
+            ),
+            patch(
+                "vllm_ascend.attention.sfa_v1.torch.distributed.is_available",
+                return_value=False,
+            ),
+            patch(
+                "vllm_ascend.attention.sfa_v1.torch.distributed.is_initialized",
+                return_value=False,
+            ),
+        ):
+            tp_group = MagicMock()
+            tp_group.rank_in_group = MagicMock(return_value=3)
+            tp_group.world_size = MagicMock(return_value=8)
+            path = _dense_prefix_compare_save_sample(
+                layer_name="model.layers.0.self_attn.attn",
+                label="latent_nope",
+                stage="lmcache_saved",
+                sample=sample,
+                preserve_longer=True,
+            )
+            with patch("vllm_ascend.attention.sfa_v1.get_tp_group", return_value=tp_group):
+                loaded = _dense_prefix_compare_load_sample(
+                    "model.layers.0.self_attn.attn",
+                    "latent_nope",
+                    "lmcache_saved",
+                )
+
+        assert path is not None
+        self.assertIn("rank3_", path)
+        self.assertIn("_tp3_of8", path)
+        assert loaded is not None
+        self.assertEqual(loaded["seq_len"], sample["seq_len"])
+        self.assertTrue(torch.equal(loaded["values"], sample["values"]))
+
+    def test_dense_prefix_full_snapshot_diff_and_replay(self):
+        metadata = MagicMock()
+        metadata.attn_state = AscendAttentionState.ChunkedPrefill
+        metadata.num_decode_tokens = 0
+        metadata.block_table = torch.tensor([[1, 3]], dtype=torch.long)
+        metadata.indexer_block_table = torch.tensor([[0, 2]], dtype=torch.long)
+        metadata.seq_lens = torch.tensor([6], dtype=torch.long)
+        metadata.seq_lens_cpu = metadata.seq_lens
+
+        kv0 = torch.arange(4 * 4, dtype=torch.float32).reshape(4, 4, 1, 1)
+        kv1 = kv0 + 100
+        kv2 = kv0 + 200
+        payload, error = _dense_prefix_full_snapshot_build(
+            source="dev_lmy",
+            layer_name="model.layers.0.self_attn.attn",
+            kv_cache=[kv0, kv1, kv2],
+            attn_metadata=metadata,
+            include_latent=True,
+            include_index=True,
+            require_complete=True,
+            allow_decode=False,
+        )
+        self.assertIsNone(error)
+        assert payload is not None
+        self.assertTrue(_dense_prefix_full_snapshot_diff(payload, payload)["match"])
+
+        changed_payload, changed_error = _dense_prefix_full_snapshot_build(
+            source="lmcache_loaded",
+            layer_name="model.layers.0.self_attn.attn",
+            kv_cache=[kv0 + 1, kv1, kv2],
+            attn_metadata=metadata,
+            include_latent=True,
+            include_index=True,
+            require_complete=True,
+            allow_decode=False,
+        )
+        self.assertIsNone(changed_error)
+        assert changed_payload is not None
+        self.assertFalse(
+            _dense_prefix_full_snapshot_diff(payload, changed_payload)["match"]
+        )
+        length_changed_payload = {
+            **payload,
+            "meta": {
+                **payload["meta"],
+                "lengths": [payload["meta"]["lengths"][0] + 1],
+            },
+        }
+        length_diff = _dense_prefix_full_snapshot_diff(
+            payload, length_changed_payload
+        )
+        self.assertFalse(length_diff["match"])
+        self.assertFalse(length_diff["same_lengths"])
+
+        target0 = torch.zeros_like(kv0)
+        target1 = torch.zeros_like(kv1)
+        target2 = torch.zeros_like(kv2)
+        class Owner:
+            pass
+
+        owner = Owner()
+        fake_npu = MagicMock()
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            patch.dict(
+                os.environ,
+                {
+                    "VLLM_ASCEND_DENSE_PREFIX_COMPARE": "1",
+                    "VLLM_ASCEND_DENSE_PREFIX_COMPARE_LAYER": "all",
+                    "VLLM_ASCEND_DENSE_PREFIX_FILE_DIR": tmpdir,
+                    "VLLM_ASCEND_DENSE_PREFIX_FILE_SYNC": "1",
+                },
+                clear=False,
+            ),
+            patch("vllm_ascend.attention.sfa_v1.torch.npu", fake_npu, create=True),
+        ):
+            _dense_prefix_full_snapshot_save_payload(
+                layer_name="model.layers.0.self_attn.attn",
+                source="dev_lmy",
+                payload=payload,
+                preserve_longer=False,
+            )
+            self.assertIsNotNone(
+                _dense_prefix_full_snapshot_load(
+                    "model.layers.0.self_attn.attn",
+                    "dev_lmy",
+                )
+            )
+            copied = _dense_prefix_full_snapshot_replay(
+                owner,
+                source="dev_lmy",
+                layer_name="model.layers.0.self_attn.attn",
+                kv_cache=[target0, target1, target2],
+                attn_metadata=metadata,
+            )
+
+        self.assertEqual(copied, {0: 2, 1: 2, 2: 2})
+        fake_npu.synchronize.assert_called_once()
+        self.assertTrue(torch.equal(target0[1], kv0[1]))
+        self.assertTrue(torch.equal(target0[3], kv0[3]))
+        self.assertTrue(torch.equal(target1[1], kv1[1]))
+        self.assertTrue(torch.equal(target1[3], kv1[3]))
+        self.assertTrue(torch.equal(target2[0], kv2[0]))
+        self.assertTrue(torch.equal(target2[2], kv2[2]))
+
+    def test_dense_prefix_replay_captures_loaded_snapshot_when_missing(self):
+        class Owner:
+            pass
+
+        metadata = MagicMock()
+        metadata.attn_state = AscendAttentionState.DecodeOnly
+        metadata.num_decode_tokens = 1
+        metadata.block_table = torch.tensor([[1, 3]], dtype=torch.long)
+        metadata.indexer_block_table = torch.tensor([[0, 2]], dtype=torch.long)
+        metadata.seq_lens = torch.tensor([6], dtype=torch.long)
+        metadata.seq_lens_cpu = metadata.seq_lens
+
+        kv0 = torch.arange(4 * 4, dtype=torch.float32).reshape(4, 4, 1, 1)
+        kv1 = kv0 + 100
+        kv2 = kv0 + 200
+        payload, error = _dense_prefix_full_snapshot_build(
+            source="dev_lmy",
+            layer_name="model.layers.0.self_attn.attn",
+            kv_cache=[kv0, kv1, kv2],
+            attn_metadata=metadata,
+            include_latent=True,
+            include_index=True,
+            require_complete=False,
+            allow_decode=True,
+        )
+        self.assertIsNone(error)
+        assert payload is not None
+
+        target0 = torch.zeros_like(kv0)
+        target1 = torch.zeros_like(kv1)
+        target2 = torch.zeros_like(kv2)
+        forward_context = MagicMock()
+        forward_context.lmcache_dense_prefix_loaded = True
+
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            patch.dict(
+                os.environ,
+                {
+                    "VLLM_ASCEND_DENSE_PREFIX_COMPARE": "1",
+                    "VLLM_ASCEND_DENSE_PREFIX_COMPARE_LAYER": "all",
+                    "VLLM_ASCEND_DENSE_PREFIX_FILE_DIR": tmpdir,
+                    "VLLM_ASCEND_DENSE_PREFIX_FILE_PARTIAL_REPLAY": "1",
+                    "VLLM_ASCEND_DENSE_PREFIX_FILE_SYNC": "0",
+                },
+                clear=False,
+            ),
+            patch(
+                "vllm_ascend.attention.sfa_v1.get_forward_context",
+                return_value=forward_context,
+            ),
+        ):
+            _dense_prefix_full_snapshot_save_payload(
+                layer_name="model.layers.0.self_attn.attn",
+                source="dev_lmy",
+                payload=payload,
+                preserve_longer=False,
+            )
+            self.assertIsNone(
+                _dense_prefix_full_snapshot_load(
+                    "model.layers.0.self_attn.attn",
+                    "lmcache_loaded",
+                )
+            )
+            _dense_prefix_replay_dev_lmy_if_loaded_mismatch(
+                Owner(),
+                layer_name="model.layers.0.self_attn.attn",
+                kv_cache=[target0, target1, target2],
+                attn_metadata=metadata,
+            )
+            loaded_payload = _dense_prefix_full_snapshot_load(
+                "model.layers.0.self_attn.attn",
+                "lmcache_loaded",
+            )
+
+        self.assertIsNotNone(loaded_payload)
+        self.assertTrue(torch.equal(target0[1], kv0[1]))
+        self.assertTrue(torch.equal(target0[3, :2], kv0[3, :2]))
+        self.assertTrue(torch.equal(target0[3, 2:], torch.zeros_like(target0[3, 2:])))
+        self.assertTrue(torch.equal(target1[1], kv1[1]))
+        self.assertTrue(torch.equal(target1[3, :2], kv1[3, :2]))
+        self.assertTrue(torch.equal(target1[3, 2:], torch.zeros_like(target1[3, 2:])))
+        self.assertTrue(torch.equal(target2[0], kv2[0]))
+        self.assertTrue(torch.equal(target2[2, :2], kv2[2, :2]))
+        self.assertTrue(torch.equal(target2[2, 2:], torch.zeros_like(target2[2, 2:])))
+
+    def test_dense_prefix_capture_loaded_snapshot_writes_current_cache(self):
+        metadata = MagicMock()
+        metadata.attn_state = AscendAttentionState.DecodeOnly
+        metadata.num_decode_tokens = 1
+        metadata.block_table = torch.tensor([[1, 3]], dtype=torch.long)
+        metadata.indexer_block_table = torch.tensor([[0, 2]], dtype=torch.long)
+        metadata.seq_lens = torch.tensor([6], dtype=torch.long)
+        metadata.seq_lens_cpu = metadata.seq_lens
+
+        kv0 = torch.arange(4 * 4, dtype=torch.float32).reshape(4, 4, 1, 1)
+        forward_context = MagicMock()
+        forward_context.lmcache_dense_prefix_loaded = True
+        forward_context.dsa_prompt_lens = None
+
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            patch.dict(
+                os.environ,
+                {
+                    "VLLM_ASCEND_DENSE_PREFIX_COMPARE": "1",
+                    "VLLM_ASCEND_DENSE_PREFIX_COMPARE_LAYER": "all",
+                    "VLLM_ASCEND_DENSE_PREFIX_FILE_DIR": tmpdir,
+                    "VLLM_ASCEND_DENSE_PREFIX_FILE_SYNC": "0",
+                },
+                clear=False,
+            ),
+            patch(
+                "vllm_ascend.attention.sfa_v1.get_forward_context",
+                return_value=forward_context,
+            ),
+        ):
+            payload = _dense_prefix_capture_loaded_snapshot(
+                MagicMock(),
+                layer_name="model.layers.0.self_attn.attn",
+                kv_cache=[kv0, kv0 + 100, kv0 + 200],
+                attn_metadata=metadata,
+                reason="unit_test",
+                overwrite=True,
+            )
+            loaded = _dense_prefix_full_snapshot_load(
+                "model.layers.0.self_attn.attn",
+                "lmcache_loaded",
+            )
+
+        assert payload is not None
+        assert loaded is not None
+        self.assertEqual(loaded["meta"]["source"], "lmcache_loaded")
+        self.assertTrue(
+            torch.equal(
+                loaded["caches"][0]["rows"][0]["data"],
+                payload["caches"][0]["rows"][0]["data"],
+            )
+        )
+
+    def test_dense_prefix_capture_loaded_snapshot_preserves_existing_without_overwrite(self):
+        metadata = MagicMock()
+        metadata.attn_state = AscendAttentionState.DecodeOnly
+        metadata.num_decode_tokens = 1
+        metadata.block_table = torch.tensor([[1, 3]], dtype=torch.long)
+        metadata.indexer_block_table = torch.tensor([[0, 2]], dtype=torch.long)
+        metadata.seq_lens = torch.tensor([6], dtype=torch.long)
+        metadata.seq_lens_cpu = metadata.seq_lens
+
+        pre_scatter = torch.arange(4 * 4, dtype=torch.float32).reshape(4, 4, 1, 1)
+        post_scatter = pre_scatter + 1000
+        forward_context = MagicMock()
+        forward_context.lmcache_dense_prefix_loaded = True
+        forward_context.dsa_prompt_lens = None
+
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            patch.dict(
+                os.environ,
+                {
+                    "VLLM_ASCEND_DENSE_PREFIX_COMPARE": "1",
+                    "VLLM_ASCEND_DENSE_PREFIX_COMPARE_LAYER": "all",
+                    "VLLM_ASCEND_DENSE_PREFIX_FILE_DIR": tmpdir,
+                    "VLLM_ASCEND_DENSE_PREFIX_FILE_SYNC": "0",
+                },
+                clear=False,
+            ),
+            patch(
+                "vllm_ascend.attention.sfa_v1.get_forward_context",
+                return_value=forward_context,
+            ),
+        ):
+            first = _dense_prefix_capture_loaded_snapshot(
+                MagicMock(),
+                layer_name="model.layers.0.self_attn.attn",
+                kv_cache=[pre_scatter, pre_scatter + 100, pre_scatter + 200],
+                attn_metadata=metadata,
+                reason="pre_scatter",
+                overwrite=True,
+            )
+            second = _dense_prefix_capture_loaded_snapshot(
+                MagicMock(),
+                layer_name="model.layers.0.self_attn.attn",
+                kv_cache=[post_scatter, post_scatter + 100, post_scatter + 200],
+                attn_metadata=metadata,
+                reason="fallback",
+                overwrite=False,
+            )
+            loaded = _dense_prefix_full_snapshot_load(
+                "model.layers.0.self_attn.attn",
+                "lmcache_loaded",
+            )
+
+        assert first is not None
+        assert second is not None
+        assert loaded is not None
+        self.assertTrue(
+            torch.equal(
+                loaded["caches"][0]["rows"][0]["data"],
+                first["caches"][0]["rows"][0]["data"],
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                second["caches"][0]["rows"][0]["data"],
+                first["caches"][0]["rows"][0]["data"],
+            )
+        )
+
+    def test_dense_prefix_snapshot_uses_metadata_prompt_lens_fallback(self):
+        metadata = MagicMock()
+        metadata.attn_state = AscendAttentionState.DecodeOnly
+        metadata.num_decode_tokens = 1
+        metadata.block_table = torch.tensor([[1, 3]], dtype=torch.long)
+        metadata.indexer_block_table = torch.tensor([[0, 2]], dtype=torch.long)
+        metadata.seq_lens = torch.tensor([7], dtype=torch.long)
+        metadata.seq_lens_cpu = metadata.seq_lens
+        metadata.prompt_lens = torch.tensor([6], dtype=torch.long)
+
+        kv0 = torch.arange(4 * 4, dtype=torch.float32).reshape(4, 4, 1, 1)
+        forward_context = MagicMock()
+        forward_context.dsa_prompt_lens = None
+        forward_context.dsa_req_ids = ["r0"]
+
+        with patch(
+            "vllm_ascend.attention.sfa_v1.get_forward_context",
+            return_value=forward_context,
+        ):
+            payload, error = _dense_prefix_full_snapshot_build(
+                source="lmcache_loaded",
+                layer_name="model.layers.0.self_attn.attn",
+                kv_cache=[kv0, kv0 + 100, kv0 + 200],
+                attn_metadata=metadata,
+                include_latent=True,
+                include_index=True,
+                require_complete=False,
+                allow_decode=True,
+            )
+
+        self.assertIsNone(error)
+        assert payload is not None
+        self.assertEqual(payload["meta"]["lengths"], [6])
+        self.assertTrue(
+            torch.equal(payload["meta"]["prompt_lens"], torch.tensor([6]))
+        )
+
+    def test_dense_prefix_compare_cache_synchronizes_before_sampling(self):
+        class Owner:
+            pass
+
+        metadata = MagicMock()
+        metadata.attn_state = AscendAttentionState.ChunkedPrefill
+        metadata.num_actual_tokens = 4
+        metadata.num_decode_tokens = 0
+        metadata.seq_lens = torch.tensor([4], dtype=torch.long)
+        metadata.prompt_lens = None
+        metadata.block_table = torch.tensor([[0]], dtype=torch.long)
+
+        kv_cache = [
+            torch.zeros(1, 4, 1, 1),
+            torch.ones(1, 4, 1, 1),
+        ]
+        fake_npu = MagicMock()
+
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            patch.dict(
+                os.environ,
+                {
+                    "VLLM_ASCEND_DENSE_PREFIX_COMPARE": "1",
+                    "VLLM_ASCEND_DENSE_PREFIX_COMPARE_LAYER": "all",
+                    "VLLM_ASCEND_DENSE_PREFIX_FILE_DIR": tmpdir,
+                    "VLLM_ASCEND_DENSE_PREFIX_FILE_SYNC": "1",
+                },
+                clear=True,
+            ),
+            patch("vllm_ascend.attention.sfa_v1.torch.npu", fake_npu, create=True),
+        ):
+            _dense_prefix_compare_cache(
+                Owner(),
+                stage="capture_before_store",
+                layer_name="model.layers.0.self_attn.attn",
+                kv_cache=kv_cache,
+                attn_metadata=metadata,
+                include_latent=True,
+                include_index=False,
+            )
+
+        fake_npu.synchronize.assert_called_once()
 
     def test_diagnostics_are_opt_in_by_default(self):
         with patch.dict(os.environ, {}, clear=True):

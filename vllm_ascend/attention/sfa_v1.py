@@ -78,15 +78,24 @@ if TYPE_CHECKING:
 # token count limits within bmm_transpose operator
 BMM_TRANS_MAX_SUPPORTED_TOKENS = 1024
 
-print(
-    "[SFA_V1_IMPORT_TRACE] imported "
-    f"file={__file__} pid={os.getpid()} "
-    f"path_trace_env={os.environ.get('VLLM_ASCEND_SFA_V1_PATH_TRACE')} "
-    f"lmcache_diag_env={os.environ.get('LMCACHE_DENSE_PREFIX_DIAG')} "
-    f"compare_env={os.environ.get('VLLM_ASCEND_DENSE_PREFIX_COMPARE')}",
-    file=sys.stderr,
-    flush=True,
-)
+if any(
+    (os.environ.get(name) or "").strip().lower()
+    not in ("", "0", "false", "off", "no")
+    for name in (
+        "VLLM_ASCEND_SFA_V1_PATH_TRACE",
+        "LMCACHE_DENSE_PREFIX_DIAG",
+        "VLLM_ASCEND_DENSE_PREFIX_COMPARE",
+    )
+):
+    print(
+        "[SFA_V1_IMPORT_TRACE] imported "
+        f"file={__file__} pid={os.getpid()} "
+        f"path_trace_env={os.environ.get('VLLM_ASCEND_SFA_V1_PATH_TRACE')} "
+        f"lmcache_diag_env={os.environ.get('LMCACHE_DENSE_PREFIX_DIAG')} "
+        f"compare_env={os.environ.get('VLLM_ASCEND_DENSE_PREFIX_COMPARE')}",
+        file=sys.stderr,
+        flush=True,
+    )
 
 
 def _dsa_debug_layer_enabled(layer_name: str) -> bool:
@@ -836,7 +845,6 @@ def _dsa_req_id_key(req_id: object) -> str:
     return str(req_id)
 
 
-_DENSE_PREFIX_COMPARE_BASELINE: dict[tuple[str, str], dict[str, Any]] = {}
 _DENSE_PREFIX_COMPARE_LOCKED_KEYS: set[tuple[str, str]] = set()
 _DENSE_PREFIX_COMPARE_EMITTED_KEYS: set[tuple[str, str, str]] = set()
 
@@ -1078,6 +1086,1074 @@ def _dense_prefix_compare_diff(
     return result
 
 
+def _dense_prefix_file_dir() -> str:
+    return os.environ.get(
+        "VLLM_ASCEND_DENSE_PREFIX_FILE_DIR",
+        "/tmp/dense_prefix_file_debug",
+    )
+
+
+def _dense_prefix_file_mask() -> int:
+    try:
+        return int(os.environ.get("VLLM_ASCEND_DENSE_PREFIX_FILE_MASK", "7"), 0)
+    except ValueError:
+        return 7
+
+
+def _dense_prefix_file_replay_enabled() -> bool:
+    return _dsa_env_flag("VLLM_ASCEND_DENSE_PREFIX_FILE_REPLAY", True)
+
+
+def _dense_prefix_file_partial_replay_enabled() -> bool:
+    return _dsa_env_flag("VLLM_ASCEND_DENSE_PREFIX_FILE_PARTIAL_REPLAY", False)
+
+
+def _dense_prefix_file_sync_enabled() -> bool:
+    return _dsa_env_flag("VLLM_ASCEND_DENSE_PREFIX_FILE_SYNC", True)
+
+
+def _dense_prefix_file_synchronize(
+    owner: object | None = None,
+    *,
+    layer_name: str | None = None,
+    reason: str | None = None,
+) -> None:
+    if not _dense_prefix_file_sync_enabled() or not hasattr(torch, "npu"):
+        return
+    try:
+        torch.npu.synchronize()
+    except Exception:
+        if owner is not None and _dsa_kv_debug_error_allowed(owner):
+            logger.exception(
+                "[DENSE_PREFIX_FILE] sync_failed layer=%s reason=%s",
+                layer_name,
+                reason,
+            )
+
+
+def _dense_prefix_file_tp_tag() -> str:
+    rank_tag = _dsa_kv_trace_rank_tag()
+    tp_world: Any = os.environ.get("WORLD_SIZE", "na")
+    tp_rank: Any = os.environ.get("LOCAL_RANK") or os.environ.get("RANK") or "na"
+    try:
+        tp_world = get_tensor_model_parallel_world_size()
+    except Exception:
+        pass
+    try:
+        tp_group = get_tp_group()
+        group_rank = getattr(tp_group, "rank_in_group", None)
+        if callable(group_rank):
+            group_rank = group_rank()
+        if group_rank is not None:
+            tp_rank = group_rank
+        group_world = getattr(tp_group, "world_size", None)
+        if callable(group_world):
+            group_world = group_world()
+        if group_world is not None:
+            tp_world = group_world
+    except Exception:
+        pass
+    return f"{rank_tag}_tp{tp_rank}_of{tp_world}"
+
+
+def _dense_prefix_file_key(value: str) -> str:
+    return _dsa_kv_trace_layer_key(str(value))
+
+
+def _dense_prefix_file_layer_dir(layer_name: str) -> str:
+    return os.path.join(
+        _dense_prefix_file_dir(),
+        _dense_prefix_file_tp_tag(),
+        _dsa_kv_trace_layer_key(layer_name),
+    )
+
+
+def _dense_prefix_compare_sample_path(
+    layer_name: str,
+    label: str,
+    stage: str,
+) -> str:
+    return os.path.join(
+        _dense_prefix_file_layer_dir(layer_name),
+        "samples",
+        f"{_dense_prefix_file_key(stage)}__{_dense_prefix_file_key(label)}.pt",
+    )
+
+
+def _dense_prefix_full_snapshot_path(layer_name: str, source: str) -> str:
+    return os.path.join(
+        _dense_prefix_file_layer_dir(layer_name),
+        "full",
+        f"{_dense_prefix_file_key(source)}.pt",
+    )
+
+
+def _dense_prefix_to_cpu_long(value: Any) -> torch.Tensor | None:
+    if value is None:
+        return None
+    try:
+        if isinstance(value, torch.Tensor):
+            return value.detach().to(device="cpu", dtype=torch.long)
+        return torch.as_tensor(value, dtype=torch.long, device="cpu")
+    except Exception:
+        return None
+
+
+def _dense_prefix_compare_load_sample(
+    layer_name: str,
+    label: str,
+    stage: str = "lmcache_saved",
+) -> dict[str, Any] | None:
+    path = _dense_prefix_compare_sample_path(layer_name, label, stage)
+    if not os.path.exists(path):
+        return None
+    try:
+        payload = torch.load(path, map_location="cpu")
+    except Exception:
+        return None
+    if isinstance(payload, dict) and isinstance(payload.get("sample"), dict):
+        return payload["sample"]
+    if isinstance(payload, dict):
+        return payload
+    return None
+
+
+def _dense_prefix_compare_save_sample(
+    *,
+    layer_name: str,
+    label: str,
+    stage: str,
+    sample: dict[str, Any],
+    preserve_longer: bool,
+) -> str | None:
+    path = _dense_prefix_compare_sample_path(layer_name, label, stage)
+    if preserve_longer and os.path.exists(path):
+        previous = _dense_prefix_compare_load_sample(layer_name, label, stage)
+        if previous is not None and int(previous.get("seq_len", -1)) >= int(
+            sample.get("seq_len", -1)
+        ):
+            return path
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp_path = f"{path}.tmp"
+        torch.save(
+            {
+                "meta": {
+                    "layer_name": layer_name,
+                    "label": label,
+                    "stage": stage,
+                    "rank_tag": _dsa_kv_trace_rank_tag(),
+                    "tp_tag": _dense_prefix_file_tp_tag(),
+                },
+                "sample": sample,
+            },
+            tmp_path,
+        )
+        os.replace(tmp_path, path)
+        return path
+    except Exception:
+        return None
+
+
+def _dense_prefix_snapshot_attn_is_decode(attn_metadata: Any) -> bool:
+    return getattr(attn_metadata, "attn_state", None) in (
+        AscendAttentionState.DecodeOnly,
+        AscendAttentionState.SpecDecoding,
+    )
+
+
+def _dense_prefix_snapshot_prompt_lens(
+    attn_metadata: Any,
+    fc: Any | None,
+) -> torch.Tensor | None:
+    for value in (
+        getattr(fc, "dsa_prompt_lens", None) if fc is not None else None,
+        getattr(attn_metadata, "prompt_lens", None),
+    ):
+        prompt_lens = _dense_prefix_to_cpu_long(value)
+        if prompt_lens is None or prompt_lens.numel() == 0:
+            continue
+        try:
+            if bool((prompt_lens > 0).any().item()):
+                return prompt_lens
+        except Exception:
+            continue
+    return None
+
+
+def _dense_prefix_snapshot_rows_and_lengths(
+    attn_metadata: Any,
+    *,
+    require_complete: bool,
+    allow_decode: bool,
+) -> tuple[list[int], list[int]]:
+    if _dense_prefix_snapshot_attn_is_decode(attn_metadata) and not allow_decode:
+        return [], []
+
+    block_table = getattr(attn_metadata, "block_table", None)
+    if block_table is None:
+        return [], []
+
+    fc = None
+    try:
+        fc = get_forward_context()
+    except Exception:
+        pass
+
+    req_ids = getattr(fc, "dsa_req_ids", None) if fc is not None else None
+    if req_ids is None:
+        req_ids = getattr(attn_metadata, "req_ids", None)
+
+    prompt_lens = _dense_prefix_snapshot_prompt_lens(attn_metadata, fc)
+    seq_lens_src = getattr(attn_metadata, "seq_lens_cpu", None)
+    if seq_lens_src is None:
+        seq_lens_src = getattr(attn_metadata, "seq_lens", None)
+    seq_lens = _dense_prefix_to_cpu_long(seq_lens_src)
+
+    row_count = int(block_table.shape[0])
+    if req_ids is not None:
+        row_count = min(row_count, len(req_ids))
+    if seq_lens is not None:
+        row_count = min(row_count, int(seq_lens.numel()))
+    if prompt_lens is not None:
+        row_count = min(row_count, int(prompt_lens.numel()))
+    if row_count <= 0 or seq_lens is None:
+        return [], []
+
+    prefill_start = 0
+    if not _dense_prefix_snapshot_attn_is_decode(attn_metadata):
+        prefill_start = min(
+            int(getattr(attn_metadata, "num_decode_tokens", 0) or 0),
+            row_count,
+        )
+
+    rows: list[int] = []
+    lengths: list[int] = []
+    for row in range(prefill_start, row_count):
+        seq_len = int(seq_lens[row].item())
+        if seq_len <= 0:
+            continue
+        if prompt_lens is not None:
+            prompt_len = int(prompt_lens[row].item())
+            if prompt_len <= 0:
+                continue
+            if require_complete and seq_len < prompt_len:
+                continue
+            seq_len = min(seq_len, prompt_len)
+        rows.append(row)
+        lengths.append(seq_len)
+    return rows, lengths
+
+
+def _dense_prefix_collect_cache_rows(
+    *,
+    cache: torch.Tensor,
+    block_table: torch.Tensor,
+    rows: list[int],
+    lengths: list[int],
+) -> list[dict[str, Any]]:
+    block_size = int(cache.shape[1])
+    max_logical_blocks = int(block_table.shape[1])
+    max_physical_blocks = int(cache.shape[0])
+    row_payloads: list[dict[str, Any]] = []
+
+    for row, length in zip(rows, lengths, strict=False):
+        num_blocks = min(
+            (int(length) + block_size - 1) // block_size,
+            max_logical_blocks,
+        )
+        if num_blocks <= 0:
+            continue
+        block_ids = block_table[row, :num_blocks].to(torch.long)
+        valid = (block_ids >= 0) & (block_ids < max_physical_blocks)
+        if not bool(valid.detach().to(device="cpu").any().item()):
+            continue
+        safe_block_ids = torch.clamp(
+            block_ids,
+            min=0,
+            max=max(max_physical_blocks - 1, 0),
+        ).to(device=cache.device)
+        data = cache.index_select(0, safe_block_ids)
+        row_payloads.append(
+            {
+                "row": int(row),
+                "length": int(length),
+                "block_ids": block_ids.detach().to(device="cpu", dtype=torch.long),
+                "valid": valid.detach().to(device="cpu"),
+                "data": data.detach().to(device="cpu", copy=True),
+            }
+        )
+    return row_payloads
+
+
+def _dense_prefix_full_snapshot_build(
+    *,
+    source: str,
+    layer_name: str,
+    kv_cache: tuple[torch.Tensor, ...] | list[torch.Tensor] | None,
+    attn_metadata: Any,
+    include_latent: bool,
+    include_index: bool,
+    require_complete: bool,
+    allow_decode: bool,
+) -> tuple[dict[str, Any] | None, str | None]:
+    if kv_cache is None:
+        return None, "kv_cache_missing"
+
+    rows, lengths = _dense_prefix_snapshot_rows_and_lengths(
+        attn_metadata,
+        require_complete=require_complete,
+        allow_decode=allow_decode,
+    )
+    if not rows:
+        return None, "rows_missing"
+
+    block_table = getattr(attn_metadata, "block_table", None)
+    if block_table is None:
+        return None, "block_table_missing"
+    indexer_block_table = (
+        getattr(attn_metadata, "indexer_block_table", None)
+        if getattr(attn_metadata, "indexer_block_table", None) is not None
+        else block_table
+    )
+
+    mask = _dense_prefix_file_mask()
+    cache_specs: list[tuple[int, torch.Tensor, torch.Tensor, str, str]] = []
+    if include_latent and len(kv_cache) >= 2:
+        if mask & 0x1:
+            cache_specs.append(
+                (0, kv_cache[0], block_table, "block_table", "latent_nope")
+            )
+        if mask & 0x2:
+            cache_specs.append(
+                (1, kv_cache[1], block_table, "block_table", "latent_pe")
+            )
+    if include_index and len(kv_cache) >= 3 and (mask & 0x4):
+        cache_specs.append(
+            (2, kv_cache[2], indexer_block_table, "indexer_block_table", "dsa_index")
+        )
+    if not cache_specs:
+        return None, "cache_specs_empty"
+
+    caches: dict[int, dict[str, Any]] = {}
+    for cache_idx, cache, table, table_name, label in cache_specs:
+        if not isinstance(cache, torch.Tensor):
+            continue
+        caches[cache_idx] = {
+            "label": label,
+            "block_table": table_name,
+            "shape": tuple(cache.shape),
+            "dtype": str(cache.dtype),
+            "rows": _dense_prefix_collect_cache_rows(
+                cache=cache,
+                block_table=table,
+                rows=rows,
+                lengths=lengths,
+            ),
+        }
+
+    if not caches:
+        return None, "caches_empty"
+
+    fc = None
+    try:
+        fc = get_forward_context()
+    except Exception:
+        pass
+    req_ids = getattr(fc, "dsa_req_ids", None) if fc is not None else None
+    req_id_rows = None
+    if req_ids is not None:
+        req_id_rows = [str(req_ids[row]) for row in rows if row < len(req_ids)]
+    prompt_lens = _dense_prefix_snapshot_prompt_lens(attn_metadata, fc)
+
+    return {
+        "meta": {
+            "source": source,
+            "layer_name": layer_name,
+            "rank_tag": _dsa_kv_trace_rank_tag(),
+            "tp_tag": _dense_prefix_file_tp_tag(),
+            "attn_state": _dsa_kv_trace_attn_state(attn_metadata),
+            "rows": rows,
+            "lengths": lengths,
+            "max_length": max(lengths) if lengths else 0,
+            "req_ids": req_id_rows,
+            "prompt_lens": None if prompt_lens is None else prompt_lens[rows],
+            "block_size": int(kv_cache[0].shape[1]) if len(kv_cache) > 0 else None,
+            "block_table_shape": tuple(block_table.shape),
+            "indexer_block_table_shape": tuple(indexer_block_table.shape),
+        },
+        "caches": caches,
+    }, None
+
+
+def _dense_prefix_full_snapshot_load(
+    layer_name: str,
+    source: str,
+) -> dict[str, Any] | None:
+    path = _dense_prefix_full_snapshot_path(layer_name, source)
+    if not os.path.exists(path):
+        return None
+    try:
+        payload = torch.load(path, map_location="cpu")
+    except Exception:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _dense_prefix_full_snapshot_save_payload(
+    *,
+    layer_name: str,
+    source: str,
+    payload: dict[str, Any],
+    preserve_longer: bool,
+) -> str | None:
+    path = _dense_prefix_full_snapshot_path(layer_name, source)
+    if preserve_longer and os.path.exists(path):
+        previous = _dense_prefix_full_snapshot_load(layer_name, source)
+        previous_len = int((previous or {}).get("meta", {}).get("max_length", -1))
+        current_len = int(payload.get("meta", {}).get("max_length", -1))
+        if previous_len >= current_len:
+            return path
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp_path = f"{path}.tmp"
+        torch.save(payload, tmp_path)
+        os.replace(tmp_path, path)
+        return path
+    except Exception:
+        return None
+
+
+def _dense_prefix_full_snapshot_save(
+    owner: object,
+    *,
+    source: str,
+    layer_name: str,
+    kv_cache: tuple[torch.Tensor, ...] | list[torch.Tensor] | None,
+    attn_metadata: Any,
+    include_latent: bool = True,
+    include_index: bool = True,
+    require_complete: bool = True,
+    allow_decode: bool = False,
+    preserve_longer: bool = True,
+) -> None:
+    if not _dense_prefix_compare_enabled():
+        return
+    if not _dense_prefix_compare_layer_enabled(layer_name):
+        return
+    try:
+        _dense_prefix_file_synchronize(
+            owner, layer_name=layer_name, reason=f"full_snapshot_save:{source}"
+        )
+        payload, error = _dense_prefix_full_snapshot_build(
+            source=source,
+            layer_name=layer_name,
+            kv_cache=kv_cache,
+            attn_metadata=attn_metadata,
+            include_latent=include_latent,
+            include_index=include_index,
+            require_complete=require_complete,
+            allow_decode=allow_decode,
+        )
+        if payload is None:
+            if _dense_prefix_compare_log_allowed(
+                owner, "file_snapshot_skip", layer_name, source
+            ):
+                logger.warning(
+                    "[DENSE_PREFIX_FILE] skip_save source=%s layer=%s error=%s",
+                    source,
+                    layer_name,
+                    error,
+                )
+            return
+        path = _dense_prefix_full_snapshot_save_payload(
+            layer_name=layer_name,
+            source=source,
+            payload=payload,
+            preserve_longer=preserve_longer,
+        )
+        if path and _dense_prefix_compare_log_allowed(
+            owner, "file_snapshot_save", layer_name, source
+        ):
+            total_blocks = sum(
+                int(row_payload["data"].shape[0])
+                for cache_payload in payload["caches"].values()
+                for row_payload in cache_payload.get("rows", [])
+            )
+            _sfa_force_print(
+                "[DENSE_PREFIX_FILE] "
+                f"saved source={source} layer={layer_name} "
+                f"cache_indices={sorted(payload['caches'])} "
+                f"rows={payload['meta']['rows']} lengths={payload['meta']['lengths']} "
+                f"blocks={total_blocks} path={path}"
+            )
+            logger.warning(
+                "[DENSE_PREFIX_FILE] saved source=%s layer=%s cache_indices=%s "
+                "rows=%s lengths=%s blocks=%s path=%s",
+                source,
+                layer_name,
+                sorted(payload["caches"]),
+                payload["meta"]["rows"],
+                payload["meta"]["lengths"],
+                total_blocks,
+                path,
+            )
+    except Exception:
+        if _dsa_kv_debug_error_allowed(owner):
+            logger.exception(
+                "[DENSE_PREFIX_FILE] save_failed source=%s layer=%s",
+                source,
+                layer_name,
+            )
+
+
+def _dense_prefix_full_snapshot_diff(
+    baseline: dict[str, Any],
+    current: dict[str, Any],
+) -> dict[str, Any]:
+    baseline_caches = baseline.get("caches", {})
+    current_caches = current.get("caches", {})
+    baseline_keys = {int(k) for k in baseline_caches}
+    current_keys = {int(k) for k in current_caches}
+    baseline_meta = baseline.get("meta", {})
+    current_meta = current.get("meta", {})
+    baseline_rows = list(baseline_meta.get("rows") or [])
+    current_rows = list(current_meta.get("rows") or [])
+    baseline_lengths = list(baseline_meta.get("lengths") or [])
+    current_lengths = list(current_meta.get("lengths") or [])
+    result: dict[str, Any] = {
+        "match": True,
+        "same_cache_indices": baseline_keys == current_keys,
+        "baseline_indices": sorted(baseline_keys),
+        "current_indices": sorted(current_keys),
+        "same_rows": baseline_rows == current_rows,
+        "baseline_rows": baseline_rows,
+        "current_rows": current_rows,
+        "same_lengths": baseline_lengths == current_lengths,
+        "baseline_lengths": baseline_lengths,
+        "current_lengths": current_lengths,
+    }
+    if (
+        baseline_keys != current_keys
+        or baseline_rows != current_rows
+        or baseline_lengths != current_lengths
+    ):
+        result["match"] = False
+
+    per_cache: dict[int, Any] = {}
+    for cache_idx in sorted(baseline_keys | current_keys):
+        base_cache = baseline_caches.get(cache_idx) or baseline_caches.get(str(cache_idx))
+        cur_cache = current_caches.get(cache_idx) or current_caches.get(str(cache_idx))
+        if base_cache is None or cur_cache is None:
+            per_cache[cache_idx] = {
+                "match": False,
+                "reason": "cache_missing",
+                "baseline_present": base_cache is not None,
+                "current_present": cur_cache is not None,
+            }
+            result["match"] = False
+            continue
+
+        base_rows = base_cache.get("rows") or []
+        cur_rows = cur_cache.get("rows") or []
+        cache_result: dict[str, Any] = {
+            "match": True,
+            "label": base_cache.get("label"),
+            "baseline_rows": len(base_rows),
+            "current_rows": len(cur_rows),
+            "same_row_count": len(base_rows) == len(cur_rows),
+        }
+        if len(base_rows) != len(cur_rows):
+            cache_result["match"] = False
+
+        for row_idx, (base_row, cur_row) in enumerate(
+            zip(base_rows, cur_rows, strict=False)
+        ):
+            base_data = base_row.get("data")
+            cur_data = cur_row.get("data")
+            if not isinstance(base_data, torch.Tensor) or not isinstance(
+                cur_data, torch.Tensor
+            ):
+                cache_result.update(
+                    {
+                        "match": False,
+                        "first_bad_row": row_idx,
+                        "reason": "row_data_missing",
+                    }
+                )
+                break
+            if tuple(base_data.shape) != tuple(cur_data.shape):
+                cache_result.update(
+                    {
+                        "match": False,
+                        "first_bad_row": row_idx,
+                        "reason": "shape_mismatch",
+                        "baseline_shape": tuple(base_data.shape),
+                        "current_shape": tuple(cur_data.shape),
+                    }
+                )
+                break
+            base_len = int(base_row.get("length", -1))
+            cur_len = int(cur_row.get("length", -1))
+            if base_len != cur_len:
+                cache_result.update(
+                    {
+                        "match": False,
+                        "first_bad_row": row_idx,
+                        "reason": "row_length_mismatch",
+                        "baseline_length": base_len,
+                        "current_length": cur_len,
+                    }
+                )
+                break
+            equal = torch.equal(base_data, cur_data)
+            if not equal:
+                base_float = base_data.to(dtype=torch.float32)
+                cur_float = cur_data.to(dtype=torch.float32)
+                diff = (base_float - cur_float).abs()
+                first = diff.reshape(-1).nonzero(as_tuple=False)
+                first_idx = int(first[0].item()) if first.numel() > 0 else None
+                cache_result.update(
+                    {
+                        "match": False,
+                        "first_bad_row": row_idx,
+                        "reason": "value_mismatch",
+                        "max_abs_diff": float(diff.max().item()),
+                        "first_diff_flat_index": first_idx,
+                    }
+                )
+                if first_idx is not None:
+                    cache_result["baseline_value"] = float(
+                        base_float.reshape(-1)[first_idx].item()
+                    )
+                    cache_result["current_value"] = float(
+                        cur_float.reshape(-1)[first_idx].item()
+                    )
+                break
+
+        if not cache_result["match"]:
+            result["match"] = False
+        per_cache[cache_idx] = cache_result
+
+    result["per_cache"] = per_cache
+    return result
+
+
+def _dense_prefix_replay_cache_rows(
+    *,
+    cache: torch.Tensor,
+    block_table: torch.Tensor,
+    target_rows: list[int],
+    target_lengths: list[int],
+    cache_payload: dict[str, Any],
+) -> int:
+    saved_rows = cache_payload.get("rows") or []
+    if not saved_rows:
+        return 0
+    block_size = int(cache.shape[1])
+    max_logical_blocks = int(block_table.shape[1])
+    max_physical_blocks = int(cache.shape[0])
+    copied_blocks = 0
+    for idx in range(min(len(saved_rows), len(target_rows), len(target_lengths))):
+        row = target_rows[idx]
+        target_len = target_lengths[idx]
+        saved = saved_rows[idx]
+        saved_data = saved.get("data")
+        if not isinstance(saved_data, torch.Tensor) or saved_data.numel() == 0:
+            continue
+        partial_replay = _dense_prefix_file_partial_replay_enabled()
+        saved_len = int(saved.get("length", target_len))
+        replay_len = min(int(target_len), saved_len) if partial_replay else int(target_len)
+        num_blocks = min(
+            int(saved_data.shape[0]),
+            (int(replay_len) + block_size - 1) // block_size,
+            max_logical_blocks,
+        )
+        if num_blocks <= 0:
+            continue
+        target_block_ids = block_table[row, :num_blocks].detach().to(
+            device="cpu", dtype=torch.long
+        )
+        target_valid = (
+            (target_block_ids >= 0)
+            & (target_block_ids < max_physical_blocks)
+        )
+        saved_valid = saved.get("valid")
+        if isinstance(saved_valid, torch.Tensor):
+            target_valid = target_valid & saved_valid[:num_blocks].to(torch.bool)
+        if not bool(target_valid.any().item()):
+            continue
+        if not partial_replay:
+            target_ids = target_block_ids[target_valid].to(device=cache.device)
+            source = saved_data[:num_blocks][target_valid].to(
+                device=cache.device,
+                dtype=cache.dtype,
+            )
+            cache.index_copy_(0, target_ids, source)
+            copied_blocks += int(target_ids.numel())
+            continue
+        for block_idx in range(num_blocks):
+            if not bool(target_valid[block_idx].item()):
+                continue
+            target_block_id = int(target_block_ids[block_idx].item())
+            tokens_in_block = min(
+                block_size,
+                max(0, replay_len - block_idx * block_size),
+            )
+            if tokens_in_block <= 0:
+                continue
+            source_block = saved_data[block_idx].to(
+                device=cache.device,
+                dtype=cache.dtype,
+            )
+            if tokens_in_block == block_size:
+                cache[target_block_id].copy_(source_block)
+            else:
+                cache[target_block_id, :tokens_in_block].copy_(
+                    source_block[:tokens_in_block]
+                )
+            copied_blocks += 1
+    return copied_blocks
+
+
+def _dense_prefix_full_snapshot_replay(
+    owner: object,
+    *,
+    source: str,
+    layer_name: str,
+    kv_cache: tuple[torch.Tensor, ...] | list[torch.Tensor] | None,
+    attn_metadata: Any,
+) -> dict[int, int]:
+    copied: dict[int, int] = {}
+    if kv_cache is None:
+        return copied
+    payload = _dense_prefix_full_snapshot_load(layer_name, source)
+    if payload is None:
+        return copied
+    rows, lengths = _dense_prefix_snapshot_rows_and_lengths(
+        attn_metadata,
+        require_complete=False,
+        allow_decode=True,
+    )
+    if not rows:
+        return copied
+    block_table = getattr(attn_metadata, "block_table", None)
+    if block_table is None:
+        return copied
+    indexer_block_table = (
+        getattr(attn_metadata, "indexer_block_table", None)
+        if getattr(attn_metadata, "indexer_block_table", None) is not None
+        else block_table
+    )
+    caches = payload.get("caches", {})
+    for cache_idx in (0, 1, 2):
+        if cache_idx >= len(kv_cache):
+            continue
+        cache_payload = caches.get(cache_idx) or caches.get(str(cache_idx))
+        if not cache_payload:
+            continue
+        table = indexer_block_table if cache_idx == 2 else block_table
+        copied[cache_idx] = _dense_prefix_replay_cache_rows(
+            cache=kv_cache[cache_idx],
+            block_table=table,
+            target_rows=rows,
+            target_lengths=lengths,
+            cache_payload=cache_payload,
+        )
+    if copied:
+        _dense_prefix_file_synchronize(
+            owner, layer_name=layer_name, reason=f"full_snapshot_replay:{source}"
+        )
+    if copied and _dense_prefix_compare_log_allowed(
+        owner, "file_replay", layer_name, source
+    ):
+        _sfa_force_print(
+            "[DENSE_PREFIX_FILE] "
+            f"replayed source={source} layer={layer_name} copied_blocks={copied}"
+        )
+        logger.warning(
+            "[DENSE_PREFIX_FILE] replayed source=%s layer=%s copied_blocks=%s",
+            source,
+            layer_name,
+            copied,
+        )
+    return copied
+
+
+def _dense_prefix_compare_full_sources_and_maybe_replay(
+    owner: object,
+    *,
+    layer_name: str,
+    kv_cache: tuple[torch.Tensor, ...] | list[torch.Tensor] | None,
+    attn_metadata: Any,
+    replay_on_mismatch: bool = True,
+) -> None:
+    if not _dense_prefix_compare_enabled():
+        return
+    if not _dense_prefix_compare_layer_enabled(layer_name):
+        return
+    if (
+        not _dense_prefix_compare_lmcache_loaded()
+        and not _dense_prefix_compare_allow_no_lmcache_load()
+    ):
+        return
+    try:
+        _dense_prefix_file_synchronize(
+            owner,
+            layer_name=layer_name,
+            reason="full_snapshot_compare:lmcache_loaded",
+        )
+        loaded_payload, error = _dense_prefix_full_snapshot_build(
+            source="lmcache_loaded",
+            layer_name=layer_name,
+            kv_cache=kv_cache,
+            attn_metadata=attn_metadata,
+            include_latent=True,
+            include_index=True,
+            require_complete=False,
+            allow_decode=True,
+        )
+        if loaded_payload is None:
+            if _dense_prefix_compare_log_allowed(
+                owner, "file_compare_skip", layer_name, "lmcache_loaded"
+            ):
+                logger.warning(
+                    "[DENSE_PREFIX_FILE_COMPARE] skip layer=%s error=%s",
+                    layer_name,
+                    error,
+                )
+            return
+        _dense_prefix_full_snapshot_save_payload(
+            layer_name=layer_name,
+            source="lmcache_loaded",
+            payload=loaded_payload,
+            preserve_longer=False,
+        )
+
+        saved_payload = _dense_prefix_full_snapshot_load(layer_name, "lmcache_saved")
+        dev_payload = _dense_prefix_full_snapshot_load(layer_name, "dev_lmy")
+        sources = {
+            "lmcache_saved": saved_payload,
+            "dev_lmy": dev_payload,
+            "lmcache_loaded": loaded_payload,
+        }
+        for baseline_name, current_name in (
+            ("lmcache_saved", "lmcache_loaded"),
+            ("dev_lmy", "lmcache_loaded"),
+            ("dev_lmy", "lmcache_saved"),
+        ):
+            baseline = sources[baseline_name]
+            current = sources[current_name]
+            if baseline is None or current is None:
+                if _dense_prefix_compare_log_allowed(
+                    owner,
+                    "file_compare_missing",
+                    layer_name,
+                    f"{baseline_name}_vs_{current_name}",
+                ):
+                    logger.warning(
+                        "[DENSE_PREFIX_FILE_COMPARE] missing layer=%s pair=%s_vs_%s "
+                        "baseline_present=%s current_present=%s",
+                        layer_name,
+                        baseline_name,
+                        current_name,
+                        baseline is not None,
+                        current is not None,
+                    )
+                continue
+            diff = _dense_prefix_full_snapshot_diff(baseline, current)
+            pair = f"{baseline_name}_vs_{current_name}"
+            log_fn = logger.warning if diff.get("match") else logger.error
+            if _dense_prefix_compare_log_allowed(
+                owner, "file_compare", layer_name, pair
+            ):
+                _sfa_force_print(
+                    "[DENSE_PREFIX_FILE_COMPARE] "
+                    f"layer={layer_name} pair={pair} match={diff.get('match')} "
+                    f"diff={diff}"
+                )
+                log_fn(
+                    "[DENSE_PREFIX_FILE_COMPARE] layer=%s pair=%s match=%s diff=%s",
+                    layer_name,
+                    pair,
+                    diff.get("match"),
+                    diff,
+                )
+            if (
+                baseline_name == "dev_lmy"
+                and current_name == "lmcache_loaded"
+                and not diff.get("match")
+                and dev_payload is not None
+                and _dense_prefix_file_replay_enabled()
+                and replay_on_mismatch
+            ):
+                _dense_prefix_full_snapshot_replay(
+                    owner,
+                    source="dev_lmy",
+                    layer_name=layer_name,
+                    kv_cache=kv_cache,
+                    attn_metadata=attn_metadata,
+                )
+                break
+    except Exception:
+        if _dsa_kv_debug_error_allowed(owner):
+            logger.exception(
+                "[DENSE_PREFIX_FILE_COMPARE] failed layer=%s",
+                layer_name,
+            )
+
+
+def _dense_prefix_capture_loaded_snapshot(
+    owner: object,
+    *,
+    layer_name: str,
+    kv_cache: tuple[torch.Tensor, ...] | list[torch.Tensor] | None,
+    attn_metadata: Any,
+    reason: str,
+    overwrite: bool,
+) -> dict[str, Any] | None:
+    if not _dense_prefix_compare_enabled():
+        return None
+    if not _dense_prefix_compare_layer_enabled(layer_name):
+        return None
+    if (
+        not _dense_prefix_compare_lmcache_loaded()
+        and not _dense_prefix_compare_allow_no_lmcache_load()
+    ):
+        return None
+    if not overwrite:
+        existing = _dense_prefix_full_snapshot_load(layer_name, "lmcache_loaded")
+        if existing is not None:
+            return existing
+    _dense_prefix_file_synchronize(
+        owner,
+        layer_name=layer_name,
+        reason=f"{reason}:lmcache_loaded",
+    )
+    loaded_payload, error = _dense_prefix_full_snapshot_build(
+        source="lmcache_loaded",
+        layer_name=layer_name,
+        kv_cache=kv_cache,
+        attn_metadata=attn_metadata,
+        include_latent=True,
+        include_index=True,
+        require_complete=False,
+        allow_decode=True,
+    )
+    if loaded_payload is None:
+        if _dense_prefix_compare_log_allowed(
+            owner, f"{reason}_capture_skip", layer_name, "lmcache_loaded"
+        ):
+            logger.warning(
+                "[DENSE_PREFIX_FILE] loaded_capture_skip reason=%s layer=%s error=%s",
+                reason,
+                layer_name,
+                error,
+            )
+        return None
+    _dense_prefix_full_snapshot_save_payload(
+        layer_name=layer_name,
+        source="lmcache_loaded",
+        payload=loaded_payload,
+        preserve_longer=False,
+    )
+    if _dense_prefix_compare_log_allowed(
+        owner, f"{reason}_capture_loaded", layer_name, "lmcache_loaded"
+    ):
+        logger.warning(
+            "[DENSE_PREFIX_FILE] captured_loaded_snapshot reason=%s "
+            "layer=%s rows=%s lengths=%s",
+            reason,
+            layer_name,
+            loaded_payload.get("meta", {}).get("rows"),
+            loaded_payload.get("meta", {}).get("lengths"),
+        )
+    return loaded_payload
+
+
+def _dense_prefix_replay_dev_lmy_if_loaded_mismatch(
+    owner: object,
+    *,
+    layer_name: str,
+    kv_cache: tuple[torch.Tensor, ...] | list[torch.Tensor] | None,
+    attn_metadata: Any,
+) -> None:
+    if not _dense_prefix_compare_enabled():
+        return
+    if not _dense_prefix_compare_layer_enabled(layer_name):
+        return
+    if not _dense_prefix_file_replay_enabled():
+        return
+    if (
+        not _dense_prefix_compare_lmcache_loaded()
+        and not _dense_prefix_compare_allow_no_lmcache_load()
+    ):
+        return
+    try:
+        dev_payload = _dense_prefix_full_snapshot_load(layer_name, "dev_lmy")
+        loaded_payload = _dense_prefix_full_snapshot_load(layer_name, "lmcache_loaded")
+        if loaded_payload is None:
+            loaded_payload = _dense_prefix_capture_loaded_snapshot(
+                owner,
+                layer_name=layer_name,
+                kv_cache=kv_cache,
+                attn_metadata=attn_metadata,
+                reason="replay_fallback",
+                overwrite=False,
+            )
+        if dev_payload is None or loaded_payload is None:
+            if _dense_prefix_compare_log_allowed(
+                owner, "file_replay_missing", layer_name, "dev_lmy_vs_lmcache_loaded"
+            ):
+                logger.warning(
+                    "[DENSE_PREFIX_FILE] replay_skip_missing layer=%s "
+                    "dev_lmy_present=%s lmcache_loaded_present=%s",
+                    layer_name,
+                    dev_payload is not None,
+                    loaded_payload is not None,
+                )
+            return
+        diff = _dense_prefix_full_snapshot_diff(dev_payload, loaded_payload)
+        if diff.get("match"):
+            if _dense_prefix_compare_log_allowed(
+                owner, "file_replay_skip_match", layer_name, "dev_lmy"
+            ):
+                logger.warning(
+                    "[DENSE_PREFIX_FILE] replay_skip_match layer=%s diff=%s",
+                    layer_name,
+                    diff,
+                )
+            return
+        if _dense_prefix_compare_log_allowed(
+            owner, "file_replay_mismatch", layer_name, "dev_lmy_vs_lmcache_loaded"
+        ):
+            _sfa_force_print(
+                "[DENSE_PREFIX_FILE_COMPARE] "
+                f"layer={layer_name} pair=dev_lmy_vs_lmcache_loaded "
+                f"match=False diff={diff}"
+            )
+            logger.error(
+                "[DENSE_PREFIX_FILE_COMPARE] layer=%s pair=%s match=%s diff=%s",
+                layer_name,
+                "dev_lmy_vs_lmcache_loaded",
+                diff.get("match"),
+                diff,
+            )
+        _dense_prefix_full_snapshot_replay(
+            owner,
+            source="dev_lmy",
+            layer_name=layer_name,
+            kv_cache=kv_cache,
+            attn_metadata=attn_metadata,
+        )
+    except Exception:
+        if _dsa_kv_debug_error_allowed(owner):
+            logger.exception(
+                "[DENSE_PREFIX_FILE] replay_decision_failed layer=%s",
+                layer_name,
+            )
+
+
 def _dense_prefix_compare_should_compare(attn_metadata: Any) -> bool:
     max_tokens = _dense_prefix_compare_int_env(
         "VLLM_ASCEND_DENSE_PREFIX_COMPARE_HIT_MAX_TOKENS", 1
@@ -1170,10 +2246,20 @@ def _dense_prefix_compare_cache_tensor(
     if stage == "capture_before_store":
         if key in _DENSE_PREFIX_COMPARE_LOCKED_KEYS:
             return
-        previous = _DENSE_PREFIX_COMPARE_BASELINE.get(key)
+        previous = _dense_prefix_compare_load_sample(
+            layer_name,
+            label,
+            "lmcache_saved",
+        )
         if previous is not None and int(previous["seq_len"]) > int(sample["seq_len"]):
             return
-        _DENSE_PREFIX_COMPARE_BASELINE[key] = sample
+        saved_path = _dense_prefix_compare_save_sample(
+            layer_name=layer_name,
+            label=label,
+            stage="lmcache_saved",
+            sample=sample,
+            preserve_longer=True,
+        )
         if (
             _dense_prefix_compare_log_baseline()
             and _dense_prefix_compare_log_allowed(owner, stage, layer_name, label)
@@ -1182,11 +2268,12 @@ def _dense_prefix_compare_cache_tensor(
                 "[DENSE_PREFIX_COMPARE] "
                 f"stage={stage} layer={layer_name} label={label} "
                 f"seq_len={sample['seq_len']} positions={sample['positions']} "
-                f"slots={sample['slots']} summary={sample['summary']}"
+                f"slots={sample['slots']} summary={sample['summary']} "
+                f"path={saved_path}"
             )
             logger.warning(
                 "[DENSE_PREFIX_COMPARE] stage=%s layer=%s label=%s "
-                "seq_len=%s positions=%s slots=%s summary=%s",
+                "seq_len=%s positions=%s slots=%s summary=%s path=%s",
                 stage,
                 layer_name,
                 label,
@@ -1194,6 +2281,7 @@ def _dense_prefix_compare_cache_tensor(
                 sample["positions"],
                 sample["slots"],
                 sample["summary"],
+                saved_path,
             )
         return
 
@@ -1204,7 +2292,18 @@ def _dense_prefix_compare_cache_tensor(
     ):
         return
 
-    baseline = _DENSE_PREFIX_COMPARE_BASELINE.get(key)
+    current_path = _dense_prefix_compare_save_sample(
+        layer_name=layer_name,
+        label=label,
+        stage=stage,
+        sample=sample,
+        preserve_longer=False,
+    )
+    baseline = _dense_prefix_compare_load_sample(
+        layer_name,
+        label,
+        "lmcache_saved",
+    )
     if baseline is None:
         if _dense_prefix_compare_log_allowed(
             owner, "gate", layer_name, f"baseline_missing:{label}"
@@ -1215,13 +2314,15 @@ def _dense_prefix_compare_cache_tensor(
                 f"label={label} seq_len={sample['seq_len']} "
                 f"positions={sample['positions']} slots={sample['slots']} "
                 f"summary={sample['summary']} "
+                f"current_path={current_path} "
                 f"attn_state={getattr(attn_metadata, 'attn_state', None)} "
                 f"num_actual_tokens={getattr(attn_metadata, 'num_actual_tokens', None)}"
             )
             logger.warning(
                 "[DENSE_PREFIX_COMPARE_GATE] reason=baseline_missing "
                 "stage=%s layer=%s label=%s seq_len=%s positions=%s "
-                "slots=%s summary=%s attn_state=%s num_actual_tokens=%s",
+                "slots=%s summary=%s current_path=%s attn_state=%s "
+                "num_actual_tokens=%s",
                 stage,
                 layer_name,
                 label,
@@ -1229,6 +2330,7 @@ def _dense_prefix_compare_cache_tensor(
                 sample["positions"],
                 sample["slots"],
                 sample["summary"],
+                current_path,
                 getattr(attn_metadata, "attn_state", None),
                 getattr(attn_metadata, "num_actual_tokens", None),
             )
@@ -1251,6 +2353,8 @@ def _dense_prefix_compare_cache_tensor(
             f"current_positions={sample['positions']} "
             f"baseline_slots={baseline['slots']} "
             f"current_slots={sample['slots']} "
+            f"baseline_path={_dense_prefix_compare_sample_path(layer_name, label, 'lmcache_saved')} "
+            f"current_path={current_path} "
             f"attn_state={getattr(attn_metadata, 'attn_state', None)} "
             f"num_actual_tokens={getattr(attn_metadata, 'num_actual_tokens', None)}"
         )
@@ -1260,7 +2364,8 @@ def _dense_prefix_compare_cache_tensor(
             "baseline_positions=%s current_positions=%s "
             "baseline_slots=%s current_slots=%s "
             "baseline_summary=%s current_summary=%s "
-            "attn_state=%s num_actual_tokens=%s",
+            "baseline_path=%s current_path=%s attn_state=%s "
+            "num_actual_tokens=%s",
             stage,
             layer_name,
             label,
@@ -1274,6 +2379,8 @@ def _dense_prefix_compare_cache_tensor(
             sample["slots"],
             baseline["summary"],
             sample["summary"],
+            _dense_prefix_compare_sample_path(layer_name, label, "lmcache_saved"),
+            current_path,
             getattr(attn_metadata, "attn_state", None),
             getattr(attn_metadata, "num_actual_tokens", None),
         )
@@ -1354,6 +2461,10 @@ def _dense_prefix_compare_cache(
             include_index=include_index,
         )
         return
+
+    _dense_prefix_file_synchronize(
+        owner, layer_name=layer_name, reason=f"sample_compare:{stage}"
+    )
 
     if include_latent and len(kv_cache) >= 2:
         _dense_prefix_compare_cache_tensor(
@@ -3859,6 +4970,22 @@ class AscendSFAImpl(MLAAttentionImpl):
                     include_latent=False,
                     include_index=True,
                 )
+                _dense_prefix_compare_full_sources_and_maybe_replay(
+                    self,
+                    layer_name=layer_name,
+                    kv_cache=kv_cache,
+                    attn_metadata=attn_metadata,
+                    replay_on_mismatch=False,
+                )
+
+            _dense_prefix_capture_loaded_snapshot(
+                self,
+                layer_name=layer_name,
+                kv_cache=kv_cache,
+                attn_metadata=attn_metadata,
+                reason="before_index_scatter",
+                overwrite=True,
+            )
 
             if self.is_kv_producer:
                 attn_metadata.reshape_cache_event = torch.npu.Event()
@@ -3875,6 +5002,25 @@ class AscendSFAImpl(MLAAttentionImpl):
                 )
             if self.is_kv_producer:
                 attn_metadata.reshape_cache_event.record()
+            _dense_prefix_replay_dev_lmy_if_loaded_mismatch(
+                self,
+                layer_name=layer_name,
+                kv_cache=kv_cache,
+                attn_metadata=attn_metadata,
+            )
+
+        _dense_prefix_full_snapshot_save(
+            self,
+            source="dev_lmy",
+            layer_name=layer_name,
+            kv_cache=kv_cache,
+            attn_metadata=attn_metadata,
+            include_latent=True,
+            include_index=True,
+            require_complete=True,
+            allow_decode=False,
+            preserve_longer=True,
+        )
 
         self._maybe_capture_prefill_shadow_kv(
             layer_name=layer_name,
@@ -4508,6 +5654,18 @@ class AscendSFAImpl(MLAAttentionImpl):
                 attn_metadata=attn_metadata,
                 include_latent=True,
                 include_index=True,
+            )
+            _dense_prefix_full_snapshot_save(
+                self,
+                source="lmcache_saved",
+                layer_name=layer_name,
+                kv_cache=kv_cache,
+                attn_metadata=attn_metadata,
+                include_latent=True,
+                include_index=True,
+                require_complete=True,
+                allow_decode=False,
+                preserve_longer=True,
             )
         _skip_decode_save = (
             bool(self.dsa_shrink_latent)
