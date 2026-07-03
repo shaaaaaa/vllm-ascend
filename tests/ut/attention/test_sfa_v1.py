@@ -36,6 +36,10 @@ from vllm_ascend.attention.sfa_v1 import (
     _sfa_path_trace_enabled,
     _sfa_path_trace_should_wrap,
     _sfa_trace_lmcache_call,
+    _tail_recalc_diff,
+    _tail_recalc_full_payload_gather_positions,
+    _tail_recalc_payload,
+    _tail_recalc_query_info,
 )
 from vllm_ascend.utils import enable_dsa_cp
 
@@ -616,6 +620,111 @@ class TestDensePrefixCompareHelpers(TestBase):
         with patch.dict(os.environ, {"VLLM_ASCEND_DENSE_PREFIX_COMPARE": "1"}, clear=True):
             self.assertFalse(_sfa_path_trace_enabled())
             self.assertTrue(_dense_prefix_compare_enabled())
+
+    def test_tail_recalc_query_info_finds_final_chunk_tail(self):
+        metadata = MagicMock()
+        metadata.attn_state = AscendAttentionState.ChunkedPrefill
+        metadata.cum_query_lens = torch.tensor([2495], dtype=torch.int32)
+        metadata.seq_lens = torch.tensor([18879], dtype=torch.int32)
+        metadata.prompt_lens = torch.tensor([18879], dtype=torch.int32)
+        metadata.num_actual_tokens = 2495
+
+        info = _tail_recalc_query_info(metadata)
+
+        assert info is not None
+        self.assertEqual(info["tail_position"], 18878)
+        self.assertEqual(info["local_index"], 2494)
+        self.assertEqual(info["first_query_position"], 16384)
+
+    def test_tail_recalc_diff_detects_value_change(self):
+        query_info = {
+            "row": 0,
+            "local_index": 1,
+            "tail_position": 5,
+            "prompt_len": 6,
+            "seq_len": 6,
+            "query_start": 0,
+            "query_end": 2,
+            "query_len": 2,
+            "first_query_position": 4,
+            "attn_state": "prefill",
+            "lmcache_loaded": False,
+        }
+        baseline = _tail_recalc_payload(
+            layer_name="model.layers.0.self_attn.attn",
+            source="prefill",
+            label="layer0_attention_output_before_vup",
+            values=torch.tensor([1.0, 2.0]),
+            query_info=query_info,
+        )
+        current = _tail_recalc_payload(
+            layer_name="model.layers.0.self_attn.attn",
+            source="loaded",
+            label="layer0_attention_output_before_vup",
+            values=torch.tensor([1.0, 4.0]),
+            query_info={**query_info, "lmcache_loaded": True},
+        )
+
+        diff = _tail_recalc_diff(baseline, current)
+
+        self.assertFalse(diff["match"])
+        self.assertEqual(diff["first_diff_flat_index"], 1)
+        self.assertEqual(diff["max_abs_diff"], 2.0)
+
+    def test_tail_recalc_full_payload_gather_positions(self):
+        layer_name = "model.layers.0.self_attn.attn"
+        payload = {
+            "meta": {
+                "source": "dev_lmy",
+                "layer_name": layer_name,
+                "rows": [0],
+                "lengths": [6],
+                "max_length": 6,
+            },
+            "caches": {
+                0: {
+                    "label": "latent_nope",
+                    "rows": [
+                        {
+                            "row": 0,
+                            "length": 6,
+                            "data": torch.arange(8, dtype=torch.float32).reshape(
+                                2, 4, 1
+                            ),
+                        }
+                    ],
+                }
+            },
+        }
+
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            patch.dict(
+                os.environ,
+                {"VLLM_ASCEND_DENSE_PREFIX_FILE_DIR": tmpdir},
+                clear=False,
+            ),
+        ):
+            _dense_prefix_full_snapshot_save_payload(
+                layer_name=layer_name,
+                source="dev_lmy",
+                payload=payload,
+                preserve_longer=False,
+            )
+            values = _tail_recalc_full_payload_gather_positions(
+                layer_name,
+                source="dev_lmy",
+                cache_idx=0,
+                positions=torch.tensor([0, 4, 5, 6, -1], dtype=torch.long),
+            )
+
+        assert values is not None
+        self.assertTrue(
+            torch.equal(
+                values.squeeze(-1),
+                torch.tensor([0.0, 4.0, 5.0, 0.0, 0.0]),
+            )
+        )
 
     def test_dense_prefix_compare_direct_call_logs_path_before_compare(self):
         class Owner:

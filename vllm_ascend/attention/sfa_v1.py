@@ -1739,6 +1739,660 @@ def _dense_prefix_full_snapshot_diff(
     return result
 
 
+def _tail_recalc_compare_enabled() -> bool:
+    return _dsa_env_flag("VLLM_ASCEND_TAIL_RECALC_COMPARE")
+
+
+def _tail_recalc_compare_layer_enabled(layer_name: str) -> bool:
+    layer_filter = os.environ.get(
+        "VLLM_ASCEND_TAIL_RECALC_COMPARE_LAYER",
+        "layers.0.,layers.1.",
+    ).strip()
+    if not layer_filter:
+        return "layers.0." in layer_name or "layers.1." in layer_name
+    if layer_filter.lower() in ("*", "all"):
+        return True
+    return any(
+        part.strip() and part.strip() in layer_name
+        for part in layer_filter.split(",")
+    )
+
+
+def _tail_recalc_attn_is_decode(attn_metadata: Any) -> bool:
+    return getattr(attn_metadata, "attn_state", None) in (
+        AscendAttentionState.DecodeOnly,
+        AscendAttentionState.SpecDecoding,
+    )
+
+
+def _tail_recalc_target_position(prompt_len: int) -> int:
+    try:
+        override = int(os.environ.get("VLLM_ASCEND_TAIL_RECALC_POSITION", "-1"))
+    except ValueError:
+        override = -1
+    if override >= 0:
+        return override
+    return int(prompt_len) - 1
+
+
+def _tail_recalc_query_info(attn_metadata: Any) -> dict[str, Any] | None:
+    """Return where the prompt tail token sits in this layer call."""
+    q_ends = _dense_prefix_to_cpu_long(getattr(attn_metadata, "cum_query_lens", None))
+    seq_lens = _dense_prefix_to_cpu_long(getattr(attn_metadata, "seq_lens", None))
+    if q_ends is None or seq_lens is None or q_ends.numel() == 0:
+        return None
+
+    fc = None
+    try:
+        fc = get_forward_context()
+    except Exception:
+        pass
+    prompt_lens = _dense_prefix_snapshot_prompt_lens(attn_metadata, fc)
+
+    row_count = min(int(q_ends.numel()), int(seq_lens.numel()))
+    if prompt_lens is not None:
+        row_count = min(row_count, int(prompt_lens.numel()))
+    if row_count <= 0:
+        return None
+
+    q_start = 0
+    for row in range(row_count):
+        q_end = int(q_ends[row].item())
+        q_len = q_end - q_start
+        seq_len = int(seq_lens[row].item())
+        if q_len <= 0 or seq_len <= 0:
+            q_start = q_end
+            continue
+
+        prompt_len = seq_len
+        if prompt_lens is not None:
+            prompt_len = int(prompt_lens[row].item())
+            if prompt_len <= 0:
+                q_start = q_end
+                continue
+
+        target_pos = _tail_recalc_target_position(prompt_len)
+        first_pos = seq_len - q_len
+        if first_pos <= target_pos < seq_len:
+            local_index = q_start + (target_pos - first_pos)
+            num_actual = int(getattr(attn_metadata, "num_actual_tokens", q_end) or q_end)
+            if 0 <= local_index < min(q_end, num_actual):
+                return {
+                    "row": int(row),
+                    "local_index": int(local_index),
+                    "tail_position": int(target_pos),
+                    "prompt_len": int(prompt_len),
+                    "seq_len": int(seq_len),
+                    "query_start": int(q_start),
+                    "query_end": int(q_end),
+                    "query_len": int(q_len),
+                    "first_query_position": int(first_pos),
+                    "attn_state": str(getattr(attn_metadata, "attn_state", None)),
+                    "lmcache_loaded": _dense_prefix_compare_lmcache_loaded(),
+                }
+        q_start = q_end
+    return None
+
+
+def _tail_recalc_source(attn_metadata: Any) -> str | None:
+    if _dense_prefix_compare_lmcache_loaded():
+        return "loaded"
+    if not _tail_recalc_attn_is_decode(attn_metadata):
+        return "prefill"
+    return None
+
+
+def _tail_recalc_file_path(layer_name: str, source: str, label: str) -> str:
+    return os.path.join(
+        _dense_prefix_file_layer_dir(layer_name),
+        "tail_recalc",
+        f"{_dense_prefix_file_key(source)}__{_dense_prefix_file_key(label)}.pt",
+    )
+
+
+def _tail_recalc_summary(value: torch.Tensor) -> dict[str, Any]:
+    flat = value.reshape(-1)
+    result: dict[str, Any] = {
+        "shape": tuple(value.shape),
+        "dtype": str(value.dtype),
+        "numel": int(flat.numel()),
+        "head": flat[:8].to(device="cpu").tolist() if flat.numel() else [],
+    }
+    if flat.numel() and torch.is_floating_point(flat):
+        flat_f = flat.to(torch.float32)
+        result.update(
+            {
+                "sum": float(flat_f.sum().item()),
+                "abs_sum": float(flat_f.abs().sum().item()),
+                "min": float(flat_f.min().item()),
+                "max": float(flat_f.max().item()),
+            }
+        )
+    elif flat.numel():
+        result.update(
+            {
+                "min": int(flat.min().item()),
+                "max": int(flat.max().item()),
+            }
+        )
+    return result
+
+
+def _tail_recalc_payload(
+    *,
+    layer_name: str,
+    source: str,
+    label: str,
+    values: torch.Tensor,
+    query_info: dict[str, Any],
+    extra: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    return {
+        "meta": {
+            "source": source,
+            "label": label,
+            "layer_name": layer_name,
+            "rank_tag": _dsa_kv_trace_rank_tag(),
+            "tp_tag": _dense_prefix_file_tp_tag(),
+            **query_info,
+            **(extra or {}),
+        },
+        "values": values.detach().to(device="cpu", copy=True),
+        "summary": _tail_recalc_summary(values.detach().to(device="cpu")),
+    }
+
+
+def _tail_recalc_load_payload(
+    layer_name: str,
+    source: str,
+    label: str,
+) -> dict[str, Any] | None:
+    path = _tail_recalc_file_path(layer_name, source, label)
+    if not os.path.exists(path):
+        return None
+    try:
+        payload = torch.load(path, map_location="cpu")
+    except Exception:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _tail_recalc_save_payload(
+    *,
+    layer_name: str,
+    source: str,
+    label: str,
+    payload: dict[str, Any],
+    preserve_existing: bool,
+) -> str | None:
+    path = _tail_recalc_file_path(layer_name, source, label)
+    if preserve_existing and os.path.exists(path):
+        return path
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp_path = f"{path}.tmp"
+        torch.save(payload, tmp_path)
+        os.replace(tmp_path, path)
+        return path
+    except Exception:
+        return None
+
+
+def _tail_recalc_diff(
+    baseline: dict[str, Any],
+    current: dict[str, Any],
+) -> dict[str, Any]:
+    base = baseline.get("values")
+    cur = current.get("values")
+    result: dict[str, Any] = {
+        "match": False,
+        "same_shape": False,
+        "same_tail_position": (
+            baseline.get("meta", {}).get("tail_position")
+            == current.get("meta", {}).get("tail_position")
+        ),
+        "baseline_summary": baseline.get("summary"),
+        "current_summary": current.get("summary"),
+    }
+    if not isinstance(base, torch.Tensor) or not isinstance(cur, torch.Tensor):
+        result["reason"] = "missing_tensor"
+        return result
+    result["same_shape"] = tuple(base.shape) == tuple(cur.shape)
+    if not result["same_shape"]:
+        result["reason"] = "shape_mismatch"
+        return result
+    equal = torch.equal(base, cur)
+    result["match"] = bool(equal and result["same_tail_position"])
+    if equal:
+        return result
+
+    base_f = base.to(torch.float32)
+    cur_f = cur.to(torch.float32)
+    diff = (base_f - cur_f).abs()
+    result["max_abs_diff"] = float(diff.max().item()) if diff.numel() else 0.0
+    first = diff.reshape(-1).nonzero(as_tuple=False)
+    if first.numel() > 0:
+        first_idx = int(first[0].item())
+        result["first_diff_flat_index"] = first_idx
+        result["baseline_value"] = float(base_f.reshape(-1)[first_idx].item())
+        result["current_value"] = float(cur_f.reshape(-1)[first_idx].item())
+    return result
+
+
+def _tail_recalc_log_payload(
+    owner: object,
+    *,
+    layer_name: str,
+    source: str,
+    label: str,
+    payload: dict[str, Any],
+    path: str | None,
+) -> None:
+    if not _dense_prefix_compare_log_allowed(
+        owner, "tail_recalc_save", layer_name, f"{source}:{label}"
+    ):
+        return
+    _sfa_force_print(
+        "[TAIL_RECALC_TRACE] "
+        f"source={source} layer={layer_name} label={label} "
+        f"tail_position={payload.get('meta', {}).get('tail_position')} "
+        f"local_index={payload.get('meta', {}).get('local_index')} "
+        f"summary={payload.get('summary')} path={path}"
+    )
+    logger.warning(
+        "[TAIL_RECALC_TRACE] source=%s layer=%s label=%s "
+        "tail_position=%s local_index=%s summary=%s path=%s",
+        source,
+        layer_name,
+        label,
+        payload.get("meta", {}).get("tail_position"),
+        payload.get("meta", {}).get("local_index"),
+        payload.get("summary"),
+        path,
+    )
+
+
+def _tail_recalc_log_diff(
+    owner: object,
+    *,
+    layer_name: str,
+    label: str,
+    pair: str,
+    diff: dict[str, Any],
+) -> None:
+    if not _dense_prefix_compare_log_allowed(
+        owner, "tail_recalc_compare", layer_name, f"{pair}:{label}"
+    ):
+        return
+    _sfa_force_print(
+        "[TAIL_RECALC_COMPARE] "
+        f"layer={layer_name} label={label} pair={pair} "
+        f"match={diff.get('match')} diff={diff}"
+    )
+    log_fn = logger.warning if diff.get("match") else logger.error
+    log_fn(
+        "[TAIL_RECALC_COMPARE] layer=%s label=%s pair=%s match=%s diff=%s",
+        layer_name,
+        label,
+        pair,
+        diff.get("match"),
+        diff,
+    )
+
+
+def _tail_recalc_capture_values(
+    owner: object,
+    *,
+    layer_name: str,
+    label: str,
+    values: torch.Tensor,
+    attn_metadata: Any,
+    query_info: dict[str, Any] | None = None,
+    extra: dict[str, Any] | None = None,
+    compare_to_prefill: bool = True,
+) -> None:
+    if not _tail_recalc_compare_enabled():
+        return
+    if not _tail_recalc_compare_layer_enabled(layer_name):
+        return
+    source = _tail_recalc_source(attn_metadata)
+    if source is None:
+        return
+    if query_info is None:
+        query_info = _tail_recalc_query_info(attn_metadata)
+    if query_info is None:
+        return
+    try:
+        _dense_prefix_file_synchronize(
+            owner, layer_name=layer_name, reason=f"tail_recalc:{label}:{source}"
+        )
+        payload = _tail_recalc_payload(
+            layer_name=layer_name,
+            source=source,
+            label=label,
+            values=values,
+            query_info=query_info,
+            extra=extra,
+        )
+        path = _tail_recalc_save_payload(
+            layer_name=layer_name,
+            source=source,
+            label=label,
+            payload=payload,
+            preserve_existing=(source == "prefill"),
+        )
+        _tail_recalc_log_payload(
+            owner,
+            layer_name=layer_name,
+            source=source,
+            label=label,
+            payload=payload,
+            path=path,
+        )
+        if source == "loaded" and compare_to_prefill:
+            baseline = _tail_recalc_load_payload(layer_name, "prefill", label)
+            if baseline is not None:
+                diff = _tail_recalc_diff(baseline, payload)
+                _tail_recalc_log_diff(
+                    owner,
+                    layer_name=layer_name,
+                    label=label,
+                    pair="prefill_vs_loaded",
+                    diff=diff,
+                )
+    except Exception:
+        if _dsa_kv_debug_error_allowed(owner):
+            logger.exception(
+                "[TAIL_RECALC_COMPARE] capture_failed layer=%s label=%s",
+                layer_name,
+                label,
+            )
+
+
+def _tail_recalc_select_query_row(
+    values: torch.Tensor,
+    query_info: dict[str, Any],
+) -> torch.Tensor | None:
+    if not isinstance(values, torch.Tensor) or values.numel() == 0:
+        return None
+    idx = int(query_info.get("local_index", -1))
+    if idx < 0 or idx >= int(values.shape[0]):
+        return None
+    return values[idx].detach()
+
+
+def _tail_recalc_capture_topk(
+    owner: object,
+    *,
+    layer_name: str,
+    label: str,
+    topk_indices: torch.Tensor,
+    attn_metadata: Any,
+    query_info: dict[str, Any] | None = None,
+) -> None:
+    if query_info is None:
+        query_info = _tail_recalc_query_info(attn_metadata)
+    if query_info is None:
+        return
+    topk_2d = _dsa_kv_trace_to_2d_indices(topk_indices)
+    row = _tail_recalc_select_query_row(topk_2d, query_info)
+    if row is None:
+        return
+    _tail_recalc_capture_values(
+        owner,
+        layer_name=layer_name,
+        label=label,
+        values=row.to(device="cpu", dtype=torch.long),
+        attn_metadata=attn_metadata,
+        query_info=query_info,
+    )
+
+
+def _tail_recalc_capture_layer_input_latent(
+    owner: object,
+    *,
+    layer_name: str,
+    kv_cache: tuple[torch.Tensor, ...] | list[torch.Tensor] | None,
+    attn_metadata: Any,
+) -> None:
+    if kv_cache is None or len(kv_cache) < 2:
+        return
+    if "layers.1." not in layer_name:
+        return
+    query_info = _tail_recalc_query_info(attn_metadata)
+    if query_info is None:
+        return
+    slot_mapping = getattr(attn_metadata, "slot_mapping", None)
+    if not isinstance(slot_mapping, torch.Tensor):
+        return
+    local_index = int(query_info["local_index"])
+    if local_index < 0 or local_index >= int(slot_mapping.numel()):
+        return
+    try:
+        slot = int(slot_mapping.reshape(-1)[local_index].detach().to(device="cpu").item())
+        if slot < 0:
+            return
+        for cache_idx, cache, label in (
+            (0, kv_cache[0], "layer1_input_latent_nope"),
+            (1, kv_cache[1], "layer1_input_latent_pe"),
+        ):
+            if not isinstance(cache, torch.Tensor):
+                continue
+            flat = cache.reshape(-1, *cache.shape[2:])
+            if slot >= int(flat.shape[0]):
+                continue
+            value = flat.index_select(
+                0, torch.tensor([slot], dtype=torch.long, device=flat.device)
+            ).squeeze(0)
+            _tail_recalc_capture_values(
+                owner,
+                layer_name=layer_name,
+                label=label,
+                values=value,
+                attn_metadata=attn_metadata,
+                query_info=query_info,
+                extra={"slot": slot, "cache_idx": cache_idx},
+            )
+    except Exception:
+        if _dsa_kv_debug_error_allowed(owner):
+            logger.exception(
+                "[TAIL_RECALC_COMPARE] layer1_input_latent_failed layer=%s",
+                layer_name,
+            )
+
+
+def _tail_recalc_gather_cache_by_topk(
+    *,
+    cache: torch.Tensor,
+    block_table: torch.Tensor,
+    row: int,
+    topk_row: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    topk = topk_row.to(device=block_table.device, dtype=torch.long)
+    block_size = int(cache.shape[1])
+    max_slots = int(cache.shape[0]) * block_size
+    table_row = block_table[row].to(torch.long)
+    logical_blocks = torch.clamp(topk, min=0) // block_size
+    offsets = torch.clamp(topk, min=0) % block_size
+    max_logical = max(int(table_row.numel()) - 1, 0)
+    safe_logical = torch.clamp(logical_blocks, min=0, max=max_logical)
+    physical_blocks = table_row.index_select(0, safe_logical)
+    slots = physical_blocks * block_size + offsets
+    valid = (
+        (topk >= 0)
+        & (logical_blocks < int(table_row.numel()))
+        & (physical_blocks >= 0)
+        & (slots >= 0)
+        & (slots < max_slots)
+    )
+    safe_slots = torch.clamp(slots, min=0, max=max(max_slots - 1, 0)).to(
+        device=cache.device
+    )
+    values = cache.reshape(-1, *cache.shape[2:]).index_select(0, safe_slots)
+    if not bool(valid.all().detach().to(device="cpu").item()):
+        mask = valid.to(device=values.device).reshape(
+            *valid.shape, *([1] * (values.dim() - 1))
+        )
+        values = torch.where(mask, values, torch.zeros_like(values))
+    return values, slots.detach().to(device="cpu", dtype=torch.long), valid.detach().to(device="cpu")
+
+
+def _tail_recalc_full_payload_gather_positions(
+    layer_name: str,
+    *,
+    source: str,
+    cache_idx: int,
+    positions: torch.Tensor,
+) -> torch.Tensor | None:
+    payload = _dense_prefix_full_snapshot_load(layer_name, source)
+    if payload is None:
+        return None
+    caches = payload.get("caches", {})
+    cache_payload = caches.get(cache_idx) or caches.get(str(cache_idx))
+    if not cache_payload:
+        return None
+    rows = cache_payload.get("rows") or []
+    if not rows:
+        return None
+    row_payload = rows[0]
+    data = row_payload.get("data")
+    if not isinstance(data, torch.Tensor) or data.numel() == 0:
+        return None
+    length = int(row_payload.get("length", 0) or 0)
+    block_size = int(data.shape[1])
+    pos = positions.detach().to(device="cpu", dtype=torch.long).reshape(-1)
+    result_shape = (int(pos.numel()), *data.shape[2:])
+    gathered = torch.zeros(result_shape, dtype=data.dtype)
+    valid = (pos >= 0) & (pos < length)
+    if not bool(valid.any().item()):
+        return gathered
+    block_ids = pos[valid] // block_size
+    offsets = pos[valid] % block_size
+    max_blocks = int(data.shape[0])
+    in_payload = (block_ids >= 0) & (block_ids < max_blocks)
+    if not bool(in_payload.any().item()):
+        return gathered
+    valid_indices = valid.nonzero(as_tuple=False).reshape(-1)[in_payload]
+    values = data[block_ids[in_payload], offsets[in_payload]]
+    gathered[valid_indices] = values
+    return gathered
+
+
+def _tail_recalc_capture_sparse_scratch_after_load(
+    owner: object,
+    *,
+    layer_name: str,
+    kv_cache: tuple[torch.Tensor, ...] | list[torch.Tensor] | None,
+    attn_metadata: Any,
+    topk_before_remap: torch.Tensor,
+    topk_after_remap: torch.Tensor,
+    selected_for_lmcache: torch.Tensor | None,
+) -> None:
+    if kv_cache is None or len(kv_cache) < 2:
+        return
+    if "layers.0." not in layer_name:
+        return
+    if selected_for_lmcache is None:
+        return
+    query_info = _tail_recalc_query_info(attn_metadata)
+    if query_info is None:
+        return
+    block_table = getattr(attn_metadata, "block_table", None)
+    if not isinstance(block_table, torch.Tensor):
+        return
+    row = int(query_info["row"])
+    topk_before_2d = _dsa_kv_trace_to_2d_indices(topk_before_remap)
+    topk_after_2d = _dsa_kv_trace_to_2d_indices(topk_after_remap)
+    local_index = int(query_info["local_index"])
+    if local_index >= int(topk_before_2d.shape[0]) or local_index >= int(
+        topk_after_2d.shape[0]
+    ):
+        return
+
+    before_row = topk_before_2d[local_index].detach().to(torch.long)
+    after_row = topk_after_2d[local_index].detach().to(torch.long)
+    prompt_len = int(query_info["prompt_len"])
+    prefill_mask = (before_row >= 0) & (before_row < prompt_len)
+    selected_count = int(prefill_mask.sum().detach().to(device="cpu").item())
+    if selected_count <= 0:
+        return
+    selected_row = selected_for_lmcache.reshape(selected_for_lmcache.shape[0], -1)
+    selected_index = min(int(query_info["row"]), int(selected_row.shape[0]) - 1)
+    selected_actual = selected_row[selected_index, :selected_count].detach().to(torch.long)
+
+    for cache_idx, cache, label in (
+        (0, kv_cache[0], "layer0_scratch_latent_nope_after_sparse_load"),
+        (1, kv_cache[1], "layer0_scratch_latent_pe_after_sparse_load"),
+    ):
+        if not isinstance(cache, torch.Tensor):
+            continue
+        values, slots, valid = _tail_recalc_gather_cache_by_topk(
+            cache=cache,
+            block_table=block_table,
+            row=row,
+            topk_row=after_row,
+        )
+        selected_values = values[prefill_mask.to(device=values.device)]
+        selected_slots = slots[prefill_mask.detach().to(device="cpu")]
+        selected_valid = valid[prefill_mask.detach().to(device="cpu")]
+        extra = {
+            "cache_idx": cache_idx,
+            "selected_count": selected_count,
+            "selected_tokens_head": selected_actual[:8].detach().to(device="cpu").tolist(),
+            "scratch_slots_head": selected_slots[:8].detach().to(device="cpu").tolist(),
+            "scratch_valid_all": bool(selected_valid.all().item()),
+        }
+        _tail_recalc_capture_values(
+            owner,
+            layer_name=layer_name,
+            label=label,
+            values=selected_values,
+            attn_metadata=attn_metadata,
+            query_info=query_info,
+            extra=extra,
+            compare_to_prefill=False,
+        )
+        reference = _tail_recalc_full_payload_gather_positions(
+            layer_name,
+            source="dev_lmy",
+            cache_idx=cache_idx,
+            positions=selected_actual,
+        )
+        if reference is None:
+            reference = _tail_recalc_full_payload_gather_positions(
+                layer_name,
+                source="lmcache_saved",
+                cache_idx=cache_idx,
+                positions=selected_actual,
+            )
+        if reference is None:
+            continue
+        ref_payload = _tail_recalc_payload(
+            layer_name=layer_name,
+            source="prefill_reference",
+            label=label,
+            values=reference,
+            query_info=query_info,
+            extra={**extra, "reference_positions_head": extra["selected_tokens_head"]},
+        )
+        cur_payload = _tail_recalc_payload(
+            layer_name=layer_name,
+            source="loaded",
+            label=label,
+            values=selected_values.detach().to(device="cpu"),
+            query_info=query_info,
+            extra=extra,
+        )
+        diff = _tail_recalc_diff(ref_payload, cur_payload)
+        _tail_recalc_log_diff(
+            owner,
+            layer_name=layer_name,
+            label=label,
+            pair="prefill_selected_vs_scratch_loaded",
+            diff=diff,
+        )
+
+
 def _dense_prefix_replay_cache_rows(
     *,
     cache: torch.Tensor,
@@ -4926,6 +5580,13 @@ class AscendSFAImpl(MLAAttentionImpl):
 
             k_li = self._get_full_kv(k_li, attn_metadata)
 
+        _tail_recalc_capture_layer_input_latent(
+            self,
+            layer_name=layer_name,
+            kv_cache=kv_cache,
+            attn_metadata=attn_metadata,
+        )
+
         if kv_cache is not None:
             if (
                 index_lmcache_enabled
@@ -5047,6 +5708,17 @@ class AscendSFAImpl(MLAAttentionImpl):
                 actual_seq_lengths_key=actual_seq_lengths_key,
             )
 
+        _tail_recalc_info = _tail_recalc_query_info(attn_metadata)
+        if "layers.0." in layer_name:
+            _tail_recalc_capture_topk(
+                self,
+                layer_name=layer_name,
+                label="layer0_topk_before_remap",
+                topk_indices=topk_indices,
+                attn_metadata=attn_metadata,
+                query_info=_tail_recalc_info,
+            )
+
         self._dsa_last_original_topk = topk_indices.detach()
         if attn_metadata.prompt_lens is not None:
             self._dsa_last_prompt_lens = attn_metadata.prompt_lens.detach()
@@ -5138,6 +5810,15 @@ class AscendSFAImpl(MLAAttentionImpl):
                     need_packed=_need_packed,
                     scratch_base=_scratch_base,
                 )
+            if "layers.0." in layer_name:
+                _tail_recalc_capture_topk(
+                    self,
+                    layer_name=layer_name,
+                    label="layer0_topk_after_remap",
+                    topk_indices=topk_indices,
+                    attn_metadata=attn_metadata,
+                    query_info=_tail_recalc_info,
+                )
             if _dsa_wait_log:
                 logger.info(
                     "[DSA_SHRINK_CHECK] remap layer=%s need_packed=%s "
@@ -5198,6 +5879,34 @@ class AscendSFAImpl(MLAAttentionImpl):
                     # Compatibility fallback for metadata built before row-level DSA
                     # fields existed. Standard MTP should not take this path.
                     _selected_for_wait = _sel_packed[: attn_metadata.num_decode_tokens]
+                if "layers.0." in layer_name:
+                    try:
+                        _selected_rows = _selected_for_wait.reshape(
+                            _selected_for_wait.shape[0], -1
+                        )
+                        if _tail_recalc_info is not None and _selected_rows.numel() > 0:
+                            _selected_row_index = min(
+                                int(_tail_recalc_info.get("row", 0)),
+                                int(_selected_rows.shape[0]) - 1,
+                            )
+                            _tail_recalc_capture_values(
+                                self,
+                                layer_name=layer_name,
+                                label="layer0_selected_tokens_sent_to_lmcache",
+                                values=_selected_rows[_selected_row_index].detach().to(
+                                    device="cpu", dtype=torch.long
+                                ),
+                                attn_metadata=attn_metadata,
+                                query_info=_tail_recalc_info,
+                                compare_to_prefill=False,
+                            )
+                    except Exception:
+                        if _dsa_kv_debug_error_allowed(self):
+                            logger.exception(
+                                "[TAIL_RECALC_COMPARE] selected_tokens_capture_failed "
+                                "layer=%s",
+                                layer_name,
+                            )
                 if (
                     _target_slot_mapping_for_wait is not None
                     and _dsa_env_flag("VLLM_ASCEND_DSA_TARGET_SLOT_GUARD", True)
@@ -5321,6 +6030,15 @@ class AscendSFAImpl(MLAAttentionImpl):
                         selected_tokens=_selected_for_wait,
                         target_slot_mapping=_target_slot_mapping_for_wait,
                         note="shrink_decode_selected_load",
+                    )
+                    _tail_recalc_capture_sparse_scratch_after_load(
+                        self,
+                        layer_name=layer_name,
+                        kv_cache=kv_cache,
+                        attn_metadata=attn_metadata,
+                        topk_before_remap=_topk_before_remap,
+                        topk_after_remap=topk_indices,
+                        selected_for_lmcache=_selected_for_wait,
                     )
                 if (
                     _target_slot_mapping_for_wait is not None
@@ -5596,6 +6314,21 @@ class AscendSFAImpl(MLAAttentionImpl):
             # logs mean ms/layer-call periodically (mirrors the manager path).
             _dsa_prof.step()
 
+        if "layers.0." in layer_name:
+            _tail_attn_row = (
+                _tail_recalc_select_query_row(attn_output, _tail_recalc_info)
+                if _tail_recalc_info is not None else None
+            )
+            if _tail_attn_row is not None:
+                _tail_recalc_capture_values(
+                    self,
+                    layer_name=layer_name,
+                    label="layer0_attention_output_before_vup",
+                    values=_tail_attn_row,
+                    attn_metadata=attn_metadata,
+                    query_info=_tail_recalc_info,
+                )
+
         attn_output = self._v_up_proj(attn_output)
         weight_prefetch_method = get_weight_prefetch_method()
         weight_prefetch_method.maybe_prefetch_mla_or_sla_weight_in_current_stream(
@@ -5631,6 +6364,20 @@ class AscendSFAImpl(MLAAttentionImpl):
             torch.distributed.all_to_all_single(attn_output, send, group=get_tp_group().device_group)
 
         output[...] = self.o_proj(attn_output)[0]
+        if "layers.0." in layer_name:
+            _tail_output_row = (
+                _tail_recalc_select_query_row(output, _tail_recalc_info)
+                if _tail_recalc_info is not None else None
+            )
+            if _tail_output_row is not None:
+                _tail_recalc_capture_values(
+                    self,
+                    layer_name=layer_name,
+                    label="layer0_layer_output_after_oproj",
+                    values=_tail_output_row,
+                    attn_metadata=attn_metadata,
+                    query_info=_tail_recalc_info,
+                )
 
         # Offload to LMCache. Legacy un-bundled connectors save only the latent
         # (k_nope, k_pe). Connectors declaring DSA index LMCache support also
