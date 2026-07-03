@@ -1,38 +1,16 @@
-import os
 import unittest
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import torch
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, KVCacheGroupSpec, KVCacheTensor
 
 from vllm_ascend.worker.model_runner_v1 import (
     NPUModelRunner,
-    _dense_prefix_compare_force_eager,
 )
 
 
 class TestNPUModelRunnerKVCache(unittest.TestCase):
-
-    def test_dense_prefix_diag_env_forces_eager_compare_path(self):
-        with patch.dict(os.environ, {}, clear=True):
-            self.assertFalse(_dense_prefix_compare_force_eager())
-
-        with patch.dict(os.environ, {"VLLM_ASCEND_DENSE_PREFIX_COMPARE": "1"}, clear=True):
-            self.assertTrue(_dense_prefix_compare_force_eager())
-
-        with patch.dict(os.environ, {"LMCACHE_DENSE_PREFIX_DIAG": "1"}, clear=True):
-            self.assertTrue(_dense_prefix_compare_force_eager())
-
-        with patch.dict(
-            os.environ,
-            {
-                "LMCACHE_DENSE_PREFIX_DIAG": "1",
-                "VLLM_ASCEND_DENSE_PREFIX_COMPARE_ALLOW_ACLGRAPH": "1",
-            },
-            clear=True,
-        ):
-            self.assertFalse(_dense_prefix_compare_force_eager())
 
     def _build_runner(self):
         runner = NPUModelRunner.__new__(NPUModelRunner)

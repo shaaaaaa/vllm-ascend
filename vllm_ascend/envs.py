@@ -114,10 +114,9 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_ENABLE_DSA_LATENT_OFFLOAD": lambda: bool(
         int(os.getenv("VLLM_ASCEND_ENABLE_DSA_LATENT_OFFLOAD", "0"))
     ),
-    # DSA latent offload staging gate (bring-up). 0 (Stage 1/2): keep the paged latent
-    # write so the offload path can be compared against native sparse attention.
-    # 1 (Stage 3): stop writing the paged latent (it lives only in LMCache + decode
-    # store) to actually free NPU memory. Default 0. Only effective with the offload
+    # DSA latent offload memory-saving gate. 0: keep the paged latent write.
+    # 1: stop writing the paged latent (it lives only in LMCache + decode
+    # store) to free NPU memory. Default 0. Only effective with the offload
     # flag on AND the SFA kernel-redirect wiring done (see sparse_offload/INTEGRATION.md).
     "VLLM_ASCEND_DSA_OFFLOAD_FREE_PAGED": lambda: bool(
         int(os.getenv("VLLM_ASCEND_DSA_OFFLOAD_FREE_PAGED", "0"))
