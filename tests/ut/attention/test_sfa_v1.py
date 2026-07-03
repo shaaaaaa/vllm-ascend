@@ -22,8 +22,6 @@ from vllm_ascend.attention.sfa_v1 import (AscendSFABackend, AscendSFAImpl,
                                            _dsa_env_flag,
                                            _sfa_path_trace_enabled,
                                            _sfa_path_trace_should_wrap,
-                                           _sfa_is_dsa_recalc_last_step,
-                                           _sfa_is_real_decode_step,
                                            _sfa_trace_lmcache_call)
 from vllm_ascend.utils import enable_dsa_cp
 
@@ -151,45 +149,6 @@ class TestDensePrefixCompareHelpers(TestBase):
         with patch.dict(os.environ, {"VLLM_ASCEND_DENSE_PREFIX_COMPARE": "1"}, clear=True):
             self.assertFalse(_sfa_path_trace_enabled())
             self.assertTrue(_dense_prefix_compare_enabled())
-
-    def test_dsa_shrink_recalc_last_decode_state_is_not_real_decode(self):
-        metadata = MagicMock()
-        metadata.attn_state = AscendAttentionState.DecodeOnly
-        metadata.num_decode_tokens = 0
-        metadata.prompt_lens = torch.tensor([0])
-
-        self.assertFalse(
-            _sfa_is_real_decode_step(metadata, dsa_shrink_latent=True)
-        )
-        self.assertTrue(
-            _sfa_is_dsa_recalc_last_step(metadata, dsa_shrink_latent=True)
-        )
-        self.assertTrue(
-            _sfa_is_real_decode_step(metadata, dsa_shrink_latent=False)
-        )
-
-        metadata.num_decode_tokens = 1
-        self.assertTrue(
-            _sfa_is_real_decode_step(metadata, dsa_shrink_latent=True)
-        )
-        self.assertFalse(
-            _sfa_is_dsa_recalc_last_step(metadata, dsa_shrink_latent=True)
-        )
-
-        metadata.attn_state = AscendAttentionState.ChunkedPrefill
-        self.assertFalse(
-            _sfa_is_real_decode_step(metadata, dsa_shrink_latent=True)
-        )
-
-    def test_dsa_shrink_without_prompt_rows_keeps_decode_state(self):
-        class Metadata:
-            attn_state = AscendAttentionState.DecodeOnly
-            num_decode_tokens = 0
-            prompt_lens = None
-
-        self.assertTrue(
-            _sfa_is_real_decode_step(Metadata(), dsa_shrink_latent=True)
-        )
 
     def test_dense_prefix_compare_direct_call_logs_path_before_compare(self):
         class Owner:

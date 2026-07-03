@@ -836,54 +836,6 @@ def _dsa_req_id_key(req_id: object) -> str:
     return str(req_id)
 
 
-def _sfa_is_decode_state(attn_metadata: Any) -> bool:
-    return getattr(attn_metadata, "attn_state", None) in (
-        AscendAttentionState.DecodeOnly,
-        AscendAttentionState.SpecDecoding,
-    )
-
-
-def _sfa_has_decode_rows(attn_metadata: Any) -> bool:
-    try:
-        return int(getattr(attn_metadata, "num_decode_tokens", 0) or 0) > 0
-    except (TypeError, ValueError):
-        return False
-
-
-def _sfa_has_prompt_lens_rows(attn_metadata: Any) -> bool:
-    return getattr(attn_metadata, "prompt_lens", None) is not None
-
-
-def _sfa_is_dsa_recalc_last_step(
-    attn_metadata: Any,
-    *,
-    dsa_shrink_latent: bool,
-) -> bool:
-    """Decode-labeled full prefix hit where the only row is still prompt."""
-    return (
-        dsa_shrink_latent
-        and _sfa_is_decode_state(attn_metadata)
-        and _sfa_has_prompt_lens_rows(attn_metadata)
-        and not _sfa_has_decode_rows(attn_metadata)
-    )
-
-
-def _sfa_is_real_decode_step(
-    attn_metadata: Any,
-    *,
-    dsa_shrink_latent: bool,
-) -> bool:
-    """True for actual generated-token decode, not full-hit recalc-last."""
-    if not _sfa_is_decode_state(attn_metadata):
-        return False
-    if _sfa_is_dsa_recalc_last_step(
-        attn_metadata,
-        dsa_shrink_latent=dsa_shrink_latent,
-    ):
-        return False
-    return True
-
-
 _DENSE_PREFIX_COMPARE_BASELINE: dict[tuple[str, str], dict[str, Any]] = {}
 _DENSE_PREFIX_COMPARE_LOCKED_KEYS: set[tuple[str, str]] = set()
 _DENSE_PREFIX_COMPARE_EMITTED_KEYS: set[tuple[str, str, str]] = set()
@@ -3623,20 +3575,14 @@ class AscendSFAImpl(MLAAttentionImpl):
                         reach_layer_for_shard_weight_series(layer)
             return output.fill_(0)
 
-        _is_pure_decode = _sfa_is_real_decode_step(
-            attn_metadata,
-            dsa_shrink_latent=bool(self.dsa_shrink_latent),
-        )
-        _is_dsa_recalc_last = _sfa_is_dsa_recalc_last_step(
-            attn_metadata,
-            dsa_shrink_latent=bool(self.dsa_shrink_latent),
-        )
-        _is_decode_only = (
+        _dsa_prof.set_step_kind(
             attn_metadata.attn_state == AscendAttentionState.DecodeOnly
-            and _is_pure_decode
         )
-        _dsa_prof.set_step_kind(_is_decode_only)
         _sfa_t = _dsa_prof.begin("sfa_fwd")
+        _is_pure_decode = attn_metadata.attn_state in (
+            AscendAttentionState.DecodeOnly,
+            AscendAttentionState.SpecDecoding,
+        )
         index_layer_name = (
             _dsa_indexer_layer_name(layer_name)
             if self.dsa_offload_unbundle
@@ -3695,10 +3641,10 @@ class AscendSFAImpl(MLAAttentionImpl):
         o_proj_full_handle = None
         # if is PD mix stage, using original TP o_proj weight, and also need to full gather for o_proj
         # weight for prefill stage.
-        full_gather_o_proj_enabled = (
-            self.enable_dsa_cp_with_o_proj_tp
-            and not _is_pure_decode
-        )
+        full_gather_o_proj_enabled = self.enable_dsa_cp_with_o_proj_tp and attn_metadata.attn_state not in {
+            AscendAttentionState.DecodeOnly,
+            AscendAttentionState.SpecDecoding,
+        }
 
         # run mlapo ops when dsa-cp is disabled, and ensure that num_tokens satisfies the count limitation
         if self.enable_mlapo and num_input_tokens <= MLAPO_MAX_SUPPORTED_TOKENS:
@@ -3779,7 +3725,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                     with _dsa_prof.section("exec_kv_slots"):
                         _pslots, _pknope, _pkpe = _dsa_mgr_xkv.pool_exec_kv_slots(
                             layer_name, _fc.dsa_req_ids, _qsl, _ctx,
-                            decode=_is_decode_only,
+                            decode=attn_metadata.attn_state == AscendAttentionState.DecodeOnly,
                         )
                     with _dsa_prof.section("exec_kv_op"):
                         k_pe, k_nope = self.exec_kv(
@@ -4309,7 +4255,7 @@ class AscendSFAImpl(MLAAttentionImpl):
             _req_ids_a = _dsa_fc.dsa_req_ids
             _kn_a = k_nope.reshape(-1, self.kv_lora_rank)
             _kp_a = k_pe.reshape(-1, self.qk_rope_head_dim)
-            if _is_decode_only:
+            if attn_metadata.attn_state == AscendAttentionState.DecodeOnly:
                 _adbg = envs.VLLM_ASCEND_DSA_ADAPTER_DEBUG
                 _sync_phases = (
                     set(p.strip() for p in envs.VLLM_ASCEND_DSA_ADAPTER_SYNC_PHASES.split(","))
@@ -4389,7 +4335,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                     attn_output = native_out  # generation uses the native result
                 else:
                     attn_output = adapter_out
-            elif not _is_dsa_recalc_last:
+            else:
                 # prefill: store this layer's prompt latent into the adapter backend so
                 # decode-time retrieve can fetch prefill-selected blocks; attention
                 # itself uses the native prefill path (attn_output stays None).
@@ -4408,7 +4354,7 @@ class AscendSFAImpl(MLAAttentionImpl):
             # no longer depends on the latent being resident in the paged cache (10b).
             _kn = k_nope.reshape(-1, self.kv_lora_rank)
             _kp = k_pe.reshape(-1, self.qk_rope_head_dim)
-            if _is_decode_only:
+            if attn_metadata.attn_state == AscendAttentionState.DecodeOnly:
                 # store this step's token into the growing decode pool, then gather the
                 # selected latent (prefill from LMCache, decode from pool) into scratch.
                 _cur_pos = attn_metadata.seq_lens.to(torch.long) - 1
@@ -4454,7 +4400,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                     attn_output = native_out  # safe: generation uses the native result
                 else:
                     attn_output = scratch_out
-            elif not _is_dsa_recalc_last:
+            else:
                 # prefill: (1) offload prompt latent to LMCache; (2) ALSO scatter it into
                 # the self-managed PagedLatentPool and run prefill attention from the pool
                 # (Route 1 / R1b). The vLLM paged latent is still written by the op, so
@@ -4553,7 +4499,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         # its dataclass default 0 on every step, prefill included), so gating on it
         # skipped the save unconditionally. Gate on attn_state instead, which the
         # builder does set: pure-decode steps are DecodeOnly/SpecDecoding.
-        if not (_is_pure_decode or _is_dsa_recalc_last):
+        if not _is_pure_decode:
             _dense_prefix_compare_cache(
                 self,
                 stage="capture_before_store",
@@ -4565,7 +4511,7 @@ class AscendSFAImpl(MLAAttentionImpl):
             )
         _skip_decode_save = (
             bool(self.dsa_shrink_latent)
-            and (_is_pure_decode or _is_dsa_recalc_last)
+            and _is_pure_decode
         )
         if not _skip_decode_save:
             if self.dsa_offload_unbundle and len(kv_cache) >= 2:
