@@ -19,6 +19,8 @@
 
 import copy
 import gc
+import os
+import time
 from types import NoneType
 
 import torch
@@ -74,6 +76,21 @@ torch_non_c_binding_in_graph_functions_npu["torch.npu.stream"] = TorchInGraphFun
 torch._dynamo.trace_rules.torch_name_rule_map.append(torch_non_c_binding_in_graph_functions_npu)  # noqa: E402
 
 
+def _startup_trace(rank: int, local_rank: int, message: str) -> None:
+    try:
+        pid = os.getpid()
+        path = f"/tmp/vllm_ascend_worker_startup_rank{rank}_pid{pid}.trace"
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(
+                f"{time.time():.6f} pid={pid} rank={rank} "
+                f"local_rank={local_rank} {message}\n"
+            )
+            f.flush()
+            os.fsync(f.fileno())
+    except Exception:
+        pass
+
+
 class NPUWorker(WorkerBase):
     def __init__(
         self,
@@ -86,6 +103,7 @@ class NPUWorker(WorkerBase):
         **kwargs,
     ):
         """Initialize the worker for Ascend."""
+        _startup_trace(rank, local_rank, "enter NPUWorker.__init__")
         if not envs_ascend.COMPILE_CUSTOM_KERNELS:
             logger.warning(
                 "COMPILE_CUSTOM_KERNELS is set to False. "
@@ -95,19 +113,40 @@ class NPUWorker(WorkerBase):
         # register patch for vllm
         from vllm_ascend.utils import adapt_patch
 
+        _startup_trace(rank, local_rank, "before adapt_patch")
         adapt_patch()
+        _startup_trace(rank, local_rank, "after adapt_patch")
 
         # Register ops when worker init.
+        _startup_trace(rank, local_rank, "before import ops")
         from vllm_ascend import ops
 
+        _startup_trace(rank, local_rank, "before register_dummy_fusion_op")
         ops.register_dummy_fusion_op()
-        if get_ascend_device_type() != AscendDeviceType.A5:
+        _startup_trace(rank, local_rank, "after register_dummy_fusion_op")
+        _startup_trace(rank, local_rank, "before get_ascend_device_type")
+        ascend_device_type = get_ascend_device_type()
+        _startup_trace(
+            rank,
+            local_rank,
+            f"after get_ascend_device_type value={ascend_device_type}",
+        )
+        if ascend_device_type != AscendDeviceType.A5:
+            _startup_trace(rank, local_rank, "before _register_atb_extensions")
             _register_atb_extensions()
+            _startup_trace(rank, local_rank, "after _register_atb_extensions")
+        _startup_trace(rank, local_rank, "before register_ascend_customop")
         register_ascend_customop(vllm_config)
+        _startup_trace(rank, local_rank, "after register_ascend_customop")
         # init ascend config and soc version
+        _startup_trace(rank, local_rank, "before init_ascend_config")
         init_ascend_config(vllm_config)
+        _startup_trace(rank, local_rank, "after init_ascend_config")
+        _startup_trace(rank, local_rank, "before check_ascend_device_type")
         check_ascend_device_type()
+        _startup_trace(rank, local_rank, "after check_ascend_device_type")
 
+        _startup_trace(rank, local_rank, "before WorkerBase.__init__")
         super().__init__(
             vllm_config=vllm_config,
             local_rank=local_rank,
@@ -115,6 +154,7 @@ class NPUWorker(WorkerBase):
             distributed_init_method=distributed_init_method,
             is_driver_worker=is_driver_worker,
         )
+        _startup_trace(rank, local_rank, "after WorkerBase.__init__")
 
         if self.cache_config.cache_dtype == "auto":
             self.cache_dtype = self.model_config.dtype
