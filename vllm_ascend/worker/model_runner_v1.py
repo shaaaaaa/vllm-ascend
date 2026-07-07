@@ -2772,6 +2772,83 @@ class NPUModelRunner(GPUModelRunner):
                     supports_dsa_index_lmcache,
                     disable_dsa_index_lmcache,
                 )
+            hf_text_config = getattr(self.model_config, "hf_text_config", None)
+            hf_config = getattr(self.model_config, "hf_config", None)
+            base_num_layers = getattr(hf_text_config, "num_hidden_layers", None)
+            if base_num_layers is None:
+                base_num_layers = getattr(hf_config, "num_hidden_layers", None)
+            num_nextn_predict_layers = getattr(
+                hf_text_config, "num_nextn_predict_layers", None
+            )
+            if num_nextn_predict_layers is None:
+                num_nextn_predict_layers = getattr(
+                    hf_config, "num_nextn_predict_layers", None
+                )
+
+            def _layer_index_from_name(layer_name: str) -> int | None:
+                marker = "model.layers."
+                marker_pos = layer_name.find(marker)
+                if marker_pos < 0:
+                    return None
+                suffix = layer_name[marker_pos + len(marker):]
+                layer_part = suffix.split(".", 1)[0]
+                try:
+                    return int(layer_part)
+                except ValueError:
+                    return None
+
+            def _is_mtp_layer_name(layer_name: str) -> bool:
+                layer_idx = _layer_index_from_name(layer_name)
+                return (
+                    base_num_layers is not None
+                    and layer_idx is not None
+                    and layer_idx >= int(base_num_layers)
+                )
+
+            def _kv_shape_summary(kv_cache: Any) -> Any:
+                if isinstance(kv_cache, torch.Tensor):
+                    return list(kv_cache.shape)
+                if isinstance(kv_cache, (list, tuple)):
+                    return [_kv_shape_summary(item) for item in kv_cache]
+                return type(kv_cache).__name__
+
+            registered_names = list(kv_caches_to_register.keys())
+            latent_names = [
+                name for name in registered_names if "indexer" not in name
+            ]
+            indexer_names = [
+                name for name in registered_names if "indexer" in name
+            ]
+            mtp_names = [
+                name for name in registered_names if _is_mtp_layer_name(name)
+            ]
+            latent_tail_shapes = [
+                (name, _kv_shape_summary(kv_caches_to_register[name]))
+                for name in latent_names[-3:]
+            ]
+            indexer_tail_shapes = [
+                (name, _kv_shape_summary(kv_caches_to_register[name]))
+                for name in indexer_names[-3:]
+            ]
+            logger.info(
+                "[MTP_KV_DIAG][register_kv_caches] total=%d registered=%d "
+                "base_num_layers=%s num_nextn_predict_layers=%s "
+                "dsa_unbundle=%s register_full_dsa_kv_caches=%s "
+                "latent_registered=%d indexer_registered=%d mtp_registered=%d "
+                "mtp_names=%s latent_tail_shapes=%s indexer_tail_shapes=%s",
+                len(kv_caches),
+                len(kv_caches_to_register),
+                base_num_layers,
+                num_nextn_predict_layers,
+                self.dsa_unbundle,
+                register_full_dsa_kv_caches,
+                len(latent_names),
+                len(indexer_names),
+                len(mtp_names),
+                mtp_names[-8:],
+                latent_tail_shapes,
+                indexer_tail_shapes,
+            )
             kv_transfer_group.register_kv_caches(kv_caches_to_register)
 
         self._maybe_init_dsa_latent_offload()
