@@ -74,6 +74,10 @@ at::Tensor npu_lightning_indexer_quant(
                     lightning_indexer_quant_output
                 );
 
+    // EXEC_NPU_CMD uses stream(false), which skips torch-npu taskQ draining.
+    // The indexer result is consumed immediately by PyTorch ops, so publish the
+    // queued ACLNN launch on the current stream before returning the tensor.
+    (void)c10_npu::getCurrentNPUStream().stream();
     return lightning_indexer_quant_output;
 
 }
