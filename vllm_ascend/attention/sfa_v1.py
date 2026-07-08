@@ -130,6 +130,12 @@ _DSA_INDEXER_DIAG_MAX_DIGEST_NUMEL = _dsa_env_int(
 _DSA_INDEXER_DIAG_KEY_SAMPLE_TOKENS = _dsa_env_int(
     "VLLM_ASCEND_DSA_INDEXER_DIAG_KEY_SAMPLE_TOKENS", 128
 )
+_DSA_SYNC_PROBES = {
+    probe.strip().lower()
+    for probe in os.getenv("VLLM_ASCEND_DSA_SYNC_PROBE", "").split(",")
+    if probe.strip()
+}
+_DSA_SYNC_PROBE_ONCE: set[tuple[str, str | None]] = set()
 
 
 def _dsa_debug_sample(value, limit: int = 8) -> list:
@@ -280,6 +286,25 @@ def _dsa_diag_write_json(path: str, payload: dict[str, Any]) -> None:
     with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump(payload, f, sort_keys=True, indent=2)
     os.replace(tmp_path, path)
+
+
+def _dsa_sync_probe(name: str, layer_name: str | None = None) -> None:
+    if name not in _DSA_SYNC_PROBES and "all" not in _DSA_SYNC_PROBES:
+        return
+    try:
+        torch.npu.synchronize()
+    except Exception:
+        logger.warning(
+            "[DSA_SYNC_PROBE_ERROR] probe=%s layer=%s failed",
+            name,
+            layer_name,
+            exc_info=True,
+        )
+        return
+    log_key = (name, layer_name)
+    if log_key not in _DSA_SYNC_PROBE_ONCE:
+        _DSA_SYNC_PROBE_ONCE.add(log_key)
+        logger.warning("[DSA_SYNC_PROBE] probe=%s layer=%s", name, layer_name)
 
 
 def _dsa_topk_to_2d_indices(topk_indices: torch.Tensor) -> torch.Tensor:
@@ -2243,6 +2268,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                         f"bad_hit={bad_block_hit}"
                     )
 
+        _dsa_sync_probe("before_sparse_fa", layer_name)
         attn_output = torch.ops._C_ascend.npu_sparse_flash_attention(
             query=ql_nope,
             key=kv,
@@ -2518,6 +2544,7 @@ class AscendSFAImpl(MLAAttentionImpl):
             if self.is_kv_producer:
                 attn_metadata.reshape_cache_event.record()
 
+        _dsa_sync_probe("before_indexer", layer_name)
         with _dsa_prof.section("indexer"):
             topk_indices = self.indexer_select_post_process(
                 x=hidden_states,
@@ -2530,6 +2557,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                 actual_seq_lengths_key=actual_seq_lengths_key,
                 layer_name=layer_name,
             )
+        _dsa_sync_probe("after_indexer", layer_name)
 
         # DSA Step B2 (compact-scratch decode): the indexer just produced topk.
         # Remap prefill-selected entries to compact scratch rows [0..n_ret) (the
@@ -2570,6 +2598,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                     need_packed=_need_packed,
                     scratch_base=_scratch_base,
                 )
+            _dsa_sync_probe("after_scratch_remap", layer_name)
             # Stage 3 = isolation diagnostic: remap + FA on (garbage) scratch but
             # NO LMCache call. Output is expected wrong; only crash/no-crash
             # matters (crash => our remap/FA, clean => LMCache transfer kernel).
@@ -2667,6 +2696,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                         target_slot_mapping=_target_slot_mapping_for_wait,
                         request_ids=_request_ids_for_wait,
                     )
+                _dsa_sync_probe("after_lmc_retrieve", layer_name)
 
         # DSA latent KV offload (GLM5.1), single-card native non-CP path only:
         #   * prefill steps  -> store this layer's prompt latent, use native attention;
