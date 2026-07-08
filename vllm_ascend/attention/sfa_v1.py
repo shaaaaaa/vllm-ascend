@@ -154,6 +154,22 @@ _DSA_SYNC_PROBES = {
     for probe in os.getenv("VLLM_ASCEND_DSA_SYNC_PROBE", "").split(",")
     if probe.strip()
 }
+_DSA_STREAM_DIAG = os.getenv("VLLM_ASCEND_DSA_STREAM_DIAG", "0").lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+_DSA_EVENT_SYNC_PROBES = {
+    probe.strip().lower()
+    for probe in os.getenv("VLLM_ASCEND_DSA_EVENT_SYNC_PROBE", "").split(",")
+    if probe.strip()
+}
+_DSA_CURRENT_STREAM_SYNC_PROBES = {
+    probe.strip().lower()
+    for probe in os.getenv("VLLM_ASCEND_DSA_CURRENT_STREAM_SYNC_PROBE", "").split(",")
+    if probe.strip()
+}
 _DSA_SYNC_PROBE_ONCE: set[tuple[str, str | None]] = set()
 _DSA_MATERIALIZE_PROBE_LOGGED: set[tuple[str, str | None]] = set()
 
@@ -334,6 +350,72 @@ def _dsa_sync_probe(name: str, layer_name: str | None = None) -> None:
         logger.warning("[DSA_SYNC_PROBE] probe=%s layer=%s", name, layer_name)
 
 
+def _dsa_describe_stream(stream: Any) -> Any:
+    if stream is None:
+        return None
+    try:
+        return {
+            "type": type(stream).__name__,
+            "npu_stream": getattr(stream, "npu_stream", None),
+            "cuda_stream": getattr(stream, "cuda_stream", None),
+            "device": str(getattr(stream, "device", None)),
+        }
+    except Exception as exc:
+        return f"{type(exc).__name__}: {exc}"
+
+
+def _dsa_current_stream_summary() -> Any:
+    summary: dict[str, Any] = {}
+    try:
+        summary["npu"] = _dsa_describe_stream(torch.npu.current_stream())
+    except Exception as exc:
+        summary["npu"] = f"{type(exc).__name__}: {exc}"
+    try:
+        summary["cuda"] = _dsa_describe_stream(torch.cuda.current_stream())
+    except Exception as exc:
+        summary["cuda"] = f"{type(exc).__name__}: {exc}"
+    return summary
+
+
+def _dsa_stream_diag(label: str, layer_name: str | None = None, **kwargs) -> None:
+    if not _DSA_STREAM_DIAG:
+        return
+    logger.warning(
+        "[DSA_STREAM_DIAG] label=%s layer=%s streams=%s extra=%s",
+        label,
+        layer_name,
+        _dsa_current_stream_summary(),
+        kwargs,
+    )
+
+
+def _dsa_event_sync_probe_enabled(name: str) -> bool:
+    return name in _DSA_EVENT_SYNC_PROBES or "all" in _DSA_EVENT_SYNC_PROBES
+
+
+def _dsa_current_stream_sync_probe(name: str, layer_name: str | None = None) -> None:
+    if (
+        name not in _DSA_CURRENT_STREAM_SYNC_PROBES
+        and "all" not in _DSA_CURRENT_STREAM_SYNC_PROBES
+    ):
+        return
+    try:
+        torch.npu.current_stream().synchronize()
+    except Exception:
+        logger.warning(
+            "[DSA_CURRENT_STREAM_SYNC_PROBE_ERROR] probe=%s layer=%s failed",
+            name,
+            layer_name,
+            exc_info=True,
+        )
+    else:
+        logger.warning(
+            "[DSA_CURRENT_STREAM_SYNC_PROBE] probe=%s layer=%s",
+            name,
+            layer_name,
+        )
+
+
 def _dsa_materialize_probe_enabled(name: str) -> bool:
     return name in _DSA_MATERIALIZE_PROBES or "all" in _DSA_MATERIALIZE_PROBES
 
@@ -410,12 +492,28 @@ def _dsa_record_selected_payload_event(
             f"LMCache handoff: layer={layer_name!r}, devices={sorted(device_types)}"
         )
     try:
+        _dsa_stream_diag(
+            "selected_event_before_publish",
+            layer_name,
+            devices=sorted(device_types),
+        )
         # Make torch-npu publish queued remap/index-select producers before the
         # event is recorded. LMCache waits on this before doing its own row
         # selection/packing, which is earlier than the connector transfer event.
         torch_npu._C._npu_getCurrentRawStream(int(torch.npu.current_device()))
+        _dsa_stream_diag("selected_event_before_record", layer_name)
         event = torch.npu.Event()
         event.record(torch.npu.current_stream())
+        _dsa_stream_diag("selected_event_after_record", layer_name)
+        # Publish the event record itself before handing it to LMCache. A plain
+        # event.record can also be queued in torch-npu's task queue; without this
+        # second publish, the consumer stream may wait on an event whose record
+        # has not been submitted yet.
+        torch_npu._C._npu_getCurrentRawStream(int(torch.npu.current_device()))
+        _dsa_stream_diag("selected_event_after_publish", layer_name)
+        if _dsa_event_sync_probe_enabled("before_lmc_selected"):
+            event.synchronize()
+            _dsa_stream_diag("selected_event_after_synchronize", layer_name)
         return event
     except Exception as exc:
         raise RuntimeError(
@@ -2280,6 +2378,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         # So two branches are maintained temporarily.
         # TODO: torch.ops._C_ascend.npu_lightning_indexer needs to be removed.
         if self.use_sparse_c8_indexer:
+            _dsa_stream_diag("indexer_branch_before", layer_name, impl="custom_quant")
             assert len(kv_cache) == 4
             weights = weights.to(torch.float16)
             diag_q_li = q_li.view(q_li_shape_ori)
@@ -2301,7 +2400,9 @@ class AscendSFAImpl(MLAAttentionImpl):
                 sparse_count=self.index_topk,
                 sparse_mode=3,
             )
+            _dsa_stream_diag("indexer_branch_after", layer_name, impl="custom_quant")
         elif self.use_torch_npu_lightning_indexer:
+            _dsa_stream_diag("indexer_branch_before", layer_name, impl="torch_npu")
             topk_indices, _ = torch_npu.npu_lightning_indexer(
                 query=q_li,
                 key=kv_cache[2],
@@ -2314,7 +2415,9 @@ class AscendSFAImpl(MLAAttentionImpl):
                 sparse_count=self.index_topk,
                 sparse_mode=3,
             )
+            _dsa_stream_diag("indexer_branch_after", layer_name, impl="torch_npu")
         else:
+            _dsa_stream_diag("indexer_branch_before", layer_name, impl="custom")
             topk_indices = torch.ops._C_ascend.npu_lightning_indexer(
                 query=q_li,
                 key=kv_cache[2],
@@ -2327,6 +2430,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                 sparse_count=self.index_topk,
                 sparse_mode=3,
             )
+            _dsa_stream_diag("indexer_branch_after", layer_name, impl="custom")
         _dsa_materialize_topk_after_indexer(topk_indices, layer_name)
         if _DSA_INDEXER_DIAG:
             try:
@@ -2734,6 +2838,7 @@ class AscendSFAImpl(MLAAttentionImpl):
             if self.is_kv_producer:
                 attn_metadata.reshape_cache_event.record()
 
+        _dsa_stream_diag("before_indexer", layer_name)
         _dsa_sync_probe("before_indexer", layer_name)
         with _dsa_prof.section("indexer"):
             topk_indices = self.indexer_select_post_process(
@@ -2747,6 +2852,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                 actual_seq_lengths_key=actual_seq_lengths_key,
                 layer_name=layer_name,
             )
+        _dsa_stream_diag("after_indexer", layer_name)
         _dsa_sync_probe("after_indexer", layer_name)
 
         # DSA Step B2 (compact-scratch decode): the indexer just produced topk.
@@ -2798,6 +2904,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                 _sel_packed,
                 layer_name,
             )
+            _dsa_stream_diag("after_scratch_remap", layer_name)
             _dsa_sync_probe("after_scratch_remap", layer_name)
             # Stage 3 = isolation diagnostic: remap + FA on (garbage) scratch but
             # NO LMCache call. Output is expected wrong; only crash/no-crash
@@ -2899,6 +3006,12 @@ class AscendSFAImpl(MLAAttentionImpl):
                     _target_slot_mapping_for_wait,
                     layer_name,
                 )
+                _dsa_stream_diag(
+                    "before_lmc_selected",
+                    layer_name,
+                    has_payload_event=_selected_payload_event is not None,
+                )
+                _dsa_current_stream_sync_probe("before_lmc_selected", layer_name)
                 _dsa_sync_probe("before_lmc_selected", layer_name)
                 with _dsa_prof.section("lmc_retrieve"):
                     _wait_fn(

@@ -20,6 +20,9 @@
 #include <ATen/Tensor.h>
 #include <acl/acl_base.h>
 #include <c10/util/Exception.h>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <dlfcn.h>
 #include <functional>
 #include <type_traits>
@@ -536,6 +539,17 @@ typedef void (*ReleaseHugeMem)(void *, bool);
         #aclnn_api, " or ", #aclnn_api "GetWorkspaceSize", " not in ",        \
         GetOpApiLibName(), ", or ", GetOpApiLibName(), "not found.");         \
     auto acl_stream = c10_npu::getCurrentNPUStream().stream(false);           \
+    const char *dsa_stream_diag = std::getenv("VLLM_ASCEND_DSA_STREAM_DIAG"); \
+    if (dsa_stream_diag != nullptr && dsa_stream_diag[0] != '\0' &&           \
+        dsa_stream_diag[0] != '0' &&                                          \
+        (std::strcmp(dsa_stream_diag, "all") == 0 ||                         \
+         std::strstr(#aclnn_api, "LightningIndexer") != nullptr ||           \
+         std::strstr(#aclnn_api, "SparseFlashAttention") != nullptr)) {      \
+      std::fprintf(stderr,                                                    \
+                   "[DSA_STREAM_DIAG] EXEC_NPU_CMD api=%s acl_stream=%p\n",   \
+                   #aclnn_api, reinterpret_cast<void *>(acl_stream));         \
+      std::fflush(stderr);                                                    \
+    }                                                                         \
     uint64_t workspace_size = 0;                                              \
     uint64_t *workspace_size_addr = &workspace_size;                          \
     aclOpExecutor *executor = nullptr;                                        \
