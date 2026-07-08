@@ -141,12 +141,16 @@ _DSA_INDEXER_DIAG_COMPONENTS = {
 _DSA_INDEXER_DIAG_SLEEP_MS = _dsa_env_int(
     "VLLM_ASCEND_DSA_INDEXER_DIAG_SLEEP_MS", 0
 )
+_DSA_MATERIALIZE_TOPK_AFTER_INDEXER = os.getenv(
+    "VLLM_ASCEND_DSA_MATERIALIZE_TOPK_AFTER_INDEXER", "0"
+).lower() in ("1", "true", "yes", "on")
 _DSA_SYNC_PROBES = {
     probe.strip().lower()
     for probe in os.getenv("VLLM_ASCEND_DSA_SYNC_PROBE", "").split(",")
     if probe.strip()
 }
 _DSA_SYNC_PROBE_ONCE: set[tuple[str, str | None]] = set()
+_DSA_MATERIALIZE_TOPK_LOGGED: set[str | None] = set()
 
 
 def _dsa_debug_sample(value, limit: int = 8) -> list:
@@ -323,6 +327,33 @@ def _dsa_sync_probe(name: str, layer_name: str | None = None) -> None:
     if log_key not in _DSA_SYNC_PROBE_ONCE:
         _DSA_SYNC_PROBE_ONCE.add(log_key)
         logger.warning("[DSA_SYNC_PROBE] probe=%s layer=%s", name, layer_name)
+
+
+def _dsa_materialize_topk_after_indexer(
+    topk_indices: torch.Tensor,
+    layer_name: str | None,
+) -> None:
+    if not _DSA_MATERIALIZE_TOPK_AFTER_INDEXER:
+        return
+    if not isinstance(topk_indices, torch.Tensor) or topk_indices.numel() == 0:
+        return
+    try:
+        # The diagnostic result showed that a CPU readback of topk_indices after
+        # the indexer, before scratch_remap/LMCache selected-token retrieval,
+        # stabilizes first-run vs prefix-hit runs. Keep the workaround minimal:
+        # read only one int32 element, do not hash, do not dump, and leave the
+        # original NPU tensor unchanged for downstream kernels.
+        topk_indices.detach().reshape(-1)[:1].to(device="cpu").item()
+    except Exception:
+        logger.warning(
+            "[DSA_TOPK_MATERIALIZE_ERROR] layer=%s failed",
+            layer_name,
+            exc_info=True,
+        )
+        return
+    if layer_name not in _DSA_MATERIALIZE_TOPK_LOGGED:
+        _DSA_MATERIALIZE_TOPK_LOGGED.add(layer_name)
+        logger.warning("[DSA_TOPK_MATERIALIZE] layer=%s", layer_name)
 
 
 def _dsa_topk_to_2d_indices(topk_indices: torch.Tensor) -> torch.Tensor:
@@ -2228,6 +2259,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                 sparse_count=self.index_topk,
                 sparse_mode=3,
             )
+        _dsa_materialize_topk_after_indexer(topk_indices, layer_name)
         if _DSA_INDEXER_DIAG:
             try:
                 self._dsa_indexer_diag_log(
