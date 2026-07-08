@@ -58,6 +58,11 @@ at::Tensor npu_sparse_flash_attention(
         layout_kv_ptr,
         sparse_mode,
         output);
+    // EXEC_NPU_CMD enqueues the custom handler through OpCommand, but captures
+    // the raw ACL stream with stream(false). Publish the queued producers
+    // (scratch-remap / LMCache wait tasks) and this sparse FA launch before
+    // downstream PyTorch ops consume the output.
+    (void)c10_npu::getCurrentNPUStream().stream();
     return output;
 }    
 }
