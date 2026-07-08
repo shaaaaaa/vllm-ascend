@@ -3006,10 +3006,16 @@ class AscendSFAImpl(MLAAttentionImpl):
                     _target_slot_mapping_for_wait,
                     layer_name,
                 )
+                _selected_payload_stream = (
+                    torch.npu.current_stream()
+                    if _selected_payload_event is not None
+                    else None
+                )
                 _dsa_stream_diag(
                     "before_lmc_selected",
                     layer_name,
                     has_payload_event=_selected_payload_event is not None,
+                    payload_stream=_dsa_describe_stream(_selected_payload_stream),
                 )
                 _dsa_current_stream_sync_probe("before_lmc_selected", layer_name)
                 _dsa_sync_probe("before_lmc_selected", layer_name)
@@ -3020,6 +3026,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                         target_slot_mapping=_target_slot_mapping_for_wait,
                         request_ids=_request_ids_for_wait,
                         payload_event=_selected_payload_event,
+                        payload_stream=_selected_payload_stream,
                     )
                 _dsa_sync_probe("after_lmc_retrieve", layer_name)
 
