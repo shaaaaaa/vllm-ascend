@@ -144,13 +144,18 @@ _DSA_INDEXER_DIAG_SLEEP_MS = _dsa_env_int(
 _DSA_MATERIALIZE_TOPK_AFTER_INDEXER = os.getenv(
     "VLLM_ASCEND_DSA_MATERIALIZE_TOPK_AFTER_INDEXER", "0"
 ).lower() in ("1", "true", "yes", "on")
+_DSA_MATERIALIZE_PROBES = {
+    probe.strip().lower()
+    for probe in os.getenv("VLLM_ASCEND_DSA_MATERIALIZE_PROBE", "").split(",")
+    if probe.strip()
+}
 _DSA_SYNC_PROBES = {
     probe.strip().lower()
     for probe in os.getenv("VLLM_ASCEND_DSA_SYNC_PROBE", "").split(",")
     if probe.strip()
 }
 _DSA_SYNC_PROBE_ONCE: set[tuple[str, str | None]] = set()
-_DSA_MATERIALIZE_TOPK_LOGGED: set[str | None] = set()
+_DSA_MATERIALIZE_PROBE_LOGGED: set[tuple[str, str | None]] = set()
 
 
 def _dsa_debug_sample(value, limit: int = 8) -> list:
@@ -329,31 +334,54 @@ def _dsa_sync_probe(name: str, layer_name: str | None = None) -> None:
         logger.warning("[DSA_SYNC_PROBE] probe=%s layer=%s", name, layer_name)
 
 
-def _dsa_materialize_topk_after_indexer(
-    topk_indices: torch.Tensor,
+def _dsa_materialize_probe_enabled(name: str) -> bool:
+    return name in _DSA_MATERIALIZE_PROBES or "all" in _DSA_MATERIALIZE_PROBES
+
+
+def _dsa_materialize_tensor_probe(
+    name: str,
+    tensor: torch.Tensor,
     layer_name: str | None,
+    *,
+    force: bool = False,
 ) -> None:
-    if not _DSA_MATERIALIZE_TOPK_AFTER_INDEXER:
+    if not force and not _dsa_materialize_probe_enabled(name):
         return
-    if not isinstance(topk_indices, torch.Tensor) or topk_indices.numel() == 0:
+    if not isinstance(tensor, torch.Tensor) or tensor.numel() == 0:
         return
     try:
-        # The diagnostic result showed that a CPU readback of topk_indices after
-        # the indexer, before scratch_remap/LMCache selected-token retrieval,
-        # stabilizes first-run vs prefix-hit runs. Keep the workaround minimal:
-        # read only one int32 element, do not hash, do not dump, and leave the
-        # original NPU tensor unchanged for downstream kernels.
-        topk_indices.detach().reshape(-1)[:1].to(device="cpu").item()
+        # Keep ordering probes minimal: read one scalar, do not hash or dump, and
+        # leave the original NPU tensor unchanged for downstream kernels.
+        tensor.detach().reshape(-1)[:1].to(device="cpu").item()
     except Exception:
         logger.warning(
-            "[DSA_TOPK_MATERIALIZE_ERROR] layer=%s failed",
+            "[DSA_MATERIALIZE_PROBE_ERROR] probe=%s layer=%s failed",
+            name,
             layer_name,
             exc_info=True,
         )
         return
-    if layer_name not in _DSA_MATERIALIZE_TOPK_LOGGED:
-        _DSA_MATERIALIZE_TOPK_LOGGED.add(layer_name)
-        logger.warning("[DSA_TOPK_MATERIALIZE] layer=%s", layer_name)
+    log_key = (name, layer_name)
+    if log_key not in _DSA_MATERIALIZE_PROBE_LOGGED:
+        _DSA_MATERIALIZE_PROBE_LOGGED.add(log_key)
+        logger.warning("[DSA_MATERIALIZE_PROBE] probe=%s layer=%s", name, layer_name)
+
+
+def _dsa_materialize_topk_after_indexer(
+    topk_indices: torch.Tensor,
+    layer_name: str | None,
+) -> None:
+    if (
+        not _DSA_MATERIALIZE_TOPK_AFTER_INDEXER
+        and not _dsa_materialize_probe_enabled("after_indexer_raw")
+    ):
+        return
+    _dsa_materialize_tensor_probe(
+        "after_indexer_raw",
+        topk_indices,
+        layer_name,
+        force=_DSA_MATERIALIZE_TOPK_AFTER_INDEXER,
+    )
 
 
 def _dsa_topk_to_2d_indices(topk_indices: torch.Tensor) -> torch.Tensor:
@@ -2386,6 +2414,11 @@ class AscendSFAImpl(MLAAttentionImpl):
                     )
 
         _dsa_sync_probe("before_sparse_fa", layer_name)
+        _dsa_materialize_tensor_probe(
+            "before_sparse_fa_topk",
+            topk_indices,
+            layer_name,
+        )
         attn_output = torch.ops._C_ascend.npu_sparse_flash_attention(
             query=ql_nope,
             key=kv,
@@ -2715,6 +2748,16 @@ class AscendSFAImpl(MLAAttentionImpl):
                     need_packed=_need_packed,
                     scratch_base=_scratch_base,
                 )
+            _dsa_materialize_tensor_probe(
+                "after_remap_topk",
+                topk_indices,
+                layer_name,
+            )
+            _dsa_materialize_tensor_probe(
+                "after_remap_selected",
+                _sel_packed,
+                layer_name,
+            )
             _dsa_sync_probe("after_scratch_remap", layer_name)
             # Stage 3 = isolation diagnostic: remap + FA on (garbage) scratch but
             # NO LMCache call. Output is expected wrong; only crash/no-crash
@@ -2806,6 +2849,11 @@ class AscendSFAImpl(MLAAttentionImpl):
                         block_table=attn_metadata.block_table,
                     )
                 _wait_fn = wait_for_kv_layer_from_connector
+                _dsa_materialize_tensor_probe(
+                    "before_lmc_selected",
+                    _selected_for_wait,
+                    layer_name,
+                )
                 with _dsa_prof.section("lmc_retrieve"):
                     _wait_fn(
                         layer_name,
