@@ -384,6 +384,46 @@ def _dsa_materialize_topk_after_indexer(
     )
 
 
+def _dsa_device_tensor_types(value: Any) -> set[str]:
+    if isinstance(value, torch.Tensor):
+        return set() if value.device.type == "cpu" else {value.device.type}
+    if isinstance(value, (list, tuple)):
+        out: set[str] = set()
+        for item in value:
+            out.update(_dsa_device_tensor_types(item))
+        return out
+    return set()
+
+
+def _dsa_record_selected_payload_event(
+    selected_tokens: Any,
+    target_slot_mapping: Any,
+    layer_name: str | None,
+) -> Any | None:
+    device_types = _dsa_device_tensor_types(selected_tokens)
+    device_types.update(_dsa_device_tensor_types(target_slot_mapping))
+    if not device_types:
+        return None
+    if not (device_types <= {"npu", "privateuseone"}):
+        raise RuntimeError(
+            "DSA selected-token payload uses unsupported device types before "
+            f"LMCache handoff: layer={layer_name!r}, devices={sorted(device_types)}"
+        )
+    try:
+        # Make torch-npu publish queued remap/index-select producers before the
+        # event is recorded. LMCache waits on this before doing its own row
+        # selection/packing, which is earlier than the connector transfer event.
+        torch_npu._C._npu_getCurrentRawStream(int(torch.npu.current_device()))
+        event = torch.npu.Event()
+        event.record(torch.npu.current_stream())
+        return event
+    except Exception as exc:
+        raise RuntimeError(
+            "Failed to record DSA selected-token producer event before LMCache "
+            f"handoff: layer={layer_name!r}"
+        ) from exc
+
+
 def _dsa_topk_to_2d_indices(topk_indices: torch.Tensor) -> torch.Tensor:
     if topk_indices.dim() == 3 and topk_indices.shape[1] == 1:
         return topk_indices[:, 0, :]
@@ -2854,6 +2894,11 @@ class AscendSFAImpl(MLAAttentionImpl):
                     _selected_for_wait,
                     layer_name,
                 )
+                _selected_payload_event = _dsa_record_selected_payload_event(
+                    _selected_for_wait,
+                    _target_slot_mapping_for_wait,
+                    layer_name,
+                )
                 _dsa_sync_probe("before_lmc_selected", layer_name)
                 with _dsa_prof.section("lmc_retrieve"):
                     _wait_fn(
@@ -2861,6 +2906,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                         selected_tokens=_selected_for_wait,
                         target_slot_mapping=_target_slot_mapping_for_wait,
                         request_ids=_request_ids_for_wait,
+                        payload_event=_selected_payload_event,
                     )
                 _dsa_sync_probe("after_lmc_retrieve", layer_name)
 

@@ -326,6 +326,7 @@ def wait_for_kv_layer_from_connector(
     token_start_index=None,
     request_ids=None,
     target_slot_mapping=None,
+    payload_event=None,
 ):
     if not has_kv_transfer_group() or not is_v1_kv_transfer_group():
         return
@@ -337,7 +338,11 @@ def wait_for_kv_layer_from_connector(
         try:
             if target_slot_mapping is None:
                 connector.wait_for_layer_load(
-                    layer_name, selected_tokens, token_start_index, request_ids
+                    layer_name,
+                    selected_tokens,
+                    token_start_index,
+                    request_ids,
+                    payload_event=payload_event,
                 )
             else:
                 connector.wait_for_layer_load(
@@ -346,6 +351,7 @@ def wait_for_kv_layer_from_connector(
                     token_start_index,
                     request_ids,
                     target_slot_mapping=target_slot_mapping,
+                    payload_event=payload_event,
                 )
         except Exception:
             logger.exception(
@@ -397,7 +403,11 @@ def wait_for_kv_layer_from_connector(
                 request_ids = list(dsa_req_ids[: selected_tokens.shape[0]])
             if target_slot_mapping is None:
                 connector.wait_for_layer_load(
-                    layer_name, selected_tokens, token_start_index, request_ids
+                    layer_name,
+                    selected_tokens,
+                    token_start_index,
+                    request_ids,
+                    payload_event=payload_event,
                 )
             else:
                 connector.wait_for_layer_load(
@@ -406,6 +416,7 @@ def wait_for_kv_layer_from_connector(
                     token_start_index,
                     request_ids,
                     target_slot_mapping=target_slot_mapping,
+                    payload_event=payload_event,
                 )
         else:
             connector.wait_for_layer_load(layer_name)
