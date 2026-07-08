@@ -2854,6 +2854,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                     _selected_for_wait,
                     layer_name,
                 )
+                _dsa_sync_probe("before_lmc_selected", layer_name)
                 with _dsa_prof.section("lmc_retrieve"):
                     _wait_fn(
                         layer_name,
