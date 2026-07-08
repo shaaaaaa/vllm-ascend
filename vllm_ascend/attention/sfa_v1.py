@@ -1,5 +1,11 @@
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, TypeVar
+import hashlib
+import io
+import json
+import os
+import re
+import time
 import scipy  # type: ignore
 import numpy as np
 import torch
@@ -73,6 +79,48 @@ if TYPE_CHECKING:
 # token count limits within bmm_transpose operator
 BMM_TRANS_MAX_SUPPORTED_TOKENS = 1024
 _DSA_TARGET_SLOT_GUARD = envs.VLLM_ASCEND_DSA_TARGET_SLOT_GUARD
+_DSA_INDEXER_DIAG = os.getenv("VLLM_ASCEND_DSA_INDEXER_DIAG", "0").lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+_DSA_INDEXER_DIAG_DUMP = os.getenv(
+    "VLLM_ASCEND_DSA_INDEXER_DIAG_DUMP", "0"
+).lower() in ("1", "true", "yes", "on")
+_DSA_INDEXER_DIAG_DUMP_FULL_KEY = os.getenv(
+    "VLLM_ASCEND_DSA_INDEXER_DIAG_DUMP_FULL_KEY", "0"
+).lower() in ("1", "true", "yes", "on")
+_DSA_INDEXER_DIAG_DUMP_DIR = os.getenv(
+    "VLLM_ASCEND_DSA_INDEXER_DIAG_DUMP_DIR",
+    "/tmp/vllm_dsa_indexer_diag",
+)
+_DSA_INDEXER_DIAG_SESSION_ID = os.getenv(
+    "VLLM_ASCEND_DSA_INDEXER_DIAG_SESSION_ID"
+) or f"pid{os.getpid()}_{int(time.time() * 1000)}"
+_DSA_INDEXER_DIAG_RUNS: dict[str, int] = {}
+_DSA_INDEXER_DIAG_REQ_RUNS: dict[str, tuple[str, int]] = {}
+
+
+def _dsa_env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except ValueError:
+        logger.warning(
+            "Invalid integer env %s=%r; using %s",
+            name,
+            os.getenv(name),
+            default,
+        )
+        return default
+
+
+_DSA_INDEXER_DIAG_LAYERS = _dsa_env_int(
+    "VLLM_ASCEND_DSA_INDEXER_DIAG_LAYERS", 8
+)
+_DSA_INDEXER_DIAG_SAMPLE_VALUES = _dsa_env_int(
+    "VLLM_ASCEND_DSA_INDEXER_DIAG_VALUES", 8
+)
 
 
 def _dsa_debug_sample(value, limit: int = 8) -> list:
@@ -90,6 +138,94 @@ def _dsa_debug_minmax_count(value) -> tuple[object, object, int] | None:
         flat.max().to(device="cpu").item(),
         int(flat.numel()),
     )
+
+
+def _dsa_diag_safe_name(value: Any) -> str:
+    raw = str(value if value is not None else "none")
+    return "".join(
+        ch if ch.isalnum() or ch in ("-", "_", ".") else "_"
+        for ch in raw
+    )[:160]
+
+
+def _dsa_diag_layer_id(layer_name: str | None) -> int:
+    match = re.search(r"layers\.(\d+)", str(layer_name))
+    return int(match.group(1)) if match else -1
+
+
+def _dsa_diag_tensor_digest(
+    value: Any,
+    *,
+    include_stride: bool = True,
+) -> str | None:
+    if not isinstance(value, torch.Tensor):
+        return None
+    h = hashlib.blake2b(digest_size=16)
+    h.update(str(tuple(int(dim) for dim in value.shape)).encode("utf-8"))
+    h.update(str(value.dtype).encode("utf-8"))
+    if include_stride:
+        h.update(
+            str(tuple(int(stride) for stride in value.stride())).encode(
+                "utf-8"
+            )
+        )
+    try:
+        cpu = value.detach().to(device="cpu").contiguous()
+        try:
+            raw = cpu.view(torch.uint8).numpy().tobytes()
+        except Exception:
+            buf = io.BytesIO()
+            torch.save(cpu, buf)
+            raw = buf.getvalue()
+        h.update(raw)
+    except Exception as exc:
+        h.update(f"digest_error:{type(exc).__name__}:{exc}".encode("utf-8"))
+    return h.hexdigest()
+
+
+def _dsa_diag_tensor_summary(value: Any) -> dict[str, Any]:
+    if not isinstance(value, torch.Tensor):
+        return {"type": type(value).__name__, "value": value}
+    return {
+        "type": "Tensor",
+        "shape": tuple(int(dim) for dim in value.shape),
+        "stride": tuple(int(stride) for stride in value.stride()),
+        "dtype": str(value.dtype),
+        "device": str(value.device),
+        "numel": int(value.numel()),
+        "digest": _dsa_diag_tensor_digest(value),
+        "value_digest": _dsa_diag_tensor_digest(
+            value, include_stride=False
+        ),
+        "head": _dsa_debug_sample(value, _DSA_INDEXER_DIAG_SAMPLE_VALUES),
+    }
+
+
+def _dsa_diag_summary_path(
+    *,
+    session_id: str,
+    signature: str,
+    run: int,
+    layer_name: str | None,
+    tp_rank: int,
+) -> str:
+    return os.path.join(
+        _DSA_INDEXER_DIAG_DUMP_DIR,
+        (
+            f"{_dsa_diag_safe_name(session_id)}"
+            f"_{_dsa_diag_safe_name(signature)}"
+            f"_run{run}"
+            f"_{_dsa_diag_safe_name(layer_name)}"
+            f"_rank{tp_rank}_summary.json"
+        ),
+    )
+
+
+def _dsa_diag_write_json(path: str, payload: dict[str, Any]) -> None:
+    tmp_path = f"{path}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, sort_keys=True, indent=2)
+    os.replace(tmp_path, path)
 
 
 def _dsa_topk_to_2d_indices(topk_indices: torch.Tensor) -> torch.Tensor:
@@ -829,6 +965,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         self.tp_size = get_tensor_model_parallel_world_size()
         self.tp_rank = get_tp_group().rank_in_group
         self.q_b_proj = kwargs["q_b_proj"]
+        self._dsa_indexer_diag_seen: set[tuple[str, str]] = set()
 
         ascend_config = get_ascend_config()
         self.enable_shared_expert_dp = ascend_config.enable_shared_expert_dp
@@ -1373,6 +1510,373 @@ class AscendSFAImpl(MLAAttentionImpl):
 
         return k_li, k_li_scale
 
+    def _dsa_indexer_diag_req_ids(self, attn_metadata: M) -> list[str]:
+        req_ids = getattr(attn_metadata, "decode_request_ids_compact", None)
+        if not req_ids:
+            req_ids = getattr(attn_metadata, "req_ids", None)
+        if not req_ids:
+            return ["unknown"]
+        return [str(req_id) for req_id in req_ids]
+
+    def _dsa_indexer_diag_signature(
+        self,
+        *,
+        actual_seq_lengths_query: torch.Tensor,
+        actual_seq_lengths_key: torch.Tensor,
+    ) -> str:
+        h = hashlib.blake2b(digest_size=8)
+        for name, tensor in (
+            ("q", actual_seq_lengths_query),
+            ("k", actual_seq_lengths_key),
+        ):
+            h.update(name.encode("utf-8"))
+            h.update(_dsa_diag_tensor_digest(tensor).encode("utf-8"))
+        h.update(str(self.index_topk).encode("utf-8"))
+        h.update(str(self.block_size).encode("utf-8"))
+        return h.hexdigest()
+
+    def _dsa_indexer_diag_run(
+        self,
+        req_ids: list[str],
+        signature: str,
+    ) -> int:
+        primary_req_id = req_ids[0] if req_ids else "unknown"
+        cached = _DSA_INDEXER_DIAG_REQ_RUNS.get(primary_req_id)
+        if cached is not None and cached[0] == signature:
+            return cached[1]
+        run = _DSA_INDEXER_DIAG_RUNS.get(signature, 0) + 1
+        _DSA_INDEXER_DIAG_RUNS[signature] = run
+        _DSA_INDEXER_DIAG_REQ_RUNS[primary_req_id] = (signature, run)
+        return run
+
+    def _dsa_indexer_diag_active_rows(
+        self,
+        tensor: torch.Tensor | None,
+        block_table: torch.Tensor | None,
+        actual_seq_lengths_key: torch.Tensor,
+    ) -> tuple[torch.Tensor | None, dict[str, Any]]:
+        meta: dict[str, Any] = {
+            "block_size": int(self.block_size),
+            "errors": [],
+        }
+        if tensor is None:
+            meta["errors"].append("missing_tensor")
+            return None, meta
+        if block_table is None:
+            meta["errors"].append("missing_block_table")
+            return None, meta
+
+        try:
+            seq_lens = (
+                actual_seq_lengths_key.detach()
+                .to(device="cpu", dtype=torch.long)
+                .reshape(-1)
+                .tolist()
+            )
+            block_table_cpu = block_table.detach().to(device="cpu", dtype=torch.long)
+            max_reqs = min(len(seq_lens), int(block_table_cpu.shape[0]))
+            rows: list[torch.Tensor] = []
+            request_records: list[dict[str, Any]] = []
+            for req_idx in range(max_reqs):
+                seq_len = max(0, int(seq_lens[req_idx]))
+                num_blocks = (seq_len + int(self.block_size) - 1) // int(
+                    self.block_size
+                )
+                phys_blocks = block_table_cpu[req_idx, :num_blocks].reshape(-1)
+                valid = (
+                    (phys_blocks >= 0)
+                    & (phys_blocks < int(tensor.shape[0]))
+                )
+                if not bool(valid.all().item()):
+                    bad = phys_blocks[~valid][:16].tolist()
+                    meta["errors"].append(
+                        f"req={req_idx} invalid_blocks={bad}"
+                    )
+                    phys_blocks = phys_blocks[valid]
+                request_records.append(
+                    {
+                        "req_index": req_idx,
+                        "seq_len": seq_len,
+                        "num_blocks": int(num_blocks),
+                        "block_head": phys_blocks[:16].tolist(),
+                    }
+                )
+                if seq_len <= 0 or int(phys_blocks.numel()) == 0:
+                    continue
+                phys_device = phys_blocks.to(
+                    device=tensor.device,
+                    dtype=torch.long,
+                )
+                gathered = tensor.index_select(0, phys_device)
+                flat = gathered.reshape(-1, *tensor.shape[2:])[:seq_len]
+                rows.append(flat.detach().to(device="cpu").contiguous())
+            meta["requests"] = request_records
+            if not rows:
+                return torch.empty(0, dtype=tensor.dtype), meta
+            return torch.cat(rows, dim=0).contiguous(), meta
+        except Exception as exc:
+            meta["errors"].append(f"{type(exc).__name__}: {exc}")
+            return None, meta
+
+    @staticmethod
+    def _dsa_indexer_diag_cpu_tensor(value: Any) -> Any:
+        if isinstance(value, torch.Tensor):
+            return value.detach().to(device="cpu").contiguous()
+        return value
+
+    def _dsa_indexer_diag_log(
+        self,
+        *,
+        layer_name: str | None,
+        x: torch.Tensor,
+        q_c: torch.Tensor,
+        q_li: torch.Tensor,
+        weights: torch.Tensor,
+        kv_cache: tuple[torch.Tensor, ...],
+        indexer_block_table: torch.Tensor,
+        attn_metadata: M,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        actual_seq_lengths_query: torch.Tensor,
+        actual_seq_lengths_key: torch.Tensor,
+        topk_indices: torch.Tensor,
+        key_dequant_scale: torch.Tensor | None = None,
+        query_dequant_scale: torch.Tensor | None = None,
+    ) -> None:
+        if not _DSA_INDEXER_DIAG:
+            return
+        if int(getattr(attn_metadata, "num_decode_tokens", 0)) <= 0:
+            return
+        layer_id = _dsa_diag_layer_id(layer_name)
+        if _DSA_INDEXER_DIAG_LAYERS >= 0 and layer_id >= _DSA_INDEXER_DIAG_LAYERS:
+            return
+
+        req_ids = self._dsa_indexer_diag_req_ids(attn_metadata)
+        seen_key = (req_ids[0], str(layer_name))
+        if seen_key in self._dsa_indexer_diag_seen:
+            return
+        self._dsa_indexer_diag_seen.add(seen_key)
+
+        os.makedirs(_DSA_INDEXER_DIAG_DUMP_DIR, exist_ok=True)
+        signature = self._dsa_indexer_diag_signature(
+            actual_seq_lengths_query=actual_seq_lengths_query,
+            actual_seq_lengths_key=actual_seq_lengths_key,
+        )
+        run = self._dsa_indexer_diag_run(req_ids, signature)
+
+        key_tensor = kv_cache[2] if len(kv_cache) > 2 else None
+        key_active, key_active_meta = self._dsa_indexer_diag_active_rows(
+            key_tensor,
+            indexer_block_table,
+            actual_seq_lengths_key,
+        )
+        key_scale_active = None
+        key_scale_active_meta: dict[str, Any] | None = None
+        if key_dequant_scale is not None:
+            key_scale_active, key_scale_active_meta = (
+                self._dsa_indexer_diag_active_rows(
+                    key_dequant_scale,
+                    indexer_block_table,
+                    actual_seq_lengths_key,
+                )
+            )
+
+        input_summaries = {
+            "x": _dsa_diag_tensor_summary(x),
+            "q_c": _dsa_diag_tensor_summary(q_c),
+            "q_li": _dsa_diag_tensor_summary(q_li),
+            "weights": _dsa_diag_tensor_summary(weights),
+            "key": _dsa_diag_tensor_summary(key_tensor),
+            "key_active": _dsa_diag_tensor_summary(key_active),
+            "key_dequant_scale": _dsa_diag_tensor_summary(key_dequant_scale),
+            "key_dequant_scale_active": _dsa_diag_tensor_summary(key_scale_active),
+            "query_dequant_scale": _dsa_diag_tensor_summary(query_dequant_scale),
+            "indexer_block_table": _dsa_diag_tensor_summary(indexer_block_table),
+            "indexer_slot_mapping": _dsa_diag_tensor_summary(
+                getattr(attn_metadata, "indexer_slot_mapping", None)
+            ),
+            "slot_mapping": _dsa_diag_tensor_summary(
+                getattr(attn_metadata, "slot_mapping", None)
+            ),
+            "actual_seq_lengths_query": _dsa_diag_tensor_summary(
+                actual_seq_lengths_query
+            ),
+            "actual_seq_lengths_key": _dsa_diag_tensor_summary(
+                actual_seq_lengths_key
+            ),
+            "cos": _dsa_diag_tensor_summary(cos),
+            "sin": _dsa_diag_tensor_summary(sin),
+            "prompt_lens": _dsa_diag_tensor_summary(
+                getattr(attn_metadata, "prompt_lens", None)
+            ),
+            "decode_req_indices": _dsa_diag_tensor_summary(
+                getattr(attn_metadata, "decode_req_indices", None)
+            ),
+            "decode_target_slot_mapping": _dsa_diag_tensor_summary(
+                getattr(attn_metadata, "decode_target_slot_mapping", None)
+            ),
+        }
+        output_summaries = {
+            "topk_indices": _dsa_diag_tensor_summary(topk_indices),
+        }
+        field_digests = {
+            f"input.{name}": summary.get("value_digest")
+            for name, summary in input_summaries.items()
+        }
+        field_digests.update(
+            {
+                f"output.{name}": summary.get("value_digest")
+                for name, summary in output_summaries.items()
+            }
+        )
+
+        summary_path = _dsa_diag_summary_path(
+            session_id=_DSA_INDEXER_DIAG_SESSION_ID,
+            signature=signature,
+            run=run,
+            layer_name=layer_name,
+            tp_rank=int(self.tp_rank),
+        )
+        dump_path = None
+        if _DSA_INDEXER_DIAG_DUMP:
+            dump_path = summary_path.replace("_summary.json", ".pt")
+            tensors = {
+                "x": self._dsa_indexer_diag_cpu_tensor(x),
+                "q_c": self._dsa_indexer_diag_cpu_tensor(q_c),
+                "q_li": self._dsa_indexer_diag_cpu_tensor(q_li),
+                "weights": self._dsa_indexer_diag_cpu_tensor(weights),
+                "key_active": key_active,
+                "key_dequant_scale_active": key_scale_active,
+                "query_dequant_scale": self._dsa_indexer_diag_cpu_tensor(
+                    query_dequant_scale
+                ),
+                "indexer_block_table": self._dsa_indexer_diag_cpu_tensor(
+                    indexer_block_table
+                ),
+                "actual_seq_lengths_query": self._dsa_indexer_diag_cpu_tensor(
+                    actual_seq_lengths_query
+                ),
+                "actual_seq_lengths_key": self._dsa_indexer_diag_cpu_tensor(
+                    actual_seq_lengths_key
+                ),
+                "cos": self._dsa_indexer_diag_cpu_tensor(cos),
+                "sin": self._dsa_indexer_diag_cpu_tensor(sin),
+                "topk_indices": self._dsa_indexer_diag_cpu_tensor(topk_indices),
+            }
+            if _DSA_INDEXER_DIAG_DUMP_FULL_KEY:
+                tensors["key"] = self._dsa_indexer_diag_cpu_tensor(key_tensor)
+                tensors["key_dequant_scale"] = self._dsa_indexer_diag_cpu_tensor(
+                    key_dequant_scale
+                )
+            torch.save(
+                {
+                    "meta": {
+                        "req_ids": req_ids,
+                        "diag_session": _DSA_INDEXER_DIAG_SESSION_ID,
+                        "signature": signature,
+                        "prompt_run": run,
+                        "layer_name": layer_name,
+                        "layer_id": layer_id,
+                        "tp_rank": int(self.tp_rank),
+                        "key_active_meta": key_active_meta,
+                        "key_dequant_scale_active_meta": key_scale_active_meta,
+                    },
+                    "tensors": tensors,
+                },
+                dump_path,
+            )
+
+        summary = {
+            "summary_path": summary_path,
+            "dump_path": dump_path,
+            "req_ids": req_ids,
+            "diag_session": _DSA_INDEXER_DIAG_SESSION_ID,
+            "signature": signature,
+            "prompt_run": run,
+            "layer_name": layer_name,
+            "layer_id": layer_id,
+            "tp_rank": int(self.tp_rank),
+            "input_summaries": input_summaries,
+            "output_summaries": output_summaries,
+            "field_digests": field_digests,
+            "key_active_meta": key_active_meta,
+            "key_dequant_scale_active_meta": key_scale_active_meta,
+        }
+        _dsa_diag_write_json(summary_path, summary)
+        logger.warning(
+            "[DSA_INDEXER_DIAG_DUMP] first_token_indexer req_ids=%s "
+            "diag_session=%s signature=%s prompt_run=%s layer=%s "
+            "tp_rank=%s summary=%s dump=%s field_digests=%s "
+            "key_active_meta=%s",
+            req_ids,
+            _DSA_INDEXER_DIAG_SESSION_ID,
+            signature,
+            run,
+            layer_name,
+            int(self.tp_rank),
+            summary_path,
+            dump_path,
+            field_digests,
+            key_active_meta,
+        )
+
+        if run <= 1:
+            return
+        prev_path = _dsa_diag_summary_path(
+            session_id=_DSA_INDEXER_DIAG_SESSION_ID,
+            signature=signature,
+            run=run - 1,
+            layer_name=layer_name,
+            tp_rank=int(self.tp_rank),
+        )
+        if not os.path.exists(prev_path):
+            logger.warning(
+                "[DSA_INDEXER_DIAG_RUN_COMPARE] first_token_indexer "
+                "diag_session=%s signature=%s prev_run=%s prompt_run=%s "
+                "layer=%s tp_rank=%s prev_summary_missing=%s "
+                "current_summary=%s req_ids=%s",
+                _DSA_INDEXER_DIAG_SESSION_ID,
+                signature,
+                run - 1,
+                run,
+                layer_name,
+                int(self.tp_rank),
+                prev_path,
+                summary_path,
+                req_ids,
+            )
+            return
+        with open(prev_path, "r", encoding="utf-8") as f:
+            previous = json.load(f)
+        previous_digests = previous.get("field_digests", {})
+        all_fields = sorted(set(previous_digests) | set(field_digests))
+        mismatches = [
+            field
+            for field in all_fields
+            if previous_digests.get(field) != field_digests.get(field)
+        ]
+        logger.warning(
+            "[DSA_INDEXER_DIAG_RUN_COMPARE] first_token_indexer "
+            "diag_session=%s signature=%s prev_run=%s prompt_run=%s "
+            "layer=%s tp_rank=%s mismatch=%s mismatches=%s "
+            "prev_req_ids=%s curr_req_ids=%s prev_summary=%s "
+            "current_summary=%s prev_dump=%s current_dump=%s",
+            _DSA_INDEXER_DIAG_SESSION_ID,
+            signature,
+            run - 1,
+            run,
+            layer_name,
+            int(self.tp_rank),
+            bool(mismatches),
+            mismatches,
+            previous.get("req_ids"),
+            req_ids,
+            prev_path,
+            summary_path,
+            previous.get("dump_path"),
+            dump_path,
+        )
+
     def indexer_select_post_process(
         self,
         x: torch.Tensor,
@@ -1383,6 +1887,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         sin: torch.Tensor,
         actual_seq_lengths_query: torch.Tensor,
         actual_seq_lengths_key: torch.Tensor,
+        layer_name: str | None = None,
     ):
         # DSA two-group mode: the indexer cache has its own block ids; fall back
         # to the (shared) latent block table in single-group mode.
@@ -1415,18 +1920,25 @@ class AscendSFAImpl(MLAAttentionImpl):
             q_li, q_li_scale = torch_npu.npu_dynamic_quant(q_li.view(-1, self.head_dim), dst_type=self.c8_k_cache_dtype)
             q_li_scale = q_li_scale.to(self.c8_k_scale_cache_dtype)
 
+        diag_q_li = q_li
+        diag_key_dequant_scale = None
+        diag_query_dequant_scale = None
+
         # DSV3.2 currently has graph compilation issues when using torch_npu.npu.lightning_indexer.
         # So two branches are maintained temporarily.
         # TODO: torch.ops._C_ascend.npu_lightning_indexer needs to be removed.
         if self.use_sparse_c8_indexer:
             assert len(kv_cache) == 4
             weights = weights.to(torch.float16)
+            diag_q_li = q_li.view(q_li_shape_ori)
+            diag_key_dequant_scale = kv_cache[3].squeeze(2)
+            diag_query_dequant_scale = q_li_scale.view(q_li_shape_ori[:-1])
             topk_indices = torch.ops._C_ascend.npu_lightning_indexer_quant(
-                query=q_li.view(q_li_shape_ori),
+                query=diag_q_li,
                 key=kv_cache[2],
                 weights=weights,
-                query_dequant_scale=q_li_scale.view(q_li_shape_ori[:-1]),
-                key_dequant_scale=kv_cache[3].squeeze(2),  # B S N D -> B S D
+                query_dequant_scale=diag_query_dequant_scale,
+                key_dequant_scale=diag_key_dequant_scale,  # B S N D -> B S D
                 actual_seq_lengths_query=actual_seq_lengths_query,
                 actual_seq_lengths_key=actual_seq_lengths_key,
                 block_table=indexer_block_table,
@@ -1463,6 +1975,23 @@ class AscendSFAImpl(MLAAttentionImpl):
                 sparse_count=self.index_topk,
                 sparse_mode=3,
             )
+        self._dsa_indexer_diag_log(
+            layer_name=layer_name,
+            x=x,
+            q_c=q_c,
+            q_li=diag_q_li,
+            weights=weights,
+            kv_cache=kv_cache,
+            indexer_block_table=indexer_block_table,
+            attn_metadata=attn_metadata,
+            cos=cos,
+            sin=sin,
+            actual_seq_lengths_query=actual_seq_lengths_query,
+            actual_seq_lengths_key=actual_seq_lengths_key,
+            topk_indices=topk_indices,
+            key_dequant_scale=diag_key_dequant_scale,
+            query_dequant_scale=diag_query_dequant_scale,
+        )
         return topk_indices
 
     def _execute_sparse_flash_attention_process(
@@ -1848,6 +2377,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                 sin=sin,
                 actual_seq_lengths_query=actual_seq_lengths_query,
                 actual_seq_lengths_key=actual_seq_lengths_key,
+                layer_name=layer_name,
             )
 
         # DSA Step B2 (compact-scratch decode): the indexer just produced topk.
