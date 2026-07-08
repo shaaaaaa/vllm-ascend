@@ -121,11 +121,22 @@ _DSA_INDEXER_DIAG_LAYERS = _dsa_env_int(
 _DSA_INDEXER_DIAG_SAMPLE_VALUES = _dsa_env_int(
     "VLLM_ASCEND_DSA_INDEXER_DIAG_VALUES", 8
 )
+_DSA_INDEXER_DIAG_EXACT_VALUES = os.getenv(
+    "VLLM_ASCEND_DSA_INDEXER_DIAG_EXACT_VALUES", "0"
+).lower() in ("1", "true", "yes", "on")
+_DSA_INDEXER_DIAG_MAX_DIGEST_NUMEL = _dsa_env_int(
+    "VLLM_ASCEND_DSA_INDEXER_DIAG_MAX_DIGEST_NUMEL", 65536
+)
+_DSA_INDEXER_DIAG_KEY_SAMPLE_TOKENS = _dsa_env_int(
+    "VLLM_ASCEND_DSA_INDEXER_DIAG_KEY_SAMPLE_TOKENS", 128
+)
 
 
 def _dsa_debug_sample(value, limit: int = 8) -> list:
     if value is None or not isinstance(value, torch.Tensor) or value.numel() == 0:
         return []
+    if value.numel() > _DSA_INDEXER_DIAG_MAX_DIGEST_NUMEL and not value.is_contiguous():
+        return ["sample_skipped_non_contiguous_large_tensor"]
     return value.detach().reshape(-1)[:limit].to(device="cpu").tolist()
 
 
@@ -157,6 +168,7 @@ def _dsa_diag_tensor_digest(
     value: Any,
     *,
     include_stride: bool = True,
+    max_numel: int | None = None,
 ) -> str | None:
     if not isinstance(value, torch.Tensor):
         return None
@@ -170,7 +182,17 @@ def _dsa_diag_tensor_digest(
             )
         )
     try:
-        cpu = value.detach().to(device="cpu").contiguous()
+        tensor = value.detach()
+        if max_numel is not None and tensor.numel() > max_numel:
+            h.update(f"sampled:{max_numel}/{int(tensor.numel())}".encode("utf-8"))
+            if tensor.numel() > max_numel and not tensor.is_contiguous():
+                h.update(b"sample_skipped_non_contiguous_large_tensor")
+                return h.hexdigest()
+            flat = tensor.reshape(-1)
+            # Use a deterministic prefix sample. It is cheap and avoids the
+            # full NPU->CPU copy that made this diagnostic unusably slow.
+            tensor = flat[:max_numel]
+        cpu = tensor.to(device="cpu").contiguous()
         try:
             raw = cpu.view(torch.uint8).numpy().tobytes()
         except Exception:
@@ -183,22 +205,54 @@ def _dsa_diag_tensor_digest(
     return h.hexdigest()
 
 
-def _dsa_diag_tensor_summary(value: Any) -> dict[str, Any]:
+def _dsa_diag_tensor_summary(
+    value: Any,
+    *,
+    digest_values: bool = True,
+    max_digest_numel: int | None = None,
+) -> dict[str, Any]:
     if not isinstance(value, torch.Tensor):
         return {"type": type(value).__name__, "value": value}
-    return {
+    summary = {
         "type": "Tensor",
         "shape": tuple(int(dim) for dim in value.shape),
         "stride": tuple(int(stride) for stride in value.stride()),
         "dtype": str(value.dtype),
         "device": str(value.device),
         "numel": int(value.numel()),
-        "digest": _dsa_diag_tensor_digest(value),
-        "value_digest": _dsa_diag_tensor_digest(
-            value, include_stride=False
-        ),
         "head": _dsa_debug_sample(value, _DSA_INDEXER_DIAG_SAMPLE_VALUES),
     }
+    if digest_values:
+        digest = _dsa_diag_tensor_digest(
+            value,
+            include_stride=False,
+            max_numel=max_digest_numel,
+        )
+        digest_numel = int(value.numel())
+        if max_digest_numel is not None:
+            digest_numel = min(digest_numel, int(max_digest_numel))
+        summary.update(
+            {
+                "digest": digest,
+                "value_digest": digest,
+                "value_digest_exact": (
+                    max_digest_numel is None
+                    or int(value.numel()) <= int(max_digest_numel)
+                ),
+                "value_digest_numel": digest_numel,
+            }
+        )
+    else:
+        summary.update(
+            {
+                "digest": None,
+                "value_digest": None,
+                "value_digest_exact": False,
+                "value_digest_numel": 0,
+                "digest_skipped": "metadata_only",
+            }
+        )
+    return summary
 
 
 def _dsa_diag_summary_path(
@@ -1556,9 +1610,13 @@ class AscendSFAImpl(MLAAttentionImpl):
         block_table: torch.Tensor | None,
         actual_seq_lengths_key: torch.Tensor,
         block_size: int,
+        max_tokens: int | None,
     ) -> tuple[torch.Tensor | None, dict[str, Any]]:
         meta: dict[str, Any] = {
             "block_size": int(block_size),
+            "max_tokens": max_tokens,
+            "sampled_tokens": 0,
+            "truncated": False,
             "errors": [],
         }
         if tensor is None:
@@ -1582,9 +1640,27 @@ class AscendSFAImpl(MLAAttentionImpl):
             max_reqs = min(len(seq_lens), int(block_table_cpu.shape[0]))
             rows: list[torch.Tensor] = []
             request_records: list[dict[str, Any]] = []
+            remaining_tokens = max_tokens
             for req_idx in range(max_reqs):
                 seq_len = max(0, int(seq_lens[req_idx]))
-                num_blocks = (seq_len + int(block_size) - 1) // int(block_size)
+                if remaining_tokens is not None and remaining_tokens <= 0:
+                    meta["truncated"] = True
+                    request_records.append(
+                        {
+                            "req_index": req_idx,
+                            "seq_len": seq_len,
+                            "sample_len": 0,
+                            "num_blocks": 0,
+                            "block_head": [],
+                        }
+                    )
+                    continue
+                sample_len = seq_len
+                if remaining_tokens is not None:
+                    sample_len = min(sample_len, int(remaining_tokens))
+                    if sample_len < seq_len:
+                        meta["truncated"] = True
+                num_blocks = (sample_len + int(block_size) - 1) // int(block_size)
                 phys_blocks = block_table_cpu[req_idx, :num_blocks].reshape(-1)
                 valid = (
                     (phys_blocks >= 0)
@@ -1600,19 +1676,23 @@ class AscendSFAImpl(MLAAttentionImpl):
                     {
                         "req_index": req_idx,
                         "seq_len": seq_len,
+                        "sample_len": sample_len,
                         "num_blocks": int(num_blocks),
                         "block_head": phys_blocks[:16].tolist(),
                     }
                 )
-                if seq_len <= 0 or int(phys_blocks.numel()) == 0:
+                if sample_len <= 0 or int(phys_blocks.numel()) == 0:
                     continue
                 phys_device = phys_blocks.to(
                     device=tensor.device,
                     dtype=torch.long,
                 )
                 gathered = tensor.index_select(0, phys_device)
-                flat = gathered.reshape(-1, *tensor.shape[2:])[:seq_len]
+                flat = gathered.reshape(-1, *tensor.shape[2:])[:sample_len]
                 rows.append(flat.detach().to(device="cpu").contiguous())
+                meta["sampled_tokens"] += int(sample_len)
+                if remaining_tokens is not None:
+                    remaining_tokens -= int(sample_len)
             meta["requests"] = request_records
             if not rows:
                 return torch.empty(0, dtype=tensor.dtype), meta
@@ -1667,6 +1747,16 @@ class AscendSFAImpl(MLAAttentionImpl):
             if isinstance(key_tensor, torch.Tensor) and key_tensor.dim() >= 2
             else -1
         )
+        max_digest_numel = (
+            None
+            if _DSA_INDEXER_DIAG_EXACT_VALUES
+            else _DSA_INDEXER_DIAG_MAX_DIGEST_NUMEL
+        )
+        max_key_tokens = (
+            None
+            if _DSA_INDEXER_DIAG_EXACT_VALUES
+            else _DSA_INDEXER_DIAG_KEY_SAMPLE_TOKENS
+        )
         signature = self._dsa_indexer_diag_signature(
             actual_seq_lengths_query=actual_seq_lengths_query,
             actual_seq_lengths_key=actual_seq_lengths_key,
@@ -1679,6 +1769,7 @@ class AscendSFAImpl(MLAAttentionImpl):
             indexer_block_table,
             actual_seq_lengths_key,
             block_size,
+            max_key_tokens,
         )
         key_scale_active = None
         key_scale_active_meta: dict[str, Any] | None = None
@@ -1689,46 +1780,81 @@ class AscendSFAImpl(MLAAttentionImpl):
                     indexer_block_table,
                     actual_seq_lengths_key,
                     block_size,
+                    max_key_tokens,
                 )
             )
 
         input_summaries = {
-            "x": _dsa_diag_tensor_summary(x),
-            "q_c": _dsa_diag_tensor_summary(q_c),
-            "q_li": _dsa_diag_tensor_summary(q_li),
-            "weights": _dsa_diag_tensor_summary(weights),
-            "key": _dsa_diag_tensor_summary(key_tensor),
-            "key_active": _dsa_diag_tensor_summary(key_active),
-            "key_dequant_scale": _dsa_diag_tensor_summary(key_dequant_scale),
-            "key_dequant_scale_active": _dsa_diag_tensor_summary(key_scale_active),
-            "query_dequant_scale": _dsa_diag_tensor_summary(query_dequant_scale),
-            "indexer_block_table": _dsa_diag_tensor_summary(indexer_block_table),
+            "x": _dsa_diag_tensor_summary(
+                x, max_digest_numel=max_digest_numel
+            ),
+            "q_c": _dsa_diag_tensor_summary(
+                q_c, max_digest_numel=max_digest_numel
+            ),
+            "q_li": _dsa_diag_tensor_summary(
+                q_li, max_digest_numel=max_digest_numel
+            ),
+            "weights": _dsa_diag_tensor_summary(
+                weights, max_digest_numel=max_digest_numel
+            ),
+            # The full key tensors are paged allocation pools. Copying/hashing
+            # them is prohibitively slow and includes slots the first token will
+            # never read. Compare key_active instead.
+            "key": _dsa_diag_tensor_summary(key_tensor, digest_values=False),
+            "key_active": _dsa_diag_tensor_summary(
+                key_active, max_digest_numel=max_digest_numel
+            ),
+            "key_dequant_scale": _dsa_diag_tensor_summary(
+                key_dequant_scale, digest_values=False
+            ),
+            "key_dequant_scale_active": _dsa_diag_tensor_summary(
+                key_scale_active, max_digest_numel=max_digest_numel
+            ),
+            "query_dequant_scale": _dsa_diag_tensor_summary(
+                query_dequant_scale, max_digest_numel=max_digest_numel
+            ),
+            "indexer_block_table": _dsa_diag_tensor_summary(
+                indexer_block_table, max_digest_numel=max_digest_numel
+            ),
             "indexer_slot_mapping": _dsa_diag_tensor_summary(
-                getattr(attn_metadata, "indexer_slot_mapping", None)
+                getattr(attn_metadata, "indexer_slot_mapping", None),
+                max_digest_numel=max_digest_numel,
             ),
             "slot_mapping": _dsa_diag_tensor_summary(
-                getattr(attn_metadata, "slot_mapping", None)
+                getattr(attn_metadata, "slot_mapping", None),
+                max_digest_numel=max_digest_numel,
             ),
             "actual_seq_lengths_query": _dsa_diag_tensor_summary(
-                actual_seq_lengths_query
+                actual_seq_lengths_query,
+                max_digest_numel=max_digest_numel,
             ),
             "actual_seq_lengths_key": _dsa_diag_tensor_summary(
-                actual_seq_lengths_key
+                actual_seq_lengths_key,
+                max_digest_numel=max_digest_numel,
             ),
-            "cos": _dsa_diag_tensor_summary(cos),
-            "sin": _dsa_diag_tensor_summary(sin),
+            "cos": _dsa_diag_tensor_summary(
+                cos, max_digest_numel=max_digest_numel
+            ),
+            "sin": _dsa_diag_tensor_summary(
+                sin, max_digest_numel=max_digest_numel
+            ),
             "prompt_lens": _dsa_diag_tensor_summary(
-                getattr(attn_metadata, "prompt_lens", None)
+                getattr(attn_metadata, "prompt_lens", None),
+                max_digest_numel=max_digest_numel,
             ),
             "decode_req_indices": _dsa_diag_tensor_summary(
-                getattr(attn_metadata, "decode_req_indices", None)
+                getattr(attn_metadata, "decode_req_indices", None),
+                max_digest_numel=max_digest_numel,
             ),
             "decode_target_slot_mapping": _dsa_diag_tensor_summary(
-                getattr(attn_metadata, "decode_target_slot_mapping", None)
+                getattr(attn_metadata, "decode_target_slot_mapping", None),
+                max_digest_numel=max_digest_numel,
             ),
         }
         output_summaries = {
-            "topk_indices": _dsa_diag_tensor_summary(topk_indices),
+            "topk_indices": _dsa_diag_tensor_summary(
+                topk_indices, max_digest_numel=max_digest_numel
+            ),
         }
         field_digests = {
             f"input.{name}": summary.get("value_digest")
@@ -1774,10 +1900,16 @@ class AscendSFAImpl(MLAAttentionImpl):
                 "sin": self._dsa_indexer_diag_cpu_tensor(sin),
                 "topk_indices": self._dsa_indexer_diag_cpu_tensor(topk_indices),
             }
-            if _DSA_INDEXER_DIAG_DUMP_FULL_KEY:
+            if _DSA_INDEXER_DIAG_DUMP_FULL_KEY and _DSA_INDEXER_DIAG_EXACT_VALUES:
                 tensors["key"] = self._dsa_indexer_diag_cpu_tensor(key_tensor)
                 tensors["key_dequant_scale"] = self._dsa_indexer_diag_cpu_tensor(
                     key_dequant_scale
+                )
+            elif _DSA_INDEXER_DIAG_DUMP_FULL_KEY:
+                tensors["key_full_dump_skipped"] = (
+                    "Set VLLM_ASCEND_DSA_INDEXER_DIAG_EXACT_VALUES=1 to "
+                    "enable full paged-key dumps. Default diagnostic mode "
+                    "only dumps sampled logical key_active rows."
                 )
             torch.save(
                 {
