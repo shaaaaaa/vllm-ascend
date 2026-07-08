@@ -130,6 +130,17 @@ _DSA_INDEXER_DIAG_MAX_DIGEST_NUMEL = _dsa_env_int(
 _DSA_INDEXER_DIAG_KEY_SAMPLE_TOKENS = _dsa_env_int(
     "VLLM_ASCEND_DSA_INDEXER_DIAG_KEY_SAMPLE_TOKENS", 128
 )
+_DSA_INDEXER_DIAG_COMPONENTS_ENV = os.getenv(
+    "VLLM_ASCEND_DSA_INDEXER_DIAG_COMPONENTS", "all"
+)
+_DSA_INDEXER_DIAG_COMPONENTS = {
+    component.strip().lower()
+    for component in _DSA_INDEXER_DIAG_COMPONENTS_ENV.split(",")
+    if component.strip() and component.strip().lower() not in ("0", "none", "off")
+}
+_DSA_INDEXER_DIAG_SLEEP_MS = _dsa_env_int(
+    "VLLM_ASCEND_DSA_INDEXER_DIAG_SLEEP_MS", 0
+)
 _DSA_SYNC_PROBES = {
     probe.strip().lower()
     for probe in os.getenv("VLLM_ASCEND_DSA_SYNC_PROBE", "").split(",")
@@ -286,6 +297,13 @@ def _dsa_diag_write_json(path: str, payload: dict[str, Any]) -> None:
     with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump(payload, f, sort_keys=True, indent=2)
     os.replace(tmp_path, path)
+
+
+def _dsa_indexer_diag_component(name: str) -> bool:
+    return (
+        "all" in _DSA_INDEXER_DIAG_COMPONENTS
+        or name in _DSA_INDEXER_DIAG_COMPONENTS
+    )
 
 
 def _dsa_sync_probe(name: str, layer_name: str | None = None) -> None:
@@ -1603,6 +1621,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         actual_seq_lengths_query: torch.Tensor,
         actual_seq_lengths_key: torch.Tensor,
         block_size: int,
+        digest_values: bool,
     ) -> str:
         h = hashlib.blake2b(digest_size=8)
         for name, tensor in (
@@ -1610,7 +1629,12 @@ class AscendSFAImpl(MLAAttentionImpl):
             ("k", actual_seq_lengths_key),
         ):
             h.update(name.encode("utf-8"))
-            h.update(_dsa_diag_tensor_digest(tensor).encode("utf-8"))
+            if digest_values:
+                h.update(_dsa_diag_tensor_digest(tensor).encode("utf-8"))
+            else:
+                h.update(str(tuple(int(dim) for dim in tensor.shape)).encode("utf-8"))
+                h.update(str(tensor.dtype).encode("utf-8"))
+                h.update(str(tensor.device).encode("utf-8"))
         h.update(str(self.index_topk).encode("utf-8"))
         h.update(str(block_size).encode("utf-8"))
         return h.hexdigest()
@@ -1765,7 +1789,25 @@ class AscendSFAImpl(MLAAttentionImpl):
             return
         self._dsa_indexer_diag_seen.add(seen_key)
 
-        os.makedirs(_DSA_INDEXER_DIAG_DUMP_DIR, exist_ok=True)
+        if _DSA_INDEXER_DIAG_SLEEP_MS > 0:
+            time.sleep(_DSA_INDEXER_DIAG_SLEEP_MS / 1000.0)
+
+        do_signature_values = _dsa_indexer_diag_component("signature")
+        do_query = _dsa_indexer_diag_component("query")
+        do_meta = _dsa_indexer_diag_component("meta")
+        do_key_active = _dsa_indexer_diag_component("key_active")
+        do_topk = _dsa_indexer_diag_component("topk")
+        do_dump = _DSA_INDEXER_DIAG_DUMP and _dsa_indexer_diag_component("dump")
+        do_file = (
+            _dsa_indexer_diag_component("file")
+            or _dsa_indexer_diag_component("compare")
+            or do_dump
+        )
+        do_compare = _dsa_indexer_diag_component("compare")
+        do_log = bool(_DSA_INDEXER_DIAG_COMPONENTS)
+
+        if do_file:
+            os.makedirs(_DSA_INDEXER_DIAG_DUMP_DIR, exist_ok=True)
         key_tensor = kv_cache[2] if len(kv_cache) > 2 else None
         block_size = (
             int(key_tensor.shape[1])
@@ -1786,101 +1828,122 @@ class AscendSFAImpl(MLAAttentionImpl):
             actual_seq_lengths_query=actual_seq_lengths_query,
             actual_seq_lengths_key=actual_seq_lengths_key,
             block_size=block_size,
+            digest_values=do_signature_values,
         )
         run = self._dsa_indexer_diag_run(req_ids, signature)
 
-        key_active, key_active_meta = self._dsa_indexer_diag_active_rows(
-            key_tensor,
-            indexer_block_table,
-            actual_seq_lengths_key,
-            block_size,
-            max_key_tokens,
-        )
+        key_active = None
+        key_active_meta: dict[str, Any] | None = None
         key_scale_active = None
         key_scale_active_meta: dict[str, Any] | None = None
-        if key_dequant_scale is not None:
-            key_scale_active, key_scale_active_meta = (
-                self._dsa_indexer_diag_active_rows(
-                    key_dequant_scale,
-                    indexer_block_table,
-                    actual_seq_lengths_key,
-                    block_size,
-                    max_key_tokens,
+        if do_key_active:
+            key_active, key_active_meta = self._dsa_indexer_diag_active_rows(
+                key_tensor,
+                indexer_block_table,
+                actual_seq_lengths_key,
+                block_size,
+                max_key_tokens,
+            )
+            if key_dequant_scale is not None:
+                key_scale_active, key_scale_active_meta = (
+                    self._dsa_indexer_diag_active_rows(
+                        key_dequant_scale,
+                        indexer_block_table,
+                        actual_seq_lengths_key,
+                        block_size,
+                        max_key_tokens,
+                    )
                 )
+
+        input_summaries = {}
+        output_summaries = {}
+        if do_query:
+            input_summaries.update(
+                {
+                    "x": _dsa_diag_tensor_summary(
+                        x, max_digest_numel=max_digest_numel
+                    ),
+                    "q_c": _dsa_diag_tensor_summary(
+                        q_c, max_digest_numel=max_digest_numel
+                    ),
+                    "q_li": _dsa_diag_tensor_summary(
+                        q_li, max_digest_numel=max_digest_numel
+                    ),
+                    "weights": _dsa_diag_tensor_summary(
+                        weights, max_digest_numel=max_digest_numel
+                    ),
+                    "query_dequant_scale": _dsa_diag_tensor_summary(
+                        query_dequant_scale, max_digest_numel=max_digest_numel
+                    ),
+                }
+            )
+        if do_key_active:
+            input_summaries.update(
+                {
+                    # The full key tensors are paged allocation pools. Copying/hashing
+                    # them is prohibitively slow and includes slots the first token will
+                    # never read. Compare key_active instead.
+                    "key": _dsa_diag_tensor_summary(
+                        key_tensor, digest_values=False
+                    ),
+                    "key_active": _dsa_diag_tensor_summary(
+                        key_active, max_digest_numel=max_digest_numel
+                    ),
+                    "key_dequant_scale": _dsa_diag_tensor_summary(
+                        key_dequant_scale, digest_values=False
+                    ),
+                    "key_dequant_scale_active": _dsa_diag_tensor_summary(
+                        key_scale_active, max_digest_numel=max_digest_numel
+                    ),
+                }
+            )
+        if do_meta:
+            input_summaries.update(
+                {
+                    "indexer_block_table": _dsa_diag_tensor_summary(
+                        indexer_block_table, max_digest_numel=max_digest_numel
+                    ),
+                    "indexer_slot_mapping": _dsa_diag_tensor_summary(
+                        getattr(attn_metadata, "indexer_slot_mapping", None),
+                        max_digest_numel=max_digest_numel,
+                    ),
+                    "slot_mapping": _dsa_diag_tensor_summary(
+                        getattr(attn_metadata, "slot_mapping", None),
+                        max_digest_numel=max_digest_numel,
+                    ),
+                    "actual_seq_lengths_query": _dsa_diag_tensor_summary(
+                        actual_seq_lengths_query,
+                        max_digest_numel=max_digest_numel,
+                    ),
+                    "actual_seq_lengths_key": _dsa_diag_tensor_summary(
+                        actual_seq_lengths_key,
+                        max_digest_numel=max_digest_numel,
+                    ),
+                    "cos": _dsa_diag_tensor_summary(
+                        cos, max_digest_numel=max_digest_numel
+                    ),
+                    "sin": _dsa_diag_tensor_summary(
+                        sin, max_digest_numel=max_digest_numel
+                    ),
+                    "prompt_lens": _dsa_diag_tensor_summary(
+                        getattr(attn_metadata, "prompt_lens", None),
+                        max_digest_numel=max_digest_numel,
+                    ),
+                    "decode_req_indices": _dsa_diag_tensor_summary(
+                        getattr(attn_metadata, "decode_req_indices", None),
+                        max_digest_numel=max_digest_numel,
+                    ),
+                    "decode_target_slot_mapping": _dsa_diag_tensor_summary(
+                        getattr(attn_metadata, "decode_target_slot_mapping", None),
+                        max_digest_numel=max_digest_numel,
+                    ),
+                }
+            )
+        if do_topk:
+            output_summaries["topk_indices"] = _dsa_diag_tensor_summary(
+                topk_indices, max_digest_numel=max_digest_numel
             )
 
-        input_summaries = {
-            "x": _dsa_diag_tensor_summary(
-                x, max_digest_numel=max_digest_numel
-            ),
-            "q_c": _dsa_diag_tensor_summary(
-                q_c, max_digest_numel=max_digest_numel
-            ),
-            "q_li": _dsa_diag_tensor_summary(
-                q_li, max_digest_numel=max_digest_numel
-            ),
-            "weights": _dsa_diag_tensor_summary(
-                weights, max_digest_numel=max_digest_numel
-            ),
-            # The full key tensors are paged allocation pools. Copying/hashing
-            # them is prohibitively slow and includes slots the first token will
-            # never read. Compare key_active instead.
-            "key": _dsa_diag_tensor_summary(key_tensor, digest_values=False),
-            "key_active": _dsa_diag_tensor_summary(
-                key_active, max_digest_numel=max_digest_numel
-            ),
-            "key_dequant_scale": _dsa_diag_tensor_summary(
-                key_dequant_scale, digest_values=False
-            ),
-            "key_dequant_scale_active": _dsa_diag_tensor_summary(
-                key_scale_active, max_digest_numel=max_digest_numel
-            ),
-            "query_dequant_scale": _dsa_diag_tensor_summary(
-                query_dequant_scale, max_digest_numel=max_digest_numel
-            ),
-            "indexer_block_table": _dsa_diag_tensor_summary(
-                indexer_block_table, max_digest_numel=max_digest_numel
-            ),
-            "indexer_slot_mapping": _dsa_diag_tensor_summary(
-                getattr(attn_metadata, "indexer_slot_mapping", None),
-                max_digest_numel=max_digest_numel,
-            ),
-            "slot_mapping": _dsa_diag_tensor_summary(
-                getattr(attn_metadata, "slot_mapping", None),
-                max_digest_numel=max_digest_numel,
-            ),
-            "actual_seq_lengths_query": _dsa_diag_tensor_summary(
-                actual_seq_lengths_query,
-                max_digest_numel=max_digest_numel,
-            ),
-            "actual_seq_lengths_key": _dsa_diag_tensor_summary(
-                actual_seq_lengths_key,
-                max_digest_numel=max_digest_numel,
-            ),
-            "cos": _dsa_diag_tensor_summary(
-                cos, max_digest_numel=max_digest_numel
-            ),
-            "sin": _dsa_diag_tensor_summary(
-                sin, max_digest_numel=max_digest_numel
-            ),
-            "prompt_lens": _dsa_diag_tensor_summary(
-                getattr(attn_metadata, "prompt_lens", None),
-                max_digest_numel=max_digest_numel,
-            ),
-            "decode_req_indices": _dsa_diag_tensor_summary(
-                getattr(attn_metadata, "decode_req_indices", None),
-                max_digest_numel=max_digest_numel,
-            ),
-            "decode_target_slot_mapping": _dsa_diag_tensor_summary(
-                getattr(attn_metadata, "decode_target_slot_mapping", None),
-                max_digest_numel=max_digest_numel,
-            ),
-        }
-        output_summaries = {
-            "topk_indices": _dsa_diag_tensor_summary(
-                topk_indices, max_digest_numel=max_digest_numel
-            ),
-        }
         field_digests = {
             f"input.{name}": summary.get("value_digest")
             for name, summary in input_summaries.items()
@@ -1900,35 +1963,52 @@ class AscendSFAImpl(MLAAttentionImpl):
             tp_rank=int(self.tp_rank),
         )
         dump_path = None
-        if _DSA_INDEXER_DIAG_DUMP:
+        if do_dump:
             dump_path = summary_path.replace("_summary.json", ".pt")
-            tensors = {
-                "x": self._dsa_indexer_diag_cpu_tensor(x),
-                "q_c": self._dsa_indexer_diag_cpu_tensor(q_c),
-                "q_li": self._dsa_indexer_diag_cpu_tensor(q_li),
-                "weights": self._dsa_indexer_diag_cpu_tensor(weights),
-                "key_active": key_active,
-                "key_dequant_scale_active": key_scale_active,
-                "query_dequant_scale": self._dsa_indexer_diag_cpu_tensor(
-                    query_dequant_scale
-                ),
-                "indexer_block_table": self._dsa_indexer_diag_cpu_tensor(
-                    indexer_block_table
-                ),
-                "actual_seq_lengths_query": self._dsa_indexer_diag_cpu_tensor(
-                    actual_seq_lengths_query
-                ),
-                "actual_seq_lengths_key": self._dsa_indexer_diag_cpu_tensor(
-                    actual_seq_lengths_key
-                ),
-                "cos": self._dsa_indexer_diag_cpu_tensor(cos),
-                "sin": self._dsa_indexer_diag_cpu_tensor(sin),
-                "topk_indices": self._dsa_indexer_diag_cpu_tensor(topk_indices),
-            }
+            tensors = {}
+            if do_query:
+                tensors.update(
+                    {
+                        "x": self._dsa_indexer_diag_cpu_tensor(x),
+                        "q_c": self._dsa_indexer_diag_cpu_tensor(q_c),
+                        "q_li": self._dsa_indexer_diag_cpu_tensor(q_li),
+                        "weights": self._dsa_indexer_diag_cpu_tensor(weights),
+                        "query_dequant_scale": self._dsa_indexer_diag_cpu_tensor(
+                            query_dequant_scale
+                        ),
+                    }
+                )
+            if do_key_active:
+                tensors.update(
+                    {
+                        "key_active": key_active,
+                        "key_dequant_scale_active": key_scale_active,
+                    }
+                )
+            if do_meta:
+                tensors.update(
+                    {
+                        "indexer_block_table": self._dsa_indexer_diag_cpu_tensor(
+                            indexer_block_table
+                        ),
+                        "actual_seq_lengths_query": self._dsa_indexer_diag_cpu_tensor(
+                            actual_seq_lengths_query
+                        ),
+                        "actual_seq_lengths_key": self._dsa_indexer_diag_cpu_tensor(
+                            actual_seq_lengths_key
+                        ),
+                        "cos": self._dsa_indexer_diag_cpu_tensor(cos),
+                        "sin": self._dsa_indexer_diag_cpu_tensor(sin),
+                    }
+                )
+            if do_topk:
+                tensors["topk_indices"] = self._dsa_indexer_diag_cpu_tensor(
+                    topk_indices
+                )
             if _DSA_INDEXER_DIAG_DUMP_FULL_KEY and _DSA_INDEXER_DIAG_EXACT_VALUES:
                 tensors["key"] = self._dsa_indexer_diag_cpu_tensor(key_tensor)
                 tensors["key_dequant_scale"] = self._dsa_indexer_diag_cpu_tensor(
-                    key_dequant_scale
+                    key_dequant_scale,
                 )
             elif _DSA_INDEXER_DIAG_DUMP_FULL_KEY:
                 tensors["key_full_dump_skipped"] = (
@@ -1941,6 +2021,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                     "meta": {
                         "req_ids": req_ids,
                         "diag_session": _DSA_INDEXER_DIAG_SESSION_ID,
+                        "diag_components": sorted(_DSA_INDEXER_DIAG_COMPONENTS),
                         "signature": signature,
                         "prompt_run": run,
                         "layer_name": layer_name,
@@ -1959,6 +2040,7 @@ class AscendSFAImpl(MLAAttentionImpl):
             "dump_path": dump_path,
             "req_ids": req_ids,
             "diag_session": _DSA_INDEXER_DIAG_SESSION_ID,
+            "diag_components": sorted(_DSA_INDEXER_DIAG_COMPONENTS),
             "signature": signature,
             "prompt_run": run,
             "layer_name": layer_name,
@@ -1970,14 +2052,17 @@ class AscendSFAImpl(MLAAttentionImpl):
             "key_active_meta": key_active_meta,
             "key_dequant_scale_active_meta": key_scale_active_meta,
         }
-        _dsa_diag_write_json(summary_path, summary)
-        logger.warning(
+        if do_file:
+            _dsa_diag_write_json(summary_path, summary)
+        if do_log:
+            logger.warning(
             "[DSA_INDEXER_DIAG_DUMP] first_token_indexer req_ids=%s "
-            "diag_session=%s signature=%s prompt_run=%s layer=%s "
+            "diag_session=%s components=%s signature=%s prompt_run=%s layer=%s "
             "tp_rank=%s summary=%s dump=%s field_digests=%s "
             "key_active_meta=%s",
             req_ids,
             _DSA_INDEXER_DIAG_SESSION_ID,
+            sorted(_DSA_INDEXER_DIAG_COMPONENTS),
             signature,
             run,
             layer_name,
@@ -1986,9 +2071,9 @@ class AscendSFAImpl(MLAAttentionImpl):
             dump_path,
             field_digests,
             key_active_meta,
-        )
+            )
 
-        if run <= 1:
+        if not do_compare or run <= 1:
             return
         prev_path = _dsa_diag_summary_path(
             session_id=_DSA_INDEXER_DIAG_SESSION_ID,
