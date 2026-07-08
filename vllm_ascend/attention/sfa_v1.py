@@ -1523,6 +1523,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         *,
         actual_seq_lengths_query: torch.Tensor,
         actual_seq_lengths_key: torch.Tensor,
+        block_size: int,
     ) -> str:
         h = hashlib.blake2b(digest_size=8)
         for name, tensor in (
@@ -1532,7 +1533,7 @@ class AscendSFAImpl(MLAAttentionImpl):
             h.update(name.encode("utf-8"))
             h.update(_dsa_diag_tensor_digest(tensor).encode("utf-8"))
         h.update(str(self.index_topk).encode("utf-8"))
-        h.update(str(self.block_size).encode("utf-8"))
+        h.update(str(block_size).encode("utf-8"))
         return h.hexdigest()
 
     def _dsa_indexer_diag_run(
@@ -1554,9 +1555,10 @@ class AscendSFAImpl(MLAAttentionImpl):
         tensor: torch.Tensor | None,
         block_table: torch.Tensor | None,
         actual_seq_lengths_key: torch.Tensor,
+        block_size: int,
     ) -> tuple[torch.Tensor | None, dict[str, Any]]:
         meta: dict[str, Any] = {
-            "block_size": int(self.block_size),
+            "block_size": int(block_size),
             "errors": [],
         }
         if tensor is None:
@@ -1564,6 +1566,9 @@ class AscendSFAImpl(MLAAttentionImpl):
             return None, meta
         if block_table is None:
             meta["errors"].append("missing_block_table")
+            return None, meta
+        if block_size <= 0:
+            meta["errors"].append("invalid_block_size")
             return None, meta
 
         try:
@@ -1579,9 +1584,7 @@ class AscendSFAImpl(MLAAttentionImpl):
             request_records: list[dict[str, Any]] = []
             for req_idx in range(max_reqs):
                 seq_len = max(0, int(seq_lens[req_idx]))
-                num_blocks = (seq_len + int(self.block_size) - 1) // int(
-                    self.block_size
-                )
+                num_blocks = (seq_len + int(block_size) - 1) // int(block_size)
                 phys_blocks = block_table_cpu[req_idx, :num_blocks].reshape(-1)
                 valid = (
                     (phys_blocks >= 0)
@@ -1658,17 +1661,24 @@ class AscendSFAImpl(MLAAttentionImpl):
         self._dsa_indexer_diag_seen.add(seen_key)
 
         os.makedirs(_DSA_INDEXER_DIAG_DUMP_DIR, exist_ok=True)
+        key_tensor = kv_cache[2] if len(kv_cache) > 2 else None
+        block_size = (
+            int(key_tensor.shape[1])
+            if isinstance(key_tensor, torch.Tensor) and key_tensor.dim() >= 2
+            else -1
+        )
         signature = self._dsa_indexer_diag_signature(
             actual_seq_lengths_query=actual_seq_lengths_query,
             actual_seq_lengths_key=actual_seq_lengths_key,
+            block_size=block_size,
         )
         run = self._dsa_indexer_diag_run(req_ids, signature)
 
-        key_tensor = kv_cache[2] if len(kv_cache) > 2 else None
         key_active, key_active_meta = self._dsa_indexer_diag_active_rows(
             key_tensor,
             indexer_block_table,
             actual_seq_lengths_key,
+            block_size,
         )
         key_scale_active = None
         key_scale_active_meta: dict[str, Any] | None = None
@@ -1678,6 +1688,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                     key_dequant_scale,
                     indexer_block_table,
                     actual_seq_lengths_key,
+                    block_size,
                 )
             )
 
@@ -1975,23 +1986,31 @@ class AscendSFAImpl(MLAAttentionImpl):
                 sparse_count=self.index_topk,
                 sparse_mode=3,
             )
-        self._dsa_indexer_diag_log(
-            layer_name=layer_name,
-            x=x,
-            q_c=q_c,
-            q_li=diag_q_li,
-            weights=weights,
-            kv_cache=kv_cache,
-            indexer_block_table=indexer_block_table,
-            attn_metadata=attn_metadata,
-            cos=cos,
-            sin=sin,
-            actual_seq_lengths_query=actual_seq_lengths_query,
-            actual_seq_lengths_key=actual_seq_lengths_key,
-            topk_indices=topk_indices,
-            key_dequant_scale=diag_key_dequant_scale,
-            query_dequant_scale=diag_query_dequant_scale,
-        )
+        if _DSA_INDEXER_DIAG:
+            try:
+                self._dsa_indexer_diag_log(
+                    layer_name=layer_name,
+                    x=x,
+                    q_c=q_c,
+                    q_li=diag_q_li,
+                    weights=weights,
+                    kv_cache=kv_cache,
+                    indexer_block_table=indexer_block_table,
+                    attn_metadata=attn_metadata,
+                    cos=cos,
+                    sin=sin,
+                    actual_seq_lengths_query=actual_seq_lengths_query,
+                    actual_seq_lengths_key=actual_seq_lengths_key,
+                    topk_indices=topk_indices,
+                    key_dequant_scale=diag_key_dequant_scale,
+                    query_dequant_scale=diag_query_dequant_scale,
+                )
+            except Exception:
+                logger.warning(
+                    "[DSA_INDEXER_DIAG_ERROR] first_token_indexer diagnostic "
+                    "failed; continuing without diagnostic output",
+                    exc_info=True,
+                )
         return topk_indices
 
     def _execute_sparse_flash_attention_process(
