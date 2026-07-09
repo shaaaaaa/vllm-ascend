@@ -1915,8 +1915,9 @@ class AscendSFAImpl(MLAAttentionImpl):
                     _committed_end = _committed_end[: _remap_boundary.numel()]
                 else:
                     _committed_end = torch.zeros_like(_remap_boundary)
+                _block_size = int(kv_cache[0].shape[1])
                 torch._assert(
-                    torch.all((_committed_end % self.block_size) == 0),
+                    torch.all((_committed_end % _block_size) == 0),
                     "DSA committed boundary must be block aligned",
                 )
                 _decode_rows = torch.arange(
