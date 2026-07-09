@@ -1649,14 +1649,14 @@ class NPUModelRunner(GPUModelRunner):
                     if completed_decode_window_saves:
                         if kv_connector_output is None:
                             kv_connector_output = KVConnectorOutput()
-                        for req_id, window_end in completed_decode_window_saves.items():
+                        for req_id, boundary in completed_decode_window_saves.items():
                             kv_connector_output.completed_decode_window_saves[
                                 req_id
                             ] = max(
                                 kv_connector_output.completed_decode_window_saves.get(
                                     req_id, 0
                                 ),
-                                window_end,
+                                boundary,
                             )
                 else:
                     get_kv_transfer_group().clear_connector_metadata()

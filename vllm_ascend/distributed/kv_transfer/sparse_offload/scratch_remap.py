@@ -4,9 +4,9 @@ Decode reads the latent through two disjoint index spaces resolved by the SAME
 per-request block table:
 
   * LMCache-selected positions (< cache boundary) -> compact scratch rows [0..n_ret)
-    (the request's first ceil(k/block_size) latent blocks, filled by LMCache);
-  * live-cache positions (>= cache boundary >= k) -> kept ABSOLUTE, read in
-    place from their tail blocks. No copy, no [retrieve|decode] assembly.
+    (the request's committed latent prefix, filled by LMCache);
+  * live-cache positions (>= cache boundary) -> kept ABSOLUTE, read in place
+    from their tail blocks. No copy, no [retrieve|decode] assembly.
 
 Everything is fixed-shape tensor math: no D2H sync, graph-mode friendly.
 """
@@ -27,8 +27,10 @@ def scratch_remap(
             by the indexer; negative entries are padding.
         prompt_lens: [bs] cache boundary per decode request. In the original
             mode this is the prompt length; decode-window mode passes the
-            current window start. Callers must ensure boundary >= k for every
-            row (else scratch rows would alias live-cache positions).
+            block-aligned committed_end reported by LMCache. Callers must
+            ensure the LMCache scatter target range is contained in the
+            committed prefix; explicit row-scratch mappings must have
+            scratch_base + row_width <= boundary.
         need_packed: whether to build the LMCache selected-token payload.
         scratch_base: optional [bs] compact scratch base per row. This lets MTP
             rows for the same request use disjoint compact scratch ranges.

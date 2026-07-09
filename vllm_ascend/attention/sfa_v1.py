@@ -560,7 +560,7 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
 
         # DSA shrink-latent: expand per-request prompt lengths to per-row cache
         # boundaries for scratch_remap. Decode rows get prompt_len by default;
-        # decode-window mode later replaces those rows with current_window_start.
+        # decode-window mode later replaces those rows with committed_end.
         # Prefill and padding rows get 0 and stay untouched by the remap.
         prompt_lens_rows = None
         decode_req_indices_rows = None
@@ -1865,8 +1865,8 @@ class AscendSFAImpl(MLAAttentionImpl):
         # (the request's first ceil(k/block_size) latent blocks) and have
         # LMCache scatter exactly those tokens into scratch. Live-cache entries
         # keep their absolute positions and are read in place via the same
-        # block table. Decode-window mode uses current_window_start as the
-        # cache boundary instead of prompt_len.
+        # block table. Decode-window mode uses connector-committed LMCache
+        # tokens as the cache boundary instead of prompt_len.
         # All fixed-shape device math — no D2H sync. No-op without a connector.
         if (
             self.dsa_shrink_latent
@@ -1874,7 +1874,8 @@ class AscendSFAImpl(MLAAttentionImpl):
             and attn_metadata.num_decode_tokens > 0
         ):
             # _remap_boundary is per row. Decode rows carry prompt_len by
-            # default; decode-window mode replaces it with current_window_start.
+            # default; decode-window mode replaces it with the committed LMCache
+            # boundary reported by the connector.
             # Prefill/padding rows carry 0 and stay untouched, so this also
             # covers mixed chunked-prefill + decode steps.
             # The packed front-list only feeds LMCache's selected_tokens; skip building
@@ -1897,10 +1898,6 @@ class AscendSFAImpl(MLAAttentionImpl):
             _remap_boundary = attn_metadata.prompt_lens
             _decode_window_size = _decode_window_save_window_size()
             if _decode_window_size > 0:
-                _cur_pos = attn_metadata.seq_lens.to(torch.long) - 1
-                _window_start = (
-                    _cur_pos // _decode_window_size * _decode_window_size
-                ).to(device=_remap_boundary.device, dtype=_remap_boundary.dtype)
                 _lmcache_cached_tokens = get_lmcache_sparse_cached_tokens(
                     getattr(get_forward_context(), "dsa_req_ids", None)
                 )
@@ -1910,19 +1907,45 @@ class AscendSFAImpl(MLAAttentionImpl):
                         device=_remap_boundary.device,
                         dtype=_remap_boundary.dtype,
                     )
-                    if _committed_end.numel() < _window_start.numel():
+                    if _committed_end.numel() < _remap_boundary.numel():
                         _committed_end = torch.nn.functional.pad(
                             _committed_end,
-                            (0, _window_start.numel() - _committed_end.numel()),
+                            (0, _remap_boundary.numel() - _committed_end.numel()),
                         )
-                    _committed_end = _committed_end[: _window_start.numel()]
-                    _window_start = torch.minimum(_window_start, _committed_end)
+                    _committed_end = _committed_end[: _remap_boundary.numel()]
+                else:
+                    _committed_end = torch.zeros_like(_remap_boundary)
+                torch._assert(
+                    torch.all((_committed_end % self.block_size) == 0),
+                    "DSA committed boundary must be block aligned",
+                )
                 _decode_rows = torch.arange(
                     _remap_boundary.shape[0], device=_remap_boundary.device
                 ) < int(attn_metadata.num_decode_tokens)
                 _remap_boundary = torch.where(
-                    _decode_rows, _window_start, _remap_boundary
+                    _decode_rows, _committed_end, _remap_boundary
                 )
+            if _scratch_base is not None:
+                _topk_2d = _dsa_topk_to_2d_indices(topk_indices)
+                _rows = min(int(_topk_2d.shape[0]), int(_remap_boundary.shape[0]))
+                if _rows > 0:
+                    _scratch_width = torch.full(
+                        (_rows,),
+                        int(_topk_2d.shape[1]),
+                        device=_scratch_base.device,
+                        dtype=_scratch_base.dtype,
+                    )
+                    _scratch_end = _scratch_base[:_rows] + _scratch_width
+                    torch._assert(
+                        torch.all(
+                            _scratch_end
+                            <= _remap_boundary[:_rows].to(
+                                device=_scratch_end.device,
+                                dtype=_scratch_end.dtype,
+                            )
+                        ),
+                        "DSA compact scratch rows exceed committed boundary",
+                    )
             with _dsa_prof.section("scratch_remap"):
                 topk_indices, _sel_packed = scratch_remap(
                     topk_indices,
