@@ -39,7 +39,7 @@ from vllm_ascend.attention.utils import (
     AscendCommonAttentionMetadata,
     ascend_chunked_prefill_workspace_size,
     enable_cp,
-    get_lmcache_sparse_cached_tokens,
+    get_lmcache_sparse_committed_ends,
     maybe_save_kv_layer_to_connector,
     trans_rope_weight,
     transdata,
@@ -1898,12 +1898,12 @@ class AscendSFAImpl(MLAAttentionImpl):
             _remap_boundary = attn_metadata.prompt_lens
             _decode_window_size = _decode_window_save_window_size()
             if _decode_window_size > 0:
-                _lmcache_cached_tokens = get_lmcache_sparse_cached_tokens(
+                _lmcache_committed_ends = get_lmcache_sparse_committed_ends(
                     getattr(get_forward_context(), "dsa_req_ids", None)
                 )
-                if _lmcache_cached_tokens is not None:
+                if _lmcache_committed_ends is not None:
                     _committed_end = torch.tensor(
-                        _lmcache_cached_tokens,
+                        _lmcache_committed_ends,
                         device=_remap_boundary.device,
                         dtype=_remap_boundary.dtype,
                     )

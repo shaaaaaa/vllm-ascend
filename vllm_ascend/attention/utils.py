@@ -320,7 +320,7 @@ def split_decodes_and_prefills(
     return (num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens)
 
 
-def get_lmcache_sparse_cached_tokens(request_ids: Any) -> list[int] | None:
+def get_lmcache_sparse_committed_ends(request_ids: Any) -> list[int] | None:
     if request_ids is None:
         return None
     if not has_kv_transfer_group() or not is_v1_kv_transfer_group():
@@ -335,21 +335,22 @@ def get_lmcache_sparse_cached_tokens(request_ids: Any) -> list[int] | None:
     except Exception:
         return None
 
-    cached_by_req: dict[str, int] = {}
+    committed_by_req: dict[str, int] = {}
     for request in getattr(metadata, "requests", ()):
         if not getattr(request, "is_sparse_decode", False):
             continue
         load_spec = getattr(request, "load_spec", None)
         if load_spec is None or not getattr(load_spec, "can_load", False):
-            cached_by_req[getattr(request, "req_id", "")] = 0
-        else:
-            cached_by_req[getattr(request, "req_id", "")] = int(
-                getattr(load_spec, "lmcache_cached_tokens", 0) or 0
-            )
+            committed_by_req[getattr(request, "req_id", "")] = 0
+            continue
+        committed_end = getattr(load_spec, "dsa_committed_end", None)
+        if committed_end is None:
+            committed_end = getattr(load_spec, "lmcache_cached_tokens", 0) or 0
+        committed_by_req[getattr(request, "req_id", "")] = int(committed_end)
 
-    if not cached_by_req:
+    if not committed_by_req:
         return None
-    return [cached_by_req.get(str(req_id), 0) for req_id in list(request_ids)]
+    return [committed_by_req.get(str(req_id), 0) for req_id in list(request_ids)]
 
 
 def wait_for_kv_layer_from_connector(
