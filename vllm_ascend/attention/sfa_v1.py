@@ -1612,7 +1612,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         _dsa_prof.set_step_kind(
             attn_metadata.attn_state == AscendAttentionState.DecodeOnly
         )
-        _sfa_t = _dsa_prof.begin("sfa_fwd")
+        _sfa_t = _dsa_prof.begin("sfa_fwd", layer_name=layer_name)
         _is_pure_decode = attn_metadata.attn_state in (
             AscendAttentionState.DecodeOnly,
             AscendAttentionState.SpecDecoding,

@@ -105,6 +105,7 @@ from vllm_ascend.compilation.acl_graph import (
     set_graph_params,
     update_full_graph_params,
 )
+from vllm_ascend.distributed.kv_transfer.sparse_offload import _prof as _dsa_prof
 from vllm_ascend.eplb.adaptor.vllm_adaptor import VllmEplbAdaptor
 from vllm_ascend.eplb.core.eplb_device_transfer_loader import D2DExpertWeightLoader
 from vllm_ascend.eplb.core.eplb_worker import EplbProcess
@@ -1514,40 +1515,58 @@ class NPUModelRunner(GPUModelRunner):
             pd_trace["pre_forward_ms"] = (
                 forward_started_ns - prepare_done_ns
             ) / 1_000_000
-        with (
-            record_function_or_nullcontext("forward"),
-            set_ascend_forward_context(
-                attn_metadata,
-                self.vllm_config,
-                num_tokens=num_tokens_padded,
-                num_tokens_across_dp=num_tokens_across_dp,
-                aclgraph_runtime_mode=cudagraph_mode,
-                batch_descriptor=batch_desc,
-                num_actual_tokens=scheduler_output.total_num_scheduled_tokens,
-                model_instance=self.model,
-                max_tokens_across_pcp=0 if self.pcp_size == 1 else self.pcp_manager.max_num_tokens_across_pcp,
-                skip_compiled=has_encoder_input,
-                dsa_offload_manager=dsa_offload_manager,
-                dsa_req_ids=dsa_req_ids,
-                dsa_prompt_lens=dsa_prompt_lens,
-                dsa_adapter_cache=dsa_adapter_cache,
-            ),
-            self.maybe_get_kv_connector_output(
-                scheduler_output,
-                **(
-                    {"defer_finalize": not clear_kv_metadata}
-                ),
-            ) as kv_connector_output,
-        ):
-            hidden_states = self._model_forward(
-                num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
+        forward_detail_token = (
+            _dsa_prof.start_forward(
+                step=pd_trace["step"],
+                requests=pd_trace["requests"],
+                sync_npu=_PD_STAGE_TRACE_SYNC_NPU,
             )
+            if pd_trace is not None
+            else None
+        )
+        try:
+            with (
+                record_function_or_nullcontext("forward"),
+                set_ascend_forward_context(
+                    attn_metadata,
+                    self.vllm_config,
+                    num_tokens=num_tokens_padded,
+                    num_tokens_across_dp=num_tokens_across_dp,
+                    aclgraph_runtime_mode=cudagraph_mode,
+                    batch_descriptor=batch_desc,
+                    num_actual_tokens=scheduler_output.total_num_scheduled_tokens,
+                    model_instance=self.model,
+                    max_tokens_across_pcp=0
+                    if self.pcp_size == 1
+                    else self.pcp_manager.max_num_tokens_across_pcp,
+                    skip_compiled=has_encoder_input,
+                    dsa_offload_manager=dsa_offload_manager,
+                    dsa_req_ids=dsa_req_ids,
+                    dsa_prompt_lens=dsa_prompt_lens,
+                    dsa_adapter_cache=dsa_adapter_cache,
+                ),
+                self.maybe_get_kv_connector_output(
+                    scheduler_output,
+                    **({"defer_finalize": not clear_kv_metadata}),
+                ) as kv_connector_output,
+            ):
+                hidden_states = self._model_forward(
+                    num_tokens_padded,
+                    input_ids,
+                    positions,
+                    intermediate_tensors,
+                    inputs_embeds,
+                    **model_kwargs,
+                )
+        finally:
+            forward_detail = _dsa_prof.finish_forward(forward_detail_token)
         if pd_trace is not None:
             _pd_stage_trace_sync_npu()
             forward_done_ns = time.perf_counter_ns()
             pd_trace["forward_ms"] = (
                 forward_done_ns - forward_started_ns
             ) / 1_000_000
+            pd_trace["forward_detail"] = forward_detail
             post_process_started_ns = forward_done_ns
         with record_function_or_nullcontext("post process"):
             aux_hidden_states = None
@@ -1863,6 +1882,34 @@ class NPUModelRunner(GPUModelRunner):
                 sample_done_ns - draft_finalize_done_ns
             ) / 1_000_000
             rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
+            forward_detail = pd_trace.get("forward_detail")
+            if forward_detail is not None:
+                logger.info(
+                    "[PD_STAGE_TRACE] scope=forward_detail rank=%d step=%d "
+                    "requests=%s timing_mode=%s total_ms=%.3f "
+                    "sfa_total_ms=%.3f sfa_calls=%d "
+                    "sfa_child_total_ms=%.3f sfa_unattributed_ms=%.3f "
+                    "sfa_max_ms=%.3f sfa_slowest_layer=%s "
+                    "non_sfa_total_ms=%.3f non_sfa_segments=%d "
+                    "non_sfa_max_ms=%.3f non_sfa_slowest_segment=%s "
+                    "sfa_phases=total_ms/count/max_ms@layer[%s]",
+                    rank,
+                    forward_detail["step"],
+                    forward_detail["requests"],
+                    forward_detail["timing_mode"],
+                    forward_detail["total_ms"],
+                    forward_detail["sfa_total_ms"],
+                    forward_detail["sfa_calls"],
+                    forward_detail["sfa_child_total_ms"],
+                    forward_detail["sfa_unattributed_ms"],
+                    forward_detail["sfa_max_ms"],
+                    forward_detail["sfa_slowest_layer"],
+                    forward_detail["non_sfa_total_ms"],
+                    forward_detail["non_sfa_segments"],
+                    forward_detail["non_sfa_max_ms"],
+                    forward_detail["non_sfa_slowest_segment"],
+                    forward_detail["phases"],
+                )
             logger.info(
                 "[PD_STAGE_TRACE] scope=worker rank=%d step=%d requests=%s "
                 "scheduled_tokens=%d timing_mode=%s prepare_input_ms=%.3f "
