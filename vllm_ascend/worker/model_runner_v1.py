@@ -18,7 +18,9 @@
 #
 
 import math
+import os
 import sys
+import time
 from collections import defaultdict
 from contextlib import contextmanager, nullcontext
 from copy import copy, deepcopy
@@ -152,6 +154,58 @@ else:
 
 
 from vllm.model_executor.layers.attention import Attention, MLAAttention
+
+
+_PD_STAGE_TRACE_ENABLED = os.environ.get("VLLM_PD_STAGE_TRACE", "0").lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+_PD_STAGE_TRACE_SYNC_NPU = os.environ.get(
+    "VLLM_PD_STAGE_TRACE_SYNC_NPU", "0"
+).lower() in ("1", "true", "yes", "on")
+try:
+    _PD_STAGE_TRACE_EVERY = max(
+        1, int(os.environ.get("VLLM_PD_STAGE_TRACE_EVERY", "1"))
+    )
+except ValueError:
+    _PD_STAGE_TRACE_EVERY = 1
+_PD_STAGE_TRACE_REQUEST_ID = os.environ.get(
+    "VLLM_PD_STAGE_TRACE_REQUEST_ID", ""
+)
+
+
+def _pd_stage_trace_sync_npu() -> None:
+    if _PD_STAGE_TRACE_SYNC_NPU:
+        torch.npu.synchronize()
+
+
+def _pd_stage_trace_batch(scheduler_output: "SchedulerOutput") -> str:
+    cached = scheduler_output.scheduled_cached_reqs
+    computed_by_req = dict(
+        zip(cached.req_ids, cached.num_computed_tokens, strict=True)
+    )
+    output_by_req = dict(
+        zip(cached.req_ids, cached.num_output_tokens, strict=True)
+    )
+    for request in scheduler_output.scheduled_new_reqs:
+        computed_by_req[request.req_id] = request.num_computed_tokens
+        output_by_req[request.req_id] = 0
+
+    parts = []
+    request_ids = list(scheduler_output.num_scheduled_tokens)
+    for request_id in request_ids[:8]:
+        phase = "decode" if output_by_req.get(request_id, 0) > 0 else "prefill"
+        parts.append(
+            f"{request_id}:phase={phase}:scheduled="
+            f"{scheduler_output.num_scheduled_tokens[request_id]}:computed="
+            f"{computed_by_req.get(request_id, -1)}:output="
+            f"{output_by_req.get(request_id, -1)}"
+        )
+    if len(request_ids) > 8:
+        parts.append(f"...+{len(request_ids) - 8}")
+    return ";".join(parts) or "none"
 
 
 # if true, allow tensor initialization and casting with internal format (e.g., NZ)
@@ -1194,6 +1248,25 @@ class NPUModelRunner(GPUModelRunner):
                 logger.warning("RoutedExpertsCapturer is not initialized.")
         if self.execute_model_state is not None:
             raise RuntimeError("State error: sample_tokens() must be called after execute_model() returns None.")
+
+        self._pd_stage_trace_pending = None
+        pd_trace = None
+        if _PD_STAGE_TRACE_ENABLED:
+            pd_step = getattr(self, "_pd_stage_trace_step", 0)
+            self._pd_stage_trace_step = pd_step + 1
+            request_ids = list(scheduler_output.num_scheduled_tokens)
+            request_matches = (
+                not _PD_STAGE_TRACE_REQUEST_ID
+                or _PD_STAGE_TRACE_REQUEST_ID in request_ids
+            )
+            if pd_step % _PD_STAGE_TRACE_EVERY == 0 and request_matches:
+                _pd_stage_trace_sync_npu()
+                pd_trace = {
+                    "step": pd_step,
+                    "requests": _pd_stage_trace_batch(scheduler_output),
+                    "execute_start_ns": time.perf_counter_ns(),
+                    "scheduled_tokens": scheduler_output.total_num_scheduled_tokens,
+                }
         # self._draft_token_ids is None when `input_fits_in_drafter=False`
         # and there is no draft tokens scheduled. so it need to update the
         # spec_decoding info in scheduler_output with async_scheduling.
@@ -1378,6 +1451,13 @@ class NPUModelRunner(GPUModelRunner):
             # update global cos, sin
             update_cos_sin(positions)
 
+        if pd_trace is not None:
+            _pd_stage_trace_sync_npu()
+            prepare_done_ns = time.perf_counter_ns()
+            pd_trace["prepare_input_ms"] = (
+                prepare_done_ns - pd_trace["execute_start_ns"]
+            ) / 1_000_000
+
         if self.dynamic_eplb:
             with record_function_or_nullcontext("EPLB weight D2D"):
                 self.eplb_updator.forward_before()
@@ -1427,6 +1507,13 @@ class NPUModelRunner(GPUModelRunner):
 
         # Run forward pass
         clear_kv_metadata = self.speculative_config is None
+        forward_started_ns = (
+            time.perf_counter_ns() if pd_trace is not None else 0
+        )
+        if pd_trace is not None:
+            pd_trace["pre_forward_ms"] = (
+                forward_started_ns - prepare_done_ns
+            ) / 1_000_000
         with (
             record_function_or_nullcontext("forward"),
             set_ascend_forward_context(
@@ -1455,6 +1542,13 @@ class NPUModelRunner(GPUModelRunner):
             hidden_states = self._model_forward(
                 num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
             )
+        if pd_trace is not None:
+            _pd_stage_trace_sync_npu()
+            forward_done_ns = time.perf_counter_ns()
+            pd_trace["forward_ms"] = (
+                forward_done_ns - forward_started_ns
+            ) / 1_000_000
+            post_process_started_ns = forward_done_ns
         with record_function_or_nullcontext("post process"):
             aux_hidden_states = None
             if self.use_aux_hidden_state_outputs:
@@ -1530,12 +1624,26 @@ class NPUModelRunner(GPUModelRunner):
                 batch_desc,
             )
             self.kv_connector_output = kv_connector_output
+        if pd_trace is not None:
+            _pd_stage_trace_sync_npu()
+            execute_done_ns = time.perf_counter_ns()
+            pd_trace["post_process_ms"] = (
+                execute_done_ns - post_process_started_ns
+            ) / 1_000_000
+            pd_trace["execute_total_ms"] = (
+                execute_done_ns - pd_trace["execute_start_ns"]
+            ) / 1_000_000
+            self._pd_stage_trace_pending = pd_trace
         return None
 
     @torch.inference_mode()
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors:
+        pd_trace = getattr(self, "_pd_stage_trace_pending", None)
+        sample_started_ns = (
+            time.perf_counter_ns() if pd_trace is not None else 0
+        )
         kv_connector_output = self.kv_connector_output
         self.kv_connector_output = None
 
@@ -1584,8 +1692,23 @@ class NPUModelRunner(GPUModelRunner):
             apply_grammar_bitmask(scheduler_output, grammar_output, self.input_batch, logits)
             logits = logits.to(self.device).to(logits_dtype)
 
+        if pd_trace is not None:
+            _pd_stage_trace_sync_npu()
+            grammar_done_ns = time.perf_counter_ns()
+            pd_trace["grammar_apply_ms"] = (
+                grammar_done_ns - sample_started_ns
+            ) / 1_000_000
+            sample_submit_started_ns = grammar_done_ns
+
         with record_function_or_nullcontext("sample_token"):
             sampler_output = self._sample(logits, spec_decode_metadata)
+
+        if pd_trace is not None:
+            _pd_stage_trace_sync_npu()
+            sample_submit_done_ns = time.perf_counter_ns()
+            pd_trace["sample_ms"] = (
+                sample_submit_done_ns - sample_submit_started_ns
+            ) / 1_000_000
 
         if self.need_accepted_tokens:
             if self.sampling_done_event is None:
@@ -1611,6 +1734,9 @@ class NPUModelRunner(GPUModelRunner):
             )
             self._copy_draft_token_ids_to_cpu(scheduler_output)
 
+        bookkeeping_started_ns = (
+            time.perf_counter_ns() if pd_trace is not None else 0
+        )
         (
             logprobs_lists,
             valid_sampled_token_ids,
@@ -1625,6 +1751,17 @@ class NPUModelRunner(GPUModelRunner):
             hidden_states,
             scheduler_output.total_num_scheduled_tokens,
             spec_decode_metadata,
+        )
+
+        if pd_trace is not None:
+            bookkeeping_done_ns = time.perf_counter_ns()
+            pd_trace["bookkeeping_sync_ms"] = (
+                bookkeeping_done_ns - bookkeeping_started_ns
+            ) / 1_000_000
+
+        connector_finalize_ms = 0.0
+        draft_finalize_started_ns = (
+            time.perf_counter_ns() if pd_trace is not None else 0
         )
 
         with record_function_or_nullcontext("draft_token"):
@@ -1645,7 +1782,14 @@ class NPUModelRunner(GPUModelRunner):
 
             if has_kv_transfer_group():
                 if self.speculative_config:
+                    connector_finalize_started_ns = (
+                        time.perf_counter_ns() if pd_trace is not None else 0
+                    )
                     completed_decode_window_saves = self.finalize_kv_connector()
+                    if pd_trace is not None:
+                        connector_finalize_ms += (
+                            time.perf_counter_ns() - connector_finalize_started_ns
+                        ) / 1_000_000
                     if completed_decode_window_saves:
                         if kv_connector_output is None:
                             kv_connector_output = KVConnectorOutput()
@@ -1660,6 +1804,13 @@ class NPUModelRunner(GPUModelRunner):
                             )
                 else:
                     get_kv_transfer_group().clear_connector_metadata()
+
+        if pd_trace is not None:
+            draft_finalize_done_ns = time.perf_counter_ns()
+            pd_trace["draft_finalize_ms"] = (
+                draft_finalize_done_ns - draft_finalize_started_ns
+            ) / 1_000_000
+            pd_trace["connector_finalize_ms"] = connector_finalize_ms
 
         if self.model_config.enable_return_routed_experts:
             capturer = RoutedExpertsCapturer.get_instance()
@@ -1704,6 +1855,43 @@ class NPUModelRunner(GPUModelRunner):
             pp = get_pp_group()
             if pp.world_size > 1 and pp.is_last_rank:
                 self._pp_broadcast_prev_sampled_token_ids(sampler_output.sampled_token_ids)
+
+        if pd_trace is not None:
+            _pd_stage_trace_sync_npu()
+            sample_done_ns = time.perf_counter_ns()
+            pd_trace["output_finalize_ms"] = (
+                sample_done_ns - draft_finalize_done_ns
+            ) / 1_000_000
+            rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
+            logger.info(
+                "[PD_STAGE_TRACE] scope=worker rank=%d step=%d requests=%s "
+                "scheduled_tokens=%d timing_mode=%s prepare_input_ms=%.3f "
+                "pre_forward_ms=%.3f forward_ms=%.3f post_process_ms=%.3f "
+                "grammar_apply_ms=%.3f "
+                "sample_ms=%.3f bookkeeping_sync_ms=%.3f "
+                "draft_finalize_ms=%.3f connector_finalize_ms=%.3f "
+                "output_finalize_ms=%.3f "
+                "execute_total_ms=%.3f sample_total_ms=%.3f total_ms=%.3f",
+                rank,
+                pd_trace["step"],
+                pd_trace["requests"],
+                pd_trace["scheduled_tokens"],
+                "sync_npu" if _PD_STAGE_TRACE_SYNC_NPU else "host_no_sync",
+                pd_trace["prepare_input_ms"],
+                pd_trace["pre_forward_ms"],
+                pd_trace["forward_ms"],
+                pd_trace["post_process_ms"],
+                pd_trace["grammar_apply_ms"],
+                pd_trace["sample_ms"],
+                pd_trace["bookkeeping_sync_ms"],
+                pd_trace["draft_finalize_ms"],
+                pd_trace["connector_finalize_ms"],
+                pd_trace["output_finalize_ms"],
+                pd_trace["execute_total_ms"],
+                (sample_done_ns - sample_started_ns) / 1_000_000,
+                (sample_done_ns - pd_trace["execute_start_ns"]) / 1_000_000,
+            )
+            self._pd_stage_trace_pending = None
 
         if not self.use_async_scheduling:
             return model_runner_output
