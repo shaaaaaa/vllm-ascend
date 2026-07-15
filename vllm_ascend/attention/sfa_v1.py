@@ -1613,6 +1613,7 @@ class AscendSFAImpl(MLAAttentionImpl):
             attn_metadata.attn_state == AscendAttentionState.DecodeOnly
         )
         _sfa_t = _dsa_prof.begin("sfa_fwd", layer_name=layer_name)
+        _sfa_setup_t = _dsa_prof.begin("sfa_setup")
         _is_pure_decode = attn_metadata.attn_state in (
             AscendAttentionState.DecodeOnly,
             AscendAttentionState.SpecDecoding,
@@ -1679,34 +1680,43 @@ class AscendSFAImpl(MLAAttentionImpl):
             AscendAttentionState.DecodeOnly,
             AscendAttentionState.SpecDecoding,
         }
+        _dsa_prof.end(_sfa_setup_t)
 
         # run mlapo ops when dsa-cp is disabled, and ensure that num_tokens satisfies the count limitation
         if self.enable_mlapo and num_input_tokens <= MLAPO_MAX_SUPPORTED_TOKENS:
-            hidden_states, ql_nope, q_pe, q_c = self._sfa_preprocess_with_mlapo(
-                hidden_states=hidden_states,
-                kv_cache=kv_cache,
-                cos=cos,
-                sin=sin,
-                slot_mapping=slot_mapping,
-                num_input_tokens=num_input_tokens,
-            )
-            k_li, k_li_scale = self.indexer_select_pre_process(x=hidden_states, cos=cos, sin=sin)
+            with _dsa_prof.section("mlapo_preprocess"):
+                hidden_states, ql_nope, q_pe, q_c = self._sfa_preprocess_with_mlapo(
+                    hidden_states=hidden_states,
+                    kv_cache=kv_cache,
+                    cos=cos,
+                    sin=sin,
+                    slot_mapping=slot_mapping,
+                    num_input_tokens=num_input_tokens,
+                )
+            with _dsa_prof.section("indexer_preprocess"):
+                k_li, k_li_scale = self.indexer_select_pre_process(
+                    x=hidden_states, cos=cos, sin=sin
+                )
         # native
         else:
             assert self.fused_qkv_a_proj is not None, "q lora is required for DSA."
-            weight_prefetch_method = get_weight_prefetch_method()
-            weight_prefetch_method.maybe_prefetch_mla_or_sla_weight_in_current_stream(
-                inputs=self.fused_qkv_a_proj.weight, dependency=hidden_states
-            )
-            qkv_lora = self.fused_qkv_a_proj(hidden_states)[0]
-            q_c, kv_no_split = qkv_lora.split(
-                [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
-                dim=-1,
-            )
-            assert self.q_a_layernorm is not None, "q_a_layernorm must be initialized"
-            q_c = self.q_a_layernorm(q_c)
+            with _dsa_prof.section("input_proj"):
+                weight_prefetch_method = get_weight_prefetch_method()
+                weight_prefetch_method.maybe_prefetch_mla_or_sla_weight_in_current_stream(
+                    inputs=self.fused_qkv_a_proj.weight, dependency=hidden_states
+                )
+                qkv_lora = self.fused_qkv_a_proj(hidden_states)[0]
+                q_c, kv_no_split = qkv_lora.split(
+                    [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
+                    dim=-1,
+                )
+                assert self.q_a_layernorm is not None, "q_a_layernorm must be initialized"
+                q_c = self.q_a_layernorm(q_c)
 
-            k_li, k_li_scale = self.indexer_select_pre_process(x=hidden_states, cos=cos, sin=sin)
+            with _dsa_prof.section("indexer_preprocess"):
+                k_li, k_li_scale = self.indexer_select_pre_process(
+                    x=hidden_states, cos=cos, sin=sin
+                )
 
             # Step B2: in compact-scratch mode the connector load is driven by
             # the post-indexer call (with selected_tokens). Calling here too
@@ -1714,11 +1724,20 @@ class AscendSFAImpl(MLAAttentionImpl):
             # (this one with a dense arange) and desync it — skip whenever the
             # batch has decode rows (mixed steps included).
             if not (self.dsa_shrink_latent and attn_metadata.num_decode_tokens > 0):
-                wait_for_kv_layer_from_connector(layer_name)
+                with _dsa_prof.section("lmc_retrieve_pre_index"):
+                    wait_for_kv_layer_from_connector(layer_name)
 
             if self.enable_dsa_cp:
                 assert slot_mapping_cp is not None
-                k_pe, k_nope = self.exec_kv(kv_no_split, cos, sin, kv_cache, slot_mapping_cp, attn_metadata)
+                with _dsa_prof.section("exec_kv"):
+                    k_pe, k_nope = self.exec_kv(
+                        kv_no_split,
+                        cos,
+                        sin,
+                        kv_cache,
+                        slot_mapping_cp,
+                        attn_metadata,
+                    )
             else:
                 _fc = get_forward_context()
                 _dsa_mgr_xkv = getattr(_fc, "dsa_offload_manager", None)
@@ -1751,6 +1770,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                 assert k_li is not None
                 async_op = self.enable_dsa_cp_with_layer_shard or full_gather_o_proj_enabled
                 # support all_gather kv async for communication calculation overlap
+                _kv_all_gather_t = _dsa_prof.begin("kv_all_gather_submit")
                 if not self.use_sparse_c8_indexer:
                     fused_kv_no_split, kv_ag_handle = all_gather_async(
                         torch.cat(
@@ -1788,42 +1808,57 @@ class AscendSFAImpl(MLAAttentionImpl):
                         get_tp_group(),
                         async_op=async_op,
                     )
+                _dsa_prof.end(_kv_all_gather_t)
 
-            ql_nope, q_pe = self._q_proj_and_k_up_proj(q_c)
-            q_pe = self.rope_single(q_pe, cos, sin)
+            with _dsa_prof.section("q_proj_rope"):
+                ql_nope, q_pe = self._q_proj_and_k_up_proj(q_c)
+                q_pe = self.rope_single(q_pe, cos, sin)
 
             if self.enable_dsa_cp:
                 if kv_ag_handle is not None:
-                    kv_ag_handle.wait()
+                    with _dsa_prof.section("kv_all_gather_wait"):
+                        kv_ag_handle.wait()
 
                 if self.enable_dsa_cp_with_layer_shard:
                     for layer in self.layer_sharding_kwargs or []:
                         if is_hidden_layer(layer):
                             reach_layer_for_shard_weight_series(layer)
                 elif full_gather_o_proj_enabled:
-                    _, o_proj_full_handle = all_gather_async(
-                        self.o_proj_tp_weight, get_tp_group(), output=AscendSFAImpl.o_proj_full_pool
-                    )
+                    with _dsa_prof.section("o_proj_weight_gather_submit"):
+                        _, o_proj_full_handle = all_gather_async(
+                            self.o_proj_tp_weight,
+                            get_tp_group(),
+                            output=AscendSFAImpl.o_proj_full_pool,
+                        )
 
                 if kv_cache is not None:
-                    assert fused_kv_no_split is not None
-                    if not self.use_sparse_c8_indexer:
-                        k_pe, k_nope, k_li = fused_kv_no_split.split(
-                            [self.qk_rope_head_dim, self.kv_lora_rank, self.head_dim], dim=-1
+                    with _dsa_prof.section("latent_cache_update"):
+                        assert fused_kv_no_split is not None
+                        if not self.use_sparse_c8_indexer:
+                            k_pe, k_nope, k_li = fused_kv_no_split.split(
+                                [
+                                    self.qk_rope_head_dim,
+                                    self.kv_lora_rank,
+                                    self.head_dim,
+                                ],
+                                dim=-1,
+                            )
+                        else:
+                            k_pe, k_nope = fused_kv_no_split.split(
+                                [self.qk_rope_head_dim, self.kv_lora_rank], dim=-1
+                            )
+                        k_nope = k_nope.view(k_nope.shape[0], 1, -1)
+                        k_pe = k_pe.view(k_pe.shape[0], 1, -1)
+                        DeviceOperator.reshape_and_cache(
+                            key=k_nope[: attn_metadata.num_actual_tokens],
+                            value=k_pe[: attn_metadata.num_actual_tokens],
+                            key_cache=kv_cache[0],
+                            value_cache=kv_cache[1],
+                            slot_mapping=slot_mapping[: attn_metadata.num_actual_tokens],
                         )
-                    else:
-                        k_pe, k_nope = fused_kv_no_split.split([self.qk_rope_head_dim, self.kv_lora_rank], dim=-1)
-                    k_nope = k_nope.view(k_nope.shape[0], 1, -1)
-                    k_pe = k_pe.view(k_pe.shape[0], 1, -1)
-                    DeviceOperator.reshape_and_cache(
-                        key=k_nope[: attn_metadata.num_actual_tokens],
-                        value=k_pe[: attn_metadata.num_actual_tokens],
-                        key_cache=kv_cache[0],
-                        value_cache=kv_cache[1],
-                        slot_mapping=slot_mapping[: attn_metadata.num_actual_tokens],
-                    )
 
-            k_li = self._get_full_kv(k_li, attn_metadata)
+            with _dsa_prof.section("full_kv"):
+                k_li = self._get_full_kv(k_li, attn_metadata)
 
         if kv_cache is not None:
             if index_lmcache_enabled and not _is_pure_decode:
@@ -1832,21 +1867,24 @@ class AscendSFAImpl(MLAAttentionImpl):
                 with _dsa_prof.section("lmc_index_retrieve"):
                     wait_for_kv_layer_from_connector(index_layer_name)
 
-            if self.is_kv_producer:
-                attn_metadata.reshape_cache_event = torch.npu.Event()
-            torch_npu.npu_scatter_nd_update_(
-                kv_cache[2].view(-1, k_li.shape[-1]), idx_slot_mapping.view(-1, 1), k_li.view(-1, k_li.shape[-1])
-            )  # b, s, n, d
-            if self.use_sparse_c8_indexer:
-                assert len(kv_cache) == 4
-                assert k_li_scale is not None
+            with _dsa_prof.section("indexer_cache_update"):
+                if self.is_kv_producer:
+                    attn_metadata.reshape_cache_event = torch.npu.Event()
                 torch_npu.npu_scatter_nd_update_(
-                    kv_cache[3].view(-1, k_li_scale.shape[-1]),
+                    kv_cache[2].view(-1, k_li.shape[-1]),
                     idx_slot_mapping.view(-1, 1),
-                    k_li_scale.view(-1, k_li_scale.shape[-1]),
-                )
-            if self.is_kv_producer:
-                attn_metadata.reshape_cache_event.record()
+                    k_li.view(-1, k_li.shape[-1]),
+                )  # b, s, n, d
+                if self.use_sparse_c8_indexer:
+                    assert len(kv_cache) == 4
+                    assert k_li_scale is not None
+                    torch_npu.npu_scatter_nd_update_(
+                        kv_cache[3].view(-1, k_li_scale.shape[-1]),
+                        idx_slot_mapping.view(-1, 1),
+                        k_li_scale.view(-1, k_li_scale.shape[-1]),
+                    )
+                if self.is_kv_producer:
+                    attn_metadata.reshape_cache_event.record()
 
         with _dsa_prof.section("indexer"):
             topk_indices = self.indexer_select_post_process(
@@ -1873,6 +1911,7 @@ class AscendSFAImpl(MLAAttentionImpl):
             and attn_metadata.prompt_lens is not None
             and attn_metadata.num_decode_tokens > 0
         ):
+            _remap_prepare_t = _dsa_prof.begin("remap_prepare")
             # _remap_boundary is per row. Decode rows carry prompt_len by
             # default; decode-window mode replaces it with current_window_start.
             # Prefill/padding rows carry 0 and stay untouched, so this also
@@ -1956,6 +1995,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                     _remap_boundary = torch.where(
                         _decode_rows, _window_start, _remap_boundary
                     )
+            _dsa_prof.end(_remap_prepare_t)
             with _dsa_prof.section("scratch_remap"):
                 topk_indices, _sel_packed = scratch_remap(
                     topk_indices,
@@ -1967,6 +2007,7 @@ class AscendSFAImpl(MLAAttentionImpl):
             # NO LMCache call. Output is expected wrong; only crash/no-crash
             # matters (crash => our remap/FA, clean => LMCache transfer kernel).
             if self.dsa_shrink_latent != 3 and _sel_packed is not None:
+                _payload_prepare_t = _dsa_prof.begin("lmc_payload_prepare")
                 _target_slot_mapping_for_wait = None
                 _request_ids_for_wait = None
                 _row_req_indices_for_wait = None
@@ -2052,6 +2093,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                         row_scratch_base=_row_scratch_base_for_wait,
                         block_table=attn_metadata.block_table,
                     )
+                _dsa_prof.end(_payload_prepare_t)
                 _wait_fn = wait_for_kv_layer_from_connector
                 with _dsa_prof.section("lmc_retrieve"):
                     _wait_fn(
@@ -2068,6 +2110,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         #     path and log the max-abs output diff, driving generation with the native
         #     result so a wrong scratch path can't corrupt output. Falls back to native
         #     when disabled or on unsupported paths (CP / sparse-c8 / mlapo).
+        _attention_route_t = _dsa_prof.begin("attention_route_setup")
         _dsa_fc = get_forward_context()
         _dsa_mgr = getattr(_dsa_fc, "dsa_offload_manager", None)
         _dsa_adapter = getattr(_dsa_fc, "dsa_adapter_cache", None)
@@ -2099,13 +2142,15 @@ class AscendSFAImpl(MLAAttentionImpl):
             )
 
         attn_output = None
+        _dsa_prof.end(_attention_route_t)
         if _adapter_supported:
             # Adapter-backed latent hot cache: FA reads the resident pool in place
             # (zero-copy), the adapter owns residency (hit/miss) + eviction.
-            _ac = _dsa_adapter
-            _req_ids_a = _dsa_fc.dsa_req_ids
-            _kn_a = k_nope.reshape(-1, self.kv_lora_rank)
-            _kp_a = k_pe.reshape(-1, self.qk_rope_head_dim)
+            with _dsa_prof.section("ad_route_setup"):
+                _ac = _dsa_adapter
+                _req_ids_a = _dsa_fc.dsa_req_ids
+                _kn_a = k_nope.reshape(-1, self.kv_lora_rank)
+                _kp_a = k_pe.reshape(-1, self.qk_rope_head_dim)
             if attn_metadata.attn_state == AscendAttentionState.DecodeOnly:
                 with _dsa_prof.section("ad_prep"):
                     # computed per layer (fresh): a cross-layer memo of these went
@@ -2130,8 +2175,9 @@ class AscendSFAImpl(MLAAttentionImpl):
                 # only block-allocation steps run those kernels; sync ONLY then. Normal
                 # in-block steps do an ordered pool write and need no sync. Remove
                 # entirely once the native kernels enforce their own device-side order.
-                if _insert_meta_op and hasattr(torch, "npu"):
-                    torch.npu.synchronize()
+                with _dsa_prof.section("ad_insert_sync"):
+                    if _insert_meta_op and hasattr(torch, "npu"):
+                        torch.npu.synchronize()
                 with _dsa_prof.section("ad_retrieve"):
                     _res_a = _ac.retrieve(layer_name, _req_slots_a, _topk2d)
                 with _dsa_prof.section("ad_fa"):
@@ -2154,14 +2200,25 @@ class AscendSFAImpl(MLAAttentionImpl):
                     _ac.release_after_fa(layer_name, _res_a.loaded_ids)
                 _dsa_prof.step()
                 if envs.VLLM_ASCEND_DSA_OFFLOAD_ASSERT_PARITY:
-                    native_out = self._execute_sparse_flash_attention_process(
-                        ql_nope, q_pe, kv_cache, topk_indices, attn_metadata,
-                        actual_seq_lengths_query, actual_seq_lengths_key,
-                        layer_name=layer_name,
-                        trace_label="adapter_parity_native",
-                    )
-                    diff = (native_out.float() - adapter_out.float()).abs().max()
-                    logger.info("[DSA-ADAPTER-PARITY] layer=%s max_abs_diff=%s", layer_name, float(diff))
+                    with _dsa_prof.section("ad_parity_fa"):
+                        native_out = self._execute_sparse_flash_attention_process(
+                            ql_nope,
+                            q_pe,
+                            kv_cache,
+                            topk_indices,
+                            attn_metadata,
+                            actual_seq_lengths_query,
+                            actual_seq_lengths_key,
+                            layer_name=layer_name,
+                            trace_label="adapter_parity_native",
+                        )
+                    with _dsa_prof.section("ad_parity_check"):
+                        diff = (native_out.float() - adapter_out.float()).abs().max()
+                        logger.info(
+                            "[DSA-ADAPTER-PARITY] layer=%s max_abs_diff=%s",
+                            layer_name,
+                            float(diff),
+                        )
                     attn_output = native_out  # generation uses the native result
                 else:
                     attn_output = adapter_out
@@ -2169,13 +2226,21 @@ class AscendSFAImpl(MLAAttentionImpl):
                 # prefill: store this layer's prompt latent into the adapter backend so
                 # decode-time retrieve can fetch prefill-selected blocks; attention
                 # itself uses the native prefill path (attn_output stays None).
-                _qsl_a = torch.cat(
-                    [attn_metadata.cum_query_lens.new_zeros(1), attn_metadata.cum_query_lens]
-                )
-                _ctx_a = attn_metadata.seq_lens - (_qsl_a[1:] - _qsl_a[:-1])
-                _ac.store_prefill(layer_name, _req_ids_a, _qsl_a, _ctx_a, _kn_a, _kp_a)
+                with _dsa_prof.section("ad_prefill_prepare"):
+                    _qsl_a = torch.cat(
+                        [
+                            attn_metadata.cum_query_lens.new_zeros(1),
+                            attn_metadata.cum_query_lens,
+                        ]
+                    )
+                    _ctx_a = attn_metadata.seq_lens - (_qsl_a[1:] - _qsl_a[:-1])
+                with _dsa_prof.section("ad_store_prefill"):
+                    _ac.store_prefill(
+                        layer_name, _req_ids_a, _qsl_a, _ctx_a, _kn_a, _kp_a
+                    )
 
         if attn_output is None and _dsa_supported:
+            _pool_route_t = _dsa_prof.begin("pool_route_setup")
             from vllm_ascend.distributed.kv_transfer.sparse_offload import sfa_hooks as _dsa_hooks
 
             _block_size = kv_cache[0].shape[1]
@@ -2184,6 +2249,7 @@ class AscendSFAImpl(MLAAttentionImpl):
             # no longer depends on the latent being resident in the paged cache (10b).
             _kn = k_nope.reshape(-1, self.kv_lora_rank)
             _kp = k_pe.reshape(-1, self.qk_rope_head_dim)
+            _dsa_prof.end(_pool_route_t)
             if attn_metadata.attn_state == AscendAttentionState.DecodeOnly:
                 # store this step's token into the growing decode pool, then gather the
                 # selected latent (prefill from LMCache, decode from pool) into scratch.
@@ -2219,14 +2285,25 @@ class AscendSFAImpl(MLAAttentionImpl):
                     )
                 _dsa_prof.step()
                 if envs.VLLM_ASCEND_DSA_OFFLOAD_ASSERT_PARITY and not self.dsa_offload_free_paged:
-                    native_out = self._execute_sparse_flash_attention_process(
-                        ql_nope, q_pe, kv_cache, topk_indices, attn_metadata,
-                        actual_seq_lengths_query, actual_seq_lengths_key,
-                        layer_name=layer_name,
-                        trace_label="lmcache_parity_native",
-                    )
-                    diff = (native_out.float() - scratch_out.float()).abs().max()
-                    logger.info("[DSA-PARITY] layer=%s max_abs_diff=%s", layer_name, float(diff))
+                    with _dsa_prof.section("parity_fa"):
+                        native_out = self._execute_sparse_flash_attention_process(
+                            ql_nope,
+                            q_pe,
+                            kv_cache,
+                            topk_indices,
+                            attn_metadata,
+                            actual_seq_lengths_query,
+                            actual_seq_lengths_key,
+                            layer_name=layer_name,
+                            trace_label="lmcache_parity_native",
+                        )
+                    with _dsa_prof.section("parity_check"):
+                        diff = (native_out.float() - scratch_out.float()).abs().max()
+                        logger.info(
+                            "[DSA-PARITY] layer=%s max_abs_diff=%s",
+                            layer_name,
+                            float(diff),
+                        )
                     attn_output = native_out  # safe: generation uses the native result
                 else:
                     attn_output = scratch_out
@@ -2235,35 +2312,69 @@ class AscendSFAImpl(MLAAttentionImpl):
                 # the self-managed PagedLatentPool and run prefill attention from the pool
                 # (Route 1 / R1b). The vLLM paged latent is still written by the op, so
                 # the parity path can compare pool-attn vs native-paged-attn.
-                _qsl = torch.cat(
-                    [attn_metadata.cum_query_lens.new_zeros(1), attn_metadata.cum_query_lens]
-                )
-                _ctx = attn_metadata.seq_lens - (_qsl[1:] - _qsl[:-1])
-                _dsa_hooks.store_prefill(
-                    _dsa_mgr, layer_name, _dsa_fc.dsa_req_ids, _qsl, _ctx, _kn, _kp
-                )
-                _dsa_mgr.populate_pool_layer(
-                    _dsa_fc.dsa_req_ids, layer_name, _qsl, _ctx, _kn, _kp
-                )
-                _p_knope, _p_kpe, _p_bt = _dsa_mgr.pool_attn_args(
-                    layer_name, _dsa_fc.dsa_req_ids, attn_metadata.block_table.shape[1]
-                )
-                pool_out = self._execute_sparse_flash_attention_process(
-                    ql_nope, q_pe, kv_cache, topk_indices, attn_metadata,
-                    actual_seq_lengths_query, actual_seq_lengths_key,
-                    kv_override=_p_knope, key_rope_override=_p_kpe, block_table_override=_p_bt,
-                    layer_name=layer_name,
-                    trace_label="pool_prefill",
-                )
-                if envs.VLLM_ASCEND_DSA_OFFLOAD_ASSERT_PARITY and not self.dsa_offload_free_paged:
-                    native_out = self._execute_sparse_flash_attention_process(
-                        ql_nope, q_pe, kv_cache, topk_indices, attn_metadata,
-                        actual_seq_lengths_query, actual_seq_lengths_key,
-                        layer_name=layer_name,
-                        trace_label="pool_prefill_parity_native",
+                with _dsa_prof.section("pool_prefill_prepare"):
+                    _qsl = torch.cat(
+                        [
+                            attn_metadata.cum_query_lens.new_zeros(1),
+                            attn_metadata.cum_query_lens,
+                        ]
                     )
-                    diff = (native_out.float() - pool_out.float()).abs().max()
-                    logger.info("[DSA-PARITY-PREFILL] layer=%s max_abs_diff=%s", layer_name, float(diff))
+                    _ctx = attn_metadata.seq_lens - (_qsl[1:] - _qsl[:-1])
+                with _dsa_prof.section("pool_store_prefill"):
+                    _dsa_hooks.store_prefill(
+                        _dsa_mgr,
+                        layer_name,
+                        _dsa_fc.dsa_req_ids,
+                        _qsl,
+                        _ctx,
+                        _kn,
+                        _kp,
+                    )
+                with _dsa_prof.section("pool_populate_prefill"):
+                    _dsa_mgr.populate_pool_layer(
+                        _dsa_fc.dsa_req_ids, layer_name, _qsl, _ctx, _kn, _kp
+                    )
+                with _dsa_prof.section("pool_attn_args"):
+                    _p_knope, _p_kpe, _p_bt = _dsa_mgr.pool_attn_args(
+                        layer_name,
+                        _dsa_fc.dsa_req_ids,
+                        attn_metadata.block_table.shape[1],
+                    )
+                with _dsa_prof.section("pool_prefill_fa"):
+                    pool_out = self._execute_sparse_flash_attention_process(
+                        ql_nope,
+                        q_pe,
+                        kv_cache,
+                        topk_indices,
+                        attn_metadata,
+                        actual_seq_lengths_query,
+                        actual_seq_lengths_key,
+                        kv_override=_p_knope,
+                        key_rope_override=_p_kpe,
+                        block_table_override=_p_bt,
+                        layer_name=layer_name,
+                        trace_label="pool_prefill",
+                    )
+                if envs.VLLM_ASCEND_DSA_OFFLOAD_ASSERT_PARITY and not self.dsa_offload_free_paged:
+                    with _dsa_prof.section("pool_prefill_parity_fa"):
+                        native_out = self._execute_sparse_flash_attention_process(
+                            ql_nope,
+                            q_pe,
+                            kv_cache,
+                            topk_indices,
+                            attn_metadata,
+                            actual_seq_lengths_query,
+                            actual_seq_lengths_key,
+                            layer_name=layer_name,
+                            trace_label="pool_prefill_parity_native",
+                        )
+                    with _dsa_prof.section("pool_prefill_parity_check"):
+                        diff = (native_out.float() - pool_out.float()).abs().max()
+                        logger.info(
+                            "[DSA-PARITY-PREFILL] layer=%s max_abs_diff=%s",
+                            layer_name,
+                            float(diff),
+                        )
                     attn_output = native_out  # safe: generation uses the native result
                 else:
                     attn_output = pool_out
@@ -2280,41 +2391,48 @@ class AscendSFAImpl(MLAAttentionImpl):
             # logs mean ms/layer-call periodically (mirrors the manager path).
             _dsa_prof.step()
 
-        attn_output = self._v_up_proj(attn_output)
-        weight_prefetch_method = get_weight_prefetch_method()
-        weight_prefetch_method.maybe_prefetch_mla_or_sla_weight_in_current_stream(
-            inputs=self.o_proj.weight,
-            dependency=attn_output,
-            max_size=MAX_O_PROJ_PREFETCH_SIZE,
-            linear_layer=self.o_proj,
-        )
+        with _dsa_prof.section("v_up_proj"):
+            attn_output = self._v_up_proj(attn_output)
+        with _dsa_prof.section("o_proj_prefetch"):
+            weight_prefetch_method = get_weight_prefetch_method()
+            weight_prefetch_method.maybe_prefetch_mla_or_sla_weight_in_current_stream(
+                inputs=self.o_proj.weight,
+                dependency=attn_output,
+                max_size=MAX_O_PROJ_PREFETCH_SIZE,
+                linear_layer=self.o_proj,
+            )
 
         if self.enable_dsa_cp_with_o_proj_tp:
             # When using SFA-CP with pd mixed, o_proj has two cases:
             # 1. prefill: o_proj is a TP weight, we need to all-gather o_proj weight to switch TP=1.
             # 2. decode: all-to-all the hidden_state before the o_proj forward.
-            result, require_o_proj_forward = self._handle_o_proj_weight_switch_and_forward(
-                attn_output=attn_output,
-                output=output,
-                o_proj_full_handle=o_proj_full_handle,
-                should_shard_weight=full_gather_o_proj_enabled,
-            )
+            with _dsa_prof.section("o_proj_weight_switch"):
+                result, require_o_proj_forward = self._handle_o_proj_weight_switch_and_forward(
+                    attn_output=attn_output,
+                    output=output,
+                    o_proj_full_handle=o_proj_full_handle,
+                    should_shard_weight=full_gather_o_proj_enabled,
+                )
             if not require_o_proj_forward:
                 _dsa_prof.end(_sfa_t)
                 return result
             attn_output = result
 
         if self.enable_dsa_cp_strict_accuracy:
-            send = (
-                attn_output.view(-1, self.tp_size, self.num_heads * self.v_head_dim)
-                .permute(1, 0, 2)
-                .reshape(-1, self.num_heads * self.v_head_dim)
-            )
+            with _dsa_prof.section("o_proj_all_to_all"):
+                send = (
+                    attn_output.view(-1, self.tp_size, self.num_heads * self.v_head_dim)
+                    .permute(1, 0, 2)
+                    .reshape(-1, self.num_heads * self.v_head_dim)
+                )
 
-            attn_output = torch.empty_like(send)
-            torch.distributed.all_to_all_single(attn_output, send, group=get_tp_group().device_group)
+                attn_output = torch.empty_like(send)
+                torch.distributed.all_to_all_single(
+                    attn_output, send, group=get_tp_group().device_group
+                )
 
-        output[...] = self.o_proj(attn_output)[0]
+        with _dsa_prof.section("o_proj"):
+            output[...] = self.o_proj(attn_output)[0]
 
         # Offload to LMCache. Legacy un-bundled connectors save only the latent
         # (k_nope, k_pe). Connectors declaring DSA index LMCache support also
@@ -2336,16 +2454,21 @@ class AscendSFAImpl(MLAAttentionImpl):
             and not _decode_window_save_enabled
         )
         if not _skip_decode_save:
-            if self.dsa_offload_unbundle and len(kv_cache) >= 2:
-                maybe_save_kv_layer_to_connector(layer_name, [kv_cache[0], kv_cache[1]])
-                if (
-                    len(kv_cache) >= 3
-                    and index_layer_name is not None
-                    and index_lmcache_enabled
-                ):
-                    maybe_save_kv_layer_to_connector(index_layer_name, [kv_cache[2]])
-            else:
-                maybe_save_kv_layer_to_connector(layer_name, list(kv_cache))
+            with _dsa_prof.section("lmc_save_submit"):
+                if self.dsa_offload_unbundle and len(kv_cache) >= 2:
+                    maybe_save_kv_layer_to_connector(
+                        layer_name, [kv_cache[0], kv_cache[1]]
+                    )
+                    if (
+                        len(kv_cache) >= 3
+                        and index_layer_name is not None
+                        and index_lmcache_enabled
+                    ):
+                        maybe_save_kv_layer_to_connector(
+                            index_layer_name, [kv_cache[2]]
+                        )
+                else:
+                    maybe_save_kv_layer_to_connector(layer_name, list(kv_cache))
 
         _dsa_prof.end(_sfa_t)
         return output_padded
