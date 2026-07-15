@@ -511,6 +511,14 @@ def parse_args():
     parser.add_argument("--prefiller-ports", type=int, nargs="+", default=[8001])
     parser.add_argument("--decoder-hosts", type=str, nargs="+", default=["localhost"])
     parser.add_argument("--decoder-ports", type=int, nargs="+", default=[8002])
+    parser.add_argument(
+        "--final-hidden-handoff",
+        action="store_true",
+        help=(
+            "Ask prefiller nodes to return the final prompt hidden state so "
+            "a sparse decoder can sample without recomputing the last token."
+        ),
+    )
     parser.add_argument("--max-retries", type=int, default=3, help="Maximum number of retries for HTTP requests")
     parser.add_argument(
         "--retry-delay", type=float, default=0.001, help="Base delay (seconds) for exponential backoff retries"
@@ -573,6 +581,34 @@ def with_cancellation(handler_func):
 app = FastAPI(lifespan=lifespan)
 
 
+def build_prefill_kv_transfer_params(
+    aborted_requests: set[str], final_hidden_handoff: bool
+) -> dict[str, Any]:
+    params: dict[str, Any] = {
+        "do_remote_decode": True,
+        "do_remote_prefill": False,
+        "remote_engine_id": None,
+        "remote_block_ids": None,
+        "remote_host": None,
+        "remote_port": None,
+        "aborted_request": list(aborted_requests),
+    }
+    if final_hidden_handoff:
+        params["ret_final_hidden"] = True
+    return params
+
+
+def update_decode_kv_transfer_params(
+    req_data: dict[str, Any], response_params: object
+) -> dict[str, Any]:
+    """Replace, rather than merge with, a previous P/D transfer envelope."""
+    if isinstance(response_params, dict) and response_params:
+        req_data["kv_transfer_params"] = response_params
+        return response_params
+    req_data.pop("kv_transfer_params", None)
+    return {}
+
+
 async def send_request_to_service(
     client: httpx.AsyncClient,
     prefiller_id: int,
@@ -584,15 +620,10 @@ async def send_request_to_service(
 ):
     aborted_requests = proxy_state.acquire_aborted_prefiller_requests(prefiller_id)
     req_data = req_data.copy()
-    req_data["kv_transfer_params"] = {
-        "do_remote_decode": True,
-        "do_remote_prefill": False,
-        "remote_engine_id": None,
-        "remote_block_ids": None,
-        "remote_host": None,
-        "remote_port": None,
-        "aborted_request": list(aborted_requests),
-    }
+    req_data["kv_transfer_params"] = build_prefill_kv_transfer_params(
+        aborted_requests,
+        getattr(global_args, "final_hidden_handoff", False),
+    )
     req_data["stream"] = False
     req_data["max_tokens"] = 1
     req_data["min_tokens"] = 1
@@ -675,9 +706,19 @@ async def _handle_select_instance(api: str, req_data: Any, request_length: int):
     )
     proxy_state.release_prefiller(prefiller_idx, prefiller_score)
     response_json = response.json()
-    kv_transfer_params = response_json.get("kv_transfer_params", {})
-    if kv_transfer_params:
-        req_data["kv_transfer_params"] = kv_transfer_params
+    kv_transfer_params = update_decode_kv_transfer_params(
+        req_data, response_json.get("kv_transfer_params")
+    )
+    if (
+        getattr(global_args, "final_hidden_handoff", False)
+        and "bootstrap_final_hidden" not in kv_transfer_params
+    ):
+        logger.warning(
+            "Prefiller %s did not return a final hidden state for request %s; "
+            "the decoder will use the normal recompute path.",
+            prefiller.url,
+            request_id,
+        )
     # Select decoder
     decoder_score = proxy_state.calculate_decode_scores(request_length)
     logger.debug("Decoder score: %f", decoder_score)

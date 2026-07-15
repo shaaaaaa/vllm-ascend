@@ -17,6 +17,10 @@
 # Adapted from vllm-project/vllm/vllm/worker/gpu_model_runner.py
 #
 
+import base64
+import binascii
+import hashlib
+import hmac
 import math
 import sys
 from collections import defaultdict
@@ -237,6 +241,93 @@ class ExecuteModelState(NamedTuple):
     ec_connector_output: "ECConnectorOutput | None"
     cudagraph_stats: CUDAGraphStat | None
     batch_desc: BatchDescriptor
+    final_hidden_states: dict[str, dict[str, Any]]
+    skip_draft_proposal: bool
+
+
+_FINAL_HIDDEN_DTYPES = {
+    "bfloat16": torch.bfloat16,
+    "float16": torch.float16,
+    "float32": torch.float32,
+}
+_MAX_FINAL_HIDDEN_BYTES = 16 * 1024 * 1024
+_MAX_FINAL_HIDDEN_BASE64_CHARS = 4 * ((_MAX_FINAL_HIDDEN_BYTES + 2) // 3)
+
+
+def serialize_final_hidden_state(hidden_state: torch.Tensor) -> dict[str, Any]:
+    """Encode a final hidden state without losing BF16/FP16 bits."""
+    hidden_state = hidden_state.detach().to("cpu").contiguous()
+    dtype = str(hidden_state.dtype).removeprefix("torch.")
+    if dtype not in _FINAL_HIDDEN_DTYPES:
+        raise ValueError(f"Unsupported final hidden state dtype: {hidden_state.dtype}")
+    raw = hidden_state.view(torch.uint8).numpy().tobytes()
+    return {
+        "version": 1,
+        "dtype": dtype,
+        "shape": list(hidden_state.shape),
+        "encoding": "base64",
+        "data": base64.b64encode(raw).decode("ascii"),
+        "data_sha256": hashlib.sha256(raw).hexdigest(),
+    }
+
+
+def deserialize_final_hidden_state(payload: dict[str, Any]) -> torch.Tensor:
+    """Decode a final hidden state produced by serialize_final_hidden_state."""
+    if payload.get("version") != 1 or payload.get("encoding") != "base64":
+        raise ValueError("Unsupported final hidden state payload")
+
+    dtype_name = payload.get("dtype")
+    dtype = _FINAL_HIDDEN_DTYPES.get(dtype_name)
+    if dtype is None:
+        raise ValueError(f"Unsupported final hidden state dtype: {dtype_name!r}")
+
+    shape = payload.get("shape")
+    if (
+        not isinstance(shape, list)
+        or not shape
+        or len(shape) != 1
+        or any(type(dim) is not int or dim <= 0 for dim in shape)
+    ):
+        raise ValueError(f"Invalid final hidden state shape: {shape!r}")
+    data = payload.get("data")
+    if not isinstance(data, str):
+        raise ValueError("Final hidden state payload data must be a string")
+    expected_bytes = math.prod(shape) * get_dtype_size(dtype)
+    if expected_bytes > _MAX_FINAL_HIDDEN_BYTES:
+        raise ValueError(
+            "Final hidden state payload exceeds the 16 MiB decoded size limit"
+        )
+    if len(data) > _MAX_FINAL_HIDDEN_BASE64_CHARS:
+        raise ValueError(
+            "Final hidden state base64 data exceeds the 16 MiB decoded size limit"
+        )
+    base64_padding = len(data) - len(data.rstrip("="))
+    decoded_size_upper_bound = (len(data) // 4) * 3 - base64_padding
+    if decoded_size_upper_bound > _MAX_FINAL_HIDDEN_BYTES:
+        raise ValueError(
+            "Final hidden state base64 data exceeds the 16 MiB decoded size limit"
+        )
+    try:
+        raw = base64.b64decode(data, validate=True)
+    except (binascii.Error, ValueError, TypeError) as exc:
+        raise ValueError("Invalid base64 final hidden state payload") from exc
+
+    if len(raw) != expected_bytes:
+        raise ValueError(
+            "Final hidden state payload size mismatch: "
+            f"expected {expected_bytes}, got {len(raw)}"
+        )
+    data_sha256 = payload.get("data_sha256")
+    if not isinstance(data_sha256, str) or not hmac.compare_digest(
+        hashlib.sha256(raw).hexdigest(), data_sha256
+    ):
+        raise ValueError("Final hidden state payload SHA-256 mismatch")
+    return (
+        torch.frombuffer(bytearray(raw), dtype=torch.uint8)
+        .view(dtype)
+        .reshape(shape)
+        .clone()
+    )
 
 
 class NPUModelRunner(GPUModelRunner):
@@ -1205,6 +1296,417 @@ class NPUModelRunner(GPUModelRunner):
 
         return draft_token_ids
 
+    def _capture_final_hidden_states(
+        self,
+        scheduler_output: "SchedulerOutput",
+        hidden_states: torch.Tensor,
+        num_scheduled_tokens: np.ndarray,
+    ) -> dict[str, dict[str, Any]]:
+        capture_req_ids = scheduler_output.capture_final_hidden_req_ids
+        if not capture_req_ids:
+            return {}
+
+        final_hidden_states: dict[str, dict[str, Any]] = {}
+        row_end = 0
+        for req_idx, req_id in enumerate(self.input_batch.req_ids):
+            row_end += int(num_scheduled_tokens[req_idx])
+            if req_id not in capture_req_ids:
+                continue
+            if row_end == 0:
+                raise RuntimeError(
+                    f"Cannot capture final hidden state for unscheduled request {req_id!r}"
+                )
+            final_hidden_states[req_id] = serialize_final_hidden_state(
+                hidden_states[row_end - 1]
+            )
+        missing_req_ids = capture_req_ids.difference(final_hidden_states)
+        if missing_req_ids:
+            raise RuntimeError(
+                "Final hidden state capture requests are absent from the model batch: "
+                f"{sorted(missing_req_ids)}"
+            )
+        return final_hidden_states
+
+    def _get_bootstrap_hidden_states(
+        self,
+        scheduler_output: "SchedulerOutput",
+    ) -> torch.Tensor:
+        bootstrap_req_ids = scheduler_output.bootstrap_sample_req_ids
+        payloads = scheduler_output.bootstrap_final_hiddens
+        if not bootstrap_req_ids or payloads is None:
+            raise RuntimeError("BOOTSTRAP_SAMPLE is missing final hidden state payloads")
+
+        hidden_size = self.model_config.get_hidden_size()
+        hidden_states = []
+        for req_id in self.input_batch.req_ids:
+            if req_id not in bootstrap_req_ids:
+                raise RuntimeError(
+                    "BOOTSTRAP_SAMPLE must be scheduled as an independent work item; "
+                    f"normal request {req_id!r} was present in the same model batch"
+                )
+            payload = payloads.get(req_id)
+            if payload is None:
+                raise RuntimeError(
+                    f"BOOTSTRAP_SAMPLE request {req_id!r} has no final hidden state"
+                )
+            hidden_state = deserialize_final_hidden_state(payload)
+            if hidden_state.shape != (hidden_size,):
+                raise ValueError(
+                    f"BOOTSTRAP_SAMPLE request {req_id!r} has hidden shape "
+                    f"{tuple(hidden_state.shape)}, expected ({hidden_size},)"
+                )
+            hidden_states.append(hidden_state)
+
+        missing_req_ids = bootstrap_req_ids.difference(self.input_batch.req_ids)
+        if missing_req_ids:
+            raise RuntimeError(
+                "BOOTSTRAP_SAMPLE requests are absent from the model batch: "
+                f"{sorted(missing_req_ids)}"
+            )
+        return torch.stack(hidden_states).to(self.device, non_blocking=True)
+
+    def _wait_for_bootstrap_kv_load(self) -> None:
+        connector = get_kv_transfer_group()
+        kv_cache_groups = self.kv_cache_config.kv_cache_groups
+        latent_layer_names = kv_cache_groups[0].layer_names
+        if not self.dsa_two_groups:
+            for layer_name in latent_layer_names:
+                connector.wait_for_layer_load(layer_name)
+            return
+
+        if len(kv_cache_groups) < 2:
+            raise RuntimeError(
+                "BOOTSTRAP_SAMPLE DSA two-group mode is missing the indexer group"
+            )
+        indexer_layer_names = kv_cache_groups[1].layer_names
+        if len(latent_layer_names) != len(indexer_layer_names):
+            raise RuntimeError(
+                "BOOTSTRAP_SAMPLE requires aligned latent and indexer layer groups"
+            )
+        # Sparse cold retrieval advances a layer only after both the latent
+        # scratch (group 0) and full indexer (group 1) waits complete.
+        for latent_layer_name, indexer_layer_name in zip(
+            latent_layer_names, indexer_layer_names
+        ):
+            connector.wait_for_layer_load(latent_layer_name)
+            connector.wait_for_layer_load(indexer_layer_name)
+
+    def _bootstrap_block_ids_by_req(
+        self,
+        scheduler_output: "SchedulerOutput",
+    ) -> dict[str, set[int]]:
+        block_ids_by_req: dict[str, set[int]] = {}
+        for req_id in scheduler_output.bootstrap_sample_req_ids:
+            request_state = self.requests.get(req_id)
+            if request_state is None:
+                continue
+            block_ids_by_req[req_id] = {
+                block_id
+                for group_block_ids in request_state.block_ids
+                for block_id in group_block_ids
+                if block_id >= 0
+            }
+        return block_ids_by_req
+
+    def _bootstrap_load_failed_req_ids(
+        self,
+        scheduler_output: "SchedulerOutput",
+        kv_connector_output: "KVConnectorOutput | None",
+    ) -> set[str]:
+        if kv_connector_output is None or not kv_connector_output.invalid_block_ids:
+            return set()
+        return {
+            req_id
+            for req_id, block_ids in self._bootstrap_block_ids_by_req(
+                scheduler_output
+            ).items()
+            if block_ids & kv_connector_output.invalid_block_ids
+        }
+
+    def _sync_tp_bootstrap_load_failed_req_ids(
+        self,
+        ordered_req_ids: list[str],
+        local_failed_req_ids: set[str],
+    ) -> set[str]:
+        tp_group = get_tp_group()
+        if tp_group.world_size == 1:
+            return local_failed_req_ids
+        flags = torch.tensor(
+            [int(req_id in local_failed_req_ids) for req_id in ordered_req_ids],
+            dtype=torch.int32,
+            device="cpu",
+        )
+        dist.all_reduce(flags, op=dist.ReduceOp.MAX, group=tp_group.cpu_group)
+        return {
+            req_id
+            for req_id, failed in zip(ordered_req_ids, flags.tolist())
+            if failed
+        }
+
+    @contextmanager
+    def _bootstrap_last_token_input_state(self, num_reqs: int):
+        num_computed_tokens = self.input_batch.num_computed_tokens_cpu[:num_reqs]
+        original_num_computed_tokens = num_computed_tokens.copy()
+        if np.any(num_computed_tokens <= 0):
+            raise RuntimeError(
+                "BOOTSTRAP_SAMPLE requires at least one computed prompt token"
+            )
+        num_computed_tokens -= 1
+        try:
+            yield
+        finally:
+            num_computed_tokens[:] = original_num_computed_tokens
+
+    def _validate_bootstrap_spec_config(self) -> None:
+        if self.speculative_config is not None and (
+            self.speculative_config.method not in ("mtp", "deepseek_mtp")
+            or self.speculative_config.num_speculative_tokens != 1
+        ):
+            raise RuntimeError(
+                "BOOTSTRAP_SAMPLE currently supports only MTP with one speculative token"
+            )
+
+    def _sync_dp_step_has_bootstrap(self, local_has_bootstrap: bool) -> bool:
+        if self.dp_size == 1:
+            return local_has_bootstrap
+        flag = torch.tensor(
+            int(local_has_bootstrap),
+            dtype=torch.int32,
+            device="cpu",
+        )
+        dist.all_reduce(flag, op=dist.ReduceOp.MAX, group=get_dp_group().cpu_group)
+        return bool(flag.item())
+
+    def _execute_bootstrap_sample(
+        self,
+        scheduler_output: "SchedulerOutput",
+    ) -> None:
+        """Sample from transferred hidden state, ignoring any target output."""
+        if self.use_async_scheduling:
+            raise RuntimeError("BOOTSTRAP_SAMPLE does not support async scheduling")
+        if self.pcp_size > 1 or self.dcp_size > 1:
+            raise RuntimeError("BOOTSTRAP_SAMPLE does not support context parallelism")
+        if get_pp_group().world_size > 1:
+            raise RuntimeError("BOOTSTRAP_SAMPLE does not support pipeline parallelism")
+
+        bootstrap_req_ids = scheduler_output.bootstrap_sample_req_ids
+        scheduled_req_ids = set(scheduler_output.num_scheduled_tokens)
+        if bootstrap_req_ids != scheduled_req_ids:
+            raise RuntimeError(
+                "BOOTSTRAP_SAMPLE must be scheduled separately from normal model work"
+            )
+        if any(
+            scheduler_output.num_scheduled_tokens[req_id] != 1
+            for req_id in bootstrap_req_ids
+        ):
+            raise RuntimeError("Each BOOTSTRAP_SAMPLE request must schedule one logical token")
+        self._validate_bootstrap_spec_config()
+
+        num_reqs = self.input_batch.num_reqs
+        num_scheduled_tokens_np = np.ones(num_reqs, dtype=np.int32)
+        run_shadow_forward = self.dp_size > 1
+        shadow_forward_inputs = None
+
+        # Recreate the metadata that a last-prompt-token forward would have
+        # produced. DP ranks run a shadow target forward for collective
+        # alignment; single-DP bootstrap skips it entirely.
+        with self._bootstrap_last_token_input_state(num_reqs):
+            (
+                logits_indices,
+                spec_decode_metadata,
+                total_num_scheduled_tokens,
+            ) = self._prepare_inputs(scheduler_output, num_scheduled_tokens_np)
+            assert spec_decode_metadata is None
+
+            (
+                cudagraph_mode,
+                batch_desc,
+                should_ubatch,
+                num_tokens_across_dp,
+                cudagraph_stats,
+            ) = self._determine_batch_execution_and_padding(
+                num_tokens=total_num_scheduled_tokens,
+                num_reqs=num_reqs,
+                num_scheduled_tokens_np=num_scheduled_tokens_np,
+                max_num_scheduled_tokens=1,
+                use_cascade_attn=False,
+                force_eager=True,
+                num_encoder_reqs=0,
+            )
+            if should_ubatch:
+                raise RuntimeError(
+                    "BOOTSTRAP_SAMPLE does not support microbatching"
+                )
+            num_tokens_padded = batch_desc.num_tokens
+            num_reqs_padded = batch_desc.num_reqs or num_reqs
+            attn_metadata, spec_decode_common_attn_metadata = (
+                self._build_attention_metadata(
+                    num_tokens=total_num_scheduled_tokens,
+                    num_tokens_padded=num_tokens_padded,
+                    num_reqs=num_reqs,
+                    num_reqs_padded=num_reqs_padded,
+                    max_query_len=1,
+                    logits_indices=logits_indices,
+                    use_spec_decode=False,
+                    num_scheduled_tokens=scheduler_output.num_scheduled_tokens,
+                    num_scheduled_tokens_np=num_scheduled_tokens_np,
+                )
+            )
+            if spec_decode_common_attn_metadata is not None:
+                spec_decode_common_attn_metadata = copy(
+                    spec_decode_common_attn_metadata
+                )
+                spec_decode_common_attn_metadata.num_computed_tokens_cpu = (
+                    spec_decode_common_attn_metadata.num_computed_tokens_cpu.clone()
+                )
+            if run_shadow_forward:
+                shadow_forward_inputs = self._preprocess(
+                    scheduler_output,
+                    num_tokens_padded,
+                    None,
+                )
+                update_cos_sin(shadow_forward_inputs[2])
+        if self.speculative_config is not None:
+            assert spec_decode_common_attn_metadata is not None
+
+        hidden_states = self._get_bootstrap_hidden_states(scheduler_output)
+
+        dsa_offload_manager = getattr(self, "dsa_offload_manager", None)
+        dsa_adapter_cache = getattr(self, "dsa_adapter_cache", None)
+        dsa_req_ids = self.input_batch.req_ids[:num_reqs]
+        dsa_prompt_lens = torch.from_numpy(
+            self.input_batch.num_prompt_tokens[:num_reqs]
+        )
+        if self.dynamic_eplb:
+            with record_function_or_nullcontext("EPLB weight D2D"):
+                self.eplb_updator.forward_before()
+        with (
+            set_ascend_forward_context(
+                attn_metadata,
+                self.vllm_config,
+                num_tokens=num_tokens_padded,
+                num_tokens_across_dp=num_tokens_across_dp,
+                aclgraph_runtime_mode=cudagraph_mode,
+                batch_descriptor=batch_desc,
+                num_actual_tokens=total_num_scheduled_tokens,
+                model_instance=self.model,
+                dsa_offload_manager=dsa_offload_manager,
+                dsa_req_ids=dsa_req_ids,
+                dsa_prompt_lens=dsa_prompt_lens,
+                dsa_adapter_cache=dsa_adapter_cache,
+            ),
+            self.maybe_get_kv_connector_output(
+                scheduler_output,
+                defer_finalize=self.speculative_config is not None,
+            ) as kv_connector_output,
+        ):
+            if run_shadow_forward:
+                assert shadow_forward_inputs is not None
+                (
+                    shadow_input_ids,
+                    shadow_inputs_embeds,
+                    shadow_positions,
+                    shadow_intermediate_tensors,
+                    shadow_model_kwargs,
+                    _,
+                ) = shadow_forward_inputs
+                # Keep DP/EP/TP collective ordering aligned with ranks that
+                # execute normal target work. Sampling still uses the
+                # transferred hidden state below; this result is discarded.
+                self._model_forward(
+                    num_tokens_padded,
+                    shadow_input_ids,
+                    shadow_positions,
+                    shadow_intermediate_tensors,
+                    shadow_inputs_embeds,
+                    **shadow_model_kwargs,
+                )
+            elif has_kv_transfer_group():
+                self._wait_for_bootstrap_kv_load()
+
+        ordered_bootstrap_req_ids = [
+            req_id
+            for req_id in self.input_batch.req_ids
+            if req_id in bootstrap_req_ids
+        ]
+        local_failed_req_ids = self._bootstrap_load_failed_req_ids(
+            scheduler_output, kv_connector_output
+        )
+        failed_req_ids = self._sync_tp_bootstrap_load_failed_req_ids(
+            ordered_bootstrap_req_ids, local_failed_req_ids
+        )
+        if failed_req_ids:
+            # Let the scheduler discard this logical work item and restart a
+            # dense prefill without advancing sampler RNG state. With MTP the
+            # connector lifecycle was deferred for a draft that will not run,
+            # so finalize it here.
+            if kv_connector_output is None:
+                kv_connector_output = KVConnectorOutput()
+            block_ids_by_req = self._bootstrap_block_ids_by_req(scheduler_output)
+            for req_id in failed_req_ids:
+                request_block_ids = block_ids_by_req.get(req_id)
+                if not request_block_ids:
+                    raise RuntimeError(
+                        "BOOTSTRAP_SAMPLE load failed for a request without "
+                        f"allocated blocks: {req_id!r}"
+                    )
+                # Propagate the per-request failure to the driver rank even if
+                # the connector reported it on a different TP worker. Use the
+                # first physical block rather than min(request_block_ids): a
+                # compact logical table contains the shared null block in its
+                # unmaterialized middle range.
+                request_state = self.requests[req_id]
+                representative_block_id = next(
+                    block_id
+                    for group_block_ids in request_state.block_ids
+                    for block_id in group_block_ids
+                    if block_id >= 0
+                )
+                kv_connector_output.invalid_block_ids.add(
+                    representative_block_id
+                )
+            if self.speculative_config is not None:
+                completed_decode_window_saves = self.finalize_kv_connector()
+                for req_id, window_end in completed_decode_window_saves.items():
+                    kv_connector_output.completed_decode_window_saves[req_id] = max(
+                        kv_connector_output.completed_decode_window_saves.get(
+                            req_id, 0
+                        ),
+                        window_end,
+                    )
+            if self.dynamic_eplb:
+                with record_function_or_nullcontext("EPLB update"):
+                    self.eplb_updator.forward_end()
+            self.execute_model_state = None
+            self.kv_connector_output = kv_connector_output
+            return
+
+        if self.ascend_config.enable_async_exponential:
+            self.sampler.do_async_exponential(
+                b_s=logits_indices.shape[0],
+                head_dim=self.model_config.get_vocab_size(),
+                generators=self.input_batch.sampling_metadata.generators,
+            )
+
+        logits = self.model.compute_logits(hidden_states)
+        self.execute_model_state = ExecuteModelState(
+            scheduler_output,
+            logits,
+            None,
+            spec_decode_common_attn_metadata,
+            hidden_states,
+            hidden_states,
+            None,
+            attn_metadata,
+            self.positions.gpu[:total_num_scheduled_tokens],
+            None,
+            cudagraph_stats,
+            batch_desc,
+            {},
+            True,
+        )
+        self.kv_connector_output = kv_connector_output
+
     @torch.inference_mode()
     def execute_model(
         self,
@@ -1235,6 +1737,23 @@ class NPUModelRunner(GPUModelRunner):
             with self.synchronize_input_prep():
                 # Update persistent batch states.
                 self._update_states(scheduler_output)
+                dp_step_has_bootstrap = self._sync_dp_step_has_bootstrap(
+                    bool(scheduler_output.bootstrap_sample_req_ids)
+                )
+                if dp_step_has_bootstrap:
+                    if self.use_async_scheduling:
+                        raise RuntimeError(
+                            "BOOTSTRAP_SAMPLE does not support async scheduling"
+                        )
+                    if self.pcp_size > 1 or self.dcp_size > 1:
+                        raise RuntimeError(
+                            "BOOTSTRAP_SAMPLE does not support context parallelism"
+                        )
+                    if get_pp_group().world_size > 1:
+                        raise RuntimeError(
+                            "BOOTSTRAP_SAMPLE does not support pipeline parallelism"
+                        )
+                    self._validate_bootstrap_spec_config()
 
                 if has_ec_transfer() and get_ec_transfer().is_producer:
                     with self.maybe_get_ec_connector_output(
@@ -1244,9 +1763,17 @@ class NPUModelRunner(GPUModelRunner):
                         self._execute_mm_encoder(scheduler_output)
                         return make_empty_encoder_model_runner_output(scheduler_output)
 
+                if scheduler_output.bootstrap_sample_req_ids:
+                    self._execute_bootstrap_sample(scheduler_output)
+                    return None
+
                 if not num_scheduled_tokens:
                     if (
-                        self.parallel_config.distributed_executor_backend == "external_launcher"
+                        (
+                            dp_step_has_bootstrap
+                            or self.parallel_config.distributed_executor_backend
+                            == "external_launcher"
+                        )
                         and self.parallel_config.data_parallel_size > 1
                     ):
                         # this is a corner case when both external launcher
@@ -1255,7 +1782,10 @@ class NPUModelRunner(GPUModelRunner):
                         # returns True. before returning early here we call
                         # dummy run to ensure coordinate_batch_across_dp
                         # is called into to avoid out of sync issues.
-                        self._dummy_run(1)
+                        self._dummy_run(
+                            1,
+                            skip_drafter=dp_step_has_bootstrap,
+                        )
                     if not has_kv_transfer_group():
                         # Return empty ModelRunnerOutput if no work to do.
                         return EMPTY_MODEL_RUNNER_OUTPUT
@@ -1550,6 +2080,21 @@ class NPUModelRunner(GPUModelRunner):
                         for aux_hidden_states_pcp in aux_hidden_states
                     ]
 
+            final_hidden_states = {}
+            if get_pp_group().is_last_rank:
+                assert isinstance(hidden_states, torch.Tensor)
+                final_hidden_states = self._capture_final_hidden_states(
+                    scheduler_output,
+                    hidden_states,
+                    np.array(
+                        [
+                            scheduler_output.num_scheduled_tokens[req_id]
+                            for req_id in self.input_batch.req_ids
+                        ],
+                        dtype=np.int32,
+                    ),
+                )
+
             if not self.broadcast_pp_output:
                 # Common case.
                 if not get_pp_group().is_last_rank:
@@ -1609,6 +2154,8 @@ class NPUModelRunner(GPUModelRunner):
                 ec_connector_output,
                 cudagraph_stats,
                 batch_desc,
+                final_hidden_states,
+                dp_step_has_bootstrap,
             )
             self.kv_connector_output = kv_connector_output
         return None
@@ -1652,6 +2199,8 @@ class NPUModelRunner(GPUModelRunner):
             ec_connector_output,
             cudagraph_stats,
             batch_desc,
+            final_hidden_states,
+            skip_draft_proposal,
         ) = self.execute_model_state
         # Clear ephemeral state.
         self.execute_model_state = None
@@ -1674,6 +2223,12 @@ class NPUModelRunner(GPUModelRunner):
 
             assert self.sampling_done_event is not None
             self.sampling_done_event.record()
+
+        # Never expose a previous step's drafts when this step intentionally
+        # suppresses drafting (bootstrap does this across every DP rank).
+        self._draft_token_ids = None
+        if hasattr(self, "_draft_token_req_ids"):
+            self._draft_token_req_ids = None
 
         def propose_draft_token_ids(sampled_token_ids):
             assert spec_decode_common_attn_metadata is not None
@@ -1709,7 +2264,7 @@ class NPUModelRunner(GPUModelRunner):
         )
 
         with record_function_or_nullcontext("draft_token"):
-            if self.speculative_config:
+            if self.speculative_config and not skip_draft_proposal:
                 use_padded_batch = (
                     self.speculative_config
                     and (self.speculative_config.use_eagle() or self.speculative_config.uses_draft_model())
@@ -1757,6 +2312,7 @@ class NPUModelRunner(GPUModelRunner):
             pooler_output=[],
             ec_connector_output=ec_connector_output if self.supports_mm_inputs else None,
             cudagraph_stats=cudagraph_stats,
+            final_hidden_states=final_hidden_states,
         )
 
         if self.dynamic_eplb:
@@ -2921,6 +3477,7 @@ class NPUModelRunner(GPUModelRunner):
         is_graph_capturing: bool = False,
         num_active_loras: int = 0,
         profile_seq_lens: int | None = None,
+        skip_drafter: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # only support eager mode and piecewise graph now
         assert cudagraph_runtime_mode is None or cudagraph_runtime_mode.valid_runtime_modes()
@@ -3261,7 +3818,7 @@ class NPUModelRunner(GPUModelRunner):
                 hidden_states = outputs
             dummy_compute_logits(hidden_states)
 
-            if self.drafter:
+            if self.drafter and not skip_drafter:
                 self.drafter.dummy_run(
                     num_tokens=num_tokens_padded,
                     with_prefill=with_prefill,
