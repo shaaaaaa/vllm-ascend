@@ -112,7 +112,7 @@ def test_wait_for_bootstrap_kv_load_interleaves_dsa_groups(monkeypatch):
 def test_bootstrap_load_failure_only_matches_current_request_blocks():
     runner = object.__new__(NPUModelRunner)
     runner.requests = {
-        "bootstrap": SimpleNamespace(block_ids=([1, 2], [11, 12])),
+        "bootstrap": SimpleNamespace(block_ids=([1, 0, 0, 2], [11, 12])),
     }
     scheduler_output = SimpleNamespace(
         bootstrap_sample_req_ids={"bootstrap"}
@@ -123,10 +123,53 @@ def test_bootstrap_load_failure_only_matches_current_request_blocks():
         scheduler_output, unrelated
     )
 
+    null_block_only = SimpleNamespace(invalid_block_ids={0})
+    assert not runner._bootstrap_load_failed_req_ids(
+        scheduler_output, null_block_only
+    )
+
     current_request_failed = SimpleNamespace(invalid_block_ids={12, 99})
     assert runner._bootstrap_load_failed_req_ids(
         scheduler_output, current_request_failed
     ) == {"bootstrap"}
+
+
+def test_compact_decode_residency_is_logged_once_per_live_request():
+    runner = object.__new__(NPUModelRunner)
+    runner.dsa_two_groups = True
+    request_state = SimpleNamespace(
+        num_computed_tokens=120_000,
+        num_prompt_tokens=120_000,
+        block_ids=([1, 2, 0, 0, 9, 10], [101, 102, 103, 104]),
+        compact_residency_log_pending=True,
+    )
+    runner.requests = {"request": request_state}
+    scheduler_output = SimpleNamespace(num_scheduled_tokens={"request": 1})
+
+    runner._log_compact_decode_residency_once(scheduler_output)
+    assert request_state.compact_residency_logged
+    assert not request_state.compact_residency_log_pending
+
+    # The second decode step must not repeat the request-level residency log.
+    runner._log_compact_decode_residency_once(scheduler_output)
+    assert request_state.compact_residency_logged
+
+
+def test_normal_prefill_does_not_enter_compact_residency_path():
+    runner = object.__new__(NPUModelRunner)
+    runner.dsa_two_groups = True
+    request_state = SimpleNamespace(
+        num_computed_tokens=4096,
+        num_prompt_tokens=120_000,
+        block_ids=([1, 2, 3, 4], [101, 102, 103, 104]),
+    )
+    runner.requests = {"request": request_state}
+
+    runner._log_compact_decode_residency_once(
+        SimpleNamespace(num_scheduled_tokens={"request": 4096})
+    )
+
+    assert not hasattr(request_state, "compact_residency_logged")
 
 
 def test_bootstrap_load_failure_is_synchronized_across_tp(monkeypatch):
@@ -185,29 +228,12 @@ def test_bootstrap_rejects_other_speculative_config():
         runner._validate_bootstrap_spec_config()
 
 
-def test_dp_bootstrap_flag_is_visible_to_normal_rank(monkeypatch):
+def test_bootstrap_runs_draft_and_finalizes_connector(monkeypatch):
     runner = object.__new__(NPUModelRunner)
-    runner.dp_size = 2
-    cpu_group = object()
-    monkeypatch.setattr(
-        model_runner_v1,
-        "get_dp_group",
-        lambda: SimpleNamespace(cpu_group=cpu_group),
+    scheduler_output = SimpleNamespace(
+        total_num_scheduled_tokens=1,
+        bootstrap_sample_req_ids={"request"},
     )
-
-    def all_reduce(flag, op, group):
-        assert op == torch.distributed.ReduceOp.MAX
-        assert group is cpu_group
-        flag.fill_(1)
-
-    monkeypatch.setattr(model_runner_v1.dist, "all_reduce", all_reduce)
-
-    assert runner._sync_dp_step_has_bootstrap(False)
-
-
-def test_bootstrap_skips_draft_but_finalizes_connector(monkeypatch):
-    runner = object.__new__(NPUModelRunner)
-    scheduler_output = SimpleNamespace(total_num_scheduled_tokens=1)
     logits = torch.zeros(1, 8)
     hidden_states = torch.zeros(1, 4)
     runner.execute_model_state = ExecuteModelState(
@@ -224,16 +250,21 @@ def test_bootstrap_skips_draft_but_finalizes_connector(monkeypatch):
         cudagraph_stats=None,
         batch_desc=None,
         final_hidden_states={},
-        skip_draft_proposal=True,
     )
     runner.kv_connector_output = SimpleNamespace()
-    runner.speculative_config = SimpleNamespace()
+    runner.speculative_config = SimpleNamespace(
+        method="deepseek_mtp",
+        use_eagle=lambda: False,
+        uses_draft_model=lambda: False,
+        disable_padded_drafter_batch=False,
+    )
     runner.need_accepted_tokens = False
     runner.model_config = SimpleNamespace(enable_return_routed_experts=False)
     runner.supports_mm_inputs = False
     runner.dynamic_eplb = False
     runner.debugger = None
     runner.use_async_scheduling = False
+    runner.input_batch = SimpleNamespace(sampling_metadata=SimpleNamespace())
     runner._draft_token_ids = [[123]]
     runner._sample = lambda logits, metadata: SimpleNamespace(
         sampled_token_ids=torch.tensor([[7]]),
@@ -248,13 +279,18 @@ def test_bootstrap_skips_draft_but_finalizes_connector(monkeypatch):
         [],
     )
     propose_calls = []
-    runner.propose_draft_token_ids = lambda *args: propose_calls.append(args)
+    runner.propose_draft_token_ids = (
+        lambda *args: propose_calls.append(args) or [[8]]
+    )
+    runner._copy_draft_token_ids_to_cpu = lambda scheduler_output: None
     finalize_calls = []
     runner.finalize_kv_connector = lambda: finalize_calls.append(True) or {}
     monkeypatch.setattr(model_runner_v1, "has_kv_transfer_group", lambda: True)
 
     runner.sample_tokens(grammar_output=None)
 
-    assert propose_calls == []
-    assert runner._draft_token_ids is None
+    assert len(propose_calls) == 1
+    assert propose_calls[0][7] is hidden_states
+    assert propose_calls[0][9] is hidden_states
+    assert runner._draft_token_ids == [[8]]
     assert finalize_calls == [True]

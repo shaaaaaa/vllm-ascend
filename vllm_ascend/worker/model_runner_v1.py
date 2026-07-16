@@ -25,6 +25,7 @@ import hmac
 import math
 import os
 import sys
+import time
 from collections import defaultdict
 from contextlib import contextmanager, nullcontext
 from copy import copy, deepcopy
@@ -347,7 +348,6 @@ class ExecuteModelState(NamedTuple):
     batch_desc: BatchDescriptor
     staged_sfa_graph_key: StagedSFAGraphKey | None
     final_hidden_states: dict[str, dict[str, Any]]
-    skip_draft_proposal: bool
 
 
 def _fixed_decode_layout_arrays(
@@ -419,23 +419,45 @@ _MAX_FINAL_HIDDEN_BASE64_CHARS = 4 * ((_MAX_FINAL_HIDDEN_BYTES + 2) // 3)
 
 def serialize_final_hidden_state(hidden_state: torch.Tensor) -> dict[str, Any]:
     """Encode a final hidden state without losing BF16/FP16 bits."""
+    started = time.perf_counter()
+    source_device = str(hidden_state.device)
+    source_dtype = str(hidden_state.dtype)
+    source_shape = tuple(hidden_state.shape)
+    d2h_started = time.perf_counter()
     hidden_state = hidden_state.detach().to("cpu").contiguous()
+    d2h_ms = (time.perf_counter() - d2h_started) * 1000
     dtype = str(hidden_state.dtype).removeprefix("torch.")
     if dtype not in _FINAL_HIDDEN_DTYPES:
         raise ValueError(f"Unsupported final hidden state dtype: {hidden_state.dtype}")
     raw = hidden_state.view(torch.uint8).numpy().tobytes()
-    return {
+    checksum = hashlib.sha256(raw).hexdigest()
+    payload = {
         "version": 1,
         "dtype": dtype,
         "shape": list(hidden_state.shape),
         "encoding": "base64",
         "data": base64.b64encode(raw).decode("ascii"),
-        "data_sha256": hashlib.sha256(raw).hexdigest(),
+        "data_sha256": checksum,
     }
+    logger.info(
+        "[FINAL_HIDDEN_SERIALIZE] source_device=%s source_dtype=%s "
+        "shape=%s raw_bytes=%d base64_chars=%d checksum=%s d2h_ms=%.3f "
+        "total_ms=%.3f",
+        source_device,
+        source_dtype,
+        source_shape,
+        len(raw),
+        len(payload["data"]),
+        checksum[:16],
+        d2h_ms,
+        (time.perf_counter() - started) * 1000,
+    )
+    return payload
 
 
 def deserialize_final_hidden_state(payload: dict[str, Any]) -> torch.Tensor:
     """Decode a final hidden state produced by serialize_final_hidden_state."""
+    started = time.perf_counter()
     if payload.get("version") != 1 or payload.get("encoding") != "base64":
         raise ValueError("Unsupported final hidden state payload")
 
@@ -485,12 +507,22 @@ def deserialize_final_hidden_state(payload: dict[str, Any]) -> torch.Tensor:
         hashlib.sha256(raw).hexdigest(), data_sha256
     ):
         raise ValueError("Final hidden state payload SHA-256 mismatch")
-    return (
+    hidden_state = (
         torch.frombuffer(bytearray(raw), dtype=torch.uint8)
         .view(dtype)
         .reshape(shape)
         .clone()
     )
+    logger.info(
+        "[FINAL_HIDDEN_DESERIALIZE] dtype=%s shape=%s raw_bytes=%d "
+        "checksum=%s total_ms=%.3f",
+        dtype_name,
+        tuple(shape),
+        len(raw),
+        data_sha256[:16],
+        (time.perf_counter() - started) * 1000,
+    )
+    return hidden_state
 
 
 class NPUModelRunner(GPUModelRunner):
@@ -1710,6 +1742,15 @@ class NPUModelRunner(GPUModelRunner):
         if not capture_req_ids:
             return {}
 
+        started = time.perf_counter()
+        logger.info(
+            "[FINAL_HIDDEN_CAPTURE_BEGIN] requests=%s batch_reqs=%d "
+            "hidden_shape=%s scheduled_tokens=%s",
+            sorted(capture_req_ids),
+            len(self.input_batch.req_ids),
+            tuple(hidden_states.shape),
+            num_scheduled_tokens.tolist(),
+        )
         final_hidden_states: dict[str, dict[str, Any]] = {}
         row_end = 0
         for req_idx, req_id in enumerate(self.input_batch.req_ids):
@@ -1720,6 +1761,14 @@ class NPUModelRunner(GPUModelRunner):
                 raise RuntimeError(
                     f"Cannot capture final hidden state for unscheduled request {req_id!r}"
                 )
+            logger.info(
+                "[FINAL_HIDDEN_CAPTURE_ROW] req=%s req_index=%d "
+                "scheduled_tokens=%d hidden_row=%d",
+                req_id,
+                req_idx,
+                int(num_scheduled_tokens[req_idx]),
+                row_end - 1,
+            )
             final_hidden_states[req_id] = serialize_final_hidden_state(
                 hidden_states[row_end - 1]
             )
@@ -1729,6 +1778,12 @@ class NPUModelRunner(GPUModelRunner):
                 "Final hidden state capture requests are absent from the model batch: "
                 f"{sorted(missing_req_ids)}"
             )
+        logger.info(
+            "[FINAL_HIDDEN_CAPTURE_DONE] requests=%s captured=%d total_ms=%.3f",
+            sorted(capture_req_ids),
+            len(final_hidden_states),
+            (time.perf_counter() - started) * 1000,
+        )
         return final_hidden_states
 
     def _get_bootstrap_hidden_states(
@@ -1742,6 +1797,12 @@ class NPUModelRunner(GPUModelRunner):
 
         hidden_size = self.model_config.get_hidden_size()
         hidden_states = []
+        logger.info(
+            "[BOOTSTRAP_HIDDEN_BEGIN] requests=%s batch_order=%s hidden_size=%d",
+            sorted(bootstrap_req_ids),
+            list(self.input_batch.req_ids),
+            hidden_size,
+        )
         for req_id in self.input_batch.req_ids:
             if req_id not in bootstrap_req_ids:
                 raise RuntimeError(
@@ -1767,15 +1828,50 @@ class NPUModelRunner(GPUModelRunner):
                 "BOOTSTRAP_SAMPLE requests are absent from the model batch: "
                 f"{sorted(missing_req_ids)}"
             )
-        return torch.stack(hidden_states).to(self.device, non_blocking=True)
+        cpu_hidden_states = torch.stack(hidden_states)
+        h2d_started = time.perf_counter()
+        device_hidden_states = cpu_hidden_states.to(
+            self.device, non_blocking=True
+        )
+        logger.info(
+            "[BOOTSTRAP_HIDDEN_H2D_ENQUEUED] requests=%s shape=%s dtype=%s "
+            "source_pinned=%s target_device=%s enqueue_ms=%.3f",
+            list(self.input_batch.req_ids),
+            tuple(cpu_hidden_states.shape),
+            cpu_hidden_states.dtype,
+            cpu_hidden_states.is_pinned(),
+            self.device,
+            (time.perf_counter() - h2d_started) * 1000,
+        )
+        return device_hidden_states
 
     def _wait_for_bootstrap_kv_load(self) -> None:
         connector = get_kv_transfer_group()
         kv_cache_groups = self.kv_cache_config.kv_cache_groups
         latent_layer_names = kv_cache_groups[0].layer_names
+        started = time.perf_counter()
+        logger.info(
+            "[BOOTSTRAP_KV_WAIT_BEGIN] dsa_two_groups=%s latent_layers=%d "
+            "connector=%s",
+            self.dsa_two_groups,
+            len(latent_layer_names),
+            connector.__class__.__name__,
+        )
         if not self.dsa_two_groups:
-            for layer_name in latent_layer_names:
+            for layer_index, layer_name in enumerate(latent_layer_names):
+                layer_started = time.perf_counter()
                 connector.wait_for_layer_load(layer_name)
+                logger.info(
+                    "[BOOTSTRAP_KV_LAYER_READY] layer_index=%d group=latent "
+                    "layer=%s wait_ms=%.3f",
+                    layer_index,
+                    layer_name,
+                    (time.perf_counter() - layer_started) * 1000,
+                )
+            logger.info(
+                "[BOOTSTRAP_KV_WAIT_DONE] dsa_two_groups=false total_ms=%.3f",
+                (time.perf_counter() - started) * 1000,
+            )
             return
 
         if len(kv_cache_groups) < 2:
@@ -1789,11 +1885,29 @@ class NPUModelRunner(GPUModelRunner):
             )
         # Sparse cold retrieval advances a layer only after both the latent
         # scratch (group 0) and full indexer (group 1) waits complete.
-        for latent_layer_name, indexer_layer_name in zip(
-            latent_layer_names, indexer_layer_names
+        for layer_index, (latent_layer_name, indexer_layer_name) in enumerate(
+            zip(latent_layer_names, indexer_layer_names)
         ):
+            layer_started = time.perf_counter()
             connector.wait_for_layer_load(latent_layer_name)
+            latent_ms = (time.perf_counter() - layer_started) * 1000
+            indexer_started = time.perf_counter()
             connector.wait_for_layer_load(indexer_layer_name)
+            logger.info(
+                "[BOOTSTRAP_KV_LAYER_READY] layer_index=%d latent=%s "
+                "indexer=%s latent_wait_ms=%.3f indexer_wait_ms=%.3f",
+                layer_index,
+                latent_layer_name,
+                indexer_layer_name,
+                latent_ms,
+                (time.perf_counter() - indexer_started) * 1000,
+            )
+        logger.info(
+            "[BOOTSTRAP_KV_WAIT_DONE] dsa_two_groups=true layers=%d "
+            "total_ms=%.3f",
+            len(latent_layer_names),
+            (time.perf_counter() - started) * 1000,
+        )
 
     def _bootstrap_block_ids_by_req(
         self,
@@ -1808,9 +1922,55 @@ class NPUModelRunner(GPUModelRunner):
                 block_id
                 for group_block_ids in request_state.block_ids
                 for block_id in group_block_ids
-                if block_id >= 0
+                if block_id > 0
             }
         return block_ids_by_req
+
+    def _log_compact_decode_residency_once(
+        self, scheduler_output: "SchedulerOutput"
+    ) -> None:
+        if not self.dsa_two_groups:
+            return
+        for req_id in scheduler_output.num_scheduled_tokens:
+            request_state = self.requests.get(req_id)
+            if request_state is None or not getattr(
+                request_state, "compact_residency_log_pending", False
+            ):
+                continue
+            if request_state.num_computed_tokens < request_state.num_prompt_tokens:
+                continue
+            if len(request_state.block_ids) < 2:
+                setattr(request_state, "compact_residency_log_pending", False)
+                continue
+            latent_block_ids = request_state.block_ids[0]
+            if 0 not in latent_block_ids:
+                logger.info(
+                    "[DSA_COMPACT_DECODE_RESIDENCY_SKIP] req=%s "
+                    "reason=no_null_blocks compact=false",
+                    req_id,
+                )
+                setattr(request_state, "compact_residency_log_pending", False)
+                continue
+            indexer_block_ids = request_state.block_ids[1]
+            logger.info(
+                "[DSA_COMPACT_DECODE_RESIDENCY] req=%s computed_tokens=%d "
+                "prompt_tokens=%d latent_logical=%d latent_resident=%d "
+                "latent_null=%d indexer_logical=%d indexer_resident=%d "
+                "indexer_head_ids=%s indexer_tail_ids=%s "
+                "remote_index_reload_expected=false",
+                req_id,
+                request_state.num_computed_tokens,
+                request_state.num_prompt_tokens,
+                len(latent_block_ids),
+                sum(block_id != 0 for block_id in latent_block_ids),
+                sum(block_id == 0 for block_id in latent_block_ids),
+                len(indexer_block_ids),
+                sum(block_id != 0 for block_id in indexer_block_ids),
+                indexer_block_ids[:4],
+                indexer_block_ids[-4:],
+            )
+            setattr(request_state, "compact_residency_log_pending", False)
+            setattr(request_state, "compact_residency_logged", True)
 
     def _bootstrap_load_failed_req_ids(
         self,
@@ -1818,14 +1978,26 @@ class NPUModelRunner(GPUModelRunner):
         kv_connector_output: "KVConnectorOutput | None",
     ) -> set[str]:
         if kv_connector_output is None or not kv_connector_output.invalid_block_ids:
+            logger.info(
+                "[BOOTSTRAP_LOAD_VALIDATE] requests=%s invalid_blocks=0 result=ok",
+                sorted(scheduler_output.bootstrap_sample_req_ids),
+            )
             return set()
-        return {
+        block_ids_by_req = self._bootstrap_block_ids_by_req(scheduler_output)
+        failed_req_ids = {
             req_id
-            for req_id, block_ids in self._bootstrap_block_ids_by_req(
-                scheduler_output
-            ).items()
+            for req_id, block_ids in block_ids_by_req.items()
             if block_ids & kv_connector_output.invalid_block_ids
         }
+        logger.warning(
+            "[BOOTSTRAP_LOAD_VALIDATE] requests=%s invalid_blocks=%s "
+            "request_block_counts=%s failed=%s",
+            sorted(scheduler_output.bootstrap_sample_req_ids),
+            sorted(kv_connector_output.invalid_block_ids),
+            {req_id: len(block_ids) for req_id, block_ids in block_ids_by_req.items()},
+            sorted(failed_req_ids),
+        )
+        return failed_req_ids
 
     def _sync_tp_bootstrap_load_failed_req_ids(
         self,
@@ -1834,18 +2006,36 @@ class NPUModelRunner(GPUModelRunner):
     ) -> set[str]:
         tp_group = get_tp_group()
         if tp_group.world_size == 1:
+            logger.info(
+                "[BOOTSTRAP_TP_LOAD_AGREEMENT] tp_size=1 local_failed=%s",
+                sorted(local_failed_req_ids),
+            )
             return local_failed_req_ids
         flags = torch.tensor(
             [int(req_id in local_failed_req_ids) for req_id in ordered_req_ids],
             dtype=torch.int32,
             device="cpu",
         )
+        started = time.perf_counter()
+        logger.info(
+            "[BOOTSTRAP_TP_LOAD_AGREEMENT_BEGIN] tp_size=%d requests=%s "
+            "local_failed=%s",
+            tp_group.world_size,
+            ordered_req_ids,
+            sorted(local_failed_req_ids),
+        )
         dist.all_reduce(flags, op=dist.ReduceOp.MAX, group=tp_group.cpu_group)
-        return {
+        failed_req_ids = {
             req_id
             for req_id, failed in zip(ordered_req_ids, flags.tolist())
             if failed
         }
+        logger.info(
+            "[BOOTSTRAP_TP_LOAD_AGREEMENT_DONE] failed=%s cpu_allreduce_ms=%.3f",
+            sorted(failed_req_ids),
+            (time.perf_counter() - started) * 1000,
+        )
+        return failed_req_ids
 
     @contextmanager
     def _bootstrap_last_token_input_state(self, num_reqs: int):
@@ -1869,17 +2059,6 @@ class NPUModelRunner(GPUModelRunner):
             raise RuntimeError(
                 "BOOTSTRAP_SAMPLE currently supports only MTP with one speculative token"
             )
-
-    def _sync_dp_step_has_bootstrap(self, local_has_bootstrap: bool) -> bool:
-        if self.dp_size == 1:
-            return local_has_bootstrap
-        flag = torch.tensor(
-            int(local_has_bootstrap),
-            dtype=torch.int32,
-            device="cpu",
-        )
-        dist.all_reduce(flag, op=dist.ReduceOp.MAX, group=get_dp_group().cpu_group)
-        return bool(flag.item())
 
     def _execute_bootstrap_sample(
         self,
@@ -1910,6 +2089,20 @@ class NPUModelRunner(GPUModelRunner):
         num_scheduled_tokens_np = np.ones(num_reqs, dtype=np.int32)
         run_shadow_forward = self.dp_size > 1
         shadow_forward_inputs = None
+        bootstrap_started = time.perf_counter()
+        logger.info(
+            "[BOOTSTRAP_EXECUTE_BEGIN] requests=%s batch_order=%s num_reqs=%d "
+            "dp_size=%d tp_size=%d shadow_forward=%s speculative_method=%s "
+            "num_speculative_tokens=%s",
+            sorted(bootstrap_req_ids),
+            list(self.input_batch.req_ids),
+            num_reqs,
+            self.dp_size,
+            get_tp_group().world_size,
+            run_shadow_forward,
+            getattr(self.speculative_config, "method", None),
+            getattr(self.speculative_config, "num_speculative_tokens", None),
+        )
 
         # Recreate the metadata that a last-prompt-token forward would have
         # produced. DP ranks run a shadow target forward for collective
@@ -1970,6 +2163,16 @@ class NPUModelRunner(GPUModelRunner):
                     None,
                 )
                 update_cos_sin(shadow_forward_inputs[2])
+            logger.info(
+                "[BOOTSTRAP_INPUTS_READY] requests=%s logical_tokens=%d "
+                "padded_tokens=%d padded_reqs=%d force_eager=true "
+                "shadow_inputs=%s",
+                list(self.input_batch.req_ids),
+                total_num_scheduled_tokens,
+                num_tokens_padded,
+                num_reqs_padded,
+                shadow_forward_inputs is not None,
+            )
         if self.speculative_config is not None:
             assert spec_decode_common_attn_metadata is not None
 
@@ -2017,6 +2220,17 @@ class NPUModelRunner(GPUModelRunner):
                 # Keep DP/EP/TP collective ordering aligned with ranks that
                 # execute normal target work. Sampling still uses the
                 # transferred hidden state below; this result is discarded.
+                shadow_started = time.perf_counter()
+                logger.info(
+                    "[BOOTSTRAP_SHADOW_BEGIN] requests=%s padded_tokens=%d "
+                    "input_ids_shape=%s positions_shape=%s output=discard",
+                    list(self.input_batch.req_ids),
+                    num_tokens_padded,
+                    tuple(shadow_input_ids.shape)
+                    if shadow_input_ids is not None
+                    else None,
+                    tuple(shadow_positions.shape),
+                )
                 self._model_forward(
                     num_tokens_padded,
                     shadow_input_ids,
@@ -2024,6 +2238,12 @@ class NPUModelRunner(GPUModelRunner):
                     shadow_intermediate_tensors,
                     shadow_inputs_embeds,
                     **shadow_model_kwargs,
+                )
+                logger.info(
+                    "[BOOTSTRAP_SHADOW_ENQUEUED] requests=%s output=discard "
+                    "host_elapsed_ms=%.3f",
+                    list(self.input_batch.req_ids),
+                    (time.perf_counter() - shadow_started) * 1000,
                 )
             elif has_kv_transfer_group():
                 self._wait_for_bootstrap_kv_load()
@@ -2064,7 +2284,7 @@ class NPUModelRunner(GPUModelRunner):
                     block_id
                     for group_block_ids in request_state.block_ids
                     for block_id in group_block_ids
-                    if block_id >= 0
+                    if block_id > 0
                 )
                 kv_connector_output.invalid_block_ids.add(
                     representative_block_id
@@ -2081,9 +2301,36 @@ class NPUModelRunner(GPUModelRunner):
             if self.dynamic_eplb:
                 with record_function_or_nullcontext("EPLB update"):
                     self.eplb_updator.forward_end()
+            self._draft_token_ids = None
+            if hasattr(self, "_draft_token_req_ids"):
+                self._draft_token_req_ids = None
             self.execute_model_state = None
             self.kv_connector_output = kv_connector_output
+            logger.warning(
+                "[BOOTSTRAP_EXECUTE_FALLBACK] failed_requests=%s "
+                "all_requests=%s action=restart_dense_prefill "
+                "sampler_rng_advanced=false draft_state_cleared=true "
+                "elapsed_ms=%.3f",
+                sorted(failed_req_ids),
+                ordered_bootstrap_req_ids,
+                (time.perf_counter() - bootstrap_started) * 1000,
+            )
             return
+
+        if self.dsa_two_groups:
+            for req_id in ordered_bootstrap_req_ids:
+                request_state = self.requests.get(req_id)
+                if request_state is not None:
+                    setattr(
+                        request_state,
+                        "compact_residency_log_pending",
+                        True,
+                    )
+            logger.info(
+                "[DSA_COMPACT_RESIDENCY_LOG_ARMED] requests=%s "
+                "trigger=next_decode_step",
+                ordered_bootstrap_req_ids,
+            )
 
         if self.ascend_config.enable_async_exponential:
             self.sampler.do_async_exponential(
@@ -2092,7 +2339,16 @@ class NPUModelRunner(GPUModelRunner):
                 generators=self.input_batch.sampling_metadata.generators,
             )
 
+        logits_started = time.perf_counter()
         logits = self.model.compute_logits(hidden_states)
+        logger.info(
+            "[BOOTSTRAP_LOGITS_ENQUEUED] requests=%s hidden_shape=%s "
+            "logits_shape=%s host_elapsed_ms=%.3f",
+            ordered_bootstrap_req_ids,
+            tuple(hidden_states.shape),
+            tuple(logits.shape),
+            (time.perf_counter() - logits_started) * 1000,
+        )
         self.execute_model_state = ExecuteModelState(
             scheduler_output,
             logits,
@@ -2107,9 +2363,14 @@ class NPUModelRunner(GPUModelRunner):
             cudagraph_stats,
             batch_desc,
             {},
-            True,
         )
         self.kv_connector_output = kv_connector_output
+        logger.info(
+            "[BOOTSTRAP_EXECUTE_READY_TO_SAMPLE] requests=%s elapsed_ms=%.3f "
+            "draft_proposal=enabled",
+            ordered_bootstrap_req_ids,
+            (time.perf_counter() - bootstrap_started) * 1000,
+        )
 
     @torch.inference_mode()
     def execute_model(
@@ -2141,10 +2402,9 @@ class NPUModelRunner(GPUModelRunner):
             with self.synchronize_input_prep():
                 # Update persistent batch states.
                 self._update_states(scheduler_output)
-                dp_step_has_bootstrap = self._sync_dp_step_has_bootstrap(
-                    bool(scheduler_output.bootstrap_sample_req_ids)
-                )
-                if dp_step_has_bootstrap:
+                if not scheduler_output.bootstrap_sample_req_ids:
+                    self._log_compact_decode_residency_once(scheduler_output)
+                if scheduler_output.bootstrap_sample_req_ids:
                     if self.use_async_scheduling:
                         raise RuntimeError(
                             "BOOTSTRAP_SAMPLE does not support async scheduling"
@@ -2173,11 +2433,8 @@ class NPUModelRunner(GPUModelRunner):
 
                 if not num_scheduled_tokens:
                     if (
-                        (
-                            dp_step_has_bootstrap
-                            or self.parallel_config.distributed_executor_backend
-                            == "external_launcher"
-                        )
+                        self.parallel_config.distributed_executor_backend
+                        == "external_launcher"
                         and self.parallel_config.data_parallel_size > 1
                     ):
                         # this is a corner case when both external launcher
@@ -2186,10 +2443,7 @@ class NPUModelRunner(GPUModelRunner):
                         # returns True. before returning early here we call
                         # dummy run to ensure coordinate_batch_across_dp
                         # is called into to avoid out of sync issues.
-                        self._dummy_run(
-                            1,
-                            skip_drafter=dp_step_has_bootstrap,
-                        )
+                        self._dummy_run(1)
                     if not has_kv_transfer_group():
                         # Return empty ModelRunnerOutput if no work to do.
                         return EMPTY_MODEL_RUNNER_OUTPUT
@@ -2700,7 +2954,6 @@ class NPUModelRunner(GPUModelRunner):
                 batch_desc,
                 staged_sfa_graph_key,
                 final_hidden_states,
-                dp_step_has_bootstrap,
             )
             self.kv_connector_output = kv_connector_output
         return None
@@ -2746,7 +2999,6 @@ class NPUModelRunner(GPUModelRunner):
             batch_desc,
             staged_sfa_graph_key,
             final_hidden_states,
-            skip_draft_proposal,
         ) = self.execute_model_state
         # Clear ephemeral state.
         self.execute_model_state = None
@@ -2776,8 +3028,15 @@ class NPUModelRunner(GPUModelRunner):
             assert self.sampling_done_event is not None
             self.sampling_done_event.record()
 
-        # Never expose a previous step's drafts when this step intentionally
-        # suppresses drafting (bootstrap does this across every DP rank).
+        is_bootstrap_step = bool(scheduler_output.bootstrap_sample_req_ids)
+        if is_bootstrap_step:
+            logger.info(
+                "[BOOTSTRAP_SAMPLE_BEGIN] requests=%s logits_shape=%s",
+                sorted(scheduler_output.bootstrap_sample_req_ids),
+                tuple(logits.shape),
+            )
+
+        # Never expose a previous step's drafts before replacing them below.
         self._draft_token_ids = None
         if hasattr(self, "_draft_token_req_ids"):
             self._draft_token_req_ids = None
@@ -2832,7 +3091,16 @@ class NPUModelRunner(GPUModelRunner):
         )
 
         with record_function_or_nullcontext("draft_token"):
-            if self.speculative_config and not skip_draft_proposal:
+            if self.speculative_config:
+                draft_started = time.perf_counter()
+                if is_bootstrap_step:
+                    logger.info(
+                        "[BOOTSTRAP_MTP_BEGIN] requests=%s sampled_token_ids=%s "
+                        "method=%s",
+                        sorted(scheduler_output.bootstrap_sample_req_ids),
+                        valid_sampled_token_ids,
+                        self.speculative_config.method,
+                    )
                 use_padded_batch = (
                     self.speculative_config
                     and (self.speculative_config.use_eagle() or self.speculative_config.uses_draft_model())
@@ -2846,6 +3114,18 @@ class NPUModelRunner(GPUModelRunner):
                     # ngram and other speculative decoding methods use the sampled
                     # tokens on the CPU, so they are run after bookkeeping.
                     propose_draft_token_ids(valid_sampled_token_ids)
+                if is_bootstrap_step:
+                    logger.info(
+                        "[BOOTSTRAP_MTP_DONE] requests=%s draft_shape=%s "
+                        "draft_dtype=%s draft_device=%s host_elapsed_ms=%.3f",
+                        sorted(scheduler_output.bootstrap_sample_req_ids),
+                        tuple(self._draft_token_ids.shape)
+                        if torch.is_tensor(self._draft_token_ids)
+                        else None,
+                        getattr(self._draft_token_ids, "dtype", None),
+                        getattr(self._draft_token_ids, "device", None),
+                        (time.perf_counter() - draft_started) * 1000,
+                    )
 
                 if _mtp_dw_diag_enabled():
                     draft_counts = {}
@@ -2931,6 +3211,15 @@ class NPUModelRunner(GPUModelRunner):
             cudagraph_stats=cudagraph_stats,
             final_hidden_states=final_hidden_states,
         )
+        if is_bootstrap_step:
+            logger.info(
+                "[BOOTSTRAP_SAMPLE_DONE] requests=%s sampled_token_ids=%s "
+                "draft_present=%s connector_output=%s",
+                sorted(scheduler_output.bootstrap_sample_req_ids),
+                valid_sampled_token_ids,
+                self._draft_token_ids is not None,
+                kv_connector_output is not None,
+            )
 
         if self.dynamic_eplb:
             with record_function_or_nullcontext("EPLB update"):
@@ -4215,7 +4504,6 @@ class NPUModelRunner(GPUModelRunner):
         is_graph_capturing: bool = False,
         num_active_loras: int = 0,
         profile_seq_lens: int | None = None,
-        skip_drafter: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # only support eager mode and piecewise graph now
         assert cudagraph_runtime_mode is None or cudagraph_runtime_mode.valid_runtime_modes()
