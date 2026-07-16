@@ -632,6 +632,15 @@ async def send_request_to_service(
     if "stream_options" in req_data:
         del req_data["stream_options"]
     headers = {"Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}", "X-Request-Id": request_id}
+    logger.info(
+        "[FINAL_HIDDEN_PROXY_PREFILL_SEND] req=%s prefiller_id=%d "
+        "endpoint=%s handoff=%s max_tokens=%s",
+        request_id,
+        prefiller_id,
+        endpoint,
+        bool(req_data["kv_transfer_params"].get("ret_final_hidden")),
+        req_data.get("max_tokens"),
+    )
     last_exc = None
     for attempt in range(1, max_retries + 1):
         try:
@@ -719,13 +728,46 @@ async def _handle_select_instance(api: str, req_data: Any, request_length: int):
             prefiller.url,
             request_id,
         )
+    else:
+        artifact = kv_transfer_params.get("bootstrap_final_hidden")
+        logger.info(
+            "[FINAL_HIDDEN_PROXY_PREFILL_DONE] req=%s prefiller=%s "
+            "artifact=%s dtype=%s shape=%s prompt_tokens=%s "
+            "base64_chars=%d checksum=%s transfer_keys=%s",
+            request_id,
+            prefiller.url,
+            artifact is not None,
+            artifact.get("dtype") if isinstance(artifact, dict) else None,
+            artifact.get("shape") if isinstance(artifact, dict) else None,
+            artifact.get("prompt_length")
+            if isinstance(artifact, dict)
+            else None,
+            len(artifact.get("data", ""))
+            if isinstance(artifact, dict)
+            else 0,
+            str(artifact.get("data_sha256", ""))[:16]
+            if isinstance(artifact, dict)
+            else None,
+            sorted(kv_transfer_params),
+        )
     # Select decoder
     decoder_score = proxy_state.calculate_decode_scores(request_length)
     logger.debug("Decoder score: %f", decoder_score)
     # Use the prefiller's kv_transfer_params to select decoder
     decoder_idx = proxy_state.select_decoder(decoder_score)
     decoder = proxy_state.decoders[decoder_idx]
-    logger.debug("Using %s %s", prefiller.url, decoder.url)
+    logger.info(
+        "[FINAL_HIDDEN_PROXY_ROUTE] req=%s request_bytes=%d prefiller=%s "
+        "decoder=%s prefiller_score=%.3f decoder_score=%.3f "
+        "bootstrap_artifact=%s",
+        request_id,
+        request_length,
+        prefiller.url,
+        decoder.url,
+        prefiller_score,
+        decoder_score,
+        "bootstrap_final_hidden" in kv_transfer_params,
+    )
     return InstanceInfo(
         request_id=request_id,
         prefiller_idx=prefiller_idx,
@@ -755,6 +797,16 @@ async def _handle_completions(api: str, request: Request):
         req_body = await request.body()
         request_length = len(req_body)
         instance_info = await _handle_select_instance(api, req_data, request_length)
+        logger.info(
+            "[FINAL_HIDDEN_PROXY_DECODE_SEND] req=%s decoder=%s stream=%s "
+            "handoff=%s max_tokens=%s",
+            instance_info.request_id,
+            instance_info.decoder.url,
+            bool(req_data.get("stream", False)),
+            "bootstrap_final_hidden"
+            in (req_data.get("kv_transfer_params") or {}),
+            req_data.get("max_tokens"),
+        )
         stream_flag = bool(req_data.get("stream", False))
         chat_flag = "messages" in req_data
 
