@@ -134,10 +134,13 @@ from fastapi.responses import StreamingResponse
 try:
     from vllm.logger import init_logger
 
-    logger = init_logger(__name__)
+    # This file is normally launched as a script, where __name__ is
+    # "__main__" and does not inherit vLLM's configured INFO handler.
+    logger = init_logger("vllm.disaggregated_prefill_proxy")
 except ImportError:
     import logging
 
+    logging.basicConfig(level=logging.INFO)
     logger = logging.getLogger(__name__)
 
 # Add uvloop for faster event loop if available
