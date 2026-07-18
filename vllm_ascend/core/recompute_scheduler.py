@@ -363,7 +363,7 @@ class RecomputeScheduler(Scheduler):
         encoder_compute_budget = self.max_num_encoder_input_tokens
         # Spec decode-related.
         scheduled_spec_decode_tokens: dict[str, list[int]] = {}
-        bootstrap_sample_req_ids: set[str] = set()
+        bootstrap_sample_req_ids: set[str] | None = None
         bootstrap_only_step = self._bootstrap_sample_ready
         if bootstrap_only_step:
             self._bootstrap_sample_ready = False
@@ -913,6 +913,8 @@ class RecomputeScheduler(Scheduler):
                 req_to_new_blocks[request_id] = self.kv_cache_manager.get_blocks(request_id)
                 num_scheduled_tokens[request_id] = num_new_tokens
                 if bootstrap_full_hit:
+                    if bootstrap_sample_req_ids is None:
+                        bootstrap_sample_req_ids = set()
                     bootstrap_sample_req_ids.add(request_id)
                     group_block_ids = self.kv_cache_manager.get_block_ids(request_id)
                     logger.info(
@@ -1019,7 +1021,7 @@ class RecomputeScheduler(Scheduler):
             (self.kv_cache_manager.take_new_block_ids() or None) if self.needs_kv_cache_zeroing else None
         )
 
-        capture_final_hidden_req_ids: set[str] = set()
+        capture_final_hidden_req_ids: set[str] | None = None
         capture_pending = getattr(self, "_capture_final_hidden_pending", None)
         if capture_pending:
             capture_pending.intersection_update(self.requests)
@@ -1033,24 +1035,23 @@ class RecomputeScheduler(Scheduler):
                 crosses_prompt_end = (
                     computed_before < request.num_prompt_tokens <= computed_after
                 )
-                logger.info(
-                    "[FINAL_HIDDEN_SCHED_DECISION] req=%s computed_before=%d "
-                    "scheduled_tokens=%d computed_after=%d prompt_tokens=%d "
-                    "request_tokens=%d is_prefill_chunk=%s "
-                    "crosses_prompt_end=%s capture=%s",
-                    req_id,
-                    computed_before,
-                    num_tokens,
-                    computed_after,
-                    request.num_prompt_tokens,
-                    request.num_tokens,
-                    request.is_prefill_chunk,
-                    crosses_prompt_end,
-                    crosses_prompt_end,
-                )
                 if crosses_prompt_end:
+                    capture_final_hidden_req_ids = capture_final_hidden_req_ids or set()
                     capture_final_hidden_req_ids.add(req_id)
                     capture_pending.discard(req_id)
+                    logger.info(
+                        "[FINAL_HIDDEN_SCHED_DECISION] req=%s "
+                        "computed_before=%d scheduled_tokens=%d "
+                        "computed_after=%d prompt_tokens=%d request_tokens=%d "
+                        "is_prefill_chunk=%s crosses_prompt_end=true capture=true",
+                        req_id,
+                        computed_before,
+                        num_tokens,
+                        computed_after,
+                        request.num_prompt_tokens,
+                        request.num_tokens,
+                        request.is_prefill_chunk,
+                    )
             if not capture_pending:
                 del self._capture_final_hidden_pending
 
@@ -1071,14 +1072,28 @@ class RecomputeScheduler(Scheduler):
             free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
             new_block_ids_to_zero=new_block_ids_to_zero,
             recomputed_reqs=recomputed_reqs,
-            capture_final_hidden_req_ids=capture_final_hidden_req_ids,
-            bootstrap_sample_req_ids=bootstrap_sample_req_ids,
-            bootstrap_final_hiddens={
-                req_id: self.requests[req_id].bootstrap_final_hidden
-                for req_id in bootstrap_sample_req_ids
-                if self.requests[req_id].bootstrap_final_hidden is not None
-            },
         )
+        if capture_final_hidden_req_ids:
+            setattr(
+                scheduler_output,
+                "capture_final_hidden_req_ids",
+                capture_final_hidden_req_ids,
+            )
+        if bootstrap_sample_req_ids:
+            setattr(
+                scheduler_output,
+                "bootstrap_sample_req_ids",
+                bootstrap_sample_req_ids,
+            )
+            setattr(
+                scheduler_output,
+                "bootstrap_final_hiddens",
+                {
+                    req_id: self.requests[req_id].bootstrap_final_hidden
+                    for req_id in bootstrap_sample_req_ids
+                    if self.requests[req_id].bootstrap_final_hidden is not None
+                },
+            )
 
         # NOTE(Kuntai): this function is designed for multiple purposes:
         # 1. Plan the KV cache store
@@ -1179,6 +1194,7 @@ class RecomputeScheduler(Scheduler):
                         "prompt_length": request.num_prompt_tokens,
                         "prompt_sha256": request.final_hidden_prompt_fingerprint,
                         "model_fingerprint": self.final_hidden_model_fingerprint,
+                        "producer_ready_unix_ns": time.time_ns(),
                     }
                 )
                 request.captured_final_hidden = envelope

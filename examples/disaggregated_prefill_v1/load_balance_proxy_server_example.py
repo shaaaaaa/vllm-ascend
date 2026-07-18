@@ -644,8 +644,19 @@ async def send_request_to_service(
     last_exc = None
     for attempt in range(1, max_retries + 1):
         try:
+            rpc_started = time.perf_counter()
             response = await client.post(endpoint, json=req_data, headers=headers)
             response.raise_for_status()
+            logger.info(
+                "[P2D_HTTP_PREFILL_RPC] req=%s attempt=%d request_bytes=%d "
+                "response_bytes=%d rpc_e2e_ms=%.3f "
+                "includes_prefill_compute=true includes_http_transfer=true",
+                request_id,
+                attempt,
+                len(response.request.content),
+                len(response.content),
+                (time.perf_counter() - rpc_started) * 1000,
+            )
             return response
         except (httpx.RequestError, httpx.HTTPStatusError) as e:
             logger.warning(f"Attempt {attempt} failed for {endpoint}: {str(e)}")
@@ -668,12 +679,76 @@ async def stream_service_response_with_retry(
     headers = {"Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}", "X-Request-Id": request_id}
     for attempt in range(1, max_retries + 1):
         try:
+            artifact = (req_data.get("kv_transfer_params") or {}).get(
+                "bootstrap_final_hidden"
+            )
+            decoder_send_unix_ns = time.time_ns()
+            if isinstance(artifact, dict):
+                artifact["proxy_decoder_send_unix_ns"] = decoder_send_unix_ns
+            rpc_started = time.perf_counter()
             async with client.stream("POST", endpoint, json=req_data, headers=headers) as response:
                 response.raise_for_status()
+                headers_ms = (time.perf_counter() - rpc_started) * 1000
+                if isinstance(artifact, dict):
+                    producer_ready_unix_ns = artifact.get(
+                        "producer_ready_unix_ns"
+                    )
+                    proxy_received_unix_ns = artifact.get(
+                        "proxy_received_unix_ns"
+                    )
+                    proxy_hold_ms = (
+                        (decoder_send_unix_ns - proxy_received_unix_ns) / 1e6
+                        if isinstance(proxy_received_unix_ns, int)
+                        else None
+                    )
+                    producer_to_decoder_send_ms = (
+                        (decoder_send_unix_ns - producer_ready_unix_ns) / 1e6
+                        if isinstance(producer_ready_unix_ns, int)
+                        else None
+                    )
+                    logger.info(
+                        "[P2D_HTTP_DECODER_REQUEST] req=%s attempt=%d "
+                        "request_bytes=%d hidden_base64_chars=%d "
+                        "proxy_hold_ms=%s producer_to_decoder_send_ms=%s "
+                        "response_headers_ms=%.3f clock_sync_required=true "
+                        "headers_include_decoder_processing=true",
+                        request_id,
+                        attempt,
+                        len(response.request.content),
+                        len(artifact.get("data", "")),
+                        f"{proxy_hold_ms:.3f}"
+                        if proxy_hold_ms is not None
+                        else "unknown",
+                        f"{producer_to_decoder_send_ms:.3f}"
+                        if producer_to_decoder_send_ms is not None
+                        else "unknown",
+                        headers_ms,
+                    )
                 first_chunk_sent = False
+                response_bytes = 0
                 async for chunk in response.aiter_bytes():
+                    response_bytes += len(chunk)
+                    if isinstance(artifact, dict) and not first_chunk_sent:
+                        logger.info(
+                            "[P2D_HTTP_DECODER_FIRST_BYTE] req=%s attempt=%d "
+                            "first_byte_ms=%.3f first_chunk_bytes=%d "
+                            "includes_cache_load_and_bootstrap=true",
+                            request_id,
+                            attempt,
+                            (time.perf_counter() - rpc_started) * 1000,
+                            len(chunk),
+                        )
                     first_chunk_sent = True
                     yield chunk
+                if isinstance(artifact, dict):
+                    logger.info(
+                        "[P2D_HTTP_DECODER_DONE] req=%s attempt=%d "
+                        "response_bytes=%d rpc_total_ms=%.3f",
+                        request_id,
+                        attempt,
+                        response_bytes,
+                        (time.perf_counter() - rpc_started) * 1000,
+                    )
                 return  # Success, exit after streaming
         except (httpx.RequestError, httpx.HTTPStatusError) as e:
             if attempt < max_retries:
@@ -714,7 +789,9 @@ async def _handle_select_instance(api: str, req_data: Any, request_length: int):
         base_delay=global_args.retry_delay,
     )
     proxy_state.release_prefiller(prefiller_idx, prefiller_score)
+    json_started = time.perf_counter()
     response_json = response.json()
+    json_parse_ms = (time.perf_counter() - json_started) * 1000
     kv_transfer_params = update_decode_kv_transfer_params(
         req_data, response_json.get("kv_transfer_params")
     )
@@ -730,10 +807,26 @@ async def _handle_select_instance(api: str, req_data: Any, request_length: int):
         )
     else:
         artifact = kv_transfer_params.get("bootstrap_final_hidden")
+        proxy_received_unix_ns = time.time_ns()
+        if isinstance(artifact, dict):
+            artifact["proxy_received_unix_ns"] = proxy_received_unix_ns
+        producer_ready_unix_ns = (
+            artifact.get("producer_ready_unix_ns")
+            if isinstance(artifact, dict)
+            else None
+        )
+        producer_to_proxy_ms = (
+            (proxy_received_unix_ns - producer_ready_unix_ns) / 1e6
+            if isinstance(producer_ready_unix_ns, int)
+            else None
+        )
         logger.info(
             "[FINAL_HIDDEN_PROXY_PREFILL_DONE] req=%s prefiller=%s "
             "artifact=%s dtype=%s shape=%s prompt_tokens=%s "
-            "base64_chars=%d checksum=%s transfer_keys=%s",
+            "base64_chars=%d checksum=%s transfer_keys=%s "
+            "response_bytes=%d json_parse_ms=%.3f "
+            "producer_to_proxy_ms=%s clock_sync_required=true "
+            "producer_to_proxy_includes=p_api_serialization_http_response",
             request_id,
             prefiller.url,
             artifact is not None,
@@ -749,6 +842,11 @@ async def _handle_select_instance(api: str, req_data: Any, request_length: int):
             if isinstance(artifact, dict)
             else None,
             sorted(kv_transfer_params),
+            len(response.content),
+            json_parse_ms,
+            f"{producer_to_proxy_ms:.3f}"
+            if producer_to_proxy_ms is not None
+            else "unknown",
         )
     # Select decoder
     decoder_score = proxy_state.calculate_decode_scores(request_length)
