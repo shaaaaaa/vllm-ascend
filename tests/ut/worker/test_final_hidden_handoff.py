@@ -68,6 +68,27 @@ def test_capture_final_hidden_uses_last_scheduled_row_per_request():
     assert torch.equal(restored, hidden_states[4])
 
 
+@pytest.mark.parametrize(
+    ("pp_last", "tp_rank", "expected"),
+    [(True, 0, True), (True, 1, False), (False, 0, False)],
+)
+def test_final_hidden_capture_is_limited_to_executor_output_rank(
+    monkeypatch, pp_last, tp_rank, expected
+):
+    monkeypatch.setattr(
+        model_runner_v1,
+        "get_pp_group",
+        lambda: SimpleNamespace(is_last_rank=pp_last),
+    )
+    monkeypatch.setattr(
+        model_runner_v1,
+        "get_tp_group",
+        lambda: SimpleNamespace(rank_in_group=tp_rank),
+    )
+
+    assert NPUModelRunner._is_final_hidden_output_rank() is expected
+
+
 def test_wait_for_bootstrap_kv_load_advances_every_group0_layer(monkeypatch):
     calls = []
     connector = SimpleNamespace(wait_for_layer_load=calls.append)
@@ -261,7 +282,6 @@ def test_bootstrap_runs_draft_and_finalizes_connector(monkeypatch):
         ec_connector_output=None,
         cudagraph_stats=None,
         batch_desc=None,
-        final_hidden_states={},
     )
     runner.kv_connector_output = SimpleNamespace()
     runner.speculative_config = SimpleNamespace(

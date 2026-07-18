@@ -347,7 +347,6 @@ class ExecuteModelState(NamedTuple):
     cudagraph_stats: CUDAGraphStat | None
     batch_desc: BatchDescriptor
     staged_sfa_graph_key: StagedSFAGraphKey | None
-    final_hidden_states: dict[str, dict[str, Any]]
 
 
 def _fixed_decode_layout_arrays(
@@ -458,6 +457,7 @@ def serialize_final_hidden_state(hidden_state: torch.Tensor) -> dict[str, Any]:
 def deserialize_final_hidden_state(payload: dict[str, Any]) -> torch.Tensor:
     """Decode a final hidden state produced by serialize_final_hidden_state."""
     started = time.perf_counter()
+    worker_received_unix_ns = time.time_ns()
     if payload.get("version") != 1 or payload.get("encoding") != "base64":
         raise ValueError("Unsupported final hidden state payload")
 
@@ -513,14 +513,45 @@ def deserialize_final_hidden_state(payload: dict[str, Any]) -> torch.Tensor:
         .reshape(shape)
         .clone()
     )
+    producer_ready_unix_ns = payload.get("producer_ready_unix_ns")
+    proxy_decoder_send_unix_ns = payload.get("proxy_decoder_send_unix_ns")
+    decoder_engine_received_unix_ns = payload.get(
+        "decoder_engine_received_unix_ns"
+    )
+    producer_to_worker_ms = (
+        (worker_received_unix_ns - producer_ready_unix_ns) / 1e6
+        if isinstance(producer_ready_unix_ns, int)
+        else None
+    )
+    proxy_to_worker_ms = (
+        (worker_received_unix_ns - proxy_decoder_send_unix_ns) / 1e6
+        if isinstance(proxy_decoder_send_unix_ns, int)
+        else None
+    )
+    engine_to_worker_ms = (
+        (worker_received_unix_ns - decoder_engine_received_unix_ns) / 1e6
+        if isinstance(decoder_engine_received_unix_ns, int)
+        else None
+    )
     logger.info(
         "[FINAL_HIDDEN_DESERIALIZE] dtype=%s shape=%s raw_bytes=%d "
-        "checksum=%s total_ms=%.3f",
+        "checksum=%s total_ms=%.3f producer_to_worker_ms=%s "
+        "proxy_to_worker_ms=%s engine_to_worker_ms=%s "
+        "clock_sync_required=true",
         dtype_name,
         tuple(shape),
         len(raw),
         data_sha256[:16],
         (time.perf_counter() - started) * 1000,
+        f"{producer_to_worker_ms:.3f}"
+        if producer_to_worker_ms is not None
+        else "unknown",
+        f"{proxy_to_worker_ms:.3f}"
+        if proxy_to_worker_ms is not None
+        else "unknown",
+        f"{engine_to_worker_ms:.3f}"
+        if engine_to_worker_ms is not None
+        else "unknown",
     )
     return hidden_state
 
@@ -1786,10 +1817,19 @@ class NPUModelRunner(GPUModelRunner):
         )
         return final_hidden_states
 
+    @staticmethod
+    def _is_final_hidden_output_rank() -> bool:
+        # MultiprocExecutor returns the first TP worker of the last PP stage.
+        return (
+            get_pp_group().is_last_rank
+            and get_tp_group().rank_in_group == 0
+        )
+
     def _get_bootstrap_hidden_states(
         self,
         scheduler_output: "SchedulerOutput",
     ) -> torch.Tensor:
+        hidden_started = time.perf_counter()
         bootstrap_req_ids = scheduler_output.bootstrap_sample_req_ids
         payloads = scheduler_output.bootstrap_final_hiddens
         if not bootstrap_req_ids or payloads is None:
@@ -1835,13 +1875,14 @@ class NPUModelRunner(GPUModelRunner):
         )
         logger.info(
             "[BOOTSTRAP_HIDDEN_H2D_ENQUEUED] requests=%s shape=%s dtype=%s "
-            "source_pinned=%s target_device=%s enqueue_ms=%.3f",
+            "source_pinned=%s target_device=%s enqueue_ms=%.3f total_ms=%.3f",
             list(self.input_batch.req_ids),
             tuple(cpu_hidden_states.shape),
             cpu_hidden_states.dtype,
             cpu_hidden_states.is_pinned(),
             self.device,
             (time.perf_counter() - h2d_started) * 1000,
+            (time.perf_counter() - hidden_started) * 1000,
         )
         return device_hidden_states
 
@@ -2207,6 +2248,11 @@ class NPUModelRunner(GPUModelRunner):
         if self.dynamic_eplb:
             with record_function_or_nullcontext("EPLB weight D2D"):
                 self.eplb_updator.forward_before()
+        connector_context = self.maybe_get_kv_connector_output(
+            scheduler_output,
+            defer_finalize=self.speculative_config is not None,
+        )
+        connector_enter_started = time.perf_counter()
         with (
             set_ascend_forward_context(
                 attn_metadata,
@@ -2222,11 +2268,18 @@ class NPUModelRunner(GPUModelRunner):
                 dsa_prompt_lens=dsa_prompt_lens,
                 dsa_adapter_cache=dsa_adapter_cache,
             ),
-            self.maybe_get_kv_connector_output(
-                scheduler_output,
-                defer_finalize=self.speculative_config is not None,
-            ) as kv_connector_output,
+            connector_context as kv_connector_output,
         ):
+            connector_enter_ms = (
+                time.perf_counter() - connector_enter_started
+            ) * 1000
+            logger.info(
+                "[BOOTSTRAP_CONNECTOR_ENTER_DONE] requests=%s "
+                "context_enter_ms=%.3f phase=lmcache_start_and_initial_fetch "
+                "hidden_transfer_included=false",
+                list(self.input_batch.req_ids),
+                connector_enter_ms,
+            )
             if run_shadow_forward:
                 assert shadow_forward_inputs is not None
                 (
@@ -2390,7 +2443,6 @@ class NPUModelRunner(GPUModelRunner):
             None,
             cudagraph_stats,
             batch_desc,
-            {},
         )
         self.kv_connector_output = kv_connector_output
         logger.info(
@@ -2943,10 +2995,10 @@ class NPUModelRunner(GPUModelRunner):
                         for aux_hidden_states_pcp in aux_hidden_states
                     ]
 
-            final_hidden_states = {}
+            final_hidden_states = None
             if (
-                get_pp_group().is_last_rank
-                and scheduler_output.capture_final_hidden_req_ids
+                scheduler_output.capture_final_hidden_req_ids
+                and self._is_final_hidden_output_rank()
             ):
                 assert isinstance(hidden_states, torch.Tensor)
                 final_hidden_states = self._capture_final_hidden_states(
@@ -2959,6 +3011,11 @@ class NPUModelRunner(GPUModelRunner):
                         ],
                         dtype=np.int32,
                     ),
+                )
+                setattr(
+                    scheduler_output,
+                    "_captured_final_hidden_states",
+                    final_hidden_states,
                 )
 
             if not self.broadcast_pp_output:
@@ -3028,7 +3085,6 @@ class NPUModelRunner(GPUModelRunner):
                 cudagraph_stats,
                 batch_desc,
                 staged_sfa_graph_key,
-                final_hidden_states,
             )
             self.kv_connector_output = kv_connector_output
         return None
@@ -3073,8 +3129,10 @@ class NPUModelRunner(GPUModelRunner):
             cudagraph_stats,
             batch_desc,
             staged_sfa_graph_key,
-            final_hidden_states,
         ) = self.execute_model_state
+        final_hidden_states = getattr(
+            scheduler_output, "_captured_final_hidden_states", None
+        )
         # Clear ephemeral state.
         self.execute_model_state = None
 
@@ -3297,8 +3355,13 @@ class NPUModelRunner(GPUModelRunner):
             pooler_output=[],
             ec_connector_output=ec_connector_output if self.supports_mm_inputs else None,
             cudagraph_stats=cudagraph_stats,
-            final_hidden_states=final_hidden_states,
         )
+        if final_hidden_states:
+            setattr(
+                model_runner_output,
+                "final_hidden_states",
+                final_hidden_states,
+            )
         if is_bootstrap_step:
             logger.info(
                 "[BOOTSTRAP_SAMPLE_DONE] requests=%s sampled_host_tokens=%s "
