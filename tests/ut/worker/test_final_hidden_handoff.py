@@ -141,18 +141,30 @@ def test_compact_decode_residency_is_logged_once_per_live_request():
         num_computed_tokens=120_000,
         num_prompt_tokens=120_000,
         block_ids=([1, 2, 0, 0, 9, 10], [101, 102, 103, 104]),
-        compact_residency_log_pending=True,
     )
     runner.requests = {"request": request_state}
+    runner._compact_residency_log_pending_req_ids = {"request"}
     scheduler_output = SimpleNamespace(num_scheduled_tokens={"request": 1})
 
     runner._log_compact_decode_residency_once(scheduler_output)
     assert request_state.compact_residency_logged
-    assert not request_state.compact_residency_log_pending
+    assert not hasattr(runner, "_compact_residency_log_pending_req_ids")
 
     # The second decode step must not repeat the request-level residency log.
     runner._log_compact_decode_residency_once(scheduler_output)
     assert request_state.compact_residency_logged
+
+
+def test_compact_residency_hot_path_does_not_scan_without_pending_request():
+    class UnexpectedAccess(dict):
+        def __iter__(self):
+            raise AssertionError("normal decode request map was scanned")
+
+    runner = object.__new__(NPUModelRunner)
+    runner.dsa_two_groups = True
+    runner._log_compact_decode_residency_once(
+        SimpleNamespace(num_scheduled_tokens=UnexpectedAccess())
+    )
 
 
 def test_normal_prefill_does_not_enter_compact_residency_path():

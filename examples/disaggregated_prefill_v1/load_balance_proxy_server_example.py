@@ -855,8 +855,19 @@ async def _handle_select_instance(api: str, req_data: Any, request_length: int):
     decoder_idx = proxy_state.select_decoder(decoder_score)
     decoder = proxy_state.decoders[decoder_idx]
     logger.info(
-    return InstanceInfo(
-        request_id=request_id,
+        "[FINAL_HIDDEN_PROXY_ROUTE] req=%s request_bytes=%d prefiller=%s "
+        "decoder=%s prefiller_score=%.3f decoder_score=%.3f "
+        "bootstrap_artifact=%s api=%s",
+        request_id,
+        request_length,
+        prefiller.url,
+        decoder.url,
+        prefiller_score,
+        decoder_score,
+        "bootstrap_final_hidden" in kv_transfer_params,
+        api,
+    )
+    return InstanceInfo(        request_id=request_id,
         prefiller_idx=prefiller_idx,
         prefiller_score=prefiller_score,
         prefiller=prefiller,

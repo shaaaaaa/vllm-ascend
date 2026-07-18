@@ -1929,18 +1929,27 @@ class NPUModelRunner(GPUModelRunner):
     def _log_compact_decode_residency_once(
         self, scheduler_output: "SchedulerOutput"
     ) -> None:
-        if not self.dsa_two_groups:
+        pending_req_ids = getattr(
+            self, "_compact_residency_log_pending_req_ids", None
+        )
+        if not self.dsa_two_groups or not pending_req_ids:
             return
-        for req_id in scheduler_output.num_scheduled_tokens:
+        pending_req_ids.intersection_update(self.requests)
+        if not pending_req_ids:
+            del self._compact_residency_log_pending_req_ids
+            return
+        scheduled_pending_req_ids = pending_req_ids.intersection(
+            scheduler_output.num_scheduled_tokens
+        )
+        for req_id in scheduled_pending_req_ids:
             request_state = self.requests.get(req_id)
-            if request_state is None or not getattr(
-                request_state, "compact_residency_log_pending", False
-            ):
+            if request_state is None:
+                pending_req_ids.discard(req_id)
                 continue
             if request_state.num_computed_tokens < request_state.num_prompt_tokens:
                 continue
             if len(request_state.block_ids) < 2:
-                setattr(request_state, "compact_residency_log_pending", False)
+                pending_req_ids.discard(req_id)
                 continue
             latent_block_ids = request_state.block_ids[0]
             if 0 not in latent_block_ids:
@@ -1949,7 +1958,7 @@ class NPUModelRunner(GPUModelRunner):
                     "reason=no_null_blocks compact=false",
                     req_id,
                 )
-                setattr(request_state, "compact_residency_log_pending", False)
+                pending_req_ids.discard(req_id)
                 continue
             indexer_block_ids = request_state.block_ids[1]
             logger.info(
@@ -1969,8 +1978,10 @@ class NPUModelRunner(GPUModelRunner):
                 indexer_block_ids[:4],
                 indexer_block_ids[-4:],
             )
-            setattr(request_state, "compact_residency_log_pending", False)
             setattr(request_state, "compact_residency_logged", True)
+            pending_req_ids.discard(req_id)
+        if not pending_req_ids:
+            del self._compact_residency_log_pending_req_ids
 
     def _bootstrap_load_failed_req_ids(
         self,
@@ -2065,8 +2076,6 @@ class NPUModelRunner(GPUModelRunner):
         scheduler_output: "SchedulerOutput",
     ) -> None:
         """Sample from transferred hidden state, ignoring any target output."""
-        if self.use_async_scheduling:
-            raise RuntimeError("BOOTSTRAP_SAMPLE does not support async scheduling")
         if self.pcp_size > 1 or self.dcp_size > 1:
             raise RuntimeError("BOOTSTRAP_SAMPLE does not support context parallelism")
         if get_pp_group().world_size > 1:
@@ -2093,7 +2102,9 @@ class NPUModelRunner(GPUModelRunner):
         logger.info(
             "[BOOTSTRAP_EXECUTE_BEGIN] requests=%s batch_order=%s num_reqs=%d "
             "dp_size=%d tp_size=%d shadow_forward=%s speculative_method=%s "
-            "num_speculative_tokens=%s",
+            "num_speculative_tokens=%s async_scheduling=%s "
+            "prev_sampled_shape=%s prev_req_ids=%s draft_shape=%s "
+            "draft_req_ids=%s",
             sorted(bootstrap_req_ids),
             list(self.input_batch.req_ids),
             num_reqs,
@@ -2102,6 +2113,15 @@ class NPUModelRunner(GPUModelRunner):
             run_shadow_forward,
             getattr(self.speculative_config, "method", None),
             getattr(self.speculative_config, "num_speculative_tokens", None),
+            self.use_async_scheduling,
+            tuple(self.input_batch.prev_sampled_token_ids.shape)
+            if self.input_batch.prev_sampled_token_ids is not None
+            else None,
+            sorted((self.input_batch.prev_req_id_to_index or {}).keys()),
+            tuple(self._draft_token_ids.shape)
+            if torch.is_tensor(self._draft_token_ids)
+            else None,
+            list(getattr(self, "_draft_token_req_ids", None) or []),
         )
 
         # Recreate the metadata that a last-prompt-token forward would have
@@ -2310,22 +2330,30 @@ class NPUModelRunner(GPUModelRunner):
                 "[BOOTSTRAP_EXECUTE_FALLBACK] failed_requests=%s "
                 "all_requests=%s action=restart_dense_prefill "
                 "sampler_rng_advanced=false draft_state_cleared=true "
-                "elapsed_ms=%.3f",
+                "invalid_blocks=%s finished_recving=%s "
+                "finished_sending=%s elapsed_ms=%.3f",
                 sorted(failed_req_ids),
                 ordered_bootstrap_req_ids,
+                sorted(kv_connector_output.invalid_block_ids),
+                sorted(kv_connector_output.finished_recving or ()),
+                sorted(kv_connector_output.finished_sending or ()),
                 (time.perf_counter() - bootstrap_started) * 1000,
             )
             return
 
         if self.dsa_two_groups:
+            pending_residency_logs = getattr(
+                self, "_compact_residency_log_pending_req_ids", None
+            )
+            if pending_residency_logs is None:
+                pending_residency_logs = set()
+                self._compact_residency_log_pending_req_ids = (
+                    pending_residency_logs
+                )
             for req_id in ordered_bootstrap_req_ids:
                 request_state = self.requests.get(req_id)
                 if request_state is not None:
-                    setattr(
-                        request_state,
-                        "compact_residency_log_pending",
-                        True,
-                    )
+                    pending_residency_logs.add(req_id)
             logger.info(
                 "[DSA_COMPACT_RESIDENCY_LOG_ARMED] requests=%s "
                 "trigger=next_decode_step",
@@ -2401,14 +2429,58 @@ class NPUModelRunner(GPUModelRunner):
         with record_function_or_nullcontext("prepare input"):
             with self.synchronize_input_prep():
                 # Update persistent batch states.
+                if scheduler_output.bootstrap_sample_req_ids:
+                    logger.info(
+                        "[BOOTSTRAP_WORKER_STATE_BEFORE_UPDATE] requests=%s "
+                        "persistent_batch=%s prev_sampled_shape=%s "
+                        "prev_req_ids=%s draft_shape=%s draft_req_ids=%s",
+                        sorted(scheduler_output.bootstrap_sample_req_ids),
+                        list(self.input_batch.req_ids),
+                        tuple(self.input_batch.prev_sampled_token_ids.shape)
+                        if self.input_batch.prev_sampled_token_ids is not None
+                        else None,
+                        sorted(
+                            (self.input_batch.prev_req_id_to_index or {}).keys()
+                        ),
+                        tuple(self._draft_token_ids.shape)
+                        if torch.is_tensor(self._draft_token_ids)
+                        else None,
+                        list(getattr(self, "_draft_token_req_ids", None) or []),
+                    )
                 self._update_states(scheduler_output)
-                if not scheduler_output.bootstrap_sample_req_ids:
+                if scheduler_output.bootstrap_sample_req_ids:
+                    request_state_summary = {}
+                    for req_id in self.input_batch.req_ids:
+                        request_state = self.requests.get(req_id)
+                        if request_state is None:
+                            continue
+                        request_state_summary[req_id] = {
+                            "computed": request_state.num_computed_tokens,
+                            "prompt": request_state.num_prompt_tokens,
+                            "group_logical": [
+                                len(ids) for ids in request_state.block_ids
+                            ],
+                            "group_resident": [
+                                sum(block_id > 0 for block_id in ids)
+                                for ids in request_state.block_ids
+                            ],
+                            "group_null": [
+                                sum(block_id == 0 for block_id in ids)
+                                for ids in request_state.block_ids
+                            ],
+                        }
+                    logger.info(
+                        "[BOOTSTRAP_WORKER_STATE_AFTER_UPDATE] requests=%s "
+                        "persistent_batch=%s request_states=%s",
+                        sorted(scheduler_output.bootstrap_sample_req_ids),
+                        list(self.input_batch.req_ids),
+                        request_state_summary,
+                    )
+                if getattr(
+                    self, "_compact_residency_log_pending_req_ids", None
+                ):
                     self._log_compact_decode_residency_once(scheduler_output)
                 if scheduler_output.bootstrap_sample_req_ids:
-                    if self.use_async_scheduling:
-                        raise RuntimeError(
-                            "BOOTSTRAP_SAMPLE does not support async scheduling"
-                        )
                     if self.pcp_size > 1 or self.dcp_size > 1:
                         raise RuntimeError(
                             "BOOTSTRAP_SAMPLE does not support context parallelism"
@@ -2872,7 +2944,10 @@ class NPUModelRunner(GPUModelRunner):
                     ]
 
             final_hidden_states = {}
-            if get_pp_group().is_last_rank:
+            if (
+                get_pp_group().is_last_rank
+                and scheduler_output.capture_final_hidden_req_ids
+            ):
                 assert isinstance(hidden_states, torch.Tensor)
                 final_hidden_states = self._capture_final_hidden_states(
                     scheduler_output,
@@ -3036,10 +3111,12 @@ class NPUModelRunner(GPUModelRunner):
                 tuple(logits.shape),
             )
 
-        # Never expose a previous step's drafts before replacing them below.
-        self._draft_token_ids = None
-        if hasattr(self, "_draft_token_req_ids"):
-            self._draft_token_req_ids = None
+        if is_bootstrap_step:
+            # The paused normal batch may have left a draft tensor with a
+            # different request order. Bootstrap replaces it before proposal.
+            self._draft_token_ids = None
+            if hasattr(self, "_draft_token_req_ids"):
+                self._draft_token_req_ids = None
 
         def propose_draft_token_ids(sampled_token_ids):
             assert spec_decode_common_attn_metadata is not None
@@ -3092,20 +3169,31 @@ class NPUModelRunner(GPUModelRunner):
 
         with record_function_or_nullcontext("draft_token"):
             if self.speculative_config:
-                draft_started = time.perf_counter()
-                if is_bootstrap_step:
-                    logger.info(
-                        "[BOOTSTRAP_MTP_BEGIN] requests=%s sampled_token_ids=%s "
-                        "method=%s",
-                        sorted(scheduler_output.bootstrap_sample_req_ids),
-                        valid_sampled_token_ids,
-                        self.speculative_config.method,
-                    )
+                draft_started = (
+                    time.perf_counter() if is_bootstrap_step else 0.0
+                )
                 use_padded_batch = (
                     self.speculative_config
-                    and (self.speculative_config.use_eagle() or self.speculative_config.uses_draft_model())
+                    and (
+                        self.speculative_config.use_eagle()
+                        or self.speculative_config.uses_draft_model()
+                    )
                     and not self.speculative_config.disable_padded_drafter_batch
                 )
+                if is_bootstrap_step:
+                    logger.info(
+                        "[BOOTSTRAP_MTP_BEGIN] requests=%s "
+                        "sampled_host_tokens=%s sampled_tensor_shape=%s "
+                        "sampled_tensor_device=%s proposal_input=%s method=%s",
+                        sorted(scheduler_output.bootstrap_sample_req_ids),
+                        valid_sampled_token_ids,
+                        tuple(sampler_output.sampled_token_ids.shape),
+                        sampler_output.sampled_token_ids.device,
+                        "npu_sampler_tensor"
+                        if use_padded_batch
+                        else "host_sampled_tokens",
+                        self.speculative_config.method,
+                    )
                 if use_padded_batch:
                     # EAGLE speculative decoding can use the GPU sampled tokens
                     # as inputs, and does not need to wait for bookkeeping to finish.
@@ -3213,11 +3301,17 @@ class NPUModelRunner(GPUModelRunner):
         )
         if is_bootstrap_step:
             logger.info(
-                "[BOOTSTRAP_SAMPLE_DONE] requests=%s sampled_token_ids=%s "
-                "draft_present=%s connector_output=%s",
+                "[BOOTSTRAP_SAMPLE_DONE] requests=%s sampled_host_tokens=%s "
+                "sampled_tensor_shape=%s sampled_tensor_device=%s "
+                "async_host_copy_deferred=%s draft_present=%s "
+                "draft_req_ids=%s connector_output=%s",
                 sorted(scheduler_output.bootstrap_sample_req_ids),
                 valid_sampled_token_ids,
+                tuple(sampler_output.sampled_token_ids.shape),
+                sampler_output.sampled_token_ids.device,
+                self.use_async_scheduling,
                 self._draft_token_ids is not None,
+                list(getattr(self, "_draft_token_req_ids", None) or []),
                 kv_connector_output is not None,
             )
 
@@ -3248,6 +3342,14 @@ class NPUModelRunner(GPUModelRunner):
 
         if not self.use_async_scheduling:
             return model_runner_output
+        if is_bootstrap_step:
+            logger.info(
+                "[BOOTSTRAP_ASYNC_OUTPUT_WRAPPED] requests=%s "
+                "invalid_req_indices=%s output_copy_stream=%s",
+                sorted(scheduler_output.bootstrap_sample_req_ids),
+                invalid_req_indices,
+                self.async_output_copy_stream is not None,
+            )
         return AsyncGPUModelRunnerOutput(
             model_runner_output=model_runner_output,
             sampled_token_ids=sampler_output.sampled_token_ids,
