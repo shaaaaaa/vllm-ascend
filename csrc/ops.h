@@ -37,6 +37,21 @@ namespace vllm_ascend {
     const int64_t size,
     const uint32_t loop_cnt,
     const uint32_t aiv_num);
+
+  extern void dsa_prepare_sparse_indices_impl(
+    void* stream,
+    void* topk_indices,
+    void* split_boundary,
+    void* valid_rows,
+    void* scratch_base,
+    void* selected_packed,
+    void* row_req_indices,
+    uint32_t row_count,
+    uint32_t row_width,
+    uint32_t valid_row_count,
+    uint32_t core_count,
+    bool need_packed,
+    bool clear_invalid_rows);
     
   torch::Tensor weak_ref_tensor(torch::Tensor& tensor) {
     if (!tensor.is_privateuseone()) {

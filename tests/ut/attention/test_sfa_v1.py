@@ -2,19 +2,89 @@ import sys
 from unittest.mock import MagicMock, patch
 
 import torch
+from vllm.distributed.parallel_state import GroupCoordinator
 
 from tests.ut.attention.utils import patch_distributed_groups
 from tests.ut.base import TestBase
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
-from vllm.distributed.parallel_state import GroupCoordinator
 
 if 'torch_npu._inductor' not in sys.modules:
     sys.modules['torch_npu._inductor'] = MagicMock()
 
-from vllm_ascend.attention.sfa_v1 import (AscendSFABackend, AscendSFAImpl,
-                                          AscendSFAMetadata,
-                                          AscendSFAMetadataBuilder)
+import vllm_ascend.attention.sfa_v1 as sfa_v1
+from vllm_ascend.attention.sfa_v1 import AscendSFABackend, AscendSFAImpl, AscendSFAMetadata, AscendSFAMetadataBuilder
 from vllm_ascend.utils import enable_dsa_cp
+
+
+class TestLMCacheSparseWaitSync(TestBase):
+
+    def setUp(self):
+        self.original_once_done = sfa_v1._lmcache_sparse_wait_sync_once_done
+        sfa_v1._lmcache_sparse_wait_sync_once_done = False
+
+    def tearDown(self):
+        sfa_v1._lmcache_sparse_wait_sync_once_done = self.original_once_done
+
+    def test_once_mode_synchronizes_only_first_sparse_wait(self):
+        stream = MagicMock()
+        with (
+            patch.object(sfa_v1, "_LMCACHE_SPARSE_WAIT_SYNC_ONCE", True),
+            patch.object(
+                sfa_v1.torch.npu,
+                "current_stream",
+                return_value=stream,
+            ) as current_stream,
+        ):
+            sfa_v1._sync_compute_stream_after_lmcache_sparse_wait()
+            sfa_v1._sync_compute_stream_after_lmcache_sparse_wait()
+
+        current_stream.assert_called_once_with()
+        stream.synchronize.assert_called_once_with()
+        self.assertTrue(sfa_v1._lmcache_sparse_wait_sync_once_done)
+
+    def test_completed_mode_does_not_touch_npu_stream(self):
+        sfa_v1._lmcache_sparse_wait_sync_once_done = True
+        with patch.object(sfa_v1.torch.npu, "current_stream") as current_stream:
+            sfa_v1._sync_compute_stream_after_lmcache_sparse_wait()
+
+        current_stream.assert_not_called()
+
+    def test_disabled_mode_does_not_synchronize(self):
+        with (
+            patch.object(sfa_v1, "_LMCACHE_SPARSE_WAIT_SYNC_ONCE", False),
+            patch.object(sfa_v1.torch.npu, "current_stream") as current_stream,
+        ):
+            sfa_v1._sync_compute_stream_after_lmcache_sparse_wait()
+
+        current_stream.assert_not_called()
+        self.assertFalse(sfa_v1._lmcache_sparse_wait_sync_once_done)
+
+    def test_sync_compute_stream_skips_when_npu_unavailable(self):
+        with (
+            patch.object(sfa_v1, "_LMCACHE_SPARSE_WAIT_SYNC_ONCE", True),
+            patch.object(sfa_v1.torch, "npu", None),
+        ):
+            sfa_v1._sync_compute_stream_after_lmcache_sparse_wait()
+
+        self.assertFalse(sfa_v1._lmcache_sparse_wait_sync_once_done)
+
+
+class TestDSASparsePadding(TestBase):
+
+    def test_trailing_graph_padding_is_zeroed_in_place(self):
+        topk = torch.arange(4 * 64, dtype=torch.int32).reshape(4, 1, 64)
+        original_actual = topk[:2].clone()
+        input_ptr = topk.data_ptr()
+
+        result, result_2d = sfa_v1._dsa_mask_padding_sparse_rows(
+            topk,
+            torch.tensor([0, 1, -1, -1], dtype=torch.int32),
+        )
+
+        self.assertEqual(result.data_ptr(), input_ptr)
+        self.assertEqual(result_2d.data_ptr(), input_ptr)
+        self.assertTrue(torch.equal(result[:2], original_actual))
+        self.assertEqual(torch.count_nonzero(result[2:]).item(), 0)
 
 
 class TestAscendSFABackend(TestBase):

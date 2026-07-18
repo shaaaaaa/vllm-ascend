@@ -14,6 +14,8 @@
  * limitations under the License.
  */
 
+#include <algorithm>
+#include <cstdint>
 #include <torch/extension.h>
 #include <torch/library.h>
 #include <torch/version.h>
@@ -218,6 +220,159 @@ std::tuple<at::Tensor, at::Tensor> get_masked_input_and_mask(
     });
     cmd.Run();
     return {masked_input, mask};
+}
+
+at::Tensor npu_dsa_prepare_sparse_indices_(
+    at::Tensor &topk_indices,
+    const at::Tensor &split_boundary,
+    const at::Tensor &valid_rows,
+    const at::Tensor &scratch_base,
+    bool need_packed,
+    const c10::optional<at::Tensor> &row_req_indices)
+{
+    TORCH_CHECK(topk_indices.is_privateuseone(),
+                "topk_indices must be on an NPU device");
+    TORCH_CHECK(split_boundary.device() == topk_indices.device() &&
+                    valid_rows.device() == topk_indices.device() &&
+                    scratch_base.device() == topk_indices.device(),
+                "all sparse-index preparation tensors must be on the same NPU device");
+    TORCH_CHECK(topk_indices.scalar_type() == at::kInt &&
+                    split_boundary.scalar_type() == at::kInt &&
+                    valid_rows.scalar_type() == at::kInt &&
+                    scratch_base.scalar_type() == at::kInt,
+                "sparse-index preparation only supports int32 tensors");
+    TORCH_CHECK(topk_indices.is_contiguous() && split_boundary.is_contiguous() &&
+                    valid_rows.is_contiguous() && scratch_base.is_contiguous(),
+                "sparse-index preparation inputs must be contiguous");
+    if (row_req_indices.has_value()) {
+        TORCH_CHECK(row_req_indices->device() == topk_indices.device(),
+                    "row_req_indices must be on the same NPU device");
+        TORCH_CHECK(row_req_indices->scalar_type() == at::kInt,
+                    "row_req_indices must be int32");
+        TORCH_CHECK(row_req_indices->is_contiguous() &&
+                        row_req_indices->dim() == 1,
+                    "row_req_indices must be a contiguous 1D tensor");
+    }
+    TORCH_CHECK(topk_indices.dim() == 2 || topk_indices.dim() == 3,
+                "topk_indices must have shape [rows, k] or [rows, 1, k]");
+    TORCH_CHECK(topk_indices.dim() != 3 || topk_indices.size(1) == 1,
+                "three-dimensional topk_indices must have shape [rows, 1, k]");
+    TORCH_CHECK(split_boundary.dim() == 1 && valid_rows.dim() == 1 &&
+                    scratch_base.dim() == 1,
+                "split_boundary, valid_rows, and scratch_base must be one-dimensional");
+
+    const int64_t row_count = topk_indices.size(0);
+    TORCH_CHECK(row_count > 0, "topk_indices must contain at least one row");
+    TORCH_CHECK(!row_req_indices.has_value() ||
+                    row_req_indices->numel() >= row_count,
+                "row_req_indices must cover every top-k row");
+    const int64_t row_width = topk_indices.numel() / row_count;
+    const int64_t valid_row_count = valid_rows.numel();
+    TORCH_CHECK(split_boundary.numel() >= row_count &&
+                    scratch_base.numel() >= row_count,
+                "split_boundary and scratch_base must cover every top-k row");
+    TORCH_CHECK(valid_row_count <= row_count,
+                "valid_rows cannot contain more entries than top-k rows");
+    TORCH_CHECK(row_width > 0 && row_width <= 4096,
+                "sparse-index preparation supports at most 4096 entries per row");
+    TORCH_CHECK(row_width % 64 == 0,
+                "sparse-index row width must be a multiple of 64 int32 values");
+    TORCH_CHECK(
+        reinterpret_cast<std::uintptr_t>(topk_indices.data_ptr()) % 256 == 0,
+        "topk_indices must start at a 256-byte-aligned address so adjacent "
+        "rows cannot share a write transaction/cacheline");
+
+    at::Tensor selected_packed = at::empty(
+        {need_packed ? valid_row_count : 0, row_width},
+        topk_indices.options());
+    if (need_packed) {
+        TORCH_CHECK(
+            reinterpret_cast<std::uintptr_t>(selected_packed.data_ptr()) % 256 == 0,
+            "selected_packed must start at a 256-byte-aligned address");
+    }
+    const bool clear_invalid_rows = row_req_indices.has_value();
+    if (valid_row_count == 0 && !clear_invalid_rows) {
+        return selected_packed;
+    }
+
+    // valid_rows is produced from np.flatnonzero in the SFA metadata builder,
+    // so every source row has exactly one owner. Keeping the check on host
+    // would require an NPU-to-CPU synchronization; direct callers must retain
+    // the same ordered-unique contract.
+    const c10_npu::OptionalNPUGuard npu_guard(topk_indices.device());
+
+    static thread_local int32_t cached_device = -1;
+    static thread_local int64_t cached_aiv_count = 0;
+    const int32_t current_device =
+        static_cast<int32_t>(topk_indices.get_device());
+    if (current_device != cached_device || cached_aiv_count <= 0) {
+        TORCH_CHECK(
+            aclGetDeviceCapability(
+                current_device,
+                ACL_DEVICE_INFO_VECTOR_CORE_NUM,
+                &cached_aiv_count) == ACL_SUCCESS,
+            "failed to query the NPU vector core count");
+        cached_device = current_device;
+    }
+    TORCH_CHECK(cached_aiv_count > 0,
+                "NPU reported no available vector cores");
+
+    // Keep enough work on each core for narrow rows while using one core per
+    // row for the common k=2048 path. A row is never split across cores.
+    constexpr int64_t target_elements_per_core = 2048;
+    const int64_t rows_per_core = std::max<int64_t>(
+        1, target_elements_per_core / row_width);
+    const int64_t work_row_count =
+        clear_invalid_rows ? row_count : valid_row_count;
+    const int64_t requested_cores =
+        (work_row_count + rows_per_core - 1) / rows_per_core;
+    const uint32_t core_count = static_cast<uint32_t>(
+        std::max<int64_t>(1, std::min(cached_aiv_count, requested_cores)));
+
+    void *topk_ptr = topk_indices.data_ptr();
+    void *split_boundary_ptr = split_boundary.data_ptr();
+    void *valid_rows_ptr = valid_rows.data_ptr();
+    void *scratch_base_ptr = scratch_base.data_ptr();
+    void *selected_packed_ptr = selected_packed.data_ptr();
+    void *row_req_indices_ptr = clear_invalid_rows
+        ? row_req_indices->data_ptr()
+        : split_boundary.data_ptr();
+    aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
+
+    at_npu::native::OpCommand cmd;
+    cmd.Name("npu_dsa_prepare_sparse_indices_");
+    cmd.SetCustomHandler([
+        stream,
+        topk_ptr,
+        split_boundary_ptr,
+        valid_rows_ptr,
+        scratch_base_ptr,
+        selected_packed_ptr,
+        row_req_indices_ptr,
+        row_count,
+        row_width,
+        valid_row_count,
+        core_count,
+        need_packed,
+        clear_invalid_rows]() -> int {
+        dsa_prepare_sparse_indices_impl(
+            stream,
+            topk_ptr,
+            split_boundary_ptr,
+            valid_rows_ptr,
+            scratch_base_ptr,
+            selected_packed_ptr,
+            row_req_indices_ptr,
+            static_cast<uint32_t>(row_count),
+            static_cast<uint32_t>(row_width),
+            static_cast<uint32_t>(valid_row_count),
+            core_count,
+            need_packed,
+            clear_invalid_rows);
+        return 0;
+    });
+    cmd.Run();
+    return selected_packed;
 }
 
 void bgmv_shrink(at::Tensor &x, at::Tensor &weight, at::Tensor &indices, at::Tensor &y, double scale)
@@ -722,6 +877,15 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "                         int added_vocab_start_index, "
         "                         int added_vocab_end_index) -> (Tensor masked_input, Tensor mask)");
     ops.impl("get_masked_input_and_mask", torch::kPrivateUse1, &vllm_ascend::get_masked_input_and_mask);
+
+    ops.def(
+        "npu_dsa_prepare_sparse_indices_(Tensor(a!) topk_indices, Tensor split_boundary, "
+        "Tensor valid_rows, Tensor scratch_base, bool need_packed, "
+        "Tensor? row_req_indices=None) -> Tensor");
+    ops.impl(
+        "npu_dsa_prepare_sparse_indices_",
+        torch::kPrivateUse1,
+        &vllm_ascend::npu_dsa_prepare_sparse_indices_);
 
     ops.def("bgmv_shrink(Tensor! x, Tensor! weight, Tensor! indices, Tensor! y, float scale) -> ()");
     ops.impl("bgmv_shrink", torch::kPrivateUse1, &vllm_ascend::bgmv_shrink);

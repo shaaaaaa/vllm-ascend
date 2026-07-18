@@ -66,6 +66,7 @@ set(VLLM_ASCEND_CUSTOM_OP_EXCLUDE_310P
     ${CMAKE_CURRENT_SOURCE_DIR}/csrc/kernels/bgmv_shrink.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/csrc/kernels/sgmv_expand.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/csrc/kernels/sgmv_shrink.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc/kernels/prepare_sparse_indices.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/csrc/mla_preprocess/op_kernel/mla_preprocess_kernel.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/csrc/batch_matmul_transpose/op_kernel/batch_matmul_transpose_kernel.cpp
 )

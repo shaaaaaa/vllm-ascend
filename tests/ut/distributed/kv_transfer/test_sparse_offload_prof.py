@@ -47,3 +47,35 @@ def test_forward_detail_is_noop_when_disabled(monkeypatch):
     assert _prof.start_forward(0, "request-1", sync_npu=False) is None
     assert _prof.begin("sfa_fwd", layer_name="model.layers.0.self_attn") is None
     assert _prof.finish_forward(None) is None
+
+
+def test_forward_detail_reports_prepare_stages_without_double_counting(monkeypatch):
+    timestamps = iter((0, 10, 20, 25, 30, 40, 45, 48, 50, 60))
+    monkeypatch.setattr(_prof, "_TRACE_ENABLED", True)
+    monkeypatch.setattr(_prof, "_sync", lambda trace: None)
+    monkeypatch.setattr(
+        _prof.time,
+        "perf_counter_ns",
+        lambda: next(timestamps) * 1_000_000,
+    )
+
+    forward = _prof.start_forward(8, "request-2", sync_npu=False)
+    sfa = _prof.begin("sfa_fwd", layer_name="model.layers.0.self_attn")
+
+    boundary = _prof.begin("prepare_boundary")
+    _prof.end(boundary)
+    fused_op = _prof.begin("prepare_sparse_indices")
+    _prof.end(fused_op)
+    payload = _prof.begin("prepare_payload")
+    _prof.end(payload)
+
+    _prof.end(sfa)
+    result = _prof.finish_forward(forward)
+
+    assert result is not None
+    assert result["sfa_total_ms"] == 40
+    assert result["sfa_child_total_ms"] == 18
+    assert result["sfa_unattributed_ms"] == 22
+    assert "prepare_sparse_indices:10.000/1/10.000" in result["phases"]
+    assert "prepare_boundary:5.000/1/5.000" in result["phases"]
+    assert "prepare_payload:3.000/1/3.000" in result["phases"]

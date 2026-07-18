@@ -208,12 +208,6 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_DSA_LMCACHE_TRACE": lambda: bool(
         int(os.getenv("VLLM_ASCEND_DSA_LMCACHE_TRACE", "0"))
     ),
-    # Validate DSA sparse/block/target-slot mappings on device and report rich
-    # diagnostics. Default OFF because the validation reads NPU predicates back
-    # to CPU on every decode layer.
-    "VLLM_ASCEND_DSA_TARGET_SLOT_GUARD": lambda: bool(
-        int(os.getenv("VLLM_ASCEND_DSA_TARGET_SLOT_GUARD", "0"))
-    ),
     # Host CPU budget (GiB) PER LAYER for the LMCache adapter backend. 0 (default) =
     # auto-size from the per-layer pinned-bundle need (num_logical_blocks * bundle,
     # with headroom); set >0 to override. Total host = this x number of MLA layers.

@@ -51,6 +51,25 @@ std::tuple<at::Tensor, at::Tensor> get_masked_input_and_mask_meta(
     return {masked_input, mask};
 }
 
+at::Tensor npu_dsa_prepare_sparse_indices_meta(
+    at::Tensor &topk_indices,
+    const at::Tensor &split_boundary,
+    const at::Tensor &valid_rows,
+    const at::Tensor &scratch_base,
+    bool need_packed,
+    const c10::optional<at::Tensor> &row_req_indices)
+{
+    (void)split_boundary;
+    (void)scratch_base;
+    (void)row_req_indices;
+    const int64_t rows = topk_indices.size(0);
+    TORCH_CHECK(rows > 0, "topk_indices must contain at least one row");
+    const int64_t row_width = topk_indices.numel() / rows;
+    return at::empty(
+        {need_packed ? valid_rows.numel() : 0, row_width},
+        topk_indices.options());
+}
+
 at::Tensor bgmv_expand_meta(at::Tensor &x, at::Tensor &weight, at::Tensor &indices, at::Tensor &y,
                        int64_t slice_offset, int64_t slice_size) {
     at::Tensor y_out = at::empty_like(y);
@@ -580,6 +599,10 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
     ops.impl("npu_gemma_rms_norm", &vllm_ascend::meta::npu_gemma_rms_norm_meta);
     // Masked input and mask meta implementation
     ops.impl("get_masked_input_and_mask", &vllm_ascend::meta::get_masked_input_and_mask_meta);
+    // Prepare compact DSA sparse indices and optional LMCache payload.
+    ops.impl(
+        "npu_dsa_prepare_sparse_indices_",
+        &vllm_ascend::meta::npu_dsa_prepare_sparse_indices_meta);
     // Bgmv expand
     ops.impl("bgmv_expand", &vllm_ascend::meta::bgmv_expand_meta);
     // Sgmv expand
