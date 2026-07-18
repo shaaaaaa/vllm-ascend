@@ -41,7 +41,12 @@ from vllm.v1.core.sched.utils import remove_all
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs, FinishReason
 from vllm.v1.metrics.perf import PerfStats
 from vllm.v1.outputs import ModelRunnerOutput
-from vllm.v1.request import Request, RequestStatus, StreamingUpdate
+from vllm.v1.request import (
+    Request,
+    RequestStatus,
+    StreamingUpdate,
+    validate_final_hidden_payload,
+)
 from vllm.v1.sample.rejection_sampler import PLACEHOLDER_TOKEN_ID
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.utils import ConstantList, record_function_or_nullcontext
@@ -124,6 +129,30 @@ class RecomputeScheduler(Scheduler):
             "qwen3_next" in self.vllm_config.model_config.hf_text_config.model_type
             or "qwen3_5" in self.vllm_config.model_config.hf_text_config.model_type
         )
+        speculative_config = self.vllm_config.speculative_config
+        supported_speculative_config = speculative_config is None or (
+            speculative_config.method in ("mtp", "deepseek_mtp")
+            and speculative_config.num_speculative_tokens == 1
+        )
+        # AsyncRecomputeScheduler is the production Ascend PD scheduler. Its
+        # bootstrap step is isolated, so async scheduling itself is supported.
+        self.final_hidden_bootstrap_supported = (
+            not self.is_encoder_decoder
+            and self.parallel_config.pipeline_parallel_size == 1
+            and self.parallel_config.prefill_context_parallel_size == 1
+            and self.parallel_config.decode_context_parallel_size == 1
+            and supported_speculative_config
+        )
+
+    def has_requests(self) -> bool:
+        # Async execution normally schedules one batch ahead. BOOTSTRAP_SAMPLE
+        # must observe its load result before another batch can reference the
+        # compact table, especially when a late load failure triggers dense
+        # prefill recovery. This attribute exists only while that one work item
+        # is in flight.
+        if getattr(self, "_bootstrap_async_barrier_req_ids", None):
+            return False
+        return super().has_requests()
 
     def add_request(self, request: Request) -> None:
         existing = self.requests.get(request.request_id)
@@ -140,6 +169,58 @@ class RecomputeScheduler(Scheduler):
                 # Streaming-input session finished.
                 self.finish_requests(request.request_id, RequestStatus.FINISHED_ABORTED)
         else:
+            if request.capture_final_hidden:
+                capture_pending = getattr(
+                    self, "_capture_final_hidden_pending", None
+                )
+                if capture_pending is None:
+                    capture_pending = set()
+                    self._capture_final_hidden_pending = capture_pending
+                capture_pending.add(request.request_id)
+            if request.bootstrap_sample_pending:
+                payload = request.bootstrap_final_hidden
+                payload_valid = payload is not None and validate_final_hidden_payload(
+                    payload, self.final_hidden_size
+                )
+                model_matches = bool(
+                    payload is not None
+                    and payload.get("model_fingerprint")
+                    == self.final_hidden_model_fingerprint
+                )
+                if (
+                    not self.final_hidden_bootstrap_supported
+                    or not payload_valid
+                    or not model_matches
+                ):
+                    logger.warning(
+                        "[BOOTSTRAP_SCHED_REJECT] req=%s supported=%s "
+                        "payload_present=%s payload_valid=%s model_matches=%s "
+                        "expected_hidden_size=%d expected_model=%s "
+                        "artifact_model=%s action=normal_prefill",
+                        request.request_id,
+                        self.final_hidden_bootstrap_supported,
+                        payload is not None,
+                        payload_valid,
+                        model_matches,
+                        self.final_hidden_size,
+                        self.final_hidden_model_fingerprint[:16],
+                        str(payload.get("model_fingerprint", ""))[:16]
+                        if payload is not None
+                        else None,
+                    )
+                    request.bootstrap_sample_pending = False
+                    request.bootstrap_final_hidden = None
+                else:
+                    logger.info(
+                        "[BOOTSTRAP_SCHED_ACCEPT] req=%s prompt_tokens=%d "
+                        "hidden_size=%d model=%s async_scheduling=%s "
+                        "action=lookup_external_cache",
+                        request.request_id,
+                        request.num_prompt_tokens,
+                        self.final_hidden_size,
+                        self.final_hidden_model_fingerprint[:16],
+                        self.scheduler_config.async_scheduling,
+                    )
             if request.resumable:
                 request.streaming_queue = deque()
             # Fill in placeholder tokens to enable full graph compatibility. Without
@@ -175,6 +256,13 @@ class RecomputeScheduler(Scheduler):
         assert self.connector is not None
 
         if request.request_id in self.failed_recving_kv_req_ids:
+            bootstrap_async_load_failed_req_ids = getattr(
+                self, "_bootstrap_async_load_failed_req_ids", None
+            )
+            bootstrap_async_load_failed = bool(
+                bootstrap_async_load_failed_req_ids
+                and request.request_id in bootstrap_async_load_failed_req_ids
+            )
             # Request had KV load failures; num_computed_tokens was already
             # updated in _update_requests_with_invalid_blocks
             if request.num_computed_tokens:
@@ -184,8 +272,22 @@ class RecomputeScheduler(Scheduler):
                 # No valid computed tokens, release allocated blocks.
                 # There may be a local cache hit on retry.
                 self.kv_cache_manager.free(request)
+                request.dsa_compact_allocated = False
 
             self.failed_recving_kv_req_ids.remove(request.request_id)
+            if bootstrap_async_load_failed:
+                bootstrap_async_load_failed_req_ids.discard(request.request_id)
+                if not bootstrap_async_load_failed_req_ids:
+                    del self._bootstrap_async_load_failed_req_ids
+                logger.warning(
+                    "[BOOTSTRAP_ASYNC_LOAD_RECOVERY] req=%s "
+                    "computed_tokens=%d compact=%s "
+                    "hidden_artifact_cleared=%s action=retry_scheduler_lookup",
+                    request.request_id,
+                    request.num_computed_tokens,
+                    request.dsa_compact_allocated,
+                    not request.bootstrap_sample_pending,
+                )
         else:
             # Now that the blocks are ready, actually cache them.
             # Use Ascend-specific block_ids logic to handle multi-group KV
@@ -197,9 +299,12 @@ class RecomputeScheduler(Scheduler):
                 num_computed_tokens = min(num_computed_tokens, request.num_tokens)
             else:
                 num_computed_tokens = request.num_tokens
-            # on a full prompt hit, we need to re-compute the last token
-            # in order to be able to sample the next token
-            if num_computed_tokens == request.num_tokens:
+            # Normal PD recomputes the last prompt token. A bootstrap request
+            # samples from the producer's final hidden state instead.
+            if (
+                num_computed_tokens == request.num_tokens
+                and not request.bootstrap_sample_pending
+            ):
                 num_computed_tokens -= 1
             # This will cache the blocks iff caching is enabled.
             self.kv_cache_manager.cache_blocks(request, num_computed_tokens)
@@ -210,6 +315,25 @@ class RecomputeScheduler(Scheduler):
             # Count the number of prefix cached tokens.
             if request.num_cached_tokens < 0:
                 request.num_cached_tokens = request.num_computed_tokens
+
+            if request.bootstrap_sample_pending:
+                group_block_ids = self.kv_cache_manager.get_block_ids(
+                    request.request_id
+                )
+                logger.info(
+                    "[BOOTSTRAP_ASYNC_LOAD_READY] req=%s prompt_tokens=%d "
+                    "computed_tokens=%d cached_tokens=%d compact=%s "
+                    "group_logical_blocks=%s group_resident_blocks=%s "
+                    "group_null_blocks=%s last_prompt_token_recompute=false",
+                    request.request_id,
+                    request.num_prompt_tokens,
+                    request.num_computed_tokens,
+                    request.num_cached_tokens,
+                    request.dsa_compact_allocated,
+                    [len(ids) for ids in group_block_ids],
+                    [sum(block_id > 0 for block_id in ids) for ids in group_block_ids],
+                    [sum(block_id == 0 for block_id in ids) for ids in group_block_ids],
+                )
 
         self.finished_recving_kv_req_ids.remove(request.request_id)
 
@@ -239,6 +363,15 @@ class RecomputeScheduler(Scheduler):
         encoder_compute_budget = self.max_num_encoder_input_tokens
         # Spec decode-related.
         scheduled_spec_decode_tokens: dict[str, list[int]] = {}
+        bootstrap_sample_req_ids: set[str] = set()
+        bootstrap_only_step = self._bootstrap_sample_ready
+        if bootstrap_only_step:
+            self._bootstrap_sample_ready = False
+            logger.info(
+                "[BOOTSTRAP_ONLY_STEP_BEGIN] running_paused=%d waiting=%d",
+                len(self.running),
+                len(self.waiting) + len(self.skipped_waiting),
+            )
 
         # For logging.
         scheduled_timestamp = time.monotonic()
@@ -251,7 +384,11 @@ class RecomputeScheduler(Scheduler):
 
         # First, schedule the RUNNING requests.
         req_index = 0
-        while req_index < len(self.running) and token_budget > 0:
+        while (
+            not bootstrap_only_step
+            and req_index < len(self.running)
+            and token_budget > 0
+        ):
             request = self.running[req_index]
 
             if (
@@ -445,6 +582,17 @@ class RecomputeScheduler(Scheduler):
                 request = request_queue.peek_request()
                 request_id = request.request_id
 
+                if bootstrap_only_step and not request.bootstrap_sample_pending:
+                    request_queue.pop_request()
+                    step_skipped_waiting.prepend_request(request)
+                    continue
+
+                # A bootstrap step may contain only one request. This keeps
+                # transfer failure, sampler state, and async placeholders
+                # strictly request-local.
+                if bootstrap_sample_req_ids:
+                    break
+
                 # try to promote blocked statuses while traversing skipped queue.
                 if self._is_blocked_waiting_status(request.status) and not self._try_promote_blocked_waiting_request(
                     request
@@ -514,6 +662,58 @@ class RecomputeScheduler(Scheduler):
                     num_new_local_computed_tokens = 0
                     num_computed_tokens = request.num_computed_tokens
 
+                bootstrap_full_hit = (
+                    request.bootstrap_sample_pending
+                    and num_computed_tokens == request.num_prompt_tokens
+                    and request.num_tokens == request.num_prompt_tokens
+                )
+                if request.bootstrap_sample_pending:
+                    logger.info(
+                        "[BOOTSTRAP_LOOKUP_RESULT] req=%s prompt_tokens=%d "
+                        "request_tokens=%d local_tokens=%d external_tokens=%d "
+                        "computed_tokens=%d full_hit=%s bootstrap_only_step=%s "
+                        "async_load=%s",
+                        request_id,
+                        request.num_prompt_tokens,
+                        request.num_tokens,
+                        num_new_local_computed_tokens,
+                        num_external_computed_tokens,
+                        num_computed_tokens,
+                        bootstrap_full_hit,
+                        bootstrap_only_step,
+                        load_kv_async,
+                    )
+                if request.bootstrap_sample_pending and not bootstrap_full_hit:
+                    logger.warning(
+                        "[BOOTSTRAP_LOOKUP_FALLBACK] req=%s reason=not_full_hit "
+                        "computed_tokens=%d prompt_tokens=%d local_tokens=%d "
+                        "external_tokens=%d action=normal_prefill",
+                        request_id,
+                        num_computed_tokens,
+                        request.num_prompt_tokens,
+                        num_new_local_computed_tokens,
+                        num_external_computed_tokens,
+                    )
+                    request.bootstrap_sample_pending = False
+                    request.bootstrap_final_hidden = None
+
+                if bootstrap_only_step and not bootstrap_full_hit:
+                    request_queue.pop_request()
+                    step_skipped_waiting.prepend_request(request)
+                    continue
+
+                if bootstrap_full_hit and num_scheduled_tokens:
+                    self._bootstrap_sample_ready = True
+                    logger.info(
+                        "[BOOTSTRAP_SCHED_DEFER] req=%s reason=normal_batch_active "
+                        "scheduled_normal=%s next_step=bootstrap_only",
+                        request_id,
+                        list(num_scheduled_tokens),
+                    )
+                    request_queue.pop_request()
+                    step_skipped_waiting.prepend_request(request)
+                    continue
+
                 encoder_inputs_to_schedule = None
                 external_load_encoder_input = []
                 new_encoder_compute_budget = encoder_compute_budget
@@ -522,6 +722,10 @@ class RecomputeScheduler(Scheduler):
                     # KVTransfer: loading remote KV, do not allocate for new work.
                     assert num_external_computed_tokens > 0
                     num_new_tokens = 0
+                elif bootstrap_full_hit:
+                    # Logical first-token work. The transferred hidden state is
+                    # authoritative, so this must not advance prompt accounting.
+                    num_new_tokens = 1
                 else:
                     # Number of tokens to be scheduled.
                     # We use `request.num_tokens` instead of
@@ -585,6 +789,23 @@ class RecomputeScheduler(Scheduler):
                 if self.is_encoder_decoder and request.has_encoder_inputs and encoder_inputs_to_schedule:
                     num_encoder_tokens = sum(request.get_num_encoder_embeds(i) for i in encoder_inputs_to_schedule)
 
+                compact_external_load = bootstrap_full_hit and (
+                    request.dsa_compact_allocated
+                    or (
+                        num_external_computed_tokens > 0
+                        and num_new_local_computed_tokens == 0
+                    )
+                )
+                if bootstrap_full_hit:
+                    logger.info(
+                        "[BOOTSTRAP_ALLOCATE_BEGIN] req=%s new_tokens=%d "
+                        "external_tokens=%d lookahead=%d compact=%s",
+                        request_id,
+                        num_new_tokens,
+                        num_external_computed_tokens,
+                        effective_lookahead_tokens,
+                        compact_external_load,
+                    )
                 new_blocks = self.kv_cache_manager.allocate_slots(
                     request,
                     num_new_tokens,
@@ -594,10 +815,19 @@ class RecomputeScheduler(Scheduler):
                     num_external_computed_tokens=num_external_computed_tokens,
                     delay_cache_blocks=load_kv_async,
                     num_encoder_tokens=num_encoder_tokens,
+                    dsa_compact_external_load=compact_external_load,
                 )
 
                 if new_blocks is None:
                     # The request cannot be scheduled.
+
+                    if bootstrap_full_hit:
+                        logger.warning(
+                            "[BOOTSTRAP_ALLOCATE_BLOCKED] req=%s compact=%s "
+                            "action=wait_for_free_blocks",
+                            request_id,
+                            compact_external_load,
+                        )
 
                     # NOTE: we need to untouch the request from the encode cache
                     # manager
@@ -646,7 +876,12 @@ class RecomputeScheduler(Scheduler):
 
                 # For spec_token_ids, the waiting queue has the same processing
                 # as the running queue.
-                if self.is_mtp_kv_consumer and request.spec_token_ids:
+                if bootstrap_full_hit:
+                    # The transferred final hidden state produces the target
+                    # token for this step. MTP is proposed after sampling; an
+                    # admission placeholder must not be consumed as input.
+                    request.spec_token_ids = []
+                elif self.is_mtp_kv_consumer and request.spec_token_ids:
                     num_scheduled_spec_tokens = (
                         num_new_tokens
                         + request.num_computed_tokens
@@ -677,6 +912,33 @@ class RecomputeScheduler(Scheduler):
                     scheduled_loras.add(request.lora_request.lora_int_id)
                 req_to_new_blocks[request_id] = self.kv_cache_manager.get_blocks(request_id)
                 num_scheduled_tokens[request_id] = num_new_tokens
+                if bootstrap_full_hit:
+                    bootstrap_sample_req_ids.add(request_id)
+                    group_block_ids = self.kv_cache_manager.get_block_ids(request_id)
+                    logger.info(
+                        "[BOOTSTRAP_SCHED_SELECTED] req=%s logical_tokens=%d "
+                        "computed_tokens=%d cached_tokens=%d compact=%s "
+                        "async_scheduling=%s group_logical_blocks=%s "
+                        "group_resident_blocks=%s group_null_blocks=%s "
+                        "group_heads=%s group_tails=%s",
+                        request_id,
+                        num_new_tokens,
+                        num_computed_tokens,
+                        request.num_cached_tokens,
+                        request.dsa_compact_allocated,
+                        self.scheduler_config.async_scheduling,
+                        [len(ids) for ids in group_block_ids],
+                        [
+                            sum(block_id > 0 for block_id in ids)
+                            for ids in group_block_ids
+                        ],
+                        [
+                            sum(block_id == 0 for block_id in ids)
+                            for ids in group_block_ids
+                        ],
+                        [ids[:4] for ids in group_block_ids],
+                        [ids[-4:] for ids in group_block_ids],
+                    )
                 token_budget -= num_new_tokens
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
@@ -757,6 +1019,41 @@ class RecomputeScheduler(Scheduler):
             (self.kv_cache_manager.take_new_block_ids() or None) if self.needs_kv_cache_zeroing else None
         )
 
+        capture_final_hidden_req_ids: set[str] = set()
+        capture_pending = getattr(self, "_capture_final_hidden_pending", None)
+        if capture_pending:
+            capture_pending.intersection_update(self.requests)
+        if capture_pending:
+            for req_id, num_tokens in num_scheduled_tokens.items():
+                if req_id not in capture_pending:
+                    continue
+                request = self.requests[req_id]
+                computed_before = request.num_computed_tokens
+                computed_after = computed_before + num_tokens
+                crosses_prompt_end = (
+                    computed_before < request.num_prompt_tokens <= computed_after
+                )
+                logger.info(
+                    "[FINAL_HIDDEN_SCHED_DECISION] req=%s computed_before=%d "
+                    "scheduled_tokens=%d computed_after=%d prompt_tokens=%d "
+                    "request_tokens=%d is_prefill_chunk=%s "
+                    "crosses_prompt_end=%s capture=%s",
+                    req_id,
+                    computed_before,
+                    num_tokens,
+                    computed_after,
+                    request.num_prompt_tokens,
+                    request.num_tokens,
+                    request.is_prefill_chunk,
+                    crosses_prompt_end,
+                    crosses_prompt_end,
+                )
+                if crosses_prompt_end:
+                    capture_final_hidden_req_ids.add(req_id)
+                    capture_pending.discard(req_id)
+            if not capture_pending:
+                del self._capture_final_hidden_pending
+
         scheduler_output = RecomputeSchedulerOutput(
             scheduled_new_reqs=new_reqs_data,
             scheduled_cached_reqs=cached_reqs_data,
@@ -774,6 +1071,13 @@ class RecomputeScheduler(Scheduler):
             free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
             new_block_ids_to_zero=new_block_ids_to_zero,
             recomputed_reqs=recomputed_reqs,
+            capture_final_hidden_req_ids=capture_final_hidden_req_ids,
+            bootstrap_sample_req_ids=bootstrap_sample_req_ids,
+            bootstrap_final_hiddens={
+                req_id: self.requests[req_id].bootstrap_final_hidden
+                for req_id in bootstrap_sample_req_ids
+                if self.requests[req_id].bootstrap_final_hidden is not None
+            },
         )
 
         # NOTE(Kuntai): this function is designed for multiple purposes:
@@ -791,6 +1095,32 @@ class RecomputeScheduler(Scheduler):
 
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
+        if bootstrap_sample_req_ids:
+            for req_id in bootstrap_sample_req_ids:
+                request = self.requests[req_id]
+                logger.info(
+                    "[BOOTSTRAP_ASYNC_STATE_RESERVED] req=%s "
+                    "computed_tokens=%d output_placeholders=%d "
+                    "spec_placeholders=%s status=%s",
+                    req_id,
+                    request.num_computed_tokens,
+                    request.num_output_placeholders,
+                    list(request.spec_token_ids),
+                    request.status.name,
+                )
+            if self.scheduler_config.async_scheduling:
+                if getattr(self, "_bootstrap_async_barrier_req_ids", None):
+                    raise RuntimeError(
+                        "A BOOTSTRAP_SAMPLE async barrier is already in flight"
+                    )
+                self._bootstrap_async_barrier_req_ids = frozenset(
+                    bootstrap_sample_req_ids
+                )
+                logger.info(
+                    "[BOOTSTRAP_ASYNC_BARRIER_ARMED] requests=%s "
+                    "action=drain_batch_queue_before_next_schedule",
+                    sorted(bootstrap_sample_req_ids),
+                )
         return scheduler_output
 
     def update_from_output(
@@ -806,6 +1136,64 @@ class RecomputeScheduler(Scheduler):
         num_nans_in_logits = model_runner_output.num_nans_in_logits
         kv_connector_output = model_runner_output.kv_connector_output
         cudagraph_stats = model_runner_output.cudagraph_stats
+
+        bootstrap_req_ids = scheduler_output.bootstrap_sample_req_ids
+        if bootstrap_req_ids and self.scheduler_config.async_scheduling:
+            barrier_req_ids = getattr(
+                self, "_bootstrap_async_barrier_req_ids", None
+            )
+            if barrier_req_ids != frozenset(bootstrap_req_ids):
+                logger.error(
+                    "[BOOTSTRAP_ASYNC_BARRIER_MISMATCH] scheduled=%s "
+                    "inflight=%s action=release_to_avoid_deadlock",
+                    sorted(bootstrap_req_ids),
+                    sorted(barrier_req_ids) if barrier_req_ids else [],
+                )
+            if hasattr(self, "_bootstrap_async_barrier_req_ids"):
+                del self._bootstrap_async_barrier_req_ids
+            logger.info(
+                "[BOOTSTRAP_ASYNC_BARRIER_RELEASED] requests=%s "
+                "invalid_blocks=%s sampled_rows=%d",
+                sorted(bootstrap_req_ids),
+                sorted(kv_connector_output.invalid_block_ids)
+                if kv_connector_output
+                else [],
+                len(sampled_token_ids),
+            )
+
+        if model_runner_output.final_hidden_states:
+            for req_id, payload in model_runner_output.final_hidden_states.items():
+                request = self.requests.get(req_id)
+                if request is None or not request.capture_final_hidden:
+                    continue
+                if request.final_hidden_prompt_fingerprint is None:
+                    logger.warning(
+                        "Cannot return final hidden state for request %s "
+                        "without prompt token ids.",
+                        req_id,
+                    )
+                    continue
+                envelope = dict(payload)
+                envelope.update(
+                    {
+                        "prompt_length": request.num_prompt_tokens,
+                        "prompt_sha256": request.final_hidden_prompt_fingerprint,
+                        "model_fingerprint": self.final_hidden_model_fingerprint,
+                    }
+                )
+                request.captured_final_hidden = envelope
+                logger.info(
+                    "[FINAL_HIDDEN_ENVELOPE_READY] req=%s prompt_tokens=%d "
+                    "dtype=%s shape=%s data_bytes_b64=%d checksum=%s "
+                    "model_fingerprint=%s",
+                    req_id,
+                    request.num_prompt_tokens,
+                    envelope.get("dtype"),
+                    envelope.get("shape"),
+                    len(envelope.get("data", "")),
+                    str(envelope.get("data_sha256", ""))[:16],
+                    self.final_hidden_model_fingerprint[:16],
+                )
 
         perf_stats: PerfStats | None = None
         if self.perf_metrics and self.perf_metrics.is_enabled():
@@ -827,6 +1215,34 @@ class RecomputeScheduler(Scheduler):
             # load. Identify affected requests and adjust their computed token
             # count to trigger recomputation of the invalid blocks.
             failed_kv_load_req_ids = self._handle_invalid_blocks(kv_connector_output.invalid_block_ids)
+
+        if bootstrap_req_ids:
+            for req_id in bootstrap_req_ids:
+                if failed_kv_load_req_ids and req_id in failed_kv_load_req_ids:
+                    continue
+                request = self.requests.get(req_id)
+                req_index = model_runner_output.req_id_to_index.get(req_id)
+                generated_token_ids = (
+                    sampled_token_ids[req_index]
+                    if request is not None
+                    and req_index is not None
+                    and sampled_token_ids
+                    else []
+                )
+                if generated_token_ids:
+                    logger.info(
+                        "[BOOTSTRAP_SCHED_COMPLETE] req=%s sampled_tokens=%s "
+                        "computed_tokens_before=%d output_placeholders_before=%d "
+                        "spec_placeholders_before=%s compact=%s",
+                        req_id,
+                        generated_token_ids,
+                        request.num_computed_tokens,
+                        request.num_output_placeholders,
+                        list(request.spec_token_ids),
+                        request.dsa_compact_allocated,
+                    )
+                    request.bootstrap_sample_pending = False
+                    request.bootstrap_final_hidden = None
 
         # return recomputed requests as EngineCoreOutput
         if scheduler_output.recomputed_reqs is not None:
@@ -965,6 +1381,25 @@ class RecomputeScheduler(Scheduler):
                 # Invariant: EngineCore returns no partial prefill outputs.
                 assert not prompt_logprobs_tensors
 
+        if bootstrap_req_ids:
+            for req_id in bootstrap_req_ids:
+                if failed_kv_load_req_ids and req_id in failed_kv_load_req_ids:
+                    continue
+                request = self.requests.get(req_id)
+                if request is None or request.is_finished():
+                    continue
+                logger.info(
+                    "[BOOTSTRAP_ASYNC_STATE_COMMITTED] req=%s "
+                    "computed_tokens=%d output_tokens=%d "
+                    "output_placeholders=%d spec_placeholders=%s status=%s",
+                    req_id,
+                    request.num_computed_tokens,
+                    len(request.output_token_ids),
+                    request.num_output_placeholders,
+                    list(request.spec_token_ids),
+                    request.status.name,
+                )
+
         # Remove the stopped requests from the running and waiting queues.
         if stopped_running_reqs:
             self.running = remove_all(self.running, stopped_running_reqs)
@@ -1033,6 +1468,96 @@ class RecomputeScheduler(Scheduler):
             eco.scheduler_stats = stats
 
         return engine_core_outputs
+
+    def _handle_invalid_blocks(self, invalid_block_ids: set[int]) -> set[str]:
+        bootstrap_async_load_req_ids = {
+            request.request_id
+            for request in self.skipped_waiting
+            if request.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+            and request.bootstrap_sample_pending
+        }
+        bootstrap_requests = {
+            request.request_id: request
+            for request in self.running
+            if request.bootstrap_sample_pending
+        }
+        for request in bootstrap_requests.values():
+            group_block_ids = self.kv_cache_manager.get_block_ids(
+                request.request_id
+            )
+            logger.warning(
+                "[BOOTSTRAP_LOAD_FAILURE_STATE_BEFORE] req=%s "
+                "invalid_blocks=%s computed_tokens=%d cached_tokens=%d "
+                "external_tokens=%d output_placeholders=%d "
+                "spec_placeholders=%s compact=%s status=%s "
+                "group_logical_blocks=%s group_resident_blocks=%s "
+                "group_null_blocks=%s",
+                request.request_id,
+                sorted(invalid_block_ids),
+                request.num_computed_tokens,
+                request.num_cached_tokens,
+                request.num_external_computed_tokens,
+                request.num_output_placeholders,
+                list(request.spec_token_ids),
+                request.dsa_compact_allocated,
+                request.status.name,
+                [len(ids) for ids in group_block_ids],
+                [sum(block_id > 0 for block_id in ids) for ids in group_block_ids],
+                [sum(block_id == 0 for block_id in ids) for ids in group_block_ids],
+            )
+        affected_req_ids = super()._handle_invalid_blocks(invalid_block_ids)
+        bootstrap_async_load_failed_req_ids = (
+            bootstrap_async_load_req_ids & self.failed_recving_kv_req_ids
+        )
+        if bootstrap_async_load_failed_req_ids:
+            tracked_failed_req_ids = getattr(
+                self, "_bootstrap_async_load_failed_req_ids", None
+            )
+            if tracked_failed_req_ids is None:
+                tracked_failed_req_ids = set()
+                self._bootstrap_async_load_failed_req_ids = tracked_failed_req_ids
+            tracked_failed_req_ids.update(bootstrap_async_load_failed_req_ids)
+            logger.warning(
+                "[BOOTSTRAP_ASYNC_LOAD_FAILURE_RECORDED] requests=%s "
+                "invalid_blocks=%s action=wait_for_transfer_completion_then_retry",
+                sorted(bootstrap_async_load_failed_req_ids),
+                sorted(invalid_block_ids),
+            )
+        for req_id in affected_req_ids & bootstrap_requests.keys():
+            request = self.requests.get(req_id)
+            if request is None:
+                continue
+            # AsyncScheduler reserved placeholders for the logical bootstrap
+            # token. No sampling occurred on load failure, so remove them
+            # before the dense-prefill retry.
+            request.num_output_placeholders = 0
+            request.spec_token_ids = []
+            if request in self.running:
+                self.running.remove(request)
+                request.status = RequestStatus.PREEMPTED
+                request.num_preemptions += 1
+                if self.log_stats:
+                    request.record_event(
+                        EngineCoreEventType.PREEMPTED, time.monotonic()
+                    )
+                self.waiting.prepend_request(request)
+            self.prev_step_scheduled_req_ids.discard(req_id)
+            logger.warning(
+                "[BOOTSTRAP_ASYNC_ROLLBACK] req=%s action=clear_placeholders "
+                "restart_computed_tokens=%d cached_tokens=%d "
+                "external_tokens=%d output_placeholders=%d "
+                "spec_placeholders=%s compact=%s status=%s "
+                "worker_block_table_action=replace_on_resume",
+                req_id,
+                request.num_computed_tokens,
+                request.num_cached_tokens,
+                request.num_external_computed_tokens,
+                request.num_output_placeholders,
+                list(request.spec_token_ids),
+                request.dsa_compact_allocated,
+                request.status.name,
+            )
+        return affected_req_ids
 
 
 class AsyncRecomputeScheduler(AsyncScheduler, RecomputeScheduler):
