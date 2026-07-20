@@ -339,6 +339,9 @@ def deserialize_final_hidden_state(payload: dict[str, Any]) -> torch.Tensor:
     decoder_engine_received_unix_ns = payload.get(
         "decoder_engine_received_unix_ns"
     )
+    decoder_worker_received_unix_ns = payload.get(
+        "decoder_worker_received_unix_ns"
+    )
     producer_to_worker_ms = (
         (worker_received_unix_ns - producer_ready_unix_ns) / 1e6
         if isinstance(producer_ready_unix_ns, int)
@@ -354,10 +357,16 @@ def deserialize_final_hidden_state(payload: dict[str, Any]) -> torch.Tensor:
         if isinstance(decoder_engine_received_unix_ns, int)
         else None
     )
+    worker_entry_to_deserialize_ms = (
+        (worker_received_unix_ns - decoder_worker_received_unix_ns) / 1e6
+        if isinstance(decoder_worker_received_unix_ns, int)
+        else None
+    )
     logger.info(
         "[FINAL_HIDDEN_DESERIALIZE] dtype=%s shape=%s raw_bytes=%d "
         "checksum=%s total_ms=%.3f producer_to_worker_ms=%s "
         "proxy_to_worker_ms=%s engine_to_worker_ms=%s "
+        "worker_entry_to_deserialize_ms=%s "
         "clock_sync_required=true",
         dtype_name,
         tuple(shape),
@@ -372,6 +381,9 @@ def deserialize_final_hidden_state(payload: dict[str, Any]) -> torch.Tensor:
         else "unknown",
         f"{engine_to_worker_ms:.3f}"
         if engine_to_worker_ms is not None
+        else "unknown",
+        f"{worker_entry_to_deserialize_ms:.3f}"
+        if worker_entry_to_deserialize_ms is not None
         else "unknown",
     )
     return hidden_state
@@ -1727,6 +1739,7 @@ class NPUModelRunner(GPUModelRunner):
         run_shadow_forward = self.dp_size > 1
         shadow_forward_inputs = None
         bootstrap_started = time.perf_counter()
+        shadow_or_kv_wait_host_ms = 0.0
         logger.info(
             "[BOOTSTRAP_EXECUTE_BEGIN] requests=%s batch_order=%s num_reqs=%d "
             "dp_size=%d tp_size=%d shadow_forward=%s speculative_method=%s "
@@ -1821,10 +1834,14 @@ class NPUModelRunner(GPUModelRunner):
                 num_reqs_padded,
                 shadow_forward_inputs is not None,
             )
+        inputs_prepare_ms = (time.perf_counter() - bootstrap_started) * 1000
         if self.speculative_config is not None:
             assert spec_decode_common_attn_metadata is not None
 
+        hidden_started = time.perf_counter()
         hidden_states = self._get_bootstrap_hidden_states(scheduler_output)
+        hidden_prepare_ms = (time.perf_counter() - hidden_started) * 1000
+        hidden_ready = time.perf_counter()
 
         dsa_offload_manager = getattr(self, "dsa_offload_manager", None)
         dsa_adapter_cache = getattr(self, "dsa_adapter_cache", None)
@@ -1840,6 +1857,7 @@ class NPUModelRunner(GPUModelRunner):
             defer_finalize=self.speculative_config is not None,
         )
         connector_enter_started = time.perf_counter()
+        pre_connector_ms = (connector_enter_started - hidden_ready) * 1000
         with (
             set_ascend_forward_context(
                 attn_metadata,
@@ -1899,15 +1917,33 @@ class NPUModelRunner(GPUModelRunner):
                     shadow_inputs_embeds,
                     **shadow_model_kwargs,
                 )
+                shadow_or_kv_wait_host_ms = (
+                    time.perf_counter() - shadow_started
+                ) * 1000
                 logger.info(
                     "[BOOTSTRAP_SHADOW_ENQUEUED] requests=%s output=discard "
                     "host_elapsed_ms=%.3f",
                     list(self.input_batch.req_ids),
-                    (time.perf_counter() - shadow_started) * 1000,
+                    shadow_or_kv_wait_host_ms,
                 )
             elif has_kv_transfer_group():
+                kv_wait_started = time.perf_counter()
                 self._wait_for_bootstrap_kv_load()
+                shadow_or_kv_wait_host_ms = (
+                    time.perf_counter() - kv_wait_started
+                ) * 1000
 
+        connector_context_ms = (
+            time.perf_counter() - connector_enter_started
+        ) * 1000
+        connector_exit_overhead_ms = max(
+            connector_context_ms
+            - connector_enter_ms
+            - shadow_or_kv_wait_host_ms,
+            0.0,
+        )
+
+        load_validation_started = time.perf_counter()
         ordered_bootstrap_req_ids = [
             req_id
             for req_id in self.input_batch.req_ids
@@ -1919,6 +1955,9 @@ class NPUModelRunner(GPUModelRunner):
         failed_req_ids = self._sync_tp_bootstrap_load_failed_req_ids(
             ordered_bootstrap_req_ids, local_failed_req_ids
         )
+        load_validation_ms = (
+            time.perf_counter() - load_validation_started
+        ) * 1000
         if failed_req_ids:
             # Let the scheduler discard this logical work item and restart a
             # dense prefill without advancing sampler RNG state. With MTP the
@@ -2009,13 +2048,14 @@ class NPUModelRunner(GPUModelRunner):
 
         logits_started = time.perf_counter()
         logits = self.model.compute_logits(hidden_states)
+        logits_host_ms = (time.perf_counter() - logits_started) * 1000
         logger.info(
             "[BOOTSTRAP_LOGITS_ENQUEUED] requests=%s hidden_shape=%s "
             "logits_shape=%s host_elapsed_ms=%.3f",
             ordered_bootstrap_req_ids,
             tuple(hidden_states.shape),
             tuple(logits.shape),
-            (time.perf_counter() - logits_started) * 1000,
+            logits_host_ms,
         )
         self.execute_model_state = ExecuteModelState(
             scheduler_output,
@@ -2032,11 +2072,41 @@ class NPUModelRunner(GPUModelRunner):
             batch_desc,
         )
         self.kv_connector_output = kv_connector_output
+        execute_total_ms = (time.perf_counter() - bootstrap_started) * 1000
+        post_load_setup_ms = max(
+            execute_total_ms
+            - inputs_prepare_ms
+            - hidden_prepare_ms
+            - pre_connector_ms
+            - connector_context_ms
+            - load_validation_ms
+            - logits_host_ms,
+            0.0,
+        )
+        logger.info(
+            "[BOOTSTRAP_EXECUTE_PHASES] requests=%s total_ms=%.3f "
+            "inputs_prepare_ms=%.3f hidden_prepare_ms=%.3f "
+            "pre_connector_ms=%.3f connector_enter_ms=%.3f "
+            "shadow_or_kv_wait_host_ms=%.3f "
+            "connector_exit_overhead_ms=%.3f load_validation_ms=%.3f "
+            "post_load_setup_ms=%.3f logits_host_ms=%.3f",
+            ordered_bootstrap_req_ids,
+            execute_total_ms,
+            inputs_prepare_ms,
+            hidden_prepare_ms,
+            pre_connector_ms,
+            connector_enter_ms,
+            shadow_or_kv_wait_host_ms,
+            connector_exit_overhead_ms,
+            load_validation_ms,
+            post_load_setup_ms,
+            logits_host_ms,
+        )
         logger.info(
             "[BOOTSTRAP_EXECUTE_READY_TO_SAMPLE] requests=%s elapsed_ms=%.3f "
             "draft_proposal=enabled",
             ordered_bootstrap_req_ids,
-            (time.perf_counter() - bootstrap_started) * 1000,
+            execute_total_ms,
         )
 
     @torch.inference_mode()
@@ -2045,6 +2115,46 @@ class NPUModelRunner(GPUModelRunner):
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: IntermediateTensors | None = None,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
+        if scheduler_output.bootstrap_sample_req_ids:
+            worker_received_unix_ns = time.time_ns()
+            payloads = scheduler_output.bootstrap_final_hiddens or {}
+            phase_timings_ms = {}
+            for req_id in sorted(scheduler_output.bootstrap_sample_req_ids):
+                payload = payloads.get(req_id)
+                if payload is None:
+                    continue
+                engine_received_unix_ns = payload.get(
+                    "decoder_engine_received_unix_ns"
+                )
+                selected_unix_ns = payload.get(
+                    "decoder_scheduler_selected_unix_ns"
+                )
+                dispatched_unix_ns = payload.get(
+                    "decoder_executor_dispatched_unix_ns"
+                )
+                payload["decoder_worker_received_unix_ns"] = worker_received_unix_ns
+                phase_timings_ms[req_id] = {
+                    "engine_to_worker": (
+                        f"{(worker_received_unix_ns - engine_received_unix_ns) / 1e6:.3f}"
+                        if isinstance(engine_received_unix_ns, int)
+                        else "unknown"
+                    ),
+                    "selected_to_worker": (
+                        f"{(worker_received_unix_ns - selected_unix_ns) / 1e6:.3f}"
+                        if isinstance(selected_unix_ns, int)
+                        else "unknown"
+                    ),
+                    "dispatch_to_worker": (
+                        f"{(worker_received_unix_ns - dispatched_unix_ns) / 1e6:.3f}"
+                        if isinstance(dispatched_unix_ns, int)
+                        else "unknown"
+                    ),
+                }
+            logger.info(
+                "[BOOTSTRAP_WORKER_RECEIVED] requests=%s phase_timings_ms=%s",
+                sorted(scheduler_output.bootstrap_sample_req_ids),
+                phase_timings_ms,
+            )
         if self.vllm_config.model_config.enable_return_routed_experts:
             capturer = RoutedExpertsCapturer.get_instance()
             if capturer is not None:
@@ -2525,7 +2635,19 @@ class NPUModelRunner(GPUModelRunner):
         # Clear ephemeral state.
         self.execute_model_state = None
 
+        is_bootstrap_step = bool(scheduler_output.bootstrap_sample_req_ids)
+        sample_api_started = (
+            time.perf_counter() if is_bootstrap_step else 0.0
+        )
+        if is_bootstrap_step:
+            logger.info(
+                "[BOOTSTRAP_SAMPLE_BEGIN] requests=%s logits_shape=%s",
+                sorted(scheduler_output.bootstrap_sample_req_ids),
+                tuple(logits.shape),
+            )
+
         # Apply structured output bitmasks if present.
+        grammar_started = time.perf_counter()
         if grammar_output is not None:
             # here we are different from gpu_model_runner,
             # the apply_grammar_bitmask uses torch.compile to optimize this,ascend does not support it now
@@ -2533,9 +2655,12 @@ class NPUModelRunner(GPUModelRunner):
             logits = logits.to("cpu").float()
             apply_grammar_bitmask(scheduler_output, grammar_output, self.input_batch, logits)
             logits = logits.to(self.device).to(logits_dtype)
+        grammar_ms = (time.perf_counter() - grammar_started) * 1000
 
+        sampler_started = time.perf_counter()
         with record_function_or_nullcontext("sample_token"):
             sampler_output = self._sample(logits, spec_decode_metadata)
+        sampler_ms = (time.perf_counter() - sampler_started) * 1000
 
         if self.need_accepted_tokens:
             if self.sampling_done_event is None:
@@ -2543,14 +2668,6 @@ class NPUModelRunner(GPUModelRunner):
 
             assert self.sampling_done_event is not None
             self.sampling_done_event.record()
-
-        is_bootstrap_step = bool(scheduler_output.bootstrap_sample_req_ids)
-        if is_bootstrap_step:
-            logger.info(
-                "[BOOTSTRAP_SAMPLE_BEGIN] requests=%s logits_shape=%s",
-                sorted(scheduler_output.bootstrap_sample_req_ids),
-                tuple(logits.shape),
-            )
 
         if is_bootstrap_step:
             # The paused normal batch may have left a draft tensor with a
@@ -2576,6 +2693,7 @@ class NPUModelRunner(GPUModelRunner):
             )
             self._copy_draft_token_ids_to_cpu(scheduler_output)
 
+        bookkeeping_started = time.perf_counter()
         (
             logprobs_lists,
             valid_sampled_token_ids,
@@ -2591,7 +2709,10 @@ class NPUModelRunner(GPUModelRunner):
             scheduler_output.total_num_scheduled_tokens,
             spec_decode_metadata,
         )
+        bookkeeping_ms = (time.perf_counter() - bookkeeping_started) * 1000
 
+        draft_host_ms = 0.0
+        connector_finalize_ms = 0.0
         with record_function_or_nullcontext("draft_token"):
             if self.speculative_config:
                 draft_started = (
@@ -2628,6 +2749,9 @@ class NPUModelRunner(GPUModelRunner):
                     # tokens on the CPU, so they are run after bookkeeping.
                     propose_draft_token_ids(valid_sampled_token_ids)
                 if is_bootstrap_step:
+                    draft_host_ms = (
+                        time.perf_counter() - draft_started
+                    ) * 1000
                     logger.info(
                         "[BOOTSTRAP_MTP_DONE] requests=%s draft_shape=%s "
                         "draft_dtype=%s draft_device=%s host_elapsed_ms=%.3f",
@@ -2637,9 +2761,10 @@ class NPUModelRunner(GPUModelRunner):
                         else None,
                         getattr(self._draft_token_ids, "dtype", None),
                         getattr(self._draft_token_ids, "device", None),
-                        (time.perf_counter() - draft_started) * 1000,
+                        draft_host_ms,
                     )
 
+            connector_finalize_started = time.perf_counter()
             if has_kv_transfer_group():
                 if self.speculative_config:
                     completed_decode_window_saves = self.finalize_kv_connector()
@@ -2657,6 +2782,9 @@ class NPUModelRunner(GPUModelRunner):
                             )
                 else:
                     get_kv_transfer_group().clear_connector_metadata()
+            connector_finalize_ms = (
+                time.perf_counter() - connector_finalize_started
+            ) * 1000
 
         if self.model_config.enable_return_routed_experts:
             capturer = RoutedExpertsCapturer.get_instance()
@@ -2665,6 +2793,7 @@ class NPUModelRunner(GPUModelRunner):
             else:
                 logger.warning("RoutedExpertsCapturer is not initialized.")
 
+        output_build_started = time.perf_counter()
         model_runner_output = ModelRunnerOutput(
             req_ids=req_ids_output_copy,
             req_id_to_index=req_id_to_index_output_copy,
@@ -2682,12 +2811,50 @@ class NPUModelRunner(GPUModelRunner):
                 "final_hidden_states",
                 final_hidden_states,
             )
+        output_build_ms = (time.perf_counter() - output_build_started) * 1000
+        output_built = time.perf_counter()
         if is_bootstrap_step:
+            sample_done_unix_ns = time.time_ns()
+            payloads = scheduler_output.bootstrap_final_hiddens or {}
+            phase_timings_ms = {}
+            for req_id in sorted(scheduler_output.bootstrap_sample_req_ids):
+                payload = payloads.get(req_id)
+                if payload is None:
+                    continue
+                selected_unix_ns = payload.get(
+                    "decoder_scheduler_selected_unix_ns"
+                )
+                dispatched_unix_ns = payload.get(
+                    "decoder_executor_dispatched_unix_ns"
+                )
+                worker_received_unix_ns = payload.get(
+                    "decoder_worker_received_unix_ns"
+                )
+                phase_timings_ms[req_id] = {
+                    "selected_to_sample_done": (
+                        f"{(sample_done_unix_ns - selected_unix_ns) / 1e6:.3f}"
+                        if isinstance(selected_unix_ns, int)
+                        else "unknown"
+                    ),
+                    "dispatch_to_sample_done": (
+                        f"{(sample_done_unix_ns - dispatched_unix_ns) / 1e6:.3f}"
+                        if isinstance(dispatched_unix_ns, int)
+                        else "unknown"
+                    ),
+                    "worker_to_sample_done": (
+                        f"{(sample_done_unix_ns - worker_received_unix_ns) / 1e6:.3f}"
+                        if isinstance(worker_received_unix_ns, int)
+                        else "unknown"
+                    ),
+                }
             logger.info(
                 "[BOOTSTRAP_SAMPLE_DONE] requests=%s sampled_host_tokens=%s "
                 "sampled_tensor_shape=%s sampled_tensor_device=%s "
                 "async_host_copy_deferred=%s draft_present=%s "
-                "draft_req_ids=%s connector_output=%s",
+                "draft_req_ids=%s connector_output=%s phase_timings_ms=%s "
+                "sample_api_ms=%.3f grammar_ms=%.3f sampler_ms=%.3f "
+                "bookkeeping_ms=%.3f draft_host_ms=%.3f "
+                "connector_finalize_ms=%.3f output_build_ms=%.3f",
                 sorted(scheduler_output.bootstrap_sample_req_ids),
                 valid_sampled_token_ids,
                 tuple(sampler_output.sampled_token_ids.shape),
@@ -2696,6 +2863,14 @@ class NPUModelRunner(GPUModelRunner):
                 self._draft_token_ids is not None,
                 list(getattr(self, "_draft_token_req_ids", None) or []),
                 kv_connector_output is not None,
+                phase_timings_ms,
+                (time.perf_counter() - sample_api_started) * 1000,
+                grammar_ms,
+                sampler_ms,
+                bookkeeping_ms,
+                draft_host_ms,
+                connector_finalize_ms,
+                output_build_ms,
             )
 
         if self.dynamic_eplb:
@@ -2724,14 +2899,26 @@ class NPUModelRunner(GPUModelRunner):
                 self._pp_broadcast_prev_sampled_token_ids(sampler_output.sampled_token_ids)
 
         if not self.use_async_scheduling:
+            if is_bootstrap_step:
+                logger.info(
+                    "[BOOTSTRAP_SAMPLE_RETURN] requests=%s "
+                    "sample_api_ms=%.3f post_output_build_ms=%.3f "
+                    "async_output=false",
+                    sorted(scheduler_output.bootstrap_sample_req_ids),
+                    (time.perf_counter() - sample_api_started) * 1000,
+                    (time.perf_counter() - output_built) * 1000,
+                )
             return model_runner_output
         if is_bootstrap_step:
             logger.info(
                 "[BOOTSTRAP_ASYNC_OUTPUT_WRAPPED] requests=%s "
-                "invalid_req_indices=%s output_copy_stream=%s",
+                "invalid_req_indices=%s output_copy_stream=%s "
+                "sample_api_ms=%.3f post_output_build_ms=%.3f",
                 sorted(scheduler_output.bootstrap_sample_req_ids),
                 invalid_req_indices,
                 self.async_output_copy_stream is not None,
+                (time.perf_counter() - sample_api_started) * 1000,
+                (time.perf_counter() - output_built) * 1000,
             )
         return AsyncGPUModelRunnerOutput(
             model_runner_output=model_runner_output,
