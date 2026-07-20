@@ -389,6 +389,8 @@ class RecomputeScheduler(Scheduler):
         # chunked prefills, prefix caching, speculative decoding,
         # and the "jump decoding" optimization in the future.
 
+        schedule_started = time.perf_counter()
+        bootstrap_selected_perf: float | None = None
         scheduled_new_reqs: list[Request] = []
         scheduled_resumed_reqs: list[Request] = []
         scheduled_running_reqs: list[Request] = []
@@ -668,6 +670,7 @@ class RecomputeScheduler(Scheduler):
                 connector_prefix_cache_queries, connector_prefix_cache_hits = 0, 0
 
                 # Get already-cached tokens.
+                lookup_started = time.perf_counter()
                 if request.num_computed_tokens == 0:
                     # Get locally-cached tokens.
                     new_computed_blocks, num_new_local_computed_tokens = self.kv_cache_manager.get_computed_blocks(
@@ -742,7 +745,7 @@ class RecomputeScheduler(Scheduler):
                         "[BOOTSTRAP_LOOKUP_RESULT] req=%s prompt_tokens=%d "
                         "request_tokens=%d local_tokens=%d external_tokens=%d "
                         "computed_tokens=%d full_hit=%s bootstrap_only_step=%s "
-                        "async_load=%s",
+                        "async_load=%s lookup_ms=%.3f",
                         request_id,
                         request.num_prompt_tokens,
                         request.num_tokens,
@@ -752,6 +755,7 @@ class RecomputeScheduler(Scheduler):
                         bootstrap_full_hit,
                         bootstrap_only_step,
                         load_kv_async,
+                        (time.perf_counter() - lookup_started) * 1000,
                     )
                 if request.bootstrap_sample_pending and not bootstrap_full_hit:
                     logger.warning(
@@ -879,6 +883,7 @@ class RecomputeScheduler(Scheduler):
                         effective_lookahead_tokens,
                         compact_external_load,
                     )
+                allocate_started = time.perf_counter()
                 new_blocks = self.kv_cache_manager.allocate_slots(
                     request,
                     num_new_tokens,
@@ -890,6 +895,14 @@ class RecomputeScheduler(Scheduler):
                     num_encoder_tokens=num_encoder_tokens,
                     dsa_compact_external_load=compact_external_load,
                 )
+                if bootstrap_full_hit:
+                    logger.info(
+                        "[BOOTSTRAP_ALLOCATE_DONE] req=%s success=%s "
+                        "allocation_ms=%.3f",
+                        request_id,
+                        new_blocks is not None,
+                        (time.perf_counter() - allocate_started) * 1000,
+                    )
 
                 if new_blocks is None:
                     # The request cannot be scheduled.
@@ -913,11 +926,19 @@ class RecomputeScheduler(Scheduler):
                 # This information is used to determine if a load is
                 # needed for this request.
                 if self.connector is not None:
+                    connector_alloc_started = time.perf_counter()
                     self.connector.update_state_after_alloc(
                         request,
                         self.kv_cache_manager.get_blocks(request_id),
                         num_external_computed_tokens,
                     )
+                    if bootstrap_full_hit:
+                        logger.info(
+                            "[BOOTSTRAP_CONNECTOR_ALLOC_UPDATED] req=%s "
+                            "elapsed_ms=%.3f",
+                            request_id,
+                            (time.perf_counter() - connector_alloc_started) * 1000,
+                        )
                     if self.connector_prefix_cache_stats is not None and connector_prefix_cache_queries != 0:
                         self.connector_prefix_cache_stats.record(
                             num_tokens=connector_prefix_cache_queries,
@@ -990,12 +1011,40 @@ class RecomputeScheduler(Scheduler):
                         bootstrap_sample_req_ids = set()
                     bootstrap_sample_req_ids.add(request_id)
                     group_block_ids = self.kv_cache_manager.get_block_ids(request_id)
+                    bootstrap_selected_perf = time.perf_counter()
+                    selected_unix_ns = time.time_ns()
+                    payload = request.bootstrap_final_hidden
+                    engine_received_unix_ns = (
+                        payload.get("decoder_engine_received_unix_ns")
+                        if payload is not None
+                        else None
+                    )
+                    dequeued_unix_ns = (
+                        payload.get("decoder_input_dequeued_unix_ns")
+                        if payload is not None
+                        else None
+                    )
+                    if payload is not None:
+                        payload["decoder_scheduler_selected_unix_ns"] = (
+                            selected_unix_ns
+                        )
+                    engine_to_selected_ms = (
+                        (selected_unix_ns - engine_received_unix_ns) / 1e6
+                        if isinstance(engine_received_unix_ns, int)
+                        else None
+                    )
+                    dequeue_to_selected_ms = (
+                        (selected_unix_ns - dequeued_unix_ns) / 1e6
+                        if isinstance(dequeued_unix_ns, int)
+                        else None
+                    )
                     logger.info(
                         "[BOOTSTRAP_SCHED_SELECTED] req=%s logical_tokens=%d "
                         "computed_tokens=%d cached_tokens=%d compact=%s "
                         "async_scheduling=%s group_logical_blocks=%s "
                         "group_resident_blocks=%s group_null_blocks=%s "
-                        "group_heads=%s group_tails=%s",
+                        "group_heads=%s group_tails=%s "
+                        "engine_to_selected_ms=%s dequeue_to_selected_ms=%s",
                         request_id,
                         num_new_tokens,
                         num_computed_tokens,
@@ -1013,6 +1062,12 @@ class RecomputeScheduler(Scheduler):
                         ],
                         [ids[:4] for ids in group_block_ids],
                         [ids[-4:] for ids in group_block_ids],
+                        f"{engine_to_selected_ms:.3f}"
+                        if engine_to_selected_ms is not None
+                        else "unknown",
+                        f"{dequeue_to_selected_ms:.3f}"
+                        if dequeue_to_selected_ms is not None
+                        else "unknown",
                     )
                 token_budget -= num_new_tokens
                 request.status = RequestStatus.RUNNING
@@ -1089,6 +1144,10 @@ class RecomputeScheduler(Scheduler):
         # this step, the total number of scheduled requests can be smaller than
         # len(self.running).
         assert len(scheduled_new_reqs) + len(scheduled_resumed_reqs) + len(scheduled_running_reqs) <= len(self.running)
+
+        output_build_started = (
+            time.perf_counter() if bootstrap_sample_req_ids else None
+        )
 
         # Get the longest common prefix among all requests in the running queue.
         # This can be potentially used for cascade attention.
@@ -1207,10 +1266,17 @@ class RecomputeScheduler(Scheduler):
                 },
             )
 
+        output_build_ms = (
+            (time.perf_counter() - output_build_started) * 1000
+            if output_build_started is not None
+            else 0.0
+        )
+
         # NOTE(Kuntai): this function is designed for multiple purposes:
         # 1. Plan the KV cache store
         # 2. Wrap up all the KV cache load / save ops into an opaque object
         # 3. Clear the internal states of the connector
+        connector_meta_started = time.perf_counter()
         if self.connector is not None:
             meta: KVConnectorMetadata = self.connector.build_connector_meta(scheduler_output)
             scheduler_output.kv_connector_metadata = meta
@@ -1219,9 +1285,12 @@ class RecomputeScheduler(Scheduler):
         if self.ec_connector is not None:
             ec_meta: ECConnectorMetadata = self.ec_connector.build_connector_meta(scheduler_output)
             scheduler_output.ec_connector_metadata = ec_meta
+        connector_meta_ms = (time.perf_counter() - connector_meta_started) * 1000
 
+        update_started = time.perf_counter()
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
+        update_ms = (time.perf_counter() - update_started) * 1000
         if bootstrap_sample_req_ids:
             for req_id in bootstrap_sample_req_ids:
                 request = self.requests[req_id]
@@ -1248,6 +1317,19 @@ class RecomputeScheduler(Scheduler):
                     "action=drain_batch_queue_before_next_schedule",
                     sorted(bootstrap_sample_req_ids),
                 )
+            logger.info(
+                "[BOOTSTRAP_SCHED_PHASES] requests=%s schedule_total_ms=%.3f "
+                "selected_to_output_ready_ms=%s output_build_ms=%.3f "
+                "connector_meta_ms=%.3f update_after_schedule_ms=%.3f",
+                sorted(bootstrap_sample_req_ids),
+                (time.perf_counter() - schedule_started) * 1000,
+                f"{(time.perf_counter() - bootstrap_selected_perf) * 1000:.3f}"
+                if bootstrap_selected_perf is not None
+                else "unknown",
+                output_build_ms,
+                connector_meta_ms,
+                update_ms,
+            )
         return scheduler_output
 
     def update_from_output(
