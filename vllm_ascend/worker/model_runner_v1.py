@@ -528,7 +528,7 @@ class NPUModelRunner(GPUModelRunner):
                     assert isinstance(self.drafter, AscendEagleProposer)
                     self.use_aux_hidden_state_outputs = self.drafter.eagle3_use_aux_hidden_state
                 self.rejection_sampler = RejectionSampler(self.sampler)
-        self.discard_request_indices = self._make_buffer(self.max_num_reqs, dtype=torch.int64)
+        self.discard_request_mask = self._make_buffer(self.max_num_reqs, dtype=torch.bool)
         self.num_discarded_requests = 0
 
     def _get_drafter(self):
@@ -878,10 +878,10 @@ class NPUModelRunner(GPUModelRunner):
         else:
             discard_requests_mask = self.seq_lens.np[:num_reqs] < num_tokens_np
 
-        discard_request_indices = np.nonzero(discard_requests_mask)[0]
-        self.num_discarded_requests = len(discard_request_indices)
-        self.discard_request_indices.np[: self.num_discarded_requests] = discard_request_indices
-        self.discard_request_indices.copy_to_gpu(self.num_discarded_requests)
+        self.discard_request_mask.np[:num_reqs] = discard_requests_mask
+        self.num_discarded_requests = int(discard_requests_mask.sum())
+        if self.num_discarded_requests:
+            self.discard_request_mask.copy_to_gpu(num_reqs)
         use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
         if not use_spec_decode:
             # NOTE(woosuk): Due to chunked prefills, the batch may contain
@@ -1110,7 +1110,7 @@ class NPUModelRunner(GPUModelRunner):
                     sampled_token_ids,
                     self.requests,
                     self.input_batch,
-                    self.discard_request_indices.gpu,
+                    self.discard_request_mask.gpu,
                     self.num_discarded_requests,
                 )
                 self._copy_valid_sampled_token_count(next_token_ids, valid_sampled_tokens_count)
@@ -1851,7 +1851,9 @@ class NPUModelRunner(GPUModelRunner):
         list[int],
     ]:
         # TODO: implement PR 28597 from vllm
-        discard_sampled_tokens_req_indices = self.discard_request_indices.np[: self.num_discarded_requests]
+        discard_sampled_tokens_req_indices = np.nonzero(
+            self.discard_request_mask.np[: self.input_batch.num_reqs]
+        )[0]
         for i in discard_sampled_tokens_req_indices:
             gen = self.input_batch.generators.get(int(i))
             if gen is not None:

@@ -1,9 +1,11 @@
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import numpy as np
 import torch
 from vllm.config import CacheConfig, CompilationMode, CUDAGraphMode, VllmConfig, set_current_vllm_config
+from vllm.v1.spec_decode.eagle import EagleProposer
 
 from tests.ut.base import TestBase
 from vllm_ascend.ascend_config import init_ascend_config
@@ -504,3 +506,67 @@ class TestEagleProposerHelperMethods(TestBase):
         ):
             return_attn, indices = self.proposer.prepare_inputs(mock_attn, num_rejected)
             self.assertEqual(indices.tolist(), [1, 2, 4])
+
+    def test_fixed_mtp1_next_tokens_skip_backup_preparation(self):
+        self.proposer.method = "mtp"
+        self.proposer.num_speculative_tokens = 1
+        sampled = torch.tensor([[11, 12], [21, -1], [31, 32]], dtype=torch.int32)
+        metadata = SimpleNamespace(max_query_len=2, num_actual_tokens=6)
+        input_batch = SimpleNamespace(num_reqs=3, vocab_size=100)
+        launcher = MagicMock()
+
+        def run_kernel(*args, **kwargs):
+            args[3].copy_(torch.tensor([12, 21, 32], dtype=torch.int32))
+            args[4].copy_(torch.tensor([2, 1, 2], dtype=torch.int32))
+
+        launcher.side_effect = run_kernel
+        kernel = MagicMock()
+        kernel.__getitem__.return_value = launcher
+        with (
+            patch(
+                "vllm_ascend.spec_decode.eagle_proposer."
+                "eagle_prepare_next_token_padded_kernel",
+                kernel,
+            ),
+            patch.object(
+                EagleProposer,
+                "prepare_next_token_ids_padded",
+            ) as generic,
+        ):
+            next_tokens, valid_counts = self.proposer.prepare_next_token_ids_padded(
+                metadata,
+                sampled,
+                {},
+                input_batch,
+                torch.zeros(3, dtype=torch.bool),
+                0,
+            )
+
+        self.assertEqual(next_tokens.tolist(), [12, 21, 32])
+        self.assertEqual(valid_counts.tolist(), [2, 1, 2])
+        generic.assert_not_called()
+
+    def test_non_fixed_mtp1_next_tokens_use_vllm_path(self):
+        self.proposer.method = "mtp"
+        self.proposer.num_speculative_tokens = 1
+        sampled = torch.tensor([[11, 12], [21, -1]], dtype=torch.int32)
+        metadata = SimpleNamespace(max_query_len=3, num_actual_tokens=4)
+        input_batch = SimpleNamespace(num_reqs=2, vocab_size=100)
+        expected = (torch.tensor([12, 21]), torch.tensor([2, 1]))
+
+        with patch.object(
+            EagleProposer,
+            "prepare_next_token_ids_padded",
+            return_value=expected,
+        ) as generic:
+            result = self.proposer.prepare_next_token_ids_padded(
+                metadata,
+                sampled,
+                {},
+                input_batch,
+                torch.ones(2, dtype=torch.bool),
+                0,
+            )
+
+        self.assertIs(result, expected)
+        self.assertTrue(torch.equal(generic.call_args.args[-1], torch.zeros(2, dtype=torch.bool)))

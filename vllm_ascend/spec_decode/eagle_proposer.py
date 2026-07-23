@@ -35,6 +35,7 @@ from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.spec_decode.utils import (
     PADDING_SLOT_ID,
     compute_new_slot_mapping,
+    eagle_prepare_next_token_padded_kernel,
     extend_all_queries_by_N,
 )
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
@@ -100,6 +101,7 @@ class SpecDecodeBaseProposer(EagleProposer):
         self.decode_threshold = 1 + self.num_speculative_tokens
         self.query_start_loc = self.runner._make_buffer(self.runner.max_num_reqs + 2, dtype=torch.int32)
         self.arange_cpu = torch.arange(self.arange.shape[0], device="cpu", dtype=torch.int32)
+        self._no_discard_mask = torch.zeros(self.runner.max_num_reqs, dtype=torch.bool, device=device)
         self.attn_mask_builder = AttentionMaskBuilder(self.device)
 
         self.enable_shared_expert_dp = shared_expert_dp_enabled()
@@ -1279,7 +1281,7 @@ class SpecDecodeBaseProposer(EagleProposer):
         sampled_token_ids: torch.Tensor,
         requests: dict[str, CachedRequestState],
         gpu_input_batch: InputBatch,
-        discard_request_indices: torch.Tensor,
+        discard_request_mask: torch.Tensor,
         num_discarded_requests: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
@@ -1288,49 +1290,44 @@ class SpecDecodeBaseProposer(EagleProposer):
         for each request, considering the "discarded" requests whose next token
         is not sampled and comes from `request.get_token_id()` instead.
         It also accounts for the rejected tokens in `sampled_token_ids`.
-        This function must use device functions to operate on the inputs, and
-        should not introduce any blocking CPU-GPU synchronization.
+        The fixed-width MTP decode path has no discarded rows, so it can skip
+        preparing backup tokens. Other layouts use vLLM's generic fused path.
         """
-        # TODO(Ben): Combine this into a custom fused kernel
-
-        # Precompute get_token_id for when there is no valid next token
         num_reqs = gpu_input_batch.num_reqs
-        self.backup_next_token_ids.np[:num_reqs] = np.array(
-            [
-                requests[gpu_input_batch.req_ids[i]].get_token_id(common_attn_metadata.seq_lens_cpu[i].item())
-                for i in range(num_reqs)
-            ]
+        no_discard_mask = self._no_discard_mask[:num_reqs]
+        fixed_mtp1_decode = (
+            self.method == "mtp"
+            and self.num_speculative_tokens == 1
+            and num_discarded_requests == 0
+            and sampled_token_ids.shape == (num_reqs, 2)
+            and common_attn_metadata.max_query_len == 2
+            and common_attn_metadata.num_actual_tokens == 2 * num_reqs
         )
-        self.backup_next_token_ids.copy_to_gpu(num_reqs)
+        if not fixed_mtp1_decode:
+            return super().prepare_next_token_ids_padded(
+                common_attn_metadata,
+                sampled_token_ids,
+                requests,
+                gpu_input_batch,
+                no_discard_mask if num_discarded_requests == 0 else discard_request_mask,
+            )
 
-        # Mask out the sampled tokens indices that should not be sampled.
-        discard_sampled_tokens_req_indices = discard_request_indices[:num_discarded_requests]
-
-        valid_sampled_token_ids_gpu = sampled_token_ids.clone()
-        valid_sampled_token_ids_gpu.index_fill_(0, discard_sampled_tokens_req_indices, -1)
-
-        # Generate a mask for all valid tokens within those requests
-        valid_mask = (valid_sampled_token_ids_gpu != -1) & (valid_sampled_token_ids_gpu < gpu_input_batch.vocab_size)
-
-        # Count the number of valid tokens in each request
-        valid_sampled_tokens_count = valid_mask.sum(dim=1)
-
-        # Get the rightmost valid index per row
-        last_valid_indices = valid_sampled_tokens_count - 1
-        last_valid_indices_safe = torch.clamp(last_valid_indices, min=0)
-
-        # Get last valid token from each row
-        # (assume undefined state where there is no valid token)
-        selected_tokens = torch.gather(valid_sampled_token_ids_gpu, 1, last_valid_indices_safe.unsqueeze(1)).squeeze(1)
-
-        # Use last token if valid, pre-computed backup if not
-        batch_size = valid_sampled_token_ids_gpu.shape[0]
-        next_token_ids = torch.where(
-            last_valid_indices != -1,
-            selected_tokens,
-            self.backup_next_token_ids.gpu[:batch_size],
+        # A non-discarded verification row always contains the recovered target
+        # token, so the fused kernel cannot take its backup-token branch.
+        next_token_ids = torch.empty(num_reqs, dtype=torch.int32, device=sampled_token_ids.device)
+        valid_sampled_tokens_count = torch.empty_like(next_token_ids)
+        eagle_prepare_next_token_padded_kernel[(num_reqs,)](
+            sampled_token_ids,
+            no_discard_mask,
+            self.backup_next_token_ids.gpu,
+            next_token_ids,
+            valid_sampled_tokens_count,
+            gpu_input_batch.vocab_size,
+            2,
+            num_reqs,
+            sampled_token_ids.stride(0),
+            BLOCK_SIZE_TOKENS=2,
         )
-
         return next_token_ids, valid_sampled_tokens_count
 
     def prepare_inputs(
