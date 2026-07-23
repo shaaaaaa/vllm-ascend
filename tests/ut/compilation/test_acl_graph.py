@@ -221,8 +221,12 @@ class TestACLGraphWrapper(TestBase):
             runtime_mode=CUDAGraphMode.PIECEWISE,
             synchronize_before_replay=False,
         )
-        first_key = StagedSFAGraphKey.exact_q1(1)
-        second_key = StagedSFAGraphKey.exact_q1(2)
+        first_key = StagedSFAGraphKey.exact_q1(2)
+        second_key = StagedSFAGraphKey.spec_fixed(1, 2)
+        self.assertEqual(
+            first_key.to_batch_descriptor(),
+            second_key.to_batch_descriptor(),
+        )
         first_graph, second_graph = MagicMock(), MagicMock()
         wrapper.concrete_aclgraph_entries = {
             first_key: ACLGraphEntry(

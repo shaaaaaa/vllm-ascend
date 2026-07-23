@@ -216,6 +216,7 @@ class TestUtils(TestBase):
 
     def test_staged_sfa_graph_capture_sizes_accepts_exact_q1_batches(self):
         vllm_config = mock.MagicMock()
+        vllm_config.speculative_config = None
         vllm_config.scheduler_config.max_num_seqs = 64
         vllm_config.scheduler_config.max_num_batched_tokens = 128
 
@@ -252,6 +253,7 @@ class TestUtils(TestBase):
 
     def test_staged_sfa_graph_capture_sizes_rejects_invalid_values(self):
         vllm_config = mock.MagicMock()
+        vllm_config.speculative_config = None
         vllm_config.scheduler_config.max_num_seqs = 64
         vllm_config.scheduler_config.max_num_batched_tokens = 128
         invalid_values = (
@@ -279,6 +281,7 @@ class TestUtils(TestBase):
     def test_staged_sfa_graph_capture_sizes_respects_q1_capacity(self):
         for max_num_seqs, max_num_batched_tokens in ((16, 64), (64, 16)):
             vllm_config = mock.MagicMock()
+            vllm_config.speculative_config = None
             vllm_config.scheduler_config.max_num_seqs = max_num_seqs
             vllm_config.scheduler_config.max_num_batched_tokens = max_num_batched_tokens
 
@@ -302,6 +305,32 @@ class TestUtils(TestBase):
                 ),
             ):
                 utils.staged_sfa_graph_capture_sizes(vllm_config)
+
+    def test_staged_sfa_graph_capture_sizes_respects_mtp_token_capacity(self):
+        vllm_config = mock.MagicMock()
+        vllm_config.speculative_config = mock.MagicMock(
+            method="mtp",
+            num_speculative_tokens=1,
+        )
+        vllm_config.scheduler_config.max_num_seqs = 8
+        vllm_config.scheduler_config.max_num_batched_tokens = 8
+
+        with (
+            mock.patch.object(
+                utils,
+                "staged_sfa_graph_configured",
+                return_value=True,
+            ),
+            mock.patch.dict(
+                os.environ,
+                {"VLLM_ASCEND_SFA_STAGED_GRAPH_CAPTURE_SIZES": "1,4,5"},
+            ),
+            self.assertRaisesRegex(
+                ValueError,
+                "scheduler capacity 4 at query width 2: \\[5\\]",
+            ),
+        ):
+            utils.staged_sfa_graph_capture_sizes(vllm_config)
 
     def test_update_aclgraph_sizes_restricts_cross_layer_capture(self):
         compilation_config = mock.MagicMock()
@@ -446,6 +475,40 @@ class TestUtils(TestBase):
 
         update_sizes.assert_called_once()
         self.assertEqual(update_sizes.call_args.args[1], [1, 32])
+
+    def test_staged_sfa_mtp_capture_uses_target_token_capacity(self):
+        vllm_config = mock.MagicMock()
+        draft_model_config = mock.MagicMock()
+        vllm_config.speculative_config = mock.MagicMock(
+            method="mtp",
+            num_speculative_tokens=1,
+            draft_model_config=draft_model_config,
+        )
+        vllm_config.compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
+        vllm_config.model_config.hf_text_config.num_hidden_layers = 8
+        vllm_config.parallel_config.data_parallel_size = 1
+        vllm_config.parallel_config.tensor_parallel_size = 2
+
+        with (
+            mock.patch.object(
+                utils,
+                "staged_sfa_graph_configured",
+                return_value=True,
+            ),
+            mock.patch.object(
+                utils,
+                "staged_sfa_graph_capture_sizes",
+                return_value=(1, 2, 4),
+            ),
+            mock.patch.object(
+                utils,
+                "update_cudagraph_capture_sizes",
+            ) as update_sizes,
+        ):
+            utils.update_aclgraph_sizes(vllm_config)
+
+        update_sizes.assert_called_once_with(vllm_config, [2, 4, 8])
+        draft_model_config.get_total_num_hidden_layers.assert_not_called()
 
     def test_staged_sfa_capture_rejects_graph_entry_overcommit(self):
         compilation_config = mock.MagicMock(
@@ -658,7 +721,7 @@ class TestUtils(TestBase):
 
         self.assertIn(utils.StagedSFAConfigReason.SPECULATIVE_DECODE, reasons)
         self.assertIn(utils.StagedSFAConfigReason.DATA_PARALLEL, reasons)
-        self.assertIn("speculative decoding/MTP is not implemented", errors)
+        self.assertIn("only fixed-width MTP speculative decoding is implemented", errors)
         self.assertIn("LoRA is not implemented", errors)
         self.assertIn(
             "external-launcher data parallel staged graphs are not implemented",
@@ -670,6 +733,21 @@ class TestUtils(TestBase):
         vllm_config.parallel_config.distributed_executor_backend = "mp"
         reasons = utils.staged_sfa_graph_configuration_reasons(vllm_config)
         self.assertNotIn(utils.StagedSFAConfigReason.DATA_PARALLEL, reasons)
+
+    def test_staged_sfa_configuration_accepts_fixed_width_mtp(self):
+        vllm_config = mock.MagicMock()
+        vllm_config.speculative_config = mock.MagicMock(
+            method="mtp",
+            num_speculative_tokens=1,
+        )
+
+        reasons = utils.staged_sfa_graph_configuration_reasons(vllm_config)
+
+        self.assertNotIn(
+            utils.StagedSFAConfigReason.SPECULATIVE_DECODE,
+            reasons,
+        )
+        self.assertEqual(utils.staged_sfa_graph_query_len(vllm_config), 2)
 
     def test_staged_sfa_rejects_profiling_side_effect_modes(self):
         vllm_config = mock.MagicMock()
@@ -698,9 +776,7 @@ class TestUtils(TestBase):
                 {"HCCL_OP_EXPANSION_MODE": "AIV"},
             ),
         ):
-            reasons = utils.staged_sfa_graph_configuration_reasons(
-                vllm_config
-            )
+            reasons = utils.staged_sfa_graph_configuration_reasons(vllm_config)
 
         self.assertIn(
             utils.StagedSFAConfigReason.LEGACY_DSA_OFFLOAD,

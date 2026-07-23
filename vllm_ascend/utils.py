@@ -105,7 +105,7 @@ class StagedSFARouteReason(str, Enum):
     CASCADE = "cascade"
     UNSUPPORTED_BATCH = "unsupported_batch"
     PADDED_BATCH = "padded_batch"
-    NON_Q1 = "non_q1"
+    NON_FIXED_QUERY = "non_fixed_query"
     SHORT_PROMPT = "short_prompt"
     BATCH_DESCRIPTOR = "batch_descriptor"
     INVALID_REQUEST_IDS = "invalid_request_ids"
@@ -548,7 +548,16 @@ def staged_sfa_graph_configuration_reasons(
         reasons.append(StagedSFAConfigReason.INDEX_TOPK_MISSING)
     if getattr(vllm_config, "kv_transfer_config", None) is None:
         reasons.append(StagedSFAConfigReason.CONNECTOR_MISSING)
-    if getattr(vllm_config, "speculative_config", None) is not None:
+    speculative_config = getattr(vllm_config, "speculative_config", None)
+    if (
+        speculative_config is not None
+        and getattr(
+            speculative_config,
+            "method",
+            None,
+        )
+        != "mtp"
+    ):
         reasons.append(StagedSFAConfigReason.SPECULATIVE_DECODE)
     if getattr(vllm_config, "lora_config", None) is not None:
         reasons.append(StagedSFAConfigReason.LORA)
@@ -592,7 +601,7 @@ _STAGED_SFA_CONFIG_MESSAGES = {
     StagedSFAConfigReason.MODEL_NOT_MLA: "the model must use MLA/SFA",
     StagedSFAConfigReason.INDEX_TOPK_MISSING: "the model must expose index_topk",
     StagedSFAConfigReason.CONNECTOR_MISSING: "a KV transfer connector must be configured",
-    StagedSFAConfigReason.SPECULATIVE_DECODE: "speculative decoding/MTP is not implemented",
+    StagedSFAConfigReason.SPECULATIVE_DECODE: "only fixed-width MTP speculative decoding is implemented",
     StagedSFAConfigReason.LORA: "LoRA is not implemented",
     StagedSFAConfigReason.DATA_PARALLEL: "external-launcher data parallel staged graphs are not implemented",
     StagedSFAConfigReason.PIPELINE_PARALLEL: "pipeline parallel staged graphs are not implemented",
@@ -623,7 +632,7 @@ def staged_sfa_graph_configured(vllm_config: VllmConfig) -> bool:
 def staged_sfa_graph_capture_sizes(
     vllm_config: VllmConfig,
 ) -> tuple[int, ...]:
-    """Return configured Q1 cross-layer graph capacities."""
+    """Return configured cross-layer graph request capacities."""
     if not staged_sfa_graph_configured(vllm_config):
         return ()
 
@@ -637,9 +646,15 @@ def staged_sfa_graph_capture_sizes(
     if not sizes or any(size <= 0 for size in sizes):
         raise ValueError("VLLM_ASCEND_SFA_STAGED_GRAPH_CAPTURE_SIZES must contain positive integers.")
     scheduler_config = getattr(vllm_config, "scheduler_config", None)
+    query_len = staged_sfa_graph_query_len(vllm_config)
+    max_num_batched_tokens = getattr(
+        scheduler_config,
+        "max_num_batched_tokens",
+        None,
+    )
     limits = (
         getattr(scheduler_config, "max_num_seqs", None),
-        getattr(scheduler_config, "max_num_batched_tokens", None),
+        (max_num_batched_tokens // query_len if isinstance(max_num_batched_tokens, int) else None),
     )
     integer_limits = [int(limit) for limit in limits if isinstance(limit, int) and limit > 0]
     if integer_limits:
@@ -647,9 +662,18 @@ def staged_sfa_graph_capture_sizes(
         oversized = [size for size in sizes if size > maximum]
         if oversized:
             raise ValueError(
-                f"Staged SFA capture sizes exceed the Q=1 scheduler capacity {maximum}: {oversized}."
+                "Staged SFA request capacities exceed the scheduler capacity "
+                f"{maximum} at query width {query_len}: {oversized}."
             )
     return sizes
+
+
+def staged_sfa_graph_query_len(vllm_config: VllmConfig) -> int:
+    """Return the fixed target-query width for the configured graph profile."""
+    speculative_config = getattr(vllm_config, "speculative_config", None)
+    if speculative_config is None:
+        return 1
+    return 1 + int(speculative_config.num_speculative_tokens)
 
 
 def update_aclgraph_sizes(vllm_config: VllmConfig) -> None:
@@ -684,10 +708,12 @@ def update_aclgraph_sizes(vllm_config: VllmConfig) -> None:
         num_hidden_layers = get_max_hidden_layers(hf_config)
     parallel_config = vllm_config.parallel_config
 
+    staged_sfa_graph_active = staged_sfa_graph_configured(vllm_config)
+
     # Calculate maximum supported batch sizes considering model architecture
     resources_per_graph = num_hidden_layers + 1
     # For suffix decoding, use the suffix path when no draft_model_config is provided.
-    if (spec := vllm_config.speculative_config) and (draft := spec.draft_model_config):
+    if not staged_sfa_graph_active and (spec := vllm_config.speculative_config) and (draft := spec.draft_model_config):
         # Use get_total_num_hidden_layers() to correctly handle MTP models,
         # which store layer count in num_nextn_predict_layers or
         # mtp_num_hidden_layers (for Qwen3.5) instead of num_hidden_layers.
@@ -702,13 +728,11 @@ def update_aclgraph_sizes(vllm_config: VllmConfig) -> None:
         ]
     )
 
-    staged_sfa_graph_active = staged_sfa_graph_configured(vllm_config)
     staged_sfa_sizes = staged_sfa_graph_capture_sizes(vllm_config)
     if staged_sfa_graph_active:
-        entry_limit = (
-            max_capture_size
-            - num_comm_groups * _ACL_COMMUNICATION_STREAM_RESERVE
-        ) // (1 + num_comm_groups * 2)
+        entry_limit = (max_capture_size - num_comm_groups * _ACL_COMMUNICATION_STREAM_RESERVE) // (
+            1 + num_comm_groups * 2
+        )
         required_entries = len(staged_sfa_sizes) * resources_per_graph
         if required_entries > entry_limit:
             raise ValueError(
@@ -718,14 +742,14 @@ def update_aclgraph_sizes(vllm_config: VllmConfig) -> None:
                 f"device quota {entry_limit}. Reduce "
                 "VLLM_ASCEND_SFA_STAGED_GRAPH_CAPTURE_SIZES."
             )
-        update_cudagraph_capture_sizes(
-            vllm_config,
-            list(staged_sfa_sizes),
-        )
+        query_len = staged_sfa_graph_query_len(vllm_config)
+        token_sizes = [size * query_len for size in staged_sfa_sizes]
+        update_cudagraph_capture_sizes(vllm_config, token_sizes)
         logger.info(
             "Restricted ACL graph batch sizes to cross-layer staged SFA "
-            "keys %s (%d/%d graph entries)",
+            "request keys %s at query width %d (%d/%d graph entries)",
             list(staged_sfa_sizes),
+            query_len,
             required_entries,
             entry_limit,
         )

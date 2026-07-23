@@ -185,7 +185,7 @@ class AscendMultiHeadLatentAttention(MultiHeadLatentAttentionWrapper):
                 impl.kv_lora_rank,
                 impl.qk_rope_head_dim,
                 impl.index_topk,
-                impl._staged_sfa_graph_capture_sizes[-1],
+                impl._staged_sfa_max_token_capacity,
             )
             torch.ops.vllm.sfa_lmcache_retrieve(
                 selected_packed,

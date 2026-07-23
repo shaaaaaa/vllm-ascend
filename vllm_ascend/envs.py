@@ -152,15 +152,15 @@ env_variables: dict[str, Callable[[], Any]] = {
     # 2 (B2+B1): additionally free the latent blocks [k .. prompt) at end of
     #   prefill (the actual memory saving). Default 0.
     "VLLM_ASCEND_DSA_SHRINK_LATENT": lambda: int(os.getenv("VLLM_ASCEND_DSA_SHRINK_LATENT", "0")),
-    # Experimental SFA graph-capture proof of concept. When enabled, exact-Q1
-    # decode is captured across layers, with selective LMCache retrieval as
-    # the eager split operation.
+    # Experimental SFA graph-capture proof of concept. When enabled, native Q1
+    # or fixed-width MTP target decode is captured across layers, with selective
+    # LMCache retrieval as the eager split operation.
     # Unsupported live batch shapes keep using the existing eager SFA forward;
     # incompatible model/runtime features fail fast during startup capture so
     # an explicitly requested POC cannot silently remain inactive.
     "VLLM_ASCEND_SFA_STAGED_GRAPH": lambda: bool(int(os.getenv("VLLM_ASCEND_SFA_STAGED_GRAPH", "0"))),
-    # Comma-separated positive exact-Q1 batch sizes, bounded by scheduler
-    # capacity. Defaults to singleton capture; not sensitive.
+    # Comma-separated positive request capacities, bounded by scheduler
+    # capacity at the active query width. Defaults to singleton capture.
     "VLLM_ASCEND_SFA_STAGED_GRAPH_CAPTURE_SIZES": lambda: os.getenv(
         "VLLM_ASCEND_SFA_STAGED_GRAPH_CAPTURE_SIZES",
         "1",

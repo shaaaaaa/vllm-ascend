@@ -293,6 +293,25 @@ class TestLMCacheSparseFrontier(TestBase):
                 scratch_capacity=8,
             )
 
+    def test_target_slot_mapping_keeps_block_table_compact(self):
+        targets = sfa_v1._dsa_build_target_slot_mapping(
+            torch.tensor([[2, 3]], dtype=torch.int32),
+            torch.tensor([0, 0], dtype=torch.int64),
+            torch.tensor([0, 4], dtype=torch.int64),
+            4,
+            4,
+            scratch_capacity=8,
+        )
+
+        self.assertEqual(targets.dtype, torch.int64)
+        torch.testing.assert_close(
+            targets,
+            torch.tensor(
+                [[8, 9, 10, 11], [12, 13, 14, 15]],
+                dtype=torch.int64,
+            ),
+        )
+
 
 class TestStagedSFAGraphPoc(TestBase):
     def setUp(self):
@@ -335,6 +354,7 @@ class TestStagedSFAGraphPoc(TestBase):
         impl.vllm_config.lora_config = None
         impl._staged_sfa_capture_state = sfa_v1._StagedSFACaptureState()
         impl._staged_sfa_graph_capture_sizes = (1, 4)
+        impl._staged_sfa_max_token_capacity = 4
         impl._staged_sfa_row_indices = None
         return impl
 
@@ -382,12 +402,7 @@ class TestStagedSFAGraphPoc(TestBase):
             dtype=torch.int32,
         )
         metadata.decode_req_indices_cpu = list(range(batch_size))
-        metadata.decode_req_indices_compact_cpu = np.arange(
-            batch_size,
-            dtype=np.int64,
-        )
         metadata.need_sparse_lmcache_payload = True
-        metadata.decode_valid_rows_all = True
         metadata.decode_valid_row_indices = torch.arange(
             batch_size,
             dtype=torch.int32,
@@ -396,7 +411,6 @@ class TestStagedSFAGraphPoc(TestBase):
             batch_size,
             dtype=torch.int32,
         )
-        metadata.decode_scratch_base_compact = None
         metadata.decode_scratch_base_cpu = [0] * batch_size
         metadata.decode_scratch_capacity = 128
         metadata.decode_target_slot_mapping = None
@@ -407,6 +421,43 @@ class TestStagedSFAGraphPoc(TestBase):
             dtype=torch.int32,
         )
         metadata.decode_remap_boundary_ready = False
+        return metadata
+
+    @classmethod
+    def _make_mtp_metadata(cls, request_capacity: int = 2):
+        query_len = 2
+        token_capacity = request_capacity * query_len
+        metadata = cls._make_decode_metadata(token_capacity)
+        metadata.attn_state = AscendAttentionState.SpecDecoding
+        metadata.cum_query_lens = torch.arange(
+            query_len,
+            token_capacity + 1,
+            query_len,
+        )
+        metadata.seq_lens = torch.full((request_capacity,), 9)
+        metadata.seq_lens_cpu = torch.full((request_capacity,), 9)
+        metadata.block_table = torch.arange(request_capacity).view(
+            request_capacity,
+            1,
+        )
+        metadata.indexer_block_table = metadata.block_table.clone()
+        request_rows = np.repeat(
+            np.arange(request_capacity, dtype=np.int32),
+            query_len,
+        )
+        scratch_bases = np.tile(
+            np.arange(query_len, dtype=np.int32) * 4,
+            request_capacity,
+        )
+        metadata.decode_req_indices = torch.from_numpy(request_rows)
+        metadata.decode_req_indices_cpu = request_rows
+        metadata.decode_scratch_base = torch.from_numpy(scratch_bases)
+        metadata.decode_scratch_base_cpu = scratch_bases
+        metadata.decode_target_slot_mapping = torch.arange(
+            token_capacity * 4,
+        ).view(token_capacity, 4)
+        metadata.req_ids = [f"req-{request}" for request in range(request_capacity)]
+        metadata.decode_request_ids_compact = [request_id for request_id in metadata.req_ids for _ in range(query_len)]
         return metadata
 
     def test_cross_layer_pre_uses_native_path_without_authorized_key(self):
@@ -540,9 +591,7 @@ class TestStagedSFAGraphPoc(TestBase):
             )
         )
         impl._cross_layer_ineligible_reason = MagicMock(return_value=None)
-        impl._cross_layer_pre_compute = MagicMock(
-            return_value=tuple(torch.empty(4) for _ in range(4))
-        )
+        impl._cross_layer_pre_compute = MagicMock(return_value=tuple(torch.empty(4) for _ in range(4)))
         context = SimpleNamespace(
             staged_sfa_graph_key=graph_key,
             staged_sfa_route=StagedSFARouteDecision(
@@ -714,8 +763,19 @@ class TestStagedSFAGraphPoc(TestBase):
                 metadata,
                 context,
             )
+            context.attn_metadata["layer-1.attn"] = metadata
+            impl.cross_layer_lmcache_retrieve(
+                "layer-0",
+                "layer-1.attn",
+                torch.ones(4, 4, dtype=torch.int32),
+                metadata,
+                context,
+            )
 
-        self.assertEqual(waits, ["layer-0", "layer-1.indexer.k_cache"])
+        self.assertEqual(
+            waits,
+            ["layer-0", "layer-1.indexer.k_cache"] * 2,
+        )
         self.assertEqual(prepare_payload.call_args.args[1].shape, (1, 4))
         self.assertIs(
             metadata.reshape_cache_event,
@@ -753,6 +813,14 @@ class TestStagedSFAGraphPoc(TestBase):
                 metadata,
                 context,
             )
+            context.attn_metadata["layer-1.attn"] = metadata
+            impl.cross_layer_lmcache_retrieve(
+                "layer-0",
+                "layer-1.attn",
+                torch.ones(4, 4, dtype=torch.int32),
+                metadata,
+                context,
+            )
 
         prepare_boundary.assert_called_once_with(
             next_metadata,
@@ -765,7 +833,6 @@ class TestStagedSFAGraphPoc(TestBase):
     def test_cross_layer_post_ignores_padded_bridge_rows(self):
         impl = self._make_eligible_impl()
         kv_cache = self._make_eligible_kv_cache()
-        impl._cross_layer_kv_cache = MagicMock(return_value=(kv_cache, "index-0", True))
         impl._cross_layer_post_compute = MagicMock()
         context = SimpleNamespace(
             staged_sfa_graph_key=STAGED_SFA_SINGLETON_GRAPH_KEY,
@@ -784,6 +851,30 @@ class TestStagedSFAGraphPoc(TestBase):
 
         args = impl._cross_layer_post_compute.call_args.args
         self.assertEqual([tensor.shape[0] for tensor in args[:3]], [1] * 3)
+
+    def test_cross_layer_post_keeps_all_mtp_target_rows(self):
+        impl = self._make_eligible_impl()
+        graph_key = StagedSFAGraphKey.spec_fixed(2, 2)
+        kv_cache = self._make_eligible_kv_cache()
+        impl._cross_layer_post_compute = MagicMock()
+
+        with patch.object(
+            sfa_v1,
+            "get_forward_context",
+            return_value=SimpleNamespace(staged_sfa_graph_key=graph_key),
+        ):
+            impl.cross_layer_graph_post(
+                "layer-0",
+                torch.empty(4, 2, 4),
+                torch.empty(4, 2, 2),
+                torch.empty(4, 1, 4, dtype=torch.int32),
+                kv_cache,
+                self._make_mtp_metadata(),
+                torch.empty(4, 4),
+            )
+
+        args = impl._cross_layer_post_compute.call_args.args
+        self.assertEqual([tensor.shape[0] for tensor in args[:3]], [4] * 3)
 
     def test_cross_layer_bootstrap_prepares_boundary_before_index_wait(self):
         impl = self._make_eligible_impl()
@@ -1024,7 +1115,6 @@ class TestStagedSFAGraphPoc(TestBase):
         targets = torch.arange(12, dtype=torch.int64).view(3, 4) + 32
         metadata.decode_request_ids_compact = ["req-0", "req-0", "req-1"]
         metadata.decode_valid_row_indices = torch.arange(3, dtype=torch.int32)
-        metadata.decode_scratch_base_compact = torch.tensor([0, 4, 0])
         metadata.decode_target_slot_mapping = targets
 
         payload = sfa_v1._prepare_dsa_sparse_lmcache_payload(
@@ -1062,7 +1152,6 @@ class TestStagedSFAGraphPoc(TestBase):
 
     def test_eligibility_accepts_single_native_piecewise_decode(self):
         impl = self._make_eligible_impl()
-        metadata = self._make_decode_metadata()
         forward_context = MagicMock()
         forward_context.cudagraph_runtime_mode = CUDAGraphMode.PIECEWISE
         forward_context.capturing = False
@@ -1095,23 +1184,25 @@ class TestStagedSFAGraphPoc(TestBase):
         ):
             for dtype in (torch.float16, torch.bfloat16):
                 with self.subTest(dtype=dtype):
+                    typed_metadata = self._make_decode_metadata()
                     reason = impl._cross_layer_ineligible_reason(
                         torch.empty(1, 4, dtype=dtype),
                         self._make_eligible_kv_cache(dtype=dtype),
-                        metadata,
+                        typed_metadata,
                     )
                     self.assertIsNone(reason)
-            metadata.need_sparse_lmcache_payload = False
+            missing_payload_metadata = self._make_decode_metadata()
+            missing_payload_metadata.need_sparse_lmcache_payload = False
             reason = impl._cross_layer_ineligible_reason(
                 torch.empty(1, 4, dtype=torch.bfloat16),
                 self._make_eligible_kv_cache(dtype=torch.bfloat16),
-                metadata,
+                missing_payload_metadata,
             )
             self.assertEqual(
                 reason,
                 "the v1 sparse LMCache payload path is unavailable",
             )
-            metadata.need_sparse_lmcache_payload = True
+            unsupported_connector_metadata = self._make_decode_metadata()
             with patch.object(
                 sfa_v1,
                 "staged_sfa_connector_supports_sparse_load",
@@ -1120,12 +1211,11 @@ class TestStagedSFAGraphPoc(TestBase):
                 reason = impl._cross_layer_ineligible_reason(
                     torch.empty(1, 4, dtype=torch.bfloat16),
                     self._make_eligible_kv_cache(dtype=torch.bfloat16),
-                    metadata,
+                    unsupported_connector_metadata,
                 )
             self.assertEqual(
                 reason,
-                "the active connector does not support staged sparse "
-                "selective loads",
+                "the active connector does not support staged sparse selective loads",
             )
 
     def test_eligibility_accepts_exact_multi_request_q1_batch(self):
@@ -1137,7 +1227,7 @@ class TestStagedSFAGraphPoc(TestBase):
             cudagraph_runtime_mode=CUDAGraphMode.PIECEWISE,
             staged_sfa_graph_dummy_run=False,
             staged_sfa_graph_key=graph_key,
-            batch_descriptor=graph_key.to_legacy_batch_descriptor(),
+            batch_descriptor=graph_key.to_batch_descriptor(),
             dsa_offload_manager=None,
             dsa_adapter_cache=None,
         )
@@ -1161,6 +1251,80 @@ class TestStagedSFAGraphPoc(TestBase):
             )
 
         self.assertIsNone(reason)
+
+    def test_eligibility_accepts_fixed_width_mtp_batch(self):
+        impl = self._make_eligible_impl()
+        impl.vllm_config.speculative_config = SimpleNamespace(
+            method="mtp",
+            num_speculative_tokens=1,
+        )
+        metadata = self._make_mtp_metadata()
+        graph_key = StagedSFAGraphKey.spec_fixed(2, 2)
+        forward_context = SimpleNamespace(
+            cudagraph_runtime_mode=CUDAGraphMode.PIECEWISE,
+            staged_sfa_graph_dummy_run=False,
+            staged_sfa_graph_key=graph_key,
+            batch_descriptor=graph_key.to_batch_descriptor(),
+            dsa_offload_manager=None,
+            dsa_adapter_cache=None,
+        )
+
+        with (
+            patch.object(
+                sfa_v1,
+                "get_forward_context",
+                return_value=forward_context,
+            ),
+            patch.object(
+                sfa_v1,
+                "get_weight_prefetch_method",
+                return_value=None,
+            ),
+            patch.object(
+                sfa_v1.envs,
+                "VLLM_ASCEND_DSA_OFFLOAD_ASSERT_PARITY",
+                False,
+            ),
+        ):
+            reason = impl._cross_layer_ineligible_reason(
+                torch.empty(4, 4, dtype=torch.bfloat16),
+                self._make_eligible_kv_cache(
+                    dtype=torch.bfloat16,
+                    num_blocks=2,
+                ),
+                metadata,
+            )
+            self.assertIsNone(reason)
+            self.assertTrue(metadata.staged_sfa_step_validated)
+
+            # All SFA layers share this immutable metadata object, so the
+            # first layer completes live admission validation for this step.
+            metadata.prompt_lens_cpu_rows = None
+            reason = impl._cross_layer_ineligible_reason(
+                torch.empty(4, 4, dtype=torch.bfloat16),
+                self._make_eligible_kv_cache(
+                    dtype=torch.bfloat16,
+                    num_blocks=2,
+                ),
+                metadata,
+            )
+            self.assertIsNone(reason)
+
+            invalid_metadata = self._make_mtp_metadata()
+            invalid_metadata.decode_target_slot_mapping = None
+            reason = impl._cross_layer_ineligible_reason(
+                torch.empty(4, 4, dtype=torch.bfloat16),
+                self._make_eligible_kv_cache(
+                    dtype=torch.bfloat16,
+                    num_blocks=2,
+                ),
+                invalid_metadata,
+            )
+
+        self.assertEqual(
+            reason,
+            "MTP decode lacks row-specific sparse targets",
+        )
 
     def test_eligibility_rejects_invalid_cache_contract(self):
         impl = self._make_eligible_impl()
@@ -1278,6 +1442,50 @@ class TestStagedSFAGraphPoc(TestBase):
                     )
                     self.assertIn(expected_reason, reason)
 
+    def test_capture_rechecks_each_layer_cache_contract(self):
+        impl = self._make_eligible_impl()
+        metadata = self._make_decode_metadata()
+        metadata.staged_sfa_step_validated = True
+        valid = self._make_eligible_kv_cache()
+        invalid_cache = (
+            torch.empty(2, 128, 2, dtype=torch.bfloat16),
+            valid[1],
+            valid[2],
+        )
+        forward_context = SimpleNamespace(
+            cudagraph_runtime_mode=CUDAGraphMode.NONE,
+            staged_sfa_graph_dummy_run=True,
+            staged_sfa_graph_key=STAGED_SFA_SINGLETON_GRAPH_KEY,
+            batch_descriptor=BatchDescriptor(num_tokens=1),
+            dsa_offload_manager=None,
+            dsa_adapter_cache=None,
+        )
+
+        with (
+            patch.object(
+                sfa_v1,
+                "get_forward_context",
+                return_value=forward_context,
+            ),
+            patch.object(
+                sfa_v1,
+                "get_weight_prefetch_method",
+                return_value=None,
+            ),
+            patch.object(
+                sfa_v1.envs,
+                "VLLM_ASCEND_DSA_OFFLOAD_ASSERT_PARITY",
+                False,
+            ),
+        ):
+            reason = impl._cross_layer_ineligible_reason(
+                torch.empty(1, 4, dtype=torch.bfloat16),
+                invalid_cache,
+                metadata,
+            )
+
+        self.assertIn("rank-4 PA_BSND", reason)
+
     def test_eligibility_rejects_weight_prefetch(self):
         impl = self._make_eligible_impl()
         metadata = self._make_decode_metadata()
@@ -1378,7 +1586,6 @@ class TestStagedSFAGraphPoc(TestBase):
         metadata.prompt_lens_cpu_rows = [8, 0, 0, 0]
         metadata.decode_req_indices[1:] = -1
         metadata.decode_req_indices_cpu = [0, -1, -1, -1]
-        metadata.decode_valid_rows_all = False
         metadata.decode_valid_row_indices = torch.tensor(
             [0],
             dtype=torch.int32,
@@ -1390,7 +1597,7 @@ class TestStagedSFAGraphPoc(TestBase):
             cudagraph_runtime_mode=CUDAGraphMode.PIECEWISE,
             staged_sfa_graph_dummy_run=False,
             staged_sfa_graph_key=graph_key,
-            batch_descriptor=graph_key.to_legacy_batch_descriptor(),
+            batch_descriptor=graph_key.to_batch_descriptor(),
             dsa_offload_manager=None,
             dsa_adapter_cache=None,
         )
@@ -1422,6 +1629,7 @@ class TestStagedSFAGraphPoc(TestBase):
             )
 
         self.assertIsNone(reason)
+
 
 class TestAscendSFABackend(TestBase):
     def test_get_name(self):
@@ -1674,3 +1882,9 @@ class TestAscendSFAMetadataBuilder(TestBase):
 
         assert isinstance(attn_metadata, AscendSFAMetadata)
         assert attn_metadata.attn_state == AscendAttentionState.DecodeOnly
+
+        common_attn_metadata.attn_state = AscendAttentionState.SpecDecoding
+        attn_metadata = builder.build_for_graph_capture(
+            common_attn_metadata=common_attn_metadata,
+        )
+        assert attn_metadata.attn_state == AscendAttentionState.SpecDecoding

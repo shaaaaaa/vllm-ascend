@@ -144,6 +144,7 @@ from vllm_ascend.utils import (
     staged_sfa_graph_capture_sizes,
     staged_sfa_graph_configuration_errors,
     staged_sfa_graph_configured,
+    staged_sfa_graph_query_len,
 )
 from vllm_ascend.worker.dsa_shared_pool import reshape_dsa_shared_pool_raw
 from vllm_ascend.worker.npu_input_batch import NPUInputBatch
@@ -1355,11 +1356,26 @@ class NPUModelRunner(GPUModelRunner):
                 staged_sfa_graph_key = self._apply_staged_sfa_route(
                     staged_sfa_route
                 )
-                if (
-                    self._staged_sfa_graph_capture_sizes
-                    and staged_sfa_graph_key is None
-                ):
+                if self._staged_sfa_graph_capture_sizes and staged_sfa_graph_key is None:
                     cudagraph_mode = CUDAGraphMode.NONE
+                    num_tokens_padded = self._pad_for_sequence_parallelism(
+                        num_tokens_unpadded
+                    )
+                    batch_desc = BatchDescriptor(num_tokens=num_tokens_padded)
+                    if cudagraph_stats is not None:
+                        cudagraph_stats = CUDAGraphStat(
+                            num_unpadded_tokens=num_tokens_unpadded,
+                            num_padded_tokens=num_tokens_padded,
+                            num_paddings=(
+                                num_tokens_padded - num_tokens_unpadded
+                            ),
+                            runtime_mode=str(cudagraph_mode),
+                        )
+                elif staged_sfa_graph_key is not None and num_tokens_across_dp is not None:
+                    # Every DP rank replays the same staged capacity. Defer this
+                    # mutation until final admission so native fallback retains
+                    # the real per-rank token counts collected above.
+                    num_tokens_across_dp.fill_(num_tokens_padded)
                 num_reqs_padded = batch_desc.num_reqs if batch_desc.num_reqs is not None else num_reqs
                 ubatch_slices, ubatch_slices_padded = maybe_create_ubatch_slices(
                     should_ubatch,
@@ -1407,7 +1423,7 @@ class NPUModelRunner(GPUModelRunner):
                         num_reqs,
                         cudagraph_mode,
                         (
-                            num_tokens_padded
+                            staged_sfa_graph_key.request_capacity
                             if staged_sfa_graph_key is not None
                             else batch_desc.num_reqs
                         ),
@@ -1489,14 +1505,13 @@ class NPUModelRunner(GPUModelRunner):
         dsa_adapter_cache = getattr(self, "dsa_adapter_cache", None)
         dsa_req_ids = None
         dsa_prompt_lens = None
-        # Thread per-request ids/prompt lengths (input_batch row order) into the
-        # forward context whenever a DSA sparse path needs them: the offload manager
-        # (Option A), the shrink-latent LMCache path (keys selected-token rows by
-        # req_id), AND the adapter latent cache.
+        # Thread request IDs through sparse paths that key state by request.
+        # Prompt lengths are consumed only by the latent offload manager.
         if dsa_offload_manager is not None or self.dsa_shrink_latent or dsa_adapter_cache is not None:
             num_reqs = self.input_batch.num_reqs
             dsa_req_ids = self.input_batch.req_ids[:num_reqs]
-            dsa_prompt_lens = torch.from_numpy(self.input_batch.num_prompt_tokens[:num_reqs])
+            if dsa_offload_manager is not None:
+                dsa_prompt_lens = torch.from_numpy(self.input_batch.num_prompt_tokens[:num_reqs])
 
         # Run forward pass
         clear_kv_metadata = self.speculative_config is None
@@ -2130,7 +2145,13 @@ class NPUModelRunner(GPUModelRunner):
         torch.Tensor | None,
         CUDAGraphStat | None,
     ]:
-        num_tokens_padded = self._pad_for_sequence_parallelism(num_tokens)
+        native_num_tokens_padded = self._pad_for_sequence_parallelism(num_tokens)
+        num_tokens_padded = native_num_tokens_padded
+        if (
+            staged_sfa_route_action is not None
+            and staged_sfa_route_action != StagedSFARouteAction.STAGED
+        ):
+            force_eager = True
         is_all_decode = np.all(self.input_batch.num_computed_tokens_cpu[:num_reqs] > 0)
         uniform_decode = (
             (
@@ -2141,6 +2162,8 @@ class NPUModelRunner(GPUModelRunner):
             if force_uniform_decode is None
             else force_uniform_decode
         )
+        if staged_sfa_route_action == StagedSFARouteAction.STAGED:
+            uniform_decode = False
         # Encoder-decoder models only support CG for decoder_step > 0 (no enc_output
         # is present). Also, chunked-prefill is disabled, so batch are uniform.
         has_encoder_output = self.model_config.is_encoder_decoder and num_encoder_reqs > 0
@@ -2175,33 +2198,62 @@ class NPUModelRunner(GPUModelRunner):
         # across ranks
         should_ubatch, num_tokens_across_dp = False, None
         if self.vllm_config.parallel_config.data_parallel_size > 1:
+            staged_route_configured = staged_sfa_route_action is not None
             (
                 _,
                 num_tokens_across_dp,
                 synced_cudagraph_mode,
                 staged_sfa_route_action,
             ) = self._sync_batch_across_dp(
-                num_tokens_padded=num_tokens_padded,
+                num_tokens_padded=(
+                    native_num_tokens_padded
+                    if staged_route_configured
+                    else num_tokens_padded
+                ),
                 cudagraph_mode=cudagraph_mode.value,
-                allow_dp_padding=(cudagraph_mode != CUDAGraphMode.NONE) or enable_sp(self.vllm_config),
+                allow_dp_padding=(
+                    not staged_route_configured
+                    and (
+                        cudagraph_mode != CUDAGraphMode.NONE
+                        or enable_sp(self.vllm_config)
+                    )
+                ),
                 staged_sfa_route_action=staged_sfa_route_action,
             )
 
             # Extract DP padding if there is any
             if num_tokens_across_dp is not None:
                 dp_rank = self.parallel_config.data_parallel_rank
-                agreed_num_tokens = int(num_tokens_across_dp[dp_rank].item())
                 if (
-                    agreed_num_tokens != num_tokens_padded
-                    or synced_cudagraph_mode != cudagraph_mode.value
+                    staged_route_configured
+                    and staged_sfa_route_action != StagedSFARouteAction.STAGED
                 ):
-                    num_tokens_padded = agreed_num_tokens
-                    cudagraph_mode, batch_descriptor = dispatch_cudagraph(
-                        num_tokens_padded,
-                        valid_modes={CUDAGraphMode(synced_cudagraph_mode)},
+                    num_tokens_padded = native_num_tokens_padded
+                    cudagraph_mode = CUDAGraphMode.NONE
+                    batch_descriptor = BatchDescriptor(num_tokens_padded)
+                else:
+                    agreed_num_tokens = int(
+                        (
+                            num_tokens_across_dp.max()
+                            if staged_route_configured
+                            else num_tokens_across_dp[dp_rank]
+                        ).item()
                     )
-                    # The synchronized count must identify an exact graph key.
-                    assert batch_descriptor.num_tokens == num_tokens_padded
+                    if (
+                        agreed_num_tokens == native_num_tokens_padded
+                        and synced_cudagraph_mode == cudagraph_mode.value
+                    ):
+                        agreed_num_tokens = num_tokens_padded
+                    if (
+                        agreed_num_tokens != num_tokens_padded
+                        or synced_cudagraph_mode != cudagraph_mode.value
+                    ):
+                        num_tokens_padded = agreed_num_tokens
+                        cudagraph_mode, batch_descriptor = dispatch_cudagraph(
+                            num_tokens_padded,
+                            valid_modes={CUDAGraphMode(synced_cudagraph_mode)},
+                        )
+                        num_tokens_padded = batch_descriptor.num_tokens
         cudagraph_stats = None
         if self.vllm_config.observability_config.cudagraph_metrics:
             cudagraph_stats = CUDAGraphStat(
@@ -2328,26 +2380,32 @@ class NPUModelRunner(GPUModelRunner):
         if staged_sfa_graph_dummy_run:
             scheduled = np.asarray(num_scheduled_tokens_np).reshape(-1)
             if (
-                num_tokens != num_reqs
-                or num_tokens_padded != num_reqs_padded
+                num_tokens != num_reqs * max_query_len
+                or num_tokens_padded
+                != num_reqs_padded * max_query_len
                 or num_reqs > num_reqs_padded
                 or scheduled.shape != (num_reqs,)
-                or not np.all(scheduled == 1)
+                or not np.all(scheduled == max_query_len)
             ):
                 raise RuntimeError(
-                    'The staged SFA graph dummy metadata requires one native '
-                    'Q=1 row per real request within its graph capacity.'
+                    'The staged SFA graph dummy metadata requires one fixed '
+                    'target-query width per request within its graph capacity.'
                 )
             staged_dummy_prompt_lens = (
-                self.seq_lens.np[:num_reqs].astype(np.int32) - 1
+                self.seq_lens.np[:num_reqs].astype(np.int32)
+                - max_query_len
             )
             if (
                 staged_dummy_prompt_lens.shape != (num_reqs,)
-                or np.any(staged_dummy_prompt_lens < self.dsa_index_topk)
+                or np.any(
+                    staged_dummy_prompt_lens
+                    < max_query_len * self.dsa_index_topk
+                )
             ):
                 raise RuntimeError(
                     'Every staged SFA graph dummy prompt boundary must be at '
-                    f'least index_topk={self.dsa_index_topk}, got '
+                    f'least query_width * index_topk='
+                    f'{max_query_len * self.dsa_index_topk}, got '
                     f'{staged_dummy_prompt_lens.tolist()}.'
                 )
             staged_dummy_computed_tokens = torch.zeros_like(
@@ -2494,16 +2552,24 @@ class NPUModelRunner(GPUModelRunner):
                         if staged_dummy_prompt_lens is not None
                         else self.input_batch.num_prompt_tokens[:num_reqs]
                     )
+                    query_widths = (
+                        np.asarray(num_scheduled_tokens_np)[:num_reqs]
+                        if num_scheduled_tokens_np is not None
+                        else np.full(num_reqs, max_query_len)
+                    )
+                    required_scratch = query_widths * self.dsa_index_topk
+                    short_prompt = (
+                        (plens_np > 0)
+                        & (plens_np < required_scratch)
+                    )
                     if (
                         not self._dsa_short_prompt_warned
-                        and (plens_np > 0).any()
-                        and plens_np[plens_np > 0].min() < self.dsa_index_topk
+                        and short_prompt.any()
                     ):
                         logger.warning(
-                            "DSA shrink-latent: request with prompt_len < index_topk (%d) detected; "
-                            "the compact-scratch path does not support it yet (scratch rows would alias "
-                            "live decode positions). Expect wrong output for such requests.",
-                            self.dsa_index_topk,
+                            "DSA shrink-latent: prompt length is smaller than "
+                            "query_width * index_topk for at least one request; "
+                            "compact scratch would alias live decode positions."
                         )
                         self._dsa_short_prompt_warned = True
                     cm.prompt_lens_cpu = plens_np.copy()
@@ -2559,7 +2625,43 @@ class NPUModelRunner(GPUModelRunner):
         # it only happens for cudagraph_runtime_mode=FULL.
         return force_attention or cudagraph_runtime_mode == CUDAGraphMode.FULL
 
-    def _staged_sfa_dummy_batch_size(
+    def _staged_sfa_graph_key(
+        self,
+        request_capacity: int,
+    ) -> StagedSFAGraphKey:
+        query_len = staged_sfa_graph_query_len(self.vllm_config)
+        if query_len == 1:
+            return StagedSFAGraphKey.exact_q1(request_capacity)
+        return StagedSFAGraphKey.spec_fixed(request_capacity, query_len)
+
+    def _staged_sfa_graph_key_for_tokens(
+        self,
+        token_capacity: int,
+    ) -> StagedSFAGraphKey | None:
+        query_len = staged_sfa_graph_query_len(self.vllm_config)
+        request_capacity, remainder = divmod(token_capacity, query_len)
+        if remainder or request_capacity not in self._staged_sfa_graph_capture_sizes:
+            return None
+        return self._staged_sfa_graph_key(request_capacity)
+
+    def _staged_sfa_dummy_seq_len(
+        self,
+        graph_key: StagedSFAGraphKey,
+    ) -> int:
+        min_seq_len = graph_key.max_query_len * (
+            self.dsa_index_topk + 1
+        )
+        dummy_seq_len = max(SEQ_LEN_WITH_MAX_PA_WORKSPACE, min_seq_len)
+        if dummy_seq_len > self.max_model_len:
+            raise RuntimeError(
+                "Staged SFA capture sequence does not fit the model length: "
+                f"required={dummy_seq_len}, max_model_len={self.max_model_len}, "
+                f"query_width={graph_key.max_query_len}, "
+                f"index_topk={self.dsa_index_topk}."
+            )
+        return dummy_seq_len
+
+    def _staged_sfa_dummy_graph_key(
         self,
         *,
         is_profile: bool,
@@ -2572,8 +2674,8 @@ class NPUModelRunner(GPUModelRunner):
         num_scheduled_tokens: np.ndarray,
         batch_descriptor: BatchDescriptor,
         dp_route_action: StagedSFARouteAction | None,
-    ) -> int | None:
-        '''Return the fixed Q=1 capacity for a staged dummy batch.'''
+    ) -> StagedSFAGraphKey | None:
+        '''Return the fixed-width staged SFA key for a dummy batch.'''
         if (
             not self._staged_sfa_graph_capture_sizes
             or is_profile
@@ -2584,25 +2686,29 @@ class NPUModelRunner(GPUModelRunner):
                 and not allow_eager
             )
             or num_active_loras != 0
-            or self.speculative_config is not None
             or dp_route_action != StagedSFARouteAction.STAGED
         ):
             return None
 
-        batch_size = int(num_tokens_padded)
+        graph_key = self._staged_sfa_graph_key_for_tokens(
+            int(num_tokens_padded)
+        )
         if (
-            batch_size not in self._staged_sfa_graph_capture_sizes
-            or batch_descriptor != BatchDescriptor(num_tokens=batch_size)
+            graph_key is None
+            or batch_descriptor != graph_key.to_batch_descriptor()
             or num_tokens_unpadded <= 0
-            or num_tokens_unpadded != num_reqs
-            or num_reqs > batch_size
+            or num_tokens_unpadded
+            != num_reqs * graph_key.max_query_len
+            or num_reqs > graph_key.request_capacity
         ):
             return None
 
         scheduled = np.asarray(num_scheduled_tokens).reshape(-1)
-        if scheduled.shape != (num_reqs,) or not np.all(scheduled == 1):
+        if scheduled.shape != (num_reqs,) or not np.all(
+            scheduled == graph_key.max_query_len
+        ):
             return None
-        return batch_size
+        return graph_key
 
     def _staged_sfa_local_route(
         self,
@@ -2626,27 +2732,39 @@ class NPUModelRunner(GPUModelRunner):
             return native(StagedSFARouteReason.NOT_CONFIGURED)
         if getattr(self, "calculate_kv_scales", False):
             return native(StagedSFARouteReason.RUNTIME_MODE)
-        if self.speculative_config is not None:
+        query_len = staged_sfa_graph_query_len(self.vllm_config)
+        if self.speculative_config is not None and getattr(
+            self.speculative_config,
+            "method",
+            None,
+        ) != "mtp":
             return native(StagedSFARouteReason.SPECULATIVE_DECODE)
         if getattr(self.vllm_config, "lora_config", None) is not None:
             return native(StagedSFARouteReason.LORA)
-        if self.attn_state != AscendAttentionState.DecodeOnly:
+        expected_attn_state = (
+            AscendAttentionState.DecodeOnly
+            if query_len == 1
+            else AscendAttentionState.SpecDecoding
+        )
+        if self.attn_state != expected_attn_state:
             return native(StagedSFARouteReason.NOT_DECODE)
         if has_cascade_attention:
             return native(StagedSFARouteReason.CASCADE)
-        batch_size = int(num_tokens_unpadded)
+        num_tokens = int(num_tokens_unpadded)
         capture_sizes = self._staged_sfa_graph_capture_sizes
         if (
-            batch_size <= 0
+            num_tokens <= 0
             or not capture_sizes
-            or batch_size > capture_sizes[-1]
-            or num_reqs != batch_size
+            or num_reqs > capture_sizes[-1]
+            or num_tokens != num_reqs * query_len
         ):
             return native(StagedSFARouteReason.UNSUPPORTED_BATCH)
         scheduled = np.asarray(num_scheduled_tokens).reshape(-1)
         prompt_lens = np.asarray(prompt_lens).reshape(-1)
-        if scheduled.shape != (batch_size,) or not np.all(scheduled == 1):
-            return native(StagedSFARouteReason.NON_Q1)
+        if scheduled.shape != (num_reqs,) or not np.all(
+            scheduled == query_len
+        ):
+            return native(StagedSFARouteReason.NON_FIXED_QUERY)
         metadata_reason, frontiers = staged_sfa_metadata_sparse_load(
             kv_connector_metadata,
             request_ids,
@@ -2661,17 +2779,20 @@ class NPUModelRunner(GPUModelRunner):
                 StagedSFARouteAction.FATAL,
                 metadata_reason,
             )
-        if len(frontiers) != batch_size:
+        if len(frontiers) != num_reqs:
             return StagedSFARouteDecision(
                 StagedSFARouteAction.FATAL,
                 StagedSFARouteReason.FRONTIER_COUNT_MISMATCH,
             )
-        if prompt_lens.shape != (batch_size,) or np.any(prompt_lens < index_topk):
+        required_frontier = query_len * index_topk
+        if prompt_lens.shape != (num_reqs,) or np.any(
+            prompt_lens < required_frontier
+        ):
             return StagedSFARouteDecision(
                 StagedSFARouteAction.FATAL,
                 StagedSFARouteReason.SHORT_PROMPT,
             )
-        if any(frontier < index_topk for frontier in frontiers):
+        if any(frontier < required_frontier for frontier in frontiers):
             return StagedSFARouteDecision(
                 StagedSFARouteAction.FATAL,
                 StagedSFARouteReason.FRONTIER_TOO_SHORT,
@@ -2717,21 +2838,22 @@ class NPUModelRunner(GPUModelRunner):
                 StagedSFARouteAction.SAFE_NATIVE,
                 StagedSFARouteReason.UBATCH,
             )
-        batch_size = int(num_tokens_unpadded)
-        capacity = int(num_tokens_padded)
-        graph_key = StagedSFAGraphKey.exact_q1(capacity)
+        num_tokens = int(num_tokens_unpadded)
+        token_capacity = int(num_tokens_padded)
+        graph_key = self._staged_sfa_graph_key_for_tokens(token_capacity)
+        query_len = staged_sfa_graph_query_len(self.vllm_config)
         if (
-            batch_size <= 0
-            or batch_size != num_reqs
-            or batch_size > capacity
-            or capacity
-            not in self._staged_sfa_graph_capture_sizes
+            graph_key is None
+            or num_tokens <= 0
+            or num_tokens != num_reqs * query_len
+            or num_tokens > token_capacity
+            or num_reqs > graph_key.request_capacity
         ):
             return StagedSFARouteDecision(
                 StagedSFARouteAction.SAFE_NATIVE,
                 StagedSFARouteReason.PADDED_BATCH,
             )
-        if batch_descriptor != graph_key.to_legacy_batch_descriptor():
+        if batch_descriptor != graph_key.to_batch_descriptor():
             return StagedSFARouteDecision(
                 StagedSFARouteAction.SAFE_NATIVE,
                 StagedSFARouteReason.BATCH_DESCRIPTOR,
@@ -2767,16 +2889,6 @@ class NPUModelRunner(GPUModelRunner):
         return None
 
     @staticmethod
-    def _staged_sfa_q1_query_start_locs(
-        batch_size: int,
-        *,
-        dtype: np.dtype,
-    ) -> np.ndarray:
-        if batch_size <= 0:
-            raise ValueError('The staged SFA dummy batch size must be positive.')
-        return np.arange(batch_size + 1, dtype=dtype)
-
-    @staticmethod
     def _staged_sfa_dummy_request_ids(batch_size: int) -> list[str]:
         if batch_size <= 0:
             raise ValueError('The staged SFA dummy batch size must be positive.')
@@ -2793,10 +2905,16 @@ class NPUModelRunner(GPUModelRunner):
     ) -> None:
         '''Give every staged dummy request a non-aliasing physical block.'''
         positions = np.asarray(positions, dtype=np.int64).reshape(-1)
-        if positions.shape != (batch_size,) or np.any(positions < 0):
+        if (
+            batch_size <= 0
+            or positions.size == 0
+            or positions.size % batch_size != 0
+            or np.any(positions < 0)
+        ):
             raise RuntimeError(
-                'Staged SFA dummy positions must contain one non-negative '
-                f'position per request, got shape={positions.shape}.'
+                'Staged SFA dummy positions must contain a fixed positive '
+                f'width per request, got shape={positions.shape} and '
+                f'batch_size={batch_size}.'
             )
 
         block_tables = getattr(
@@ -2836,7 +2954,11 @@ class NPUModelRunner(GPUModelRunner):
                     f'counts={len(available_blocks_per_group)}.'
                 )
 
-        req_indices = np.arange(batch_size, dtype=np.int32)
+        query_len = positions.size // batch_size
+        req_indices = np.repeat(
+            np.arange(batch_size, dtype=np.int32),
+            query_len,
+        )
         max_position = int(positions.max()) if positions.size else -1
         for group_index, block_table in enumerate(block_tables):
             available_blocks = available_blocks_per_group[group_index]
@@ -2897,12 +3019,12 @@ class NPUModelRunner(GPUModelRunner):
             )
             block_table.commit_block_table(batch_size)
             block_table.compute_slot_mapping(req_indices, positions)
-            block_table.commit_slot_mapping(batch_size)
+            block_table.commit_slot_mapping(positions.size)
 
-            slots = block_table.slot_mapping.np[:batch_size]
-            if np.any(slots < 0) or np.unique(slots).size != batch_size:
+            slots = block_table.slot_mapping.np[:positions.size]
+            if np.any(slots < 0) or np.unique(slots).size != positions.size:
                 raise RuntimeError(
-                    'The staged SFA dummy slot mapping aliases requests in '
+                    'The staged SFA dummy slot mapping aliases token rows in '
                     f'KV group {group_index}: slots={slots.tolist()}.'
                 )
     @torch.inference_mode()
@@ -2937,7 +3059,19 @@ class NPUModelRunner(GPUModelRunner):
         # When setting max_query_len = 1, we switch to and capture the optimized
         # routine of FA2 for pure decode, i.e., Flashdecode + an optimization
         # for GQA/MQA.
-        max_query_len = self.uniform_decode_query_len if uniform_decode else num_tokens
+        staged_capture = not uniform_decode and skip_eplb and not remove_lora
+        staged_capture_key = (
+            self._staged_sfa_graph_key_for_tokens(num_tokens)
+            if staged_capture
+            else None
+        )
+        max_query_len = (
+            staged_capture_key.max_query_len
+            if staged_capture_key is not None
+            else self.uniform_decode_query_len
+            if uniform_decode
+            else num_tokens
+        )
         # Set num_scheduled_tokens based on num_tokens and max_num_seqs
         # for dummy run with LoRA so that the num_reqs collectively
         # has num_tokens in total.
@@ -2945,6 +3079,9 @@ class NPUModelRunner(GPUModelRunner):
         max_num_reqs = self.scheduler_config.max_num_seqs
         if create_mixed_batch:
             raise NotImplementedError("create_mixed_batch is used for warmup deepgemm, vllm-ascend does not need it")
+        elif staged_capture_key is not None:
+            num_reqs = staged_capture_key.request_capacity
+            num_scheduled_tokens_list = [max_query_len] * num_reqs
         elif uniform_decode:
             assert not create_mixed_batch
             num_reqs = min(max_num_reqs, cdiv(num_tokens, max_query_len))
@@ -2966,7 +3103,6 @@ class NPUModelRunner(GPUModelRunner):
         self.query_lens = torch.from_numpy(num_scheduled_tokens)
         num_tokens_unpadded = int(num_scheduled_tokens.sum())
         num_sampled_tokens = np.ones(num_reqs, dtype=np.int32)
-        staged_capture = not uniform_decode and skip_eplb and not remove_lora
         dp_idle = uniform_decode and cudagraph_runtime_mode is None and self.dp_size > 1
         dummy_route_action = (
             StagedSFARouteAction.STAGED
@@ -3026,7 +3162,7 @@ class NPUModelRunner(GPUModelRunner):
         # vllm-ascend does not support ubatch now
         ubatch_slices, ubatch_slices_padded = None, None
         attn_metadata: PerLayerAttnMetadata | None = None
-        staged_sfa_dummy_batch_size = self._staged_sfa_dummy_batch_size(
+        staged_sfa_dummy_key = self._staged_sfa_dummy_graph_key(
             is_profile=is_profile,
             cudagraph_runtime_mode=cudagraph_runtime_mode,
             allow_eager=staged_capture,
@@ -3038,7 +3174,7 @@ class NPUModelRunner(GPUModelRunner):
             batch_descriptor=batch_desc,
             dp_route_action=dp_route_action,
         )
-        staged_sfa_graph_dummy_run = staged_sfa_dummy_batch_size is not None
+        staged_sfa_graph_dummy_run = staged_sfa_dummy_key is not None
         if (
             dummy_route_action is not None
             and not staged_sfa_graph_dummy_run
@@ -3080,18 +3216,19 @@ class NPUModelRunner(GPUModelRunner):
             # seq_lens. We use this seq_len only when capturing graph, and still use max_query_len
             # in inference. This will be removed once npu_fused_infer_attention_score
             # outperforms _npu_paged_attention on all cases.
-            # The staged SFA POC reuses 6144 only as bounded dummy data. Its
-            # indexer/SFA capacity is fixed by the max-model-length block-table
-            # width, while seq_lens remains a live tensor input during replay.
-            # That makes changing lengths plausible, but the torch_npu
-            # lightning-indexer branch still requires live numerical parity.
+            # Staged SFA uses at least the workspace-profiling length and grows
+            # it when fixed-width MTP needs more disjoint scratch positions.
+            # The block-table width still bounds the maximum live sequence.
             if profile_seq_lens is not None:
                 seq_lens = profile_seq_lens
+            elif staged_sfa_dummy_key is not None:
+                seq_lens = self._staged_sfa_dummy_seq_len(
+                    staged_sfa_dummy_key
+                )
             else:
                 seq_lens = (
                     SEQ_LEN_WITH_MAX_PA_WORKSPACE
-                    if staged_sfa_graph_dummy_run
-                    or (
+                    if (
                         is_graph_capturing
                         and using_paged_attention(
                             num_tokens,
@@ -3105,21 +3242,28 @@ class NPUModelRunner(GPUModelRunner):
             self.seq_lens.copy_to_gpu()
 
             if staged_sfa_graph_dummy_run:
+                assert staged_sfa_dummy_key is not None
+                request_capacity = staged_sfa_dummy_key.request_capacity
+                query_len = staged_sfa_dummy_key.max_query_len
+                request_positions = (
+                    self.seq_lens.np[:request_capacity].astype(np.int64)
+                    - query_len
+                )
                 self._prepare_staged_sfa_dummy_block_tables(
-                    batch_size=num_reqs,
+                    batch_size=request_capacity,
                     positions=(
-                        self.seq_lens.np[:num_reqs]
-                        .astype(np.int64)
-                        - 1
+                        np.repeat(request_positions, query_len)
+                        + np.tile(np.arange(query_len), request_capacity)
                     ),
                 )
-                query_start_locs = self._staged_sfa_q1_query_start_locs(
-                    num_reqs,
-                    dtype=self.query_start_loc.np.dtype,
+                cum_num_tokens, _ = self._get_cumsum_and_arange(
+                    num_scheduled_tokens,
+                    cumsum_dtype=self.query_start_loc.np.dtype,
                 )
+                self.query_start_loc.np[0] = 0
                 self.query_start_loc.np[
-                    : num_reqs + 1
-                ] = query_start_locs
+                    1 : request_capacity + 1
+                ] = cum_num_tokens
             else:
                 cum_num_tokens, _ = self._get_cumsum_and_arange(
                     num_scheduled_tokens
@@ -3134,7 +3278,7 @@ class NPUModelRunner(GPUModelRunner):
                 num_reqs,
                 cudagraph_runtime_mode,
                 (
-                    staged_sfa_dummy_batch_size
+                    staged_sfa_dummy_key.request_capacity
                     if staged_sfa_graph_dummy_run
                     else batch_desc.num_reqs
                 ),
@@ -3147,7 +3291,9 @@ class NPUModelRunner(GPUModelRunner):
                 num_reqs=num_reqs,
                 num_reqs_padded=num_reqs_padded,
                 max_query_len=(
-                    1 if staged_sfa_graph_dummy_run else max_query_len
+                    staged_sfa_dummy_key.max_query_len
+                    if staged_sfa_graph_dummy_run
+                    else max_query_len
                 ),
                 ubatch_slices=ubatch_slices_padded if pad_attn else ubatch_slices,
                 for_cudagraph_capture=is_graph_capturing,
@@ -3220,11 +3366,6 @@ class NPUModelRunner(GPUModelRunner):
                 if hasattr(self.drafter, "model") and hasattr(self.drafter.model, "compute_logits"):
                     return self.drafter.model.compute_logits(hidden_states[dummy_indices])
 
-            staged_dummy_key = (
-                StagedSFAGraphKey.exact_q1(staged_sfa_dummy_batch_size)
-                if staged_sfa_dummy_batch_size is not None
-                else None
-            )
             with set_ascend_forward_context(
                 attn_metadata,
                 self.vllm_config,
@@ -3242,14 +3383,14 @@ class NPUModelRunner(GPUModelRunner):
                     StagedSFARouteDecision(
                         StagedSFARouteAction.STAGED,
                         StagedSFARouteReason.ELIGIBLE,
-                        staged_dummy_key,
+                        staged_sfa_dummy_key,
                     )
-                    if staged_dummy_key is not None
+                    if staged_sfa_dummy_key is not None
                     else None
                 ),
-                staged_sfa_graph_key=staged_dummy_key,
+                staged_sfa_graph_key=staged_sfa_dummy_key,
             ):
-                if staged_dummy_key is not None and self._staged_sfa_impls:
+                if staged_sfa_dummy_key is not None and self._staged_sfa_impls:
                     first_layer_name, first_impl = self._staged_sfa_impls[0]
                     first_impl.bootstrap_cross_layer(first_layer_name)
                 outputs = self._model_forward(
@@ -4451,7 +4592,7 @@ class NPUModelRunner(GPUModelRunner):
                     "[SFA cross-layer graph] no local SFA layers were captured"
                 )
             graph_keys = tuple(
-                StagedSFAGraphKey.exact_q1(size)
+                self._staged_sfa_graph_key(size)
                 for size in staged_sfa_graph_capture_sizes(self.vllm_config)
             )
             for layer_name, impl in self._staged_sfa_impls:

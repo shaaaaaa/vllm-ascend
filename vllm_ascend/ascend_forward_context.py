@@ -67,16 +67,24 @@ class StagedSFAGraphKey:
             max_query_len=1,
         )
 
-    def to_legacy_batch_descriptor(self) -> BatchDescriptor:
-        """Adapt exact Q=1 capacities to normalized PIECEWISE dispatch."""
-        if (
-            self.query_profile != StagedSFAQueryProfile.DECODE_Q1
-            or self.token_capacity != self.request_capacity
-            or self.max_query_len != 1
-        ):
-            raise NotImplementedError(
-                "Only equal-capacity Q=1 staged SFA keys can use legacy BatchDescriptor dispatch."
-            )
+    @classmethod
+    def spec_fixed(
+        cls,
+        request_capacity: int,
+        max_query_len: int,
+    ) -> "StagedSFAGraphKey":
+        """Construct a fixed-width speculative target-decode key."""
+        if max_query_len <= 1:
+            raise ValueError("Speculative staged SFA requires query width > 1.")
+        return cls(
+            token_capacity=request_capacity * max_query_len,
+            request_capacity=request_capacity,
+            query_profile=StagedSFAQueryProfile.SPEC_FIXED,
+            max_query_len=max_query_len,
+        )
+
+    def to_batch_descriptor(self) -> BatchDescriptor:
+        """Return the normalized PIECEWISE descriptor for this token capacity."""
         return BatchDescriptor(num_tokens=self.token_capacity)
 
 

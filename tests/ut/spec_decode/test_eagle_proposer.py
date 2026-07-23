@@ -1,5 +1,5 @@
-from unittest.mock import MagicMock, patch
 import unittest
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 import torch
@@ -137,6 +137,28 @@ class TestEagleProposerInitialization(TestBase):
             self.assertFalse(proposer.use_cuda_graph)
             expected_max_num_tokens = proposer.max_num_tokens
             self.assertEqual(proposer.hidden_states.shape, (expected_max_num_tokens, 2048))
+
+    @patch(
+        "vllm_ascend.spec_decode.eagle_proposer.staged_sfa_graph_configured",
+        return_value=True,
+    )
+    def test_initialization_mtp_staged_target_excludes_proposer_graph(self, _):
+        self.vllm_config.speculative_config.method = "mtp"
+        self.vllm_config.speculative_config.draft_model_config.get_hidden_size.return_value = 2048
+        self.vllm_config.compilation_config.mode = CompilationMode.VLLM_COMPILE
+        self.vllm_config.model_config.enforce_eager = False
+        self.vllm_config.speculative_config.enforce_eager = False
+        self.vllm_config.scheduler_config.async_scheduling = False
+        init_ascend_config(self.vllm_config)
+
+        with set_current_vllm_config(self.vllm_config):
+            proposer = AscendEagleProposer(
+                vllm_config=self.vllm_config,
+                device=self.device,
+                runner=self.runner,
+            )
+
+        self.assertFalse(proposer.use_cuda_graph)
 
 @unittest.skip("Skip due to the changes in #7153, fix me later")
 class TestEagleProposerLoadModel(TestBase):

@@ -228,6 +228,7 @@ class TestAscendMultiHeadLatentAttention(TestBase):
             kv_lora_rank=self.kv_lora_rank,
             qk_rope_head_dim=self.qk_rope_head_dim,
             index_topk=8,
+            _staged_sfa_max_token_capacity=1,
         )
         mla_attn = MagicMock(impl=impl)
         mla_attn.process_weights_after_loading = MagicMock()
@@ -268,6 +269,7 @@ class TestAscendMultiHeadLatentAttention(TestBase):
         self.assertEqual(attn.next_layer_name, "model.layers.1.mla.attn")
         retrieve.assert_called_once()
         pre.assert_called_once()
+        self.assertEqual(pre.call_args.args[-1], 1)
         post.assert_called_once()
 
     def test_retrieve_only_partition_builds_cross_layer_island(self):

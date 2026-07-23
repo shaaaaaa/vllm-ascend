@@ -46,7 +46,12 @@ from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
 from vllm_ascend.compilation.acl_graph import ACLGraphWrapper, update_full_graph_params
 from vllm_ascend.ops.triton.spec_decode.utils import prepare_inputs_padded_kernel
 from vllm_ascend.ops.triton.triton_utils import get_vectorcore_num
-from vllm_ascend.utils import enable_sp, lmhead_tp_enable, shared_expert_dp_enabled
+from vllm_ascend.utils import (
+    enable_sp,
+    lmhead_tp_enable,
+    shared_expert_dp_enabled,
+    staged_sfa_graph_configured,
+)
 
 # Currently we will fix block size to a small one since `num_reqs` can't be too large
 _PREPARE_INPUTS_BLOCK_SIZE = 4
@@ -138,6 +143,7 @@ class SpecDecodeBaseProposer(EagleProposer):
                 self.use_cuda_graph
                 and not self.use_async_scheduling
                 and not self.speculative_config.disable_padded_drafter_batch
+                and not staged_sfa_graph_configured(vllm_config)
             )
 
         # TODO: Remove it when the bug of fx-graph is solved

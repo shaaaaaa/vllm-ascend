@@ -79,7 +79,7 @@ removing an eligibility guard is never support.
 R1 can be released as a bounded production feature. R2-R5 expand coverage; they
 must not weaken the R1 safety contract.
 
-## Current implementation checkpoint: cross-layer Q1 milestone
+## Current implementation checkpoint: cross-layer Q1 and fixed-width MTP
 
 The branch now contains the cross-layer implementation, exact-size Q1 batching,
 and fixed-capacity padded-Q1 dispatch. Singleton execution and TP2 batch sizes
@@ -87,6 +87,10 @@ and fixed-capacity padded-Q1 dispatch. Singleton execution and TP2 batch sizes
 TP2 model, a real batch of 3 has also been qualified against capacities
 `[1, 2, 4]`; runtime metrics repeatedly report `3 -> 4` PIECEWISE dispatch with
 one inactive row. Broader bucket, full-model, and trace evidence remain:
+
+The W6 implementation adds fixed-width MTP target keys, disjoint candidate-row
+scratch/targets, native bootstrap/ragged fallback, and target/proposer bucket
+isolation. Hardware qualification is still pending.
 
 - `vllm::sfa_lmcache_retrieve` is the only staged-SFA FX split;
 - Graph A and Graph B reuse the already-validated SFA math but are captured by
@@ -198,8 +202,8 @@ connector API without a demonstrated correctness need.
 | P0.9 bounded resources | Outer islands use ordinary piecewise graph-memory profiling; stream count still relies on the existing per-layer heuristic and PP is not included | KV sizing can overcommit HBM/streams if profiling misses lifecycle high-water or the stream heuristic is wrong | Measured graph/workspace high-water plus a conservative, topology-aware quota before service readiness |
 | P0.10 qualification evidence | TP2 startup, acceptable output, prefix hit, decode save, repeat stability, singleton TPOT improvement, and batch-1/2/4 throughput checkpoints pass. Focused batch routing/startup tests pass, but client concurrency has not proven pure-decode key-2/4 replay | A synchronized HTTP launch does not control scheduler phase alignment, so batch responses alone can hide smaller-key replay or whole-step native execution | Add runtime per-key admission/replay evidence or a deterministic phase-aligned exerciser, then automate numerical, partition, trace, lifecycle, and failure matrices for every enabled exact key |
 | P1.1 padded rows | Fixed-capacity Q1 rows now use safe pad block/slots, inactive-row masks, compact LMCache payloads, and persistent bridge/remap storage; TP2 `3 -> 4` churn and long-decode trials pass | Production bucket gaps can waste compute, and broader row reorder/condense coverage remains | Choose bounded buckets from resource/workload evidence and qualify every real size plus inactive-row isolation; optimize remaining per-step metadata only if profiling makes it material |
-| P1.2 rich ACL dispatch | `ACLGraphWrapper` dispatches staged entries with the full `StagedSFAGraphKey`; generic graph paths retain `BatchDescriptor` | Future `SPEC_FIXED` keys still require collision tests at equal token capacities | Keep the full staged structural key through capture/replay and add equal-capacity Q1/MTP dispatch tests with W6 |
-| P1.3 MTP scratch | Native metadata has row-specific groundwork; staged eligibility rejects it | Candidate rows can alias scratch or lose request-row order | Fixed-width profile, unique-request frontier expansion, disjoint scratch/targets, valid-row mask |
+| P1.2 rich ACL dispatch | `ACLGraphWrapper` dispatches staged entries with the full `StagedSFAGraphKey`; equal-token-capacity Q1/MTP collision coverage is present and generic graph paths retain `BatchDescriptor` | Broader target/proposer capture combinations remain unqualified | Keep target staged keys isolated from proposer dispatch and preserve the full structural key through capture/replay |
+| P1.3 MTP scratch | Fixed-width target rows use unique-request frontier expansion, duplicate compact request IDs, disjoint scratch/targets, and valid-row masks | Partial acceptance and decode-window save interaction are not yet qualified | Keep unsupported/ragged target layouts native and qualify acceptance/save boundaries before enabling that combination |
 | P1.4 scheduler ownership | Input rows can be condensed/swapped after scheduler output is formed; scratch is configured through scattered environment reads | Request IDs, block rows, selected rows, and targets can describe different generations | Build plan after row condensation; use generation/step identity and typed KV scratch configuration |
 | P1.5 DP/PP/concurrency | Internal DP route/bucket agreement, padding, and empty-rank dummy execution are implemented and DP2+TP2 trials pass; PP/virtual engines, external-launcher DP, and overlapping invocation remain rejected or unsupported | Overlap or multiple graph/cache namespaces could reuse mutable bindings or stale addresses | Preserve the qualified serialized DP path; add per-VE/cache namespace and isolated in-flight slots, or retain explicit rejection, before PP/VE/overlap admission |
 | P1.6 compatibility | Layer eligibility, startup config, memory budgeting, and connector checks encode different support subsets | Service can reserve/capture before discovering an unsupported operator combination | One capability fingerprint and reason enum used by every stage |
@@ -807,7 +811,8 @@ steps to a proven safe path; it cannot retroactively fall back a mutated step.
    connector consensus to the decode path. Keep the existing LMCache-vLLM API
    unless a reproduced correctness failure cannot be repaired internally.
 3. Finish W5's production bucket selection and broader NPU qualification on
-   the existing padded-Q1 path, then implement W6 fixed-width MTP and the
+   the existing padded-Q1 path, then qualify the implemented W6 fixed-width MTP
+   target path and the
    remaining W7 serving-parallelism/lifecycle ownership work. Cross-run output
    variability characterization is lower-priority W8 evidence, not a W5 gate.
 4. Keep performance regression gates active throughout feature work, then run
@@ -1027,13 +1032,16 @@ deferred W3 availability protocol is not a feature dependency.
 
 ### W6: fixed-width MTP target decode
 
-- Add `SPEC_FIXED` dispatch, candidate masks, unique-to-compact frontier
-  expansion, row-specific scratch/targets, and acceptance/recalc semantics.
-- Account target and draft resources separately; keep an SFA draft model out of
-  scope unless separately qualified.
+- **Implemented:** `SPEC_FIXED` target dispatch, candidate masks,
+  unique-to-compact frontier expansion, row-specific scratch/targets, native
+  fallback before padding, and target/proposer graph-bucket isolation.
+- **Remaining qualification:** acceptance/recalc patterns, decode-window save
+  interaction, TP/DP churn, and target output/throughput evidence. Keep an SFA
+  draft model out of scope unless separately qualified.
 
-Exit: widths 1/2/3 and all accepted-token patterns pass logits/token/KV/LMCache
-parity under churn and boundary cases. Depends on W5 row-capacity machinery.
+Exit: every configured target width and its accepted-token patterns pass
+logits/token/KV/LMCache parity under churn and boundary cases. Depends on W5
+row-capacity machinery.
 
 ### W7: DP, PP/virtual engines, and overlap
 
