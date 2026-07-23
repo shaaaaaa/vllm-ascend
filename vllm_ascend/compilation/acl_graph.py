@@ -78,6 +78,18 @@ class ACLGraphWrapper:
         # buffers can be updated by async scheduling. Narrow staged wrappers
         # may opt out when their same-stream/event ordering is explicit.
         self.synchronize_before_replay = synchronize_before_replay
+        speculative_config = vllm_config.speculative_config
+        speculative_method = (
+            speculative_config.method if speculative_config else None
+        )
+        self._draft_replay_is_stream_ordered = (
+            speculative_method in ("eagle", "eagle3")
+            and runtime_mode == CUDAGraphMode.FULL
+        ) or (
+            speculative_method == "mtp"
+            and runtime_mode == CUDAGraphMode.PIECEWISE
+            and not vllm_config.scheduler_config.async_scheduling
+        )
         self.compilation_config = vllm_config.compilation_config
 
         self.first_run_finished = False
@@ -263,15 +275,9 @@ class ACLGraphWrapper:
         # so that update_attn_params only executes after the previous graph replay has fully completed.
         # If we do not in main model and in full-graph mode when using merge-eagle-graph,
         # we do not need to synchronize.
-        use_eagle = (
-            self.vllm_config.speculative_config.method in ("eagle", "eagle3")
-            if self.vllm_config.speculative_config
-            else False
-        )
-        if self.synchronize_before_replay and (
-            self.runtime_mode != CUDAGraphMode.FULL
-            or not _EXTRA_CTX.is_draft_model
-            or not use_eagle
+        if self.synchronize_before_replay and not (
+            _EXTRA_CTX.is_draft_model
+            and self._draft_replay_is_stream_ordered
         ):
             torch.npu.current_stream().synchronize()
         entry.aclgraph.replay()

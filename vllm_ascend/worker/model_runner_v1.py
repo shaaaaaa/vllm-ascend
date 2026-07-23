@@ -2441,6 +2441,15 @@ class NPUModelRunner(GPUModelRunner):
             max_query_len=max_query_len,
             max_seq_len=max_seq_len,
             block_table_tensor=block_table_gid_0,
+            block_table_cpu=(
+                self.input_batch.block_table[0].get_numpy_array()
+                if (
+                    self.dsa_shrink_latent
+                    and self.speculative_config is not None
+                    and self.speculative_config.method == "mtp"
+                )
+                else None
+            ),
             slot_mapping=slot_mapping_gid_0,
             causal=True,
             num_input_tokens=num_tokens_padded,

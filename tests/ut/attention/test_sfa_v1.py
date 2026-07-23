@@ -1747,6 +1747,100 @@ class TestAscendSFAMetadataBuilder(TestBase):
         self.patcher.stop()
         self.parent_init_patcher.stop()
 
+    def test_fixed_mtp_row_plan_reuses_unchanged_shape(self):
+        builder = object.__new__(AscendSFAMetadataBuilder)
+        builder.speculative_config = SimpleNamespace(method="mtp")
+        builder.decode_threshold = 2
+        builder.index_topk = 4
+        builder._staged_mtp_row_plan = None
+        common = SimpleNamespace(
+            is_draft_model=False,
+            attn_state=AscendAttentionState.SpecDecoding,
+            max_query_len=2,
+            num_actual_tokens=4,
+            num_input_tokens=8,
+        )
+
+        plan, changed = builder._fixed_mtp_row_plan(
+            common,
+            np.array([10, 20], dtype=np.int32),
+        )
+        cached, changed_again = builder._fixed_mtp_row_plan(
+            common,
+            np.array([10, 20], dtype=np.int32),
+        )
+
+        self.assertTrue(changed)
+        self.assertFalse(changed_again)
+        self.assertIs(cached, plan)
+        np.testing.assert_array_equal(
+            plan[0],
+            np.array([10, 10, 20, 20, 0, 0, 0, 0], dtype=np.int32),
+        )
+        np.testing.assert_array_equal(
+            plan[5],
+            np.array([0, 4, 0, 4], dtype=np.int32),
+        )
+
+        common.is_draft_model = True
+        self.assertIsNone(
+            builder._fixed_mtp_row_plan(
+                common,
+                np.array([10, 20], dtype=np.int32),
+            )
+        )
+
+    def test_fixed_mtp_target_slots_rebuild_only_with_block_rows(self):
+        builder = object.__new__(AscendSFAMetadataBuilder)
+        builder.block_size = 4
+        builder.index_topk = 4
+        builder.decode_threshold = 2
+        builder.decode_scratch_base_compact = torch.tensor(
+            [0, 4],
+            dtype=torch.long,
+        )
+        builder._dsa_target_position_offsets = torch.arange(
+            4,
+            dtype=torch.long,
+        )
+        builder._staged_mtp_target_slots = None
+        block_table = torch.tensor([[2, 3]], dtype=torch.int32)
+        common = SimpleNamespace(
+            block_table_cpu=block_table.numpy().copy()
+        )
+        request_rows_device = torch.tensor([0, 0], dtype=torch.long)
+
+        first = builder._persistent_mtp_target_slots(
+            common,
+            block_table,
+            request_rows_device,
+            8,
+        )
+        second = builder._persistent_mtp_target_slots(
+            common,
+            block_table,
+            request_rows_device,
+            8,
+        )
+        self.assertIs(second, first)
+
+        common.block_table_cpu[0, 0] = 4
+        block_table[0, 0] = 4
+        rebuilt = builder._persistent_mtp_target_slots(
+            common,
+            block_table,
+            request_rows_device,
+            8,
+        )
+        self.assertIsNot(rebuilt, first)
+        torch.testing.assert_close(
+            rebuilt,
+            torch.tensor(
+                [[16, 17, 18, 19], [12, 13, 14, 15]],
+                dtype=torch.long,
+            ),
+        )
+
     @patch_distributed_groups(dcp_size=2, pcp_size=2, needs_mocks=False)
     def test_ascend_sfa_metadata_builder_default(self):
         kv_cache_spec = MagicMock()

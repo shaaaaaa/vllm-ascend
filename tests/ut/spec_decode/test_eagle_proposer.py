@@ -138,11 +138,7 @@ class TestEagleProposerInitialization(TestBase):
             expected_max_num_tokens = proposer.max_num_tokens
             self.assertEqual(proposer.hidden_states.shape, (expected_max_num_tokens, 2048))
 
-    @patch(
-        "vllm_ascend.spec_decode.eagle_proposer.staged_sfa_graph_configured",
-        return_value=True,
-    )
-    def test_initialization_mtp_staged_target_excludes_proposer_graph(self, _):
+    def test_initialization_mtp_uses_proposer_graph(self):
         self.vllm_config.speculative_config.method = "mtp"
         self.vllm_config.speculative_config.draft_model_config.get_hidden_size.return_value = 2048
         self.vllm_config.compilation_config.mode = CompilationMode.VLLM_COMPILE
@@ -158,7 +154,7 @@ class TestEagleProposerInitialization(TestBase):
                 runner=self.runner,
             )
 
-        self.assertFalse(proposer.use_cuda_graph)
+        self.assertTrue(proposer.use_cuda_graph)
 
 @unittest.skip("Skip due to the changes in #7153, fix me later")
 class TestEagleProposerLoadModel(TestBase):

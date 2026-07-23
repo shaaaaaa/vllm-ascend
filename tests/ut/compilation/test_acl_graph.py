@@ -22,7 +22,7 @@ from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.forward_context import BatchDescriptor, ForwardContext
 
 from tests.ut.base import TestBase
-from vllm_ascend.ascend_forward_context import StagedSFAGraphKey
+from vllm_ascend.ascend_forward_context import _EXTRA_CTX, StagedSFAGraphKey
 from vllm_ascend.attention.attention_v1 import AscendMetadata, AscendMetadataForDecode
 from vllm_ascend.attention.context_parallel.attention_cp import AscendAttentionCPImpl
 from vllm_ascend.attention.context_parallel.mla_cp import AscendMlaCPImpl
@@ -202,6 +202,55 @@ class TestACLGraphWrapper(TestBase):
         self.assertIs(result, captured_output)
         stream.synchronize.assert_not_called()
         graph.replay.assert_called_once_with()
+
+    @patch('vllm_ascend.compilation.acl_graph.current_platform')
+    @patch('vllm_ascend.compilation.acl_graph.envs')
+    def test_ordered_mtp_draft_replay_skips_only_its_host_synchronization(
+        self,
+        mock_envs,
+        mock_current_platform,
+    ):
+        mock_envs.VLLM_LOGGING_LEVEL = "INFO"
+        mock_current_platform.get_global_graph_pool.return_value = (
+            self.mock_graph_pool
+        )
+        self.mock_vllm_config.speculative_config = Mock(method="mtp")
+        self.mock_vllm_config.scheduler_config = Mock(
+            async_scheduling=False
+        )
+        wrapper = ACLGraphWrapper(
+            runnable=self.mock_runnable,
+            vllm_config=self.mock_vllm_config,
+            runtime_mode=CUDAGraphMode.PIECEWISE,
+            cudagraph_options=self.mock_cudagraph_options,
+        )
+        graph = MagicMock()
+        wrapper.concrete_aclgraph_entries[self.mock_batch_descriptor] = (
+            ACLGraphEntry(
+                batch_descriptor=self.mock_batch_descriptor,
+                aclgraph=graph,
+                output="draft",
+            )
+        )
+        self.mock_forward_context.cudagraph_runtime_mode = (
+            CUDAGraphMode.PIECEWISE
+        )
+        stream = MagicMock()
+
+        with (
+            patch(
+                'vllm_ascend.compilation.acl_graph.get_forward_context',
+                return_value=self.mock_forward_context,
+            ),
+            patch.object(torch.npu, 'current_stream', return_value=stream),
+            patch.object(_EXTRA_CTX, 'is_draft_model', True),
+        ):
+            self.assertEqual(wrapper(), "draft")
+            _EXTRA_CTX.is_draft_model = False
+            self.assertEqual(wrapper(), "draft")
+
+        stream.synchronize.assert_called_once_with()
+        self.assertEqual(graph.replay.call_count, 2)
 
     @patch('vllm_ascend.compilation.acl_graph.current_platform')
     @patch('vllm_ascend.compilation.acl_graph.envs')

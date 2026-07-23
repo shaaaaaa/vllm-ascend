@@ -1243,7 +1243,7 @@ class TestStagedSFAStartupCaptureValidation(unittest.TestCase):
         runner._profiling_cudagraph_memory = False
         return runner
 
-    def test_collect_staged_sfa_impls_excludes_eager_drafter(self):
+    def test_collect_staged_sfa_impls_excludes_drafter_lifecycle(self):
         runner = self._build_runner()
         target_name = "model.layers.0.self_attn.attn"
         draft_name = "model.layers.78.self_attn.attn"

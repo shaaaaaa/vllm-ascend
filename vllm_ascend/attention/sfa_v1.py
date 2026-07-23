@@ -726,6 +726,8 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             dtype=torch.int32,
             device=device,
         )
+        self.decode_prompt_lens = torch.empty_like(self.decode_remap_boundary)
+        self.decode_req_indices = torch.empty_like(self.decode_remap_boundary)
         self.decode_valid_row_indices = torch.empty_like(self.decode_remap_boundary)
         self.decode_scratch_base = torch.empty_like(self.decode_remap_boundary)
         max_num_batched_tokens = vllm_config.scheduler_config.max_num_batched_tokens
@@ -735,6 +737,117 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             device=device,
         )
         self.decode_scratch_base_compact = torch.empty_like(self.decode_req_indices_compact)
+        self._staged_mtp_row_plan = None
+        self._staged_mtp_target_slots = None
+
+    def _fixed_mtp_row_plan(
+        self,
+        common_attn_metadata: AscendCommonAttentionMetadata,
+        prompt_lens: np.ndarray,
+    ):
+        """Return the immutable row plan for one fixed-width MTP batch."""
+        query_len = self.decode_threshold
+        num_actual_tokens = common_attn_metadata.num_actual_tokens
+        num_input_tokens = common_attn_metadata.num_input_tokens
+        if (
+            getattr(self.speculative_config, "method", None) != "mtp"
+            or getattr(common_attn_metadata, "is_draft_model", False) is True
+            or common_attn_metadata.attn_state
+            != AscendAttentionState.SpecDecoding
+            or common_attn_metadata.max_query_len != query_len
+            or num_actual_tokens <= 0
+            or num_actual_tokens > num_input_tokens
+            or num_actual_tokens % query_len
+            or num_input_tokens % query_len
+        ):
+            self._staged_mtp_row_plan = None
+            return None
+
+        num_actual_reqs = num_actual_tokens // query_len
+        if prompt_lens.size < num_actual_reqs:
+            self._staged_mtp_row_plan = None
+            return None
+        key = (
+            num_input_tokens,
+            num_actual_tokens,
+            prompt_lens[:num_actual_reqs].tobytes(),
+        )
+        if self._staged_mtp_row_plan is not None:
+            cached_key, plan = self._staged_mtp_row_plan
+            if cached_key == key:
+                return plan, False
+
+        rows = np.zeros(num_input_tokens, dtype=np.int32)
+        req_rows = np.full(num_input_tokens, -1, dtype=np.int32)
+        scratch_base = np.zeros(num_input_tokens, dtype=np.int32)
+        valid_rows = np.arange(num_actual_tokens, dtype=np.int32)
+        valid_req_rows = np.repeat(
+            np.arange(num_actual_reqs, dtype=np.int64),
+            query_len,
+        )
+        valid_scratch_base = np.tile(
+            np.arange(query_len, dtype=np.int32) * self.index_topk,
+            num_actual_reqs,
+        )
+        rows[:num_actual_tokens] = np.repeat(
+            prompt_lens[:num_actual_reqs],
+            query_len,
+        )
+        req_rows[:num_actual_tokens] = valid_req_rows
+        scratch_base[:num_actual_tokens] = valid_scratch_base
+        plan = (
+            rows,
+            req_rows,
+            valid_rows,
+            valid_req_rows,
+            scratch_base,
+            valid_scratch_base,
+        )
+        self._staged_mtp_row_plan = key, plan
+        return plan, True
+
+    def _persistent_mtp_target_slots(
+        self,
+        common_attn_metadata: AscendCommonAttentionMetadata,
+        block_table: torch.Tensor,
+        row_req_indices_device: torch.Tensor,
+        scratch_capacity: int,
+    ) -> torch.Tensor:
+        """Rebuild MTP target slots only when their CPU block rows change."""
+        row_count = row_req_indices_device.shape[0]
+        block_table_cpu = common_attn_metadata.block_table_cpu
+        if not isinstance(block_table_cpu, np.ndarray):
+            self._staged_mtp_target_slots = None
+            return _dsa_build_target_slot_mapping(
+                block_table,
+                row_req_indices_device,
+                self.decode_scratch_base_compact[:row_count],
+                self.index_topk,
+                self.block_size,
+                scratch_capacity=scratch_capacity,
+                position_offsets=self._dsa_target_position_offsets,
+            )
+
+        required_blocks = scratch_capacity // self.block_size
+        num_requests = row_count // self.decode_threshold
+        block_rows = block_table_cpu[:num_requests, :required_blocks]
+        key = num_requests, block_rows.tobytes()
+        if self._staged_mtp_target_slots is not None:
+            cached_key, target_slots = self._staged_mtp_target_slots
+            if cached_key == key:
+                return target_slots
+
+        target_slots = _dsa_build_target_slot_mapping(
+            block_table,
+            row_req_indices_device,
+            self.decode_scratch_base_compact[:row_count],
+            self.index_topk,
+            self.block_size,
+            scratch_capacity=scratch_capacity,
+            position_offsets=self._dsa_target_position_offsets,
+        )
+        self._staged_mtp_target_slots = key, target_slots
+        return target_slots
 
     @staticmethod
     def determine_chunked_prefill_workspace_size(vllm_config: VllmConfig) -> int:
@@ -787,7 +900,6 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
         decode_req_indices_compact = None
         decode_request_ids_compact = None
         decode_scratch_base_rows = None
-        decode_scratch_base_compact = None
         decode_scratch_capacity = (
             (self.index_topk * self.decode_threshold + self.block_size - 1) // self.block_size * self.block_size
         )
@@ -796,68 +908,167 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
         num_decode_rows = 0
         plens_cpu = common_attn_metadata.prompt_lens_cpu if self.dsa_shrink_latent else None
         if plens_cpu is not None:
-            rows = np.zeros(num_input_tokens, dtype=np.int32)
-            req_rows = np.full(num_input_tokens, -1, dtype=np.int32)
-            row_offsets = np.zeros(num_input_tokens, dtype=np.int32)
-            n_real = min(len(plens_cpu), num_reqs)
-            qsl = common_attn_metadata.query_start_loc_cpu[: n_real + 1].numpy()
-            computed = common_attn_metadata.num_computed_tokens_cpu[:n_real].numpy()
-            for r in range(n_real):
-                s, e = int(qsl[r]), int(qsl[r + 1])
-                plen = int(plens_cpu[r])
-                first_decode = max(s, s + plen - int(computed[r]))
-                if first_decode < e:
-                    count = e - first_decode
-                    offsets = np.arange(count, dtype=np.int32)
-                    rows[first_decode:e] = plen
-                    req_rows[first_decode:e] = r
-                    row_offsets[first_decode:e] = offsets
-            num_decode_rows = int(np.count_nonzero(req_rows >= 0))
-            prompt_lens_rows = torch.from_numpy(rows).to(block_table.device)
-            decode_req_indices_rows = torch.from_numpy(req_rows).to(block_table.device)
-            scratch_base_np = row_offsets.astype(np.int32) * self.index_topk
+            plens_np = np.asarray(plens_cpu, dtype=np.int32).reshape(-1)
+            fixed_mtp_plan = self._fixed_mtp_row_plan(
+                common_attn_metadata,
+                plens_np,
+            )
+            if fixed_mtp_plan is None:
+                rows = np.zeros(num_input_tokens, dtype=np.int32)
+                req_rows = np.full(num_input_tokens, -1, dtype=np.int32)
+                row_offsets = np.zeros(num_input_tokens, dtype=np.int32)
+                n_real = min(plens_np.size, num_reqs)
+                qsl = common_attn_metadata.query_start_loc_cpu[
+                    : n_real + 1
+                ].numpy()
+                computed = common_attn_metadata.num_computed_tokens_cpu[
+                    :n_real
+                ].numpy()
+                for r in range(n_real):
+                    s, e = int(qsl[r]), int(qsl[r + 1])
+                    plen = int(plens_np[r])
+                    first_decode = max(
+                        s,
+                        s + plen - int(computed[r]),
+                    )
+                    if first_decode < e:
+                        count = e - first_decode
+                        rows[first_decode:e] = plen
+                        req_rows[first_decode:e] = r
+                        row_offsets[first_decode:e] = np.arange(
+                            count,
+                            dtype=np.int32,
+                        )
+                valid_row_indices_np = np.flatnonzero(
+                    req_rows >= 0
+                ).astype(np.int32)
+                valid_req_indices_np = req_rows[
+                    valid_row_indices_np
+                ].astype(np.int64)
+            else:
+                (
+                    rows,
+                    req_rows,
+                    valid_row_indices_np,
+                    valid_req_indices_np,
+                    scratch_base_np,
+                    valid_scratch_base_np,
+                ), plan_changed = fixed_mtp_plan
+            num_decode_rows = int(valid_row_indices_np.size)
+            if fixed_mtp_plan is None:
+                scratch_base_np = (
+                    row_offsets.astype(np.int32) * self.index_topk
+                )
+                valid_scratch_base_np = scratch_base_np[
+                    valid_row_indices_np
+                ]
+
+            if fixed_mtp_plan is not None:
+                if plan_changed:
+                    self.decode_prompt_lens[:num_input_tokens].copy_(
+                        torch.from_numpy(rows)
+                    )
+                    self.decode_req_indices[:num_input_tokens].copy_(
+                        torch.from_numpy(req_rows)
+                    )
+                    self.decode_scratch_base[:num_input_tokens].copy_(
+                        torch.from_numpy(scratch_base_np)
+                    )
+                    self.decode_valid_row_indices[
+                        :num_decode_rows
+                    ].copy_(torch.from_numpy(valid_row_indices_np))
+                    self.decode_req_indices_compact[
+                        :num_decode_rows
+                    ].copy_(torch.from_numpy(valid_req_indices_np))
+                    self.decode_scratch_base_compact[
+                        :num_decode_rows
+                    ].copy_(torch.from_numpy(valid_scratch_base_np))
+                prompt_lens_rows = self.decode_prompt_lens[
+                    :num_input_tokens
+                ]
+                decode_req_indices_rows = self.decode_req_indices[
+                    :num_input_tokens
+                ]
+            else:
+                prompt_lens_rows = torch.from_numpy(rows).to(
+                    block_table.device
+                )
+                decode_req_indices_rows = torch.from_numpy(req_rows).to(
+                    block_table.device
+                )
+                self.decode_scratch_base[:num_input_tokens].copy_(
+                    torch.from_numpy(scratch_base_np)
+                )
             # Plain decode has one row per request and uses the legacy per-request
             # sparse slot mapping. Only MTP/spec rows need disjoint scratch bases
             # and explicit target-slot tensors.
-            needs_row_scratch_base = bool(np.any(scratch_base_np))
+            needs_row_scratch_base = (
+                fixed_mtp_plan is not None
+                or bool(np.any(scratch_base_np))
+            )
             if num_decode_rows > 0:
-                self.decode_scratch_base[:num_input_tokens].copy_(torch.from_numpy(scratch_base_np))
                 decode_scratch_base_rows = self.decode_scratch_base[:num_input_tokens]
             need_sparse_lmcache_payload = self.dsa_shrink_latent != 3 and staged_sfa_connector_supports_sparse_load()
-            valid_row_indices_np = np.flatnonzero(req_rows >= 0).astype(np.int32)
             if valid_row_indices_np.size:
-                valid_req_indices_np = req_rows[valid_row_indices_np].astype(np.int64)
-                valid_scratch_base_np = scratch_base_np[valid_row_indices_np]
                 req_ids = common_attn_metadata.request_ids
                 if req_ids is not None:
                     decode_request_ids_compact = [req_ids[int(req_idx)] for req_idx in valid_req_indices_np]
                 # The fused kernel assigns each complete source row to one AIV.
                 valid_row_count = int(valid_row_indices_np.size)
-                self.decode_valid_row_indices[:valid_row_count].copy_(torch.from_numpy(valid_row_indices_np))
+                if fixed_mtp_plan is None:
+                    self.decode_valid_row_indices[
+                        :valid_row_count
+                    ].copy_(torch.from_numpy(valid_row_indices_np))
+                    self.decode_req_indices_compact[
+                        :valid_row_count
+                    ].copy_(torch.from_numpy(valid_req_indices_np))
                 decode_valid_row_indices = self.decode_valid_row_indices[:valid_row_count]
-                self.decode_req_indices_compact[:valid_row_count].copy_(torch.from_numpy(valid_req_indices_np))
                 decode_req_indices_compact = self.decode_req_indices_compact[:valid_row_count]
                 if needs_row_scratch_base:
-                    required_capacity = int(valid_scratch_base_np.max()) + self.index_topk
-                    if required_capacity > decode_scratch_capacity:
-                        raise RuntimeError(
-                            "DSA compact scratch rows exceed the scheduler "
-                            "reservation: required_capacity="
-                            f"{required_capacity}, reserved_capacity="
-                            f"{decode_scratch_capacity}, "
-                            f"decode_threshold={self.decode_threshold}."
+                    if fixed_mtp_plan is None:
+                        required_capacity = (
+                            int(valid_scratch_base_np.max())
+                            + self.index_topk
                         )
-                    self.decode_scratch_base_compact[:valid_row_count].copy_(torch.from_numpy(valid_scratch_base_np))
-                    decode_scratch_base_compact = self.decode_scratch_base_compact[:valid_row_count]
-                    decode_target_slot_mapping = _dsa_build_target_slot_mapping(
-                        block_table,
-                        decode_req_indices_compact,
-                        decode_scratch_base_compact,
-                        self.index_topk,
-                        self.block_size,
-                        scratch_capacity=decode_scratch_capacity,
-                        position_offsets=self._dsa_target_position_offsets,
-                    )
+                        if required_capacity > decode_scratch_capacity:
+                            raise RuntimeError(
+                                "DSA compact scratch rows exceed the "
+                                "scheduler reservation: required_capacity="
+                                f"{required_capacity}, reserved_capacity="
+                                f"{decode_scratch_capacity}, "
+                                f"decode_threshold={self.decode_threshold}."
+                            )
+                        self.decode_scratch_base_compact[
+                            :valid_row_count
+                        ].copy_(torch.from_numpy(valid_scratch_base_np))
+                    if fixed_mtp_plan is None:
+                        decode_scratch_base_compact = (
+                            self.decode_scratch_base_compact[
+                                :valid_row_count
+                            ]
+                        )
+                        decode_target_slot_mapping = (
+                            _dsa_build_target_slot_mapping(
+                                block_table,
+                                decode_req_indices_compact,
+                                decode_scratch_base_compact,
+                                self.index_topk,
+                                self.block_size,
+                                scratch_capacity=decode_scratch_capacity,
+                                position_offsets=(
+                                    self._dsa_target_position_offsets
+                                ),
+                            )
+                        )
+                    else:
+                        decode_target_slot_mapping = (
+                            self._persistent_mtp_target_slots(
+                                common_attn_metadata,
+                                block_table,
+                                decode_req_indices_compact,
+                                decode_scratch_capacity,
+                            )
+                        )
 
         cum_query_lens = common_attn_metadata.query_start_loc[1 : num_reqs + 1]
         seq_lens = common_attn_metadata.seq_lens[:num_reqs]

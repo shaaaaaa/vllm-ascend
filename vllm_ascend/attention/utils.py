@@ -2,6 +2,7 @@ from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import Any
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from vllm.config import VllmConfig, get_current_vllm_config
@@ -215,6 +216,11 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
     # separate groups). None in single-group mode.
     indexer_block_table_tensor: torch.Tensor | None = None
     indexer_slot_mapping: torch.Tensor | None = None
+    # CPU mirror of block_table_tensor. Staged MTP uses it to detect whether
+    # its persistent sparse target slots need rebuilding without a D2H sync.
+    block_table_cpu: np.ndarray | None = None
+    # Internal routing tag for metadata rebuilt by the speculative proposer.
+    is_draft_model: bool = False
     # DSA shrink-latent: per-request prompt lengths (CPU, length num_reqs); the
     # SFA builder expands them per ROW (decode rows -> plen, prefill/padding
     # rows -> 0 = no remap).
@@ -238,6 +244,8 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
             # there will be error about shape mismatch during reshape and cache.
             # This is really strange since vLLM slices them as well
             block_table_tensor=self.block_table_tensor,
+            block_table_cpu=self.block_table_cpu,
+            is_draft_model=self.is_draft_model,
             slot_mapping=self.slot_mapping,
             causal=self.causal,
             actual_seq_lengths_q=self.actual_seq_lengths_q[:num_actual_tokens],

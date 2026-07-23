@@ -50,7 +50,6 @@ from vllm_ascend.utils import (
     enable_sp,
     lmhead_tp_enable,
     shared_expert_dp_enabled,
-    staged_sfa_graph_configured,
 )
 
 # Currently we will fix block size to a small one since `num_reqs` can't be too large
@@ -143,7 +142,6 @@ class SpecDecodeBaseProposer(EagleProposer):
                 self.use_cuda_graph
                 and not self.use_async_scheduling
                 and not self.speculative_config.disable_padded_drafter_batch
-                and not staged_sfa_graph_configured(vllm_config)
             )
 
         # TODO: Remove it when the bug of fx-graph is solved
@@ -389,6 +387,7 @@ class SpecDecodeBaseProposer(EagleProposer):
                 slot_mapping=self.runner.input_batch.block_table[0].slot_mapping.gpu,
                 positions=self.runner.positions.gpu,
                 attn_state=self.runner.attn_state,
+                is_draft_model=True,
                 decode_token_per_req=self.runner.decode_token_per_req,
                 max_seq_len=0,
             )
@@ -567,20 +566,25 @@ class SpecDecodeBaseProposer(EagleProposer):
         # only tensor which will be used in current FIA.
         # Strictly speaking, `query_start_loc`, `seq_lens` should also have
         # their memory allocated separately for each step just like `slot_mapping`.
-        slot_mapping_lens = common_attn_metadata.slot_mapping.shape[0]
-        self.slot_mapping_group[0][:slot_mapping_lens].copy_(common_attn_metadata.slot_mapping[:slot_mapping_lens])
-        self.slot_mapping_group[0][slot_mapping_lens:].fill_(-1)
+        slot_mapping_lens = min(
+            common_attn_metadata.slot_mapping.shape[0],
+            num_input_tokens,
+        )
+        self.slot_mapping_group[0][:slot_mapping_lens].copy_(
+            common_attn_metadata.slot_mapping[:slot_mapping_lens]
+        )
+        if slot_mapping_lens < num_input_tokens:
+            self.slot_mapping_group[0][
+                slot_mapping_lens:num_input_tokens
+            ].fill_(-1)
         common_attn_metadata.slot_mapping = self.slot_mapping_group[0]
         common_attn_metadata.num_input_tokens = num_input_tokens
+        common_attn_metadata.is_draft_model = True
         # FIXME(woosuk): The below two ops cause synchronization. Optimize.
         assert len(self.draft_attn_groups) > 0
         builder = self.draft_attn_groups[0].get_metadata_builder()
         attn_metadata = builder.build(0, common_attn_metadata, self.runner.get_model())
 
-        if self.uses_mrope:
-            used_update_positions = self.mrope_positions[:, token_indices_to_sample]
-        else:
-            used_update_positions = self.positions[token_indices_to_sample]
         per_layer_attn_metadata = dict()
         # The first step of speculative.
         for layer_name in self.attn_layer_names:
@@ -590,10 +594,17 @@ class SpecDecodeBaseProposer(EagleProposer):
         # Copy the old attn_metadata and update
         attn_metadata_i = per_layer_attn_metadata[self.attn_layer_names[0]]
 
-        # Clone the data so that when calculating the data at position 2 and position 3
-        # in the merged graph, it does not affect position 1
-        # FIXME(lilinsiman)
-        common_attn_metadata.block_table_tensor = common_attn_metadata.block_table_tensor.clone()
+        if self.num_speculative_tokens > 1:
+            # Later draft steps update the table in place.
+            common_attn_metadata.block_table_tensor = (
+                common_attn_metadata.block_table_tensor.clone()
+            )
+            if self.uses_mrope:
+                used_update_positions = self.mrope_positions[
+                    :, token_indices_to_sample
+                ]
+            else:
+                used_update_positions = self.positions[token_indices_to_sample]
 
         if self.pcp_size * self.dcp_size > 1:
             if self.num_speculative_tokens > 1 and not attn_metadata_i.num_prefills:
