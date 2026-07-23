@@ -103,6 +103,54 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
         self.assertEqual(v_cache.shape, (2, 16, 8, 64))
 
 
+class TestFixedMTP1SpecDecodeMetadata(unittest.TestCase):
+    def _build_runner(self):
+        runner = NPUModelRunner.__new__(NPUModelRunner)
+        runner.speculative_config = SimpleNamespace(
+            method="mtp",
+            num_speculative_tokens=1,
+        )
+        runner.pcp_size = 1
+        runner.dcp_size = 1
+        runner.max_num_reqs = 4
+        runner.device = torch.device("cpu")
+        runner.arange_np = np.arange(32, dtype=np.int32)
+        runner.input_ids = SimpleNamespace(
+            gpu=torch.tensor(
+                [10, 11, 20, 21, 30, 31, 40, 41],
+                dtype=torch.int32,
+            )
+        )
+        runner._init_fixed_mtp1_spec_decode_template()
+        return runner
+
+    def test_fixed_layout_reuses_device_template(self):
+        runner = self._build_runner()
+        metadata = runner._calc_spec_decode_metadata(
+            np.ones(3, dtype=np.int32),
+            np.array([2, 4, 6], dtype=np.int32),
+            None,
+        )
+
+        self.assertEqual(metadata.num_draft_tokens, [1, 1, 1])
+        self.assertEqual(metadata.cu_num_draft_tokens.tolist(), [1, 2, 3])
+        self.assertEqual(metadata.cu_num_sampled_tokens.tolist(), [2, 4, 6])
+        self.assertEqual(metadata.target_logits_indices.tolist(), [0, 2, 4])
+        self.assertEqual(metadata.bonus_logits_indices.tolist(), [1, 3, 5])
+        self.assertEqual(metadata.logits_indices.tolist(), list(range(6)))
+        self.assertEqual(metadata.draft_token_ids.tolist(), [11, 21, 31])
+        self.assertTrue(metadata.draft_token_ids.is_contiguous())
+
+    def test_irregular_layout_does_not_use_template(self):
+        runner = self._build_runner()
+        self.assertIsNone(
+            runner._fixed_mtp1_spec_decode_metadata(
+                np.array([1, 0], dtype=np.int32),
+                np.array([2, 3], dtype=np.int32),
+            )
+        )
+
+
 class TestStagedSFAGraphKey(unittest.TestCase):
     def test_structural_dimensions_do_not_collide(self):
         base = STAGED_SFA_SINGLETON_GRAPH_KEY

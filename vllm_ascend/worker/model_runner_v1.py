@@ -530,6 +530,25 @@ class NPUModelRunner(GPUModelRunner):
                 self.rejection_sampler = RejectionSampler(self.sampler)
         self.discard_request_mask = self._make_buffer(self.max_num_reqs, dtype=torch.bool)
         self.num_discarded_requests = 0
+        self._init_fixed_mtp1_spec_decode_template()
+
+    def _init_fixed_mtp1_spec_decode_template(self) -> None:
+        self._fixed_mtp1_spec_decode_template = None
+        if (
+            self.speculative_config is None
+            or self.speculative_config.method != "mtp"
+            or self.speculative_config.num_speculative_tokens != 1
+            or self.pcp_size * self.dcp_size != 1
+        ):
+            return
+        req = np.arange(self.max_num_reqs, dtype=np.int32)
+        template = np.zeros((5, 2 * self.max_num_reqs), dtype=np.int32)
+        template[0, : self.max_num_reqs] = req + 1
+        template[1, : self.max_num_reqs] = 2 * (req + 1)
+        template[2, : self.max_num_reqs] = 2 * req
+        template[3, : self.max_num_reqs] = 2 * req + 1
+        template[4] = np.arange(2 * self.max_num_reqs, dtype=np.int32)
+        self._fixed_mtp1_spec_decode_template = torch.from_numpy(template).to(self.device)
 
     def _get_drafter(self):
         return get_spec_decode_method(self.speculative_config.method, self.vllm_config, self.device, self)
@@ -985,6 +1004,13 @@ class NPUModelRunner(GPUModelRunner):
         cu_num_scheduled_tokens: np.ndarray,
         num_pcp_pads: np.ndarray | None,
     ) -> SpecDecodeMetadata:
+        fixed_mtp1 = self._fixed_mtp1_spec_decode_metadata(
+            num_draft_tokens,
+            cu_num_scheduled_tokens,
+        )
+        if fixed_mtp1 is not None:
+            return fixed_mtp1
+
         # Inputs:
         # cu_num_scheduled_tokens:  [  4, 104, 107, 207, 209]
         # num_draft_tokens:         [  3,   0,   2,   0,   1]
@@ -1050,6 +1076,38 @@ class NPUModelRunner(GPUModelRunner):
         return SpecDecodeMetadata(
             draft_token_ids=draft_token_ids,
             num_draft_tokens=num_draft_tokens.tolist(),
+            cu_num_draft_tokens=cu_num_draft_tokens,
+            cu_num_sampled_tokens=cu_num_sampled_tokens,
+            target_logits_indices=target_logits_indices,
+            bonus_logits_indices=bonus_logits_indices,
+            logits_indices=logits_indices,
+        )
+
+    def _fixed_mtp1_spec_decode_metadata(
+        self,
+        num_draft_tokens: np.ndarray,
+        cu_num_scheduled_tokens: np.ndarray,
+    ) -> SpecDecodeMetadata | None:
+        template = getattr(self, "_fixed_mtp1_spec_decode_template", None)
+        num_reqs = len(num_draft_tokens)
+        if (
+            template is None
+            or num_reqs == 0
+            or not np.all(num_draft_tokens == 1)
+            or not np.array_equal(
+                cu_num_scheduled_tokens,
+                2 * self.arange_np[1 : num_reqs + 1],
+            )
+        ):
+            return None
+        cu_num_draft_tokens = template[0, :num_reqs]
+        cu_num_sampled_tokens = template[1, :num_reqs]
+        target_logits_indices = template[2, :num_reqs]
+        bonus_logits_indices = template[3, :num_reqs]
+        logits_indices = template[4, : 2 * num_reqs]
+        return SpecDecodeMetadata(
+            draft_token_ids=self.input_ids.gpu[bonus_logits_indices],
+            num_draft_tokens=[1] * num_reqs,
             cu_num_draft_tokens=cu_num_draft_tokens,
             cu_num_sampled_tokens=cu_num_sampled_tokens,
             target_logits_indices=target_logits_indices,
