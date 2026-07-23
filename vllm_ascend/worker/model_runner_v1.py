@@ -4535,13 +4535,21 @@ class NPUModelRunner(GPUModelRunner):
 
 
     def _collect_staged_sfa_impls(self) -> tuple[tuple[str, Any], ...]:
-        """Return each local staged SFA implementation exactly once."""
+        """Return each target-model staged SFA implementation exactly once."""
         attn_layers = get_layers_from_vllm_config(
             self.vllm_config,
             AttentionLayerBase,
         )
+        draft_layer_names = getattr(
+            getattr(self, "drafter", None),
+            "attn_layer_names",
+            (),
+        )
         staged_impls: dict[int, tuple[str, Any]] = {}
         for layer_name, attn_layer in attn_layers.items():
+            # Drafter layers are outside the target graph capture lifecycle.
+            if layer_name in draft_layer_names:
+                continue
             impl = getattr(attn_layer, "impl", None)
             if impl is None or not getattr(
                 impl,

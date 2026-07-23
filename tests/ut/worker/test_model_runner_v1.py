@@ -1243,6 +1243,35 @@ class TestStagedSFAStartupCaptureValidation(unittest.TestCase):
         runner._profiling_cudagraph_memory = False
         return runner
 
+    def test_collect_staged_sfa_impls_excludes_eager_drafter(self):
+        runner = self._build_runner()
+        target_name = "model.layers.0.self_attn.attn"
+        draft_name = "model.layers.78.self_attn.attn"
+        target_impl = SimpleNamespace(enable_staged_sfa_graph=True)
+        draft_impl = SimpleNamespace(enable_staged_sfa_graph=True)
+        runner.drafter = SimpleNamespace(
+            attn_layer_names=[draft_name],
+        )
+        attn_layers = {
+            target_name: SimpleNamespace(
+                layer_name=target_name,
+                impl=target_impl,
+            ),
+            draft_name: SimpleNamespace(
+                layer_name=draft_name,
+                impl=draft_impl,
+            ),
+        }
+
+        with patch.object(
+            model_runner_module,
+            "get_layers_from_vllm_config",
+            return_value=attn_layers,
+        ):
+            staged_impls = runner._collect_staged_sfa_impls()
+
+        self.assertEqual(staged_impls, ((target_name, target_impl),))
+
     def test_capture_model_preserves_result_and_validates_cross_layer_warmup(self):
         runner = self._build_runner()
         calls = []
