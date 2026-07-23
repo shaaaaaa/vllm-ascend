@@ -2628,7 +2628,16 @@ class NPUModelRunner(GPUModelRunner):
         if self.dp_size == 1:
             return False, None, cudagraph_mode, staged_sfa_route_action
 
-        rows = 3 if staged_sfa_route_action is not None else 2
+        # The collective layout is a wire protocol and must be identical on
+        # every DP rank. A final-hidden bootstrap rank has no local SFA route
+        # to apply, while a peer may execute normal staged-SFA decode in the
+        # same step. Keep the route row present for neutral participants
+        # whenever staged SFA is configured; its zero value is STAGED, the
+        # neutral element for the max-reduced route action.
+        staged_route_protocol = bool(
+            getattr(self, "_staged_sfa_graph_capture_sizes", ())
+        ) or staged_sfa_route_action is not None
+        rows = 3 if staged_route_protocol else 2
         tensor = self._dp_batch_sync_buffers.get(rows)
         if tensor is None or tensor.shape[1] != self.dp_size:
             tensor = torch.empty(
