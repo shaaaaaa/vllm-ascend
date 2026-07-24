@@ -10,6 +10,7 @@ from vllm_ascend.worker.model_runner_v1 import (
     NPUModelRunner,
     deserialize_final_hidden_state,
     final_hidden_parity_summary,
+    final_hidden_value_summary,
     serialize_final_hidden_state,
 )
 
@@ -95,6 +96,27 @@ def test_final_hidden_parity_summary_reports_top1_mismatch():
     assert summary["top1_match"] == [False]
 
 
+def test_final_hidden_value_summary_counts_nonfinite_values():
+    values = torch.tensor(
+        [1.5, float("nan"), float("inf"), -float("inf")],
+        dtype=torch.float32,
+    )
+
+    summary = final_hidden_value_summary(values)
+
+    assert summary == {
+        "device": "cpu",
+        "dtype": "torch.float32",
+        "shape": [4],
+        "numel": 4,
+        "finite_count": 1,
+        "nan_count": 1,
+        "posinf_count": 1,
+        "neginf_count": 1,
+        "finite_abs_max": 1.5,
+    }
+
+
 def test_capture_final_hidden_uses_last_scheduled_row_per_request():
     runner = object.__new__(NPUModelRunner)
     runner.input_batch = SimpleNamespace(req_ids=["request-a", "request-b"])
@@ -107,10 +129,49 @@ def test_capture_final_hidden_uses_last_scheduled_row_per_request():
         scheduler_output,
         hidden_states,
         num_scheduled_tokens=torch.tensor([2, 3]).numpy(),
+        logits_indices=torch.tensor([1, 4]),
     )
 
     restored = deserialize_final_hidden_state(payloads["request-b"])
     assert torch.equal(restored, hidden_states[4])
+
+
+def test_capture_diagnostics_compare_legacy_and_sampler_rows(monkeypatch):
+    monkeypatch.setattr(
+        model_runner_v1.envs_ascend,
+        "VLLM_ASCEND_FINAL_HIDDEN_PARITY_TRACE",
+        True,
+    )
+    runner = object.__new__(NPUModelRunner)
+    runner.input_batch = SimpleNamespace(req_ids=["request-a", "request-b"])
+    scheduler_output = SimpleNamespace(
+        capture_final_hidden_req_ids={"request-b"}
+    )
+    hidden_states = torch.tensor(
+        [
+            [1.0, 1.0],
+            [2.0, 2.0],
+            [3.0, 3.0],
+            [4.0, 4.0],
+            [float("nan"), float("nan")],
+        ]
+    )
+
+    payloads = runner._capture_final_hidden_states(
+        scheduler_output,
+        hidden_states,
+        num_scheduled_tokens=torch.tensor([2, 3]).numpy(),
+        logits_indices=torch.tensor([1, 3]),
+    )
+
+    diagnostics = payloads["request-b"]["capture_diagnostics"]
+    assert diagnostics["legacy_row_index"] == 4
+    assert diagnostics["sampler_row_index"] == 3
+    assert diagnostics["legacy_npu"]["nan_count"] == 2
+    assert diagnostics["sampler_npu"]["nan_count"] == 0
+    assert diagnostics["payload_cpu"]["nan_count"] == 2
+    assert not diagnostics["legacy_equals_sampler"]
+    assert diagnostics["legacy_sha256"] != diagnostics["sampler_sha256"]
 
 
 @pytest.mark.parametrize(

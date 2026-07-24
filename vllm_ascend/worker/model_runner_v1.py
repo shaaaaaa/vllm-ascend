@@ -379,6 +379,39 @@ def final_hidden_parity_summary(
     }
 
 
+def final_hidden_value_summary(tensor: torch.Tensor) -> dict[str, Any]:
+    """Summarize non-finite values without changing the source tensor."""
+    tensor = tensor.detach()
+    finite_mask = torch.isfinite(tensor)
+    inf_mask = torch.isinf(tensor)
+    nan_count = int(torch.isnan(tensor).sum().to("cpu"))
+    posinf_count = int((inf_mask & (tensor > 0)).sum().to("cpu"))
+    neginf_count = int((inf_mask & (tensor < 0)).sum().to("cpu"))
+    finite_count = int(finite_mask.sum().to("cpu"))
+    finite_abs_max = None
+    if finite_count:
+        finite_abs_max = float(
+            torch.where(
+                finite_mask,
+                tensor.float().abs(),
+                torch.zeros((), dtype=torch.float32, device=tensor.device),
+            )
+            .max()
+            .to("cpu")
+        )
+    return {
+        "device": str(tensor.device),
+        "dtype": str(tensor.dtype),
+        "shape": list(tensor.shape),
+        "numel": tensor.numel(),
+        "finite_count": finite_count,
+        "nan_count": nan_count,
+        "posinf_count": posinf_count,
+        "neginf_count": neginf_count,
+        "finite_abs_max": finite_abs_max,
+    }
+
+
 class NPUModelRunner(GPUModelRunner):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         # TODO(qcs): These manual pad and unpad for GPUModelRunner are
@@ -1350,11 +1383,21 @@ class NPUModelRunner(GPUModelRunner):
         scheduler_output: "SchedulerOutput",
         hidden_states: torch.Tensor,
         num_scheduled_tokens: np.ndarray,
+        logits_indices: torch.Tensor,
     ) -> dict[str, dict[str, Any]]:
         capture_req_ids = scheduler_output.capture_final_hidden_req_ids
         if not capture_req_ids:
             return {}
 
+        parity_trace = envs_ascend.VLLM_ASCEND_FINAL_HIDDEN_PARITY_TRACE
+        sampler_row_indices = None
+        if parity_trace:
+            sampler_row_indices = (
+                logits_indices[: len(self.input_batch.req_ids)]
+                .detach()
+                .to("cpu")
+                .tolist()
+            )
         final_hidden_states: dict[str, dict[str, Any]] = {}
         row_end = 0
         for req_idx, req_id in enumerate(self.input_batch.req_ids):
@@ -1365,9 +1408,41 @@ class NPUModelRunner(GPUModelRunner):
                 raise RuntimeError(
                     f"Cannot capture final hidden state for unscheduled request {req_id!r}"
                 )
-            final_hidden_states[req_id] = serialize_final_hidden_state(
-                hidden_states[row_end - 1]
-            )
+            legacy_row_index = row_end - 1
+            legacy_hidden_state = hidden_states[legacy_row_index]
+            payload = serialize_final_hidden_state(legacy_hidden_state)
+            if parity_trace:
+                assert sampler_row_indices is not None
+                sampler_row_index = int(sampler_row_indices[req_idx])
+                sampler_hidden_state = hidden_states[sampler_row_index]
+                sampler_payload = serialize_final_hidden_state(
+                    sampler_hidden_state
+                )
+                capture_diagnostics = {
+                    "legacy_row_index": legacy_row_index,
+                    "sampler_row_index": sampler_row_index,
+                    "legacy_npu": final_hidden_value_summary(
+                        legacy_hidden_state
+                    ),
+                    "sampler_npu": final_hidden_value_summary(
+                        sampler_hidden_state
+                    ),
+                    "payload_cpu": final_hidden_value_summary(
+                        deserialize_final_hidden_state(payload)
+                    ),
+                    "legacy_sha256": payload["data_sha256"],
+                    "sampler_sha256": sampler_payload["data_sha256"],
+                    "legacy_equals_sampler": torch.equal(
+                        legacy_hidden_state, sampler_hidden_state
+                    ),
+                }
+                payload["capture_diagnostics"] = capture_diagnostics
+                logger.info(
+                    "[FINAL_HIDDEN_CAPTURE_DIAG] req=%s diagnostics=%s",
+                    req_id,
+                    capture_diagnostics,
+                )
+            final_hidden_states[req_id] = payload
         missing_req_ids = capture_req_ids.difference(final_hidden_states)
         if missing_req_ids:
             raise RuntimeError(
@@ -1395,6 +1470,7 @@ class NPUModelRunner(GPUModelRunner):
 
         hidden_size = self.model_config.get_hidden_size()
         hidden_states = []
+        ordered_req_ids = []
         for req_id in self.input_batch.req_ids:
             if req_id not in bootstrap_req_ids:
                 raise RuntimeError(
@@ -1412,7 +1488,17 @@ class NPUModelRunner(GPUModelRunner):
                     f"BOOTSTRAP_SAMPLE request {req_id!r} has hidden shape "
                     f"{tuple(hidden_state.shape)}, expected ({hidden_size},)"
                 )
+            if envs_ascend.VLLM_ASCEND_FINAL_HIDDEN_PARITY_TRACE:
+                logger.info(
+                    "[FINAL_HIDDEN_RESTORE_CPU_DIAG] req=%s "
+                    "payload_sha256=%s capture_diagnostics=%s restored=%s",
+                    req_id,
+                    payload["data_sha256"],
+                    payload.get("capture_diagnostics"),
+                    final_hidden_value_summary(hidden_state),
+                )
             hidden_states.append(hidden_state)
+            ordered_req_ids.append(req_id)
 
         missing_req_ids = bootstrap_req_ids.difference(self.input_batch.req_ids)
         if missing_req_ids:
@@ -1421,9 +1507,19 @@ class NPUModelRunner(GPUModelRunner):
                 f"{sorted(missing_req_ids)}"
             )
         cpu_hidden_states = torch.stack(hidden_states)
-        return cpu_hidden_states.to(
+        device_hidden_states = cpu_hidden_states.to(
             self.device, non_blocking=True
         )
+        if envs_ascend.VLLM_ASCEND_FINAL_HIDDEN_PARITY_TRACE:
+            for req_idx, req_id in enumerate(ordered_req_ids):
+                logger.info(
+                    "[FINAL_HIDDEN_RESTORE_NPU_DIAG] req=%s restored=%s",
+                    req_id,
+                    final_hidden_value_summary(
+                        device_hidden_states[req_idx]
+                    ),
+                )
+        return device_hidden_states
 
     def _wait_for_bootstrap_kv_load(self) -> None:
         connector = get_kv_transfer_group()
@@ -1781,6 +1877,16 @@ class NPUModelRunner(GPUModelRunner):
                     logits,
                     reference_logits,
                 )
+                transferred_hidden_summary = final_hidden_value_summary(
+                    hidden_states
+                )
+                reference_hidden_summary = final_hidden_value_summary(
+                    shadow_sample_hidden_states
+                )
+                transferred_logits_summary = final_hidden_value_summary(logits)
+                reference_logits_summary = final_hidden_value_summary(
+                    reference_logits
+                )
                 payload_hashes = {
                     req_id: scheduler_output.bootstrap_final_hiddens[req_id][
                         "data_sha256"
@@ -1797,7 +1903,9 @@ class NPUModelRunner(GPUModelRunner):
                     "payload_sha256_prefix=%s hidden_exact=%s "
                     "hidden_max_abs=%s logits_exact=%s logits_max_abs=%s "
                     "top1_match=%s transferred_top_ids=%s "
-                    "reference_top_ids=%s",
+                    "reference_top_ids=%s transferred_hidden=%s "
+                    "reference_hidden=%s transferred_logits=%s "
+                    "reference_logits=%s",
                     ordered_bootstrap_req_ids,
                     payload_hashes,
                     parity["hidden_exact"],
@@ -1807,6 +1915,10 @@ class NPUModelRunner(GPUModelRunner):
                     parity["top1_match"],
                     parity["transferred_top_ids"],
                     parity["reference_top_ids"],
+                    transferred_hidden_summary,
+                    reference_hidden_summary,
+                    transferred_logits_summary,
+                    reference_logits_summary,
                 )
         self.execute_model_state = ExecuteModelState(
             scheduler_output,
@@ -2200,6 +2312,7 @@ class NPUModelRunner(GPUModelRunner):
                         ],
                         dtype=np.int32,
                     ),
+                    logits_indices,
                 )
                 setattr(
                     scheduler_output,
