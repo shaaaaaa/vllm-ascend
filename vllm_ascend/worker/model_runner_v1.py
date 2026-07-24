@@ -2284,6 +2284,8 @@ class NPUModelRunner(GPUModelRunner):
 
         # Run forward pass
         clear_kv_metadata = self.speculative_config is None
+        final_hidden_forward_boundary_diag = None
+        final_hidden_after_sync_clone = None
         with (
             record_function_or_nullcontext("forward"),
             set_ascend_forward_context(
@@ -2320,6 +2322,66 @@ class NPUModelRunner(GPUModelRunner):
             if staged_sfa_graph_key is not None:
                 for _, impl in self._staged_sfa_impls:
                     impl.submit_cross_layer_save()
+            if (
+                envs_ascend.VLLM_ASCEND_FINAL_HIDDEN_PARITY_TRACE
+                and scheduler_output.capture_final_hidden_req_ids
+                and self._is_final_hidden_output_rank()
+            ):
+                trace_hidden_states = (
+                    hidden_states[0]
+                    if self.use_aux_hidden_state_outputs
+                    else hidden_states
+                )
+                assert isinstance(trace_hidden_states, torch.Tensor)
+                final_hidden_forward_boundary_diag = {
+                    "before_device_sync": final_hidden_value_summary(
+                        trace_hidden_states
+                    ),
+                    "before_device_sync_rows": final_hidden_row_summary(
+                        trace_hidden_states[:num_tokens_unpadded]
+                    ),
+                    "data_ptr": trace_hidden_states.data_ptr(),
+                }
+                torch.npu.synchronize()
+                final_hidden_forward_boundary_diag["after_device_sync"] = (
+                    final_hidden_value_summary(trace_hidden_states)
+                )
+                final_hidden_forward_boundary_diag[
+                    "after_device_sync_rows"
+                ] = final_hidden_row_summary(
+                    trace_hidden_states[:num_tokens_unpadded]
+                )
+                final_hidden_after_sync_clone = (
+                    trace_hidden_states.detach().clone()
+                )
+                torch.npu.synchronize()
+        if final_hidden_forward_boundary_diag is not None:
+            trace_hidden_states = (
+                hidden_states[0]
+                if self.use_aux_hidden_state_outputs
+                else hidden_states
+            )
+            assert isinstance(trace_hidden_states, torch.Tensor)
+            assert final_hidden_after_sync_clone is not None
+            final_hidden_forward_boundary_diag["after_connector_exit"] = (
+                final_hidden_value_summary(trace_hidden_states)
+            )
+            final_hidden_forward_boundary_diag[
+                "after_connector_exit_rows"
+            ] = final_hidden_row_summary(
+                trace_hidden_states[:num_tokens_unpadded]
+            )
+            final_hidden_forward_boundary_diag[
+                "after_connector_exit_clone"
+            ] = final_hidden_value_summary(
+                final_hidden_after_sync_clone[:num_tokens_unpadded]
+            )
+            logger.info(
+                "[FINAL_HIDDEN_FORWARD_BOUNDARY_DIAG] requests=%s "
+                "diagnostics=%s",
+                sorted(scheduler_output.capture_final_hidden_req_ids),
+                final_hidden_forward_boundary_diag,
+            )
         with record_function_or_nullcontext("post process"):
             aux_hidden_states = None
             if self.use_aux_hidden_state_outputs:
