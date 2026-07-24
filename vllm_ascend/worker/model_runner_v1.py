@@ -412,6 +412,31 @@ def final_hidden_value_summary(tensor: torch.Tensor) -> dict[str, Any]:
     }
 
 
+def final_hidden_row_summary(tensor: torch.Tensor) -> dict[str, Any]:
+    """Summarize which hidden-state rows contain non-finite values."""
+    if tensor.ndim < 2:
+        raise ValueError(
+            "Final hidden row diagnostics require a tensor with at least 2 dimensions"
+        )
+    rows = tensor.reshape(-1, tensor.shape[-1])
+    finite_per_row = torch.isfinite(rows).sum(dim=-1).to("cpu")
+    row_width = int(rows.shape[-1])
+    fully_finite = finite_per_row == row_width
+    fully_nonfinite = finite_per_row == 0
+    partially_finite = ~(fully_finite | fully_nonfinite)
+    nonfinite_row_indices = torch.nonzero(
+        ~fully_finite, as_tuple=False
+    ).flatten()
+    return {
+        "rows": int(rows.shape[0]),
+        "row_width": row_width,
+        "fully_finite_rows": int(fully_finite.sum().item()),
+        "partially_finite_rows": int(partially_finite.sum().item()),
+        "fully_nonfinite_rows": int(fully_nonfinite.sum().item()),
+        "first_nonfinite_row_indices": nonfinite_row_indices[:16].tolist(),
+    }
+
+
 class NPUModelRunner(GPUModelRunner):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         # TODO(qcs): These manual pad and unpad for GPUModelRunner are
@@ -1410,21 +1435,34 @@ class NPUModelRunner(GPUModelRunner):
                 )
             legacy_row_index = row_end - 1
             legacy_hidden_state = hidden_states[legacy_row_index]
-            payload = serialize_final_hidden_state(legacy_hidden_state)
             if parity_trace:
                 assert sampler_row_indices is not None
                 sampler_row_index = int(sampler_row_indices[req_idx])
                 sampler_hidden_state = hidden_states[sampler_row_index]
+                legacy_npu_before_serialize = final_hidden_value_summary(
+                    legacy_hidden_state
+                )
+                sampler_npu_before_serialize = final_hidden_value_summary(
+                    sampler_hidden_state
+                )
+            payload = serialize_final_hidden_state(legacy_hidden_state)
+            if parity_trace:
                 sampler_payload = serialize_final_hidden_state(
                     sampler_hidden_state
                 )
                 capture_diagnostics = {
                     "legacy_row_index": legacy_row_index,
                     "sampler_row_index": sampler_row_index,
-                    "legacy_npu": final_hidden_value_summary(
+                    "legacy_npu_before_serialize": (
+                        legacy_npu_before_serialize
+                    ),
+                    "sampler_npu_before_serialize": (
+                        sampler_npu_before_serialize
+                    ),
+                    "legacy_npu_after_serialize": final_hidden_value_summary(
                         legacy_hidden_state
                     ),
-                    "sampler_npu": final_hidden_value_summary(
+                    "sampler_npu_after_serialize": final_hidden_value_summary(
                         sampler_hidden_state
                     ),
                     "payload_cpu": final_hidden_value_summary(
@@ -2364,6 +2402,65 @@ class NPUModelRunner(GPUModelRunner):
                 )
                 assert broadcasted is not None
                 logits = broadcasted["logits"]
+
+            if (
+                envs_ascend.VLLM_ASCEND_FINAL_HIDDEN_PARITY_TRACE
+                and final_hidden_states
+            ):
+                unpadded_hidden_rows = hidden_states[:num_tokens_unpadded]
+                padded_hidden_rows = hidden_states[
+                    num_tokens_unpadded:num_tokens_padded
+                ]
+                row_end = 0
+                for req_idx, req_id in enumerate(self.input_batch.req_ids):
+                    row_start = row_end
+                    row_end += int(num_scheduled_tokens_np[req_idx])
+                    if req_id not in final_hidden_states:
+                        continue
+                    req_logits = logits[req_idx]
+                    topk = min(5, req_logits.shape[-1])
+                    sampler_row_index = int(
+                        logits_indices[req_idx].detach().to("cpu").item()
+                    )
+                    logger.info(
+                        "[FINAL_HIDDEN_PRODUCER_SAMPLE_DIAG] req=%s "
+                        "cudagraph_mode=%s staged_sfa_graph_key=%s "
+                        "num_tokens_unpadded=%s num_tokens_padded=%s "
+                        "hidden_shape=%s req_row_start=%s req_row_end=%s "
+                        "req_num_scheduled_tokens=%s legacy_row_index=%s "
+                        "sampler_row_index=%s "
+                        "unpadded_row_summary=%s padded_row_summary=%s "
+                        "legacy_after_lm_head=%s "
+                        "actual_sample_hidden=%s producer_logits=%s "
+                        "producer_top_ids=%s",
+                        req_id,
+                        cudagraph_mode,
+                        staged_sfa_graph_key,
+                        num_tokens_unpadded,
+                        num_tokens_padded,
+                        list(hidden_states.shape),
+                        row_start,
+                        row_end,
+                        int(num_scheduled_tokens_np[req_idx]),
+                        row_end - 1,
+                        sampler_row_index,
+                        final_hidden_row_summary(unpadded_hidden_rows),
+                        (
+                            final_hidden_row_summary(padded_hidden_rows)
+                            if padded_hidden_rows.shape[0] > 0
+                            else None
+                        ),
+                        final_hidden_value_summary(
+                            hidden_states[row_end - 1]
+                        ),
+                        final_hidden_value_summary(
+                            sample_hidden_states[req_idx]
+                        ),
+                        final_hidden_value_summary(req_logits),
+                        torch.topk(req_logits, k=topk, dim=-1)
+                        .indices.to("cpu")
+                        .tolist(),
+                    )
 
             # Apply structured output bitmasks if present
             self.execute_model_state = ExecuteModelState(

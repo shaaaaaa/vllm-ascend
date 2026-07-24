@@ -10,6 +10,7 @@ from vllm_ascend.worker.model_runner_v1 import (
     NPUModelRunner,
     deserialize_final_hidden_state,
     final_hidden_parity_summary,
+    final_hidden_row_summary,
     final_hidden_value_summary,
     serialize_final_hidden_state,
 )
@@ -117,6 +118,26 @@ def test_final_hidden_value_summary_counts_nonfinite_values():
     }
 
 
+def test_final_hidden_row_summary_reports_nonfinite_row_classes():
+    values = torch.tensor(
+        [
+            [1.0, 2.0],
+            [float("nan"), 3.0],
+            [float("nan"), float("inf")],
+        ],
+        dtype=torch.float32,
+    )
+
+    assert final_hidden_row_summary(values) == {
+        "rows": 3,
+        "row_width": 2,
+        "fully_finite_rows": 1,
+        "partially_finite_rows": 1,
+        "fully_nonfinite_rows": 1,
+        "first_nonfinite_row_indices": [1, 2],
+    }
+
+
 def test_capture_final_hidden_uses_last_scheduled_row_per_request():
     runner = object.__new__(NPUModelRunner)
     runner.input_batch = SimpleNamespace(req_ids=["request-a", "request-b"])
@@ -167,8 +188,10 @@ def test_capture_diagnostics_compare_legacy_and_sampler_rows(monkeypatch):
     diagnostics = payloads["request-b"]["capture_diagnostics"]
     assert diagnostics["legacy_row_index"] == 4
     assert diagnostics["sampler_row_index"] == 3
-    assert diagnostics["legacy_npu"]["nan_count"] == 2
-    assert diagnostics["sampler_npu"]["nan_count"] == 0
+    assert diagnostics["legacy_npu_before_serialize"]["nan_count"] == 2
+    assert diagnostics["sampler_npu_before_serialize"]["nan_count"] == 0
+    assert diagnostics["legacy_npu_after_serialize"]["nan_count"] == 2
+    assert diagnostics["sampler_npu_after_serialize"]["nan_count"] == 0
     assert diagnostics["payload_cpu"]["nan_count"] == 2
     assert not diagnostics["legacy_equals_sampler"]
     assert diagnostics["legacy_sha256"] != diagnostics["sampler_sha256"]
