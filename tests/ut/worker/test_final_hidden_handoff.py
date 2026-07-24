@@ -8,6 +8,7 @@ import vllm_ascend.worker.model_runner_v1 as model_runner_v1
 from vllm_ascend.worker.model_runner_v1 import (
     ExecuteModelState,
     NPUModelRunner,
+    NonFiniteFinalHiddenStateError,
     deserialize_final_hidden_state,
     final_hidden_parity_summary,
     serialize_final_hidden_state,
@@ -49,6 +50,17 @@ def test_final_hidden_payload_rejects_oversize_before_decode():
 
     with pytest.raises(ValueError, match="16 MiB decoded size limit"):
         deserialize_final_hidden_state(payload)
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), -float("inf")])
+def test_final_hidden_payload_rejects_nonfinite_values(value):
+    hidden_state = torch.tensor([1.0, value], dtype=torch.float32)
+
+    with pytest.raises(
+        NonFiniteFinalHiddenStateError,
+        match="1/2 non-finite values",
+    ):
+        serialize_final_hidden_state(hidden_state)
 
 
 def test_final_hidden_parity_summary_reports_exact_match():
@@ -95,22 +107,46 @@ def test_final_hidden_parity_summary_reports_top1_mismatch():
     assert summary["top1_match"] == [False]
 
 
-def test_capture_final_hidden_uses_last_scheduled_row_per_request():
+def test_capture_final_hidden_reuses_sampler_selected_row_per_request():
     runner = object.__new__(NPUModelRunner)
     runner.input_batch = SimpleNamespace(req_ids=["request-a", "request-b"])
     scheduler_output = SimpleNamespace(
         capture_final_hidden_req_ids={"request-b"}
     )
-    hidden_states = torch.arange(20, dtype=torch.float32).reshape(5, 4)
+    sample_hidden_states = torch.tensor(
+        [
+            [1.0, 2.0, 3.0, 4.0],
+            [11.0, 12.0, 13.0, 14.0],
+        ],
+        dtype=torch.float32,
+    )
 
     payloads = runner._capture_final_hidden_states(
         scheduler_output,
-        hidden_states,
-        num_scheduled_tokens=torch.tensor([2, 3]).numpy(),
+        sample_hidden_states,
     )
 
     restored = deserialize_final_hidden_state(payloads["request-b"])
-    assert torch.equal(restored, hidden_states[4])
+    assert torch.equal(restored, sample_hidden_states[1])
+
+
+def test_capture_final_hidden_skips_nonfinite_sampler_row():
+    runner = object.__new__(NPUModelRunner)
+    runner.input_batch = SimpleNamespace(req_ids=["request"])
+    scheduler_output = SimpleNamespace(
+        capture_final_hidden_req_ids={"request"}
+    )
+    sample_hidden_states = torch.tensor(
+        [[1.0, float("nan")]],
+        dtype=torch.float32,
+    )
+
+    payloads = runner._capture_final_hidden_states(
+        scheduler_output,
+        sample_hidden_states,
+    )
+
+    assert payloads == {}
 
 
 @pytest.mark.parametrize(
