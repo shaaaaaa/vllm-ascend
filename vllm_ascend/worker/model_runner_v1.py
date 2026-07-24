@@ -437,6 +437,19 @@ def final_hidden_row_summary(tensor: torch.Tensor) -> dict[str, Any]:
     }
 
 
+def final_hidden_tensor_sha256_prefix(tensor: torch.Tensor) -> str:
+    """Fingerprint an exact tensor payload for diagnostic comparisons."""
+    raw = (
+        tensor.detach()
+        .to("cpu")
+        .contiguous()
+        .view(torch.uint8)
+        .numpy()
+        .tobytes()
+    )
+    return hashlib.sha256(raw).hexdigest()[:16]
+
+
 class NPUModelRunner(GPUModelRunner):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         # TODO(qcs): These manual pad and unpad for GPUModelRunner are
@@ -2297,6 +2310,37 @@ class NPUModelRunner(GPUModelRunner):
         clear_kv_metadata = self.speculative_config is None
         final_hidden_forward_boundary_diag = None
         final_hidden_after_sync_clone = None
+        final_hidden_boundary_trace_requests: list[str] = []
+        final_hidden_boundary_trace_reason = None
+        if (
+            envs_ascend.VLLM_ASCEND_FINAL_HIDDEN_PARITY_TRACE
+            and self._is_final_hidden_output_rank()
+        ):
+            capture_req_ids = set(
+                scheduler_output.capture_final_hidden_req_ids or ()
+            )
+            prefill_req_ids = [
+                req_id
+                for req_idx, req_id in enumerate(
+                    self.input_batch.req_ids[:num_reqs]
+                )
+                if (
+                    int(self.input_batch.num_computed_tokens_cpu[req_idx])
+                    < int(self.input_batch.num_prompt_tokens[req_idx])
+                )
+            ]
+            if capture_req_ids:
+                final_hidden_boundary_trace_requests = sorted(capture_req_ids)
+                final_hidden_boundary_trace_reason = "capture_requested"
+            elif self.is_kv_producer and prefill_req_ids:
+                # This control path deliberately does not depend on
+                # ret_final_hidden/capture_final_hidden_req_ids. It lets an
+                # otherwise identical producer-prefill run prove whether the
+                # model output was already non-finite with handoff disabled.
+                final_hidden_boundary_trace_requests = prefill_req_ids
+                final_hidden_boundary_trace_reason = (
+                    "producer_prefill_without_capture"
+                )
         with (
             record_function_or_nullcontext("forward"),
             set_ascend_forward_context(
@@ -2334,9 +2378,8 @@ class NPUModelRunner(GPUModelRunner):
                 for _, impl in self._staged_sfa_impls:
                     impl.submit_cross_layer_save()
             if (
-                envs_ascend.VLLM_ASCEND_FINAL_HIDDEN_PARITY_TRACE
-                and scheduler_output.capture_final_hidden_req_ids
-                and self._is_final_hidden_output_rank()
+                final_hidden_boundary_trace_requests
+                and final_hidden_boundary_trace_reason is not None
             ):
                 trace_hidden_states = (
                     hidden_states[0]
@@ -2352,8 +2395,56 @@ class NPUModelRunner(GPUModelRunner):
                         trace_hidden_states[:num_tokens_unpadded]
                     ),
                     "data_ptr": trace_hidden_states.data_ptr(),
+                    "trace_reason": final_hidden_boundary_trace_reason,
+                    "capture_request_ids": sorted(
+                        scheduler_output.capture_final_hidden_req_ids or ()
+                    ),
+                    "is_kv_producer": self.is_kv_producer,
+                    "is_kv_consumer": self.is_kv_consumer,
+                    "request_ids": list(
+                        self.input_batch.req_ids[:num_reqs]
+                    ),
+                    "num_scheduled_tokens": [
+                        int(value) for value in num_scheduled_tokens_np
+                    ],
+                    "num_computed_tokens_before": [
+                        int(value)
+                        for value in self.input_batch.num_computed_tokens_cpu[
+                            :num_reqs
+                        ]
+                    ],
+                    "num_prompt_tokens": [
+                        int(value)
+                        for value in self.input_batch.num_prompt_tokens[
+                            :num_reqs
+                        ]
+                    ],
+                    "num_tokens_unpadded": int(num_tokens_unpadded),
+                    "num_tokens_padded": int(num_tokens_padded),
+                    "cudagraph_mode": str(cudagraph_mode),
+                    "staged_sfa_graph_key": staged_sfa_graph_key,
+                    "should_ubatch": bool(should_ubatch),
                 }
                 torch.npu.synchronize()
+                if input_ids is not None:
+                    final_hidden_forward_boundary_diag[
+                        "input_ids_sha256_prefix"
+                    ] = final_hidden_tensor_sha256_prefix(
+                        input_ids[:num_tokens_unpadded]
+                    )
+                if positions.ndim == 2:
+                    trace_positions = positions[:, :num_tokens_unpadded]
+                else:
+                    trace_positions = positions[:num_tokens_unpadded]
+                final_hidden_forward_boundary_diag[
+                    "positions_sha256_prefix"
+                ] = final_hidden_tensor_sha256_prefix(trace_positions)
+                final_hidden_forward_boundary_diag[
+                    "positions_first"
+                ] = trace_positions.reshape(-1)[:8].to("cpu").tolist()
+                final_hidden_forward_boundary_diag[
+                    "positions_last"
+                ] = trace_positions.reshape(-1)[-8:].to("cpu").tolist()
                 final_hidden_forward_boundary_diag["after_device_sync"] = (
                     final_hidden_value_summary(trace_hidden_states)
                 )
@@ -2389,8 +2480,11 @@ class NPUModelRunner(GPUModelRunner):
             )
             logger.info(
                 "[FINAL_HIDDEN_FORWARD_BOUNDARY_DIAG] requests=%s "
+                "reason=%s capture_requested=%s "
                 "diagnostics=%s",
-                sorted(scheduler_output.capture_final_hidden_req_ids),
+                final_hidden_boundary_trace_requests,
+                final_hidden_boundary_trace_reason,
+                bool(scheduler_output.capture_final_hidden_req_ids),
                 final_hidden_forward_boundary_diag,
             )
         with record_function_or_nullcontext("post process"):
