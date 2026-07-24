@@ -83,6 +83,21 @@ class TestBlockTableComputeSlotMapping(TestBase):
                                    (i + 1) * 4))  # [0,1,2,3], [4,5,6,7], etc.
             block_table.add_row(block_ids, i)
 
+    def test_commit_block_table_only_copies_after_mutation(self):
+        block_table = self.create_block_table(1, 0, 1, 0, 1)
+
+        with patch.object(block_table.block_table, "copy_to_gpu") as copy_to_gpu:
+            block_table.commit_block_table(1)
+            block_table.commit_block_table(1)
+            copy_to_gpu.assert_called_once_with(1)
+
+            block_table.add_row([0], 0)
+            block_table.commit_block_table(1)
+            self.assertEqual(copy_to_gpu.call_count, 2)
+
+            block_table.commit_block_table(1, force=True)
+            self.assertEqual(copy_to_gpu.call_count, 3)
+
     def _test_slot_mapping_for_ranks(self, dcp_world_size, pcp_world_size,
                                      cp_kv_cache_interleave_size,
                                      test_configs):

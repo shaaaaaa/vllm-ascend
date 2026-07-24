@@ -745,13 +745,23 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
         # Staged SHRINK_LATENT=2 graph input. The address must survive metadata
         # rebuilds across decode steps, so keep one builder-owned device buffer
         # and overwrite only its contents before Graph A replay.
+        max_num_tokens = int(vllm_config.scheduler_config.max_num_batched_tokens)
         self.decode_remap_boundary = torch.empty(
-            vllm_config.scheduler_config.max_num_batched_tokens,
+            max_num_tokens,
             dtype=torch.int32,
             device=device,
         )
+        # Reuse fixed Q1 row metadata until batch composition changes.
+        self.decode_prompt_lens = torch.empty_like(self.decode_remap_boundary)
+        self.decode_req_indices = torch.empty_like(self.decode_remap_boundary)
+        self.decode_req_indices_compact = torch.empty(max_num_tokens, dtype=torch.long, device=device)
         self.decode_valid_row_indices = torch.empty_like(self.decode_remap_boundary)
         self.decode_scratch_base = torch.empty_like(self.decode_remap_boundary)
+        self._decode_prompt_lens_cpu = np.zeros(max_num_tokens, dtype=np.int32)
+        self._decode_req_indices_cpu = np.full(max_num_tokens, -1, dtype=np.int32)
+        self._decode_row_indices_cpu = np.arange(max_num_tokens, dtype=np.int64)
+        self._decode_scratch_base_cpu = np.zeros(max_num_tokens, dtype=np.int32)
+        self._decode_q1_signature = None
 
     @staticmethod
     def determine_chunked_prefill_workspace_size(vllm_config: VllmConfig) -> int:
@@ -816,70 +826,114 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
         num_decode_rows = 0
         plens_cpu = common_attn_metadata.prompt_lens_cpu if self.dsa_shrink_latent else None
         if plens_cpu is not None:
-            rows = np.zeros(num_input_tokens, dtype=np.int32)
-            req_rows = np.full(num_input_tokens, -1, dtype=np.int32)
-            row_offsets = np.zeros(num_input_tokens, dtype=np.int32)
+            plens_cpu = np.asarray(plens_cpu, dtype=np.int32)
             n_real = min(len(plens_cpu), num_reqs)
-            qsl = common_attn_metadata.query_start_loc_cpu[: n_real + 1].numpy()
             computed = common_attn_metadata.num_computed_tokens_cpu[:n_real].numpy()
-            for r in range(n_real):
-                s, e = int(qsl[r]), int(qsl[r + 1])
-                plen = int(plens_cpu[r])
-                first_decode = max(s, s + plen - int(computed[r]))
-                if first_decode < e:
-                    count = e - first_decode
-                    offsets = np.arange(count, dtype=np.int32)
-                    rows[first_decode:e] = plen
-                    req_rows[first_decode:e] = r
-                    row_offsets[first_decode:e] = offsets
-            num_decode_rows = int(np.count_nonzero(req_rows >= 0))
-            prompt_lens_rows = torch.from_numpy(rows).to(block_table.device)
-            decode_req_indices_rows = torch.from_numpy(req_rows).to(block_table.device)
-            scratch_base_np = row_offsets.astype(np.int32) * self.index_topk
-            # Plain decode has one row per request and uses the legacy per-request
-            # sparse slot mapping. Only MTP/spec rows need disjoint scratch bases
-            # and explicit target-slot tensors.
-            needs_row_scratch_base = bool(np.any(scratch_base_np))
-            if num_decode_rows > 0:
-                self.decode_scratch_base[:num_input_tokens].copy_(torch.from_numpy(scratch_base_np))
-                decode_scratch_base_rows = self.decode_scratch_base[:num_input_tokens]
-            if needs_row_scratch_base:
-                decode_row_offsets_rows = torch.from_numpy(row_offsets).to(block_table.device)
             need_sparse_lmcache_payload = self.dsa_shrink_latent != 3 and staged_sfa_connector_supports_sparse_load()
-            valid_row_indices_np = np.flatnonzero(req_rows >= 0).astype(np.int32)
-            if valid_row_indices_np.size:
-                decode_valid_rows_all = int(valid_row_indices_np.size) == int(num_input_tokens)
-                valid_req_indices_np = req_rows[valid_row_indices_np].astype(np.int64)
-                valid_scratch_base_np = scratch_base_np[valid_row_indices_np]
-                decode_req_indices_compact_cpu = valid_req_indices_np
-                req_ids = common_attn_metadata.request_ids
-                if req_ids is not None:
-                    decode_request_ids_compact = [req_ids[int(req_idx)] for req_idx in valid_req_indices_np]
-                # The fused kernel assigns each complete source row to one AIV.
-                valid_row_count = int(valid_row_indices_np.size)
-                self.decode_valid_row_indices[:valid_row_count].copy_(torch.from_numpy(valid_row_indices_np))
-                decode_valid_row_indices = self.decode_valid_row_indices[:valid_row_count]
-                decode_req_indices_compact = torch.from_numpy(valid_req_indices_np).to(block_table.device)
-                if needs_row_scratch_base:
-                    required_capacity = int(valid_scratch_base_np.max()) + self.index_topk
-                    if required_capacity > decode_scratch_capacity:
-                        raise RuntimeError(
-                            "DSA compact scratch rows exceed the scheduler "
-                            "reservation: required_capacity="
-                            f"{required_capacity}, reserved_capacity="
-                            f"{decode_scratch_capacity}, "
-                            f"decode_threshold={self.decode_threshold}."
-                        )
-                    decode_scratch_base_compact = torch.from_numpy(valid_scratch_base_np).to(block_table.device)
-                    decode_target_slot_mapping = _dsa_build_target_slot_mapping(
-                        block_table,
-                        decode_req_indices_compact,
-                        decode_scratch_base_compact,
-                        self.index_topk,
-                        self.block_size,
-                        scratch_capacity=decode_scratch_capacity,
-                        position_offsets=self._dsa_target_position_offsets,
+            q1_decode = (
+                not self.enable_dsa_cp
+                and common_attn_metadata.attn_state == AscendAttentionState.DecodeOnly
+                and num_input_tokens == num_reqs
+                and num_actual_tokens == len(plens_cpu)
+                and n_real == len(plens_cpu)
+                and np.all(computed >= plens_cpu[:n_real])
+            )
+            if q1_decode:
+                num_decode_rows = num_actual_tokens
+                signature = (
+                    num_input_tokens,
+                    tuple(common_attn_metadata.request_ids or ()),
+                    tuple(map(int, plens_cpu)),
+                )
+                rows = self._decode_prompt_lens_cpu[:num_input_tokens]
+                req_rows = self._decode_req_indices_cpu[:num_input_tokens]
+                scratch_base_np = self._decode_scratch_base_cpu[:num_input_tokens]
+                if signature != self._decode_q1_signature:
+                    rows.fill(0)
+                    rows[:num_decode_rows] = plens_cpu
+                    req_rows.fill(-1)
+                    req_rows[:num_decode_rows] = self._decode_row_indices_cpu[:num_decode_rows]
+                    self.decode_prompt_lens[:num_input_tokens].copy_(torch.from_numpy(rows))
+                    self.decode_req_indices[:num_input_tokens].copy_(torch.from_numpy(req_rows))
+                    self.decode_valid_row_indices[:num_decode_rows].copy_(
+                        torch.from_numpy(self._decode_row_indices_cpu[:num_decode_rows])
                     )
+                    self.decode_req_indices_compact[:num_decode_rows].copy_(
+                        torch.from_numpy(self._decode_row_indices_cpu[:num_decode_rows])
+                    )
+                    self.decode_scratch_base[:num_input_tokens].zero_()
+                    self._decode_q1_signature = signature
+                prompt_lens_rows = self.decode_prompt_lens[:num_input_tokens]
+                decode_req_indices_rows = self.decode_req_indices[:num_input_tokens]
+                decode_valid_row_indices = self.decode_valid_row_indices[:num_decode_rows]
+                decode_valid_rows_all = num_decode_rows == num_input_tokens
+                decode_req_indices_compact = self.decode_req_indices_compact[:num_decode_rows]
+                decode_req_indices_compact_cpu = self._decode_row_indices_cpu[:num_decode_rows]
+                decode_request_ids_compact = common_attn_metadata.request_ids
+                decode_scratch_base_rows = self.decode_scratch_base[:num_input_tokens]
+            else:
+                self._decode_q1_signature = None
+                rows = np.zeros(num_input_tokens, dtype=np.int32)
+                req_rows = np.full(num_input_tokens, -1, dtype=np.int32)
+                row_offsets = np.zeros(num_input_tokens, dtype=np.int32)
+                qsl = common_attn_metadata.query_start_loc_cpu[: n_real + 1].numpy()
+                for r in range(n_real):
+                    s, e = int(qsl[r]), int(qsl[r + 1])
+                    plen = int(plens_cpu[r])
+                    first_decode = max(s, s + plen - int(computed[r]))
+                    if first_decode < e:
+                        count = e - first_decode
+                        offsets = np.arange(count, dtype=np.int32)
+                        rows[first_decode:e] = plen
+                        req_rows[first_decode:e] = r
+                        row_offsets[first_decode:e] = offsets
+                num_decode_rows = int(np.count_nonzero(req_rows >= 0))
+                prompt_lens_rows = torch.from_numpy(rows).to(block_table.device)
+                decode_req_indices_rows = torch.from_numpy(req_rows).to(block_table.device)
+                scratch_base_np = row_offsets.astype(np.int32) * self.index_topk
+                # Plain decode has one row per request and uses the legacy per-request
+                # sparse slot mapping. Only MTP/spec rows need disjoint scratch bases
+                # and explicit target-slot tensors.
+                needs_row_scratch_base = bool(np.any(scratch_base_np))
+                if num_decode_rows > 0:
+                    self.decode_scratch_base[:num_input_tokens].copy_(torch.from_numpy(scratch_base_np))
+                    decode_scratch_base_rows = self.decode_scratch_base[:num_input_tokens]
+                if needs_row_scratch_base:
+                    decode_row_offsets_rows = torch.from_numpy(row_offsets).to(block_table.device)
+                valid_row_indices_np = np.flatnonzero(req_rows >= 0).astype(np.int32)
+                if valid_row_indices_np.size:
+                    decode_valid_rows_all = int(valid_row_indices_np.size) == int(num_input_tokens)
+                    valid_req_indices_np = req_rows[valid_row_indices_np].astype(np.int64)
+                    valid_scratch_base_np = scratch_base_np[valid_row_indices_np]
+                    decode_req_indices_compact_cpu = valid_req_indices_np
+                    req_ids = common_attn_metadata.request_ids
+                    if req_ids is not None:
+                        decode_request_ids_compact = [req_ids[int(req_idx)] for req_idx in valid_req_indices_np]
+                    # The fused kernel assigns each complete source row to one AIV.
+                    valid_row_count = int(valid_row_indices_np.size)
+                    self.decode_valid_row_indices[:valid_row_count].copy_(torch.from_numpy(valid_row_indices_np))
+                    decode_valid_row_indices = self.decode_valid_row_indices[:valid_row_count]
+                    decode_req_indices_compact = torch.from_numpy(valid_req_indices_np).to(block_table.device)
+                    if needs_row_scratch_base:
+                        required_capacity = int(valid_scratch_base_np.max()) + self.index_topk
+                        if required_capacity > decode_scratch_capacity:
+                            raise RuntimeError(
+                                "DSA compact scratch rows exceed the scheduler "
+                                "reservation: required_capacity="
+                                f"{required_capacity}, reserved_capacity="
+                                f"{decode_scratch_capacity}, "
+                                f"decode_threshold={self.decode_threshold}."
+                            )
+                        decode_scratch_base_compact = torch.from_numpy(valid_scratch_base_np).to(block_table.device)
+                        decode_target_slot_mapping = _dsa_build_target_slot_mapping(
+                            block_table,
+                            decode_req_indices_compact,
+                            decode_scratch_base_compact,
+                            self.index_topk,
+                            self.block_size,
+                            scratch_capacity=decode_scratch_capacity,
+                            position_offsets=self._dsa_target_position_offsets,
+                        )
 
         cum_query_lens = common_attn_metadata.query_start_loc[1 : num_reqs + 1]
         seq_lens = common_attn_metadata.seq_lens[:num_reqs]

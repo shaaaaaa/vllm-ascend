@@ -1674,3 +1674,109 @@ class TestAscendSFAMetadataBuilder(TestBase):
 
         assert isinstance(attn_metadata, AscendSFAMetadata)
         assert attn_metadata.attn_state == AscendAttentionState.DecodeOnly
+
+    @patch("vllm_ascend.attention.sfa_v1.staged_sfa_connector_supports_sparse_load", return_value=True)
+    @patch("vllm_ascend.attention.sfa_v1.get_cos_and_sin_mla")
+    def test_q1_sparse_rows_reuse_builder_storage(self, mock_get_cos_and_sin_mla, _):
+        vllm_config = MagicMock()
+        vllm_config.cache_config.block_size = 16
+        vllm_config.model_config.max_model_len = 1024
+        vllm_config.model_config.get_head_size.return_value = 64
+        vllm_config.model_config.dtype = torch.float16
+        vllm_config.model_config.hf_text_config.qk_rope_head_dim = 64
+        vllm_config.model_config.hf_text_config.topk_tokens = 32
+        vllm_config.speculative_config = None
+        vllm_config.scheduler_config.max_num_seqs = 4
+        vllm_config.scheduler_config.max_num_batched_tokens = 4
+        builder = AscendSFAMetadataBuilder(
+            kv_cache_spec=MagicMock(),
+            layer_names=["layer1"],
+            vllm_config=vllm_config,
+            device=torch.device("cpu"),
+        )
+        builder.dsa_shrink_latent = 2
+        builder.enable_dsa_cp = False
+
+        common = MagicMock()
+        common.num_reqs = 4
+        common.num_actual_tokens = 2
+        common.num_input_tokens = 4
+        common.block_table_tensor = torch.zeros((4, 4), dtype=torch.int32)
+        common.slot_mapping = torch.arange(4, dtype=torch.int32)
+        common.positions = torch.arange(4, dtype=torch.long)
+        common.indexer_block_table_tensor = None
+        common.indexer_slot_mapping = None
+        common.prompt_lens_cpu = np.array([128, 256], dtype=np.int32)
+        common.request_ids = ["req0", "req1"]
+        common.query_start_loc = torch.arange(5, dtype=torch.int32)
+        common.query_start_loc_cpu = torch.arange(5, dtype=torch.int32)
+        common.num_computed_tokens_cpu = torch.tensor([128, 256, 0, 0], dtype=torch.int32)
+        common.seq_lens = torch.tensor([129, 257, 0, 0], dtype=torch.int32)
+        common.seq_lens_cpu = common.seq_lens.cpu()
+        common.attn_state = AscendAttentionState.DecodeOnly
+        mock_get_cos_and_sin_mla.return_value = (
+            torch.zeros((4, 1)),
+            torch.zeros((4, 1)),
+        )
+
+        first = builder.build(0, common)
+        prompt_lens_version = first.prompt_lens._version
+        second = builder.build(0, common)
+
+        self.assertEqual(first.prompt_lens.data_ptr(), second.prompt_lens.data_ptr())
+        self.assertEqual(first.decode_req_indices.data_ptr(), second.decode_req_indices.data_ptr())
+        self.assertEqual(second.prompt_lens._version, prompt_lens_version)
+        torch.testing.assert_close(
+            second.prompt_lens,
+            torch.tensor([128, 256, 0, 0], dtype=torch.int32),
+        )
+        torch.testing.assert_close(
+            second.decode_req_indices,
+            torch.tensor([0, 1, -1, -1], dtype=torch.int32),
+        )
+        torch.testing.assert_close(
+            second.decode_valid_row_indices,
+            torch.tensor([0, 1], dtype=torch.int32),
+        )
+        self.assertFalse(second.decode_valid_rows_all)
+
+        common.num_computed_tokens_cpu = torch.tensor([127, 256, 0, 0], dtype=torch.int32)
+        prompt_remainder = builder.build(0, common)
+
+        self.assertEqual(prompt_remainder.num_decode_tokens, 1)
+        torch.testing.assert_close(
+            prompt_remainder.decode_valid_row_indices,
+            torch.tensor([1], dtype=torch.int32),
+        )
+
+        common.num_computed_tokens_cpu = torch.tensor([128, 384, 0, 0], dtype=torch.int32)
+        common.prompt_lens_cpu = np.array([128, 384], dtype=np.int32)
+        common.request_ids = ["req0", "req2"]
+        updated = builder.build(0, common)
+
+        self.assertEqual(first.prompt_lens.data_ptr(), updated.prompt_lens.data_ptr())
+        self.assertGreater(updated.prompt_lens._version, prompt_lens_version)
+        torch.testing.assert_close(
+            updated.prompt_lens,
+            torch.tensor([128, 384, 0, 0], dtype=torch.int32),
+        )
+        self.assertEqual(updated.decode_request_ids_compact, ["req0", "req2"])
+
+        common.attn_state = AscendAttentionState.ChunkedPrefill
+        common.num_actual_tokens = 4
+        common.query_start_loc = torch.tensor([0, 2, 4, 4, 4], dtype=torch.int32)
+        common.query_start_loc_cpu = common.query_start_loc.cpu()
+        common.num_computed_tokens_cpu = torch.tensor([127, 383, 0, 0], dtype=torch.int32)
+        builder.build(0, common)
+
+        common.attn_state = AscendAttentionState.DecodeOnly
+        common.num_actual_tokens = 2
+        common.query_start_loc = torch.arange(5, dtype=torch.int32)
+        common.query_start_loc_cpu = common.query_start_loc.cpu()
+        common.num_computed_tokens_cpu = torch.tensor([128, 384, 0, 0], dtype=torch.int32)
+        restored = builder.build(0, common)
+
+        torch.testing.assert_close(
+            restored.decode_valid_row_indices,
+            torch.tensor([0, 1], dtype=torch.int32),
+        )

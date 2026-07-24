@@ -174,6 +174,52 @@ class TestStagedSFAGraphKey(unittest.TestCase):
                 key.to_legacy_batch_descriptor()
 
 
+class TestQueryStartPadding(unittest.TestCase):
+    @staticmethod
+    def _build_runner():
+        runner = NPUModelRunner.__new__(NPUModelRunner)
+        runner.uniform_decode_query_len = 1
+        runner.compilation_config = SimpleNamespace(
+            cudagraph_mode=CUDAGraphMode.PIECEWISE,
+        )
+        runner.arange_np = np.arange(8, dtype=np.int32)
+        runner.query_start_loc = SimpleNamespace(
+            np=np.array([0, 1, 2, -1, -1, -1, -1, -1], dtype=np.int32),
+            copy_to_gpu=MagicMock(),
+        )
+        return runner
+
+    def test_exact_q1_capacity_reuses_uploaded_query_starts(self):
+        runner = self._build_runner()
+
+        padded_reqs = runner._pad_query_start_loc_for_fia(
+            num_tokens_padded=2,
+            num_reqs_padded=2,
+            num_reqs=2,
+            batch_desc_num_reqs=2,
+        )
+
+        self.assertEqual(padded_reqs, 2)
+        runner.query_start_loc.copy_to_gpu.assert_not_called()
+
+    def test_padded_q1_capacity_uploads_padding(self):
+        runner = self._build_runner()
+
+        padded_reqs = runner._pad_query_start_loc_for_fia(
+            num_tokens_padded=4,
+            num_reqs_padded=4,
+            num_reqs=2,
+            batch_desc_num_reqs=4,
+        )
+
+        self.assertEqual(padded_reqs, 4)
+        np.testing.assert_array_equal(
+            runner.query_start_loc.np[:5],
+            np.arange(5, dtype=np.int32),
+        )
+        runner.query_start_loc.copy_to_gpu.assert_called_once_with()
+
+
 class TestStagedSFADummyBatch(unittest.TestCase):
     @staticmethod
     def _build_runner():

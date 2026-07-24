@@ -75,6 +75,7 @@ class BlockTable:
         if self.pcp_world_size * self.dcp_world_size > 1:
             duplicate_size += num_speculative_tokens
         self.block_table = self._make_buffer(max_num_reqs * duplicate_size, logical_table_size, dtype=torch.int32)
+        self._block_table_dirty = True
         self.num_blocks_per_row = np.zeros(max_num_reqs, dtype=np.int32)
         self.slot_mapping = self._make_buffer(
             self.max_num_batched_tokens + 2 * self.pcp_world_size * self.max_num_reqs, dtype=torch.int32
@@ -99,15 +100,18 @@ class BlockTable:
 
         self.block_table.np[row_idx, start : start + num_blocks] = block_ids
         self.num_blocks_per_row[row_idx] += num_blocks
+        self._block_table_dirty = True
 
     def add_row(self, block_ids: list[int], row_idx: int) -> None:
         self.num_blocks_per_row[row_idx] = 0
+        self._block_table_dirty = True
         self.append_row(block_ids, row_idx)
 
     def move_row(self, src: int, tgt: int) -> None:
         num_blocks = self.num_blocks_per_row[src]
         self.block_table.np[tgt, :num_blocks] = self.block_table.np[src, :num_blocks]
         self.num_blocks_per_row[tgt] = num_blocks
+        self._block_table_dirty = True
 
     def swap_row(self, src: int, tgt: int) -> None:
         num_blocks_src = self.num_blocks_per_row[src]
@@ -116,6 +120,7 @@ class BlockTable:
         self.num_blocks_per_row[tgt] = num_blocks_src
 
         self.block_table.np[[src, tgt]] = self.block_table.np[[tgt, src]]
+        self._block_table_dirty = True
 
     def compute_slot_mapping(self, req_indices: np.ndarray, positions: np.ndarray) -> None:
         # E.g., [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]
@@ -185,8 +190,11 @@ class BlockTable:
                 block_offsets = positions % self.block_size
                 np.add(block_numbers * self.block_size, block_offsets, out=self.slot_mapping.np[: req_indices.shape[0]])
 
-    def commit_block_table(self, num_reqs: int) -> None:
+    def commit_block_table(self, num_reqs: int, force: bool = False) -> None:
+        if not (force or self._block_table_dirty):
+            return
         self.block_table.copy_to_gpu(num_reqs)
+        self._block_table_dirty = False
 
     def commit_slot_mapping(self, num_tokens: int) -> None:
         self.slot_mapping.copy_to_gpu(num_tokens)
@@ -194,6 +202,7 @@ class BlockTable:
     def clear(self) -> None:
         self.block_table.fill_(0)
         self.block_table.cpu.fill_(0)
+        self._block_table_dirty = False
 
     def _convert_physical_to_logical_blocks(self, physical_blocks: np.ndarray) -> np.ndarray:
         """Convert physical block IDs to logical block IDs."""
@@ -303,9 +312,9 @@ class MultiGroupBlockTable:
         for block_table in self.block_tables:
             block_table.compute_slot_mapping(req_indices, positions)
 
-    def commit_block_table(self, num_reqs: int) -> None:
+    def commit_block_table(self, num_reqs: int, force: bool = False) -> None:
         for block_table in self.block_tables:
-            block_table.commit_block_table(num_reqs)
+            block_table.commit_block_table(num_reqs, force)
 
     def commit_slot_mapping(self, num_tokens: int) -> None:
         for block_table in self.block_tables:

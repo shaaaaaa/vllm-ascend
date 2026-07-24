@@ -847,10 +847,12 @@ class NPUModelRunner(GPUModelRunner):
             # Uniform-batch case: num_reqs must be no greater than num_reqs_padded
             assert num_reqs <= num_reqs_padded
 
-            last_loc = self.query_start_loc.np[num_reqs]
-            self.query_start_loc.np[num_reqs + 1 : num_reqs_padded + 1] = (
-                self.arange_np[1 : num_reqs_padded + 1 - num_reqs] * self.uniform_decode_query_len + last_loc
-            )
+            if num_reqs < num_reqs_padded:
+                last_loc = self.query_start_loc.np[num_reqs]
+                self.query_start_loc.np[num_reqs + 1 : num_reqs_padded + 1] = (
+                    self.arange_np[1 : num_reqs_padded + 1 - num_reqs] * self.uniform_decode_query_len + last_loc
+                )
+                self.query_start_loc.copy_to_gpu()
         else:
             # Mixed-batch case: num_reqs must equal num_reqs_padded
             assert num_reqs == num_reqs_padded
@@ -858,8 +860,7 @@ class NPUModelRunner(GPUModelRunner):
             # Insert a dummy request instead of setting query_start_loc[num_reqs] = num_tokens_padded directly
             self.query_start_loc.np[num_reqs_padded + 1] = num_tokens_padded
             num_reqs_padded = num_reqs_padded + 1
-
-        self.query_start_loc.copy_to_gpu()
+            self.query_start_loc.copy_to_gpu()
 
         return num_reqs_padded
 
@@ -884,8 +885,6 @@ class NPUModelRunner(GPUModelRunner):
         # This way, we can overlap the copy with the following CPU operations.
         self.input_batch.block_table.commit_block_table(num_reqs)
 
-        req_indices = np.repeat(self.arange_np[:num_reqs], num_scheduled_tokens)
-
         # Get the attention state.
         if not scheduler_output.scheduled_spec_decode_tokens:
             num_valid_tokens = num_scheduled_tokens
@@ -906,8 +905,19 @@ class NPUModelRunner(GPUModelRunner):
 
         # Get positions.
         positions_np = self.positions.np[:total_num_scheduled_tokens]
-        cu_num_tokens, arange = self._get_cumsum_and_arange(num_scheduled_tokens)
-        np.add(self.input_batch.num_computed_tokens_cpu[req_indices], arange, out=positions_np)
+        uniform_q1 = (
+            not self.use_cp
+            and attn_state == AscendAttentionState.DecodeOnly
+            and total_num_scheduled_tokens == num_reqs
+        )
+        if uniform_q1:
+            req_indices = self.arange_np[:num_reqs]
+            cu_num_tokens = self.arange_np[1 : num_reqs + 1]
+            positions_np[:] = self.input_batch.num_computed_tokens_cpu[:num_reqs]
+        else:
+            req_indices = np.repeat(self.arange_np[:num_reqs], num_scheduled_tokens)
+            cu_num_tokens, arange = self._get_cumsum_and_arange(num_scheduled_tokens)
+            np.add(self.input_batch.num_computed_tokens_cpu[req_indices], arange, out=positions_np)
 
         self.input_batch.block_table.compute_slot_mapping(req_indices, positions_np)
         self.input_batch.block_table.commit_slot_mapping(total_num_scheduled_tokens)
@@ -1078,7 +1088,8 @@ class NPUModelRunner(GPUModelRunner):
         discard_request_indices = np.nonzero(discard_requests_mask)[0]
         self.num_discarded_requests = len(discard_request_indices)
         self.discard_request_indices.np[: self.num_discarded_requests] = discard_request_indices
-        self.discard_request_indices.copy_to_gpu(self.num_discarded_requests)
+        if self.num_discarded_requests:
+            self.discard_request_indices.copy_to_gpu(self.num_discarded_requests)
         use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
         if not use_spec_decode:
             # NOTE(woosuk): Due to chunked prefills, the batch may contain
@@ -3265,8 +3276,10 @@ class NPUModelRunner(GPUModelRunner):
                 # Fill unused with -1. Needed for reshape_and_cache in full cuda
                 # graph mode. `blk_table_tensor` -1 to match mamba PAD_SLOT_ID
                 if self.pcp_size == 1:
-                    slot_mapping[num_tokens:num_tokens_padded].fill_(-1)
-                    blk_table_tensor[num_reqs:num_reqs_padded].fill_(0)
+                    if num_tokens < num_tokens_padded:
+                        slot_mapping[num_tokens:num_tokens_padded].fill_(-1)
+                    if num_reqs < num_reqs_padded:
+                        blk_table_tensor[num_reqs:num_reqs_padded].fill_(0)
             if self.pcp_size > 1:
                 slot_mapping = self.pcp_manager.get_padded_slot_mapping(
                     num_tokens,
@@ -3464,7 +3477,7 @@ class NPUModelRunner(GPUModelRunner):
                             self.dsa_index_topk,
                         )
                         self._dsa_short_prompt_warned = True
-                    cm.prompt_lens_cpu = plens_np.copy()
+                    cm.prompt_lens_cpu = plens_np
             if self.speculative_config and spec_decode_common_attn_metadata is None:
                 if isinstance(self.drafter, AscendEagleProposer | AscendDraftModelProposer):
                     if self.drafter.attn_layer_names[0] in kv_cache_group.layer_names:
@@ -3853,7 +3866,7 @@ class NPUModelRunner(GPUModelRunner):
             block_table.num_blocks_per_row[:batch_size] = (
                 block_table.max_num_blocks_per_req
             )
-            block_table.commit_block_table(batch_size)
+            block_table.commit_block_table(batch_size, force=True)
             block_table.compute_slot_mapping(req_indices, positions)
             block_table.commit_slot_mapping(batch_size)
 
