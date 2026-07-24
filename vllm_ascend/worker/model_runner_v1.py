@@ -252,23 +252,12 @@ _MAX_FINAL_HIDDEN_BYTES = 16 * 1024 * 1024
 _MAX_FINAL_HIDDEN_BASE64_CHARS = 4 * ((_MAX_FINAL_HIDDEN_BYTES + 2) // 3)
 
 
-class NonFiniteFinalHiddenStateError(ValueError):
-    """Raised when a final-hidden payload would contain NaN or infinity."""
-
-
 def serialize_final_hidden_state(hidden_state: torch.Tensor) -> dict[str, Any]:
     """Encode a final hidden state without losing BF16/FP16 bits."""
     hidden_state = hidden_state.detach().to("cpu").contiguous()
     dtype = str(hidden_state.dtype).removeprefix("torch.")
     if dtype not in _FINAL_HIDDEN_DTYPES:
         raise ValueError(f"Unsupported final hidden state dtype: {hidden_state.dtype}")
-    finite_mask = torch.isfinite(hidden_state)
-    if not finite_mask.all():
-        nonfinite_count = hidden_state.numel() - int(finite_mask.sum())
-        raise NonFiniteFinalHiddenStateError(
-            "Final hidden state contains "
-            f"{nonfinite_count}/{hidden_state.numel()} non-finite values"
-        )
     raw = hidden_state.view(torch.uint8).numpy().tobytes()
     checksum = hashlib.sha256(raw).hexdigest()
     return {
@@ -1359,32 +1348,27 @@ class NPUModelRunner(GPUModelRunner):
     def _capture_final_hidden_states(
         self,
         scheduler_output: "SchedulerOutput",
-        sample_hidden_states: torch.Tensor,
+        hidden_states: torch.Tensor,
+        num_scheduled_tokens: np.ndarray,
     ) -> dict[str, dict[str, Any]]:
         capture_req_ids = scheduler_output.capture_final_hidden_req_ids
         if not capture_req_ids:
             return {}
 
         final_hidden_states: dict[str, dict[str, Any]] = {}
-        rejected_req_ids: set[str] = set()
+        row_end = 0
         for req_idx, req_id in enumerate(self.input_batch.req_ids):
+            row_end += int(num_scheduled_tokens[req_idx])
             if req_id not in capture_req_ids:
                 continue
-            try:
-                final_hidden_states[req_id] = serialize_final_hidden_state(
-                    sample_hidden_states[req_idx]
+            if row_end == 0:
+                raise RuntimeError(
+                    f"Cannot capture final hidden state for unscheduled request {req_id!r}"
                 )
-            except NonFiniteFinalHiddenStateError as exc:
-                rejected_req_ids.add(req_id)
-                logger.error(
-                    "Rejecting final-hidden handoff for request %s: %s. "
-                    "The decoder must use normal last-token recomputation.",
-                    req_id,
-                    exc,
-                )
-        missing_req_ids = capture_req_ids.difference(
-            final_hidden_states, rejected_req_ids
-        )
+            final_hidden_states[req_id] = serialize_final_hidden_state(
+                hidden_states[row_end - 1]
+            )
+        missing_req_ids = capture_req_ids.difference(final_hidden_states)
         if missing_req_ids:
             raise RuntimeError(
                 "Final hidden state capture requests are absent from the model batch: "
@@ -2200,6 +2184,29 @@ class NPUModelRunner(GPUModelRunner):
                         for aux_hidden_states_pcp in aux_hidden_states
                     ]
 
+            final_hidden_states = None
+            if (
+                scheduler_output.capture_final_hidden_req_ids
+                and self._is_final_hidden_output_rank()
+            ):
+                assert isinstance(hidden_states, torch.Tensor)
+                final_hidden_states = self._capture_final_hidden_states(
+                    scheduler_output,
+                    hidden_states,
+                    np.array(
+                        [
+                            scheduler_output.num_scheduled_tokens[req_id]
+                            for req_id in self.input_batch.req_ids
+                        ],
+                        dtype=np.int32,
+                    ),
+                )
+                setattr(
+                    scheduler_output,
+                    "_captured_final_hidden_states",
+                    final_hidden_states,
+                )
+
             if not self.broadcast_pp_output:
                 # Common case.
                 if not get_pp_group().is_last_rank:
@@ -2244,21 +2251,6 @@ class NPUModelRunner(GPUModelRunner):
                 )
                 assert broadcasted is not None
                 logits = broadcasted["logits"]
-
-            final_hidden_states = None
-            if (
-                scheduler_output.capture_final_hidden_req_ids
-                and self._is_final_hidden_output_rank()
-            ):
-                final_hidden_states = self._capture_final_hidden_states(
-                    scheduler_output,
-                    sample_hidden_states,
-                )
-                setattr(
-                    scheduler_output,
-                    "_captured_final_hidden_states",
-                    final_hidden_states,
-                )
 
             # Apply structured output bitmasks if present
             self.execute_model_state = ExecuteModelState(
