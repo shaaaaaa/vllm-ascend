@@ -329,6 +329,56 @@ def deserialize_final_hidden_state(payload: dict[str, Any]) -> torch.Tensor:
     )
 
 
+def final_hidden_parity_summary(
+    transferred_hidden_states: torch.Tensor,
+    reference_hidden_states: torch.Tensor,
+    transferred_logits: torch.Tensor,
+    reference_logits: torch.Tensor,
+    topk: int = 5,
+) -> dict[str, Any]:
+    """Build a compact exactness summary for final-hidden diagnostics."""
+    if transferred_hidden_states.shape != reference_hidden_states.shape:
+        raise ValueError(
+            "Final-hidden parity shape mismatch: "
+            f"{tuple(transferred_hidden_states.shape)} != "
+            f"{tuple(reference_hidden_states.shape)}"
+        )
+    if transferred_logits.shape != reference_logits.shape:
+        raise ValueError(
+            "Final-hidden logits parity shape mismatch: "
+            f"{tuple(transferred_logits.shape)} != "
+            f"{tuple(reference_logits.shape)}"
+        )
+
+    hidden_delta = (
+        transferred_hidden_states.float() - reference_hidden_states.float()
+    ).abs()
+    logits_delta = (transferred_logits.float() - reference_logits.float()).abs()
+    hidden_exact = torch.eq(
+        transferred_hidden_states, reference_hidden_states
+    ).all(dim=-1)
+    logits_exact = torch.eq(transferred_logits, reference_logits).all(dim=-1)
+    topk = min(topk, transferred_logits.shape[-1])
+    transferred_top_ids = torch.topk(
+        transferred_logits, k=topk, dim=-1
+    ).indices
+    reference_top_ids = torch.topk(reference_logits, k=topk, dim=-1).indices
+
+    return {
+        "hidden_exact": hidden_exact.to("cpu").tolist(),
+        "hidden_max_abs": hidden_delta.amax(dim=-1).to("cpu").tolist(),
+        "logits_exact": logits_exact.to("cpu").tolist(),
+        "logits_max_abs": logits_delta.amax(dim=-1).to("cpu").tolist(),
+        "transferred_top_ids": transferred_top_ids.to("cpu").tolist(),
+        "reference_top_ids": reference_top_ids.to("cpu").tolist(),
+        "top1_match": torch.eq(
+            transferred_top_ids[:, 0], reference_top_ids[:, 0]
+        )
+        .to("cpu")
+        .tolist(),
+    }
+
+
 class NPUModelRunner(GPUModelRunner):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         # TODO(qcs): These manual pad and unpad for GPUModelRunner are
@@ -1508,7 +1558,9 @@ class NPUModelRunner(GPUModelRunner):
         num_reqs = self.input_batch.num_reqs
         num_scheduled_tokens_np = np.ones(num_reqs, dtype=np.int32)
         run_shadow_forward = self.dp_size > 1
+        parity_trace = envs_ascend.VLLM_ASCEND_FINAL_HIDDEN_PARITY_TRACE
         shadow_forward_inputs = None
+        shadow_sample_hidden_states = None
 
         # Recreate the metadata that a last-prompt-token forward would have
         # produced. DP ranks run a shadow target forward for collective
@@ -1616,8 +1668,9 @@ class NPUModelRunner(GPUModelRunner):
                 ) = shadow_forward_inputs
                 # Keep DP/EP/TP collective ordering aligned with ranks that
                 # execute normal target work. Sampling still uses the
-                # transferred hidden state below; this result is discarded.
-                self._model_forward(
+                # transferred hidden state below. Retain the result only for
+                # explicitly enabled parity diagnostics.
+                shadow_hidden_states = self._model_forward(
                     num_tokens_padded,
                     shadow_input_ids,
                     shadow_positions,
@@ -1625,6 +1678,12 @@ class NPUModelRunner(GPUModelRunner):
                     shadow_inputs_embeds,
                     **shadow_model_kwargs,
                 )
+                if parity_trace:
+                    if self.use_aux_hidden_state_outputs:
+                        shadow_hidden_states, _ = shadow_hidden_states
+                    shadow_sample_hidden_states = shadow_hidden_states[
+                        logits_indices
+                    ]
             elif has_kv_transfer_group():
                 self._wait_for_bootstrap_kv_load()
 
@@ -1701,6 +1760,54 @@ class NPUModelRunner(GPUModelRunner):
             )
 
         logits = self.model.compute_logits(hidden_states)
+        if parity_trace:
+            if shadow_sample_hidden_states is None:
+                logger.warning(
+                    "[FINAL_HIDDEN_BOOTSTRAP_PARITY] reqs=%s "
+                    "reference_available=False reason=dp_shadow_forward_disabled",
+                    ordered_bootstrap_req_ids,
+                )
+            else:
+                # Some LM-head implementations reuse an internal output buffer.
+                # Preserve the transferred-hidden logits before invoking it
+                # again for the reference path.
+                logits = logits.clone()
+                reference_logits = self.model.compute_logits(
+                    shadow_sample_hidden_states
+                )
+                parity = final_hidden_parity_summary(
+                    hidden_states,
+                    shadow_sample_hidden_states,
+                    logits,
+                    reference_logits,
+                )
+                payload_hashes = {
+                    req_id: scheduler_output.bootstrap_final_hiddens[req_id][
+                        "data_sha256"
+                    ][:16]
+                    for req_id in ordered_bootstrap_req_ids
+                }
+                log_fn = (
+                    logger.info
+                    if all(parity["top1_match"])
+                    else logger.error
+                )
+                log_fn(
+                    "[FINAL_HIDDEN_BOOTSTRAP_PARITY] reqs=%s "
+                    "payload_sha256_prefix=%s hidden_exact=%s "
+                    "hidden_max_abs=%s logits_exact=%s logits_max_abs=%s "
+                    "top1_match=%s transferred_top_ids=%s "
+                    "reference_top_ids=%s",
+                    ordered_bootstrap_req_ids,
+                    payload_hashes,
+                    parity["hidden_exact"],
+                    parity["hidden_max_abs"],
+                    parity["logits_exact"],
+                    parity["logits_max_abs"],
+                    parity["top1_match"],
+                    parity["transferred_top_ids"],
+                    parity["reference_top_ids"],
+                )
         self.execute_model_state = ExecuteModelState(
             scheduler_output,
             logits,

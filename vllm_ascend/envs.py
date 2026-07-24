@@ -191,6 +191,13 @@ env_variables: dict[str, Callable[[], Any]] = {
     # DSA/LMCache trace logging. Default OFF because tensor summaries can force
     # NPU->CPU synchronization on the decode hot path.
     "VLLM_ASCEND_DSA_LMCACHE_TRACE": lambda: bool(int(os.getenv("VLLM_ASCEND_DSA_LMCACHE_TRACE", "0"))),
+    # Compare a transferred final hidden state and its logits with the normal
+    # last-prompt-token shadow forward during bootstrap. Diagnostic only:
+    # enabling it adds NPU synchronization and one extra LM-head invocation to
+    # each final-hidden bootstrap step. Default OFF; not sensitive.
+    "VLLM_ASCEND_FINAL_HIDDEN_PARITY_TRACE": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_FINAL_HIDDEN_PARITY_TRACE", "0"))
+    ),
     # Host CPU budget (GiB) PER LAYER for the LMCache adapter backend. 0 (default) =
     # auto-size from the per-layer pinned-bundle need (num_logical_blocks * bundle,
     # with headroom); set >0 to override. Total host = this x number of MLA layers.

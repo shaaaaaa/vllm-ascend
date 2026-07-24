@@ -9,6 +9,7 @@ from vllm_ascend.worker.model_runner_v1 import (
     ExecuteModelState,
     NPUModelRunner,
     deserialize_final_hidden_state,
+    final_hidden_parity_summary,
     serialize_final_hidden_state,
 )
 
@@ -48,6 +49,50 @@ def test_final_hidden_payload_rejects_oversize_before_decode():
 
     with pytest.raises(ValueError, match="16 MiB decoded size limit"):
         deserialize_final_hidden_state(payload)
+
+
+def test_final_hidden_parity_summary_reports_exact_match():
+    hidden_states = torch.tensor([[1.0, 2.0]], dtype=torch.bfloat16)
+    logits = torch.tensor([[0.1, 0.7, 0.2]], dtype=torch.float32)
+
+    summary = final_hidden_parity_summary(
+        hidden_states,
+        hidden_states.clone(),
+        logits,
+        logits.clone(),
+    )
+
+    assert summary == {
+        "hidden_exact": [True],
+        "hidden_max_abs": [0.0],
+        "logits_exact": [True],
+        "logits_max_abs": [0.0],
+        "transferred_top_ids": [[1, 2, 0]],
+        "reference_top_ids": [[1, 2, 0]],
+        "top1_match": [True],
+    }
+
+
+def test_final_hidden_parity_summary_reports_top1_mismatch():
+    transferred_hidden = torch.tensor([[1.0, 2.0]], dtype=torch.bfloat16)
+    reference_hidden = torch.tensor([[1.0, 3.0]], dtype=torch.bfloat16)
+    transferred_logits = torch.tensor([[0.8, 0.1]], dtype=torch.float32)
+    reference_logits = torch.tensor([[0.1, 0.8]], dtype=torch.float32)
+
+    summary = final_hidden_parity_summary(
+        transferred_hidden,
+        reference_hidden,
+        transferred_logits,
+        reference_logits,
+    )
+
+    assert summary["hidden_exact"] == [False]
+    assert summary["hidden_max_abs"] == [1.0]
+    assert summary["logits_exact"] == [False]
+    assert summary["logits_max_abs"] == pytest.approx([0.7])
+    assert summary["transferred_top_ids"] == [[0, 1]]
+    assert summary["reference_top_ids"] == [[1, 0]]
+    assert summary["top1_match"] == [False]
 
 
 def test_capture_final_hidden_uses_last_scheduled_row_per_request():
