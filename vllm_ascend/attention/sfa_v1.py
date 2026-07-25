@@ -45,7 +45,6 @@ from vllm_ascend.attention.mla_v1 import MAX_O_PROJ_PREFETCH_SIZE, MLAPO_MAX_SUP
 from vllm_ascend.attention.mtp_dw_diag import (
     diagnostic_int_checksum,
     diagnostic_values_to_list,
-    scratch_live_slot_aliases,
     scratch_target_safety,
 )
 from vllm_ascend.attention.utils import (
@@ -54,6 +53,7 @@ from vllm_ascend.attention.utils import (
     enable_cp,
     get_lmcache_sparse_cached_tokens,
     maybe_save_kv_layer_to_connector,
+    resolve_dsa_index_topk,
     staged_sfa_connector_supports_sparse_load,
     trans_rope_weight,
     transdata,
@@ -152,6 +152,10 @@ class _StagedSFALayerBinding:
     bridge: tuple[_TensorBinding, ...]
     kv_cache: tuple[_TensorBinding, ...]
     remap_boundary: _TensorBinding
+    request_state_indices: _TensorBinding
+    request_generations: _TensorBinding
+    scratch_resident_tokens: _TensorBinding
+    scratch_resident_generations: _TensorBinding
     producer_event_id: int
 
 
@@ -172,6 +176,10 @@ class _StagedSFACaptureState:
         key: StagedSFAGraphKey,
         bridge: tuple[torch.Tensor, ...],
         kv_cache: tuple[torch.Tensor, ...],
+        request_state_indices: torch.Tensor,
+        request_generations: torch.Tensor,
+        scratch_resident_tokens: torch.Tensor,
+        scratch_resident_generations: torch.Tensor,
     ) -> None:
         if key in self.bindings:
             raise RuntimeError(f"staged SFA graph key was captured twice: {key}")
@@ -182,6 +190,10 @@ class _StagedSFACaptureState:
             tuple(_TensorBinding.from_tensor(tensor) for tensor in bridge),
             tuple(_TensorBinding.from_tensor(tensor) for tensor in kv_cache),
             _TensorBinding.from_tensor(self.remap_boundary),
+            _TensorBinding.from_tensor(request_state_indices),
+            _TensorBinding.from_tensor(request_generations),
+            _TensorBinding.from_tensor(scratch_resident_tokens),
+            _TensorBinding.from_tensor(scratch_resident_generations),
             id(self.producer_event),
         )
         if self.bindings:
@@ -193,6 +205,18 @@ class _StagedSFACaptureState:
                 != existing.remap_boundary.address
                 or binding.remap_boundary.layout[1:]
                 != existing.remap_boundary.layout[1:]
+                or binding.request_state_indices.address
+                != existing.request_state_indices.address
+                or binding.request_state_indices.layout[1:]
+                != existing.request_state_indices.layout[1:]
+                or binding.request_generations.address
+                != existing.request_generations.address
+                or binding.request_generations.layout[1:]
+                != existing.request_generations.layout[1:]
+                or binding.scratch_resident_tokens
+                != existing.scratch_resident_tokens
+                or binding.scratch_resident_generations
+                != existing.scratch_resident_generations
                 or binding.bridge != existing.bridge
             ):
                 raise RuntimeError(
@@ -254,6 +278,9 @@ def _update_dsa_split_boundary_in_place(
     attn_metadata: Any,
     cached_tokens: list[int] | None,
     decode_window_size: int,
+    *,
+    index_topk: int,
+    block_size: int,
 ) -> torch.Tensor:
     """Update the builder-owned row boundary without temporary device tensors."""
     split_boundary = attn_metadata.split_boundary
@@ -281,6 +308,17 @@ def _update_dsa_split_boundary_in_place(
 
     seq_lens_cpu = attn_metadata.seq_lens_cpu
     num_reqs = int(seq_lens_cpu.shape[0])
+    block_table = getattr(attn_metadata, "block_table", None)
+    if (
+        block_size <= 0
+        or block_table is None
+        or block_table.dim() != 2
+    ):
+        raise RuntimeError(
+            "DSA sparse boundary requires a rank-2 block table and positive "
+            f"block size: block_table={getattr(block_table, 'shape', None)}, "
+            f"block_size={block_size}."
+        )
     has_cached_frontier = cached_tokens is not None
     if (
         has_cached_frontier
@@ -311,6 +349,16 @@ def _update_dsa_split_boundary_in_place(
         elif has_cached_frontier:
             boundary_cpu[row_index] = cached_end
 
+    _validate_dsa_scratch_capacity(
+        boundary_cpu[:num_rows],
+        row_req_indices_cpu[:num_rows],
+        getattr(attn_metadata, "decode_scratch_base_cpu", None),
+        index_topk,
+        getattr(attn_metadata, "decode_scratch_capacity", None),
+        seq_lens=seq_lens_cpu,
+        block_table_width=int(block_table.shape[1]),
+        block_size=block_size,
+    )
     split_boundary.copy_(boundary_cpu_tensor[:num_rows])
     attn_metadata.decode_split_boundary = split_boundary
     return split_boundary
@@ -354,6 +402,7 @@ def _prepare_sfa_remap_boundary(
     *,
     is_dummy_run: bool,
     index_topk: int,
+    block_size: int,
     cached_tokens: tuple[int, ...] | None = None,
 ) -> torch.Tensor:
     """Fill the stable Graph-A remap-boundary input once per step.
@@ -439,6 +488,9 @@ def _prepare_sfa_remap_boundary(
         getattr(attn_metadata, "decode_scratch_base_cpu", None),
         index_topk,
         getattr(attn_metadata, "decode_scratch_capacity", None),
+        seq_lens=seq_lens,
+        block_table_width=int(attn_metadata.block_table.shape[1]),
+        block_size=block_size,
     )
 
     boundary.copy_(torch.from_numpy(boundary_rows))
@@ -452,6 +504,10 @@ def _validate_dsa_scratch_capacity(
     scratch_base_rows: Any,
     index_topk: int,
     scratch_capacity: int | None = None,
+    *,
+    seq_lens: Any = None,
+    block_table_width: int | None = None,
+    block_size: int | None = None,
 ) -> None:
     """Validate request-level union scratch cannot alias live KV positions."""
     width = int(index_topk)
@@ -466,6 +522,55 @@ def _validate_dsa_scratch_capacity(
             f"boundaries={boundaries.size}, request_rows={request_rows.size}."
         )
 
+    layout_values = (seq_lens, block_table_width, block_size)
+    if any(value is not None for value in layout_values):
+        if any(value is None for value in layout_values):
+            raise RuntimeError(
+                "DSA boundary layout validation requires seq_lens, "
+                "block_table_width, and block_size together."
+            )
+        assert block_table_width is not None
+        assert block_size is not None
+        if int(block_table_width) <= 0 or int(block_size) <= 0:
+            raise RuntimeError(
+                "DSA block-table token capacity must be positive: "
+                f"block_table_width={block_table_width}, "
+                f"block_size={block_size}."
+            )
+        sequence_lengths = np.asarray(
+            seq_lens,
+            dtype=np.int64,
+        ).reshape(-1)
+        table_capacity = int(block_table_width) * int(block_size)
+        for row, (boundary, request_index) in enumerate(
+            zip(boundaries, request_rows, strict=True)
+        ):
+            request_index = int(request_index)
+            if request_index < 0:
+                continue
+            if request_index >= sequence_lengths.size:
+                raise RuntimeError(
+                    "DSA sparse row references a request outside seq_lens: "
+                    f"row={row}, request={request_index}, "
+                    f"num_reqs={sequence_lengths.size}."
+                )
+            boundary = int(boundary)
+            seq_len = int(sequence_lengths[request_index])
+            if boundary < 0 or boundary > seq_len:
+                raise RuntimeError(
+                    "DSA sparse boundary is outside the request sequence: "
+                    f"row={row}, request={request_index}, "
+                    f"boundary={boundary}, seq_len={seq_len}."
+                )
+            if seq_len > table_capacity:
+                raise RuntimeError(
+                    "DSA request sequence exceeds its block-table capacity: "
+                    f"row={row}, request={request_index}, "
+                    f"seq_len={seq_len}, table_capacity={table_capacity}, "
+                    f"block_table_width={block_table_width}, "
+                    f"block_size={block_size}."
+                )
+
     if scratch_capacity is None or int(scratch_capacity) < width:
         raise RuntimeError(
             "DSA request-union scratch reservation is missing or too small: "
@@ -476,13 +581,20 @@ def _validate_dsa_scratch_capacity(
         {int(value) for value in request_rows if int(value) >= 0}
     ):
         rows = np.flatnonzero(request_rows == request_index)
+        request_boundaries = boundaries[rows]
+        if np.any(request_boundaries != request_boundaries[0]):
+            raise RuntimeError(
+                "All DSA MTP rows for one request must use the same sparse "
+                "boundary; otherwise one row can overwrite KV that another "
+                f"row still treats as resident: request={request_index}, "
+                f"boundaries={request_boundaries.tolist()}."
+            )
         if rows.size * width > capacity:
             raise RuntimeError(
                 "DSA request-union scratch reservation is too small: "
                 f"request={request_index}, rows={rows.size}, "
                 f"index_topk={width}, scratch_capacity={capacity}."
             )
-        request_boundaries = boundaries[rows]
         if np.any(
             (request_boundaries != 0)
             & (request_boundaries < capacity)
@@ -493,6 +605,43 @@ def _validate_dsa_scratch_capacity(
                 f"{request_boundaries.tolist()}, "
                 f"scratch_capacity={capacity}."
             )
+
+
+def _dsa_selected_counts_for_wait(
+    selected_counts: torch.Tensor,
+    request_count: int,
+) -> torch.Tensor:
+    """Expose one logical count per request to the LMCache wait API.
+
+    The prepare kernel owns cacheline-padded ``[capacity, >=1]`` storage, but
+    its Python wrapper and the staged bridge expose the logical first-column
+    view as ``[capacity]``. Accept either representation at this boundary and
+    always pass a rank-one tensor to LMCache.
+    """
+    if selected_counts.dim() not in (1, 2):
+        raise RuntimeError(
+            "DSA selected-count storage must be a logical "
+            "[request_capacity] view or cacheline-padded "
+            "[request_capacity, >=1] backing storage: "
+            f"shape={tuple(selected_counts.shape)}, "
+            f"request_count={request_count}."
+        )
+    if request_count < 0 or int(selected_counts.shape[0]) < request_count:
+        raise RuntimeError(
+            "DSA selected-count storage is smaller than the request count: "
+            f"shape={tuple(selected_counts.shape)}, "
+            f"request_count={request_count}."
+        )
+    if selected_counts.dim() == 1:
+        return selected_counts[:request_count]
+    if selected_counts.dim() == 2 and int(selected_counts.shape[1]) >= 1:
+        return selected_counts[:request_count, 0]
+    raise RuntimeError(
+        "DSA selected-count storage must be a logical [request_capacity] "
+        "view or cacheline-padded [request_capacity, >=1] backing storage: "
+        f"shape={tuple(selected_counts.shape)}, "
+        f"request_count={request_count}."
+    )
 
 
 def _prepare_dsa_sparse_lmcache_payload(
@@ -776,6 +925,12 @@ class AscendSFAMetadata:
     decode_target_slot_mapping: torch.Tensor | None = None
     decode_selected_tokens: torch.Tensor | None = None
     decode_selected_counts: torch.Tensor | None = None
+    # Current compact request row -> runner-owned stable scratch-state row.
+    # The generation changes whenever the request incarnation or its physical
+    # scratch prefix changes, so per-layer resident metadata can be invalidated
+    # lazily inside the fused preparation operator.
+    decode_scratch_state_indices: torch.Tensor | None = None
+    decode_scratch_request_generations: torch.Tensor | None = None
     need_sparse_lmcache_payload: bool = False
     staged_sfa_payload_validated: bool = False
     prompt_lens_cpu_rows: Any = None
@@ -828,15 +983,7 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
         self.rope_dim = self.model_config.hf_text_config.qk_rope_head_dim
         self.enable_dsa_cp = enable_dsa_cp()
         self.dsa_shrink_latent = int(envs.VLLM_ASCEND_DSA_SHRINK_LATENT) if envs.VLLM_ASCEND_DSA_UNBUNDLE else 0
-        hf_config = self.model_config.hf_config
-        hf_text_config = self.model_config.hf_text_config
-        self.index_topk = int(
-            getattr(
-                hf_text_config or hf_config,
-                "topk_tokens",
-                getattr(hf_text_config or hf_config, "index_topk", 2048),
-            )
-        )
+        self.index_topk = resolve_dsa_index_topk(self.model_config)
         if self.dsa_shrink_latent and self.index_topk % self.block_size:
             raise ValueError(
                 "DSA index_topk must be an integer multiple of block_size: "
@@ -1007,6 +1154,8 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
         decode_target_slot_mapping = None
         decode_selected_tokens = None
         decode_selected_counts = None
+        decode_scratch_state_indices = None
+        decode_scratch_request_generations = None
         need_sparse_lmcache_payload = False
         num_decode_rows = 0
         decode_req_indices_cpu = None
@@ -1115,6 +1264,32 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
                 decode_target_slot_mapping = self._dsa_target_slots[:num_reqs]
                 decode_selected_tokens = self._dsa_selected_tokens[:num_reqs]
                 decode_selected_counts = self._dsa_selected_counts[:num_reqs]
+                decode_scratch_state_indices = getattr(
+                    common_attn_metadata,
+                    "dsa_scratch_state_indices",
+                    None,
+                )
+                decode_scratch_request_generations = getattr(
+                    common_attn_metadata,
+                    "dsa_scratch_request_generations",
+                    None,
+                )
+                if (
+                    decode_scratch_state_indices is None
+                    or decode_scratch_request_generations is None
+                    or int(decode_scratch_state_indices.numel()) < num_reqs
+                    or int(decode_scratch_request_generations.numel()) < num_reqs
+                ):
+                    raise RuntimeError(
+                        "DSA scratch reuse requires stable request state-slot "
+                        "and generation metadata for every request row."
+                    )
+                decode_scratch_state_indices = (
+                    decode_scratch_state_indices[:num_reqs]
+                )
+                decode_scratch_request_generations = (
+                    decode_scratch_request_generations[:num_reqs]
+                )
 
         cum_query_lens = common_attn_metadata.query_start_loc[1 : num_reqs + 1]
         seq_lens = common_attn_metadata.seq_lens[:num_reqs]
@@ -1242,6 +1417,10 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             decode_target_slot_mapping=decode_target_slot_mapping,
             decode_selected_tokens=decode_selected_tokens,
             decode_selected_counts=decode_selected_counts,
+            decode_scratch_state_indices=decode_scratch_state_indices,
+            decode_scratch_request_generations=(
+                decode_scratch_request_generations
+            ),
             need_sparse_lmcache_payload=need_sparse_lmcache_payload,
             prompt_lens_cpu_rows=rows if plens_cpu is not None else None,
             decode_remap_boundary=self.decode_remap_boundary[:num_input_tokens],
@@ -1345,14 +1524,9 @@ class AscendSFAImpl(MLAAttentionImpl):
         # indexer param
         self.n_head: int = self.indexer.n_head  # 64
         self.head_dim: int = self.indexer.head_dim  # 128
-        hf_config = self.vllm_config.model_config.hf_config
-        hf_text_config = getattr(self.vllm_config.model_config, "hf_text_config", None)
-        self.index_topk = int(
-            getattr(
-                self.indexer,
-                "topk_tokens",
-                getattr(hf_text_config or hf_config, "index_topk", 2048),
-            )
+        self.index_topk = resolve_dsa_index_topk(
+            self.vllm_config.model_config,
+            runtime_topk=getattr(self.indexer, "topk_tokens", None),
         )
         self.wq_b = self.indexer.wq_b
         self.wk = self.indexer.wk
@@ -1373,6 +1547,27 @@ class AscendSFAImpl(MLAAttentionImpl):
         self.dsa_offload_unbundle = bool(envs.VLLM_ASCEND_DSA_UNBUNDLE)
         # Step B staging (1 = B2 compact-scratch read; 2 = +B1 freeing).
         self.dsa_shrink_latent = int(envs.VLLM_ASCEND_DSA_SHRINK_LATENT) if self.dsa_offload_unbundle else 0
+        self.scratch_capacity = self.decode_threshold * self.index_topk
+        if self.dsa_shrink_latent:
+            state_rows = self.vllm_config.scheduler_config.max_num_seqs
+            state_device = self.q_b_proj.weight.device
+            self._dsa_scratch_resident_tokens = torch.full(
+                (state_rows, self.scratch_capacity),
+                -1,
+                dtype=torch.int32,
+                device=state_device,
+            )
+            # One 64-byte row per stable request slot. Different request AIVs
+            # therefore never update generations in the same cache line.
+            self._dsa_scratch_resident_generations = torch.full(
+                (state_rows, 8),
+                torch.iinfo(torch.int64).min,
+                dtype=torch.int64,
+                device=state_device,
+            )
+        else:
+            self._dsa_scratch_resident_tokens = None
+            self._dsa_scratch_resident_generations = None
         self.enable_staged_sfa_graph = staged_sfa_graph_configured(self.vllm_config)
         self._staged_sfa_graph_capture_sizes = (
             staged_sfa_graph_capture_sizes(self.vllm_config) if self.enable_staged_sfa_graph else ()
@@ -2261,8 +2456,21 @@ class AscendSFAImpl(MLAAttentionImpl):
             or attn_metadata.decode_target_slot_mapping is None
             or int(attn_metadata.decode_target_slot_mapping.shape[0])
             != graph_key.request_capacity
+            or attn_metadata.decode_scratch_state_indices is None
+            or int(attn_metadata.decode_scratch_state_indices.numel())
+            != graph_key.request_capacity
+            or attn_metadata.decode_scratch_request_generations is None
+            or int(
+                attn_metadata.decode_scratch_request_generations.numel()
+            )
+            != graph_key.request_capacity
+            or self._dsa_scratch_resident_tokens is None
+            or self._dsa_scratch_resident_generations is None
         ):
-            return "the request-union remap buffers do not match the graph key"
+            return (
+                "the request-union remap/reuse buffers do not match the "
+                "graph key"
+            )
 
         request_ids = attn_metadata.decode_request_ids_compact
         full_request_ids = attn_metadata.req_ids
@@ -2342,6 +2550,10 @@ class AscendSFAImpl(MLAAttentionImpl):
         remap_boundary: torch.Tensor,
         row_req_indices: torch.Tensor,
         request_block_table: torch.Tensor,
+        request_state_indices: torch.Tensor,
+        request_generations: torch.Tensor,
+        resident_token_ids: torch.Tensor,
+        resident_generations: torch.Tensor,
         selected_packed: torch.Tensor,
         selected_counts: torch.Tensor,
         target_slot_mapping: torch.Tensor,
@@ -2414,6 +2626,10 @@ class AscendSFAImpl(MLAAttentionImpl):
             block_size=self.block_size,
             need_packed=True,
             clear_invalid_rows=True,
+            request_state_indices=request_state_indices,
+            request_generations=request_generations,
+            resident_token_ids=resident_token_ids,
+            resident_generations=resident_generations,
         )
         assert selected_packed is not None
         assert selected_count_values is not None
@@ -2634,6 +2850,28 @@ class AscendSFAImpl(MLAAttentionImpl):
 
         is_dummy = bool(getattr(context, "staged_sfa_graph_dummy_run", False))
         state = self._staged_sfa_capture_state
+        captured_binding = state.bindings.get(graph_key)
+        if captured_binding is not None:
+            assert attn_metadata.decode_scratch_state_indices is not None
+            assert (
+                attn_metadata.decode_scratch_request_generations is not None
+            )
+            current_state_indices = _TensorBinding.from_tensor(
+                attn_metadata.decode_scratch_state_indices
+            )
+            current_generations = _TensorBinding.from_tensor(
+                attn_metadata.decode_scratch_request_generations
+            )
+            if (
+                current_state_indices
+                != captured_binding.request_state_indices
+                or current_generations
+                != captured_binding.request_generations
+            ):
+                raise RuntimeError(
+                    "[SFA cross-layer graph] request scratch-state input "
+                    "binding changed after capture"
+                )
         initialized_capacity = state.initialized_cache_capacity
         if is_dummy and graph_key.request_capacity > initialized_capacity:
             for cache in kv_cache:
@@ -2660,6 +2898,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                 attn_metadata.req_ids,
                 is_dummy_run=is_dummy,
                 index_topk=self.index_topk,
+                block_size=self.block_size,
                 cached_tokens=getattr(
                     getattr(context, "staged_sfa_route", None),
                     "frontiers",
@@ -2672,6 +2911,23 @@ class AscendSFAImpl(MLAAttentionImpl):
         selected_packed = attn_metadata.decode_selected_tokens
         selected_counts = attn_metadata.decode_selected_counts
         target_slots = attn_metadata.decode_target_slot_mapping
+        if (
+            selected_packed is None
+            or selected_counts is None
+            or target_slots is None
+        ):
+            raise RuntimeError(
+                "Staged DSA scratch-reuse retrieve requires selected tokens, "
+                "target slots, and selected counts as one complete payload."
+            )
+        request_state_indices = (
+            attn_metadata.decode_scratch_state_indices
+        )
+        request_generations = (
+            attn_metadata.decode_scratch_request_generations
+        )
+        resident_token_ids = self._dsa_scratch_resident_tokens
+        resident_generations = self._dsa_scratch_resident_generations
         if any(
             value is None
             for value in (
@@ -2679,9 +2935,19 @@ class AscendSFAImpl(MLAAttentionImpl):
                 selected_packed,
                 selected_counts,
                 target_slots,
+                request_state_indices,
+                request_generations,
+                resident_token_ids,
+                resident_generations,
             )
         ):
-            raise RuntimeError("staged SFA request-union buffers are unavailable")
+            raise RuntimeError(
+                "staged SFA request-union/reuse buffers are unavailable"
+            )
+        assert request_state_indices is not None
+        assert request_generations is not None
+        assert resident_token_ids is not None
+        assert resident_generations is not None
         outputs = self._cross_layer_pre_compute(
             hidden_states,
             kv_cache[0],
@@ -2697,6 +2963,10 @@ class AscendSFAImpl(MLAAttentionImpl):
             remap_boundary,
             row_req_indices,
             attn_metadata.block_table,
+            request_state_indices,
+            request_generations,
+            resident_token_ids,
+            resident_generations,
             selected_packed,
             selected_counts,
             target_slots,
@@ -2720,7 +2990,15 @@ class AscendSFAImpl(MLAAttentionImpl):
             index_enabled,
         )
         if is_dummy and context.cudagraph_runtime_mode == CUDAGraphMode.PIECEWISE:
-            state.register(graph_key, outputs, kv_cache)
+            state.register(
+                graph_key,
+                outputs,
+                kv_cache,
+                request_state_indices,
+                request_generations,
+                resident_token_ids,
+                resident_generations,
+            )
         return outputs
 
     def cross_layer_lmcache_retrieve(
@@ -2745,6 +3023,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                         next_metadata.req_ids,
                         is_dummy_run=True,
                         index_topk=self.index_topk,
+                        block_size=self.block_size,
                     )
                 return
             route = context.staged_sfa_route
@@ -2757,13 +3036,17 @@ class AscendSFAImpl(MLAAttentionImpl):
             if request_ids is None:
                 raise RuntimeError("staged SFA request ids are unavailable")
             request_count = len(request_ids)
+            selected_count_values = _dsa_selected_counts_for_wait(
+                selected_counts,
+                request_count,
+            )
             wait_for_kv_layer_from_connector(
                 layer_name,
                 selected_tokens=selected_packed[:request_count],
                 token_start_index=None,
                 request_ids=request_ids,
                 target_slot_mapping=target_slots[:request_count],
-                selected_token_counts=selected_counts[:request_count],
+                selected_token_counts=selected_count_values,
                 payload_event=producer_event,
             )
             if _LMCACHE_SPARSE_WAIT_SYNC_ONCE and not _lmcache_sparse_wait_sync_once_done:
@@ -2775,6 +3058,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                     next_metadata.req_ids,
                     is_dummy_run=False,
                     index_topk=self.index_topk,
+                    block_size=self.block_size,
                     cached_tokens=route.frontiers,
                 )
                 if index_enabled:
@@ -2791,6 +3075,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                 metadata.req_ids,
                 is_dummy_run=is_dummy,
                 index_topk=self.index_topk,
+                block_size=self.block_size,
                 cached_tokens=(
                     None
                     if is_dummy
@@ -3146,6 +3431,8 @@ class AscendSFAImpl(MLAAttentionImpl):
                         attn_metadata,
                         _lmcache_cached_tokens,
                         _decode_window_size,
+                        index_topk=self.index_topk,
+                        block_size=self.block_size,
                     )
                     if _decode_window_size > 0 and _mtp_dw_diag_enabled():
                         # Diagnostics only; these host values are intentionally
@@ -3166,6 +3453,39 @@ class AscendSFAImpl(MLAAttentionImpl):
             if _row_req_indices is None:
                 raise RuntimeError("DSA union remap requires row request indices")
             _selected_token_counts = attn_metadata.decode_selected_counts
+            _request_state_indices = (
+                attn_metadata.decode_scratch_state_indices
+                if _need_packed
+                else None
+            )
+            _request_generations = (
+                attn_metadata.decode_scratch_request_generations
+                if _need_packed
+                else None
+            )
+            _resident_token_ids = (
+                self._dsa_scratch_resident_tokens
+                if _need_packed
+                else None
+            )
+            _resident_generations = (
+                self._dsa_scratch_resident_generations
+                if _need_packed
+                else None
+            )
+            if _need_packed and any(
+                value is None
+                for value in (
+                    _request_state_indices,
+                    _request_generations,
+                    _resident_token_ids,
+                    _resident_generations,
+                )
+            ):
+                raise RuntimeError(
+                    "DSA scratch reuse requires stable request generations "
+                    "and per-layer resident state."
+                )
             with _dsa_prof.section("prepare_sparse_indices"):
                 (
                     topk_indices,
@@ -3183,6 +3503,10 @@ class AscendSFAImpl(MLAAttentionImpl):
                     block_size=self.block_size,
                     need_packed=_need_packed,
                     clear_invalid_rows=_is_pure_decode,
+                    request_state_indices=_request_state_indices,
+                    request_generations=_request_generations,
+                    resident_token_ids=_resident_token_ids,
+                    resident_generations=_resident_generations,
                 )
             _sparse_indices_padding_zeroed = _is_pure_decode
             _diag_context = get_forward_context() if _mtp_dw_diag_enabled() and _diag_remap_build else None
@@ -3238,7 +3562,21 @@ class AscendSFAImpl(MLAAttentionImpl):
                     else []
                 )
                 _diag_selected_counts = (
-                    _selected_token_counts.detach().cpu().tolist()
+                    _dsa_selected_counts_for_wait(
+                        _selected_token_counts,
+                        (
+                            int(_diag_packed.shape[0])
+                            if _diag_packed is not None
+                            else (
+                                len(_diag_req_ids)
+                                if _diag_req_ids is not None
+                                else 0
+                            )
+                        ),
+                    )
+                    .detach()
+                    .cpu()
+                    .tolist()
                     if _diag_deep_req_ids and _selected_token_counts is not None
                     else []
                 )
@@ -3308,7 +3646,6 @@ class AscendSFAImpl(MLAAttentionImpl):
                         packed_values = packed_row.tolist()
                         absolute_values = absolute_row.tolist()
                         selected_absolute_values = selected_absolute.tolist()
-                        payload_width = len(packed_values)
                         block_size = int(kv_cache[0].shape[1])
                         block_table_row = attn_metadata.block_table[int(req_index)].detach().cpu().tolist()
                         scratch_safety = scratch_target_safety(
@@ -3324,60 +3661,16 @@ class AscendSFAImpl(MLAAttentionImpl):
                             if compact_row is not None and compact_row < len(_diag_target_slots)
                             else None
                         )
-                        if actual_target_slots is not None:
-                            consumed_target_slots = actual_target_slots[:selected_count]
-                            actual_aliases = sorted(
-                                set(consumed_target_slots).intersection(scratch_safety["live_slots"])
-                            )
-                        else:
-                            consumed_target_slots = []
-                            actual_aliases = []
-                        try:
-                            derived_target_slots, live_slots, _ = scratch_live_slot_aliases(
-                                block_table_row,
-                                range(
-                                    effective_scratch_base,
-                                    effective_scratch_base + payload_width,
-                                ),
-                                boundary,
-                                current_position,
-                                block_size,
-                            )
-                            target_slots = actual_target_slots or derived_target_slots
-                            consumed_target_slots = target_slots[:selected_count]
-                            aliases = sorted(set(consumed_target_slots).intersection(live_slots))
-                            if target_slots != derived_target_slots:
-                                _mtp_dw_event(
-                                    "fail",
-                                    invariant="deep_target_slot_mapping",
-                                    tp_rank=self.tp_rank,
-                                    tp_world=self.tp_size,
-                                    req=req_id,
-                                    row=row,
-                                    req_index=int(req_index),
-                                    derived_sample=derived_target_slots[:8],
-                                    actual_sample=target_slots[:8],
-                                )
-                        except ValueError as error:
-                            _mtp_dw_event(
-                                "fail",
-                                invariant="deep_physical_slot_mapping",
-                                tp_rank=self.tp_rank,
-                                tp_world=self.tp_size,
-                                req=req_id,
-                                row=row,
-                                req_index=int(req_index),
-                                row_offset=row_offset,
-                                scratch_base=effective_scratch_base,
-                                current_position=current_position,
-                                prompt_len=prompt_len,
-                                committed_end=committed,
-                                boundary=boundary,
-                                detail=str(error),
-                            )
-                            target_slots = actual_target_slots or []
-                            live_slots = scratch_safety["live_slots"]
-                            aliases = actual_aliases
+                        # Reuse deliberately targets arbitrary non-live scratch
+                        # slots, so the old compact-prefix target derivation is
+                        # no longer an invariant. Validate the explicit physical
+                        # targets consumed by LMCache instead.
+                        target_slots = actual_target_slots or []
+                        live_slots = scratch_safety["live_slots"]
+                        consumed_target_slots = target_slots[:selected_count]
+                        aliases = sorted(
+                            set(consumed_target_slots).intersection(live_slots)
+                        )
                         deep_common = {
                             "tp_rank": self.tp_rank,
                             "tp_world": self.tp_size,
@@ -3555,18 +3848,46 @@ class AscendSFAImpl(MLAAttentionImpl):
             # Stage 3 = isolation diagnostic: remap + FA on (garbage) scratch but
             # NO LMCache call. Output is expected wrong; only crash/no-crash
             # matters (crash => our remap/FA, clean => LMCache transfer kernel).
-            if self.dsa_shrink_latent != 3 and _sel_packed is not None:
+            if self.dsa_shrink_latent != 3:
+                if (
+                    _sel_packed is None
+                    or _selected_token_counts is None
+                    or _target_slot_mapping is None
+                ):
+                    raise RuntimeError(
+                        "DSA scratch-reuse retrieve requires selected tokens, "
+                        "target slots, and selected counts as one complete "
+                        "payload."
+                    )
                 _selected_for_wait = _sel_packed
-                _target_slot_mapping_for_wait = attn_metadata.decode_target_slot_mapping
+                _target_slot_mapping_for_wait = _target_slot_mapping
                 _request_ids_for_wait = attn_metadata.decode_request_ids_compact
+                if _request_ids_for_wait is None:
+                    raise RuntimeError(
+                        "DSA scratch-reuse retrieve requires row-aligned "
+                        "request IDs."
+                    )
+                _request_count_for_wait = len(_request_ids_for_wait)
+                _selected_count_values_for_wait = (
+                    _dsa_selected_counts_for_wait(
+                        _selected_token_counts,
+                        _request_count_for_wait,
+                    )
+                )
                 _wait_fn = wait_for_kv_layer_from_connector
                 with _dsa_prof.section("lmc_retrieve"):
                     _wait_fn(
                         layer_name,
-                        selected_tokens=_selected_for_wait,
-                        target_slot_mapping=_target_slot_mapping_for_wait,
+                        selected_tokens=_selected_for_wait[
+                            :_request_count_for_wait
+                        ],
+                        target_slot_mapping=_target_slot_mapping_for_wait[
+                            :_request_count_for_wait
+                        ],
                         request_ids=_request_ids_for_wait,
-                        selected_token_counts=_selected_token_counts,
+                        selected_token_counts=(
+                            _selected_count_values_for_wait
+                        ),
                     )
                 if _LMCACHE_SPARSE_WAIT_SYNC_ONCE and not _lmcache_sparse_wait_sync_once_done:
                     _sync_compute_stream_after_lmcache_sparse_wait()

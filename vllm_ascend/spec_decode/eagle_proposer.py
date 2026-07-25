@@ -158,13 +158,21 @@ class SpecDecodeBaseProposer(EagleProposer):
         else:
             self.tp_group_context = nullcontext()
 
-        staged_mtp_graph_requested = (
+        staged_mtp_graph_blocked = (
             self.method == "mtp"
             and staged_sfa_graph_configured(vllm_config)
         )
-        self.use_cuda_graph = self.runner._use_aclgraph() and (
-            not self.speculative_config.enforce_eager
-            or staged_mtp_graph_requested
+        if staged_mtp_graph_blocked:
+            logger.warning(
+                "MTP draft outer FULL graph is disabled for staged DSA: "
+                "sparse LMCache retrieve is a host-side split that must run "
+                "on every draft step. Target staged PIECEWISE graphs remain "
+                "enabled; the draft runs eagerly."
+            )
+        self.use_cuda_graph = (
+            self.runner._use_aclgraph()
+            and not self.speculative_config.enforce_eager
+            and not staged_mtp_graph_blocked
         )
         if self.method == "mtp":
             self.use_cuda_graph = (
@@ -172,11 +180,14 @@ class SpecDecodeBaseProposer(EagleProposer):
                 and not self.use_async_scheduling
                 and not self.speculative_config.disable_padded_drafter_batch
             )
-        self.use_staged_mtp_draft_graph = (
-            self.method == "mtp"
-            and self.use_cuda_graph
-            and staged_sfa_graph_configured(vllm_config)
-        )
+        # A FULL wrapper around the complete MTP model would capture the
+        # device-side sparse prepare/remap kernels but replay without
+        # re-entering the host-side LMCache split. That can mark misses
+        # resident without loading them. Keep this path fail-closed until the
+        # draft model has true piecewise pre/retrieve/post graph orchestration.
+        # ``use_cuda_graph=False`` also forces its forward context to NONE, so
+        # the native fallback re-enters the connector wait on every draft step.
+        self.use_staged_mtp_draft_graph = False
         self._staged_mtp_max_request_capacity = 0
         if self.use_staged_mtp_draft_graph:
             capture_sizes = staged_sfa_graph_capture_sizes(vllm_config)
@@ -204,6 +215,22 @@ class SpecDecodeBaseProposer(EagleProposer):
             torch.zeros(slot_mapping_lens, dtype=torch.int32, device=device, pin_memory=self.runner.pin_memory)
             for _ in range(self.num_speculative_tokens)
         ]
+        self.indexer_slot_mapping_group = (
+            [
+                torch.full(
+                    (slot_mapping_lens,),
+                    PADDING_SLOT_ID,
+                    # vLLM BlockTable.slot_mapping is int64. Keep the
+                    # indexer group's fixed draft buffers layout-compatible
+                    # with the runner-owned source used during target decode.
+                    dtype=torch.int64,
+                    device=device,
+                )
+                for _ in range(self.num_speculative_tokens)
+            ]
+            if getattr(self.runner, "dsa_two_groups", False) is True
+            else None
+        )
         self._staged_mtp_metadata_arenas: list[
             _DraftStepMetadataArena
         ] = []
@@ -528,6 +555,72 @@ class SpecDecodeBaseProposer(EagleProposer):
         ]
         self._staged_mtp_arena_capacity = capacity
 
+    def _bind_dsa_scratch_state_capacity(
+        self,
+        common: AscendCommonAttentionMetadata,
+        capacity: int,
+    ) -> None:
+        """Bind fixed-address scratch lifetime metadata at padded capacity."""
+        state_indices = getattr(common, "dsa_scratch_state_indices", None)
+        generations = getattr(
+            common,
+            "dsa_scratch_request_generations",
+            None,
+        )
+        if (state_indices is None) != (generations is None):
+            raise RuntimeError(
+                "MTP DSA scratch state indices and generations must be "
+                "provided together."
+            )
+        if state_indices is not None and (
+            int(state_indices.numel()) >= capacity
+            and int(generations.numel()) >= capacity
+        ):
+            common.dsa_scratch_state_indices = state_indices[:capacity]
+            common.dsa_scratch_request_generations = generations[:capacity]
+            return
+
+        runner_indices = getattr(
+            self.runner,
+            "dsa_scratch_state_indices",
+            None,
+        )
+        runner_generations = getattr(
+            self.runner,
+            "dsa_scratch_request_generations",
+            None,
+        )
+        runner_indices = getattr(runner_indices, "gpu", runner_indices)
+        runner_generations = getattr(
+            runner_generations,
+            "gpu",
+            runner_generations,
+        )
+        if (
+            state_indices is None
+            and generations is None
+            and runner_indices is None
+            and runner_generations is None
+        ):
+            return
+        if (
+            not isinstance(runner_indices, torch.Tensor)
+            or not isinstance(runner_generations, torch.Tensor)
+            or int(runner_indices.numel()) < capacity
+            or int(runner_generations.numel()) < capacity
+        ):
+            raise RuntimeError(
+                "MTP padded metadata cannot recover the runner-owned DSA "
+                "scratch state buffers: "
+                f"capacity={capacity}, "
+                f"indices={getattr(runner_indices, 'shape', None)}, "
+                f"generations={getattr(runner_generations, 'shape', None)}."
+            )
+        common.dsa_scratch_state_indices = runner_indices[:capacity]
+        common.dsa_scratch_request_generations = (
+            runner_generations[:capacity]
+        )
+
     def _bind_staged_mtp_metadata_arena(
         self,
         common: AscendCommonAttentionMetadata,
@@ -598,6 +691,61 @@ class SpecDecodeBaseProposer(EagleProposer):
             result.positions = arena.positions[:capacity]
         result.num_reqs = capacity
         return result
+
+    def _set_draft_step_indexer_slot_mapping(
+        self,
+        common: AscendCommonAttentionMetadata,
+        *,
+        draft_step: int,
+        source: torch.Tensor,
+        valid_slots: int,
+    ) -> None:
+        """Copy one draft step's indexer slots into fixed-address storage."""
+        if valid_slots < 0 or valid_slots > int(source.numel()):
+            raise RuntimeError(
+                "Invalid MTP indexer slot count: "
+                f"valid_slots={valid_slots}, source={source.numel()}."
+            )
+        destination = None
+        groups = getattr(self, "indexer_slot_mapping_group", None)
+        if groups is not None and draft_step < len(groups):
+            destination = groups[draft_step]
+        if destination is None:
+            raise RuntimeError(
+                "MTP received a two-group indexer slot mapping without "
+                "fixed per-draft-step storage."
+            )
+        if valid_slots > int(destination.numel()):
+            raise RuntimeError(
+                "MTP indexer slot mapping exceeds fixed storage: "
+                f"valid_slots={valid_slots}, "
+                f"capacity={destination.numel()}."
+            )
+        same_storage = destination.data_ptr() == source.data_ptr()
+        if not same_storage:
+            destination.fill_(PADDING_SLOT_ID)
+            if valid_slots:
+                destination[:valid_slots].copy_(source[:valid_slots])
+        elif valid_slots < int(destination.numel()):
+            destination[valid_slots:].fill_(PADDING_SLOT_ID)
+        common.indexer_slot_mapping = destination
+
+    def _dsa_indexer_kernel_block_size(self) -> int:
+        if getattr(self.runner, "dsa_two_groups", False) is True:
+            input_batch = getattr(self.runner, "input_batch", None)
+            multi_group_table = getattr(input_batch, "block_table", None)
+            if multi_group_table is None:
+                raise RuntimeError(
+                    "DSA two-group MTP cannot resolve the indexer block size."
+                )
+            block_size = int(multi_group_table[1].block_size)
+            if block_size <= 0:
+                raise RuntimeError(
+                    "DSA two-group MTP indexer block size must be positive, "
+                    f"got {block_size}."
+                )
+            return block_size
+        return int(self.kernel_block_size)
 
     def shallow_copy_metadata(self, attn_metadata):
         # Currently, new objects will be assigned to the lists in attn_metadata
@@ -851,6 +999,10 @@ class SpecDecodeBaseProposer(EagleProposer):
             )
             common_attn_metadata.seq_lens = self.runner.seq_lens.gpu[:num_reqs_padded]
             common_attn_metadata.seq_lens_cpu = self.runner.seq_lens.cpu[:num_reqs_padded]
+            self._bind_dsa_scratch_state_capacity(
+                common_attn_metadata,
+                num_reqs_padded,
+            )
 
         if self.supports_mm_inputs:
             mm_embeds, is_mm_embed = mm_embed_inputs or (None, None)
@@ -871,6 +1023,31 @@ class SpecDecodeBaseProposer(EagleProposer):
                 token_indices_to_sample
             ]
 
+        step0_indexer_block_table = getattr(
+            common_attn_metadata,
+            "indexer_block_table_tensor",
+            None,
+        )
+        step0_indexer_slot_mapping = getattr(
+            common_attn_metadata,
+            "indexer_slot_mapping",
+            None,
+        )
+        if (step0_indexer_block_table is None) != (
+            step0_indexer_slot_mapping is None
+        ):
+            raise RuntimeError(
+                "MTP DSA indexer block table and slot mapping must be "
+                "provided together."
+            )
+        if (
+            getattr(self.runner, "dsa_two_groups", False) is True
+            and step0_indexer_block_table is None
+        ):
+            raise RuntimeError(
+                "DSA two-group MTP requires the target runner's indexer "
+                "block table and slot mapping."
+            )
         if use_staged_mtp_draft_graph:
             common_attn_metadata = self._bind_staged_mtp_metadata_arena(
                 common_attn_metadata,
@@ -889,6 +1066,13 @@ class SpecDecodeBaseProposer(EagleProposer):
         self.slot_mapping_group[0][:slot_mapping_lens].copy_(common_attn_metadata.slot_mapping[:slot_mapping_lens])
         self.slot_mapping_group[0][slot_mapping_lens:].fill_(-1)
         common_attn_metadata.slot_mapping = self.slot_mapping_group[0]
+        if step0_indexer_slot_mapping is not None:
+            self._set_draft_step_indexer_slot_mapping(
+                common_attn_metadata,
+                draft_step=0,
+                source=step0_indexer_slot_mapping,
+                valid_slots=num_input_tokens,
+            )
         common_attn_metadata.num_input_tokens = num_input_tokens
         # FIXME(woosuk): The below two ops cause synchronization. Optimize.
         assert len(self.draft_attn_groups) > 0
@@ -1561,6 +1745,19 @@ class SpecDecodeBaseProposer(EagleProposer):
             common_attn_metadata.positions[:batch_size].copy_(clamped_positions)
 
         if self.pcp_size * self.dcp_size > 1:
+            if (
+                getattr(
+                    old_common_metadata,
+                    "indexer_block_table_tensor",
+                    None,
+                )
+                is not None
+            ):
+                raise RuntimeError(
+                    "DSA two-group MTP draft slot updates with PCP/DCP are "
+                    "not implemented; a separate indexer-group PCP slot "
+                    "mapping is required."
+                )
             num_computed_tokens_of_pcp_dcp = self.runner.pcp_manager._get_cp_local_seq_lens(
                 ori_seq_len + draft_step + 1,
                 self.pcp_size,
@@ -1599,6 +1796,47 @@ class SpecDecodeBaseProposer(EagleProposer):
             self.slot_mapping_group[draft_step][slot_mapping.shape[0] :].fill_(PADDING_SLOT_ID)
             # Set the address of the attn_metadata.slot_mapping to the self.slot_mapping_group[idx]
             common_attn_metadata.slot_mapping = self.slot_mapping_group[draft_step]
+            indexer_block_table = getattr(
+                old_common_metadata,
+                "indexer_block_table_tensor",
+                None,
+            )
+            if indexer_block_table is not None:
+                indexer_block_size = (
+                    self._dsa_indexer_kernel_block_size()
+                )
+                if self.uses_mrope:
+                    indexer_block_numbers = (
+                        clamped_positions[0] // indexer_block_size
+                    )
+                else:
+                    indexer_block_numbers = (
+                        clamped_positions // indexer_block_size
+                    )
+                indexer_block_ids = indexer_block_table.gather(
+                    dim=1,
+                    index=indexer_block_numbers.view(-1, 1),
+                ).view(-1)
+                if self.uses_mrope:
+                    indexer_slot_mapping = (
+                        indexer_block_ids * indexer_block_size
+                        + clamped_positions[0] % indexer_block_size
+                    )
+                else:
+                    indexer_slot_mapping = (
+                        indexer_block_ids * indexer_block_size
+                        + clamped_positions % indexer_block_size
+                    )
+                indexer_slot_mapping.masked_fill_(
+                    exceeds_max_model_len,
+                    PADDING_SLOT_ID,
+                )
+                self._set_draft_step_indexer_slot_mapping(
+                    common_attn_metadata,
+                    draft_step=draft_step,
+                    source=indexer_slot_mapping,
+                    valid_slots=batch_size,
+                )
 
         attn_metadata_builder = attn_group.get_metadata_builder()
 
@@ -1759,6 +1997,18 @@ class SpecDecodeBaseProposer(EagleProposer):
             common_attn_metadata.slot_mapping[token_indices]
         )
         common_attn_metadata.slot_mapping[token_indices.shape[0] :].fill_(-1)
+        indexer_slot_mapping = getattr(
+            common_attn_metadata,
+            "indexer_slot_mapping",
+            None,
+        )
+        if indexer_slot_mapping is not None:
+            indexer_slot_mapping[: token_indices.shape[0]].copy_(
+                indexer_slot_mapping[token_indices]
+            )
+            indexer_slot_mapping[token_indices.shape[0] :].fill_(
+                PADDING_SLOT_ID
+            )
 
         # NOTE: Currently positions and seq_lens are not used in attn forward
         # so we do not need to fixed them. But if they are used in the future,
@@ -1775,11 +2025,23 @@ class SpecDecodeBaseProposer(EagleProposer):
             max_query_len=new_query_len_per_req.max().item(),
             block_table_tensor=common_attn_metadata.block_table_tensor,
             slot_mapping=common_attn_metadata.slot_mapping,
+            indexer_block_table_tensor=(
+                common_attn_metadata.indexer_block_table_tensor
+            ),
+            indexer_slot_mapping=common_attn_metadata.indexer_slot_mapping,
             actual_seq_lengths_q=self.runner.actual_seq_lengths_q,
             positions=common_attn_metadata.positions[token_indices],
             attn_state=self.runner.attn_state,
             decode_token_per_req=self.runner.decode_token_per_req,
             max_seq_len=0,
+            prompt_lens_cpu=common_attn_metadata.prompt_lens_cpu,
+            request_ids=common_attn_metadata.request_ids,
+            dsa_scratch_state_indices=(
+                common_attn_metadata.dsa_scratch_state_indices
+            ),
+            dsa_scratch_request_generations=(
+                common_attn_metadata.dsa_scratch_request_generations
+            ),
         )
         return spec_common_attn_metadata, token_indices
 
@@ -1854,12 +2116,24 @@ class SpecDecodeBaseProposer(EagleProposer):
             actual_seq_lengths_q=self.runner.actual_seq_lengths_q,
             block_table_tensor=common_attn_metadata.block_table_tensor,
             slot_mapping=common_attn_metadata.slot_mapping,
+            indexer_block_table_tensor=(
+                common_attn_metadata.indexer_block_table_tensor
+            ),
+            indexer_slot_mapping=common_attn_metadata.indexer_slot_mapping,
             positions=common_attn_metadata.positions,
             attn_state=self.runner.attn_state,
             decode_token_per_req=self.runner.decode_token_per_req,
             num_computed_tokens_cpu=common_attn_metadata.num_computed_tokens_cpu,
             seq_lens=common_attn_metadata.seq_lens,
             max_seq_len=0,
+            prompt_lens_cpu=common_attn_metadata.prompt_lens_cpu,
+            request_ids=common_attn_metadata.request_ids,
+            dsa_scratch_state_indices=(
+                common_attn_metadata.dsa_scratch_state_indices
+            ),
+            dsa_scratch_request_generations=(
+                common_attn_metadata.dsa_scratch_request_generations
+            ),
         )
 
         return spec_common_attn_metadata, token_indices, token_indices_to_sample, num_rejected_tokens_gpu

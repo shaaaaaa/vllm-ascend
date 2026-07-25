@@ -5,6 +5,7 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import torch
 from vllm.config import CacheConfig, CompilationMode, CUDAGraphMode, VllmConfig, set_current_vllm_config
+from vllm.v1.spec_decode.utils import PADDING_SLOT_ID
 
 from tests.ut.base import TestBase
 from vllm_ascend.ascend_config import init_ascend_config
@@ -161,6 +162,147 @@ class TestEagleProposerInitialization(TestBase):
                 torch.arange(5, dtype=torch.int32),
             )
         )
+
+    def test_mtp_padding_recovers_fixed_dsa_state_buffers(self):
+        proposer = SpecDecodeBaseProposer.__new__(
+            SpecDecodeBaseProposer
+        )
+        runner_indices = torch.tensor(
+            [1, 0, 2, 3, 4], dtype=torch.int32
+        )
+        runner_generations = torch.tensor(
+            [-1, -2, -3, -4, -5], dtype=torch.int64
+        )
+        proposer.runner = SimpleNamespace(
+            dsa_scratch_state_indices=SimpleNamespace(gpu=runner_indices),
+            dsa_scratch_request_generations=SimpleNamespace(
+                gpu=runner_generations
+            ),
+        )
+        for common in (
+            SimpleNamespace(
+                dsa_scratch_state_indices=runner_indices[:2],
+                dsa_scratch_request_generations=runner_generations[:2],
+            ),
+            # A padded metadata object may start without DSA-specific fields.
+            SimpleNamespace(
+                dsa_scratch_state_indices=None,
+                dsa_scratch_request_generations=None,
+            ),
+        ):
+            proposer._bind_dsa_scratch_state_capacity(common, 4)
+
+            self.assertEqual(
+                common.dsa_scratch_state_indices.tolist(),
+                [1, 0, 2, 3],
+            )
+            self.assertEqual(
+                common.dsa_scratch_request_generations.tolist(),
+                [-1, -2, -3, -4],
+            )
+            self.assertEqual(
+                common.dsa_scratch_state_indices.data_ptr(),
+                runner_indices.data_ptr(),
+            )
+            self.assertEqual(
+                common.dsa_scratch_request_generations.data_ptr(),
+                runner_generations.data_ptr(),
+            )
+
+    def test_second_mtp_step_uses_indexer_group_block_table(self):
+        proposer = SpecDecodeBaseProposer.__new__(
+            SpecDecodeBaseProposer
+        )
+        proposer.use_staged_mtp_draft_graph = False
+        proposer.pcp_size = 1
+        proposer.dcp_size = 1
+        proposer.uses_mrope = False
+        proposer.max_model_len = 128
+        proposer.kernel_block_size = 2
+        proposer.method = "mtp"
+        proposer.arange = torch.arange(8, dtype=torch.int32)
+        proposer.token_arange_np = np.arange(8, dtype=np.int32)
+        proposer.slot_mapping_group = [
+            torch.full((4,), PADDING_SLOT_ID, dtype=torch.int32)
+            for _ in range(2)
+        ]
+        proposer.indexer_slot_mapping_group = [
+            torch.full((4,), PADDING_SLOT_ID, dtype=torch.int64)
+            for _ in range(2)
+        ]
+        proposer.runner = SimpleNamespace(
+            dsa_two_groups=True,
+            input_batch=SimpleNamespace(
+                block_table=[
+                    SimpleNamespace(block_size=2),
+                    SimpleNamespace(block_size=2),
+                ]
+            ),
+        )
+        common = SimpleNamespace(
+            query_start_loc=torch.tensor([0, 1, 2], dtype=torch.int32),
+            query_start_loc_cpu=torch.tensor(
+                [0, 1, 2], dtype=torch.int32
+            ),
+            seq_lens=torch.tensor([2, 4], dtype=torch.int32),
+            seq_lens_cpu=torch.tensor([2, 4], dtype=torch.int32),
+            num_computed_tokens_cpu=torch.tensor(
+                [1, 3], dtype=torch.int32
+            ),
+            num_reqs=2,
+            num_actual_tokens=2,
+            num_input_tokens=2,
+            max_query_len=1,
+            decode_token_per_req=1,
+            attn_state=None,
+            graph_pad_size=-1,
+            block_table_tensor=torch.tensor(
+                [[10, 11], [20, 21]], dtype=torch.int32
+            ),
+            indexer_block_table_tensor=torch.tensor(
+                [[30, 31], [40, 41]], dtype=torch.int32
+            ),
+            slot_mapping=torch.zeros(4, dtype=torch.int32),
+            indexer_slot_mapping=torch.zeros(4, dtype=torch.int64),
+            positions=torch.zeros(4, dtype=torch.int32),
+        )
+        builder = SimpleNamespace(
+            build_for_drafting=lambda **kwargs: kwargs[
+                "common_attn_metadata"
+            ]
+        )
+        attn_group = SimpleNamespace(
+            get_metadata_builder=lambda: builder
+        )
+
+        updated, metadata = proposer.attn_update_stack_num_spec_norm(
+            1,
+            None,
+            common,
+            batch_size=2,
+            input_batch_size=4,
+            used_update_positions=torch.tensor(
+                [0, 2], dtype=torch.int32
+            ),
+            aclgraph_runtime_mode=CUDAGraphMode.NONE,
+            attn_group=attn_group,
+        )
+
+        self.assertIs(updated, metadata)
+        self.assertEqual(
+            updated.slot_mapping.tolist(),
+            [21, 43, PADDING_SLOT_ID, PADDING_SLOT_ID],
+        )
+        self.assertEqual(
+            updated.indexer_slot_mapping.tolist(),
+            [61, 83, PADDING_SLOT_ID, PADDING_SLOT_ID],
+        )
+        self.assertEqual(updated.indexer_slot_mapping.dtype, torch.int64)
+        self.assertEqual(
+            updated.indexer_slot_mapping.data_ptr(),
+            proposer.indexer_slot_mapping_group[1].data_ptr(),
+        )
+
     def test_initialization_eagle3_enforce_eager(self):
         self.vllm_config.speculative_config.method = "eagle3"
         self.vllm_config.speculative_config.draft_model_config.get_hidden_size.return_value = 2048
@@ -212,12 +354,12 @@ class TestEagleProposerInitialization(TestBase):
             expected_max_num_tokens = proposer.max_num_tokens
             self.assertEqual(proposer.hidden_states.shape, (expected_max_num_tokens, 2048))
 
-    def test_staged_mtp_graph_overrides_legacy_draft_enforce_eager(
+    def test_staged_mtp_keeps_host_retrieve_outside_draft_full_graph(
         self,
     ):
         self.vllm_config.speculative_config.method = "mtp"
         self.vllm_config.speculative_config.draft_model_config.get_hidden_size.return_value = 2048
-        self.vllm_config.speculative_config.enforce_eager = True
+        self.vllm_config.speculative_config.enforce_eager = False
         self.vllm_config.scheduler_config.async_scheduling = False
         self.runner._use_aclgraph.return_value = True
         self.runner.cudagraph_batch_sizes = [2, 4]
@@ -233,6 +375,9 @@ class TestEagleProposerInitialization(TestBase):
                 "staged_sfa_graph_capture_sizes",
                 return_value=(2, 4),
             ),
+            patch(
+                "vllm_ascend.spec_decode.eagle_proposer.logger.warning"
+            ) as warning,
             set_current_vllm_config(self.vllm_config),
         ):
             proposer = AscendEagleProposer(
@@ -241,8 +386,13 @@ class TestEagleProposerInitialization(TestBase):
                 runner=self.runner,
             )
 
-        self.assertTrue(proposer.use_cuda_graph)
-        self.assertTrue(proposer.use_staged_mtp_draft_graph)
+        self.assertFalse(proposer.use_cuda_graph)
+        self.assertFalse(proposer.use_staged_mtp_draft_graph)
+        warning.assert_called_once()
+        self.assertIn(
+            "host-side split",
+            warning.call_args.args[0],
+        )
 
 @unittest.skip("Skip due to the changes in #7153, fix me later")
 class TestEagleProposerLoadModel(TestBase):
@@ -577,8 +727,7 @@ class TestEagleProposerHelperMethods(TestBase):
         # Clear the current vllm config
         set_current_vllm_config(None)
 
-    # TODO: This is equivalent to disable_padded_drafter_batch=True.
-    # We need to add a test_prepare_inputs_padded in future.
+    # This is equivalent to disable_padded_drafter_batch=True.
     def test_prepare_inputs(self):
         self.proposer.token_arange_np = np.arange(10)
         mock_attn = MagicMock()
@@ -592,3 +741,142 @@ class TestEagleProposerHelperMethods(TestBase):
         ):
             return_attn, indices = self.proposer.prepare_inputs(mock_attn, num_rejected)
             self.assertEqual(indices.tolist(), [1, 2, 4])
+
+    def _dsa_common_metadata(self):
+        state_indices = torch.tensor([1, 0], dtype=torch.int32)
+        generations = torch.tensor([17, 23], dtype=torch.int64)
+        prompt_lens = np.array([8, 18], dtype=np.int32)
+        request_ids = ["req-a", "req-b"]
+        indexer_block_table = torch.tensor(
+            [[110, 111], [120, 121]],
+            dtype=torch.int32,
+        )
+        indexer_slot_mapping = torch.tensor(
+            [210, 211, 220, 221],
+            dtype=torch.int64,
+        )
+        return (
+            SimpleNamespace(
+                query_start_loc=torch.tensor([0, 2, 4], dtype=torch.int32),
+                query_start_loc_cpu=torch.tensor(
+                    [0, 2, 4], dtype=torch.int32
+                ),
+                seq_lens=torch.tensor([10, 20], dtype=torch.int32),
+                seq_lens_cpu=torch.tensor([10, 20], dtype=torch.int32),
+                num_computed_tokens_cpu=torch.tensor(
+                    [9, 19], dtype=torch.int32
+                ),
+                num_reqs=2,
+                num_actual_tokens=4,
+                num_input_tokens=4,
+                block_table_tensor=torch.tensor(
+                    [[10, 11], [20, 21]], dtype=torch.int32
+                ),
+                slot_mapping=torch.arange(4, dtype=torch.int32),
+                indexer_block_table_tensor=indexer_block_table,
+                indexer_slot_mapping=indexer_slot_mapping,
+                positions=torch.arange(4, dtype=torch.int64),
+                prompt_lens_cpu=prompt_lens,
+                request_ids=request_ids,
+                dsa_scratch_state_indices=state_indices,
+                dsa_scratch_request_generations=generations,
+            ),
+            prompt_lens,
+            request_ids,
+            state_indices,
+            generations,
+        )
+
+    @staticmethod
+    def _assert_dsa_lifetime_metadata_preserved(
+        metadata,
+        prompt_lens,
+        request_ids,
+        state_indices,
+        generations,
+    ):
+        assert metadata.prompt_lens_cpu is prompt_lens
+        assert metadata.request_ids is request_ids
+        assert metadata.dsa_scratch_state_indices is state_indices
+        assert metadata.dsa_scratch_request_generations is generations
+
+    def test_prepare_inputs_preserves_dsa_scratch_lifetime_metadata(self):
+        (
+            common,
+            prompt_lens,
+            request_ids,
+            state_indices,
+            generations,
+        ) = self._dsa_common_metadata()
+        self.proposer.token_arange_np = np.arange(8)
+        self.proposer.runner.actual_seq_lengths_q = []
+        self.proposer.runner.attn_state = None
+        self.proposer.runner.decode_token_per_req = 2
+
+        metadata, _ = self.proposer.prepare_inputs(
+            common,
+            sampled_token_ids=[[101], [202]],
+            num_draft_tokens=[1, 1],
+        )
+
+        self._assert_dsa_lifetime_metadata_preserved(
+            metadata,
+            prompt_lens,
+            request_ids,
+            state_indices,
+            generations,
+        )
+        self.assertIs(
+            metadata.indexer_block_table_tensor,
+            common.indexer_block_table_tensor,
+        )
+        self.assertEqual(
+            metadata.indexer_slot_mapping.tolist(),
+            [210, 220, PADDING_SLOT_ID, PADDING_SLOT_ID],
+        )
+
+    def test_prepare_inputs_padded_preserves_dsa_scratch_lifetime_metadata(
+        self,
+    ):
+        (
+            common,
+            prompt_lens,
+            request_ids,
+            state_indices,
+            generations,
+        ) = self._dsa_common_metadata()
+        self.proposer.arange = torch.arange(8, dtype=torch.int32)
+        self.proposer.runner.actual_seq_lengths_q = []
+        self.proposer.runner.attn_state = None
+        self.proposer.runner.decode_token_per_req = 2
+        spec_decode_metadata = SimpleNamespace(
+            cu_num_draft_tokens=torch.tensor([1, 2], dtype=torch.int32)
+        )
+
+        with patch(
+            "vllm_ascend.spec_decode.eagle_proposer.enable_sp",
+            return_value=False,
+        ):
+            metadata, *_ = self.proposer.prepare_inputs_padded(
+                common,
+                spec_decode_metadata,
+                valid_sampled_tokens_count=torch.tensor(
+                    [1, 1], dtype=torch.int32
+                ),
+            )
+
+        self._assert_dsa_lifetime_metadata_preserved(
+            metadata,
+            prompt_lens,
+            request_ids,
+            state_indices,
+            generations,
+        )
+        self.assertIs(
+            metadata.indexer_block_table_tensor,
+            common.indexer_block_table_tensor,
+        )
+        self.assertIs(
+            metadata.indexer_slot_mapping,
+            common.indexer_slot_mapping,
+        )

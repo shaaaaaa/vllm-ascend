@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <limits>
 #include <torch/extension.h>
 #include <torch/library.h>
 #include <torch/version.h>
@@ -479,6 +480,246 @@ at::Tensor npu_dsa_prepare_sparse_indices_(
             static_cast<uint32_t>(selected_count_stride),
             static_cast<uint32_t>(bitmap_words),
             static_cast<uint32_t>(block_size), need_packed,
+            clear_invalid_rows);
+        return 0;
+    });
+    cmd.Run();
+    return selected_counts;
+}
+
+at::Tensor npu_dsa_prepare_sparse_indices_reuse_(
+    at::Tensor &topk_indices,
+    const at::Tensor &split_boundary,
+    const at::Tensor &row_req_indices,
+    const at::Tensor &request_block_table,
+    at::Tensor &selected_packed,
+    at::Tensor &selected_counts,
+    at::Tensor &target_slots,
+    const at::Tensor &request_state_indices,
+    const at::Tensor &request_generations,
+    at::Tensor &resident_token_ids,
+    at::Tensor &resident_generations,
+    int64_t block_size,
+    bool need_packed,
+    bool clear_invalid_rows)
+{
+    TORCH_CHECK(
+        need_packed,
+        "scratch-reuse sparse-index preparation requires need_packed=True");
+    TORCH_CHECK(topk_indices.is_privateuseone(),
+                "topk_indices must be on an NPU device");
+    const auto device = topk_indices.device();
+    TORCH_CHECK(
+        split_boundary.device() == device &&
+            row_req_indices.device() == device &&
+            request_block_table.device() == device &&
+            selected_packed.device() == device &&
+            selected_counts.device() == device &&
+            target_slots.device() == device &&
+            request_state_indices.device() == device &&
+            request_generations.device() == device &&
+            resident_token_ids.device() == device &&
+            resident_generations.device() == device,
+        "all scratch-reuse sparse-index tensors must share one NPU device");
+    TORCH_CHECK(
+        topk_indices.scalar_type() == at::kInt &&
+            split_boundary.scalar_type() == at::kInt &&
+            row_req_indices.scalar_type() == at::kInt &&
+            request_block_table.scalar_type() == at::kInt &&
+            selected_packed.scalar_type() == at::kInt &&
+            selected_counts.scalar_type() == at::kInt &&
+            request_state_indices.scalar_type() == at::kInt &&
+            resident_token_ids.scalar_type() == at::kInt,
+        "top-k indices, boundaries, tables, counts, state indices, and "
+        "resident token ids must be int32");
+    TORCH_CHECK(
+        target_slots.scalar_type() == at::kLong &&
+            request_generations.scalar_type() == at::kLong &&
+            resident_generations.scalar_type() == at::kLong,
+        "target slots and request/resident generations must be int64");
+    TORCH_CHECK(
+        topk_indices.is_contiguous() && split_boundary.is_contiguous() &&
+            row_req_indices.is_contiguous() &&
+            request_block_table.is_contiguous() &&
+            selected_packed.is_contiguous() &&
+            selected_counts.is_contiguous() &&
+            target_slots.is_contiguous() &&
+            request_state_indices.is_contiguous() &&
+            request_generations.is_contiguous() &&
+            resident_token_ids.is_contiguous() &&
+            resident_generations.is_contiguous(),
+        "all scratch-reuse sparse-index tensors must be contiguous");
+    TORCH_CHECK(
+        topk_indices.dim() == 2 ||
+            (topk_indices.dim() == 3 && topk_indices.size(1) == 1),
+        "topk_indices must have shape [rows,k] or [rows,1,k]");
+    TORCH_CHECK(
+        request_block_table.dim() == 2 && selected_packed.dim() == 2 &&
+            selected_counts.dim() == 2 &&
+            target_slots.sizes() == selected_packed.sizes(),
+        "request tables and preallocated payload/count buffers must be 2D");
+    TORCH_CHECK(
+        request_state_indices.dim() == 1 &&
+            request_generations.dim() == 1,
+        "request state indices and generations must be one-dimensional");
+    TORCH_CHECK(
+        resident_token_ids.dim() == 2 && resident_generations.dim() == 2,
+        "resident token ids and generations must be two-dimensional");
+
+    const int64_t row_count = topk_indices.size(0);
+    TORCH_CHECK(row_count > 0,
+                "topk_indices must contain at least one row");
+    const int64_t row_width = topk_indices.numel() / row_count;
+    const int64_t request_count = request_block_table.size(0);
+    const int64_t block_table_width = request_block_table.size(1);
+    const int64_t scratch_capacity = selected_packed.size(1);
+    const int64_t selected_count_stride = selected_counts.size(1);
+    const int64_t state_row_count = resident_token_ids.size(0);
+    const int64_t resident_token_stride = resident_token_ids.size(1);
+    const int64_t resident_generation_stride =
+        resident_generations.size(1);
+
+    TORCH_CHECK(request_count > 0,
+                "request block table must contain a request");
+    TORCH_CHECK(
+        split_boundary.numel() >= row_count &&
+            row_req_indices.numel() >= row_count,
+        "split_boundary and row_req_indices must cover every top-k row");
+    TORCH_CHECK(
+        request_state_indices.numel() >= request_count &&
+            request_generations.numel() >= request_count,
+        "stable state indices and generations must cover every request");
+    TORCH_CHECK(
+        selected_packed.size(0) == request_count &&
+            selected_counts.size(0) == request_count &&
+            selected_count_stride >= 16 &&
+            selected_count_stride % 16 == 0,
+        "payload/count rows must match request rows and count rows must "
+        "have a cacheline-padded stride");
+    TORCH_CHECK(
+        block_size > 0 && row_width > 0 && row_width <= 4096,
+        "block_size and sparse row width must be supported and positive");
+    TORCH_CHECK(
+        row_width % 16 == 0,
+        "sparse row width must be a multiple of 16 int32 values so "
+        "different request cores never update the same cacheline");
+    TORCH_CHECK(
+        scratch_capacity >= row_width && scratch_capacity % 16 == 0,
+        "scratch capacity must cover one sparse row and be a multiple of "
+        "16 int32 values so request payload rows do not share a cacheline");
+    TORCH_CHECK(
+        scratch_capacity % row_width == 0,
+        "scratch capacity must be an integer number of top-k rows: "
+        "scratch_capacity=", scratch_capacity, ", row_width=", row_width);
+    TORCH_CHECK(
+        resident_token_stride == scratch_capacity &&
+            resident_token_stride % 16 == 0,
+        "resident token rows must exactly match the cacheline-padded scratch "
+        "capacity");
+    TORCH_CHECK(
+        state_row_count > 0 &&
+            resident_generations.size(0) == state_row_count &&
+            resident_generation_stride >= 8 &&
+            resident_generation_stride % 8 == 0,
+        "resident generation rows must match resident state rows and have "
+        "an int64 stride padded to a complete cacheline");
+    TORCH_CHECK(
+        block_table_width * block_size >= scratch_capacity,
+        "request block table is too short for the fixed scratch prefix");
+    TORCH_CHECK(
+        reinterpret_cast<std::uintptr_t>(topk_indices.data_ptr()) % 64 == 0 &&
+            reinterpret_cast<std::uintptr_t>(selected_packed.data_ptr()) %
+                    64 ==
+                0 &&
+            reinterpret_cast<std::uintptr_t>(selected_counts.data_ptr()) %
+                    64 ==
+                0 &&
+            reinterpret_cast<std::uintptr_t>(target_slots.data_ptr()) % 64 ==
+                0 &&
+            reinterpret_cast<std::uintptr_t>(resident_token_ids.data_ptr()) %
+                    64 ==
+                0 &&
+            reinterpret_cast<std::uintptr_t>(
+                resident_generations.data_ptr()) %
+                    64 ==
+                0,
+        "every per-row mutable buffer must start at a 64-byte-aligned "
+        "address so different request AIVs cannot share a cacheline");
+
+    constexpr int64_t uint32_max =
+        static_cast<int64_t>(std::numeric_limits<uint32_t>::max());
+    TORCH_CHECK(
+        row_count <= uint32_max && row_width <= uint32_max &&
+            request_count <= uint32_max &&
+            block_table_width <= uint32_max &&
+            scratch_capacity <= uint32_max &&
+            selected_count_stride <= uint32_max &&
+            block_size <= uint32_max && state_row_count <= uint32_max &&
+            resident_token_stride <= uint32_max &&
+            resident_generation_stride <= uint32_max,
+        "scratch-reuse operator dimensions must fit uint32 kernel arguments");
+    const int64_t token_capacity = block_table_width * block_size;
+    const int64_t bitmap_words = (token_capacity + 31) / 32;
+    TORCH_CHECK(
+        bitmap_words <= uint32_max,
+        "scratch-reuse bitmap is too large for the uint32 kernel argument");
+    const int64_t bitmap_buffer_words =
+        ((bitmap_words + 7) / 8) * 8;
+    const int64_t rank_buffer_words =
+        ((scratch_capacity + 7) / 8) * 8;
+    const int64_t temporary_ub_bytes =
+        (2 * bitmap_buffer_words + rank_buffer_words) *
+            static_cast<int64_t>(sizeof(int32_t)) +
+        scratch_capacity * static_cast<int64_t>(sizeof(int32_t)) +
+        8 * static_cast<int64_t>(sizeof(int64_t));
+    // Ascend A2/A3 AIV has a 192-KiB UB; this repository uses the same limit
+    // in its other custom kernels. Fail at launch rather than over-allocating
+    // the runtime-sized TBufs in the device kernel.
+    constexpr int64_t aiv_ub_bytes = 192 * 1024;
+    TORCH_CHECK(
+        temporary_ub_bytes <= aiv_ub_bytes,
+        "scratch-reuse temporary UB exceeds the 192-KiB AIV limit: "
+        "required=", temporary_ub_bytes, " bytes, bitmap token capacity=",
+        token_capacity, ", scratch_capacity=", scratch_capacity);
+    const c10_npu::OptionalNPUGuard npu_guard(device);
+    aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
+    void* topk_ptr = topk_indices.data_ptr();
+    void* boundary_ptr = split_boundary.data_ptr();
+    void* row_req_ptr = row_req_indices.data_ptr();
+    void* table_ptr = request_block_table.data_ptr();
+    void* packed_ptr = selected_packed.data_ptr();
+    void* counts_ptr = selected_counts.data_ptr();
+    void* slots_ptr = target_slots.data_ptr();
+    void* state_indices_ptr = request_state_indices.data_ptr();
+    void* request_generations_ptr = request_generations.data_ptr();
+    void* resident_tokens_ptr = resident_token_ids.data_ptr();
+    void* resident_generations_ptr = resident_generations.data_ptr();
+
+    at_npu::native::OpCommand cmd;
+    cmd.Name("npu_dsa_prepare_sparse_indices_reuse_");
+    cmd.SetCustomHandler([
+        stream, topk_ptr, boundary_ptr, row_req_ptr, table_ptr, packed_ptr,
+        counts_ptr, slots_ptr, state_indices_ptr, request_generations_ptr,
+        resident_tokens_ptr, resident_generations_ptr, row_count, row_width,
+        request_count, block_table_width, scratch_capacity,
+        selected_count_stride, bitmap_words, block_size, state_row_count,
+        resident_token_stride, resident_generation_stride,
+        clear_invalid_rows]() -> int {
+        dsa_prepare_sparse_indices_reuse_impl(
+            stream, topk_ptr, boundary_ptr, row_req_ptr, table_ptr, packed_ptr,
+            counts_ptr, slots_ptr, state_indices_ptr, request_generations_ptr,
+            resident_tokens_ptr, resident_generations_ptr,
+            static_cast<uint32_t>(row_count),
+            static_cast<uint32_t>(row_width),
+            static_cast<uint32_t>(request_count),
+            static_cast<uint32_t>(block_table_width),
+            static_cast<uint32_t>(scratch_capacity),
+            static_cast<uint32_t>(selected_count_stride),
+            static_cast<uint32_t>(bitmap_words),
+            static_cast<uint32_t>(block_size),
+            static_cast<uint32_t>(state_row_count),
+            static_cast<uint32_t>(resident_token_stride),
+            static_cast<uint32_t>(resident_generation_stride),
             clear_invalid_rows);
         return 0;
     });
@@ -999,6 +1240,19 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "npu_dsa_prepare_sparse_indices_",
         torch::kPrivateUse1,
         &vllm_ascend::npu_dsa_prepare_sparse_indices_);
+    ops.def(
+        "npu_dsa_prepare_sparse_indices_reuse_("
+        "Tensor(a!) topk_indices, Tensor split_boundary, "
+        "Tensor row_req_indices, Tensor request_block_table, "
+        "Tensor(b!) selected_packed, Tensor(c!) selected_counts, "
+        "Tensor(d!) target_slots, Tensor request_state_indices, "
+        "Tensor request_generations, Tensor(e!) resident_token_ids, "
+        "Tensor(f!) resident_generations, int block_size, "
+        "bool need_packed, bool clear_invalid_rows) -> Tensor(c!)");
+    ops.impl(
+        "npu_dsa_prepare_sparse_indices_reuse_",
+        torch::kPrivateUse1,
+        &vllm_ascend::npu_dsa_prepare_sparse_indices_reuse_);
 
     ops.def("bgmv_shrink(Tensor! x, Tensor! weight, Tensor! indices, Tensor! y, float scale) -> ()");
     ops.impl("bgmv_shrink", torch::kPrivateUse1, &vllm_ascend::bgmv_shrink);

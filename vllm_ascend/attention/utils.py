@@ -23,6 +23,82 @@ logger = init_logger(__name__)
 _DSA_LMCACHE_TRACE = envs.VLLM_ASCEND_DSA_LMCACHE_TRACE
 
 
+def resolve_dsa_index_topk(
+    model_config: Any,
+    *,
+    runtime_topk: Any = None,
+) -> int:
+    """Resolve one DSA top-k value and reject disagreeing configuration."""
+    hf_config = getattr(model_config, "hf_config", None)
+    hf_text_config = getattr(model_config, "hf_text_config", None)
+    candidates: list[tuple[str, int]] = []
+    seen_fields: set[tuple[int, str]] = set()
+    for owner_name, owner in (
+        ("hf_text_config", hf_text_config),
+        ("hf_config", hf_config),
+    ):
+        if owner is None:
+            continue
+        owner_fields = vars(owner)
+        for field_name in ("index_topk", "topk_tokens"):
+            field_key = (id(owner), field_name)
+            # HF configuration values loaded from JSON are stored explicitly
+            # on the config object. Looking them up through ``hasattr`` is
+            # unsafe here because proxy objects (notably MagicMock in tests)
+            # synthesize arbitrary attributes and can manufacture a fake,
+            # conflicting top-k value.
+            if field_key in seen_fields or field_name not in owner_fields:
+                continue
+            seen_fields.add(field_key)
+            raw_value = owner_fields[field_name]
+            if raw_value is None:
+                continue
+            try:
+                value = int(raw_value)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError(
+                    "DSA top-k configuration must be an integer: "
+                    f"{owner_name}.{field_name}={raw_value!r}."
+                ) from exc
+            if value <= 0:
+                raise ValueError(
+                    "DSA top-k configuration must be positive: "
+                    f"{owner_name}.{field_name}={value}."
+                )
+            candidates.append((f"{owner_name}.{field_name}", value))
+    if runtime_topk is not None:
+        try:
+            value = int(runtime_topk)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(
+                "DSA indexer runtime top-k must be an integer: "
+                f"runtime_topk={runtime_topk!r}."
+            ) from exc
+        if value <= 0:
+            raise ValueError(
+                "DSA indexer runtime top-k must be positive: "
+                f"runtime_topk={value}."
+            )
+        candidates.append(("indexer.topk_tokens", value))
+    if not candidates:
+        raise ValueError(
+            "DSA requires index_topk (or topk_tokens) in the model "
+            "configuration."
+        )
+
+    values = {value for _, value in candidates}
+    if len(values) != 1:
+        details = ", ".join(
+            f"{name}={value}" for name, value in candidates
+        )
+        raise ValueError(
+            "DSA scratch reservation, sparse metadata, and indexer output "
+            "must use one identical top-k value. Configure index_topk and "
+            f"topk_tokens consistently: {details}."
+        )
+    return candidates[0][1]
+
+
 def _dsa_lmcache_log_layer(layer_name: str) -> bool:
     return _DSA_LMCACHE_TRACE and "layers.0." in layer_name
 
@@ -220,6 +296,14 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
     # rows -> 0 = no remap).
     prompt_lens_cpu: Any = None
     request_ids: list[str] | None = None
+    # DSA scratch reuse: maps the current batch request order to persistent
+    # per-layer scratch-state rows.  The generation prevents a newly bound
+    # request (or a request whose scratch block prefix changed) from observing
+    # token ids left by the previous owner of the same stable row. Positive
+    # generations denote real requests; non-positive values are reserved for
+    # dummy/padding rows and must not mutate persistent state.
+    dsa_scratch_state_indices: torch.Tensor | None = None
+    dsa_scratch_request_generations: torch.Tensor | None = None
 
     # TODO: Remove it when vLLM no longer uses this function.
     def unpadded(self, num_actual_tokens: int, num_actual_reqs: int) -> "AscendCommonAttentionMetadata":
@@ -247,7 +331,28 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
             num_input_tokens=self.num_input_tokens,
             prefill_context_parallel_metadata=self.prefill_context_parallel_metadata,
             max_seq_len=self.max_seq_len,
-            request_ids=(self.request_ids[:num_actual_reqs] if self.request_ids is not None else None),
+            indexer_block_table_tensor=self.indexer_block_table_tensor,
+            indexer_slot_mapping=self.indexer_slot_mapping,
+            prompt_lens_cpu=(
+                self.prompt_lens_cpu[:num_actual_reqs]
+                if self.prompt_lens_cpu is not None
+                else None
+            ),
+            request_ids=(
+                self.request_ids[:num_actual_reqs]
+                if self.request_ids is not None
+                else None
+            ),
+            dsa_scratch_state_indices=(
+                self.dsa_scratch_state_indices[:num_actual_reqs]
+                if self.dsa_scratch_state_indices is not None
+                else None
+            ),
+            dsa_scratch_request_generations=(
+                self.dsa_scratch_request_generations[:num_actual_reqs]
+                if self.dsa_scratch_request_generations is not None
+                else None
+            ),
         )
 
 

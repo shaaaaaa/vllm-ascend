@@ -8,6 +8,7 @@ and the manager gather that reads prefill latent from the backend (LMCache) and 
 latent from the pool. The on-NPU kernel wiring is verified by the parity run.
 """
 
+import pytest
 import torch
 
 from vllm_ascend.distributed.kv_transfer.sparse_offload.decode_latent_pool import (
@@ -562,3 +563,287 @@ class TestPrepareSparseIndices:
         assert counts.item() == 2
         assert packed[0, :2].tolist() == [0, 1]
         assert remapped.tolist() == [[0, 1, 2, 3], [1, 0, 3, 4]]
+
+
+class TestPrepareSparseIndicesReuse:
+    """Stateful scratch-slot reuse reference semantics."""
+
+    @staticmethod
+    def _run(
+        topk,
+        boundaries,
+        row_requests,
+        tables,
+        state_indices,
+        request_generations,
+        resident_tokens,
+        resident_generations,
+        block_size=2,
+        clear_invalid_rows=False,
+    ):
+        from vllm_ascend.distributed.kv_transfer.sparse_offload.prepare_sparse_indices import (
+            _prepare_sparse_indices_reuse_torch,
+        )
+
+        return _prepare_sparse_indices_reuse_torch(
+            torch.tensor(topk, dtype=torch.int32),
+            torch.tensor(boundaries, dtype=torch.int32),
+            torch.tensor(row_requests, dtype=torch.int32),
+            torch.tensor(tables, dtype=torch.int32),
+            torch.tensor(state_indices, dtype=torch.int32),
+            torch.tensor(request_generations, dtype=torch.int64),
+            resident_tokens,
+            resident_generations,
+            block_size=block_size,
+            clear_invalid_rows=clear_invalid_rows,
+        )
+
+    def test_two_steps_reuse_mtp_union_and_zero_miss(self):
+        resident = torch.full((1, 4), -1, dtype=torch.int32)
+        generations = torch.full((1, 8), -1, dtype=torch.int64)
+
+        first = self._run(
+            [[1, 2, 8, 9], [2, 3, 9, 10]],
+            [4, 4],
+            [0, 0],
+            [[10, 11]],
+            [0],
+            [7],
+            resident,
+            generations,
+        )
+        assert first[0].tolist() == [[0, 1, 8, 9], [1, 2, 9, 10]]
+        assert first[1][0, :3].tolist() == [1, 2, 3]
+        assert first[2].tolist() == [3]
+        assert first[3][0, :3].tolist() == [20, 21, 22]
+        assert resident.tolist() == [[1, 2, 3, -1]]
+
+        second = self._run(
+            [[3, 2, 8, 9], [2, 3, 9, 10]],
+            [4, 4],
+            [0, 0],
+            [[10, 11]],
+            [0],
+            [7],
+            resident,
+            generations,
+        )
+        assert second[0].tolist() == [[2, 1, 8, 9], [1, 2, 9, 10]]
+        assert second[2].tolist() == [0]
+        assert resident.tolist() == [[1, 2, 3, -1]]
+
+    def test_q1_two_steps_reuse_same_slots_with_zero_miss(self):
+        """num_speculative_tokens=0 still uses the stateful reuse contract."""
+        resident = torch.full((1, 4), -1, dtype=torch.int32)
+        generations = torch.full((1, 8), -1, dtype=torch.int64)
+
+        first = self._run(
+            [[1, 2, 8, 9]],
+            [4],
+            [0],
+            [[10, 11]],
+            [0],
+            [7],
+            resident,
+            generations,
+        )
+        assert first[0].tolist() == [[0, 1, 8, 9]]
+        assert first[1][0, :2].tolist() == [1, 2]
+        assert first[2].tolist() == [2]
+        assert first[3][0, :2].tolist() == [20, 21]
+
+        second = self._run(
+            [[2, 1, 8, 9]],
+            [4],
+            [0],
+            [[10, 11]],
+            [0],
+            [7],
+            resident,
+            generations,
+        )
+        assert second[0].tolist() == [[1, 0, 8, 9]]
+        assert second[2].tolist() == [0]
+        assert resident.tolist() == [[1, 2, -1, -1]]
+
+    def test_misses_evict_only_slots_outside_current_union(self):
+        resident = torch.tensor([[1, 2, 3, -1]], dtype=torch.int32)
+        generations = torch.full((1, 8), -1, dtype=torch.int64)
+        generations[0, 0] = 1
+
+        remapped, packed, counts, targets = self._run(
+            [[2, 4, 5, 9]],
+            [8],
+            [0],
+            [[10, 11]],
+            [0],
+            [1],
+            resident,
+            generations,
+        )
+        assert remapped.tolist() == [[1, 0, 2, 9]]
+        assert counts.tolist() == [2]
+        assert packed[0, :2].tolist() == [4, 5]
+        assert targets[0, :2].tolist() == [20, 22]
+        assert resident.tolist() == [[4, 2, 5, -1]]
+
+    def test_miss_payload_uses_row_major_first_seen_order(self):
+        resident = torch.full((1, 4), -1, dtype=torch.int32)
+        generations = torch.full((1, 8), -1, dtype=torch.int64)
+
+        remapped, packed, counts, targets = self._run(
+            [[5, 1, 4, 9], [4, 2, 5, 10]],
+            [6, 6],
+            [0, 0],
+            [[10, 11]],
+            [0],
+            [1],
+            resident,
+            generations,
+        )
+        assert counts.tolist() == [4]
+        assert packed[0, :4].tolist() == [5, 1, 4, 2]
+        assert targets[0, :4].tolist() == [20, 21, 22, 23]
+        assert remapped.tolist() == [[0, 1, 2, 9], [2, 3, 0, 10]]
+
+    def test_multiple_requests_use_independent_stable_state_rows(self):
+        resident = torch.full((3, 4), -1, dtype=torch.int32)
+        resident[0, 0] = 6
+        resident[2, 3] = 1
+        generations = torch.full((3, 8), -1, dtype=torch.int64)
+        generations[0, 0] = 20
+        generations[2, 0] = 10
+
+        remapped, packed, counts, targets = self._run(
+            [[1, 2, 8, 9], [6, 7, 8, 9]],
+            [8, 8],
+            [0, 1],
+            [[10, 11], [20, 21]],
+            [2, 0],
+            [10, 20],
+            resident,
+            generations,
+        )
+        assert remapped.tolist() == [[3, 0, 8, 9], [0, 1, 8, 9]]
+        assert counts.tolist() == [1, 1]
+        assert packed[:, 0].tolist() == [2, 7]
+        assert targets[:, 0].tolist() == [20, 41]
+        assert resident[2].tolist() == [2, -1, -1, 1]
+        assert resident[0].tolist() == [6, 7, -1, -1]
+
+    def test_generation_change_invalidates_all_stale_slots(self):
+        resident = torch.tensor([[5, 6, 7, 8]], dtype=torch.int32)
+        generations = torch.zeros((1, 8), dtype=torch.int64)
+
+        remapped, packed, counts, targets = self._run(
+            [[6, 9, 12, 13]],
+            [10],
+            [0],
+            [[30, 31]],
+            [0],
+            [1],
+            resident,
+            generations,
+        )
+        assert remapped.tolist() == [[0, 1, 12, 13]]
+        assert packed[0, :2].tolist() == [6, 9]
+        assert counts.tolist() == [2]
+        assert targets[0, :2].tolist() == [60, 61]
+        assert resident.tolist() == [[6, 9, -1, -1]]
+        assert generations[0, 0].item() == 1
+
+    def test_zero_boundary_defers_generation_reset_until_scratch_is_used(self):
+        resident = torch.tensor([[5, 6, -1, -1]], dtype=torch.int32)
+        generations = torch.full((1, 8), -1, dtype=torch.int64)
+        generations[0, 0] = 4
+
+        remapped, _, counts, _ = self._run(
+            [[5, 6, 12, 13]],
+            [0],
+            [0],
+            [[30, 31]],
+            [0],
+            [5],
+            resident,
+            generations,
+        )
+        assert remapped.tolist() == [[5, 6, 12, 13]]
+        assert counts.tolist() == [0]
+        assert resident.tolist() == [[5, 6, -1, -1]]
+        assert generations[0, 0].item() == 4
+
+        remapped, packed, counts, _ = self._run(
+            [[5, 7, 12, 13]],
+            [8],
+            [0],
+            [[30, 31]],
+            [0],
+            [5],
+            resident,
+            generations,
+        )
+        assert remapped.tolist() == [[0, 1, 12, 13]]
+        assert packed[0, :2].tolist() == [5, 7]
+        assert counts.tolist() == [2]
+        assert resident.tolist() == [[5, 7, -1, -1]]
+        assert generations[0, 0].item() == 5
+
+    def test_nonpositive_padding_generation_never_touches_state(self):
+        resident = torch.tensor([[5, 6, 7, 8]], dtype=torch.int32)
+        generations = torch.full((1, 8), 123, dtype=torch.int64)
+
+        remapped, _, counts, _ = self._run(
+            [[1, 2, 12, 13]],
+            [10],
+            [-1],
+            [[30, 31]],
+            # Padding can carry an otherwise valid state index, but it does
+            # not own that state row.
+            [0],
+            [0],
+            resident,
+            generations,
+            clear_invalid_rows=True,
+        )
+        assert remapped.tolist() == [[0, 0, 0, 0]]
+        assert counts.tolist() == [0]
+        assert resident.tolist() == [[5, 6, 7, 8]]
+        assert generations.tolist() == [[123] * 8]
+
+    def test_lmcache_token_must_fit_request_block_table(self):
+        resident = torch.full((1, 4), -1, dtype=torch.int32)
+        generations = torch.full((1, 8), -1, dtype=torch.int64)
+
+        with pytest.raises(
+            ValueError,
+            match="selected LMCache token 4.*block-table capacity is 4",
+        ):
+            self._run(
+                [[4, 5, 8, 9]],
+                [6],
+                [0],
+                [[10, 11]],
+                [0],
+                [1],
+                resident,
+                generations,
+            )
+
+    def test_scratch_miss_rejects_null_physical_block(self):
+        resident = torch.full((1, 4), -1, dtype=torch.int32)
+        generations = torch.full((1, 8), -1, dtype=torch.int64)
+
+        with pytest.raises(
+            ValueError,
+            match=r"scratch slot 0.*physical block 0.*null block",
+        ):
+            self._run(
+                [[1, 8, 9, 10]],
+                [4],
+                [0],
+                [[0, 11]],
+                [0],
+                [1],
+                resident,
+                generations,
+            )

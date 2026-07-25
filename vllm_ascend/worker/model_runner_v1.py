@@ -106,6 +106,7 @@ from vllm_ascend.attention.mtp_dw_diag import (
 from vllm_ascend.attention.utils import (
     AscendCommonAttentionMetadata,
     get_lmcache_sparse_cached_tokens,
+    resolve_dsa_index_topk,
     staged_sfa_connector_supports_sparse_load,
     staged_sfa_metadata_sparse_load,
     using_paged_attention,
@@ -317,6 +318,114 @@ class ExecuteModelState(NamedTuple):
     staged_sfa_graph_key: StagedSFAGraphKey | None
 
 
+@dataclass(frozen=True)
+class _DSAScratchStateBinding:
+    state_index: int
+    generation: int
+    scratch_block_prefix: tuple[int, ...]
+
+
+class _DSAScratchStateSlotManager:
+    """Stable request-to-row bindings for per-layer DSA scratch metadata.
+
+    Batch rows are compacted and reordered by ``InputBatch``.  They therefore
+    cannot index persistent scratch-residency state directly.  This manager
+    gives each live request a stable row until it is explicitly finished or
+    preempted.  A monotonically increasing generation invalidates stale
+    per-layer contents when a row is reused or its physical scratch prefix
+    changes.
+    """
+
+    def __init__(self, capacity: int):
+        if capacity <= 0:
+            raise ValueError(
+                "DSA scratch state capacity must be positive, "
+                f"got {capacity}."
+            )
+        self.capacity = capacity
+        self._bindings: dict[str, _DSAScratchStateBinding] = {}
+        self._free_state_indices = list(range(capacity))
+        # Positive generations are reserved for real requests. Graph-capture
+        # dummy rows use non-positive generations.
+        self._next_generation = 1
+
+    def _new_generation(self) -> int:
+        generation = self._next_generation
+        self._next_generation += 1
+        return generation
+
+    def bind(
+        self,
+        req_id: str,
+        scratch_block_prefix: tuple[int, ...],
+        *,
+        force_new_generation: bool = False,
+    ) -> _DSAScratchStateBinding:
+        old = self._bindings.get(req_id)
+        if old is not None:
+            if (
+                not force_new_generation
+                and old.scratch_block_prefix == scratch_block_prefix
+            ):
+                return old
+            binding = _DSAScratchStateBinding(
+                state_index=old.state_index,
+                generation=self._new_generation(),
+                scratch_block_prefix=scratch_block_prefix,
+            )
+            self._bindings[req_id] = binding
+            return binding
+
+        if not self._free_state_indices:
+            raise RuntimeError(
+                "DSA scratch state slots are exhausted: "
+                f"capacity={self.capacity}, live_requests={len(self._bindings)}."
+            )
+        state_index = self._free_state_indices.pop(0)
+        binding = _DSAScratchStateBinding(
+            state_index=state_index,
+            generation=self._new_generation(),
+            scratch_block_prefix=scratch_block_prefix,
+        )
+        self._bindings[req_id] = binding
+        return binding
+
+    def release(self, req_id: str) -> None:
+        binding = self._bindings.pop(req_id, None)
+        if binding is None:
+            return
+        self._free_state_indices.append(binding.state_index)
+        self._free_state_indices.sort()
+
+    def get(self, req_id: str) -> _DSAScratchStateBinding | None:
+        return self._bindings.get(req_id)
+
+
+def _dsa_require_full_scratch_rows(
+    sequence_lengths: Any,
+    *,
+    num_reqs: int,
+    scratch_tokens: int,
+) -> np.ndarray:
+    """Return which requests may address the fixed scratch prefix this step."""
+    lengths = np.asarray(sequence_lengths, dtype=np.int64).reshape(-1)
+    if lengths.shape != (num_reqs,):
+        raise RuntimeError(
+            "DSA scratch readiness inputs do not match the active "
+            f"batch: sequence_lengths={lengths.shape}, num_reqs={num_reqs}."
+        )
+    if scratch_tokens <= 0:
+        raise RuntimeError(
+            "DSA scratch readiness requires a positive scratch capacity, "
+            f"got scratch_tokens={scratch_tokens}."
+        )
+    # A positive SFA boundary is separately constrained to be at least the
+    # scratch capacity and no greater than seq_len. Therefore every request
+    # that can actually address scratch is included by this predicate. The
+    # runner's seq_len already includes scheduled MTP lookahead tokens.
+    return lengths >= scratch_tokens
+
+
 class NPUModelRunner(GPUModelRunner):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         # TODO(qcs): These manual pad and unpad for GPUModelRunner are
@@ -391,7 +500,9 @@ class NPUModelRunner(GPUModelRunner):
         )
         self.dsa_index_topk = 0
         if self.use_sparse:
-            self.dsa_index_topk = int(self.model_config.hf_text_config.index_topk)
+            self.dsa_index_topk = resolve_dsa_index_topk(
+                self.model_config
+            )
             self.sparse_head_dim = (
                 self.model_config.hf_text_config.kv_lora_rank,
                 self.model_config.hf_text_config.qk_rope_head_dim,
@@ -497,6 +608,35 @@ class NPUModelRunner(GPUModelRunner):
         set_mc2_tokens_capacity(vllm_config, self.max_num_reqs, self.uniform_decode_query_len)
         set_mc2_mask(vllm_config, self.device)
         self.decode_threshold = 1 + (self.speculative_config.num_speculative_tokens if self.speculative_config else 0)
+        self._dsa_scratch_state_slot_manager: (
+            _DSAScratchStateSlotManager | None
+        ) = None
+        self.dsa_scratch_state_indices = None
+        self.dsa_scratch_request_generations = None
+        self._dsa_scratch_blocks_per_request = 0
+        if self.dsa_shrink_latent:
+            scratch_tokens = self.decode_threshold * self.dsa_index_topk
+            if scratch_tokens % self.block_size:
+                raise ValueError(
+                    "DSA scratch capacity must be block aligned: "
+                    f"(1 + num_speculative_tokens) * index_topk="
+                    f"{scratch_tokens}, block_size={self.block_size}."
+                )
+            self._dsa_scratch_blocks_per_request = (
+                scratch_tokens // self.block_size
+            )
+            self._dsa_scratch_state_slot_manager = (
+                _DSAScratchStateSlotManager(self.max_num_reqs)
+            )
+            # These fixed-address buffers are graph inputs. Their values are
+            # rewritten in current InputBatch order before metadata is built.
+            # FIA may append one synthetic request to a mixed batch.
+            self.dsa_scratch_state_indices = self._make_buffer(
+                self.max_num_reqs + 1, dtype=torch.int32
+            )
+            self.dsa_scratch_request_generations = self._make_buffer(
+                self.max_num_reqs + 1, dtype=torch.int64
+            )
 
         self.use_aclgraph = self._use_aclgraph()
 
@@ -1294,6 +1434,67 @@ class NPUModelRunner(GPUModelRunner):
             raise ValueError(f"Unknown speculative decoding method: {self.speculative_config.method}")
 
         return draft_token_ids
+
+    def _update_states(self, scheduler_output: "SchedulerOutput") -> None:
+        manager = getattr(
+            self, "_dsa_scratch_state_slot_manager", None
+        )
+        if manager is not None:
+            # A merely unscheduled request is deliberately absent here: it
+            # still owns both its physical scratch blocks and residency row.
+            released_req_ids = set(scheduler_output.finished_req_ids)
+            released_req_ids.update(
+                scheduler_output.preempted_req_ids or ()
+            )
+            for req_id in released_req_ids:
+                manager.release(req_id)
+
+        super()._update_states(scheduler_output)
+
+        if manager is None:
+            return
+        resumed_req_ids = set(
+            scheduler_output.scheduled_cached_reqs.resumed_req_ids
+        )
+        for req_id in self.input_batch.req_ids[
+            : self.input_batch.num_reqs
+        ]:
+            req_state = self.requests[req_id]
+            if not req_state.block_ids:
+                raise RuntimeError(
+                    f"DSA request {req_id!r} has no latent KV block group."
+                )
+            latent_block_ids = req_state.block_ids[0]
+            scratch_blocks = self._dsa_scratch_blocks_per_request
+            # Admission/early prefill may not have allocated the complete
+            # scratch prefix yet. The partial (including empty) prefix is a
+            # valid fingerprint; every extension invalidates resident state.
+            # The sparse-retrieve path separately requires full capacity at
+            # the point where scratch slots are actually addressed.
+            scratch_block_prefix = tuple(
+                int(block_id)
+                for block_id in latent_block_ids[:scratch_blocks]
+            )
+            invalid_scratch_blocks = [
+                block_id
+                for block_id in scratch_block_prefix
+                if block_id <= 0
+            ]
+            if invalid_scratch_blocks:
+                raise RuntimeError(
+                    "DSA scratch prefixes may contain only allocated positive "
+                    f"block IDs: req_id={req_id!r}, "
+                    f"scratch_prefix={scratch_block_prefix}, "
+                    f"invalid={invalid_scratch_blocks}. vLLM reserves "
+                    "block_id=0 as the null block."
+                )
+            manager.bind(
+                req_id,
+                scratch_block_prefix,
+                # Resumption starts a new request incarnation even if a
+                # scheduler happens to return the same physical blocks.
+                force_new_generation=req_id in resumed_req_ids,
+            )
 
     @torch.inference_mode()
     def execute_model(
@@ -2458,6 +2659,135 @@ class NPUModelRunner(GPUModelRunner):
             cudagraph_stats,
         )
 
+    def _prepare_dsa_scratch_state_metadata(
+        self,
+        *,
+        num_reqs: int,
+        request_capacity: int,
+        dummy_metadata: bool,
+        require_full_scratch_rows: Any = None,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        manager = getattr(
+            self, "_dsa_scratch_state_slot_manager", None
+        )
+        indices = getattr(self, "dsa_scratch_state_indices", None)
+        generations = getattr(
+            self, "dsa_scratch_request_generations", None
+        )
+        if manager is None:
+            return None, None
+        assert indices is not None and generations is not None
+        metadata_capacity = indices.cpu.numel()
+        if not (
+            0 <= num_reqs <= manager.capacity
+            and num_reqs <= request_capacity <= metadata_capacity
+        ):
+            raise RuntimeError(
+                "Invalid DSA scratch metadata request capacity: "
+                f"num_reqs={num_reqs}, request_capacity={request_capacity}, "
+                f"state_capacity={manager.capacity}, "
+                f"metadata_capacity={metadata_capacity}."
+            )
+
+        # Every graph-padding row gets an in-range state row and a
+        # non-positive generation, which can never match a real request.
+        indices.np[:request_capacity] = (
+            np.arange(request_capacity, dtype=np.int32)
+            % manager.capacity
+        )
+        generations.np[:request_capacity] = -(
+            np.arange(request_capacity, dtype=np.int64) + 1
+        )
+
+        if not dummy_metadata:
+            req_ids = self.input_batch.req_ids[:num_reqs]
+            if len(req_ids) != num_reqs:
+                raise RuntimeError(
+                    "DSA scratch metadata cannot match the current request "
+                    f"order: expected={num_reqs}, actual={len(req_ids)}."
+                )
+            required_rows = (
+                np.zeros(num_reqs, dtype=np.bool_)
+                if require_full_scratch_rows is None
+                else np.asarray(
+                    require_full_scratch_rows,
+                    dtype=np.bool_,
+                ).reshape(-1)
+            )
+            if required_rows.shape != (num_reqs,):
+                raise RuntimeError(
+                    "DSA scratch-prefix readiness metadata does not match "
+                    f"the request batch: rows={required_rows.shape}, "
+                    f"num_reqs={num_reqs}."
+                )
+            required_blocks = int(
+                self._dsa_scratch_blocks_per_request
+            )
+            for row, req_id in enumerate(req_ids):
+                binding = manager.get(req_id)
+                if binding is None:
+                    raise RuntimeError(
+                        "DSA scratch request has no stable state binding: "
+                        f"req_id={req_id!r}, batch_row={row}."
+                    )
+                invalid_scratch_blocks = [
+                    block_id
+                    for block_id in binding.scratch_block_prefix
+                    if block_id <= 0
+                ]
+                if invalid_scratch_blocks:
+                    raise RuntimeError(
+                        "DSA scratch prefixes may contain only allocated "
+                        "positive block IDs before metadata is published: "
+                        f"req_id={req_id!r}, batch_row={row}, "
+                        f"scratch_prefix={binding.scratch_block_prefix}, "
+                        f"invalid={invalid_scratch_blocks}."
+                    )
+                if (
+                    required_rows[row]
+                    and len(binding.scratch_block_prefix)
+                    < required_blocks
+                ):
+                    raise RuntimeError(
+                        "DSA scratch prefix is incomplete before the request "
+                        "can enter its first positive-boundary sparse decode: "
+                        f"req_id={req_id!r}, batch_row={row}, "
+                        f"allocated_blocks={len(binding.scratch_block_prefix)}, "
+                        f"required_blocks={required_blocks}."
+                    )
+                indices.np[row] = binding.state_index
+                generations.np[row] = binding.generation
+            actual_state_indices = indices.np[:num_reqs]
+            actual_generations = generations.np[:num_reqs]
+            if np.any(actual_generations <= 0):
+                raise RuntimeError(
+                    "Real DSA requests must have positive scratch-state "
+                    f"generations, got {actual_generations.tolist()}."
+                )
+            if np.any(
+                (actual_state_indices < 0)
+                | (actual_state_indices >= manager.capacity)
+            ):
+                raise RuntimeError(
+                    "Real DSA scratch-state rows must be in range "
+                    f"[0, {manager.capacity}): "
+                    f"rows={actual_state_indices.tolist()}, "
+                    f"capacity={manager.capacity}."
+                )
+            if np.unique(actual_state_indices).size != num_reqs:
+                raise RuntimeError(
+                    "Real DSA requests must map to distinct scratch-state "
+                    "rows; otherwise multiple AIVs would update the same "
+                    f"resident cache line: rows={actual_state_indices.tolist()}."
+                )
+
+        indices.copy_to_gpu(request_capacity)
+        generations.copy_to_gpu(request_capacity)
+        return (
+            indices.gpu[:request_capacity],
+            generations.gpu[:request_capacity],
+        )
+
     def _build_attention_metadata(
         self,
         num_tokens: int,
@@ -2473,6 +2803,7 @@ class NPUModelRunner(GPUModelRunner):
         num_scheduled_tokens: dict[str, int] | None = None,
         num_scheduled_tokens_np: np.ndarray | None = None,
         cascade_attn_prefix_lens: list[list[int]] | None = None,
+        dummy_run: bool = False,
     ) -> tuple[PerLayerAttnMetadata, CommonAttentionMetadata | None]:
         """
         :return: tuple[attn_metadata, spec_decode_common_attn_metadata]
@@ -2604,6 +2935,41 @@ class NPUModelRunner(GPUModelRunner):
                 num_reqs
             )
 
+        dsa_dummy_metadata = (
+            dummy_run
+            or for_cudagraph_capture
+            or staged_sfa_graph_dummy_run
+        )
+        require_full_scratch_rows = None
+        if (
+            not dsa_dummy_metadata
+            and self.dsa_shrink_latent
+            and self._dsa_scratch_state_slot_manager is not None
+        ):
+            scratch_tokens = (
+                self._dsa_scratch_blocks_per_request * self.block_size
+            )
+            # A short request can enter decode with boundary=0 and continue
+            # using its ordinary NPU KV prefix; it does not need the complete
+            # scratch reservation yet. A positive boundary is separately
+            # constrained to be >= scratch capacity by the SFA builder, so
+            # every request that can address scratch is covered here.
+            require_full_scratch_rows = _dsa_require_full_scratch_rows(
+                self.seq_lens.np[:num_reqs],
+                num_reqs=num_reqs,
+                scratch_tokens=scratch_tokens,
+            )
+
+        (
+            dsa_scratch_state_indices,
+            dsa_scratch_request_generations,
+        ) = self._prepare_dsa_scratch_state_metadata(
+            num_reqs=num_reqs,
+            request_capacity=num_reqs_padded,
+            dummy_metadata=dsa_dummy_metadata,
+            require_full_scratch_rows=require_full_scratch_rows,
+        )
+
         cm_base = AscendCommonAttentionMetadata(
             query_start_loc=self.query_start_loc.gpu[: num_reqs_padded + 1],
             query_start_loc_cpu=self.query_start_loc.cpu[: num_reqs_padded + 1],
@@ -2639,6 +3005,10 @@ class NPUModelRunner(GPUModelRunner):
                     if self.dsa_shrink_latent
                     else None
                 )
+            ),
+            dsa_scratch_state_indices=dsa_scratch_state_indices,
+            dsa_scratch_request_generations=(
+                dsa_scratch_request_generations
             ),
         )
 
@@ -3471,6 +3841,7 @@ class NPUModelRunner(GPUModelRunner):
                 ),
                 ubatch_slices=ubatch_slices_padded if pad_attn else ubatch_slices,
                 for_cudagraph_capture=is_graph_capturing,
+                dummy_run=True,
                 num_scheduled_tokens_np=num_scheduled_tokens,
                 staged_sfa_graph_dummy_run=staged_sfa_graph_dummy_run,
             )

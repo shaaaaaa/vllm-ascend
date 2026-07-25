@@ -22,7 +22,11 @@ from vllm_ascend.utils import (
     StagedSFARouteReason,
 )
 from vllm_ascend.worker.block_table import MultiGroupBlockTable
-from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
+from vllm_ascend.worker.model_runner_v1 import (
+    NPUModelRunner,
+    _dsa_require_full_scratch_rows,
+    _DSAScratchStateSlotManager,
+)
 
 
 class TestNPUModelRunnerKVCache(unittest.TestCase):
@@ -101,6 +105,368 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
 
         self.assertEqual(k_cache.shape, (2, 16, 8, 64))
         self.assertEqual(v_cache.shape, (2, 16, 8, 64))
+
+
+class TestDSAScratchStateSlots(unittest.TestCase):
+    @staticmethod
+    def _runner(capacity=4):
+        runner = NPUModelRunner.__new__(NPUModelRunner)
+        runner.device = torch.device("cpu")
+        runner.pin_memory = False
+        runner._dsa_scratch_state_slot_manager = (
+            _DSAScratchStateSlotManager(capacity)
+        )
+        runner.dsa_scratch_state_indices = runner._make_buffer(
+            capacity + 1, dtype=torch.int32
+        )
+        runner.dsa_scratch_request_generations = runner._make_buffer(
+            capacity + 1, dtype=torch.int64
+        )
+        runner._dsa_scratch_blocks_per_request = 2
+        runner.input_batch = SimpleNamespace(
+            req_ids=[],
+            num_reqs=0,
+        )
+        runner.requests = {}
+        return runner
+
+    @staticmethod
+    def _scheduler_output(
+        *,
+        finished=(),
+        preempted=(),
+        resumed=(),
+    ):
+        return SimpleNamespace(
+            finished_req_ids=set(finished),
+            preempted_req_ids=set(preempted),
+            scheduled_cached_reqs=SimpleNamespace(
+                resumed_req_ids=list(resumed)
+            ),
+        )
+
+    @staticmethod
+    def _request(blocks):
+        return SimpleNamespace(block_ids=(list(blocks),))
+
+    def test_metadata_follows_reordered_batch_rows(self):
+        runner = self._runner()
+        manager = runner._dsa_scratch_state_slot_manager
+        a = manager.bind("a", (10, 11))
+        b = manager.bind("b", (20, 21))
+        runner.input_batch.req_ids = ["b", "a"]
+        runner.input_batch.num_reqs = 2
+
+        indices, generations = (
+            runner._prepare_dsa_scratch_state_metadata(
+                num_reqs=2,
+                request_capacity=4,
+                dummy_metadata=False,
+            )
+        )
+
+        self.assertEqual(
+            indices.tolist(),
+            [b.state_index, a.state_index, 2, 3],
+        )
+        self.assertEqual(
+            generations.tolist(),
+            [b.generation, a.generation, -3, -4],
+        )
+
+    def test_metadata_rejects_duplicate_real_state_rows(self):
+        runner = self._runner()
+        manager = runner._dsa_scratch_state_slot_manager
+        binding = manager.bind("a", (10, 11))
+        # Corrupt the manager deliberately: this is the condition that would
+        # make two request AIVs write one resident-state cache line.
+        manager._bindings["b"] = binding
+        runner.input_batch.req_ids = ["a", "b"]
+        runner.input_batch.num_reqs = 2
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "must map to distinct scratch-state rows",
+        ):
+            runner._prepare_dsa_scratch_state_metadata(
+                num_reqs=2,
+                request_capacity=2,
+                dummy_metadata=False,
+            )
+
+    def test_metadata_rejects_out_of_range_real_state_row(self):
+        runner = self._runner(capacity=2)
+        manager = runner._dsa_scratch_state_slot_manager
+        binding = manager.bind("a", (10, 11))
+        # Corrupt the manager deliberately. The device kernel indexes resident
+        # state directly with this row, so uniqueness alone is insufficient.
+        manager._bindings["a"] = type(binding)(
+            state_index=manager.capacity,
+            generation=binding.generation,
+            scratch_block_prefix=binding.scratch_block_prefix,
+        )
+        runner.input_batch.req_ids = ["a"]
+        runner.input_batch.num_reqs = 1
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            r"must be in range \[0, 2\).*rows=\[2\].*capacity=2",
+        ):
+            runner._prepare_dsa_scratch_state_metadata(
+                num_reqs=1,
+                request_capacity=1,
+                dummy_metadata=False,
+            )
+
+    def test_unscheduled_request_keeps_binding(self):
+        runner = self._runner()
+        manager = runner._dsa_scratch_state_slot_manager
+        binding = manager.bind("unscheduled", (10, 11))
+        runner.input_batch.req_ids = []
+        runner.input_batch.num_reqs = 0
+
+        with patch.object(
+            model_runner_module.GPUModelRunner,
+            "_update_states",
+            return_value=None,
+        ):
+            runner._update_states(self._scheduler_output())
+
+        self.assertEqual(manager.get("unscheduled"), binding)
+
+    def test_preempt_resume_gets_new_generation(self):
+        runner = self._runner()
+        manager = runner._dsa_scratch_state_slot_manager
+        old = manager.bind("a", (10, 11))
+        runner.input_batch.req_ids = ["a"]
+        runner.input_batch.num_reqs = 1
+        runner.requests["a"] = self._request((10, 11))
+
+        with patch.object(
+            model_runner_module.GPUModelRunner,
+            "_update_states",
+            return_value=None,
+        ):
+            runner._update_states(
+                self._scheduler_output(
+                    preempted=("a",),
+                    resumed=("a",),
+                )
+            )
+
+        resumed = manager.get("a")
+        self.assertIsNotNone(resumed)
+        self.assertNotEqual(resumed.generation, old.generation)
+
+    def test_scratch_prefix_change_invalidates_same_state_row(self):
+        runner = self._runner()
+        manager = runner._dsa_scratch_state_slot_manager
+        runner.input_batch.req_ids = ["a"]
+        runner.input_batch.num_reqs = 1
+        runner.requests["a"] = self._request((10, 11, 99))
+
+        with patch.object(
+            model_runner_module.GPUModelRunner,
+            "_update_states",
+            return_value=None,
+        ):
+            runner._update_states(self._scheduler_output())
+            old = manager.get("a")
+            runner.requests["a"].block_ids[0][1] = 12
+            runner._update_states(self._scheduler_output())
+            changed = manager.get("a")
+
+        self.assertIsNotNone(old)
+        self.assertIsNotNone(changed)
+        self.assertEqual(changed.state_index, old.state_index)
+        self.assertNotEqual(changed.generation, old.generation)
+        self.assertEqual(changed.scratch_block_prefix, (10, 12))
+
+    def test_empty_and_partial_prefix_expand_without_error(self):
+        runner = self._runner()
+        manager = runner._dsa_scratch_state_slot_manager
+        runner.input_batch.req_ids = ["short"]
+        runner.input_batch.num_reqs = 1
+        runner.requests["short"] = self._request(())
+
+        with patch.object(
+            model_runner_module.GPUModelRunner,
+            "_update_states",
+            return_value=None,
+        ):
+            runner._update_states(self._scheduler_output())
+            empty = manager.get("short")
+            runner.requests["short"].block_ids[0].append(10)
+            runner._update_states(self._scheduler_output())
+            partial = manager.get("short")
+            runner.requests["short"].block_ids[0].append(11)
+            runner._update_states(self._scheduler_output())
+            complete = manager.get("short")
+
+        self.assertIsNotNone(empty)
+        self.assertIsNotNone(partial)
+        self.assertIsNotNone(complete)
+        self.assertEqual(empty.scratch_block_prefix, ())
+        self.assertEqual(partial.scratch_block_prefix, (10,))
+        self.assertEqual(complete.scratch_block_prefix, (10, 11))
+        self.assertEqual(
+            empty.state_index,
+            partial.state_index,
+        )
+        self.assertEqual(
+            partial.state_index,
+            complete.state_index,
+        )
+        self.assertNotEqual(empty.generation, partial.generation)
+        self.assertNotEqual(partial.generation, complete.generation)
+
+    def test_update_rejects_null_block_in_existing_scratch_prefix(self):
+        runner = self._runner()
+        runner.input_batch.req_ids = ["bad"]
+        runner.input_batch.num_reqs = 1
+        runner.requests["bad"] = self._request((10, 0, 99))
+
+        with (
+            patch.object(
+                model_runner_module.GPUModelRunner,
+                "_update_states",
+                return_value=None,
+            ),
+            self.assertRaisesRegex(
+                RuntimeError,
+                r"positive block IDs.*block_id=0",
+            ),
+        ):
+            runner._update_states(self._scheduler_output())
+
+    def test_positive_boundary_readiness_requires_full_scratch_prefix(self):
+        runner = self._runner()
+        runner._dsa_scratch_state_slot_manager.bind("short", (10,))
+        runner.input_batch.req_ids = ["short"]
+        runner.input_batch.num_reqs = 1
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            r"incomplete.*positive-boundary sparse decode.*"
+            r"allocated_blocks=1, required_blocks=2",
+        ):
+            runner._prepare_dsa_scratch_state_metadata(
+                num_reqs=1,
+                request_capacity=1,
+                dummy_metadata=False,
+                require_full_scratch_rows=np.asarray([True]),
+            )
+
+    def test_zero_boundary_readiness_allows_partial_scratch_prefix(self):
+        runner = self._runner()
+        binding = runner._dsa_scratch_state_slot_manager.bind(
+            "short",
+            (10,),
+        )
+        runner.input_batch.req_ids = ["short"]
+        runner.input_batch.num_reqs = 1
+
+        state_indices, generations = (
+            runner._prepare_dsa_scratch_state_metadata(
+                num_reqs=1,
+                request_capacity=1,
+                dummy_metadata=False,
+                require_full_scratch_rows=np.asarray([False]),
+            )
+        )
+
+        self.assertEqual(state_indices.tolist(), [binding.state_index])
+        self.assertEqual(generations.tolist(), [binding.generation])
+
+    def test_scratch_readiness_uses_total_sequence_length_threshold(self):
+        capacity = 4096
+        required = _dsa_require_full_scratch_rows(
+            np.asarray([capacity - 1, capacity, capacity + 1]),
+            num_reqs=3,
+            scratch_tokens=capacity,
+        )
+
+        self.assertEqual(required.tolist(), [False, True, True])
+
+    def test_scratch_readiness_includes_scheduled_mtp_lookahead(self):
+        capacity = 4096
+        computed = np.asarray([capacity - 2], dtype=np.int64)
+        scheduled_mtp_rows = np.asarray([2], dtype=np.int64)
+
+        required = _dsa_require_full_scratch_rows(
+            computed + scheduled_mtp_rows,
+            num_reqs=1,
+            scratch_tokens=capacity,
+        )
+
+        self.assertEqual(required.tolist(), [True])
+
+    def test_short_full_hit_recompute_does_not_require_full_scratch(self):
+        required = _dsa_require_full_scratch_rows(
+            np.asarray([2047], dtype=np.int64),
+            num_reqs=1,
+            scratch_tokens=4096,
+        )
+
+        self.assertEqual(required.tolist(), [False])
+
+    def test_finished_same_id_is_new_incarnation(self):
+        runner = self._runner()
+        manager = runner._dsa_scratch_state_slot_manager
+        old = manager.bind("same", (10, 11))
+        runner.input_batch.req_ids = ["same"]
+        runner.input_batch.num_reqs = 1
+        runner.requests["same"] = self._request((10, 11))
+
+        with patch.object(
+            model_runner_module.GPUModelRunner,
+            "_update_states",
+            return_value=None,
+        ):
+            runner._update_states(
+                self._scheduler_output(finished=("same",))
+            )
+
+        reincarnated = manager.get("same")
+        self.assertIsNotNone(reincarnated)
+        self.assertNotEqual(reincarnated.generation, old.generation)
+
+    def test_released_state_row_is_reused_with_new_generation(self):
+        manager = _DSAScratchStateSlotManager(1)
+        old = manager.bind("a", (10, 11))
+        manager.release("a")
+        new = manager.bind("b", (20, 21))
+
+        self.assertEqual(new.state_index, old.state_index)
+        self.assertNotEqual(new.generation, old.generation)
+
+    def test_dummy_rows_have_valid_indices_and_reserved_generations(self):
+        runner = self._runner(capacity=3)
+
+        indices, generations = (
+            runner._prepare_dsa_scratch_state_metadata(
+                num_reqs=2,
+                request_capacity=3,
+                dummy_metadata=True,
+            )
+        )
+
+        self.assertEqual(indices.tolist(), [0, 1, 2])
+        self.assertEqual(generations.tolist(), [-1, -2, -3])
+
+    def test_fia_padding_row_uses_in_range_state_index(self):
+        runner = self._runner(capacity=3)
+
+        indices, generations = (
+            runner._prepare_dsa_scratch_state_metadata(
+                num_reqs=3,
+                request_capacity=4,
+                dummy_metadata=True,
+            )
+        )
+
+        self.assertEqual(indices.tolist(), [0, 1, 2, 0])
+        self.assertEqual(generations.tolist(), [-1, -2, -3, -4])
 
 
 class TestStagedSFAGraphKey(unittest.TestCase):
@@ -1238,7 +1604,7 @@ class TestStagedSFAStartupCaptureValidation(unittest.TestCase):
         calls = []
         draft_seal = MagicMock(return_value=2)
         runner.drafter = SimpleNamespace(
-            use_staged_mtp_draft_graph=True,
+            use_staged_mtp_draft_graph=False,
             seal_staged_mtp_draft_graphs=draft_seal,
         )
         impl = SimpleNamespace(
@@ -1293,7 +1659,7 @@ class TestStagedSFAStartupCaptureValidation(unittest.TestCase):
         )
         impl.seal_staged_sfa_capture.assert_called_once_with(graph_keys)
         seal_entries.assert_called_once_with(graph_keys, 2)
-        draft_seal.assert_called_once_with((1, 2))
+        draft_seal.assert_not_called()
 
     def test_collect_staged_sfa_impls_excludes_mtp_draft_layer(self):
         runner = self._build_runner()

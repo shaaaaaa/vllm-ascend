@@ -57,6 +57,32 @@ namespace vllm_ascend {
     uint32_t block_size,
     bool need_packed,
     bool clear_invalid_rows);
+
+  extern void dsa_prepare_sparse_indices_reuse_impl(
+    void* stream,
+    void* topk_indices,
+    void* split_boundary,
+    void* row_req_indices,
+    void* request_block_table,
+    void* selected_packed,
+    void* selected_counts,
+    void* target_slots,
+    void* request_state_indices,
+    void* request_generations,
+    void* resident_token_ids,
+    void* resident_generations,
+    uint32_t row_count,
+    uint32_t row_width,
+    uint32_t request_count,
+    uint32_t block_table_width,
+    uint32_t scratch_capacity,
+    uint32_t selected_count_stride,
+    uint32_t bitmap_words,
+    uint32_t block_size,
+    uint32_t state_row_count,
+    uint32_t resident_token_stride,
+    uint32_t resident_generation_stride,
+    bool clear_invalid_rows);
     
   torch::Tensor weak_ref_tensor(torch::Tensor& tensor) {
     if (!tensor.is_privateuseone()) {

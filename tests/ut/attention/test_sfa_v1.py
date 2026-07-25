@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import numpy as np
+import pytest
 import torch
 from vllm.config import CUDAGraphMode
 from vllm.distributed.parallel_state import GroupCoordinator
@@ -42,6 +43,43 @@ def test_sfa_metadata_declares_cached_decode_split_boundary() -> None:
     assert field.default is None
 
 
+def test_dsa_topk_resolver_accepts_one_consistent_value() -> None:
+    model_config = SimpleNamespace(
+        hf_config=SimpleNamespace(index_topk=2048),
+        hf_text_config=SimpleNamespace(
+            index_topk=2048,
+            topk_tokens=2048,
+        ),
+    )
+
+    assert (
+        attention_utils.resolve_dsa_index_topk(
+            model_config,
+            runtime_topk=2048,
+        )
+        == 2048
+    )
+
+
+def test_dsa_topk_resolver_rejects_disagreeing_sources() -> None:
+    model_config = SimpleNamespace(
+        hf_config=SimpleNamespace(index_topk=2048),
+        hf_text_config=SimpleNamespace(
+            index_topk=2048,
+            topk_tokens=4096,
+        ),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=r"one identical top-k value.*index_topk=2048.*topk_tokens=4096",
+    ):
+        attention_utils.resolve_dsa_index_topk(
+            model_config,
+            runtime_topk=2048,
+        )
+
+
 def test_sparse_boundary_updates_preallocated_storage_in_place():
     boundary_cpu = torch.tensor([9, 9, 19, 0], dtype=torch.int32)
     boundary = torch.empty(4, dtype=torch.int32)
@@ -54,6 +92,9 @@ def test_sparse_boundary_updates_preallocated_storage_in_place():
         seq_lens_cpu=torch.tensor([513, 770], dtype=torch.int32),
         num_decode_tokens=3,
         decode_split_boundary=None,
+        decode_scratch_base_cpu=None,
+        decode_scratch_capacity=256,
+        block_table=torch.zeros((2, 4), dtype=torch.int32),
     )
     address = metadata.split_boundary.data_ptr()
 
@@ -78,6 +119,8 @@ def test_sparse_boundary_updates_preallocated_storage_in_place():
             metadata,
             cached_tokens=[512, 768],
             decode_window_size=256,
+            index_topk=128,
+            block_size=256,
         )
 
     assert actual.data_ptr() == address
@@ -96,12 +139,17 @@ def test_sparse_boundary_short_frontier_preserves_zero_pad_semantics():
         seq_lens_cpu=torch.tensor([10, 20], dtype=torch.int32),
         num_decode_tokens=2,
         decode_split_boundary=None,
+        decode_scratch_base_cpu=None,
+        decode_scratch_capacity=4,
+        block_table=torch.zeros((2, 1), dtype=torch.int32),
     )
 
     actual = _update_dsa_split_boundary_in_place(
         metadata,
         cached_tokens=[8],
         decode_window_size=0,
+        index_topk=4,
+        block_size=32,
     )
 
     assert actual.tolist() == [8, 0]
@@ -431,6 +479,17 @@ class TestLMCacheSparseFrontier(TestBase):
             4,
             scratch_capacity=8,
         )
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "must use the same sparse boundary",
+        ):
+            sfa_v1._validate_dsa_scratch_capacity(
+                [0, 8],
+                [0, 0],
+                None,
+                4,
+                scratch_capacity=8,
+            )
         with self.assertRaisesRegex(RuntimeError, "alias live KV"):
             sfa_v1._validate_dsa_scratch_capacity(
                 [4, 4],
@@ -438,6 +497,36 @@ class TestLMCacheSparseFrontier(TestBase):
                 None,
                 4,
                 scratch_capacity=8,
+            )
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "outside the request sequence",
+        ):
+            sfa_v1._validate_dsa_scratch_capacity(
+                [17],
+                [0],
+                None,
+                4,
+                scratch_capacity=8,
+                seq_lens=[16],
+                block_table_width=2,
+                block_size=8,
+            )
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "exceeds its block-table capacity",
+        ):
+            sfa_v1._validate_dsa_scratch_capacity(
+                [0],
+                [0],
+                None,
+                4,
+                scratch_capacity=8,
+                seq_lens=[17],
+                block_table_width=2,
+                block_size=8,
             )
 
         with self.assertRaisesRegex(
@@ -492,11 +581,22 @@ class TestStagedSFAGraphPoc(TestBase):
         impl.q_a_layernorm = MagicMock()
         impl.vllm_config = MagicMock()
         impl.vllm_config.cache_config.block_size = 128
+        impl.block_size = 128
         impl.vllm_config.speculative_config = None
         impl.vllm_config.lora_config = None
         impl._staged_sfa_capture_state = sfa_v1._StagedSFACaptureState()
         impl._staged_sfa_graph_capture_sizes = (1, 4)
         impl._staged_sfa_bridge_buffers = None
+        impl._dsa_scratch_resident_tokens = torch.full(
+            (4, 4),
+            -1,
+            dtype=torch.int32,
+        )
+        impl._dsa_scratch_resident_generations = torch.full(
+            (4, 8),
+            -1,
+            dtype=torch.int64,
+        )
         return impl
 
     @staticmethod
@@ -538,10 +638,14 @@ class TestStagedSFAGraphPoc(TestBase):
         metadata.cum_query_lens = torch.arange(1, batch_size + 1)
         metadata.seq_lens = torch.full((batch_size,), 9)
         metadata.seq_lens_cpu = torch.full((batch_size,), 9)
-        metadata.block_table = torch.arange(batch_size).view(batch_size, 1)
-        metadata.indexer_block_table = torch.arange(batch_size).view(
+        metadata.block_table = torch.arange(
+            batch_size * 32
+        ).view(batch_size, 32)
+        metadata.indexer_block_table = torch.arange(
+            batch_size * 32
+        ).view(
             batch_size,
-            1,
+            32,
         )
         metadata.prompt_lens = torch.full(
             (batch_size,),
@@ -570,7 +674,7 @@ class TestStagedSFAGraphPoc(TestBase):
         )
         metadata.decode_scratch_base_compact = None
         metadata.decode_scratch_base_cpu = [0] * batch_size
-        metadata.decode_scratch_capacity = 128
+        metadata.decode_scratch_capacity = 4
         metadata.decode_selected_tokens = torch.empty(
             batch_size, 4, dtype=torch.int32
         )
@@ -579,6 +683,15 @@ class TestStagedSFAGraphPoc(TestBase):
         )
         metadata.decode_target_slot_mapping = torch.empty(
             batch_size, 4, dtype=torch.long
+        )
+        metadata.decode_scratch_state_indices = torch.arange(
+            batch_size,
+            dtype=torch.int32,
+        )
+        metadata.decode_scratch_request_generations = torch.arange(
+            1,
+            batch_size + 1,
+            dtype=torch.int64,
         )
         metadata.decode_request_ids_compact = [f"req-{row}" for row in range(batch_size)]
         metadata.req_ids = list(metadata.decode_request_ids_compact)
@@ -694,6 +807,7 @@ class TestStagedSFAGraphPoc(TestBase):
             eager_metadata.req_ids,
             is_dummy_run=True,
             index_topk=impl.index_topk,
+            block_size=impl.block_size,
             cached_tokens=(4096,),
         )
         self.assertIs(
@@ -701,14 +815,170 @@ class TestStagedSFAGraphPoc(TestBase):
             eager_metadata.decode_remap_boundary,
         )
         self.assertIs(
-            impl._cross_layer_pre_compute.call_args_list[1].args[-6],
+            impl._cross_layer_pre_compute.call_args_list[1].args[11],
             eager_metadata.decode_remap_boundary,
         )
         self.assertEqual(
             impl._staged_sfa_capture_state.bindings.keys(),
             {STAGED_SFA_SINGLETON_GRAPH_KEY},
         )
+        binding = impl._staged_sfa_capture_state.bindings[
+            STAGED_SFA_SINGLETON_GRAPH_KEY
+        ]
+        self.assertEqual(
+            binding.request_state_indices.address,
+            capture_metadata.decode_scratch_state_indices.data_ptr(),
+        )
+        self.assertEqual(
+            binding.request_generations.address,
+            capture_metadata.decode_scratch_request_generations.data_ptr(),
+        )
         self.assertTrue(all(tensor.shape[0] == 4 for result in outputs for tensor in result))
+
+    def test_cross_layer_replay_rejects_scratch_state_pointer_drift(self):
+        impl = self._make_eligible_impl()
+        metadata = self._make_decode_metadata()
+        kv_cache = self._make_eligible_kv_cache()
+        state = impl._staged_sfa_capture_state
+        state.producer_event = MagicMock()
+        state.remap_boundary = metadata.decode_remap_boundary
+        state.runtime = ("layer-0", kv_cache, "index-0", True)
+        state.register(
+            STAGED_SFA_SINGLETON_GRAPH_KEY,
+            self._make_pre_outputs(),
+            kv_cache,
+            metadata.decode_scratch_state_indices,
+            metadata.decode_scratch_request_generations,
+            impl._dsa_scratch_resident_tokens,
+            impl._dsa_scratch_resident_generations,
+        )
+        metadata.decode_scratch_state_indices = (
+            metadata.decode_scratch_state_indices.clone()
+        )
+        context = SimpleNamespace(
+            staged_sfa_graph_key=STAGED_SFA_SINGLETON_GRAPH_KEY,
+            staged_sfa_route=_staged_route(),
+            staged_sfa_graph_dummy_run=False,
+            cudagraph_runtime_mode=CUDAGraphMode.PIECEWISE,
+        )
+
+        with (
+            patch.object(
+                sfa_v1,
+                "get_forward_context",
+                return_value=context,
+            ),
+            patch.object(
+                impl,
+                "_cross_layer_kv_cache",
+                return_value=(kv_cache, "index-0", True),
+            ),
+            patch.object(
+                impl,
+                "_cross_layer_ineligible_reason",
+                return_value=None,
+            ),
+            self.assertRaisesRegex(
+                RuntimeError,
+                "scratch-state input binding changed",
+            ),
+        ):
+            impl.cross_layer_graph_pre(
+                "layer-0",
+                torch.empty(1, 4),
+                kv_cache,
+                metadata,
+                False,
+                torch.empty(1, 4),
+            )
+
+    def test_selected_counts_wait_view_uses_one_value_per_cacheline_row(
+        self,
+    ):
+        padded_counts = torch.arange(
+            48,
+            dtype=torch.int32,
+        ).view(3, 16)
+
+        logical_counts = sfa_v1._dsa_selected_counts_for_wait(
+            padded_counts,
+            2,
+        )
+
+        self.assertEqual(logical_counts.shape, (2,))
+        self.assertEqual(logical_counts.tolist(), [0, 16])
+        self.assertEqual(padded_counts.shape, (3, 16))
+        logical_input = torch.tensor([5, 7, 9], dtype=torch.int32)
+        logical_view = sfa_v1._dsa_selected_counts_for_wait(logical_input, 2)
+        self.assertEqual(logical_view.shape, (2,))
+        self.assertEqual(logical_view.tolist(), [5, 7])
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "selected-count storage",
+        ):
+            sfa_v1._dsa_selected_counts_for_wait(
+                torch.ones(3, 0, dtype=torch.int32),
+                2,
+            )
+
+    def test_cross_layer_replay_rejects_scratch_state_layout_drift(self):
+        impl = self._make_eligible_impl()
+        metadata = self._make_decode_metadata()
+        state_indices_storage = torch.empty(2, dtype=torch.int32)
+        metadata.decode_scratch_state_indices = state_indices_storage[:1]
+        kv_cache = self._make_eligible_kv_cache()
+        state = impl._staged_sfa_capture_state
+        state.producer_event = MagicMock()
+        state.remap_boundary = metadata.decode_remap_boundary
+        state.runtime = ("layer-0", kv_cache, "index-0", True)
+        state.register(
+            STAGED_SFA_SINGLETON_GRAPH_KEY,
+            self._make_pre_outputs(),
+            kv_cache,
+            metadata.decode_scratch_state_indices,
+            metadata.decode_scratch_request_generations,
+            impl._dsa_scratch_resident_tokens,
+            impl._dsa_scratch_resident_generations,
+        )
+        metadata.decode_scratch_state_indices = (
+            state_indices_storage.as_strided((1,), (2,))
+        )
+        context = SimpleNamespace(
+            staged_sfa_graph_key=STAGED_SFA_SINGLETON_GRAPH_KEY,
+            staged_sfa_route=_staged_route(),
+            staged_sfa_graph_dummy_run=False,
+            cudagraph_runtime_mode=CUDAGraphMode.PIECEWISE,
+        )
+
+        with (
+            patch.object(
+                sfa_v1,
+                "get_forward_context",
+                return_value=context,
+            ),
+            patch.object(
+                impl,
+                "_cross_layer_kv_cache",
+                return_value=(kv_cache, "index-0", True),
+            ),
+            patch.object(
+                impl,
+                "_cross_layer_ineligible_reason",
+                return_value=None,
+            ),
+            self.assertRaisesRegex(
+                RuntimeError,
+                "scratch-state input binding changed",
+            ),
+        ):
+            impl.cross_layer_graph_pre(
+                "layer-0",
+                torch.empty(1, 4),
+                kv_cache,
+                metadata,
+                False,
+                torch.empty(1, 4),
+            )
 
     def test_cross_layer_padding_uses_fixed_graph_rows(self):
         impl = self._make_eligible_impl()
@@ -758,7 +1028,7 @@ class TestStagedSFAGraphPoc(TestBase):
             )
 
         args = impl._cross_layer_pre_compute.call_args.args
-        self.assertEqual(args[-5].tolist(), [0, 1, 2, 3])
+        self.assertEqual(args[13].tolist(), [0, 1, 2, 3])
 
     def test_bridge_storage_is_preallocated_and_reused_for_q1(self):
         impl = self._make_eligible_impl()
@@ -832,6 +1102,10 @@ class TestStagedSFAGraphPoc(TestBase):
             key,
             tuple(torch.empty(1) for _ in range(6)),
             self._make_eligible_kv_cache(),
+            torch.empty(1, dtype=torch.int32),
+            torch.empty(1, dtype=torch.int64),
+            torch.empty((1, 4), dtype=torch.int32),
+            torch.empty((1, 8), dtype=torch.int64),
         )
         state.seal((key,))
 
@@ -845,10 +1119,18 @@ class TestStagedSFAGraphPoc(TestBase):
             runtime=("layer-0",),
         )
         bridge = tuple(torch.empty(4) for _ in range(6))
+        state_indices = torch.empty(1, dtype=torch.int32)
+        request_generations = torch.empty(1, dtype=torch.int64)
+        resident_tokens = torch.empty((1, 4), dtype=torch.int32)
+        resident_generations = torch.empty((1, 8), dtype=torch.int64)
         state.register(
             STAGED_SFA_SINGLETON_GRAPH_KEY,
             bridge,
             self._make_eligible_kv_cache(),
+            state_indices,
+            request_generations,
+            resident_tokens,
+            resident_generations,
         )
 
         with self.assertRaisesRegex(
@@ -859,7 +1141,51 @@ class TestStagedSFAGraphPoc(TestBase):
                 StagedSFAGraphKey.exact_q1(2),
                 bridge,
                 self._make_eligible_kv_cache(),
+                state_indices,
+                request_generations,
+                resident_tokens,
+                resident_generations,
             )
+
+    def test_capture_state_allows_fixed_state_buffer_views_across_keys(self):
+        state = sfa_v1._StagedSFACaptureState(
+            producer_event=object(),
+            remap_boundary=torch.empty(4, dtype=torch.int32),
+            runtime=("layer-0",),
+        )
+        bridge = tuple(torch.empty(4) for _ in range(6))
+        kv_cache = self._make_eligible_kv_cache()
+        state_indices = torch.empty(4, dtype=torch.int32)
+        request_generations = torch.empty(4, dtype=torch.int64)
+        resident_tokens = torch.empty((4, 4), dtype=torch.int32)
+        resident_generations = torch.empty((4, 8), dtype=torch.int64)
+
+        state.register(
+            STAGED_SFA_SINGLETON_GRAPH_KEY,
+            bridge,
+            kv_cache,
+            state_indices[:1],
+            request_generations[:1],
+            resident_tokens,
+            resident_generations,
+        )
+        state.register(
+            StagedSFAGraphKey.exact_q1(2),
+            bridge,
+            kv_cache,
+            state_indices[:2],
+            request_generations[:2],
+            resident_tokens,
+            resident_generations,
+        )
+
+        self.assertEqual(
+            set(state.bindings),
+            {
+                STAGED_SFA_SINGLETON_GRAPH_KEY,
+                StagedSFAGraphKey.exact_q1(2),
+            },
+        )
 
     def test_capture_reset_discards_cached_index_tensor(self):
         impl = self._make_eligible_impl()
@@ -954,7 +1280,10 @@ class TestStagedSFAGraphPoc(TestBase):
                 "layer-0",
                 "layer-1.attn",
                 torch.ones(4, 4, dtype=torch.int32),
-                torch.ones(4, dtype=torch.int32),
+                torch.arange(
+                    64,
+                    dtype=torch.int32,
+                ).view(4, 16),
                 torch.zeros(4, 4, dtype=torch.long),
                 metadata,
                 context,
@@ -969,11 +1298,24 @@ class TestStagedSFAGraphPoc(TestBase):
             wait_for_layer.call_args_list[0].kwargs["payload_event"],
             impl._staged_sfa_capture_state.producer_event,
         )
+        self.assertEqual(
+            wait_for_layer.call_args_list[0]
+            .kwargs["selected_token_counts"]
+            .tolist(),
+            [0],
+        )
+        self.assertEqual(
+            wait_for_layer.call_args_list[0]
+            .kwargs["selected_token_counts"]
+            .dim(),
+            1,
+        )
         prepare_boundary.assert_called_once_with(
             next_metadata,
             next_metadata.req_ids,
             is_dummy_run=False,
             index_topk=impl.index_topk,
+            block_size=impl.block_size,
             cached_tokens=(4096,),
         )
 
@@ -994,7 +1336,7 @@ class TestStagedSFAGraphPoc(TestBase):
                 "layer-0",
                 "layer-1.attn",
                 torch.ones(4, 4, dtype=torch.int32),
-                torch.ones(4, dtype=torch.int32),
+                torch.ones(4, 16, dtype=torch.int32),
                 torch.zeros(4, 4, dtype=torch.long),
                 metadata,
                 context,
@@ -1005,6 +1347,7 @@ class TestStagedSFAGraphPoc(TestBase):
             next_metadata.req_ids,
             is_dummy_run=True,
             index_topk=impl.index_topk,
+            block_size=impl.block_size,
         )
         wait_for_layer.assert_not_called()
 
@@ -1083,6 +1426,7 @@ class TestStagedSFAGraphPoc(TestBase):
             metadata.req_ids,
             is_dummy_run=True,
             index_topk=impl.index_topk,
+            block_size=impl.block_size,
             cached_tokens=None,
         )
         wait_for_layer.assert_not_called()
@@ -1106,6 +1450,7 @@ class TestStagedSFAGraphPoc(TestBase):
                 ["req-0"],
                 is_dummy_run=False,
                 index_topk=4,
+                block_size=256,
                 cached_tokens=(900,),
             )
             second = sfa_v1._prepare_sfa_remap_boundary(
@@ -1113,6 +1458,7 @@ class TestStagedSFAGraphPoc(TestBase):
                 ["req-0"],
                 is_dummy_run=False,
                 index_topk=4,
+                block_size=256,
                 cached_tokens=(900,),
             )
 
@@ -1137,6 +1483,7 @@ class TestStagedSFAGraphPoc(TestBase):
                 ["req-0"],
                 is_dummy_run=False,
                 index_topk=4,
+                block_size=256,
                 cached_tokens=(900,),
             )
 
@@ -1150,6 +1497,7 @@ class TestStagedSFAGraphPoc(TestBase):
             ["req-0"],
             is_dummy_run=True,
             index_topk=4,
+            block_size=256,
             cached_tokens=(),
         )
 
@@ -1177,6 +1525,7 @@ class TestStagedSFAGraphPoc(TestBase):
                 ["req-0"],
                 is_dummy_run=False,
                 index_topk=4,
+                block_size=256,
             )
 
         self.assertEqual(boundary.tolist(), [900])
@@ -1205,6 +1554,7 @@ class TestStagedSFAGraphPoc(TestBase):
                 ["decode-req", "prefill-req"],
                 is_dummy_run=False,
                 index_topk=4,
+                block_size=256,
             )
 
         self.assertEqual(boundary.tolist(), [90, 0])
@@ -1233,6 +1583,7 @@ class TestStagedSFAGraphPoc(TestBase):
         metadata.decode_req_indices_cpu = [0, 0, 1, 1]
         metadata.seq_lens_cpu = torch.tensor([110, 210])
         metadata.decode_scratch_base_cpu = [0, 4, 0, 4]
+        metadata.decode_scratch_capacity = 8
         metadata.decode_remap_boundary = torch.empty(4, dtype=torch.int32)
         metadata.decode_remap_boundary_ready = False
 
@@ -1246,6 +1597,7 @@ class TestStagedSFAGraphPoc(TestBase):
                 ["req-0", "req-1"],
                 is_dummy_run=False,
                 index_topk=4,
+                block_size=256,
                 cached_tokens=(90, 180),
             )
 
@@ -1257,6 +1609,7 @@ class TestStagedSFAGraphPoc(TestBase):
         metadata.decode_req_indices_cpu = [0, 0]
         metadata.seq_lens_cpu = torch.tensor([110])
         metadata.decode_scratch_base_cpu = [0, 4]
+        metadata.decode_scratch_capacity = 8
         metadata.decode_remap_boundary = torch.empty(2, dtype=torch.int32)
         metadata.decode_remap_boundary_ready = False
 
@@ -1276,6 +1629,7 @@ class TestStagedSFAGraphPoc(TestBase):
                 ["req-0"],
                 is_dummy_run=False,
                 index_topk=4,
+                block_size=256,
                 cached_tokens=(7,),
             )
 
@@ -1933,6 +2287,15 @@ class TestAscendSFAMetadataBuilder(TestBase):
                 seq_lens_cpu=torch.tensor(computed, dtype=torch.int32),
                 request_ids=request_ids,
                 attn_state=AscendAttentionState.DecodeOnly,
+                dsa_scratch_state_indices=torch.arange(
+                    num_reqs,
+                    dtype=torch.int32,
+                ),
+                dsa_scratch_request_generations=torch.arange(
+                    1,
+                    num_reqs + 1,
+                    dtype=torch.int64,
+                ),
             )
 
         first = builder.build(
