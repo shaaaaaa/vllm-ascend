@@ -22,6 +22,11 @@ from vllm.forward_context import get_forward_context
 from vllm.logger import logger
 from vllm.model_executor.layers.attention.mla_attention import MLACommonMetadataBuilder
 from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+from vllm.model_executor.models.deepseek_v2_diagnostics import (
+    record_tensor as record_deepseek_v2_tensor,
+    record_value as record_deepseek_v2_value,
+    trace_is_active as deepseek_v2_trace_is_active,
+)
 from vllm.triton_utils import HAS_TRITON
 from vllm.v1.attention.backend import (
     AttentionBackend,  # type: ignore
@@ -97,6 +102,9 @@ _LMCACHE_SPARSE_WAIT_SYNC_ONCE = os.getenv("VLLM_ASCEND_LMCACHE_SPARSE_WAIT_SYNC
 )
 _lmcache_sparse_wait_sync_once_done = False
 _lmcache_sparse_wait_sync_once_lock = Lock()
+_GL51_DEEP_DIAG_ENABLED = os.getenv(
+    "VLLM_ASCEND_GL51_DEEP_DIAG", "0"
+).strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _staged_sfa_profile_scope(name: str):
@@ -2518,6 +2526,57 @@ class AscendSFAImpl(MLAAttentionImpl):
                         reach_layer_for_shard_weight_series(layer)
             return output.fill_(0)
 
+        _deep_diag = (
+            _GL51_DEEP_DIAG_ENABLED and deepseek_v2_trace_is_active()
+        )
+        if _deep_diag:
+            _deep_diag_prefix = f"sfa.{layer_name}"
+            record_deepseek_v2_value(
+                f"{_deep_diag_prefix}.attn_state",
+                str(attn_metadata.attn_state),
+            )
+            record_deepseek_v2_value(
+                f"{_deep_diag_prefix}.route",
+                {
+                    "enable_mlapo": bool(self.enable_mlapo),
+                    "enable_dsa_cp": bool(self.enable_dsa_cp),
+                    "dsa_shrink_latent": int(self.dsa_shrink_latent),
+                    "dsa_offload_unbundle": bool(self.dsa_offload_unbundle),
+                    "num_input_tokens": int(attn_metadata.num_input_tokens),
+                    "num_actual_tokens": int(attn_metadata.num_actual_tokens),
+                    "num_decode_tokens": int(attn_metadata.num_decode_tokens),
+                },
+            )
+            record_deepseek_v2_tensor(
+                f"{_deep_diag_prefix}.input.hidden", hidden_states
+            )
+            record_deepseek_v2_tensor(
+                f"{_deep_diag_prefix}.metadata.slot_mapping",
+                attn_metadata.slot_mapping,
+            )
+            record_deepseek_v2_tensor(
+                f"{_deep_diag_prefix}.metadata.indexer_slot_mapping",
+                getattr(attn_metadata, "indexer_slot_mapping", None),
+            )
+            record_deepseek_v2_tensor(
+                f"{_deep_diag_prefix}.metadata.cum_query_lens",
+                attn_metadata.cum_query_lens,
+            )
+            record_deepseek_v2_tensor(
+                f"{_deep_diag_prefix}.metadata.seq_lens",
+                attn_metadata.seq_lens,
+            )
+            record_deepseek_v2_tensor(
+                f"{_deep_diag_prefix}.metadata.block_table",
+                attn_metadata.block_table,
+            )
+            record_deepseek_v2_tensor(
+                f"{_deep_diag_prefix}.metadata.indexer_block_table",
+                getattr(attn_metadata, "indexer_block_table", None),
+            )
+        else:
+            _deep_diag_prefix = ""
+
         _dsa_prof.set_step_kind(attn_metadata.attn_state == AscendAttentionState.DecodeOnly)
         _sfa_t = _dsa_prof.begin("sfa_fwd")
         _is_pure_decode = attn_metadata.attn_state in (
@@ -2580,6 +2639,8 @@ class AscendSFAImpl(MLAAttentionImpl):
             AscendAttentionState.SpecDecoding,
         }
 
+        k_nope = None
+        k_pe = None
         # run mlapo ops when dsa-cp is disabled, and ensure that num_tokens satisfies the count limitation
         if self.enable_mlapo and num_input_tokens <= MLAPO_MAX_SUPPORTED_TOKENS:
             hidden_states, ql_nope, q_pe, q_c = self._sfa_preprocess_with_mlapo(
@@ -2591,6 +2652,10 @@ class AscendSFAImpl(MLAAttentionImpl):
                 num_input_tokens=num_input_tokens,
             )
             k_li, k_li_scale = self.indexer_select_pre_process(x=hidden_states, cos=cos, sin=sin)
+            if _deep_diag:
+                record_deepseek_v2_value(
+                    f"{_deep_diag_prefix}.preprocess_mode", "mlapo"
+                )
         # native
         else:
             assert self.fused_qkv_a_proj is not None, "q lora is required for DSA."
@@ -2599,14 +2664,29 @@ class AscendSFAImpl(MLAAttentionImpl):
                 inputs=self.fused_qkv_a_proj.weight, dependency=hidden_states
             )
             qkv_lora = self.fused_qkv_a_proj(hidden_states)[0]
+            if _deep_diag:
+                record_deepseek_v2_tensor(
+                    f"{_deep_diag_prefix}.qkv_lora", qkv_lora
+                )
             q_c, kv_no_split = qkv_lora.split(
                 [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
                 dim=-1,
             )
             assert self.q_a_layernorm is not None, "q_a_layernorm must be initialized"
             q_c = self.q_a_layernorm(q_c)
+            if _deep_diag:
+                record_deepseek_v2_tensor(
+                    f"{_deep_diag_prefix}.q_c.after_norm", q_c
+                )
+                record_deepseek_v2_tensor(
+                    f"{_deep_diag_prefix}.kv_no_split", kv_no_split
+                )
 
             k_li, k_li_scale = self.indexer_select_pre_process(x=hidden_states, cos=cos, sin=sin)
+            if _deep_diag:
+                record_deepseek_v2_value(
+                    f"{_deep_diag_prefix}.preprocess_mode", "native"
+                )
 
             # Step B2: in compact-scratch mode the connector load is driven by
             # the post-indexer call (with selected_tokens). Calling here too
@@ -2724,6 +2804,26 @@ class AscendSFAImpl(MLAAttentionImpl):
 
             k_li = self._get_full_kv(k_li, attn_metadata)
 
+        if _deep_diag:
+            record_deepseek_v2_tensor(
+                f"{_deep_diag_prefix}.preprocess.hidden", hidden_states
+            )
+            record_deepseek_v2_tensor(f"{_deep_diag_prefix}.q_c", q_c)
+            record_deepseek_v2_tensor(f"{_deep_diag_prefix}.k_li", k_li)
+            record_deepseek_v2_tensor(
+                f"{_deep_diag_prefix}.k_li_scale", k_li_scale
+            )
+            record_deepseek_v2_tensor(
+                f"{_deep_diag_prefix}.k_nope", k_nope
+            )
+            record_deepseek_v2_tensor(
+                f"{_deep_diag_prefix}.k_pe", k_pe
+            )
+            record_deepseek_v2_tensor(
+                f"{_deep_diag_prefix}.ql_nope", ql_nope
+            )
+            record_deepseek_v2_tensor(f"{_deep_diag_prefix}.q_pe", q_pe)
+
         if kv_cache is not None:
             if index_lmcache_enabled:
                 # A cold shared-cache decode needs prompt index rows before
@@ -2758,6 +2858,10 @@ class AscendSFAImpl(MLAAttentionImpl):
                 sin=sin,
                 actual_seq_lengths_query=actual_seq_lengths_query,
                 actual_seq_lengths_key=actual_seq_lengths_key,
+            )
+        if _deep_diag:
+            record_deepseek_v2_tensor(
+                f"{_deep_diag_prefix}.topk_indices.raw", topk_indices
             )
 
         # DSA Step B2 (compact-scratch decode): the indexer just produced topk.
@@ -2842,6 +2946,11 @@ class AscendSFAImpl(MLAAttentionImpl):
                     )
                 if _LMCACHE_SPARSE_WAIT_SYNC_ONCE and not _lmcache_sparse_wait_sync_once_done:
                     _sync_compute_stream_after_lmcache_sparse_wait()
+        if _deep_diag:
+            record_deepseek_v2_tensor(
+                f"{_deep_diag_prefix}.topk_indices.effective",
+                topk_indices,
+            )
 
         # DSA latent KV offload (GLM5.1), single-card native non-CP path only:
         #   * prefill steps  -> store this layer's prompt latent, use native attention;
@@ -3080,7 +3189,16 @@ class AscendSFAImpl(MLAAttentionImpl):
             # logs mean ms/layer-call periodically (mirrors the manager path).
             _dsa_prof.step()
 
+        if _deep_diag:
+            record_deepseek_v2_tensor(
+                f"{_deep_diag_prefix}.attention.output.raw", attn_output
+            )
         attn_output = self._v_up_proj(attn_output)
+        if _deep_diag:
+            record_deepseek_v2_tensor(
+                f"{_deep_diag_prefix}.attention.output.after_v_up",
+                attn_output,
+            )
         weight_prefetch_method = get_weight_prefetch_method()
         weight_prefetch_method.maybe_prefetch_mla_or_sla_weight_in_current_stream(
             inputs=self.o_proj.weight,
@@ -3115,6 +3233,11 @@ class AscendSFAImpl(MLAAttentionImpl):
             torch.distributed.all_to_all_single(attn_output, send, group=get_tp_group().device_group)
 
         output[...] = self.o_proj(attn_output)[0]
+        if _deep_diag:
+            record_deepseek_v2_tensor(
+                f"{_deep_diag_prefix}.attention.output.after_o_proj",
+                output,
+            )
 
         # Offload to LMCache. Legacy un-bundled connectors save only the latent
         # (k_nope, k_pe). Connectors declaring DSA index LMCache support also
