@@ -47,6 +47,12 @@ from vllm.logger import logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.mamba.abstract import MambaBase
 from vllm.model_executor.model_loader import get_model
+from vllm.model_executor.models.deepseek_v2_diagnostics import (
+    abort_trace as abort_deepseek_v2_trace,
+    begin_trace as begin_deepseek_v2_trace,
+    end_trace as end_deepseek_v2_trace,
+    record_tensor as record_deepseek_v2_tensor,
+)
 from vllm.sequence import IntermediateTensors
 from vllm.utils.import_utils import LazyLoader
 from vllm.utils.math_utils import cdiv, round_up
@@ -128,6 +134,12 @@ from vllm_ascend.quantization.utils import enable_fa_quant
 from vllm_ascend.sample.sampler import AscendSampler
 from vllm_ascend.spec_decode import get_spec_decode_method
 from vllm_ascend.spec_decode.draft_proposer import AscendDraftModelProposer
+from vllm_ascend.worker.deepseek_v2_flight_recorder import (
+    flight_recorder_enabled,
+    flight_recorder_output_dir,
+    flight_recorder_run_name,
+    write_flight_record,
+)
 from vllm_ascend.spec_decode.eagle_proposer import AscendEagleProposer
 from vllm_ascend.spec_decode.medusa_proposer import AscendMedusaProposer
 from vllm_ascend.spec_decode.ngram_proposer import AscendNgramProposer
@@ -625,6 +637,36 @@ class NPUModelRunner(GPUModelRunner):
         if vllm_config.kv_transfer_config is not None:
             self.is_kv_producer = vllm_config.kv_transfer_config.is_kv_producer
             self.is_kv_consumer = vllm_config.kv_transfer_config.is_kv_consumer
+        gl51_deep_diag_requested = flight_recorder_enabled()
+        if gl51_deep_diag_requested and not self.is_kv_producer:
+            raise RuntimeError(
+                "VLLM_ASCEND_GL51_DEEP_DIAG must be enabled only in the "
+                "P-side server process"
+            )
+        self._gl51_deep_diag_enabled = gl51_deep_diag_requested
+        self._gl51_deep_diag_completed = 0
+        if self._gl51_deep_diag_enabled:
+            # Resolve required settings at startup instead of failing after an
+            # expensive request has already begun.
+            diag_run_name = flight_recorder_run_name()
+            diag_output_dir = flight_recorder_output_dir()
+            if self.compilation_config.mode != CompilationMode.NONE:
+                raise RuntimeError(
+                    "VLLM_ASCEND_GL51_DEEP_DIAG requires P-side "
+                    f"compilation mode NONE, got {self.compilation_config.mode}"
+                )
+            if self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE:
+                raise RuntimeError(
+                    "VLLM_ASCEND_GL51_DEEP_DIAG requires P-side "
+                    "cudagraph mode NONE, got "
+                    f"{self.compilation_config.cudagraph_mode}"
+                )
+            logger.warning(
+                "[GL51_DEEP_DIAG_ARMED] run=%s output_dir=%s "
+                "scope=first_single_request_producer_prefill",
+                diag_run_name,
+                diag_output_dir,
+            )
 
         set_cos_and_sin(vllm_config, self.max_num_reqs, self.uniform_decode_query_len, self.dtype, self.device)
         set_mc2_tokens_capacity(vllm_config, self.max_num_reqs, self.uniform_decode_query_len)
@@ -2308,6 +2350,118 @@ class NPUModelRunner(GPUModelRunner):
 
         # Run forward pass
         clear_kv_metadata = self.speculative_config is None
+        gl51_deep_trace = None
+        gl51_deep_trace_request_id = None
+        gl51_deep_trace_started = False
+        if (
+            self._gl51_deep_diag_enabled
+            and self._gl51_deep_diag_completed == 0
+        ):
+            gl51_prefill_req_ids = [
+                req_id
+                for req_idx, req_id in enumerate(
+                    self.input_batch.req_ids[:num_reqs]
+                )
+                if (
+                    int(self.input_batch.num_computed_tokens_cpu[req_idx])
+                    < int(self.input_batch.num_prompt_tokens[req_idx])
+                )
+            ]
+            if gl51_prefill_req_ids:
+                if num_reqs != 1 or len(gl51_prefill_req_ids) != 1:
+                    raise RuntimeError(
+                        "VLLM_ASCEND_GL51_DEEP_DIAG requires exactly one "
+                        "active producer-prefill request; got "
+                        f"num_reqs={num_reqs}, prefill_reqs={gl51_prefill_req_ids}"
+                    )
+                if num_tokens_padded != num_tokens_unpadded:
+                    raise RuntimeError(
+                        "VLLM_ASCEND_GL51_DEEP_DIAG forbids token padding; "
+                        f"unpadded={num_tokens_unpadded}, "
+                        f"padded={num_tokens_padded}"
+                    )
+                if cudagraph_mode != CUDAGraphMode.NONE:
+                    raise RuntimeError(
+                        "VLLM_ASCEND_GL51_DEEP_DIAG requires runtime "
+                        f"cudagraph mode NONE, got {cudagraph_mode}"
+                    )
+                if staged_sfa_graph_key is not None:
+                    raise RuntimeError(
+                        "VLLM_ASCEND_GL51_DEEP_DIAG does not support a "
+                        f"staged SFA graph, got {staged_sfa_graph_key}"
+                    )
+                if should_ubatch:
+                    raise RuntimeError(
+                        "VLLM_ASCEND_GL51_DEEP_DIAG does not support ubatching"
+                    )
+                if self.pcp_size != 1 or self.dcp_size != 1:
+                    raise RuntimeError(
+                        "VLLM_ASCEND_GL51_DEEP_DIAG requires PCP=DCP=1, got "
+                        f"PCP={self.pcp_size}, DCP={self.dcp_size}"
+                    )
+                if self.use_aux_hidden_state_outputs:
+                    raise RuntimeError(
+                        "VLLM_ASCEND_GL51_DEEP_DIAG does not support "
+                        "auxiliary hidden-state outputs"
+                    )
+
+                gl51_deep_trace_request_id = gl51_prefill_req_ids[0]
+                begin_deepseek_v2_trace(
+                    {
+                        "request_id": gl51_deep_trace_request_id,
+                        "model": str(self.model_config.model),
+                        "dtype": str(self.dtype),
+                        "tp_size": int(get_tp_group().world_size),
+                        "dp_size": int(self.dp_size),
+                        "dp_rank": int(self.dp_rank),
+                        "tp_rank": int(get_tp_group().rank_in_group),
+                        "num_reqs": int(num_reqs),
+                        "num_tokens_unpadded": int(num_tokens_unpadded),
+                        "num_tokens_padded": int(num_tokens_padded),
+                        "num_scheduled_tokens": [
+                            int(value) for value in num_scheduled_tokens_np
+                        ],
+                        "num_computed_tokens_before": [
+                            int(value)
+                            for value in self.input_batch.num_computed_tokens_cpu[
+                                :num_reqs
+                            ]
+                        ],
+                        "num_prompt_tokens": [
+                            int(value)
+                            for value in self.input_batch.num_prompt_tokens[
+                                :num_reqs
+                            ]
+                        ],
+                        "compilation_mode": str(
+                            self.compilation_config.mode
+                        ),
+                        "configured_cudagraph_mode": str(
+                            self.compilation_config.cudagraph_mode
+                        ),
+                        "runtime_cudagraph_mode": str(cudagraph_mode),
+                        "staged_sfa_graph_key": None,
+                        "attn_state": str(self.attn_state),
+                        "is_kv_producer": bool(self.is_kv_producer),
+                        "is_kv_consumer": bool(self.is_kv_consumer),
+                    }
+                )
+                gl51_deep_trace_started = True
+                if input_ids is not None:
+                    record_deepseek_v2_tensor(
+                        "runner.input_ids",
+                        input_ids[:num_tokens_unpadded],
+                    )
+                if positions.ndim == 2:
+                    gl51_positions = positions[:, :num_tokens_unpadded]
+                else:
+                    gl51_positions = positions[:num_tokens_unpadded]
+                record_deepseek_v2_tensor(
+                    "runner.positions", gl51_positions
+                )
+                record_deepseek_v2_tensor(
+                    "runner.logits_indices", logits_indices
+                )
         final_hidden_forward_boundary_diag = None
         final_hidden_after_sync_clone = None
         final_hidden_boundary_trace_requests: list[str] = []
@@ -2371,9 +2525,22 @@ class NPUModelRunner(GPUModelRunner):
             if staged_sfa_graph_key is not None:
                 first_layer_name, first_impl = self._staged_sfa_impls[0]
                 first_impl.bootstrap_cross_layer(first_layer_name)
-            hidden_states = self._model_forward(
-                num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
-            )
+            try:
+                hidden_states = self._model_forward(
+                    num_tokens_padded,
+                    input_ids,
+                    positions,
+                    intermediate_tensors,
+                    inputs_embeds,
+                    **model_kwargs,
+                )
+            except BaseException:
+                if gl51_deep_trace_started:
+                    abort_deepseek_v2_trace()
+                raise
+            if gl51_deep_trace_started:
+                gl51_deep_trace = end_deepseek_v2_trace()
+                gl51_deep_trace_started = False
             if staged_sfa_graph_key is not None:
                 for _, impl in self._staged_sfa_impls:
                     impl.submit_cross_layer_save()
@@ -2457,6 +2624,21 @@ class NPUModelRunner(GPUModelRunner):
                     trace_hidden_states.detach().clone()
                 )
                 torch.npu.synchronize()
+        if gl51_deep_trace is not None:
+            assert gl51_deep_trace_request_id is not None
+            gl51_deep_trace_path = write_flight_record(
+                gl51_deep_trace,
+                request_id=gl51_deep_trace_request_id,
+                dp_rank=self.dp_rank,
+                tp_rank=get_tp_group().rank_in_group,
+            )
+            self._gl51_deep_diag_completed += 1
+            logger.warning(
+                "[GL51_DEEP_DIAG_WRITTEN] request=%s tensors=%d path=%s",
+                gl51_deep_trace_request_id,
+                len(gl51_deep_trace.tensors),
+                gl51_deep_trace_path,
+            )
         if final_hidden_forward_boundary_diag is not None:
             trace_hidden_states = (
                 hidden_states[0]
