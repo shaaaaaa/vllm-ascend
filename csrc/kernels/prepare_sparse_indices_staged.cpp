@@ -1443,8 +1443,14 @@ public:
             srcInt[shardWidth_], compactIndices, shardWidth_);
         AscendC::PipeBarrier<PIPE_V>();
         SortAll(src, tmp);
+        // Finalize adds each shard's request-local prefix before taking the
+        // maximum across dense maps.  A plain -1 sentinel would therefore
+        // become a non-negative false rank for every shard with a non-zero
+        // prefix and overwrite mappings owned by earlier shards.
         AscendC::Duplicate(
-            mapping, static_cast<int32_t>(-1), requestWidth_);
+            mapping,
+            -static_cast<int32_t>(requestWidth_ + 1),
+            requestWidth_);
         AscendC::PipeBarrier<PIPE_V>();
         Sync<AscendC::HardEvent::V_S>();
 
@@ -2478,6 +2484,14 @@ public:
                 Sync<AscendC::HardEvent::MTE3_MTE2>();
             }
             count += shardUnique;
+        }
+
+        if (count != 0) {
+            // The loop orders each selected copy against the following MTE2
+            // load.  After the final shard, however, packed is reused directly
+            // by vector target generation.  Complete that last MTE3 read
+            // before allowing the V pipe to overwrite the same UB buffer.
+            Sync<AscendC::HardEvent::MTE3_V>();
         }
 
         for (uint32_t offset = 0; offset < count; offset += rowWidth_) {
