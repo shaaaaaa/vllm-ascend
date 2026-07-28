@@ -71,20 +71,21 @@ removing an eligibility guard is never support.
 | Release | Graph envelope | Required non-graph behavior |
 | --- | --- | --- |
 | R1: cross-layer exact Q1 | Retrieve-only outer FX splits, nominally `N + 1` ACL islands for `N` local SFA layers, two-group unbundled LMCache, `SHRINK_LATENT=2`, exact configured Q=1 decode sizes, fp16/bf16, target model, TP, one DP replica, one virtual engine | All unsupported steps are classified before model forward as safe native, recompute, or fatal |
-| R2: general Q1 | Fixed-capacity padded Q=1 buckets through `max_num_seqs` | Inactive rows are invisible to LMCache and cannot touch live cache state |
+| R2: general Q1 | Fixed-capacity padded Q=1 buckets; the currently verified configured capacities are `1,2,4,5` | Inactive rows are invisible to LMCache and cannot touch live cache state; adding capacities is an explicit resource/qualification expansion |
 | R3: MTP | Fixed `SPEC_FIXED` candidate-width buckets for the target model | Unsupported widths/acceptance layouts use a proven route selected before mutation |
-| R4: serving parallelism | DP padding, empty ranks, PP/virtual-engine isolation, multi-engine lifecycle expansion | Rank decisions cannot diverge or reuse stale graph/cache addresses; base cache-epoch invalidation/rejection already ships in R1 |
+| R4: serving parallelism | Internal DP padding and empty ranks are complete for the tested envelope; PP/virtual-engine, external DP, and multi-engine lifecycle are later expansions | Rank decisions cannot diverge or reuse stale graph/cache addresses; base cache-epoch invalidation/rejection already ships in R1 |
 | R5: optional modes | Individually qualified LoRA, CP/o-proj TP, C8, MLAPO, prefetch, mixed prefill/decode, legacy offload paths | Each mode remains explicitly eager or rejected until its own design and gates pass |
 
 R1 can be released as a bounded production feature. R2-R5 expand coverage; they
 must not weaken the R1 safety contract.
 
-## Current implementation checkpoint: cross-layer exact-Q1 milestone
+## Current implementation checkpoint: cross-layer staged-Q1 milestone
 
-The branch now contains the cross-layer implementation plus exact-size Q1
-batching. Singleton execution and TP2 batch sizes 1/2/4 have passed initial
-Ascend functional/performance trials; runtime per-key replay and trace evidence
-are still required before the batched path is qualified:
+The branch contains the cross-layer implementation, exact Q1 batching, internal
+DP, and fixed-capacity Q1 padding. Configured capture capacities `1,2,4,5` have
+passed the current functional trials, including intervening real batch sizes;
+the remaining runtime per-key, trace, and lifecycle evidence belongs to W4
+release sign-off rather than missing feature implementation:
 
 - `vllm::sfa_lmcache_retrieve` is the only staged-SFA FX split;
 - Graph A and Graph B reuse the already-validated SFA math but are captured by
@@ -100,10 +101,10 @@ are still required before the batched path is qualified:
   production;
 - decode saves are submitted at the model boundary because per-layer Python
   save callbacks cannot remain inside the cross-layer islands;
-- capture is restricted to configured exact unpadded Q=1 request counts. A
-  fixed-capacity contiguous bridge uses the largest configured capture size;
-  smaller exact keys populate that bridge and slice back to their authorized
-  rows. This is an internal stable-layout ABI, not general padded-Q1 support;
+- capture uses configured fixed-capacity Q=1 buckets. A contiguous bridge uses
+  the largest configured capture size; smaller real batches populate the
+  containing bucket with safe inactive rows and compact back to their authorized
+  outputs. LMCache receives only real rows;
 - LMCache row routing preserves the exact batched request order, and startup
   verifies every configured key on every local SFA layer;
 - parity verification is once per graph key rather than once per replay;
@@ -134,6 +135,21 @@ behavior, resource bounds, and the production ownership plan remain open. The
 nested-wrapper implementation has been removed from this branch; its earlier
 commit remains the comparison and rollback point.
 
+Subsequent trials closed two feature milestones that older revisions of this
+document still described as future work. Internal DP is implemented and accepted
+for the tested single-machine envelope. Fixed-capacity padded Q1 dispatch is
+implemented and verified with configured capture capacities `1,2,4,5`, including
+non-capacity real batch sizes routed through the containing bucket. These are not
+pending implementation packages. Broader DP topologies and additional bucket
+capacities are separate qualification expansions.
+
+The long-prompt batch-4 host regression is also closed. Warm sparse connector
+metadata now reuses the stable request state rather than rebuilding and
+serializing the full long token list, slot mappings, and decode mask on every
+step. The corrected path was verified with staged capture capacities `1,2,4,5`.
+W4 remains open only as the umbrella production evidence/sign-off activity; it
+does not represent missing DP or padded-Q1 implementation.
+
 ### Trial-closed issues and newly exposed work
 
 `DONE` below means the stated trial issue is closed; it does not imply that the
@@ -150,6 +166,9 @@ whole R1 production gate is complete.
 | Exact batched LMCache row routing and per-key startup completeness | **DONE in code/unit/startup** | Exact request order is covered by focused tests and every configured key is checked for every local SFA layer |
 | Exact TP2 batch throughput checkpoint | **DONE** | On the eight-layer model, batches 1/2/4 reach 56/94/144 tok/s with LMCache and 72/124/184 tok/s with LMCache loading bypassed; normal and bypass scaling are nearly identical |
 | Decode critical-path host cleanup | **DONE at TP2 on the eight-layer model** | `f7038e2f` restores the established 56/94/144 tok/s baseline without changing connector waits, saves, events, or ACL replay synchronization; TP8/full-model requalification remains |
+| Internal DP support | **DONE for the tested envelope** | Internal DP route/capacity agreement, empty-rank handling, and real-row-only LMCache payloads passed the TP2+DP2 trial matrix; external-launcher DP, PP, and broader topologies remain separate work |
+| Configured padded-Q1 buckets | **DONE** | Fixed-capacity padding and inactive-row masking are implemented and verified with capture capacities `1,2,4,5`; requests not covered by a configured capacity retain the pre-mutation native route |
+| Long-prompt batch-4 connector metadata | **DONE** | Compact warm connector metadata removes the repeated construction, serialization, and worker reconstruction of long stable sparse metadata; the prior long-prompt batch-4 degradation is fixed under capture capacities `1,2,4,5` |
 | Mixed prefill/decode native sparse-frontier lookup | **IMPLEMENTED; NPU RERUN PENDING** | The current code queries frontiers only for request indices referenced by decode rows; rerun the concurrent smoke before closing |
 | Exact batch-2/4 runtime replay qualification | **OPEN** | Throughput from concurrent clients does not prove that every steady step was pure decode or identify the exact replay key |
 | Cross-layer island and event topology | **OPEN** | Capture an NPU trace proving the precise `N + 1` island plan, middle-island fusion, one eager retrieve per layer, and no nested wrappers |
@@ -158,15 +177,15 @@ whole R1 production gate is complete.
 
 | Mode | Current behavior | Production requirement |
 | --- | --- | --- |
-| Exact unpadded Q=1 | Cross-layer capture for configured exact request counts; TP2 batches 1/2/4 have a functional/performance checkpoint, but per-key batched replay is not trace-qualified | Prove actual replay and parity for every enabled key, then finish the P0 safety work |
-| Long generation | Singleton repeated decode is stable with live metadata tensors | Prove every block/window/maximum-length boundary and every enabled exact key |
-| Unconfigured or padded Q=1 | Runner disables replay before model forward; native SFA executes | Add planned padded buckets in R2 |
+| Exact unpadded Q=1 | Cross-layer capture is implemented and trial-qualified for configured capacities `1,2,4,5`; final release evidence remains under W4 | Preserve per-key replay/parity evidence and the P0 safety contract for every released key |
+| Long generation | Repeated decode is stable, and compact warm connector metadata fixes the long-prompt batch-4 host regression | Preserve boundary coverage for every released key and keep full metadata only for the first/change epoch |
+| Padded or unconfigured Q=1 | Real sizes use the containing configured fixed-capacity bucket with inactive-row masking; sizes above or outside the configured capacities select the native route before mutation | **DONE for the configured `1,2,4,5` envelope**; qualify any newly added capacity without reopening the existing implementation |
 | MTP/speculative target | Startup/runtime rejection | Fixed candidate-width keys, row masks, disjoint scratch in R3 |
 | Mixed prefill/decode | Whole scheduler step uses safe-native SFA; decode-only frontier filtering is implemented and awaits NPU rerun | R1 must qualify this native route; optional native-prefill/staged-decode row partition belongs to R5 |
 | Compact-scratch LMCache native path | Available for many rows | Classify precisely when it is safe; never assume it is always a fallback |
 | Legacy manager/free-paged/adapter | Rejected by staged path | Stay eager until their existing connector lifecycle and event behavior are independently qualified |
 | TP | TP2 exact-Q1 startup, batching, prefix reuse, deterministic output, startup checks for every local layer/key, and the post-W2 critical-path cleanup pass; TP8 passed before the final cleanup | Requalify the exact current commit on TP8; treat immediate convergence of an asymmetric connector exception as deferred availability hardening rather than a decode-path requirement |
-| DP | Internal DP route/capacity agreement, fixed-capacity padding, real-row-only LMCache payloads, and connector-free empty-rank dummy execution are implemented; external-launcher DP remains rejected | Qualify DP2/DP4 alone and with TP, including uneven and empty ranks, fallback/fatal agreement, prefix reuse, and long decode |
+| DP | Internal DP route/capacity agreement, fixed-capacity padding, real-row-only LMCache payloads, and connector-free empty-rank dummy execution are implemented and accepted for the tested TP2+DP2 envelope; external-launcher DP remains rejected | Treat internal DP as complete for the current envelope; qualify DP4, multi-node/external ownership, or other new topologies only when added to the release scope |
 | PP/multiple virtual engines | No capture namespace/lifecycle contract | Isolate cache epochs and in-flight slots or reject in R1-R3 |
 | LoRA, CP/o-proj TP, C8, MLAPO, prefetch | Rejected in layer eligibility | Centralize the rejection before capture and enable individually in R5 |
 | Ubatch/cascade | Runner rejects | Preserve rejection until state is invocation-safe |
@@ -191,12 +210,12 @@ connector API without a demonstrated correctness need.
 | P0.7 stream ordering | Each captured pre records a persistent producer event that the existing LMCache `payload_event` path waits; each retrieve split also waits the next index group. Generic outer PIECEWISE replay synchronization and the one-time sparse wait fence remain | Retained fences protect R1 but can cap TPOT and jitter | Keep the existing fence for R1. Trace the producer/load/following-island chain and remove synchronization only as measured P2.5/W8 optimization |
 | P0.8 stable ownership | Outer PIECEWISE wrappers own the cross-layer graph storage, and startup retains per-layer cache/event bindings, but the namespace does not cover weights, workspaces, cache epoch, virtual engine, or overlapping invocation | Stale pointers after lifecycle changes or state races | Island registry and buffer arena scoped by model/VE/cache epoch/key/in-flight slot, with invalidation |
 | P0.9 bounded resources | Outer islands use ordinary piecewise graph-memory profiling; stream count still relies on the existing per-layer heuristic and PP is not included | KV sizing can overcommit HBM/streams if profiling misses lifecycle high-water or the stream heuristic is wrong | Measured graph/workspace high-water plus a conservative, topology-aware quota before service readiness |
-| P0.10 qualification evidence | TP2 startup, deterministic output, prefix hit, decode save, repeat stability, singleton TPOT improvement, and batch-1/2/4 throughput checkpoints pass. Focused batch routing/startup tests pass, but client concurrency has not proven pure-decode key-2/4 replay | A synchronized HTTP launch does not control scheduler phase alignment, so batch responses alone can hide smaller-key replay or whole-step native execution | Add runtime per-key admission/replay evidence or a deterministic phase-aligned exerciser, then automate numerical, partition, trace, lifecycle, and failure matrices for every enabled exact key |
-| P1.1 padded rows | Only remap boundary is persistent; builder allocates per-step CPU/NumPy/device metadata | Exact keys cause graph explosion/fallbacks and cannot safely pad | Stable fixed-capacity row arena, safe pad block/slots, masks through both logical SFA phases and connector filtering |
-| P1.2 rich ACL dispatch | `StagedSFAGraphKey` collapses to legacy `BatchDescriptor(num_tokens)` | Padded Q1 and `SPEC_FIXED` entries can collide at equal token counts | Carry the full structural key through `ACLGraphWrapper` dispatch |
+| P0.10 qualification evidence | TP2 startup, deterministic output, prefix hit, decode save, repeat stability, singleton TPOT improvement, configured capacities `1,2,4,5`, padded real sizes, and internal-DP trials pass. W4 still owns the signed automated release matrix rather than more feature implementation | Ad-hoc client concurrency and smoke logs alone may not prove every numerical, lifecycle, and failure boundary in the released fingerprint | Retain per-key admission/replay evidence and automate the remaining numerical, partition, lifecycle, failure, and soak matrix for the final released envelope |
+| P1.1 padded rows | Fixed-capacity row storage, safe pad metadata, inactive-row masking, and real-row-only connector filtering are implemented and verified for capture capacities `1,2,4,5` | A newly added capacity or execution mode could omit a mask or exceed its resource budget | **DONE for the configured W5 envelope**; treat every added capacity as an explicit resource and parity qualification |
+| P1.2 rich ACL dispatch | Staged entries retain their full structural key while generic graph paths retain the legacy batch descriptor | Future `SPEC_FIXED` or optional modes can introduce new structural dimensions | **DONE for Q1/W5**; extend the existing key only when a new mode requires a new capture identity |
 | P1.3 MTP scratch | Native metadata has row-specific groundwork; staged eligibility rejects it | Candidate rows can alias scratch or lose request-row order | Fixed-width profile, unique-request frontier expansion, disjoint scratch/targets, valid-row mask |
 | P1.4 scheduler ownership | Input rows can be condensed/swapped after scheduler output is formed; scratch is configured through scattered environment reads | Request IDs, block rows, selected rows, and targets can describe different generations | Build plan after row condensation; use generation/step identity and typed KV scratch configuration |
-| P1.5 DP/PP/concurrency | Exact co-scheduled Q1 request batching is implemented for configured sizes; DP/ubatch are rejected and active-key aliases are mutable without locking | Exact batching does not establish DP agreement, overlapping invocation safety, or virtual-engine isolation | Qualify exact batching first; then add DP-wide bucket agreement, per-VE/cache namespace, and either isolated in-flight slots or enforced no overlap |
+| P1.5 DP/PP/concurrency | Internal DP bucket agreement, padded execution, empty-rank handling, and real-row connector routing are implemented and tested in the TP2+DP2 envelope; PP, external-launcher DP, ubatch, and overlapping virtual engines remain rejected | Expanding beyond the tested internal-DP envelope requires rank/LMCache ownership and invocation-safe graph state | **DONE for current internal DP**; W7 now covers only broader topology, PP/VE namespace, micro-batching, and overlap expansion |
 | P1.6 compatibility | Layer eligibility, startup config, memory budgeting, and connector checks encode different support subsets | Service can reserve/capture before discovering an unsupported operator combination | One capability fingerprint and reason enum used by every stage |
 | P1.7 mixed-phase hybrid replay | A step containing prefill and decode deliberately runs wholly native; the trial confirmed that ordinary client concurrency naturally produces this scheduler phase | Throughput can fall during arrivals even though already-decoding rows match a captured key | Optional R5 feature: compact/partition decode rows, run prefill through native MLA, replay a qualified staged decode key, and recombine outputs without changing LMCache's public connector API |
 | P1.8 runtime key observability | Startup logs/counters establish captured keys, but the smoke client cannot prove which key a live scheduler step admitted and replayed | Qualification and operations can confuse a captured key with a used key or a safe-native mixed step | Expose low-cardinality per-key admission/replay/fallback counters and include them in smoke assertions |
@@ -581,27 +600,27 @@ fail. Silent scratch/live aliasing is forbidden.
 
 ### Tensor parallelism
 
-- Perform one support/admission consensus per step within each TP group before
-  model forward; never discover rank disagreement in a layer.
-- After each rank-local connector index/latent operation, require either a
-  protocol-guaranteed uniform result or a TP phase verdict before entering the
-  following graph island. One-rank failure must make every rank abort before a
-  projection/collective can diverge.
-- Gather rank-specific diagnostics when consensus fails.
+- Derive support/admission deterministically from the scheduler input already
+  broadcast by vLLM and startup-sealed state; do not add a success-path TP
+  collective solely for staged admission.
+- Treat an asymmetric rank-local connector failure as fail-stop with bounded
+  execute timeout and supervised restart. Immediate per-split TP convergence is
+  deferred P2.4/W3 availability hardening because it would add a rendezvous to
+  every layer.
 - Preserve identical layer/phase progress across ranks even when only one rank
   saves to shared LMCache.
 - Qualify TP1, TP2, and TP8, including rank-local pointer/layout differences.
 
 ### Data parallelism
 
-- Choose a compatible structural bucket across DP replicas before any
-  collective; active masks, request IDs, and frontiers remain rank-local.
-- Support an all-padding empty rank and uneven loads without connector calls for
-  inactive rows.
-- Do TP consensus inside each replica and define any DP-wide graph-key
-  agreement separately.
-- Exercise DP2/DP4 alone and combined with TP; no rank may enter a different
-  collective schedule because its graph admission differed.
+- **Done for the current internal TP2+DP2 envelope:** use vLLM's existing DP
+  agreement/dummy-run path while active masks, request IDs, frontiers, and
+  connector calls remain local to real rows.
+- **Done:** all-padding empty ranks and uneven loads do not issue connector calls
+  for inactive rows.
+- Treat DP4, external-launcher DP, and new multi-node combinations as explicit
+  future topology expansions with their own ownership and collective-schedule
+  qualification.
 
 ### Pipeline parallelism and virtual engines
 
@@ -793,19 +812,18 @@ steps to a proven safe path; it cannot retroactively fall back a mutated step.
 
 ### Immediate execution order after the current trial
 
-1. Requalify the exact current commit on TP8/full layers. Combine this with the
-   completed TP2 evidence, including the `f7038e2f` no-regression checkpoint:
-   exact startup entry counts on every rank, deterministic output, prefix
-   miss/hit, decode save/release, `1 -> B -> 1`, bounded memory, and no TPOT
-   regression.
-2. Close W4's exact-Q1 functional evidence bundle without adding route or
-   connector consensus to the decode path. Keep the existing LMCache-vLLM API
-   unless a reproduced correctness failure cannot be repaired internally.
-3. Implement and qualify the core feature packages in order: W5 padded Q1,
-   W6 fixed-width MTP, then W7 serving parallelism and lifecycle ownership.
-4. Keep performance regression gates active throughout feature work, then run
-   W8 profiling and measured optimization before the lower-priority optional-mode
-   matrix. Detailed island/event traces remain evidence work in W8.
+1. Treat internal DP and W5 padded Q1 as completed for the tested configured
+   envelope. Preserve capture capacities `1,2,4,5` as the accepted test set;
+   adding capacities or topologies is new qualification work, not unfinished W5.
+2. Keep W4 open as release evidence/sign-off only: automate the remaining
+   numerical, lifecycle, boundary, soak, kill-switch, and fingerprint evidence
+   without adding decode-path coordination or changing the LMCache-vLLM API.
+3. Continue W8 measured performance work. The long-prompt batch-4 connector
+   metadata regression is closed by compact warm metadata; use its no-regression
+   test as a permanent gate and optimize only the next measured bottleneck.
+4. Keep W6 MTP deferred after its measured throughput regression. In W7, only
+   broader DP/external ownership, PP/VE namespace, micro-batching, and overlap
+   remain; internal DP is not pending implementation.
 5. Revisit P2.4 asymmetric TP connector-failure containment only if production
    availability data shows that bounded execute timeout plus engine restart is
    insufficient. Any success-path synchronization must pass a signed TPOT gate.
@@ -979,6 +997,9 @@ be enabled.
 
 ### W4: R1 cross-layer exact-Q1 NPU qualification and rollout
 
+Status: **feature implementation and current-envelope functional trials
+complete; formal production evidence/sign-off remains open**.
+
 - Run the complete numerical/boundary/cache/TP/lifecycle matrix against both
   the archived two-wrapper commit and the valid native LMCache route.
 - Automate numerical, boundary, cache, TP, graph-cardinality, zero-nested-wrapper,
@@ -995,15 +1016,20 @@ the release owner signs the evidence bundle.
 
 ### W5: padded Q1 buckets
 
+Status: **DONE for configured capture capacities `1,2,4,5`**.
+
 - Fixed-capacity Q1 padding is implemented for internal DP: vLLM-owned padded
   rows keep safe block/slot metadata, Graph A masks inactive sparse rows, and
   the split callback sends only compact real rows to LMCache.
-- Choose buckets from resource budget and workload distribution.
-- Prove all real sizes and row reorder/condense transitions within each bucket.
+- The configured capacities `1,2,4,5` and intervening real sizes have passed
+  the functional transition tests for the current envelope.
+- Preserve inactive-row and row-order assertions whenever a new capacity is
+  added.
 
-Exit: ordinary sizes through `max_num_seqs` use bounded keys and inactive rows
-cannot mutate/read/save request data. Depends on W2 and W4 qualification; the
-deferred W3 availability protocol is not a feature dependency.
+Exit: complete for the configured envelope: real sizes route through bounded
+keys and inactive rows cannot mutate/read/save request data. Supporting further
+sizes through `max_num_seqs` is an explicit capacity expansion. The deferred W3
+availability protocol is not a feature dependency.
 
 ### W6: fixed-width MTP target decode
 
@@ -1015,26 +1041,31 @@ deferred W3 availability protocol is not a feature dependency.
 Exit: widths 1/2/3 and all accepted-token patterns pass logits/token/KV/LMCache
 parity under churn and boundary cases. Depends on W5 row-capacity machinery.
 
-### W7: DP, PP/virtual engines, and overlap
+### W7: remaining parallelism, lifecycle, and overlap expansion
+
+Status: **internal DP DONE for the tested TP2+DP2 envelope; broader topology
+work remains optional/open**.
 
 - Internal DP bucket/route agreement and empty-rank execution are implemented
-  through the existing vLLM DP collective and dummy-run path; qualify DP2/DP4
-  and keep external-launcher DP rejected until its rank/LMCache ownership is
-  defined.
+  through the existing vLLM DP collective and dummy-run path. Keep
+  external-launcher and broader multi-node DP rejected until rank/LMCache
+  ownership is defined.
 - Namespace/invalidate per PP stage and virtual engine.
-- Add in-flight slots or enforce and test serialization.
+- Add in-flight slots or enforce and test serialization before admitting
+  micro-batching or overlapping virtual engines.
 - Extend memory/stream budgets and the documented fail-stop policy to combined
   parallelism. Strict per-split asymmetric-failure consensus remains P2.4 unless
   independently justified and performance-qualified.
 
-Exit: DP2/DP4, PP2/VE2, and qualified TP combinations sustain heterogeneous
-loads without hangs, row leakage, cursor drift, or stale capture. Depends on
-W2-W5; MTP+DP qualification additionally depends on W6.
+Exit for each new topology: the newly scoped DP/PP/VE/overlap combination
+sustains heterogeneous loads without hangs, row leakage, cursor drift, or stale
+capture. The current TP2+DP2 envelope is already closed; MTP combined with any
+DP topology additionally depends on W6.
 
 ### W8: post-feature throughput and latency optimization
 
-Status: **planned immediately after core feature support; lower priority than
-W5-W7 feature breadth, higher priority than optional-mode expansion**.
+Status: **active; W5 and internal DP are complete, while MTP and broader
+parallelism remain deferred until they justify reopening**.
 
 - Preserve no-profiler batch-1/2/4 baselines with and without LMCache loading;
   report step time plus throughput/TTFT/TPOT p50, p90, and p99 rather than only
@@ -1047,6 +1078,11 @@ W5-W7 feature breadth, higher priority than optional-mode expansion**.
   1/4/8-layer sweep. Separate SFA index selection, sparse attention, projections,
   LM head/logits/sampling, TP collectives, outer-island replay/fences, scheduler
   and model-runner host work, LMCache submission, transfer, and consumer join.
+- **Done:** compact warm sparse connector metadata avoids rebuilding,
+  serializing, and reconstructing stable long-prompt token IDs, slot mappings,
+  and masks every decode step. This closes the observed long-prompt batch-4 host
+  regression for capture capacities `1,2,4,5`; retain that workload as a
+  no-regression gate.
 - Treat the current TP2 result as evidence against a new LMCache batch-4
   serialization bottleneck, not as proof that its absolute 22-24% gap is
   irreducible. Optimize connector submission or transfer only when the profile
@@ -1068,8 +1104,9 @@ W5-W7 feature breadth, higher priority than optional-mode expansion**.
 Exit: the signed workload meets its aggregate-throughput and TTFT/TPOT p50/p99
 targets on the full target model; traces account for the remaining batch-scaling
 loss, no correctness/feature matrix regresses, and every retained synchronization
-has a documented dependency purpose. Depends on W1-W2 and W4, and should follow
-stable W5-W7 feature behavior. W3 is evaluated afterward only if its availability
+has a documented dependency purpose. Current work depends on W1-W5 and the
+accepted internal-DP envelope. Every future W6/W7 expansion must carry the same
+performance regression gates. W3 is evaluated afterward only if its availability
 benefit justifies a measured success-path cost.
 
 ### W9: optional execution modes
