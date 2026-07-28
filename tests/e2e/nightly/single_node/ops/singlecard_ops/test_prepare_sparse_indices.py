@@ -1156,16 +1156,6 @@ def test_production_staged_remaps_without_building_optional_payload():
         [topk - 100, 1024 + topk - 100],
         dtype=torch.int32,
     )
-    expected = _prepare_sparse_indices_torch(
-        source,
-        boundaries,
-        row_req_indices=torch.tensor([0, 0], dtype=torch.int32),
-        request_block_table=torch.arange(32, dtype=torch.int32).reshape(
-            1, 32
-        ),
-        block_size=128,
-        need_packed=False,
-    )
     selected, counts, targets = _buffers(1, 2 * topk)
     targets.fill_(-7)
     workspace = torch.empty_like(selected)
@@ -1206,7 +1196,33 @@ def test_production_staged_remaps_without_building_optional_payload():
     )
     torch.npu.synchronize()
 
-    assert torch.equal(actual[0].cpu(), expected[0])
+    remapped = actual[0].cpu().reshape(2, topk)
+    source_rows = source.reshape(2, topk)
+    selected_mask = (
+        (source_rows >= 0)
+        & (source_rows < boundaries.reshape(-1, 1))
+    )
+    assert torch.equal(remapped[~selected_mask], source_rows[~selected_mask])
+
+    # The sharded operator does not promise a global union order. Validate the
+    # actual contract without relying on either shard ordering: equal tokens
+    # share one rank, unequal tokens never share a rank, and all union ranks
+    # form a dense [0, unique_count) range.
+    token_to_rank = {}
+    rank_to_token = {}
+    for token, rank in zip(
+        source_rows[selected_mask].tolist(),
+        remapped[selected_mask].tolist(),
+    ):
+        if token in token_to_rank:
+            assert token_to_rank[token] == rank
+        else:
+            token_to_rank[token] = rank
+        if rank in rank_to_token:
+            assert rank_to_token[rank] == token
+        else:
+            rank_to_token[rank] = token
+    assert sorted(rank_to_token) == list(range(len(token_to_rank)))
     assert actual[1:] == (None, None, None)
     assert counts[0, 0].item() == 0
     assert torch.all(targets == -7)
