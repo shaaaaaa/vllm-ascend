@@ -910,6 +910,9 @@ class AscendSFAMetadata:
     decode_selected_tokens: torch.Tensor | None = None
     decode_selected_counts: torch.Tensor | None = None
     decode_union_mapping_workspace: torch.Tensor | None = None
+    decode_shard_packed_workspace: torch.Tensor | None = None
+    decode_shard_mapping_workspace: torch.Tensor | None = None
+    decode_shard_counts_workspace: torch.Tensor | None = None
     need_sparse_lmcache_payload: bool = False
     staged_sfa_payload_validated: bool = False
     prompt_lens_cpu_rows: Any = None
@@ -1053,6 +1056,19 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
                 dtype=torch.int32,
                 device=device,
             )
+            self._dsa_shard_packed = torch.empty(
+                (max_num_reqs, 2, self.scratch_capacity),
+                dtype=torch.int32,
+                device=device,
+            )
+            self._dsa_shard_mapping = torch.empty_like(
+                self._dsa_shard_packed
+            )
+            self._dsa_shard_counts = torch.empty(
+                (max_num_reqs, 2, 16),
+                dtype=torch.int32,
+                device=device,
+            )
             fixed_query_starts = np.arange(
                 max_num_reqs + 1,
                 dtype=np.int32,
@@ -1087,6 +1103,9 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             self._dsa_selected_counts = None
             self._dsa_target_slots = None
             self._dsa_union_mapping = None
+            self._dsa_shard_packed = None
+            self._dsa_shard_mapping = None
+            self._dsa_shard_counts = None
             self._dsa_fixed_query_starts_cpu = None
         self._dsa_fixed_layout_signature = None
         self.actual_seq_lengths_query = torch.zeros(max_num_reqs + 1, dtype=torch.int32, device=device)
@@ -1180,6 +1199,9 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
         decode_selected_tokens = None
         decode_selected_counts = None
         decode_union_mapping_workspace = None
+        decode_shard_packed_workspace = None
+        decode_shard_mapping_workspace = None
+        decode_shard_counts_workspace = None
         need_sparse_lmcache_payload = False
         num_decode_rows = 0
         decode_req_indices_cpu = None
@@ -1420,6 +1442,9 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
                 assert self._dsa_selected_tokens is not None
                 assert self._dsa_selected_counts is not None
                 assert self._dsa_union_mapping is not None
+                assert self._dsa_shard_packed is not None
+                assert self._dsa_shard_mapping is not None
+                assert self._dsa_shard_counts is not None
                 req_ids = common_attn_metadata.request_ids
                 if req_ids is not None:
                     decode_request_ids_compact = list(req_ids[:num_reqs])
@@ -1429,6 +1454,15 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
                 decode_selected_tokens = self._dsa_selected_tokens[:num_reqs]
                 decode_selected_counts = self._dsa_selected_counts[:num_reqs]
                 decode_union_mapping_workspace = self._dsa_union_mapping[
+                    :num_reqs
+                ]
+                decode_shard_packed_workspace = self._dsa_shard_packed[
+                    :num_reqs
+                ]
+                decode_shard_mapping_workspace = self._dsa_shard_mapping[
+                    :num_reqs
+                ]
+                decode_shard_counts_workspace = self._dsa_shard_counts[
                     :num_reqs
                 ]
 
@@ -1559,6 +1593,9 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             decode_selected_tokens=decode_selected_tokens,
             decode_selected_counts=decode_selected_counts,
             decode_union_mapping_workspace=decode_union_mapping_workspace,
+            decode_shard_packed_workspace=decode_shard_packed_workspace,
+            decode_shard_mapping_workspace=decode_shard_mapping_workspace,
+            decode_shard_counts_workspace=decode_shard_counts_workspace,
             need_sparse_lmcache_payload=need_sparse_lmcache_payload,
             prompt_lens_cpu_rows=rows if plens_cpu is not None else None,
             decode_remap_boundary=self.decode_remap_boundary[:num_input_tokens],
@@ -2590,6 +2627,18 @@ class AscendSFAImpl(MLAAttentionImpl):
             != graph_key.request_capacity
             or attn_metadata.decode_union_mapping_workspace.shape
             != attn_metadata.decode_selected_tokens.shape
+            or attn_metadata.decode_shard_packed_workspace is None
+            or int(attn_metadata.decode_shard_packed_workspace.shape[0])
+            != graph_key.request_capacity
+            or int(attn_metadata.decode_shard_packed_workspace.shape[1]) != 2
+            or int(attn_metadata.decode_shard_packed_workspace.shape[2])
+            != int(attn_metadata.decode_selected_tokens.shape[1])
+            or attn_metadata.decode_shard_mapping_workspace is None
+            or attn_metadata.decode_shard_mapping_workspace.shape
+            != attn_metadata.decode_shard_packed_workspace.shape
+            or attn_metadata.decode_shard_counts_workspace is None
+            or tuple(attn_metadata.decode_shard_counts_workspace.shape)
+            != (graph_key.request_capacity, 2, 16)
         ):
             return "the request-union remap buffers do not match the graph key"
 
@@ -2674,6 +2723,9 @@ class AscendSFAImpl(MLAAttentionImpl):
         selected_counts: torch.Tensor,
         target_slot_mapping: torch.Tensor,
         local_to_union_workspace: torch.Tensor,
+        shard_packed_workspace: torch.Tensor,
+        shard_mapping_workspace: torch.Tensor,
+        shard_counts_workspace: torch.Tensor,
     ) -> tuple[torch.Tensor, ...]:
         """Pre-retrieval compute captured by the outer PIECEWISE graph."""
         assert self.fused_qkv_a_proj is not None
@@ -2744,6 +2796,9 @@ class AscendSFAImpl(MLAAttentionImpl):
             need_packed=True,
             clear_invalid_rows=True,
             local_to_union_workspace=local_to_union_workspace,
+            shard_packed_workspace=shard_packed_workspace,
+            shard_mapping_workspace=shard_mapping_workspace,
+            shard_counts_workspace=shard_counts_workspace,
             staged_mtp=int(topk_indices.shape[0])
             // int(request_block_table.shape[0]),
         )
@@ -3007,6 +3062,15 @@ class AscendSFAImpl(MLAAttentionImpl):
         local_to_union_workspace = (
             attn_metadata.decode_union_mapping_workspace
         )
+        shard_packed_workspace = (
+            attn_metadata.decode_shard_packed_workspace
+        )
+        shard_mapping_workspace = (
+            attn_metadata.decode_shard_mapping_workspace
+        )
+        shard_counts_workspace = (
+            attn_metadata.decode_shard_counts_workspace
+        )
         if any(
             value is None
             for value in (
@@ -3015,6 +3079,9 @@ class AscendSFAImpl(MLAAttentionImpl):
                 selected_counts,
                 target_slots,
                 local_to_union_workspace,
+                shard_packed_workspace,
+                shard_mapping_workspace,
+                shard_counts_workspace,
             )
         ):
             raise RuntimeError("staged SFA request-union buffers are unavailable")
@@ -3037,6 +3104,9 @@ class AscendSFAImpl(MLAAttentionImpl):
             selected_counts,
             target_slots,
             local_to_union_workspace,
+            shard_packed_workspace,
+            shard_mapping_workspace,
+            shard_counts_workspace,
         )
         outputs = self._copy_to_staged_sfa_bridge(
             hidden_states,
@@ -3528,6 +3598,21 @@ class AscendSFAImpl(MLAAttentionImpl):
                     clear_invalid_rows=_is_pure_decode,
                     local_to_union_workspace=(
                         attn_metadata.decode_union_mapping_workspace
+                        if _staged_mtp is not None
+                        else None
+                    ),
+                    shard_packed_workspace=(
+                        attn_metadata.decode_shard_packed_workspace
+                        if _staged_mtp is not None
+                        else None
+                    ),
+                    shard_mapping_workspace=(
+                        attn_metadata.decode_shard_mapping_workspace
+                        if _staged_mtp is not None
+                        else None
+                    ),
+                    shard_counts_workspace=(
+                        attn_metadata.decode_shard_counts_workspace
                         if _staged_mtp is not None
                         else None
                     ),

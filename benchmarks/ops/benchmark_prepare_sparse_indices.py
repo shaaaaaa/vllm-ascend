@@ -4,6 +4,7 @@ import statistics
 import torch
 
 from vllm_ascend.distributed.kv_transfer.sparse_offload.prepare_sparse_indices import (
+    _sparse_index_op_name,
     prepare_sparse_indices,
 )
 from vllm_ascend.utils import enable_custom_op
@@ -288,23 +289,13 @@ def production_only_main(
     iterations: int = 200,
     warmups: int = 20,
 ) -> None:
-    """Benchmark only the production staged sparse-index operator."""
+    """Benchmark only the selected production sparse-index operator."""
     if topk != 2048:
         raise ValueError("the production staged operator requires --topk 2048")
     if mtp not in (1, 2):
         raise ValueError("the production staged operator supports only --mtp 1 or 2")
     if not enable_custom_op():
         raise RuntimeError("vllm-ascend custom operators could not be loaded")
-    try:
-        production_op = (
-            torch.ops._C_ascend.npu_dsa_prepare_sparse_indices_staged_
-        )
-    except AttributeError as exc:
-        raise RuntimeError(
-            "vllm_ascend_C does not expose the production staged operator; "
-            "rebuild the custom-op extension"
-        ) from exc
-
     request_batch = 4
     row_count = request_batch * mtp
     source = _mtp_rows_with_half_overlap(
@@ -353,21 +344,35 @@ def production_only_main(
         device="npu",
     )
     local_to_union_workspace = torch.empty_like(selected)
+    shard_packed_workspace = torch.empty(
+        (request_batch, 2, capacity),
+        dtype=torch.int32,
+        device="npu",
+    )
+    shard_mapping_workspace = torch.empty_like(shard_packed_workspace)
+    shard_counts_workspace = torch.empty(
+        (request_batch, 2, 16),
+        dtype=torch.int32,
+        device="npu",
+    )
 
     def run() -> None:
-        production_op(
+        prepare_sparse_indices(
             values,
             boundaries,
-            row_requests,
-            block_table,
-            selected,
-            counts,
-            targets,
-            local_to_union_workspace,
-            block_size,
-            mtp,
-            True,
-            True,
+            row_req_indices=row_requests,
+            request_block_table=block_table,
+            selected_packed=selected,
+            selected_counts=counts,
+            target_slot_mapping=targets,
+            block_size=block_size,
+            need_packed=True,
+            clear_invalid_rows=True,
+            local_to_union_workspace=local_to_union_workspace,
+            shard_packed_workspace=shard_packed_workspace,
+            shard_mapping_workspace=shard_mapping_workspace,
+            shard_counts_workspace=shard_counts_workspace,
+            staged_mtp=mtp,
         )
 
     # Correctness is checked once outside the timed section.
@@ -389,7 +394,7 @@ def production_only_main(
     targets_cpu = targets.cpu()
     for request in range(request_batch):
         if not torch.equal(
-            selected_cpu[request, :expected_count],
+            torch.sort(selected_cpu[request, :expected_count]).values,
             expected_selected,
         ):
             raise AssertionError(
@@ -441,7 +446,20 @@ def production_only_main(
         f"topk={topk}, MTP={mtp}, requests={request_batch}, "
         f"split_boundary={split_boundary} (source max={source_max})"
     )
-    _summary("production-staged", samples)
+    uses_sharded_operator = (
+        _sparse_index_op_name(mtp)
+        == "npu_dsa_prepare_sparse_indices_sharded_"
+    )
+    production_label = (
+        "production-sharded-single-row"
+        if uses_sharded_operator and mtp == 1
+        else (
+            "production-sharded-sort"
+            if uses_sharded_operator
+            else "production-staged-sort"
+        )
+    )
+    _summary(production_label, samples)
 
 
 def main(
@@ -526,6 +544,23 @@ def main(
         torch.empty_like(hash_buffers[0]),
         torch.empty_like(hash_buffers[2]),
         torch.empty_like(hash_buffers[3]),
+    )
+    production_sharded_scratch = (
+        torch.empty(
+            (request_batch, 2, capacity),
+            dtype=torch.int32,
+            device="npu",
+        ),
+        torch.empty(
+            (request_batch, 2, capacity),
+            dtype=torch.int32,
+            device="npu",
+        ),
+        torch.empty(
+            (request_batch, 2, 16),
+            dtype=torch.int32,
+            device="npu",
+        ),
     )
     shard_count = 1 << (mtp - 1).bit_length()
     sharded_sort_scratch = (
@@ -682,6 +717,9 @@ def main(
             target_slot_mapping=production_staged_buffers[3],
             block_size=block_size,
             local_to_union_workspace=production_staged_buffers[1],
+            shard_packed_workspace=production_sharded_scratch[0],
+            shard_mapping_workspace=production_sharded_scratch[1],
+            shard_counts_workspace=production_sharded_scratch[2],
             staged_mtp=mtp,
         )
         production_staged_result = (
@@ -900,6 +938,9 @@ def main(
                 target_slot_mapping=production_staged_buffers[3],
                 block_size=block_size,
                 local_to_union_workspace=production_staged_buffers[1],
+                shard_packed_workspace=production_sharded_scratch[0],
+                shard_mapping_workspace=production_sharded_scratch[1],
+                shard_counts_workspace=production_sharded_scratch[2],
                 staged_mtp=mtp,
             ),
             lambda: production_staged_values.copy_(source),
@@ -920,11 +961,24 @@ def main(
     _summary("sharded-vector-map", sharded_vector_samples)
     _summary("sharded-vector-dedup", sharded_vector_dedup_samples)
     production_staged_mean = None
+    uses_sharded_operator = (
+        _sparse_index_op_name(mtp)
+        == "npu_dsa_prepare_sparse_indices_sharded_"
+    )
+    production_label = (
+        "production-sharded-single-row"
+        if uses_sharded_operator and mtp == 1
+        else (
+            "production-sharded-sort"
+            if uses_sharded_operator
+            else "production-staged-sort"
+        )
+    )
     if production_staged_samples:
         production_staged_mean = statistics.fmean(
             production_staged_samples
         )
-        _summary("production-staged", production_staged_samples)
+        _summary(production_label, production_staged_samples)
     native_unique_mean = None
     if native_unique_baseline:
         native_unique_mean = statistics.fmean(native_unique_samples)
@@ -980,7 +1034,7 @@ def main(
         ("sharded-vector-dedup", sharded_vector_dedup_mean),
     ]
     if production_staged_mean is not None:
-        candidates.append(("production-staged", production_staged_mean))
+        candidates.append((production_label, production_staged_mean))
     if native_unique_baseline:
         candidates.append(("native-unique", native_unique_mean))
     if pair_baselines:
@@ -1004,7 +1058,7 @@ if __name__ == "__main__":
         "--production-only",
         action="store_true",
         help=(
-            "benchmark only npu_dsa_prepare_sparse_indices_staged_; "
+            "benchmark only the selected production staged operator; "
             "do not initialize or run experimental sharded paths"
         ),
     )

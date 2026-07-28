@@ -21,6 +21,13 @@ def _load_dsa_union_operator():
         pytest.fail(
             "vllm_ascend_C does not contain the production staged DSA operator"
         )
+    if not hasattr(
+        torch.ops._C_ascend,
+        "npu_dsa_prepare_sparse_indices_sharded_",
+    ):
+        pytest.fail(
+            "vllm_ascend_C does not contain the production sharded DSA operator"
+        )
     if not hasattr(torch.ops._C_ascend, "npu_dsa_prepare_sparse_indices_legacy_"):
         pytest.fail("vllm_ascend_C does not contain the pre-union DSA operator")
     if not hasattr(torch.ops._C_ascend, "npu_dsa_staged_unique_finalize_"):
@@ -61,6 +68,7 @@ def _run_production_staged(
     mtp: int,
     *,
     capture_graph: bool = False,
+    use_sharded_sort: bool = True,
 ):
     row_width = source.numel() // source.shape[0]
     capacity = mtp * row_width
@@ -75,6 +83,17 @@ def _run_production_staged(
     ).repeat_interleave(mtp)
     selected, counts, targets = _buffers(request_count, capacity)
     mapping = torch.empty_like(selected)
+    shard_packed = torch.empty(
+        (request_count, 2, capacity),
+        dtype=torch.int32,
+        device="npu",
+    )
+    shard_mapping = torch.empty_like(shard_packed)
+    shard_counts = torch.empty(
+        (request_count, 2, 16),
+        dtype=torch.int32,
+        device="npu",
+    )
     block_table = torch.arange(
         request_count * table_width,
         dtype=torch.int32,
@@ -82,11 +101,25 @@ def _run_production_staged(
     ).reshape(request_count, table_width)
     addresses = tuple(
         tensor.data_ptr()
-        for tensor in (values, selected, counts, targets, mapping)
+        for tensor in (
+            values,
+            selected,
+            counts,
+            targets,
+            mapping,
+            shard_packed,
+            shard_mapping,
+            shard_counts,
+        )
     )
 
     def invoke():
-        torch.ops._C_ascend.npu_dsa_prepare_sparse_indices_staged_(
+        op = (
+            torch.ops._C_ascend.npu_dsa_prepare_sparse_indices_sharded_
+            if use_sharded_sort
+            else torch.ops._C_ascend.npu_dsa_prepare_sparse_indices_staged_
+        )
+        args = [
             values,
             boundaries_npu,
             row_requests,
@@ -95,11 +128,10 @@ def _run_production_staged(
             counts,
             targets,
             mapping,
-            block_size,
-            mtp,
-            True,
-            True,
-        )
+        ]
+        if use_sharded_sort:
+            args.extend((shard_packed, shard_mapping, shard_counts))
+        op(*args, block_size, mtp, True, True)
 
     if capture_graph:
         graph = torch.npu.NPUGraph()
@@ -113,7 +145,16 @@ def _run_production_staged(
     torch.npu.synchronize()
     assert addresses == tuple(
         tensor.data_ptr()
-        for tensor in (values, selected, counts, targets, mapping)
+        for tensor in (
+            values,
+            selected,
+            counts,
+            targets,
+            mapping,
+            shard_packed,
+            shard_mapping,
+            shard_counts,
+        )
     )
     return (
         values.cpu(),
@@ -856,8 +897,14 @@ def test_zero_boundary_keeps_resident_absolute_indices():
 
 
 @pytest.mark.parametrize("capture_graph", [False, True])
-def test_production_staged_mtp2_respects_per_row_boundary_and_graph(
+@pytest.mark.parametrize(
+    "use_sharded_sort",
+    [True, False],
+    ids=["sharded-sort", "legacy-staged-sort"],
+)
+def test_production_mtp2_backends_respect_per_row_boundary_and_graph(
     capture_graph,
+    use_sharded_sort,
 ):
     request_count = 2
     mtp = 2
@@ -879,8 +926,8 @@ def test_production_staged_mtp2_respects_per_row_boundary_and_graph(
         rows.extend((first, second))
         boundaries.extend(
             (
-                int(first.max()) - 100,
-                int(second.max()) - 100,
+                0 if request == 0 else int(first.max()) - 100,
+                0 if request == 0 else int(second.max()) - 100,
             )
         )
     source = torch.stack(rows).unsqueeze(1)
@@ -908,22 +955,98 @@ def test_production_staged_mtp2_respects_per_row_boundary_and_graph(
         request_count,
         mtp,
         capture_graph=capture_graph,
+        use_sharded_sort=use_sharded_sort,
     )
 
-    assert torch.equal(actual[0], expected[0])
     assert torch.equal(actual[2], expected[2])
-    for request, count in enumerate(expected[2].tolist()):
-        assert torch.equal(
-            actual[1][request, :count],
-            expected[1][request, :count],
+    if use_sharded_sort:
+        source_2d = source.reshape(request_count * mtp, topk)
+        remapped = actual[0].reshape(request_count * mtp, topk)
+        selected_mask = (
+            (source_2d >= 0)
+            & (source_2d < boundary_tensor.reshape(-1, 1))
         )
+        safe_ranks = torch.where(
+            selected_mask,
+            remapped,
+            torch.zeros_like(remapped),
+        )
+        reconstructed_selected = torch.gather(
+            actual[1].repeat_interleave(mtp, dim=0),
+            1,
+            safe_ranks.to(torch.long),
+        )
+        reconstructed = torch.where(
+            selected_mask,
+            reconstructed_selected,
+            remapped,
+        )
+        assert torch.equal(reconstructed, source_2d)
+    else:
+        assert torch.equal(actual[0], expected[0])
+    for request, count in enumerate(expected[2].tolist()):
+        actual_selected = actual[1][request, :count]
+        expected_selected = expected[1][request, :count]
+        if use_sharded_sort:
+            assert torch.equal(
+                torch.sort(actual_selected).values,
+                expected_selected,
+            )
+        else:
+            assert torch.equal(actual_selected, expected_selected)
         assert torch.equal(
             actual[3][request, :count],
             expected[3][request, :count],
         )
 
 
-def test_production_staged_mtp1_skips_union_and_preserves_source_order():
+def test_production_sharded_mtp2_handles_one_full_value_shard():
+    topk = 2048
+    source = torch.stack(
+        (
+            2 * torch.arange(topk, dtype=torch.int32),
+            2 * torch.arange(topk, 2 * topk, dtype=torch.int32),
+        )
+    ).unsqueeze(1)
+    boundaries = torch.full(
+        (2,),
+        4 * topk,
+        dtype=torch.int32,
+    )
+    row_requests = torch.zeros(2, dtype=torch.int32)
+    block_table = torch.arange(32, dtype=torch.int32).reshape(1, 32)
+    expected = _prepare_sparse_indices_torch(
+        source,
+        boundaries,
+        row_req_indices=row_requests,
+        request_block_table=block_table,
+        block_size=128,
+    )
+
+    actual = _run_production_staged(
+        source,
+        boundaries,
+        request_count=1,
+        mtp=2,
+        use_sharded_sort=True,
+    )
+
+    assert torch.equal(actual[0], expected[0])
+    assert actual[2].tolist() == [2 * topk]
+    assert torch.equal(actual[1][0, : 2 * topk], expected[1][0])
+    assert torch.equal(actual[3][0, : 2 * topk], expected[3][0])
+
+
+@pytest.mark.parametrize("capture_graph", [False, True])
+@pytest.mark.parametrize(
+    "use_sharded_sort",
+    [True, False],
+    ids=["sharded-operator", "legacy-staged-operator"],
+)
+def test_production_mtp1_backends_skip_union_and_preserve_source_order(
+    capture_graph,
+    use_sharded_sort,
+):
     request_count = 2
     topk = 2048
     rows = torch.stack(
@@ -944,6 +1067,8 @@ def test_production_staged_mtp1_skips_union_and_preserves_source_order():
         boundaries,
         request_count,
         1,
+        capture_graph=capture_graph,
+        use_sharded_sort=use_sharded_sort,
     )
 
     expected_remapped = rows.reshape(request_count, topk).clone()
@@ -1044,6 +1169,17 @@ def test_production_staged_remaps_without_building_optional_payload():
     selected, counts, targets = _buffers(1, 2 * topk)
     targets.fill_(-7)
     workspace = torch.empty_like(selected)
+    shard_packed = torch.empty(
+        (1, 2, 2 * topk),
+        dtype=torch.int32,
+        device="npu",
+    )
+    shard_mapping = torch.empty_like(shard_packed)
+    shard_counts = torch.empty(
+        (1, 2, 16),
+        dtype=torch.int32,
+        device="npu",
+    )
     actual = prepare_sparse_indices(
         source.npu(),
         boundaries.npu(),
@@ -1063,6 +1199,9 @@ def test_production_staged_remaps_without_building_optional_payload():
         block_size=128,
         need_packed=False,
         local_to_union_workspace=workspace,
+        shard_packed_workspace=shard_packed,
+        shard_mapping_workspace=shard_mapping,
+        shard_counts_workspace=shard_counts,
         staged_mtp=2,
     )
     torch.npu.synchronize()

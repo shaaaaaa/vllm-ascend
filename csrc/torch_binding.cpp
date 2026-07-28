@@ -1291,7 +1291,7 @@ at::Tensor npu_dsa_prepare_sparse_indices_(
     return selected_counts;
 }
 
-at::Tensor npu_dsa_prepare_sparse_indices_staged_(
+at::Tensor npu_dsa_prepare_sparse_indices_staged_common_(
     at::Tensor &topk_indices,
     const at::Tensor &split_boundary,
     const at::Tensor &row_req_indices,
@@ -1300,10 +1300,14 @@ at::Tensor npu_dsa_prepare_sparse_indices_staged_(
     at::Tensor &selected_counts,
     at::Tensor &target_slots,
     at::Tensor &local_to_union_workspace,
+    at::Tensor *shard_packed_workspace,
+    at::Tensor *shard_mapping_workspace,
+    at::Tensor *shard_counts_workspace,
     int64_t block_size,
     int64_t mtp,
     bool need_packed,
-    bool clear_invalid_rows)
+    bool clear_invalid_rows,
+    bool use_sharded_sort)
 {
     TORCH_CHECK(mtp == 1 || mtp == 2,
                 "staged sparse-index preparation only supports MTP=1 or "
@@ -1374,6 +1378,54 @@ at::Tensor npu_dsa_prepare_sparse_indices_staged_(
                 "count row must occupy whole 64-byte cachelines");
     TORCH_CHECK(scratch_capacity >= mtp * row_width,
                 "staged payload/workspace width must cover all MTP rows");
+    if (use_sharded_sort) {
+        TORCH_CHECK(shard_packed_workspace != nullptr &&
+                        shard_mapping_workspace != nullptr &&
+                        shard_counts_workspace != nullptr,
+                    "the production sharded-sort path requires caller-owned "
+                    "shard workspaces");
+        TORCH_CHECK(shard_packed_workspace->device() == device &&
+                        shard_mapping_workspace->device() == device &&
+                        shard_counts_workspace->device() == device,
+                    "all production sharded-sort workspaces must share the "
+                    "input NPU device");
+        TORCH_CHECK(shard_packed_workspace->scalar_type() == at::kInt &&
+                        shard_mapping_workspace->scalar_type() == at::kInt &&
+                        shard_counts_workspace->scalar_type() == at::kInt,
+                    "all production sharded-sort workspaces must be int32");
+        TORCH_CHECK(shard_packed_workspace->is_contiguous() &&
+                        shard_mapping_workspace->is_contiguous() &&
+                        shard_counts_workspace->is_contiguous(),
+                    "all production sharded-sort workspaces must be "
+                    "contiguous");
+        if (mtp == 2) {
+            TORCH_CHECK(scratch_capacity == mtp * row_width,
+                        "the production sharded-sort path requires an exact "
+                        "request-width payload/workspace");
+            TORCH_CHECK(
+                shard_packed_workspace->dim() == 3 &&
+                    shard_packed_workspace->size(0) == request_count &&
+                    shard_packed_workspace->size(1) == mtp &&
+                    shard_packed_workspace->size(2) == scratch_capacity &&
+                    shard_mapping_workspace->dim() == 3 &&
+                    shard_mapping_workspace->sizes() ==
+                        shard_packed_workspace->sizes() &&
+                    shard_counts_workspace->dim() == 3 &&
+                    shard_counts_workspace->size(0) == request_count &&
+                    shard_counts_workspace->size(1) == mtp &&
+                    shard_counts_workspace->size(2) == 16,
+                "invalid production sharded-sort workspace shapes");
+        }
+        TORCH_CHECK(
+            reinterpret_cast<std::uintptr_t>(
+                shard_packed_workspace->data_ptr()) % 256 == 0 &&
+                reinterpret_cast<std::uintptr_t>(
+                    shard_mapping_workspace->data_ptr()) % 256 == 0 &&
+                reinterpret_cast<std::uintptr_t>(
+                    shard_counts_workspace->data_ptr()) % 64 == 0,
+            "production sharded-sort vector workspaces must be 256-byte "
+            "aligned and count workspaces must be 64-byte aligned");
+    }
     TORCH_CHECK(block_size > 0 &&
                     (block_size & (block_size - 1)) == 0 &&
                     block_table_width * block_size >= scratch_capacity,
@@ -1425,31 +1477,104 @@ at::Tensor npu_dsa_prepare_sparse_indices_staged_(
     void* counts_ptr = selected_counts.data_ptr();
     void* slots_ptr = target_slots.data_ptr();
     void* map_ptr = local_to_union_workspace.data_ptr();
+    void* shard_packed_ptr =
+        use_sharded_sort ? shard_packed_workspace->data_ptr() : nullptr;
+    void* shard_mapping_ptr =
+        use_sharded_sort ? shard_mapping_workspace->data_ptr() : nullptr;
+    void* shard_counts_ptr =
+        use_sharded_sort ? shard_counts_workspace->data_ptr() : nullptr;
 
     at_npu::native::OpCommand cmd;
-    cmd.Name("npu_dsa_prepare_sparse_indices_staged_");
+    cmd.Name(
+        use_sharded_sort
+            ? "npu_dsa_prepare_sparse_indices_sharded_"
+            : "npu_dsa_prepare_sparse_indices_staged_");
     cmd.SetCustomHandler([
         stream, topk_ptr, boundary_ptr, row_req_ptr, table_ptr, packed_ptr,
-        counts_ptr, slots_ptr, map_ptr, row_count, row_width, request_count,
-        mtp, scratch_capacity, block_table_width, selected_count_stride,
-        block_size, core_count, need_packed,
-        clear_invalid_rows]() -> int {
-        dsa_prepare_sparse_indices_staged_impl(
-            stream, topk_ptr, boundary_ptr, row_req_ptr, table_ptr,
-            packed_ptr, counts_ptr, slots_ptr, map_ptr,
-            static_cast<uint32_t>(row_count),
-            static_cast<uint32_t>(row_width),
-            static_cast<uint32_t>(request_count),
-            static_cast<uint32_t>(mtp),
-            static_cast<uint32_t>(scratch_capacity),
-            static_cast<uint32_t>(block_table_width),
-            static_cast<uint32_t>(selected_count_stride),
-            static_cast<uint32_t>(block_size), core_count, need_packed,
-            clear_invalid_rows);
+        counts_ptr, slots_ptr, map_ptr, shard_packed_ptr,
+        shard_mapping_ptr, shard_counts_ptr, row_count, row_width,
+        request_count, mtp, scratch_capacity, block_table_width,
+        selected_count_stride, block_size, core_count, need_packed,
+        clear_invalid_rows, use_sharded_sort]() -> int {
+        if (use_sharded_sort) {
+            dsa_prepare_sparse_indices_sharded_impl(
+                stream, topk_ptr, boundary_ptr, row_req_ptr, table_ptr,
+                packed_ptr, counts_ptr, slots_ptr, map_ptr,
+                shard_packed_ptr, shard_mapping_ptr, shard_counts_ptr,
+                static_cast<uint32_t>(request_count),
+                static_cast<uint32_t>(mtp),
+                static_cast<uint32_t>(row_width),
+                static_cast<uint32_t>(scratch_capacity),
+                static_cast<uint32_t>(block_table_width),
+                static_cast<uint32_t>(selected_count_stride),
+                static_cast<uint32_t>(block_size), core_count, need_packed,
+                clear_invalid_rows);
+        } else {
+            dsa_prepare_sparse_indices_staged_impl(
+                stream, topk_ptr, boundary_ptr, row_req_ptr, table_ptr,
+                packed_ptr, counts_ptr, slots_ptr, map_ptr,
+                static_cast<uint32_t>(row_count),
+                static_cast<uint32_t>(row_width),
+                static_cast<uint32_t>(request_count),
+                static_cast<uint32_t>(mtp),
+                static_cast<uint32_t>(scratch_capacity),
+                static_cast<uint32_t>(block_table_width),
+                static_cast<uint32_t>(selected_count_stride),
+                static_cast<uint32_t>(block_size), core_count, need_packed,
+                clear_invalid_rows);
+        }
         return 0;
     });
     cmd.Run();
     return selected_counts;
+}
+
+at::Tensor npu_dsa_prepare_sparse_indices_staged_(
+    at::Tensor &topk_indices,
+    const at::Tensor &split_boundary,
+    const at::Tensor &row_req_indices,
+    const at::Tensor &request_block_table,
+    at::Tensor &selected_packed,
+    at::Tensor &selected_counts,
+    at::Tensor &target_slots,
+    at::Tensor &local_to_union_workspace,
+    int64_t block_size,
+    int64_t mtp,
+    bool need_packed,
+    bool clear_invalid_rows)
+{
+    return npu_dsa_prepare_sparse_indices_staged_common_(
+        topk_indices, split_boundary, row_req_indices, request_block_table,
+        selected_packed, selected_counts, target_slots,
+        local_to_union_workspace, nullptr, nullptr, nullptr,
+        block_size, mtp, need_packed,
+        clear_invalid_rows, false);
+}
+
+at::Tensor npu_dsa_prepare_sparse_indices_sharded_(
+    at::Tensor &topk_indices,
+    const at::Tensor &split_boundary,
+    const at::Tensor &row_req_indices,
+    const at::Tensor &request_block_table,
+    at::Tensor &selected_packed,
+    at::Tensor &selected_counts,
+    at::Tensor &target_slots,
+    at::Tensor &local_to_union_workspace,
+    at::Tensor &shard_packed_workspace,
+    at::Tensor &shard_mapping_workspace,
+    at::Tensor &shard_counts_workspace,
+    int64_t block_size,
+    int64_t mtp,
+    bool need_packed,
+    bool clear_invalid_rows)
+{
+    return npu_dsa_prepare_sparse_indices_staged_common_(
+        topk_indices, split_boundary, row_req_indices, request_block_table,
+        selected_packed, selected_counts, target_slots,
+        local_to_union_workspace, &shard_packed_workspace,
+        &shard_mapping_workspace, &shard_counts_workspace,
+        block_size, mtp, need_packed,
+        clear_invalid_rows, true);
 }
 
 void bgmv_shrink(at::Tensor &x, at::Tensor &weight, at::Tensor &indices, at::Tensor &y, double scale)
@@ -1977,6 +2102,21 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "npu_dsa_prepare_sparse_indices_staged_",
         torch::kPrivateUse1,
         &vllm_ascend::npu_dsa_prepare_sparse_indices_staged_);
+    ops.def(
+        "npu_dsa_prepare_sparse_indices_sharded_("
+        "Tensor(a!) topk_indices, Tensor split_boundary, "
+        "Tensor row_req_indices, Tensor request_block_table, "
+        "Tensor(b!) selected_packed, Tensor(c!) selected_counts, "
+        "Tensor(d!) target_slots, Tensor(e!) local_to_union_workspace, "
+        "Tensor(f!) shard_packed_workspace, "
+        "Tensor(g!) shard_mapping_workspace, "
+        "Tensor(h!) shard_counts_workspace, "
+        "int block_size, int mtp, bool need_packed, "
+        "bool clear_invalid_rows) -> Tensor(c!)");
+    ops.impl(
+        "npu_dsa_prepare_sparse_indices_sharded_",
+        torch::kPrivateUse1,
+        &vllm_ascend::npu_dsa_prepare_sparse_indices_sharded_);
     ops.def(
         "npu_dsa_prepare_sparse_indices_legacy_(Tensor(a!) topk_indices, "
         "Tensor split_boundary, Tensor valid_rows, Tensor scratch_base, "
