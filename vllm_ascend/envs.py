@@ -152,6 +152,13 @@ env_variables: dict[str, Callable[[], Any]] = {
     # 2 (B2+B1): additionally free the latent blocks [k .. prompt) at end of
     #   prefill (the actual memory saving). Default 0.
     "VLLM_ASCEND_DSA_SHRINK_LATENT": lambda: int(os.getenv("VLLM_ASCEND_DSA_SHRINK_LATENT", "0")),
+    # Select the production sharded sparse-index operator for MTP=1/2. MTP=1
+    # bypasses sort/union inside that operator; MTP=2 uses request-sharded
+    # sort/union. 1 (default) enables it; 0 keeps the legacy staged operator as
+    # a compatibility fallback. Non-sensitive.
+    "VLLM_ASCEND_DSA_MTP_SHARDED_SORT": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_DSA_MTP_SHARDED_SORT", "1"))
+    ),
     # Experimental SFA graph-capture proof of concept. When enabled, exact-Q1
     # decode is captured across layers, with selective LMCache retrieval as
     # the eager split operation.

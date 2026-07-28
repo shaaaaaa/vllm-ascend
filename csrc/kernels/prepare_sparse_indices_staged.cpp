@@ -22,6 +22,7 @@ constexpr uint32_t kCumSumWorkspaceBytes =
 constexpr uint32_t kDataBlockBytes = 32;
 constexpr uint32_t kInt32PerDataBlock =
     kDataBlockBytes / sizeof(int32_t);
+constexpr uint32_t kInt32PerCacheline = 16;
 constexpr AscendC::CumSumConfig kCumSumConfig{true, false, false};
 
 template <AscendC::HardEvent event>
@@ -1205,22 +1206,28 @@ public:
     __aicore__ inline void Init(
         __gm__ int32_t* topkIndices,
         __gm__ int32_t* splitBoundary,
+        __gm__ int32_t* rowReqIndices,
         __gm__ int32_t* shardPacked,
         __gm__ int32_t* shardMapping,
         __gm__ int32_t* shardCounts,
         uint32_t requestCount,
         uint32_t rowsPerRequest,
         uint32_t rowWidth,
+        uint32_t shardCapacity,
         uint32_t shardCount,
-        uint32_t shardCountStride)
+        uint32_t shardCountStride,
+        uint32_t shardCountRequestStride,
+        bool useRowReqIndices)
     {
         requestCount_ = requestCount;
         rowsPerRequest_ = rowsPerRequest;
         rowWidth_ = rowWidth;
         requestWidth_ = rowsPerRequest * rowWidth;
-        shardWidth_ = rowWidth;
+        shardWidth_ = shardCapacity;
         shardCount_ = shardCount;
         shardCountStride_ = shardCountStride;
+        shardCountRequestStride_ = shardCountRequestStride;
+        useRowReqIndices_ = useRowReqIndices;
         uint32_t shifted = shardCount_;
         while (shifted > 1) {
             shifted >>= 1;
@@ -1230,13 +1237,15 @@ public:
             topkIndices, requestCount_ * requestWidth_);
         splitBoundary_.SetGlobalBuffer(
             splitBoundary, requestCount_ * rowsPerRequest_);
+        rowReqIndices_.SetGlobalBuffer(
+            rowReqIndices, requestCount_ * rowsPerRequest_);
         shardPacked_.SetGlobalBuffer(
             shardPacked, requestCount_ * shardCount_ * shardWidth_);
         shardMapping_.SetGlobalBuffer(
             shardMapping, requestCount_ * shardCount_ * requestWidth_);
         shardCounts_.SetGlobalBuffer(
             shardCounts,
-            requestCount_ * shardCount_ * shardCountStride_);
+            requestCount_ * shardCountRequestStride_);
 
         // Scan one MTP row at a time.  This keeps UB use independent of the
         // MTP depth while all rows belonging to the request feed one shard.
@@ -1275,8 +1284,8 @@ public:
             (static_cast<uint64_t>(request) * shardCount_ + shard)
             * requestWidth_;
         const uint64_t countOffset =
-            (static_cast<uint64_t>(request) * shardCount_ + shard)
-            * shardCountStride_;
+            static_cast<uint64_t>(request) * shardCountRequestStride_
+            + shard * shardCountStride_;
 
         auto input = inputBuf_.Get<int32_t>();
         auto work = workBuf_.Get<int32_t>();
@@ -1309,6 +1318,11 @@ public:
         uint32_t shardElements = 0;
         uint32_t compactEnd = 0;
         for (uint32_t mtpRow = 0; mtpRow < rowsPerRequest_; ++mtpRow) {
+            const uint32_t row = request * rowsPerRequest_ + mtpRow;
+            if (useRowReqIndices_ &&
+                rowReqIndices_.GetValue(row) != static_cast<int32_t>(request)) {
+                continue;
+            }
             const uint64_t inputOffset =
                 static_cast<uint64_t>(request) * requestWidth_
                 + static_cast<uint64_t>(mtpRow) * rowWidth_;
@@ -1433,16 +1447,17 @@ public:
             return;
         }
 
+        const uint32_t sortElements = SortElementCount(compactEnd);
         AscendC::Cast(
             src,
             compactTokens,
             AscendC::RoundMode::CAST_NONE,
-            shardWidth_);
-        AscendC::Muls(src, src, -1.0F, shardWidth_);
+            sortElements);
+        AscendC::Muls(src, src, -1.0F, sortElements);
         AscendC::DataCopy(
-            srcInt[shardWidth_], compactIndices, shardWidth_);
+            srcInt[sortElements], compactIndices, sortElements);
         AscendC::PipeBarrier<PIPE_V>();
-        SortAll(src, tmp);
+        SortAll(src, tmp, sortElements);
         // Finalize adds each shard's request-local prefix before taking the
         // maximum across dense maps.  A plain -1 sentinel would therefore
         // become a non-negative false rank for every shard with a non-zero
@@ -1488,15 +1503,29 @@ public:
     }
 
 private:
+    __aicore__ inline uint32_t SortElementCount(uint32_t count)
+    {
+        uint32_t groups =
+            (count + kSortGroup - 1) / kSortGroup;
+        groups = groups == 0 ? 1 : groups;
+        uint32_t scale = 1;
+        while (groups > kMergeWays) {
+            groups = (groups + kMergeWays - 1) / kMergeWays;
+            scale *= kMergeWays;
+        }
+        return groups * scale * kSortGroup;
+    }
+
     __aicore__ inline void SortAll(
         AscendC::LocalTensor<float>& src,
-        AscendC::LocalTensor<float>& tmp)
+        AscendC::LocalTensor<float>& tmp,
+        uint32_t sortElements)
     {
-        const uint32_t repeats = shardWidth_ / kSortGroup;
+        const uint32_t repeats = sortElements / kSortGroup;
         AscendC::Sort32(
             tmp,
             src,
-            src[shardWidth_].ReinterpretCast<uint32_t>(),
+            src[sortElements].ReinterpretCast<uint32_t>(),
             repeats);
         AscendC::PipeBarrier<PIPE_V>();
         uint32_t groups = repeats;
@@ -1533,13 +1562,14 @@ private:
             ++pass;
         }
         if (pass % 2 == 0) {
-            AscendC::DataCopy(src, tmp, shardWidth_ * kPairWidth);
+            AscendC::DataCopy(src, tmp, sortElements * kPairWidth);
             AscendC::PipeBarrier<PIPE_V>();
         }
     }
 
     AscendC::GlobalTensor<int32_t> topkIndices_;
     AscendC::GlobalTensor<int32_t> splitBoundary_;
+    AscendC::GlobalTensor<int32_t> rowReqIndices_;
     AscendC::GlobalTensor<int32_t> shardPacked_;
     AscendC::GlobalTensor<int32_t> shardMapping_;
     AscendC::GlobalTensor<int32_t> shardCounts_;
@@ -1565,7 +1595,9 @@ private:
     uint32_t shardWidth_ = 0;
     uint32_t shardCount_ = 0;
     uint32_t shardCountStride_ = 0;
+    uint32_t shardCountRequestStride_ = 0;
     uint32_t shardBits_ = 0;
+    bool useRowReqIndices_ = false;
 };
 
 // Experimental follow-up to DSAStagedShardedSortKernel. Deduplication and
@@ -2726,6 +2758,7 @@ class DSAStagedShardedFinalizeKernel {
 public:
     __aicore__ inline void Init(
         __gm__ int32_t* topkIndices,
+        __gm__ int32_t* rowReqIndices,
         __gm__ int32_t* selectedPacked,
         __gm__ int32_t* localToUnion,
         __gm__ int32_t* selectedCount,
@@ -2737,21 +2770,31 @@ public:
         uint32_t requestCount,
         uint32_t rowsPerRequest,
         uint32_t rowWidth,
+        uint32_t shardCapacity,
         uint32_t shardCount,
         uint32_t blockTableWidth,
         uint32_t selectedCountStride,
         uint32_t shardCountStride,
-        uint32_t blockSize)
+        uint32_t shardCountRequestStride,
+        uint32_t blockSize,
+        bool useRowReqIndices,
+        bool clearInvalidRows,
+        bool needPacked)
     {
         requestCount_ = requestCount;
         rowsPerRequest_ = rowsPerRequest;
         rowWidth_ = rowWidth;
         requestWidth_ = rowsPerRequest * rowWidth;
+        shardCapacity_ = shardCapacity;
         shardCount_ = shardCount;
         blockTableWidth_ = blockTableWidth;
         selectedCountStride_ = selectedCountStride;
         shardCountStride_ = shardCountStride;
+        shardCountRequestStride_ = shardCountRequestStride;
         blockSize_ = blockSize;
+        useRowReqIndices_ = useRowReqIndices;
+        clearInvalidRows_ = clearInvalidRows;
+        needPacked_ = needPacked;
         uint32_t shifted = blockSize_;
         while (shifted > 1) {
             shifted >>= 1;
@@ -2759,6 +2802,8 @@ public:
         }
         topkIndices_.SetGlobalBuffer(
             topkIndices, requestCount_ * requestWidth_);
+        rowReqIndices_.SetGlobalBuffer(
+            rowReqIndices, requestCount_ * rowsPerRequest_);
         selectedPacked_.SetGlobalBuffer(
             selectedPacked, requestCount_ * requestWidth_);
         localToUnion_.SetGlobalBuffer(
@@ -2770,13 +2815,13 @@ public:
         targetSlots_.SetGlobalBuffer(
             targetSlots, requestCount_ * requestWidth_);
         shardPacked_.SetGlobalBuffer(
-            shardPacked, requestCount_ * shardCount_ * rowWidth_);
+            shardPacked, requestCount_ * shardCount_ * shardCapacity_);
         shardMapping_.SetGlobalBuffer(
             shardMapping, requestCount_ * shardCount_ * requestWidth_);
         shardCounts_.SetGlobalBuffer(
             shardCounts,
-            requestCount_ * shardCount_ * shardCountStride_);
-        pipe_.InitBuffer(packedBuf_, rowWidth_ * sizeof(int32_t));
+            requestCount_ * shardCountRequestStride_);
+        pipe_.InitBuffer(packedBuf_, shardCapacity_ * sizeof(int32_t));
         pipe_.InitBuffer(accumMapBuf_, requestWidth_ * sizeof(int32_t));
         pipe_.InitBuffer(shardMapBuf_, requestWidth_ * sizeof(int32_t));
         pipe_.InitBuffer(rankBuf_, rowWidth_ * sizeof(int32_t));
@@ -2798,7 +2843,7 @@ public:
         const uint64_t outputOffset =
             static_cast<uint64_t>(request) * requestWidth_;
         const uint64_t shardBase =
-            static_cast<uint64_t>(request) * shardCount_ * rowWidth_;
+            static_cast<uint64_t>(request) * shardCount_ * shardCapacity_;
         const uint64_t mapBase =
             static_cast<uint64_t>(request) * shardCount_ * requestWidth_;
 
@@ -2827,11 +2872,12 @@ public:
         for (uint32_t shard = 0; shard < shardCount_; ++shard) {
             const uint32_t shardUnique = static_cast<uint32_t>(
                 shardCounts_.GetValue(
-                    (static_cast<uint64_t>(request) * shardCount_ + shard)
-                    * shardCountStride_));
+                    static_cast<uint64_t>(request)
+                        * shardCountRequestStride_
+                    + shard * shardCountStride_));
             CopyGlobalToLocalExact(
                 packed,
-                shardPacked_[shardBase + shard * rowWidth_],
+                shardPacked_[shardBase + shard * shardCapacity_],
                 shardUnique);
             AscendC::DataCopy(
                 shardMap,
@@ -2848,12 +2894,14 @@ public:
                 accumMap, accumMap, shardMap, requestWidth_);
             AscendC::PipeBarrier<PIPE_V>();
             Sync<AscendC::HardEvent::V_MTE2>();
-            Sync<AscendC::HardEvent::MTE2_MTE3>();
-            CopyLocalToGlobalExact(
-                selectedPacked_[outputOffset + count],
-                packed,
-                shardUnique);
-            Sync<AscendC::HardEvent::MTE3_MTE2>();
+            if (needPacked_) {
+                Sync<AscendC::HardEvent::MTE2_MTE3>();
+                CopyLocalToGlobalExact(
+                    selectedPacked_[outputOffset + count],
+                    packed,
+                    shardUnique);
+                Sync<AscendC::HardEvent::MTE3_MTE2>();
+            }
             count += shardUnique;
         }
 
@@ -2866,6 +2914,22 @@ public:
         // token index while remapping selected positions in place.
         for (uint32_t mtpRow = 0; mtpRow < rowsPerRequest_; ++mtpRow) {
             const uint32_t rowOffset = mtpRow * rowWidth_;
+            const uint32_t row = request * rowsPerRequest_ + mtpRow;
+            if (useRowReqIndices_ &&
+                rowReqIndices_.GetValue(row) != static_cast<int32_t>(request)) {
+                if (clearInvalidRows_) {
+                    AscendC::Duplicate(
+                        physical, static_cast<int32_t>(0), rowWidth_);
+                    AscendC::PipeBarrier<PIPE_V>();
+                    Sync<AscendC::HardEvent::V_MTE3>();
+                    AscendC::DataCopy(
+                        topkIndices_[outputOffset + rowOffset],
+                        physical,
+                        rowWidth_);
+                    Sync<AscendC::HardEvent::MTE3_MTE2>();
+                }
+                continue;
+            }
             auto mapping = accumMap[rowOffset];
             AscendC::DataCopy(
                 packed,
@@ -2901,60 +2965,63 @@ public:
             Sync<AscendC::HardEvent::MTE3_MTE2>();
         }
 
-        for (uint32_t offset = 0; offset < count; offset += rowWidth_) {
-            const uint32_t remaining = count - offset;
-            const uint32_t tile =
-                remaining < rowWidth_ ? remaining : rowWidth_;
-            AscendC::CreateVecIndex(
-                ranks, static_cast<int32_t>(offset), tile);
-            AscendC::ShiftRight(
-                logical,
-                ranks,
-                static_cast<int32_t>(blockSizeShift_),
-                tile);
-            AscendC::PipeBarrier<PIPE_V>();
-            AscendC::Muls(
-                shardMap,
-                logical,
-                static_cast<int32_t>(sizeof(int32_t)),
-                tile);
-            AscendC::PipeBarrier<PIPE_V>();
-            AscendC::Gather(
-                physical,
-                blockTable,
-                shardMap.ReinterpretCast<uint32_t>(),
-                static_cast<uint32_t>(0),
-                tile);
-            AscendC::PipeBarrier<PIPE_V>();
-            AscendC::Muls(
-                physical, physical,
-                static_cast<int32_t>(blockSize_), tile);
-            AscendC::Muls(
-                logical, logical,
-                static_cast<int32_t>(blockSize_), tile);
-            AscendC::PipeBarrier<PIPE_V>();
-            AscendC::Sub(ranks, ranks, logical, tile);
-            AscendC::PipeBarrier<PIPE_V>();
-            AscendC::Add(physical, physical, ranks, tile);
-            AscendC::PipeBarrier<PIPE_V>();
-            AscendC::Cast(
-                targets,
-                physical,
-                AscendC::RoundMode::CAST_NONE,
-                tile);
-            AscendC::PipeBarrier<PIPE_V>();
-            Sync<AscendC::HardEvent::V_MTE3>();
-            CopyLocalToGlobalExact(
-                targetSlots_[outputOffset + offset], targets, tile);
-            Sync<AscendC::HardEvent::MTE3_V>();
+        if (needPacked_) {
+            for (uint32_t offset = 0; offset < count; offset += rowWidth_) {
+                const uint32_t remaining = count - offset;
+                const uint32_t tile =
+                    remaining < rowWidth_ ? remaining : rowWidth_;
+                AscendC::CreateVecIndex(
+                    ranks, static_cast<int32_t>(offset), tile);
+                AscendC::ShiftRight(
+                    logical,
+                    ranks,
+                    static_cast<int32_t>(blockSizeShift_),
+                    tile);
+                AscendC::PipeBarrier<PIPE_V>();
+                AscendC::Muls(
+                    shardMap,
+                    logical,
+                    static_cast<int32_t>(sizeof(int32_t)),
+                    tile);
+                AscendC::PipeBarrier<PIPE_V>();
+                AscendC::Gather(
+                    physical,
+                    blockTable,
+                    shardMap.ReinterpretCast<uint32_t>(),
+                    static_cast<uint32_t>(0),
+                    tile);
+                AscendC::PipeBarrier<PIPE_V>();
+                AscendC::Muls(
+                    physical, physical,
+                    static_cast<int32_t>(blockSize_), tile);
+                AscendC::Muls(
+                    logical, logical,
+                    static_cast<int32_t>(blockSize_), tile);
+                AscendC::PipeBarrier<PIPE_V>();
+                AscendC::Sub(ranks, ranks, logical, tile);
+                AscendC::PipeBarrier<PIPE_V>();
+                AscendC::Add(physical, physical, ranks, tile);
+                AscendC::PipeBarrier<PIPE_V>();
+                AscendC::Cast(
+                    targets,
+                    physical,
+                    AscendC::RoundMode::CAST_NONE,
+                    tile);
+                AscendC::PipeBarrier<PIPE_V>();
+                Sync<AscendC::HardEvent::V_MTE3>();
+                CopyLocalToGlobalExact(
+                    targetSlots_[outputOffset + offset], targets, tile);
+                Sync<AscendC::HardEvent::MTE3_V>();
+            }
         }
         selectedCount_.SetValue(
             static_cast<uint64_t>(request) * selectedCountStride_,
-            static_cast<int32_t>(count));
+            needPacked_ ? static_cast<int32_t>(count) : 0);
     }
 
 private:
     AscendC::GlobalTensor<int32_t> topkIndices_;
+    AscendC::GlobalTensor<int32_t> rowReqIndices_;
     AscendC::GlobalTensor<int32_t> selectedPacked_;
     AscendC::GlobalTensor<int32_t> localToUnion_;
     AscendC::GlobalTensor<int32_t> selectedCount_;
@@ -2977,12 +3044,17 @@ private:
     uint32_t rowsPerRequest_ = 0;
     uint32_t rowWidth_ = 0;
     uint32_t requestWidth_ = 0;
+    uint32_t shardCapacity_ = 0;
     uint32_t shardCount_ = 0;
     uint32_t blockTableWidth_ = 0;
     uint32_t selectedCountStride_ = 0;
     uint32_t shardCountStride_ = 0;
+    uint32_t shardCountRequestStride_ = 0;
     uint32_t blockSize_ = 0;
     uint32_t blockSizeShift_ = 0;
+    bool useRowReqIndices_ = false;
+    bool clearInvalidRows_ = false;
+    bool needPacked_ = true;
 };
 
 class DSAStagedRemapRowsKernel {
@@ -3440,9 +3512,36 @@ extern "C" __global__ __aicore__ void dsa_staged_sharded_sort_kernel(
     if ASCEND_IS_AIV {
         DSAStagedShardedSortKernel op;
         op.Init(
-            topkIndices, splitBoundary, shardPacked, shardMapping, shardCounts,
-            requestCount, rowsPerRequest, rowWidth, shardCount,
-            shardCountStride);
+            topkIndices, splitBoundary, topkIndices, shardPacked,
+            shardMapping, shardCounts, requestCount, rowsPerRequest,
+            rowWidth, rowWidth, shardCount, shardCountStride,
+            shardCount * shardCountStride, false);
+        op.Process();
+    }
+}
+
+extern "C" __global__ __aicore__ void
+dsa_staged_production_sharded_sort_kernel(
+    __gm__ int32_t* topkIndices,
+    __gm__ int32_t* splitBoundary,
+    __gm__ int32_t* rowReqIndices,
+    __gm__ int32_t* shardPacked,
+    __gm__ int32_t* shardMapping,
+    __gm__ int32_t* shardCounts,
+    uint32_t requestCount,
+    uint32_t rowsPerRequest,
+    uint32_t rowWidth,
+    uint32_t shardCount,
+    uint32_t shardCountStride,
+    uint32_t shardCountRequestStride)
+{
+    if ASCEND_IS_AIV {
+        DSAStagedShardedSortKernel op;
+        op.Init(
+            topkIndices, splitBoundary, rowReqIndices, shardPacked,
+            shardMapping, shardCounts, requestCount, rowsPerRequest,
+            rowWidth, rowsPerRequest * rowWidth, shardCount, shardCountStride,
+            shardCountRequestStride, true);
         op.Process();
     }
 }
@@ -3587,11 +3686,51 @@ extern "C" __global__ __aicore__ void dsa_staged_sharded_finalize_kernel(
     if ASCEND_IS_AIV {
         DSAStagedShardedFinalizeKernel op;
         op.Init(
-            topkIndices, selectedPacked, localToUnion, selectedCount,
-            requestBlockTable, targetSlots, shardPacked, shardMapping,
-            shardCounts, requestCount, rowsPerRequest, rowWidth,
-            shardCount, blockTableWidth, selectedCountStride,
-            shardCountStride, blockSize);
+            topkIndices, topkIndices, selectedPacked, localToUnion,
+            selectedCount, requestBlockTable, targetSlots, shardPacked,
+            shardMapping, shardCounts, requestCount, rowsPerRequest,
+            rowWidth, rowWidth, shardCount, blockTableWidth,
+            selectedCountStride,
+            shardCountStride, shardCount * shardCountStride, blockSize,
+            false, false, true);
+        op.Process();
+    }
+}
+
+extern "C" __global__ __aicore__ void
+dsa_staged_production_sharded_finalize_kernel(
+    __gm__ int32_t* topkIndices,
+    __gm__ int32_t* rowReqIndices,
+    __gm__ int32_t* selectedPacked,
+    __gm__ int32_t* localToUnion,
+    __gm__ int32_t* selectedCount,
+    __gm__ int32_t* requestBlockTable,
+    __gm__ int64_t* targetSlots,
+    __gm__ int32_t* shardPacked,
+    __gm__ int32_t* shardMapping,
+    __gm__ int32_t* shardCounts,
+    uint32_t requestCount,
+    uint32_t rowsPerRequest,
+    uint32_t rowWidth,
+    uint32_t shardCount,
+    uint32_t blockTableWidth,
+    uint32_t selectedCountStride,
+    uint32_t shardCountStride,
+    uint32_t shardCountRequestStride,
+    uint32_t blockSize,
+    bool needPacked,
+    bool clearInvalidRows)
+{
+    if ASCEND_IS_AIV {
+        DSAStagedShardedFinalizeKernel op;
+        op.Init(
+            topkIndices, rowReqIndices, selectedPacked, localToUnion,
+            selectedCount, requestBlockTable, targetSlots, shardPacked,
+            shardMapping, shardCounts, requestCount, rowsPerRequest,
+            rowWidth, rowsPerRequest * rowWidth, shardCount,
+            blockTableWidth, selectedCountStride,
+            shardCountStride, shardCountRequestStride, blockSize, true,
+            clearInvalidRows, needPacked);
         op.Process();
     }
 }
@@ -3671,12 +3810,11 @@ extern "C" __global__ __aicore__ void dsa_staged_copy_rows_kernel(
 
 namespace vllm_ascend {
 
-void dsa_prepare_sparse_indices_staged_impl(
+static void dsa_prepare_sparse_indices_single_row_impl(
     void* stream, void* topkIndices, void* splitBoundary,
     void* rowReqIndices, void* requestBlockTable,
     void* selectedPacked, void* selectedCount, void* targetSlots,
-    void* localToUnion, uint32_t rowCount, uint32_t rowWidth,
-    uint32_t requestCount, uint32_t rowsPerRequest,
+    void* localToUnion, uint32_t requestCount, uint32_t rowWidth,
     uint32_t scratchCapacity, uint32_t blockTableWidth,
     uint32_t selectedCountStride, uint32_t blockSize,
     uint32_t coreCount, bool needPacked, bool clearInvalidRows)
@@ -3687,21 +3825,47 @@ void dsa_prepare_sparse_indices_staged_impl(
         static_cast<int32_t*>(rowReqIndices),
         static_cast<int32_t*>(selectedPacked),
         static_cast<int32_t*>(localToUnion),
-        rowCount, rowWidth, requestCount, rowsPerRequest,
+        requestCount, rowWidth, requestCount, 1,
         scratchCapacity, coreCount, clearInvalidRows);
+    dsa_staged_single_row_finalize_kernel<<<
+        requestCount, nullptr, stream>>>(
+        static_cast<int32_t*>(localToUnion),
+        static_cast<int32_t*>(selectedCount),
+        static_cast<int32_t*>(requestBlockTable),
+        static_cast<int64_t*>(targetSlots),
+        requestCount, rowWidth, scratchCapacity,
+        blockTableWidth, selectedCountStride, blockSize,
+        needPacked);
+}
 
+void dsa_prepare_sparse_indices_staged_impl(
+    void* stream, void* topkIndices, void* splitBoundary,
+    void* rowReqIndices, void* requestBlockTable,
+    void* selectedPacked, void* selectedCount, void* targetSlots,
+    void* localToUnion, uint32_t rowCount, uint32_t rowWidth,
+    uint32_t requestCount, uint32_t rowsPerRequest,
+    uint32_t scratchCapacity, uint32_t blockTableWidth,
+    uint32_t selectedCountStride, uint32_t blockSize,
+    uint32_t coreCount, bool needPacked, bool clearInvalidRows)
+{
     if (rowsPerRequest == 1) {
-        dsa_staged_single_row_finalize_kernel<<<
-            requestCount, nullptr, stream>>>(
-            static_cast<int32_t*>(localToUnion),
-            static_cast<int32_t*>(selectedCount),
-            static_cast<int32_t*>(requestBlockTable),
-            static_cast<int64_t*>(targetSlots),
-            requestCount, rowWidth, scratchCapacity,
-            blockTableWidth, selectedCountStride, blockSize,
-            needPacked);
+        dsa_prepare_sparse_indices_single_row_impl(
+            stream, topkIndices, splitBoundary, rowReqIndices,
+            requestBlockTable, selectedPacked, selectedCount, targetSlots,
+            localToUnion, requestCount, rowWidth, scratchCapacity,
+            blockTableWidth, selectedCountStride, blockSize, coreCount,
+            needPacked, clearInvalidRows);
         return;
     }
+
+    dsa_staged_compact_rows_kernel<<<coreCount, nullptr, stream>>>(
+        static_cast<int32_t*>(topkIndices),
+        static_cast<int32_t*>(splitBoundary),
+        static_cast<int32_t*>(rowReqIndices),
+        static_cast<int32_t*>(selectedPacked),
+        static_cast<int32_t*>(localToUnion),
+        rowCount, rowWidth, requestCount, rowsPerRequest,
+        scratchCapacity, coreCount, clearInvalidRows);
 
     dsa_staged_production_sort_union_kernel<<<
         requestCount, nullptr, stream>>>(
@@ -3722,6 +3886,59 @@ void dsa_prepare_sparse_indices_staged_impl(
         static_cast<int32_t*>(localToUnion),
         rowCount, rowWidth, rowsPerRequest, scratchCapacity,
         coreCount);
+}
+
+void dsa_prepare_sparse_indices_sharded_impl(
+    void* stream, void* topkIndices, void* splitBoundary,
+    void* rowReqIndices, void* requestBlockTable,
+    void* selectedPacked, void* selectedCount, void* targetSlots,
+    void* localToUnion, void* shardPacked, void* shardMapping,
+    void* shardCounts, uint32_t requestCount,
+    uint32_t rowsPerRequest, uint32_t rowWidth,
+    uint32_t scratchCapacity, uint32_t blockTableWidth,
+    uint32_t selectedCountStride, uint32_t blockSize,
+    uint32_t coreCount, bool needPacked, bool clearInvalidRows)
+{
+    if (rowsPerRequest == 1) {
+        // MTP=1 top-k is unique by contract. Keep the public production
+        // operator uniform, but bypass all shard partition/sort/union work.
+        dsa_prepare_sparse_indices_single_row_impl(
+            stream, topkIndices, splitBoundary, rowReqIndices,
+            requestBlockTable, selectedPacked, selectedCount, targetSlots,
+            localToUnion, requestCount, rowWidth, scratchCapacity,
+            blockTableWidth, selectedCountStride, blockSize, coreCount,
+            needPacked, clearInvalidRows);
+        return;
+    }
+
+    (void)scratchCapacity;
+    const uint32_t shardCount = rowsPerRequest;
+    dsa_staged_production_sharded_sort_kernel<<<
+        shardCount * requestCount, nullptr, stream>>>(
+        static_cast<int32_t*>(topkIndices),
+        static_cast<int32_t*>(splitBoundary),
+        static_cast<int32_t*>(rowReqIndices),
+        static_cast<int32_t*>(shardPacked),
+        static_cast<int32_t*>(shardMapping),
+        static_cast<int32_t*>(shardCounts),
+        requestCount, rowsPerRequest, rowWidth, shardCount,
+        kInt32PerCacheline, shardCount * kInt32PerCacheline);
+    dsa_staged_production_sharded_finalize_kernel<<<
+        requestCount, nullptr, stream>>>(
+        static_cast<int32_t*>(topkIndices),
+        static_cast<int32_t*>(rowReqIndices),
+        static_cast<int32_t*>(selectedPacked),
+        static_cast<int32_t*>(localToUnion),
+        static_cast<int32_t*>(selectedCount),
+        static_cast<int32_t*>(requestBlockTable),
+        static_cast<int64_t*>(targetSlots),
+        static_cast<int32_t*>(shardPacked),
+        static_cast<int32_t*>(shardMapping),
+        static_cast<int32_t*>(shardCounts),
+        requestCount, rowsPerRequest, rowWidth, shardCount,
+        blockTableWidth, selectedCountStride, kInt32PerCacheline,
+        shardCount * kInt32PerCacheline, blockSize, needPacked,
+        clearInvalidRows);
 }
 
 void dsa_staged_hash_union_impl(

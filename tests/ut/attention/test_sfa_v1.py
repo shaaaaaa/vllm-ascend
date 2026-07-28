@@ -788,6 +788,15 @@ class TestStagedSFAGraphPoc(TestBase):
         metadata.decode_union_mapping_workspace = torch.empty(
             batch_size, 4, dtype=torch.int32
         )
+        metadata.decode_shard_packed_workspace = torch.empty(
+            batch_size, 2, 4, dtype=torch.int32
+        )
+        metadata.decode_shard_mapping_workspace = torch.empty_like(
+            metadata.decode_shard_packed_workspace
+        )
+        metadata.decode_shard_counts_workspace = torch.empty(
+            batch_size, 2, 16, dtype=torch.int32
+        )
         metadata.decode_request_ids_compact = [f"req-{row}" for row in range(batch_size)]
         metadata.req_ids = list(metadata.decode_request_ids_compact)
         metadata.decode_remap_boundary = torch.empty(
@@ -1679,6 +1688,15 @@ class TestStagedSFAGraphPoc(TestBase):
         metadata.decode_union_mapping_workspace = torch.empty(
             2, 8, dtype=torch.int32
         )
+        metadata.decode_shard_packed_workspace = torch.empty(
+            2, 2, 8, dtype=torch.int32
+        )
+        metadata.decode_shard_mapping_workspace = torch.empty_like(
+            metadata.decode_shard_packed_workspace
+        )
+        metadata.decode_shard_counts_workspace = torch.empty(
+            2, 2, 16, dtype=torch.int32
+        )
         graph_key = StagedSFAGraphKey.fixed_spec(2, 2)
         context = SimpleNamespace(
             cudagraph_runtime_mode=CUDAGraphMode.PIECEWISE,
@@ -2178,6 +2196,9 @@ class TestAscendSFAMetadataBuilder(TestBase):
             first.decode_selected_counts.data_ptr(),
             first.decode_target_slot_mapping.data_ptr(),
             first.decode_union_mapping_workspace.data_ptr(),
+            first.decode_shard_packed_workspace.data_ptr(),
+            first.decode_shard_mapping_workspace.data_ptr(),
+            first.decode_shard_counts_workspace.data_ptr(),
         )
         assert first.decode_req_indices.tolist() == [0, 0, 1, 1]
         assert first.decode_row_offsets.tolist() == [0, 1, 0, 1]
@@ -2200,6 +2221,9 @@ class TestAscendSFAMetadataBuilder(TestBase):
             second.decode_selected_counts.data_ptr(),
             second.decode_target_slot_mapping.data_ptr(),
             second.decode_union_mapping_workspace.data_ptr(),
+            second.decode_shard_packed_workspace.data_ptr(),
+            second.decode_shard_mapping_workspace.data_ptr(),
+            second.decode_shard_counts_workspace.data_ptr(),
         )
 
         assert second_addresses == addresses

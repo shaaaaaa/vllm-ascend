@@ -524,6 +524,37 @@ class TestPrepareSparseIndices:
                 block_size=64,
             )
 
+    def test_staged_mtp_uses_sharded_operator_with_legacy_env_fallback(
+        self,
+        monkeypatch,
+    ):
+        from vllm_ascend.distributed.kv_transfer.sparse_offload.prepare_sparse_indices import (
+            _sparse_index_op_name,
+        )
+
+        monkeypatch.delenv(
+            "VLLM_ASCEND_DSA_MTP_SHARDED_SORT",
+            raising=False,
+        )
+        assert (
+            _sparse_index_op_name(2)
+            == "npu_dsa_prepare_sparse_indices_sharded_"
+        )
+        assert (
+            _sparse_index_op_name(1)
+            == "npu_dsa_prepare_sparse_indices_sharded_"
+        )
+
+        monkeypatch.setenv("VLLM_ASCEND_DSA_MTP_SHARDED_SORT", "0")
+        assert (
+            _sparse_index_op_name(2)
+            == "npu_dsa_prepare_sparse_indices_staged_"
+        )
+        assert (
+            _sparse_index_op_name(1)
+            == "npu_dsa_prepare_sparse_indices_staged_"
+        )
+
     def test_public_staged_prepare_rejects_mtp_above_two_before_dispatch(self):
         import pytest
 
@@ -560,6 +591,37 @@ class TestPrepareSparseIndices:
                 selected_packed=torch.zeros((1, 4096), dtype=torch.int32),
                 selected_counts=torch.zeros((1, 16), dtype=torch.int32),
                 target_slot_mapping=torch.zeros((1, 4096), dtype=torch.long),
+                block_size=128,
+                staged_mtp=2,
+            )
+
+    def test_public_sharded_prepare_requires_all_caller_owned_workspaces(
+        self,
+        monkeypatch,
+    ):
+        import pytest
+
+        from vllm_ascend.distributed.kv_transfer.sparse_offload.prepare_sparse_indices import (
+            prepare_sparse_indices,
+        )
+
+        monkeypatch.delenv(
+            "VLLM_ASCEND_DSA_MTP_SHARDED_SORT",
+            raising=False,
+        )
+        with pytest.raises(ValueError, match="shard_packed_workspace"):
+            prepare_sparse_indices(
+                torch.zeros((2, 2048), dtype=torch.int32),
+                torch.zeros(2, dtype=torch.int32),
+                row_req_indices=torch.zeros(2, dtype=torch.int32),
+                request_block_table=torch.zeros((1, 32), dtype=torch.int32),
+                selected_packed=torch.zeros((1, 4096), dtype=torch.int32),
+                selected_counts=torch.zeros((1, 16), dtype=torch.int32),
+                target_slot_mapping=torch.zeros((1, 4096), dtype=torch.long),
+                local_to_union_workspace=torch.zeros(
+                    (1, 4096),
+                    dtype=torch.int32,
+                ),
                 block_size=128,
                 staged_mtp=2,
             )
