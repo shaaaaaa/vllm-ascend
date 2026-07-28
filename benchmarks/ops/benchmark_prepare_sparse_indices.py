@@ -521,8 +521,11 @@ def main(
     sharded_sort_buffers = tuple(torch.empty_like(item) for item in hash_buffers)
     sharded_vector_buffers = tuple(torch.empty_like(item) for item in hash_buffers)
     sharded_vector_dedup_buffers = tuple(torch.empty_like(item) for item in hash_buffers)
-    production_staged_buffers = tuple(
-        torch.empty_like(item) for item in hash_buffers
+    production_staged_buffers = (
+        torch.empty_like(hash_buffers[0]),
+        torch.empty_like(hash_buffers[0]),
+        torch.empty_like(hash_buffers[2]),
+        torch.empty_like(hash_buffers[3]),
     )
     shard_count = 1 << (mtp - 1).bit_length()
     sharded_sort_scratch = (
