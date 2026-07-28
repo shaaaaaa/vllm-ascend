@@ -196,8 +196,13 @@ def _run_vector_sharded_union(
         graph = torch.npu.NPUGraph()
         with torch.npu.graph(graph):
             invoke()
-        values.copy_(source.npu())
-        graph.replay()
+        # Replay more than once with the original absolute indices restored.
+        # This catches missing cross-pipeline dependencies that otherwise let
+        # one replay consume mapping or row data left by the previous replay.
+        source_npu = source.npu()
+        for _ in range(3):
+            values.copy_(source_npu)
+            graph.replay()
     else:
         invoke()
     torch.npu.synchronize()

@@ -2009,6 +2009,14 @@ private:
         uint64_t mapOffset,
         uint64_t countOffset)
     {
+        // Publish the union before reusing the CumSum workspace for the dense
+        // scatter.  Keeping this copy adjacent to the GatherMask producer
+        // avoids extending unionLocal's vector-pipeline lifetime across the
+        // following scalar scatter.
+        Sync<AscendC::HardEvent::V_MTE3>();
+        CopyLocalToGlobalExact(
+            shardPacked_[shardOffset], unionLocal, uniqueCount);
+
         // CumSum has completed, so its 64-KiB workspace can be reused as the
         // dense request mapping without increasing peak UB use. Every stage
         // AIV writes only its own shard scratch segment.
@@ -2028,8 +2036,6 @@ private:
 
         Sync<AscendC::HardEvent::S_MTE3>();
         Sync<AscendC::HardEvent::V_MTE3>();
-        CopyLocalToGlobalExact(
-            shardPacked_[shardOffset], unionLocal, uniqueCount);
         AscendC::DataCopy(
             shardMapping_[mapOffset], mapping, requestWidth_);
         shardCounts_.SetValue(
@@ -2642,9 +2648,13 @@ public:
             AscendC::Max(
                 accumMap, accumMap, shardMap, partWidth_);
             AscendC::PipeBarrier<PIPE_V>();
+            // The next iteration reuses shardMap as an MTE2 destination.
+            // PipeBarrier orders only vector instructions; without this
+            // cross-pipe dependency the following DMA may overwrite ranks
+            // that Max is still consuming.
+            Sync<AscendC::HardEvent::V_MTE2>();
         }
 
-        Sync<AscendC::HardEvent::V_MTE2>();
         AscendC::DataCopy(
             input,
             topkIndices_[requestBase + partBegin],
@@ -2871,7 +2881,10 @@ public:
                 topkIndices_[outputOffset + rowOffset],
                 physical,
                 rowWidth_);
-            Sync<AscendC::HardEvent::MTE3_V>();
+            // The next row immediately reuses packed as an MTE2 destination.
+            // Wait on that consumer pipe explicitly instead of relying on a
+            // V-side dependency through a different local tensor.
+            Sync<AscendC::HardEvent::MTE3_MTE2>();
         }
 
         for (uint32_t offset = 0; offset < count; offset += rowWidth_) {
