@@ -1482,7 +1482,7 @@ def test_resident_hybrid_lookup_rows_uses_private_padding_sentinels():
     dummy_state_base = requests
     selected = torch.arange(
         capacity, dtype=torch.int32, device="npu"
-    ).expand(requests, -1)
+    ).repeat(requests, 1)
     counts = torch.zeros(
         (requests, 16), dtype=torch.int32, device="npu"
     )
