@@ -220,6 +220,12 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
     # rows -> 0 = no remap).
     prompt_lens_cpu: Any = None
     request_ids: list[str] | None = None
+    # Stable request-owned rows for the experimental persistent sparse
+    # scratch cache. Padding/graph-dummy rows contain -1.
+    resident_state_indices: torch.Tensor | None = None
+    resident_state_generations: torch.Tensor | None = None
+    resident_state_indices_cpu: Any = None
+    resident_state_generations_cpu: Any = None
 
     # TODO: Remove it when vLLM no longer uses this function.
     def unpadded(self, num_actual_tokens: int, num_actual_reqs: int) -> "AscendCommonAttentionMetadata":
@@ -248,6 +254,26 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
             prefill_context_parallel_metadata=self.prefill_context_parallel_metadata,
             max_seq_len=self.max_seq_len,
             request_ids=(self.request_ids[:num_actual_reqs] if self.request_ids is not None else None),
+            resident_state_indices=(
+                self.resident_state_indices[:num_actual_reqs]
+                if self.resident_state_indices is not None
+                else None
+            ),
+            resident_state_generations=(
+                self.resident_state_generations[:num_actual_reqs]
+                if self.resident_state_generations is not None
+                else None
+            ),
+            resident_state_indices_cpu=(
+                self.resident_state_indices_cpu[:num_actual_reqs]
+                if self.resident_state_indices_cpu is not None
+                else None
+            ),
+            resident_state_generations_cpu=(
+                self.resident_state_generations_cpu[:num_actual_reqs]
+                if self.resident_state_generations_cpu is not None
+                else None
+            ),
         )
 
 
@@ -465,6 +491,7 @@ def wait_for_kv_layer_from_connector(
     target_slot_mapping=None,
     selected_token_counts=None,
     payload_event=None,
+    require_complete_sparse_load: bool = False,
 ):
     if not has_kv_transfer_group() or not is_v1_kv_transfer_group():
         return
@@ -478,6 +505,8 @@ def wait_for_kv_layer_from_connector(
         wait_kwargs["selected_token_counts"] = selected_token_counts
     if payload_event is not None:
         wait_kwargs["payload_event"] = payload_event
+    if require_complete_sparse_load:
+        wait_kwargs["require_complete_sparse_load"] = True
 
     if selected_tokens is not None and request_ids is not None and not should_log:
         try:

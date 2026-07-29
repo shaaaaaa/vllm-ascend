@@ -1029,6 +1029,63 @@ at::Tensor npu_dsa_staged_remap_rows_(
     return local_indices;
 }
 
+at::Tensor npu_dsa_resident_remap_rows_(
+    at::Tensor &topk_indices,
+    const at::Tensor &position_to_union,
+    const at::Tensor &union_to_slot)
+{
+    TORCH_CHECK(topk_indices.is_privateuseone() &&
+                    position_to_union.device() == topk_indices.device() &&
+                    union_to_slot.device() == topk_indices.device(),
+                "resident remap tensors must share one NPU device");
+    TORCH_CHECK(topk_indices.scalar_type() == at::kInt &&
+                    position_to_union.scalar_type() == at::kInt &&
+                    union_to_slot.scalar_type() == at::kInt &&
+                    topk_indices.is_contiguous() &&
+                    position_to_union.is_contiguous() &&
+                    union_to_slot.is_contiguous(),
+                "resident remap tensors must be contiguous int32");
+    TORCH_CHECK(topk_indices.dim() == 2 ||
+                    (topk_indices.dim() == 3 &&
+                     topk_indices.size(1) == 1),
+                "topk_indices must be [rows,k] or [rows,1,k]");
+    TORCH_CHECK(position_to_union.dim() == 2 &&
+                    union_to_slot.dim() == 2,
+                "resident remap maps must be rank two");
+    const int64_t row_count = topk_indices.size(0);
+    const int64_t request_count = union_to_slot.size(0);
+    TORCH_CHECK(request_count > 0 && row_count % request_count == 0,
+                "resident remap rows must be request-major");
+    const int64_t row_width = topk_indices.numel() / row_count;
+    const int64_t rows_per_request = row_count / request_count;
+    const int64_t scratch_capacity = union_to_slot.size(1);
+    TORCH_CHECK(
+        scratch_capacity == rows_per_request * row_width &&
+            position_to_union.numel() ==
+                request_count * scratch_capacity,
+        "resident remap shapes do not match MTP * topk capacity");
+    const c10_npu::OptionalNPUGuard npu_guard(topk_indices.device());
+    aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
+    void* topk_ptr = topk_indices.data_ptr();
+    void* position_ptr = position_to_union.data_ptr();
+    void* slots_ptr = union_to_slot.data_ptr();
+    at_npu::native::OpCommand cmd;
+    cmd.Name("npu_dsa_resident_remap_rows_");
+    cmd.SetCustomHandler([
+        stream, topk_ptr, position_ptr, slots_ptr, row_count,
+        row_width, rows_per_request, scratch_capacity]() -> int {
+        dsa_resident_remap_rows_impl(
+            stream, topk_ptr, position_ptr, slots_ptr,
+            static_cast<uint32_t>(row_count),
+            static_cast<uint32_t>(row_width),
+            static_cast<uint32_t>(rows_per_request),
+            static_cast<uint32_t>(scratch_capacity));
+        return 0;
+    });
+    cmd.Run();
+    return topk_indices;
+}
+
 at::Tensor npu_dsa_staged_unique_finalize_(
     const at::Tensor &unique_keys,
     const at::Tensor &inverse,
@@ -2179,6 +2236,13 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "npu_dsa_staged_remap_rows_",
         torch::kPrivateUse1,
         &vllm_ascend::npu_dsa_staged_remap_rows_);
+    ops.def(
+        "npu_dsa_resident_remap_rows_(Tensor(a!) topk_indices, "
+        "Tensor position_to_union, Tensor union_to_slot) -> Tensor(a!)");
+    ops.impl(
+        "npu_dsa_resident_remap_rows_",
+        torch::kPrivateUse1,
+        &vllm_ascend::npu_dsa_resident_remap_rows_);
     ops.def(
         "npu_dsa_staged_unique_finalize_(Tensor unique_keys, "
         "Tensor inverse, Tensor row_req_indices, "

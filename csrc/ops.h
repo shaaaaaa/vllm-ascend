@@ -220,6 +220,16 @@ namespace vllm_ascend {
     uint32_t row_count,
     uint32_t row_width);
 
+  extern void dsa_resident_remap_rows_impl(
+    void* stream,
+    void* topk_indices,
+    void* position_to_union,
+    void* union_to_slot,
+    uint32_t row_count,
+    uint32_t row_width,
+    uint32_t rows_per_request,
+    uint32_t scratch_capacity);
+
   extern void dsa_staged_unique_finalize_impl(
     void* stream,
     void* unique_keys,

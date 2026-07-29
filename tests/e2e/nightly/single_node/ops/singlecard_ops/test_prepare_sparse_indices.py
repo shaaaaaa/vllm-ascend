@@ -5,6 +5,10 @@ from vllm_ascend.distributed.kv_transfer.sparse_offload.prepare_sparse_indices i
     _prepare_sparse_indices_torch,
     prepare_sparse_indices,
 )
+from vllm_ascend.distributed.kv_transfer.sparse_offload.resident_sparse_cache import (
+    allocate_resident_workspace,
+    prepare_resident_sparse_cache_,
+)
 from vllm_ascend.utils import enable_custom_op
 
 
@@ -44,6 +48,14 @@ def _load_dsa_union_operator():
         "npu_dsa_staged_sharded_vector_dedup_",
     ):
         pytest.fail("vllm_ascend_C does not contain the vector-dedup operator")
+    if not hasattr(
+        torch.ops._C_ascend,
+        "npu_dsa_resident_remap_rows_",
+    ):
+        pytest.fail(
+            "vllm_ascend_C does not contain the resident parallel-map "
+            "operator"
+        )
 
 
 def _buffers(requests: int, capacity: int):
@@ -1226,3 +1238,475 @@ def test_production_staged_remaps_without_building_optional_payload():
     assert actual[1:] == (None, None, None)
     assert counts[0, 0].item() == 0
     assert torch.all(targets == -7)
+
+
+@pytest.mark.parametrize("mtp", [1, 2])
+@pytest.mark.parametrize(
+    "parallel_map",
+    [False, True],
+    ids=["native-map", "parallel-aiv-map"],
+)
+def test_resident_sparse_cache_native_ops_and_graph_replay(
+    mtp,
+    parallel_map,
+):
+    requests = 2
+    # Match the production kernel shape. In particular, this makes the
+    # parallel-map graph test exercise the full 2048-element source row.
+    topk = 2048
+    capacity = mtp * topk
+    union_count = capacity - 8
+    token_stride = 8192
+    block_size = 16
+    state_rows = 2 * requests
+
+    union_seed = torch.stack(
+        [
+            torch.arange(
+                request * 128,
+                request * 128 + capacity,
+                dtype=torch.int32,
+            )
+            for request in range(requests)
+        ]
+    ).npu()
+    selected = union_seed.clone()
+    counts = torch.zeros(
+        (requests, 16), dtype=torch.int32, device="npu"
+    )
+    counts[:, 0] = union_count
+    count_seed = counts.clone()
+    mapping = torch.full(
+        (requests, capacity), -1, dtype=torch.int32, device="npu"
+    )
+    mapping[:, :union_count] = torch.arange(
+        union_count, dtype=torch.int32, device="npu"
+    )
+    topk_seed = torch.arange(
+        requests * capacity, dtype=torch.int32, device="npu"
+    ).reshape(requests * mtp, 1, topk)
+    topk_values = topk_seed.clone()
+    targets = torch.empty(
+        (requests, capacity), dtype=torch.long, device="npu"
+    )
+    block_table = torch.arange(
+        requests * (capacity // block_size),
+        dtype=torch.int32,
+        device="npu",
+    ).reshape(requests, capacity // block_size)
+    states = torch.arange(requests, dtype=torch.int32, device="npu")
+    request_generations = torch.ones(
+        requests, dtype=torch.int64, device="npu"
+    )
+    token_to_slot = torch.full(
+        (state_rows, token_stride),
+        -1,
+        dtype=torch.int16,
+        device="npu",
+    )
+    slot_to_token = torch.full(
+        (state_rows, capacity + 1),
+        -1,
+        dtype=torch.int32,
+        device="npu",
+    )
+    state_generations = torch.full(
+        (state_rows, 8), -1, dtype=torch.int64, device="npu"
+    )
+    workspace = allocate_resident_workspace(
+        requests, capacity, device=torch.device("npu")
+    )
+
+    def invoke():
+        prepare_resident_sparse_cache_(
+            topk_values,
+            mapping,
+            selected,
+            counts,
+            targets,
+            block_table,
+            states,
+            request_generations,
+            token_to_slot,
+            slot_to_token,
+            state_generations,
+            workspace,
+            block_size=block_size,
+            scratch_capacity=capacity,
+            parallel_map=parallel_map,
+        )
+
+    persistent_addresses = (
+        token_to_slot.data_ptr(),
+        slot_to_token.data_ptr(),
+        state_generations.data_ptr(),
+    )
+    workspace_addresses = tuple(
+        value.data_ptr()
+        for value in vars(workspace).values()
+        if isinstance(value, torch.Tensor)
+    )
+    graph = torch.npu.NPUGraph()
+    with torch.npu.graph(graph):
+        invoke()
+
+    # Cold replay: every union token is a miss.
+    token_to_slot.fill_(-1)
+    slot_to_token.fill_(-1)
+    state_generations.fill_(-1)
+    selected.copy_(union_seed)
+    counts.copy_(count_seed)
+    topk_values.copy_(topk_seed)
+    graph.replay()
+    torch.npu.synchronize()
+    assert counts[:, 0].cpu().tolist() == [union_count] * requests
+    assert torch.equal(
+        selected[:, :union_count].cpu(),
+        union_seed[:, :union_count].cpu(),
+    )
+
+    # Warm replay: all tokens hit, so LMCache receives an empty payload while
+    # the original positions still map to their resident slots.
+    selected.copy_(union_seed)
+    counts.copy_(count_seed)
+    topk_values.copy_(topk_seed)
+    graph.replay()
+    torch.npu.synchronize()
+    assert counts[:, 0].cpu().tolist() == [0] * requests
+    assert torch.equal(
+        topk_values.reshape(requests, capacity)[:, :union_count].cpu(),
+        torch.arange(union_count, dtype=torch.int32)
+        .expand(requests, -1),
+    )
+    assert persistent_addresses == (
+        token_to_slot.data_ptr(),
+        slot_to_token.data_ptr(),
+        state_generations.data_ptr(),
+    )
+    assert workspace_addresses == tuple(
+        value.data_ptr()
+        for value in vars(workspace).values()
+        if isinstance(value, torch.Tensor)
+    )
+
+
+@pytest.mark.parametrize("mtp", [1, 2])
+@pytest.mark.parametrize("request_count", [1, 4])
+@pytest.mark.parametrize("capture_graph", [False, True])
+def test_resident_parallel_map_matches_tensor_reference(
+    mtp,
+    request_count,
+    capture_graph,
+):
+    topk = 2048
+    capacity = mtp * topk
+    row_count = request_count * mtp
+    source = (
+        torch.arange(row_count * topk, dtype=torch.int32)
+        .reshape(row_count, 1, topk)
+        + 50000
+    )
+    positions = torch.arange(capacity, dtype=torch.int32).expand(
+        request_count, -1
+    )
+    selected_mask = positions.remainder(3) != 0
+    # Multiplication by an odd number is a permutation modulo a power-of-two
+    # capacity. This exercises non-monotonic union ranks.
+    ranks = positions.mul(17).remainder(capacity)
+    position_to_union = torch.where(
+        selected_mask,
+        ranks,
+        torch.full_like(ranks, -1),
+    )
+    union_to_slot = torch.arange(
+        capacity - 1,
+        -1,
+        -1,
+        dtype=torch.int32,
+    ).expand(request_count, -1)
+    union_to_slot = (
+        union_to_slot
+        + torch.arange(request_count, dtype=torch.int32).reshape(-1, 1)
+        * capacity
+    )
+    expected = source.reshape(request_count, capacity).clone()
+    expected.copy_(
+        torch.where(
+            selected_mask,
+            torch.gather(union_to_slot, 1, ranks.to(torch.long)),
+            expected,
+        )
+    )
+
+    values = source.npu()
+    mapping_npu = position_to_union.npu()
+    slots_npu = union_to_slot.npu()
+
+    def invoke():
+        torch.ops._C_ascend.npu_dsa_resident_remap_rows_(
+            values,
+            mapping_npu,
+            slots_npu,
+        )
+
+    if capture_graph:
+        graph = torch.npu.NPUGraph()
+        with torch.npu.graph(graph):
+            invoke()
+        values.copy_(source.npu())
+        mapping_npu.copy_(position_to_union.npu())
+        slots_npu.copy_(union_to_slot.npu())
+        graph.replay()
+    else:
+        invoke()
+    torch.npu.synchronize()
+    assert torch.equal(
+        values.cpu().reshape(request_count, capacity),
+        expected,
+    )
+
+
+def _resident_production_fixture(mtp, request_count=2):
+    topk = 2048
+    capacity = mtp * topk
+    row_count = request_count * mtp
+    shared = torch.arange(topk // 2, dtype=torch.int32)
+    request_rows = torch.stack(
+        [
+            torch.cat(
+                (
+                    shared,
+                    torch.arange(
+                        topk // 2 + row * topk // 2,
+                        topk // 2 + (row + 1) * topk // 2,
+                        dtype=torch.int32,
+                    ),
+                )
+            )
+            for row in range(mtp)
+        ]
+    )
+    source = request_rows.repeat(request_count, 1).unsqueeze(1)
+    split_boundary = int(source.max()) - 100
+    boundaries = torch.full(
+        (row_count,), split_boundary, dtype=torch.int32, device="npu"
+    )
+    row_requests = torch.arange(
+        request_count, dtype=torch.int32, device="npu"
+    ).repeat_interleave(mtp)
+    block_size = 128
+    max_tokens = 131072
+    block_table = torch.arange(
+        request_count * max_tokens // block_size,
+        dtype=torch.int32,
+        device="npu",
+    ).reshape(request_count, max_tokens // block_size)
+    values = source.npu()
+    selected, counts, targets = _buffers(request_count, capacity)
+    mapping = torch.empty_like(selected)
+    shard_packed = torch.empty(
+        (request_count, 2, capacity),
+        dtype=torch.int32,
+        device="npu",
+    )
+    shard_mapping = torch.empty_like(shard_packed)
+    shard_counts = torch.empty(
+        (request_count, 2, 16),
+        dtype=torch.int32,
+        device="npu",
+    )
+    token_stride = 131104
+    slot_stride = ((capacity + 16) // 16) * 16
+    token_to_slot = torch.full(
+        (2 * request_count, token_stride),
+        -1,
+        dtype=torch.int16,
+        device="npu",
+    )
+    slot_to_token = torch.full(
+        (2 * request_count, slot_stride),
+        -1,
+        dtype=torch.int32,
+        device="npu",
+    )
+    state_generations = torch.ones(
+        (2 * request_count, 8),
+        dtype=torch.int64,
+        device="npu",
+    )
+    states = torch.arange(
+        request_count, dtype=torch.int32, device="npu"
+    )
+    request_generations = torch.ones(
+        request_count, dtype=torch.int64, device="npu"
+    )
+    workspace = allocate_resident_workspace(
+        request_count, capacity, device=torch.device("npu")
+    )
+
+    def union():
+        values.copy_(source.npu())
+        prepare_sparse_indices(
+            values,
+            boundaries,
+            row_req_indices=row_requests,
+            request_block_table=block_table,
+            selected_packed=selected,
+            selected_counts=counts,
+            target_slot_mapping=targets,
+            block_size=block_size,
+            need_packed=True,
+            clear_invalid_rows=True,
+            local_to_union_workspace=mapping,
+            shard_packed_workspace=shard_packed,
+            shard_mapping_workspace=shard_mapping,
+            shard_counts_workspace=shard_counts,
+            staged_mtp=mtp,
+        )
+
+    def resident():
+        prepare_resident_sparse_cache_(
+            values,
+            mapping,
+            selected,
+            counts,
+            targets,
+            block_table,
+            states,
+            request_generations,
+            token_to_slot,
+            slot_to_token,
+            state_generations,
+            workspace,
+            block_size=block_size,
+            scratch_capacity=capacity,
+            parallel_map=True,
+        )
+
+    return {
+        "topk": topk,
+        "capacity": capacity,
+        "source": source,
+        "boundaries": boundaries,
+        "values": values,
+        "selected": selected,
+        "counts": counts,
+        "targets": targets,
+        "mapping": mapping,
+        "block_table": block_table,
+        "token_to_slot": token_to_slot,
+        "slot_to_token": slot_to_token,
+        "state_generations": state_generations,
+        "request_generations": request_generations,
+        "union": union,
+        "resident": resident,
+    }
+
+
+@pytest.mark.parametrize("mtp", [1, 2])
+def test_resident_production_pipeline_partial_hits_all_hits_and_generation(
+    mtp,
+):
+    fixture = _resident_production_fixture(mtp)
+    request_count = fixture["selected"].shape[0]
+    capacity = fixture["capacity"]
+    fixture["union"]()
+    torch.npu.synchronize()
+    union_seed = fixture["selected"].clone()
+    count_seed = fixture["counts"].clone()
+    union_count = int(count_seed[0, 0].item())
+    assert fixture["counts"][:, 0].cpu().tolist() == [
+        union_count
+    ] * request_count
+
+    # Put half the union in high-numbered scratch slots. Misses must use the
+    # lowest unprotected slots, while hits retain their existing slots.
+    hit_count = union_count // 2
+    hit_slots = torch.arange(
+        capacity - hit_count,
+        capacity,
+        dtype=torch.int16,
+        device="npu",
+    ).expand(request_count, -1)
+    hit_tokens = union_seed[:, :hit_count].to(torch.long)
+    request_rows = torch.arange(
+        request_count, dtype=torch.long, device="npu"
+    ).reshape(-1, 1)
+    fixture["token_to_slot"][request_rows, hit_tokens] = hit_slots
+    fixture["slot_to_token"][
+        :request_count, capacity - hit_count : capacity
+    ].copy_(union_seed[:, :hit_count])
+
+    fixture["resident"]()
+    torch.npu.synchronize()
+    miss_count = union_count - hit_count
+    assert fixture["counts"][:, 0].cpu().tolist() == [
+        miss_count
+    ] * request_count
+    assert torch.equal(
+        fixture["selected"][:, :miss_count].cpu(),
+        union_seed[:, hit_count:union_count].cpu(),
+    )
+    for request in range(request_count):
+        assert torch.equal(
+            fixture["targets"][request, :miss_count].cpu(),
+            torch.arange(miss_count, dtype=torch.long)
+            + request * 131072,
+        )
+
+    source_rows = fixture["source"].reshape(request_count, capacity)
+    remapped = fixture["values"].reshape(request_count, capacity)
+    boundary_rows = fixture["boundaries"].cpu().reshape(
+        request_count, mtp, 1
+    )
+    selected_mask = (
+        fixture["source"].reshape(request_count, mtp, -1)
+        < boundary_rows
+    ).reshape(request_count, capacity)
+    safe_slots = torch.where(
+        selected_mask.npu(),
+        remapped,
+        torch.zeros_like(remapped),
+    )
+    reconstructed = torch.gather(
+        fixture["slot_to_token"][:request_count, :capacity],
+        1,
+        safe_slots.to(torch.long),
+    )
+    assert torch.equal(
+        reconstructed[selected_mask.npu()].cpu(),
+        source_rows[selected_mask].cpu(),
+    )
+    assert torch.equal(
+        remapped[~selected_mask.npu()].cpu(),
+        source_rows[~selected_mask].cpu(),
+    )
+
+    # The next identical step is entirely resident.
+    fixture["union"]()
+    fixture["resident"]()
+    torch.npu.synchronize()
+    assert fixture["counts"][:, 0].cpu().tolist() == [0] * request_count
+
+    # Reusing the state row with a new generation invalidates every old hit.
+    fixture["request_generations"].fill_(2)
+    fixture["union"]()
+    fixture["resident"]()
+    torch.npu.synchronize()
+    assert fixture["counts"][:, 0].cpu().tolist() == [
+        union_count
+    ] * request_count
+
+
+@pytest.mark.parametrize("mtp", [1, 2])
+def test_resident_production_pipeline_zero_split_boundary_is_noop(mtp):
+    fixture = _resident_production_fixture(mtp)
+    fixture["boundaries"].zero_()
+    fixture["union"]()
+    fixture["resident"]()
+    torch.npu.synchronize()
+
+    assert fixture["counts"][:, 0].cpu().tolist() == [
+        0
+    ] * fixture["selected"].shape[0]
+    assert torch.equal(fixture["values"].cpu(), fixture["source"])

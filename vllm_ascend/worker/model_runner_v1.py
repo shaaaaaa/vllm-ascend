@@ -120,6 +120,10 @@ from vllm_ascend.compilation.acl_graph import (
     set_graph_params,
     update_full_graph_params,
 )
+from vllm_ascend.distributed.kv_transfer.sparse_offload.resident_sparse_cache import (
+    MAX_INT16_SCRATCH_CAPACITY,
+    ResidentRequestStateRegistry,
+)
 from vllm_ascend.eplb.adaptor.vllm_adaptor import VllmEplbAdaptor
 from vllm_ascend.eplb.core.eplb_device_transfer_loader import D2DExpertWeightLoader
 from vllm_ascend.eplb.core.eplb_worker import EplbProcess
@@ -659,6 +663,41 @@ class NPUModelRunner(GPUModelRunner):
             self.cudagraph_batch_sizes = []
         self.mamba_state_idx: dict[str, int] = {}
         self._mamba_copy_bufs: mamba_utils.MambaCopyBuffers | None = None
+        # Persistent scratch residency is the production shrink-latent path.
+        self.dsa_resident_cache = bool(self.dsa_shrink_latent)
+        self._resident_state_registry: ResidentRequestStateRegistry | None = None
+        self._resident_state_indices = None
+        self._resident_state_generations = None
+        self._resident_scratch_capacity = (
+            self.decode_threshold * self.dsa_index_topk
+        )
+        if self.dsa_resident_cache:
+            if not (
+                0
+                < self._resident_scratch_capacity
+                < MAX_INT16_SCRATCH_CAPACITY
+            ):
+                raise ValueError(
+                    "resident sparse cache stores scratch slots in signed "
+                    "int16 and requires 0 < MTP * index_topk < "
+                    f"{MAX_INT16_SCRATCH_CAPACITY}; got "
+                    f"{self._resident_scratch_capacity}"
+                )
+            self._resident_state_registry = ResidentRequestStateRegistry(
+                self.max_num_reqs
+            )
+            self._resident_state_indices = self._make_buffer(
+                self.max_num_reqs, dtype=torch.int32
+            )
+            self._resident_state_generations = self._make_buffer(
+                self.max_num_reqs, dtype=torch.int64
+            )
+            logger.info(
+                "DSA resident sparse scratch enabled: capacity=%d, "
+                "state_slots=%d.",
+                self._resident_scratch_capacity,
+                self.max_num_reqs,
+            )
 
     @property
     def use_cp(self) -> bool:
@@ -669,6 +708,73 @@ class NPUModelRunner(GPUModelRunner):
 
     def _sync_device(self) -> None:
         torch.npu.synchronize()
+
+    def _update_states(self, scheduler_output: SchedulerOutput) -> None:
+        registry = self._resident_state_registry
+        if registry is not None:
+            registry.release(tuple(scheduler_output.finished_req_ids))
+        super()._update_states(scheduler_output)
+
+    def _prepare_resident_request_state(
+        self,
+        *,
+        num_reqs: int,
+        num_reqs_padded: int,
+        is_dummy: bool,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None, Any, Any]:
+        registry = self._resident_state_registry
+        indices = self._resident_state_indices
+        generations = self._resident_state_generations
+        if registry is None or indices is None or generations is None:
+            return None, None, None, None
+
+        indices.np[:num_reqs_padded].fill(-1)
+        generations.np[:num_reqs_padded].fill(-1)
+        if not is_dummy and num_reqs:
+            request_ids = tuple(self.input_batch.req_ids[:num_reqs])
+            if any(request_id is None for request_id in request_ids):
+                raise RuntimeError(
+                    "resident sparse cache received an empty request id"
+                )
+            block_table = self.input_batch.block_table[0]
+            scratch_blocks = cdiv(
+                self._resident_scratch_capacity,
+                block_table.block_size,
+            )
+            signatures = []
+            for row in range(num_reqs):
+                if block_table.num_blocks_per_row[row] < scratch_blocks:
+                    raise RuntimeError(
+                        "resident sparse cache scratch prefix is not fully "
+                        f"allocated for request row {row}: needs "
+                        f"{scratch_blocks} blocks, has "
+                        f"{block_table.num_blocks_per_row[row]}"
+                    )
+                signatures.append(
+                    tuple(
+                        map(
+                            int,
+                            block_table.block_table.np[
+                                row, :scratch_blocks
+                            ],
+                        )
+                    )
+                )
+            state_rows, state_generations = registry.bind(
+                request_ids,  # type: ignore[arg-type]
+                signatures,
+            )
+            indices.np[:num_reqs] = state_rows
+            generations.np[:num_reqs] = state_generations
+
+        indices.copy_to_gpu(num_reqs_padded)
+        generations.copy_to_gpu(num_reqs_padded)
+        return (
+            indices.gpu[:num_reqs_padded],
+            generations.gpu[:num_reqs_padded],
+            indices.np[:num_reqs_padded],
+            generations.np[:num_reqs_padded],
+        )
 
     def _set_up_drafter(self):
         # Set up speculative decoding.
@@ -2735,6 +2841,17 @@ class NPUModelRunner(GPUModelRunner):
                 num_reqs
             )
 
+        (
+            resident_state_indices,
+            resident_state_generations,
+            resident_state_indices_cpu,
+            resident_state_generations_cpu,
+        ) = self._prepare_resident_request_state(
+            num_reqs=num_reqs,
+            num_reqs_padded=num_reqs_padded,
+            is_dummy=staged_sfa_graph_dummy_run,
+        )
+
         cm_base = AscendCommonAttentionMetadata(
             query_start_loc=self.query_start_loc.gpu[: num_reqs_padded + 1],
             query_start_loc_cpu=self.query_start_loc.cpu[: num_reqs_padded + 1],
@@ -2771,6 +2888,10 @@ class NPUModelRunner(GPUModelRunner):
                     else None
                 )
             ),
+            resident_state_indices=resident_state_indices,
+            resident_state_generations=resident_state_generations,
+            resident_state_indices_cpu=resident_state_indices_cpu,
+            resident_state_generations_cpu=resident_state_generations_cpu,
         )
 
         if logits_indices is not None and self.cache_config.kv_sharing_fast_prefill:

@@ -3116,6 +3116,129 @@ private:
     uint32_t rowWidth_ = 0;
 };
 
+// Resident mapping is position-sharded: one AIV owns one complete source
+// top-k row. Each output row is cacheline aligned and has a single writer.
+class DSAResidentRemapRowsKernel {
+public:
+    __aicore__ inline void Init(
+        __gm__ int32_t* topkIndices,
+        __gm__ int32_t* positionToUnion,
+        __gm__ int32_t* unionToSlot,
+        uint32_t rowCount,
+        uint32_t rowWidth,
+        uint32_t rowsPerRequest,
+        uint32_t scratchCapacity)
+    {
+        rowCount_ = rowCount;
+        rowWidth_ = rowWidth;
+        rowsPerRequest_ = rowsPerRequest;
+        scratchCapacity_ = scratchCapacity;
+        topkIndices_.SetGlobalBuffer(
+            topkIndices,
+            static_cast<uint64_t>(rowCount_) * rowWidth_);
+        positionToUnion_.SetGlobalBuffer(
+            positionToUnion,
+            static_cast<uint64_t>(rowCount_) * rowWidth_);
+        const uint32_t requestCount = rowCount_ / rowsPerRequest_;
+        unionToSlot_.SetGlobalBuffer(
+            unionToSlot,
+            static_cast<uint64_t>(requestCount) * scratchCapacity_);
+        pipe_.InitBuffer(inputBuf_, rowWidth_ * sizeof(int32_t));
+        pipe_.InitBuffer(rankBuf_, rowWidth_ * sizeof(int32_t));
+        pipe_.InitBuffer(clampedBuf_, rowWidth_ * sizeof(int32_t));
+        pipe_.InitBuffer(outputBuf_, rowWidth_ * sizeof(int32_t));
+        pipe_.InitBuffer(offsetBuf_, rowWidth_ * sizeof(uint32_t));
+        pipe_.InitBuffer(
+            unionBuf_, scratchCapacity_ * sizeof(int32_t));
+        pipe_.InitBuffer(selectedMaskBuf_, rowWidth_ / 8);
+    }
+
+    __aicore__ inline void Process()
+    {
+        const uint32_t row = AscendC::GetBlockIdx();
+        if (row >= rowCount_) {
+            return;
+        }
+        const uint32_t request = row / rowsPerRequest_;
+        const uint64_t rowOffset =
+            static_cast<uint64_t>(row) * rowWidth_;
+        const uint64_t unionOffset =
+            static_cast<uint64_t>(request) * scratchCapacity_;
+        auto input = inputBuf_.Get<int32_t>();
+        auto ranks = rankBuf_.Get<int32_t>();
+        auto clamped = clampedBuf_.Get<int32_t>();
+        auto output = outputBuf_.Get<int32_t>();
+        auto offsets = offsetBuf_.Get<uint32_t>();
+        auto unionSlots = unionBuf_.Get<int32_t>();
+        auto selectedMask = selectedMaskBuf_.Get<uint8_t>();
+        AscendC::DataCopy(
+            input, topkIndices_[rowOffset], rowWidth_);
+        AscendC::DataCopy(
+            ranks, positionToUnion_[rowOffset], rowWidth_);
+        AscendC::DataCopy(
+            unionSlots, unionToSlot_[unionOffset], scratchCapacity_);
+        Sync<AscendC::HardEvent::MTE2_V>();
+
+        AscendC::Maxs(
+            clamped, ranks, static_cast<int32_t>(0), rowWidth_);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Compare(
+            selectedMask,
+            clamped,
+            ranks,
+            AscendC::CMPMODE::EQ,
+            rowWidth_);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Mins(
+            clamped,
+            clamped,
+            static_cast<int32_t>(scratchCapacity_ - 1),
+            rowWidth_);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Muls(
+            offsets.ReinterpretCast<int32_t>(),
+            clamped,
+            static_cast<int32_t>(sizeof(int32_t)),
+            rowWidth_);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Gather(
+            output,
+            unionSlots,
+            offsets,
+            static_cast<uint32_t>(0),
+            rowWidth_);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Select(
+            output.ReinterpretCast<float>(),
+            selectedMask,
+            output.ReinterpretCast<float>(),
+            input.ReinterpretCast<float>(),
+            AscendC::SELMODE::VSEL_TENSOR_TENSOR_MODE,
+            rowWidth_);
+        AscendC::PipeBarrier<PIPE_V>();
+        Sync<AscendC::HardEvent::V_MTE3>();
+        AscendC::DataCopy(
+            topkIndices_[rowOffset], output, rowWidth_);
+    }
+
+private:
+    AscendC::GlobalTensor<int32_t> topkIndices_;
+    AscendC::GlobalTensor<int32_t> positionToUnion_;
+    AscendC::GlobalTensor<int32_t> unionToSlot_;
+    AscendC::TPipe pipe_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> inputBuf_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> rankBuf_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> clampedBuf_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> outputBuf_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> offsetBuf_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> unionBuf_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> selectedMaskBuf_;
+    uint32_t rowCount_ = 0;
+    uint32_t rowWidth_ = 0;
+    uint32_t rowsPerRequest_ = 0;
+    uint32_t scratchCapacity_ = 0;
+};
+
 class DSAStagedUniqueFinalizeKernel {
 public:
     __aicore__ inline void Init(
@@ -3748,6 +3871,24 @@ extern "C" __global__ __aicore__ void dsa_staged_remap_rows_kernel(
     }
 }
 
+extern "C" __global__ __aicore__ void dsa_resident_remap_rows_kernel(
+    __gm__ int32_t* topkIndices,
+    __gm__ int32_t* positionToUnion,
+    __gm__ int32_t* unionToSlot,
+    uint32_t rowCount,
+    uint32_t rowWidth,
+    uint32_t rowsPerRequest,
+    uint32_t scratchCapacity)
+{
+    if ASCEND_IS_AIV {
+        DSAResidentRemapRowsKernel op;
+        op.Init(
+            topkIndices, positionToUnion, unionToSlot, rowCount,
+            rowWidth, rowsPerRequest, scratchCapacity);
+        op.Process();
+    }
+}
+
 extern "C" __global__ __aicore__ void dsa_staged_unique_finalize_kernel(
     __gm__ int32_t* uniqueKeys,
     __gm__ int32_t* inverseWords,
@@ -4121,6 +4262,18 @@ void dsa_staged_remap_rows_impl(
     dsa_staged_remap_rows_kernel<<<rowCount, nullptr, stream>>>(
         static_cast<int32_t*>(localIndices),
         static_cast<int32_t*>(localToUnion), rowCount, rowWidth);
+}
+
+void dsa_resident_remap_rows_impl(
+    void* stream, void* topkIndices, void* positionToUnion,
+    void* unionToSlot, uint32_t rowCount, uint32_t rowWidth,
+    uint32_t rowsPerRequest, uint32_t scratchCapacity)
+{
+    dsa_resident_remap_rows_kernel<<<rowCount, nullptr, stream>>>(
+        static_cast<int32_t*>(topkIndices),
+        static_cast<int32_t*>(positionToUnion),
+        static_cast<int32_t*>(unionToSlot),
+        rowCount, rowWidth, rowsPerRequest, scratchCapacity);
 }
 
 void dsa_staged_unique_finalize_impl(
