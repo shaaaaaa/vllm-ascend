@@ -174,11 +174,14 @@ class ResidentSparseWorkspace:
     state_slot_indices: torch.Tensor
     gather_indices: torch.Tensor
     safe_states: torch.Tensor
+    dummy_states: torch.Tensor
+    state_token_bases: torch.Tensor
+    state_slot_bases: torch.Tensor
+    state_generation_indices: torch.Tensor
     current_generations: torch.Tensor
     generation_matches: torch.Tensor
     valid_states: torch.Tensor
     slot_ids: torch.Tensor
-    row_ids: torch.Tensor
     int_sources: torch.Tensor
     short_sources: torch.Tensor
 
@@ -229,6 +232,19 @@ def allocate_resident_workspace(
         safe_states=torch.empty(
             max_requests, dtype=torch.long, device=device
         ),
+        dummy_states=(
+            torch.arange(max_requests, dtype=torch.long, device=device)
+            + max_requests
+        ),
+        state_token_bases=torch.empty(
+            max_requests, dtype=torch.long, device=device
+        ),
+        state_slot_bases=torch.empty(
+            max_requests, dtype=torch.long, device=device
+        ),
+        state_generation_indices=torch.empty(
+            max_requests, dtype=torch.long, device=device
+        ),
         current_generations=torch.empty(
             max_requests, dtype=torch.long, device=device
         ),
@@ -241,9 +257,6 @@ def allocate_resident_workspace(
         slot_ids=torch.arange(
             scratch_capacity, dtype=torch.int32, device=device
         ).expand(max_requests, -1),
-        row_ids=torch.arange(
-            max_requests, dtype=torch.long, device=device
-        ).reshape(-1, 1),
         int_sources=torch.empty(shape, dtype=torch.int32, device=device),
         short_sources=torch.empty(shape, dtype=torch.int16, device=device),
     )
@@ -333,11 +346,16 @@ def prepare_resident_sparse_cache_(
     state_slot_indices = workspace.state_slot_indices[:request_count]
     gather_indices = workspace.gather_indices[:request_count]
     safe_states = workspace.safe_states[:request_count]
+    dummy_states = workspace.dummy_states[:request_count]
+    state_token_bases = workspace.state_token_bases[:request_count]
+    state_slot_bases = workspace.state_slot_bases[:request_count]
+    state_generation_indices = (
+        workspace.state_generation_indices[:request_count]
+    )
     current_generations = workspace.current_generations[:request_count]
     generation_matches = workspace.generation_matches[:request_count]
     valid_states = workspace.valid_states[:request_count]
     slot_ids = workspace.slot_ids[:request_count]
-    row_ids = workspace.row_ids[:request_count]
     int_sources = workspace.int_sources[:request_count]
     short_sources = workspace.short_sources[:request_count]
 
@@ -348,13 +366,12 @@ def prepare_resident_sparse_cache_(
     )
     token_stride = int(token_to_slot.shape[1])
     slot_stride = int(slot_to_token.shape[1])
-    dummy_base = int(token_to_slot.shape[0]) - int(
-        workspace.slot_ids.shape[0]
-    )
-    if dummy_base < request_count:
+    max_requests = int(workspace.slot_ids.shape[0])
+    dummy_base = int(token_to_slot.shape[0]) - max_requests
+    if dummy_base != max_requests:
         raise ValueError(
-            "resident persistent maps need one cacheline-private dummy row "
-            "per maximum batch request"
+            "resident persistent maps need exactly one real and one "
+            "cacheline-private dummy row per maximum batch request"
         )
     if slot_to_token.shape[0] != token_to_slot.shape[0]:
         raise ValueError("resident persistent maps have different state rows")
@@ -368,24 +385,25 @@ def prepare_resident_sparse_cache_(
     union_tokens.copy_(selected_packed)
     torch.lt(slot_ids, counts.reshape(-1, 1), out=valid_union)
 
-    safe_states.copy_(request_state_indices)
-    current_generations.copy_(row_ids.reshape(-1))
-    current_generations.add_(dummy_base)
     torch.ge(request_state_indices, 0, out=valid_states)
     torch.where(
         valid_states,
-        safe_states,
-        current_generations,
+        request_state_indices,
+        dummy_states,
         out=safe_states,
     )
-    gather_indices.reshape(-1)[:request_count].copy_(safe_states)
-    gather_indices.reshape(-1)[:request_count].mul_(
+    state_token_bases.copy_(safe_states)
+    state_token_bases.mul_(token_stride)
+    state_slot_bases.copy_(safe_states)
+    state_slot_bases.mul_(slot_stride)
+    state_generation_indices.copy_(safe_states)
+    state_generation_indices.mul_(
         int(state_generations.shape[1])
     )
     torch.gather(
         state_generations.reshape(-1),
         0,
-        gather_indices.reshape(-1)[:request_count],
+        state_generation_indices,
         out=current_generations,
     )
     torch.eq(
@@ -398,8 +416,7 @@ def prepare_resident_sparse_cache_(
     # Materialize and logically clear every slot row whose owner generation
     # changed. This prevents an unoverwritten stale slot from becoming a hit
     # on a later step of the new request.
-    state_slot_indices.copy_(safe_states.reshape(-1, 1))
-    state_slot_indices.mul_(slot_stride)
+    state_slot_indices.copy_(state_slot_bases.reshape(-1, 1))
     state_slot_indices.add_(slot_ids)
     _flat_gather(slot_to_token, state_slot_indices, candidate_tokens)
     int_sources.fill_(-1)
@@ -420,8 +437,7 @@ def prepare_resident_sparse_cache_(
     gather_indices.copy_(union_tokens)
     torch.logical_not(valid_union, out=miss_mask)
     gather_indices.masked_fill_(miss_mask, 0)
-    state_token_indices.copy_(safe_states.reshape(-1, 1))
-    state_token_indices.mul_(token_stride)
+    state_token_indices.copy_(state_token_bases.reshape(-1, 1))
     state_token_indices.add_(gather_indices)
     _flat_gather(token_to_slot, state_token_indices, old_slots_i16)
     old_slots.copy_(old_slots_i16)
@@ -430,17 +446,17 @@ def prepare_resident_sparse_cache_(
     # int16 reverse entries harmless and avoids clearing the 130K-token row.
     gather_indices.copy_(old_slots)
     gather_indices.clamp_(min=0, max=scratch_capacity - 1)
-    state_slot_indices.copy_(safe_states.reshape(-1, 1))
-    state_slot_indices.mul_(slot_stride)
+    state_slot_indices.copy_(state_slot_bases.reshape(-1, 1))
     state_slot_indices.add_(gather_indices)
     _flat_gather(slot_to_token, state_slot_indices, candidate_tokens)
     torch.eq(candidate_tokens, union_tokens, out=hit_mask)
     hit_mask.logical_and_(valid_union)
     torch.ge(old_slots, 0, out=miss_mask)
     hit_mask.logical_and_(miss_mask)
-    torch.lt(old_slots, scratch_capacity, out=miss_mask)
-    hit_mask.logical_and_(miss_mask)
-    hit_mask.logical_and_(generation_matches.reshape(-1, 1))
+    # Every published reverse entry is either -1 or a slot below capacity.
+    # A generation mismatch has also cleared this row's forward map above, so
+    # neither the upper-bound comparison nor another generation mask can
+    # reject an additional hit.
 
     # protected[request, slot] is private to one request row; all invalid
     # entries scatter to that same row's sentinel at index capacity.
@@ -449,7 +465,7 @@ def prepare_resident_sparse_cache_(
     torch.logical_not(hit_mask, out=available_mask)
     gather_indices.masked_fill_(available_mask, scratch_capacity)
     int_sources.copy_(hit_mask)
-    protected.scatter_add_(1, gather_indices, int_sources)
+    protected.scatter_(1, gather_indices, int_sources)
     torch.eq(protected[:, :scratch_capacity], 0, out=available_mask)
     torch.cumsum(
         available_mask,
@@ -459,7 +475,6 @@ def prepare_resident_sparse_cache_(
     )
 
     # Invert the ascending free-slot prefix without a scalar/token loop.
-    available_by_rank.fill_(scratch_capacity)
     gather_indices.copy_(available_prefix)
     gather_indices.sub_(1)
     torch.logical_not(available_mask, out=miss_mask)
@@ -478,21 +493,20 @@ def prepare_resident_sparse_cache_(
     gather_indices.sub_(1)
     torch.logical_not(miss_mask, out=available_mask)
     gather_indices.masked_fill_(available_mask, scratch_capacity)
-    state_slot_indices.copy_(row_ids)
-    state_slot_indices.mul_(int(available_by_rank.shape[1]))
-    state_slot_indices.add_(gather_indices)
-    _flat_gather(
+    torch.gather(
         available_by_rank,
-        state_slot_indices,
-        int_sources,
+        1,
+        gather_indices,
+        out=int_sources,
     )
+    # Only miss positions consume gathered free-slot ranks. Hit/padding
+    # positions read the shared sentinel and are discarded below.
+    int_sources.masked_fill_(available_mask, -1)
     torch.where(hit_mask, old_slots, int_sources, out=union_to_slot)
-    torch.logical_not(valid_union, out=available_mask)
-    union_to_slot.masked_fill_(available_mask, -1)
 
     # Compact misses and their assigned slots in union order.
-    miss_payload.zero_()
-    miss_slot_payload.zero_()
+    # Every consumed prefix position is written exactly once. Tails are
+    # intentionally unspecified and ignored through selected_counts.
     miss_payload.scatter_(1, gather_indices, union_tokens)
     miss_slot_payload.scatter_(1, gather_indices, int_sources)
     selected_packed.copy_(miss_payload[:, :scratch_capacity])
@@ -501,13 +515,11 @@ def prepare_resident_sparse_cache_(
     # Invalidate overwritten reverse entries, then publish both directions.
     gather_indices.copy_(int_sources)
     gather_indices.clamp_(min=0, max=scratch_capacity - 1)
-    state_slot_indices.copy_(safe_states.reshape(-1, 1))
-    state_slot_indices.mul_(slot_stride)
+    state_slot_indices.copy_(state_slot_bases.reshape(-1, 1))
     state_slot_indices.add_(gather_indices)
     _flat_gather(slot_to_token, state_slot_indices, candidate_tokens)
 
-    state_token_indices.copy_(safe_states.reshape(-1, 1))
-    state_token_indices.mul_(token_stride)
+    state_token_indices.copy_(state_token_bases.reshape(-1, 1))
     gather_indices.copy_(candidate_tokens)
     gather_indices.clamp_(min=0, max=token_stride - 1)
     state_token_indices.add_(gather_indices)
@@ -531,8 +543,7 @@ def prepare_resident_sparse_cache_(
     )
 
     # token -> slot
-    state_token_indices.copy_(safe_states.reshape(-1, 1))
-    state_token_indices.mul_(token_stride)
+    state_token_indices.copy_(state_token_bases.reshape(-1, 1))
     gather_indices.copy_(union_tokens)
     torch.logical_not(valid_union, out=available_mask)
     gather_indices.masked_fill_(available_mask, token_stride - 1)
@@ -548,8 +559,7 @@ def prepare_resident_sparse_cache_(
     )
 
     # slot -> token
-    state_slot_indices.copy_(safe_states.reshape(-1, 1))
-    state_slot_indices.mul_(slot_stride)
+    state_slot_indices.copy_(state_slot_bases.reshape(-1, 1))
     gather_indices.copy_(union_to_slot)
     gather_indices.masked_fill_(available_mask, scratch_capacity)
     state_slot_indices.add_(gather_indices)
@@ -560,13 +570,9 @@ def prepare_resident_sparse_cache_(
         state_slot_indices.reshape(-1),
         int_sources.reshape(-1),
     )
-    gather_indices.reshape(-1)[:request_count].copy_(safe_states)
-    gather_indices.reshape(-1)[:request_count].mul_(
-        int(state_generations.shape[1])
-    )
     state_generations.reshape(-1).scatter_(
         0,
-        gather_indices.reshape(-1)[:request_count],
+        state_generation_indices,
         request_state_generations,
     )
 
@@ -574,10 +580,12 @@ def prepare_resident_sparse_cache_(
     gather_indices.copy_(miss_slot_payload[:, :scratch_capacity])
     int_sources.copy_(gather_indices)
     gather_indices.div_(block_size, rounding_mode="floor")
-    state_slot_indices.copy_(row_ids)
-    state_slot_indices.mul_(int(request_block_table.shape[1]))
-    state_slot_indices.add_(gather_indices)
-    _flat_gather(request_block_table, state_slot_indices, candidate_tokens)
+    torch.gather(
+        request_block_table,
+        1,
+        gather_indices,
+        out=candidate_tokens,
+    )
     candidate_tokens.mul_(block_size)
     int_sources.remainder_(block_size)
     candidate_tokens.add_(int_sources)

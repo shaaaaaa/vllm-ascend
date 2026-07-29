@@ -335,7 +335,7 @@ def test_native_planner_cold_hits_and_lowest_unprotected_eviction():
         capacity=4,
     )
     assert topk.tolist() == [[1, 2, 3, 0]]
-    assert selected[0].tolist() == [50, 0, 0, 0]
+    assert selected[0, :1].tolist() == [50]
     assert counts.tolist() == [1]
     assert targets[0, 0].item() == 100
     assert state[0][0, 10].item() == -1
