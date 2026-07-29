@@ -680,6 +680,7 @@ class TestStagedSFAGraphPoc(TestBase):
     def _make_eligible_impl():
         impl = AscendSFAImpl.__new__(AscendSFAImpl)
         impl.dsa_shrink_latent = 2
+        impl.dsa_resident_cache = True
         impl.num_kv_heads = 1
         impl.local_num_heads = 2
         impl.kv_lora_rank = 2
@@ -796,6 +797,14 @@ class TestStagedSFAGraphPoc(TestBase):
         )
         metadata.decode_shard_counts_workspace = torch.empty(
             batch_size, 2, 16, dtype=torch.int32
+        )
+        metadata.resident_state_indices = torch.arange(
+            batch_size,
+            dtype=torch.int32,
+        )
+        metadata.resident_state_generations = torch.ones(
+            batch_size,
+            dtype=torch.int64,
         )
         metadata.decode_request_ids_compact = [f"req-{row}" for row in range(batch_size)]
         metadata.req_ids = list(metadata.decode_request_ids_compact)
@@ -921,7 +930,7 @@ class TestStagedSFAGraphPoc(TestBase):
             eager_metadata.decode_remap_boundary,
         )
         self.assertIs(
-            impl._cross_layer_pre_compute.call_args_list[1].args[-7],
+            impl._cross_layer_pre_compute.call_args_list[1].args[11],
             eager_metadata.decode_remap_boundary,
         )
         self.assertEqual(
@@ -980,7 +989,7 @@ class TestStagedSFAGraphPoc(TestBase):
         args = impl._cross_layer_pre_compute.call_args.args
         # The graph keeps four fixed rows, while -1 prevents its three
         # padding rows from participating in the request-level union.
-        self.assertEqual(args[-6].tolist(), [0, -1, -1, -1])
+        self.assertEqual(args[12].tolist(), [0, -1, -1, -1])
 
     def test_bridge_storage_is_preallocated_and_reused_for_q1(self):
         impl = self._make_eligible_impl()
@@ -1191,6 +1200,10 @@ class TestStagedSFAGraphPoc(TestBase):
         self.assertIs(
             wait_for_layer.call_args_list[0].kwargs["payload_event"],
             impl._staged_sfa_capture_state.producer_event,
+        )
+        self.assertTrue(
+            wait_for_layer.call_args_list[0]
+            .kwargs["require_complete_sparse_load"]
         )
         prepare_boundary.assert_called_once_with(
             next_metadata,
@@ -1696,6 +1709,14 @@ class TestStagedSFAGraphPoc(TestBase):
         )
         metadata.decode_shard_counts_workspace = torch.empty(
             2, 2, 16, dtype=torch.int32
+        )
+        metadata.resident_state_indices = torch.arange(
+            2,
+            dtype=torch.int32,
+        )
+        metadata.resident_state_generations = torch.ones(
+            2,
+            dtype=torch.int64,
         )
         graph_key = StagedSFAGraphKey.fixed_spec(2, 2)
         context = SimpleNamespace(
