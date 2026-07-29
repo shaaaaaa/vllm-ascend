@@ -1086,6 +1086,275 @@ at::Tensor npu_dsa_resident_remap_rows_(
     return topk_indices;
 }
 
+at::Tensor npu_dsa_resident_lookup_rows_(
+    const at::Tensor &selected_packed,
+    const at::Tensor &selected_count,
+    const at::Tensor &request_state_indices,
+    at::Tensor &lookup_indices,
+    int64_t token_stride,
+    int64_t dummy_state_base)
+{
+    TORCH_CHECK(
+        selected_packed.is_privateuseone() &&
+            selected_count.device() == selected_packed.device() &&
+            request_state_indices.device() == selected_packed.device() &&
+            lookup_indices.device() == selected_packed.device(),
+        "resident lookup tensors must share one NPU device");
+    TORCH_CHECK(
+        selected_packed.scalar_type() == at::kInt &&
+            selected_count.scalar_type() == at::kInt &&
+            request_state_indices.scalar_type() == at::kInt &&
+            lookup_indices.scalar_type() == at::kLong,
+        "resident lookup expects int32 inputs and int64 indices");
+    TORCH_CHECK(
+        selected_packed.is_contiguous() &&
+            selected_count.is_contiguous() &&
+            request_state_indices.is_contiguous() &&
+            lookup_indices.is_contiguous(),
+        "resident lookup tensors must be contiguous");
+    TORCH_CHECK(
+        selected_packed.dim() == 2 &&
+            (selected_count.dim() == 1 || selected_count.dim() == 2) &&
+            request_state_indices.dim() == 1 &&
+            lookup_indices.sizes() == selected_packed.sizes(),
+        "resident lookup tensor shapes do not match");
+    const int64_t request_count = selected_packed.size(0);
+    const int64_t scratch_capacity = selected_packed.size(1);
+    const int64_t count_stride =
+        selected_count.dim() == 1 ? 1 : selected_count.size(1);
+    TORCH_CHECK(
+        request_count > 0 && scratch_capacity > 0 &&
+            scratch_capacity <= 4096 &&
+            scratch_capacity % 256 == 0 &&
+            count_stride > 0 &&
+            selected_count.size(0) >= request_count &&
+            request_state_indices.numel() >= request_count,
+        "resident lookup metadata is too small");
+    TORCH_CHECK(
+        token_stride > scratch_capacity &&
+            token_stride % 32 == 0 &&
+            dummy_state_base >= request_count,
+        "resident lookup stride or dummy-state base is invalid");
+    TORCH_CHECK(
+        2 * dummy_state_base * token_stride <=
+            static_cast<int64_t>(std::numeric_limits<int32_t>::max()),
+        "resident flattened lookup indices exceed int32");
+
+    const c10_npu::OptionalNPUGuard npu_guard(selected_packed.device());
+    aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
+    void* selected_ptr = selected_packed.data_ptr();
+    void* count_ptr = selected_count.data_ptr();
+    void* state_ptr = request_state_indices.data_ptr();
+    void* index_ptr = lookup_indices.data_ptr();
+    at_npu::native::OpCommand cmd;
+    cmd.Name("npu_dsa_resident_lookup_rows_");
+    cmd.SetCustomHandler([
+        stream, selected_ptr, count_ptr, state_ptr, index_ptr,
+        request_count, scratch_capacity, count_stride, token_stride,
+        dummy_state_base]() -> int {
+        dsa_resident_lookup_rows_impl(
+            stream, selected_ptr, count_ptr, state_ptr, index_ptr,
+            static_cast<uint32_t>(request_count),
+            static_cast<uint32_t>(scratch_capacity),
+            static_cast<uint32_t>(count_stride),
+            static_cast<uint32_t>(token_stride),
+            static_cast<uint32_t>(dummy_state_base));
+        return 0;
+    });
+    cmd.Run();
+    return lookup_indices;
+}
+
+at::Tensor npu_dsa_resident_finalize_rows_(
+    at::Tensor &topk_indices,
+    const at::Tensor &position_to_union,
+    at::Tensor &selected_packed,
+    at::Tensor &selected_count,
+    at::Tensor &target_slots,
+    const at::Tensor &request_block_table,
+    const at::Tensor &request_state_indices,
+    const at::Tensor &request_state_generations,
+    const at::Tensor &old_slots,
+    at::Tensor &slot_to_token,
+    at::Tensor &state_generations,
+    at::Tensor &union_to_slot,
+    at::Tensor &reverse_indices,
+    at::Tensor &reverse_values,
+    int64_t token_stride,
+    int64_t block_size)
+{
+    const auto device = selected_packed.device();
+    TORCH_CHECK(
+        selected_packed.is_privateuseone() &&
+            topk_indices.device() == device &&
+            position_to_union.device() == device &&
+            selected_count.device() == device &&
+            target_slots.device() == device &&
+            request_block_table.device() == device &&
+            request_state_indices.device() == device &&
+            request_state_generations.device() == device &&
+            old_slots.device() == device &&
+            slot_to_token.device() == device &&
+            state_generations.device() == device &&
+            union_to_slot.device() == device &&
+            reverse_indices.device() == device &&
+            reverse_values.device() == device,
+        "resident finalize tensors must share one NPU device");
+    TORCH_CHECK(
+        topk_indices.scalar_type() == at::kInt &&
+            position_to_union.scalar_type() == at::kInt &&
+            selected_packed.scalar_type() == at::kInt &&
+            selected_count.scalar_type() == at::kInt &&
+            target_slots.scalar_type() == at::kLong &&
+            request_block_table.scalar_type() == at::kInt &&
+            request_state_indices.scalar_type() == at::kInt &&
+            request_state_generations.scalar_type() == at::kLong &&
+            old_slots.scalar_type() == at::kShort &&
+            slot_to_token.scalar_type() == at::kInt &&
+            state_generations.scalar_type() == at::kLong &&
+            union_to_slot.scalar_type() == at::kInt &&
+            reverse_indices.scalar_type() == at::kLong &&
+            reverse_values.scalar_type() == at::kShort,
+        "resident finalize tensor dtypes do not match");
+    TORCH_CHECK(
+        topk_indices.is_contiguous() &&
+            position_to_union.is_contiguous() &&
+            selected_packed.is_contiguous() &&
+            selected_count.is_contiguous() &&
+            target_slots.is_contiguous() &&
+            request_block_table.is_contiguous() &&
+            request_state_indices.is_contiguous() &&
+            request_state_generations.is_contiguous() &&
+            old_slots.is_contiguous() &&
+            slot_to_token.is_contiguous() &&
+            state_generations.is_contiguous() &&
+            union_to_slot.is_contiguous() &&
+            reverse_indices.is_contiguous() &&
+            reverse_values.is_contiguous(),
+        "resident finalize tensors must be contiguous");
+
+    TORCH_CHECK(
+        (topk_indices.dim() == 2 ||
+            (topk_indices.dim() == 3 &&
+             topk_indices.size(1) == 1)) &&
+            selected_packed.dim() == 2 &&
+            (selected_count.dim() == 1 || selected_count.dim() == 2) &&
+            target_slots.dim() == 2 &&
+            request_block_table.dim() == 2 &&
+            request_state_indices.dim() == 1 &&
+            request_state_generations.dim() == 1 &&
+            old_slots.dim() == 2 &&
+            slot_to_token.dim() == 2 &&
+            state_generations.dim() == 2 &&
+            union_to_slot.dim() == 2 &&
+            reverse_indices.dim() == 2 &&
+            reverse_values.dim() == 2 &&
+            position_to_union.dim() == 2,
+        "resident finalize tensors must have request-major shapes");
+    const int64_t request_count = selected_packed.size(0);
+    const int64_t scratch_capacity = selected_packed.size(1);
+    const int64_t row_count = topk_indices.size(0);
+    TORCH_CHECK(
+        request_count > 0 && row_count % request_count == 0,
+        "resident finalize top-k rows are not request-major");
+    const int64_t rows_per_request = row_count / request_count;
+    const int64_t row_width = topk_indices.numel() / row_count;
+    const int64_t selected_count_stride =
+        selected_count.dim() == 1 ? 1 : selected_count.size(1);
+    const int64_t block_table_width = request_block_table.size(1);
+    const int64_t slot_stride = slot_to_token.size(1);
+    const int64_t generation_stride = state_generations.size(1);
+    const int64_t dummy_state_base = slot_to_token.size(0) / 2;
+    TORCH_CHECK(
+        scratch_capacity <= 4096 &&
+            scratch_capacity % 256 == 0 &&
+            selected_count_stride > 0 &&
+            block_table_width > 0 &&
+            scratch_capacity == rows_per_request * row_width &&
+            position_to_union.numel() ==
+                request_count * scratch_capacity &&
+            target_slots.sizes() == selected_packed.sizes() &&
+            old_slots.sizes() == selected_packed.sizes() &&
+            union_to_slot.sizes() == selected_packed.sizes() &&
+            reverse_indices.sizes() == selected_packed.sizes() &&
+            reverse_values.sizes() == selected_packed.sizes(),
+        "resident finalize payload shapes do not match");
+    TORCH_CHECK(
+        selected_count.size(0) >= request_count &&
+            request_block_table.size(0) >= request_count &&
+            request_state_indices.numel() >= request_count &&
+            request_state_generations.numel() >= request_count &&
+            slot_to_token.size(0) == state_generations.size(0) &&
+            slot_to_token.size(0) == 2 * dummy_state_base &&
+            slot_stride >= scratch_capacity + 1 &&
+            token_stride % 32 == 0 &&
+            slot_stride % 16 == 0 &&
+            generation_stride >= 8 &&
+            generation_stride % 8 == 0,
+        "resident finalize persistent-state shapes do not match");
+    TORCH_CHECK(
+        token_stride > scratch_capacity && block_size > 0 &&
+            request_block_table.size(1) * block_size >=
+                scratch_capacity,
+        "resident finalize strides do not cover the scratch cache");
+    TORCH_CHECK(
+        2 * dummy_state_base * token_stride <=
+            static_cast<int64_t>(std::numeric_limits<int32_t>::max()),
+        "resident flattened reverse indices exceed int32");
+
+    const c10_npu::OptionalNPUGuard npu_guard(device);
+    aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
+    void* topk_ptr = topk_indices.data_ptr();
+    void* position_ptr = position_to_union.data_ptr();
+    void* selected_ptr = selected_packed.data_ptr();
+    void* count_ptr = selected_count.data_ptr();
+    void* target_ptr = target_slots.data_ptr();
+    void* block_table_ptr = request_block_table.data_ptr();
+    void* state_ptr = request_state_indices.data_ptr();
+    void* request_generation_ptr = request_state_generations.data_ptr();
+    void* old_slot_ptr = old_slots.data_ptr();
+    void* slot_to_token_ptr = slot_to_token.data_ptr();
+    void* state_generation_ptr = state_generations.data_ptr();
+    void* union_to_slot_ptr = union_to_slot.data_ptr();
+    void* reverse_index_ptr = reverse_indices.data_ptr();
+    void* reverse_value_ptr = reverse_values.data_ptr();
+    at_npu::native::OpCommand cmd;
+    cmd.Name("npu_dsa_resident_finalize_rows_");
+    cmd.SetCustomHandler([
+        stream, topk_ptr, position_ptr, selected_ptr, count_ptr,
+        target_ptr, block_table_ptr, state_ptr,
+        request_generation_ptr, old_slot_ptr, slot_to_token_ptr,
+        state_generation_ptr, union_to_slot_ptr, reverse_index_ptr,
+        reverse_value_ptr, request_count, scratch_capacity,
+        selected_count_stride, block_table_width, token_stride,
+        slot_stride, generation_stride, dummy_state_base, block_size,
+        row_count, row_width, rows_per_request]() -> int {
+        dsa_resident_finalize_rows_impl(
+            stream, selected_ptr, count_ptr, target_ptr,
+            block_table_ptr, state_ptr, request_generation_ptr,
+            old_slot_ptr, slot_to_token_ptr, state_generation_ptr,
+            union_to_slot_ptr, reverse_index_ptr, reverse_value_ptr,
+            static_cast<uint32_t>(request_count),
+            static_cast<uint32_t>(scratch_capacity),
+            static_cast<uint32_t>(selected_count_stride),
+            static_cast<uint32_t>(block_table_width),
+            static_cast<uint32_t>(token_stride),
+            static_cast<uint32_t>(slot_stride),
+            static_cast<uint32_t>(generation_stride),
+            static_cast<uint32_t>(dummy_state_base),
+            static_cast<uint32_t>(block_size));
+        dsa_resident_remap_rows_impl(
+            stream, topk_ptr, position_ptr, union_to_slot_ptr,
+            static_cast<uint32_t>(row_count),
+            static_cast<uint32_t>(row_width),
+            static_cast<uint32_t>(rows_per_request),
+            static_cast<uint32_t>(scratch_capacity));
+        return 0;
+    });
+    cmd.Run();
+    return selected_count;
+}
+
 at::Tensor npu_dsa_staged_unique_finalize_(
     const at::Tensor &unique_keys,
     const at::Tensor &inverse,
@@ -2243,6 +2512,29 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "npu_dsa_resident_remap_rows_",
         torch::kPrivateUse1,
         &vllm_ascend::npu_dsa_resident_remap_rows_);
+    ops.def(
+        "npu_dsa_resident_lookup_rows_(Tensor selected_packed, "
+        "Tensor selected_count, Tensor request_state_indices, "
+        "Tensor(a!) lookup_indices, int token_stride, "
+        "int dummy_state_base) -> Tensor(a!)");
+    ops.impl(
+        "npu_dsa_resident_lookup_rows_",
+        torch::kPrivateUse1,
+        &vllm_ascend::npu_dsa_resident_lookup_rows_);
+    ops.def(
+        "npu_dsa_resident_finalize_rows_(Tensor(a!) topk_indices, "
+        "Tensor position_to_union, Tensor(b!) selected_packed, "
+        "Tensor(c!) selected_count, Tensor(d!) target_slots, "
+        "Tensor request_block_table, Tensor request_state_indices, "
+        "Tensor request_state_generations, Tensor old_slots, "
+        "Tensor(e!) slot_to_token, Tensor(f!) state_generations, "
+        "Tensor(g!) union_to_slot, Tensor(h!) reverse_indices, "
+        "Tensor(i!) reverse_values, int token_stride, "
+        "int block_size) -> Tensor(c!)");
+    ops.impl(
+        "npu_dsa_resident_finalize_rows_",
+        torch::kPrivateUse1,
+        &vllm_ascend::npu_dsa_resident_finalize_rows_);
     ops.def(
         "npu_dsa_staged_unique_finalize_(Tensor unique_keys, "
         "Tensor inverse, Tensor row_req_indices, "

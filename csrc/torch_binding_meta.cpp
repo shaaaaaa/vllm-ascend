@@ -130,6 +130,58 @@ at::Tensor npu_dsa_prepare_sparse_indices_sharded_meta(
         clear_invalid_rows);
 }
 
+at::Tensor npu_dsa_resident_lookup_rows_meta(
+    const at::Tensor &selected_packed,
+    const at::Tensor &selected_count,
+    const at::Tensor &request_state_indices,
+    at::Tensor &lookup_indices,
+    int64_t token_stride,
+    int64_t dummy_state_base)
+{
+    (void)selected_packed;
+    (void)selected_count;
+    (void)request_state_indices;
+    (void)token_stride;
+    (void)dummy_state_base;
+    return lookup_indices;
+}
+
+at::Tensor npu_dsa_resident_finalize_rows_meta(
+    at::Tensor &topk_indices,
+    const at::Tensor &position_to_union,
+    at::Tensor &selected_packed,
+    at::Tensor &selected_count,
+    at::Tensor &target_slots,
+    const at::Tensor &request_block_table,
+    const at::Tensor &request_state_indices,
+    const at::Tensor &request_state_generations,
+    const at::Tensor &old_slots,
+    at::Tensor &slot_to_token,
+    at::Tensor &state_generations,
+    at::Tensor &union_to_slot,
+    at::Tensor &reverse_indices,
+    at::Tensor &reverse_values,
+    int64_t token_stride,
+    int64_t block_size)
+{
+    (void)topk_indices;
+    (void)position_to_union;
+    (void)selected_packed;
+    (void)target_slots;
+    (void)request_block_table;
+    (void)request_state_indices;
+    (void)request_state_generations;
+    (void)old_slots;
+    (void)slot_to_token;
+    (void)state_generations;
+    (void)union_to_slot;
+    (void)reverse_indices;
+    (void)reverse_values;
+    (void)token_stride;
+    (void)block_size;
+    return selected_count;
+}
+
 at::Tensor npu_dsa_staged_sharded_union_meta(
     at::Tensor &topk_indices,
     const at::Tensor &split_boundary,
@@ -758,6 +810,12 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
     ops.impl(
         "npu_dsa_staged_sharded_vector_dedup_",
         &vllm_ascend::meta::npu_dsa_staged_sharded_vector_dedup_meta);
+    ops.impl(
+        "npu_dsa_resident_lookup_rows_",
+        &vllm_ascend::meta::npu_dsa_resident_lookup_rows_meta);
+    ops.impl(
+        "npu_dsa_resident_finalize_rows_",
+        &vllm_ascend::meta::npu_dsa_resident_finalize_rows_meta);
     // Bgmv expand
     ops.impl("bgmv_expand", &vllm_ascend::meta::bgmv_expand_meta);
     // Sgmv expand

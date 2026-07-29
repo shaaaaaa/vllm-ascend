@@ -230,6 +230,42 @@ namespace vllm_ascend {
     uint32_t rows_per_request,
     uint32_t scratch_capacity);
 
+  extern void dsa_resident_lookup_rows_impl(
+    void* stream,
+    void* selected_packed,
+    void* selected_count,
+    void* request_state_indices,
+    void* lookup_indices,
+    uint32_t request_count,
+    uint32_t scratch_capacity,
+    uint32_t selected_count_stride,
+    uint32_t token_stride,
+    uint32_t dummy_state_base);
+
+  extern void dsa_resident_finalize_rows_impl(
+    void* stream,
+    void* selected_packed,
+    void* selected_count,
+    void* target_slots,
+    void* request_block_table,
+    void* request_state_indices,
+    void* request_state_generations,
+    void* old_slots,
+    void* slot_to_token,
+    void* state_generations,
+    void* union_to_slot,
+    void* reverse_indices,
+    void* reverse_values,
+    uint32_t request_count,
+    uint32_t scratch_capacity,
+    uint32_t selected_count_stride,
+    uint32_t block_table_width,
+    uint32_t token_stride,
+    uint32_t slot_stride,
+    uint32_t generation_stride,
+    uint32_t dummy_state_base,
+    uint32_t block_size);
+
   extern void dsa_staged_unique_finalize_impl(
     void* stream,
     void* unique_keys,

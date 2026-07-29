@@ -7,10 +7,6 @@ from vllm_ascend.distributed.kv_transfer.sparse_offload.prepare_sparse_indices i
     _sparse_index_op_name,
     prepare_sparse_indices,
 )
-from vllm_ascend.distributed.kv_transfer.sparse_offload.resident_sparse_cache import (
-    allocate_resident_workspace,
-    prepare_resident_sparse_cache_,
-)
 from vllm_ascend.utils import enable_custom_op
 
 
@@ -475,211 +471,24 @@ def resident_only_main(
     iterations: int = 200,
     warmups: int = 20,
 ) -> None:
-    """Benchmark production union plus persistent-residency planning."""
-    if topk != 2048:
-        raise ValueError("the production staged operator requires --topk 2048")
-    if mtp not in (1, 2):
-        raise ValueError("resident production supports only --mtp 1 or 2")
-    if request_batch <= 0:
-        raise ValueError("--requests must be positive")
-    if not 0.0 <= hit_rate <= 1.0:
-        raise ValueError("--hit-rate must be between 0 and 1")
-    if not enable_custom_op():
-        raise RuntimeError("vllm-ascend custom operators could not be loaded")
-
-    device = torch.device("npu")
-    row_count = request_batch * mtp
-    capacity = mtp * topk
-    max_tokens = 131072
-    block_size = 128
-    source = _mtp_rows_with_half_overlap(
-        topk, request_batch, mtp, "npu"
-    )
-    values = source.clone()
-    source_max = int(source.max().item())
-    split_boundary = source_max - 100
-    boundaries = torch.full(
-        (row_count,),
-        split_boundary,
-        dtype=torch.int32,
-        device=device,
-    )
-    row_requests = torch.arange(
-        request_batch, dtype=torch.int32, device=device
-    ).repeat_interleave(mtp)
-    blocks_per_request = max_tokens // block_size
-    block_table = torch.arange(
-        request_batch * blocks_per_request,
-        dtype=torch.int32,
-        device=device,
-    ).reshape(request_batch, blocks_per_request)
-    selected = torch.empty(
-        (request_batch, capacity), dtype=torch.int32, device=device
-    )
-    counts = torch.empty(
-        (request_batch, 16), dtype=torch.int32, device=device
-    )
-    targets = torch.empty(
-        (request_batch, capacity), dtype=torch.long, device=device
-    )
-    local_to_union = torch.empty_like(selected)
-    shard_packed = torch.empty(
-        (request_batch, 2, capacity), dtype=torch.int32, device=device
-    )
-    shard_mapping = torch.empty_like(shard_packed)
-    shard_counts = torch.empty(
-        (request_batch, 2, 16), dtype=torch.int32, device=device
-    )
-
-    def production_union() -> None:
-        prepare_sparse_indices(
-            values,
-            boundaries,
-            row_req_indices=row_requests,
-            request_block_table=block_table,
-            selected_packed=selected,
-            selected_counts=counts,
-            target_slot_mapping=targets,
-            block_size=block_size,
-            need_packed=True,
-            clear_invalid_rows=True,
-            local_to_union_workspace=local_to_union,
-            shard_packed_workspace=shard_packed,
-            shard_mapping_workspace=shard_mapping,
-            shard_counts_workspace=shard_counts,
-            staged_mtp=mtp,
+    """Compatibility shim for the standalone resident benchmark."""
+    if __package__:
+        from .benchmark_resident_sparse_cache import (
+            main as benchmark_resident_sparse_cache,
+        )
+    else:
+        from benchmark_resident_sparse_cache import (
+            main as benchmark_resident_sparse_cache,
         )
 
-    production_union()
-    torch.npu.synchronize()
-    union_seed = selected.clone()
-    count_seed = counts.clone()
-    mapping_seed = local_to_union.clone()
-    target_seed = targets.clone()
-    union_count = int(counts[0, 0].item())
-    hit_count = int(union_count * hit_rate)
-
-    token_stride = ((max_tokens + 1 + 31) // 32) * 32
-    slot_stride = ((capacity + 1 + 15) // 16) * 16
-    token_to_slot = torch.full(
-        (2 * request_batch, token_stride),
-        -1,
-        dtype=torch.int16,
-        device=device,
-    )
-    slot_to_token = torch.full(
-        (2 * request_batch, slot_stride),
-        -1,
-        dtype=torch.int32,
-        device=device,
-    )
-    state_generations = torch.ones(
-        (2 * request_batch, 8), dtype=torch.int64, device=device
-    )
-    request_states = torch.arange(
-        request_batch, dtype=torch.int32, device=device
-    )
-    request_generations = torch.ones(
-        request_batch, dtype=torch.int64, device=device
-    )
-    workspace = allocate_resident_workspace(
-        request_batch, capacity, device=device
-    )
-    seed_token_to_slot = token_to_slot.clone()
-    seed_slot_to_token = slot_to_token.clone()
-    if hit_count:
-        hit_tokens = union_seed[:, :hit_count].to(torch.long)
-        hit_slots = torch.arange(
-            hit_count, dtype=torch.int16, device=device
-        ).expand(request_batch, -1)
-        seed_token_to_slot[
-            request_states.to(torch.long).reshape(-1, 1), hit_tokens
-        ] = hit_slots
-        seed_slot_to_token[
-            :request_batch, :hit_count
-        ].copy_(union_seed[:, :hit_count])
-
-    def resident_plan() -> None:
-        prepare_resident_sparse_cache_(
-            values,
-            local_to_union,
-            selected,
-            counts,
-            targets,
-            block_table,
-            request_states,
-            request_generations,
-            token_to_slot,
-            slot_to_token,
-            state_generations,
-            workspace,
-            block_size=block_size,
-            scratch_capacity=capacity,
-            parallel_map=parallel_map,
-        )
-
-    def reset_resident_inputs() -> None:
-        values.copy_(source)
-        selected.copy_(union_seed)
-        counts.copy_(count_seed)
-        local_to_union.copy_(mapping_seed)
-        targets.copy_(target_seed)
-        token_to_slot.copy_(seed_token_to_slot)
-        slot_to_token.copy_(seed_slot_to_token)
-        state_generations.fill_(1)
-
-    reset_resident_inputs()
-    resident_plan()
-    torch.npu.synchronize()
-    actual_misses = counts[:, 0].cpu().tolist()
-    expected_misses = [union_count - hit_count] * request_batch
-    if actual_misses != expected_misses:
-        raise AssertionError(
-            "resident miss counts are incorrect: "
-            f"actual={actual_misses}, expected={expected_misses}"
-        )
-
-    production_samples = _measure_npu_ms(
-        production_union,
-        lambda: values.copy_(source),
-        warmups,
+    _ = parallel_map
+    benchmark_resident_sparse_cache(
+        topk,
+        mtp,
+        request_batch,
+        hit_rate,
         iterations,
-    )
-    resident_samples = _measure_npu_ms(
-        resident_plan,
-        reset_resident_inputs,
         warmups,
-        iterations,
-    )
-
-    def combined() -> None:
-        production_union()
-        resident_plan()
-
-    combined_samples = _measure_npu_ms(
-        combined,
-        lambda: (
-            values.copy_(source),
-            token_to_slot.copy_(seed_token_to_slot),
-            slot_to_token.copy_(seed_slot_to_token),
-            state_generations.fill_(1),
-        ),
-        warmups,
-        iterations,
-    )
-    print(
-        "resident-only benchmark: "
-        f"topk={topk}, MTP={mtp}, requests={request_batch}, "
-        f"hit_rate={hit_rate:.2%}, union={union_count}, "
-        f"misses={union_count - hit_count}, "
-        f"map={'parallel-aiv' if parallel_map else 'native'}"
-    )
-    _summary("production", production_samples)
-    _summary("resident-plan", resident_samples)
-    _summary("combined", combined_samples)
-    print(
-        "resident overhead: "
-        f"{statistics.fmean(combined_samples) - statistics.fmean(production_samples):+.6f} ms"
     )
 
 
@@ -1280,7 +1089,10 @@ if __name__ == "__main__":
     parser.add_argument(
         "--parallel-map",
         action="store_true",
-        help="use the position-sharded multi-AIV resident remap kernel",
+        help=(
+            "deprecated compatibility flag for the standalone resident "
+            "benchmark"
+        ),
     )
     parser.add_argument(
         "--production-only",
@@ -1294,8 +1106,8 @@ if __name__ == "__main__":
         "--resident-only",
         action="store_true",
         help=(
-            "benchmark only production union, resident planning, and their "
-            "combined path"
+            "deprecated compatibility redirect to "
+            "benchmark_resident_sparse_cache.py"
         ),
     )
     args = parser.parse_args()

@@ -3237,6 +3237,408 @@ private:
     uint32_t scratchCapacity_ = 0;
 };
 
+// Build the flattened int64 indices consumed by the native NPU gather. One
+// AIV owns one complete request row; padding is redirected to that request's
+// private sentinel token, so no two requests touch the same cacheline.
+class DSAResidentLookupRowsKernel {
+public:
+    __aicore__ inline void Init(
+        __gm__ int32_t* selectedPacked,
+        __gm__ int32_t* selectedCount,
+        __gm__ int32_t* requestStateIndices,
+        __gm__ int32_t* lookupIndexWords,
+        uint32_t requestCount,
+        uint32_t scratchCapacity,
+        uint32_t selectedCountStride,
+        uint32_t tokenStride,
+        uint32_t dummyStateBase)
+    {
+        requestCount_ = requestCount;
+        scratchCapacity_ = scratchCapacity;
+        selectedCountStride_ = selectedCountStride;
+        tokenStride_ = tokenStride;
+        dummyStateBase_ = dummyStateBase;
+        selectedPacked_.SetGlobalBuffer(
+            selectedPacked,
+            static_cast<uint64_t>(requestCount_) * scratchCapacity_);
+        selectedCount_.SetGlobalBuffer(
+            selectedCount,
+            static_cast<uint64_t>(requestCount_) * selectedCountStride_);
+        requestStateIndices_.SetGlobalBuffer(
+            requestStateIndices, requestCount_);
+        lookupIndexWords_.SetGlobalBuffer(
+            lookupIndexWords,
+            2 * static_cast<uint64_t>(requestCount_) * scratchCapacity_);
+        pipe_.InitBuffer(tokenBuf_, scratchCapacity_ * sizeof(int32_t));
+        pipe_.InitBuffer(positionBuf_, scratchCapacity_ * sizeof(int32_t));
+        pipe_.InitBuffer(indexBuf_, scratchCapacity_ * sizeof(int32_t));
+        pipe_.InitBuffer(index64Buf_, scratchCapacity_ * sizeof(int64_t));
+        pipe_.InitBuffer(validMaskBuf_, scratchCapacity_ / 8);
+    }
+
+    __aicore__ inline void Process()
+    {
+        const uint32_t request = AscendC::GetBlockIdx();
+        if (request >= requestCount_) {
+            return;
+        }
+        const uint64_t offset =
+            static_cast<uint64_t>(request) * scratchCapacity_;
+        auto tokens = tokenBuf_.Get<int32_t>();
+        auto positions = positionBuf_.Get<int32_t>();
+        auto indices = indexBuf_.Get<int32_t>();
+        auto indices64 = index64Buf_.Get<int64_t>();
+        auto validMask = validMaskBuf_.Get<uint8_t>();
+        AscendC::DataCopy(
+            tokens, selectedPacked_[offset], scratchCapacity_);
+        Sync<AscendC::HardEvent::MTE2_V>();
+
+        int32_t count = selectedCount_.GetValue(
+            static_cast<uint64_t>(request) * selectedCountStride_);
+        if (count < 0) {
+            count = 0;
+        } else if (count > static_cast<int32_t>(scratchCapacity_)) {
+            count = static_cast<int32_t>(scratchCapacity_);
+        }
+        const int32_t state = requestStateIndices_.GetValue(request);
+        const bool validState =
+            state >= 0 &&
+            state < static_cast<int32_t>(dummyStateBase_);
+        const uint32_t safeState = validState
+            ? static_cast<uint32_t>(state)
+            : dummyStateBase_ + request;
+        const int32_t base =
+            static_cast<int32_t>(safeState * tokenStride_);
+        const int32_t sentinel =
+            base + static_cast<int32_t>(tokenStride_ - 1);
+
+        AscendC::CreateVecIndex(
+            positions, static_cast<int32_t>(0), scratchCapacity_);
+        AscendC::Duplicate(indices, count, scratchCapacity_);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Compare(
+            validMask,
+            positions,
+            indices,
+            AscendC::CMPMODE::LT,
+            scratchCapacity_);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Adds(indices, tokens, base, scratchCapacity_);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Duplicate(
+            positions, sentinel, scratchCapacity_);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Select(
+            indices.ReinterpretCast<float>(),
+            validMask,
+            indices.ReinterpretCast<float>(),
+            positions.ReinterpretCast<float>(),
+            AscendC::SELMODE::VSEL_TENSOR_TENSOR_MODE,
+            scratchCapacity_);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Cast(
+            indices64,
+            indices,
+            AscendC::RoundMode::CAST_NONE,
+            scratchCapacity_);
+        AscendC::PipeBarrier<PIPE_V>();
+        Sync<AscendC::HardEvent::V_MTE3>();
+        CopyLocalToGlobalExact(
+            lookupIndexWords_[2 * offset],
+            indices64.ReinterpretCast<int32_t>(),
+            2 * scratchCapacity_);
+    }
+
+private:
+    AscendC::GlobalTensor<int32_t> selectedPacked_;
+    AscendC::GlobalTensor<int32_t> selectedCount_;
+    AscendC::GlobalTensor<int32_t> requestStateIndices_;
+    AscendC::GlobalTensor<int32_t> lookupIndexWords_;
+    AscendC::TPipe pipe_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> tokenBuf_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> positionBuf_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> indexBuf_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> index64Buf_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> validMaskBuf_;
+    uint32_t requestCount_ = 0;
+    uint32_t scratchCapacity_ = 0;
+    uint32_t selectedCountStride_ = 0;
+    uint32_t tokenStride_ = 0;
+    uint32_t dummyStateBase_ = 0;
+};
+
+// Fuse row-local residency validation, free-slot assignment, miss compaction,
+// forward-map publication, and LMCache target construction. The remaining
+// loops are three linear passes over request-local UB tensors; the 130K
+// reverse lookup remains a native gather/scatter in Python. One AIV owns
+// every output row of one request.
+class DSAResidentFinalizeRowsKernel {
+public:
+    __aicore__ inline void Init(
+        __gm__ int32_t* selectedPacked,
+        __gm__ int32_t* selectedCount,
+        __gm__ int32_t* targetSlotWords,
+        __gm__ int32_t* requestBlockTable,
+        __gm__ int32_t* requestStateIndices,
+        __gm__ int64_t* requestStateGenerations,
+        __gm__ int16_t* oldSlots,
+        __gm__ int32_t* slotToToken,
+        __gm__ int64_t* stateGenerations,
+        __gm__ int32_t* unionToSlot,
+        __gm__ int32_t* reverseIndexWords,
+        __gm__ int16_t* reverseValues,
+        uint32_t requestCount,
+        uint32_t scratchCapacity,
+        uint32_t selectedCountStride,
+        uint32_t blockTableWidth,
+        uint32_t tokenStride,
+        uint32_t slotStride,
+        uint32_t generationStride,
+        uint32_t dummyStateBase,
+        uint32_t blockSize)
+    {
+        requestCount_ = requestCount;
+        scratchCapacity_ = scratchCapacity;
+        selectedCountStride_ = selectedCountStride;
+        blockTableWidth_ = blockTableWidth;
+        tokenStride_ = tokenStride;
+        slotStride_ = slotStride;
+        generationStride_ = generationStride;
+        dummyStateBase_ = dummyStateBase;
+        blockSize_ = blockSize;
+        const uint64_t requestElements =
+            static_cast<uint64_t>(requestCount_) * scratchCapacity_;
+        selectedPacked_.SetGlobalBuffer(selectedPacked, requestElements);
+        selectedCount_.SetGlobalBuffer(
+            selectedCount,
+            static_cast<uint64_t>(requestCount_) * selectedCountStride_);
+        targetSlotWords_.SetGlobalBuffer(
+            targetSlotWords, 2 * requestElements);
+        requestBlockTable_.SetGlobalBuffer(
+            requestBlockTable,
+            static_cast<uint64_t>(requestCount_) * blockTableWidth_);
+        requestStateIndices_.SetGlobalBuffer(
+            requestStateIndices, requestCount_);
+        requestStateGenerations_.SetGlobalBuffer(
+            requestStateGenerations, requestCount_);
+        oldSlots_.SetGlobalBuffer(oldSlots, requestElements);
+        slotToToken_.SetGlobalBuffer(
+            slotToToken,
+            static_cast<uint64_t>(2 * dummyStateBase_) * slotStride_);
+        stateGenerations_.SetGlobalBuffer(
+            stateGenerations,
+            static_cast<uint64_t>(2 * dummyStateBase_) * generationStride_);
+        unionToSlot_.SetGlobalBuffer(unionToSlot, requestElements);
+        reverseIndexWords_.SetGlobalBuffer(
+            reverseIndexWords, 2 * requestElements);
+        reverseValues_.SetGlobalBuffer(reverseValues, requestElements);
+
+        pipe_.InitBuffer(tokenBuf_, scratchCapacity_ * sizeof(int32_t));
+        pipe_.InitBuffer(forwardBuf_, scratchCapacity_ * sizeof(int32_t));
+        pipe_.InitBuffer(mapBuf_, scratchCapacity_ * sizeof(int32_t));
+        pipe_.InitBuffer(freeBuf_, scratchCapacity_ * sizeof(int32_t));
+        pipe_.InitBuffer(oldSlotBuf_, scratchCapacity_ * sizeof(int16_t));
+        pipe_.InitBuffer(targetBuf_, scratchCapacity_ * sizeof(int64_t));
+        pipe_.InitBuffer(indexBuf_, scratchCapacity_ * sizeof(int32_t));
+        pipe_.InitBuffer(
+            blockTableBuf_, blockTableWidth_ * sizeof(int32_t));
+    }
+
+    __aicore__ inline void Process()
+    {
+        const uint32_t request = AscendC::GetBlockIdx();
+        if (request >= requestCount_) {
+            return;
+        }
+        const uint64_t offset =
+            static_cast<uint64_t>(request) * scratchCapacity_;
+        auto tokens = tokenBuf_.Get<int32_t>();
+        auto forward = forwardBuf_.Get<int32_t>();
+        auto mapping = mapBuf_.Get<int32_t>();
+        auto freeSlots = freeBuf_.Get<int32_t>();
+        auto oldSlots = oldSlotBuf_.Get<int16_t>();
+        auto targets = targetBuf_.Get<int64_t>();
+        auto reverseIndices = indexBuf_.Get<int32_t>();
+        auto blockTable = blockTableBuf_.Get<int32_t>();
+
+        int32_t count = selectedCount_.GetValue(
+            static_cast<uint64_t>(request) * selectedCountStride_);
+        if (count < 0) {
+            count = 0;
+        } else if (count > static_cast<int32_t>(scratchCapacity_)) {
+            count = static_cast<int32_t>(scratchCapacity_);
+        }
+        const int32_t state = requestStateIndices_.GetValue(request);
+        const bool validState =
+            state >= 0 &&
+            state < static_cast<int32_t>(dummyStateBase_);
+        const uint32_t safeState = validState
+            ? static_cast<uint32_t>(state)
+            : dummyStateBase_ + request;
+        const int64_t requestedGeneration =
+            requestStateGenerations_.GetValue(request);
+        const uint64_t generationOffset =
+            static_cast<uint64_t>(safeState) * generationStride_;
+        const bool generationMatches =
+            validState &&
+            stateGenerations_.GetValue(generationOffset) ==
+                requestedGeneration;
+        const uint64_t forwardOffset =
+            static_cast<uint64_t>(safeState) * slotStride_;
+        const int32_t tokenBase =
+            static_cast<int32_t>(safeState * tokenStride_);
+        const int32_t reverseSentinel =
+            tokenBase + static_cast<int32_t>(tokenStride_ - 1);
+
+        AscendC::DataCopy(
+            tokens, selectedPacked_[offset], scratchCapacity_);
+        AscendC::DataCopy(
+            oldSlots, oldSlots_[offset], scratchCapacity_);
+        CopyGlobalToLocalExact(
+            blockTable,
+            requestBlockTable_[
+                static_cast<uint64_t>(request) * blockTableWidth_],
+            blockTableWidth_);
+        if (generationMatches) {
+            AscendC::DataCopy(
+                forward, slotToToken_[forwardOffset], scratchCapacity_);
+        } else {
+            AscendC::Duplicate(
+                forward, static_cast<int32_t>(-1), scratchCapacity_);
+        }
+        Sync<AscendC::HardEvent::MTE2_V>();
+        AscendC::Duplicate(
+            mapping, static_cast<int32_t>(-1), scratchCapacity_);
+        AscendC::Duplicate(
+            reverseIndices, reverseSentinel, scratchCapacity_);
+        AscendC::PipeBarrier<PIPE_V>();
+        Sync<AscendC::HardEvent::MTE2_S>();
+        Sync<AscendC::HardEvent::V_S>();
+
+        // Mark protected slots. LocalTensor does not expose an arbitrary
+        // scatter primitive in the supported AscendC API, so the fused
+        // implementation retains a request-local scalar phase: mark hits,
+        // scan free slots, then assign/compact misses.
+        for (int32_t i = 0; i < count; ++i) {
+            const int32_t candidate =
+                static_cast<int32_t>(oldSlots.GetValue(i));
+            const bool hit =
+                candidate >= 0 &&
+                candidate < static_cast<int32_t>(scratchCapacity_) &&
+                forward.GetValue(candidate) == tokens.GetValue(i);
+            if (hit) {
+                mapping.SetValue(candidate, 1);
+            }
+        }
+
+        uint32_t freeCount = 0;
+        for (uint32_t slot = 0; slot < scratchCapacity_; ++slot) {
+            if (mapping.GetValue(slot) < 0) {
+                freeSlots.SetValue(freeCount++, static_cast<int32_t>(slot));
+            }
+        }
+
+        uint32_t missCount = 0;
+        for (uint32_t i = 0; i < scratchCapacity_; ++i) {
+            const int32_t candidate =
+                static_cast<int32_t>(oldSlots.GetValue(i));
+            oldSlots.SetValue(i, static_cast<int16_t>(-1));
+            if (i >= static_cast<uint32_t>(count)) {
+                mapping.SetValue(i, static_cast<int32_t>(-1));
+                continue;
+            }
+            const int32_t token = tokens.GetValue(i);
+            const bool hit =
+                candidate >= 0 &&
+                candidate < static_cast<int32_t>(scratchCapacity_) &&
+                forward.GetValue(candidate) == token;
+            if (hit) {
+                mapping.SetValue(i, candidate);
+                continue;
+            }
+            const int32_t slot = freeSlots.GetValue(missCount);
+            mapping.SetValue(i, slot);
+            freeSlots.SetValue(missCount, token);
+            forward.SetValue(slot, token);
+            reverseIndices.SetValue(i, tokenBase + token);
+            oldSlots.SetValue(i, static_cast<int16_t>(slot));
+            const int32_t logicalBlock =
+                slot / static_cast<int32_t>(blockSize_);
+            const int32_t physicalBlock =
+                blockTable.GetValue(logicalBlock);
+            targets.SetValue(
+                missCount,
+                static_cast<int64_t>(physicalBlock) * blockSize_ +
+                    slot % static_cast<int32_t>(blockSize_));
+            ++missCount;
+        }
+
+        Sync<AscendC::HardEvent::S_MTE3>();
+        CopyLocalToGlobalExact(
+            selectedPacked_[offset], freeSlots, missCount);
+        CopyLocalToGlobalExact(
+            targetSlotWords_[2 * offset],
+            targets.ReinterpretCast<int32_t>(),
+            2 * missCount);
+        AscendC::DataCopy(
+            slotToToken_[forwardOffset], forward, scratchCapacity_);
+        AscendC::DataCopy(
+            unionToSlot_[offset], mapping, scratchCapacity_);
+        AscendC::DataCopy(
+            reverseValues_[offset], oldSlots, scratchCapacity_);
+        Sync<AscendC::HardEvent::MTE3_V>();
+        Sync<AscendC::HardEvent::S_V>();
+        AscendC::Cast(
+            targets,
+            reverseIndices,
+            AscendC::RoundMode::CAST_NONE,
+            scratchCapacity_);
+        AscendC::PipeBarrier<PIPE_V>();
+        Sync<AscendC::HardEvent::V_MTE3>();
+        CopyLocalToGlobalExact(
+            reverseIndexWords_[2 * offset],
+            targets.ReinterpretCast<int32_t>(),
+            2 * scratchCapacity_);
+        selectedCount_.SetValue(
+            static_cast<uint64_t>(request) * selectedCountStride_,
+            static_cast<int32_t>(missCount));
+        stateGenerations_.SetValue(
+            generationOffset, requestedGeneration);
+    }
+
+private:
+    AscendC::GlobalTensor<int32_t> selectedPacked_;
+    AscendC::GlobalTensor<int32_t> selectedCount_;
+    AscendC::GlobalTensor<int32_t> targetSlotWords_;
+    AscendC::GlobalTensor<int32_t> requestBlockTable_;
+    AscendC::GlobalTensor<int32_t> requestStateIndices_;
+    AscendC::GlobalTensor<int64_t> requestStateGenerations_;
+    AscendC::GlobalTensor<int16_t> oldSlots_;
+    AscendC::GlobalTensor<int32_t> slotToToken_;
+    AscendC::GlobalTensor<int64_t> stateGenerations_;
+    AscendC::GlobalTensor<int32_t> unionToSlot_;
+    AscendC::GlobalTensor<int32_t> reverseIndexWords_;
+    AscendC::GlobalTensor<int16_t> reverseValues_;
+    AscendC::TPipe pipe_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> tokenBuf_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> forwardBuf_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> mapBuf_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> freeBuf_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> oldSlotBuf_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> targetBuf_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> indexBuf_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> blockTableBuf_;
+    uint32_t requestCount_ = 0;
+    uint32_t scratchCapacity_ = 0;
+    uint32_t selectedCountStride_ = 0;
+    uint32_t blockTableWidth_ = 0;
+    uint32_t tokenStride_ = 0;
+    uint32_t slotStride_ = 0;
+    uint32_t generationStride_ = 0;
+    uint32_t dummyStateBase_ = 0;
+    uint32_t blockSize_ = 0;
+};
+
 class DSAStagedUniqueFinalizeKernel {
 public:
     __aicore__ inline void Init(
@@ -3887,6 +4289,64 @@ extern "C" __global__ __aicore__ void dsa_resident_remap_rows_kernel(
     }
 }
 
+extern "C" __global__ __aicore__ void dsa_resident_lookup_rows_kernel(
+    __gm__ int32_t* selectedPacked,
+    __gm__ int32_t* selectedCount,
+    __gm__ int32_t* requestStateIndices,
+    __gm__ int32_t* lookupIndexWords,
+    uint32_t requestCount,
+    uint32_t scratchCapacity,
+    uint32_t selectedCountStride,
+    uint32_t tokenStride,
+    uint32_t dummyStateBase)
+{
+    if ASCEND_IS_AIV {
+        DSAResidentLookupRowsKernel op;
+        op.Init(
+            selectedPacked, selectedCount, requestStateIndices,
+            lookupIndexWords, requestCount, scratchCapacity,
+            selectedCountStride, tokenStride, dummyStateBase);
+        op.Process();
+    }
+}
+
+extern "C" __global__ __aicore__ void dsa_resident_finalize_rows_kernel(
+    __gm__ int32_t* selectedPacked,
+    __gm__ int32_t* selectedCount,
+    __gm__ int32_t* targetSlotWords,
+    __gm__ int32_t* requestBlockTable,
+    __gm__ int32_t* requestStateIndices,
+    __gm__ int64_t* requestStateGenerations,
+    __gm__ int16_t* oldSlots,
+    __gm__ int32_t* slotToToken,
+    __gm__ int64_t* stateGenerations,
+    __gm__ int32_t* unionToSlot,
+    __gm__ int32_t* reverseIndexWords,
+    __gm__ int16_t* reverseValues,
+    uint32_t requestCount,
+    uint32_t scratchCapacity,
+    uint32_t selectedCountStride,
+    uint32_t blockTableWidth,
+    uint32_t tokenStride,
+    uint32_t slotStride,
+    uint32_t generationStride,
+    uint32_t dummyStateBase,
+    uint32_t blockSize)
+{
+    if ASCEND_IS_AIV {
+        DSAResidentFinalizeRowsKernel op;
+        op.Init(
+            selectedPacked, selectedCount, targetSlotWords,
+            requestBlockTable, requestStateIndices,
+            requestStateGenerations, oldSlots, slotToToken,
+            stateGenerations, unionToSlot, reverseIndexWords,
+            reverseValues, requestCount, scratchCapacity,
+            selectedCountStride, blockTableWidth, tokenStride,
+            slotStride, generationStride, dummyStateBase, blockSize);
+        op.Process();
+    }
+}
+
 extern "C" __global__ __aicore__ void dsa_staged_unique_finalize_kernel(
     __gm__ int32_t* uniqueKeys,
     __gm__ int32_t* inverseWords,
@@ -4272,6 +4732,52 @@ void dsa_resident_remap_rows_impl(
         static_cast<int32_t*>(positionToUnion),
         static_cast<int32_t*>(unionToSlot),
         rowCount, rowWidth, rowsPerRequest, scratchCapacity);
+}
+
+void dsa_resident_lookup_rows_impl(
+    void* stream, void* selectedPacked, void* selectedCount,
+    void* requestStateIndices, void* lookupIndices,
+    uint32_t requestCount, uint32_t scratchCapacity,
+    uint32_t selectedCountStride, uint32_t tokenStride,
+    uint32_t dummyStateBase)
+{
+    dsa_resident_lookup_rows_kernel<<<requestCount, nullptr, stream>>>(
+        static_cast<int32_t*>(selectedPacked),
+        static_cast<int32_t*>(selectedCount),
+        static_cast<int32_t*>(requestStateIndices),
+        static_cast<int32_t*>(lookupIndices),
+        requestCount, scratchCapacity, selectedCountStride,
+        tokenStride, dummyStateBase);
+}
+
+void dsa_resident_finalize_rows_impl(
+    void* stream, void* selectedPacked, void* selectedCount,
+    void* targetSlots, void* requestBlockTable,
+    void* requestStateIndices, void* requestStateGenerations,
+    void* oldSlots, void* slotToToken, void* stateGenerations,
+    void* unionToSlot, void* reverseIndices, void* reverseValues,
+    uint32_t requestCount, uint32_t scratchCapacity,
+    uint32_t selectedCountStride, uint32_t blockTableWidth,
+    uint32_t tokenStride, uint32_t slotStride,
+    uint32_t generationStride, uint32_t dummyStateBase,
+    uint32_t blockSize)
+{
+    dsa_resident_finalize_rows_kernel<<<requestCount, nullptr, stream>>>(
+        static_cast<int32_t*>(selectedPacked),
+        static_cast<int32_t*>(selectedCount),
+        static_cast<int32_t*>(targetSlots),
+        static_cast<int32_t*>(requestBlockTable),
+        static_cast<int32_t*>(requestStateIndices),
+        static_cast<int64_t*>(requestStateGenerations),
+        static_cast<int16_t*>(oldSlots),
+        static_cast<int32_t*>(slotToToken),
+        static_cast<int64_t*>(stateGenerations),
+        static_cast<int32_t*>(unionToSlot),
+        static_cast<int32_t*>(reverseIndices),
+        static_cast<int16_t*>(reverseValues),
+        requestCount, scratchCapacity, selectedCountStride,
+        blockTableWidth, tokenStride, slotStride, generationStride,
+        dummyStateBase, blockSize);
 }
 
 void dsa_staged_unique_finalize_impl(

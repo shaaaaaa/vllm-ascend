@@ -56,6 +56,14 @@ def _load_dsa_union_operator():
             "vllm_ascend_C does not contain the resident parallel-map "
             "operator"
         )
+    for name in (
+        "npu_dsa_resident_lookup_rows_",
+        "npu_dsa_resident_finalize_rows_",
+    ):
+        if not hasattr(torch.ops._C_ascend, name):
+            pytest.fail(
+                f"vllm_ascend_C does not contain the {name} operator"
+            )
 
 
 def _buffers(requests: int, capacity: int):
@@ -1244,7 +1252,7 @@ def test_production_staged_remaps_without_building_optional_payload():
 @pytest.mark.parametrize(
     "parallel_map",
     [False, True],
-    ids=["native-map", "parallel-aiv-map"],
+    ids=["all-torch", "hybrid-aiv"],
 )
 def test_resident_sparse_cache_native_ops_and_graph_replay(
     mtp,
@@ -1304,8 +1312,9 @@ def test_resident_sparse_cache_native_ops_and_graph_replay(
         dtype=torch.int16,
         device="npu",
     )
+    slot_stride = ((capacity + 1 + 15) // 16) * 16
     slot_to_token = torch.full(
-        (state_rows, capacity + 1),
+        (state_rows, slot_stride),
         -1,
         dtype=torch.int32,
         device="npu",
@@ -1466,6 +1475,48 @@ def test_resident_parallel_map_matches_tensor_reference(
     )
 
 
+def test_resident_hybrid_lookup_rows_uses_private_padding_sentinels():
+    requests = 2
+    capacity = 256
+    token_stride = 512
+    dummy_state_base = requests
+    selected = torch.arange(
+        requests * capacity, dtype=torch.int32, device="npu"
+    ).reshape(requests, capacity)
+    counts = torch.zeros(
+        (requests, 16), dtype=torch.int32, device="npu"
+    )
+    counts[:, 0] = torch.tensor([3, 1], dtype=torch.int32, device="npu")
+    # The second request is graph padding and must use its own dummy row.
+    states = torch.tensor([1, -1], dtype=torch.int32, device="npu")
+    indices = torch.empty(
+        (requests, capacity), dtype=torch.int64, device="npu"
+    )
+
+    torch.ops._C_ascend.npu_dsa_resident_lookup_rows_(
+        selected,
+        counts,
+        states,
+        indices,
+        token_stride,
+        dummy_state_base,
+    )
+    torch.npu.synchronize()
+
+    expected = torch.empty((requests, capacity), dtype=torch.int64)
+    expected[0].fill_(2 * token_stride - 1)
+    expected[0, :3] = (
+        selected[0, :3].cpu().to(torch.int64) + token_stride
+    )
+    dummy_state = dummy_state_base + 1
+    expected[1].fill_((dummy_state + 1) * token_stride - 1)
+    expected[1, 0] = (
+        selected[1, 0].cpu().to(torch.int64)
+        + dummy_state * token_stride
+    )
+    assert torch.equal(indices.cpu(), expected)
+
+
 def _resident_production_fixture(mtp, request_count=2):
     topk = 2048
     capacity = mtp * topk
@@ -1564,7 +1615,7 @@ def _resident_production_fixture(mtp, request_count=2):
             staged_mtp=mtp,
         )
 
-    def resident():
+    def resident(use_hybrid_aiv=True):
         prepare_resident_sparse_cache_(
             values,
             mapping,
@@ -1580,7 +1631,7 @@ def _resident_production_fixture(mtp, request_count=2):
             workspace,
             block_size=block_size,
             scratch_capacity=capacity,
-            parallel_map=True,
+            parallel_map=use_hybrid_aiv,
         )
 
     return {
@@ -1601,6 +1652,62 @@ def _resident_production_fixture(mtp, request_count=2):
         "union": union,
         "resident": resident,
     }
+
+
+@pytest.mark.parametrize("mtp", [1, 2])
+def test_resident_hybrid_matches_all_torch_for_partial_hits(mtp):
+    reference = _resident_production_fixture(mtp)
+    hybrid = _resident_production_fixture(mtp)
+    fixtures = (reference, hybrid)
+    for fixture in fixtures:
+        fixture["union"]()
+    torch.npu.synchronize()
+
+    union_count = int(reference["counts"][0, 0].item())
+    hit_count = union_count // 2
+    request_count = reference["selected"].shape[0]
+    capacity = reference["capacity"]
+    hit_slots = torch.arange(
+        capacity - hit_count,
+        capacity,
+        dtype=torch.int16,
+        device="npu",
+    ).expand(request_count, -1)
+    request_rows = torch.arange(
+        request_count, dtype=torch.long, device="npu"
+    ).reshape(-1, 1)
+    for fixture in fixtures:
+        hit_tokens = fixture["selected"][:, :hit_count].to(torch.long)
+        fixture["token_to_slot"][
+            request_rows, hit_tokens
+        ] = hit_slots
+        fixture["slot_to_token"][
+            :request_count, capacity - hit_count : capacity
+        ].copy_(fixture["selected"][:, :hit_count])
+
+    reference["resident"](False)
+    hybrid["resident"](True)
+    torch.npu.synchronize()
+    miss_count = union_count - hit_count
+    for name in (
+        "values",
+        "token_to_slot",
+        "slot_to_token",
+        "state_generations",
+    ):
+        assert torch.equal(reference[name].cpu(), hybrid[name].cpu()), name
+    assert torch.equal(
+        reference["counts"][:, 0].cpu(),
+        hybrid["counts"][:, 0].cpu(),
+    )
+    assert torch.equal(
+        reference["selected"][:, :miss_count].cpu(),
+        hybrid["selected"][:, :miss_count].cpu(),
+    )
+    assert torch.equal(
+        reference["targets"][:, :miss_count].cpu(),
+        hybrid["targets"][:, :miss_count].cpu(),
+    )
 
 
 @pytest.mark.parametrize("mtp", [1, 2])

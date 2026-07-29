@@ -279,6 +279,105 @@ def _flat_gather(
     )
 
 
+def _prepare_resident_sparse_cache_hybrid_(
+    topk_indices: torch.Tensor,
+    position_to_union: torch.Tensor,
+    selected_packed: torch.Tensor,
+    selected_counts: torch.Tensor,
+    target_slot_mapping: torch.Tensor,
+    request_block_table: torch.Tensor,
+    request_state_indices: torch.Tensor,
+    request_state_generations: torch.Tensor,
+    token_to_slot: torch.Tensor,
+    slot_to_token: torch.Tensor,
+    state_generations: torch.Tensor,
+    workspace: ResidentSparseWorkspace,
+    *,
+    block_size: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Run the fused AIV planner around one native gather and scatter."""
+    request_count, scratch_capacity = selected_packed.shape
+    token_stride = int(token_to_slot.shape[1])
+    max_requests = int(workspace.slot_ids.shape[0])
+    dummy_state_base = int(token_to_slot.shape[0]) - max_requests
+    if dummy_state_base != max_requests:
+        raise ValueError(
+            "resident persistent maps need exactly one real and one "
+            "cacheline-private dummy row per maximum batch request"
+        )
+    if slot_to_token.shape[0] != token_to_slot.shape[0]:
+        raise ValueError("resident persistent maps have different state rows")
+    if token_stride % 32 or int(slot_to_token.shape[1]) % 16:
+        raise ValueError(
+            "hybrid resident rows must begin on separate 64-byte "
+            "cachelines"
+        )
+    if (
+        state_generations.dim() != 2
+        or state_generations.shape[0] != token_to_slot.shape[0]
+        or state_generations.shape[1] < 8
+        or state_generations.shape[1] % 8
+    ):
+        raise ValueError("resident generation table has different state rows")
+
+    lookup_indices = workspace.state_token_indices[:request_count]
+    old_slots_i16 = workspace.old_slots_i16[:request_count]
+    union_to_slot = workspace.union_to_slot[:request_count]
+    reverse_values = workspace.short_sources[:request_count]
+    try:
+        lookup_op = torch.ops._C_ascend.npu_dsa_resident_lookup_rows_
+        finalize_op = (
+            torch.ops._C_ascend.npu_dsa_resident_finalize_rows_
+        )
+    except AttributeError as exc:
+        raise RuntimeError(
+            "vllm_ascend_C does not expose the fused resident planner; "
+            "rebuild the custom-op extension"
+        ) from exc
+
+    lookup_op(
+        selected_packed,
+        selected_counts,
+        request_state_indices,
+        lookup_indices,
+        token_stride,
+        dummy_state_base,
+    )
+    _flat_gather(token_to_slot, lookup_indices, old_slots_i16)
+    finalize_op(
+        topk_indices,
+        position_to_union,
+        selected_packed,
+        selected_counts,
+        target_slot_mapping,
+        request_block_table,
+        request_state_indices,
+        request_state_generations,
+        old_slots_i16,
+        slot_to_token,
+        state_generations,
+        union_to_slot,
+        lookup_indices,
+        reverse_values,
+        token_stride,
+        block_size,
+    )
+    # The fused AIV emits fixed-shape request-private sentinel updates for
+    # hits/padding and real updates only for misses. The native NPU scatter is
+    # the sole writer of the 130K token -> slot reverse table.
+    token_to_slot.reshape(-1).scatter_(
+        0,
+        lookup_indices.reshape(-1),
+        reverse_values.reshape(-1),
+    )
+    counts = (
+        selected_counts[:, 0]
+        if selected_counts.dim() == 2
+        else selected_counts
+    )
+    return topk_indices, selected_packed, counts, target_slot_mapping
+
+
 def prepare_resident_sparse_cache_(
     topk_indices: torch.Tensor,
     position_to_union: torch.Tensor,
@@ -300,8 +399,10 @@ def prepare_resident_sparse_cache_(
     """Convert a request union into a persistent scratch-cache miss plan.
 
     This function is intentionally fixed-shape and mutates only caller-owned
-    tensors.  Every operation is an NPU-native tensor operation, so the path is
-    graph-capturable without a host-side token loop. ``selected_packed`` and
+    tensors. ``parallel_map=True`` selects the fused per-request AIV planner
+    around one native NPU gather and scatter. ``False`` preserves the original
+    all-Torch native-op implementation as a correctness/performance reference.
+    Both paths are graph-capturable. ``selected_packed`` and
     ``selected_counts`` enter with the union and leave with only cache misses.
     """
     validate_resident_shapes(
@@ -329,6 +430,22 @@ def prepare_resident_sparse_cache_(
         raise ValueError(
             "resident top-k must contain MTP * index_topk positions per "
             "request"
+        )
+    if parallel_map:
+        return _prepare_resident_sparse_cache_hybrid_(
+            topk_indices,
+            position_to_union,
+            selected_packed,
+            selected_counts,
+            target_slot_mapping,
+            request_block_table,
+            request_state_indices,
+            request_state_generations,
+            token_to_slot,
+            slot_to_token,
+            state_generations,
+            workspace,
+            block_size=block_size,
         )
 
     union_tokens = workspace.union_tokens[:request_count]
@@ -597,33 +714,20 @@ def prepare_resident_sparse_cache_(
 
     # Map every selected original top-k position through union rank -> actual
     # persistent scratch slot. Live-cache positions retain absolute indices.
-    if parallel_map:
-        try:
-            remap_op = (
-                torch.ops._C_ascend.npu_dsa_resident_remap_rows_
-            )
-        except AttributeError as exc:
-            raise RuntimeError(
-                "vllm_ascend_C does not expose "
-                "npu_dsa_resident_remap_rows_; rebuild the custom-op "
-                "extension"
-            ) from exc
-        remap_op(topk_indices, position_to_union, union_to_slot)
-    else:
-        topk_2d = topk_indices.reshape(request_count, scratch_capacity)
-        mapping = position_to_union.reshape(
-            request_count, scratch_capacity
-        )
-        torch.ge(mapping, 0, out=valid_union)
-        gather_indices.copy_(mapping)
-        gather_indices.clamp_min_(0)
-        torch.gather(
-            union_to_slot,
-            1,
-            gather_indices,
-            out=int_sources,
-        )
-        torch.where(valid_union, int_sources, topk_2d, out=topk_2d)
+    topk_2d = topk_indices.reshape(request_count, scratch_capacity)
+    mapping = position_to_union.reshape(
+        request_count, scratch_capacity
+    )
+    torch.ge(mapping, 0, out=valid_union)
+    gather_indices.copy_(mapping)
+    gather_indices.clamp_min_(0)
+    torch.gather(
+        union_to_slot,
+        1,
+        gather_indices,
+        out=int_sources,
+    )
+    torch.where(valid_union, int_sources, topk_2d, out=topk_2d)
     return topk_indices, selected_packed, counts, target_slot_mapping
 
 
