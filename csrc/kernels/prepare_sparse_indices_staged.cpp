@@ -110,12 +110,16 @@ public:
         __gm__ int32_t* rowReqIndices,
         __gm__ int32_t* rowPacked,
         __gm__ int32_t* rowCounts,
+        __gm__ int32_t* selectedCount,
+        __gm__ int32_t* positionMap,
         uint32_t rowCount,
         uint32_t rowWidth,
         uint32_t requestCount,
         uint32_t rowsPerRequest,
         uint32_t scratchCapacity,
+        uint32_t selectedCountStride,
         uint32_t coreCount,
+        bool emitPositionMap,
         bool clearInvalidRows)
     {
         rowCount_ = rowCount;
@@ -123,7 +127,9 @@ public:
         requestCount_ = requestCount;
         rowsPerRequest_ = rowsPerRequest;
         scratchCapacity_ = scratchCapacity;
+        selectedCountStride_ = selectedCountStride;
         coreCount_ = coreCount;
+        emitPositionMap_ = emitPositionMap;
         clearInvalidRows_ = clearInvalidRows;
         topkIndices_.SetGlobalBuffer(
             topkIndices,
@@ -135,6 +141,12 @@ public:
             static_cast<uint64_t>(requestCount_) * scratchCapacity_);
         rowCounts_.SetGlobalBuffer(
             rowCounts,
+            static_cast<uint64_t>(requestCount_) * scratchCapacity_);
+        selectedCount_.SetGlobalBuffer(
+            selectedCount,
+            static_cast<uint64_t>(requestCount_) * selectedCountStride_);
+        positionMap_.SetGlobalBuffer(
+            positionMap,
             static_cast<uint64_t>(requestCount_) * scratchCapacity_);
 
         const uint32_t rowBytes = rowWidth_ * sizeof(int32_t);
@@ -187,6 +199,12 @@ private:
         if (rowRequest < 0) {
             AscendC::Duplicate(
                 packed, static_cast<int32_t>(0x7FFFFFFF), rowWidth_);
+            if (emitPositionMap_) {
+                AscendC::Duplicate(
+                    flags.ReinterpretCast<int32_t>(),
+                    static_cast<int32_t>(-1),
+                    rowWidth_);
+            }
             if (clearInvalidRows_) {
                 AscendC::Duplicate(
                     input, static_cast<int32_t>(0), rowWidth_);
@@ -199,7 +217,18 @@ private:
                 AscendC::DataCopy(
                     topkIndices_[inputOffset], input, rowWidth_);
             }
-            rowCounts_.SetValue(packedOffset, 0);
+            if (emitPositionMap_) {
+                AscendC::DataCopy(
+                    positionMap_[packedOffset],
+                    flags.ReinterpretCast<int32_t>(),
+                    rowWidth_);
+                selectedCount_.SetValue(
+                    static_cast<uint64_t>(request)
+                        * selectedCountStride_,
+                    0);
+            } else {
+                rowCounts_.SetValue(packedOffset, 0);
+            }
             return;
         }
 
@@ -207,11 +236,28 @@ private:
         if (boundary <= 0) {
             AscendC::Duplicate(
                 packed, static_cast<int32_t>(0x7FFFFFFF), rowWidth_);
+            if (emitPositionMap_) {
+                AscendC::Duplicate(
+                    flags.ReinterpretCast<int32_t>(),
+                    static_cast<int32_t>(-1),
+                    rowWidth_);
+            }
             AscendC::PipeBarrier<PIPE_V>();
             Sync<AscendC::HardEvent::V_MTE3>();
             AscendC::DataCopy(
                 rowPacked_[packedOffset], packed, rowWidth_);
-            rowCounts_.SetValue(packedOffset, 0);
+            if (emitPositionMap_) {
+                AscendC::DataCopy(
+                    positionMap_[packedOffset],
+                    flags.ReinterpretCast<int32_t>(),
+                    rowWidth_);
+                selectedCount_.SetValue(
+                    static_cast<uint64_t>(request)
+                        * selectedCountStride_,
+                    0);
+            } else {
+                rowCounts_.SetValue(packedOffset, 0);
+            }
             return;
         }
         AscendC::Maxs(
@@ -312,13 +358,41 @@ private:
             AscendC::SELMODE::VSEL_TENSOR_TENSOR_MODE,
             rowWidth_);
         AscendC::PipeBarrier<PIPE_V>();
+        if (emitPositionMap_) {
+            // MTP=1 bypasses union, but the resident planner still needs the
+            // same position -> selected-rank contract as the MTP=2 path.
+            // Reuse the dead flags buffer after CumSum to avoid increasing UB.
+            AscendC::Duplicate(
+                flags.ReinterpretCast<int32_t>(),
+                static_cast<int32_t>(-1),
+                rowWidth_);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Select(
+                flags,
+                selectedMask,
+                clamped.ReinterpretCast<float>(),
+                flags,
+                AscendC::SELMODE::VSEL_TENSOR_TENSOR_MODE,
+                rowWidth_);
+            AscendC::PipeBarrier<PIPE_V>();
+        }
         Sync<AscendC::HardEvent::V_MTE3>();
         AscendC::DataCopy(
             topkIndices_[inputOffset], input, rowWidth_);
         AscendC::DataCopy(
             rowPacked_[packedOffset], packed, rowWidth_);
-        rowCounts_.SetValue(
-            packedOffset, static_cast<int32_t>(selectedCount));
+        if (emitPositionMap_) {
+            AscendC::DataCopy(
+                positionMap_[packedOffset],
+                flags.ReinterpretCast<int32_t>(),
+                rowWidth_);
+            selectedCount_.SetValue(
+                static_cast<uint64_t>(request) * selectedCountStride_,
+                static_cast<int32_t>(selectedCount));
+        } else {
+            rowCounts_.SetValue(
+                packedOffset, static_cast<int32_t>(selectedCount));
+        }
     }
 
     AscendC::GlobalTensor<int32_t> topkIndices_;
@@ -326,6 +400,8 @@ private:
     AscendC::GlobalTensor<int32_t> rowReqIndices_;
     AscendC::GlobalTensor<int32_t> rowPacked_;
     AscendC::GlobalTensor<int32_t> rowCounts_;
+    AscendC::GlobalTensor<int32_t> selectedCount_;
+    AscendC::GlobalTensor<int32_t> positionMap_;
     AscendC::TPipe pipe_;
     AscendC::TBuf<AscendC::TPosition::VECCALC> inputBuf_;
     AscendC::TBuf<AscendC::TPosition::VECCALC> clampedBuf_;
@@ -341,7 +417,9 @@ private:
     uint32_t requestCount_ = 0;
     uint32_t rowsPerRequest_ = 0;
     uint32_t scratchCapacity_ = 0;
+    uint32_t selectedCountStride_ = 0;
     uint32_t coreCount_ = 0;
+    bool emitPositionMap_ = false;
     bool clearInvalidRows_ = false;
 };
 
@@ -901,7 +979,7 @@ public:
         }
         rowCounts_.SetGlobalBuffer(
             rowCounts,
-            static_cast<uint64_t>(requestCount_) * scratchCapacity_);
+            static_cast<uint64_t>(requestCount_) * selectedCountStride_);
         selectedCount_.SetGlobalBuffer(
             selectedCount,
             static_cast<uint64_t>(requestCount_) * selectedCountStride_);
@@ -934,7 +1012,8 @@ public:
         const uint64_t outputOffset =
             static_cast<uint64_t>(request) * scratchCapacity_;
         const uint32_t count = static_cast<uint32_t>(
-            rowCounts_.GetValue(outputOffset));
+            rowCounts_.GetValue(
+                static_cast<uint64_t>(request) * selectedCountStride_));
         if (count == 0) {
             selectedCount_.SetValue(
                 static_cast<uint64_t>(request) * selectedCountStride_, 0);
@@ -3314,13 +3393,17 @@ public:
 
         AscendC::CreateVecIndex(
             positions, static_cast<int32_t>(0), scratchCapacity_);
-        AscendC::Duplicate(indices, count, scratchCapacity_);
+        // Use the same Mins+EQ validity construction as the production sort
+        // kernels. It also handles count==0: min(position, -1) never equals a
+        // non-negative position.
+        AscendC::Mins(
+            indices, positions, count - 1, scratchCapacity_);
         AscendC::PipeBarrier<PIPE_V>();
         AscendC::Compare(
             validMask,
-            positions,
             indices,
-            AscendC::CMPMODE::LT,
+            positions,
+            AscendC::CMPMODE::EQ,
             scratchCapacity_);
         AscendC::PipeBarrier<PIPE_V>();
         AscendC::Adds(indices, tokens, base, scratchCapacity_);
@@ -3883,20 +3966,26 @@ extern "C" __global__ __aicore__ void dsa_staged_compact_rows_kernel(
     __gm__ int32_t* rowReqIndices,
     __gm__ int32_t* rowPacked,
     __gm__ int32_t* rowCounts,
+    __gm__ int32_t* selectedCount,
+    __gm__ int32_t* positionMap,
     uint32_t rowCount,
     uint32_t rowWidth,
     uint32_t requestCount,
     uint32_t rowsPerRequest,
     uint32_t scratchCapacity,
+    uint32_t selectedCountStride,
     uint32_t coreCount,
+    bool emitPositionMap,
     bool clearInvalidRows)
 {
     if ASCEND_IS_AIV {
         DSAStagedCompactRowsKernel op;
         op.Init(
             topkIndices, splitBoundary, rowReqIndices, rowPacked, rowCounts,
+            selectedCount, positionMap,
             rowCount, rowWidth, requestCount, rowsPerRequest,
-            scratchCapacity, coreCount, clearInvalidRows);
+            scratchCapacity, selectedCountStride, coreCount,
+            emitPositionMap, clearInvalidRows);
         op.Process();
     }
 }
@@ -4424,11 +4513,14 @@ static void dsa_prepare_sparse_indices_single_row_impl(
         static_cast<int32_t*>(rowReqIndices),
         static_cast<int32_t*>(selectedPacked),
         static_cast<int32_t*>(localToUnion),
+        static_cast<int32_t*>(selectedCount),
+        static_cast<int32_t*>(localToUnion),
         requestCount, rowWidth, requestCount, 1,
-        scratchCapacity, coreCount, clearInvalidRows);
+        scratchCapacity, selectedCountStride, coreCount, true,
+        clearInvalidRows);
     dsa_staged_single_row_finalize_kernel<<<
         requestCount, nullptr, stream>>>(
-        static_cast<int32_t*>(localToUnion),
+        static_cast<int32_t*>(selectedCount),
         static_cast<int32_t*>(selectedCount),
         static_cast<int32_t*>(requestBlockTable),
         static_cast<int64_t*>(targetSlots),
@@ -4463,8 +4555,11 @@ void dsa_prepare_sparse_indices_staged_impl(
         static_cast<int32_t*>(rowReqIndices),
         static_cast<int32_t*>(selectedPacked),
         static_cast<int32_t*>(localToUnion),
+        static_cast<int32_t*>(selectedCount),
+        static_cast<int32_t*>(localToUnion),
         rowCount, rowWidth, requestCount, rowsPerRequest,
-        scratchCapacity, coreCount, clearInvalidRows);
+        scratchCapacity, selectedCountStride, coreCount, false,
+        clearInvalidRows);
 
     dsa_staged_production_sort_union_kernel<<<
         requestCount, nullptr, stream>>>(

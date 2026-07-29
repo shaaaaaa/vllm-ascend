@@ -176,9 +176,9 @@ def main(
         hit_slots = torch.arange(
             capacity - hit_count,
             capacity,
-            dtype=torch.int16,
+            dtype=torch.int32,
             device=device,
-        ).expand(requests, -1)
+        ).to(torch.int16).expand(requests, -1)
         seed_token_to_slot[
             request_states.to(torch.int64).reshape(-1, 1),
             hit_tokens,

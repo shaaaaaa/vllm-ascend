@@ -1476,19 +1476,21 @@ def test_resident_parallel_map_matches_tensor_reference(
 
 
 def test_resident_hybrid_lookup_rows_uses_private_padding_sentinels():
-    requests = 2
+    requests = 4
     capacity = 256
     token_stride = 512
     dummy_state_base = requests
     selected = torch.arange(
-        requests * capacity, dtype=torch.int32, device="npu"
-    ).reshape(requests, capacity)
+        capacity, dtype=torch.int32, device="npu"
+    ).expand(requests, -1)
     counts = torch.zeros(
         (requests, 16), dtype=torch.int32, device="npu"
     )
-    counts[:, 0] = torch.tensor([3, 1], dtype=torch.int32, device="npu")
-    # The second request is graph padding and must use its own dummy row.
-    states = torch.tensor([1, -1], dtype=torch.int32, device="npu")
+    counts[:, 0] = torch.tensor(
+        [0, 1, 3, capacity], dtype=torch.int32, device="npu"
+    )
+    # The third request is graph padding and must use its own dummy row.
+    states = torch.tensor([0, 1, -1, 3], dtype=torch.int32, device="npu")
     indices = torch.empty(
         (requests, capacity), dtype=torch.int64, device="npu"
     )
@@ -1504,16 +1506,19 @@ def test_resident_hybrid_lookup_rows_uses_private_padding_sentinels():
     torch.npu.synchronize()
 
     expected = torch.empty((requests, capacity), dtype=torch.int64)
-    expected[0].fill_(2 * token_stride - 1)
-    expected[0, :3] = (
-        selected[0, :3].cpu().to(torch.int64) + token_stride
-    )
-    dummy_state = dummy_state_base + 1
-    expected[1].fill_((dummy_state + 1) * token_stride - 1)
-    expected[1, 0] = (
-        selected[1, 0].cpu().to(torch.int64)
-        + dummy_state * token_stride
-    )
+    counts_cpu = counts[:, 0].cpu().tolist()
+    states_cpu = states.cpu().tolist()
+    selected_cpu = selected.cpu().to(torch.int64)
+    for request, (count, state) in enumerate(
+        zip(counts_cpu, states_cpu, strict=True)
+    ):
+        safe_state = (
+            state if state >= 0 else dummy_state_base + request
+        )
+        expected[request].fill_((safe_state + 1) * token_stride - 1)
+        expected[request, :count] = (
+            selected_cpu[request, :count] + safe_state * token_stride
+        )
     assert torch.equal(indices.cpu(), expected)
 
 
@@ -1670,9 +1675,9 @@ def test_resident_hybrid_matches_all_torch_for_partial_hits(mtp):
     hit_slots = torch.arange(
         capacity - hit_count,
         capacity,
-        dtype=torch.int16,
+        dtype=torch.int32,
         device="npu",
-    ).expand(request_count, -1)
+    ).to(torch.int16).expand(request_count, -1)
     request_rows = torch.arange(
         request_count, dtype=torch.long, device="npu"
     ).reshape(-1, 1)
@@ -1732,9 +1737,9 @@ def test_resident_production_pipeline_partial_hits_all_hits_and_generation(
     hit_slots = torch.arange(
         capacity - hit_count,
         capacity,
-        dtype=torch.int16,
+        dtype=torch.int32,
         device="npu",
-    ).expand(request_count, -1)
+    ).to(torch.int16).expand(request_count, -1)
     hit_tokens = union_seed[:, :hit_count].to(torch.long)
     request_rows = torch.arange(
         request_count, dtype=torch.long, device="npu"
@@ -1810,6 +1815,10 @@ def test_resident_production_pipeline_zero_split_boundary_is_noop(mtp):
     fixture = _resident_production_fixture(mtp)
     fixture["boundaries"].zero_()
     fixture["union"]()
+    if mtp == 1:
+        # The single-row fast path bypasses union, but must still publish the
+        # position-map contract consumed by the resident planner.
+        assert torch.all(fixture["mapping"].cpu() == -1)
     fixture["resident"]()
     torch.npu.synchronize()
 
