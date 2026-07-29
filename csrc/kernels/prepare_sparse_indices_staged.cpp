@@ -3146,8 +3146,10 @@ public:
         pipe_.InitBuffer(inputBuf_, rowWidth_ * sizeof(int32_t));
         pipe_.InitBuffer(rankBuf_, rowWidth_ * sizeof(int32_t));
         pipe_.InitBuffer(clampedBuf_, rowWidth_ * sizeof(int32_t));
-        pipe_.InitBuffer(outputBuf_, rowWidth_ * sizeof(int32_t));
-        pipe_.InitBuffer(offsetBuf_, rowWidth_ * sizeof(uint32_t));
+        // ranks becomes the Gather destination after Compare, while clamped
+        // becomes the final Select destination after serving as byte offsets.
+        // Their lifetimes do not overlap, so this reduces peak UB usage by two
+        // row buffers without changing the remap algorithm.
         pipe_.InitBuffer(
             unionBuf_, scratchCapacity_ * sizeof(int32_t));
         pipe_.InitBuffer(selectedMaskBuf_, rowWidth_ / 8);
@@ -3167,8 +3169,6 @@ public:
         auto input = inputBuf_.Get<int32_t>();
         auto ranks = rankBuf_.Get<int32_t>();
         auto clamped = clampedBuf_.Get<int32_t>();
-        auto output = outputBuf_.Get<int32_t>();
-        auto offsets = offsetBuf_.Get<uint32_t>();
         auto unionSlots = unionBuf_.Get<int32_t>();
         auto selectedMask = selectedMaskBuf_.Get<uint8_t>();
         AscendC::DataCopy(
@@ -3196,29 +3196,29 @@ public:
             rowWidth_);
         AscendC::PipeBarrier<PIPE_V>();
         AscendC::Muls(
-            offsets.ReinterpretCast<int32_t>(),
+            clamped,
             clamped,
             static_cast<int32_t>(sizeof(int32_t)),
             rowWidth_);
         AscendC::PipeBarrier<PIPE_V>();
         AscendC::Gather(
-            output,
+            ranks,
             unionSlots,
-            offsets,
+            clamped.ReinterpretCast<uint32_t>(),
             static_cast<uint32_t>(0),
             rowWidth_);
         AscendC::PipeBarrier<PIPE_V>();
         AscendC::Select(
-            output.ReinterpretCast<float>(),
+            clamped.ReinterpretCast<float>(),
             selectedMask,
-            output.ReinterpretCast<float>(),
+            ranks.ReinterpretCast<float>(),
             input.ReinterpretCast<float>(),
             AscendC::SELMODE::VSEL_TENSOR_TENSOR_MODE,
             rowWidth_);
         AscendC::PipeBarrier<PIPE_V>();
         Sync<AscendC::HardEvent::V_MTE3>();
         AscendC::DataCopy(
-            topkIndices_[rowOffset], output, rowWidth_);
+            topkIndices_[rowOffset], clamped, rowWidth_);
     }
 
 private:
@@ -3229,8 +3229,6 @@ private:
     AscendC::TBuf<AscendC::TPosition::VECCALC> inputBuf_;
     AscendC::TBuf<AscendC::TPosition::VECCALC> rankBuf_;
     AscendC::TBuf<AscendC::TPosition::VECCALC> clampedBuf_;
-    AscendC::TBuf<AscendC::TPosition::VECCALC> outputBuf_;
-    AscendC::TBuf<AscendC::TPosition::VECCALC> offsetBuf_;
     AscendC::TBuf<AscendC::TPosition::VECCALC> unionBuf_;
     AscendC::TBuf<AscendC::TPosition::VECCALC> selectedMaskBuf_;
     uint32_t rowCount_ = 0;
