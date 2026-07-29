@@ -485,6 +485,34 @@ class TestLMCacheSparseFrontier(TestBase):
             (StagedSFARouteReason.ELIGIBLE, (0, 8192)),
         )
 
+    def test_cold_compact_resume_excludes_recomputed_last_prompt_token(self):
+        metadata = SimpleNamespace(
+            requests=[
+                SimpleNamespace(
+                    req_id="cold-compact",
+                    is_sparse_decode=True,
+                    load_spec=SimpleNamespace(
+                        can_load=True,
+                        lmcache_cached_tokens=8193,
+                        dsa_committed_end=8192,
+                        dsa_cold_compact_load=False,
+                    ),
+                )
+            ]
+        )
+
+        self.assertEqual(
+            attention_utils.staged_sfa_metadata_sparse_load(
+                metadata,
+                ["cold-compact"],
+            ),
+            (StagedSFARouteReason.ELIGIBLE, (8192,)),
+        )
+        self.assertEqual(
+            self._remap_frontiers(metadata, ["cold-compact"]),
+            [8192],
+        )
+
     def test_mixed_load_requires_every_row_to_be_loadable(self):
         metadata = SimpleNamespace(
             requests=[
