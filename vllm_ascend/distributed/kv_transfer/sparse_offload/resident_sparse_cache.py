@@ -537,8 +537,10 @@ def prepare_resident_sparse_cache_(
     torch.logical_not(valid_union, out=available_mask)
     gather_indices.masked_fill_(available_mask, token_stride - 1)
     state_token_indices.add_(gather_indices)
+    # union_to_slot was already set to -1 at every invalid union position.
+    # Copying it performs the checked int32 -> int16 conversion without an
+    # int16 masked_fill_, which aclnn does not support on Ascend.
     short_sources.copy_(union_to_slot)
-    short_sources.masked_fill_(available_mask, INVALID_SCRATCH_SLOT)
     token_to_slot.reshape(-1).scatter_(
         0,
         state_token_indices.reshape(-1),
