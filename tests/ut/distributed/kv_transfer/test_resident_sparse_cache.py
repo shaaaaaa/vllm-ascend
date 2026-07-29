@@ -342,6 +342,26 @@ def test_native_planner_cold_hits_and_lowest_unprotected_eviction():
     assert state[1][0, :4].tolist() == [50, 20, 30, 40]
 
 
+def test_native_planner_uses_request_major_block_table_rows():
+    state = _native_state(requests=2, capacity=4)
+    assert torch.count_nonzero(state[3].miss_slot_payload).item() == 0
+    _, _, counts, targets = _native_plan(
+        [[10, 20], [30, 40]],
+        token_to_slot=state[0],
+        slot_to_token=state[1],
+        generations=state[2],
+        workspace=state[3],
+        request_generations=[1, 1],
+        capacity=4,
+    )
+
+    assert counts.tolist() == [2, 2]
+    assert targets[0, :2].tolist() == [100, 101]
+    assert targets[1, :2].tolist() == [104, 105]
+    assert torch.all(state[3].miss_slot_payload[:, :4] >= 0)
+    assert torch.all(state[3].miss_slot_payload[:, :4] < 4)
+
+
 def test_native_planner_generation_change_rejects_all_old_slots():
     state = _native_state(capacity=4)
     _native_plan(

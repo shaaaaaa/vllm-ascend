@@ -219,7 +219,11 @@ def allocate_resident_workspace(
         miss_payload=torch.empty(
             sentinel_shape, dtype=torch.int32, device=device
         ),
-        miss_slot_payload=torch.empty(
+        # The final fixed-shape block-table gather reads the full capacity,
+        # including positions beyond the current miss count. Start those
+        # unwritten tails at a valid local slot; later scatters only publish
+        # other valid local slots within the payload region.
+        miss_slot_payload=torch.zeros(
             sentinel_shape, dtype=torch.int32, device=device
         ),
         state_token_indices=torch.empty(
