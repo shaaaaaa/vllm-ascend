@@ -183,7 +183,9 @@ def main(
             request_states.to(torch.int64).reshape(-1, 1),
             hit_tokens,
         ] = hit_slots
-        seed_slot_to_token[:, capacity - hit_count : capacity].copy_(
+        seed_slot_to_token[
+            :requests, capacity - hit_count : capacity
+        ].copy_(
             union_seed[:, :hit_count]
         )
 
