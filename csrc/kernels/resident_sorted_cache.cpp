@@ -1488,8 +1488,12 @@ public:
         stateCounts_.SetValue(
             newCountOffset, static_cast<int32_t>(mergedCount));
 
+        // Temporary isolation: keep union/finalize/state update unchanged
+        // while excluding only the new vector remap from execution.
+#if 0
         RemapPositionPartition(
             request, shard, requestShardBase);
+#endif
 
         // Every shard copied its complete old list to private UB before
         // overwriting its own disjoint GM range. Generation mismatches were
