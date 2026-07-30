@@ -475,6 +475,7 @@ class RecomputeScheduler(Scheduler):
 
                 num_external_computed_tokens = 0
                 load_kv_async = False
+                dsa_compact_external_load = False
                 connector_prefix_cache_queries, connector_prefix_cache_hits = 0, 0
 
                 # Get already-cached tokens.
@@ -500,6 +501,13 @@ class RecomputeScheduler(Scheduler):
 
                         request.num_external_computed_tokens = ext_tokens
                         num_external_computed_tokens = ext_tokens
+                        dsa_compact_external_load = load_kv_async and bool(
+                            getattr(
+                                self.connector,
+                                "supports_dsa_compact_external_load",
+                                False,
+                            )
+                        )
 
                         if load_kv_async:
                             logger.info(
@@ -507,7 +515,7 @@ class RecomputeScheduler(Scheduler):
                                 "scheduler=%s req=%s request_tokens=%d "
                                 "local_tokens=%d external_tokens=%d "
                                 "connector_compact_capable=%s "
-                                "compact_forwarded=false reason=argument_omitted",
+                                "compact_forwarded=%s",
                                 type(self).__name__,
                                 request_id,
                                 request.num_tokens,
@@ -520,6 +528,7 @@ class RecomputeScheduler(Scheduler):
                                         False,
                                     )
                                 ),
+                                dsa_compact_external_load,
                             )
 
                         connector_prefix_cache_queries = request.num_tokens - num_new_local_computed_tokens
@@ -615,6 +624,7 @@ class RecomputeScheduler(Scheduler):
                     num_external_computed_tokens=num_external_computed_tokens,
                     delay_cache_blocks=load_kv_async,
                     num_encoder_tokens=num_encoder_tokens,
+                    dsa_compact_external_load=dsa_compact_external_load,
                 )
 
                 if load_kv_async:
@@ -622,12 +632,13 @@ class RecomputeScheduler(Scheduler):
                         "[DSA_COLD_DIAG] scheduler_allocation "
                         "scheduler=%s req=%s result=%s "
                         "num_new_tokens=%d external_tokens=%d "
-                        "delay_cache_blocks=true compact_forwarded=false",
+                        "delay_cache_blocks=true compact_forwarded=%s",
                         type(self).__name__,
                         request_id,
                         "success" if new_blocks is not None else "no_space",
                         num_new_tokens,
                         num_external_computed_tokens,
+                        dsa_compact_external_load,
                     )
 
                 if new_blocks is None:
