@@ -46,6 +46,14 @@ def parse_args() -> argparse.Namespace:
         nargs="+",
         default=(1, 2),
     )
+    parser.add_argument(
+        "--step",
+        type=int,
+        choices=(1, 2, 3),
+        nargs="+",
+        default=(1, 2, 3),
+        help="Decode step whose remap pipeline should be truncated.",
+    )
     parser.add_argument("--start-stage", type=int, default=1)
     parser.add_argument("--end-stage", type=int, default=18)
     return parser.parse_args()
@@ -58,28 +66,31 @@ def main() -> int:
     environment["ASCEND_LAUNCH_BLOCKING"] = "1"
 
     for mtp in args.mtp:
-        for stage, name in STAGES:
-            if stage < args.start_stage or stage > args.end_stage:
-                continue
-            case = f"mtp{mtp}-stage{stage}-{name}"
-            node = f"{TEST_FILE}::{TEST_NAME}[{case}]"
-            print(
-                f"\n===== MTP={mtp} stage={stage}: {name} =====",
-                flush=True,
-            )
-            result = subprocess.run(
-                [sys.executable, "-m", "pytest", "-sv", node],
-                cwd=repo_root,
-                env=environment,
-                check=False,
-            )
-            if result.returncode != 0:
+        for step in args.step:
+            for stage, name in STAGES:
+                if stage < args.start_stage or stage > args.end_stage:
+                    continue
+                case = f"mtp{mtp}-step{step}-stage{stage}-{name}"
+                node = f"{TEST_FILE}::{TEST_NAME}[{case}]"
                 print(
-                    "\nFIRST FAILING REMAP STAGE:"
-                    f" MTP={mtp}, stage={stage}, instruction={name}",
+                    f"\n===== MTP={mtp} step={step}"
+                    f" stage={stage}: {name} =====",
                     flush=True,
                 )
-                return result.returncode
+                result = subprocess.run(
+                    [sys.executable, "-m", "pytest", "-sv", node],
+                    cwd=repo_root,
+                    env=environment,
+                    check=False,
+                )
+                if result.returncode != 0:
+                    print(
+                        "\nFIRST FAILING REMAP STAGE:"
+                        f" MTP={mtp}, step={step}, stage={stage},"
+                        f" instruction={name}",
+                        flush=True,
+                    )
+                    return result.returncode
 
     print("\nAll selected remap stages passed.", flush=True)
     return 0

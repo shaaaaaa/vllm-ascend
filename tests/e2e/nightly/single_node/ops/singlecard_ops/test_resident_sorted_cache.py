@@ -647,26 +647,27 @@ _REMAP_VECTOR_DEBUG_STAGES = (
     (18, "topk-writeback"),
 )
 _REMAP_VECTOR_DEBUG_CASES = tuple(
-    (mtp, stage, name)
+    (mtp, target_step, stage, name)
     for mtp in (1, 2)
+    for target_step in (1, 2, 3)
     for stage, name in _REMAP_VECTOR_DEBUG_STAGES
 )
 
 
 @pytest.mark.parametrize(
-    "mtp,debug_stage,stage_name",
+    "mtp,target_step,debug_stage,stage_name",
     _REMAP_VECTOR_DEBUG_CASES,
     ids=[
-        f"mtp{mtp}-stage{stage}-{name}"
-        for mtp, stage, name in _REMAP_VECTOR_DEBUG_CASES
+        f"mtp{mtp}-step{target_step}-stage{stage}-{name}"
+        for mtp, target_step, stage, name in _REMAP_VECTOR_DEBUG_CASES
     ],
 )
-def test_remap_vector_stage_probe(mtp, debug_stage, stage_name):
+def test_remap_vector_stage_probe(
+    mtp, target_step, debug_stage, stage_name
+):
     """Run exactly one prefix of the remap pipeline in this process."""
     requests = 1
     capacity = mtp * 2048
-    source = _source(mtp, 0)
-    values = source.npu()
     boundaries = torch.full(
         (mtp,),
         100_000,
@@ -688,37 +689,47 @@ def test_remap_vector_stage_probe(mtp, debug_stage, stage_name):
         device="npu",
     ).reshape(1, -1)
 
-    prepare_resident_sharded_union_(
-        values,
-        boundaries,
-        row_requests,
-        request_states,
-        request_generations,
-        state,
-        workspace,
-        mtp=mtp,
-    )
-    print(
-        "\n[resident-remap-stage]"
-        f" mtp={mtp}"
-        f" stage={debug_stage}"
-        f" name={stage_name}",
-        flush=True,
-    )
-    prepare_sorted_resident_cache_(
-        values,
-        block_table,
-        request_states,
-        request_generations,
-        state,
-        workspace,
-        block_size=128,
-        remap_debug_stage=debug_stage,
-    )
-    torch.npu.synchronize()
+    for step, offset in enumerate((0, 100, 0), start=1):
+        if step > target_step:
+            break
+        source = _source(mtp, offset)
+        values = source.npu()
+        prepare_resident_sharded_union_(
+            values,
+            boundaries,
+            row_requests,
+            request_states,
+            request_generations,
+            state,
+            workspace,
+            mtp=mtp,
+        )
+        stage = debug_stage if step == target_step else 18
+        print(
+            "\n[resident-remap-stage]"
+            f" mtp={mtp}"
+            f" target_step={target_step}"
+            f" current_step={step}"
+            f" offset={offset}"
+            f" stage={stage}"
+            f" name={stage_name if step == target_step else 'setup-full'}",
+            flush=True,
+        )
+        prepare_sorted_resident_cache_(
+            values,
+            block_table,
+            request_states,
+            request_generations,
+            state,
+            workspace,
+            block_size=128,
+            remap_debug_stage=stage,
+        )
+        torch.npu.synchronize()
     print(
         "[resident-remap-stage-passed]"
         f" mtp={mtp}"
+        f" target_step={target_step}"
         f" stage={debug_stage}"
         f" name={stage_name}",
         flush=True,
@@ -1108,7 +1119,7 @@ def test_sorted_resident_matches_three_step_reference(mtp):
     ).reshape(requests, blocks_per_request)
 
     reference: dict[int, int] = {}
-    for offset in (0, 100, 0):
+    for step, offset in enumerate((0, 100, 0), start=1):
         source = _source(mtp, offset)
         values = source.npu()
         prepare_resident_sharded_union_(
@@ -1129,6 +1140,14 @@ def test_sorted_resident_matches_three_step_reference(mtp):
             shard_count,
         )[0]
         reference, expected_misses, expected_slots = _reference_step(expected_shards, reference, capacity)
+        print(
+            "\n[resident-three-step-full-remap]"
+            f" mtp={mtp}"
+            f" step={step}"
+            f" offset={offset}"
+            " debug_stage=18",
+            flush=True,
+        )
         prepare_sorted_resident_cache_(
             values,
             block_table,
@@ -1137,6 +1156,7 @@ def test_sorted_resident_matches_three_step_reference(mtp):
             state,
             workspace,
             block_size=block_size,
+            remap_debug_stage=18,
         )
         torch.npu.synchronize()
 
