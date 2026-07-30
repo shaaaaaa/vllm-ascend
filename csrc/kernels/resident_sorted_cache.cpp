@@ -1421,32 +1421,41 @@ public:
             }
         }
 
+        // Compact the current misses in place before merging. Avoid a
+        // nested data-dependent while/break loop: some AICore compiler
+        // versions can lower its zero-trip path to an unmatched loopend.
+        // The write index never exceeds the read index, so reusing the
+        // current-token and prior-slot buffers is safe.
+        uint32_t currentMissCount = 0;
+        if (currentCount > 0) {
+            for (uint32_t index = 0; index < currentCount; ++index) {
+                const int16_t slot = priorSlots.GetValue(index);
+                if (slot >= 0 &&
+                    overwritten.GetValue(
+                        static_cast<uint32_t>(slot)) != 0) {
+                    currentTokens.SetValue(
+                        currentMissCount,
+                        currentTokens.GetValue(index));
+                    priorSlots.SetValue(currentMissCount, slot);
+                    ++currentMissCount;
+                }
+            }
+        }
+
         // Merge two already-sorted runs: surviving old residents and the
-        // current misses. Hits are already present in the survivor run and
-        // must not be inserted a second time.
+        // compacted current misses. Hits are already present in the survivor
+        // run and must not be inserted a second time.
         uint32_t oldIndex = 0;
         uint32_t currentIndex = 0;
-        uint32_t mergedCount = 0;
-        if (survivorCount > 0 || currentCount > 0) {
-            while (oldIndex < survivorCount ||
-                   currentIndex < currentCount) {
-                if (currentIndex < currentCount) {
-                    while (currentIndex < currentCount) {
-                        const int16_t slot =
-                            priorSlots.GetValue(currentIndex);
-                        if (slot >= 0 &&
-                            overwritten.GetValue(
-                                static_cast<uint32_t>(slot)) != 0) {
-                            break;
-                        }
-                        ++currentIndex;
-                    }
-                }
+        const uint32_t mergedCount =
+            survivorCount + currentMissCount;
+        if (mergedCount > 0) {
+            for (uint32_t mergedIndex = 0;
+                 mergedIndex < mergedCount;
+                 ++mergedIndex) {
                 const bool haveOld = oldIndex < survivorCount;
-                const bool haveMiss = currentIndex < currentCount;
-                if (!haveOld && !haveMiss) {
-                    break;
-                }
+                const bool haveMiss =
+                    currentIndex < currentMissCount;
                 const int32_t oldToken = haveOld
                     ? survivorTokens.GetValue(oldIndex)
                     : static_cast<int32_t>(0x7FFFFFFF);
@@ -1454,19 +1463,18 @@ public:
                     ? currentTokens.GetValue(currentIndex)
                     : static_cast<int32_t>(0x7FFFFFFF);
                 if (haveOld && (!haveMiss || oldToken < missToken)) {
-                    mergedTokens.SetValue(mergedCount, oldToken);
+                    mergedTokens.SetValue(mergedIndex, oldToken);
                     mergedSlots.SetValue(
-                        mergedCount,
+                        mergedIndex,
                         survivorSlots.GetValue(oldIndex));
                     ++oldIndex;
                 } else {
-                    mergedTokens.SetValue(mergedCount, missToken);
+                    mergedTokens.SetValue(mergedIndex, missToken);
                     mergedSlots.SetValue(
-                        mergedCount,
+                        mergedIndex,
                         priorSlots.GetValue(currentIndex));
                     ++currentIndex;
                 }
-                ++mergedCount;
             }
         }
 
