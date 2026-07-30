@@ -31,9 +31,9 @@ constexpr uint32_t kResidentProbeDebugInts = 32;
 constexpr uint32_t kResidentFinalizeDebugInts = 16;
 
 // Temporary compile-time bisect for the original fused update+remap kernel.
-// Count-only passes while the two-load quarter faults. Enable only the first
-// GM-to-UB copy (shard_mapping) after the count branch; compile out the
-// prior_slots copy, syncs, vector work, and everything after the loop.
+// Keep only the shard-mapping GM-to-UB copies and their explicit
+// inter-iteration reuse dependency; compile out the prior-slot copy, vector
+// work, and everything after the loop.
 #define DSA_RESIDENT_FUSED_REMAP_BISECT_SKIP_POST_LOOP 1
 #define DSA_RESIDENT_FUSED_REMAP_BISECT_SKIP_AFTER_MAPPING_LOAD 1
 
@@ -1727,19 +1727,29 @@ private:
             0,
             0};
 #if DSA_RESIDENT_FUSED_REMAP_BISECT_SKIP_AFTER_MAPPING_LOAD
-        // The preceding bisect observed LOOPEND/LCNT=0 only after adding the
-        // first mapping copy to this dynamic shard loop. Execute that exact
-        // source-shard-0 copy without the loop to distinguish loop codegen
-        // from the reused UB destination and the copy itself.
-        const uint32_t count = static_cast<uint32_t>(
-            shardCounts_.GetValue(
-                static_cast<uint64_t>(request)
-                    * shardCountRequestStride_));
-        if (count > 0) {
+        // The no-loop single-copy experiment passed. Restore the exact dynamic
+        // loop, but explicitly complete each MTE2 write before the following
+        // iteration reuses the same UB destination. This distinguishes a
+        // missing reuse dependency in the earlier reduced test from loop
+        // control-flow codegen.
+        for (uint32_t shard = 0; shard < shardCount_; ++shard) {
+            const uint32_t count = static_cast<uint32_t>(
+                shardCounts_.GetValue(
+                    static_cast<uint64_t>(request)
+                        * shardCountRequestStride_
+                    + shard * shardCountStride_));
+            if (count == 0) {
+                continue;
+            }
             AscendC::DataCopy(
                 mappingOrGathered,
-                shardMapping_[mappingBase + begin],
+                shardMapping_[
+                    mappingBase
+                    + static_cast<uint64_t>(shard) * requestWidth_
+                    + begin],
                 mappingCopy);
+            Sync<AscendC::HardEvent::MTE2_S>();
+            Sync<AscendC::HardEvent::S_MTE2>();
         }
 #else
         for (uint32_t shard = 0; shard < shardCount_; ++shard) {
