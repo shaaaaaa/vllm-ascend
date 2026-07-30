@@ -1516,81 +1516,165 @@ private:
         const uint64_t mappingBase =
             static_cast<uint64_t>(request) * shardCount_
             * requestWidth_;
-        // State merge no longer needs these three buffers. Reuse them to
-        // stage this position partition, every shard's mapping slice, and
-        // all active prior slots before the scalar remap loop.
-        auto topkPartition = oldTokenBuf_.Get<int32_t>();
-        auto mappingPartition =
-            currentTokenBuf_.Get<int16_t>();
-        auto remapPriorSlots =
-            survivorTokenBuf_.Get<int16_t>();
+
+        // The state merge has finished consuming these buffers. Reuse them
+        // for the same vector Gather+Select algorithm as the established
+        // resident row remapper, adapted to shard-local int16 ranks/slots.
+        auto input = oldTokenBuf_.Get<int32_t>();
+        auto mappingOrGathered = oldSlotBuf_.Get<int16_t>();
+        auto rankFloatOrCandidate = currentTokenBuf_.Get<float>();
+        auto shardSlots = priorSlotBuf_.Get<int16_t>();
+        auto ranksOrOutput = survivorTokenBuf_.Get<int32_t>();
+        auto accumulatedSlots = survivorSlotBuf_.Get<int32_t>();
+        auto clampedOffsets = mergedTokenBuf_.Get<int32_t>();
+        auto gatheredFloat = mergedSlotBuf_.Get<float>();
+        auto selectedMask = overwrittenBuf_.Get<uint8_t>();
+
+        // old/current/survivor buffers were consumed by the scalar pipeline,
+        // while merged buffers are still MTE3 sources. Complete those
+        // dependencies before MTE2/vector reuse of the same UB allocations.
+        Sync<AscendC::HardEvent::S_MTE2>();
+        Sync<AscendC::HardEvent::S_V>();
+        Sync<AscendC::HardEvent::MTE3_V>();
+
         CopyGlobalToLocalExact(
-            topkPartition,
+            input,
             topkIndices_[requestOffset + begin],
             partWidth);
-        uint32_t shardOffsets[kMaxResidentShards] = {};
-        uint32_t packedEnd = 0;
+        Sync<AscendC::HardEvent::MTE2_V>();
+        AscendC::Duplicate(
+            accumulatedSlots, static_cast<int32_t>(-1), partWidth);
+        AscendC::PipeBarrier<PIPE_V>();
+
         for (uint32_t shard = 0; shard < shardCount_; ++shard) {
-            CopyGlobalToLocalExact(
-                mappingPartition[shard * partWidth],
-                shardMapping_[
-                    mappingBase
-                    + static_cast<uint64_t>(shard) * requestWidth_
-                    + begin],
-                partWidth);
             const uint32_t count = static_cast<uint32_t>(
                 shardCounts_.GetValue(
                     static_cast<uint64_t>(request)
                         * shardCountRequestStride_
                     + shard * shardCountStride_));
-            const uint32_t localOffset =
-                (packedEnd + kInt16PerDataBlock - 1)
-                & ~(kInt16PerDataBlock - 1);
-            shardOffsets[shard] = localOffset;
-            if (count > 0) {
-                CopyGlobalToLocalExact(
-                    remapPriorSlots[localOffset],
-                    priorSlots_[
-                        requestShardBase
-                        + static_cast<uint64_t>(shard) * capacity_],
-                    count);
-            }
-            packedEnd = localOffset + count;
-        }
-        Sync<AscendC::HardEvent::MTE2_S>();
-
-        // Temporary diagnostic: keep remap GM/UB transfers active while
-        // removing only the scalar token-to-slot loop.
-#if 0
-        for (uint32_t localPosition = 0;
-             localPosition < partWidth;
-             ++localPosition) {
-            const int32_t token =
-                topkPartition.GetValue(localPosition);
-            if (token < 0) {
+            if (count == 0) {
                 continue;
             }
-            const uint32_t tokenShard =
-                static_cast<uint32_t>(token)
-                & (shardCount_ - 1U);
-            const int16_t rank =
-                mappingPartition.GetValue(
-                    tokenShard * partWidth + localPosition);
-            if (rank >= 0) {
-                const int16_t slot =
-                    remapPriorSlots.GetValue(
-                        shardOffsets[tokenShard]
-                        + static_cast<uint32_t>(rank));
-                topkPartition.SetValue(
-                    localPosition,
-                    static_cast<int32_t>(slot));
-            }
+
+            CopyGlobalToLocalExact(
+                mappingOrGathered,
+                shardMapping_[
+                    mappingBase
+                    + static_cast<uint64_t>(shard) * requestWidth_
+                    + begin],
+                partWidth);
+            CopyGlobalToLocalExact(
+                shardSlots,
+                priorSlots_[
+                    requestShardBase
+                    + static_cast<uint64_t>(shard) * capacity_],
+                count);
+            Sync<AscendC::HardEvent::MTE2_V>();
+
+            // Atlas A2 has no direct int16 -> int32 Cast. Convert through
+            // float, which exactly represents every int16 rank and slot.
+            AscendC::Cast(
+                rankFloatOrCandidate,
+                mappingOrGathered,
+                AscendC::RoundMode::CAST_NONE,
+                partWidth);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Cast(
+                ranksOrOutput,
+                rankFloatOrCandidate,
+                AscendC::RoundMode::CAST_ROUND,
+                partWidth);
+            AscendC::PipeBarrier<PIPE_V>();
+
+            AscendC::Maxs(
+                clampedOffsets,
+                ranksOrOutput,
+                static_cast<int32_t>(0),
+                partWidth);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Compare(
+                selectedMask,
+                clampedOffsets,
+                ranksOrOutput,
+                AscendC::CMPMODE::EQ,
+                partWidth);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Mins(
+                clampedOffsets,
+                clampedOffsets,
+                static_cast<int32_t>(count - 1),
+                partWidth);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Muls(
+                clampedOffsets,
+                clampedOffsets,
+                static_cast<int32_t>(sizeof(int16_t)),
+                partWidth);
+            AscendC::PipeBarrier<PIPE_V>();
+
+            AscendC::Gather(
+                mappingOrGathered,
+                shardSlots,
+                clampedOffsets.ReinterpretCast<uint32_t>(),
+                static_cast<uint32_t>(0),
+                partWidth);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Cast(
+                gatheredFloat,
+                mappingOrGathered,
+                AscendC::RoundMode::CAST_NONE,
+                partWidth);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Cast(
+                rankFloatOrCandidate.ReinterpretCast<int32_t>(),
+                gatheredFloat,
+                AscendC::RoundMode::CAST_ROUND,
+                partWidth);
+            AscendC::PipeBarrier<PIPE_V>();
+
+            // Exactly one value shard owns each selected original position.
+            // Invalid (-1) mappings leave the accumulated slot unchanged.
+            AscendC::Select(
+                accumulatedSlots.ReinterpretCast<float>(),
+                selectedMask,
+                rankFloatOrCandidate,
+                accumulatedSlots.ReinterpretCast<float>(),
+                AscendC::SELMODE::VSEL_TENSOR_TENSOR_MODE,
+                partWidth);
+            AscendC::PipeBarrier<PIPE_V>();
+            // The next iteration reuses both int16 MTE2 destinations after
+            // the vector pipeline has consumed them.
+            Sync<AscendC::HardEvent::V_MTE2>();
         }
-#endif
-        Sync<AscendC::HardEvent::S_MTE3>();
+
+        // Preserve unselected/split-boundary positions exactly as the old
+        // resident remapper does; selected positions receive their slot.
+        AscendC::Maxs(
+            clampedOffsets,
+            accumulatedSlots,
+            static_cast<int32_t>(0),
+            partWidth);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Compare(
+            selectedMask,
+            clampedOffsets,
+            accumulatedSlots,
+            AscendC::CMPMODE::EQ,
+            partWidth);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Select(
+            ranksOrOutput.ReinterpretCast<float>(),
+            selectedMask,
+            accumulatedSlots.ReinterpretCast<float>(),
+            input.ReinterpretCast<float>(),
+            AscendC::SELMODE::VSEL_TENSOR_TENSOR_MODE,
+            partWidth);
+        AscendC::PipeBarrier<PIPE_V>();
+
+        Sync<AscendC::HardEvent::V_MTE3>();
         CopyLocalToGlobalExact(
             topkIndices_[requestOffset + begin],
-            topkPartition,
+            ranksOrOutput,
             partWidth);
     }
 
