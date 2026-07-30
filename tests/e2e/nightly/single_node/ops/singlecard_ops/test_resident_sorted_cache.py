@@ -119,6 +119,58 @@ def _seed_resident_state(
     state.generations[state_index, 0] = generation
 
 
+def _print_empty_state_finalize_debug(
+    *,
+    mtp: int,
+    capacity: int,
+    counts: torch.Tensor,
+    prior_before: list[torch.Tensor],
+    workspace,
+) -> None:
+    prior_after = workspace.prior_slots[0].cpu()
+    overwritten = workspace.overwritten_slots[0].cpu()
+    miss_count = int(workspace.miss_counts[0, 0].cpu())
+    active_after = torch.cat(
+        [
+            prior_after[shard, : int(counts[shard])]
+            for shard in range(counts.numel())
+            if int(counts[shard]) > 0
+        ]
+    )
+    active_before = torch.cat(prior_before)
+    valid_after = (active_after >= 0) & (active_after < capacity)
+    invalid_after = active_after >= capacity
+    still_negative = active_after < 0
+    unique_valid = torch.unique(active_after[valid_after]).numel()
+    treated_as_hit = torch.zeros_like(valid_after)
+    treated_as_hit[valid_after] = (
+        overwritten[active_after[valid_after].to(torch.int64)] == 0
+    )
+    sample_indices = torch.nonzero(
+        treated_as_hit | invalid_after | still_negative,
+        as_tuple=False,
+    ).flatten()[:32]
+    sample = [
+        (int(index), int(active_after[index]))
+        for index in sample_indices
+    ]
+    print(
+        "\n[resident-finalize-debug]"
+        f" mtp={mtp}"
+        f" active={active_before.numel()}"
+        f" pre_negative={int((active_before < 0).sum())}"
+        f" pre_nonnegative={int((active_before >= 0).sum())}"
+        f" miss_count={miss_count}"
+        f" post_valid={int(valid_after.sum())}"
+        f" post_invalid={int(invalid_after.sum())}"
+        f" post_negative={int(still_negative.sum())}"
+        f" post_unique_valid={unique_valid}"
+        f" overwritten={int(overwritten.sum())}"
+        f" treated_as_hit={int(treated_as_hit.sum())}"
+        f" suspicious_sample={sample}"
+    )
+
+
 @pytest.mark.parametrize("mtp", [1, 2])
 def test_resident_union_is_sorted_per_fixed_token_shard(mtp):
     requests = 2
@@ -303,6 +355,22 @@ def test_int16_mapping_and_uint8_overwrite_at_full_shard_capacity(mtp):
     assert int(workspace.shard_counts[0, 0, 0].cpu()) == capacity
     assert torch.all(workspace.shard_counts[0, 1:, 0].cpu() == 0)
     assert workspace.shard_mapping[0, 0].cpu().tolist() == list(range(capacity))
+    counts = workspace.shard_counts[0, :, 0].cpu()
+    prior_before = [
+        workspace.prior_slots[0, shard, : int(counts[shard])].cpu().clone()
+        for shard in range(shard_count)
+        if int(counts[shard]) > 0
+    ]
+    print(
+        "\n[resident-finalize-debug-pre]"
+        f" mtp={mtp}"
+        f" shard_counts={counts.tolist()}"
+        f" active={sum(prior.numel() for prior in prior_before)}"
+        f" negative={sum(int((prior < 0).sum()) for prior in prior_before)}"
+        f" nonnegative={sum(int((prior >= 0).sum()) for prior in prior_before)}"
+    )
+    assert sum(prior.numel() for prior in prior_before) == capacity
+    assert all(torch.all(prior == -1) for prior in prior_before)
 
     prepare_sorted_resident_cache_(
         values,
@@ -314,6 +382,13 @@ def test_int16_mapping_and_uint8_overwrite_at_full_shard_capacity(mtp):
         block_size=128,
     )
     torch.npu.synchronize()
+    _print_empty_state_finalize_debug(
+        mtp=mtp,
+        capacity=capacity,
+        counts=counts,
+        prior_before=prior_before,
+        workspace=workspace,
+    )
     assert int(workspace.miss_counts[0, 0].cpu()) == capacity
     assert workspace.overwritten_slots.dtype == torch.uint8
     assert torch.all(workspace.overwritten_slots[0].cpu() == 1)

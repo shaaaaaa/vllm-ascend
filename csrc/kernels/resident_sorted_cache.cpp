@@ -21,9 +21,12 @@ namespace {
 constexpr uint32_t kDataBlockBytes = 32;
 constexpr uint32_t kInt32PerDataBlock =
     kDataBlockBytes / sizeof(int32_t);
+constexpr uint32_t kInt16PerDataBlock =
+    kDataBlockBytes / sizeof(int16_t);
 constexpr uint32_t kSortGroup = 32;
 constexpr uint32_t kPairWidth = 2;
 constexpr uint32_t kMergeWays = 4;
+constexpr uint32_t kMaxResidentShards = 4;
 
 template <AscendC::HardEvent event>
 __aicore__ inline void Sync()
@@ -628,6 +631,8 @@ public:
         missCountStride_ = missCountStride;
         blockTableWidth_ = blockTableWidth;
         blockSize_ = blockSize;
+        blockTableEntries_ =
+            (capacity_ + blockSize_ - 1) / blockSize_;
         const uint64_t requestShardElements =
             static_cast<uint64_t>(requestCount_) * shardCount_
             * capacity_;
@@ -662,6 +667,21 @@ public:
             freeSlotBuf_, capacity_ * sizeof(int16_t));
         pipe_.InitBuffer(
             overwrittenBuf_, capacity_ * sizeof(uint8_t));
+        const uint32_t packedElements =
+            capacity_ + shardCount_ * kInt16PerDataBlock;
+        pipe_.InitBuffer(
+            packedTokenBuf_, packedElements * sizeof(int32_t));
+        pipe_.InitBuffer(
+            packedPriorSlotBuf_, packedElements * sizeof(int16_t));
+        pipe_.InitBuffer(
+            missTokenBuf_, capacity_ * sizeof(int32_t));
+        pipe_.InitBuffer(
+            targetSlotBuf_, capacity_ * sizeof(int64_t));
+        const uint32_t blockTableBytes =
+            (blockTableEntries_ * sizeof(int32_t)
+                + kDataBlockBytes - 1)
+            & ~(kDataBlockBytes - 1);
+        pipe_.InitBuffer(blockTableBuf_, blockTableBytes);
     }
 
     __aicore__ inline void Process()
@@ -677,6 +697,12 @@ public:
         auto protectedSlots = protectedBuf_.Get<int16_t>();
         auto freeSlots = freeSlotBuf_.Get<int16_t>();
         auto overwritten = overwrittenBuf_.Get<uint8_t>();
+        auto packedTokens = packedTokenBuf_.Get<int32_t>();
+        auto packedPriorSlots =
+            packedPriorSlotBuf_.Get<int16_t>();
+        auto missTokens = missTokenBuf_.Get<int32_t>();
+        auto targetSlots = targetSlotBuf_.Get<int64_t>();
+        auto blockTable = blockTableBuf_.Get<int32_t>();
         AscendC::Duplicate(
             protectedSlots, static_cast<int16_t>(0), capacity_);
         AscendC::Duplicate(
@@ -684,20 +710,56 @@ public:
             static_cast<int16_t>(0),
             capacity_ / sizeof(int16_t));
         AscendC::PipeBarrier<PIPE_V>();
-        Sync<AscendC::HardEvent::V_S>();
 
+        const AscendC::DataCopyParams blockTableCopy{
+            1,
+            static_cast<uint16_t>(
+                blockTableEntries_ * sizeof(int32_t)),
+            0,
+            0};
+        AscendC::DataCopyPad(
+            blockTable,
+            requestBlockTable_[
+                static_cast<uint64_t>(request) * blockTableWidth_],
+            blockTableCopy,
+            {});
+        uint32_t shardCounts[kMaxResidentShards] = {};
+        uint32_t shardOffsets[kMaxResidentShards] = {};
+        uint32_t packedEnd = 0;
         for (uint32_t shard = 0; shard < shardCount_; ++shard) {
             const uint32_t count = static_cast<uint32_t>(
                 shardCounts_.GetValue(
                     static_cast<uint64_t>(request)
                         * shardCountRequestStride_
                     + shard * shardCountStride_));
+            const uint32_t localOffset =
+                (packedEnd + kInt16PerDataBlock - 1)
+                & ~(kInt16PerDataBlock - 1);
             const uint64_t shardOffset =
                 requestShardBase
                 + static_cast<uint64_t>(shard) * capacity_;
+            shardCounts[shard] = count;
+            shardOffsets[shard] = localOffset;
+            CopyGlobalToLocalExact(
+                packedTokens[localOffset],
+                shardPacked_[shardOffset],
+                count);
+            CopyGlobalToLocalExact(
+                packedPriorSlots[localOffset],
+                priorSlots_[shardOffset],
+                count);
+            packedEnd = localOffset + count;
+        }
+        Sync<AscendC::HardEvent::MTE2_S>();
+        Sync<AscendC::HardEvent::V_S>();
+
+        for (uint32_t shard = 0; shard < shardCount_; ++shard) {
+            const uint32_t count = shardCounts[shard];
+            const uint32_t localOffset = shardOffsets[shard];
             for (uint32_t index = 0; index < count; ++index) {
                 const int16_t slot =
-                    priorSlots_.GetValue(shardOffset + index);
+                    packedPriorSlots.GetValue(
+                        localOffset + index);
                 if (slot >= 0) {
                     protectedSlots.SetValue(
                         static_cast<uint32_t>(slot),
@@ -716,23 +778,17 @@ public:
 
         uint32_t missCount = 0;
         for (uint32_t shard = 0; shard < shardCount_; ++shard) {
-            const uint32_t count = static_cast<uint32_t>(
-                shardCounts_.GetValue(
-                    static_cast<uint64_t>(request)
-                        * shardCountRequestStride_
-                    + shard * shardCountStride_));
-            const uint64_t shardOffset =
-                requestShardBase
-                + static_cast<uint64_t>(shard) * capacity_;
+            const uint32_t count = shardCounts[shard];
+            const uint32_t localOffset = shardOffsets[shard];
             for (uint32_t index = 0; index < count; ++index) {
                 int16_t slot =
-                    priorSlots_.GetValue(shardOffset + index);
+                    packedPriorSlots.GetValue(
+                        localOffset + index);
                 if (slot < 0) {
                     slot = freeSlots.GetValue(missCount);
                     const int32_t token =
-                        shardPacked_.GetValue(shardOffset + index);
-                    missTokens_.SetValue(
-                        requestOffset + missCount, token);
+                        packedTokens.GetValue(localOffset + index);
+                    missTokens.SetValue(missCount, token);
                     const uint32_t logicalSlot =
                         static_cast<uint32_t>(slot);
                     const uint32_t logicalBlock =
@@ -740,12 +796,9 @@ public:
                     const uint32_t blockOffset =
                         logicalSlot % blockSize_;
                     const int32_t physicalBlock =
-                        requestBlockTable_.GetValue(
-                            static_cast<uint64_t>(request)
-                                * blockTableWidth_
-                            + logicalBlock);
-                    targetSlots_.SetValue(
-                        requestOffset + missCount,
+                        blockTable.GetValue(logicalBlock);
+                    targetSlots.SetValue(
+                        missCount,
                         static_cast<int64_t>(physicalBlock)
                                 * blockSize_
                             + blockOffset);
@@ -753,15 +806,32 @@ public:
                         logicalSlot, static_cast<uint8_t>(1));
                     ++missCount;
                 }
-                priorSlots_.SetValue(
-                    shardOffset + index, slot);
+                packedPriorSlots.SetValue(
+                    localOffset + index, slot);
             }
         }
         Sync<AscendC::HardEvent::S_MTE3>();
+        for (uint32_t shard = 0; shard < shardCount_; ++shard) {
+            const uint64_t shardOffset =
+                requestShardBase
+                + static_cast<uint64_t>(shard) * capacity_;
+            CopyLocalToGlobalExact(
+                priorSlots_[shardOffset],
+                packedPriorSlots[shardOffsets[shard]],
+                shardCounts[shard]);
+        }
         CopyLocalToGlobalExact(
             overwrittenSlots_[requestOffset],
             overwritten,
             capacity_);
+        CopyLocalToGlobalExact(
+            missTokens_[requestOffset],
+            missTokens,
+            missCount);
+        CopyLocalToGlobalExact(
+            targetSlots_[requestOffset],
+            targetSlots,
+            missCount);
         // One cacheline per request prevents count false sharing.
         missCounts_.SetValue(
             static_cast<uint64_t>(request) * missCountStride_,
@@ -781,6 +851,12 @@ private:
     AscendC::TBuf<AscendC::TPosition::VECCALC> protectedBuf_;
     AscendC::TBuf<AscendC::TPosition::VECCALC> freeSlotBuf_;
     AscendC::TBuf<AscendC::TPosition::VECCALC> overwrittenBuf_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> packedTokenBuf_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC>
+        packedPriorSlotBuf_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> missTokenBuf_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> targetSlotBuf_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> blockTableBuf_;
     uint32_t requestCount_ = 0;
     uint32_t shardCount_ = 0;
     uint32_t capacity_ = 0;
@@ -789,6 +865,7 @@ private:
     uint32_t missCountStride_ = 0;
     uint32_t blockTableWidth_ = 0;
     uint32_t blockSize_ = 0;
+    uint32_t blockTableEntries_ = 0;
 };
 
 class DSAResidentSortedUpdateKernel {
@@ -1056,15 +1133,57 @@ private:
     {
         const uint32_t partWidth = requestWidth_ / shardCount_;
         const uint32_t begin = part * partWidth;
-        const uint32_t end = begin + partWidth;
         const uint64_t requestOffset =
             static_cast<uint64_t>(request) * requestWidth_;
         const uint64_t mappingBase =
             static_cast<uint64_t>(request) * shardCount_
             * requestWidth_;
-        for (uint32_t position = begin; position < end; ++position) {
+        // State merge no longer needs these three buffers. Reuse them to
+        // stage this position partition, every shard's mapping slice, and
+        // all active prior slots before the scalar remap loop.
+        auto topkPartition = oldTokenBuf_.Get<int32_t>();
+        auto mappingPartition =
+            currentTokenBuf_.Get<int16_t>();
+        auto remapPriorSlots =
+            survivorTokenBuf_.Get<int16_t>();
+        CopyGlobalToLocalExact(
+            topkPartition,
+            topkIndices_[requestOffset + begin],
+            partWidth);
+        uint32_t shardOffsets[kMaxResidentShards] = {};
+        uint32_t packedEnd = 0;
+        for (uint32_t shard = 0; shard < shardCount_; ++shard) {
+            CopyGlobalToLocalExact(
+                mappingPartition[shard * partWidth],
+                shardMapping_[
+                    mappingBase
+                    + static_cast<uint64_t>(shard) * requestWidth_
+                    + begin],
+                partWidth);
+            const uint32_t count = static_cast<uint32_t>(
+                shardCounts_.GetValue(
+                    static_cast<uint64_t>(request)
+                        * shardCountRequestStride_
+                    + shard * shardCountStride_));
+            const uint32_t localOffset =
+                (packedEnd + kInt16PerDataBlock - 1)
+                & ~(kInt16PerDataBlock - 1);
+            shardOffsets[shard] = localOffset;
+            CopyGlobalToLocalExact(
+                remapPriorSlots[localOffset],
+                priorSlots_[
+                    requestShardBase
+                    + static_cast<uint64_t>(shard) * capacity_],
+                count);
+            packedEnd = localOffset + count;
+        }
+        Sync<AscendC::HardEvent::MTE2_S>();
+
+        for (uint32_t localPosition = 0;
+             localPosition < partWidth;
+             ++localPosition) {
             const int32_t token =
-                topkIndices_.GetValue(requestOffset + position);
+                topkPartition.GetValue(localPosition);
             if (token < 0) {
                 continue;
             }
@@ -1072,23 +1191,23 @@ private:
                 static_cast<uint32_t>(token)
                 & (shardCount_ - 1U);
             const int16_t rank =
-                shardMapping_.GetValue(
-                    mappingBase
-                    + static_cast<uint64_t>(tokenShard)
-                        * requestWidth_
-                    + position);
+                mappingPartition.GetValue(
+                    tokenShard * partWidth + localPosition);
             if (rank >= 0) {
                 const int16_t slot =
-                    priorSlots_.GetValue(
-                        requestShardBase
-                        + static_cast<uint64_t>(tokenShard)
-                            * capacity_
+                    remapPriorSlots.GetValue(
+                        shardOffsets[tokenShard]
                         + static_cast<uint32_t>(rank));
-                topkIndices_.SetValue(
-                    requestOffset + position,
+                topkPartition.SetValue(
+                    localPosition,
                     static_cast<int32_t>(slot));
             }
         }
+        Sync<AscendC::HardEvent::S_MTE3>();
+        CopyLocalToGlobalExact(
+            topkIndices_[requestOffset + begin],
+            topkPartition,
+            partWidth);
     }
 
     AscendC::GlobalTensor<int32_t> topkIndices_;
