@@ -31,11 +31,11 @@ constexpr uint32_t kResidentProbeDebugInts = 32;
 constexpr uint32_t kResidentFinalizeDebugInts = 16;
 
 // Temporary compile-time bisect for the original fused update+remap kernel.
-// Keep the original for statement but compile out its entire body and
-// everything after it. This separates the loop structure/pre-loop setup from
-// every operation formerly executed by an iteration.
+// The empty loop passes. Enable the first quarter through shard count lookup,
+// both GM-to-UB copies, and their MTE2-to-vector synchronization; compile out
+// the remaining vector work and everything after the loop.
 #define DSA_RESIDENT_FUSED_REMAP_BISECT_SKIP_POST_LOOP 1
-#define DSA_RESIDENT_FUSED_REMAP_BISECT_SKIP_LOOP_BODY 1
+#define DSA_RESIDENT_FUSED_REMAP_BISECT_SKIP_AFTER_LOADS 1
 
 template <AscendC::HardEvent event>
 __aicore__ inline void Sync()
@@ -1718,7 +1718,6 @@ private:
         AscendC::PipeBarrier<PIPE_V>();
 
         for (uint32_t shard = 0; shard < shardCount_; ++shard) {
-#if !DSA_RESIDENT_FUSED_REMAP_BISECT_SKIP_LOOP_BODY
             const uint32_t count = static_cast<uint32_t>(
                 shardCounts_.GetValue(
                     static_cast<uint64_t>(request)
@@ -1743,6 +1742,7 @@ private:
                 count);
             Sync<AscendC::HardEvent::MTE2_V>();
 
+#if !DSA_RESIDENT_FUSED_REMAP_BISECT_SKIP_AFTER_LOADS
             // Atlas A2 has no direct int16 -> int32 Cast. Convert through
             // float, which exactly represents every int16 rank and slot.
             AscendC::Cast(

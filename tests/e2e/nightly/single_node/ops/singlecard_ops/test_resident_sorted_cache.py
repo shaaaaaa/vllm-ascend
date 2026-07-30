@@ -1024,8 +1024,8 @@ def test_split_plan_preserves_topk_until_standalone_remap(mtp):
 
 
 @pytest.mark.parametrize("mtp", [1, 2])
-def test_fused_remap_bisect_empty_loop_does_not_crash(mtp):
-    """Exercise the original loop statement with its body compiled out."""
+def test_fused_remap_bisect_loop_load_quarter_does_not_crash(mtp):
+    """Exercise count lookup and GM-to-UB loads in the fused remap loop."""
     requests = 1
     shard_count = resident_shard_count(mtp)
     capacity = mtp * 2048
@@ -1084,9 +1084,9 @@ def test_fused_remap_bisect_empty_loop_does_not_crash(mtp):
     )
     torch.npu.synchronize()
 
-    # The compile-time bisect removes the complete loop body and final
-    # writeback, so every position retains its original token while the
-    # pre-loop setup and finalize/state update still execute.
+    # The compile-time bisect keeps only count lookup and the two GM-to-UB
+    # loads in each iteration. It removes all vector work and final writeback,
+    # so every position retains its original token.
     assert values.reshape(-1).cpu().tolist() == source.reshape(-1).tolist()
     miss_count = int(workspace.miss_counts[0, 0].cpu())
     assert workspace.miss_tokens[0, :miss_count].cpu().tolist() == expected_misses
