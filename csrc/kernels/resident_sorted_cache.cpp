@@ -31,14 +31,11 @@ constexpr uint32_t kResidentProbeDebugInts = 32;
 constexpr uint32_t kResidentFinalizeDebugInts = 16;
 
 // Temporary compile-time bisect for the original fused update+remap kernel.
-// Keep the complete per-shard loop, including Gather/Cast/Select, and compile
-// out everything after that loop. A crash is therefore inside the loop; a
-// clean synchronization places the fault in the post-loop finalization.
+// Keep the original for statement but compile out its entire body and
+// everything after it. This separates the loop structure/pre-loop setup from
+// every operation formerly executed by an iteration.
 #define DSA_RESIDENT_FUSED_REMAP_BISECT_SKIP_POST_LOOP 1
-// The full loop still faults with the post-loop block removed. Keep the loop
-// prefix through byte-offset generation and compile out Gather plus the slot
-// casts and inner Select to bisect the loop itself.
-#define DSA_RESIDENT_FUSED_REMAP_BISECT_SKIP_LOOP_SECOND_HALF 1
+#define DSA_RESIDENT_FUSED_REMAP_BISECT_SKIP_LOOP_BODY 1
 
 template <AscendC::HardEvent event>
 __aicore__ inline void Sync()
@@ -1701,9 +1698,7 @@ private:
         auto ranksOrOutput = survivorTokenBuf_.Get<int32_t>();
         auto accumulatedSlots = survivorSlotBuf_.Get<int32_t>();
         auto clampedOffsets = mergedTokenBuf_.Get<int32_t>();
-#if !DSA_RESIDENT_FUSED_REMAP_BISECT_SKIP_LOOP_SECOND_HALF
         auto gatheredFloat = mergedSlotBuf_.Get<float>();
-#endif
         auto selectedMask = overwrittenBuf_.Get<uint8_t>();
 
         // old/current/survivor buffers were consumed by the scalar pipeline,
@@ -1723,6 +1718,7 @@ private:
         AscendC::PipeBarrier<PIPE_V>();
 
         for (uint32_t shard = 0; shard < shardCount_; ++shard) {
+#if !DSA_RESIDENT_FUSED_REMAP_BISECT_SKIP_LOOP_BODY
             const uint32_t count = static_cast<uint32_t>(
                 shardCounts_.GetValue(
                     static_cast<uint64_t>(request)
@@ -1788,7 +1784,6 @@ private:
                 partWidth);
             AscendC::PipeBarrier<PIPE_V>();
 
-#if !DSA_RESIDENT_FUSED_REMAP_BISECT_SKIP_LOOP_SECOND_HALF
             AscendC::Gather(
                 mappingOrGathered,
                 shardSlots,
@@ -1819,10 +1814,10 @@ private:
                 AscendC::SELMODE::VSEL_TENSOR_TENSOR_MODE,
                 partWidth);
             AscendC::PipeBarrier<PIPE_V>();
-#endif
             // The next iteration reuses both int16 MTE2 destinations after
             // the vector pipeline has consumed them.
             Sync<AscendC::HardEvent::V_MTE2>();
+#endif
         }
 
 #if !DSA_RESIDENT_FUSED_REMAP_BISECT_SKIP_POST_LOOP
