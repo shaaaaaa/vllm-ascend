@@ -2,10 +2,12 @@ import pytest
 import torch
 
 from vllm_ascend.distributed.kv_transfer.sparse_offload.resident_sorted_cache import (
+    RESIDENT_READ_PROBE_DEBUG_INTS,
     allocate_sorted_resident_state,
     allocate_sorted_resident_workspace,
     prepare_resident_sharded_union_,
     prepare_sorted_resident_cache_,
+    probe_sorted_resident_reads_,
     resident_shard_count,
 )
 from vllm_ascend.utils import enable_custom_op
@@ -18,6 +20,7 @@ def _load_sorted_resident_ops():
     for name in (
         "npu_dsa_resident_sharded_union_",
         "npu_dsa_resident_sorted_plan_",
+        "npu_dsa_resident_sorted_read_probe_",
     ):
         if not hasattr(torch.ops._C_ascend, name):
             pytest.fail(f"vllm_ascend_C does not contain {name}")
@@ -308,6 +311,110 @@ def test_fused_union_intersection_and_generation_invalidation(mtp):
         count = int(workspace.shard_counts[0, shard, 0].cpu())
         assert torch.all(workspace.prior_slots[0, shard, :count].cpu() == -1)
     assert torch.all(state.counts[0, :, 0].cpu() == 0)
+
+
+@pytest.mark.parametrize("mtp", [1, 2])
+def test_kernel_read_probe_matches_full_capacity_union_output(mtp):
+    """Capture the exact GM values observed by an AIV before finalization."""
+    requests = 1
+    shard_count = resident_shard_count(mtp)
+    capacity = mtp * 2048
+    source = (
+        torch.arange(capacity, dtype=torch.int32)
+        .mul(shard_count)
+        .reshape(mtp, 1, 2048)
+    )
+    values = source.npu()
+    boundaries = torch.full(
+        (mtp,),
+        int(source.max()) + 1,
+        dtype=torch.int32,
+        device="npu",
+    )
+    row_requests = torch.zeros(mtp, dtype=torch.int32, device="npu")
+    request_states = torch.zeros(1, dtype=torch.int32, device="npu")
+    request_generations = torch.ones(1, dtype=torch.int64, device="npu")
+    workspace = allocate_sorted_resident_workspace(
+        requests, mtp, device=torch.device("npu")
+    )
+    state = allocate_sorted_resident_state(
+        requests, requests, mtp, device=torch.device("npu")
+    )
+
+    prepare_resident_sharded_union_(
+        values,
+        boundaries,
+        row_requests,
+        request_states,
+        request_generations,
+        state,
+        workspace,
+        mtp=mtp,
+    )
+    debug_info = torch.full(
+        (requests, RESIDENT_READ_PROBE_DEBUG_INTS),
+        -1,
+        dtype=torch.int32,
+        device="npu",
+    )
+    prior_readback = torch.full_like(workspace.prior_slots, -12345)
+    probe_sorted_resident_reads_(
+        workspace,
+        debug_info,
+        prior_readback,
+    )
+    torch.npu.synchronize()
+
+    host_counts = workspace.shard_counts[0, :, 0].cpu()
+    host_prior = workspace.prior_slots[0].cpu()
+    probe_debug = debug_info[0].cpu()
+    probe_prior = prior_readback[0].cpu()
+    assert int(probe_debug[0]) == 0x52535031
+    assert int(probe_debug[1]) == shard_count
+    assert int(probe_debug[2]) == capacity
+    for shard in range(shard_count):
+        base = 4 + shard * 7
+        raw_count = int(probe_debug[base])
+        fresh_count = int(probe_debug[base + 1])
+        bulk_count = int(probe_debug[base + 2])
+        first_slot = int(probe_debug[base + 3])
+        last_slot = int(probe_debug[base + 4])
+        negative = int(probe_debug[base + 5])
+        nonnegative = int(probe_debug[base + 6])
+        expected_count = int(host_counts[shard])
+        print(
+            "\n[resident-kernel-read-probe]"
+            f" mtp={mtp}"
+            f" shard={shard}"
+            f" host_count={expected_count}"
+            f" raw_count={raw_count}"
+            f" fresh_count={fresh_count}"
+            f" bulk_count={bulk_count}"
+            f" first_slot={first_slot}"
+            f" last_slot={last_slot}"
+            f" negative={negative}"
+            f" nonnegative={nonnegative}"
+        )
+        assert fresh_count == expected_count
+        assert bulk_count == expected_count
+        assert torch.equal(
+            probe_prior[shard, :expected_count],
+            host_prior[shard, :expected_count],
+        )
+        assert torch.all(
+            probe_prior[shard, expected_count:] == -12345
+        )
+        if expected_count:
+            assert first_slot == int(host_prior[shard, 0])
+            assert last_slot == int(
+                host_prior[shard, expected_count - 1]
+            )
+            assert negative == int(
+                (host_prior[shard, :expected_count] < 0).sum()
+            )
+            assert nonnegative == int(
+                (host_prior[shard, :expected_count] >= 0).sum()
+            )
 
 
 @pytest.mark.parametrize("mtp", [1, 2])

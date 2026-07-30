@@ -256,6 +256,18 @@ at::Tensor npu_dsa_resident_sorted_plan_meta(
     return miss_counts;
 }
 
+at::Tensor npu_dsa_resident_sorted_read_probe_meta(
+    const at::Tensor &shard_counts,
+    const at::Tensor &prior_slots,
+    at::Tensor &debug_info,
+    at::Tensor &prior_readback)
+{
+    (void)shard_counts;
+    (void)prior_slots;
+    (void)prior_readback;
+    return debug_info;
+}
+
 at::Tensor npu_dsa_staged_sharded_union_meta(
     at::Tensor &topk_indices,
     const at::Tensor &split_boundary,
@@ -896,6 +908,9 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
     ops.impl(
         "npu_dsa_resident_sorted_plan_",
         &vllm_ascend::meta::npu_dsa_resident_sorted_plan_meta);
+    ops.impl(
+        "npu_dsa_resident_sorted_read_probe_",
+        &vllm_ascend::meta::npu_dsa_resident_sorted_read_probe_meta);
     // Bgmv expand
     ops.impl("bgmv_expand", &vllm_ascend::meta::bgmv_expand_meta);
     // Sgmv expand

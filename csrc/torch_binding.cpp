@@ -1817,6 +1817,82 @@ at::Tensor npu_dsa_resident_sorted_plan_(
     return miss_counts;
 }
 
+at::Tensor npu_dsa_resident_sorted_read_probe_(
+    const at::Tensor &shard_counts,
+    const at::Tensor &prior_slots,
+    at::Tensor &debug_info,
+    at::Tensor &prior_readback)
+{
+    const auto device = shard_counts.device();
+    TORCH_CHECK(
+        shard_counts.is_privateuseone() &&
+            prior_slots.device() == device &&
+            debug_info.device() == device &&
+            prior_readback.device() == device,
+        "resident read-probe tensors must share one NPU device");
+    TORCH_CHECK(
+        shard_counts.scalar_type() == at::kInt &&
+            prior_slots.scalar_type() == at::kShort &&
+            debug_info.scalar_type() == at::kInt &&
+            prior_readback.scalar_type() == at::kShort,
+        "resident read-probe tensor dtypes are invalid");
+    TORCH_CHECK(
+        shard_counts.is_contiguous() &&
+            prior_slots.is_contiguous() &&
+            debug_info.is_contiguous() &&
+            prior_readback.is_contiguous(),
+        "resident read-probe tensors must be contiguous");
+    TORCH_CHECK(
+        shard_counts.dim() == 3 &&
+            prior_slots.dim() == 3 &&
+            debug_info.dim() == 2 &&
+            prior_readback.dim() == 3,
+        "resident read-probe tensor ranks are invalid");
+
+    const int64_t request_count = prior_slots.size(0);
+    const int64_t shard_count = prior_slots.size(1);
+    const int64_t capacity = prior_slots.size(2);
+    const int64_t shard_count_stride = shard_counts.size(2);
+    const int64_t shard_count_request_stride =
+        shard_counts.size(1) * shard_count_stride;
+    TORCH_CHECK(
+        request_count > 0 &&
+            (shard_count == 2 || shard_count == 4) &&
+            capacity > 0 &&
+            shard_counts.size(0) == request_count &&
+            shard_counts.size(1) == shard_count &&
+            shard_count_stride >= 16 &&
+            debug_info.size(0) == request_count &&
+            debug_info.size(1) == 32 &&
+            prior_readback.sizes() == prior_slots.sizes(),
+        "resident read-probe tensor shapes are invalid");
+
+    const c10_npu::OptionalNPUGuard npu_guard(device);
+    aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
+    void* count_ptr = shard_counts.data_ptr();
+    void* prior_ptr = prior_slots.data_ptr();
+    void* debug_ptr = debug_info.data_ptr();
+    void* readback_ptr = prior_readback.data_ptr();
+    at_npu::native::OpCommand cmd;
+    cmd.Name("npu_dsa_resident_sorted_read_probe_");
+    cmd.SetCustomHandler([
+        stream, count_ptr, prior_ptr, debug_ptr, readback_ptr,
+        request_count, shard_count, capacity,
+        shard_count_stride,
+        shard_count_request_stride]() -> int {
+        dsa_resident_sorted_read_probe_impl(
+            stream, count_ptr, prior_ptr, debug_ptr, readback_ptr,
+            static_cast<uint32_t>(request_count),
+            static_cast<uint32_t>(shard_count),
+            static_cast<uint32_t>(capacity),
+            static_cast<uint32_t>(shard_count_stride),
+            static_cast<uint32_t>(shard_count_request_stride));
+        return 0;
+    });
+    cmd.Run();
+    return debug_info;
+}
+
 at::Tensor npu_dsa_staged_unique_finalize_(
     const at::Tensor &unique_keys,
     const at::Tensor &inverse,
@@ -3026,6 +3102,15 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "npu_dsa_resident_sorted_plan_",
         torch::kPrivateUse1,
         &vllm_ascend::npu_dsa_resident_sorted_plan_);
+    ops.def(
+        "npu_dsa_resident_sorted_read_probe_("
+        "Tensor shard_counts, Tensor prior_slots, "
+        "Tensor(a!) debug_info, Tensor(b!) prior_readback) "
+        "-> Tensor(a!)");
+    ops.impl(
+        "npu_dsa_resident_sorted_read_probe_",
+        torch::kPrivateUse1,
+        &vllm_ascend::npu_dsa_resident_sorted_read_probe_);
     ops.def(
         "npu_dsa_staged_unique_finalize_(Tensor unique_keys, "
         "Tensor inverse, Tensor row_req_indices, "

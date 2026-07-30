@@ -324,6 +324,18 @@ namespace vllm_ascend {
     uint32_t block_table_width,
     uint32_t block_size);
 
+  extern void dsa_resident_sorted_read_probe_impl(
+    void* stream,
+    void* shard_counts,
+    void* prior_slots,
+    void* debug_info,
+    void* prior_readback,
+    uint32_t request_count,
+    uint32_t shard_count,
+    uint32_t capacity,
+    uint32_t shard_count_stride,
+    uint32_t shard_count_request_stride);
+
   extern void dsa_staged_unique_finalize_impl(
     void* stream,
     void* unique_keys,

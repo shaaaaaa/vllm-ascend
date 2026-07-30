@@ -27,6 +27,7 @@ constexpr uint32_t kSortGroup = 32;
 constexpr uint32_t kPairWidth = 2;
 constexpr uint32_t kMergeWays = 4;
 constexpr uint32_t kMaxResidentShards = 4;
+constexpr uint32_t kResidentProbeDebugInts = 32;
 
 template <AscendC::HardEvent event>
 __aicore__ inline void Sync()
@@ -47,19 +48,6 @@ __aicore__ inline T ReadGlobalScalarFresh(
         AscendC::CacheLine::SINGLE_CACHE_LINE,
         AscendC::DcciDst::CACHELINE_OUT>(tensor[offset]);
     return tensor.GetValue(offset);
-}
-
-template <typename T>
-__aicore__ inline void WriteGlobalScalarVisible(
-    AscendC::GlobalTensor<T>& tensor,
-    uint64_t offset,
-    T value)
-{
-    tensor.SetValue(offset, value);
-    AscendC::DataCacheCleanAndInvalid<
-        T,
-        AscendC::CacheLine::SINGLE_CACHE_LINE,
-        AscendC::DcciDst::CACHELINE_OUT>(tensor[offset]);
 }
 
 template <typename T>
@@ -278,7 +266,7 @@ public:
         uint32_t selectedElements = 0;
         for (uint32_t mtpRow = 0; mtpRow < rowsPerRequest_; ++mtpRow) {
             const uint32_t row = request * rowsPerRequest_ + mtpRow;
-            if (ReadGlobalScalarFresh(rowReqIndices_, row) !=
+            if (rowReqIndices_.GetValue(row) !=
                 static_cast<int32_t>(request)) {
                 continue;
             }
@@ -286,7 +274,7 @@ public:
                 static_cast<uint64_t>(request) * requestWidth_
                 + static_cast<uint64_t>(mtpRow) * rowWidth_;
             const int32_t boundary =
-                ReadGlobalScalarFresh(splitBoundary_, row);
+                splitBoundary_.GetValue(row);
             AscendC::DataCopy(
                 input, topkIndices_[inputOffset], rowWidth_);
             Sync<AscendC::HardEvent::MTE2_V>();
@@ -442,8 +430,7 @@ public:
         auto oldSlots = reusedInt16;
         auto priorSlots = reusedInt16[shardCapacity_];
         const int32_t state =
-            ReadGlobalScalarFresh(
-                requestStateIndices_, request);
+            requestStateIndices_.GetValue(request);
         const bool realState =
             state >= 0 &&
             state < static_cast<int32_t>(dummyStateBase_);
@@ -451,11 +438,9 @@ public:
             ? static_cast<uint32_t>(state)
             : dummyStateBase_ + request;
         const int64_t requestedGeneration =
-            ReadGlobalScalarFresh(
-                requestStateGenerations_, request);
+            requestStateGenerations_.GetValue(request);
         const int64_t storedGeneration =
-            ReadGlobalScalarFresh(
-                stateGenerations_,
+            stateGenerations_.GetValue(
                 static_cast<uint64_t>(safeState)
                 * generationStride_);
         const bool generationMatches =
@@ -466,8 +451,7 @@ public:
             + shard * shardCountStride_;
         const uint32_t oldCount = generationMatches
             ? static_cast<uint32_t>(
-                  ReadGlobalScalarFresh(
-                      stateCounts_, stateCountOffset))
+                  stateCounts_.GetValue(stateCountOffset))
             : 0U;
         const uint64_t stateShardOffset =
             (static_cast<uint64_t>(safeState) * shardCount_ + shard)
@@ -503,10 +487,7 @@ public:
             priorSlots.SetValue(currentIndex, slot);
         }
         if (!generationMatches) {
-            WriteGlobalScalarVisible(
-                stateCounts_,
-                stateCountOffset,
-                static_cast<int32_t>(0));
+            stateCounts_.SetValue(stateCountOffset, 0);
         }
 
         Sync<AscendC::HardEvent::S_MTE3>();
@@ -519,10 +500,8 @@ public:
             priorSlots_[shardOffset], priorSlots, rank);
         // Host validation reserves one full 64-byte int32 cacheline per
         // (request, shard), so sibling AIVs never share this write line.
-        WriteGlobalScalarVisible(
-            shardCounts_,
-            countOffset,
-            static_cast<int32_t>(rank));
+        shardCounts_.SetValue(
+            countOffset, static_cast<int32_t>(rank));
     }
 
 private:
@@ -635,6 +614,164 @@ private:
     uint32_t generationStride_ = 0;
     uint32_t shardBits_ = 0;
     bool deduplicate_ = false;
+};
+
+// Test-only read probe. It never mutates resident state. For every shard it
+// records the count observed by raw scalar GM access, DCCI-protected scalar
+// access, and MTE2 bulk access. It also publishes the complete active
+// prior-slot payload after the same GM-to-UB copy used by the production
+// finalize kernel, so tests can compare every element on the host.
+class DSAResidentSortedReadProbeKernel {
+public:
+    __aicore__ inline void Init(
+        __gm__ int32_t* shardCounts,
+        __gm__ int16_t* priorSlots,
+        __gm__ int32_t* debugInfo,
+        __gm__ int16_t* priorReadback,
+        uint32_t requestCount,
+        uint32_t shardCount,
+        uint32_t capacity,
+        uint32_t shardCountStride,
+        uint32_t shardCountRequestStride)
+    {
+        requestCount_ = requestCount;
+        shardCount_ = shardCount;
+        capacity_ = capacity;
+        shardCountStride_ = shardCountStride;
+        shardCountRequestStride_ = shardCountRequestStride;
+        shardCounts_.SetGlobalBuffer(
+            shardCounts,
+            static_cast<uint64_t>(requestCount_)
+                * shardCountRequestStride_);
+        priorSlots_.SetGlobalBuffer(
+            priorSlots,
+            static_cast<uint64_t>(requestCount_) * shardCount_
+                * capacity_);
+        debugInfo_.SetGlobalBuffer(
+            debugInfo,
+            static_cast<uint64_t>(requestCount_)
+                * kResidentProbeDebugInts);
+        priorReadback_.SetGlobalBuffer(
+            priorReadback,
+            static_cast<uint64_t>(requestCount_) * shardCount_
+                * capacity_);
+        pipe_.InitBuffer(countBuf_, kDataBlockBytes);
+        pipe_.InitBuffer(
+            priorBuf_, capacity_ * sizeof(int16_t));
+        pipe_.InitBuffer(
+            debugBuf_,
+            kResidentProbeDebugInts * sizeof(int32_t));
+    }
+
+    __aicore__ inline void Process()
+    {
+        const uint32_t request = AscendC::GetBlockIdx();
+        if (request >= requestCount_) {
+            return;
+        }
+        auto countLocal = countBuf_.Get<int32_t>();
+        auto priorLocal = priorBuf_.Get<int16_t>();
+        auto debug = debugBuf_.Get<int32_t>();
+        AscendC::Duplicate(
+            debug,
+            static_cast<int32_t>(0),
+            kResidentProbeDebugInts);
+        AscendC::PipeBarrier<PIPE_V>();
+        Sync<AscendC::HardEvent::V_S>();
+        debug.SetValue(0, static_cast<int32_t>(0x52535031));
+        debug.SetValue(1, static_cast<int32_t>(shardCount_));
+        debug.SetValue(2, static_cast<int32_t>(capacity_));
+
+        const uint64_t requestShardBase =
+            static_cast<uint64_t>(request) * shardCount_ * capacity_;
+        for (uint32_t shard = 0; shard < shardCount_; ++shard) {
+            const uint64_t countOffset =
+                static_cast<uint64_t>(request)
+                    * shardCountRequestStride_
+                + shard * shardCountStride_;
+            const int32_t rawCount =
+                shardCounts_.GetValue(countOffset);
+            const int32_t freshCount =
+                ReadGlobalScalarFresh(shardCounts_, countOffset);
+            AscendC::DataCopy(
+                countLocal,
+                shardCounts_[countOffset],
+                kInt32PerDataBlock);
+            Sync<AscendC::HardEvent::MTE2_S>();
+            const int32_t bulkCount = countLocal.GetValue(0);
+            const uint32_t safeCount =
+                bulkCount > 0 &&
+                    static_cast<uint32_t>(bulkCount) <= capacity_
+                ? static_cast<uint32_t>(bulkCount)
+                : 0U;
+            const uint64_t priorOffset =
+                requestShardBase
+                + static_cast<uint64_t>(shard) * capacity_;
+            CopyGlobalToLocalExact(
+                priorLocal,
+                priorSlots_[priorOffset],
+                safeCount);
+            Sync<AscendC::HardEvent::MTE2_S>();
+            uint32_t bulkNegative = 0;
+            uint32_t bulkNonnegative = 0;
+            for (uint32_t index = 0; index < safeCount; ++index) {
+                if (priorLocal.GetValue(index) < 0) {
+                    ++bulkNegative;
+                } else {
+                    ++bulkNonnegative;
+                }
+            }
+            if (safeCount > 0) {
+                Sync<AscendC::HardEvent::S_MTE3>();
+                CopyLocalToGlobalExact(
+                    priorReadback_[priorOffset],
+                    priorLocal,
+                    safeCount);
+            }
+            const uint32_t base = 4 + shard * 7;
+            debug.SetValue(base, rawCount);
+            debug.SetValue(base + 1, freshCount);
+            debug.SetValue(base + 2, bulkCount);
+            debug.SetValue(base + 3, safeCount > 0
+                ? static_cast<int32_t>(priorLocal.GetValue(0))
+                : static_cast<int32_t>(0x7FFF));
+            debug.SetValue(base + 4, safeCount > 0
+                ? static_cast<int32_t>(
+                    priorLocal.GetValue(safeCount - 1))
+                : static_cast<int32_t>(0x7FFF));
+            debug.SetValue(
+                base + 5, static_cast<int32_t>(bulkNegative));
+            debug.SetValue(
+                base + 6, static_cast<int32_t>(bulkNonnegative));
+            if (safeCount > 0) {
+                Sync<AscendC::HardEvent::MTE3_MTE2>();
+            } else {
+                Sync<AscendC::HardEvent::S_MTE2>();
+            }
+        }
+        Sync<AscendC::HardEvent::S_MTE3>();
+        AscendC::DataCopy(
+            debugInfo_[
+                static_cast<uint64_t>(request)
+                    * kResidentProbeDebugInts],
+            debug,
+            kResidentProbeDebugInts);
+    }
+
+private:
+    AscendC::GlobalTensor<int32_t> shardCounts_;
+    AscendC::GlobalTensor<int16_t> priorSlots_;
+    AscendC::GlobalTensor<int32_t> debugInfo_;
+    AscendC::GlobalTensor<int16_t> priorReadback_;
+    AscendC::TPipe pipe_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> countBuf_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> priorBuf_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> debugBuf_;
+    uint32_t requestCount_ = 0;
+    uint32_t shardCount_ = 0;
+    uint32_t capacity_ = 0;
+    uint32_t shardCountStride_ = 0;
+    uint32_t shardCountRequestStride_ = 0;
 };
 
 class DSAResidentSortedFinalizeKernel {
@@ -762,8 +899,7 @@ public:
         uint32_t packedEnd = 0;
         for (uint32_t shard = 0; shard < shardCount_; ++shard) {
             const uint32_t count = static_cast<uint32_t>(
-                ReadGlobalScalarFresh(
-                    shardCounts_,
+                shardCounts_.GetValue(
                     static_cast<uint64_t>(request)
                         * shardCountRequestStride_
                     + shard * shardCountStride_));
@@ -868,8 +1004,7 @@ public:
             targetSlots,
             missCount);
         // One cacheline per request prevents count false sharing.
-        WriteGlobalScalarVisible(
-            missCounts_,
+        missCounts_.SetValue(
             static_cast<uint64_t>(request) * missCountStride_,
             static_cast<int32_t>(missCount));
     }
@@ -1011,8 +1146,7 @@ public:
             return;
         }
         const int32_t state =
-            ReadGlobalScalarFresh(
-                requestStateIndices_, request);
+            requestStateIndices_.GetValue(request);
         const bool realState =
             state >= 0 &&
             state < static_cast<int32_t>(dummyStateBase_);
@@ -1024,18 +1158,15 @@ public:
                 * shardCountRequestStride_
             + shard * shardCountStride_;
         const int64_t requestedGeneration =
-            ReadGlobalScalarFresh(
-                requestStateGenerations_, request);
+            requestStateGenerations_.GetValue(request);
         const uint64_t oldCountOffset =
             static_cast<uint64_t>(safeState)
                 * shardCountRequestStride_
             + shard * shardCountStride_;
         const uint32_t oldCount = static_cast<uint32_t>(
-            ReadGlobalScalarFresh(
-                stateCounts_, oldCountOffset));
+            stateCounts_.GetValue(oldCountOffset));
         const uint32_t currentCount = static_cast<uint32_t>(
-            ReadGlobalScalarFresh(
-                shardCounts_, requestCountOffset));
+            shardCounts_.GetValue(requestCountOffset));
         const uint64_t requestShardBase =
             static_cast<uint64_t>(request) * shardCount_ * capacity_;
         const uint64_t requestShardOffset =
@@ -1147,8 +1278,7 @@ public:
             static_cast<uint64_t>(safeState)
                 * shardCountRequestStride_
             + shard * shardCountStride_;
-        WriteGlobalScalarVisible(
-            stateCounts_,
+        stateCounts_.SetValue(
             newCountOffset, static_cast<int32_t>(mergedCount));
 
         RemapPositionPartition(
@@ -1159,8 +1289,7 @@ public:
         // materialized as zero counts by the fused union kernel, so
         // sibling blocks do not re-read this generation publication.
         if (shard == 0) {
-            WriteGlobalScalarVisible(
-                stateGenerations_,
+            stateGenerations_.SetValue(
                 static_cast<uint64_t>(safeState)
                     * generationStride_,
                 requestedGeneration);
@@ -1203,8 +1332,7 @@ private:
                     + begin],
                 partWidth);
             const uint32_t count = static_cast<uint32_t>(
-                ReadGlobalScalarFresh(
-                    shardCounts_,
+                shardCounts_.GetValue(
                     static_cast<uint64_t>(request)
                         * shardCountRequestStride_
                     + shard * shardCountStride_));
@@ -1323,6 +1451,26 @@ dsa_resident_sharded_union_kernel(
         priorSlots, requestCount, stateRowCount, dummyStateBase,
         rowsPerRequest, rowWidth, shardCount, shardCapacity,
         shardCountStride, shardCountRequestStride, generationStride);
+    op.Process();
+}
+
+extern "C" __global__ __aicore__ void
+dsa_resident_sorted_read_probe_kernel(
+    __gm__ int32_t* shardCounts,
+    __gm__ int16_t* priorSlots,
+    __gm__ int32_t* debugInfo,
+    __gm__ int16_t* priorReadback,
+    uint32_t requestCount,
+    uint32_t shardCount,
+    uint32_t capacity,
+    uint32_t shardCountStride,
+    uint32_t shardCountRequestStride)
+{
+    DSAResidentSortedReadProbeKernel op;
+    op.Init(
+        shardCounts, priorSlots, debugInfo, priorReadback,
+        requestCount, shardCount, capacity,
+        shardCountStride, shardCountRequestStride);
     op.Process();
 }
 
@@ -1506,6 +1654,28 @@ void dsa_resident_sorted_plan_impl(
         rowsPerRequest, rowWidth, shardCount, capacity,
         shardCountStride, shardCountRequestStride,
         generationStride);
+}
+
+void dsa_resident_sorted_read_probe_impl(
+    void* stream,
+    void* shardCounts,
+    void* priorSlots,
+    void* debugInfo,
+    void* priorReadback,
+    uint32_t requestCount,
+    uint32_t shardCount,
+    uint32_t capacity,
+    uint32_t shardCountStride,
+    uint32_t shardCountRequestStride)
+{
+    dsa_resident_sorted_read_probe_kernel<<<
+        requestCount, nullptr, stream>>>(
+        static_cast<int32_t*>(shardCounts),
+        static_cast<int16_t*>(priorSlots),
+        static_cast<int32_t*>(debugInfo),
+        static_cast<int16_t*>(priorReadback),
+        requestCount, shardCount, capacity,
+        shardCountStride, shardCountRequestStride);
 }
 
 }  // namespace vllm_ascend

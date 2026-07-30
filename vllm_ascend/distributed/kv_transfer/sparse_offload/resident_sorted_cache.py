@@ -18,6 +18,7 @@ import torch
 RESIDENT_COUNT_CACHELINE_INTS = 16
 RESIDENT_GENERATION_CACHELINE_LONGS = 8
 INDEX_TOPK = 2048
+RESIDENT_READ_PROBE_DEBUG_INTS = 32
 
 
 def resident_shard_count(mtp: int) -> int:
@@ -219,4 +220,24 @@ def prepare_sorted_resident_cache_(
         workspace.miss_tokens,
         workspace.miss_counts[:, 0],
         workspace.target_slots,
+    )
+
+
+def probe_sorted_resident_reads_(
+    workspace: SortedResidentWorkspace,
+    debug_info: torch.Tensor,
+    prior_readback: torch.Tensor,
+) -> None:
+    """Test-only: publish the finalize kernel's GM-to-UB input view."""
+    try:
+        op = torch.ops._C_ascend.npu_dsa_resident_sorted_read_probe_
+    except AttributeError as error:
+        raise RuntimeError(
+            "vllm_ascend_C does not expose the sorted resident read probe; rebuild the extension"
+        ) from error
+    op(
+        workspace.shard_counts,
+        workspace.prior_slots,
+        debug_info,
+        prior_readback,
     )
