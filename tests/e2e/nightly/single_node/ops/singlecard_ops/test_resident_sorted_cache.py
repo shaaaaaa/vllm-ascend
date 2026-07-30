@@ -102,6 +102,93 @@ def _assert_union_outputs(
     return expected
 
 
+def _assert_and_print_fused_remap_copy_inputs(
+    source: torch.Tensor,
+    workspace,
+    expected_shards: list[list[list[int]]],
+) -> None:
+    """Publish the exact GM slices consumed by the fused remap copy."""
+    requests = workspace.shard_mapping.shape[0]
+    shard_count = workspace.shard_mapping.shape[1]
+    request_width = workspace.shard_mapping.shape[2]
+    part_width = request_width // shard_count
+    mapping_base_ptr = workspace.shard_mapping.data_ptr()
+    mapping = workspace.shard_mapping.cpu()
+    counts = workspace.shard_counts[:, :, 0].cpu()
+    source_flat = source.reshape(requests, request_width)
+
+    print(
+        "\n[resident-fused-remap-copy-input]"
+        f" shape={tuple(workspace.shard_mapping.shape)}"
+        f" dtype={workspace.shard_mapping.dtype}"
+        f" contiguous={workspace.shard_mapping.is_contiguous()}"
+        f" base_ptr=0x{mapping_base_ptr:x}"
+        f" base_mod64={mapping_base_ptr % 64}"
+        f" request_width={request_width}"
+        f" part_width={part_width}"
+        f" copy_elements={part_width}"
+        f" copy_bytes={part_width * mapping.element_size()}"
+    )
+
+    for request in range(requests):
+        expected_mapping = []
+        tokens = source_flat[request].tolist()
+        for source_shard in range(shard_count):
+            rank_by_token = {
+                token: rank
+                for rank, token in enumerate(
+                    expected_shards[request][source_shard]
+                )
+            }
+            expected_mapping.append(
+                [rank_by_token.get(token, -1) for token in tokens]
+            )
+
+        for part in range(shard_count):
+            begin = part * part_width
+            end = begin + part_width
+            for source_shard in range(shard_count):
+                element_offset = (
+                    (request * shard_count + source_shard)
+                    * request_width
+                    + begin
+                )
+                byte_offset = element_offset * mapping.element_size()
+                source_ptr = mapping_base_ptr + byte_offset
+                actual = mapping[
+                    request, source_shard, begin:end
+                ]
+                expected = expected_mapping[source_shard][begin:end]
+                assert actual.tolist() == expected
+                nonnegative = actual[actual >= 0]
+                rank_min = (
+                    int(nonnegative.min()) if nonnegative.numel() else -1
+                )
+                rank_max = (
+                    int(nonnegative.max()) if nonnegative.numel() else -1
+                )
+                print(
+                    "[resident-fused-remap-copy-slice]"
+                    f" request={request}"
+                    f" part={part}"
+                    f" source_shard={source_shard}"
+                    f" shard_count_value={int(counts[request, source_shard])}"
+                    f" begin={begin}"
+                    f" end={end}"
+                    f" element_offset={element_offset}"
+                    f" byte_offset={byte_offset}"
+                    f" source_ptr=0x{source_ptr:x}"
+                    f" source_mod64={source_ptr % 64}"
+                    f" count={part_width}"
+                    f" negative={int((actual < 0).sum())}"
+                    f" nonnegative={int((actual >= 0).sum())}"
+                    f" rank_min={rank_min}"
+                    f" rank_max={rank_max}"
+                    f" first16={actual[:16].tolist()}"
+                    f" last16={actual[-16:].tolist()}"
+                )
+
+
 def _seed_resident_state(
     state,
     *,
@@ -1062,6 +1149,10 @@ def test_fused_remap_bisect_mapping_load_does_not_crash(mtp):
         workspace,
         mtp=mtp,
     )
+    # Materialize the exact producer output before launching the crashing
+    # fused consumer. This confirms its GM source values, offsets, lengths,
+    # and alignment without changing the fused kernel itself.
+    torch.npu.synchronize()
     expected_shards = _expected_shards(
         source,
         boundaries.cpu(),
@@ -1069,6 +1160,11 @@ def test_fused_remap_bisect_mapping_load_does_not_crash(mtp):
         mtp,
         shard_count,
     )[0]
+    _assert_and_print_fused_remap_copy_inputs(
+        source,
+        workspace,
+        [expected_shards],
+    )
     reference, expected_misses, expected_slots = _reference_step(
         expected_shards, {}, capacity
     )
