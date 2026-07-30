@@ -1678,4 +1678,40 @@ void dsa_resident_sorted_read_probe_impl(
         shardCountStride, shardCountRequestStride);
 }
 
+void dsa_resident_sorted_finalize_debug_impl(
+    void* stream,
+    void* shardPacked,
+    void* shardCounts,
+    void* priorSlots,
+    void* overwrittenSlots,
+    void* missTokens,
+    void* missCounts,
+    void* targetSlots,
+    void* requestBlockTable,
+    uint32_t requestCount,
+    uint32_t shardCount,
+    uint32_t capacity,
+    uint32_t shardCountStride,
+    uint32_t shardCountRequestStride,
+    uint32_t missCountStride,
+    uint32_t blockTableWidth,
+    uint32_t blockSize)
+{
+    // Test-only boundary isolation: launch the exact production finalize
+    // kernel without launching the following state-update/remap kernel.
+    dsa_resident_sorted_finalize_kernel<<<
+        requestCount, nullptr, stream>>>(
+        static_cast<int32_t*>(shardPacked),
+        static_cast<int32_t*>(shardCounts),
+        static_cast<int16_t*>(priorSlots),
+        static_cast<uint8_t*>(overwrittenSlots),
+        static_cast<int32_t*>(missTokens),
+        static_cast<int32_t*>(missCounts),
+        static_cast<int64_t*>(targetSlots),
+        static_cast<int32_t*>(requestBlockTable),
+        requestCount, shardCount, capacity, shardCountStride,
+        shardCountRequestStride, missCountStride,
+        blockTableWidth, blockSize);
+}
+
 }  // namespace vllm_ascend

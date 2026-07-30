@@ -241,3 +241,31 @@ def probe_sorted_resident_reads_(
         debug_info,
         prior_readback,
     )
+
+
+def debug_sorted_resident_finalize_only_(
+    request_block_table: torch.Tensor,
+    workspace: SortedResidentWorkspace,
+    *,
+    block_size: int,
+) -> None:
+    """Test-only: run the exact finalize kernel without state update/remap."""
+    try:
+        op = (
+            torch.ops._C_ascend.npu_dsa_resident_sorted_finalize_debug_
+        )
+    except AttributeError as error:
+        raise RuntimeError(
+            "vllm_ascend_C does not expose the sorted resident finalize debug op; rebuild the extension"
+        ) from error
+    op(
+        workspace.shard_packed,
+        workspace.shard_counts,
+        workspace.prior_slots,
+        workspace.overwritten_slots,
+        workspace.miss_tokens,
+        workspace.miss_counts,
+        workspace.target_slots,
+        request_block_table,
+        block_size,
+    )

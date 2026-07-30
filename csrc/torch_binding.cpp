@@ -1893,6 +1893,124 @@ at::Tensor npu_dsa_resident_sorted_read_probe_(
     return debug_info;
 }
 
+at::Tensor npu_dsa_resident_sorted_finalize_debug_(
+    const at::Tensor &shard_packed,
+    const at::Tensor &shard_counts,
+    at::Tensor &prior_slots,
+    at::Tensor &overwritten_slots,
+    at::Tensor &miss_tokens,
+    at::Tensor &miss_counts,
+    at::Tensor &target_slots,
+    const at::Tensor &request_block_table,
+    int64_t block_size)
+{
+    const auto device = shard_packed.device();
+    TORCH_CHECK(
+        shard_packed.is_privateuseone() &&
+            shard_counts.device() == device &&
+            prior_slots.device() == device &&
+            overwritten_slots.device() == device &&
+            miss_tokens.device() == device &&
+            miss_counts.device() == device &&
+            target_slots.device() == device &&
+            request_block_table.device() == device,
+        "resident finalize-debug tensors must share one NPU device");
+    TORCH_CHECK(
+        shard_packed.scalar_type() == at::kInt &&
+            shard_counts.scalar_type() == at::kInt &&
+            prior_slots.scalar_type() == at::kShort &&
+            overwritten_slots.scalar_type() == at::kByte &&
+            miss_tokens.scalar_type() == at::kInt &&
+            miss_counts.scalar_type() == at::kInt &&
+            target_slots.scalar_type() == at::kLong &&
+            request_block_table.scalar_type() == at::kInt,
+        "resident finalize-debug tensor dtypes are invalid");
+    TORCH_CHECK(
+        shard_packed.is_contiguous() &&
+            shard_counts.is_contiguous() &&
+            prior_slots.is_contiguous() &&
+            overwritten_slots.is_contiguous() &&
+            miss_tokens.is_contiguous() &&
+            miss_counts.is_contiguous() &&
+            target_slots.is_contiguous() &&
+            request_block_table.is_contiguous(),
+        "resident finalize-debug tensors must be contiguous");
+    TORCH_CHECK(
+        shard_packed.dim() == 3 &&
+            shard_counts.dim() == 3 &&
+            prior_slots.dim() == 3 &&
+            overwritten_slots.dim() == 2 &&
+            miss_tokens.dim() == 2 &&
+            miss_counts.dim() == 2 &&
+            target_slots.dim() == 2 &&
+            request_block_table.dim() == 2,
+        "resident finalize-debug tensor ranks are invalid");
+
+    const int64_t request_count = shard_packed.size(0);
+    const int64_t shard_count = shard_packed.size(1);
+    const int64_t capacity = shard_packed.size(2);
+    const int64_t shard_count_stride = shard_counts.size(2);
+    const int64_t shard_count_request_stride =
+        shard_counts.size(1) * shard_count_stride;
+    const int64_t miss_count_stride = miss_counts.size(1);
+    const int64_t block_table_width = request_block_table.size(1);
+    TORCH_CHECK(
+        request_count > 0 &&
+            (shard_count == 2 || shard_count == 4) &&
+            capacity > 0 &&
+            prior_slots.sizes() == shard_packed.sizes() &&
+            shard_counts.size(0) == request_count &&
+            shard_counts.size(1) == shard_count &&
+            shard_count_stride >= 16 &&
+            overwritten_slots.size(0) == request_count &&
+            overwritten_slots.size(1) == capacity &&
+            miss_tokens.sizes() == overwritten_slots.sizes() &&
+            target_slots.sizes() == overwritten_slots.sizes() &&
+            miss_counts.size(0) == request_count &&
+            miss_count_stride >= 16 &&
+            request_block_table.size(0) >= request_count &&
+            block_size > 0 &&
+            block_table_width * block_size >= capacity,
+        "resident finalize-debug tensor shapes are invalid");
+
+    const c10_npu::OptionalNPUGuard npu_guard(device);
+    aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
+    void* packed_ptr = shard_packed.data_ptr();
+    void* count_ptr = shard_counts.data_ptr();
+    void* prior_ptr = prior_slots.data_ptr();
+    void* overwritten_ptr = overwritten_slots.data_ptr();
+    void* miss_token_ptr = miss_tokens.data_ptr();
+    void* miss_count_ptr = miss_counts.data_ptr();
+    void* target_ptr = target_slots.data_ptr();
+    void* block_table_ptr = request_block_table.data_ptr();
+    at_npu::native::OpCommand cmd;
+    cmd.Name("npu_dsa_resident_sorted_finalize_debug_");
+    cmd.SetCustomHandler([
+        stream, packed_ptr, count_ptr, prior_ptr,
+        overwritten_ptr, miss_token_ptr, miss_count_ptr,
+        target_ptr, block_table_ptr,
+        request_count, shard_count, capacity,
+        shard_count_stride, shard_count_request_stride,
+        miss_count_stride, block_table_width,
+        block_size]() -> int {
+        dsa_resident_sorted_finalize_debug_impl(
+            stream, packed_ptr, count_ptr, prior_ptr,
+            overwritten_ptr, miss_token_ptr, miss_count_ptr,
+            target_ptr, block_table_ptr,
+            static_cast<uint32_t>(request_count),
+            static_cast<uint32_t>(shard_count),
+            static_cast<uint32_t>(capacity),
+            static_cast<uint32_t>(shard_count_stride),
+            static_cast<uint32_t>(shard_count_request_stride),
+            static_cast<uint32_t>(miss_count_stride),
+            static_cast<uint32_t>(block_table_width),
+            static_cast<uint32_t>(block_size));
+        return 0;
+    });
+    cmd.Run();
+    return miss_counts;
+}
+
 at::Tensor npu_dsa_staged_unique_finalize_(
     const at::Tensor &unique_keys,
     const at::Tensor &inverse,
@@ -3111,6 +3229,17 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "npu_dsa_resident_sorted_read_probe_",
         torch::kPrivateUse1,
         &vllm_ascend::npu_dsa_resident_sorted_read_probe_);
+    ops.def(
+        "npu_dsa_resident_sorted_finalize_debug_("
+        "Tensor shard_packed, Tensor shard_counts, "
+        "Tensor(a!) prior_slots, Tensor(b!) overwritten_slots, "
+        "Tensor(c!) miss_tokens, Tensor(d!) miss_counts, "
+        "Tensor(e!) target_slots, Tensor request_block_table, "
+        "int block_size) -> Tensor(d!)");
+    ops.impl(
+        "npu_dsa_resident_sorted_finalize_debug_",
+        torch::kPrivateUse1,
+        &vllm_ascend::npu_dsa_resident_sorted_finalize_debug_);
     ops.def(
         "npu_dsa_staged_unique_finalize_(Tensor unique_keys, "
         "Tensor inverse, Tensor row_req_indices, "

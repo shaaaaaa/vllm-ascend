@@ -5,6 +5,7 @@ from vllm_ascend.distributed.kv_transfer.sparse_offload.resident_sorted_cache im
     RESIDENT_READ_PROBE_DEBUG_INTS,
     allocate_sorted_resident_state,
     allocate_sorted_resident_workspace,
+    debug_sorted_resident_finalize_only_,
     prepare_resident_sharded_union_,
     prepare_sorted_resident_cache_,
     probe_sorted_resident_reads_,
@@ -21,6 +22,7 @@ def _load_sorted_resident_ops():
         "npu_dsa_resident_sharded_union_",
         "npu_dsa_resident_sorted_plan_",
         "npu_dsa_resident_sorted_read_probe_",
+        "npu_dsa_resident_sorted_finalize_debug_",
     ):
         if not hasattr(torch.ops._C_ascend, name):
             pytest.fail(f"vllm_ascend_C does not contain {name}")
@@ -415,6 +417,86 @@ def test_kernel_read_probe_matches_full_capacity_union_output(mtp):
             assert nonnegative == int(
                 (host_prior[shard, :expected_count] >= 0).sum()
             )
+
+
+@pytest.mark.parametrize("mtp", [1, 2])
+def test_finalize_kernel_boundary_at_full_shard_capacity(mtp):
+    """Validate finalize outputs before state update/remap is launched."""
+    requests = 1
+    shard_count = resident_shard_count(mtp)
+    capacity = mtp * 2048
+    source = (
+        torch.arange(capacity, dtype=torch.int32)
+        .mul(shard_count)
+        .reshape(mtp, 1, 2048)
+    )
+    values = source.npu()
+    boundaries = torch.full(
+        (mtp,),
+        int(source.max()) + 1,
+        dtype=torch.int32,
+        device="npu",
+    )
+    row_requests = torch.zeros(mtp, dtype=torch.int32, device="npu")
+    request_states = torch.zeros(1, dtype=torch.int32, device="npu")
+    request_generations = torch.ones(1, dtype=torch.int64, device="npu")
+    workspace = allocate_sorted_resident_workspace(
+        requests, mtp, device=torch.device("npu")
+    )
+    state = allocate_sorted_resident_state(
+        requests, requests, mtp, device=torch.device("npu")
+    )
+    block_table = torch.arange(
+        capacity // 128, dtype=torch.int32, device="npu"
+    ).reshape(1, -1)
+
+    prepare_resident_sharded_union_(
+        values,
+        boundaries,
+        row_requests,
+        request_states,
+        request_generations,
+        state,
+        workspace,
+        mtp=mtp,
+    )
+    # Deliberately do not synchronize between the two kernels. This matches
+    # the production stream-ordered launch and the established staged-union
+    # implementation.
+    debug_sorted_resident_finalize_only_(
+        block_table,
+        workspace,
+        block_size=128,
+    )
+    torch.npu.synchronize()
+
+    miss_count = int(workspace.miss_counts[0, 0].cpu())
+    prior = workspace.prior_slots[0, 0, :capacity].cpu()
+    overwritten = workspace.overwritten_slots[0].cpu()
+    misses = workspace.miss_tokens[0, :miss_count].cpu()
+    targets = workspace.target_slots[0, :miss_count].cpu()
+    packed = workspace.shard_packed[0, 0, :capacity].cpu()
+    print(
+        "\n[resident-finalize-kernel-boundary]"
+        f" mtp={mtp}"
+        f" miss_count={miss_count}"
+        f" prior_negative={int((prior < 0).sum())}"
+        f" prior_unique={torch.unique(prior).numel()}"
+        f" overwritten={int(overwritten.sum())}"
+        f" miss_first={int(misses[0]) if miss_count else -1}"
+        f" miss_last={int(misses[-1]) if miss_count else -1}"
+        f" target_first={int(targets[0]) if miss_count else -1}"
+        f" target_last={int(targets[-1]) if miss_count else -1}"
+    )
+    assert miss_count == capacity
+    assert prior.tolist() == list(range(capacity))
+    assert torch.all(overwritten == 1)
+    assert torch.equal(misses, packed)
+    assert targets.tolist() == list(range(capacity))
+    # The isolated boundary op must not launch update/remap.
+    assert values.cpu().reshape(-1).tolist() == source.reshape(-1).tolist()
+    assert torch.all(state.counts[:, :, 0].cpu() == 0)
+    assert torch.all(state.generations[:, 0].cpu() == -1)
 
 
 @pytest.mark.parametrize("mtp", [1, 2])

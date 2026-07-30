@@ -268,6 +268,28 @@ at::Tensor npu_dsa_resident_sorted_read_probe_meta(
     return debug_info;
 }
 
+at::Tensor npu_dsa_resident_sorted_finalize_debug_meta(
+    const at::Tensor &shard_packed,
+    const at::Tensor &shard_counts,
+    at::Tensor &prior_slots,
+    at::Tensor &overwritten_slots,
+    at::Tensor &miss_tokens,
+    at::Tensor &miss_counts,
+    at::Tensor &target_slots,
+    const at::Tensor &request_block_table,
+    int64_t block_size)
+{
+    (void)shard_packed;
+    (void)shard_counts;
+    (void)prior_slots;
+    (void)overwritten_slots;
+    (void)miss_tokens;
+    (void)target_slots;
+    (void)request_block_table;
+    (void)block_size;
+    return miss_counts;
+}
+
 at::Tensor npu_dsa_staged_sharded_union_meta(
     at::Tensor &topk_indices,
     const at::Tensor &split_boundary,
@@ -911,6 +933,9 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
     ops.impl(
         "npu_dsa_resident_sorted_read_probe_",
         &vllm_ascend::meta::npu_dsa_resident_sorted_read_probe_meta);
+    ops.impl(
+        "npu_dsa_resident_sorted_finalize_debug_",
+        &vllm_ascend::meta::npu_dsa_resident_sorted_finalize_debug_meta);
     // Bgmv expand
     ops.impl("bgmv_expand", &vllm_ascend::meta::bgmv_expand_meta);
     // Sgmv expand
