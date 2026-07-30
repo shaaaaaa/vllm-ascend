@@ -322,8 +322,7 @@ namespace vllm_ascend {
     uint32_t miss_count_stride,
     uint32_t generation_stride,
     uint32_t block_table_width,
-    uint32_t block_size,
-    uint32_t remap_debug_stage);
+    uint32_t block_size);
 
   extern void dsa_resident_sorted_read_probe_impl(
     void* stream,

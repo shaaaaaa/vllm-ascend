@@ -1600,8 +1600,7 @@ at::Tensor npu_dsa_resident_sorted_plan_(
     at::Tensor &miss_counts,
     at::Tensor &target_slots,
     int64_t block_size,
-    int64_t dummy_state_base,
-    int64_t remap_debug_stage)
+    int64_t dummy_state_base)
 {
     const auto device = topk_indices.device();
     TORCH_CHECK(
@@ -1711,9 +1710,6 @@ at::Tensor npu_dsa_resident_sorted_plan_(
             block_table_width * block_size >= capacity,
         "sorted-resident dimensions are unsupported");
     TORCH_CHECK(
-        remap_debug_stage >= 0 && remap_debug_stage <= 18,
-        "sorted-resident remap debug stage must be in [0, 18]");
-    TORCH_CHECK(
         dummy_state_base >= request_count &&
             state_row_count >= dummy_state_base + request_count &&
             state_slots.sizes() == state_tokens.sizes() &&
@@ -1793,7 +1789,7 @@ at::Tensor npu_dsa_resident_sorted_plan_(
         rows_per_request, row_width, shard_count, capacity,
         shard_count_stride, shard_count_request_stride,
         miss_count_stride, generation_stride,
-        block_table_width, block_size, remap_debug_stage]() -> int {
+        block_table_width, block_size]() -> int {
         dsa_resident_sorted_plan_impl(
             stream, topk_ptr, packed_ptr, mapping_ptr,
             shard_count_ptr, block_table_ptr, request_state_ptr,
@@ -1814,8 +1810,7 @@ at::Tensor npu_dsa_resident_sorted_plan_(
             static_cast<uint32_t>(miss_count_stride),
             static_cast<uint32_t>(generation_stride),
             static_cast<uint32_t>(block_table_width),
-            static_cast<uint32_t>(block_size),
-            static_cast<uint32_t>(remap_debug_stage));
+            static_cast<uint32_t>(block_size));
         return 0;
     });
     cmd.Run();
@@ -3231,8 +3226,7 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "Tensor(f!) prior_slots, Tensor(g!) overwritten_slots, "
         "Tensor(h!) miss_tokens, Tensor(i!) miss_counts, "
         "Tensor(j!) target_slots, int block_size, "
-        "int dummy_state_base, "
-        "int remap_debug_stage=0) -> Tensor(i!)");
+        "int dummy_state_base) -> Tensor(i!)");
     ops.impl(
         "npu_dsa_resident_sorted_plan_",
         torch::kPrivateUse1,

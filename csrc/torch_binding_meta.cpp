@@ -234,8 +234,7 @@ at::Tensor npu_dsa_resident_sorted_plan_meta(
     at::Tensor &miss_counts,
     at::Tensor &target_slots,
     int64_t block_size,
-    int64_t dummy_state_base,
-    int64_t remap_debug_stage)
+    int64_t dummy_state_base)
 {
     (void)topk_indices;
     (void)shard_packed;
@@ -254,7 +253,6 @@ at::Tensor npu_dsa_resident_sorted_plan_meta(
     (void)target_slots;
     (void)block_size;
     (void)dummy_state_base;
-    (void)remap_debug_stage;
     return miss_counts;
 }
 

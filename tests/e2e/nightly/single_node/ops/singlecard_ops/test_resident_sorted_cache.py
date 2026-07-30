@@ -516,226 +516,6 @@ def test_kernel_read_probe_matches_full_capacity_union_output(mtp):
             )
 
 
-@pytest.mark.parametrize("mtp", [1, 2])
-def test_remap_input_capture_matches_kernel_internal_reads(mtp):
-    """Print and verify the payload read inside RemapPositionPartition."""
-    requests = 1
-    shard_count = resident_shard_count(mtp)
-    capacity = mtp * 2048
-    source = _source(mtp, 0)
-    values = source.npu()
-    boundaries = torch.full(
-        (mtp,),
-        100_000,
-        dtype=torch.int32,
-        device="npu",
-    )
-    row_requests = torch.zeros(mtp, dtype=torch.int32, device="npu")
-    request_states = torch.zeros(1, dtype=torch.int32, device="npu")
-    request_generations = torch.ones(1, dtype=torch.int64, device="npu")
-    workspace = allocate_sorted_resident_workspace(
-        requests, mtp, device=torch.device("npu")
-    )
-    state = allocate_sorted_resident_state(
-        requests, requests, mtp, device=torch.device("npu")
-    )
-    block_table = torch.arange(
-        capacity // 128,
-        dtype=torch.int32,
-        device="npu",
-    ).reshape(1, -1)
-
-    prepare_resident_sharded_union_(
-        values,
-        boundaries,
-        row_requests,
-        request_states,
-        request_generations,
-        state,
-        workspace,
-        mtp=mtp,
-    )
-    expected_topk = values.reshape(-1).cpu().clone()
-    expected_mapping = workspace.shard_mapping[0].cpu().clone()
-
-    prepare_sorted_resident_cache_(
-        values,
-        block_table,
-        request_states,
-        request_generations,
-        state,
-        workspace,
-        block_size=128,
-    )
-    torch.npu.synchronize()
-
-    counts = workspace.shard_counts[0, :, 0].cpu()
-    expected_prior = workspace.prior_slots[0].cpu()
-    captured_topk = workspace.miss_tokens[0].cpu()
-    captured_mapping = (
-        workspace.target_slots[0]
-        .cpu()
-        .view(torch.int16)[: shard_count * capacity]
-        .reshape(shard_count, capacity)
-    )
-    captured_prior = (
-        workspace.shard_packed[0]
-        .cpu()
-        .view(torch.int16)
-        .reshape(shard_count, 2 * capacity)[:, :capacity]
-    )
-
-    topk_mismatches = int((captured_topk != expected_topk).sum())
-    mapping_mismatches = int(
-        (captured_mapping != expected_mapping).sum()
-    )
-    print(
-        "\n[resident-remap-input]"
-        f" mtp={mtp}"
-        f" shard_count={shard_count}"
-        f" capacity={capacity}"
-        f" part_width={capacity // shard_count}"
-        f" topk_first={int(captured_topk[0])}"
-        f" topk_last={int(captured_topk[-1])}"
-        f" topk_mismatches={topk_mismatches}"
-        f" mapping_mismatches={mapping_mismatches}"
-    )
-    assert topk_mismatches == 0
-    assert mapping_mismatches == 0
-    for shard in range(shard_count):
-        count = int(counts[shard])
-        prior_mismatches = int(
-            (
-                captured_prior[shard, :count]
-                != expected_prior[shard, :count]
-            ).sum()
-        )
-        mapping = captured_mapping[shard]
-        print(
-            "[resident-remap-input-shard]"
-            f" mtp={mtp}"
-            f" shard={shard}"
-            f" count={count}"
-            f" mapping_first={int(mapping[0])}"
-            f" mapping_last={int(mapping[-1])}"
-            f" mapping_negative={int((mapping < 0).sum())}"
-            f" prior_first={int(captured_prior[shard, 0]) if count else -1}"
-            f" prior_last={int(captured_prior[shard, count - 1]) if count else -1}"
-            f" prior_mismatches={prior_mismatches}"
-        )
-        assert prior_mismatches == 0
-
-
-_REMAP_VECTOR_DEBUG_STAGES = (
-    (1, "topk-load"),
-    (2, "accumulator-duplicate"),
-    (3, "first-shard-load"),
-    (4, "mapping-int16-to-float"),
-    (5, "mapping-float-to-int32"),
-    (6, "rank-maxs"),
-    (7, "rank-compare"),
-    (8, "rank-mins"),
-    (9, "rank-byte-offset"),
-    (10, "slot-gather-int16"),
-    (11, "slot-int16-to-float"),
-    (12, "slot-float-to-int32"),
-    (13, "first-shard-select"),
-    (14, "all-shards-select"),
-    (15, "final-maxs"),
-    (16, "final-compare"),
-    (17, "final-select"),
-    (18, "topk-writeback"),
-)
-_REMAP_VECTOR_DEBUG_CASES = tuple(
-    (mtp, target_step, stage, name)
-    for mtp in (1, 2)
-    for target_step in (1, 2, 3)
-    for stage, name in _REMAP_VECTOR_DEBUG_STAGES
-)
-
-
-@pytest.mark.parametrize(
-    "mtp,target_step,debug_stage,stage_name",
-    _REMAP_VECTOR_DEBUG_CASES,
-    ids=[
-        f"mtp{mtp}-step{target_step}-stage{stage}-{name}"
-        for mtp, target_step, stage, name in _REMAP_VECTOR_DEBUG_CASES
-    ],
-)
-def test_remap_vector_stage_probe(
-    mtp, target_step, debug_stage, stage_name
-):
-    """Run exactly one prefix of the remap pipeline in this process."""
-    requests = 1
-    capacity = mtp * 2048
-    boundaries = torch.full(
-        (mtp,),
-        100_000,
-        dtype=torch.int32,
-        device="npu",
-    )
-    row_requests = torch.zeros(mtp, dtype=torch.int32, device="npu")
-    request_states = torch.zeros(1, dtype=torch.int32, device="npu")
-    request_generations = torch.ones(1, dtype=torch.int64, device="npu")
-    workspace = allocate_sorted_resident_workspace(
-        requests, mtp, device=torch.device("npu")
-    )
-    state = allocate_sorted_resident_state(
-        requests, requests, mtp, device=torch.device("npu")
-    )
-    block_table = torch.arange(
-        capacity // 128,
-        dtype=torch.int32,
-        device="npu",
-    ).reshape(1, -1)
-
-    for step, offset in enumerate((0, 100, 0), start=1):
-        if step > target_step:
-            break
-        source = _source(mtp, offset)
-        values = source.npu()
-        prepare_resident_sharded_union_(
-            values,
-            boundaries,
-            row_requests,
-            request_states,
-            request_generations,
-            state,
-            workspace,
-            mtp=mtp,
-        )
-        stage = debug_stage if step == target_step else 18
-        print(
-            "\n[resident-remap-stage]"
-            f" mtp={mtp}"
-            f" target_step={target_step}"
-            f" current_step={step}"
-            f" offset={offset}"
-            f" stage={stage}"
-            f" name={stage_name if step == target_step else 'setup-full'}",
-            flush=True,
-        )
-        prepare_sorted_resident_cache_(
-            values,
-            block_table,
-            request_states,
-            request_generations,
-            state,
-            workspace,
-            block_size=128,
-            remap_debug_stage=stage,
-        )
-        torch.npu.synchronize()
-    print(
-        "[resident-remap-stage-passed]"
-        f" mtp={mtp}"
-        f" target_step={target_step}"
-        f" stage={debug_stage}"
-        f" name={stage_name}",
-        flush=True,
-    )
-
-
 @pytest.mark.parametrize(
     "mtp,debug_stage",
     [
@@ -1119,7 +899,7 @@ def test_sorted_resident_matches_three_step_reference(mtp):
     ).reshape(requests, blocks_per_request)
 
     reference: dict[int, int] = {}
-    for step, offset in enumerate((0, 100, 0), start=1):
+    for offset in (0, 100, 0):
         source = _source(mtp, offset)
         values = source.npu()
         prepare_resident_sharded_union_(
@@ -1140,14 +920,6 @@ def test_sorted_resident_matches_three_step_reference(mtp):
             shard_count,
         )[0]
         reference, expected_misses, expected_slots = _reference_step(expected_shards, reference, capacity)
-        print(
-            "\n[resident-three-step-full-remap]"
-            f" mtp={mtp}"
-            f" step={step}"
-            f" offset={offset}"
-            " debug_stage=18",
-            flush=True,
-        )
         prepare_sorted_resident_cache_(
             values,
             block_table,
@@ -1156,7 +928,6 @@ def test_sorted_resident_matches_three_step_reference(mtp):
             state,
             workspace,
             block_size=block_size,
-            remap_debug_stage=18,
         )
         torch.npu.synchronize()
 
