@@ -1717,6 +1717,16 @@ private:
             accumulatedSlots, static_cast<int32_t>(-1), partWidth);
         AscendC::PipeBarrier<PIPE_V>();
 
+        // Diagnostic single-variable experiment: keep the same GM/UB tensors
+        // and 2048-byte transfer, but bypass the element-count overload that
+        // emitted the reproducible LOOPEND/LCNT=0 fault in this fused context.
+        // DataCopyParams::blockLen is in 32-byte datablocks for aligned copy.
+        const AscendC::DataCopyParams mappingCopy{
+            1,
+            static_cast<uint16_t>(
+                partWidth * sizeof(int16_t) / kDataBlockBytes),
+            0,
+            0};
         for (uint32_t shard = 0; shard < shardCount_; ++shard) {
             const uint32_t count = static_cast<uint32_t>(
                 shardCounts_.GetValue(
@@ -1727,13 +1737,13 @@ private:
                 continue;
             }
 
-            CopyGlobalToLocalExact(
+            AscendC::DataCopy(
                 mappingOrGathered,
                 shardMapping_[
                     mappingBase
                     + static_cast<uint64_t>(shard) * requestWidth_
                     + begin],
-                partWidth);
+                mappingCopy);
 #if !DSA_RESIDENT_FUSED_REMAP_BISECT_SKIP_AFTER_MAPPING_LOAD
             CopyGlobalToLocalExact(
                 shardSlots,
