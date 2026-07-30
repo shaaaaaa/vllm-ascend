@@ -1,0 +1,89 @@
+import pytest
+import torch
+
+from vllm_ascend.distributed.kv_transfer.sparse_offload.resident_sorted_cache import (
+    allocate_sorted_resident_state,
+    allocate_sorted_resident_workspace,
+    resident_shard_count,
+)
+
+
+@pytest.mark.parametrize("mtp,capacity,shard_count", [(1, 2048, 2), (2, 4096, 4)])
+def test_sorted_resident_allocations_are_cacheline_partitioned(mtp, capacity, shard_count):
+    requests = 3
+    state = allocate_sorted_resident_state(
+        requests,
+        requests,
+        mtp,
+        device=torch.device("cpu"),
+    )
+    workspace = allocate_sorted_resident_workspace(
+        requests,
+        mtp,
+        device=torch.device("cpu"),
+    )
+
+    assert state.tokens.shape == (
+        2 * requests,
+        shard_count,
+        capacity,
+    )
+    assert state.slots.shape == state.tokens.shape
+    assert state.counts.shape == (
+        2 * requests,
+        shard_count,
+        16,
+    )
+    assert state.generations.shape == (2 * requests, 8)
+    assert state.dummy_state_base == requests
+    assert workspace.shard_packed.shape == (
+        requests,
+        shard_count,
+        capacity,
+    )
+    assert workspace.shard_mapping.shape == workspace.shard_packed.shape
+    assert workspace.shard_mapping.dtype == torch.int16
+    assert workspace.prior_slots.shape == workspace.shard_packed.shape
+    assert not hasattr(workspace, "assigned_slots")
+    assert workspace.shard_counts.shape == (requests, shard_count, 16)
+    assert workspace.overwritten_slots.shape == (requests, capacity)
+    assert workspace.overwritten_slots.dtype == torch.uint8
+    assert workspace.overwritten_slots.numel() * workspace.overwritten_slots.element_size() == (
+        requests * capacity
+    )
+    assert workspace.miss_counts.shape == (requests, 16)
+    assert state.tokens.data_ptr() % 64 == 0
+    assert state.slots.data_ptr() % 64 == 0
+    assert state.counts.data_ptr() % 64 == 0
+    assert workspace.shard_packed.data_ptr() % 64 == 0
+    assert workspace.shard_mapping.data_ptr() % 64 == 0
+    assert workspace.shard_counts.data_ptr() % 64 == 0
+    assert state.tokens.stride(1) * state.tokens.element_size() % 64 == 0
+    assert state.slots.stride(1) * state.slots.element_size() % 64 == 0
+    assert workspace.shard_mapping.stride(1) * workspace.shard_mapping.element_size() % 64 == 0
+    assert workspace.prior_slots.stride(1) * workspace.prior_slots.element_size() % 64 == 0
+    assert (
+        workspace.overwritten_slots.stride(0)
+        * workspace.overwritten_slots.element_size()
+        % 64
+        == 0
+    )
+
+
+def test_sorted_resident_uses_strict_next_power_of_two():
+    assert resident_shard_count(1) == 2
+    assert resident_shard_count(2) == 4
+
+
+def test_sorted_resident_rejects_unsupported_mtp_and_state_size():
+    with pytest.raises(ValueError, match="MTP=1 or MTP=2"):
+        allocate_sorted_resident_workspace(1, 3, device=torch.device("cpu"))
+    with pytest.raises(ValueError, match="cover every active request"):
+        allocate_sorted_resident_state(
+            1,
+            2,
+            1,
+            device=torch.device("cpu"),
+        )
+    with pytest.raises(ValueError, match="MTP=1 or MTP=2"):
+        resident_shard_count(3)

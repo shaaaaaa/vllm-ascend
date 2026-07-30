@@ -182,6 +182,80 @@ at::Tensor npu_dsa_resident_finalize_rows_meta(
     return selected_count;
 }
 
+at::Tensor npu_dsa_resident_sharded_union_meta(
+    const at::Tensor &topk_indices,
+    const at::Tensor &split_boundary,
+    const at::Tensor &row_req_indices,
+    at::Tensor &shard_packed,
+    at::Tensor &shard_mapping,
+    at::Tensor &shard_counts,
+    const at::Tensor &request_state_indices,
+    const at::Tensor &request_state_generations,
+    at::Tensor &state_tokens,
+    at::Tensor &state_slots,
+    at::Tensor &state_counts,
+    const at::Tensor &state_generations,
+    at::Tensor &prior_slots,
+    int64_t mtp,
+    int64_t dummy_state_base)
+{
+    (void)topk_indices;
+    (void)split_boundary;
+    (void)row_req_indices;
+    (void)shard_packed;
+    (void)shard_mapping;
+    (void)request_state_indices;
+    (void)request_state_generations;
+    (void)state_tokens;
+    (void)state_slots;
+    (void)state_counts;
+    (void)state_generations;
+    (void)prior_slots;
+    (void)mtp;
+    (void)dummy_state_base;
+    return shard_counts;
+}
+
+at::Tensor npu_dsa_resident_sorted_plan_meta(
+    at::Tensor &topk_indices,
+    const at::Tensor &shard_packed,
+    const at::Tensor &shard_mapping,
+    const at::Tensor &shard_counts,
+    const at::Tensor &request_block_table,
+    const at::Tensor &request_state_indices,
+    const at::Tensor &request_state_generations,
+    at::Tensor &state_tokens,
+    at::Tensor &state_slots,
+    at::Tensor &state_counts,
+    at::Tensor &state_generations,
+    at::Tensor &prior_slots,
+    at::Tensor &overwritten_slots,
+    at::Tensor &miss_tokens,
+    at::Tensor &miss_counts,
+    at::Tensor &target_slots,
+    int64_t block_size,
+    int64_t dummy_state_base)
+{
+    (void)topk_indices;
+    (void)shard_packed;
+    (void)shard_mapping;
+    (void)shard_counts;
+    (void)request_block_table;
+    (void)request_state_indices;
+    (void)request_state_generations;
+    (void)state_tokens;
+    (void)state_slots;
+    (void)state_counts;
+    (void)state_generations;
+    (void)prior_slots;
+    (void)overwritten_slots;
+    (void)miss_tokens;
+    (void)target_slots;
+    (void)block_size;
+    (void)dummy_state_base;
+    return miss_counts;
+}
+
 at::Tensor npu_dsa_staged_sharded_union_meta(
     at::Tensor &topk_indices,
     const at::Tensor &split_boundary,
@@ -816,6 +890,12 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
     ops.impl(
         "npu_dsa_resident_finalize_rows_",
         &vllm_ascend::meta::npu_dsa_resident_finalize_rows_meta);
+    ops.impl(
+        "npu_dsa_resident_sharded_union_",
+        &vllm_ascend::meta::npu_dsa_resident_sharded_union_meta);
+    ops.impl(
+        "npu_dsa_resident_sorted_plan_",
+        &vllm_ascend::meta::npu_dsa_resident_sorted_plan_meta);
     // Bgmv expand
     ops.impl("bgmv_expand", &vllm_ascend::meta::bgmv_expand_meta);
     // Sgmv expand

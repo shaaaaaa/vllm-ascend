@@ -7,6 +7,12 @@ from vllm_ascend.distributed.kv_transfer.sparse_offload.prepare_sparse_indices i
     _sparse_index_op_name,
     prepare_sparse_indices,
 )
+from vllm_ascend.distributed.kv_transfer.sparse_offload.resident_sorted_cache import (
+    allocate_sorted_resident_state,
+    allocate_sorted_resident_workspace,
+    prepare_resident_sharded_union_,
+    resident_shard_count,
+)
 from vllm_ascend.utils import enable_custom_op
 
 
@@ -50,6 +56,49 @@ def _measure_npu_ms(run, reset, warmups: int, iterations: int) -> list[float]:
         end.record()
     torch.npu.synchronize()
     return [start.elapsed_time(end) for start, end in zip(starts, ends)]
+
+
+def _validate_resident_sharded_union(
+    source: torch.Tensor,
+    boundary: int,
+    shard_packed: torch.Tensor,
+    shard_mapping: torch.Tensor,
+    shard_counts: torch.Tensor,
+    *,
+    mtp: int,
+) -> None:
+    source_cpu = source.reshape(shard_packed.shape[0], mtp, -1).cpu()
+    packed_cpu = shard_packed.cpu()
+    mapping_cpu = shard_mapping.cpu()
+    counts_cpu = shard_counts[:, :, 0].cpu()
+    shard_count = shard_packed.shape[1]
+    for request in range(shard_packed.shape[0]):
+        for shard in range(shard_count):
+            expected = sorted(
+                {
+                    int(token)
+                    for token in source_cpu[request].reshape(-1).tolist()
+                    if 0 <= token < boundary and token % shard_count == shard
+                }
+            )
+            count = int(counts_cpu[request, shard])
+            actual = packed_cpu[request, shard, :count].tolist()
+            if actual != expected:
+                raise AssertionError(
+                    f"resident shard {shard} payload differs: "
+                    f"{actual[:8]} != {expected[:8]}"
+                )
+        for position, token in enumerate(
+            source_cpu[request].reshape(-1).tolist()
+        ):
+            if not 0 <= token < boundary:
+                continue
+            shard = token % shard_count
+            rank = int(mapping_cpu[request, shard, position])
+            if int(packed_cpu[request, shard, rank]) != token:
+                raise AssertionError(
+                    "resident shard mapping does not point at its token"
+                )
 
 
 def _summary(name: str, samples: list[float]) -> None:
@@ -504,7 +553,11 @@ def main(
         raise ValueError("the sharded benchmark supports --mtp from 1 to 8")
     if not enable_custom_op():
         raise RuntimeError("vllm-ascend custom operators could not be loaded")
-    print(f"MTP depth={mtp}, value shards={1 << (mtp - 1).bit_length()}")
+    print(
+        f"MTP depth={mtp}, "
+        f"legacy value shards={1 << (mtp - 1).bit_length()}, "
+        f"resident shards={resident_shard_count(mtp) if mtp <= 2 else 'n/a'}"
+    )
     legacy_op = torch.ops._C_ascend.npu_dsa_prepare_sparse_indices_legacy_
     union_op = torch.ops._C_ascend.npu_dsa_staged_union_
     remap_op = torch.ops._C_ascend.npu_dsa_staged_remap_rows_
@@ -529,6 +582,7 @@ def main(
     sharded_vector_values = source.clone()
     sharded_vector_dedup_values = source.clone()
     production_staged_values = source.clone()
+    resident_union_values = source.clone()
     max_tokens = 131072
     boundaries = torch.full((row_count,), max_tokens, dtype=torch.int32, device="npu")
     source_max = (mtp + 1) * topk // 2 - 1
@@ -621,6 +675,31 @@ def main(
         ),
     )
     sharded_vector_dedup_scratch = tuple(torch.empty_like(item) for item in sharded_sort_scratch)
+    resident_union_workspace = (
+        allocate_sorted_resident_workspace(
+            request_batch,
+            mtp,
+            device=torch.device("npu"),
+        )
+        if mtp <= 2
+        else None
+    )
+    resident_union_state = (
+        allocate_sorted_resident_state(
+            request_batch,
+            request_batch,
+            mtp,
+            device=torch.device("npu"),
+        )
+        if mtp <= 2
+        else None
+    )
+    resident_request_states = torch.arange(
+        request_batch, dtype=torch.int32, device="npu"
+    )
+    resident_request_generations = torch.ones(
+        request_batch, dtype=torch.int64, device="npu"
+    )
 
     def staged(values, buffers, use_sort):
         return _staged_runner(
@@ -722,6 +801,20 @@ def main(
             block_size=block_size,
         )
 
+    def resident_sharded_union():
+        assert resident_union_workspace is not None
+        assert resident_union_state is not None
+        prepare_resident_sharded_union_(
+            resident_union_values,
+            sharded_boundaries,
+            row_requests,
+            resident_request_states,
+            resident_request_generations,
+            resident_union_state,
+            resident_union_workspace,
+            mtp=mtp,
+        )
+
     pair_baselines = mtp == 2
     native_unique_baseline = mtp in (2, 3)
     if not pair_baselines:
@@ -735,6 +828,8 @@ def main(
     sharded_sort_result = staged_sharded_sort()
     sharded_vector_result = staged_sharded_vector()
     sharded_vector_dedup_result = staged_sharded_vector_dedup()
+    if resident_union_workspace is not None:
+        resident_sharded_union()
     production_staged_result = None
     if mtp <= 2:
         production_result = prepare_sparse_indices(
@@ -854,6 +949,15 @@ def main(
             mtp=mtp,
             topk=topk,
             max_tokens=max_tokens,
+        )
+    if resident_union_workspace is not None:
+        _validate_resident_sharded_union(
+            source,
+            sharded_boundary,
+            resident_union_workspace.shard_packed,
+            resident_union_workspace.shard_mapping,
+            resident_union_workspace.shard_counts,
+            mtp=mtp,
         )
 
     legacy_samples = _measure_npu_ms(
@@ -977,6 +1081,14 @@ def main(
             warmups,
             iterations,
         )
+    resident_union_samples = []
+    if resident_union_workspace is not None:
+        resident_union_samples = _measure_npu_ms(
+            resident_sharded_union,
+            lambda: resident_union_values.copy_(source),
+            warmups,
+            iterations,
+        )
 
     legacy_mean = statistics.fmean(legacy_samples)
     union_mean = statistics.fmean(union_samples)
@@ -1009,6 +1121,15 @@ def main(
             production_staged_samples
         )
         _summary(production_label, production_staged_samples)
+    resident_union_mean = None
+    if resident_union_samples:
+        resident_union_mean = statistics.fmean(resident_union_samples)
+        _summary(
+            "resident-sort+intersect"
+            if mtp == 1
+            else "resident-union+intersect",
+            resident_union_samples,
+        )
     native_unique_mean = None
     if native_unique_baseline:
         native_unique_mean = statistics.fmean(native_unique_samples)
@@ -1065,6 +1186,15 @@ def main(
     ]
     if production_staged_mean is not None:
         candidates.append((production_label, production_staged_mean))
+    if resident_union_mean is not None:
+        candidates.append(
+            (
+                "resident-sort+intersect"
+                if mtp == 1
+                else "resident-union+intersect",
+                resident_union_mean,
+            )
+        )
     if native_unique_baseline:
         candidates.append(("native-unique", native_unique_mean))
     if pair_baselines:

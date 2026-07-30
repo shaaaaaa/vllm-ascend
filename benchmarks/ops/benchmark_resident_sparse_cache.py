@@ -1,8 +1,8 @@
 """Benchmark persistent sparse-cache planning independently of MTP union.
 
-This benchmark starts from a synthetic, already-deduplicated request union.
-It compares only the resident-cache implementations and separately measures
-the two torch-npu ACLNN primitives used by the hybrid path.
+It compares the existing reverse-map implementations with the independent
+sorted-shard path. The sorted path reports union, resident-plan, and
+end-to-end latency separately.
 """
 
 import argparse
@@ -10,6 +10,13 @@ import statistics
 
 import torch
 
+from vllm_ascend.distributed.kv_transfer.sparse_offload.resident_sorted_cache import (
+    allocate_sorted_resident_state,
+    allocate_sorted_resident_workspace,
+    prepare_resident_sharded_union_,
+    prepare_sorted_resident_cache_,
+    resident_shard_count,
+)
 from vllm_ascend.distributed.kv_transfer.sparse_offload.resident_sparse_cache import (
     allocate_resident_workspace,
     prepare_resident_sparse_cache_,
@@ -189,6 +196,51 @@ def main(
             union_seed[:, :hit_count]
         )
 
+    sorted_workspace = allocate_sorted_resident_workspace(
+        requests, mtp, device=device
+    )
+    sorted_state = allocate_sorted_resident_state(
+        requests, requests, mtp, device=device
+    )
+    sorted_values = topk_seed.clone()
+    sorted_boundaries = torch.full(
+        (requests * mtp,),
+        union_count,
+        dtype=torch.int32,
+        device=device,
+    )
+    sorted_row_requests = torch.arange(
+        requests, dtype=torch.int32, device=device
+    ).repeat_interleave(mtp)
+    shard_count = resident_shard_count(mtp)
+    if hit_count:
+        sorted_hit_tokens = union_seed[0, :hit_count]
+        sorted_hit_slots = torch.arange(
+            capacity - hit_count,
+            capacity,
+            dtype=torch.int16,
+            device=device,
+        )
+        for shard in range(shard_count):
+            mask = sorted_hit_tokens.remainder(shard_count).eq(shard)
+            shard_tokens = sorted_hit_tokens[mask]
+            shard_slots = sorted_hit_slots[mask]
+            shard_hits = shard_tokens.numel()
+            sorted_state.tokens[:requests, shard, :shard_hits].copy_(
+                shard_tokens.expand(requests, -1)
+            )
+            sorted_state.slots[:requests, shard, :shard_hits].copy_(
+                shard_slots.expand(requests, -1)
+            )
+            sorted_state.counts[:requests, shard, 0].fill_(shard_hits)
+    sorted_state.generations[:requests, 0].fill_(1)
+    sorted_state_seed = (
+        sorted_state.tokens.clone(),
+        sorted_state.slots.clone(),
+        sorted_state.counts.clone(),
+        sorted_state.generations.clone(),
+    )
+
     def reset_inputs() -> None:
         values.copy_(topk_seed)
         selected.copy_(union_seed)
@@ -217,6 +269,40 @@ def main(
             scratch_capacity=capacity,
             parallel_map=use_hybrid_aiv,
         )
+
+    def reset_sorted_inputs() -> None:
+        sorted_values.copy_(topk_seed)
+        sorted_state.tokens.copy_(sorted_state_seed[0])
+        sorted_state.slots.copy_(sorted_state_seed[1])
+        sorted_state.counts.copy_(sorted_state_seed[2])
+        sorted_state.generations.copy_(sorted_state_seed[3])
+
+    def sorted_union() -> None:
+        prepare_resident_sharded_union_(
+            sorted_values,
+            sorted_boundaries,
+            sorted_row_requests,
+            request_states,
+            request_generations,
+            sorted_state,
+            sorted_workspace,
+            mtp=mtp,
+        )
+
+    def sorted_plan() -> None:
+        prepare_sorted_resident_cache_(
+            sorted_values,
+            block_table,
+            request_states,
+            request_generations,
+            sorted_state,
+            sorted_workspace,
+            block_size=block_size,
+        )
+
+    def sorted_end_to_end() -> None:
+        sorted_union()
+        sorted_plan()
 
     expected_misses = [union_count - hit_count] * requests
     reset_inputs()
@@ -275,6 +361,25 @@ def main(
             "hybrid resident planner differs from all-Torch reference: "
             + ", ".join(mismatch_names)
         )
+
+    reset_sorted_inputs()
+    sorted_end_to_end()
+    torch.npu.synchronize()
+    expected_miss_set = set(range(hit_count, union_count))
+    for request in range(requests):
+        miss_count = int(sorted_workspace.miss_counts[request, 0].cpu())
+        actual_miss_set = set(
+            sorted_workspace.miss_tokens[
+                request, :miss_count
+            ].cpu().tolist()
+        )
+        if (
+            miss_count != union_count - hit_count
+            or actual_miss_set != expected_miss_set
+        ):
+            raise AssertionError(
+                "sorted resident planner produced an incorrect miss set"
+            )
 
     # Save the exact scatter payload emitted by the hybrid planner.
     scatter_indices_seed = (
@@ -337,17 +442,41 @@ def main(
         warmups,
         iterations,
     )
+    sorted_union_samples = _measure_npu_ms(
+        sorted_union,
+        lambda: sorted_values.copy_(topk_seed),
+        warmups,
+        iterations,
+    )
+    reset_sorted_inputs()
+    sorted_union()
+    torch.npu.synchronize()
+    sorted_plan_samples = _measure_npu_ms(
+        sorted_plan,
+        reset_sorted_inputs,
+        warmups,
+        iterations,
+    )
+    sorted_end_to_end_samples = _measure_npu_ms(
+        sorted_end_to_end,
+        reset_sorted_inputs,
+        warmups,
+        iterations,
+    )
 
     print(
         "resident sparse-cache benchmark: "
         f"topk={topk}, MTP={mtp}, requests={requests}, "
         f"hit_rate={hit_rate:.2%}, union={union_count}, "
-        f"misses={union_count - hit_count}"
+        f"misses={union_count - hit_count}, shards={shard_count}"
     )
     _summary("aclnn-gather", gather_samples)
     _summary("aclnn-scatter", scatter_samples)
     _summary("all-torch", torch_samples)
     _summary("hybrid-aiv", hybrid_samples)
+    _summary("sorted-union+intersect", sorted_union_samples)
+    _summary("sorted-finalize+update", sorted_plan_samples)
+    _summary("sorted-end2end", sorted_end_to_end_samples)
     torch_mean = statistics.fmean(torch_samples)
     hybrid_mean = statistics.fmean(hybrid_samples)
     gather_scatter_mean = (
@@ -365,6 +494,17 @@ def main(
         f"({(hybrid_mean / torch_mean - 1) * 100:+.2f}%), "
         f"speedup={torch_mean / hybrid_mean:.3f}x"
     )
+    for name, samples in (
+        ("sorted-finalize+update", sorted_plan_samples),
+        ("sorted-end2end", sorted_end_to_end_samples),
+    ):
+        mean = statistics.fmean(samples)
+        print(
+            f"{name} vs hybrid: "
+            f"{mean - hybrid_mean:+.6f} ms "
+            f"({(mean / hybrid_mean - 1) * 100:+.2f}%), "
+            f"speedup={hybrid_mean / mean:.3f}x"
+        )
 
 
 if __name__ == "__main__":
