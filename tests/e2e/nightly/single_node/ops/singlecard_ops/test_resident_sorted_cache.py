@@ -1111,8 +1111,8 @@ def test_split_plan_preserves_topk_until_standalone_remap(mtp):
 
 
 @pytest.mark.parametrize("mtp", [1, 2])
-def test_fused_remap_bisect_mapping_params_copy_does_not_crash(mtp):
-    """Exercise the isolated explicit-params shard-mapping GM-to-UB copy."""
+def test_fused_remap_bisect_no_loop_mapping_copy_does_not_crash(mtp):
+    """Exercise source-shard-0 mapping copy without a surrounding loop."""
     requests = 1
     shard_count = resident_shard_count(mtp)
     capacity = mtp * 2048

@@ -1717,16 +1717,31 @@ private:
             accumulatedSlots, static_cast<int32_t>(-1), partWidth);
         AscendC::PipeBarrier<PIPE_V>();
 
-        // Diagnostic single-variable experiment: keep the same GM/UB tensors
-        // and 2048-byte transfer, but bypass the element-count overload that
-        // emitted the reproducible LOOPEND/LCNT=0 fault in this fused context.
-        // DataCopyParams::blockLen is in 32-byte datablocks for aligned copy.
+        // Retain the explicit-params form from the preceding experiment so
+        // this revision changes only whether a dynamic shard loop surrounds
+        // the copy. DataCopyParams::blockLen is in 32-byte datablocks.
         const AscendC::DataCopyParams mappingCopy{
             1,
             static_cast<uint16_t>(
                 partWidth * sizeof(int16_t) / kDataBlockBytes),
             0,
             0};
+#if DSA_RESIDENT_FUSED_REMAP_BISECT_SKIP_AFTER_MAPPING_LOAD
+        // The preceding bisect observed LOOPEND/LCNT=0 only after adding the
+        // first mapping copy to this dynamic shard loop. Execute that exact
+        // source-shard-0 copy without the loop to distinguish loop codegen
+        // from the reused UB destination and the copy itself.
+        const uint32_t count = static_cast<uint32_t>(
+            shardCounts_.GetValue(
+                static_cast<uint64_t>(request)
+                    * shardCountRequestStride_));
+        if (count > 0) {
+            AscendC::DataCopy(
+                mappingOrGathered,
+                shardMapping_[mappingBase + begin],
+                mappingCopy);
+        }
+#else
         for (uint32_t shard = 0; shard < shardCount_; ++shard) {
             const uint32_t count = static_cast<uint32_t>(
                 shardCounts_.GetValue(
@@ -1744,7 +1759,6 @@ private:
                     + static_cast<uint64_t>(shard) * requestWidth_
                     + begin],
                 mappingCopy);
-#if !DSA_RESIDENT_FUSED_REMAP_BISECT_SKIP_AFTER_MAPPING_LOAD
             CopyGlobalToLocalExact(
                 shardSlots,
                 priorSlots_[
@@ -1827,8 +1841,8 @@ private:
             // The next iteration reuses both int16 MTE2 destinations after
             // the vector pipeline has consumed them.
             Sync<AscendC::HardEvent::V_MTE2>();
-#endif
         }
+#endif
 
 #if !DSA_RESIDENT_FUSED_REMAP_BISECT_SKIP_POST_LOOP
         // Preserve unselected/split-boundary positions exactly as the old
