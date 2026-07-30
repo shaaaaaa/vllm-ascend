@@ -9,6 +9,7 @@ from vllm_ascend.distributed.kv_transfer.sparse_offload.resident_sorted_cache im
     debug_sorted_resident_finalize_only_,
     prepare_resident_sharded_union_,
     prepare_sorted_resident_cache_,
+    prepare_sorted_resident_cache_fused_,
     prepare_sorted_resident_cache_no_remap_,
     probe_sorted_resident_reads_,
     remap_sorted_resident_cache_,
@@ -1020,6 +1021,77 @@ def test_split_plan_preserves_topk_until_standalone_remap(mtp):
     assert values.reshape(-1).cpu().tolist() == [
         reference[token] for token in source.reshape(-1).tolist()
     ]
+
+
+@pytest.mark.parametrize("mtp", [1, 2])
+def test_fused_remap_bisect_without_post_loop_does_not_crash(mtp):
+    """Exercise the complete shard loop with post-loop work compiled out."""
+    requests = 1
+    shard_count = resident_shard_count(mtp)
+    capacity = mtp * 2048
+    source = _source(mtp, 0)
+    values = source.npu()
+    boundaries = torch.full(
+        (mtp,),
+        100_000,
+        dtype=torch.int32,
+        device="npu",
+    )
+    row_requests = torch.zeros(mtp, dtype=torch.int32, device="npu")
+    request_states = torch.zeros(1, dtype=torch.int32, device="npu")
+    request_generations = torch.ones(1, dtype=torch.int64, device="npu")
+    workspace = allocate_sorted_resident_workspace(
+        requests, mtp, device=torch.device("npu")
+    )
+    state = allocate_sorted_resident_state(
+        requests, requests, mtp, device=torch.device("npu")
+    )
+    block_table = torch.arange(
+        capacity // 128,
+        dtype=torch.int32,
+        device="npu",
+    ).reshape(1, -1)
+
+    prepare_resident_sharded_union_(
+        values,
+        boundaries,
+        row_requests,
+        request_states,
+        request_generations,
+        state,
+        workspace,
+        mtp=mtp,
+    )
+    expected_shards = _expected_shards(
+        source,
+        boundaries.cpu(),
+        requests,
+        mtp,
+        shard_count,
+    )[0]
+    reference, expected_misses, expected_slots = _reference_step(
+        expected_shards, {}, capacity
+    )
+
+    prepare_sorted_resident_cache_fused_(
+        values,
+        block_table,
+        request_states,
+        request_generations,
+        state,
+        workspace,
+        block_size=128,
+    )
+    torch.npu.synchronize()
+
+    # The compile-time bisect removes the final writeback, so every position
+    # must retain its original token while the complete shard loop and the
+    # finalize/state update still execute.
+    assert values.reshape(-1).cpu().tolist() == source.reshape(-1).tolist()
+    miss_count = int(workspace.miss_counts[0, 0].cpu())
+    assert workspace.miss_tokens[0, :miss_count].cpu().tolist() == expected_misses
+    assert workspace.target_slots[0, :miss_count].cpu().tolist() == expected_slots
+    assert _state_dict(state, 0, shard_count) == reference
 
 
 @pytest.mark.parametrize("mtp", [1, 2])

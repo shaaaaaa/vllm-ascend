@@ -30,6 +30,12 @@ constexpr uint32_t kMaxResidentShards = 4;
 constexpr uint32_t kResidentProbeDebugInts = 32;
 constexpr uint32_t kResidentFinalizeDebugInts = 16;
 
+// Temporary compile-time bisect for the original fused update+remap kernel.
+// Keep the complete per-shard loop, including Gather/Cast/Select, and compile
+// out everything after that loop. A crash is therefore inside the loop; a
+// clean synchronization places the fault in the post-loop finalization.
+#define DSA_RESIDENT_FUSED_REMAP_BISECT_SKIP_POST_LOOP 1
+
 template <AscendC::HardEvent event>
 __aicore__ inline void Sync()
 {
@@ -1811,6 +1817,7 @@ private:
             Sync<AscendC::HardEvent::V_MTE2>();
         }
 
+#if !DSA_RESIDENT_FUSED_REMAP_BISECT_SKIP_POST_LOOP
         // Preserve unselected/split-boundary positions exactly as the old
         // resident remapper does; selected positions receive their slot.
         AscendC::Maxs(
@@ -1840,6 +1847,7 @@ private:
             topkIndices_[requestOffset + begin],
             ranksOrOutput,
             partWidth);
+#endif
     }
 
     AscendC::GlobalTensor<int32_t> topkIndices_;
