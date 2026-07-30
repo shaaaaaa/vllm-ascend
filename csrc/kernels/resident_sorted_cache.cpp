@@ -1559,6 +1559,9 @@ private:
         }
         Sync<AscendC::HardEvent::MTE2_S>();
 
+        // Temporary diagnostic: keep remap GM/UB transfers active while
+        // removing only the scalar token-to-slot loop.
+#if 0
         for (uint32_t localPosition = 0;
              localPosition < partWidth;
              ++localPosition) {
@@ -1583,6 +1586,7 @@ private:
                     static_cast<int32_t>(slot));
             }
         }
+#endif
         Sync<AscendC::HardEvent::S_MTE3>();
         CopyLocalToGlobalExact(
             topkIndices_[requestOffset + begin],
