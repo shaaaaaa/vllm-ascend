@@ -31,11 +31,11 @@ constexpr uint32_t kResidentProbeDebugInts = 32;
 constexpr uint32_t kResidentFinalizeDebugInts = 16;
 
 // Temporary compile-time bisect for the original fused update+remap kernel.
-// The load quarter still faults. Enable only the first eighth: shard count
-// lookup and the zero-count branch. Compile out all GM-to-UB copies, syncs,
-// vector work, and everything after the loop.
+// Count-only passes while the two-load quarter faults. Enable only the first
+// GM-to-UB copy (shard_mapping) after the count branch; compile out the
+// prior_slots copy, syncs, vector work, and everything after the loop.
 #define DSA_RESIDENT_FUSED_REMAP_BISECT_SKIP_POST_LOOP 1
-#define DSA_RESIDENT_FUSED_REMAP_BISECT_SKIP_AFTER_COUNT 1
+#define DSA_RESIDENT_FUSED_REMAP_BISECT_SKIP_AFTER_MAPPING_LOAD 1
 
 template <AscendC::HardEvent event>
 __aicore__ inline void Sync()
@@ -1727,7 +1727,6 @@ private:
                 continue;
             }
 
-#if !DSA_RESIDENT_FUSED_REMAP_BISECT_SKIP_AFTER_COUNT
             CopyGlobalToLocalExact(
                 mappingOrGathered,
                 shardMapping_[
@@ -1735,6 +1734,7 @@ private:
                     + static_cast<uint64_t>(shard) * requestWidth_
                     + begin],
                 partWidth);
+#if !DSA_RESIDENT_FUSED_REMAP_BISECT_SKIP_AFTER_MAPPING_LOAD
             CopyGlobalToLocalExact(
                 shardSlots,
                 priorSlots_[

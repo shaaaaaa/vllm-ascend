@@ -1024,8 +1024,8 @@ def test_split_plan_preserves_topk_until_standalone_remap(mtp):
 
 
 @pytest.mark.parametrize("mtp", [1, 2])
-def test_fused_remap_bisect_loop_count_eighth_does_not_crash(mtp):
-    """Exercise only shard count lookup in the fused remap loop."""
+def test_fused_remap_bisect_mapping_load_does_not_crash(mtp):
+    """Exercise count lookup and the shard-mapping GM-to-UB copy."""
     requests = 1
     shard_count = resident_shard_count(mtp)
     capacity = mtp * 2048
@@ -1084,9 +1084,9 @@ def test_fused_remap_bisect_loop_count_eighth_does_not_crash(mtp):
     )
     torch.npu.synchronize()
 
-    # The compile-time bisect keeps only count lookup and its zero branch in
-    # each iteration. It removes all copies, syncs, vector work, and final
-    # writeback, so every position retains its original token.
+    # The compile-time bisect keeps count lookup and only the first GM-to-UB
+    # copy in each iteration. It removes the prior-slot copy, syncs, vector
+    # work, and final writeback, so every position retains its original token.
     assert values.reshape(-1).cpu().tolist() == source.reshape(-1).tolist()
     miss_count = int(workspace.miss_counts[0, 0].cpu())
     assert workspace.miss_tokens[0, :miss_count].cpu().tolist() == expected_misses
