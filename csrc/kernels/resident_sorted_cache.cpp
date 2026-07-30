@@ -1245,6 +1245,9 @@ public:
         __gm__ int32_t* shardCounts,
         __gm__ int16_t* priorSlots,
         __gm__ uint8_t* overwrittenSlots,
+        __gm__ int32_t* remapDebugTopk,
+        __gm__ int16_t* remapDebugMapping,
+        __gm__ int16_t* remapDebugPrior,
         __gm__ int32_t* requestStateIndices,
         __gm__ int64_t* requestStateGenerations,
         __gm__ int32_t* stateTokens,
@@ -1297,6 +1300,16 @@ public:
         overwrittenSlots_.SetGlobalBuffer(
             overwrittenSlots,
             static_cast<uint64_t>(requestCount_) * capacity_);
+        remapDebugTopk_.SetGlobalBuffer(
+            remapDebugTopk, requestElements);
+        remapDebugMapping_.SetGlobalBuffer(
+            remapDebugMapping,
+            static_cast<uint64_t>(requestCount_) * shardCount_
+                * requestWidth_);
+        remapDebugPrior_.SetGlobalBuffer(
+            remapDebugPrior,
+            static_cast<uint64_t>(requestCount_) * shardCount_
+                * 2 * capacity_);
         requestStateIndices_.SetGlobalBuffer(
             requestStateIndices, requestCount_);
         requestStateGenerations_.SetGlobalBuffer(
@@ -1488,12 +1501,8 @@ public:
         stateCounts_.SetValue(
             newCountOffset, static_cast<int32_t>(mergedCount));
 
-        // Temporary isolation: keep union/finalize/state update unchanged
-        // while excluding only the new vector remap from execution.
-#if 0
         RemapPositionPartition(
             request, shard, requestShardBase);
-#endif
 
         // Every shard copied its complete old list to private UB before
         // overwriting its own disjoint GM range. Generation mismatches were
@@ -1521,6 +1530,69 @@ private:
             static_cast<uint64_t>(request) * shardCount_
             * requestWidth_;
 
+        // Temporary diagnostic: capture the exact GM payload copied by this
+        // invocation, then skip all remap vector instructions. Each position
+        // partition owns disjoint top-k/mapping ranges; each block also owns
+        // one complete prior-slot shard, so the readback has one writer per
+        // cacheline.
+        auto debugTopk = oldTokenBuf_.Get<int32_t>();
+        auto debugMapping = oldSlotBuf_.Get<int16_t>();
+        auto debugPrior = priorSlotBuf_.Get<int16_t>();
+        Sync<AscendC::HardEvent::S_MTE2>();
+        CopyGlobalToLocalExact(
+            debugTopk,
+            topkIndices_[requestOffset + begin],
+            partWidth);
+        Sync<AscendC::HardEvent::MTE2_MTE3>();
+        CopyLocalToGlobalExact(
+            remapDebugTopk_[requestOffset + begin],
+            debugTopk,
+            partWidth);
+        Sync<AscendC::HardEvent::MTE3_MTE2>();
+
+        for (uint32_t valueShard = 0;
+             valueShard < shardCount_;
+             ++valueShard) {
+            const uint64_t mappingOffset =
+                mappingBase
+                + static_cast<uint64_t>(valueShard) * requestWidth_
+                + begin;
+            CopyGlobalToLocalExact(
+                debugMapping,
+                shardMapping_[mappingOffset],
+                partWidth);
+            Sync<AscendC::HardEvent::MTE2_MTE3>();
+            CopyLocalToGlobalExact(
+                remapDebugMapping_[mappingOffset],
+                debugMapping,
+                partWidth);
+            Sync<AscendC::HardEvent::MTE3_MTE2>();
+        }
+
+        const uint32_t ownCount = static_cast<uint32_t>(
+            shardCounts_.GetValue(
+                static_cast<uint64_t>(request)
+                    * shardCountRequestStride_
+                + part * shardCountStride_));
+        if (ownCount > 0) {
+            const uint64_t priorOffset =
+                requestShardBase
+                + static_cast<uint64_t>(part) * capacity_;
+            CopyGlobalToLocalExact(
+                debugPrior,
+                priorSlots_[priorOffset],
+                ownCount);
+            Sync<AscendC::HardEvent::MTE2_MTE3>();
+            const uint64_t debugPriorOffset =
+                (static_cast<uint64_t>(request) * shardCount_ + part)
+                * 2 * capacity_;
+            CopyLocalToGlobalExact(
+                remapDebugPrior_[debugPriorOffset],
+                debugPrior,
+                ownCount);
+        }
+
+#if 0
         // The state merge has finished consuming these buffers. Reuse them
         // for the same vector Gather+Select algorithm as the established
         // resident row remapper, adapted to shard-local int16 ranks/slots.
@@ -1680,6 +1752,7 @@ private:
             topkIndices_[requestOffset + begin],
             ranksOrOutput,
             partWidth);
+#endif
     }
 
     AscendC::GlobalTensor<int32_t> topkIndices_;
@@ -1688,6 +1761,9 @@ private:
     AscendC::GlobalTensor<int32_t> shardCounts_;
     AscendC::GlobalTensor<int16_t> priorSlots_;
     AscendC::GlobalTensor<uint8_t> overwrittenSlots_;
+    AscendC::GlobalTensor<int32_t> remapDebugTopk_;
+    AscendC::GlobalTensor<int16_t> remapDebugMapping_;
+    AscendC::GlobalTensor<int16_t> remapDebugPrior_;
     AscendC::GlobalTensor<int32_t> requestStateIndices_;
     AscendC::GlobalTensor<int64_t> requestStateGenerations_;
     AscendC::GlobalTensor<int32_t> stateTokens_;
@@ -1815,6 +1891,9 @@ dsa_resident_sorted_update_kernel(
     __gm__ int32_t* shardCounts,
     __gm__ int16_t* priorSlots,
     __gm__ uint8_t* overwrittenSlots,
+    __gm__ int32_t* remapDebugTopk,
+    __gm__ int16_t* remapDebugMapping,
+    __gm__ int16_t* remapDebugPrior,
     __gm__ int32_t* requestStateIndices,
     __gm__ int64_t* requestStateGenerations,
     __gm__ int32_t* stateTokens,
@@ -1836,6 +1915,7 @@ dsa_resident_sorted_update_kernel(
     op.Init(
         topkIndices, shardPacked, shardMapping, shardCounts,
         priorSlots, overwrittenSlots,
+        remapDebugTopk, remapDebugMapping, remapDebugPrior,
         requestStateIndices, requestStateGenerations,
         stateTokens, stateSlots, stateCounts, stateGenerations,
         requestCount, stateRowCount,
@@ -1949,6 +2029,9 @@ void dsa_resident_sorted_plan_impl(
         static_cast<int32_t*>(shardCounts),
         static_cast<int16_t*>(priorSlots),
         static_cast<uint8_t*>(overwrittenSlots),
+        static_cast<int32_t*>(missTokens),
+        static_cast<int16_t*>(targetSlots),
+        static_cast<int16_t*>(shardPacked),
         static_cast<int32_t*>(requestStateIndices),
         static_cast<int64_t*>(requestStateGenerations),
         static_cast<int32_t*>(stateTokens),
