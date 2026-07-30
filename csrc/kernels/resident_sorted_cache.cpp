@@ -1496,8 +1496,12 @@ public:
         stateCounts_.SetValue(
             newCountOffset, static_cast<int32_t>(mergedCount));
 
-        RemapPositionPartition(
-            request, shard, requestShardBase);
+        // Diagnostic only: temporarily skip position remapping to isolate
+        // the remaining AICore exception from the state merge/writeback.
+        // The three-step reference test is expected to reach a value
+        // assertion failure while this call is disabled.
+        // RemapPositionPartition(
+        //     request, shard, requestShardBase);
 
         // Every shard copied its complete old list to private UB before
         // overwriting its own disjoint GM range. Generation mismatches were
