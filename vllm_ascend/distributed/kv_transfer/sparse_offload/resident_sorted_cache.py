@@ -189,6 +189,7 @@ def prepare_sorted_resident_cache_(
     workspace: SortedResidentWorkspace,
     *,
     block_size: int,
+    remap_debug_stage: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Assign miss slots and linearly update the sorted resident state."""
     try:
@@ -216,6 +217,7 @@ def prepare_sorted_resident_cache_(
         workspace.target_slots,
         block_size,
         state.dummy_state_base,
+        remap_debug_stage,
     )
     return (
         workspace.miss_tokens,

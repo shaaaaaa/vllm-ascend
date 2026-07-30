@@ -1263,7 +1263,8 @@ public:
         uint32_t capacity,
         uint32_t shardCountStride,
         uint32_t shardCountRequestStride,
-        uint32_t generationStride)
+        uint32_t generationStride,
+        uint32_t remapDebugStage)
     {
         requestCount_ = requestCount;
         stateRowCount_ = stateRowCount;
@@ -1276,6 +1277,7 @@ public:
         shardCountStride_ = shardCountStride;
         shardCountRequestStride_ = shardCountRequestStride;
         generationStride_ = generationStride;
+        remapDebugStage_ = remapDebugStage;
         const uint64_t requestElements =
             static_cast<uint64_t>(requestCount_) * requestWidth_;
         const uint64_t requestShardElements =
@@ -1530,69 +1532,72 @@ private:
             static_cast<uint64_t>(request) * shardCount_
             * requestWidth_;
 
-        // Temporary diagnostic: capture the exact GM payload copied by this
-        // invocation, then skip all remap vector instructions. Each position
-        // partition owns disjoint top-k/mapping ranges; each block also owns
-        // one complete prior-slot shard, so the readback has one writer per
-        // cacheline.
-        auto debugTopk = oldTokenBuf_.Get<int32_t>();
-        auto debugMapping = oldSlotBuf_.Get<int16_t>();
-        auto debugPrior = priorSlotBuf_.Get<int16_t>();
-        Sync<AscendC::HardEvent::S_MTE2>();
-        CopyGlobalToLocalExact(
-            debugTopk,
-            topkIndices_[requestOffset + begin],
-            partWidth);
-        Sync<AscendC::HardEvent::MTE2_MTE3>();
-        CopyLocalToGlobalExact(
-            remapDebugTopk_[requestOffset + begin],
-            debugTopk,
-            partWidth);
-        Sync<AscendC::HardEvent::MTE3_MTE2>();
-
-        for (uint32_t valueShard = 0;
-             valueShard < shardCount_;
-             ++valueShard) {
-            const uint64_t mappingOffset =
-                mappingBase
-                + static_cast<uint64_t>(valueShard) * requestWidth_
-                + begin;
+        if (remapDebugStage_ == 0) {
+            // Stage 0 captures the exact GM payload copied by this
+            // invocation and skips all vector remap instructions. Each
+            // partition owns disjoint top-k/mapping ranges; each block also
+            // owns one complete prior-slot shard.
+            auto debugTopk = oldTokenBuf_.Get<int32_t>();
+            auto debugMapping = oldSlotBuf_.Get<int16_t>();
+            auto debugPrior = priorSlotBuf_.Get<int16_t>();
+            Sync<AscendC::HardEvent::S_MTE2>();
             CopyGlobalToLocalExact(
-                debugMapping,
-                shardMapping_[mappingOffset],
+                debugTopk,
+                topkIndices_[requestOffset + begin],
                 partWidth);
             Sync<AscendC::HardEvent::MTE2_MTE3>();
             CopyLocalToGlobalExact(
-                remapDebugMapping_[mappingOffset],
-                debugMapping,
+                remapDebugTopk_[requestOffset + begin],
+                debugTopk,
                 partWidth);
             Sync<AscendC::HardEvent::MTE3_MTE2>();
+
+            for (uint32_t valueShard = 0;
+                 valueShard < shardCount_;
+                 ++valueShard) {
+                const uint64_t mappingOffset =
+                    mappingBase
+                    + static_cast<uint64_t>(valueShard)
+                        * requestWidth_
+                    + begin;
+                CopyGlobalToLocalExact(
+                    debugMapping,
+                    shardMapping_[mappingOffset],
+                    partWidth);
+                Sync<AscendC::HardEvent::MTE2_MTE3>();
+                CopyLocalToGlobalExact(
+                    remapDebugMapping_[mappingOffset],
+                    debugMapping,
+                    partWidth);
+                Sync<AscendC::HardEvent::MTE3_MTE2>();
+            }
+
+            const uint32_t ownCount = static_cast<uint32_t>(
+                shardCounts_.GetValue(
+                    static_cast<uint64_t>(request)
+                        * shardCountRequestStride_
+                    + part * shardCountStride_));
+            if (ownCount > 0) {
+                const uint64_t priorOffset =
+                    requestShardBase
+                    + static_cast<uint64_t>(part) * capacity_;
+                CopyGlobalToLocalExact(
+                    debugPrior,
+                    priorSlots_[priorOffset],
+                    ownCount);
+                Sync<AscendC::HardEvent::MTE2_MTE3>();
+                const uint64_t debugPriorOffset =
+                    (static_cast<uint64_t>(request) * shardCount_
+                        + part)
+                    * 2 * capacity_;
+                CopyLocalToGlobalExact(
+                    remapDebugPrior_[debugPriorOffset],
+                    debugPrior,
+                    ownCount);
+            }
+            return;
         }
 
-        const uint32_t ownCount = static_cast<uint32_t>(
-            shardCounts_.GetValue(
-                static_cast<uint64_t>(request)
-                    * shardCountRequestStride_
-                + part * shardCountStride_));
-        if (ownCount > 0) {
-            const uint64_t priorOffset =
-                requestShardBase
-                + static_cast<uint64_t>(part) * capacity_;
-            CopyGlobalToLocalExact(
-                debugPrior,
-                priorSlots_[priorOffset],
-                ownCount);
-            Sync<AscendC::HardEvent::MTE2_MTE3>();
-            const uint64_t debugPriorOffset =
-                (static_cast<uint64_t>(request) * shardCount_ + part)
-                * 2 * capacity_;
-            CopyLocalToGlobalExact(
-                remapDebugPrior_[debugPriorOffset],
-                debugPrior,
-                ownCount);
-        }
-
-#if 0
         // The state merge has finished consuming these buffers. Reuse them
         // for the same vector Gather+Select algorithm as the established
         // resident row remapper, adapted to shard-local int16 ranks/slots.
@@ -1618,11 +1623,19 @@ private:
             topkIndices_[requestOffset + begin],
             partWidth);
         Sync<AscendC::HardEvent::MTE2_V>();
+        if (remapDebugStage_ == 1) {
+            return;
+        }
         AscendC::Duplicate(
             accumulatedSlots, static_cast<int32_t>(-1), partWidth);
         AscendC::PipeBarrier<PIPE_V>();
+        if (remapDebugStage_ == 2) {
+            return;
+        }
 
-        for (uint32_t shard = 0; shard < shardCount_; ++shard) {
+        const uint32_t shardLimit =
+            remapDebugStage_ <= 13 ? 1U : shardCount_;
+        for (uint32_t shard = 0; shard < shardLimit; ++shard) {
             const uint32_t count = static_cast<uint32_t>(
                 shardCounts_.GetValue(
                     static_cast<uint64_t>(request)
@@ -1646,6 +1659,9 @@ private:
                     + static_cast<uint64_t>(shard) * capacity_],
                 count);
             Sync<AscendC::HardEvent::MTE2_V>();
+            if (remapDebugStage_ == 3) {
+                return;
+            }
 
             // Atlas A2 has no direct int16 -> int32 Cast. Convert through
             // float, which exactly represents every int16 rank and slot.
@@ -1655,12 +1671,18 @@ private:
                 AscendC::RoundMode::CAST_NONE,
                 partWidth);
             AscendC::PipeBarrier<PIPE_V>();
+            if (remapDebugStage_ == 4) {
+                return;
+            }
             AscendC::Cast(
                 ranksOrOutput,
                 rankFloatOrCandidate,
                 AscendC::RoundMode::CAST_ROUND,
                 partWidth);
             AscendC::PipeBarrier<PIPE_V>();
+            if (remapDebugStage_ == 5) {
+                return;
+            }
 
             AscendC::Maxs(
                 clampedOffsets,
@@ -1668,6 +1690,9 @@ private:
                 static_cast<int32_t>(0),
                 partWidth);
             AscendC::PipeBarrier<PIPE_V>();
+            if (remapDebugStage_ == 6) {
+                return;
+            }
             AscendC::Compare(
                 selectedMask,
                 clampedOffsets,
@@ -1675,18 +1700,27 @@ private:
                 AscendC::CMPMODE::EQ,
                 partWidth);
             AscendC::PipeBarrier<PIPE_V>();
+            if (remapDebugStage_ == 7) {
+                return;
+            }
             AscendC::Mins(
                 clampedOffsets,
                 clampedOffsets,
                 static_cast<int32_t>(count - 1),
                 partWidth);
             AscendC::PipeBarrier<PIPE_V>();
+            if (remapDebugStage_ == 8) {
+                return;
+            }
             AscendC::Muls(
                 clampedOffsets,
                 clampedOffsets,
                 static_cast<int32_t>(sizeof(int16_t)),
                 partWidth);
             AscendC::PipeBarrier<PIPE_V>();
+            if (remapDebugStage_ == 9) {
+                return;
+            }
 
             AscendC::Gather(
                 mappingOrGathered,
@@ -1695,18 +1729,27 @@ private:
                 static_cast<uint32_t>(0),
                 partWidth);
             AscendC::PipeBarrier<PIPE_V>();
+            if (remapDebugStage_ == 10) {
+                return;
+            }
             AscendC::Cast(
                 gatheredFloat,
                 mappingOrGathered,
                 AscendC::RoundMode::CAST_NONE,
                 partWidth);
             AscendC::PipeBarrier<PIPE_V>();
+            if (remapDebugStage_ == 11) {
+                return;
+            }
             AscendC::Cast(
                 rankFloatOrCandidate.ReinterpretCast<int32_t>(),
                 gatheredFloat,
                 AscendC::RoundMode::CAST_ROUND,
                 partWidth);
             AscendC::PipeBarrier<PIPE_V>();
+            if (remapDebugStage_ == 12) {
+                return;
+            }
 
             // Exactly one value shard owns each selected original position.
             // Invalid (-1) mappings leave the accumulated slot unchanged.
@@ -1718,9 +1761,15 @@ private:
                 AscendC::SELMODE::VSEL_TENSOR_TENSOR_MODE,
                 partWidth);
             AscendC::PipeBarrier<PIPE_V>();
+            if (remapDebugStage_ == 13) {
+                return;
+            }
             // The next iteration reuses both int16 MTE2 destinations after
             // the vector pipeline has consumed them.
             Sync<AscendC::HardEvent::V_MTE2>();
+        }
+        if (remapDebugStage_ == 14) {
+            return;
         }
 
         // Preserve unselected/split-boundary positions exactly as the old
@@ -1731,6 +1780,9 @@ private:
             static_cast<int32_t>(0),
             partWidth);
         AscendC::PipeBarrier<PIPE_V>();
+        if (remapDebugStage_ == 15) {
+            return;
+        }
         AscendC::Compare(
             selectedMask,
             clampedOffsets,
@@ -1738,6 +1790,9 @@ private:
             AscendC::CMPMODE::EQ,
             partWidth);
         AscendC::PipeBarrier<PIPE_V>();
+        if (remapDebugStage_ == 16) {
+            return;
+        }
         AscendC::Select(
             ranksOrOutput.ReinterpretCast<float>(),
             selectedMask,
@@ -1746,13 +1801,15 @@ private:
             AscendC::SELMODE::VSEL_TENSOR_TENSOR_MODE,
             partWidth);
         AscendC::PipeBarrier<PIPE_V>();
+        if (remapDebugStage_ == 17) {
+            return;
+        }
 
         Sync<AscendC::HardEvent::V_MTE3>();
         CopyLocalToGlobalExact(
             topkIndices_[requestOffset + begin],
             ranksOrOutput,
             partWidth);
-#endif
     }
 
     AscendC::GlobalTensor<int32_t> topkIndices_;
@@ -1791,6 +1848,7 @@ private:
     uint32_t shardCountStride_ = 0;
     uint32_t shardCountRequestStride_ = 0;
     uint32_t generationStride_ = 0;
+    uint32_t remapDebugStage_ = 0;
 };
 
 extern "C" __global__ __aicore__ void
@@ -1909,7 +1967,8 @@ dsa_resident_sorted_update_kernel(
     uint32_t capacity,
     uint32_t shardCountStride,
     uint32_t shardCountRequestStride,
-    uint32_t generationStride)
+    uint32_t generationStride,
+    uint32_t remapDebugStage)
 {
     DSAResidentSortedUpdateKernel op;
     op.Init(
@@ -1921,7 +1980,7 @@ dsa_resident_sorted_update_kernel(
         requestCount, stateRowCount,
         dummyStateBase, rowsPerRequest, rowWidth, shardCount,
         capacity, shardCountStride, shardCountRequestStride,
-        generationStride);
+        generationStride, remapDebugStage);
     op.Process();
 }
 
@@ -2005,7 +2064,8 @@ void dsa_resident_sorted_plan_impl(
     uint32_t missCountStride,
     uint32_t generationStride,
     uint32_t blockTableWidth,
-    uint32_t blockSize)
+    uint32_t blockSize,
+    uint32_t remapDebugStage)
 {
     dsa_resident_sorted_finalize_kernel<<<
         requestCount, nullptr, stream>>>(
@@ -2041,7 +2101,7 @@ void dsa_resident_sorted_plan_impl(
         requestCount, stateRowCount, dummyStateBase,
         rowsPerRequest, rowWidth, shardCount, capacity,
         shardCountStride, shardCountRequestStride,
-        generationStride);
+        generationStride, remapDebugStage);
 }
 
 void dsa_resident_sorted_read_probe_impl(

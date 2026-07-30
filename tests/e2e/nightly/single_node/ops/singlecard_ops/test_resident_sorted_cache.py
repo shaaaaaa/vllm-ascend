@@ -626,6 +626,105 @@ def test_remap_input_capture_matches_kernel_internal_reads(mtp):
         assert prior_mismatches == 0
 
 
+_REMAP_VECTOR_DEBUG_STAGES = (
+    (1, "topk-load"),
+    (2, "accumulator-duplicate"),
+    (3, "first-shard-load"),
+    (4, "mapping-int16-to-float"),
+    (5, "mapping-float-to-int32"),
+    (6, "rank-maxs"),
+    (7, "rank-compare"),
+    (8, "rank-mins"),
+    (9, "rank-byte-offset"),
+    (10, "slot-gather-int16"),
+    (11, "slot-int16-to-float"),
+    (12, "slot-float-to-int32"),
+    (13, "first-shard-select"),
+    (14, "all-shards-select"),
+    (15, "final-maxs"),
+    (16, "final-compare"),
+    (17, "final-select"),
+    (18, "topk-writeback"),
+)
+_REMAP_VECTOR_DEBUG_CASES = tuple(
+    (mtp, stage, name)
+    for mtp in (1, 2)
+    for stage, name in _REMAP_VECTOR_DEBUG_STAGES
+)
+
+
+@pytest.mark.parametrize(
+    "mtp,debug_stage,stage_name",
+    _REMAP_VECTOR_DEBUG_CASES,
+    ids=[
+        f"mtp{mtp}-stage{stage}-{name}"
+        for mtp, stage, name in _REMAP_VECTOR_DEBUG_CASES
+    ],
+)
+def test_remap_vector_stage_probe(mtp, debug_stage, stage_name):
+    """Run exactly one prefix of the remap pipeline in this process."""
+    requests = 1
+    capacity = mtp * 2048
+    source = _source(mtp, 0)
+    values = source.npu()
+    boundaries = torch.full(
+        (mtp,),
+        100_000,
+        dtype=torch.int32,
+        device="npu",
+    )
+    row_requests = torch.zeros(mtp, dtype=torch.int32, device="npu")
+    request_states = torch.zeros(1, dtype=torch.int32, device="npu")
+    request_generations = torch.ones(1, dtype=torch.int64, device="npu")
+    workspace = allocate_sorted_resident_workspace(
+        requests, mtp, device=torch.device("npu")
+    )
+    state = allocate_sorted_resident_state(
+        requests, requests, mtp, device=torch.device("npu")
+    )
+    block_table = torch.arange(
+        capacity // 128,
+        dtype=torch.int32,
+        device="npu",
+    ).reshape(1, -1)
+
+    prepare_resident_sharded_union_(
+        values,
+        boundaries,
+        row_requests,
+        request_states,
+        request_generations,
+        state,
+        workspace,
+        mtp=mtp,
+    )
+    print(
+        "\n[resident-remap-stage]"
+        f" mtp={mtp}"
+        f" stage={debug_stage}"
+        f" name={stage_name}",
+        flush=True,
+    )
+    prepare_sorted_resident_cache_(
+        values,
+        block_table,
+        request_states,
+        request_generations,
+        state,
+        workspace,
+        block_size=128,
+        remap_debug_stage=debug_stage,
+    )
+    torch.npu.synchronize()
+    print(
+        "[resident-remap-stage-passed]"
+        f" mtp={mtp}"
+        f" stage={debug_stage}"
+        f" name={stage_name}",
+        flush=True,
+    )
+
+
 @pytest.mark.parametrize(
     "mtp,debug_stage",
     [
