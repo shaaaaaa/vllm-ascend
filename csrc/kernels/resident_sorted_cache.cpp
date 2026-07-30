@@ -1067,13 +1067,17 @@ public:
         }
         Sync<AscendC::HardEvent::S_MTE3>();
         for (uint32_t shard = 0; shard < shardCount_; ++shard) {
+            const uint32_t count = shardCounts[shard];
+            if (count == 0) {
+                continue;
+            }
             const uint64_t shardOffset =
                 requestShardBase
                 + static_cast<uint64_t>(shard) * capacity_;
             CopyLocalToGlobalExact(
                 priorSlots_[shardOffset],
                 packedPriorSlots[shardOffsets[shard]],
-                shardCounts[shard]);
+                count);
         }
         if (debugStage_ == 7) {
             PublishDebug(
