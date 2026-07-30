@@ -244,6 +244,56 @@ def test_resident_union_zero_boundary_is_empty(mtp):
 
 
 @pytest.mark.parametrize("mtp", [1, 2])
+def test_sorted_resident_zero_boundary_full_path_is_noop(mtp):
+    """Exercise every dynamic zero-count transfer in the production path."""
+    requests = 1
+    capacity = mtp * 2048
+    block_size = 128
+    source = _source(mtp, 0)
+    values = source.npu()
+    boundaries = torch.zeros(requests * mtp, dtype=torch.int32, device="npu")
+    row_requests = torch.zeros(requests * mtp, dtype=torch.int32, device="npu")
+    request_states = torch.zeros(requests, dtype=torch.int32, device="npu")
+    request_generations = torch.ones(requests, dtype=torch.int64, device="npu")
+    workspace = allocate_sorted_resident_workspace(
+        requests, mtp, device=torch.device("npu")
+    )
+    state = allocate_sorted_resident_state(
+        requests, requests, mtp, device=torch.device("npu")
+    )
+    block_table = torch.arange(
+        capacity // block_size, dtype=torch.int32, device="npu"
+    ).reshape(requests, -1)
+
+    prepare_resident_sharded_union_(
+        values,
+        boundaries,
+        row_requests,
+        request_states,
+        request_generations,
+        state,
+        workspace,
+        mtp=mtp,
+    )
+    prepare_sorted_resident_cache_(
+        values,
+        block_table,
+        request_states,
+        request_generations,
+        state,
+        workspace,
+        block_size=block_size,
+    )
+    torch.npu.synchronize()
+
+    assert torch.all(workspace.shard_counts[:, :, 0].cpu() == 0)
+    assert int(workspace.miss_counts[0, 0].cpu()) == 0
+    assert torch.all(workspace.overwritten_slots[0].cpu() == 0)
+    assert torch.all(state.counts[0, :, 0].cpu() == 0)
+    assert torch.equal(values.cpu(), source)
+
+
+@pytest.mark.parametrize("mtp", [1, 2])
 def test_fused_union_intersection_and_generation_invalidation(mtp):
     requests = 1
     shard_count = resident_shard_count(mtp)
@@ -848,6 +898,65 @@ def test_sorted_resident_matches_three_step_reference(mtp):
         for position, token in enumerate(original):
             expected = reference[token] if token < boundary else token
             assert remapped[position] == expected
+
+
+@pytest.mark.parametrize("mtp", [1, 2])
+def test_sorted_resident_all_hit_emits_zero_misses(mtp):
+    """A non-empty resident step must skip zero-length miss writebacks."""
+    requests = 1
+    shard_count = resident_shard_count(mtp)
+    capacity = mtp * 2048
+    block_size = 128
+    source = _source(mtp, 0)
+    boundaries = torch.full(
+        (requests * mtp,), 100_000, dtype=torch.int32, device="npu"
+    )
+    row_requests = torch.zeros(requests * mtp, dtype=torch.int32, device="npu")
+    request_states = torch.zeros(requests, dtype=torch.int32, device="npu")
+    request_generations = torch.ones(requests, dtype=torch.int64, device="npu")
+    workspace = allocate_sorted_resident_workspace(
+        requests, mtp, device=torch.device("npu")
+    )
+    state = allocate_sorted_resident_state(
+        requests, requests, mtp, device=torch.device("npu")
+    )
+    block_table = torch.arange(
+        capacity // block_size, dtype=torch.int32, device="npu"
+    ).reshape(requests, -1)
+
+    for step in range(2):
+        values = source.npu()
+        prepare_resident_sharded_union_(
+            values,
+            boundaries,
+            row_requests,
+            request_states,
+            request_generations,
+            state,
+            workspace,
+            mtp=mtp,
+        )
+        prepare_sorted_resident_cache_(
+            values,
+            block_table,
+            request_states,
+            request_generations,
+            state,
+            workspace,
+            block_size=block_size,
+        )
+        torch.npu.synchronize()
+        miss_count = int(workspace.miss_counts[0, 0].cpu())
+        if step == 0:
+            assert miss_count > 0
+        else:
+            assert miss_count == 0
+            assert torch.all(workspace.overwritten_slots[0].cpu() == 0)
+
+    resident = _state_dict(state, 0, shard_count)
+    assert values.reshape(-1).cpu().tolist() == [
+        resident[token] for token in source.reshape(-1).tolist()
+    ]
 
 
 @pytest.mark.parametrize("mtp", [1, 2])

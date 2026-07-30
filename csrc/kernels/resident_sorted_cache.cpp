@@ -493,12 +493,16 @@ public:
 
         Sync<AscendC::HardEvent::S_MTE3>();
         Sync<AscendC::HardEvent::V_MTE3>();
-        CopyLocalToGlobalExact(
-            shardPacked_[shardOffset], sortedTokens, rank);
+        if (rank > 0) {
+            CopyLocalToGlobalExact(
+                shardPacked_[shardOffset], sortedTokens, rank);
+        }
         AscendC::DataCopy(
             shardMapping_[mappingOffset], mapping, requestWidth_);
-        CopyLocalToGlobalExact(
-            priorSlots_[shardOffset], priorSlots, rank);
+        if (rank > 0) {
+            CopyLocalToGlobalExact(
+                priorSlots_[shardOffset], priorSlots, rank);
+        }
         // Host validation reserves one full 64-byte int32 cacheline per
         // (request, shard), so sibling AIVs never share this write line.
         shardCounts_.SetValue(
@@ -708,10 +712,12 @@ public:
             const uint64_t priorOffset =
                 requestShardBase
                 + static_cast<uint64_t>(shard) * capacity_;
-            CopyGlobalToLocalExact(
-                priorLocal,
-                priorSlots_[priorOffset],
-                safeCount);
+            if (safeCount > 0) {
+                CopyGlobalToLocalExact(
+                    priorLocal,
+                    priorSlots_[priorOffset],
+                    safeCount);
+            }
             Sync<AscendC::HardEvent::MTE2_S>();
             uint32_t bulkNegative = 0;
             uint32_t bulkNonnegative = 0;
@@ -919,14 +925,16 @@ public:
                 + static_cast<uint64_t>(shard) * capacity_;
             shardCounts[shard] = count;
             shardOffsets[shard] = localOffset;
-            CopyGlobalToLocalExact(
-                packedTokens[localOffset],
-                shardPacked_[shardOffset],
-                count);
-            CopyGlobalToLocalExact(
-                packedPriorSlots[localOffset],
-                priorSlots_[shardOffset],
-                count);
+            if (count > 0) {
+                CopyGlobalToLocalExact(
+                    packedTokens[localOffset],
+                    shardPacked_[shardOffset],
+                    count);
+                CopyGlobalToLocalExact(
+                    packedPriorSlots[localOffset],
+                    priorSlots_[shardOffset],
+                    count);
+            }
             packedEnd = localOffset + count;
         }
         Sync<AscendC::HardEvent::MTE2_S>();
@@ -991,10 +999,12 @@ public:
         }
         if (debugStage_ == 5) {
             Sync<AscendC::HardEvent::S_MTE3>();
-            CopyLocalToGlobalExact(
-                priorSlots_[requestShardBase],
-                freeSlots,
-                freeCount);
+            if (freeCount > 0) {
+                CopyLocalToGlobalExact(
+                    priorSlots_[requestShardBase],
+                    freeSlots,
+                    freeCount);
+            }
             PublishDebug(
                 blockTable, request, packedEnd,
                 protectedCount, freeCount, 0, 0x7FFF, 0x7FFF,
@@ -1101,10 +1111,12 @@ public:
                 firstTarget, lastTarget);
             return;
         }
-        CopyLocalToGlobalExact(
-            missTokens_[requestOffset],
-            missTokens,
-            missCount);
+        if (missCount > 0) {
+            CopyLocalToGlobalExact(
+                missTokens_[requestOffset],
+                missTokens,
+                missCount);
+        }
         if (debugStage_ == 9) {
             PublishDebug(
                 blockTable, request, packedEnd,
@@ -1114,10 +1126,12 @@ public:
                 firstTarget, lastTarget);
             return;
         }
-        CopyLocalToGlobalExact(
-            targetSlots_[requestOffset],
-            targetSlots,
-            missCount);
+        if (missCount > 0) {
+            CopyLocalToGlobalExact(
+                targetSlots_[requestOffset],
+                targetSlots,
+                missCount);
+        }
         if (debugStage_ == 10) {
             PublishDebug(
                 blockTable, request, packedEnd,
@@ -1365,14 +1379,16 @@ public:
             CopyGlobalToLocalExact(
                 oldSlots, stateSlots_[oldStateOffset], oldCount);
         }
-        CopyGlobalToLocalExact(
-            currentTokens,
-            shardPacked_[requestShardOffset],
-            currentCount);
-        CopyGlobalToLocalExact(
-            priorSlots,
-            priorSlots_[requestShardOffset],
-            currentCount);
+        if (currentCount > 0) {
+            CopyGlobalToLocalExact(
+                currentTokens,
+                shardPacked_[requestShardOffset],
+                currentCount);
+            CopyGlobalToLocalExact(
+                priorSlots,
+                priorSlots_[requestShardOffset],
+                currentCount);
+        }
         CopyGlobalToLocalExact(
             overwritten,
             overwrittenSlots_[
@@ -1439,14 +1455,16 @@ public:
         }
 
         Sync<AscendC::HardEvent::S_MTE3>();
-        CopyLocalToGlobalExact(
-            stateTokens_[oldStateOffset],
-            mergedTokens,
-            mergedCount);
-        CopyLocalToGlobalExact(
-            stateSlots_[oldStateOffset],
-            mergedSlots,
-            mergedCount);
+        if (mergedCount > 0) {
+            CopyLocalToGlobalExact(
+                stateTokens_[oldStateOffset],
+                mergedTokens,
+                mergedCount);
+            CopyLocalToGlobalExact(
+                stateSlots_[oldStateOffset],
+                mergedSlots,
+                mergedCount);
+        }
         const uint64_t newCountOffset =
             static_cast<uint64_t>(safeState)
                 * shardCountRequestStride_
@@ -1513,12 +1531,14 @@ private:
                 (packedEnd + kInt16PerDataBlock - 1)
                 & ~(kInt16PerDataBlock - 1);
             shardOffsets[shard] = localOffset;
-            CopyGlobalToLocalExact(
-                remapPriorSlots[localOffset],
-                priorSlots_[
-                    requestShardBase
-                    + static_cast<uint64_t>(shard) * capacity_],
-                count);
+            if (count > 0) {
+                CopyGlobalToLocalExact(
+                    remapPriorSlots[localOffset],
+                    priorSlots_[
+                        requestShardBase
+                        + static_cast<uint64_t>(shard) * capacity_],
+                    count);
+            }
             packedEnd = localOffset + count;
         }
         Sync<AscendC::HardEvent::MTE2_S>();
