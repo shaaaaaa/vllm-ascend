@@ -38,6 +38,31 @@ __aicore__ inline void Sync()
 }
 
 template <typename T>
+__aicore__ inline T ReadGlobalScalarFresh(
+    AscendC::GlobalTensor<T>& tensor,
+    uint64_t offset)
+{
+    AscendC::DataCacheCleanAndInvalid<
+        T,
+        AscendC::CacheLine::SINGLE_CACHE_LINE,
+        AscendC::DcciDst::CACHELINE_OUT>(tensor[offset]);
+    return tensor.GetValue(offset);
+}
+
+template <typename T>
+__aicore__ inline void WriteGlobalScalarVisible(
+    AscendC::GlobalTensor<T>& tensor,
+    uint64_t offset,
+    T value)
+{
+    tensor.SetValue(offset, value);
+    AscendC::DataCacheCleanAndInvalid<
+        T,
+        AscendC::CacheLine::SINGLE_CACHE_LINE,
+        AscendC::DcciDst::CACHELINE_OUT>(tensor[offset]);
+}
+
+template <typename T>
 __aicore__ inline void CopyLocalToGlobalExact(
     AscendC::GlobalTensor<T> dst,
     AscendC::LocalTensor<T> src,
@@ -253,7 +278,7 @@ public:
         uint32_t selectedElements = 0;
         for (uint32_t mtpRow = 0; mtpRow < rowsPerRequest_; ++mtpRow) {
             const uint32_t row = request * rowsPerRequest_ + mtpRow;
-            if (rowReqIndices_.GetValue(row) !=
+            if (ReadGlobalScalarFresh(rowReqIndices_, row) !=
                 static_cast<int32_t>(request)) {
                 continue;
             }
@@ -261,7 +286,7 @@ public:
                 static_cast<uint64_t>(request) * requestWidth_
                 + static_cast<uint64_t>(mtpRow) * rowWidth_;
             const int32_t boundary =
-                splitBoundary_.GetValue(row);
+                ReadGlobalScalarFresh(splitBoundary_, row);
             AscendC::DataCopy(
                 input, topkIndices_[inputOffset], rowWidth_);
             Sync<AscendC::HardEvent::MTE2_V>();
@@ -417,7 +442,8 @@ public:
         auto oldSlots = reusedInt16;
         auto priorSlots = reusedInt16[shardCapacity_];
         const int32_t state =
-            requestStateIndices_.GetValue(request);
+            ReadGlobalScalarFresh(
+                requestStateIndices_, request);
         const bool realState =
             state >= 0 &&
             state < static_cast<int32_t>(dummyStateBase_);
@@ -425,9 +451,11 @@ public:
             ? static_cast<uint32_t>(state)
             : dummyStateBase_ + request;
         const int64_t requestedGeneration =
-            requestStateGenerations_.GetValue(request);
+            ReadGlobalScalarFresh(
+                requestStateGenerations_, request);
         const int64_t storedGeneration =
-            stateGenerations_.GetValue(
+            ReadGlobalScalarFresh(
+                stateGenerations_,
                 static_cast<uint64_t>(safeState)
                 * generationStride_);
         const bool generationMatches =
@@ -438,7 +466,8 @@ public:
             + shard * shardCountStride_;
         const uint32_t oldCount = generationMatches
             ? static_cast<uint32_t>(
-                  stateCounts_.GetValue(stateCountOffset))
+                  ReadGlobalScalarFresh(
+                      stateCounts_, stateCountOffset))
             : 0U;
         const uint64_t stateShardOffset =
             (static_cast<uint64_t>(safeState) * shardCount_ + shard)
@@ -474,7 +503,10 @@ public:
             priorSlots.SetValue(currentIndex, slot);
         }
         if (!generationMatches) {
-            stateCounts_.SetValue(stateCountOffset, 0);
+            WriteGlobalScalarVisible(
+                stateCounts_,
+                stateCountOffset,
+                static_cast<int32_t>(0));
         }
 
         Sync<AscendC::HardEvent::S_MTE3>();
@@ -487,8 +519,10 @@ public:
             priorSlots_[shardOffset], priorSlots, rank);
         // Host validation reserves one full 64-byte int32 cacheline per
         // (request, shard), so sibling AIVs never share this write line.
-        shardCounts_.SetValue(
-            countOffset, static_cast<int32_t>(rank));
+        WriteGlobalScalarVisible(
+            shardCounts_,
+            countOffset,
+            static_cast<int32_t>(rank));
     }
 
 private:
@@ -728,7 +762,8 @@ public:
         uint32_t packedEnd = 0;
         for (uint32_t shard = 0; shard < shardCount_; ++shard) {
             const uint32_t count = static_cast<uint32_t>(
-                shardCounts_.GetValue(
+                ReadGlobalScalarFresh(
+                    shardCounts_,
                     static_cast<uint64_t>(request)
                         * shardCountRequestStride_
                     + shard * shardCountStride_));
@@ -833,7 +868,8 @@ public:
             targetSlots,
             missCount);
         // One cacheline per request prevents count false sharing.
-        missCounts_.SetValue(
+        WriteGlobalScalarVisible(
+            missCounts_,
             static_cast<uint64_t>(request) * missCountStride_,
             static_cast<int32_t>(missCount));
     }
@@ -975,7 +1011,8 @@ public:
             return;
         }
         const int32_t state =
-            requestStateIndices_.GetValue(request);
+            ReadGlobalScalarFresh(
+                requestStateIndices_, request);
         const bool realState =
             state >= 0 &&
             state < static_cast<int32_t>(dummyStateBase_);
@@ -987,15 +1024,18 @@ public:
                 * shardCountRequestStride_
             + shard * shardCountStride_;
         const int64_t requestedGeneration =
-            requestStateGenerations_.GetValue(request);
+            ReadGlobalScalarFresh(
+                requestStateGenerations_, request);
         const uint64_t oldCountOffset =
             static_cast<uint64_t>(safeState)
                 * shardCountRequestStride_
             + shard * shardCountStride_;
         const uint32_t oldCount = static_cast<uint32_t>(
-            stateCounts_.GetValue(oldCountOffset));
+            ReadGlobalScalarFresh(
+                stateCounts_, oldCountOffset));
         const uint32_t currentCount = static_cast<uint32_t>(
-            shardCounts_.GetValue(requestCountOffset));
+            ReadGlobalScalarFresh(
+                shardCounts_, requestCountOffset));
         const uint64_t requestShardBase =
             static_cast<uint64_t>(request) * shardCount_ * capacity_;
         const uint64_t requestShardOffset =
@@ -1107,7 +1147,8 @@ public:
             static_cast<uint64_t>(safeState)
                 * shardCountRequestStride_
             + shard * shardCountStride_;
-        stateCounts_.SetValue(
+        WriteGlobalScalarVisible(
+            stateCounts_,
             newCountOffset, static_cast<int32_t>(mergedCount));
 
         RemapPositionPartition(
@@ -1118,7 +1159,8 @@ public:
         // materialized as zero counts by the fused union kernel, so
         // sibling blocks do not re-read this generation publication.
         if (shard == 0) {
-            stateGenerations_.SetValue(
+            WriteGlobalScalarVisible(
+                stateGenerations_,
                 static_cast<uint64_t>(safeState)
                     * generationStride_,
                 requestedGeneration);
@@ -1161,7 +1203,8 @@ private:
                     + begin],
                 partWidth);
             const uint32_t count = static_cast<uint32_t>(
-                shardCounts_.GetValue(
+                ReadGlobalScalarFresh(
+                    shardCounts_,
                     static_cast<uint64_t>(request)
                         * shardCountRequestStride_
                     + shard * shardCountStride_));
