@@ -180,7 +180,8 @@ def prepare_resident_sharded_union_(
     )
 
 
-def prepare_sorted_resident_cache_(
+def _run_sorted_resident_plan_(
+    op,
     topk_indices: torch.Tensor,
     request_block_table: torch.Tensor,
     request_state_indices: torch.Tensor,
@@ -189,14 +190,7 @@ def prepare_sorted_resident_cache_(
     workspace: SortedResidentWorkspace,
     *,
     block_size: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Assign miss slots and linearly update the sorted resident state."""
-    try:
-        op = torch.ops._C_ascend.npu_dsa_resident_sorted_plan_
-    except AttributeError as error:
-        raise RuntimeError(
-            "vllm_ascend_C does not expose the sorted resident planner; rebuild the extension"
-        ) from error
+) -> None:
     op(
         topk_indices,
         workspace.shard_packed,
@@ -216,6 +210,122 @@ def prepare_sorted_resident_cache_(
         workspace.target_slots,
         block_size,
         state.dummy_state_base,
+    )
+
+
+def prepare_sorted_resident_cache_(
+    topk_indices: torch.Tensor,
+    request_block_table: torch.Tensor,
+    request_state_indices: torch.Tensor,
+    request_state_generations: torch.Tensor,
+    state: SortedResidentState,
+    workspace: SortedResidentWorkspace,
+    *,
+    block_size: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Run state planning followed by the standalone vector remap."""
+    prepare_sorted_resident_cache_no_remap_(
+        topk_indices,
+        request_block_table,
+        request_state_indices,
+        request_state_generations,
+        state,
+        workspace,
+        block_size=block_size,
+    )
+    remap_sorted_resident_cache_(topk_indices, workspace)
+    return (
+        workspace.miss_tokens,
+        workspace.miss_counts[:, 0],
+        workspace.target_slots,
+    )
+
+
+def prepare_sorted_resident_cache_no_remap_(
+    topk_indices: torch.Tensor,
+    request_block_table: torch.Tensor,
+    request_state_indices: torch.Tensor,
+    request_state_generations: torch.Tensor,
+    state: SortedResidentState,
+    workspace: SortedResidentWorkspace,
+    *,
+    block_size: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Assign misses and update resident state without remapping top-k."""
+    try:
+        plan_op = (
+            torch.ops._C_ascend
+            .npu_dsa_resident_sorted_plan_no_remap_
+        )
+    except AttributeError as error:
+        raise RuntimeError(
+            "vllm_ascend_C does not expose the no-remap sorted resident "
+            "planner; rebuild the extension"
+        ) from error
+    _run_sorted_resident_plan_(
+        plan_op,
+        topk_indices,
+        request_block_table,
+        request_state_indices,
+        request_state_generations,
+        state,
+        workspace,
+        block_size=block_size,
+    )
+    return (
+        workspace.miss_tokens,
+        workspace.miss_counts[:, 0],
+        workspace.target_slots,
+    )
+
+
+def remap_sorted_resident_cache_(
+    topk_indices: torch.Tensor,
+    workspace: SortedResidentWorkspace,
+) -> None:
+    """Apply the standalone shard-local-rank to resident-slot remap."""
+    try:
+        op = torch.ops._C_ascend.npu_dsa_resident_sorted_remap_
+    except AttributeError as error:
+        raise RuntimeError(
+            "vllm_ascend_C does not expose the standalone sorted resident "
+            "remap; rebuild the extension"
+        ) from error
+    op(
+        topk_indices,
+        workspace.shard_mapping,
+        workspace.shard_counts,
+        workspace.prior_slots,
+    )
+
+
+def prepare_sorted_resident_cache_fused_(
+    topk_indices: torch.Tensor,
+    request_block_table: torch.Tensor,
+    request_state_indices: torch.Tensor,
+    request_state_generations: torch.Tensor,
+    state: SortedResidentState,
+    workspace: SortedResidentWorkspace,
+    *,
+    block_size: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Run the original fused state-update plus remap fallback."""
+    try:
+        op = torch.ops._C_ascend.npu_dsa_resident_sorted_plan_
+    except AttributeError as error:
+        raise RuntimeError(
+            "vllm_ascend_C does not expose the fused sorted resident "
+            "planner; rebuild the extension"
+        ) from error
+    _run_sorted_resident_plan_(
+        op,
+        topk_indices,
+        request_block_table,
+        request_state_indices,
+        request_state_generations,
+        state,
+        workspace,
+        block_size=block_size,
     )
     return (
         workspace.miss_tokens,

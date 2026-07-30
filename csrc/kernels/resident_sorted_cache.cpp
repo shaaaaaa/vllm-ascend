@@ -1503,6 +1503,170 @@ public:
         }
     }
 
+    // Split-path state update. Keep Process() above unchanged so the original
+    // fused update+remap kernel remains available as an exact fallback.
+    __aicore__ inline void ProcessStateOnly()
+    {
+        const uint32_t block = AscendC::GetBlockIdx();
+        const uint32_t request = block / shardCount_;
+        const uint32_t shard = block % shardCount_;
+        if (request >= requestCount_) {
+            return;
+        }
+        const int32_t state =
+            requestStateIndices_.GetValue(request);
+        const bool realState =
+            state >= 0 &&
+            state < static_cast<int32_t>(dummyStateBase_);
+        const uint32_t safeState = realState
+            ? static_cast<uint32_t>(state)
+            : dummyStateBase_ + request;
+        const uint64_t requestCountOffset =
+            static_cast<uint64_t>(request)
+                * shardCountRequestStride_
+            + shard * shardCountStride_;
+        const int64_t requestedGeneration =
+            requestStateGenerations_.GetValue(request);
+        const uint64_t oldCountOffset =
+            static_cast<uint64_t>(safeState)
+                * shardCountRequestStride_
+            + shard * shardCountStride_;
+        const uint32_t oldCount = static_cast<uint32_t>(
+            stateCounts_.GetValue(oldCountOffset));
+        const uint32_t currentCount = static_cast<uint32_t>(
+            shardCounts_.GetValue(requestCountOffset));
+        const uint64_t requestShardBase =
+            static_cast<uint64_t>(request) * shardCount_ * capacity_;
+        const uint64_t requestShardOffset =
+            requestShardBase
+            + static_cast<uint64_t>(shard) * capacity_;
+        const uint64_t oldStateOffset =
+            (static_cast<uint64_t>(safeState) * shardCount_ + shard)
+            * capacity_;
+
+        auto oldTokens = oldTokenBuf_.Get<int32_t>();
+        auto oldSlots = oldSlotBuf_.Get<int16_t>();
+        auto currentTokens = currentTokenBuf_.Get<int32_t>();
+        auto priorSlots = priorSlotBuf_.Get<int16_t>();
+        auto overwritten = overwrittenBuf_.Get<uint8_t>();
+        auto survivorTokens = survivorTokenBuf_.Get<int32_t>();
+        auto survivorSlots = survivorSlotBuf_.Get<int16_t>();
+        auto mergedTokens = mergedTokenBuf_.Get<int32_t>();
+        auto mergedSlots = mergedSlotBuf_.Get<int16_t>();
+
+        if (oldCount > 0) {
+            CopyGlobalToLocalExact(
+                oldTokens, stateTokens_[oldStateOffset], oldCount);
+            CopyGlobalToLocalExact(
+                oldSlots, stateSlots_[oldStateOffset], oldCount);
+        }
+        if (currentCount > 0) {
+            CopyGlobalToLocalExact(
+                currentTokens,
+                shardPacked_[requestShardOffset],
+                currentCount);
+            CopyGlobalToLocalExact(
+                priorSlots,
+                priorSlots_[requestShardOffset],
+                currentCount);
+        }
+        CopyGlobalToLocalExact(
+            overwritten,
+            overwrittenSlots_[
+                static_cast<uint64_t>(request) * capacity_],
+            capacity_);
+        Sync<AscendC::HardEvent::MTE2_S>();
+
+        uint32_t survivorCount = 0;
+        if (oldCount > 0) {
+            for (uint32_t index = 0; index < oldCount; ++index) {
+                const int16_t slot = oldSlots.GetValue(index);
+                if (slot >= 0 &&
+                    overwritten.GetValue(
+                        static_cast<uint32_t>(slot)) == 0) {
+                    survivorTokens.SetValue(
+                        survivorCount, oldTokens.GetValue(index));
+                    survivorSlots.SetValue(survivorCount, slot);
+                    ++survivorCount;
+                }
+            }
+        }
+
+        // Merge two already-sorted runs: surviving old residents and the
+        // current misses. Hits are already present in the survivor run and
+        // must not be inserted a second time.
+        uint32_t oldIndex = 0;
+        uint32_t currentIndex = 0;
+        uint32_t mergedCount = 0;
+        if (survivorCount > 0 || currentCount > 0) {
+            while (oldIndex < survivorCount ||
+                   currentIndex < currentCount) {
+                if (currentIndex < currentCount) {
+                    while (currentIndex < currentCount) {
+                        const int16_t slot =
+                            priorSlots.GetValue(currentIndex);
+                        if (slot >= 0 &&
+                            overwritten.GetValue(
+                                static_cast<uint32_t>(slot)) != 0) {
+                            break;
+                        }
+                        ++currentIndex;
+                    }
+                }
+                const bool haveOld = oldIndex < survivorCount;
+                const bool haveMiss = currentIndex < currentCount;
+                if (!haveOld && !haveMiss) {
+                    break;
+                }
+                const int32_t oldToken = haveOld
+                    ? survivorTokens.GetValue(oldIndex)
+                    : static_cast<int32_t>(0x7FFFFFFF);
+                const int32_t missToken = haveMiss
+                    ? currentTokens.GetValue(currentIndex)
+                    : static_cast<int32_t>(0x7FFFFFFF);
+                if (haveOld && (!haveMiss || oldToken < missToken)) {
+                    mergedTokens.SetValue(mergedCount, oldToken);
+                    mergedSlots.SetValue(
+                        mergedCount,
+                        survivorSlots.GetValue(oldIndex));
+                    ++oldIndex;
+                } else {
+                    mergedTokens.SetValue(mergedCount, missToken);
+                    mergedSlots.SetValue(
+                        mergedCount,
+                        priorSlots.GetValue(currentIndex));
+                    ++currentIndex;
+                }
+                ++mergedCount;
+            }
+        }
+
+        Sync<AscendC::HardEvent::S_MTE3>();
+        if (mergedCount > 0) {
+            CopyLocalToGlobalExact(
+                stateTokens_[oldStateOffset],
+                mergedTokens,
+                mergedCount);
+            CopyLocalToGlobalExact(
+                stateSlots_[oldStateOffset],
+                mergedSlots,
+                mergedCount);
+        }
+        const uint64_t newCountOffset =
+            static_cast<uint64_t>(safeState)
+                * shardCountRequestStride_
+            + shard * shardCountStride_;
+        stateCounts_.SetValue(
+            newCountOffset, static_cast<int32_t>(mergedCount));
+
+        if (shard == 0) {
+            stateGenerations_.SetValue(
+                static_cast<uint64_t>(safeState)
+                    * generationStride_,
+                requestedGeneration);
+        }
+    }
+
 private:
     __aicore__ inline void RemapPositionPartition(
         uint32_t request,
@@ -1713,6 +1877,248 @@ private:
     uint32_t generationStride_ = 0;
 };
 
+// Split-path remap. One AIV owns one contiguous 1024-position partition,
+// so output cachelines have a single writer. Unlike the fused fallback, this
+// kernel uses dedicated UB and has no dependency on state-update UB reuse.
+class DSAResidentSortedRemapKernel {
+public:
+    __aicore__ inline void Init(
+        __gm__ int32_t* topkIndices,
+        __gm__ int16_t* shardMapping,
+        __gm__ int32_t* shardCounts,
+        __gm__ int16_t* priorSlots,
+        uint32_t requestCount,
+        uint32_t rowsPerRequest,
+        uint32_t rowWidth,
+        uint32_t shardCount,
+        uint32_t capacity,
+        uint32_t shardCountStride,
+        uint32_t shardCountRequestStride)
+    {
+        requestCount_ = requestCount;
+        requestWidth_ = rowsPerRequest * rowWidth;
+        shardCount_ = shardCount;
+        capacity_ = capacity;
+        partWidth_ = requestWidth_ / shardCount_;
+        shardCountStride_ = shardCountStride;
+        shardCountRequestStride_ = shardCountRequestStride;
+        topkIndices_.SetGlobalBuffer(
+            topkIndices,
+            static_cast<uint64_t>(requestCount_) * requestWidth_);
+        shardMapping_.SetGlobalBuffer(
+            shardMapping,
+            static_cast<uint64_t>(requestCount_) * shardCount_
+                * requestWidth_);
+        shardCounts_.SetGlobalBuffer(
+            shardCounts,
+            static_cast<uint64_t>(requestCount_)
+                * shardCountRequestStride_);
+        priorSlots_.SetGlobalBuffer(
+            priorSlots,
+            static_cast<uint64_t>(requestCount_) * shardCount_
+                * capacity_);
+
+        pipe_.InitBuffer(
+            inputBuf_, partWidth_ * sizeof(int32_t));
+        pipe_.InitBuffer(
+            mappingBuf_, partWidth_ * sizeof(int16_t));
+        pipe_.InitBuffer(
+            rankFloatBuf_, partWidth_ * sizeof(float));
+        pipe_.InitBuffer(
+            shardSlotBuf_, capacity_ * sizeof(int16_t));
+        pipe_.InitBuffer(
+            rankBuf_, partWidth_ * sizeof(int32_t));
+        pipe_.InitBuffer(
+            accumulatedBuf_, partWidth_ * sizeof(int32_t));
+        pipe_.InitBuffer(
+            offsetBuf_, partWidth_ * sizeof(int32_t));
+        pipe_.InitBuffer(
+            gatheredFloatBuf_, partWidth_ * sizeof(float));
+        pipe_.InitBuffer(selectedMaskBuf_, partWidth_ / 8);
+    }
+
+    __aicore__ inline void Process()
+    {
+        const uint32_t block = AscendC::GetBlockIdx();
+        const uint32_t request = block / shardCount_;
+        const uint32_t part = block % shardCount_;
+        if (request >= requestCount_) {
+            return;
+        }
+        const uint32_t begin = part * partWidth_;
+        const uint64_t requestOffset =
+            static_cast<uint64_t>(request) * requestWidth_;
+        const uint64_t mappingBase =
+            static_cast<uint64_t>(request) * shardCount_
+            * requestWidth_;
+        const uint64_t requestShardBase =
+            static_cast<uint64_t>(request) * shardCount_ * capacity_;
+
+        auto input = inputBuf_.Get<int32_t>();
+        auto mappingOrGathered = mappingBuf_.Get<int16_t>();
+        auto rankFloatOrCandidate = rankFloatBuf_.Get<float>();
+        auto shardSlots = shardSlotBuf_.Get<int16_t>();
+        auto ranksOrOutput = rankBuf_.Get<int32_t>();
+        auto accumulatedSlots = accumulatedBuf_.Get<int32_t>();
+        auto clampedOffsets = offsetBuf_.Get<int32_t>();
+        auto gatheredFloat = gatheredFloatBuf_.Get<float>();
+        auto selectedMask = selectedMaskBuf_.Get<uint8_t>();
+
+        CopyGlobalToLocalExact(
+            input,
+            topkIndices_[requestOffset + begin],
+            partWidth_);
+        Sync<AscendC::HardEvent::MTE2_V>();
+        AscendC::Duplicate(
+            accumulatedSlots,
+            static_cast<int32_t>(-1),
+            partWidth_);
+        AscendC::PipeBarrier<PIPE_V>();
+
+        for (uint32_t shard = 0; shard < shardCount_; ++shard) {
+            const uint32_t count = static_cast<uint32_t>(
+                shardCounts_.GetValue(
+                    static_cast<uint64_t>(request)
+                        * shardCountRequestStride_
+                    + shard * shardCountStride_));
+            if (count == 0) {
+                continue;
+            }
+
+            CopyGlobalToLocalExact(
+                mappingOrGathered,
+                shardMapping_[
+                    mappingBase
+                    + static_cast<uint64_t>(shard) * requestWidth_
+                    + begin],
+                partWidth_);
+            CopyGlobalToLocalExact(
+                shardSlots,
+                priorSlots_[
+                    requestShardBase
+                    + static_cast<uint64_t>(shard) * capacity_],
+                count);
+            Sync<AscendC::HardEvent::MTE2_V>();
+
+            AscendC::Cast(
+                rankFloatOrCandidate,
+                mappingOrGathered,
+                AscendC::RoundMode::CAST_NONE,
+                partWidth_);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Cast(
+                ranksOrOutput,
+                rankFloatOrCandidate,
+                AscendC::RoundMode::CAST_ROUND,
+                partWidth_);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Maxs(
+                clampedOffsets,
+                ranksOrOutput,
+                static_cast<int32_t>(0),
+                partWidth_);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Compare(
+                selectedMask,
+                clampedOffsets,
+                ranksOrOutput,
+                AscendC::CMPMODE::EQ,
+                partWidth_);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Mins(
+                clampedOffsets,
+                clampedOffsets,
+                static_cast<int32_t>(count - 1),
+                partWidth_);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Muls(
+                clampedOffsets,
+                clampedOffsets,
+                static_cast<int32_t>(sizeof(int16_t)),
+                partWidth_);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Gather(
+                mappingOrGathered,
+                shardSlots,
+                clampedOffsets.ReinterpretCast<uint32_t>(),
+                static_cast<uint32_t>(0),
+                partWidth_);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Cast(
+                gatheredFloat,
+                mappingOrGathered,
+                AscendC::RoundMode::CAST_NONE,
+                partWidth_);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Cast(
+                rankFloatOrCandidate.ReinterpretCast<int32_t>(),
+                gatheredFloat,
+                AscendC::RoundMode::CAST_ROUND,
+                partWidth_);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Select(
+                accumulatedSlots.ReinterpretCast<float>(),
+                selectedMask,
+                rankFloatOrCandidate,
+                accumulatedSlots.ReinterpretCast<float>(),
+                AscendC::SELMODE::VSEL_TENSOR_TENSOR_MODE,
+                partWidth_);
+            AscendC::PipeBarrier<PIPE_V>();
+            Sync<AscendC::HardEvent::V_MTE2>();
+        }
+
+        AscendC::Maxs(
+            clampedOffsets,
+            accumulatedSlots,
+            static_cast<int32_t>(0),
+            partWidth_);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Compare(
+            selectedMask,
+            clampedOffsets,
+            accumulatedSlots,
+            AscendC::CMPMODE::EQ,
+            partWidth_);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Select(
+            ranksOrOutput.ReinterpretCast<float>(),
+            selectedMask,
+            accumulatedSlots.ReinterpretCast<float>(),
+            input.ReinterpretCast<float>(),
+            AscendC::SELMODE::VSEL_TENSOR_TENSOR_MODE,
+            partWidth_);
+        AscendC::PipeBarrier<PIPE_V>();
+        Sync<AscendC::HardEvent::V_MTE3>();
+        CopyLocalToGlobalExact(
+            topkIndices_[requestOffset + begin],
+            ranksOrOutput,
+            partWidth_);
+    }
+
+private:
+    AscendC::GlobalTensor<int32_t> topkIndices_;
+    AscendC::GlobalTensor<int16_t> shardMapping_;
+    AscendC::GlobalTensor<int32_t> shardCounts_;
+    AscendC::GlobalTensor<int16_t> priorSlots_;
+    AscendC::TPipe pipe_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> inputBuf_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> mappingBuf_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> rankFloatBuf_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> shardSlotBuf_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> rankBuf_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> accumulatedBuf_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> offsetBuf_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> gatheredFloatBuf_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> selectedMaskBuf_;
+    uint32_t requestCount_ = 0;
+    uint32_t requestWidth_ = 0;
+    uint32_t shardCount_ = 0;
+    uint32_t capacity_ = 0;
+    uint32_t partWidth_ = 0;
+    uint32_t shardCountStride_ = 0;
+    uint32_t shardCountRequestStride_ = 0;
+};
+
 extern "C" __global__ __aicore__ void
 dsa_resident_sharded_union_kernel(
     __gm__ int32_t* topkIndices,
@@ -1841,6 +2247,66 @@ dsa_resident_sorted_update_kernel(
     op.Process();
 }
 
+extern "C" __global__ __aicore__ void
+dsa_resident_sorted_state_update_kernel(
+    __gm__ int32_t* topkIndices,
+    __gm__ int32_t* shardPacked,
+    __gm__ int16_t* shardMapping,
+    __gm__ int32_t* shardCounts,
+    __gm__ int16_t* priorSlots,
+    __gm__ uint8_t* overwrittenSlots,
+    __gm__ int32_t* requestStateIndices,
+    __gm__ int64_t* requestStateGenerations,
+    __gm__ int32_t* stateTokens,
+    __gm__ int16_t* stateSlots,
+    __gm__ int32_t* stateCounts,
+    __gm__ int64_t* stateGenerations,
+    uint32_t requestCount,
+    uint32_t stateRowCount,
+    uint32_t dummyStateBase,
+    uint32_t rowsPerRequest,
+    uint32_t rowWidth,
+    uint32_t shardCount,
+    uint32_t capacity,
+    uint32_t shardCountStride,
+    uint32_t shardCountRequestStride,
+    uint32_t generationStride)
+{
+    DSAResidentSortedUpdateKernel op;
+    op.Init(
+        topkIndices, shardPacked, shardMapping, shardCounts,
+        priorSlots, overwrittenSlots,
+        requestStateIndices, requestStateGenerations,
+        stateTokens, stateSlots, stateCounts, stateGenerations,
+        requestCount, stateRowCount,
+        dummyStateBase, rowsPerRequest, rowWidth, shardCount,
+        capacity, shardCountStride, shardCountRequestStride,
+        generationStride);
+    op.ProcessStateOnly();
+}
+
+extern "C" __global__ __aicore__ void
+dsa_resident_sorted_remap_kernel(
+    __gm__ int32_t* topkIndices,
+    __gm__ int16_t* shardMapping,
+    __gm__ int32_t* shardCounts,
+    __gm__ int16_t* priorSlots,
+    uint32_t requestCount,
+    uint32_t rowsPerRequest,
+    uint32_t rowWidth,
+    uint32_t shardCount,
+    uint32_t capacity,
+    uint32_t shardCountStride,
+    uint32_t shardCountRequestStride)
+{
+    DSAResidentSortedRemapKernel op;
+    op.Init(
+        topkIndices, shardMapping, shardCounts, priorSlots,
+        requestCount, rowsPerRequest, rowWidth, shardCount,
+        capacity, shardCountStride, shardCountRequestStride);
+    op.Process();
+}
+
 }  // namespace
 
 namespace vllm_ascend {
@@ -1955,6 +2421,96 @@ void dsa_resident_sorted_plan_impl(
         rowsPerRequest, rowWidth, shardCount, capacity,
         shardCountStride, shardCountRequestStride,
         generationStride);
+}
+
+void dsa_resident_sorted_plan_no_remap_impl(
+    void* stream,
+    void* topkIndices,
+    void* shardPacked,
+    void* shardMapping,
+    void* shardCounts,
+    void* requestBlockTable,
+    void* requestStateIndices,
+    void* requestStateGenerations,
+    void* stateTokens,
+    void* stateSlots,
+    void* stateCounts,
+    void* stateGenerations,
+    void* priorSlots,
+    void* overwrittenSlots,
+    void* missTokens,
+    void* missCounts,
+    void* targetSlots,
+    uint32_t requestCount,
+    uint32_t stateRowCount,
+    uint32_t dummyStateBase,
+    uint32_t rowsPerRequest,
+    uint32_t rowWidth,
+    uint32_t shardCount,
+    uint32_t capacity,
+    uint32_t shardCountStride,
+    uint32_t shardCountRequestStride,
+    uint32_t missCountStride,
+    uint32_t generationStride,
+    uint32_t blockTableWidth,
+    uint32_t blockSize)
+{
+    dsa_resident_sorted_finalize_kernel<<<
+        requestCount, nullptr, stream>>>(
+            static_cast<int32_t*>(shardPacked),
+            static_cast<int32_t*>(shardCounts),
+            static_cast<int16_t*>(priorSlots),
+            static_cast<uint8_t*>(overwrittenSlots),
+            static_cast<int32_t*>(missTokens),
+            static_cast<int32_t*>(missCounts),
+            static_cast<int64_t*>(targetSlots),
+            static_cast<int32_t*>(requestBlockTable),
+            static_cast<int32_t*>(missCounts),
+            requestCount, shardCount, capacity, shardCountStride,
+            shardCountRequestStride, missCountStride,
+            blockTableWidth, blockSize, 0);
+    dsa_resident_sorted_state_update_kernel<<<
+        requestCount * shardCount, nullptr, stream>>>(
+            static_cast<int32_t*>(topkIndices),
+            static_cast<int32_t*>(shardPacked),
+            static_cast<int16_t*>(shardMapping),
+            static_cast<int32_t*>(shardCounts),
+            static_cast<int16_t*>(priorSlots),
+            static_cast<uint8_t*>(overwrittenSlots),
+            static_cast<int32_t*>(requestStateIndices),
+            static_cast<int64_t*>(requestStateGenerations),
+            static_cast<int32_t*>(stateTokens),
+            static_cast<int16_t*>(stateSlots),
+            static_cast<int32_t*>(stateCounts),
+            static_cast<int64_t*>(stateGenerations),
+            requestCount, stateRowCount, dummyStateBase,
+            rowsPerRequest, rowWidth, shardCount, capacity,
+            shardCountStride, shardCountRequestStride,
+            generationStride);
+}
+
+void dsa_resident_sorted_remap_impl(
+    void* stream,
+    void* topkIndices,
+    void* shardMapping,
+    void* shardCounts,
+    void* priorSlots,
+    uint32_t requestCount,
+    uint32_t rowsPerRequest,
+    uint32_t rowWidth,
+    uint32_t shardCount,
+    uint32_t capacity,
+    uint32_t shardCountStride,
+    uint32_t shardCountRequestStride)
+{
+    dsa_resident_sorted_remap_kernel<<<
+        requestCount * shardCount, nullptr, stream>>>(
+            static_cast<int32_t*>(topkIndices),
+            static_cast<int16_t*>(shardMapping),
+            static_cast<int32_t*>(shardCounts),
+            static_cast<int16_t*>(priorSlots),
+            requestCount, rowsPerRequest, rowWidth, shardCount,
+            capacity, shardCountStride, shardCountRequestStride);
 }
 
 void dsa_resident_sorted_read_probe_impl(

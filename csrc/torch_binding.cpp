@@ -1582,7 +1582,7 @@ at::Tensor npu_dsa_resident_sharded_union_(
         prior_slots, mtp, dummy_state_base);
 }
 
-at::Tensor npu_dsa_resident_sorted_plan_(
+static at::Tensor resident_sorted_plan_common_(
     at::Tensor &topk_indices,
     const at::Tensor &shard_packed,
     const at::Tensor &shard_mapping,
@@ -1600,7 +1600,8 @@ at::Tensor npu_dsa_resident_sorted_plan_(
     at::Tensor &miss_counts,
     at::Tensor &target_slots,
     int64_t block_size,
-    int64_t dummy_state_base)
+    int64_t dummy_state_base,
+    bool fused_remap)
 {
     const auto device = topk_indices.device();
     TORCH_CHECK(
@@ -1777,7 +1778,10 @@ at::Tensor npu_dsa_resident_sorted_plan_(
     void* miss_count_ptr = miss_counts.data_ptr();
     void* target_ptr = target_slots.data_ptr();
     at_npu::native::OpCommand cmd;
-    cmd.Name("npu_dsa_resident_sorted_plan_");
+    cmd.Name(
+        fused_remap
+            ? "npu_dsa_resident_sorted_plan_"
+            : "npu_dsa_resident_sorted_plan_no_remap_");
     cmd.SetCustomHandler([
         stream, topk_ptr, packed_ptr, mapping_ptr,
         shard_count_ptr, block_table_ptr, request_state_ptr,
@@ -1789,8 +1793,11 @@ at::Tensor npu_dsa_resident_sorted_plan_(
         rows_per_request, row_width, shard_count, capacity,
         shard_count_stride, shard_count_request_stride,
         miss_count_stride, generation_stride,
-        block_table_width, block_size]() -> int {
-        dsa_resident_sorted_plan_impl(
+        block_table_width, block_size, fused_remap]() -> int {
+        auto impl = fused_remap
+            ? dsa_resident_sorted_plan_impl
+            : dsa_resident_sorted_plan_no_remap_impl;
+        impl(
             stream, topk_ptr, packed_ptr, mapping_ptr,
             shard_count_ptr, block_table_ptr, request_state_ptr,
             request_generation_ptr, state_token_ptr, state_slot_ptr,
@@ -1815,6 +1822,168 @@ at::Tensor npu_dsa_resident_sorted_plan_(
     });
     cmd.Run();
     return miss_counts;
+}
+
+at::Tensor npu_dsa_resident_sorted_plan_(
+    at::Tensor &topk_indices,
+    const at::Tensor &shard_packed,
+    const at::Tensor &shard_mapping,
+    const at::Tensor &shard_counts,
+    const at::Tensor &request_block_table,
+    const at::Tensor &request_state_indices,
+    const at::Tensor &request_state_generations,
+    at::Tensor &state_tokens,
+    at::Tensor &state_slots,
+    at::Tensor &state_counts,
+    at::Tensor &state_generations,
+    at::Tensor &prior_slots,
+    at::Tensor &overwritten_slots,
+    at::Tensor &miss_tokens,
+    at::Tensor &miss_counts,
+    at::Tensor &target_slots,
+    int64_t block_size,
+    int64_t dummy_state_base)
+{
+    return resident_sorted_plan_common_(
+        topk_indices, shard_packed, shard_mapping, shard_counts,
+        request_block_table, request_state_indices,
+        request_state_generations, state_tokens, state_slots,
+        state_counts, state_generations, prior_slots,
+        overwritten_slots, miss_tokens, miss_counts, target_slots,
+        block_size, dummy_state_base, true);
+}
+
+at::Tensor npu_dsa_resident_sorted_plan_no_remap_(
+    at::Tensor &topk_indices,
+    const at::Tensor &shard_packed,
+    const at::Tensor &shard_mapping,
+    const at::Tensor &shard_counts,
+    const at::Tensor &request_block_table,
+    const at::Tensor &request_state_indices,
+    const at::Tensor &request_state_generations,
+    at::Tensor &state_tokens,
+    at::Tensor &state_slots,
+    at::Tensor &state_counts,
+    at::Tensor &state_generations,
+    at::Tensor &prior_slots,
+    at::Tensor &overwritten_slots,
+    at::Tensor &miss_tokens,
+    at::Tensor &miss_counts,
+    at::Tensor &target_slots,
+    int64_t block_size,
+    int64_t dummy_state_base)
+{
+    return resident_sorted_plan_common_(
+        topk_indices, shard_packed, shard_mapping, shard_counts,
+        request_block_table, request_state_indices,
+        request_state_generations, state_tokens, state_slots,
+        state_counts, state_generations, prior_slots,
+        overwritten_slots, miss_tokens, miss_counts, target_slots,
+        block_size, dummy_state_base, false);
+}
+
+at::Tensor npu_dsa_resident_sorted_remap_(
+    at::Tensor &topk_indices,
+    const at::Tensor &shard_mapping,
+    const at::Tensor &shard_counts,
+    const at::Tensor &prior_slots)
+{
+    const auto device = topk_indices.device();
+    TORCH_CHECK(
+        topk_indices.is_privateuseone() &&
+            shard_mapping.device() == device &&
+            shard_counts.device() == device &&
+            prior_slots.device() == device,
+        "sorted-resident remap tensors must share one NPU device");
+    TORCH_CHECK(
+        topk_indices.scalar_type() == at::kInt &&
+            shard_mapping.scalar_type() == at::kShort &&
+            shard_counts.scalar_type() == at::kInt &&
+            prior_slots.scalar_type() == at::kShort,
+        "sorted-resident remap tensor dtypes are invalid");
+    TORCH_CHECK(
+        topk_indices.is_contiguous() &&
+            shard_mapping.is_contiguous() &&
+            shard_counts.is_contiguous() &&
+            prior_slots.is_contiguous(),
+        "sorted-resident remap tensors must be contiguous");
+    TORCH_CHECK(
+        (topk_indices.dim() == 2 ||
+            (topk_indices.dim() == 3 &&
+             topk_indices.size(1) == 1)) &&
+            shard_mapping.dim() == 3 &&
+            shard_counts.dim() == 3 &&
+            prior_slots.dim() == 3,
+        "sorted-resident remap tensor ranks are invalid");
+
+    const int64_t request_count = shard_mapping.size(0);
+    const int64_t row_count = topk_indices.size(0);
+    TORCH_CHECK(
+        request_count > 0 && row_count > 0 &&
+            row_count % request_count == 0,
+        "sorted-resident remap rows must be request-major");
+    const int64_t rows_per_request = row_count / request_count;
+    const int64_t row_width = topk_indices.numel() / row_count;
+    const int64_t request_width = rows_per_request * row_width;
+    const int64_t shard_count = shard_mapping.size(1);
+    const int64_t capacity = prior_slots.size(2);
+    const int64_t shard_count_stride = shard_counts.size(2);
+    const int64_t shard_count_request_stride =
+        shard_counts.size(1) * shard_count_stride;
+    int64_t expected_shard_count = 1;
+    while (expected_shard_count <= rows_per_request) {
+        expected_shard_count <<= 1;
+    }
+    TORCH_CHECK(
+        rows_per_request >= 1 && rows_per_request <= 2 &&
+            row_width == 2048 &&
+            request_width == capacity &&
+            shard_count == expected_shard_count &&
+            request_width % (16 * shard_count) == 0 &&
+            shard_mapping.size(2) == request_width &&
+            shard_counts.size(0) == request_count &&
+            shard_counts.size(1) == shard_count &&
+            shard_count_stride >= 16 &&
+            prior_slots.size(0) == request_count &&
+            prior_slots.size(1) == shard_count,
+        "sorted-resident remap workspace shapes are invalid");
+    TORCH_CHECK(
+        reinterpret_cast<std::uintptr_t>(
+            topk_indices.data_ptr()) % 64 == 0 &&
+            reinterpret_cast<std::uintptr_t>(
+            shard_mapping.data_ptr()) % 64 == 0 &&
+            reinterpret_cast<std::uintptr_t>(
+                shard_counts.data_ptr()) % 64 == 0 &&
+            reinterpret_cast<std::uintptr_t>(
+                prior_slots.data_ptr()) % 64 == 0,
+        "sorted-resident remap inputs must be 64-byte aligned");
+
+    const c10_npu::OptionalNPUGuard npu_guard(device);
+    aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
+    void* topk_ptr = topk_indices.data_ptr();
+    void* mapping_ptr = shard_mapping.data_ptr();
+    void* count_ptr = shard_counts.data_ptr();
+    void* prior_ptr = prior_slots.data_ptr();
+    at_npu::native::OpCommand cmd;
+    cmd.Name("npu_dsa_resident_sorted_remap_");
+    cmd.SetCustomHandler([
+        stream, topk_ptr, mapping_ptr, count_ptr, prior_ptr,
+        request_count, rows_per_request, row_width, shard_count,
+        capacity, shard_count_stride,
+        shard_count_request_stride]() -> int {
+        dsa_resident_sorted_remap_impl(
+            stream, topk_ptr, mapping_ptr, count_ptr, prior_ptr,
+            static_cast<uint32_t>(request_count),
+            static_cast<uint32_t>(rows_per_request),
+            static_cast<uint32_t>(row_width),
+            static_cast<uint32_t>(shard_count),
+            static_cast<uint32_t>(capacity),
+            static_cast<uint32_t>(shard_count_stride),
+            static_cast<uint32_t>(shard_count_request_stride));
+        return 0;
+    });
+    cmd.Run();
+    return topk_indices;
 }
 
 at::Tensor npu_dsa_resident_sorted_read_probe_(
@@ -3231,6 +3400,31 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "npu_dsa_resident_sorted_plan_",
         torch::kPrivateUse1,
         &vllm_ascend::npu_dsa_resident_sorted_plan_);
+    ops.def(
+        "npu_dsa_resident_sorted_plan_no_remap_("
+        "Tensor(a!) topk_indices, "
+        "Tensor shard_packed, Tensor shard_mapping, "
+        "Tensor shard_counts, Tensor request_block_table, "
+        "Tensor request_state_indices, "
+        "Tensor request_state_generations, "
+        "Tensor(b!) state_tokens, Tensor(c!) state_slots, "
+        "Tensor(d!) state_counts, Tensor(e!) state_generations, "
+        "Tensor(f!) prior_slots, Tensor(g!) overwritten_slots, "
+        "Tensor(h!) miss_tokens, Tensor(i!) miss_counts, "
+        "Tensor(j!) target_slots, int block_size, "
+        "int dummy_state_base) -> Tensor(i!)");
+    ops.impl(
+        "npu_dsa_resident_sorted_plan_no_remap_",
+        torch::kPrivateUse1,
+        &vllm_ascend::npu_dsa_resident_sorted_plan_no_remap_);
+    ops.def(
+        "npu_dsa_resident_sorted_remap_("
+        "Tensor(a!) topk_indices, Tensor shard_mapping, "
+        "Tensor shard_counts, Tensor prior_slots) -> Tensor(a!)");
+    ops.impl(
+        "npu_dsa_resident_sorted_remap_",
+        torch::kPrivateUse1,
+        &vllm_ascend::npu_dsa_resident_sorted_remap_);
     ops.def(
         "npu_dsa_resident_sorted_read_probe_("
         "Tensor shard_counts, Tensor prior_slots, "

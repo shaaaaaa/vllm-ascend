@@ -256,6 +256,18 @@ at::Tensor npu_dsa_resident_sorted_plan_meta(
     return miss_counts;
 }
 
+at::Tensor npu_dsa_resident_sorted_remap_meta(
+    at::Tensor &topk_indices,
+    const at::Tensor &shard_mapping,
+    const at::Tensor &shard_counts,
+    const at::Tensor &prior_slots)
+{
+    (void)shard_mapping;
+    (void)shard_counts;
+    (void)prior_slots;
+    return topk_indices;
+}
+
 at::Tensor npu_dsa_resident_sorted_read_probe_meta(
     const at::Tensor &shard_counts,
     const at::Tensor &prior_slots,
@@ -934,6 +946,12 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
     ops.impl(
         "npu_dsa_resident_sorted_plan_",
         &vllm_ascend::meta::npu_dsa_resident_sorted_plan_meta);
+    ops.impl(
+        "npu_dsa_resident_sorted_plan_no_remap_",
+        &vllm_ascend::meta::npu_dsa_resident_sorted_plan_meta);
+    ops.impl(
+        "npu_dsa_resident_sorted_remap_",
+        &vllm_ascend::meta::npu_dsa_resident_sorted_remap_meta);
     ops.impl(
         "npu_dsa_resident_sorted_read_probe_",
         &vllm_ascend::meta::npu_dsa_resident_sorted_read_probe_meta);
