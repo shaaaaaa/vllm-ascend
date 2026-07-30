@@ -1902,7 +1902,9 @@ at::Tensor npu_dsa_resident_sorted_finalize_debug_(
     at::Tensor &miss_counts,
     at::Tensor &target_slots,
     const at::Tensor &request_block_table,
-    int64_t block_size)
+    at::Tensor &debug_info,
+    int64_t block_size,
+    int64_t debug_stage)
 {
     const auto device = shard_packed.device();
     TORCH_CHECK(
@@ -1913,7 +1915,8 @@ at::Tensor npu_dsa_resident_sorted_finalize_debug_(
             miss_tokens.device() == device &&
             miss_counts.device() == device &&
             target_slots.device() == device &&
-            request_block_table.device() == device,
+            request_block_table.device() == device &&
+            debug_info.device() == device,
         "resident finalize-debug tensors must share one NPU device");
     TORCH_CHECK(
         shard_packed.scalar_type() == at::kInt &&
@@ -1923,7 +1926,8 @@ at::Tensor npu_dsa_resident_sorted_finalize_debug_(
             miss_tokens.scalar_type() == at::kInt &&
             miss_counts.scalar_type() == at::kInt &&
             target_slots.scalar_type() == at::kLong &&
-            request_block_table.scalar_type() == at::kInt,
+            request_block_table.scalar_type() == at::kInt &&
+            debug_info.scalar_type() == at::kInt,
         "resident finalize-debug tensor dtypes are invalid");
     TORCH_CHECK(
         shard_packed.is_contiguous() &&
@@ -1933,7 +1937,8 @@ at::Tensor npu_dsa_resident_sorted_finalize_debug_(
             miss_tokens.is_contiguous() &&
             miss_counts.is_contiguous() &&
             target_slots.is_contiguous() &&
-            request_block_table.is_contiguous(),
+            request_block_table.is_contiguous() &&
+            debug_info.is_contiguous(),
         "resident finalize-debug tensors must be contiguous");
     TORCH_CHECK(
         shard_packed.dim() == 3 &&
@@ -1943,7 +1948,8 @@ at::Tensor npu_dsa_resident_sorted_finalize_debug_(
             miss_tokens.dim() == 2 &&
             miss_counts.dim() == 2 &&
             target_slots.dim() == 2 &&
-            request_block_table.dim() == 2,
+            request_block_table.dim() == 2 &&
+            debug_info.dim() == 2,
         "resident finalize-debug tensor ranks are invalid");
 
     const int64_t request_count = shard_packed.size(0);
@@ -1969,8 +1975,11 @@ at::Tensor npu_dsa_resident_sorted_finalize_debug_(
             miss_counts.size(0) == request_count &&
             miss_count_stride >= 16 &&
             request_block_table.size(0) >= request_count &&
+            debug_info.size(0) == request_count &&
+            debug_info.size(1) == 16 &&
             block_size > 0 &&
-            block_table_width * block_size >= capacity,
+            block_table_width * block_size >= capacity &&
+            debug_stage >= 0 && debug_stage <= 11,
         "resident finalize-debug tensor shapes are invalid");
 
     const c10_npu::OptionalNPUGuard npu_guard(device);
@@ -1983,20 +1992,21 @@ at::Tensor npu_dsa_resident_sorted_finalize_debug_(
     void* miss_count_ptr = miss_counts.data_ptr();
     void* target_ptr = target_slots.data_ptr();
     void* block_table_ptr = request_block_table.data_ptr();
+    void* debug_ptr = debug_info.data_ptr();
     at_npu::native::OpCommand cmd;
     cmd.Name("npu_dsa_resident_sorted_finalize_debug_");
     cmd.SetCustomHandler([
         stream, packed_ptr, count_ptr, prior_ptr,
         overwritten_ptr, miss_token_ptr, miss_count_ptr,
-        target_ptr, block_table_ptr,
+        target_ptr, block_table_ptr, debug_ptr,
         request_count, shard_count, capacity,
         shard_count_stride, shard_count_request_stride,
         miss_count_stride, block_table_width,
-        block_size]() -> int {
+        block_size, debug_stage]() -> int {
         dsa_resident_sorted_finalize_debug_impl(
             stream, packed_ptr, count_ptr, prior_ptr,
             overwritten_ptr, miss_token_ptr, miss_count_ptr,
-            target_ptr, block_table_ptr,
+            target_ptr, block_table_ptr, debug_ptr,
             static_cast<uint32_t>(request_count),
             static_cast<uint32_t>(shard_count),
             static_cast<uint32_t>(capacity),
@@ -2004,7 +2014,8 @@ at::Tensor npu_dsa_resident_sorted_finalize_debug_(
             static_cast<uint32_t>(shard_count_request_stride),
             static_cast<uint32_t>(miss_count_stride),
             static_cast<uint32_t>(block_table_width),
-            static_cast<uint32_t>(block_size));
+            static_cast<uint32_t>(block_size),
+            static_cast<uint32_t>(debug_stage));
         return 0;
     });
     cmd.Run();
@@ -3235,7 +3246,8 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "Tensor(a!) prior_slots, Tensor(b!) overwritten_slots, "
         "Tensor(c!) miss_tokens, Tensor(d!) miss_counts, "
         "Tensor(e!) target_slots, Tensor request_block_table, "
-        "int block_size) -> Tensor(d!)");
+        "Tensor(f!) debug_info, int block_size, "
+        "int debug_stage) -> Tensor(d!)");
     ops.impl(
         "npu_dsa_resident_sorted_finalize_debug_",
         torch::kPrivateUse1,

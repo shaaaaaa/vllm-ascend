@@ -28,6 +28,7 @@ constexpr uint32_t kPairWidth = 2;
 constexpr uint32_t kMergeWays = 4;
 constexpr uint32_t kMaxResidentShards = 4;
 constexpr uint32_t kResidentProbeDebugInts = 32;
+constexpr uint32_t kResidentFinalizeDebugInts = 16;
 
 template <AscendC::HardEvent event>
 __aicore__ inline void Sync()
@@ -785,6 +786,7 @@ public:
         __gm__ int32_t* missCounts,
         __gm__ int64_t* targetSlots,
         __gm__ int32_t* requestBlockTable,
+        __gm__ int32_t* debugInfo,
         uint32_t requestCount,
         uint32_t shardCount,
         uint32_t capacity,
@@ -792,7 +794,8 @@ public:
         uint32_t shardCountRequestStride,
         uint32_t missCountStride,
         uint32_t blockTableWidth,
-        uint32_t blockSize)
+        uint32_t blockSize,
+        uint32_t debugStage)
     {
         requestCount_ = requestCount;
         shardCount_ = shardCount;
@@ -802,6 +805,7 @@ public:
         missCountStride_ = missCountStride;
         blockTableWidth_ = blockTableWidth;
         blockSize_ = blockSize;
+        debugStage_ = debugStage;
         blockTableEntries_ =
             (capacity_ + blockSize_ - 1) / blockSize_;
         const uint64_t requestShardElements =
@@ -831,6 +835,10 @@ public:
             requestBlockTable,
             static_cast<uint64_t>(requestCount_)
                 * blockTableWidth_);
+        debugInfo_.SetGlobalBuffer(
+            debugInfo,
+            static_cast<uint64_t>(requestCount_)
+                * kResidentFinalizeDebugInts);
 
         pipe_.InitBuffer(
             protectedBuf_, capacity_ * sizeof(int16_t));
@@ -923,7 +931,15 @@ public:
         }
         Sync<AscendC::HardEvent::MTE2_S>();
         Sync<AscendC::HardEvent::V_S>();
+        if (debugStage_ == 1) {
+            PublishDebug(
+                blockTable, request, packedEnd,
+                0, 0, 0, 0x7FFF, 0x7FFF,
+                0x7FFFFFFF, 0x7FFFFFFF, -1, -1);
+            return;
+        }
 
+        uint32_t protectedCount = 0;
         for (uint32_t shard = 0; shard < shardCount_; ++shard) {
             const uint32_t count = shardCounts[shard];
             const uint32_t localOffset = shardOffsets[shard];
@@ -935,8 +951,28 @@ public:
                     protectedSlots.SetValue(
                         static_cast<uint32_t>(slot),
                         static_cast<int16_t>(1));
+                    ++protectedCount;
                 }
             }
+        }
+        if (debugStage_ == 2) {
+            PublishDebug(
+                blockTable, request, packedEnd,
+                protectedCount, 0, 0, 0x7FFF, 0x7FFF,
+                0x7FFFFFFF, 0x7FFFFFFF, -1, -1);
+            return;
+        }
+        if (debugStage_ == 3) {
+            Sync<AscendC::HardEvent::S_MTE3>();
+            CopyLocalToGlobalExact(
+                priorSlots_[requestShardBase],
+                protectedSlots,
+                capacity_);
+            PublishDebug(
+                blockTable, request, packedEnd,
+                protectedCount, 0, 0, 0x7FFF, 0x7FFF,
+                0x7FFFFFFF, 0x7FFFFFFF, -1, -1);
+            return;
         }
 
         uint32_t freeCount = 0;
@@ -946,8 +982,33 @@ public:
                     freeCount++, static_cast<int16_t>(slot));
             }
         }
+        if (debugStage_ == 4) {
+            PublishDebug(
+                blockTable, request, packedEnd,
+                protectedCount, freeCount, 0, 0x7FFF, 0x7FFF,
+                0x7FFFFFFF, 0x7FFFFFFF, -1, -1);
+            return;
+        }
+        if (debugStage_ == 5) {
+            Sync<AscendC::HardEvent::S_MTE3>();
+            CopyLocalToGlobalExact(
+                priorSlots_[requestShardBase],
+                freeSlots,
+                freeCount);
+            PublishDebug(
+                blockTable, request, packedEnd,
+                protectedCount, freeCount, 0, 0x7FFF, 0x7FFF,
+                0x7FFFFFFF, 0x7FFFFFFF, -1, -1);
+            return;
+        }
 
         uint32_t missCount = 0;
+        int32_t firstAssignedSlot = 0x7FFF;
+        int32_t lastAssignedSlot = 0x7FFF;
+        int32_t firstMissToken = 0x7FFFFFFF;
+        int32_t lastMissToken = 0x7FFFFFFF;
+        int32_t firstTarget = -1;
+        int32_t lastTarget = -1;
         for (uint32_t shard = 0; shard < shardCount_; ++shard) {
             const uint32_t count = shardCounts[shard];
             const uint32_t localOffset = shardOffsets[shard];
@@ -973,6 +1034,20 @@ public:
                         static_cast<int64_t>(physicalBlock)
                                 * blockSize_
                             + blockOffset);
+                    const int32_t target =
+                        physicalBlock
+                            * static_cast<int32_t>(blockSize_)
+                        + static_cast<int32_t>(blockOffset);
+                    if (missCount == 0) {
+                        firstAssignedSlot =
+                            static_cast<int32_t>(slot);
+                        firstMissToken = token;
+                        firstTarget = target;
+                    }
+                    lastAssignedSlot =
+                        static_cast<int32_t>(slot);
+                    lastMissToken = token;
+                    lastTarget = target;
                     overwritten.SetValue(
                         logicalSlot, static_cast<uint8_t>(1));
                     ++missCount;
@@ -980,6 +1055,15 @@ public:
                 packedPriorSlots.SetValue(
                     localOffset + index, slot);
             }
+        }
+        if (debugStage_ == 6) {
+            PublishDebug(
+                blockTable, request, packedEnd,
+                protectedCount, freeCount, missCount,
+                firstAssignedSlot, lastAssignedSlot,
+                firstMissToken, lastMissToken,
+                firstTarget, lastTarget);
+            return;
         }
         Sync<AscendC::HardEvent::S_MTE3>();
         for (uint32_t shard = 0; shard < shardCount_; ++shard) {
@@ -991,25 +1075,108 @@ public:
                 packedPriorSlots[shardOffsets[shard]],
                 shardCounts[shard]);
         }
+        if (debugStage_ == 7) {
+            PublishDebug(
+                blockTable, request, packedEnd,
+                protectedCount, freeCount, missCount,
+                firstAssignedSlot, lastAssignedSlot,
+                firstMissToken, lastMissToken,
+                firstTarget, lastTarget);
+            return;
+        }
         CopyLocalToGlobalExact(
             overwrittenSlots_[requestOffset],
             overwritten,
             capacity_);
+        if (debugStage_ == 8) {
+            PublishDebug(
+                blockTable, request, packedEnd,
+                protectedCount, freeCount, missCount,
+                firstAssignedSlot, lastAssignedSlot,
+                firstMissToken, lastMissToken,
+                firstTarget, lastTarget);
+            return;
+        }
         CopyLocalToGlobalExact(
             missTokens_[requestOffset],
             missTokens,
             missCount);
+        if (debugStage_ == 9) {
+            PublishDebug(
+                blockTable, request, packedEnd,
+                protectedCount, freeCount, missCount,
+                firstAssignedSlot, lastAssignedSlot,
+                firstMissToken, lastMissToken,
+                firstTarget, lastTarget);
+            return;
+        }
         CopyLocalToGlobalExact(
             targetSlots_[requestOffset],
             targetSlots,
             missCount);
+        if (debugStage_ == 10) {
+            PublishDebug(
+                blockTable, request, packedEnd,
+                protectedCount, freeCount, missCount,
+                firstAssignedSlot, lastAssignedSlot,
+                firstMissToken, lastMissToken,
+                firstTarget, lastTarget);
+            return;
+        }
         // One cacheline per request prevents count false sharing.
         missCounts_.SetValue(
             static_cast<uint64_t>(request) * missCountStride_,
             static_cast<int32_t>(missCount));
+        if (debugStage_ == 11) {
+            PublishDebug(
+                blockTable, request, packedEnd,
+                protectedCount, freeCount, missCount,
+                firstAssignedSlot, lastAssignedSlot,
+                firstMissToken, lastMissToken,
+                firstTarget, lastTarget);
+        }
     }
 
 private:
+    __aicore__ inline void PublishDebug(
+        AscendC::LocalTensor<int32_t> debug,
+        uint32_t request,
+        uint32_t packedEnd,
+        uint32_t protectedCount,
+        uint32_t freeCount,
+        uint32_t missCount,
+        int32_t firstAssignedSlot,
+        int32_t lastAssignedSlot,
+        int32_t firstMissToken,
+        int32_t lastMissToken,
+        int32_t firstTarget,
+        int32_t lastTarget)
+    {
+        debug.SetValue(0, static_cast<int32_t>(0x52534631));
+        debug.SetValue(1, static_cast<int32_t>(debugStage_));
+        debug.SetValue(2, static_cast<int32_t>(shardCount_));
+        debug.SetValue(3, static_cast<int32_t>(capacity_));
+        debug.SetValue(4, static_cast<int32_t>(packedEnd));
+        debug.SetValue(5, static_cast<int32_t>(protectedCount));
+        debug.SetValue(6, static_cast<int32_t>(freeCount));
+        debug.SetValue(7, static_cast<int32_t>(missCount));
+        debug.SetValue(8, firstAssignedSlot);
+        debug.SetValue(9, lastAssignedSlot);
+        debug.SetValue(10, firstMissToken);
+        debug.SetValue(11, lastMissToken);
+        debug.SetValue(12, firstTarget);
+        debug.SetValue(13, lastTarget);
+        debug.SetValue(14, static_cast<int32_t>(blockTableEntries_));
+        debug.SetValue(15, static_cast<int32_t>(blockSize_));
+        Sync<AscendC::HardEvent::S_MTE3>();
+        AscendC::DataCopy(
+            debugInfo_[
+                static_cast<uint64_t>(request)
+                    * kResidentFinalizeDebugInts],
+            debug,
+            kResidentFinalizeDebugInts);
+    }
+
     AscendC::GlobalTensor<int32_t> shardPacked_;
     AscendC::GlobalTensor<int32_t> shardCounts_;
     AscendC::GlobalTensor<int16_t> priorSlots_;
@@ -1018,6 +1185,7 @@ private:
     AscendC::GlobalTensor<int32_t> missCounts_;
     AscendC::GlobalTensor<int64_t> targetSlots_;
     AscendC::GlobalTensor<int32_t> requestBlockTable_;
+    AscendC::GlobalTensor<int32_t> debugInfo_;
     AscendC::TPipe pipe_;
     AscendC::TBuf<AscendC::TPosition::VECCALC> protectedBuf_;
     AscendC::TBuf<AscendC::TPosition::VECCALC> freeSlotBuf_;
@@ -1037,6 +1205,7 @@ private:
     uint32_t blockTableWidth_ = 0;
     uint32_t blockSize_ = 0;
     uint32_t blockTableEntries_ = 0;
+    uint32_t debugStage_ = 0;
 };
 
 class DSAResidentSortedUpdateKernel {
@@ -1484,6 +1653,7 @@ dsa_resident_sorted_finalize_kernel(
     __gm__ int32_t* missCounts,
     __gm__ int64_t* targetSlots,
     __gm__ int32_t* requestBlockTable,
+    __gm__ int32_t* debugInfo,
     uint32_t requestCount,
     uint32_t shardCount,
     uint32_t capacity,
@@ -1491,15 +1661,17 @@ dsa_resident_sorted_finalize_kernel(
     uint32_t shardCountRequestStride,
     uint32_t missCountStride,
     uint32_t blockTableWidth,
-    uint32_t blockSize)
+    uint32_t blockSize,
+    uint32_t debugStage)
 {
     DSAResidentSortedFinalizeKernel op;
     op.Init(
         shardPacked, shardCounts, priorSlots, overwrittenSlots,
         missTokens, missCounts, targetSlots,
-        requestBlockTable, requestCount, shardCount, capacity,
+        requestBlockTable, debugInfo,
+        requestCount, shardCount, capacity,
         shardCountStride, shardCountRequestStride, missCountStride,
-        blockTableWidth, blockSize);
+        blockTableWidth, blockSize, debugStage);
     op.Process();
 }
 
@@ -1633,9 +1805,10 @@ void dsa_resident_sorted_plan_impl(
         static_cast<int32_t*>(missCounts),
         static_cast<int64_t*>(targetSlots),
         static_cast<int32_t*>(requestBlockTable),
+        static_cast<int32_t*>(missCounts),
         requestCount, shardCount, capacity, shardCountStride,
         shardCountRequestStride, missCountStride,
-        blockTableWidth, blockSize);
+        blockTableWidth, blockSize, 0);
     dsa_resident_sorted_update_kernel<<<
         requestCount * shardCount, nullptr, stream>>>(
         static_cast<int32_t*>(topkIndices),
@@ -1688,6 +1861,7 @@ void dsa_resident_sorted_finalize_debug_impl(
     void* missCounts,
     void* targetSlots,
     void* requestBlockTable,
+    void* debugInfo,
     uint32_t requestCount,
     uint32_t shardCount,
     uint32_t capacity,
@@ -1695,7 +1869,8 @@ void dsa_resident_sorted_finalize_debug_impl(
     uint32_t shardCountRequestStride,
     uint32_t missCountStride,
     uint32_t blockTableWidth,
-    uint32_t blockSize)
+    uint32_t blockSize,
+    uint32_t debugStage)
 {
     // Test-only boundary isolation: launch the exact production finalize
     // kernel without launching the following state-update/remap kernel.
@@ -1709,9 +1884,10 @@ void dsa_resident_sorted_finalize_debug_impl(
         static_cast<int32_t*>(missCounts),
         static_cast<int64_t*>(targetSlots),
         static_cast<int32_t*>(requestBlockTable),
+        static_cast<int32_t*>(debugInfo),
         requestCount, shardCount, capacity, shardCountStride,
         shardCountRequestStride, missCountStride,
-        blockTableWidth, blockSize);
+        blockTableWidth, blockSize, debugStage);
 }
 
 }  // namespace vllm_ascend

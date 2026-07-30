@@ -277,7 +277,9 @@ at::Tensor npu_dsa_resident_sorted_finalize_debug_meta(
     at::Tensor &miss_counts,
     at::Tensor &target_slots,
     const at::Tensor &request_block_table,
-    int64_t block_size)
+    at::Tensor &debug_info,
+    int64_t block_size,
+    int64_t debug_stage)
 {
     (void)shard_packed;
     (void)shard_counts;
@@ -286,7 +288,9 @@ at::Tensor npu_dsa_resident_sorted_finalize_debug_meta(
     (void)miss_tokens;
     (void)target_slots;
     (void)request_block_table;
+    (void)debug_info;
     (void)block_size;
+    (void)debug_stage;
     return miss_counts;
 }
 

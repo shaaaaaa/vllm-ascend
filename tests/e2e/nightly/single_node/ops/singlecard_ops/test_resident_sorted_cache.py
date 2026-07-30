@@ -2,6 +2,7 @@ import pytest
 import torch
 
 from vllm_ascend.distributed.kv_transfer.sparse_offload.resident_sorted_cache import (
+    RESIDENT_FINALIZE_DEBUG_INTS,
     RESIDENT_READ_PROBE_DEBUG_INTS,
     allocate_sorted_resident_state,
     allocate_sorted_resident_workspace,
@@ -417,6 +418,141 @@ def test_kernel_read_probe_matches_full_capacity_union_output(mtp):
             assert nonnegative == int(
                 (host_prior[shard, :expected_count] >= 0).sum()
             )
+
+
+@pytest.mark.parametrize(
+    "mtp,debug_stage",
+    [
+        pytest.param(mtp, stage, id=f"mtp{mtp}-stage{stage}")
+        for mtp in (1, 2)
+        for stage in range(1, 12)
+    ],
+)
+def test_finalize_kernel_internal_stage_at_full_capacity(
+    mtp,
+    debug_stage,
+):
+    """Stop inside finalize and validate the first observable bad stage."""
+    requests = 1
+    shard_count = resident_shard_count(mtp)
+    capacity = mtp * 2048
+    source = (
+        torch.arange(capacity, dtype=torch.int32)
+        .mul(shard_count)
+        .reshape(mtp, 1, 2048)
+    )
+    values = source.npu()
+    boundaries = torch.full(
+        (mtp,),
+        int(source.max()) + 1,
+        dtype=torch.int32,
+        device="npu",
+    )
+    row_requests = torch.zeros(mtp, dtype=torch.int32, device="npu")
+    request_states = torch.zeros(1, dtype=torch.int32, device="npu")
+    request_generations = torch.ones(1, dtype=torch.int64, device="npu")
+    workspace = allocate_sorted_resident_workspace(
+        requests, mtp, device=torch.device("npu")
+    )
+    state = allocate_sorted_resident_state(
+        requests, requests, mtp, device=torch.device("npu")
+    )
+    block_table = torch.arange(
+        capacity // 128, dtype=torch.int32, device="npu"
+    ).reshape(1, -1)
+    debug_info = torch.full(
+        (requests, RESIDENT_FINALIZE_DEBUG_INTS),
+        -1,
+        dtype=torch.int32,
+        device="npu",
+    )
+
+    prepare_resident_sharded_union_(
+        values,
+        boundaries,
+        row_requests,
+        request_states,
+        request_generations,
+        state,
+        workspace,
+        mtp=mtp,
+    )
+    debug_sorted_resident_finalize_only_(
+        block_table,
+        workspace,
+        block_size=128,
+        debug_info=debug_info,
+        debug_stage=debug_stage,
+    )
+    torch.npu.synchronize()
+
+    debug = debug_info[0].cpu()
+    packed = workspace.shard_packed[0, 0, :capacity].cpu()
+    fields = {
+        "stage": int(debug[1]),
+        "packed_end": int(debug[4]),
+        "protected_count": int(debug[5]),
+        "free_count": int(debug[6]),
+        "miss_count": int(debug[7]),
+        "first_slot": int(debug[8]),
+        "last_slot": int(debug[9]),
+        "first_token": int(debug[10]),
+        "last_token": int(debug[11]),
+        "first_target": int(debug[12]),
+        "last_target": int(debug[13]),
+    }
+    print(
+        "\n[resident-finalize-internal-stage]"
+        f" mtp={mtp}"
+        f" requested_stage={debug_stage}"
+        f" fields={fields}"
+    )
+    assert int(debug[0]) == 0x52534631
+    assert fields["stage"] == debug_stage
+    assert int(debug[2]) == shard_count
+    assert int(debug[3]) == capacity
+    assert fields["packed_end"] == capacity
+
+    if debug_stage >= 2:
+        assert fields["protected_count"] == 0
+    if debug_stage == 3:
+        assert torch.all(
+            workspace.prior_slots[0, 0, :capacity].cpu() == 0
+        )
+    if debug_stage >= 4:
+        assert fields["free_count"] == capacity
+    if debug_stage == 5:
+        assert (
+            workspace.prior_slots[0, 0, :capacity].cpu().tolist()
+            == list(range(capacity))
+        )
+    if debug_stage >= 6:
+        assert fields["miss_count"] == capacity
+        assert fields["first_slot"] == 0
+        assert fields["last_slot"] == capacity - 1
+        assert fields["first_token"] == int(packed[0])
+        assert fields["last_token"] == int(packed[-1])
+        assert fields["first_target"] == 0
+        assert fields["last_target"] == capacity - 1
+    if debug_stage >= 7:
+        assert (
+            workspace.prior_slots[0, 0, :capacity].cpu().tolist()
+            == list(range(capacity))
+        )
+    if debug_stage >= 8:
+        assert torch.all(workspace.overwritten_slots[0].cpu() == 1)
+    if debug_stage >= 9:
+        assert torch.equal(
+            workspace.miss_tokens[0, :capacity].cpu(),
+            packed,
+        )
+    if debug_stage >= 10:
+        assert (
+            workspace.target_slots[0, :capacity].cpu().tolist()
+            == list(range(capacity))
+        )
+    if debug_stage >= 11:
+        assert int(workspace.miss_counts[0, 0].cpu()) == capacity
 
 
 @pytest.mark.parametrize("mtp", [1, 2])

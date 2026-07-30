@@ -19,6 +19,7 @@ RESIDENT_COUNT_CACHELINE_INTS = 16
 RESIDENT_GENERATION_CACHELINE_LONGS = 8
 INDEX_TOPK = 2048
 RESIDENT_READ_PROBE_DEBUG_INTS = 32
+RESIDENT_FINALIZE_DEBUG_INTS = 16
 
 
 def resident_shard_count(mtp: int) -> int:
@@ -248,6 +249,8 @@ def debug_sorted_resident_finalize_only_(
     workspace: SortedResidentWorkspace,
     *,
     block_size: int,
+    debug_info: torch.Tensor | None = None,
+    debug_stage: int = 0,
 ) -> None:
     """Test-only: run the exact finalize kernel without state update/remap."""
     try:
@@ -258,6 +261,8 @@ def debug_sorted_resident_finalize_only_(
         raise RuntimeError(
             "vllm_ascend_C does not expose the sorted resident finalize debug op; rebuild the extension"
         ) from error
+    if debug_info is None:
+        debug_info = workspace.miss_counts
     op(
         workspace.shard_packed,
         workspace.shard_counts,
@@ -267,5 +272,7 @@ def debug_sorted_resident_finalize_only_(
         workspace.miss_counts,
         workspace.target_slots,
         request_block_table,
+        debug_info,
         block_size,
+        debug_stage,
     )
