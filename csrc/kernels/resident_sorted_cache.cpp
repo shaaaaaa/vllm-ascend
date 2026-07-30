@@ -390,7 +390,7 @@ public:
 
         auto sortedInt = src.ReinterpretCast<int32_t>();
         uint32_t rank = 0;
-        if (!deduplicate_) {
+        if (selectedElements > 0 && !deduplicate_) {
             // MTP=1 is unique by contract. Keep this as a separate loop so
             // the launch-time MTP choice does not add a branch per token.
             for (uint32_t i = 0; i < selectedElements; ++i) {
@@ -404,7 +404,7 @@ public:
                     original, static_cast<int16_t>(rank));
                 ++rank;
             }
-        } else {
+        } else if (selectedElements > 0) {
             int32_t previous = -1;
             for (uint32_t i = 0; i < selectedElements; ++i) {
                 const int32_t token =
@@ -470,22 +470,26 @@ public:
         Sync<AscendC::HardEvent::MTE2_S>();
 
         uint32_t oldIndex = 0;
-        for (uint32_t currentIndex = 0;
-             currentIndex < rank;
-             ++currentIndex) {
-            const int32_t token =
-                sortedTokens.GetValue(currentIndex);
-            while (
-                oldIndex < oldCount &&
-                oldTokens.GetValue(oldIndex) < token) {
-                ++oldIndex;
+        if (rank > 0) {
+            for (uint32_t currentIndex = 0;
+                 currentIndex < rank;
+                 ++currentIndex) {
+                const int32_t token =
+                    sortedTokens.GetValue(currentIndex);
+                if (oldIndex < oldCount) {
+                    while (
+                        oldIndex < oldCount &&
+                        oldTokens.GetValue(oldIndex) < token) {
+                        ++oldIndex;
+                    }
+                }
+                const int16_t slot =
+                    oldIndex < oldCount &&
+                        oldTokens.GetValue(oldIndex) == token
+                    ? oldSlots.GetValue(oldIndex)
+                    : static_cast<int16_t>(-1);
+                priorSlots.SetValue(currentIndex, slot);
             }
-            const int16_t slot =
-                oldIndex < oldCount &&
-                    oldTokens.GetValue(oldIndex) == token
-                ? oldSlots.GetValue(oldIndex)
-                : static_cast<int16_t>(-1);
-            priorSlots.SetValue(currentIndex, slot);
         }
         if (!generationMatches) {
             stateCounts_.SetValue(stateCountOffset, 0);
@@ -721,11 +725,13 @@ public:
             Sync<AscendC::HardEvent::MTE2_S>();
             uint32_t bulkNegative = 0;
             uint32_t bulkNonnegative = 0;
-            for (uint32_t index = 0; index < safeCount; ++index) {
-                if (priorLocal.GetValue(index) < 0) {
-                    ++bulkNegative;
-                } else {
-                    ++bulkNonnegative;
+            if (safeCount > 0) {
+                for (uint32_t index = 0; index < safeCount; ++index) {
+                    if (priorLocal.GetValue(index) < 0) {
+                        ++bulkNegative;
+                    } else {
+                        ++bulkNonnegative;
+                    }
                 }
             }
             if (safeCount > 0) {
@@ -951,15 +957,17 @@ public:
         for (uint32_t shard = 0; shard < shardCount_; ++shard) {
             const uint32_t count = shardCounts[shard];
             const uint32_t localOffset = shardOffsets[shard];
-            for (uint32_t index = 0; index < count; ++index) {
-                const int16_t slot =
-                    packedPriorSlots.GetValue(
-                        localOffset + index);
-                if (slot >= 0) {
-                    protectedSlots.SetValue(
-                        static_cast<uint32_t>(slot),
-                        static_cast<int16_t>(1));
-                    ++protectedCount;
+            if (count > 0) {
+                for (uint32_t index = 0; index < count; ++index) {
+                    const int16_t slot =
+                        packedPriorSlots.GetValue(
+                            localOffset + index);
+                    if (slot >= 0) {
+                        protectedSlots.SetValue(
+                            static_cast<uint32_t>(slot),
+                            static_cast<int16_t>(1));
+                        ++protectedCount;
+                    }
                 }
             }
         }
@@ -1022,48 +1030,50 @@ public:
         for (uint32_t shard = 0; shard < shardCount_; ++shard) {
             const uint32_t count = shardCounts[shard];
             const uint32_t localOffset = shardOffsets[shard];
-            for (uint32_t index = 0; index < count; ++index) {
-                int16_t slot =
-                    packedPriorSlots.GetValue(
-                        localOffset + index);
-                if (slot < 0) {
-                    slot = freeSlots.GetValue(missCount);
-                    const int32_t token =
-                        packedTokens.GetValue(localOffset + index);
-                    missTokens.SetValue(missCount, token);
-                    const uint32_t logicalSlot =
-                        static_cast<uint32_t>(slot);
-                    const uint32_t logicalBlock =
-                        logicalSlot / blockSize_;
-                    const uint32_t blockOffset =
-                        logicalSlot % blockSize_;
-                    const int32_t physicalBlock =
-                        blockTable.GetValue(logicalBlock);
-                    targetSlots.SetValue(
-                        missCount,
-                        static_cast<int64_t>(physicalBlock)
-                                * blockSize_
-                            + blockOffset);
-                    const int32_t target =
-                        physicalBlock
-                            * static_cast<int32_t>(blockSize_)
-                        + static_cast<int32_t>(blockOffset);
-                    if (missCount == 0) {
-                        firstAssignedSlot =
+            if (count > 0) {
+                for (uint32_t index = 0; index < count; ++index) {
+                    int16_t slot =
+                        packedPriorSlots.GetValue(
+                            localOffset + index);
+                    if (slot < 0) {
+                        slot = freeSlots.GetValue(missCount);
+                        const int32_t token =
+                            packedTokens.GetValue(localOffset + index);
+                        missTokens.SetValue(missCount, token);
+                        const uint32_t logicalSlot =
+                            static_cast<uint32_t>(slot);
+                        const uint32_t logicalBlock =
+                            logicalSlot / blockSize_;
+                        const uint32_t blockOffset =
+                            logicalSlot % blockSize_;
+                        const int32_t physicalBlock =
+                            blockTable.GetValue(logicalBlock);
+                        targetSlots.SetValue(
+                            missCount,
+                            static_cast<int64_t>(physicalBlock)
+                                    * blockSize_
+                                + blockOffset);
+                        const int32_t target =
+                            physicalBlock
+                                * static_cast<int32_t>(blockSize_)
+                            + static_cast<int32_t>(blockOffset);
+                        if (missCount == 0) {
+                            firstAssignedSlot =
+                                static_cast<int32_t>(slot);
+                            firstMissToken = token;
+                            firstTarget = target;
+                        }
+                        lastAssignedSlot =
                             static_cast<int32_t>(slot);
-                        firstMissToken = token;
-                        firstTarget = target;
+                        lastMissToken = token;
+                        lastTarget = target;
+                        overwritten.SetValue(
+                            logicalSlot, static_cast<uint8_t>(1));
+                        ++missCount;
                     }
-                    lastAssignedSlot =
-                        static_cast<int32_t>(slot);
-                    lastMissToken = token;
-                    lastTarget = target;
-                    overwritten.SetValue(
-                        logicalSlot, static_cast<uint8_t>(1));
-                    ++missCount;
+                    packedPriorSlots.SetValue(
+                        localOffset + index, slot);
                 }
-                packedPriorSlots.SetValue(
-                    localOffset + index, slot);
             }
         }
         if (debugStage_ == 6) {
@@ -1397,15 +1407,17 @@ public:
         Sync<AscendC::HardEvent::MTE2_S>();
 
         uint32_t survivorCount = 0;
-        for (uint32_t index = 0; index < oldCount; ++index) {
-            const int16_t slot = oldSlots.GetValue(index);
-            if (slot >= 0 &&
-                overwritten.GetValue(
-                    static_cast<uint32_t>(slot)) == 0) {
-                survivorTokens.SetValue(
-                    survivorCount, oldTokens.GetValue(index));
-                survivorSlots.SetValue(survivorCount, slot);
-                ++survivorCount;
+        if (oldCount > 0) {
+            for (uint32_t index = 0; index < oldCount; ++index) {
+                const int16_t slot = oldSlots.GetValue(index);
+                if (slot >= 0 &&
+                    overwritten.GetValue(
+                        static_cast<uint32_t>(slot)) == 0) {
+                    survivorTokens.SetValue(
+                        survivorCount, oldTokens.GetValue(index));
+                    survivorSlots.SetValue(survivorCount, slot);
+                    ++survivorCount;
+                }
             }
         }
 
@@ -1415,43 +1427,47 @@ public:
         uint32_t oldIndex = 0;
         uint32_t currentIndex = 0;
         uint32_t mergedCount = 0;
-        while (oldIndex < survivorCount ||
-               currentIndex < currentCount) {
-            while (currentIndex < currentCount) {
-                const int16_t slot =
-                    priorSlots.GetValue(currentIndex);
-                if (slot >= 0 &&
-                    overwritten.GetValue(
-                        static_cast<uint32_t>(slot)) != 0) {
+        if (survivorCount > 0 || currentCount > 0) {
+            while (oldIndex < survivorCount ||
+                   currentIndex < currentCount) {
+                if (currentIndex < currentCount) {
+                    while (currentIndex < currentCount) {
+                        const int16_t slot =
+                            priorSlots.GetValue(currentIndex);
+                        if (slot >= 0 &&
+                            overwritten.GetValue(
+                                static_cast<uint32_t>(slot)) != 0) {
+                            break;
+                        }
+                        ++currentIndex;
+                    }
+                }
+                const bool haveOld = oldIndex < survivorCount;
+                const bool haveMiss = currentIndex < currentCount;
+                if (!haveOld && !haveMiss) {
                     break;
                 }
-                ++currentIndex;
+                const int32_t oldToken = haveOld
+                    ? survivorTokens.GetValue(oldIndex)
+                    : static_cast<int32_t>(0x7FFFFFFF);
+                const int32_t missToken = haveMiss
+                    ? currentTokens.GetValue(currentIndex)
+                    : static_cast<int32_t>(0x7FFFFFFF);
+                if (haveOld && (!haveMiss || oldToken < missToken)) {
+                    mergedTokens.SetValue(mergedCount, oldToken);
+                    mergedSlots.SetValue(
+                        mergedCount,
+                        survivorSlots.GetValue(oldIndex));
+                    ++oldIndex;
+                } else {
+                    mergedTokens.SetValue(mergedCount, missToken);
+                    mergedSlots.SetValue(
+                        mergedCount,
+                        priorSlots.GetValue(currentIndex));
+                    ++currentIndex;
+                }
+                ++mergedCount;
             }
-            const bool haveOld = oldIndex < survivorCount;
-            const bool haveMiss = currentIndex < currentCount;
-            if (!haveOld && !haveMiss) {
-                break;
-            }
-            const int32_t oldToken = haveOld
-                ? survivorTokens.GetValue(oldIndex)
-                : static_cast<int32_t>(0x7FFFFFFF);
-            const int32_t missToken = haveMiss
-                ? currentTokens.GetValue(currentIndex)
-                : static_cast<int32_t>(0x7FFFFFFF);
-            if (haveOld && (!haveMiss || oldToken < missToken)) {
-                mergedTokens.SetValue(mergedCount, oldToken);
-                mergedSlots.SetValue(
-                    mergedCount,
-                    survivorSlots.GetValue(oldIndex));
-                ++oldIndex;
-            } else {
-                mergedTokens.SetValue(mergedCount, missToken);
-                mergedSlots.SetValue(
-                    mergedCount,
-                    priorSlots.GetValue(currentIndex));
-                ++currentIndex;
-            }
-            ++mergedCount;
         }
 
         Sync<AscendC::HardEvent::S_MTE3>();
