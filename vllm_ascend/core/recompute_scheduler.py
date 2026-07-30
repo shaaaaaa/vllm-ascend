@@ -501,6 +501,27 @@ class RecomputeScheduler(Scheduler):
                         request.num_external_computed_tokens = ext_tokens
                         num_external_computed_tokens = ext_tokens
 
+                        if load_kv_async:
+                            logger.info(
+                                "[DSA_COLD_DIAG] scheduler_admission "
+                                "scheduler=%s req=%s request_tokens=%d "
+                                "local_tokens=%d external_tokens=%d "
+                                "connector_compact_capable=%s "
+                                "compact_forwarded=false reason=argument_omitted",
+                                type(self).__name__,
+                                request_id,
+                                request.num_tokens,
+                                num_new_local_computed_tokens,
+                                num_external_computed_tokens,
+                                bool(
+                                    getattr(
+                                        self.connector,
+                                        "supports_dsa_compact_external_load",
+                                        False,
+                                    )
+                                ),
+                            )
+
                         connector_prefix_cache_queries = request.num_tokens - num_new_local_computed_tokens
                         connector_prefix_cache_hits = num_external_computed_tokens
 
@@ -595,6 +616,19 @@ class RecomputeScheduler(Scheduler):
                     delay_cache_blocks=load_kv_async,
                     num_encoder_tokens=num_encoder_tokens,
                 )
+
+                if load_kv_async:
+                    logger.info(
+                        "[DSA_COLD_DIAG] scheduler_allocation "
+                        "scheduler=%s req=%s result=%s "
+                        "num_new_tokens=%d external_tokens=%d "
+                        "delay_cache_blocks=true compact_forwarded=false",
+                        type(self).__name__,
+                        request_id,
+                        "success" if new_blocks is not None else "no_space",
+                        num_new_tokens,
+                        num_external_computed_tokens,
+                    )
 
                 if new_blocks is None:
                     # The request cannot be scheduled.
