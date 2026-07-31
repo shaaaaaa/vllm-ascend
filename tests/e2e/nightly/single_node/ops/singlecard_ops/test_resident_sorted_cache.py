@@ -1039,6 +1039,112 @@ def test_sorted_resident_matches_three_step_reference(mtp):
 
 
 @pytest.mark.parametrize("mtp", [1, 2])
+def test_fused_sorted_resident_matches_three_step_reference(mtp):
+    """Validate fused update+remap across misses, hits, and replacements."""
+    requests = 1
+    shard_count = resident_shard_count(mtp)
+    capacity = mtp * 2048
+    block_size = 128
+    boundary = 100_000
+    workspace = allocate_sorted_resident_workspace(
+        requests,
+        mtp,
+        device=torch.device("npu"),
+    )
+    state = allocate_sorted_resident_state(
+        requests,
+        requests,
+        mtp,
+        device=torch.device("npu"),
+    )
+    row_requests = torch.zeros(
+        requests * mtp,
+        dtype=torch.int32,
+        device="npu",
+    )
+    boundaries = torch.full(
+        (requests * mtp,),
+        boundary,
+        dtype=torch.int32,
+        device="npu",
+    )
+    request_states = torch.zeros(
+        requests,
+        dtype=torch.int32,
+        device="npu",
+    )
+    request_generations = torch.ones(
+        requests,
+        dtype=torch.int64,
+        device="npu",
+    )
+    blocks_per_request = capacity // block_size
+    block_table = torch.arange(
+        requests * blocks_per_request,
+        dtype=torch.int32,
+        device="npu",
+    ).reshape(requests, blocks_per_request)
+
+    reference: dict[int, int] = {}
+    for offset in (0, 100, 0):
+        source = _source(mtp, offset)
+        values = source.npu()
+        prepare_resident_sharded_union_(
+            values,
+            boundaries,
+            row_requests,
+            request_states,
+            request_generations,
+            state,
+            workspace,
+            mtp=mtp,
+        )
+        expected_shards = _expected_shards(
+            source,
+            boundaries.cpu(),
+            requests,
+            mtp,
+            shard_count,
+        )[0]
+        reference, expected_misses, expected_slots = _reference_step(
+            expected_shards,
+            reference,
+            capacity,
+        )
+        prepare_sorted_resident_cache_fused_(
+            values,
+            block_table,
+            request_states,
+            request_generations,
+            state,
+            workspace,
+            block_size=block_size,
+        )
+        torch.npu.synchronize()
+
+        miss_count = int(workspace.miss_counts[0, 0].cpu())
+        assert (
+            workspace.miss_tokens[0, :miss_count].cpu().tolist()
+            == expected_misses
+        )
+        assert (
+            workspace.target_slots[0, :miss_count].cpu().tolist()
+            == expected_slots
+        )
+        overwritten = workspace.overwritten_slots[0].cpu()
+        assert overwritten.dtype == torch.uint8
+        assert int(overwritten.max()) <= 1
+        assert int(overwritten.sum()) == miss_count
+        assert _state_dict(state, 0, shard_count) == reference
+
+        remapped = values.reshape(-1).cpu().tolist()
+        original = source.reshape(-1).tolist()
+        for position, token in enumerate(original):
+            expected = reference[token] if token < boundary else token
+            assert remapped[position] == expected
+
+
+@pytest.mark.parametrize("mtp", [1, 2])
 def test_split_plan_preserves_topk_until_standalone_remap(mtp):
     requests = 1
     shard_count = resident_shard_count(mtp)
