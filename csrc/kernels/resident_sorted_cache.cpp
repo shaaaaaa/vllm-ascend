@@ -31,9 +31,9 @@ constexpr uint32_t kResidentProbeDebugInts = 32;
 constexpr uint32_t kResidentFinalizeDebugInts = 16;
 
 // Temporary compile-time bisect for the original fused update+remap kernel.
-// Reproduce the first failing bisect state: keep both GM-to-UB copies and
-// their MTE2-to-vector synchronization, but compile out vector work and
-// everything after the loop.
+// Extend the first failing bisect state by one dependency only: keep both
+// GM-to-UB copies and MTE2-to-vector synchronization, then additionally wait
+// for MTE2 on the scalar pipeline. Compile out vector work and post-loop work.
 #define DSA_RESIDENT_FUSED_REMAP_BISECT_SKIP_POST_LOOP 1
 #define DSA_RESIDENT_FUSED_REMAP_BISECT_SKIP_AFTER_MAPPING_LOAD 1
 
@@ -1718,9 +1718,9 @@ private:
         AscendC::PipeBarrier<PIPE_V>();
 
 #if DSA_RESIDENT_FUSED_REMAP_BISECT_SKIP_AFTER_MAPPING_LOAD
-        // Match the first failing load-quarter experiment exactly: issue both
-        // GM-to-UB copies and the original MTE2-to-vector synchronization,
-        // with no scalar probes, vector consumers, or reverse reuse fence.
+        // Add only MTE2-to-scalar synchronization to the first failing
+        // load-quarter experiment. Keep scalar probes, vector consumers, and
+        // reverse reuse fences disabled.
         for (uint32_t shard = 0; shard < shardCount_; ++shard) {
             const uint32_t count = static_cast<uint32_t>(
                 shardCounts_.GetValue(
@@ -1744,6 +1744,7 @@ private:
                     + static_cast<uint64_t>(shard) * capacity_],
                 count);
             Sync<AscendC::HardEvent::MTE2_V>();
+            Sync<AscendC::HardEvent::MTE2_S>();
         }
 #else
         const AscendC::DataCopyParams mappingCopy{
