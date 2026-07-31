@@ -1717,15 +1717,6 @@ private:
             accumulatedSlots, static_cast<int32_t>(-1), partWidth);
         AscendC::PipeBarrier<PIPE_V>();
 
-        // Retain the explicit-params form from the preceding experiment so
-        // this revision changes only whether a dynamic shard loop surrounds
-        // the copy. DataCopyParams::blockLen is in 32-byte datablocks.
-        const AscendC::DataCopyParams mappingCopy{
-            1,
-            static_cast<uint16_t>(
-                partWidth * sizeof(int16_t) / kDataBlockBytes),
-            0,
-            0};
 #if DSA_RESIDENT_FUSED_REMAP_BISECT_SKIP_AFTER_MAPPING_LOAD
         // The no-loop single-copy experiment passed. Restore the exact dynamic
         // loop, but explicitly complete each MTE2 write before the following
@@ -1741,17 +1732,23 @@ private:
             if (count == 0) {
                 continue;
             }
-            AscendC::DataCopy(
+            CopyGlobalToLocalExact(
                 mappingOrGathered,
                 shardMapping_[
                     mappingBase
                     + static_cast<uint64_t>(shard) * requestWidth_
                     + begin],
-                mappingCopy);
+                partWidth);
             Sync<AscendC::HardEvent::MTE2_S>();
             Sync<AscendC::HardEvent::S_MTE2>();
         }
 #else
+        const AscendC::DataCopyParams mappingCopy{
+            1,
+            static_cast<uint16_t>(
+                partWidth * sizeof(int16_t) / kDataBlockBytes),
+            0,
+            0};
         for (uint32_t shard = 0; shard < shardCount_; ++shard) {
             const uint32_t count = static_cast<uint32_t>(
                 shardCounts_.GetValue(

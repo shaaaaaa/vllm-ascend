@@ -1111,8 +1111,8 @@ def test_split_plan_preserves_topk_until_standalone_remap(mtp):
 
 
 @pytest.mark.parametrize("mtp", [1, 2])
-def test_fused_remap_bisect_synced_mapping_loop_does_not_crash(mtp):
-    """Exercise repeated mapping copies with explicit UB-reuse dependency."""
+def test_fused_remap_bisect_synced_exact_copy_loop_does_not_crash(mtp):
+    """Exercise CopyGlobalToLocalExact with explicit UB-reuse dependency."""
     requests = 1
     shard_count = resident_shard_count(mtp)
     capacity = mtp * 2048
