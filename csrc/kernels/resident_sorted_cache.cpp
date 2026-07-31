@@ -30,13 +30,6 @@ constexpr uint32_t kMaxResidentShards = 4;
 constexpr uint32_t kResidentProbeDebugInts = 32;
 constexpr uint32_t kResidentFinalizeDebugInts = 16;
 
-// Temporary compile-time bisect for the original fused update+remap kernel.
-// Extend the first failing bisect state by one dependency only: keep both
-// GM-to-UB copies and MTE2-to-vector synchronization, then additionally wait
-// for MTE2 on the scalar pipeline. Compile out vector work and post-loop work.
-#define DSA_RESIDENT_FUSED_REMAP_BISECT_SKIP_POST_LOOP 1
-#define DSA_RESIDENT_FUSED_REMAP_BISECT_SKIP_AFTER_MAPPING_LOAD 1
-
 template <AscendC::HardEvent event>
 __aicore__ inline void Sync()
 {
@@ -1717,10 +1710,6 @@ private:
             accumulatedSlots, static_cast<int32_t>(-1), partWidth);
         AscendC::PipeBarrier<PIPE_V>();
 
-#if DSA_RESIDENT_FUSED_REMAP_BISECT_SKIP_AFTER_MAPPING_LOAD
-        // Add only MTE2-to-scalar synchronization to the first failing
-        // load-quarter experiment. Keep scalar probes, vector consumers, and
-        // reverse reuse fences disabled.
         for (uint32_t shard = 0; shard < shardCount_; ++shard) {
             const uint32_t count = static_cast<uint32_t>(
                 shardCounts_.GetValue(
@@ -1745,38 +1734,6 @@ private:
                 count);
             Sync<AscendC::HardEvent::MTE2_V>();
             Sync<AscendC::HardEvent::MTE2_S>();
-        }
-#else
-        const AscendC::DataCopyParams mappingCopy{
-            1,
-            static_cast<uint16_t>(
-                partWidth * sizeof(int16_t) / kDataBlockBytes),
-            0,
-            0};
-        for (uint32_t shard = 0; shard < shardCount_; ++shard) {
-            const uint32_t count = static_cast<uint32_t>(
-                shardCounts_.GetValue(
-                    static_cast<uint64_t>(request)
-                        * shardCountRequestStride_
-                    + shard * shardCountStride_));
-            if (count == 0) {
-                continue;
-            }
-
-            AscendC::DataCopy(
-                mappingOrGathered,
-                shardMapping_[
-                    mappingBase
-                    + static_cast<uint64_t>(shard) * requestWidth_
-                    + begin],
-                mappingCopy);
-            CopyGlobalToLocalExact(
-                shardSlots,
-                priorSlots_[
-                    requestShardBase
-                    + static_cast<uint64_t>(shard) * capacity_],
-                count);
-            Sync<AscendC::HardEvent::MTE2_V>();
 
             // Atlas A2 has no direct int16 -> int32 Cast. Convert through
             // float, which exactly represents every int16 rank and slot.
@@ -1853,9 +1810,7 @@ private:
             // the vector pipeline has consumed them.
             Sync<AscendC::HardEvent::V_MTE2>();
         }
-#endif
 
-#if !DSA_RESIDENT_FUSED_REMAP_BISECT_SKIP_POST_LOOP
         // Preserve unselected/split-boundary positions exactly as the old
         // resident remapper does; selected positions receive their slot.
         AscendC::Maxs(
@@ -1885,7 +1840,6 @@ private:
             topkIndices_[requestOffset + begin],
             ranksOrOutput,
             partWidth);
-#endif
     }
 
     AscendC::GlobalTensor<int32_t> topkIndices_;

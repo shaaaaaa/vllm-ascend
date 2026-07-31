@@ -1112,7 +1112,7 @@ def test_split_plan_preserves_topk_until_standalone_remap(mtp):
 
 @pytest.mark.parametrize("mtp", [1, 2])
 def test_fused_remap_bisect_synced_exact_copy_loop_does_not_crash(mtp):
-    """Exercise the failing two-load state plus MTE2-to-scalar sync."""
+    """Exercise the complete fused remap with per-shard MTE2 scalar sync."""
     requests = 1
     shard_count = resident_shard_count(mtp)
     capacity = mtp * 2048
@@ -1171,10 +1171,9 @@ def test_fused_remap_bisect_synced_exact_copy_loop_does_not_crash(mtp):
     )
     torch.npu.synchronize()
 
-    # The compile-time bisect adds only MTE2-to-scalar synchronization to the
-    # original two-load failure. Scalar/vector work and final writeback remain
-    # disabled, so every position retains its original token.
-    assert values.reshape(-1).cpu().tolist() == source.reshape(-1).tolist()
+    assert values.reshape(-1).cpu().tolist() == [
+        reference[token] for token in source.reshape(-1).tolist()
+    ]
     miss_count = int(workspace.miss_counts[0, 0].cpu())
     assert workspace.miss_tokens[0, :miss_count].cpu().tolist() == expected_misses
     assert workspace.target_slots[0, :miss_count].cpu().tolist() == expected_slots
