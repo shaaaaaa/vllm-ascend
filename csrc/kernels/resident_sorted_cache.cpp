@@ -1718,11 +1718,9 @@ private:
         AscendC::PipeBarrier<PIPE_V>();
 
 #if DSA_RESIDENT_FUSED_REMAP_BISECT_SKIP_AFTER_MAPPING_LOAD
-        // The no-loop single-copy experiment passed. Restore the exact dynamic
-        // loop, but explicitly complete each MTE2 write before the following
-        // iteration reuses the same UB destination. This distinguishes a
-        // missing reuse dependency in the earlier reduced test from loop
-        // control-flow codegen.
+        // Restore both GM-to-UB copies from the original loop, then complete
+        // them with one shared MTE2-to-scalar-to-MTE2 fence before either UB
+        // destination is reused by the following iteration.
         for (uint32_t shard = 0; shard < shardCount_; ++shard) {
             const uint32_t count = static_cast<uint32_t>(
                 shardCounts_.GetValue(
@@ -1739,6 +1737,12 @@ private:
                     + static_cast<uint64_t>(shard) * requestWidth_
                     + begin],
                 partWidth);
+            CopyGlobalToLocalExact(
+                shardSlots,
+                priorSlots_[
+                    requestShardBase
+                    + static_cast<uint64_t>(shard) * capacity_],
+                count);
             Sync<AscendC::HardEvent::MTE2_S>();
             Sync<AscendC::HardEvent::S_MTE2>();
         }
