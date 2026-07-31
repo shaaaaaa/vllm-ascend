@@ -31,9 +31,8 @@ constexpr uint32_t kResidentProbeDebugInts = 32;
 constexpr uint32_t kResidentFinalizeDebugInts = 16;
 
 // Temporary compile-time bisect for the original fused update+remap kernel.
-// Keep only the shard-mapping GM-to-UB copies and their explicit
-// inter-iteration reuse dependency; compile out the prior-slot copy, vector
-// work, and everything after the loop.
+// Keep both GM-to-UB copies plus synchronized scalar UB probes; compile out
+// vector work and everything after the loop.
 #define DSA_RESIDENT_FUSED_REMAP_BISECT_SKIP_POST_LOOP 1
 #define DSA_RESIDENT_FUSED_REMAP_BISECT_SKIP_AFTER_MAPPING_LOAD 1
 
@@ -1718,9 +1717,9 @@ private:
         AscendC::PipeBarrier<PIPE_V>();
 
 #if DSA_RESIDENT_FUSED_REMAP_BISECT_SKIP_AFTER_MAPPING_LOAD
-        // Restore both GM-to-UB copies from the original loop, then complete
-        // them with one shared MTE2-to-scalar-to-MTE2 fence before either UB
-        // destination is reused by the following iteration.
+        // Restore both GM-to-UB copies from the original loop. Probe one value
+        // from each UB destination through the scalar pipeline and write it
+        // back unchanged, then complete the scalar-to-MTE2 reuse dependency.
         for (uint32_t shard = 0; shard < shardCount_; ++shard) {
             const uint32_t count = static_cast<uint32_t>(
                 shardCounts_.GetValue(
@@ -1744,6 +1743,12 @@ private:
                     + static_cast<uint64_t>(shard) * capacity_],
                 count);
             Sync<AscendC::HardEvent::MTE2_S>();
+            const int16_t mappingHead =
+                mappingOrGathered.GetValue(0);
+            const int16_t slotTail =
+                shardSlots.GetValue(count - 1);
+            mappingOrGathered.SetValue(0, mappingHead);
+            shardSlots.SetValue(count - 1, slotTail);
             Sync<AscendC::HardEvent::S_MTE2>();
         }
 #else

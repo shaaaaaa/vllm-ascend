@@ -1112,7 +1112,7 @@ def test_split_plan_preserves_topk_until_standalone_remap(mtp):
 
 @pytest.mark.parametrize("mtp", [1, 2])
 def test_fused_remap_bisect_synced_exact_copy_loop_does_not_crash(mtp):
-    """Exercise CopyGlobalToLocalExact with explicit UB-reuse dependency."""
+    """Exercise two exact copies plus a synchronized scalar UB round trip."""
     requests = 1
     shard_count = resident_shard_count(mtp)
     capacity = mtp * 2048
@@ -1180,9 +1180,9 @@ def test_fused_remap_bisect_synced_exact_copy_loop_does_not_crash(mtp):
     )
     torch.npu.synchronize()
 
-    # The compile-time bisect keeps count lookup and only the first GM-to-UB
-    # copy in each iteration. It removes the prior-slot copy, syncs, vector
-    # work, and final writeback, so every position retains its original token.
+    # The compile-time bisect keeps count lookup, both GM-to-UB copies, and
+    # synchronized no-op scalar reads/writes. Vector work and final writeback
+    # remain disabled, so every position retains its original token.
     assert values.reshape(-1).cpu().tolist() == source.reshape(-1).tolist()
     miss_count = int(workspace.miss_counts[0, 0].cpu())
     assert workspace.miss_tokens[0, :miss_count].cpu().tolist() == expected_misses
