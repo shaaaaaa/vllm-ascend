@@ -1942,6 +1942,199 @@ at::Tensor npu_dsa_resident_sorted_plan_no_remap_(
         block_size, dummy_state_base, false);
 }
 
+at::Tensor npu_dsa_resident_finalize_coordinator_(
+    at::Tensor &shard_counts,
+    at::Tensor &miss_counts)
+{
+    const auto device = shard_counts.device();
+    TORCH_CHECK(
+        shard_counts.is_privateuseone() &&
+            miss_counts.device() == device,
+        "resident finalize coordinator tensors must share one NPU device");
+    TORCH_CHECK(
+        shard_counts.scalar_type() == at::kInt &&
+            miss_counts.scalar_type() == at::kInt,
+        "resident finalize coordinator expects int32 tensors");
+    TORCH_CHECK(
+        shard_counts.is_contiguous() && miss_counts.is_contiguous(),
+        "resident finalize coordinator tensors must be contiguous");
+    TORCH_CHECK(
+        shard_counts.dim() == 3 && miss_counts.dim() == 2,
+        "resident finalize coordinator tensor ranks are invalid");
+    const int64_t request_count = shard_counts.size(0);
+    const int64_t shard_count = shard_counts.size(1);
+    const int64_t shard_count_stride = shard_counts.size(2);
+    const int64_t shard_count_request_stride =
+        shard_count * shard_count_stride;
+    const int64_t miss_count_stride = miss_counts.size(1);
+    TORCH_CHECK(
+        request_count > 0 &&
+            (shard_count == 2 || shard_count == 4) &&
+            shard_count_stride >= 16 &&
+            miss_counts.size(0) == request_count &&
+            miss_count_stride >= 16,
+        "resident finalize coordinator shapes are invalid");
+    TORCH_CHECK(
+        reinterpret_cast<std::uintptr_t>(
+            shard_counts.data_ptr()) % 64 == 0 &&
+            reinterpret_cast<std::uintptr_t>(
+                miss_counts.data_ptr()) % 64 == 0,
+        "resident finalize coordinator records must be 64-byte aligned");
+
+    const c10_npu::OptionalNPUGuard npu_guard(device);
+    aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
+    void* shard_count_ptr = shard_counts.data_ptr();
+    void* miss_count_ptr = miss_counts.data_ptr();
+    at_npu::native::OpCommand cmd;
+    cmd.Name("npu_dsa_resident_finalize_coordinator_");
+    cmd.SetCustomHandler([
+        stream, shard_count_ptr, miss_count_ptr,
+        request_count, shard_count, shard_count_stride,
+        shard_count_request_stride, miss_count_stride]() -> int {
+        dsa_resident_finalize_coordinator_impl(
+            stream, shard_count_ptr, miss_count_ptr,
+            static_cast<uint32_t>(request_count),
+            static_cast<uint32_t>(shard_count),
+            static_cast<uint32_t>(shard_count_stride),
+            static_cast<uint32_t>(shard_count_request_stride),
+            static_cast<uint32_t>(miss_count_stride));
+        return 0;
+    });
+    cmd.Run();
+    return miss_counts;
+}
+
+at::Tensor npu_dsa_resident_sharded_finalize_worker_(
+    const at::Tensor &shard_counts,
+    at::Tensor &prior_slots,
+    const at::Tensor &shard_miss_tokens,
+    const at::Tensor &shard_miss_positions,
+    const at::Tensor &shard_evictable_slots,
+    at::Tensor &miss_tokens,
+    at::Tensor &target_slots,
+    const at::Tensor &request_block_table,
+    int64_t block_size)
+{
+    const auto device = shard_counts.device();
+    TORCH_CHECK(
+        shard_counts.is_privateuseone() &&
+            prior_slots.device() == device &&
+            shard_miss_tokens.device() == device &&
+            shard_miss_positions.device() == device &&
+            shard_evictable_slots.device() == device &&
+            miss_tokens.device() == device &&
+            target_slots.device() == device &&
+            request_block_table.device() == device,
+        "resident sharded finalize tensors must share one NPU device");
+    TORCH_CHECK(
+        shard_counts.scalar_type() == at::kInt &&
+            prior_slots.scalar_type() == at::kShort &&
+            shard_miss_tokens.scalar_type() == at::kInt &&
+            shard_miss_positions.scalar_type() == at::kShort &&
+            shard_evictable_slots.scalar_type() == at::kShort &&
+            miss_tokens.scalar_type() == at::kInt &&
+            target_slots.scalar_type() == at::kLong &&
+            request_block_table.scalar_type() == at::kInt,
+        "resident sharded finalize tensor dtypes are invalid");
+    TORCH_CHECK(
+        shard_counts.is_contiguous() &&
+            prior_slots.is_contiguous() &&
+            shard_miss_tokens.is_contiguous() &&
+            shard_miss_positions.is_contiguous() &&
+            shard_evictable_slots.is_contiguous() &&
+            miss_tokens.is_contiguous() &&
+            target_slots.is_contiguous() &&
+            request_block_table.is_contiguous(),
+        "resident sharded finalize tensors must be contiguous");
+    TORCH_CHECK(
+        shard_counts.dim() == 3 &&
+            prior_slots.dim() == 3 &&
+            shard_miss_tokens.dim() == 3 &&
+            shard_miss_positions.dim() == 3 &&
+            shard_evictable_slots.dim() == 3 &&
+            miss_tokens.dim() == 2 &&
+            target_slots.dim() == 2 &&
+            request_block_table.dim() == 2,
+        "resident sharded finalize tensor ranks are invalid");
+    const int64_t request_count = prior_slots.size(0);
+    const int64_t shard_count = prior_slots.size(1);
+    const int64_t capacity = prior_slots.size(2);
+    const int64_t shard_count_stride = shard_counts.size(2);
+    const int64_t shard_count_request_stride =
+        shard_counts.size(1) * shard_count_stride;
+    const int64_t block_table_width = request_block_table.size(1);
+    TORCH_CHECK(
+        request_count > 0 &&
+            (shard_count == 2 || shard_count == 4) &&
+            capacity > 0 && capacity <= 32768 &&
+            capacity % (16 * shard_count) == 0 &&
+            shard_counts.size(0) == request_count &&
+            shard_counts.size(1) == shard_count &&
+            shard_count_stride >= 16 &&
+            shard_miss_tokens.sizes() == prior_slots.sizes() &&
+            shard_miss_positions.sizes() == prior_slots.sizes() &&
+            shard_evictable_slots.sizes() == prior_slots.sizes() &&
+            miss_tokens.size(0) == request_count &&
+            miss_tokens.size(1) == capacity &&
+            target_slots.sizes() == miss_tokens.sizes() &&
+            request_block_table.size(0) >= request_count &&
+            block_size > 0 &&
+            block_table_width * block_size >= capacity,
+        "resident sharded finalize shapes are invalid");
+    TORCH_CHECK(
+        reinterpret_cast<std::uintptr_t>(
+            shard_counts.data_ptr()) % 64 == 0 &&
+            reinterpret_cast<std::uintptr_t>(
+                prior_slots.data_ptr()) % 64 == 0 &&
+            reinterpret_cast<std::uintptr_t>(
+                shard_miss_tokens.data_ptr()) % 64 == 0 &&
+            reinterpret_cast<std::uintptr_t>(
+                shard_miss_positions.data_ptr()) % 64 == 0 &&
+            reinterpret_cast<std::uintptr_t>(
+                shard_evictable_slots.data_ptr()) % 64 == 0 &&
+            reinterpret_cast<std::uintptr_t>(
+                miss_tokens.data_ptr()) % 64 == 0 &&
+            reinterpret_cast<std::uintptr_t>(
+                target_slots.data_ptr()) % 64 == 0,
+        "resident sharded finalize outputs must be 64-byte aligned");
+
+    const c10_npu::OptionalNPUGuard npu_guard(device);
+    aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
+    void* shard_count_ptr = shard_counts.data_ptr();
+    void* prior_slot_ptr = prior_slots.data_ptr();
+    void* shard_miss_token_ptr = shard_miss_tokens.data_ptr();
+    void* shard_miss_position_ptr = shard_miss_positions.data_ptr();
+    void* shard_evictable_slot_ptr = shard_evictable_slots.data_ptr();
+    void* miss_token_ptr = miss_tokens.data_ptr();
+    void* target_ptr = target_slots.data_ptr();
+    void* block_table_ptr = request_block_table.data_ptr();
+    at_npu::native::OpCommand cmd;
+    cmd.Name("npu_dsa_resident_sharded_finalize_worker_");
+    cmd.SetCustomHandler([
+        stream, shard_count_ptr, prior_slot_ptr,
+        shard_miss_token_ptr, shard_miss_position_ptr,
+        shard_evictable_slot_ptr, miss_token_ptr, target_ptr,
+        block_table_ptr, request_count, shard_count, capacity,
+        shard_count_stride, shard_count_request_stride,
+        block_table_width, block_size]() -> int {
+        dsa_resident_sharded_finalize_worker_impl(
+            stream, shard_count_ptr, prior_slot_ptr,
+            shard_miss_token_ptr, shard_miss_position_ptr,
+            shard_evictable_slot_ptr, miss_token_ptr, target_ptr,
+            block_table_ptr,
+            static_cast<uint32_t>(request_count),
+            static_cast<uint32_t>(shard_count),
+            static_cast<uint32_t>(capacity),
+            static_cast<uint32_t>(shard_count_stride),
+            static_cast<uint32_t>(shard_count_request_stride),
+            static_cast<uint32_t>(block_table_width),
+            static_cast<uint32_t>(block_size));
+        return 0;
+    });
+    cmd.Run();
+    return miss_tokens;
+}
+
 at::Tensor npu_dsa_resident_sorted_update_debug_(
     at::Tensor &topk_indices,
     const at::Tensor &shard_packed,
@@ -3651,6 +3844,24 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "npu_dsa_resident_sorted_plan_no_remap_",
         torch::kPrivateUse1,
         &vllm_ascend::npu_dsa_resident_sorted_plan_no_remap_);
+    ops.def(
+        "npu_dsa_resident_finalize_coordinator_("
+        "Tensor(a!) shard_counts, Tensor(b!) miss_counts) -> Tensor(b!)");
+    ops.impl(
+        "npu_dsa_resident_finalize_coordinator_",
+        torch::kPrivateUse1,
+        &vllm_ascend::npu_dsa_resident_finalize_coordinator_);
+    ops.def(
+        "npu_dsa_resident_sharded_finalize_worker_("
+        "Tensor shard_counts, Tensor(a!) prior_slots, "
+        "Tensor shard_miss_tokens, Tensor shard_miss_positions, "
+        "Tensor shard_evictable_slots, Tensor(b!) miss_tokens, "
+        "Tensor(c!) target_slots, Tensor request_block_table, "
+        "int block_size) -> Tensor(b!)");
+    ops.impl(
+        "npu_dsa_resident_sharded_finalize_worker_",
+        torch::kPrivateUse1,
+        &vllm_ascend::npu_dsa_resident_sharded_finalize_worker_);
     ops.def(
         "npu_dsa_resident_sorted_update_debug_("
         "Tensor(a!) topk_indices, Tensor shard_packed, "

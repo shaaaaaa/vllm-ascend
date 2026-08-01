@@ -278,6 +278,36 @@ at::Tensor npu_dsa_resident_sorted_remap_meta(
     return topk_indices;
 }
 
+at::Tensor npu_dsa_resident_finalize_coordinator_meta(
+    at::Tensor &shard_counts,
+    at::Tensor &miss_counts)
+{
+    (void)shard_counts;
+    return miss_counts;
+}
+
+at::Tensor npu_dsa_resident_sharded_finalize_worker_meta(
+    const at::Tensor &shard_counts,
+    at::Tensor &prior_slots,
+    const at::Tensor &shard_miss_tokens,
+    const at::Tensor &shard_miss_positions,
+    const at::Tensor &shard_evictable_slots,
+    at::Tensor &miss_tokens,
+    at::Tensor &target_slots,
+    const at::Tensor &request_block_table,
+    int64_t block_size)
+{
+    (void)shard_counts;
+    (void)prior_slots;
+    (void)shard_miss_tokens;
+    (void)shard_miss_positions;
+    (void)shard_evictable_slots;
+    (void)target_slots;
+    (void)request_block_table;
+    (void)block_size;
+    return miss_tokens;
+}
+
 at::Tensor npu_dsa_resident_sorted_update_debug_meta(
     at::Tensor &topk_indices,
     const at::Tensor &shard_packed,
@@ -991,6 +1021,12 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
     ops.impl(
         "npu_dsa_resident_sorted_plan_no_remap_",
         &vllm_ascend::meta::npu_dsa_resident_sorted_plan_meta);
+    ops.impl(
+        "npu_dsa_resident_finalize_coordinator_",
+        &vllm_ascend::meta::npu_dsa_resident_finalize_coordinator_meta);
+    ops.impl(
+        "npu_dsa_resident_sharded_finalize_worker_",
+        &vllm_ascend::meta::npu_dsa_resident_sharded_finalize_worker_meta);
     ops.impl(
         "npu_dsa_resident_sorted_update_debug_",
         &vllm_ascend::meta::npu_dsa_resident_sorted_update_debug_meta);

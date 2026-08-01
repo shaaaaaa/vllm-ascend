@@ -356,6 +356,76 @@ def prepare_sorted_resident_cache_fused_(
     )
 
 
+def coordinate_sorted_resident_finalize_(
+    workspace: SortedResidentWorkspace,
+) -> None:
+    """Compute only request-global shard prefixes and allocation counts."""
+    try:
+        op = torch.ops._C_ascend.npu_dsa_resident_finalize_coordinator_
+    except AttributeError as error:
+        raise RuntimeError(
+            "vllm_ascend_C does not expose the resident finalize coordinator; rebuild the extension"
+        ) from error
+    op(workspace.shard_counts, workspace.miss_counts)
+
+
+def run_sharded_resident_finalize_(
+    request_block_table: torch.Tensor,
+    workspace: SortedResidentWorkspace,
+    *,
+    block_size: int,
+) -> None:
+    """Assign slots and emit compact LMCache payloads in parallel."""
+    try:
+        op = torch.ops._C_ascend.npu_dsa_resident_sharded_finalize_worker_
+    except AttributeError as error:
+        raise RuntimeError(
+            "vllm_ascend_C does not expose the sharded resident finalize worker; rebuild the extension"
+        ) from error
+    op(
+        workspace.shard_counts,
+        workspace.prior_slots,
+        workspace.shard_miss_tokens,
+        workspace.shard_miss_positions,
+        workspace.shard_evictable_slots,
+        workspace.miss_tokens,
+        workspace.target_slots,
+        request_block_table,
+        block_size,
+    )
+
+
+def prepare_sorted_resident_cache_coordinated_(
+    topk_indices: torch.Tensor,
+    request_block_table: torch.Tensor,
+    request_state_indices: torch.Tensor,
+    request_state_generations: torch.Tensor,
+    state: SortedResidentState,
+    workspace: SortedResidentWorkspace,
+    *,
+    block_size: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Run the experimental tiny-coordinator, shard-worker planner."""
+    coordinate_sorted_resident_finalize_(workspace)
+    run_sharded_resident_finalize_(
+        request_block_table,
+        workspace,
+        block_size=block_size,
+    )
+    debug_sorted_resident_update_only_(
+        topk_indices,
+        request_state_indices,
+        request_state_generations,
+        state,
+        workspace,
+    )
+    return (
+        workspace.miss_tokens,
+        workspace.miss_counts[:, 0],
+        workspace.target_slots,
+    )
+
+
 def probe_sorted_resident_reads_(
     workspace: SortedResidentWorkspace,
     debug_info: torch.Tensor,

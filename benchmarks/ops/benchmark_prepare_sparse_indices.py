@@ -10,11 +10,14 @@ from vllm_ascend.distributed.kv_transfer.sparse_offload.prepare_sparse_indices i
 from vllm_ascend.distributed.kv_transfer.sparse_offload.resident_sorted_cache import (
     allocate_sorted_resident_state,
     allocate_sorted_resident_workspace,
+    coordinate_sorted_resident_finalize_,
     debug_sorted_resident_finalize_only_,
     debug_sorted_resident_update_only_,
     prepare_resident_sharded_union_,
+    prepare_sorted_resident_cache_coordinated_,
     prepare_sorted_resident_cache_fused_,
     resident_shard_count,
+    run_sharded_resident_finalize_,
 )
 from vllm_ascend.utils import enable_custom_op
 
@@ -888,6 +891,35 @@ def main(
         resident_sharded_union()
         resident_fused_finalize()
 
+    def resident_finalize_coordinator():
+        assert resident_union_workspace is not None
+        coordinate_sorted_resident_finalize_(resident_union_workspace)
+
+    def resident_sharded_finalize_worker():
+        assert resident_union_workspace is not None
+        run_sharded_resident_finalize_(
+            block_table,
+            resident_union_workspace,
+            block_size=block_size,
+        )
+
+    def resident_coordinated_plan():
+        assert resident_union_workspace is not None
+        assert resident_union_state is not None
+        prepare_sorted_resident_cache_coordinated_(
+            resident_union_values,
+            block_table,
+            resident_request_states,
+            resident_request_generations,
+            resident_union_state,
+            resident_union_workspace,
+            block_size=block_size,
+        )
+
+    def resident_coordinated_end_to_end():
+        resident_sharded_union()
+        resident_coordinated_plan()
+
     pair_baselines = mtp == 2
     native_unique_baseline = mtp in (2, 3)
     if not pair_baselines:
@@ -1105,6 +1137,7 @@ def main(
         )
 
         resident_finalize_debug = torch.empty((request_batch, 16), dtype=torch.int32, device="npu")
+
         def resident_finalize_only():
             debug_sorted_resident_finalize_only_(
                 block_table,
@@ -1148,6 +1181,41 @@ def main(
             mtp=mtp,
         )
 
+        # Validate the experimental decomposition from the same union/state
+        # seed, then retain the coordinator output for isolated worker timing.
+        resident_union_values.copy_(source)
+        restore_resident_state()
+        resident_union_workspace.shard_packed.copy_(resident_union_seed[0])
+        resident_union_workspace.shard_mapping.copy_(resident_union_seed[1])
+        resident_union_workspace.shard_counts.copy_(resident_union_seed[2])
+        resident_union_workspace.prior_slots.copy_(resident_union_seed[3])
+        resident_union_workspace.shard_miss_tokens.copy_(resident_union_seed[4])
+        resident_union_workspace.shard_miss_positions.copy_(resident_union_seed[5])
+        resident_union_workspace.shard_evictable_slots.copy_(resident_union_seed[6])
+        resident_finalize_coordinator()
+        torch.npu.synchronize()
+        resident_coordinator_seed = resident_union_workspace.shard_counts.clone()
+        resident_sharded_finalize_worker()
+        torch.npu.synchronize()
+        if resident_union_workspace.miss_counts[:, 0].cpu().tolist() != [resident_expected_misses] * request_batch:
+            raise AssertionError("coordinated resident finalize emitted an incorrect miss count")
+        coordinated_selected_evicts = resident_union_workspace.shard_counts[:, :, 4].sum(dim=1).cpu().tolist()
+        if coordinated_selected_evicts != [resident_selected_evicts] * request_batch:
+            raise AssertionError(
+                "resident coordinator selected an incorrect evict prefix: "
+                f"actual={coordinated_selected_evicts}, "
+                f"expected={resident_selected_evicts}"
+            )
+        resident_update_only()
+        torch.npu.synchronize()
+        _validate_resident_remap(
+            source,
+            sharded_boundary,
+            resident_union_values,
+            resident_union_state,
+            mtp=mtp,
+        )
+
         def restore_resident_union_seed():
             resident_union_workspace.shard_packed.copy_(resident_union_seed[0])
             resident_union_workspace.shard_mapping.copy_(resident_union_seed[1])
@@ -1162,6 +1230,13 @@ def main(
             restore_resident_state()
 
         def reset_resident_finalize():
+            resident_union_workspace.prior_slots.copy_(resident_union_seed[3])
+
+        def reset_resident_coordinator():
+            resident_union_workspace.shard_counts.copy_(resident_union_seed[2])
+
+        def reset_resident_sharded_finalize():
+            resident_union_workspace.shard_counts.copy_(resident_coordinator_seed)
             resident_union_workspace.prior_slots.copy_(resident_union_seed[3])
 
         def reset_resident_update():
@@ -1302,9 +1377,13 @@ def main(
     resident_union_samples = []
     resident_no_intersection_samples = []
     resident_finalize_samples = []
+    resident_coordinator_samples = []
+    resident_sharded_finalize_samples = []
     resident_update_samples = []
     resident_plan_samples = []
+    resident_coordinated_plan_samples = []
     resident_end_to_end_samples = []
+    resident_coordinated_end_to_end_samples = []
     if resident_union_workspace is not None:
         resident_union_samples = _measure_npu_ms(
             resident_sharded_union,
@@ -1324,6 +1403,18 @@ def main(
             warmups,
             iterations,
         )
+        resident_coordinator_samples = _measure_npu_ms(
+            resident_finalize_coordinator,
+            reset_resident_coordinator,
+            warmups,
+            iterations,
+        )
+        resident_sharded_finalize_samples = _measure_npu_ms(
+            resident_sharded_finalize_worker,
+            reset_resident_sharded_finalize,
+            warmups,
+            iterations,
+        )
         resident_update_samples = _measure_npu_ms(
             resident_update_only,
             reset_resident_update,
@@ -1336,8 +1427,20 @@ def main(
             warmups,
             iterations,
         )
+        resident_coordinated_plan_samples = _measure_npu_ms(
+            resident_coordinated_plan,
+            reset_resident_plan,
+            warmups,
+            iterations,
+        )
         resident_end_to_end_samples = _measure_npu_ms(
             resident_end_to_end,
+            reset_resident_end_to_end,
+            warmups,
+            iterations,
+        )
+        resident_coordinated_end_to_end_samples = _measure_npu_ms(
+            resident_coordinated_end_to_end,
             reset_resident_end_to_end,
             warmups,
             iterations,
@@ -1390,12 +1493,28 @@ def main(
             "scratch_full=True"
         )
         _summary("resident-finalize-kernel", resident_finalize_samples)
+        _summary("resident-coordinator-kernel", resident_coordinator_samples)
+        _summary(
+            "resident-sharded-finalize-kernel",
+            resident_sharded_finalize_samples,
+        )
         _summary("resident-update+remap-kernel", resident_update_samples)
         _summary("resident-plan-two-kernel", resident_plan_samples)
+        _summary(
+            "resident-coordinated-three-kernel",
+            resident_coordinated_plan_samples,
+        )
         _summary("resident-end-to-end", resident_end_to_end_samples)
+        _summary(
+            "resident-coordinated-end-to-end",
+            resident_coordinated_end_to_end_samples,
+        )
         resident_finalize_mean = statistics.fmean(resident_finalize_samples)
         resident_update_mean = statistics.fmean(resident_update_samples)
         resident_plan_mean = statistics.fmean(resident_plan_samples)
+        resident_coordinator_mean = statistics.fmean(resident_coordinator_samples)
+        resident_sharded_finalize_mean = statistics.fmean(resident_sharded_finalize_samples)
+        resident_coordinated_plan_mean = statistics.fmean(resident_coordinated_plan_samples)
         resident_isolated_sum = resident_finalize_mean + resident_update_mean
         slower_stage = "finalize" if resident_finalize_mean >= resident_update_mean else "update+remap"
         print(
@@ -1404,6 +1523,17 @@ def main(
             f"update+remap={resident_update_mean / resident_isolated_sum:.2%}, "
             f"slower={slower_stage}, "
             f"isolated_sum-plan={resident_isolated_sum - resident_plan_mean:+.6f} ms"
+        )
+        coordinated_isolated_sum = resident_coordinator_mean + resident_sharded_finalize_mean + resident_update_mean
+        print(
+            "resident coordinated breakdown: "
+            f"coordinator={resident_coordinator_mean:.6f} ms, "
+            f"sharded_finalize={resident_sharded_finalize_mean:.6f} ms, "
+            f"update+remap={resident_update_mean:.6f} ms, "
+            f"isolated_sum-plan="
+            f"{coordinated_isolated_sum - resident_coordinated_plan_mean:+.6f} ms, "
+            f"plan_delta_vs_original="
+            f"{resident_coordinated_plan_mean - resident_plan_mean:+.6f} ms"
         )
         print(
             "resident intersection-only overhead: "
