@@ -1844,7 +1844,7 @@ def test_parallel_v2_assigns_cross_shard_evict_slots(mtp):
         torch.tensor(stale_tokens, dtype=torch.int32, device="npu")
     )
     state.slots[0, 0, :5].copy_(
-        torch.arange(5, dtype=torch.int16, device="npu")
+        torch.arange(5, dtype=torch.int16).npu()
     )
     state.counts[0, 0, 0] = 5
     state.generations[0, 0] = 3
