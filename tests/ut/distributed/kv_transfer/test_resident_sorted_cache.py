@@ -13,8 +13,10 @@ from vllm_ascend.distributed.kv_transfer.sparse_offload.resident_sorted_cache im
     "mtp,capacity,shard_count,shard_count_override",
     [
         (1, 2048, 2, None),
+        (1, 2048, 1, 1),
         (1, 2048, 4, 4),
         (2, 4096, 4, None),
+        (2, 4096, 2, 2),
         (2, 4096, 8, 8),
     ],
 )

@@ -16,6 +16,7 @@ from vllm_ascend.distributed.kv_transfer.sparse_offload.resident_sorted_cache im
     prepare_resident_sharded_union_,
     prepare_sorted_resident_cache_coordinated_,
     prepare_sorted_resident_cache_fused_,
+    resident_shard_count,
     run_sharded_resident_finalize_,
 )
 from vllm_ascend.utils import enable_custom_op
@@ -599,6 +600,31 @@ def resident_only_main(
     )
 
 
+def _resolve_benchmark_shard_count(
+    mtp: int,
+    shards_per_row: int | None,
+    *,
+    default: int,
+    topk: int,
+) -> int:
+    """Apply one row-partition override without changing path defaults."""
+    if shards_per_row is None:
+        return default
+    shard_count = mtp * shards_per_row
+    minimum_shard_count = 1 << (mtp - 1).bit_length()
+    if (
+        shard_count < minimum_shard_count
+        or shard_count > 8
+        or shard_count & (shard_count - 1)
+        or topk % shard_count
+    ):
+        raise ValueError(
+            "--shards-per-row must produce a power-of-two total shard count "
+            "between the MTP row minimum and 8"
+        )
+    return shard_count
+
+
 def main(
     topk: int = 2048,
     mtp: int = 2,
@@ -613,29 +639,30 @@ def main(
         raise ValueError("the sharded benchmark supports --mtp from 1 to 8")
     if not enable_custom_op():
         raise RuntimeError("vllm-ascend custom operators could not be loaded")
-    default_shard_count = 1 << (mtp - 1).bit_length()
-    shard_count = (
-        default_shard_count
-        if shards_per_row is None
-        else mtp * shards_per_row
+    default_value_shard_count = 1 << (mtp - 1).bit_length()
+    value_shard_count = _resolve_benchmark_shard_count(
+        mtp,
+        shards_per_row,
+        default=default_value_shard_count,
+        topk=topk,
     )
-    if (
-        shard_count < default_shard_count
-        or shard_count > 8
-        or shard_count & (shard_count - 1)
-        or topk % shard_count
-    ):
-        raise ValueError(
-            "--shards-per-row must produce a power-of-two total shard count "
-            "between the default and 8"
+    resident_shards = (
+        _resolve_benchmark_shard_count(
+            mtp,
+            shards_per_row,
+            default=resident_shard_count(mtp),
+            topk=topk,
         )
+        if mtp <= 2
+        else None
+    )
     print(
         f"MTP depth={mtp}, "
-        f"legacy value shards={default_shard_count}, "
+        f"legacy value shards={default_value_shard_count}, "
         f"benchmark shards/row={shards_per_row or 'default'}, "
-        f"benchmark total shards={shard_count}, "
-        f"approx elements/shard={mtp * topk // shard_count}, "
-        f"resident shards={shard_count if mtp <= 2 else 'n/a'}"
+        f"benchmark total shards={value_shard_count}, "
+        f"approx elements/shard={mtp * topk // value_shard_count}, "
+        f"resident shards={resident_shards if resident_shards is not None else 'n/a'}"
     )
     legacy_op = torch.ops._C_ascend.npu_dsa_prepare_sparse_indices_legacy_
     union_op = torch.ops._C_ascend.npu_dsa_staged_union_
@@ -727,17 +754,17 @@ def main(
     )
     sharded_sort_scratch = (
         torch.empty(
-            (request_batch, shard_count, topk),
+            (request_batch, value_shard_count, topk),
             dtype=torch.int32,
             device="npu",
         ),
         torch.empty(
-            (request_batch, shard_count, mtp * topk),
+            (request_batch, value_shard_count, mtp * topk),
             dtype=torch.int32,
             device="npu",
         ),
         torch.empty(
-            (request_batch, shard_count, 16),
+            (request_batch, value_shard_count, 16),
             dtype=torch.int32,
             device="npu",
         ),
@@ -747,7 +774,7 @@ def main(
         torch.empty_like(sharded_sort_scratch[1]),
         torch.empty_like(sharded_sort_scratch[2]),
         torch.empty(
-            (request_batch, shard_count, 2 * topk),
+            (request_batch, value_shard_count, 2 * topk),
             dtype=torch.int32,
             device="npu",
         ),
@@ -758,7 +785,7 @@ def main(
             request_batch,
             mtp,
             device=torch.device("npu"),
-            shard_count=shard_count,
+            shard_count=resident_shards,
         )
         if mtp <= 2
         else None
@@ -769,7 +796,7 @@ def main(
             request_batch,
             mtp,
             device=torch.device("npu"),
-            shard_count=shard_count,
+            shard_count=resident_shards,
         )
         if mtp <= 2
         else None
@@ -1112,7 +1139,7 @@ def main(
             request_batch=request_batch,
             valid_token_count=sharded_boundary,
             capacity=capacity,
-            shard_count=shard_count,
+            shard_count=resident_shards,
             hit_rate=resident_hit_rate,
         )
         resident_state_seed = (
@@ -1136,7 +1163,7 @@ def main(
         actual_misses = []
         for request in range(request_batch):
             request_misses = 0
-            for shard in range(shard_count):
+            for shard in range(resident_shards):
                 count = int(count_cpu[request, shard])
                 request_misses += int((prior_cpu[request, shard, :count] < 0).sum())
             actual_misses.append(request_misses)

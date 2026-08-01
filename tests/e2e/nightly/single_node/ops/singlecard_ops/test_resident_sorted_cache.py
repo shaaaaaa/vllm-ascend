@@ -1713,7 +1713,7 @@ def _coordinated_seed(current_shards, scenario):
 
 @pytest.mark.parametrize(
     "mtp,shard_count_override",
-    [(1, None), (1, 4), (2, None), (2, 8)],
+    [(1, None), (1, 1), (1, 4), (2, None), (2, 2), (2, 8)],
 )
 @pytest.mark.parametrize("scenario", ["empty", "resident90", "cross_shard"])
 def test_coordinated_finalize_matches_production(
@@ -1857,7 +1857,7 @@ def test_coordinated_finalize_matches_production(
 
 @pytest.mark.parametrize(
     "mtp,shard_count_override",
-    [(1, None), (1, 4), (2, None), (2, 8)],
+    [(1, None), (1, 1), (1, 4), (2, None), (2, 2), (2, 8)],
 )
 def test_coordinated_finalize_supports_graph_replay(
     mtp, shard_count_override
