@@ -26,7 +26,7 @@ constexpr uint32_t kInt16PerDataBlock =
     kDataBlockBytes / sizeof(int16_t);
 constexpr uint32_t kInt32PerCacheLine =
     kCacheLineBytes / sizeof(int32_t);
-constexpr uint32_t kMaxResidentShards = 4;
+constexpr uint32_t kMaxResidentShards = 8;
 
 // Existing union/finalize metadata. Keep the production fields unchanged and
 // use only the spare entries in each 16-int, cacheline-private shard record.

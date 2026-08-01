@@ -16,7 +16,6 @@ from vllm_ascend.distributed.kv_transfer.sparse_offload.resident_sorted_cache im
     prepare_resident_sharded_union_,
     prepare_sorted_resident_cache_coordinated_,
     prepare_sorted_resident_cache_fused_,
-    resident_shard_count,
     run_sharded_resident_finalize_,
 )
 from vllm_ascend.utils import enable_custom_op
@@ -636,7 +635,7 @@ def main(
         f"benchmark shards/row={shards_per_row or 'default'}, "
         f"benchmark total shards={shard_count}, "
         f"approx elements/shard={mtp * topk // shard_count}, "
-        f"resident shards={resident_shard_count(mtp) if mtp <= 2 else 'n/a'}"
+        f"resident shards={shard_count if mtp <= 2 else 'n/a'}"
     )
     legacy_op = torch.ops._C_ascend.npu_dsa_prepare_sparse_indices_legacy_
     union_op = torch.ops._C_ascend.npu_dsa_staged_union_
@@ -759,6 +758,7 @@ def main(
             request_batch,
             mtp,
             device=torch.device("npu"),
+            shard_count=shard_count,
         )
         if mtp <= 2
         else None
@@ -769,6 +769,7 @@ def main(
             request_batch,
             mtp,
             device=torch.device("npu"),
+            shard_count=shard_count,
         )
         if mtp <= 2
         else None
@@ -1111,7 +1112,7 @@ def main(
             request_batch=request_batch,
             valid_token_count=sharded_boundary,
             capacity=capacity,
-            shard_count=resident_shard_count(mtp),
+            shard_count=shard_count,
             hit_rate=resident_hit_rate,
         )
         resident_state_seed = (
@@ -1135,7 +1136,7 @@ def main(
         actual_misses = []
         for request in range(request_batch):
             request_misses = 0
-            for shard in range(resident_shard_count(mtp)):
+            for shard in range(shard_count):
                 count = int(count_cpu[request, shard])
                 request_misses += int((prior_cpu[request, shard, :count] < 0).sum())
             actual_misses.append(request_misses)

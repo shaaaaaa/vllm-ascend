@@ -9,19 +9,31 @@ from vllm_ascend.distributed.kv_transfer.sparse_offload.resident_sorted_cache im
 )
 
 
-@pytest.mark.parametrize("mtp,capacity,shard_count", [(1, 2048, 2), (2, 4096, 4)])
-def test_sorted_resident_allocations_are_cacheline_partitioned(mtp, capacity, shard_count):
+@pytest.mark.parametrize(
+    "mtp,capacity,shard_count,shard_count_override",
+    [
+        (1, 2048, 2, None),
+        (1, 2048, 4, 4),
+        (2, 4096, 4, None),
+        (2, 4096, 8, 8),
+    ],
+)
+def test_sorted_resident_allocations_are_cacheline_partitioned(
+    mtp, capacity, shard_count, shard_count_override
+):
     requests = 3
     state = allocate_sorted_resident_state(
         requests,
         requests,
         mtp,
         device=torch.device("cpu"),
+        shard_count=shard_count_override,
     )
     workspace = allocate_sorted_resident_workspace(
         requests,
         mtp,
         device=torch.device("cpu"),
+        shard_count=shard_count_override,
     )
 
     assert state.tokens.shape == (
@@ -87,6 +99,13 @@ def test_sorted_resident_rejects_unsupported_mtp_and_state_size():
         )
     with pytest.raises(ValueError, match="MTP=1 or MTP=2"):
         resident_shard_count(3)
+    with pytest.raises(ValueError, match="power of two from 1 to 8"):
+        allocate_sorted_resident_workspace(
+            1,
+            2,
+            device=torch.device("cpu"),
+            shard_count=16,
+        )
 
 
 @pytest.mark.parametrize("mtp", [1, 2])

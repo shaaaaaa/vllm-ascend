@@ -1490,13 +1490,10 @@ at::Tensor resident_sharded_union_common_(
     TORCH_CHECK(
         mtp >= 1 && mtp <= 2 && rows_per_request == mtp,
         "resident sharded union currently requires MTP=1 or MTP=2");
-    int64_t expected_shard_count = 1;
-    while (expected_shard_count <= mtp) {
-        expected_shard_count <<= 1;
-    }
     TORCH_CHECK(
         row_width == 2048 &&
-            shard_count == expected_shard_count &&
+            shard_count >= 1 && shard_count <= 8 &&
+            (shard_count & (shard_count - 1)) == 0 &&
             shard_capacity == request_width &&
             request_width % (16 * shard_count) == 0 &&
             split_boundary.numel() >= row_count &&
@@ -1760,15 +1757,12 @@ static at::Tensor resident_sorted_plan_common_(
     const int64_t miss_count_stride = miss_counts.size(1);
     const int64_t generation_stride = state_generations.size(1);
     const int64_t block_table_width = request_block_table.size(1);
-    int64_t expected_shard_count = 1;
-    while (expected_shard_count <= rows_per_request) {
-        expected_shard_count <<= 1;
-    }
     TORCH_CHECK(
         rows_per_request >= 1 && rows_per_request <= 2 &&
             row_width == 2048 &&
             capacity == request_width &&
-            shard_count == expected_shard_count &&
+            shard_count >= 1 && shard_count <= 8 &&
+            (shard_count & (shard_count - 1)) == 0 &&
             request_width % (16 * shard_count) == 0 &&
             block_size > 0 &&
             block_table_width * block_size >= capacity,
@@ -1987,7 +1981,8 @@ at::Tensor npu_dsa_resident_finalize_coordinator_(
     const int64_t miss_count_stride = miss_counts.size(1);
     TORCH_CHECK(
         request_count > 0 &&
-            (shard_count == 2 || shard_count == 4) &&
+            shard_count >= 1 && shard_count <= 8 &&
+            (shard_count & (shard_count - 1)) == 0 &&
             shard_count_stride >= 16 &&
             miss_counts.size(0) == request_count &&
             miss_count_stride >= 16,
@@ -2089,7 +2084,8 @@ at::Tensor npu_dsa_resident_sharded_finalize_worker_(
     const int64_t block_table_width = request_block_table.size(1);
     TORCH_CHECK(
         request_count > 0 &&
-            (shard_count == 2 || shard_count == 4) &&
+            shard_count >= 1 && shard_count <= 8 &&
+            (shard_count & (shard_count - 1)) == 0 &&
             capacity > 0 && capacity <= 32768 &&
             capacity % (16 * shard_count) == 0 &&
             shard_counts.size(0) == request_count &&
@@ -2242,14 +2238,11 @@ at::Tensor npu_dsa_resident_sorted_update_debug_(
     const int64_t shard_count_request_stride =
         shard_counts.size(1) * shard_count_stride;
     const int64_t generation_stride = state_generations.size(1);
-    int64_t expected_shard_count = 1;
-    while (expected_shard_count <= rows_per_request) {
-        expected_shard_count <<= 1;
-    }
     TORCH_CHECK(
         rows_per_request >= 1 && rows_per_request <= 2 &&
             row_width == 2048 && capacity == request_width &&
-            shard_count == expected_shard_count &&
+            shard_count >= 1 && shard_count <= 8 &&
+            (shard_count & (shard_count - 1)) == 0 &&
             request_width % (16 * shard_count) == 0 &&
             dummy_state_base >= request_count &&
             state_row_count >= dummy_state_base + request_count &&
@@ -2364,15 +2357,12 @@ at::Tensor npu_dsa_resident_sorted_remap_(
     const int64_t shard_count_stride = shard_counts.size(2);
     const int64_t shard_count_request_stride =
         shard_counts.size(1) * shard_count_stride;
-    int64_t expected_shard_count = 1;
-    while (expected_shard_count <= rows_per_request) {
-        expected_shard_count <<= 1;
-    }
     TORCH_CHECK(
         rows_per_request >= 1 && rows_per_request <= 2 &&
             row_width == 2048 &&
             request_width == capacity &&
-            shard_count == expected_shard_count &&
+            shard_count >= 1 && shard_count <= 8 &&
+            (shard_count & (shard_count - 1)) == 0 &&
             request_width % (16 * shard_count) == 0 &&
             shard_mapping.size(2) == request_width &&
             shard_counts.size(0) == request_count &&
@@ -2460,7 +2450,8 @@ at::Tensor npu_dsa_resident_sorted_read_probe_(
         shard_counts.size(1) * shard_count_stride;
     TORCH_CHECK(
         request_count > 0 &&
-            (shard_count == 2 || shard_count == 4) &&
+            shard_count >= 1 && shard_count <= 8 &&
+            (shard_count & (shard_count - 1)) == 0 &&
             capacity > 0 &&
             shard_counts.size(0) == request_count &&
             shard_counts.size(1) == shard_count &&
@@ -2575,7 +2566,8 @@ at::Tensor npu_dsa_resident_sorted_finalize_debug_(
     const int64_t block_table_width = request_block_table.size(1);
     TORCH_CHECK(
         request_count > 0 &&
-            (shard_count == 2 || shard_count == 4) &&
+            shard_count >= 1 && shard_count <= 8 &&
+            (shard_count & (shard_count - 1)) == 0 &&
             capacity > 0 &&
             prior_slots.sizes() == shard_packed.sizes() &&
             shard_miss_tokens.sizes() == shard_packed.sizes() &&
