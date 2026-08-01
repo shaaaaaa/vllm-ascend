@@ -1503,7 +1503,7 @@ at::Tensor resident_sharded_union_common_(
             shard_mapping.size(2) == request_width &&
             shard_counts.size(0) == request_count &&
             shard_counts.size(1) == shard_count &&
-            shard_count_stride >= 16 &&
+            shard_count_stride >= 16 && shard_count_stride % 16 == 0 &&
             dummy_state_base >= request_count &&
             state_row_count >= dummy_state_base + request_count &&
             state_slots.sizes() == state_tokens.sizes() &&
@@ -1511,9 +1511,9 @@ at::Tensor resident_sharded_union_common_(
             state_tokens.size(2) == shard_capacity &&
             state_counts.size(0) == state_row_count &&
             state_counts.size(1) == shard_count &&
-            state_counts.size(2) >= 16 &&
+            state_counts.size(2) == shard_count_stride &&
             state_generations.size(0) == state_row_count &&
-            generation_stride >= 8 &&
+            generation_stride >= 8 && generation_stride % 8 == 0 &&
             prior_slots.sizes() == shard_packed.sizes() &&
             shard_miss_tokens.sizes() == shard_packed.sizes() &&
             shard_miss_positions.sizes() == shard_packed.sizes() &&
@@ -1636,7 +1636,7 @@ static at::Tensor resident_sorted_plan_common_(
     at::Tensor &topk_indices,
     const at::Tensor &shard_packed,
     const at::Tensor &shard_mapping,
-    const at::Tensor &shard_counts,
+    at::Tensor &shard_counts,
     const at::Tensor &request_block_table,
     const at::Tensor &request_state_indices,
     const at::Tensor &request_state_generations,
@@ -1775,9 +1775,9 @@ static at::Tensor resident_sorted_plan_common_(
             state_tokens.size(2) == capacity &&
             state_counts.size(0) == state_row_count &&
             state_counts.size(1) == shard_count &&
-            state_counts.size(2) >= 16 &&
+            state_counts.size(2) == shard_count_stride &&
             state_generations.size(0) == state_row_count &&
-            generation_stride >= 8,
+            generation_stride >= 8 && generation_stride % 8 == 0,
         "sorted-resident persistent-state shapes are invalid");
     TORCH_CHECK(
         shard_mapping.size(0) == request_count &&
@@ -1785,7 +1785,7 @@ static at::Tensor resident_sorted_plan_common_(
             shard_mapping.size(2) == request_width &&
             shard_counts.size(0) == request_count &&
             shard_counts.size(1) == shard_count &&
-            shard_count_stride >= 16 &&
+            shard_count_stride >= 16 && shard_count_stride % 16 == 0 &&
             prior_slots.sizes() == shard_packed.sizes() &&
             shard_miss_tokens.sizes() == shard_packed.sizes() &&
             shard_miss_positions.sizes() == shard_packed.sizes() &&
@@ -1793,7 +1793,7 @@ static at::Tensor resident_sorted_plan_common_(
             miss_tokens.size(0) == request_count &&
             miss_tokens.size(1) == capacity &&
             miss_counts.size(0) == request_count &&
-            miss_count_stride >= 16 &&
+            miss_count_stride >= 16 && miss_count_stride % 16 == 0 &&
             target_slots.sizes() == miss_tokens.sizes() &&
             request_block_table.size(0) >= request_count &&
             request_state_indices.numel() >= request_count &&
@@ -1801,7 +1801,9 @@ static at::Tensor resident_sorted_plan_common_(
         "sorted-resident workspace shapes are invalid");
     TORCH_CHECK(
         reinterpret_cast<std::uintptr_t>(
-            state_tokens.data_ptr()) % 64 == 0 &&
+            shard_counts.data_ptr()) % 64 == 0 &&
+            reinterpret_cast<std::uintptr_t>(
+                state_tokens.data_ptr()) % 64 == 0 &&
             reinterpret_cast<std::uintptr_t>(
                 state_slots.data_ptr()) % 64 == 0 &&
             reinterpret_cast<std::uintptr_t>(
@@ -1894,7 +1896,7 @@ at::Tensor npu_dsa_resident_sorted_plan_(
     at::Tensor &topk_indices,
     const at::Tensor &shard_packed,
     const at::Tensor &shard_mapping,
-    const at::Tensor &shard_counts,
+    at::Tensor &shard_counts,
     const at::Tensor &request_block_table,
     const at::Tensor &request_state_indices,
     const at::Tensor &request_state_generations,
@@ -1926,7 +1928,7 @@ at::Tensor npu_dsa_resident_sorted_plan_no_remap_(
     at::Tensor &topk_indices,
     const at::Tensor &shard_packed,
     const at::Tensor &shard_mapping,
-    const at::Tensor &shard_counts,
+    at::Tensor &shard_counts,
     const at::Tensor &request_block_table,
     const at::Tensor &request_state_indices,
     const at::Tensor &request_state_generations,
@@ -1983,9 +1985,9 @@ at::Tensor npu_dsa_resident_finalize_coordinator_(
         request_count > 0 &&
             shard_count >= 1 && shard_count <= 8 &&
             (shard_count & (shard_count - 1)) == 0 &&
-            shard_count_stride >= 16 &&
+            shard_count_stride >= 16 && shard_count_stride % 16 == 0 &&
             miss_counts.size(0) == request_count &&
-            miss_count_stride >= 16,
+            miss_count_stride >= 16 && miss_count_stride % 16 == 0,
         "resident finalize coordinator shapes are invalid");
     TORCH_CHECK(
         reinterpret_cast<std::uintptr_t>(
@@ -2018,7 +2020,7 @@ at::Tensor npu_dsa_resident_finalize_coordinator_(
 }
 
 at::Tensor npu_dsa_resident_sharded_finalize_worker_(
-    const at::Tensor &shard_counts,
+    at::Tensor &shard_counts,
     at::Tensor &prior_slots,
     const at::Tensor &shard_miss_tokens,
     const at::Tensor &shard_miss_positions,
@@ -2090,14 +2092,14 @@ at::Tensor npu_dsa_resident_sharded_finalize_worker_(
             capacity % (16 * shard_count) == 0 &&
             shard_counts.size(0) == request_count &&
             shard_counts.size(1) == shard_count &&
-            shard_count_stride >= 16 &&
+            shard_count_stride >= 16 && shard_count_stride % 16 == 0 &&
             shard_miss_tokens.sizes() == prior_slots.sizes() &&
             shard_miss_positions.sizes() == prior_slots.sizes() &&
             shard_evictable_slots.sizes() == prior_slots.sizes() &&
             miss_tokens.size(0) == request_count &&
             miss_tokens.size(1) == capacity &&
             miss_counts.size(0) == request_count &&
-            miss_count_stride >= 16 &&
+            miss_count_stride >= 16 && miss_count_stride % 16 == 0 &&
             target_slots.sizes() == miss_tokens.sizes() &&
             request_block_table.size(0) >= request_count &&
             block_size > 0 &&
@@ -2251,10 +2253,10 @@ at::Tensor npu_dsa_resident_sorted_update_debug_(
             state_tokens.size(2) == capacity &&
             state_counts.size(0) == state_row_count &&
             state_counts.size(1) == shard_count &&
-            shard_count_stride >= 16 &&
-            state_counts.size(2) >= 16 &&
+            shard_count_stride >= 16 && shard_count_stride % 16 == 0 &&
+            state_counts.size(2) == shard_count_stride &&
             state_generations.size(0) == state_row_count &&
-            generation_stride >= 8 &&
+            generation_stride >= 8 && generation_stride % 8 == 0 &&
             shard_mapping.size(0) == request_count &&
             shard_mapping.size(1) == shard_count &&
             shard_mapping.size(2) == request_width &&
@@ -2264,6 +2266,14 @@ at::Tensor npu_dsa_resident_sorted_update_debug_(
             request_state_indices.numel() >= request_count &&
             request_state_generations.numel() >= request_count,
         "resident update-debug tensor shapes are invalid");
+    TORCH_CHECK(
+        reinterpret_cast<std::uintptr_t>(
+            shard_counts.data_ptr()) % 64 == 0 &&
+            reinterpret_cast<std::uintptr_t>(
+                state_counts.data_ptr()) % 64 == 0 &&
+            reinterpret_cast<std::uintptr_t>(
+                state_generations.data_ptr()) % 64 == 0,
+        "resident update-debug scalar records must be 64-byte aligned");
 
     const c10_npu::OptionalNPUGuard npu_guard(device);
     aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
@@ -2367,7 +2377,7 @@ at::Tensor npu_dsa_resident_sorted_remap_(
             shard_mapping.size(2) == request_width &&
             shard_counts.size(0) == request_count &&
             shard_counts.size(1) == shard_count &&
-            shard_count_stride >= 16 &&
+            shard_count_stride >= 16 && shard_count_stride % 16 == 0 &&
             prior_slots.size(0) == request_count &&
             prior_slots.size(1) == shard_count,
         "sorted-resident remap workspace shapes are invalid");
@@ -2455,11 +2465,15 @@ at::Tensor npu_dsa_resident_sorted_read_probe_(
             capacity > 0 &&
             shard_counts.size(0) == request_count &&
             shard_counts.size(1) == shard_count &&
-            shard_count_stride >= 16 &&
+            shard_count_stride >= 16 && shard_count_stride % 16 == 0 &&
             debug_info.size(0) == request_count &&
             debug_info.size(1) == 32 &&
             prior_readback.sizes() == prior_slots.sizes(),
         "resident read-probe tensor shapes are invalid");
+    TORCH_CHECK(
+        reinterpret_cast<std::uintptr_t>(
+            shard_counts.data_ptr()) % 64 == 0,
+        "resident read-probe scalar records must be 64-byte aligned");
 
     const c10_npu::OptionalNPUGuard npu_guard(device);
     aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
@@ -2489,7 +2503,7 @@ at::Tensor npu_dsa_resident_sorted_read_probe_(
 
 at::Tensor npu_dsa_resident_sorted_finalize_debug_(
     const at::Tensor &shard_packed,
-    const at::Tensor &shard_counts,
+    at::Tensor &shard_counts,
     at::Tensor &prior_slots,
     const at::Tensor &shard_miss_tokens,
     const at::Tensor &shard_miss_positions,
@@ -2575,12 +2589,12 @@ at::Tensor npu_dsa_resident_sorted_finalize_debug_(
             shard_evictable_slots.sizes() == shard_packed.sizes() &&
             shard_counts.size(0) == request_count &&
             shard_counts.size(1) == shard_count &&
-            shard_count_stride >= 16 &&
+            shard_count_stride >= 16 && shard_count_stride % 16 == 0 &&
             miss_tokens.size(0) == request_count &&
             miss_tokens.size(1) == capacity &&
             target_slots.sizes() == miss_tokens.sizes() &&
             miss_counts.size(0) == request_count &&
-            miss_count_stride >= 16 &&
+            miss_count_stride >= 16 && miss_count_stride % 16 == 0 &&
             request_block_table.size(0) >= request_count &&
             debug_info.size(0) == request_count &&
             debug_info.size(1) == 16 &&
@@ -2588,6 +2602,12 @@ at::Tensor npu_dsa_resident_sorted_finalize_debug_(
             block_table_width * block_size >= capacity &&
             debug_stage >= 0 && debug_stage <= 11,
         "resident finalize-debug tensor shapes are invalid");
+    TORCH_CHECK(
+        reinterpret_cast<std::uintptr_t>(
+            shard_counts.data_ptr()) % 64 == 0 &&
+            reinterpret_cast<std::uintptr_t>(
+                miss_counts.data_ptr()) % 64 == 0,
+        "resident finalize-debug scalar records must be 64-byte aligned");
 
     const c10_npu::OptionalNPUGuard npu_guard(device);
     aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
@@ -3834,7 +3854,7 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
     ops.def(
         "npu_dsa_resident_sorted_plan_(Tensor(a!) topk_indices, "
         "Tensor shard_packed, Tensor shard_mapping, "
-        "Tensor shard_counts, Tensor request_block_table, "
+        "Tensor(j!) shard_counts, Tensor request_block_table, "
         "Tensor request_state_indices, "
         "Tensor request_state_generations, "
         "Tensor(b!) state_tokens, Tensor(c!) state_slots, "
@@ -3852,7 +3872,7 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "npu_dsa_resident_sorted_plan_no_remap_("
         "Tensor(a!) topk_indices, "
         "Tensor shard_packed, Tensor shard_mapping, "
-        "Tensor shard_counts, Tensor request_block_table, "
+        "Tensor(j!) shard_counts, Tensor request_block_table, "
         "Tensor request_state_indices, "
         "Tensor request_state_generations, "
         "Tensor(b!) state_tokens, Tensor(c!) state_slots, "
@@ -3875,12 +3895,12 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         &vllm_ascend::npu_dsa_resident_finalize_coordinator_);
     ops.def(
         "npu_dsa_resident_sharded_finalize_worker_("
-        "Tensor shard_counts, Tensor(a!) prior_slots, "
+        "Tensor(a!) shard_counts, Tensor(b!) prior_slots, "
         "Tensor shard_miss_tokens, Tensor shard_miss_positions, "
-        "Tensor shard_evictable_slots, Tensor(b!) miss_tokens, "
-        "Tensor(c!) miss_counts, Tensor(d!) target_slots, "
+        "Tensor shard_evictable_slots, Tensor(c!) miss_tokens, "
+        "Tensor(d!) miss_counts, Tensor(e!) target_slots, "
         "Tensor request_block_table, "
-        "int block_size) -> Tensor(b!)");
+        "int block_size) -> Tensor(c!)");
     ops.impl(
         "npu_dsa_resident_sharded_finalize_worker_",
         torch::kPrivateUse1,
@@ -3918,7 +3938,7 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         &vllm_ascend::npu_dsa_resident_sorted_read_probe_);
     ops.def(
         "npu_dsa_resident_sorted_finalize_debug_("
-        "Tensor shard_packed, Tensor shard_counts, "
+        "Tensor shard_packed, Tensor(f!) shard_counts, "
         "Tensor(a!) prior_slots, Tensor shard_miss_tokens, "
         "Tensor shard_miss_positions, Tensor shard_evictable_slots, "
         "Tensor(b!) miss_tokens, Tensor(c!) miss_counts, "

@@ -50,6 +50,44 @@ __aicore__ inline void Sync()
     AscendC::WaitFlag<event>(id);
 }
 
+// Scalar GM access uses a private per-AICore DCache. Shared 64-byte records
+// must be refreshed before reads and published after their final write.
+template <typename T>
+__aicore__ inline T ReadGlobalScalarFresh(
+    AscendC::GlobalTensor<T>& tensor,
+    uint64_t offset)
+{
+    AscendC::DataCacheCleanAndInvalid<
+        T,
+        AscendC::CacheLine::SINGLE_CACHE_LINE,
+        AscendC::DcciDst::CACHELINE_OUT>(tensor[offset]);
+    return tensor.GetValue(offset);
+}
+
+template <typename T>
+__aicore__ inline void PublishGlobalCacheLine(
+    AscendC::GlobalTensor<T>& tensor,
+    uint64_t alignedOffset)
+{
+    AscendC::DataCacheCleanAndInvalid<
+        T,
+        AscendC::CacheLine::SINGLE_CACHE_LINE,
+        AscendC::DcciDst::CACHELINE_OUT>(tensor[alignedOffset]);
+}
+
+template <typename T>
+__aicore__ inline void WriteGlobalScalarVisible(
+    AscendC::GlobalTensor<T>& tensor,
+    uint64_t alignedOffset,
+    T value)
+{
+    tensor.SetValue(alignedOffset, value);
+    AscendC::DataCacheCleanAndInvalid<
+        T,
+        AscendC::CacheLine::SINGLE_CACHE_LINE,
+        AscendC::DcciDst::CACHELINE_OUT>(tensor[alignedOffset]);
+}
+
 template <typename T>
 __aicore__ inline void CopyLocalToGlobalExact(
     AscendC::GlobalTensor<T> dst,
@@ -138,6 +176,9 @@ public:
                 static_cast<uint64_t>(request)
                     * shardCountRequestStride_
                 + shard * shardCountStride_;
+            // Union metadata is produced by one AICore per shard. Refresh at
+            // the aligned record base before reading the rest of this line.
+            (void)ReadGlobalScalarFresh(shardCounts_, countOffset);
             missCounts[shard] = static_cast<uint32_t>(
                 shardCounts_.GetValue(
                     countOffset + kShardMissCount));
@@ -185,11 +226,13 @@ public:
             shardCounts_.SetValue(
                 countOffset + kShardTotalMissCount,
                 static_cast<int32_t>(totalMissCount));
+            PublishGlobalCacheLine(shardCounts_, countOffset);
             missPrefix += missCounts[shard];
             selectedEvictPrefix += selectedCount;
             remainingEvictions -= selectedCount;
         }
-        missCounts_.SetValue(
+        WriteGlobalScalarVisible(
+            missCounts_,
             static_cast<uint64_t>(request) * missCountStride_,
             static_cast<int32_t>(totalMissCount));
     }
@@ -322,7 +365,8 @@ public:
                     * shardCountRequestStride_
                 + shard * shardCountStride_;
             currentCounts[shard] = static_cast<uint32_t>(
-                shardCounts_.GetValue(
+                ReadGlobalScalarFresh(
+                    shardCounts_,
                     countOffset + kShardCurrentCount));
             missCounts[shard] = static_cast<uint32_t>(
                 shardCounts_.GetValue(
@@ -371,8 +415,10 @@ public:
         shardCounts_.SetValue(
             ownerCountOffset + kShardTotalMissCount,
             static_cast<int32_t>(totalMissCount));
+        PublishGlobalCacheLine(shardCounts_, ownerCountOffset);
         if (ownerShard == 0) {
-            missCounts_.SetValue(
+            WriteGlobalScalarVisible(
+                missCounts_,
                 static_cast<uint64_t>(request) * missCountStride_,
                 static_cast<int32_t>(totalMissCount));
         }

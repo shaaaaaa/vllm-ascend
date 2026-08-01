@@ -1877,6 +1877,126 @@ def test_coordinated_finalize_matches_production(
         (2, 8),
     ],
 )
+def test_coordinated_finalize_reuses_metadata_with_cpu_reference(
+    mtp, shard_count_override
+):
+    """Reuse fixed GM addresses across misses, hits, and replacements."""
+    requests = 2
+    capacity = mtp * 2048
+    block_size = 128
+    full_boundary = 100_000
+    shard_count = shard_count_override or resident_shard_count(mtp)
+    boundaries_cpu = torch.full(
+        (requests * mtp,), full_boundary, dtype=torch.int32
+    )
+    boundaries = boundaries_cpu.npu()
+    row_requests = torch.arange(
+        requests, dtype=torch.int32, device="npu"
+    ).repeat_interleave(mtp)
+    request_states = torch.arange(requests, dtype=torch.int32, device="npu")
+    request_generations = torch.arange(
+        1, 1 + requests, dtype=torch.int64, device="npu"
+    )
+    block_table = torch.arange(
+        capacity // block_size, dtype=torch.int32, device="npu"
+    ).repeat(requests, 1)
+    workspace = allocate_sorted_resident_workspace(
+        requests,
+        mtp,
+        device=torch.device("npu"),
+        shard_count=shard_count_override,
+    )
+    state = allocate_sorted_resident_state(
+        requests,
+        requests,
+        mtp,
+        device=torch.device("npu"),
+        shard_count=shard_count_override,
+    )
+
+    references: list[dict[int, int]] = [{} for _ in range(requests)]
+    for offset, boundary in (
+        (0, full_boundary),
+        (0, 1024),
+        (100, full_boundary),
+        (100, full_boundary),
+        (0, full_boundary),
+    ):
+        boundaries_cpu.fill_(boundary)
+        boundaries.fill_(boundary)
+        source = _source(mtp, offset, requests)
+        values = source.npu()
+        prepare_resident_sharded_union_(
+            values,
+            boundaries,
+            row_requests,
+            request_states,
+            request_generations,
+            state,
+            workspace,
+            mtp=mtp,
+        )
+        expected_shards = _expected_shards(
+            source,
+            boundaries_cpu,
+            requests,
+            mtp,
+            shard_count,
+        )
+        expected_steps = []
+        for request in range(requests):
+            reference, misses, slots = _reference_step(
+                expected_shards[request], references[request], capacity
+            )
+            references[request] = reference
+            expected_steps.append((misses, slots))
+
+        prepare_sorted_resident_cache_coordinated_(
+            values,
+            block_table,
+            request_states,
+            request_generations,
+            state,
+            workspace,
+            block_size=block_size,
+        )
+        torch.npu.synchronize()
+
+        remapped = values.reshape(requests, -1).cpu()
+        original = source.reshape(requests, -1)
+        for request in range(requests):
+            expected_misses, expected_slots = expected_steps[request]
+            miss_count = int(workspace.miss_counts[request, 0].cpu())
+            assert miss_count == len(expected_misses)
+            assert (
+                workspace.miss_tokens[request, :miss_count].cpu().tolist()
+                == expected_misses
+            )
+            assert (
+                workspace.target_slots[request, :miss_count].cpu().tolist()
+                == expected_slots
+            )
+            assert _state_dict(state, request, shard_count) == references[request]
+            expected_remapped = [
+                references[request][token] if token < boundary else token
+                for token in original[request].tolist()
+            ]
+            assert remapped[request].tolist() == expected_remapped
+
+
+@pytest.mark.parametrize(
+    "mtp,shard_count_override",
+    [
+        (1, None),
+        (1, 1),
+        (1, 2),
+        (1, 4),
+        (2, None),
+        (2, 2),
+        (2, 4),
+        (2, 8),
+    ],
+)
 def test_coordinated_finalize_supports_graph_replay(
     mtp, shard_count_override
 ):

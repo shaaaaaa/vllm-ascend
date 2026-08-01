@@ -226,7 +226,7 @@ at::Tensor npu_dsa_resident_sorted_plan_meta(
     at::Tensor &topk_indices,
     const at::Tensor &shard_packed,
     const at::Tensor &shard_mapping,
-    const at::Tensor &shard_counts,
+    at::Tensor &shard_counts,
     const at::Tensor &request_block_table,
     const at::Tensor &request_state_indices,
     const at::Tensor &request_state_generations,
@@ -287,7 +287,7 @@ at::Tensor npu_dsa_resident_finalize_coordinator_meta(
 }
 
 at::Tensor npu_dsa_resident_sharded_finalize_worker_meta(
-    const at::Tensor &shard_counts,
+    at::Tensor &shard_counts,
     at::Tensor &prior_slots,
     const at::Tensor &shard_miss_tokens,
     const at::Tensor &shard_miss_positions,
@@ -352,7 +352,7 @@ at::Tensor npu_dsa_resident_sorted_read_probe_meta(
 
 at::Tensor npu_dsa_resident_sorted_finalize_debug_meta(
     const at::Tensor &shard_packed,
-    const at::Tensor &shard_counts,
+    at::Tensor &shard_counts,
     at::Tensor &prior_slots,
     const at::Tensor &shard_miss_tokens,
     const at::Tensor &shard_miss_positions,

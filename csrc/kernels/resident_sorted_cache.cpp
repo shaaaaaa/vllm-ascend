@@ -44,6 +44,8 @@ __aicore__ inline void Sync()
     AscendC::WaitFlag<event>(id);
 }
 
+// Scalar GM access uses a private per-AICore DCache. Shared 64-byte records
+// must be refreshed before reads and published after their final write.
 template <typename T>
 __aicore__ inline T ReadGlobalScalarFresh(
     AscendC::GlobalTensor<T>& tensor,
@@ -54,6 +56,30 @@ __aicore__ inline T ReadGlobalScalarFresh(
         AscendC::CacheLine::SINGLE_CACHE_LINE,
         AscendC::DcciDst::CACHELINE_OUT>(tensor[offset]);
     return tensor.GetValue(offset);
+}
+
+template <typename T>
+__aicore__ inline void PublishGlobalCacheLine(
+    AscendC::GlobalTensor<T>& tensor,
+    uint64_t alignedOffset)
+{
+    AscendC::DataCacheCleanAndInvalid<
+        T,
+        AscendC::CacheLine::SINGLE_CACHE_LINE,
+        AscendC::DcciDst::CACHELINE_OUT>(tensor[alignedOffset]);
+}
+
+template <typename T>
+__aicore__ inline void WriteGlobalScalarVisible(
+    AscendC::GlobalTensor<T>& tensor,
+    uint64_t alignedOffset,
+    T value)
+{
+    tensor.SetValue(alignedOffset, value);
+    AscendC::DataCacheCleanAndInvalid<
+        T,
+        AscendC::CacheLine::SINGLE_CACHE_LINE,
+        AscendC::DcciDst::CACHELINE_OUT>(tensor[alignedOffset]);
 }
 
 template <typename T>
@@ -287,7 +313,7 @@ public:
         uint32_t selectedElements = 0;
         for (uint32_t mtpRow = 0; mtpRow < rowsPerRequest_; ++mtpRow) {
             const uint32_t row = request * rowsPerRequest_ + mtpRow;
-            if (rowReqIndices_.GetValue(row) !=
+            if (ReadGlobalScalarFresh(rowReqIndices_, row) !=
                 static_cast<int32_t>(request)) {
                 continue;
             }
@@ -295,7 +321,7 @@ public:
                 static_cast<uint64_t>(request) * requestWidth_
                 + static_cast<uint64_t>(mtpRow) * rowWidth_;
             const int32_t boundary =
-                splitBoundary_.GetValue(row);
+                ReadGlobalScalarFresh(splitBoundary_, row);
             AscendC::DataCopy(
                 input, topkIndices_[inputOffset], rowWidth_);
             Sync<AscendC::HardEvent::MTE2_V>();
@@ -457,7 +483,7 @@ public:
         auto shardMissPositions = tmpInt16;
         auto shardEvictableSlots = tmpInt16[shardCapacity_];
         const int32_t state =
-            requestStateIndices_.GetValue(request);
+            ReadGlobalScalarFresh(requestStateIndices_, request);
         const bool realState =
             state >= 0 &&
             state < static_cast<int32_t>(dummyStateBase_);
@@ -465,9 +491,10 @@ public:
             ? static_cast<uint32_t>(state)
             : dummyStateBase_ + request;
         const int64_t requestedGeneration =
-            requestStateGenerations_.GetValue(request);
+            ReadGlobalScalarFresh(requestStateGenerations_, request);
         const int64_t storedGeneration =
-            stateGenerations_.GetValue(
+            ReadGlobalScalarFresh(
+                stateGenerations_,
                 static_cast<uint64_t>(safeState)
                 * generationStride_);
         const bool generationMatches =
@@ -478,7 +505,8 @@ public:
             + shard * shardCountStride_;
         const uint32_t oldCount = generationMatches
             ? static_cast<uint32_t>(
-                  stateCounts_.GetValue(stateCountOffset))
+                  ReadGlobalScalarFresh(
+                      stateCounts_, stateCountOffset))
             : 0U;
         const uint64_t stateShardOffset =
             (static_cast<uint64_t>(safeState) * shardCount_ + shard)
@@ -531,7 +559,9 @@ public:
             ++oldIndex;
         }
         if (!generationMatches) {
-            stateCounts_.SetValue(stateCountOffset, 0);
+            WriteGlobalScalarVisible(
+                stateCounts_, stateCountOffset,
+                static_cast<int32_t>(0));
         }
 
         Sync<AscendC::HardEvent::S_MTE3>();
@@ -576,6 +606,9 @@ public:
         shardCounts_.SetValue(
             countOffset + kShardOldCount,
             static_cast<int32_t>(oldCount));
+        // SetValue updates the per-core DCache first. Publish the completed
+        // cacheline so finalize blocks on other cores observe this launch.
+        PublishGlobalCacheLine(shardCounts_, countOffset);
     }
 
 private:
@@ -990,7 +1023,8 @@ public:
         uint32_t packedEnd = 0;
         for (uint32_t shard = 0; shard < shardCount_; ++shard) {
             const uint32_t count = static_cast<uint32_t>(
-                shardCounts_.GetValue(
+                ReadGlobalScalarFresh(
+                    shardCounts_,
                     static_cast<uint64_t>(request)
                         * shardCountRequestStride_
                     + shard * shardCountStride_));
@@ -1217,7 +1251,8 @@ public:
             return;
         }
         // One cacheline per request prevents count false sharing.
-        missCounts_.SetValue(
+        WriteGlobalScalarVisible(
+            missCounts_,
             static_cast<uint64_t>(request) * missCountStride_,
             static_cast<int32_t>(missCount));
         if (debugStage_ == 11) {
@@ -1276,8 +1311,11 @@ private:
                 static_cast<uint64_t>(request)
                     * shardCountRequestStride_
                 + shard * shardCountStride_;
+            // The union producer runs on one AICore per shard. Refresh this
+            // record once, then read the remaining fields from the same line.
             const uint32_t currentCount = static_cast<uint32_t>(
-                shardCounts_.GetValue(
+                ReadGlobalScalarFresh(
+                    shardCounts_,
                     countOffset + kShardCurrentCount));
             const uint32_t shardMissCount = static_cast<uint32_t>(
                 shardCounts_.GetValue(
@@ -1358,6 +1396,7 @@ private:
             shardCounts_.SetValue(
                 countOffset + kShardSelectedEvictCount,
                 static_cast<int32_t>(selectedCount));
+            PublishGlobalCacheLine(shardCounts_, countOffset);
             evictableEnd = evictableOffset + selectedCount;
             remainingEvictions -= selectedCount;
         }
@@ -1455,7 +1494,8 @@ private:
                 targetSlots,
                 totalMissCount);
         }
-        missCounts_.SetValue(
+        WriteGlobalScalarVisible(
+            missCounts_,
             static_cast<uint64_t>(request) * missCountStride_,
             static_cast<int32_t>(totalMissCount));
     }
@@ -1645,7 +1685,7 @@ public:
             return;
         }
         const int32_t state =
-            requestStateIndices_.GetValue(request);
+            ReadGlobalScalarFresh(requestStateIndices_, request);
         const bool realState =
             state >= 0 &&
             state < static_cast<int32_t>(dummyStateBase_);
@@ -1657,15 +1697,16 @@ public:
                 * shardCountRequestStride_
             + shard * shardCountStride_;
         const int64_t requestedGeneration =
-            requestStateGenerations_.GetValue(request);
+            ReadGlobalScalarFresh(requestStateGenerations_, request);
         const uint64_t oldCountOffset =
             static_cast<uint64_t>(safeState)
                 * shardCountRequestStride_
             + shard * shardCountStride_;
         const uint32_t oldCount = static_cast<uint32_t>(
-            stateCounts_.GetValue(oldCountOffset));
+            ReadGlobalScalarFresh(stateCounts_, oldCountOffset));
+        // Refresh once at the cacheline base; selectedEvictCount shares it.
         const uint32_t currentCount = static_cast<uint32_t>(
-            shardCounts_.GetValue(requestCountOffset));
+            ReadGlobalScalarFresh(shardCounts_, requestCountOffset));
         const uint32_t selectedEvictCount = static_cast<uint32_t>(
             shardCounts_.GetValue(
                 requestCountOffset + kShardSelectedEvictCount));
@@ -1770,8 +1811,9 @@ public:
             static_cast<uint64_t>(safeState)
                 * shardCountRequestStride_
             + shard * shardCountStride_;
-        stateCounts_.SetValue(
-            newCountOffset, static_cast<int32_t>(mergedCount));
+        WriteGlobalScalarVisible(
+            stateCounts_, newCountOffset,
+            static_cast<int32_t>(mergedCount));
 
         RemapPositionPartition(
             request, shard, requestShardBase);
@@ -1781,7 +1823,8 @@ public:
         // materialized as zero counts by the fused union kernel, so
         // sibling blocks do not re-read this generation publication.
         if (shard == 0) {
-            stateGenerations_.SetValue(
+            WriteGlobalScalarVisible(
+                stateGenerations_,
                 static_cast<uint64_t>(safeState)
                     * generationStride_,
                 requestedGeneration);
@@ -1799,7 +1842,7 @@ public:
             return;
         }
         const int32_t state =
-            requestStateIndices_.GetValue(request);
+            ReadGlobalScalarFresh(requestStateIndices_, request);
         const bool realState =
             state >= 0 &&
             state < static_cast<int32_t>(dummyStateBase_);
@@ -1811,15 +1854,16 @@ public:
                 * shardCountRequestStride_
             + shard * shardCountStride_;
         const int64_t requestedGeneration =
-            requestStateGenerations_.GetValue(request);
+            ReadGlobalScalarFresh(requestStateGenerations_, request);
         const uint64_t oldCountOffset =
             static_cast<uint64_t>(safeState)
                 * shardCountRequestStride_
             + shard * shardCountStride_;
         const uint32_t oldCount = static_cast<uint32_t>(
-            stateCounts_.GetValue(oldCountOffset));
+            ReadGlobalScalarFresh(stateCounts_, oldCountOffset));
+        // Refresh once at the cacheline base; selectedEvictCount shares it.
         const uint32_t currentCount = static_cast<uint32_t>(
-            shardCounts_.GetValue(requestCountOffset));
+            ReadGlobalScalarFresh(shardCounts_, requestCountOffset));
         const uint32_t selectedEvictCount = static_cast<uint32_t>(
             shardCounts_.GetValue(
                 requestCountOffset + kShardSelectedEvictCount));
@@ -1924,11 +1968,13 @@ public:
             static_cast<uint64_t>(safeState)
                 * shardCountRequestStride_
             + shard * shardCountStride_;
-        stateCounts_.SetValue(
-            newCountOffset, static_cast<int32_t>(mergedCount));
+        WriteGlobalScalarVisible(
+            stateCounts_, newCountOffset,
+            static_cast<int32_t>(mergedCount));
 
         if (shard == 0) {
-            stateGenerations_.SetValue(
+            WriteGlobalScalarVisible(
+                stateGenerations_,
                 static_cast<uint64_t>(safeState)
                     * generationStride_,
                 requestedGeneration);
@@ -1980,7 +2026,8 @@ private:
 
         for (uint32_t shard = 0; shard < shardCount_; ++shard) {
             const uint32_t count = static_cast<uint32_t>(
-                shardCounts_.GetValue(
+                ReadGlobalScalarFresh(
+                    shardCounts_,
                     static_cast<uint64_t>(request)
                         * shardCountRequestStride_
                     + shard * shardCountStride_));
@@ -2244,7 +2291,8 @@ public:
 
         for (uint32_t shard = 0; shard < shardCount_; ++shard) {
             const uint32_t count = static_cast<uint32_t>(
-                shardCounts_.GetValue(
+                ReadGlobalScalarFresh(
+                    shardCounts_,
                     static_cast<uint64_t>(request)
                         * shardCountRequestStride_
                     + shard * shardCountStride_));
