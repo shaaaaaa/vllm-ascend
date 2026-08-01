@@ -1364,7 +1364,7 @@ class TestStagedSFAGraphPoc(TestBase):
             wait_for_layer.call_args_list[0]
             .kwargs["selected_token_counts"]
             .tolist(),
-            [1, 1, 1, 1],
+            [1],
         )
         prepare_boundary.assert_called_once_with(
             next_metadata,
