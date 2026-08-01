@@ -562,16 +562,22 @@ at::Tensor npu_dsa_staged_sharded_union_(
     const int64_t rows_per_request = row_count / request_count;
     TORCH_CHECK(rows_per_request > 0 && rows_per_request <= 8,
                 "benchmark sharded union supports MTP depths from 1 to 8");
-    int64_t shard_count = 1;
-    while (shard_count < rows_per_request) {
-        shard_count <<= 1;
+    int64_t minimum_shard_count = 1;
+    while (minimum_shard_count < rows_per_request) {
+        minimum_shard_count <<= 1;
     }
+    const int64_t shard_count = shard_packed.size(1);
+    TORCH_CHECK(shard_count > 0, "benchmark shard count must be positive");
     const int64_t request_width = rows_per_request * row_width;
     const int64_t selected_count_stride =
         selected_count.numel() / request_count;
     const int64_t shard_count_stride =
         shard_counts.numel() / (shard_count * request_count);
     TORCH_CHECK(row_width == 2048 &&
+                    shard_count >= minimum_shard_count &&
+                    shard_count <= 8 &&
+                    (shard_count & (shard_count - 1)) == 0 &&
+                    row_width % shard_count == 0 &&
                     split_boundary.numel() >= row_count &&
                     request_block_table.size(0) == request_count,
                 "benchmark sharded union requires [2048] MTP rows");
@@ -726,10 +732,12 @@ at::Tensor npu_dsa_staged_sharded_vector_union_(
     const int64_t rows_per_request = row_count / request_count;
     TORCH_CHECK(rows_per_request > 0 && rows_per_request <= 8,
                 "vector sharded union supports MTP depths from 1 to 8");
-    int64_t shard_count = 1;
-    while (shard_count < rows_per_request) {
-        shard_count <<= 1;
+    int64_t minimum_shard_count = 1;
+    while (minimum_shard_count < rows_per_request) {
+        minimum_shard_count <<= 1;
     }
+    const int64_t shard_count = shard_packed.size(1);
+    TORCH_CHECK(shard_count > 0, "vector shard count must be positive");
     const int64_t request_width = rows_per_request * row_width;
     const int64_t mapping_parts = shard_count;
     const int64_t mapping_part_width = request_width / mapping_parts;
@@ -738,6 +746,10 @@ at::Tensor npu_dsa_staged_sharded_vector_union_(
     const int64_t shard_count_stride =
         shard_counts.numel() / (shard_count * request_count);
     TORCH_CHECK(row_width == 2048 &&
+                    shard_count >= minimum_shard_count &&
+                    shard_count <= 8 &&
+                    (shard_count & (shard_count - 1)) == 0 &&
+                    row_width % shard_count == 0 &&
                     split_boundary.numel() >= row_count &&
                     request_block_table.size(0) == request_count,
                 "vector sharded union requires [2048] MTP rows");
@@ -898,10 +910,12 @@ at::Tensor npu_dsa_staged_sharded_vector_dedup_(
     const int64_t rows_per_request = row_count / request_count;
     TORCH_CHECK(rows_per_request > 0 && rows_per_request <= 8,
                 "vector dedup supports MTP depths from 1 to 8");
-    int64_t shard_count = 1;
-    while (shard_count < rows_per_request) {
-        shard_count <<= 1;
+    int64_t minimum_shard_count = 1;
+    while (minimum_shard_count < rows_per_request) {
+        minimum_shard_count <<= 1;
     }
+    const int64_t shard_count = shard_packed.size(1);
+    TORCH_CHECK(shard_count > 0, "vector dedup shard count must be positive");
     const int64_t request_width = rows_per_request * row_width;
     const int64_t mapping_part_width = request_width / shard_count;
     const int64_t selected_count_stride =
@@ -909,6 +923,10 @@ at::Tensor npu_dsa_staged_sharded_vector_dedup_(
     const int64_t shard_count_stride =
         shard_counts.numel() / (shard_count * request_count);
     TORCH_CHECK(row_width == 2048 &&
+                    shard_count >= minimum_shard_count &&
+                    shard_count <= 8 &&
+                    (shard_count & (shard_count - 1)) == 0 &&
+                    row_width % shard_count == 0 &&
                     split_boundary.numel() >= row_count &&
                     request_block_table.size(0) == request_count,
                 "vector dedup requires [2048] MTP rows");

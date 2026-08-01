@@ -606,6 +606,7 @@ def main(
     iterations: int = 200,
     warmups: int = 20,
     resident_hit_rate: float = 0.9,
+    shards_per_row: int | None = None,
 ) -> None:
     if topk != 2048:
         raise ValueError("the experimental staged kernels currently require --topk 2048")
@@ -613,9 +614,28 @@ def main(
         raise ValueError("the sharded benchmark supports --mtp from 1 to 8")
     if not enable_custom_op():
         raise RuntimeError("vllm-ascend custom operators could not be loaded")
+    default_shard_count = 1 << (mtp - 1).bit_length()
+    shard_count = (
+        default_shard_count
+        if shards_per_row is None
+        else mtp * shards_per_row
+    )
+    if (
+        shard_count < default_shard_count
+        or shard_count > 8
+        or shard_count & (shard_count - 1)
+        or topk % shard_count
+    ):
+        raise ValueError(
+            "--shards-per-row must produce a power-of-two total shard count "
+            "between the default and 8"
+        )
     print(
         f"MTP depth={mtp}, "
-        f"legacy value shards={1 << (mtp - 1).bit_length()}, "
+        f"legacy value shards={default_shard_count}, "
+        f"benchmark shards/row={shards_per_row or 'default'}, "
+        f"benchmark total shards={shard_count}, "
+        f"approx elements/shard={mtp * topk // shard_count}, "
         f"resident shards={resident_shard_count(mtp) if mtp <= 2 else 'n/a'}"
     )
     legacy_op = torch.ops._C_ascend.npu_dsa_prepare_sparse_indices_legacy_
@@ -706,7 +726,6 @@ def main(
             device="npu",
         ),
     )
-    shard_count = 1 << (mtp - 1).bit_length()
     sharded_sort_scratch = (
         torch.empty(
             (request_batch, shard_count, topk),
@@ -1629,6 +1648,15 @@ if __name__ == "__main__":
     parser.add_argument("--requests", type=int, default=4)
     parser.add_argument("--hit-rate", type=float, default=0.9)
     parser.add_argument(
+        "--shards-per-row",
+        type=int,
+        default=None,
+        help=(
+            "benchmark-only row shard multiplier; total launch shards are "
+            "MTP * shards_per_row, while the default remains unchanged"
+        ),
+    )
+    parser.add_argument(
         "--parallel-map",
         action="store_true",
         help=("deprecated compatibility flag for the standalone resident benchmark"),
@@ -1673,4 +1701,5 @@ if __name__ == "__main__":
             args.iterations,
             args.warmups,
             args.hit_rate,
+            args.shards_per_row,
         )

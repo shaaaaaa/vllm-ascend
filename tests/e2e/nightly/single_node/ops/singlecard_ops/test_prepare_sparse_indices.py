@@ -192,12 +192,17 @@ def _run_vector_sharded_union(
     *,
     capture_graph: bool = False,
     use_position_map: bool = False,
+    shards_per_row: int | None = None,
 ):
     topk = source.shape[-1]
     row_count = source.shape[0]
     mtp = row_count // request_count
     capacity = mtp * topk
-    shard_count = 1 << (mtp - 1).bit_length()
+    shard_count = (
+        1 << (mtp - 1).bit_length()
+        if shards_per_row is None
+        else mtp * shards_per_row
+    )
     block_size = 128
     max_tokens = 131072
     values = source.npu()
@@ -460,8 +465,11 @@ def test_four_stage_native_unique_with_batched_mtp_rows():
     assert torch.equal(reconstructed.cpu(), source.reshape(row_count, topk).cpu())
 
 
-@pytest.mark.parametrize("mtp", [1, 2, 3, 4])
-def test_sharded_union_tracks_mtp_depth(mtp):
+@pytest.mark.parametrize(
+    "mtp,shards_per_row",
+    [(1, None), (2, None), (3, None), (4, None), (1, 4), (2, 4)],
+)
+def test_sharded_union_tracks_mtp_depth(mtp, shards_per_row):
     topk = 2048
     request_count = 2
     row_count = request_count * mtp
@@ -495,7 +503,11 @@ def test_sharded_union_tracks_mtp_depth(mtp):
     ).reshape(request_count, 131072 // block_size)
     selected, counts, targets = _buffers(request_count, capacity)
     local_to_union = torch.empty((row_count, topk), dtype=torch.int32, device="npu")
-    shard_count = 1 << (mtp - 1).bit_length()
+    shard_count = (
+        1 << (mtp - 1).bit_length()
+        if shards_per_row is None
+        else mtp * shards_per_row
+    )
     shard_packed = torch.empty(
         (request_count, shard_count, topk),
         dtype=torch.int32,
@@ -632,6 +644,50 @@ def test_vector_sharded_union_all_supported_mtp_depths(mtp, use_position_map):
                 expected_offsets.append(offset)
                 offset += result["shard_counts"][request, shard, 0].item()
             assert result["counts"][request, 1 : 1 + shard_count].tolist() == expected_offsets
+
+
+@pytest.mark.parametrize("mtp", [1, 2])
+@pytest.mark.parametrize(
+    "use_position_map",
+    [False, True],
+    ids=["pair-map", "position-map"],
+)
+def test_vector_sharded_union_supports_four_shards_per_row(
+    mtp, use_position_map
+):
+    topk = 2048
+    request_count = 2
+    shared = torch.arange(topk // 2, dtype=torch.int32)
+    request_rows = torch.stack(
+        tuple(
+            torch.cat(
+                (
+                    shared,
+                    torch.arange(
+                        topk // 2 + row * topk // 2,
+                        topk // 2 + (row + 1) * topk // 2,
+                        dtype=torch.int32,
+                    ),
+                )
+            )
+            for row in range(mtp)
+        )
+    )
+    source = request_rows.repeat(request_count, 1).unsqueeze(1)
+    boundary = (mtp + 1) * topk // 2 - 101
+    boundaries = torch.full(
+        (request_count * mtp,), boundary, dtype=torch.int32
+    )
+
+    result = _run_vector_sharded_union(
+        source,
+        boundaries,
+        request_count,
+        use_position_map=use_position_map,
+        shards_per_row=4,
+    )
+    _assert_vector_sharded_result(result, source, boundaries, request_count)
+    assert result["shard_packed"].shape[1] == mtp * 4
 
 
 @pytest.mark.parametrize(
