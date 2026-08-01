@@ -2868,16 +2868,17 @@ private:
                 AscendC::RoundMode::CAST_NONE,
                 count);
             AscendC::PipeBarrier<PIPE_V>();
+            // The next shard reuses missToken as an MTE2 destination. Order
+            // that future write after the current vector chain while V is
+            // still an active producer; placing this after MTE3_V would form
+            // an empty V event segment on the final iteration.
+            Sync<AscendC::HardEvent::V_MTE2>();
             Sync<AscendC::HardEvent::V_MTE3>();
             CopyLocalToGlobalExact(
                 targetSlots_[requestOffset + missBase],
                 target64,
                 count);
             Sync<AscendC::HardEvent::MTE3_V>();
-            // The next shard reuses missToken as an MTE2 destination. Its
-            // current contents are still consumed by the target-slot vector
-            // chain above, so order V before that following MTE2 write.
-            Sync<AscendC::HardEvent::V_MTE2>();
         }
         missCounts_.SetValue(
             static_cast<uint64_t>(request) * missCountStride_,
