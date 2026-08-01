@@ -381,6 +381,7 @@ namespace vllm_ascend {
     void* shard_miss_positions,
     void* shard_evictable_slots,
     void* miss_tokens,
+    void* miss_counts,
     void* target_slots,
     void* request_block_table,
     uint32_t request_count,
@@ -388,6 +389,7 @@ namespace vllm_ascend {
     uint32_t capacity,
     uint32_t shard_count_stride,
     uint32_t shard_count_request_stride,
+    uint32_t miss_count_stride,
     uint32_t block_table_width,
     uint32_t block_size);
 

@@ -204,10 +204,11 @@ private:
     uint32_t missCountStride_ = 0;
 };
 
-// A copied and reduced finalize worker. One AICore owns one request/shard
-// prior-slot slice. The same core also owns a cacheline-aligned partition of
-// the request's compact LMCache payload, so sibling writers never share a
-// cacheline even when shard miss counts are not cacheline aligned.
+// A copied and reduced finalize worker. Every request/shard AICore repeats the
+// tiny O(shard_count) prefix calculation, then writes only its own 64-byte
+// metadata record. One AICore owns one request/shard prior-slot slice and a
+// cacheline-aligned partition of the compact LMCache payload, so sibling
+// writers never share a cacheline even when shard miss counts are not aligned.
 class DSAResidentShardedFinalizeWorkerKernel {
 public:
     __aicore__ inline void Init(
@@ -217,6 +218,7 @@ public:
         __gm__ int16_t* shardMissPositions,
         __gm__ int16_t* shardEvictableSlots,
         __gm__ int32_t* missTokens,
+        __gm__ int32_t* missCounts,
         __gm__ int64_t* targetSlots,
         __gm__ int32_t* requestBlockTable,
         uint32_t requestCount,
@@ -224,6 +226,7 @@ public:
         uint32_t capacity,
         uint32_t shardCountStride,
         uint32_t shardCountRequestStride,
+        uint32_t missCountStride,
         uint32_t blockTableWidth,
         uint32_t blockSize)
     {
@@ -232,6 +235,7 @@ public:
         capacity_ = capacity;
         shardCountStride_ = shardCountStride;
         shardCountRequestStride_ = shardCountRequestStride;
+        missCountStride_ = missCountStride;
         blockTableWidth_ = blockTableWidth;
         blockSize_ = blockSize;
         blockTableEntries_ =
@@ -253,6 +257,9 @@ public:
         shardEvictableSlots_.SetGlobalBuffer(
             shardEvictableSlots, requestShardElements);
         missTokens_.SetGlobalBuffer(missTokens, requestElements);
+        missCounts_.SetGlobalBuffer(
+            missCounts,
+            static_cast<uint64_t>(requestCount_) * missCountStride_);
         targetSlots_.SetGlobalBuffer(targetSlots, requestElements);
         requestBlockTable_.SetGlobalBuffer(
             requestBlockTable,
@@ -301,17 +308,14 @@ public:
             static_cast<uint64_t>(request)
                 * shardCountRequestStride_
             + ownerShard * shardCountStride_;
-        const uint32_t totalMissCount = static_cast<uint32_t>(
-            shardCounts_.GetValue(
-                ownerCountOffset + kShardTotalMissCount));
-        if (totalMissCount == 0) {
-            return;
-        }
-
         uint32_t currentCounts[kMaxResidentShards] = {};
         uint32_t missCounts[kMaxResidentShards] = {};
+        uint32_t evictableCounts[kMaxResidentShards] = {};
         uint32_t missPrefixes[kMaxResidentShards] = {};
         uint32_t missOffsets[kMaxResidentShards] = {};
+        uint32_t totalMissCount = 0;
+        uint32_t totalEvictableCount = 0;
+        uint32_t totalOldCount = 0;
         for (uint32_t shard = 0; shard < shardCount_; ++shard) {
             const uint64_t countOffset =
                 static_cast<uint64_t>(request)
@@ -323,22 +327,58 @@ public:
             missCounts[shard] = static_cast<uint32_t>(
                 shardCounts_.GetValue(
                     countOffset + kShardMissCount));
-            selectedEvictCounts_[shard] = static_cast<uint32_t>(
+            evictableCounts[shard] = static_cast<uint32_t>(
                 shardCounts_.GetValue(
-                    countOffset + kShardSelectedEvictCount));
-            missPrefixes[shard] = static_cast<uint32_t>(
+                    countOffset + kShardEvictableCount));
+            missPrefixes[shard] = totalMissCount;
+            totalMissCount += missCounts[shard];
+            totalEvictableCount += evictableCounts[shard];
+            totalOldCount += static_cast<uint32_t>(
                 shardCounts_.GetValue(
-                    countOffset + kShardMissPrefix));
-            selectedEvictPrefixes_[shard] = static_cast<uint32_t>(
-                shardCounts_.GetValue(
-                    countOffset + kShardSelectedEvictPrefix));
+                    countOffset + kShardOldCount));
         }
         const uint32_t totalSelectedEvictCount =
-            static_cast<uint32_t>(shardCounts_.GetValue(
-                ownerCountOffset + kShardTotalSelectedEvictCount));
-        const uint32_t totalOldCount =
-            static_cast<uint32_t>(shardCounts_.GetValue(
-                ownerCountOffset + kShardTotalOldCount));
+            totalMissCount < totalEvictableCount
+            ? totalMissCount
+            : totalEvictableCount;
+        uint32_t selectedEvictPrefix = 0;
+        uint32_t remainingEvictions = totalSelectedEvictCount;
+        for (uint32_t shard = 0; shard < shardCount_; ++shard) {
+            selectedEvictPrefixes_[shard] = selectedEvictPrefix;
+            selectedEvictCounts_[shard] =
+                evictableCounts[shard] < remainingEvictions
+                ? evictableCounts[shard]
+                : remainingEvictions;
+            selectedEvictPrefix += selectedEvictCounts_[shard];
+            remainingEvictions -= selectedEvictCounts_[shard];
+        }
+
+        shardCounts_.SetValue(
+            ownerCountOffset + kShardSelectedEvictCount,
+            static_cast<int32_t>(selectedEvictCounts_[ownerShard]));
+        shardCounts_.SetValue(
+            ownerCountOffset + kShardMissPrefix,
+            static_cast<int32_t>(missPrefixes[ownerShard]));
+        shardCounts_.SetValue(
+            ownerCountOffset + kShardSelectedEvictPrefix,
+            static_cast<int32_t>(selectedEvictPrefixes_[ownerShard]));
+        shardCounts_.SetValue(
+            ownerCountOffset + kShardTotalSelectedEvictCount,
+            static_cast<int32_t>(totalSelectedEvictCount));
+        shardCounts_.SetValue(
+            ownerCountOffset + kShardTotalOldCount,
+            static_cast<int32_t>(totalOldCount));
+        shardCounts_.SetValue(
+            ownerCountOffset + kShardTotalMissCount,
+            static_cast<int32_t>(totalMissCount));
+        if (ownerShard == 0) {
+            missCounts_.SetValue(
+                static_cast<uint64_t>(request) * missCountStride_,
+                static_cast<int32_t>(totalMissCount));
+        }
+        if (totalMissCount == 0) {
+            return;
+        }
 
         const uint64_t requestShardBase =
             static_cast<uint64_t>(request) * shardCount_ * capacity_;
@@ -536,6 +576,7 @@ private:
     AscendC::GlobalTensor<int16_t> shardMissPositions_;
     AscendC::GlobalTensor<int16_t> shardEvictableSlots_;
     AscendC::GlobalTensor<int32_t> missTokens_;
+    AscendC::GlobalTensor<int32_t> missCounts_;
     AscendC::GlobalTensor<int64_t> targetSlots_;
     AscendC::GlobalTensor<int32_t> requestBlockTable_;
     AscendC::TPipe pipe_;
@@ -551,6 +592,7 @@ private:
     uint32_t capacity_ = 0;
     uint32_t shardCountStride_ = 0;
     uint32_t shardCountRequestStride_ = 0;
+    uint32_t missCountStride_ = 0;
     uint32_t blockTableWidth_ = 0;
     uint32_t blockSize_ = 0;
     uint32_t blockTableEntries_ = 0;
@@ -584,6 +626,7 @@ dsa_resident_sharded_finalize_worker_kernel(
     __gm__ int16_t* shardMissPositions,
     __gm__ int16_t* shardEvictableSlots,
     __gm__ int32_t* missTokens,
+    __gm__ int32_t* missCounts,
     __gm__ int64_t* targetSlots,
     __gm__ int32_t* requestBlockTable,
     uint32_t requestCount,
@@ -591,6 +634,7 @@ dsa_resident_sharded_finalize_worker_kernel(
     uint32_t capacity,
     uint32_t shardCountStride,
     uint32_t shardCountRequestStride,
+    uint32_t missCountStride,
     uint32_t blockTableWidth,
     uint32_t blockSize)
 {
@@ -598,9 +642,10 @@ dsa_resident_sharded_finalize_worker_kernel(
     op.Init(
         shardCounts, priorSlots,
         shardMissTokens, shardMissPositions, shardEvictableSlots,
-        missTokens, targetSlots, requestBlockTable,
+        missTokens, missCounts, targetSlots, requestBlockTable,
         requestCount, shardCount, capacity,
         shardCountStride, shardCountRequestStride,
+        missCountStride,
         blockTableWidth, blockSize);
     op.Process();
 }
@@ -635,6 +680,7 @@ void dsa_resident_sharded_finalize_worker_impl(
     void* shardMissPositions,
     void* shardEvictableSlots,
     void* missTokens,
+    void* missCounts,
     void* targetSlots,
     void* requestBlockTable,
     uint32_t requestCount,
@@ -642,6 +688,7 @@ void dsa_resident_sharded_finalize_worker_impl(
     uint32_t capacity,
     uint32_t shardCountStride,
     uint32_t shardCountRequestStride,
+    uint32_t missCountStride,
     uint32_t blockTableWidth,
     uint32_t blockSize)
 {
@@ -653,10 +700,12 @@ void dsa_resident_sharded_finalize_worker_impl(
         static_cast<int16_t*>(shardMissPositions),
         static_cast<int16_t*>(shardEvictableSlots),
         static_cast<int32_t*>(missTokens),
+        static_cast<int32_t*>(missCounts),
         static_cast<int64_t*>(targetSlots),
         static_cast<int32_t*>(requestBlockTable),
         requestCount, shardCount, capacity,
         shardCountStride, shardCountRequestStride,
+        missCountStride,
         blockTableWidth, blockSize);
 }
 

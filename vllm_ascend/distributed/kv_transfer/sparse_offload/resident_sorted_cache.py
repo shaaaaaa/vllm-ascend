@@ -375,7 +375,7 @@ def run_sharded_resident_finalize_(
     *,
     block_size: int,
 ) -> None:
-    """Assign slots and emit compact LMCache payloads in parallel."""
+    """Self-coordinate, assign slots, and emit LMCache payloads by shard."""
     try:
         op = torch.ops._C_ascend.npu_dsa_resident_sharded_finalize_worker_
     except AttributeError as error:
@@ -389,6 +389,7 @@ def run_sharded_resident_finalize_(
         workspace.shard_miss_positions,
         workspace.shard_evictable_slots,
         workspace.miss_tokens,
+        workspace.miss_counts,
         workspace.target_slots,
         request_block_table,
         block_size,
@@ -405,8 +406,7 @@ def prepare_sorted_resident_cache_coordinated_(
     *,
     block_size: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Run the experimental tiny-coordinator, shard-worker planner."""
-    coordinate_sorted_resident_finalize_(workspace)
+    """Run the experimental self-coordinating two-kernel planner."""
     run_sharded_resident_finalize_(
         request_block_table,
         workspace,

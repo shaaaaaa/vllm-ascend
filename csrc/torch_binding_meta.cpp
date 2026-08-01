@@ -293,6 +293,7 @@ at::Tensor npu_dsa_resident_sharded_finalize_worker_meta(
     const at::Tensor &shard_miss_positions,
     const at::Tensor &shard_evictable_slots,
     at::Tensor &miss_tokens,
+    at::Tensor &miss_counts,
     at::Tensor &target_slots,
     const at::Tensor &request_block_table,
     int64_t block_size)
@@ -302,6 +303,7 @@ at::Tensor npu_dsa_resident_sharded_finalize_worker_meta(
     (void)shard_miss_tokens;
     (void)shard_miss_positions;
     (void)shard_evictable_slots;
+    (void)miss_counts;
     (void)target_slots;
     (void)request_block_table;
     (void)block_size;

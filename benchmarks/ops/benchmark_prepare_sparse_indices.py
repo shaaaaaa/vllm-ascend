@@ -1181,8 +1181,8 @@ def main(
             mtp=mtp,
         )
 
-        # Validate the experimental decomposition from the same union/state
-        # seed, then retain the coordinator output for isolated worker timing.
+        # Validate the self-coordinating sharded finalize from the same
+        # union/state seed. The coordinator remains an isolated comparison.
         resident_union_values.copy_(source)
         restore_resident_state()
         resident_union_workspace.shard_packed.copy_(resident_union_seed[0])
@@ -1192,17 +1192,14 @@ def main(
         resident_union_workspace.shard_miss_tokens.copy_(resident_union_seed[4])
         resident_union_workspace.shard_miss_positions.copy_(resident_union_seed[5])
         resident_union_workspace.shard_evictable_slots.copy_(resident_union_seed[6])
-        resident_finalize_coordinator()
-        torch.npu.synchronize()
-        resident_coordinator_seed = resident_union_workspace.shard_counts.clone()
         resident_sharded_finalize_worker()
         torch.npu.synchronize()
         if resident_union_workspace.miss_counts[:, 0].cpu().tolist() != [resident_expected_misses] * request_batch:
-            raise AssertionError("coordinated resident finalize emitted an incorrect miss count")
+            raise AssertionError("sharded resident finalize emitted an incorrect miss count")
         coordinated_selected_evicts = resident_union_workspace.shard_counts[:, :, 4].sum(dim=1).cpu().tolist()
         if coordinated_selected_evicts != [resident_selected_evicts] * request_batch:
             raise AssertionError(
-                "resident coordinator selected an incorrect evict prefix: "
+                "resident sharded finalize selected an incorrect evict prefix: "
                 f"actual={coordinated_selected_evicts}, "
                 f"expected={resident_selected_evicts}"
             )
@@ -1236,7 +1233,7 @@ def main(
             resident_union_workspace.shard_counts.copy_(resident_union_seed[2])
 
         def reset_resident_sharded_finalize():
-            resident_union_workspace.shard_counts.copy_(resident_coordinator_seed)
+            resident_union_workspace.shard_counts.copy_(resident_union_seed[2])
             resident_union_workspace.prior_slots.copy_(resident_union_seed[3])
 
         def reset_resident_update():
@@ -1501,12 +1498,12 @@ def main(
         _summary("resident-update+remap-kernel", resident_update_samples)
         _summary("resident-plan-two-kernel", resident_plan_samples)
         _summary(
-            "resident-coordinated-three-kernel",
+            "resident-sharded-plan-two-kernel",
             resident_coordinated_plan_samples,
         )
         _summary("resident-end-to-end", resident_end_to_end_samples)
         _summary(
-            "resident-coordinated-end-to-end",
+            "resident-sharded-end-to-end",
             resident_coordinated_end_to_end_samples,
         )
         resident_finalize_mean = statistics.fmean(resident_finalize_samples)
@@ -1524,10 +1521,10 @@ def main(
             f"slower={slower_stage}, "
             f"isolated_sum-plan={resident_isolated_sum - resident_plan_mean:+.6f} ms"
         )
-        coordinated_isolated_sum = resident_coordinator_mean + resident_sharded_finalize_mean + resident_update_mean
+        coordinated_isolated_sum = resident_sharded_finalize_mean + resident_update_mean
         print(
-            "resident coordinated breakdown: "
-            f"coordinator={resident_coordinator_mean:.6f} ms, "
+            "resident sharded-plan breakdown: "
+            f"coordinator-isolated={resident_coordinator_mean:.6f} ms, "
             f"sharded_finalize={resident_sharded_finalize_mean:.6f} ms, "
             f"update+remap={resident_update_mean:.6f} ms, "
             f"isolated_sum-plan="
