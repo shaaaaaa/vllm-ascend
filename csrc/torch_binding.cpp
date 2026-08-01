@@ -1478,8 +1478,7 @@ at::Tensor resident_sharded_union_common_(
     }
     TORCH_CHECK(
         row_width == 2048 &&
-            (shard_count == expected_shard_count ||
-             (mtp == 1 && shard_count == 4)) &&
+            shard_count == expected_shard_count &&
             shard_capacity == request_width &&
             request_width % (16 * shard_count) == 0 &&
             split_boundary.numel() >= row_count &&
@@ -1751,8 +1750,7 @@ static at::Tensor resident_sorted_plan_common_(
         rows_per_request >= 1 && rows_per_request <= 2 &&
             row_width == 2048 &&
             capacity == request_width &&
-            (shard_count == expected_shard_count ||
-             (rows_per_request == 1 && shard_count == 4)) &&
+            shard_count == expected_shard_count &&
             request_width % (16 * shard_count) == 0 &&
             block_size > 0 &&
             block_table_width * block_size >= capacity,
@@ -2233,8 +2231,7 @@ at::Tensor npu_dsa_resident_sorted_update_debug_(
     TORCH_CHECK(
         rows_per_request >= 1 && rows_per_request <= 2 &&
             row_width == 2048 && capacity == request_width &&
-            (shard_count == expected_shard_count ||
-             (rows_per_request == 1 && shard_count == 4)) &&
+            shard_count == expected_shard_count &&
             request_width % (16 * shard_count) == 0 &&
             dummy_state_base >= request_count &&
             state_row_count >= dummy_state_base + request_count &&
@@ -2357,8 +2354,7 @@ at::Tensor npu_dsa_resident_sorted_remap_(
         rows_per_request >= 1 && rows_per_request <= 2 &&
             row_width == 2048 &&
             request_width == capacity &&
-            (shard_count == expected_shard_count ||
-             (rows_per_request == 1 && shard_count == 4)) &&
+            shard_count == expected_shard_count &&
             request_width % (16 * shard_count) == 0 &&
             shard_mapping.size(2) == request_width &&
             shard_counts.size(0) == request_count &&

@@ -606,7 +606,6 @@ def main(
     iterations: int = 200,
     warmups: int = 20,
     resident_hit_rate: float = 0.9,
-    resident_shards: int | None = None,
 ) -> None:
     if topk != 2048:
         raise ValueError("the experimental staged kernels currently require --topk 2048")
@@ -614,23 +613,10 @@ def main(
         raise ValueError("the sharded benchmark supports --mtp from 1 to 8")
     if not enable_custom_op():
         raise RuntimeError("vllm-ascend custom operators could not be loaded")
-    default_resident_shards = resident_shard_count(mtp) if mtp <= 2 else None
-    if resident_shards is not None and not (
-        mtp <= 2
-        and resident_shards in {default_resident_shards, 4}
-    ):
-        raise ValueError(
-            "--resident-shards supports MTP=1 with 2/4 shards and MTP=2 with 4 shards"
-        )
-    resolved_resident_shards = (
-        default_resident_shards
-        if mtp <= 2 and resident_shards is None
-        else resident_shards
-    )
     print(
         f"MTP depth={mtp}, "
         f"legacy value shards={1 << (mtp - 1).bit_length()}, "
-        f"resident shards={resolved_resident_shards if mtp <= 2 else 'n/a'}"
+        f"resident shards={resident_shard_count(mtp) if mtp <= 2 else 'n/a'}"
     )
     legacy_op = torch.ops._C_ascend.npu_dsa_prepare_sparse_indices_legacy_
     union_op = torch.ops._C_ascend.npu_dsa_staged_union_
@@ -754,7 +740,6 @@ def main(
             request_batch,
             mtp,
             device=torch.device("npu"),
-            shard_count=resident_shards,
         )
         if mtp <= 2
         else None
@@ -765,7 +750,6 @@ def main(
             request_batch,
             mtp,
             device=torch.device("npu"),
-            shard_count=resident_shards,
         )
         if mtp <= 2
         else None
@@ -1108,7 +1092,7 @@ def main(
             request_batch=request_batch,
             valid_token_count=sharded_boundary,
             capacity=capacity,
-            shard_count=resolved_resident_shards,
+            shard_count=resident_shard_count(mtp),
             hit_rate=resident_hit_rate,
         )
         resident_state_seed = (
@@ -1132,7 +1116,7 @@ def main(
         actual_misses = []
         for request in range(request_batch):
             request_misses = 0
-            for shard in range(resolved_resident_shards):
+            for shard in range(resident_shard_count(mtp)):
                 count = int(count_cpu[request, shard])
                 request_misses += int((prior_cpu[request, shard, :count] < 0).sum())
             actual_misses.append(request_misses)
@@ -1645,15 +1629,6 @@ if __name__ == "__main__":
     parser.add_argument("--requests", type=int, default=4)
     parser.add_argument("--hit-rate", type=float, default=0.9)
     parser.add_argument(
-        "--resident-shards",
-        type=int,
-        default=None,
-        help=(
-            "benchmark-only resident value-shard override; currently MTP=1 "
-            "supports 2/4 to compare shard parallelism"
-        ),
-    )
-    parser.add_argument(
         "--parallel-map",
         action="store_true",
         help=("deprecated compatibility flag for the standalone resident benchmark"),
@@ -1698,5 +1673,4 @@ if __name__ == "__main__":
             args.iterations,
             args.warmups,
             args.hit_rate,
-            args.resident_shards,
         )

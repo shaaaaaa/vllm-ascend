@@ -1711,14 +1711,9 @@ def _coordinated_seed(current_shards, scenario):
     }
 
 
-@pytest.mark.parametrize(
-    "mtp,shard_count_override",
-    [(1, None), (1, 4), (2, None)],
-)
+@pytest.mark.parametrize("mtp", [1, 2])
 @pytest.mark.parametrize("scenario", ["empty", "resident90", "cross_shard"])
-def test_coordinated_finalize_matches_production(
-    mtp, shard_count_override, scenario
-):
+def test_coordinated_finalize_matches_production(mtp, scenario):
     requests = 2
     capacity = mtp * 2048
     block_size = 128
@@ -1735,7 +1730,7 @@ def test_coordinated_finalize_matches_production(
     request_generations = torch.arange(
         11, 11 + requests, dtype=torch.int64, device="npu"
     )
-    shard_count = resident_shard_count(mtp, shard_count_override)
+    shard_count = resident_shard_count(mtp)
     expected_shards = _expected_shards(
         source, boundaries_cpu, requests, mtp, shard_count
     )
@@ -1750,20 +1745,13 @@ def test_coordinated_finalize_matches_production(
 
     states = [
         allocate_sorted_resident_state(
-            requests,
-            requests,
-            mtp,
-            device=torch.device("npu"),
-            shard_count=shard_count_override,
+            requests, requests, mtp, device=torch.device("npu")
         )
         for _ in range(2)
     ]
     workspaces = [
         allocate_sorted_resident_workspace(
-            requests,
-            mtp,
-            device=torch.device("npu"),
-            shard_count=shard_count_override,
+            requests, mtp, device=torch.device("npu")
         )
         for _ in range(2)
     ]
@@ -1855,13 +1843,8 @@ def test_coordinated_finalize_matches_production(
         )
 
 
-@pytest.mark.parametrize(
-    "mtp,shard_count_override",
-    [(1, None), (1, 4), (2, None)],
-)
-def test_coordinated_finalize_supports_graph_replay(
-    mtp, shard_count_override
-):
+@pytest.mark.parametrize("mtp", [1, 2])
+def test_coordinated_finalize_supports_graph_replay(mtp):
     requests = 1
     capacity = mtp * 2048
     source = _source(mtp, 0)
@@ -1879,17 +1862,10 @@ def test_coordinated_finalize_supports_graph_replay(
         capacity // 128, dtype=torch.int32, device="npu"
     ).reshape(1, -1)
     workspace = allocate_sorted_resident_workspace(
-        requests,
-        mtp,
-        device=torch.device("npu"),
-        shard_count=shard_count_override,
+        requests, mtp, device=torch.device("npu")
     )
     state = allocate_sorted_resident_state(
-        requests,
-        requests,
-        mtp,
-        device=torch.device("npu"),
-        shard_count=shard_count_override,
+        requests, requests, mtp, device=torch.device("npu")
     )
 
     graph = torch.npu.NPUGraph()

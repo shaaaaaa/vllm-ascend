@@ -21,16 +21,11 @@ RESIDENT_READ_PROBE_DEBUG_INTS = 32
 RESIDENT_FINALIZE_DEBUG_INTS = 16
 
 
-def resident_shard_count(mtp: int, shard_count: int | None = None) -> int:
-    """Resolve value shards: defaults to MTP=1 -> 2 and MTP=2 -> 4."""
+def resident_shard_count(mtp: int) -> int:
+    """Return the strictly next power of two: MTP=1 -> 2, MTP=2 -> 4."""
     if mtp not in (1, 2):
         raise ValueError("sorted resident path supports only MTP=1 or MTP=2")
-    default_shard_count = 1 << mtp.bit_length()
-    if shard_count is None or shard_count == default_shard_count:
-        return default_shard_count
-    if mtp == 1 and shard_count == 4:
-        return shard_count
-    raise ValueError("resident shard count supports MTP=1 with 2/4 and MTP=2 with 4")
+    return 1 << mtp.bit_length()
 
 
 @dataclass
@@ -66,12 +61,11 @@ def allocate_sorted_resident_state(
     mtp: int,
     *,
     device: torch.device,
-    shard_count: int | None = None,
 ) -> SortedResidentState:
     """Allocate persistent sorted state plus request-private dummy rows."""
     if state_capacity < max_active_requests:
         raise ValueError("state capacity must cover every active request")
-    shard_count = resident_shard_count(mtp, shard_count)
+    shard_count = resident_shard_count(mtp)
     scratch_capacity = mtp * INDEX_TOPK
     state_rows = state_capacity + max_active_requests
     return SortedResidentState(
@@ -109,12 +103,11 @@ def allocate_sorted_resident_workspace(
     mtp: int,
     *,
     device: torch.device,
-    shard_count: int | None = None,
 ) -> SortedResidentWorkspace:
     """Allocate fixed-address workspaces for MTP=1 or MTP=2."""
     if request_count <= 0:
         raise ValueError("request count must be positive")
-    shard_count = resident_shard_count(mtp, shard_count)
+    shard_count = resident_shard_count(mtp)
     capacity = mtp * INDEX_TOPK
     shard_shape = (request_count, shard_count, capacity)
     count_shape = (
