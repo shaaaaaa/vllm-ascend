@@ -64,11 +64,16 @@ from vllm_ascend.distributed.kv_transfer.sparse_offload import _prof as _dsa_pro
 from vllm_ascend.distributed.kv_transfer.sparse_offload.prepare_sparse_indices import (
     prepare_sparse_indices,
 )
-from vllm_ascend.distributed.kv_transfer.sparse_offload.resident_sparse_cache import (
+from vllm_ascend.distributed.kv_transfer.sparse_offload.resident_sorted_cache import (
+    INDEX_TOPK,
     MAX_INT16_SCRATCH_CAPACITY,
-    ResidentSparseWorkspace,
-    allocate_resident_workspace,
-    prepare_resident_sparse_cache_,
+    SortedResidentState,
+    SortedResidentWorkspace,
+    allocate_sorted_resident_state,
+    allocate_sorted_resident_workspace,
+    prepare_resident_sharded_union_,
+    prepare_sorted_resident_cache_fused_,
+    sorted_resident_workspace_prefix,
 )
 from vllm_ascend.distributed.utils import all_gather_async
 from vllm_ascend.ops.layer_shard_linear import (
@@ -1760,12 +1765,17 @@ class AscendSFAImpl(MLAAttentionImpl):
                 "staged sparse-index preparation only supports MTP=1 or "
                 f"MTP=2; got MTP={self.decode_threshold}"
             )
-        # Persistent residency is always active for compact shrink-latent.
-        self.dsa_resident_cache = bool(self.dsa_shrink_latent)
-        self._resident_token_to_slot: torch.Tensor | None = None
-        self._resident_slot_to_token: torch.Tensor | None = None
-        self._resident_state_generations: torch.Tensor | None = None
-        self._resident_workspace: ResidentSparseWorkspace | None = None
+        # Select one startup-static branch so graph replay keeps fixed tensor
+        # addresses and never reads an environment variable.
+        self.dsa_resident_cache = bool(
+            self.dsa_shrink_latent
+            and envs.VLLM_ASCEND_DSA_RESIDENT_CACHE
+        )
+        self._sorted_resident_state: SortedResidentState | None = None
+        self._sorted_resident_workspace: SortedResidentWorkspace | None = None
+        self._sorted_resident_workspace_views: dict[
+            int, SortedResidentWorkspace
+        ] = {}
         if self.dsa_resident_cache:
             scratch_capacity = self.decode_threshold * self.index_topk
             if not (
@@ -1776,40 +1786,27 @@ class AscendSFAImpl(MLAAttentionImpl):
                     "slots and 0 < MTP * index_topk < "
                     f"{MAX_INT16_SCRATCH_CAPACITY}; got {scratch_capacity}"
                 )
+            if self.index_topk != INDEX_TOPK:
+                raise ValueError(
+                    "sorted resident cache currently requires index_topk="
+                    f"{INDEX_TOPK}; got {self.index_topk}"
+                )
             max_requests = int(
                 self.vllm_config.scheduler_config.max_num_seqs
             )
-            # Each possible graph-dummy request owns a separate sink row, so
-            # no two request workers write one cacheline.
-            state_rows = 2 * max_requests
-            token_stride = _round_up(
-                int(self.vllm_config.model_config.max_model_len) + 1,
-                32,
-            )
-            slot_stride = _round_up(scratch_capacity + 1, 16)
             state_device = self.q_b_proj.weight.device
-            self._resident_token_to_slot = torch.full(
-                (state_rows, token_stride),
-                -1,
-                dtype=torch.int16,
-                device=state_device,
-            )
-            self._resident_slot_to_token = torch.full(
-                (state_rows, slot_stride),
-                -1,
-                dtype=torch.int32,
-                device=state_device,
-            )
-            self._resident_state_generations = torch.full(
-                (state_rows, 8),
-                -1,
-                dtype=torch.int64,
-                device=state_device,
-            )
-            self._resident_workspace = allocate_resident_workspace(
+            self._sorted_resident_state = allocate_sorted_resident_state(
                 max_requests,
-                scratch_capacity,
+                max_requests,
+                self.decode_threshold,
                 device=state_device,
+            )
+            self._sorted_resident_workspace = (
+                allocate_sorted_resident_workspace(
+                    max_requests,
+                    self.decode_threshold,
+                    device=state_device,
+                )
             )
         self.enable_staged_sfa_graph = staged_sfa_graph_configured(self.vllm_config)
         self._staged_sfa_graph_capture_sizes = (
@@ -2794,57 +2791,125 @@ class AscendSFAImpl(MLAAttentionImpl):
                 kv_caches,
             )
 
-    def _prepare_resident_sparse_cache(
+    def _prepare_sorted_resident_sparse_cache(
         self,
         topk_indices: torch.Tensor,
-        position_to_union: torch.Tensor,
-        selected_packed: torch.Tensor,
-        selected_counts: torch.Tensor,
-        target_slot_mapping: torch.Tensor,
+        split_boundary: torch.Tensor,
+        row_req_indices: torch.Tensor,
         request_block_table: torch.Tensor,
         request_state_indices: torch.Tensor | None,
         request_state_generations: torch.Tensor | None,
+        *,
+        mtp: int,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        if not self.dsa_resident_cache:
-            counts = (
-                selected_counts[:, 0]
-                if selected_counts.dim() == 2
-                else selected_counts
-            )
-            return (
-                topk_indices,
-                selected_packed,
-                counts,
-                target_slot_mapping,
-            )
         if (
             request_state_indices is None
             or request_state_generations is None
-            or self._resident_token_to_slot is None
-            or self._resident_slot_to_token is None
-            or self._resident_state_generations is None
-            or self._resident_workspace is None
+            or self._sorted_resident_state is None
+            or self._sorted_resident_workspace is None
         ):
             raise RuntimeError(
-                "resident sparse cache is enabled but its fixed state or "
-                "request metadata is unavailable"
+                "sorted resident cache is enabled but its fixed state, "
+                "workspace, or request metadata is unavailable"
             )
-        return prepare_resident_sparse_cache_(
+        request_count = int(request_block_table.shape[0])
+        if int(topk_indices.shape[0]) != request_count * mtp:
+            raise RuntimeError(
+                "sorted resident cache requires request-major decode rows: "
+                f"rows={topk_indices.shape[0]}, requests={request_count}, "
+                f"MTP={mtp}"
+            )
+        workspace = self._sorted_resident_workspace_views.get(request_count)
+        if workspace is None:
+            workspace = sorted_resident_workspace_prefix(
+                self._sorted_resident_workspace,
+                request_count,
+            )
+            self._sorted_resident_workspace_views[request_count] = workspace
+        prepare_resident_sharded_union_(
             topk_indices,
-            position_to_union,
-            selected_packed,
-            selected_counts,
-            target_slot_mapping,
-            request_block_table,
+            split_boundary,
+            row_req_indices,
             request_state_indices,
             request_state_generations,
-            self._resident_token_to_slot,
-            self._resident_slot_to_token,
-            self._resident_state_generations,
-            self._resident_workspace,
+            self._sorted_resident_state,
+            workspace,
+            mtp=mtp,
+        )
+        miss_tokens, miss_counts, target_slots = (
+            prepare_sorted_resident_cache_fused_(
+                topk_indices,
+                request_block_table,
+                request_state_indices,
+                request_state_generations,
+                self._sorted_resident_state,
+                workspace,
+                block_size=self.block_size,
+            )
+        )
+        return (
+            topk_indices,
+            miss_tokens,
+            miss_counts,
+            target_slots,
+        )
+
+    def _prepare_decode_sparse_indices(
+        self,
+        topk_indices: torch.Tensor,
+        split_boundary: torch.Tensor,
+        row_req_indices: torch.Tensor,
+        request_block_table: torch.Tensor,
+        selected_packed: torch.Tensor,
+        selected_counts: torch.Tensor,
+        target_slot_mapping: torch.Tensor,
+        request_state_indices: torch.Tensor | None,
+        request_state_generations: torch.Tensor | None,
+        *,
+        local_to_union_workspace: torch.Tensor | None,
+        shard_packed_workspace: torch.Tensor | None,
+        shard_mapping_workspace: torch.Tensor | None,
+        shard_counts_workspace: torch.Tensor | None,
+        staged_mtp: int | None,
+        need_packed: bool,
+        clear_invalid_rows: bool,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor | None,
+        torch.Tensor | None,
+        torch.Tensor | None,
+    ]:
+        """Select the startup-static resident or ordinary decode planner."""
+        if (
+            self.dsa_resident_cache
+            and need_packed
+            and staged_mtp is not None
+        ):
+            return self._prepare_sorted_resident_sparse_cache(
+                topk_indices,
+                split_boundary,
+                row_req_indices,
+                request_block_table,
+                request_state_indices,
+                request_state_generations,
+                mtp=staged_mtp,
+            )
+        return prepare_sparse_indices(
+            topk_indices,
+            split_boundary,
+            row_req_indices=row_req_indices,
+            request_block_table=request_block_table,
+            selected_packed=selected_packed,
+            selected_counts=selected_counts,
+            target_slot_mapping=target_slot_mapping,
             block_size=self.block_size,
-            scratch_capacity=self.decode_threshold * self.index_topk,
-            parallel_map=True,
+            need_packed=need_packed,
+            clear_invalid_rows=clear_invalid_rows,
+            local_to_union_workspace=local_to_union_workspace,
+            shard_packed_workspace=shard_packed_workspace,
+            shard_mapping_workspace=shard_mapping_workspace,
+            shard_counts_workspace=shard_counts_workspace,
+            staged_mtp=staged_mtp,
         )
 
     def _cross_layer_pre_compute(
@@ -2925,47 +2990,36 @@ class AscendSFAImpl(MLAAttentionImpl):
             actual_seq_lengths_key=actual_seq_lengths_key,
             indexer_block_table_override=indexer_block_table,
         )
+        staged_mtp = (
+            int(topk_indices.shape[0])
+            // int(request_block_table.shape[0])
+        )
         (
             topk_indices,
             selected_packed,
             selected_count_values,
             target_slot_mapping,
-        ) = prepare_sparse_indices(
+        ) = self._prepare_decode_sparse_indices(
             topk_indices,
             remap_boundary,
-            row_req_indices=row_req_indices,
-            request_block_table=request_block_table,
-            selected_packed=selected_packed,
-            selected_counts=selected_counts,
-            target_slot_mapping=target_slot_mapping,
-            block_size=self.block_size,
-            need_packed=True,
-            clear_invalid_rows=True,
+            row_req_indices,
+            request_block_table,
+            selected_packed,
+            selected_counts,
+            target_slot_mapping,
+            request_state_indices,
+            request_state_generations,
             local_to_union_workspace=local_to_union_workspace,
             shard_packed_workspace=shard_packed_workspace,
             shard_mapping_workspace=shard_mapping_workspace,
             shard_counts_workspace=shard_counts_workspace,
-            staged_mtp=int(topk_indices.shape[0])
-            // int(request_block_table.shape[0]),
+            staged_mtp=staged_mtp,
+            need_packed=True,
+            clear_invalid_rows=True,
         )
         assert selected_packed is not None
         assert selected_count_values is not None
         assert target_slot_mapping is not None
-        (
-            topk_indices,
-            selected_packed,
-            selected_count_values,
-            target_slot_mapping,
-        ) = self._prepare_resident_sparse_cache(
-            topk_indices,
-            local_to_union_workspace,
-            selected_packed,
-            selected_counts,
-            target_slot_mapping,
-            request_block_table,
-            request_state_indices,
-            request_state_generations,
-        )
         return (
             ql_nope,
             q_pe,
@@ -3335,7 +3389,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                 target_slot_mapping=target_slots[:request_count],
                 selected_token_counts=selected_counts[:request_count],
                 payload_event=producer_event,
-                require_complete_sparse_load=self.dsa_resident_cache,
+                require_complete_sparse_load=bool(self.dsa_shrink_latent),
             )
             if _LMCACHE_SPARSE_WAIT_SYNC_ONCE and not _lmcache_sparse_wait_sync_once_done:
                 _sync_compute_stream_after_lmcache_sparse_wait()
@@ -3749,17 +3803,16 @@ class AscendSFAImpl(MLAAttentionImpl):
                     _sel_packed,
                     _selected_token_counts,
                     _target_slot_mapping,
-                ) = prepare_sparse_indices(
+                ) = self._prepare_decode_sparse_indices(
                     topk_indices,
                     _split_boundary,
-                    row_req_indices=_row_req_indices,
-                    request_block_table=attn_metadata.block_table,
-                    selected_packed=attn_metadata.decode_selected_tokens,
-                    selected_counts=attn_metadata.decode_selected_counts,
-                    target_slot_mapping=attn_metadata.decode_target_slot_mapping,
-                    block_size=self.block_size,
-                    need_packed=_need_packed,
-                    clear_invalid_rows=_is_pure_decode,
+                    _row_req_indices,
+                    attn_metadata.block_table,
+                    attn_metadata.decode_selected_tokens,
+                    attn_metadata.decode_selected_counts,
+                    attn_metadata.decode_target_slot_mapping,
+                    attn_metadata.resident_state_indices,
+                    attn_metadata.resident_state_generations,
                     local_to_union_workspace=(
                         attn_metadata.decode_union_mapping_workspace
                         if _staged_mtp is not None
@@ -3781,34 +3834,9 @@ class AscendSFAImpl(MLAAttentionImpl):
                         else None
                     ),
                     staged_mtp=_staged_mtp,
+                    need_packed=_need_packed,
+                    clear_invalid_rows=_is_pure_decode,
                 )
-                if self.dsa_resident_cache and _need_packed:
-                    if (
-                        _sel_packed is None
-                        or _target_slot_mapping is None
-                        or attn_metadata.decode_selected_counts is None
-                        or attn_metadata.decode_union_mapping_workspace
-                        is None
-                    ):
-                        raise RuntimeError(
-                            "resident sparse cache requires the packed "
-                            "request-union outputs"
-                        )
-                    (
-                        topk_indices,
-                        _sel_packed,
-                        _selected_token_counts,
-                        _target_slot_mapping,
-                    ) = self._prepare_resident_sparse_cache(
-                        topk_indices,
-                        attn_metadata.decode_union_mapping_workspace,
-                        _sel_packed,
-                        attn_metadata.decode_selected_counts,
-                        _target_slot_mapping,
-                        attn_metadata.block_table,
-                        attn_metadata.resident_state_indices,
-                        attn_metadata.resident_state_generations,
-                    )
             _sparse_indices_padding_zeroed = _is_pure_decode
             _diag_context = get_forward_context() if _mtp_dw_diag_enabled() and _diag_remap_build else None
             if _diag_context is not None and getattr(_diag_context, "mtp_dw_diag_req_ids", None):
@@ -4182,7 +4210,7 @@ class AscendSFAImpl(MLAAttentionImpl):
             # matters (crash => our remap/FA, clean => LMCache transfer kernel).
             if self.dsa_shrink_latent != 3 and _sel_packed is not None:
                 _selected_for_wait = _sel_packed
-                _target_slot_mapping_for_wait = attn_metadata.decode_target_slot_mapping
+                _target_slot_mapping_for_wait = _target_slot_mapping
                 _request_ids_for_wait = attn_metadata.decode_request_ids_compact
                 _wait_fn = wait_for_kv_layer_from_connector
                 with _dsa_prof.section("lmc_retrieve"):
@@ -4192,7 +4220,9 @@ class AscendSFAImpl(MLAAttentionImpl):
                         target_slot_mapping=_target_slot_mapping_for_wait,
                         request_ids=_request_ids_for_wait,
                         selected_token_counts=_selected_token_counts,
-                        require_complete_sparse_load=self.dsa_resident_cache,
+                        require_complete_sparse_load=bool(
+                            self.dsa_shrink_latent
+                        ),
                     )
                 if _LMCACHE_SPARSE_WAIT_SYNC_ONCE and not _lmcache_sparse_wait_sync_once_done:
                     _sync_compute_stream_after_lmcache_sparse_wait()

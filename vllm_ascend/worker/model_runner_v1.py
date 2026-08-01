@@ -663,8 +663,12 @@ class NPUModelRunner(GPUModelRunner):
             self.cudagraph_batch_sizes = []
         self.mamba_state_idx: dict[str, int] = {}
         self._mamba_copy_bufs: mamba_utils.MambaCopyBuffers | None = None
-        # Persistent scratch residency is the production shrink-latent path.
-        self.dsa_resident_cache = bool(self.dsa_shrink_latent)
+        # The disabled path still uses compact scratch, but retrieves the
+        # complete split-boundary union.
+        self.dsa_resident_cache = bool(
+            self.dsa_shrink_latent
+            and envs_ascend.VLLM_ASCEND_DSA_RESIDENT_CACHE
+        )
         self._resident_state_registry: ResidentRequestStateRegistry | None = None
         self._resident_state_indices = None
         self._resident_state_generations = None
@@ -693,7 +697,7 @@ class NPUModelRunner(GPUModelRunner):
                 self.max_num_reqs, dtype=torch.int64
             )
             logger.info(
-                "DSA resident sparse scratch enabled: capacity=%d, "
+                "DSA sorted resident scratch reuse enabled: capacity=%d, "
                 "state_slots=%d.",
                 self._resident_scratch_capacity,
                 self.max_num_reqs,
@@ -721,6 +725,7 @@ class NPUModelRunner(GPUModelRunner):
         num_reqs: int,
         num_reqs_padded: int,
         is_dummy: bool,
+        decode_only: bool = True,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None, Any, Any]:
         registry = self._resident_state_registry
         indices = self._resident_state_indices
@@ -736,6 +741,11 @@ class NPUModelRunner(GPUModelRunner):
                 raise RuntimeError(
                     "resident sparse cache received an empty request id"
                 )
+            if not decode_only:
+                # Mixed batches use the ordinary union and may overwrite
+                # scratch without updating sorted state. The next decode-only
+                # step must therefore observe a generation mismatch.
+                registry.invalidate(request_ids)  # type: ignore[arg-type]
             block_table = self.input_batch.block_table[0]
             scratch_blocks = cdiv(
                 self._resident_scratch_capacity,
@@ -2850,6 +2860,14 @@ class NPUModelRunner(GPUModelRunner):
             num_reqs=num_reqs,
             num_reqs_padded=num_reqs_padded,
             is_dummy=staged_sfa_graph_dummy_run,
+            decode_only=(
+                staged_sfa_graph_dummy_run
+                or self.attn_state
+                in (
+                    AscendAttentionState.DecodeOnly,
+                    AscendAttentionState.SpecDecoding,
+                )
+            ),
         )
 
         cm_base = AscendCommonAttentionMetadata(

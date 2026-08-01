@@ -11,6 +11,7 @@ from vllm_ascend.distributed.kv_transfer.sparse_offload.resident_sorted_cache im
     allocate_sorted_resident_state,
     allocate_sorted_resident_workspace,
     prepare_resident_sharded_union_,
+    prepare_sorted_resident_cache_fused_,
     resident_shard_count,
 )
 from vllm_ascend.utils import enable_custom_op
@@ -99,6 +100,44 @@ def _validate_resident_sharded_union(
                 raise AssertionError(
                     "resident shard mapping does not point at its token"
                 )
+
+
+def _validate_resident_remap(
+    source: torch.Tensor,
+    boundary: int,
+    remapped: torch.Tensor,
+    state,
+    *,
+    mtp: int,
+) -> None:
+    request_batch = int(source.shape[0]) // mtp
+    source_cpu = source.reshape(request_batch, mtp, -1).cpu()
+    remapped_cpu = remapped.reshape(request_batch, mtp, -1).cpu()
+    tokens_cpu = state.tokens[:request_batch].cpu()
+    slots_cpu = state.slots[:request_batch].cpu()
+    counts_cpu = state.counts[:request_batch, :, 0].cpu()
+    for request in range(request_batch):
+        token_to_slot = {}
+        for shard in range(tokens_cpu.shape[1]):
+            count = int(counts_cpu[request, shard])
+            token_to_slot.update(
+                zip(
+                    tokens_cpu[request, shard, :count].tolist(),
+                    slots_cpu[request, shard, :count].tolist(),
+                    strict=True,
+                )
+            )
+        expected = source_cpu[request].clone()
+        for row in range(mtp):
+            for position, token in enumerate(
+                source_cpu[request, row].tolist()
+            ):
+                if 0 <= token < boundary:
+                    expected[row, position] = token_to_slot[token]
+        if not torch.equal(remapped_cpu[request], expected):
+            raise AssertionError(
+                f"resident fused remap differs for request {request}"
+            )
 
 
 def _summary(name: str, samples: list[float]) -> None:
@@ -700,6 +739,9 @@ def main(
     resident_request_generations = torch.ones(
         request_batch, dtype=torch.int64, device="npu"
     )
+    resident_cold_generations = torch.full(
+        (request_batch,), 2, dtype=torch.int64, device="npu"
+    )
 
     def staged(values, buffers, use_sort):
         return _staged_runner(
@@ -801,7 +843,9 @@ def main(
             block_size=block_size,
         )
 
-    def resident_sharded_union():
+    def resident_sharded_union(
+        request_generations=resident_request_generations,
+    ):
         assert resident_union_workspace is not None
         assert resident_union_state is not None
         prepare_resident_sharded_union_(
@@ -809,11 +853,28 @@ def main(
             sharded_boundaries,
             row_requests,
             resident_request_states,
-            resident_request_generations,
+            request_generations,
             resident_union_state,
             resident_union_workspace,
             mtp=mtp,
         )
+
+    def resident_fused_finalize():
+        assert resident_union_workspace is not None
+        assert resident_union_state is not None
+        prepare_sorted_resident_cache_fused_(
+            resident_union_values,
+            block_table,
+            resident_request_states,
+            resident_request_generations,
+            resident_union_state,
+            resident_union_workspace,
+            block_size=block_size,
+        )
+
+    def resident_end_to_end():
+        resident_sharded_union()
+        resident_fused_finalize()
 
     pair_baselines = mtp == 2
     native_unique_baseline = mtp in (2, 3)
@@ -959,6 +1020,33 @@ def main(
             resident_union_workspace.shard_counts,
             mtp=mtp,
         )
+        # Validate the exact production pair once cold and once resident. The
+        # first finalize must emit the complete union; the next identical step
+        # must emit no LMCache payload while still remapping every top-k row.
+        resident_fused_finalize()
+        torch.npu.synchronize()
+        if resident_union_workspace.miss_counts[:, 0].cpu().tolist() != [
+            sharded_boundary
+        ] * request_batch:
+            raise AssertionError(
+                "cold resident fused path emitted an incorrect miss count"
+            )
+        resident_union_values.copy_(source)
+        resident_end_to_end()
+        torch.npu.synchronize()
+        if resident_union_workspace.miss_counts[:, 0].cpu().tolist() != [
+            0
+        ] * request_batch:
+            raise AssertionError(
+                "steady resident fused path did not eliminate all hits"
+            )
+        _validate_resident_remap(
+            source,
+            sharded_boundary,
+            resident_union_values,
+            resident_union_state,
+            mtp=mtp,
+        )
 
     legacy_samples = _measure_npu_ms(
         lambda: legacy_op(
@@ -1082,9 +1170,34 @@ def main(
             iterations,
         )
     resident_union_samples = []
+    resident_no_intersection_samples = []
+    resident_finalize_samples = []
+    resident_end_to_end_samples = []
     if resident_union_workspace is not None:
         resident_union_samples = _measure_npu_ms(
             resident_sharded_union,
+            lambda: resident_union_values.copy_(source),
+            warmups,
+            iterations,
+        )
+        resident_no_intersection_samples = _measure_npu_ms(
+            lambda: resident_sharded_union(resident_cold_generations),
+            lambda: resident_union_values.copy_(source),
+            warmups,
+            iterations,
+        )
+        # The state is already warm from correctness validation, so these are
+        # steady all-hit decode measurements. Reset only the remapped input;
+        # persistent resident state intentionally survives each iteration.
+        resident_sharded_union()
+        resident_finalize_samples = _measure_npu_ms(
+            resident_fused_finalize,
+            lambda: resident_union_values.copy_(source),
+            warmups,
+            iterations,
+        )
+        resident_end_to_end_samples = _measure_npu_ms(
+            resident_end_to_end,
             lambda: resident_union_values.copy_(source),
             warmups,
             iterations,
@@ -1122,13 +1235,32 @@ def main(
         )
         _summary(production_label, production_staged_samples)
     resident_union_mean = None
+    resident_no_intersection_mean = None
+    resident_end_to_end_mean = None
     if resident_union_samples:
         resident_union_mean = statistics.fmean(resident_union_samples)
+        resident_no_intersection_mean = statistics.fmean(
+            resident_no_intersection_samples
+        )
+        _summary(
+            "resident-union-no-intersect",
+            resident_no_intersection_samples,
+        )
         _summary(
             "resident-sort+intersect"
             if mtp == 1
             else "resident-union+intersect",
             resident_union_samples,
+        )
+        resident_end_to_end_mean = statistics.fmean(
+            resident_end_to_end_samples
+        )
+        _summary("resident-fused-finalize", resident_finalize_samples)
+        _summary("resident-end-to-end", resident_end_to_end_samples)
+        print(
+            "resident intersection-only overhead: "
+            f"{resident_union_mean - resident_no_intersection_mean:+.6f} ms "
+            f"({(resident_union_mean / resident_no_intersection_mean - 1) * 100:+.2f}%)"
         )
     native_unique_mean = None
     if native_unique_baseline:
@@ -1176,6 +1308,12 @@ def main(
         f"{sharded_vector_dedup_mean - no_union_mean:+.6f} ms "
         f"({(sharded_vector_dedup_mean / no_union_mean - 1) * 100:+.2f}%)"
     )
+    if resident_end_to_end_mean is not None:
+        print(
+            "resident intersection/state overhead vs sharded-sort: "
+            f"{resident_end_to_end_mean - sharded_sort_mean:+.6f} ms "
+            f"({(resident_end_to_end_mean / sharded_sort_mean - 1) * 100:+.2f}%)"
+        )
     candidates = [
         ("pre-union", legacy_mean),
         ("fused-union", union_mean),
@@ -1194,6 +1332,9 @@ def main(
                 else "resident-union+intersect",
                 resident_union_mean,
             )
+        )
+        candidates.append(
+            ("resident-end-to-end", resident_end_to_end_mean)
         )
     if native_unique_baseline:
         candidates.append(("native-unique", native_unique_mean))

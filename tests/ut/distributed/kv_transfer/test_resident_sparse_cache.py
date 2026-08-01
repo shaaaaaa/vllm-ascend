@@ -243,6 +243,16 @@ def test_request_registry_releases_and_generates_new_owner():
     assert second_generation[0] > first_generation[0]
 
 
+def test_request_registry_invalidate_keeps_row_and_makes_state_cold():
+    registry = ResidentRequestStateRegistry(1)
+    first_state, first_generation = registry.bind(["a"], [("x",)])
+    registry.invalidate(["a", "not-bound"])
+    second_state, second_generation = registry.bind(["a"], [("x",)])
+
+    assert second_state.tolist() == first_state.tolist()
+    assert second_generation[0] == first_generation[0] + 1
+
+
 def _native_state(*, requests=1, capacity=8, token_stride=64):
     # The second half contains cacheline-private graph-dummy sinks.
     token_to_slot = torch.full(

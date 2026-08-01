@@ -1,6 +1,4 @@
-"""Experimental sorted-shard sparse-cache planner.
-
-This path is deliberately separate from production sparse-index preparation:
+"""Sorted-shard sparse-cache planner for decode-only compact scratch.
 
 * MTP=1 partitions and sorts the already-unique row without deduplication.
 * MTP=2 partitions, sorts, and deduplicates the two rows shard-locally.
@@ -18,6 +16,7 @@ import torch
 RESIDENT_COUNT_CACHELINE_INTS = 16
 RESIDENT_GENERATION_CACHELINE_LONGS = 8
 INDEX_TOPK = 2048
+MAX_INT16_SCRATCH_CAPACITY = 1 << 15
 RESIDENT_READ_PROBE_DEBUG_INTS = 32
 RESIDENT_FINALIZE_DEBUG_INTS = 16
 
@@ -139,6 +138,28 @@ def allocate_sorted_resident_workspace(
             dtype=torch.int64,
             device=device,
         ),
+    )
+
+
+def sorted_resident_workspace_prefix(
+    workspace: SortedResidentWorkspace,
+    request_count: int,
+) -> SortedResidentWorkspace:
+    """Return aligned contiguous prefix views for the active request count."""
+    if request_count <= 0 or request_count > workspace.shard_packed.shape[0]:
+        raise ValueError(
+            "active sorted-resident request count is out of range: "
+            f"{request_count} not in [1, {workspace.shard_packed.shape[0]}]"
+        )
+    return SortedResidentWorkspace(
+        shard_packed=workspace.shard_packed[:request_count],
+        shard_mapping=workspace.shard_mapping[:request_count],
+        shard_counts=workspace.shard_counts[:request_count],
+        prior_slots=workspace.prior_slots[:request_count],
+        overwritten_slots=workspace.overwritten_slots[:request_count],
+        miss_tokens=workspace.miss_tokens[:request_count],
+        miss_counts=workspace.miss_counts[:request_count],
+        target_slots=workspace.target_slots[:request_count],
     )
 
 
@@ -309,7 +330,7 @@ def prepare_sorted_resident_cache_fused_(
     *,
     block_size: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Run the original fused state-update plus remap fallback."""
+    """Run the production fused state update and top-k remap."""
     try:
         op = torch.ops._C_ascend.npu_dsa_resident_sorted_plan_
     except AttributeError as error:

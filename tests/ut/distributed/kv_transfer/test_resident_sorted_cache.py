@@ -5,6 +5,7 @@ from vllm_ascend.distributed.kv_transfer.sparse_offload.resident_sorted_cache im
     allocate_sorted_resident_state,
     allocate_sorted_resident_workspace,
     resident_shard_count,
+    sorted_resident_workspace_prefix,
 )
 
 
@@ -87,3 +88,27 @@ def test_sorted_resident_rejects_unsupported_mtp_and_state_size():
         )
     with pytest.raises(ValueError, match="MTP=1 or MTP=2"):
         resident_shard_count(3)
+
+
+@pytest.mark.parametrize("mtp", [1, 2])
+def test_sorted_resident_workspace_prefix_keeps_fixed_storage(mtp):
+    workspace = allocate_sorted_resident_workspace(
+        4,
+        mtp,
+        device=torch.device("cpu"),
+    )
+    active = sorted_resident_workspace_prefix(workspace, 2)
+
+    assert active.shard_packed.shape[0] == 2
+    assert active.miss_tokens.shape[0] == 2
+    assert active.target_slots.shape[0] == 2
+    assert active.shard_packed.data_ptr() == workspace.shard_packed.data_ptr()
+    assert active.miss_tokens.data_ptr() == workspace.miss_tokens.data_ptr()
+    assert active.target_slots.data_ptr() == workspace.target_slots.data_ptr()
+    assert active.shard_packed.is_contiguous()
+    assert active.prior_slots.data_ptr() % 64 == 0
+
+    with pytest.raises(ValueError, match="out of range"):
+        sorted_resident_workspace_prefix(workspace, 0)
+    with pytest.raises(ValueError, match="out of range"):
+        sorted_resident_workspace_prefix(workspace, 5)

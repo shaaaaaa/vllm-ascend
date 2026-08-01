@@ -1544,7 +1544,7 @@ def test_sorted_resident_full_path_supports_graph_replay(mtp):
             workspace,
             mtp=mtp,
         )
-        prepare_sorted_resident_cache_(
+        prepare_sorted_resident_cache_fused_(
             values,
             block_table,
             request_states,

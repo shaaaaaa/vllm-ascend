@@ -71,3 +71,11 @@ class TestEnvVariables(TestBase):
             self.assertEqual(getattr(envs_ascend, name), 3)
         with patch.dict(os.environ, {name: "-1"}):
             self.assertEqual(getattr(envs_ascend, name), 0)
+
+    def test_dsa_resident_cache_defaults_on_and_can_be_disabled(self):
+        name = "VLLM_ASCEND_DSA_RESIDENT_CACHE"
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(name, None)
+            self.assertTrue(getattr(envs_ascend, name))
+        with patch.dict(os.environ, {name: "0"}):
+            self.assertFalse(getattr(envs_ascend, name))

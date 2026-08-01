@@ -57,6 +57,13 @@ class ResidentRequestStateRegistry:
             # forward map before accepting reverse-map hits.
             self._generations[state] += 1
 
+    def invalidate(self, request_ids: Sequence[str]) -> None:
+        """Make bound request state cold without releasing its stable row."""
+        for request_id in request_ids:
+            state = self._request_to_state.get(request_id)
+            if state is not None:
+                self._generations[state] += 1
+
     def _allocate(self, request_id: str, protected: set[str]) -> int:
         for state, owner in enumerate(self._state_to_request):
             if owner is None:

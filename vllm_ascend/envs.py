@@ -159,6 +159,14 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_DSA_MTP_SHARDED_SORT": lambda: bool(
         int(os.getenv("VLLM_ASCEND_DSA_MTP_SHARDED_SORT", "1"))
     ),
+    # Reuse compact-scratch rows that already contain this decode step's
+    # request-union tokens. 1 (default) enables the sorted-shard resident
+    # planner, so LMCache receives only misses. 0 keeps the ordinary
+    # split-boundary union and retrieves its complete payload every step.
+    # Read during model initialization; changing it requires a worker restart.
+    "VLLM_ASCEND_DSA_RESIDENT_CACHE": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_DSA_RESIDENT_CACHE", "1"))
+    ),
     # Experimental SFA graph-capture proof of concept. When enabled, exact-Q1
     # decode is captured across layers, with selective LMCache retrieval as
     # the eager split operation.

@@ -658,6 +658,126 @@ class TestLMCacheSparseFrontier(TestBase):
             )
 
 
+@pytest.mark.parametrize("mtp", [1, 2])
+def test_sorted_resident_helper_uses_active_fixed_address_prefix(mtp):
+    impl = AscendSFAImpl.__new__(AscendSFAImpl)
+    impl.block_size = 128
+    impl._sorted_resident_state = MagicMock()
+    impl._sorted_resident_workspace = (
+        sfa_v1.allocate_sorted_resident_workspace(
+            4,
+            mtp,
+            device=torch.device("cpu"),
+        )
+    )
+    impl._sorted_resident_workspace_views = {}
+    requests = 2
+    topk = torch.zeros(
+        (requests * mtp, 1, sfa_v1.INDEX_TOPK),
+        dtype=torch.int32,
+    )
+    split_boundary = torch.full(
+        (requests * mtp,),
+        4096,
+        dtype=torch.int32,
+    )
+    row_req_indices = torch.arange(
+        requests,
+        dtype=torch.int32,
+    ).repeat_interleave(mtp)
+    block_table = torch.zeros((requests, 32), dtype=torch.int32)
+    state_indices = torch.arange(requests, dtype=torch.int32)
+    state_generations = torch.ones(requests, dtype=torch.int64)
+
+    with (
+        patch.object(
+            sfa_v1,
+            "prepare_resident_sharded_union_",
+        ) as union,
+        patch.object(
+            sfa_v1,
+            "prepare_sorted_resident_cache_fused_",
+        ) as finalize,
+    ):
+        active_workspace = sfa_v1.sorted_resident_workspace_prefix(
+            impl._sorted_resident_workspace,
+            requests,
+        )
+        finalize.return_value = (
+            active_workspace.miss_tokens,
+            active_workspace.miss_counts[:, 0],
+            active_workspace.target_slots,
+        )
+        outputs = impl._prepare_sorted_resident_sparse_cache(
+            topk,
+            split_boundary,
+            row_req_indices,
+            block_table,
+            state_indices,
+            state_generations,
+            mtp=mtp,
+        )
+
+    union_workspace = union.call_args.args[6]
+    finalize_workspace = finalize.call_args.args[5]
+    assert union_workspace is finalize_workspace
+    assert union_workspace.shard_packed.shape[0] == requests
+    assert (
+        union_workspace.shard_packed.data_ptr()
+        == impl._sorted_resident_workspace.shard_packed.data_ptr()
+    )
+    assert outputs[0] is topk
+    assert outputs[1] is active_workspace.miss_tokens
+    assert outputs[2].data_ptr() == active_workspace.miss_counts.data_ptr()
+    assert outputs[3] is active_workspace.target_slots
+
+
+@pytest.mark.parametrize(
+    "enabled,need_packed,mtp,uses_sorted",
+    [
+        (True, True, 1, True),
+        (True, True, 2, True),
+        (False, True, 1, False),
+        (True, True, None, False),
+        (True, False, 1, False),
+    ],
+)
+def test_decode_sparse_planner_routes_only_fixed_decode_to_resident(
+    enabled,
+    need_packed,
+    mtp,
+    uses_sorted,
+):
+    impl = AscendSFAImpl.__new__(AscendSFAImpl)
+    impl.block_size = 128
+    impl.dsa_resident_cache = enabled
+    expected = (MagicMock(), MagicMock(), MagicMock(), MagicMock())
+    impl._prepare_sorted_resident_sparse_cache = MagicMock(
+        return_value=expected
+    )
+    tensors = [MagicMock() for _ in range(9)]
+
+    with patch.object(
+        sfa_v1,
+        "prepare_sparse_indices",
+        return_value=expected,
+    ) as ordinary:
+        actual = impl._prepare_decode_sparse_indices(
+            *tensors,
+            local_to_union_workspace=MagicMock(),
+            shard_packed_workspace=MagicMock(),
+            shard_mapping_workspace=MagicMock(),
+            shard_counts_workspace=MagicMock(),
+            staged_mtp=mtp,
+            need_packed=need_packed,
+            clear_invalid_rows=True,
+        )
+
+    assert actual is expected
+    assert impl._prepare_sorted_resident_sparse_cache.called is uses_sorted
+    assert ordinary.called is not uses_sorted
+
+
 class TestStagedSFAGraphPoc(TestBase):
     def setUp(self):
         super().setUp()
