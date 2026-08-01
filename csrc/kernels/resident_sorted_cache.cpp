@@ -29,6 +29,10 @@ constexpr uint32_t kMergeWays = 4;
 constexpr uint32_t kMaxResidentShards = 4;
 constexpr uint32_t kResidentProbeDebugInts = 32;
 constexpr uint32_t kResidentFinalizeDebugInts = 16;
+constexpr uint32_t kShardCurrentCount = 0;
+constexpr uint32_t kShardMissCount = 1;
+constexpr uint32_t kShardEvictableCount = 2;
+constexpr uint32_t kShardOldCount = 3;
 
 template <AscendC::HardEvent event>
 __aicore__ inline void Sync()
@@ -119,6 +123,9 @@ public:
         __gm__ int32_t* stateCounts,
         __gm__ int64_t* stateGenerations,
         __gm__ int16_t* priorSlots,
+        __gm__ int32_t* shardMissTokens,
+        __gm__ int16_t* shardMissPositions,
+        __gm__ int16_t* shardEvictableSlots,
         uint32_t requestCount,
         uint32_t stateRowCount,
         uint32_t dummyStateBase,
@@ -190,6 +197,18 @@ public:
                 * generationStride_);
         priorSlots_.SetGlobalBuffer(
             priorSlots,
+            static_cast<uint64_t>(requestCount_) * shardCount_
+                * shardCapacity_);
+        shardMissTokens_.SetGlobalBuffer(
+            shardMissTokens,
+            static_cast<uint64_t>(requestCount_) * shardCount_
+                * shardCapacity_);
+        shardMissPositions_.SetGlobalBuffer(
+            shardMissPositions,
+            static_cast<uint64_t>(requestCount_) * shardCount_
+                * shardCapacity_);
+        shardEvictableSlots_.SetGlobalBuffer(
+            shardEvictableSlots,
             static_cast<uint64_t>(requestCount_) * shardCount_
                 * shardCapacity_);
 
@@ -430,6 +449,12 @@ public:
         auto reusedInt16 = compactIndices.ReinterpretCast<int16_t>();
         auto oldSlots = reusedInt16;
         auto priorSlots = reusedInt16[shardCapacity_];
+        // Sort workspaces are dead after shard-local sort/dedup. Reuse them
+        // for the compact intersection products instead of increasing UB.
+        auto shardMissTokens = src.ReinterpretCast<int32_t>();
+        auto tmpInt16 = tmp.ReinterpretCast<int16_t>();
+        auto shardMissPositions = tmpInt16;
+        auto shardEvictableSlots = tmpInt16[shardCapacity_];
         const int32_t state =
             requestStateIndices_.GetValue(request);
         const bool realState =
@@ -470,26 +495,39 @@ public:
         Sync<AscendC::HardEvent::MTE2_S>();
 
         uint32_t oldIndex = 0;
+        uint32_t missCount = 0;
+        uint32_t evictableCount = 0;
         if (rank > 0) {
             for (uint32_t currentIndex = 0;
                  currentIndex < rank;
                  ++currentIndex) {
                 const int32_t token =
                     sortedTokens.GetValue(currentIndex);
-                if (oldIndex < oldCount) {
-                    while (
-                        oldIndex < oldCount &&
-                        oldTokens.GetValue(oldIndex) < token) {
-                        ++oldIndex;
-                    }
-                }
-                const int16_t slot =
+                while (
                     oldIndex < oldCount &&
-                        oldTokens.GetValue(oldIndex) == token
-                    ? oldSlots.GetValue(oldIndex)
-                    : static_cast<int16_t>(-1);
+                    oldTokens.GetValue(oldIndex) < token) {
+                    shardEvictableSlots.SetValue(
+                        evictableCount++, oldSlots.GetValue(oldIndex));
+                    ++oldIndex;
+                }
+                int16_t slot = static_cast<int16_t>(-1);
+                if (oldIndex < oldCount &&
+                    oldTokens.GetValue(oldIndex) == token) {
+                    slot = oldSlots.GetValue(oldIndex);
+                    ++oldIndex;
+                } else {
+                    shardMissTokens.SetValue(missCount, token);
+                    shardMissPositions.SetValue(
+                        missCount, static_cast<int16_t>(currentIndex));
+                    ++missCount;
+                }
                 priorSlots.SetValue(currentIndex, slot);
             }
+        }
+        while (oldIndex < oldCount) {
+            shardEvictableSlots.SetValue(
+                evictableCount++, oldSlots.GetValue(oldIndex));
+            ++oldIndex;
         }
         if (!generationMatches) {
             stateCounts_.SetValue(stateCountOffset, 0);
@@ -507,10 +545,36 @@ public:
             CopyLocalToGlobalExact(
                 priorSlots_[shardOffset], priorSlots, rank);
         }
+        if (missCount > 0) {
+            CopyLocalToGlobalExact(
+                shardMissTokens_[shardOffset],
+                shardMissTokens,
+                missCount);
+            CopyLocalToGlobalExact(
+                shardMissPositions_[shardOffset],
+                shardMissPositions,
+                missCount);
+        }
+        if (evictableCount > 0) {
+            CopyLocalToGlobalExact(
+                shardEvictableSlots_[shardOffset],
+                shardEvictableSlots,
+                evictableCount);
+        }
         // Host validation reserves one full 64-byte int32 cacheline per
         // (request, shard), so sibling AIVs never share this write line.
         shardCounts_.SetValue(
-            countOffset, static_cast<int32_t>(rank));
+            countOffset + kShardCurrentCount,
+            static_cast<int32_t>(rank));
+        shardCounts_.SetValue(
+            countOffset + kShardMissCount,
+            static_cast<int32_t>(missCount));
+        shardCounts_.SetValue(
+            countOffset + kShardEvictableCount,
+            static_cast<int32_t>(evictableCount));
+        shardCounts_.SetValue(
+            countOffset + kShardOldCount,
+            static_cast<int32_t>(oldCount));
     }
 
 private:
@@ -593,6 +657,9 @@ private:
     AscendC::GlobalTensor<int32_t> stateCounts_;
     AscendC::GlobalTensor<int64_t> stateGenerations_;
     AscendC::GlobalTensor<int16_t> priorSlots_;
+    AscendC::GlobalTensor<int32_t> shardMissTokens_;
+    AscendC::GlobalTensor<int16_t> shardMissPositions_;
+    AscendC::GlobalTensor<int16_t> shardEvictableSlots_;
     AscendC::TPipe pipe_;
     AscendC::TBuf<AscendC::TPosition::VECCALC> inputBuf_;
     AscendC::TBuf<AscendC::TPosition::VECCALC> workBuf_;
@@ -793,6 +860,9 @@ public:
         __gm__ int32_t* shardPacked,
         __gm__ int32_t* shardCounts,
         __gm__ int16_t* priorSlots,
+        __gm__ int32_t* shardMissTokens,
+        __gm__ int16_t* shardMissPositions,
+        __gm__ int16_t* shardEvictableSlots,
         __gm__ uint8_t* overwrittenSlots,
         __gm__ int32_t* missTokens,
         __gm__ int32_t* missCounts,
@@ -833,6 +903,12 @@ public:
                 * shardCountRequestStride_);
         priorSlots_.SetGlobalBuffer(
             priorSlots, requestShardElements);
+        shardMissTokens_.SetGlobalBuffer(
+            shardMissTokens, requestShardElements);
+        shardMissPositions_.SetGlobalBuffer(
+            shardMissPositions, requestShardElements);
+        shardEvictableSlots_.SetGlobalBuffer(
+            shardEvictableSlots, requestShardElements);
         overwrittenSlots_.SetGlobalBuffer(
             overwrittenSlots, requestElements);
         missTokens_.SetGlobalBuffer(
@@ -852,14 +928,14 @@ public:
             static_cast<uint64_t>(requestCount_)
                 * kResidentFinalizeDebugInts);
 
-        pipe_.InitBuffer(
-            protectedBuf_, capacity_ * sizeof(int16_t));
-        pipe_.InitBuffer(
-            freeSlotBuf_, capacity_ * sizeof(int16_t));
-        pipe_.InitBuffer(
-            overwrittenBuf_, capacity_ * sizeof(uint8_t));
         const uint32_t packedElements =
             capacity_ + shardCount_ * kInt16PerDataBlock;
+        pipe_.InitBuffer(
+            protectedBuf_, packedElements * sizeof(int16_t));
+        pipe_.InitBuffer(
+            freeSlotBuf_, packedElements * sizeof(int16_t));
+        pipe_.InitBuffer(
+            overwrittenBuf_, capacity_ * sizeof(uint8_t));
         pipe_.InitBuffer(
             packedTokenBuf_, packedElements * sizeof(int32_t));
         pipe_.InitBuffer(
@@ -879,6 +955,10 @@ public:
     {
         const uint32_t request = AscendC::GetBlockIdx();
         if (request >= requestCount_) {
+            return;
+        }
+        if (debugStage_ == 0) {
+            ProcessCompact(request);
             return;
         }
         const uint64_t requestOffset =
@@ -1166,6 +1246,215 @@ public:
     }
 
 private:
+    __aicore__ inline void ProcessCompact(uint32_t request)
+    {
+        const uint64_t requestOffset =
+            static_cast<uint64_t>(request) * capacity_;
+        const uint64_t requestShardBase =
+            static_cast<uint64_t>(request) * shardCount_ * capacity_;
+        auto missPositions = protectedBuf_.Get<int16_t>();
+        auto evictableSlots = freeSlotBuf_.Get<int16_t>();
+        auto overwritten = overwrittenBuf_.Get<uint8_t>();
+        auto inputMissTokens = packedTokenBuf_.Get<int32_t>();
+        auto packedPriorSlots = packedPriorSlotBuf_.Get<int16_t>();
+        auto outputMissTokens = missTokenBuf_.Get<int32_t>();
+        auto targetSlots = targetSlotBuf_.Get<int64_t>();
+        auto blockTable = blockTableBuf_.Get<int32_t>();
+
+        AscendC::Duplicate(
+            overwritten.ReinterpretCast<int16_t>(),
+            static_cast<int16_t>(0),
+            capacity_ / sizeof(int16_t));
+        AscendC::PipeBarrier<PIPE_V>();
+        const AscendC::DataCopyParams blockTableCopy{
+            1,
+            static_cast<uint16_t>(
+                blockTableEntries_ * sizeof(int32_t)),
+            0,
+            0};
+        AscendC::DataCopyPad(
+            blockTable,
+            requestBlockTable_[
+                static_cast<uint64_t>(request) * blockTableWidth_],
+            blockTableCopy,
+            {});
+
+        uint32_t currentCounts[kMaxResidentShards] = {};
+        uint32_t missCounts[kMaxResidentShards] = {};
+        uint32_t evictableCounts[kMaxResidentShards] = {};
+        uint32_t priorOffsets[kMaxResidentShards] = {};
+        uint32_t missOffsets[kMaxResidentShards] = {};
+        uint32_t evictableOffsets[kMaxResidentShards] = {};
+        uint32_t priorEnd = 0;
+        uint32_t missEnd = 0;
+        uint32_t evictableEnd = 0;
+        uint32_t totalMissCount = 0;
+        uint32_t totalEvictableCount = 0;
+        uint32_t totalOldCount = 0;
+        for (uint32_t shard = 0; shard < shardCount_; ++shard) {
+            const uint64_t countOffset =
+                static_cast<uint64_t>(request)
+                    * shardCountRequestStride_
+                + shard * shardCountStride_;
+            const uint32_t currentCount = static_cast<uint32_t>(
+                shardCounts_.GetValue(
+                    countOffset + kShardCurrentCount));
+            const uint32_t shardMissCount = static_cast<uint32_t>(
+                shardCounts_.GetValue(
+                    countOffset + kShardMissCount));
+            const uint32_t evictableCount = static_cast<uint32_t>(
+                shardCounts_.GetValue(
+                    countOffset + kShardEvictableCount));
+            const uint32_t oldCount = static_cast<uint32_t>(
+                shardCounts_.GetValue(
+                    countOffset + kShardOldCount));
+            const uint32_t priorOffset =
+                (priorEnd + kInt16PerDataBlock - 1)
+                & ~(kInt16PerDataBlock - 1);
+            const uint32_t missOffset =
+                (missEnd + kInt16PerDataBlock - 1)
+                & ~(kInt16PerDataBlock - 1);
+            const uint32_t evictableOffset =
+                (evictableEnd + kInt16PerDataBlock - 1)
+                & ~(kInt16PerDataBlock - 1);
+            const uint64_t shardOffset =
+                requestShardBase
+                + static_cast<uint64_t>(shard) * capacity_;
+            currentCounts[shard] = currentCount;
+            missCounts[shard] = shardMissCount;
+            evictableCounts[shard] = evictableCount;
+            priorOffsets[shard] = priorOffset;
+            missOffsets[shard] = missOffset;
+            evictableOffsets[shard] = evictableOffset;
+            if (currentCount > 0) {
+                CopyGlobalToLocalExact(
+                    packedPriorSlots[priorOffset],
+                    priorSlots_[shardOffset],
+                    currentCount);
+            }
+            if (shardMissCount > 0) {
+                CopyGlobalToLocalExact(
+                    inputMissTokens[missOffset],
+                    shardMissTokens_[shardOffset],
+                    shardMissCount);
+                CopyGlobalToLocalExact(
+                    missPositions[missOffset],
+                    shardMissPositions_[shardOffset],
+                    shardMissCount);
+            }
+            if (evictableCount > 0) {
+                CopyGlobalToLocalExact(
+                    evictableSlots[evictableOffset],
+                    shardEvictableSlots_[shardOffset],
+                    evictableCount);
+            }
+            priorEnd = priorOffset + currentCount;
+            missEnd = missOffset + shardMissCount;
+            evictableEnd = evictableOffset + evictableCount;
+            totalMissCount += shardMissCount;
+            totalEvictableCount += evictableCount;
+            totalOldCount += oldCount;
+        }
+        Sync<AscendC::HardEvent::MTE2_S>();
+        Sync<AscendC::HardEvent::V_S>();
+
+        uint32_t globalMiss = 0;
+        uint32_t evictableShard = 0;
+        uint32_t evictableIndex = 0;
+        if (totalMissCount > 0) {
+            for (uint32_t shard = 0; shard < shardCount_; ++shard) {
+                const uint32_t shardMissCount = missCounts[shard];
+                if (shardMissCount == 0) {
+                    continue;
+                }
+                for (uint32_t localMiss = 0;
+                     localMiss < shardMissCount;
+                     ++localMiss) {
+                    int16_t slot;
+                    if (globalMiss < totalEvictableCount) {
+                        while (
+                            evictableShard < shardCount_ &&
+                            evictableIndex >=
+                                evictableCounts[evictableShard]) {
+                            ++evictableShard;
+                            evictableIndex = 0;
+                        }
+                        slot = evictableSlots.GetValue(
+                            evictableOffsets[evictableShard]
+                                + evictableIndex);
+                        ++evictableIndex;
+                    } else {
+                        // Resident allocation preserves a dense occupied
+                        // prefix. Every old entry not present in the current
+                        // union is emitted above as an evictable slot; after
+                        // pooling all shards, any remaining miss grows the
+                        // prefix from totalOldCount. Therefore the global
+                        // candidate count is always capacity - hitCount.
+                        slot = static_cast<int16_t>(
+                            totalOldCount
+                            + globalMiss
+                            - totalEvictableCount);
+                    }
+                    const uint32_t position = static_cast<uint32_t>(
+                        missPositions.GetValue(
+                            missOffsets[shard] + localMiss));
+                    packedPriorSlots.SetValue(
+                        priorOffsets[shard] + position, slot);
+                    const int32_t token = inputMissTokens.GetValue(
+                        missOffsets[shard] + localMiss);
+                    outputMissTokens.SetValue(globalMiss, token);
+                    const uint32_t logicalSlot =
+                        static_cast<uint32_t>(slot);
+                    const uint32_t logicalBlock =
+                        logicalSlot / blockSize_;
+                    const uint32_t blockOffset =
+                        logicalSlot % blockSize_;
+                    const int32_t physicalBlock =
+                        blockTable.GetValue(logicalBlock);
+                    targetSlots.SetValue(
+                        globalMiss,
+                        static_cast<int64_t>(physicalBlock)
+                                * blockSize_
+                            + blockOffset);
+                    overwritten.SetValue(
+                        logicalSlot, static_cast<uint8_t>(1));
+                    ++globalMiss;
+                }
+            }
+        }
+
+        Sync<AscendC::HardEvent::S_MTE3>();
+        Sync<AscendC::HardEvent::V_MTE3>();
+        for (uint32_t shard = 0; shard < shardCount_; ++shard) {
+            const uint32_t currentCount = currentCounts[shard];
+            if (currentCount == 0) {
+                continue;
+            }
+            const uint64_t shardOffset =
+                requestShardBase
+                + static_cast<uint64_t>(shard) * capacity_;
+            CopyLocalToGlobalExact(
+                priorSlots_[shardOffset],
+                packedPriorSlots[priorOffsets[shard]],
+                currentCount);
+        }
+        CopyLocalToGlobalExact(
+            overwrittenSlots_[requestOffset], overwritten, capacity_);
+        if (totalMissCount > 0) {
+            CopyLocalToGlobalExact(
+                missTokens_[requestOffset],
+                outputMissTokens,
+                totalMissCount);
+            CopyLocalToGlobalExact(
+                targetSlots_[requestOffset],
+                targetSlots,
+                totalMissCount);
+        }
+        missCounts_.SetValue(
+            static_cast<uint64_t>(request) * missCountStride_,
+            static_cast<int32_t>(totalMissCount));
+    }
+
     __aicore__ inline void PublishDebug(
         AscendC::LocalTensor<int32_t> debug,
         uint32_t request,
@@ -1208,6 +1497,9 @@ private:
     AscendC::GlobalTensor<int32_t> shardPacked_;
     AscendC::GlobalTensor<int32_t> shardCounts_;
     AscendC::GlobalTensor<int16_t> priorSlots_;
+    AscendC::GlobalTensor<int32_t> shardMissTokens_;
+    AscendC::GlobalTensor<int16_t> shardMissPositions_;
+    AscendC::GlobalTensor<int16_t> shardEvictableSlots_;
     AscendC::GlobalTensor<uint8_t> overwrittenSlots_;
     AscendC::GlobalTensor<int32_t> missTokens_;
     AscendC::GlobalTensor<int32_t> missCounts_;
@@ -2134,6 +2426,9 @@ dsa_resident_sharded_union_kernel(
     __gm__ int32_t* stateCounts,
     __gm__ int64_t* stateGenerations,
     __gm__ int16_t* priorSlots,
+    __gm__ int32_t* shardMissTokens,
+    __gm__ int16_t* shardMissPositions,
+    __gm__ int16_t* shardEvictableSlots,
     uint32_t requestCount,
     uint32_t stateRowCount,
     uint32_t dummyStateBase,
@@ -2151,7 +2446,9 @@ dsa_resident_sharded_union_kernel(
         shardPacked, shardMapping, shardCounts,
         requestStateIndices, requestStateGenerations,
         stateTokens, stateSlots, stateCounts, stateGenerations,
-        priorSlots, requestCount, stateRowCount, dummyStateBase,
+        priorSlots, shardMissTokens, shardMissPositions,
+        shardEvictableSlots,
+        requestCount, stateRowCount, dummyStateBase,
         rowsPerRequest, rowWidth, shardCount, shardCapacity,
         shardCountStride, shardCountRequestStride, generationStride);
     op.Process();
@@ -2182,6 +2479,9 @@ dsa_resident_sorted_finalize_kernel(
     __gm__ int32_t* shardPacked,
     __gm__ int32_t* shardCounts,
     __gm__ int16_t* priorSlots,
+    __gm__ int32_t* shardMissTokens,
+    __gm__ int16_t* shardMissPositions,
+    __gm__ int16_t* shardEvictableSlots,
     __gm__ uint8_t* overwrittenSlots,
     __gm__ int32_t* missTokens,
     __gm__ int32_t* missCounts,
@@ -2200,7 +2500,9 @@ dsa_resident_sorted_finalize_kernel(
 {
     DSAResidentSortedFinalizeKernel op;
     op.Init(
-        shardPacked, shardCounts, priorSlots, overwrittenSlots,
+        shardPacked, shardCounts, priorSlots,
+        shardMissTokens, shardMissPositions, shardEvictableSlots,
+        overwrittenSlots,
         missTokens, missCounts, targetSlots,
         requestBlockTable, debugInfo,
         requestCount, shardCount, capacity,
@@ -2326,6 +2628,9 @@ void dsa_resident_sharded_union_impl(
     void* stateCounts,
     void* stateGenerations,
     void* priorSlots,
+    void* shardMissTokens,
+    void* shardMissPositions,
+    void* shardEvictableSlots,
     uint32_t requestCount,
     uint32_t stateRowCount,
     uint32_t dummyStateBase,
@@ -2352,6 +2657,9 @@ void dsa_resident_sharded_union_impl(
         static_cast<int32_t*>(stateCounts),
         static_cast<int64_t*>(stateGenerations),
         static_cast<int16_t*>(priorSlots),
+        static_cast<int32_t*>(shardMissTokens),
+        static_cast<int16_t*>(shardMissPositions),
+        static_cast<int16_t*>(shardEvictableSlots),
         requestCount, stateRowCount, dummyStateBase, rowsPerRequest,
         rowWidth, shardCount, shardCapacity, shardCountStride,
         shardCountRequestStride, generationStride);
@@ -2371,6 +2679,9 @@ void dsa_resident_sorted_plan_impl(
     void* stateCounts,
     void* stateGenerations,
     void* priorSlots,
+    void* shardMissTokens,
+    void* shardMissPositions,
+    void* shardEvictableSlots,
     void* overwrittenSlots,
     void* missTokens,
     void* missCounts,
@@ -2394,6 +2705,9 @@ void dsa_resident_sorted_plan_impl(
         static_cast<int32_t*>(shardPacked),
         static_cast<int32_t*>(shardCounts),
         static_cast<int16_t*>(priorSlots),
+        static_cast<int32_t*>(shardMissTokens),
+        static_cast<int16_t*>(shardMissPositions),
+        static_cast<int16_t*>(shardEvictableSlots),
         static_cast<uint8_t*>(overwrittenSlots),
         static_cast<int32_t*>(missTokens),
         static_cast<int32_t*>(missCounts),
@@ -2403,13 +2717,24 @@ void dsa_resident_sorted_plan_impl(
         requestCount, shardCount, capacity, shardCountStride,
         shardCountRequestStride, missCountStride,
         blockTableWidth, blockSize, 0);
-    dsa_resident_sorted_update_debug_impl(
-        stream, topkIndices, shardPacked, shardMapping, shardCounts,
-        priorSlots, overwrittenSlots, requestStateIndices,
-        requestStateGenerations, stateTokens, stateSlots, stateCounts,
-        stateGenerations, requestCount, stateRowCount, dummyStateBase,
+    dsa_resident_sorted_update_kernel<<<
+        requestCount * shardCount, nullptr, stream>>>(
+        static_cast<int32_t*>(topkIndices),
+        static_cast<int32_t*>(shardPacked),
+        static_cast<int16_t*>(shardMapping),
+        static_cast<int32_t*>(shardCounts),
+        static_cast<int16_t*>(priorSlots),
+        static_cast<uint8_t*>(overwrittenSlots),
+        static_cast<int32_t*>(requestStateIndices),
+        static_cast<int64_t*>(requestStateGenerations),
+        static_cast<int32_t*>(stateTokens),
+        static_cast<int16_t*>(stateSlots),
+        static_cast<int32_t*>(stateCounts),
+        static_cast<int64_t*>(stateGenerations),
+        requestCount, stateRowCount, dummyStateBase,
         rowsPerRequest, rowWidth, shardCount, capacity,
-        shardCountStride, shardCountRequestStride, generationStride);
+        shardCountStride, shardCountRequestStride,
+        generationStride);
 }
 
 void dsa_resident_sorted_update_debug_impl(
@@ -2471,6 +2796,9 @@ void dsa_resident_sorted_plan_no_remap_impl(
     void* stateCounts,
     void* stateGenerations,
     void* priorSlots,
+    void* shardMissTokens,
+    void* shardMissPositions,
+    void* shardEvictableSlots,
     void* overwrittenSlots,
     void* missTokens,
     void* missCounts,
@@ -2494,6 +2822,9 @@ void dsa_resident_sorted_plan_no_remap_impl(
             static_cast<int32_t*>(shardPacked),
             static_cast<int32_t*>(shardCounts),
             static_cast<int16_t*>(priorSlots),
+            static_cast<int32_t*>(shardMissTokens),
+            static_cast<int16_t*>(shardMissPositions),
+            static_cast<int16_t*>(shardEvictableSlots),
             static_cast<uint8_t*>(overwrittenSlots),
             static_cast<int32_t*>(missTokens),
             static_cast<int32_t*>(missCounts),
@@ -2574,6 +2905,9 @@ void dsa_resident_sorted_finalize_debug_impl(
     void* shardPacked,
     void* shardCounts,
     void* priorSlots,
+    void* shardMissTokens,
+    void* shardMissPositions,
+    void* shardEvictableSlots,
     void* overwrittenSlots,
     void* missTokens,
     void* missCounts,
@@ -2597,6 +2931,9 @@ void dsa_resident_sorted_finalize_debug_impl(
         static_cast<int32_t*>(shardPacked),
         static_cast<int32_t*>(shardCounts),
         static_cast<int16_t*>(priorSlots),
+        static_cast<int32_t*>(shardMissTokens),
+        static_cast<int16_t*>(shardMissPositions),
+        static_cast<int16_t*>(shardEvictableSlots),
         static_cast<uint8_t*>(overwrittenSlots),
         static_cast<int32_t*>(missTokens),
         static_cast<int32_t*>(missCounts),

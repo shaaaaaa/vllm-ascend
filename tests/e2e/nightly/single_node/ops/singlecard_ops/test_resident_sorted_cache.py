@@ -9,7 +9,6 @@ from vllm_ascend.distributed.kv_transfer.sparse_offload.resident_sorted_cache im
     debug_sorted_resident_finalize_only_,
     prepare_resident_sharded_union_,
     prepare_sorted_resident_cache_fused_,
-    prepare_sorted_resident_cache_no_remap_,
     probe_sorted_resident_reads_,
     resident_shard_count,
 )
@@ -62,9 +61,16 @@ def _expected_shards(
         union = set()
         for row in range(mtp):
             boundary = int(boundaries[request * mtp + row])
-            union.update(int(token) for token in rows[request, row].tolist() if 0 <= token < boundary)
+            union.update(
+                int(token)
+                for token in rows[request, row].tolist()
+                if 0 <= token < boundary
+            )
         result.append(
-            [sorted(token for token in union if token % shard_count == shard) for shard in range(shard_count)]
+            [
+                sorted(token for token in union if token % shard_count == shard)
+                for shard in range(shard_count)
+            ]
         )
     return result
 
@@ -134,37 +140,25 @@ def _assert_and_print_fused_remap_copy_inputs(
         for source_shard in range(shard_count):
             rank_by_token = {
                 token: rank
-                for rank, token in enumerate(
-                    expected_shards[request][source_shard]
-                )
+                for rank, token in enumerate(expected_shards[request][source_shard])
             }
-            expected_mapping.append(
-                [rank_by_token.get(token, -1) for token in tokens]
-            )
+            expected_mapping.append([rank_by_token.get(token, -1) for token in tokens])
 
         for part in range(shard_count):
             begin = part * part_width
             end = begin + part_width
             for source_shard in range(shard_count):
                 element_offset = (
-                    (request * shard_count + source_shard)
-                    * request_width
-                    + begin
-                )
+                    request * shard_count + source_shard
+                ) * request_width + begin
                 byte_offset = element_offset * mapping.element_size()
                 source_ptr = mapping_base_ptr + byte_offset
-                actual = mapping[
-                    request, source_shard, begin:end
-                ]
+                actual = mapping[request, source_shard, begin:end]
                 expected = expected_mapping[source_shard][begin:end]
                 assert actual.tolist() == expected
                 nonnegative = actual[actual >= 0]
-                rank_min = (
-                    int(nonnegative.min()) if nonnegative.numel() else -1
-                )
-                rank_max = (
-                    int(nonnegative.max()) if nonnegative.numel() else -1
-                )
+                rank_min = int(nonnegative.min()) if nonnegative.numel() else -1
+                rank_max = int(nonnegative.max()) if nonnegative.numel() else -1
                 print(
                     "[resident-fused-remap-copy-slice]"
                     f" request={request}"
@@ -246,10 +240,7 @@ def _print_empty_state_finalize_debug(
         treated_as_hit | invalid_after | still_negative,
         as_tuple=False,
     ).flatten()[:32]
-    sample = [
-        (int(index), int(active_after[index]))
-        for index in sample_indices
-    ]
+    sample = [(int(index), int(active_after[index])) for index in sample_indices]
     print(
         "\n[resident-finalize-debug]"
         f" mtp={mtp}"
@@ -272,9 +263,7 @@ def test_resident_union_is_sorted_per_fixed_token_shard(mtp):
     requests = 2
     source = _source(mtp, 0, requests)
     boundary = 1948 if mtp == 1 else 2972
-    boundaries = boundary - 73 * torch.arange(
-        requests * mtp, dtype=torch.int32
-    )
+    boundaries = boundary - 73 * torch.arange(requests * mtp, dtype=torch.int32)
     row_requests = torch.arange(requests, dtype=torch.int32).repeat_interleave(mtp)
     workspace = allocate_sorted_resident_workspace(
         requests,
@@ -445,13 +434,12 @@ def test_fused_union_intersection_and_generation_invalidation(mtp):
     state = allocate_sorted_resident_state(
         requests, requests, mtp, device=torch.device("npu")
     )
-    expected_shards = _expected_shards(
-        source, boundaries, requests, mtp, shard_count
-    )[0]
+    expected_shards = _expected_shards(source, boundaries, requests, mtp, shard_count)[
+        0
+    ]
     union_tokens = [token for shard in expected_shards for token in shard]
     resident = {
-        token: (index * 37) % capacity
-        for index, token in enumerate(union_tokens[::5])
+        token: (index * 37) % capacity for index, token in enumerate(union_tokens[::5])
     }
     _seed_resident_state(
         state,
@@ -503,15 +491,90 @@ def test_fused_union_intersection_and_generation_invalidation(mtp):
 
 
 @pytest.mark.parametrize("mtp", [1, 2])
+def test_shard_intersection_compacts_misses_and_evictable_slots(mtp):
+    requests = 1
+    shard_count = resident_shard_count(mtp)
+    source = _source(mtp, 0)
+    boundaries = torch.full((mtp,), 1600, dtype=torch.int32)
+    row_requests = torch.zeros(mtp, dtype=torch.int32, device="npu")
+    request_states = torch.zeros(1, dtype=torch.int32, device="npu")
+    request_generations = torch.full((1,), 11, dtype=torch.int64, device="npu")
+    workspace = allocate_sorted_resident_workspace(
+        requests, mtp, device=torch.device("npu")
+    )
+    state = allocate_sorted_resident_state(
+        requests, requests, mtp, device=torch.device("npu")
+    )
+    current_shards = _expected_shards(source, boundaries, requests, mtp, shard_count)[0]
+    current_tokens = [token for shard in current_shards for token in shard]
+    hit_tokens = current_tokens[::4]
+    stale_tokens = list(range(20_000, 20_000 + 257))
+    old_tokens = sorted(set(hit_tokens + stale_tokens))
+    resident = {token: slot for slot, token in enumerate(old_tokens)}
+    old_shards = [
+        sorted(token for token in old_tokens if token % shard_count == shard)
+        for shard in range(shard_count)
+    ]
+    _seed_resident_state(
+        state,
+        state_index=0,
+        generation=11,
+        shards=old_shards,
+        resident=resident,
+    )
+
+    prepare_resident_sharded_union_(
+        source.npu(),
+        boundaries.npu(),
+        row_requests,
+        request_states,
+        request_generations,
+        state,
+        workspace,
+        mtp=mtp,
+    )
+    torch.npu.synchronize()
+
+    counts = workspace.shard_counts[0].cpu()
+    for shard in range(shard_count):
+        current = current_shards[shard]
+        expected_misses = [token for token in current if token not in resident]
+        expected_positions = [
+            position for position, token in enumerate(current) if token not in resident
+        ]
+        expected_evictable_slots = [
+            resident[token] for token in old_shards[shard] if token not in set(current)
+        ]
+        assert int(counts[shard, 0]) == len(current)
+        assert int(counts[shard, 1]) == len(expected_misses)
+        assert int(counts[shard, 2]) == len(expected_evictable_slots)
+        assert int(counts[shard, 3]) == len(old_shards[shard])
+        assert (
+            workspace.shard_miss_tokens[0, shard, : len(expected_misses)].cpu().tolist()
+            == expected_misses
+        )
+        assert (
+            workspace.shard_miss_positions[0, shard, : len(expected_positions)]
+            .cpu()
+            .tolist()
+            == expected_positions
+        )
+        assert (
+            workspace.shard_evictable_slots[0, shard, : len(expected_evictable_slots)]
+            .cpu()
+            .tolist()
+            == expected_evictable_slots
+        )
+
+
+@pytest.mark.parametrize("mtp", [1, 2])
 def test_kernel_read_probe_matches_full_capacity_union_output(mtp):
     """Capture the exact GM values observed by an AIV before finalization."""
     requests = 1
     shard_count = resident_shard_count(mtp)
     capacity = mtp * 2048
     source = (
-        torch.arange(capacity, dtype=torch.int32)
-        .mul(shard_count)
-        .reshape(mtp, 1, 2048)
+        torch.arange(capacity, dtype=torch.int32).mul(shard_count).reshape(mtp, 1, 2048)
     )
     values = source.npu()
     boundaries = torch.full(
@@ -590,20 +653,12 @@ def test_kernel_read_probe_matches_full_capacity_union_output(mtp):
             probe_prior[shard, :expected_count],
             host_prior[shard, :expected_count],
         )
-        assert torch.all(
-            probe_prior[shard, expected_count:] == -12345
-        )
+        assert torch.all(probe_prior[shard, expected_count:] == -12345)
         if expected_count:
             assert first_slot == int(host_prior[shard, 0])
-            assert last_slot == int(
-                host_prior[shard, expected_count - 1]
-            )
-            assert negative == int(
-                (host_prior[shard, :expected_count] < 0).sum()
-            )
-            assert nonnegative == int(
-                (host_prior[shard, :expected_count] >= 0).sum()
-            )
+            assert last_slot == int(host_prior[shard, expected_count - 1])
+            assert negative == int((host_prior[shard, :expected_count] < 0).sum())
+            assert nonnegative == int((host_prior[shard, :expected_count] >= 0).sum())
 
 
 @pytest.mark.parametrize(
@@ -623,9 +678,7 @@ def test_finalize_kernel_internal_stage_at_full_capacity(
     shard_count = resident_shard_count(mtp)
     capacity = mtp * 2048
     source = (
-        torch.arange(capacity, dtype=torch.int32)
-        .mul(shard_count)
-        .reshape(mtp, 1, 2048)
+        torch.arange(capacity, dtype=torch.int32).mul(shard_count).reshape(mtp, 1, 2048)
     )
     values = source.npu()
     boundaries = torch.full(
@@ -688,10 +741,7 @@ def test_finalize_kernel_internal_stage_at_full_capacity(
         "last_target": int(debug[13]),
     }
     print(
-        "\n[resident-finalize-internal-stage]"
-        f" mtp={mtp}"
-        f" requested_stage={debug_stage}"
-        f" fields={fields}"
+        f"\n[resident-finalize-internal-stage] mtp={mtp} requested_stage={debug_stage} fields={fields}"
     )
     assert int(debug[0]) == 0x52534631
     assert fields["stage"] == debug_stage
@@ -702,15 +752,12 @@ def test_finalize_kernel_internal_stage_at_full_capacity(
     if debug_stage >= 2:
         assert fields["protected_count"] == 0
     if debug_stage == 3:
-        assert torch.all(
-            workspace.prior_slots[0, 0, :capacity].cpu() == 0
-        )
+        assert torch.all(workspace.prior_slots[0, 0, :capacity].cpu() == 0)
     if debug_stage >= 4:
         assert fields["free_count"] == capacity
     if debug_stage == 5:
-        assert (
-            workspace.prior_slots[0, 0, :capacity].cpu().tolist()
-            == list(range(capacity))
+        assert workspace.prior_slots[0, 0, :capacity].cpu().tolist() == list(
+            range(capacity)
         )
     if debug_stage >= 6:
         assert fields["miss_count"] == capacity
@@ -721,9 +768,8 @@ def test_finalize_kernel_internal_stage_at_full_capacity(
         assert fields["first_target"] == 0
         assert fields["last_target"] == capacity - 1
     if debug_stage >= 7:
-        assert (
-            workspace.prior_slots[0, 0, :capacity].cpu().tolist()
-            == list(range(capacity))
+        assert workspace.prior_slots[0, 0, :capacity].cpu().tolist() == list(
+            range(capacity)
         )
     if debug_stage >= 8:
         assert torch.all(workspace.overwritten_slots[0].cpu() == 1)
@@ -733,9 +779,8 @@ def test_finalize_kernel_internal_stage_at_full_capacity(
             packed,
         )
     if debug_stage >= 10:
-        assert (
-            workspace.target_slots[0, :capacity].cpu().tolist()
-            == list(range(capacity))
+        assert workspace.target_slots[0, :capacity].cpu().tolist() == list(
+            range(capacity)
         )
     if debug_stage >= 11:
         assert int(workspace.miss_counts[0, 0].cpu()) == capacity
@@ -748,9 +793,7 @@ def test_finalize_kernel_boundary_at_full_shard_capacity(mtp):
     shard_count = resident_shard_count(mtp)
     capacity = mtp * 2048
     source = (
-        torch.arange(capacity, dtype=torch.int32)
-        .mul(shard_count)
-        .reshape(mtp, 1, 2048)
+        torch.arange(capacity, dtype=torch.int32).mul(shard_count).reshape(mtp, 1, 2048)
     )
     values = source.npu()
     boundaries = torch.full(
@@ -827,9 +870,7 @@ def test_int16_mapping_and_uint8_overwrite_at_full_shard_capacity(mtp):
     shard_count = resident_shard_count(mtp)
     capacity = mtp * 2048
     source = (
-        torch.arange(capacity, dtype=torch.int32)
-        .mul(shard_count)
-        .reshape(mtp, 1, 2048)
+        torch.arange(capacity, dtype=torch.int32).mul(shard_count).reshape(mtp, 1, 2048)
     )
     values = source.npu()
     boundaries = torch.full(
@@ -912,24 +953,39 @@ def _reference_step(
     resident: dict[int, int],
     capacity: int,
 ) -> tuple[dict[int, int], list[int], list[int]]:
-    protected = {resident[token] for shard in shards for token in shard if token in resident}
-    free_slots = [slot for slot in range(capacity) if slot not in protected]
+    occupied = set(resident.values())
+    assert occupied == set(range(len(occupied)))
+    current = {token for shard in shards for token in shard}
+    shard_count = len(shards)
+    evictable_slots = []
+    for shard in range(shard_count):
+        old_tokens = sorted(
+            token
+            for token in resident
+            if token % shard_count == shard and token not in current
+        )
+        evictable_slots.extend(resident[token] for token in old_tokens)
     assigned = {}
     misses = []
     miss_slots = []
-    free_index = 0
     for shard in shards:
         for token in shard:
             if token in resident:
                 assigned[token] = resident[token]
             else:
-                slot = free_slots[free_index]
-                free_index += 1
+                miss_index = len(misses)
+                if miss_index < len(evictable_slots):
+                    slot = evictable_slots[miss_index]
+                else:
+                    slot = len(occupied) + miss_index - len(evictable_slots)
+                assert slot < capacity
                 assigned[token] = slot
                 misses.append(token)
                 miss_slots.append(slot)
     overwritten = set(miss_slots)
-    updated = {token: slot for token, slot in resident.items() if slot not in overwritten}
+    updated = {
+        token: slot for token, slot in resident.items() if slot not in overwritten
+    }
     updated.update({token: assigned[token] for token in misses})
     return updated, misses, miss_slots
 
@@ -1009,7 +1065,9 @@ def test_sorted_resident_matches_three_step_reference(mtp):
             mtp,
             shard_count,
         )[0]
-        reference, expected_misses, expected_slots = _reference_step(expected_shards, reference, capacity)
+        reference, expected_misses, expected_slots = _reference_step(
+            expected_shards, reference, capacity
+        )
         prepare_sorted_resident_cache_fused_(
             values,
             block_table,
@@ -1034,6 +1092,161 @@ def test_sorted_resident_matches_three_step_reference(mtp):
         for position, token in enumerate(original):
             expected = reference[token] if token < boundary else token
             assert remapped[position] == expected
+
+
+@pytest.mark.parametrize("mtp", [1, 2])
+def test_sorted_resident_grows_contiguous_slot_tail_before_reuse(mtp):
+    requests = 1
+    shard_count = resident_shard_count(mtp)
+    capacity = mtp * 2048
+    block_size = 128
+    workspace = allocate_sorted_resident_workspace(
+        requests, mtp, device=torch.device("npu")
+    )
+    state = allocate_sorted_resident_state(
+        requests, requests, mtp, device=torch.device("npu")
+    )
+    row_requests = torch.zeros(mtp, dtype=torch.int32, device="npu")
+    request_states = torch.zeros(1, dtype=torch.int32, device="npu")
+    request_generations = torch.ones(1, dtype=torch.int64, device="npu")
+    block_table = torch.arange(
+        capacity // block_size,
+        dtype=torch.int32,
+        device="npu",
+    ).reshape(1, -1)
+
+    reference: dict[int, int] = {}
+    for offset, boundary in ((0, 1000), (0, 1200), (100, 1300)):
+        source = _source(mtp, offset)
+        values = source.npu()
+        boundaries = torch.full((mtp,), boundary, dtype=torch.int32, device="npu")
+        prepare_resident_sharded_union_(
+            values,
+            boundaries,
+            row_requests,
+            request_states,
+            request_generations,
+            state,
+            workspace,
+            mtp=mtp,
+        )
+        expected_shards = _expected_shards(
+            source,
+            boundaries.cpu(),
+            requests,
+            mtp,
+            shard_count,
+        )[0]
+        reference, expected_misses, expected_slots = _reference_step(
+            expected_shards, reference, capacity
+        )
+        prepare_sorted_resident_cache_fused_(
+            values,
+            block_table,
+            request_states,
+            request_generations,
+            state,
+            workspace,
+            block_size=block_size,
+        )
+        torch.npu.synchronize()
+
+        miss_count = int(workspace.miss_counts[0, 0].cpu())
+        assert miss_count == len(expected_misses)
+        assert workspace.miss_tokens[0, :miss_count].cpu().tolist() == expected_misses
+        assert workspace.target_slots[0, :miss_count].cpu().tolist() == expected_slots
+        actual = _state_dict(state, 0, shard_count)
+        assert actual == reference
+        assert set(actual.values()) == set(range(len(actual)))
+
+
+@pytest.mark.parametrize("mtp", [1, 2])
+def test_sorted_resident_pools_evict_slots_across_shards(mtp):
+    requests = 1
+    shard_count = resident_shard_count(mtp)
+    capacity = mtp * 2048
+    block_size = 128
+    boundary = 100
+    workspace = allocate_sorted_resident_workspace(
+        requests, mtp, device=torch.device("npu")
+    )
+    state = allocate_sorted_resident_state(
+        requests, requests, mtp, device=torch.device("npu")
+    )
+    row_requests = torch.zeros(mtp, dtype=torch.int32, device="npu")
+    boundaries = torch.full((mtp,), boundary, dtype=torch.int32, device="npu")
+    request_states = torch.zeros(1, dtype=torch.int32, device="npu")
+    request_generations = torch.ones(1, dtype=torch.int64, device="npu")
+    block_table = torch.arange(
+        capacity // block_size,
+        dtype=torch.int32,
+        device="npu",
+    ).reshape(1, -1)
+
+    def make_source(selected):
+        source = torch.arange(
+            mtp * 2048,
+            dtype=torch.int32,
+        ).reshape(mtp, 1, 2048)
+        source.add_(10_000)
+        source[0, 0, : len(selected)] = torch.tensor(selected, dtype=torch.int32)
+        return source
+
+    first = make_source([0, 1, 2, 3])
+    first_values = first.npu()
+    prepare_resident_sharded_union_(
+        first_values,
+        boundaries,
+        row_requests,
+        request_states,
+        request_generations,
+        state,
+        workspace,
+        mtp=mtp,
+    )
+    prepare_sorted_resident_cache_fused_(
+        first_values,
+        block_table,
+        request_states,
+        request_generations,
+        state,
+        workspace,
+        block_size=block_size,
+    )
+    torch.npu.synchronize()
+    first_resident = _state_dict(state, 0, shard_count)
+    evicted_slot = first_resident[0]
+
+    second = make_source([1, 2, 3, 5])
+    second_values = second.npu()
+    prepare_resident_sharded_union_(
+        second_values,
+        boundaries,
+        row_requests,
+        request_states,
+        request_generations,
+        state,
+        workspace,
+        mtp=mtp,
+    )
+    prepare_sorted_resident_cache_fused_(
+        second_values,
+        block_table,
+        request_states,
+        request_generations,
+        state,
+        workspace,
+        block_size=block_size,
+    )
+    torch.npu.synchronize()
+
+    assert 0 % shard_count != 5 % shard_count
+    assert int(workspace.miss_counts[0, 0].cpu()) == 1
+    assert int(workspace.miss_tokens[0, 0].cpu()) == 5
+    assert int(workspace.target_slots[0, 0].cpu()) == evicted_slot
+    second_resident = _state_dict(state, 0, shard_count)
+    assert 0 not in second_resident
+    assert second_resident[5] == evicted_slot
 
 
 @pytest.mark.parametrize("mtp", [1, 2])
@@ -1121,14 +1334,8 @@ def test_fused_sorted_resident_matches_three_step_reference(mtp):
         torch.npu.synchronize()
 
         miss_count = int(workspace.miss_counts[0, 0].cpu())
-        assert (
-            workspace.miss_tokens[0, :miss_count].cpu().tolist()
-            == expected_misses
-        )
-        assert (
-            workspace.target_slots[0, :miss_count].cpu().tolist()
-            == expected_slots
-        )
+        assert workspace.miss_tokens[0, :miss_count].cpu().tolist() == expected_misses
+        assert workspace.target_slots[0, :miss_count].cpu().tolist() == expected_slots
         overwritten = workspace.overwritten_slots[0].cpu()
         assert overwritten.dtype == torch.uint8
         assert int(overwritten.max()) <= 1
@@ -1220,9 +1427,7 @@ def test_sorted_resident_all_hit_emits_zero_misses(mtp):
     capacity = mtp * 2048
     block_size = 128
     source = _source(mtp, 0)
-    boundaries = torch.full(
-        (requests * mtp,), 100_000, dtype=torch.int32, device="npu"
-    )
+    boundaries = torch.full((requests * mtp,), 100_000, dtype=torch.int32, device="npu")
     row_requests = torch.zeros(requests * mtp, dtype=torch.int32, device="npu")
     request_states = torch.zeros(requests, dtype=torch.int32, device="npu")
     request_generations = torch.ones(requests, dtype=torch.int64, device="npu")
@@ -1287,9 +1492,7 @@ def test_sorted_resident_keeps_multiple_request_states_isolated(mtp):
         requests, dtype=torch.int32, device="npu"
     ).repeat_interleave(mtp)
     request_states = torch.arange(requests, dtype=torch.int32, device="npu")
-    request_generations = torch.tensor(
-        [11, 22], dtype=torch.int64, device="npu"
-    )
+    request_generations = torch.tensor([11, 22], dtype=torch.int64, device="npu")
     workspace = allocate_sorted_resident_workspace(
         requests, mtp, device=torch.device("npu")
     )
@@ -1343,9 +1546,7 @@ def test_sorted_resident_keeps_multiple_request_states_isolated(mtp):
             workspace.miss_tokens[request, :miss_count].cpu().tolist()
             == expected_misses
         )
-        expected_targets = [
-            request * capacity + slot for slot in expected_slots
-        ]
+        expected_targets = [request * capacity + slot for slot in expected_slots]
         assert (
             workspace.target_slots[request, :miss_count].cpu().tolist()
             == expected_targets
@@ -1403,9 +1604,7 @@ def test_sorted_resident_negative_state_uses_request_private_dummy_row(mtp):
     expected_shards = _expected_shards(
         source, boundaries.cpu(), requests, mtp, shard_count
     )[0]
-    expected, expected_misses, _ = _reference_step(
-        expected_shards, {}, capacity
-    )
+    expected, expected_misses, _ = _reference_step(expected_shards, {}, capacity)
 
     prepare_resident_sharded_union_(
         values,
@@ -1449,8 +1648,12 @@ def test_sorted_resident_full_path_supports_graph_replay(mtp):
     row_requests = torch.zeros(mtp, dtype=torch.int32, device="npu")
     request_states = torch.zeros(1, dtype=torch.int32, device="npu")
     request_generations = torch.ones(1, dtype=torch.int64, device="npu")
-    block_table = torch.arange(capacity // 128, dtype=torch.int32, device="npu").reshape(1, -1)
-    workspace = allocate_sorted_resident_workspace(requests, mtp, device=torch.device("npu"))
+    block_table = torch.arange(
+        capacity // 128, dtype=torch.int32, device="npu"
+    ).reshape(1, -1)
+    workspace = allocate_sorted_resident_workspace(
+        requests, mtp, device=torch.device("npu")
+    )
     state = allocate_sorted_resident_state(
         requests,
         requests,

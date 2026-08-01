@@ -196,6 +196,9 @@ at::Tensor npu_dsa_resident_sharded_union_meta(
     at::Tensor &state_counts,
     const at::Tensor &state_generations,
     at::Tensor &prior_slots,
+    at::Tensor &shard_miss_tokens,
+    at::Tensor &shard_miss_positions,
+    at::Tensor &shard_evictable_slots,
     int64_t mtp,
     int64_t dummy_state_base)
 {
@@ -211,6 +214,9 @@ at::Tensor npu_dsa_resident_sharded_union_meta(
     (void)state_counts;
     (void)state_generations;
     (void)prior_slots;
+    (void)shard_miss_tokens;
+    (void)shard_miss_positions;
+    (void)shard_evictable_slots;
     (void)mtp;
     (void)dummy_state_base;
     return shard_counts;
@@ -229,6 +235,9 @@ at::Tensor npu_dsa_resident_sorted_plan_meta(
     at::Tensor &state_counts,
     at::Tensor &state_generations,
     at::Tensor &prior_slots,
+    const at::Tensor &shard_miss_tokens,
+    const at::Tensor &shard_miss_positions,
+    const at::Tensor &shard_evictable_slots,
     at::Tensor &overwritten_slots,
     at::Tensor &miss_tokens,
     at::Tensor &miss_counts,
@@ -248,6 +257,9 @@ at::Tensor npu_dsa_resident_sorted_plan_meta(
     (void)state_counts;
     (void)state_generations;
     (void)prior_slots;
+    (void)shard_miss_tokens;
+    (void)shard_miss_positions;
+    (void)shard_evictable_slots;
     (void)overwritten_slots;
     (void)miss_tokens;
     (void)target_slots;
@@ -314,6 +326,9 @@ at::Tensor npu_dsa_resident_sorted_finalize_debug_meta(
     const at::Tensor &shard_packed,
     const at::Tensor &shard_counts,
     at::Tensor &prior_slots,
+    const at::Tensor &shard_miss_tokens,
+    const at::Tensor &shard_miss_positions,
+    const at::Tensor &shard_evictable_slots,
     at::Tensor &overwritten_slots,
     at::Tensor &miss_tokens,
     at::Tensor &miss_counts,
@@ -326,6 +341,9 @@ at::Tensor npu_dsa_resident_sorted_finalize_debug_meta(
     (void)shard_packed;
     (void)shard_counts;
     (void)prior_slots;
+    (void)shard_miss_tokens;
+    (void)shard_miss_positions;
+    (void)shard_evictable_slots;
     (void)overwritten_slots;
     (void)miss_tokens;
     (void)target_slots;

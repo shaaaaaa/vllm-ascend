@@ -47,6 +47,9 @@ class SortedResidentWorkspace:
     shard_mapping: torch.Tensor
     shard_counts: torch.Tensor
     prior_slots: torch.Tensor
+    shard_miss_tokens: torch.Tensor
+    shard_miss_positions: torch.Tensor
+    shard_evictable_slots: torch.Tensor
     overwritten_slots: torch.Tensor
     miss_tokens: torch.Tensor
     miss_counts: torch.Tensor
@@ -118,6 +121,9 @@ def allocate_sorted_resident_workspace(
         shard_mapping=torch.empty(shard_shape, dtype=torch.int16, device=device),
         shard_counts=torch.zeros(count_shape, dtype=torch.int32, device=device),
         prior_slots=torch.empty(shard_shape, dtype=torch.int16, device=device),
+        shard_miss_tokens=torch.empty(shard_shape, dtype=torch.int32, device=device),
+        shard_miss_positions=torch.empty(shard_shape, dtype=torch.int16, device=device),
+        shard_evictable_slots=torch.empty(shard_shape, dtype=torch.int16, device=device),
         overwritten_slots=torch.empty(
             (request_count, capacity),
             dtype=torch.uint8,
@@ -156,6 +162,9 @@ def sorted_resident_workspace_prefix(
         shard_mapping=workspace.shard_mapping[:request_count],
         shard_counts=workspace.shard_counts[:request_count],
         prior_slots=workspace.prior_slots[:request_count],
+        shard_miss_tokens=workspace.shard_miss_tokens[:request_count],
+        shard_miss_positions=workspace.shard_miss_positions[:request_count],
+        shard_evictable_slots=workspace.shard_evictable_slots[:request_count],
         overwritten_slots=workspace.overwritten_slots[:request_count],
         miss_tokens=workspace.miss_tokens[:request_count],
         miss_counts=workspace.miss_counts[:request_count],
@@ -196,6 +205,9 @@ def prepare_resident_sharded_union_(
         state.counts,
         state.generations,
         workspace.prior_slots,
+        workspace.shard_miss_tokens,
+        workspace.shard_miss_positions,
+        workspace.shard_evictable_slots,
         mtp,
         state.dummy_state_base,
     )
@@ -225,6 +237,9 @@ def _run_sorted_resident_plan_(
         state.counts,
         state.generations,
         workspace.prior_slots,
+        workspace.shard_miss_tokens,
+        workspace.shard_miss_positions,
+        workspace.shard_evictable_slots,
         workspace.overwritten_slots,
         workspace.miss_tokens,
         workspace.miss_counts,
@@ -390,6 +405,9 @@ def debug_sorted_resident_finalize_only_(
         workspace.shard_packed,
         workspace.shard_counts,
         workspace.prior_slots,
+        workspace.shard_miss_tokens,
+        workspace.shard_miss_positions,
+        workspace.shard_evictable_slots,
         workspace.overwritten_slots,
         workspace.miss_tokens,
         workspace.miss_counts,

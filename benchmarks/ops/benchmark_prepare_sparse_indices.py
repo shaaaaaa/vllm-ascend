@@ -1099,6 +1099,9 @@ def main(
             resident_union_workspace.shard_mapping.clone(),
             resident_union_workspace.shard_counts.clone(),
             resident_union_workspace.prior_slots.clone(),
+            resident_union_workspace.shard_miss_tokens.clone(),
+            resident_union_workspace.shard_miss_positions.clone(),
+            resident_union_workspace.shard_evictable_slots.clone(),
         )
 
         resident_finalize_debug = torch.empty((request_batch, 16), dtype=torch.int32, device="npu")
@@ -1144,6 +1147,9 @@ def main(
             resident_union_workspace.shard_mapping.copy_(resident_union_seed[1])
             resident_union_workspace.shard_counts.copy_(resident_union_seed[2])
             resident_union_workspace.prior_slots.copy_(resident_union_seed[3])
+            resident_union_workspace.shard_miss_tokens.copy_(resident_union_seed[4])
+            resident_union_workspace.shard_miss_positions.copy_(resident_union_seed[5])
+            resident_union_workspace.shard_evictable_slots.copy_(resident_union_seed[6])
 
         def reset_resident_union():
             resident_union_values.copy_(source)
