@@ -33,6 +33,7 @@ constexpr uint32_t kShardCurrentCount = 0;
 constexpr uint32_t kShardMissCount = 1;
 constexpr uint32_t kShardEvictableCount = 2;
 constexpr uint32_t kShardOldCount = 3;
+constexpr uint32_t kShardSelectedEvictCount = 4;
 
 template <AscendC::HardEvent event>
 __aicore__ inline void Sync()
@@ -1282,6 +1283,7 @@ private:
         uint32_t currentCounts[kMaxResidentShards] = {};
         uint32_t missCounts[kMaxResidentShards] = {};
         uint32_t evictableCounts[kMaxResidentShards] = {};
+        uint32_t selectedEvictCounts[kMaxResidentShards] = {};
         uint32_t priorOffsets[kMaxResidentShards] = {};
         uint32_t missOffsets[kMaxResidentShards] = {};
         uint32_t evictableOffsets[kMaxResidentShards] = {};
@@ -1314,9 +1316,6 @@ private:
             const uint32_t missOffset =
                 (missEnd + kInt16PerDataBlock - 1)
                 & ~(kInt16PerDataBlock - 1);
-            const uint32_t evictableOffset =
-                (evictableEnd + kInt16PerDataBlock - 1)
-                & ~(kInt16PerDataBlock - 1);
             const uint64_t shardOffset =
                 requestShardBase
                 + static_cast<uint64_t>(shard) * capacity_;
@@ -1325,7 +1324,6 @@ private:
             evictableCounts[shard] = evictableCount;
             priorOffsets[shard] = priorOffset;
             missOffsets[shard] = missOffset;
-            evictableOffsets[shard] = evictableOffset;
             if (currentCount > 0) {
                 CopyGlobalToLocalExact(
                     packedPriorSlots[priorOffset],
@@ -1342,19 +1340,53 @@ private:
                     shardMissPositions_[shardOffset],
                     shardMissCount);
             }
-            if (evictableCount > 0) {
-                CopyGlobalToLocalExact(
-                    evictableSlots[evictableOffset],
-                    shardEvictableSlots_[shardOffset],
-                    evictableCount);
-            }
             priorEnd = priorOffset + currentCount;
             missEnd = missOffset + shardMissCount;
-            evictableEnd = evictableOffset + evictableCount;
             totalMissCount += shardMissCount;
             totalEvictableCount += evictableCount;
             totalOldCount += oldCount;
         }
+
+        // Finalize consumes evictable slots shard-major. Only copy the
+        // prefix that can actually be paired with a miss. Each UB segment
+        // remains 32-byte aligned for DataCopy/DataCopyPad; the small gaps
+        // are covered by packedElements' per-shard padding allowance.
+        uint32_t remainingEvictions = totalMissCount < totalEvictableCount
+            ? totalMissCount
+            : totalEvictableCount;
+        for (uint32_t shard = 0; shard < shardCount_; ++shard) {
+            const uint32_t selectedCount =
+                evictableCounts[shard] < remainingEvictions
+                ? evictableCounts[shard]
+                : remainingEvictions;
+            const uint32_t evictableOffset =
+                (evictableEnd + kInt16PerDataBlock - 1)
+                & ~(kInt16PerDataBlock - 1);
+            const uint64_t shardOffset =
+                requestShardBase
+                + static_cast<uint64_t>(shard) * capacity_;
+            const uint64_t countOffset =
+                static_cast<uint64_t>(request)
+                    * shardCountRequestStride_
+                + shard * shardCountStride_;
+            selectedEvictCounts[shard] = selectedCount;
+            evictableOffsets[shard] = evictableOffset;
+            if (selectedCount > 0) {
+                CopyGlobalToLocalExact(
+                    evictableSlots[evictableOffset],
+                    shardEvictableSlots_[shardOffset],
+                    selectedCount);
+            }
+            shardCounts_.SetValue(
+                countOffset + kShardSelectedEvictCount,
+                static_cast<int32_t>(selectedCount));
+            evictableEnd = evictableOffset + selectedCount;
+            remainingEvictions -= selectedCount;
+        }
+        const uint32_t totalSelectedEvictCount =
+            totalMissCount < totalEvictableCount
+            ? totalMissCount
+            : totalEvictableCount;
         Sync<AscendC::HardEvent::MTE2_S>();
         Sync<AscendC::HardEvent::V_S>();
 
@@ -1371,11 +1403,11 @@ private:
                      localMiss < shardMissCount;
                      ++localMiss) {
                     int16_t slot;
-                    if (globalMiss < totalEvictableCount) {
+                    if (globalMiss < totalSelectedEvictCount) {
                         while (
                             evictableShard < shardCount_ &&
                             evictableIndex >=
-                                evictableCounts[evictableShard]) {
+                                selectedEvictCounts[evictableShard]) {
                             ++evictableShard;
                             evictableIndex = 0;
                         }
@@ -1393,7 +1425,7 @@ private:
                         slot = static_cast<int16_t>(
                             totalOldCount
                             + globalMiss
-                            - totalEvictableCount);
+                            - totalSelectedEvictCount);
                     }
                     const uint32_t position = static_cast<uint32_t>(
                         missPositions.GetValue(
@@ -1656,6 +1688,9 @@ public:
             stateCounts_.GetValue(oldCountOffset));
         const uint32_t currentCount = static_cast<uint32_t>(
             shardCounts_.GetValue(requestCountOffset));
+        const uint32_t selectedEvictCount = static_cast<uint32_t>(
+            shardCounts_.GetValue(
+                requestCountOffset + kShardSelectedEvictCount));
         const uint64_t requestShardBase =
             static_cast<uint64_t>(request) * shardCount_ * capacity_;
         const uint64_t requestShardOffset =
@@ -1669,9 +1704,6 @@ public:
         auto oldSlots = oldSlotBuf_.Get<int16_t>();
         auto currentTokens = currentTokenBuf_.Get<int32_t>();
         auto priorSlots = priorSlotBuf_.Get<int16_t>();
-        auto overwritten = overwrittenBuf_.Get<uint8_t>();
-        auto survivorTokens = survivorTokenBuf_.Get<int32_t>();
-        auto survivorSlots = survivorSlotBuf_.Get<int16_t>();
         auto mergedTokens = mergedTokenBuf_.Get<int32_t>();
         auto mergedSlots = mergedSlotBuf_.Get<int16_t>();
 
@@ -1691,74 +1723,57 @@ public:
                 priorSlots_[requestShardOffset],
                 currentCount);
         }
-        CopyGlobalToLocalExact(
-            overwritten,
-            overwrittenSlots_[
-                static_cast<uint64_t>(request) * capacity_],
-            capacity_);
         Sync<AscendC::HardEvent::MTE2_S>();
 
-        uint32_t survivorCount = 0;
-        if (oldCount > 0) {
-            for (uint32_t index = 0; index < oldCount; ++index) {
-                const int16_t slot = oldSlots.GetValue(index);
-                if (slot >= 0 &&
-                    overwritten.GetValue(
-                        static_cast<uint32_t>(slot)) == 0) {
-                    survivorTokens.SetValue(
-                        survivorCount, oldTokens.GetValue(index));
-                    survivorSlots.SetValue(survivorCount, slot);
-                    ++survivorCount;
-                }
-            }
-        }
-
-        // Merge two already-sorted runs: surviving old residents and the
-        // current misses. Hits are already present in the survivor run and
-        // must not be inserted a second time.
+        // Rebuild the sorted resident state in one merge. Finalize consumes
+        // each shard's evictable list from the beginning and publishes that
+        // prefix length above. Therefore the first selectedEvictCount old
+        // tokens absent from current are removed; later absent old tokens
+        // remain resident, hits retain their old slot, and misses already
+        // carry their newly assigned slot in priorSlots.
         uint32_t oldIndex = 0;
         uint32_t currentIndex = 0;
+        uint32_t evictableIndex = 0;
         uint32_t mergedCount = 0;
-        if (survivorCount > 0 || currentCount > 0) {
-            while (oldIndex < survivorCount ||
+        if (oldCount > 0 || currentCount > 0) {
+            while (oldIndex < oldCount ||
                    currentIndex < currentCount) {
-                if (currentIndex < currentCount) {
-                    while (currentIndex < currentCount) {
-                        const int16_t slot =
-                            priorSlots.GetValue(currentIndex);
-                        if (slot >= 0 &&
-                            overwritten.GetValue(
-                                static_cast<uint32_t>(slot)) != 0) {
-                            break;
-                        }
-                        ++currentIndex;
-                    }
-                }
-                const bool haveOld = oldIndex < survivorCount;
-                const bool haveMiss = currentIndex < currentCount;
-                if (!haveOld && !haveMiss) {
-                    break;
-                }
+                const bool haveOld = oldIndex < oldCount;
+                const bool haveCurrent = currentIndex < currentCount;
                 const int32_t oldToken = haveOld
-                    ? survivorTokens.GetValue(oldIndex)
+                    ? oldTokens.GetValue(oldIndex)
                     : static_cast<int32_t>(0x7FFFFFFF);
-                const int32_t missToken = haveMiss
+                const int32_t currentToken = haveCurrent
                     ? currentTokens.GetValue(currentIndex)
                     : static_cast<int32_t>(0x7FFFFFFF);
-                if (haveOld && (!haveMiss || oldToken < missToken)) {
-                    mergedTokens.SetValue(mergedCount, oldToken);
-                    mergedSlots.SetValue(
-                        mergedCount,
-                        survivorSlots.GetValue(oldIndex));
+                if (haveOld &&
+                    (!haveCurrent || oldToken < currentToken)) {
+                    if (evictableIndex >= selectedEvictCount) {
+                        mergedTokens.SetValue(mergedCount, oldToken);
+                        mergedSlots.SetValue(
+                            mergedCount, oldSlots.GetValue(oldIndex));
+                        ++mergedCount;
+                    }
+                    ++evictableIndex;
                     ++oldIndex;
-                } else {
-                    mergedTokens.SetValue(mergedCount, missToken);
+                } else if (haveCurrent &&
+                           (!haveOld || currentToken < oldToken)) {
+                    mergedTokens.SetValue(mergedCount, currentToken);
                     mergedSlots.SetValue(
                         mergedCount,
                         priorSlots.GetValue(currentIndex));
                     ++currentIndex;
+                    ++mergedCount;
+                } else {
+                    // Equal token: preserve the resident slot and consume
+                    // both sorted inputs exactly once.
+                    mergedTokens.SetValue(mergedCount, currentToken);
+                    mergedSlots.SetValue(
+                        mergedCount, oldSlots.GetValue(oldIndex));
+                    ++oldIndex;
+                    ++currentIndex;
+                    ++mergedCount;
                 }
-                ++mergedCount;
             }
         }
 
@@ -1827,6 +1842,9 @@ public:
             stateCounts_.GetValue(oldCountOffset));
         const uint32_t currentCount = static_cast<uint32_t>(
             shardCounts_.GetValue(requestCountOffset));
+        const uint32_t selectedEvictCount = static_cast<uint32_t>(
+            shardCounts_.GetValue(
+                requestCountOffset + kShardSelectedEvictCount));
         const uint64_t requestShardBase =
             static_cast<uint64_t>(request) * shardCount_ * capacity_;
         const uint64_t requestShardOffset =
@@ -1840,9 +1858,6 @@ public:
         auto oldSlots = oldSlotBuf_.Get<int16_t>();
         auto currentTokens = currentTokenBuf_.Get<int32_t>();
         auto priorSlots = priorSlotBuf_.Get<int16_t>();
-        auto overwritten = overwrittenBuf_.Get<uint8_t>();
-        auto survivorTokens = survivorTokenBuf_.Get<int32_t>();
-        auto survivorSlots = survivorSlotBuf_.Get<int16_t>();
         auto mergedTokens = mergedTokenBuf_.Get<int32_t>();
         auto mergedSlots = mergedSlotBuf_.Get<int16_t>();
 
@@ -1862,74 +1877,57 @@ public:
                 priorSlots_[requestShardOffset],
                 currentCount);
         }
-        CopyGlobalToLocalExact(
-            overwritten,
-            overwrittenSlots_[
-                static_cast<uint64_t>(request) * capacity_],
-            capacity_);
         Sync<AscendC::HardEvent::MTE2_S>();
 
-        uint32_t survivorCount = 0;
-        if (oldCount > 0) {
-            for (uint32_t index = 0; index < oldCount; ++index) {
-                const int16_t slot = oldSlots.GetValue(index);
-                if (slot >= 0 &&
-                    overwritten.GetValue(
-                        static_cast<uint32_t>(slot)) == 0) {
-                    survivorTokens.SetValue(
-                        survivorCount, oldTokens.GetValue(index));
-                    survivorSlots.SetValue(survivorCount, slot);
-                    ++survivorCount;
-                }
-            }
-        }
-
-        // Merge two already-sorted runs: surviving old residents and the
-        // current misses. Hits are already present in the survivor run and
-        // must not be inserted a second time.
+        // Rebuild the sorted resident state in one merge. Finalize consumes
+        // each shard's evictable list from the beginning and publishes that
+        // prefix length above. Therefore the first selectedEvictCount old
+        // tokens absent from current are removed; later absent old tokens
+        // remain resident, hits retain their old slot, and misses already
+        // carry their newly assigned slot in priorSlots.
         uint32_t oldIndex = 0;
         uint32_t currentIndex = 0;
+        uint32_t evictableIndex = 0;
         uint32_t mergedCount = 0;
-        if (survivorCount > 0 || currentCount > 0) {
-            while (oldIndex < survivorCount ||
+        if (oldCount > 0 || currentCount > 0) {
+            while (oldIndex < oldCount ||
                    currentIndex < currentCount) {
-                if (currentIndex < currentCount) {
-                    while (currentIndex < currentCount) {
-                        const int16_t slot =
-                            priorSlots.GetValue(currentIndex);
-                        if (slot >= 0 &&
-                            overwritten.GetValue(
-                                static_cast<uint32_t>(slot)) != 0) {
-                            break;
-                        }
-                        ++currentIndex;
-                    }
-                }
-                const bool haveOld = oldIndex < survivorCount;
-                const bool haveMiss = currentIndex < currentCount;
-                if (!haveOld && !haveMiss) {
-                    break;
-                }
+                const bool haveOld = oldIndex < oldCount;
+                const bool haveCurrent = currentIndex < currentCount;
                 const int32_t oldToken = haveOld
-                    ? survivorTokens.GetValue(oldIndex)
+                    ? oldTokens.GetValue(oldIndex)
                     : static_cast<int32_t>(0x7FFFFFFF);
-                const int32_t missToken = haveMiss
+                const int32_t currentToken = haveCurrent
                     ? currentTokens.GetValue(currentIndex)
                     : static_cast<int32_t>(0x7FFFFFFF);
-                if (haveOld && (!haveMiss || oldToken < missToken)) {
-                    mergedTokens.SetValue(mergedCount, oldToken);
-                    mergedSlots.SetValue(
-                        mergedCount,
-                        survivorSlots.GetValue(oldIndex));
+                if (haveOld &&
+                    (!haveCurrent || oldToken < currentToken)) {
+                    if (evictableIndex >= selectedEvictCount) {
+                        mergedTokens.SetValue(mergedCount, oldToken);
+                        mergedSlots.SetValue(
+                            mergedCount, oldSlots.GetValue(oldIndex));
+                        ++mergedCount;
+                    }
+                    ++evictableIndex;
                     ++oldIndex;
-                } else {
-                    mergedTokens.SetValue(mergedCount, missToken);
+                } else if (haveCurrent &&
+                           (!haveOld || currentToken < oldToken)) {
+                    mergedTokens.SetValue(mergedCount, currentToken);
                     mergedSlots.SetValue(
                         mergedCount,
                         priorSlots.GetValue(currentIndex));
                     ++currentIndex;
+                    ++mergedCount;
+                } else {
+                    // Equal token: preserve the resident slot and consume
+                    // both sorted inputs exactly once.
+                    mergedTokens.SetValue(mergedCount, currentToken);
+                    mergedSlots.SetValue(
+                        mergedCount, oldSlots.GetValue(oldIndex));
+                    ++oldIndex;
+                    ++currentIndex;
+                    ++mergedCount;
                 }
-                ++mergedCount;
             }
         }
 

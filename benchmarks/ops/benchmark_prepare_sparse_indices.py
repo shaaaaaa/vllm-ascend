@@ -1118,6 +1118,16 @@ def main(
         torch.npu.synchronize()
         if resident_union_workspace.miss_counts[:, 0].cpu().tolist() != [resident_expected_misses] * request_batch:
             raise AssertionError("resident 90%-hit finalize emitted an incorrect miss count")
+        resident_selected_evicts = min(
+            resident_expected_misses,
+            capacity - resident_hit_count,
+        )
+        selected_evicts = resident_union_workspace.shard_counts[:, :, 4].sum(dim=1).cpu().tolist()
+        if selected_evicts != [resident_selected_evicts] * request_batch:
+            raise AssertionError(
+                "resident finalize selected an incorrect evict prefix: "
+                f"actual={selected_evicts}, expected={resident_selected_evicts}"
+            )
         resident_finalized_seed = (
             resident_union_workspace.prior_slots.clone(),
             resident_union_workspace.overwritten_slots.clone(),
@@ -1380,6 +1390,8 @@ def main(
             f"hit_rate={resident_hit_count / sharded_boundary:.2%}, "
             f"hits={resident_hit_count}, "
             f"misses={resident_expected_misses}, "
+            f"evict_candidates={capacity - resident_hit_count}, "
+            f"evict_slots_copied={resident_selected_evicts}, "
             "scratch_full=True"
         )
         _summary("resident-finalize-kernel", resident_finalize_samples)

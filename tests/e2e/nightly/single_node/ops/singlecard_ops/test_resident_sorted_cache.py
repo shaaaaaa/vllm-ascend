@@ -1192,7 +1192,7 @@ def test_sorted_resident_pools_evict_slots_across_shards(mtp):
         source[0, 0, : len(selected)] = torch.tensor(selected, dtype=torch.int32)
         return source
 
-    first = make_source([0, 1, 2, 3])
+    first = make_source([0, 1, 2, 3, 4])
     first_values = first.npu()
     prepare_resident_sharded_union_(
         first_values,
@@ -1244,8 +1244,13 @@ def test_sorted_resident_pools_evict_slots_across_shards(mtp):
     assert int(workspace.miss_counts[0, 0].cpu()) == 1
     assert int(workspace.miss_tokens[0, 0].cpu()) == 5
     assert int(workspace.target_slots[0, 0].cpu()) == evicted_slot
+    selected_evict_counts = workspace.shard_counts[0, :, 4].cpu().tolist()
+    assert sum(selected_evict_counts) == 1
+    assert selected_evict_counts[0 % shard_count] == 1
+    assert selected_evict_counts[5 % shard_count] == 0
     second_resident = _state_dict(state, 0, shard_count)
     assert 0 not in second_resident
+    assert second_resident[4] == first_resident[4]
     assert second_resident[5] == evicted_slot
 
 
