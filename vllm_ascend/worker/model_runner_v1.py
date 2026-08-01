@@ -726,6 +726,7 @@ class NPUModelRunner(GPUModelRunner):
         num_reqs_padded: int,
         is_dummy: bool,
         decode_only: bool = True,
+        remap_frontiers: tuple[int, ...] | None = None,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None, Any, Any]:
         registry = self._resident_state_registry
         indices = self._resident_state_indices
@@ -741,6 +742,12 @@ class NPUModelRunner(GPUModelRunner):
                 raise RuntimeError(
                     "resident sparse cache received an empty request id"
                 )
+            if remap_frontiers is not None and len(remap_frontiers) != num_reqs:
+                raise RuntimeError(
+                    "resident sparse cache remap frontier count differs from "
+                    f"the active request count: {len(remap_frontiers)} != "
+                    f"{num_reqs}"
+                )
             if not decode_only:
                 # Mixed batches use the ordinary union and may overwrite
                 # scratch without updating sorted state. The next decode-only
@@ -751,15 +758,32 @@ class NPUModelRunner(GPUModelRunner):
                 self._resident_scratch_capacity,
                 block_table.block_size,
             )
+            eligible_rows = []
+            eligible_request_ids = []
+            short_request_ids = []
             signatures = []
             for row in range(num_reqs):
                 if block_table.num_blocks_per_row[row] < scratch_blocks:
-                    raise RuntimeError(
-                        "resident sparse cache scratch prefix is not fully "
-                        f"allocated for request row {row}: needs "
-                        f"{scratch_blocks} blocks, has "
-                        f"{block_table.num_blocks_per_row[row]}"
-                    )
+                    if (
+                        remap_frontiers is not None
+                        and remap_frontiers[row] != 0
+                    ):
+                        raise RuntimeError(
+                            "resident sparse cache received a nonzero remap "
+                            "frontier without a complete scratch prefix for "
+                            f"request row {row}: frontier="
+                            f"{remap_frontiers[row]}, needs {scratch_blocks} "
+                            "blocks, has "
+                            f"{block_table.num_blocks_per_row[row]}"
+                        )
+                    # A short request has a zero remap frontier, so its KV
+                    # remains resident and the scratch planner is a no-op.
+                    # Keep it on the cold/dummy state until the complete fixed
+                    # scratch prefix has been allocated.
+                    short_request_ids.append(request_ids[row])
+                    continue
+                eligible_rows.append(row)
+                eligible_request_ids.append(request_ids[row])
                 signatures.append(
                     tuple(
                         map(
@@ -770,12 +794,18 @@ class NPUModelRunner(GPUModelRunner):
                         )
                     )
                 )
-            state_rows, state_generations = registry.bind(
-                request_ids,  # type: ignore[arg-type]
-                signatures,
-            )
-            indices.np[:num_reqs] = state_rows
-            generations.np[:num_reqs] = state_generations
+            if decode_only and short_request_ids:
+                # If a preempted/restarted request used to own a resident row,
+                # make a later partial-to-full transition cold even when the
+                # allocator happens to reuse the same physical block ids.
+                registry.invalidate(short_request_ids)  # type: ignore[arg-type]
+            if eligible_rows:
+                state_rows, state_generations = registry.bind(
+                    eligible_request_ids,  # type: ignore[arg-type]
+                    signatures,
+                )
+                indices.np[eligible_rows] = state_rows
+                generations.np[eligible_rows] = state_generations
 
         indices.copy_to_gpu(num_reqs_padded)
         generations.copy_to_gpu(num_reqs_padded)
@@ -1765,6 +1795,12 @@ class NPUModelRunner(GPUModelRunner):
                     num_scheduled_tokens=scheduler_output.num_scheduled_tokens,
                     num_scheduled_tokens_np=num_scheduled_tokens_np,
                     cascade_attn_prefix_lens=cascade_attn_prefix_lens,
+                    resident_remap_frontiers=(
+                        staged_sfa_route.frontiers
+                        if staged_sfa_route.action
+                        == StagedSFARouteAction.STAGED
+                        else None
+                    ),
                 )
 
             (
@@ -2718,6 +2754,7 @@ class NPUModelRunner(GPUModelRunner):
         num_scheduled_tokens: dict[str, int] | None = None,
         num_scheduled_tokens_np: np.ndarray | None = None,
         cascade_attn_prefix_lens: list[list[int]] | None = None,
+        resident_remap_frontiers: tuple[int, ...] | None = None,
     ) -> tuple[PerLayerAttnMetadata, CommonAttentionMetadata | None]:
         """
         :return: tuple[attn_metadata, spec_decode_common_attn_metadata]
@@ -2868,6 +2905,7 @@ class NPUModelRunner(GPUModelRunner):
                     AscendAttentionState.SpecDecoding,
                 )
             ),
+            remap_frontiers=resident_remap_frontiers,
         )
 
         cm_base = AscendCommonAttentionMetadata(

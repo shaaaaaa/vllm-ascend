@@ -152,6 +152,107 @@ class TestStagedSFADummyRemapBoundaries(unittest.TestCase):
                 )
 
 
+class TestResidentRequestState(unittest.TestCase):
+    @staticmethod
+    def _build_runner():
+        runner = NPUModelRunner.__new__(NPUModelRunner)
+        runner._resident_state_registry = (
+            model_runner_module.ResidentRequestStateRegistry(3)
+        )
+        runner._resident_state_indices = SimpleNamespace(
+            np=np.zeros(3, dtype=np.int32),
+            gpu=torch.zeros(3, dtype=torch.int32),
+            copy_to_gpu=MagicMock(),
+        )
+        runner._resident_state_generations = SimpleNamespace(
+            np=np.zeros(3, dtype=np.int64),
+            gpu=torch.zeros(3, dtype=torch.int64),
+            copy_to_gpu=MagicMock(),
+        )
+        runner._resident_scratch_capacity = 4096
+
+        block_ids = np.full((2, 32), -1, dtype=np.int32)
+        block_ids[0, :26] = np.arange(100, 126, dtype=np.int32)
+        block_ids[1] = np.arange(200, 232, dtype=np.int32)
+        block_table = SimpleNamespace(
+            block_size=128,
+            num_blocks_per_row=np.array([26, 32], dtype=np.int32),
+            block_table=SimpleNamespace(np=block_ids),
+        )
+        runner.input_batch = SimpleNamespace(
+            req_ids=["short", "full"],
+            block_table=[block_table],
+        )
+        return runner, block_table
+
+    def test_short_row_stays_cold_until_full_scratch_is_allocated(self):
+        runner, block_table = self._build_runner()
+
+        _, _, indices, generations = runner._prepare_resident_request_state(
+            num_reqs=2,
+            num_reqs_padded=3,
+            is_dummy=False,
+            remap_frontiers=(0, 4096),
+        )
+
+        self.assertEqual(indices.tolist()[0], -1)
+        self.assertEqual(generations.tolist()[0], -1)
+        self.assertGreaterEqual(indices.tolist()[1], 0)
+        self.assertGreaterEqual(generations.tolist()[1], 0)
+        self.assertEqual(indices.tolist()[2], -1)
+        full_state = int(indices[1])
+        full_generation = int(generations[1])
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "nonzero remap frontier without a complete scratch prefix",
+        ):
+            runner._prepare_resident_request_state(
+                num_reqs=2,
+                num_reqs_padded=3,
+                is_dummy=False,
+                remap_frontiers=(4096, 4096),
+            )
+
+        block_table.block_table.np[0, 26:] = np.arange(
+            126, 132, dtype=np.int32
+        )
+        block_table.num_blocks_per_row[0] = 32
+        _, _, indices, generations = runner._prepare_resident_request_state(
+            num_reqs=2,
+            num_reqs_padded=3,
+            is_dummy=False,
+            remap_frontiers=(4096, 4096),
+        )
+
+        self.assertGreaterEqual(indices.tolist()[0], 0)
+        self.assertGreaterEqual(generations.tolist()[0], 0)
+        self.assertEqual(int(indices[1]), full_state)
+        self.assertEqual(int(generations[1]), full_generation)
+
+        short_state = int(indices[0])
+        short_generation = int(generations[0])
+        block_table.num_blocks_per_row[0] = 26
+        _, _, indices, generations = runner._prepare_resident_request_state(
+            num_reqs=2,
+            num_reqs_padded=3,
+            is_dummy=False,
+            remap_frontiers=(0, 4096),
+        )
+        self.assertEqual(int(indices[0]), -1)
+        self.assertEqual(int(generations[0]), -1)
+
+        block_table.num_blocks_per_row[0] = 32
+        _, _, indices, generations = runner._prepare_resident_request_state(
+            num_reqs=2,
+            num_reqs_padded=3,
+            is_dummy=False,
+            remap_frontiers=(4096, 4096),
+        )
+        self.assertEqual(int(indices[0]), short_state)
+        self.assertGreater(int(generations[0]), short_generation)
+
+
 class TestNPUModelRunnerKVCache(unittest.TestCase):
     def _build_runner(self):
         runner = NPUModelRunner.__new__(NPUModelRunner)
