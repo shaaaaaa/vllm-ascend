@@ -220,7 +220,18 @@ def test_sparse_boundary_prefers_explicit_committed_end():
                 load_spec=SimpleNamespace(
                     can_load=True,
                     lmcache_cached_tokens=3072,
-                    dsa_committed_end=0,
+                    dsa_committed_end=3072,
+                    dsa_scratch_capacity=4096,
+                ),
+            ),
+            SimpleNamespace(
+                req_id="scratch-full",
+                is_sparse_decode=True,
+                load_spec=SimpleNamespace(
+                    can_load=True,
+                    lmcache_cached_tokens=4096,
+                    dsa_committed_end=4096,
+                    dsa_scratch_capacity=4096,
                 ),
             ),
             SimpleNamespace(
@@ -245,7 +256,9 @@ def test_sparse_boundary_prefers_explicit_committed_end():
         patch.object(attention_utils, "is_v1_kv_transfer_group", return_value=True),
         patch.object(attention_utils, "get_kv_transfer_group", return_value=connector),
     ):
-        assert attention_utils.get_lmcache_sparse_cached_tokens(["resident", "offloaded"]) == [0, 8192]
+        assert attention_utils.get_lmcache_sparse_cached_tokens(
+            ["resident", "scratch-full", "offloaded"]
+        ) == [0, 4096, 8192]
 
 
 def _staged_route(frontiers=(4096,)):
@@ -463,7 +476,8 @@ class TestLMCacheSparseFrontier(TestBase):
                     load_spec=SimpleNamespace(
                         can_load=True,
                         lmcache_cached_tokens=1024,
-                        dsa_committed_end=0,
+                        dsa_committed_end=3072,
+                        dsa_scratch_capacity=4096,
                     ),
                 ),
                 SimpleNamespace(
@@ -473,6 +487,7 @@ class TestLMCacheSparseFrontier(TestBase):
                         can_load=True,
                         lmcache_cached_tokens=8192,
                         dsa_committed_end=8192,
+                        dsa_scratch_capacity=4096,
                     ),
                 ),
             ]
@@ -1356,9 +1371,10 @@ class TestStagedSFAGraphPoc(TestBase):
             wait_for_layer.call_args_list[0].kwargs["payload_event"],
             impl._staged_sfa_capture_state.producer_event,
         )
-        self.assertTrue(
+        self.assertEqual(
             wait_for_layer.call_args_list[0]
-            .kwargs["require_complete_sparse_load"]
+            .kwargs["require_complete_sparse_load"],
+            frozenset({"req-0"}),
         )
         self.assertEqual(
             wait_for_layer.call_args_list[0]
@@ -1372,6 +1388,42 @@ class TestStagedSFAGraphPoc(TestBase):
             is_dummy_run=False,
             index_topk=impl.index_topk,
             cached_tokens=(4096,),
+        )
+
+    def test_cross_layer_zero_boundary_disables_complete_remap(self):
+        impl = self._make_eligible_impl()
+        metadata = self._make_decode_metadata()
+        context = SimpleNamespace(
+            staged_sfa_graph_key=StagedSFAGraphKey.exact_q1(1),
+            staged_sfa_route=StagedSFARouteDecision(
+                StagedSFARouteAction.STAGED,
+                StagedSFARouteReason.ELIGIBLE,
+                StagedSFAGraphKey.exact_q1(1),
+                (0,),
+            ),
+            staged_sfa_graph_dummy_run=False,
+            attn_metadata={},
+        )
+
+        with patch.object(
+            sfa_v1,
+            "wait_for_kv_layer_from_connector",
+        ) as wait_for_layer:
+            impl.cross_layer_lmcache_retrieve(
+                "layer-0",
+                "",
+                torch.ones(1, 4, dtype=torch.int32),
+                torch.zeros(1, dtype=torch.int32),
+                torch.zeros(1, 4, dtype=torch.long),
+                metadata,
+                context,
+            )
+
+        self.assertEqual(
+            wait_for_layer.call_args.kwargs[
+                "require_complete_sparse_load"
+            ],
+            frozenset(),
         )
 
     def test_cross_layer_dummy_retrieve_only_prepares_next_boundary(self):

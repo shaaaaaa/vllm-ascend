@@ -760,27 +760,30 @@ class NPUModelRunner(GPUModelRunner):
             )
             eligible_rows = []
             eligible_request_ids = []
-            short_request_ids = []
+            inactive_request_ids = []
             signatures = []
             for row in range(num_reqs):
+                remap_frontier = (
+                    remap_frontiers[row]
+                    if remap_frontiers is not None
+                    else None
+                )
+                if remap_frontier == 0:
+                    # A zero boundary is the no-remap path even if the block
+                    # allocator has already materialized the full prefix.
+                    inactive_request_ids.append(request_ids[row])
+                    continue
                 if block_table.num_blocks_per_row[row] < scratch_blocks:
-                    if (
-                        remap_frontiers is not None
-                        and remap_frontiers[row] != 0
-                    ):
+                    if remap_frontier is not None:
                         raise RuntimeError(
                             "resident sparse cache received a nonzero remap "
                             "frontier without a complete scratch prefix for "
                             f"request row {row}: frontier="
-                            f"{remap_frontiers[row]}, needs {scratch_blocks} "
+                            f"{remap_frontier}, needs {scratch_blocks} "
                             "blocks, has "
                             f"{block_table.num_blocks_per_row[row]}"
                         )
-                    # A short request has a zero remap frontier, so its KV
-                    # remains resident and the scratch planner is a no-op.
-                    # Keep it on the cold/dummy state until the complete fixed
-                    # scratch prefix has been allocated.
-                    short_request_ids.append(request_ids[row])
+                    inactive_request_ids.append(request_ids[row])
                     continue
                 eligible_rows.append(row)
                 eligible_request_ids.append(request_ids[row])
@@ -794,11 +797,11 @@ class NPUModelRunner(GPUModelRunner):
                         )
                     )
                 )
-            if decode_only and short_request_ids:
+            if decode_only and inactive_request_ids:
                 # If a preempted/restarted request used to own a resident row,
-                # make a later partial-to-full transition cold even when the
-                # allocator happens to reuse the same physical block ids.
-                registry.invalidate(short_request_ids)  # type: ignore[arg-type]
+                # make a later zero-to-nonzero boundary transition cold even
+                # when the allocator reuses the same physical block ids.
+                registry.invalidate(inactive_request_ids)  # type: ignore[arg-type]
             if eligible_rows:
                 state_rows, state_generations = registry.bind(
                     eligible_request_ids,  # type: ignore[arg-type]

@@ -942,6 +942,7 @@ class AscendSFAMetadata:
     prompt_lens_cpu_rows: Any = None
     decode_remap_boundary: torch.Tensor | None = None
     decode_remap_boundary_ready: bool = False
+    decode_active_remap_request_ids: frozenset[str] = frozenset()
 
 
 M = TypeVar("M", bound=AscendSFAMetadata)
@@ -3397,6 +3398,15 @@ class AscendSFAImpl(MLAAttentionImpl):
             if request_ids is None:
                 raise RuntimeError("staged SFA request ids are unavailable")
             request_count = len(request_ids)
+            active_remap_request_ids = frozenset(
+                str(request_id)
+                for request_id, boundary in zip(
+                    request_ids,
+                    route.frontiers,
+                    strict=True,
+                )
+                if int(boundary) != 0
+            )
             wait_for_kv_layer_from_connector(
                 layer_name,
                 selected_tokens=selected_packed[:request_count],
@@ -3405,7 +3415,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                 target_slot_mapping=target_slots[:request_count],
                 selected_token_counts=selected_counts[:request_count],
                 payload_event=producer_event,
-                require_complete_sparse_load=bool(self.dsa_shrink_latent),
+                require_complete_sparse_load=active_remap_request_ids,
             )
             if _LMCACHE_SPARSE_WAIT_SYNC_ONCE and not _lmcache_sparse_wait_sync_once_done:
                 _sync_compute_stream_after_lmcache_sparse_wait()
@@ -3781,6 +3791,26 @@ class AscendSFAImpl(MLAAttentionImpl):
                 _lmcache_cached_tokens = _resolve_sparse_cached_tokens_by_request(
                     attn_metadata,
                     attn_metadata.req_ids,
+                )
+                request_ids_value = attn_metadata.req_ids
+                request_ids = (
+                    list(request_ids_value)
+                    if request_ids_value is not None
+                    else []
+                )
+                if len(request_ids) != len(_lmcache_cached_tokens):
+                    raise RuntimeError(
+                        "DSA remap request IDs differ from resolved boundaries: "
+                        f"{len(request_ids)} != {len(_lmcache_cached_tokens)}"
+                    )
+                attn_metadata.decode_active_remap_request_ids = frozenset(
+                    str(request_id)
+                    for request_id, boundary in zip(
+                        request_ids,
+                        _lmcache_cached_tokens,
+                        strict=True,
+                    )
+                    if int(boundary) != 0
                 )
                 if _lmcache_cached_tokens is not None or _decode_window_size > 0:
                     _split_boundary = _update_dsa_split_boundary_in_place(
@@ -4236,8 +4266,8 @@ class AscendSFAImpl(MLAAttentionImpl):
                         target_slot_mapping=_target_slot_mapping_for_wait,
                         request_ids=_request_ids_for_wait,
                         selected_token_counts=_selected_token_counts,
-                        require_complete_sparse_load=bool(
-                            self.dsa_shrink_latent
+                        require_complete_sparse_load=(
+                            attn_metadata.decode_active_remap_request_ids
                         ),
                     )
                 if _LMCACHE_SPARSE_WAIT_SYNC_ONCE and not _lmcache_sparse_wait_sync_once_done:

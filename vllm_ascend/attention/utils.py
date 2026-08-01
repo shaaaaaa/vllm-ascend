@@ -362,13 +362,29 @@ def staged_sfa_connector_supports_sparse_load() -> bool:
         return False
 
 
+def _dsa_remap_frontier(load_spec: Any) -> int:
+    """Derive the operator boundary without changing LMCache commit progress."""
+    if load_spec is None or not getattr(load_spec, "can_load", False):
+        return 0
+    committed_value = (
+        getattr(load_spec, "dsa_committed_end", None)
+        if getattr(load_spec, "dsa_committed_end", None) is not None
+        else getattr(load_spec, "lmcache_cached_tokens", 0)
+    )
+    committed_end = int(committed_value or 0)
+    scratch_capacity = getattr(load_spec, "dsa_scratch_capacity", None)
+    if scratch_capacity is not None and committed_end < int(scratch_capacity):
+        return 0
+    return committed_end
+
+
 def get_lmcache_sparse_cached_tokens(request_ids: Any) -> list[int]:
     """Return a proven remap frontier for every active request.
 
-    Sparse-decode metadata contributes its committed LMCache frontier. A
-    loadable dense-prefix request contributes zero because its first decoder
-    step intentionally waits for the full prefix to become resident before
-    attention, so compact-scratch remapping must remain disabled for it.
+    Sparse-decode metadata contributes a boundary derived from committed
+    LMCache progress and the fixed scratch capacity. A loadable dense-prefix
+    request contributes zero because its first decoder step intentionally
+    waits for the full prefix to become resident before attention.
     """
     if request_ids is None:
         raise RuntimeError("[SFA sparse remap] active request IDs are unavailable.")
@@ -412,16 +428,12 @@ def get_lmcache_sparse_cached_tokens(request_ids: Any) -> list[int]:
                 "[SFA sparse remap] connector remap metadata contains a "
                 f"duplicate request ID: {req_id!r}."
             )
-        if is_dense_prefix_load:
-            cached_by_req[req_id] = 0
-        elif load_spec is None or not getattr(load_spec, "can_load", False):
+        if is_dense_prefix_load or load_spec is None or not getattr(
+            load_spec, "can_load", False
+        ):
             cached_by_req[req_id] = 0
         else:
-            cached_by_req[req_id] = int(
-                getattr(load_spec, "dsa_committed_end", None)
-                if getattr(load_spec, "dsa_committed_end", None) is not None
-                else getattr(load_spec, "lmcache_cached_tokens", 0)
-            )
+            cached_by_req[req_id] = _dsa_remap_frontier(load_spec)
 
     missing = [req_id for req_id in normalized_request_ids if req_id not in cached_by_req]
     if missing:
@@ -454,17 +466,7 @@ def staged_sfa_metadata_sparse_load(
         if getattr(request, "is_sparse_decode", False):
             if req_id in sparse_frontiers:
                 return StagedSFARouteReason.DUPLICATE_SPARSE_LOAD, ()
-            sparse_frontiers[req_id] = int(
-                getattr(load_spec, "dsa_committed_end", None)
-                if getattr(load_spec, "dsa_committed_end", None)
-                is not None
-                else (
-                    getattr(load_spec, "lmcache_cached_tokens", 0)
-                    if getattr(load_spec, "can_load", False)
-                    else 0
-                )
-                or 0
-            )
+            sparse_frontiers[req_id] = _dsa_remap_frontier(load_spec)
             continue
         if getattr(load_spec, "can_load", False):
             dense_request_ids.add(req_id)
@@ -491,7 +493,7 @@ def wait_for_kv_layer_from_connector(
     target_slot_mapping=None,
     selected_token_counts=None,
     payload_event=None,
-    require_complete_sparse_load: bool = False,
+    require_complete_sparse_load: Any = False,
 ):
     if not has_kv_transfer_group() or not is_v1_kv_transfer_group():
         return
@@ -506,7 +508,9 @@ def wait_for_kv_layer_from_connector(
     if payload_event is not None:
         wait_kwargs["payload_event"] = payload_event
     if require_complete_sparse_load:
-        wait_kwargs["require_complete_sparse_load"] = True
+        wait_kwargs["require_complete_sparse_load"] = (
+            require_complete_sparse_load
+        )
 
     if selected_tokens is not None and request_ids is not None and not should_log:
         try:
