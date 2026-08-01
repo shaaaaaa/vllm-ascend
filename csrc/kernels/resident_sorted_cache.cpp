@@ -864,7 +864,6 @@ public:
         __gm__ int32_t* shardMissTokens,
         __gm__ int16_t* shardMissPositions,
         __gm__ int16_t* shardEvictableSlots,
-        __gm__ uint8_t* overwrittenSlots,
         __gm__ int32_t* missTokens,
         __gm__ int32_t* missCounts,
         __gm__ int64_t* targetSlots,
@@ -910,8 +909,6 @@ public:
             shardMissPositions, requestShardElements);
         shardEvictableSlots_.SetGlobalBuffer(
             shardEvictableSlots, requestShardElements);
-        overwrittenSlots_.SetGlobalBuffer(
-            overwrittenSlots, requestElements);
         missTokens_.SetGlobalBuffer(
             missTokens, requestElements);
         missCounts_.SetGlobalBuffer(
@@ -935,8 +932,6 @@ public:
             protectedBuf_, packedElements * sizeof(int16_t));
         pipe_.InitBuffer(
             freeSlotBuf_, packedElements * sizeof(int16_t));
-        pipe_.InitBuffer(
-            overwrittenBuf_, capacity_ * sizeof(uint8_t));
         pipe_.InitBuffer(
             packedTokenBuf_, packedElements * sizeof(int32_t));
         pipe_.InitBuffer(
@@ -968,7 +963,6 @@ public:
             static_cast<uint64_t>(request) * shardCount_ * capacity_;
         auto protectedSlots = protectedBuf_.Get<int16_t>();
         auto freeSlots = freeSlotBuf_.Get<int16_t>();
-        auto overwritten = overwrittenBuf_.Get<uint8_t>();
         auto packedTokens = packedTokenBuf_.Get<int32_t>();
         auto packedPriorSlots =
             packedPriorSlotBuf_.Get<int16_t>();
@@ -977,10 +971,6 @@ public:
         auto blockTable = blockTableBuf_.Get<int32_t>();
         AscendC::Duplicate(
             protectedSlots, static_cast<int16_t>(0), capacity_);
-        AscendC::Duplicate(
-            overwritten.ReinterpretCast<int16_t>(),
-            static_cast<int16_t>(0),
-            capacity_ / sizeof(int16_t));
         AscendC::PipeBarrier<PIPE_V>();
 
         const AscendC::DataCopyParams blockTableCopy{
@@ -1148,8 +1138,6 @@ public:
                             static_cast<int32_t>(slot);
                         lastMissToken = token;
                         lastTarget = target;
-                        overwritten.SetValue(
-                            logicalSlot, static_cast<uint8_t>(1));
                         ++missCount;
                     }
                     packedPriorSlots.SetValue(
@@ -1189,10 +1177,6 @@ public:
                 firstTarget, lastTarget);
             return;
         }
-        CopyLocalToGlobalExact(
-            overwrittenSlots_[requestOffset],
-            overwritten,
-            capacity_);
         if (debugStage_ == 8) {
             PublishDebug(
                 blockTable, request, packedEnd,
@@ -1255,18 +1239,12 @@ private:
             static_cast<uint64_t>(request) * shardCount_ * capacity_;
         auto missPositions = protectedBuf_.Get<int16_t>();
         auto evictableSlots = freeSlotBuf_.Get<int16_t>();
-        auto overwritten = overwrittenBuf_.Get<uint8_t>();
         auto inputMissTokens = packedTokenBuf_.Get<int32_t>();
         auto packedPriorSlots = packedPriorSlotBuf_.Get<int16_t>();
         auto outputMissTokens = missTokenBuf_.Get<int32_t>();
         auto targetSlots = targetSlotBuf_.Get<int64_t>();
         auto blockTable = blockTableBuf_.Get<int32_t>();
 
-        AscendC::Duplicate(
-            overwritten.ReinterpretCast<int16_t>(),
-            static_cast<int16_t>(0),
-            capacity_ / sizeof(int16_t));
-        AscendC::PipeBarrier<PIPE_V>();
         const AscendC::DataCopyParams blockTableCopy{
             1,
             static_cast<uint16_t>(
@@ -1448,15 +1426,12 @@ private:
                         static_cast<int64_t>(physicalBlock)
                                 * blockSize_
                             + blockOffset);
-                    overwritten.SetValue(
-                        logicalSlot, static_cast<uint8_t>(1));
                     ++globalMiss;
                 }
             }
         }
 
         Sync<AscendC::HardEvent::S_MTE3>();
-        Sync<AscendC::HardEvent::V_MTE3>();
         for (uint32_t shard = 0; shard < shardCount_; ++shard) {
             const uint32_t currentCount = currentCounts[shard];
             if (currentCount == 0) {
@@ -1470,8 +1445,6 @@ private:
                 packedPriorSlots[priorOffsets[shard]],
                 currentCount);
         }
-        CopyLocalToGlobalExact(
-            overwrittenSlots_[requestOffset], overwritten, capacity_);
         if (totalMissCount > 0) {
             CopyLocalToGlobalExact(
                 missTokens_[requestOffset],
@@ -1532,7 +1505,6 @@ private:
     AscendC::GlobalTensor<int32_t> shardMissTokens_;
     AscendC::GlobalTensor<int16_t> shardMissPositions_;
     AscendC::GlobalTensor<int16_t> shardEvictableSlots_;
-    AscendC::GlobalTensor<uint8_t> overwrittenSlots_;
     AscendC::GlobalTensor<int32_t> missTokens_;
     AscendC::GlobalTensor<int32_t> missCounts_;
     AscendC::GlobalTensor<int64_t> targetSlots_;
@@ -1541,7 +1513,6 @@ private:
     AscendC::TPipe pipe_;
     AscendC::TBuf<AscendC::TPosition::VECCALC> protectedBuf_;
     AscendC::TBuf<AscendC::TPosition::VECCALC> freeSlotBuf_;
-    AscendC::TBuf<AscendC::TPosition::VECCALC> overwrittenBuf_;
     AscendC::TBuf<AscendC::TPosition::VECCALC> packedTokenBuf_;
     AscendC::TBuf<AscendC::TPosition::VECCALC>
         packedPriorSlotBuf_;
@@ -1568,7 +1539,6 @@ public:
         __gm__ int16_t* shardMapping,
         __gm__ int32_t* shardCounts,
         __gm__ int16_t* priorSlots,
-        __gm__ uint8_t* overwrittenSlots,
         __gm__ int32_t* requestStateIndices,
         __gm__ int64_t* requestStateGenerations,
         __gm__ int32_t* stateTokens,
@@ -1618,9 +1588,6 @@ public:
                 * shardCountRequestStride_);
         priorSlots_.SetGlobalBuffer(
             priorSlots, requestShardElements);
-        overwrittenSlots_.SetGlobalBuffer(
-            overwrittenSlots,
-            static_cast<uint64_t>(requestCount_) * capacity_);
         requestStateIndices_.SetGlobalBuffer(
             requestStateIndices, requestCount_);
         requestStateGenerations_.SetGlobalBuffer(
@@ -1647,7 +1614,7 @@ public:
         pipe_.InitBuffer(
             priorSlotBuf_, capacity_ * sizeof(int16_t));
         pipe_.InitBuffer(
-            overwrittenBuf_, capacity_ * sizeof(uint8_t));
+            selectedMaskBuf_, capacity_ * sizeof(uint8_t));
         pipe_.InitBuffer(
             survivorTokenBuf_, capacity_ * sizeof(int32_t));
         pipe_.InitBuffer(
@@ -1982,7 +1949,7 @@ private:
         auto accumulatedSlots = survivorSlotBuf_.Get<int32_t>();
         auto clampedOffsets = mergedTokenBuf_.Get<int32_t>();
         auto gatheredFloat = mergedSlotBuf_.Get<float>();
-        auto selectedMask = overwrittenBuf_.Get<uint8_t>();
+        auto selectedMask = selectedMaskBuf_.Get<uint8_t>();
 
         // old/current/survivor buffers were consumed by the scalar pipeline,
         // while merged buffers are still MTE3 sources. Complete those
@@ -2137,7 +2104,6 @@ private:
     AscendC::GlobalTensor<int16_t> shardMapping_;
     AscendC::GlobalTensor<int32_t> shardCounts_;
     AscendC::GlobalTensor<int16_t> priorSlots_;
-    AscendC::GlobalTensor<uint8_t> overwrittenSlots_;
     AscendC::GlobalTensor<int32_t> requestStateIndices_;
     AscendC::GlobalTensor<int64_t> requestStateGenerations_;
     AscendC::GlobalTensor<int32_t> stateTokens_;
@@ -2149,7 +2115,7 @@ private:
     AscendC::TBuf<AscendC::TPosition::VECCALC> oldSlotBuf_;
     AscendC::TBuf<AscendC::TPosition::VECCALC> currentTokenBuf_;
     AscendC::TBuf<AscendC::TPosition::VECCALC> priorSlotBuf_;
-    AscendC::TBuf<AscendC::TPosition::VECCALC> overwrittenBuf_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> selectedMaskBuf_;
     AscendC::TBuf<AscendC::TPosition::VECCALC> survivorTokenBuf_;
     AscendC::TBuf<AscendC::TPosition::VECCALC> survivorSlotBuf_;
     AscendC::TBuf<AscendC::TPosition::VECCALC> mergedTokenBuf_;
@@ -2480,7 +2446,6 @@ dsa_resident_sorted_finalize_kernel(
     __gm__ int32_t* shardMissTokens,
     __gm__ int16_t* shardMissPositions,
     __gm__ int16_t* shardEvictableSlots,
-    __gm__ uint8_t* overwrittenSlots,
     __gm__ int32_t* missTokens,
     __gm__ int32_t* missCounts,
     __gm__ int64_t* targetSlots,
@@ -2500,7 +2465,6 @@ dsa_resident_sorted_finalize_kernel(
     op.Init(
         shardPacked, shardCounts, priorSlots,
         shardMissTokens, shardMissPositions, shardEvictableSlots,
-        overwrittenSlots,
         missTokens, missCounts, targetSlots,
         requestBlockTable, debugInfo,
         requestCount, shardCount, capacity,
@@ -2516,7 +2480,6 @@ dsa_resident_sorted_update_kernel(
     __gm__ int16_t* shardMapping,
     __gm__ int32_t* shardCounts,
     __gm__ int16_t* priorSlots,
-    __gm__ uint8_t* overwrittenSlots,
     __gm__ int32_t* requestStateIndices,
     __gm__ int64_t* requestStateGenerations,
     __gm__ int32_t* stateTokens,
@@ -2537,7 +2500,7 @@ dsa_resident_sorted_update_kernel(
     DSAResidentSortedUpdateKernel op;
     op.Init(
         topkIndices, shardPacked, shardMapping, shardCounts,
-        priorSlots, overwrittenSlots,
+        priorSlots,
         requestStateIndices, requestStateGenerations,
         stateTokens, stateSlots, stateCounts, stateGenerations,
         requestCount, stateRowCount,
@@ -2554,7 +2517,6 @@ dsa_resident_sorted_state_update_kernel(
     __gm__ int16_t* shardMapping,
     __gm__ int32_t* shardCounts,
     __gm__ int16_t* priorSlots,
-    __gm__ uint8_t* overwrittenSlots,
     __gm__ int32_t* requestStateIndices,
     __gm__ int64_t* requestStateGenerations,
     __gm__ int32_t* stateTokens,
@@ -2575,7 +2537,7 @@ dsa_resident_sorted_state_update_kernel(
     DSAResidentSortedUpdateKernel op;
     op.Init(
         topkIndices, shardPacked, shardMapping, shardCounts,
-        priorSlots, overwrittenSlots,
+        priorSlots,
         requestStateIndices, requestStateGenerations,
         stateTokens, stateSlots, stateCounts, stateGenerations,
         requestCount, stateRowCount,
@@ -2680,7 +2642,6 @@ void dsa_resident_sorted_plan_impl(
     void* shardMissTokens,
     void* shardMissPositions,
     void* shardEvictableSlots,
-    void* overwrittenSlots,
     void* missTokens,
     void* missCounts,
     void* targetSlots,
@@ -2706,7 +2667,6 @@ void dsa_resident_sorted_plan_impl(
         static_cast<int32_t*>(shardMissTokens),
         static_cast<int16_t*>(shardMissPositions),
         static_cast<int16_t*>(shardEvictableSlots),
-        static_cast<uint8_t*>(overwrittenSlots),
         static_cast<int32_t*>(missTokens),
         static_cast<int32_t*>(missCounts),
         static_cast<int64_t*>(targetSlots),
@@ -2722,7 +2682,6 @@ void dsa_resident_sorted_plan_impl(
         static_cast<int16_t*>(shardMapping),
         static_cast<int32_t*>(shardCounts),
         static_cast<int16_t*>(priorSlots),
-        static_cast<uint8_t*>(overwrittenSlots),
         static_cast<int32_t*>(requestStateIndices),
         static_cast<int64_t*>(requestStateGenerations),
         static_cast<int32_t*>(stateTokens),
@@ -2742,7 +2701,6 @@ void dsa_resident_sorted_update_debug_impl(
     void* shardMapping,
     void* shardCounts,
     void* priorSlots,
-    void* overwrittenSlots,
     void* requestStateIndices,
     void* requestStateGenerations,
     void* stateTokens,
@@ -2767,7 +2725,6 @@ void dsa_resident_sorted_update_debug_impl(
         static_cast<int16_t*>(shardMapping),
         static_cast<int32_t*>(shardCounts),
         static_cast<int16_t*>(priorSlots),
-        static_cast<uint8_t*>(overwrittenSlots),
         static_cast<int32_t*>(requestStateIndices),
         static_cast<int64_t*>(requestStateGenerations),
         static_cast<int32_t*>(stateTokens),
@@ -2797,7 +2754,6 @@ void dsa_resident_sorted_plan_no_remap_impl(
     void* shardMissTokens,
     void* shardMissPositions,
     void* shardEvictableSlots,
-    void* overwrittenSlots,
     void* missTokens,
     void* missCounts,
     void* targetSlots,
@@ -2823,7 +2779,6 @@ void dsa_resident_sorted_plan_no_remap_impl(
             static_cast<int32_t*>(shardMissTokens),
             static_cast<int16_t*>(shardMissPositions),
             static_cast<int16_t*>(shardEvictableSlots),
-            static_cast<uint8_t*>(overwrittenSlots),
             static_cast<int32_t*>(missTokens),
             static_cast<int32_t*>(missCounts),
             static_cast<int64_t*>(targetSlots),
@@ -2839,7 +2794,6 @@ void dsa_resident_sorted_plan_no_remap_impl(
             static_cast<int16_t*>(shardMapping),
             static_cast<int32_t*>(shardCounts),
             static_cast<int16_t*>(priorSlots),
-            static_cast<uint8_t*>(overwrittenSlots),
             static_cast<int32_t*>(requestStateIndices),
             static_cast<int64_t*>(requestStateGenerations),
             static_cast<int32_t*>(stateTokens),
@@ -2906,7 +2860,6 @@ void dsa_resident_sorted_finalize_debug_impl(
     void* shardMissTokens,
     void* shardMissPositions,
     void* shardEvictableSlots,
-    void* overwrittenSlots,
     void* missTokens,
     void* missCounts,
     void* targetSlots,
@@ -2932,7 +2885,6 @@ void dsa_resident_sorted_finalize_debug_impl(
         static_cast<int32_t*>(shardMissTokens),
         static_cast<int16_t*>(shardMissPositions),
         static_cast<int16_t*>(shardEvictableSlots),
-        static_cast<uint8_t*>(overwrittenSlots),
         static_cast<int32_t*>(missTokens),
         static_cast<int32_t*>(missCounts),
         static_cast<int64_t*>(targetSlots),

@@ -52,10 +52,8 @@ def test_sorted_resident_allocations_are_cacheline_partitioned(mtp, capacity, sh
     assert workspace.shard_evictable_slots.shape == workspace.shard_packed.shape
     assert workspace.shard_evictable_slots.dtype == torch.int16
     assert not hasattr(workspace, "assigned_slots")
+    assert not hasattr(workspace, "overwritten_slots")
     assert workspace.shard_counts.shape == (requests, shard_count, 16)
-    assert workspace.overwritten_slots.shape == (requests, capacity)
-    assert workspace.overwritten_slots.dtype == torch.uint8
-    assert workspace.overwritten_slots.numel() * workspace.overwritten_slots.element_size() == (requests * capacity)
     assert workspace.miss_counts.shape == (requests, 16)
     assert state.tokens.data_ptr() % 64 == 0
     assert state.slots.data_ptr() % 64 == 0
@@ -70,7 +68,6 @@ def test_sorted_resident_allocations_are_cacheline_partitioned(mtp, capacity, sh
     assert workspace.shard_miss_tokens.stride(1) * workspace.shard_miss_tokens.element_size() % 64 == 0
     assert workspace.shard_miss_positions.stride(1) * workspace.shard_miss_positions.element_size() % 64 == 0
     assert workspace.shard_evictable_slots.stride(1) * workspace.shard_evictable_slots.element_size() % 64 == 0
-    assert workspace.overwritten_slots.stride(0) * workspace.overwritten_slots.element_size() % 64 == 0
 
 
 def test_sorted_resident_uses_strict_next_power_of_two():

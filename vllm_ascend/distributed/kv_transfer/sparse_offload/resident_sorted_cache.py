@@ -50,7 +50,6 @@ class SortedResidentWorkspace:
     shard_miss_tokens: torch.Tensor
     shard_miss_positions: torch.Tensor
     shard_evictable_slots: torch.Tensor
-    overwritten_slots: torch.Tensor
     miss_tokens: torch.Tensor
     miss_counts: torch.Tensor
     target_slots: torch.Tensor
@@ -124,11 +123,6 @@ def allocate_sorted_resident_workspace(
         shard_miss_tokens=torch.empty(shard_shape, dtype=torch.int32, device=device),
         shard_miss_positions=torch.empty(shard_shape, dtype=torch.int16, device=device),
         shard_evictable_slots=torch.empty(shard_shape, dtype=torch.int16, device=device),
-        overwritten_slots=torch.empty(
-            (request_count, capacity),
-            dtype=torch.uint8,
-            device=device,
-        ),
         miss_tokens=torch.empty(
             (request_count, capacity),
             dtype=torch.int32,
@@ -165,7 +159,6 @@ def sorted_resident_workspace_prefix(
         shard_miss_tokens=workspace.shard_miss_tokens[:request_count],
         shard_miss_positions=workspace.shard_miss_positions[:request_count],
         shard_evictable_slots=workspace.shard_evictable_slots[:request_count],
-        overwritten_slots=workspace.overwritten_slots[:request_count],
         miss_tokens=workspace.miss_tokens[:request_count],
         miss_counts=workspace.miss_counts[:request_count],
         target_slots=workspace.target_slots[:request_count],
@@ -240,7 +233,6 @@ def _run_sorted_resident_plan_(
         workspace.shard_miss_tokens,
         workspace.shard_miss_positions,
         workspace.shard_evictable_slots,
-        workspace.overwritten_slots,
         workspace.miss_tokens,
         workspace.miss_counts,
         workspace.target_slots,
@@ -408,7 +400,6 @@ def debug_sorted_resident_finalize_only_(
         workspace.shard_miss_tokens,
         workspace.shard_miss_positions,
         workspace.shard_evictable_slots,
-        workspace.overwritten_slots,
         workspace.miss_tokens,
         workspace.miss_counts,
         workspace.target_slots,
@@ -439,7 +430,6 @@ def debug_sorted_resident_update_only_(
         workspace.shard_mapping,
         workspace.shard_counts,
         workspace.prior_slots,
-        workspace.overwritten_slots,
         request_state_indices,
         request_state_generations,
         state.tokens,

@@ -238,7 +238,6 @@ at::Tensor npu_dsa_resident_sorted_plan_meta(
     const at::Tensor &shard_miss_tokens,
     const at::Tensor &shard_miss_positions,
     const at::Tensor &shard_evictable_slots,
-    at::Tensor &overwritten_slots,
     at::Tensor &miss_tokens,
     at::Tensor &miss_counts,
     at::Tensor &target_slots,
@@ -260,7 +259,6 @@ at::Tensor npu_dsa_resident_sorted_plan_meta(
     (void)shard_miss_tokens;
     (void)shard_miss_positions;
     (void)shard_evictable_slots;
-    (void)overwritten_slots;
     (void)miss_tokens;
     (void)target_slots;
     (void)block_size;
@@ -286,7 +284,6 @@ at::Tensor npu_dsa_resident_sorted_update_debug_meta(
     const at::Tensor &shard_mapping,
     const at::Tensor &shard_counts,
     const at::Tensor &prior_slots,
-    const at::Tensor &overwritten_slots,
     const at::Tensor &request_state_indices,
     const at::Tensor &request_state_generations,
     at::Tensor &state_tokens,
@@ -299,7 +296,6 @@ at::Tensor npu_dsa_resident_sorted_update_debug_meta(
     (void)shard_mapping;
     (void)shard_counts;
     (void)prior_slots;
-    (void)overwritten_slots;
     (void)request_state_indices;
     (void)request_state_generations;
     (void)state_tokens;
@@ -329,7 +325,6 @@ at::Tensor npu_dsa_resident_sorted_finalize_debug_meta(
     const at::Tensor &shard_miss_tokens,
     const at::Tensor &shard_miss_positions,
     const at::Tensor &shard_evictable_slots,
-    at::Tensor &overwritten_slots,
     at::Tensor &miss_tokens,
     at::Tensor &miss_counts,
     at::Tensor &target_slots,
@@ -344,7 +339,6 @@ at::Tensor npu_dsa_resident_sorted_finalize_debug_meta(
     (void)shard_miss_tokens;
     (void)shard_miss_positions;
     (void)shard_evictable_slots;
-    (void)overwritten_slots;
     (void)miss_tokens;
     (void)target_slots;
     (void)request_block_table;

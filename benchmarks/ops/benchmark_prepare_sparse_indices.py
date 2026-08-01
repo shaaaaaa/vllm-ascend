@@ -1105,7 +1105,6 @@ def main(
         )
 
         resident_finalize_debug = torch.empty((request_batch, 16), dtype=torch.int32, device="npu")
-
         def resident_finalize_only():
             debug_sorted_resident_finalize_only_(
                 block_table,
@@ -1128,10 +1127,7 @@ def main(
                 "resident finalize selected an incorrect evict prefix: "
                 f"actual={selected_evicts}, expected={resident_selected_evicts}"
             )
-        resident_finalized_seed = (
-            resident_union_workspace.prior_slots.clone(),
-            resident_union_workspace.overwritten_slots.clone(),
-        )
+        resident_finalized_seed = resident_union_workspace.prior_slots.clone()
 
         def resident_update_only():
             debug_sorted_resident_update_only_(
@@ -1171,8 +1167,7 @@ def main(
         def reset_resident_update():
             resident_union_values.copy_(source)
             restore_resident_state()
-            resident_union_workspace.prior_slots.copy_(resident_finalized_seed[0])
-            resident_union_workspace.overwritten_slots.copy_(resident_finalized_seed[1])
+            resident_union_workspace.prior_slots.copy_(resident_finalized_seed)
 
         def reset_resident_plan():
             resident_union_values.copy_(source)

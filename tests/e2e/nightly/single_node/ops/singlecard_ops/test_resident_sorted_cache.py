@@ -218,7 +218,6 @@ def _print_empty_state_finalize_debug(
     workspace,
 ) -> None:
     prior_after = workspace.prior_slots[0].cpu()
-    overwritten = workspace.overwritten_slots[0].cpu()
     miss_count = int(workspace.miss_counts[0, 0].cpu())
     active_after = torch.cat(
         [
@@ -232,12 +231,8 @@ def _print_empty_state_finalize_debug(
     invalid_after = active_after >= capacity
     still_negative = active_after < 0
     unique_valid = torch.unique(active_after[valid_after]).numel()
-    treated_as_hit = torch.zeros_like(valid_after)
-    treated_as_hit[valid_after] = (
-        overwritten[active_after[valid_after].to(torch.int64)] == 0
-    )
     sample_indices = torch.nonzero(
-        treated_as_hit | invalid_after | still_negative,
+        invalid_after | still_negative,
         as_tuple=False,
     ).flatten()[:32]
     sample = [(int(index), int(active_after[index])) for index in sample_indices]
@@ -252,8 +247,6 @@ def _print_empty_state_finalize_debug(
         f" post_invalid={int(invalid_after.sum())}"
         f" post_negative={int(still_negative.sum())}"
         f" post_unique_valid={unique_valid}"
-        f" overwritten={int(overwritten.sum())}"
-        f" treated_as_hit={int(treated_as_hit.sum())}"
         f" suspicious_sample={sample}"
     )
 
@@ -367,7 +360,6 @@ def test_sorted_resident_zero_boundary_full_path_is_noop(mtp):
 
     assert torch.all(workspace.shard_counts[:, :, 0].cpu() == 0)
     assert int(workspace.miss_counts[0, 0].cpu()) == 0
-    assert torch.all(workspace.overwritten_slots[0].cpu() == 0)
     assert torch.all(state.counts[0, :, 0].cpu() == 0)
     assert torch.equal(values.cpu(), source)
 
@@ -415,7 +407,6 @@ def test_sorted_resident_zero_boundary_finalize_only(mtp):
     torch.npu.synchronize()
 
     assert int(workspace.miss_counts[0, 0].cpu()) == 0
-    assert torch.all(workspace.overwritten_slots[0].cpu() == 0)
 
 
 @pytest.mark.parametrize("mtp", [1, 2])
@@ -705,7 +696,6 @@ def test_finalize_kernel_internal_stage_at_full_capacity(
         dtype=torch.int32,
         device="npu",
     )
-
     prepare_resident_sharded_union_(
         values,
         boundaries,
@@ -771,8 +761,6 @@ def test_finalize_kernel_internal_stage_at_full_capacity(
         assert workspace.prior_slots[0, 0, :capacity].cpu().tolist() == list(
             range(capacity)
         )
-    if debug_stage >= 8:
-        assert torch.all(workspace.overwritten_slots[0].cpu() == 1)
     if debug_stage >= 9:
         assert torch.equal(
             workspace.miss_tokens[0, :capacity].cpu(),
@@ -814,7 +802,6 @@ def test_finalize_kernel_boundary_at_full_shard_capacity(mtp):
     block_table = torch.arange(
         capacity // 128, dtype=torch.int32, device="npu"
     ).reshape(1, -1)
-
     prepare_resident_sharded_union_(
         values,
         boundaries,
@@ -837,7 +824,6 @@ def test_finalize_kernel_boundary_at_full_shard_capacity(mtp):
 
     miss_count = int(workspace.miss_counts[0, 0].cpu())
     prior = workspace.prior_slots[0, 0, :capacity].cpu()
-    overwritten = workspace.overwritten_slots[0].cpu()
     misses = workspace.miss_tokens[0, :miss_count].cpu()
     targets = workspace.target_slots[0, :miss_count].cpu()
     packed = workspace.shard_packed[0, 0, :capacity].cpu()
@@ -847,7 +833,6 @@ def test_finalize_kernel_boundary_at_full_shard_capacity(mtp):
         f" miss_count={miss_count}"
         f" prior_negative={int((prior < 0).sum())}"
         f" prior_unique={torch.unique(prior).numel()}"
-        f" overwritten={int(overwritten.sum())}"
         f" miss_first={int(misses[0]) if miss_count else -1}"
         f" miss_last={int(misses[-1]) if miss_count else -1}"
         f" target_first={int(targets[0]) if miss_count else -1}"
@@ -855,7 +840,6 @@ def test_finalize_kernel_boundary_at_full_shard_capacity(mtp):
     )
     assert miss_count == capacity
     assert prior.tolist() == list(range(capacity))
-    assert torch.all(overwritten == 1)
     assert torch.equal(misses, packed)
     assert targets.tolist() == list(range(capacity))
     # The isolated boundary op must not launch update/remap.
@@ -942,8 +926,6 @@ def test_int16_mapping_and_uint8_overwrite_at_full_shard_capacity(mtp):
         workspace=workspace,
     )
     assert int(workspace.miss_counts[0, 0].cpu()) == capacity
-    assert workspace.overwritten_slots.dtype == torch.uint8
-    assert torch.all(workspace.overwritten_slots[0].cpu() == 1)
     assert values.reshape(-1).cpu().tolist() == list(range(capacity))
     assert int(state.counts[0, 0, 0].cpu()) == capacity
 
@@ -1082,10 +1064,6 @@ def test_sorted_resident_matches_three_step_reference(mtp):
         miss_count = int(workspace.miss_counts[0, 0].cpu())
         assert workspace.miss_tokens[0, :miss_count].cpu().tolist() == expected_misses
         assert workspace.target_slots[0, :miss_count].cpu().tolist() == expected_slots
-        overwritten = workspace.overwritten_slots[0].cpu()
-        assert overwritten.dtype == torch.uint8
-        assert int(overwritten.max()) <= 1
-        assert int(overwritten.sum()) == miss_count
         assert _state_dict(state, 0, shard_count) == reference
         remapped = values.reshape(-1).cpu().tolist()
         original = source.reshape(-1).tolist()
@@ -1341,10 +1319,6 @@ def test_fused_sorted_resident_matches_three_step_reference(mtp):
         miss_count = int(workspace.miss_counts[0, 0].cpu())
         assert workspace.miss_tokens[0, :miss_count].cpu().tolist() == expected_misses
         assert workspace.target_slots[0, :miss_count].cpu().tolist() == expected_slots
-        overwritten = workspace.overwritten_slots[0].cpu()
-        assert overwritten.dtype == torch.uint8
-        assert int(overwritten.max()) <= 1
-        assert int(overwritten.sum()) == miss_count
         assert _state_dict(state, 0, shard_count) == reference
 
         remapped = values.reshape(-1).cpu().tolist()
@@ -1473,7 +1447,6 @@ def test_sorted_resident_all_hit_emits_zero_misses(mtp):
             assert miss_count > 0
         else:
             assert miss_count == 0
-            assert torch.all(workspace.overwritten_slots[0].cpu() == 0)
 
     resident = _state_dict(state, 0, shard_count)
     assert values.reshape(-1).cpu().tolist() == [
@@ -1557,7 +1530,6 @@ def test_sorted_resident_keeps_multiple_request_states_isolated(mtp):
             == expected_targets
         )
         assert _state_dict(state, request, shard_count) == reference
-        assert int(workspace.overwritten_slots[request].sum().cpu()) == miss_count
 
     values.copy_(source.npu())
     prepare_resident_sharded_union_(
@@ -1581,7 +1553,6 @@ def test_sorted_resident_keeps_multiple_request_states_isolated(mtp):
     )
     torch.npu.synchronize()
     assert torch.all(workspace.miss_counts[:, 0].cpu() == 0)
-    assert torch.all(workspace.overwritten_slots.cpu() == 0)
     for request in range(requests):
         assert _state_dict(state, request, shard_count) == references[request]
 
@@ -1695,17 +1666,14 @@ def test_sorted_resident_full_path_supports_graph_replay(mtp):
     torch.npu.synchronize()
     expected_count = 1948 if mtp == 1 else 2972
     assert int(workspace.miss_counts[0, 0].cpu()) == expected_count
-    assert int(workspace.overwritten_slots[0].sum().cpu()) == expected_count
 
     values.copy_(source.npu())
     graph.replay()
     torch.npu.synchronize()
     assert int(workspace.miss_counts[0, 0].cpu()) == 0
-    assert int(workspace.overwritten_slots[0].sum().cpu()) == 0
 
     values.copy_(source.npu())
     request_generations.fill_(2)
     graph.replay()
     torch.npu.synchronize()
     assert int(workspace.miss_counts[0, 0].cpu()) == expected_count
-    assert int(workspace.overwritten_slots[0].sum().cpu()) == expected_count

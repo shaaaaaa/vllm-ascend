@@ -1633,7 +1633,6 @@ static at::Tensor resident_sorted_plan_common_(
     const at::Tensor &shard_miss_tokens,
     const at::Tensor &shard_miss_positions,
     const at::Tensor &shard_evictable_slots,
-    at::Tensor &overwritten_slots,
     at::Tensor &miss_tokens,
     at::Tensor &miss_counts,
     at::Tensor &target_slots,
@@ -1658,7 +1657,6 @@ static at::Tensor resident_sorted_plan_common_(
             shard_miss_tokens.device() == device &&
             shard_miss_positions.device() == device &&
             shard_evictable_slots.device() == device &&
-            overwritten_slots.device() == device &&
             miss_tokens.device() == device &&
             miss_counts.device() == device &&
             target_slots.device() == device,
@@ -1679,7 +1677,6 @@ static at::Tensor resident_sorted_plan_common_(
             shard_miss_tokens.scalar_type() == at::kInt &&
             shard_miss_positions.scalar_type() == at::kShort &&
             shard_evictable_slots.scalar_type() == at::kShort &&
-            overwritten_slots.scalar_type() == at::kByte &&
             miss_tokens.scalar_type() == at::kInt &&
             miss_counts.scalar_type() == at::kInt &&
             target_slots.scalar_type() == at::kLong,
@@ -1700,7 +1697,6 @@ static at::Tensor resident_sorted_plan_common_(
             shard_miss_tokens.is_contiguous() &&
             shard_miss_positions.is_contiguous() &&
             shard_evictable_slots.is_contiguous() &&
-            overwritten_slots.is_contiguous() &&
             miss_tokens.is_contiguous() &&
             miss_counts.is_contiguous() &&
             target_slots.is_contiguous(),
@@ -1723,7 +1719,6 @@ static at::Tensor resident_sorted_plan_common_(
             shard_miss_tokens.dim() == 3 &&
             shard_miss_positions.dim() == 3 &&
             shard_evictable_slots.dim() == 3 &&
-            overwritten_slots.dim() == 2 &&
             miss_tokens.dim() == 2 &&
             miss_counts.dim() == 2 &&
             target_slots.dim() == 2,
@@ -1783,8 +1778,6 @@ static at::Tensor resident_sorted_plan_common_(
             shard_miss_tokens.sizes() == shard_packed.sizes() &&
             shard_miss_positions.sizes() == shard_packed.sizes() &&
             shard_evictable_slots.sizes() == shard_packed.sizes() &&
-            overwritten_slots.size(0) == request_count &&
-            overwritten_slots.size(1) == capacity &&
             miss_tokens.size(0) == request_count &&
             miss_tokens.size(1) == capacity &&
             miss_counts.size(0) == request_count &&
@@ -1812,8 +1805,6 @@ static at::Tensor resident_sorted_plan_common_(
             reinterpret_cast<std::uintptr_t>(
                 shard_evictable_slots.data_ptr()) % 64 == 0 &&
             reinterpret_cast<std::uintptr_t>(
-                overwritten_slots.data_ptr()) % 64 == 0 &&
-            reinterpret_cast<std::uintptr_t>(
                 miss_counts.data_ptr()) % 64 == 0,
         "sorted-resident cacheline-owned buffers must be 64-byte aligned");
 
@@ -1835,7 +1826,6 @@ static at::Tensor resident_sorted_plan_common_(
     void* shard_miss_token_ptr = shard_miss_tokens.data_ptr();
     void* shard_miss_position_ptr = shard_miss_positions.data_ptr();
     void* shard_evictable_slot_ptr = shard_evictable_slots.data_ptr();
-    void* overwritten_ptr = overwritten_slots.data_ptr();
     void* miss_token_ptr = miss_tokens.data_ptr();
     void* miss_count_ptr = miss_counts.data_ptr();
     void* target_ptr = target_slots.data_ptr();
@@ -1851,7 +1841,6 @@ static at::Tensor resident_sorted_plan_common_(
         state_count_ptr, state_generation_ptr,
         prior_slot_ptr, shard_miss_token_ptr,
         shard_miss_position_ptr, shard_evictable_slot_ptr,
-        overwritten_ptr,
         miss_token_ptr, miss_count_ptr, target_ptr,
         request_count, state_row_count, dummy_state_base,
         rows_per_request, row_width, shard_count, capacity,
@@ -1868,7 +1857,6 @@ static at::Tensor resident_sorted_plan_common_(
             state_count_ptr, state_generation_ptr,
             prior_slot_ptr, shard_miss_token_ptr,
             shard_miss_position_ptr, shard_evictable_slot_ptr,
-            overwritten_ptr,
             miss_token_ptr, miss_count_ptr,
             target_ptr,
             static_cast<uint32_t>(request_count),
@@ -1906,7 +1894,6 @@ at::Tensor npu_dsa_resident_sorted_plan_(
     const at::Tensor &shard_miss_tokens,
     const at::Tensor &shard_miss_positions,
     const at::Tensor &shard_evictable_slots,
-    at::Tensor &overwritten_slots,
     at::Tensor &miss_tokens,
     at::Tensor &miss_counts,
     at::Tensor &target_slots,
@@ -1919,7 +1906,7 @@ at::Tensor npu_dsa_resident_sorted_plan_(
         request_state_generations, state_tokens, state_slots,
         state_counts, state_generations, prior_slots,
         shard_miss_tokens, shard_miss_positions, shard_evictable_slots,
-        overwritten_slots, miss_tokens, miss_counts, target_slots,
+        miss_tokens, miss_counts, target_slots,
         block_size, dummy_state_base, true);
 }
 
@@ -1939,7 +1926,6 @@ at::Tensor npu_dsa_resident_sorted_plan_no_remap_(
     const at::Tensor &shard_miss_tokens,
     const at::Tensor &shard_miss_positions,
     const at::Tensor &shard_evictable_slots,
-    at::Tensor &overwritten_slots,
     at::Tensor &miss_tokens,
     at::Tensor &miss_counts,
     at::Tensor &target_slots,
@@ -1952,7 +1938,7 @@ at::Tensor npu_dsa_resident_sorted_plan_no_remap_(
         request_state_generations, state_tokens, state_slots,
         state_counts, state_generations, prior_slots,
         shard_miss_tokens, shard_miss_positions, shard_evictable_slots,
-        overwritten_slots, miss_tokens, miss_counts, target_slots,
+        miss_tokens, miss_counts, target_slots,
         block_size, dummy_state_base, false);
 }
 
@@ -1962,7 +1948,6 @@ at::Tensor npu_dsa_resident_sorted_update_debug_(
     const at::Tensor &shard_mapping,
     const at::Tensor &shard_counts,
     const at::Tensor &prior_slots,
-    const at::Tensor &overwritten_slots,
     const at::Tensor &request_state_indices,
     const at::Tensor &request_state_generations,
     at::Tensor &state_tokens,
@@ -1978,7 +1963,6 @@ at::Tensor npu_dsa_resident_sorted_update_debug_(
             shard_mapping.device() == device &&
             shard_counts.device() == device &&
             prior_slots.device() == device &&
-            overwritten_slots.device() == device &&
             request_state_indices.device() == device &&
             request_state_generations.device() == device &&
             state_tokens.device() == device &&
@@ -1992,7 +1976,6 @@ at::Tensor npu_dsa_resident_sorted_update_debug_(
             shard_mapping.scalar_type() == at::kShort &&
             shard_counts.scalar_type() == at::kInt &&
             prior_slots.scalar_type() == at::kShort &&
-            overwritten_slots.scalar_type() == at::kByte &&
             request_state_indices.scalar_type() == at::kInt &&
             request_state_generations.scalar_type() == at::kLong &&
             state_tokens.scalar_type() == at::kInt &&
@@ -2003,7 +1986,7 @@ at::Tensor npu_dsa_resident_sorted_update_debug_(
     TORCH_CHECK(
         topk_indices.is_contiguous() && shard_packed.is_contiguous() &&
             shard_mapping.is_contiguous() && shard_counts.is_contiguous() &&
-            prior_slots.is_contiguous() && overwritten_slots.is_contiguous() &&
+            prior_slots.is_contiguous() &&
             request_state_indices.is_contiguous() &&
             request_state_generations.is_contiguous() &&
             state_tokens.is_contiguous() && state_slots.is_contiguous() &&
@@ -2014,7 +1997,6 @@ at::Tensor npu_dsa_resident_sorted_update_debug_(
          (topk_indices.dim() == 3 && topk_indices.size(1) == 1)) &&
             shard_packed.dim() == 3 && shard_mapping.dim() == 3 &&
             shard_counts.dim() == 3 && prior_slots.dim() == 3 &&
-            overwritten_slots.dim() == 2 &&
             request_state_indices.dim() == 1 &&
             request_state_generations.dim() == 1 &&
             state_tokens.dim() == 3 && state_slots.dim() == 3 &&
@@ -2063,8 +2045,6 @@ at::Tensor npu_dsa_resident_sorted_update_debug_(
             shard_counts.size(0) == request_count &&
             shard_counts.size(1) == shard_count &&
             prior_slots.sizes() == shard_packed.sizes() &&
-            overwritten_slots.size(0) == request_count &&
-            overwritten_slots.size(1) == capacity &&
             request_state_indices.numel() >= request_count &&
             request_state_generations.numel() >= request_count,
         "resident update-debug tensor shapes are invalid");
@@ -2076,7 +2056,6 @@ at::Tensor npu_dsa_resident_sorted_update_debug_(
     void* mapping_ptr = shard_mapping.data_ptr();
     void* count_ptr = shard_counts.data_ptr();
     void* prior_ptr = prior_slots.data_ptr();
-    void* overwritten_ptr = overwritten_slots.data_ptr();
     void* request_state_ptr = request_state_indices.data_ptr();
     void* request_generation_ptr = request_state_generations.data_ptr();
     void* state_token_ptr = state_tokens.data_ptr();
@@ -2087,7 +2066,7 @@ at::Tensor npu_dsa_resident_sorted_update_debug_(
     cmd.Name("npu_dsa_resident_sorted_update_debug_");
     cmd.SetCustomHandler([
         stream, topk_ptr, packed_ptr, mapping_ptr, count_ptr,
-        prior_ptr, overwritten_ptr, request_state_ptr,
+        prior_ptr, request_state_ptr,
         request_generation_ptr, state_token_ptr, state_slot_ptr,
         state_count_ptr, state_generation_ptr, request_count,
         state_row_count, dummy_state_base, rows_per_request,
@@ -2095,7 +2074,7 @@ at::Tensor npu_dsa_resident_sorted_update_debug_(
         shard_count_request_stride, generation_stride]() -> int {
         dsa_resident_sorted_update_debug_impl(
             stream, topk_ptr, packed_ptr, mapping_ptr, count_ptr,
-            prior_ptr, overwritten_ptr, request_state_ptr,
+            prior_ptr, request_state_ptr,
             request_generation_ptr, state_token_ptr, state_slot_ptr,
             state_count_ptr, state_generation_ptr,
             static_cast<uint32_t>(request_count),
@@ -2301,7 +2280,6 @@ at::Tensor npu_dsa_resident_sorted_finalize_debug_(
     const at::Tensor &shard_miss_tokens,
     const at::Tensor &shard_miss_positions,
     const at::Tensor &shard_evictable_slots,
-    at::Tensor &overwritten_slots,
     at::Tensor &miss_tokens,
     at::Tensor &miss_counts,
     at::Tensor &target_slots,
@@ -2318,7 +2296,6 @@ at::Tensor npu_dsa_resident_sorted_finalize_debug_(
             shard_miss_tokens.device() == device &&
             shard_miss_positions.device() == device &&
             shard_evictable_slots.device() == device &&
-            overwritten_slots.device() == device &&
             miss_tokens.device() == device &&
             miss_counts.device() == device &&
             target_slots.device() == device &&
@@ -2332,7 +2309,6 @@ at::Tensor npu_dsa_resident_sorted_finalize_debug_(
             shard_miss_tokens.scalar_type() == at::kInt &&
             shard_miss_positions.scalar_type() == at::kShort &&
             shard_evictable_slots.scalar_type() == at::kShort &&
-            overwritten_slots.scalar_type() == at::kByte &&
             miss_tokens.scalar_type() == at::kInt &&
             miss_counts.scalar_type() == at::kInt &&
             target_slots.scalar_type() == at::kLong &&
@@ -2346,7 +2322,6 @@ at::Tensor npu_dsa_resident_sorted_finalize_debug_(
             shard_miss_tokens.is_contiguous() &&
             shard_miss_positions.is_contiguous() &&
             shard_evictable_slots.is_contiguous() &&
-            overwritten_slots.is_contiguous() &&
             miss_tokens.is_contiguous() &&
             miss_counts.is_contiguous() &&
             target_slots.is_contiguous() &&
@@ -2360,7 +2335,6 @@ at::Tensor npu_dsa_resident_sorted_finalize_debug_(
             shard_miss_tokens.dim() == 3 &&
             shard_miss_positions.dim() == 3 &&
             shard_evictable_slots.dim() == 3 &&
-            overwritten_slots.dim() == 2 &&
             miss_tokens.dim() == 2 &&
             miss_counts.dim() == 2 &&
             target_slots.dim() == 2 &&
@@ -2387,10 +2361,9 @@ at::Tensor npu_dsa_resident_sorted_finalize_debug_(
             shard_counts.size(0) == request_count &&
             shard_counts.size(1) == shard_count &&
             shard_count_stride >= 16 &&
-            overwritten_slots.size(0) == request_count &&
-            overwritten_slots.size(1) == capacity &&
-            miss_tokens.sizes() == overwritten_slots.sizes() &&
-            target_slots.sizes() == overwritten_slots.sizes() &&
+            miss_tokens.size(0) == request_count &&
+            miss_tokens.size(1) == capacity &&
+            target_slots.sizes() == miss_tokens.sizes() &&
             miss_counts.size(0) == request_count &&
             miss_count_stride >= 16 &&
             request_block_table.size(0) >= request_count &&
@@ -2409,7 +2382,6 @@ at::Tensor npu_dsa_resident_sorted_finalize_debug_(
     void* shard_miss_token_ptr = shard_miss_tokens.data_ptr();
     void* shard_miss_position_ptr = shard_miss_positions.data_ptr();
     void* shard_evictable_slot_ptr = shard_evictable_slots.data_ptr();
-    void* overwritten_ptr = overwritten_slots.data_ptr();
     void* miss_token_ptr = miss_tokens.data_ptr();
     void* miss_count_ptr = miss_counts.data_ptr();
     void* target_ptr = target_slots.data_ptr();
@@ -2421,7 +2393,7 @@ at::Tensor npu_dsa_resident_sorted_finalize_debug_(
         stream, packed_ptr, count_ptr, prior_ptr,
         shard_miss_token_ptr, shard_miss_position_ptr,
         shard_evictable_slot_ptr,
-        overwritten_ptr, miss_token_ptr, miss_count_ptr,
+        miss_token_ptr, miss_count_ptr,
         target_ptr, block_table_ptr, debug_ptr,
         request_count, shard_count, capacity,
         shard_count_stride, shard_count_request_stride,
@@ -2431,7 +2403,7 @@ at::Tensor npu_dsa_resident_sorted_finalize_debug_(
             stream, packed_ptr, count_ptr, prior_ptr,
             shard_miss_token_ptr, shard_miss_position_ptr,
             shard_evictable_slot_ptr,
-            overwritten_ptr, miss_token_ptr, miss_count_ptr,
+            miss_token_ptr, miss_count_ptr,
             target_ptr, block_table_ptr, debug_ptr,
             static_cast<uint32_t>(request_count),
             static_cast<uint32_t>(shard_count),
@@ -3654,10 +3626,9 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "Tensor(d!) state_counts, Tensor(e!) state_generations, "
         "Tensor(f!) prior_slots, Tensor shard_miss_tokens, "
         "Tensor shard_miss_positions, Tensor shard_evictable_slots, "
-        "Tensor(g!) overwritten_slots, "
-        "Tensor(h!) miss_tokens, Tensor(i!) miss_counts, "
-        "Tensor(j!) target_slots, int block_size, "
-        "int dummy_state_base) -> Tensor(i!)");
+        "Tensor(g!) miss_tokens, Tensor(h!) miss_counts, "
+        "Tensor(i!) target_slots, int block_size, "
+        "int dummy_state_base) -> Tensor(h!)");
     ops.impl(
         "npu_dsa_resident_sorted_plan_",
         torch::kPrivateUse1,
@@ -3673,10 +3644,9 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "Tensor(d!) state_counts, Tensor(e!) state_generations, "
         "Tensor(f!) prior_slots, Tensor shard_miss_tokens, "
         "Tensor shard_miss_positions, Tensor shard_evictable_slots, "
-        "Tensor(g!) overwritten_slots, "
-        "Tensor(h!) miss_tokens, Tensor(i!) miss_counts, "
-        "Tensor(j!) target_slots, int block_size, "
-        "int dummy_state_base) -> Tensor(i!)");
+        "Tensor(g!) miss_tokens, Tensor(h!) miss_counts, "
+        "Tensor(i!) target_slots, int block_size, "
+        "int dummy_state_base) -> Tensor(h!)");
     ops.impl(
         "npu_dsa_resident_sorted_plan_no_remap_",
         torch::kPrivateUse1,
@@ -3685,7 +3655,7 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "npu_dsa_resident_sorted_update_debug_("
         "Tensor(a!) topk_indices, Tensor shard_packed, "
         "Tensor shard_mapping, Tensor shard_counts, "
-        "Tensor prior_slots, Tensor overwritten_slots, "
+        "Tensor prior_slots, "
         "Tensor request_state_indices, "
         "Tensor request_state_generations, "
         "Tensor(b!) state_tokens, Tensor(c!) state_slots, "
@@ -3717,11 +3687,10 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "Tensor shard_packed, Tensor shard_counts, "
         "Tensor(a!) prior_slots, Tensor shard_miss_tokens, "
         "Tensor shard_miss_positions, Tensor shard_evictable_slots, "
-        "Tensor(b!) overwritten_slots, "
-        "Tensor(c!) miss_tokens, Tensor(d!) miss_counts, "
-        "Tensor(e!) target_slots, Tensor request_block_table, "
-        "Tensor(f!) debug_info, int block_size, "
-        "int debug_stage) -> Tensor(d!)");
+        "Tensor(b!) miss_tokens, Tensor(c!) miss_counts, "
+        "Tensor(d!) target_slots, Tensor request_block_table, "
+        "Tensor(e!) debug_info, int block_size, "
+        "int debug_stage) -> Tensor(c!)");
     ops.impl(
         "npu_dsa_resident_sorted_finalize_debug_",
         torch::kPrivateUse1,
