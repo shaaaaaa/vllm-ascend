@@ -274,14 +274,10 @@ def prepare_sorted_resident_cache_no_remap_(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Assign misses and update resident state without remapping top-k."""
     try:
-        plan_op = (
-            torch.ops._C_ascend
-            .npu_dsa_resident_sorted_plan_no_remap_
-        )
+        plan_op = torch.ops._C_ascend.npu_dsa_resident_sorted_plan_no_remap_
     except AttributeError as error:
         raise RuntimeError(
-            "vllm_ascend_C does not expose the no-remap sorted resident "
-            "planner; rebuild the extension"
+            "vllm_ascend_C does not expose the no-remap sorted resident planner; rebuild the extension"
         ) from error
     _run_sorted_resident_plan_(
         plan_op,
@@ -309,8 +305,7 @@ def remap_sorted_resident_cache_(
         op = torch.ops._C_ascend.npu_dsa_resident_sorted_remap_
     except AttributeError as error:
         raise RuntimeError(
-            "vllm_ascend_C does not expose the standalone sorted resident "
-            "remap; rebuild the extension"
+            "vllm_ascend_C does not expose the standalone sorted resident remap; rebuild the extension"
         ) from error
     op(
         topk_indices,
@@ -335,8 +330,7 @@ def prepare_sorted_resident_cache_fused_(
         op = torch.ops._C_ascend.npu_dsa_resident_sorted_plan_
     except AttributeError as error:
         raise RuntimeError(
-            "vllm_ascend_C does not expose the fused sorted resident "
-            "planner; rebuild the extension"
+            "vllm_ascend_C does not expose the fused sorted resident planner; rebuild the extension"
         ) from error
     _run_sorted_resident_plan_(
         op,
@@ -385,9 +379,7 @@ def debug_sorted_resident_finalize_only_(
 ) -> None:
     """Test-only: run the exact finalize kernel without state update/remap."""
     try:
-        op = (
-            torch.ops._C_ascend.npu_dsa_resident_sorted_finalize_debug_
-        )
+        op = torch.ops._C_ascend.npu_dsa_resident_sorted_finalize_debug_
     except AttributeError as error:
         raise RuntimeError(
             "vllm_ascend_C does not expose the sorted resident finalize debug op; rebuild the extension"
@@ -406,4 +398,35 @@ def debug_sorted_resident_finalize_only_(
         debug_info,
         block_size,
         debug_stage,
+    )
+
+
+def debug_sorted_resident_update_only_(
+    topk_indices: torch.Tensor,
+    request_state_indices: torch.Tensor,
+    request_state_generations: torch.Tensor,
+    state: SortedResidentState,
+    workspace: SortedResidentWorkspace,
+) -> None:
+    """Benchmark-only: run the exact production state-update/remap kernel."""
+    try:
+        op = torch.ops._C_ascend.npu_dsa_resident_sorted_update_debug_
+    except AttributeError as error:
+        raise RuntimeError(
+            "vllm_ascend_C does not expose the sorted resident update debug op; rebuild the extension"
+        ) from error
+    op(
+        topk_indices,
+        workspace.shard_packed,
+        workspace.shard_mapping,
+        workspace.shard_counts,
+        workspace.prior_slots,
+        workspace.overwritten_slots,
+        request_state_indices,
+        request_state_generations,
+        state.tokens,
+        state.slots,
+        state.counts,
+        state.generations,
+        state.dummy_state_base,
     )

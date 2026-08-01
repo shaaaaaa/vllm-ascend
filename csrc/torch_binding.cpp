@@ -1882,6 +1882,164 @@ at::Tensor npu_dsa_resident_sorted_plan_no_remap_(
         block_size, dummy_state_base, false);
 }
 
+at::Tensor npu_dsa_resident_sorted_update_debug_(
+    at::Tensor &topk_indices,
+    const at::Tensor &shard_packed,
+    const at::Tensor &shard_mapping,
+    const at::Tensor &shard_counts,
+    const at::Tensor &prior_slots,
+    const at::Tensor &overwritten_slots,
+    const at::Tensor &request_state_indices,
+    const at::Tensor &request_state_generations,
+    at::Tensor &state_tokens,
+    at::Tensor &state_slots,
+    at::Tensor &state_counts,
+    at::Tensor &state_generations,
+    int64_t dummy_state_base)
+{
+    const auto device = topk_indices.device();
+    TORCH_CHECK(
+        topk_indices.is_privateuseone() &&
+            shard_packed.device() == device &&
+            shard_mapping.device() == device &&
+            shard_counts.device() == device &&
+            prior_slots.device() == device &&
+            overwritten_slots.device() == device &&
+            request_state_indices.device() == device &&
+            request_state_generations.device() == device &&
+            state_tokens.device() == device &&
+            state_slots.device() == device &&
+            state_counts.device() == device &&
+            state_generations.device() == device,
+        "resident update-debug tensors must share one NPU device");
+    TORCH_CHECK(
+        topk_indices.scalar_type() == at::kInt &&
+            shard_packed.scalar_type() == at::kInt &&
+            shard_mapping.scalar_type() == at::kShort &&
+            shard_counts.scalar_type() == at::kInt &&
+            prior_slots.scalar_type() == at::kShort &&
+            overwritten_slots.scalar_type() == at::kByte &&
+            request_state_indices.scalar_type() == at::kInt &&
+            request_state_generations.scalar_type() == at::kLong &&
+            state_tokens.scalar_type() == at::kInt &&
+            state_slots.scalar_type() == at::kShort &&
+            state_counts.scalar_type() == at::kInt &&
+            state_generations.scalar_type() == at::kLong,
+        "resident update-debug tensor dtypes are invalid");
+    TORCH_CHECK(
+        topk_indices.is_contiguous() && shard_packed.is_contiguous() &&
+            shard_mapping.is_contiguous() && shard_counts.is_contiguous() &&
+            prior_slots.is_contiguous() && overwritten_slots.is_contiguous() &&
+            request_state_indices.is_contiguous() &&
+            request_state_generations.is_contiguous() &&
+            state_tokens.is_contiguous() && state_slots.is_contiguous() &&
+            state_counts.is_contiguous() && state_generations.is_contiguous(),
+        "resident update-debug tensors must be contiguous");
+    TORCH_CHECK(
+        (topk_indices.dim() == 2 ||
+         (topk_indices.dim() == 3 && topk_indices.size(1) == 1)) &&
+            shard_packed.dim() == 3 && shard_mapping.dim() == 3 &&
+            shard_counts.dim() == 3 && prior_slots.dim() == 3 &&
+            overwritten_slots.dim() == 2 &&
+            request_state_indices.dim() == 1 &&
+            request_state_generations.dim() == 1 &&
+            state_tokens.dim() == 3 && state_slots.dim() == 3 &&
+            state_counts.dim() == 3 && state_generations.dim() == 2,
+        "resident update-debug tensor ranks are invalid");
+
+    const int64_t request_count = shard_packed.size(0);
+    const int64_t shard_count = shard_packed.size(1);
+    const int64_t capacity = shard_packed.size(2);
+    const int64_t row_count = topk_indices.size(0);
+    TORCH_CHECK(
+        request_count > 0 && row_count > 0 &&
+            row_count % request_count == 0,
+        "resident update-debug top-k rows must be request-major");
+    const int64_t rows_per_request = row_count / request_count;
+    const int64_t row_width = topk_indices.numel() / row_count;
+    const int64_t request_width = rows_per_request * row_width;
+    const int64_t state_row_count = state_tokens.size(0);
+    const int64_t shard_count_stride = shard_counts.size(2);
+    const int64_t shard_count_request_stride =
+        shard_counts.size(1) * shard_count_stride;
+    const int64_t generation_stride = state_generations.size(1);
+    int64_t expected_shard_count = 1;
+    while (expected_shard_count <= rows_per_request) {
+        expected_shard_count <<= 1;
+    }
+    TORCH_CHECK(
+        rows_per_request >= 1 && rows_per_request <= 2 &&
+            row_width == 2048 && capacity == request_width &&
+            shard_count == expected_shard_count &&
+            request_width % (16 * shard_count) == 0 &&
+            dummy_state_base >= request_count &&
+            state_row_count >= dummy_state_base + request_count &&
+            state_slots.sizes() == state_tokens.sizes() &&
+            state_tokens.size(1) == shard_count &&
+            state_tokens.size(2) == capacity &&
+            state_counts.size(0) == state_row_count &&
+            state_counts.size(1) == shard_count &&
+            shard_count_stride >= 16 &&
+            state_counts.size(2) >= 16 &&
+            state_generations.size(0) == state_row_count &&
+            generation_stride >= 8 &&
+            shard_mapping.size(0) == request_count &&
+            shard_mapping.size(1) == shard_count &&
+            shard_mapping.size(2) == request_width &&
+            shard_counts.size(0) == request_count &&
+            shard_counts.size(1) == shard_count &&
+            prior_slots.sizes() == shard_packed.sizes() &&
+            overwritten_slots.size(0) == request_count &&
+            overwritten_slots.size(1) == capacity &&
+            request_state_indices.numel() >= request_count &&
+            request_state_generations.numel() >= request_count,
+        "resident update-debug tensor shapes are invalid");
+
+    const c10_npu::OptionalNPUGuard npu_guard(device);
+    aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
+    void* topk_ptr = topk_indices.data_ptr();
+    void* packed_ptr = shard_packed.data_ptr();
+    void* mapping_ptr = shard_mapping.data_ptr();
+    void* count_ptr = shard_counts.data_ptr();
+    void* prior_ptr = prior_slots.data_ptr();
+    void* overwritten_ptr = overwritten_slots.data_ptr();
+    void* request_state_ptr = request_state_indices.data_ptr();
+    void* request_generation_ptr = request_state_generations.data_ptr();
+    void* state_token_ptr = state_tokens.data_ptr();
+    void* state_slot_ptr = state_slots.data_ptr();
+    void* state_count_ptr = state_counts.data_ptr();
+    void* state_generation_ptr = state_generations.data_ptr();
+    at_npu::native::OpCommand cmd;
+    cmd.Name("npu_dsa_resident_sorted_update_debug_");
+    cmd.SetCustomHandler([
+        stream, topk_ptr, packed_ptr, mapping_ptr, count_ptr,
+        prior_ptr, overwritten_ptr, request_state_ptr,
+        request_generation_ptr, state_token_ptr, state_slot_ptr,
+        state_count_ptr, state_generation_ptr, request_count,
+        state_row_count, dummy_state_base, rows_per_request,
+        row_width, shard_count, capacity, shard_count_stride,
+        shard_count_request_stride, generation_stride]() -> int {
+        dsa_resident_sorted_update_debug_impl(
+            stream, topk_ptr, packed_ptr, mapping_ptr, count_ptr,
+            prior_ptr, overwritten_ptr, request_state_ptr,
+            request_generation_ptr, state_token_ptr, state_slot_ptr,
+            state_count_ptr, state_generation_ptr,
+            static_cast<uint32_t>(request_count),
+            static_cast<uint32_t>(state_row_count),
+            static_cast<uint32_t>(dummy_state_base),
+            static_cast<uint32_t>(rows_per_request),
+            static_cast<uint32_t>(row_width),
+            static_cast<uint32_t>(shard_count),
+            static_cast<uint32_t>(capacity),
+            static_cast<uint32_t>(shard_count_stride),
+            static_cast<uint32_t>(shard_count_request_stride),
+            static_cast<uint32_t>(generation_stride));
+        return 0;
+    });
+    cmd.Run();
+    return topk_indices;
+}
+
 at::Tensor npu_dsa_resident_sorted_remap_(
     at::Tensor &topk_indices,
     const at::Tensor &shard_mapping,
@@ -3417,6 +3575,20 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "npu_dsa_resident_sorted_plan_no_remap_",
         torch::kPrivateUse1,
         &vllm_ascend::npu_dsa_resident_sorted_plan_no_remap_);
+    ops.def(
+        "npu_dsa_resident_sorted_update_debug_("
+        "Tensor(a!) topk_indices, Tensor shard_packed, "
+        "Tensor shard_mapping, Tensor shard_counts, "
+        "Tensor prior_slots, Tensor overwritten_slots, "
+        "Tensor request_state_indices, "
+        "Tensor request_state_generations, "
+        "Tensor(b!) state_tokens, Tensor(c!) state_slots, "
+        "Tensor(d!) state_counts, Tensor(e!) state_generations, "
+        "int dummy_state_base) -> Tensor(a!)");
+    ops.impl(
+        "npu_dsa_resident_sorted_update_debug_",
+        torch::kPrivateUse1,
+        &vllm_ascend::npu_dsa_resident_sorted_update_debug_);
     ops.def(
         "npu_dsa_resident_sorted_remap_("
         "Tensor(a!) topk_indices, Tensor shard_mapping, "

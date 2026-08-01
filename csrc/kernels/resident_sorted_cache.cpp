@@ -2403,6 +2403,40 @@ void dsa_resident_sorted_plan_impl(
         requestCount, shardCount, capacity, shardCountStride,
         shardCountRequestStride, missCountStride,
         blockTableWidth, blockSize, 0);
+    dsa_resident_sorted_update_debug_impl(
+        stream, topkIndices, shardPacked, shardMapping, shardCounts,
+        priorSlots, overwrittenSlots, requestStateIndices,
+        requestStateGenerations, stateTokens, stateSlots, stateCounts,
+        stateGenerations, requestCount, stateRowCount, dummyStateBase,
+        rowsPerRequest, rowWidth, shardCount, capacity,
+        shardCountStride, shardCountRequestStride, generationStride);
+}
+
+void dsa_resident_sorted_update_debug_impl(
+    void* stream,
+    void* topkIndices,
+    void* shardPacked,
+    void* shardMapping,
+    void* shardCounts,
+    void* priorSlots,
+    void* overwrittenSlots,
+    void* requestStateIndices,
+    void* requestStateGenerations,
+    void* stateTokens,
+    void* stateSlots,
+    void* stateCounts,
+    void* stateGenerations,
+    uint32_t requestCount,
+    uint32_t stateRowCount,
+    uint32_t dummyStateBase,
+    uint32_t rowsPerRequest,
+    uint32_t rowWidth,
+    uint32_t shardCount,
+    uint32_t capacity,
+    uint32_t shardCountStride,
+    uint32_t shardCountRequestStride,
+    uint32_t generationStride)
+{
     dsa_resident_sorted_update_kernel<<<
         requestCount * shardCount, nullptr, stream>>>(
         static_cast<int32_t*>(topkIndices),

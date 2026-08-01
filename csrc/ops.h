@@ -356,6 +356,31 @@ namespace vllm_ascend {
     uint32_t block_table_width,
     uint32_t block_size);
 
+  extern void dsa_resident_sorted_update_debug_impl(
+    void* stream,
+    void* topk_indices,
+    void* shard_packed,
+    void* shard_mapping,
+    void* shard_counts,
+    void* prior_slots,
+    void* overwritten_slots,
+    void* request_state_indices,
+    void* request_state_generations,
+    void* state_tokens,
+    void* state_slots,
+    void* state_counts,
+    void* state_generations,
+    uint32_t request_count,
+    uint32_t state_row_count,
+    uint32_t dummy_state_base,
+    uint32_t rows_per_request,
+    uint32_t row_width,
+    uint32_t shard_count,
+    uint32_t capacity,
+    uint32_t shard_count_stride,
+    uint32_t shard_count_request_stride,
+    uint32_t generation_stride);
+
   extern void dsa_resident_sorted_remap_impl(
     void* stream,
     void* topk_indices,
