@@ -2601,6 +2601,9 @@ private:
         const Metadata& meta,
         AscendC::LocalTensor<int16_t> pool)
     {
+        if (meta.totalSelected == 0) {
+            return;
+        }
         AscendC::Duplicate(
             pool, static_cast<int16_t>(0),
             capacity_ + shardCount_ * kInt16PerDataBlock);
@@ -2652,6 +2655,15 @@ private:
         uint32_t count)
     {
         if (count == 0) {
+            return;
+        }
+        if (meta.totalSelected == 0) {
+            AscendC::Adds(
+                output,
+                globalMiss,
+                static_cast<int32_t>(meta.totalOld),
+                count);
+            AscendC::PipeBarrier<PIPE_V>();
             return;
         }
         AscendC::Duplicate(work, static_cast<int32_t>(0), count);
@@ -2744,6 +2756,12 @@ private:
         uint32_t request,
         const Metadata& meta)
     {
+        if (meta.totalMiss == 0) {
+            missCounts_.SetValue(
+                static_cast<uint64_t>(request) * missCountStride_,
+                static_cast<int32_t>(0));
+            return;
+        }
         auto missToken = i32ABuf_.Get<int32_t>();
         auto globalMiss = i32BBuf_.Get<int32_t>();
         auto assignedSlot = i32CBuf_.Get<int32_t>();
@@ -2889,6 +2907,21 @@ private:
             * capacity_;
         const uint32_t oldCount = meta.oldCounts[shard];
         const uint32_t currentCount = meta.currentCounts[shard];
+
+        if (oldCount == 0 && currentCount == 0) {
+            stateCounts_.SetValue(
+                static_cast<uint64_t>(safeState)
+                        * shardCountRequestStride_
+                    + shard * shardCountStride_,
+                static_cast<int32_t>(0));
+            if (shard == 0) {
+                stateGenerations_.SetValue(
+                    static_cast<uint64_t>(safeState)
+                        * generationStride_,
+                    requestStateGenerations_.GetValue(request));
+            }
+            return;
+        }
 
         BuildEvictPool(request, meta, pool);
         if (oldCount > 0) {
