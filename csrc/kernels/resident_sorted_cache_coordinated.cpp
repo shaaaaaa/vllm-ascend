@@ -119,6 +119,9 @@ public:
         missCounts_.SetGlobalBuffer(
             missCounts,
             static_cast<uint64_t>(requestCount_) * missCountStride_);
+        pipe_.InitBuffer(
+            shardMetadataBuf_,
+            shardCount_ * shardCountStride_ * sizeof(int32_t));
     }
 
     __aicore__ inline void Process()
@@ -127,6 +130,14 @@ public:
         if (request >= requestCount_) {
             return;
         }
+        auto shardMetadata = shardMetadataBuf_.Get<int32_t>();
+        AscendC::DataCopy(
+            shardMetadata,
+            shardCounts_[
+                static_cast<uint64_t>(request)
+                    * shardCountRequestStride_],
+            shardCount_ * shardCountStride_);
+        Sync<AscendC::HardEvent::MTE2_S>();
 
         uint32_t missCounts[kMaxResidentShards] = {};
         uint32_t evictableCounts[kMaxResidentShards] = {};
@@ -134,21 +145,20 @@ public:
         uint32_t totalEvictableCount = 0;
         uint32_t totalOldCount = 0;
         for (uint32_t shard = 0; shard < shardCount_; ++shard) {
-            const uint64_t countOffset =
-                static_cast<uint64_t>(request)
-                    * shardCountRequestStride_
-                + shard * shardCountStride_;
             missCounts[shard] = static_cast<uint32_t>(
-                shardCounts_.GetValue(
-                    countOffset + kShardMissCount));
+                shardMetadata.GetValue(
+                    shard * shardCountStride_
+                    + kShardMissCount));
             evictableCounts[shard] = static_cast<uint32_t>(
-                shardCounts_.GetValue(
-                    countOffset + kShardEvictableCount));
+                shardMetadata.GetValue(
+                    shard * shardCountStride_
+                    + kShardEvictableCount));
             totalMissCount += missCounts[shard];
             totalEvictableCount += evictableCounts[shard];
             totalOldCount += static_cast<uint32_t>(
-                shardCounts_.GetValue(
-                    countOffset + kShardOldCount));
+                shardMetadata.GetValue(
+                    shard * shardCountStride_
+                    + kShardOldCount));
         }
 
         const uint32_t totalSelectedEvictCount =
@@ -197,6 +207,8 @@ public:
 private:
     AscendC::GlobalTensor<int32_t> shardCounts_;
     AscendC::GlobalTensor<int32_t> missCounts_;
+    AscendC::TPipe pipe_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> shardMetadataBuf_;
     uint32_t requestCount_ = 0;
     uint32_t shardCount_ = 0;
     uint32_t shardCountStride_ = 0;
@@ -294,6 +306,9 @@ public:
                 + kDataBlockBytes - 1)
             & ~(kDataBlockBytes - 1);
         pipe_.InitBuffer(blockTableBuf_, blockTableBytes);
+        pipe_.InitBuffer(
+            shardMetadataBuf_,
+            shardCount_ * shardCountStride_ * sizeof(int32_t));
     }
 
     __aicore__ inline void Process()
@@ -308,6 +323,14 @@ public:
             static_cast<uint64_t>(request)
                 * shardCountRequestStride_
             + ownerShard * shardCountStride_;
+        auto shardMetadata = shardMetadataBuf_.Get<int32_t>();
+        AscendC::DataCopy(
+            shardMetadata,
+            shardCounts_[
+                static_cast<uint64_t>(request)
+                    * shardCountRequestStride_],
+            shardCount_ * shardCountStride_);
+        Sync<AscendC::HardEvent::MTE2_S>();
         uint32_t currentCounts[kMaxResidentShards] = {};
         uint32_t missCounts[kMaxResidentShards] = {};
         uint32_t evictableCounts[kMaxResidentShards] = {};
@@ -317,25 +340,25 @@ public:
         uint32_t totalEvictableCount = 0;
         uint32_t totalOldCount = 0;
         for (uint32_t shard = 0; shard < shardCount_; ++shard) {
-            const uint64_t countOffset =
-                static_cast<uint64_t>(request)
-                    * shardCountRequestStride_
-                + shard * shardCountStride_;
             currentCounts[shard] = static_cast<uint32_t>(
-                shardCounts_.GetValue(
-                    countOffset + kShardCurrentCount));
+                shardMetadata.GetValue(
+                    shard * shardCountStride_
+                    + kShardCurrentCount));
             missCounts[shard] = static_cast<uint32_t>(
-                shardCounts_.GetValue(
-                    countOffset + kShardMissCount));
+                shardMetadata.GetValue(
+                    shard * shardCountStride_
+                    + kShardMissCount));
             evictableCounts[shard] = static_cast<uint32_t>(
-                shardCounts_.GetValue(
-                    countOffset + kShardEvictableCount));
+                shardMetadata.GetValue(
+                    shard * shardCountStride_
+                    + kShardEvictableCount));
             missPrefixes[shard] = totalMissCount;
             totalMissCount += missCounts[shard];
             totalEvictableCount += evictableCounts[shard];
             totalOldCount += static_cast<uint32_t>(
-                shardCounts_.GetValue(
-                    countOffset + kShardOldCount));
+                shardMetadata.GetValue(
+                    shard * shardCountStride_
+                    + kShardOldCount));
         }
         const uint32_t totalSelectedEvictCount =
             totalMissCount < totalEvictableCount
@@ -587,6 +610,7 @@ private:
     AscendC::TBuf<AscendC::TPosition::VECCALC> outputMissTokenBuf_;
     AscendC::TBuf<AscendC::TPosition::VECCALC> outputTargetSlotBuf_;
     AscendC::TBuf<AscendC::TPosition::VECCALC> blockTableBuf_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> shardMetadataBuf_;
     uint32_t requestCount_ = 0;
     uint32_t shardCount_ = 0;
     uint32_t capacity_ = 0;
