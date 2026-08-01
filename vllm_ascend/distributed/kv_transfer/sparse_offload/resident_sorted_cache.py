@@ -206,47 +206,6 @@ def prepare_resident_sharded_union_(
     )
 
 
-def prepare_resident_sharded_union_v2_(
-    topk_indices: torch.Tensor,
-    split_boundary: torch.Tensor,
-    row_req_indices: torch.Tensor,
-    request_state_indices: torch.Tensor,
-    request_state_generations: torch.Tensor,
-    state: SortedResidentState,
-    workspace: SortedResidentWorkspace,
-    *,
-    mtp: int,
-) -> None:
-    """Experimental union that encodes each miss's shard-local rank."""
-    resident_shard_count(mtp)
-    try:
-        op = torch.ops._C_ascend.npu_dsa_resident_sharded_union_v2_
-    except AttributeError as error:
-        raise RuntimeError(
-            "vllm_ascend_C does not expose the resident union v2; rebuild the extension"
-        ) from error
-    op(
-        topk_indices,
-        split_boundary,
-        row_req_indices,
-        workspace.shard_packed,
-        workspace.shard_mapping,
-        workspace.shard_counts,
-        request_state_indices,
-        request_state_generations,
-        state.tokens,
-        state.slots,
-        state.counts,
-        state.generations,
-        workspace.prior_slots,
-        workspace.shard_miss_tokens,
-        workspace.shard_miss_positions,
-        workspace.shard_evictable_slots,
-        mtp,
-        state.dummy_state_base,
-    )
-
-
 def _run_sorted_resident_plan_(
     op,
     topk_indices: torch.Tensor,
@@ -379,40 +338,6 @@ def prepare_sorted_resident_cache_fused_(
     except AttributeError as error:
         raise RuntimeError(
             "vllm_ascend_C does not expose the fused sorted resident planner; rebuild the extension"
-        ) from error
-    _run_sorted_resident_plan_(
-        op,
-        topk_indices,
-        request_block_table,
-        request_state_indices,
-        request_state_generations,
-        state,
-        workspace,
-        block_size=block_size,
-    )
-    return (
-        workspace.miss_tokens,
-        workspace.miss_counts[:, 0],
-        workspace.target_slots,
-    )
-
-
-def prepare_sorted_resident_cache_parallel_v2_(
-    topk_indices: torch.Tensor,
-    request_block_table: torch.Tensor,
-    request_state_indices: torch.Tensor,
-    request_state_generations: torch.Tensor,
-    state: SortedResidentState,
-    workspace: SortedResidentWorkspace,
-    *,
-    block_size: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Experimental single-launch parallel output/state/remap plan."""
-    try:
-        op = torch.ops._C_ascend.npu_dsa_resident_parallel_plan_v2_
-    except AttributeError as error:
-        raise RuntimeError(
-            "vllm_ascend_C does not expose the parallel resident v2 planner; rebuild the extension"
         ) from error
     _run_sorted_resident_plan_(
         op,

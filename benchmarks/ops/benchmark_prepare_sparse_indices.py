@@ -13,9 +13,7 @@ from vllm_ascend.distributed.kv_transfer.sparse_offload.resident_sorted_cache im
     debug_sorted_resident_finalize_only_,
     debug_sorted_resident_update_only_,
     prepare_resident_sharded_union_,
-    prepare_resident_sharded_union_v2_,
     prepare_sorted_resident_cache_fused_,
-    prepare_sorted_resident_cache_parallel_v2_,
     resident_shard_count,
 )
 from vllm_ascend.utils import enable_custom_op
@@ -642,7 +640,6 @@ def main(
     sharded_vector_dedup_values = source.clone()
     production_staged_values = source.clone()
     resident_union_values = source.clone()
-    resident_v2_values = source.clone()
     max_tokens = 131072
     boundaries = torch.full((row_count,), max_tokens, dtype=torch.int32, device="npu")
     source_max = (mtp + 1) * topk // 2 - 1
@@ -745,25 +742,6 @@ def main(
         else None
     )
     resident_union_state = (
-        allocate_sorted_resident_state(
-            request_batch,
-            request_batch,
-            mtp,
-            device=torch.device("npu"),
-        )
-        if mtp <= 2
-        else None
-    )
-    resident_v2_workspace = (
-        allocate_sorted_resident_workspace(
-            request_batch,
-            mtp,
-            device=torch.device("npu"),
-        )
-        if mtp <= 2
-        else None
-    )
-    resident_v2_state = (
         allocate_sorted_resident_state(
             request_batch,
             request_batch,
@@ -910,37 +888,6 @@ def main(
         resident_sharded_union()
         resident_fused_finalize()
 
-    def resident_v2_sharded_union():
-        assert resident_v2_workspace is not None
-        assert resident_v2_state is not None
-        prepare_resident_sharded_union_v2_(
-            resident_v2_values,
-            sharded_boundaries,
-            row_requests,
-            resident_request_states,
-            resident_request_generations,
-            resident_v2_state,
-            resident_v2_workspace,
-            mtp=mtp,
-        )
-
-    def resident_v2_parallel_plan():
-        assert resident_v2_workspace is not None
-        assert resident_v2_state is not None
-        prepare_sorted_resident_cache_parallel_v2_(
-            resident_v2_values,
-            block_table,
-            resident_request_states,
-            resident_request_generations,
-            resident_v2_state,
-            resident_v2_workspace,
-            block_size=block_size,
-        )
-
-    def resident_v2_end_to_end():
-        resident_v2_sharded_union()
-        resident_v2_parallel_plan()
-
     pair_baselines = mtp == 2
     native_unique_baseline = mtp in (2, 3)
     if not pair_baselines:
@@ -956,7 +903,6 @@ def main(
     sharded_vector_dedup_result = staged_sharded_vector_dedup()
     if resident_union_workspace is not None:
         resident_sharded_union()
-        resident_v2_sharded_union()
     production_staged_result = None
     if mtp <= 2:
         production_result = prepare_sparse_indices(
@@ -1232,86 +1178,6 @@ def main(
             resident_union_values.copy_(source)
             restore_resident_state()
 
-        assert resident_v2_workspace is not None
-        assert resident_v2_state is not None
-        v2_hit_count, v2_expected_misses = (
-            _seed_sorted_resident_state_for_hit_rate(
-                resident_v2_state,
-                request_batch=request_batch,
-                valid_token_count=sharded_boundary,
-                capacity=capacity,
-                shard_count=resident_shard_count(mtp),
-                hit_rate=resident_hit_rate,
-            )
-        )
-        if (v2_hit_count, v2_expected_misses) != (
-            resident_hit_count,
-            resident_expected_misses,
-        ):
-            raise AssertionError("resident v1/v2 benchmark seeds differ")
-        resident_v2_state_seed = (
-            resident_v2_state.tokens.clone(),
-            resident_v2_state.slots.clone(),
-            resident_v2_state.counts.clone(),
-            resident_v2_state.generations.clone(),
-        )
-
-        def restore_resident_v2_state():
-            resident_v2_state.tokens.copy_(resident_v2_state_seed[0])
-            resident_v2_state.slots.copy_(resident_v2_state_seed[1])
-            resident_v2_state.counts.copy_(resident_v2_state_seed[2])
-            resident_v2_state.generations.copy_(resident_v2_state_seed[3])
-
-        resident_v2_values.copy_(source)
-        resident_v2_sharded_union()
-        resident_v2_union_seed = (
-            resident_v2_workspace.shard_packed.clone(),
-            resident_v2_workspace.shard_mapping.clone(),
-            resident_v2_workspace.shard_counts.clone(),
-            resident_v2_workspace.prior_slots.clone(),
-            resident_v2_workspace.shard_miss_tokens.clone(),
-            resident_v2_workspace.shard_miss_positions.clone(),
-            resident_v2_workspace.shard_evictable_slots.clone(),
-        )
-
-        def restore_resident_v2_union_seed():
-            resident_v2_workspace.shard_packed.copy_(resident_v2_union_seed[0])
-            resident_v2_workspace.shard_mapping.copy_(resident_v2_union_seed[1])
-            resident_v2_workspace.shard_counts.copy_(resident_v2_union_seed[2])
-            resident_v2_workspace.prior_slots.copy_(resident_v2_union_seed[3])
-            resident_v2_workspace.shard_miss_tokens.copy_(resident_v2_union_seed[4])
-            resident_v2_workspace.shard_miss_positions.copy_(resident_v2_union_seed[5])
-            resident_v2_workspace.shard_evictable_slots.copy_(resident_v2_union_seed[6])
-
-        resident_v2_parallel_plan()
-        torch.npu.synchronize()
-        if resident_v2_workspace.miss_counts[:, 0].cpu().tolist() != [
-            resident_expected_misses
-        ] * request_batch:
-            raise AssertionError(
-                "resident v2 90%-hit plan emitted an incorrect miss count"
-            )
-        _validate_resident_remap(
-            source,
-            sharded_boundary,
-            resident_v2_values,
-            resident_v2_state,
-            mtp=mtp,
-        )
-
-        def reset_resident_v2_union():
-            resident_v2_values.copy_(source)
-            restore_resident_v2_state()
-
-        def reset_resident_v2_plan():
-            resident_v2_values.copy_(source)
-            restore_resident_v2_state()
-            restore_resident_v2_union_seed()
-
-        def reset_resident_v2_end_to_end():
-            resident_v2_values.copy_(source)
-            restore_resident_v2_state()
-
     legacy_samples = _measure_npu_ms(
         lambda: legacy_op(
             legacy_values,
@@ -1439,9 +1305,6 @@ def main(
     resident_update_samples = []
     resident_plan_samples = []
     resident_end_to_end_samples = []
-    resident_v2_union_samples = []
-    resident_v2_plan_samples = []
-    resident_v2_end_to_end_samples = []
     if resident_union_workspace is not None:
         resident_union_samples = _measure_npu_ms(
             resident_sharded_union,
@@ -1479,24 +1342,6 @@ def main(
             warmups,
             iterations,
         )
-        resident_v2_union_samples = _measure_npu_ms(
-            resident_v2_sharded_union,
-            reset_resident_v2_union,
-            warmups,
-            iterations,
-        )
-        resident_v2_plan_samples = _measure_npu_ms(
-            resident_v2_parallel_plan,
-            reset_resident_v2_plan,
-            warmups,
-            iterations,
-        )
-        resident_v2_end_to_end_samples = _measure_npu_ms(
-            resident_v2_end_to_end,
-            reset_resident_v2_end_to_end,
-            warmups,
-            iterations,
-        )
 
     legacy_mean = statistics.fmean(legacy_samples)
     union_mean = statistics.fmean(union_samples)
@@ -1523,7 +1368,6 @@ def main(
     resident_union_mean = None
     resident_no_intersection_mean = None
     resident_end_to_end_mean = None
-    resident_v2_end_to_end_mean = None
     if resident_union_samples:
         resident_union_mean = statistics.fmean(resident_union_samples)
         resident_no_intersection_mean = statistics.fmean(resident_no_intersection_samples)
@@ -1545,20 +1389,10 @@ def main(
             f"evict_slots_copied={resident_selected_evicts}, "
             "scratch_full=True"
         )
-        print(
-            "resident v2 AIV layout: "
-            f"union={request_batch * resident_shard_count(mtp)}, "
-            "plan="
-            f"{request_batch * (1 + 2 * resident_shard_count(mtp))} "
-            "(1 output + shard_count state + shard_count remap per request)"
-        )
         _summary("resident-finalize-kernel", resident_finalize_samples)
         _summary("resident-update+remap-kernel", resident_update_samples)
         _summary("resident-plan-two-kernel", resident_plan_samples)
         _summary("resident-end-to-end", resident_end_to_end_samples)
-        _summary("resident-v2-union", resident_v2_union_samples)
-        _summary("resident-v2-parallel-plan", resident_v2_plan_samples)
-        _summary("resident-v2-end-to-end", resident_v2_end_to_end_samples)
         resident_finalize_mean = statistics.fmean(resident_finalize_samples)
         resident_update_mean = statistics.fmean(resident_update_samples)
         resident_plan_mean = statistics.fmean(resident_plan_samples)
@@ -1575,20 +1409,6 @@ def main(
             "resident intersection-only overhead: "
             f"{resident_union_mean - resident_no_intersection_mean:+.6f} ms "
             f"({(resident_union_mean / resident_no_intersection_mean - 1) * 100:+.2f}%)"
-        )
-        resident_v2_plan_mean = statistics.fmean(resident_v2_plan_samples)
-        resident_v2_end_to_end_mean = statistics.fmean(
-            resident_v2_end_to_end_samples
-        )
-        print(
-            "resident v2 parallel-plan vs old two-kernel plan: "
-            f"{resident_v2_plan_mean - resident_plan_mean:+.6f} ms "
-            f"({(resident_v2_plan_mean / resident_plan_mean - 1) * 100:+.2f}%)"
-        )
-        print(
-            "resident v2 end-to-end vs old: "
-            f"{resident_v2_end_to_end_mean - resident_end_to_end_mean:+.6f} ms "
-            f"({(resident_v2_end_to_end_mean / resident_end_to_end_mean - 1) * 100:+.2f}%)"
         )
     native_unique_mean = None
     if native_unique_baseline:
@@ -1660,9 +1480,6 @@ def main(
             )
         )
         candidates.append(("resident-end-to-end", resident_end_to_end_mean))
-        candidates.append(
-            ("resident-v2-end-to-end", resident_v2_end_to_end_mean)
-        )
     if native_unique_baseline:
         candidates.append(("native-unique", native_unique_mean))
     if pair_baselines:

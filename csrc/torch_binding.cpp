@@ -1375,8 +1375,7 @@ at::Tensor resident_sharded_union_common_(
     at::Tensor &shard_miss_positions,
     at::Tensor &shard_evictable_slots,
     int64_t mtp,
-    int64_t dummy_state_base,
-    bool experimental_v2)
+    int64_t dummy_state_base)
 {
     const auto device = topk_indices.device();
     TORCH_CHECK(
@@ -1552,10 +1551,7 @@ at::Tensor resident_sharded_union_common_(
     void* shard_miss_position_ptr = shard_miss_positions.data_ptr();
     void* shard_evictable_slot_ptr = shard_evictable_slots.data_ptr();
     at_npu::native::OpCommand cmd;
-    cmd.Name(
-        experimental_v2
-            ? "npu_dsa_resident_sharded_union_v2_"
-            : "npu_dsa_resident_sharded_union_");
+    cmd.Name("npu_dsa_resident_sharded_union_");
     cmd.SetCustomHandler([
         stream, topk_ptr, boundary_ptr, row_request_ptr,
         packed_ptr, mapping_ptr, count_ptr, request_state_ptr,
@@ -1566,11 +1562,8 @@ at::Tensor resident_sharded_union_common_(
         request_count, state_row_count, dummy_state_base,
         rows_per_request, row_width, shard_count, shard_capacity,
         shard_count_stride, shard_count_request_stride,
-        generation_stride, experimental_v2]() -> int {
-        auto impl = experimental_v2
-            ? dsa_resident_sharded_union_v2_impl
-            : dsa_resident_sharded_union_impl;
-        impl(
+        generation_stride]() -> int {
+        dsa_resident_sharded_union_impl(
             stream, topk_ptr, boundary_ptr, row_request_ptr,
             packed_ptr, mapping_ptr, count_ptr, request_state_ptr,
             request_generation_ptr, state_token_ptr, state_slot_ptr,
@@ -1621,36 +1614,7 @@ at::Tensor npu_dsa_resident_sharded_union_(
         request_state_indices, request_state_generations,
         state_tokens, state_slots, state_counts, state_generations,
         prior_slots, shard_miss_tokens, shard_miss_positions,
-        shard_evictable_slots, mtp, dummy_state_base, false);
-}
-
-at::Tensor npu_dsa_resident_sharded_union_v2_(
-    const at::Tensor &topk_indices,
-    const at::Tensor &split_boundary,
-    const at::Tensor &row_req_indices,
-    at::Tensor &shard_packed,
-    at::Tensor &shard_mapping,
-    at::Tensor &shard_counts,
-    const at::Tensor &request_state_indices,
-    const at::Tensor &request_state_generations,
-    at::Tensor &state_tokens,
-    at::Tensor &state_slots,
-    at::Tensor &state_counts,
-    const at::Tensor &state_generations,
-    at::Tensor &prior_slots,
-    at::Tensor &shard_miss_tokens,
-    at::Tensor &shard_miss_positions,
-    at::Tensor &shard_evictable_slots,
-    int64_t mtp,
-    int64_t dummy_state_base)
-{
-    return resident_sharded_union_common_(
-        topk_indices, split_boundary, row_req_indices,
-        shard_packed, shard_mapping, shard_counts,
-        request_state_indices, request_state_generations,
-        state_tokens, state_slots, state_counts, state_generations,
-        prior_slots, shard_miss_tokens, shard_miss_positions,
-        shard_evictable_slots, mtp, dummy_state_base, true);
+        shard_evictable_slots, mtp, dummy_state_base);
 }
 
 static at::Tensor resident_sorted_plan_common_(
@@ -1674,8 +1638,7 @@ static at::Tensor resident_sorted_plan_common_(
     at::Tensor &target_slots,
     int64_t block_size,
     int64_t dummy_state_base,
-    bool fused_remap,
-    bool experimental_v2)
+    bool fused_remap)
 {
     const auto device = topk_indices.device();
     TORCH_CHECK(
@@ -1793,10 +1756,6 @@ static at::Tensor resident_sorted_plan_common_(
             block_table_width * block_size >= capacity,
         "sorted-resident dimensions are unsupported");
     TORCH_CHECK(
-        !experimental_v2 ||
-            (block_size & (block_size - 1)) == 0,
-        "parallel resident v2 requires a power-of-two block_size");
-    TORCH_CHECK(
         dummy_state_base >= request_count &&
             state_row_count >= dummy_state_base + request_count &&
             state_slots.sizes() == state_tokens.sizes() &&
@@ -1872,9 +1831,7 @@ static at::Tensor resident_sorted_plan_common_(
     void* target_ptr = target_slots.data_ptr();
     at_npu::native::OpCommand cmd;
     cmd.Name(
-        experimental_v2
-            ? "npu_dsa_resident_parallel_plan_v2_"
-            : fused_remap
+        fused_remap
             ? "npu_dsa_resident_sorted_plan_"
             : "npu_dsa_resident_sorted_plan_no_remap_");
     cmd.SetCustomHandler([
@@ -1889,13 +1846,10 @@ static at::Tensor resident_sorted_plan_common_(
         rows_per_request, row_width, shard_count, capacity,
         shard_count_stride, shard_count_request_stride,
         miss_count_stride, generation_stride,
-        block_table_width, block_size, fused_remap,
-        experimental_v2]() -> int {
-        auto impl = experimental_v2
-            ? dsa_resident_parallel_plan_v2_impl
-            : fused_remap
-                ? dsa_resident_sorted_plan_impl
-                : dsa_resident_sorted_plan_no_remap_impl;
+        block_table_width, block_size, fused_remap]() -> int {
+        auto impl = fused_remap
+            ? dsa_resident_sorted_plan_impl
+            : dsa_resident_sorted_plan_no_remap_impl;
         impl(
             stream, topk_ptr, packed_ptr, mapping_ptr,
             shard_count_ptr, block_table_ptr, request_state_ptr,
@@ -1953,39 +1907,7 @@ at::Tensor npu_dsa_resident_sorted_plan_(
         state_counts, state_generations, prior_slots,
         shard_miss_tokens, shard_miss_positions, shard_evictable_slots,
         miss_tokens, miss_counts, target_slots,
-        block_size, dummy_state_base, true, false);
-}
-
-at::Tensor npu_dsa_resident_parallel_plan_v2_(
-    at::Tensor &topk_indices,
-    const at::Tensor &shard_packed,
-    const at::Tensor &shard_mapping,
-    const at::Tensor &shard_counts,
-    const at::Tensor &request_block_table,
-    const at::Tensor &request_state_indices,
-    const at::Tensor &request_state_generations,
-    at::Tensor &state_tokens,
-    at::Tensor &state_slots,
-    at::Tensor &state_counts,
-    at::Tensor &state_generations,
-    at::Tensor &prior_slots,
-    const at::Tensor &shard_miss_tokens,
-    const at::Tensor &shard_miss_positions,
-    const at::Tensor &shard_evictable_slots,
-    at::Tensor &miss_tokens,
-    at::Tensor &miss_counts,
-    at::Tensor &target_slots,
-    int64_t block_size,
-    int64_t dummy_state_base)
-{
-    return resident_sorted_plan_common_(
-        topk_indices, shard_packed, shard_mapping, shard_counts,
-        request_block_table, request_state_indices,
-        request_state_generations, state_tokens, state_slots,
-        state_counts, state_generations, prior_slots,
-        shard_miss_tokens, shard_miss_positions, shard_evictable_slots,
-        miss_tokens, miss_counts, target_slots,
-        block_size, dummy_state_base, true, true);
+        block_size, dummy_state_base, true);
 }
 
 at::Tensor npu_dsa_resident_sorted_plan_no_remap_(
@@ -2017,7 +1939,7 @@ at::Tensor npu_dsa_resident_sorted_plan_no_remap_(
         state_counts, state_generations, prior_slots,
         shard_miss_tokens, shard_miss_positions, shard_evictable_slots,
         miss_tokens, miss_counts, target_slots,
-        block_size, dummy_state_base, false, false);
+        block_size, dummy_state_base, false);
 }
 
 at::Tensor npu_dsa_resident_sorted_update_debug_(
@@ -3695,22 +3617,6 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         torch::kPrivateUse1,
         &vllm_ascend::npu_dsa_resident_sharded_union_);
     ops.def(
-        "npu_dsa_resident_sharded_union_v2_(Tensor topk_indices, "
-        "Tensor split_boundary, Tensor row_req_indices, "
-        "Tensor(a!) shard_packed, Tensor(b!) shard_mapping, "
-        "Tensor(c!) shard_counts, Tensor request_state_indices, "
-        "Tensor request_state_generations, Tensor state_tokens, "
-        "Tensor state_slots, Tensor(d!) state_counts, "
-        "Tensor state_generations, Tensor(e!) prior_slots, "
-        "Tensor(f!) shard_miss_tokens, "
-        "Tensor(g!) shard_miss_positions, "
-        "Tensor(h!) shard_evictable_slots, "
-        "int mtp, int dummy_state_base) -> Tensor(c!)");
-    ops.impl(
-        "npu_dsa_resident_sharded_union_v2_",
-        torch::kPrivateUse1,
-        &vllm_ascend::npu_dsa_resident_sharded_union_v2_);
-    ops.def(
         "npu_dsa_resident_sorted_plan_(Tensor(a!) topk_indices, "
         "Tensor shard_packed, Tensor shard_mapping, "
         "Tensor shard_counts, Tensor request_block_table, "
@@ -3727,24 +3633,6 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "npu_dsa_resident_sorted_plan_",
         torch::kPrivateUse1,
         &vllm_ascend::npu_dsa_resident_sorted_plan_);
-    ops.def(
-        "npu_dsa_resident_parallel_plan_v2_("
-        "Tensor(a!) topk_indices, "
-        "Tensor shard_packed, Tensor shard_mapping, "
-        "Tensor shard_counts, Tensor request_block_table, "
-        "Tensor request_state_indices, "
-        "Tensor request_state_generations, "
-        "Tensor(b!) state_tokens, Tensor(c!) state_slots, "
-        "Tensor(d!) state_counts, Tensor(e!) state_generations, "
-        "Tensor(f!) prior_slots, Tensor shard_miss_tokens, "
-        "Tensor shard_miss_positions, Tensor shard_evictable_slots, "
-        "Tensor(g!) miss_tokens, Tensor(h!) miss_counts, "
-        "Tensor(i!) target_slots, int block_size, "
-        "int dummy_state_base) -> Tensor(h!)");
-    ops.impl(
-        "npu_dsa_resident_parallel_plan_v2_",
-        torch::kPrivateUse1,
-        &vllm_ascend::npu_dsa_resident_parallel_plan_v2_);
     ops.def(
         "npu_dsa_resident_sorted_plan_no_remap_("
         "Tensor(a!) topk_indices, "
