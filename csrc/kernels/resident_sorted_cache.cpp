@@ -1657,23 +1657,27 @@ public:
             selectedMaskBuf_, capacity_ * sizeof(uint8_t));
         pipe_.InitBuffer(
             survivorTokenBuf_, capacity_ * sizeof(int32_t));
-        // Remap reinterprets both slot buffers as int32/float. For MTP=1
-        // with one shard, remapPartWidth equals capacity, so the old int16
-        // allocation exposed only half the required elements and corrupted
-        // the second half of the remapped row.
+        // Remap reinterprets the survivor slot buffer as int32. For MTP=1
+        // with one shard, remapPartWidth equals capacity, so an int16-only
+        // allocation would expose only half the required elements.
         const uint32_t remapPartWidth = requestWidth_ / shardCount_;
         const uint32_t remapInt32Bytes =
             remapPartWidth * sizeof(int32_t);
         const uint32_t compactInt16Bytes =
             capacity_ * sizeof(int16_t);
-        const uint32_t remapReuseBytes =
+        const uint32_t survivorSlotBytes =
             remapInt32Bytes > compactInt16Bytes
                 ? remapInt32Bytes
                 : compactInt16Bytes;
-        pipe_.InitBuffer(survivorSlotBuf_, remapReuseBytes);
+        pipe_.InitBuffer(survivorSlotBuf_, survivorSlotBytes);
         pipe_.InitBuffer(
             mergedTokenBuf_, capacity_ * sizeof(int32_t));
-        pipe_.InitBuffer(mergedSlotBuf_, remapReuseBytes);
+        pipe_.InitBuffer(mergedSlotBuf_, compactInt16Bytes);
+        // State writeback consumes the merged buffers through MTE3 while
+        // remap starts vector work. Keep the remap temporaries disjoint so
+        // both pipelines can overlap without remap overwriting MTE3 input.
+        pipe_.InitBuffer(remapOffsetBuf_, remapInt32Bytes);
+        pipe_.InitBuffer(remapGatheredBuf_, remapInt32Bytes);
     }
 
     __aicore__ inline void Process()
@@ -1995,25 +1999,25 @@ private:
             static_cast<uint64_t>(request) * shardCount_
             * requestWidth_;
 
-        // The state merge has finished consuming these buffers. Reuse them
-        // for the same vector Gather+Select algorithm as the established
+        // Use the same vector Gather+Select algorithm as the established
         // resident row remapper, adapted to shard-local int16 ranks/slots.
+        // The dedicated offset/gather buffers must remain disjoint from the
+        // merged state buffers, which can still be MTE3 writeback sources.
         auto input = oldTokenBuf_.Get<int32_t>();
         auto mappingOrGathered = oldSlotBuf_.Get<int16_t>();
         auto rankFloatOrCandidate = currentTokenBuf_.Get<float>();
         auto shardSlots = priorSlotBuf_.Get<int16_t>();
         auto ranksOrOutput = survivorTokenBuf_.Get<int32_t>();
         auto accumulatedSlots = survivorSlotBuf_.Get<int32_t>();
-        auto clampedOffsets = mergedTokenBuf_.Get<int32_t>();
-        auto gatheredFloat = mergedSlotBuf_.Get<float>();
+        auto clampedOffsets = remapOffsetBuf_.Get<int32_t>();
+        auto gatheredFloat = remapGatheredBuf_.Get<float>();
         auto selectedMask = selectedMaskBuf_.Get<uint8_t>();
 
-        // old/current/survivor buffers were consumed by the scalar pipeline,
-        // while merged buffers are still MTE3 sources. Complete those
-        // dependencies before MTE2/vector reuse of the same UB allocations.
+        // The scalar pipeline has finished consuming the buffers reused by
+        // MTE2/vector remap. Merged buffers are deliberately not reused here,
+        // so their state writeback can remain in flight on MTE3.
         Sync<AscendC::HardEvent::S_MTE2>();
         Sync<AscendC::HardEvent::S_V>();
-        Sync<AscendC::HardEvent::MTE3_V>();
 
         CopyGlobalToLocalExact(
             input,
@@ -2178,6 +2182,8 @@ private:
     AscendC::TBuf<AscendC::TPosition::VECCALC> survivorSlotBuf_;
     AscendC::TBuf<AscendC::TPosition::VECCALC> mergedTokenBuf_;
     AscendC::TBuf<AscendC::TPosition::VECCALC> mergedSlotBuf_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> remapOffsetBuf_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> remapGatheredBuf_;
     uint32_t requestCount_ = 0;
     uint32_t stateRowCount_ = 0;
     uint32_t dummyStateBase_ = 0;

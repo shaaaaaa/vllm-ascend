@@ -1237,12 +1237,13 @@ def test_sorted_resident_pools_evict_slots_across_shards(mtp):
 
 @pytest.mark.parametrize("mtp", [1, 2])
 def test_fused_sorted_resident_matches_three_step_reference(mtp):
-    """Validate fused update+remap across misses, hits, and replacements."""
-    requests = 1
+    """Validate concurrent fused update+remap across fixed-address reuse."""
+    requests = 2
     shard_count = resident_shard_count(mtp)
     capacity = mtp * 2048
     block_size = 128
     boundary = 100_000
+    request_token_stride = 10_000
     workspace = allocate_sorted_resident_workspace(
         requests,
         mtp,
@@ -1254,37 +1255,35 @@ def test_fused_sorted_resident_matches_three_step_reference(mtp):
         mtp,
         device=torch.device("npu"),
     )
-    row_requests = torch.zeros(
-        requests * mtp,
-        dtype=torch.int32,
-        device="npu",
-    )
+    row_requests = torch.arange(
+        requests, dtype=torch.int32, device="npu"
+    ).repeat_interleave(mtp)
     boundaries = torch.full(
         (requests * mtp,),
         boundary,
         dtype=torch.int32,
         device="npu",
     )
-    request_states = torch.zeros(
-        requests,
-        dtype=torch.int32,
-        device="npu",
+    request_states = torch.arange(
+        requests, dtype=torch.int32, device="npu"
     )
-    request_generations = torch.ones(
-        requests,
-        dtype=torch.int64,
-        device="npu",
+    request_generations = torch.arange(
+        1, requests + 1, dtype=torch.int64, device="npu"
     )
     blocks_per_request = capacity // block_size
-    block_table = torch.arange(
-        requests * blocks_per_request,
-        dtype=torch.int32,
-        device="npu",
+    block_table_cpu = torch.arange(
+        requests * blocks_per_request, dtype=torch.int32
     ).reshape(requests, blocks_per_request)
+    block_table = block_table_cpu.npu()
 
-    reference: dict[int, int] = {}
+    references: list[dict[int, int]] = [{} for _ in range(requests)]
     for offset in (0, 100, 0):
-        source = _source(mtp, offset)
+        source = torch.cat(
+            tuple(
+                _source(mtp, offset + request * request_token_stride)
+                for request in range(requests)
+            )
+        )
         values = source.npu()
         prepare_resident_sharded_union_(
             values,
@@ -1302,12 +1301,16 @@ def test_fused_sorted_resident_matches_three_step_reference(mtp):
             requests,
             mtp,
             shard_count,
-        )[0]
-        reference, expected_misses, expected_slots = _reference_step(
-            expected_shards,
-            reference,
-            capacity,
         )
+        expected_steps = []
+        for request in range(requests):
+            reference, expected_misses, expected_slots = _reference_step(
+                expected_shards[request],
+                references[request],
+                capacity,
+            )
+            references[request] = reference
+            expected_steps.append((expected_misses, expected_slots))
         prepare_sorted_resident_cache_fused_(
             values,
             block_table,
@@ -1319,16 +1322,29 @@ def test_fused_sorted_resident_matches_three_step_reference(mtp):
         )
         torch.npu.synchronize()
 
-        miss_count = int(workspace.miss_counts[0, 0].cpu())
-        assert workspace.miss_tokens[0, :miss_count].cpu().tolist() == expected_misses
-        assert workspace.target_slots[0, :miss_count].cpu().tolist() == expected_slots
-        assert _state_dict(state, 0, shard_count) == reference
-
-        remapped = values.reshape(-1).cpu().tolist()
-        original = source.reshape(-1).tolist()
-        for position, token in enumerate(original):
-            expected = reference[token] if token < boundary else token
-            assert remapped[position] == expected
+        remapped = values.reshape(requests, -1).cpu()
+        original = source.reshape(requests, -1)
+        for request in range(requests):
+            expected_misses, expected_slots = expected_steps[request]
+            expected_targets = [
+                int(block_table_cpu[request, slot // block_size]) * block_size
+                + slot % block_size
+                for slot in expected_slots
+            ]
+            miss_count = int(workspace.miss_counts[request, 0].cpu())
+            assert (
+                workspace.miss_tokens[request, :miss_count].cpu().tolist()
+                == expected_misses
+            )
+            assert (
+                workspace.target_slots[request, :miss_count].cpu().tolist()
+                == expected_targets
+            )
+            reference = references[request]
+            assert _state_dict(state, request, shard_count) == reference
+            for position, token in enumerate(original[request].tolist()):
+                expected = reference[token] if token < boundary else token
+                assert int(remapped[request, position]) == expected
 
 
 @pytest.mark.parametrize("mtp", [1, 2])
