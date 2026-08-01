@@ -2808,6 +2808,9 @@ private:
                 missTokens_[requestOffset + missBase],
                 missToken,
                 count);
+            // missToken is now payload-only. Order its MTE3 consumer before
+            // the next shard reuses the same UB as an MTE2 destination.
+            Sync<AscendC::HardEvent::MTE3_MTE2>();
 
             AscendC::CreateVecIndex(
                 globalMiss,
@@ -2824,21 +2827,20 @@ private:
                 static_cast<int32_t>(blockSizeShift_),
                 count);
             AscendC::PipeBarrier<PIPE_V>();
-            Sync<AscendC::HardEvent::MTE3_V>();
             AscendC::Muls(
-                missToken,
+                work,
                 globalMiss,
                 static_cast<int32_t>(blockSize_),
                 count);
             AscendC::PipeBarrier<PIPE_V>();
             AscendC::Sub(
-                missToken,
+                work,
                 assignedSlot,
-                missToken,
+                work,
                 count);
             AscendC::PipeBarrier<PIPE_V>();
             AscendC::Muls(
-                work,
+                assignedSlot,
                 globalMiss,
                 static_cast<int32_t>(sizeof(int32_t)),
                 count);
@@ -2846,7 +2848,7 @@ private:
             AscendC::Gather(
                 globalMiss,
                 blockTable,
-                work.ReinterpretCast<uint32_t>(),
+                assignedSlot.ReinterpretCast<uint32_t>(),
                 static_cast<uint32_t>(0),
                 count);
             AscendC::PipeBarrier<PIPE_V>();
@@ -2859,7 +2861,7 @@ private:
             AscendC::Add(
                 globalMiss,
                 globalMiss,
-                missToken,
+                work,
                 count);
             AscendC::PipeBarrier<PIPE_V>();
             AscendC::Cast(
@@ -2868,11 +2870,6 @@ private:
                 AscendC::RoundMode::CAST_NONE,
                 count);
             AscendC::PipeBarrier<PIPE_V>();
-            // The next shard reuses missToken as an MTE2 destination. Order
-            // that future write after the current vector chain while V is
-            // still an active producer; placing this after MTE3_V would form
-            // an empty V event segment on the final iteration.
-            Sync<AscendC::HardEvent::V_MTE2>();
             Sync<AscendC::HardEvent::V_MTE3>();
             CopyLocalToGlobalExact(
                 targetSlots_[requestOffset + missBase],
