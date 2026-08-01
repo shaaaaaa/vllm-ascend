@@ -733,6 +733,41 @@ def test_sorted_resident_helper_uses_active_fixed_address_prefix(mtp):
 
 
 @pytest.mark.parametrize(
+    "mtp,shards_per_row,expected",
+    [
+        (1, 1, 1),
+        (1, 2, 2),
+        (1, 4, 4),
+        (2, 1, 2),
+        (2, 2, 4),
+        (2, 4, 8),
+    ],
+)
+def test_configured_resident_shards_are_request_wide(
+    mtp, shards_per_row, expected
+):
+    with patch.object(
+        sfa_v1.envs,
+        "VLLM_ASCEND_DSA_RESIDENT_SHARDS_PER_ROW",
+        shards_per_row,
+    ):
+        assert sfa_v1._configured_resident_shards(mtp) == (
+            shards_per_row,
+            expected,
+        )
+
+
+def test_configured_resident_shards_default_to_four_per_row():
+    with patch.object(
+        sfa_v1.envs,
+        "VLLM_ASCEND_DSA_RESIDENT_SHARDS_PER_ROW",
+        4,
+    ):
+        assert sfa_v1._configured_resident_shards(1) == (4, 4)
+        assert sfa_v1._configured_resident_shards(2) == (4, 8)
+
+
+@pytest.mark.parametrize(
     "enabled,need_packed,mtp,uses_sorted",
     [
         (True, True, 1, True),
@@ -1324,6 +1359,12 @@ class TestStagedSFAGraphPoc(TestBase):
         self.assertTrue(
             wait_for_layer.call_args_list[0]
             .kwargs["require_complete_sparse_load"]
+        )
+        self.assertEqual(
+            wait_for_layer.call_args_list[0]
+            .kwargs["selected_token_counts"]
+            .tolist(),
+            [1, 1, 1, 1],
         )
         prepare_boundary.assert_called_once_with(
             next_metadata,

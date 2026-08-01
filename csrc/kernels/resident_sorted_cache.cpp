@@ -1617,12 +1617,23 @@ public:
             selectedMaskBuf_, capacity_ * sizeof(uint8_t));
         pipe_.InitBuffer(
             survivorTokenBuf_, capacity_ * sizeof(int32_t));
-        pipe_.InitBuffer(
-            survivorSlotBuf_, capacity_ * sizeof(int16_t));
+        // Remap reinterprets both slot buffers as int32/float. For MTP=1
+        // with one shard, remapPartWidth equals capacity, so the old int16
+        // allocation exposed only half the required elements and corrupted
+        // the second half of the remapped row.
+        const uint32_t remapPartWidth = requestWidth_ / shardCount_;
+        const uint32_t remapInt32Bytes =
+            remapPartWidth * sizeof(int32_t);
+        const uint32_t compactInt16Bytes =
+            capacity_ * sizeof(int16_t);
+        const uint32_t remapReuseBytes =
+            remapInt32Bytes > compactInt16Bytes
+                ? remapInt32Bytes
+                : compactInt16Bytes;
+        pipe_.InitBuffer(survivorSlotBuf_, remapReuseBytes);
         pipe_.InitBuffer(
             mergedTokenBuf_, capacity_ * sizeof(int32_t));
-        pipe_.InitBuffer(
-            mergedSlotBuf_, capacity_ * sizeof(int16_t));
+        pipe_.InitBuffer(mergedSlotBuf_, remapReuseBytes);
     }
 
     __aicore__ inline void Process()

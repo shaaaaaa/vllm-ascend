@@ -167,6 +167,13 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_DSA_RESIDENT_CACHE": lambda: bool(
         int(os.getenv("VLLM_ASCEND_DSA_RESIDENT_CACHE", "1"))
     ),
+    # Value shards assigned to each MTP row by the sorted resident planner.
+    # The request-wide shard count is MTP * shards_per_row. The value must be
+    # a power of two in [1, 4]. Read once during model initialization so graph
+    # capture and replay use one fixed state/workspace layout.
+    "VLLM_ASCEND_DSA_RESIDENT_SHARDS_PER_ROW": lambda: int(
+        os.getenv("VLLM_ASCEND_DSA_RESIDENT_SHARDS_PER_ROW", "4")
+    ),
     # Experimental SFA graph-capture proof of concept. When enabled, exact-Q1
     # decode is captured across layers, with selective LMCache retrieval as
     # the eager split operation.

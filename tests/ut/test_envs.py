@@ -81,3 +81,11 @@ class TestEnvVariables(TestBase):
             self.assertTrue(getattr(envs_ascend, name))
         with patch.dict(os.environ, {name: "0"}):
             self.assertFalse(getattr(envs_ascend, name))
+
+    def test_dsa_resident_shards_per_row_defaults_to_four(self):
+        name = "VLLM_ASCEND_DSA_RESIDENT_SHARDS_PER_ROW"
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(name, None)
+            self.assertEqual(getattr(envs_ascend, name), 4)
+        with patch.dict(os.environ, {name: "2"}):
+            self.assertEqual(getattr(envs_ascend, name), 2)

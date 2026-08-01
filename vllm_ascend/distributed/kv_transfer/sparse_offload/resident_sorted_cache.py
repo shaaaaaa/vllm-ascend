@@ -19,13 +19,26 @@ INDEX_TOPK = 2048
 MAX_INT16_SCRATCH_CAPACITY = 1 << 15
 RESIDENT_READ_PROBE_DEBUG_INTS = 32
 RESIDENT_FINALIZE_DEBUG_INTS = 16
+DEFAULT_RESIDENT_SHARDS_PER_ROW = 4
+MAX_RESIDENT_SHARDS_PER_ROW = 4
 
 
-def resident_shard_count(mtp: int) -> int:
-    """Return the strictly next power of two: MTP=1 -> 2, MTP=2 -> 4."""
+def resident_shard_count(
+    mtp: int,
+    shards_per_row: int = DEFAULT_RESIDENT_SHARDS_PER_ROW,
+) -> int:
+    """Resolve the request-wide shard count from one row partition setting."""
     if mtp not in (1, 2):
         raise ValueError("sorted resident path supports only MTP=1 or MTP=2")
-    return 1 << mtp.bit_length()
+    if (
+        shards_per_row < 1
+        or shards_per_row > MAX_RESIDENT_SHARDS_PER_ROW
+        or shards_per_row & (shards_per_row - 1)
+    ):
+        raise ValueError(
+            "resident shards_per_row must be a power of two from 1 to 4"
+        )
+    return mtp * shards_per_row
 
 
 def _resolve_resident_shard_count(

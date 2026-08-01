@@ -12,11 +12,13 @@ from vllm_ascend.distributed.kv_transfer.sparse_offload.resident_sorted_cache im
 @pytest.mark.parametrize(
     "mtp,capacity,shard_count,shard_count_override",
     [
-        (1, 2048, 2, None),
+        (1, 2048, 4, None),
         (1, 2048, 1, 1),
+        (1, 2048, 2, 2),
         (1, 2048, 4, 4),
-        (2, 4096, 4, None),
+        (2, 4096, 8, None),
         (2, 4096, 2, 2),
+        (2, 4096, 4, 4),
         (2, 4096, 8, 8),
     ],
 )
@@ -84,9 +86,26 @@ def test_sorted_resident_allocations_are_cacheline_partitioned(
     assert workspace.shard_evictable_slots.stride(1) * workspace.shard_evictable_slots.element_size() % 64 == 0
 
 
-def test_sorted_resident_uses_strict_next_power_of_two():
-    assert resident_shard_count(1) == 2
-    assert resident_shard_count(2) == 4
+@pytest.mark.parametrize(
+    "mtp,shards_per_row,expected",
+    [
+        (1, 1, 1),
+        (1, 2, 2),
+        (1, 4, 4),
+        (2, 1, 2),
+        (2, 2, 4),
+        (2, 4, 8),
+    ],
+)
+def test_sorted_resident_resolves_shards_per_row(
+    mtp, shards_per_row, expected
+):
+    assert resident_shard_count(mtp, shards_per_row) == expected
+
+
+def test_sorted_resident_defaults_to_four_shards_per_row():
+    assert resident_shard_count(1) == 4
+    assert resident_shard_count(2) == 8
 
 
 def test_sorted_resident_rejects_unsupported_mtp_and_state_size():
@@ -101,6 +120,9 @@ def test_sorted_resident_rejects_unsupported_mtp_and_state_size():
         )
     with pytest.raises(ValueError, match="MTP=1 or MTP=2"):
         resident_shard_count(3)
+    for shards_per_row in (0, 3, 8):
+        with pytest.raises(ValueError, match="power of two from 1 to 4"):
+            resident_shard_count(1, shards_per_row)
     with pytest.raises(ValueError, match="power of two from 1 to 8"):
         allocate_sorted_resident_workspace(
             1,

@@ -73,6 +73,7 @@ from vllm_ascend.distributed.kv_transfer.sparse_offload.resident_sorted_cache im
     allocate_sorted_resident_workspace,
     prepare_resident_sharded_union_,
     prepare_sorted_resident_cache_fused_,
+    resident_shard_count,
     sorted_resident_workspace_prefix,
 )
 from vllm_ascend.distributed.utils import all_gather_async
@@ -133,6 +134,14 @@ def _staged_sfa_profile_scope(name: str):
     if torch.autograd._profiler_enabled():
         return torch.profiler.record_function(name)
     return nullcontext()
+
+
+def _configured_resident_shards(mtp: int) -> tuple[int, int]:
+    """Resolve the startup-static row and request shard counts."""
+    shards_per_row = int(
+        envs.VLLM_ASCEND_DSA_RESIDENT_SHARDS_PER_ROW
+    )
+    return shards_per_row, resident_shard_count(mtp, shards_per_row)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1776,7 +1785,12 @@ class AscendSFAImpl(MLAAttentionImpl):
         self._sorted_resident_workspace_views: dict[
             int, SortedResidentWorkspace
         ] = {}
+        self.dsa_resident_shards_per_row: int | None = None
         if self.dsa_resident_cache:
+            resident_shards_per_row, resident_shards = (
+                _configured_resident_shards(self.decode_threshold)
+            )
+            self.dsa_resident_shards_per_row = resident_shards_per_row
             scratch_capacity = self.decode_threshold * self.index_topk
             if not (
                 0 < scratch_capacity < MAX_INT16_SCRATCH_CAPACITY
@@ -1800,12 +1814,14 @@ class AscendSFAImpl(MLAAttentionImpl):
                 max_requests,
                 self.decode_threshold,
                 device=state_device,
+                shard_count=resident_shards,
             )
             self._sorted_resident_workspace = (
                 allocate_sorted_resident_workspace(
                     max_requests,
                     self.decode_threshold,
                     device=state_device,
+                    shard_count=resident_shards,
                 )
             )
         self.enable_staged_sfa_graph = staged_sfa_graph_configured(self.vllm_config)
