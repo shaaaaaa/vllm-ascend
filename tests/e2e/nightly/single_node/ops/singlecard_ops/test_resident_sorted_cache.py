@@ -1751,6 +1751,19 @@ def test_sorted_resident_full_path_supports_graph_replay(mtp):
         mtp,
         device=torch.device("npu"),
     )
+    shard_count = resident_shard_count(mtp)
+    expected_shards = _expected_shards(
+        source,
+        boundaries.cpu(),
+        requests,
+        mtp,
+        shard_count,
+    )[0]
+    expected_state, _, _ = _reference_step(
+        expected_shards,
+        {},
+        capacity,
+    )
 
     graph = torch.npu.NPUGraph()
     with torch.npu.graph(graph):
@@ -1781,17 +1794,96 @@ def test_sorted_resident_full_path_supports_graph_replay(mtp):
     torch.npu.synchronize()
     expected_count = 1948 if mtp == 1 else 2972
     assert int(workspace.miss_counts[0, 0].cpu()) == expected_count
+    assert _state_dict(state, 0, shard_count) == expected_state
 
     values.copy_(source.npu())
     graph.replay()
     torch.npu.synchronize()
     assert int(workspace.miss_counts[0, 0].cpu()) == 0
+    assert _state_dict(state, 0, shard_count) == expected_state
 
     values.copy_(source.npu())
     request_generations.fill_(2)
     graph.replay()
     torch.npu.synchronize()
     assert int(workspace.miss_counts[0, 0].cpu()) == expected_count
+    assert _state_dict(state, 0, shard_count) == expected_state
+
+
+@pytest.mark.parametrize("mtp", [1, 2])
+def test_sorted_resident_no_remap_graph_replay_completes_state_writeback(mtp):
+    requests = 1
+    capacity = mtp * INDEX_TOPK
+    source = _source(mtp, 0)
+    values = source.npu()
+    boundaries_cpu = torch.full(
+        (mtp,),
+        1948 if mtp == 1 else 2972,
+        dtype=torch.int32,
+    )
+    boundaries = boundaries_cpu.npu()
+    row_requests = torch.zeros(mtp, dtype=torch.int32, device="npu")
+    request_states = torch.zeros(1, dtype=torch.int32, device="npu")
+    request_generations = torch.ones(1, dtype=torch.int64, device="npu")
+    block_table = torch.arange(
+        capacity // 128,
+        dtype=torch.int32,
+        device="npu",
+    ).reshape(1, -1)
+    shard_count = resident_shard_count(mtp)
+    workspace = allocate_sorted_resident_workspace(
+        requests,
+        mtp,
+        device=torch.device("npu"),
+    )
+    state = allocate_sorted_resident_state(
+        requests,
+        requests,
+        mtp,
+        device=torch.device("npu"),
+    )
+    expected_shards = _expected_shards(
+        source,
+        boundaries_cpu,
+        requests,
+        mtp,
+        shard_count,
+    )[0]
+    expected_state, _, _ = _reference_step(
+        expected_shards,
+        {},
+        capacity,
+    )
+
+    graph = torch.npu.NPUGraph()
+    with torch.npu.graph(graph):
+        prepare_resident_sharded_union_(
+            values,
+            boundaries,
+            row_requests,
+            request_states,
+            request_generations,
+            state,
+            workspace,
+            mtp=mtp,
+        )
+        prepare_sorted_resident_cache_no_remap_(
+            values,
+            block_table,
+            request_states,
+            request_generations,
+            state,
+            workspace,
+            block_size=128,
+        )
+
+    state.counts.zero_()
+    state.generations.fill_(-1)
+    graph.replay()
+    torch.npu.synchronize()
+
+    assert torch.equal(values.cpu(), source)
+    assert _state_dict(state, 0, shard_count) == expected_state
 
 
 def test_target_sfa_snapshot_replays_production_resident_planner():

@@ -1833,6 +1833,10 @@ public:
                     * generationStride_,
                 requestedGeneration);
         }
+        // Do not let the kernel retire after publishing the new count while
+        // state token/slot (and remapped top-k) MTE3 writes are still in
+        // flight. The following invocation treats count as the valid prefix.
+        Sync<AscendC::HardEvent::MTE3_S>();
     }
 
     // Split-path state update. Keep Process() above unchanged so the original
@@ -1983,6 +1987,10 @@ public:
                     * generationStride_,
                 requestedGeneration);
         }
+        // ProcessStateOnly has no remap work after state writeback to hide the
+        // MTE3 latency. Explicitly complete both state copies before return;
+        // otherwise the visible count can describe unwritten UB garbage.
+        Sync<AscendC::HardEvent::MTE3_S>();
     }
 
 private:
