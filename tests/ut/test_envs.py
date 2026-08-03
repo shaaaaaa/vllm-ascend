@@ -89,3 +89,11 @@ class TestEnvVariables(TestBase):
             self.assertEqual(getattr(envs_ascend, name), 4)
         with patch.dict(os.environ, {name: "2"}):
             self.assertEqual(getattr(envs_ascend, name), 2)
+
+    def test_staged_mtp_draft_graph_defaults_off_and_can_be_enabled(self):
+        name = "VLLM_ASCEND_SFA_STAGED_MTP_DRAFT_GRAPH"
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(name, None)
+            self.assertFalse(getattr(envs_ascend, name))
+        with patch.dict(os.environ, {name: "1"}):
+            self.assertTrue(getattr(envs_ascend, name))

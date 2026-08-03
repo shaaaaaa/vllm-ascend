@@ -40,6 +40,7 @@ from vllm.v1.spec_decode.utils import (
 )
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 
+from vllm_ascend import envs as envs_ascend
 from vllm_ascend.ascend_forward_context import (
     _EXTRA_CTX,
     StagedSFAGraphKey,
@@ -160,6 +161,7 @@ class SpecDecodeBaseProposer(EagleProposer):
 
         staged_mtp_graph_requested = (
             self.method == "mtp"
+            and envs_ascend.VLLM_ASCEND_SFA_STAGED_MTP_DRAFT_GRAPH
             and staged_sfa_graph_configured(vllm_config)
         )
         self.use_cuda_graph = self.runner._use_aclgraph() and (
@@ -173,9 +175,7 @@ class SpecDecodeBaseProposer(EagleProposer):
                 and not self.speculative_config.disable_padded_drafter_batch
             )
         self.use_staged_mtp_draft_graph = (
-            self.method == "mtp"
-            and self.use_cuda_graph
-            and staged_sfa_graph_configured(vllm_config)
+            staged_mtp_graph_requested and self.use_cuda_graph
         )
         self._staged_mtp_max_request_capacity = 0
         if self.use_staged_mtp_draft_graph:

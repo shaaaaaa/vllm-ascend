@@ -181,6 +181,13 @@ env_variables: dict[str, Callable[[], Any]] = {
     # incompatible model/runtime features fail fast during startup capture so
     # an explicitly requested POC cannot silently remain inactive.
     "VLLM_ASCEND_SFA_STAGED_GRAPH": lambda: bool(int(os.getenv("VLLM_ASCEND_SFA_STAGED_GRAPH", "0"))),
+    # Independently capture the MTP drafter as a FULL graph while the target
+    # model uses staged SFA. Disabled by default; the target staged graph and
+    # resident scratch reuse do not depend on this opt-in. Non-sensitive; read
+    # during proposer initialization and requires a worker restart.
+    "VLLM_ASCEND_SFA_STAGED_MTP_DRAFT_GRAPH": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_SFA_STAGED_MTP_DRAFT_GRAPH", "0"))
+    ),
     # Comma-separated positive exact-Q1 batch sizes, bounded by scheduler
     # capacity. Defaults to singleton capture; not sensitive.
     "VLLM_ASCEND_SFA_STAGED_GRAPH_CAPTURE_SIZES": lambda: os.getenv(

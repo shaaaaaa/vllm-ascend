@@ -1569,6 +1569,67 @@ class TestStagedSFAStartupCaptureValidation(unittest.TestCase):
         seal_entries.assert_called_once_with(graph_keys, 2)
         draft_seal.assert_called_once_with((1, 2))
 
+    def test_capture_model_seals_target_staged_graph_when_draft_graph_is_off(self):
+        runner = self._build_runner()
+        runner.vllm_config.speculative_config = SimpleNamespace(
+            num_speculative_tokens=1,
+        )
+        runner.decode_threshold = 2
+        draft_seal = MagicMock()
+        runner.drafter = SimpleNamespace(
+            use_staged_mtp_draft_graph=False,
+            seal_staged_mtp_draft_graphs=draft_seal,
+        )
+        impl = SimpleNamespace(
+            seal_staged_sfa_capture=MagicMock(),
+        )
+        with (
+            patch.object(
+                model_runner_module,
+                "staged_sfa_graph_capture_sizes",
+                return_value=(2, 4),
+            ),
+            patch.object(
+                model_runner_module,
+                "_torch_cuda_wrapper",
+                return_value=nullcontext(),
+            ),
+            patch.object(
+                model_runner_module,
+                "_replace_gpu_model_runner_function_wrapper",
+                return_value=nullcontext(),
+            ),
+            patch.object(
+                runner,
+                "_reset_staged_sfa_startup_capture",
+            ),
+            patch.object(
+                model_runner_module.GPUModelRunner,
+                "capture_model",
+                return_value=123,
+            ),
+            patch.object(
+                model_runner_module.ACLGraphWrapper,
+                "seal_staged_entries",
+                return_value=4,
+            ) as seal_entries,
+            patch.object(
+                runner,
+                "_collect_staged_sfa_impls",
+                return_value=(("layer-0", impl),),
+            ),
+        ):
+            result = runner.capture_model()
+
+        graph_keys = tuple(
+            StagedSFAGraphKey.fixed_spec(requests, 2)
+            for requests in (1, 2)
+        )
+        self.assertEqual(result, 123)
+        impl.seal_staged_sfa_capture.assert_called_once_with(graph_keys)
+        seal_entries.assert_called_once_with(graph_keys, 2)
+        draft_seal.assert_not_called()
+
     def test_collect_staged_sfa_impls_excludes_mtp_draft_layer(self):
         runner = self._build_runner()
         runner.vllm_config.model_config.hf_text_config.num_hidden_layers = 78
