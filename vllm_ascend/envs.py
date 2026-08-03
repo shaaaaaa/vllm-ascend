@@ -222,6 +222,20 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_DSA_LMCACHE_TRACE": lambda: bool(
         int(os.getenv("VLLM_ASCEND_DSA_LMCACHE_TRACE", "0"))
     ),
+    # Emit the per-layer sparse LMCache miss-token ratio about once per second.
+    # The denominator is index_topk * decode rows (including MTP rows). Default
+    # off because each emitted sample intentionally synchronizes one scalar from
+    # NPU to CPU. Non-sensitive; read during model initialization.
+    "VLLM_ASCEND_DSA_LMCACHE_LOAD_STAT": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_DSA_LMCACHE_LOAD_STAT", "0"))
+    ),
+    # Fence the target/MTP-drafter boundary and persist bounded layer-78 tensor
+    # snapshots for crash diagnosis. Default off because the fences serialize
+    # NPU work and the snapshots copy tensors to CPU. Non-sensitive; checked at
+    # every live MTP proposal, although changing it normally requires restart.
+    "VLLM_ASCEND_MTP_DRAFT_DEBUG": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_MTP_DRAFT_DEBUG", "0"))
+    ),
     # Emit bounded diagnostics for MTP and LMCache decode-window interaction.
     # Default off because sampled tensor summaries can synchronize NPU and CPU.
     "VLLM_ASCEND_MTP_DW_DIAG": lambda: bool(

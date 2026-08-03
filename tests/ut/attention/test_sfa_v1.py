@@ -108,6 +108,69 @@ def test_sparse_boundary_short_frontier_preserves_zero_pad_semantics():
     assert actual.tolist() == [8, 0]
 
 
+def test_lmcache_load_stat_aggregates_mtp_rows_and_resets():
+    impl = AscendSFAImpl.__new__(AscendSFAImpl)
+    impl.index_topk = 4
+    impl._lmcache_load_stat_enabled = True
+    impl._lmcache_load_stat_tokens = None
+    impl._lmcache_load_stat_denominator = 0
+    impl._lmcache_load_stat_rows = 0
+    impl._lmcache_load_stat_calls = 0
+    impl._lmcache_load_stat_last_log = 10.0
+
+    with (
+        patch.object(sfa_v1, "monotonic", side_effect=[10.5, 11.2]),
+        patch.object(sfa_v1.logger, "info") as log,
+    ):
+        impl._record_lmcache_load_stat(
+            "model.layers.78.self_attn",
+            torch.tensor([[1, 99], [2, 99]], dtype=torch.int32),
+            request_count=2,
+            decode_rows=4,
+        )
+        impl._record_lmcache_load_stat(
+            "model.layers.78.self_attn",
+            torch.tensor([[3, 99], [4, 99]], dtype=torch.int32),
+            request_count=2,
+            decode_rows=4,
+        )
+
+    log.assert_called_once()
+    args = log.call_args.args
+    assert args[1:] == (
+        "model.layers.78.self_attn",
+        pytest.approx(1.2),
+        10,
+        4,
+        8,
+        32,
+        pytest.approx(10 / 32),
+        2,
+    )
+    assert impl._lmcache_load_stat_tokens.item() == 0
+    assert impl._lmcache_load_stat_denominator == 0
+    assert impl._lmcache_load_stat_rows == 0
+    assert impl._lmcache_load_stat_calls == 0
+    assert impl._lmcache_load_stat_last_log == pytest.approx(11.2)
+
+
+def test_lmcache_load_stat_disabled_does_not_touch_tensor_or_clock():
+    impl = AscendSFAImpl.__new__(AscendSFAImpl)
+    impl._lmcache_load_stat_enabled = False
+    impl._lmcache_load_stat_tokens = None
+
+    with patch.object(sfa_v1, "monotonic") as clock:
+        impl._record_lmcache_load_stat(
+            "model.layers.0.self_attn",
+            torch.tensor([3], dtype=torch.int32),
+            request_count=1,
+            decode_rows=1,
+        )
+
+    clock.assert_not_called()
+    assert impl._lmcache_load_stat_tokens is None
+
+
 def test_sparse_boundary_gathers_by_request_for_mtp_rows():
     boundary_cpu = torch.tensor(
         [11, 11, 22, 22],

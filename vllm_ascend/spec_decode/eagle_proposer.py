@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 import copy
+import os
 from collections.abc import Callable
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -56,6 +58,14 @@ from vllm_ascend.compilation.acl_graph import (
 )
 from vllm_ascend.ops.triton.spec_decode.utils import prepare_inputs_padded_kernel
 from vllm_ascend.ops.triton.triton_utils import get_vectorcore_num
+from vllm_ascend.spec_decode.mtp_draft_diagnostics import (
+    MTP_DRAFT_DIAG_ROOT,
+    MTP_DRAFT_DIAG_SCHEMA_VERSION,
+    atomic_torch_save,
+    cpu_snapshot,
+    referenced_block_ids,
+    snapshot_cache_components,
+)
 from vllm_ascend.utils import (
     enable_sp,
     lmhead_tp_enable,
@@ -77,6 +87,13 @@ class _DraftStepMetadataArena:
     num_computed_tokens_cpu: torch.Tensor
     block_table_tensor: torch.Tensor
     positions: torch.Tensor
+
+
+@dataclass(frozen=True)
+class _MTPDraftDiagnosticContext:
+    proposal_id: int
+    rank: int
+    output_dir: Path
 
 
 # TODO: Remove it when the bug of fx-graph is solved
@@ -208,6 +225,11 @@ class SpecDecodeBaseProposer(EagleProposer):
             _DraftStepMetadataArena
         ] = []
         self._staged_mtp_arena_capacity = 0
+        self._mtp_draft_diag_context: (
+            _MTPDraftDiagnosticContext | None
+        ) = None
+        self._mtp_draft_diag_proposal_id = 0
+        self._draft_attn_layers: dict[str, Any] = {}
 
         self._runnable = self._run_merged_draft
         self.is_multimodal_model = self.vllm_config.model_config.is_multimodal_model
@@ -255,6 +277,10 @@ class SpecDecodeBaseProposer(EagleProposer):
 
         self.attn_layer_names = list(sorted(self._draft_attn_layer_names))
         draft_attn_layers_dict = get_layers_from_vllm_config(self.vllm_config, AttentionLayerBase)
+        self._draft_attn_layers = {
+            layer_name: draft_attn_layers_dict[layer_name]
+            for layer_name in self.attn_layer_names
+        }
         self.kernel_block_size = (
             draft_attn_layers_dict[self.attn_layer_names[0]].get_attn_backend().get_supported_kernel_block_sizes()[0]
         )
@@ -390,6 +416,404 @@ class SpecDecodeBaseProposer(EagleProposer):
         if isinstance(self.model, ACLGraphWrapper):
             return self.model.unwrap()
         return self.model
+
+    @contextmanager
+    def mtp_draft_diagnostic_scope(self):
+        """Fence one live MTP proposal from the preceding target work."""
+        if (
+            self.method != "mtp"
+            or not envs_ascend.VLLM_ASCEND_MTP_DRAFT_DEBUG
+        ):
+            yield
+            return
+
+        self._mtp_draft_diag_proposal_id = getattr(self, "_mtp_draft_diag_proposal_id", 0) + 1
+        proposal_id = self._mtp_draft_diag_proposal_id
+        try:
+            rank = int(get_world_group().rank)
+        except Exception:
+            rank = int(os.getenv("RANK", "-1"))
+        rank_dir = MTP_DRAFT_DIAG_ROOT / (
+            f"rank_{rank}_pid_{os.getpid()}"
+        )
+        output_dir = rank_dir / f"slot_{proposal_id % 2}"
+        context = _MTPDraftDiagnosticContext(
+            proposal_id=proposal_id,
+            rank=rank,
+            output_dir=output_dir,
+        )
+        previous_context = getattr(self, "_mtp_draft_diag_context", None)
+        self._mtp_draft_diag_context = context
+        boundary_path = output_dir / "target_boundary.pt"
+        boundary_payload = {
+            "schema_version": MTP_DRAFT_DIAG_SCHEMA_VERSION,
+            "proposal_id": proposal_id,
+            "rank": rank,
+            "pid": os.getpid(),
+            "phase": "target_boundary_sync_started",
+        }
+        atomic_torch_save(
+            {
+                **boundary_payload,
+                "slot": proposal_id % 2,
+                "output_dir": str(output_dir),
+            },
+            rank_dir / "latest.pt",
+        )
+        for draft_step in range(getattr(self, "num_speculative_tokens", 1)):
+            step_payload = {
+                **boundary_payload,
+                "draft_step": draft_step,
+                "phase": "not_captured_for_current_proposal",
+            }
+            for suffix in ("input", "output", "failure"):
+                atomic_torch_save(
+                    step_payload,
+                    output_dir / f"step_{draft_step}_{suffix}.pt",
+                )
+        atomic_torch_save(boundary_payload, boundary_path)
+        logger.warning(
+            "[MTP_DRAFT_DIAG] proposal=%d target boundary sync started; dump_dir=%s",
+            proposal_id,
+            output_dir,
+        )
+        try:
+            try:
+                torch.npu.synchronize()
+            except Exception as error:
+                atomic_torch_save(
+                    {
+                        **boundary_payload,
+                        "phase": "target_boundary_sync_failed",
+                        "error_type": type(error).__qualname__,
+                        "error": str(error),
+                    },
+                    boundary_path,
+                )
+                logger.exception(
+                    "[MTP_DRAFT_DIAG] proposal=%d failed before entering "
+                    "the drafter; the asynchronous fault belongs to target/"
+                    "sampling work",
+                    proposal_id,
+                )
+                raise
+            atomic_torch_save(
+                {
+                    **boundary_payload,
+                    "phase": "target_boundary_sync_passed",
+                },
+                boundary_path,
+            )
+            logger.warning(
+                "[MTP_DRAFT_DIAG] proposal=%d target boundary sync passed",
+                proposal_id,
+            )
+            yield
+        finally:
+            self._mtp_draft_diag_context = previous_context
+
+    def _mtp_draft_cache_blocks(
+        self,
+        per_layer_attn_metadata: Any,
+    ) -> dict[str, Any]:
+        forward_context = get_forward_context()
+        virtual_engine = int(getattr(forward_context, "virtual_engine", 0))
+        layer_registry = getattr(forward_context, "no_compile_layers", None)
+        if not layer_registry:
+            layer_registry = getattr(self, "_draft_attn_layers", {})
+
+        snapshots: dict[str, Any] = {}
+        for layer_name in self.attn_layer_names:
+            metadata = (
+                per_layer_attn_metadata.get(layer_name)
+                if isinstance(per_layer_attn_metadata, dict)
+                else per_layer_attn_metadata
+            )
+            layer = layer_registry.get(layer_name) if hasattr(layer_registry, "get") else None
+            if layer is None:
+                layer = getattr(self, "_draft_attn_layers", {}).get(layer_name)
+            if layer is None:
+                snapshots[layer_name] = {"error": "layer not found"}
+                continue
+
+            kv_caches = getattr(layer, "kv_cache", None)
+            if isinstance(kv_caches, list):
+                if virtual_engine >= len(kv_caches):
+                    snapshots[layer_name] = {
+                        "error": "virtual engine exceeds kv_cache list",
+                        "virtual_engine": virtual_engine,
+                    }
+                    continue
+                cache = kv_caches[virtual_engine]
+            else:
+                cache = kv_caches
+
+            first_tensor = None
+            if isinstance(cache, torch.Tensor):
+                first_tensor = cache
+            elif isinstance(cache, (tuple, list)):
+                first_tensor = next(
+                    (component for component in cache if isinstance(component, torch.Tensor)),
+                    None,
+                )
+            if first_tensor is None or first_tensor.ndim < 2:
+                snapshots[layer_name] = {
+                    "cache": cpu_snapshot(cache),
+                    "error": "cache has no block dimension",
+                }
+                continue
+            block_size = int(first_tensor.shape[1])
+
+            block_table = getattr(metadata, "block_table", None)
+            seq_lens = getattr(metadata, "seq_lens_cpu", None)
+            if seq_lens is None:
+                seq_lens = getattr(metadata, "seq_lens", None)
+            latent_block_ids = referenced_block_ids(
+                block_table,
+                (
+                    getattr(metadata, "slot_mapping", None),
+                    getattr(metadata, "decode_target_slot_mapping", None),
+                ),
+                block_size,
+                seq_lens,
+            )
+            indexer_block_table = getattr(metadata, "indexer_block_table", None)
+            indexer_block_ids = referenced_block_ids(
+                (indexer_block_table if indexer_block_table is not None else block_table),
+                (getattr(metadata, "indexer_slot_mapping", None),),
+                block_size,
+                seq_lens,
+            )
+            snapshots[layer_name] = {
+                "block_size": block_size,
+                "latent_block_ids": latent_block_ids,
+                "indexer_block_ids": indexer_block_ids,
+                "cache": snapshot_cache_components(
+                    cache,
+                    latent_block_ids=latent_block_ids,
+                    indexer_block_ids=indexer_block_ids,
+                ),
+                "resident_state": self._mtp_draft_resident_state(layer, metadata),
+            }
+
+            indexer_layer_name = layer_name.rsplit(".", 1)[0] + ".indexer.k_cache"
+            indexer_layer = layer_registry.get(indexer_layer_name) if hasattr(layer_registry, "get") else None
+            if indexer_layer is not None:
+                indexer_caches = getattr(indexer_layer, "kv_cache", None)
+                indexer_cache = (
+                    indexer_caches[virtual_engine]
+                    if isinstance(indexer_caches, list) and virtual_engine < len(indexer_caches)
+                    else indexer_caches
+                )
+                snapshots[layer_name]["unbundled_indexer_cache"] = snapshot_cache_components(
+                    indexer_cache,
+                    latent_block_ids=indexer_block_ids,
+                    indexer_block_ids=indexer_block_ids,
+                )
+        return snapshots
+
+    @staticmethod
+    def _mtp_draft_resident_state(
+        layer: Any,
+        metadata: Any,
+    ) -> dict[str, Any] | None:
+        state = getattr(
+            getattr(layer, "impl", None),
+            "_sorted_resident_state",
+            None,
+        )
+        state_indices = getattr(metadata, "resident_state_indices", None)
+        if state is None or state_indices is None:
+            return None
+
+        row_ids = sorted(
+            {int(row_id) for row_id in state_indices.detach().cpu().reshape(-1).tolist() if int(row_id) >= 0}
+        )
+        payload: dict[str, Any] = {
+            "row_ids": row_ids,
+            "dummy_state_base": int(state.dummy_state_base),
+        }
+        for name in ("tokens", "slots", "counts", "generations"):
+            tensor = getattr(state, name)
+            valid_rows = [row_id for row_id in row_ids if row_id < tensor.shape[0]]
+            if valid_rows:
+                indices = torch.tensor(
+                    valid_rows,
+                    dtype=torch.long,
+                    device=tensor.device,
+                )
+                values = tensor.index_select(0, indices)
+                values = values.detach().cpu().clone()
+            else:
+                values = torch.empty(
+                    (0, *tensor.shape[1:]),
+                    dtype=tensor.dtype,
+                    device="cpu",
+                )
+            payload[name] = values
+        return payload
+
+    def _run_mtp_draft_layer_with_diagnostics(
+        self,
+        model_kwargs: dict[str, Any],
+        *,
+        draft_step: int,
+        per_layer_attn_metadata: Any,
+        runtime_inputs: dict[str, Any],
+    ) -> Any:
+        context = getattr(self, "_mtp_draft_diag_context", None)
+        if self.method != "mtp" or context is None:
+            return self.model(**model_kwargs)
+
+        step_prefix = f"step_{draft_step}"
+        input_path = context.output_dir / f"{step_prefix}_input.pt"
+        output_path = context.output_dir / f"{step_prefix}_output.pt"
+        failure_path = context.output_dir / f"{step_prefix}_failure.pt"
+        base_payload = {
+            "schema_version": MTP_DRAFT_DIAG_SCHEMA_VERSION,
+            "proposal_id": context.proposal_id,
+            "draft_step": draft_step,
+            "rank": context.rank,
+            "pid": os.getpid(),
+            "draft_layer_names": list(self.attn_layer_names),
+            "model_type": (f"{type(self.model).__module__}.{type(self.model).__qualname__}"),
+        }
+
+        logger.warning(
+            "[MTP_DRAFT_DIAG] proposal=%d step=%d layer pre-sync started",
+            context.proposal_id,
+            draft_step,
+        )
+        try:
+            torch.npu.synchronize()
+        except Exception as error:
+            atomic_torch_save(
+                {
+                    **base_payload,
+                    "phase": "layer_pre_sync_failed",
+                    "error_type": type(error).__qualname__,
+                    "error": str(error),
+                },
+                failure_path,
+            )
+            logger.exception(
+                "[MTP_DRAFT_DIAG] proposal=%d step=%d failed before "
+                "layer 78; the fault belongs to drafter input preparation",
+                context.proposal_id,
+                draft_step,
+            )
+            raise
+
+        logger.warning(
+            "[MTP_DRAFT_DIAG] proposal=%d step=%d layer pre-sync passed",
+            context.proposal_id,
+            draft_step,
+        )
+        forward_context = get_forward_context()
+        try:
+            input_payload = {
+                **base_payload,
+                "phase": "layer_input",
+                "model_kwargs": cpu_snapshot(model_kwargs),
+                "runtime_inputs": cpu_snapshot(runtime_inputs),
+                "attention_metadata": cpu_snapshot(per_layer_attn_metadata),
+                "forward_context": cpu_snapshot(
+                    {
+                        "virtual_engine": getattr(forward_context, "virtual_engine", 0),
+                        "cudagraph_runtime_mode": getattr(
+                            forward_context,
+                            "cudagraph_runtime_mode",
+                            None,
+                        ),
+                        "num_tokens": getattr(forward_context, "num_tokens", None),
+                        "num_actual_tokens": getattr(forward_context, "num_actual_tokens", None),
+                        "is_draft_model": getattr(forward_context, "is_draft_model", None),
+                    }
+                ),
+                "cache_blocks": self._mtp_draft_cache_blocks(per_layer_attn_metadata),
+            }
+            atomic_torch_save(input_payload, input_path)
+        except Exception as error:
+            atomic_torch_save(
+                {
+                    **base_payload,
+                    "phase": "layer_input_dump_failed",
+                    "error_type": type(error).__qualname__,
+                    "error": str(error),
+                },
+                failure_path,
+            )
+            logger.exception(
+                "[MTP_DRAFT_DIAG] proposal=%d step=%d could not save the layer input",
+                context.proposal_id,
+                draft_step,
+            )
+            raise
+
+        logger.warning(
+            "[MTP_DRAFT_DIAG] proposal=%d step=%d input saved to %s",
+            context.proposal_id,
+            draft_step,
+            input_path,
+        )
+        try:
+            result = self.model(**model_kwargs)
+        except Exception as error:
+            atomic_torch_save(
+                {
+                    **base_payload,
+                    "phase": "layer_call_failed",
+                    "input_path": str(input_path),
+                    "error_type": type(error).__qualname__,
+                    "error": str(error),
+                },
+                failure_path,
+            )
+            logger.exception(
+                "[MTP_DRAFT_DIAG] proposal=%d step=%d layer 78 raised synchronously; input=%s",
+                context.proposal_id,
+                draft_step,
+                input_path,
+            )
+            raise
+
+        try:
+            torch.npu.synchronize()
+        except Exception as error:
+            # Do not touch result or any other NPU tensor after this fence.
+            atomic_torch_save(
+                {
+                    **base_payload,
+                    "phase": "layer_post_sync_failed",
+                    "input_path": str(input_path),
+                    "error_type": type(error).__qualname__,
+                    "error": str(error),
+                },
+                failure_path,
+            )
+            logger.exception(
+                "[MTP_DRAFT_DIAG] proposal=%d step=%d failed after layer 78; layer input is preserved at %s",
+                context.proposal_id,
+                draft_step,
+                input_path,
+            )
+            raise
+
+        atomic_torch_save(
+            {
+                **base_payload,
+                "phase": "layer_output",
+                "output": cpu_snapshot(result),
+            },
+            output_path,
+        )
+        logger.warning(
+            "[MTP_DRAFT_DIAG] proposal=%d step=%d layer post-sync passed; output saved to %s",
+            context.proposal_id,
+            draft_step,
+            output_path,
+        )
+        return result
 
     def seal_staged_mtp_draft_graphs(
         self,
@@ -1078,7 +1502,18 @@ class SpecDecodeBaseProposer(EagleProposer):
             if self.method == "mtp":
                 model_kwargs["positions"] = model_positions
 
-        ret_hidden_states = self.model(**model_kwargs)
+        ret_hidden_states = self._run_mtp_draft_layer_with_diagnostics(
+            model_kwargs,
+            draft_step=0,
+            per_layer_attn_metadata=(multi_steps_attn_metadata[0] if multi_steps_attn_metadata else None),
+            runtime_inputs={
+                "num_input_tokens": num_input_tokens,
+                "batch_size": batch_size,
+                "token_indices_to_sample": token_indices_to_sample,
+                "num_tokens": num_tokens,
+                "is_prefill": is_prefill,
+            },
+        )
         if not self.model_returns_tuple():
             last_hidden_states = ret_hidden_states
             hidden_states = last_hidden_states
@@ -1221,7 +1656,20 @@ class SpecDecodeBaseProposer(EagleProposer):
             if self.pass_hidden_states_to_model:
                 model_kwargs["hidden_states"] = model_hidden_states
 
-            ret_hidden_states = self.model(**model_kwargs)
+            ret_hidden_states = self._run_mtp_draft_layer_with_diagnostics(
+                model_kwargs,
+                draft_step=draft_step + 1,
+                per_layer_attn_metadata=(
+                    multi_steps_attn_metadata[draft_step + 1] if multi_steps_attn_metadata else None
+                ),
+                runtime_inputs={
+                    "num_input_tokens": input_batch_size,
+                    "batch_size": batch_size,
+                    "token_indices_to_sample": (token_indices_to_sample),
+                    "num_tokens": num_tokens,
+                    "is_prefill": is_prefill,
+                },
+            )
             if not self.model_returns_tuple():
                 last_hidden_states = ret_hidden_states
                 hidden_states = last_hidden_states

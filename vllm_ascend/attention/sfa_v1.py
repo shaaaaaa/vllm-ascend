@@ -4,6 +4,7 @@ from contextlib import nullcontext
 from dataclasses import dataclass, field
 from functools import lru_cache
 from threading import Lock
+from time import monotonic
 from typing import TYPE_CHECKING, Any, TypeVar
 
 import numpy as np
@@ -116,6 +117,7 @@ _LMCACHE_SPARSE_WAIT_SYNC_ONCE = os.getenv("VLLM_ASCEND_LMCACHE_SPARSE_WAIT_SYNC
 )
 _lmcache_sparse_wait_sync_once_done = False
 _lmcache_sparse_wait_sync_once_lock = Lock()
+_LMCACHE_LOAD_STAT_INTERVAL_S = 1.0
 
 
 def _mtp_dw_diag_enabled() -> bool:
@@ -1750,6 +1752,14 @@ class AscendSFAImpl(MLAAttentionImpl):
                 getattr(hf_text_config or hf_config, "index_topk", 2048),
             )
         )
+        self._lmcache_load_stat_enabled = bool(
+            envs.VLLM_ASCEND_DSA_LMCACHE_LOAD_STAT
+        )
+        self._lmcache_load_stat_tokens: torch.Tensor | None = None
+        self._lmcache_load_stat_denominator = 0
+        self._lmcache_load_stat_rows = 0
+        self._lmcache_load_stat_calls = 0
+        self._lmcache_load_stat_last_log = monotonic()
         self.wq_b = self.indexer.wq_b
         self.wk = self.indexer.wk
         self.weights_proj = self.indexer.weights_proj
@@ -3363,6 +3373,64 @@ class AscendSFAImpl(MLAAttentionImpl):
             state.register(graph_key, outputs, kv_cache)
         return outputs
 
+    def _record_lmcache_load_stat(
+        self,
+        layer_name: str,
+        selected_counts: torch.Tensor,
+        *,
+        request_count: int,
+        decode_rows: int,
+    ) -> None:
+        """Accumulate actual sparse LMCache misses and periodically report."""
+        if not getattr(self, "_lmcache_load_stat_enabled", False):
+            return
+        request_count = int(request_count)
+        decode_rows = int(decode_rows)
+        if request_count <= 0 or decode_rows <= 0:
+            return
+
+        counts = selected_counts[:request_count]
+        if counts.ndim > 1:
+            counts = counts[..., 0]
+        loaded_tokens = counts.sum(dtype=torch.int64)
+        accumulator = self._lmcache_load_stat_tokens
+        if accumulator is None:
+            self._lmcache_load_stat_tokens = loaded_tokens.detach().clone()
+        else:
+            accumulator.add_(loaded_tokens)
+
+        self._lmcache_load_stat_rows += decode_rows
+        self._lmcache_load_stat_denominator += self.index_topk * decode_rows
+        self._lmcache_load_stat_calls += 1
+
+        now = monotonic()
+        elapsed = now - self._lmcache_load_stat_last_log
+        if elapsed < _LMCACHE_LOAD_STAT_INTERVAL_S:
+            return
+
+        # Diagnostic-only: one deliberate device-to-host scalar sync per layer
+        # and reporting interval. The disabled path never executes a reduction.
+        loaded = int(self._lmcache_load_stat_tokens.item())
+        denominator = self._lmcache_load_stat_denominator
+        logger.info(
+            "[DSA_LMCACHE_LOAD_STAT] layer=%s interval_s=%.3f "
+            "loaded_tokens=%d topk=%d decode_rows=%d topk_tokens=%d "
+            "load_ratio=%.6f calls=%d",
+            layer_name,
+            elapsed,
+            loaded,
+            self.index_topk,
+            self._lmcache_load_stat_rows,
+            denominator,
+            loaded / denominator if denominator else 0.0,
+            self._lmcache_load_stat_calls,
+        )
+        self._lmcache_load_stat_tokens.zero_()
+        self._lmcache_load_stat_denominator = 0
+        self._lmcache_load_stat_rows = 0
+        self._lmcache_load_stat_calls = 0
+        self._lmcache_load_stat_last_log = now
+
     def cross_layer_lmcache_retrieve(
         self,
         layer_name: str,
@@ -3406,6 +3474,13 @@ class AscendSFAImpl(MLAAttentionImpl):
                 selected_token_counts=selected_counts[:request_count],
                 payload_event=producer_event,
             )
+            if getattr(self, "_lmcache_load_stat_enabled", False):
+                self._record_lmcache_load_stat(
+                    layer_name,
+                    selected_counts,
+                    request_count=request_count,
+                    decode_rows=request_count * self.decode_threshold,
+                )
             if _LMCACHE_SPARSE_WAIT_SYNC_ONCE and not _lmcache_sparse_wait_sync_once_done:
                 _sync_compute_stream_after_lmcache_sparse_wait()
             if next_layer_name:
@@ -4246,6 +4321,16 @@ class AscendSFAImpl(MLAAttentionImpl):
                         target_slot_mapping=_target_slot_mapping_for_wait,
                         request_ids=_request_ids_for_wait,
                         selected_token_counts=_selected_token_counts,
+                    )
+                if (
+                    _request_ids_for_wait is not None
+                    and getattr(self, "_lmcache_load_stat_enabled", False)
+                ):
+                    self._record_lmcache_load_stat(
+                        layer_name,
+                        _selected_token_counts,
+                        request_count=len(_request_ids_for_wait),
+                        decode_rows=attn_metadata.num_decode_tokens,
                     )
                 if _LMCACHE_SPARSE_WAIT_SYNC_ONCE and not _lmcache_sparse_wait_sync_once_done:
                     _sync_compute_stream_after_lmcache_sparse_wait()

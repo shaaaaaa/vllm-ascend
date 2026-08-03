@@ -1,4 +1,7 @@
+import os
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -11,6 +14,10 @@ from vllm_ascend.ascend_config import init_ascend_config
 from vllm_ascend.spec_decode.eagle_proposer import (
     AscendEagleProposer,
     SpecDecodeBaseProposer,
+    _MTPDraftDiagnosticContext,
+)
+from vllm_ascend.spec_decode.mtp_draft_diagnostics import (
+    referenced_block_ids,
 )
 
 
@@ -314,6 +321,256 @@ class TestEagleProposerInitialization(TestBase):
 
         self.assertTrue(proposer.use_cuda_graph)
         self.assertTrue(proposer.use_staged_mtp_draft_graph)
+
+class TestMTPDraftDiagnostics(TestBase):
+    @staticmethod
+    def _proposer(output_dir: Path):
+        proposer = SpecDecodeBaseProposer.__new__(SpecDecodeBaseProposer)
+        proposer.method = "mtp"
+        proposer.attn_layer_names = []
+        proposer._draft_attn_layers = {}
+        proposer._mtp_draft_diag_context = _MTPDraftDiagnosticContext(
+            proposal_id=7,
+            rank=3,
+            output_dir=output_dir,
+        )
+        return proposer
+
+    @staticmethod
+    def _model_kwargs():
+        return {
+            "input_ids": torch.tensor([11], dtype=torch.int32),
+            "positions": torch.tensor([5], dtype=torch.int64),
+            "hidden_states": torch.tensor([[2.0, 4.0]]),
+            "inputs_embeds": None,
+        }
+
+    @staticmethod
+    def _fake_forward(**model_kwargs):
+        return model_kwargs["hidden_states"] + model_kwargs["positions"].reshape(-1, 1)
+
+    @patch("vllm_ascend.spec_decode.eagle_proposer.get_forward_context")
+    @patch("vllm_ascend.spec_decode.eagle_proposer.atomic_torch_save")
+    @patch("vllm_ascend.spec_decode.eagle_proposer.torch.npu.synchronize")
+    def test_layer_dump_order(
+        self,
+        synchronize,
+        save,
+        get_context,
+    ):
+        events = []
+        synchronize.side_effect = lambda: events.append("sync")
+        save.side_effect = lambda payload, path: events.append(path.name)
+        get_context.return_value = SimpleNamespace(
+            virtual_engine=0,
+            no_compile_layers={},
+        )
+        with TemporaryDirectory() as temp_dir:
+            proposer = self._proposer(Path(temp_dir))
+
+            def model(**model_kwargs):
+                events.append("model")
+                return self._fake_forward(**model_kwargs)
+
+            proposer.model = model
+            proposer._run_mtp_draft_layer_with_diagnostics(
+                self._model_kwargs(),
+                draft_step=0,
+                per_layer_attn_metadata=None,
+                runtime_inputs={"num_tokens": 1},
+            )
+
+        self.assertEqual(
+            events,
+            [
+                "sync",
+                "step_0_input.pt",
+                "model",
+                "sync",
+                "step_0_output.pt",
+            ],
+        )
+
+    @patch("vllm_ascend.spec_decode.eagle_proposer.atomic_torch_save")
+    @patch(
+        "vllm_ascend.spec_decode.eagle_proposer.torch.npu.synchronize",
+        side_effect=RuntimeError("previous device error"),
+    )
+    def test_layer_pre_sync_failure_does_not_run_model(
+        self,
+        synchronize,
+        save,
+    ):
+        del synchronize
+        with TemporaryDirectory() as temp_dir:
+            proposer = self._proposer(Path(temp_dir))
+            proposer.model = MagicMock()
+            with self.assertRaisesRegex(RuntimeError, "previous device error"):
+                proposer._run_mtp_draft_layer_with_diagnostics(
+                    self._model_kwargs(),
+                    draft_step=0,
+                    per_layer_attn_metadata=None,
+                    runtime_inputs={"num_tokens": 1},
+                )
+
+        proposer.model.assert_not_called()
+        self.assertEqual(save.call_count, 1)
+        self.assertEqual(
+            save.call_args.args[0]["phase"],
+            "layer_pre_sync_failed",
+        )
+
+    @patch("vllm_ascend.spec_decode.eagle_proposer.get_forward_context")
+    @patch(
+        "vllm_ascend.spec_decode.eagle_proposer.torch.npu.synchronize",
+        side_effect=[None, RuntimeError("draft device error")],
+    )
+    def test_layer_post_sync_failure_preserves_input(
+        self,
+        synchronize,
+        get_context,
+    ):
+        del synchronize
+        get_context.return_value = SimpleNamespace(
+            virtual_engine=0,
+            no_compile_layers={},
+        )
+        with TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir)
+            proposer = self._proposer(output_dir)
+            proposer.model = MagicMock(side_effect=self._fake_forward)
+
+            with self.assertRaisesRegex(RuntimeError, "draft device error"):
+                proposer._run_mtp_draft_layer_with_diagnostics(
+                    self._model_kwargs(),
+                    draft_step=0,
+                    per_layer_attn_metadata=None,
+                    runtime_inputs={"num_tokens": 1},
+                )
+
+            self.assertTrue((output_dir / "step_0_input.pt").is_file())
+            self.assertFalse((output_dir / "step_0_output.pt").exists())
+            failure = torch.load(
+                output_dir / "step_0_failure.pt",
+                weights_only=True,
+            )
+            self.assertEqual(failure["phase"], "layer_post_sync_failed")
+            proposer.model.assert_called_once()
+
+    @patch("vllm_ascend.spec_decode.eagle_proposer.get_forward_context")
+    @patch("vllm_ascend.spec_decode.eagle_proposer.torch.npu.synchronize")
+    def test_saved_pt_round_trip_preserves_draft_io(
+        self,
+        synchronize,
+        get_context,
+    ):
+        del synchronize
+        get_context.return_value = SimpleNamespace(
+            virtual_engine=0,
+            no_compile_layers={},
+            cudagraph_runtime_mode=CUDAGraphMode.NONE,
+            num_tokens=1,
+            num_actual_tokens=1,
+            is_draft_model=True,
+        )
+        with TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir)
+            proposer = self._proposer(output_dir)
+            proposer.model = self._fake_forward
+            proposer._run_mtp_draft_layer_with_diagnostics(
+                self._model_kwargs(),
+                draft_step=0,
+                per_layer_attn_metadata=None,
+                runtime_inputs={"num_tokens": 1},
+            )
+
+            saved_input = torch.load(
+                output_dir / "step_0_input.pt",
+                weights_only=True,
+            )
+            saved_output = torch.load(
+                output_dir / "step_0_output.pt",
+                weights_only=True,
+            )
+            replayed = self._fake_forward(**saved_input["model_kwargs"])
+            self.assertTrue(torch.equal(replayed, saved_output["output"]))
+            self.assertEqual(
+                saved_input["proposal_id"],
+                saved_output["proposal_id"],
+            )
+
+    def test_cache_dump_ignores_padded_block_table_entries(self):
+        block_table = torch.tensor(
+            [[10, 11, 99], [20, 98, 97]],
+            dtype=torch.int32,
+        )
+        seq_lens = torch.tensor([9, 4], dtype=torch.int32)
+        slot_mapping = torch.tensor([24], dtype=torch.int32)
+
+        block_ids = referenced_block_ids(
+            block_table,
+            (slot_mapping,),
+            block_size=8,
+            seq_lens=seq_lens,
+        )
+
+        self.assertEqual(block_ids, [3, 10, 11, 20])
+
+    @patch("vllm_ascend.spec_decode.eagle_proposer.torch.npu.synchronize")
+    def test_diagnostic_scope_is_noop_when_debug_is_disabled(
+        self,
+        synchronize,
+    ):
+        proposer = SpecDecodeBaseProposer.__new__(SpecDecodeBaseProposer)
+        proposer.method = "mtp"
+        proposer._mtp_draft_diag_context = None
+
+        with (
+            patch.dict(
+                os.environ,
+                {"VLLM_ASCEND_MTP_DRAFT_DEBUG": "0"},
+            ),
+            proposer.mtp_draft_diagnostic_scope(),
+        ):
+            self.assertIsNone(proposer._mtp_draft_diag_context)
+
+        synchronize.assert_not_called()
+
+    @patch("vllm_ascend.spec_decode.eagle_proposer.get_world_group")
+    @patch(
+        "vllm_ascend.spec_decode.eagle_proposer.torch.npu.synchronize",
+        side_effect=RuntimeError("target device error"),
+    )
+    def test_target_boundary_failure_never_enters_scope(
+        self,
+        synchronize,
+        get_world_group,
+    ):
+        del synchronize
+        get_world_group.return_value.rank = 2
+        proposer = SpecDecodeBaseProposer.__new__(SpecDecodeBaseProposer)
+        proposer.method = "mtp"
+        proposer._mtp_draft_diag_proposal_id = 0
+        proposer._mtp_draft_diag_context = None
+        entered = False
+
+        with (
+            TemporaryDirectory() as temp_dir,
+            patch(
+                "vllm_ascend.spec_decode.eagle_proposer.MTP_DRAFT_DIAG_ROOT",
+                Path(temp_dir),
+            ),
+            patch.dict(
+                os.environ,
+                {"VLLM_ASCEND_MTP_DRAFT_DEBUG": "1"},
+            ),
+            self.assertRaisesRegex(RuntimeError, "target device error"),
+            proposer.mtp_draft_diagnostic_scope(),
+        ):
+            entered = True
+
+        self.assertFalse(entered)
+
 
 @unittest.skip("Skip due to the changes in #7153, fix me later")
 class TestEagleProposerLoadModel(TestBase):
