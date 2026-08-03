@@ -1759,7 +1759,7 @@ def test_sorted_resident_full_path_supports_graph_replay(mtp):
         mtp,
         shard_count,
     )[0]
-    expected_state, _, _ = _reference_step(
+    expected_state, expected_misses, expected_slots = _reference_step(
         expected_shards,
         {},
         capacity,
@@ -1794,6 +1794,15 @@ def test_sorted_resident_full_path_supports_graph_replay(mtp):
     torch.npu.synchronize()
     expected_count = 1948 if mtp == 1 else 2972
     assert int(workspace.miss_counts[0, 0].cpu()) == expected_count
+    _assert_union_outputs(source, boundaries.cpu(), workspace, mtp=mtp)
+    assert workspace.miss_tokens[0, :expected_count].cpu().tolist() == (
+        expected_misses
+    )
+    # This test uses an identity physical block table, so physical target
+    # slots equal the reference logical resident slots.
+    assert workspace.target_slots[0, :expected_count].cpu().tolist() == (
+        expected_slots
+    )
     assert _state_dict(state, 0, shard_count) == expected_state
 
     values.copy_(source.npu())
@@ -1811,7 +1820,8 @@ def test_sorted_resident_full_path_supports_graph_replay(mtp):
 
 
 @pytest.mark.parametrize("mtp", [1, 2])
-def test_sorted_resident_no_remap_graph_replay_completes_state_writeback(mtp):
+@pytest.mark.parametrize("remap", [False, True])
+def test_sorted_resident_split_graph_replay_completes_writeback(mtp, remap):
     requests = 1
     capacity = mtp * INDEX_TOPK
     source = _source(mtp, 0)
@@ -1854,6 +1864,13 @@ def test_sorted_resident_no_remap_graph_replay_completes_state_writeback(mtp):
         {},
         capacity,
     )
+    expected_values = source.clone().reshape(requests, -1)
+    if remap:
+        for position, token in enumerate(expected_values[0].tolist()):
+            row = position // INDEX_TOPK
+            if 0 <= token < int(boundaries_cpu[row]):
+                expected_values[0, position] = expected_state[token]
+    expected_values = expected_values.reshape_as(source)
 
     graph = torch.npu.NPUGraph()
     with torch.npu.graph(graph):
@@ -1876,13 +1893,15 @@ def test_sorted_resident_no_remap_graph_replay_completes_state_writeback(mtp):
             workspace,
             block_size=128,
         )
+        if remap:
+            remap_sorted_resident_cache_(values, workspace)
 
     state.counts.zero_()
     state.generations.fill_(-1)
     graph.replay()
     torch.npu.synchronize()
 
-    assert torch.equal(values.cpu(), source)
+    assert torch.equal(values.cpu(), expected_values)
     assert _state_dict(state, 0, shard_count) == expected_state
 
 

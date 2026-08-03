@@ -592,6 +592,9 @@ public:
                 shardEvictableSlots,
                 evictableCount);
         }
+        // Finalize consumes these payloads according to the cacheline below.
+        // Make the MTE3 payload visible before publishing its valid lengths.
+        Sync<AscendC::HardEvent::MTE3_S>();
         // Host validation reserves one full 64-byte int32 cacheline per
         // (request, shard), so sibling AIVs never share this write line.
         shardCounts_.SetValue(
@@ -1241,6 +1244,9 @@ public:
                 targetSlots,
                 missCount);
         }
+        // Consumers use missCounts as the publication record for all three
+        // MTE3 payloads above, so the payload must complete first.
+        Sync<AscendC::HardEvent::MTE3_S>();
         if (debugStage_ == 10) {
             PublishDebug(
                 blockTable, request, packedEnd,
@@ -1494,6 +1500,9 @@ private:
                 targetSlots,
                 totalMissCount);
         }
+        // State update and LMCache consume these buffers by the count written
+        // below. Preserve payload-before-metadata ordering across kernels.
+        Sync<AscendC::HardEvent::MTE3_S>();
         WriteGlobalScalarVisible(
             missCounts_,
             static_cast<uint64_t>(request) * missCountStride_,
@@ -1537,6 +1546,7 @@ private:
                     * kResidentFinalizeDebugInts],
             debug,
             kResidentFinalizeDebugInts);
+        Sync<AscendC::HardEvent::MTE3_S>();
     }
 
     AscendC::GlobalTensor<int32_t> shardPacked_;
@@ -2422,6 +2432,8 @@ public:
             topkIndices_[requestOffset + begin],
             ranksOrOutput,
             partWidth_);
+        // Sparse attention may consume top-k immediately after this kernel.
+        Sync<AscendC::HardEvent::MTE3_S>();
     }
 
 private:
