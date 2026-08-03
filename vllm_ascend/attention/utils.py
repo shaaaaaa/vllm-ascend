@@ -493,7 +493,6 @@ def wait_for_kv_layer_from_connector(
     target_slot_mapping=None,
     selected_token_counts=None,
     payload_event=None,
-    require_complete_sparse_load: Any = False,
 ):
     if not has_kv_transfer_group() or not is_v1_kv_transfer_group():
         return
@@ -507,11 +506,6 @@ def wait_for_kv_layer_from_connector(
         wait_kwargs["selected_token_counts"] = selected_token_counts
     if payload_event is not None:
         wait_kwargs["payload_event"] = payload_event
-    if require_complete_sparse_load:
-        wait_kwargs["require_complete_sparse_load"] = (
-            require_complete_sparse_load
-        )
-
     if selected_tokens is not None and request_ids is not None and not should_log:
         try:
             connector.wait_for_layer_load(

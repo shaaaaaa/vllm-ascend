@@ -1371,10 +1371,9 @@ class TestStagedSFAGraphPoc(TestBase):
             wait_for_layer.call_args_list[0].kwargs["payload_event"],
             impl._staged_sfa_capture_state.producer_event,
         )
-        self.assertEqual(
-            wait_for_layer.call_args_list[0]
-            .kwargs["require_complete_sparse_load"],
-            frozenset({"req-0"}),
+        self.assertNotIn(
+            "require_complete_sparse_load",
+            wait_for_layer.call_args_list[0].kwargs,
         )
         self.assertEqual(
             wait_for_layer.call_args_list[0]
@@ -1388,42 +1387,6 @@ class TestStagedSFAGraphPoc(TestBase):
             is_dummy_run=False,
             index_topk=impl.index_topk,
             cached_tokens=(4096,),
-        )
-
-    def test_cross_layer_zero_boundary_disables_complete_remap(self):
-        impl = self._make_eligible_impl()
-        metadata = self._make_decode_metadata()
-        context = SimpleNamespace(
-            staged_sfa_graph_key=StagedSFAGraphKey.exact_q1(1),
-            staged_sfa_route=StagedSFARouteDecision(
-                StagedSFARouteAction.STAGED,
-                StagedSFARouteReason.ELIGIBLE,
-                StagedSFAGraphKey.exact_q1(1),
-                (0,),
-            ),
-            staged_sfa_graph_dummy_run=False,
-            attn_metadata={},
-        )
-
-        with patch.object(
-            sfa_v1,
-            "wait_for_kv_layer_from_connector",
-        ) as wait_for_layer:
-            impl.cross_layer_lmcache_retrieve(
-                "layer-0",
-                "",
-                torch.ones(1, 4, dtype=torch.int32),
-                torch.zeros(1, dtype=torch.int32),
-                torch.zeros(1, 4, dtype=torch.long),
-                metadata,
-                context,
-            )
-
-        self.assertEqual(
-            wait_for_layer.call_args.kwargs[
-                "require_complete_sparse_load"
-            ],
-            frozenset(),
         )
 
     def test_cross_layer_dummy_retrieve_only_prepares_next_boundary(self):
