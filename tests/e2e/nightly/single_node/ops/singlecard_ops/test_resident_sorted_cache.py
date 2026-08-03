@@ -76,8 +76,26 @@ def _load_target_sfa_planner_snapshot() -> tuple[dict, dict, Path]:
         pytest.fail(f"paired target input snapshot is missing: {input_path}")
 
     pre = torch.load(pre_path, map_location="cpu", weights_only=False)
+    failure_input_path = os.getenv(
+        "VLLM_ASCEND_TARGET_SFA_REPLAY_FAILURE_INPUT"
+    )
+    if not failure_input_path:
+        pytest.fail(
+            "set VLLM_ASCEND_TARGET_SFA_REPLAY_FAILURE_INPUT to the paired "
+            "layer input snapshot from a rank that reported the device fault"
+        )
+    input_path = Path(failure_input_path)
+    if not input_path.is_file() or not input_path.name.endswith("_input.pt"):
+        pytest.fail(
+            "failure-rank replay input is not a layer input file: "
+            f"{input_path}"
+        )
     layer_input = torch.load(input_path, map_location="cpu", weights_only=False)
-    identity = ("schema_version", "step_id", "rank", "layer")
+    # The failing rank faults before its pre snapshot can be written. Allow its
+    # input/state to be paired with the successful rank's planner intermediates,
+    # but require the same logical forward and layer. Rank is deliberately not
+    # part of this identity check and is reported separately by the test.
+    identity = ("schema_version", "step_id", "layer")
     mismatched = {
         name: (layer_input.get(name), pre.get(name))
         for name in identity
@@ -1849,7 +1867,15 @@ def test_target_sfa_snapshot_replays_production_resident_planner():
     if replay_count <= 0:
         pytest.fail("VLLM_ASCEND_TARGET_SFA_REPLAY_COUNT must be positive")
 
-    device = torch.device("npu")
+    replay_device = os.getenv("VLLM_ASCEND_TARGET_SFA_REPLAY_DEVICE")
+    if not replay_device:
+        pytest.fail(
+            "set VLLM_ASCEND_TARGET_SFA_REPLAY_DEVICE to a failing physical "
+            "device such as npu:5; running this replay implicitly on rank-0's "
+            "device is only a reference and cannot reproduce the reported fault"
+        )
+    device = torch.device(replay_device)
+    torch.npu.set_device(device)
     values = source_cpu.to(device=device)
     source = values.clone()
     boundaries = boundaries_cpu.to(device=device)
@@ -2047,7 +2073,11 @@ def test_target_sfa_snapshot_replays_production_resident_planner():
     saved_mismatches = int((saved_topk != expected_remap).sum())
     print(
         "[target-sfa-resident-replay]"
-        f" snapshot={pre_path} requests={request_count} mtp={mtp}"
+        f" planner_snapshot={pre_path}"
+        f" planner_snapshot_rank={pre.get('rank')}"
+        f" failure_input_rank={layer_input.get('rank')}"
+        f" execution_device={device}"
+        f" requests={request_count} mtp={mtp}"
         f" shards={shard_count} block_size={block_size}"
         f" boundaries={boundaries_cpu.tolist()}"
         f" replays_per_stage={replay_count}"
