@@ -180,6 +180,7 @@ def test_target_sfa_diagnostics_save_layer_io_and_retrieve_state():
     impl.block_size = 4
     impl._sorted_resident_state = None
     impl._sorted_resident_workspace_views = {}
+    impl.index_topk = 2
     impl._staged_sfa_bridge_buffers = (
         torch.arange(8, dtype=torch.float32).reshape(2, 1, 4),
         torch.arange(4, dtype=torch.float32).reshape(2, 1, 2),
@@ -195,7 +196,9 @@ def test_target_sfa_diagnostics_save_layer_io_and_retrieve_state():
     )
     impl._staged_sfa_capture_state = SimpleNamespace(
         runtime=("model.layers.0.self_attn.attn", kv_cache, None, False),
+        remap_boundary=torch.tensor([4, 4], dtype=torch.int32),
     )
+    raw_topk = torch.tensor([[2, 3, 5, 6]], dtype=torch.int32)
     metadata = SimpleNamespace(
         num_actual_tokens=2,
         num_decode_tokens=2,
@@ -204,6 +207,7 @@ def test_target_sfa_diagnostics_save_layer_io_and_retrieve_state():
         decode_req_indices=torch.tensor([0, 0], dtype=torch.int32),
         block_table=torch.tensor([[10, 11, 12, 13]], dtype=torch.int32),
         resident_state_indices=None,
+        decode_union_mapping_workspace=raw_topk,
     )
     context = SimpleNamespace(
         staged_sfa_graph_key=object(),
@@ -288,6 +292,11 @@ def test_target_sfa_diagnostics_save_layer_io_and_retrieve_state():
     assert torch.equal(
         saved_pre["topk_indices"],
         impl._staged_sfa_bridge_buffers[2],
+    )
+    assert torch.equal(saved_pre["raw_topk"], raw_topk.reshape(2, 1, 2))
+    assert torch.equal(
+        saved_pre["remap_boundary"],
+        impl._staged_sfa_capture_state.remap_boundary,
     )
     assert saved_pre["cache_before_lmcache"][0]["physical_block_ids"] == [3, 10, 11]
     assert saved_lmcache["cache_after_lmcache"][0]["physical_block_ids"] == [3, 10, 11]
@@ -1037,6 +1046,41 @@ def test_decode_sparse_planner_routes_only_fixed_decode_to_resident(
     assert actual is expected
     assert impl._prepare_sorted_resident_sparse_cache.called is uses_sorted
     assert ordinary.called is not uses_sorted
+
+
+def test_decode_sparse_planner_debug_snapshots_raw_topk_before_resident():
+    impl = AscendSFAImpl.__new__(AscendSFAImpl)
+    impl.block_size = 128
+    impl.dsa_resident_cache = True
+    expected = (MagicMock(), MagicMock(), MagicMock(), MagicMock())
+    impl._prepare_sorted_resident_sparse_cache = MagicMock(
+        return_value=expected
+    )
+    topk = torch.tensor(
+        [[[7, 8]], [[9, 10]]],
+        dtype=torch.int32,
+    )
+    raw_topk_workspace = torch.full((1, 4), -1, dtype=torch.int32)
+    tensors = [topk, *(MagicMock() for _ in range(8))]
+
+    with patch.dict(
+        os.environ,
+        {"VLLM_ASCEND_MTP_DRAFT_DEBUG": "1"},
+    ):
+        actual = impl._prepare_decode_sparse_indices(
+            *tensors,
+            local_to_union_workspace=raw_topk_workspace,
+            shard_packed_workspace=MagicMock(),
+            shard_mapping_workspace=MagicMock(),
+            shard_counts_workspace=MagicMock(),
+            staged_mtp=2,
+            need_packed=True,
+            clear_invalid_rows=True,
+        )
+
+    assert actual is expected
+    assert torch.equal(raw_topk_workspace, topk.reshape(1, 4))
+    impl._prepare_sorted_resident_sparse_cache.assert_called_once()
 
 
 class TestStagedSFAGraphPoc(TestBase):

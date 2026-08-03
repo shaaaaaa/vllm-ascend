@@ -2922,6 +2922,14 @@ class AscendSFAImpl(MLAAttentionImpl):
             and need_packed
             and staged_mtp is not None
         ):
+            if envs.VLLM_ASCEND_MTP_DRAFT_DEBUG:
+                if local_to_union_workspace is None:
+                    raise RuntimeError(
+                        "target SFA diagnostics require raw top-k workspace"
+                    )
+                local_to_union_workspace.copy_(
+                    topk_indices.reshape_as(local_to_union_workspace)
+                )
             return self._prepare_sorted_resident_sparse_cache(
                 topk_indices,
                 split_boundary,
@@ -3615,6 +3623,8 @@ class AscendSFAImpl(MLAAttentionImpl):
         runtime = self._staged_sfa_capture_state.runtime
         kv_cache = runtime[1] if runtime is not None else None
         workspace = self._sorted_resident_workspace_views.get(request_count)
+        raw_topk = attn_metadata.decode_union_mapping_workspace
+        stable_boundary = self._staged_sfa_capture_state.remap_boundary
         payload = {
             "schema_version": TARGET_SFA_DIAG_SCHEMA_VERSION,
             "step_id": session.step_id,
@@ -3624,6 +3634,20 @@ class AscendSFAImpl(MLAAttentionImpl):
             "layer_name": layer_name,
             "phase": phase,
             "block_size": self.block_size,
+            "raw_topk": (
+                raw_topk[:request_count]
+                .reshape(actual_rows, 1, self.index_topk)
+                .detach()
+                .cpu()
+                .clone()
+                if raw_topk is not None
+                else None
+            ),
+            "remap_boundary": (
+                stable_boundary[:actual_rows].detach().cpu().clone()
+                if stable_boundary is not None
+                else None
+            ),
             "ql_nope": bridge[0][:actual_rows].detach().cpu().clone(),
             "q_pe": bridge[1][:actual_rows].detach().cpu().clone(),
             "topk_indices": bridge[2][:actual_rows].detach().cpu().clone(),

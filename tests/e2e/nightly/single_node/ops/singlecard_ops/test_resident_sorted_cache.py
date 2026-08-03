@@ -13,7 +13,9 @@ from vllm_ascend.distributed.kv_transfer.sparse_offload.resident_sorted_cache im
     debug_sorted_resident_finalize_only_,
     prepare_resident_sharded_union_,
     prepare_sorted_resident_cache_fused_,
+    prepare_sorted_resident_cache_no_remap_,
     probe_sorted_resident_reads_,
+    remap_sorted_resident_cache_,
     resident_shard_count,
 )
 from vllm_ascend.utils import enable_custom_op
@@ -1775,19 +1777,20 @@ def test_sorted_resident_full_path_supports_graph_replay(mtp):
 
 
 def test_target_sfa_snapshot_replays_production_resident_planner():
-    """Replay the layer-0 resident failure with graph-stable saved tensors."""
+    """Bisect the saved layer-0 failure through graph-replayed planner stages."""
     layer_input, pre, pre_path = _load_target_sfa_planner_snapshot()
     metadata = layer_input.get("metadata")
     state_before = layer_input.get("resident_state_before")
-    state_after = pre.get("resident_state_after")
     if not isinstance(metadata, dict) or not isinstance(state_before, dict):
         pytest.fail("target input snapshot lacks metadata or resident state-before")
-    if not isinstance(state_after, dict):
-        pytest.fail("target pre snapshot lacks resident state-after")
 
     fields = _workspace_snapshot_fields(pre)
-    source_cpu = _reconstruct_resident_source_topk(pre).contiguous()
-    expected_topk = pre["topk_indices"].contiguous()
+    raw_topk = pre.get("raw_topk")
+    source_cpu = (
+        raw_topk
+        if isinstance(raw_topk, torch.Tensor)
+        else _reconstruct_resident_source_topk(pre)
+    ).contiguous()
     request_count = int(pre["selected_counts"].shape[0])
     request_width = int(source_cpu.numel()) // request_count
     if request_width % INDEX_TOPK:
@@ -1806,10 +1809,15 @@ def test_target_sfa_snapshot_replays_production_resident_planner():
         pytest.fail(f"target snapshot lacks metadata tensor from {names}")
 
     rows = request_count * mtp
-    boundaries_cpu = metadata_tensor(
-        "decode_remap_boundary",
-        "decode_split_boundary",
-        "split_boundary",
+    raw_boundary = pre.get("remap_boundary")
+    boundaries_cpu = (
+        raw_boundary
+        if isinstance(raw_boundary, torch.Tensor)
+        else metadata_tensor(
+            "decode_remap_boundary",
+            "decode_split_boundary",
+            "split_boundary",
+        )
     )[:rows].to(torch.int32).contiguous()
     row_requests_cpu = (
         metadata_tensor("decode_req_indices")[:rows]
@@ -1837,14 +1845,13 @@ def test_target_sfa_snapshot_replays_production_resident_planner():
             os.getenv("VLLM_ASCEND_TARGET_SFA_REPLAY_BLOCK_SIZE", "128"),
         )
     )
-    replay_count = int(os.getenv("VLLM_ASCEND_TARGET_SFA_REPLAY_COUNT", "32"))
+    replay_count = int(os.getenv("VLLM_ASCEND_TARGET_SFA_REPLAY_COUNT", "8"))
     if replay_count <= 0:
         pytest.fail("VLLM_ASCEND_TARGET_SFA_REPLAY_COUNT must be positive")
 
     device = torch.device("npu")
     values = source_cpu.to(device=device)
     source = values.clone()
-    expected = expected_topk.to(device=device)
     boundaries = boundaries_cpu.to(device=device)
     row_requests = row_requests_cpu.to(device=device)
     request_states = request_states_cpu.to(device=device)
@@ -1870,22 +1877,52 @@ def test_target_sfa_snapshot_replays_production_resident_planner():
         state.generations.fill_(-1)
         _copy_resident_snapshot_(state, state_before)
 
-    def assert_saved_output() -> None:
-        assert torch.equal(values, expected), "planner top-k differs from saved output"
-        rows_device = torch.tensor(
-            state_after["row_indices"],
-            dtype=torch.long,
-            device=device,
-        )
-        for name in ("tokens", "slots", "counts", "generations"):
-            actual = getattr(state, name).index_select(0, rows_device).cpu()
-            assert torch.equal(actual, state_after[name]), (
-                f"planner resident {name} differs from saved output"
-            )
-
     restore_failure_input()
-    graph = torch.npu.NPUGraph()
-    with torch.npu.graph(graph):
+    torch.npu.synchronize()
+    resident_before: list[dict[int, int]] = []
+    for request in range(request_count):
+        state_index = int(request_states_cpu[request])
+        generation = int(request_generations_cpu[request])
+        if (
+            0 <= state_index < dummy_state_base
+            and int(state.generations[state_index, 0].cpu()) == generation
+        ):
+            resident_before.append(
+                _state_dict(state, state_index, shard_count)
+            )
+        else:
+            resident_before.append({})
+
+    expected_shards = _expected_shards(
+        source_cpu,
+        boundaries_cpu,
+        request_count,
+        mtp,
+        shard_count,
+    )
+    expected_states: list[dict[int, int]] = []
+    expected_misses: list[list[int]] = []
+    expected_miss_slots: list[list[int]] = []
+    for request in range(request_count):
+        expected_state, misses, miss_slots = _reference_step(
+            expected_shards[request],
+            resident_before[request],
+            request_width,
+        )
+        expected_states.append(expected_state)
+        expected_misses.append(misses)
+        expected_miss_slots.append(miss_slots)
+
+    expected_remap = source_cpu.reshape(request_count, request_width).clone()
+    for request in range(request_count):
+        for position, token in enumerate(expected_remap[request].tolist()):
+            row = position // INDEX_TOPK
+            boundary = int(boundaries_cpu[request * mtp + row])
+            if 0 <= token < boundary:
+                expected_remap[request, position] = expected_states[request][token]
+    expected_remap = expected_remap.reshape_as(source_cpu)
+
+    def union_body() -> None:
         prepare_resident_sharded_union_(
             values,
             boundaries,
@@ -1896,6 +1933,33 @@ def test_target_sfa_snapshot_replays_production_resident_planner():
             workspace,
             mtp=mtp,
         )
+
+    def finalize_body() -> None:
+        union_body()
+        debug_sorted_resident_finalize_only_(
+            block_table,
+            workspace,
+            block_size=block_size,
+        )
+
+    def no_remap_body() -> None:
+        union_body()
+        prepare_sorted_resident_cache_no_remap_(
+            values,
+            block_table,
+            request_states,
+            request_generations,
+            state,
+            workspace,
+            block_size=block_size,
+        )
+
+    def split_remap_body() -> None:
+        no_remap_body()
+        remap_sorted_resident_cache_(values, workspace)
+
+    def fused_body() -> None:
+        union_body()
         prepare_sorted_resident_cache_fused_(
             values,
             block_table,
@@ -1905,21 +1969,95 @@ def test_target_sfa_snapshot_replays_production_resident_planner():
             workspace,
             block_size=block_size,
         )
-    torch.npu.synchronize()
-    assert_saved_output()
 
+    def assert_union() -> None:
+        _assert_union_outputs(
+            source_cpu,
+            boundaries_cpu,
+            workspace,
+            mtp=mtp,
+        )
+
+    def assert_finalize() -> None:
+        assert_union()
+        for request in range(request_count):
+            miss_count = int(workspace.miss_counts[request, 0].cpu())
+            assert miss_count == len(expected_misses[request])
+            assert (
+                workspace.miss_tokens[request, :miss_count].cpu().tolist()
+                == expected_misses[request]
+            )
+            slots = expected_miss_slots[request]
+            expected_targets = [
+                int(block_table_cpu[request, slot // block_size]) * block_size
+                + slot % block_size
+                for slot in slots
+            ]
+            assert (
+                workspace.target_slots[request, :miss_count].cpu().tolist()
+                == expected_targets
+            )
+
+    def assert_state_updated() -> None:
+        assert_finalize()
+        assert torch.equal(values.cpu(), source_cpu)
+        for request in range(request_count):
+            state_index = int(request_states_cpu[request])
+            if state_index < 0:
+                state_index = state.dummy_state_base + request
+            assert _state_dict(state, state_index, shard_count) == (
+                expected_states[request]
+            )
+
+    def assert_remapped() -> None:
+        assert_finalize()
+        assert torch.equal(values.cpu(), expected_remap)
+        for request in range(request_count):
+            state_index = int(request_states_cpu[request])
+            if state_index < 0:
+                state_index = state.dummy_state_base + request
+            assert _state_dict(state, state_index, shard_count) == (
+                expected_states[request]
+            )
+
+    def run_graph_stage(label: str, body, assertion) -> None:
+        restore_failure_input()
+        print(f"[target-sfa-resident-replay] stage={label} capture started")
+        graph = torch.npu.NPUGraph()
+        with torch.npu.graph(graph):
+            body()
+        torch.npu.synchronize()
+        assertion()
+        print(f"[target-sfa-resident-replay] stage={label} capture passed")
+        for replay in range(replay_count):
+            restore_failure_input()
+            print(
+                f"[target-sfa-resident-replay] stage={label} "
+                f"replay={replay + 1} started"
+            )
+            graph.replay()
+            torch.npu.synchronize()
+            assertion()
+            print(
+                f"[target-sfa-resident-replay] stage={label} "
+                f"replay={replay + 1} passed"
+            )
+
+    saved_topk = pre["topk_indices"].reshape_as(expected_remap)
+    saved_mismatches = int((saved_topk != expected_remap).sum())
     print(
         "[target-sfa-resident-replay]"
         f" snapshot={pre_path} requests={request_count} mtp={mtp}"
         f" shards={shard_count} block_size={block_size}"
-        f" replays={replay_count}"
+        f" boundaries={boundaries_cpu.tolist()}"
+        f" replays_per_stage={replay_count}"
+        f" saved_oracle_mismatches={saved_mismatches}"
     )
-    for replay in range(replay_count):
-        restore_failure_input()
-        graph.replay()
-        torch.npu.synchronize()
-        assert_saved_output()
-        print(f"[target-sfa-resident-replay] replay={replay + 1} passed")
+    run_graph_stage("union", union_body, assert_union)
+    run_graph_stage("finalize", finalize_body, assert_finalize)
+    run_graph_stage("state_update_no_remap", no_remap_body, assert_state_updated)
+    run_graph_stage("standalone_remap", split_remap_body, assert_remapped)
+    run_graph_stage("production_fused", fused_body, assert_remapped)
 
 
 def test_mtp1_decode_6400_boundary_graph_replay_does_not_poison_stream():
