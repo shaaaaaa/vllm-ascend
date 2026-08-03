@@ -49,6 +49,17 @@ from vllm_ascend.attention.mtp_dw_diag import (
     scratch_live_slot_aliases,
     scratch_target_safety,
 )
+from vllm_ascend.attention.target_sfa_diagnostics import (
+    TARGET_SFA_DIAG_SCHEMA_VERSION,
+    active_resident_state_snapshot,
+    atomic_torch_save,
+    cpu_snapshot,
+    target_cache_snapshot,
+    target_metadata_snapshot,
+    target_sfa_path,
+    target_sfa_session,
+    topk_physical_block_ids,
+)
 from vllm_ascend.attention.utils import (
     AscendCommonAttentionMetadata,
     ascend_chunked_prefill_workspace_size,
@@ -3431,6 +3442,279 @@ class AscendSFAImpl(MLAAttentionImpl):
         self._lmcache_load_stat_calls = 0
         self._lmcache_load_stat_last_log = now
 
+    @staticmethod
+    def _target_sfa_debug_is_live(context: Any) -> bool:
+        if (
+            not envs.VLLM_ASCEND_MTP_DRAFT_DEBUG
+            or getattr(context, "staged_sfa_graph_dummy_run", False)
+            or getattr(context, "staged_sfa_graph_key", None) is None
+        ):
+            return False
+        try:
+            return not torch.npu.is_current_stream_capturing()
+        except (AttributeError, RuntimeError):
+            return True
+
+    def _target_sfa_diag_failure(
+        self,
+        session: Any,
+        layer: int,
+        phase: str,
+        error: Exception,
+    ) -> None:
+        payload = {
+            "schema_version": TARGET_SFA_DIAG_SCHEMA_VERSION,
+            "step_id": session.step_id,
+            "rank": session.rank,
+            "pid": os.getpid(),
+            "layer": layer,
+            "phase": phase,
+            "error_type": type(error).__qualname__,
+            "error": str(error),
+        }
+        atomic_torch_save(
+            payload,
+            target_sfa_path(session, layer, f"{phase}_failure"),
+        )
+        atomic_torch_save(
+            payload,
+            session.output_dir.parent / "latest_failure.pt",
+        )
+
+    def target_sfa_diagnostic_boundary(
+        self,
+        layer_name: str,
+        phase: str,
+        tensor: torch.Tensor,
+        attn_metadata: Any,
+        context: Any,
+    ) -> None:
+        """Synchronize and save the graph-external input/output boundary."""
+        if not self._target_sfa_debug_is_live(context):
+            return
+        session, layer = target_sfa_session(
+            context,
+            layer_name,
+            self.tp_rank,
+            begin=phase == "input",
+        )
+        logger.warning(
+            "[TARGET_SFA_DIAG] step=%d layer=%d phase=%s sync started",
+            session.step_id,
+            layer,
+            phase,
+        )
+        try:
+            torch.npu.synchronize()
+        except Exception as error:
+            self._target_sfa_diag_failure(
+                session,
+                layer,
+                phase,
+                error,
+            )
+            logger.exception(
+                "[TARGET_SFA_DIAG] step=%d layer=%d phase=%s sync failed",
+                session.step_id,
+                layer,
+                phase,
+            )
+            raise
+
+        actual_rows = min(
+            int(getattr(attn_metadata, "num_actual_tokens", tensor.shape[0])),
+            int(tensor.shape[0]),
+        )
+        payload = {
+            "schema_version": TARGET_SFA_DIAG_SCHEMA_VERSION,
+            "step_id": session.step_id,
+            "rank": session.rank,
+            "pid": os.getpid(),
+            "layer": layer,
+            "layer_name": layer_name,
+            "phase": phase,
+            "tensor": tensor[:actual_rows].detach().cpu().clone(),
+        }
+        if phase == "input":
+            payload["metadata"] = target_metadata_snapshot(attn_metadata)
+            payload["resident_state_before"] = (
+                active_resident_state_snapshot(
+                    self._sorted_resident_state,
+                    attn_metadata,
+                )
+            )
+        path = target_sfa_path(session, layer, phase)
+        atomic_torch_save(payload, path)
+        logger.warning(
+            "[TARGET_SFA_DIAG] step=%d layer=%d phase=%s sync passed; saved=%s",
+            session.step_id,
+            layer,
+            phase,
+            path,
+        )
+
+    def _target_sfa_diag_pre_retrieve(
+        self,
+        layer_name: str,
+        selected_packed: torch.Tensor,
+        selected_counts: torch.Tensor,
+        target_slots: torch.Tensor,
+        attn_metadata: Any,
+        context: Any,
+        request_count: int,
+    ) -> tuple[Any, int, list[int]] | None:
+        if not self._target_sfa_debug_is_live(context):
+            return None
+        session, layer = target_sfa_session(
+            context,
+            layer_name,
+            self.tp_rank,
+        )
+        phase = "pre"
+        logger.warning(
+            "[TARGET_SFA_DIAG] step=%d layer=%d phase=%s sync started",
+            session.step_id,
+            layer,
+            phase,
+        )
+        try:
+            torch.npu.synchronize()
+        except Exception as error:
+            self._target_sfa_diag_failure(
+                session,
+                layer,
+                phase,
+                error,
+            )
+            logger.exception(
+                "[TARGET_SFA_DIAG] step=%d layer=%d phase=%s sync failed",
+                session.step_id,
+                layer,
+                phase,
+            )
+            raise
+
+        bridge = self._staged_sfa_bridge_buffers
+        if bridge is None:
+            raise RuntimeError(
+                "target SFA diagnostics require initialized bridge buffers"
+            )
+        actual_rows = min(
+            int(getattr(attn_metadata, "num_actual_tokens", bridge[0].shape[0])),
+            int(bridge[0].shape[0]),
+        )
+        block_ids = topk_physical_block_ids(
+            bridge[2],
+            attn_metadata.decode_req_indices,
+            attn_metadata.block_table,
+            target_slots,
+            block_size=self.block_size,
+            actual_rows=actual_rows,
+            request_count=request_count,
+        )
+        runtime = self._staged_sfa_capture_state.runtime
+        kv_cache = runtime[1] if runtime is not None else None
+        workspace = self._sorted_resident_workspace_views.get(request_count)
+        payload = {
+            "schema_version": TARGET_SFA_DIAG_SCHEMA_VERSION,
+            "step_id": session.step_id,
+            "rank": session.rank,
+            "pid": os.getpid(),
+            "layer": layer,
+            "layer_name": layer_name,
+            "phase": phase,
+            "ql_nope": bridge[0][:actual_rows].detach().cpu().clone(),
+            "q_pe": bridge[1][:actual_rows].detach().cpu().clone(),
+            "topk_indices": bridge[2][:actual_rows].detach().cpu().clone(),
+            "selected_packed": (
+                selected_packed[:request_count].detach().cpu().clone()
+            ),
+            "selected_counts": (
+                selected_counts[:request_count].detach().cpu().clone()
+            ),
+            "target_slots": (
+                target_slots[:request_count].detach().cpu().clone()
+            ),
+            "metadata": target_metadata_snapshot(attn_metadata),
+            "resident_state_after": active_resident_state_snapshot(
+                self._sorted_resident_state,
+                attn_metadata,
+            ),
+            "resident_workspace": cpu_snapshot(workspace),
+            "physical_block_ids": block_ids,
+            "cache_before_lmcache": (
+                target_cache_snapshot(kv_cache, block_ids)
+                if kv_cache is not None
+                else None
+            ),
+        }
+        path = target_sfa_path(session, layer, phase)
+        atomic_torch_save(payload, path)
+        logger.warning(
+            "[TARGET_SFA_DIAG] step=%d layer=%d phase=%s sync passed; saved=%s",
+            session.step_id,
+            layer,
+            phase,
+            path,
+        )
+        return session, layer, block_ids
+
+    def _target_sfa_diag_post_retrieve(
+        self,
+        diagnostic: tuple[Any, int, list[int]] | None,
+    ) -> None:
+        if diagnostic is None:
+            return
+        session, layer, block_ids = diagnostic
+        phase = "lmcache"
+        logger.warning(
+            "[TARGET_SFA_DIAG] step=%d layer=%d phase=%s sync started",
+            session.step_id,
+            layer,
+            phase,
+        )
+        try:
+            torch.npu.synchronize()
+        except Exception as error:
+            self._target_sfa_diag_failure(
+                session,
+                layer,
+                phase,
+                error,
+            )
+            logger.exception(
+                "[TARGET_SFA_DIAG] step=%d layer=%d phase=%s sync failed",
+                session.step_id,
+                layer,
+                phase,
+            )
+            raise
+        runtime = self._staged_sfa_capture_state.runtime
+        kv_cache = runtime[1] if runtime is not None else None
+        payload = {
+            "schema_version": TARGET_SFA_DIAG_SCHEMA_VERSION,
+            "step_id": session.step_id,
+            "rank": session.rank,
+            "pid": os.getpid(),
+            "layer": layer,
+            "phase": phase,
+            "physical_block_ids": block_ids,
+            "cache_after_lmcache": (
+                target_cache_snapshot(kv_cache, block_ids)
+                if kv_cache is not None
+                else None
+            ),
+        }
+        path = target_sfa_path(session, layer, phase)
+        atomic_torch_save(payload, path)
+        logger.warning(
+            "[TARGET_SFA_DIAG] step=%d layer=%d phase=%s sync passed; saved=%s",
+            session.step_id,
+            layer,
+            phase,
+            path,
+        )
+
     def cross_layer_lmcache_retrieve(
         self,
         layer_name: str,
@@ -3465,6 +3749,15 @@ class AscendSFAImpl(MLAAttentionImpl):
             if request_ids is None:
                 raise RuntimeError("staged SFA request ids are unavailable")
             request_count = len(request_ids)
+            target_diagnostic = self._target_sfa_diag_pre_retrieve(
+                layer_name,
+                selected_packed,
+                selected_counts,
+                target_slots,
+                attn_metadata,
+                context,
+                request_count,
+            )
             wait_for_kv_layer_from_connector(
                 layer_name,
                 selected_tokens=selected_packed[:request_count],
@@ -3474,6 +3767,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                 selected_token_counts=selected_counts[:request_count],
                 payload_event=producer_event,
             )
+            self._target_sfa_diag_post_retrieve(target_diagnostic)
             if getattr(self, "_lmcache_load_stat_enabled", False):
                 self._record_lmcache_load_stat(
                     layer_name,

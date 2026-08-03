@@ -1,5 +1,7 @@
 import os
 import sys
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -22,6 +24,7 @@ if "torch_npu._inductor" not in sys.modules:
     sys.modules["torch_npu._inductor"] = MagicMock()
 
 import vllm_ascend.attention.sfa_v1 as sfa_v1
+import vllm_ascend.attention.target_sfa_diagnostics as target_diag
 import vllm_ascend.attention.utils as attention_utils
 from vllm_ascend.attention.sfa_v1 import (
     AscendSFABackend,
@@ -169,6 +172,151 @@ def test_lmcache_load_stat_disabled_does_not_touch_tensor_or_clock():
 
     clock.assert_not_called()
     assert impl._lmcache_load_stat_tokens is None
+
+
+def test_target_sfa_diagnostics_save_layer_io_and_retrieve_state():
+    impl = AscendSFAImpl.__new__(AscendSFAImpl)
+    impl.tp_rank = 3
+    impl.block_size = 4
+    impl._sorted_resident_state = None
+    impl._sorted_resident_workspace_views = {}
+    impl._staged_sfa_bridge_buffers = (
+        torch.arange(8, dtype=torch.float32).reshape(2, 1, 4),
+        torch.arange(4, dtype=torch.float32).reshape(2, 1, 2),
+        torch.tensor([[[0, 5]], [[1, 6]]], dtype=torch.int32),
+        torch.tensor([[0, 1, 5, 6]], dtype=torch.int32),
+        torch.tensor([4], dtype=torch.int32),
+        torch.tensor([[12, 13, 14, 15]], dtype=torch.long),
+    )
+    kv_cache = (
+        torch.arange(20 * 4 * 2, dtype=torch.float32).reshape(20, 4, 1, 2),
+        torch.arange(20 * 4, dtype=torch.float32).reshape(20, 4, 1, 1),
+        torch.empty(20, 4, 1, 1),
+    )
+    impl._staged_sfa_capture_state = SimpleNamespace(
+        runtime=("model.layers.0.self_attn.attn", kv_cache, None, False),
+    )
+    metadata = SimpleNamespace(
+        num_actual_tokens=2,
+        num_decode_tokens=2,
+        req_ids=["request-0"],
+        decode_request_ids_compact=["request-0"],
+        decode_req_indices=torch.tensor([0, 0], dtype=torch.int32),
+        block_table=torch.tensor([[10, 11, 12, 13]], dtype=torch.int32),
+        resident_state_indices=None,
+    )
+    context = SimpleNamespace(
+        staged_sfa_graph_key=object(),
+        staged_sfa_graph_dummy_run=False,
+    )
+
+    with (
+        TemporaryDirectory() as temp_dir,
+        patch.dict(
+            os.environ,
+            {"VLLM_ASCEND_MTP_DRAFT_DEBUG": "1"},
+        ),
+        patch.object(
+            target_diag,
+            "MTP_DRAFT_DIAG_ROOT",
+            Path(temp_dir),
+        ),
+        patch.object(
+            sfa_v1.torch.npu,
+            "is_current_stream_capturing",
+            return_value=False,
+        ),
+        patch.object(sfa_v1.torch.npu, "synchronize"),
+    ):
+        input_tensor = torch.arange(6, dtype=torch.float32).reshape(2, 3)
+        impl.target_sfa_diagnostic_boundary(
+            "model.layers.0.self_attn.attn",
+            "input",
+            input_tensor,
+            metadata,
+            context,
+        )
+        diagnostic = impl._target_sfa_diag_pre_retrieve(
+            "model.layers.0.self_attn.attn",
+            impl._staged_sfa_bridge_buffers[3],
+            impl._staged_sfa_bridge_buffers[4],
+            impl._staged_sfa_bridge_buffers[5],
+            metadata,
+            context,
+            1,
+        )
+        impl._target_sfa_diag_post_retrieve(diagnostic)
+        output_tensor = input_tensor + 1
+        impl.target_sfa_diagnostic_boundary(
+            "model.layers.0.self_attn.attn",
+            "output",
+            output_tensor,
+            metadata,
+            context,
+        )
+        target_diag.target_tail_boundary(
+            context._target_sfa_diag_session,
+            "model_forward",
+            output_tensor + 1,
+        )
+
+        session = context._target_sfa_diag_session
+        saved_input = torch.load(
+            target_diag.target_sfa_path(session, 0, "input"),
+            weights_only=True,
+        )
+        saved_pre = torch.load(
+            target_diag.target_sfa_path(session, 0, "pre"),
+            weights_only=True,
+        )
+        saved_lmcache = torch.load(
+            target_diag.target_sfa_path(session, 0, "lmcache"),
+            weights_only=True,
+        )
+        saved_output = torch.load(
+            target_diag.target_sfa_path(session, 0, "output"),
+            weights_only=True,
+        )
+        saved_model_output = torch.load(
+            session.output_dir / "target_model_forward.pt",
+            weights_only=True,
+        )
+
+    assert torch.equal(saved_input["tensor"], input_tensor)
+    assert saved_input["metadata"]["req_ids"] == ["request-0"]
+    assert saved_pre["physical_block_ids"] == [3, 10, 11]
+    assert torch.equal(
+        saved_pre["topk_indices"],
+        impl._staged_sfa_bridge_buffers[2],
+    )
+    assert saved_pre["cache_before_lmcache"][0]["physical_block_ids"] == [3, 10, 11]
+    assert saved_lmcache["cache_after_lmcache"][0]["physical_block_ids"] == [3, 10, 11]
+    assert torch.equal(saved_output["tensor"], output_tensor)
+    assert torch.equal(saved_model_output["value"], output_tensor + 1)
+
+
+def test_target_sfa_diagnostics_skip_dummy_graph_capture():
+    impl = AscendSFAImpl.__new__(AscendSFAImpl)
+    context = SimpleNamespace(
+        staged_sfa_graph_key=object(),
+        staged_sfa_graph_dummy_run=True,
+    )
+    with (
+        patch.dict(
+            os.environ,
+            {"VLLM_ASCEND_MTP_DRAFT_DEBUG": "1"},
+        ),
+        patch.object(sfa_v1.torch.npu, "synchronize") as synchronize,
+    ):
+        impl.target_sfa_diagnostic_boundary(
+            "model.layers.0.self_attn.attn",
+            "input",
+            torch.ones(1, 2),
+            SimpleNamespace(),
+            context,
+        )
+
+    synchronize.assert_not_called()
 
 
 def test_sparse_boundary_gathers_by_request_for_mtp_rows():

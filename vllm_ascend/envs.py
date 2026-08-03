@@ -229,10 +229,11 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_DSA_LMCACHE_LOAD_STAT": lambda: bool(
         int(os.getenv("VLLM_ASCEND_DSA_LMCACHE_LOAD_STAT", "0"))
     ),
-    # Fence the target/MTP-drafter boundary and persist bounded layer-78 tensor
-    # snapshots for crash diagnosis. Default off because the fences serialize
-    # NPU work and the snapshots copy tensors to CPU. Non-sensitive; checked at
-    # every live MTP proposal, although changing it normally requires restart.
+    # Fence every live target-SFA phase plus the target/MTP-drafter boundary,
+    # and persist rolling target-layer and draft-layer tensor snapshots for
+    # crash diagnosis. Default off because the fences serialize NPU work and
+    # the snapshots copy substantial tensor data to CPU/disk. Non-sensitive;
+    # changing it requires restart because it also changes graph partitions.
     "VLLM_ASCEND_MTP_DRAFT_DEBUG": lambda: bool(
         int(os.getenv("VLLM_ASCEND_MTP_DRAFT_DEBUG", "0"))
     ),

@@ -103,6 +103,9 @@ from vllm_ascend.attention.mtp_dw_diag import (
     post_commit_sample_requests,
     scheduled_decode_requests,
 )
+from vllm_ascend.attention.target_sfa_diagnostics import (
+    target_tail_boundary,
+)
 from vllm_ascend.attention.utils import (
     AscendCommonAttentionMetadata,
     get_lmcache_sparse_cached_tokens,
@@ -1994,6 +1997,18 @@ class NPUModelRunner(GPUModelRunner):
             hidden_states = self._model_forward(
                 num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
             )
+            target_diag_session = getattr(
+                get_forward_context(),
+                "_target_sfa_diag_session",
+                None,
+            )
+            if envs_ascend.VLLM_ASCEND_MTP_DRAFT_DEBUG:
+                target_tail_boundary(
+                    target_diag_session,
+                    "model_forward",
+                    hidden_states,
+                )
+            self._target_sfa_diag_session = target_diag_session
             if staged_sfa_graph_key is not None:
                 for _, impl in self._staged_sfa_impls:
                     impl.submit_cross_layer_save()
@@ -2055,6 +2070,13 @@ class NPUModelRunner(GPUModelRunner):
                 )
                 assert broadcasted is not None
                 logits = broadcasted["logits"]
+
+            if envs_ascend.VLLM_ASCEND_MTP_DRAFT_DEBUG:
+                target_tail_boundary(
+                    getattr(self, "_target_sfa_diag_session", None),
+                    "logits",
+                    logits,
+                )
 
             # Apply structured output bitmasks if present
             self.execute_model_state = ExecuteModelState(
@@ -2130,6 +2152,12 @@ class NPUModelRunner(GPUModelRunner):
 
         with record_function_or_nullcontext("sample_token"):
             sampler_output = self._sample(logits, spec_decode_metadata)
+        if envs_ascend.VLLM_ASCEND_MTP_DRAFT_DEBUG:
+            target_tail_boundary(
+                getattr(self, "_target_sfa_diag_session", None),
+                "sampling",
+                sampler_output,
+            )
 
         if self.need_accepted_tokens:
             if self.sampling_done_event is None:
