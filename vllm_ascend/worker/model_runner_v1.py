@@ -5217,9 +5217,17 @@ class NPUModelRunner(GPUModelRunner):
                         "[SFA cross-layer graph] eager warmup/capture was "
                         f"incomplete for {layer_name}: {exc}"
                     ) from exc
+            # The normal retrieve split creates one outer island per target
+            # layer plus the model tail.  Target diagnostics add graph-external
+            # input and output boundaries around every target layer, creating
+            # two additional islands per layer.  Keep the exact-count check so
+            # a genuinely incomplete debug capture still fails at startup.
+            expected_outer_islands = len(self._staged_sfa_impls) + 1
+            if envs_ascend.VLLM_ASCEND_MTP_DRAFT_DEBUG:
+                expected_outer_islands += 2 * len(self._staged_sfa_impls)
             graph_entry_count = ACLGraphWrapper.seal_staged_entries(
                 graph_keys,
-                len(self._staged_sfa_impls) + 1,
+                expected_outer_islands,
             )
             draft_graph_count = 0
             if (

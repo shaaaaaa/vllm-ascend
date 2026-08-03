@@ -1630,6 +1630,63 @@ class TestStagedSFAStartupCaptureValidation(unittest.TestCase):
         seal_entries.assert_called_once_with(graph_keys, 2)
         draft_seal.assert_not_called()
 
+    def test_capture_model_counts_target_debug_split_islands(self):
+        runner = self._build_runner()
+        impls = tuple(
+            (
+                f"layer-{index}",
+                SimpleNamespace(seal_staged_sfa_capture=MagicMock()),
+            )
+            for index in range(3)
+        )
+        with (
+            patch.object(
+                model_runner_module,
+                "staged_sfa_graph_configured",
+                return_value=True,
+            ),
+            patch.object(
+                model_runner_module.envs_ascend,
+                "VLLM_ASCEND_MTP_DRAFT_DEBUG",
+                True,
+            ),
+            patch.object(
+                model_runner_module,
+                "_torch_cuda_wrapper",
+                return_value=nullcontext(),
+            ),
+            patch.object(
+                model_runner_module,
+                "_replace_gpu_model_runner_function_wrapper",
+                return_value=nullcontext(),
+            ),
+            patch.object(runner, "_reset_staged_sfa_startup_capture"),
+            patch.object(
+                model_runner_module.GPUModelRunner,
+                "capture_model",
+                return_value=123,
+            ),
+            patch.object(
+                model_runner_module.ACLGraphWrapper,
+                "seal_staged_entries",
+                return_value=14,
+            ) as seal_entries,
+            patch.object(
+                runner,
+                "_collect_staged_sfa_impls",
+                return_value=impls,
+            ),
+        ):
+            result = runner.capture_model()
+
+        graph_keys = tuple(
+            StagedSFAGraphKey.exact_q1(size) for size in (1, 2)
+        )
+        self.assertEqual(result, 123)
+        # Normal layout: 3 target islands + 1 tail. Diagnostics add an input
+        # and output split around each of the 3 target layers: 4 + 2 * 3 = 10.
+        seal_entries.assert_called_once_with(graph_keys, 10)
+
     def test_collect_staged_sfa_impls_excludes_mtp_draft_layer(self):
         runner = self._build_runner()
         runner.vllm_config.model_config.hf_text_config.num_hidden_layers = 78
