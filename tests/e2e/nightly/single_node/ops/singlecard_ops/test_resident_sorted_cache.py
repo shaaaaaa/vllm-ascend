@@ -1,3 +1,6 @@
+import os
+from pathlib import Path
+
 import pytest
 import torch
 
@@ -47,6 +50,81 @@ def _source(mtp: int, offset: int, requests: int = 1) -> torch.Tensor:
         )
     )
     return rows.repeat(requests, 1).unsqueeze(1)
+
+
+def _load_target_sfa_planner_snapshot() -> tuple[dict, dict, Path]:
+    raw_path = os.getenv("VLLM_ASCEND_TARGET_SFA_REPLAY_SNAPSHOT")
+    if not raw_path:
+        pytest.skip(
+            "set VLLM_ASCEND_TARGET_SFA_REPLAY_SNAPSHOT to a target slot "
+            "directory or layer_NN_pre.pt"
+        )
+    path = Path(raw_path)
+    if path.is_dir():
+        pre_paths = sorted(path.glob("layer_*_pre.pt"))
+        if not pre_paths:
+            pytest.fail(f"target snapshot directory has no layer pre file: {path}")
+        pre_path = pre_paths[0]
+    else:
+        pre_path = path
+    if not pre_path.is_file() or not pre_path.name.endswith("_pre.pt"):
+        pytest.fail(f"target replay snapshot is not a layer pre file: {pre_path}")
+    input_path = pre_path.with_name(pre_path.name.replace("_pre.pt", "_input.pt"))
+    if not input_path.is_file():
+        pytest.fail(f"paired target input snapshot is missing: {input_path}")
+
+    pre = torch.load(pre_path, map_location="cpu", weights_only=False)
+    layer_input = torch.load(input_path, map_location="cpu", weights_only=False)
+    identity = ("schema_version", "step_id", "rank", "layer")
+    mismatched = {
+        name: (layer_input.get(name), pre.get(name))
+        for name in identity
+        if layer_input.get(name) != pre.get(name)
+    }
+    if mismatched:
+        pytest.fail(f"target input/pre snapshot identity mismatch: {mismatched}")
+    return layer_input, pre, pre_path
+
+
+def _workspace_snapshot_fields(pre: dict) -> dict[str, torch.Tensor]:
+    snapshot = pre.get("resident_workspace")
+    if not isinstance(snapshot, dict):
+        pytest.fail("target pre snapshot has no resident_workspace")
+    fields = snapshot.get("fields")
+    if not isinstance(fields, dict):
+        pytest.fail("resident_workspace is not a dataclass snapshot")
+    return fields
+
+
+def _reconstruct_resident_source_topk(pre: dict) -> torch.Tensor:
+    """Invert the saved shard mapping to recover planner input token IDs."""
+    fields = _workspace_snapshot_fields(pre)
+    packed = fields["shard_packed"]
+    mapping = fields["shard_mapping"]
+    remapped = pre["topk_indices"].clone()
+    request_count, shard_count, request_width = mapping.shape
+    source = remapped.reshape(request_count, request_width).clone()
+    assigned = torch.zeros_like(source, dtype=torch.bool)
+
+    for shard in range(shard_count):
+        ranks = mapping[:, shard].to(torch.long)
+        valid = ranks >= 0
+        if torch.any(valid & assigned):
+            pytest.fail("saved shard mapping assigns one source position twice")
+        gathered = packed[:, shard].gather(1, ranks.clamp_min(0))
+        source[valid] = gathered[valid]
+        assigned |= valid
+    return source.reshape_as(remapped)
+
+
+def _copy_resident_snapshot_(state, snapshot: dict) -> None:
+    rows = torch.tensor(snapshot["row_indices"], dtype=torch.long, device="npu")
+    for name in ("tokens", "slots", "counts", "generations"):
+        getattr(state, name).index_copy_(
+            0,
+            rows,
+            snapshot[name].to(device="npu"),
+        )
 
 
 def _expected_shards(
@@ -1694,6 +1772,154 @@ def test_sorted_resident_full_path_supports_graph_replay(mtp):
     graph.replay()
     torch.npu.synchronize()
     assert int(workspace.miss_counts[0, 0].cpu()) == expected_count
+
+
+def test_target_sfa_snapshot_replays_production_resident_planner():
+    """Replay the layer-0 resident failure with graph-stable saved tensors."""
+    layer_input, pre, pre_path = _load_target_sfa_planner_snapshot()
+    metadata = layer_input.get("metadata")
+    state_before = layer_input.get("resident_state_before")
+    state_after = pre.get("resident_state_after")
+    if not isinstance(metadata, dict) or not isinstance(state_before, dict):
+        pytest.fail("target input snapshot lacks metadata or resident state-before")
+    if not isinstance(state_after, dict):
+        pytest.fail("target pre snapshot lacks resident state-after")
+
+    fields = _workspace_snapshot_fields(pre)
+    source_cpu = _reconstruct_resident_source_topk(pre).contiguous()
+    expected_topk = pre["topk_indices"].contiguous()
+    request_count = int(pre["selected_counts"].shape[0])
+    request_width = int(source_cpu.numel()) // request_count
+    if request_width % INDEX_TOPK:
+        pytest.fail(f"saved request width is not a multiple of top-k: {request_width}")
+    mtp = request_width // INDEX_TOPK
+    if mtp not in (1, 2):
+        pytest.fail(f"saved resident planner has unsupported MTP={mtp}")
+    shard_count = int(fields["shard_packed"].shape[1])
+    dummy_state_base = int(state_before["dummy_state_base"])
+
+    def metadata_tensor(*names: str) -> torch.Tensor:
+        for name in names:
+            value = metadata.get(name)
+            if isinstance(value, torch.Tensor):
+                return value
+        pytest.fail(f"target snapshot lacks metadata tensor from {names}")
+
+    rows = request_count * mtp
+    boundaries_cpu = metadata_tensor(
+        "decode_remap_boundary",
+        "decode_split_boundary",
+        "split_boundary",
+    )[:rows].to(torch.int32).contiguous()
+    row_requests_cpu = (
+        metadata_tensor("decode_req_indices")[:rows]
+        .to(torch.int32)
+        .contiguous()
+    )
+    request_states_cpu = (
+        metadata_tensor("resident_state_indices")[:request_count]
+        .to(torch.int32)
+        .contiguous()
+    )
+    request_generations_cpu = (
+        metadata_tensor("resident_state_generations")[:request_count]
+        .to(torch.int64)
+        .contiguous()
+    )
+    block_table_cpu = (
+        metadata_tensor("block_table")[:request_count]
+        .to(torch.int32)
+        .contiguous()
+    )
+    block_size = int(
+        pre.get(
+            "block_size",
+            os.getenv("VLLM_ASCEND_TARGET_SFA_REPLAY_BLOCK_SIZE", "128"),
+        )
+    )
+    replay_count = int(os.getenv("VLLM_ASCEND_TARGET_SFA_REPLAY_COUNT", "32"))
+    if replay_count <= 0:
+        pytest.fail("VLLM_ASCEND_TARGET_SFA_REPLAY_COUNT must be positive")
+
+    device = torch.device("npu")
+    values = source_cpu.to(device=device)
+    source = values.clone()
+    expected = expected_topk.to(device=device)
+    boundaries = boundaries_cpu.to(device=device)
+    row_requests = row_requests_cpu.to(device=device)
+    request_states = request_states_cpu.to(device=device)
+    request_generations = request_generations_cpu.to(device=device)
+    block_table = block_table_cpu.to(device=device)
+    state = allocate_sorted_resident_state(
+        dummy_state_base,
+        request_count,
+        mtp,
+        device=device,
+        shard_count=shard_count,
+    )
+    workspace = allocate_sorted_resident_workspace(
+        request_count,
+        mtp,
+        device=device,
+        shard_count=shard_count,
+    )
+
+    def restore_failure_input() -> None:
+        values.copy_(source)
+        state.counts.zero_()
+        state.generations.fill_(-1)
+        _copy_resident_snapshot_(state, state_before)
+
+    def assert_saved_output() -> None:
+        assert torch.equal(values, expected), "planner top-k differs from saved output"
+        rows_device = torch.tensor(
+            state_after["row_indices"],
+            dtype=torch.long,
+            device=device,
+        )
+        for name in ("tokens", "slots", "counts", "generations"):
+            actual = getattr(state, name).index_select(0, rows_device).cpu()
+            assert torch.equal(actual, state_after[name]), (
+                f"planner resident {name} differs from saved output"
+            )
+
+    restore_failure_input()
+    graph = torch.npu.NPUGraph()
+    with torch.npu.graph(graph):
+        prepare_resident_sharded_union_(
+            values,
+            boundaries,
+            row_requests,
+            request_states,
+            request_generations,
+            state,
+            workspace,
+            mtp=mtp,
+        )
+        prepare_sorted_resident_cache_fused_(
+            values,
+            block_table,
+            request_states,
+            request_generations,
+            state,
+            workspace,
+            block_size=block_size,
+        )
+    torch.npu.synchronize()
+    assert_saved_output()
+
+    print(
+        "[target-sfa-resident-replay]"
+        f" snapshot={pre_path} requests={request_count} mtp={mtp}"
+        f" shards={shard_count} block_size={block_size}"
+        f" replays={replay_count}"
+    )
+    for replay in range(replay_count):
+        restore_failure_input()
+        graph.replay()
+        torch.npu.synchronize()
+        assert_saved_output()
+        print(f"[target-sfa-resident-replay] replay={replay + 1} passed")
 
 
 def test_mtp1_decode_6400_boundary_graph_replay_does_not_poison_stream():

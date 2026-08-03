@@ -3623,6 +3623,7 @@ class AscendSFAImpl(MLAAttentionImpl):
             "layer": layer,
             "layer_name": layer_name,
             "phase": phase,
+            "block_size": self.block_size,
             "ql_nope": bridge[0][:actual_rows].detach().cpu().clone(),
             "q_pe": bridge[1][:actual_rows].detach().cpu().clone(),
             "topk_indices": bridge[2][:actual_rows].detach().cpu().clone(),
