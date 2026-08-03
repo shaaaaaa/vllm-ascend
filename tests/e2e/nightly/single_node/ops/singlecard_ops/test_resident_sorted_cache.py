@@ -2053,8 +2053,10 @@ def test_target_sfa_snapshot_replays_production_resident_planner():
         with torch.npu.graph(graph):
             body()
         torch.npu.synchronize()
-        assertion()
-        print(f"[target-sfa-resident-replay] stage={label} capture passed")
+        # Ascend graph capture records the body but does not execute it. Validate
+        # only after replay; checking here would inspect the zero-initialized
+        # workspace and incorrectly report the union stage as broken.
+        print(f"[target-sfa-resident-replay] stage={label} capture completed")
         for replay in range(replay_count):
             restore_failure_input()
             print(
