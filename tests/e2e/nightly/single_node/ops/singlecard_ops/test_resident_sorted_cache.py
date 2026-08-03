@@ -2,6 +2,7 @@ import pytest
 import torch
 
 from vllm_ascend.distributed.kv_transfer.sparse_offload.resident_sorted_cache import (
+    INDEX_TOPK,
     RESIDENT_FINALIZE_DEBUG_INTS,
     RESIDENT_READ_PROBE_DEBUG_INTS,
     allocate_sorted_resident_state,
@@ -1693,3 +1694,130 @@ def test_sorted_resident_full_path_supports_graph_replay(mtp):
     graph.replay()
     torch.npu.synchronize()
     assert int(workspace.miss_counts[0, 0].cpu()) == expected_count
+
+
+def test_mtp1_decode_6400_boundary_graph_replay_does_not_poison_stream():
+    """Stress the TP-local resident shape from the 6400-token crash."""
+    num_speculative_tokens = 1
+    mtp = 1 + num_speculative_tokens
+    requests = 1
+    block_size = 128
+    activation_boundary = mtp * INDEX_TOPK
+    cached_tokens = 6400
+    stress_replay_pairs = 32
+    capacity = mtp * INDEX_TOPK
+    shard_count = resident_shard_count(mtp)
+
+    # One speculative token produces two target rows. With the production
+    # defaults this is the 4096-slot, eight-shard operator shape from the log.
+    assert capacity == 4096
+    assert shard_count == 8
+
+    def make_source(offset: int, boundary: int) -> torch.Tensor:
+        cached_selection_count = capacity - mtp
+        assert offset + cached_selection_count <= boundary
+        cached_positions = torch.arange(
+            offset,
+            offset + cached_selection_count,
+            dtype=torch.int32,
+        )
+        live_positions = torch.arange(
+            boundary,
+            boundary + mtp,
+            dtype=torch.int32,
+        )
+        return torch.cat((cached_positions, live_positions)).reshape(mtp, 1, INDEX_TOPK)
+
+    warmup_steps = (
+        (0, activation_boundary),
+        (997, 5120),
+        (2048, 6144),
+        (2303, cached_tokens),
+        (0, cached_tokens),
+    )
+    churn_steps = ((2303, cached_tokens), (0, cached_tokens))
+    replay_steps = warmup_steps + churn_steps * stress_replay_pairs
+    unique_steps = tuple(dict.fromkeys(replay_steps))
+    sources = {step: make_source(*step) for step in unique_steps}
+    npu_sources = {step: source.npu() for step, source in sources.items()}
+
+    capture_source = sources[warmup_steps[0]]
+    values = capture_source.npu()
+    boundaries = torch.full(
+        (mtp,),
+        activation_boundary,
+        dtype=torch.int32,
+        device="npu",
+    )
+    row_requests = torch.zeros(mtp, dtype=torch.int32, device="npu")
+    request_states = torch.zeros(requests, dtype=torch.int32, device="npu")
+    request_generations = torch.ones(requests, dtype=torch.int64, device="npu")
+    block_table_cpu = torch.arange(capacity // block_size, dtype=torch.int32).reshape(requests, -1)
+    block_table = block_table_cpu.npu()
+    workspace = allocate_sorted_resident_workspace(requests, mtp, device=torch.device("npu"))
+    state = allocate_sorted_resident_state(requests, requests, mtp, device=torch.device("npu"))
+
+    graph = torch.npu.NPUGraph()
+    with torch.npu.graph(graph):
+        prepare_resident_sharded_union_(
+            values,
+            boundaries,
+            row_requests,
+            request_states,
+            request_generations,
+            state,
+            workspace,
+            mtp=mtp,
+        )
+        prepare_sorted_resident_cache_fused_(
+            values,
+            block_table,
+            request_states,
+            request_generations,
+            state,
+            workspace,
+            block_size=block_size,
+        )
+
+    # Reuse captured tensor addresses and queue every replay before the first
+    # sync, retaining the asynchronous failure pattern from the server log.
+    state.counts.zero_()
+    state.generations.fill_(-1)
+    reference: dict[int, int] = {}
+    expected_misses: list[int] = []
+    expected_slots: list[int] = []
+    final_source = capture_source
+    for step in replay_steps:
+        source = sources[step]
+        boundary = step[1]
+        expected_shards = _expected_shards(
+            source,
+            torch.full((mtp,), boundary, dtype=torch.int32),
+            requests,
+            mtp,
+            shard_count,
+        )[0]
+        reference, expected_misses, expected_slots = _reference_step(
+            expected_shards,
+            reference,
+            capacity,
+        )
+        values.copy_(npu_sources[step])
+        boundaries.fill_(boundary)
+        graph.replay()
+        final_source = source
+
+    torch.npu.synchronize()
+
+    assert _state_dict(state, 0, shard_count) == reference
+    miss_count = int(workspace.miss_counts[0, 0].cpu())
+    assert miss_count == len(expected_misses)
+    assert workspace.miss_tokens[0, :miss_count].cpu().tolist() == expected_misses
+    expected_targets = [
+        int(block_table_cpu[0, slot // block_size]) * block_size + slot % block_size for slot in expected_slots
+    ]
+    assert workspace.target_slots[0, :miss_count].cpu().tolist() == expected_targets
+    remapped = values.reshape(-1).cpu().tolist()
+    assert remapped == [
+        reference[token] if 0 <= token < cached_tokens else token for token in final_source.reshape(-1).tolist()
+    ]
