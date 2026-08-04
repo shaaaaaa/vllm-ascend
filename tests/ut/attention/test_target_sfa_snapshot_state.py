@@ -24,6 +24,15 @@ def _load_snapshot(env_name: str, expected_suffix: str) -> tuple[Path, dict]:
     return path, payload
 
 
+def _load_snapshot_path(path: Path, expected_suffix: str) -> dict:
+    if not path.is_file() or not path.name.endswith(expected_suffix):
+        pytest.fail(f"target SFA snapshot is missing: {path}")
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    if not isinstance(payload, dict):
+        pytest.fail(f"target SFA snapshot is not a dictionary: {path}")
+    return payload
+
+
 def _require_tensor(snapshot: dict, name: str, source: Path) -> torch.Tensor:
     value = snapshot.get(name)
     if not isinstance(value, torch.Tensor):
@@ -93,9 +102,19 @@ def _validated_resident_rows(
             shard_tokens = tokens[local_row, shard, :count].tolist()
             shard_slots = slots[local_row, shard, :count].tolist()
             if shard_tokens != sorted(shard_tokens):
+                inversion = next(
+                    index
+                    for index in range(1, count)
+                    if shard_tokens[index - 1] > shard_tokens[index]
+                )
+                begin = max(inversion - 4, 0)
+                end = min(inversion + 5, count)
                 pytest.fail(
                     f"resident tokens are not sorted in {source}: "
-                    f"row={state_row} shard={shard}"
+                    f"row={state_row} shard={shard} count={count} "
+                    f"first_inversion={inversion - 1}->{inversion} "
+                    f"tokens[{begin}:{end}]={shard_tokens[begin:end]} "
+                    f"slots[{begin}:{end}]={shard_slots[begin:end]}"
                 )
             if len(shard_tokens) != len(set(shard_tokens)):
                 pytest.fail(
@@ -132,6 +151,80 @@ def _validated_resident_rows(
     return shard_count, rows
 
 
+def _validate_union_workspace(pre: dict, source: Path) -> tuple[int, list[list[int]]]:
+    workspace = pre.get("resident_workspace")
+    fields = workspace.get("fields") if isinstance(workspace, dict) else None
+    if not isinstance(fields, dict):
+        pytest.fail(f"target SFA pre snapshot lacks resident workspace: {source}")
+    packed = _require_tensor(fields, "shard_packed", source)
+    counts = _require_tensor(fields, "shard_counts", source)
+    if (
+        packed.ndim != 3
+        or counts.ndim != 3
+        or tuple(counts.shape[:2]) != tuple(packed.shape[:2])
+        or counts.shape[2] < 1
+    ):
+        pytest.fail(
+            f"resident union workspace shapes are invalid in {source}: "
+            f"packed={tuple(packed.shape)} counts={tuple(counts.shape)}"
+        )
+    request_count, shard_count, capacity = packed.shape
+    request_counts: list[list[int]] = []
+    for request in range(request_count):
+        shard_counts: list[int] = []
+        total_count = 0
+        for shard in range(shard_count):
+            count = int(counts[request, shard, 0])
+            if count < 0 or count > capacity:
+                pytest.fail(
+                    f"resident union count is out of range in {source}: "
+                    f"request={request} shard={shard} count={count} "
+                    f"capacity={capacity}"
+                )
+            total_count += count
+            shard_counts.append(count)
+            shard_tokens = packed[request, shard, :count].tolist()
+            if shard_tokens != sorted(shard_tokens):
+                inversion = next(
+                    index
+                    for index in range(1, count)
+                    if shard_tokens[index - 1] > shard_tokens[index]
+                )
+                begin = max(inversion - 4, 0)
+                end = min(inversion + 5, count)
+                pytest.fail(
+                    f"resident union tokens are not sorted in {source}: "
+                    f"request={request} shard={shard} count={count} "
+                    f"first_inversion={inversion - 1}->{inversion} "
+                    f"tokens[{begin}:{end}]={shard_tokens[begin:end]}"
+                )
+            if len(shard_tokens) != len(set(shard_tokens)):
+                pytest.fail(
+                    f"resident union tokens are duplicated in {source}: "
+                    f"request={request} shard={shard}"
+                )
+            wrong_shard = next(
+                (
+                    int(token)
+                    for token in shard_tokens
+                    if int(token) < 0 or int(token) % shard_count != shard
+                ),
+                None,
+            )
+            if wrong_shard is not None:
+                pytest.fail(
+                    f"resident union token is in the wrong shard in {source}: "
+                    f"request={request} shard={shard} token={wrong_shard}"
+                )
+        if total_count > capacity:
+            pytest.fail(
+                f"resident union exceeds scratch capacity in {source}: "
+                f"request={request} count={total_count} capacity={capacity}"
+            )
+        request_counts.append(shard_counts)
+    return shard_count, request_counts
+
+
 def test_target_sfa_resident_state_is_continuous_before_failure():
     """Validate the saved state transition immediately before graph failure."""
     previous_path, previous = _load_snapshot(
@@ -165,14 +258,55 @@ def test_target_sfa_resident_state_is_continuous_before_failure():
             f"previous={previous_step} current={current_step}"
         )
 
+    previous_input_path = previous_path.with_name(
+        previous_path.name.replace("_pre.pt", "_input.pt")
+    )
+    previous_input = _load_snapshot_path(previous_input_path, "_input.pt")
+    previous_input_mismatches = {
+        name: (previous_input.get(name), previous.get(name))
+        for name in ("schema_version", "step_id", "rank", "layer", "layer_name")
+        if previous_input.get(name) != previous.get(name)
+    }
+    if previous_input_mismatches:
+        pytest.fail(
+            "previous target SFA input/pre snapshots do not match: "
+            f"{previous_input_mismatches}"
+        )
+
+    input_shards, input_rows = _validated_resident_rows(
+        previous_input.get("resident_state_before"),
+        previous_input_path,
+    )
+    print(
+        "[target-sfa-state-transition] previous input state passed:"
+        f" step={previous_step} shards={input_shards}"
+        f" resident_counts="
+        f"{{{', '.join(f'{row}: {len(state[1])}' for row, state in input_rows.items())}}}"
+    )
+    union_shards, union_counts = _validate_union_workspace(
+        previous,
+        previous_path,
+    )
+    print(
+        "[target-sfa-state-transition] previous union workspace passed:"
+        f" step={previous_step} shards={union_shards}"
+        f" shard_counts={union_counts}"
+    )
+
     previous_shards, previous_rows = _validated_resident_rows(
         previous.get("resident_state_after"),
         previous_path,
+    )
+    print(
+        "[target-sfa-state-transition] previous output state passed:"
+        f" step={previous_step} shards={previous_shards}"
     )
     current_shards, current_rows = _validated_resident_rows(
         current.get("resident_state_before"),
         current_path,
     )
+    assert input_shards == previous_shards
+    assert union_shards == previous_shards
     assert current_shards == previous_shards
     assert current_rows.keys() == previous_rows.keys()
     for state_row, previous_state in previous_rows.items():
