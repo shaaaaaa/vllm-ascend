@@ -1712,18 +1712,21 @@ public:
             + shard * shardCountStride_;
         const int64_t requestedGeneration =
             ReadGlobalScalarFresh(requestStateGenerations_, request);
-        const uint64_t oldCountOffset =
-            static_cast<uint64_t>(safeState)
-                * shardCountRequestStride_
-            + shard * shardCountStride_;
-        const uint32_t oldCount = static_cast<uint32_t>(
-            ReadGlobalScalarFresh(stateCounts_, oldCountOffset));
-        // Refresh once at the cacheline base; selectedEvictCount shares it.
+        // Union already resolved the request generation and published the
+        // authoritative old prefix length in this invocation's private
+        // workspace. Do not re-read the persistent count here: on generation
+        // rollover another AICore can still hold the previous graph replay's
+        // scalar cacheline and resurrect a stale count after union reset it.
+        // Refresh the workspace cacheline once, then consume all fields from
+        // that same immutable invocation record.
         const uint32_t currentCount = static_cast<uint32_t>(
             ReadGlobalScalarFresh(shardCounts_, requestCountOffset));
         const uint32_t selectedEvictCount = static_cast<uint32_t>(
             shardCounts_.GetValue(
                 requestCountOffset + kShardSelectedEvictCount));
+        const uint32_t oldCount = static_cast<uint32_t>(
+            shardCounts_.GetValue(
+                requestCountOffset + kShardOldCount));
         const uint64_t requestShardBase =
             static_cast<uint64_t>(request) * shardCount_ * capacity_;
         const uint64_t requestShardOffset =
@@ -1873,18 +1876,16 @@ public:
             + shard * shardCountStride_;
         const int64_t requestedGeneration =
             ReadGlobalScalarFresh(requestStateGenerations_, request);
-        const uint64_t oldCountOffset =
-            static_cast<uint64_t>(safeState)
-                * shardCountRequestStride_
-            + shard * shardCountStride_;
-        const uint32_t oldCount = static_cast<uint32_t>(
-            ReadGlobalScalarFresh(stateCounts_, oldCountOffset));
-        // Refresh once at the cacheline base; selectedEvictCount shares it.
+        // Match Process(): union's per-invocation old count is authoritative,
+        // especially when a generation rollover invalidates persistent state.
         const uint32_t currentCount = static_cast<uint32_t>(
             ReadGlobalScalarFresh(shardCounts_, requestCountOffset));
         const uint32_t selectedEvictCount = static_cast<uint32_t>(
             shardCounts_.GetValue(
                 requestCountOffset + kShardSelectedEvictCount));
+        const uint32_t oldCount = static_cast<uint32_t>(
+            shardCounts_.GetValue(
+                requestCountOffset + kShardOldCount));
         const uint64_t requestShardBase =
             static_cast<uint64_t>(request) * shardCount_ * capacity_;
         const uint64_t requestShardOffset =

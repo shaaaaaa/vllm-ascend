@@ -581,6 +581,98 @@ def test_fused_union_intersection_and_generation_invalidation(mtp):
 
 
 @pytest.mark.parametrize("mtp", [1, 2])
+def test_fused_update_trusts_union_old_count_on_generation_rollover(mtp):
+    """A stale persistent count must not resurrect invalidated state."""
+    requests = 1
+    shard_count = resident_shard_count(mtp)
+    capacity = mtp * 2048
+    source = _source(mtp, 0)
+    boundaries = torch.full((mtp,), 1600, dtype=torch.int32)
+    row_requests = torch.zeros(mtp, dtype=torch.int32, device="npu")
+    request_states = torch.zeros(1, dtype=torch.int32, device="npu")
+    request_generations = torch.full((1,), 8, dtype=torch.int64, device="npu")
+    workspace = allocate_sorted_resident_workspace(
+        requests, mtp, device=torch.device("npu")
+    )
+    state = allocate_sorted_resident_state(
+        requests, requests, mtp, device=torch.device("npu")
+    )
+    block_table = torch.arange(
+        capacity // 128,
+        dtype=torch.int32,
+        device="npu",
+    ).reshape(1, -1)
+
+    stale_shards = [
+        [100_000 + shard + index * shard_count for index in range(8)]
+        for shard in range(shard_count)
+    ]
+    stale_resident = {
+        token: slot
+        for slot, token in enumerate(
+            token for shard in stale_shards for token in shard
+        )
+    }
+    _seed_resident_state(
+        state,
+        state_index=0,
+        generation=7,
+        shards=stale_shards,
+        resident=stale_resident,
+    )
+
+    values = source.npu()
+    prepare_resident_sharded_union_(
+        values,
+        boundaries.npu(),
+        row_requests,
+        request_states,
+        request_generations,
+        state,
+        workspace,
+        mtp=mtp,
+    )
+    torch.npu.synchronize()
+    assert torch.all(workspace.shard_counts[0, :, 3].cpu() == 0)
+    assert torch.all(state.counts[0, :, 0].cpu() == 0)
+
+    # Model the stale scalar cacheline observed in the production graph: GM
+    # contains an obsolete nonzero count even though union's generation-aware
+    # workspace correctly records an empty old prefix for this invocation.
+    for shard in range(shard_count):
+        state.counts[0, shard, 0] = len(stale_shards[shard])
+
+    expected_shards = _expected_shards(
+        source,
+        boundaries,
+        requests,
+        mtp,
+        shard_count,
+    )[0]
+    expected_state, expected_misses, expected_slots = _reference_step(
+        expected_shards,
+        {},
+        capacity,
+    )
+    prepare_sorted_resident_cache_fused_(
+        values,
+        block_table,
+        request_states,
+        request_generations,
+        state,
+        workspace,
+        block_size=128,
+    )
+    torch.npu.synchronize()
+
+    assert _state_dict(state, 0, shard_count) == expected_state
+    miss_count = int(workspace.miss_counts[0, 0].cpu())
+    assert workspace.miss_tokens[0, :miss_count].cpu().tolist() == expected_misses
+    assert workspace.target_slots[0, :miss_count].cpu().tolist() == expected_slots
+    assert int(state.generations[0, 0].cpu()) == 8
+
+
+@pytest.mark.parametrize("mtp", [1, 2])
 def test_shard_intersection_compacts_misses_and_evictable_slots(mtp):
     requests = 1
     shard_count = resident_shard_count(mtp)
