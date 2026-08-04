@@ -512,6 +512,109 @@ def _build_report(
     }
 
 
+def _compact_state_row(
+    row: dict[str, Any],
+    current_counts: list[int] | None = None,
+) -> dict[str, Any]:
+    shards = []
+    for shard in row["shards"]:
+        tokens = shard["tokens"]
+        slots = shard["slots"]
+        inversion = shard["first_inversion"]
+        inversion_begin = max((inversion or 0) - 4, 0)
+        inversion_end = min((inversion or 0) + 5, len(tokens))
+        current_count = (
+            current_counts[shard["shard"]]
+            if current_counts is not None
+            else None
+        )
+        boundary_begin = max((current_count or 0) - 4, 0)
+        boundary_end = min((current_count or 0) + 5, len(tokens))
+        shards.append(
+            {
+                "shard": shard["shard"],
+                "count": shard["count"],
+                "sorted": shard["sorted"],
+                "first_inversion": inversion,
+                "first8_tokens": tokens[:8],
+                "last8_tokens": tokens[-8:],
+                "first8_slots": slots[:8],
+                "last8_slots": slots[-8:],
+                "tokens_near_inversion": tokens[
+                    inversion_begin:inversion_end
+                ],
+                "slots_near_inversion": slots[
+                    inversion_begin:inversion_end
+                ],
+                "union_current_count": current_count,
+                "tokens_near_union_count": tokens[
+                    boundary_begin:boundary_end
+                ],
+                "slots_near_union_count": slots[
+                    boundary_begin:boundary_end
+                ],
+            }
+        )
+    return {
+        "generation": row["generation"],
+        "total_count": row["total_count"],
+        "shards": shards,
+    }
+
+
+def _compact_report(report: dict[str, Any]) -> dict[str, Any]:
+    captured = report["captured"]
+    before_rows = captured["resident_state_before"]
+    after_rows = captured["resident_state_after"]
+    analyses = []
+    for analysis in report["analysis"]:
+        current_counts = [
+            shard["counts"]["current"] for shard in analysis["union"]
+        ]
+        safe_state = analysis["safe_state"]
+        analyses.append(
+            {
+                "request": analysis["request"],
+                "state_index": analysis["state_index"],
+                "safe_state": safe_state,
+                "stored_generation_before": analysis[
+                    "stored_generation_before"
+                ],
+                "requested_generation": analysis["requested_generation"],
+                "generation_matches": analysis["generation_matches"],
+                "stored_generation_after": analysis[
+                    "stored_generation_after"
+                ],
+                "persistent_counts_before": analysis[
+                    "persistent_counts_before"
+                ],
+                "persistent_counts_after": analysis[
+                    "persistent_counts_after"
+                ],
+                "union": analysis["union"],
+                "miss_tokens": analysis["miss_tokens"],
+                "target_slots": analysis["target_slots"],
+                "resident_state_after": analysis[
+                    "resident_state_after"
+                ],
+                "remapped_topk": analysis["remapped_topk"],
+                "state_before_detail": _compact_state_row(
+                    before_rows[safe_state]
+                ),
+                "state_after_detail": _compact_state_row(
+                    after_rows[safe_state],
+                    current_counts,
+                ),
+            }
+        )
+    return {
+        "files": report["files"],
+        "identity": report["identity"],
+        "shape": report["shape"],
+        "analysis": analyses,
+    }
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input", type=Path, required=True)
@@ -521,6 +624,11 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         help="write JSON here instead of stdout",
     )
+    parser.add_argument(
+        "--summary-only",
+        action="store_true",
+        help="omit full tensors and retain only counts and mismatch windows",
+    )
     return parser.parse_args()
 
 
@@ -529,6 +637,8 @@ def main() -> int:
     layer_input = _load(args.input)
     pre = _load(args.pre)
     report = _build_report(args.input, args.pre, layer_input, pre)
+    if args.summary_only:
+        report = _compact_report(report)
     text = json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True)
     if args.output is None:
         print(text)
