@@ -109,6 +109,7 @@ class TestSchedulerDynamicBatch(TestBase):
             disable_chunked_mm_input=False,
             enable_chunked_prefill=True,
             max_num_batched_tokens=MAX_NUM_BATCHED_TOKENS,
+            is_encoder_decoder=False,
         )
 
         scheduler_config.max_num_encoder_input_tokens = 10000
@@ -118,7 +119,6 @@ class TestSchedulerDynamicBatch(TestBase):
 
         model_config = ModelConfig(
             model=MODEL,
-            task="auto",
             tokenizer=MODEL,
             tokenizer_mode="auto",
             trust_remote_code=True,
@@ -128,8 +128,12 @@ class TestSchedulerDynamicBatch(TestBase):
         )
         model_config.pooler_config = MagicMock()
         model_config.multimodal_config = MagicMock()
-        model_config.hf_text_config = MagicMock()
-        model_config.hf_text_config.is_encoder_decoder = False
+        model_config.hf_config = MagicMock()
+        model_config.hf_config.is_encoder_decoder = False
+        model_config.hf_config.get_text_config.return_value = (
+            model_config.hf_config
+        )
+        model_config.hf_text_config = model_config.hf_config
         # Cache config, optionally force APC
         kwargs_cache: Dict[str,
                            Any] = ({} if ENABLE_PREFIX_CACHING is None else {
@@ -139,7 +143,6 @@ class TestSchedulerDynamicBatch(TestBase):
         cache_config = CacheConfig(
             block_size=block_size,
             gpu_memory_utilization=0.9,
-            swap_space=0,
             cache_dtype="auto",
             **kwargs_cache,
         )
