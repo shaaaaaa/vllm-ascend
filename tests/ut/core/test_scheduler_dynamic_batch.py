@@ -98,7 +98,7 @@ class TestSchedulerDynamicBatch(TestBase):
 
     @patch("vllm.config.ModelConfig.__post_init__", MagicMock())
     @patch("vllm.config.VllmConfig.__post_init__", MagicMock())
-    def create_scheduler(self):
+    def create_scheduler(self, *, multimodal: bool = True):
         use_kv_connector = False
         block_size = 16
 
@@ -127,7 +127,7 @@ class TestSchedulerDynamicBatch(TestBase):
             max_model_len=MAX_NUM_BATCHED_TOKENS,
         )
         model_config.pooler_config = MagicMock()
-        model_config.multimodal_config = MagicMock()
+        model_config.multimodal_config = MagicMock() if multimodal else None
         model_config.hf_config = MagicMock()
         model_config.hf_config.is_encoder_decoder = False
         model_config.hf_config.get_text_config.return_value = (
@@ -171,8 +171,10 @@ class TestSchedulerDynamicBatch(TestBase):
             kv_cache_tensors=[],
             kv_cache_groups=[
                 KVCacheGroupSpec(['layer'],
-                                 FullAttentionSpec(block_size, 1, 1,
-                                                   torch.float32, False))
+                                 FullAttentionSpec(block_size=block_size,
+                                                   num_kv_heads=1,
+                                                   head_size=1,
+                                                   dtype=torch.float32))
             ],
         )
         kv_cache_config.hash_block_size = block_size
@@ -252,7 +254,7 @@ class TestSchedulerDynamicBatch(TestBase):
             self.assertEqual(scheduler.running[i], request)
 
     def test_async_external_load_forwards_compact_allocation(self):
-        scheduler = self.create_scheduler()
+        scheduler = self.create_scheduler(multimodal=False)
         request = create_requests(num_requests=1)[0]
         scheduler.add_request(request)
         scheduler.connector = MagicMock()
