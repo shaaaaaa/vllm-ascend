@@ -729,7 +729,8 @@ class TestLMCacheSparseFrontier(TestBase):
                     load_spec=SimpleNamespace(
                         can_load=True,
                         lmcache_cached_tokens=8193,
-                        dsa_committed_end=8192,
+                        dsa_committed_end=8193,
+                        dsa_remap_frontier=8192,
                         dsa_cold_compact_load=False,
                     ),
                 )

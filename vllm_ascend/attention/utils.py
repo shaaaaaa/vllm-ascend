@@ -366,9 +366,15 @@ def _dsa_remap_frontier(load_spec: Any) -> int:
     """Derive the operator boundary without changing LMCache commit progress."""
     if load_spec is None or not getattr(load_spec, "can_load", False):
         return 0
+    remap_value = getattr(load_spec, "dsa_remap_frontier", None)
     committed_value = (
-        getattr(load_spec, "dsa_committed_end", None)
-        if getattr(load_spec, "dsa_committed_end", None) is not None
+        remap_value
+        if remap_value is not None
+        else getattr(load_spec, "dsa_committed_end", None)
+    )
+    committed_value = (
+        committed_value
+        if committed_value is not None
         else getattr(load_spec, "lmcache_cached_tokens", 0)
     )
     committed_end = int(committed_value or 0)
