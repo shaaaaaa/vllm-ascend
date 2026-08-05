@@ -350,6 +350,7 @@ class SchedulerDynamicBatch(Scheduler):
 
                 num_external_computed_tokens = 0
                 load_kv_async = False
+                dsa_compact_external_load = False
 
                 # Get already-cached tokens.
                 if request.num_computed_tokens == 0:
@@ -372,12 +373,27 @@ class SchedulerDynamicBatch(Scheduler):
                             skipped_waiting_requests.prepend_request(request)
                             continue
 
+                        request.num_external_computed_tokens = (
+                            num_external_computed_tokens
+                        )
+                        dsa_compact_external_load = load_kv_async and bool(
+                            getattr(
+                                self.connector,
+                                "supports_dsa_compact_external_load",
+                                False,
+                            )
+                        )
+
                     # Total computed tokens (local + external).
-                    num_computed_tokens = num_new_local_computed_tokens + num_external_computed_tokens
+                    num_computed_tokens = (
+                        num_new_local_computed_tokens
+                        + num_external_computed_tokens
+                    )
+                    assert num_computed_tokens <= request.num_tokens
                 # KVTransfer: WAITING reqs have num_computed_tokens > 0
                 # after async KV recvs are completed.
                 else:
-                    new_computed_blocks = self.kv_cache_manager.create_empty_block_list()
+                    new_computed_blocks = self.kv_cache_manager.empty_kv_cache_blocks
                     num_new_local_computed_tokens = 0
                     num_computed_tokens = request.num_computed_tokens
 
@@ -437,12 +453,14 @@ class SchedulerDynamicBatch(Scheduler):
 
                 new_blocks = self.kv_cache_manager.allocate_slots(
                     request,
-                    num_new_tokens + num_external_computed_tokens,
-                    num_new_local_computed_tokens,
-                    new_computed_blocks,
+                    num_new_tokens,
+                    num_new_computed_tokens=num_new_local_computed_tokens,
+                    new_computed_blocks=new_computed_blocks,
                     num_lookahead_tokens=effective_lookahead_tokens,
+                    num_external_computed_tokens=num_external_computed_tokens,
                     delay_cache_blocks=load_kv_async,
                     num_encoder_tokens=num_encoder_tokens,
+                    dsa_compact_external_load=dsa_compact_external_load,
                 )
 
                 if new_blocks is None:
@@ -456,7 +474,7 @@ class SchedulerDynamicBatch(Scheduler):
                 if self.connector is not None:
                     self.connector.update_state_after_alloc(
                         request,
-                        new_computed_blocks + new_blocks,
+                        self.kv_cache_manager.get_blocks(request.request_id),
                         num_external_computed_tokens,
                     )
 
@@ -468,6 +486,7 @@ class SchedulerDynamicBatch(Scheduler):
                     # into the WAITING_FOR_REMOTE_KV state.
                     skipped_waiting_requests.prepend_request(request)
                     request.status = RequestStatus.WAITING_FOR_REMOTE_KVS
+                    request.num_computed_tokens = num_computed_tokens
                     continue
 
                 req_index += 1

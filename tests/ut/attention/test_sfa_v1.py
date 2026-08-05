@@ -720,6 +720,34 @@ class TestLMCacheSparseFrontier(TestBase):
             (StagedSFARouteReason.ELIGIBLE, (0, 8192)),
         )
 
+    def test_cold_compact_resume_excludes_recomputed_last_prompt_token(self):
+        metadata = SimpleNamespace(
+            requests=[
+                SimpleNamespace(
+                    req_id="cold-compact",
+                    is_sparse_decode=True,
+                    load_spec=SimpleNamespace(
+                        can_load=True,
+                        lmcache_cached_tokens=8193,
+                        dsa_committed_end=8192,
+                        dsa_cold_compact_load=False,
+                    ),
+                )
+            ]
+        )
+
+        self.assertEqual(
+            attention_utils.staged_sfa_metadata_sparse_load(
+                metadata,
+                ["cold-compact"],
+            ),
+            (StagedSFARouteReason.ELIGIBLE, (8192,)),
+        )
+        self.assertEqual(
+            self._remap_frontiers(metadata, ["cold-compact"]),
+            [8192],
+        )
+
     def test_mixed_load_requires_every_row_to_be_loadable(self):
         metadata = SimpleNamespace(
             requests=[
@@ -891,6 +919,16 @@ class TestLMCacheSparseFrontier(TestBase):
                 6,
                 pure_decode=True,
             )
+
+    def test_fixed_staged_decode_layout_falls_back_for_dp_padding(self):
+        self.assertIsNone(
+            sfa_v1._fixed_staged_decode_mtp(
+                [0] + [-1] * 72,
+                1,
+                73,
+                pure_decode=True,
+            )
+        )
 
 
 @pytest.mark.parametrize("mtp", [1, 2])

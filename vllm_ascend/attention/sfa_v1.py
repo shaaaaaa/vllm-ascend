@@ -646,11 +646,6 @@ def _fixed_staged_decode_mtp(
         return None
     mtp = row_count // request_count
     if mtp not in (1, 2):
-        if mtp > 2:
-            raise RuntimeError(
-                "staged sparse-index preparation only supports MTP=1 or "
-                f"MTP=2; got MTP={mtp}"
-            )
         return None
     expected = np.repeat(
         np.arange(request_count, dtype=np.int64),

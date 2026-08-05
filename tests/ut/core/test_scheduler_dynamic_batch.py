@@ -250,6 +250,42 @@ class TestSchedulerDynamicBatch(TestBase):
         for i, request in enumerate(requests):
             self.assertEqual(scheduler.running[i], request)
 
+    def test_async_external_load_forwards_compact_allocation(self):
+        scheduler = self.create_scheduler()
+        request = create_requests(num_requests=1)[0]
+        scheduler.add_request(request)
+        scheduler.connector = MagicMock()
+        external_tokens = request.num_tokens - 1
+        scheduler.connector.get_num_new_matched_tokens.return_value = (
+            external_tokens,
+            True,
+        )
+        scheduler.connector.supports_dsa_compact_external_load = True
+
+        with patch.object(
+            scheduler.kv_cache_manager,
+            "allocate_slots",
+            wraps=scheduler.kv_cache_manager.allocate_slots,
+        ) as allocate_slots:
+            scheduler.schedule()
+
+        args, kwargs = allocate_slots.call_args
+        self.assertEqual(args[1], 0)
+        self.assertEqual(
+            kwargs["num_external_computed_tokens"], external_tokens
+        )
+        self.assertTrue(kwargs["delay_cache_blocks"])
+        self.assertTrue(kwargs["dsa_compact_external_load"])
+        published_blocks = scheduler.connector.update_state_after_alloc.call_args.args[1]
+        self.assertEqual(
+            published_blocks.get_block_ids(),
+            scheduler.kv_cache_manager.get_blocks(request.request_id).get_block_ids(),
+        )
+        self.assertTrue(any(published_blocks.get_block_ids()))
+        self.assertEqual(request.status, RequestStatus.WAITING_FOR_REMOTE_KVS)
+        self.assertEqual(request.num_external_computed_tokens, external_tokens)
+        self.assertEqual(request.num_computed_tokens, external_tokens)
+
     def test_schedule_multimodal_requests(self):
         scheduler = self.create_scheduler()
         scheduler.scheduler_config.chunked_prefill_enabled = True
