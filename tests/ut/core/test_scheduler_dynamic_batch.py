@@ -98,9 +98,7 @@ class TestSchedulerDynamicBatch(TestBase):
 
     @patch("vllm.config.ModelConfig.__post_init__", MagicMock())
     @patch("vllm.config.VllmConfig.__post_init__", MagicMock())
-    @patch('vllm.v1.core.sched.scheduler.compute_encoder_budget')
-    def create_scheduler(self, mock_compute_encoder_budget):
-        mock_compute_encoder_budget.return_value = [100, 100]
+    def create_scheduler(self):
         use_kv_connector = False
         block_size = 16
 
