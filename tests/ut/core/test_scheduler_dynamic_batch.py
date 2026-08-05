@@ -56,7 +56,7 @@ def create_requests(
             for j, position in enumerate(mm_position):
                 identifier = f"hash{i}_{j}"
                 mm_feature = MultiModalFeatureSpec(
-                    data=MultiModalKwargsItem.dummy("dummy_m"),
+                    data=MultiModalKwargsItem.dummy(),
                     mm_position=position,
                     identifier=identifier,
                     modality="image")
@@ -64,7 +64,6 @@ def create_requests(
         request = Request(request_id=f"{i}",
                           prompt_token_ids=[i] * num_tokens,
                           sampling_params=sampling_params,
-                          eos_token_id=EOS_TOKEN_ID,
                           pooling_params=None,
                           mm_features=mm_features if mm_features else None,
                           block_hasher=get_request_block_hasher(
