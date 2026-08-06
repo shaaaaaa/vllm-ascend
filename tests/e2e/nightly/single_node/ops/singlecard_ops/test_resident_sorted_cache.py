@@ -1911,6 +1911,114 @@ def test_sorted_resident_full_path_supports_graph_replay(mtp):
     assert _state_dict(state, 0, shard_count) == expected_state
 
 
+@pytest.mark.parametrize(
+    "actual_requests,request_capacity",
+    [(3, 4), (5, 8)],
+    ids=["request-3-graph-8", "request-5-graph-16"],
+)
+def test_sorted_resident_mtp2_graph_replay_with_inactive_request_rows(
+    actual_requests,
+    request_capacity,
+):
+    """Compare the working graph-8 shape with the failing graph-16 shape."""
+    mtp = 2
+    token_capacity = request_capacity * mtp
+    active_tokens = actual_requests * mtp
+    scratch_capacity = mtp * INDEX_TOPK
+    block_size = 128
+    source = _source(mtp, 0, requests=request_capacity)
+    source[active_tokens:].zero_()
+    values = source.npu()
+    boundaries = torch.zeros(
+        token_capacity,
+        dtype=torch.int32,
+        device="npu",
+    )
+    boundaries[:active_tokens].fill_(512)
+    row_requests = torch.full(
+        (token_capacity,),
+        -1,
+        dtype=torch.int32,
+        device="npu",
+    )
+    row_requests[:active_tokens].copy_(
+        torch.arange(
+            actual_requests,
+            dtype=torch.int32,
+            device="npu",
+        ).repeat_interleave(mtp)
+    )
+    request_states = torch.full(
+        (request_capacity,),
+        -1,
+        dtype=torch.int32,
+        device="npu",
+    )
+    request_states[:actual_requests].copy_(
+        torch.arange(
+            actual_requests,
+            dtype=torch.int32,
+            device="npu",
+        )
+    )
+    request_generations = torch.full(
+        (request_capacity,),
+        -1,
+        dtype=torch.int64,
+        device="npu",
+    )
+    request_generations[:actual_requests].fill_(1)
+    blocks_per_request = scratch_capacity // block_size
+    block_table = torch.arange(
+        request_capacity * blocks_per_request,
+        dtype=torch.int32,
+        device="npu",
+    ).reshape(request_capacity, blocks_per_request)
+    workspace = allocate_sorted_resident_workspace(
+        request_capacity,
+        mtp,
+        device=torch.device("npu"),
+    )
+    state = allocate_sorted_resident_state(
+        request_capacity,
+        request_capacity,
+        mtp,
+        device=torch.device("npu"),
+    )
+
+    graph = torch.npu.NPUGraph()
+    with torch.npu.graph(graph):
+        prepare_resident_sharded_union_(
+            values,
+            boundaries,
+            row_requests,
+            request_states,
+            request_generations,
+            state,
+            workspace,
+            mtp=mtp,
+        )
+        prepare_sorted_resident_cache_fused_(
+            values,
+            block_table,
+            request_states,
+            request_generations,
+            state,
+            workspace,
+            block_size=block_size,
+        )
+
+    values.copy_(source.npu())
+    state.counts.zero_()
+    state.generations.fill_(-1)
+    workspace.miss_counts.zero_()
+    graph.replay()
+    torch.npu.synchronize()
+
+    assert torch.all(workspace.miss_counts[:actual_requests, 0].cpu() > 0)
+    assert torch.all(workspace.miss_counts[actual_requests:, 0].cpu() == 0)
+
+
 @pytest.mark.parametrize("mtp", [1, 2])
 @pytest.mark.parametrize("remap", [False, True])
 def test_sorted_resident_split_graph_replay_completes_writeback(mtp, remap):

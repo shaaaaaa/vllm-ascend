@@ -1455,6 +1455,99 @@ class TestStagedSFAGraphPoc(TestBase):
         # padding rows from participating in the request-level union.
         self.assertEqual(args[12].tolist(), [0, -1, -1, -1])
 
+    def test_three_and_five_request_batches_both_have_padding_slots(self):
+        """Padding alone cannot explain a failure unique to request five."""
+        query_width = 2
+        for actual_requests, request_capacity in ((3, 4), (5, 8)):
+            with self.subTest(actual_requests=actual_requests):
+                actual_tokens = actual_requests * query_width
+                token_capacity = request_capacity * query_width
+                padding_tokens = token_capacity - actual_tokens
+                impl = self._make_eligible_impl()
+                impl.decode_threshold = query_width
+                graph_key = StagedSFAGraphKey.fixed_spec(
+                    request_capacity,
+                    query_width,
+                )
+                metadata = self._make_decode_metadata(token_capacity)
+                metadata.num_actual_tokens = actual_tokens
+                metadata.decode_req_indices = torch.cat(
+                    (
+                        torch.arange(actual_requests).repeat_interleave(
+                            query_width
+                        ),
+                        torch.full((padding_tokens,), -1),
+                    )
+                ).to(torch.int32)
+                metadata.slot_mapping[actual_tokens:].fill_(-1)
+                metadata.indexer_slot_mapping[actual_tokens:].fill_(-1)
+                metadata.req_ids = [
+                    f"req-{index}" for index in range(actual_requests)
+                ]
+                impl._staged_sfa_capture_state.producer_event = MagicMock()
+                impl._cross_layer_kv_cache = MagicMock(
+                    return_value=(
+                        self._make_eligible_kv_cache(
+                            num_blocks=request_capacity
+                        ),
+                        "index-0",
+                        True,
+                    )
+                )
+                impl._cross_layer_ineligible_reason = MagicMock(
+                    return_value=None
+                )
+                impl._cross_layer_pre_compute = MagicMock(
+                    return_value=self._make_pre_outputs(
+                        token_capacity,
+                        request_capacity,
+                    )
+                )
+                context = SimpleNamespace(
+                    staged_sfa_graph_key=graph_key,
+                    staged_sfa_route=StagedSFARouteDecision(
+                        StagedSFARouteAction.STAGED,
+                        StagedSFARouteReason.ELIGIBLE,
+                        graph_key,
+                        (131_584,) * actual_requests,
+                    ),
+                    staged_sfa_graph_dummy_run=False,
+                    cudagraph_runtime_mode=CUDAGraphMode.PIECEWISE,
+                )
+
+                with (
+                    patch.object(
+                        sfa_v1,
+                        "get_forward_context",
+                        return_value=context,
+                    ),
+                    patch.object(
+                        sfa_v1,
+                        "_prepare_sfa_remap_boundary",
+                        return_value=metadata.decode_remap_boundary,
+                    ),
+                ):
+                    impl.cross_layer_graph_pre(
+                        "layer-0",
+                        torch.empty(token_capacity, 4),
+                        self._make_eligible_kv_cache(
+                            num_blocks=request_capacity
+                        ),
+                        metadata,
+                        False,
+                        torch.empty(token_capacity, 4),
+                    )
+
+                args = impl._cross_layer_pre_compute.call_args.args
+                self.assertEqual(
+                    torch.count_nonzero(args[6] < 0).item(),
+                    padding_tokens,
+                )
+                self.assertEqual(
+                    torch.count_nonzero(args[7] < 0).item(),
+                    padding_tokens,
+                )
+
     def test_bridge_storage_is_preallocated_and_reused_for_q1(self):
         impl = self._make_eligible_impl()
         hidden_states = torch.empty(1, 4)

@@ -1046,6 +1046,81 @@ class TestStagedSFADummyBatch(unittest.TestCase):
         self.assertEqual(route.action, StagedSFARouteAction.STAGED)
         self.assertEqual(route.graph_key, StagedSFAGraphKey.fixed_spec(2, 2))
 
+    def test_mtp_request_three_and_five_use_different_graph_capacities(self):
+        query_width = 2
+        runner = self._build_runner()
+        runner.speculative_config = SimpleNamespace(
+            method="mtp",
+            num_speculative_tokens=1,
+        )
+        runner.decode_threshold = query_width
+        runner.attn_state = AscendAttentionState.SpecDecoding
+        runner._staged_sfa_graph_capture_sizes = (
+            4 * query_width,
+            8 * query_width,
+        )
+        for actual_requests, graph_request_capacity in ((3, 4), (5, 8)):
+            with self.subTest(actual_requests=actual_requests):
+                request_ids = [
+                    f"req-{index}" for index in range(actual_requests)
+                ]
+                local = runner._staged_sfa_local_route(
+                    num_tokens_unpadded=actual_requests * query_width,
+                    num_reqs=actual_requests,
+                    num_scheduled_tokens=np.full(
+                        actual_requests,
+                        query_width,
+                        dtype=np.int32,
+                    ),
+                    index_topk=2048,
+                    has_cascade_attention=False,
+                    request_ids=request_ids,
+                    kv_connector_metadata=SimpleNamespace(
+                        requests=[
+                            SimpleNamespace(
+                                req_id=req_id,
+                                is_sparse_decode=True,
+                                load_spec=SimpleNamespace(
+                                    can_load=True,
+                                    lmcache_cached_tokens=131_584,
+                                ),
+                            )
+                            for req_id in request_ids
+                        ]
+                    ),
+                )
+                graph_token_capacity = (
+                    graph_request_capacity * query_width
+                )
+                route = runner._staged_sfa_live_route(
+                    local_route=local,
+                    dp_route_action=StagedSFARouteAction.STAGED,
+                    cudagraph_mode=CUDAGraphMode.PIECEWISE,
+                    batch_descriptor=BatchDescriptor(
+                        num_tokens=graph_token_capacity
+                    ),
+                    num_tokens_unpadded=actual_requests * query_width,
+                    num_tokens_padded=graph_token_capacity,
+                    num_reqs=actual_requests,
+                    should_ubatch=False,
+                )
+
+                self.assertEqual(
+                    route.action,
+                    StagedSFARouteAction.STAGED,
+                )
+                self.assertEqual(
+                    route.graph_key,
+                    StagedSFAGraphKey.fixed_spec(
+                        graph_request_capacity,
+                        query_width,
+                    ),
+                )
+                self.assertGreater(
+                    route.graph_key.request_capacity,
+                    actual_requests,
+                )
+
     def test_zero_frontier_uses_graph_with_all_kv_resident(self):
         runner = self._build_runner()
         request_ids = ["req-0"]
