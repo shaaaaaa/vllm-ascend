@@ -1920,6 +1920,8 @@ def test_sorted_resident_full_path_supports_graph_replay(mtp):
         (4, 6, 6),
         (4, 8, 8),
         (4, 5, 8),
+        (4, 15, 15),
+        (4, 15, 16),
     ],
     ids=[
         "shards-2-requests-8-logical-blocks-32",
@@ -1928,6 +1930,8 @@ def test_sorted_resident_full_path_supports_graph_replay(mtp):
         "shards-4-requests-6-logical-blocks-48",
         "shards-4-requests-8-logical-blocks-64",
         "shards-4-active-5-capacity-8-logical-blocks-64",
+        "shards-4-requests-15-logical-blocks-120",
+        "shards-4-active-15-capacity-16-logical-blocks-128",
     ],
 )
 def test_sorted_resident_mtp2_graph_replay_with_inactive_request_rows(
