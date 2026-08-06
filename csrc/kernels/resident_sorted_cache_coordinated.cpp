@@ -161,10 +161,16 @@ public:
 
     __aicore__ inline void Process()
     {
-        const uint32_t request = AscendC::GetBlockIdx();
-        if (request >= requestCount_) {
-            return;
+        const uint32_t physicalBlockCount = AscendC::GetBlockNum();
+        for (uint32_t request = AscendC::GetBlockIdx();
+             request < requestCount_;
+             request += physicalBlockCount) {
+            ProcessRequest(request);
         }
+    }
+
+    __aicore__ inline void ProcessRequest(uint32_t request)
+    {
 
         uint32_t missCounts[kMaxResidentShards] = {};
         uint32_t evictableCounts[kMaxResidentShards] = {};
@@ -341,12 +347,19 @@ public:
 
     __aicore__ inline void Process()
     {
-        const uint32_t block = AscendC::GetBlockIdx();
+        const uint32_t logicalBlockCount = requestCount_ * shardCount_;
+        const uint32_t physicalBlockCount = AscendC::GetBlockNum();
+        for (uint32_t block = AscendC::GetBlockIdx();
+             block < logicalBlockCount;
+             block += physicalBlockCount) {
+            ProcessBlock(block);
+        }
+    }
+
+    __aicore__ inline void ProcessBlock(uint32_t block)
+    {
         const uint32_t request = block / shardCount_;
         const uint32_t ownerShard = block % shardCount_;
-        if (request >= requestCount_) {
-            return;
-        }
         const uint64_t ownerCountOffset =
             static_cast<uint64_t>(request)
                 * shardCountRequestStride_
@@ -588,6 +601,9 @@ public:
                 outputTargetSlots,
                 outputCount);
         }
+        // A physical AIV may own another logical request/shard next.
+        // Complete all UB-backed writes before reusing those buffers.
+        Sync<AscendC::HardEvent::MTE3_S>();
     }
 
 private:
@@ -700,6 +716,19 @@ dsa_resident_sharded_finalize_worker_kernel(
 
 namespace vllm_ascend {
 
+namespace {
+
+inline uint32_t ResidentPhysicalBlockCount(
+    uint32_t logicalBlockCount,
+    uint32_t coreCount)
+{
+    return logicalBlockCount < coreCount
+        ? logicalBlockCount
+        : coreCount;
+}
+
+}  // namespace
+
 void dsa_resident_finalize_coordinator_impl(
     void* stream,
     void* shardCounts,
@@ -708,10 +737,12 @@ void dsa_resident_finalize_coordinator_impl(
     uint32_t shardCount,
     uint32_t shardCountStride,
     uint32_t shardCountRequestStride,
-    uint32_t missCountStride)
+    uint32_t missCountStride,
+    uint32_t coreCount)
 {
     dsa_resident_finalize_coordinator_kernel<<<
-        requestCount, nullptr, stream>>>(
+        ResidentPhysicalBlockCount(requestCount, coreCount),
+        nullptr, stream>>>(
         static_cast<int32_t*>(shardCounts),
         static_cast<int32_t*>(missCounts),
         requestCount, shardCount, shardCountStride,
@@ -736,10 +767,13 @@ void dsa_resident_sharded_finalize_worker_impl(
     uint32_t shardCountRequestStride,
     uint32_t missCountStride,
     uint32_t blockTableWidth,
-    uint32_t blockSize)
+    uint32_t blockSize,
+    uint32_t coreCount)
 {
+    const uint32_t logicalBlockCount = requestCount * shardCount;
     dsa_resident_sharded_finalize_worker_kernel<<<
-        requestCount * shardCount, nullptr, stream>>>(
+        ResidentPhysicalBlockCount(logicalBlockCount, coreCount),
+        nullptr, stream>>>(
         static_cast<int32_t*>(shardCounts),
         static_cast<int16_t*>(priorSlots),
         static_cast<int32_t*>(shardMissTokens),

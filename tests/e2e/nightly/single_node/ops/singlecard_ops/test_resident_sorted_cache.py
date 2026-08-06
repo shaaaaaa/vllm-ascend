@@ -1912,24 +1912,37 @@ def test_sorted_resident_full_path_supports_graph_replay(mtp):
 
 
 @pytest.mark.parametrize(
-    "actual_requests,request_capacity",
-    [(3, 4), (5, 8)],
-    ids=["request-3-graph-8", "request-5-graph-16"],
+    "shards_per_row,actual_requests,request_count",
+    [
+        (2, 8, 8),
+        (4, 4, 4),
+        (4, 5, 5),
+        (4, 6, 6),
+        (4, 8, 8),
+        (4, 5, 8),
+    ],
+    ids=[
+        "shards-2-requests-8-logical-blocks-32",
+        "shards-4-requests-4-logical-blocks-32",
+        "shards-4-requests-5-logical-blocks-40",
+        "shards-4-requests-6-logical-blocks-48",
+        "shards-4-requests-8-logical-blocks-64",
+        "shards-4-active-5-capacity-8-logical-blocks-64",
+    ],
 )
-@pytest.mark.parametrize("shards_per_row", [2], ids=["shards-per-row-2"])
 def test_sorted_resident_mtp2_graph_replay_with_inactive_request_rows(
-    actual_requests,
-    request_capacity,
     shards_per_row,
+    actual_requests,
+    request_count,
 ):
-    """Check graph-8 and graph-16 with an explicit shard budget."""
+    """Replay logical shard work below, at, and above the AIV count."""
     mtp = 2
     shard_count = resident_shard_count(mtp, shards_per_row)
-    token_capacity = request_capacity * mtp
+    token_capacity = request_count * mtp
     active_tokens = actual_requests * mtp
     scratch_capacity = mtp * INDEX_TOPK
     block_size = 128
-    source = _source(mtp, 0, requests=request_capacity)
+    source = _source(mtp, 0, requests=request_count)
     source[active_tokens:].zero_()
     values = source.npu()
     boundaries = torch.zeros(
@@ -1952,7 +1965,7 @@ def test_sorted_resident_mtp2_graph_replay_with_inactive_request_rows(
         ).repeat_interleave(mtp)
     )
     request_states = torch.full(
-        (request_capacity,),
+        (request_count,),
         -1,
         dtype=torch.int32,
         device="npu",
@@ -1965,7 +1978,7 @@ def test_sorted_resident_mtp2_graph_replay_with_inactive_request_rows(
         )
     )
     request_generations = torch.full(
-        (request_capacity,),
+        (request_count,),
         -1,
         dtype=torch.int64,
         device="npu",
@@ -1973,19 +1986,19 @@ def test_sorted_resident_mtp2_graph_replay_with_inactive_request_rows(
     request_generations[:actual_requests].fill_(1)
     blocks_per_request = scratch_capacity // block_size
     block_table = torch.arange(
-        request_capacity * blocks_per_request,
+        request_count * blocks_per_request,
         dtype=torch.int32,
         device="npu",
-    ).reshape(request_capacity, blocks_per_request)
+    ).reshape(request_count, blocks_per_request)
     workspace = allocate_sorted_resident_workspace(
-        request_capacity,
+        request_count,
         mtp,
         device=torch.device("npu"),
         shard_count=shard_count,
     )
     state = allocate_sorted_resident_state(
-        request_capacity,
-        request_capacity,
+        request_count,
+        request_count,
         mtp,
         device=torch.device("npu"),
         shard_count=shard_count,

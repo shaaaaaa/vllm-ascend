@@ -264,12 +264,19 @@ public:
 
     __aicore__ inline void Process()
     {
-        const uint32_t block = AscendC::GetBlockIdx();
+        const uint32_t logicalBlockCount = requestCount_ * shardCount_;
+        const uint32_t physicalBlockCount = AscendC::GetBlockNum();
+        for (uint32_t block = AscendC::GetBlockIdx();
+             block < logicalBlockCount;
+             block += physicalBlockCount) {
+            ProcessBlock(block);
+        }
+    }
+
+    __aicore__ inline void ProcessBlock(uint32_t block)
+    {
         const uint32_t request = block / shardCount_;
         const uint32_t shard = block % shardCount_;
-        if (request >= requestCount_) {
-            return;
-        }
 
         const uint64_t shardOffset =
             (static_cast<uint64_t>(request) * shardCount_ + shard)
@@ -778,10 +785,16 @@ public:
 
     __aicore__ inline void Process()
     {
-        const uint32_t request = AscendC::GetBlockIdx();
-        if (request >= requestCount_) {
-            return;
+        const uint32_t physicalBlockCount = AscendC::GetBlockNum();
+        for (uint32_t request = AscendC::GetBlockIdx();
+             request < requestCount_;
+             request += physicalBlockCount) {
+            ProcessRequest(request);
         }
+    }
+
+    __aicore__ inline void ProcessRequest(uint32_t request)
+    {
         auto countLocal = countBuf_.Get<int32_t>();
         auto priorLocal = priorBuf_.Get<int16_t>();
         auto debug = debugBuf_.Get<int32_t>();
@@ -873,6 +886,9 @@ public:
                     * kResidentProbeDebugInts],
             debug,
             kResidentProbeDebugInts);
+        // A physical AIV may process another request next. Complete the
+        // debug-buffer write before that request reuses the same UB.
+        Sync<AscendC::HardEvent::MTE3_S>();
     }
 
 private:
@@ -985,10 +1001,16 @@ public:
 
     __aicore__ inline void Process()
     {
-        const uint32_t request = AscendC::GetBlockIdx();
-        if (request >= requestCount_) {
-            return;
+        const uint32_t physicalBlockCount = AscendC::GetBlockNum();
+        for (uint32_t request = AscendC::GetBlockIdx();
+             request < requestCount_;
+             request += physicalBlockCount) {
+            ProcessRequest(request);
         }
+    }
+
+    __aicore__ inline void ProcessRequest(uint32_t request)
+    {
         if (debugStage_ == 0) {
             ProcessCompact(request);
             return;
@@ -1692,12 +1714,19 @@ public:
 
     __aicore__ inline void Process()
     {
-        const uint32_t block = AscendC::GetBlockIdx();
+        const uint32_t logicalBlockCount = requestCount_ * shardCount_;
+        const uint32_t physicalBlockCount = AscendC::GetBlockNum();
+        for (uint32_t block = AscendC::GetBlockIdx();
+             block < logicalBlockCount;
+             block += physicalBlockCount) {
+            ProcessBlock(block);
+        }
+    }
+
+    __aicore__ inline void ProcessBlock(uint32_t block)
+    {
         const uint32_t request = block / shardCount_;
         const uint32_t shard = block % shardCount_;
-        if (request >= requestCount_) {
-            return;
-        }
         const int32_t state =
             ReadGlobalScalarFresh(requestStateIndices_, request);
         const bool realState =
@@ -1856,12 +1885,19 @@ public:
     // fused update+remap kernel remains available as an exact fallback.
     __aicore__ inline void ProcessStateOnly()
     {
-        const uint32_t block = AscendC::GetBlockIdx();
+        const uint32_t logicalBlockCount = requestCount_ * shardCount_;
+        const uint32_t physicalBlockCount = AscendC::GetBlockNum();
+        for (uint32_t block = AscendC::GetBlockIdx();
+             block < logicalBlockCount;
+             block += physicalBlockCount) {
+            ProcessStateBlock(block);
+        }
+    }
+
+    __aicore__ inline void ProcessStateBlock(uint32_t block)
+    {
         const uint32_t request = block / shardCount_;
         const uint32_t shard = block % shardCount_;
-        if (request >= requestCount_) {
-            return;
-        }
         const int32_t state =
             ReadGlobalScalarFresh(requestStateIndices_, request);
         const bool realState =
@@ -2278,12 +2314,19 @@ public:
 
     __aicore__ inline void Process()
     {
-        const uint32_t block = AscendC::GetBlockIdx();
+        const uint32_t logicalBlockCount = requestCount_ * shardCount_;
+        const uint32_t physicalBlockCount = AscendC::GetBlockNum();
+        for (uint32_t block = AscendC::GetBlockIdx();
+             block < logicalBlockCount;
+             block += physicalBlockCount) {
+            ProcessBlock(block);
+        }
+    }
+
+    __aicore__ inline void ProcessBlock(uint32_t block)
+    {
         const uint32_t request = block / shardCount_;
         const uint32_t part = block % shardCount_;
-        if (request >= requestCount_) {
-            return;
-        }
         const uint32_t begin = part * partWidth_;
         const uint64_t requestOffset =
             static_cast<uint64_t>(request) * requestWidth_;
@@ -2659,6 +2702,19 @@ dsa_resident_sorted_remap_kernel(
 
 namespace vllm_ascend {
 
+namespace {
+
+inline uint32_t ResidentPhysicalBlockCount(
+    uint32_t logicalBlockCount,
+    uint32_t coreCount)
+{
+    return logicalBlockCount < coreCount
+        ? logicalBlockCount
+        : coreCount;
+}
+
+}  // namespace
+
 void dsa_resident_sharded_union_impl(
     void* stream,
     void* topkIndices,
@@ -2686,10 +2742,13 @@ void dsa_resident_sharded_union_impl(
     uint32_t shardCapacity,
     uint32_t shardCountStride,
     uint32_t shardCountRequestStride,
-    uint32_t generationStride)
+    uint32_t generationStride,
+    uint32_t coreCount)
 {
+    const uint32_t logicalBlockCount = requestCount * shardCount;
     dsa_resident_sharded_union_kernel<<<
-        requestCount * shardCount, nullptr, stream>>>(
+        ResidentPhysicalBlockCount(logicalBlockCount, coreCount),
+        nullptr, stream>>>(
         static_cast<int32_t*>(topkIndices),
         static_cast<int32_t*>(splitBoundary),
         static_cast<int32_t*>(rowReqIndices),
@@ -2743,10 +2802,12 @@ void dsa_resident_sorted_plan_impl(
     uint32_t missCountStride,
     uint32_t generationStride,
     uint32_t blockTableWidth,
-    uint32_t blockSize)
+    uint32_t blockSize,
+    uint32_t coreCount)
 {
     dsa_resident_sorted_finalize_kernel<<<
-        requestCount, nullptr, stream>>>(
+        ResidentPhysicalBlockCount(requestCount, coreCount),
+        nullptr, stream>>>(
         static_cast<int32_t*>(shardPacked),
         static_cast<int32_t*>(shardCounts),
         static_cast<int16_t*>(priorSlots),
@@ -2761,8 +2822,10 @@ void dsa_resident_sorted_plan_impl(
         requestCount, shardCount, capacity, shardCountStride,
         shardCountRequestStride, missCountStride,
         blockTableWidth, blockSize, 0);
+    const uint32_t logicalBlockCount = requestCount * shardCount;
     dsa_resident_sorted_update_kernel<<<
-        requestCount * shardCount, nullptr, stream>>>(
+        ResidentPhysicalBlockCount(logicalBlockCount, coreCount),
+        nullptr, stream>>>(
         static_cast<int32_t*>(topkIndices),
         static_cast<int32_t*>(shardPacked),
         static_cast<int16_t*>(shardMapping),
@@ -2802,10 +2865,13 @@ void dsa_resident_sorted_update_debug_impl(
     uint32_t capacity,
     uint32_t shardCountStride,
     uint32_t shardCountRequestStride,
-    uint32_t generationStride)
+    uint32_t generationStride,
+    uint32_t coreCount)
 {
+    const uint32_t logicalBlockCount = requestCount * shardCount;
     dsa_resident_sorted_update_kernel<<<
-        requestCount * shardCount, nullptr, stream>>>(
+        ResidentPhysicalBlockCount(logicalBlockCount, coreCount),
+        nullptr, stream>>>(
         static_cast<int32_t*>(topkIndices),
         static_cast<int32_t*>(shardPacked),
         static_cast<int16_t*>(shardMapping),
@@ -2855,10 +2921,12 @@ void dsa_resident_sorted_plan_no_remap_impl(
     uint32_t missCountStride,
     uint32_t generationStride,
     uint32_t blockTableWidth,
-    uint32_t blockSize)
+    uint32_t blockSize,
+    uint32_t coreCount)
 {
     dsa_resident_sorted_finalize_kernel<<<
-        requestCount, nullptr, stream>>>(
+        ResidentPhysicalBlockCount(requestCount, coreCount),
+        nullptr, stream>>>(
             static_cast<int32_t*>(shardPacked),
             static_cast<int32_t*>(shardCounts),
             static_cast<int16_t*>(priorSlots),
@@ -2873,8 +2941,10 @@ void dsa_resident_sorted_plan_no_remap_impl(
             requestCount, shardCount, capacity, shardCountStride,
             shardCountRequestStride, missCountStride,
             blockTableWidth, blockSize, 0);
+    const uint32_t logicalBlockCount = requestCount * shardCount;
     dsa_resident_sorted_state_update_kernel<<<
-        requestCount * shardCount, nullptr, stream>>>(
+        ResidentPhysicalBlockCount(logicalBlockCount, coreCount),
+        nullptr, stream>>>(
             static_cast<int32_t*>(topkIndices),
             static_cast<int32_t*>(shardPacked),
             static_cast<int16_t*>(shardMapping),
@@ -2904,10 +2974,13 @@ void dsa_resident_sorted_remap_impl(
     uint32_t shardCount,
     uint32_t capacity,
     uint32_t shardCountStride,
-    uint32_t shardCountRequestStride)
+    uint32_t shardCountRequestStride,
+    uint32_t coreCount)
 {
+    const uint32_t logicalBlockCount = requestCount * shardCount;
     dsa_resident_sorted_remap_kernel<<<
-        requestCount * shardCount, nullptr, stream>>>(
+        ResidentPhysicalBlockCount(logicalBlockCount, coreCount),
+        nullptr, stream>>>(
             static_cast<int32_t*>(topkIndices),
             static_cast<int16_t*>(shardMapping),
             static_cast<int32_t*>(shardCounts),
@@ -2926,10 +2999,12 @@ void dsa_resident_sorted_read_probe_impl(
     uint32_t shardCount,
     uint32_t capacity,
     uint32_t shardCountStride,
-    uint32_t shardCountRequestStride)
+    uint32_t shardCountRequestStride,
+    uint32_t coreCount)
 {
     dsa_resident_sorted_read_probe_kernel<<<
-        requestCount, nullptr, stream>>>(
+        ResidentPhysicalBlockCount(requestCount, coreCount),
+        nullptr, stream>>>(
         static_cast<int32_t*>(shardCounts),
         static_cast<int16_t*>(priorSlots),
         static_cast<int32_t*>(debugInfo),
@@ -2959,12 +3034,14 @@ void dsa_resident_sorted_finalize_debug_impl(
     uint32_t missCountStride,
     uint32_t blockTableWidth,
     uint32_t blockSize,
-    uint32_t debugStage)
+    uint32_t debugStage,
+    uint32_t coreCount)
 {
     // Test-only boundary isolation: launch the exact production finalize
     // kernel without launching the following state-update/remap kernel.
     dsa_resident_sorted_finalize_kernel<<<
-        requestCount, nullptr, stream>>>(
+        ResidentPhysicalBlockCount(requestCount, coreCount),
+        nullptr, stream>>>(
         static_cast<int32_t*>(shardPacked),
         static_cast<int32_t*>(shardCounts),
         static_cast<int16_t*>(priorSlots),

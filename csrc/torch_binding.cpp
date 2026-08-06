@@ -1375,6 +1375,26 @@ at::Tensor npu_dsa_resident_finalize_rows_(
 
 namespace {
 
+uint32_t resident_vector_core_count(const at::Tensor &tensor)
+{
+    static thread_local int32_t cached_device = -1;
+    static thread_local int64_t cached_aiv_count = 0;
+    const int32_t current_device =
+        static_cast<int32_t>(tensor.get_device());
+    if (current_device != cached_device || cached_aiv_count <= 0) {
+        TORCH_CHECK(
+            aclGetDeviceCapability(
+                current_device,
+                ACL_DEVICE_INFO_VECTOR_CORE_NUM,
+                &cached_aiv_count) == ACL_SUCCESS,
+            "failed to query the NPU vector core count");
+        cached_device = current_device;
+    }
+    TORCH_CHECK(cached_aiv_count > 0,
+                "NPU reported no available vector cores");
+    return static_cast<uint32_t>(cached_aiv_count);
+}
+
 at::Tensor resident_sharded_union_common_(
     const at::Tensor &topk_indices,
     const at::Tensor &split_boundary,
@@ -1547,6 +1567,8 @@ at::Tensor resident_sharded_union_common_(
         "resident sharded-sort output bases must be 64-byte aligned");
 
     const c10_npu::OptionalNPUGuard npu_guard(device);
+    const uint32_t core_count =
+        resident_vector_core_count(topk_indices);
     aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
     void* topk_ptr = topk_indices.data_ptr();
     void* boundary_ptr = split_boundary.data_ptr();
@@ -1577,7 +1599,7 @@ at::Tensor resident_sharded_union_common_(
         request_count, state_row_count, dummy_state_base,
         rows_per_request, row_width, shard_count, shard_capacity,
         shard_count_stride, shard_count_request_stride,
-        generation_stride]() -> int {
+        generation_stride, core_count]() -> int {
         dsa_resident_sharded_union_impl(
             stream, topk_ptr, boundary_ptr, row_request_ptr,
             packed_ptr, mapping_ptr, count_ptr, request_state_ptr,
@@ -1594,7 +1616,8 @@ at::Tensor resident_sharded_union_common_(
             static_cast<uint32_t>(shard_capacity),
             static_cast<uint32_t>(shard_count_stride),
             static_cast<uint32_t>(shard_count_request_stride),
-            static_cast<uint32_t>(generation_stride));
+            static_cast<uint32_t>(generation_stride),
+            core_count);
         return 0;
     });
     cmd.Run();
@@ -1823,6 +1846,8 @@ static at::Tensor resident_sorted_plan_common_(
         "sorted-resident cacheline-owned buffers must be 64-byte aligned");
 
     const c10_npu::OptionalNPUGuard npu_guard(device);
+    const uint32_t core_count =
+        resident_vector_core_count(topk_indices);
     aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
     void* topk_ptr = topk_indices.data_ptr();
     void* packed_ptr = shard_packed.data_ptr();
@@ -1860,7 +1885,8 @@ static at::Tensor resident_sorted_plan_common_(
         rows_per_request, row_width, shard_count, capacity,
         shard_count_stride, shard_count_request_stride,
         miss_count_stride, generation_stride,
-        block_table_width, block_size, fused_remap]() -> int {
+        block_table_width, block_size, fused_remap,
+        core_count]() -> int {
         auto impl = fused_remap
             ? dsa_resident_sorted_plan_impl
             : dsa_resident_sorted_plan_no_remap_impl;
@@ -1885,7 +1911,8 @@ static at::Tensor resident_sorted_plan_common_(
             static_cast<uint32_t>(miss_count_stride),
             static_cast<uint32_t>(generation_stride),
             static_cast<uint32_t>(block_table_width),
-            static_cast<uint32_t>(block_size));
+            static_cast<uint32_t>(block_size),
+            core_count);
         return 0;
     });
     cmd.Run();
@@ -1997,6 +2024,8 @@ at::Tensor npu_dsa_resident_finalize_coordinator_(
         "resident finalize coordinator records must be 64-byte aligned");
 
     const c10_npu::OptionalNPUGuard npu_guard(device);
+    const uint32_t core_count =
+        resident_vector_core_count(shard_counts);
     aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
     void* shard_count_ptr = shard_counts.data_ptr();
     void* miss_count_ptr = miss_counts.data_ptr();
@@ -2005,14 +2034,16 @@ at::Tensor npu_dsa_resident_finalize_coordinator_(
     cmd.SetCustomHandler([
         stream, shard_count_ptr, miss_count_ptr,
         request_count, shard_count, shard_count_stride,
-        shard_count_request_stride, miss_count_stride]() -> int {
+        shard_count_request_stride, miss_count_stride,
+        core_count]() -> int {
         dsa_resident_finalize_coordinator_impl(
             stream, shard_count_ptr, miss_count_ptr,
             static_cast<uint32_t>(request_count),
             static_cast<uint32_t>(shard_count),
             static_cast<uint32_t>(shard_count_stride),
             static_cast<uint32_t>(shard_count_request_stride),
-            static_cast<uint32_t>(miss_count_stride));
+            static_cast<uint32_t>(miss_count_stride),
+            core_count);
         return 0;
     });
     cmd.Run();
@@ -2125,6 +2156,8 @@ at::Tensor npu_dsa_resident_sharded_finalize_worker_(
         "resident sharded finalize outputs must be 64-byte aligned");
 
     const c10_npu::OptionalNPUGuard npu_guard(device);
+    const uint32_t core_count =
+        resident_vector_core_count(shard_counts);
     aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
     void* shard_count_ptr = shard_counts.data_ptr();
     void* prior_slot_ptr = prior_slots.data_ptr();
@@ -2143,7 +2176,8 @@ at::Tensor npu_dsa_resident_sharded_finalize_worker_(
         shard_evictable_slot_ptr, miss_token_ptr, miss_count_ptr, target_ptr,
         block_table_ptr, request_count, shard_count, capacity,
         shard_count_stride, shard_count_request_stride,
-        miss_count_stride, block_table_width, block_size]() -> int {
+        miss_count_stride, block_table_width, block_size,
+        core_count]() -> int {
         dsa_resident_sharded_finalize_worker_impl(
             stream, shard_count_ptr, prior_slot_ptr,
             shard_miss_token_ptr, shard_miss_position_ptr,
@@ -2156,7 +2190,8 @@ at::Tensor npu_dsa_resident_sharded_finalize_worker_(
             static_cast<uint32_t>(shard_count_request_stride),
             static_cast<uint32_t>(miss_count_stride),
             static_cast<uint32_t>(block_table_width),
-            static_cast<uint32_t>(block_size));
+            static_cast<uint32_t>(block_size),
+            core_count);
         return 0;
     });
     cmd.Run();
@@ -2276,6 +2311,8 @@ at::Tensor npu_dsa_resident_sorted_update_debug_(
         "resident update-debug scalar records must be 64-byte aligned");
 
     const c10_npu::OptionalNPUGuard npu_guard(device);
+    const uint32_t core_count =
+        resident_vector_core_count(topk_indices);
     aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
     void* topk_ptr = topk_indices.data_ptr();
     void* packed_ptr = shard_packed.data_ptr();
@@ -2297,7 +2334,8 @@ at::Tensor npu_dsa_resident_sorted_update_debug_(
         state_count_ptr, state_generation_ptr, request_count,
         state_row_count, dummy_state_base, rows_per_request,
         row_width, shard_count, capacity, shard_count_stride,
-        shard_count_request_stride, generation_stride]() -> int {
+        shard_count_request_stride, generation_stride,
+        core_count]() -> int {
         dsa_resident_sorted_update_debug_impl(
             stream, topk_ptr, packed_ptr, mapping_ptr, count_ptr,
             prior_ptr, request_state_ptr,
@@ -2312,7 +2350,8 @@ at::Tensor npu_dsa_resident_sorted_update_debug_(
             static_cast<uint32_t>(capacity),
             static_cast<uint32_t>(shard_count_stride),
             static_cast<uint32_t>(shard_count_request_stride),
-            static_cast<uint32_t>(generation_stride));
+            static_cast<uint32_t>(generation_stride),
+            core_count);
         return 0;
     });
     cmd.Run();
@@ -2393,6 +2432,8 @@ at::Tensor npu_dsa_resident_sorted_remap_(
         "sorted-resident remap inputs must be 64-byte aligned");
 
     const c10_npu::OptionalNPUGuard npu_guard(device);
+    const uint32_t core_count =
+        resident_vector_core_count(topk_indices);
     aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
     void* topk_ptr = topk_indices.data_ptr();
     void* mapping_ptr = shard_mapping.data_ptr();
@@ -2404,7 +2445,7 @@ at::Tensor npu_dsa_resident_sorted_remap_(
         stream, topk_ptr, mapping_ptr, count_ptr, prior_ptr,
         request_count, rows_per_request, row_width, shard_count,
         capacity, shard_count_stride,
-        shard_count_request_stride]() -> int {
+        shard_count_request_stride, core_count]() -> int {
         dsa_resident_sorted_remap_impl(
             stream, topk_ptr, mapping_ptr, count_ptr, prior_ptr,
             static_cast<uint32_t>(request_count),
@@ -2413,7 +2454,8 @@ at::Tensor npu_dsa_resident_sorted_remap_(
             static_cast<uint32_t>(shard_count),
             static_cast<uint32_t>(capacity),
             static_cast<uint32_t>(shard_count_stride),
-            static_cast<uint32_t>(shard_count_request_stride));
+            static_cast<uint32_t>(shard_count_request_stride),
+            core_count);
         return 0;
     });
     cmd.Run();
@@ -2476,6 +2518,8 @@ at::Tensor npu_dsa_resident_sorted_read_probe_(
         "resident read-probe scalar records must be 64-byte aligned");
 
     const c10_npu::OptionalNPUGuard npu_guard(device);
+    const uint32_t core_count =
+        resident_vector_core_count(shard_counts);
     aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
     void* count_ptr = shard_counts.data_ptr();
     void* prior_ptr = prior_slots.data_ptr();
@@ -2487,14 +2531,15 @@ at::Tensor npu_dsa_resident_sorted_read_probe_(
         stream, count_ptr, prior_ptr, debug_ptr, readback_ptr,
         request_count, shard_count, capacity,
         shard_count_stride,
-        shard_count_request_stride]() -> int {
+        shard_count_request_stride, core_count]() -> int {
         dsa_resident_sorted_read_probe_impl(
             stream, count_ptr, prior_ptr, debug_ptr, readback_ptr,
             static_cast<uint32_t>(request_count),
             static_cast<uint32_t>(shard_count),
             static_cast<uint32_t>(capacity),
             static_cast<uint32_t>(shard_count_stride),
-            static_cast<uint32_t>(shard_count_request_stride));
+            static_cast<uint32_t>(shard_count_request_stride),
+            core_count);
         return 0;
     });
     cmd.Run();
@@ -2610,6 +2655,8 @@ at::Tensor npu_dsa_resident_sorted_finalize_debug_(
         "resident finalize-debug scalar records must be 64-byte aligned");
 
     const c10_npu::OptionalNPUGuard npu_guard(device);
+    const uint32_t core_count =
+        resident_vector_core_count(shard_packed);
     aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
     void* packed_ptr = shard_packed.data_ptr();
     void* count_ptr = shard_counts.data_ptr();
@@ -2633,7 +2680,7 @@ at::Tensor npu_dsa_resident_sorted_finalize_debug_(
         request_count, shard_count, capacity,
         shard_count_stride, shard_count_request_stride,
         miss_count_stride, block_table_width,
-        block_size, debug_stage]() -> int {
+        block_size, debug_stage, core_count]() -> int {
         dsa_resident_sorted_finalize_debug_impl(
             stream, packed_ptr, count_ptr, prior_ptr,
             shard_miss_token_ptr, shard_miss_position_ptr,
@@ -2648,7 +2695,8 @@ at::Tensor npu_dsa_resident_sorted_finalize_debug_(
             static_cast<uint32_t>(miss_count_stride),
             static_cast<uint32_t>(block_table_width),
             static_cast<uint32_t>(block_size),
-            static_cast<uint32_t>(debug_stage));
+            static_cast<uint32_t>(debug_stage),
+            core_count);
         return 0;
     });
     cmd.Run();

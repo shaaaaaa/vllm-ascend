@@ -293,7 +293,8 @@ namespace vllm_ascend {
     uint32_t shard_capacity,
     uint32_t shard_count_stride,
     uint32_t shard_count_request_stride,
-    uint32_t generation_stride);
+    uint32_t generation_stride,
+    uint32_t core_count);
 
   extern void dsa_resident_sorted_plan_impl(
     void* stream,
@@ -327,7 +328,8 @@ namespace vllm_ascend {
     uint32_t miss_count_stride,
     uint32_t generation_stride,
     uint32_t block_table_width,
-    uint32_t block_size);
+    uint32_t block_size,
+    uint32_t core_count);
 
   extern void dsa_resident_sorted_plan_no_remap_impl(
     void* stream,
@@ -361,7 +363,8 @@ namespace vllm_ascend {
     uint32_t miss_count_stride,
     uint32_t generation_stride,
     uint32_t block_table_width,
-    uint32_t block_size);
+    uint32_t block_size,
+    uint32_t core_count);
 
   extern void dsa_resident_finalize_coordinator_impl(
     void* stream,
@@ -371,7 +374,8 @@ namespace vllm_ascend {
     uint32_t shard_count,
     uint32_t shard_count_stride,
     uint32_t shard_count_request_stride,
-    uint32_t miss_count_stride);
+    uint32_t miss_count_stride,
+    uint32_t core_count);
 
   extern void dsa_resident_sharded_finalize_worker_impl(
     void* stream,
@@ -391,7 +395,8 @@ namespace vllm_ascend {
     uint32_t shard_count_request_stride,
     uint32_t miss_count_stride,
     uint32_t block_table_width,
-    uint32_t block_size);
+    uint32_t block_size,
+    uint32_t core_count);
 
   extern void dsa_resident_sorted_update_debug_impl(
     void* stream,
@@ -415,7 +420,8 @@ namespace vllm_ascend {
     uint32_t capacity,
     uint32_t shard_count_stride,
     uint32_t shard_count_request_stride,
-    uint32_t generation_stride);
+    uint32_t generation_stride,
+    uint32_t core_count);
 
   extern void dsa_resident_sorted_remap_impl(
     void* stream,
@@ -429,7 +435,8 @@ namespace vllm_ascend {
     uint32_t shard_count,
     uint32_t capacity,
     uint32_t shard_count_stride,
-    uint32_t shard_count_request_stride);
+    uint32_t shard_count_request_stride,
+    uint32_t core_count);
 
   extern void dsa_resident_sorted_read_probe_impl(
     void* stream,
@@ -441,7 +448,8 @@ namespace vllm_ascend {
     uint32_t shard_count,
     uint32_t capacity,
     uint32_t shard_count_stride,
-    uint32_t shard_count_request_stride);
+    uint32_t shard_count_request_stride,
+    uint32_t core_count);
 
   extern void dsa_resident_sorted_finalize_debug_impl(
     void* stream,
@@ -464,7 +472,8 @@ namespace vllm_ascend {
     uint32_t miss_count_stride,
     uint32_t block_table_width,
     uint32_t block_size,
-    uint32_t debug_stage);
+    uint32_t debug_stage,
+    uint32_t core_count);
 
   extern void dsa_staged_unique_finalize_impl(
     void* stream,
