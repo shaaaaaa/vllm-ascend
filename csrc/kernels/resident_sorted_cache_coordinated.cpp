@@ -673,6 +673,7 @@ dsa_resident_finalize_coordinator_kernel(
     uint32_t shardCountRequestStride,
     uint32_t missCountStride)
 {
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
     DSAResidentFinalizeCoordinatorKernel op;
     op.Init(
         shardCounts, missCounts, requestCount, shardCount,
@@ -700,6 +701,7 @@ dsa_resident_sharded_finalize_worker_kernel(
     uint32_t blockTableWidth,
     uint32_t blockSize)
 {
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
     DSAResidentShardedFinalizeWorkerKernel op;
     op.Init(
         shardCounts, priorSlots,

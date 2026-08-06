@@ -2533,6 +2533,7 @@ dsa_resident_sharded_union_kernel(
     uint32_t shardCountRequestStride,
     uint32_t generationStride)
 {
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
     DSAResidentShardedUnionKernel op;
     op.Init(
         topkIndices, splitBoundary, rowReqIndices,
@@ -2559,6 +2560,7 @@ dsa_resident_sorted_read_probe_kernel(
     uint32_t shardCountStride,
     uint32_t shardCountRequestStride)
 {
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
     DSAResidentSortedReadProbeKernel op;
     op.Init(
         shardCounts, priorSlots, debugInfo, priorReadback,
@@ -2590,6 +2592,7 @@ dsa_resident_sorted_finalize_kernel(
     uint32_t blockSize,
     uint32_t debugStage)
 {
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
     DSAResidentSortedFinalizeKernel op;
     op.Init(
         shardPacked, shardCounts, priorSlots,
@@ -2626,6 +2629,7 @@ dsa_resident_sorted_update_kernel(
     uint32_t shardCountRequestStride,
     uint32_t generationStride)
 {
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
     DSAResidentSortedUpdateKernel op;
     op.Init(
         topkIndices, shardPacked, shardMapping, shardCounts,
@@ -2663,6 +2667,7 @@ dsa_resident_sorted_state_update_kernel(
     uint32_t shardCountRequestStride,
     uint32_t generationStride)
 {
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
     DSAResidentSortedUpdateKernel op;
     op.Init(
         topkIndices, shardPacked, shardMapping, shardCounts,
@@ -2690,6 +2695,7 @@ dsa_resident_sorted_remap_kernel(
     uint32_t shardCountStride,
     uint32_t shardCountRequestStride)
 {
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
     DSAResidentSortedRemapKernel op;
     op.Init(
         topkIndices, shardMapping, shardCounts, priorSlots,
