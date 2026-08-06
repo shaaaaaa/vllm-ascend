@@ -1916,12 +1916,15 @@ def test_sorted_resident_full_path_supports_graph_replay(mtp):
     [(3, 4), (5, 8)],
     ids=["request-3-graph-8", "request-5-graph-16"],
 )
+@pytest.mark.parametrize("shards_per_row", [2], ids=["shards-per-row-2"])
 def test_sorted_resident_mtp2_graph_replay_with_inactive_request_rows(
     actual_requests,
     request_capacity,
+    shards_per_row,
 ):
-    """Compare the working graph-8 shape with the failing graph-16 shape."""
+    """Check graph-8 and graph-16 with an explicit shard budget."""
     mtp = 2
+    shard_count = resident_shard_count(mtp, shards_per_row)
     token_capacity = request_capacity * mtp
     active_tokens = actual_requests * mtp
     scratch_capacity = mtp * INDEX_TOPK
@@ -1978,12 +1981,14 @@ def test_sorted_resident_mtp2_graph_replay_with_inactive_request_rows(
         request_capacity,
         mtp,
         device=torch.device("npu"),
+        shard_count=shard_count,
     )
     state = allocate_sorted_resident_state(
         request_capacity,
         request_capacity,
         mtp,
         device=torch.device("npu"),
+        shard_count=shard_count,
     )
 
     graph = torch.npu.NPUGraph()
