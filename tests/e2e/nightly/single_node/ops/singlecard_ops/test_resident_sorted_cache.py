@@ -1922,6 +1922,7 @@ def test_sorted_resident_full_path_supports_graph_replay(mtp):
         (4, 5, 8),
         (4, 15, 15),
         (4, 15, 16),
+        (4, 41, 41),
     ],
     ids=[
         "shards-2-requests-8-logical-blocks-32",
@@ -1932,6 +1933,7 @@ def test_sorted_resident_full_path_supports_graph_replay(mtp):
         "shards-4-active-5-capacity-8-logical-blocks-64",
         "shards-4-requests-15-logical-blocks-120",
         "shards-4-active-15-capacity-16-logical-blocks-128",
+        "shards-4-requests-41-logical-blocks-328",
     ],
 )
 def test_sorted_resident_mtp2_graph_replay_with_inactive_request_rows(
@@ -2037,8 +2039,59 @@ def test_sorted_resident_mtp2_graph_replay_with_inactive_request_rows(
     graph.replay()
     torch.npu.synchronize()
 
-    assert torch.all(workspace.miss_counts[:actual_requests, 0].cpu() > 0)
-    assert torch.all(workspace.miss_counts[actual_requests:, 0].cpu() == 0)
+    # Validate every stage of the replay, not only the fact that active rows
+    # produced a miss.  This catches a kernel that launches successfully but
+    # silently drops work once its logical request/shard count exceeds the
+    # physical AIV count.
+    source_cpu = source.cpu()
+    boundaries_cpu = boundaries.cpu()
+    expected_shards = _assert_union_outputs(
+        source_cpu,
+        boundaries_cpu,
+        workspace,
+        mtp=mtp,
+    )
+    prior_slots = workspace.prior_slots.cpu()
+    for request in range(request_count):
+        for shard, expected_tokens in enumerate(expected_shards[request]):
+            count = len(expected_tokens)
+            assert prior_slots[request, shard, :count].tolist() == [-1] * count
+    block_table_cpu = block_table.cpu()
+    expected_values = source_cpu.reshape(request_count, -1).clone()
+    for request in range(request_count):
+        expected_state, expected_misses, expected_slots = _reference_step(
+            expected_shards[request],
+            {},
+            scratch_capacity,
+        )
+        miss_count = int(workspace.miss_counts[request, 0].cpu())
+        if request < actual_requests:
+            assert miss_count == len(expected_misses)
+            assert workspace.miss_tokens[request, :miss_count].cpu().tolist() == (
+                expected_misses
+            )
+            expected_target_slots = [
+                int(block_table_cpu[request, slot // block_size]) * block_size
+                + slot % block_size
+                for slot in expected_slots
+            ]
+            assert workspace.target_slots[
+                request, :miss_count
+            ].cpu().tolist() == expected_target_slots
+            assert _state_dict(state, request, shard_count) == expected_state
+            assert int(state.generations[request, 0].cpu()) == 1
+
+            for position, token in enumerate(expected_values[request].tolist()):
+                row = position // INDEX_TOPK
+                boundary = int(boundaries_cpu[request * mtp + row])
+                if 0 <= token < boundary:
+                    expected_values[request, position] = expected_state[token]
+        else:
+            assert miss_count == 0
+            assert torch.all(state.counts[request, :, 0].cpu() == 0)
+            assert int(state.generations[request, 0].cpu()) == -1
+
+    assert torch.equal(values.cpu(), expected_values.reshape_as(source_cpu))
 
 
 @pytest.mark.parametrize("mtp", [1, 2])
