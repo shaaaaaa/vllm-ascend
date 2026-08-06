@@ -386,6 +386,15 @@ class NPUPlatform(Platform):
             mla_split_op = "vllm::sfa_lmcache_retrieve" if cross_layer_sfa else "vllm::mla_forward"
             if mla_split_op not in compilation_config.splitting_ops:
                 compilation_config.splitting_ops.append(mla_split_op)
+            if (
+                cross_layer_sfa
+                and envs_ascend.VLLM_ASCEND_MTP_DRAFT_DEBUG
+                and "vllm::sfa_target_layer_diag"
+                not in compilation_config.splitting_ops
+            ):
+                compilation_config.splitting_ops.append(
+                    "vllm::sfa_target_layer_diag"
+                )
             update_aclgraph_sizes(vllm_config)
             ascend_config.ascend_compilation_config.enable_npugraph_ex = False
         elif (

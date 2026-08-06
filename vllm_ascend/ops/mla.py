@@ -33,6 +33,7 @@ from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.backend import AttentionMetadata  # type: ignore
 
+from vllm_ascend import envs as envs_ascend
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.utils import is_vl_model, parse_layer_idx, vllm_version_is
@@ -151,6 +152,10 @@ class AscendMultiHeadLatentAttention(MultiHeadLatentAttentionWrapper):
             else ""
         )
         self.use_cross_layer_sfa = getattr(self.mla_attn.impl, "enable_staged_sfa_graph", False) is True
+        self.target_sfa_debug = bool(
+            self.use_cross_layer_sfa
+            and envs_ascend.VLLM_ASCEND_MTP_DRAFT_DEBUG
+        )
 
         compilation_config = vllm_config.compilation_config
         if prefix in compilation_config.static_forward_context:
@@ -176,6 +181,12 @@ class AscendMultiHeadLatentAttention(MultiHeadLatentAttentionWrapper):
 
         if self.use_cross_layer_sfa:
             impl = self.mla_attn.impl
+            if self.target_sfa_debug:
+                torch.ops.vllm.sfa_target_layer_diag(
+                    hidden_states,
+                    self.prefix,
+                    "input",
+                )
             (
                 ql_nope,
                 q_pe,
@@ -217,6 +228,12 @@ class AscendMultiHeadLatentAttention(MultiHeadLatentAttentionWrapper):
                 output,
                 self.prefix,
             )
+            if self.target_sfa_debug:
+                torch.ops.vllm.sfa_target_layer_diag(
+                    output,
+                    self.prefix,
+                    "output",
+                )
         else:
             torch.ops.vllm.mla_forward(hidden_states, need_gather_q_kv, output, self.prefix)
         output = output.view(-1, hidden_dim)
@@ -416,6 +433,29 @@ def sfa_forward_post_fake(
     return
 
 
+def sfa_target_layer_diag(
+    tensor: torch.Tensor,
+    layer_name: str,
+    phase: str,
+) -> None:
+    context, layer, attn_metadata = _mla_runtime_metadata(layer_name)
+    layer.mla_attn.impl.target_sfa_diagnostic_boundary(
+        layer.mla_attn.layer_name,
+        phase,
+        tensor,
+        attn_metadata,
+        context,
+    )
+
+
+def sfa_target_layer_diag_fake(
+    tensor: torch.Tensor,
+    layer_name: str,
+    phase: str,
+) -> None:
+    return
+
+
 direct_register_custom_op(
     op_name="sfa_forward_pre",
     op_func=sfa_forward_pre,
@@ -435,5 +475,12 @@ direct_register_custom_op(
     op_func=sfa_forward_post,
     mutates_args=["output"],
     fake_impl=sfa_forward_post_fake,
+    dispatch_key="PrivateUse1",
+)
+direct_register_custom_op(
+    op_name="sfa_target_layer_diag",
+    op_func=sfa_target_layer_diag,
+    mutates_args=["tensor"],
+    fake_impl=sfa_target_layer_diag_fake,
     dispatch_key="PrivateUse1",
 )

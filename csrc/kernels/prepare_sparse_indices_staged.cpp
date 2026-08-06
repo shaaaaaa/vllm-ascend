@@ -22,6 +22,7 @@ constexpr uint32_t kCumSumWorkspaceBytes =
 constexpr uint32_t kDataBlockBytes = 32;
 constexpr uint32_t kInt32PerDataBlock =
     kDataBlockBytes / sizeof(int32_t);
+constexpr uint32_t kInt32PerCacheline = 16;
 constexpr AscendC::CumSumConfig kCumSumConfig{true, false, false};
 
 template <AscendC::HardEvent event>
@@ -109,12 +110,16 @@ public:
         __gm__ int32_t* rowReqIndices,
         __gm__ int32_t* rowPacked,
         __gm__ int32_t* rowCounts,
+        __gm__ int32_t* selectedCount,
+        __gm__ int32_t* positionMap,
         uint32_t rowCount,
         uint32_t rowWidth,
         uint32_t requestCount,
         uint32_t rowsPerRequest,
         uint32_t scratchCapacity,
+        uint32_t selectedCountStride,
         uint32_t coreCount,
+        bool emitPositionMap,
         bool clearInvalidRows)
     {
         rowCount_ = rowCount;
@@ -122,7 +127,9 @@ public:
         requestCount_ = requestCount;
         rowsPerRequest_ = rowsPerRequest;
         scratchCapacity_ = scratchCapacity;
+        selectedCountStride_ = selectedCountStride;
         coreCount_ = coreCount;
+        emitPositionMap_ = emitPositionMap;
         clearInvalidRows_ = clearInvalidRows;
         topkIndices_.SetGlobalBuffer(
             topkIndices,
@@ -134,6 +141,12 @@ public:
             static_cast<uint64_t>(requestCount_) * scratchCapacity_);
         rowCounts_.SetGlobalBuffer(
             rowCounts,
+            static_cast<uint64_t>(requestCount_) * scratchCapacity_);
+        selectedCount_.SetGlobalBuffer(
+            selectedCount,
+            static_cast<uint64_t>(requestCount_) * selectedCountStride_);
+        positionMap_.SetGlobalBuffer(
+            positionMap,
             static_cast<uint64_t>(requestCount_) * scratchCapacity_);
 
         const uint32_t rowBytes = rowWidth_ * sizeof(int32_t);
@@ -186,6 +199,12 @@ private:
         if (rowRequest < 0) {
             AscendC::Duplicate(
                 packed, static_cast<int32_t>(0x7FFFFFFF), rowWidth_);
+            if (emitPositionMap_) {
+                AscendC::Duplicate(
+                    flags.ReinterpretCast<int32_t>(),
+                    static_cast<int32_t>(-1),
+                    rowWidth_);
+            }
             if (clearInvalidRows_) {
                 AscendC::Duplicate(
                     input, static_cast<int32_t>(0), rowWidth_);
@@ -198,7 +217,18 @@ private:
                 AscendC::DataCopy(
                     topkIndices_[inputOffset], input, rowWidth_);
             }
-            rowCounts_.SetValue(packedOffset, 0);
+            if (emitPositionMap_) {
+                AscendC::DataCopy(
+                    positionMap_[packedOffset],
+                    flags.ReinterpretCast<int32_t>(),
+                    rowWidth_);
+                selectedCount_.SetValue(
+                    static_cast<uint64_t>(request)
+                        * selectedCountStride_,
+                    0);
+            } else {
+                rowCounts_.SetValue(packedOffset, 0);
+            }
             return;
         }
 
@@ -206,11 +236,28 @@ private:
         if (boundary <= 0) {
             AscendC::Duplicate(
                 packed, static_cast<int32_t>(0x7FFFFFFF), rowWidth_);
+            if (emitPositionMap_) {
+                AscendC::Duplicate(
+                    flags.ReinterpretCast<int32_t>(),
+                    static_cast<int32_t>(-1),
+                    rowWidth_);
+            }
             AscendC::PipeBarrier<PIPE_V>();
             Sync<AscendC::HardEvent::V_MTE3>();
             AscendC::DataCopy(
                 rowPacked_[packedOffset], packed, rowWidth_);
-            rowCounts_.SetValue(packedOffset, 0);
+            if (emitPositionMap_) {
+                AscendC::DataCopy(
+                    positionMap_[packedOffset],
+                    flags.ReinterpretCast<int32_t>(),
+                    rowWidth_);
+                selectedCount_.SetValue(
+                    static_cast<uint64_t>(request)
+                        * selectedCountStride_,
+                    0);
+            } else {
+                rowCounts_.SetValue(packedOffset, 0);
+            }
             return;
         }
         AscendC::Maxs(
@@ -311,13 +358,41 @@ private:
             AscendC::SELMODE::VSEL_TENSOR_TENSOR_MODE,
             rowWidth_);
         AscendC::PipeBarrier<PIPE_V>();
+        if (emitPositionMap_) {
+            // MTP=1 bypasses union, but the resident planner still needs the
+            // same position -> selected-rank contract as the MTP=2 path.
+            // Reuse the dead flags buffer after CumSum to avoid increasing UB.
+            AscendC::Duplicate(
+                flags.ReinterpretCast<int32_t>(),
+                static_cast<int32_t>(-1),
+                rowWidth_);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Select(
+                flags,
+                selectedMask,
+                clamped.ReinterpretCast<float>(),
+                flags,
+                AscendC::SELMODE::VSEL_TENSOR_TENSOR_MODE,
+                rowWidth_);
+            AscendC::PipeBarrier<PIPE_V>();
+        }
         Sync<AscendC::HardEvent::V_MTE3>();
         AscendC::DataCopy(
             topkIndices_[inputOffset], input, rowWidth_);
         AscendC::DataCopy(
             rowPacked_[packedOffset], packed, rowWidth_);
-        rowCounts_.SetValue(
-            packedOffset, static_cast<int32_t>(selectedCount));
+        if (emitPositionMap_) {
+            AscendC::DataCopy(
+                positionMap_[packedOffset],
+                flags.ReinterpretCast<int32_t>(),
+                rowWidth_);
+            selectedCount_.SetValue(
+                static_cast<uint64_t>(request) * selectedCountStride_,
+                static_cast<int32_t>(selectedCount));
+        } else {
+            rowCounts_.SetValue(
+                packedOffset, static_cast<int32_t>(selectedCount));
+        }
     }
 
     AscendC::GlobalTensor<int32_t> topkIndices_;
@@ -325,6 +400,8 @@ private:
     AscendC::GlobalTensor<int32_t> rowReqIndices_;
     AscendC::GlobalTensor<int32_t> rowPacked_;
     AscendC::GlobalTensor<int32_t> rowCounts_;
+    AscendC::GlobalTensor<int32_t> selectedCount_;
+    AscendC::GlobalTensor<int32_t> positionMap_;
     AscendC::TPipe pipe_;
     AscendC::TBuf<AscendC::TPosition::VECCALC> inputBuf_;
     AscendC::TBuf<AscendC::TPosition::VECCALC> clampedBuf_;
@@ -340,7 +417,9 @@ private:
     uint32_t requestCount_ = 0;
     uint32_t rowsPerRequest_ = 0;
     uint32_t scratchCapacity_ = 0;
+    uint32_t selectedCountStride_ = 0;
     uint32_t coreCount_ = 0;
+    bool emitPositionMap_ = false;
     bool clearInvalidRows_ = false;
 };
 
@@ -900,7 +979,7 @@ public:
         }
         rowCounts_.SetGlobalBuffer(
             rowCounts,
-            static_cast<uint64_t>(requestCount_) * scratchCapacity_);
+            static_cast<uint64_t>(requestCount_) * selectedCountStride_);
         selectedCount_.SetGlobalBuffer(
             selectedCount,
             static_cast<uint64_t>(requestCount_) * selectedCountStride_);
@@ -933,7 +1012,8 @@ public:
         const uint64_t outputOffset =
             static_cast<uint64_t>(request) * scratchCapacity_;
         const uint32_t count = static_cast<uint32_t>(
-            rowCounts_.GetValue(outputOffset));
+            rowCounts_.GetValue(
+                static_cast<uint64_t>(request) * selectedCountStride_));
         if (count == 0) {
             selectedCount_.SetValue(
                 static_cast<uint64_t>(request) * selectedCountStride_, 0);
@@ -1205,22 +1285,28 @@ public:
     __aicore__ inline void Init(
         __gm__ int32_t* topkIndices,
         __gm__ int32_t* splitBoundary,
+        __gm__ int32_t* rowReqIndices,
         __gm__ int32_t* shardPacked,
         __gm__ int32_t* shardMapping,
         __gm__ int32_t* shardCounts,
         uint32_t requestCount,
         uint32_t rowsPerRequest,
         uint32_t rowWidth,
+        uint32_t shardCapacity,
         uint32_t shardCount,
-        uint32_t shardCountStride)
+        uint32_t shardCountStride,
+        uint32_t shardCountRequestStride,
+        bool useRowReqIndices)
     {
         requestCount_ = requestCount;
         rowsPerRequest_ = rowsPerRequest;
         rowWidth_ = rowWidth;
         requestWidth_ = rowsPerRequest * rowWidth;
-        shardWidth_ = rowWidth;
+        shardWidth_ = shardCapacity;
         shardCount_ = shardCount;
         shardCountStride_ = shardCountStride;
+        shardCountRequestStride_ = shardCountRequestStride;
+        useRowReqIndices_ = useRowReqIndices;
         uint32_t shifted = shardCount_;
         while (shifted > 1) {
             shifted >>= 1;
@@ -1230,13 +1316,15 @@ public:
             topkIndices, requestCount_ * requestWidth_);
         splitBoundary_.SetGlobalBuffer(
             splitBoundary, requestCount_ * rowsPerRequest_);
+        rowReqIndices_.SetGlobalBuffer(
+            rowReqIndices, requestCount_ * rowsPerRequest_);
         shardPacked_.SetGlobalBuffer(
             shardPacked, requestCount_ * shardCount_ * shardWidth_);
         shardMapping_.SetGlobalBuffer(
             shardMapping, requestCount_ * shardCount_ * requestWidth_);
         shardCounts_.SetGlobalBuffer(
             shardCounts,
-            requestCount_ * shardCount_ * shardCountStride_);
+            requestCount_ * shardCountRequestStride_);
 
         // Scan one MTP row at a time.  This keeps UB use independent of the
         // MTP depth while all rows belonging to the request feed one shard.
@@ -1275,8 +1363,8 @@ public:
             (static_cast<uint64_t>(request) * shardCount_ + shard)
             * requestWidth_;
         const uint64_t countOffset =
-            (static_cast<uint64_t>(request) * shardCount_ + shard)
-            * shardCountStride_;
+            static_cast<uint64_t>(request) * shardCountRequestStride_
+            + shard * shardCountStride_;
 
         auto input = inputBuf_.Get<int32_t>();
         auto work = workBuf_.Get<int32_t>();
@@ -1309,6 +1397,11 @@ public:
         uint32_t shardElements = 0;
         uint32_t compactEnd = 0;
         for (uint32_t mtpRow = 0; mtpRow < rowsPerRequest_; ++mtpRow) {
+            const uint32_t row = request * rowsPerRequest_ + mtpRow;
+            if (useRowReqIndices_ &&
+                rowReqIndices_.GetValue(row) != static_cast<int32_t>(request)) {
+                continue;
+            }
             const uint64_t inputOffset =
                 static_cast<uint64_t>(request) * requestWidth_
                 + static_cast<uint64_t>(mtpRow) * rowWidth_;
@@ -1433,18 +1526,25 @@ public:
             return;
         }
 
+        const uint32_t sortElements = SortElementCount(compactEnd);
         AscendC::Cast(
             src,
             compactTokens,
             AscendC::RoundMode::CAST_NONE,
-            shardWidth_);
-        AscendC::Muls(src, src, -1.0F, shardWidth_);
+            sortElements);
+        AscendC::Muls(src, src, -1.0F, sortElements);
         AscendC::DataCopy(
-            srcInt[shardWidth_], compactIndices, shardWidth_);
+            srcInt[sortElements], compactIndices, sortElements);
         AscendC::PipeBarrier<PIPE_V>();
-        SortAll(src, tmp);
+        SortAll(src, tmp, sortElements);
+        // Finalize adds each shard's request-local prefix before taking the
+        // maximum across dense maps.  A plain -1 sentinel would therefore
+        // become a non-negative false rank for every shard with a non-zero
+        // prefix and overwrite mappings owned by earlier shards.
         AscendC::Duplicate(
-            mapping, static_cast<int32_t>(-1), requestWidth_);
+            mapping,
+            -static_cast<int32_t>(requestWidth_ + 1),
+            requestWidth_);
         AscendC::PipeBarrier<PIPE_V>();
         Sync<AscendC::HardEvent::V_S>();
 
@@ -1482,15 +1582,29 @@ public:
     }
 
 private:
+    __aicore__ inline uint32_t SortElementCount(uint32_t count)
+    {
+        uint32_t groups =
+            (count + kSortGroup - 1) / kSortGroup;
+        groups = groups == 0 ? 1 : groups;
+        uint32_t scale = 1;
+        while (groups > kMergeWays) {
+            groups = (groups + kMergeWays - 1) / kMergeWays;
+            scale *= kMergeWays;
+        }
+        return groups * scale * kSortGroup;
+    }
+
     __aicore__ inline void SortAll(
         AscendC::LocalTensor<float>& src,
-        AscendC::LocalTensor<float>& tmp)
+        AscendC::LocalTensor<float>& tmp,
+        uint32_t sortElements)
     {
-        const uint32_t repeats = shardWidth_ / kSortGroup;
+        const uint32_t repeats = sortElements / kSortGroup;
         AscendC::Sort32(
             tmp,
             src,
-            src[shardWidth_].ReinterpretCast<uint32_t>(),
+            src[sortElements].ReinterpretCast<uint32_t>(),
             repeats);
         AscendC::PipeBarrier<PIPE_V>();
         uint32_t groups = repeats;
@@ -1527,13 +1641,14 @@ private:
             ++pass;
         }
         if (pass % 2 == 0) {
-            AscendC::DataCopy(src, tmp, shardWidth_ * kPairWidth);
+            AscendC::DataCopy(src, tmp, sortElements * kPairWidth);
             AscendC::PipeBarrier<PIPE_V>();
         }
     }
 
     AscendC::GlobalTensor<int32_t> topkIndices_;
     AscendC::GlobalTensor<int32_t> splitBoundary_;
+    AscendC::GlobalTensor<int32_t> rowReqIndices_;
     AscendC::GlobalTensor<int32_t> shardPacked_;
     AscendC::GlobalTensor<int32_t> shardMapping_;
     AscendC::GlobalTensor<int32_t> shardCounts_;
@@ -1559,7 +1674,9 @@ private:
     uint32_t shardWidth_ = 0;
     uint32_t shardCount_ = 0;
     uint32_t shardCountStride_ = 0;
+    uint32_t shardCountRequestStride_ = 0;
     uint32_t shardBits_ = 0;
+    bool useRowReqIndices_ = false;
 };
 
 // Experimental follow-up to DSAStagedShardedSortKernel. Deduplication and
@@ -2009,6 +2126,14 @@ private:
         uint64_t mapOffset,
         uint64_t countOffset)
     {
+        // Publish the union before reusing the CumSum workspace for the dense
+        // scatter.  Keeping this copy adjacent to the GatherMask producer
+        // avoids extending unionLocal's vector-pipeline lifetime across the
+        // following scalar scatter.
+        Sync<AscendC::HardEvent::V_MTE3>();
+        CopyLocalToGlobalExact(
+            shardPacked_[shardOffset], unionLocal, uniqueCount);
+
         // CumSum has completed, so its 64-KiB workspace can be reused as the
         // dense request mapping without increasing peak UB use. Every stage
         // AIV writes only its own shard scratch segment.
@@ -2028,8 +2153,6 @@ private:
 
         Sync<AscendC::HardEvent::S_MTE3>();
         Sync<AscendC::HardEvent::V_MTE3>();
-        CopyLocalToGlobalExact(
-            shardPacked_[shardOffset], unionLocal, uniqueCount);
         AscendC::DataCopy(
             shardMapping_[mapOffset], mapping, requestWidth_);
         shardCounts_.SetValue(
@@ -2474,6 +2597,14 @@ public:
             count += shardUnique;
         }
 
+        if (count != 0) {
+            // The loop orders each selected copy against the following MTE2
+            // load.  After the final shard, however, packed is reused directly
+            // by vector target generation.  Complete that last MTE3 read
+            // before allowing the V pipe to overwrite the same UB buffer.
+            Sync<AscendC::HardEvent::MTE3_V>();
+        }
+
         for (uint32_t offset = 0; offset < count; offset += rowWidth_) {
             const uint32_t remaining = count - offset;
             const uint32_t tile =
@@ -2642,9 +2773,13 @@ public:
             AscendC::Max(
                 accumMap, accumMap, shardMap, partWidth_);
             AscendC::PipeBarrier<PIPE_V>();
+            // The next iteration reuses shardMap as an MTE2 destination.
+            // PipeBarrier orders only vector instructions; without this
+            // cross-pipe dependency the following DMA may overwrite ranks
+            // that Max is still consuming.
+            Sync<AscendC::HardEvent::V_MTE2>();
         }
 
-        Sync<AscendC::HardEvent::V_MTE2>();
         AscendC::DataCopy(
             input,
             topkIndices_[requestBase + partBegin],
@@ -2702,6 +2837,7 @@ class DSAStagedShardedFinalizeKernel {
 public:
     __aicore__ inline void Init(
         __gm__ int32_t* topkIndices,
+        __gm__ int32_t* rowReqIndices,
         __gm__ int32_t* selectedPacked,
         __gm__ int32_t* localToUnion,
         __gm__ int32_t* selectedCount,
@@ -2713,21 +2849,31 @@ public:
         uint32_t requestCount,
         uint32_t rowsPerRequest,
         uint32_t rowWidth,
+        uint32_t shardCapacity,
         uint32_t shardCount,
         uint32_t blockTableWidth,
         uint32_t selectedCountStride,
         uint32_t shardCountStride,
-        uint32_t blockSize)
+        uint32_t shardCountRequestStride,
+        uint32_t blockSize,
+        bool useRowReqIndices,
+        bool clearInvalidRows,
+        bool needPacked)
     {
         requestCount_ = requestCount;
         rowsPerRequest_ = rowsPerRequest;
         rowWidth_ = rowWidth;
         requestWidth_ = rowsPerRequest * rowWidth;
+        shardCapacity_ = shardCapacity;
         shardCount_ = shardCount;
         blockTableWidth_ = blockTableWidth;
         selectedCountStride_ = selectedCountStride;
         shardCountStride_ = shardCountStride;
+        shardCountRequestStride_ = shardCountRequestStride;
         blockSize_ = blockSize;
+        useRowReqIndices_ = useRowReqIndices;
+        clearInvalidRows_ = clearInvalidRows;
+        needPacked_ = needPacked;
         uint32_t shifted = blockSize_;
         while (shifted > 1) {
             shifted >>= 1;
@@ -2735,6 +2881,8 @@ public:
         }
         topkIndices_.SetGlobalBuffer(
             topkIndices, requestCount_ * requestWidth_);
+        rowReqIndices_.SetGlobalBuffer(
+            rowReqIndices, requestCount_ * rowsPerRequest_);
         selectedPacked_.SetGlobalBuffer(
             selectedPacked, requestCount_ * requestWidth_);
         localToUnion_.SetGlobalBuffer(
@@ -2746,13 +2894,13 @@ public:
         targetSlots_.SetGlobalBuffer(
             targetSlots, requestCount_ * requestWidth_);
         shardPacked_.SetGlobalBuffer(
-            shardPacked, requestCount_ * shardCount_ * rowWidth_);
+            shardPacked, requestCount_ * shardCount_ * shardCapacity_);
         shardMapping_.SetGlobalBuffer(
             shardMapping, requestCount_ * shardCount_ * requestWidth_);
         shardCounts_.SetGlobalBuffer(
             shardCounts,
-            requestCount_ * shardCount_ * shardCountStride_);
-        pipe_.InitBuffer(packedBuf_, rowWidth_ * sizeof(int32_t));
+            requestCount_ * shardCountRequestStride_);
+        pipe_.InitBuffer(packedBuf_, shardCapacity_ * sizeof(int32_t));
         pipe_.InitBuffer(accumMapBuf_, requestWidth_ * sizeof(int32_t));
         pipe_.InitBuffer(shardMapBuf_, requestWidth_ * sizeof(int32_t));
         pipe_.InitBuffer(rankBuf_, rowWidth_ * sizeof(int32_t));
@@ -2774,7 +2922,7 @@ public:
         const uint64_t outputOffset =
             static_cast<uint64_t>(request) * requestWidth_;
         const uint64_t shardBase =
-            static_cast<uint64_t>(request) * shardCount_ * rowWidth_;
+            static_cast<uint64_t>(request) * shardCount_ * shardCapacity_;
         const uint64_t mapBase =
             static_cast<uint64_t>(request) * shardCount_ * requestWidth_;
 
@@ -2803,11 +2951,12 @@ public:
         for (uint32_t shard = 0; shard < shardCount_; ++shard) {
             const uint32_t shardUnique = static_cast<uint32_t>(
                 shardCounts_.GetValue(
-                    (static_cast<uint64_t>(request) * shardCount_ + shard)
-                    * shardCountStride_));
+                    static_cast<uint64_t>(request)
+                        * shardCountRequestStride_
+                    + shard * shardCountStride_));
             CopyGlobalToLocalExact(
                 packed,
-                shardPacked_[shardBase + shard * rowWidth_],
+                shardPacked_[shardBase + shard * shardCapacity_],
                 shardUnique);
             AscendC::DataCopy(
                 shardMap,
@@ -2824,12 +2973,14 @@ public:
                 accumMap, accumMap, shardMap, requestWidth_);
             AscendC::PipeBarrier<PIPE_V>();
             Sync<AscendC::HardEvent::V_MTE2>();
-            Sync<AscendC::HardEvent::MTE2_MTE3>();
-            CopyLocalToGlobalExact(
-                selectedPacked_[outputOffset + count],
-                packed,
-                shardUnique);
-            Sync<AscendC::HardEvent::MTE3_MTE2>();
+            if (needPacked_) {
+                Sync<AscendC::HardEvent::MTE2_MTE3>();
+                CopyLocalToGlobalExact(
+                    selectedPacked_[outputOffset + count],
+                    packed,
+                    shardUnique);
+                Sync<AscendC::HardEvent::MTE3_MTE2>();
+            }
             count += shardUnique;
         }
 
@@ -2842,6 +2993,22 @@ public:
         // token index while remapping selected positions in place.
         for (uint32_t mtpRow = 0; mtpRow < rowsPerRequest_; ++mtpRow) {
             const uint32_t rowOffset = mtpRow * rowWidth_;
+            const uint32_t row = request * rowsPerRequest_ + mtpRow;
+            if (useRowReqIndices_ &&
+                rowReqIndices_.GetValue(row) != static_cast<int32_t>(request)) {
+                if (clearInvalidRows_) {
+                    AscendC::Duplicate(
+                        physical, static_cast<int32_t>(0), rowWidth_);
+                    AscendC::PipeBarrier<PIPE_V>();
+                    Sync<AscendC::HardEvent::V_MTE3>();
+                    AscendC::DataCopy(
+                        topkIndices_[outputOffset + rowOffset],
+                        physical,
+                        rowWidth_);
+                    Sync<AscendC::HardEvent::MTE3_MTE2>();
+                }
+                continue;
+            }
             auto mapping = accumMap[rowOffset];
             AscendC::DataCopy(
                 packed,
@@ -2871,63 +3038,69 @@ public:
                 topkIndices_[outputOffset + rowOffset],
                 physical,
                 rowWidth_);
-            Sync<AscendC::HardEvent::MTE3_V>();
+            // The next row immediately reuses packed as an MTE2 destination.
+            // Wait on that consumer pipe explicitly instead of relying on a
+            // V-side dependency through a different local tensor.
+            Sync<AscendC::HardEvent::MTE3_MTE2>();
         }
 
-        for (uint32_t offset = 0; offset < count; offset += rowWidth_) {
-            const uint32_t remaining = count - offset;
-            const uint32_t tile =
-                remaining < rowWidth_ ? remaining : rowWidth_;
-            AscendC::CreateVecIndex(
-                ranks, static_cast<int32_t>(offset), tile);
-            AscendC::ShiftRight(
-                logical,
-                ranks,
-                static_cast<int32_t>(blockSizeShift_),
-                tile);
-            AscendC::PipeBarrier<PIPE_V>();
-            AscendC::Muls(
-                shardMap,
-                logical,
-                static_cast<int32_t>(sizeof(int32_t)),
-                tile);
-            AscendC::PipeBarrier<PIPE_V>();
-            AscendC::Gather(
-                physical,
-                blockTable,
-                shardMap.ReinterpretCast<uint32_t>(),
-                static_cast<uint32_t>(0),
-                tile);
-            AscendC::PipeBarrier<PIPE_V>();
-            AscendC::Muls(
-                physical, physical,
-                static_cast<int32_t>(blockSize_), tile);
-            AscendC::Muls(
-                logical, logical,
-                static_cast<int32_t>(blockSize_), tile);
-            AscendC::PipeBarrier<PIPE_V>();
-            AscendC::Sub(ranks, ranks, logical, tile);
-            AscendC::PipeBarrier<PIPE_V>();
-            AscendC::Add(physical, physical, ranks, tile);
-            AscendC::PipeBarrier<PIPE_V>();
-            AscendC::Cast(
-                targets,
-                physical,
-                AscendC::RoundMode::CAST_NONE,
-                tile);
-            AscendC::PipeBarrier<PIPE_V>();
-            Sync<AscendC::HardEvent::V_MTE3>();
-            CopyLocalToGlobalExact(
-                targetSlots_[outputOffset + offset], targets, tile);
-            Sync<AscendC::HardEvent::MTE3_V>();
+        if (needPacked_) {
+            for (uint32_t offset = 0; offset < count; offset += rowWidth_) {
+                const uint32_t remaining = count - offset;
+                const uint32_t tile =
+                    remaining < rowWidth_ ? remaining : rowWidth_;
+                AscendC::CreateVecIndex(
+                    ranks, static_cast<int32_t>(offset), tile);
+                AscendC::ShiftRight(
+                    logical,
+                    ranks,
+                    static_cast<int32_t>(blockSizeShift_),
+                    tile);
+                AscendC::PipeBarrier<PIPE_V>();
+                AscendC::Muls(
+                    shardMap,
+                    logical,
+                    static_cast<int32_t>(sizeof(int32_t)),
+                    tile);
+                AscendC::PipeBarrier<PIPE_V>();
+                AscendC::Gather(
+                    physical,
+                    blockTable,
+                    shardMap.ReinterpretCast<uint32_t>(),
+                    static_cast<uint32_t>(0),
+                    tile);
+                AscendC::PipeBarrier<PIPE_V>();
+                AscendC::Muls(
+                    physical, physical,
+                    static_cast<int32_t>(blockSize_), tile);
+                AscendC::Muls(
+                    logical, logical,
+                    static_cast<int32_t>(blockSize_), tile);
+                AscendC::PipeBarrier<PIPE_V>();
+                AscendC::Sub(ranks, ranks, logical, tile);
+                AscendC::PipeBarrier<PIPE_V>();
+                AscendC::Add(physical, physical, ranks, tile);
+                AscendC::PipeBarrier<PIPE_V>();
+                AscendC::Cast(
+                    targets,
+                    physical,
+                    AscendC::RoundMode::CAST_NONE,
+                    tile);
+                AscendC::PipeBarrier<PIPE_V>();
+                Sync<AscendC::HardEvent::V_MTE3>();
+                CopyLocalToGlobalExact(
+                    targetSlots_[outputOffset + offset], targets, tile);
+                Sync<AscendC::HardEvent::MTE3_V>();
+            }
         }
         selectedCount_.SetValue(
             static_cast<uint64_t>(request) * selectedCountStride_,
-            static_cast<int32_t>(count));
+            needPacked_ ? static_cast<int32_t>(count) : 0);
     }
 
 private:
     AscendC::GlobalTensor<int32_t> topkIndices_;
+    AscendC::GlobalTensor<int32_t> rowReqIndices_;
     AscendC::GlobalTensor<int32_t> selectedPacked_;
     AscendC::GlobalTensor<int32_t> localToUnion_;
     AscendC::GlobalTensor<int32_t> selectedCount_;
@@ -2950,12 +3123,17 @@ private:
     uint32_t rowsPerRequest_ = 0;
     uint32_t rowWidth_ = 0;
     uint32_t requestWidth_ = 0;
+    uint32_t shardCapacity_ = 0;
     uint32_t shardCount_ = 0;
     uint32_t blockTableWidth_ = 0;
     uint32_t selectedCountStride_ = 0;
     uint32_t shardCountStride_ = 0;
+    uint32_t shardCountRequestStride_ = 0;
     uint32_t blockSize_ = 0;
     uint32_t blockSizeShift_ = 0;
+    bool useRowReqIndices_ = false;
+    bool clearInvalidRows_ = false;
+    bool needPacked_ = true;
 };
 
 class DSAStagedRemapRowsKernel {
@@ -3015,6 +3193,533 @@ private:
     AscendC::TBuf<AscendC::TPosition::VECCALC> offsetBuf_;
     uint32_t rowCount_ = 0;
     uint32_t rowWidth_ = 0;
+};
+
+// Resident mapping is position-sharded: one AIV owns one complete source
+// top-k row. Each output row is cacheline aligned and has a single writer.
+class DSAResidentRemapRowsKernel {
+public:
+    __aicore__ inline void Init(
+        __gm__ int32_t* topkIndices,
+        __gm__ int32_t* positionToUnion,
+        __gm__ int32_t* unionToSlot,
+        uint32_t rowCount,
+        uint32_t rowWidth,
+        uint32_t rowsPerRequest,
+        uint32_t scratchCapacity)
+    {
+        rowCount_ = rowCount;
+        rowWidth_ = rowWidth;
+        rowsPerRequest_ = rowsPerRequest;
+        scratchCapacity_ = scratchCapacity;
+        topkIndices_.SetGlobalBuffer(
+            topkIndices,
+            static_cast<uint64_t>(rowCount_) * rowWidth_);
+        positionToUnion_.SetGlobalBuffer(
+            positionToUnion,
+            static_cast<uint64_t>(rowCount_) * rowWidth_);
+        const uint32_t requestCount = rowCount_ / rowsPerRequest_;
+        unionToSlot_.SetGlobalBuffer(
+            unionToSlot,
+            static_cast<uint64_t>(requestCount) * scratchCapacity_);
+        pipe_.InitBuffer(inputBuf_, rowWidth_ * sizeof(int32_t));
+        pipe_.InitBuffer(rankBuf_, rowWidth_ * sizeof(int32_t));
+        pipe_.InitBuffer(clampedBuf_, rowWidth_ * sizeof(int32_t));
+        // ranks becomes the Gather destination after Compare, while clamped
+        // becomes the final Select destination after serving as byte offsets.
+        // Their lifetimes do not overlap, so this reduces peak UB usage by two
+        // row buffers without changing the remap algorithm.
+        pipe_.InitBuffer(
+            unionBuf_, scratchCapacity_ * sizeof(int32_t));
+        pipe_.InitBuffer(selectedMaskBuf_, rowWidth_ / 8);
+    }
+
+    __aicore__ inline void Process()
+    {
+        const uint32_t row = AscendC::GetBlockIdx();
+        if (row >= rowCount_) {
+            return;
+        }
+        const uint32_t request = row / rowsPerRequest_;
+        const uint64_t rowOffset =
+            static_cast<uint64_t>(row) * rowWidth_;
+        const uint64_t unionOffset =
+            static_cast<uint64_t>(request) * scratchCapacity_;
+        auto input = inputBuf_.Get<int32_t>();
+        auto ranks = rankBuf_.Get<int32_t>();
+        auto clamped = clampedBuf_.Get<int32_t>();
+        auto unionSlots = unionBuf_.Get<int32_t>();
+        auto selectedMask = selectedMaskBuf_.Get<uint8_t>();
+        AscendC::DataCopy(
+            input, topkIndices_[rowOffset], rowWidth_);
+        AscendC::DataCopy(
+            ranks, positionToUnion_[rowOffset], rowWidth_);
+        AscendC::DataCopy(
+            unionSlots, unionToSlot_[unionOffset], scratchCapacity_);
+        Sync<AscendC::HardEvent::MTE2_V>();
+
+        AscendC::Maxs(
+            clamped, ranks, static_cast<int32_t>(0), rowWidth_);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Compare(
+            selectedMask,
+            clamped,
+            ranks,
+            AscendC::CMPMODE::EQ,
+            rowWidth_);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Mins(
+            clamped,
+            clamped,
+            static_cast<int32_t>(scratchCapacity_ - 1),
+            rowWidth_);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Muls(
+            clamped,
+            clamped,
+            static_cast<int32_t>(sizeof(int32_t)),
+            rowWidth_);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Gather(
+            ranks,
+            unionSlots,
+            clamped.ReinterpretCast<uint32_t>(),
+            static_cast<uint32_t>(0),
+            rowWidth_);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Select(
+            clamped.ReinterpretCast<float>(),
+            selectedMask,
+            ranks.ReinterpretCast<float>(),
+            input.ReinterpretCast<float>(),
+            AscendC::SELMODE::VSEL_TENSOR_TENSOR_MODE,
+            rowWidth_);
+        AscendC::PipeBarrier<PIPE_V>();
+        Sync<AscendC::HardEvent::V_MTE3>();
+        AscendC::DataCopy(
+            topkIndices_[rowOffset], clamped, rowWidth_);
+    }
+
+private:
+    AscendC::GlobalTensor<int32_t> topkIndices_;
+    AscendC::GlobalTensor<int32_t> positionToUnion_;
+    AscendC::GlobalTensor<int32_t> unionToSlot_;
+    AscendC::TPipe pipe_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> inputBuf_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> rankBuf_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> clampedBuf_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> unionBuf_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> selectedMaskBuf_;
+    uint32_t rowCount_ = 0;
+    uint32_t rowWidth_ = 0;
+    uint32_t rowsPerRequest_ = 0;
+    uint32_t scratchCapacity_ = 0;
+};
+
+// Build the flattened int64 indices consumed by the native NPU gather. One
+// AIV owns one complete request row; padding is redirected to that request's
+// private sentinel token, so no two requests touch the same cacheline.
+class DSAResidentLookupRowsKernel {
+public:
+    __aicore__ inline void Init(
+        __gm__ int32_t* selectedPacked,
+        __gm__ int32_t* selectedCount,
+        __gm__ int32_t* requestStateIndices,
+        __gm__ int32_t* lookupIndexWords,
+        uint32_t requestCount,
+        uint32_t scratchCapacity,
+        uint32_t selectedCountStride,
+        uint32_t tokenStride,
+        uint32_t dummyStateBase)
+    {
+        requestCount_ = requestCount;
+        scratchCapacity_ = scratchCapacity;
+        selectedCountStride_ = selectedCountStride;
+        tokenStride_ = tokenStride;
+        dummyStateBase_ = dummyStateBase;
+        selectedPacked_.SetGlobalBuffer(
+            selectedPacked,
+            static_cast<uint64_t>(requestCount_) * scratchCapacity_);
+        selectedCount_.SetGlobalBuffer(
+            selectedCount,
+            static_cast<uint64_t>(requestCount_) * selectedCountStride_);
+        requestStateIndices_.SetGlobalBuffer(
+            requestStateIndices, requestCount_);
+        lookupIndexWords_.SetGlobalBuffer(
+            lookupIndexWords,
+            2 * static_cast<uint64_t>(requestCount_) * scratchCapacity_);
+        pipe_.InitBuffer(tokenBuf_, scratchCapacity_ * sizeof(int32_t));
+        pipe_.InitBuffer(positionBuf_, scratchCapacity_ * sizeof(int32_t));
+        pipe_.InitBuffer(indexBuf_, scratchCapacity_ * sizeof(int32_t));
+        pipe_.InitBuffer(index64Buf_, scratchCapacity_ * sizeof(int64_t));
+        pipe_.InitBuffer(validMaskBuf_, scratchCapacity_ / 8);
+    }
+
+    __aicore__ inline void Process()
+    {
+        const uint32_t request = AscendC::GetBlockIdx();
+        if (request >= requestCount_) {
+            return;
+        }
+        const uint64_t offset =
+            static_cast<uint64_t>(request) * scratchCapacity_;
+        auto tokens = tokenBuf_.Get<int32_t>();
+        auto positions = positionBuf_.Get<int32_t>();
+        auto indices = indexBuf_.Get<int32_t>();
+        auto indices64 = index64Buf_.Get<int64_t>();
+        auto validMask = validMaskBuf_.Get<uint8_t>();
+        AscendC::DataCopy(
+            tokens, selectedPacked_[offset], scratchCapacity_);
+        Sync<AscendC::HardEvent::MTE2_V>();
+
+        int32_t count = selectedCount_.GetValue(
+            static_cast<uint64_t>(request) * selectedCountStride_);
+        if (count < 0) {
+            count = 0;
+        } else if (count > static_cast<int32_t>(scratchCapacity_)) {
+            count = static_cast<int32_t>(scratchCapacity_);
+        }
+        const int32_t state = requestStateIndices_.GetValue(request);
+        const bool validState =
+            state >= 0 &&
+            state < static_cast<int32_t>(dummyStateBase_);
+        const uint32_t safeState = validState
+            ? static_cast<uint32_t>(state)
+            : dummyStateBase_ + request;
+        const int32_t base =
+            static_cast<int32_t>(safeState * tokenStride_);
+        const int32_t sentinel =
+            base + static_cast<int32_t>(tokenStride_ - 1);
+
+        AscendC::CreateVecIndex(
+            positions, static_cast<int32_t>(0), scratchCapacity_);
+        // Use the same Mins+EQ validity construction as the production sort
+        // kernels. It also handles count==0: min(position, -1) never equals a
+        // non-negative position.
+        AscendC::Mins(
+            indices, positions, count - 1, scratchCapacity_);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Compare(
+            validMask,
+            indices,
+            positions,
+            AscendC::CMPMODE::EQ,
+            scratchCapacity_);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Adds(indices, tokens, base, scratchCapacity_);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Duplicate(
+            positions, sentinel, scratchCapacity_);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Select(
+            indices.ReinterpretCast<float>(),
+            validMask,
+            indices.ReinterpretCast<float>(),
+            positions.ReinterpretCast<float>(),
+            AscendC::SELMODE::VSEL_TENSOR_TENSOR_MODE,
+            scratchCapacity_);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Cast(
+            indices64,
+            indices,
+            AscendC::RoundMode::CAST_NONE,
+            scratchCapacity_);
+        AscendC::PipeBarrier<PIPE_V>();
+        Sync<AscendC::HardEvent::V_MTE3>();
+        CopyLocalToGlobalExact(
+            lookupIndexWords_[2 * offset],
+            indices64.ReinterpretCast<int32_t>(),
+            2 * scratchCapacity_);
+    }
+
+private:
+    AscendC::GlobalTensor<int32_t> selectedPacked_;
+    AscendC::GlobalTensor<int32_t> selectedCount_;
+    AscendC::GlobalTensor<int32_t> requestStateIndices_;
+    AscendC::GlobalTensor<int32_t> lookupIndexWords_;
+    AscendC::TPipe pipe_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> tokenBuf_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> positionBuf_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> indexBuf_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> index64Buf_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> validMaskBuf_;
+    uint32_t requestCount_ = 0;
+    uint32_t scratchCapacity_ = 0;
+    uint32_t selectedCountStride_ = 0;
+    uint32_t tokenStride_ = 0;
+    uint32_t dummyStateBase_ = 0;
+};
+
+// Fuse row-local residency validation, free-slot assignment, miss compaction,
+// forward-map publication, and LMCache target construction. The remaining
+// loops are three linear passes over request-local UB tensors; the 130K
+// reverse lookup remains a native gather/scatter in Python. One AIV owns
+// every output row of one request.
+class DSAResidentFinalizeRowsKernel {
+public:
+    __aicore__ inline void Init(
+        __gm__ int32_t* selectedPacked,
+        __gm__ int32_t* selectedCount,
+        __gm__ int32_t* targetSlotWords,
+        __gm__ int32_t* requestBlockTable,
+        __gm__ int32_t* requestStateIndices,
+        __gm__ int64_t* requestStateGenerations,
+        __gm__ int16_t* oldSlots,
+        __gm__ int32_t* slotToToken,
+        __gm__ int64_t* stateGenerations,
+        __gm__ int32_t* unionToSlot,
+        __gm__ int32_t* reverseIndexWords,
+        __gm__ int16_t* reverseValues,
+        uint32_t requestCount,
+        uint32_t scratchCapacity,
+        uint32_t selectedCountStride,
+        uint32_t blockTableWidth,
+        uint32_t tokenStride,
+        uint32_t slotStride,
+        uint32_t generationStride,
+        uint32_t dummyStateBase,
+        uint32_t blockSize)
+    {
+        requestCount_ = requestCount;
+        scratchCapacity_ = scratchCapacity;
+        selectedCountStride_ = selectedCountStride;
+        blockTableWidth_ = blockTableWidth;
+        tokenStride_ = tokenStride;
+        slotStride_ = slotStride;
+        generationStride_ = generationStride;
+        dummyStateBase_ = dummyStateBase;
+        blockSize_ = blockSize;
+        const uint64_t requestElements =
+            static_cast<uint64_t>(requestCount_) * scratchCapacity_;
+        selectedPacked_.SetGlobalBuffer(selectedPacked, requestElements);
+        selectedCount_.SetGlobalBuffer(
+            selectedCount,
+            static_cast<uint64_t>(requestCount_) * selectedCountStride_);
+        targetSlotWords_.SetGlobalBuffer(
+            targetSlotWords, 2 * requestElements);
+        requestBlockTable_.SetGlobalBuffer(
+            requestBlockTable,
+            static_cast<uint64_t>(requestCount_) * blockTableWidth_);
+        requestStateIndices_.SetGlobalBuffer(
+            requestStateIndices, requestCount_);
+        requestStateGenerations_.SetGlobalBuffer(
+            requestStateGenerations, requestCount_);
+        oldSlots_.SetGlobalBuffer(oldSlots, requestElements);
+        slotToToken_.SetGlobalBuffer(
+            slotToToken,
+            static_cast<uint64_t>(2 * dummyStateBase_) * slotStride_);
+        stateGenerations_.SetGlobalBuffer(
+            stateGenerations,
+            static_cast<uint64_t>(2 * dummyStateBase_) * generationStride_);
+        unionToSlot_.SetGlobalBuffer(unionToSlot, requestElements);
+        reverseIndexWords_.SetGlobalBuffer(
+            reverseIndexWords, 2 * requestElements);
+        reverseValues_.SetGlobalBuffer(reverseValues, requestElements);
+
+        pipe_.InitBuffer(tokenBuf_, scratchCapacity_ * sizeof(int32_t));
+        pipe_.InitBuffer(forwardBuf_, scratchCapacity_ * sizeof(int32_t));
+        pipe_.InitBuffer(mapBuf_, scratchCapacity_ * sizeof(int32_t));
+        pipe_.InitBuffer(freeBuf_, scratchCapacity_ * sizeof(int32_t));
+        pipe_.InitBuffer(oldSlotBuf_, scratchCapacity_ * sizeof(int16_t));
+        pipe_.InitBuffer(targetBuf_, scratchCapacity_ * sizeof(int64_t));
+        pipe_.InitBuffer(indexBuf_, scratchCapacity_ * sizeof(int32_t));
+        pipe_.InitBuffer(
+            blockTableBuf_, blockTableWidth_ * sizeof(int32_t));
+    }
+
+    __aicore__ inline void Process()
+    {
+        const uint32_t request = AscendC::GetBlockIdx();
+        if (request >= requestCount_) {
+            return;
+        }
+        const uint64_t offset =
+            static_cast<uint64_t>(request) * scratchCapacity_;
+        auto tokens = tokenBuf_.Get<int32_t>();
+        auto forward = forwardBuf_.Get<int32_t>();
+        auto mapping = mapBuf_.Get<int32_t>();
+        auto freeSlots = freeBuf_.Get<int32_t>();
+        auto oldSlots = oldSlotBuf_.Get<int16_t>();
+        auto targets = targetBuf_.Get<int64_t>();
+        auto reverseIndices = indexBuf_.Get<int32_t>();
+        auto blockTable = blockTableBuf_.Get<int32_t>();
+
+        int32_t count = selectedCount_.GetValue(
+            static_cast<uint64_t>(request) * selectedCountStride_);
+        if (count < 0) {
+            count = 0;
+        } else if (count > static_cast<int32_t>(scratchCapacity_)) {
+            count = static_cast<int32_t>(scratchCapacity_);
+        }
+        const int32_t state = requestStateIndices_.GetValue(request);
+        const bool validState =
+            state >= 0 &&
+            state < static_cast<int32_t>(dummyStateBase_);
+        const uint32_t safeState = validState
+            ? static_cast<uint32_t>(state)
+            : dummyStateBase_ + request;
+        const int64_t requestedGeneration =
+            requestStateGenerations_.GetValue(request);
+        const uint64_t generationOffset =
+            static_cast<uint64_t>(safeState) * generationStride_;
+        const bool generationMatches =
+            validState &&
+            stateGenerations_.GetValue(generationOffset) ==
+                requestedGeneration;
+        const uint64_t forwardOffset =
+            static_cast<uint64_t>(safeState) * slotStride_;
+        const int32_t tokenBase =
+            static_cast<int32_t>(safeState * tokenStride_);
+        const int32_t reverseSentinel =
+            tokenBase + static_cast<int32_t>(tokenStride_ - 1);
+
+        AscendC::DataCopy(
+            tokens, selectedPacked_[offset], scratchCapacity_);
+        AscendC::DataCopy(
+            oldSlots, oldSlots_[offset], scratchCapacity_);
+        CopyGlobalToLocalExact(
+            blockTable,
+            requestBlockTable_[
+                static_cast<uint64_t>(request) * blockTableWidth_],
+            blockTableWidth_);
+        if (generationMatches) {
+            AscendC::DataCopy(
+                forward, slotToToken_[forwardOffset], scratchCapacity_);
+        } else {
+            AscendC::Duplicate(
+                forward, static_cast<int32_t>(-1), scratchCapacity_);
+        }
+        Sync<AscendC::HardEvent::MTE2_V>();
+        AscendC::Duplicate(
+            mapping, static_cast<int32_t>(-1), scratchCapacity_);
+        AscendC::Duplicate(
+            reverseIndices, reverseSentinel, scratchCapacity_);
+        AscendC::PipeBarrier<PIPE_V>();
+        Sync<AscendC::HardEvent::MTE2_S>();
+        Sync<AscendC::HardEvent::V_S>();
+
+        // Mark protected slots. LocalTensor does not expose an arbitrary
+        // scatter primitive in the supported AscendC API, so the fused
+        // implementation retains a request-local scalar phase: mark hits,
+        // scan free slots, then assign/compact misses.
+        for (int32_t i = 0; i < count; ++i) {
+            const int32_t candidate =
+                static_cast<int32_t>(oldSlots.GetValue(i));
+            const bool hit =
+                candidate >= 0 &&
+                candidate < static_cast<int32_t>(scratchCapacity_) &&
+                forward.GetValue(candidate) == tokens.GetValue(i);
+            if (hit) {
+                mapping.SetValue(candidate, 1);
+            }
+        }
+
+        uint32_t freeCount = 0;
+        for (uint32_t slot = 0; slot < scratchCapacity_; ++slot) {
+            if (mapping.GetValue(slot) < 0) {
+                freeSlots.SetValue(freeCount++, static_cast<int32_t>(slot));
+            }
+        }
+
+        uint32_t missCount = 0;
+        for (uint32_t i = 0; i < scratchCapacity_; ++i) {
+            const int32_t candidate =
+                static_cast<int32_t>(oldSlots.GetValue(i));
+            oldSlots.SetValue(i, static_cast<int16_t>(-1));
+            if (i >= static_cast<uint32_t>(count)) {
+                mapping.SetValue(i, static_cast<int32_t>(-1));
+                continue;
+            }
+            const int32_t token = tokens.GetValue(i);
+            const bool hit =
+                candidate >= 0 &&
+                candidate < static_cast<int32_t>(scratchCapacity_) &&
+                forward.GetValue(candidate) == token;
+            if (hit) {
+                mapping.SetValue(i, candidate);
+                continue;
+            }
+            const int32_t slot = freeSlots.GetValue(missCount);
+            mapping.SetValue(i, slot);
+            freeSlots.SetValue(missCount, token);
+            forward.SetValue(slot, token);
+            reverseIndices.SetValue(i, tokenBase + token);
+            oldSlots.SetValue(i, static_cast<int16_t>(slot));
+            const int32_t logicalBlock =
+                slot / static_cast<int32_t>(blockSize_);
+            const int32_t physicalBlock =
+                blockTable.GetValue(logicalBlock);
+            targets.SetValue(
+                missCount,
+                static_cast<int64_t>(physicalBlock) * blockSize_ +
+                    slot % static_cast<int32_t>(blockSize_));
+            ++missCount;
+        }
+
+        Sync<AscendC::HardEvent::S_MTE3>();
+        CopyLocalToGlobalExact(
+            selectedPacked_[offset], freeSlots, missCount);
+        CopyLocalToGlobalExact(
+            targetSlotWords_[2 * offset],
+            targets.ReinterpretCast<int32_t>(),
+            2 * missCount);
+        AscendC::DataCopy(
+            slotToToken_[forwardOffset], forward, scratchCapacity_);
+        AscendC::DataCopy(
+            unionToSlot_[offset], mapping, scratchCapacity_);
+        AscendC::DataCopy(
+            reverseValues_[offset], oldSlots, scratchCapacity_);
+        Sync<AscendC::HardEvent::MTE3_V>();
+        Sync<AscendC::HardEvent::S_V>();
+        AscendC::Cast(
+            targets,
+            reverseIndices,
+            AscendC::RoundMode::CAST_NONE,
+            scratchCapacity_);
+        AscendC::PipeBarrier<PIPE_V>();
+        Sync<AscendC::HardEvent::V_MTE3>();
+        CopyLocalToGlobalExact(
+            reverseIndexWords_[2 * offset],
+            targets.ReinterpretCast<int32_t>(),
+            2 * scratchCapacity_);
+        selectedCount_.SetValue(
+            static_cast<uint64_t>(request) * selectedCountStride_,
+            static_cast<int32_t>(missCount));
+        stateGenerations_.SetValue(
+            generationOffset, requestedGeneration);
+    }
+
+private:
+    AscendC::GlobalTensor<int32_t> selectedPacked_;
+    AscendC::GlobalTensor<int32_t> selectedCount_;
+    AscendC::GlobalTensor<int32_t> targetSlotWords_;
+    AscendC::GlobalTensor<int32_t> requestBlockTable_;
+    AscendC::GlobalTensor<int32_t> requestStateIndices_;
+    AscendC::GlobalTensor<int64_t> requestStateGenerations_;
+    AscendC::GlobalTensor<int16_t> oldSlots_;
+    AscendC::GlobalTensor<int32_t> slotToToken_;
+    AscendC::GlobalTensor<int64_t> stateGenerations_;
+    AscendC::GlobalTensor<int32_t> unionToSlot_;
+    AscendC::GlobalTensor<int32_t> reverseIndexWords_;
+    AscendC::GlobalTensor<int16_t> reverseValues_;
+    AscendC::TPipe pipe_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> tokenBuf_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> forwardBuf_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> mapBuf_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> freeBuf_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> oldSlotBuf_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> targetBuf_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> indexBuf_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> blockTableBuf_;
+    uint32_t requestCount_ = 0;
+    uint32_t scratchCapacity_ = 0;
+    uint32_t selectedCountStride_ = 0;
+    uint32_t blockTableWidth_ = 0;
+    uint32_t tokenStride_ = 0;
+    uint32_t slotStride_ = 0;
+    uint32_t generationStride_ = 0;
+    uint32_t dummyStateBase_ = 0;
+    uint32_t blockSize_ = 0;
 };
 
 class DSAStagedUniqueFinalizeKernel {
@@ -3261,20 +3966,26 @@ extern "C" __global__ __aicore__ void dsa_staged_compact_rows_kernel(
     __gm__ int32_t* rowReqIndices,
     __gm__ int32_t* rowPacked,
     __gm__ int32_t* rowCounts,
+    __gm__ int32_t* selectedCount,
+    __gm__ int32_t* positionMap,
     uint32_t rowCount,
     uint32_t rowWidth,
     uint32_t requestCount,
     uint32_t rowsPerRequest,
     uint32_t scratchCapacity,
+    uint32_t selectedCountStride,
     uint32_t coreCount,
+    bool emitPositionMap,
     bool clearInvalidRows)
 {
     if ASCEND_IS_AIV {
         DSAStagedCompactRowsKernel op;
         op.Init(
             topkIndices, splitBoundary, rowReqIndices, rowPacked, rowCounts,
+            selectedCount, positionMap,
             rowCount, rowWidth, requestCount, rowsPerRequest,
-            scratchCapacity, coreCount, clearInvalidRows);
+            scratchCapacity, selectedCountStride, coreCount,
+            emitPositionMap, clearInvalidRows);
         op.Process();
     }
 }
@@ -3413,9 +4124,36 @@ extern "C" __global__ __aicore__ void dsa_staged_sharded_sort_kernel(
     if ASCEND_IS_AIV {
         DSAStagedShardedSortKernel op;
         op.Init(
-            topkIndices, splitBoundary, shardPacked, shardMapping, shardCounts,
-            requestCount, rowsPerRequest, rowWidth, shardCount,
-            shardCountStride);
+            topkIndices, splitBoundary, topkIndices, shardPacked,
+            shardMapping, shardCounts, requestCount, rowsPerRequest,
+            rowWidth, rowWidth, shardCount, shardCountStride,
+            shardCount * shardCountStride, false);
+        op.Process();
+    }
+}
+
+extern "C" __global__ __aicore__ void
+dsa_staged_production_sharded_sort_kernel(
+    __gm__ int32_t* topkIndices,
+    __gm__ int32_t* splitBoundary,
+    __gm__ int32_t* rowReqIndices,
+    __gm__ int32_t* shardPacked,
+    __gm__ int32_t* shardMapping,
+    __gm__ int32_t* shardCounts,
+    uint32_t requestCount,
+    uint32_t rowsPerRequest,
+    uint32_t rowWidth,
+    uint32_t shardCount,
+    uint32_t shardCountStride,
+    uint32_t shardCountRequestStride)
+{
+    if ASCEND_IS_AIV {
+        DSAStagedShardedSortKernel op;
+        op.Init(
+            topkIndices, splitBoundary, rowReqIndices, shardPacked,
+            shardMapping, shardCounts, requestCount, rowsPerRequest,
+            rowWidth, rowsPerRequest * rowWidth, shardCount, shardCountStride,
+            shardCountRequestStride, true);
         op.Process();
     }
 }
@@ -3560,11 +4298,51 @@ extern "C" __global__ __aicore__ void dsa_staged_sharded_finalize_kernel(
     if ASCEND_IS_AIV {
         DSAStagedShardedFinalizeKernel op;
         op.Init(
-            topkIndices, selectedPacked, localToUnion, selectedCount,
-            requestBlockTable, targetSlots, shardPacked, shardMapping,
-            shardCounts, requestCount, rowsPerRequest, rowWidth,
-            shardCount, blockTableWidth, selectedCountStride,
-            shardCountStride, blockSize);
+            topkIndices, topkIndices, selectedPacked, localToUnion,
+            selectedCount, requestBlockTable, targetSlots, shardPacked,
+            shardMapping, shardCounts, requestCount, rowsPerRequest,
+            rowWidth, rowWidth, shardCount, blockTableWidth,
+            selectedCountStride,
+            shardCountStride, shardCount * shardCountStride, blockSize,
+            false, false, true);
+        op.Process();
+    }
+}
+
+extern "C" __global__ __aicore__ void
+dsa_staged_production_sharded_finalize_kernel(
+    __gm__ int32_t* topkIndices,
+    __gm__ int32_t* rowReqIndices,
+    __gm__ int32_t* selectedPacked,
+    __gm__ int32_t* localToUnion,
+    __gm__ int32_t* selectedCount,
+    __gm__ int32_t* requestBlockTable,
+    __gm__ int64_t* targetSlots,
+    __gm__ int32_t* shardPacked,
+    __gm__ int32_t* shardMapping,
+    __gm__ int32_t* shardCounts,
+    uint32_t requestCount,
+    uint32_t rowsPerRequest,
+    uint32_t rowWidth,
+    uint32_t shardCount,
+    uint32_t blockTableWidth,
+    uint32_t selectedCountStride,
+    uint32_t shardCountStride,
+    uint32_t shardCountRequestStride,
+    uint32_t blockSize,
+    bool needPacked,
+    bool clearInvalidRows)
+{
+    if ASCEND_IS_AIV {
+        DSAStagedShardedFinalizeKernel op;
+        op.Init(
+            topkIndices, rowReqIndices, selectedPacked, localToUnion,
+            selectedCount, requestBlockTable, targetSlots, shardPacked,
+            shardMapping, shardCounts, requestCount, rowsPerRequest,
+            rowWidth, rowsPerRequest * rowWidth, shardCount,
+            blockTableWidth, selectedCountStride,
+            shardCountStride, shardCountRequestStride, blockSize, true,
+            clearInvalidRows, needPacked);
         op.Process();
     }
 }
@@ -3578,6 +4356,82 @@ extern "C" __global__ __aicore__ void dsa_staged_remap_rows_kernel(
     if ASCEND_IS_AIV {
         DSAStagedRemapRowsKernel op;
         op.Init(localIndices, localToUnion, rowCount, rowWidth);
+        op.Process();
+    }
+}
+
+extern "C" __global__ __aicore__ void dsa_resident_remap_rows_kernel(
+    __gm__ int32_t* topkIndices,
+    __gm__ int32_t* positionToUnion,
+    __gm__ int32_t* unionToSlot,
+    uint32_t rowCount,
+    uint32_t rowWidth,
+    uint32_t rowsPerRequest,
+    uint32_t scratchCapacity)
+{
+    if ASCEND_IS_AIV {
+        DSAResidentRemapRowsKernel op;
+        op.Init(
+            topkIndices, positionToUnion, unionToSlot, rowCount,
+            rowWidth, rowsPerRequest, scratchCapacity);
+        op.Process();
+    }
+}
+
+extern "C" __global__ __aicore__ void dsa_resident_lookup_rows_kernel(
+    __gm__ int32_t* selectedPacked,
+    __gm__ int32_t* selectedCount,
+    __gm__ int32_t* requestStateIndices,
+    __gm__ int32_t* lookupIndexWords,
+    uint32_t requestCount,
+    uint32_t scratchCapacity,
+    uint32_t selectedCountStride,
+    uint32_t tokenStride,
+    uint32_t dummyStateBase)
+{
+    if ASCEND_IS_AIV {
+        DSAResidentLookupRowsKernel op;
+        op.Init(
+            selectedPacked, selectedCount, requestStateIndices,
+            lookupIndexWords, requestCount, scratchCapacity,
+            selectedCountStride, tokenStride, dummyStateBase);
+        op.Process();
+    }
+}
+
+extern "C" __global__ __aicore__ void dsa_resident_finalize_rows_kernel(
+    __gm__ int32_t* selectedPacked,
+    __gm__ int32_t* selectedCount,
+    __gm__ int32_t* targetSlotWords,
+    __gm__ int32_t* requestBlockTable,
+    __gm__ int32_t* requestStateIndices,
+    __gm__ int64_t* requestStateGenerations,
+    __gm__ int16_t* oldSlots,
+    __gm__ int32_t* slotToToken,
+    __gm__ int64_t* stateGenerations,
+    __gm__ int32_t* unionToSlot,
+    __gm__ int32_t* reverseIndexWords,
+    __gm__ int16_t* reverseValues,
+    uint32_t requestCount,
+    uint32_t scratchCapacity,
+    uint32_t selectedCountStride,
+    uint32_t blockTableWidth,
+    uint32_t tokenStride,
+    uint32_t slotStride,
+    uint32_t generationStride,
+    uint32_t dummyStateBase,
+    uint32_t blockSize)
+{
+    if ASCEND_IS_AIV {
+        DSAResidentFinalizeRowsKernel op;
+        op.Init(
+            selectedPacked, selectedCount, targetSlotWords,
+            requestBlockTable, requestStateIndices,
+            requestStateGenerations, oldSlots, slotToToken,
+            stateGenerations, unionToSlot, reverseIndexWords,
+            reverseValues, requestCount, scratchCapacity,
+            selectedCountStride, blockTableWidth, tokenStride,
+            slotStride, generationStride, dummyStateBase, blockSize);
         op.Process();
     }
 }
@@ -3644,12 +4498,11 @@ extern "C" __global__ __aicore__ void dsa_staged_copy_rows_kernel(
 
 namespace vllm_ascend {
 
-void dsa_prepare_sparse_indices_staged_impl(
+static void dsa_prepare_sparse_indices_single_row_impl(
     void* stream, void* topkIndices, void* splitBoundary,
     void* rowReqIndices, void* requestBlockTable,
     void* selectedPacked, void* selectedCount, void* targetSlots,
-    void* localToUnion, uint32_t rowCount, uint32_t rowWidth,
-    uint32_t requestCount, uint32_t rowsPerRequest,
+    void* localToUnion, uint32_t requestCount, uint32_t rowWidth,
     uint32_t scratchCapacity, uint32_t blockTableWidth,
     uint32_t selectedCountStride, uint32_t blockSize,
     uint32_t coreCount, bool needPacked, bool clearInvalidRows)
@@ -3660,21 +4513,53 @@ void dsa_prepare_sparse_indices_staged_impl(
         static_cast<int32_t*>(rowReqIndices),
         static_cast<int32_t*>(selectedPacked),
         static_cast<int32_t*>(localToUnion),
-        rowCount, rowWidth, requestCount, rowsPerRequest,
-        scratchCapacity, coreCount, clearInvalidRows);
+        static_cast<int32_t*>(selectedCount),
+        static_cast<int32_t*>(localToUnion),
+        requestCount, rowWidth, requestCount, 1,
+        scratchCapacity, selectedCountStride, coreCount, true,
+        clearInvalidRows);
+    dsa_staged_single_row_finalize_kernel<<<
+        requestCount, nullptr, stream>>>(
+        static_cast<int32_t*>(selectedCount),
+        static_cast<int32_t*>(selectedCount),
+        static_cast<int32_t*>(requestBlockTable),
+        static_cast<int64_t*>(targetSlots),
+        requestCount, rowWidth, scratchCapacity,
+        blockTableWidth, selectedCountStride, blockSize,
+        needPacked);
+}
 
+void dsa_prepare_sparse_indices_staged_impl(
+    void* stream, void* topkIndices, void* splitBoundary,
+    void* rowReqIndices, void* requestBlockTable,
+    void* selectedPacked, void* selectedCount, void* targetSlots,
+    void* localToUnion, uint32_t rowCount, uint32_t rowWidth,
+    uint32_t requestCount, uint32_t rowsPerRequest,
+    uint32_t scratchCapacity, uint32_t blockTableWidth,
+    uint32_t selectedCountStride, uint32_t blockSize,
+    uint32_t coreCount, bool needPacked, bool clearInvalidRows)
+{
     if (rowsPerRequest == 1) {
-        dsa_staged_single_row_finalize_kernel<<<
-            requestCount, nullptr, stream>>>(
-            static_cast<int32_t*>(localToUnion),
-            static_cast<int32_t*>(selectedCount),
-            static_cast<int32_t*>(requestBlockTable),
-            static_cast<int64_t*>(targetSlots),
-            requestCount, rowWidth, scratchCapacity,
-            blockTableWidth, selectedCountStride, blockSize,
-            needPacked);
+        dsa_prepare_sparse_indices_single_row_impl(
+            stream, topkIndices, splitBoundary, rowReqIndices,
+            requestBlockTable, selectedPacked, selectedCount, targetSlots,
+            localToUnion, requestCount, rowWidth, scratchCapacity,
+            blockTableWidth, selectedCountStride, blockSize, coreCount,
+            needPacked, clearInvalidRows);
         return;
     }
+
+    dsa_staged_compact_rows_kernel<<<coreCount, nullptr, stream>>>(
+        static_cast<int32_t*>(topkIndices),
+        static_cast<int32_t*>(splitBoundary),
+        static_cast<int32_t*>(rowReqIndices),
+        static_cast<int32_t*>(selectedPacked),
+        static_cast<int32_t*>(localToUnion),
+        static_cast<int32_t*>(selectedCount),
+        static_cast<int32_t*>(localToUnion),
+        rowCount, rowWidth, requestCount, rowsPerRequest,
+        scratchCapacity, selectedCountStride, coreCount, false,
+        clearInvalidRows);
 
     dsa_staged_production_sort_union_kernel<<<
         requestCount, nullptr, stream>>>(
@@ -3695,6 +4580,59 @@ void dsa_prepare_sparse_indices_staged_impl(
         static_cast<int32_t*>(localToUnion),
         rowCount, rowWidth, rowsPerRequest, scratchCapacity,
         coreCount);
+}
+
+void dsa_prepare_sparse_indices_sharded_impl(
+    void* stream, void* topkIndices, void* splitBoundary,
+    void* rowReqIndices, void* requestBlockTable,
+    void* selectedPacked, void* selectedCount, void* targetSlots,
+    void* localToUnion, void* shardPacked, void* shardMapping,
+    void* shardCounts, uint32_t requestCount,
+    uint32_t rowsPerRequest, uint32_t rowWidth,
+    uint32_t scratchCapacity, uint32_t blockTableWidth,
+    uint32_t selectedCountStride, uint32_t blockSize,
+    uint32_t coreCount, bool needPacked, bool clearInvalidRows)
+{
+    if (rowsPerRequest == 1) {
+        // MTP=1 top-k is unique by contract. Keep the public production
+        // operator uniform, but bypass all shard partition/sort/union work.
+        dsa_prepare_sparse_indices_single_row_impl(
+            stream, topkIndices, splitBoundary, rowReqIndices,
+            requestBlockTable, selectedPacked, selectedCount, targetSlots,
+            localToUnion, requestCount, rowWidth, scratchCapacity,
+            blockTableWidth, selectedCountStride, blockSize, coreCount,
+            needPacked, clearInvalidRows);
+        return;
+    }
+
+    (void)scratchCapacity;
+    const uint32_t shardCount = rowsPerRequest;
+    dsa_staged_production_sharded_sort_kernel<<<
+        shardCount * requestCount, nullptr, stream>>>(
+        static_cast<int32_t*>(topkIndices),
+        static_cast<int32_t*>(splitBoundary),
+        static_cast<int32_t*>(rowReqIndices),
+        static_cast<int32_t*>(shardPacked),
+        static_cast<int32_t*>(shardMapping),
+        static_cast<int32_t*>(shardCounts),
+        requestCount, rowsPerRequest, rowWidth, shardCount,
+        kInt32PerCacheline, shardCount * kInt32PerCacheline);
+    dsa_staged_production_sharded_finalize_kernel<<<
+        requestCount, nullptr, stream>>>(
+        static_cast<int32_t*>(topkIndices),
+        static_cast<int32_t*>(rowReqIndices),
+        static_cast<int32_t*>(selectedPacked),
+        static_cast<int32_t*>(localToUnion),
+        static_cast<int32_t*>(selectedCount),
+        static_cast<int32_t*>(requestBlockTable),
+        static_cast<int64_t*>(targetSlots),
+        static_cast<int32_t*>(shardPacked),
+        static_cast<int32_t*>(shardMapping),
+        static_cast<int32_t*>(shardCounts),
+        requestCount, rowsPerRequest, rowWidth, shardCount,
+        blockTableWidth, selectedCountStride, kInt32PerCacheline,
+        shardCount * kInt32PerCacheline, blockSize, needPacked,
+        clearInvalidRows);
 }
 
 void dsa_staged_hash_union_impl(
@@ -3877,6 +4815,64 @@ void dsa_staged_remap_rows_impl(
     dsa_staged_remap_rows_kernel<<<rowCount, nullptr, stream>>>(
         static_cast<int32_t*>(localIndices),
         static_cast<int32_t*>(localToUnion), rowCount, rowWidth);
+}
+
+void dsa_resident_remap_rows_impl(
+    void* stream, void* topkIndices, void* positionToUnion,
+    void* unionToSlot, uint32_t rowCount, uint32_t rowWidth,
+    uint32_t rowsPerRequest, uint32_t scratchCapacity)
+{
+    dsa_resident_remap_rows_kernel<<<rowCount, nullptr, stream>>>(
+        static_cast<int32_t*>(topkIndices),
+        static_cast<int32_t*>(positionToUnion),
+        static_cast<int32_t*>(unionToSlot),
+        rowCount, rowWidth, rowsPerRequest, scratchCapacity);
+}
+
+void dsa_resident_lookup_rows_impl(
+    void* stream, void* selectedPacked, void* selectedCount,
+    void* requestStateIndices, void* lookupIndices,
+    uint32_t requestCount, uint32_t scratchCapacity,
+    uint32_t selectedCountStride, uint32_t tokenStride,
+    uint32_t dummyStateBase)
+{
+    dsa_resident_lookup_rows_kernel<<<requestCount, nullptr, stream>>>(
+        static_cast<int32_t*>(selectedPacked),
+        static_cast<int32_t*>(selectedCount),
+        static_cast<int32_t*>(requestStateIndices),
+        static_cast<int32_t*>(lookupIndices),
+        requestCount, scratchCapacity, selectedCountStride,
+        tokenStride, dummyStateBase);
+}
+
+void dsa_resident_finalize_rows_impl(
+    void* stream, void* selectedPacked, void* selectedCount,
+    void* targetSlots, void* requestBlockTable,
+    void* requestStateIndices, void* requestStateGenerations,
+    void* oldSlots, void* slotToToken, void* stateGenerations,
+    void* unionToSlot, void* reverseIndices, void* reverseValues,
+    uint32_t requestCount, uint32_t scratchCapacity,
+    uint32_t selectedCountStride, uint32_t blockTableWidth,
+    uint32_t tokenStride, uint32_t slotStride,
+    uint32_t generationStride, uint32_t dummyStateBase,
+    uint32_t blockSize)
+{
+    dsa_resident_finalize_rows_kernel<<<requestCount, nullptr, stream>>>(
+        static_cast<int32_t*>(selectedPacked),
+        static_cast<int32_t*>(selectedCount),
+        static_cast<int32_t*>(targetSlots),
+        static_cast<int32_t*>(requestBlockTable),
+        static_cast<int32_t*>(requestStateIndices),
+        static_cast<int64_t*>(requestStateGenerations),
+        static_cast<int16_t*>(oldSlots),
+        static_cast<int32_t*>(slotToToken),
+        static_cast<int64_t*>(stateGenerations),
+        static_cast<int32_t*>(unionToSlot),
+        static_cast<int32_t*>(reverseIndices),
+        static_cast<int16_t*>(reverseValues),
+        requestCount, scratchCapacity, selectedCountStride,
+        blockTableWidth, tokenStride, slotStride, generationStride,
+        dummyStateBase, blockSize);
 }
 
 void dsa_staged_unique_finalize_impl(

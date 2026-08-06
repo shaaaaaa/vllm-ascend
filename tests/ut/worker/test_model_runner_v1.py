@@ -152,6 +152,116 @@ class TestStagedSFADummyRemapBoundaries(unittest.TestCase):
                 )
 
 
+class TestResidentRequestState(unittest.TestCase):
+    @staticmethod
+    def _build_runner():
+        runner = NPUModelRunner.__new__(NPUModelRunner)
+        runner._resident_state_registry = (
+            model_runner_module.ResidentRequestStateRegistry(3)
+        )
+        runner._resident_state_indices = SimpleNamespace(
+            np=np.zeros(3, dtype=np.int32),
+            gpu=torch.zeros(3, dtype=torch.int32),
+            copy_to_gpu=MagicMock(),
+        )
+        runner._resident_state_generations = SimpleNamespace(
+            np=np.zeros(3, dtype=np.int64),
+            gpu=torch.zeros(3, dtype=torch.int64),
+            copy_to_gpu=MagicMock(),
+        )
+        runner._resident_scratch_capacity = 4096
+
+        block_ids = np.full((2, 32), -1, dtype=np.int32)
+        block_ids[0, :26] = np.arange(100, 126, dtype=np.int32)
+        block_ids[1] = np.arange(200, 232, dtype=np.int32)
+        block_table = SimpleNamespace(
+            block_size=128,
+            num_blocks_per_row=np.array([26, 32], dtype=np.int32),
+            block_table=SimpleNamespace(np=block_ids),
+        )
+        runner.input_batch = SimpleNamespace(
+            req_ids=["short", "full"],
+            block_table=[block_table],
+        )
+        return runner, block_table
+
+    def test_zero_boundary_stays_cold_until_remap_activates(self):
+        runner, block_table = self._build_runner()
+
+        _, _, indices, generations = runner._prepare_resident_request_state(
+            num_reqs=2,
+            num_reqs_padded=3,
+            is_dummy=False,
+            remap_frontiers=(0, 4096),
+        )
+
+        self.assertEqual(indices.tolist()[0], -1)
+        self.assertEqual(generations.tolist()[0], -1)
+        self.assertGreaterEqual(indices.tolist()[1], 0)
+        self.assertGreaterEqual(generations.tolist()[1], 0)
+        self.assertEqual(indices.tolist()[2], -1)
+        full_state = int(indices[1])
+        full_generation = int(generations[1])
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "nonzero remap frontier without a complete scratch prefix",
+        ):
+            runner._prepare_resident_request_state(
+                num_reqs=2,
+                num_reqs_padded=3,
+                is_dummy=False,
+                remap_frontiers=(4096, 4096),
+            )
+
+        block_table.block_table.np[0, 26:] = np.arange(
+            126, 132, dtype=np.int32
+        )
+        block_table.num_blocks_per_row[0] = 32
+        _, _, indices, generations = runner._prepare_resident_request_state(
+            num_reqs=2,
+            num_reqs_padded=3,
+            is_dummy=False,
+            remap_frontiers=(0, 4096),
+        )
+        self.assertEqual(int(indices[0]), -1)
+        self.assertEqual(int(generations[0]), -1)
+
+        _, _, indices, generations = runner._prepare_resident_request_state(
+            num_reqs=2,
+            num_reqs_padded=3,
+            is_dummy=False,
+            remap_frontiers=(4096, 4096),
+        )
+
+        self.assertGreaterEqual(indices.tolist()[0], 0)
+        self.assertGreaterEqual(generations.tolist()[0], 0)
+        self.assertEqual(int(indices[1]), full_state)
+        self.assertEqual(int(generations[1]), full_generation)
+
+        short_state = int(indices[0])
+        short_generation = int(generations[0])
+        block_table.num_blocks_per_row[0] = 26
+        _, _, indices, generations = runner._prepare_resident_request_state(
+            num_reqs=2,
+            num_reqs_padded=3,
+            is_dummy=False,
+            remap_frontiers=(0, 4096),
+        )
+        self.assertEqual(int(indices[0]), -1)
+        self.assertEqual(int(generations[0]), -1)
+
+        block_table.num_blocks_per_row[0] = 32
+        _, _, indices, generations = runner._prepare_resident_request_state(
+            num_reqs=2,
+            num_reqs_padded=3,
+            is_dummy=False,
+            remap_frontiers=(4096, 4096),
+        )
+        self.assertEqual(int(indices[0]), short_state)
+        self.assertGreater(int(generations[0]), short_generation)
+
+
 class TestNPUModelRunnerKVCache(unittest.TestCase):
     def _build_runner(self):
         runner = NPUModelRunner.__new__(NPUModelRunner)
@@ -1014,6 +1124,81 @@ class TestStagedSFADummyBatch(unittest.TestCase):
         self.assertEqual(route.action, StagedSFARouteAction.STAGED)
         self.assertEqual(route.graph_key, StagedSFAGraphKey.fixed_spec(2, 2))
 
+    def test_mtp_request_three_and_five_use_different_graph_capacities(self):
+        query_width = 2
+        runner = self._build_runner()
+        runner.speculative_config = SimpleNamespace(
+            method="mtp",
+            num_speculative_tokens=1,
+        )
+        runner.decode_threshold = query_width
+        runner.attn_state = AscendAttentionState.SpecDecoding
+        runner._staged_sfa_graph_capture_sizes = (
+            4 * query_width,
+            8 * query_width,
+        )
+        for actual_requests, graph_request_capacity in ((3, 4), (5, 8)):
+            with self.subTest(actual_requests=actual_requests):
+                request_ids = [
+                    f"req-{index}" for index in range(actual_requests)
+                ]
+                local = runner._staged_sfa_local_route(
+                    num_tokens_unpadded=actual_requests * query_width,
+                    num_reqs=actual_requests,
+                    num_scheduled_tokens=np.full(
+                        actual_requests,
+                        query_width,
+                        dtype=np.int32,
+                    ),
+                    index_topk=2048,
+                    has_cascade_attention=False,
+                    request_ids=request_ids,
+                    kv_connector_metadata=SimpleNamespace(
+                        requests=[
+                            SimpleNamespace(
+                                req_id=req_id,
+                                is_sparse_decode=True,
+                                load_spec=SimpleNamespace(
+                                    can_load=True,
+                                    lmcache_cached_tokens=131_584,
+                                ),
+                            )
+                            for req_id in request_ids
+                        ]
+                    ),
+                )
+                graph_token_capacity = (
+                    graph_request_capacity * query_width
+                )
+                route = runner._staged_sfa_live_route(
+                    local_route=local,
+                    dp_route_action=StagedSFARouteAction.STAGED,
+                    cudagraph_mode=CUDAGraphMode.PIECEWISE,
+                    batch_descriptor=BatchDescriptor(
+                        num_tokens=graph_token_capacity
+                    ),
+                    num_tokens_unpadded=actual_requests * query_width,
+                    num_tokens_padded=graph_token_capacity,
+                    num_reqs=actual_requests,
+                    should_ubatch=False,
+                )
+
+                self.assertEqual(
+                    route.action,
+                    StagedSFARouteAction.STAGED,
+                )
+                self.assertEqual(
+                    route.graph_key,
+                    StagedSFAGraphKey.fixed_spec(
+                        graph_request_capacity,
+                        query_width,
+                    ),
+                )
+                self.assertGreater(
+                    route.graph_key.request_capacity,
+                    actual_requests,
+                )
+
     def test_zero_frontier_uses_graph_with_all_kv_resident(self):
         runner = self._build_runner()
         request_ids = ["req-0"]
@@ -1032,7 +1217,8 @@ class TestStagedSFADummyBatch(unittest.TestCase):
                         load_spec=SimpleNamespace(
                             can_load=True,
                             lmcache_cached_tokens=257,
-                            dsa_committed_end=0,
+                            dsa_committed_end=257,
+                            dsa_scratch_capacity=4096,
                         ),
                     )
                 ]
@@ -1536,6 +1722,124 @@ class TestStagedSFAStartupCaptureValidation(unittest.TestCase):
         impl.seal_staged_sfa_capture.assert_called_once_with(graph_keys)
         seal_entries.assert_called_once_with(graph_keys, 2)
         draft_seal.assert_called_once_with((1, 2))
+
+    def test_capture_model_seals_target_staged_graph_when_draft_graph_is_off(self):
+        runner = self._build_runner()
+        runner.vllm_config.speculative_config = SimpleNamespace(
+            num_speculative_tokens=1,
+        )
+        runner.decode_threshold = 2
+        draft_seal = MagicMock()
+        runner.drafter = SimpleNamespace(
+            use_staged_mtp_draft_graph=False,
+            seal_staged_mtp_draft_graphs=draft_seal,
+        )
+        impl = SimpleNamespace(
+            seal_staged_sfa_capture=MagicMock(),
+        )
+        with (
+            patch.object(
+                model_runner_module,
+                "staged_sfa_graph_capture_sizes",
+                return_value=(2, 4),
+            ),
+            patch.object(
+                model_runner_module,
+                "_torch_cuda_wrapper",
+                return_value=nullcontext(),
+            ),
+            patch.object(
+                model_runner_module,
+                "_replace_gpu_model_runner_function_wrapper",
+                return_value=nullcontext(),
+            ),
+            patch.object(
+                runner,
+                "_reset_staged_sfa_startup_capture",
+            ),
+            patch.object(
+                model_runner_module.GPUModelRunner,
+                "capture_model",
+                return_value=123,
+            ),
+            patch.object(
+                model_runner_module.ACLGraphWrapper,
+                "seal_staged_entries",
+                return_value=4,
+            ) as seal_entries,
+            patch.object(
+                runner,
+                "_collect_staged_sfa_impls",
+                return_value=(("layer-0", impl),),
+            ),
+        ):
+            result = runner.capture_model()
+
+        graph_keys = tuple(
+            StagedSFAGraphKey.fixed_spec(requests, 2)
+            for requests in (1, 2)
+        )
+        self.assertEqual(result, 123)
+        impl.seal_staged_sfa_capture.assert_called_once_with(graph_keys)
+        seal_entries.assert_called_once_with(graph_keys, 2)
+        draft_seal.assert_not_called()
+
+    def test_capture_model_counts_target_debug_split_islands(self):
+        runner = self._build_runner()
+        impls = tuple(
+            (
+                f"layer-{index}",
+                SimpleNamespace(seal_staged_sfa_capture=MagicMock()),
+            )
+            for index in range(3)
+        )
+        with (
+            patch.object(
+                model_runner_module,
+                "staged_sfa_graph_configured",
+                return_value=True,
+            ),
+            patch.object(
+                model_runner_module.envs_ascend,
+                "VLLM_ASCEND_MTP_DRAFT_DEBUG",
+                True,
+            ),
+            patch.object(
+                model_runner_module,
+                "_torch_cuda_wrapper",
+                return_value=nullcontext(),
+            ),
+            patch.object(
+                model_runner_module,
+                "_replace_gpu_model_runner_function_wrapper",
+                return_value=nullcontext(),
+            ),
+            patch.object(runner, "_reset_staged_sfa_startup_capture"),
+            patch.object(
+                model_runner_module.GPUModelRunner,
+                "capture_model",
+                return_value=123,
+            ),
+            patch.object(
+                model_runner_module.ACLGraphWrapper,
+                "seal_staged_entries",
+                return_value=14,
+            ) as seal_entries,
+            patch.object(
+                runner,
+                "_collect_staged_sfa_impls",
+                return_value=impls,
+            ),
+        ):
+            result = runner.capture_model()
+
+        graph_keys = tuple(
+            StagedSFAGraphKey.exact_q1(size) for size in (1, 2)
+        )
+        self.assertEqual(result, 123)
+        # Normal layout: 3 target islands + 1 tail. Diagnostics add an input
+        # and output split around each of the 3 target layers: 4 + 2 * 3 = 10.
+        seal_entries.assert_called_once_with(graph_keys, 10)
 
     def test_collect_staged_sfa_impls_excludes_mtp_draft_layer(self):
         runner = self._build_runner()

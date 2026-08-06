@@ -1,5 +1,7 @@
 import os
 import sys
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -22,6 +24,7 @@ if "torch_npu._inductor" not in sys.modules:
     sys.modules["torch_npu._inductor"] = MagicMock()
 
 import vllm_ascend.attention.sfa_v1 as sfa_v1
+import vllm_ascend.attention.target_sfa_diagnostics as target_diag
 import vllm_ascend.attention.utils as attention_utils
 from vllm_ascend.attention.sfa_v1 import (
     AscendSFABackend,
@@ -106,6 +109,223 @@ def test_sparse_boundary_short_frontier_preserves_zero_pad_semantics():
     )
 
     assert actual.tolist() == [8, 0]
+
+
+def test_lmcache_load_stat_aggregates_mtp_rows_and_resets():
+    impl = AscendSFAImpl.__new__(AscendSFAImpl)
+    impl.index_topk = 4
+    impl._lmcache_load_stat_enabled = True
+    impl._lmcache_load_stat_tokens = None
+    impl._lmcache_load_stat_denominator = 0
+    impl._lmcache_load_stat_rows = 0
+    impl._lmcache_load_stat_calls = 0
+    impl._lmcache_load_stat_last_log = 10.0
+
+    with (
+        patch.object(sfa_v1, "monotonic", side_effect=[10.5, 11.2]),
+        patch.object(sfa_v1.logger, "info") as log,
+    ):
+        impl._record_lmcache_load_stat(
+            "model.layers.78.self_attn",
+            torch.tensor([[1, 99], [2, 99]], dtype=torch.int32),
+            request_count=2,
+            decode_rows=4,
+        )
+        impl._record_lmcache_load_stat(
+            "model.layers.78.self_attn",
+            torch.tensor([[3, 99], [4, 99]], dtype=torch.int32),
+            request_count=2,
+            decode_rows=4,
+        )
+
+    log.assert_called_once()
+    args = log.call_args.args
+    assert args[1:] == (
+        "model.layers.78.self_attn",
+        pytest.approx(1.2),
+        10,
+        4,
+        8,
+        32,
+        pytest.approx(10 / 32),
+        2,
+    )
+    assert impl._lmcache_load_stat_tokens.item() == 0
+    assert impl._lmcache_load_stat_denominator == 0
+    assert impl._lmcache_load_stat_rows == 0
+    assert impl._lmcache_load_stat_calls == 0
+    assert impl._lmcache_load_stat_last_log == pytest.approx(11.2)
+
+
+def test_lmcache_load_stat_disabled_does_not_touch_tensor_or_clock():
+    impl = AscendSFAImpl.__new__(AscendSFAImpl)
+    impl._lmcache_load_stat_enabled = False
+    impl._lmcache_load_stat_tokens = None
+
+    with patch.object(sfa_v1, "monotonic") as clock:
+        impl._record_lmcache_load_stat(
+            "model.layers.0.self_attn",
+            torch.tensor([3], dtype=torch.int32),
+            request_count=1,
+            decode_rows=1,
+        )
+
+    clock.assert_not_called()
+    assert impl._lmcache_load_stat_tokens is None
+
+
+def test_target_sfa_diagnostics_save_layer_io_and_retrieve_state():
+    impl = AscendSFAImpl.__new__(AscendSFAImpl)
+    impl.tp_rank = 3
+    impl.block_size = 4
+    impl._sorted_resident_state = None
+    impl._sorted_resident_workspace_views = {}
+    impl.index_topk = 2
+    impl._staged_sfa_bridge_buffers = (
+        torch.arange(8, dtype=torch.float32).reshape(2, 1, 4),
+        torch.arange(4, dtype=torch.float32).reshape(2, 1, 2),
+        torch.tensor([[[0, 5]], [[1, 6]]], dtype=torch.int32),
+        torch.tensor([[0, 1, 5, 6]], dtype=torch.int32),
+        torch.tensor([4], dtype=torch.int32),
+        torch.tensor([[12, 13, 14, 15]], dtype=torch.long),
+    )
+    kv_cache = (
+        torch.arange(20 * 4 * 2, dtype=torch.float32).reshape(20, 4, 1, 2),
+        torch.arange(20 * 4, dtype=torch.float32).reshape(20, 4, 1, 1),
+        torch.empty(20, 4, 1, 1),
+    )
+    impl._staged_sfa_capture_state = SimpleNamespace(
+        runtime=("model.layers.0.self_attn.attn", kv_cache, None, False),
+        remap_boundary=torch.tensor([4, 4], dtype=torch.int32),
+    )
+    raw_topk = torch.tensor([[2, 3, 5, 6]], dtype=torch.int32)
+    metadata = SimpleNamespace(
+        num_actual_tokens=2,
+        num_decode_tokens=2,
+        req_ids=["request-0"],
+        decode_request_ids_compact=["request-0"],
+        decode_req_indices=torch.tensor([0, 0], dtype=torch.int32),
+        block_table=torch.tensor([[10, 11, 12, 13]], dtype=torch.int32),
+        resident_state_indices=None,
+        decode_union_mapping_workspace=raw_topk,
+    )
+    context = SimpleNamespace(
+        staged_sfa_graph_key=object(),
+        staged_sfa_graph_dummy_run=False,
+    )
+
+    with (
+        TemporaryDirectory() as temp_dir,
+        patch.dict(
+            os.environ,
+            {"VLLM_ASCEND_MTP_DRAFT_DEBUG": "1"},
+        ),
+        patch.object(
+            target_diag,
+            "MTP_DRAFT_DIAG_ROOT",
+            Path(temp_dir),
+        ),
+        patch.object(
+            sfa_v1.torch.npu,
+            "is_current_stream_capturing",
+            return_value=False,
+        ),
+        patch.object(sfa_v1.torch.npu, "synchronize"),
+    ):
+        input_tensor = torch.arange(6, dtype=torch.float32).reshape(2, 3)
+        impl.target_sfa_diagnostic_boundary(
+            "model.layers.0.self_attn.attn",
+            "input",
+            input_tensor,
+            metadata,
+            context,
+        )
+        diagnostic = impl._target_sfa_diag_pre_retrieve(
+            "model.layers.0.self_attn.attn",
+            impl._staged_sfa_bridge_buffers[3],
+            impl._staged_sfa_bridge_buffers[4],
+            impl._staged_sfa_bridge_buffers[5],
+            metadata,
+            context,
+            1,
+        )
+        impl._target_sfa_diag_post_retrieve(diagnostic)
+        output_tensor = input_tensor + 1
+        impl.target_sfa_diagnostic_boundary(
+            "model.layers.0.self_attn.attn",
+            "output",
+            output_tensor,
+            metadata,
+            context,
+        )
+        target_diag.target_tail_boundary(
+            context._target_sfa_diag_session,
+            "model_forward",
+            output_tensor + 1,
+        )
+
+        session = context._target_sfa_diag_session
+        saved_input = torch.load(
+            target_diag.target_sfa_path(session, 0, "input"),
+            weights_only=True,
+        )
+        saved_pre = torch.load(
+            target_diag.target_sfa_path(session, 0, "pre"),
+            weights_only=True,
+        )
+        saved_lmcache = torch.load(
+            target_diag.target_sfa_path(session, 0, "lmcache"),
+            weights_only=True,
+        )
+        saved_output = torch.load(
+            target_diag.target_sfa_path(session, 0, "output"),
+            weights_only=True,
+        )
+        saved_model_output = torch.load(
+            session.output_dir / "target_model_forward.pt",
+            weights_only=True,
+        )
+
+    assert torch.equal(saved_input["tensor"], input_tensor)
+    assert saved_input["metadata"]["req_ids"] == ["request-0"]
+    assert saved_pre["physical_block_ids"] == [3, 10, 11]
+    assert torch.equal(
+        saved_pre["topk_indices"],
+        impl._staged_sfa_bridge_buffers[2],
+    )
+    assert torch.equal(saved_pre["raw_topk"], raw_topk.reshape(2, 1, 2))
+    assert torch.equal(
+        saved_pre["remap_boundary"],
+        impl._staged_sfa_capture_state.remap_boundary,
+    )
+    assert saved_pre["cache_before_lmcache"][0]["physical_block_ids"] == [3, 10, 11]
+    assert saved_lmcache["cache_after_lmcache"][0]["physical_block_ids"] == [3, 10, 11]
+    assert torch.equal(saved_output["tensor"], output_tensor)
+    assert torch.equal(saved_model_output["value"], output_tensor + 1)
+
+
+def test_target_sfa_diagnostics_skip_dummy_graph_capture():
+    impl = AscendSFAImpl.__new__(AscendSFAImpl)
+    context = SimpleNamespace(
+        staged_sfa_graph_key=object(),
+        staged_sfa_graph_dummy_run=True,
+    )
+    with (
+        patch.dict(
+            os.environ,
+            {"VLLM_ASCEND_MTP_DRAFT_DEBUG": "1"},
+        ),
+        patch.object(sfa_v1.torch.npu, "synchronize") as synchronize,
+    ):
+        impl.target_sfa_diagnostic_boundary(
+            "model.layers.0.self_attn.attn",
+            "input",
+            torch.ones(1, 2),
+            SimpleNamespace(),
+            context,
+        )
+
+    synchronize.assert_not_called()
 
 
 def test_sparse_boundary_gathers_by_request_for_mtp_rows():
@@ -220,7 +440,18 @@ def test_sparse_boundary_prefers_explicit_committed_end():
                 load_spec=SimpleNamespace(
                     can_load=True,
                     lmcache_cached_tokens=3072,
-                    dsa_committed_end=0,
+                    dsa_committed_end=3072,
+                    dsa_scratch_capacity=4096,
+                ),
+            ),
+            SimpleNamespace(
+                req_id="scratch-full",
+                is_sparse_decode=True,
+                load_spec=SimpleNamespace(
+                    can_load=True,
+                    lmcache_cached_tokens=4096,
+                    dsa_committed_end=4096,
+                    dsa_scratch_capacity=4096,
                 ),
             ),
             SimpleNamespace(
@@ -245,7 +476,9 @@ def test_sparse_boundary_prefers_explicit_committed_end():
         patch.object(attention_utils, "is_v1_kv_transfer_group", return_value=True),
         patch.object(attention_utils, "get_kv_transfer_group", return_value=connector),
     ):
-        assert attention_utils.get_lmcache_sparse_cached_tokens(["resident", "offloaded"]) == [0, 8192]
+        assert attention_utils.get_lmcache_sparse_cached_tokens(
+            ["resident", "scratch-full", "offloaded"]
+        ) == [0, 4096, 8192]
 
 
 def _staged_route(frontiers=(4096,)):
@@ -463,7 +696,8 @@ class TestLMCacheSparseFrontier(TestBase):
                     load_spec=SimpleNamespace(
                         can_load=True,
                         lmcache_cached_tokens=1024,
-                        dsa_committed_end=0,
+                        dsa_committed_end=3072,
+                        dsa_scratch_capacity=4096,
                     ),
                 ),
                 SimpleNamespace(
@@ -473,6 +707,7 @@ class TestLMCacheSparseFrontier(TestBase):
                         can_load=True,
                         lmcache_cached_tokens=8192,
                         dsa_committed_end=8192,
+                        dsa_scratch_capacity=4096,
                     ),
                 ),
             ]
@@ -494,7 +729,8 @@ class TestLMCacheSparseFrontier(TestBase):
                     load_spec=SimpleNamespace(
                         can_load=True,
                         lmcache_cached_tokens=8193,
-                        dsa_committed_end=8192,
+                        dsa_committed_end=8193,
+                        dsa_remap_frontier=8192,
                         dsa_cold_compact_load=False,
                         dsa_cold_compact_resume=True,
                     ),
@@ -703,6 +939,196 @@ class TestLMCacheSparseFrontier(TestBase):
         )
 
 
+@pytest.mark.parametrize("mtp", [1, 2])
+def test_sorted_resident_helper_uses_active_fixed_address_prefix(mtp):
+    impl = AscendSFAImpl.__new__(AscendSFAImpl)
+    impl.block_size = 128
+    impl._sorted_resident_state = MagicMock()
+    impl._sorted_resident_workspace = (
+        sfa_v1.allocate_sorted_resident_workspace(
+            4,
+            mtp,
+            device=torch.device("cpu"),
+        )
+    )
+    impl._sorted_resident_workspace_views = {}
+    requests = 2
+    topk = torch.zeros(
+        (requests * mtp, 1, sfa_v1.INDEX_TOPK),
+        dtype=torch.int32,
+    )
+    split_boundary = torch.full(
+        (requests * mtp,),
+        4096,
+        dtype=torch.int32,
+    )
+    row_req_indices = torch.arange(
+        requests,
+        dtype=torch.int32,
+    ).repeat_interleave(mtp)
+    block_table = torch.zeros((requests, 32), dtype=torch.int32)
+    state_indices = torch.arange(requests, dtype=torch.int32)
+    state_generations = torch.ones(requests, dtype=torch.int64)
+
+    with (
+        patch.object(
+            sfa_v1,
+            "prepare_resident_sharded_union_",
+        ) as union,
+        patch.object(
+            sfa_v1,
+            "prepare_sorted_resident_cache_fused_",
+        ) as finalize,
+    ):
+        active_workspace = sfa_v1.sorted_resident_workspace_prefix(
+            impl._sorted_resident_workspace,
+            requests,
+        )
+        finalize.return_value = (
+            active_workspace.miss_tokens,
+            active_workspace.miss_counts[:, 0],
+            active_workspace.target_slots,
+        )
+        outputs = impl._prepare_sorted_resident_sparse_cache(
+            topk,
+            split_boundary,
+            row_req_indices,
+            block_table,
+            state_indices,
+            state_generations,
+            mtp=mtp,
+        )
+
+    union_workspace = union.call_args.args[6]
+    finalize_workspace = finalize.call_args.args[5]
+    assert union_workspace is finalize_workspace
+    assert union_workspace.shard_packed.shape[0] == requests
+    assert (
+        union_workspace.shard_packed.data_ptr()
+        == impl._sorted_resident_workspace.shard_packed.data_ptr()
+    )
+    assert outputs[0] is topk
+    assert outputs[1] is active_workspace.miss_tokens
+    assert outputs[2].data_ptr() == active_workspace.miss_counts.data_ptr()
+    assert outputs[3] is active_workspace.target_slots
+
+
+@pytest.mark.parametrize(
+    "mtp,shards_per_row,expected",
+    [
+        (1, 1, 1),
+        (1, 2, 2),
+        (1, 4, 4),
+        (2, 1, 2),
+        (2, 2, 4),
+        (2, 4, 8),
+    ],
+)
+def test_configured_resident_shards_are_request_wide(
+    mtp, shards_per_row, expected
+):
+    with patch.object(
+        sfa_v1.envs,
+        "VLLM_ASCEND_DSA_RESIDENT_SHARDS_PER_ROW",
+        shards_per_row,
+    ):
+        assert sfa_v1._configured_resident_shards(mtp) == (
+            shards_per_row,
+            expected,
+        )
+
+
+def test_configured_resident_shards_default_to_four_per_row():
+    with patch.object(
+        sfa_v1.envs,
+        "VLLM_ASCEND_DSA_RESIDENT_SHARDS_PER_ROW",
+        4,
+    ):
+        assert sfa_v1._configured_resident_shards(1) == (4, 4)
+        assert sfa_v1._configured_resident_shards(2) == (4, 8)
+
+
+@pytest.mark.parametrize(
+    "enabled,need_packed,mtp,uses_sorted",
+    [
+        (True, True, 1, True),
+        (True, True, 2, True),
+        (False, True, 1, False),
+        (True, True, None, False),
+        (True, False, 1, False),
+    ],
+)
+def test_decode_sparse_planner_routes_only_fixed_decode_to_resident(
+    enabled,
+    need_packed,
+    mtp,
+    uses_sorted,
+):
+    impl = AscendSFAImpl.__new__(AscendSFAImpl)
+    impl.block_size = 128
+    impl.dsa_resident_cache = enabled
+    expected = (MagicMock(), MagicMock(), MagicMock(), MagicMock())
+    impl._prepare_sorted_resident_sparse_cache = MagicMock(
+        return_value=expected
+    )
+    tensors = [MagicMock() for _ in range(9)]
+
+    with patch.object(
+        sfa_v1,
+        "prepare_sparse_indices",
+        return_value=expected,
+    ) as ordinary:
+        actual = impl._prepare_decode_sparse_indices(
+            *tensors,
+            local_to_union_workspace=MagicMock(),
+            shard_packed_workspace=MagicMock(),
+            shard_mapping_workspace=MagicMock(),
+            shard_counts_workspace=MagicMock(),
+            staged_mtp=mtp,
+            need_packed=need_packed,
+            clear_invalid_rows=True,
+        )
+
+    assert actual is expected
+    assert impl._prepare_sorted_resident_sparse_cache.called is uses_sorted
+    assert ordinary.called is not uses_sorted
+
+
+def test_decode_sparse_planner_debug_snapshots_raw_topk_before_resident():
+    impl = AscendSFAImpl.__new__(AscendSFAImpl)
+    impl.block_size = 128
+    impl.dsa_resident_cache = True
+    expected = (MagicMock(), MagicMock(), MagicMock(), MagicMock())
+    impl._prepare_sorted_resident_sparse_cache = MagicMock(
+        return_value=expected
+    )
+    topk = torch.tensor(
+        [[[7, 8]], [[9, 10]]],
+        dtype=torch.int32,
+    )
+    raw_topk_workspace = torch.full((1, 4), -1, dtype=torch.int32)
+    tensors = [topk, *(MagicMock() for _ in range(8))]
+
+    with patch.dict(
+        os.environ,
+        {"VLLM_ASCEND_MTP_DRAFT_DEBUG": "1"},
+    ):
+        actual = impl._prepare_decode_sparse_indices(
+            *tensors,
+            local_to_union_workspace=raw_topk_workspace,
+            shard_packed_workspace=MagicMock(),
+            shard_mapping_workspace=MagicMock(),
+            shard_counts_workspace=MagicMock(),
+            staged_mtp=2,
+            need_packed=True,
+            clear_invalid_rows=True,
+        )
+
+    assert actual is expected
+    assert torch.equal(raw_topk_workspace, topk.reshape(1, 4))
+    impl._prepare_sorted_resident_sparse_cache.assert_called_once()
+
+
 class TestStagedSFAGraphPoc(TestBase):
     def setUp(self):
         super().setUp()
@@ -725,6 +1151,7 @@ class TestStagedSFAGraphPoc(TestBase):
     def _make_eligible_impl():
         impl = AscendSFAImpl.__new__(AscendSFAImpl)
         impl.dsa_shrink_latent = 2
+        impl.dsa_resident_cache = True
         impl.num_kv_heads = 1
         impl.local_num_heads = 2
         impl.kv_lora_rank = 2
@@ -832,6 +1259,23 @@ class TestStagedSFAGraphPoc(TestBase):
         )
         metadata.decode_union_mapping_workspace = torch.empty(
             batch_size, 4, dtype=torch.int32
+        )
+        metadata.decode_shard_packed_workspace = torch.empty(
+            batch_size, 2, 4, dtype=torch.int32
+        )
+        metadata.decode_shard_mapping_workspace = torch.empty_like(
+            metadata.decode_shard_packed_workspace
+        )
+        metadata.decode_shard_counts_workspace = torch.empty(
+            batch_size, 2, 16, dtype=torch.int32
+        )
+        metadata.resident_state_indices = torch.arange(
+            batch_size,
+            dtype=torch.int32,
+        )
+        metadata.resident_state_generations = torch.ones(
+            batch_size,
+            dtype=torch.int64,
         )
         metadata.decode_request_ids_compact = [f"req-{row}" for row in range(batch_size)]
         metadata.req_ids = list(metadata.decode_request_ids_compact)
@@ -957,7 +1401,7 @@ class TestStagedSFAGraphPoc(TestBase):
             eager_metadata.decode_remap_boundary,
         )
         self.assertIs(
-            impl._cross_layer_pre_compute.call_args_list[1].args[-7],
+            impl._cross_layer_pre_compute.call_args_list[1].args[11],
             eager_metadata.decode_remap_boundary,
         )
         self.assertEqual(
@@ -1016,7 +1460,100 @@ class TestStagedSFAGraphPoc(TestBase):
         args = impl._cross_layer_pre_compute.call_args.args
         # The graph keeps four fixed rows, while -1 prevents its three
         # padding rows from participating in the request-level union.
-        self.assertEqual(args[-6].tolist(), [0, -1, -1, -1])
+        self.assertEqual(args[12].tolist(), [0, -1, -1, -1])
+
+    def test_three_and_five_request_batches_both_have_padding_slots(self):
+        """Padding alone cannot explain a failure unique to request five."""
+        query_width = 2
+        for actual_requests, request_capacity in ((3, 4), (5, 8)):
+            with self.subTest(actual_requests=actual_requests):
+                actual_tokens = actual_requests * query_width
+                token_capacity = request_capacity * query_width
+                padding_tokens = token_capacity - actual_tokens
+                impl = self._make_eligible_impl()
+                impl.decode_threshold = query_width
+                graph_key = StagedSFAGraphKey.fixed_spec(
+                    request_capacity,
+                    query_width,
+                )
+                metadata = self._make_decode_metadata(token_capacity)
+                metadata.num_actual_tokens = actual_tokens
+                metadata.decode_req_indices = torch.cat(
+                    (
+                        torch.arange(actual_requests).repeat_interleave(
+                            query_width
+                        ),
+                        torch.full((padding_tokens,), -1),
+                    )
+                ).to(torch.int32)
+                metadata.slot_mapping[actual_tokens:].fill_(-1)
+                metadata.indexer_slot_mapping[actual_tokens:].fill_(-1)
+                metadata.req_ids = [
+                    f"req-{index}" for index in range(actual_requests)
+                ]
+                impl._staged_sfa_capture_state.producer_event = MagicMock()
+                impl._cross_layer_kv_cache = MagicMock(
+                    return_value=(
+                        self._make_eligible_kv_cache(
+                            num_blocks=request_capacity
+                        ),
+                        "index-0",
+                        True,
+                    )
+                )
+                impl._cross_layer_ineligible_reason = MagicMock(
+                    return_value=None
+                )
+                impl._cross_layer_pre_compute = MagicMock(
+                    return_value=self._make_pre_outputs(
+                        token_capacity,
+                        request_capacity,
+                    )
+                )
+                context = SimpleNamespace(
+                    staged_sfa_graph_key=graph_key,
+                    staged_sfa_route=StagedSFARouteDecision(
+                        StagedSFARouteAction.STAGED,
+                        StagedSFARouteReason.ELIGIBLE,
+                        graph_key,
+                        (131_584,) * actual_requests,
+                    ),
+                    staged_sfa_graph_dummy_run=False,
+                    cudagraph_runtime_mode=CUDAGraphMode.PIECEWISE,
+                )
+
+                with (
+                    patch.object(
+                        sfa_v1,
+                        "get_forward_context",
+                        return_value=context,
+                    ),
+                    patch.object(
+                        sfa_v1,
+                        "_prepare_sfa_remap_boundary",
+                        return_value=metadata.decode_remap_boundary,
+                    ),
+                ):
+                    impl.cross_layer_graph_pre(
+                        "layer-0",
+                        torch.empty(token_capacity, 4),
+                        self._make_eligible_kv_cache(
+                            num_blocks=request_capacity
+                        ),
+                        metadata,
+                        False,
+                        torch.empty(token_capacity, 4),
+                    )
+
+                args = impl._cross_layer_pre_compute.call_args.args
+                self.assertEqual(
+                    torch.count_nonzero(args[6] < 0).item(),
+                    padding_tokens,
+                )
+                self.assertEqual(
+                    torch.count_nonzero(args[7] < 0).item(),
+                    padding_tokens,
+                )
 
     def test_bridge_storage_is_preallocated_and_reused_for_q1(self):
         impl = self._make_eligible_impl()
@@ -1227,6 +1764,16 @@ class TestStagedSFAGraphPoc(TestBase):
         self.assertIs(
             wait_for_layer.call_args_list[0].kwargs["payload_event"],
             impl._staged_sfa_capture_state.producer_event,
+        )
+        self.assertNotIn(
+            "require_complete_sparse_load",
+            wait_for_layer.call_args_list[0].kwargs,
+        )
+        self.assertEqual(
+            wait_for_layer.call_args_list[0]
+            .kwargs["selected_token_counts"]
+            .tolist(),
+            [1],
         )
         prepare_boundary.assert_called_once_with(
             next_metadata,
@@ -1723,6 +2270,23 @@ class TestStagedSFAGraphPoc(TestBase):
         )
         metadata.decode_union_mapping_workspace = torch.empty(
             2, 8, dtype=torch.int32
+        )
+        metadata.decode_shard_packed_workspace = torch.empty(
+            2, 2, 8, dtype=torch.int32
+        )
+        metadata.decode_shard_mapping_workspace = torch.empty_like(
+            metadata.decode_shard_packed_workspace
+        )
+        metadata.decode_shard_counts_workspace = torch.empty(
+            2, 2, 16, dtype=torch.int32
+        )
+        metadata.resident_state_indices = torch.arange(
+            2,
+            dtype=torch.int32,
+        )
+        metadata.resident_state_generations = torch.ones(
+            2,
+            dtype=torch.int64,
         )
         graph_key = StagedSFAGraphKey.fixed_spec(2, 2)
         context = SimpleNamespace(
@@ -2255,6 +2819,9 @@ class TestAscendSFAMetadataBuilder(TestBase):
             first.decode_selected_counts.data_ptr(),
             first.decode_target_slot_mapping.data_ptr(),
             first.decode_union_mapping_workspace.data_ptr(),
+            first.decode_shard_packed_workspace.data_ptr(),
+            first.decode_shard_mapping_workspace.data_ptr(),
+            first.decode_shard_counts_workspace.data_ptr(),
         )
         assert first.decode_req_indices.tolist() == [0, 0, 1, 1]
         assert first.decode_row_offsets.tolist() == [0, 1, 0, 1]
@@ -2277,6 +2844,9 @@ class TestAscendSFAMetadataBuilder(TestBase):
             second.decode_selected_counts.data_ptr(),
             second.decode_target_slot_mapping.data_ptr(),
             second.decode_union_mapping_workspace.data_ptr(),
+            second.decode_shard_packed_workspace.data_ptr(),
+            second.decode_shard_mapping_workspace.data_ptr(),
+            second.decode_shard_counts_workspace.data_ptr(),
         )
 
         assert second_addresses == addresses

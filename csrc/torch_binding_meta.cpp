@@ -103,6 +103,283 @@ at::Tensor npu_dsa_prepare_sparse_indices_staged_meta(
     return selected_counts;
 }
 
+at::Tensor npu_dsa_prepare_sparse_indices_sharded_meta(
+    at::Tensor &topk_indices,
+    const at::Tensor &split_boundary,
+    const at::Tensor &row_req_indices,
+    const at::Tensor &request_block_table,
+    at::Tensor &selected_packed,
+    at::Tensor &selected_counts,
+    at::Tensor &target_slots,
+    at::Tensor &local_to_union_workspace,
+    at::Tensor &shard_packed_workspace,
+    at::Tensor &shard_mapping_workspace,
+    at::Tensor &shard_counts_workspace,
+    int64_t block_size,
+    int64_t mtp,
+    bool need_packed,
+    bool clear_invalid_rows)
+{
+    (void)shard_packed_workspace;
+    (void)shard_mapping_workspace;
+    (void)shard_counts_workspace;
+    return npu_dsa_prepare_sparse_indices_staged_meta(
+        topk_indices, split_boundary, row_req_indices, request_block_table,
+        selected_packed, selected_counts, target_slots,
+        local_to_union_workspace, block_size, mtp, need_packed,
+        clear_invalid_rows);
+}
+
+at::Tensor npu_dsa_resident_lookup_rows_meta(
+    const at::Tensor &selected_packed,
+    const at::Tensor &selected_count,
+    const at::Tensor &request_state_indices,
+    at::Tensor &lookup_indices,
+    int64_t token_stride,
+    int64_t dummy_state_base)
+{
+    (void)selected_packed;
+    (void)selected_count;
+    (void)request_state_indices;
+    (void)token_stride;
+    (void)dummy_state_base;
+    return lookup_indices;
+}
+
+at::Tensor npu_dsa_resident_finalize_rows_meta(
+    at::Tensor &topk_indices,
+    const at::Tensor &position_to_union,
+    at::Tensor &selected_packed,
+    at::Tensor &selected_count,
+    at::Tensor &target_slots,
+    const at::Tensor &request_block_table,
+    const at::Tensor &request_state_indices,
+    const at::Tensor &request_state_generations,
+    const at::Tensor &old_slots,
+    at::Tensor &slot_to_token,
+    at::Tensor &state_generations,
+    at::Tensor &union_to_slot,
+    at::Tensor &reverse_indices,
+    at::Tensor &reverse_values,
+    int64_t token_stride,
+    int64_t block_size)
+{
+    (void)topk_indices;
+    (void)position_to_union;
+    (void)selected_packed;
+    (void)target_slots;
+    (void)request_block_table;
+    (void)request_state_indices;
+    (void)request_state_generations;
+    (void)old_slots;
+    (void)slot_to_token;
+    (void)state_generations;
+    (void)union_to_slot;
+    (void)reverse_indices;
+    (void)reverse_values;
+    (void)token_stride;
+    (void)block_size;
+    return selected_count;
+}
+
+at::Tensor npu_dsa_resident_sharded_union_meta(
+    const at::Tensor &topk_indices,
+    const at::Tensor &split_boundary,
+    const at::Tensor &row_req_indices,
+    at::Tensor &shard_packed,
+    at::Tensor &shard_mapping,
+    at::Tensor &shard_counts,
+    const at::Tensor &request_state_indices,
+    const at::Tensor &request_state_generations,
+    at::Tensor &state_tokens,
+    at::Tensor &state_slots,
+    at::Tensor &state_counts,
+    const at::Tensor &state_generations,
+    at::Tensor &prior_slots,
+    at::Tensor &shard_miss_tokens,
+    at::Tensor &shard_miss_positions,
+    at::Tensor &shard_evictable_slots,
+    int64_t mtp,
+    int64_t dummy_state_base)
+{
+    (void)topk_indices;
+    (void)split_boundary;
+    (void)row_req_indices;
+    (void)shard_packed;
+    (void)shard_mapping;
+    (void)request_state_indices;
+    (void)request_state_generations;
+    (void)state_tokens;
+    (void)state_slots;
+    (void)state_counts;
+    (void)state_generations;
+    (void)prior_slots;
+    (void)shard_miss_tokens;
+    (void)shard_miss_positions;
+    (void)shard_evictable_slots;
+    (void)mtp;
+    (void)dummy_state_base;
+    return shard_counts;
+}
+
+at::Tensor npu_dsa_resident_sorted_plan_meta(
+    at::Tensor &topk_indices,
+    const at::Tensor &shard_packed,
+    const at::Tensor &shard_mapping,
+    at::Tensor &shard_counts,
+    const at::Tensor &request_block_table,
+    const at::Tensor &request_state_indices,
+    const at::Tensor &request_state_generations,
+    at::Tensor &state_tokens,
+    at::Tensor &state_slots,
+    at::Tensor &state_counts,
+    at::Tensor &state_generations,
+    at::Tensor &prior_slots,
+    const at::Tensor &shard_miss_tokens,
+    const at::Tensor &shard_miss_positions,
+    const at::Tensor &shard_evictable_slots,
+    at::Tensor &miss_tokens,
+    at::Tensor &miss_counts,
+    at::Tensor &target_slots,
+    int64_t block_size,
+    int64_t dummy_state_base)
+{
+    (void)topk_indices;
+    (void)shard_packed;
+    (void)shard_mapping;
+    (void)shard_counts;
+    (void)request_block_table;
+    (void)request_state_indices;
+    (void)request_state_generations;
+    (void)state_tokens;
+    (void)state_slots;
+    (void)state_counts;
+    (void)state_generations;
+    (void)prior_slots;
+    (void)shard_miss_tokens;
+    (void)shard_miss_positions;
+    (void)shard_evictable_slots;
+    (void)miss_tokens;
+    (void)target_slots;
+    (void)block_size;
+    (void)dummy_state_base;
+    return miss_counts;
+}
+
+at::Tensor npu_dsa_resident_sorted_remap_meta(
+    at::Tensor &topk_indices,
+    const at::Tensor &shard_mapping,
+    const at::Tensor &shard_counts,
+    const at::Tensor &prior_slots)
+{
+    (void)shard_mapping;
+    (void)shard_counts;
+    (void)prior_slots;
+    return topk_indices;
+}
+
+at::Tensor npu_dsa_resident_finalize_coordinator_meta(
+    at::Tensor &shard_counts,
+    at::Tensor &miss_counts)
+{
+    (void)shard_counts;
+    return miss_counts;
+}
+
+at::Tensor npu_dsa_resident_sharded_finalize_worker_meta(
+    at::Tensor &shard_counts,
+    at::Tensor &prior_slots,
+    const at::Tensor &shard_miss_tokens,
+    const at::Tensor &shard_miss_positions,
+    const at::Tensor &shard_evictable_slots,
+    at::Tensor &miss_tokens,
+    at::Tensor &miss_counts,
+    at::Tensor &target_slots,
+    const at::Tensor &request_block_table,
+    int64_t block_size)
+{
+    (void)shard_counts;
+    (void)prior_slots;
+    (void)shard_miss_tokens;
+    (void)shard_miss_positions;
+    (void)shard_evictable_slots;
+    (void)miss_counts;
+    (void)target_slots;
+    (void)request_block_table;
+    (void)block_size;
+    return miss_tokens;
+}
+
+at::Tensor npu_dsa_resident_sorted_update_debug_meta(
+    at::Tensor &topk_indices,
+    const at::Tensor &shard_packed,
+    const at::Tensor &shard_mapping,
+    const at::Tensor &shard_counts,
+    const at::Tensor &prior_slots,
+    const at::Tensor &request_state_indices,
+    const at::Tensor &request_state_generations,
+    at::Tensor &state_tokens,
+    at::Tensor &state_slots,
+    at::Tensor &state_counts,
+    at::Tensor &state_generations,
+    int64_t dummy_state_base)
+{
+    (void)shard_packed;
+    (void)shard_mapping;
+    (void)shard_counts;
+    (void)prior_slots;
+    (void)request_state_indices;
+    (void)request_state_generations;
+    (void)state_tokens;
+    (void)state_slots;
+    (void)state_counts;
+    (void)state_generations;
+    (void)dummy_state_base;
+    return topk_indices;
+}
+
+at::Tensor npu_dsa_resident_sorted_read_probe_meta(
+    const at::Tensor &shard_counts,
+    const at::Tensor &prior_slots,
+    at::Tensor &debug_info,
+    at::Tensor &prior_readback)
+{
+    (void)shard_counts;
+    (void)prior_slots;
+    (void)prior_readback;
+    return debug_info;
+}
+
+at::Tensor npu_dsa_resident_sorted_finalize_debug_meta(
+    const at::Tensor &shard_packed,
+    at::Tensor &shard_counts,
+    at::Tensor &prior_slots,
+    const at::Tensor &shard_miss_tokens,
+    const at::Tensor &shard_miss_positions,
+    const at::Tensor &shard_evictable_slots,
+    at::Tensor &miss_tokens,
+    at::Tensor &miss_counts,
+    at::Tensor &target_slots,
+    const at::Tensor &request_block_table,
+    at::Tensor &debug_info,
+    int64_t block_size,
+    int64_t debug_stage)
+{
+    (void)shard_packed;
+    (void)shard_counts;
+    (void)prior_slots;
+    (void)shard_miss_tokens;
+    (void)shard_miss_positions;
+    (void)shard_evictable_slots;
+    (void)miss_tokens;
+    (void)target_slots;
+    (void)request_block_table;
+    (void)debug_info;
+    (void)block_size;
+    (void)debug_stage;
+    return miss_counts;
+}
+
 at::Tensor npu_dsa_staged_sharded_union_meta(
     at::Tensor &topk_indices,
     const at::Tensor &split_boundary,
@@ -720,6 +997,9 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
         "npu_dsa_prepare_sparse_indices_staged_",
         &vllm_ascend::meta::npu_dsa_prepare_sparse_indices_staged_meta);
     ops.impl(
+        "npu_dsa_prepare_sparse_indices_sharded_",
+        &vllm_ascend::meta::npu_dsa_prepare_sparse_indices_sharded_meta);
+    ops.impl(
         "npu_dsa_staged_sharded_union_",
         &vllm_ascend::meta::npu_dsa_staged_sharded_union_meta);
     ops.impl(
@@ -728,6 +1008,39 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
     ops.impl(
         "npu_dsa_staged_sharded_vector_dedup_",
         &vllm_ascend::meta::npu_dsa_staged_sharded_vector_dedup_meta);
+    ops.impl(
+        "npu_dsa_resident_lookup_rows_",
+        &vllm_ascend::meta::npu_dsa_resident_lookup_rows_meta);
+    ops.impl(
+        "npu_dsa_resident_finalize_rows_",
+        &vllm_ascend::meta::npu_dsa_resident_finalize_rows_meta);
+    ops.impl(
+        "npu_dsa_resident_sharded_union_",
+        &vllm_ascend::meta::npu_dsa_resident_sharded_union_meta);
+    ops.impl(
+        "npu_dsa_resident_sorted_plan_",
+        &vllm_ascend::meta::npu_dsa_resident_sorted_plan_meta);
+    ops.impl(
+        "npu_dsa_resident_sorted_plan_no_remap_",
+        &vllm_ascend::meta::npu_dsa_resident_sorted_plan_meta);
+    ops.impl(
+        "npu_dsa_resident_finalize_coordinator_",
+        &vllm_ascend::meta::npu_dsa_resident_finalize_coordinator_meta);
+    ops.impl(
+        "npu_dsa_resident_sharded_finalize_worker_",
+        &vllm_ascend::meta::npu_dsa_resident_sharded_finalize_worker_meta);
+    ops.impl(
+        "npu_dsa_resident_sorted_update_debug_",
+        &vllm_ascend::meta::npu_dsa_resident_sorted_update_debug_meta);
+    ops.impl(
+        "npu_dsa_resident_sorted_remap_",
+        &vllm_ascend::meta::npu_dsa_resident_sorted_remap_meta);
+    ops.impl(
+        "npu_dsa_resident_sorted_read_probe_",
+        &vllm_ascend::meta::npu_dsa_resident_sorted_read_probe_meta);
+    ops.impl(
+        "npu_dsa_resident_sorted_finalize_debug_",
+        &vllm_ascend::meta::npu_dsa_resident_sorted_finalize_debug_meta);
     // Bgmv expand
     ops.impl("bgmv_expand", &vllm_ascend::meta::bgmv_expand_meta);
     // Sgmv expand

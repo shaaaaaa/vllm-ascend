@@ -103,6 +103,9 @@ from vllm_ascend.attention.mtp_dw_diag import (
     post_commit_sample_requests,
     scheduled_decode_requests,
 )
+from vllm_ascend.attention.target_sfa_diagnostics import (
+    target_tail_boundary,
+)
 from vllm_ascend.attention.utils import (
     AscendCommonAttentionMetadata,
     get_lmcache_sparse_cached_tokens,
@@ -119,6 +122,10 @@ from vllm_ascend.compilation.acl_graph import (
     set_draft_graph_params,
     set_graph_params,
     update_full_graph_params,
+)
+from vllm_ascend.distributed.kv_transfer.sparse_offload.resident_sparse_cache import (
+    MAX_INT16_SCRATCH_CAPACITY,
+    ResidentRequestStateRegistry,
 )
 from vllm_ascend.eplb.adaptor.vllm_adaptor import VllmEplbAdaptor
 from vllm_ascend.eplb.core.eplb_device_transfer_loader import D2DExpertWeightLoader
@@ -659,6 +666,45 @@ class NPUModelRunner(GPUModelRunner):
             self.cudagraph_batch_sizes = []
         self.mamba_state_idx: dict[str, int] = {}
         self._mamba_copy_bufs: mamba_utils.MambaCopyBuffers | None = None
+        # The disabled path still uses compact scratch, but retrieves the
+        # complete split-boundary union.
+        self.dsa_resident_cache = bool(
+            self.dsa_shrink_latent
+            and envs_ascend.VLLM_ASCEND_DSA_RESIDENT_CACHE
+        )
+        self._resident_state_registry: ResidentRequestStateRegistry | None = None
+        self._resident_state_indices = None
+        self._resident_state_generations = None
+        self._resident_scratch_capacity = (
+            self.decode_threshold * self.dsa_index_topk
+        )
+        if self.dsa_resident_cache:
+            if not (
+                0
+                < self._resident_scratch_capacity
+                < MAX_INT16_SCRATCH_CAPACITY
+            ):
+                raise ValueError(
+                    "resident sparse cache stores scratch slots in signed "
+                    "int16 and requires 0 < MTP * index_topk < "
+                    f"{MAX_INT16_SCRATCH_CAPACITY}; got "
+                    f"{self._resident_scratch_capacity}"
+                )
+            self._resident_state_registry = ResidentRequestStateRegistry(
+                self.max_num_reqs
+            )
+            self._resident_state_indices = self._make_buffer(
+                self.max_num_reqs, dtype=torch.int32
+            )
+            self._resident_state_generations = self._make_buffer(
+                self.max_num_reqs, dtype=torch.int64
+            )
+            logger.info(
+                "DSA sorted resident scratch reuse enabled: capacity=%d, "
+                "state_slots=%d.",
+                self._resident_scratch_capacity,
+                self.max_num_reqs,
+            )
 
     @property
     def use_cp(self) -> bool:
@@ -669,6 +715,112 @@ class NPUModelRunner(GPUModelRunner):
 
     def _sync_device(self) -> None:
         torch.npu.synchronize()
+
+    def _update_states(self, scheduler_output: SchedulerOutput) -> None:
+        registry = self._resident_state_registry
+        if registry is not None:
+            registry.release(tuple(scheduler_output.finished_req_ids))
+        super()._update_states(scheduler_output)
+
+    def _prepare_resident_request_state(
+        self,
+        *,
+        num_reqs: int,
+        num_reqs_padded: int,
+        is_dummy: bool,
+        decode_only: bool = True,
+        remap_frontiers: tuple[int, ...] | None = None,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None, Any, Any]:
+        registry = self._resident_state_registry
+        indices = self._resident_state_indices
+        generations = self._resident_state_generations
+        if registry is None or indices is None or generations is None:
+            return None, None, None, None
+
+        indices.np[:num_reqs_padded].fill(-1)
+        generations.np[:num_reqs_padded].fill(-1)
+        if not is_dummy and num_reqs:
+            request_ids = tuple(self.input_batch.req_ids[:num_reqs])
+            if any(request_id is None for request_id in request_ids):
+                raise RuntimeError(
+                    "resident sparse cache received an empty request id"
+                )
+            if remap_frontiers is not None and len(remap_frontiers) != num_reqs:
+                raise RuntimeError(
+                    "resident sparse cache remap frontier count differs from "
+                    f"the active request count: {len(remap_frontiers)} != "
+                    f"{num_reqs}"
+                )
+            if not decode_only:
+                # Mixed batches use the ordinary union and may overwrite
+                # scratch without updating sorted state. The next decode-only
+                # step must therefore observe a generation mismatch.
+                registry.invalidate(request_ids)  # type: ignore[arg-type]
+            block_table = self.input_batch.block_table[0]
+            scratch_blocks = cdiv(
+                self._resident_scratch_capacity,
+                block_table.block_size,
+            )
+            eligible_rows = []
+            eligible_request_ids = []
+            inactive_request_ids = []
+            signatures = []
+            for row in range(num_reqs):
+                remap_frontier = (
+                    remap_frontiers[row]
+                    if remap_frontiers is not None
+                    else None
+                )
+                if remap_frontier == 0:
+                    # A zero boundary is the no-remap path even if the block
+                    # allocator has already materialized the full prefix.
+                    inactive_request_ids.append(request_ids[row])
+                    continue
+                if block_table.num_blocks_per_row[row] < scratch_blocks:
+                    if remap_frontier is not None:
+                        raise RuntimeError(
+                            "resident sparse cache received a nonzero remap "
+                            "frontier without a complete scratch prefix for "
+                            f"request row {row}: frontier="
+                            f"{remap_frontier}, needs {scratch_blocks} "
+                            "blocks, has "
+                            f"{block_table.num_blocks_per_row[row]}"
+                        )
+                    inactive_request_ids.append(request_ids[row])
+                    continue
+                eligible_rows.append(row)
+                eligible_request_ids.append(request_ids[row])
+                signatures.append(
+                    tuple(
+                        map(
+                            int,
+                            block_table.block_table.np[
+                                row, :scratch_blocks
+                            ],
+                        )
+                    )
+                )
+            if decode_only and inactive_request_ids:
+                # If a preempted/restarted request used to own a resident row,
+                # make a later zero-to-nonzero boundary transition cold even
+                # when the allocator reuses the same physical block ids.
+                registry.invalidate(inactive_request_ids)  # type: ignore[arg-type]
+            if eligible_rows:
+                state_rows, state_generations = registry.bind(
+                    eligible_request_ids,  # type: ignore[arg-type]
+                    signatures,
+                )
+                indices.np[eligible_rows] = state_rows
+                generations.np[eligible_rows] = state_generations
+
+        indices.copy_to_gpu(num_reqs_padded)
+        generations.copy_to_gpu(num_reqs_padded)
+        return (
+            indices.gpu[:num_reqs_padded],
+            generations.gpu[:num_reqs_padded],
+            indices.np[:num_reqs_padded],
+            generations.np[:num_reqs_padded],
+        )
 
     def _set_up_drafter(self):
         # Set up speculative decoding.
@@ -1656,6 +1808,12 @@ class NPUModelRunner(GPUModelRunner):
                     cold_compact_resumes=(
                         staged_sfa_route.cold_compact_resumes
                     ),
+                    resident_remap_frontiers=(
+                        staged_sfa_route.frontiers
+                        if staged_sfa_route.action
+                        == StagedSFARouteAction.STAGED
+                        else None
+                    ),
                 )
 
             (
@@ -1846,6 +2004,18 @@ class NPUModelRunner(GPUModelRunner):
             hidden_states = self._model_forward(
                 num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
             )
+            target_diag_session = getattr(
+                get_forward_context(),
+                "_target_sfa_diag_session",
+                None,
+            )
+            if envs_ascend.VLLM_ASCEND_MTP_DRAFT_DEBUG:
+                target_tail_boundary(
+                    target_diag_session,
+                    "model_forward",
+                    hidden_states,
+                )
+            self._target_sfa_diag_session = target_diag_session
             if staged_sfa_graph_key is not None:
                 for _, impl in self._staged_sfa_impls:
                     impl.submit_cross_layer_save()
@@ -1907,6 +2077,13 @@ class NPUModelRunner(GPUModelRunner):
                 )
                 assert broadcasted is not None
                 logits = broadcasted["logits"]
+
+            if envs_ascend.VLLM_ASCEND_MTP_DRAFT_DEBUG:
+                target_tail_boundary(
+                    getattr(self, "_target_sfa_diag_session", None),
+                    "logits",
+                    logits,
+                )
 
             # Apply structured output bitmasks if present
             self.execute_model_state = ExecuteModelState(
@@ -1982,6 +2159,12 @@ class NPUModelRunner(GPUModelRunner):
 
         with record_function_or_nullcontext("sample_token"):
             sampler_output = self._sample(logits, spec_decode_metadata)
+        if envs_ascend.VLLM_ASCEND_MTP_DRAFT_DEBUG:
+            target_tail_boundary(
+                getattr(self, "_target_sfa_diag_session", None),
+                "sampling",
+                sampler_output,
+            )
 
         if self.need_accepted_tokens:
             if self.sampling_done_event is None:
@@ -1992,20 +2175,26 @@ class NPUModelRunner(GPUModelRunner):
 
         def propose_draft_token_ids(sampled_token_ids):
             assert spec_decode_common_attn_metadata is not None
-            self._draft_token_ids = self.propose_draft_token_ids(
-                sampled_token_ids,
-                self.input_batch.sampling_metadata,
-                scheduler_output,
-                spec_decode_metadata,
-                spec_decode_common_attn_metadata,
-                positions,
-                scheduler_output.total_num_scheduled_tokens,
-                hidden_states,
-                aux_hidden_states,
-                sample_hidden_states,
-                batch_desc,
-                staged_sfa_graph_key,
+            draft_diag_scope = (
+                self.drafter.mtp_draft_diagnostic_scope()
+                if getattr(self.drafter, "method", None) == "mtp"
+                else nullcontext()
             )
+            with draft_diag_scope:
+                self._draft_token_ids = self.propose_draft_token_ids(
+                    sampled_token_ids,
+                    self.input_batch.sampling_metadata,
+                    scheduler_output,
+                    spec_decode_metadata,
+                    spec_decode_common_attn_metadata,
+                    positions,
+                    scheduler_output.total_num_scheduled_tokens,
+                    hidden_states,
+                    aux_hidden_states,
+                    sample_hidden_states,
+                    batch_desc,
+                    staged_sfa_graph_key,
+                )
             self._copy_draft_token_ids_to_cpu(scheduler_output)
 
         (
@@ -2610,6 +2799,7 @@ class NPUModelRunner(GPUModelRunner):
         num_scheduled_tokens_np: np.ndarray | None = None,
         cascade_attn_prefix_lens: list[list[int]] | None = None,
         cold_compact_resumes: tuple[bool, ...] = (),
+        resident_remap_frontiers: tuple[int, ...] | None = None,
     ) -> tuple[PerLayerAttnMetadata, CommonAttentionMetadata | None]:
         """
         :return: tuple[attn_metadata, spec_decode_common_attn_metadata]
@@ -2743,6 +2933,26 @@ class NPUModelRunner(GPUModelRunner):
                 num_reqs
             )
 
+        (
+            resident_state_indices,
+            resident_state_generations,
+            resident_state_indices_cpu,
+            resident_state_generations_cpu,
+        ) = self._prepare_resident_request_state(
+            num_reqs=num_reqs,
+            num_reqs_padded=num_reqs_padded,
+            is_dummy=staged_sfa_graph_dummy_run,
+            decode_only=(
+                staged_sfa_graph_dummy_run
+                or self.attn_state
+                in (
+                    AscendAttentionState.DecodeOnly,
+                    AscendAttentionState.SpecDecoding,
+                )
+            ),
+            remap_frontiers=resident_remap_frontiers,
+        )
+
         cm_base = AscendCommonAttentionMetadata(
             query_start_loc=self.query_start_loc.gpu[: num_reqs_padded + 1],
             query_start_loc_cpu=self.query_start_loc.cpu[: num_reqs_padded + 1],
@@ -2780,6 +2990,10 @@ class NPUModelRunner(GPUModelRunner):
                 )
             ),
             cold_compact_resumes=cold_compact_resumes,
+            resident_state_indices=resident_state_indices,
+            resident_state_generations=resident_state_generations,
+            resident_state_indices_cpu=resident_state_indices_cpu,
+            resident_state_generations_cpu=resident_state_generations_cpu,
         )
 
         if logits_indices is not None and self.cache_config.kv_sharing_fast_prefill:
@@ -5036,9 +5250,17 @@ class NPUModelRunner(GPUModelRunner):
                         "[SFA cross-layer graph] eager warmup/capture was "
                         f"incomplete for {layer_name}: {exc}"
                     ) from exc
+            # The normal retrieve split creates one outer island per target
+            # layer plus the model tail.  Target diagnostics add graph-external
+            # input and output boundaries around every target layer, creating
+            # two additional islands per layer.  Keep the exact-count check so
+            # a genuinely incomplete debug capture still fails at startup.
+            expected_outer_islands = len(self._staged_sfa_impls) + 1
+            if envs_ascend.VLLM_ASCEND_MTP_DRAFT_DEBUG:
+                expected_outer_islands += 2 * len(self._staged_sfa_impls)
             graph_entry_count = ACLGraphWrapper.seal_staged_entries(
                 graph_keys,
-                len(self._staged_sfa_impls) + 1,
+                expected_outer_islands,
             )
             draft_graph_count = 0
             if (

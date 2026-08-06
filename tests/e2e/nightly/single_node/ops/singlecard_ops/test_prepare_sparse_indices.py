@@ -5,6 +5,10 @@ from vllm_ascend.distributed.kv_transfer.sparse_offload.prepare_sparse_indices i
     _prepare_sparse_indices_torch,
     prepare_sparse_indices,
 )
+from vllm_ascend.distributed.kv_transfer.sparse_offload.resident_sparse_cache import (
+    allocate_resident_workspace,
+    prepare_resident_sparse_cache_,
+)
 from vllm_ascend.utils import enable_custom_op
 
 
@@ -20,6 +24,13 @@ def _load_dsa_union_operator():
     ):
         pytest.fail(
             "vllm_ascend_C does not contain the production staged DSA operator"
+        )
+    if not hasattr(
+        torch.ops._C_ascend,
+        "npu_dsa_prepare_sparse_indices_sharded_",
+    ):
+        pytest.fail(
+            "vllm_ascend_C does not contain the production sharded DSA operator"
         )
     if not hasattr(torch.ops._C_ascend, "npu_dsa_prepare_sparse_indices_legacy_"):
         pytest.fail("vllm_ascend_C does not contain the pre-union DSA operator")
@@ -37,6 +48,22 @@ def _load_dsa_union_operator():
         "npu_dsa_staged_sharded_vector_dedup_",
     ):
         pytest.fail("vllm_ascend_C does not contain the vector-dedup operator")
+    if not hasattr(
+        torch.ops._C_ascend,
+        "npu_dsa_resident_remap_rows_",
+    ):
+        pytest.fail(
+            "vllm_ascend_C does not contain the resident parallel-map "
+            "operator"
+        )
+    for name in (
+        "npu_dsa_resident_lookup_rows_",
+        "npu_dsa_resident_finalize_rows_",
+    ):
+        if not hasattr(torch.ops._C_ascend, name):
+            pytest.fail(
+                f"vllm_ascend_C does not contain the {name} operator"
+            )
 
 
 def _buffers(requests: int, capacity: int):
@@ -61,6 +88,7 @@ def _run_production_staged(
     mtp: int,
     *,
     capture_graph: bool = False,
+    use_sharded_sort: bool = True,
 ):
     row_width = source.numel() // source.shape[0]
     capacity = mtp * row_width
@@ -75,6 +103,17 @@ def _run_production_staged(
     ).repeat_interleave(mtp)
     selected, counts, targets = _buffers(request_count, capacity)
     mapping = torch.empty_like(selected)
+    shard_packed = torch.empty(
+        (request_count, 2, capacity),
+        dtype=torch.int32,
+        device="npu",
+    )
+    shard_mapping = torch.empty_like(shard_packed)
+    shard_counts = torch.empty(
+        (request_count, 2, 16),
+        dtype=torch.int32,
+        device="npu",
+    )
     block_table = torch.arange(
         request_count * table_width,
         dtype=torch.int32,
@@ -82,11 +121,25 @@ def _run_production_staged(
     ).reshape(request_count, table_width)
     addresses = tuple(
         tensor.data_ptr()
-        for tensor in (values, selected, counts, targets, mapping)
+        for tensor in (
+            values,
+            selected,
+            counts,
+            targets,
+            mapping,
+            shard_packed,
+            shard_mapping,
+            shard_counts,
+        )
     )
 
     def invoke():
-        torch.ops._C_ascend.npu_dsa_prepare_sparse_indices_staged_(
+        op = (
+            torch.ops._C_ascend.npu_dsa_prepare_sparse_indices_sharded_
+            if use_sharded_sort
+            else torch.ops._C_ascend.npu_dsa_prepare_sparse_indices_staged_
+        )
+        args = [
             values,
             boundaries_npu,
             row_requests,
@@ -95,11 +148,10 @@ def _run_production_staged(
             counts,
             targets,
             mapping,
-            block_size,
-            mtp,
-            True,
-            True,
-        )
+        ]
+        if use_sharded_sort:
+            args.extend((shard_packed, shard_mapping, shard_counts))
+        op(*args, block_size, mtp, True, True)
 
     if capture_graph:
         graph = torch.npu.NPUGraph()
@@ -113,7 +165,16 @@ def _run_production_staged(
     torch.npu.synchronize()
     assert addresses == tuple(
         tensor.data_ptr()
-        for tensor in (values, selected, counts, targets, mapping)
+        for tensor in (
+            values,
+            selected,
+            counts,
+            targets,
+            mapping,
+            shard_packed,
+            shard_mapping,
+            shard_counts,
+        )
     )
     return (
         values.cpu(),
@@ -131,12 +192,17 @@ def _run_vector_sharded_union(
     *,
     capture_graph: bool = False,
     use_position_map: bool = False,
+    shards_per_row: int | None = None,
 ):
     topk = source.shape[-1]
     row_count = source.shape[0]
     mtp = row_count // request_count
     capacity = mtp * topk
-    shard_count = 1 << (mtp - 1).bit_length()
+    shard_count = (
+        1 << (mtp - 1).bit_length()
+        if shards_per_row is None
+        else mtp * shards_per_row
+    )
     block_size = 128
     max_tokens = 131072
     values = source.npu()
@@ -196,8 +262,13 @@ def _run_vector_sharded_union(
         graph = torch.npu.NPUGraph()
         with torch.npu.graph(graph):
             invoke()
-        values.copy_(source.npu())
-        graph.replay()
+        # Replay more than once with the original absolute indices restored.
+        # This catches missing cross-pipeline dependencies that otherwise let
+        # one replay consume mapping or row data left by the previous replay.
+        source_npu = source.npu()
+        for _ in range(3):
+            values.copy_(source_npu)
+            graph.replay()
     else:
         invoke()
     torch.npu.synchronize()
@@ -394,8 +465,11 @@ def test_four_stage_native_unique_with_batched_mtp_rows():
     assert torch.equal(reconstructed.cpu(), source.reshape(row_count, topk).cpu())
 
 
-@pytest.mark.parametrize("mtp", [1, 2, 3, 4])
-def test_sharded_union_tracks_mtp_depth(mtp):
+@pytest.mark.parametrize(
+    "mtp,shards_per_row",
+    [(1, None), (2, None), (3, None), (4, None), (1, 4), (2, 4)],
+)
+def test_sharded_union_tracks_mtp_depth(mtp, shards_per_row):
     topk = 2048
     request_count = 2
     row_count = request_count * mtp
@@ -429,7 +503,11 @@ def test_sharded_union_tracks_mtp_depth(mtp):
     ).reshape(request_count, 131072 // block_size)
     selected, counts, targets = _buffers(request_count, capacity)
     local_to_union = torch.empty((row_count, topk), dtype=torch.int32, device="npu")
-    shard_count = 1 << (mtp - 1).bit_length()
+    shard_count = (
+        1 << (mtp - 1).bit_length()
+        if shards_per_row is None
+        else mtp * shards_per_row
+    )
     shard_packed = torch.empty(
         (request_count, shard_count, topk),
         dtype=torch.int32,
@@ -566,6 +644,50 @@ def test_vector_sharded_union_all_supported_mtp_depths(mtp, use_position_map):
                 expected_offsets.append(offset)
                 offset += result["shard_counts"][request, shard, 0].item()
             assert result["counts"][request, 1 : 1 + shard_count].tolist() == expected_offsets
+
+
+@pytest.mark.parametrize("mtp", [1, 2])
+@pytest.mark.parametrize(
+    "use_position_map",
+    [False, True],
+    ids=["pair-map", "position-map"],
+)
+def test_vector_sharded_union_supports_four_shards_per_row(
+    mtp, use_position_map
+):
+    topk = 2048
+    request_count = 2
+    shared = torch.arange(topk // 2, dtype=torch.int32)
+    request_rows = torch.stack(
+        tuple(
+            torch.cat(
+                (
+                    shared,
+                    torch.arange(
+                        topk // 2 + row * topk // 2,
+                        topk // 2 + (row + 1) * topk // 2,
+                        dtype=torch.int32,
+                    ),
+                )
+            )
+            for row in range(mtp)
+        )
+    )
+    source = request_rows.repeat(request_count, 1).unsqueeze(1)
+    boundary = (mtp + 1) * topk // 2 - 101
+    boundaries = torch.full(
+        (request_count * mtp,), boundary, dtype=torch.int32
+    )
+
+    result = _run_vector_sharded_union(
+        source,
+        boundaries,
+        request_count,
+        use_position_map=use_position_map,
+        shards_per_row=4,
+    )
+    _assert_vector_sharded_result(result, source, boundaries, request_count)
+    assert result["shard_packed"].shape[1] == mtp * 4
 
 
 @pytest.mark.parametrize(
@@ -851,8 +973,14 @@ def test_zero_boundary_keeps_resident_absolute_indices():
 
 
 @pytest.mark.parametrize("capture_graph", [False, True])
-def test_production_staged_mtp2_respects_per_row_boundary_and_graph(
+@pytest.mark.parametrize(
+    "use_sharded_sort",
+    [True, False],
+    ids=["sharded-sort", "legacy-staged-sort"],
+)
+def test_production_mtp2_backends_respect_per_row_boundary_and_graph(
     capture_graph,
+    use_sharded_sort,
 ):
     request_count = 2
     mtp = 2
@@ -874,8 +1002,8 @@ def test_production_staged_mtp2_respects_per_row_boundary_and_graph(
         rows.extend((first, second))
         boundaries.extend(
             (
-                int(first.max()) - 100,
-                int(second.max()) - 100,
+                0 if request == 0 else int(first.max()) - 100,
+                0 if request == 0 else int(second.max()) - 100,
             )
         )
     source = torch.stack(rows).unsqueeze(1)
@@ -903,22 +1031,98 @@ def test_production_staged_mtp2_respects_per_row_boundary_and_graph(
         request_count,
         mtp,
         capture_graph=capture_graph,
+        use_sharded_sort=use_sharded_sort,
     )
 
-    assert torch.equal(actual[0], expected[0])
     assert torch.equal(actual[2], expected[2])
-    for request, count in enumerate(expected[2].tolist()):
-        assert torch.equal(
-            actual[1][request, :count],
-            expected[1][request, :count],
+    if use_sharded_sort:
+        source_2d = source.reshape(request_count * mtp, topk)
+        remapped = actual[0].reshape(request_count * mtp, topk)
+        selected_mask = (
+            (source_2d >= 0)
+            & (source_2d < boundary_tensor.reshape(-1, 1))
         )
+        safe_ranks = torch.where(
+            selected_mask,
+            remapped,
+            torch.zeros_like(remapped),
+        )
+        reconstructed_selected = torch.gather(
+            actual[1].repeat_interleave(mtp, dim=0),
+            1,
+            safe_ranks.to(torch.long),
+        )
+        reconstructed = torch.where(
+            selected_mask,
+            reconstructed_selected,
+            remapped,
+        )
+        assert torch.equal(reconstructed, source_2d)
+    else:
+        assert torch.equal(actual[0], expected[0])
+    for request, count in enumerate(expected[2].tolist()):
+        actual_selected = actual[1][request, :count]
+        expected_selected = expected[1][request, :count]
+        if use_sharded_sort:
+            assert torch.equal(
+                torch.sort(actual_selected).values,
+                expected_selected,
+            )
+        else:
+            assert torch.equal(actual_selected, expected_selected)
         assert torch.equal(
             actual[3][request, :count],
             expected[3][request, :count],
         )
 
 
-def test_production_staged_mtp1_skips_union_and_preserves_source_order():
+def test_production_sharded_mtp2_handles_one_full_value_shard():
+    topk = 2048
+    source = torch.stack(
+        (
+            2 * torch.arange(topk, dtype=torch.int32),
+            2 * torch.arange(topk, 2 * topk, dtype=torch.int32),
+        )
+    ).unsqueeze(1)
+    boundaries = torch.full(
+        (2,),
+        4 * topk,
+        dtype=torch.int32,
+    )
+    row_requests = torch.zeros(2, dtype=torch.int32)
+    block_table = torch.arange(32, dtype=torch.int32).reshape(1, 32)
+    expected = _prepare_sparse_indices_torch(
+        source,
+        boundaries,
+        row_req_indices=row_requests,
+        request_block_table=block_table,
+        block_size=128,
+    )
+
+    actual = _run_production_staged(
+        source,
+        boundaries,
+        request_count=1,
+        mtp=2,
+        use_sharded_sort=True,
+    )
+
+    assert torch.equal(actual[0], expected[0])
+    assert actual[2].tolist() == [2 * topk]
+    assert torch.equal(actual[1][0, : 2 * topk], expected[1][0])
+    assert torch.equal(actual[3][0, : 2 * topk], expected[3][0])
+
+
+@pytest.mark.parametrize("capture_graph", [False, True])
+@pytest.mark.parametrize(
+    "use_sharded_sort",
+    [True, False],
+    ids=["sharded-operator", "legacy-staged-operator"],
+)
+def test_production_mtp1_backends_skip_union_and_preserve_source_order(
+    capture_graph,
+    use_sharded_sort,
+):
     request_count = 2
     topk = 2048
     rows = torch.stack(
@@ -939,6 +1143,8 @@ def test_production_staged_mtp1_skips_union_and_preserves_source_order():
         boundaries,
         request_count,
         1,
+        capture_graph=capture_graph,
+        use_sharded_sort=use_sharded_sort,
     )
 
     expected_remapped = rows.reshape(request_count, topk).clone()
@@ -1026,19 +1232,20 @@ def test_production_staged_remaps_without_building_optional_payload():
         [topk - 100, 1024 + topk - 100],
         dtype=torch.int32,
     )
-    expected = _prepare_sparse_indices_torch(
-        source,
-        boundaries,
-        row_req_indices=torch.tensor([0, 0], dtype=torch.int32),
-        request_block_table=torch.arange(32, dtype=torch.int32).reshape(
-            1, 32
-        ),
-        block_size=128,
-        need_packed=False,
-    )
     selected, counts, targets = _buffers(1, 2 * topk)
     targets.fill_(-7)
     workspace = torch.empty_like(selected)
+    shard_packed = torch.empty(
+        (1, 2, 2 * topk),
+        dtype=torch.int32,
+        device="npu",
+    )
+    shard_mapping = torch.empty_like(shard_packed)
+    shard_counts = torch.empty(
+        (1, 2, 16),
+        dtype=torch.int32,
+        device="npu",
+    )
     actual = prepare_sparse_indices(
         source.npu(),
         boundaries.npu(),
@@ -1058,11 +1265,620 @@ def test_production_staged_remaps_without_building_optional_payload():
         block_size=128,
         need_packed=False,
         local_to_union_workspace=workspace,
+        shard_packed_workspace=shard_packed,
+        shard_mapping_workspace=shard_mapping,
+        shard_counts_workspace=shard_counts,
         staged_mtp=2,
     )
     torch.npu.synchronize()
 
-    assert torch.equal(actual[0].cpu(), expected[0])
+    remapped = actual[0].cpu().reshape(2, topk)
+    source_rows = source.reshape(2, topk)
+    selected_mask = (
+        (source_rows >= 0)
+        & (source_rows < boundaries.reshape(-1, 1))
+    )
+    assert torch.equal(remapped[~selected_mask], source_rows[~selected_mask])
+
+    # The sharded operator does not promise a global union order. Validate the
+    # actual contract without relying on either shard ordering: equal tokens
+    # share one rank, unequal tokens never share a rank, and all union ranks
+    # form a dense [0, unique_count) range.
+    token_to_rank = {}
+    rank_to_token = {}
+    for token, rank in zip(
+        source_rows[selected_mask].tolist(),
+        remapped[selected_mask].tolist(),
+    ):
+        if token in token_to_rank:
+            assert token_to_rank[token] == rank
+        else:
+            token_to_rank[token] = rank
+        if rank in rank_to_token:
+            assert rank_to_token[rank] == token
+        else:
+            rank_to_token[rank] = token
+    assert sorted(rank_to_token) == list(range(len(token_to_rank)))
     assert actual[1:] == (None, None, None)
     assert counts[0, 0].item() == 0
     assert torch.all(targets == -7)
+
+
+@pytest.mark.parametrize("mtp", [1, 2])
+@pytest.mark.parametrize(
+    "parallel_map",
+    [False, True],
+    ids=["all-torch", "hybrid-aiv"],
+)
+def test_resident_sparse_cache_native_ops_and_graph_replay(
+    mtp,
+    parallel_map,
+):
+    requests = 2
+    # Match the production kernel shape. In particular, this makes the
+    # parallel-map graph test exercise the full 2048-element source row.
+    topk = 2048
+    capacity = mtp * topk
+    union_count = capacity - 8
+    token_stride = 8192
+    block_size = 16
+    state_rows = 2 * requests
+
+    union_seed = torch.stack(
+        [
+            torch.arange(
+                request * 128,
+                request * 128 + capacity,
+                dtype=torch.int32,
+            )
+            for request in range(requests)
+        ]
+    ).npu()
+    selected = union_seed.clone()
+    counts = torch.zeros(
+        (requests, 16), dtype=torch.int32, device="npu"
+    )
+    counts[:, 0] = union_count
+    count_seed = counts.clone()
+    mapping = torch.full(
+        (requests, capacity), -1, dtype=torch.int32, device="npu"
+    )
+    mapping[:, :union_count] = torch.arange(
+        union_count, dtype=torch.int32, device="npu"
+    )
+    topk_seed = torch.arange(
+        requests * capacity, dtype=torch.int32, device="npu"
+    ).reshape(requests * mtp, 1, topk)
+    topk_values = topk_seed.clone()
+    targets = torch.empty(
+        (requests, capacity), dtype=torch.long, device="npu"
+    )
+    block_table = torch.arange(
+        requests * (capacity // block_size),
+        dtype=torch.int32,
+        device="npu",
+    ).reshape(requests, capacity // block_size)
+    states = torch.arange(requests, dtype=torch.int32, device="npu")
+    request_generations = torch.ones(
+        requests, dtype=torch.int64, device="npu"
+    )
+    token_to_slot = torch.full(
+        (state_rows, token_stride),
+        -1,
+        dtype=torch.int16,
+        device="npu",
+    )
+    slot_stride = ((capacity + 1 + 15) // 16) * 16
+    slot_to_token = torch.full(
+        (state_rows, slot_stride),
+        -1,
+        dtype=torch.int32,
+        device="npu",
+    )
+    state_generations = torch.full(
+        (state_rows, 8), -1, dtype=torch.int64, device="npu"
+    )
+    workspace = allocate_resident_workspace(
+        requests, capacity, device=torch.device("npu")
+    )
+
+    def invoke():
+        prepare_resident_sparse_cache_(
+            topk_values,
+            mapping,
+            selected,
+            counts,
+            targets,
+            block_table,
+            states,
+            request_generations,
+            token_to_slot,
+            slot_to_token,
+            state_generations,
+            workspace,
+            block_size=block_size,
+            scratch_capacity=capacity,
+            parallel_map=parallel_map,
+        )
+
+    persistent_addresses = (
+        token_to_slot.data_ptr(),
+        slot_to_token.data_ptr(),
+        state_generations.data_ptr(),
+    )
+    workspace_addresses = tuple(
+        value.data_ptr()
+        for value in vars(workspace).values()
+        if isinstance(value, torch.Tensor)
+    )
+    graph = torch.npu.NPUGraph()
+    with torch.npu.graph(graph):
+        invoke()
+
+    # Cold replay: every union token is a miss.
+    token_to_slot.fill_(-1)
+    slot_to_token.fill_(-1)
+    state_generations.fill_(-1)
+    selected.copy_(union_seed)
+    counts.copy_(count_seed)
+    topk_values.copy_(topk_seed)
+    graph.replay()
+    torch.npu.synchronize()
+    assert counts[:, 0].cpu().tolist() == [union_count] * requests
+    assert torch.equal(
+        selected[:, :union_count].cpu(),
+        union_seed[:, :union_count].cpu(),
+    )
+
+    # Warm replay: all tokens hit, so LMCache receives an empty payload while
+    # the original positions still map to their resident slots.
+    selected.copy_(union_seed)
+    counts.copy_(count_seed)
+    topk_values.copy_(topk_seed)
+    graph.replay()
+    torch.npu.synchronize()
+    assert counts[:, 0].cpu().tolist() == [0] * requests
+    assert torch.equal(
+        topk_values.reshape(requests, capacity)[:, :union_count].cpu(),
+        torch.arange(union_count, dtype=torch.int32)
+        .expand(requests, -1),
+    )
+    assert persistent_addresses == (
+        token_to_slot.data_ptr(),
+        slot_to_token.data_ptr(),
+        state_generations.data_ptr(),
+    )
+    assert workspace_addresses == tuple(
+        value.data_ptr()
+        for value in vars(workspace).values()
+        if isinstance(value, torch.Tensor)
+    )
+
+
+@pytest.mark.parametrize("mtp", [1, 2])
+@pytest.mark.parametrize("request_count", [1, 4])
+@pytest.mark.parametrize("capture_graph", [False, True])
+def test_resident_parallel_map_matches_tensor_reference(
+    mtp,
+    request_count,
+    capture_graph,
+):
+    topk = 2048
+    capacity = mtp * topk
+    row_count = request_count * mtp
+    source = (
+        torch.arange(row_count * topk, dtype=torch.int32)
+        .reshape(row_count, 1, topk)
+        + 50000
+    )
+    positions = torch.arange(capacity, dtype=torch.int32).expand(
+        request_count, -1
+    )
+    selected_mask = positions.remainder(3) != 0
+    # Multiplication by an odd number is a permutation modulo a power-of-two
+    # capacity. This exercises non-monotonic union ranks.
+    ranks = positions.mul(17).remainder(capacity)
+    position_to_union = torch.where(
+        selected_mask,
+        ranks,
+        torch.full_like(ranks, -1),
+    )
+    union_to_slot = torch.arange(
+        capacity - 1,
+        -1,
+        -1,
+        dtype=torch.int32,
+    ).expand(request_count, -1)
+    union_to_slot = (
+        union_to_slot
+        + torch.arange(request_count, dtype=torch.int32).reshape(-1, 1)
+        * capacity
+    )
+    expected = source.reshape(request_count, capacity).clone()
+    expected.copy_(
+        torch.where(
+            selected_mask,
+            torch.gather(union_to_slot, 1, ranks.to(torch.long)),
+            expected,
+        )
+    )
+
+    values = source.npu()
+    mapping_npu = position_to_union.npu()
+    slots_npu = union_to_slot.npu()
+
+    def invoke():
+        torch.ops._C_ascend.npu_dsa_resident_remap_rows_(
+            values,
+            mapping_npu,
+            slots_npu,
+        )
+
+    if capture_graph:
+        graph = torch.npu.NPUGraph()
+        with torch.npu.graph(graph):
+            invoke()
+        values.copy_(source.npu())
+        mapping_npu.copy_(position_to_union.npu())
+        slots_npu.copy_(union_to_slot.npu())
+        graph.replay()
+    else:
+        invoke()
+    torch.npu.synchronize()
+    assert torch.equal(
+        values.cpu().reshape(request_count, capacity),
+        expected,
+    )
+
+
+def test_resident_hybrid_lookup_rows_uses_private_padding_sentinels():
+    requests = 4
+    capacity = 256
+    token_stride = 512
+    dummy_state_base = requests
+    selected = torch.arange(
+        capacity, dtype=torch.int32, device="npu"
+    ).repeat(requests, 1)
+    counts = torch.zeros(
+        (requests, 16), dtype=torch.int32, device="npu"
+    )
+    counts[:, 0] = torch.tensor(
+        [0, 1, 3, capacity], dtype=torch.int32, device="npu"
+    )
+    # The third request is graph padding and must use its own dummy row.
+    states = torch.tensor([0, 1, -1, 3], dtype=torch.int32, device="npu")
+    indices = torch.empty(
+        (requests, capacity), dtype=torch.int64, device="npu"
+    )
+
+    torch.ops._C_ascend.npu_dsa_resident_lookup_rows_(
+        selected,
+        counts,
+        states,
+        indices,
+        token_stride,
+        dummy_state_base,
+    )
+    torch.npu.synchronize()
+
+    expected = torch.empty((requests, capacity), dtype=torch.int64)
+    counts_cpu = counts[:, 0].cpu().tolist()
+    states_cpu = states.cpu().tolist()
+    selected_cpu = selected.cpu().to(torch.int64)
+    for request, (count, state) in enumerate(
+        zip(counts_cpu, states_cpu, strict=True)
+    ):
+        safe_state = (
+            state if state >= 0 else dummy_state_base + request
+        )
+        expected[request].fill_((safe_state + 1) * token_stride - 1)
+        expected[request, :count] = (
+            selected_cpu[request, :count] + safe_state * token_stride
+        )
+    assert torch.equal(indices.cpu(), expected)
+
+
+def _resident_production_fixture(mtp, request_count=2):
+    topk = 2048
+    capacity = mtp * topk
+    row_count = request_count * mtp
+    shared = torch.arange(topk // 2, dtype=torch.int32)
+    request_rows = torch.stack(
+        [
+            torch.cat(
+                (
+                    shared,
+                    torch.arange(
+                        topk // 2 + row * topk // 2,
+                        topk // 2 + (row + 1) * topk // 2,
+                        dtype=torch.int32,
+                    ),
+                )
+            )
+            for row in range(mtp)
+        ]
+    )
+    source = request_rows.repeat(request_count, 1).unsqueeze(1)
+    split_boundary = int(source.max()) - 100
+    boundaries = torch.full(
+        (row_count,), split_boundary, dtype=torch.int32, device="npu"
+    )
+    row_requests = torch.arange(
+        request_count, dtype=torch.int32, device="npu"
+    ).repeat_interleave(mtp)
+    block_size = 128
+    max_tokens = 131072
+    block_table = torch.arange(
+        request_count * max_tokens // block_size,
+        dtype=torch.int32,
+        device="npu",
+    ).reshape(request_count, max_tokens // block_size)
+    values = source.npu()
+    selected, counts, targets = _buffers(request_count, capacity)
+    mapping = torch.empty_like(selected)
+    shard_packed = torch.empty(
+        (request_count, 2, capacity),
+        dtype=torch.int32,
+        device="npu",
+    )
+    shard_mapping = torch.empty_like(shard_packed)
+    shard_counts = torch.empty(
+        (request_count, 2, 16),
+        dtype=torch.int32,
+        device="npu",
+    )
+    token_stride = 131104
+    slot_stride = ((capacity + 16) // 16) * 16
+    token_to_slot = torch.full(
+        (2 * request_count, token_stride),
+        -1,
+        dtype=torch.int16,
+        device="npu",
+    )
+    slot_to_token = torch.full(
+        (2 * request_count, slot_stride),
+        -1,
+        dtype=torch.int32,
+        device="npu",
+    )
+    state_generations = torch.ones(
+        (2 * request_count, 8),
+        dtype=torch.int64,
+        device="npu",
+    )
+    states = torch.arange(
+        request_count, dtype=torch.int32, device="npu"
+    )
+    request_generations = torch.ones(
+        request_count, dtype=torch.int64, device="npu"
+    )
+    workspace = allocate_resident_workspace(
+        request_count, capacity, device=torch.device("npu")
+    )
+
+    def union():
+        values.copy_(source.npu())
+        prepare_sparse_indices(
+            values,
+            boundaries,
+            row_req_indices=row_requests,
+            request_block_table=block_table,
+            selected_packed=selected,
+            selected_counts=counts,
+            target_slot_mapping=targets,
+            block_size=block_size,
+            need_packed=True,
+            clear_invalid_rows=True,
+            local_to_union_workspace=mapping,
+            shard_packed_workspace=shard_packed,
+            shard_mapping_workspace=shard_mapping,
+            shard_counts_workspace=shard_counts,
+            staged_mtp=mtp,
+        )
+
+    def resident(use_hybrid_aiv=True):
+        prepare_resident_sparse_cache_(
+            values,
+            mapping,
+            selected,
+            counts,
+            targets,
+            block_table,
+            states,
+            request_generations,
+            token_to_slot,
+            slot_to_token,
+            state_generations,
+            workspace,
+            block_size=block_size,
+            scratch_capacity=capacity,
+            parallel_map=use_hybrid_aiv,
+        )
+
+    return {
+        "topk": topk,
+        "capacity": capacity,
+        "source": source,
+        "boundaries": boundaries,
+        "values": values,
+        "selected": selected,
+        "counts": counts,
+        "targets": targets,
+        "mapping": mapping,
+        "block_table": block_table,
+        "token_to_slot": token_to_slot,
+        "slot_to_token": slot_to_token,
+        "state_generations": state_generations,
+        "request_generations": request_generations,
+        "union": union,
+        "resident": resident,
+    }
+
+
+@pytest.mark.parametrize("mtp", [1, 2])
+def test_resident_hybrid_matches_all_torch_for_partial_hits(mtp):
+    reference = _resident_production_fixture(mtp)
+    hybrid = _resident_production_fixture(mtp)
+    fixtures = (reference, hybrid)
+    for fixture in fixtures:
+        fixture["union"]()
+    torch.npu.synchronize()
+
+    union_count = int(reference["counts"][0, 0].item())
+    hit_count = union_count // 2
+    request_count = reference["selected"].shape[0]
+    capacity = reference["capacity"]
+    hit_slots = torch.arange(
+        capacity - hit_count,
+        capacity,
+        dtype=torch.int32,
+        device="npu",
+    ).to(torch.int16).expand(request_count, -1)
+    request_rows = torch.arange(
+        request_count, dtype=torch.long, device="npu"
+    ).reshape(-1, 1)
+    for fixture in fixtures:
+        hit_tokens = fixture["selected"][:, :hit_count].to(torch.long)
+        fixture["token_to_slot"][
+            request_rows, hit_tokens
+        ] = hit_slots
+        fixture["slot_to_token"][
+            :request_count, capacity - hit_count : capacity
+        ].copy_(fixture["selected"][:, :hit_count])
+
+    reference["resident"](False)
+    hybrid["resident"](True)
+    torch.npu.synchronize()
+    miss_count = union_count - hit_count
+    for name in (
+        "values",
+        "token_to_slot",
+        "slot_to_token",
+        "state_generations",
+    ):
+        assert torch.equal(reference[name].cpu(), hybrid[name].cpu()), name
+    assert torch.equal(
+        reference["counts"][:, 0].cpu(),
+        hybrid["counts"][:, 0].cpu(),
+    )
+    assert torch.equal(
+        reference["selected"][:, :miss_count].cpu(),
+        hybrid["selected"][:, :miss_count].cpu(),
+    )
+    assert torch.equal(
+        reference["targets"][:, :miss_count].cpu(),
+        hybrid["targets"][:, :miss_count].cpu(),
+    )
+
+
+@pytest.mark.parametrize("mtp", [1, 2])
+def test_resident_production_pipeline_partial_hits_all_hits_and_generation(
+    mtp,
+):
+    fixture = _resident_production_fixture(mtp)
+    request_count = fixture["selected"].shape[0]
+    capacity = fixture["capacity"]
+    fixture["union"]()
+    torch.npu.synchronize()
+    union_seed = fixture["selected"].clone()
+    count_seed = fixture["counts"].clone()
+    union_count = int(count_seed[0, 0].item())
+    assert fixture["counts"][:, 0].cpu().tolist() == [
+        union_count
+    ] * request_count
+
+    # Put half the union in high-numbered scratch slots. Misses must use the
+    # lowest unprotected slots, while hits retain their existing slots.
+    hit_count = union_count // 2
+    hit_slots = torch.arange(
+        capacity - hit_count,
+        capacity,
+        dtype=torch.int32,
+        device="npu",
+    ).to(torch.int16).expand(request_count, -1)
+    hit_tokens = union_seed[:, :hit_count].to(torch.long)
+    request_rows = torch.arange(
+        request_count, dtype=torch.long, device="npu"
+    ).reshape(-1, 1)
+    fixture["token_to_slot"][request_rows, hit_tokens] = hit_slots
+    fixture["slot_to_token"][
+        :request_count, capacity - hit_count : capacity
+    ].copy_(union_seed[:, :hit_count])
+
+    fixture["resident"]()
+    torch.npu.synchronize()
+    miss_count = union_count - hit_count
+    assert fixture["counts"][:, 0].cpu().tolist() == [
+        miss_count
+    ] * request_count
+    assert torch.equal(
+        fixture["selected"][:, :miss_count].cpu(),
+        union_seed[:, hit_count:union_count].cpu(),
+    )
+    for request in range(request_count):
+        assert torch.equal(
+            fixture["targets"][request, :miss_count].cpu(),
+            torch.arange(miss_count, dtype=torch.long)
+            + request * 131072,
+        )
+
+    source_rows = fixture["source"].reshape(request_count, capacity)
+    remapped = fixture["values"].reshape(request_count, capacity)
+    boundary_rows = fixture["boundaries"].cpu().reshape(
+        request_count, mtp, 1
+    )
+    selected_mask = (
+        fixture["source"].reshape(request_count, mtp, -1)
+        < boundary_rows
+    ).reshape(request_count, capacity)
+    safe_slots = torch.where(
+        selected_mask.npu(),
+        remapped,
+        torch.zeros_like(remapped),
+    )
+    reconstructed = torch.gather(
+        fixture["slot_to_token"][:request_count, :capacity],
+        1,
+        safe_slots.to(torch.long),
+    )
+    assert torch.equal(
+        reconstructed[selected_mask.npu()].cpu(),
+        source_rows[selected_mask].cpu(),
+    )
+    assert torch.equal(
+        remapped[~selected_mask.npu()].cpu(),
+        source_rows[~selected_mask].cpu(),
+    )
+
+    # The next identical step is entirely resident.
+    fixture["union"]()
+    fixture["resident"]()
+    torch.npu.synchronize()
+    assert fixture["counts"][:, 0].cpu().tolist() == [0] * request_count
+
+    # Reusing the state row with a new generation invalidates every old hit.
+    fixture["request_generations"].fill_(2)
+    fixture["union"]()
+    fixture["resident"]()
+    torch.npu.synchronize()
+    assert fixture["counts"][:, 0].cpu().tolist() == [
+        union_count
+    ] * request_count
+
+
+@pytest.mark.parametrize("mtp", [1, 2])
+def test_resident_production_pipeline_zero_split_boundary_is_noop(mtp):
+    fixture = _resident_production_fixture(mtp)
+    fixture["boundaries"].zero_()
+    fixture["union"]()
+    if mtp == 1:
+        # The single-row fast path bypasses union, but must still publish the
+        # position-map contract consumed by the resident planner.
+        assert torch.all(fixture["mapping"].cpu() == -1)
+    fixture["resident"]()
+    torch.npu.synchronize()
+
+    assert fixture["counts"][:, 0].cpu().tolist() == [
+        0
+    ] * fixture["selected"].shape[0]
+    assert torch.equal(fixture["values"].cpu(), fixture["source"])

@@ -38,10 +38,12 @@ class TestEnvVariables(TestBase):
                                      var_handler())
 
                     handler_source = inspect.getsource(var_handler)
-                    if 'int(' in handler_source:
-                        test_vals = ["123", "456"]
-                    elif 'bool(int(' in handler_source:
+                    if 'bool(int(' in handler_source:
                         test_vals = ["0", "1"]
+                    elif 'int(' in handler_source:
+                        test_vals = ["123", "456"]
+                    elif 'float(' in handler_source:
+                        test_vals = ["1.25", "2.5"]
                     else:
                         test_vals = [f"test_{var_name}", f"custom_{var_name}"]
 
@@ -71,3 +73,27 @@ class TestEnvVariables(TestBase):
             self.assertEqual(getattr(envs_ascend, name), 3)
         with patch.dict(os.environ, {name: "-1"}):
             self.assertEqual(getattr(envs_ascend, name), 0)
+
+    def test_dsa_resident_cache_defaults_on_and_can_be_disabled(self):
+        name = "VLLM_ASCEND_DSA_RESIDENT_CACHE"
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(name, None)
+            self.assertTrue(getattr(envs_ascend, name))
+        with patch.dict(os.environ, {name: "0"}):
+            self.assertFalse(getattr(envs_ascend, name))
+
+    def test_dsa_resident_shards_per_row_defaults_to_four(self):
+        name = "VLLM_ASCEND_DSA_RESIDENT_SHARDS_PER_ROW"
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(name, None)
+            self.assertEqual(getattr(envs_ascend, name), 4)
+        with patch.dict(os.environ, {name: "2"}):
+            self.assertEqual(getattr(envs_ascend, name), 2)
+
+    def test_staged_mtp_draft_graph_defaults_off_and_can_be_enabled(self):
+        name = "VLLM_ASCEND_SFA_STAGED_MTP_DRAFT_GRAPH"
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(name, None)
+            self.assertFalse(getattr(envs_ascend, name))
+        with patch.dict(os.environ, {name: "1"}):
+            self.assertTrue(getattr(envs_ascend, name))

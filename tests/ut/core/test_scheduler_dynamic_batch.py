@@ -56,7 +56,7 @@ def create_requests(
             for j, position in enumerate(mm_position):
                 identifier = f"hash{i}_{j}"
                 mm_feature = MultiModalFeatureSpec(
-                    data=MultiModalKwargsItem.dummy("dummy_m"),
+                    data=MultiModalKwargsItem.dummy(),
                     mm_position=position,
                     identifier=identifier,
                     modality="image")
@@ -64,7 +64,6 @@ def create_requests(
         request = Request(request_id=f"{i}",
                           prompt_token_ids=[i] * num_tokens,
                           sampling_params=sampling_params,
-                          eos_token_id=EOS_TOKEN_ID,
                           pooling_params=None,
                           mm_features=mm_features if mm_features else None,
                           block_hasher=get_request_block_hasher(
@@ -98,9 +97,7 @@ class TestSchedulerDynamicBatch(TestBase):
 
     @patch("vllm.config.ModelConfig.__post_init__", MagicMock())
     @patch("vllm.config.VllmConfig.__post_init__", MagicMock())
-    @patch('vllm.v1.core.sched.scheduler.compute_encoder_budget')
-    def create_scheduler(self, mock_compute_encoder_budget):
-        mock_compute_encoder_budget.return_value = [100, 100]
+    def create_scheduler(self, *, multimodal: bool = True):
         use_kv_connector = False
         block_size = 16
 
@@ -111,6 +108,7 @@ class TestSchedulerDynamicBatch(TestBase):
             disable_chunked_mm_input=False,
             enable_chunked_prefill=True,
             max_num_batched_tokens=MAX_NUM_BATCHED_TOKENS,
+            is_encoder_decoder=False,
         )
 
         scheduler_config.max_num_encoder_input_tokens = 10000
@@ -120,7 +118,6 @@ class TestSchedulerDynamicBatch(TestBase):
 
         model_config = ModelConfig(
             model=MODEL,
-            task="auto",
             tokenizer=MODEL,
             tokenizer_mode="auto",
             trust_remote_code=True,
@@ -129,9 +126,13 @@ class TestSchedulerDynamicBatch(TestBase):
             max_model_len=MAX_NUM_BATCHED_TOKENS,
         )
         model_config.pooler_config = MagicMock()
-        model_config.multimodal_config = MagicMock()
-        model_config.hf_text_config = MagicMock()
-        model_config.hf_text_config.is_encoder_decoder = False
+        model_config.multimodal_config = MagicMock() if multimodal else None
+        model_config.hf_config = MagicMock()
+        model_config.hf_config.is_encoder_decoder = False
+        model_config.hf_config.get_text_config.return_value = (
+            model_config.hf_config
+        )
+        model_config.hf_text_config = model_config.hf_config
         # Cache config, optionally force APC
         kwargs_cache: Dict[str,
                            Any] = ({} if ENABLE_PREFIX_CACHING is None else {
@@ -141,7 +142,6 @@ class TestSchedulerDynamicBatch(TestBase):
         cache_config = CacheConfig(
             block_size=block_size,
             gpu_memory_utilization=0.9,
-            swap_space=0,
             cache_dtype="auto",
             **kwargs_cache,
         )
@@ -170,8 +170,10 @@ class TestSchedulerDynamicBatch(TestBase):
             kv_cache_tensors=[],
             kv_cache_groups=[
                 KVCacheGroupSpec(['layer'],
-                                 FullAttentionSpec(block_size, 1, 1,
-                                                   torch.float32, False))
+                                 FullAttentionSpec(block_size=block_size,
+                                                   num_kv_heads=1,
+                                                   head_size=1,
+                                                   dtype=torch.float32))
             ],
         )
         kv_cache_config.hash_block_size = block_size
@@ -251,7 +253,7 @@ class TestSchedulerDynamicBatch(TestBase):
             self.assertEqual(scheduler.running[i], request)
 
     def test_async_external_load_forwards_compact_allocation(self):
-        scheduler = self.create_scheduler()
+        scheduler = self.create_scheduler(multimodal=False)
         request = create_requests(num_requests=1)[0]
         scheduler.add_request(request)
         scheduler.connector = MagicMock()

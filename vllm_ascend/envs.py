@@ -152,6 +152,28 @@ env_variables: dict[str, Callable[[], Any]] = {
     # 2 (B2+B1): additionally free the latent blocks [k .. prompt) at end of
     #   prefill (the actual memory saving). Default 0.
     "VLLM_ASCEND_DSA_SHRINK_LATENT": lambda: int(os.getenv("VLLM_ASCEND_DSA_SHRINK_LATENT", "0")),
+    # Select the production sharded sparse-index operator for MTP=1/2. MTP=1
+    # bypasses sort/union inside that operator; MTP=2 uses request-sharded
+    # sort/union. 1 (default) enables it; 0 keeps the legacy staged operator as
+    # a compatibility fallback. Non-sensitive.
+    "VLLM_ASCEND_DSA_MTP_SHARDED_SORT": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_DSA_MTP_SHARDED_SORT", "1"))
+    ),
+    # Reuse compact-scratch rows that already contain this decode step's
+    # request-union tokens. 1 (default) enables the sorted-shard resident
+    # planner, so LMCache receives only misses. 0 keeps the ordinary
+    # split-boundary union and retrieves its complete payload every step.
+    # Read during model initialization; changing it requires a worker restart.
+    "VLLM_ASCEND_DSA_RESIDENT_CACHE": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_DSA_RESIDENT_CACHE", "1"))
+    ),
+    # Value shards assigned to each MTP row by the sorted resident planner.
+    # The request-wide shard count is MTP * shards_per_row. The value must be
+    # a power of two in [1, 4]. Read once during model initialization so graph
+    # capture and replay use one fixed state/workspace layout.
+    "VLLM_ASCEND_DSA_RESIDENT_SHARDS_PER_ROW": lambda: int(
+        os.getenv("VLLM_ASCEND_DSA_RESIDENT_SHARDS_PER_ROW", "4")
+    ),
     # Experimental SFA graph-capture proof of concept. When enabled, exact-Q1
     # decode is captured across layers, with selective LMCache retrieval as
     # the eager split operation.
@@ -159,6 +181,13 @@ env_variables: dict[str, Callable[[], Any]] = {
     # incompatible model/runtime features fail fast during startup capture so
     # an explicitly requested POC cannot silently remain inactive.
     "VLLM_ASCEND_SFA_STAGED_GRAPH": lambda: bool(int(os.getenv("VLLM_ASCEND_SFA_STAGED_GRAPH", "0"))),
+    # Independently capture the MTP drafter as a FULL graph while the target
+    # model uses staged SFA. Disabled by default; the target staged graph and
+    # resident scratch reuse do not depend on this opt-in. Non-sensitive; read
+    # during proposer initialization and requires a worker restart.
+    "VLLM_ASCEND_SFA_STAGED_MTP_DRAFT_GRAPH": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_SFA_STAGED_MTP_DRAFT_GRAPH", "0"))
+    ),
     # Comma-separated positive exact-Q1 batch sizes, bounded by scheduler
     # capacity. Defaults to singleton capture; not sensitive.
     "VLLM_ASCEND_SFA_STAGED_GRAPH_CAPTURE_SIZES": lambda: os.getenv(
@@ -192,6 +221,21 @@ env_variables: dict[str, Callable[[], Any]] = {
     # NPU->CPU synchronization on the decode hot path.
     "VLLM_ASCEND_DSA_LMCACHE_TRACE": lambda: bool(
         int(os.getenv("VLLM_ASCEND_DSA_LMCACHE_TRACE", "0"))
+    ),
+    # Emit the per-layer sparse LMCache miss-token ratio about once per second.
+    # The denominator is index_topk * decode rows (including MTP rows). Default
+    # off because each emitted sample intentionally synchronizes one scalar from
+    # NPU to CPU. Non-sensitive; read during model initialization.
+    "VLLM_ASCEND_DSA_LMCACHE_LOAD_STAT": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_DSA_LMCACHE_LOAD_STAT", "0"))
+    ),
+    # Fence every live target-SFA phase plus the target/MTP-drafter boundary,
+    # and persist rolling target-layer and draft-layer tensor snapshots for
+    # crash diagnosis. Default off because the fences serialize NPU work and
+    # the snapshots copy substantial tensor data to CPU/disk. Non-sensitive;
+    # changing it requires restart because it also changes graph partitions.
+    "VLLM_ASCEND_MTP_DRAFT_DEBUG": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_MTP_DRAFT_DEBUG", "0"))
     ),
     # Emit bounded diagnostics for MTP and LMCache decode-window interaction.
     # Default off because sampled tensor summaries can synchronize NPU and CPU.

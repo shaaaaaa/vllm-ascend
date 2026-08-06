@@ -4,6 +4,7 @@ from contextlib import nullcontext
 from dataclasses import dataclass, field
 from functools import lru_cache
 from threading import Lock
+from time import monotonic
 from typing import TYPE_CHECKING, Any, TypeVar
 
 import numpy as np
@@ -48,6 +49,17 @@ from vllm_ascend.attention.mtp_dw_diag import (
     scratch_live_slot_aliases,
     scratch_target_safety,
 )
+from vllm_ascend.attention.target_sfa_diagnostics import (
+    TARGET_SFA_DIAG_SCHEMA_VERSION,
+    active_resident_state_snapshot,
+    atomic_torch_save,
+    cpu_snapshot,
+    target_cache_snapshot,
+    target_metadata_snapshot,
+    target_sfa_path,
+    target_sfa_session,
+    topk_physical_block_ids,
+)
 from vllm_ascend.attention.utils import (
     AscendCommonAttentionMetadata,
     ascend_chunked_prefill_workspace_size,
@@ -63,6 +75,18 @@ from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.distributed.kv_transfer.sparse_offload import _prof as _dsa_prof
 from vllm_ascend.distributed.kv_transfer.sparse_offload.prepare_sparse_indices import (
     prepare_sparse_indices,
+)
+from vllm_ascend.distributed.kv_transfer.sparse_offload.resident_sorted_cache import (
+    INDEX_TOPK,
+    MAX_INT16_SCRATCH_CAPACITY,
+    SortedResidentState,
+    SortedResidentWorkspace,
+    allocate_sorted_resident_state,
+    allocate_sorted_resident_workspace,
+    prepare_resident_sharded_union_,
+    prepare_sorted_resident_cache_fused_,
+    resident_shard_count,
+    sorted_resident_workspace_prefix,
 )
 from vllm_ascend.distributed.utils import all_gather_async
 from vllm_ascend.ops.layer_shard_linear import (
@@ -104,6 +128,7 @@ _LMCACHE_SPARSE_WAIT_SYNC_ONCE = os.getenv("VLLM_ASCEND_LMCACHE_SPARSE_WAIT_SYNC
 )
 _lmcache_sparse_wait_sync_once_done = False
 _lmcache_sparse_wait_sync_once_lock = Lock()
+_LMCACHE_LOAD_STAT_INTERVAL_S = 1.0
 
 
 def _mtp_dw_diag_enabled() -> bool:
@@ -122,6 +147,14 @@ def _staged_sfa_profile_scope(name: str):
     if torch.autograd._profiler_enabled():
         return torch.profiler.record_function(name)
     return nullcontext()
+
+
+def _configured_resident_shards(mtp: int) -> tuple[int, int]:
+    """Resolve the startup-static row and request shard counts."""
+    shards_per_row = int(
+        envs.VLLM_ASCEND_DSA_RESIDENT_SHARDS_PER_ROW
+    )
+    return shards_per_row, resident_shard_count(mtp, shards_per_row)
 
 
 @dataclass(frozen=True, slots=True)
@@ -883,6 +916,10 @@ class AscendSFAMetadata:
     # input_batch, not on CommonAttentionMetadata; the runner may need to thread them
     # in (see sparse_offload/INTEGRATION.md section B).
     req_ids: list[str] | None = None
+    resident_state_indices: torch.Tensor | None = None
+    resident_state_generations: torch.Tensor | None = None
+    resident_state_indices_cpu: Any = None
+    resident_state_generations_cpu: Any = None
     prompt_lens: torch.Tensor | None = None
     decode_req_indices: torch.Tensor | None = None
     decode_req_indices_cpu: Any = None
@@ -905,6 +942,9 @@ class AscendSFAMetadata:
     decode_selected_tokens: torch.Tensor | None = None
     decode_selected_counts: torch.Tensor | None = None
     decode_union_mapping_workspace: torch.Tensor | None = None
+    decode_shard_packed_workspace: torch.Tensor | None = None
+    decode_shard_mapping_workspace: torch.Tensor | None = None
+    decode_shard_counts_workspace: torch.Tensor | None = None
     need_sparse_lmcache_payload: bool = False
     staged_sfa_payload_validated: bool = False
     prompt_lens_cpu_rows: Any = None
@@ -1048,6 +1088,19 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
                 dtype=torch.int32,
                 device=device,
             )
+            self._dsa_shard_packed = torch.empty(
+                (max_num_reqs, 2, self.scratch_capacity),
+                dtype=torch.int32,
+                device=device,
+            )
+            self._dsa_shard_mapping = torch.empty_like(
+                self._dsa_shard_packed
+            )
+            self._dsa_shard_counts = torch.empty(
+                (max_num_reqs, 2, 16),
+                dtype=torch.int32,
+                device=device,
+            )
             fixed_query_starts = np.arange(
                 max_num_reqs + 1,
                 dtype=np.int32,
@@ -1082,6 +1135,9 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             self._dsa_selected_counts = None
             self._dsa_target_slots = None
             self._dsa_union_mapping = None
+            self._dsa_shard_packed = None
+            self._dsa_shard_mapping = None
+            self._dsa_shard_counts = None
             self._dsa_fixed_query_starts_cpu = None
         self._dsa_fixed_layout_signature = None
         self.actual_seq_lengths_query = torch.zeros(max_num_reqs + 1, dtype=torch.int32, device=device)
@@ -1175,6 +1231,9 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
         decode_selected_tokens = None
         decode_selected_counts = None
         decode_union_mapping_workspace = None
+        decode_shard_packed_workspace = None
+        decode_shard_mapping_workspace = None
+        decode_shard_counts_workspace = None
         need_sparse_lmcache_payload = False
         num_decode_rows = 0
         decode_req_indices_cpu = None
@@ -1431,6 +1490,9 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
                 assert self._dsa_selected_tokens is not None
                 assert self._dsa_selected_counts is not None
                 assert self._dsa_union_mapping is not None
+                assert self._dsa_shard_packed is not None
+                assert self._dsa_shard_mapping is not None
+                assert self._dsa_shard_counts is not None
                 req_ids = common_attn_metadata.request_ids
                 if req_ids is not None:
                     decode_request_ids_compact = list(req_ids[:num_reqs])
@@ -1440,6 +1502,15 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
                 decode_selected_tokens = self._dsa_selected_tokens[:num_reqs]
                 decode_selected_counts = self._dsa_selected_counts[:num_reqs]
                 decode_union_mapping_workspace = self._dsa_union_mapping[
+                    :num_reqs
+                ]
+                decode_shard_packed_workspace = self._dsa_shard_packed[
+                    :num_reqs
+                ]
+                decode_shard_mapping_workspace = self._dsa_shard_mapping[
+                    :num_reqs
+                ]
+                decode_shard_counts_workspace = self._dsa_shard_counts[
                     :num_reqs
                 ]
 
@@ -1547,6 +1618,24 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             # DSA latent offload: best-effort; getattr -> None when not threaded in yet
             # (harmless unless the feature is enabled). HW-VERIFY the real source.
             req_ids=getattr(common_attn_metadata, "request_ids", None),
+            resident_state_indices=getattr(
+                common_attn_metadata, "resident_state_indices", None
+            ),
+            resident_state_generations=getattr(
+                common_attn_metadata,
+                "resident_state_generations",
+                None,
+            ),
+            resident_state_indices_cpu=getattr(
+                common_attn_metadata,
+                "resident_state_indices_cpu",
+                None,
+            ),
+            resident_state_generations_cpu=getattr(
+                common_attn_metadata,
+                "resident_state_generations_cpu",
+                None,
+            ),
             prompt_lens=prompt_lens_rows,
             decode_req_indices=decode_req_indices_rows,
             decode_req_indices_cpu=decode_req_indices_cpu,
@@ -1570,6 +1659,9 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             decode_selected_tokens=decode_selected_tokens,
             decode_selected_counts=decode_selected_counts,
             decode_union_mapping_workspace=decode_union_mapping_workspace,
+            decode_shard_packed_workspace=decode_shard_packed_workspace,
+            decode_shard_mapping_workspace=decode_shard_mapping_workspace,
+            decode_shard_counts_workspace=decode_shard_counts_workspace,
             need_sparse_lmcache_payload=need_sparse_lmcache_payload,
             prompt_lens_cpu_rows=rows if plens_cpu is not None else None,
             decode_remap_boundary=self.decode_remap_boundary[:num_input_tokens],
@@ -1682,6 +1774,14 @@ class AscendSFAImpl(MLAAttentionImpl):
                 getattr(hf_text_config or hf_config, "index_topk", 2048),
             )
         )
+        self._lmcache_load_stat_enabled = bool(
+            envs.VLLM_ASCEND_DSA_LMCACHE_LOAD_STAT
+        )
+        self._lmcache_load_stat_tokens: torch.Tensor | None = None
+        self._lmcache_load_stat_denominator = 0
+        self._lmcache_load_stat_rows = 0
+        self._lmcache_load_stat_calls = 0
+        self._lmcache_load_stat_last_log = monotonic()
         self.wq_b = self.indexer.wq_b
         self.wk = self.indexer.wk
         self.weights_proj = self.indexer.weights_proj
@@ -1705,6 +1805,56 @@ class AscendSFAImpl(MLAAttentionImpl):
             raise ValueError(
                 "staged sparse-index preparation only supports MTP=1 or "
                 f"MTP=2; got MTP={self.decode_threshold}"
+            )
+        # Select one startup-static branch so graph replay keeps fixed tensor
+        # addresses and never reads an environment variable.
+        self.dsa_resident_cache = bool(
+            self.dsa_shrink_latent
+            and envs.VLLM_ASCEND_DSA_RESIDENT_CACHE
+        )
+        self._sorted_resident_state: SortedResidentState | None = None
+        self._sorted_resident_workspace: SortedResidentWorkspace | None = None
+        self._sorted_resident_workspace_views: dict[
+            int, SortedResidentWorkspace
+        ] = {}
+        self.dsa_resident_shards_per_row: int | None = None
+        if self.dsa_resident_cache:
+            resident_shards_per_row, resident_shards = (
+                _configured_resident_shards(self.decode_threshold)
+            )
+            self.dsa_resident_shards_per_row = resident_shards_per_row
+            scratch_capacity = self.decode_threshold * self.index_topk
+            if not (
+                0 < scratch_capacity < MAX_INT16_SCRATCH_CAPACITY
+            ):
+                raise ValueError(
+                    "resident sparse cache requires signed-int16 scratch "
+                    "slots and 0 < MTP * index_topk < "
+                    f"{MAX_INT16_SCRATCH_CAPACITY}; got {scratch_capacity}"
+                )
+            if self.index_topk != INDEX_TOPK:
+                raise ValueError(
+                    "sorted resident cache currently requires index_topk="
+                    f"{INDEX_TOPK}; got {self.index_topk}"
+                )
+            max_requests = int(
+                self.vllm_config.scheduler_config.max_num_seqs
+            )
+            state_device = self.q_b_proj.weight.device
+            self._sorted_resident_state = allocate_sorted_resident_state(
+                max_requests,
+                max_requests,
+                self.decode_threshold,
+                device=state_device,
+                shard_count=resident_shards,
+            )
+            self._sorted_resident_workspace = (
+                allocate_sorted_resident_workspace(
+                    max_requests,
+                    self.decode_threshold,
+                    device=state_device,
+                    shard_count=resident_shards,
+                )
             )
         self.enable_staged_sfa_graph = staged_sfa_graph_configured(self.vllm_config)
         self._staged_sfa_graph_capture_sizes = (
@@ -2601,8 +2751,32 @@ class AscendSFAImpl(MLAAttentionImpl):
             != graph_key.request_capacity
             or attn_metadata.decode_union_mapping_workspace.shape
             != attn_metadata.decode_selected_tokens.shape
+            or attn_metadata.decode_shard_packed_workspace is None
+            or int(attn_metadata.decode_shard_packed_workspace.shape[0])
+            != graph_key.request_capacity
+            or int(attn_metadata.decode_shard_packed_workspace.shape[1]) != 2
+            or int(attn_metadata.decode_shard_packed_workspace.shape[2])
+            != int(attn_metadata.decode_selected_tokens.shape[1])
+            or attn_metadata.decode_shard_mapping_workspace is None
+            or attn_metadata.decode_shard_mapping_workspace.shape
+            != attn_metadata.decode_shard_packed_workspace.shape
+            or attn_metadata.decode_shard_counts_workspace is None
+            or tuple(attn_metadata.decode_shard_counts_workspace.shape)
+            != (graph_key.request_capacity, 2, 16)
         ):
             return "the request-union remap buffers do not match the graph key"
+        if self.dsa_resident_cache and (
+            attn_metadata.resident_state_indices is None
+            or attn_metadata.resident_state_generations is None
+            or tuple(attn_metadata.resident_state_indices.shape)
+            != (graph_key.request_capacity,)
+            or tuple(attn_metadata.resident_state_generations.shape)
+            != (graph_key.request_capacity,)
+        ):
+            return (
+                "the resident sparse-cache request state does not match the "
+                "graph key"
+            )
 
         request_ids = attn_metadata.decode_request_ids_compact
         full_request_ids = attn_metadata.req_ids
@@ -2665,6 +2839,135 @@ class AscendSFAImpl(MLAAttentionImpl):
                 kv_caches,
             )
 
+    def _prepare_sorted_resident_sparse_cache(
+        self,
+        topk_indices: torch.Tensor,
+        split_boundary: torch.Tensor,
+        row_req_indices: torch.Tensor,
+        request_block_table: torch.Tensor,
+        request_state_indices: torch.Tensor | None,
+        request_state_generations: torch.Tensor | None,
+        *,
+        mtp: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        if (
+            request_state_indices is None
+            or request_state_generations is None
+            or self._sorted_resident_state is None
+            or self._sorted_resident_workspace is None
+        ):
+            raise RuntimeError(
+                "sorted resident cache is enabled but its fixed state, "
+                "workspace, or request metadata is unavailable"
+            )
+        request_count = int(request_block_table.shape[0])
+        if int(topk_indices.shape[0]) != request_count * mtp:
+            raise RuntimeError(
+                "sorted resident cache requires request-major decode rows: "
+                f"rows={topk_indices.shape[0]}, requests={request_count}, "
+                f"MTP={mtp}"
+            )
+        workspace = self._sorted_resident_workspace_views.get(request_count)
+        if workspace is None:
+            workspace = sorted_resident_workspace_prefix(
+                self._sorted_resident_workspace,
+                request_count,
+            )
+            self._sorted_resident_workspace_views[request_count] = workspace
+        prepare_resident_sharded_union_(
+            topk_indices,
+            split_boundary,
+            row_req_indices,
+            request_state_indices,
+            request_state_generations,
+            self._sorted_resident_state,
+            workspace,
+            mtp=mtp,
+        )
+        miss_tokens, miss_counts, target_slots = (
+            prepare_sorted_resident_cache_fused_(
+                topk_indices,
+                request_block_table,
+                request_state_indices,
+                request_state_generations,
+                self._sorted_resident_state,
+                workspace,
+                block_size=self.block_size,
+            )
+        )
+        return (
+            topk_indices,
+            miss_tokens,
+            miss_counts,
+            target_slots,
+        )
+
+    def _prepare_decode_sparse_indices(
+        self,
+        topk_indices: torch.Tensor,
+        split_boundary: torch.Tensor,
+        row_req_indices: torch.Tensor,
+        request_block_table: torch.Tensor,
+        selected_packed: torch.Tensor,
+        selected_counts: torch.Tensor,
+        target_slot_mapping: torch.Tensor,
+        request_state_indices: torch.Tensor | None,
+        request_state_generations: torch.Tensor | None,
+        *,
+        local_to_union_workspace: torch.Tensor | None,
+        shard_packed_workspace: torch.Tensor | None,
+        shard_mapping_workspace: torch.Tensor | None,
+        shard_counts_workspace: torch.Tensor | None,
+        staged_mtp: int | None,
+        need_packed: bool,
+        clear_invalid_rows: bool,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor | None,
+        torch.Tensor | None,
+        torch.Tensor | None,
+    ]:
+        """Select the startup-static resident or ordinary decode planner."""
+        if (
+            self.dsa_resident_cache
+            and need_packed
+            and staged_mtp is not None
+        ):
+            if envs.VLLM_ASCEND_MTP_DRAFT_DEBUG:
+                if local_to_union_workspace is None:
+                    raise RuntimeError(
+                        "target SFA diagnostics require raw top-k workspace"
+                    )
+                local_to_union_workspace.copy_(
+                    topk_indices.reshape_as(local_to_union_workspace)
+                )
+            return self._prepare_sorted_resident_sparse_cache(
+                topk_indices,
+                split_boundary,
+                row_req_indices,
+                request_block_table,
+                request_state_indices,
+                request_state_generations,
+                mtp=staged_mtp,
+            )
+        return prepare_sparse_indices(
+            topk_indices,
+            split_boundary,
+            row_req_indices=row_req_indices,
+            request_block_table=request_block_table,
+            selected_packed=selected_packed,
+            selected_counts=selected_counts,
+            target_slot_mapping=target_slot_mapping,
+            block_size=self.block_size,
+            need_packed=need_packed,
+            clear_invalid_rows=clear_invalid_rows,
+            local_to_union_workspace=local_to_union_workspace,
+            shard_packed_workspace=shard_packed_workspace,
+            shard_mapping_workspace=shard_mapping_workspace,
+            shard_counts_workspace=shard_counts_workspace,
+            staged_mtp=staged_mtp,
+        )
+
     def _cross_layer_pre_compute(
         self,
         hidden_states: torch.Tensor,
@@ -2685,6 +2988,11 @@ class AscendSFAImpl(MLAAttentionImpl):
         selected_counts: torch.Tensor,
         target_slot_mapping: torch.Tensor,
         local_to_union_workspace: torch.Tensor,
+        shard_packed_workspace: torch.Tensor,
+        shard_mapping_workspace: torch.Tensor,
+        shard_counts_workspace: torch.Tensor,
+        request_state_indices: torch.Tensor | None,
+        request_state_generations: torch.Tensor | None,
     ) -> tuple[torch.Tensor, ...]:
         """Pre-retrieval compute captured by the outer PIECEWISE graph."""
         assert self.fused_qkv_a_proj is not None
@@ -2738,25 +3046,32 @@ class AscendSFAImpl(MLAAttentionImpl):
             actual_seq_lengths_key=actual_seq_lengths_key,
             indexer_block_table_override=indexer_block_table,
         )
+        staged_mtp = (
+            int(topk_indices.shape[0])
+            // int(request_block_table.shape[0])
+        )
         (
             topk_indices,
             selected_packed,
             selected_count_values,
             target_slot_mapping,
-        ) = prepare_sparse_indices(
+        ) = self._prepare_decode_sparse_indices(
             topk_indices,
             remap_boundary,
-            row_req_indices=row_req_indices,
-            request_block_table=request_block_table,
-            selected_packed=selected_packed,
-            selected_counts=selected_counts,
-            target_slot_mapping=target_slot_mapping,
-            block_size=self.block_size,
+            row_req_indices,
+            request_block_table,
+            selected_packed,
+            selected_counts,
+            target_slot_mapping,
+            request_state_indices,
+            request_state_generations,
+            local_to_union_workspace=local_to_union_workspace,
+            shard_packed_workspace=shard_packed_workspace,
+            shard_mapping_workspace=shard_mapping_workspace,
+            shard_counts_workspace=shard_counts_workspace,
+            staged_mtp=staged_mtp,
             need_packed=True,
             clear_invalid_rows=True,
-            local_to_union_workspace=local_to_union_workspace,
-            staged_mtp=int(topk_indices.shape[0])
-            // int(request_block_table.shape[0]),
         )
         assert selected_packed is not None
         assert selected_count_values is not None
@@ -3018,6 +3333,15 @@ class AscendSFAImpl(MLAAttentionImpl):
         local_to_union_workspace = (
             attn_metadata.decode_union_mapping_workspace
         )
+        shard_packed_workspace = (
+            attn_metadata.decode_shard_packed_workspace
+        )
+        shard_mapping_workspace = (
+            attn_metadata.decode_shard_mapping_workspace
+        )
+        shard_counts_workspace = (
+            attn_metadata.decode_shard_counts_workspace
+        )
         if any(
             value is None
             for value in (
@@ -3026,6 +3350,9 @@ class AscendSFAImpl(MLAAttentionImpl):
                 selected_counts,
                 target_slots,
                 local_to_union_workspace,
+                shard_packed_workspace,
+                shard_mapping_workspace,
+                shard_counts_workspace,
             )
         ):
             raise RuntimeError("staged SFA request-union buffers are unavailable")
@@ -3048,6 +3375,11 @@ class AscendSFAImpl(MLAAttentionImpl):
             selected_counts,
             target_slots,
             local_to_union_workspace,
+            shard_packed_workspace,
+            shard_mapping_workspace,
+            shard_counts_workspace,
+            attn_metadata.resident_state_indices,
+            attn_metadata.resident_state_generations,
         )
         outputs = self._copy_to_staged_sfa_bridge(
             hidden_states,
@@ -3070,6 +3402,354 @@ class AscendSFAImpl(MLAAttentionImpl):
         if is_dummy and context.cudagraph_runtime_mode == CUDAGraphMode.PIECEWISE:
             state.register(graph_key, outputs, kv_cache)
         return outputs
+
+    def _record_lmcache_load_stat(
+        self,
+        layer_name: str,
+        selected_counts: torch.Tensor,
+        *,
+        request_count: int,
+        decode_rows: int,
+    ) -> None:
+        """Accumulate actual sparse LMCache misses and periodically report."""
+        if not getattr(self, "_lmcache_load_stat_enabled", False):
+            return
+        request_count = int(request_count)
+        decode_rows = int(decode_rows)
+        if request_count <= 0 or decode_rows <= 0:
+            return
+
+        counts = selected_counts[:request_count]
+        if counts.ndim > 1:
+            counts = counts[..., 0]
+        loaded_tokens = counts.sum(dtype=torch.int64)
+        accumulator = self._lmcache_load_stat_tokens
+        if accumulator is None:
+            self._lmcache_load_stat_tokens = loaded_tokens.detach().clone()
+        else:
+            accumulator.add_(loaded_tokens)
+
+        self._lmcache_load_stat_rows += decode_rows
+        self._lmcache_load_stat_denominator += self.index_topk * decode_rows
+        self._lmcache_load_stat_calls += 1
+
+        now = monotonic()
+        elapsed = now - self._lmcache_load_stat_last_log
+        if elapsed < _LMCACHE_LOAD_STAT_INTERVAL_S:
+            return
+
+        # Diagnostic-only: one deliberate device-to-host scalar sync per layer
+        # and reporting interval. The disabled path never executes a reduction.
+        loaded = int(self._lmcache_load_stat_tokens.item())
+        denominator = self._lmcache_load_stat_denominator
+        logger.info(
+            "[DSA_LMCACHE_LOAD_STAT] layer=%s interval_s=%.3f "
+            "loaded_tokens=%d topk=%d decode_rows=%d topk_tokens=%d "
+            "load_ratio=%.6f calls=%d",
+            layer_name,
+            elapsed,
+            loaded,
+            self.index_topk,
+            self._lmcache_load_stat_rows,
+            denominator,
+            loaded / denominator if denominator else 0.0,
+            self._lmcache_load_stat_calls,
+        )
+        self._lmcache_load_stat_tokens.zero_()
+        self._lmcache_load_stat_denominator = 0
+        self._lmcache_load_stat_rows = 0
+        self._lmcache_load_stat_calls = 0
+        self._lmcache_load_stat_last_log = now
+
+    @staticmethod
+    def _target_sfa_debug_is_live(context: Any) -> bool:
+        if (
+            not envs.VLLM_ASCEND_MTP_DRAFT_DEBUG
+            or getattr(context, "staged_sfa_graph_dummy_run", False)
+            or getattr(context, "staged_sfa_graph_key", None) is None
+        ):
+            return False
+        try:
+            return not torch.npu.is_current_stream_capturing()
+        except (AttributeError, RuntimeError):
+            return True
+
+    def _target_sfa_diag_failure(
+        self,
+        session: Any,
+        layer: int,
+        phase: str,
+        error: Exception,
+    ) -> None:
+        payload = {
+            "schema_version": TARGET_SFA_DIAG_SCHEMA_VERSION,
+            "step_id": session.step_id,
+            "rank": session.rank,
+            "pid": os.getpid(),
+            "layer": layer,
+            "phase": phase,
+            "error_type": type(error).__qualname__,
+            "error": str(error),
+        }
+        atomic_torch_save(
+            payload,
+            target_sfa_path(session, layer, f"{phase}_failure"),
+        )
+        atomic_torch_save(
+            payload,
+            session.output_dir.parent / "latest_failure.pt",
+        )
+
+    def target_sfa_diagnostic_boundary(
+        self,
+        layer_name: str,
+        phase: str,
+        tensor: torch.Tensor,
+        attn_metadata: Any,
+        context: Any,
+    ) -> None:
+        """Synchronize and save the graph-external input/output boundary."""
+        if not self._target_sfa_debug_is_live(context):
+            return
+        session, layer = target_sfa_session(
+            context,
+            layer_name,
+            self.tp_rank,
+            begin=phase == "input",
+        )
+        logger.warning(
+            "[TARGET_SFA_DIAG] step=%d layer=%d phase=%s sync started",
+            session.step_id,
+            layer,
+            phase,
+        )
+        try:
+            torch.npu.synchronize()
+        except Exception as error:
+            self._target_sfa_diag_failure(
+                session,
+                layer,
+                phase,
+                error,
+            )
+            logger.exception(
+                "[TARGET_SFA_DIAG] step=%d layer=%d phase=%s sync failed",
+                session.step_id,
+                layer,
+                phase,
+            )
+            raise
+
+        actual_rows = min(
+            int(getattr(attn_metadata, "num_actual_tokens", tensor.shape[0])),
+            int(tensor.shape[0]),
+        )
+        payload = {
+            "schema_version": TARGET_SFA_DIAG_SCHEMA_VERSION,
+            "step_id": session.step_id,
+            "rank": session.rank,
+            "pid": os.getpid(),
+            "layer": layer,
+            "layer_name": layer_name,
+            "phase": phase,
+            "tensor": tensor[:actual_rows].detach().cpu().clone(),
+        }
+        if phase == "input":
+            payload["metadata"] = target_metadata_snapshot(attn_metadata)
+            payload["resident_state_before"] = (
+                active_resident_state_snapshot(
+                    self._sorted_resident_state,
+                    attn_metadata,
+                )
+            )
+        path = target_sfa_path(session, layer, phase)
+        atomic_torch_save(payload, path)
+        logger.warning(
+            "[TARGET_SFA_DIAG] step=%d layer=%d phase=%s sync passed; saved=%s",
+            session.step_id,
+            layer,
+            phase,
+            path,
+        )
+
+    def _target_sfa_diag_pre_retrieve(
+        self,
+        layer_name: str,
+        selected_packed: torch.Tensor,
+        selected_counts: torch.Tensor,
+        target_slots: torch.Tensor,
+        attn_metadata: Any,
+        context: Any,
+        request_count: int,
+    ) -> tuple[Any, int, list[int]] | None:
+        if not self._target_sfa_debug_is_live(context):
+            return None
+        session, layer = target_sfa_session(
+            context,
+            layer_name,
+            self.tp_rank,
+        )
+        phase = "pre"
+        logger.warning(
+            "[TARGET_SFA_DIAG] step=%d layer=%d phase=%s sync started",
+            session.step_id,
+            layer,
+            phase,
+        )
+        try:
+            torch.npu.synchronize()
+        except Exception as error:
+            self._target_sfa_diag_failure(
+                session,
+                layer,
+                phase,
+                error,
+            )
+            logger.exception(
+                "[TARGET_SFA_DIAG] step=%d layer=%d phase=%s sync failed",
+                session.step_id,
+                layer,
+                phase,
+            )
+            raise
+
+        bridge = self._staged_sfa_bridge_buffers
+        if bridge is None:
+            raise RuntimeError(
+                "target SFA diagnostics require initialized bridge buffers"
+            )
+        actual_rows = min(
+            int(getattr(attn_metadata, "num_actual_tokens", bridge[0].shape[0])),
+            int(bridge[0].shape[0]),
+        )
+        block_ids = topk_physical_block_ids(
+            bridge[2],
+            attn_metadata.decode_req_indices,
+            attn_metadata.block_table,
+            target_slots,
+            block_size=self.block_size,
+            actual_rows=actual_rows,
+            request_count=request_count,
+        )
+        runtime = self._staged_sfa_capture_state.runtime
+        kv_cache = runtime[1] if runtime is not None else None
+        workspace = self._sorted_resident_workspace_views.get(request_count)
+        raw_topk = attn_metadata.decode_union_mapping_workspace
+        stable_boundary = self._staged_sfa_capture_state.remap_boundary
+        payload = {
+            "schema_version": TARGET_SFA_DIAG_SCHEMA_VERSION,
+            "step_id": session.step_id,
+            "rank": session.rank,
+            "pid": os.getpid(),
+            "layer": layer,
+            "layer_name": layer_name,
+            "phase": phase,
+            "block_size": self.block_size,
+            "raw_topk": (
+                raw_topk[:request_count]
+                .reshape(actual_rows, 1, self.index_topk)
+                .detach()
+                .cpu()
+                .clone()
+                if raw_topk is not None
+                else None
+            ),
+            "remap_boundary": (
+                stable_boundary[:actual_rows].detach().cpu().clone()
+                if stable_boundary is not None
+                else None
+            ),
+            "ql_nope": bridge[0][:actual_rows].detach().cpu().clone(),
+            "q_pe": bridge[1][:actual_rows].detach().cpu().clone(),
+            "topk_indices": bridge[2][:actual_rows].detach().cpu().clone(),
+            "selected_packed": (
+                selected_packed[:request_count].detach().cpu().clone()
+            ),
+            "selected_counts": (
+                selected_counts[:request_count].detach().cpu().clone()
+            ),
+            "target_slots": (
+                target_slots[:request_count].detach().cpu().clone()
+            ),
+            "metadata": target_metadata_snapshot(attn_metadata),
+            "resident_state_after": active_resident_state_snapshot(
+                self._sorted_resident_state,
+                attn_metadata,
+            ),
+            "resident_workspace": cpu_snapshot(workspace),
+            "physical_block_ids": block_ids,
+            "cache_before_lmcache": (
+                target_cache_snapshot(kv_cache, block_ids)
+                if kv_cache is not None
+                else None
+            ),
+        }
+        path = target_sfa_path(session, layer, phase)
+        atomic_torch_save(payload, path)
+        logger.warning(
+            "[TARGET_SFA_DIAG] step=%d layer=%d phase=%s sync passed; saved=%s",
+            session.step_id,
+            layer,
+            phase,
+            path,
+        )
+        return session, layer, block_ids
+
+    def _target_sfa_diag_post_retrieve(
+        self,
+        diagnostic: tuple[Any, int, list[int]] | None,
+    ) -> None:
+        if diagnostic is None:
+            return
+        session, layer, block_ids = diagnostic
+        phase = "lmcache"
+        logger.warning(
+            "[TARGET_SFA_DIAG] step=%d layer=%d phase=%s sync started",
+            session.step_id,
+            layer,
+            phase,
+        )
+        try:
+            torch.npu.synchronize()
+        except Exception as error:
+            self._target_sfa_diag_failure(
+                session,
+                layer,
+                phase,
+                error,
+            )
+            logger.exception(
+                "[TARGET_SFA_DIAG] step=%d layer=%d phase=%s sync failed",
+                session.step_id,
+                layer,
+                phase,
+            )
+            raise
+        runtime = self._staged_sfa_capture_state.runtime
+        kv_cache = runtime[1] if runtime is not None else None
+        payload = {
+            "schema_version": TARGET_SFA_DIAG_SCHEMA_VERSION,
+            "step_id": session.step_id,
+            "rank": session.rank,
+            "pid": os.getpid(),
+            "layer": layer,
+            "phase": phase,
+            "physical_block_ids": block_ids,
+            "cache_after_lmcache": (
+                target_cache_snapshot(kv_cache, block_ids)
+                if kv_cache is not None
+                else None
+            ),
+        }
+        path = target_sfa_path(session, layer, phase)
+        atomic_torch_save(payload, path)
+        logger.warning(
+            "[TARGET_SFA_DIAG] step=%d layer=%d phase=%s sync passed; saved=%s",
+            session.step_id,
+            layer,
+            phase,
+            path,
+        )
 
     def cross_layer_lmcache_retrieve(
         self,
@@ -3105,6 +3785,15 @@ class AscendSFAImpl(MLAAttentionImpl):
             if request_ids is None:
                 raise RuntimeError("staged SFA request ids are unavailable")
             request_count = len(request_ids)
+            target_diagnostic = self._target_sfa_diag_pre_retrieve(
+                layer_name,
+                selected_packed,
+                selected_counts,
+                target_slots,
+                attn_metadata,
+                context,
+                request_count,
+            )
             wait_for_kv_layer_from_connector(
                 layer_name,
                 selected_tokens=selected_packed[:request_count],
@@ -3114,6 +3803,14 @@ class AscendSFAImpl(MLAAttentionImpl):
                 selected_token_counts=selected_counts[:request_count],
                 payload_event=producer_event,
             )
+            self._target_sfa_diag_post_retrieve(target_diagnostic)
+            if getattr(self, "_lmcache_load_stat_enabled", False):
+                self._record_lmcache_load_stat(
+                    layer_name,
+                    selected_counts,
+                    request_count=request_count,
+                    decode_rows=request_count * self.decode_threshold,
+                )
             if _LMCACHE_SPARSE_WAIT_SYNC_ONCE and not _lmcache_sparse_wait_sync_once_done:
                 _sync_compute_stream_after_lmcache_sparse_wait()
             if next_layer_name:
@@ -3489,6 +4186,17 @@ class AscendSFAImpl(MLAAttentionImpl):
                     attn_metadata,
                     attn_metadata.req_ids,
                 )
+                request_ids_value = attn_metadata.req_ids
+                request_ids = (
+                    list(request_ids_value)
+                    if request_ids_value is not None
+                    else []
+                )
+                if len(request_ids) != len(_lmcache_cached_tokens):
+                    raise RuntimeError(
+                        "DSA remap request IDs differ from resolved boundaries: "
+                        f"{len(request_ids)} != {len(_lmcache_cached_tokens)}"
+                    )
                 if _lmcache_cached_tokens is not None or _decode_window_size > 0:
                     _split_boundary = _update_dsa_split_boundary_in_place(
                         attn_metadata,
@@ -3526,23 +4234,39 @@ class AscendSFAImpl(MLAAttentionImpl):
                     _sel_packed,
                     _selected_token_counts,
                     _target_slot_mapping,
-                ) = prepare_sparse_indices(
+                ) = self._prepare_decode_sparse_indices(
                     topk_indices,
                     _split_boundary,
-                    row_req_indices=_row_req_indices,
-                    request_block_table=attn_metadata.block_table,
-                    selected_packed=attn_metadata.decode_selected_tokens,
-                    selected_counts=attn_metadata.decode_selected_counts,
-                    target_slot_mapping=attn_metadata.decode_target_slot_mapping,
-                    block_size=self.block_size,
-                    need_packed=_need_packed,
-                    clear_invalid_rows=_is_pure_decode,
+                    _row_req_indices,
+                    attn_metadata.block_table,
+                    attn_metadata.decode_selected_tokens,
+                    attn_metadata.decode_selected_counts,
+                    attn_metadata.decode_target_slot_mapping,
+                    attn_metadata.resident_state_indices,
+                    attn_metadata.resident_state_generations,
                     local_to_union_workspace=(
                         attn_metadata.decode_union_mapping_workspace
                         if _staged_mtp is not None
                         else None
                     ),
+                    shard_packed_workspace=(
+                        attn_metadata.decode_shard_packed_workspace
+                        if _staged_mtp is not None
+                        else None
+                    ),
+                    shard_mapping_workspace=(
+                        attn_metadata.decode_shard_mapping_workspace
+                        if _staged_mtp is not None
+                        else None
+                    ),
+                    shard_counts_workspace=(
+                        attn_metadata.decode_shard_counts_workspace
+                        if _staged_mtp is not None
+                        else None
+                    ),
                     staged_mtp=_staged_mtp,
+                    need_packed=_need_packed,
+                    clear_invalid_rows=_is_pure_decode,
                 )
             _sparse_indices_padding_zeroed = _is_pure_decode
             _diag_context = get_forward_context() if _mtp_dw_diag_enabled() and _diag_remap_build else None
@@ -3917,7 +4641,7 @@ class AscendSFAImpl(MLAAttentionImpl):
             # matters (crash => our remap/FA, clean => LMCache transfer kernel).
             if self.dsa_shrink_latent != 3 and _sel_packed is not None:
                 _selected_for_wait = _sel_packed
-                _target_slot_mapping_for_wait = attn_metadata.decode_target_slot_mapping
+                _target_slot_mapping_for_wait = _target_slot_mapping
                 _request_ids_for_wait = attn_metadata.decode_request_ids_compact
                 _wait_fn = wait_for_kv_layer_from_connector
                 with _dsa_prof.section("lmc_retrieve"):
@@ -3927,6 +4651,16 @@ class AscendSFAImpl(MLAAttentionImpl):
                         target_slot_mapping=_target_slot_mapping_for_wait,
                         request_ids=_request_ids_for_wait,
                         selected_token_counts=_selected_token_counts,
+                    )
+                if (
+                    _request_ids_for_wait is not None
+                    and getattr(self, "_lmcache_load_stat_enabled", False)
+                ):
+                    self._record_lmcache_load_stat(
+                        layer_name,
+                        _selected_token_counts,
+                        request_count=len(_request_ids_for_wait),
+                        decode_rows=attn_metadata.num_decode_tokens,
                     )
                 if _LMCACHE_SPARSE_WAIT_SYNC_ONCE and not _lmcache_sparse_wait_sync_once_done:
                     _sync_compute_stream_after_lmcache_sparse_wait()
