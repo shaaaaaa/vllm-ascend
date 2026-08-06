@@ -2052,10 +2052,6 @@ def test_sorted_resident_mtp2_graph_replay_with_inactive_request_rows(
         mtp=mtp,
     )
     prior_slots = workspace.prior_slots.cpu()
-    for request in range(request_count):
-        for shard, expected_tokens in enumerate(expected_shards[request]):
-            count = len(expected_tokens)
-            assert prior_slots[request, shard, :count].tolist() == [-1] * count
     block_table_cpu = block_table.cpu()
     expected_values = source_cpu.reshape(request_count, -1).clone()
     for request in range(request_count):
@@ -2064,6 +2060,12 @@ def test_sorted_resident_mtp2_graph_replay_with_inactive_request_rows(
             {},
             scratch_capacity,
         )
+        for shard, expected_tokens in enumerate(expected_shards[request]):
+            count = len(expected_tokens)
+            expected_prior_slots = [expected_state[token] for token in expected_tokens]
+            assert prior_slots[request, shard, :count].tolist() == (
+                expected_prior_slots
+            )
         miss_count = int(workspace.miss_counts[request, 0].cpu())
         if request < actual_requests:
             assert miss_count == len(expected_misses)
