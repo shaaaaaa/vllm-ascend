@@ -17,7 +17,8 @@ RESIDENT_COUNT_CACHELINE_INTS = 16
 RESIDENT_GENERATION_CACHELINE_LONGS = 8
 INDEX_TOPK = 2048
 MAX_INT16_SCRATCH_CAPACITY = 1 << 15
-RESIDENT_READ_PROBE_DEBUG_INTS = 32
+MAX_RESIDENT_SHARDS = 8
+RESIDENT_READ_PROBE_DEBUG_INTS = 4 + 7 * MAX_RESIDENT_SHARDS
 RESIDENT_FINALIZE_DEBUG_INTS = 16
 DEFAULT_RESIDENT_SHARDS_PER_ROW = 4
 MAX_RESIDENT_SHARDS_PER_ROW = 4
@@ -48,7 +49,11 @@ def _resolve_resident_shard_count(
     default = resident_shard_count(mtp)
     if shard_count is None:
         return default
-    if shard_count < 1 or shard_count > 8 or shard_count & (shard_count - 1):
+    if (
+        shard_count < 1
+        or shard_count > MAX_RESIDENT_SHARDS
+        or shard_count & (shard_count - 1)
+    ):
         raise ValueError("resident shard count must be a power of two from 1 to 8")
     return shard_count
 
