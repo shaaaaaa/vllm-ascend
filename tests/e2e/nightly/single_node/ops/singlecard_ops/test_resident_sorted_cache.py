@@ -2060,6 +2060,8 @@ def test_sorted_resident_mtp2_graph_replay_with_inactive_request_rows(
             {},
             scratch_capacity,
         )
+        # The fused finalize stage overwrites prior_slots with the assigned
+        # logical slots; validate that final value here.
         for shard, expected_tokens in enumerate(expected_shards[request]):
             count = len(expected_tokens)
             expected_prior_slots = [expected_state[token] for token in expected_tokens]
