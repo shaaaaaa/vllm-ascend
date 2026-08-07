@@ -2931,7 +2931,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         if (
             self.dsa_resident_cache
             and need_packed
-            and staged_mtp is not None
+            and staged_mtp == self.decode_threshold
         ):
             if envs.VLLM_ASCEND_MTP_DRAFT_DEBUG:
                 if local_to_union_workspace is None:

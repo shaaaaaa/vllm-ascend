@@ -1049,24 +1049,27 @@ def test_configured_resident_shards_default_to_four_per_row():
 
 
 @pytest.mark.parametrize(
-    "enabled,need_packed,mtp,uses_sorted",
+    "enabled,need_packed,decode_threshold,mtp,uses_sorted",
     [
-        (True, True, 1, True),
-        (True, True, 2, True),
-        (False, True, 1, False),
-        (True, True, None, False),
-        (True, False, 1, False),
+        (True, True, 1, 1, True),
+        (True, True, 2, 2, True),
+        (True, True, 2, 1, False),
+        (False, True, 1, 1, False),
+        (True, True, 1, None, False),
+        (True, False, 1, 1, False),
     ],
 )
 def test_decode_sparse_planner_routes_only_fixed_decode_to_resident(
     enabled,
     need_packed,
+    decode_threshold,
     mtp,
     uses_sorted,
 ):
     impl = AscendSFAImpl.__new__(AscendSFAImpl)
     impl.block_size = 128
     impl.dsa_resident_cache = enabled
+    impl.decode_threshold = decode_threshold
     expected = (MagicMock(), MagicMock(), MagicMock(), MagicMock())
     impl._prepare_sorted_resident_sparse_cache = MagicMock(
         return_value=expected
@@ -1098,6 +1101,7 @@ def test_decode_sparse_planner_debug_snapshots_raw_topk_before_resident():
     impl = AscendSFAImpl.__new__(AscendSFAImpl)
     impl.block_size = 128
     impl.dsa_resident_cache = True
+    impl.decode_threshold = 2
     expected = (MagicMock(), MagicMock(), MagicMock(), MagicMock())
     impl._prepare_sorted_resident_sparse_cache = MagicMock(
         return_value=expected
