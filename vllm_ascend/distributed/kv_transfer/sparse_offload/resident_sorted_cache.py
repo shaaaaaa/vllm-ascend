@@ -238,6 +238,47 @@ def prepare_resident_sharded_union_(
     )
 
 
+def prepare_resident_sharded_union_optimized_(
+    topk_indices: torch.Tensor,
+    split_boundary: torch.Tensor,
+    row_req_indices: torch.Tensor,
+    request_state_indices: torch.Tensor,
+    request_state_generations: torch.Tensor,
+    state: SortedResidentState,
+    workspace: SortedResidentWorkspace,
+    *,
+    mtp: int,
+) -> None:
+    """Benchmark-only union variant using power-of-two shard masking."""
+    resident_shard_count(mtp)
+    try:
+        op = torch.ops._C_ascend.npu_dsa_resident_sharded_union_optimized_
+    except AttributeError as error:
+        raise RuntimeError(
+            "vllm_ascend_C does not expose the optimized resident union; rebuild the extension"
+        ) from error
+    op(
+        topk_indices,
+        split_boundary,
+        row_req_indices,
+        workspace.shard_packed,
+        workspace.shard_mapping,
+        workspace.shard_counts,
+        request_state_indices,
+        request_state_generations,
+        state.tokens,
+        state.slots,
+        state.counts,
+        state.generations,
+        workspace.prior_slots,
+        workspace.shard_miss_tokens,
+        workspace.shard_miss_positions,
+        workspace.shard_evictable_slots,
+        mtp,
+        state.dummy_state_base,
+    )
+
+
 def _run_sorted_resident_plan_(
     op,
     topk_indices: torch.Tensor,
@@ -512,6 +553,39 @@ def debug_sorted_resident_finalize_only_(
     )
 
 
+def debug_sorted_resident_finalize_optimized_(
+    request_block_table: torch.Tensor,
+    workspace: SortedResidentWorkspace,
+    *,
+    block_size: int,
+    debug_info: torch.Tensor | None = None,
+) -> None:
+    """Benchmark-only finalize variant with vector target addressing."""
+    try:
+        op = torch.ops._C_ascend.npu_dsa_resident_sorted_finalize_optimized_
+    except AttributeError as error:
+        raise RuntimeError(
+            "vllm_ascend_C does not expose the optimized resident finalize; rebuild the extension"
+        ) from error
+    if debug_info is None:
+        debug_info = workspace.miss_counts
+    op(
+        workspace.shard_packed,
+        workspace.shard_counts,
+        workspace.prior_slots,
+        workspace.shard_miss_tokens,
+        workspace.shard_miss_positions,
+        workspace.shard_evictable_slots,
+        workspace.miss_tokens,
+        workspace.miss_counts,
+        workspace.target_slots,
+        request_block_table,
+        debug_info,
+        block_size,
+        0,
+    )
+
+
 def debug_sorted_resident_update_only_(
     topk_indices: torch.Tensor,
     request_state_indices: torch.Tensor,
@@ -525,6 +599,36 @@ def debug_sorted_resident_update_only_(
     except AttributeError as error:
         raise RuntimeError(
             "vllm_ascend_C does not expose the sorted resident update debug op; rebuild the extension"
+        ) from error
+    op(
+        topk_indices,
+        workspace.shard_packed,
+        workspace.shard_mapping,
+        workspace.shard_counts,
+        workspace.prior_slots,
+        request_state_indices,
+        request_state_generations,
+        state.tokens,
+        state.slots,
+        state.counts,
+        state.generations,
+        state.dummy_state_base,
+    )
+
+
+def debug_sorted_resident_update_optimized_(
+    topk_indices: torch.Tensor,
+    request_state_indices: torch.Tensor,
+    request_state_generations: torch.Tensor,
+    state: SortedResidentState,
+    workspace: SortedResidentWorkspace,
+) -> None:
+    """Benchmark-only update variant batching remap across value shards."""
+    try:
+        op = torch.ops._C_ascend.npu_dsa_resident_sorted_update_optimized_
+    except AttributeError as error:
+        raise RuntimeError(
+            "vllm_ascend_C does not expose the optimized resident update; rebuild the extension"
         ) from error
     op(
         topk_indices,

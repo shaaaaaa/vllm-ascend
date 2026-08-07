@@ -1413,7 +1413,8 @@ at::Tensor resident_sharded_union_common_(
     at::Tensor &shard_miss_positions,
     at::Tensor &shard_evictable_slots,
     int64_t mtp,
-    int64_t dummy_state_base)
+    int64_t dummy_state_base,
+    bool optimized)
 {
     const auto device = topk_indices.device();
     TORCH_CHECK(
@@ -1588,7 +1589,10 @@ at::Tensor resident_sharded_union_common_(
     void* shard_miss_position_ptr = shard_miss_positions.data_ptr();
     void* shard_evictable_slot_ptr = shard_evictable_slots.data_ptr();
     at_npu::native::OpCommand cmd;
-    cmd.Name("npu_dsa_resident_sharded_union_");
+    cmd.Name(
+        optimized
+            ? "npu_dsa_resident_sharded_union_optimized_"
+            : "npu_dsa_resident_sharded_union_");
     cmd.SetCustomHandler([
         stream, topk_ptr, boundary_ptr, row_request_ptr,
         packed_ptr, mapping_ptr, count_ptr, request_state_ptr,
@@ -1599,8 +1603,11 @@ at::Tensor resident_sharded_union_common_(
         request_count, state_row_count, dummy_state_base,
         rows_per_request, row_width, shard_count, shard_capacity,
         shard_count_stride, shard_count_request_stride,
-        generation_stride, core_count]() -> int {
-        dsa_resident_sharded_union_impl(
+        generation_stride, core_count, optimized]() -> int {
+        auto impl = optimized
+            ? dsa_resident_sharded_union_optimized_impl
+            : dsa_resident_sharded_union_impl;
+        impl(
             stream, topk_ptr, boundary_ptr, row_request_ptr,
             packed_ptr, mapping_ptr, count_ptr, request_state_ptr,
             request_generation_ptr, state_token_ptr, state_slot_ptr,
@@ -1652,7 +1659,36 @@ at::Tensor npu_dsa_resident_sharded_union_(
         request_state_indices, request_state_generations,
         state_tokens, state_slots, state_counts, state_generations,
         prior_slots, shard_miss_tokens, shard_miss_positions,
-        shard_evictable_slots, mtp, dummy_state_base);
+        shard_evictable_slots, mtp, dummy_state_base, false);
+}
+
+at::Tensor npu_dsa_resident_sharded_union_optimized_(
+    const at::Tensor &topk_indices,
+    const at::Tensor &split_boundary,
+    const at::Tensor &row_req_indices,
+    at::Tensor &shard_packed,
+    at::Tensor &shard_mapping,
+    at::Tensor &shard_counts,
+    const at::Tensor &request_state_indices,
+    const at::Tensor &request_state_generations,
+    at::Tensor &state_tokens,
+    at::Tensor &state_slots,
+    at::Tensor &state_counts,
+    const at::Tensor &state_generations,
+    at::Tensor &prior_slots,
+    at::Tensor &shard_miss_tokens,
+    at::Tensor &shard_miss_positions,
+    at::Tensor &shard_evictable_slots,
+    int64_t mtp,
+    int64_t dummy_state_base)
+{
+    return resident_sharded_union_common_(
+        topk_indices, split_boundary, row_req_indices,
+        shard_packed, shard_mapping, shard_counts,
+        request_state_indices, request_state_generations,
+        state_tokens, state_slots, state_counts, state_generations,
+        prior_slots, shard_miss_tokens, shard_miss_positions,
+        shard_evictable_slots, mtp, dummy_state_base, true);
 }
 
 static at::Tensor resident_sorted_plan_common_(
@@ -2198,7 +2234,7 @@ at::Tensor npu_dsa_resident_sharded_finalize_worker_(
     return miss_tokens;
 }
 
-at::Tensor npu_dsa_resident_sorted_update_debug_(
+static at::Tensor resident_sorted_update_debug_common_(
     at::Tensor &topk_indices,
     const at::Tensor &shard_packed,
     const at::Tensor &shard_mapping,
@@ -2210,7 +2246,8 @@ at::Tensor npu_dsa_resident_sorted_update_debug_(
     at::Tensor &state_slots,
     at::Tensor &state_counts,
     at::Tensor &state_generations,
-    int64_t dummy_state_base)
+    int64_t dummy_state_base,
+    bool optimized)
 {
     const auto device = topk_indices.device();
     TORCH_CHECK(
@@ -2326,7 +2363,10 @@ at::Tensor npu_dsa_resident_sorted_update_debug_(
     void* state_count_ptr = state_counts.data_ptr();
     void* state_generation_ptr = state_generations.data_ptr();
     at_npu::native::OpCommand cmd;
-    cmd.Name("npu_dsa_resident_sorted_update_debug_");
+    cmd.Name(
+        optimized
+            ? "npu_dsa_resident_sorted_update_optimized_"
+            : "npu_dsa_resident_sorted_update_debug_");
     cmd.SetCustomHandler([
         stream, topk_ptr, packed_ptr, mapping_ptr, count_ptr,
         prior_ptr, request_state_ptr,
@@ -2335,8 +2375,11 @@ at::Tensor npu_dsa_resident_sorted_update_debug_(
         state_row_count, dummy_state_base, rows_per_request,
         row_width, shard_count, capacity, shard_count_stride,
         shard_count_request_stride, generation_stride,
-        core_count]() -> int {
-        dsa_resident_sorted_update_debug_impl(
+        core_count, optimized]() -> int {
+        auto impl = optimized
+            ? dsa_resident_sorted_update_optimized_impl
+            : dsa_resident_sorted_update_debug_impl;
+        impl(
             stream, topk_ptr, packed_ptr, mapping_ptr, count_ptr,
             prior_ptr, request_state_ptr,
             request_generation_ptr, state_token_ptr, state_slot_ptr,
@@ -2356,6 +2399,48 @@ at::Tensor npu_dsa_resident_sorted_update_debug_(
     });
     cmd.Run();
     return topk_indices;
+}
+
+at::Tensor npu_dsa_resident_sorted_update_debug_(
+    at::Tensor &topk_indices,
+    const at::Tensor &shard_packed,
+    const at::Tensor &shard_mapping,
+    const at::Tensor &shard_counts,
+    const at::Tensor &prior_slots,
+    const at::Tensor &request_state_indices,
+    const at::Tensor &request_state_generations,
+    at::Tensor &state_tokens,
+    at::Tensor &state_slots,
+    at::Tensor &state_counts,
+    at::Tensor &state_generations,
+    int64_t dummy_state_base)
+{
+    return resident_sorted_update_debug_common_(
+        topk_indices, shard_packed, shard_mapping, shard_counts,
+        prior_slots, request_state_indices, request_state_generations,
+        state_tokens, state_slots, state_counts, state_generations,
+        dummy_state_base, false);
+}
+
+at::Tensor npu_dsa_resident_sorted_update_optimized_(
+    at::Tensor &topk_indices,
+    const at::Tensor &shard_packed,
+    const at::Tensor &shard_mapping,
+    const at::Tensor &shard_counts,
+    const at::Tensor &prior_slots,
+    const at::Tensor &request_state_indices,
+    const at::Tensor &request_state_generations,
+    at::Tensor &state_tokens,
+    at::Tensor &state_slots,
+    at::Tensor &state_counts,
+    at::Tensor &state_generations,
+    int64_t dummy_state_base)
+{
+    return resident_sorted_update_debug_common_(
+        topk_indices, shard_packed, shard_mapping, shard_counts,
+        prior_slots, request_state_indices, request_state_generations,
+        state_tokens, state_slots, state_counts, state_generations,
+        dummy_state_base, true);
 }
 
 at::Tensor npu_dsa_resident_sorted_remap_(
@@ -2546,7 +2631,7 @@ at::Tensor npu_dsa_resident_sorted_read_probe_(
     return debug_info;
 }
 
-at::Tensor npu_dsa_resident_sorted_finalize_debug_(
+static at::Tensor resident_sorted_finalize_common_(
     const at::Tensor &shard_packed,
     at::Tensor &shard_counts,
     at::Tensor &prior_slots,
@@ -2559,7 +2644,8 @@ at::Tensor npu_dsa_resident_sorted_finalize_debug_(
     const at::Tensor &request_block_table,
     at::Tensor &debug_info,
     int64_t block_size,
-    int64_t debug_stage)
+    int64_t debug_stage,
+    bool optimized)
 {
     const auto device = shard_packed.device();
     TORCH_CHECK(
@@ -2648,6 +2734,9 @@ at::Tensor npu_dsa_resident_sorted_finalize_debug_(
             debug_stage >= 0 && debug_stage <= 11,
         "resident finalize-debug tensor shapes are invalid");
     TORCH_CHECK(
+        !optimized || (block_size & (block_size - 1)) == 0,
+        "optimized resident finalize requires a power-of-two block_size");
+    TORCH_CHECK(
         reinterpret_cast<std::uintptr_t>(
             shard_counts.data_ptr()) % 64 == 0 &&
             reinterpret_cast<std::uintptr_t>(
@@ -2670,7 +2759,10 @@ at::Tensor npu_dsa_resident_sorted_finalize_debug_(
     void* block_table_ptr = request_block_table.data_ptr();
     void* debug_ptr = debug_info.data_ptr();
     at_npu::native::OpCommand cmd;
-    cmd.Name("npu_dsa_resident_sorted_finalize_debug_");
+    cmd.Name(
+        optimized
+            ? "npu_dsa_resident_sorted_finalize_optimized_"
+            : "npu_dsa_resident_sorted_finalize_debug_");
     cmd.SetCustomHandler([
         stream, packed_ptr, count_ptr, prior_ptr,
         shard_miss_token_ptr, shard_miss_position_ptr,
@@ -2680,8 +2772,11 @@ at::Tensor npu_dsa_resident_sorted_finalize_debug_(
         request_count, shard_count, capacity,
         shard_count_stride, shard_count_request_stride,
         miss_count_stride, block_table_width,
-        block_size, debug_stage, core_count]() -> int {
-        dsa_resident_sorted_finalize_debug_impl(
+        block_size, debug_stage, core_count, optimized]() -> int {
+        auto impl = optimized
+            ? dsa_resident_sorted_finalize_optimized_impl
+            : dsa_resident_sorted_finalize_debug_impl;
+        impl(
             stream, packed_ptr, count_ptr, prior_ptr,
             shard_miss_token_ptr, shard_miss_position_ptr,
             shard_evictable_slot_ptr,
@@ -2701,6 +2796,52 @@ at::Tensor npu_dsa_resident_sorted_finalize_debug_(
     });
     cmd.Run();
     return miss_counts;
+}
+
+at::Tensor npu_dsa_resident_sorted_finalize_debug_(
+    const at::Tensor &shard_packed,
+    at::Tensor &shard_counts,
+    at::Tensor &prior_slots,
+    const at::Tensor &shard_miss_tokens,
+    const at::Tensor &shard_miss_positions,
+    const at::Tensor &shard_evictable_slots,
+    at::Tensor &miss_tokens,
+    at::Tensor &miss_counts,
+    at::Tensor &target_slots,
+    const at::Tensor &request_block_table,
+    at::Tensor &debug_info,
+    int64_t block_size,
+    int64_t debug_stage)
+{
+    return resident_sorted_finalize_common_(
+        shard_packed, shard_counts, prior_slots,
+        shard_miss_tokens, shard_miss_positions,
+        shard_evictable_slots, miss_tokens, miss_counts,
+        target_slots, request_block_table, debug_info,
+        block_size, debug_stage, false);
+}
+
+at::Tensor npu_dsa_resident_sorted_finalize_optimized_(
+    const at::Tensor &shard_packed,
+    at::Tensor &shard_counts,
+    at::Tensor &prior_slots,
+    const at::Tensor &shard_miss_tokens,
+    const at::Tensor &shard_miss_positions,
+    const at::Tensor &shard_evictable_slots,
+    at::Tensor &miss_tokens,
+    at::Tensor &miss_counts,
+    at::Tensor &target_slots,
+    const at::Tensor &request_block_table,
+    at::Tensor &debug_info,
+    int64_t block_size,
+    int64_t debug_stage)
+{
+    return resident_sorted_finalize_common_(
+        shard_packed, shard_counts, prior_slots,
+        shard_miss_tokens, shard_miss_positions,
+        shard_evictable_slots, miss_tokens, miss_counts,
+        target_slots, request_block_table, debug_info,
+        block_size, debug_stage, true);
 }
 
 at::Tensor npu_dsa_staged_unique_finalize_(
@@ -3900,6 +4041,23 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         torch::kPrivateUse1,
         &vllm_ascend::npu_dsa_resident_sharded_union_);
     ops.def(
+        "npu_dsa_resident_sharded_union_optimized_("
+        "Tensor topk_indices, Tensor split_boundary, "
+        "Tensor row_req_indices, Tensor(a!) shard_packed, "
+        "Tensor(b!) shard_mapping, Tensor(c!) shard_counts, "
+        "Tensor request_state_indices, "
+        "Tensor request_state_generations, Tensor state_tokens, "
+        "Tensor state_slots, Tensor(d!) state_counts, "
+        "Tensor state_generations, Tensor(e!) prior_slots, "
+        "Tensor(f!) shard_miss_tokens, "
+        "Tensor(g!) shard_miss_positions, "
+        "Tensor(h!) shard_evictable_slots, "
+        "int mtp, int dummy_state_base) -> Tensor(c!)");
+    ops.impl(
+        "npu_dsa_resident_sharded_union_optimized_",
+        torch::kPrivateUse1,
+        &vllm_ascend::npu_dsa_resident_sharded_union_optimized_);
+    ops.def(
         "npu_dsa_resident_sorted_plan_(Tensor(a!) topk_indices, "
         "Tensor shard_packed, Tensor shard_mapping, "
         "Tensor(j!) shard_counts, Tensor request_block_table, "
@@ -3968,6 +4126,19 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         torch::kPrivateUse1,
         &vllm_ascend::npu_dsa_resident_sorted_update_debug_);
     ops.def(
+        "npu_dsa_resident_sorted_update_optimized_("
+        "Tensor(a!) topk_indices, Tensor shard_packed, "
+        "Tensor shard_mapping, Tensor shard_counts, "
+        "Tensor prior_slots, Tensor request_state_indices, "
+        "Tensor request_state_generations, "
+        "Tensor(b!) state_tokens, Tensor(c!) state_slots, "
+        "Tensor(d!) state_counts, Tensor(e!) state_generations, "
+        "int dummy_state_base) -> Tensor(a!)");
+    ops.impl(
+        "npu_dsa_resident_sorted_update_optimized_",
+        torch::kPrivateUse1,
+        &vllm_ascend::npu_dsa_resident_sorted_update_optimized_);
+    ops.def(
         "npu_dsa_resident_sorted_remap_("
         "Tensor(a!) topk_indices, Tensor shard_mapping, "
         "Tensor shard_counts, Tensor prior_slots) -> Tensor(a!)");
@@ -3997,6 +4168,19 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "npu_dsa_resident_sorted_finalize_debug_",
         torch::kPrivateUse1,
         &vllm_ascend::npu_dsa_resident_sorted_finalize_debug_);
+    ops.def(
+        "npu_dsa_resident_sorted_finalize_optimized_("
+        "Tensor shard_packed, Tensor(f!) shard_counts, "
+        "Tensor(a!) prior_slots, Tensor shard_miss_tokens, "
+        "Tensor shard_miss_positions, Tensor shard_evictable_slots, "
+        "Tensor(b!) miss_tokens, Tensor(c!) miss_counts, "
+        "Tensor(d!) target_slots, Tensor request_block_table, "
+        "Tensor(e!) debug_info, int block_size, "
+        "int debug_stage) -> Tensor(c!)");
+    ops.impl(
+        "npu_dsa_resident_sorted_finalize_optimized_",
+        torch::kPrivateUse1,
+        &vllm_ascend::npu_dsa_resident_sorted_finalize_optimized_);
     ops.def(
         "npu_dsa_staged_unique_finalize_(Tensor unique_keys, "
         "Tensor inverse, Tensor row_req_indices, "

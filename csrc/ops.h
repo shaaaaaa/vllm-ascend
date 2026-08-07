@@ -296,6 +296,36 @@ namespace vllm_ascend {
     uint32_t generation_stride,
     uint32_t core_count);
 
+  extern void dsa_resident_sharded_union_optimized_impl(
+    void* stream,
+    void* topk_indices,
+    void* split_boundary,
+    void* row_req_indices,
+    void* shard_packed,
+    void* shard_mapping,
+    void* shard_counts,
+    void* request_state_indices,
+    void* request_state_generations,
+    void* state_tokens,
+    void* state_slots,
+    void* state_counts,
+    void* state_generations,
+    void* prior_slots,
+    void* shard_miss_tokens,
+    void* shard_miss_positions,
+    void* shard_evictable_slots,
+    uint32_t request_count,
+    uint32_t state_row_count,
+    uint32_t dummy_state_base,
+    uint32_t rows_per_request,
+    uint32_t row_width,
+    uint32_t shard_count,
+    uint32_t shard_capacity,
+    uint32_t shard_count_stride,
+    uint32_t shard_count_request_stride,
+    uint32_t generation_stride,
+    uint32_t core_count);
+
   extern void dsa_resident_sorted_plan_impl(
     void* stream,
     void* topk_indices,
@@ -423,6 +453,31 @@ namespace vllm_ascend {
     uint32_t generation_stride,
     uint32_t core_count);
 
+  extern void dsa_resident_sorted_update_optimized_impl(
+    void* stream,
+    void* topk_indices,
+    void* shard_packed,
+    void* shard_mapping,
+    void* shard_counts,
+    void* prior_slots,
+    void* request_state_indices,
+    void* request_state_generations,
+    void* state_tokens,
+    void* state_slots,
+    void* state_counts,
+    void* state_generations,
+    uint32_t request_count,
+    uint32_t state_row_count,
+    uint32_t dummy_state_base,
+    uint32_t rows_per_request,
+    uint32_t row_width,
+    uint32_t shard_count,
+    uint32_t capacity,
+    uint32_t shard_count_stride,
+    uint32_t shard_count_request_stride,
+    uint32_t generation_stride,
+    uint32_t core_count);
+
   extern void dsa_resident_sorted_remap_impl(
     void* stream,
     void* topk_indices,
@@ -452,6 +507,30 @@ namespace vllm_ascend {
     uint32_t core_count);
 
   extern void dsa_resident_sorted_finalize_debug_impl(
+    void* stream,
+    void* shard_packed,
+    void* shard_counts,
+    void* prior_slots,
+    void* shard_miss_tokens,
+    void* shard_miss_positions,
+    void* shard_evictable_slots,
+    void* miss_tokens,
+    void* miss_counts,
+    void* target_slots,
+    void* request_block_table,
+    void* debug_info,
+    uint32_t request_count,
+    uint32_t shard_count,
+    uint32_t capacity,
+    uint32_t shard_count_stride,
+    uint32_t shard_count_request_stride,
+    uint32_t miss_count_stride,
+    uint32_t block_table_width,
+    uint32_t block_size,
+    uint32_t debug_stage,
+    uint32_t core_count);
+
+  extern void dsa_resident_sorted_finalize_optimized_impl(
     void* stream,
     void* shard_packed,
     void* shard_counts,

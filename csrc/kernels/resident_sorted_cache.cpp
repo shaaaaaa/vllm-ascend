@@ -134,6 +134,7 @@ __aicore__ inline void CopyGlobalToLocalExact(
 // but it must still be sorted for the resident intersection.
 // deduplicate=true is the MTP=2 path: equal values from the two rows collapse
 // to one shard-local union entry.
+template <bool UseBitwiseShard>
 class DSAResidentShardedUnionKernel {
 public:
     __aicore__ inline void Init(
@@ -310,6 +311,16 @@ public:
             static_cast<int32_t>(0x7FFFFFFF),
             requestWidth_);
         AscendC::PipeBarrier<PIPE_V>();
+        if constexpr (UseBitwiseShard) {
+            // shardCount is a host-validated power of two.  Keep the mask in
+            // UB across MTP rows so modulo needs one vector And per row
+            // instead of ShiftRight + Muls + Sub.
+            AscendC::Duplicate(
+                clamped,
+                static_cast<int32_t>(shardCount_ - 1),
+                rowWidth_);
+            AscendC::PipeBarrier<PIPE_V>();
+        }
 
         AscendC::GatherMaskParams gatherParams;
         gatherParams.repeatTimes = 1;
@@ -333,19 +344,27 @@ public:
                 input, topkIndices_[inputOffset], rowWidth_);
             Sync<AscendC::HardEvent::MTE2_V>();
 
-            // shard = token % shardCount. shardCount is a host-validated
-            // power of two, but vector shift/multiply keeps this path valid
-            // for signed int32 input before the non-negative mask is applied.
-            AscendC::ShiftRight(
-                work, input, static_cast<int32_t>(shardBits_),
-                rowWidth_);
-            AscendC::PipeBarrier<PIPE_V>();
-            AscendC::Muls(
-                work, work, static_cast<int32_t>(shardCount_),
-                rowWidth_);
-            AscendC::PipeBarrier<PIPE_V>();
-            AscendC::Sub(work, input, work, rowWidth_);
-            AscendC::PipeBarrier<PIPE_V>();
+            if constexpr (UseBitwiseShard) {
+                AscendC::And(
+                    work.ReinterpretCast<uint16_t>(),
+                    input.ReinterpretCast<uint16_t>(),
+                    clamped.ReinterpretCast<uint16_t>(),
+                    rowWidth_ * sizeof(int32_t) / sizeof(uint16_t));
+                AscendC::PipeBarrier<PIPE_V>();
+            } else {
+                // Preserve the production modulo path bit-for-bit.  Negative
+                // inputs are removed by the non-negative mask below.
+                AscendC::ShiftRight(
+                    work, input, static_cast<int32_t>(shardBits_),
+                    rowWidth_);
+                AscendC::PipeBarrier<PIPE_V>();
+                AscendC::Muls(
+                    work, work, static_cast<int32_t>(shardCount_),
+                    rowWidth_);
+                AscendC::PipeBarrier<PIPE_V>();
+                AscendC::Sub(work, input, work, rowWidth_);
+                AscendC::PipeBarrier<PIPE_V>();
+            }
             AscendC::Duplicate(
                 indices, static_cast<int32_t>(shard), rowWidth_);
             AscendC::PipeBarrier<PIPE_V>();
@@ -356,26 +375,52 @@ public:
                 AscendC::CMPMODE::EQ,
                 rowWidth_);
             AscendC::PipeBarrier<PIPE_V>();
-            AscendC::Maxs(
-                clamped, input, static_cast<int32_t>(0), rowWidth_);
-            AscendC::PipeBarrier<PIPE_V>();
-            AscendC::Compare(
-                nonNegativeMask,
-                clamped,
-                input,
-                AscendC::CMPMODE::EQ,
-                rowWidth_);
-            AscendC::PipeBarrier<PIPE_V>();
-            AscendC::Mins(
-                clamped, input, boundary - 1, rowWidth_);
-            AscendC::PipeBarrier<PIPE_V>();
-            AscendC::Compare(
-                beforeBoundaryMask,
-                clamped,
-                input,
-                AscendC::CMPMODE::EQ,
-                rowWidth_);
-            AscendC::PipeBarrier<PIPE_V>();
+            if constexpr (UseBitwiseShard) {
+                // work is dead after the shard comparison.  Reuse it for
+                // the validity masks and leave the precomputed shard mask in
+                // clamped intact for the next MTP row.
+                AscendC::Maxs(
+                    work, input, static_cast<int32_t>(0), rowWidth_);
+                AscendC::PipeBarrier<PIPE_V>();
+                AscendC::Compare(
+                    nonNegativeMask,
+                    work,
+                    input,
+                    AscendC::CMPMODE::EQ,
+                    rowWidth_);
+                AscendC::PipeBarrier<PIPE_V>();
+                AscendC::Mins(
+                    work, input, boundary - 1, rowWidth_);
+                AscendC::PipeBarrier<PIPE_V>();
+                AscendC::Compare(
+                    beforeBoundaryMask,
+                    work,
+                    input,
+                    AscendC::CMPMODE::EQ,
+                    rowWidth_);
+                AscendC::PipeBarrier<PIPE_V>();
+            } else {
+                AscendC::Maxs(
+                    clamped, input, static_cast<int32_t>(0), rowWidth_);
+                AscendC::PipeBarrier<PIPE_V>();
+                AscendC::Compare(
+                    nonNegativeMask,
+                    clamped,
+                    input,
+                    AscendC::CMPMODE::EQ,
+                    rowWidth_);
+                AscendC::PipeBarrier<PIPE_V>();
+                AscendC::Mins(
+                    clamped, input, boundary - 1, rowWidth_);
+                AscendC::PipeBarrier<PIPE_V>();
+                AscendC::Compare(
+                    beforeBoundaryMask,
+                    clamped,
+                    input,
+                    AscendC::CMPMODE::EQ,
+                    rowWidth_);
+                AscendC::PipeBarrier<PIPE_V>();
+            }
             AscendC::And(
                 selectedMask.ReinterpretCast<uint16_t>(),
                 shardMask.ReinterpretCast<uint16_t>(),
@@ -907,6 +952,7 @@ private:
     uint32_t shardCountRequestStride_ = 0;
 };
 
+template <bool VectorizeTargets>
 class DSAResidentSortedFinalizeKernel {
 public:
     __aicore__ inline void Init(
@@ -940,6 +986,13 @@ public:
         blockTableWidth_ = blockTableWidth;
         blockSize_ = blockSize;
         debugStage_ = debugStage;
+        if constexpr (VectorizeTargets) {
+            uint32_t shifted = blockSize_;
+            while (shifted > 1) {
+                ++blockShift_;
+                shifted >>= 1;
+            }
+        }
         blockTableEntries_ =
             (capacity_ + blockSize_ - 1) / blockSize_;
         const uint64_t requestShardElements =
@@ -992,6 +1045,12 @@ public:
             missTokenBuf_, capacity_ * sizeof(int32_t));
         pipe_.InitBuffer(
             targetSlotBuf_, capacity_ * sizeof(int64_t));
+        if constexpr (VectorizeTargets) {
+            pipe_.InitBuffer(
+                logicalSlotBuf_, capacity_ * sizeof(int32_t));
+            pipe_.InitBuffer(
+                logicalBlockBuf_, capacity_ * sizeof(int32_t));
+        }
         const uint32_t blockTableBytes =
             (blockTableEntries_ * sizeof(int32_t)
                 + kDataBlockBytes - 1)
@@ -1294,6 +1353,91 @@ public:
     }
 
 private:
+    __aicore__ inline void RecordTarget(
+        AscendC::LocalTensor<int64_t> targetSlots,
+        AscendC::LocalTensor<int32_t> blockTable,
+        uint32_t missIndex,
+        uint32_t logicalSlot)
+    {
+        if constexpr (VectorizeTargets) {
+            logicalSlotBuf_.Get<int32_t>().SetValue(
+                missIndex, static_cast<int32_t>(logicalSlot));
+        } else {
+            const uint32_t logicalBlock = logicalSlot / blockSize_;
+            const uint32_t blockOffset = logicalSlot % blockSize_;
+            const int32_t physicalBlock =
+                blockTable.GetValue(logicalBlock);
+            targetSlots.SetValue(
+                missIndex,
+                static_cast<int64_t>(physicalBlock) * blockSize_
+                    + blockOffset);
+        }
+    }
+
+    __aicore__ inline void VectorizeTargetSlots(
+        uint32_t count,
+        AscendC::LocalTensor<int64_t> targetSlots,
+        AscendC::LocalTensor<int32_t> deadMissTokens,
+        AscendC::LocalTensor<int32_t> blockTable)
+    {
+        if (count == 0) {
+            return;
+        }
+        auto logicalSlots = logicalSlotBuf_.Get<int32_t>();
+        auto logicalBlocks = logicalBlockBuf_.Get<int32_t>();
+
+        Sync<AscendC::HardEvent::S_V>();
+        AscendC::ShiftRight(
+            logicalBlocks,
+            logicalSlots,
+            static_cast<int32_t>(blockShift_),
+            count);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Muls(
+            deadMissTokens,
+            logicalBlocks,
+            static_cast<int32_t>(blockSize_),
+            count);
+        AscendC::PipeBarrier<PIPE_V>();
+        // logicalSlots is dead after this operation. Reuse it for the
+        // in-block offset to keep the optimized kernel within the AIV UB.
+        AscendC::Sub(
+            logicalSlots, logicalSlots, deadMissTokens, count);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Muls(
+            logicalBlocks,
+            logicalBlocks,
+            static_cast<int32_t>(sizeof(int32_t)),
+            count);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Gather(
+            deadMissTokens,
+            blockTable,
+            logicalBlocks.ReinterpretCast<uint32_t>(),
+            static_cast<uint32_t>(0),
+            count);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Muls(
+            deadMissTokens,
+            deadMissTokens,
+            static_cast<int32_t>(blockSize_),
+            count);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Add(
+            deadMissTokens,
+            deadMissTokens,
+            logicalSlots,
+            count);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Cast(
+            targetSlots,
+            deadMissTokens,
+            AscendC::RoundMode::CAST_NONE,
+            count);
+        AscendC::PipeBarrier<PIPE_V>();
+        Sync<AscendC::HardEvent::V_MTE3>();
+    }
+
     __aicore__ inline void ProcessCompact(uint32_t request)
     {
         const uint64_t requestOffset =
@@ -1482,20 +1626,22 @@ private:
                     outputMissTokens.SetValue(globalMiss, token);
                     const uint32_t logicalSlot =
                         static_cast<uint32_t>(slot);
-                    const uint32_t logicalBlock =
-                        logicalSlot / blockSize_;
-                    const uint32_t blockOffset =
-                        logicalSlot % blockSize_;
-                    const int32_t physicalBlock =
-                        blockTable.GetValue(logicalBlock);
-                    targetSlots.SetValue(
+                    RecordTarget(
+                        targetSlots,
+                        blockTable,
                         globalMiss,
-                        static_cast<int64_t>(physicalBlock)
-                                * blockSize_
-                            + blockOffset);
+                        logicalSlot);
                     ++globalMiss;
                 }
             }
+        }
+
+        if constexpr (VectorizeTargets) {
+            VectorizeTargetSlots(
+                totalMissCount,
+                targetSlots,
+                inputMissTokens,
+                blockTable);
         }
 
         Sync<AscendC::HardEvent::S_MTE3>();
@@ -1590,6 +1736,8 @@ private:
         packedPriorSlotBuf_;
     AscendC::TBuf<AscendC::TPosition::VECCALC> missTokenBuf_;
     AscendC::TBuf<AscendC::TPosition::VECCALC> targetSlotBuf_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> logicalSlotBuf_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> logicalBlockBuf_;
     AscendC::TBuf<AscendC::TPosition::VECCALC> blockTableBuf_;
     uint32_t requestCount_ = 0;
     uint32_t shardCount_ = 0;
@@ -1601,8 +1749,10 @@ private:
     uint32_t blockSize_ = 0;
     uint32_t blockTableEntries_ = 0;
     uint32_t debugStage_ = 0;
+    uint32_t blockShift_ = 0;
 };
 
+template <bool BatchShardRemap>
 class DSAResidentSortedUpdateKernel {
 public:
     __aicore__ inline void Init(
@@ -1683,8 +1833,12 @@ public:
             oldSlotBuf_, capacity_ * sizeof(int16_t));
         pipe_.InitBuffer(
             currentTokenBuf_, capacity_ * sizeof(int32_t));
+        const uint32_t packedPriorElements =
+            capacity_ + shardCount_ * kInt16PerDataBlock;
         pipe_.InitBuffer(
-            priorSlotBuf_, capacity_ * sizeof(int16_t));
+            priorSlotBuf_,
+            (BatchShardRemap ? packedPriorElements : capacity_)
+                * sizeof(int16_t));
         pipe_.InitBuffer(
             selectedMaskBuf_, capacity_ * sizeof(uint8_t));
         pipe_.InitBuffer(
@@ -1697,10 +1851,11 @@ public:
             remapPartWidth * sizeof(int32_t);
         const uint32_t compactInt16Bytes =
             capacity_ * sizeof(int16_t);
-        const uint32_t survivorSlotBytes =
-            remapInt32Bytes > compactInt16Bytes
-                ? remapInt32Bytes
-                : compactInt16Bytes;
+        const uint32_t survivorSlotBytes = BatchShardRemap
+            ? requestWidth_ * sizeof(int32_t)
+            : (remapInt32Bytes > compactInt16Bytes
+                  ? remapInt32Bytes
+                  : compactInt16Bytes);
         pipe_.InitBuffer(survivorSlotBuf_, survivorSlotBytes);
         pipe_.InitBuffer(
             mergedTokenBuf_, capacity_ * sizeof(int32_t));
@@ -1861,8 +2016,13 @@ public:
             stateCounts_, newCountOffset,
             static_cast<int32_t>(mergedCount));
 
-        RemapPositionPartition(
-            request, shard, requestShardBase);
+        if constexpr (BatchShardRemap) {
+            RemapPositionPartitionBatched(
+                request, shard, requestShardBase);
+        } else {
+            RemapPositionPartition(
+                request, shard, requestShardBase);
+        }
 
         // Every shard copied its complete old list to private UB before
         // overwriting its own disjoint GM range. Generation mismatches were
@@ -2041,6 +2201,214 @@ public:
     }
 
 private:
+    __aicore__ inline void RemapPositionPartitionBatched(
+        uint32_t request,
+        uint32_t part,
+        uint64_t requestShardBase)
+    {
+        const uint32_t partWidth = requestWidth_ / shardCount_;
+        const uint32_t begin = part * partWidth;
+        const uint64_t requestOffset =
+            static_cast<uint64_t>(request) * requestWidth_;
+        const uint64_t mappingBase =
+            static_cast<uint64_t>(request) * shardCount_
+            * requestWidth_;
+
+        // Reuse the state-update scratch only after its scalar phase has
+        // finished.  The merged state buffers remain disjoint and may still
+        // be feeding MTE3 while remap runs.
+        auto input = oldTokenBuf_.Get<int32_t>();
+        auto mappingsOrGathered = oldSlotBuf_.Get<int16_t>();
+        auto rankFloatOrOutput = currentTokenBuf_.Get<float>();
+        auto packedPriorSlots = priorSlotBuf_.Get<int16_t>();
+        auto ranksOrCandidates = survivorTokenBuf_.Get<int32_t>();
+        auto prefixesOrScratch = survivorSlotBuf_.Get<int32_t>();
+        auto selectedMask = selectedMaskBuf_.Get<uint8_t>();
+
+        Sync<AscendC::HardEvent::S_MTE2>();
+        Sync<AscendC::HardEvent::S_V>();
+
+        CopyGlobalToLocalExact(
+            input,
+            topkIndices_[requestOffset + begin],
+            partWidth);
+
+        // Pack all shard mapping slices with one strided MTE2 operation. The
+        // host guarantees that both lengths are 32-byte aligned, so use the
+        // aligned DataCopy form and express length/stride in data blocks.
+        const uint32_t mappingBlockBytes =
+            partWidth * sizeof(int16_t);
+        const uint32_t mappingSourceStrideBytes =
+            (requestWidth_ - partWidth) * sizeof(int16_t);
+        const AscendC::DataCopyParams mappingCopy{
+            static_cast<uint16_t>(shardCount_),
+            static_cast<uint16_t>(mappingBlockBytes / kDataBlockBytes),
+            static_cast<uint16_t>(
+                mappingSourceStrideBytes / kDataBlockBytes),
+            0};
+        AscendC::DataCopy(
+            mappingsOrGathered,
+            shardMapping_[mappingBase + begin],
+            mappingCopy);
+
+        // Issue every compact prior-slot copy before the only MTE2->V wait.
+        // The old path waits once per shard and reruns the full vector chain
+        // per shard; this path packs first and vectorizes the whole matrix.
+        uint32_t priorOffsets[kMaxResidentShards] = {};
+        uint32_t priorEnd = 0;
+        for (uint32_t shard = 0; shard < shardCount_; ++shard) {
+            const uint64_t countOffset =
+                static_cast<uint64_t>(request)
+                    * shardCountRequestStride_
+                + shard * shardCountStride_;
+            const uint32_t count = static_cast<uint32_t>(
+                ReadGlobalScalarFresh(shardCounts_, countOffset));
+            const uint32_t priorOffset =
+                (priorEnd + kInt16PerDataBlock - 1)
+                & ~(kInt16PerDataBlock - 1);
+            priorOffsets[shard] = priorOffset;
+            if (count > 0) {
+                CopyGlobalToLocalExact(
+                    packedPriorSlots[priorOffset],
+                    priorSlots_[
+                        requestShardBase
+                        + static_cast<uint64_t>(shard) * capacity_],
+                    count);
+            }
+            priorEnd = priorOffset + count;
+        }
+        Sync<AscendC::HardEvent::MTE2_V>();
+
+        // Atlas A2 converts int16 through float. Do it once for the flattened
+        // [source_shard, position_partition] matrix.
+        AscendC::Cast(
+            rankFloatOrOutput,
+            mappingsOrGathered,
+            AscendC::RoundMode::CAST_NONE,
+            requestWidth_);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Cast(
+            ranksOrCandidates,
+            rankFloatOrOutput,
+            AscendC::RoundMode::CAST_ROUND,
+            requestWidth_);
+        AscendC::PipeBarrier<PIPE_V>();
+
+        // rankFloatOrOutput is dead after the int32 Cast. Reinterpret it as
+        // the clamped-rank scratch used to form the validity mask.
+        auto clampedRanks =
+            rankFloatOrOutput.ReinterpretCast<int32_t>();
+        AscendC::Maxs(
+            clampedRanks,
+            ranksOrCandidates,
+            static_cast<int32_t>(0),
+            requestWidth_);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Compare(
+            selectedMask,
+            clampedRanks,
+            ranksOrCandidates,
+            AscendC::CMPMODE::EQ,
+            requestWidth_);
+        AscendC::PipeBarrier<PIPE_V>();
+        // Each shard has a different packed-prior prefix. Issue disjoint
+        // scalar-vector Adds and cover the complete matrix with one barrier;
+        // this avoids materializing and reading a full prefix tensor.
+        for (uint32_t shard = 0; shard < shardCount_; ++shard) {
+            AscendC::Adds(
+                ranksOrCandidates[shard * partWidth],
+                clampedRanks[shard * partWidth],
+                static_cast<int32_t>(priorOffsets[shard]),
+                partWidth);
+        }
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Muls(
+            ranksOrCandidates,
+            ranksOrCandidates,
+            static_cast<int32_t>(sizeof(int16_t)),
+            requestWidth_);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Gather(
+            mappingsOrGathered,
+            packedPriorSlots,
+            ranksOrCandidates.ReinterpretCast<uint32_t>(),
+            static_cast<uint32_t>(0),
+            requestWidth_);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Cast(
+            rankFloatOrOutput,
+            mappingsOrGathered,
+            AscendC::RoundMode::CAST_NONE,
+            requestWidth_);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Cast(
+            ranksOrCandidates,
+            rankFloatOrOutput,
+            AscendC::RoundMode::CAST_ROUND,
+            requestWidth_);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Duplicate(
+            prefixesOrScratch,
+            static_cast<int32_t>(-1),
+            requestWidth_);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Select(
+            ranksOrCandidates.ReinterpretCast<float>(),
+            selectedMask,
+            ranksOrCandidates.ReinterpretCast<float>(),
+            prefixesOrScratch.ReinterpretCast<float>(),
+            AscendC::SELMODE::VSEL_TENSOR_TENSOR_MODE,
+            requestWidth_);
+        AscendC::PipeBarrier<PIPE_V>();
+
+        // Exactly one shard owns each selected position. Reduce the shard
+        // rows with log2(shardCount) vector stages; -1 is the identity.
+        for (uint32_t stride = 1;
+             stride < shardCount_;
+             stride <<= 1) {
+            for (uint32_t base = 0;
+                 base < shardCount_;
+                 base += stride << 1) {
+                AscendC::Max(
+                    ranksOrCandidates[base * partWidth],
+                    ranksOrCandidates[base * partWidth],
+                    ranksOrCandidates[(base + stride) * partWidth],
+                    partWidth);
+            }
+            AscendC::PipeBarrier<PIPE_V>();
+        }
+
+        auto accumulatedSlots = ranksOrCandidates;
+        auto output = rankFloatOrOutput.ReinterpretCast<int32_t>();
+        AscendC::Maxs(
+            prefixesOrScratch,
+            accumulatedSlots,
+            static_cast<int32_t>(0),
+            partWidth);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Compare(
+            selectedMask,
+            prefixesOrScratch,
+            accumulatedSlots,
+            AscendC::CMPMODE::EQ,
+            partWidth);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Select(
+            output.ReinterpretCast<float>(),
+            selectedMask,
+            accumulatedSlots.ReinterpretCast<float>(),
+            input.ReinterpretCast<float>(),
+            AscendC::SELMODE::VSEL_TENSOR_TENSOR_MODE,
+            partWidth);
+        AscendC::PipeBarrier<PIPE_V>();
+
+        Sync<AscendC::HardEvent::V_MTE3>();
+        CopyLocalToGlobalExact(
+            topkIndices_[requestOffset + begin],
+            output,
+            partWidth);
+    }
+
     __aicore__ inline void RemapPositionPartition(
         uint32_t request,
         uint32_t part,
@@ -2534,7 +2902,51 @@ dsa_resident_sharded_union_kernel(
     uint32_t generationStride)
 {
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
-    DSAResidentShardedUnionKernel op;
+    DSAResidentShardedUnionKernel<false> op;
+    op.Init(
+        topkIndices, splitBoundary, rowReqIndices,
+        shardPacked, shardMapping, shardCounts,
+        requestStateIndices, requestStateGenerations,
+        stateTokens, stateSlots, stateCounts, stateGenerations,
+        priorSlots, shardMissTokens, shardMissPositions,
+        shardEvictableSlots,
+        requestCount, stateRowCount, dummyStateBase,
+        rowsPerRequest, rowWidth, shardCount, shardCapacity,
+        shardCountStride, shardCountRequestStride, generationStride);
+    op.Process();
+}
+
+extern "C" __global__ __aicore__ void
+dsa_resident_sharded_union_optimized_kernel(
+    __gm__ int32_t* topkIndices,
+    __gm__ int32_t* splitBoundary,
+    __gm__ int32_t* rowReqIndices,
+    __gm__ int32_t* shardPacked,
+    __gm__ int16_t* shardMapping,
+    __gm__ int32_t* shardCounts,
+    __gm__ int32_t* requestStateIndices,
+    __gm__ int64_t* requestStateGenerations,
+    __gm__ int32_t* stateTokens,
+    __gm__ int16_t* stateSlots,
+    __gm__ int32_t* stateCounts,
+    __gm__ int64_t* stateGenerations,
+    __gm__ int16_t* priorSlots,
+    __gm__ int32_t* shardMissTokens,
+    __gm__ int16_t* shardMissPositions,
+    __gm__ int16_t* shardEvictableSlots,
+    uint32_t requestCount,
+    uint32_t stateRowCount,
+    uint32_t dummyStateBase,
+    uint32_t rowsPerRequest,
+    uint32_t rowWidth,
+    uint32_t shardCount,
+    uint32_t shardCapacity,
+    uint32_t shardCountStride,
+    uint32_t shardCountRequestStride,
+    uint32_t generationStride)
+{
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
+    DSAResidentShardedUnionKernel<true> op;
     op.Init(
         topkIndices, splitBoundary, rowReqIndices,
         shardPacked, shardMapping, shardCounts,
@@ -2593,7 +3005,43 @@ dsa_resident_sorted_finalize_kernel(
     uint32_t debugStage)
 {
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
-    DSAResidentSortedFinalizeKernel op;
+    DSAResidentSortedFinalizeKernel<false> op;
+    op.Init(
+        shardPacked, shardCounts, priorSlots,
+        shardMissTokens, shardMissPositions, shardEvictableSlots,
+        missTokens, missCounts, targetSlots,
+        requestBlockTable, debugInfo,
+        requestCount, shardCount, capacity,
+        shardCountStride, shardCountRequestStride, missCountStride,
+        blockTableWidth, blockSize, debugStage);
+    op.Process();
+}
+
+extern "C" __global__ __aicore__ void
+dsa_resident_sorted_finalize_optimized_kernel(
+    __gm__ int32_t* shardPacked,
+    __gm__ int32_t* shardCounts,
+    __gm__ int16_t* priorSlots,
+    __gm__ int32_t* shardMissTokens,
+    __gm__ int16_t* shardMissPositions,
+    __gm__ int16_t* shardEvictableSlots,
+    __gm__ int32_t* missTokens,
+    __gm__ int32_t* missCounts,
+    __gm__ int64_t* targetSlots,
+    __gm__ int32_t* requestBlockTable,
+    __gm__ int32_t* debugInfo,
+    uint32_t requestCount,
+    uint32_t shardCount,
+    uint32_t capacity,
+    uint32_t shardCountStride,
+    uint32_t shardCountRequestStride,
+    uint32_t missCountStride,
+    uint32_t blockTableWidth,
+    uint32_t blockSize,
+    uint32_t debugStage)
+{
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
+    DSAResidentSortedFinalizeKernel<true> op;
     op.Init(
         shardPacked, shardCounts, priorSlots,
         shardMissTokens, shardMissPositions, shardEvictableSlots,
@@ -2630,7 +3078,45 @@ dsa_resident_sorted_update_kernel(
     uint32_t generationStride)
 {
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
-    DSAResidentSortedUpdateKernel op;
+    DSAResidentSortedUpdateKernel<false> op;
+    op.Init(
+        topkIndices, shardPacked, shardMapping, shardCounts,
+        priorSlots,
+        requestStateIndices, requestStateGenerations,
+        stateTokens, stateSlots, stateCounts, stateGenerations,
+        requestCount, stateRowCount,
+        dummyStateBase, rowsPerRequest, rowWidth, shardCount,
+        capacity, shardCountStride, shardCountRequestStride,
+        generationStride);
+    op.Process();
+}
+
+extern "C" __global__ __aicore__ void
+dsa_resident_sorted_update_optimized_kernel(
+    __gm__ int32_t* topkIndices,
+    __gm__ int32_t* shardPacked,
+    __gm__ int16_t* shardMapping,
+    __gm__ int32_t* shardCounts,
+    __gm__ int16_t* priorSlots,
+    __gm__ int32_t* requestStateIndices,
+    __gm__ int64_t* requestStateGenerations,
+    __gm__ int32_t* stateTokens,
+    __gm__ int16_t* stateSlots,
+    __gm__ int32_t* stateCounts,
+    __gm__ int64_t* stateGenerations,
+    uint32_t requestCount,
+    uint32_t stateRowCount,
+    uint32_t dummyStateBase,
+    uint32_t rowsPerRequest,
+    uint32_t rowWidth,
+    uint32_t shardCount,
+    uint32_t capacity,
+    uint32_t shardCountStride,
+    uint32_t shardCountRequestStride,
+    uint32_t generationStride)
+{
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
+    DSAResidentSortedUpdateKernel<true> op;
     op.Init(
         topkIndices, shardPacked, shardMapping, shardCounts,
         priorSlots,
@@ -2668,7 +3154,7 @@ dsa_resident_sorted_state_update_kernel(
     uint32_t generationStride)
 {
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
-    DSAResidentSortedUpdateKernel op;
+    DSAResidentSortedUpdateKernel<false> op;
     op.Init(
         topkIndices, shardPacked, shardMapping, shardCounts,
         priorSlots,
@@ -2753,6 +3239,61 @@ void dsa_resident_sharded_union_impl(
 {
     const uint32_t logicalBlockCount = requestCount * shardCount;
     dsa_resident_sharded_union_kernel<<<
+        ResidentPhysicalBlockCount(logicalBlockCount, coreCount),
+        nullptr, stream>>>(
+        static_cast<int32_t*>(topkIndices),
+        static_cast<int32_t*>(splitBoundary),
+        static_cast<int32_t*>(rowReqIndices),
+        static_cast<int32_t*>(shardPacked),
+        static_cast<int16_t*>(shardMapping),
+        static_cast<int32_t*>(shardCounts),
+        static_cast<int32_t*>(requestStateIndices),
+        static_cast<int64_t*>(requestStateGenerations),
+        static_cast<int32_t*>(stateTokens),
+        static_cast<int16_t*>(stateSlots),
+        static_cast<int32_t*>(stateCounts),
+        static_cast<int64_t*>(stateGenerations),
+        static_cast<int16_t*>(priorSlots),
+        static_cast<int32_t*>(shardMissTokens),
+        static_cast<int16_t*>(shardMissPositions),
+        static_cast<int16_t*>(shardEvictableSlots),
+        requestCount, stateRowCount, dummyStateBase, rowsPerRequest,
+        rowWidth, shardCount, shardCapacity, shardCountStride,
+        shardCountRequestStride, generationStride);
+}
+
+void dsa_resident_sharded_union_optimized_impl(
+    void* stream,
+    void* topkIndices,
+    void* splitBoundary,
+    void* rowReqIndices,
+    void* shardPacked,
+    void* shardMapping,
+    void* shardCounts,
+    void* requestStateIndices,
+    void* requestStateGenerations,
+    void* stateTokens,
+    void* stateSlots,
+    void* stateCounts,
+    void* stateGenerations,
+    void* priorSlots,
+    void* shardMissTokens,
+    void* shardMissPositions,
+    void* shardEvictableSlots,
+    uint32_t requestCount,
+    uint32_t stateRowCount,
+    uint32_t dummyStateBase,
+    uint32_t rowsPerRequest,
+    uint32_t rowWidth,
+    uint32_t shardCount,
+    uint32_t shardCapacity,
+    uint32_t shardCountStride,
+    uint32_t shardCountRequestStride,
+    uint32_t generationStride,
+    uint32_t coreCount)
+{
+    const uint32_t logicalBlockCount = requestCount * shardCount;
+    dsa_resident_sharded_union_optimized_kernel<<<
         ResidentPhysicalBlockCount(logicalBlockCount, coreCount),
         nullptr, stream>>>(
         static_cast<int32_t*>(topkIndices),
@@ -2876,6 +3417,52 @@ void dsa_resident_sorted_update_debug_impl(
 {
     const uint32_t logicalBlockCount = requestCount * shardCount;
     dsa_resident_sorted_update_kernel<<<
+        ResidentPhysicalBlockCount(logicalBlockCount, coreCount),
+        nullptr, stream>>>(
+        static_cast<int32_t*>(topkIndices),
+        static_cast<int32_t*>(shardPacked),
+        static_cast<int16_t*>(shardMapping),
+        static_cast<int32_t*>(shardCounts),
+        static_cast<int16_t*>(priorSlots),
+        static_cast<int32_t*>(requestStateIndices),
+        static_cast<int64_t*>(requestStateGenerations),
+        static_cast<int32_t*>(stateTokens),
+        static_cast<int16_t*>(stateSlots),
+        static_cast<int32_t*>(stateCounts),
+        static_cast<int64_t*>(stateGenerations),
+        requestCount, stateRowCount, dummyStateBase,
+        rowsPerRequest, rowWidth, shardCount, capacity,
+        shardCountStride, shardCountRequestStride,
+        generationStride);
+}
+
+void dsa_resident_sorted_update_optimized_impl(
+    void* stream,
+    void* topkIndices,
+    void* shardPacked,
+    void* shardMapping,
+    void* shardCounts,
+    void* priorSlots,
+    void* requestStateIndices,
+    void* requestStateGenerations,
+    void* stateTokens,
+    void* stateSlots,
+    void* stateCounts,
+    void* stateGenerations,
+    uint32_t requestCount,
+    uint32_t stateRowCount,
+    uint32_t dummyStateBase,
+    uint32_t rowsPerRequest,
+    uint32_t rowWidth,
+    uint32_t shardCount,
+    uint32_t capacity,
+    uint32_t shardCountStride,
+    uint32_t shardCountRequestStride,
+    uint32_t generationStride,
+    uint32_t coreCount)
+{
+    const uint32_t logicalBlockCount = requestCount * shardCount;
+    dsa_resident_sorted_update_optimized_kernel<<<
         ResidentPhysicalBlockCount(logicalBlockCount, coreCount),
         nullptr, stream>>>(
         static_cast<int32_t*>(topkIndices),
@@ -3046,6 +3633,49 @@ void dsa_resident_sorted_finalize_debug_impl(
     // Test-only boundary isolation: launch the exact production finalize
     // kernel without launching the following state-update/remap kernel.
     dsa_resident_sorted_finalize_kernel<<<
+        ResidentPhysicalBlockCount(requestCount, coreCount),
+        nullptr, stream>>>(
+        static_cast<int32_t*>(shardPacked),
+        static_cast<int32_t*>(shardCounts),
+        static_cast<int16_t*>(priorSlots),
+        static_cast<int32_t*>(shardMissTokens),
+        static_cast<int16_t*>(shardMissPositions),
+        static_cast<int16_t*>(shardEvictableSlots),
+        static_cast<int32_t*>(missTokens),
+        static_cast<int32_t*>(missCounts),
+        static_cast<int64_t*>(targetSlots),
+        static_cast<int32_t*>(requestBlockTable),
+        static_cast<int32_t*>(debugInfo),
+        requestCount, shardCount, capacity, shardCountStride,
+        shardCountRequestStride, missCountStride,
+        blockTableWidth, blockSize, debugStage);
+}
+
+void dsa_resident_sorted_finalize_optimized_impl(
+    void* stream,
+    void* shardPacked,
+    void* shardCounts,
+    void* priorSlots,
+    void* shardMissTokens,
+    void* shardMissPositions,
+    void* shardEvictableSlots,
+    void* missTokens,
+    void* missCounts,
+    void* targetSlots,
+    void* requestBlockTable,
+    void* debugInfo,
+    uint32_t requestCount,
+    uint32_t shardCount,
+    uint32_t capacity,
+    uint32_t shardCountStride,
+    uint32_t shardCountRequestStride,
+    uint32_t missCountStride,
+    uint32_t blockTableWidth,
+    uint32_t blockSize,
+    uint32_t debugStage,
+    uint32_t coreCount)
+{
+    dsa_resident_sorted_finalize_optimized_kernel<<<
         ResidentPhysicalBlockCount(requestCount, coreCount),
         nullptr, stream>>>(
         static_cast<int32_t*>(shardPacked),

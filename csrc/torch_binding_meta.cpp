@@ -1018,6 +1018,9 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
         "npu_dsa_resident_sharded_union_",
         &vllm_ascend::meta::npu_dsa_resident_sharded_union_meta);
     ops.impl(
+        "npu_dsa_resident_sharded_union_optimized_",
+        &vllm_ascend::meta::npu_dsa_resident_sharded_union_meta);
+    ops.impl(
         "npu_dsa_resident_sorted_plan_",
         &vllm_ascend::meta::npu_dsa_resident_sorted_plan_meta);
     ops.impl(
@@ -1033,6 +1036,9 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
         "npu_dsa_resident_sorted_update_debug_",
         &vllm_ascend::meta::npu_dsa_resident_sorted_update_debug_meta);
     ops.impl(
+        "npu_dsa_resident_sorted_update_optimized_",
+        &vllm_ascend::meta::npu_dsa_resident_sorted_update_debug_meta);
+    ops.impl(
         "npu_dsa_resident_sorted_remap_",
         &vllm_ascend::meta::npu_dsa_resident_sorted_remap_meta);
     ops.impl(
@@ -1040,6 +1046,9 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
         &vllm_ascend::meta::npu_dsa_resident_sorted_read_probe_meta);
     ops.impl(
         "npu_dsa_resident_sorted_finalize_debug_",
+        &vllm_ascend::meta::npu_dsa_resident_sorted_finalize_debug_meta);
+    ops.impl(
+        "npu_dsa_resident_sorted_finalize_optimized_",
         &vllm_ascend::meta::npu_dsa_resident_sorted_finalize_debug_meta);
     // Bgmv expand
     ops.impl("bgmv_expand", &vllm_ascend::meta::bgmv_expand_meta);
