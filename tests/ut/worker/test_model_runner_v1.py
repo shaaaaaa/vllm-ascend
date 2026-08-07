@@ -261,6 +261,36 @@ class TestResidentRequestState(unittest.TestCase):
         self.assertEqual(int(indices[0]), short_state)
         self.assertGreater(int(generations[0]), short_generation)
 
+    def test_generic_fallback_invalidates_resident_generation(self):
+        runner, _ = self._build_runner()
+        _, _, indices, generations = runner._prepare_resident_request_state(
+            num_reqs=2,
+            num_reqs_padded=2,
+            is_dummy=False,
+            remap_frontiers=(4096, 4096),
+        )
+        state = indices.copy()
+        resident_generation = generations.copy()
+
+        _, _, indices, generations = runner._prepare_resident_request_state(
+            num_reqs=2,
+            num_reqs_padded=2,
+            is_dummy=False,
+            resident_compatible=False,
+            remap_frontiers=(4096, 4096),
+        )
+        np.testing.assert_array_equal(indices, [-1, -1])
+        np.testing.assert_array_equal(generations, [-1, -1])
+
+        _, _, indices, generations = runner._prepare_resident_request_state(
+            num_reqs=2,
+            num_reqs_padded=2,
+            is_dummy=False,
+            remap_frontiers=(4096, 4096),
+        )
+        np.testing.assert_array_equal(indices, state)
+        self.assertTrue(np.all(generations > resident_generation))
+
 
 class TestNPUModelRunnerKVCache(unittest.TestCase):
     def _build_runner(self):

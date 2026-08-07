@@ -728,7 +728,7 @@ class NPUModelRunner(GPUModelRunner):
         num_reqs: int,
         num_reqs_padded: int,
         is_dummy: bool,
-        decode_only: bool = True,
+        resident_compatible: bool = True,
         remap_frontiers: tuple[int, ...] | None = None,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None, Any, Any]:
         registry = self._resident_state_registry
@@ -751,10 +751,9 @@ class NPUModelRunner(GPUModelRunner):
                     f"the active request count: {len(remap_frontiers)} != "
                     f"{num_reqs}"
                 )
-            if not decode_only:
-                # Mixed batches use the ordinary union and may overwrite
-                # scratch without updating sorted state. The next decode-only
-                # step must therefore observe a generation mismatch.
+            if not resident_compatible:
+                # Generic decode/prefill unions may overwrite scratch without
+                # updating sorted state. The next resident step must be cold.
                 registry.invalidate(request_ids)  # type: ignore[arg-type]
             block_table = self.input_batch.block_table[0]
             scratch_blocks = cdiv(
@@ -800,12 +799,12 @@ class NPUModelRunner(GPUModelRunner):
                         )
                     )
                 )
-            if decode_only and inactive_request_ids:
+            if resident_compatible and inactive_request_ids:
                 # If a preempted/restarted request used to own a resident row,
                 # make a later zero-to-nonzero boundary transition cold even
                 # when the allocator reuses the same physical block ids.
                 registry.invalidate(inactive_request_ids)  # type: ignore[arg-type]
-            if eligible_rows:
+            if resident_compatible and eligible_rows:
                 state_rows, state_generations = registry.bind(
                     eligible_request_ids,  # type: ignore[arg-type]
                     signatures,
@@ -2892,9 +2891,15 @@ class NPUModelRunner(GPUModelRunner):
         staged_dummy_prompt_lens = None
         staged_dummy_computed_tokens = None
         staged_dummy_request_ids = None
+        resident_state_enabled = self._resident_state_registry is not None
+        scheduled = (
+            np.asarray(num_scheduled_tokens_np).reshape(-1)
+            if staged_sfa_graph_dummy_run or resident_state_enabled
+            else None
+        )
         if staged_sfa_graph_dummy_run:
             query_width = self.decode_threshold
-            scheduled = np.asarray(num_scheduled_tokens_np).reshape(-1)
+            assert scheduled is not None
             if (
                 num_tokens != num_reqs * query_width
                 or num_tokens_padded != num_reqs_padded * query_width
@@ -2933,6 +2938,22 @@ class NPUModelRunner(GPUModelRunner):
                 num_reqs
             )
 
+        resident_compatible = (
+            not resident_state_enabled
+            or staged_sfa_graph_dummy_run
+            or (
+                self.attn_state
+                in (
+                    AscendAttentionState.DecodeOnly,
+                    AscendAttentionState.SpecDecoding,
+                )
+                and num_tokens == num_reqs * self.decode_threshold
+                and num_tokens_padded == num_reqs_padded * self.decode_threshold
+                and scheduled is not None
+                and scheduled.shape == (num_reqs,)
+                and np.all(scheduled == self.decode_threshold)
+            )
+        )
         (
             resident_state_indices,
             resident_state_generations,
@@ -2942,14 +2963,7 @@ class NPUModelRunner(GPUModelRunner):
             num_reqs=num_reqs,
             num_reqs_padded=num_reqs_padded,
             is_dummy=staged_sfa_graph_dummy_run,
-            decode_only=(
-                staged_sfa_graph_dummy_run
-                or self.attn_state
-                in (
-                    AscendAttentionState.DecodeOnly,
-                    AscendAttentionState.SpecDecoding,
-                )
-            ),
+            resident_compatible=resident_compatible,
             remap_frontiers=resident_remap_frontiers,
         )
 
