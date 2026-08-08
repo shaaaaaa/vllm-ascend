@@ -319,6 +319,18 @@
 #           to override them, then delete the patch file `worker/patch_rejection_sampler.py`.
 #       2. make these functions as costom op, then remove AscendRejectionSampler
 #
+# ** 6a. File: worker/patch_logprobs.py**
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#   1. `vllm.v1.sample.sampler.batched_count_greater_than`
+#    Why:
+#       vLLM's compiled helper enters CUDA/Triton capability checks, but NPU has
+#       no CUDA-style device capability.
+#    How:
+#       Replace the ops export and sampler's imported reference with the
+#       equivalent eager op.
+#    Future Plan:
+#       Remove this patch when vLLM gates compilation for eager backends.
+#
 ## ** 7. File: worker/patch_module.py**
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #   1. `vllm.v1.attention.backends.gdn_attn.torch.argsort`
