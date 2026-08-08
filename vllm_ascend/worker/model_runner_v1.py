@@ -2270,7 +2270,10 @@ class NPUModelRunner(GPUModelRunner):
 
             if has_kv_transfer_group():
                 if self.speculative_config:
-                    completed_decode_window_saves = self.finalize_kv_connector()
+                    finalized_kv_output = self.finalize_kv_connector()
+                    completed_decode_window_saves = (
+                        finalized_kv_output.completed_decode_window_saves
+                    )
                     diag_req_ids = getattr(
                         self, "_mtp_dw_diag_current_req_ids", set()
                     )
@@ -2290,18 +2293,14 @@ class NPUModelRunner(GPUModelRunner):
                                 completed_decode_window_saves.get(req_id)
                             ),
                         )
-                    if completed_decode_window_saves:
-                        if kv_connector_output is None:
-                            kv_connector_output = KVConnectorOutput()
-                        for req_id, window_end in completed_decode_window_saves.items():
-                            kv_connector_output.completed_decode_window_saves[
-                                req_id
-                            ] = max(
-                                kv_connector_output.completed_decode_window_saves.get(
-                                    req_id, 0
-                                ),
-                                window_end,
+                    if not finalized_kv_output.is_empty():
+                        kv_connector_output = (
+                            finalized_kv_output
+                            if kv_connector_output is None
+                            else KVConnectorOutput.merge(
+                                kv_connector_output, finalized_kv_output
                             )
+                        )
 
         if self.model_config.enable_return_routed_experts:
             capturer = RoutedExpertsCapturer.get_instance()
