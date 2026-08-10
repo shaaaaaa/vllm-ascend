@@ -11,9 +11,10 @@ logging enabled, for example::
       '{"profiler":"torch","torch_profiler_dir":"/path/to/profile", \\
         "ignore_frontend":true}'
 
-The profiler starts before the request, so it cannot miss the save trigger.
-With the default chunk/window size, the 6143-token raw prompt is one token short
-of the first decode-save boundary. Profiling stops only after the matching
+The long prompt is prefetched without profiling. With the default chunk/window
+size, the 6080-token raw prompt reaches its first decode-save boundary after 64
+generated tokens. Profiling starts after 4 generated tokens, leaving a 60-token
+lead before the save trigger, and stops only after the matching
 ``commit_advanced`` event proves that the save completed and advanced the
 ordered committed frontier. The script then parses and validates the worker
 traces. It intentionally drives one unique request so an unrelated save cannot
@@ -53,6 +54,9 @@ TRACE_POLL_INTERVAL_SECONDS = 1.0
 LOG_POLL_INTERVAL_SECONDS = 0.05
 TRACE_SCAN_CHUNK_BYTES = 8 * 1024 * 1024
 MINIMUM_DEFAULT_PROMPT_TOKENS = 6000
+DEFAULT_TRIGGER_TOKENS = 64
+DEFAULT_PROFILE_AFTER_TOKENS = 4
+DEFAULT_POST_TRIGGER_TOKENS = 32
 
 
 class SmokeFailure(RuntimeError):
@@ -198,12 +202,19 @@ def calculate_decode_save_boundary(
     return DecodeSaveBoundary(start, end, generated_tokens_to_trigger)
 
 
-def default_prompt_tokens(chunk_size: int) -> int:
-    """Return the first chunk-boundary-minus-one prompt above 6000 tokens."""
+def default_prompt_tokens(chunk_size: int, window_size: int) -> int:
+    """Return a prompt above 6000 with time to start before its boundary."""
     if chunk_size <= 0:
         raise ValueError("chunk_size must be positive")
-    next_boundary = (MINIMUM_DEFAULT_PROMPT_TOKENS // chunk_size + 1) * chunk_size
-    return next_boundary - 1
+    if window_size < chunk_size:
+        raise ValueError("window_size must be at least chunk_size")
+    trigger_tokens = max(
+        DEFAULT_TRIGGER_TOKENS,
+        window_size - chunk_size + 1,
+    )
+    remainder = window_size - trigger_tokens
+    chunk_index = (MINIMUM_DEFAULT_PROMPT_TOKENS - remainder) // chunk_size + 1
+    return chunk_index * chunk_size + remainder
 
 
 def parse_async_decode_save_event(line: str) -> dict[str, Any] | None:
@@ -223,13 +234,16 @@ def parse_async_decode_save_event(line: str) -> dict[str, Any] | None:
 
 def matching_commit_event(
     events: Iterable[dict[str, Any]],
-    request_id: str,
+    request_id_prefix: str,
     target_end: int,
 ) -> dict[str, Any] | None:
     for event in events:
         if event.get("event") != COMMIT_ADVANCED_EVENT:
             continue
-        if event.get("request_id") != request_id:
+        event_request_id = event.get("request_id")
+        if not isinstance(event_request_id, str) or not (
+            event_request_id == request_id_prefix or event_request_id.startswith(f"{request_id_prefix}-")
+        ):
             continue
         ordered_end = event.get("ordered_committed_end")
         if isinstance(ordered_end, int) and ordered_end >= target_end:
@@ -239,7 +253,7 @@ def matching_commit_event(
 
 def wait_for_commit_event(
     log_tail: AsyncDecodeSaveLogTail,
-    request_id: str,
+    request_id_prefix: str,
     target_end: int,
     timeout: float,
 ) -> dict[str, Any]:
@@ -247,7 +261,7 @@ def wait_for_commit_event(
     while time.monotonic() < deadline:
         event = matching_commit_event(
             log_tail.read_events(),
-            request_id,
+            request_id_prefix,
             target_end,
         )
         if event is not None:
@@ -255,7 +269,8 @@ def wait_for_commit_event(
         time.sleep(LOG_POLL_INTERVAL_SECONDS)
     raise SmokeFailure(
         "no matching commit_advanced event within "
-        f"{timeout:g}s for request_id={request_id}, target_end={target_end}; "
+        f"{timeout:g}s for request_id_prefix={request_id_prefix}, "
+        f"target_end={target_end}; "
         "ensure LMCACHE_ASYNC_DECODE_SAVE_LOG_COMPLETIONS=1 and async "
         "decode save are enabled"
     )
@@ -302,7 +317,9 @@ def run_profiled_decode(args: argparse.Namespace) -> ProfileResult:
         )
 
     public_request_id = args.request_id
-    engine_request_id = f"cmpl-{public_request_id}"
+    # Completion serving appends "-0" for the single prompt, then EngineCore
+    # adds a random suffix. Match the stable, delimiter-complete prefix.
+    engine_request_id_prefix = f"cmpl-{public_request_id}-0"
     payload = {
         "model": args.model,
         "prompt": [args.prompt_token_id] * args.prompt_tokens,
@@ -329,20 +346,13 @@ def run_profiled_decode(args: argparse.Namespace) -> ProfileResult:
     profile_start_attempted = False
     profile_stop_attempted = False
     try:
-        # Start before dispatch: reacting to a completion or trigger log would
-        # necessarily miss the beginning of the device-side store operation.
-        profile_start_attempted = True
-        profile_control(
-            args.base_url,
-            "start",
-            args.profile_control_timeout,
-        )
-        profile_started_at = time.monotonic()
         print(
-            "profiler started before request "
-            f"{engine_request_id}; decode-save target=[{boundary.start}, "
+            "submitting request with profiler disabled during long-prompt "
+            f"prefill; request_id_prefix={engine_request_id_prefix}, "
+            f"decode-save target=[{boundary.start}, "
             f"{boundary.end}), trigger after "
-            f"{boundary.generated_tokens_to_trigger} generated token(s)",
+            f"{boundary.generated_tokens_to_trigger} generated token(s), "
+            f"profile starts after {args.profile_after_tokens}",
             flush=True,
         )
 
@@ -355,12 +365,40 @@ def run_profiled_decode(args: argparse.Namespace) -> ProfileResult:
                 if event is None:
                     continue
                 generated_tokens += _count_delta_token_ids(event)
-                if trigger_observed_at is None and generated_tokens >= boundary.generated_tokens_to_trigger:
+                if not profile_start_attempted and generated_tokens >= boundary.generated_tokens_to_trigger:
+                    raise SmokeFailure(
+                        "completion stream reached the decode-save boundary "
+                        "before the profiler could start; reduce "
+                        "--profile-after-tokens or choose a prompt with more "
+                        "tokens before the boundary"
+                    )
+                if not profile_start_attempted and generated_tokens >= args.profile_after_tokens:
+                    # Mark the attempt first so a lost start response still
+                    # gets exactly one best-effort cleanup stop.
+                    profile_start_attempted = True
+                    profile_control(
+                        args.base_url,
+                        "start",
+                        args.profile_control_timeout,
+                    )
+                    profile_started_at = time.monotonic()
+                    print(
+                        "profiler started after "
+                        f"{generated_tokens} generated token(s); "
+                        f"{boundary.generated_tokens_to_trigger - generated_tokens} "
+                        "token(s) remain before decode-save trigger",
+                        flush=True,
+                    )
+                if (
+                    profile_started_at is not None
+                    and trigger_observed_at is None
+                    and generated_tokens >= boundary.generated_tokens_to_trigger
+                ):
                     trigger_observed_at = time.monotonic()
-                if commit_event is None:
+                if profile_started_at is not None and commit_event is None:
                     commit_event = matching_commit_event(
                         log_tail.read_events(),
-                        engine_request_id,
+                        engine_request_id_prefix,
                         boundary.end,
                     )
                 if commit_event is not None and not profile_stop_attempted:
@@ -377,6 +415,12 @@ def run_profiled_decode(args: argparse.Namespace) -> ProfileResult:
                         flush=True,
                     )
 
+        if not profile_start_attempted:
+            raise SmokeFailure(
+                f"completion produced {generated_tokens} token(s), but the "
+                f"profiler is configured to start after "
+                f"{args.profile_after_tokens}"
+            )
         if generated_tokens < boundary.generated_tokens_to_trigger:
             raise SmokeFailure(
                 f"completion produced {generated_tokens} token(s), but "
@@ -386,7 +430,7 @@ def run_profiled_decode(args: argparse.Namespace) -> ProfileResult:
         if commit_event is None:
             commit_event = wait_for_commit_event(
                 log_tail,
-                engine_request_id,
+                engine_request_id_prefix,
                 boundary.end,
                 args.completion_timeout,
             )
@@ -419,9 +463,12 @@ def run_profiled_decode(args: argparse.Namespace) -> ProfileResult:
     if profile_started_at is None or profile_stopped_at is None:
         raise SmokeFailure("profile interval did not complete")
     assert commit_event is not None
+    committed_request_id = commit_event.get("request_id")
+    if not isinstance(committed_request_id, str):
+        raise SmokeFailure("matching commit event has no string request_id")
     trigger_seconds = None if trigger_observed_at is None else trigger_observed_at - profile_started_at
     return ProfileResult(
-        request_id=engine_request_id,
+        request_id=committed_request_id,
         generated_tokens=generated_tokens,
         boundary=boundary,
         commit_event=commit_event,
@@ -551,12 +598,22 @@ def parse_args() -> argparse.Namespace:
         "--prompt-tokens",
         type=int,
         help=(
-            "raw prompt length; default is the first chunk boundary minus "
-            "one above 6000 tokens (6143 for chunk_size=256)"
+            "raw prompt length; default is above 6000 and leaves 64 decode "
+            "tokens before the boundary (6080 for chunk/window_size=256)"
         ),
     )
     parser.add_argument("--prompt-token-id", type=int, default=1000)
-    parser.add_argument("--max-tokens", type=int, default=32)
+    parser.add_argument(
+        "--profile-after-tokens",
+        type=int,
+        default=DEFAULT_PROFILE_AFTER_TOKENS,
+        help="start profiler after this many streamed decode tokens",
+    )
+    parser.add_argument(
+        "--max-tokens",
+        type=int,
+        help="default is trigger distance plus 32 completion-tail tokens",
+    )
     parser.add_argument(
         "--request-id",
         default=f"decode-save-profile-{time.time_ns()}",
@@ -574,16 +631,19 @@ def parse_args() -> argparse.Namespace:
         parser.error("--expected-ranks must be positive")
     if args.chunk_size <= 0:
         parser.error("--chunk-size must be positive")
-    if args.prompt_tokens is None:
-        args.prompt_tokens = default_prompt_tokens(args.chunk_size)
     if args.window_size < args.chunk_size:
         parser.error("--window-size must be at least --chunk-size")
+    if args.prompt_tokens is None:
+        args.prompt_tokens = default_prompt_tokens(
+            args.chunk_size,
+            args.window_size,
+        )
     if args.prompt_tokens <= 0:
         parser.error("--prompt-tokens must be positive")
     if args.prompt_token_id < 0:
         parser.error("--prompt-token-id must be non-negative")
-    if args.max_tokens <= 0:
-        parser.error("--max-tokens must be positive")
+    if args.profile_after_tokens <= 0:
+        parser.error("--profile-after-tokens must be positive")
     if not args.request_id:
         parser.error("--request-id must not be empty")
     for name in (
@@ -604,6 +664,16 @@ def parse_args() -> argparse.Namespace:
         )
     except ValueError as exc:
         parser.error(str(exc))
+    if args.profile_after_tokens >= boundary.generated_tokens_to_trigger:
+        parser.error(
+            "--profile-after-tokens must be smaller than the generated "
+            "token count at the decode-save boundary "
+            f"({boundary.generated_tokens_to_trigger})"
+        )
+    if args.max_tokens is None:
+        args.max_tokens = boundary.generated_tokens_to_trigger + DEFAULT_POST_TRIGGER_TOKENS
+    if args.max_tokens <= 0:
+        parser.error("--max-tokens must be positive")
     if args.max_tokens < boundary.generated_tokens_to_trigger:
         parser.error(f"--max-tokens must be at least {boundary.generated_tokens_to_trigger} for this prompt/config")
     return args

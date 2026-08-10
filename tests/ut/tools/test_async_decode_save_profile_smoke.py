@@ -18,9 +18,10 @@ def _args(server_log: Path) -> SimpleNamespace:
         server_log=server_log,
         chunk_size=256,
         window_size=256,
-        prompt_tokens=511,
+        prompt_tokens=504,
         prompt_token_id=1000,
-        max_tokens=2,
+        profile_after_tokens=2,
+        max_tokens=10,
         request_id="profile-test",
         request_timeout=5,
         completion_timeout=5,
@@ -48,9 +49,18 @@ def _commit_line(request_id: str, end: int) -> str:
 
 
 class _StreamingResponse:
-    def __init__(self, server_log: Path, commit_line: str):
+    def __init__(
+        self,
+        server_log: Path,
+        commit_line: str,
+        *,
+        chunks: int = 10,
+        commit_after_chunk: int = 8,
+    ):
         self.server_log = server_log
         self.commit_line = commit_line
+        self.chunks = chunks
+        self.commit_after_chunk = commit_after_chunk
 
     def __enter__(self):
         return self
@@ -59,28 +69,29 @@ class _StreamingResponse:
         return False
 
     def __iter__(self):
-        with self.server_log.open("a", encoding="utf-8") as log_file:
-            log_file.write(self.commit_line)
-            log_file.flush()
-        yield b'data: {"choices": [{"text": "x", "token_ids": [42]}]}\n'
-        yield b'data: {"choices": [{"text": "y", "token_ids": [43]}]}\n'
+        for chunk in range(1, self.chunks + 1):
+            if chunk == self.commit_after_chunk:
+                with self.server_log.open("a", encoding="utf-8") as log_file:
+                    log_file.write(self.commit_line)
+                    log_file.flush()
+            yield (b'data: {"choices": [{"text": "x", "token_ids": [' + str(40 + chunk).encode() + b"]}]}\n")
         yield b"data: [DONE]\n"
 
 
-def test_default_prompt_exceeds_6000_and_stays_one_before_chunk_boundary():
-    prompt_tokens = smoke.default_prompt_tokens(256)
+def test_default_prompt_exceeds_6000_and_leaves_profile_start_lead():
+    prompt_tokens = smoke.default_prompt_tokens(256, 256)
 
-    assert prompt_tokens == 6143
+    assert prompt_tokens == 6080
     assert prompt_tokens > 6000
-    assert (prompt_tokens + 1) % 256 == 0
+    assert smoke.calculate_decode_save_boundary(prompt_tokens, 256, 256).generated_tokens_to_trigger == 64
 
 
-def test_boundary_is_one_decode_token_after_6143_token_prompt():
-    assert smoke.calculate_decode_save_boundary(6143, 256, 256) == (
+def test_boundary_is_64_decode_tokens_after_6080_token_prompt():
+    assert smoke.calculate_decode_save_boundary(6080, 256, 256) == (
         smoke.DecodeSaveBoundary(
             start=5888,
             end=6144,
-            generated_tokens_to_trigger=1,
+            generated_tokens_to_trigger=64,
         )
     )
 
@@ -127,28 +138,28 @@ def test_matching_commit_requires_request_and_target_frontier():
         },
         {
             "event": "commit_advanced",
-            "request_id": "cmpl-target",
+            "request_id": "cmpl-target-0-12345678",
             "ordered_committed_end": 256,
         },
         {
             "event": "persist_complete",
-            "request_id": "cmpl-target",
+            "request_id": "cmpl-target-0-12345678",
             "ordered_committed_end": 512,
         },
     ]
 
-    assert smoke.matching_commit_event(events, "cmpl-target", 512) is None
+    assert smoke.matching_commit_event(events, "cmpl-target-0", 512) is None
     events.append(
         {
             "event": "commit_advanced",
-            "request_id": "cmpl-target",
+            "request_id": "cmpl-target-0-12345678",
             "ordered_committed_end": 512,
         }
     )
-    assert smoke.matching_commit_event(events, "cmpl-target", 512) == events[-1]
+    assert smoke.matching_commit_event(events, "cmpl-target-0", 512) == events[-1]
 
 
-def test_profile_starts_before_request_and_stops_after_matching_commit(
+def test_profile_skips_prefill_and_stops_after_matching_internal_request(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -166,7 +177,7 @@ def test_profile_starts_before_request_and_stops_after_matching_commit(
         requests.append(json.loads(request.data))
         return _StreamingResponse(
             server_log,
-            _commit_line("cmpl-profile-test", 512),
+            _commit_line("cmpl-profile-test-0-12345678", 512),
         )
 
     monkeypatch.setattr(smoke, "profile_control", profile_control)
@@ -174,12 +185,12 @@ def test_profile_starts_before_request_and_stops_after_matching_commit(
 
     result = smoke.run_profiled_decode(args)
 
-    assert timeline == ["start", "request", "stop"]
+    assert timeline == ["request", "start", "stop"]
     assert requests == [
         {
             "model": "model",
-            "prompt": [1000] * 511,
-            "max_tokens": 2,
+            "prompt": [1000] * 504,
+            "max_tokens": 10,
             "temperature": 0,
             "stream": True,
             "ignore_eos": True,
@@ -187,8 +198,8 @@ def test_profile_starts_before_request_and_stops_after_matching_commit(
             "request_id": "profile-test",
         }
     ]
-    assert result.request_id == "cmpl-profile-test"
-    assert result.generated_tokens == 2
+    assert result.request_id == "cmpl-profile-test-0-12345678"
+    assert result.generated_tokens == 10
     assert result.commit_event["ordered_committed_end"] == 512
     assert result.trigger_observed_seconds is not None
 
@@ -207,6 +218,14 @@ def test_start_failure_gets_one_cleanup_stop(
             raise urllib.error.URLError("start response lost")
 
     monkeypatch.setattr(smoke, "profile_control", profile_control)
+    monkeypatch.setattr(
+        smoke.urllib.request,
+        "urlopen",
+        lambda *args, **kwargs: _StreamingResponse(
+            server_log,
+            _commit_line("cmpl-profile-test-0-12345678", 512),
+        ),
+    )
 
     with pytest.raises(urllib.error.URLError, match="start response lost"):
         smoke.run_profiled_decode(_args(server_log))
@@ -233,7 +252,7 @@ def test_stop_failure_is_not_retried(
         "urlopen",
         lambda *args, **kwargs: _StreamingResponse(
             server_log,
-            _commit_line("cmpl-profile-test", 512),
+            _commit_line("cmpl-profile-test-0-12345678", 512),
         ),
     )
 
