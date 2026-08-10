@@ -625,6 +625,7 @@ class TestStagedSFADummyBatch(unittest.TestCase):
         runner = self._build_runner()
         runner.dp_size = 2
         runner.dp_rank = 0
+        runner._staged_sfa_graph_capture_sizes = ()
         runner._skip_all_reduce_across_dp_group = MagicMock(return_value=False)
 
         def all_reduce(tensor, group):
@@ -652,6 +653,43 @@ class TestStagedSFADummyBatch(unittest.TestCase):
 
         self.assertEqual(sizes.tolist(), [4, 4])
         self.assertEqual(mode, CUDAGraphMode.PIECEWISE.value)
+        self.assertIsNone(action)
+
+    def test_dp_sync_keeps_staged_shape_for_neutral_rank(self):
+        runner = self._build_runner()
+        runner.dp_size = 2
+        runner.dp_rank = 0
+        runner._skip_all_reduce_across_dp_group = MagicMock(return_value=False)
+
+        def all_reduce(tensor, group):
+            self.assertEqual(tuple(tensor.shape), (3, 2))
+            self.assertEqual(tensor[2, 0].item(), 0)
+            tensor[0, 1] = 4
+            tensor[1, 1] = CUDAGraphMode.PIECEWISE.value
+            tensor[2, 1] = tuple(StagedSFARouteAction).index(
+                StagedSFARouteAction.STAGED
+            )
+
+        with (
+            patch.object(
+                model_runner_module,
+                "get_dp_group",
+                return_value=SimpleNamespace(cpu_group=object()),
+            ),
+            patch.object(
+                model_runner_module.dist,
+                "all_reduce",
+                side_effect=all_reduce,
+            ),
+        ):
+            _, sizes, mode, action = runner._sync_batch_across_dp(
+                num_tokens_padded=1,
+                cudagraph_mode=CUDAGraphMode.NONE.value,
+                allow_dp_padding=False,
+            )
+
+        self.assertEqual(sizes.tolist(), [1, 4])
+        self.assertEqual(mode, CUDAGraphMode.NONE.value)
         self.assertIsNone(action)
 
     def test_dp_redispatches_only_when_agreement_changes_the_key(self):
