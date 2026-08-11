@@ -102,6 +102,21 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
     # caches so this connector can route them to different children.
     requires_full_dsa_kv_caches = True
 
+    @staticmethod
+    def _supports_dsa_compact_load(connector: Any) -> bool:
+        capability = getattr(
+            connector, "supports_dsa_compact_external_load", False
+        )
+        return bool(capability() if callable(capability) else capability)
+
+    @property
+    def supports_dsa_compact_external_load(self) -> bool:
+        # The scheduler reads this immediately after matched-token lookup.
+        # Delegate to the child selected for that request, since advertising
+        # another child's capability could select compact allocation for an
+        # incompatible loader.
+        return getattr(self, "_selected_supports_dsa_compact_load", False)
+
     @property
     def uses_layerwise_model_callbacks(self) -> bool:
         return any(
@@ -407,6 +422,7 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
     ) -> tuple[int | None, bool]:
         to_return = (0, False)
         chosen_connector = -1
+        self._selected_supports_dsa_compact_load = False
         for i, connector in enumerate(self._connectors):
             tokens, load_async = connector.get_num_new_matched_tokens(
                 request,
@@ -418,6 +434,9 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
                 self._requests_to_connector[request.request_id] = i
                 chosen_connector = i
                 to_return = (tokens, load_async)
+                self._selected_supports_dsa_compact_load = (
+                    self._supports_dsa_compact_load(connector)
+                )
 
         tokens, load_async = to_return
         if (
@@ -539,13 +558,8 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
         if isinstance(params, dict) and params.get("do_remote_decode"):
             live_providers = []
             for connector in connectors:
-                capability = getattr(
-                    connector, "supports_dsa_compact_external_load", False
-                )
                 try:
-                    capable = bool(
-                        capability() if callable(capability) else capability
-                    )
+                    capable = self._supports_dsa_compact_load(connector)
                 except Exception:
                     logger.exception(
                         "Live-split scheduler capability probe failed"

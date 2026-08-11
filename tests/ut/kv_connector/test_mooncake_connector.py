@@ -1290,6 +1290,27 @@ class TestMooncakeConnectorMetadata(unittest.TestCase):
 
 class TestAscendMultiLateSplitInjection(unittest.TestCase):
 
+    def test_compact_load_capability_follows_selected_child(self):
+        class Child:
+            def __init__(self, tokens, capable):
+                self.tokens = tokens
+                self.supports_dsa_compact_external_load = capable
+
+            def get_num_new_matched_tokens(self, _request, _computed):
+                return self.tokens, True
+
+        multi = object.__new__(AscendMultiConnector)
+        multi._requests_to_connector = {}
+        request = types.SimpleNamespace(request_id="req")
+
+        multi._connectors = [Child(16, False), Child(32, True)]
+        self.assertEqual(multi.get_num_new_matched_tokens(request, 0), (16, True))
+        self.assertFalse(multi.supports_dsa_compact_external_load)
+
+        multi._connectors = [Child(0, False), Child(32, True)]
+        self.assertEqual(multi.get_num_new_matched_tokens(request, 0), (32, True))
+        self.assertTrue(multi.supports_dsa_compact_external_load)
+
     def _assert_scheduler_live_provider_runs_first(self, provider_first):
         events = []
         request = types.SimpleNamespace(
