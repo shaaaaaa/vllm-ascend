@@ -207,6 +207,43 @@ def test_ascend_multi_registers_latent_and_indexer_separately():
     index_connector.register_kv_caches.assert_called_once_with(kv_caches)
 
 
+def test_ascend_multi_forwards_staged_sfa_capabilities():
+    multi = object.__new__(AscendMultiConnector)
+    multi._connectors = [
+        SimpleNamespace(
+            supports_staged_sfa_sparse_load=False,
+            uses_layerwise_model_callbacks=False,
+        ),
+        SimpleNamespace(
+            supports_staged_sfa_sparse_load=True,
+            uses_layerwise_model_callbacks=True,
+            wait_for_layer_load=lambda _layer_name: None,
+        ),
+    ]
+
+    assert multi.uses_layerwise_model_callbacks
+    assert multi.supports_staged_sfa_sparse_load
+
+
+def test_ascend_multi_rejects_split_staged_sfa_capabilities():
+    multi = object.__new__(AscendMultiConnector)
+    multi._connectors = [
+        SimpleNamespace(
+            supports_staged_sfa_sparse_load=True,
+            uses_layerwise_model_callbacks=False,
+            wait_for_layer_load=lambda _layer_name: None,
+        ),
+        SimpleNamespace(
+            supports_staged_sfa_sparse_load=False,
+            uses_layerwise_model_callbacks=True,
+            wait_for_layer_load=lambda _layer_name: None,
+        ),
+    ]
+
+    assert multi.uses_layerwise_model_callbacks
+    assert not multi.supports_staged_sfa_sparse_load
+
+
 def test_ascend_multi_wait_for_layer_load_forwards_supported_extra_args():
     multi = object.__new__(AscendMultiConnector)
     calls = []

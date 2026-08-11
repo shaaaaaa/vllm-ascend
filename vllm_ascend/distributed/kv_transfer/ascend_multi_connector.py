@@ -99,6 +99,22 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
     # caches so this connector can route them to different children.
     requires_full_dsa_kv_caches = True
 
+    @property
+    def uses_layerwise_model_callbacks(self) -> bool:
+        return any(
+            getattr(connector, "uses_layerwise_model_callbacks", False)
+            for connector in self._connectors
+        )
+
+    @property
+    def supports_staged_sfa_sparse_load(self) -> bool:
+        return any(
+            getattr(connector, "supports_staged_sfa_sparse_load", False)
+            and getattr(connector, "uses_layerwise_model_callbacks", False)
+            and callable(getattr(connector, "wait_for_layer_load", None))
+            for connector in self._connectors
+        )
+
     def get_live_split_results(self) -> dict[str, str]:
         merged: dict[str, str] = {}
         for connector in self._connectors:
