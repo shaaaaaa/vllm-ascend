@@ -111,6 +111,7 @@ from vllm_ascend.attention.utils import (
     get_lmcache_sparse_cached_tokens,
     staged_sfa_connector_supports_sparse_load,
     staged_sfa_metadata_sparse_route,
+    unwrap_staged_sfa_connector_metadata,
     using_paged_attention,
 )
 
@@ -3264,7 +3265,9 @@ class NPUModelRunner(GPUModelRunner):
             return native(StagedSFARouteReason.NON_Q1)
         metadata_reason, frontiers, cold_resumes = (
             staged_sfa_metadata_sparse_route(
-                kv_connector_metadata,
+                unwrap_staged_sfa_connector_metadata(
+                    kv_connector_metadata
+                ),
                 request_ids,
             )
         )

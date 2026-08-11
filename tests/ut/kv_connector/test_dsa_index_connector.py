@@ -17,6 +17,9 @@ fake_torch_npu.atb = SimpleNamespace(npu_paged_cache_load=MagicMock())
 sys.modules.setdefault("torch_npu", fake_torch_npu)
 
 from vllm.distributed.kv_transfer.kv_connector.v1.base import SupportsHMA  # noqa: E402
+from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import (  # noqa: E402
+    MultiKVConnectorMetadata,
+)
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks  # noqa: E402
 
 from vllm_ascend.distributed.kv_transfer.ascend_multi_connector import (  # noqa: E402
@@ -246,8 +249,8 @@ def test_ascend_multi_rejects_split_staged_sfa_capabilities():
     assert not multi.supports_staged_sfa_sparse_load
 
 
-def test_ascend_multi_reads_staged_sfa_metadata_from_capable_child():
-    metadata = object()
+def test_ascend_multi_unwraps_scheduler_metadata_from_capable_child():
+    target_metadata = object()
     multi = object.__new__(AscendMultiConnector)
     multi._connectors = [
         SimpleNamespace(_get_connector_metadata=lambda: object()),
@@ -255,11 +258,17 @@ def test_ascend_multi_reads_staged_sfa_metadata_from_capable_child():
             supports_staged_sfa_sparse_load=True,
             uses_layerwise_model_callbacks=True,
             wait_for_layer_load=lambda _layer_name: None,
-            _get_connector_metadata=lambda: metadata,
+            _get_connector_metadata=lambda: object(),
         ),
     ]
+    metadata = MultiKVConnectorMetadata(
+        metadata=(object(), target_metadata)
+    )
 
-    assert multi._get_staged_sfa_connector_metadata() is metadata
+    assert (
+        multi._unwrap_staged_sfa_connector_metadata(metadata)
+        is target_metadata
+    )
 
 
 def test_ascend_multi_wait_for_layer_load_forwards_supported_extra_args():

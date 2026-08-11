@@ -501,7 +501,7 @@ def test_sparse_boundary_uses_wrapped_connector_metadata():
         uses_layerwise_model_callbacks=True,
         wait_for_layer_load=lambda *_args, **_kwargs: None,
         _get_connector_metadata=lambda: SimpleNamespace(metadata=[]),
-        _get_staged_sfa_connector_metadata=lambda: child_metadata,
+        _unwrap_staged_sfa_connector_metadata=lambda _metadata: child_metadata,
     )
     with (
         patch.object(attention_utils, "has_kv_transfer_group", return_value=True),

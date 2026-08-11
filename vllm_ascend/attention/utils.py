@@ -366,6 +366,17 @@ def staged_sfa_connector_supports_sparse_load() -> bool:
         return False
 
 
+def unwrap_staged_sfa_connector_metadata(metadata: Any) -> Any:
+    """Select staged-SFA child metadata when the active connector is wrapped."""
+    if not has_kv_transfer_group() or not is_v1_kv_transfer_group():
+        return metadata
+    connector = get_kv_transfer_group()
+    unwrap = getattr(
+        connector, "_unwrap_staged_sfa_connector_metadata", None
+    )
+    return unwrap(metadata) if callable(unwrap) else metadata
+
+
 def _dsa_remap_frontier(load_spec: Any) -> int:
     """Derive the operator boundary without changing LMCache commit progress."""
     if load_spec is None or not getattr(load_spec, "can_load", False):
@@ -410,17 +421,14 @@ def get_lmcache_sparse_cached_tokens(request_ids: Any) -> list[int]:
         )
 
     connector = get_kv_transfer_group()
-    get_metadata = getattr(
-        connector, "_get_staged_sfa_connector_metadata", None
-    )
-    if not callable(get_metadata):
-        get_metadata = getattr(connector, "_get_connector_metadata", None)
+    get_metadata = getattr(connector, "_get_connector_metadata", None)
     if not callable(get_metadata):
         raise RuntimeError("[SFA sparse remap] connector frontier metadata is unavailable.")
     try:
         metadata = get_metadata()
     except Exception as exc:
         raise RuntimeError("[SFA sparse remap] connector frontier metadata lookup failed.") from exc
+    metadata = unwrap_staged_sfa_connector_metadata(metadata)
 
     cached_by_req: dict[str, int] = {}
     for request in getattr(metadata, "requests", ()):

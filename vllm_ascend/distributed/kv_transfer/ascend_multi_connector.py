@@ -5,7 +5,10 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
     SupportsHMA,
 )
-from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import MultiConnector
+from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import (
+    MultiConnector,
+    MultiKVConnectorMetadata,
+)
 from vllm.logger import init_logger
 from vllm.utils.func_utils import supports_kw
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
@@ -109,8 +112,8 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
     def _staged_sfa_connector(self):
         return next(
             (
-                connector
-                for connector in self._connectors
+                (index, connector)
+                for index, connector in enumerate(self._connectors)
                 if getattr(
                     connector, "supports_staged_sfa_sparse_load", False
                 )
@@ -125,13 +128,22 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
     def supports_staged_sfa_sparse_load(self) -> bool:
         return self._staged_sfa_connector() is not None
 
-    def _get_staged_sfa_connector_metadata(self):
-        connector = self._staged_sfa_connector()
-        if connector is None:
+    def _unwrap_staged_sfa_connector_metadata(self, metadata):
+        entry = self._staged_sfa_connector()
+        if entry is None:
             raise RuntimeError(
                 "No child connector satisfies the staged-SFA contract"
             )
-        return connector._get_connector_metadata()
+        if not isinstance(metadata, MultiKVConnectorMetadata):
+            raise TypeError(
+                "AscendMultiConnector requires MultiKVConnectorMetadata"
+            )
+        index, _ = entry
+        if len(metadata.metadata) != len(self._connectors):
+            raise RuntimeError(
+                "MultiConnector metadata does not match its child connectors"
+            )
+        return metadata.metadata[index]
 
     def get_live_split_results(self) -> dict[str, str]:
         merged: dict[str, str] = {}
