@@ -106,14 +106,32 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
             for connector in self._connectors
         )
 
+    def _staged_sfa_connector(self):
+        return next(
+            (
+                connector
+                for connector in self._connectors
+                if getattr(
+                    connector, "supports_staged_sfa_sparse_load", False
+                )
+                and getattr(connector, "uses_layerwise_model_callbacks", False)
+                and callable(getattr(connector, "wait_for_layer_load", None))
+                and callable(getattr(connector, "_get_connector_metadata", None))
+            ),
+            None,
+        )
+
     @property
     def supports_staged_sfa_sparse_load(self) -> bool:
-        return any(
-            getattr(connector, "supports_staged_sfa_sparse_load", False)
-            and getattr(connector, "uses_layerwise_model_callbacks", False)
-            and callable(getattr(connector, "wait_for_layer_load", None))
-            for connector in self._connectors
-        )
+        return self._staged_sfa_connector() is not None
+
+    def _get_staged_sfa_connector_metadata(self):
+        connector = self._staged_sfa_connector()
+        if connector is None:
+            raise RuntimeError(
+                "No child connector satisfies the staged-SFA contract"
+            )
+        return connector._get_connector_metadata()
 
     def get_live_split_results(self) -> dict[str, str]:
         merged: dict[str, str] = {}

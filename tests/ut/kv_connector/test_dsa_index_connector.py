@@ -218,6 +218,7 @@ def test_ascend_multi_forwards_staged_sfa_capabilities():
             supports_staged_sfa_sparse_load=True,
             uses_layerwise_model_callbacks=True,
             wait_for_layer_load=lambda _layer_name: None,
+            _get_connector_metadata=lambda: object(),
         ),
     ]
 
@@ -232,6 +233,7 @@ def test_ascend_multi_rejects_split_staged_sfa_capabilities():
             supports_staged_sfa_sparse_load=True,
             uses_layerwise_model_callbacks=False,
             wait_for_layer_load=lambda _layer_name: None,
+            _get_connector_metadata=lambda: object(),
         ),
         SimpleNamespace(
             supports_staged_sfa_sparse_load=False,
@@ -242,6 +244,22 @@ def test_ascend_multi_rejects_split_staged_sfa_capabilities():
 
     assert multi.uses_layerwise_model_callbacks
     assert not multi.supports_staged_sfa_sparse_load
+
+
+def test_ascend_multi_reads_staged_sfa_metadata_from_capable_child():
+    metadata = object()
+    multi = object.__new__(AscendMultiConnector)
+    multi._connectors = [
+        SimpleNamespace(_get_connector_metadata=lambda: object()),
+        SimpleNamespace(
+            supports_staged_sfa_sparse_load=True,
+            uses_layerwise_model_callbacks=True,
+            wait_for_layer_load=lambda _layer_name: None,
+            _get_connector_metadata=lambda: metadata,
+        ),
+    ]
+
+    assert multi._get_staged_sfa_connector_metadata() is metadata
 
 
 def test_ascend_multi_wait_for_layer_load_forwards_supported_extra_args():

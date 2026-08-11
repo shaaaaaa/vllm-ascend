@@ -409,7 +409,12 @@ def get_lmcache_sparse_cached_tokens(request_ids: Any) -> list[int]:
             "staged sparse selective-load/frontier contract."
         )
 
-    get_metadata = getattr(get_kv_transfer_group(), "_get_connector_metadata", None)
+    connector = get_kv_transfer_group()
+    get_metadata = getattr(
+        connector, "_get_staged_sfa_connector_metadata", None
+    )
+    if not callable(get_metadata):
+        get_metadata = getattr(connector, "_get_connector_metadata", None)
     if not callable(get_metadata):
         raise RuntimeError("[SFA sparse remap] connector frontier metadata is unavailable.")
     try:

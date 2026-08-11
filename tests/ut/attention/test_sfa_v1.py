@@ -481,6 +481,38 @@ def test_sparse_boundary_prefers_explicit_committed_end():
         ) == [0, 4096, 8192]
 
 
+def test_sparse_boundary_uses_wrapped_connector_metadata():
+    from vllm_ascend.attention import utils as attention_utils
+
+    child_metadata = SimpleNamespace(
+        requests=[
+            SimpleNamespace(
+                req_id="wrapped",
+                is_sparse_decode=True,
+                load_spec=SimpleNamespace(
+                    can_load=True,
+                    dsa_committed_end=8192,
+                ),
+            )
+        ]
+    )
+    connector = SimpleNamespace(
+        supports_staged_sfa_sparse_load=True,
+        uses_layerwise_model_callbacks=True,
+        wait_for_layer_load=lambda *_args, **_kwargs: None,
+        _get_connector_metadata=lambda: SimpleNamespace(metadata=[]),
+        _get_staged_sfa_connector_metadata=lambda: child_metadata,
+    )
+    with (
+        patch.object(attention_utils, "has_kv_transfer_group", return_value=True),
+        patch.object(attention_utils, "is_v1_kv_transfer_group", return_value=True),
+        patch.object(attention_utils, "get_kv_transfer_group", return_value=connector),
+    ):
+        assert attention_utils.get_lmcache_sparse_cached_tokens(["wrapped"]) == [
+            8192
+        ]
+
+
 def _staged_route(frontiers=(4096,)):
     return StagedSFARouteDecision(
         StagedSFARouteAction.STAGED,
