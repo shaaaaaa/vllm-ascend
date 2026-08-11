@@ -496,8 +496,6 @@ class NPUModelRunner(GPUModelRunner):
         # DSA latent offload Route-1 pragmatic (M-B): when enabled, the SFA paged cache
         # holds only the indexer key (latent goes to the self-managed PagedLatentPool),
         # so the per-token page shrinks ~5.5x and GPU KV cache size grows.
-        import vllm_ascend.envs as envs_ascend
-
         self.dsa_free_paged = bool(
             self.use_sparse
             and envs_ascend.VLLM_ASCEND_ENABLE_DSA_LATENT_OFFLOAD
