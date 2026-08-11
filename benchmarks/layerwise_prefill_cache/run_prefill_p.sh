@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+rm -rf /dev/shm/*
+
 MODE="${1:?usage: $0 off|on}"
 case "${MODE}" in
   off) LAYERWISE=false ;;
