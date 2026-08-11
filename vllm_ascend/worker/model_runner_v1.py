@@ -445,6 +445,9 @@ class NPUModelRunner(GPUModelRunner):
                     "dp_rank": self.dp_rank,
                     "device": str(device),
                 },
+                stall_timeout_sec=(
+                    envs_ascend.VLLM_ASCEND_SFA_FLIGHT_STALL_TIMEOUT_SEC
+                ),
             )
             if envs_ascend.VLLM_ASCEND_SFA_FLIGHT_RECORDER
             else None

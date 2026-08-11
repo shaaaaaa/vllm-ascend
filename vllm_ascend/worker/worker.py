@@ -476,15 +476,19 @@ class NPUWorker(WorkerBase):
                 comm_postprocess=comm_postprocess,
             )
 
+        recorder = self.model_runner.sfa_flight_recorder
+        if recorder is not None:
+            recorder.record("execute_model_runner_begin")
         try:
             output = self.model_runner.execute_model(
                 scheduler_output, intermediate_tensors
             )
         except Exception as error:
-            recorder = self.model_runner.sfa_flight_recorder
             if recorder is not None:
                 recorder.dump("execute_model_failed", error)
             raise
+        if recorder is not None:
+            recorder.record("execute_model_runner_end")
         if isinstance(output, (ModelRunnerOutput, AsyncModelRunnerOutput, NoneType)):
             return output
 
@@ -516,13 +520,18 @@ class NPUWorker(WorkerBase):
 
     @torch.inference_mode()
     def sample_tokens(self, grammar_output: "GrammarOutput") -> ModelRunnerOutput | AsyncModelRunnerOutput:
+        recorder = self.model_runner.sfa_flight_recorder
+        if recorder is not None:
+            recorder.record("sample_tokens_begin")
         try:
-            return self.model_runner.sample_tokens(grammar_output)
+            output = self.model_runner.sample_tokens(grammar_output)
         except Exception as error:
-            recorder = self.model_runner.sfa_flight_recorder
             if recorder is not None:
                 recorder.dump("sample_tokens_failed", error)
             raise
+        if recorder is not None:
+            recorder.record("sample_tokens_end")
+        return output
 
     def load_model(self) -> None:
         if self.vllm_config.model_config.enable_sleep_mode:

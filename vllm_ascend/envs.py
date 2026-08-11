@@ -206,6 +206,12 @@ env_variables: dict[str, Callable[[], Any]] = {
         "VLLM_ASCEND_SFA_FLIGHT_RECORDER_DIR",
         "/tmp/vllm_ascend_sfa_flight",
     ),
+    # Seconds without a host-side phase transition before the flight recorder
+    # treats an in-flight SFA operation as stalled and dumps its ring. Set to
+    # zero to disable the watchdog while keeping exception-triggered dumps.
+    "VLLM_ASCEND_SFA_FLIGHT_STALL_TIMEOUT_SEC": lambda: int(
+        os.getenv("VLLM_ASCEND_SFA_FLIGHT_STALL_TIMEOUT_SEC", "180")
+    ),
     # Number of blocks for the self-managed paged latent pool (Route 1). 0 = derive a
     # default from max_num_seqs. The pool holds prefill latent during prefill (freed
     # after) + decode latent, sized far below full-context. Tune up for long prompts.
