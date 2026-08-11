@@ -30,7 +30,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 BASE_PROMPT_TOKENS = 65536
-ON_PROMPT_MULTIPLIERS = (1, 2, 4, 8, 16)
+ON_PROMPT_MULTIPLIERS = (1, 2, 4)
 DEFAULT_CHUNK_SIZE = 8192
 OFF_TIMEOUT_SECONDS = 300.0
 

@@ -28,7 +28,7 @@ BENCHMARK = _load_benchmark_module()
 
 def test_on_uses_prompt_length_sweep_and_separate_output_paths() -> None:
     assert BENCHMARK.prompt_multipliers("off") == (1,)
-    assert BENCHMARK.prompt_multipliers("on") == (1, 2, 4, 8, 16)
+    assert BENCHMARK.prompt_multipliers("on") == (1, 2, 4)
     assert BENCHMARK.case_output_path(Path("on.json"), 8) == Path("on-8x.json")
 
 
@@ -82,7 +82,7 @@ def test_summary_reports_average_chunk_and_total_times() -> None:
 
 @pytest.mark.parametrize(
     ("label", "expected_timeout"),
-    (("off", 300.0), ("on", 4800.0)),
+    (("off", 300.0), ("on", 1200.0)),
 )
 def test_mode_defaults(
     monkeypatch: pytest.MonkeyPatch,
