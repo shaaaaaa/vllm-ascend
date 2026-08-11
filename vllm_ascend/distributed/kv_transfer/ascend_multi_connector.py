@@ -155,7 +155,9 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
                 previous = merged.setdefault(request_id, status)
                 if previous != status:
                     merged[request_id] = "failure"
-        backlog = self._live_split_result_backlog
+        backlog = getattr(self, "_live_split_result_backlog", None)
+        if backlog is None:
+            backlog = self._live_split_result_backlog = {}
         for connector in self._connectors:
             accept_results = getattr(
                 connector, "_accept_live_split_results", None
