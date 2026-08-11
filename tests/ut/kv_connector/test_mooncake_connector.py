@@ -1,3 +1,4 @@
+import contextlib
 import os
 import queue
 import socket
@@ -13,6 +14,7 @@ from unittest.mock import MagicMock, patch
 import msgspec
 import zmq
 from vllm.utils.network_utils import make_zmq_path
+from vllm.v1.request import RequestStatus
 
 fake_engine = types.ModuleType("mooncake.engine")
 fake_engine.TransferEngine = MagicMock()  # type: ignore[attr-defined]
@@ -40,12 +42,33 @@ patch(
     return_value=_mock_pcp_group).start()
 patch('vllm.distributed.parallel_state._DCP', _mock_dcp_group).start()
 
+from vllm_ascend.distributed.kv_transfer.ascend_multi_connector import (  # noqa: E402
+    AscendMultiConnector,
+)
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector import (  # noqa: E402
-    KVCacheRecvingThread, KVCacheSendingThread, KVCacheTaskTracker,
-    KVConnectorRole, MooncakeAgentMetadata, MooncakeConnector,
-    MooncakeConnectorMetadata, MooncakeConnectorScheduler,
-    MooncakeConnectorWorker, ReqMeta, ensure_zmq_recv, ensure_zmq_send,
-    group_concurrent_contiguous, string_to_int64_hash, zmq_ctx)
+    LIVE_SPLIT_CAPABILITY,
+    LIVE_SPLIT_SOURCE_DESCRIPTOR,
+    KVCacheRecvingThread,
+    KVCacheSendingThread,
+    KVCacheTaskTracker,
+    KVConnectorRole,
+    MooncakeAgentMetadata,
+    MooncakeConnector,
+    MooncakeConnectorMetadata,
+    MooncakeConnectorScheduler,
+    MooncakeConnectorWorker,
+    ReqMeta,
+    SplitTransferPlan,
+    SplitTransferSegment,
+    ensure_zmq_recv,
+    ensure_zmq_send,
+    group_concurrent_contiguous,
+    string_to_int64_hash,
+    zmq_ctx,
+)
+from vllm_ascend.distributed.kv_transfer.utils.mooncake_transfer_engine import (  # noqa: E402
+    GlobalTE,
+)
 
 GET_META_MSG = b"get_meta_msg"
 DONE_RECVING_MSG = b"done_recving_msg"
@@ -436,6 +459,192 @@ class TestCoreFunctionality(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             self.thread._transfer_kv_cache(self.test_req)
 
+    @patch(
+        'vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector.global_te.temporary_registration'
+    )
+    def test_split_transfer_exact_cpu_npu_destinations(self, mock_register):
+        mock_register.return_value = contextlib.nullcontext()
+        self.thread.tp_rank = 7
+        self.thread.tp_size = 8
+        self.vllm_config.parallel_config.data_parallel_rank_local = 1
+        self.thread.kv_caches_base_addr["remote_engine"] = {
+            6666: [0x3000, 0x5000]
+        }
+        self.thread.remote_num_blocks["remote_engine"] = {6666: 2}
+        self.thread.remote_buffer_sizes["remote_engine"] = {
+            6666: (4096, 4096)
+        }
+        self.thread.remote_capabilities = {
+            ("remote_engine", 6666): (LIVE_SPLIT_CAPABILITY,)
+        }
+        plan = SplitTransferPlan(
+            segments=(
+                SplitTransferSegment(0, 0, 32, 0x8000, 256, "cpu"),
+                SplitTransferSegment(1, 1, 64, 0xA000, 512, "npu"),
+            ),
+            group_byte_totals=(256, 512),
+            tp_rank=7,
+            dp_rank=1,
+        )
+        request = dict(self.test_req, split_plan=plan)
+
+        self.thread._transfer_kv_cache(request)
+
+        mock_register.assert_called_once_with([0x8000, 0xA000], [256, 512])
+        self.engine.batch_transfer_sync_read.assert_called_once_with(
+            "localhost:7777", [0x8000, 0xA000],
+            [0x3000 + 32, 0x5000 + 64], [256, 512])
+
+    def test_split_transfer_rejects_wrong_dp_rank(self):
+        self.vllm_config.parallel_config.data_parallel_rank_local = 1
+        plan = SplitTransferPlan(
+            segments=(
+                SplitTransferSegment(0, 0, 0, 0x8000, 1, "cpu"),
+                SplitTransferSegment(1, 1, 0, 0xA000, 1, "npu"),
+            ),
+            group_byte_totals=(1, 1),
+            tp_rank=0,
+            dp_rank=0,
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "TP/DP rank mismatch"):
+            self.thread._transfer_kv_cache(dict(self.test_req,
+                                                split_plan=plan))
+
+    @patch(
+        'vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector.global_te.temporary_registration'
+    )
+    def test_index_only_group1_allows_zero_unrequested_group0(
+        self, mock_register
+    ):
+        mock_register.return_value = contextlib.nullcontext()
+        self.vllm_config.parallel_config.data_parallel_rank_local = 0
+        self.thread.kv_caches_base_addr["remote_engine"] = {6666: [0x5000]}
+        self.thread.remote_num_blocks["remote_engine"] = {6666: 2}
+        self.thread.remote_buffer_sizes["remote_engine"] = {6666: (4096,)}
+        self.thread.remote_capabilities = {
+            ("remote_engine", 6666): (LIVE_SPLIT_CAPABILITY,)
+        }
+        plan = SplitTransferPlan(
+            segments=(
+                SplitTransferSegment(1, 0, 64, 0xA000, 512, "npu"),
+            ),
+            group_byte_totals=(0, 512),
+            tp_rank=0,
+            dp_rank=0,
+            requested_groups=(1,),
+        )
+
+        self.thread._transfer_kv_cache(
+            dict(self.test_req, split_plan=plan))
+
+        mock_register.assert_called_once_with([0xA000], [512])
+        self.engine.batch_transfer_sync_read.assert_called_once_with(
+            "localhost:7777", [0xA000], [0x5000 + 64], [512])
+
+    def test_split_rejects_zero_or_missing_requested_group(self):
+        self.vllm_config.parallel_config.data_parallel_rank_local = 0
+        zero_group1 = SplitTransferPlan(
+            segments=(),
+            group_byte_totals=(0, 0),
+            tp_rank=0,
+            dp_rank=0,
+            requested_groups=(1,),
+        )
+        with self.assertRaisesRegex(RuntimeError, "requested split group"):
+            self.thread._transfer_split_destinations(
+                self.test_req, zero_group1)
+
+        missing_group0 = SplitTransferPlan(
+            segments=(
+                SplitTransferSegment(1, 0, 0, 0xA000, 8, "npu"),
+            ),
+            group_byte_totals=(0, 8),
+            tp_rank=0,
+            dp_rank=0,
+            requested_groups=(0, 1),
+        )
+        with self.assertRaisesRegex(RuntimeError, "requested split group"):
+            self.thread._transfer_split_destinations(
+                self.test_req, missing_group0)
+
+    def test_split_queue_backpressure_uses_existing_queue(self):
+        self.thread.request_queue = queue.Queue()
+        for item in range(64):
+            self.thread.request_queue.put(item)
+        plan = SplitTransferPlan((), (0, 0), tp_rank=0, dp_rank=0)
+
+        admitted = self.thread.add_request(
+            request_id="overflow",
+            remote_request_id="remote",
+            local_block_ids=[],
+            remote_block_ids=[],
+            remote_engine_id="remote_engine",
+            remote_host="localhost",
+            remote_handshake_port=6666,
+            offset=0,
+            tp_num_need_pulls=1,
+            split_plan=plan,
+        )
+
+        self.assertFalse(admitted)
+        self.assertEqual(self.thread.request_queue.qsize(), 64)
+
+    def test_split_and_ordinary_requests_keep_fifo_order(self):
+        self.thread.request_queue = queue.Queue()
+        common = dict(
+            local_block_ids=[],
+            remote_block_ids=[],
+            remote_engine_id="remote_engine",
+            remote_host="localhost",
+            remote_handshake_port=6666,
+            offset=0,
+            tp_num_need_pulls=1,
+        )
+        self.thread.add_request("ordinary", "ordinary-remote", **common)
+        plan = SplitTransferPlan((), (0, 0), tp_rank=0, dp_rank=0)
+        self.thread.add_request(
+            "split", "split-remote", split_plan=plan, **common)
+
+        self.assertEqual(self.thread.request_queue.get()["request_id"],
+                         "ordinary")
+        self.assertEqual(self.thread.request_queue.get()["request_id"],
+                         "split")
+
+    @patch.object(KVCacheRecvingThread, '_send_split_done_signal')
+    @patch.object(KVCacheRecvingThread, '_transfer_kv_cache')
+    def test_cancelled_split_is_acked_without_transfer(self, mock_transfer,
+                                                      mock_send):
+        plan = SplitTransferPlan((), (0, 0), tp_rank=0, dp_rank=0)
+        request = dict(self.test_req, split_plan=plan)
+        self.thread.active_split_requests.add("req1")
+        self.assertTrue(self.thread.cancel_split_request("req1"))
+
+        self.thread._handle_request(request)
+
+        mock_transfer.assert_not_called()
+        mock_send.assert_called_once_with("req1", "localhost", 6666,
+                                          "cancelled")
+        self.thread.task_tracker.complete_split_request.assert_called_once_with(
+            "req1", "cancelled", mark_finished=False)
+        self.assertNotIn("req1", self.thread.active_split_requests)
+
+    @patch.object(KVCacheRecvingThread, '_send_split_done_signal')
+    @patch.object(KVCacheRecvingThread, '_transfer_kv_cache')
+    def test_successful_split_waits_for_provider_completion(self, mock_transfer,
+                                                           mock_send):
+        plan = SplitTransferPlan((), (0, 0), tp_rank=0, dp_rank=0)
+        request = dict(self.test_req, split_plan=plan)
+        self.thread.active_split_requests.add("req1")
+
+        self.thread._handle_request(request)
+
+        mock_transfer.assert_called_once_with(request)
+        mock_send.assert_called_once_with("req1", "localhost", 6666,
+                                          "success")
+        self.thread.task_tracker.complete_split_request.assert_called_once_with(
+            "req1", "success", mark_finished=False)
+
 
 class TestMetadataHandling(unittest.TestCase):
 
@@ -674,6 +883,153 @@ class TestKVCacheTaskTracker(unittest.TestCase):
         finished = self.tracker.get_and_clear_finished_requests()
         self.assertEqual(finished, {"req1"})
 
+    def test_split_ack_is_idempotent_and_releases_lease(self):
+        self.tracker.add_req_to_process("req")
+        self.tracker.add_delayed_request("req", time.time(), split=True)
+        self.tracker.complete_split_request("req", "success")
+        self.tracker.complete_split_request("req", "failure")
+
+        self.assertEqual(self.tracker.get_and_clear_split_results(),
+                         {"req": "success"})
+        self.assertNotIn("req", self.tracker.delayed_free_requests)
+        self.assertNotIn("req", self.tracker.reqs_to_process)
+
+    def test_split_lease_timeout_reports_fallback_result(self):
+        self.tracker.add_req_to_process("req")
+        self.tracker.add_delayed_request(
+            "req", time.time() - 600, split=True)
+
+        self.assertEqual(self.tracker._retrieve_expired_requests(), {"req"})
+        self.assertEqual(self.tracker.get_and_clear_split_results(),
+                         {"req": "timeout"})
+
+    def test_reused_split_request_clears_both_terminal_generations(self):
+        for mark_finished in (True, False):
+            with self.subTest(mark_finished=mark_finished):
+                tracker = KVCacheTaskTracker()
+                tracker.add_req_to_process("req")
+                tracker.add_delayed_request("req", time.time(), split=True)
+                tracker.complete_split_request(
+                    "req", "success", mark_finished=mark_finished
+                )
+
+                tracker.add_req_to_process("req")
+                self.assertNotIn("req", tracker.finished_requests)
+                self.assertNotIn("req", tracker.split_terminal_requests)
+                self.assertNotIn("req", tracker.split_results)
+                tracker.add_delayed_request("req", time.time(), split=True)
+                tracker.complete_split_request(
+                    "req", "failure", mark_finished=mark_finished
+                )
+
+                self.assertEqual(
+                    tracker.get_and_clear_split_results(), {"req": "failure"}
+                )
+
+    def test_receive_admission_precedes_immediate_split_completion(self):
+        tracker = KVCacheTaskTracker()
+
+        class ImmediateThread:
+            task_tracker = tracker
+
+            def add_request(self, request_id, **_kwargs):
+                self.assert_admitted = request_id in tracker.reqs_to_process
+                tracker.complete_split_request(
+                    request_id, "success", mark_finished=False
+                )
+                return True
+
+        recv_thread = ImmediateThread()
+        worker = object.__new__(MooncakeConnectorWorker)
+        worker.kv_recv_thread = recv_thread
+        worker.kv_send_thread = None
+        worker._prefill_tp_size = 1
+        worker._prefill_pp_size = 1
+        worker._get_tp_num_need_pulls = lambda _size: 1
+        worker._get_remote_rank = lambda _request_id, _size: [0]
+        worker._get_remote_host_info_by_port = (
+            lambda _base, _port, host, engine, _mapping: (host, engine)
+        )
+        metadata = MooncakeConnectorMetadata()
+        metadata.reqs_in_batch.add("req")
+        metadata.requests["req"] = ReqMeta(
+            local_block_ids=[1],
+            num_external_tokens=1,
+            remote_block_ids=[2],
+            remote_host="host",
+            remote_port=30000,
+            remote_engine_id="engine",
+            remote_request_id="remote-req",
+            remote_pcp_size=1,
+            remote_dcp_size=1,
+            remote_ptp_size=1,
+            remote_multi_nodes_meta_mapping={},
+            num_prompt_blocks=1,
+            split_plan=SplitTransferPlan((), (1, 1), 0, 0),
+            split_negotiated=True,
+        )
+
+        worker.start_load_kv(metadata)
+
+        self.assertTrue(recv_thread.assert_admitted)
+        self.assertEqual(
+            tracker.get_and_clear_split_results(), {"req": "success"}
+        )
+
+
+class TestGlobalTransferEngineRegistration(unittest.TestCase):
+
+    def test_additional_and_contained_regions_are_safe(self):
+        registry = GlobalTE()
+        registry.transfer_engine = MagicMock()
+        registry.transfer_engine.register_memory.return_value = 0
+
+        registry.register_buffer([0x1000], [0x1000])
+        registry.register_buffer([0x1400, 0x4000], [0x100, 0x200])
+
+        self.assertEqual(
+            registry.transfer_engine.register_memory.call_args_list,
+            [unittest.mock.call(0x1000, 0x1000),
+             unittest.mock.call(0x4000, 0x200)])
+
+    def test_partial_registration_overlap_is_rejected(self):
+        registry = GlobalTE()
+        registry.transfer_engine = MagicMock()
+        registry.transfer_engine.register_memory.return_value = 0
+        registry.register_buffer([0x1000], [0x1000])
+
+        with self.assertRaisesRegex(RuntimeError, "partially overlaps"):
+            registry.register_buffer([0x1800], [0x1000])
+
+    def test_temporary_registration_releases_and_allows_address_reuse(self):
+        registry = GlobalTE()
+        registry.transfer_engine = MagicMock()
+        registry.transfer_engine.register_memory.return_value = 0
+        registry.transfer_engine.unregister_memory.return_value = 0
+
+        with registry.temporary_registration([0x8000], [0x100]):
+            self.assertEqual(registry.registered_buffers[0x8000], 0x100)
+        with registry.temporary_registration([0x8000], [0x200]):
+            self.assertEqual(registry.registered_buffers[0x8000], 0x200)
+
+        self.assertNotIn(0x8000, registry.registered_buffers)
+        self.assertEqual(
+            registry.transfer_engine.unregister_memory.call_args_list,
+            [unittest.mock.call(0x8000), unittest.mock.call(0x8000)],
+        )
+
+    def test_temporary_registration_does_not_release_persistent_buffer(self):
+        registry = GlobalTE()
+        registry.transfer_engine = MagicMock()
+        registry.transfer_engine.register_memory.return_value = 0
+        registry.register_buffer([0x1000], [0x1000])
+
+        with registry.temporary_registration([0x1400], [0x100]):
+            pass
+
+        registry.transfer_engine.unregister_memory.assert_not_called()
+        self.assertEqual(registry.registered_buffers, {0x1000: 0x1000})
+
 
 class TestMooncakeConnectorMetadata(unittest.TestCase):
 
@@ -704,6 +1060,578 @@ class TestMooncakeConnectorMetadata(unittest.TestCase):
         self.assertEqual(req_meta.remote_host, "localhost")
         self.assertEqual(req_meta.remote_port, 5000)
         self.assertEqual(req_meta.remote_ptp_size, 2)
+
+    def test_add_split_destination_plan(self):
+        meta = MooncakeConnectorMetadata()
+        meta.add_new_req(
+            request_id="req-split",
+            local_block_ids=[1],
+            num_external_tokens=16,
+            kv_transfer_params={
+                "remote_block_ids": [2],
+                "remote_engine_id": "remote",
+                "remote_request_id": "remote-req",
+                "remote_host": "host",
+                "remote_port": 30000,
+                LIVE_SPLIT_CAPABILITY: {
+                    "segments": [{
+                        "group_id": 0,
+                        "source_buffer_index": 0,
+                        "source_offset": 0,
+                        "destination_address": 0x1000,
+                        "length": 256,
+                        "destination_kind": "cpu",
+                    }, {
+                        "group_id": 1,
+                        "source_buffer_index": 1,
+                        "source_offset": 128,
+                        "destination_address": 0x2000,
+                        "length": 128,
+                        "destination_kind": "npu",
+                    }],
+                    "group_byte_totals": [256, 128],
+                    "tp_rank": 7,
+                    "dp_rank": 1,
+                },
+            })
+
+        plan = meta.requests["req-split"].split_plan
+        self.assertIsNotNone(plan)
+        self.assertEqual(plan.group_byte_totals, (256, 128))
+        self.assertEqual((plan.tp_rank, plan.dp_rank), (7, 1))
+
+    def test_missing_late_plan_selects_persistent_fallback(self):
+        meta = MooncakeConnectorMetadata()
+        meta.add_new_req(
+            request_id="req-late",
+            local_block_ids=[1],
+            num_external_tokens=16,
+            kv_transfer_params={
+                "remote_block_ids": [2],
+                "remote_engine_id": "remote",
+                "remote_request_id": "remote-req",
+                "remote_host": "host",
+                "remote_port": 30000,
+                "live_split_capabilities": (LIVE_SPLIT_CAPABILITY,),
+            })
+
+        self.assertTrue(meta.needs_late_split_plans())
+        meta.accept_late_split_plans({})
+
+        request = meta.requests["req-late"]
+        self.assertTrue(request.split_fallback)
+        self.assertIsNone(request.split_plan)
+
+    def test_short_group_totals_select_persistent_fallback(self):
+        metadata = MooncakeConnectorMetadata()
+        metadata.add_new_req(
+            request_id="req-invalid",
+            local_block_ids=[1],
+            num_external_tokens=16,
+            kv_transfer_params={
+                "remote_block_ids": [2],
+                "remote_engine_id": "remote",
+                "remote_request_id": "remote-req",
+                "remote_host": "host",
+                "remote_port": 30000,
+                "live_split_capabilities": (LIVE_SPLIT_CAPABILITY,),
+            })
+
+        metadata.accept_late_split_plans({"req-invalid": {
+            "segments": [],
+            "group_byte_totals": [0],
+            "tp_rank": 0,
+            "dp_rank": 0,
+        }})
+
+        request = metadata.requests["req-invalid"]
+        self.assertTrue(request.split_fallback)
+        self.assertIsNone(request.split_plan)
+
+    def test_index_only_plan_never_routes_group0(self):
+        meta = MooncakeConnectorMetadata()
+        meta.add_new_req(
+            request_id="req-index",
+            local_block_ids=[1],
+            num_external_tokens=16,
+            kv_transfer_params={
+                "remote_block_ids": [2],
+                "remote_engine_id": "remote",
+                "remote_request_id": "remote-req",
+                "remote_host": "host",
+                "remote_port": 30000,
+                "live_split_capabilities": (LIVE_SPLIT_CAPABILITY,),
+            })
+        meta.accept_late_split_plans({"req-index": {
+            "segments": [{
+                "group_id": 0,
+                "source_buffer_index": 0,
+                "source_offset": 0,
+                "destination_address": 0x1000,
+                "length": 16,
+                "destination_kind": "cpu",
+            }, {
+                "group_id": 1,
+                "source_buffer_index": 0,
+                "source_offset": 0,
+                "destination_address": 0x2000,
+                "length": 8,
+                "destination_kind": "npu",
+            }],
+            "group_byte_totals": [16, 8],
+            "tp_rank": 0,
+            "dp_rank": 0,
+        }}, supported_groups=(1,))
+
+        plan = meta.requests["req-index"].split_plan
+        self.assertIsNotNone(plan)
+        self.assertEqual(plan.requested_groups, (1,))
+        self.assertEqual(plan.group_byte_totals, (0, 8))
+        self.assertEqual([segment.group_id for segment in plan.segments], [1])
+
+    def test_prefiller_source_is_stream_merged_with_different_dest_pools(self):
+        metadata = MooncakeConnectorMetadata()
+        metadata.add_new_req(
+            "req", [1], 16, {
+                "remote_block_ids": [9, 11],
+                "remote_engine_id": "remote",
+                "remote_request_id": "remote-req",
+                "remote_host": "host",
+                "remote_port": 30000,
+                "live_split_capabilities": (LIVE_SPLIT_CAPABILITY,),
+                LIVE_SPLIT_SOURCE_DESCRIPTOR: {
+                    "segments": [
+                        {"group_id": 0, "source_buffer_index": 2,
+                         "source_buffer_base": 0x5000,
+                         "source_offset": 96, "length": 12},
+                        {"group_id": 0, "source_buffer_index": 4,
+                         "source_buffer_base": 0x9000,
+                         "source_offset": 32, "length": 20},
+                        {"group_id": 1, "source_buffer_index": 5,
+                         "source_buffer_base": 0xB000,
+                         "source_offset": 64, "length": 8},
+                    ],
+                    "group_byte_totals": [32, 8],
+                    "tp_rank": 3, "dp_rank": 1,
+                },
+            })
+        metadata.accept_late_split_plans({"req": {
+            "segments": [
+                {"group_id": 0, "destination_address": 0x1000,
+                 "length": 16, "destination_kind": "cpu"},
+                {"group_id": 0, "destination_address": 0x3000,
+                 "length": 16, "destination_kind": "cpu"},
+                {"group_id": 1, "destination_address": 0x7000,
+                 "length": 8, "destination_kind": "npu"},
+            ],
+            "group_byte_totals": [32, 8],
+            "tp_rank": 3, "dp_rank": 1,
+        }})
+
+        plan = metadata.requests["req"].split_plan
+        self.assertIsNotNone(plan)
+        self.assertEqual(
+            [(s.source_buffer_index, s.source_offset,
+              s.destination_address, s.length) for s in plan.segments],
+            [(2, 96, 0x1000, 12), (4, 32, 0x100C, 4),
+             (4, 36, 0x3000, 16), (5, 64, 0x7000, 8)],
+        )
+
+    def test_source_descriptor_rank_mismatch_falls_back(self):
+        metadata = MooncakeConnectorMetadata()
+        params = {
+            "remote_block_ids": [1], "remote_engine_id": "remote",
+            "remote_request_id": "remote-req", "remote_host": "host",
+            "remote_port": 30000,
+            "live_split_capabilities": (LIVE_SPLIT_CAPABILITY,),
+            LIVE_SPLIT_SOURCE_DESCRIPTOR: {
+                "segments": [{"group_id": 1, "source_buffer_index": 0,
+                              "source_buffer_base": 0x5000,
+                              "source_offset": 0, "length": 8}],
+                "group_byte_totals": [0, 8], "tp_rank": 0, "dp_rank": 0,
+            },
+        }
+        metadata.add_new_req("req", [1], 16, params)
+        metadata.accept_late_split_plans({"req": {
+            "segments": [{"group_id": 1,
+                          "destination_address": 0x9000, "length": 8,
+                          "destination_kind": "npu"}],
+            "group_byte_totals": [0, 8], "tp_rank": 1, "dp_rank": 0,
+            "requested_groups": [1],
+        }}, supported_groups=(1,))
+        self.assertTrue(metadata.requests["req"].split_fallback)
+        self.assertIsNone(metadata.requests["req"].split_plan)
+
+    def test_malformed_source_descriptor_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "source byte totals"):
+            MooncakeConnectorMetadata._parse_source_descriptor({
+                "segments": [{"group_id": 0, "source_buffer_index": 0,
+                              "source_buffer_base": 0x1000,
+                              "source_offset": 0, "length": 7}],
+                "group_byte_totals": [8, 0], "tp_rank": 0, "dp_rank": 0,
+            })
+
+    def test_malformed_received_source_uses_persistent_fallback(self):
+        metadata = MooncakeConnectorMetadata()
+        metadata.add_new_req("req", [1], 16, {
+            "remote_block_ids": [1], "remote_engine_id": "remote",
+            "remote_request_id": "remote-req", "remote_host": "host",
+            "remote_port": 30000,
+            "live_split_capabilities": (LIVE_SPLIT_CAPABILITY,),
+            LIVE_SPLIT_SOURCE_DESCRIPTOR: {
+                "segments": [], "group_byte_totals": [1, 0],
+                "tp_rank": 0, "dp_rank": 0,
+            },
+        })
+        metadata.accept_late_split_plans({"req": {}})
+        self.assertTrue(metadata.requests["req"].split_fallback)
+        self.assertIsNone(metadata.requests["req"].split_plan)
+
+
+class TestAscendMultiLateSplitInjection(unittest.TestCase):
+
+    def _assert_scheduler_live_provider_runs_first(self, provider_first):
+        events = []
+        request = types.SimpleNamespace(
+            request_id="req",
+            kv_transfer_params={"do_remote_decode": True},
+        )
+
+        class Provider:
+            supports_dsa_compact_external_load = True
+
+            def request_finished(self, req, _block_ids):
+                events.append("provider")
+                req.kv_transfer_params["request_live_split"] = True
+                return False, None
+
+        class Consumer:
+            def request_finished(self, req, _block_ids):
+                self.assert_live = req.kv_transfer_params.get(
+                    "request_live_split", False
+                )
+                events.append("consumer")
+                return False, None
+
+        provider = Provider()
+        consumer = Consumer()
+        multi = object.__new__(AscendMultiConnector)
+        multi._connectors = (
+            [provider, consumer] if provider_first else [consumer, provider]
+        )
+        multi._extra_async_saves = {}
+        multi._requests_to_connector = {}
+        multi._index_load_async_req_ids = set()
+
+        multi.request_finished_all_groups(request, ([1],))
+
+        self.assertEqual(events, ["provider", "consumer"])
+        self.assertTrue(consumer.assert_live)
+
+    def test_scheduler_live_negotiation_provider_first(self):
+        self._assert_scheduler_live_provider_runs_first(True)
+
+    def test_scheduler_live_negotiation_consumer_first(self):
+        self._assert_scheduler_live_provider_runs_first(False)
+
+    def test_scheduler_non_live_preserves_configured_order(self):
+        events = []
+
+        class Child:
+            def __init__(self, name, capable=False):
+                self.name = name
+                self.supports_dsa_compact_external_load = capable
+
+            def request_finished(self, _request, _block_ids):
+                events.append(self.name)
+                return False, None
+
+        multi = object.__new__(AscendMultiConnector)
+        multi._connectors = [Child("first"), Child("second", capable=True)]
+        multi._extra_async_saves = {}
+        multi._requests_to_connector = {}
+        multi._index_load_async_req_ids = set()
+        request = types.SimpleNamespace(request_id="req", kv_transfer_params={})
+
+        multi.request_finished_all_groups(request, ([1],))
+
+        self.assertEqual(events, ["first", "second"])
+
+    def test_worker_plan_is_taken_after_provider_allocation(self):
+        events = []
+        metadata = MooncakeConnectorMetadata()
+        metadata.add_new_req(
+            request_id="req",
+            local_block_ids=[1],
+            num_external_tokens=16,
+            kv_transfer_params={
+                "remote_block_ids": [2],
+                "remote_engine_id": "remote",
+                "remote_request_id": "remote-req",
+                "remote_host": "host",
+                "remote_port": 30000,
+                "live_split_capabilities": (LIVE_SPLIT_CAPABILITY,),
+            })
+        plan = {
+            "segments": [{
+                "group_id": 0,
+                "source_buffer_index": 0,
+                "source_offset": 0,
+                "destination_address": 0x1000,
+                "length": 16,
+                "destination_kind": "cpu",
+            }, {
+                "group_id": 1,
+                "source_buffer_index": 1,
+                "source_offset": 0,
+                "destination_address": 0x2000,
+                "length": 8,
+                "destination_kind": "npu",
+            }],
+            "group_byte_totals": [16, 8],
+            "tp_rank": 0,
+            "dp_rank": 0,
+        }
+
+        class Provider:
+            allocated = False
+
+            def start_load_kv(self, _forward_context, **_kwargs):
+                self.allocated = True
+                events.append("allocated")
+
+            def _take_live_split_destination_plans(self):
+                assert self.allocated
+                events.append("taken")
+                return {"req": plan}
+
+        class Consumer:
+            def _needs_live_split_destination_plans(self):
+                return metadata.needs_late_split_plans()
+
+            def _accept_live_split_destination_plans(self, plans):
+                events.append("accepted")
+                metadata.accept_late_split_plans(plans)
+
+            def start_load_kv(self, _forward_context, **_kwargs):
+                assert metadata.requests["req"].split_plan is not None
+                events.append("mooncake-started")
+
+        multi = object.__new__(AscendMultiConnector)
+        multi._connectors = [Consumer(), Provider()]
+
+        multi.start_load_kv(object())
+
+        self.assertEqual(events, [
+            "allocated", "taken", "accepted", "mooncake-started"
+        ])
+
+    def test_results_reach_provider_once_and_duplicate_drain_is_empty(self):
+        delivered = []
+
+        class Source:
+            results = [{"ok": "success", "bad": "failure"}, {}]
+
+            def get_live_split_results(self):
+                return self.results.pop(0)
+
+        class Provider:
+            def _accept_live_split_results(self, results):
+                delivered.append(results)
+
+        multi = object.__new__(AscendMultiConnector)
+        multi._connectors = [Provider(), Source()]
+
+        first = multi.get_live_split_results()
+        second = multi.get_live_split_results()
+
+        self.assertEqual(first, {"ok": "success", "bad": "failure"})
+        self.assertEqual(second, {})
+        self.assertEqual(delivered, [first])
+
+    def test_standard_finished_poll_delivers_ack_without_early_completion(self):
+        delivered = []
+
+        class Source:
+            results = [{"req": "success"}, {}]
+
+            def get_finished(self, _finished_req_ids):
+                return None, None
+
+            def get_live_split_results(self):
+                return self.results.pop(0)
+
+        class Provider:
+            def get_finished(self, _finished_req_ids):
+                return None, None
+
+            def _accept_live_split_results(self, results):
+                delivered.append(results)
+
+        multi = object.__new__(AscendMultiConnector)
+        multi._connectors = [Provider(), Source()]
+        multi._extra_async_saves = {}
+
+        first = multi.get_finished(set())
+        second = multi.get_finished(set())
+
+        self.assertEqual(first, (None, None))
+        self.assertEqual(second, (None, None))
+        self.assertEqual(delivered, [{"req": "success"}])
+
+    @patch(
+        'vllm_ascend.distributed.kv_transfer.ascend_multi_connector.logger'
+    )
+    def test_index_only_consumer_requires_group0_persistent_fallback(
+        self, mock_logger
+    ):
+        events = []
+
+        class Provider:
+            def start_load_kv(self, _forward_context, **_kwargs):
+                events.append("persistent-started")
+
+            def _take_live_split_destination_plans(self):
+                events.append("unsafe-take")
+                return {"req": {}}
+
+        class IndexConsumer:
+            accepted = None
+
+            def _needs_live_split_destination_plans(self):
+                return True
+
+            def _accept_live_split_destination_plans(self, plans):
+                self.accepted = plans
+
+            def _live_split_source_groups(self):
+                return (1,)
+
+            def start_load_kv(self, _forward_context, **_kwargs):
+                events.append("index-started")
+
+        consumer = IndexConsumer()
+        multi = object.__new__(AscendMultiConnector)
+        multi._connectors = [consumer, Provider()]
+
+        multi.start_load_kv(object())
+
+        self.assertEqual(events, ["persistent-started", "index-started"])
+        self.assertEqual(consumer.accepted, {})
+        mock_logger.warning.assert_called_once()
+
+    def test_group_aware_provider_enables_index_only_plan(self):
+        handled = []
+
+        class Provider:
+            def start_load_kv(self, _forward_context, **_kwargs):
+                pass
+
+            def _take_live_split_destination_plans(self, handled_groups):
+                handled.append(handled_groups)
+                return {"req": "group1-plan"}
+
+        class IndexConsumer:
+            accepted = None
+
+            def _needs_live_split_destination_plans(self):
+                return True
+
+            def _accept_live_split_destination_plans(self, plans):
+                self.accepted = plans
+
+            def _live_split_source_groups(self):
+                return (1,)
+
+            def start_load_kv(self, _forward_context, **_kwargs):
+                pass
+
+        consumer = IndexConsumer()
+        multi = object.__new__(AscendMultiConnector)
+        multi._connectors = [Provider(), consumer]
+
+        multi.start_load_kv(object())
+
+        self.assertEqual(handled, [(1,)])
+        self.assertEqual(consumer.accepted, {"req": "group1-plan"})
+
+    @patch(
+        'vllm_ascend.distributed.kv_transfer.ascend_multi_connector.logger'
+    )
+    def test_result_provider_exception_preserves_failure_fallback(
+        self, mock_logger
+    ):
+        delivered = []
+
+        class Source:
+            def get_live_split_results(self):
+                return {"bad": "failure"}
+
+        class BrokenProvider:
+            def _accept_live_split_results(self, _results):
+                raise RuntimeError("provider failed")
+
+        class HealthyProvider:
+            def _accept_live_split_results(self, results):
+                delivered.append(results)
+
+        multi = object.__new__(AscendMultiConnector)
+        multi._connectors = [BrokenProvider(), Source(), HealthyProvider()]
+
+        results = multi.get_live_split_results()
+
+        self.assertEqual(results, {"bad": "failure"})
+        self.assertEqual(delivered, [results])
+        mock_logger.exception.assert_called_once()
+
+    def test_finished_poll_retries_only_failed_result_provider(self):
+        broken_deliveries = []
+        healthy_deliveries = []
+
+        class Source:
+            results = [{"req": "success"}, {}]
+
+            def get_finished(self, _finished_req_ids):
+                return None, None
+
+            def get_live_split_results(self):
+                return self.results.pop(0)
+
+        class RetryProvider:
+            attempts = 0
+
+            def get_finished(self, _finished_req_ids):
+                return None, None
+
+            def _accept_live_split_results(self, results):
+                self.attempts += 1
+                if self.attempts == 1:
+                    raise RuntimeError("retry")
+                broken_deliveries.append(results)
+
+        class HealthyProvider:
+            def get_finished(self, _finished_req_ids):
+                return None, None
+
+            def _accept_live_split_results(self, results):
+                healthy_deliveries.append(results)
+
+        retry = RetryProvider()
+        multi = object.__new__(AscendMultiConnector)
+        multi._connectors = [retry, Source(), HealthyProvider()]
+        multi._extra_async_saves = {}
+        multi._live_split_result_backlog = {}
+
+        multi.get_finished(set())
+        self.assertEqual(retry.attempts, 1)
+        self.assertEqual(healthy_deliveries, [{"req": "success"}])
+        self.assertTrue(multi._live_split_result_backlog)
+
+        multi.get_finished(set())
+        self.assertEqual(retry.attempts, 2)
+        self.assertEqual(broken_deliveries, [{"req": "success"}])
+        self.assertEqual(healthy_deliveries, [{"req": "success"}])
+        self.assertEqual(multi._live_split_result_backlog, {})
 
 
 class TestMooncakeConnectorSchedulerMatchedTokens(unittest.TestCase):
@@ -953,6 +1881,29 @@ class TestMooncakeConnectorScheduler(unittest.TestCase):
             request, [1, 2, 3])
         self.assertFalse(delay_free)
         self.assertIsNone(params)
+
+    def test_request_finished_forwards_prefiller_source_descriptor(self):
+        source = {
+            "segments": [{"group_id": 1, "source_buffer_index": 3,
+                          "source_buffer_base": 0x9000,
+                          "source_offset": 128, "length": 24}],
+            "group_byte_totals": [0, 24], "tp_rank": 1, "dp_rank": 0,
+        }
+        request = MockRequest(
+            "req1",
+            kv_transfer_params={
+                "do_remote_decode": True,
+                "request_live_split": True,
+                LIVE_SPLIT_SOURCE_DESCRIPTOR: source,
+            },
+            status=RequestStatus.FINISHED_LENGTH_CAPPED,
+        )
+
+        delay_free, params = self.scheduler.request_finished(request, [7, 9])
+
+        self.assertTrue(delay_free)
+        self.assertEqual(params[LIVE_SPLIT_SOURCE_DESCRIPTOR], source)
+        self.assertIsNot(params[LIVE_SPLIT_SOURCE_DESCRIPTOR], source)
 
 
 class TestUtils(unittest.TestCase):

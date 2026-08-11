@@ -20,6 +20,7 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector imp
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
     from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
+    from vllm.forward_context import ForwardContext
     from vllm.v1.kv_cache_interface import KVCacheConfig
     from vllm.v1.request import Request
 
@@ -98,6 +99,48 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
     # caches so this connector can route them to different children.
     requires_full_dsa_kv_caches = True
 
+    def get_live_split_results(self) -> dict[str, str]:
+        merged: dict[str, str] = {}
+        for connector in self._connectors:
+            get_results = getattr(connector, "get_live_split_results", None)
+            if not callable(get_results):
+                continue
+            for request_id, status in get_results().items():
+                previous = merged.setdefault(request_id, status)
+                if previous != status:
+                    merged[request_id] = "failure"
+        backlog = self._live_split_result_backlog
+        for connector in self._connectors:
+            accept_results = getattr(
+                connector, "_accept_live_split_results", None
+            )
+            if not callable(accept_results):
+                continue
+            provider_id = id(connector)
+            pending = backlog.pop(provider_id, {})
+            for request_id, status in merged.items():
+                previous = pending.setdefault(request_id, status)
+                if previous != status:
+                    pending[request_id] = "failure"
+            if not pending:
+                continue
+            try:
+                accept_results(dict(pending))
+            except Exception:
+                backlog[provider_id] = pending
+                logger.exception(
+                    "Live-split result provider failed; preserving status "
+                    "for persistent fallback"
+                )
+        return merged
+
+    def get_finished(
+        self, finished_req_ids: set[str]
+    ) -> tuple[set[str] | None, set[str] | None]:
+        finished = super().get_finished(finished_req_ids)
+        self.get_live_split_results()
+        return finished
+
     def __init__(
         self,
         vllm_config: "VllmConfig",
@@ -135,6 +178,7 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
         # MultiConnector while allowing legacy child connector constructors.
         self._extra_async_saves: dict[str, int] = {}
         self._index_load_async_req_ids: set[str] = set()
+        self._live_split_result_backlog: dict[int, dict[str, str]] = {}
         self._wait_for_layer_load_sig_cache: dict[
             tuple[type, int, tuple[str, ...]], bool
         ] = {}
@@ -207,6 +251,79 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
                 connector.register_kv_caches(kv_caches)
             else:
                 connector.register_kv_caches(latent_only)
+
+    def start_load_kv(
+        self, forward_context: "ForwardContext", **kwargs: Any
+    ) -> None:
+        late_consumers = [
+            connector
+            for connector in self._connectors
+            if callable(
+                getattr(
+                    connector, "_accept_live_split_destination_plans", None
+                )
+            )
+            and callable(
+                getattr(
+                    connector, "_needs_live_split_destination_plans", None
+                )
+            )
+            and connector._needs_live_split_destination_plans()
+        ]
+        if not late_consumers:
+            for connector in self._connectors:
+                connector.start_load_kv(forward_context, **kwargs)
+            return
+
+        handled_groups: set[int] = set()
+        for connector in late_consumers:
+            get_groups = getattr(connector, "_live_split_source_groups", None)
+            handled_groups.update(
+                get_groups() if callable(get_groups) else (0, 1)
+            )
+        unhandled_groups = {0, 1} - handled_groups
+
+        providers = []
+        for connector in self._connectors:
+            if connector in late_consumers:
+                continue
+            connector.start_load_kv(forward_context, **kwargs)
+            take_plans = getattr(
+                connector, "_take_live_split_destination_plans", None
+            )
+            if callable(take_plans):
+                accepts_groups = _callable_accepts_args(
+                    take_plans, 1, set()
+                )
+                if unhandled_groups and not accepts_groups:
+                    logger.warning(
+                        "Live-split provider cannot acknowledge unhandled "
+                        "groups %s; using persistent fallback",
+                        sorted(unhandled_groups),
+                    )
+                    continue
+                providers.append((take_plans, accepts_groups))
+
+        plans: dict[str, Any] = {}
+        for take_plans, accepts_groups in providers:
+            try:
+                provided = (
+                    take_plans(tuple(sorted(handled_groups)))
+                    if accepts_groups
+                    else take_plans()
+                )
+                if provided:
+                    plans.update(provided)
+            except Exception:
+                logger.exception(
+                    "Live-split destination provider failed; using persistent fallback"
+                )
+                plans.clear()
+                break
+
+        for connector in late_consumers:
+            connector._accept_live_split_destination_plans(plans)
+            connector.start_load_kv(forward_context, **kwargs)
 
     def wait_for_layer_load(
         self,
@@ -369,7 +486,33 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
         async_saves = 0
         kv_transfer_params: dict[str, Any] | None = None
 
-        for connector in self._connectors:
+        connectors = self._connectors
+        params = getattr(request, "kv_transfer_params", None)
+        if isinstance(params, dict) and params.get("do_remote_decode"):
+            live_providers = []
+            for connector in connectors:
+                capability = getattr(
+                    connector, "supports_dsa_compact_external_load", False
+                )
+                try:
+                    capable = bool(
+                        capability() if callable(capability) else capability
+                    )
+                except Exception:
+                    logger.exception(
+                        "Live-split scheduler capability probe failed"
+                    )
+                    capable = False
+                if capable:
+                    live_providers.append(connector)
+            if live_providers:
+                connectors = live_providers + [
+                    connector
+                    for connector in connectors
+                    if connector not in live_providers
+                ]
+
+        for connector in connectors:
             if isinstance(connector, SupportsHMA):
                 async_save, txfer_params = connector.request_finished_all_groups(
                     request, block_ids
@@ -381,6 +524,17 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
 
             if async_save:
                 async_saves += 1
+            # The compact provider runs before Mooncake. Pass its opaque source
+            # layout to Mooncake for registration validation/canonicalization;
+            # only Mooncake's canonical descriptor is returned downstream.
+            if (
+                isinstance(params, dict)
+                and isinstance(txfer_params, dict)
+                and "ascend_live_split_source_v1" in txfer_params
+            ):
+                params["ascend_live_split_source_v1"] = txfer_params.pop(
+                    "ascend_live_split_source_v1"
+                )
             kv_transfer_params = self._merge_kv_transfer_params(
                 kv_transfer_params, txfer_params
             )

@@ -62,6 +62,11 @@ if TYPE_CHECKING:
 
 GET_META_MSG = b"get_meta_msg"
 DONE_RECVING_MSG = b"done_recving_msg"
+SPLIT_DONE_MSG = b"split_done_msg_v1"
+LIVE_SPLIT_CAPABILITY = "ascend_live_split_v1"
+LIVE_SPLIT_SOURCE_DESCRIPTOR = "ascend_live_split_source_v1"
+MAX_PENDING_SPLIT_REQUESTS = 64
+MAX_TASK_HISTORY_SIZE = 16000
 
 
 class RemotePortInfo(TypedDict):
@@ -75,6 +80,52 @@ class MooncakeAgentMetadata(msgspec.Struct, omit_defaults=True, dict=True):
     kv_caches_base_addr: list[int]
     num_blocks: int
     local_ip: str = ""
+    capabilities: tuple[str, ...] = ()
+    kv_caches_buffer_sizes: tuple[int, ...] = ()
+    buffer_group_ids: tuple[int, ...] = ()
+    tp_rank: int = 0
+    dp_rank: int = 0
+
+
+@dataclass(frozen=True)
+class SplitTransferSegment:
+    """One registered local destination and its remote KV source extent."""
+
+    group_id: int
+    source_buffer_index: int
+    source_offset: int
+    destination_address: int
+    length: int
+    destination_kind: str
+    source_buffer_base: int | None = None
+
+
+@dataclass(frozen=True)
+class SplitSourceSegment:
+    """Opaque prefiller-owned extent in a registered source buffer."""
+
+    group_id: int
+    source_buffer_index: int
+    source_buffer_base: int
+    source_offset: int
+    length: int
+
+
+@dataclass(frozen=True)
+class SplitSourceDescriptor:
+    segments: tuple[SplitSourceSegment, ...]
+    group_byte_totals: tuple[int, int]
+    tp_rank: int
+    dp_rank: int
+
+
+@dataclass(frozen=True)
+class SplitTransferPlan:
+    segments: tuple[SplitTransferSegment, ...]
+    group_byte_totals: tuple[int, int]
+    tp_rank: int
+    dp_rank: int
+    requested_groups: tuple[int, ...] = (0, 1)
 
 
 @dataclass
@@ -91,6 +142,11 @@ class ReqMeta:
     remote_ptp_size: int | None
     remote_multi_nodes_meta_mapping: dict[str, dict[str, Any]]
     num_prompt_blocks: int
+    split_plan: SplitTransferPlan | None = None
+    split_negotiated: bool = False
+    split_fallback: bool = False
+    split_source: tuple[SplitSourceDescriptor, ...] | None = None
+    split_source_invalid: bool = False
 
 
 @dataclass
@@ -125,9 +181,20 @@ class KVCacheTaskTracker:
         # be force-freed.
         self.delayed_free_requests: OrderedDict[str, float] = OrderedDict()
         self.reqs_to_process: set[str] = set()
+        self.split_results: dict[str, str] = {}
+        self.split_leases: set[str] = set()
+        self.split_terminal_requests: OrderedDict[str, None] = OrderedDict()
 
     def add_req_to_process(self, request_id: str):
-        self.reqs_to_process.add(request_id)
+        with self.done_task_lock:
+            if request_id in self.reqs_to_process:
+                return
+            self.finished_requests.discard(request_id)
+            self.delayed_free_requests.pop(request_id, None)
+            self.split_results.pop(request_id, None)
+            self.split_leases.discard(request_id)
+            self.split_terminal_requests.pop(request_id, None)
+            self.reqs_to_process.add(request_id)
 
     def add_not_transfer_request(self, request_id: str):
         with self.done_task_lock:
@@ -146,6 +213,29 @@ class KVCacheTaskTracker:
                     "If it is a P node, this request may have been force freed."
                 )
 
+    def complete_split_request(
+        self, request_id: str, status: str, mark_finished: bool = True
+    ):
+        """Record one terminal ACK; duplicate ACKs are harmless."""
+        with self.done_task_lock:
+            if request_id in self.split_terminal_requests:
+                return
+            self.split_terminal_requests[request_id] = None
+            if len(self.split_terminal_requests) > MAX_TASK_HISTORY_SIZE:
+                self.split_terminal_requests.popitem(last=False)
+            self.split_results[request_id] = status
+            if mark_finished:
+                self.finished_requests.add(request_id)
+            self.reqs_to_process.discard(request_id)
+            self.delayed_free_requests.pop(request_id, None)
+            self.split_leases.discard(request_id)
+
+    def get_and_clear_split_results(self) -> dict[str, str]:
+        with self.done_task_lock:
+            results = dict(self.split_results)
+            self.split_results.clear()
+            return results
+
     def get_and_clear_finished_requests(self) -> set[str]:
         """
         Get and clear the requests that have been completed.
@@ -159,11 +249,15 @@ class KVCacheTaskTracker:
             self.finished_requests.clear()
         return finished_requests
 
-    def add_delayed_request(self, request_id: str, delay_start_time: float):
+    def add_delayed_request(
+        self, request_id: str, delay_start_time: float, split: bool = False
+    ):
         """Add a delayed free request."""
         with self.done_task_lock:
             if request_id in self.reqs_to_process:
                 self.delayed_free_requests[request_id] = delay_start_time
+                if split:
+                    self.split_leases.add(request_id)
 
     def _retrieve_expired_requests(self):
         """Retrieve all expired delayed requests."""
@@ -177,6 +271,10 @@ class KVCacheTaskTracker:
                 self.delayed_free_requests.popitem(last=False)
                 self.reqs_to_process.discard(request_id)
                 expired_requests.add(request_id)
+                if request_id in self.split_leases:
+                    self.split_results.setdefault(request_id, "timeout")
+                    self.split_leases.discard(request_id)
+                    self.split_terminal_requests[request_id] = None
                 logger.info("Force freed request: %s", request_id)
             else:
                 break
@@ -225,8 +323,11 @@ class KVCacheSendingThread(threading.Thread):
     def add_not_transfer_request(self, request_id: str):
         self.task_tracker.add_not_transfer_request(request_id)
 
-    def add_delayed_request(self, request_id: str, delay_start_time: float):
-        return self.task_tracker.add_delayed_request(request_id, delay_start_time)
+    def add_delayed_request(
+        self, request_id: str, delay_start_time: float, split: bool = False
+    ):
+        return self.task_tracker.add_delayed_request(
+            request_id, delay_start_time, split=split)
 
     def run(self):
         """Run the thread to handle KV cache transfer requests."""
@@ -293,6 +394,18 @@ class KVCacheSendingThread(threading.Thread):
                             # If the socket is not ready, retry sending.
                             logger.debug("Socket not ready, retrying to send ACK for request %s", msg[1])
                             time.sleep(0.01)
+                elif msg[0] == SPLIT_DONE_MSG:
+                    request_id, status = msg[1], msg[2]
+                    if status not in ("success", "failure", "cancelled", "fallback"):
+                        status = "failure"
+                    self.task_tracker.complete_split_request(request_id, status)
+                    while True:
+                        try:
+                            sock.send_multipart(
+                                (identity, b"", b"ACK"), flags=zmq.NOBLOCK)
+                            break
+                        except zmq.Again:
+                            time.sleep(0.01)
                 else:
                     logger.error("Connection listener got unexpected message %s", msg)
             except Exception as e:
@@ -330,12 +443,19 @@ class KVCacheRecvingThread(threading.Thread):
         self.kv_caches_base_addr: dict[str, dict[int, list[int]]] = SizedDict()
         self.kv_caches_base_addr[local_engine_id][local_handshake_port] = local_kv_caches_base_addr
         self.remote_te_port: dict[str, dict[int, int]] = SizedDict()
+        self.remote_num_blocks: dict[str, dict[int, int]] = SizedDict()
+        self.remote_buffer_sizes: dict[str, dict[int, tuple[int, ...]]] = (
+            SizedDict()
+        )
         self.block_len = block_len
         # TODO(jianzs): find a better way to detect MLA.
         self.use_mla = len(block_len) == 2
 
         self.request_queue: queue.Queue[Any] = queue.Queue()
         self.executor = ThreadPoolExecutor(max_workers=32)
+        self.split_request_lock = threading.Lock()
+        self.active_split_requests: set[str] = set()
+        self.cancelled_split_requests: set[str] = set()
 
         self.task_tracker = KVCacheTaskTracker()
 
@@ -382,13 +502,13 @@ class KVCacheRecvingThread(threading.Thread):
         tp_num_need_pulls: int,
         remote_port_send_num: dict[int, RemotePortInfo] | None = None,
         all_task_done: bool = False,
+        split_plan: SplitTransferPlan | None = None,
     ):
         """Add a new request to the queue for processing."""
         if remote_port_send_num is None:
             remote_port_send_num = {}
         logger.debug(f"Adding request {request_id} to the queue.")
-        self.request_queue.put(
-            {
+        request_data = {
                 "request_id": request_id,
                 "local_block_ids": local_block_ids,
                 "remote_block_ids": remote_block_ids,
@@ -400,8 +520,24 @@ class KVCacheRecvingThread(threading.Thread):
                 "tp_num_need_pulls": tp_num_need_pulls,
                 "remote_port_send_num": remote_port_send_num,
                 "all_task_done": all_task_done,
+                "split_plan": split_plan,
             }
-        )
+        if split_plan is not None:
+            if self.request_queue.qsize() >= MAX_PENDING_SPLIT_REQUESTS:
+                return False
+            with self.split_request_lock:
+                self.active_split_requests.add(request_id)
+            self.request_queue.put_nowait(request_data)
+        else:
+            self.request_queue.put(request_data)
+        return True
+
+    def cancel_split_request(self, request_id: str) -> bool:
+        with self.split_request_lock:
+            if request_id not in self.active_split_requests:
+                return False
+            self.cancelled_split_requests.add(request_id)
+            return True
 
     def get_and_clear_finished_requests(self) -> set[str]:
         """
@@ -433,24 +569,50 @@ class KVCacheRecvingThread(threading.Thread):
         remote_port_send_num = req_meta["remote_port_send_num"]
         all_task_done = req_meta["all_task_done"]
 
+        split_plan = req_meta.get("split_plan")
+        split_status = "success"
         try:
+            if split_plan is not None:
+                with self.split_request_lock:
+                    if request_id in self.cancelled_split_requests:
+                        split_status = "cancelled"
+            if split_status == "cancelled":
+                raise InterruptedError("Split transfer was cancelled")
             logger.debug(f"Starting to transfer KV cache for request {remote_request_id}.")
             self._transfer_kv_cache(req_meta)
+            if split_plan is not None:
+                with self.split_request_lock:
+                    if request_id in self.cancelled_split_requests:
+                        split_status = "cancelled"
             logger.debug(f"Finished transferring KV cache for request {remote_request_id}.")
+        except InterruptedError:
+            logger.info("Cancelled split transfer for request %s", remote_request_id)
         except Exception as e:
+            split_status = "failure"
             logger.error(f"Failed to transfer KV cache for request {remote_request_id}: {e}", exc_info=True)
         finally:
-            self._send_done_signal_to_free_remote_port(remote_request_id, remote_host, remote_port_send_num)
-            if all_task_done:
-                if len(req_meta["local_block_ids"]) > 0:
-                    self.task_tracker.update_done_task_count(request_id)
-                if request_id in self.proc_not_transfer_request:
-                    del self.proc_not_transfer_request[request_id]
-            self.request_queue.task_done()
-            # Always send the done signal to the remote host to ensure proper
-            # resource cleanup. Failing to do so may cause a memory leak on the
-            # remote host.
-            self._send_done_recv_signal(remote_request_id, remote_host, remote_handshake_port, remote_port_send_num)
+            if split_plan is None:
+                self._send_done_signal_to_free_remote_port(
+                    remote_request_id, remote_host, remote_port_send_num)
+                if all_task_done:
+                    if len(req_meta["local_block_ids"]) > 0:
+                        self.task_tracker.update_done_task_count(request_id)
+                    if request_id in self.proc_not_transfer_request:
+                        del self.proc_not_transfer_request[request_id]
+                self.request_queue.task_done()
+                # Ordinary transfers retain their original completion message.
+                self._send_done_recv_signal(remote_request_id, remote_host, remote_handshake_port, remote_port_send_num)
+            else:
+                self.request_queue.task_done()
+                self.task_tracker.complete_split_request(
+                    request_id, split_status,
+                    mark_finished=False)
+                self._send_split_done_signal(
+                    remote_request_id, remote_host, remote_handshake_port,
+                    split_status)
+                with self.split_request_lock:
+                    self.active_split_requests.discard(request_id)
+                    self.cancelled_split_requests.discard(request_id)
 
     def _send_done_signal_to_free_remote_port(
         self, request_id: str, remote_host: str, remote_port_send_num: dict[int, RemotePortInfo]
@@ -476,6 +638,11 @@ class KVCacheRecvingThread(threading.Thread):
         remote_handshake_port = req_meta["remote_handshake_port"]
         offset = req_meta["offset"]
         tp_num_need_pulls = req_meta["tp_num_need_pulls"]
+
+        split_plan = req_meta.get("split_plan")
+        if split_plan is not None:
+            self._transfer_split_destinations(req_meta, split_plan)
+            return
 
         # Full prefix cache hit: do not need to read remote blocks, just notify
         # P worker that we have the blocks we need.
@@ -579,6 +746,79 @@ class KVCacheRecvingThread(threading.Thread):
                     self.reformat_kv_cache(grouped_local_block_ids, tp_num_need_pulls, False, need_nz_cache)
             else:
                 self.reformat_kv_cache(grouped_local_block_ids, tp_num_need_pulls, need_cat_cache, need_nz_cache)
+
+    def _transfer_split_destinations(
+        self, req_meta: dict[str, Any], plan: SplitTransferPlan
+    ) -> None:
+        if plan.tp_rank != self.tp_rank or plan.dp_rank != self.vllm_config.parallel_config.data_parallel_rank_local:
+            raise RuntimeError("Split destination TP/DP rank mismatch")
+        requested_groups = set(plan.requested_groups)
+        if not requested_groups or not requested_groups.issubset({0, 1}):
+            raise RuntimeError("Split destination requested groups are invalid")
+        totals = [0, 0]
+        for segment in plan.segments:
+            if segment.group_id not in requested_groups:
+                raise RuntimeError("Split segment targets an unrequested group")
+            expected_kind = "cpu" if segment.group_id == 0 else "npu"
+            if segment.destination_kind != expected_kind:
+                raise RuntimeError(
+                    f"Split group {segment.group_id} requires {expected_kind} destinations"
+                )
+            if segment.length <= 0 or segment.source_offset < 0 or segment.destination_address <= 0:
+                raise RuntimeError("Invalid split destination extent")
+            totals[segment.group_id] += segment.length
+        if tuple(totals) != plan.group_byte_totals:
+            raise RuntimeError(
+                f"Split destination byte totals mismatch: {tuple(totals)} != {plan.group_byte_totals}"
+            )
+        for group_id, total in enumerate(totals):
+            if group_id in requested_groups and total <= 0:
+                raise RuntimeError("Every requested split group requires bytes")
+            if group_id not in requested_groups and total != 0:
+                raise RuntimeError("Unrequested split groups must have zero bytes")
+
+        remote_host = req_meta["remote_host"]
+        remote_port = req_meta["remote_handshake_port"]
+        remote_engine_id = req_meta["remote_engine_id"]
+        if (
+            remote_engine_id not in self.kv_caches_base_addr
+            or remote_port not in self.kv_caches_base_addr[remote_engine_id]
+        ):
+            self._get_remote_metadata(remote_host, remote_port)
+        capabilities = getattr(self, "remote_capabilities", {}).get(
+            (remote_engine_id, remote_port), ())
+        if LIVE_SPLIT_CAPABILITY not in capabilities:
+            raise RuntimeError("Remote Mooncake peer lacks live split capability")
+        remote_bases = self.kv_caches_base_addr[remote_engine_id][remote_port]
+        for segment in plan.segments:
+            if not 0 <= segment.source_buffer_index < len(remote_bases):
+                raise RuntimeError("Split source buffer index is out of range")
+            if (
+                segment.source_buffer_base is not None
+                and segment.source_buffer_base
+                != remote_bases[segment.source_buffer_index]
+            ):
+                raise RuntimeError("Split source buffer identity mismatch")
+            remote_sizes = self.remote_buffer_sizes[remote_engine_id][remote_port]
+            if len(remote_sizes) != len(remote_bases):
+                raise RuntimeError(
+                    "Remote peer omitted registered source buffer sizes"
+                )
+            source_size = remote_sizes[segment.source_buffer_index]
+            if segment.source_offset + segment.length > source_size:
+                raise RuntimeError("Split source extent exceeds registered KV buffer")
+        session_id = f"{remote_host}:{self.remote_te_port[remote_engine_id][remote_port]}"
+        local_destinations = [segment.destination_address for segment in plan.segments]
+        remote_sources = [
+            remote_bases[segment.source_buffer_index] + segment.source_offset
+            for segment in plan.segments
+        ]
+        lengths = [segment.length for segment in plan.segments]
+        with global_te.temporary_registration(local_destinations, lengths):
+            ret = self.engine.batch_transfer_sync_read(
+                session_id, local_destinations, remote_sources, lengths)
+        if ret < 0:
+            raise RuntimeError(f"Mooncake split transfer failed, ret: {ret}")
 
     def reformat_kv_cache_with_fused_op(self, block_ids: list[list[int]], tp_num_need_pulls: int):
         # Get necessary parameters
@@ -707,6 +947,13 @@ class KVCacheRecvingThread(threading.Thread):
             )
             self.kv_caches_base_addr[engine_id][remote_handshake_port] = agent_meta.kv_caches_base_addr
             self.remote_te_port[engine_id][remote_handshake_port] = agent_meta.te_rpc_port
+            self.remote_num_blocks[engine_id][remote_handshake_port] = agent_meta.num_blocks
+            self.remote_buffer_sizes[engine_id][remote_handshake_port] = tuple(
+                agent_meta.kv_caches_buffer_sizes
+            )
+            if not hasattr(self, "remote_capabilities"):
+                self.remote_capabilities = {}
+            self.remote_capabilities[(engine_id, remote_handshake_port)] = agent_meta.capabilities
         finally:
             if sock is not None:
                 self._return_remote_socket(sock, remote_host, remote_handshake_port)
@@ -746,6 +993,30 @@ class KVCacheRecvingThread(threading.Thread):
                 self._return_remote_socket(sock, remote_host, remote_handshake_port)
                 logger.debug("Returned socket to pool for %s:%d", remote_host, remote_handshake_port)
 
+    def _send_split_done_signal(
+        self, request_id: str, remote_host: str,
+        remote_handshake_port: int, status: str
+    ) -> None:
+        sock = None
+        try:
+            sock = self._get_remote_socket(remote_host, remote_handshake_port)
+            ensure_zmq_send(
+                sock, self.encoder.encode((SPLIT_DONE_MSG, request_id, status)),
+                f"{remote_host}:{remote_handshake_port}")
+            response = ensure_zmq_recv(
+                sock, self.remote_poller,
+                f"{remote_host}:{remote_handshake_port}", timeout=self.timeout)
+            if response != b"ACK":
+                raise RuntimeError("Split completion was not acknowledged")
+        except RuntimeError:
+            if isinstance(sock, zmq.Socket):
+                sock.close()
+                sock = None
+            logger.warning("Split completion ACK failed for request %s", request_id)
+        finally:
+            if sock is not None:
+                self._return_remote_socket(sock, remote_host, remote_handshake_port)
+
     def _get_remote_socket(self, remote_host: str, remote_handshake_port: int) -> zmq.Socket:  # type: ignore
         """Get a socket to the remote host."""
         remote_path = make_zmq_path("tcp", remote_host, remote_handshake_port)
@@ -784,6 +1055,7 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
         self.requests: dict[str, ReqMeta] = {}
         self.requests_to_send: dict[str, float] = {}
         self.reqs_in_batch: set[str] = set()
+        self.split_requests_to_send: set[str] = set()
 
     def add_new_req(
         self,
@@ -792,6 +1064,25 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
         num_external_tokens: int,
         kv_transfer_params: dict[str, Any],
     ):
+        split_plan_data = kv_transfer_params.get(LIVE_SPLIT_CAPABILITY)
+        split_plan = self._parse_split_plan(split_plan_data)
+        split_source_invalid = False
+        try:
+            split_source = self._parse_source_descriptor(
+                kv_transfer_params.get(LIVE_SPLIT_SOURCE_DESCRIPTOR)
+            )
+        except (KeyError, TypeError, ValueError):
+            logger.warning(
+                "Invalid prefiller live-split source descriptor for request "
+                "%s; using persistent fallback",
+                request_id,
+            )
+            split_source = None
+            split_source_invalid = True
+        capabilities = kv_transfer_params.get("live_split_capabilities", ())
+        split_negotiated = (
+            LIVE_SPLIT_CAPABILITY in capabilities or split_plan is not None
+        )
         self.requests[request_id] = ReqMeta(
             local_block_ids=local_block_ids,
             num_external_tokens=num_external_tokens,
@@ -805,7 +1096,215 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
             remote_ptp_size=kv_transfer_params.get("remote_ptp_size"),
             remote_multi_nodes_meta_mapping=kv_transfer_params.get("remote_multi_nodes_meta_mapping", {}),
             num_prompt_blocks=kv_transfer_params.get("num_prompt_blocks", 0),
+            split_plan=split_plan,
+            split_negotiated=split_negotiated,
+            split_source=split_source,
+            split_source_invalid=split_source_invalid,
         )
+
+    @staticmethod
+    def _parse_source_descriptor(
+        descriptor: Any,
+    ) -> tuple[SplitSourceDescriptor, ...] | None:
+        if descriptor is None:
+            return None
+        if isinstance(descriptor, SplitSourceDescriptor):
+            descriptors = (descriptor,)
+        elif not isinstance(descriptor, dict):
+            raise ValueError("Live split source descriptor must be a mapping")
+        else:
+            raw_descriptors = descriptor.get("descriptors", (descriptor,))
+            descriptors = tuple(
+                SplitSourceDescriptor(
+                    segments=tuple(
+                        SplitSourceSegment(**segment)
+                        for segment in raw["segments"]
+                    ),
+                    group_byte_totals=tuple(raw["group_byte_totals"]),
+                    tp_rank=int(raw["tp_rank"]),
+                    dp_rank=int(raw["dp_rank"]),
+                )
+                for raw in raw_descriptors
+            )
+        identities: set[tuple[int, int]] = set()
+        for parsed in descriptors:
+            if len(parsed.group_byte_totals) != 2:
+                raise ValueError("Live split source totals require two groups")
+            if (parsed.tp_rank, parsed.dp_rank) in identities:
+                raise ValueError("Duplicate live split source rank")
+            identities.add((parsed.tp_rank, parsed.dp_rank))
+            totals = [0, 0]
+            for segment in parsed.segments:
+                if (
+                    segment.group_id not in (0, 1)
+                    or segment.source_buffer_index < 0
+                    or segment.source_buffer_base <= 0
+                    or segment.source_offset < 0
+                    or segment.length <= 0
+                ):
+                    raise ValueError("Invalid live split source extent")
+                totals[segment.group_id] += segment.length
+            if tuple(totals) != parsed.group_byte_totals:
+                raise ValueError("Live split source byte totals mismatch")
+        return descriptors
+
+    @classmethod
+    def _merge_source_and_destinations(
+        cls,
+        source: SplitSourceDescriptor,
+        plan: Any,
+        supported_groups: tuple[int, ...] = (0, 1),
+    ) -> SplitTransferPlan:
+        if not isinstance(plan, dict):
+            raise ValueError("Live split destination plan must be a mapping")
+        dest_totals = tuple(plan["group_byte_totals"])
+        requested_groups = tuple(
+            group for group in plan.get("requested_groups", (0, 1))
+            if group in supported_groups
+        )
+        if (
+            len(dest_totals) != 2
+            or not requested_groups
+            or not set(requested_groups).issubset({0, 1})
+            or any(dest_totals[group] != source.group_byte_totals[group]
+                   for group in requested_groups)
+        ):
+            raise ValueError("Live split source/destination totals mismatch")
+        tp_rank, dp_rank = int(plan["tp_rank"]), int(plan["dp_rank"])
+        if (tp_rank, dp_rank) != (source.tp_rank, source.dp_rank):
+            raise ValueError("Live split source/destination rank mismatch")
+        destinations = plan["segments"]
+        merged: list[SplitTransferSegment] = []
+        for group_id in requested_groups:
+            sources = [s for s in source.segments if s.group_id == group_id]
+            dests = [d for d in destinations if int(d["group_id"]) == group_id]
+            source_pos = dest_pos = source_offset = dest_offset = 0
+            while source_pos < len(sources) and dest_pos < len(dests):
+                src, dst = sources[source_pos], dests[dest_pos]
+                dst_length = int(dst["length"])
+                length = min(src.length - source_offset,
+                             dst_length - dest_offset)
+                if length <= 0:
+                    raise ValueError("Invalid live split destination extent")
+                merged.append(SplitTransferSegment(
+                    group_id=group_id,
+                    source_buffer_index=src.source_buffer_index,
+                    source_offset=src.source_offset + source_offset,
+                    destination_address=int(dst["destination_address"])
+                    + dest_offset,
+                    length=length,
+                    destination_kind=str(dst["destination_kind"]),
+                    source_buffer_base=src.source_buffer_base,
+                ))
+                source_offset += length
+                dest_offset += length
+                if source_offset == src.length:
+                    source_pos += 1
+                    source_offset = 0
+                if dest_offset == dst_length:
+                    dest_pos += 1
+                    dest_offset = 0
+            if source_pos != len(sources) or dest_pos != len(dests):
+                raise ValueError("Live split source/destination layout mismatch")
+        return SplitTransferPlan(
+            segments=tuple(merged),
+            group_byte_totals=tuple(
+                source.group_byte_totals[group]
+                if group in requested_groups else 0
+                for group in range(2)
+            ),
+            tp_rank=tp_rank,
+            dp_rank=dp_rank,
+            requested_groups=requested_groups,
+        )
+
+    @staticmethod
+    def _parse_split_plan(plan: Any) -> SplitTransferPlan | None:
+        if plan is None:
+            return plan
+        if isinstance(plan, SplitTransferPlan):
+            parsed = plan
+        elif not isinstance(plan, dict):
+            raise ValueError("Live split destination plan must be a mapping")
+        else:
+            segments = tuple(
+                SplitTransferSegment(**segment) for segment in plan["segments"]
+            )
+            parsed = SplitTransferPlan(
+                segments=segments,
+                group_byte_totals=tuple(plan["group_byte_totals"]),
+                tp_rank=int(plan["tp_rank"]),
+                dp_rank=int(plan["dp_rank"]),
+                requested_groups=tuple(plan.get("requested_groups", (0, 1))),
+            )
+        if len(parsed.group_byte_totals) != 2:
+            raise ValueError("Live split byte totals require exactly two groups")
+        return parsed
+
+    def needs_late_split_plans(self) -> bool:
+        return any(
+            meta.split_negotiated and meta.split_plan is None
+            for meta in self.requests.values()
+        )
+
+    def accept_late_split_plans(
+        self, plans: dict[str, Any], supported_groups: tuple[int, ...] = (0, 1)
+    ) -> None:
+        for request_id, meta in self.requests.items():
+            if not meta.split_negotiated or meta.split_plan is not None:
+                continue
+            if meta.split_source_invalid:
+                meta.split_fallback = True
+                continue
+            try:
+                raw_plan = plans.get(request_id)
+                source = None
+                if meta.split_source is not None and raw_plan is not None:
+                    identity = (int(raw_plan["tp_rank"]), int(raw_plan["dp_rank"]))
+                    source = next(
+                        (
+                            item
+                            for item in meta.split_source
+                            if (item.tp_rank, item.dp_rank) == identity
+                        ),
+                        None,
+                    )
+                    if source is None:
+                        raise ValueError("Missing live split source rank")
+                plan = (
+                    self._merge_source_and_destinations(
+                        source, raw_plan, supported_groups
+                    )
+                    if source is not None
+                    else self._parse_split_plan(raw_plan)
+                )
+                if plan is not None:
+                    segments = tuple(
+                        segment
+                        for segment in plan.segments
+                        if segment.group_id in supported_groups
+                    )
+                    totals = tuple(
+                        plan.group_byte_totals[group_id]
+                        if group_id in supported_groups
+                        else 0
+                        for group_id in range(2)
+                    )
+                    plan = SplitTransferPlan(
+                        segments=segments,
+                        group_byte_totals=totals,
+                        tp_rank=plan.tp_rank,
+                        dp_rank=plan.dp_rank,
+                        requested_groups=supported_groups,
+                    )
+                meta.split_plan = plan
+            except (KeyError, TypeError, ValueError):
+                logger.warning(
+                    "Invalid late live-split destination plan for request %s; "
+                    "using persistent fallback",
+                    request_id,
+                )
+            meta.split_fallback = meta.split_plan is None
 
 
 class MooncakeConnector(KVConnectorBase_V1):
@@ -860,7 +1359,33 @@ class MooncakeConnector(KVConnectorBase_V1):
     def get_finished(self, finished_req_ids: set[str]) -> tuple[set[str], set[str]]:
         """Get the finished recving and sending requests."""
         assert self.connector_worker is not None
+        self.connector_worker.cancel_live_split(finished_req_ids)
         return self.connector_worker.get_finished()
+
+    def get_live_split_results(self) -> dict[str, str]:
+        assert self.connector_worker is not None
+        return self.connector_worker.get_live_split_results()
+
+    def _needs_live_split_destination_plans(self) -> bool:
+        metadata = self._connector_metadata
+        return (
+            isinstance(metadata, MooncakeConnectorMetadata)
+            and metadata.needs_late_split_plans()
+        )
+
+    def _accept_live_split_destination_plans(
+        self, plans: dict[str, Any]
+    ) -> None:
+        metadata = self._connector_metadata
+        if isinstance(metadata, MooncakeConnectorMetadata):
+            metadata.accept_late_split_plans(
+                plans, self._live_split_source_groups())
+
+    def _live_split_source_groups(self) -> tuple[int, ...]:
+        index_group_id = getattr(self, "index_group_id", None)
+        if index_group_id is not None:
+            return (int(index_group_id),)
+        return (0, 1)
 
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
         assert self.connector_worker is not None
@@ -942,9 +1467,50 @@ class MooncakeConnectorScheduler:
         self._reqs_need_recv: dict[str, tuple[Request, list[int], int]] = {}
         self._reqs_need_send: dict[str, float] = {}
         self._reqs_in_batch: set[str] = set()
+        self._split_reqs_need_send: set[str] = set()
 
         # master-slave meta information for cross-nodes
         self.multi_nodes_meta_mapping: dict[str, dict[str, Any]] = {}
+        self.local_source_metadata: dict[
+            tuple[int, int], MooncakeAgentMetadata
+        ] = {}
+
+    def _canonicalize_source_descriptor(self, descriptor: Any) -> dict[str, Any]:
+        if not isinstance(descriptor, dict):
+            raise ValueError("Live split source descriptor must be a mapping")
+        raw_descriptors = descriptor.get("descriptors", (descriptor,))
+        normalized = []
+        for raw in raw_descriptors:
+            identity = (int(raw["tp_rank"]), int(raw["dp_rank"]))
+            metadata = self.local_source_metadata.get(identity)
+            if metadata is None:
+                raise ValueError("Live split source rank has no local handshake")
+            bases = metadata.kv_caches_base_addr
+            sizes = metadata.kv_caches_buffer_sizes
+            groups = metadata.buffer_group_ids
+            if not (len(bases) == len(sizes) == len(groups)):
+                raise ValueError("Live split source handshake is incomplete")
+            indices = {base: index for index, base in enumerate(bases)}
+            if len(indices) != len(bases):
+                raise ValueError("Live split source bases are not unique")
+            segments = []
+            for segment in raw["segments"]:
+                segment = dict(segment)
+                base = int(segment["source_buffer_base"])
+                index = indices.get(base)
+                if index is None:
+                    raise ValueError("Live split source base is not registered")
+                if int(segment["group_id"]) != groups[index]:
+                    raise ValueError("Live split source group does not match buffer")
+                if (
+                    int(segment["source_offset"]) + int(segment["length"])
+                    > sizes[index]
+                ):
+                    raise ValueError("Live split source extent exceeds buffer")
+                segment["source_buffer_index"] = index
+                segments.append(segment)
+            normalized.append({**raw, "segments": segments})
+        return {"descriptors": normalized}
 
     def get_num_new_matched_tokens(self, request: "Request", num_computed_tokens: int) -> tuple[int, bool]:
         """
@@ -1025,6 +1591,8 @@ class MooncakeConnectorScheduler:
         self._reqs_need_recv.clear()
         meta.requests_to_send = self._reqs_need_send
         self._reqs_need_send = {}
+        meta.split_requests_to_send = self._split_reqs_need_send
+        self._split_reqs_need_send = set()
         meta.reqs_in_batch = self._reqs_in_batch
         self._reqs_in_batch = set()
 
@@ -1057,10 +1625,12 @@ class MooncakeConnectorScheduler:
         if delay_free_blocks:
             logger.info("Delaying free of %d blocks for request %s", len(computed_block_ids), request.request_id)
             self._reqs_need_send[request.request_id] = time.time()
+            if params.get("request_live_split", False):
+                self._split_reqs_need_send.add(request.request_id)
 
         num_prompt_blocks = math.ceil(len(request.prompt_token_ids) / self.block_size)
 
-        return delay_free_blocks, dict(
+        transfer_params = dict(
             do_remote_prefill=True,
             do_remote_decode=False,
             remote_block_ids=computed_block_ids,
@@ -1075,6 +1645,25 @@ class MooncakeConnectorScheduler:
             remote_multi_nodes_meta_mapping=self.multi_nodes_meta_mapping,
             num_prompt_blocks=num_prompt_blocks,
         )
+        if params.get("request_live_split", False):
+            transfer_params["live_split_capabilities"] = (LIVE_SPLIT_CAPABILITY,)
+            source_descriptor = params.get(LIVE_SPLIT_SOURCE_DESCRIPTOR)
+            if source_descriptor is not None:
+                # This descriptor is created by the prefiller-side compact
+                # provider, which owns the registered source layout.  The
+                # decoder must not synthesize source offsets from its pool.
+                try:
+                    transfer_params[LIVE_SPLIT_SOURCE_DESCRIPTOR] = (
+                        self._canonicalize_source_descriptor(source_descriptor)
+                    )
+                except (KeyError, TypeError, ValueError):
+                    logger.warning(
+                        "Invalid prefiller source registration for %s; "
+                        "using persistent fallback",
+                        request.request_id,
+                        exc_info=True,
+                    )
+        return delay_free_blocks, transfer_params
 
     def set_xfer_handshake_metadata(self, metadata: dict[int, KVConnectorHandshakeMetadata]) -> None:
         """
@@ -1088,6 +1677,10 @@ class MooncakeConnectorScheduler:
                 "host": rank_metadata.local_ip,
                 "engine_id": rank_metadata.engine_id,
             }
+            if isinstance(rank_metadata, MooncakeAgentMetadata):
+                self.local_source_metadata[
+                    (rank_metadata.tp_rank, rank_metadata.dp_rank)
+                ] = rank_metadata
 
 
 class MooncakeConnectorWorker:
@@ -1159,6 +1752,18 @@ class MooncakeConnectorWorker:
             self.tp_num_need_pulls = num_d_block_heads // num_p_block_heads
         self.local_remote_block_port_mapping: dict[str, list[list[int]] | None] = {}
         self.remote_port_send_num: dict[str, dict[int, RemotePortInfo]] = {}
+
+    def get_live_split_results(self) -> dict[str, str]:
+        thread = self.kv_send_thread if self.kv_role == "kv_producer" else self.kv_recv_thread
+        if thread is None:
+            return {}
+        return thread.task_tracker.get_and_clear_split_results()
+
+    def cancel_live_split(self, request_ids: set[str]) -> None:
+        if self.kv_role != "kv_consumer" or self.kv_recv_thread is None:
+            return
+        for request_id in request_ids:
+            self.kv_recv_thread.cancel_split_request(request_id)
 
     def _get_prefill_decode_size(self, vllm_config: VllmConfig):
         # get prefill tp and dp size from extra config
@@ -1253,6 +1858,10 @@ class MooncakeConnectorWorker:
         kv_caches_base_addr = []
         ptrs = []
         lengths = []
+        buffer_group_ids = []
+        configured_group = self.vllm_config.kv_transfer_config.get_from_extra_config(
+            "index_group_id", None
+        )
         length = len(self.block_len)
         for cache_or_caches in kv_caches.values():
             # Normalize to always be a list of caches
@@ -1262,6 +1871,13 @@ class MooncakeConnectorWorker:
                 kv_caches_base_addr.append(base_addr)
                 ptrs.append(base_addr)
                 lengths.append(region_len)
+                buffer_group_ids.append(
+                    int(configured_group)
+                    if configured_group is not None
+                    else 1
+                    if self.use_sparse and i == len(cache_or_caches) - 1
+                    else 0
+                )
         global_te.register_buffer(ptrs, lengths)
         # After KV Caches registered, start the sending or receiving thread.
         metadata = MooncakeAgentMetadata(
@@ -1270,6 +1886,18 @@ class MooncakeConnectorWorker:
             kv_caches_base_addr=kv_caches_base_addr,
             num_blocks=self.num_blocks,
             local_ip=get_ip(),
+            capabilities=(LIVE_SPLIT_CAPABILITY,),
+            kv_caches_buffer_sizes=tuple(lengths),
+            buffer_group_ids=tuple(buffer_group_ids),
+            tp_rank=self.tp_rank,
+            dp_rank=int(
+                getattr(
+                    self.vllm_config.parallel_config,
+                    "data_parallel_rank_local",
+                    0,
+                )
+                or 0
+            ),
         )
         self.xfer_handshake_metadata = metadata
 
@@ -1550,6 +2178,10 @@ class MooncakeConnectorWorker:
 
     def start_load_kv(self, metadata: MooncakeConnectorMetadata):
         """Start loading KV blocks from remote engine."""
+        if self.kv_recv_thread is not None:
+            for req_id in metadata.reqs_in_batch:
+                self.kv_recv_thread.task_tracker.add_req_to_process(req_id)
+
         for req_id, meta in metadata.requests.items():
             logger.debug(
                 "start_load_kv for request %s from remote engine %s. "
@@ -1563,6 +2195,24 @@ class MooncakeConnectorWorker:
             prefill_tp_size = meta.remote_ptp_size if getattr(meta, "remote_ptp_size", None) else self._prefill_tp_size
             tp_num_need_pulls = self._get_tp_num_need_pulls(prefill_tp_size)
             remote_req_id = meta.remote_request_id
+
+            if meta.split_fallback:
+                assert self.kv_recv_thread is not None
+                remote_rank = self._get_remote_rank(
+                    remote_req_id, prefill_tp_size)[0]
+                remote_port = meta.remote_port + remote_rank
+                remote_host, _ = self._get_remote_host_info_by_port(
+                    meta.remote_port,
+                    remote_port,
+                    meta.remote_host,
+                    meta.remote_engine_id,
+                    meta.remote_multi_nodes_meta_mapping,
+                )
+                self.kv_recv_thread.task_tracker.complete_split_request(
+                    req_id, "fallback", mark_finished=False)
+                self.kv_recv_thread._send_split_done_signal(
+                    remote_req_id, remote_host, remote_port, "fallback")
+                continue
 
             if meta.remote_pcp_size * meta.remote_dcp_size > 1:
                 remote_handshake_port_list, local_block_ids_list, remote_block_ids_list = self._get_kv_split_metadata(
@@ -1606,7 +2256,7 @@ class MooncakeConnectorWorker:
                         meta.remote_engine_id,
                         meta.remote_multi_nodes_meta_mapping,
                     )
-                    self.kv_recv_thread.add_request(
+                    admitted = self.kv_recv_thread.add_request(
                         request_id=req_id,
                         remote_request_id=remote_req_id,
                         local_block_ids=meta.local_block_ids,
@@ -1617,24 +2267,34 @@ class MooncakeConnectorWorker:
                         offset=i,
                         tp_num_need_pulls=tp_num_need_pulls,
                         all_task_done=(i == tp_num_need_pulls * self._prefill_pp_size - 1),
+                        split_plan=meta.split_plan,
                     )
+                    if not admitted:
+                        self.kv_recv_thread.task_tracker.complete_split_request(
+                            req_id, "fallback", mark_finished=False)
+                        self.kv_recv_thread._send_split_done_signal(
+                            remote_req_id, remote_host,
+                            remote_handshake_port_list[i][0], "fallback")
+                        break
 
         for req_id in metadata.reqs_in_batch:
             if self.kv_send_thread is not None:
                 self.kv_send_thread.task_tracker.add_req_to_process(req_id)
-            if self.kv_recv_thread is not None:
-                self.kv_recv_thread.task_tracker.add_req_to_process(req_id)
 
         if self.kv_send_thread is not None and self.pcp_size * self.dcp_size == 1:
             for req_id, delay_start_time in metadata.requests_to_send.items():
                 if self.tp_rank in self._prefill_get_remote_rank(req_id):
-                    self.kv_send_thread.add_delayed_request(req_id, delay_start_time)
+                    self.kv_send_thread.add_delayed_request(
+                        req_id, delay_start_time,
+                        split=req_id in metadata.split_requests_to_send)
                 else:
                     self.kv_send_thread.add_not_transfer_request(req_id)
 
         if self.kv_send_thread is not None and self.pcp_size * self.dcp_size > 1:
             for req_id, delay_start_time in metadata.requests_to_send.items():
-                self.kv_send_thread.add_delayed_request(req_id, delay_start_time)
+                self.kv_send_thread.add_delayed_request(
+                    req_id, delay_start_time,
+                    split=req_id in metadata.split_requests_to_send)
 
     def _get_tp_num_need_pulls(self, prefill_tp_size: int) -> int:
         if prefill_tp_size is None:
