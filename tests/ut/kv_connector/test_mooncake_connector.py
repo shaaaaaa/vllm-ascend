@@ -1025,6 +1025,21 @@ class TestGlobalTransferEngineRegistration(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "partially overlaps"):
             registry.register_buffer([0x1800], [0x1000])
 
+    def test_nested_regions_in_one_batch_register_containing_region(self):
+        registry = GlobalTE()
+        registry.transfer_engine = MagicMock()
+        registry.transfer_engine.register_memory.return_value = 0
+
+        registry.register_buffer(
+            [0x1000, 0x1800, 0x1000],
+            [0x800, 0x800, 0x1000],
+        )
+
+        registry.transfer_engine.register_memory.assert_called_once_with(
+            0x1000, 0x1000
+        )
+        self.assertEqual(registry.registered_buffers, {0x1000: 0x1000})
+
     def test_temporary_registration_releases_and_allows_address_reuse(self):
         registry = GlobalTE()
         registry.transfer_engine = MagicMock()

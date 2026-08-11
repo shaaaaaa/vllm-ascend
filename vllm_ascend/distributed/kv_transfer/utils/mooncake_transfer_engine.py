@@ -42,7 +42,14 @@ class GlobalTE:
             raise ValueError("Mooncake pointer and size counts must match")
         with self.register_buffer_lock:
             assert self.transfer_engine is not None, "Transfer engine must be initialized"
-            for ptr, size in zip(ptrs, sizes):
+            # DSA shared-pool caches expose the same slab as one index view and
+            # smaller latent views.  Register containing views first so nested
+            # aliases are idempotent regardless of connector dictionary order.
+            regions = sorted(
+                zip(ptrs, sizes, strict=True),
+                key=lambda region: (-region[1], region[0]),
+            )
+            for ptr, size in regions:
                 if ptr <= 0 or size <= 0:
                     raise ValueError("Mooncake memory regions must be positive")
                 end = ptr + size
