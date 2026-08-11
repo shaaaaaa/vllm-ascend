@@ -210,6 +210,50 @@ def test_ascend_multi_registers_latent_and_indexer_separately():
     index_connector.register_kv_caches.assert_called_once_with(kv_caches)
 
 
+def test_ascend_multi_registers_all_groups_with_hma_child():
+    class HMAConnector(SupportsHMA):
+        def __init__(self):
+            self.register_kv_caches = MagicMock()
+
+        def request_finished_all_groups(self, request, block_ids):
+            raise NotImplementedError
+
+    multi = object.__new__(AscendMultiConnector)
+    hma_connector = HMAConnector()
+    index_connector = object.__new__(MooncakeDSAIndexConnector)
+    index_connector.register_kv_caches = MagicMock()
+    multi._connectors = [hma_connector, index_connector]
+
+    latent = (object(), object())
+    indexer = (object(),)
+    kv_caches = {
+        "model.layers.0.self_attn": latent,
+        "model.layers.0.self_attn.indexer": indexer,
+    }
+
+    multi.register_kv_caches(kv_caches)
+
+    hma_connector.register_kv_caches.assert_called_once_with(kv_caches)
+    index_connector.register_kv_caches.assert_called_once_with(kv_caches)
+
+
+def test_ascend_multi_registers_all_groups_for_live_split_child():
+    multi = object.__new__(AscendMultiConnector)
+    live_connector = SimpleNamespace(
+        requires_full_dsa_kv_caches=True,
+        register_kv_caches=MagicMock(),
+    )
+    multi._connectors = [live_connector]
+    kv_caches = {
+        "model.layers.0.self_attn": (object(), object()),
+        "model.layers.0.self_attn.indexer": (object(),),
+    }
+
+    multi.register_kv_caches(kv_caches)
+
+    live_connector.register_kv_caches.assert_called_once_with(kv_caches)
+
+
 def test_ascend_multi_forwards_staged_sfa_capabilities():
     multi = object.__new__(AscendMultiConnector)
     multi._connectors = [

@@ -310,10 +310,10 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
             )
 
         for connector in self._connectors:
-            if isinstance(connector, MooncakeDSAIndexConnector):
-                connector.register_kv_caches(kv_caches)
-            else:
-                connector.register_kv_caches(latent_only)
+            requires_full = isinstance(connector, SupportsHMA) or getattr(
+                connector, "requires_full_dsa_kv_caches", False
+            )
+            connector.register_kv_caches(kv_caches if requires_full else latent_only)
 
     def start_load_kv(
         self, forward_context: "ForwardContext", **kwargs: Any

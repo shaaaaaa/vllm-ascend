@@ -428,6 +428,7 @@ class KVCacheRecvingThread(threading.Thread):
         vllm_config: VllmConfig,
         kv_caches: dict[str, Any],
         prefill_pp_layer_partition: str | None = None,
+        ordinary_group_id: int = 0,
     ):
         super().__init__(daemon=True, name="KVCacheRecvingThread")
         self.tp_rank = tp_rank
@@ -442,9 +443,13 @@ class KVCacheRecvingThread(threading.Thread):
         self.kv_caches = kv_caches
         self.kv_caches_base_addr: dict[str, dict[int, list[int]]] = SizedDict()
         self.kv_caches_base_addr[local_engine_id][local_handshake_port] = local_kv_caches_base_addr
+        self.ordinary_group_id = ordinary_group_id
         self.remote_te_port: dict[str, dict[int, int]] = SizedDict()
         self.remote_num_blocks: dict[str, dict[int, int]] = SizedDict()
         self.remote_buffer_sizes: dict[str, dict[int, tuple[int, ...]]] = (
+            SizedDict()
+        )
+        self.remote_buffer_group_ids: dict[str, dict[int, tuple[int, ...]]] = (
             SizedDict()
         )
         self.block_len = block_len
@@ -678,7 +683,20 @@ class KVCacheRecvingThread(threading.Thread):
         prefill_pp_rank = offset // tp_num_need_pulls  # PP rank where current request resides
         inner_offset = offset % tp_num_need_pulls  # Offset within each PP stage
 
-        remote_kv_caches_base_addrs = self.kv_caches_base_addr[remote_engine_id][remote_handshake_port]
+        remote_kv_caches_base_addrs = self.kv_caches_base_addr[remote_engine_id][
+            remote_handshake_port
+        ]
+        remote_groups = self.remote_buffer_group_ids[remote_engine_id].get(
+            remote_handshake_port, ()
+        )
+        if remote_groups:
+            remote_kv_caches_base_addrs = [
+                base
+                for base, group in zip(
+                    remote_kv_caches_base_addrs, remote_groups, strict=True
+                )
+                if group == self.ordinary_group_id
+            ]
         first_layer_index, end_layer_index = self.pp_layer_indices[prefill_pp_rank]
         # support MTP layer kv transfer
         if self.vllm_config.speculative_config is not None:
@@ -950,6 +968,9 @@ class KVCacheRecvingThread(threading.Thread):
             self.remote_num_blocks[engine_id][remote_handshake_port] = agent_meta.num_blocks
             self.remote_buffer_sizes[engine_id][remote_handshake_port] = tuple(
                 agent_meta.kv_caches_buffer_sizes
+            )
+            self.remote_buffer_group_ids[engine_id][remote_handshake_port] = tuple(
+                agent_meta.buffer_group_ids
             )
             if not hasattr(self, "remote_capabilities"):
                 self.remote_capabilities = {}
@@ -1308,6 +1329,11 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
 
 
 class MooncakeConnector(KVConnectorBase_V1):
+    # Live split registers the unbundled latent and index buffers and routes
+    # them by explicit group descriptors. Ordinary transfers use this
+    # connector's selected group (latent by default, index for index-only).
+    requires_full_dsa_kv_caches = True
+
     def __init__(self, vllm_config: VllmConfig, role: KVConnectorRole, kv_cache_config: KVCacheConfig | None = None):
         assert vllm_config.kv_transfer_config is not None
         self.engine_id = vllm_config.kv_transfer_config.engine_id
@@ -1827,17 +1853,21 @@ class MooncakeConnectorWorker:
             len(first_kv_cache_tuple) == 2
             and first_kv_cache_tuple[0].size(-1) != first_kv_cache_tuple[1].size(-1)
         )
-        self.use_sparse = len(first_kv_cache_tuple) == 3
+        self.use_sparse = len(first_kv_cache_tuple) >= 3 or any(
+            "indexer" in name for name in kv_caches
+        )
 
         self.num_blocks = first_kv_cache.shape[0]
         logger.info("num_blocks: %s", self.num_blocks)
         self.block_len = []
         if self.use_mla or self.use_sparse:
             block_rank = 3  # [block_size, latent_dim]
-            for i in range(len(first_kv_cache_tuple)):
-                block_shape = first_kv_cache_tuple[i].shape[-block_rank:]
+            for cache in first_kv_cache_tuple:
+                block_shape = cache.shape[-block_rank:]
                 logger.info("block_shape: %s", block_shape)
-                self.block_len.append(first_kv_cache[i].element_size() * math.prod(block_shape))
+                self.block_len.append(
+                    cache.element_size() * math.prod(block_shape)
+                )
         else:
             # eager:[num_block, block_size, num_head, hidden_dim]
             block_rank = (
@@ -1856,28 +1886,39 @@ class MooncakeConnectorWorker:
 
         self.kv_caches = kv_caches
         kv_caches_base_addr = []
+        ordinary_kv_caches_base_addr = []
         ptrs = []
         lengths = []
         buffer_group_ids = []
         configured_group = self.vllm_config.kv_transfer_config.get_from_extra_config(
             "index_group_id", None
         )
-        length = len(self.block_len)
-        for cache_or_caches in kv_caches.values():
+        ordinary_group_id = (
+            int(configured_group)
+            if configured_group is not None
+            else 1
+            if all("indexer" in name for name in kv_caches)
+            else 0
+        )
+        for layer_name, cache_or_caches in kv_caches.items():
             # Normalize to always be a list of caches
             for i, cache in enumerate(cache_or_caches, 0):
                 base_addr = cache.data_ptr()
-                region_len = self.num_blocks * self.block_len[i % length]
+                region_len = cache.numel() * cache.element_size()
                 kv_caches_base_addr.append(base_addr)
                 ptrs.append(base_addr)
                 lengths.append(region_len)
-                buffer_group_ids.append(
+                group_id = (
                     int(configured_group)
                     if configured_group is not None
                     else 1
-                    if self.use_sparse and i == len(cache_or_caches) - 1
+                    if "indexer" in layer_name
+                    or (self.use_sparse and i >= 2)
                     else 0
                 )
+                buffer_group_ids.append(group_id)
+                if group_id == ordinary_group_id:
+                    ordinary_kv_caches_base_addr.append(base_addr)
         global_te.register_buffer(ptrs, lengths)
         # After KV Caches registered, start the sending or receiving thread.
         metadata = MooncakeAgentMetadata(
@@ -1925,12 +1966,13 @@ class MooncakeConnectorWorker:
                 self.engine_id,
                 self.handshake_port,
                 self.side_channel_port,
-                kv_caches_base_addr,
+                ordinary_kv_caches_base_addr,
                 self.block_len,
                 ready_event,
                 self.vllm_config,
                 self.kv_caches,
                 self._prefill_pp_layer_partition,
+                ordinary_group_id=ordinary_group_id,
             )
             self.kv_recv_thread.start()
 

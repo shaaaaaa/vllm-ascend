@@ -1,4 +1,5 @@
 import contextlib
+import math
 import os
 import queue
 import socket
@@ -458,6 +459,29 @@ class TestCoreFunctionality(unittest.TestCase):
 
         with self.assertRaises(RuntimeError):
             self.thread._transfer_kv_cache(self.test_req)
+
+    def test_ordinary_transfer_filters_remote_index_buffers(self):
+        self.thread.kv_caches_base_addr["remote_engine"] = {
+            6666: [0x3000, 0x9000, 0x4000]
+        }
+        self.thread.remote_buffer_group_ids["remote_engine"] = {
+            6666: (0, 1, 0)
+        }
+        request = dict(
+            self.test_req,
+            local_block_ids=[0],
+            remote_block_ids=[0],
+            tp_num_need_pulls=1,
+        )
+
+        self.thread._transfer_kv_cache(request)
+
+        self.engine.batch_transfer_sync_read.assert_called_once_with(
+            "localhost:7777",
+            [0x1000, 0x2000],
+            [0x3000, 0x4000],
+            [1024, 2048],
+        )
 
     @patch(
         'vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector.global_te.temporary_registration'
@@ -2213,6 +2237,73 @@ class TestMooncakeConnectorWorker(unittest.TestCase):
         worker.register_kv_caches(mla_caches)
         self.assertTrue(worker.use_mla)
         self.assertEqual(len(worker.block_len), 2)
+
+    def test_register_kv_caches_unbundled_dsa_uses_exact_regions(self):
+        def cache(ptr, shape):
+            tensor = MagicMock()
+            tensor.data_ptr.return_value = ptr
+            tensor.shape = shape
+            tensor.size.side_effect = lambda dim=None: (
+                shape if dim is None else shape[dim]
+            )
+            tensor.numel.return_value = math.prod(shape)
+            tensor.element_size.return_value = 2
+            return tensor
+
+        latent_nope = cache(0x1000, (10, 16, 1, 512))
+        latent_rope = cache(0x2000, (10, 16, 1, 64))
+        indexer = cache(0x3000, (40, 16, 1, 128))
+
+        self.vllm_config.kv_transfer_config.kv_role = "kv_consumer"
+        with patch(
+            "vllm_ascend.distributed.kv_transfer.kv_p2p."
+            "mooncake_connector.KVCacheRecvingThread"
+        ) as recv_thread:
+            worker = MooncakeConnectorWorker(self.vllm_config, self.engine_id)
+            worker.register_kv_caches(
+                {
+                    "model.layers.0.self_attn": (latent_nope, latent_rope),
+                    "model.layers.0.self_attn.indexer": (indexer,),
+                }
+            )
+
+        metadata = worker.xfer_handshake_metadata
+        self.assertTrue(worker.use_sparse)
+        self.assertEqual(metadata.buffer_group_ids, (0, 0, 1))
+        self.assertEqual(
+            metadata.kv_caches_buffer_sizes,
+            tuple(
+                math.prod(tensor.shape) * 2
+                for tensor in (latent_nope, latent_rope, indexer)
+            ),
+        )
+        recv_args = recv_thread.call_args.args
+        self.assertEqual(recv_args[7], [0x1000, 0x2000])
+        self.assertEqual(recv_thread.call_args.kwargs["ordinary_group_id"], 0)
+
+    def test_register_kv_caches_index_only_uses_group_one_for_ordinary_transfer(self):
+        indexer = MagicMock()
+        indexer.data_ptr.return_value = 0x3000
+        indexer.shape = (40, 16, 1, 128)
+        indexer.size.side_effect = lambda dim=None: (
+            indexer.shape if dim is None else indexer.shape[dim]
+        )
+        indexer.numel.return_value = math.prod(indexer.shape)
+        indexer.element_size.return_value = 2
+        self.vllm_config.kv_transfer_config.kv_role = "kv_consumer"
+
+        with patch(
+            "vllm_ascend.distributed.kv_transfer.kv_p2p."
+            "mooncake_connector.KVCacheRecvingThread"
+        ) as recv_thread:
+            worker = MooncakeConnectorWorker(self.vllm_config, self.engine_id)
+            worker.register_kv_caches(
+                {"model.layers.0.self_attn.indexer": (indexer,)}
+            )
+
+        recv_args = recv_thread.call_args.args
+        self.assertEqual(recv_args[7], [0x3000])
+        self.assertEqual(recv_thread.call_args.kwargs["ordinary_group_id"], 1)
 
     def test_device_id_selection_with_physical_devices(self):
         # Test with physical devices set
