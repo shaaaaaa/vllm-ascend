@@ -164,6 +164,9 @@ class CompletionClient:
                 prompt_tokens_reported = usage.get("prompt_tokens")
                 completion_tokens_reported = usage.get("completion_tokens")
 
+        # The SSE [DONE] marker precedes the HTTP chunked-transfer terminator.
+        # Consume the response tail before reusing this persistent connection.
+        response.read()
         completed = time.perf_counter()
         if not saw_done:
             raise RuntimeError("stream ended without a [DONE] event")
