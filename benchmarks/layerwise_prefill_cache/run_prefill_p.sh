@@ -14,7 +14,8 @@ esac
 MODEL="${MODEL:-/workspace/models/GLM-5.1-w4a8}"
 LMCACHE_CONFIG="${LMCACHE_CONFIG:-/workspace/lmy/lmcache_config.yaml}"
 CHUNK_SIZE="${CHUNK_SIZE:-8192}"
-MAX_MODEL_LEN="${MAX_MODEL_LEN:-65537}"
+MAX_MODEL_LEN="${MAX_MODEL_LEN:-70000}"
+GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.95}"
 PORT="${PORT:-9960}"
 RUN_ID="$(date +%Y%m%d_%H%M%S)"
 OUTPUT_DIR="/workspace/lmy/layerwise-prefill-bench/${MODE}-${RUN_ID}"
@@ -41,7 +42,7 @@ PYTHONHASHSEED=0 \
 VLLM_LOG_STATS_INTERVAL=1 \
 vllm serve "${MODEL}" \
   --served-model-name glm51-prefill \
-  --gpu-memory-utilization 0.94 \
+  --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION}" \
   --trust-remote-code \
   --tensor-parallel-size 8 \
   --data-parallel-size 1 \
