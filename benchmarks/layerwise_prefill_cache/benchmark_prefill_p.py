@@ -19,6 +19,7 @@ import argparse
 import hashlib
 import http.client
 import json
+import math
 import random
 import statistics
 import time
@@ -28,8 +29,9 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-OFF_PROMPT_TOKENS = 65536
-LAYERWISE_PROMPT_MULTIPLIER = 20
+BASE_PROMPT_TOKENS = 65536
+ON_PROMPT_MULTIPLIERS = (1, 2, 4, 8, 16)
+DEFAULT_CHUNK_SIZE = 8192
 OFF_TIMEOUT_SECONDS = 300.0
 
 
@@ -184,10 +186,16 @@ class CompletionClient:
         )
 
 
-def summarize(results: list[RequestResult], prompt_tokens: int) -> dict[str, Any]:
+def summarize(
+    results: list[RequestResult],
+    prompt_tokens: int,
+    chunk_size: int,
+) -> dict[str, Any]:
     ttft_ms = [result.ttft_seconds * 1000 for result in results]
     e2e_ms = [result.e2e_seconds * 1000 for result in results]
     total_e2e_seconds = sum(result.e2e_seconds for result in results)
+    num_chunks = math.ceil(prompt_tokens / chunk_size)
+    average_chunk_ttft_ms = [value / num_chunks for value in ttft_ms]
 
     def latency_summary(values: list[float]) -> dict[str, float]:
         return {
@@ -199,10 +207,28 @@ def summarize(results: list[RequestResult], prompt_tokens: int) -> dict[str, Any
         }
 
     return {
+        "chunk_size": chunk_size,
+        "num_chunks": num_chunks,
+        "average_chunk_ttft": latency_summary(average_chunk_ttft_ms),
         "ttft": latency_summary(ttft_ms),
         "e2e": latency_summary(e2e_ms),
         "aggregate_input_tokens_per_second": (len(results) * prompt_tokens / total_e2e_seconds),
     }
+
+
+def prompt_multipliers(label: str) -> tuple[int, ...]:
+    return ON_PROMPT_MULTIPLIERS if label == "on" else (1,)
+
+
+def case_output_path(output: Path, multiplier: int) -> Path:
+    suffix = output.suffix or ".json"
+    stem = output.stem if output.suffix else output.name
+    return output.with_name(f"{stem}-{multiplier}x{suffix}")
+
+
+def case_seed(seed: int, label: str, multiplier: int) -> int:
+    label_offset = 10_000_019 if label == "on" else 0
+    return seed + label_offset + multiplier * 1_000_003
 
 
 def parse_args() -> argparse.Namespace:
@@ -214,11 +240,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--prompt-tokens",
         type=int,
+        default=BASE_PROMPT_TOKENS,
         help=(
-            f"Defaults to {OFF_PROMPT_TOKENS} for off and "
-            f"{OFF_PROMPT_TOKENS * LAYERWISE_PROMPT_MULTIPLIER} for on"
+            f"Base prompt length (default: {BASE_PROMPT_TOKENS}); on runs "
+            f"multipliers {','.join(map(str, ON_PROMPT_MULTIPLIERS))}"
         ),
     )
+    parser.add_argument("--chunk-size", type=int, default=DEFAULT_CHUNK_SIZE)
     parser.add_argument("--warmups", type=int, default=1)
     parser.add_argument("--repeats", type=int, default=5)
     parser.add_argument("--seed", type=int, default=20260811)
@@ -231,21 +259,21 @@ def parse_args() -> argparse.Namespace:
         type=float,
         help=(
             f"Defaults to {OFF_TIMEOUT_SECONDS:g}s for off and "
-            f"{OFF_TIMEOUT_SECONDS * LAYERWISE_PROMPT_MULTIPLIER:g}s for on"
+            f"{OFF_TIMEOUT_SECONDS * max(ON_PROMPT_MULTIPLIERS):g}s for on"
         ),
     )
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args()
 
-    multiplier = LAYERWISE_PROMPT_MULTIPLIER if args.label == "on" else 1
-    if args.prompt_tokens is None:
-        args.prompt_tokens = OFF_PROMPT_TOKENS * multiplier
     if args.timeout is None:
-        args.timeout = OFF_TIMEOUT_SECONDS * multiplier
+        timeout_multiplier = max(prompt_multipliers(args.label))
+        args.timeout = OFF_TIMEOUT_SECONDS * timeout_multiplier
 
     if args.prompt_tokens <= 0:
         parser.error("--prompt-tokens must be positive")
+    if args.chunk_size <= 0:
+        parser.error("--chunk-size must be positive")
     if args.warmups < 0 or args.repeats <= 0:
         parser.error("--warmups must be >= 0 and --repeats must be > 0")
     if not 0 <= args.token_id_min < args.token_id_max <= 2**32:
@@ -254,29 +282,36 @@ def parse_args() -> argparse.Namespace:
         parser.error("--cache-chunk-tokens must be in [1, prompt-tokens]")
     if args.warmups and args.seed == args.warmup_seed:
         parser.error("--seed and --warmup-seed must differ")
-    if args.output.exists() and not args.overwrite:
-        parser.error(f"output already exists: {args.output}; pass --overwrite")
     return args
 
 
-def main() -> int:
-    args = parse_args()
+def run_case(
+    *,
+    args: argparse.Namespace,
+    client: CompletionClient,
+    multiplier: int,
+    seen_first_chunk_digests: set[str],
+) -> dict[str, Any]:
+    prompt_tokens = args.prompt_tokens * multiplier
+    measured_seed = case_seed(args.seed, args.label, multiplier)
+    warmup_seed = case_seed(args.warmup_seed, args.label, multiplier)
     print(
-        f"Generating {args.warmups} warmup and {args.repeats} measured prompts of {args.prompt_tokens} tokens...",
+        f"\n[{multiplier}x] Generating {args.warmups} warmup and "
+        f"{args.repeats} measured prompts of {prompt_tokens} tokens...",
         flush=True,
     )
     warmup_prompts = make_prompts(
-        seed=args.warmup_seed,
+        seed=warmup_seed,
         count=args.warmups,
-        prompt_tokens=args.prompt_tokens,
+        prompt_tokens=prompt_tokens,
         token_id_min=args.token_id_min,
         token_id_max=args.token_id_max,
         cache_chunk_tokens=args.cache_chunk_tokens,
     )
     measured_prompts = make_prompts(
-        seed=args.seed,
+        seed=measured_seed,
         count=args.repeats,
-        prompt_tokens=args.prompt_tokens,
+        prompt_tokens=prompt_tokens,
         token_id_min=args.token_id_min,
         token_id_max=args.token_id_max,
         cache_chunk_tokens=args.cache_chunk_tokens,
@@ -285,63 +320,67 @@ def main() -> int:
     first_chunk_digests = [prompt.first_chunk_digest for prompt in all_prompts]
     if len(first_chunk_digests) != len(set(first_chunk_digests)):
         raise RuntimeError("warmup/measured prompts contain a duplicate first cache chunk")
+    duplicate_digests = seen_first_chunk_digests.intersection(first_chunk_digests)
+    if duplicate_digests:
+        raise RuntimeError("prompt-length cases contain a duplicate first cache chunk")
+    seen_first_chunk_digests.update(first_chunk_digests)
 
-    client = CompletionClient(args.base_url, args.endpoint, args.timeout)
     results: list[RequestResult] = []
-    try:
-        for index, prompt in enumerate(warmup_prompts):
-            ttft, e2e, _, _ = client.run(
-                model=args.model,
-                prompt=prompt,
-                request_id=f"prefill-{args.label}-warmup-{index}",
-            )
-            print(
-                f"warmup {index + 1}/{args.warmups} "
-                f"hash={prompt.digest[:16]} ttft={ttft * 1000:.3f} ms "
-                f"e2e={e2e * 1000:.3f} ms",
-                flush=True,
-            )
+    for index, prompt in enumerate(warmup_prompts):
+        ttft, e2e, _, _ = client.run(
+            model=args.model,
+            prompt=prompt,
+            request_id=f"prefill-{args.label}-{multiplier}x-warmup-{index}",
+        )
+        print(
+            f"warmup {index + 1}/{args.warmups} "
+            f"hash={prompt.digest[:16]} ttft={ttft * 1000:.3f} ms "
+            f"e2e={e2e * 1000:.3f} ms",
+            flush=True,
+        )
 
-        for index, prompt in enumerate(measured_prompts):
-            ttft, e2e, prompt_count, completion_count = client.run(
-                model=args.model,
-                prompt=prompt,
-                request_id=f"prefill-{args.label}-measure-{index}",
+    for index, prompt in enumerate(measured_prompts):
+        ttft, e2e, prompt_count, completion_count = client.run(
+            model=args.model,
+            prompt=prompt,
+            request_id=f"prefill-{args.label}-{multiplier}x-measure-{index}",
+        )
+        if prompt_count is not None and prompt_count != prompt_tokens:
+            raise RuntimeError(
+                f"server reported an unexpected prompt length: expected={prompt_tokens}, actual={prompt_count}"
             )
-            if prompt_count is not None and prompt_count != args.prompt_tokens:
-                raise RuntimeError(
-                    f"server reported an unexpected prompt length: expected={args.prompt_tokens}, actual={prompt_count}"
-                )
-            result = RequestResult(
-                request_index=index,
-                prompt_digest=prompt.digest,
-                first_chunk_digest=prompt.first_chunk_digest,
-                ttft_seconds=ttft,
-                e2e_seconds=e2e,
-                prompt_tokens_reported=prompt_count,
-                completion_tokens_reported=completion_count,
-            )
-            results.append(result)
-            print(
-                f"measure {index + 1}/{args.repeats} "
-                f"hash={prompt.digest[:16]} ttft={ttft * 1000:.3f} ms "
-                f"e2e={e2e * 1000:.3f} ms",
-                flush=True,
-            )
-    finally:
-        client.close()
+        result = RequestResult(
+            request_index=index,
+            prompt_digest=prompt.digest,
+            first_chunk_digest=prompt.first_chunk_digest,
+            ttft_seconds=ttft,
+            e2e_seconds=e2e,
+            prompt_tokens_reported=prompt_count,
+            completion_tokens_reported=completion_count,
+        )
+        results.append(result)
+        print(
+            f"measure {index + 1}/{args.repeats} "
+            f"hash={prompt.digest[:16]} ttft={ttft * 1000:.3f} ms "
+            f"e2e={e2e * 1000:.3f} ms",
+            flush=True,
+        )
 
-    summary = summarize(results, args.prompt_tokens)
-    output = {
+    summary = summarize(results, prompt_tokens, args.chunk_size)
+    return {
+        "schema_version": 2,
         "label": args.label,
+        "multiplier": multiplier,
         "base_url": args.base_url,
         "endpoint": args.endpoint,
         "model": args.model,
-        "prompt_tokens": args.prompt_tokens,
+        "base_prompt_tokens": args.prompt_tokens,
+        "prompt_tokens": prompt_tokens,
+        "chunk_size": args.chunk_size,
         "warmups": args.warmups,
         "repeats": args.repeats,
-        "seed": args.seed,
-        "warmup_seed": args.warmup_seed,
+        "seed": measured_seed,
+        "warmup_seed": warmup_seed,
         "token_id_min": args.token_id_min,
         "token_id_max": args.token_id_max,
         "cache_chunk_tokens": args.cache_chunk_tokens,
@@ -350,12 +389,19 @@ def main() -> int:
         "requests": [asdict(result) for result in results],
         "summary": summary,
     }
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(json.dumps(output, indent=2) + "\n", encoding="utf-8")
 
-    print("\nSummary")
+
+def print_case_summary(output: dict[str, Any], output_path: Path) -> None:
+    summary = output["summary"]
+    print(f"\nSummary {output['multiplier']}x: prompt={output['prompt_tokens']} chunks={summary['num_chunks']}")
     print(
-        f"TTFT: mean={summary['ttft']['mean_ms']:.3f} ms "
+        "Average chunk TTFT: "
+        f"mean={summary['average_chunk_ttft']['mean_ms']:.3f} ms "
+        f"p50={summary['average_chunk_ttft']['p50_ms']:.3f} ms "
+        f"p90={summary['average_chunk_ttft']['p90_ms']:.3f} ms"
+    )
+    print(
+        f"Total TTFT: mean={summary['ttft']['mean_ms']:.3f} ms "
         f"p50={summary['ttft']['p50_ms']:.3f} ms "
         f"p90={summary['ttft']['p90_ms']:.3f} ms"
     )
@@ -365,7 +411,77 @@ def main() -> int:
         f"p90={summary['e2e']['p90_ms']:.3f} ms"
     )
     print(f"Input throughput: {summary['aggregate_input_tokens_per_second']:.3f} token/s")
-    print(f"Wrote {args.output}")
+    print(f"Wrote {output_path}")
+
+
+def main() -> int:
+    args = parse_args()
+    multipliers = prompt_multipliers(args.label)
+    multiple_cases = len(multipliers) > 1
+    case_paths = [
+        case_output_path(args.output, multiplier) if multiple_cases else args.output for multiplier in multipliers
+    ]
+    all_output_paths = [*case_paths, *([args.output] if multiple_cases else [])]
+    existing = [path for path in all_output_paths if path.exists()]
+    if existing and not args.overwrite:
+        paths = ", ".join(str(path) for path in existing)
+        raise FileExistsError(f"output already exists: {paths}; pass --overwrite")
+
+    client = CompletionClient(args.base_url, args.endpoint, args.timeout)
+    case_outputs: list[dict[str, Any]] = []
+    seen_first_chunk_digests: set[str] = set()
+    try:
+        for multiplier, output_path in zip(multipliers, case_paths, strict=True):
+            output = run_case(
+                args=args,
+                client=client,
+                multiplier=multiplier,
+                seen_first_chunk_digests=seen_first_chunk_digests,
+            )
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_text(
+                json.dumps(output, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            print_case_summary(output, output_path)
+            case_outputs.append(output)
+    finally:
+        client.close()
+
+    if multiple_cases:
+        aggregate = {
+            "schema_version": 2,
+            "label": args.label,
+            "base_prompt_tokens": args.prompt_tokens,
+            "chunk_size": args.chunk_size,
+            "multipliers": list(multipliers),
+            "case_outputs": [str(path) for path in case_paths],
+            "cases": [
+                {
+                    "multiplier": output["multiplier"],
+                    "prompt_tokens": output["prompt_tokens"],
+                    "summary": output["summary"],
+                }
+                for output in case_outputs
+            ],
+        }
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(
+            json.dumps(aggregate, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        print("\n| multiplier | prompt tokens | chunks | avg chunk mean ms | total TTFT mean ms |")
+        print("|---:|---:|---:|---:|---:|")
+        for output in case_outputs:
+            summary = output["summary"]
+            print(
+                f"| {output['multiplier']}x | {output['prompt_tokens']} | "
+                f"{summary['num_chunks']} | "
+                f"{summary['average_chunk_ttft']['mean_ms']:.3f} | "
+                f"{summary['ttft']['mean_ms']:.3f} |"
+            )
+        print(f"Wrote aggregate summary {args.output}")
+
     return 0
 
 
