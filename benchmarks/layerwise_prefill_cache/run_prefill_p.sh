@@ -5,8 +5,16 @@ rm -rf /dev/shm/*
 
 MODE="${1:?usage: $0 off|on}"
 case "${MODE}" in
-  off) LAYERWISE=false ;;
-  on) LAYERWISE=true ;;
+  off)
+    LAYERWISE=false
+    DEFAULT_MAX_MODEL_LEN=70000
+    ALLOW_LONG_MAX_MODEL_LEN=0
+    ;;
+  on)
+    LAYERWISE=true
+    DEFAULT_MAX_MODEL_LEN=1400000
+    ALLOW_LONG_MAX_MODEL_LEN=1
+    ;;
   *)
     echo "mode must be off or on" >&2
     exit 2
@@ -16,7 +24,7 @@ esac
 MODEL="${MODEL:-/workspace/models/GLM-5.1-w4a8}"
 LMCACHE_CONFIG="${LMCACHE_CONFIG:-/workspace/lmy/lmcache_config.yaml}"
 CHUNK_SIZE="${CHUNK_SIZE:-8192}"
-MAX_MODEL_LEN="${MAX_MODEL_LEN:-70000}"
+MAX_MODEL_LEN="${MAX_MODEL_LEN:-${DEFAULT_MAX_MODEL_LEN}}"
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.96}"
 PORT="${PORT:-9960}"
 RUN_ID="$(date +%Y%m%d_%H%M%S)"
@@ -24,9 +32,11 @@ OUTPUT_DIR="/workspace/lmy/layerwise-prefill-bench/${MODE}-${RUN_ID}"
 LOG="${OUTPUT_DIR}/server.log"
 
 mkdir -p "${OUTPUT_DIR}"
-printf 'MODE=%s\nLAYERWISE=%s\nLOG=%s\n' "${MODE}" "${LAYERWISE}" "${LOG}"
+printf 'MODE=%s\nLAYERWISE=%s\nMAX_MODEL_LEN=%s\nLOG=%s\n' \
+  "${MODE}" "${LAYERWISE}" "${MAX_MODEL_LEN}" "${LOG}"
 
 VLLM_USE_V1=1 \
+VLLM_ALLOW_LONG_MAX_MODEL_LEN="${ALLOW_LONG_MAX_MODEL_LEN}" \
 VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE="${LAYERWISE}" \
 VLLM_ASCEND_DSA_UNBUNDLE=1 \
 VLLM_ASCEND_DSA_TWO_GROUPS=1 \

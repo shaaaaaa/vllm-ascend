@@ -28,6 +28,10 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+OFF_PROMPT_TOKENS = 65536
+LAYERWISE_PROMPT_MULTIPLIER = 20
+OFF_TIMEOUT_SECONDS = 300.0
+
 
 @dataclass(frozen=True)
 class Prompt:
@@ -206,8 +210,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--base-url", default="http://127.0.0.1:9960")
     parser.add_argument("--endpoint", default="/v1/completions")
     parser.add_argument("--model", default="glm51-prefill")
-    parser.add_argument("--label", required=True, help="For example: off or on")
-    parser.add_argument("--prompt-tokens", type=int, default=65536)
+    parser.add_argument("--label", required=True, choices=("off", "on"))
+    parser.add_argument(
+        "--prompt-tokens",
+        type=int,
+        help=(
+            f"Defaults to {OFF_PROMPT_TOKENS} for off and "
+            f"{OFF_PROMPT_TOKENS * LAYERWISE_PROMPT_MULTIPLIER} for on"
+        ),
+    )
     parser.add_argument("--warmups", type=int, default=1)
     parser.add_argument("--repeats", type=int, default=5)
     parser.add_argument("--seed", type=int, default=20260811)
@@ -215,10 +226,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--token-id-min", type=int, default=1000)
     parser.add_argument("--token-id-max", type=int, default=100000)
     parser.add_argument("--cache-chunk-tokens", type=int, default=256)
-    parser.add_argument("--timeout", type=float, default=300)
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        help=(
+            f"Defaults to {OFF_TIMEOUT_SECONDS:g}s for off and "
+            f"{OFF_TIMEOUT_SECONDS * LAYERWISE_PROMPT_MULTIPLIER:g}s for on"
+        ),
+    )
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args()
+
+    multiplier = LAYERWISE_PROMPT_MULTIPLIER if args.label == "on" else 1
+    if args.prompt_tokens is None:
+        args.prompt_tokens = OFF_PROMPT_TOKENS * multiplier
+    if args.timeout is None:
+        args.timeout = OFF_TIMEOUT_SECONDS * multiplier
 
     if args.prompt_tokens <= 0:
         parser.error("--prompt-tokens must be positive")
