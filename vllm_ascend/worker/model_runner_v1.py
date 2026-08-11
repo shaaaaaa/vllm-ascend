@@ -137,6 +137,10 @@ from vllm_ascend.patch.worker.patch_draft_quarot import patch_load_weights
 from vllm_ascend.patch.worker.patch_module import patch_torch_npu_argsort
 from vllm_ascend.quantization.utils import enable_fa_quant
 from vllm_ascend.sample.sampler import AscendSampler
+from vllm_ascend.sfa_flight_recorder import (
+    SFAFlightRecorder,
+    record_sfa_flight_event,
+)
 from vllm_ascend.spec_decode import get_spec_decode_method
 from vllm_ascend.spec_decode.draft_proposer import AscendDraftModelProposer
 from vllm_ascend.spec_decode.eagle_proposer import AscendEagleProposer
@@ -434,6 +438,17 @@ class NPUModelRunner(GPUModelRunner):
         self.max_num_reqs = self.scheduler_config.max_num_seqs
         self.dp_size = vllm_config.parallel_config.data_parallel_size
         self.dp_rank = vllm_config.parallel_config.data_parallel_rank
+        self.sfa_flight_recorder = (
+            SFAFlightRecorder(
+                envs_ascend.VLLM_ASCEND_SFA_FLIGHT_RECORDER_DIR,
+                {
+                    "dp_rank": self.dp_rank,
+                    "device": str(device),
+                },
+            )
+            if envs_ascend.VLLM_ASCEND_SFA_FLIGHT_RECORDER
+            else None
+        )
 
         self.sampler = AscendSampler()
         self.attn_state: AscendAttentionState | None = None
@@ -1941,6 +1956,7 @@ class NPUModelRunner(GPUModelRunner):
                 mtp_dw_deep_diag_req_ids=diag_deep_req_ids,
                 staged_sfa_route=staged_sfa_route,
                 staged_sfa_graph_key=staged_sfa_graph_key,
+                sfa_flight_recorder=self.sfa_flight_recorder,
             ),
             self.maybe_get_kv_connector_output(
                 scheduler_output,
@@ -2000,8 +2016,22 @@ class NPUModelRunner(GPUModelRunner):
             if staged_sfa_graph_key is not None:
                 first_layer_name, first_impl = self._staged_sfa_impls[0]
                 first_impl.bootstrap_cross_layer(first_layer_name)
+            record_sfa_flight_event(
+                self.sfa_flight_recorder,
+                "model_forward_begin",
+                is_dummy=False,
+                num_tokens=int(num_tokens_padded),
+                graph_key=str(staged_sfa_graph_key),
+            )
             hidden_states = self._model_forward(
                 num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
+            )
+            record_sfa_flight_event(
+                self.sfa_flight_recorder,
+                "model_forward_end",
+                is_dummy=False,
+                num_tokens=int(num_tokens_padded),
+                graph_key=str(staged_sfa_graph_key),
             )
             target_diag_session = getattr(
                 get_forward_context(),
@@ -3952,12 +3982,36 @@ class NPUModelRunner(GPUModelRunner):
                     else None
                 ),
                 staged_sfa_graph_key=staged_dummy_key,
+                sfa_flight_recorder=self.sfa_flight_recorder,
             ):
+                record_sfa_flight_event(
+                    self.sfa_flight_recorder,
+                    "dummy_route",
+                    is_dummy=bool(staged_sfa_graph_dummy_run),
+                    num_tokens=int(num_tokens_padded),
+                    num_requests=int(num_reqs),
+                    runtime_mode=str(cudagraph_runtime_mode),
+                    graph_key=str(staged_dummy_key),
+                )
                 if staged_dummy_key is not None and self._staged_sfa_impls:
                     first_layer_name, first_impl = self._staged_sfa_impls[0]
                     first_impl.bootstrap_cross_layer(first_layer_name)
+                record_sfa_flight_event(
+                    self.sfa_flight_recorder,
+                    "model_forward_begin",
+                    is_dummy=True,
+                    num_tokens=int(num_tokens_padded),
+                    graph_key=str(staged_dummy_key),
+                )
                 outputs = self._model_forward(
                     num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds
+                )
+                record_sfa_flight_event(
+                    self.sfa_flight_recorder,
+                    "model_forward_end",
+                    is_dummy=True,
+                    num_tokens=int(num_tokens_padded),
+                    graph_key=str(staged_dummy_key),
                 )
             if self.use_aux_hidden_state_outputs:
                 hidden_states, _ = outputs

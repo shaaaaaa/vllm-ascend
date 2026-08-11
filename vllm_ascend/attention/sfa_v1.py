@@ -98,6 +98,7 @@ from vllm_ascend.ops.layer_shard_linear import (
 from vllm_ascend.ops.rotary_embedding import get_cos_and_sin_mla
 from vllm_ascend.ops.triton.rope import rope_forward_triton_siso
 from vllm_ascend.quantization.methods import AscendW8A8LinearMethod
+from vllm_ascend.sfa_flight_recorder import record_sfa_flight_event
 from vllm_ascend.utils import (
     ACL_FORMAT_FRACTAL_ND,
     StagedSFARouteAction,
@@ -147,6 +148,27 @@ def _staged_sfa_profile_scope(name: str):
     if torch.autograd._profiler_enabled():
         return torch.profiler.record_function(name)
     return nullcontext()
+
+
+def _sfa_flight_recorder() -> Any | None:
+    """Return the current host-only recorder when a forward owns one."""
+    if not envs.VLLM_ASCEND_SFA_FLIGHT_RECORDER:
+        return None
+    try:
+        context = get_forward_context()
+    except RuntimeError:
+        return None
+    return getattr(context, "sfa_flight_recorder", None)
+
+
+def _current_npu_capture_state() -> bool | None:
+    """Query capture state without synchronizing or reading device data."""
+    if not envs.VLLM_ASCEND_SFA_FLIGHT_RECORDER:
+        return None
+    try:
+        return bool(torch.npu.is_current_stream_capturing())
+    except (AttributeError, RuntimeError):
+        return None
 
 
 def _configured_resident_shards(mtp: int) -> tuple[int, int]:
@@ -559,7 +581,26 @@ def _prepare_sfa_remap_boundary(
         getattr(attn_metadata, "decode_scratch_capacity", None),
     )
 
+    recorder = _sfa_flight_recorder()
+    record_sfa_flight_event(
+        recorder,
+        "boundary_copy_begin",
+        is_dummy=bool(is_dummy_run),
+        is_capturing=_current_npu_capture_state(),
+        boundary_shape=tuple(int(value) for value in boundary.shape),
+        boundary_address=int(boundary.data_ptr()),
+        boundary_ready=bool(attn_metadata.decode_remap_boundary_ready),
+        source_rows=int(boundary_rows.size),
+        source_contiguous=bool(boundary_rows.flags.c_contiguous),
+    )
     boundary.copy_(torch.from_numpy(boundary_rows))
+    record_sfa_flight_event(
+        recorder,
+        "boundary_copy_end",
+        is_dummy=bool(is_dummy_run),
+        is_capturing=_current_npu_capture_state(),
+        boundary_address=int(boundary.data_ptr()),
+    )
     attn_metadata.decode_remap_boundary_ready = True
     return boundary
 
@@ -2874,6 +2915,14 @@ class AscendSFAImpl(MLAAttentionImpl):
                 request_count,
             )
             self._sorted_resident_workspace_views[request_count] = workspace
+        recorder = _sfa_flight_recorder()
+        record_sfa_flight_event(
+            recorder,
+            "resident_union_begin",
+            request_count=request_count,
+            mtp=int(mtp),
+            is_capturing=_current_npu_capture_state(),
+        )
         prepare_resident_sharded_union_(
             topk_indices,
             split_boundary,
@@ -2883,6 +2932,20 @@ class AscendSFAImpl(MLAAttentionImpl):
             self._sorted_resident_state,
             workspace,
             mtp=mtp,
+        )
+        record_sfa_flight_event(
+            recorder,
+            "resident_union_end",
+            request_count=request_count,
+            mtp=int(mtp),
+            is_capturing=_current_npu_capture_state(),
+        )
+        record_sfa_flight_event(
+            recorder,
+            "resident_fused_begin",
+            request_count=request_count,
+            mtp=int(mtp),
+            is_capturing=_current_npu_capture_state(),
         )
         miss_tokens, miss_counts, target_slots = (
             prepare_sorted_resident_cache_fused_(
@@ -2894,6 +2957,13 @@ class AscendSFAImpl(MLAAttentionImpl):
                 workspace,
                 block_size=self.block_size,
             )
+        )
+        record_sfa_flight_event(
+            recorder,
+            "resident_fused_end",
+            request_count=request_count,
+            mtp=int(mtp),
+            is_capturing=_current_npu_capture_state(),
         )
         return (
             topk_indices,
@@ -3794,6 +3864,15 @@ class AscendSFAImpl(MLAAttentionImpl):
                 context,
                 request_count,
             )
+            recorder = _sfa_flight_recorder()
+            record_sfa_flight_event(
+                recorder,
+                "lmcache_retrieve_begin",
+                layer=layer_name,
+                request_count=int(request_count),
+                graph_key=str(graph_key),
+                is_capturing=_current_npu_capture_state(),
+            )
             wait_for_kv_layer_from_connector(
                 layer_name,
                 selected_tokens=selected_packed[:request_count],
@@ -3802,6 +3881,14 @@ class AscendSFAImpl(MLAAttentionImpl):
                 target_slot_mapping=target_slots[:request_count],
                 selected_token_counts=selected_counts[:request_count],
                 payload_event=producer_event,
+            )
+            record_sfa_flight_event(
+                recorder,
+                "lmcache_retrieve_end",
+                layer=layer_name,
+                request_count=int(request_count),
+                graph_key=str(graph_key),
+                is_capturing=_current_npu_capture_state(),
             )
             self._target_sfa_diag_post_retrieve(target_diagnostic)
             if getattr(self, "_lmcache_load_stat_enabled", False):
@@ -3831,6 +3918,17 @@ class AscendSFAImpl(MLAAttentionImpl):
             context = get_forward_context()
             metadata = context.attn_metadata[layer_name]
             is_dummy = bool(getattr(context, "staged_sfa_graph_dummy_run", False))
+            recorder = _sfa_flight_recorder()
+            record_sfa_flight_event(
+                recorder,
+                "bootstrap_begin",
+                layer=layer_name,
+                is_dummy=is_dummy,
+                is_capturing=_current_npu_capture_state(),
+                runtime_mode=str(context.cudagraph_runtime_mode),
+                graph_key=str(getattr(context, "staged_sfa_graph_key", None)),
+                boundary_ready=bool(metadata.decode_remap_boundary_ready),
+            )
             _prepare_sfa_remap_boundary(
                 metadata,
                 metadata.req_ids,
@@ -3841,6 +3939,16 @@ class AscendSFAImpl(MLAAttentionImpl):
                     if is_dummy
                     else context.staged_sfa_route.frontiers
                 ),
+            )
+            record_sfa_flight_event(
+                recorder,
+                "bootstrap_end",
+                layer=layer_name,
+                is_dummy=is_dummy,
+                is_capturing=_current_npu_capture_state(),
+                runtime_mode=str(context.cudagraph_runtime_mode),
+                graph_key=str(getattr(context, "staged_sfa_graph_key", None)),
+                boundary_ready=bool(metadata.decode_remap_boundary_ready),
             )
             runtime = self._staged_sfa_capture_state.runtime
             if not is_dummy and runtime and runtime[2] is not None and runtime[3]:

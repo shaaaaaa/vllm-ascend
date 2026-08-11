@@ -135,6 +135,7 @@ def set_ascend_forward_context(
     staged_sfa_graph_dummy_run: bool = False,
     staged_sfa_route: StagedSFARouteDecision | None = None,
     staged_sfa_graph_key: StagedSFAGraphKey | None = None,
+    sfa_flight_recorder: Any = None,
 ):
     """A context manager that stores the current forward context,
     can be attention metadata, etc.
@@ -175,6 +176,7 @@ def set_ascend_forward_context(
         forward_context.staged_sfa_graph_dummy_run = staged_sfa_graph_dummy_run
         forward_context.staged_sfa_route = staged_sfa_route
         forward_context.staged_sfa_graph_key = staged_sfa_graph_key
+        forward_context.sfa_flight_recorder = sfa_flight_recorder
         # Async staged PIECEWISE replay fences only the first graph island in
         # one model forward. ForwardContext is the ownership boundary for that
         # state: MTP rows and all layer islands in this forward share it, while

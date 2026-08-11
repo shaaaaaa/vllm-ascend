@@ -476,7 +476,15 @@ class NPUWorker(WorkerBase):
                 comm_postprocess=comm_postprocess,
             )
 
-        output = self.model_runner.execute_model(scheduler_output, intermediate_tensors)
+        try:
+            output = self.model_runner.execute_model(
+                scheduler_output, intermediate_tensors
+            )
+        except Exception as error:
+            recorder = self.model_runner.sfa_flight_recorder
+            if recorder is not None:
+                recorder.dump("execute_model_failed", error)
+            raise
         if isinstance(output, (ModelRunnerOutput, AsyncModelRunnerOutput, NoneType)):
             return output
 
@@ -508,7 +516,13 @@ class NPUWorker(WorkerBase):
 
     @torch.inference_mode()
     def sample_tokens(self, grammar_output: "GrammarOutput") -> ModelRunnerOutput | AsyncModelRunnerOutput:
-        return self.model_runner.sample_tokens(grammar_output)
+        try:
+            return self.model_runner.sample_tokens(grammar_output)
+        except Exception as error:
+            recorder = self.model_runner.sfa_flight_recorder
+            if recorder is not None:
+                recorder.dump("sample_tokens_failed", error)
+            raise
 
     def load_model(self) -> None:
         if self.vllm_config.model_config.enable_sleep_mode:
@@ -654,7 +668,23 @@ class NPUWorker(WorkerBase):
         self.model_runner.reset_encoder_cache()
 
     def execute_dummy_batch(self) -> None:
-        self.model_runner._dummy_run(num_tokens=self.model_runner.decode_token_per_req, uniform_decode=True)
+        recorder = self.model_runner.sfa_flight_recorder
+        if recorder is not None:
+            recorder.record(
+                "dummy_enter",
+                decode_tokens=int(self.model_runner.decode_token_per_req),
+            )
+        try:
+            self.model_runner._dummy_run(
+                num_tokens=self.model_runner.decode_token_per_req,
+                uniform_decode=True,
+            )
+        except Exception as error:
+            if recorder is not None:
+                recorder.dump("execute_dummy_batch_failed", error)
+            raise
+        if recorder is not None:
+            recorder.record("dummy_exit")
 
     def _init_worker_distributed_environment(self) -> None:
         """Initialize the distributed environment."""

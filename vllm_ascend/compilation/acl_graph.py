@@ -21,6 +21,7 @@ from vllm.logger import logger
 from vllm.platforms import current_platform
 
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
+from vllm_ascend.sfa_flight_recorder import record_sfa_flight_event
 
 from ..utils import weak_ref_tensors
 
@@ -277,6 +278,22 @@ class ACLGraphWrapper:
             if self.vllm_config.speculative_config
             else False
         )
+        recorder = getattr(forward_context, "sfa_flight_recorder", None)
+        if staged_graph_key is not None and recorder is not None:
+            record_sfa_flight_event(
+                recorder,
+                "acl_graph_replay_begin",
+                graph_key=str(staged_graph_key),
+                is_dummy=bool(
+                    getattr(
+                        forward_context, "staged_sfa_graph_dummy_run", False
+                    )
+                ),
+                runnable=type(self.runnable).__qualname__,
+                wrapper_id=int(id(self)),
+                layer_idx=getattr(forward_context, "layer_idx", None),
+                synchronize_before_replay=bool(self.synchronize_before_replay),
+            )
         if (
             self.synchronize_before_replay
             and not stream_ordered_staged_replay
@@ -290,6 +307,21 @@ class ACLGraphWrapper:
             if staged_piecewise_replay and async_scheduling is True:
                 forward_context.staged_sfa_replay_fenced = True
         entry.aclgraph.replay()
+        if staged_graph_key is not None and recorder is not None:
+            record_sfa_flight_event(
+                recorder,
+                "acl_graph_replay_end",
+                graph_key=str(staged_graph_key),
+                is_dummy=bool(
+                    getattr(
+                        forward_context, "staged_sfa_graph_dummy_run", False
+                    )
+                ),
+                runnable=type(self.runnable).__qualname__,
+                wrapper_id=int(id(self)),
+                layer_idx=getattr(forward_context, "layer_idx", None),
+                synchronize_before_replay=bool(self.synchronize_before_replay),
+            )
         return entry.output
 
 

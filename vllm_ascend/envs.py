@@ -194,6 +194,18 @@ env_variables: dict[str, Callable[[], Any]] = {
         "VLLM_ASCEND_SFA_STAGED_GRAPH_CAPTURE_SIZES",
         "1",
     ),
+    # Keep host-only staged-SFA phase markers in a per-worker memory ring and
+    # dump them only after a failure. This diagnostic performs no NPU reads or
+    # synchronization. Disabled by default; changing it requires a restart.
+    "VLLM_ASCEND_SFA_FLIGHT_RECORDER": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_SFA_FLIGHT_RECORDER", "0"))
+    ),
+    # Failure dump directory for VLLM_ASCEND_SFA_FLIGHT_RECORDER. Files are
+    # written only after an exception. The directory is not sensitive.
+    "VLLM_ASCEND_SFA_FLIGHT_RECORDER_DIR": lambda: os.getenv(
+        "VLLM_ASCEND_SFA_FLIGHT_RECORDER_DIR",
+        "/tmp/vllm_ascend_sfa_flight",
+    ),
     # Number of blocks for the self-managed paged latent pool (Route 1). 0 = derive a
     # default from max_num_seqs. The pool holds prefill latent during prefill (freed
     # after) + decode latent, sized far below full-context. Tune up for long prompts.
