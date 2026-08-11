@@ -161,6 +161,10 @@ from vllm_ascend.utils import (
     staged_sfa_graph_configuration_errors,
     staged_sfa_graph_configured,
 )
+from vllm_ascend.worker.chunked_prefill_graph_profiler import (
+    ChunkedPrefillGraphProfiler,
+    make_graph_prefill_step,
+)
 from vllm_ascend.worker.dsa_shared_pool import reshape_dsa_shared_pool_raw
 from vllm_ascend.worker.npu_input_batch import NPUInputBatch
 from vllm_ascend.worker.pcp_utils import PCPManager
@@ -446,6 +450,9 @@ class NPUModelRunner(GPUModelRunner):
         self._dp_batch_sync_buffers: dict[int, torch.Tensor] = {}
         self._staged_sfa_startup_capture_attempted = False
         self._profiling_cudagraph_memory = False
+        self.chunked_prefill_graph_profiler: (
+            ChunkedPrefillGraphProfiler | None
+        ) = None
 
         # Ascend-specific configurations
         self.ascend_config = get_ascend_config()
@@ -2001,9 +2008,48 @@ class NPUModelRunner(GPUModelRunner):
             if staged_sfa_graph_key is not None:
                 first_layer_name, first_impl = self._staged_sfa_impls[0]
                 first_impl.bootstrap_cross_layer(first_layer_name)
-            hidden_states = self._model_forward(
-                num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
-            )
+            graph_profile_active = False
+            if self.chunked_prefill_graph_profiler is not None:
+                graph_profile_active = (
+                    self.chunked_prefill_graph_profiler.start_step(
+                        make_graph_prefill_step(
+                            request_ids=self.input_batch.req_ids[:num_reqs],
+                            query_tokens=num_scheduled_tokens_np[:num_reqs],
+                            context_tokens_before=(
+                                self.input_batch.num_computed_tokens_cpu[
+                                    :num_reqs
+                                ]
+                            ),
+                            prompt_tokens=(
+                                self.input_batch.num_prompt_tokens[:num_reqs]
+                            ),
+                            num_tokens_padded=num_tokens_padded,
+                            cudagraph_mode=cudagraph_mode,
+                            graph_capture_count_before=(
+                                compilation_counter.num_cudagraph_captured
+                            ),
+                        )
+                    )
+                )
+            try:
+                hidden_states = self._model_forward(
+                    num_tokens_padded,
+                    input_ids,
+                    positions,
+                    intermediate_tensors,
+                    inputs_embeds,
+                    **model_kwargs,
+                )
+            except BaseException:
+                if graph_profile_active:
+                    assert self.chunked_prefill_graph_profiler is not None
+                    self.chunked_prefill_graph_profiler.abort_step()
+                raise
+            if graph_profile_active:
+                assert self.chunked_prefill_graph_profiler is not None
+                self.chunked_prefill_graph_profiler.finish_step(
+                    compilation_counter.num_cudagraph_captured
+                )
             target_diag_session = getattr(
                 get_forward_context(),
                 "_target_sfa_diag_session",
@@ -4068,6 +4114,30 @@ class NPUModelRunner(GPUModelRunner):
                 self.model = self.load_lora_model(self.model, self.vllm_config, self.device)
         self.model_memory_usage = m.consumed_memory
         logger.info("Loading model weights took %.4f GB", m.consumed_memory / float(2**30))
+
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        self.chunked_prefill_graph_profiler = (
+            ChunkedPrefillGraphProfiler.from_env(
+                enforce_eager=self.model_config.enforce_eager,
+                rank=rank,
+                dp_rank=self.dp_rank,
+                pipeline_parallel_size=(
+                    self.parallel_config.pipeline_parallel_size
+                ),
+                num_hidden_layers=(
+                    self.model_config.get_total_num_hidden_layers()
+                ),
+                max_num_batched_tokens=(
+                    self.scheduler_config.max_num_batched_tokens
+                ),
+            )
+        )
+        if self.chunked_prefill_graph_profiler is not None:
+            logger.warning(
+                "Graph-mode chunked-prefill benchmark is enabled; each "
+                "prefill step will synchronize and write timing data to %s",
+                self.chunked_prefill_graph_profiler.output_path,
+            )
 
         # wrap the model with full graph wrapper if needed.
         if self.compilation_config.cudagraph_mode.has_full_cudagraphs():
