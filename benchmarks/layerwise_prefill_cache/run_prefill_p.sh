@@ -53,7 +53,6 @@ vllm serve "${MODEL}" \
   --host 0.0.0.0 \
   --port "${PORT}" \
   --no-enable-prefix-caching \
-  --disable-log-requests \
   --quantization ascend \
   --compilation-config '{"cudagraph_mode":"PIECEWISE"}' \
   --kv-transfer-config \
