@@ -27,14 +27,15 @@ BENCHMARK = _load_benchmark_module()
 
 
 def test_on_uses_prompt_length_sweep_and_separate_output_paths() -> None:
-    assert BENCHMARK.prompt_multipliers("off") == (1,)
-    assert BENCHMARK.prompt_multipliers("on") == (1, 2, 4)
+    assert BENCHMARK.prompt_multipliers("off", 4) == (1,)
+    assert BENCHMARK.prompt_multipliers("on", 3) == (1, 2, 4)
+    assert BENCHMARK.prompt_multipliers("on", 4) == (1, 2, 4, 8)
     assert BENCHMARK.case_output_path(Path("on.json"), 8) == Path("on-8x.json")
 
 
 def test_each_prompt_length_uses_a_distinct_cache_prefix() -> None:
     digests = []
-    for multiplier in BENCHMARK.prompt_multipliers("on"):
+    for multiplier in BENCHMARK.prompt_multipliers("on", 3):
         prompt = BENCHMARK.make_prompts(
             seed=BENCHMARK.case_seed(1234, "on", multiplier),
             count=1,
@@ -105,5 +106,30 @@ def test_mode_defaults(
     args = BENCHMARK.parse_args()
 
     assert args.prompt_tokens == 65536
+    assert args.rounds == 3
     assert args.chunk_size == 8192
     assert args.timeout == expected_timeout
+
+
+def test_custom_rounds_control_cases_and_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "benchmark_prefill_p.py",
+            "--label",
+            "on",
+            "--rounds",
+            "4",
+            "--output",
+            str(tmp_path / "on.json"),
+        ],
+    )
+
+    args = BENCHMARK.parse_args()
+
+    assert BENCHMARK.prompt_multipliers(args.label, args.rounds) == (1, 2, 4, 8)
+    assert args.timeout == 2400.0

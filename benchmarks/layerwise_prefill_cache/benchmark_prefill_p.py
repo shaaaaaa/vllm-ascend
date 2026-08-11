@@ -30,7 +30,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 BASE_PROMPT_TOKENS = 65536
-ON_PROMPT_MULTIPLIERS = (1, 2, 4)
+DEFAULT_ON_ROUNDS = 3
 DEFAULT_CHUNK_SIZE = 8192
 OFF_TIMEOUT_SECONDS = 300.0
 
@@ -216,8 +216,8 @@ def summarize(
     }
 
 
-def prompt_multipliers(label: str) -> tuple[int, ...]:
-    return ON_PROMPT_MULTIPLIERS if label == "on" else (1,)
+def prompt_multipliers(label: str, rounds: int) -> tuple[int, ...]:
+    return tuple(1 << index for index in range(rounds)) if label == "on" else (1,)
 
 
 def case_output_path(output: Path, multiplier: int) -> Path:
@@ -241,9 +241,15 @@ def parse_args() -> argparse.Namespace:
         "--prompt-tokens",
         type=int,
         default=BASE_PROMPT_TOKENS,
+        help=(f"Base prompt length (default: {BASE_PROMPT_TOKENS}); on multiplies it by successive powers of two"),
+    )
+    parser.add_argument(
+        "--rounds",
+        type=int,
+        default=DEFAULT_ON_ROUNDS,
         help=(
-            f"Base prompt length (default: {BASE_PROMPT_TOKENS}); on runs "
-            f"multipliers {','.join(map(str, ON_PROMPT_MULTIPLIERS))}"
+            f"Number of prompt-length cases for on (default: {DEFAULT_ON_ROUNDS}); "
+            "for example, 3 runs 1x/2x/4x and 4 runs 1x/2x/4x/8x"
         ),
     )
     parser.add_argument("--chunk-size", type=int, default=DEFAULT_CHUNK_SIZE)
@@ -257,17 +263,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--timeout",
         type=float,
-        help=(
-            f"Defaults to {OFF_TIMEOUT_SECONDS:g}s for off and "
-            f"{OFF_TIMEOUT_SECONDS * max(ON_PROMPT_MULTIPLIERS):g}s for on"
-        ),
+        help=(f"Defaults to {OFF_TIMEOUT_SECONDS:g}s times the largest prompt multiplier"),
     )
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args()
 
+    if args.rounds <= 0:
+        parser.error("--rounds must be positive")
     if args.timeout is None:
-        timeout_multiplier = max(prompt_multipliers(args.label))
+        timeout_multiplier = max(prompt_multipliers(args.label, args.rounds))
         args.timeout = OFF_TIMEOUT_SECONDS * timeout_multiplier
 
     if args.prompt_tokens <= 0:
@@ -416,7 +421,7 @@ def print_case_summary(output: dict[str, Any], output_path: Path) -> None:
 
 def main() -> int:
     args = parse_args()
-    multipliers = prompt_multipliers(args.label)
+    multipliers = prompt_multipliers(args.label, args.rounds)
     multiple_cases = len(multipliers) > 1
     case_paths = [
         case_output_path(args.output, multiplier) if multiple_cases else args.output for multiplier in multipliers
