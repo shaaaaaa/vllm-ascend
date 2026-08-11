@@ -22,12 +22,27 @@ import os
 from collections.abc import Callable
 from typing import Any
 
+
+def _strict_bool_env(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name, "true" if default else "false")
+    normalized = raw.strip().lower()
+    if normalized == "true":
+        return True
+    if normalized == "false":
+        return False
+    raise ValueError(f"{name} must be 'true' or 'false', got {raw!r}")
+
 # The begin-* and end* here are used by the documentation generator
 # to extract the used env vars.
 
 # begin-env-vars-definition
 
 env_variables: dict[str, Callable[[], Any]] = {
+    # Explicit PD prefill-node marker and feature gate for the layerwise DSA
+    # child pool. It is intentionally independent of kv_role/kv_rank.
+    "VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE": lambda: _strict_bool_env(
+        "VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE"
+    ),
     # max compile thread number for package building. Usually, it is set to
     # the number of CPU cores. If not set, the default value is None, which
     # means all number of CPU cores will be used.

@@ -26,6 +26,7 @@ from vllm.v1.pool.metadata import PoolingStates
 from vllm.v1.sample.logits_processor import BatchUpdateBuilder, LogitsProcessors
 from vllm.v1.worker.gpu_input_batch import InputBatch
 
+import vllm_ascend.envs as envs_ascend
 from vllm_ascend.worker.block_table import MultiGroupBlockTable
 
 
@@ -103,6 +104,28 @@ class NPUInputBatch(InputBatch):
             kernel_sizes=kernel_block_sizes,
             cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
         )
+        self.layerwise_prefill_block_tables = (self.block_table,)
+        if envs_ascend.VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE:
+            self.layerwise_prefill_block_tables = (
+                self.block_table,
+                *(
+                    MultiGroupBlockTable(
+                        max_num_reqs=max_num_reqs,
+                        max_model_len=max_model_len,
+                        max_num_batched_tokens=max_num_batched_tokens,
+                        pin_memory=pin_memory,
+                        device=device,
+                        block_sizes=block_sizes,
+                        max_num_blocks=max_num_blocks_per_req,
+                        num_speculative_tokens=num_speculative_tokens,
+                        kernel_sizes=kernel_block_sizes,
+                        cp_kv_cache_interleave_size=(
+                            cp_kv_cache_interleave_size
+                        ),
+                    )
+                    for _ in range(2)
+                ),
+            )
 
         # Sampling-related.
         self.temperature = torch.empty((max_num_reqs,), dtype=torch.float32, device=device)

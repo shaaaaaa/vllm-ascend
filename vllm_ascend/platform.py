@@ -274,6 +274,12 @@ class NPUPlatform(Platform):
         parallel_config = vllm_config.parallel_config
         cache_config = vllm_config.cache_config
         ascend_compilation_config = ascend_config.ascend_compilation_config
+        if envs_ascend.VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE:
+            if parallel_config.pipeline_parallel_size != 1:
+                raise ValueError(
+                    "VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE=true requires "
+                    "pipeline_parallel_size == 1"
+                )
         if ascend_compilation_config:
             vllm_config.additional_config.setdefault("ascend_compilation_config", {}).update(
                 vars(ascend_compilation_config)

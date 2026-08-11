@@ -55,6 +55,7 @@ from vllm.v1.attention.backend import AttentionBackend, AttentionMetadata
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
 from vllm.v1.attention.selector import get_attn_backend  # type: ignore
+from vllm.v1.core.dsa_shared_pool import DSABlockAllocationMode
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
@@ -511,6 +512,14 @@ class NPUModelRunner(GPUModelRunner):
         self.dsa_shared_pool = bool(
             self.dsa_two_groups and envs_ascend.VLLM_ASCEND_DSA_SHARED_POOL
         )
+        self.layerwise_prefill_p_node = bool(
+            envs_ascend.VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE
+        )
+        if self.layerwise_prefill_p_node and not self.dsa_shared_pool:
+            raise ValueError(
+                "Layerwise-prefill P nodes require DSA unbundle, two groups, "
+                "and the DSA shared pool"
+            )
         if self.dsa_shared_pool:
             logger.info("DSA shared bundle pool enabled for latent/indexer KV cache.")
         elif envs_ascend.VLLM_ASCEND_DSA_SHARED_POOL:
@@ -1000,6 +1009,95 @@ class NPUModelRunner(GPUModelRunner):
             return staged_sfa_graph_key.request_capacity
         return batch_desc.num_reqs
 
+    def _refresh_layerwise_prefill_block_tables(self):
+        """Rebuild the two shadow-bank tables in current request-row order."""
+        tables = getattr(
+            self.input_batch,
+            "layerwise_prefill_block_tables",
+            (self.input_batch.block_table,),
+        )
+        if not self.layerwise_prefill_p_node:
+            return tables
+        if len(tables) != 3:
+            raise RuntimeError(
+                "Layerwise-prefill P node requires exactly three block tables"
+            )
+
+        for req_index, req_id in enumerate(self.input_batch.req_ids):
+            request = self.requests[req_id]
+            if (
+                request.block_allocation_mode
+                != DSABlockAllocationMode.PREFILL_CHILD
+            ):
+                raise RuntimeError(
+                    "Layerwise-prefill request has the wrong allocation mode: "
+                    f"request_id={req_id}, "
+                    f"mode={request.block_allocation_mode}"
+                )
+            bank_ids = request.block_ids_by_bank
+            if bank_ids is None or len(bank_ids) != 3:
+                raise RuntimeError(
+                    "Layerwise-prefill request is missing its three physical "
+                    f"block banks: request_id={req_id}"
+                )
+            if bank_ids[0] != request.block_ids:
+                raise RuntimeError(
+                    "Layerwise-prefill primary block table differs from bank 0: "
+                    f"request_id={req_id}"
+                )
+            tables[1].add_row(bank_ids[1], req_index)
+            tables[2].add_row(bank_ids[2], req_index)
+        return tables
+
+    @staticmethod
+    def _layerwise_prefill_layer_banks(
+        kv_cache_group: KVCacheGroupSpec,
+        attn_group: AttentionGroup,
+    ) -> tuple[tuple[str, int], ...]:
+        """Return each attention layer's rotating physical-bank index."""
+        layer_positions = {
+            layer_name: index
+            for index, layer_name in enumerate(kv_cache_group.layer_names)
+        }
+        missing = [
+            layer_name
+            for layer_name in attn_group.layer_names
+            if layer_name not in layer_positions
+        ]
+        if missing:
+            raise RuntimeError(
+                "Attention group contains layers absent from its KV-cache "
+                f"group: {missing}"
+            )
+        return tuple(
+            (layer_name, layer_positions[layer_name] % 3)
+            for layer_name in attn_group.layer_names
+        )
+
+    def _layerwise_prefill_common_attn_metadata(
+        self,
+        common_attn_metadata: CommonAttentionMetadata,
+        kv_cache_gid: int,
+        bank: int,
+        block_table_getter: Any,
+    ) -> CommonAttentionMetadata:
+        """Copy common metadata and select one bank for all DSA groups."""
+        layer_cm = copy(common_attn_metadata)
+        (
+            layer_cm.block_table_tensor,
+            layer_cm.slot_mapping,
+        ) = block_table_getter(kv_cache_gid, bank)
+        if (
+            kv_cache_gid == 0
+            and self.dsa_two_groups
+            and len(self.kv_cache_config.kv_cache_groups) == 2
+        ):
+            (
+                layer_cm.indexer_block_table_tensor,
+                layer_cm.indexer_slot_mapping,
+            ) = block_table_getter(1, bank)
+        return layer_cm
+
     def _prepare_inputs(
         self,
         scheduler_output: "SchedulerOutput",
@@ -1019,7 +1117,9 @@ class NPUModelRunner(GPUModelRunner):
 
         # OPTIMIZATION: Start copying the block table first.
         # This way, we can overlap the copy with the following CPU operations.
-        self.input_batch.block_table.commit_block_table(num_reqs)
+        block_tables_by_bank = self._refresh_layerwise_prefill_block_tables()
+        for block_table in block_tables_by_bank:
+            block_table.commit_block_table(num_reqs)
 
         # Get the attention state.
         if not scheduler_output.scheduled_spec_decode_tokens:
@@ -1087,8 +1187,9 @@ class NPUModelRunner(GPUModelRunner):
             cu_num_tokens, arange = self._get_cumsum_and_arange(num_scheduled_tokens)
             np.add(self.input_batch.num_computed_tokens_cpu[req_indices], arange, out=positions_np)
 
-        self.input_batch.block_table.compute_slot_mapping(req_indices, positions_np)
-        self.input_batch.block_table.commit_slot_mapping(total_num_scheduled_tokens)
+        for block_table in block_tables_by_bank:
+            block_table.compute_slot_mapping(req_indices, positions_np)
+            block_table.commit_slot_mapping(total_num_scheduled_tokens)
 
         if self.use_cp:
             self.pcp_manager.init_batch_info(
@@ -2884,7 +2985,10 @@ class NPUModelRunner(GPUModelRunner):
                 num_reqs,
             )
 
-        def _get_block_table_and_slot_mapping(kv_cache_gid: int):
+        def _get_block_table_and_slot_mapping(
+            kv_cache_gid: int,
+            bank: int = 0,
+        ):
             assert num_reqs_padded is not None and num_tokens_padded is not None
             kv_cache_spec = kv_cache_groups[kv_cache_gid].kv_cache_spec
             if self.pcp_size > 1:
@@ -2909,7 +3013,16 @@ class NPUModelRunner(GPUModelRunner):
                     device=self.device,
                 )
             else:
-                blk_table = self.input_batch.block_table[kv_cache_gid]
+                block_tables_by_bank = getattr(
+                    self.input_batch,
+                    "layerwise_prefill_block_tables",
+                    (self.input_batch.block_table,),
+                )
+                if bank < 0 or bank >= len(block_tables_by_bank):
+                    raise RuntimeError(
+                        f"invalid layerwise-prefill bank {bank}"
+                    )
+                blk_table = block_tables_by_bank[bank][kv_cache_gid]
                 slot_mapping = blk_table.slot_mapping.gpu[:maybe_pcp_full_tokens]
                 maybe_num_reqs_padded = num_reqs_padded * self.decode_token_per_req if self.use_cp else num_reqs_padded
                 blk_table_tensor = blk_table.get_device_tensor()[:maybe_num_reqs_padded]
@@ -3050,6 +3163,7 @@ class NPUModelRunner(GPUModelRunner):
             attn_gid: int,
             common_attn_metadata: CommonAttentionMetadata,
             ubid: int | None = None,
+            layer_names: tuple[str, ...] | None = None,
         ) -> None:
             attn_group = self.attn_groups[kv_cache_gid][attn_gid]
             builder = attn_group.get_metadata_builder(ubid or 0)
@@ -3088,7 +3202,7 @@ class NPUModelRunner(GPUModelRunner):
                 assert isinstance(attn_metadata, list)
                 attn_metadata_dict = attn_metadata[ubid]
 
-            for layer_name in attn_group.layer_names:
+            for layer_name in layer_names or tuple(attn_group.layer_names):
                 attn_metadata_dict[layer_name] = attn_metadata_i
 
         # Prepare the attention metadata for each KV cache group and make layers
@@ -3142,7 +3256,28 @@ class NPUModelRunner(GPUModelRunner):
                     spec_decode_common_attn_metadata = cm
 
             for attn_gid in range(len(self.attn_groups[kv_cache_gid])):
-                _build_attn_group_metadata(kv_cache_gid, attn_gid, cm)
+                if not self.layerwise_prefill_p_node:
+                    _build_attn_group_metadata(kv_cache_gid, attn_gid, cm)
+                    continue
+
+                attn_group = self.attn_groups[kv_cache_gid][attn_gid]
+                for layer_name, bank in self._layerwise_prefill_layer_banks(
+                    kv_cache_group, attn_group
+                ):
+                    layer_cm = (
+                        self._layerwise_prefill_common_attn_metadata(
+                            cm,
+                            kv_cache_gid,
+                            bank,
+                            _get_block_table_and_slot_mapping,
+                        )
+                    )
+                    _build_attn_group_metadata(
+                        kv_cache_gid,
+                        attn_gid,
+                        layer_cm,
+                        layer_names=(layer_name,),
+                    )
         if self.is_mm_prefix_lm:
             req_doc_ranges = {}
             for req_id in self.input_batch.req_ids:
@@ -4422,6 +4557,7 @@ class NPUModelRunner(GPUModelRunner):
         """
         # init kv cache tensors
         kv_cache_raw_tensors: dict[str, torch.Tensor | torch.Tensor | None | None] = {}
+        self._layerwise_prefill_global_raw_backing = None
         # prefill disaggregation need the addr of cache tensor be aligned with 2M
         alignment = 2 * 1024 * 1024
         layer_kv_cache_spec = self._get_layer_kv_cache_specs(kv_cache_config)
@@ -4447,12 +4583,28 @@ class NPUModelRunner(GPUModelRunner):
             ):
                 if self.use_sparse_c8_indexer:
                     raise RuntimeError("DSA shared pool does not support sparse C8 indexer.")
-                if self.vllm_config.kv_transfer_config is None:
+                if (
+                    self.vllm_config.kv_transfer_config is None
+                    and not self.layerwise_prefill_p_node
+                ):
                     raw_tensor = torch.zeros(kv_cache_tensor.size, dtype=torch.int8, device=self.device)
                 else:
                     cache_size_aligned = kv_cache_tensor.size + alignment
-                    raw_tensor = torch.zeros(cache_size_aligned, dtype=torch.int8, device=self.device)
-                    raw_tensor = self._align_memory(raw_tensor, alignment)[: kv_cache_tensor.size]
+                    raw_backing = torch.zeros(
+                        cache_size_aligned,
+                        dtype=torch.int8,
+                        device=self.device,
+                    )
+                    raw_tensor = self._align_memory(
+                        raw_backing, alignment
+                    )[: kv_cache_tensor.size]
+                    if self.layerwise_prefill_p_node:
+                        if self._layerwise_prefill_global_raw_backing is not None:
+                            raise RuntimeError(
+                                "Layerwise-prefill P node received more than "
+                                "one global DSA shared tensor"
+                            )
+                        self._layerwise_prefill_global_raw_backing = raw_backing
                 for layer_name_inner in kv_cache_tensor.shared_by:
                     kv_cache_raw_tensors[layer_name_inner] = (raw_tensor,)
                 continue
@@ -4616,6 +4768,10 @@ class NPUModelRunner(GPUModelRunner):
         """
         kv_caches: dict[str, torch.Tensor] = {}
         layer_kv_cache_spec = self._get_layer_kv_cache_specs(kv_cache_config)
+        dsa_shared_views: dict[
+            int,
+            tuple[tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]],
+        ] = {}
         for group in self._kv_cache_spec_attn_group_iterator():
             attn_backend = group.backend
             for layer_name in group.layer_names:
@@ -4635,16 +4791,35 @@ class NPUModelRunner(GPUModelRunner):
                     elt = get_dtype_size(spec.dtype)
                     kv_lora_rank, qk_rope_head_dim, index_head_dim = self.sparse_head_dim
                     if self.dsa_shared_pool and len(raws) == 1:
-                        kv_caches[layer_name] = reshape_dsa_shared_pool_raw(
-                            raws[0],
-                            spec.dtype,
-                            bs,
-                            nh,
-                            kv_lora_rank,
-                            qk_rope_head_dim,
-                            index_head_dim,
-                            is_indexer="indexer" in layer_name,
-                        )
+                        raw = raws[0]
+                        raw_key = id(raw)
+                        views = dsa_shared_views.get(raw_key)
+                        if views is None:
+                            latent_views = reshape_dsa_shared_pool_raw(
+                                raw,
+                                spec.dtype,
+                                bs,
+                                nh,
+                                kv_lora_rank,
+                                qk_rope_head_dim,
+                                index_head_dim,
+                                is_indexer=False,
+                            )
+                            indexer_views = reshape_dsa_shared_pool_raw(
+                                raw,
+                                spec.dtype,
+                                bs,
+                                nh,
+                                kv_lora_rank,
+                                qk_rope_head_dim,
+                                index_head_dim,
+                                is_indexer=True,
+                            )
+                            views = (latent_views, indexer_views)
+                            dsa_shared_views[raw_key] = views
+                        kv_caches[layer_name] = views[
+                            int("indexer" in layer_name)
+                        ]
                         continue
                     # Discriminate by LAYER NAME (grouping may rewrite sparse_head_dim).
                     if "indexer" in layer_name:  # single vector cache

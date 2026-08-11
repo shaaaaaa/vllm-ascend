@@ -2,13 +2,20 @@ import unittest
 from contextlib import nullcontext
 from dataclasses import FrozenInstanceError
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import numpy as np
 import torch
 from vllm.config import CUDAGraphMode
 from vllm.forward_context import BatchDescriptor
-from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, KVCacheGroupSpec, KVCacheTensor
+from vllm.v1.core.dsa_shared_pool import DSABlockAllocationMode
+from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
+    KVCacheConfig,
+    KVCacheGroupSpec,
+    KVCacheTensor,
+    MLAAttentionSpec,
+)
 
 import vllm_ascend.worker.model_runner_v1 as model_runner_module
 from vllm_ascend.ascend_forward_context import (
@@ -262,6 +269,194 @@ class TestResidentRequestState(unittest.TestCase):
         self.assertGreater(int(generations[0]), short_generation)
 
 
+class TestLayerwisePrefillBlockTables(unittest.TestCase):
+    @staticmethod
+    def _build_runner(enabled=True):
+        runner = NPUModelRunner.__new__(NPUModelRunner)
+        runner.layerwise_prefill_p_node = enabled
+        runner.input_batch = SimpleNamespace(
+            block_table=MagicMock(name="primary_table"),
+            req_ids=["req-b", "req-a"],
+        )
+        runner.input_batch.layerwise_prefill_block_tables = (
+            runner.input_batch.block_table,
+            MagicMock(name="bank_1_table"),
+            MagicMock(name="bank_2_table"),
+        )
+        runner.requests = {
+            "req-a": SimpleNamespace(
+                block_ids=([1], [2]),
+                block_ids_by_bank=(
+                    ([1], [2]),
+                    ([11], [12]),
+                    ([21], [22]),
+                ),
+                block_allocation_mode=(
+                    DSABlockAllocationMode.PREFILL_CHILD
+                ),
+            ),
+            "req-b": SimpleNamespace(
+                block_ids=([3], [4]),
+                block_ids_by_bank=(
+                    ([3], [4]),
+                    ([13], [14]),
+                    ([23], [24]),
+                ),
+                block_allocation_mode=(
+                    DSABlockAllocationMode.PREFILL_CHILD
+                ),
+            ),
+        }
+        return runner
+
+    def test_refresh_populates_shadow_tables_in_request_row_order(self):
+        runner = self._build_runner()
+
+        tables = runner._refresh_layerwise_prefill_block_tables()
+
+        self.assertIs(tables[0], runner.input_batch.block_table)
+        self.assertEqual(
+            tables[1].add_row.call_args_list,
+            [
+                call(([13], [14]), 0),
+                call(([11], [12]), 1),
+            ],
+        )
+        self.assertEqual(
+            tables[2].add_row.call_args_list,
+            [
+                call(([23], [24]), 0),
+                call(([21], [22]), 1),
+            ],
+        )
+
+    def test_refresh_is_noop_when_feature_is_disabled(self):
+        runner = self._build_runner(enabled=False)
+
+        tables = runner._refresh_layerwise_prefill_block_tables()
+
+        self.assertEqual(
+            tables, runner.input_batch.layerwise_prefill_block_tables
+        )
+        tables[1].add_row.assert_not_called()
+        tables[2].add_row.assert_not_called()
+
+    def test_refresh_rejects_invalid_request_metadata(self):
+        cases = (
+            (
+                "table count",
+                lambda runner: setattr(
+                    runner.input_batch,
+                    "layerwise_prefill_block_tables",
+                    (runner.input_batch.block_table,),
+                ),
+                "exactly three block tables",
+            ),
+            (
+                "allocation mode",
+                lambda runner: setattr(
+                    runner.requests["req-b"],
+                    "block_allocation_mode",
+                    DSABlockAllocationMode.FULL_PARENT,
+                ),
+                "wrong allocation mode",
+            ),
+            (
+                "bank count",
+                lambda runner: setattr(
+                    runner.requests["req-b"],
+                    "block_ids_by_bank",
+                    (([3], [4]), ([13], [14])),
+                ),
+                "missing its three physical block banks",
+            ),
+            (
+                "primary mismatch",
+                lambda runner: setattr(
+                    runner.requests["req-b"],
+                    "block_ids_by_bank",
+                    (([99], [4]), ([13], [14]), ([23], [24])),
+                ),
+                "differs from bank 0",
+            ),
+        )
+        for name, mutate, error in cases:
+            with self.subTest(name=name):
+                runner = self._build_runner()
+                mutate(runner)
+                with self.assertRaisesRegex(RuntimeError, error):
+                    runner._refresh_layerwise_prefill_block_tables()
+
+    def test_layer_banks_rotate_and_reject_foreign_layers(self):
+        kv_cache_group = SimpleNamespace(
+            layer_names=[f"layer-{index}" for index in range(7)]
+        )
+        attn_group = SimpleNamespace(
+            layer_names=["layer-0", "layer-2", "layer-3", "layer-6"]
+        )
+
+        self.assertEqual(
+            NPUModelRunner._layerwise_prefill_layer_banks(
+                kv_cache_group, attn_group
+            ),
+            (
+                ("layer-0", 0),
+                ("layer-2", 2),
+                ("layer-3", 0),
+                ("layer-6", 0),
+            ),
+        )
+        with self.assertRaisesRegex(RuntimeError, "absent"):
+            NPUModelRunner._layerwise_prefill_layer_banks(
+                kv_cache_group,
+                SimpleNamespace(layer_names=["foreign-layer"]),
+            )
+
+    def test_graph_metadata_keeps_same_preallocated_bank_for_dsa_groups(self):
+        runner = self._build_runner()
+        runner.dsa_two_groups = True
+        runner.kv_cache_config = SimpleNamespace(
+            kv_cache_groups=[object(), object()]
+        )
+        bank_tensors = {
+            (0, 2): (torch.empty(1), torch.empty(2, dtype=torch.long)),
+            (1, 2): (torch.empty(3), torch.empty(4, dtype=torch.long)),
+        }
+        common = SimpleNamespace(
+            block_table_tensor=torch.empty(5),
+            slot_mapping=torch.empty(6, dtype=torch.long),
+            indexer_block_table_tensor=torch.empty(7),
+            indexer_slot_mapping=torch.empty(8, dtype=torch.long),
+        )
+        original_table = common.block_table_tensor
+        original_indexer_table = common.indexer_block_table_tensor
+        getter = MagicMock(
+            side_effect=lambda group, bank: bank_tensors[(group, bank)]
+        )
+
+        selected = runner._layerwise_prefill_common_attn_metadata(
+            common, 0, 2, getter
+        )
+
+        self.assertIsNot(selected, common)
+        self.assertIs(selected.block_table_tensor, bank_tensors[(0, 2)][0])
+        self.assertIs(selected.slot_mapping, bank_tensors[(0, 2)][1])
+        self.assertIs(
+            selected.indexer_block_table_tensor,
+            bank_tensors[(1, 2)][0],
+        )
+        self.assertIs(
+            selected.indexer_slot_mapping,
+            bank_tensors[(1, 2)][1],
+        )
+        self.assertEqual(getter.call_args_list, [
+            call(0, 2),
+            call(1, 2),
+        ])
+        self.assertIs(common.block_table_tensor, original_table)
+        self.assertIs(common.indexer_block_table_tensor, original_indexer_table)
+
+
 class TestNPUModelRunnerKVCache(unittest.TestCase):
     def _build_runner(self):
         runner = NPUModelRunner.__new__(NPUModelRunner)
@@ -288,6 +483,133 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
         )
         runner.attn_backend = backend
         return runner
+
+    @staticmethod
+    def _make_dsa_shared_config(
+        layer_count=2,
+    ):
+        latent_names = [f"model.layers.{i}.self_attn.attn" for i in range(layer_count)]
+        indexer_names = [f"model.layers.{i}.self_attn.indexer" for i in range(layer_count)]
+        latent_spec = MLAAttentionSpec(
+            block_size=1,
+            num_kv_heads=1,
+            head_size=576,
+            dtype=torch.float16,
+        )
+        indexer_spec = MLAAttentionSpec(
+            block_size=1,
+            num_kv_heads=1,
+            head_size=128,
+            dtype=torch.float16,
+        )
+        # One DSA bundle: lcm(576 * 2, 128 * 2) bytes.
+        tensor_size = 2304
+        config = KVCacheConfig(
+            num_blocks=1,
+            kv_cache_tensors=[
+                KVCacheTensor(
+                    size=tensor_size,
+                    shared_by=[*latent_names, *indexer_names],
+                )
+            ],
+            kv_cache_groups=[
+                KVCacheGroupSpec(
+                    layer_names=latent_names,
+                    kv_cache_spec=latent_spec,
+                ),
+                KVCacheGroupSpec(
+                    layer_names=indexer_names,
+                    kv_cache_spec=indexer_spec,
+                ),
+            ],
+        )
+        return config, latent_names, indexer_names
+
+    def _enable_layerwise_dsa_shared_pool(self, runner):
+        runner.use_sparse = True
+        runner.dsa_shared_pool = True
+        runner.dsa_unbundle = True
+        runner.layerwise_prefill_p_node = True
+        runner.sparse_head_dim = (512, 64, 128)
+        runner.kv_cache_dtype = torch.float16
+
+    def test_layerwise_prefill_allocates_one_aligned_global_slab(self):
+        runner = self._build_runner()
+        self._enable_layerwise_dsa_shared_pool(runner)
+        config, latent_names, indexer_names = self._make_dsa_shared_config()
+
+        raw_tensors = runner._allocate_kv_cache_tensors(config)
+
+        all_names = [*latent_names, *indexer_names]
+        first_tuple = raw_tensors[all_names[0]]
+        self.assertTrue(
+            all(raw_tensors[name] is first_tuple for name in all_names)
+        )
+        self.assertEqual(len(first_tuple), 1)
+        self.assertEqual(first_tuple[0].numel(), 2304)
+        self.assertEqual(first_tuple[0].data_ptr() % (2 * 1024 * 1024), 0)
+        self.assertIsNotNone(runner._layerwise_prefill_global_raw_backing)
+        self.assertGreater(
+            runner._layerwise_prefill_global_raw_backing.numel(),
+            first_tuple[0].numel(),
+        )
+
+    def test_layerwise_prefill_reshapes_shared_slab_once_per_view_type(self):
+        runner = self._build_runner()
+        self._enable_layerwise_dsa_shared_pool(runner)
+        config, latent_names, indexer_names = self._make_dsa_shared_config()
+        raw_tensors = runner._allocate_kv_cache_tensors(config)
+        runner._kv_cache_spec_attn_group_iterator = lambda: [
+            SimpleNamespace(
+                backend=runner.attn_backend,
+                layer_names=group.layer_names,
+                kv_cache_spec=group.kv_cache_spec,
+            )
+            for group in config.kv_cache_groups
+        ]
+        original_reshape = model_runner_module.reshape_dsa_shared_pool_raw
+
+        with patch.object(
+            model_runner_module,
+            "reshape_dsa_shared_pool_raw",
+            wraps=original_reshape,
+        ) as reshape:
+            kv_caches = runner._reshape_kv_cache_tensors(
+                config, raw_tensors
+            )
+
+        self.assertEqual(reshape.call_count, 2)
+        self.assertIs(kv_caches[latent_names[0]], kv_caches[latent_names[1]])
+        self.assertIs(
+            kv_caches[indexer_names[0]], kv_caches[indexer_names[1]]
+        )
+        self.assertEqual(len(kv_caches[latent_names[0]]), 2)
+        self.assertEqual(len(kv_caches[indexer_names[0]]), 1)
+        latent_storage = kv_caches[latent_names[0]][0].untyped_storage()
+        indexer_storage = kv_caches[indexer_names[0]][0].untyped_storage()
+        self.assertEqual(
+            latent_storage.data_ptr(), indexer_storage.data_ptr()
+        )
+
+    def test_layerwise_prefill_rejects_multiple_global_slabs(self):
+        runner = self._build_runner()
+        self._enable_layerwise_dsa_shared_pool(runner)
+        config, latent_names, indexer_names = self._make_dsa_shared_config(
+            layer_count=2
+        )
+        config.kv_cache_tensors = [
+            KVCacheTensor(
+                size=2304,
+                shared_by=[latent_names[0], indexer_names[0]],
+            ),
+            KVCacheTensor(
+                size=2304,
+                shared_by=[latent_names[1], indexer_names[1]],
+            ),
+        ]
+
+        with self.assertRaisesRegex(RuntimeError, "more than one global"):
+            runner._allocate_kv_cache_tensors(config)
 
     def test_allocate_kv_cache_uses_layer_spec_for_draft_gqa(self):
         runner = self._build_runner()
