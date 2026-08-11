@@ -20,9 +20,6 @@ PORT="${PORT:-9960}"
 RUN_ID="$(date +%Y%m%d_%H%M%S)"
 OUTPUT_DIR="/workspace/lmy/layerwise-prefill-bench/${MODE}-${RUN_ID}"
 LOG="${OUTPUT_DIR}/server.log"
-COMPILATION_CONFIG="$(printf \
-  '{"cudagraph_mode":"PIECEWISE","cudagraph_capture_sizes":[1,%s]}' \
-  "${CHUNK_SIZE}")"
 
 mkdir -p "${OUTPUT_DIR}"
 printf 'MODE=%s\nLAYERWISE=%s\nLOG=%s\n' "${MODE}" "${LAYERWISE}" "${LOG}"
@@ -58,7 +55,7 @@ vllm serve "${MODEL}" \
   --port "${PORT}" \
   --no-enable-prefix-caching \
   --quantization ascend \
-  --compilation-config "${COMPILATION_CONFIG}" \
+  --compilation-config '{"cudagraph_mode":"PIECEWISE"}' \
   --kv-transfer-config \
     '{"kv_connector":"LMCacheAscendConnectorV1Dynamic","kv_role":"kv_producer","kv_connector_module_path":"lmcache_ascend.integration.vllm.lmcache_ascend_connector_v1"}' \
   2>&1 | tee "${LOG}"
