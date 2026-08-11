@@ -541,17 +541,20 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
         raw_tensors = runner._allocate_kv_cache_tensors(config)
 
         all_names = [*latent_names, *indexer_names]
-        first_tuple = raw_tensors[all_names[0]]
+        first_raw = raw_tensors[all_names[0]][0]
         self.assertTrue(
-            all(raw_tensors[name] is first_tuple for name in all_names)
+            all(
+                len(raw_tensors[name]) == 1
+                and raw_tensors[name][0] is first_raw
+                for name in all_names
+            )
         )
-        self.assertEqual(len(first_tuple), 1)
-        self.assertEqual(first_tuple[0].numel(), 2304)
-        self.assertEqual(first_tuple[0].data_ptr() % (2 * 1024 * 1024), 0)
+        self.assertEqual(first_raw.numel(), 2304)
+        self.assertEqual(first_raw.data_ptr() % (2 * 1024 * 1024), 0)
         self.assertIsNotNone(runner._layerwise_prefill_global_raw_backing)
         self.assertGreater(
             runner._layerwise_prefill_global_raw_backing.numel(),
-            first_tuple[0].numel(),
+            first_raw.numel(),
         )
 
     def test_layerwise_prefill_reshapes_shared_slab_once_per_view_type(self):
