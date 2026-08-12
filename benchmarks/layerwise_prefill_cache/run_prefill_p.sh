@@ -30,10 +30,11 @@ PORT="${PORT:-9960}"
 RUN_ID="$(date +%Y%m%d_%H%M%S)"
 OUTPUT_DIR="/workspace/lmy/layerwise-prefill-bench/${MODE}-${RUN_ID}"
 LOG="${OUTPUT_DIR}/server.log"
+PROFILE_DIR="${PROFILE_DIR:-${OUTPUT_DIR}/profile}"
 
-mkdir -p "${OUTPUT_DIR}"
-printf 'MODE=%s\nLAYERWISE=%s\nMAX_MODEL_LEN=%s\nLOG=%s\n' \
-  "${MODE}" "${LAYERWISE}" "${MAX_MODEL_LEN}" "${LOG}"
+mkdir -p "${OUTPUT_DIR}" "${PROFILE_DIR}"
+printf 'MODE=%s\nLAYERWISE=%s\nMAX_MODEL_LEN=%s\nLOG=%s\nPROFILE_DIR=%s\n' \
+  "${MODE}" "${LAYERWISE}" "${MAX_MODEL_LEN}" "${LOG}" "${PROFILE_DIR}"
 
 VLLM_USE_V1=1 \
 VLLM_ALLOW_LONG_MAX_MODEL_LEN="${ALLOW_LONG_MAX_MODEL_LEN}" \
@@ -68,6 +69,8 @@ vllm serve "${MODEL}" \
   --no-enable-prefix-caching \
   --quantization ascend \
   --compilation-config '{"cudagraph_mode":"PIECEWISE"}' \
+  --profiler-config \
+    "{\"profiler\":\"torch\",\"torch_profiler_dir\":\"${PROFILE_DIR}\",\"torch_profiler_with_stack\":false,\"torch_profiler_with_memory\":false,\"ignore_frontend\":true}" \
   --kv-transfer-config \
     '{"kv_connector":"LMCacheAscendConnectorV1Dynamic","kv_role":"kv_producer","kv_connector_module_path":"lmcache_ascend.integration.vllm.lmcache_ascend_connector_v1"}' \
   2>&1 | tee "${LOG}"
