@@ -9,6 +9,7 @@ import random
 import struct
 import threading
 import time
+import uuid
 from collections import OrderedDict, defaultdict, deque
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
@@ -67,6 +68,8 @@ LIVE_SPLIT_CAPABILITY = "ascend_live_split_v1"
 LIVE_SPLIT_SOURCE_DESCRIPTOR = "ascend_live_split_source_v1"
 MAX_PENDING_SPLIT_REQUESTS = 64
 MAX_TASK_HISTORY_SIZE = 16000
+MAX_SPLIT_TRANSFER_ID_LENGTH = 64
+SPLIT_DONE_MAX_ATTEMPTS = 3
 
 
 class RemotePortInfo(TypedDict):
@@ -147,6 +150,7 @@ class ReqMeta:
     split_fallback: bool = False
     split_source: tuple[SplitSourceDescriptor, ...] | None = None
     split_source_invalid: bool = False
+    split_transfer_id: str | None = None
 
 
 @dataclass
@@ -184,8 +188,14 @@ class KVCacheTaskTracker:
         self.split_results: dict[str, str] = {}
         self.split_leases: set[str] = set()
         self.split_terminal_requests: OrderedDict[str, None] = OrderedDict()
+        self.split_transfer_ids: dict[str, str] = {}
+        self.early_split_results: OrderedDict[tuple[str, str], str] = (
+            OrderedDict()
+        )
 
-    def add_req_to_process(self, request_id: str):
+    def add_req_to_process(
+        self, request_id: str, split_transfer_id: str | None = None
+    ):
         with self.done_task_lock:
             if request_id in self.reqs_to_process:
                 return
@@ -194,6 +204,13 @@ class KVCacheTaskTracker:
             self.split_results.pop(request_id, None)
             self.split_leases.discard(request_id)
             self.split_terminal_requests.pop(request_id, None)
+            if split_transfer_id is None:
+                self.split_transfer_ids.pop(request_id, None)
+            else:
+                for key in tuple(self.early_split_results):
+                    if key[0] == request_id and key[1] != split_transfer_id:
+                        self.early_split_results.pop(key, None)
+                self.split_transfer_ids[request_id] = split_transfer_id
             self.reqs_to_process.add(request_id)
 
     def add_not_transfer_request(self, request_id: str):
@@ -214,12 +231,29 @@ class KVCacheTaskTracker:
                 )
 
     def complete_split_request(
-        self, request_id: str, status: str, mark_finished: bool = True
+        self,
+        request_id: str,
+        status: str,
+        mark_finished: bool = True,
+        split_transfer_id: str | None = None,
     ):
         """Record one terminal ACK; duplicate ACKs are harmless."""
         with self.done_task_lock:
+            current = self.split_transfer_ids.get(request_id)
+            if current is not None and split_transfer_id is None:
+                return False
+            if split_transfer_id is not None:
+                if current is None:
+                    self.early_split_results[
+                        (request_id, split_transfer_id)
+                    ] = status
+                    if len(self.early_split_results) > MAX_TASK_HISTORY_SIZE:
+                        self.early_split_results.popitem(last=False)
+                    return True
+                if current != split_transfer_id:
+                    return False
             if request_id in self.split_terminal_requests:
-                return
+                return True
             self.split_terminal_requests[request_id] = None
             if len(self.split_terminal_requests) > MAX_TASK_HISTORY_SIZE:
                 self.split_terminal_requests.popitem(last=False)
@@ -229,6 +263,8 @@ class KVCacheTaskTracker:
             self.reqs_to_process.discard(request_id)
             self.delayed_free_requests.pop(request_id, None)
             self.split_leases.discard(request_id)
+            self.split_transfer_ids.pop(request_id, None)
+            return True
 
     def get_and_clear_split_results(self) -> dict[str, str]:
         with self.done_task_lock:
@@ -250,14 +286,31 @@ class KVCacheTaskTracker:
         return finished_requests
 
     def add_delayed_request(
-        self, request_id: str, delay_start_time: float, split: bool = False
+        self,
+        request_id: str,
+        delay_start_time: float,
+        split: bool = False,
+        split_transfer_id: str | None = None,
     ):
         """Add a delayed free request."""
         with self.done_task_lock:
             if request_id in self.reqs_to_process:
                 self.delayed_free_requests[request_id] = delay_start_time
                 if split:
+                    if split_transfer_id is not None:
+                        self.split_transfer_ids[request_id] = split_transfer_id
                     self.split_leases.add(request_id)
+                    early_status = self.early_split_results.pop(
+                        (request_id, split_transfer_id), None
+                    )
+                    if early_status is not None:
+                        self.split_terminal_requests[request_id] = None
+                        self.split_results[request_id] = early_status
+                        self.finished_requests.add(request_id)
+                        self.reqs_to_process.discard(request_id)
+                        self.delayed_free_requests.pop(request_id, None)
+                        self.split_leases.discard(request_id)
+                        self.split_transfer_ids.pop(request_id, None)
 
     def _retrieve_expired_requests(self):
         """Retrieve all expired delayed requests."""
@@ -274,6 +327,7 @@ class KVCacheTaskTracker:
                 if request_id in self.split_leases:
                     self.split_results.setdefault(request_id, "timeout")
                     self.split_leases.discard(request_id)
+                    self.split_transfer_ids.pop(request_id, None)
                     self.split_terminal_requests[request_id] = None
                 logger.info("Force freed request: %s", request_id)
             else:
@@ -324,10 +378,18 @@ class KVCacheSendingThread(threading.Thread):
         self.task_tracker.add_not_transfer_request(request_id)
 
     def add_delayed_request(
-        self, request_id: str, delay_start_time: float, split: bool = False
+        self,
+        request_id: str,
+        delay_start_time: float,
+        split: bool = False,
+        split_transfer_id: str | None = None,
     ):
         return self.task_tracker.add_delayed_request(
-            request_id, delay_start_time, split=split)
+            request_id,
+            delay_start_time,
+            split=split,
+            split_transfer_id=split_transfer_id,
+        )
 
     def run(self):
         """Run the thread to handle KV cache transfer requests."""
@@ -395,10 +457,22 @@ class KVCacheSendingThread(threading.Thread):
                             logger.debug("Socket not ready, retrying to send ACK for request %s", msg[1])
                             time.sleep(0.01)
                 elif msg[0] == SPLIT_DONE_MSG:
-                    request_id, status = msg[1], msg[2]
+                    if len(msg) not in (3, 4):
+                        raise ValueError("Invalid split completion message")
+                    request_id, status = msg[1:3]
+                    split_transfer_id = msg[3] if len(msg) == 4 else None
+                    if (
+                        split_transfer_id is not None
+                        and not isinstance(split_transfer_id, str)
+                    ):
+                        raise ValueError("Invalid split transfer identity")
                     if status not in ("success", "failure", "cancelled", "fallback"):
                         status = "failure"
-                    self.task_tracker.complete_split_request(request_id, status)
+                    self.task_tracker.complete_split_request(
+                        request_id,
+                        status,
+                        split_transfer_id=split_transfer_id,
+                    )
                     while True:
                         try:
                             sock.send_multipart(
@@ -459,8 +533,8 @@ class KVCacheRecvingThread(threading.Thread):
         self.request_queue: queue.Queue[Any] = queue.Queue()
         self.executor = ThreadPoolExecutor(max_workers=32)
         self.split_request_lock = threading.Lock()
-        self.active_split_requests: set[str] = set()
-        self.cancelled_split_requests: set[str] = set()
+        self.active_split_requests: dict[str, str | None] = {}
+        self.cancelled_split_requests: set[tuple[str, str | None]] = set()
 
         self.task_tracker = KVCacheTaskTracker()
 
@@ -508,6 +582,7 @@ class KVCacheRecvingThread(threading.Thread):
         remote_port_send_num: dict[int, RemotePortInfo] | None = None,
         all_task_done: bool = False,
         split_plan: SplitTransferPlan | None = None,
+        split_transfer_id: str | None = None,
     ):
         """Add a new request to the queue for processing."""
         if remote_port_send_num is None:
@@ -526,12 +601,19 @@ class KVCacheRecvingThread(threading.Thread):
                 "remote_port_send_num": remote_port_send_num,
                 "all_task_done": all_task_done,
                 "split_plan": split_plan,
-            }
+                "split_transfer_id": split_transfer_id,
+        }
         if split_plan is not None:
             if self.request_queue.qsize() >= MAX_PENDING_SPLIT_REQUESTS:
                 return False
             with self.split_request_lock:
-                self.active_split_requests.add(request_id)
+                active = self.active_split_requests.get(request_id)
+                if (
+                    request_id in self.active_split_requests
+                    and active != split_transfer_id
+                ):
+                    return False
+                self.active_split_requests[request_id] = split_transfer_id
             self.request_queue.put_nowait(request_data)
         else:
             self.request_queue.put(request_data)
@@ -541,7 +623,8 @@ class KVCacheRecvingThread(threading.Thread):
         with self.split_request_lock:
             if request_id not in self.active_split_requests:
                 return False
-            self.cancelled_split_requests.add(request_id)
+            split_transfer_id = self.active_split_requests[request_id]
+            self.cancelled_split_requests.add((request_id, split_transfer_id))
             return True
 
     def get_and_clear_finished_requests(self) -> set[str]:
@@ -575,11 +658,12 @@ class KVCacheRecvingThread(threading.Thread):
         all_task_done = req_meta["all_task_done"]
 
         split_plan = req_meta.get("split_plan")
+        split_transfer_id = req_meta.get("split_transfer_id")
         split_status = "success"
         try:
             if split_plan is not None:
                 with self.split_request_lock:
-                    if request_id in self.cancelled_split_requests:
+                    if (request_id, split_transfer_id) in self.cancelled_split_requests:
                         split_status = "cancelled"
             if split_status == "cancelled":
                 raise InterruptedError("Split transfer was cancelled")
@@ -587,7 +671,7 @@ class KVCacheRecvingThread(threading.Thread):
             self._transfer_kv_cache(req_meta)
             if split_plan is not None:
                 with self.split_request_lock:
-                    if request_id in self.cancelled_split_requests:
+                    if (request_id, split_transfer_id) in self.cancelled_split_requests:
                         split_status = "cancelled"
             logger.debug(f"Finished transferring KV cache for request {remote_request_id}.")
         except InterruptedError:
@@ -611,13 +695,17 @@ class KVCacheRecvingThread(threading.Thread):
                 self.request_queue.task_done()
                 self.task_tracker.complete_split_request(
                     request_id, split_status,
-                    mark_finished=False)
-                self._send_split_done_signal(
+                    mark_finished=False,
+                    split_transfer_id=split_transfer_id)
+                self.executor.submit(
+                    self._send_split_done_signal,
                     remote_request_id, remote_host, remote_handshake_port,
-                    split_status)
+                    split_status, split_transfer_id)
                 with self.split_request_lock:
-                    self.active_split_requests.discard(request_id)
-                    self.cancelled_split_requests.discard(request_id)
+                    if self.active_split_requests.get(request_id) == split_transfer_id:
+                        self.active_split_requests.pop(request_id, None)
+                    self.cancelled_split_requests.discard(
+                        (request_id, split_transfer_id))
 
     def _send_done_signal_to_free_remote_port(
         self, request_id: str, remote_host: str, remote_port_send_num: dict[int, RemotePortInfo]
@@ -1016,27 +1104,53 @@ class KVCacheRecvingThread(threading.Thread):
 
     def _send_split_done_signal(
         self, request_id: str, remote_host: str,
-        remote_handshake_port: int, status: str
-    ) -> None:
-        sock = None
-        try:
-            sock = self._get_remote_socket(remote_host, remote_handshake_port)
-            ensure_zmq_send(
-                sock, self.encoder.encode((SPLIT_DONE_MSG, request_id, status)),
-                f"{remote_host}:{remote_handshake_port}")
-            response = ensure_zmq_recv(
-                sock, self.remote_poller,
-                f"{remote_host}:{remote_handshake_port}", timeout=self.timeout)
-            if response != b"ACK":
-                raise RuntimeError("Split completion was not acknowledged")
-        except RuntimeError:
-            if isinstance(sock, zmq.Socket):
-                sock.close()
-                sock = None
-            logger.warning("Split completion ACK failed for request %s", request_id)
-        finally:
-            if sock is not None:
-                self._return_remote_socket(sock, remote_host, remote_handshake_port)
+        remote_handshake_port: int, status: str,
+        split_transfer_id: str | None,
+    ) -> bool:
+        for attempt in range(SPLIT_DONE_MAX_ATTEMPTS):
+            context = zmq.Context()  # type: ignore
+            sock = None
+            try:
+                sock = make_zmq_socket(
+                    ctx=context,
+                    path=make_zmq_path(
+                        "tcp", remote_host, remote_handshake_port
+                    ),
+                    socket_type=zmq.REQ,  # type: ignore
+                    bind=False,
+                    linger=0,
+                )
+                sock.setsockopt(zmq.SNDTIMEO, int(self.timeout * 1000))
+                poller = zmq.Poller()  # type: ignore
+                poller.register(sock, zmq.POLLIN)  # type: ignore
+                ensure_zmq_send(
+                    sock,
+                    self.encoder.encode(
+                        (SPLIT_DONE_MSG, request_id, status)
+                        if split_transfer_id is None
+                        else (
+                            SPLIT_DONE_MSG,
+                            request_id,
+                            status,
+                            split_transfer_id,
+                        )
+                    ),
+                    f"{remote_host}:{remote_handshake_port}")
+                response = ensure_zmq_recv(
+                    sock, poller,
+                    f"{remote_host}:{remote_handshake_port}", timeout=self.timeout)
+                if response != b"ACK":
+                    raise RuntimeError("Split completion was not acknowledged")
+                return True
+            except (RuntimeError, zmq.ZMQError):  # type: ignore
+                if attempt + 1 < SPLIT_DONE_MAX_ATTEMPTS:
+                    time.sleep(0.05 * (attempt + 1))
+            finally:
+                if sock is not None:
+                    sock.close()
+                context.term()
+        logger.warning("Split completion ACK failed for request %s", request_id)
+        return False
 
     def _get_remote_socket(self, remote_host: str, remote_handshake_port: int) -> zmq.Socket:  # type: ignore
         """Get a socket to the remote host."""
@@ -1072,11 +1186,13 @@ class KVCacheRecvingThread(threading.Thread):
 
 
 class MooncakeConnectorMetadata(KVConnectorMetadata):
-    def __init__(self):
+    def __init__(self, live_split_topology_supported: bool = True):
         self.requests: dict[str, ReqMeta] = {}
         self.requests_to_send: dict[str, float] = {}
         self.reqs_in_batch: set[str] = set()
         self.split_requests_to_send: set[str] = set()
+        self.split_transfer_ids: dict[str, str] = {}
+        self.live_split_topology_supported = live_split_topology_supported
 
     def add_new_req(
         self,
@@ -1104,6 +1220,17 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
         split_negotiated = (
             LIVE_SPLIT_CAPABILITY in capabilities or split_plan is not None
         )
+        split_transfer_id = kv_transfer_params.get("live_split_transfer_id")
+        if split_negotiated and not self.live_split_topology_supported:
+            split_plan = None
+            split_source_invalid = True
+        if split_negotiated and (
+            not isinstance(split_transfer_id, str)
+            or not split_transfer_id
+            or len(split_transfer_id) > MAX_SPLIT_TRANSFER_ID_LENGTH
+        ):
+            split_source_invalid = True
+            split_transfer_id = None
         self.requests[request_id] = ReqMeta(
             local_block_ids=local_block_ids,
             num_external_tokens=num_external_tokens,
@@ -1121,6 +1248,7 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
             split_negotiated=split_negotiated,
             split_source=split_source,
             split_source_invalid=split_source_invalid,
+            split_transfer_id=split_transfer_id,
         )
 
     @staticmethod
@@ -1300,14 +1428,20 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
                     else self._parse_split_plan(raw_plan)
                 )
                 if plan is not None:
+                    requested_groups = tuple(
+                        group for group in plan.requested_groups
+                        if group in supported_groups
+                    )
+                    if not requested_groups:
+                        raise ValueError("No requested live-split group is supported")
                     segments = tuple(
                         segment
                         for segment in plan.segments
-                        if segment.group_id in supported_groups
+                        if segment.group_id in requested_groups
                     )
                     totals = tuple(
                         plan.group_byte_totals[group_id]
-                        if group_id in supported_groups
+                        if group_id in requested_groups
                         else 0
                         for group_id in range(2)
                     )
@@ -1316,7 +1450,7 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
                         group_byte_totals=totals,
                         tp_rank=plan.tp_rank,
                         dp_rank=plan.dp_rank,
-                        requested_groups=supported_groups,
+                        requested_groups=requested_groups,
                     )
                 meta.split_plan = plan
             except (KeyError, TypeError, ValueError):
@@ -1478,6 +1612,7 @@ class MooncakeConnectorScheduler:
         self.pcp_size = vllm_config.parallel_config.prefill_context_parallel_size
         self.dcp_size = vllm_config.parallel_config.decode_context_parallel_size
         self.tp_size = vllm_config.parallel_config.tensor_parallel_size
+        self.pp_size = vllm_config.parallel_config.pipeline_parallel_size
         self.max_device_id = (
             vllm_config.parallel_config.tensor_parallel_size
             * vllm_config.parallel_config.data_parallel_size
@@ -1500,6 +1635,7 @@ class MooncakeConnectorScheduler:
         self._reqs_need_send: dict[str, float] = {}
         self._reqs_in_batch: set[str] = set()
         self._split_reqs_need_send: set[str] = set()
+        self.split_transfer_ids: dict[str, str] = {}
 
         # master-slave meta information for cross-nodes
         self.multi_nodes_meta_mapping: dict[str, dict[str, Any]] = {}
@@ -1614,7 +1750,9 @@ class MooncakeConnectorScheduler:
         self,
         scheduler_output: SchedulerOutput,
     ) -> KVConnectorMetadata:
-        meta = MooncakeConnectorMetadata()
+        meta = MooncakeConnectorMetadata(
+            self.pp_size == 1 and self.pcp_size == 1 and self.dcp_size == 1
+        )
 
         # Loop through scheduled reqs and convert to ReqMeta.
         for req_id, (req, block_ids, num_external_tokens) in self._reqs_need_recv.items():
@@ -1635,6 +1773,11 @@ class MooncakeConnectorScheduler:
         self._reqs_need_send = {}
         meta.split_requests_to_send = self._split_reqs_need_send
         self._split_reqs_need_send = set()
+        meta.split_transfer_ids = {
+            request_id: self.split_transfer_ids.pop(request_id)
+            for request_id in meta.split_requests_to_send
+            if request_id in self.split_transfer_ids
+        }
         meta.reqs_in_batch = self._reqs_in_batch
         self._reqs_in_batch = set()
 
@@ -1667,8 +1810,6 @@ class MooncakeConnectorScheduler:
         if delay_free_blocks:
             logger.info("Delaying free of %d blocks for request %s", len(computed_block_ids), request.request_id)
             self._reqs_need_send[request.request_id] = time.time()
-            if params.get("request_live_split", False):
-                self._split_reqs_need_send.add(request.request_id)
 
         num_prompt_blocks = math.ceil(len(request.prompt_token_ids) / self.block_size)
 
@@ -1687,8 +1828,19 @@ class MooncakeConnectorScheduler:
             remote_multi_nodes_meta_mapping=self.multi_nodes_meta_mapping,
             num_prompt_blocks=num_prompt_blocks,
         )
-        if params.get("request_live_split", False):
+        live_topology_supported = (
+            self.pp_size == 1 and self.pcp_size == 1 and self.dcp_size == 1
+        )
+        if (
+            params.get("request_live_split", False)
+            and delay_free_blocks
+            and live_topology_supported
+        ):
+            split_transfer_id = uuid.uuid4().hex
+            self.split_transfer_ids[request.request_id] = split_transfer_id
+            self._split_reqs_need_send.add(request.request_id)
             transfer_params["live_split_capabilities"] = (LIVE_SPLIT_CAPABILITY,)
+            transfer_params["live_split_transfer_id"] = split_transfer_id
             source_descriptor = params.get(LIVE_SPLIT_SOURCE_DESCRIPTOR)
             if source_descriptor is not None:
                 # This descriptor is created by the prefiller-side compact
@@ -2241,7 +2393,11 @@ class MooncakeConnectorWorker:
         """Start loading KV blocks from remote engine."""
         if self.kv_recv_thread is not None:
             for req_id in metadata.reqs_in_batch:
-                self.kv_recv_thread.task_tracker.add_req_to_process(req_id)
+                self.kv_recv_thread.task_tracker.add_req_to_process(
+                    req_id,
+                    metadata.requests.get(req_id, None).split_transfer_id
+                    if req_id in metadata.requests else None,
+                )
 
         for req_id, meta in metadata.requests.items():
             logger.debug(
@@ -2270,9 +2426,12 @@ class MooncakeConnectorWorker:
                     meta.remote_multi_nodes_meta_mapping,
                 )
                 self.kv_recv_thread.task_tracker.complete_split_request(
-                    req_id, "fallback", mark_finished=False)
-                self.kv_recv_thread._send_split_done_signal(
-                    remote_req_id, remote_host, remote_port, "fallback")
+                    req_id, "fallback", mark_finished=False,
+                    split_transfer_id=meta.split_transfer_id)
+                self.kv_recv_thread.executor.submit(
+                    self.kv_recv_thread._send_split_done_signal,
+                    remote_req_id, remote_host, remote_port, "fallback",
+                    meta.split_transfer_id)
                 continue
 
             if meta.remote_pcp_size * meta.remote_dcp_size > 1:
@@ -2306,13 +2465,22 @@ class MooncakeConnectorWorker:
                             ),
                         )
             else:  # TODO: support prefill context parallel and pipeline parallel open at the same time
-                chosen_rank_list = self._get_remote_rank(remote_req_id, prefill_tp_size)
-                remote_handshake_port_list = [[x + meta.remote_port] for x in chosen_rank_list]
-                for i in range(tp_num_need_pulls * self._prefill_pp_size):
+                if meta.split_plan is not None:
+                    if self._prefill_pp_size != 1:
+                        raise RuntimeError(
+                            "Live split does not encode prefiller PP rank"
+                        )
+                    remote_ranks = (meta.split_plan.tp_rank,)
+                else:
+                    remote_ranks = tuple(
+                        self._get_remote_rank(remote_req_id, prefill_tp_size)
+                    )
+                for i, remote_rank in enumerate(remote_ranks):
                     assert self.kv_recv_thread is not None
+                    remote_handshake_port = meta.remote_port + remote_rank
                     remote_host, remote_engine_id = self._get_remote_host_info_by_port(
                         meta.remote_port,
-                        remote_handshake_port_list[i][0],
+                        remote_handshake_port,
                         meta.remote_host,
                         meta.remote_engine_id,
                         meta.remote_multi_nodes_meta_mapping,
@@ -2324,30 +2492,36 @@ class MooncakeConnectorWorker:
                         remote_block_ids=meta.remote_block_ids,
                         remote_engine_id=remote_engine_id,
                         remote_host=remote_host,
-                        remote_handshake_port=remote_handshake_port_list[i][0],
+                        remote_handshake_port=remote_handshake_port,
                         offset=i,
                         tp_num_need_pulls=tp_num_need_pulls,
-                        all_task_done=(i == tp_num_need_pulls * self._prefill_pp_size - 1),
+                        all_task_done=(i == len(remote_ranks) - 1),
                         split_plan=meta.split_plan,
+                        split_transfer_id=meta.split_transfer_id,
                     )
                     if not admitted:
                         self.kv_recv_thread.task_tracker.complete_split_request(
-                            req_id, "fallback", mark_finished=False)
-                        self.kv_recv_thread._send_split_done_signal(
+                            req_id, "fallback", mark_finished=False,
+                            split_transfer_id=meta.split_transfer_id)
+                        self.kv_recv_thread.executor.submit(
+                            self.kv_recv_thread._send_split_done_signal,
                             remote_req_id, remote_host,
-                            remote_handshake_port_list[i][0], "fallback")
+                            remote_handshake_port, "fallback",
+                            meta.split_transfer_id)
                         break
 
         for req_id in metadata.reqs_in_batch:
             if self.kv_send_thread is not None:
-                self.kv_send_thread.task_tracker.add_req_to_process(req_id)
+                self.kv_send_thread.task_tracker.add_req_to_process(
+                    req_id, metadata.split_transfer_ids.get(req_id))
 
         if self.kv_send_thread is not None and self.pcp_size * self.dcp_size == 1:
             for req_id, delay_start_time in metadata.requests_to_send.items():
                 if self.tp_rank in self._prefill_get_remote_rank(req_id):
                     self.kv_send_thread.add_delayed_request(
                         req_id, delay_start_time,
-                        split=req_id in metadata.split_requests_to_send)
+                        split=req_id in metadata.split_requests_to_send,
+                        split_transfer_id=metadata.split_transfer_ids.get(req_id))
                 else:
                     self.kv_send_thread.add_not_transfer_request(req_id)
 
@@ -2355,7 +2529,8 @@ class MooncakeConnectorWorker:
             for req_id, delay_start_time in metadata.requests_to_send.items():
                 self.kv_send_thread.add_delayed_request(
                     req_id, delay_start_time,
-                    split=req_id in metadata.split_requests_to_send)
+                    split=req_id in metadata.split_requests_to_send,
+                    split_transfer_id=metadata.split_transfer_ids.get(req_id))
 
     def _get_tp_num_need_pulls(self, prefill_tp_size: int) -> int:
         if prefill_tp_size is None:

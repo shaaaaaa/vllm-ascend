@@ -209,6 +209,9 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
     ) -> tuple[set[str] | None, set[str] | None]:
         finished = super().get_finished(finished_req_ids)
         self.get_live_split_results()
+        for pending in self._live_split_result_backlog.values():
+            for request_id in finished_req_ids:
+                pending.pop(request_id, None)
         return finished
 
     def __init__(
