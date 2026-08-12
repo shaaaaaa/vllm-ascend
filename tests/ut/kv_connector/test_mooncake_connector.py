@@ -61,6 +61,7 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector import (  # n
     ReqMeta,
     SplitTransferPlan,
     SplitTransferSegment,
+    _send_router_ack,
     ensure_zmq_recv,
     ensure_zmq_send,
     group_concurrent_contiguous,
@@ -262,6 +263,9 @@ class TestKVCacheSendingThread(unittest.TestCase):
 
         sock.close()
         context.term()
+        thread.stop()
+        thread.join(timeout=1)
+        self.assertFalse(thread.is_alive())
 
 
 class TestKVCacheRecvingThreadBasic(unittest.TestCase):
@@ -684,6 +688,27 @@ class TestCoreFunctionality(unittest.TestCase):
         self.assertEqual(self.thread.request_queue.get()["request_id"],
                          "split")
 
+    def test_duplicate_split_generation_is_queued_once(self):
+        self.thread.request_queue = queue.Queue()
+        plan = SplitTransferPlan((), (0, 0), tp_rank=0, dp_rank=0)
+        common = dict(
+            remote_request_id="remote",
+            local_block_ids=[],
+            remote_block_ids=[],
+            remote_engine_id="remote_engine",
+            remote_host="localhost",
+            remote_handshake_port=6666,
+            offset=0,
+            tp_num_need_pulls=1,
+            split_plan=plan,
+            split_transfer_id="generation-a",
+        )
+
+        self.assertTrue(self.thread.add_request("req", **common))
+        self.assertTrue(self.thread.add_request("req", **common))
+
+        self.assertEqual(self.thread.request_queue.qsize(), 1)
+
     @patch.object(KVCacheRecvingThread, '_send_split_done_signal')
     @patch.object(KVCacheRecvingThread, '_transfer_kv_cache')
     def test_cancelled_split_is_acked_without_transfer(self, mock_transfer,
@@ -799,7 +824,8 @@ class TestMetadataHandling(unittest.TestCase):
         side_effect=Exception("Network error"))
     def test_get_remote_metadata_failure(self, mock_recv, mock_send):
         with patch.object(self.thread, '_get_remote_socket') as mock_get_socket, \
-                patch.object(self.thread, '_return_remote_socket') as mock_return_socket:
+                patch.object(self.thread, '_return_remote_socket') as mock_return_socket, \
+                patch.object(self.thread, '_discard_remote_socket') as mock_discard_socket:
             mock_socket = MagicMock()
             mock_get_socket.return_value = mock_socket
 
@@ -807,7 +833,8 @@ class TestMetadataHandling(unittest.TestCase):
                 self.thread._get_remote_metadata("host1", 5555)
 
             self.assertEqual(str(context.exception), "Network error")
-            mock_return_socket.assert_called_once()
+            mock_return_socket.assert_not_called()
+            mock_discard_socket.assert_called_once_with(mock_socket)
 
 
 class TestMainThreadLoop(unittest.TestCase):
@@ -1200,6 +1227,90 @@ class TestGlobalTransferEngineRegistration(unittest.TestCase):
         registry.transfer_engine.unregister_memory.assert_not_called()
         self.assertEqual(registry.registered_buffers, {0x1000: 0x1000})
 
+    def test_adopted_registration_covers_temporary_pages(self):
+        registry = GlobalTE()
+        registry.transfer_engine = MagicMock()
+
+        self.assertTrue(registry.adopt_registered_buffer(0x1000, 0x1000))
+        with registry.temporary_registration([0x1400], [0x100]):
+            pass
+        registry.release_adopted_buffer(0x1000, 0x1000)
+
+        registry.transfer_engine.register_memory.assert_not_called()
+        registry.transfer_engine.unregister_memory.assert_not_called()
+        self.assertEqual(registry.registered_buffers, {})
+
+    def test_adopted_registration_cannot_release_during_transfer(self):
+        registry = GlobalTE()
+        registry.transfer_engine = MagicMock()
+        registry.adopt_registered_buffer(0x1000, 0x1000)
+
+        with (
+            registry.temporary_registration([0x1400], [0x100]),
+            self.assertRaisesRegex(RuntimeError, "in use"),
+        ):
+            registry.release_adopted_buffer(0x1000, 0x1000)
+
+        registry.release_adopted_buffer(0x1000, 0x1000)
+        self.assertEqual(registry.registered_buffers, {})
+
+    def test_native_owner_registration_is_not_adopted(self):
+        registry = GlobalTE()
+        registry.transfer_engine = MagicMock()
+        registry.transfer_engine.register_memory.return_value = 0
+        registry.register_buffer([0x1000], [0x1000])
+
+        with self.assertRaisesRegex(RuntimeError, "another owner"):
+            registry.adopt_registered_buffer(0x1000, 0x1000)
+
+        self.assertEqual(registry.registered_buffers, {0x1000: 0x1000})
+
+    def test_adopted_unregister_keeps_region_visible_until_native_release(self):
+        registry = GlobalTE()
+        registry.transfer_engine = MagicMock()
+        registry.adopt_registered_buffer(0x1000, 0x1000)
+
+        def unregister():
+            self.assertEqual(registry.registered_buffers, {0x1000: 0x1000})
+            return 0
+
+        registry.release_adopted_buffer(0x1000, 0x1000, unregister)
+
+        self.assertEqual(registry.registered_buffers, {})
+
+    def test_temporary_unregister_failure_releases_adopted_lease(self):
+        registry = GlobalTE()
+        registry.transfer_engine = MagicMock()
+        registry.transfer_engine.register_memory.return_value = 0
+        registry.transfer_engine.unregister_memory.return_value = -1
+        registry.adopt_registered_buffer(0x1000, 0x1000)
+
+        with (
+            self.assertRaisesRegex(RuntimeError, "unregistration failed"),
+            registry.temporary_registration(
+                [0x1400, 0x3000], [0x100, 0x100]
+            ),
+        ):
+            pass
+
+        self.assertEqual(registry._adopted_leases, {})
+
+
+class TestControlAcknowledgement(unittest.TestCase):
+
+    @patch(
+        "vllm_ascend.distributed.kv_transfer.kv_p2p."
+        "mooncake_connector.time.sleep"
+    )
+    def test_router_ack_retry_is_bounded(self, mock_sleep):
+        sock = MagicMock()
+        sock.send_multipart.side_effect = zmq.Again()
+
+        self.assertFalse(_send_router_ack(sock, b"peer", "req"))
+
+        self.assertEqual(sock.send_multipart.call_count, 3)
+        self.assertEqual(mock_sleep.call_count, 2)
+
 
 class TestMooncakeConnectorMetadata(unittest.TestCase):
 
@@ -1230,6 +1341,26 @@ class TestMooncakeConnectorMetadata(unittest.TestCase):
         self.assertEqual(req_meta.remote_host, "localhost")
         self.assertEqual(req_meta.remote_port, 5000)
         self.assertEqual(req_meta.remote_ptp_size, 2)
+
+    def test_negotiated_split_without_nonce_falls_back(self):
+        meta = MooncakeConnectorMetadata()
+
+        meta.add_new_req(
+            request_id="req",
+            local_block_ids=[1],
+            num_external_tokens=16,
+            kv_transfer_params={
+                "remote_block_ids": [2],
+                "remote_engine_id": "remote",
+                "remote_request_id": "remote-req",
+                "remote_host": "host",
+                "remote_port": 1234,
+                "live_split_capabilities": (LIVE_SPLIT_CAPABILITY,),
+            },
+        )
+
+        self.assertTrue(meta.requests["req"].split_fallback)
+        self.assertIsNone(meta.requests["req"].split_transfer_id)
 
     def test_add_split_destination_plan(self):
         meta = MooncakeConnectorMetadata()
@@ -1518,6 +1649,37 @@ class TestMooncakeConnectorMetadata(unittest.TestCase):
 
 
 class TestAscendMultiLateSplitInjection(unittest.TestCase):
+
+    def test_shutdown_stops_live_borrower_before_shared_owner(self):
+        events = []
+
+        class Child:
+            def __init__(self, name, borrower=False):
+                self.name = name
+                self.releases_live_transfer_destinations_on_shutdown = borrower
+
+            def shutdown(self):
+                events.append(self.name)
+
+        multi = object.__new__(AscendMultiConnector)
+        multi._connectors = [Child("lmcache"), Child("mooncake", True)]
+
+        multi.shutdown()
+
+        self.assertEqual(events, ["mooncake", "lmcache"])
+
+    def test_shutdown_does_not_close_owner_if_borrower_is_active(self):
+        owner = MagicMock()
+        borrower = MagicMock()
+        borrower.releases_live_transfer_destinations_on_shutdown = True
+        borrower.shutdown.side_effect = RuntimeError("active transfer")
+        multi = object.__new__(AscendMultiConnector)
+        multi._connectors = [owner, borrower]
+
+        with self.assertRaisesRegex(RuntimeError, "active transfer"):
+            multi.shutdown()
+
+        owner.shutdown.assert_not_called()
 
     def test_compact_load_capability_follows_selected_child(self):
         class Child:
@@ -2266,6 +2428,33 @@ class TestMooncakeConnectorScheduler(unittest.TestCase):
         self.assertEqual(descriptor["segments"][0]["group_id"], 1)
         self.assertEqual(descriptor["segments"][0]["source_buffer_index"], 0)
 
+    def test_source_canonicalization_rejects_negative_extent(self):
+        self.scheduler.live_split_source_groups = (1,)
+        self.scheduler.local_source_metadata[(0, 0)] = MooncakeAgentMetadata(
+            engine_id="engine",
+            te_rpc_port=1,
+            kv_caches_base_addr=[0x2000],
+            num_blocks=1,
+            kv_caches_buffer_sizes=(0x100,),
+            buffer_group_ids=(1,),
+            tp_rank=0,
+            dp_rank=0,
+        )
+        source = {
+            "segments": [{
+                "group_id": 1,
+                "source_buffer_base": 0x2000,
+                "source_offset": -1,
+                "length": 24,
+            }],
+            "group_byte_totals": [0, 24],
+            "tp_rank": 0,
+            "dp_rank": 0,
+        }
+
+        with self.assertRaisesRegex(ValueError, "Invalid live split"):
+            self.scheduler._canonicalize_source_descriptor(source)
+
 
 class TestUtils(unittest.TestCase):
 
@@ -2495,6 +2684,45 @@ class TestMooncakeConnectorWorker(unittest.TestCase):
         self.assertEqual(len(worker.kv_caches), 1)
         self.assertIsNotNone(worker.kv_send_thread)
         self.assertIsNone(worker.kv_recv_thread)
+
+    def test_shutdown_stops_and_joins_worker_thread(self):
+        worker = MooncakeConnectorWorker(self.vllm_config, self.engine_id)
+        thread = MagicMock()
+        thread.is_alive.return_value = False
+        thread.task_tracker.done_task_lock = contextlib.nullcontext()
+        thread.task_tracker.split_leases = set()
+        worker.kv_send_thread = thread
+
+        worker.shutdown()
+
+        thread.stop.assert_called_once_with()
+        thread.join.assert_called_once()
+
+    def test_shutdown_retains_listener_while_live_source_is_active(self):
+        worker = MooncakeConnectorWorker(self.vllm_config, self.engine_id)
+        thread = MagicMock()
+        thread.task_tracker.done_task_lock = contextlib.nullcontext()
+        thread.task_tracker.split_leases = {"req"}
+        worker.kv_send_thread = thread
+
+        with self.assertRaisesRegex(RuntimeError, "source ownership"):
+            worker.shutdown()
+
+        thread.stop.assert_not_called()
+
+    def test_shutdown_closes_receiver_resources_after_join(self):
+        worker = MooncakeConnectorWorker(self.vllm_config, self.engine_id)
+        thread = MagicMock()
+        thread.is_alive.return_value = False
+        thread.split_request_lock = contextlib.nullcontext()
+        thread.active_split_requests = {}
+        worker.kv_recv_thread = thread
+
+        worker.shutdown()
+
+        thread.stop.assert_called_once_with()
+        thread.join.assert_called_once()
+        thread.close_resources.assert_called_once_with()
 
     def test_register_kv_caches_consumer(self):
         self.vllm_config.kv_transfer_config.kv_role = 'kv_consumer'

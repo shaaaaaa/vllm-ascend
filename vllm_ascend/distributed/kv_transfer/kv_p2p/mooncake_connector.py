@@ -70,6 +70,8 @@ MAX_PENDING_SPLIT_REQUESTS = 64
 MAX_TASK_HISTORY_SIZE = 16000
 MAX_SPLIT_TRANSFER_ID_LENGTH = 64
 SPLIT_DONE_MAX_ATTEMPTS = 3
+CONTROL_ACK_MAX_ATTEMPTS = 3
+THREAD_SHUTDOWN_TIMEOUT = 30.0
 
 
 class RemotePortInfo(TypedDict):
@@ -363,6 +365,7 @@ class KVCacheSendingThread(threading.Thread):
         self.kv_caches = kv_caches
         self.pcp_rank = pcp_rank
         self.port_send_num: dict[str, int] = {}
+        self.stop_event = threading.Event()
 
         self.task_tracker = KVCacheTaskTracker()
 
@@ -403,6 +406,7 @@ class KVCacheSendingThread(threading.Thread):
             path = make_zmq_path("tcp", self.side_channel_host, handshake_port)
             logger.info("Starting listening on path: %s", path)
             with zmq_ctx(zmq.ROUTER, path) as sock:  # type: ignore
+                sock.setsockopt(zmq.RCVTIMEO, 100)
                 self.ready_event.set()
                 self.run_busy_loop(sock)
         except Exception as e:
@@ -415,7 +419,7 @@ class KVCacheSendingThread(threading.Thread):
         logger.debug("Size of encoded MooncakeAgentMetadata: %s bytes", str(size_in_bytes))
 
         decoder = msgspec.msgpack.Decoder(type=tuple)
-        while True:
+        while not self.stop_event.is_set():
             try:
                 frames = sock.recv_multipart()
                 if len(frames) < 2:
@@ -446,16 +450,7 @@ class KVCacheSendingThread(threading.Thread):
                             del self.port_send_num[request_id]
                     else:
                         self.task_tracker.update_done_task_count(request_id)
-                    # Acknowledge the request completion.
-                    while True:
-                        try:
-                            # Send ACK to the sender.
-                            sock.send_multipart((identity, b"", b"ACK"), flags=zmq.NOBLOCK)  # type: ignore
-                            break
-                        except zmq.Again:  # type: ignore
-                            # If the socket is not ready, retry sending.
-                            logger.debug("Socket not ready, retrying to send ACK for request %s", msg[1])
-                            time.sleep(0.01)
+                    _send_router_ack(sock, identity, request_id)
                 elif msg[0] == SPLIT_DONE_MSG:
                     if len(msg) not in (3, 4):
                         raise ValueError("Invalid split completion message")
@@ -473,17 +468,16 @@ class KVCacheSendingThread(threading.Thread):
                         status,
                         split_transfer_id=split_transfer_id,
                     )
-                    while True:
-                        try:
-                            sock.send_multipart(
-                                (identity, b"", b"ACK"), flags=zmq.NOBLOCK)
-                            break
-                        except zmq.Again:
-                            time.sleep(0.01)
+                    _send_router_ack(sock, identity, request_id)
                 else:
                     logger.error("Connection listener got unexpected message %s", msg)
+            except zmq.Again:
+                continue
             except Exception as e:
                 logger.error("Connection listener got exception %s: %s", type(e), e)
+
+    def stop(self) -> None:
+        self.stop_event.set()
 
 
 class KVCacheRecvingThread(threading.Thread):
@@ -535,6 +529,7 @@ class KVCacheRecvingThread(threading.Thread):
         self.split_request_lock = threading.Lock()
         self.active_split_requests: dict[str, str | None] = {}
         self.cancelled_split_requests: set[tuple[str, str | None]] = set()
+        self.stop_event = threading.Event()
 
         self.task_tracker = KVCacheTaskTracker()
 
@@ -604,14 +599,11 @@ class KVCacheRecvingThread(threading.Thread):
                 "split_transfer_id": split_transfer_id,
         }
         if split_plan is not None:
-            if self.request_queue.qsize() >= MAX_PENDING_SPLIT_REQUESTS:
-                return False
             with self.split_request_lock:
                 active = self.active_split_requests.get(request_id)
-                if (
-                    request_id in self.active_split_requests
-                    and active != split_transfer_id
-                ):
+                if request_id in self.active_split_requests:
+                    return active == split_transfer_id
+                if self.request_queue.qsize() >= MAX_PENDING_SPLIT_REQUESTS:
                     return False
                 self.active_split_requests[request_id] = split_transfer_id
             self.request_queue.put_nowait(request_data)
@@ -638,16 +630,30 @@ class KVCacheRecvingThread(threading.Thread):
     def run(self):
         """Run the thread to handle KV cache transfer requests."""
         self.ready_event.set()
-        while True:
+        while not self.stop_event.is_set():
             try:
                 request_data = self.request_queue.get()
                 if request_data is None:
-                    logger.warning("Received a None request!")
                     self.request_queue.task_done()
-                    continue
+                    break
                 self._handle_request(request_data)
             except Exception as e:
                 logger.error(f"Error in KVCacheTransferThread: {e}")
+
+    def stop(self) -> None:
+        self.request_queue.put(None)
+
+    def close_resources(self) -> None:
+        self.executor.shutdown(wait=True, cancel_futures=False)
+        with self.remote_sockets_lock:
+            sockets = [
+                socket
+                for pooled in self.remote_sockets.values()
+                for socket in pooled
+            ]
+            self.remote_sockets.clear()
+        for socket in sockets:
+            self._discard_remote_socket(socket)
 
     def _handle_request(self, req_meta: dict[str, Any]):
         request_id = req_meta["request_id"]
@@ -1042,6 +1048,7 @@ class KVCacheRecvingThread(threading.Thread):
     def _get_remote_metadata(self, remote_host: str, remote_handshake_port: int) -> None:
         """Get the metadata from the remote host."""
         sock: zmq.Socket | None = None  # type: ignore
+        healthy = False
         try:
             sock = self._get_remote_socket(remote_host, remote_handshake_port)
             ensure_zmq_send(sock, self.encoder.encode((GET_META_MSG, "")), f"{remote_host}:{remote_handshake_port}")
@@ -1063,10 +1070,20 @@ class KVCacheRecvingThread(threading.Thread):
             if not hasattr(self, "remote_capabilities"):
                 self.remote_capabilities = {}
             self.remote_capabilities[(engine_id, remote_handshake_port)] = agent_meta.capabilities
+            healthy = True
         finally:
             if sock is not None:
-                self._return_remote_socket(sock, remote_host, remote_handshake_port)
-                logger.debug("Returned socket to pool for %s:%d", remote_host, remote_handshake_port)
+                if healthy:
+                    self._return_remote_socket(
+                        sock, remote_host, remote_handshake_port
+                    )
+                    logger.debug(
+                        "Returned socket to pool for %s:%d",
+                        remote_host,
+                        remote_handshake_port,
+                    )
+                else:
+                    self._discard_remote_socket(sock)
 
     def _send_done_recv_signal(
         self,
@@ -1092,9 +1109,9 @@ class KVCacheRecvingThread(threading.Thread):
                     "Failed to receive ACK for request %s from %s:%d", request_id, remote_host, remote_handshake_port
                 )
                 raise RuntimeError(f"Failed to receive ACK, resp: {resp.decode('utf-8')}")
-        except RuntimeError as e:
+        except (RuntimeError, zmq.ZMQError) as e:  # type: ignore
             if isinstance(sock, zmq.Socket):  # type: ignore
-                sock.close()
+                self._discard_remote_socket(sock)
                 sock = None
                 logger.warning(f"Unexpected error occurred in socket, {e}, closing the original channel")
         finally:
@@ -1184,6 +1201,13 @@ class KVCacheRecvingThread(threading.Thread):
         with self.remote_sockets_lock:
             self.remote_sockets[remote_path].append(sock)
 
+    def _discard_remote_socket(self, sock: zmq.Socket) -> None:  # type: ignore
+        with contextlib.suppress(KeyError):
+            self.remote_poller.unregister(sock)
+        context = sock.context
+        sock.close(linger=0)
+        context.term()
+
 
 class MooncakeConnectorMetadata(KVConnectorMetadata):
     def __init__(self, live_split_topology_supported: bool = True):
@@ -1248,6 +1272,7 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
             split_negotiated=split_negotiated,
             split_source=split_source,
             split_source_invalid=split_source_invalid,
+            split_fallback=split_negotiated and split_transfer_id is None,
             split_transfer_id=split_transfer_id,
         )
 
@@ -1467,6 +1492,7 @@ class MooncakeConnector(KVConnectorBase_V1):
     # them by explicit group descriptors. Ordinary transfers use this
     # connector's selected group (latent by default, index for index-only).
     requires_full_dsa_kv_caches = True
+    releases_live_transfer_destinations_on_shutdown = True
 
     def __init__(self, vllm_config: VllmConfig, role: KVConnectorRole, kv_cache_config: KVCacheConfig | None = None):
         assert vllm_config.kv_transfer_config is not None
@@ -1525,6 +1551,10 @@ class MooncakeConnector(KVConnectorBase_V1):
     def get_live_split_results(self) -> dict[str, str]:
         assert self.connector_worker is not None
         return self.connector_worker.get_live_split_results()
+
+    def shutdown(self) -> None:
+        if self.connector_worker is not None:
+            self.connector_worker.shutdown()
 
     def _needs_live_split_destination_plans(self) -> bool:
         metadata = self._connector_metadata
@@ -1668,16 +1698,23 @@ class MooncakeConnectorScheduler:
                 if group_id not in self.live_split_source_groups:
                     continue
                 base = int(segment["source_buffer_base"])
+                offset = int(segment["source_offset"])
+                length = int(segment["length"])
+                if base <= 0 or offset < 0 or length <= 0:
+                    raise ValueError("Invalid live split source extent")
                 index = indices.get(base)
                 if index is None:
                     raise ValueError("Live split source base is not registered")
                 if group_id != groups[index]:
                     raise ValueError("Live split source group does not match buffer")
                 if (
-                    int(segment["source_offset"]) + int(segment["length"])
-                    > sizes[index]
+                    offset + length > sizes[index]
                 ):
                     raise ValueError("Live split source extent exceeds buffer")
+                segment["group_id"] = group_id
+                segment["source_buffer_base"] = base
+                segment["source_offset"] = offset
+                segment["length"] = length
                 segment["source_buffer_index"] = index
                 segments.append(segment)
             if not segments:
@@ -1958,6 +1995,39 @@ class MooncakeConnectorWorker:
             return
         for request_id in request_ids:
             self.kv_recv_thread.cancel_split_request(request_id)
+
+    def shutdown(self) -> None:
+        """Fence transfer threads before shared registrations are released."""
+        if self.kv_send_thread is not None:
+            tracker = self.kv_send_thread.task_tracker
+            with tracker.done_task_lock:
+                if tracker.split_leases:
+                    raise RuntimeError(
+                        "Mooncake live source ownership remains active"
+                    )
+        threads = tuple(
+            thread
+            for thread in (self.kv_send_thread, self.kv_recv_thread)
+            if thread is not None
+        )
+        for thread in threads:
+            thread.stop()
+        for thread in threads:
+            thread.join(THREAD_SHUTDOWN_TIMEOUT)
+            if thread.is_alive():
+                if isinstance(thread, KVCacheSendingThread):
+                    thread.stop_event.clear()
+                raise RuntimeError(
+                    f"{thread.name} did not stop before Mooncake shutdown"
+                )
+        if self.kv_recv_thread is not None:
+            with self.kv_recv_thread.split_request_lock:
+                if self.kv_recv_thread.active_split_requests:
+                    raise RuntimeError(
+                        "Mooncake split transfer ownership remains active"
+                    )
+        if self.kv_recv_thread is not None:
+            self.kv_recv_thread.close_resources()
 
     def _get_prefill_decode_size(self, vllm_config: VllmConfig):
         # get prefill tp and dp size from extra config
@@ -2699,6 +2769,25 @@ def ensure_zmq_send(
             else:
                 logger.error(f"Send failed after all retries: {e}")
                 raise RuntimeError(f"Failed to send data to {path} after {max_retries} retries: {e}")
+
+
+def _send_router_ack(
+    socket: zmq.Socket, identity: bytes, request_id: str  # type: ignore
+) -> bool:
+    """Send a bounded ROUTER acknowledgement without stalling the listener."""
+    for attempt in range(CONTROL_ACK_MAX_ATTEMPTS):
+        try:
+            socket.send_multipart(
+                (identity, b"", b"ACK"), flags=zmq.NOBLOCK
+            )
+            return True
+        except zmq.Again:
+            if attempt + 1 < CONTROL_ACK_MAX_ATTEMPTS:
+                time.sleep(0.01)
+        except zmq.ZMQError:
+            break
+    logger.warning("Failed to acknowledge control message for %s", request_id)
+    return False
 
 
 def ensure_zmq_recv(

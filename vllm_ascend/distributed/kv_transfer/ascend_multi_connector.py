@@ -214,6 +214,40 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
                 pending.pop(request_id, None)
         return finished
 
+    def shutdown(self) -> None:
+        """Stop live-transfer borrowers before shared-memory owners."""
+        borrowers = [
+            connector
+            for connector in self._connectors
+            if getattr(
+                connector,
+                "releases_live_transfer_destinations_on_shutdown",
+                False,
+            )
+        ]
+        owners = [
+            connector
+            for connector in self._connectors
+            if not getattr(
+                connector,
+                "releases_live_transfer_destinations_on_shutdown",
+                False,
+            )
+        ]
+        for phase in (borrowers, owners):
+            error: Exception | None = None
+            for connector in phase:
+                try:
+                    connector.shutdown()
+                except Exception as exc:
+                    logger.exception(
+                        "Exception during connector %s shutdown.",
+                        connector.__class__.__name__,
+                    )
+                    error = exc
+            if error is not None:
+                raise error
+
     def __init__(
         self,
         vllm_config: "VllmConfig",
