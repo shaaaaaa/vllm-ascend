@@ -2253,6 +2253,42 @@ class TestMooncakeConnectorWorker(unittest.TestCase):
         self.assertTrue(worker.use_mla)
         self.assertEqual(len(worker.block_len), 2)
 
+    def test_register_kv_caches_deduplicates_underlying_storages(self):
+        def cache(view_ptr, storage):
+            tensor = MagicMock()
+            tensor.data_ptr.return_value = view_ptr
+            tensor.shape = (10, 16, 1, 8)
+            tensor.size.side_effect = lambda dim=None: (
+                tensor.shape if dim is None else tensor.shape[dim]
+            )
+            tensor.numel.return_value = math.prod(tensor.shape)
+            tensor.element_size.return_value = 2
+            tensor.untyped_storage.return_value = storage
+            return tensor
+
+        storage = MagicMock()
+        storage.data_ptr.return_value = 0x1000
+        storage.nbytes.return_value = 0x4000
+        caches = {
+            "layer1": (
+                cache(0x1000, storage),
+                cache(0x2000, storage),
+            )
+        }
+
+        with patch(
+            "vllm_ascend.distributed.kv_transfer.kv_p2p."
+            "mooncake_connector.global_te.register_buffer"
+        ) as register_buffer:
+            worker = MooncakeConnectorWorker(self.vllm_config, self.engine_id)
+            worker.register_kv_caches(caches)
+
+        register_buffer.assert_called_once_with([0x1000], [0x4000])
+        self.assertEqual(
+            worker.xfer_handshake_metadata.kv_caches_base_addr,
+            [0x1000, 0x2000],
+        )
+
     def test_register_kv_caches_unbundled_dsa_uses_exact_regions(self):
         def cache(ptr, shape):
             tensor = MagicMock()

@@ -1887,7 +1887,7 @@ class MooncakeConnectorWorker:
         self.kv_caches = kv_caches
         kv_caches_base_addr = []
         ordinary_kv_caches_base_addr = []
-        ptrs = []
+        storage_regions: dict[int, int] = {}
         lengths = []
         buffer_group_ids = []
         configured_group = self.vllm_config.kv_transfer_config.get_from_extra_config(
@@ -1905,8 +1905,9 @@ class MooncakeConnectorWorker:
             for i, cache in enumerate(cache_or_caches, 0):
                 base_addr = cache.data_ptr()
                 region_len = cache.numel() * cache.element_size()
+                storage = cache.untyped_storage()
+                storage_regions[int(storage.data_ptr())] = int(storage.nbytes())
                 kv_caches_base_addr.append(base_addr)
-                ptrs.append(base_addr)
                 lengths.append(region_len)
                 group_id = (
                     int(configured_group)
@@ -1919,7 +1920,9 @@ class MooncakeConnectorWorker:
                 buffer_group_ids.append(group_id)
                 if group_id == ordinary_group_id:
                     ordinary_kv_caches_base_addr.append(base_addr)
-        global_te.register_buffer(ptrs, lengths)
+        global_te.register_buffer(
+            list(storage_regions), list(storage_regions.values())
+        )
         # After KV Caches registered, start the sending or receiving thread.
         metadata = MooncakeAgentMetadata(
             engine_id=self.engine_id,
