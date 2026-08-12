@@ -549,6 +549,9 @@ class TestCoreFunctionality(unittest.TestCase):
         self.thread.remote_buffer_sizes["remote_engine"] = {
             6666: (4096, 4096)
         }
+        self.thread.remote_buffer_group_ids["remote_engine"] = {
+            6666: (0, 1)
+        }
         self.thread.remote_capabilities = {
             ("remote_engine", 6666): (LIVE_SPLIT_CAPABILITY,)
         }
@@ -597,6 +600,7 @@ class TestCoreFunctionality(unittest.TestCase):
         self.thread.kv_caches_base_addr["remote_engine"] = {6666: [0x5000]}
         self.thread.remote_num_blocks["remote_engine"] = {6666: 2}
         self.thread.remote_buffer_sizes["remote_engine"] = {6666: (4096,)}
+        self.thread.remote_buffer_group_ids["remote_engine"] = {6666: (1,)}
         self.thread.remote_capabilities = {
             ("remote_engine", 6666): (LIVE_SPLIT_CAPABILITY,)
         }
@@ -616,6 +620,41 @@ class TestCoreFunctionality(unittest.TestCase):
         mock_register.assert_called_once_with([0xA000], [512])
         self.engine.batch_transfer_sync_read.assert_called_once_with(
             "localhost:7777", [0xA000], [0x5000 + 64], [512])
+
+    def test_split_rejects_source_group_mismatch(self):
+        self.thread.kv_caches_base_addr["remote_engine"] = {6666: [0x5000]}
+        self.thread.remote_buffer_sizes["remote_engine"] = {6666: (4096,)}
+        self.thread.remote_buffer_group_ids["remote_engine"] = {6666: (0,)}
+        self.thread.remote_capabilities = {
+            ("remote_engine", 6666): (LIVE_SPLIT_CAPABILITY,)
+        }
+        plan = SplitTransferPlan(
+            segments=(
+                SplitTransferSegment(1, 0, 64, 0xA000, 512, "npu"),
+            ),
+            group_byte_totals=(0, 512),
+            tp_rank=0,
+            dp_rank=0,
+            requested_groups=(1,),
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "source buffer group"):
+            self.thread._transfer_split_destinations(self.test_req, plan)
+
+    def test_split_rejects_overlapping_destinations(self):
+        plan = SplitTransferPlan(
+            segments=(
+                SplitTransferSegment(1, 0, 0, 0xA000, 16, "npu"),
+                SplitTransferSegment(1, 0, 16, 0xA008, 16, "npu"),
+            ),
+            group_byte_totals=(0, 32),
+            tp_rank=0,
+            dp_rank=0,
+            requested_groups=(1,),
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "destination extents overlap"):
+            self.thread._transfer_split_destinations(self.test_req, plan)
 
     def test_split_rejects_zero_or_missing_requested_group(self):
         self.vllm_config.parallel_config.data_parallel_rank_local = 0
@@ -709,54 +748,105 @@ class TestCoreFunctionality(unittest.TestCase):
 
         self.assertEqual(self.thread.request_queue.qsize(), 1)
 
-    @patch.object(KVCacheRecvingThread, '_send_split_done_signal')
+    def test_completed_split_generation_is_not_queued_again(self):
+        self.thread.request_queue = queue.Queue()
+        plan = SplitTransferPlan((), (0, 0), tp_rank=0, dp_rank=0)
+        self.thread.completed_split_requests[("req", "generation-a")] = (
+            "success"
+        )
+
+        admitted = self.thread.add_request(
+            request_id="req",
+            remote_request_id="remote",
+            local_block_ids=[],
+            remote_block_ids=[],
+            remote_engine_id="remote_engine",
+            remote_host="localhost",
+            remote_handshake_port=6666,
+            offset=0,
+            tp_num_need_pulls=1,
+            split_plan=plan,
+            split_transfer_id="generation-a",
+        )
+
+        self.assertTrue(admitted)
+        self.assertTrue(self.thread.request_queue.empty())
+        self.thread.task_tracker.complete_split_request.assert_not_called()
+
+    def test_stop_rejects_new_queue_admission(self):
+        self.thread.request_queue = queue.Queue()
+
+        self.thread.stop()
+
+        self.assertFalse(
+            self.thread.add_request(
+                request_id="req",
+                remote_request_id="remote",
+                local_block_ids=[],
+                remote_block_ids=[],
+                remote_engine_id="remote_engine",
+                remote_host="localhost",
+                remote_handshake_port=6666,
+                offset=0,
+                tp_num_need_pulls=1,
+            )
+        )
+        self.assertIsNone(self.thread.request_queue.get_nowait())
+
+    def test_split_completion_signal_is_submitted_once(self):
+        self.thread._submit_split_done_signal = MagicMock()
+
+        self.thread._signal_split_completion(
+            "local", "remote", "host", 6666, "success", "generation-a"
+        )
+        self.thread._signal_split_completion(
+            "local", "remote", "host", 6666, "success", "generation-a"
+        )
+
+        self.thread._submit_split_done_signal.assert_called_once_with(
+            "remote", "host", 6666, "success", "generation-a"
+        )
+
     @patch.object(KVCacheRecvingThread, '_transfer_kv_cache')
-    def test_cancelled_split_is_acked_without_transfer(self, mock_transfer,
-                                                      mock_send):
+    def test_cancelled_split_is_acked_without_transfer(self, mock_transfer):
         plan = SplitTransferPlan((), (0, 0), tp_rank=0, dp_rank=0)
         request = dict(
             self.test_req,
             split_plan=plan,
             split_transfer_id="generation-a",
         )
-        self.thread.executor.submit = MagicMock(
-            side_effect=lambda function, *args: function(*args)
-        )
+        self.thread._signal_split_completion = MagicMock()
         self.thread.active_split_requests["req1"] = "generation-a"
         self.assertTrue(self.thread.cancel_split_request("req1"))
 
         self.thread._handle_request(request)
 
         mock_transfer.assert_not_called()
-        self.thread.executor.submit.assert_called_once_with(
-            mock_send, "req1", "localhost", 6666, "cancelled",
-            "generation-a")
+        self.thread._signal_split_completion.assert_called_once_with(
+            "req1", "req1", "localhost", 6666, "cancelled", "generation-a"
+        )
         self.thread.task_tracker.complete_split_request.assert_called_once_with(
             "req1", "cancelled", mark_finished=False,
             split_transfer_id="generation-a")
         self.assertNotIn("req1", self.thread.active_split_requests)
 
-    @patch.object(KVCacheRecvingThread, '_send_split_done_signal')
     @patch.object(KVCacheRecvingThread, '_transfer_kv_cache')
-    def test_successful_split_waits_for_provider_completion(self, mock_transfer,
-                                                           mock_send):
+    def test_successful_split_waits_for_provider_completion(self, mock_transfer):
         plan = SplitTransferPlan((), (0, 0), tp_rank=0, dp_rank=0)
         request = dict(
             self.test_req,
             split_plan=plan,
             split_transfer_id="generation-a",
         )
-        self.thread.executor.submit = MagicMock(
-            side_effect=lambda function, *args: function(*args)
-        )
+        self.thread._signal_split_completion = MagicMock()
         self.thread.active_split_requests["req1"] = "generation-a"
 
         self.thread._handle_request(request)
 
         mock_transfer.assert_called_once_with(request)
-        self.thread.executor.submit.assert_called_once_with(
-            mock_send, "req1", "localhost", 6666, "success",
-            "generation-a")
+        self.thread._signal_split_completion.assert_called_once_with(
+            "req1", "req1", "localhost", 6666, "success", "generation-a"
+        )
         self.thread.task_tracker.complete_split_request.assert_called_once_with(
             "req1", "success", mark_finished=False,
             split_transfer_id="generation-a")
@@ -1215,6 +1305,22 @@ class TestGlobalTransferEngineRegistration(unittest.TestCase):
             [unittest.mock.call(0x8000), unittest.mock.call(0x8000)],
         )
 
+    def test_duplicate_temporary_region_unregisters_once(self):
+        registry = GlobalTE()
+        registry.transfer_engine = MagicMock()
+        registry.transfer_engine.register_memory.return_value = 0
+        registry.transfer_engine.unregister_memory.return_value = 0
+
+        with registry.temporary_registration(
+            [0x8000, 0x8000], [0x100, 0x100]
+        ):
+            self.assertEqual(registry._temporary_refcounts[0x8000], 2)
+
+        registry.transfer_engine.unregister_memory.assert_called_once_with(
+            0x8000
+        )
+        self.assertEqual(registry.registered_buffers, {})
+
     def test_temporary_registration_does_not_release_persistent_buffer(self):
         registry = GlobalTE()
         registry.transfer_engine = MagicMock()
@@ -1294,6 +1400,25 @@ class TestGlobalTransferEngineRegistration(unittest.TestCase):
             pass
 
         self.assertEqual(registry._adopted_leases, {})
+
+    def test_temporary_unregister_attempts_every_region(self):
+        registry = GlobalTE()
+        registry.transfer_engine = MagicMock()
+        registry.transfer_engine.register_memory.return_value = 0
+        registry.transfer_engine.unregister_memory.side_effect = [0, -1]
+
+        with (
+            self.assertRaisesRegex(RuntimeError, "1 region"),
+            registry.temporary_registration(
+                [0x3000, 0x5000], [0x100, 0x100]
+            ),
+        ):
+            pass
+
+        self.assertEqual(
+            registry.transfer_engine.unregister_memory.call_count, 2
+        )
+        self.assertEqual(len(registry.registered_buffers), 1)
 
 
 class TestControlAcknowledgement(unittest.TestCase):
@@ -2716,6 +2841,7 @@ class TestMooncakeConnectorWorker(unittest.TestCase):
         thread.is_alive.return_value = False
         thread.split_request_lock = contextlib.nullcontext()
         thread.active_split_requests = {}
+        thread.pending_split_signals = set()
         worker.kv_recv_thread = thread
 
         worker.shutdown()
@@ -2723,6 +2849,20 @@ class TestMooncakeConnectorWorker(unittest.TestCase):
         thread.stop.assert_called_once_with()
         thread.join.assert_called_once()
         thread.close_resources.assert_called_once_with()
+
+    def test_shutdown_retains_receiver_while_terminal_signal_is_active(self):
+        worker = MooncakeConnectorWorker(self.vllm_config, self.engine_id)
+        thread = MagicMock()
+        thread.is_alive.return_value = False
+        thread.split_request_lock = contextlib.nullcontext()
+        thread.active_split_requests = {}
+        thread.pending_split_signals = {MagicMock()}
+        worker.kv_recv_thread = thread
+
+        with self.assertRaisesRegex(RuntimeError, "signals remain active"):
+            worker.shutdown()
+
+        thread.close_resources.assert_not_called()
 
     def test_register_kv_caches_consumer(self):
         self.vllm_config.kv_transfer_config.kv_role = 'kv_consumer'

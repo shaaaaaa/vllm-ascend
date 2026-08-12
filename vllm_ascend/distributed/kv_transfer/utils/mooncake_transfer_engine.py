@@ -212,18 +212,31 @@ class GlobalTE:
                     )
 
     def _release_temporary_locked(self, bases) -> None:
+        failures: list[int] = []
+        releases: dict[int, int] = {}
         for base in bases:
+            releases[base] = releases.get(base, 0) + 1
+        for base, release_count in releases.items():
             refs = self._temporary_refcounts.get(base)
             if refs is None:
                 continue
-            if refs > 1:
-                self._temporary_refcounts[base] = refs - 1
+            if refs > release_count:
+                self._temporary_refcounts[base] = refs - release_count
                 continue
             ret_value = self.transfer_engine.unregister_memory(base)
             if ret_value != 0:
-                raise RuntimeError("Mooncake memory unregistration failed.")
+                # Keep the native registration visible, but no request owns a
+                # lease now. A later temporary use will retry unregistration.
+                self._temporary_refcounts[base] = 0
+                failures.append(base)
+                continue
             self._temporary_refcounts.pop(base, None)
             self.registered_buffers.pop(base, None)
+        if failures:
+            raise RuntimeError(
+                "Mooncake memory unregistration failed for "
+                f"{len(failures)} region(s)."
+            )
 
     def _release_adopted_leases_locked(self, bases) -> None:
         for base in bases:

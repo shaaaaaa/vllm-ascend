@@ -12,7 +12,7 @@ import time
 import uuid
 from collections import OrderedDict, defaultdict, deque
 from collections.abc import Iterator
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, TypedDict
 
@@ -525,10 +525,15 @@ class KVCacheRecvingThread(threading.Thread):
         self.use_mla = len(block_len) == 2
 
         self.request_queue: queue.Queue[Any] = queue.Queue()
+        self.request_queue_lock = threading.Lock()
         self.executor = ThreadPoolExecutor(max_workers=32)
         self.split_request_lock = threading.Lock()
         self.active_split_requests: dict[str, str | None] = {}
+        self.completed_split_requests: OrderedDict[
+            tuple[str, str | None], str
+        ] = OrderedDict()
         self.cancelled_split_requests: set[tuple[str, str | None]] = set()
+        self.pending_split_signals: set[Future[Any]] = set()
         self.stop_event = threading.Event()
 
         self.task_tracker = KVCacheTaskTracker()
@@ -598,17 +603,24 @@ class KVCacheRecvingThread(threading.Thread):
                 "split_plan": split_plan,
                 "split_transfer_id": split_transfer_id,
         }
-        if split_plan is not None:
-            with self.split_request_lock:
-                active = self.active_split_requests.get(request_id)
-                if request_id in self.active_split_requests:
-                    return active == split_transfer_id
-                if self.request_queue.qsize() >= MAX_PENDING_SPLIT_REQUESTS:
-                    return False
-                self.active_split_requests[request_id] = split_transfer_id
-            self.request_queue.put_nowait(request_data)
-        else:
-            self.request_queue.put(request_data)
+        with self.request_queue_lock:
+            if self.stop_event.is_set():
+                return False
+            if split_plan is not None:
+                generation = (request_id, split_transfer_id)
+                with self.split_request_lock:
+                    completed = self.completed_split_requests.get(generation)
+                    if completed is not None:
+                        return True
+                    active = self.active_split_requests.get(request_id)
+                    if request_id in self.active_split_requests:
+                        return active == split_transfer_id
+                    if self.request_queue.qsize() >= MAX_PENDING_SPLIT_REQUESTS:
+                        return False
+                    self.active_split_requests[request_id] = split_transfer_id
+                self.request_queue.put_nowait(request_data)
+            else:
+                self.request_queue.put(request_data)
         return True
 
     def cancel_split_request(self, request_id: str) -> bool:
@@ -630,7 +642,7 @@ class KVCacheRecvingThread(threading.Thread):
     def run(self):
         """Run the thread to handle KV cache transfer requests."""
         self.ready_event.set()
-        while not self.stop_event.is_set():
+        while True:
             try:
                 request_data = self.request_queue.get()
                 if request_data is None:
@@ -641,7 +653,11 @@ class KVCacheRecvingThread(threading.Thread):
                 logger.error(f"Error in KVCacheTransferThread: {e}")
 
     def stop(self) -> None:
-        self.request_queue.put(None)
+        with self.request_queue_lock:
+            if self.stop_event.is_set():
+                return
+            self.stop_event.set()
+            self.request_queue.put(None)
 
     def close_resources(self) -> None:
         self.executor.shutdown(wait=True, cancel_futures=False)
@@ -654,6 +670,44 @@ class KVCacheRecvingThread(threading.Thread):
             self.remote_sockets.clear()
         for socket in sockets:
             self._discard_remote_socket(socket)
+
+    def _submit_split_done_signal(self, *args: Any) -> None:
+        future = self.executor.submit(self._send_split_done_signal, *args)
+        with self.split_request_lock:
+            self.pending_split_signals.add(future)
+        future.add_done_callback(self._split_done_signal_finished)
+
+    def _signal_split_completion(
+        self,
+        request_id: str,
+        remote_request_id: str,
+        remote_host: str,
+        remote_handshake_port: int,
+        status: str,
+        split_transfer_id: str | None,
+    ) -> None:
+        generation = (request_id, split_transfer_id)
+        with self.split_request_lock:
+            if generation in self.completed_split_requests:
+                return
+            self.completed_split_requests[generation] = status
+            if len(self.completed_split_requests) > MAX_TASK_HISTORY_SIZE:
+                self.completed_split_requests.popitem(last=False)
+        self._submit_split_done_signal(
+            remote_request_id,
+            remote_host,
+            remote_handshake_port,
+            status,
+            split_transfer_id,
+        )
+
+    def _split_done_signal_finished(self, future: Future[Any]) -> None:
+        with self.split_request_lock:
+            self.pending_split_signals.discard(future)
+        try:
+            future.result()
+        except Exception:
+            logger.exception("Mooncake split completion signal task failed")
 
     def _handle_request(self, req_meta: dict[str, Any]):
         request_id = req_meta["request_id"]
@@ -703,15 +757,19 @@ class KVCacheRecvingThread(threading.Thread):
                     request_id, split_status,
                     mark_finished=False,
                     split_transfer_id=split_transfer_id)
-                self.executor.submit(
-                    self._send_split_done_signal,
-                    remote_request_id, remote_host, remote_handshake_port,
-                    split_status, split_transfer_id)
                 with self.split_request_lock:
                     if self.active_split_requests.get(request_id) == split_transfer_id:
                         self.active_split_requests.pop(request_id, None)
                     self.cancelled_split_requests.discard(
                         (request_id, split_transfer_id))
+                self._signal_split_completion(
+                    request_id,
+                    remote_request_id,
+                    remote_host,
+                    remote_handshake_port,
+                    split_status,
+                    split_transfer_id,
+                )
 
     def _send_done_signal_to_free_remote_port(
         self, request_id: str, remote_host: str, remote_port_send_num: dict[int, RemotePortInfo]
@@ -868,6 +926,10 @@ class KVCacheRecvingThread(threading.Thread):
         if not requested_groups or not requested_groups.issubset({0, 1}):
             raise RuntimeError("Split destination requested groups are invalid")
         totals = [0, 0]
+        destinations: dict[str, list[tuple[int, int]]] = {
+            "cpu": [],
+            "npu": [],
+        }
         for segment in plan.segments:
             if segment.group_id not in requested_groups:
                 raise RuntimeError("Split segment targets an unrequested group")
@@ -879,6 +941,16 @@ class KVCacheRecvingThread(threading.Thread):
             if segment.length <= 0 or segment.source_offset < 0 or segment.destination_address <= 0:
                 raise RuntimeError("Invalid split destination extent")
             totals[segment.group_id] += segment.length
+            destinations[segment.destination_kind].append(
+                (
+                    segment.destination_address,
+                    segment.destination_address + segment.length,
+                )
+            )
+        for ranges in destinations.values():
+            ranges.sort()
+            if any(left[1] > right[0] for left, right in zip(ranges, ranges[1:])):
+                raise RuntimeError("Split destination extents overlap")
         if tuple(totals) != plan.group_byte_totals:
             raise RuntimeError(
                 f"Split destination byte totals mismatch: {tuple(totals)} != {plan.group_byte_totals}"
@@ -902,20 +974,25 @@ class KVCacheRecvingThread(threading.Thread):
         if LIVE_SPLIT_CAPABILITY not in capabilities:
             raise RuntimeError("Remote Mooncake peer lacks live split capability")
         remote_bases = self.kv_caches_base_addr[remote_engine_id][remote_port]
+        remote_sizes = self.remote_buffer_sizes[remote_engine_id][remote_port]
+        remote_groups = self.remote_buffer_group_ids[remote_engine_id][remote_port]
+        if len(remote_sizes) != len(remote_bases):
+            raise RuntimeError(
+                "Remote peer omitted registered source buffer sizes"
+            )
+        if len(remote_groups) != len(remote_bases):
+            raise RuntimeError(
+                "Remote peer omitted registered source buffer groups"
+            )
         for segment in plan.segments:
             if not 0 <= segment.source_buffer_index < len(remote_bases):
                 raise RuntimeError("Split source buffer index is out of range")
-            if (
-                segment.source_buffer_base is not None
-                and segment.source_buffer_base
-                != remote_bases[segment.source_buffer_index]
-            ):
+            if segment.source_buffer_base != remote_bases[
+                segment.source_buffer_index
+            ]:
                 raise RuntimeError("Split source buffer identity mismatch")
-            remote_sizes = self.remote_buffer_sizes[remote_engine_id][remote_port]
-            if len(remote_sizes) != len(remote_bases):
-                raise RuntimeError(
-                    "Remote peer omitted registered source buffer sizes"
-                )
+            if remote_groups[segment.source_buffer_index] != segment.group_id:
+                raise RuntimeError("Split source buffer group mismatch")
             source_size = remote_sizes[segment.source_buffer_index]
             if segment.source_offset + segment.length > source_size:
                 raise RuntimeError("Split source extent exceeds registered KV buffer")
@@ -2026,6 +2103,10 @@ class MooncakeConnectorWorker:
                     raise RuntimeError(
                         "Mooncake split transfer ownership remains active"
                     )
+                if self.kv_recv_thread.pending_split_signals:
+                    raise RuntimeError(
+                        "Mooncake split completion signals remain active"
+                    )
         if self.kv_recv_thread is not None:
             self.kv_recv_thread.close_resources()
 
@@ -2498,8 +2579,8 @@ class MooncakeConnectorWorker:
                 self.kv_recv_thread.task_tracker.complete_split_request(
                     req_id, "fallback", mark_finished=False,
                     split_transfer_id=meta.split_transfer_id)
-                self.kv_recv_thread.executor.submit(
-                    self.kv_recv_thread._send_split_done_signal,
+                self.kv_recv_thread._signal_split_completion(
+                    req_id,
                     remote_req_id, remote_host, remote_port, "fallback",
                     meta.split_transfer_id)
                 continue
@@ -2573,8 +2654,8 @@ class MooncakeConnectorWorker:
                         self.kv_recv_thread.task_tracker.complete_split_request(
                             req_id, "fallback", mark_finished=False,
                             split_transfer_id=meta.split_transfer_id)
-                        self.kv_recv_thread.executor.submit(
-                            self.kv_recv_thread._send_split_done_signal,
+                        self.kv_recv_thread._signal_split_completion(
+                            req_id,
                             remote_req_id, remote_host,
                             remote_handshake_port, "fallback",
                             meta.split_transfer_id)
