@@ -1341,7 +1341,7 @@ class MooncakeConnector(KVConnectorBase_V1):
 
         if role == KVConnectorRole.SCHEDULER:
             self.connector_scheduler: MooncakeConnectorScheduler | None = MooncakeConnectorScheduler(
-                vllm_config, str(self.engine_id)
+                vllm_config, str(self.engine_id), self._live_split_source_groups()
             )
             self.connector_worker: MooncakeConnectorWorker | None = None
         elif role == KVConnectorRole.WORKER:
@@ -1459,12 +1459,18 @@ class MooncakeConnector(KVConnectorBase_V1):
 class MooncakeConnectorScheduler:
     """Implementation of Scheduler side methods"""
 
-    def __init__(self, vllm_config: VllmConfig, engine_id: str):
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        engine_id: str,
+        live_split_source_groups: tuple[int, ...] = (0, 1),
+    ):
         self.vllm_config = vllm_config
         init_ascend_config(vllm_config)
         self.ascend_config = get_ascend_config()
         self.block_size = vllm_config.cache_config.block_size
         self.engine_id = engine_id
+        self.live_split_source_groups = live_split_source_groups
         self.local_ip = get_ip()
         logger.info("Initializing Mooncake Scheduler %s", engine_id)
 
@@ -1522,11 +1528,14 @@ class MooncakeConnectorScheduler:
             segments = []
             for segment in raw["segments"]:
                 segment = dict(segment)
+                group_id = int(segment["group_id"])
+                if group_id not in self.live_split_source_groups:
+                    continue
                 base = int(segment["source_buffer_base"])
                 index = indices.get(base)
                 if index is None:
                     raise ValueError("Live split source base is not registered")
-                if int(segment["group_id"]) != groups[index]:
+                if group_id != groups[index]:
                     raise ValueError("Live split source group does not match buffer")
                 if (
                     int(segment["source_offset"]) + int(segment["length"])
@@ -1535,7 +1544,14 @@ class MooncakeConnectorScheduler:
                     raise ValueError("Live split source extent exceeds buffer")
                 segment["source_buffer_index"] = index
                 segments.append(segment)
-            normalized.append({**raw, "segments": segments})
+            if not segments:
+                raise ValueError("Live split source has no supported groups")
+            totals = [0, 0]
+            for segment in segments:
+                totals[int(segment["group_id"])] += int(segment["length"])
+            normalized.append(
+                {**raw, "segments": segments, "group_byte_totals": totals}
+            )
         return {"descriptors": normalized}
 
     def get_num_new_matched_tokens(self, request: "Request", num_computed_tokens: int) -> tuple[int, bool]:

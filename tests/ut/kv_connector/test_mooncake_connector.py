@@ -1966,6 +1966,40 @@ class TestMooncakeConnectorScheduler(unittest.TestCase):
         self.assertEqual(params[LIVE_SPLIT_SOURCE_DESCRIPTOR], source)
         self.assertIsNot(params[LIVE_SPLIT_SOURCE_DESCRIPTOR], source)
 
+    def test_index_connector_canonicalizes_only_owned_source_group(self):
+        self.scheduler.live_split_source_groups = (1,)
+        self.scheduler.local_source_metadata[(0, 0)] = MooncakeAgentMetadata(
+            engine_id="engine",
+            te_rpc_port=1,
+            kv_caches_base_addr=[0x2000],
+            num_blocks=1,
+            kv_caches_buffer_sizes=(0x100,),
+            buffer_group_ids=(1,),
+            tp_rank=0,
+            dp_rank=0,
+        )
+        source = {
+            "segments": [
+                {"group_id": 0, "source_buffer_index": 0,
+                 "source_buffer_base": 0x1000, "source_offset": 0,
+                 "length": 16},
+                {"group_id": 1, "source_buffer_index": 0,
+                 "source_buffer_base": 0x2000, "source_offset": 8,
+                 "length": 24},
+            ],
+            "group_byte_totals": [16, 24],
+            "tp_rank": 0,
+            "dp_rank": 0,
+        }
+
+        result = self.scheduler._canonicalize_source_descriptor(source)
+
+        descriptor = result["descriptors"][0]
+        self.assertEqual(descriptor["group_byte_totals"], [0, 24])
+        self.assertEqual(len(descriptor["segments"]), 1)
+        self.assertEqual(descriptor["segments"][0]["group_id"], 1)
+        self.assertEqual(descriptor["segments"][0]["source_buffer_index"], 0)
+
 
 class TestUtils(unittest.TestCase):
 
