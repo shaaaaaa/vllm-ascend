@@ -1358,7 +1358,8 @@ class TestAscendMultiLateSplitInjection(unittest.TestCase):
         )
 
         class Provider:
-            supports_dsa_compact_external_load = True
+            supports_dsa_compact_external_load = False
+            supports_dsa_live_split_source = True
 
             def request_finished(self, req, _block_ids):
                 events.append("provider")
@@ -1400,7 +1401,7 @@ class TestAscendMultiLateSplitInjection(unittest.TestCase):
         class Child:
             def __init__(self, name, capable=False):
                 self.name = name
-                self.supports_dsa_compact_external_load = capable
+                self.supports_dsa_live_split_source = capable
 
             def request_finished(self, _request, _block_ids):
                 events.append(self.name)

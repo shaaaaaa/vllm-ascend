@@ -109,6 +109,13 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
         )
         return bool(capability() if callable(capability) else capability)
 
+    @staticmethod
+    def _supports_dsa_live_split_source(connector: Any) -> bool:
+        capability = getattr(
+            connector, "supports_dsa_live_split_source", False
+        )
+        return bool(capability() if callable(capability) else capability)
+
     @property
     def supports_dsa_compact_external_load(self) -> bool:
         # The scheduler reads this immediately after matched-token lookup.
@@ -559,7 +566,7 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
             live_providers = []
             for connector in connectors:
                 try:
-                    capable = self._supports_dsa_compact_load(connector)
+                    capable = self._supports_dsa_live_split_source(connector)
                 except Exception:
                     logger.exception(
                         "Live-split scheduler capability probe failed"
