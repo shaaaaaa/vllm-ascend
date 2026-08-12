@@ -31,7 +31,7 @@ from urllib.parse import urlparse
 
 BASE_PROMPT_TOKENS = 65536
 DEFAULT_ON_ROUNDS = 3
-DEFAULT_CHUNK_SIZE = 8192
+DEFAULT_CHUNK_SIZE = 2048
 OFF_TIMEOUT_SECONDS = 300.0
 
 
@@ -217,7 +217,7 @@ def summarize(
 
 
 def prompt_multipliers(label: str, rounds: int) -> tuple[int, ...]:
-    return tuple(1 << index for index in range(rounds)) if label == "on" else (1,)
+    return tuple(1 << index for index in range(rounds))
 
 
 def case_output_path(output: Path, multiplier: int) -> Path:
@@ -241,14 +241,17 @@ def parse_args() -> argparse.Namespace:
         "--prompt-tokens",
         type=int,
         default=BASE_PROMPT_TOKENS,
-        help=(f"Base prompt length (default: {BASE_PROMPT_TOKENS}); on multiplies it by successive powers of two"),
+        help=(
+            f"Base prompt length (default: {BASE_PROMPT_TOKENS}); each mode "
+            "multiplies it by successive powers of two"
+        ),
     )
     parser.add_argument(
         "--rounds",
         type=int,
         default=DEFAULT_ON_ROUNDS,
         help=(
-            f"Number of prompt-length cases for on (default: {DEFAULT_ON_ROUNDS}); "
+            f"Number of prompt-length cases (default: {DEFAULT_ON_ROUNDS}); "
             "for example, 3 runs 1x/2x/4x and 4 runs 1x/2x/4x/8x"
         ),
     )

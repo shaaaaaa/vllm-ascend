@@ -26,8 +26,8 @@ def _load_benchmark_module() -> ModuleType:
 BENCHMARK = _load_benchmark_module()
 
 
-def test_on_uses_prompt_length_sweep_and_separate_output_paths() -> None:
-    assert BENCHMARK.prompt_multipliers("off", 4) == (1,)
+def test_both_modes_use_prompt_length_sweep_and_separate_output_paths() -> None:
+    assert BENCHMARK.prompt_multipliers("off", 4) == (1, 2, 4, 8)
     assert BENCHMARK.prompt_multipliers("on", 3) == (1, 2, 4)
     assert BENCHMARK.prompt_multipliers("on", 4) == (1, 2, 4, 8)
     assert BENCHMARK.case_output_path(Path("on.json"), 8) == Path("on-8x.json")
@@ -83,7 +83,7 @@ def test_summary_reports_average_chunk_and_total_times() -> None:
 
 @pytest.mark.parametrize(
     ("label", "expected_timeout"),
-    (("off", 300.0), ("on", 1200.0)),
+    (("off", 1200.0), ("on", 1200.0)),
 )
 def test_mode_defaults(
     monkeypatch: pytest.MonkeyPatch,
@@ -107,13 +107,15 @@ def test_mode_defaults(
 
     assert args.prompt_tokens == 65536
     assert args.rounds == 3
-    assert args.chunk_size == 8192
+    assert args.chunk_size == 2048
     assert args.timeout == expected_timeout
 
 
+@pytest.mark.parametrize("label", ("off", "on"))
 def test_custom_rounds_control_cases_and_timeout(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    label: str,
 ) -> None:
     monkeypatch.setattr(
         sys,
@@ -121,11 +123,11 @@ def test_custom_rounds_control_cases_and_timeout(
         [
             "benchmark_prefill_p.py",
             "--label",
-            "on",
+            label,
             "--rounds",
             "4",
             "--output",
-            str(tmp_path / "on.json"),
+            str(tmp_path / f"{label}.json"),
         ],
     )
 
