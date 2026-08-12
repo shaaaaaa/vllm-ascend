@@ -388,7 +388,11 @@ def _dsa_remap_frontier(load_spec: Any) -> int:
     return committed_end
 
 
-def get_lmcache_sparse_cached_tokens(request_ids: Any) -> list[int]:
+def _get_lmcache_sparse_cached_tokens(
+    request_ids: Any,
+    *,
+    require_all: bool,
+) -> list[int | None]:
     """Return a proven remap frontier for every active request.
 
     Sparse-decode metadata contributes a boundary derived from committed
@@ -446,11 +450,32 @@ def get_lmcache_sparse_cached_tokens(request_ids: Any) -> list[int]:
             cached_by_req[req_id] = _dsa_remap_frontier(load_spec)
 
     missing = [req_id for req_id in normalized_request_ids if req_id not in cached_by_req]
-    if missing:
+    if require_all and missing:
         raise RuntimeError(
             f"[SFA sparse remap] connector metadata has no proven sparse frontier for active requests: {missing!r}."
         )
-    return [cached_by_req[req_id] for req_id in normalized_request_ids]
+    return [cached_by_req.get(req_id) for req_id in normalized_request_ids]
+
+
+def get_lmcache_sparse_cached_tokens(request_ids: Any) -> list[int]:
+    frontiers = _get_lmcache_sparse_cached_tokens(
+        request_ids,
+        require_all=True,
+    )
+    result: list[int] = []
+    for frontier in frontiers:
+        assert frontier is not None
+        result.append(int(frontier))
+    return result
+
+
+def get_lmcache_sparse_cached_tokens_optional(
+    request_ids: Any,
+) -> list[int | None]:
+    return _get_lmcache_sparse_cached_tokens(
+        request_ids,
+        require_all=False,
+    )
 
 
 def staged_sfa_metadata_sparse_route(

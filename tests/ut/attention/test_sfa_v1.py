@@ -625,6 +625,46 @@ class TestLMCacheSparseFrontier(TestBase):
             (StagedSFARouteReason.MISSING_CONNECTOR_METADATA, ()),
         )
 
+    def test_native_optional_frontier_keeps_staged_lookup_strict(self):
+        metadata = SimpleNamespace(
+            requests=[
+                SimpleNamespace(
+                    req_id='req-0',
+                    is_sparse_decode=True,
+                    load_spec=SimpleNamespace(
+                        can_load=True,
+                        lmcache_cached_tokens=128,
+                    ),
+                )
+            ]
+        )
+        connector = SimpleNamespace(_get_connector_metadata=lambda: metadata)
+        with (
+            patch.object(
+                attention_utils,
+                'staged_sfa_connector_supports_sparse_load',
+                return_value=True,
+            ),
+            patch.object(
+                attention_utils,
+                'get_kv_transfer_group',
+                return_value=connector,
+            ),
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                'no proven sparse frontier',
+            ):
+                attention_utils.get_lmcache_sparse_cached_tokens(
+                    ['req-0', 'req-1']
+                )
+            self.assertEqual(
+                attention_utils.get_lmcache_sparse_cached_tokens_optional(
+                    ['req-0', 'req-1']
+                ),
+                [128, None],
+            )
+
     def test_frontiers_preserve_native_request_order(self):
         metadata = SimpleNamespace(
             requests=[
@@ -1909,7 +1949,10 @@ class TestStagedSFAGraphPoc(TestBase):
                 "_decode_window_save_window_size",
                 return_value=256,
             ),
-            patch.object(sfa_v1, "get_lmcache_sparse_cached_tokens") as lookup,
+            patch.object(
+                sfa_v1,
+                "get_lmcache_sparse_cached_tokens_optional",
+            ) as lookup,
         ):
             first = sfa_v1._prepare_sfa_remap_boundary(
                 metadata,
@@ -1978,7 +2021,7 @@ class TestStagedSFAGraphPoc(TestBase):
             ),
             patch.object(
                 sfa_v1,
-                "get_lmcache_sparse_cached_tokens",
+                "get_lmcache_sparse_cached_tokens_optional",
                 return_value=[900],
             ) as lookup,
         ):
@@ -2006,7 +2049,7 @@ class TestStagedSFAGraphPoc(TestBase):
             ),
             patch.object(
                 sfa_v1,
-                "get_lmcache_sparse_cached_tokens",
+                "get_lmcache_sparse_cached_tokens_optional",
                 return_value=[90],
             ) as lookup,
         ):
@@ -2026,7 +2069,7 @@ class TestStagedSFAGraphPoc(TestBase):
 
         with patch.object(
             sfa_v1,
-            "get_lmcache_sparse_cached_tokens",
+            "get_lmcache_sparse_cached_tokens_optional",
             return_value=[90],
         ) as lookup:
             cached_tokens = sfa_v1._resolve_sparse_cached_tokens_by_request(
@@ -2034,8 +2077,28 @@ class TestStagedSFAGraphPoc(TestBase):
                 ["decode-req", "prefill-req"],
             )
 
-        self.assertEqual(cached_tokens, [90, 0])
+        self.assertEqual(cached_tokens, [90, None])
         lookup.assert_called_once_with(["decode-req"])
+
+    def test_native_partial_frontier_preserves_unmanaged_boundary(self):
+        boundary_cpu = torch.tensor([100, 200], dtype=torch.int32)
+        metadata = SimpleNamespace(
+            split_boundary=boundary_cpu.clone(),
+            decode_split_boundary_cpu=boundary_cpu.numpy(),
+            decode_split_boundary_cpu_tensor=boundary_cpu,
+            decode_req_indices_cpu=np.array([0, 1], dtype=np.int32),
+            seq_lens_cpu=torch.tensor([110, 210], dtype=torch.int32),
+            num_decode_tokens=2,
+            decode_split_boundary=None,
+        )
+
+        result = sfa_v1._update_dsa_split_boundary_in_place(
+            metadata,
+            cached_tokens=[90, None],
+            decode_window_size=0,
+        )
+
+        self.assertEqual(result.tolist(), [90, 200])
 
     def test_remap_boundary_uses_unique_request_ids_for_mtp_rows(self):
         metadata = self._make_decode_metadata()

@@ -64,7 +64,7 @@ from vllm_ascend.attention.utils import (
     AscendCommonAttentionMetadata,
     ascend_chunked_prefill_workspace_size,
     enable_cp,
-    get_lmcache_sparse_cached_tokens,
+    get_lmcache_sparse_cached_tokens_optional,
     maybe_save_kv_layer_to_connector,
     staged_sfa_connector_supports_sparse_load,
     trans_rope_weight,
@@ -307,7 +307,7 @@ def _decode_window_save_window_size() -> int:
 
 def _update_dsa_split_boundary_in_place(
     attn_metadata: Any,
-    cached_tokens: list[int] | None,
+    cached_tokens: list[int | None] | None,
     decode_window_size: int,
 ) -> torch.Tensor:
     """Update the builder-owned row boundary without temporary device tensors."""
@@ -368,20 +368,15 @@ def _update_dsa_split_boundary_in_place(
     ):
         if has_cached_frontier:
             cached_count = min(len(cached_tokens), num_reqs)
-            if cached_count == num_reqs:
-                request_boundaries = np.asarray(
-                    cached_tokens[:cached_count],
-                    dtype=np.int32,
-                )
-            else:
-                request_boundaries = np.zeros(
-                    num_reqs,
-                    dtype=np.int32,
-                )
-                request_boundaries[:cached_count] = np.asarray(
-                    cached_tokens[:cached_count],
-                    dtype=np.int32,
-                )
+            request_boundaries = np.zeros(num_reqs, dtype=np.int32)
+            cached_request_mask = np.zeros(num_reqs, dtype=np.bool_)
+            for request_index, cached_token in enumerate(
+                cached_tokens[:cached_count]
+            ):
+                if cached_token is None:
+                    continue
+                request_boundaries[request_index] = int(cached_token)
+                cached_request_mask[request_index] = True
         else:
             request_boundaries = np.empty(
                 num_reqs,
@@ -405,13 +400,24 @@ def _update_dsa_split_boundary_in_place(
                     window_starts,
                     request_boundaries,
                     out=request_boundaries,
+                    where=cached_request_mask,
                     casting="unsafe",
                 )
+                request_boundaries[~cached_request_mask] = window_starts[
+                    ~cached_request_mask
+                ]
             else:
                 request_boundaries[:] = window_starts
-        boundary_cpu[:num_rows][valid_rows] = request_boundaries[
-            row_req_indices[valid_rows]
-        ]
+        rows_with_dynamic_boundary = valid_rows.copy()
+        if has_cached_frontier and decode_window_size <= 0:
+            rows_with_dynamic_boundary[valid_rows] = cached_request_mask[
+                row_req_indices[valid_rows]
+            ]
+        boundary_cpu[:num_rows][rows_with_dynamic_boundary] = (
+            request_boundaries[
+                row_req_indices[rows_with_dynamic_boundary]
+            ]
+        )
 
     split_boundary.copy_(boundary_cpu_tensor[:num_rows])
     attn_metadata.decode_split_boundary = split_boundary
@@ -421,8 +427,8 @@ def _update_dsa_split_boundary_in_place(
 def _resolve_sparse_cached_tokens_by_request(
     attn_metadata: Any,
     request_ids: Any,
-) -> list[int]:
-    """Resolve strict connector frontiers in the native request order."""
+) -> list[int | None]:
+    """Resolve available connector frontiers in native request order."""
     row_req_indices = attn_metadata.decode_req_indices_cpu
     if row_req_indices is None:
         raise RuntimeError("[SFA sparse remap] row/request mapping is unavailable.")
@@ -441,12 +447,16 @@ def _resolve_sparse_cached_tokens_by_request(
     decode_request_ids = [
         request_ids[request_index] for request_index in decode_request_indices
     ]
-    resolved = get_lmcache_sparse_cached_tokens(decode_request_ids)
-    cached_tokens = [0] * int(attn_metadata.seq_lens_cpu.shape[0])
+    resolved = get_lmcache_sparse_cached_tokens_optional(decode_request_ids)
+    cached_tokens: list[int | None] = [None] * int(
+        attn_metadata.seq_lens_cpu.shape[0]
+    )
     for request_index, committed_end in zip(
         decode_request_indices, resolved, strict=True
     ):
-        cached_tokens[request_index] = int(committed_end)
+        cached_tokens[request_index] = (
+            None if committed_end is None else int(committed_end)
+        )
     return cached_tokens
 
 
@@ -520,11 +530,18 @@ def _prepare_sfa_remap_boundary(
                 if decode_request_indices[-1] >= len(request_ids):
                     raise RuntimeError("[SFA sparse remap] active request IDs do not cover all decode rows.")
                 decode_request_ids = [request_ids[index] for index in decode_request_indices]
-                resolved_tokens = get_lmcache_sparse_cached_tokens(decode_request_ids)
-                cached_tokens_by_request[
-                    decode_request_indices_np
-                ] = np.asarray(resolved_tokens, dtype=np.int32)
-                cached_request_mask[decode_request_indices_np] = True
+                resolved_tokens = get_lmcache_sparse_cached_tokens_optional(
+                    decode_request_ids
+                )
+                for request_index, resolved_token in zip(
+                    decode_request_indices,
+                    resolved_tokens,
+                    strict=True,
+                ):
+                    if resolved_token is None:
+                        continue
+                    cached_tokens_by_request[request_index] = int(resolved_token)
+                    cached_request_mask[request_index] = True
         else:
             if len(cached_tokens) != len(decode_request_indices):
                 raise RuntimeError(
