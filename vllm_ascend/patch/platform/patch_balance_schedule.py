@@ -624,6 +624,14 @@ class BalanceDPEngineCoreProc(DPEngineCoreProc):
 
                 # We are in a running state and so must execute a dummy pass
                 # if the model didn't execute any ready requests.
+                dummy_state = dict(
+                    balance_dummy=True,
+                    local_unfinished=local_unfinished_reqs,
+                    running=len(self.scheduler.running),
+                    waiting=len(self.scheduler.waiting),
+                    engines_running=self.engines_running,
+                )
+                logger.info(str(dummy_state))
                 self.execute_dummy_batch()
 
             # 3) All-reduce operation to determine global unfinished reqs.

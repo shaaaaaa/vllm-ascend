@@ -2670,7 +2670,11 @@ class NPUModelRunner(GPUModelRunner):
         tensor.zero_()
         num_tokens_across_dp = tensor[0]
 
-        if self._skip_all_reduce_across_dp_group():
+        # Staged SFA uses this collective to agree both its route and fixed
+        # graph capacity. The MC2 fast path may skip token-count coordination
+        # for ordinary graphs, but doing so here lets DP ranks replay different
+        # staged graph contracts.
+        if self._skip_all_reduce_across_dp_group() and not staged_route_protocol:
             num_tokens_across_dp.fill_(num_tokens_padded)
             return (
                 False,
