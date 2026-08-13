@@ -2602,8 +2602,8 @@ class TestMooncakeConnectorScheduler(unittest.TestCase):
         metadata.accept_late_split_plans({})
         self.assertTrue(request_meta.split_fallback)
 
-    def test_index_connector_canonicalizes_only_owned_source_group(self):
-        self.scheduler.live_split_source_groups = (1,)
+    def test_live_split_canonicalizes_only_destination_supported_group(self):
+        self.assertEqual(self.scheduler.live_split_source_groups, (1,))
         self.scheduler.local_source_metadata[(0, 0)] = MooncakeAgentMetadata(
             engine_id="engine",
             te_rpc_port=1,

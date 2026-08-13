@@ -1759,7 +1759,9 @@ class MooncakeConnector(KVConnectorBase_V1):
         index_group_id = getattr(self, "index_group_id", None)
         if index_group_id is not None:
             return (int(index_group_id),)
-        return (0, 1)
+        # Group 0 remains on LMCache's rank-0-owned persistent collective;
+        # the current live destination protocol safely imports group 1 only.
+        return (1,)
 
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
         assert self.connector_worker is not None
@@ -1811,7 +1813,7 @@ class MooncakeConnectorScheduler:
         self,
         vllm_config: VllmConfig,
         engine_id: str,
-        live_split_source_groups: tuple[int, ...] = (0, 1),
+        live_split_source_groups: tuple[int, ...] = (1,),
     ):
         self.vllm_config = vllm_config
         init_ascend_config(vllm_config)
