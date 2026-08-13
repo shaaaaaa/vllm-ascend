@@ -2698,15 +2698,16 @@ class MooncakeConnectorWorker:
 
     def start_load_kv(self, metadata: MooncakeConnectorMetadata):
         """Start loading KV blocks from remote engine."""
-        _cold_live_log(
-            "live_source_worker_load_entry",
-            request_ids=sorted(metadata.requests),
-            split_requests=[
-                req_id
-                for req_id, meta in metadata.requests.items()
-                if meta.split_negotiated
-            ],
-        )
+        if metadata.requests:
+            _cold_live_log(
+                "live_source_worker_load_entry",
+                request_ids=sorted(metadata.requests),
+                split_requests=[
+                    req_id
+                    for req_id, meta in metadata.requests.items()
+                    if meta.split_negotiated
+                ],
+            )
         if self.kv_recv_thread is not None:
             for req_id in metadata.reqs_in_batch:
                 self.kv_recv_thread.task_tracker.add_req_to_process(
