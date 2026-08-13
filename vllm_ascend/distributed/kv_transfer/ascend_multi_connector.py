@@ -1,4 +1,7 @@
 import inspect
+import json
+import os
+import time
 from typing import TYPE_CHECKING, Any
 
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
@@ -28,6 +31,27 @@ if TYPE_CHECKING:
     from vllm.v1.request import Request
 
 logger = init_logger(__name__)
+
+
+def _cold_live_log(event: str, **fields: Any) -> None:
+    if os.environ.get("LMCACHE_COLD_START_PERF", "0").lower() in (
+        "", "0", "false", "no", "off"
+    ):
+        return
+    logger.info(
+        "[LMCACHE_COLD_PERF] %s",
+        json.dumps(
+            {
+                "schema": 1,
+                "event": event,
+                "pid": os.getpid(),
+                "monotonic_ms": round(time.perf_counter() * 1000, 3),
+                **fields,
+            },
+            default=str,
+            separators=(",", ":"),
+        ),
+    )
 
 
 def _is_single_tensor_kv(kv_cache: Any) -> bool:
@@ -638,12 +662,32 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
                 and isinstance(txfer_params, dict)
                 and "ascend_live_split_source_v1" in txfer_params
             ):
+                source = txfer_params["ascend_live_split_source_v1"]
+                _cold_live_log(
+                    "live_source_multi_handoff",
+                    req_id=request.request_id,
+                    provider=connector.__class__.__name__,
+                    descriptor_count=len(source.get("descriptors", ())),
+                )
                 params["ascend_live_split_source_v1"] = txfer_params.pop(
                     "ascend_live_split_source_v1"
                 )
             kv_transfer_params = self._merge_kv_transfer_params(
                 kv_transfer_params, txfer_params
             )
+
+        _cold_live_log(
+            "live_source_multi_finish",
+            req_id=request.request_id,
+            request_live_split=bool(
+                isinstance(params, dict) and params.get("request_live_split")
+            ),
+            source_attached=bool(
+                isinstance(kv_transfer_params, dict)
+                and "ascend_live_split_source_v1" in kv_transfer_params
+            ),
+            child_count=len(connectors),
+        )
 
         if async_saves > 1:
             self._extra_async_saves[request.request_id] = async_saves - 1
