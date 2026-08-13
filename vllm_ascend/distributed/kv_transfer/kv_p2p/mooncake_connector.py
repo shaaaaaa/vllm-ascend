@@ -2,6 +2,7 @@
 import contextlib
 import copy
 import hashlib
+import json
 import math
 import os
 import queue
@@ -72,6 +73,27 @@ MAX_SPLIT_TRANSFER_ID_LENGTH = 64
 SPLIT_DONE_MAX_ATTEMPTS = 3
 CONTROL_ACK_MAX_ATTEMPTS = 3
 THREAD_SHUTDOWN_TIMEOUT = 30.0
+
+
+def _cold_live_log(event: str, **fields: Any) -> None:
+    if os.environ.get("LMCACHE_COLD_START_PERF", "0").lower() in (
+        "", "0", "false", "no", "off"
+    ):
+        return
+    logger.info(
+        "[LMCACHE_COLD_PERF] %s",
+        json.dumps(
+            {
+                "schema": 1,
+                "event": event,
+                "pid": os.getpid(),
+                "monotonic_ms": round(time.perf_counter() * 1000, 3),
+                **fields,
+            },
+            default=str,
+            separators=(",", ":"),
+        ),
+    )
 
 
 class RemotePortInfo(TypedDict):
@@ -1353,6 +1375,15 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
             LIVE_SPLIT_CAPABILITY in capabilities or split_plan is not None
         )
         split_transfer_id = kv_transfer_params.get("live_split_transfer_id")
+        _cold_live_log(
+            "live_source_decoder_ingest",
+            req_id=request_id,
+            source_present=LIVE_SPLIT_SOURCE_DESCRIPTOR in kv_transfer_params,
+            source_valid=split_source is not None,
+            split_negotiated=split_negotiated,
+            transfer_id_present=isinstance(split_transfer_id, str),
+            transfer_param_keys=sorted(kv_transfer_params),
+        )
         if split_negotiated and not self.live_split_topology_supported:
             split_plan = None
             split_source_invalid = True
@@ -2040,6 +2071,14 @@ class MooncakeConnectorScheduler:
             transfer_params["live_split_capabilities"] = (LIVE_SPLIT_CAPABILITY,)
             transfer_params["live_split_transfer_id"] = split_transfer_id
             source_descriptor = params.get(LIVE_SPLIT_SOURCE_DESCRIPTOR)
+            _cold_live_log(
+                "live_source_mooncake_input",
+                req_id=request.request_id,
+                request_live_split=True,
+                source_present=source_descriptor is not None,
+                topology_supported=True,
+                request_param_keys=sorted(params),
+            )
             if source_descriptor is not None:
                 # This descriptor is created by the prefiller-side compact
                 # provider, which owns the registered source layout.  The
@@ -2055,6 +2094,14 @@ class MooncakeConnectorScheduler:
                         request.request_id,
                         exc_info=True,
                     )
+            _cold_live_log(
+                "live_source_mooncake_emit",
+                req_id=request.request_id,
+                source_present=(
+                    LIVE_SPLIT_SOURCE_DESCRIPTOR in transfer_params
+                ),
+                transfer_param_keys=sorted(transfer_params),
+            )
         return delay_free_blocks, transfer_params
 
     def set_xfer_handshake_metadata(self, metadata: dict[int, KVConnectorHandshakeMetadata]) -> None:
