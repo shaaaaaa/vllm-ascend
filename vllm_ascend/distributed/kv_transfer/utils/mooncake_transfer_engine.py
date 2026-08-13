@@ -51,32 +51,48 @@ class GlobalTE:
                 zip(ptrs, sizes, strict=True),
                 key=lambda region: (-region[1], region[0]),
             )
-            for ptr, size in regions:
-                if ptr <= 0 or size <= 0:
-                    raise ValueError("Mooncake memory regions must be positive")
-                end = ptr + size
-                containing = next(
-                    (
-                        (base, registered_size)
-                        for base, registered_size in self.registered_buffers.items()
-                        if base <= ptr and end <= base + registered_size
-                    ),
-                    None,
-                )
-                if containing is not None:
-                    continue
-                overlapping = any(
-                    ptr < base + registered_size and base < end
-                    for base, registered_size in self.registered_buffers.items()
-                )
-                if overlapping:
-                    raise RuntimeError(
-                        "Mooncake memory region partially overlaps an existing registration"
+            registered: list[int] = []
+            try:
+                for ptr, size in regions:
+                    if ptr <= 0 or size <= 0:
+                        raise ValueError("Mooncake memory regions must be positive")
+                    end = ptr + size
+                    containing = next(
+                        (
+                            (base, registered_size)
+                            for base, registered_size in self.registered_buffers.items()
+                            if base <= ptr and end <= base + registered_size
+                        ),
+                        None,
                     )
-                ret_value = self.transfer_engine.register_memory(ptr, size)
-                if ret_value != 0:
-                    raise RuntimeError("Mooncake memory registration failed.")
-                self.registered_buffers[ptr] = size
+                    if containing is not None:
+                        continue
+                    overlapping = any(
+                        ptr < base + registered_size and base < end
+                        for base, registered_size in self.registered_buffers.items()
+                    )
+                    if overlapping:
+                        raise RuntimeError(
+                            "Mooncake memory region partially overlaps an existing registration"
+                        )
+                    ret_value = self.transfer_engine.register_memory(ptr, size)
+                    if ret_value != 0:
+                        raise RuntimeError("Mooncake memory registration failed.")
+                    self.registered_buffers[ptr] = size
+                    registered.append(ptr)
+            except Exception:
+                failures = []
+                for base in reversed(registered):
+                    if self.transfer_engine.unregister_memory(base) != 0:
+                        failures.append(base)
+                    else:
+                        self.registered_buffers.pop(base, None)
+                if failures:
+                    raise RuntimeError(
+                        "Mooncake memory registration rollback failed for "
+                        f"{len(failures)} region(s)."
+                    )
+                raise
 
     def adopt_registered_buffer(
         self,

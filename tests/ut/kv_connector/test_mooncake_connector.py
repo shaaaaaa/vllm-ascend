@@ -410,7 +410,7 @@ class TestSocketManagement(unittest.TestCase):
 
         self.assertEqual(mock_socket_factory.call_count, 2)
         expected = self.thread.encoder.encode(
-            (b"split_done_msg_v1", "req", "success", "generation-a"))
+            (b"split_done_msg_v2", "req", "success", "generation-a"))
         self.assertEqual(
             [call.args[1] for call in mock_send.call_args_list],
             [expected, expected],
@@ -804,6 +804,7 @@ class TestCoreFunctionality(unittest.TestCase):
         )
 
         self.thread._submit_split_done_signal.assert_called_once_with(
+            ("local", "generation-a"),
             "remote", "host", 6666, "success", "generation-a"
         )
 
@@ -1104,14 +1105,37 @@ class TestKVCacheTaskTracker(unittest.TestCase):
         self.assertNotIn("req", self.tracker.delayed_free_requests)
         self.assertNotIn("req", self.tracker.reqs_to_process)
 
-    def test_split_lease_timeout_reports_fallback_result(self):
+    def test_split_lease_timeout_keeps_native_source_pinned(self):
         self.tracker.add_req_to_process("req")
         self.tracker.add_delayed_request(
             "req", time.time() - 600, split=True)
 
-        self.assertEqual(self.tracker._retrieve_expired_requests(), {"req"})
+        self.assertEqual(self.tracker._retrieve_expired_requests(), set())
+        self.assertIn("req", self.tracker.delayed_free_requests)
+        self.assertIn("req", self.tracker.split_leases)
+
+        self.tracker.complete_split_request("req", "success")
+
         self.assertEqual(self.tracker.get_and_clear_split_results(),
-                         {"req": "timeout"})
+                         {"req": "success"})
+        self.assertEqual(self.tracker.get_and_clear_finished_requests(),
+                         {"req"})
+
+    def test_expired_split_lease_does_not_block_ordinary_expiry(self):
+        expired = time.time() - 600
+        for request_id in ("split", "ordinary", "fresh"):
+            self.tracker.add_req_to_process(request_id)
+        self.tracker.add_delayed_request("split", expired, split=True)
+        self.tracker.add_delayed_request("ordinary", expired)
+        self.tracker.add_delayed_request("fresh", time.time())
+
+        self.assertEqual(
+            self.tracker._retrieve_expired_requests(), {"ordinary"}
+        )
+        self.assertEqual(
+            tuple(self.tracker.delayed_free_requests), ("split", "fresh")
+        )
+        self.assertIn("split", self.tracker.split_leases)
 
     def test_reused_split_request_clears_both_terminal_generations(self):
         for mark_finished in (True, False):
@@ -1287,6 +1311,31 @@ class TestGlobalTransferEngineRegistration(unittest.TestCase):
             0x1000, 0x1000
         )
         self.assertEqual(registry.registered_buffers, {0x1000: 0x1000})
+
+    def test_failed_persistent_batch_rolls_back_new_regions(self):
+        registry = GlobalTE()
+        registry.transfer_engine = MagicMock()
+        registry.transfer_engine.register_memory.side_effect = [0, -1]
+        registry.transfer_engine.unregister_memory.return_value = 0
+
+        with self.assertRaisesRegex(RuntimeError, "registration failed"):
+            registry.register_buffer([0x1000, 0x3000], [0x100, 0x100])
+
+        registry.transfer_engine.unregister_memory.assert_called_once_with(
+            0x1000
+        )
+        self.assertEqual(registry.registered_buffers, {})
+
+    def test_failed_persistent_batch_retains_failed_rollback(self):
+        registry = GlobalTE()
+        registry.transfer_engine = MagicMock()
+        registry.transfer_engine.register_memory.side_effect = [0, -1]
+        registry.transfer_engine.unregister_memory.return_value = -1
+
+        with self.assertRaisesRegex(RuntimeError, "rollback failed"):
+            registry.register_buffer([0x1000, 0x3000], [0x100, 0x100])
+
+        self.assertEqual(registry.registered_buffers, {0x1000: 0x100})
 
     def test_temporary_registration_releases_and_allows_address_reuse(self):
         registry = GlobalTE()
@@ -2842,6 +2891,7 @@ class TestMooncakeConnectorWorker(unittest.TestCase):
         thread.split_request_lock = contextlib.nullcontext()
         thread.active_split_requests = {}
         thread.pending_split_signals = set()
+        thread.undelivered_split_signals = set()
         worker.kv_recv_thread = thread
 
         worker.shutdown()
@@ -2857,6 +2907,7 @@ class TestMooncakeConnectorWorker(unittest.TestCase):
         thread.split_request_lock = contextlib.nullcontext()
         thread.active_split_requests = {}
         thread.pending_split_signals = {MagicMock()}
+        thread.undelivered_split_signals = set()
         worker.kv_recv_thread = thread
 
         with self.assertRaisesRegex(RuntimeError, "signals remain active"):

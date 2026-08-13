@@ -63,8 +63,8 @@ if TYPE_CHECKING:
 
 GET_META_MSG = b"get_meta_msg"
 DONE_RECVING_MSG = b"done_recving_msg"
-SPLIT_DONE_MSG = b"split_done_msg_v1"
-LIVE_SPLIT_CAPABILITY = "ascend_live_split_v1"
+SPLIT_DONE_MSG = b"split_done_msg_v2"
+LIVE_SPLIT_CAPABILITY = "ascend_live_split_v2"
 LIVE_SPLIT_SOURCE_DESCRIPTOR = "ascend_live_split_source_v1"
 MAX_PENDING_SPLIT_REQUESTS = 64
 MAX_TASK_HISTORY_SIZE = 16000
@@ -319,21 +319,22 @@ class KVCacheTaskTracker:
         expired_requests: set[str] = set()
         # Free delayed requests if they exceed the timeout
         current_time = time.time()
-        while self.delayed_free_requests:
-            request_id = next(iter(self.delayed_free_requests))
-            delay_start_time = self.delayed_free_requests[request_id]
-            if current_time - delay_start_time > envs.VLLM_NIXL_ABORT_REQUEST_TIMEOUT:
-                self.delayed_free_requests.popitem(last=False)
-                self.reqs_to_process.discard(request_id)
-                expired_requests.add(request_id)
-                if request_id in self.split_leases:
-                    self.split_results.setdefault(request_id, "timeout")
-                    self.split_leases.discard(request_id)
-                    self.split_transfer_ids.pop(request_id, None)
-                    self.split_terminal_requests[request_id] = None
-                logger.info("Force freed request: %s", request_id)
-            else:
+        for request_id, delay_start_time in tuple(
+            self.delayed_free_requests.items()
+        ):
+            if (
+                current_time - delay_start_time
+                <= envs.VLLM_NIXL_ABORT_REQUEST_TIMEOUT
+            ):
                 break
+            if request_id in self.split_leases:
+                # A wall-clock timeout does not fence a remote native read.
+                # Keep live-source blocks pinned until its terminal ACK.
+                continue
+            self.delayed_free_requests.pop(request_id, None)
+            self.reqs_to_process.discard(request_id)
+            expired_requests.add(request_id)
+            logger.info("Force freed request: %s", request_id)
         return expired_requests
 
 
@@ -534,6 +535,7 @@ class KVCacheRecvingThread(threading.Thread):
         ] = OrderedDict()
         self.cancelled_split_requests: set[tuple[str, str | None]] = set()
         self.pending_split_signals: set[Future[Any]] = set()
+        self.undelivered_split_signals: set[tuple[str, str | None]] = set()
         self.stop_event = threading.Event()
 
         self.task_tracker = KVCacheTaskTracker()
@@ -612,6 +614,11 @@ class KVCacheRecvingThread(threading.Thread):
                     completed = self.completed_split_requests.get(generation)
                     if completed is not None:
                         return True
+                    if (
+                        len(self.undelivered_split_signals)
+                        >= MAX_PENDING_SPLIT_REQUESTS
+                    ):
+                        return False
                     active = self.active_split_requests.get(request_id)
                     if request_id in self.active_split_requests:
                         return active == split_transfer_id
@@ -671,11 +678,15 @@ class KVCacheRecvingThread(threading.Thread):
         for socket in sockets:
             self._discard_remote_socket(socket)
 
-    def _submit_split_done_signal(self, *args: Any) -> None:
+    def _submit_split_done_signal(
+        self, generation: tuple[str, str | None], *args: Any
+    ) -> None:
         future = self.executor.submit(self._send_split_done_signal, *args)
         with self.split_request_lock:
             self.pending_split_signals.add(future)
-        future.add_done_callback(self._split_done_signal_finished)
+        future.add_done_callback(
+            lambda done: self._split_done_signal_finished(generation, done)
+        )
 
     def _signal_split_completion(
         self,
@@ -691,9 +702,14 @@ class KVCacheRecvingThread(threading.Thread):
             if generation in self.completed_split_requests:
                 return
             self.completed_split_requests[generation] = status
+            self.undelivered_split_signals.add(generation)
             if len(self.completed_split_requests) > MAX_TASK_HISTORY_SIZE:
-                self.completed_split_requests.popitem(last=False)
+                for old_generation in tuple(self.completed_split_requests):
+                    if old_generation not in self.undelivered_split_signals:
+                        self.completed_split_requests.pop(old_generation)
+                        break
         self._submit_split_done_signal(
+            generation,
             remote_request_id,
             remote_host,
             remote_handshake_port,
@@ -701,13 +717,19 @@ class KVCacheRecvingThread(threading.Thread):
             split_transfer_id,
         )
 
-    def _split_done_signal_finished(self, future: Future[Any]) -> None:
+    def _split_done_signal_finished(
+        self, generation: tuple[str, str | None], future: Future[Any]
+    ) -> None:
         with self.split_request_lock:
             self.pending_split_signals.discard(future)
         try:
-            future.result()
+            delivered = future.result()
         except Exception:
             logger.exception("Mooncake split completion signal task failed")
+            return
+        if delivered:
+            with self.split_request_lock:
+                self.undelivered_split_signals.discard(generation)
 
     def _handle_request(self, req_meta: dict[str, Any]):
         request_id = req_meta["request_id"]
@@ -1201,49 +1223,58 @@ class KVCacheRecvingThread(threading.Thread):
         remote_handshake_port: int, status: str,
         split_transfer_id: str | None,
     ) -> bool:
-        for attempt in range(SPLIT_DONE_MAX_ATTEMPTS):
-            context = zmq.Context()  # type: ignore
-            sock = None
-            try:
-                sock = make_zmq_socket(
-                    ctx=context,
-                    path=make_zmq_path(
-                        "tcp", remote_host, remote_handshake_port
-                    ),
-                    socket_type=zmq.REQ,  # type: ignore
-                    bind=False,
-                    linger=0,
-                )
-                sock.setsockopt(zmq.SNDTIMEO, int(self.timeout * 1000))
-                poller = zmq.Poller()  # type: ignore
-                poller.register(sock, zmq.POLLIN)  # type: ignore
-                ensure_zmq_send(
-                    sock,
-                    self.encoder.encode(
-                        (SPLIT_DONE_MSG, request_id, status)
-                        if split_transfer_id is None
-                        else (
-                            SPLIT_DONE_MSG,
-                            request_id,
-                            status,
-                            split_transfer_id,
+        while not self.stop_event.is_set():
+            for attempt in range(SPLIT_DONE_MAX_ATTEMPTS):
+                context = zmq.Context()  # type: ignore
+                sock = None
+                try:
+                    sock = make_zmq_socket(
+                        ctx=context,
+                        path=make_zmq_path(
+                            "tcp", remote_host, remote_handshake_port
+                        ),
+                        socket_type=zmq.REQ,  # type: ignore
+                        bind=False,
+                        linger=0,
+                    )
+                    sock.setsockopt(zmq.SNDTIMEO, int(self.timeout * 1000))
+                    poller = zmq.Poller()  # type: ignore
+                    poller.register(sock, zmq.POLLIN)  # type: ignore
+                    ensure_zmq_send(
+                        sock,
+                        self.encoder.encode(
+                            (SPLIT_DONE_MSG, request_id, status)
+                            if split_transfer_id is None
+                            else (
+                                SPLIT_DONE_MSG,
+                                request_id,
+                                status,
+                                split_transfer_id,
+                            )
+                        ),
+                        f"{remote_host}:{remote_handshake_port}")
+                    response = ensure_zmq_recv(
+                        sock, poller,
+                        f"{remote_host}:{remote_handshake_port}",
+                        timeout=self.timeout,
+                    )
+                    if response != b"ACK":
+                        raise RuntimeError(
+                            "Split completion was not acknowledged"
                         )
-                    ),
-                    f"{remote_host}:{remote_handshake_port}")
-                response = ensure_zmq_recv(
-                    sock, poller,
-                    f"{remote_host}:{remote_handshake_port}", timeout=self.timeout)
-                if response != b"ACK":
-                    raise RuntimeError("Split completion was not acknowledged")
-                return True
-            except (RuntimeError, zmq.ZMQError):  # type: ignore
-                if attempt + 1 < SPLIT_DONE_MAX_ATTEMPTS:
-                    time.sleep(0.05 * (attempt + 1))
-            finally:
-                if sock is not None:
-                    sock.close()
-                context.term()
-        logger.warning("Split completion ACK failed for request %s", request_id)
+                    return True
+                except (RuntimeError, zmq.ZMQError):  # type: ignore
+                    if attempt + 1 < SPLIT_DONE_MAX_ATTEMPTS:
+                        time.sleep(0.05 * (attempt + 1))
+                finally:
+                    if sock is not None:
+                        sock.close()
+                    context.term()
+            logger.warning(
+                "Split completion ACK failed for request %s; retrying",
+                request_id,
+            )
+            self.stop_event.wait(0.25)
         return False
 
     def _get_remote_socket(self, remote_host: str, remote_handshake_port: int) -> zmq.Socket:  # type: ignore
@@ -1417,13 +1448,28 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
             len(dest_totals) != 2
             or not requested_groups
             or not set(requested_groups).issubset({0, 1})
-            or any(dest_totals[group] != source.group_byte_totals[group]
-                   for group in requested_groups)
         ):
-            raise ValueError("Live split source/destination totals mismatch")
+            raise ValueError(
+                "invalid destination totals/groups: "
+                f"totals={dest_totals}, groups={requested_groups}"
+            )
+        mismatched_totals = {
+            group: (source.group_byte_totals[group], dest_totals[group])
+            for group in requested_groups
+            if dest_totals[group] != source.group_byte_totals[group]
+        }
+        if mismatched_totals:
+            raise ValueError(
+                "source/destination byte totals differ "
+                f"(source, destination)={mismatched_totals}"
+            )
         tp_rank, dp_rank = int(plan["tp_rank"]), int(plan["dp_rank"])
         if (tp_rank, dp_rank) != (source.tp_rank, source.dp_rank):
-            raise ValueError("Live split source/destination rank mismatch")
+            raise ValueError(
+                "source/destination ranks differ: "
+                f"source={(source.tp_rank, source.dp_rank)}, "
+                f"destination={(tp_rank, dp_rank)}"
+            )
         destinations = plan["segments"]
         merged: list[SplitTransferSegment] = []
         for group_id in requested_groups:
@@ -1456,7 +1502,11 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
                     dest_pos += 1
                     dest_offset = 0
             if source_pos != len(sources) or dest_pos != len(dests):
-                raise ValueError("Live split source/destination layout mismatch")
+                raise ValueError(
+                    "source/destination extents do not cover the same bytes: "
+                    f"group={group_id}, source_extents={len(sources)}, "
+                    f"destination_extents={len(dests)}"
+                )
         return SplitTransferPlan(
             segments=tuple(merged),
             group_byte_totals=tuple(
@@ -1509,6 +1559,16 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
                 continue
             try:
                 raw_plan = plans.get(request_id)
+                if isinstance(raw_plan, dict) and meta.split_source is None:
+                    raw_segments = raw_plan.get("segments", ())
+                    if (
+                        not raw_segments
+                        or "source_buffer_index" not in raw_segments[0]
+                    ):
+                        raise ValueError(
+                            "prefiller source descriptor is missing; "
+                            "received only a decoder destination plan"
+                        )
                 source = None
                 if meta.split_source is not None and raw_plan is not None:
                     identity = (int(raw_plan["tp_rank"]), int(raw_plan["dp_rank"]))
@@ -1555,11 +1615,12 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
                         requested_groups=requested_groups,
                     )
                 meta.split_plan = plan
-            except (KeyError, TypeError, ValueError):
+            except (KeyError, TypeError, ValueError) as error:
                 logger.warning(
                     "Invalid late live-split destination plan for request %s; "
-                    "using persistent fallback",
+                    "using persistent fallback: %s",
                     request_id,
+                    error,
                 )
             meta.split_fallback = meta.split_plan is None
 
@@ -1720,6 +1781,16 @@ class MooncakeConnectorScheduler:
         self.dcp_size = vllm_config.parallel_config.decode_context_parallel_size
         self.tp_size = vllm_config.parallel_config.tensor_parallel_size
         self.pp_size = vllm_config.parallel_config.pipeline_parallel_size
+        prefill = vllm_config.kv_transfer_config.get_from_extra_config(
+            "prefill", {}
+        )
+        decode = vllm_config.kv_transfer_config.get_from_extra_config(
+            "decode", {}
+        )
+        self._live_prefill_tp_size = int(prefill.get("tp_size", self.tp_size))
+        self._live_decode_tp_size = int(decode.get("tp_size", self.tp_size))
+        self._live_prefill_dp_size = int(prefill.get("dp_size", 1))
+        self._live_decode_dp_size = int(decode.get("dp_size", 1))
         self.max_device_id = (
             vllm_config.parallel_config.tensor_parallel_size
             * vllm_config.parallel_config.data_parallel_size
@@ -1749,6 +1820,15 @@ class MooncakeConnectorScheduler:
         self.local_source_metadata: dict[
             tuple[int, int], MooncakeAgentMetadata
         ] = {}
+
+    def _live_split_topology_supported(self) -> bool:
+        return (
+            self.pp_size == 1
+            and self.pcp_size == 1
+            and self.dcp_size == 1
+            and self._live_prefill_tp_size == self._live_decode_tp_size
+            and self._live_prefill_dp_size == self._live_decode_dp_size == 1
+        )
 
     def _canonicalize_source_descriptor(self, descriptor: Any) -> dict[str, Any]:
         if not isinstance(descriptor, dict):
@@ -1865,7 +1945,7 @@ class MooncakeConnectorScheduler:
         scheduler_output: SchedulerOutput,
     ) -> KVConnectorMetadata:
         meta = MooncakeConnectorMetadata(
-            self.pp_size == 1 and self.pcp_size == 1 and self.dcp_size == 1
+            self._live_split_topology_supported()
         )
 
         # Loop through scheduled reqs and convert to ReqMeta.
@@ -1942,13 +2022,10 @@ class MooncakeConnectorScheduler:
             remote_multi_nodes_meta_mapping=self.multi_nodes_meta_mapping,
             num_prompt_blocks=num_prompt_blocks,
         )
-        live_topology_supported = (
-            self.pp_size == 1 and self.pcp_size == 1 and self.dcp_size == 1
-        )
         if (
             params.get("request_live_split", False)
             and delay_free_blocks
-            and live_topology_supported
+            and self._live_split_topology_supported()
         ):
             split_transfer_id = uuid.uuid4().hex
             self.split_transfer_ids[request.request_id] = split_transfer_id
@@ -2106,6 +2183,10 @@ class MooncakeConnectorWorker:
                 if self.kv_recv_thread.pending_split_signals:
                     raise RuntimeError(
                         "Mooncake split completion signals remain active"
+                    )
+                if self.kv_recv_thread.undelivered_split_signals:
+                    raise RuntimeError(
+                        "Mooncake split completion signals remain unacknowledged"
                     )
         if self.kv_recv_thread is not None:
             self.kv_recv_thread.close_resources()
