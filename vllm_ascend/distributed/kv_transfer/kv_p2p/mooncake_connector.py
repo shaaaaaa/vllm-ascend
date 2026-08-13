@@ -841,6 +841,12 @@ class KVCacheRecvingThread(threading.Thread):
         tp_num_need_pulls = req_meta["tp_num_need_pulls"]
 
         split_plan = req_meta.get("split_plan")
+        _cold_live_log(
+            "live_source_transfer_dispatch_entry",
+            req_id=req_meta.get("request_id"),
+            remote_req_id=remote_request_id,
+            split_plan_present=split_plan is not None,
+        )
         if split_plan is not None:
             self._transfer_split_destinations(req_meta, split_plan)
             return
@@ -964,6 +970,14 @@ class KVCacheRecvingThread(threading.Thread):
     def _transfer_split_destinations(
         self, req_meta: dict[str, Any], plan: SplitTransferPlan
     ) -> None:
+        _cold_live_log(
+            "live_source_native_transfer_entry",
+            req_id=req_meta.get("request_id"),
+            transfer_id=req_meta.get("split_transfer_id"),
+            segment_count=len(plan.segments),
+            requested_groups=plan.requested_groups,
+            group_byte_totals=plan.group_byte_totals,
+        )
         if plan.tp_rank != self.tp_rank or plan.dp_rank != self.vllm_config.parallel_config.data_parallel_rank_local:
             raise RuntimeError("Split destination TP/DP rank mismatch")
         requested_groups = set(plan.requested_groups)
@@ -1588,6 +1602,13 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
             if meta.split_source_invalid:
                 meta.split_fallback = True
                 continue
+            _cold_live_log(
+                "live_source_late_plan_entry",
+                req_id=request_id,
+                source_present=meta.split_source is not None,
+                destination_present=request_id in plans,
+                supported_groups=supported_groups,
+            )
             try:
                 raw_plan = plans.get(request_id)
                 if isinstance(raw_plan, dict) and meta.split_source is None:
@@ -2677,6 +2698,15 @@ class MooncakeConnectorWorker:
 
     def start_load_kv(self, metadata: MooncakeConnectorMetadata):
         """Start loading KV blocks from remote engine."""
+        _cold_live_log(
+            "live_source_worker_load_entry",
+            request_ids=sorted(metadata.requests),
+            split_requests=[
+                req_id
+                for req_id, meta in metadata.requests.items()
+                if meta.split_negotiated
+            ],
+        )
         if self.kv_recv_thread is not None:
             for req_id in metadata.reqs_in_batch:
                 self.kv_recv_thread.task_tracker.add_req_to_process(
