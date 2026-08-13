@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""Capture the final four chunks of one 65,536-token P-node prefill.
+"""Capture the first and final four chunks of a 65,536-token P-node prefill.
 
 Run this once against an ``off`` server and once against an ``on`` server.
 Both captures use the same deterministic measured prompt. A distinct prompt is
@@ -8,11 +8,12 @@ first run with profiling disabled to warm model/runtime paths without creating
 an LMCache prefix hit for the measured request.
 
 The script follows ``staged_sfa_graph_smoke.py``: it controls the worker-only
-profiler through ``/start_profile`` and ``/stop_profile``. The worker starts
-recording exactly at the final-chunk window, then this script invokes the
-bounded ``torch_npu.profiler.analyse`` subprocess and waits for one stable
-``trace_view.json`` per TP rank. It deliberately does not aggregate operator
-times; open the resulting profile directory in MindStudio Insight.
+profiler through ``/start_profile`` and ``/stop_profile``. The worker records
+the first and final chunk windows into separate ``first-4`` and ``last-4``
+directories. This script invokes the bounded ``torch_npu.profiler.analyse``
+subprocess for each and waits for one stable ``trace_view.json`` per TP rank.
+It deliberately does not aggregate operator times; open the resulting profile
+directories in MindStudio Insight.
 """
 
 from __future__ import annotations
@@ -34,7 +35,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 PROMPT_TOKENS = 65_536
-PROFILE_LAST_CHUNKS = 4
+PROFILE_EDGE_CHUNKS = 4
 PROFILE_CHUNK_TOKENS = 2_048
 DEFAULT_SEED = 20_260_813
 DEFAULT_WARMUP_SEED = 10_001
@@ -45,7 +46,7 @@ TRACE_POLL_INTERVAL_SECONDS = 1.0
 FRONTEND_PROFILER_ENABLED = (
     "Torch profiler enabled. AsyncLLM CPU traces will be collected under"
 )
-DEFERRED_PROFILE_ENABLED = "Deferred prefill profiler enabled:"
+DEFERRED_PROFILE_ENABLED = "Deferred prefill edge profiler enabled:"
 
 
 class SmokeFailure(RuntimeError):
@@ -115,7 +116,7 @@ def wait_until_ready(base_url: str, timeout: float) -> None:
 
 def require_worker_only_profiling(
     server_log: Path,
-    profile_last_chunks: int,
+    profile_edge_chunks: int,
 ) -> None:
     if not server_log.is_file():
         raise SmokeFailure(f"server log does not exist: {server_log}")
@@ -126,26 +127,35 @@ def require_worker_only_profiling(
             "ignore_frontend=true so only TP worker traces are captured"
         )
     expected = (
-        f"{DEFERRED_PROFILE_ENABLED} last_chunks={profile_last_chunks}, "
+        f"{DEFERRED_PROFILE_ENABLED} edge_chunks={profile_edge_chunks}, "
         f"chunk_size={PROFILE_CHUNK_TOKENS}"
     )
     if expected not in log_text:
         raise SmokeFailure(
-            "server is not configured to capture the requested final prefill "
-            f"window; start it with PREFILL_PROFILE_LAST_CHUNKS="
-            f"{profile_last_chunks}"
+            "server is not configured to capture the requested prefill edge "
+            f"windows; start it with PREFILL_PROFILE_EDGE_CHUNKS="
+            f"{profile_edge_chunks}"
         )
 
 
-def expected_chunk_markers(profile_last_chunks: int) -> tuple[str, ...]:
+def expected_chunk_markers(
+    window: str,
+    profile_edge_chunks: int,
+) -> tuple[str, ...]:
     total_chunks = PROMPT_TOKENS // PROFILE_CHUNK_TOKENS
-    first_chunk = total_chunks - profile_last_chunks + 1
+    if window == "first":
+        chunk_range = range(1, profile_edge_chunks + 1)
+    elif window == "last":
+        first_chunk = total_chunks - profile_edge_chunks + 1
+        chunk_range = range(first_chunk, total_chunks + 1)
+    else:
+        raise ValueError(f"unknown profile window: {window}")
     return tuple(
-        "prefill_profile::"
+        f"prefill_profile::{window}::"
         f"chunk_{chunk}_of_{total_chunks}::"
         f"tokens_{(chunk - 1) * PROFILE_CHUNK_TOKENS}_"
         f"{chunk * PROFILE_CHUNK_TOKENS}"
-        for chunk in range(first_chunk, total_chunks + 1)
+        for chunk in chunk_range
     )
 
 
@@ -166,10 +176,11 @@ def scan_binary(path: Path, needles: Iterable[str]) -> dict[str, int]:
 def validate_chunk_markers(
     traces: list[Path],
     *,
+    window: str,
     expected_ranks: int,
-    profile_last_chunks: int,
+    profile_edge_chunks: int,
 ) -> None:
-    markers = expected_chunk_markers(profile_last_chunks)
+    markers = expected_chunk_markers(window, profile_edge_chunks)
     valid_traces = 0
     failures = []
     for trace in traces:
@@ -182,12 +193,12 @@ def validate_chunk_markers(
 
     if valid_traces < expected_ranks:
         raise SmokeFailure(
-            f"only {valid_traces} worker traces contained all final "
-            f"{profile_last_chunks} chunk markers; expected "
+            f"only {valid_traces} worker traces contained all {window} "
+            f"{profile_edge_chunks} chunk markers; expected "
             f"{expected_ranks}\n  " + "\n  ".join(failures)
         )
     print(
-        f"validated final {profile_last_chunks} chunk markers in "
+        f"validated {window} {profile_edge_chunks} chunk markers in "
         f"{valid_traces} worker traces",
         flush=True,
     )
@@ -367,7 +378,7 @@ def wait_for_new_traces(
     )
 
 
-def run_capture(args: argparse.Namespace) -> list[Path]:
+def run_capture(args: argparse.Namespace) -> dict[str, list[Path]]:
     warmup = make_prompt(
         args.warmup_seed,
         cache_chunk_tokens=args.cache_chunk_tokens,
@@ -401,7 +412,15 @@ def run_capture(args: argparse.Namespace) -> list[Path]:
             flush=True,
         )
 
-        before_traces = trace_snapshot(args.profile_dir)
+        window_dirs = {
+            window: args.profile_dir
+            / f"{window}-{args.profile_edge_chunks}"
+            for window in ("first", "last")
+        }
+        before_traces = {
+            window: trace_snapshot(window_dir)
+            for window, window_dir in window_dirs.items()
+        }
         profile_start_attempted = True
         profile_control(
             args.base_url,
@@ -410,8 +429,8 @@ def run_capture(args: argparse.Namespace) -> list[Path]:
         )
         print(
             f"capture: label={args.label}, prompt_tokens={PROMPT_TOKENS}, "
-            f"hash={measured.digest[:16]}, profiler=last_"
-            f"{args.profile_last_chunks}_chunks",
+            f"hash={measured.digest[:16]}, profiler=first_and_last_"
+            f"{args.profile_edge_chunks}_chunks",
             flush=True,
         )
         measured_timing = client.run(
@@ -448,23 +467,27 @@ def run_capture(args: argparse.Namespace) -> list[Path]:
         f"e2e={measured_timing.e2e_ms:.3f} ms",
         flush=True,
     )
-    analyse_profile_data(
-        args.profile_dir,
-        expected_ranks=args.expected_ranks,
-        timeout=args.profile_analysis_timeout,
-    )
-    traces = wait_for_new_traces(
-        args.profile_dir,
-        before_traces,
-        expected_ranks=args.expected_ranks,
-        timeout=args.trace_timeout,
-    )
-    validate_chunk_markers(
-        traces,
-        expected_ranks=args.expected_ranks,
-        profile_last_chunks=args.profile_last_chunks,
-    )
-    return traces
+    traces_by_window = {}
+    for window, window_dir in window_dirs.items():
+        analyse_profile_data(
+            window_dir,
+            expected_ranks=args.expected_ranks,
+            timeout=args.profile_analysis_timeout,
+        )
+        traces = wait_for_new_traces(
+            window_dir,
+            before_traces[window],
+            expected_ranks=args.expected_ranks,
+            timeout=args.trace_timeout,
+        )
+        validate_chunk_markers(
+            traces,
+            window=window,
+            expected_ranks=args.expected_ranks,
+            profile_edge_chunks=args.profile_edge_chunks,
+        )
+        traces_by_window[window] = traces
+    return traces_by_window
 
 
 def parse_args() -> argparse.Namespace:
@@ -479,10 +502,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--profile-dir", type=Path, required=True)
     parser.add_argument("--expected-ranks", type=int, default=8)
     parser.add_argument(
-        "--profile-last-chunks",
+        "--profile-edge-chunks",
         type=int,
-        default=PROFILE_LAST_CHUNKS,
-        help="final chunked-prefill steps captured in each worker trace",
+        default=PROFILE_EDGE_CHUNKS,
+        help="first and final chunked-prefill steps captured per worker",
     )
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
     parser.add_argument("--warmup-seed", type=int, default=DEFAULT_WARMUP_SEED)
@@ -501,9 +524,10 @@ def parse_args() -> argparse.Namespace:
     if args.expected_ranks <= 0:
         parser.error("--expected-ranks must be positive")
     total_chunks = PROMPT_TOKENS // PROFILE_CHUNK_TOKENS
-    if not 0 < args.profile_last_chunks <= total_chunks:
+    if not 0 < args.profile_edge_chunks <= total_chunks // 2:
         parser.error(
-            f"--profile-last-chunks must be within [1, {total_chunks}]"
+            "--profile-edge-chunks must be within "
+            f"[1, {total_chunks // 2}]"
         )
     if args.seed == args.warmup_seed:
         parser.error("--seed and --warmup-seed must differ")
@@ -527,9 +551,9 @@ def main() -> int:
         wait_until_ready(args.base_url, args.ready_timeout)
         require_worker_only_profiling(
             args.server_log,
-            args.profile_last_chunks,
+            args.profile_edge_chunks,
         )
-        traces = run_capture(args)
+        traces_by_window = run_capture(args)
     except (
         SmokeFailure,
         urllib.error.HTTPError,
@@ -541,11 +565,15 @@ def main() -> int:
     print("\nPREFILL PROFILE CAPTURE PASSED")
     print(
         f"label={args.label} prompt_tokens={PROMPT_TOKENS} "
-        f"profile_last_chunks={args.profile_last_chunks}"
+        f"profile_edge_chunks={args.profile_edge_chunks}"
     )
-    print(f"MindStudio profile root: {args.profile_dir}")
-    for trace in traces:
-        print(f"trace: {trace}")
+    for window, traces in traces_by_window.items():
+        print(
+            f"MindStudio {window} profile root: "
+            f"{args.profile_dir / f'{window}-{args.profile_edge_chunks}'}"
+        )
+        for trace in traces:
+            print(f"trace: {trace}")
     print(
         "Run this script again against the other mode with the default seeds; "
         "then compare both profile roots in MindStudio Insight."

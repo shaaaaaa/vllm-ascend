@@ -21,7 +21,9 @@ import copy
 import gc
 import math
 from contextlib import nullcontext
+from pathlib import Path
 from types import NoneType
+from typing import Any
 
 import torch
 import torch.nn as nn
@@ -137,16 +139,16 @@ class NPUWorker(WorkerBase):
         # Profiler is lazily initialized on first profile(is_start=True) call (RFC #6954)
         self.profiler_config = vllm_config.profiler_config
         self.profiler = None
-        self._prefill_profile_last_chunks = (
-            envs_ascend.VLLM_ASCEND_PREFILL_PROFILE_LAST_CHUNKS
+        self._prefill_profile_edge_chunks = (
+            envs_ascend.VLLM_ASCEND_PREFILL_PROFILE_EDGE_CHUNKS
         )
-        if self._prefill_profile_last_chunks < 0:
+        if self._prefill_profile_edge_chunks < 0:
             raise ValueError(
-                "VLLM_ASCEND_PREFILL_PROFILE_LAST_CHUNKS must be "
+                "VLLM_ASCEND_PREFILL_PROFILE_EDGE_CHUNKS must be "
                 "non-negative"
             )
         self._prefill_profile_chunk_size = 0
-        if self._prefill_profile_last_chunks:
+        if self._prefill_profile_edge_chunks:
             self._prefill_profile_chunk_size = int(
                 vllm_config.scheduler_config.max_num_batched_tokens
             )
@@ -156,16 +158,16 @@ class NPUWorker(WorkerBase):
                     "deferred prefill profiler is enabled"
                 )
         self._prefill_profile_armed = False
-        self._prefill_profile_active = False
-        self._prefill_profile_complete = False
-        self._prefill_profile_trace_name: str | None = None
+        self._prefill_profile_active_window: str | None = None
+        self._prefill_profile_complete_windows: set[str] = set()
+        self._prefill_profile_profilers: dict[str, Any] = {}
         self._prefill_profile_prompt_lens: dict[str, int] = {}
-        self._prefill_profile_chunks_seen = 0
-        if self._prefill_profile_last_chunks:
+        self._prefill_profile_chunks_seen = {"first": 0, "last": 0}
+        if self._prefill_profile_edge_chunks:
             logger.info(
-                "Deferred prefill profiler enabled: last_chunks=%d, "
+                "Deferred prefill edge profiler enabled: edge_chunks=%d, "
                 "chunk_size=%d",
-                self._prefill_profile_last_chunks,
+                self._prefill_profile_edge_chunks,
                 self._prefill_profile_chunk_size,
             )
         if vllm_config.model_config and vllm_config.model_config.enable_sleep_mode:
@@ -693,7 +695,7 @@ class NPUWorker(WorkerBase):
             self.profiler.stop()
 
     def _prefill_profile_window_enabled(self) -> bool:
-        return getattr(self, "_prefill_profile_last_chunks", 0) > 0
+        return getattr(self, "_prefill_profile_edge_chunks", 0) > 0
 
     def _profile_prefill_window(
         self,
@@ -702,47 +704,74 @@ class NPUWorker(WorkerBase):
         profile_prefix: str | None,
     ) -> None:
         if is_start:
-            if getattr(self, "_prefill_profile_active", False):
+            if getattr(self, "_prefill_profile_active_window", None):
                 raise RuntimeError("prefill profile window is already active")
-            from vllm.distributed.utils import get_worker_rank_suffix
-
-            rank_suffix = get_worker_rank_suffix(global_rank=self.rank)
-            trace_name = (
-                f"{profile_prefix}_{rank_suffix}"
-                if profile_prefix
-                else rank_suffix
-            )
-            if self.profiler is None:
-                self.profiler = self._create_profiler(trace_name)
             self._prefill_profile_armed = True
-            self._prefill_profile_complete = False
-            self._prefill_profile_chunks_seen = 0
+            self._prefill_profile_complete_windows = set()
+            self._prefill_profile_profilers = {}
+            self._prefill_profile_chunks_seen = {"first": 0, "last": 0}
             self._prefill_profile_prompt_lens = {}
-            self._prefill_profile_trace_name = profile_prefix
             logger.info(
-                "Armed profiler for the final %d prefill chunks",
-                self._prefill_profile_last_chunks,
+                "Armed profilers for the first and final %d prefill chunks",
+                self._prefill_profile_edge_chunks,
             )
             return
 
         self._prefill_profile_armed = False
-        if getattr(self, "_prefill_profile_active", False):
-            assert self.profiler is not None
-            self.profiler.stop()
-            self._prefill_profile_active = False
-            if getattr(self, "_prefill_profile_complete", False):
+        active_window = getattr(
+            self, "_prefill_profile_active_window", None
+        )
+        if active_window is not None:
+            profiler = self._prefill_profile_profilers[active_window]
+            profiler.stop()
+            self._prefill_profile_active_window = None
+            if active_window in self._prefill_profile_complete_windows:
                 logger.info(
-                    "Stopped completed prefill profile window after %d "
-                    "chunks",
-                    self._prefill_profile_chunks_seen,
+                    "Stopped completed %s prefill profile window after "
+                    "%d chunks",
+                    active_window,
+                    self._prefill_profile_chunks_seen[active_window],
                 )
             else:
                 logger.warning(
-                    "Stopped an incomplete prefill profile window after "
+                    "Stopped an incomplete %s prefill profile window after "
                     "%d/%d chunks",
-                    self._prefill_profile_chunks_seen,
-                    self._prefill_profile_last_chunks,
+                    active_window,
+                    self._prefill_profile_chunks_seen[active_window],
+                    self._prefill_profile_edge_chunks,
                 )
+        missing = {"first", "last"} - self._prefill_profile_complete_windows
+        if missing:
+            raise RuntimeError(
+                "prefill profile windows did not complete: "
+                + ", ".join(sorted(missing))
+            )
+
+    def _create_prefill_window_profiler(self, window: str):
+        from vllm.distributed.utils import get_worker_rank_suffix
+
+        root_dir = Path(self.profiler_config.torch_profiler_dir)
+        window_name = f"{window}-{self._prefill_profile_edge_chunks}"
+        rank_suffix = get_worker_rank_suffix(global_rank=self.rank)
+        return self._create_profiler(
+            f"{window_name}_{rank_suffix}",
+            output_dir=str(root_dir / window_name),
+        )
+
+    def _start_prefill_window(self, window: str) -> None:
+        if window not in self._prefill_profile_profilers:
+            self._prefill_profile_profilers[window] = (
+                self._create_prefill_window_profiler(window)
+            )
+        profiler = self._prefill_profile_profilers[window]
+        profiler.start()
+        self._prefill_profile_active_window = window
+
+    def _stop_prefill_window(self, window: str) -> None:
+        profiler = self._prefill_profile_profilers[window]
+        profiler.stop()
+        self._prefill_profile_active_window = None
+        self._prefill_profile_complete_windows.add(window)
 
     def _prefill_profile_step(
         self,
@@ -796,7 +825,7 @@ class NPUWorker(WorkerBase):
             return None
         if not (
             getattr(self, "_prefill_profile_armed", False)
-            or getattr(self, "_prefill_profile_active", False)
+            or getattr(self, "_prefill_profile_active_window", None)
         ):
             return None
 
@@ -806,40 +835,55 @@ class NPUWorker(WorkerBase):
         req_id, computed, scheduled, prompt_len = step
         chunk_size = self._prefill_profile_chunk_size
         total_chunks = math.ceil(prompt_len / chunk_size)
-        first_profiled_chunk = max(
-            1, total_chunks - self._prefill_profile_last_chunks + 1
-        )
         chunk_index = computed // chunk_size + 1
+        last_first_chunk = max(
+            1, total_chunks - self._prefill_profile_edge_chunks + 1
+        )
+        if chunk_index <= self._prefill_profile_edge_chunks:
+            window = "first"
+            window_first_chunk = 1
+        elif chunk_index >= last_first_chunk:
+            window = "last"
+            window_first_chunk = last_first_chunk
+        else:
+            return None
 
-        if not getattr(self, "_prefill_profile_active", False):
-            expected_start = (first_profiled_chunk - 1) * chunk_size
-            if computed < expected_start:
-                return None
+        if window in self._prefill_profile_complete_windows:
+            return None
+        active_window = getattr(
+            self, "_prefill_profile_active_window", None
+        )
+        if active_window is None:
+            expected_start = (window_first_chunk - 1) * chunk_size
             if computed != expected_start:
                 logger.error(
-                    "Cannot start final-chunk profiler at token %d; "
+                    "Cannot start %s-chunk profiler at token %d; "
                     "expected %d for request %s",
+                    window,
                     computed,
                     expected_start,
                     req_id,
                 )
                 self._prefill_profile_armed = False
                 return None
-            assert self.profiler is not None
-            self.profiler.start()
-            self._prefill_profile_active = True
+            self._start_prefill_window(window)
             logger.info(
-                "Started profiler at prefill chunk %d/%d, tokens "
+                "Started %s profiler at prefill chunk %d/%d, tokens "
                 "[%d, %d), request=%s",
+                window,
                 chunk_index,
                 total_chunks,
                 computed,
                 computed + scheduled,
                 req_id,
             )
+        elif active_window != window:
+            raise RuntimeError(
+                f"prefill profiler window overlap: {active_window}, {window}"
+            )
 
         expected_computed = (
-            (first_profiled_chunk - 1 + self._prefill_profile_chunks_seen)
+            (window_first_chunk - 1 + self._prefill_profile_chunks_seen[window])
             * chunk_size
         )
         if computed != expected_computed:
@@ -850,9 +894,9 @@ class NPUWorker(WorkerBase):
                 computed,
             )
             return None
-        self._prefill_profile_chunks_seen += 1
+        self._prefill_profile_chunks_seen[window] += 1
         return (
-            "prefill_profile::"
+            f"prefill_profile::{window}::"
             f"chunk_{chunk_index}_of_{total_chunks}::"
             f"tokens_{computed}_{computed + scheduled}"
         )
@@ -861,34 +905,29 @@ class NPUWorker(WorkerBase):
         self,
         scheduler_output: "SchedulerOutput",
     ) -> None:
-        if not getattr(self, "_prefill_profile_active", False):
+        window = getattr(self, "_prefill_profile_active_window", None)
+        if window is None:
             return
         step = self._prefill_profile_step(scheduler_output)
         if step is None:
             return
         req_id, computed, scheduled, prompt_len = step
-        if computed + scheduled < prompt_len:
+        if self._prefill_profile_chunks_seen[window] < (
+            self._prefill_profile_edge_chunks
+        ):
             return
 
-        if self._prefill_profile_chunks_seen != min(
-            math.ceil(prompt_len / self._prefill_profile_chunk_size),
-            self._prefill_profile_last_chunks,
-        ):
-            logger.error(
-                "Final-chunk profiler captured %d chunks; expected %d",
-                self._prefill_profile_chunks_seen,
-                self._prefill_profile_last_chunks,
-            )
-
-        self._prefill_profile_armed = False
-        self._prefill_profile_complete = True
+        if window == "first":
+            self._stop_prefill_window(window)
+        else:
+            self._prefill_profile_armed = False
+            self._prefill_profile_complete_windows.add(window)
         logger.info(
-            "Completed final-chunk profile: chunks=%d, tokens=[%d, %d), "
-            "request=%s; awaiting stop_profile",
-            self._prefill_profile_chunks_seen,
-            prompt_len
-            - self._prefill_profile_chunks_seen
-            * self._prefill_profile_chunk_size,
+            "Completed %s prefill profile: chunks=%d, ending_token=%d, "
+            "prompt_len=%d, request=%s",
+            window,
+            self._prefill_profile_chunks_seen[window],
+            computed + scheduled,
             prompt_len,
             req_id,
         )
@@ -926,13 +965,19 @@ class NPUWorker(WorkerBase):
         init_ascend_model_parallel(self.parallel_config)
         ensure_ec_transfer_initialized(self.vllm_config)
 
-    def _create_profiler(self, trace_name: str):
+    def _create_profiler(
+        self,
+        trace_name: str,
+        *,
+        output_dir: str | None = None,
+    ):
         """Create torch_npu profiler with trace naming for unique files per worker (RFC #6954)."""
         profiler_config = self.profiler_config
 
         if profiler_config.profiler != "torch":
             raise RuntimeError(f"Unrecognized profiler: {profiler_config.profiler}")
-        if not profiler_config.torch_profiler_dir:
+        profiler_dir = output_dir or profiler_config.torch_profiler_dir
+        if not profiler_dir:
             raise RuntimeError("torch_profiler_dir cannot be empty.")
         if envs_ascend.MSMONITOR_USE_DAEMON:
             raise RuntimeError("MSMONITOR_USE_DAEMON and torch profiler cannot be both enabled at the same time.")
@@ -961,7 +1006,7 @@ class NPUWorker(WorkerBase):
             with_modules=profiler_config.torch_profiler_with_stack,
             experimental_config=experimental_config,
             on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(
-                profiler_config.torch_profiler_dir,
+                profiler_dir,
                 worker_name=trace_name,
                 analyse_flag=False,
             ),

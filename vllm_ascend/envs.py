@@ -43,11 +43,11 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE": lambda: _strict_bool_env(
         "VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE"
     ),
-    # Test-only worker profiler window. When positive, /start_profile arms the
-    # profiler instead of starting it immediately; workers capture only this
-    # many final chunked-prefill steps. Zero keeps the normal profiler API.
-    "VLLM_ASCEND_PREFILL_PROFILE_LAST_CHUNKS": lambda: int(
-        os.getenv("VLLM_ASCEND_PREFILL_PROFILE_LAST_CHUNKS", "0")
+    # Test-only worker profiler windows. When positive, /start_profile arms
+    # two profilers that capture this many first and final chunked-prefill
+    # steps into separate directories. Zero keeps the normal profiler API.
+    "VLLM_ASCEND_PREFILL_PROFILE_EDGE_CHUNKS": lambda: int(
+        os.getenv("VLLM_ASCEND_PREFILL_PROFILE_EDGE_CHUNKS", "0")
     ),
     # max compile thread number for package building. Usually, it is set to
     # the number of CPU cores. If not set, the default value is None, which

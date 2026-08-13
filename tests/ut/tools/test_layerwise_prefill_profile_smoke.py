@@ -22,50 +22,58 @@ def test_prompts_are_deterministic_and_warmup_has_distinct_cache_chunk():
 def test_requires_worker_only_deferred_profile_configuration(tmp_path: Path):
     server_log = tmp_path / "server.log"
     server_log.write_text(
-        "Deferred prefill profiler enabled: last_chunks=4, "
+        "Deferred prefill edge profiler enabled: edge_chunks=4, "
         "chunk_size=2048\n",
         encoding="utf-8",
     )
 
     smoke.require_worker_only_profiling(server_log, 4)
 
-    with pytest.raises(smoke.SmokeFailure, match="requested final"):
+    with pytest.raises(smoke.SmokeFailure, match="requested prefill edge"):
         smoke.require_worker_only_profiling(server_log, 3)
 
 
-def test_expected_chunk_markers_cover_final_four_2048_chunks():
-    assert smoke.expected_chunk_markers(4) == (
-        "prefill_profile::chunk_29_of_32::tokens_57344_59392",
-        "prefill_profile::chunk_30_of_32::tokens_59392_61440",
-        "prefill_profile::chunk_31_of_32::tokens_61440_63488",
-        "prefill_profile::chunk_32_of_32::tokens_63488_65536",
+def test_expected_chunk_markers_cover_edge_four_2048_chunks():
+    assert smoke.expected_chunk_markers("first", 4) == (
+        "prefill_profile::first::chunk_1_of_32::tokens_0_2048",
+        "prefill_profile::first::chunk_2_of_32::tokens_2048_4096",
+        "prefill_profile::first::chunk_3_of_32::tokens_4096_6144",
+        "prefill_profile::first::chunk_4_of_32::tokens_6144_8192",
+    )
+    assert smoke.expected_chunk_markers("last", 4) == (
+        "prefill_profile::last::chunk_29_of_32::tokens_57344_59392",
+        "prefill_profile::last::chunk_30_of_32::tokens_59392_61440",
+        "prefill_profile::last::chunk_31_of_32::tokens_61440_63488",
+        "prefill_profile::last::chunk_32_of_32::tokens_63488_65536",
     )
 
 
 def test_trace_requires_every_final_chunk_marker(tmp_path: Path):
-    markers = smoke.expected_chunk_markers(4)
+    markers = smoke.expected_chunk_markers("last", 4)
     trace = tmp_path / "trace_view.json"
     trace.write_text(" ".join(markers), encoding="utf-8")
 
     smoke.validate_chunk_markers(
         [trace],
+        window="last",
         expected_ranks=1,
-        profile_last_chunks=4,
+        profile_edge_chunks=4,
     )
 
     trace.write_text(" ".join(markers[:-1]), encoding="utf-8")
     with pytest.raises(smoke.SmokeFailure, match="chunk_32_of_32"):
         smoke.validate_chunk_markers(
             [trace],
+            window="last",
             expected_ranks=1,
-            profile_last_chunks=4,
+            profile_edge_chunks=4,
         )
 
 
 def test_rejects_frontend_profile_even_with_deferred_workers(tmp_path: Path):
     server_log = tmp_path / "server.log"
     server_log.write_text(
-        "Deferred prefill profiler enabled: last_chunks=4, "
+        "Deferred prefill edge profiler enabled: edge_chunks=4, "
         "chunk_size=2048\n"
         f"{smoke.FRONTEND_PROFILER_ENABLED} /tmp/profile\n",
         encoding="utf-8",
@@ -82,7 +90,7 @@ def _capture_args(tmp_path: Path) -> SimpleNamespace:
         model="glm51-prefill",
         profile_dir=tmp_path,
         expected_ranks=8,
-        profile_last_chunks=4,
+        profile_edge_chunks=4,
         seed=smoke.DEFAULT_SEED,
         warmup_seed=smoke.DEFAULT_WARMUP_SEED,
         cache_chunk_tokens=256,
@@ -136,23 +144,28 @@ def test_capture_profiles_only_measured_request(
     )
     monkeypatch.setattr(smoke, "validate_chunk_markers", lambda *a, **k: None)
 
-    assert smoke.run_capture(_capture_args(tmp_path)) == [trace]
+    assert smoke.run_capture(_capture_args(tmp_path)) == {
+        "first": [trace],
+        "last": [trace],
+    }
     event_names = [event[0] for event in events]
     assert event_names == [
         "client",
         "request",
+        "snapshot",
         "snapshot",
         "profile",
         "request",
         "profile",
         "close",
         "analyse",
+        "analyse",
     ]
     assert events[1][1].endswith("-warmup")
-    assert events[4][1].endswith("-measure")
-    assert events[3] == ("profile", "start")
-    assert events[5] == ("profile", "stop")
-    assert events[1][2] != events[4][2]
+    assert events[5][1].endswith("-measure")
+    assert events[4] == ("profile", "start")
+    assert events[6] == ("profile", "stop")
+    assert events[1][2] != events[5][2]
 
 
 def test_stop_failure_is_not_retried(

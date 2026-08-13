@@ -1,4 +1,5 @@
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -310,7 +311,7 @@ class TestNPUWorker(TestBase):
             worker.profile(is_start=False)
             mock_profiler.stop.assert_called_once()
 
-    def test_deferred_prefill_profile_captures_final_four_chunks(self):
+    def test_deferred_prefill_profile_captures_edge_four_chunks(self):
         from vllm_ascend.worker.worker import NPUWorker
 
         def scheduler_output(computed_tokens: int):
@@ -339,20 +340,29 @@ class TestNPUWorker(TestBase):
 
         with patch.object(NPUWorker, "__init__", lambda self: None):
             worker = NPUWorker()
-        worker._prefill_profile_last_chunks = 4
+        worker._prefill_profile_edge_chunks = 4
         worker._prefill_profile_chunk_size = 2_048
         worker._prefill_profile_armed = True
-        worker._prefill_profile_active = False
-        worker._prefill_profile_complete = False
-        worker._prefill_profile_chunks_seen = 0
+        worker._prefill_profile_active_window = None
+        worker._prefill_profile_complete_windows = set()
+        worker._prefill_profile_chunks_seen = {"first": 0, "last": 0}
         worker._prefill_profile_prompt_lens = {}
-        worker.profiler = MagicMock()
+        worker._prefill_profile_profilers = {
+            "first": MagicMock(),
+            "last": MagicMock(),
+        }
 
-        self.assertIsNone(
-            worker._maybe_start_prefill_profile(scheduler_output(0))
-        )
         markers = []
-        for computed in (57_344, 59_392, 61_440, 63_488):
+        for computed in (
+            0,
+            2_048,
+            4_096,
+            6_144,
+            57_344,
+            59_392,
+            61_440,
+            63_488,
+        ):
             output = scheduler_output(computed)
             markers.append(worker._maybe_start_prefill_profile(output))
             worker._maybe_stop_prefill_profile(output)
@@ -360,50 +370,80 @@ class TestNPUWorker(TestBase):
         self.assertEqual(
             markers,
             [
-                "prefill_profile::chunk_29_of_32::tokens_57344_59392",
-                "prefill_profile::chunk_30_of_32::tokens_59392_61440",
-                "prefill_profile::chunk_31_of_32::tokens_61440_63488",
-                "prefill_profile::chunk_32_of_32::tokens_63488_65536",
+                "prefill_profile::first::chunk_1_of_32::tokens_0_2048",
+                "prefill_profile::first::chunk_2_of_32::tokens_2048_4096",
+                "prefill_profile::first::chunk_3_of_32::tokens_4096_6144",
+                "prefill_profile::first::chunk_4_of_32::tokens_6144_8192",
+                "prefill_profile::last::chunk_29_of_32::tokens_57344_59392",
+                "prefill_profile::last::chunk_30_of_32::tokens_59392_61440",
+                "prefill_profile::last::chunk_31_of_32::tokens_61440_63488",
+                "prefill_profile::last::chunk_32_of_32::tokens_63488_65536",
             ],
         )
-        worker.profiler.start.assert_called_once_with()
-        worker.profiler.stop.assert_not_called()
+        first_profiler = worker._prefill_profile_profilers["first"]
+        last_profiler = worker._prefill_profile_profilers["last"]
+        first_profiler.start.assert_called_once_with()
+        first_profiler.stop.assert_called_once_with()
+        last_profiler.start.assert_called_once_with()
+        last_profiler.stop.assert_not_called()
         worker._profile_prefill_window(
             is_start=False,
             profile_prefix=None,
         )
-        worker.profiler.stop.assert_called_once_with()
+        last_profiler.stop.assert_called_once_with()
         self.assertFalse(worker._prefill_profile_armed)
-        self.assertFalse(worker._prefill_profile_active)
-        self.assertTrue(worker._prefill_profile_complete)
-        self.assertEqual(worker._prefill_profile_chunks_seen, 4)
+        self.assertIsNone(worker._prefill_profile_active_window)
+        self.assertEqual(
+            worker._prefill_profile_complete_windows,
+            {"first", "last"},
+        )
+        self.assertEqual(
+            worker._prefill_profile_chunks_seen,
+            {"first": 4, "last": 4},
+        )
 
-    def test_deferred_prefill_profile_is_created_when_armed(self):
+    def test_deferred_prefill_profile_uses_separate_directories(self):
         from vllm_ascend.worker.worker import NPUWorker
 
-        profiler = MagicMock()
+        first_profiler = MagicMock()
+        last_profiler = MagicMock()
         with patch.object(NPUWorker, "__init__", lambda self: None):
             worker = NPUWorker()
         worker.rank = 3
-        worker.profiler = None
-        worker._prefill_profile_last_chunks = 4
-        worker._prefill_profile_active = False
-        worker._create_profiler = MagicMock(return_value=profiler)
+        worker.profiler_config = SimpleNamespace(
+            torch_profiler_dir="/profiles/root"
+        )
+        worker._prefill_profile_edge_chunks = 4
+        worker._prefill_profile_active_window = None
+        worker._prefill_profile_profilers = {}
+        worker._create_profiler = MagicMock(
+            side_effect=[first_profiler, last_profiler]
+        )
 
         with patch(
             "vllm.distributed.utils.get_worker_rank_suffix",
             return_value="dp0_pp0_tp3_dcp0_ep0_rank3",
         ):
-            worker._profile_prefill_window(
-                is_start=True,
-                profile_prefix="off-final-4",
-            )
+            worker._start_prefill_window("first")
+            worker._stop_prefill_window("first")
+            worker._start_prefill_window("last")
 
-        worker._create_profiler.assert_called_once_with(
-            "off-final-4_dp0_pp0_tp3_dcp0_ep0_rank3"
+        self.assertEqual(
+            worker._create_profiler.call_args_list,
+            [
+                unittest.mock.call(
+                    "first-4_dp0_pp0_tp3_dcp0_ep0_rank3",
+                    output_dir=str(Path("/profiles/root") / "first-4"),
+                ),
+                unittest.mock.call(
+                    "last-4_dp0_pp0_tp3_dcp0_ep0_rank3",
+                    output_dir=str(Path("/profiles/root") / "last-4"),
+                ),
+            ],
         )
-        profiler.start.assert_not_called()
-        self.assertTrue(worker._prefill_profile_armed)
+        first_profiler.start.assert_called_once_with()
+        first_profiler.stop.assert_called_once_with()
+        last_profiler.start.assert_called_once_with()
 
     def test_profile_no_profiler_raises_error(self):
         """Test profile method raises exception when profiler is not available"""
