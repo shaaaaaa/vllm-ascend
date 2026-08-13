@@ -1845,9 +1845,9 @@ class MooncakeConnectorScheduler:
             groups = metadata.buffer_group_ids
             if not (len(bases) == len(sizes) == len(groups)):
                 raise ValueError("Live split source handshake is incomplete")
-            indices = {base: index for index, base in enumerate(bases)}
-            if len(indices) != len(bases):
-                raise ValueError("Live split source bases are not unique")
+            indices: dict[int, list[int]] = defaultdict(list)
+            for index, base in enumerate(bases):
+                indices[base].append(index)
             segments = []
             for segment in raw["segments"]:
                 segment = dict(segment)
@@ -1859,14 +1859,21 @@ class MooncakeConnectorScheduler:
                 length = int(segment["length"])
                 if base <= 0 or offset < 0 or length <= 0:
                     raise ValueError("Invalid live split source extent")
-                index = indices.get(base)
-                if index is None:
+                base_indices = indices.get(base)
+                if not base_indices:
                     raise ValueError("Live split source base is not registered")
-                if group_id != groups[index]:
+                group_matched = False
+                index = None
+                for candidate in base_indices:
+                    if group_id != groups[candidate]:
+                        continue
+                    group_matched = True
+                    if offset + length <= sizes[candidate]:
+                        index = candidate
+                        break
+                if not group_matched:
                     raise ValueError("Live split source group does not match buffer")
-                if (
-                    offset + length > sizes[index]
-                ):
+                if index is None:
                     raise ValueError("Live split source extent exceeds buffer")
                 segment["group_id"] = group_id
                 segment["source_buffer_base"] = base

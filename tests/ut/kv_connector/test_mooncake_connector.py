@@ -2629,6 +2629,35 @@ class TestMooncakeConnectorScheduler(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Invalid live split"):
             self.scheduler._canonicalize_source_descriptor(source)
 
+    def test_source_canonicalization_disambiguates_aliased_views(self):
+        self.scheduler.live_split_source_groups = (1,)
+        self.scheduler.local_source_metadata[(0, 0)] = MooncakeAgentMetadata(
+            engine_id="engine",
+            te_rpc_port=1,
+            kv_caches_base_addr=[0x2000, 0x2000, 0x2000],
+            num_blocks=1,
+            kv_caches_buffer_sizes=(0x100, 0x20, 0x200),
+            buffer_group_ids=(0, 1, 1),
+            tp_rank=0,
+            dp_rank=0,
+        )
+        source = {
+            "segments": [{
+                "group_id": 1,
+                "source_buffer_base": 0x2000,
+                "source_offset": 0x40,
+                "length": 0x20,
+            }],
+            "group_byte_totals": [0, 0x20],
+            "tp_rank": 0,
+            "dp_rank": 0,
+        }
+
+        result = self.scheduler._canonicalize_source_descriptor(source)
+
+        segment = result["descriptors"][0]["segments"][0]
+        self.assertEqual(segment["source_buffer_index"], 2)
+
 
 class TestUtils(unittest.TestCase):
 
