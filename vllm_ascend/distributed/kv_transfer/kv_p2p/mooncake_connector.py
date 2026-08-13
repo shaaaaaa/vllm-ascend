@@ -841,12 +841,6 @@ class KVCacheRecvingThread(threading.Thread):
         tp_num_need_pulls = req_meta["tp_num_need_pulls"]
 
         split_plan = req_meta.get("split_plan")
-        _cold_live_log(
-            "live_source_transfer_dispatch_entry",
-            req_id=req_meta.get("request_id"),
-            remote_req_id=remote_request_id,
-            split_plan_present=split_plan is not None,
-        )
         if split_plan is not None:
             self._transfer_split_destinations(req_meta, split_plan)
             return

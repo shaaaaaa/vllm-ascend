@@ -401,15 +401,15 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
             )
             and connector._needs_live_split_destination_plans()
         ]
+        if not late_consumers:
+            for connector in self._connectors:
+                connector.start_load_kv(forward_context, **kwargs)
+            return
         _cold_live_log(
             "live_source_ascend_multi_load_entry",
             late_consumers=[c.__class__.__name__ for c in late_consumers],
             children=[c.__class__.__name__ for c in self._connectors],
         )
-        if not late_consumers:
-            for connector in self._connectors:
-                connector.start_load_kv(forward_context, **kwargs)
-            return
 
         handled_groups: set[int] = set()
         for connector in late_consumers:
@@ -694,18 +694,6 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
             ),
             child_count=len(connectors),
         )
-        _cold_live_log(
-            "live_source_ascend_multi_finish_entry",
-            req_id=request.request_id,
-            connector=self.__class__.__name__,
-            children=[c.__class__.__name__ for c in self._connectors],
-            source_present=bool(
-                isinstance(getattr(request, "kv_transfer_params", None), dict)
-                and "ascend_live_split_source_v1"
-                in request.kv_transfer_params
-            ),
-        )
-
         if async_saves > 1:
             self._extra_async_saves[request.request_id] = async_saves - 1
 
