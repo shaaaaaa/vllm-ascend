@@ -1921,6 +1921,40 @@ class TestAscendMultiLateSplitInjection(unittest.TestCase):
     def test_scheduler_live_negotiation_consumer_first(self):
         self._assert_scheduler_live_provider_runs_first(False)
 
+    def test_scheduler_keeps_mooncake_canonical_source_in_output(self):
+        raw = {"descriptors": [{"segments": ["raw"]}]}
+        canonical = {"descriptors": [{"segments": ["canonical"]}]}
+
+        class Provider:
+            supports_dsa_live_split_source = True
+
+            def request_finished(self, request, _block_ids):
+                request.kv_transfer_params["request_live_split"] = True
+                return False, {LIVE_SPLIT_SOURCE_DESCRIPTOR: raw}
+
+        class Mooncake:
+            supports_dsa_live_split_source = False
+
+            def request_finished(self, request, _block_ids):
+                assert request.kv_transfer_params[
+                    LIVE_SPLIT_SOURCE_DESCRIPTOR
+                ] == raw
+                return False, {LIVE_SPLIT_SOURCE_DESCRIPTOR: canonical}
+
+        multi = object.__new__(AscendMultiConnector)
+        multi._connectors = [Provider(), Mooncake()]
+        multi._extra_async_saves = {}
+        multi._requests_to_connector = {}
+        multi._index_load_async_req_ids = set()
+        request = types.SimpleNamespace(
+            request_id="req",
+            kv_transfer_params={"do_remote_decode": True},
+        )
+
+        _, params = multi.request_finished_all_groups(request, ([1],))
+
+        self.assertEqual(params[LIVE_SPLIT_SOURCE_DESCRIPTOR], canonical)
+
     def test_scheduler_non_live_preserves_configured_order(self):
         events = []
 

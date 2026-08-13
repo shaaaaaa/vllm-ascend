@@ -665,6 +665,7 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
             if (
                 isinstance(params, dict)
                 and isinstance(txfer_params, dict)
+                and self._supports_dsa_live_split_source(connector)
                 and "ascend_live_split_source_v1" in txfer_params
             ):
                 source = txfer_params["ascend_live_split_source_v1"]
