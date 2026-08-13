@@ -19,6 +19,8 @@
 
 import copy
 import gc
+import math
+from contextlib import nullcontext
 from types import NoneType
 
 import torch
@@ -135,6 +137,37 @@ class NPUWorker(WorkerBase):
         # Profiler is lazily initialized on first profile(is_start=True) call (RFC #6954)
         self.profiler_config = vllm_config.profiler_config
         self.profiler = None
+        self._prefill_profile_last_chunks = (
+            envs_ascend.VLLM_ASCEND_PREFILL_PROFILE_LAST_CHUNKS
+        )
+        if self._prefill_profile_last_chunks < 0:
+            raise ValueError(
+                "VLLM_ASCEND_PREFILL_PROFILE_LAST_CHUNKS must be "
+                "non-negative"
+            )
+        self._prefill_profile_chunk_size = 0
+        if self._prefill_profile_last_chunks:
+            self._prefill_profile_chunk_size = int(
+                vllm_config.scheduler_config.max_num_batched_tokens
+            )
+            if self._prefill_profile_chunk_size <= 0:
+                raise ValueError(
+                    "max_num_batched_tokens must be positive when the "
+                    "deferred prefill profiler is enabled"
+                )
+        self._prefill_profile_armed = False
+        self._prefill_profile_active = False
+        self._prefill_profile_complete = False
+        self._prefill_profile_trace_name: str | None = None
+        self._prefill_profile_prompt_lens: dict[str, int] = {}
+        self._prefill_profile_chunks_seen = 0
+        if self._prefill_profile_last_chunks:
+            logger.info(
+                "Deferred prefill profiler enabled: last_chunks=%d, "
+                "chunk_size=%d",
+                self._prefill_profile_last_chunks,
+                self._prefill_profile_chunk_size,
+            )
         if vllm_config.model_config and vllm_config.model_config.enable_sleep_mode:
             # Buffers saved before sleep
             self._sleep_saved_buffers: dict[str, torch.Tensor] = {}
@@ -476,7 +509,21 @@ class NPUWorker(WorkerBase):
                 comm_postprocess=comm_postprocess,
             )
 
-        output = self.model_runner.execute_model(scheduler_output, intermediate_tensors)
+        profile_chunk_marker = self._maybe_start_prefill_profile(
+            scheduler_output
+        )
+        try:
+            profile_context = (
+                torch.profiler.record_function(profile_chunk_marker)
+                if profile_chunk_marker is not None
+                else nullcontext()
+            )
+            with profile_context:
+                output = self.model_runner.execute_model(
+                    scheduler_output, intermediate_tensors
+                )
+        finally:
+            self._maybe_stop_prefill_profile(scheduler_output)
         if isinstance(output, (ModelRunnerOutput, AsyncModelRunnerOutput, NoneType)):
             return output
 
@@ -618,6 +665,13 @@ class NPUWorker(WorkerBase):
                 "=YOUR_DIR_PATH_TO_DUMP_TRACE'"
             )
 
+        if self._prefill_profile_window_enabled():
+            self._profile_prefill_window(
+                is_start=is_start,
+                profile_prefix=profile_prefix,
+            )
+            return
+
         if is_start:
             from vllm.distributed.utils import get_worker_rank_suffix
 
@@ -637,6 +691,207 @@ class NPUWorker(WorkerBase):
                 logger.warning("Profiler was not started, nothing to stop.")
                 return
             self.profiler.stop()
+
+    def _prefill_profile_window_enabled(self) -> bool:
+        return getattr(self, "_prefill_profile_last_chunks", 0) > 0
+
+    def _profile_prefill_window(
+        self,
+        *,
+        is_start: bool,
+        profile_prefix: str | None,
+    ) -> None:
+        if is_start:
+            if getattr(self, "_prefill_profile_active", False):
+                raise RuntimeError("prefill profile window is already active")
+            from vllm.distributed.utils import get_worker_rank_suffix
+
+            rank_suffix = get_worker_rank_suffix(global_rank=self.rank)
+            trace_name = (
+                f"{profile_prefix}_{rank_suffix}"
+                if profile_prefix
+                else rank_suffix
+            )
+            if self.profiler is None:
+                self.profiler = self._create_profiler(trace_name)
+            self._prefill_profile_armed = True
+            self._prefill_profile_complete = False
+            self._prefill_profile_chunks_seen = 0
+            self._prefill_profile_prompt_lens = {}
+            self._prefill_profile_trace_name = profile_prefix
+            logger.info(
+                "Armed profiler for the final %d prefill chunks",
+                self._prefill_profile_last_chunks,
+            )
+            return
+
+        self._prefill_profile_armed = False
+        if getattr(self, "_prefill_profile_active", False):
+            assert self.profiler is not None
+            self.profiler.stop()
+            self._prefill_profile_active = False
+            if getattr(self, "_prefill_profile_complete", False):
+                logger.info(
+                    "Stopped completed prefill profile window after %d "
+                    "chunks",
+                    self._prefill_profile_chunks_seen,
+                )
+            else:
+                logger.warning(
+                    "Stopped an incomplete prefill profile window after "
+                    "%d/%d chunks",
+                    self._prefill_profile_chunks_seen,
+                    self._prefill_profile_last_chunks,
+                )
+
+    def _prefill_profile_step(
+        self,
+        scheduler_output: "SchedulerOutput",
+    ) -> tuple[str, int, int, int] | None:
+        """Return (request id, computed, scheduled, prompt length)."""
+        prompt_lens = getattr(self, "_prefill_profile_prompt_lens", None)
+        if prompt_lens is None:
+            prompt_lens = self._prefill_profile_prompt_lens = {}
+
+        computed_by_req: dict[str, int] = {}
+        for request in scheduler_output.scheduled_new_reqs:
+            prompt_token_ids = request.prompt_token_ids
+            if prompt_token_ids is None:
+                prompt_token_ids = request.prefill_token_ids
+            if prompt_token_ids is not None:
+                prompt_lens[request.req_id] = len(prompt_token_ids)
+            computed_by_req[request.req_id] = request.num_computed_tokens
+
+        cached = scheduler_output.scheduled_cached_reqs
+        computed_by_req.update(
+            zip(cached.req_ids, cached.num_computed_tokens)
+        )
+        candidates = []
+        for req_id, scheduled in scheduler_output.num_scheduled_tokens.items():
+            computed = computed_by_req.get(req_id)
+            prompt_len = prompt_lens.get(req_id)
+            if (
+                computed is not None
+                and prompt_len is not None
+                and computed < prompt_len
+            ):
+                candidates.append(
+                    (req_id, int(computed), int(scheduled), prompt_len)
+                )
+        if len(candidates) > 1:
+            logger.warning_once(
+                "Deferred prefill profiler requires one active prefill "
+                "request; saw %d",
+                len(candidates),
+                scope="local",
+            )
+            return None
+        return candidates[0] if candidates else None
+
+    def _maybe_start_prefill_profile(
+        self,
+        scheduler_output: "SchedulerOutput",
+    ) -> str | None:
+        if not self._prefill_profile_window_enabled():
+            return None
+        if not (
+            getattr(self, "_prefill_profile_armed", False)
+            or getattr(self, "_prefill_profile_active", False)
+        ):
+            return None
+
+        step = self._prefill_profile_step(scheduler_output)
+        if step is None:
+            return None
+        req_id, computed, scheduled, prompt_len = step
+        chunk_size = self._prefill_profile_chunk_size
+        total_chunks = math.ceil(prompt_len / chunk_size)
+        first_profiled_chunk = max(
+            1, total_chunks - self._prefill_profile_last_chunks + 1
+        )
+        chunk_index = computed // chunk_size + 1
+
+        if not getattr(self, "_prefill_profile_active", False):
+            expected_start = (first_profiled_chunk - 1) * chunk_size
+            if computed < expected_start:
+                return None
+            if computed != expected_start:
+                logger.error(
+                    "Cannot start final-chunk profiler at token %d; "
+                    "expected %d for request %s",
+                    computed,
+                    expected_start,
+                    req_id,
+                )
+                self._prefill_profile_armed = False
+                return None
+            assert self.profiler is not None
+            self.profiler.start()
+            self._prefill_profile_active = True
+            logger.info(
+                "Started profiler at prefill chunk %d/%d, tokens "
+                "[%d, %d), request=%s",
+                chunk_index,
+                total_chunks,
+                computed,
+                computed + scheduled,
+                req_id,
+            )
+
+        expected_computed = (
+            (first_profiled_chunk - 1 + self._prefill_profile_chunks_seen)
+            * chunk_size
+        )
+        if computed != expected_computed:
+            logger.error(
+                "Non-contiguous prefill profile window: expected token %d, "
+                "got %d",
+                expected_computed,
+                computed,
+            )
+            return None
+        self._prefill_profile_chunks_seen += 1
+        return (
+            "prefill_profile::"
+            f"chunk_{chunk_index}_of_{total_chunks}::"
+            f"tokens_{computed}_{computed + scheduled}"
+        )
+
+    def _maybe_stop_prefill_profile(
+        self,
+        scheduler_output: "SchedulerOutput",
+    ) -> None:
+        if not getattr(self, "_prefill_profile_active", False):
+            return
+        step = self._prefill_profile_step(scheduler_output)
+        if step is None:
+            return
+        req_id, computed, scheduled, prompt_len = step
+        if computed + scheduled < prompt_len:
+            return
+
+        if self._prefill_profile_chunks_seen != min(
+            math.ceil(prompt_len / self._prefill_profile_chunk_size),
+            self._prefill_profile_last_chunks,
+        ):
+            logger.error(
+                "Final-chunk profiler captured %d chunks; expected %d",
+                self._prefill_profile_chunks_seen,
+                self._prefill_profile_last_chunks,
+            )
+
+        self._prefill_profile_armed = False
+        self._prefill_profile_complete = True
+        logger.info(
+            "Completed final-chunk profile: chunks=%d, tokens=[%d, %d), "
+            "request=%s; awaiting stop_profile",
+            self._prefill_profile_chunks_seen,
+            prompt_len
+            - self._prefill_profile_chunks_seen
+            * self._prefill_profile_chunk_size,
+            prompt_len,
+            req_id,
+        )
 
     def add_lora(self, lora_request: LoRARequest) -> bool:
         return self.model_runner.add_lora(lora_request)

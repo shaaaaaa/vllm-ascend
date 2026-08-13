@@ -310,6 +310,101 @@ class TestNPUWorker(TestBase):
             worker.profile(is_start=False)
             mock_profiler.stop.assert_called_once()
 
+    def test_deferred_prefill_profile_captures_final_four_chunks(self):
+        from vllm_ascend.worker.worker import NPUWorker
+
+        def scheduler_output(computed_tokens: int):
+            is_new = computed_tokens == 0
+            return SimpleNamespace(
+                scheduled_new_reqs=(
+                    [
+                        SimpleNamespace(
+                            req_id="request-0",
+                            prompt_token_ids=range(65_536),
+                            prefill_token_ids=None,
+                            num_computed_tokens=0,
+                        )
+                    ]
+                    if is_new
+                    else []
+                ),
+                scheduled_cached_reqs=SimpleNamespace(
+                    req_ids=[] if is_new else ["request-0"],
+                    num_computed_tokens=(
+                        [] if is_new else [computed_tokens]
+                    ),
+                ),
+                num_scheduled_tokens={"request-0": 2_048},
+            )
+
+        with patch.object(NPUWorker, "__init__", lambda self: None):
+            worker = NPUWorker()
+        worker._prefill_profile_last_chunks = 4
+        worker._prefill_profile_chunk_size = 2_048
+        worker._prefill_profile_armed = True
+        worker._prefill_profile_active = False
+        worker._prefill_profile_complete = False
+        worker._prefill_profile_chunks_seen = 0
+        worker._prefill_profile_prompt_lens = {}
+        worker.profiler = MagicMock()
+
+        self.assertIsNone(
+            worker._maybe_start_prefill_profile(scheduler_output(0))
+        )
+        markers = []
+        for computed in (57_344, 59_392, 61_440, 63_488):
+            output = scheduler_output(computed)
+            markers.append(worker._maybe_start_prefill_profile(output))
+            worker._maybe_stop_prefill_profile(output)
+
+        self.assertEqual(
+            markers,
+            [
+                "prefill_profile::chunk_29_of_32::tokens_57344_59392",
+                "prefill_profile::chunk_30_of_32::tokens_59392_61440",
+                "prefill_profile::chunk_31_of_32::tokens_61440_63488",
+                "prefill_profile::chunk_32_of_32::tokens_63488_65536",
+            ],
+        )
+        worker.profiler.start.assert_called_once_with()
+        worker.profiler.stop.assert_not_called()
+        worker._profile_prefill_window(
+            is_start=False,
+            profile_prefix=None,
+        )
+        worker.profiler.stop.assert_called_once_with()
+        self.assertFalse(worker._prefill_profile_armed)
+        self.assertFalse(worker._prefill_profile_active)
+        self.assertTrue(worker._prefill_profile_complete)
+        self.assertEqual(worker._prefill_profile_chunks_seen, 4)
+
+    def test_deferred_prefill_profile_is_created_when_armed(self):
+        from vllm_ascend.worker.worker import NPUWorker
+
+        profiler = MagicMock()
+        with patch.object(NPUWorker, "__init__", lambda self: None):
+            worker = NPUWorker()
+        worker.rank = 3
+        worker.profiler = None
+        worker._prefill_profile_last_chunks = 4
+        worker._prefill_profile_active = False
+        worker._create_profiler = MagicMock(return_value=profiler)
+
+        with patch(
+            "vllm.distributed.utils.get_worker_rank_suffix",
+            return_value="dp0_pp0_tp3_dcp0_ep0_rank3",
+        ):
+            worker._profile_prefill_window(
+                is_start=True,
+                profile_prefix="off-final-4",
+            )
+
+        worker._create_profiler.assert_called_once_with(
+            "off-final-4_dp0_pp0_tp3_dcp0_ep0_rank3"
+        )
+        profiler.start.assert_not_called()
+        self.assertTrue(worker._prefill_profile_armed)
+
     def test_profile_no_profiler_raises_error(self):
         """Test profile method raises exception when profiler is not available"""
         from vllm_ascend.worker.worker import NPUWorker
