@@ -33,6 +33,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorMetadata,
     KVConnectorRole,
 )
+from vllm.distributed.kv_transfer.diagnostics import mark_cold_perf_requests
 from vllm.distributed.parallel_state import (
     get_decode_context_model_parallel_rank,
     get_decode_context_model_parallel_world_size,
@@ -81,6 +82,12 @@ def _cold_live_log(event: str, **fields: Any) -> None:
         "", "0", "false", "no", "off"
     ):
         return
+    request_ids = fields.get("request_ids")
+    request_id = fields.get("req_id")
+    if request_id is not None:
+        mark_cold_perf_requests((request_id,))
+    if request_ids:
+        mark_cold_perf_requests(request_ids)
     logger.info(
         "[LMCACHE_COLD_PERF] %s",
         json.dumps(

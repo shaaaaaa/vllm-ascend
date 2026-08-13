@@ -21,6 +21,7 @@ import json
 import math
 import os
 import sys
+import time
 from collections import defaultdict
 from contextlib import contextmanager, nullcontext
 from copy import copy, deepcopy
@@ -39,6 +40,12 @@ from vllm.config import CompilationMode, CUDAGraphMode, VllmConfig, get_layers_f
 from vllm.distributed import get_tensor_model_parallel_world_size, tensor_model_parallel_all_gather
 from vllm.distributed.ec_transfer import get_ec_transfer, has_ec_transfer
 from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
+from vllm.distributed.kv_transfer.diagnostics import (
+    cold_perf_enabled,
+    forget_cold_perf_request,
+    is_cold_perf_request,
+    log_cold_perf_event,
+)
 from vllm.distributed.parallel_state import get_dcp_group, get_dp_group, get_pcp_group, get_pp_group, get_tp_group
 from vllm.forward_context import BatchDescriptor, get_forward_context
 from vllm.logger import logger
@@ -1603,6 +1610,25 @@ class NPUModelRunner(GPUModelRunner):
         ):
             scheduler_output = deepcopy(scheduler_output)
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
+        cold_perf_req_ids = (
+            [
+                req_id
+                for req_id in scheduler_output.num_scheduled_tokens
+                if is_cold_perf_request(req_id)
+            ]
+            if cold_perf_enabled()
+            else []
+        )
+        cold_perf_execute_start = (
+            time.perf_counter() if cold_perf_req_ids else 0.0
+        )
+        self._cold_perf_current_req_ids = cold_perf_req_ids
+        log_cold_perf_event(
+            "decoder_worker_execute_entry",
+            request_ids=cold_perf_req_ids,
+            once=True,
+            total_num_scheduled_tokens=num_scheduled_tokens,
+        )
         with record_function_or_nullcontext("prepare input"):
             with self.synchronize_input_prep():
                 # Update persistent batch states.
@@ -1834,6 +1860,17 @@ class NPUModelRunner(GPUModelRunner):
             # update global cos, sin
             update_cos_sin(positions)
 
+        if cold_perf_req_ids:
+            log_cold_perf_event(
+                "decoder_input_prepare_complete",
+                request_ids=cold_perf_req_ids,
+                once=True,
+                total_num_scheduled_tokens=num_scheduled_tokens,
+                elapsed_ms=round(
+                    (time.perf_counter() - cold_perf_execute_start) * 1000, 3
+                ),
+            )
+
         if self.dynamic_eplb:
             with record_function_or_nullcontext("EPLB weight D2D"):
                 self.eplb_updator.forward_before()
@@ -2001,9 +2038,28 @@ class NPUModelRunner(GPUModelRunner):
             if staged_sfa_graph_key is not None:
                 first_layer_name, first_impl = self._staged_sfa_impls[0]
                 first_impl.bootstrap_cross_layer(first_layer_name)
+            cold_perf_forward_start = (
+                time.perf_counter() if cold_perf_req_ids else 0.0
+            )
+            log_cold_perf_event(
+                "decoder_forward_start",
+                request_ids=cold_perf_req_ids,
+                once=True,
+                total_num_scheduled_tokens=num_tokens_padded,
+            )
             hidden_states = self._model_forward(
                 num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
             )
+            if cold_perf_req_ids:
+                log_cold_perf_event(
+                    "decoder_forward_return",
+                    request_ids=cold_perf_req_ids,
+                    once=True,
+                    cpu_elapsed_ms=round(
+                        (time.perf_counter() - cold_perf_forward_start) * 1000,
+                        3,
+                    ),
+                )
             target_diag_session = getattr(
                 get_forward_context(),
                 "_target_sfa_diag_session",
@@ -2110,6 +2166,15 @@ class NPUModelRunner(GPUModelRunner):
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors:
         kv_connector_output = self.kv_connector_output
         self.kv_connector_output = None
+        cold_perf_req_ids = getattr(self, "_cold_perf_current_req_ids", ())
+        cold_perf_sample_start = (
+            time.perf_counter() if cold_perf_req_ids else 0.0
+        )
+        log_cold_perf_event(
+            "decoder_sample_start",
+            request_ids=cold_perf_req_ids,
+            once=True,
+        )
 
         if self.execute_model_state is None:
             # Nothing to do (PP non-final rank case), output isn't used.
@@ -2212,6 +2277,18 @@ class NPUModelRunner(GPUModelRunner):
             scheduler_output.total_num_scheduled_tokens,
             spec_decode_metadata,
         )
+        if cold_perf_req_ids:
+            log_cold_perf_event(
+                "decoder_sample_complete",
+                request_ids=cold_perf_req_ids,
+                once=True,
+                elapsed_ms=round(
+                    (time.perf_counter() - cold_perf_sample_start) * 1000, 3
+                ),
+                output_request_count=len(req_ids_output_copy),
+            )
+            for req_id in cold_perf_req_ids:
+                forget_cold_perf_request(req_id)
         _mtp_dw_for_requests(
             self,
             scheduler_output,
