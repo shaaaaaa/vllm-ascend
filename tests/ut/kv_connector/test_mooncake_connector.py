@@ -48,6 +48,7 @@ from vllm_ascend.distributed.kv_transfer.ascend_multi_connector import (  # noqa
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector import (  # noqa: E402
     LIVE_SPLIT_CAPABILITY,
+    LIVE_SPLIT_COMPACT_CAPABILITY,
     LIVE_SPLIT_SOURCE_DESCRIPTOR,
     KVCacheRecvingThread,
     KVCacheSendingThread,
@@ -61,6 +62,9 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector import (  # n
     ReqMeta,
     SplitTransferPlan,
     SplitTransferSegment,
+    SplitCompactLayer,
+    SplitCompactLayout,
+    SplitCompactRun,
     _send_router_ack,
     ensure_zmq_recv,
     ensure_zmq_send,
@@ -74,6 +78,116 @@ from vllm_ascend.distributed.kv_transfer.utils.mooncake_transfer_engine import (
 
 GET_META_MSG = b"get_meta_msg"
 DONE_RECVING_MSG = b"done_recving_msg"
+
+
+def test_compact_split_plan_expands_at_worker_boundary() -> None:
+    source = SplitCompactLayout(
+        group_id=1,
+        token_count=4,
+        layers=(
+            SplitCompactLayer(0, 1000, 8, 16, 2),
+            SplitCompactLayer(1, 2000, 8, 16, 3),
+        ),
+        runs=(
+            SplitCompactRun(0, 3, 2),
+            SplitCompactRun(2, 8, 2),
+        ),
+    )
+    destination = SplitCompactLayout(
+        group_id=1,
+        token_count=4,
+        layers=(
+            SplitCompactLayer(0, 3000, 8, 16),
+            SplitCompactLayer(1, 4000, 8, 16),
+        ),
+        runs=(SplitCompactRun(0, 5, 4),),
+    )
+    plan = SplitTransferPlan(
+        segments=(),
+        group_byte_totals=(0, 64),
+        tp_rank=0,
+        dp_rank=0,
+        requested_groups=(1,),
+        compact_source=source,
+        compact_destination=destination,
+    )
+
+    expanded = KVCacheRecvingThread._expand_compact_split_plan(plan)
+
+    assert len(expanded.segments) == 4
+    assert [segment.source_offset for segment in expanded.segments] == [24, 24, 64, 64]
+    assert [segment.destination_address for segment in expanded.segments] == [3040, 4040, 3056, 4056]
+    assert [segment.length for segment in expanded.segments] == [16] * 4
+
+
+def test_compact_source_canonicalizes_layer_buffers() -> None:
+    scheduler = MooncakeConnectorScheduler.__new__(MooncakeConnectorScheduler)
+    scheduler.live_split_source_groups = (1,)
+    scheduler.local_source_metadata = {
+        (0, 0): MooncakeAgentMetadata(
+            engine_id="engine",
+            te_rpc_port=1,
+            kv_caches_base_addr=[1000, 2000],
+            kv_caches_buffer_sizes=(128, 128),
+            buffer_group_ids=(1, 1),
+            num_blocks=1,
+        )
+    }
+    descriptor = {
+        "format": "layer_slot_runs_v1",
+        "tp_rank": 0,
+        "dp_rank": 0,
+        "group_byte_totals": [0, 64],
+        "compact_layout": {
+            "group_id": 1,
+            "token_count": 4,
+            "layers": [
+                {"layer_id": 0, "buffer_base": 1000, "token_bytes": 8, "slot_capacity": 16},
+                {"layer_id": 1, "buffer_base": 2000, "token_bytes": 8, "slot_capacity": 16},
+            ],
+            "runs": [{"logical_token_start": 0, "physical_slot_start": 3, "token_count": 4}],
+        },
+    }
+
+    result = scheduler._canonicalize_source_descriptor(descriptor)
+
+    layers = result["descriptors"][0]["compact_layout"]["layers"]
+    assert [layer["buffer_index"] for layer in layers] == [0, 1]
+    assert LIVE_SPLIT_COMPACT_CAPABILITY
+
+
+def test_compact_source_rejects_incomplete_layer_registration() -> None:
+    scheduler = MooncakeConnectorScheduler.__new__(MooncakeConnectorScheduler)
+    scheduler.live_split_source_groups = (1,)
+    scheduler.local_source_metadata = {
+        (0, 0): MooncakeAgentMetadata(
+            engine_id="engine",
+            te_rpc_port=1,
+            kv_caches_base_addr=[1000, 2000],
+            kv_caches_buffer_sizes=(128, 128),
+            buffer_group_ids=(1, 1),
+            num_blocks=1,
+        )
+    }
+    descriptor = {
+        "format": "layer_slot_runs_v1",
+        "tp_rank": 0,
+        "dp_rank": 0,
+        "group_byte_totals": [0, 32],
+        "compact_layout": {
+            "group_id": 1,
+            "token_count": 4,
+            "layers": [
+                {"layer_id": 0, "buffer_base": 1000,
+                 "token_bytes": 8, "slot_capacity": 16},
+            ],
+            "runs": [{"logical_token_start": 0,
+                      "physical_slot_start": 3, "token_count": 4}],
+        },
+    }
+
+    with unittest.TestCase().assertRaisesRegex(ValueError, "incomplete"):
+        scheduler._canonicalize_source_descriptor(descriptor)
 
 
 class TestKVCacheTaskTrackerInit(unittest.TestCase):

@@ -66,6 +66,7 @@ GET_META_MSG = b"get_meta_msg"
 DONE_RECVING_MSG = b"done_recving_msg"
 SPLIT_DONE_MSG = b"split_done_msg_v2"
 LIVE_SPLIT_CAPABILITY = "ascend_live_split_v2"
+LIVE_SPLIT_COMPACT_CAPABILITY = "ascend_live_split_compact_v1"
 LIVE_SPLIT_SOURCE_DESCRIPTOR = "ascend_live_split_source_v1"
 MAX_PENDING_SPLIT_REQUESTS = 64
 MAX_TASK_HISTORY_SIZE = 16000
@@ -139,11 +140,36 @@ class SplitSourceSegment:
 
 
 @dataclass(frozen=True)
+class SplitCompactLayer:
+    layer_id: int
+    buffer_base: int
+    token_bytes: int
+    slot_capacity: int
+    buffer_index: int = -1
+
+
+@dataclass(frozen=True)
+class SplitCompactRun:
+    logical_token_start: int
+    physical_slot_start: int
+    token_count: int
+
+
+@dataclass(frozen=True)
+class SplitCompactLayout:
+    group_id: int
+    token_count: int
+    layers: tuple[SplitCompactLayer, ...]
+    runs: tuple[SplitCompactRun, ...]
+
+
+@dataclass(frozen=True)
 class SplitSourceDescriptor:
     segments: tuple[SplitSourceSegment, ...]
     group_byte_totals: tuple[int, int]
     tp_rank: int
     dp_rank: int
+    compact_layout: SplitCompactLayout | None = None
 
 
 @dataclass(frozen=True)
@@ -153,6 +179,8 @@ class SplitTransferPlan:
     tp_rank: int
     dp_rank: int
     requested_groups: tuple[int, ...] = (0, 1)
+    compact_source: SplitCompactLayout | None = None
+    compact_destination: SplitCompactLayout | None = None
 
 
 @dataclass
@@ -964,6 +992,16 @@ class KVCacheRecvingThread(threading.Thread):
     def _transfer_split_destinations(
         self, req_meta: dict[str, Any], plan: SplitTransferPlan
     ) -> None:
+        compact = plan.compact_source is not None
+        compact_source_runs = (
+            len(plan.compact_source.runs) if plan.compact_source is not None else 0
+        )
+        compact_destination_runs = (
+            len(plan.compact_destination.runs)
+            if plan.compact_destination is not None else 0
+        )
+        if plan.compact_source is not None or plan.compact_destination is not None:
+            plan = self._expand_compact_split_plan(plan)
         _cold_live_log(
             "live_source_native_transfer_entry",
             req_id=req_meta.get("request_id"),
@@ -971,6 +1009,9 @@ class KVCacheRecvingThread(threading.Thread):
             segment_count=len(plan.segments),
             requested_groups=plan.requested_groups,
             group_byte_totals=plan.group_byte_totals,
+            compact=compact,
+            compact_source_runs=compact_source_runs,
+            compact_destination_runs=compact_destination_runs,
         )
         if plan.tp_rank != self.tp_rank or plan.dp_rank != self.vllm_config.parallel_config.data_parallel_rank_local:
             raise RuntimeError("Split destination TP/DP rank mismatch")
@@ -1025,9 +1066,13 @@ class KVCacheRecvingThread(threading.Thread):
             (remote_engine_id, remote_port), ())
         if LIVE_SPLIT_CAPABILITY not in capabilities:
             raise RuntimeError("Remote Mooncake peer lacks live split capability")
+        if compact and LIVE_SPLIT_COMPACT_CAPABILITY not in capabilities:
+            raise RuntimeError("Remote Mooncake peer lacks compact split capability")
         remote_bases = self.kv_caches_base_addr[remote_engine_id][remote_port]
         remote_sizes = self.remote_buffer_sizes[remote_engine_id][remote_port]
         remote_groups = self.remote_buffer_group_ids[remote_engine_id][remote_port]
+        if compact and len(plan.segments) > 1_000_000:
+            raise RuntimeError("Expanded compact split plan is too large")
         if len(remote_sizes) != len(remote_bases):
             raise RuntimeError(
                 "Remote peer omitted registered source buffer sizes"
@@ -1060,6 +1105,72 @@ class KVCacheRecvingThread(threading.Thread):
                 session_id, local_destinations, remote_sources, lengths)
         if ret < 0:
             raise RuntimeError(f"Mooncake split transfer failed, ret: {ret}")
+
+    @staticmethod
+    def _expand_compact_split_plan(
+        plan: SplitTransferPlan,
+    ) -> SplitTransferPlan:
+        source, destination = plan.compact_source, plan.compact_destination
+        if source is None or destination is None or plan.requested_groups != (1,):
+            raise RuntimeError("Incomplete compact split transfer plan")
+        if any(layer.buffer_index < 0 for layer in source.layers):
+            raise RuntimeError("Compact split source buffer is unresolved")
+        source_layers = {layer.layer_id: layer for layer in source.layers}
+        destination_layers = {layer.layer_id: layer for layer in destination.layers}
+        if (
+            len(source_layers) != len(source.layers)
+            or len(destination_layers) != len(destination.layers)
+            or source_layers.keys() != destination_layers.keys()
+        ):
+            raise RuntimeError("Compact split layer sets differ")
+        segments: list[SplitTransferSegment] = []
+        src_pos = dst_pos = src_offset = dst_offset = 0
+        while src_pos < len(source.runs) and dst_pos < len(destination.runs):
+            src_run, dst_run = source.runs[src_pos], destination.runs[dst_pos]
+            src_logical = src_run.logical_token_start + src_offset
+            dst_logical = dst_run.logical_token_start + dst_offset
+            if src_logical != dst_logical:
+                raise RuntimeError("Compact split logical coverage differs")
+            count = min(
+                src_run.token_count - src_offset,
+                dst_run.token_count - dst_offset,
+            )
+            for layer_id in source_layers:
+                src_layer = source_layers[layer_id]
+                dst_layer = destination_layers[layer_id]
+                if src_layer.token_bytes != dst_layer.token_bytes:
+                    raise RuntimeError("Compact split token widths differ")
+                segments.append(SplitTransferSegment(
+                    group_id=1,
+                    source_buffer_index=src_layer.buffer_index,
+                    source_buffer_base=src_layer.buffer_base,
+                    source_offset=(src_run.physical_slot_start + src_offset)
+                    * src_layer.token_bytes,
+                    destination_address=dst_layer.buffer_base
+                    + (dst_run.physical_slot_start + dst_offset)
+                    * dst_layer.token_bytes,
+                    length=count * src_layer.token_bytes,
+                    destination_kind="npu",
+                ))
+            src_offset += count
+            dst_offset += count
+            if src_offset == src_run.token_count:
+                src_pos += 1
+                src_offset = 0
+            if dst_offset == dst_run.token_count:
+                dst_pos += 1
+                dst_offset = 0
+        if src_pos != len(source.runs) or dst_pos != len(destination.runs):
+            raise RuntimeError("Compact split run coverage differs")
+        if sum(segment.length for segment in segments) != plan.group_byte_totals[1]:
+            raise RuntimeError("Expanded compact split byte total differs")
+        return SplitTransferPlan(
+            segments=tuple(segments),
+            group_byte_totals=plan.group_byte_totals,
+            tp_rank=plan.tp_rank,
+            dp_rank=plan.dp_rank,
+            requested_groups=plan.requested_groups,
+        )
 
     def reformat_kv_cache_with_fused_op(self, block_ids: list[list[int]], tp_num_need_pulls: int):
         # Get necessary parameters
@@ -1424,6 +1535,59 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
         )
 
     @staticmethod
+    def _parse_compact_layout(layout: Any) -> SplitCompactLayout | None:
+        if layout is None:
+            return None
+        if not isinstance(layout, dict):
+            raise ValueError("Compact split layout must be a mapping")
+        parsed = SplitCompactLayout(
+            group_id=int(layout["group_id"]),
+            token_count=int(layout["token_count"]),
+            layers=tuple(SplitCompactLayer(**layer) for layer in layout["layers"]),
+            runs=tuple(SplitCompactRun(**run) for run in layout["runs"]),
+        )
+        if (
+            parsed.group_id != 1
+            or parsed.token_count <= 0
+            or len(parsed.layers) > 4096
+            or len(parsed.runs) > 1_000_000
+        ):
+            raise ValueError("Compact split layout only supports group 1")
+        if not parsed.layers or not parsed.runs:
+            raise ValueError("Compact split layout is empty")
+        layer_ids = [layer.layer_id for layer in parsed.layers]
+        if layer_ids != list(range(len(parsed.layers))):
+            raise ValueError("Compact split layers must be complete and ordered")
+        if any(
+            layer.buffer_base <= 0
+            or layer.token_bytes <= 0
+            or layer.slot_capacity <= 0
+            for layer in parsed.layers
+        ):
+            raise ValueError("Invalid compact split layer")
+        logical = 0
+        for run in parsed.runs:
+            if (
+                run.logical_token_start != logical
+                or run.physical_slot_start < 0
+                or run.token_count <= 0
+                or run.physical_slot_start + run.token_count
+                > min(layer.slot_capacity for layer in parsed.layers)
+            ):
+                raise ValueError("Invalid compact split run coverage")
+            logical += run.token_count
+        if logical != parsed.token_count:
+            raise ValueError("Compact split runs do not cover all tokens")
+        physical = sorted(
+            (run.physical_slot_start,
+             run.physical_slot_start + run.token_count)
+            for run in parsed.runs
+        )
+        if any(left[1] > right[0] for left, right in zip(physical, physical[1:])):
+            raise ValueError("Compact split physical slots overlap")
+        return parsed
+
+    @staticmethod
     def _parse_source_descriptor(
         descriptor: Any,
     ) -> tuple[SplitSourceDescriptor, ...] | None:
@@ -1439,11 +1603,16 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
                 SplitSourceDescriptor(
                     segments=tuple(
                         SplitSourceSegment(**segment)
-                        for segment in raw["segments"]
+                        for segment in raw.get("segments", ())
                     ),
                     group_byte_totals=tuple(raw["group_byte_totals"]),
                     tp_rank=int(raw["tp_rank"]),
                     dp_rank=int(raw["dp_rank"]),
+                    compact_layout=(
+                        MooncakeConnectorMetadata._parse_compact_layout(
+                            raw.get("compact_layout")
+                        )
+                    ),
                 )
                 for raw in raw_descriptors
             )
@@ -1465,6 +1634,15 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
                 ):
                     raise ValueError("Invalid live split source extent")
                 totals[segment.group_id] += segment.length
+            if parsed.compact_layout is not None:
+                if any(
+                    layer.buffer_index < 0
+                    for layer in parsed.compact_layout.layers
+                ):
+                    raise ValueError("Compact split source buffer is unresolved")
+                totals[1] += parsed.compact_layout.token_count * sum(
+                    layer.token_bytes for layer in parsed.compact_layout.layers
+                )
             if tuple(totals) != parsed.group_byte_totals:
                 raise ValueError("Live split source byte totals mismatch")
         return descriptors
@@ -1508,6 +1686,37 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
                 "source/destination ranks differ: "
                 f"source={(source.tp_rank, source.dp_rank)}, "
                 f"destination={(tp_rank, dp_rank)}"
+            )
+        compact_destination = cls._parse_compact_layout(
+            plan.get("compact_layout")
+        )
+        if source.compact_layout is not None or compact_destination is not None:
+            if (
+                requested_groups != (1,)
+                or source.compact_layout is None
+                or compact_destination is None
+                or source.compact_layout.token_count
+                != compact_destination.token_count
+                or len(source.compact_layout.layers)
+                != len(compact_destination.layers)
+            ):
+                raise ValueError("Compact source/destination layouts differ")
+            source_widths = [
+                layer.token_bytes for layer in source.compact_layout.layers
+            ]
+            destination_widths = [
+                layer.token_bytes for layer in compact_destination.layers
+            ]
+            if source_widths != destination_widths:
+                raise ValueError("Compact source/destination token widths differ")
+            return SplitTransferPlan(
+                segments=(),
+                group_byte_totals=(0, source.group_byte_totals[1]),
+                tp_rank=tp_rank,
+                dp_rank=dp_rank,
+                requested_groups=(1,),
+                compact_source=source.compact_layout,
+                compact_destination=compact_destination,
             )
         destinations = plan["segments"]
         merged: list[SplitTransferSegment] = []
@@ -1568,7 +1777,8 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
             raise ValueError("Live split destination plan must be a mapping")
         else:
             segments = tuple(
-                SplitTransferSegment(**segment) for segment in plan["segments"]
+                SplitTransferSegment(**segment)
+                for segment in plan.get("segments", ())
             )
             parsed = SplitTransferPlan(
                 segments=segments,
@@ -1576,6 +1786,14 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
                 tp_rank=int(plan["tp_rank"]),
                 dp_rank=int(plan["dp_rank"]),
                 requested_groups=tuple(plan.get("requested_groups", (0, 1))),
+                compact_source=MooncakeConnectorMetadata._parse_compact_layout(
+                    plan.get("compact_source")
+                ),
+                compact_destination=(
+                    MooncakeConnectorMetadata._parse_compact_layout(
+                        plan.get("compact_layout")
+                    )
+                ),
             )
         if len(parsed.group_byte_totals) != 2:
             raise ValueError("Live split byte totals require exactly two groups")
@@ -1659,6 +1877,8 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
                         tp_rank=plan.tp_rank,
                         dp_rank=plan.dp_rank,
                         requested_groups=requested_groups,
+                        compact_source=plan.compact_source,
+                        compact_destination=plan.compact_destination,
                     )
                 meta.split_plan = plan
             except (KeyError, TypeError, ValueError) as error:
@@ -1896,6 +2116,56 @@ class MooncakeConnectorScheduler:
             indices: dict[int, list[int]] = defaultdict(list)
             for index, base in enumerate(bases):
                 indices[base].append(index)
+            compact = raw.get("compact_layout")
+            if compact is not None:
+                if raw.get("segments"):
+                    raise ValueError("Mixed compact and segment source layout")
+                if raw.get("format") != "layer_slot_runs_v1":
+                    raise ValueError("Unknown compact live split format")
+                compact = dict(compact)
+                if int(compact["group_id"]) not in self.live_split_source_groups:
+                    raise ValueError("Compact live split group is unsupported")
+                layers = []
+                for layer in compact["layers"]:
+                    layer = dict(layer)
+                    base = int(layer["buffer_base"])
+                    token_bytes = int(layer["token_bytes"])
+                    capacity = int(layer["slot_capacity"])
+                    index = next(
+                        (
+                            candidate
+                            for candidate in indices.get(base, ())
+                            if groups[candidate] == 1
+                            and capacity * token_bytes <= sizes[candidate]
+                        ),
+                        None,
+                    )
+                    if index is None:
+                        raise ValueError(
+                            "Compact live split layer is not registered"
+                        )
+                    layer["buffer_base"] = base
+                    layer["buffer_index"] = index
+                    layers.append(layer)
+                expected_layers = sum(group == 1 for group in groups)
+                if (
+                    len(layers) != expected_layers
+                    or len({layer["buffer_index"] for layer in layers})
+                    != len(layers)
+                ):
+                    raise ValueError("Compact live split layers are incomplete")
+                compact["layers"] = layers
+                parsed = MooncakeConnectorMetadata._parse_compact_layout(compact)
+                if parsed is None:
+                    raise ValueError("Compact live split layout is missing")
+                expected_total = parsed.token_count * sum(
+                    layer.token_bytes for layer in parsed.layers
+                )
+                totals = tuple(raw["group_byte_totals"])
+                if len(totals) != 2 or totals != (0, expected_total):
+                    raise ValueError("Compact live split byte total differs")
+                normalized.append({**raw, "compact_layout": compact})
+                continue
             segments = []
             for segment in raw["segments"]:
                 segment = dict(segment)
@@ -2085,7 +2355,10 @@ class MooncakeConnectorScheduler:
             split_transfer_id = uuid.uuid4().hex
             self.split_transfer_ids[request.request_id] = split_transfer_id
             self._split_reqs_need_send.add(request.request_id)
-            transfer_params["live_split_capabilities"] = (LIVE_SPLIT_CAPABILITY,)
+            transfer_params["live_split_capabilities"] = (
+                LIVE_SPLIT_CAPABILITY,
+                LIVE_SPLIT_COMPACT_CAPABILITY,
+            )
             transfer_params["live_split_transfer_id"] = split_transfer_id
             source_descriptor = params.get(LIVE_SPLIT_SOURCE_DESCRIPTOR)
             _cold_live_log(
@@ -2401,7 +2674,7 @@ class MooncakeConnectorWorker:
             kv_caches_base_addr=kv_caches_base_addr,
             num_blocks=self.num_blocks,
             local_ip=get_ip(),
-            capabilities=(LIVE_SPLIT_CAPABILITY,),
+            capabilities=(LIVE_SPLIT_CAPABILITY, LIVE_SPLIT_COMPACT_CAPABILITY),
             kv_caches_buffer_sizes=tuple(lengths),
             buffer_group_ids=tuple(buffer_group_ids),
             tp_rank=self.tp_rank,
