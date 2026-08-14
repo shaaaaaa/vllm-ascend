@@ -123,6 +123,7 @@ import sys
 import threading
 import time
 import uuid
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any
@@ -208,7 +209,7 @@ TAINT_PRIORITY = 1e15
 
 
 class ServerState:
-    def __init__(self, host, port):
+    def __init__(self, host: str, port: int) -> None:
         self.host = host
         self.port = port
         self.url = f"http://{host}:{port}/v1"
@@ -227,6 +228,8 @@ class ServerState:
         self.active_kv_cache = 0  # Only for prefiller
         self.active_requests = 0  # Number of active requests
         self.aborted_requests = set()  # Track aborted requests
+        self.decoder_mooncake_segments: dict[int, str] | None = None
+        self.decoder_rank_active_tokens: dict[int, float] = {}
         # Removed individual server lock - will use global locks instead
 
     def __eq__(self, other):
@@ -242,8 +245,24 @@ class ServerState:
         return f"{self.host}:{self.port}"
 
 
+@dataclass
+class DecoderReservation:
+    """Track one decoder endpoint and optional DP-rank load reservation."""
+
+    server: ServerState
+    decoder_idx: int
+    decoder_score: float
+    dp_rank: int | None = None
+    preferred_segment: str | None = None
+
+
 class ProxyState:
-    def __init__(self, prefiller_instances, decoder_instances):
+    def __init__(
+        self,
+        prefiller_instances: list[tuple[str, int]],
+        decoder_instances: list[tuple[str, int]],
+        decoder_mooncake_segments: list[dict[int, str]] | None = None,
+    ) -> None:
         self.request_num = 0
         self.tainted_prefillers: list[ServerState] = []
         self.tainted_decoders: list[ServerState] = []
@@ -251,6 +270,17 @@ class ProxyState:
 
         self.prefillers: list[ServerState] = [ServerState(h, p) for h, p in prefiller_instances]
         self.decoders: list[ServerState] = [ServerState(h, p) for h, p in decoder_instances]
+        self.decoder_mooncake_segments = decoder_mooncake_segments
+        if decoder_mooncake_segments is not None:
+            if len(decoder_mooncake_segments) != len(self.decoders):
+                raise ValueError(
+                    "Decoder Mooncake mappings must match decoder endpoints"
+                )
+            for server, rank_segments in zip(self.decoders, decoder_mooncake_segments):
+                server.decoder_mooncake_segments = dict(rank_segments)
+                server.decoder_rank_active_tokens = {
+                    dp_rank: 0.0 for dp_rank in rank_segments
+                }
         self.req_to_prefiller = {}
         self.req_id_lock = asyncio.Lock()
         # Removed selection locks - no longer needed for synchronous methods
@@ -361,6 +391,68 @@ class ProxyState:
         self.decoders[idx].active_tokens -= token_count
         # Update priority queue after releasing
         self._update_decoder_priority(idx)
+
+    def select_decoder_reservation(
+        self, token_count: float
+    ) -> DecoderReservation:
+        """Reserve an endpoint and its least-loaded configured DP rank.
+
+        Args:
+            token_count: Load score charged to the endpoint and selected rank.
+
+        Returns:
+            The endpoint/rank reservation that must be released exactly once.
+        """
+        decoder_idx = self.select_decoder(token_count)
+        server = self.decoders[decoder_idx]
+        rank_segments = server.decoder_mooncake_segments
+        if not rank_segments:
+            return DecoderReservation(server, decoder_idx, token_count)
+        dp_rank = min(
+            rank_segments,
+            key=lambda rank: (
+                server.decoder_rank_active_tokens[rank],
+                rank,
+            ),
+        )
+        server.decoder_rank_active_tokens[dp_rank] += token_count
+        return DecoderReservation(
+            server,
+            decoder_idx,
+            token_count,
+            dp_rank,
+            rank_segments[dp_rank],
+        )
+
+    def release_decoder_reservation(
+        self, reservation: DecoderReservation
+    ) -> None:
+        """Release a decoder reservation without mutating replacement servers."""
+        server = reservation.server
+        if reservation.dp_rank is not None:
+            rank_tokens = server.decoder_rank_active_tokens.get(
+                reservation.dp_rank, 0.0
+            )
+            server.decoder_rank_active_tokens[reservation.dp_rank] = max(
+                0.0, rank_tokens - reservation.decoder_score
+            )
+        decoder_idx = next(
+            (
+                index
+                for index, decoder in enumerate(self.decoders)
+                if decoder is server
+            ),
+            None,
+        )
+        if decoder_idx is not None:
+            server.active_tokens = max(
+                0.0, server.active_tokens - reservation.decoder_score
+            )
+            self._update_decoder_priority(decoder_idx)
+        else:
+            server.active_tokens = max(
+                0.0, server.active_tokens - reservation.decoder_score
+            )
 
     # Omni_infer's calculate_input_scores function
     def calculate_prefill_scores(self, request_length: int) -> float:
@@ -552,7 +644,59 @@ class NodeListener:
             return False
 
 
-def parse_args():
+def _parse_decoder_mooncake_segments(
+    raw_mappings: list[str] | None, decoder_count: int
+) -> list[dict[int, str]] | None:
+    """Parse endpoint-aligned global-DP-rank Mooncake segment mappings."""
+    if raw_mappings is None:
+        return None
+    if len(raw_mappings) != decoder_count:
+        raise ValueError(
+            "Number of --decoder-mooncake-segments arguments must match "
+            "the number of decoder endpoints"
+        )
+
+    parsed_mappings = []
+    seen_ranks = set()
+    for endpoint_idx, raw_mapping in enumerate(raw_mappings):
+        if not raw_mapping or not raw_mapping.strip():
+            raise ValueError(
+                f"Decoder endpoint {endpoint_idx} has an empty Mooncake segment mapping"
+            )
+        rank_segments = {}
+        for raw_entry in raw_mapping.split(","):
+            entry = raw_entry.strip()
+            if not entry or "=" not in entry:
+                raise ValueError(
+                    "Each decoder Mooncake mapping must use global_rank=segment"
+                )
+            raw_rank, raw_segment = entry.split("=", 1)
+            try:
+                dp_rank = int(raw_rank.strip())
+            except ValueError as exc:
+                raise ValueError(
+                    f"Invalid decoder data-parallel rank: {raw_rank!r}"
+                ) from exc
+            if dp_rank < 0:
+                raise ValueError("Decoder data-parallel ranks must be non-negative")
+            segment = raw_segment.strip()
+            if not segment:
+                raise ValueError(
+                    f"Decoder data-parallel rank {dp_rank} has an empty Mooncake segment"
+                )
+            if dp_rank in seen_ranks:
+                raise ValueError(
+                    f"Decoder data-parallel rank {dp_rank} is mapped more than once"
+                )
+            seen_ranks.add(dp_rank)
+            rank_segments[dp_rank] = segment
+        parsed_mappings.append(rank_segments)
+    return parsed_mappings
+
+
+def parse_args() -> argparse.Namespace:
+    """Parse proxy endpoints and optional endpoint-aligned segment mappings."""
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--host", type=str, default="localhost")
@@ -560,6 +704,16 @@ def parse_args():
     parser.add_argument("--prefiller-ports", type=int, nargs="+", default=[8001])
     parser.add_argument("--decoder-hosts", type=str, nargs="+", default=["localhost"])
     parser.add_argument("--decoder-ports", type=int, nargs="+", default=[8002])
+    parser.add_argument(
+        "--decoder-mooncake-segments",
+        type=str,
+        nargs="+",
+        default=None,
+        help=(
+            "Optional per-decoder global DP rank to Mooncake segment mappings, "
+            'for example "0=decoder-a:12345,1=decoder-b:12345"'
+        ),
+    )
     parser.add_argument("--max-retries", type=int, default=3, help="Maximum number of retries for HTTP requests")
     parser.add_argument(
         "--retry-delay", type=float, default=0.001, help="Base delay (seconds) for exponential backoff retries"
@@ -580,13 +734,23 @@ def parse_args():
         raise ValueError("Number of decoder hosts must match number of decoder ports")
     args.prefiller_instances = list(zip(args.prefiller_hosts, args.prefiller_ports))
     args.decoder_instances = list(zip(args.decoder_hosts, args.decoder_ports))
+    args.decoder_mooncake_segments = _parse_decoder_mooncake_segments(
+        args.decoder_mooncake_segments,
+        len(args.decoder_instances),
+    )
     return args
 
 
 @asynccontextmanager
-async def lifespan(app: FastAPI):
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    """Create proxy clients for the application lifetime and close them."""
+
     global proxy_state
-    proxy_state = ProxyState(global_args.prefiller_instances, global_args.decoder_instances)
+    proxy_state = ProxyState(
+        global_args.prefiller_instances,
+        global_args.decoder_instances,
+        getattr(global_args, "decoder_mooncake_segments", None),
+    )
     print(f"Initialized {len(proxy_state.prefillers)} prefill clients and {len(proxy_state.decoders)} decode clients.")
     yield
     for p in proxy_state.prefillers:
@@ -630,7 +794,8 @@ async def send_request_to_service(
     request_id: str,
     max_retries: int = 3,
     base_delay: float = 0.2,
-):
+    preferred_mooncake_segment: str | None = None,
+) -> httpx.Response:
     aborted_requests = proxy_state.acquire_aborted_prefiller_requests(prefiller_id)
     req_data = req_data.copy()
     req_data["kv_transfer_params"] = {
@@ -642,6 +807,10 @@ async def send_request_to_service(
         "remote_port": None,
         "aborted_request": list(aborted_requests),
     }
+    if preferred_mooncake_segment is not None:
+        req_data["kv_transfer_params"]["lmcache.mooncake_preferred_segment"] = (
+            preferred_mooncake_segment
+        )
     req_data["stream"] = False
     req_data["max_tokens"] = 1
     req_data["min_tokens"] = 1
@@ -690,13 +859,17 @@ async def stream_service_response_with_retry(
     request_id: str,
     max_retries: int = 3,
     base_delay: float = 0.2,
-):
+    decoder_dp_rank: int | None = None,
+) -> AsyncIterator[bytes]:
     headers = {
         "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}",
         "X-Request-Id": request_id,
         "Content-Type": "application/json",
     }
+    if decoder_dp_rank is not None:
+        headers["X-data-parallel-rank"] = str(decoder_dp_rank)
     for attempt in range(1, max_retries + 1):
+        first_chunk_sent = False
         try:
             _log_proxy_cold_perf_event(
                 "proxy_decoder_send_start",
@@ -713,12 +886,17 @@ async def stream_service_response_with_retry(
                 headers=headers,
             ) as response:
                 response.raise_for_status()
-                first_chunk_sent = False
                 async for chunk in response.aiter_bytes():
                     first_chunk_sent = True
                     yield chunk
                 return  # Success, exit after streaming
         except (httpx.RequestError, httpx.HTTPStatusError) as e:
+            if first_chunk_sent:
+                logger.error(
+                    "Streaming to client interrupted after response started: %s",
+                    str(e),
+                )
+                return
             if attempt < max_retries:
                 logger.warning(f"Attempt {attempt} failed for streaming {endpoint}: {str(e)}")
                 await asyncio.sleep(base_delay * (2 ** (attempt - 1)))
@@ -727,7 +905,7 @@ async def stream_service_response_with_retry(
                 raise e
         except Exception as e:
             # If any chunk has been sent, do not retry, just log and drop
-            if "first_chunk_sent" in locals() and first_chunk_sent:
+            if first_chunk_sent:
                 logger.error(f"Streaming to client interrupted after response started: {str(e)}")
                 return
             else:
@@ -739,70 +917,122 @@ async def stream_service_response_with_retry(
                     raise e
 
 
-async def _handle_select_instance(api: str, req_data: Any, request_length: int):
+async def _handle_select_instance(
+    api: str, req_data: Any, request_length: int
+) -> "InstanceInfo":
     prefiller_score = proxy_state.calculate_prefill_scores(request_length)
     logger.debug(f"Request length: {request_length}, Prefiller score: {prefiller_score}")
     request_id = await proxy_state.next_req_id()
-    # Select prefiller
-    prefiller_idx = proxy_state.select_prefiller(prefiller_score)
-    prefiller = proxy_state.prefillers[prefiller_idx]
-    # Send request to prefiller
-    response = await send_request_to_service(
-        prefiller.client,
-        prefiller_idx,
-        api,
-        req_data,
-        request_id,
-        max_retries=global_args.max_retries,
-        base_delay=global_args.retry_delay,
-    )
-    _log_proxy_cold_perf_event(
-        "proxy_prefill_response_received",
-        request_id,
-        endpoint=api,
-        prefiller_url=prefiller.url,
-        response_bytes=len(response.content),
-        request_bytes=request_length,
-    )
-    proxy_state.release_prefiller(prefiller_idx, prefiller_score)
-    response_json = response.json()
-    kv_transfer_params = response_json.get("kv_transfer_params", {})
-    if kv_transfer_params:
-        req_data["kv_transfer_params"] = kv_transfer_params
-    # Select decoder
     decoder_score = proxy_state.calculate_decode_scores(request_length)
     logger.debug("Decoder score: %f", decoder_score)
-    # Use the prefiller's kv_transfer_params to select decoder
-    decoder_idx = proxy_state.select_decoder(decoder_score)
-    decoder = proxy_state.decoders[decoder_idx]
-    encode_started = time.perf_counter()
-    decoder_body = _encode_json_payload(req_data)
-    _log_proxy_cold_perf_event(
-        "proxy_decoder_body_encode_complete",
-        request_id,
-        endpoint=api,
-        encode_ms=round((time.perf_counter() - encode_started) * 1000, 3),
-        body_bytes=len(decoder_body),
+    prefiller_idx = None
+    prefiller_active_released = False
+    decoder = None
+    reservation = None
+    placement_enabled = (
+        getattr(proxy_state, "decoder_mooncake_segments", None) is not None
     )
-    _log_proxy_cold_perf_event(
-        "proxy_decoder_dispatch_ready",
-        request_id,
-        endpoint=api,
-        decoder_url=decoder.url,
-        request_bytes=request_length,
-        kv_transfer_param_keys=sorted(str(key) for key in kv_transfer_params),
-    )
-    logger.debug("Using %s %s", prefiller.url, decoder.url)
-    return InstanceInfo(
-        request_id=request_id,
-        prefiller_idx=prefiller_idx,
-        prefiller_score=prefiller_score,
-        prefiller=prefiller,
-        decoder=decoder,
-        decoder_body=decoder_body,
-        decoder_idx=decoder_idx,
-        decoder_score=decoder_score,
-    )
+    try:
+        if placement_enabled:
+            reservation = proxy_state.select_decoder_reservation(decoder_score)
+            decoder = reservation.server
+            _log_proxy_cold_perf_event(
+                "proxy_decoder_placement_reserved",
+                request_id,
+                endpoint=api,
+                decoder_url=decoder.url,
+                decoder_idx=reservation.decoder_idx,
+                dp_rank=reservation.dp_rank,
+                preferred_segment=reservation.preferred_segment,
+                request_bytes=request_length,
+            )
+
+        prefiller_idx = proxy_state.select_prefiller(prefiller_score)
+        prefiller = proxy_state.prefillers[prefiller_idx]
+        response = await send_request_to_service(
+            prefiller.client,
+            prefiller_idx,
+            api,
+            req_data,
+            request_id,
+            max_retries=global_args.max_retries,
+            base_delay=global_args.retry_delay,
+            preferred_mooncake_segment=(
+                reservation.preferred_segment if reservation else None
+            ),
+        )
+        _log_proxy_cold_perf_event(
+            "proxy_prefill_response_received",
+            request_id,
+            endpoint=api,
+            prefiller_url=prefiller.url,
+            response_bytes=len(response.content),
+            request_bytes=request_length,
+        )
+        proxy_state.release_prefiller(prefiller_idx, prefiller_score)
+        prefiller_active_released = True
+        response_json = response.json()
+        returned_kv_transfer_params = response_json.get(
+            "kv_transfer_params", {}
+        )
+        if not isinstance(returned_kv_transfer_params, dict):
+            raise TypeError(
+                "Prefiller kv_transfer_params must be a dictionary"
+            )
+        # The proxy owns transport metadata. Never inherit caller-provided
+        # values, and never send the producer-only placement hint to decode.
+        kv_transfer_params = dict(returned_kv_transfer_params)
+        kv_transfer_params.pop(
+            "lmcache.mooncake_preferred_segment", None
+        )
+        req_data["kv_transfer_params"] = kv_transfer_params
+
+        if not placement_enabled:
+            # Preserve the original selection order when affinity is not configured.
+            decoder_idx = proxy_state.select_decoder(decoder_score)
+            decoder = proxy_state.decoders[decoder_idx]
+            reservation = DecoderReservation(
+                decoder, decoder_idx, decoder_score
+            )
+
+        encode_started = time.perf_counter()
+        decoder_body = _encode_json_payload(req_data)
+        _log_proxy_cold_perf_event(
+            "proxy_decoder_body_encode_complete",
+            request_id,
+            endpoint=api,
+            encode_ms=round((time.perf_counter() - encode_started) * 1000, 3),
+            body_bytes=len(decoder_body),
+        )
+        _log_proxy_cold_perf_event(
+            "proxy_decoder_dispatch_ready",
+            request_id,
+            endpoint=api,
+            decoder_url=decoder.url,
+            request_bytes=request_length,
+            kv_transfer_param_keys=sorted(str(key) for key in kv_transfer_params),
+        )
+        logger.debug("Using %s %s", prefiller.url, decoder.url)
+        return InstanceInfo(
+            request_id=request_id,
+            prefiller_idx=prefiller_idx,
+            prefiller_score=prefiller_score,
+            prefiller=prefiller,
+            decoder=decoder,
+            decoder_body=decoder_body,
+            decoder_idx=reservation.decoder_idx,
+            decoder_score=decoder_score,
+            reservation=reservation,
+        )
+    except BaseException:
+        if reservation is not None:
+            proxy_state.release_decoder_reservation(reservation)
+        if prefiller_idx is not None:
+            if not prefiller_active_released:
+                proxy_state.release_prefiller(prefiller_idx, prefiller_score)
+            proxy_state.abort_prefiller_request(prefiller_idx, request_id)
+            proxy_state.release_prefiller_kv(prefiller_idx, prefiller_score)
+        raise
 
 
 @dataclass
@@ -815,9 +1045,58 @@ class InstanceInfo:
     decoder_score: float
     decoder: ServerState
     decoder_body: bytes
+    reservation: DecoderReservation | None = None
+
+    def __post_init__(self) -> None:
+        if self.reservation is None:
+            self.reservation = DecoderReservation(
+                self.decoder,
+                self.decoder_idx,
+                self.decoder_score,
+            )
 
 
-async def _handle_completions(api: str, request: Request):
+def _release_decoder_reservation(instance_info: InstanceInfo) -> None:
+    reservation = instance_info.reservation
+    if reservation is None:
+        return
+    instance_info.reservation = None
+    proxy_state.release_decoder_reservation(reservation)
+
+
+class _CleanupStreamingResponse(StreamingResponse):
+    """Run request-owned cleanup even if body iteration never starts."""
+
+    def __init__(
+        self,
+        *args: Any,
+        cleanup: Callable[[], None],
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        self._cleanup = cleanup
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            self._cleanup()
+
+
+async def _handle_completions(
+    api: str, request: Request
+) -> StreamingResponse:
+    instance_info = None
+    response_owns_cleanup = False
+    request_count_released = False
+
+    def release_request_count() -> None:
+        nonlocal request_count_released
+        if request_count_released:
+            return
+        proxy_state.request_num -= 1
+        request_count_released = True
+
     try:
         proxy_state.request_num += 1
         req_data = await request.json()
@@ -836,9 +1115,31 @@ async def _handle_completions(api: str, request: Request):
             origin_prompt = ""
         # refer to vLLM sampling_params: max_token default value
         origin_max_tokens = req_data.get("max_tokens", 16)
+        released_kv = False
 
-        async def generate_stream():
-            nonlocal instance_info
+        def cleanup_current_request() -> None:
+            nonlocal released_kv
+            try:
+                if not released_kv:
+                    proxy_state.abort_prefiller_request(
+                        instance_info.prefiller_idx,
+                        instance_info.request_id,
+                    )
+                    proxy_state.release_prefiller_kv(
+                        instance_info.prefiller_idx,
+                        instance_info.prefiller_score,
+                    )
+                    released_kv = True
+            finally:
+                try:
+                    _release_decoder_reservation(instance_info)
+                finally:
+                    # Keep dynamically removed endpoints tainted until the
+                    # response and every request-owned reservation are done.
+                    release_request_count()
+
+        async def generate_stream() -> AsyncIterator[bytes]:
+            nonlocal instance_info, released_kv
             _log_proxy_cold_perf_event(
                 "proxy_decoder_generator_entry",
                 instance_info.request_id,
@@ -847,7 +1148,6 @@ async def _handle_completions(api: str, request: Request):
                 request_bytes=request_length,
             )
             generated_token = ""
-            released_kv = False
             retry_count = 0
             retry = True
             completion_tokens = 0
@@ -862,6 +1162,11 @@ async def _handle_completions(api: str, request: Request):
                         request_id=instance_info.request_id,
                         max_retries=global_args.max_retries,
                         base_delay=global_args.retry_delay,
+                        decoder_dp_rank=(
+                            instance_info.reservation.dp_rank
+                            if instance_info.reservation
+                            else None
+                        ),
                     ):
                         if not released_kv and chunk:
                             proxy_state.release_prefiller_kv(instance_info.prefiller_idx, instance_info.prefiller_score)
@@ -910,7 +1215,9 @@ async def _handle_completions(api: str, request: Request):
                                 req_data["prompt"] = origin_prompt + generated_token
                             req_data["max_tokens"] = origin_max_tokens - completion_tokens + retry_count
                             tmp_request_length = len(json.dumps(req_data).encode("utf-8"))
+                            _release_decoder_reservation(instance_info)
                             instance_info = await _handle_select_instance(api, req_data, tmp_request_length)
+                            released_kv = False
                             break
                         if retry_count > 0 and not stream_flag:
                             if chat_flag:
@@ -925,15 +1232,18 @@ async def _handle_completions(api: str, request: Request):
                     f"the aborted request {instance_info.request_id} will be routing to the target "
                     "prefiller when new request is ready to dispatch to it"
                 )
-                proxy_state.abort_prefiller_request(instance_info.prefiller_idx, instance_info.request_id)
-                proxy_state.release_prefiller_kv(instance_info.prefiller_idx, instance_info.prefiller_score)
-
-            # After streaming done, release tokens
-            proxy_state.release_decoder(instance_info.decoder_idx, instance_info.decoder_score)
+            finally:
+                cleanup_current_request()
 
         # Determine the correct media type based on stream flag
         media_type = "text/event-stream; charset=utf-8" if stream_flag else "application/json"
-        return StreamingResponse(generate_stream(), media_type=media_type)
+        response = _CleanupStreamingResponse(
+            generate_stream(),
+            media_type=media_type,
+            cleanup=cleanup_current_request,
+        )
+        response_owns_cleanup = True
+        return response
     except Exception as e:
         import traceback
 
@@ -943,7 +1253,20 @@ async def _handle_completions(api: str, request: Request):
         print("".join(traceback.format_exception(*exc_info)))
         raise
     finally:
-        proxy_state.request_num -= 1
+        if not response_owns_cleanup:
+            try:
+                if instance_info is not None:
+                    proxy_state.abort_prefiller_request(
+                        instance_info.prefiller_idx,
+                        instance_info.request_id,
+                    )
+                    proxy_state.release_prefiller_kv(
+                        instance_info.prefiller_idx,
+                        instance_info.prefiller_score,
+                    )
+                    _release_decoder_reservation(instance_info)
+            finally:
+                release_request_count()
 
 
 async def _handle_adjust_instances(adjust_mode: str, request: Request):
