@@ -11,6 +11,7 @@ import struct
 import threading
 import time
 import uuid
+from bisect import bisect_right
 from collections import OrderedDict, defaultdict, deque
 from collections.abc import Iterator
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -68,6 +69,7 @@ DONE_RECVING_MSG = b"done_recving_msg"
 SPLIT_DONE_MSG = b"split_done_msg_v2"
 LIVE_SPLIT_CAPABILITY = "ascend_live_split_v2"
 LIVE_SPLIT_COMPACT_CAPABILITY = "ascend_live_split_compact_v1"
+LIVE_SPLIT_LATENT_CPU_CAPABILITY = "ascend_live_split_latent_cpu_v1"
 LIVE_SPLIT_SOURCE_DESCRIPTOR = "ascend_live_split_source_v1"
 MAX_PENDING_SPLIT_REQUESTS = 64
 MAX_TASK_HISTORY_SIZE = 16000
@@ -75,6 +77,17 @@ MAX_SPLIT_TRANSFER_ID_LENGTH = 64
 SPLIT_DONE_MAX_ATTEMPTS = 3
 CONTROL_ACK_MAX_ATTEMPTS = 3
 THREAD_SHUTDOWN_TIMEOUT = 30.0
+MAX_WIRE_INTEGER = (1 << 63) - 1
+
+
+def _wire_int(value: Any, field: str) -> int:
+    """Parse an integer field without silently truncating wire values."""
+    if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
+        raise ValueError(f"{field} must be an integer")
+    parsed = int(value)
+    if not -MAX_WIRE_INTEGER <= parsed <= MAX_WIRE_INTEGER:
+        raise ValueError(f"{field} is outside the supported integer range")
+    return parsed
 
 
 def _cold_live_log(event: str, **fields: Any) -> None:
@@ -171,12 +184,42 @@ class SplitCompactLayout:
 
 
 @dataclass(frozen=True)
+class SplitLatentRun:
+    logical_token_start: int
+    physical_slot_start: int
+    token_count: int
+
+
+@dataclass(frozen=True)
+class SplitLatentPage:
+    logical_token_start: int
+    token_count: int
+    runs: tuple[SplitLatentRun, ...]
+
+
+@dataclass(frozen=True)
+class SplitLatentLayout:
+    group_id: int
+    token_count: int
+    layers: tuple[SplitCompactLayer, ...]
+    pages: tuple[SplitLatentPage, ...]
+
+
+@dataclass(frozen=True)
+class SplitLatentDestinationPage:
+    logical_token_start: int
+    destination_address: int
+    length: int
+
+
+@dataclass(frozen=True)
 class SplitSourceDescriptor:
     segments: tuple[SplitSourceSegment, ...]
     group_byte_totals: tuple[int, int]
     tp_rank: int
     dp_rank: int
     compact_layout: SplitCompactLayout | None = None
+    latent_layout: SplitLatentLayout | None = None
 
 
 @dataclass(frozen=True)
@@ -188,6 +231,8 @@ class SplitTransferPlan:
     requested_groups: tuple[int, ...] = (0, 1)
     compact_source: SplitCompactLayout | None = None
     compact_destination: SplitCompactLayout | None = None
+    latent_source: SplitLatentLayout | None = None
+    latent_destination_pages: tuple[SplitLatentDestinationPage, ...] = ()
 
 
 @dataclass
@@ -569,6 +614,12 @@ class KVCacheRecvingThread(threading.Thread):
         self.kv_caches = kv_caches
         self.kv_caches_base_addr: dict[str, dict[int, list[int]]] = SizedDict()
         self.kv_caches_base_addr[local_engine_id][local_handshake_port] = local_kv_caches_base_addr
+        # The ordinary-transfer base list can intentionally be a subset (for
+        # example, group 1 only).  Keep the complete local registration table
+        # separately for live-split destination ownership validation.
+        self.local_registered_bases: tuple[int, ...] = ()
+        self.local_buffer_sizes: tuple[int, ...] = ()
+        self.local_buffer_group_ids: tuple[int, ...] = ()
         self.ordinary_group_id = ordinary_group_id
         self.remote_te_port: dict[str, dict[int, int]] = SizedDict()
         self.remote_num_blocks: dict[str, dict[int, int]] = SizedDict()
@@ -594,6 +645,7 @@ class KVCacheRecvingThread(threading.Thread):
         self.pending_split_signals: set[Future[Any]] = set()
         self.undelivered_split_signals: set[tuple[str, str | None]] = set()
         self.stop_event = threading.Event()
+        self._accepting_requests = True
 
         self.task_tracker = KVCacheTaskTracker()
 
@@ -663,7 +715,7 @@ class KVCacheRecvingThread(threading.Thread):
                 "split_transfer_id": split_transfer_id,
         }
         with self.request_queue_lock:
-            if self.stop_event.is_set():
+            if not getattr(self, "_accepting_requests", True):
                 return False
             if split_plan is not None:
                 generation = (request_id, split_transfer_id)
@@ -718,12 +770,29 @@ class KVCacheRecvingThread(threading.Thread):
 
     def stop(self) -> None:
         with self.request_queue_lock:
-            if self.stop_event.is_set():
+            if not getattr(self, "_accepting_requests", True):
                 return
-            self.stop_event.set()
+            # Stop admitting/processing new DMA work, but keep the terminal
+            # ACK sender alive until every queued transfer has completed and
+            # its result has been acknowledged.
+            self._accepting_requests = False
             self.request_queue.put(None)
 
+    def wait_for_split_signals(self, timeout: float) -> bool:
+        deadline = time.monotonic() + timeout
+        while True:
+            with self.split_request_lock:
+                if (
+                    not self.pending_split_signals
+                    and not self.undelivered_split_signals
+                ):
+                    return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.01)
+
     def close_resources(self) -> None:
+        self.stop_event.set()
         self.executor.shutdown(wait=True, cancel_futures=False)
         with self.remote_sockets_lock:
             sockets = [
@@ -996,10 +1065,118 @@ class KVCacheRecvingThread(threading.Thread):
             else:
                 self.reformat_kv_cache(grouped_local_block_ids, tp_num_need_pulls, need_cat_cache, need_nz_cache)
 
+    def _validate_local_compact_destination(
+        self, layout: SplitCompactLayout
+    ) -> None:
+        if not (
+            self.local_registered_bases
+            and len(self.local_registered_bases)
+            == len(self.local_buffer_sizes)
+            == len(self.local_buffer_group_ids)
+        ):
+            raise RuntimeError("Local split destination registry is incomplete")
+        expected = tuple(
+            (base, size)
+            for base, size, group in zip(
+                self.local_registered_bases,
+                self.local_buffer_sizes,
+                self.local_buffer_group_ids,
+                strict=True,
+            )
+            if group == layout.group_id
+        )
+        if len(layout.layers) != len(expected):
+            raise RuntimeError("Compact split destination layers are incomplete")
+        for layer, (base, size) in zip(layout.layers, expected, strict=True):
+            if (
+                layer.buffer_base != base
+                or layer.slot_capacity * layer.token_bytes > size
+            ):
+                raise RuntimeError(
+                    "Compact split destination is outside registered KV"
+                )
+
+    @staticmethod
+    def _validate_remote_compact_source(
+        layout: SplitCompactLayout | SplitLatentLayout,
+        remote_bases: list[int],
+        remote_sizes: tuple[int, ...],
+        remote_groups: tuple[int, ...],
+    ) -> None:
+        expected_indices = tuple(
+            index
+            for index, group in enumerate(remote_groups)
+            if group == layout.group_id
+        )
+        if len(layout.layers) != len(expected_indices):
+            raise RuntimeError("Compact split source layers are incomplete")
+        for layer, index in zip(
+            layout.layers, expected_indices, strict=True
+        ):
+            if (
+                layer.buffer_index != index
+                or layer.buffer_base != remote_bases[index]
+                or layer.slot_capacity * layer.token_bytes
+                > remote_sizes[index]
+            ):
+                raise RuntimeError(
+                    "Compact split source is outside registered KV"
+                )
+
     def _transfer_split_destinations(
         self, req_meta: dict[str, Any], plan: SplitTransferPlan
     ) -> None:
+        transfer_started = time.perf_counter()
         compact = plan.compact_source is not None
+        latent = plan.latent_source is not None
+        if plan.tp_rank != self.tp_rank or plan.dp_rank != self.vllm_config.parallel_config.data_parallel_rank_local:
+            raise RuntimeError("Split destination TP/DP rank mismatch")
+        requested_groups = set(plan.requested_groups)
+        if not requested_groups or not requested_groups.issubset({0, 1}):
+            raise RuntimeError("Split destination requested groups are invalid")
+        if compact:
+            if plan.compact_destination is None:
+                raise RuntimeError("Compact split destination layout is missing")
+            self._validate_local_compact_destination(
+                plan.compact_destination
+            )
+            assert plan.compact_source is not None
+            estimated_vectors = len(plan.compact_source.layers) * max(
+                0,
+                len(plan.compact_source.runs)
+                + len(plan.compact_destination.runs),
+            )
+            if latent:
+                assert plan.latent_source is not None
+                estimated_vectors += len(plan.latent_source.layers) * sum(
+                    len(page.runs) for page in plan.latent_source.pages
+                )
+            if estimated_vectors > 1_000_000:
+                raise RuntimeError("Expanded compact split plan is too large")
+        registration_regions: list[tuple[int, int]] = []
+        if compact and not latent:
+            assert plan.compact_destination is not None
+            registration_regions.extend(
+                (
+                    layer.buffer_base,
+                    layer.slot_capacity * layer.token_bytes,
+                )
+                for layer in plan.compact_destination.layers
+            )
+        if latent:
+            registration_regions.extend(
+                (page.destination_address, page.length)
+                for page in plan.latent_destination_pages
+            )
+            page_ranges = sorted(
+                (address, address + length)
+                for address, length in registration_regions
+            )
+            if any(
+                left[1] > right[0]
+                for left, right in zip(page_ranges, page_ranges[1:])
+            ):
+                raise RuntimeError("Latent destination pages overlap")
         compact_source_runs = (
             len(plan.compact_source.runs) if plan.compact_source is not None else 0
         )
@@ -1007,8 +1184,65 @@ class KVCacheRecvingThread(threading.Thread):
             len(plan.compact_destination.runs)
             if plan.compact_destination is not None else 0
         )
-        if plan.compact_source is not None or plan.compact_destination is not None:
+        latent_layer_count = (
+            len(plan.latent_source.layers)
+            if plan.latent_source is not None else 0
+        )
+        latent_page_count = (
+            len(plan.latent_destination_pages)
+            if plan.latent_source is not None else 0
+        )
+        remote_host = req_meta["remote_host"]
+        remote_port = req_meta["remote_handshake_port"]
+        remote_engine_id = req_meta["remote_engine_id"]
+        if (
+            remote_engine_id not in self.kv_caches_base_addr
+            or remote_port not in self.kv_caches_base_addr[remote_engine_id]
+        ):
+            self._get_remote_metadata(remote_host, remote_port)
+        capabilities = getattr(self, "remote_capabilities", {}).get(
+            (remote_engine_id, remote_port), ()
+        )
+        if LIVE_SPLIT_CAPABILITY not in capabilities:
+            raise RuntimeError("Remote Mooncake peer lacks live split capability")
+        if compact and LIVE_SPLIT_COMPACT_CAPABILITY not in capabilities:
+            raise RuntimeError("Remote Mooncake peer lacks compact split capability")
+        if latent and LIVE_SPLIT_LATENT_CPU_CAPABILITY not in capabilities:
+            raise RuntimeError("Remote Mooncake peer lacks latent CPU capability")
+        remote_bases = self.kv_caches_base_addr[remote_engine_id][remote_port]
+        remote_sizes = self.remote_buffer_sizes[remote_engine_id][remote_port]
+        remote_groups = self.remote_buffer_group_ids[remote_engine_id][remote_port]
+        if len(remote_sizes) != len(remote_bases):
+            raise RuntimeError(
+                "Remote peer omitted registered source buffer sizes"
+            )
+        if len(remote_groups) != len(remote_bases):
+            raise RuntimeError(
+                "Remote peer omitted registered source buffer groups"
+            )
+        if compact:
+            assert plan.compact_source is not None
+            self._validate_remote_compact_source(
+                plan.compact_source,
+                remote_bases,
+                remote_sizes,
+                remote_groups,
+            )
+            if latent:
+                assert plan.latent_source is not None
+                self._validate_remote_compact_source(
+                    plan.latent_source,
+                    remote_bases,
+                    remote_sizes,
+                    remote_groups,
+                )
+        if (
+            plan.compact_source is not None
+            or plan.compact_destination is not None
+            or latent
+        ):
             plan = self._expand_compact_split_plan(plan)
+        expanded_at = time.perf_counter()
         _cold_live_log(
             "live_source_native_transfer_entry",
             req_id=req_meta.get("request_id"),
@@ -1019,12 +1253,10 @@ class KVCacheRecvingThread(threading.Thread):
             compact=compact,
             compact_source_runs=compact_source_runs,
             compact_destination_runs=compact_destination_runs,
+            latent=latent,
+            latent_layer_count=latent_layer_count,
+            latent_page_count=latent_page_count,
         )
-        if plan.tp_rank != self.tp_rank or plan.dp_rank != self.vllm_config.parallel_config.data_parallel_rank_local:
-            raise RuntimeError("Split destination TP/DP rank mismatch")
-        requested_groups = set(plan.requested_groups)
-        if not requested_groups or not requested_groups.issubset({0, 1}):
-            raise RuntimeError("Split destination requested groups are invalid")
         totals = [0, 0]
         destinations: dict[str, list[tuple[int, int]]] = {
             "cpu": [],
@@ -1041,16 +1273,60 @@ class KVCacheRecvingThread(threading.Thread):
             if segment.length <= 0 or segment.source_offset < 0 or segment.destination_address <= 0:
                 raise RuntimeError("Invalid split destination extent")
             totals[segment.group_id] += segment.length
-            destinations[segment.destination_kind].append(
-                (
-                    segment.destination_address,
-                    segment.destination_address + segment.length,
+            if not compact:
+                destinations[segment.destination_kind].append(
+                    (
+                        segment.destination_address,
+                        segment.destination_address + segment.length,
+                    )
                 )
+        if not compact:
+            for ranges in destinations.values():
+                ranges.sort()
+                if any(
+                    left[1] > right[0]
+                    for left, right in zip(ranges, ranges[1:])
+                ):
+                    raise RuntimeError("Split destination extents overlap")
+        if not compact and destinations["npu"] and not (
+            self.local_registered_bases
+            and self.local_buffer_sizes
+            and self.local_buffer_group_ids
+        ):
+            raise RuntimeError("Local split destination registry is unavailable")
+        if not compact and (
+            self.local_registered_bases
+            or self.local_buffer_sizes
+            or self.local_buffer_group_ids
+        ):
+            if not (
+                len(self.local_registered_bases)
+                == len(self.local_buffer_sizes)
+                == len(self.local_buffer_group_ids)
+            ):
+                raise RuntimeError("Local split destination registry is incomplete")
+            local_group1 = sorted(
+                (base, size)
+                for base, size, group in zip(
+                    self.local_registered_bases,
+                    self.local_buffer_sizes,
+                    self.local_buffer_group_ids,
+                    strict=True,
+                )
+                if group == 1
             )
-        for ranges in destinations.values():
-            ranges.sort()
-            if any(left[1] > right[0] for left, right in zip(ranges, ranges[1:])):
-                raise RuntimeError("Split destination extents overlap")
+            local_group1_starts = tuple(base for base, _ in local_group1)
+            for start, end in destinations["npu"]:
+                owner_index = bisect_right(local_group1_starts, start) - 1
+                if owner_index < 0:
+                    raise RuntimeError(
+                        "Split NPU destination is outside registered group-1 KV"
+                    )
+                base, size = local_group1[owner_index]
+                if end > base + size:
+                    raise RuntimeError(
+                        "Split NPU destination is outside registered group-1 KV"
+                    )
         if tuple(totals) != plan.group_byte_totals:
             raise RuntimeError(
                 f"Split destination byte totals mismatch: {tuple(totals)} != {plan.group_byte_totals}"
@@ -1061,45 +1337,19 @@ class KVCacheRecvingThread(threading.Thread):
             if group_id not in requested_groups and total != 0:
                 raise RuntimeError("Unrequested split groups must have zero bytes")
 
-        remote_host = req_meta["remote_host"]
-        remote_port = req_meta["remote_handshake_port"]
-        remote_engine_id = req_meta["remote_engine_id"]
-        if (
-            remote_engine_id not in self.kv_caches_base_addr
-            or remote_port not in self.kv_caches_base_addr[remote_engine_id]
-        ):
-            self._get_remote_metadata(remote_host, remote_port)
-        capabilities = getattr(self, "remote_capabilities", {}).get(
-            (remote_engine_id, remote_port), ())
-        if LIVE_SPLIT_CAPABILITY not in capabilities:
-            raise RuntimeError("Remote Mooncake peer lacks live split capability")
-        if compact and LIVE_SPLIT_COMPACT_CAPABILITY not in capabilities:
-            raise RuntimeError("Remote Mooncake peer lacks compact split capability")
-        remote_bases = self.kv_caches_base_addr[remote_engine_id][remote_port]
-        remote_sizes = self.remote_buffer_sizes[remote_engine_id][remote_port]
-        remote_groups = self.remote_buffer_group_ids[remote_engine_id][remote_port]
-        if compact and len(plan.segments) > 1_000_000:
-            raise RuntimeError("Expanded compact split plan is too large")
-        if len(remote_sizes) != len(remote_bases):
-            raise RuntimeError(
-                "Remote peer omitted registered source buffer sizes"
-            )
-        if len(remote_groups) != len(remote_bases):
-            raise RuntimeError(
-                "Remote peer omitted registered source buffer groups"
-            )
-        for segment in plan.segments:
-            if not 0 <= segment.source_buffer_index < len(remote_bases):
-                raise RuntimeError("Split source buffer index is out of range")
-            if segment.source_buffer_base != remote_bases[
-                segment.source_buffer_index
-            ]:
-                raise RuntimeError("Split source buffer identity mismatch")
-            if remote_groups[segment.source_buffer_index] != segment.group_id:
-                raise RuntimeError("Split source buffer group mismatch")
-            source_size = remote_sizes[segment.source_buffer_index]
-            if segment.source_offset + segment.length > source_size:
-                raise RuntimeError("Split source extent exceeds registered KV buffer")
+        if not compact:
+            for segment in plan.segments:
+                if not 0 <= segment.source_buffer_index < len(remote_bases):
+                    raise RuntimeError("Split source buffer index is out of range")
+                if segment.source_buffer_base != remote_bases[
+                    segment.source_buffer_index
+                ]:
+                    raise RuntimeError("Split source buffer identity mismatch")
+                if remote_groups[segment.source_buffer_index] != segment.group_id:
+                    raise RuntimeError("Split source buffer group mismatch")
+                source_size = remote_sizes[segment.source_buffer_index]
+                if segment.source_offset + segment.length > source_size:
+                    raise RuntimeError("Split source extent exceeds registered KV buffer")
         session_id = f"{remote_host}:{self.remote_te_port[remote_engine_id][remote_port]}"
         local_destinations = [segment.destination_address for segment in plan.segments]
         remote_sources = [
@@ -1107,18 +1357,47 @@ class KVCacheRecvingThread(threading.Thread):
             for segment in plan.segments
         ]
         lengths = [segment.length for segment in plan.segments]
-        with global_te.temporary_registration(local_destinations, lengths):
+        if not registration_regions:
+            registration_regions = list(zip(local_destinations, lengths))
+        registration_ptrs, registration_sizes = map(
+            list, zip(*registration_regions, strict=True)
+        )
+        with global_te.temporary_registration(
+            registration_ptrs,
+            registration_sizes,
+            require_existing=latent,
+            adopted_only=latent,
+        ):
+            registered_at = time.perf_counter()
             ret = self.engine.batch_transfer_sync_read(
                 session_id, local_destinations, remote_sources, lengths)
+            native_done_at = time.perf_counter()
+        released_at = time.perf_counter()
         if ret < 0:
             raise RuntimeError(f"Mooncake split transfer failed, ret: {ret}")
+        _cold_live_log(
+            "live_source_native_transfer_complete",
+            req_id=req_meta.get("request_id"),
+            transfer_id=req_meta.get("split_transfer_id"),
+            vector_count=len(lengths),
+            registration_region_count=len(registration_regions),
+            expand_ms=round((expanded_at - transfer_started) * 1000, 3),
+            registration_ms=round((registered_at - expanded_at) * 1000, 3),
+            native_ms=round((native_done_at - registered_at) * 1000, 3),
+            unregister_ms=round((released_at - native_done_at) * 1000, 3),
+            elapsed_ms=round((released_at - transfer_started) * 1000, 3),
+        )
 
     @staticmethod
     def _expand_compact_split_plan(
         plan: SplitTransferPlan,
     ) -> SplitTransferPlan:
         source, destination = plan.compact_source, plan.compact_destination
-        if source is None or destination is None or plan.requested_groups != (1,):
+        if (
+            source is None
+            or destination is None
+            or plan.requested_groups not in ((1,), (0, 1))
+        ):
             raise RuntimeError("Incomplete compact split transfer plan")
         if any(layer.buffer_index < 0 for layer in source.layers):
             raise RuntimeError("Compact split source buffer is unresolved")
@@ -1131,6 +1410,45 @@ class KVCacheRecvingThread(threading.Thread):
         ):
             raise RuntimeError("Compact split layer sets differ")
         segments: list[SplitTransferSegment] = []
+        if 0 in plan.requested_groups:
+            latent = plan.latent_source
+            pages = plan.latent_destination_pages
+            if latent is None or len(pages) != len(latent.pages):
+                raise RuntimeError("Incomplete latent CPU split transfer plan")
+            if any(layer.buffer_index < 0 for layer in latent.layers):
+                raise RuntimeError("Latent split source buffer is unresolved")
+            for source_page, destination_page in zip(latent.pages, pages):
+                destination_offset = 0
+                for layer in latent.layers:
+                    for run in source_page.runs:
+                        logical_offset = (
+                            run.logical_token_start
+                            - source_page.logical_token_start
+                        )
+                        if logical_offset < 0:
+                            raise RuntimeError("Latent run precedes its page")
+                        length = run.token_count * layer.token_bytes
+                        segments.append(SplitTransferSegment(
+                            group_id=0,
+                            source_buffer_index=layer.buffer_index,
+                            source_buffer_base=layer.buffer_base,
+                            source_offset=(run.physical_slot_start
+                                           * layer.token_bytes),
+                            destination_address=(
+                                destination_page.destination_address
+                                + destination_offset
+                                + logical_offset * layer.token_bytes
+                            ),
+                            length=length,
+                            destination_kind="cpu",
+                        ))
+                    destination_offset += (
+                        source_page.token_count * layer.token_bytes
+                    )
+                if destination_offset != destination_page.length:
+                    raise RuntimeError(
+                        "Expanded latent destination page byte total differs"
+                    )
         src_pos = dst_pos = src_offset = dst_offset = 0
         while src_pos < len(source.runs) and dst_pos < len(destination.runs):
             src_run, dst_run = source.runs[src_pos], destination.runs[dst_pos]
@@ -1169,8 +1487,13 @@ class KVCacheRecvingThread(threading.Thread):
                 dst_offset = 0
         if src_pos != len(source.runs) or dst_pos != len(destination.runs):
             raise RuntimeError("Compact split run coverage differs")
-        if sum(segment.length for segment in segments) != plan.group_byte_totals[1]:
-            raise RuntimeError("Expanded compact split byte total differs")
+        totals = tuple(
+            sum(segment.length for segment in segments
+                if segment.group_id == group_id)
+            for group_id in range(2)
+        )
+        if totals != plan.group_byte_totals:
+            raise RuntimeError("Expanded compact split byte totals differ")
         return SplitTransferPlan(
             segments=tuple(segments),
             group_byte_totals=plan.group_byte_totals,
@@ -1482,13 +1805,22 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
         kv_transfer_params: dict[str, Any],
     ):
         split_plan_data = kv_transfer_params.get(LIVE_SPLIT_CAPABILITY)
-        split_plan = self._parse_split_plan(split_plan_data)
         split_source_invalid = False
+        try:
+            split_plan = self._parse_split_plan(split_plan_data)
+        except (KeyError, OverflowError, TypeError, ValueError):
+            logger.warning(
+                "Invalid eager live-split destination plan for request %s; "
+                "using persistent fallback",
+                request_id,
+            )
+            split_plan = None
+            split_source_invalid = True
         try:
             split_source = self._parse_source_descriptor(
                 kv_transfer_params.get(LIVE_SPLIT_SOURCE_DESCRIPTOR)
             )
-        except (KeyError, TypeError, ValueError):
+        except (AttributeError, KeyError, OverflowError, TypeError, ValueError):
             logger.warning(
                 "Invalid prefiller live-split source descriptor for request "
                 "%s; using persistent fallback",
@@ -1548,10 +1880,47 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
         if not isinstance(layout, dict):
             raise ValueError("Compact split layout must be a mapping")
         parsed = SplitCompactLayout(
-            group_id=int(layout["group_id"]),
-            token_count=int(layout["token_count"]),
-            layers=tuple(SplitCompactLayer(**layer) for layer in layout["layers"]),
-            runs=tuple(SplitCompactRun(**run) for run in layout["runs"]),
+            group_id=_wire_int(layout["group_id"], "compact.group_id"),
+            token_count=_wire_int(
+                layout["token_count"], "compact.token_count"
+            ),
+            layers=tuple(
+                SplitCompactLayer(
+                    layer_id=_wire_int(
+                        layer["layer_id"], "compact.layer_id"
+                    ),
+                    buffer_base=_wire_int(
+                        layer["buffer_base"], "compact.buffer_base"
+                    ),
+                    token_bytes=_wire_int(
+                        layer["token_bytes"], "compact.token_bytes"
+                    ),
+                    slot_capacity=_wire_int(
+                        layer["slot_capacity"], "compact.slot_capacity"
+                    ),
+                    buffer_index=_wire_int(
+                        layer.get("buffer_index", -1),
+                        "compact.buffer_index",
+                    ),
+                )
+                for layer in layout["layers"]
+            ),
+            runs=tuple(
+                SplitCompactRun(
+                    logical_token_start=_wire_int(
+                        run["logical_token_start"],
+                        "compact.logical_token_start",
+                    ),
+                    physical_slot_start=_wire_int(
+                        run["physical_slot_start"],
+                        "compact.physical_slot_start",
+                    ),
+                    token_count=_wire_int(
+                        run["token_count"], "compact.run_token_count"
+                    ),
+                )
+                for run in layout["runs"]
+            ),
         )
         if (
             parsed.group_id != 1
@@ -1595,6 +1964,149 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
         return parsed
 
     @staticmethod
+    def _parse_latent_layout(layout: Any) -> SplitLatentLayout | None:
+        if layout is None:
+            return None
+        if not isinstance(layout, dict):
+            raise ValueError("Latent split layout must be a mapping")
+        pages = tuple(
+            SplitLatentPage(
+                logical_token_start=_wire_int(
+                    page["logical_token_start"],
+                    "latent.logical_token_start",
+                ),
+                token_count=_wire_int(
+                    page["token_count"], "latent.page_token_count"
+                ),
+                runs=tuple(
+                    SplitLatentRun(
+                        logical_token_start=_wire_int(
+                            run["logical_token_start"],
+                            "latent.run_logical_token_start",
+                        ),
+                        physical_slot_start=_wire_int(
+                            run["physical_slot_start"],
+                            "latent.physical_slot_start",
+                        ),
+                        token_count=_wire_int(
+                            run["token_count"],
+                            "latent.run_token_count",
+                        ),
+                    )
+                    for run in page["runs"]
+                ),
+            )
+            for page in layout["pages"]
+        )
+        parsed = SplitLatentLayout(
+            group_id=_wire_int(layout["group_id"], "latent.group_id"),
+            token_count=_wire_int(
+                layout["token_count"], "latent.token_count"
+            ),
+            layers=tuple(
+                SplitCompactLayer(
+                    layer_id=_wire_int(
+                        layer["layer_id"], "latent.layer_id"
+                    ),
+                    buffer_base=_wire_int(
+                        layer["buffer_base"], "latent.buffer_base"
+                    ),
+                    token_bytes=_wire_int(
+                        layer["token_bytes"], "latent.token_bytes"
+                    ),
+                    slot_capacity=_wire_int(
+                        layer["slot_capacity"], "latent.slot_capacity"
+                    ),
+                    buffer_index=_wire_int(
+                        layer.get("buffer_index", -1),
+                        "latent.buffer_index",
+                    ),
+                )
+                for layer in layout["layers"]
+            ),
+            pages=pages,
+        )
+        if (
+            parsed.group_id != 0
+            or parsed.token_count <= 0
+            or not parsed.layers
+            or len(parsed.layers) > 4096
+            or not parsed.pages
+            or sum(len(page.runs) for page in parsed.pages) > 1_000_000
+        ):
+            raise ValueError("Invalid latent split layout")
+        layer_ids = [layer.layer_id for layer in parsed.layers]
+        if layer_ids != list(range(len(parsed.layers))):
+            raise ValueError("Latent split layers must be complete and ordered")
+        if any(
+            layer.buffer_base <= 0
+            or layer.token_bytes <= 0
+            or layer.slot_capacity <= 0
+            for layer in parsed.layers
+        ):
+            raise ValueError("Invalid latent split layer")
+        capacity = min(layer.slot_capacity for layer in parsed.layers)
+        logical = 0
+        for page in parsed.pages:
+            if (
+                page.logical_token_start != logical
+                or page.token_count <= 0
+                or not page.runs
+            ):
+                raise ValueError("Invalid latent split page coverage")
+            page_logical = logical
+            for run in page.runs:
+                if (
+                    run.logical_token_start != page_logical
+                    or run.physical_slot_start < 0
+                    or run.token_count <= 0
+                    or run.physical_slot_start + run.token_count > capacity
+                ):
+                    raise ValueError("Invalid latent split run coverage")
+                page_logical += run.token_count
+            if page_logical != logical + page.token_count:
+                raise ValueError("Latent split runs do not cover their page")
+            logical += page.token_count
+        if logical != parsed.token_count:
+            raise ValueError("Latent split pages do not cover all tokens")
+        physical = sorted(
+            (
+                run.physical_slot_start,
+                run.physical_slot_start + run.token_count,
+            )
+            for page in parsed.pages
+            for run in page.runs
+        )
+        if any(
+            left[1] > right[0]
+            for left, right in zip(physical, physical[1:])
+        ):
+            raise ValueError("Latent split physical slots overlap")
+        return parsed
+
+    @staticmethod
+    def _source_group_byte_totals(
+        raw: dict[str, Any],
+        latent_layout: SplitLatentLayout | None,
+    ) -> tuple[int, ...]:
+        """Promote an optional latent extension after base-schema parsing."""
+        base_totals = tuple(
+            _wire_int(value, "source.group_byte_total")
+            for value in raw["group_byte_totals"]
+        )
+        if latent_layout is None or "latent_group_byte_total" not in raw:
+            return base_totals
+        if len(base_totals) != 2 or int(base_totals[0]) != 0:
+            raise ValueError("Latent extension requires group-1 base totals")
+        return (
+            _wire_int(
+                raw["latent_group_byte_total"],
+                "source.latent_group_byte_total",
+            ),
+            base_totals[1],
+        )
+
+    @staticmethod
     def _parse_source_descriptor(
         descriptor: Any,
     ) -> tuple[SplitSourceDescriptor, ...] | None:
@@ -1606,23 +2118,50 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
             raise ValueError("Live split source descriptor must be a mapping")
         else:
             raw_descriptors = descriptor.get("descriptors", (descriptor,))
-            descriptors = tuple(
-                SplitSourceDescriptor(
+            parsed_descriptors = []
+            for raw in raw_descriptors:
+                latent_layout = MooncakeConnectorMetadata._parse_latent_layout(
+                    raw.get("latent_layout")
+                )
+                parsed_descriptors.append(SplitSourceDescriptor(
                     segments=tuple(
-                        SplitSourceSegment(**segment)
+                        SplitSourceSegment(
+                            group_id=_wire_int(
+                                segment["group_id"], "source.group_id"
+                            ),
+                            source_buffer_index=_wire_int(
+                                segment["source_buffer_index"],
+                                "source.buffer_index",
+                            ),
+                            source_buffer_base=_wire_int(
+                                segment["source_buffer_base"],
+                                "source.buffer_base",
+                            ),
+                            source_offset=_wire_int(
+                                segment["source_offset"],
+                                "source.offset",
+                            ),
+                            length=_wire_int(
+                                segment["length"], "source.length"
+                            ),
+                        )
                         for segment in raw.get("segments", ())
                     ),
-                    group_byte_totals=tuple(raw["group_byte_totals"]),
-                    tp_rank=int(raw["tp_rank"]),
-                    dp_rank=int(raw["dp_rank"]),
+                    group_byte_totals=(
+                        MooncakeConnectorMetadata._source_group_byte_totals(
+                            raw, latent_layout
+                        )
+                    ),
+                    tp_rank=_wire_int(raw["tp_rank"], "source.tp_rank"),
+                    dp_rank=_wire_int(raw["dp_rank"], "source.dp_rank"),
                     compact_layout=(
                         MooncakeConnectorMetadata._parse_compact_layout(
                             raw.get("compact_layout")
                         )
                     ),
-                )
-                for raw in raw_descriptors
-            )
+                    latent_layout=latent_layout,
+                ))
+            descriptors = tuple(parsed_descriptors)
         identities: set[tuple[int, int]] = set()
         for parsed in descriptors:
             if len(parsed.group_byte_totals) != 2:
@@ -1650,6 +2189,16 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
                 totals[1] += parsed.compact_layout.token_count * sum(
                     layer.token_bytes for layer in parsed.compact_layout.layers
                 )
+            if parsed.latent_layout is not None:
+                if any(
+                    layer.buffer_index < 0
+                    for layer in parsed.latent_layout.layers
+                ):
+                    raise ValueError("Latent split source buffer is unresolved")
+                latent_total = parsed.latent_layout.token_count * sum(
+                    layer.token_bytes for layer in parsed.latent_layout.layers
+                )
+                totals[0] += latent_total
             if tuple(totals) != parsed.group_byte_totals:
                 raise ValueError("Live split source byte totals mismatch")
         return descriptors
@@ -1663,9 +2212,22 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
     ) -> SplitTransferPlan:
         if not isinstance(plan, dict):
             raise ValueError("Live split destination plan must be a mapping")
-        dest_totals = tuple(plan["group_byte_totals"])
+        dest_totals = tuple(
+            _wire_int(value, "destination.group_byte_total")
+            for value in plan["group_byte_totals"]
+        )
+        requested_group_values = tuple(
+            _wire_int(value, "destination.requested_group")
+            for value in plan.get("requested_groups", (0, 1))
+        )
+        if (
+            len(set(requested_group_values)) != len(requested_group_values)
+            or not set(requested_group_values).issubset({0, 1})
+        ):
+            raise ValueError("Destination requested groups are invalid")
         requested_groups = tuple(
-            group for group in plan.get("requested_groups", (0, 1))
+            group
+            for group in requested_group_values
             if group in supported_groups
         )
         if (
@@ -1687,7 +2249,8 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
                 "source/destination byte totals differ "
                 f"(source, destination)={mismatched_totals}"
             )
-        tp_rank, dp_rank = int(plan["tp_rank"]), int(plan["dp_rank"])
+        tp_rank = _wire_int(plan["tp_rank"], "destination.tp_rank")
+        dp_rank = _wire_int(plan["dp_rank"], "destination.dp_rank")
         if (tp_rank, dp_rank) != (source.tp_rank, source.dp_rank):
             raise ValueError(
                 "source/destination ranks differ: "
@@ -1697,9 +2260,76 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
         compact_destination = cls._parse_compact_layout(
             plan.get("compact_layout")
         )
+        latent_destination_segments = tuple(plan.get("latent_pages", ()))
+        hybrid = 0 in requested_groups
+        latent_pages: tuple[SplitLatentDestinationPage, ...] = ()
+        if hybrid:
+            try:
+                destination_plane_widths = tuple(
+                    _wire_int(width, "destination.latent_token_bytes")
+                    for width in plan["latent_token_bytes"]
+                )
+            except (KeyError, TypeError, ValueError):
+                destination_plane_widths = ()
+            source_plane_widths = tuple(
+                layer.token_bytes for layer in source.latent_layout.layers
+            ) if source.latent_layout is not None else ()
+            if (
+                requested_groups != (0, 1)
+                or source.latent_layout is None
+                or not latent_destination_segments
+                or destination_plane_widths != source_plane_widths
+                or any(
+                    _wire_int(
+                        segment["length"], "destination.latent_page_length"
+                    ) <= 0
+                    or _wire_int(
+                        segment["destination_address"],
+                        "destination.latent_page_address",
+                    ) <= 0
+                    for segment in latent_destination_segments
+                )
+            ):
+                raise ValueError("Incomplete latent CPU split plan")
+            page_bytes = sum(destination_plane_widths)
+            if len(latent_destination_segments) != len(source.latent_layout.pages):
+                raise ValueError("Latent source/destination page counts differ")
+            latent_pages = tuple(
+                SplitLatentDestinationPage(
+                    logical_token_start=_wire_int(
+                        segment["logical_token_start"],
+                        "destination.latent_page_logical_start",
+                    ),
+                    destination_address=_wire_int(
+                        segment["destination_address"],
+                        "destination.latent_page_address",
+                    ),
+                    length=_wire_int(
+                        segment["length"],
+                        "destination.latent_page_length",
+                    ),
+                )
+                for segment in latent_destination_segments
+            )
+            if any(
+                destination.length != source_page.token_count * page_bytes
+                or destination.logical_token_start
+                != source_page.logical_token_start
+                or _wire_int(
+                    raw_page.get("valid_tokens", -1),
+                    "destination.latent_page_valid_tokens",
+                )
+                != source_page.token_count
+                for destination, source_page, raw_page in zip(
+                    latent_pages,
+                    source.latent_layout.pages,
+                    latent_destination_segments,
+                )
+            ):
+                raise ValueError("Latent destination page byte lengths differ")
         if source.compact_layout is not None or compact_destination is not None:
             if (
-                requested_groups != (1,)
+                requested_groups not in ((1,), (0, 1))
                 or source.compact_layout is None
                 or compact_destination is None
                 or source.compact_layout.token_count
@@ -1718,22 +2348,35 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
                 raise ValueError("Compact source/destination token widths differ")
             return SplitTransferPlan(
                 segments=(),
-                group_byte_totals=(0, source.group_byte_totals[1]),
+                group_byte_totals=tuple(
+                    source.group_byte_totals[group]
+                    if group in requested_groups else 0
+                    for group in range(2)
+                ),
                 tp_rank=tp_rank,
                 dp_rank=dp_rank,
-                requested_groups=(1,),
+                requested_groups=requested_groups,
                 compact_source=source.compact_layout,
                 compact_destination=compact_destination,
+                latent_source=source.latent_layout if hybrid else None,
+                latent_destination_pages=latent_pages if hybrid else (),
             )
         destinations = plan["segments"]
         merged: list[SplitTransferSegment] = []
         for group_id in requested_groups:
             sources = [s for s in source.segments if s.group_id == group_id]
-            dests = [d for d in destinations if int(d["group_id"]) == group_id]
+            dests = [
+                d
+                for d in destinations
+                if _wire_int(d["group_id"], "destination.group_id")
+                == group_id
+            ]
             source_pos = dest_pos = source_offset = dest_offset = 0
             while source_pos < len(sources) and dest_pos < len(dests):
                 src, dst = sources[source_pos], dests[dest_pos]
-                dst_length = int(dst["length"])
+                dst_length = _wire_int(
+                    dst["length"], "destination.length"
+                )
                 length = min(src.length - source_offset,
                              dst_length - dest_offset)
                 if length <= 0:
@@ -1742,7 +2385,10 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
                     group_id=group_id,
                     source_buffer_index=src.source_buffer_index,
                     source_offset=src.source_offset + source_offset,
-                    destination_address=int(dst["destination_address"])
+                    destination_address=_wire_int(
+                        dst["destination_address"],
+                        "destination.address",
+                    )
                     + dest_offset,
                     length=length,
                     destination_kind=str(dst["destination_kind"]),
@@ -1784,15 +2430,46 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
             raise ValueError("Live split destination plan must be a mapping")
         else:
             segments = tuple(
-                SplitTransferSegment(**segment)
+                SplitTransferSegment(
+                    group_id=_wire_int(
+                        segment["group_id"], "plan.group_id"
+                    ),
+                    source_buffer_index=_wire_int(
+                        segment["source_buffer_index"],
+                        "plan.source_buffer_index",
+                    ),
+                    source_offset=_wire_int(
+                        segment["source_offset"], "plan.source_offset"
+                    ),
+                    destination_address=_wire_int(
+                        segment["destination_address"],
+                        "plan.destination_address",
+                    ),
+                    length=_wire_int(segment["length"], "plan.length"),
+                    destination_kind=str(segment["destination_kind"]),
+                    source_buffer_base=(
+                        None
+                        if segment.get("source_buffer_base") is None
+                        else _wire_int(
+                            segment["source_buffer_base"],
+                            "plan.source_buffer_base",
+                        )
+                    ),
+                )
                 for segment in plan.get("segments", ())
             )
             parsed = SplitTransferPlan(
                 segments=segments,
-                group_byte_totals=tuple(plan["group_byte_totals"]),
-                tp_rank=int(plan["tp_rank"]),
-                dp_rank=int(plan["dp_rank"]),
-                requested_groups=tuple(plan.get("requested_groups", (0, 1))),
+                group_byte_totals=tuple(
+                    _wire_int(value, "plan.group_byte_total")
+                    for value in plan["group_byte_totals"]
+                ),
+                tp_rank=_wire_int(plan["tp_rank"], "plan.tp_rank"),
+                dp_rank=_wire_int(plan["dp_rank"], "plan.dp_rank"),
+                requested_groups=tuple(
+                    _wire_int(value, "plan.requested_group")
+                    for value in plan.get("requested_groups", (0, 1))
+                ),
                 compact_source=MooncakeConnectorMetadata._parse_compact_layout(
                     plan.get("compact_source")
                 ),
@@ -1800,6 +2477,25 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
                     MooncakeConnectorMetadata._parse_compact_layout(
                         plan.get("compact_layout")
                     )
+                ),
+                latent_source=MooncakeConnectorMetadata._parse_latent_layout(
+                    plan.get("latent_source")
+                ),
+                latent_destination_pages=tuple(
+                    SplitLatentDestinationPage(
+                        logical_token_start=_wire_int(
+                            page["logical_token_start"],
+                            "plan.latent_page_logical_start",
+                        ),
+                        destination_address=_wire_int(
+                            page["destination_address"],
+                            "plan.latent_page_address",
+                        ),
+                        length=_wire_int(
+                            page["length"], "plan.latent_page_length"
+                        ),
+                    )
+                    for page in plan.get("latent_destination_pages", ())
                 ),
             )
         if len(parsed.group_byte_totals) != 2:
@@ -1842,7 +2538,10 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
                         )
                 source = None
                 if meta.split_source is not None and raw_plan is not None:
-                    identity = (int(raw_plan["tp_rank"]), int(raw_plan["dp_rank"]))
+                    identity = (
+                        _wire_int(raw_plan["tp_rank"], "destination.tp_rank"),
+                        _wire_int(raw_plan["dp_rank"], "destination.dp_rank"),
+                    )
                     source = next(
                         (
                             item
@@ -1886,6 +2585,14 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
                         requested_groups=requested_groups,
                         compact_source=plan.compact_source,
                         compact_destination=plan.compact_destination,
+                        latent_source=(
+                            plan.latent_source
+                            if 0 in requested_groups else None
+                        ),
+                        latent_destination_pages=(
+                            plan.latent_destination_pages
+                            if 0 in requested_groups else ()
+                        ),
                     )
                 meta.split_plan = plan
             except (KeyError, TypeError, ValueError) as error:
@@ -1902,11 +2609,11 @@ class MooncakeConnector(KVConnectorBase_V1):
     # Live split registers the unbundled latent and index buffers and routes
     # them by explicit group descriptors. Ordinary transfers use this
     # connector's selected group (latent by default, index for index-only).
-    requires_full_dsa_kv_caches = True
     releases_live_transfer_destinations_on_shutdown = True
 
     def __init__(self, vllm_config: VllmConfig, role: KVConnectorRole, kv_cache_config: KVCacheConfig | None = None):
         assert vllm_config.kv_transfer_config is not None
+        self._role = role
         self.engine_id = vllm_config.kv_transfer_config.engine_id
         self._connector_metadata = MooncakeConnectorMetadata()
 
@@ -1949,9 +2656,19 @@ class MooncakeConnector(KVConnectorBase_V1):
     ############################################################
     # Worker Side Methods
     ############################################################
-    def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
+    def register_kv_caches(
+        self,
+        kv_caches: dict[str, torch.Tensor],
+        *,
+        ordinary_kv_caches: dict[str, torch.Tensor] | None = None,
+    ):
         assert self.connector_worker is not None
-        self.connector_worker.register_kv_caches(kv_caches)
+        if ordinary_kv_caches is None:
+            self.connector_worker.register_kv_caches(kv_caches)
+        else:
+            self.connector_worker.register_kv_caches(
+                kv_caches, ordinary_kv_caches=ordinary_kv_caches
+            )
 
     def get_finished(self, finished_req_ids: set[str]) -> tuple[set[str], set[str]]:
         """Get the finished recving and sending requests."""
@@ -2111,7 +2828,10 @@ class MooncakeConnectorScheduler:
         raw_descriptors = descriptor.get("descriptors", (descriptor,))
         normalized = []
         for raw in raw_descriptors:
-            identity = (int(raw["tp_rank"]), int(raw["dp_rank"]))
+            identity = (
+                _wire_int(raw["tp_rank"], "source.tp_rank"),
+                _wire_int(raw["dp_rank"], "source.dp_rank"),
+            )
             metadata = self.local_source_metadata.get(identity)
             if metadata is None:
                 raise ValueError("Live split source rank has no local handshake")
@@ -2124,20 +2844,34 @@ class MooncakeConnectorScheduler:
             for index, base in enumerate(bases):
                 indices[base].append(index)
             compact = raw.get("compact_layout")
+            latent = raw.get("latent_layout")
+            if compact is not None or latent is not None:
+                if (
+                    raw.get("segments")
+                    or raw.get("format") not in (
+                        "layer_slot_runs_v1",
+                        "hybrid_compact_v1",
+                    )
+                ):
+                    raise ValueError("Unknown or mixed compact live split format")
             if compact is not None:
-                if raw.get("segments"):
-                    raise ValueError("Mixed compact and segment source layout")
-                if raw.get("format") != "layer_slot_runs_v1":
-                    raise ValueError("Unknown compact live split format")
                 compact = dict(compact)
-                if int(compact["group_id"]) not in self.live_split_source_groups:
+                if _wire_int(
+                    compact["group_id"], "compact.group_id"
+                ) not in self.live_split_source_groups:
                     raise ValueError("Compact live split group is unsupported")
                 layers = []
                 for layer in compact["layers"]:
                     layer = dict(layer)
-                    base = int(layer["buffer_base"])
-                    token_bytes = int(layer["token_bytes"])
-                    capacity = int(layer["slot_capacity"])
+                    base = _wire_int(
+                        layer["buffer_base"], "compact.buffer_base"
+                    )
+                    token_bytes = _wire_int(
+                        layer["token_bytes"], "compact.token_bytes"
+                    )
+                    capacity = _wire_int(
+                        layer["slot_capacity"], "compact.slot_capacity"
+                    )
                     index = next(
                         (
                             candidate
@@ -2155,33 +2889,144 @@ class MooncakeConnectorScheduler:
                     layer["buffer_index"] = index
                     layers.append(layer)
                 expected_layers = sum(group == 1 for group in groups)
+                expected_indices = tuple(
+                    index for index, group in enumerate(groups) if group == 1
+                )
                 if (
                     len(layers) != expected_layers
                     or len({layer["buffer_index"] for layer in layers})
                     != len(layers)
+                    or tuple(
+                        layer["buffer_index"] for layer in layers
+                    ) != expected_indices
                 ):
                     raise ValueError("Compact live split layers are incomplete")
                 compact["layers"] = layers
                 parsed = MooncakeConnectorMetadata._parse_compact_layout(compact)
                 if parsed is None:
                     raise ValueError("Compact live split layout is missing")
-                expected_total = parsed.token_count * sum(
-                    layer.token_bytes for layer in parsed.layers
+            if latent is not None:
+                if 0 not in self.live_split_source_groups:
+                    raise ValueError("Latent live split group is unsupported")
+                latent = dict(latent)
+                layers = []
+                for layer in latent["layers"]:
+                    layer = dict(layer)
+                    base = _wire_int(
+                        layer["buffer_base"], "latent.buffer_base"
+                    )
+                    token_bytes = _wire_int(
+                        layer["token_bytes"], "latent.token_bytes"
+                    )
+                    capacity = _wire_int(
+                        layer["slot_capacity"], "latent.slot_capacity"
+                    )
+                    index = next(
+                        (
+                            candidate
+                            for candidate in indices.get(base, ())
+                            if groups[candidate] == 0
+                            and capacity * token_bytes <= sizes[candidate]
+                        ),
+                        None,
+                    )
+                    if index is None:
+                        raise ValueError(
+                            "Latent live split layer is not registered"
+                        )
+                    layer["buffer_base"] = base
+                    layer["buffer_index"] = index
+                    layers.append(layer)
+                expected_layers = sum(group == 0 for group in groups)
+                expected_indices = tuple(
+                    index for index, group in enumerate(groups) if group == 0
                 )
-                totals = tuple(raw["group_byte_totals"])
-                if len(totals) != 2 or totals != (0, expected_total):
+                if (
+                    len(layers) != expected_layers
+                    or len({layer["buffer_index"] for layer in layers})
+                    != len(layers)
+                    or tuple(
+                        layer["buffer_index"] for layer in layers
+                    ) != expected_indices
+                ):
+                    raise ValueError("Latent live split layers are incomplete")
+                latent["layers"] = layers
+                if MooncakeConnectorMetadata._parse_latent_layout(latent) is None:
+                    raise ValueError("Latent live split layout is missing")
+            if compact is not None or latent is not None:
+                parsed_compact = (
+                    MooncakeConnectorMetadata._parse_compact_layout(compact)
+                    if compact is not None else None
+                )
+                parsed_latent = (
+                    MooncakeConnectorMetadata._parse_latent_layout(latent)
+                    if latent is not None else None
+                )
+                expected_totals = (
+                    parsed_latent.token_count
+                    * sum(layer.token_bytes for layer in parsed_latent.layers)
+                    if parsed_latent is not None else 0,
+                    parsed_compact.token_count
+                    * sum(layer.token_bytes for layer in parsed_compact.layers)
+                    if parsed_compact is not None else 0,
+                )
+                base_totals = tuple(
+                    _wire_int(value, "source.group_byte_total")
+                    for value in raw["group_byte_totals"]
+                )
+                if len(base_totals) != 2:
+                    raise ValueError("Compact live split totals require two groups")
+                latent_total_raw = raw.get("latent_group_byte_total")
+                compact_only_valid = (
+                    parsed_latent is None
+                    and latent_total_raw is None
+                    and base_totals == expected_totals
+                )
+                extension_valid = (
+                    parsed_latent is not None
+                    and base_totals == (0, expected_totals[1])
+                    and latent_total_raw is not None
+                    and _wire_int(
+                        latent_total_raw, "source.latent_group_byte_total"
+                    ) == expected_totals[0]
+                )
+                legacy_hybrid_valid = (
+                    parsed_latent is not None
+                    and raw.get("format") == "hybrid_compact_v1"
+                    and latent_total_raw is None
+                    and base_totals == expected_totals
+                )
+                if not (
+                    compact_only_valid
+                    or extension_valid
+                    or legacy_hybrid_valid
+                ):
                     raise ValueError("Compact live split byte total differs")
-                normalized.append({**raw, "compact_layout": compact})
+                normalized.append({
+                    **raw,
+                    # Preserve the established group-1 carrier on the wire.
+                    # New decoders promote latent_group_byte_total only after
+                    # validating the extension; old decoders ignore it.
+                    "group_byte_totals": list(base_totals),
+                    "compact_layout": compact,
+                    "latent_layout": latent,
+                })
                 continue
             segments = []
             for segment in raw["segments"]:
                 segment = dict(segment)
-                group_id = int(segment["group_id"])
+                group_id = _wire_int(
+                    segment["group_id"], "source.group_id"
+                )
                 if group_id not in self.live_split_source_groups:
                     continue
-                base = int(segment["source_buffer_base"])
-                offset = int(segment["source_offset"])
-                length = int(segment["length"])
+                base = _wire_int(
+                    segment["source_buffer_base"], "source.buffer_base"
+                )
+                offset = _wire_int(
+                    segment["source_offset"], "source.offset"
+                )
+                length = _wire_int(segment["length"], "source.length")
                 if base <= 0 or offset < 0 or length <= 0:
                     raise ValueError("Invalid live split source extent")
                 base_indices = indices.get(base)
@@ -2210,7 +3055,7 @@ class MooncakeConnectorScheduler:
                 raise ValueError("Live split source has no supported groups")
             totals = [0, 0]
             for segment in segments:
-                totals[int(segment["group_id"])] += int(segment["length"])
+                totals[segment["group_id"]] += segment["length"]
             normalized.append(
                 {**raw, "segments": segments, "group_byte_totals": totals}
             )
@@ -2362,10 +3207,13 @@ class MooncakeConnectorScheduler:
             split_transfer_id = uuid.uuid4().hex
             self.split_transfer_ids[request.request_id] = split_transfer_id
             self._split_reqs_need_send.add(request.request_id)
-            transfer_params["live_split_capabilities"] = (
+            capabilities = [
                 LIVE_SPLIT_CAPABILITY,
                 LIVE_SPLIT_COMPACT_CAPABILITY,
-            )
+            ]
+            if 0 in self.live_split_source_groups:
+                capabilities.append(LIVE_SPLIT_LATENT_CPU_CAPABILITY)
+            transfer_params["live_split_capabilities"] = tuple(capabilities)
             transfer_params["live_split_transfer_id"] = split_transfer_id
             source_descriptor = params.get(LIVE_SPLIT_SOURCE_DESCRIPTOR)
             _cold_live_log(
@@ -2384,7 +3232,13 @@ class MooncakeConnectorScheduler:
                     transfer_params[LIVE_SPLIT_SOURCE_DESCRIPTOR] = (
                         self._canonicalize_source_descriptor(source_descriptor)
                     )
-                except (KeyError, TypeError, ValueError):
+                except (
+                    AttributeError,
+                    KeyError,
+                    OverflowError,
+                    TypeError,
+                    ValueError,
+                ):
                     logger.warning(
                         "Invalid prefiller source registration for %s; "
                         "using persistent fallback",
@@ -2426,7 +3280,11 @@ class MooncakeConnectorWorker:
         self._get_prefill_decode_size(vllm_config)
         self._validate_local_parallel_config(vllm_config)
         os.environ["ASCEND_TRANSFER_TIMEOUT"] = str(get_transfer_timeout_value())
-        if self._prefill_tp_size < self._decode_tp_size:
+        kv_role = vllm_config.kv_transfer_config.kv_role
+        if (
+            kv_role != "kv_both"
+            and self._prefill_tp_size < self._decode_tp_size
+        ):
             raise ValueError(
                 f"prefill_tp_size: {self._prefill_tp_size} must be greater than"
                 f" or equal to the decode_tp_size: {self._decode_tp_size}"
@@ -2490,13 +3348,23 @@ class MooncakeConnectorWorker:
         self.remote_port_send_num: dict[str, dict[int, RemotePortInfo]] = {}
 
     def get_live_split_results(self) -> dict[str, str]:
-        thread = self.kv_send_thread if self.kv_role == "kv_producer" else self.kv_recv_thread
-        if thread is None:
-            return {}
-        return thread.task_tracker.get_and_clear_split_results()
+        merged: dict[str, str] = {}
+        for thread in (self.kv_send_thread, self.kv_recv_thread):
+            if thread is None:
+                continue
+            for request_id, status in (
+                thread.task_tracker.get_and_clear_split_results().items()
+            ):
+                previous = merged.setdefault(request_id, status)
+                if previous != status:
+                    merged[request_id] = "failure"
+        return merged
 
     def cancel_live_split(self, request_ids: set[str]) -> None:
-        if self.kv_role != "kv_consumer" or self.kv_recv_thread is None:
+        if (
+            self.kv_role not in ("kv_consumer", "kv_both")
+            or self.kv_recv_thread is None
+        ):
             return
         for request_id in request_ids:
             self.kv_recv_thread.cancel_split_request(request_id)
@@ -2526,12 +3394,18 @@ class MooncakeConnectorWorker:
                     f"{thread.name} did not stop before Mooncake shutdown"
                 )
         if self.kv_recv_thread is not None:
+            signals_drained = self.kv_recv_thread.wait_for_split_signals(
+                THREAD_SHUTDOWN_TIMEOUT
+            )
             with self.kv_recv_thread.split_request_lock:
                 if self.kv_recv_thread.active_split_requests:
                     raise RuntimeError(
                         "Mooncake split transfer ownership remains active"
                     )
-                if self.kv_recv_thread.pending_split_signals:
+                if (
+                    not signals_drained
+                    or self.kv_recv_thread.pending_split_signals
+                ):
                     raise RuntimeError(
                         "Mooncake split completion signals remain active"
                     )
@@ -2570,10 +3444,27 @@ class MooncakeConnectorWorker:
         kv_role = vllm_config.kv_transfer_config.kv_role
 
         sides: list[tuple[str, int, int]] = []
-        if kv_role in ("kv_producer", "kv_both"):
+        if kv_role == "kv_producer":
             sides.append(("prefill", self._prefill_tp_size, self._prefill_pp_size))
-        if kv_role in ("kv_consumer", "kv_both"):
+        elif kv_role == "kv_consumer":
             sides.append(("decode", self._decode_tp_size, self._decode_pp_size))
+        elif kv_role == "kv_both":
+            matches = [
+                (side, tp_size, pp_size)
+                for side, tp_size, pp_size in (
+                    ("prefill", self._prefill_tp_size, self._prefill_pp_size),
+                    ("decode", self._decode_tp_size, self._decode_pp_size),
+                )
+                if tp_size == actual_tp_size and pp_size == actual_pp_size
+            ]
+            if not matches:
+                raise ValueError(
+                    "MooncakeConnector kv_role=kv_both requires the local "
+                    "TP/PP topology to match either the configured prefill "
+                    "or decode side"
+                )
+        else:
+            raise ValueError(f"Unsupported Mooncake kv_role: {kv_role}")
 
         for side, configured_tp_size, configured_pp_size in sides:
             if configured_tp_size != actual_tp_size:
@@ -2593,10 +3484,16 @@ class MooncakeConnectorWorker:
                     f"or kv_connector_extra_config.{side}.pp_size."
                 )
 
-    def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
+    def register_kv_caches(
+        self,
+        kv_caches: dict[str, torch.Tensor],
+        *,
+        ordinary_kv_caches: dict[str, torch.Tensor] | None = None,
+    ):
         """Register the KV Cache data."""
 
-        _, first_kv_cache_tuple = next(iter(kv_caches.items()))
+        transfer_kv_caches = ordinary_kv_caches or kv_caches
+        _, first_kv_cache_tuple = next(iter(transfer_kv_caches.items()))
         first_kv_cache = first_kv_cache_tuple[0]
 
         # TODO(tms): Find a more robust way to detect and handle MLA
@@ -2605,7 +3502,7 @@ class MooncakeConnectorWorker:
             and first_kv_cache_tuple[0].size(-1) != first_kv_cache_tuple[1].size(-1)
         )
         self.use_sparse = len(first_kv_cache_tuple) >= 3 or any(
-            "indexer" in name for name in kv_caches
+            "indexer" in name for name in transfer_kv_caches
         )
 
         self.num_blocks = first_kv_cache.shape[0]
@@ -2635,7 +3532,7 @@ class MooncakeConnectorWorker:
             first_kv_cache.shape,
         )
 
-        self.kv_caches = kv_caches
+        self.kv_caches = transfer_kv_caches
         kv_caches_base_addr = []
         ordinary_kv_caches_base_addr = []
         storage_regions: dict[int, int] = {}
@@ -2648,7 +3545,7 @@ class MooncakeConnectorWorker:
             int(configured_group)
             if configured_group is not None
             else 1
-            if all("indexer" in name for name in kv_caches)
+            if all("indexer" in name for name in transfer_kv_caches)
             else 0
         )
         for layer_name, cache_or_caches in kv_caches.items():
@@ -2661,9 +3558,7 @@ class MooncakeConnectorWorker:
                 kv_caches_base_addr.append(base_addr)
                 lengths.append(region_len)
                 group_id = (
-                    int(configured_group)
-                    if configured_group is not None
-                    else 1
+                    1
                     if "indexer" in layer_name
                     or (self.use_sparse and i >= 2)
                     else 0
@@ -2675,13 +3570,20 @@ class MooncakeConnectorWorker:
             list(storage_regions), list(storage_regions.values())
         )
         # After KV Caches registered, start the sending or receiving thread.
+        capabilities = [LIVE_SPLIT_CAPABILITY, LIVE_SPLIT_COMPACT_CAPABILITY]
+        if (
+            getattr(self, "live_latent_source_enabled", False)
+            and self.kv_role in ("kv_producer", "kv_both")
+            and self.tp_rank == 0
+        ):
+            capabilities.append(LIVE_SPLIT_LATENT_CPU_CAPABILITY)
         metadata = MooncakeAgentMetadata(
             engine_id=self.engine_id,
             te_rpc_port=self.te_rpc_port,
             kv_caches_base_addr=kv_caches_base_addr,
             num_blocks=self.num_blocks,
             local_ip=get_ip(),
-            capabilities=(LIVE_SPLIT_CAPABILITY, LIVE_SPLIT_COMPACT_CAPABILITY),
+            capabilities=tuple(capabilities),
             kv_caches_buffer_sizes=tuple(lengths),
             buffer_group_ids=tuple(buffer_group_ids),
             tp_rank=self.tp_rank,
@@ -2696,8 +3598,10 @@ class MooncakeConnectorWorker:
         )
         self.xfer_handshake_metadata = metadata
 
-        ready_event = threading.Event()
-        if self.kv_role == "kv_producer":
+        ready_events: list[threading.Event] = []
+        if self.kv_role in ("kv_producer", "kv_both"):
+            send_ready_event = threading.Event()
+            ready_events.append(send_ready_event)
             self.kv_send_thread = KVCacheSendingThread(
                 self.vllm_config,
                 self.tp_rank,
@@ -2706,12 +3610,14 @@ class MooncakeConnectorWorker:
                 self.side_channel_host,
                 self.side_channel_port,
                 metadata,
-                ready_event,
+                send_ready_event,
                 self.kv_caches,
                 self.pcp_rank,
             )
             self.kv_send_thread.start()
-        else:
+        if self.kv_role in ("kv_consumer", "kv_both"):
+            recv_ready_event = threading.Event()
+            ready_events.append(recv_ready_event)
             self.kv_recv_thread = KVCacheRecvingThread(
                 self.tp_rank,
                 self.tp_size,
@@ -2722,19 +3628,30 @@ class MooncakeConnectorWorker:
                 self.side_channel_port,
                 ordinary_kv_caches_base_addr,
                 self.block_len,
-                ready_event,
+                recv_ready_event,
                 self.vllm_config,
                 self.kv_caches,
                 self._prefill_pp_layer_partition,
                 ordinary_group_id=ordinary_group_id,
             )
+            self.kv_recv_thread.local_buffer_sizes = tuple(lengths)
+            self.kv_recv_thread.local_buffer_group_ids = tuple(
+                buffer_group_ids
+            )
+            self.kv_recv_thread.local_registered_bases = tuple(
+                kv_caches_base_addr
+            )
             self.kv_recv_thread.start()
 
         start_wait_time = time.time()
-        thread = self.kv_send_thread if self.kv_role == "kv_producer" else self.kv_recv_thread
-        assert thread is not None
-        while not ready_event.is_set():
-            if not thread.is_alive():
+        threads = tuple(
+            thread
+            for thread in (self.kv_send_thread, self.kv_recv_thread)
+            if thread is not None
+        )
+        assert threads
+        while not all(event.is_set() for event in ready_events):
+            if any(not thread.is_alive() for thread in threads):
                 raise RuntimeError("KV Cache sending/receiving thread failed to start.")
             if time.time() - start_wait_time > 5 * 60:
                 raise RuntimeError("Timeout waiting for KV Cache thread to be ready.")
@@ -2744,13 +3661,13 @@ class MooncakeConnectorWorker:
         done_sending = (
             self.kv_send_thread.get_and_clear_finished_requests(  # type: ignore[union-attr]
             )
-            if self.kv_role == "kv_producer"
+            if self.kv_send_thread is not None
             else set()
         )
         done_recving = (
             self.kv_recv_thread.get_and_clear_finished_requests(  # type: ignore[union-attr]
             )
-            if self.kv_role == "kv_consumer"
+            if self.kv_recv_thread is not None
             else set()
         )
         if self.tp_rank == 0:
@@ -2985,11 +3902,10 @@ class MooncakeConnectorWorker:
                 ],
             )
         if self.kv_recv_thread is not None:
-            for req_id in metadata.reqs_in_batch:
+            for req_id, request_meta in metadata.requests.items():
                 self.kv_recv_thread.task_tracker.add_req_to_process(
                     req_id,
-                    metadata.requests.get(req_id, None).split_transfer_id
-                    if req_id in metadata.requests else None,
+                    request_meta.split_transfer_id,
                 )
 
         for req_id, meta in metadata.requests.items():
@@ -3103,8 +4019,8 @@ class MooncakeConnectorWorker:
                             meta.split_transfer_id)
                         break
 
-        for req_id in metadata.reqs_in_batch:
-            if self.kv_send_thread is not None:
+        if self.kv_send_thread is not None:
+            for req_id in metadata.requests_to_send:
                 self.kv_send_thread.task_tracker.add_req_to_process(
                     req_id, metadata.split_transfer_ids.get(req_id))
 

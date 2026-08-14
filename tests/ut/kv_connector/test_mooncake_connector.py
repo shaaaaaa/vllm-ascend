@@ -13,6 +13,7 @@ from typing import Any, Dict, Optional, OrderedDict
 from unittest.mock import MagicMock, patch
 
 import msgspec
+import pytest
 import zmq
 from vllm.utils.network_utils import make_zmq_path
 from vllm.v1.request import RequestStatus
@@ -49,6 +50,7 @@ from vllm_ascend.distributed.kv_transfer.ascend_multi_connector import (  # noqa
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector import (  # noqa: E402
     LIVE_SPLIT_CAPABILITY,
     LIVE_SPLIT_COMPACT_CAPABILITY,
+    LIVE_SPLIT_LATENT_CPU_CAPABILITY,
     LIVE_SPLIT_SOURCE_DESCRIPTOR,
     KVCacheRecvingThread,
     KVCacheSendingThread,
@@ -65,6 +67,10 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector import (  # n
     SplitCompactLayer,
     SplitCompactLayout,
     SplitCompactRun,
+    SplitLatentDestinationPage,
+    SplitLatentLayout,
+    SplitLatentPage,
+    SplitLatentRun,
     _send_router_ack,
     ensure_zmq_recv,
     ensure_zmq_send,
@@ -118,6 +124,203 @@ def test_compact_split_plan_expands_at_worker_boundary() -> None:
     assert [segment.source_offset for segment in expanded.segments] == [24, 24, 64, 64]
     assert [segment.destination_address for segment in expanded.segments] == [3040, 4040, 3056, 4056]
     assert [segment.length for segment in expanded.segments] == [16] * 4
+
+
+def test_hybrid_split_plan_expands_latent_pages_before_group1() -> None:
+    index_source = SplitCompactLayout(
+        1, 2, (SplitCompactLayer(0, 5000, 4, 16, 4),),
+        (SplitCompactRun(0, 3, 2),),
+    )
+    index_destination = SplitCompactLayout(
+        1, 2, (SplitCompactLayer(0, 6000, 4, 16),),
+        (SplitCompactRun(0, 7, 2),),
+    )
+    latent_source = SplitLatentLayout(
+        0,
+        3,
+        (
+            SplitCompactLayer(0, 1000, 2, 16, 0),
+            SplitCompactLayer(1, 2000, 4, 16, 1),
+        ),
+        (
+            SplitLatentPage(0, 2, (SplitLatentRun(0, 4, 2),)),
+            SplitLatentPage(2, 1, (SplitLatentRun(2, 9, 1),)),
+        ),
+    )
+    plan = SplitTransferPlan(
+        (), (18, 8), 0, 0, (0, 1), index_source, index_destination,
+        latent_source,
+        (SplitLatentDestinationPage(0, 10000, 12),
+         SplitLatentDestinationPage(2, 11000, 6)),
+    )
+
+    expanded = KVCacheRecvingThread._expand_compact_split_plan(plan)
+
+    assert [segment.group_id for segment in expanded.segments] == [0, 0, 0, 0, 1]
+    assert [segment.source_offset for segment in expanded.segments] == [8, 16, 18, 36, 12]
+    assert [segment.destination_address for segment in expanded.segments] == [
+        10000, 10004, 11000, 11002, 6028
+    ]
+    assert [segment.length for segment in expanded.segments] == [4, 8, 2, 4, 8]
+
+
+def test_hybrid_source_and_cpu_pages_merge() -> None:
+    latent = SplitLatentLayout(
+        0, 2, (SplitCompactLayer(0, 1000, 4, 8, 0),),
+        (SplitLatentPage(0, 2, (SplitLatentRun(0, 1, 2),)),),
+    )
+    compact = SplitCompactLayout(
+        1, 2, (SplitCompactLayer(0, 2000, 2, 8, 1),),
+        (SplitCompactRun(0, 1, 2),),
+    )
+    source = MooncakeConnectorMetadata._parse_source_descriptor({
+        "tp_rank": 0,
+        "dp_rank": 0,
+        "group_byte_totals": [8, 4],
+        "segments": [],
+        "compact_layout": {
+            "group_id": 1, "token_count": 2,
+            "layers": [compact.layers[0].__dict__],
+            "runs": [compact.runs[0].__dict__],
+        },
+        "latent_layout": {
+            "group_id": 0, "token_count": 2,
+            "layers": [latent.layers[0].__dict__],
+            "pages": [{
+                "logical_token_start": 0, "token_count": 2,
+                "runs": [latent.pages[0].runs[0].__dict__],
+            }],
+        },
+    })[0]
+    plan = MooncakeConnectorMetadata._merge_source_and_destinations(
+        source,
+        {
+            "tp_rank": 0, "dp_rank": 0,
+            "requested_groups": [0, 1],
+            "group_byte_totals": [8, 4],
+            "segments": [],
+            "latent_token_bytes": [4],
+            "latent_pages": [{
+                "destination_address": 3000,
+                "logical_token_start": 0,
+                "length": 8,
+                "valid_tokens": 2,
+            }],
+            "compact_layout": {
+                "group_id": 1, "token_count": 2,
+                "layers": [{"layer_id": 0, "buffer_base": 4000,
+                            "token_bytes": 2, "slot_capacity": 8}],
+                "runs": [{"logical_token_start": 0,
+                          "physical_slot_start": 2, "token_count": 2}],
+            },
+        },
+    )
+    assert plan.requested_groups == (0, 1)
+    assert plan.latent_source == latent
+    assert plan.latent_destination_pages == (
+        SplitLatentDestinationPage(0, 3000, 8),
+    )
+
+
+def test_latent_source_rejects_physical_slot_overlap_across_pages() -> None:
+    descriptor = {
+        "tp_rank": 0,
+        "dp_rank": 0,
+        "group_byte_totals": [16, 0],
+        "segments": [],
+        "latent_layout": {
+            "group_id": 0,
+            "token_count": 4,
+            "layers": [{
+                "layer_id": 0,
+                "buffer_base": 1000,
+                "buffer_index": 0,
+                "token_bytes": 4,
+                "slot_capacity": 8,
+            }],
+            "pages": [
+                {
+                    "logical_token_start": 0,
+                    "token_count": 2,
+                    "runs": [{
+                        "logical_token_start": 0,
+                        "physical_slot_start": 1,
+                        "token_count": 2,
+                    }],
+                },
+                {
+                    "logical_token_start": 2,
+                    "token_count": 2,
+                    "runs": [{
+                        "logical_token_start": 2,
+                        "physical_slot_start": 2,
+                        "token_count": 2,
+                    }],
+                },
+            ],
+        },
+    }
+
+    with pytest.raises(ValueError, match="physical slots overlap"):
+        MooncakeConnectorMetadata._parse_source_descriptor(descriptor)
+
+
+def test_hybrid_merge_rejects_equal_total_with_different_plane_widths() -> None:
+    source = MooncakeConnectorMetadata._parse_source_descriptor({
+        "tp_rank": 0,
+        "dp_rank": 0,
+        "group_byte_totals": [16, 4],
+        "segments": [],
+        "latent_layout": {
+            "group_id": 0,
+            "token_count": 2,
+            "layers": [
+                {"layer_id": 0, "buffer_base": 1000, "buffer_index": 0,
+                 "token_bytes": 2, "slot_capacity": 8},
+                {"layer_id": 1, "buffer_base": 2000, "buffer_index": 1,
+                 "token_bytes": 6, "slot_capacity": 8},
+            ],
+            "pages": [{
+                "logical_token_start": 0,
+                "token_count": 2,
+                "runs": [{"logical_token_start": 0,
+                          "physical_slot_start": 0, "token_count": 2}],
+            }],
+        },
+        "compact_layout": {
+            "group_id": 1,
+            "token_count": 2,
+            "layers": [{"layer_id": 0, "buffer_base": 3000,
+                        "buffer_index": 2, "token_bytes": 2,
+                        "slot_capacity": 8}],
+            "runs": [{"logical_token_start": 0,
+                      "physical_slot_start": 0, "token_count": 2}],
+        },
+    })[0]
+    destination = {
+        "tp_rank": 0,
+        "dp_rank": 0,
+        "requested_groups": [0, 1],
+        "group_byte_totals": [16, 4],
+        "segments": [],
+        "latent_token_bytes": [4, 4],
+        "latent_pages": [{"destination_address": 4000,
+                          "logical_token_start": 0, "length": 16,
+                          "valid_tokens": 2}],
+        "compact_layout": {
+            "group_id": 1,
+            "token_count": 2,
+            "layers": [{"layer_id": 0, "buffer_base": 5000,
+                        "token_bytes": 2, "slot_capacity": 8}],
+            "runs": [{"logical_token_start": 0,
+                      "physical_slot_start": 0, "token_count": 2}],
+        },
+    }
+
+    with pytest.raises(ValueError, match="Incomplete latent CPU split plan"):
+        MooncakeConnectorMetadata._merge_source_and_destinations(
+            source, destination
+        )
 
 
 def test_compact_source_canonicalizes_layer_buffers() -> None:
@@ -188,6 +391,162 @@ def test_compact_source_rejects_incomplete_layer_registration() -> None:
 
     with unittest.TestCase().assertRaisesRegex(ValueError, "incomplete"):
         scheduler._canonicalize_source_descriptor(descriptor)
+
+
+def test_compact_source_rejects_permuted_registered_layers() -> None:
+    scheduler = MooncakeConnectorScheduler.__new__(MooncakeConnectorScheduler)
+    scheduler.live_split_source_groups = (1,)
+    scheduler.local_source_metadata = {
+        (0, 0): MooncakeAgentMetadata(
+            engine_id="engine",
+            te_rpc_port=1,
+            kv_caches_base_addr=[1000, 2000],
+            kv_caches_buffer_sizes=(128, 128),
+            buffer_group_ids=(1, 1),
+            num_blocks=1,
+        )
+    }
+    descriptor = {
+        "format": "layer_slot_runs_v1",
+        "tp_rank": 0,
+        "dp_rank": 0,
+        "group_byte_totals": [0, 64],
+        "compact_layout": {
+            "group_id": 1,
+            "token_count": 4,
+            "layers": [
+                {"layer_id": 0, "buffer_base": 2000,
+                 "token_bytes": 8, "slot_capacity": 16},
+                {"layer_id": 1, "buffer_base": 1000,
+                 "token_bytes": 8, "slot_capacity": 16},
+            ],
+            "runs": [{"logical_token_start": 0,
+                      "physical_slot_start": 3, "token_count": 4}],
+        },
+    }
+
+    with pytest.raises(ValueError, match="incomplete"):
+        scheduler._canonicalize_source_descriptor(descriptor)
+
+
+def test_latent_source_rejects_permuted_registered_planes() -> None:
+    scheduler = MooncakeConnectorScheduler.__new__(MooncakeConnectorScheduler)
+    scheduler.live_split_source_groups = (0, 1)
+    scheduler.local_source_metadata = {
+        (0, 0): MooncakeAgentMetadata(
+            engine_id="engine",
+            te_rpc_port=1,
+            kv_caches_base_addr=[1000, 2000, 3000],
+            kv_caches_buffer_sizes=(128, 128, 128),
+            buffer_group_ids=(0, 0, 1),
+            num_blocks=1,
+        )
+    }
+    descriptor = {
+        "format": "layer_slot_runs_v1",
+        "tp_rank": 0,
+        "dp_rank": 0,
+        "group_byte_totals": [0, 16],
+        "latent_group_byte_total": 32,
+        "segments": [],
+        "latent_layout": {
+            "group_id": 0,
+            "token_count": 2,
+            "layers": [
+                {"layer_id": 0, "buffer_base": 2000,
+                 "token_bytes": 8, "slot_capacity": 16},
+                {"layer_id": 1, "buffer_base": 1000,
+                 "token_bytes": 8, "slot_capacity": 16},
+            ],
+            "pages": [{
+                "logical_token_start": 0,
+                "token_count": 2,
+                "runs": [{"logical_token_start": 0,
+                          "physical_slot_start": 0, "token_count": 2}],
+            }],
+        },
+        "compact_layout": {
+            "group_id": 1,
+            "token_count": 2,
+            "layers": [{"layer_id": 0, "buffer_base": 3000,
+                        "token_bytes": 8, "slot_capacity": 16}],
+            "runs": [{"logical_token_start": 0,
+                      "physical_slot_start": 0, "token_count": 2}],
+        },
+    }
+
+    with pytest.raises(ValueError, match="incomplete"):
+        scheduler._canonicalize_source_descriptor(descriptor)
+
+
+def test_latent_extension_promotes_total_after_source_validation() -> None:
+    scheduler = MooncakeConnectorScheduler.__new__(MooncakeConnectorScheduler)
+    scheduler.live_split_source_groups = (0, 1)
+    scheduler.local_source_metadata = {
+        (0, 0): MooncakeAgentMetadata(
+            engine_id="engine",
+            te_rpc_port=1,
+            kv_caches_base_addr=[1000, 2000],
+            kv_caches_buffer_sizes=(128, 128),
+            buffer_group_ids=(0, 1),
+            num_blocks=1,
+        )
+    }
+    descriptor = {
+        "format": "layer_slot_runs_v1",
+        "tp_rank": 0,
+        "dp_rank": 0,
+        # The established carrier remains a valid group-1-only descriptor.
+        "group_byte_totals": [0, 16],
+        "latent_group_byte_total": 16,
+        "latent_layout": {
+            "group_id": 0,
+            "token_count": 2,
+            "layers": [{"layer_id": 0, "buffer_base": 1000,
+                        "token_bytes": 8, "slot_capacity": 16}],
+            "pages": [{
+                "logical_token_start": 0,
+                "token_count": 2,
+                "runs": [{"logical_token_start": 0,
+                          "physical_slot_start": 0, "token_count": 2}],
+            }],
+        },
+        "compact_layout": {
+            "group_id": 1,
+            "token_count": 2,
+            "layers": [{"layer_id": 0, "buffer_base": 2000,
+                        "token_bytes": 8, "slot_capacity": 16}],
+            "runs": [{"logical_token_start": 0,
+                      "physical_slot_start": 0, "token_count": 2}],
+        },
+    }
+
+    result = scheduler._canonicalize_source_descriptor(descriptor)
+    normalized = result["descriptors"][0]
+
+    assert normalized["group_byte_totals"] == [0, 16]
+    assert isinstance(normalized["group_byte_totals"], list)
+    assert normalized["latent_group_byte_total"] == 16
+    assert normalized["latent_layout"]["layers"][0]["buffer_index"] == 0
+    assert normalized["compact_layout"]["layers"][0]["buffer_index"] == 1
+
+    parsed = MooncakeConnectorMetadata._parse_source_descriptor(result)
+    assert parsed is not None
+    assert parsed[0].group_byte_totals == (16, 16)
+
+    # A pre-extension decoder ignores the new fields and still receives a
+    # complete, valid group-1 compact descriptor.
+    legacy_view = {
+        **normalized,
+        "latent_layout": None,
+    }
+    legacy_view.pop("latent_group_byte_total")
+    legacy_parsed = MooncakeConnectorMetadata._parse_source_descriptor(
+        legacy_view
+    )
+    assert legacy_parsed is not None
+    assert legacy_parsed[0].group_byte_totals == (0, 16)
+    assert legacy_parsed[0].compact_layout is not None
 
 
 class TestKVCacheTaskTrackerInit(unittest.TestCase):
@@ -669,6 +1028,12 @@ class TestCoreFunctionality(unittest.TestCase):
         self.thread.remote_capabilities = {
             ("remote_engine", 6666): (LIVE_SPLIT_CAPABILITY,)
         }
+        self.thread.kv_caches_base_addr["local_engine"][5555] = [
+            0x7000, 0xA000
+        ]
+        self.thread.local_registered_bases = (0x7000, 0xA000)
+        self.thread.local_buffer_sizes = (4096, 4096)
+        self.thread.local_buffer_group_ids = (0, 1)
         plan = SplitTransferPlan(
             segments=(
                 SplitTransferSegment(0, 0, 32, 0x8000, 256, "cpu"),
@@ -682,10 +1047,238 @@ class TestCoreFunctionality(unittest.TestCase):
 
         self.thread._transfer_kv_cache(request)
 
-        mock_register.assert_called_once_with([0x8000, 0xA000], [256, 512])
+        mock_register.assert_called_once_with(
+            [0x8000, 0xA000],
+            [256, 512],
+            require_existing=False,
+            adopted_only=False,
+        )
         self.engine.batch_transfer_sync_read.assert_called_once_with(
             "localhost:7777", [0x8000, 0xA000],
             [0x3000 + 32, 0x5000 + 64], [256, 512])
+
+    @patch(
+        'vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector.global_te.temporary_registration'
+    )
+    def test_hybrid_transfer_registers_page_envelopes_not_expanded_runs(
+        self, mock_register
+    ):
+        mock_register.return_value = contextlib.nullcontext()
+        self.thread.tp_rank = 0
+        self.vllm_config.parallel_config.data_parallel_rank_local = 0
+        self.thread.kv_caches_base_addr["remote_engine"] = {
+            6666: [1000, 2000]
+        }
+        self.thread.remote_buffer_sizes["remote_engine"] = {
+            6666: (128, 128)
+        }
+        self.thread.remote_buffer_group_ids["remote_engine"] = {
+            6666: (0, 1)
+        }
+        self.thread.remote_capabilities = {
+            ("remote_engine", 6666): (
+                LIVE_SPLIT_CAPABILITY,
+                LIVE_SPLIT_COMPACT_CAPABILITY,
+                LIVE_SPLIT_LATENT_CPU_CAPABILITY,
+            )
+        }
+        self.thread.kv_caches_base_addr["local_engine"][5555] = [5000, 6000]
+        self.thread.local_registered_bases = (5000, 6000)
+        self.thread.local_buffer_sizes = (128, 128)
+        self.thread.local_buffer_group_ids = (0, 1)
+        plan = SplitTransferPlan(
+            segments=(),
+            group_byte_totals=(8, 4),
+            tp_rank=0,
+            dp_rank=0,
+            requested_groups=(0, 1),
+            compact_source=SplitCompactLayout(
+                1, 2, (SplitCompactLayer(0, 2000, 2, 8, 1),),
+                (SplitCompactRun(0, 1, 2),),
+            ),
+            compact_destination=SplitCompactLayout(
+                1, 2, (SplitCompactLayer(0, 6000, 2, 8),),
+                (SplitCompactRun(0, 2, 2),),
+            ),
+            latent_source=SplitLatentLayout(
+                0, 2, (SplitCompactLayer(0, 1000, 4, 8, 0),),
+                (SplitLatentPage(
+                    0, 2,
+                    (SplitLatentRun(0, 1, 1), SplitLatentRun(1, 3, 1)),
+                ),),
+            ),
+            latent_destination_pages=(
+                SplitLatentDestinationPage(0, 10000, 8),
+            ),
+        )
+
+        self.thread._transfer_split_destinations(self.test_req, plan)
+
+        mock_register.assert_called_once_with(
+            [10000], [8], require_existing=True, adopted_only=True
+        )
+        self.engine.batch_transfer_sync_read.assert_called_once_with(
+            "localhost:7777",
+            [10000, 10004, 6004],
+            [1004, 1012, 2002],
+            [4, 4, 4],
+        )
+
+    @patch(
+        'vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector.global_te.temporary_registration'
+    )
+    def test_compact_group1_registers_layer_envelopes_not_expanded_runs(
+        self, mock_register
+    ):
+        mock_register.return_value = contextlib.nullcontext()
+        self.thread.tp_rank = 0
+        self.vllm_config.parallel_config.data_parallel_rank_local = 0
+        self.thread.kv_caches_base_addr["remote_engine"] = {
+            6666: [2000]
+        }
+        self.thread.remote_buffer_sizes["remote_engine"] = {
+            6666: (128,)
+        }
+        self.thread.remote_buffer_group_ids["remote_engine"] = {
+            6666: (1,)
+        }
+        self.thread.remote_capabilities = {
+            ("remote_engine", 6666): (
+                LIVE_SPLIT_CAPABILITY,
+                LIVE_SPLIT_COMPACT_CAPABILITY,
+            )
+        }
+        self.thread.local_registered_bases = (6000,)
+        self.thread.local_buffer_sizes = (128,)
+        self.thread.local_buffer_group_ids = (1,)
+        plan = SplitTransferPlan(
+            segments=(),
+            group_byte_totals=(0, 8),
+            tp_rank=0,
+            dp_rank=0,
+            requested_groups=(1,),
+            compact_source=SplitCompactLayout(
+                1, 4, (SplitCompactLayer(0, 2000, 2, 8, 0),),
+                (
+                    SplitCompactRun(0, 1, 2),
+                    SplitCompactRun(2, 5, 2),
+                ),
+            ),
+            compact_destination=SplitCompactLayout(
+                1, 4, (SplitCompactLayer(0, 6000, 2, 8),),
+                (
+                    SplitCompactRun(0, 2, 2),
+                    SplitCompactRun(2, 6, 2),
+                ),
+            ),
+        )
+
+        self.thread._transfer_split_destinations(self.test_req, plan)
+
+        mock_register.assert_called_once_with(
+            [6000], [16], require_existing=False, adopted_only=False
+        )
+        self.engine.batch_transfer_sync_read.assert_called_once_with(
+            "localhost:7777",
+            [6004, 6012],
+            [2002, 2010],
+            [4, 4],
+        )
+
+    def test_hybrid_expansion_matches_layer_page_byte_layout(self):
+        widths = (2, 1, 3, 2)
+        source_bases = (1000, 2000, 3000, 4000)
+        logical_slots = (3, 4, 1, 6, 0)
+        latent_layers = tuple(
+            SplitCompactLayer(layer, base, width, 8, layer)
+            for layer, (base, width) in enumerate(
+                zip(source_bases, widths, strict=True)
+            )
+        )
+        plan = SplitTransferPlan(
+            segments=(),
+            group_byte_totals=(sum(widths) * 5, 5),
+            tp_rank=0,
+            dp_rank=0,
+            requested_groups=(0, 1),
+            compact_source=SplitCompactLayout(
+                1, 5, (SplitCompactLayer(0, 5000, 1, 8, 4),),
+                (SplitCompactRun(0, 0, 5),),
+            ),
+            compact_destination=SplitCompactLayout(
+                1, 5, (SplitCompactLayer(0, 6000, 1, 8),),
+                (SplitCompactRun(0, 0, 5),),
+            ),
+            latent_source=SplitLatentLayout(
+                0,
+                5,
+                latent_layers,
+                (
+                    SplitLatentPage(
+                        0, 3,
+                        (SplitLatentRun(0, 3, 2),
+                         SplitLatentRun(2, 1, 1)),
+                    ),
+                    SplitLatentPage(
+                        3, 2,
+                        (SplitLatentRun(3, 6, 1),
+                         SplitLatentRun(4, 0, 1)),
+                    ),
+                ),
+            ),
+            latent_destination_pages=(
+                SplitLatentDestinationPage(0, 10000, sum(widths) * 3),
+                SplitLatentDestinationPage(3, 11000, sum(widths) * 2),
+            ),
+        )
+
+        expanded = self.thread._expand_compact_split_plan(plan)
+        source_data = {}
+        for layer, (base, width) in enumerate(
+            zip(source_bases, widths, strict=True)
+        ):
+            source_data[base] = bytes(
+                (layer * 40 + slot * 4 + byte) % 256
+                for slot in range(8)
+                for byte in range(width)
+            )
+        destinations = {10000: bytearray(sum(widths) * 3),
+                        11000: bytearray(sum(widths) * 2)}
+        for segment in expanded.segments:
+            if segment.group_id != 0:
+                continue
+            page_base = 10000 if segment.destination_address < 11000 else 11000
+            dst_offset = segment.destination_address - page_base
+            src = source_data[segment.source_buffer_base]
+            destinations[page_base][dst_offset:dst_offset + segment.length] = (
+                src[segment.source_offset:segment.source_offset + segment.length]
+            )
+
+        for page_base, slots in ((10000, logical_slots[:3]),
+                                 (11000, logical_slots[3:])):
+            expected = bytearray()
+            for base, width in zip(source_bases, widths, strict=True):
+                for slot in slots:
+                    start = slot * width
+                    expected.extend(source_data[base][start:start + width])
+            self.assertEqual(destinations[page_base], expected)
+
+    def test_split_rejects_npu_destination_outside_local_group1(self):
+        self.thread.local_registered_bases = (0x1000, 0x2000)
+        self.thread.local_buffer_sizes = (0x100, 0x100)
+        self.thread.local_buffer_group_ids = (0, 1)
+        plan = SplitTransferPlan(
+            segments=(
+                SplitTransferSegment(1, 0, 0, 0x3000, 8, "npu"),
+            ),
+            group_byte_totals=(0, 8),
+            tp_rank=0,
+            dp_rank=0,
+            requested_groups=(1,),
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "registered group-1 KV"):
+            self.thread._transfer_split_destinations(self.test_req, plan)
 
     def test_split_transfer_rejects_wrong_dp_rank(self):
         self.vllm_config.parallel_config.data_parallel_rank_local = 1
@@ -718,6 +1311,10 @@ class TestCoreFunctionality(unittest.TestCase):
         self.thread.remote_capabilities = {
             ("remote_engine", 6666): (LIVE_SPLIT_CAPABILITY,)
         }
+        self.thread.kv_caches_base_addr["local_engine"][5555] = [0xA000]
+        self.thread.local_registered_bases = (0xA000,)
+        self.thread.local_buffer_sizes = (4096,)
+        self.thread.local_buffer_group_ids = (1,)
         plan = SplitTransferPlan(
             segments=(
                 SplitTransferSegment(1, 0, 64, 0xA000, 512, "npu"),
@@ -731,11 +1328,19 @@ class TestCoreFunctionality(unittest.TestCase):
         self.thread._transfer_kv_cache(
             dict(self.test_req, split_plan=plan))
 
-        mock_register.assert_called_once_with([0xA000], [512])
+        mock_register.assert_called_once_with(
+            [0xA000],
+            [512],
+            require_existing=False,
+            adopted_only=False,
+        )
         self.engine.batch_transfer_sync_read.assert_called_once_with(
             "localhost:7777", [0xA000], [0x5000 + 64], [512])
 
     def test_split_rejects_source_group_mismatch(self):
+        self.thread.local_registered_bases = (0xA000,)
+        self.thread.local_buffer_sizes = (4096,)
+        self.thread.local_buffer_group_ids = (1,)
         self.thread.kv_caches_base_addr["remote_engine"] = {6666: [0x5000]}
         self.thread.remote_buffer_sizes["remote_engine"] = {6666: (4096,)}
         self.thread.remote_buffer_group_ids["remote_engine"] = {6666: (0,)}
@@ -772,6 +1377,9 @@ class TestCoreFunctionality(unittest.TestCase):
 
     def test_split_rejects_zero_or_missing_requested_group(self):
         self.vllm_config.parallel_config.data_parallel_rank_local = 0
+        self.thread.local_registered_bases = (0xA000,)
+        self.thread.local_buffer_sizes = (4096,)
+        self.thread.local_buffer_group_ids = (1,)
         zero_group1 = SplitTransferPlan(
             segments=(),
             group_byte_totals=(0, 0),
@@ -1349,13 +1957,18 @@ class TestKVCacheTaskTracker(unittest.TestCase):
                 return True
 
         recv_thread = ImmediateThread()
+        send_thread = MagicMock()
         worker = object.__new__(MooncakeConnectorWorker)
         worker.kv_recv_thread = recv_thread
-        worker.kv_send_thread = None
+        worker.kv_send_thread = send_thread
         worker._prefill_tp_size = 1
         worker._prefill_pp_size = 1
+        worker.pcp_size = 1
+        worker.dcp_size = 1
+        worker.tp_rank = 0
         worker._get_tp_num_need_pulls = lambda _size: 1
         worker._get_remote_rank = lambda _request_id, _size: [0]
+        worker._prefill_get_remote_rank = lambda _request_id: [0]
         worker._get_remote_host_info_by_port = (
             lambda _base, _port, host, engine, _mapping: (host, engine)
         )
@@ -1385,6 +1998,29 @@ class TestKVCacheTaskTracker(unittest.TestCase):
         self.assertEqual(
             tracker.get_and_clear_split_results(), {"req": "success"}
         )
+        send_thread.task_tracker.add_req_to_process.assert_not_called()
+
+    def test_both_role_enrolls_only_send_metadata_in_sender(self):
+        worker = object.__new__(MooncakeConnectorWorker)
+        worker.kv_send_thread = MagicMock()
+        worker.kv_recv_thread = MagicMock()
+        worker.pcp_size = 1
+        worker.dcp_size = 1
+        worker.tp_rank = 0
+        worker._prefill_get_remote_rank = lambda _request_id: [0]
+        metadata = MooncakeConnectorMetadata()
+        metadata.reqs_in_batch.update(("send", "unrelated"))
+        metadata.requests_to_send["send"] = 1.0
+
+        worker.start_load_kv(metadata)
+
+        worker.kv_send_thread.task_tracker.add_req_to_process.assert_called_once_with(
+            "send", None
+        )
+        worker.kv_send_thread.add_delayed_request.assert_called_once_with(
+            "send", 1.0, split=False, split_transfer_id=None
+        )
+        worker.kv_recv_thread.task_tracker.add_req_to_process.assert_not_called()
 
 
 class TestGlobalTransferEngineRegistration(unittest.TestCase):
@@ -1505,9 +2141,55 @@ class TestGlobalTransferEngineRegistration(unittest.TestCase):
             pass
         registry.release_adopted_buffer(0x1000, 0x1000)
 
+    def test_adopted_registration_uses_one_lease_for_many_pages(self):
+        registry = GlobalTE()
+        registry.transfer_engine = MagicMock()
+        registry.adopt_registered_buffer(0x1000, 0x1000)
+
+        with registry.temporary_registration(
+            [0x1100, 0x1200, 0x1300],
+            [0x80, 0x80, 0x80],
+            require_existing=True,
+            adopted_only=True,
+        ):
+            self.assertEqual(registry._adopted_leases, {0x1000: 1})
+
+        self.assertEqual(registry._adopted_leases, {})
+        registry.release_adopted_buffer(0x1000, 0x1000)
+
         registry.transfer_engine.register_memory.assert_not_called()
         registry.transfer_engine.unregister_memory.assert_not_called()
         self.assertEqual(registry.registered_buffers, {})
+
+    def test_required_adopted_registration_rejects_unowned_region(self):
+        registry = GlobalTE()
+        registry.transfer_engine = MagicMock()
+
+        with self.assertRaisesRegex(RuntimeError, "existing registration"):
+            with registry.temporary_registration(
+                [0x1400],
+                [0x100],
+                require_existing=True,
+                adopted_only=True,
+            ):
+                pass
+
+        registry.transfer_engine.register_memory.assert_not_called()
+
+    def test_required_adopted_registration_rejects_native_owner(self):
+        registry = GlobalTE()
+        registry.transfer_engine = MagicMock()
+        registry.transfer_engine.register_memory.return_value = 0
+        registry.register_buffer([0x1000], [0x1000])
+
+        with self.assertRaisesRegex(RuntimeError, "not an adopted"):
+            with registry.temporary_registration(
+                [0x1400],
+                [0x100],
+                require_existing=True,
+                adopted_only=True,
+            ):
+                pass
 
     def test_adopted_registration_cannot_release_during_transfer(self):
         registry = GlobalTE()
@@ -1688,6 +2370,93 @@ class TestMooncakeConnectorMetadata(unittest.TestCase):
         self.assertIsNotNone(plan)
         self.assertEqual(plan.group_byte_totals, (256, 128))
         self.assertEqual((plan.tp_rank, plan.dp_rank), (7, 1))
+
+    def test_malformed_eager_split_plan_falls_back(self):
+        meta = MooncakeConnectorMetadata()
+        meta.add_new_req(
+            request_id="req-invalid-eager",
+            local_block_ids=[1],
+            num_external_tokens=16,
+            kv_transfer_params={
+                "remote_block_ids": [2],
+                "remote_engine_id": "remote",
+                "remote_request_id": "remote-req",
+                "remote_host": "host",
+                "remote_port": 30000,
+                "live_split_capabilities": (LIVE_SPLIT_CAPABILITY,),
+                "live_split_transfer_id": "generation-a",
+                LIVE_SPLIT_CAPABILITY: {
+                    "group_byte_totals": "invalid",
+                    "tp_rank": 0,
+                    "dp_rank": 0,
+                },
+            },
+        )
+
+        request = meta.requests["req-invalid-eager"]
+        self.assertTrue(request.split_fallback)
+        self.assertIsNone(request.split_plan)
+
+    def test_non_integral_wire_address_falls_back(self):
+        meta = MooncakeConnectorMetadata()
+        meta.add_new_req(
+            request_id="req-non-integral-address",
+            local_block_ids=[1],
+            num_external_tokens=16,
+            kv_transfer_params={
+                "remote_block_ids": [2],
+                "remote_engine_id": "remote",
+                "remote_request_id": "remote-req",
+                "remote_host": "host",
+                "remote_port": 30000,
+                "live_split_capabilities": (LIVE_SPLIT_CAPABILITY,),
+                "live_split_transfer_id": "generation-a",
+                LIVE_SPLIT_CAPABILITY: {
+                    "segments": [{
+                        "group_id": 1,
+                        "source_buffer_index": 0,
+                        "source_offset": 0,
+                        "destination_address": 4096.5,
+                        "length": 64,
+                        "destination_kind": "npu",
+                    }],
+                    "group_byte_totals": [0, 64],
+                    "tp_rank": 0,
+                    "dp_rank": 0,
+                    "requested_groups": [1],
+                },
+            },
+        )
+
+        request = meta.requests["req-non-integral-address"]
+        self.assertTrue(request.split_fallback)
+        self.assertIsNone(request.split_plan)
+
+    def test_non_integral_compact_source_address_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "buffer_base must be an integer"):
+            MooncakeConnectorMetadata._parse_source_descriptor({
+                "descriptors": [{
+                    "group_byte_totals": [0, 64],
+                    "tp_rank": 0,
+                    "dp_rank": 0,
+                    "compact_layout": {
+                        "group_id": 1,
+                        "token_count": 1,
+                        "layers": [{
+                            "layer_id": 0,
+                            "buffer_base": 8192.25,
+                            "token_bytes": 64,
+                            "slot_capacity": 1,
+                            "buffer_index": 0,
+                        }],
+                        "runs": [{
+                            "logical_token_start": 0,
+                            "physical_slot_start": 0,
+                            "token_count": 1,
+                        }],
+                    },
+                }],
+            })
 
     def test_missing_late_plan_selects_persistent_fallback(self):
         meta = MooncakeConnectorMetadata()
@@ -1935,6 +2704,39 @@ class TestMooncakeConnectorMetadata(unittest.TestCase):
         self.assertTrue(metadata.requests["req"].split_fallback)
         self.assertIsNone(metadata.requests["req"].split_plan)
 
+    def test_non_mapping_received_source_uses_persistent_fallback(self):
+        metadata = MooncakeConnectorMetadata()
+        metadata.add_new_req("req", [1], 16, {
+            "remote_block_ids": [1], "remote_engine_id": "remote",
+            "remote_request_id": "remote-req", "remote_host": "host",
+            "remote_port": 30000,
+            "live_split_capabilities": (LIVE_SPLIT_CAPABILITY,),
+            "live_split_transfer_id": "generation-a",
+            LIVE_SPLIT_SOURCE_DESCRIPTOR: {
+                "descriptors": [None],
+            },
+        })
+        metadata.accept_late_split_plans({"req": {}})
+        self.assertTrue(metadata.requests["req"].split_fallback)
+        self.assertIsNone(metadata.requests["req"].split_plan)
+
+    def test_non_finite_received_source_uses_persistent_fallback(self):
+        metadata = MooncakeConnectorMetadata()
+        metadata.add_new_req("req", [1], 16, {
+            "remote_block_ids": [1], "remote_engine_id": "remote",
+            "remote_request_id": "remote-req", "remote_host": "host",
+            "remote_port": 30000,
+            "live_split_capabilities": (LIVE_SPLIT_CAPABILITY,),
+            "live_split_transfer_id": "generation-a",
+            LIVE_SPLIT_SOURCE_DESCRIPTOR: {
+                "segments": [], "group_byte_totals": [0, float("inf")],
+                "tp_rank": 0, "dp_rank": 0,
+            },
+        })
+        metadata.accept_late_split_plans({"req": {}})
+        self.assertTrue(metadata.requests["req"].split_fallback)
+        self.assertIsNone(metadata.requests["req"].split_plan)
+
 
 class TestAscendMultiLateSplitInjection(unittest.TestCase):
 
@@ -1955,6 +2757,42 @@ class TestAscendMultiLateSplitInjection(unittest.TestCase):
         multi.shutdown()
 
         self.assertEqual(events, ["mooncake", "lmcache"])
+
+    def test_shutdown_delivers_borrower_result_before_owner_shutdown(self):
+        events = []
+
+        class Borrower:
+            releases_live_transfer_destinations_on_shutdown = True
+
+            def shutdown(self):
+                events.append("borrower_shutdown")
+
+            def get_live_split_results(self):
+                events.append("result_poll")
+                return {"req": "success"}
+
+        class Owner:
+            def _accept_live_split_results(self, results):
+                events.append(("result_accept", results))
+
+            def shutdown(self):
+                events.append("owner_shutdown")
+
+        multi = object.__new__(AscendMultiConnector)
+        multi._connectors = [Owner(), Borrower()]
+        multi._live_split_result_backlog = {}
+
+        multi.shutdown()
+
+        self.assertEqual(
+            events,
+            [
+                "borrower_shutdown",
+                "result_poll",
+                ("result_accept", {"req": "success"}),
+                "owner_shutdown",
+            ],
+        )
 
     def test_shutdown_does_not_close_owner_if_borrower_is_active(self):
         owner = MagicMock()
@@ -2369,14 +3207,19 @@ class TestAscendMultiLateSplitInjection(unittest.TestCase):
         self.assertEqual(healthy_deliveries, [{"req": "success"}])
         self.assertEqual(multi._live_split_result_backlog, {})
 
-    def test_finished_request_discards_stale_provider_backlog(self):
+    def test_finished_request_preserves_provider_backlog_until_accepted(self):
         delivered = []
 
         class Provider:
+            attempts = 0
+
             def get_finished(self, _finished_req_ids):
                 return None, None
 
             def _accept_live_split_results(self, results):
+                self.attempts += 1
+                if self.attempts == 1:
+                    raise RuntimeError("retry")
                 delivered.append(results)
 
         multi = object.__new__(AscendMultiConnector)
@@ -2388,8 +3231,17 @@ class TestAscendMultiLateSplitInjection(unittest.TestCase):
         }
 
         multi.get_finished({"reused"})
+        self.assertEqual(delivered, [])
+        self.assertEqual(
+            multi._live_split_result_backlog,
+            {id(provider): {"reused": "success", "active": "failure"}},
+        )
 
-        self.assertEqual(delivered, [{"active": "failure"}])
+        multi.get_finished(set())
+
+        self.assertEqual(
+            delivered, [{"reused": "success", "active": "failure"}]
+        )
         self.assertEqual(multi._live_split_result_backlog, {})
 
 
@@ -3036,6 +3888,56 @@ class TestMooncakeConnectorWorker(unittest.TestCase):
         self.assertIsNotNone(worker.kv_send_thread)
         self.assertIsNone(worker.kv_recv_thread)
 
+    def test_register_kv_caches_both_starts_sender_and_receiver(self):
+        self.vllm_config.kv_transfer_config.kv_role = "kv_both"
+        worker = MooncakeConnectorWorker(self.vllm_config, self.engine_id)
+
+        worker.register_kv_caches(self.kv_caches)
+
+        self.assertIsNotNone(worker.kv_send_thread)
+        self.assertIsNotNone(worker.kv_recv_thread)
+        self.assertTrue(worker.kv_send_thread.start.called)
+        self.assertTrue(worker.kv_recv_thread.start.called)
+
+    def test_both_role_merges_sender_and_receiver_live_results(self):
+        worker = object.__new__(MooncakeConnectorWorker)
+        send = MagicMock()
+        recv = MagicMock()
+        send.task_tracker.get_and_clear_split_results.return_value = {
+            "sent": "success",
+            "conflict": "success",
+        }
+        recv.task_tracker.get_and_clear_split_results.return_value = {
+            "received": "success",
+            "conflict": "failure",
+        }
+        worker.kv_send_thread = send
+        worker.kv_recv_thread = recv
+
+        self.assertEqual(
+            worker.get_live_split_results(),
+            {
+                "sent": "success",
+                "received": "success",
+                "conflict": "failure",
+            },
+        )
+
+    def test_both_role_reports_send_and_receive_completion(self):
+        worker = object.__new__(MooncakeConnectorWorker)
+        send = MagicMock()
+        recv = MagicMock()
+        send.get_and_clear_finished_requests.return_value = {"sent"}
+        recv.get_and_clear_finished_requests.return_value = {"received"}
+        worker.kv_send_thread = send
+        worker.kv_recv_thread = recv
+        worker.tp_rank = 0
+
+        self.assertEqual(
+            worker.get_finished(),
+            ({"sent"}, {"received"}),
+        )
+
     def test_shutdown_stops_and_joins_worker_thread(self):
         worker = MooncakeConnectorWorker(self.vllm_config, self.engine_id)
         thread = MagicMock()
@@ -3069,6 +3971,7 @@ class TestMooncakeConnectorWorker(unittest.TestCase):
         thread.active_split_requests = {}
         thread.pending_split_signals = set()
         thread.undelivered_split_signals = set()
+        thread.wait_for_split_signals.return_value = True
         worker.kv_recv_thread = thread
 
         worker.shutdown()
@@ -3076,6 +3979,19 @@ class TestMooncakeConnectorWorker(unittest.TestCase):
         thread.stop.assert_called_once_with()
         thread.join.assert_called_once()
         thread.close_resources.assert_called_once_with()
+
+    def test_receiver_stop_keeps_terminal_ack_sender_alive(self):
+        thread = object.__new__(KVCacheRecvingThread)
+        thread.request_queue_lock = threading.Lock()
+        thread.request_queue = queue.Queue()
+        thread.stop_event = threading.Event()
+        thread._accepting_requests = True
+
+        thread.stop()
+
+        self.assertFalse(thread._accepting_requests)
+        self.assertFalse(thread.stop_event.is_set())
+        self.assertIsNone(thread.request_queue.get_nowait())
 
     def test_shutdown_retains_receiver_while_terminal_signal_is_active(self):
         worker = MooncakeConnectorWorker(self.vllm_config, self.engine_id)
@@ -3085,6 +4001,7 @@ class TestMooncakeConnectorWorker(unittest.TestCase):
         thread.active_split_requests = {}
         thread.pending_split_signals = {MagicMock()}
         thread.undelivered_split_signals = set()
+        thread.wait_for_split_signals.return_value = False
         worker.kv_recv_thread = thread
 
         with self.assertRaisesRegex(RuntimeError, "signals remain active"):
@@ -3136,6 +4053,31 @@ class TestMooncakeConnectorWorker(unittest.TestCase):
         with self.assertRaisesRegex(
                 ValueError,
                 r"prefill\.tp_size \(8\).*--tensor-parallel-size \(2\)"):
+            MooncakeConnectorWorker(self.vllm_config, self.engine_id)
+
+    def test_local_parallel_config_both_accepts_matching_local_side(self):
+        self.vllm_config.kv_transfer_config.kv_role = "kv_both"
+        self.vllm_config.kv_transfer_config.get_from_extra_config.side_effect = (
+            lambda k, d: {
+                "prefill": {"tp_size": 8, "dp_size": 1, "pp_size": 1},
+                "decode": {"tp_size": 2, "dp_size": 1, "pp_size": 1},
+            }.get(k, d)
+        )
+
+        worker = MooncakeConnectorWorker(self.vllm_config, self.engine_id)
+
+        self.assertEqual(worker.kv_role, "kv_both")
+
+    def test_local_parallel_config_both_rejects_unknown_local_side(self):
+        self.vllm_config.kv_transfer_config.kv_role = "kv_both"
+        self.vllm_config.kv_transfer_config.get_from_extra_config.side_effect = (
+            lambda k, d: {
+                "prefill": {"tp_size": 8, "dp_size": 1, "pp_size": 1},
+                "decode": {"tp_size": 4, "dp_size": 1, "pp_size": 1},
+            }.get(k, d)
+        )
+
+        with self.assertRaisesRegex(ValueError, "match either"):
             MooncakeConnectorWorker(self.vllm_config, self.engine_id)
 
     def test_register_kv_caches_mla_case(self):
@@ -3228,6 +4170,12 @@ class TestMooncakeConnectorWorker(unittest.TestCase):
         recv_args = recv_thread.call_args.args
         self.assertEqual(recv_args[7], [0x1000, 0x2000])
         self.assertEqual(recv_thread.call_args.kwargs["ordinary_group_id"], 0)
+        recv_instance = recv_thread.return_value
+        self.assertEqual(
+            recv_instance.local_registered_bases,
+            (0x1000, 0x2000, 0x3000),
+        )
+        self.assertEqual(recv_instance.local_buffer_group_ids, (0, 0, 1))
 
     def test_register_kv_caches_index_only_uses_group_one_for_ordinary_transfer(self):
         indexer = MagicMock()
@@ -3252,6 +4200,9 @@ class TestMooncakeConnectorWorker(unittest.TestCase):
         recv_args = recv_thread.call_args.args
         self.assertEqual(recv_args[7], [0x3000])
         self.assertEqual(recv_thread.call_args.kwargs["ordinary_group_id"], 1)
+        recv_instance = recv_thread.return_value
+        self.assertEqual(recv_instance.local_registered_bases, (0x3000,))
+        self.assertEqual(recv_instance.local_buffer_group_ids, (1,))
 
     def test_device_id_selection_with_physical_devices(self):
         # Test with physical devices set

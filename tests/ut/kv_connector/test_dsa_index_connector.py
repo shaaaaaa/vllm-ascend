@@ -17,6 +17,9 @@ fake_torch_npu.atb = SimpleNamespace(npu_paged_cache_load=MagicMock())
 sys.modules.setdefault("torch_npu", fake_torch_npu)
 
 from vllm.distributed.kv_transfer.kv_connector.v1.base import SupportsHMA  # noqa: E402
+from vllm.distributed.kv_transfer.kv_connector.v1.base import (  # noqa: E402
+    KVConnectorRole,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import (  # noqa: E402
     MultiKVConnectorMetadata,
 )
@@ -24,6 +27,9 @@ from vllm.v1.core.kv_cache_manager import KVCacheBlocks  # noqa: E402
 
 from vllm_ascend.distributed.kv_transfer.ascend_multi_connector import (  # noqa: E402
     AscendMultiConnector,
+)
+from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector import (  # noqa: E402
+    MooncakeConnector,
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_dsa_index_connector import (  # noqa: E402
     MooncakeDSAIndexConnector,
@@ -104,6 +110,49 @@ def test_ascend_multi_init_supports_legacy_child_connector_signature(monkeypatch
         ("legacy", legacy_config, role, None),
         ("new", new_config, role, kv_cache_config),
     ]
+
+
+def test_live_latent_requires_capable_provider_and_hybrid_consumer():
+    class Provider:
+        supports_dsa_live_latent_split_source = True
+
+        def __init__(self):
+            self.decisions = []
+
+        def configure_live_latent_source(self, enabled):
+            self.decisions.append(enabled)
+
+    provider = Provider()
+    multi = object.__new__(AscendMultiConnector)
+    multi._connectors = [provider]
+    multi._configure_live_latent_split()
+    assert provider.decisions == [False]
+
+    consumer = object.__new__(MooncakeDSAIndexConnector)
+    consumer._latent_live_enabled = False
+    consumer.connector_scheduler = None
+    consumer.connector_worker = SimpleNamespace(kv_role="kv_consumer")
+    multi._connectors = [provider, consumer]
+    multi._configure_live_latent_split()
+
+    assert provider.decisions == [False, True]
+    assert consumer._latent_live_enabled is True
+
+
+def test_live_latent_old_or_unconfigurable_provider_fails_closed():
+    class OldProvider:
+        supports_dsa_live_latent_split_source = True
+
+    consumer = object.__new__(MooncakeDSAIndexConnector)
+    consumer._latent_live_enabled = True
+    consumer.connector_scheduler = None
+    consumer.connector_worker = None
+    multi = object.__new__(AscendMultiConnector)
+    multi._connectors = [OldProvider(), consumer]
+
+    multi._configure_live_latent_split()
+
+    assert consumer._latent_live_enabled is False
 
 
 def test_dsa_index_connector_supports_hma_and_selects_index_group():
@@ -188,6 +237,128 @@ def test_dsa_index_registers_only_indexer_layers():
     )
 
 
+def test_dsa_index_live_latent_registers_full_source_only_on_tp0():
+    connector = object.__new__(MooncakeDSAIndexConnector)
+    connector.index_group_id = 1
+    connector._latent_live_enabled = True
+    connector._latent_live_source_enabled = True
+    connector._latent_live_destination_enabled = False
+    connector._dsa_role = KVConnectorRole.WORKER
+    connector.connector_scheduler = None
+    connector.connector_worker = MagicMock(kv_role="kv_producer", tp_rank=0)
+    latent = (object(), object())
+    indexer = (object(),)
+    caches = {"layer": latent, "layer.indexer": indexer}
+
+    connector.register_kv_caches(caches)
+
+    connector.connector_worker.register_kv_caches.assert_called_once_with(
+        caches, ordinary_kv_caches={"layer.indexer": indexer}
+    )
+
+
+def test_dsa_index_live_latent_registers_full_source_for_kv_both_tp0():
+    connector = object.__new__(MooncakeDSAIndexConnector)
+    connector.index_group_id = 1
+    connector._latent_live_enabled = True
+    connector._latent_live_source_enabled = True
+    connector._latent_live_destination_enabled = True
+    connector._dsa_role = KVConnectorRole.WORKER
+    connector.connector_scheduler = None
+    connector.connector_worker = MagicMock(kv_role="kv_both", tp_rank=0)
+    latent = (object(), object())
+    indexer = (object(),)
+    caches = {"layer": latent, "layer.indexer": indexer}
+
+    assert connector._live_split_source_groups() == (0, 1)
+    connector.register_kv_caches(caches)
+
+    connector.connector_worker.register_kv_caches.assert_called_once_with(
+        caches, ordinary_kv_caches={"layer.indexer": indexer}
+    )
+
+
+def test_dsa_index_live_latent_negotiation_supports_kv_both_worker():
+    connector = object.__new__(MooncakeDSAIndexConnector)
+    connector.index_group_id = 1
+    connector._latent_live_enabled = False
+    connector.connector_scheduler = MagicMock()
+    connector.connector_worker = MagicMock(kv_role="kv_both", tp_rank=0)
+
+    connector.configure_live_latent_source(True)
+
+    assert connector._latent_live_enabled is True
+    assert connector.connector_scheduler.live_split_source_groups == (0, 1)
+    assert connector.connector_worker.live_latent_enabled is True
+
+
+def test_ascend_multi_enables_provider_for_kv_both_transport():
+    class Provider:
+        supports_dsa_live_latent_split_source = True
+
+        def __init__(self):
+            self.decisions = []
+
+        def configure_live_latent_source(self, enabled):
+            self.decisions.append(enabled)
+
+    provider = Provider()
+    consumer = object.__new__(MooncakeDSAIndexConnector)
+    consumer._latent_live_enabled = False
+    consumer.connector_scheduler = None
+    consumer.connector_worker = SimpleNamespace(kv_role="kv_both")
+    multi = object.__new__(AscendMultiConnector)
+    multi._connectors = [provider, consumer]
+
+    multi._configure_live_latent_split()
+
+    assert provider.decisions == [True]
+    assert consumer._latent_live_enabled is True
+
+
+def test_ascend_multi_separates_source_and_destination_transport():
+    class Provider:
+        supports_dsa_live_latent_split_source = False
+        supports_dsa_live_latent_split_destination = True
+
+        def __init__(self):
+            self.decisions = []
+
+        def configure_live_latent_source(self, enabled):
+            self.decisions.append(enabled)
+
+    provider = Provider()
+    transport = object.__new__(MooncakeDSAIndexConnector)
+    transport._latent_live_enabled = False
+    transport._latent_live_source_enabled = False
+    transport._latent_live_destination_enabled = False
+    transport.connector_scheduler = None
+    transport.connector_worker = SimpleNamespace(kv_role="kv_both")
+    multi = object.__new__(AscendMultiConnector)
+    multi._connectors = [provider, transport]
+
+    multi._configure_live_latent_split()
+
+    assert provider.decisions == [True]
+    assert transport._latent_live_source_enabled is False
+    assert transport._latent_live_destination_enabled is True
+
+
+def test_dsa_index_live_latent_decoder_groups_are_rank_aware():
+    connector = object.__new__(MooncakeDSAIndexConnector)
+    connector.index_group_id = 1
+    connector._latent_live_enabled = True
+    connector._latent_live_source_enabled = False
+    connector._latent_live_destination_enabled = True
+    connector._dsa_role = KVConnectorRole.WORKER
+    connector.connector_scheduler = None
+    connector.connector_worker = SimpleNamespace(kv_role="kv_consumer", tp_rank=0)
+    assert connector._live_split_source_groups() == (0, 1)
+
+    connector.connector_worker.tp_rank = 1
+    assert connector._live_split_source_groups() == (1,)
+
+
 def test_ascend_multi_registers_latent_and_indexer_separately():
     multi = object.__new__(AscendMultiConnector)
     latent_connector = MagicMock()
@@ -237,13 +408,11 @@ def test_ascend_multi_registers_all_groups_with_hma_child():
     index_connector.register_kv_caches.assert_called_once_with(kv_caches)
 
 
-def test_ascend_multi_registers_all_groups_for_live_split_child():
+def test_ascend_multi_keeps_generic_mooncake_on_latent_group():
     multi = object.__new__(AscendMultiConnector)
-    live_connector = SimpleNamespace(
-        requires_full_dsa_kv_caches=True,
-        register_kv_caches=MagicMock(),
-    )
-    multi._connectors = [live_connector]
+    mooncake = object.__new__(MooncakeConnector)
+    mooncake.register_kv_caches = MagicMock()
+    multi._connectors = [mooncake]
     kv_caches = {
         "model.layers.0.self_attn": (object(), object()),
         "model.layers.0.self_attn.indexer": (object(),),
@@ -251,7 +420,9 @@ def test_ascend_multi_registers_all_groups_for_live_split_child():
 
     multi.register_kv_caches(kv_caches)
 
-    live_connector.register_kv_caches.assert_called_once_with(kv_caches)
+    mooncake.register_kv_caches.assert_called_once_with(
+        {"model.layers.0.self_attn": kv_caches["model.layers.0.self_attn"]}
+    )
 
 
 def test_ascend_multi_forwards_staged_sfa_capabilities():

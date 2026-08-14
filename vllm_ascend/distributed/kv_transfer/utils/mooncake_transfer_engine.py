@@ -153,13 +153,19 @@ class GlobalTE:
 
     @contextmanager
     def temporary_registration(
-        self, ptrs: list[int], sizes: list[int]
+        self,
+        ptrs: list[int],
+        sizes: list[int],
+        *,
+        require_existing: bool = False,
+        adopted_only: bool = False,
     ) -> Iterator[None]:
         """Lease request-scoped regions without releasing process KV buffers."""
         if len(ptrs) != len(sizes):
             raise ValueError("Mooncake pointer and size counts must match")
         leased_bases: list[int] = []
         adopted_bases: list[int] = []
+        covered_bases: set[int] = set()
         with self.register_buffer_lock:
             assert self.transfer_engine is not None, (
                 "Transfer engine must be initialized"
@@ -182,6 +188,17 @@ class GlobalTE:
                         None,
                     )
                     if containing is not None:
+                        # One context lease protects the whole containing
+                        # registration. Hybrid group-0 commonly supplies one
+                        # range per page from the same shared slab; counting
+                        # every page adds avoidable work without strengthening
+                        # the ownership fence.
+                        if containing in covered_bases:
+                            continue
+                        if adopted_only and containing not in self._adopted_buffers:
+                            raise RuntimeError(
+                                "Mooncake region is not an adopted registration"
+                            )
                         if containing in self._adopted_buffers:
                             self._adopted_leases[containing] = (
                                 self._adopted_leases.get(containing, 0) + 1
@@ -190,7 +207,12 @@ class GlobalTE:
                         elif containing in self._temporary_refcounts:
                             self._temporary_refcounts[containing] += 1
                             leased_bases.append(containing)
+                        covered_bases.add(containing)
                         continue
+                    if require_existing:
+                        raise RuntimeError(
+                            "Mooncake region is outside existing registration"
+                        )
                     if any(
                         ptr < base + registered_size and base < end
                         for base, registered_size
@@ -208,6 +230,7 @@ class GlobalTE:
                     self.registered_buffers[ptr] = size
                     self._temporary_refcounts[ptr] = 1
                     leased_bases.append(ptr)
+                    covered_bases.add(ptr)
             except Exception:
                 try:
                     self._release_temporary_locked(reversed(leased_bases))

@@ -233,9 +233,6 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
     ) -> tuple[set[str] | None, set[str] | None]:
         finished = super().get_finished(finished_req_ids)
         self.get_live_split_results()
-        for pending in self._live_split_result_backlog.values():
-            for request_id in finished_req_ids:
-                pending.pop(request_id, None)
         return finished
 
     def shutdown(self) -> None:
@@ -258,7 +255,7 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
                 False,
             )
         ]
-        for phase in (borrowers, owners):
+        for phase_index, phase in enumerate((borrowers, owners)):
             error: Exception | None = None
             for connector in phase:
                 try:
@@ -271,6 +268,16 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
                     error = exc
             if error is not None:
                 raise error
+            if phase_index == 0:
+                # Borrower shutdown fences native DMA. Drain any terminal
+                # results it produced before owner shutdown cancels/releases
+                # the destination contexts.
+                self.get_live_split_results()
+                if any(self._live_split_result_backlog.values()):
+                    raise RuntimeError(
+                        "Live-split terminal results were not accepted before "
+                        "destination-owner shutdown"
+                    )
 
     def __init__(
         self,
@@ -318,6 +325,59 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
             "AscendMultiConnector initialized children: %s",
             [connector.__class__.__name__ for connector in self._connectors],
         )
+        self._configure_live_latent_split()
+
+    def _configure_live_latent_split(self) -> None:
+        """Enable hybrid group-0 only when owner and borrower both support it."""
+        source_providers: list[Any] = []
+        destination_providers: list[Any] = []
+        hybrid_consumers: list[Any] = []
+        for child in self._connectors:
+            configure = getattr(child, "configure_live_latent_source", None)
+            source_capability = getattr(
+                child, "supports_dsa_live_latent_split_source", False
+            )
+            if callable(configure) and bool(
+                source_capability()
+                if callable(source_capability)
+                else source_capability
+            ):
+                source_providers.append(child)
+            destination_capability = getattr(
+                child, "supports_dsa_live_latent_split_destination", False
+            )
+            if callable(configure) and bool(
+                destination_capability()
+                if callable(destination_capability)
+                else destination_capability
+            ):
+                destination_providers.append(child)
+            transport_capability = getattr(
+                child, "supports_dsa_live_latent_transport", False
+            )
+            if (
+                isinstance(child, MooncakeDSAIndexConnector)
+                and callable(configure)
+                and bool(
+                    transport_capability()
+                    if callable(transport_capability)
+                    else transport_capability
+                )
+            ):
+                hybrid_consumers.append(child)
+
+        source_enabled = bool(source_providers and hybrid_consumers)
+        destination_enabled = bool(destination_providers and hybrid_consumers)
+        for child in self._connectors:
+            configure_transport = getattr(
+                child, "configure_live_latent_transport", None
+            )
+            if callable(configure_transport):
+                configure_transport(source_enabled, destination_enabled)
+                continue
+            configure = getattr(child, "configure_live_latent_source", None)
+            if callable(configure):
+                configure(source_enabled or destination_enabled)
 
     def _has_dsa_index_connector(self) -> bool:
         return any(isinstance(c, MooncakeDSAIndexConnector) for c in self._connectors)
@@ -368,7 +428,7 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
         )
 
         if has_index_connector:
-            logger.info(
+            logger.debug(
                 "AscendMultiConnector DSA KV split: total_layers=%d "
                 "latent_layers=%d indexer_layers=%d children=%s",
                 len(kv_caches),
@@ -531,7 +591,7 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
                 self._index_load_async_req_ids = index_load_async_req_ids
             index_load_async_req_ids.add(request.request_id)
             params = request.kv_transfer_params
-            logger.info(
+            logger.debug(
                 "AscendMultiConnector scheduling async DSA index load: "
                 "request_id=%s external_tokens=%d chosen_connector=%s "
                 "remote_index_blocks=%d",
@@ -576,7 +636,7 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
             or do_remote_prefill
             or do_remote_decode
         ):
-            logger.info(
+            logger.debug(
                 "AscendMultiConnector alloc dispatch: request_id=%s "
                 "external_tokens=%d block_groups=%s chosen_connector=%s "
                 "do_remote_prefill=%s do_remote_decode=%s",
@@ -590,7 +650,7 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
         empty_blocks = blocks.new_empty()
         for i, connector in enumerate(self._connectors):
             if skip_chosen_zero_update and i == chosen_connector:
-                logger.info(
+                logger.debug(
                     "AscendMultiConnector preserving latent load state "
                     "after async DSA index load: request_id=%s "
                     "skipped_connector=%s",
@@ -616,7 +676,7 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
         request: "Request",
         block_ids: tuple[list[int], ...],
     ) -> tuple[bool, dict[str, Any] | None]:
-        logger.info(
+        logger.debug(
             "AscendMultiConnector finish dispatch: request_id=%s "
             "block_groups=%s children=%s",
             request.request_id,
