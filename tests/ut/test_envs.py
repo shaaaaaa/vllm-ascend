@@ -127,8 +127,8 @@ class TestEnvVariables(TestBase):
             ):
                 getattr(envs_ascend, name)
 
-    def test_prefill_timing_debug_is_strict_boolean(self):
-        name = "VLLM_ASCEND_PREFILL_TIMING_DEBUG"
+    def test_prefill_profile_all_chunks_is_strict_boolean(self):
+        name = "VLLM_ASCEND_PREFILL_PROFILE_ALL_CHUNKS"
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop(name, None)
             self.assertFalse(getattr(envs_ascend, name))
