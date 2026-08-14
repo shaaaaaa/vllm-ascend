@@ -45,12 +45,29 @@ class Prompt:
 @dataclass(frozen=True)
 class RequestResult:
     request_index: int
+    request_id: str
     prompt_digest: str
     first_chunk_digest: str
     ttft_seconds: float
     e2e_seconds: float
     prompt_tokens_reported: int | None
     completion_tokens_reported: int | None
+    client_send_unix_ns: int
+    client_response_headers_unix_ns: int
+    client_first_token_unix_ns: int
+    client_done_unix_ns: int
+
+
+@dataclass(frozen=True)
+class ClientTiming:
+    ttft_seconds: float
+    e2e_seconds: float
+    prompt_tokens_reported: int | None
+    completion_tokens_reported: int | None
+    send_unix_ns: int
+    response_headers_unix_ns: int
+    first_token_unix_ns: int
+    done_unix_ns: int
 
 
 def _digest_token_ids(token_ids: list[int]) -> str:
@@ -114,7 +131,7 @@ class CompletionClient:
         model: str,
         prompt: Prompt,
         request_id: str,
-    ) -> tuple[float, float, int | None, int | None]:
+    ) -> ClientTiming:
         payload = {
             "model": model,
             "prompt": prompt.token_ids,
@@ -131,6 +148,7 @@ class CompletionClient:
             "X-Request-Id": request_id,
         }
 
+        send_unix_ns = time.time_ns()
         started = time.perf_counter()
         self.connection.request(
             "POST",
@@ -139,11 +157,13 @@ class CompletionClient:
             headers=headers,
         )
         response = self.connection.getresponse()
+        response_headers_unix_ns = time.time_ns()
         if response.status != 200:
             error_body = response.read().decode("utf-8", errors="replace")
             raise RuntimeError(f"request failed with HTTP {response.status}: {error_body}")
 
         first_token_at: float | None = None
+        first_token_unix_ns: int | None = None
         prompt_tokens_reported: int | None = None
         completion_tokens_reported: int | None = None
         saw_done = False
@@ -165,6 +185,7 @@ class CompletionClient:
             choices = event.get("choices") or []
             if first_token_at is None and any("text" in choice for choice in choices):
                 first_token_at = time.perf_counter()
+                first_token_unix_ns = time.time_ns()
             usage = event.get("usage")
             if usage:
                 prompt_tokens_reported = usage.get("prompt_tokens")
@@ -174,15 +195,21 @@ class CompletionClient:
         # Consume the response tail before reusing this persistent connection.
         response.read()
         completed = time.perf_counter()
+        done_unix_ns = time.time_ns()
         if not saw_done:
             raise RuntimeError("stream ended without a [DONE] event")
         if first_token_at is None:
             raise RuntimeError("stream completed without a completion-token event")
-        return (
-            first_token_at - started,
-            completed - started,
-            prompt_tokens_reported,
-            completion_tokens_reported,
+        assert first_token_unix_ns is not None
+        return ClientTiming(
+            ttft_seconds=first_token_at - started,
+            e2e_seconds=completed - started,
+            prompt_tokens_reported=prompt_tokens_reported,
+            completion_tokens_reported=completion_tokens_reported,
+            send_unix_ns=send_unix_ns,
+            response_headers_unix_ns=response_headers_unix_ns,
+            first_token_unix_ns=first_token_unix_ns,
+            done_unix_ns=done_unix_ns,
         )
 
 
@@ -335,48 +362,58 @@ def run_case(
 
     results: list[RequestResult] = []
     for index, prompt in enumerate(warmup_prompts):
-        ttft, e2e, _, _ = client.run(
+        timing = client.run(
             model=args.model,
             prompt=prompt,
             request_id=f"prefill-{args.label}-{multiplier}x-warmup-{index}",
         )
         print(
             f"warmup {index + 1}/{args.warmups} "
-            f"hash={prompt.digest[:16]} ttft={ttft * 1000:.3f} ms "
-            f"e2e={e2e * 1000:.3f} ms",
+            f"hash={prompt.digest[:16]} "
+            f"ttft={timing.ttft_seconds * 1000:.3f} ms "
+            f"e2e={timing.e2e_seconds * 1000:.3f} ms",
             flush=True,
         )
 
     for index, prompt in enumerate(measured_prompts):
-        ttft, e2e, prompt_count, completion_count = client.run(
+        request_id = f"prefill-{args.label}-{multiplier}x-measure-{index}"
+        timing = client.run(
             model=args.model,
             prompt=prompt,
-            request_id=f"prefill-{args.label}-{multiplier}x-measure-{index}",
+            request_id=request_id,
         )
+        prompt_count = timing.prompt_tokens_reported
+        completion_count = timing.completion_tokens_reported
         if prompt_count is not None and prompt_count != prompt_tokens:
             raise RuntimeError(
                 f"server reported an unexpected prompt length: expected={prompt_tokens}, actual={prompt_count}"
             )
         result = RequestResult(
             request_index=index,
+            request_id=request_id,
             prompt_digest=prompt.digest,
             first_chunk_digest=prompt.first_chunk_digest,
-            ttft_seconds=ttft,
-            e2e_seconds=e2e,
+            ttft_seconds=timing.ttft_seconds,
+            e2e_seconds=timing.e2e_seconds,
             prompt_tokens_reported=prompt_count,
             completion_tokens_reported=completion_count,
+            client_send_unix_ns=timing.send_unix_ns,
+            client_response_headers_unix_ns=timing.response_headers_unix_ns,
+            client_first_token_unix_ns=timing.first_token_unix_ns,
+            client_done_unix_ns=timing.done_unix_ns,
         )
         results.append(result)
         print(
             f"measure {index + 1}/{args.repeats} "
-            f"hash={prompt.digest[:16]} ttft={ttft * 1000:.3f} ms "
-            f"e2e={e2e * 1000:.3f} ms",
+            f"hash={prompt.digest[:16]} "
+            f"ttft={timing.ttft_seconds * 1000:.3f} ms "
+            f"e2e={timing.e2e_seconds * 1000:.3f} ms",
             flush=True,
         )
 
     summary = summarize(results, prompt_tokens, args.chunk_size)
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "label": args.label,
         "multiplier": multiplier,
         "base_url": args.base_url,
@@ -458,7 +495,7 @@ def main() -> int:
 
     if multiple_cases:
         aggregate = {
-            "schema_version": 2,
+            "schema_version": 3,
             "label": args.label,
             "base_prompt_tokens": args.prompt_tokens,
             "chunk_size": args.chunk_size,

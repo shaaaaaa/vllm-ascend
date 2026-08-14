@@ -404,6 +404,80 @@ class TestNPUWorker(TestBase):
         )
         profiler.start.assert_called_once_with()
 
+    def test_prefill_trace_records_host_points_for_rank_zero(self):
+        from vllm_ascend.worker.worker import NPUWorker
+
+        request_id = "cmpl-prefill-off-1x-measure-0-0-deadbeef"
+        scheduler_output = SimpleNamespace(
+            scheduled_new_reqs=[
+                SimpleNamespace(
+                    req_id=request_id,
+                    prompt_token_ids=list(range(4096)),
+                    prefill_token_ids=None,
+                    num_computed_tokens=0,
+                )
+            ],
+            scheduled_cached_reqs=SimpleNamespace(
+                req_ids=[],
+                num_computed_tokens=[],
+            ),
+            num_scheduled_tokens={request_id: 2048},
+        )
+        with patch.object(NPUWorker, "__init__", lambda self: None):
+            worker = NPUWorker()
+        worker.rank = 0
+        worker.vllm_config = SimpleNamespace(
+            scheduler_config=SimpleNamespace(max_num_batched_tokens=2048)
+        )
+        worker._prefill_trace_prompt_lens = {}
+        worker._prefill_trace_execute_start_ns = 10
+        worker._prefill_trace_execute_return_ns = 20
+
+        with (
+            patch(
+                "vllm_ascend.worker.worker.prefill_trace_enabled",
+                return_value=True,
+            ),
+            patch(
+                "vllm_ascend.worker.worker.prefill_trace_points_at"
+            ) as trace_points_at,
+        ):
+            steps = worker._worker_prefill_trace_steps(scheduler_output)
+            worker._flush_worker_prefill_points(
+                steps,
+                sample_start_ns=21,
+                sample_return_ns=22,
+            )
+
+        points = trace_points_at.call_args.args[0]
+        assert [point[:3] for point in points] == [
+            ("worker_execute_start", request_id, 10),
+            ("worker_execute_return", request_id, 20),
+            ("worker_sampling_start", request_id, 21),
+            ("worker_sampling_return", request_id, 22),
+        ]
+        for point in points:
+            assert point[3] == {
+                "rank": 0,
+                "chunk": 1,
+                "total_chunks": 2,
+                "computed_tokens": 0,
+                "scheduled_tokens": 2048,
+                "prompt_tokens": 4096,
+            }
+
+    def test_prefill_trace_skips_nonzero_worker_ranks(self):
+        from vllm_ascend.worker.worker import NPUWorker
+
+        with patch.object(NPUWorker, "__init__", lambda self: None):
+            worker = NPUWorker()
+        worker.rank = 1
+        with patch(
+            "vllm_ascend.worker.worker.prefill_trace_enabled",
+            return_value=True,
+        ):
+            assert worker._worker_prefill_trace_steps(MagicMock()) == ()
+
     def test_profile_no_profiler_raises_error(self):
         """Test profile method raises exception when profiler is not available"""
         from vllm_ascend.worker.worker import NPUWorker

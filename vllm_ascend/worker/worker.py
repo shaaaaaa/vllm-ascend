@@ -37,6 +37,20 @@ from vllm.distributed.kv_transfer import ensure_kv_transfer_initialized, get_kv_
 from vllm.distributed.parallel_state import Handle, get_pp_group, get_tp_group
 from vllm.logger import logger
 from vllm.lora.request import LoRARequest
+from vllm.prefill_trace import (
+    PrefillStep,
+    prefill_steps,
+    step_fields,
+)
+from vllm.prefill_trace import (
+    enabled as prefill_trace_enabled,
+)
+from vllm.prefill_trace import (
+    points_at as prefill_trace_points_at,
+)
+from vllm.prefill_trace import (
+    timestamp_ns as prefill_trace_timestamp_ns,
+)
 from vllm.sequence import IntermediateTensors
 from vllm.tasks import SupportedTask
 from vllm.utils.mem_constants import GiB_bytes
@@ -138,6 +152,10 @@ class NPUWorker(WorkerBase):
         # Profiler is lazily initialized on first profile(is_start=True) call (RFC #6954)
         self.profiler_config = vllm_config.profiler_config
         self.profiler = None
+        self._prefill_trace_prompt_lens: dict[str, int] = {}
+        self._prefill_trace_sample_steps: tuple[PrefillStep, ...] = ()
+        self._prefill_trace_execute_start_ns: int | None = None
+        self._prefill_trace_execute_return_ns: int | None = None
         self._prefill_profile_all_chunks = (
             envs_ascend.VLLM_ASCEND_PREFILL_PROFILE_ALL_CHUNKS
         )
@@ -504,6 +522,10 @@ class NPUWorker(WorkerBase):
                 comm_postprocess=comm_postprocess,
             )
 
+        trace_steps = self._worker_prefill_trace_steps(scheduler_output)
+        trace_execute_start_ns = (
+            prefill_trace_timestamp_ns() if trace_steps else None
+        )
         profile_chunk_marker = self._maybe_start_prefill_profile(
             scheduler_output
         )
@@ -519,7 +541,19 @@ class NPUWorker(WorkerBase):
                 )
         finally:
             self._maybe_stop_prefill_profile(scheduler_output)
+        trace_execute_return_ns = (
+            prefill_trace_timestamp_ns() if trace_steps else None
+        )
+        self._prefill_trace_sample_steps = trace_steps
+        self._prefill_trace_execute_start_ns = trace_execute_start_ns
+        self._prefill_trace_execute_return_ns = trace_execute_return_ns
         if isinstance(output, (ModelRunnerOutput, AsyncModelRunnerOutput, NoneType)):
+            if output is not None:
+                self._flush_worker_prefill_points(
+                    trace_steps,
+                    sample_start_ns=None,
+                    sample_return_ns=None,
+                )
             return output
 
         assert isinstance(output, IntermediateTensors)
@@ -550,7 +584,67 @@ class NPUWorker(WorkerBase):
 
     @torch.inference_mode()
     def sample_tokens(self, grammar_output: "GrammarOutput") -> ModelRunnerOutput | AsyncModelRunnerOutput:
-        return self.model_runner.sample_tokens(grammar_output)
+        trace_steps = self._prefill_trace_sample_steps
+        sample_start_ns = prefill_trace_timestamp_ns() if trace_steps else None
+        try:
+            return self.model_runner.sample_tokens(grammar_output)
+        finally:
+            self._flush_worker_prefill_points(
+                trace_steps,
+                sample_start_ns=sample_start_ns,
+                sample_return_ns=(
+                    prefill_trace_timestamp_ns() if trace_steps else None
+                ),
+            )
+            for step in trace_steps:
+                if step.computed_tokens + step.scheduled_tokens >= step.prompt_tokens:
+                    self._prefill_trace_prompt_lens.pop(
+                        step.request_id,
+                        None,
+                    )
+            self._prefill_trace_sample_steps = ()
+
+    def _worker_prefill_trace_steps(
+        self,
+        scheduler_output: "SchedulerOutput",
+    ) -> tuple[PrefillStep, ...]:
+        if self.rank != 0 or not prefill_trace_enabled():
+            return ()
+        return prefill_steps(
+            scheduler_output,
+            self._prefill_trace_prompt_lens,
+        )
+
+    def _flush_worker_prefill_points(
+        self,
+        steps: tuple[PrefillStep, ...],
+        *,
+        sample_start_ns: int | None,
+        sample_return_ns: int | None,
+    ) -> None:
+        chunk_size = int(self.vllm_config.scheduler_config.max_num_batched_tokens)
+        event_times = (
+            ("worker_execute_start", self._prefill_trace_execute_start_ns),
+            ("worker_execute_return", self._prefill_trace_execute_return_ns),
+            ("worker_sampling_start", sample_start_ns),
+            ("worker_sampling_return", sample_return_ns),
+        )
+        points = []
+        for step in steps:
+            fields = step_fields(step, chunk_size)
+            for event, unix_ns in event_times:
+                if unix_ns is not None:
+                    points.append(
+                        (
+                            event,
+                            step.request_id,
+                            unix_ns,
+                            {"rank": self.rank, **fields},
+                        )
+                    )
+        prefill_trace_points_at(points)
+        self._prefill_trace_execute_start_ns = None
+        self._prefill_trace_execute_return_ns = None
 
     def load_model(self) -> None:
         if self.vllm_config.model_config.enable_sleep_mode:

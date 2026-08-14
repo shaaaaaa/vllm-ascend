@@ -71,21 +71,31 @@ def test_summary_reports_average_chunk_and_total_times() -> None:
     results = [
         BENCHMARK.RequestResult(
             request_index=0,
+            request_id="prefill-off-1x-measure-0",
             prompt_digest="a",
             first_chunk_digest="aa",
             ttft_seconds=8.0,
             e2e_seconds=8.1,
             prompt_tokens_reported=16384,
             completion_tokens_reported=1,
+            client_send_unix_ns=1,
+            client_response_headers_unix_ns=2,
+            client_first_token_unix_ns=3,
+            client_done_unix_ns=4,
         ),
         BENCHMARK.RequestResult(
             request_index=1,
+            request_id="prefill-off-1x-measure-1",
             prompt_digest="b",
             first_chunk_digest="bb",
             ttft_seconds=12.0,
             e2e_seconds=12.1,
             prompt_tokens_reported=16384,
             completion_tokens_reported=1,
+            client_send_unix_ns=5,
+            client_response_headers_unix_ns=6,
+            client_first_token_unix_ns=7,
+            client_done_unix_ns=8,
         ),
     ]
 
