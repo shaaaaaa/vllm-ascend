@@ -3390,17 +3390,40 @@ class NPUModelRunner(GPUModelRunner):
             if any(cold_resumes):
                 computed = np.asarray(num_computed_tokens).reshape(-1)
                 prompts = np.asarray(prompt_lens).reshape(-1)
-                if (
-                    len(cold_resumes) != num_reqs
-                    or computed.shape != (num_reqs,)
-                    or prompts.shape != (num_reqs,)
-                    or any(
-                        int(computed[i]) != int(prompts[i]) - 1
-                        or frontiers[i] != int(computed[i])
-                        for i, resume in enumerate(cold_resumes)
-                        if resume
+                layout_failures: list[str] = []
+                if len(cold_resumes) != num_reqs:
+                    layout_failures.append("resume_count")
+                if computed.shape != (num_reqs,):
+                    layout_failures.append("computed_shape")
+                if prompts.shape != (num_reqs,):
+                    layout_failures.append("prompt_shape")
+                if not layout_failures:
+                    for i, resume in enumerate(cold_resumes):
+                        if not resume:
+                            continue
+                        if int(computed[i]) != int(prompts[i]) - 1:
+                            layout_failures.append(
+                                f"computed_prompt_minus_one[{i}]"
+                            )
+                        if frontiers[i] != int(computed[i]):
+                            layout_failures.append(
+                                f"frontier_computed[{i}]"
+                            )
+                if layout_failures:
+                    log_cold_perf_event(
+                        "decoder_cold_compact_graph_reject",
+                        request_ids=request_ids,
+                        once=True,
+                        failed_invariants=layout_failures,
+                        cold_resume_indices=[
+                            i
+                            for i, resume in enumerate(cold_resumes)
+                            if resume
+                        ],
+                        num_computed_tokens=computed.tolist(),
+                        prompt_lens=prompts.tolist(),
+                        remap_frontiers=list(frontiers),
                     )
-                ):
                     return native(StagedSFARouteReason.COLD_COMPACT_LAYOUT)
         else:
             cold_resumes = ()

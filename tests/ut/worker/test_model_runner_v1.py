@@ -1075,6 +1075,44 @@ class TestStagedSFADummyBatch(unittest.TestCase):
                     StagedSFARouteReason.COLD_COMPACT_LAYOUT,
                 )
 
+        bad_frontier = SimpleNamespace(
+            requests=[
+                SimpleNamespace(
+                    req_id="cold",
+                    is_sparse_decode=True,
+                    load_spec=SimpleNamespace(
+                        can_load=True,
+                        dsa_committed_end=7936,
+                        dsa_cold_compact_resume=True,
+                    ),
+                )
+            ]
+        )
+        with patch.object(
+            model_runner_module, "log_cold_perf_event"
+        ) as log_event:
+            rejected = runner._staged_sfa_local_route(
+                **{
+                    **kwargs,
+                    "kv_connector_metadata": bad_frontier,
+                }
+            )
+
+        self.assertEqual(
+            rejected.reason,
+            StagedSFARouteReason.COLD_COMPACT_LAYOUT,
+        )
+        log_event.assert_called_once_with(
+            "decoder_cold_compact_graph_reject",
+            request_ids=["cold"],
+            once=True,
+            failed_invariants=["frontier_computed[0]"],
+            cold_resume_indices=[0],
+            num_computed_tokens=[8192],
+            prompt_lens=[8193],
+            remap_frontiers=[7936],
+        )
+
     def test_native_route_logs_once_per_reason(self):
         runner = self._build_runner()
         route = model_runner_module.StagedSFARouteDecision(
