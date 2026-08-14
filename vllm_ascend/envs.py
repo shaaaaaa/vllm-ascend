@@ -49,6 +49,13 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_PREFILL_PROFILE_EDGE_CHUNKS": lambda: int(
         os.getenv("VLLM_ASCEND_PREFILL_PROFILE_EDGE_CHUNKS", "0")
     ),
+    # Diagnostic-only chunked-prefill wall-clock logging. When enabled, each
+    # worker reports the execute_model duration and the gap since the previous
+    # chunk. The timer does not synchronize the NPU and defaults to disabled.
+    # This variable is not sensitive; valid values are true and false.
+    "VLLM_ASCEND_PREFILL_TIMING_DEBUG": lambda: _strict_bool_env(
+        "VLLM_ASCEND_PREFILL_TIMING_DEBUG"
+    ),
     # max compile thread number for package building. Usually, it is set to
     # the number of CPU cores. If not set, the default value is None, which
     # means all number of CPU cores will be used.

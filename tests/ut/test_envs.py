@@ -126,3 +126,19 @@ class TestEnvVariables(TestBase):
                 ),
             ):
                 getattr(envs_ascend, name)
+
+    def test_prefill_timing_debug_is_strict_boolean(self):
+        name = "VLLM_ASCEND_PREFILL_TIMING_DEBUG"
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(name, None)
+            self.assertFalse(getattr(envs_ascend, name))
+
+        for value, expected in (("true", True), ("false", False)):
+            with patch.dict(os.environ, {name: value}):
+                self.assertIs(getattr(envs_ascend, name), expected)
+
+        with (
+            patch.dict(os.environ, {name: "1"}),
+            self.assertRaisesRegex(ValueError, name),
+        ):
+            getattr(envs_ascend, name)

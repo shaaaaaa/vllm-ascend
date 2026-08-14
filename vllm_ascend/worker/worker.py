@@ -20,6 +20,7 @@
 import copy
 import gc
 import math
+import time
 from contextlib import nullcontext
 from pathlib import Path
 from types import NoneType
@@ -169,6 +170,16 @@ class NPUWorker(WorkerBase):
                 "chunk_size=%d",
                 self._prefill_profile_edge_chunks,
                 self._prefill_profile_chunk_size,
+            )
+        self._prefill_timing_debug = envs_ascend.VLLM_ASCEND_PREFILL_TIMING_DEBUG
+        self._prefill_timing_prompt_lens: dict[str, int] = {}
+        self._prefill_timing_last_end: dict[str, float] = {}
+        self._prefill_timing_pending_sample: tuple[str, int, int] | None = None
+        if self._prefill_timing_debug:
+            logger.info(
+                "[PREFILL_TIMING] worker timing enabled: rank=%d mode=%s",
+                self.rank,
+                "on" if envs_ascend.VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE else "off",
             )
         if vllm_config.model_config and vllm_config.model_config.enable_sleep_mode:
             # Buffers saved before sleep
@@ -511,6 +522,9 @@ class NPUWorker(WorkerBase):
                 comm_postprocess=comm_postprocess,
             )
 
+        timing_step = self._prefill_timing_step(scheduler_output)
+        timing_started = time.perf_counter() if timing_step is not None else 0.0
+        timing_started_ns = time.time_ns() if timing_step is not None else 0
         profile_chunk_marker = self._maybe_start_prefill_profile(
             scheduler_output
         )
@@ -526,6 +540,50 @@ class NPUWorker(WorkerBase):
                 )
         finally:
             self._maybe_stop_prefill_profile(scheduler_output)
+            if timing_step is not None:
+                timing_ended = time.perf_counter()
+                timing_ended_ns = time.time_ns()
+                req_id, computed, scheduled, prompt_len = timing_step
+                previous_end = self._prefill_timing_last_end.get(req_id)
+                gap_ms = (
+                    (timing_started - previous_end) * 1000
+                    if previous_end is not None
+                    else None
+                )
+                chunk_size = int(
+                    self.vllm_config.scheduler_config.max_num_batched_tokens
+                )
+                chunk_index = computed // chunk_size + 1
+                total_chunks = math.ceil(prompt_len / chunk_size)
+                logger.info(
+                    "[PREFILL_TIMING] worker_chunk rank=%d mode=%s "
+                    "request=%s chunk=%d/%d tokens=[%d,%d) "
+                    "scheduled=%d gap_ms=%s execute_ms=%.3f "
+                    "start_unix_ns=%d end_unix_ns=%d",
+                    self.rank,
+                    "on"
+                    if envs_ascend.VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE
+                    else "off",
+                    req_id,
+                    chunk_index,
+                    total_chunks,
+                    computed,
+                    computed + scheduled,
+                    scheduled,
+                    "first" if gap_ms is None else f"{gap_ms:.3f}",
+                    (timing_ended - timing_started) * 1000,
+                    timing_started_ns,
+                    timing_ended_ns,
+                )
+                self._prefill_timing_last_end[req_id] = timing_ended
+                if computed + scheduled >= prompt_len:
+                    self._prefill_timing_pending_sample = (
+                        req_id,
+                        computed + scheduled,
+                        timing_ended_ns,
+                    )
+                    self._prefill_timing_prompt_lens.pop(req_id, None)
+                    self._prefill_timing_last_end.pop(req_id, None)
         if isinstance(output, (ModelRunnerOutput, AsyncModelRunnerOutput, NoneType)):
             return output
 
@@ -557,7 +615,36 @@ class NPUWorker(WorkerBase):
 
     @torch.inference_mode()
     def sample_tokens(self, grammar_output: "GrammarOutput") -> ModelRunnerOutput | AsyncModelRunnerOutput:
-        return self.model_runner.sample_tokens(grammar_output)
+        timing_sample = getattr(
+            self,
+            "_prefill_timing_pending_sample",
+            None,
+        )
+        timing_started = time.perf_counter() if timing_sample is not None else 0.0
+        timing_started_ns = time.time_ns() if timing_sample is not None else 0
+        try:
+            return self.model_runner.sample_tokens(grammar_output)
+        finally:
+            if timing_sample is not None:
+                timing_ended = time.perf_counter()
+                timing_ended_ns = time.time_ns()
+                req_id, prompt_len, forward_end_ns = timing_sample
+                logger.info(
+                    "[PREFILL_TIMING] worker_sample rank=%d mode=%s "
+                    "request=%s prompt_tokens=%d forward_to_sample_ms=%.3f "
+                    "sample_ms=%.3f start_unix_ns=%d end_unix_ns=%d",
+                    self.rank,
+                    "on"
+                    if envs_ascend.VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE
+                    else "off",
+                    req_id,
+                    prompt_len,
+                    (timing_started_ns - forward_end_ns) / 1_000_000,
+                    (timing_ended - timing_started) * 1000,
+                    timing_started_ns,
+                    timing_ended_ns,
+                )
+                self._prefill_timing_pending_sample = None
 
     def load_model(self) -> None:
         if self.vllm_config.model_config.enable_sleep_mode:
@@ -696,6 +783,42 @@ class NPUWorker(WorkerBase):
 
     def _prefill_profile_window_enabled(self) -> bool:
         return getattr(self, "_prefill_profile_edge_chunks", 0) > 0
+
+    def _prefill_timing_step(
+        self,
+        scheduler_output: "SchedulerOutput",
+    ) -> tuple[str, int, int, int] | None:
+        """Return the single active prefill step when timing is enabled."""
+        if not getattr(self, "_prefill_timing_debug", False):
+            return None
+
+        prompt_lens = self._prefill_timing_prompt_lens
+        computed_by_req: dict[str, int] = {}
+        for request in scheduler_output.scheduled_new_reqs:
+            prompt_token_ids = request.prompt_token_ids
+            if prompt_token_ids is None:
+                prompt_token_ids = request.prefill_token_ids
+            if prompt_token_ids is not None:
+                prompt_lens[request.req_id] = len(prompt_token_ids)
+            computed_by_req[request.req_id] = request.num_computed_tokens
+
+        cached = scheduler_output.scheduled_cached_reqs
+        computed_by_req.update(zip(cached.req_ids, cached.num_computed_tokens))
+        candidates = []
+        for req_id, scheduled in scheduler_output.num_scheduled_tokens.items():
+            computed = computed_by_req.get(req_id)
+            prompt_len = prompt_lens.get(req_id)
+            if (
+                computed is not None
+                and prompt_len is not None
+                and computed < prompt_len
+            ):
+                candidates.append(
+                    (req_id, int(computed), int(scheduled), prompt_len)
+                )
+        if len(candidates) != 1:
+            return None
+        return candidates[0]
 
     def _profile_prefill_window(
         self,

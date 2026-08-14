@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import sys
+from argparse import Namespace
 from pathlib import Path
 from types import ModuleType
 
@@ -37,7 +38,7 @@ def test_each_prompt_length_uses_a_distinct_cache_prefix() -> None:
     digests = []
     for multiplier in BENCHMARK.prompt_multipliers("on", 3):
         prompt = BENCHMARK.make_prompts(
-            seed=BENCHMARK.case_seed(1234, "on", multiplier),
+            seed=BENCHMARK.case_seed(1234, multiplier),
             count=1,
             prompt_tokens=64 * multiplier,
             token_id_min=1000,
@@ -48,10 +49,85 @@ def test_each_prompt_length_uses_a_distinct_cache_prefix() -> None:
     assert len(digests) == len(set(digests))
 
 
+def test_run_case_label_does_not_change_requests() -> None:
+    class RecordingClient:
+        def __init__(self) -> None:
+            self.calls = []
+
+        def run(self, **kwargs):
+            self.calls.append(kwargs)
+            return 0.1, 0.2, 64, 1, 100, 200
+
+    def run(label: str):
+        client = RecordingClient()
+        args = Namespace(
+            label=label,
+            prompt_tokens=64,
+            warmups=1,
+            repeats=2,
+            seed=20260811,
+            warmup_seed=10001,
+            token_id_min=1000,
+            token_id_max=2000,
+            cache_chunk_tokens=16,
+            chunk_size=16,
+            model="model",
+            base_url="http://127.0.0.1:9960",
+            endpoint="/v1/completions",
+        )
+        BENCHMARK.run_case(
+            args=args,
+            client=client,
+            multiplier=1,
+            seen_first_chunk_digests=set(),
+        )
+        return [
+            (call["request_id"], call["prompt"].token_ids)
+            for call in client.calls
+        ]
+
+    assert run("off") == run("on")
+
+
+def test_measured_output_records_request_id_and_wall_clock() -> None:
+    class RecordingClient:
+        def run(self, **kwargs):
+            return 0.1, 0.2, 64, 1, 123, 456
+
+    args = Namespace(
+        label="on",
+        prompt_tokens=64,
+        warmups=0,
+        repeats=1,
+        seed=20260811,
+        warmup_seed=10001,
+        token_id_min=1000,
+        token_id_max=2000,
+        cache_chunk_tokens=16,
+        chunk_size=16,
+        model="model",
+        base_url="http://127.0.0.1:9960",
+        endpoint="/v1/completions",
+    )
+
+    output = BENCHMARK.run_case(
+        args=args,
+        client=RecordingClient(),
+        multiplier=1,
+        seen_first_chunk_digests=set(),
+    )
+
+    request = output["requests"][0]
+    assert request["request_id"] == "prefill-1x-measure-0"
+    assert request["client_start_unix_ns"] == 123
+    assert request["first_token_unix_ns"] == 456
+
+
 def test_summary_reports_average_chunk_and_total_times() -> None:
     results = [
         BENCHMARK.RequestResult(
             request_index=0,
+            request_id="prefill-1x-measure-0",
             prompt_digest="a",
             first_chunk_digest="aa",
             ttft_seconds=8.0,
@@ -61,6 +137,7 @@ def test_summary_reports_average_chunk_and_total_times() -> None:
         ),
         BENCHMARK.RequestResult(
             request_index=1,
+            request_id="prefill-1x-measure-1",
             prompt_digest="b",
             first_chunk_digest="bb",
             ttft_seconds=12.0,

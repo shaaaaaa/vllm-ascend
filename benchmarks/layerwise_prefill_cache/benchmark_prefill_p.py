@@ -45,12 +45,15 @@ class Prompt:
 @dataclass(frozen=True)
 class RequestResult:
     request_index: int
+    request_id: str | None
     prompt_digest: str
     first_chunk_digest: str
     ttft_seconds: float
     e2e_seconds: float
     prompt_tokens_reported: int | None
     completion_tokens_reported: int | None
+    client_start_unix_ns: int | None = None
+    first_token_unix_ns: int | None = None
 
 
 def _digest_token_ids(token_ids: list[int]) -> str:
@@ -114,7 +117,7 @@ class CompletionClient:
         model: str,
         prompt: Prompt,
         request_id: str,
-    ) -> tuple[float, float, int | None, int | None]:
+    ) -> tuple[float, float, int | None, int | None, int, int]:
         payload = {
             "model": model,
             "prompt": prompt.token_ids,
@@ -131,6 +134,7 @@ class CompletionClient:
             "X-Request-Id": request_id,
         }
 
+        started_unix_ns = time.time_ns()
         started = time.perf_counter()
         self.connection.request(
             "POST",
@@ -144,6 +148,7 @@ class CompletionClient:
             raise RuntimeError(f"request failed with HTTP {response.status}: {error_body}")
 
         first_token_at: float | None = None
+        first_token_unix_ns: int | None = None
         prompt_tokens_reported: int | None = None
         completion_tokens_reported: int | None = None
         saw_done = False
@@ -165,6 +170,7 @@ class CompletionClient:
             choices = event.get("choices") or []
             if first_token_at is None and any("text" in choice for choice in choices):
                 first_token_at = time.perf_counter()
+                first_token_unix_ns = time.time_ns()
             usage = event.get("usage")
             if usage:
                 prompt_tokens_reported = usage.get("prompt_tokens")
@@ -178,11 +184,14 @@ class CompletionClient:
             raise RuntimeError("stream ended without a [DONE] event")
         if first_token_at is None:
             raise RuntimeError("stream completed without a completion-token event")
+        assert first_token_unix_ns is not None
         return (
             first_token_at - started,
             completed - started,
             prompt_tokens_reported,
             completion_tokens_reported,
+            started_unix_ns,
+            first_token_unix_ns,
         )
 
 
@@ -226,9 +235,14 @@ def case_output_path(output: Path, multiplier: int) -> Path:
     return output.with_name(f"{stem}-{multiplier}x{suffix}")
 
 
-def case_seed(seed: int, label: str, multiplier: int) -> int:
-    label_offset = 10_000_019 if label == "on" else 0
-    return seed + label_offset + multiplier * 1_000_003
+def case_seed(seed: int, multiplier: int) -> int:
+    """Return a mode-independent seed for one prompt-length case."""
+    return seed + multiplier * 1_000_003
+
+
+def benchmark_request_id(multiplier: int, phase: str, index: int) -> str:
+    """Return a mode-independent request ID for reproducible A/B runs."""
+    return f"prefill-{multiplier}x-{phase}-{index}"
 
 
 def parse_args() -> argparse.Namespace:
@@ -301,8 +315,8 @@ def run_case(
     seen_first_chunk_digests: set[str],
 ) -> dict[str, Any]:
     prompt_tokens = args.prompt_tokens * multiplier
-    measured_seed = case_seed(args.seed, args.label, multiplier)
-    warmup_seed = case_seed(args.warmup_seed, args.label, multiplier)
+    measured_seed = case_seed(args.seed, multiplier)
+    warmup_seed = case_seed(args.warmup_seed, multiplier)
     print(
         f"\n[{multiplier}x] Generating {args.warmups} warmup and "
         f"{args.repeats} measured prompts of {prompt_tokens} tokens...",
@@ -335,23 +349,32 @@ def run_case(
 
     results: list[RequestResult] = []
     for index, prompt in enumerate(warmup_prompts):
-        ttft, e2e, _, _ = client.run(
+        ttft, e2e, _, _, start_unix_ns, first_unix_ns = client.run(
             model=args.model,
             prompt=prompt,
-            request_id=f"prefill-{args.label}-{multiplier}x-warmup-{index}",
+            request_id=benchmark_request_id(multiplier, "warmup", index),
         )
         print(
             f"warmup {index + 1}/{args.warmups} "
             f"hash={prompt.digest[:16]} ttft={ttft * 1000:.3f} ms "
-            f"e2e={e2e * 1000:.3f} ms",
+            f"e2e={e2e * 1000:.3f} ms start_unix_ns={start_unix_ns} "
+            f"first_token_unix_ns={first_unix_ns}",
             flush=True,
         )
 
     for index, prompt in enumerate(measured_prompts):
-        ttft, e2e, prompt_count, completion_count = client.run(
+        request_id = benchmark_request_id(multiplier, "measure", index)
+        (
+            ttft,
+            e2e,
+            prompt_count,
+            completion_count,
+            start_unix_ns,
+            first_unix_ns,
+        ) = client.run(
             model=args.model,
             prompt=prompt,
-            request_id=f"prefill-{args.label}-{multiplier}x-measure-{index}",
+            request_id=request_id,
         )
         if prompt_count is not None and prompt_count != prompt_tokens:
             raise RuntimeError(
@@ -359,18 +382,22 @@ def run_case(
             )
         result = RequestResult(
             request_index=index,
+            request_id=request_id,
             prompt_digest=prompt.digest,
             first_chunk_digest=prompt.first_chunk_digest,
             ttft_seconds=ttft,
             e2e_seconds=e2e,
             prompt_tokens_reported=prompt_count,
             completion_tokens_reported=completion_count,
+            client_start_unix_ns=start_unix_ns,
+            first_token_unix_ns=first_unix_ns,
         )
         results.append(result)
         print(
             f"measure {index + 1}/{args.repeats} "
             f"hash={prompt.digest[:16]} ttft={ttft * 1000:.3f} ms "
-            f"e2e={e2e * 1000:.3f} ms",
+            f"e2e={e2e * 1000:.3f} ms start_unix_ns={start_unix_ns} "
+            f"first_token_unix_ns={first_unix_ns}",
             flush=True,
         )
 

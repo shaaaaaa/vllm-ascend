@@ -445,6 +445,47 @@ class TestNPUWorker(TestBase):
         first_profiler.stop.assert_called_once_with()
         last_profiler.start.assert_called_once_with()
 
+    def test_prefill_timing_tracks_new_and_cached_chunks(self):
+        from vllm_ascend.worker.worker import NPUWorker
+
+        def scheduler_output(computed_tokens: int):
+            is_new = computed_tokens == 0
+            return SimpleNamespace(
+                scheduled_new_reqs=(
+                    [
+                        SimpleNamespace(
+                            req_id="request-0",
+                            prompt_token_ids=range(4_096),
+                            prefill_token_ids=None,
+                            num_computed_tokens=0,
+                        )
+                    ]
+                    if is_new
+                    else []
+                ),
+                scheduled_cached_reqs=SimpleNamespace(
+                    req_ids=[] if is_new else ["request-0"],
+                    num_computed_tokens=(
+                        [] if is_new else [computed_tokens]
+                    ),
+                ),
+                num_scheduled_tokens={"request-0": 2_048},
+            )
+
+        with patch.object(NPUWorker, "__init__", lambda self: None):
+            worker = NPUWorker()
+        worker._prefill_timing_debug = True
+        worker._prefill_timing_prompt_lens = {}
+
+        self.assertEqual(
+            worker._prefill_timing_step(scheduler_output(0)),
+            ("request-0", 0, 2_048, 4_096),
+        )
+        self.assertEqual(
+            worker._prefill_timing_step(scheduler_output(2_048)),
+            ("request-0", 2_048, 2_048, 4_096),
+        )
+
     def test_profile_no_profiler_raises_error(self):
         """Test profile method raises exception when profiler is not available"""
         from vllm_ascend.worker.worker import NPUWorker
