@@ -139,6 +139,38 @@ def test_live_latent_requires_capable_provider_and_hybrid_consumer():
     assert consumer._latent_live_enabled is True
 
 
+def test_live_latent_accepts_capability_based_transport_wrapper():
+    class Provider:
+        supports_dsa_live_latent_split_source = True
+
+        def __init__(self):
+            self.decisions = []
+
+        def configure_live_latent_source(self, enabled):
+            self.decisions.append(enabled)
+
+    class WrappedTransport:
+        supports_dsa_live_latent_transport = True
+
+        def __init__(self):
+            self.decisions = []
+
+        def configure_live_latent_transport(
+            self, source_enabled, destination_enabled
+        ):
+            self.decisions.append((source_enabled, destination_enabled))
+
+    provider = Provider()
+    transport = WrappedTransport()
+    multi = object.__new__(AscendMultiConnector)
+    multi._connectors = [provider, transport]
+
+    multi._configure_live_latent_split()
+
+    assert provider.decisions == [True]
+    assert transport.decisions == [(True, False)]
+
+
 def test_live_latent_old_or_unconfigurable_provider_fails_closed():
     class OldProvider:
         supports_dsa_live_latent_split_source = True

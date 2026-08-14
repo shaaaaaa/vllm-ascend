@@ -332,42 +332,61 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
         source_providers: list[Any] = []
         destination_providers: list[Any] = []
         hybrid_consumers: list[Any] = []
+        capability_details: list[dict[str, Any]] = []
         for child in self._connectors:
             configure = getattr(child, "configure_live_latent_source", None)
             source_capability = getattr(
                 child, "supports_dsa_live_latent_split_source", False
             )
-            if callable(configure) and bool(
+            source_supported = bool(
                 source_capability()
                 if callable(source_capability)
                 else source_capability
-            ):
+            )
+            if callable(configure) and source_supported:
                 source_providers.append(child)
             destination_capability = getattr(
                 child, "supports_dsa_live_latent_split_destination", False
             )
-            if callable(configure) and bool(
+            destination_supported = bool(
                 destination_capability()
                 if callable(destination_capability)
                 else destination_capability
-            ):
+            )
+            if callable(configure) and destination_supported:
                 destination_providers.append(child)
+            configure_transport = getattr(
+                child, "configure_live_latent_transport", None
+            )
             transport_capability = getattr(
                 child, "supports_dsa_live_latent_transport", False
             )
-            if (
-                isinstance(child, MooncakeDSAIndexConnector)
-                and callable(configure)
-                and bool(
-                    transport_capability()
-                    if callable(transport_capability)
-                    else transport_capability
-                )
-            ):
+            transport_supported = bool(
+                transport_capability()
+                if callable(transport_capability)
+                else transport_capability
+            )
+            if callable(configure_transport) and transport_supported:
                 hybrid_consumers.append(child)
+            capability_details.append(
+                {
+                    "connector": child.__class__.__name__,
+                    "configurable_provider": callable(configure),
+                    "source": source_supported,
+                    "destination": destination_supported,
+                    "configurable_transport": callable(configure_transport),
+                    "transport": transport_supported,
+                }
+            )
 
         source_enabled = bool(source_providers and hybrid_consumers)
         destination_enabled = bool(destination_providers and hybrid_consumers)
+        _cold_live_log(
+            "live_source_capability_config",
+            children=capability_details,
+            source_enabled=source_enabled,
+            destination_enabled=destination_enabled,
+        )
         for child in self._connectors:
             configure_transport = getattr(
                 child, "configure_live_latent_transport", None
