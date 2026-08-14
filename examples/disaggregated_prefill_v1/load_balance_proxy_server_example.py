@@ -171,9 +171,11 @@ def _log_proxy_cold_perf_event(
         "endpoint": endpoint,
         **fields,
     }
-    logger.info(
-        "[LMCACHE_COLD_PERF] %s",
-        json.dumps(payload, default=str, separators=(",", ":")),
+    print(
+        "[LMCACHE_COLD_PERF] "
+        + json.dumps(payload, default=str, separators=(",", ":")),
+        file=sys.stderr,
+        flush=True,
     )
 
 

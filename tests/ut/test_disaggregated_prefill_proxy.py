@@ -15,7 +15,7 @@ class TestProxyColdPerfLogging(unittest.TestCase):
         with (
             patch.dict(os.environ, {"LMCACHE_COLD_START_PERF": "1"}),
             patch.object(proxy.time, "perf_counter", return_value=12.345),
-            patch.object(proxy.logger, "info") as log_info,
+            patch("builtins.print") as print_line,
         ):
             proxy._log_proxy_cold_perf_event(
                 "proxy_decoder_send_start",
@@ -24,9 +24,12 @@ class TestProxyColdPerfLogging(unittest.TestCase):
                 attempt=1,
             )
 
-        args = log_info.call_args.args
-        self.assertEqual(args[0], "[LMCACHE_COLD_PERF] %s")
-        payload = json.loads(args[1])
+        print_line.assert_called_once()
+        args, kwargs = print_line.call_args
+        self.assertTrue(args[0].startswith("[LMCACHE_COLD_PERF] "))
+        self.assertIs(kwargs["file"], proxy.sys.stderr)
+        self.assertIs(kwargs["flush"], True)
+        payload = json.loads(args[0].split(" ", 1)[1])
         self.assertEqual(payload["event"], "proxy_decoder_send_start")
         self.assertEqual(payload["monotonic_ms"], 12345.0)
         self.assertEqual(payload["req_id"], "cmpl-request-uuid")
@@ -36,7 +39,7 @@ class TestProxyColdPerfLogging(unittest.TestCase):
     def test_log_event_is_disabled_by_default(self):
         with (
             patch.dict(os.environ, {}, clear=True),
-            patch.object(proxy.logger, "info") as log_info,
+            patch("builtins.print") as print_line,
         ):
             proxy._log_proxy_cold_perf_event(
                 "proxy_decoder_send_start",
@@ -44,7 +47,7 @@ class TestProxyColdPerfLogging(unittest.TestCase):
                 endpoint="/completions",
             )
 
-        log_info.assert_not_called()
+        print_line.assert_not_called()
 
     def test_instance_selection_logs_handoff_boundaries(self):
         request_id = "request-uuid"
