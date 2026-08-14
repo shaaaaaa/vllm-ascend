@@ -12,6 +12,139 @@ from examples.disaggregated_prefill_v1 import (
 
 
 class TestProxyColdPerfLogging(unittest.TestCase):
+    def test_decoder_placement_response_uses_tp0_results(self):
+        self.assertEqual(
+            proxy._parse_decoder_placement_response(
+                {
+                    "results": [
+                        {"dp_rank": 1, "segment": "decoder-b:2001"},
+                        None,
+                        {"dp_rank": 0, "segment": "decoder-a:2000"},
+                    ]
+                }
+            ),
+            {0: "decoder-a:2000", 1: "decoder-b:2001"},
+        )
+
+        invalid_payloads = (
+            {},
+            {"results": []},
+            {"results": [{"dp_rank": -1, "segment": "host:1"}]},
+            {"results": [{"dp_rank": 0, "segment": ""}]},
+            {"results": ["not-a-dictionary"]},
+            {
+                "results": [
+                    {"dp_rank": 0, "segment": "host-a:1"},
+                    {"dp_rank": 0, "segment": "host-b:1"},
+                ]
+            },
+        )
+        for payload in invalid_payloads:
+            with self.subTest(payload=payload), self.assertRaises(ValueError):
+                proxy._parse_decoder_placement_response(payload)
+
+    def test_decoder_placement_discovery_calls_existing_collective_rpc(self):
+        response = SimpleNamespace(
+            raise_for_status=MagicMock(),
+            json=MagicMock(
+                return_value={
+                    "results": [
+                        None,
+                        {"dp_rank": 3, "segment": "decoder-a:12345"},
+                    ]
+                }
+            ),
+        )
+        server = SimpleNamespace(
+            client=SimpleNamespace(post=AsyncMock(return_value=response)),
+            url="http://decoder:8002/v1",
+        )
+
+        result = asyncio.run(proxy._discover_decoder_mooncake_segments(server))
+
+        self.assertEqual(result, {3: "decoder-a:12345"})
+        server.client.post.assert_awaited_once_with(
+            "http://decoder:8002/collective_rpc",
+            json={"method": "get_mooncake_placement_info"},
+            headers={"Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}"},
+        )
+        response.raise_for_status.assert_called_once_with()
+
+    def test_decoder_placement_discovery_is_cached(self):
+        decoder = SimpleNamespace(
+            url="http://decoder:8002/v1",
+            decoder_mooncake_segments=None,
+            decoder_rank_active_tokens={},
+            decoder_placement_task=None,
+        )
+        state = proxy.ProxyState.__new__(proxy.ProxyState)
+        state.decoders = [decoder]
+
+        with (
+            patch.object(
+                proxy,
+                "_discover_decoder_mooncake_segments",
+                AsyncMock(return_value={3: "decoder-a:12345"}),
+            ) as discover,
+            patch.object(proxy, "_log_proxy_cold_perf_event"),
+        ):
+            asyncio.run(
+                state.ensure_decoder_mooncake_segments(
+                    decoder, "request-1", "/completions"
+                )
+            )
+            asyncio.run(
+                state.ensure_decoder_mooncake_segments(
+                    decoder, "request-2", "/completions"
+                )
+            )
+
+        discover.assert_awaited_once_with(decoder)
+        self.assertEqual(
+            decoder.decoder_mooncake_segments,
+            {3: "decoder-a:12345"},
+        )
+        self.assertEqual(decoder.decoder_rank_active_tokens, {3: 0.0})
+
+    def test_decoder_placement_discovery_failure_caches_safe_fallback(self):
+        decoder = SimpleNamespace(
+            url="http://decoder:8002/v1",
+            decoder_mooncake_segments=None,
+            decoder_rank_active_tokens={},
+            decoder_placement_task=None,
+        )
+        state = proxy.ProxyState.__new__(proxy.ProxyState)
+        state.decoders = [decoder]
+
+        with (
+            patch.object(
+                proxy,
+                "_discover_decoder_mooncake_segments",
+                AsyncMock(side_effect=proxy.httpx.RequestError("unavailable")),
+            ) as discover,
+            patch.object(proxy, "_log_proxy_cold_perf_event") as log_event,
+        ):
+            asyncio.run(
+                state.ensure_decoder_mooncake_segments(
+                    decoder, "request-1", "/completions"
+                )
+            )
+            asyncio.run(
+                state.ensure_decoder_mooncake_segments(
+                    decoder, "request-2", "/completions"
+                )
+            )
+
+        discover.assert_awaited_once_with(decoder)
+        self.assertEqual(decoder.decoder_mooncake_segments, {})
+        log_event.assert_called_once_with(
+            "proxy_decoder_placement_discovery_failed",
+            "request-1",
+            endpoint="/completions",
+            decoder_url=decoder.url,
+            error="unavailable",
+        )
+
     def test_decoder_mooncake_segment_mapping_validation(self):
         self.assertEqual(
             proxy._parse_decoder_mooncake_segments(
@@ -24,10 +157,16 @@ class TestProxyColdPerfLogging(unittest.TestCase):
             ],
         )
         self.assertIsNone(proxy._parse_decoder_mooncake_segments(None, 2))
+        self.assertEqual(
+            proxy._parse_decoder_mooncake_segments(
+                ["0=decoder-a:12345", "0=decoder-b:12345"], 2
+            ),
+            [{0: "decoder-a:12345"}, {0: "decoder-b:12345"}],
+        )
 
         invalid_mappings = (
             (["0=a:1"], 2),
-            (["0=a:1", "0=b:1"], 2),
+            (["0=a:1,0=b:1"], 1),
             (["0="], 1),
             ([""], 1),
             (["not-a-mapping"], 1),
@@ -195,6 +334,8 @@ class TestProxyColdPerfLogging(unittest.TestCase):
             calculate_decode_scores=MagicMock(return_value=10.0),
             select_decoder=MagicMock(return_value=0),
             decoders=[decoder],
+            ensure_decoder_mooncake_segments=AsyncMock(),
+            assign_decoder_rank=MagicMock(side_effect=lambda value: value),
         )
         response = SimpleNamespace(
             content=b'{"kv_transfer_params":{"source":"live"}}',
@@ -291,6 +432,8 @@ class TestProxyColdPerfLogging(unittest.TestCase):
             calculate_decode_scores=MagicMock(return_value=10.0),
             select_decoder=MagicMock(return_value=0),
             decoders=[decoder],
+            ensure_decoder_mooncake_segments=AsyncMock(),
+            assign_decoder_rank=MagicMock(side_effect=lambda value: value),
         )
         response = SimpleNamespace(
             content=b"{}", json=MagicMock(return_value={})
@@ -333,17 +476,23 @@ class TestProxyColdPerfLogging(unittest.TestCase):
             client=object(), url="http://prefiller:8001/v1"
         )
         decoder = SimpleNamespace(url="http://decoder:8002/v1")
-        reservation = proxy.DecoderReservation(
-            decoder, 0, 10.0, 3, "decoder-a:12345"
-        )
+        reservations = []
+
+        def assign_rank(reservation):
+            reservation.dp_rank = 3
+            reservation.preferred_segment = "decoder-a:12345"
+            reservations.append(reservation)
+            return reservation
+
         state = SimpleNamespace(
             decoder_mooncake_segments=[{3: "decoder-a:12345"}],
             calculate_prefill_scores=MagicMock(return_value=100.0),
             calculate_decode_scores=MagicMock(return_value=10.0),
             next_req_id=AsyncMock(return_value="request-uuid"),
-            select_decoder_reservation=MagicMock(
-                return_value=reservation
-            ),
+            select_decoder=MagicMock(return_value=0),
+            decoders=[decoder],
+            ensure_decoder_mooncake_segments=AsyncMock(),
+            assign_decoder_rank=MagicMock(side_effect=assign_rank),
             select_prefiller=MagicMock(return_value=0),
             prefillers=[prefiller],
             release_prefiller=MagicMock(),
@@ -379,7 +528,7 @@ class TestProxyColdPerfLogging(unittest.TestCase):
             )
 
         state.release_decoder_reservation.assert_called_once_with(
-            reservation
+            reservations[0]
         )
         state.abort_prefiller_request.assert_called_once_with(
             0, "request-uuid"
@@ -395,16 +544,17 @@ class TestProxyColdPerfLogging(unittest.TestCase):
         decoder = SimpleNamespace(
             client=object(), url="http://decoder:8002/v1"
         )
-        reservation = proxy.DecoderReservation(
-            decoder,
-            decoder_idx=0,
-            decoder_score=10.0,
-            dp_rank=3,
-            preferred_segment="decoder-a:12345",
-        )
-
         def reserve_decoder(_score):
             order.append("reserve_decoder")
+            return 0
+
+        async def discover_decoder(*_args):
+            order.append("discover_decoder")
+
+        def assign_rank(reservation):
+            order.append("assign_rank")
+            reservation.dp_rank = 3
+            reservation.preferred_segment = "decoder-a:12345"
             return reservation
 
         def select_prefiller(_score):
@@ -416,10 +566,12 @@ class TestProxyColdPerfLogging(unittest.TestCase):
             calculate_prefill_scores=MagicMock(return_value=100.0),
             calculate_decode_scores=MagicMock(return_value=10.0),
             next_req_id=AsyncMock(return_value=request_id),
-            select_decoder_reservation=MagicMock(
-                side_effect=reserve_decoder
-            ),
+            select_decoder=MagicMock(side_effect=reserve_decoder),
             decoders=[decoder],
+            ensure_decoder_mooncake_segments=AsyncMock(
+                side_effect=discover_decoder
+            ),
+            assign_decoder_rank=MagicMock(side_effect=assign_rank),
             select_prefiller=MagicMock(side_effect=select_prefiller),
             prefillers=[prefiller],
             release_prefiller=MagicMock(),
@@ -468,7 +620,13 @@ class TestProxyColdPerfLogging(unittest.TestCase):
 
         self.assertEqual(
             order,
-            ["reserve_decoder", "select_prefiller", "send_prefill"],
+            [
+                "reserve_decoder",
+                "discover_decoder",
+                "assign_rank",
+                "select_prefiller",
+                "send_prefill",
+            ],
         )
         self.assertEqual(
             result.reservation.dp_rank, 3
@@ -494,22 +652,23 @@ class TestProxyColdPerfLogging(unittest.TestCase):
     def test_affinity_prefill_cancellation_releases_all_reservations(self):
         prefiller = SimpleNamespace(client=object())
         decoder = SimpleNamespace(url="http://decoder:8002/v1")
-        reservation = proxy.DecoderReservation(
-            decoder,
-            decoder_idx=0,
-            decoder_score=10.0,
-            dp_rank=3,
-            preferred_segment="decoder-a:12345",
-        )
+        reservations = []
+
+        def assign_rank(reservation):
+            reservation.dp_rank = 3
+            reservation.preferred_segment = "decoder-a:12345"
+            reservations.append(reservation)
+            return reservation
+
         state = SimpleNamespace(
             decoder_mooncake_segments=[{3: "decoder-a:12345"}],
             calculate_prefill_scores=MagicMock(return_value=100.0),
             calculate_decode_scores=MagicMock(return_value=10.0),
             next_req_id=AsyncMock(return_value="request-uuid"),
-            select_decoder_reservation=MagicMock(
-                return_value=reservation
-            ),
+            select_decoder=MagicMock(return_value=0),
             decoders=[decoder],
+            ensure_decoder_mooncake_segments=AsyncMock(),
+            assign_decoder_rank=MagicMock(side_effect=assign_rank),
             select_prefiller=MagicMock(return_value=0),
             prefillers=[prefiller],
             release_decoder_reservation=MagicMock(),
@@ -540,7 +699,9 @@ class TestProxyColdPerfLogging(unittest.TestCase):
                 )
             )
 
-        state.release_decoder_reservation.assert_called_once_with(reservation)
+        state.release_decoder_reservation.assert_called_once_with(
+            reservations[0]
+        )
         state.release_prefiller.assert_called_once_with(0, 100.0)
         state.abort_prefiller_request.assert_called_once_with(
             0, "request-uuid"

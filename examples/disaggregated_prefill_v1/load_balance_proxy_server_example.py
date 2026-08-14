@@ -109,6 +109,8 @@
 # - You can scale the number of prefiller and decoder servers as needed.
 # - The proxy will round-robin requests to balance load.
 # - For production, ensure your backend servers are robust and secure.
+# - Automatic decoder-preferred Mooncake placement requires decoder servers to
+#   expose vLLM's collective RPC with VLLM_SERVER_DEV_MODE=1.
 #
 # For more details, see the code and comments in this file.
 
@@ -230,6 +232,7 @@ class ServerState:
         self.aborted_requests = set()  # Track aborted requests
         self.decoder_mooncake_segments: dict[int, str] | None = None
         self.decoder_rank_active_tokens: dict[int, float] = {}
+        self.decoder_placement_task: asyncio.Task[dict[int, str]] | None = None
         # Removed individual server lock - will use global locks instead
 
     def __eq__(self, other):
@@ -404,10 +407,19 @@ class ProxyState:
             The endpoint/rank reservation that must be released exactly once.
         """
         decoder_idx = self.select_decoder(token_count)
-        server = self.decoders[decoder_idx]
+        reservation = DecoderReservation(
+            self.decoders[decoder_idx], decoder_idx, token_count
+        )
+        return self.assign_decoder_rank(reservation)
+
+    def assign_decoder_rank(
+        self, reservation: DecoderReservation
+    ) -> DecoderReservation:
+        """Assign the least-loaded discovered DP rank to an endpoint reservation."""
+        server = reservation.server
         rank_segments = server.decoder_mooncake_segments
         if not rank_segments:
-            return DecoderReservation(server, decoder_idx, token_count)
+            return reservation
         dp_rank = min(
             rank_segments,
             key=lambda rank: (
@@ -415,13 +427,57 @@ class ProxyState:
                 rank,
             ),
         )
-        server.decoder_rank_active_tokens[dp_rank] += token_count
-        return DecoderReservation(
-            server,
-            decoder_idx,
-            token_count,
-            dp_rank,
-            rank_segments[dp_rank],
+        server.decoder_rank_active_tokens[dp_rank] += reservation.decoder_score
+        reservation.dp_rank = dp_rank
+        reservation.preferred_segment = rank_segments[dp_rank]
+        return reservation
+
+    async def ensure_decoder_mooncake_segments(
+        self,
+        server: ServerState,
+        request_id: str,
+        endpoint: str,
+    ) -> None:
+        """Discover and cache one decoder endpoint's TP0 Mooncake segments."""
+        if server.decoder_mooncake_segments is not None:
+            return
+        task = server.decoder_placement_task
+        if task is None:
+            task = asyncio.create_task(_discover_decoder_mooncake_segments(server))
+            server.decoder_placement_task = task
+        try:
+            rank_segments = await asyncio.shield(task)
+        except (httpx.RequestError, httpx.HTTPStatusError, ValueError) as exc:
+            if server.decoder_placement_task is task:
+                server.decoder_placement_task = None
+                server.decoder_mooncake_segments = {}
+            logger.warning(
+                "Mooncake placement discovery failed for decoder %s: %s",
+                server.url,
+                exc,
+            )
+            _log_proxy_cold_perf_event(
+                "proxy_decoder_placement_discovery_failed",
+                request_id,
+                endpoint=endpoint,
+                decoder_url=server.url,
+                error=str(exc),
+            )
+            return
+
+        if server.decoder_mooncake_segments is not None:
+            return
+        server.decoder_mooncake_segments = rank_segments
+        server.decoder_rank_active_tokens = {
+            dp_rank: 0.0 for dp_rank in rank_segments
+        }
+        server.decoder_placement_task = None
+        _log_proxy_cold_perf_event(
+            "proxy_decoder_placement_discovered",
+            request_id,
+            endpoint=endpoint,
+            decoder_url=server.url,
+            rank_segments=rank_segments,
         )
 
     def release_decoder_reservation(
@@ -644,10 +700,52 @@ class NodeListener:
             return False
 
 
+def _parse_decoder_placement_response(payload: Any) -> dict[int, str]:
+    """Validate JSON returned by vLLM's collective RPC endpoint."""
+    if not isinstance(payload, dict) or not isinstance(payload.get("results"), list):
+        raise ValueError("Decoder collective RPC returned an invalid response")
+    rank_segments: dict[int, str] = {}
+    for result in payload["results"]:
+        if result is None:
+            continue
+        if not isinstance(result, dict):
+            raise ValueError("Decoder placement result must be a dictionary")
+        dp_rank = result.get("dp_rank")
+        segment = result.get("segment")
+        if isinstance(dp_rank, bool) or not isinstance(dp_rank, int) or dp_rank < 0:
+            raise ValueError(f"Invalid decoder data-parallel rank: {dp_rank!r}")
+        if not isinstance(segment, str) or not segment.strip():
+            raise ValueError(f"Invalid Mooncake segment for DP rank {dp_rank}")
+        segment = segment.strip()
+        existing = rank_segments.get(dp_rank)
+        if existing is not None and existing != segment:
+            raise ValueError(
+                f"Decoder DP rank {dp_rank} reported conflicting Mooncake segments"
+            )
+        rank_segments[dp_rank] = segment
+    if not rank_segments:
+        raise ValueError("Decoder did not report any TP0 Mooncake segments")
+    return rank_segments
+
+
+async def _discover_decoder_mooncake_segments(
+    server: ServerState,
+) -> dict[int, str]:
+    """Fetch dynamic TP0 Mooncake addresses through vLLM's existing RPC."""
+    collective_rpc_url = server.url.removesuffix("/v1") + "/collective_rpc"
+    response = await server.client.post(
+        collective_rpc_url,
+        json={"method": "get_mooncake_placement_info"},
+        headers={"Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}"},
+    )
+    response.raise_for_status()
+    return _parse_decoder_placement_response(response.json())
+
+
 def _parse_decoder_mooncake_segments(
     raw_mappings: list[str] | None, decoder_count: int
 ) -> list[dict[int, str]] | None:
-    """Parse endpoint-aligned global-DP-rank Mooncake segment mappings."""
+    """Parse endpoint-aligned routable-DP-rank Mooncake segment mappings."""
     if raw_mappings is None:
         return None
     if len(raw_mappings) != decoder_count:
@@ -657,13 +755,13 @@ def _parse_decoder_mooncake_segments(
         )
 
     parsed_mappings = []
-    seen_ranks = set()
     for endpoint_idx, raw_mapping in enumerate(raw_mappings):
         if not raw_mapping or not raw_mapping.strip():
             raise ValueError(
                 f"Decoder endpoint {endpoint_idx} has an empty Mooncake segment mapping"
             )
         rank_segments = {}
+        seen_ranks = set()
         for raw_entry in raw_mapping.split(","):
             entry = raw_entry.strip()
             if not entry or "=" not in entry:
@@ -695,7 +793,7 @@ def _parse_decoder_mooncake_segments(
 
 
 def parse_args() -> argparse.Namespace:
-    """Parse proxy endpoints and optional endpoint-aligned segment mappings."""
+    """Parse proxy endpoints and optional placement-discovery overrides."""
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=8000)
@@ -710,7 +808,8 @@ def parse_args() -> argparse.Namespace:
         nargs="+",
         default=None,
         help=(
-            "Optional per-decoder global DP rank to Mooncake segment mappings, "
+            "Optional override for automatically discovered per-decoder request "
+            "routing rank to Mooncake segment mappings, "
             'for example "0=decoder-a:12345,1=decoder-b:12345"'
         ),
     )
@@ -929,13 +1028,20 @@ async def _handle_select_instance(
     prefiller_active_released = False
     decoder = None
     reservation = None
-    placement_enabled = (
-        getattr(proxy_state, "decoder_mooncake_segments", None) is not None
-    )
     try:
-        if placement_enabled:
-            reservation = proxy_state.select_decoder_reservation(decoder_score)
-            decoder = reservation.server
+        decoder_idx = proxy_state.select_decoder(decoder_score)
+        decoder = proxy_state.decoders[decoder_idx]
+        reservation = DecoderReservation(
+            decoder, decoder_idx, decoder_score
+        )
+        # Discovery is a first-use operation. Keep the stable request path
+        # synchronous once this endpoint has a mapping (or a cached fallback).
+        if getattr(decoder, "decoder_mooncake_segments", None) is None:
+            await proxy_state.ensure_decoder_mooncake_segments(
+                decoder, request_id, api
+            )
+        proxy_state.assign_decoder_rank(reservation)
+        if reservation.preferred_segment is not None:
             _log_proxy_cold_perf_event(
                 "proxy_decoder_placement_reserved",
                 request_id,
@@ -986,14 +1092,6 @@ async def _handle_select_instance(
             "lmcache.mooncake_preferred_segment", None
         )
         req_data["kv_transfer_params"] = kv_transfer_params
-
-        if not placement_enabled:
-            # Preserve the original selection order when affinity is not configured.
-            decoder_idx = proxy_state.select_decoder(decoder_score)
-            decoder = proxy_state.decoders[decoder_idx]
-            reservation = DecoderReservation(
-                decoder, decoder_idx, decoder_score
-            )
 
         encode_started = time.perf_counter()
         decoder_body = _encode_json_payload(req_data)

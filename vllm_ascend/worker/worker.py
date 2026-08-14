@@ -579,6 +579,31 @@ class NPUWorker(WorkerBase):
             return None
         return {self.rank: metadata}
 
+    def get_mooncake_placement_info(self) -> dict[str, int | str] | None:
+        """Expose this decoder DP rank's TP0 Mooncake segment."""
+        metadata_by_rank = self.get_kv_connector_handshake_metadata()
+        if not metadata_by_rank:
+            return None
+        metadata = next(iter(metadata_by_rank.values()))
+        local_ip = getattr(metadata, "local_ip", "")
+        te_rpc_port = getattr(metadata, "te_rpc_port", None)
+        if getattr(metadata, "tp_rank", None) != 0 or not local_ip:
+            return None
+        if not isinstance(te_rpc_port, int) or te_rpc_port <= 0:
+            return None
+        parallel_config = self.vllm_config.parallel_config
+        local_dp_rank = getattr(parallel_config, "data_parallel_rank_local", None)
+        route_dp_rank = (
+            local_dp_rank
+            if getattr(parallel_config, "local_engines_only", False)
+            and local_dp_rank is not None
+            else parallel_config.data_parallel_rank
+        )
+        return {
+            "dp_rank": route_dp_rank,
+            "segment": f"{local_ip}:{te_rpc_port}",
+        }
+
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         return self.model_runner.get_kv_cache_spec()
 
