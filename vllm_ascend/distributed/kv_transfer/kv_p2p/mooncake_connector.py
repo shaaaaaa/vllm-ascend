@@ -2613,6 +2613,14 @@ class MooncakeConnector(KVConnectorBase_V1):
 
     def __init__(self, vllm_config: VllmConfig, role: KVConnectorRole, kv_cache_config: KVCacheConfig | None = None):
         assert vllm_config.kv_transfer_config is not None
+        # Generic MooncakeConnectorV1 is the connector used by the standard
+        # Ascend PD deployment.  Keep the hybrid latent protocol disabled
+        # until AscendMultiConnector has negotiated both an LMCache owner and
+        # a Mooncake borrower in this process.
+        self._latent_live_enabled = False
+        self._latent_live_source_enabled = False
+        self._latent_live_destination_enabled = False
+        self._dsa_role = role
         self._role = role
         self.engine_id = vllm_config.kv_transfer_config.engine_id
         self._connector_metadata = MooncakeConnectorMetadata()
@@ -2625,6 +2633,51 @@ class MooncakeConnector(KVConnectorBase_V1):
         elif role == KVConnectorRole.WORKER:
             self.connector_scheduler = None
             self.connector_worker = MooncakeConnectorWorker(vllm_config, str(self.engine_id))
+
+    def configure_live_latent_source(self, enabled: bool) -> None:
+        """Compatibility hook for callers with one shared capability bit."""
+        self.configure_live_latent_transport(enabled, enabled)
+
+    def configure_live_latent_transport(
+        self, source_enabled: bool, destination_enabled: bool
+    ) -> None:
+        """Apply the process-local two-sided hybrid transport decision."""
+        supported = self.supports_dsa_live_latent_transport
+        self._latent_live_source_enabled = bool(
+            source_enabled and supported
+        )
+        self._latent_live_destination_enabled = bool(
+            destination_enabled and supported
+        )
+        self._latent_live_enabled = bool(
+            self._latent_live_source_enabled
+            or self._latent_live_destination_enabled
+        )
+        if self.connector_scheduler is not None:
+            index_group_id = int(getattr(self, "index_group_id", 1))
+            self.connector_scheduler.live_split_source_groups = (
+                (0, index_group_id)
+                if self._latent_live_enabled
+                else (index_group_id,)
+            )
+        if self.connector_worker is not None:
+            self.connector_worker.live_latent_enabled = (
+                self._latent_live_enabled
+            )
+            self.connector_worker.live_latent_source_enabled = (
+                self._latent_live_source_enabled
+            )
+
+    @property
+    def supports_dsa_live_latent_transport(self) -> bool:
+        """Whether this connector role can borrow live latent buffers."""
+        if self.connector_worker is not None:
+            return self.connector_worker.kv_role in (
+                "kv_producer",
+                "kv_consumer",
+                "kv_both",
+            )
+        return self.connector_scheduler is not None
 
     ############################################################
     # Scheduler Side Methods
@@ -2700,12 +2753,23 @@ class MooncakeConnector(KVConnectorBase_V1):
                 plans, self._live_split_source_groups())
 
     def _live_split_source_groups(self) -> tuple[int, ...]:
-        index_group_id = getattr(self, "index_group_id", None)
-        if index_group_id is not None:
-            return (int(index_group_id),)
-        # Group 0 remains on LMCache's rank-0-owned persistent collective;
-        # the current live destination protocol safely imports group 1 only.
-        return (1,)
+        index_group_id = int(getattr(self, "index_group_id", 1))
+        if not getattr(self, "_latent_live_enabled", False):
+            return (index_group_id,)
+        if getattr(self, "_dsa_role", None) == KVConnectorRole.SCHEDULER:
+            return (0, index_group_id)
+        worker = self.connector_worker
+        if (
+            worker is not None
+            and worker.kv_role in ("kv_consumer", "kv_both")
+            and worker.tp_rank == 0
+            and getattr(self, "_latent_live_destination_enabled", False)
+        ):
+            return (0, index_group_id)
+        # Producer and passive decoder workers keep ordinary block routing on
+        # group 1.  TP0 latent source registration is advertised separately
+        # through the worker handshake.
+        return (index_group_id,)
 
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
         assert self.connector_worker is not None

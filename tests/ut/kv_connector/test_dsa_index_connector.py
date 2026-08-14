@@ -348,6 +348,55 @@ def test_ascend_multi_enables_provider_for_kv_both_transport():
     assert consumer._latent_live_enabled is True
 
 
+def test_ascend_multi_enables_generic_mooncake_hybrid_transport():
+    class Provider:
+        supports_dsa_live_latent_split_source = True
+
+        def __init__(self):
+            self.decisions = []
+
+        def configure_live_latent_source(self, enabled):
+            self.decisions.append(enabled)
+
+    provider = Provider()
+    transport = object.__new__(MooncakeConnector)
+    transport._latent_live_enabled = False
+    transport._latent_live_source_enabled = False
+    transport._latent_live_destination_enabled = False
+    transport.connector_scheduler = None
+    transport.connector_worker = SimpleNamespace(
+        kv_role="kv_producer", tp_rank=0
+    )
+    multi = object.__new__(AscendMultiConnector)
+    multi._connectors = [provider, transport]
+
+    multi._configure_live_latent_split()
+
+    assert provider.decisions == [True]
+    assert transport._latent_live_enabled is True
+    assert transport._latent_live_source_enabled is True
+    assert transport._latent_live_destination_enabled is False
+    assert transport.connector_worker.live_latent_source_enabled is True
+
+
+def test_generic_mooncake_live_latent_decoder_groups_are_rank_aware():
+    connector = object.__new__(MooncakeConnector)
+    connector._latent_live_enabled = False
+    connector._latent_live_source_enabled = False
+    connector._latent_live_destination_enabled = False
+    connector._dsa_role = KVConnectorRole.WORKER
+    connector.connector_scheduler = None
+    connector.connector_worker = SimpleNamespace(
+        kv_role="kv_consumer", tp_rank=0
+    )
+
+    connector.configure_live_latent_transport(False, True)
+
+    assert connector._live_split_source_groups() == (0, 1)
+    connector.connector_worker.tp_rank = 1
+    assert connector._live_split_source_groups() == (1,)
+
+
 def test_ascend_multi_separates_source_and_destination_transport():
     class Provider:
         supports_dsa_live_latent_split_source = False

@@ -60,64 +60,7 @@ class MooncakeDSAIndexConnector(MooncakeConnector, SupportsHMA):
                 "index_group_id", _DEFAULT_INDEX_GROUP_ID
             )
         )
-        self._latent_live_enabled = False
-        self._latent_live_source_enabled = False
-        self._latent_live_destination_enabled = False
-        self._dsa_role = role
         super().__init__(vllm_config, role, kv_cache_config)
-
-    def configure_live_latent_source(self, enabled: bool) -> None:
-        """Enable the opt-in TP0 latent source/destination protocol."""
-        self.configure_live_latent_transport(enabled, enabled)
-
-    def configure_live_latent_transport(
-        self, source_enabled: bool, destination_enabled: bool
-    ) -> None:
-        supported = self.supports_dsa_live_latent_transport
-        self._latent_live_source_enabled = bool(source_enabled and supported)
-        self._latent_live_destination_enabled = bool(
-            destination_enabled and supported
-        )
-        self._latent_live_enabled = bool(
-            self._latent_live_source_enabled
-            or self._latent_live_destination_enabled
-        )
-        if self.connector_scheduler is not None:
-            self.connector_scheduler.live_split_source_groups = (
-                (0, self.index_group_id)
-                if self._latent_live_enabled else (self.index_group_id,)
-            )
-        if self.connector_worker is not None:
-            self.connector_worker.live_latent_enabled = self._latent_live_enabled
-            self.connector_worker.live_latent_source_enabled = (
-                self._latent_live_source_enabled
-            )
-
-    @property
-    def supports_dsa_live_latent_transport(self) -> bool:
-        """Whether this process role can be one side of hybrid transport."""
-        if self.connector_worker is not None:
-            return self.connector_worker.kv_role in (
-                "kv_producer",
-                "kv_consumer",
-                "kv_both",
-            )
-        return self.connector_scheduler is not None
-
-    def _live_split_source_groups(self) -> tuple[int, ...]:
-        if not getattr(self, "_latent_live_enabled", False):
-            return (self.index_group_id,)
-        if getattr(self, "_dsa_role", None) == KVConnectorRole.SCHEDULER:
-            return (0, self.index_group_id)
-        worker = self.connector_worker
-        if (
-            worker is not None
-            and worker.kv_role in ("kv_consumer", "kv_both")
-            and worker.tp_rank == 0
-            and getattr(self, "_latent_live_destination_enabled", False)
-        ):
-            return (0, self.index_group_id)
-        return (self.index_group_id,)
 
     def register_kv_caches(self, kv_caches: dict) -> None:
         index_only = {
