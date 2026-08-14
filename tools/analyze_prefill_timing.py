@@ -101,6 +101,48 @@ def _sum(items: list[dict[str, str]], field: str) -> float:
     return sum(float(item[field]) for item in items)
 
 
+def _resolve_server_request(
+    request_id: str,
+    request: dict[str, Any],
+    parsed: dict[str, dict[int, dict[str, Any]]],
+) -> tuple[str | None, dict[int, dict[str, Any]]]:
+    """Resolve vLLM's optional per-engine random request-ID suffix."""
+    candidates = [
+        (server_id, ranks)
+        for server_id, ranks in parsed.items()
+        if server_id == request_id or server_id.startswith(f"{request_id}-")
+    ]
+    if len(candidates) == 1:
+        return candidates[0]
+    if not candidates:
+        return None, {}
+
+    client_start = request.get("client_start_unix_ns")
+    first_token = request.get("first_token_unix_ns")
+    if client_start is not None and first_token is not None:
+        in_window = []
+        for server_id, ranks in candidates:
+            chunk_starts = [
+                int(chunk["start"])
+                for fields in ranks.values()
+                for chunk in fields["chunks"]
+            ]
+            chunk_ends = [
+                int(chunk["end"])
+                for fields in ranks.values()
+                for chunk in fields["chunks"]
+            ]
+            if (
+                chunk_starts
+                and min(chunk_starts) >= int(client_start)
+                and max(chunk_ends) <= int(first_token)
+            ):
+                in_window.append((server_id, ranks))
+        if len(in_window) == 1:
+            return in_window[0]
+    return None, {}
+
+
 def summarize(
     requests: dict[str, dict[str, Any]],
     parsed: dict[str, dict[int, dict[str, Any]]],
@@ -108,9 +150,24 @@ def summarize(
     """Build one critical-rank timing summary per measured request."""
     rows = []
     for request_id, request in requests.items():
-        ranks = parsed.get(request_id, {})
+        server_request_id, ranks = _resolve_server_request(
+            request_id,
+            request,
+            parsed,
+        )
         if not ranks:
-            rows.append({"request": request_id, "error": "no server timing logs"})
+            matching_ids = [
+                server_id
+                for server_id in parsed
+                if server_id == request_id
+                or server_id.startswith(f"{request_id}-")
+            ]
+            error = (
+                "ambiguous server timing logs: " + ", ".join(matching_ids)
+                if matching_ids
+                else "no server timing logs"
+            )
+            rows.append({"request": request_id, "error": error})
             continue
         critical_rank, fields = max(
             ranks.items(),
@@ -170,6 +227,7 @@ def summarize(
         rows.append(
             {
                 "request": request_id,
+                "server_request": server_request_id,
                 "rank": critical_rank,
                 "chunks": len(chunks),
                 "ttft_ms": ttft_ms,

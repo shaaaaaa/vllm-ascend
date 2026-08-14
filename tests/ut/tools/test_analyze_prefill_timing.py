@@ -32,26 +32,26 @@ def test_summarize_breaks_down_critical_rank(tmp_path: Path) -> None:
         "\n".join(
             (
                 "(Worker_TP0 pid=1) [PREFILL_TIMING] worker_chunk rank=0 "
-                "mode=on request=cmpl-prefill-1x-measure-0-0 chunk=1/2 "
+                "mode=on request=cmpl-prefill-1x-measure-0-0-deadbeef chunk=1/2 "
                 "tokens=[0,2048) scheduled=2048 gap_ms=first execute_ms=10.000 "
                 "start_unix_ns=1010000000 end_unix_ns=1020000000",
                 "(Worker_TP0 pid=1) [PREFILL_TIMING] lmcache_save_fence mode=on "
-                "request=cmpl-prefill-1x-measure-0-0 prefix_tokens=4096 "
+                "request=cmpl-prefill-1x-measure-0-0-deadbeef prefix_tokens=4096 "
                 "save_from=0 load_wait_count=0 load_wait_ms=0.000 "
                 "callback_count=80 callback_ms=2.000 "
                 "active_storers_before=2 pending_sync_before_finish=4 "
                 "pending_sync_after_finish=0 wait_impl_ms=1.000 "
                 "finish_batch_ms=3.000 total_ms=4.000",
                 "(Worker_TP0 pid=1) [PREFILL_TIMING] lmcache_start_load mode=on "
-                "request=cmpl-prefill-1x-measure-0-0 prefix_tokens=4096 "
+                "request=cmpl-prefill-1x-measure-0-0-deadbeef prefix_tokens=4096 "
                 "can_load=true load_tokens=256 elapsed_ms=0.500",
                 "(Worker_TP0 pid=1) [PREFILL_TIMING] worker_chunk rank=0 "
-                "mode=on request=cmpl-prefill-1x-measure-0-0 chunk=2/2 "
+                "mode=on request=cmpl-prefill-1x-measure-0-0-deadbeef chunk=2/2 "
                 "tokens=[2048,4096) scheduled=2048 gap_ms=5.000 "
                 "execute_ms=20.000 start_unix_ns=1025000000 "
                 "end_unix_ns=1045000000",
                 "(Worker_TP0 pid=1) [PREFILL_TIMING] worker_sample rank=0 mode=on "
-                "request=cmpl-prefill-1x-measure-0-0 prompt_tokens=4096 "
+                "request=cmpl-prefill-1x-measure-0-0-deadbeef prompt_tokens=4096 "
                 "forward_to_sample_ms=1.000 sample_ms=2.000 "
                 "start_unix_ns=1046000000 end_unix_ns=1048000000",
             )
@@ -66,6 +66,7 @@ def test_summarize_breaks_down_critical_rank(tmp_path: Path) -> None:
 
     assert len(rows) == 1
     row = rows[0]
+    assert row["server_request"] == "cmpl-prefill-1x-measure-0-0-deadbeef"
     assert row["rank"] == 0
     assert row["ttft_ms"] == pytest.approx(50)
     assert row["client_to_first_chunk_ms"] == pytest.approx(10)
