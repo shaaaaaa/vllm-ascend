@@ -124,6 +124,14 @@ class RecomputeScheduler(Scheduler):
             "qwen3_next" in self.vllm_config.model_config.hf_text_config.model_type
             or "qwen3_5" in self.vllm_config.model_config.hf_text_config.model_type
         )
+        logger.info(
+            "[TOKEN_ACCOUNTING_SCHEDULER_INIT] scheduler=RecomputeScheduler "
+            "dp_rank=%s dp_size=%s log_stats=%s mtp_consumer=%s",
+            self.vllm_config.parallel_config.data_parallel_rank,
+            self.vllm_config.parallel_config.data_parallel_size,
+            self.log_stats,
+            self.is_mtp_kv_consumer,
+        )
 
     def add_request(self, request: Request) -> None:
         existing = self.requests.get(request.request_id)
@@ -174,7 +182,8 @@ class RecomputeScheduler(Scheduler):
         """
         assert self.connector is not None
 
-        if request.request_id in self.failed_recving_kv_req_ids:
+        failed_recv = request.request_id in self.failed_recving_kv_req_ids
+        if failed_recv:
             # Request had KV load failures; num_computed_tokens was already
             # updated in _update_requests_with_invalid_blocks
             if request.num_computed_tokens:
@@ -210,6 +219,38 @@ class RecomputeScheduler(Scheduler):
             # Count the number of prefix cached tokens.
             if request.num_cached_tokens < 0:
                 request.num_cached_tokens = request.num_computed_tokens
+
+        if request.num_external_computed_tokens > 0:
+            recomputed_tokens = int(
+                request.num_cached_tokens + 1 == request.num_prompt_tokens
+            )
+            local_compute = request.num_prompt_tokens - request.num_cached_tokens
+            local_cache_hit = (
+                request.num_cached_tokens
+                + recomputed_tokens
+                - request.num_external_computed_tokens
+            )
+            logger.info(
+                "[TOKEN_ACCOUNTING_REMOTE_READY] "
+                "scheduler=RecomputeScheduler dp_rank=%s req=%s status=%s "
+                "preemptions=%d failed_recv=%s prompt=%d tokens=%d "
+                "computed=%d cached=%d external=%d recomputed=%d "
+                "local_compute=%d local_cache_hit=%d accounting_valid=%s",
+                self.vllm_config.parallel_config.data_parallel_rank,
+                request.request_id,
+                request.status.name,
+                request.num_preemptions,
+                failed_recv,
+                request.num_prompt_tokens,
+                request.num_tokens,
+                request.num_computed_tokens,
+                request.num_cached_tokens,
+                request.num_external_computed_tokens,
+                recomputed_tokens,
+                local_compute,
+                local_cache_hit,
+                local_compute >= 0 and local_cache_hit >= 0,
+            )
 
         self.finished_recving_kv_req_ids.remove(request.request_id)
 
@@ -473,6 +514,7 @@ class RecomputeScheduler(Scheduler):
                     step_skipped_waiting.prepend_request(request)
                     continue
 
+                cached_tokens_before_lookup = request.num_cached_tokens
                 num_external_computed_tokens = 0
                 load_kv_async = False
                 dsa_compact_external_load = False
@@ -508,6 +550,27 @@ class RecomputeScheduler(Scheduler):
                                 False,
                             )
                         )
+                        if ext_tokens > 0:
+                            logger.info(
+                                "[TOKEN_ACCOUNTING_SCHED_LOOKUP] "
+                                "scheduler=RecomputeScheduler dp_rank=%s "
+                                "req=%s status=%s preemptions=%d prompt=%d "
+                                "tokens=%d computed_before=%d cached_before=%d "
+                                "local_hit=%d external=%d load_async=%s "
+                                "dsa_compact=%s",
+                                self.vllm_config.parallel_config.data_parallel_rank,
+                                request_id,
+                                request.status.name,
+                                request.num_preemptions,
+                                request.num_prompt_tokens,
+                                request.num_tokens,
+                                request.num_computed_tokens,
+                                cached_tokens_before_lookup,
+                                num_new_local_computed_tokens,
+                                ext_tokens,
+                                load_kv_async,
+                                dsa_compact_external_load,
+                            )
 
                         connector_prefix_cache_queries = request.num_tokens - num_new_local_computed_tokens
                         connector_prefix_cache_hits = num_external_computed_tokens
@@ -692,6 +755,45 @@ class RecomputeScheduler(Scheduler):
                 # Count the number of prefix cached tokens.
                 if request.num_cached_tokens < 0:
                     request.num_cached_tokens = num_computed_tokens
+                if (
+                    request.num_external_computed_tokens > 0
+                    or request.num_cached_tokens > request.num_prompt_tokens
+                ):
+                    recomputed_tokens = int(
+                        request.num_cached_tokens + 1
+                        == request.num_prompt_tokens
+                    )
+                    local_compute = (
+                        request.num_prompt_tokens - request.num_cached_tokens
+                    )
+                    local_cache_hit = (
+                        request.num_cached_tokens
+                        + recomputed_tokens
+                        - request.num_external_computed_tokens
+                    )
+                    logger.info(
+                        "[TOKEN_ACCOUNTING_SCHED_DECISION] "
+                        "scheduler=RecomputeScheduler dp_rank=%s req=%s "
+                        "status=%s preemptions=%d prompt=%d tokens=%d "
+                        "computed=%d cached_before=%d cached_candidate=%d "
+                        "cached_after=%d external=%d recomputed=%d "
+                        "local_compute=%d local_cache_hit=%d accounting_valid=%s",
+                        self.vllm_config.parallel_config.data_parallel_rank,
+                        request_id,
+                        request.status.name,
+                        request.num_preemptions,
+                        request.num_prompt_tokens,
+                        request.num_tokens,
+                        request.num_computed_tokens,
+                        cached_tokens_before_lookup,
+                        min(num_computed_tokens, request.num_prompt_tokens),
+                        request.num_cached_tokens,
+                        request.num_external_computed_tokens,
+                        recomputed_tokens,
+                        local_compute,
+                        local_cache_hit,
+                        local_compute >= 0 and local_cache_hit >= 0,
+                    )
                 # Encoder-related.
                 if encoder_inputs_to_schedule:
                     scheduled_encoder_inputs[request_id] = encoder_inputs_to_schedule

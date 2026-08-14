@@ -605,15 +605,46 @@ async def send_request_to_service(
     for attempt in range(1, max_retries + 1):
         try:
             response = await client.post(endpoint, json=req_data, headers=headers)
+            if response.is_error:
+                logger.error(
+                    "[PD_PROXY_PREFILL_HTTP_ERROR] request_id=%s url=%s "
+                    "status=%d body=%r",
+                    request_id,
+                    response.request.url,
+                    response.status_code,
+                    response.text[:2048],
+                )
             response.raise_for_status()
+            logger.info(
+                "[PD_PROXY_PREFILL_RESPONSE] request_id=%s url=%s status=%d",
+                request_id,
+                response.request.url,
+                response.status_code,
+            )
             return response
         except (httpx.RequestError, httpx.HTTPStatusError) as e:
-            logger.warning(f"Attempt {attempt} failed for {endpoint}: {str(e)}")
+            logger.warning(
+                "[PD_PROXY_PREFILL_ATTEMPT_FAILED] request_id=%s "
+                "base_url=%s endpoint=%s attempt=%d/%d error=%r",
+                request_id,
+                client.base_url,
+                endpoint,
+                attempt,
+                max_retries,
+                e,
+            )
             last_exc = e
             if attempt < max_retries:
                 await asyncio.sleep(base_delay * (2 ** (attempt - 1)))
             else:
-                logger.error(f"All {max_retries} attempts failed for {endpoint}.")
+                logger.error(
+                    "[PD_PROXY_PREFILL_RETRIES_EXHAUSTED] request_id=%s "
+                    "base_url=%s endpoint=%s attempts=%d",
+                    request_id,
+                    client.base_url,
+                    endpoint,
+                    max_retries,
+                )
                 raise last_exc
 
 
@@ -629,7 +660,23 @@ async def stream_service_response_with_retry(
     for attempt in range(1, max_retries + 1):
         try:
             async with client.stream("POST", endpoint, json=req_data, headers=headers) as response:
+                if response.is_error:
+                    body = (await response.aread())[:2048]
+                    logger.error(
+                        "[PD_PROXY_DECODE_HTTP_ERROR] request_id=%s url=%s "
+                        "status=%d body=%r",
+                        request_id,
+                        response.request.url,
+                        response.status_code,
+                        body,
+                    )
                 response.raise_for_status()
+                logger.info(
+                    "[PD_PROXY_DECODE_RESPONSE] request_id=%s url=%s status=%d",
+                    request_id,
+                    response.request.url,
+                    response.status_code,
+                )
                 first_chunk_sent = False
                 async for chunk in response.aiter_bytes():
                     first_chunk_sent = True
@@ -637,22 +684,64 @@ async def stream_service_response_with_retry(
                 return  # Success, exit after streaming
         except (httpx.RequestError, httpx.HTTPStatusError) as e:
             if attempt < max_retries:
-                logger.warning(f"Attempt {attempt} failed for streaming {endpoint}: {str(e)}")
+                logger.warning(
+                    "[PD_PROXY_DECODE_ATTEMPT_FAILED] request_id=%s "
+                    "base_url=%s endpoint=%s attempt=%d/%d error=%r",
+                    request_id,
+                    client.base_url,
+                    endpoint,
+                    attempt,
+                    max_retries,
+                    e,
+                )
                 await asyncio.sleep(base_delay * (2 ** (attempt - 1)))
             else:
-                logger.error(f"All {max_retries} attempts failed for streaming {endpoint}.")
+                logger.error(
+                    "[PD_PROXY_DECODE_RETRIES_EXHAUSTED] request_id=%s "
+                    "base_url=%s endpoint=%s attempts=%d error=%r",
+                    request_id,
+                    client.base_url,
+                    endpoint,
+                    max_retries,
+                    e,
+                )
                 raise e
         except Exception as e:
             # If any chunk has been sent, do not retry, just log and drop
             if "first_chunk_sent" in locals() and first_chunk_sent:
-                logger.error(f"Streaming to client interrupted after response started: {str(e)}")
+                logger.exception(
+                    "[PD_PROXY_DECODE_STREAM_INTERRUPTED] request_id=%s "
+                    "base_url=%s endpoint=%s error=%r",
+                    request_id,
+                    client.base_url,
+                    endpoint,
+                    e,
+                )
                 return
             else:
                 if attempt < max_retries:
-                    logger.warning(f"Attempt {attempt} failed for streaming {endpoint}: {str(e)}")
+                    logger.exception(
+                        "[PD_PROXY_DECODE_STREAM_ATTEMPT_FAILED] request_id=%s "
+                        "base_url=%s endpoint=%s attempt=%d/%d error=%r",
+                        request_id,
+                        client.base_url,
+                        endpoint,
+                        attempt,
+                        max_retries,
+                        e,
+                    )
                     await asyncio.sleep(base_delay * (2 ** (attempt - 1)))
                 else:
-                    logger.error(f"All {max_retries} attempts failed for streaming {endpoint}.")
+                    logger.exception(
+                        "[PD_PROXY_DECODE_STREAM_RETRIES_EXHAUSTED] "
+                        "request_id=%s base_url=%s endpoint=%s attempts=%d "
+                        "error=%r",
+                        request_id,
+                        client.base_url,
+                        endpoint,
+                        max_retries,
+                        e,
+                    )
                     raise e
 
 
@@ -663,6 +752,12 @@ async def _handle_select_instance(api: str, req_data: Any, request_length: int):
     # Select prefiller
     prefiller_idx = proxy_state.select_prefiller(prefiller_score)
     prefiller = proxy_state.prefillers[prefiller_idx]
+    logger.info(
+        "[PD_PROXY_PREFILL_SELECTED] request_id=%s prefiller=%s api=%s",
+        request_id,
+        prefiller.url,
+        api,
+    )
     # Send request to prefiller
     response = await send_request_to_service(
         prefiller.client,
@@ -684,6 +779,13 @@ async def _handle_select_instance(api: str, req_data: Any, request_length: int):
     # Use the prefiller's kv_transfer_params to select decoder
     decoder_idx = proxy_state.select_decoder(decoder_score)
     decoder = proxy_state.decoders[decoder_idx]
+    logger.info(
+        "[PD_PROXY_ROUTE] request_id=%s prefiller=%s decoder=%s api=%s",
+        request_id,
+        prefiller.url,
+        decoder.url,
+        api,
+    )
     logger.debug("Using %s %s", prefiller.url, decoder.url)
     return InstanceInfo(
         request_id=request_id,
@@ -803,10 +905,15 @@ async def _handle_completions(api: str, request: Request):
                             chunk = json.dumps(chunk_json).encode("utf-8")
                         yield chunk
             except Exception as e:
-                logger.error(
-                    f"Error during streaming from decoder {instance_info.decoder.url}: {str(e)} "
-                    f"the aborted request {instance_info.request_id} will be routing to the target "
-                    "prefiller when new request is ready to dispatch to it"
+                logger.exception(
+                    "[PD_PROXY_DECODE_STREAM_ERROR] request_id=%s "
+                    "prefiller=%s decoder=%s error=%r; the aborted request "
+                    "will be routed to the target prefiller when a new "
+                    "request is ready to dispatch",
+                    instance_info.request_id,
+                    instance_info.prefiller.url,
+                    instance_info.decoder.url,
+                    e,
                 )
                 proxy_state.abort_prefiller_request(instance_info.prefiller_idx, instance_info.request_id)
                 proxy_state.release_prefiller_kv(instance_info.prefiller_idx, instance_info.prefiller_score)

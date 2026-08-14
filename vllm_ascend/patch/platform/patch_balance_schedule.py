@@ -50,6 +50,13 @@ class BalanceScheduler(Scheduler):
             torch.tensor([0], dtype=torch.int, device="cpu")
             for _ in range(self.vllm_config.parallel_config.data_parallel_size)
         ]
+        logger.info(
+            "[TOKEN_ACCOUNTING_SCHEDULER_INIT] scheduler=BalanceScheduler "
+            "dp_rank=%s dp_size=%s log_stats=%s",
+            self.vllm_config.parallel_config.data_parallel_rank,
+            self.vllm_config.parallel_config.data_parallel_size,
+            self.log_stats,
+        )
 
     def balance_gather(self, dp_group):
         running_tensor = torch.tensor([len(self.running)], dtype=torch.int, device="cpu")
@@ -325,6 +332,7 @@ class BalanceScheduler(Scheduler):
                     skipped_waiting_requests.prepend_request(request)
                     continue
 
+                cached_tokens_before_lookup = request.num_cached_tokens
                 num_external_computed_tokens = 0
                 load_kv_async = False
                 connector_prefix_cache_queries, connector_prefix_cache_hits = 0, 0
@@ -352,6 +360,25 @@ class BalanceScheduler(Scheduler):
 
                         request.num_external_computed_tokens = ext_tokens
                         num_external_computed_tokens = ext_tokens
+                        if ext_tokens > 0:
+                            logger.info(
+                                "[TOKEN_ACCOUNTING_SCHED_LOOKUP] "
+                                "scheduler=BalanceScheduler dp_rank=%s req=%s "
+                                "status=%s preemptions=%d prompt=%d tokens=%d "
+                                "computed_before=%d cached_before=%d "
+                                "local_hit=%d external=%d load_async=%s",
+                                self.vllm_config.parallel_config.data_parallel_rank,
+                                request_id,
+                                request.status.name,
+                                request.num_preemptions,
+                                request.num_prompt_tokens,
+                                request.num_tokens,
+                                request.num_computed_tokens,
+                                cached_tokens_before_lookup,
+                                num_new_local_computed_tokens,
+                                ext_tokens,
+                                load_kv_async,
+                            )
 
                         connector_prefix_cache_queries = request.num_tokens - num_new_local_computed_tokens
                         connector_prefix_cache_hits = num_external_computed_tokens
@@ -500,6 +527,45 @@ class BalanceScheduler(Scheduler):
                 # Count the number of prefix cached tokens.
                 if request.num_cached_tokens < 0:
                     request.num_cached_tokens = num_computed_tokens
+                if (
+                    request.num_external_computed_tokens > 0
+                    or request.num_cached_tokens > request.num_prompt_tokens
+                ):
+                    recomputed_tokens = int(
+                        request.num_cached_tokens + 1
+                        == request.num_prompt_tokens
+                    )
+                    local_compute = (
+                        request.num_prompt_tokens - request.num_cached_tokens
+                    )
+                    local_cache_hit = (
+                        request.num_cached_tokens
+                        + recomputed_tokens
+                        - request.num_external_computed_tokens
+                    )
+                    logger.info(
+                        "[TOKEN_ACCOUNTING_SCHED_DECISION] "
+                        "scheduler=BalanceScheduler dp_rank=%s req=%s "
+                        "status=%s preemptions=%d prompt=%d tokens=%d "
+                        "computed=%d cached_before=%d cached_candidate=%d "
+                        "cached_after=%d external=%d recomputed=%d "
+                        "local_compute=%d local_cache_hit=%d accounting_valid=%s",
+                        self.vllm_config.parallel_config.data_parallel_rank,
+                        request_id,
+                        request.status.name,
+                        request.num_preemptions,
+                        request.num_prompt_tokens,
+                        request.num_tokens,
+                        request.num_computed_tokens,
+                        cached_tokens_before_lookup,
+                        min(num_computed_tokens, request.num_prompt_tokens),
+                        request.num_cached_tokens,
+                        request.num_external_computed_tokens,
+                        recomputed_tokens,
+                        local_compute,
+                        local_cache_hit,
+                        local_compute >= 0 and local_cache_hit >= 0,
+                    )
                 # Encoder-related.
                 if encoder_inputs_to_schedule:
                     scheduled_encoder_inputs[request_id] = encoder_inputs_to_schedule
