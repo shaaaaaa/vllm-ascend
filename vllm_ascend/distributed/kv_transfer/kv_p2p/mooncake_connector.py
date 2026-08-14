@@ -1258,6 +1258,12 @@ class KVCacheRecvingThread(threading.Thread):
             latent_page_count=latent_page_count,
         )
         totals = [0, 0]
+        split_native_groups = len(requested_groups) > 1
+        native_segments_by_group: dict[int, list[SplitTransferSegment]] = (
+            {group_id: [] for group_id in sorted(requested_groups)}
+            if split_native_groups
+            else {}
+        )
         destinations: dict[str, list[tuple[int, int]]] = {
             "cpu": [],
             "npu": [],
@@ -1270,6 +1276,8 @@ class KVCacheRecvingThread(threading.Thread):
                 raise RuntimeError(
                     f"Split group {segment.group_id} requires {expected_kind} destinations"
                 )
+            if split_native_groups:
+                native_segments_by_group[segment.group_id].append(segment)
             if segment.length <= 0 or segment.source_offset < 0 or segment.destination_address <= 0:
                 raise RuntimeError("Invalid split destination extent")
             totals[segment.group_id] += segment.length
@@ -1351,17 +1359,26 @@ class KVCacheRecvingThread(threading.Thread):
                 if segment.source_offset + segment.length > source_size:
                     raise RuntimeError("Split source extent exceeds registered KV buffer")
         session_id = f"{remote_host}:{self.remote_te_port[remote_engine_id][remote_port]}"
-        local_destinations = [segment.destination_address for segment in plan.segments]
-        remote_sources = [
-            remote_bases[segment.source_buffer_index] + segment.source_offset
-            for segment in plan.segments
-        ]
-        lengths = [segment.length for segment in plan.segments]
+        native_batches = (
+            tuple(
+                (group_id, segments)
+                for group_id, segments in native_segments_by_group.items()
+            )
+            if split_native_groups
+            else ((next(iter(requested_groups)), plan.segments),)
+        )
+        if any(not segments for _, segments in native_batches):
+            raise RuntimeError("Every native split batch requires segments")
         if not registration_regions:
-            registration_regions = list(zip(local_destinations, lengths))
+            registration_regions = [
+                (segment.destination_address, segment.length)
+                for segment in plan.segments
+            ]
         registration_ptrs, registration_sizes = map(
             list, zip(*registration_regions, strict=True)
         )
+        native_group_ms: dict[str, float] = {}
+        native_failure: tuple[int, int] | None = None
         with global_te.temporary_registration(
             registration_ptrs,
             registration_sizes,
@@ -1369,17 +1386,39 @@ class KVCacheRecvingThread(threading.Thread):
             adopted_only=latent,
         ):
             registered_at = time.perf_counter()
-            ret = self.engine.batch_transfer_sync_read(
-                session_id, local_destinations, remote_sources, lengths)
+            for group_id, segments in native_batches:
+                batch_started = time.perf_counter()
+                ret = self.engine.batch_transfer_sync_read(
+                    session_id,
+                    [segment.destination_address for segment in segments],
+                    [
+                        remote_bases[segment.source_buffer_index]
+                        + segment.source_offset
+                        for segment in segments
+                    ],
+                    [segment.length for segment in segments],
+                )
+                native_group_ms[str(group_id)] = round(
+                    (time.perf_counter() - batch_started) * 1000, 3
+                )
+                if ret < 0:
+                    native_failure = (group_id, ret)
+                    break
             native_done_at = time.perf_counter()
         released_at = time.perf_counter()
-        if ret < 0:
-            raise RuntimeError(f"Mooncake split transfer failed, ret: {ret}")
+        if native_failure is not None:
+            failed_group, failure_code = native_failure
+            raise RuntimeError(
+                "Mooncake split transfer failed for group "
+                f"{failed_group}, ret: {failure_code}"
+            )
         _cold_live_log(
             "live_source_native_transfer_complete",
             req_id=req_meta.get("request_id"),
             transfer_id=req_meta.get("split_transfer_id"),
-            vector_count=len(lengths),
+            vector_count=len(plan.segments),
+            native_batch_count=len(native_batches),
+            native_group_ms=native_group_ms,
             registration_region_count=len(registration_regions),
             expand_ms=round((expanded_at - transfer_started) * 1000, 3),
             registration_ms=round((registered_at - expanded_at) * 1000, 3),

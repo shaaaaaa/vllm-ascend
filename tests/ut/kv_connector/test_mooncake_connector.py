@@ -10,7 +10,7 @@ import types
 import unittest
 from collections import defaultdict, deque
 from typing import Any, Dict, Optional, OrderedDict
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import msgspec
 import pytest
@@ -1036,8 +1036,12 @@ class TestCoreFunctionality(unittest.TestCase):
         self.thread.local_buffer_group_ids = (0, 1)
         plan = SplitTransferPlan(
             segments=(
-                SplitTransferSegment(0, 0, 32, 0x8000, 256, "cpu"),
-                SplitTransferSegment(1, 1, 64, 0xA000, 512, "npu"),
+                SplitTransferSegment(
+                    0, 0, 32, 0x8000, 256, "cpu", 0x3000
+                ),
+                SplitTransferSegment(
+                    1, 1, 64, 0xA000, 512, "npu", 0x5000
+                ),
             ),
             group_byte_totals=(256, 512),
             tp_rank=7,
@@ -1053,9 +1057,13 @@ class TestCoreFunctionality(unittest.TestCase):
             require_existing=False,
             adopted_only=False,
         )
-        self.engine.batch_transfer_sync_read.assert_called_once_with(
-            "localhost:7777", [0x8000, 0xA000],
-            [0x3000 + 32, 0x5000 + 64], [256, 512])
+        self.assertEqual(
+            self.engine.batch_transfer_sync_read.call_args_list,
+            [
+                call("localhost:7777", [0x8000], [0x3000 + 32], [256]),
+                call("localhost:7777", [0xA000], [0x5000 + 64], [512]),
+            ],
+        )
 
     @patch(
         'vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector.global_te.temporary_registration'
@@ -1117,11 +1125,63 @@ class TestCoreFunctionality(unittest.TestCase):
         mock_register.assert_called_once_with(
             [10000], [8], require_existing=True, adopted_only=True
         )
+        self.assertEqual(
+            self.engine.batch_transfer_sync_read.call_args_list,
+            [
+                call(
+                    "localhost:7777",
+                    [10000, 10004],
+                    [1004, 1012],
+                    [4, 4],
+                ),
+                call("localhost:7777", [6004], [2002], [4]),
+            ],
+        )
+
+    @patch(
+        'vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector.global_te.temporary_registration'
+    )
+    def test_mixed_split_stops_before_group1_when_group0_fails(
+        self, mock_register
+    ):
+        mock_register.return_value = contextlib.nullcontext()
+        self.thread.tp_rank = 0
+        self.vllm_config.parallel_config.data_parallel_rank_local = 0
+        self.thread.kv_caches_base_addr["remote_engine"] = {
+            6666: [0x3000, 0x5000]
+        }
+        self.thread.remote_buffer_sizes["remote_engine"] = {
+            6666: (4096, 4096)
+        }
+        self.thread.remote_buffer_group_ids["remote_engine"] = {
+            6666: (0, 1)
+        }
+        self.thread.remote_capabilities = {
+            ("remote_engine", 6666): (LIVE_SPLIT_CAPABILITY,)
+        }
+        self.thread.local_registered_bases = (0x7000, 0xA000)
+        self.thread.local_buffer_sizes = (4096, 4096)
+        self.thread.local_buffer_group_ids = (0, 1)
+        plan = SplitTransferPlan(
+            segments=(
+                SplitTransferSegment(
+                    0, 0, 32, 0x8000, 256, "cpu", 0x3000
+                ),
+                SplitTransferSegment(
+                    1, 1, 64, 0xA000, 512, "npu", 0x5000
+                ),
+            ),
+            group_byte_totals=(256, 512),
+            tp_rank=0,
+            dp_rank=0,
+        )
+        self.engine.batch_transfer_sync_read.return_value = -1
+
+        with self.assertRaisesRegex(RuntimeError, "failed for group 0"):
+            self.thread._transfer_split_destinations(self.test_req, plan)
+
         self.engine.batch_transfer_sync_read.assert_called_once_with(
-            "localhost:7777",
-            [10000, 10004, 6004],
-            [1004, 1012, 2002],
-            [4, 4, 4],
+            "localhost:7777", [0x8000], [0x3000 + 32], [256]
         )
 
     @patch(
