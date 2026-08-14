@@ -759,7 +759,10 @@ class TestLMCacheSparseFrontier(TestBase):
                     req_id="cold-compact",
                     is_sparse_decode=True,
                     load_spec=SimpleNamespace(
-                        can_load=True,
+                        # The async cold load has already completed, so the
+                        # scheduler correctly clears the load action while the
+                        # restored sparse frontier remains valid.
+                        can_load=False,
                         lmcache_cached_tokens=8193,
                         dsa_committed_end=8193,
                         dsa_remap_frontier=8192,

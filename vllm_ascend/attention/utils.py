@@ -379,7 +379,12 @@ def unwrap_staged_sfa_connector_metadata(metadata: Any) -> Any:
 
 def _dsa_remap_frontier(load_spec: Any) -> int:
     """Derive the operator boundary without changing LMCache commit progress."""
-    if load_spec is None or not getattr(load_spec, "can_load", False):
+    if load_spec is None:
+        return 0
+    cold_compact_resume = bool(
+        getattr(load_spec, "dsa_cold_compact_resume", False)
+    )
+    if not getattr(load_spec, "can_load", False) and not cold_compact_resume:
         return 0
     remap_value = getattr(load_spec, "dsa_remap_frontier", None)
     committed_value = (
@@ -451,9 +456,7 @@ def get_lmcache_sparse_cached_tokens(request_ids: Any) -> list[int]:
                 "[SFA sparse remap] connector remap metadata contains a "
                 f"duplicate request ID: {req_id!r}."
             )
-        if is_dense_prefix_load or load_spec is None or not getattr(
-            load_spec, "can_load", False
-        ):
+        if is_dense_prefix_load or load_spec is None:
             cached_by_req[req_id] = 0
         else:
             cached_by_req[req_id] = _dsa_remap_frontier(load_spec)

@@ -140,6 +140,43 @@ except ImportError:
 
     logger = logging.getLogger(__name__)
 
+
+_COLD_PERF_FALSE_VALUES = ("", "0", "false", "no", "off")
+
+
+def _log_proxy_cold_perf_event(
+    event: str,
+    request_id: str,
+    *,
+    endpoint: str,
+    **fields: Any,
+) -> None:
+    if (
+        os.environ.get("LMCACHE_COLD_START_PERF", "0").lower()
+        in _COLD_PERF_FALSE_VALUES
+    ):
+        return
+    if request_id.startswith(("cmpl-", "chatcmpl-")):
+        req_id = request_id
+    else:
+        prefix = "chatcmpl" if "chat/" in endpoint else "cmpl"
+        req_id = f"{prefix}-{request_id}"
+    payload = {
+        "schema": 1,
+        "event": event,
+        "pid": os.getpid(),
+        "monotonic_ms": round(time.perf_counter() * 1000, 3),
+        "req_id": req_id,
+        "proxy_request_id": request_id,
+        "endpoint": endpoint,
+        **fields,
+    }
+    logger.info(
+        "[LMCACHE_COLD_PERF] %s",
+        json.dumps(payload, default=str, separators=(",", ":")),
+    )
+
+
 # Add uvloop for faster event loop if available
 try:
     import uvloop
@@ -628,6 +665,13 @@ async def stream_service_response_with_retry(
     headers = {"Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}", "X-Request-Id": request_id}
     for attempt in range(1, max_retries + 1):
         try:
+            _log_proxy_cold_perf_event(
+                "proxy_decoder_send_start",
+                request_id,
+                endpoint=endpoint,
+                attempt=attempt,
+                decoder_url=str(getattr(client, "base_url", "")),
+            )
             async with client.stream("POST", endpoint, json=req_data, headers=headers) as response:
                 response.raise_for_status()
                 first_chunk_sent = False
@@ -673,6 +717,14 @@ async def _handle_select_instance(api: str, req_data: Any, request_length: int):
         max_retries=global_args.max_retries,
         base_delay=global_args.retry_delay,
     )
+    _log_proxy_cold_perf_event(
+        "proxy_prefill_response_received",
+        request_id,
+        endpoint=api,
+        prefiller_url=prefiller.url,
+        response_bytes=len(response.content),
+        request_bytes=request_length,
+    )
     proxy_state.release_prefiller(prefiller_idx, prefiller_score)
     response_json = response.json()
     kv_transfer_params = response_json.get("kv_transfer_params", {})
@@ -684,6 +736,14 @@ async def _handle_select_instance(api: str, req_data: Any, request_length: int):
     # Use the prefiller's kv_transfer_params to select decoder
     decoder_idx = proxy_state.select_decoder(decoder_score)
     decoder = proxy_state.decoders[decoder_idx]
+    _log_proxy_cold_perf_event(
+        "proxy_decoder_dispatch_ready",
+        request_id,
+        endpoint=api,
+        decoder_url=decoder.url,
+        request_bytes=request_length,
+        kv_transfer_param_keys=sorted(str(key) for key in kv_transfer_params),
+    )
     logger.debug("Using %s %s", prefiller.url, decoder.url)
     return InstanceInfo(
         request_id=request_id,
@@ -729,6 +789,13 @@ async def _handle_completions(api: str, request: Request):
 
         async def generate_stream():
             nonlocal instance_info
+            _log_proxy_cold_perf_event(
+                "proxy_decoder_generator_entry",
+                instance_info.request_id,
+                endpoint=api,
+                decoder_url=instance_info.decoder.url,
+                request_bytes=request_length,
+            )
             generated_token = ""
             released_kv = False
             retry_count = 0

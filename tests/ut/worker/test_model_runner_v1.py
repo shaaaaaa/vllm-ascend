@@ -1007,7 +1007,7 @@ class TestStagedSFADummyBatch(unittest.TestCase):
                     req_id="cold",
                     is_sparse_decode=True,
                     load_spec=SimpleNamespace(
-                        can_load=True,
+                        can_load=False,
                         lmcache_cached_tokens=8193,
                         dsa_committed_end=8192,
                         dsa_cold_compact_resume=True,
