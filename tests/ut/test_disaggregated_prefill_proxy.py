@@ -49,6 +49,68 @@ class TestProxyColdPerfLogging(unittest.TestCase):
 
         print_line.assert_not_called()
 
+    def test_prefiller_payload_is_encoded_once_and_reused_for_retry(self):
+        response = SimpleNamespace(
+            raise_for_status=MagicMock(),
+        )
+        client = SimpleNamespace(
+            post=AsyncMock(
+                side_effect=[
+                    proxy.httpx.RequestError("retry"),
+                    response,
+                ]
+            )
+        )
+        state = SimpleNamespace(
+            acquire_aborted_prefiller_requests=MagicMock(
+                return_value={"aborted-request"}
+            )
+        )
+        request_data = {
+            "prompt": "hello",
+            "stream": True,
+            "max_tokens": 16,
+            "stream_options": {"include_usage": True},
+        }
+
+        with (
+            patch.object(proxy, "proxy_state", state),
+            patch.object(
+                proxy,
+                "_encode_json_payload",
+                wraps=proxy._encode_json_payload,
+            ) as encode_payload,
+            patch.object(proxy, "_log_proxy_cold_perf_event"),
+        ):
+            result = asyncio.run(
+                proxy.send_request_to_service(
+                    client,
+                    0,
+                    "/completions",
+                    request_data,
+                    "request-uuid",
+                    max_retries=2,
+                    base_delay=0,
+                )
+            )
+
+        self.assertIs(result, response)
+        encode_payload.assert_called_once()
+        first_content = client.post.call_args_list[0].kwargs["content"]
+        second_content = client.post.call_args_list[1].kwargs["content"]
+        self.assertIs(first_content, second_content)
+        encoded = json.loads(first_content)
+        self.assertFalse(encoded["stream"])
+        self.assertEqual(encoded["max_tokens"], 1)
+        self.assertEqual(encoded["min_tokens"], 1)
+        self.assertNotIn("stream_options", encoded)
+        self.assertEqual(
+            encoded["kv_transfer_params"]["aborted_request"],
+            ["aborted-request"],
+        )
+        self.assertTrue(request_data["stream"])
+        self.assertEqual(request_data["max_tokens"], 16)
+
     def test_instance_selection_logs_handoff_boundaries(self):
         request_id = "request-uuid"
         prefiller = SimpleNamespace(
@@ -92,6 +154,11 @@ class TestProxyColdPerfLogging(unittest.TestCase):
                 "send_request_to_service",
                 AsyncMock(return_value=response),
             ),
+            patch.object(
+                proxy.time,
+                "perf_counter",
+                side_effect=[10.0, 10.002],
+            ),
             patch.object(proxy, "_log_proxy_cold_perf_event") as log_event,
         ):
             result = asyncio.run(
@@ -116,6 +183,15 @@ class TestProxyColdPerfLogging(unittest.TestCase):
                     request_bytes=4096,
                 ),
                 call(
+                    "proxy_decoder_body_encode_complete",
+                    request_id,
+                    endpoint="/completions",
+                    encode_ms=2.0,
+                    body_bytes=len(
+                        b'{"kv_transfer_params":{"source":"live"}}'
+                    ),
+                ),
+                call(
                     "proxy_decoder_dispatch_ready",
                     request_id,
                     endpoint="/completions",
@@ -128,6 +204,10 @@ class TestProxyColdPerfLogging(unittest.TestCase):
         self.assertEqual(
             req_data["kv_transfer_params"],
             {"source": "live"},
+        )
+        self.assertEqual(
+            result.decoder_body,
+            b'{"kv_transfer_params":{"source":"live"}}',
         )
 
     def test_decoder_stream_logs_actual_send_start(self):
@@ -158,7 +238,7 @@ class TestProxyColdPerfLogging(unittest.TestCase):
                 async for chunk in proxy.stream_service_response_with_retry(
                     client,
                     "/completions",
-                    {},
+                    b"{}",
                     "request-uuid",
                 )
             ]
@@ -175,6 +255,13 @@ class TestProxyColdPerfLogging(unittest.TestCase):
             endpoint="/completions",
             attempt=1,
             decoder_url="http://decoder:8002/v1/",
+            body_bytes=2,
+        )
+        stream_kwargs = client.stream.call_args.kwargs
+        self.assertEqual(stream_kwargs["content"], b"{}")
+        self.assertEqual(
+            stream_kwargs["headers"]["Content-Type"],
+            "application/json",
         )
 
     def test_streaming_response_logs_lazy_generator_entry(self):
@@ -195,6 +282,7 @@ class TestProxyColdPerfLogging(unittest.TestCase):
             decoder_idx=0,
             decoder_score=10.0,
             decoder=decoder,
+            decoder_body=b"{}",
         )
         state = SimpleNamespace(
             request_num=0,

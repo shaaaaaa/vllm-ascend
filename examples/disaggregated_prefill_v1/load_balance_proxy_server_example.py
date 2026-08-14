@@ -144,6 +144,16 @@ except ImportError:
 _COLD_PERF_FALSE_VALUES = ("", "0", "false", "no", "off")
 
 
+def _encode_json_payload(payload: Any) -> bytes:
+    """Encode a service payload once so retries can reuse the same bytes."""
+    return json.dumps(
+        payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+
+
 def _log_proxy_cold_perf_event(
     event: str,
     request_id: str,
@@ -639,11 +649,28 @@ async def send_request_to_service(
         req_data["max_completion_tokens"] = 1
     if "stream_options" in req_data:
         del req_data["stream_options"]
-    headers = {"Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}", "X-Request-Id": request_id}
+    encode_started = time.perf_counter()
+    request_content = _encode_json_payload(req_data)
+    _log_proxy_cold_perf_event(
+        "proxy_prefill_body_encode_complete",
+        request_id,
+        endpoint=endpoint,
+        encode_ms=round((time.perf_counter() - encode_started) * 1000, 3),
+        body_bytes=len(request_content),
+    )
+    headers = {
+        "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}",
+        "X-Request-Id": request_id,
+        "Content-Type": "application/json",
+    }
     last_exc = None
     for attempt in range(1, max_retries + 1):
         try:
-            response = await client.post(endpoint, json=req_data, headers=headers)
+            response = await client.post(
+                endpoint,
+                content=request_content,
+                headers=headers,
+            )
             response.raise_for_status()
             return response
         except (httpx.RequestError, httpx.HTTPStatusError) as e:
@@ -659,12 +686,16 @@ async def send_request_to_service(
 async def stream_service_response_with_retry(
     client: httpx.AsyncClient,
     endpoint: str,
-    req_data: dict,
+    request_content: bytes,
     request_id: str,
     max_retries: int = 3,
     base_delay: float = 0.2,
 ):
-    headers = {"Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}", "X-Request-Id": request_id}
+    headers = {
+        "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}",
+        "X-Request-Id": request_id,
+        "Content-Type": "application/json",
+    }
     for attempt in range(1, max_retries + 1):
         try:
             _log_proxy_cold_perf_event(
@@ -673,8 +704,14 @@ async def stream_service_response_with_retry(
                 endpoint=endpoint,
                 attempt=attempt,
                 decoder_url=str(getattr(client, "base_url", "")),
+                body_bytes=len(request_content),
             )
-            async with client.stream("POST", endpoint, json=req_data, headers=headers) as response:
+            async with client.stream(
+                "POST",
+                endpoint,
+                content=request_content,
+                headers=headers,
+            ) as response:
                 response.raise_for_status()
                 first_chunk_sent = False
                 async for chunk in response.aiter_bytes():
@@ -738,6 +775,15 @@ async def _handle_select_instance(api: str, req_data: Any, request_length: int):
     # Use the prefiller's kv_transfer_params to select decoder
     decoder_idx = proxy_state.select_decoder(decoder_score)
     decoder = proxy_state.decoders[decoder_idx]
+    encode_started = time.perf_counter()
+    decoder_body = _encode_json_payload(req_data)
+    _log_proxy_cold_perf_event(
+        "proxy_decoder_body_encode_complete",
+        request_id,
+        endpoint=api,
+        encode_ms=round((time.perf_counter() - encode_started) * 1000, 3),
+        body_bytes=len(decoder_body),
+    )
     _log_proxy_cold_perf_event(
         "proxy_decoder_dispatch_ready",
         request_id,
@@ -753,6 +799,7 @@ async def _handle_select_instance(api: str, req_data: Any, request_length: int):
         prefiller_score=prefiller_score,
         prefiller=prefiller,
         decoder=decoder,
+        decoder_body=decoder_body,
         decoder_idx=decoder_idx,
         decoder_score=decoder_score,
     )
@@ -767,6 +814,7 @@ class InstanceInfo:
     decoder_idx: int
     decoder_score: float
     decoder: ServerState
+    decoder_body: bytes
 
 
 async def _handle_completions(api: str, request: Request):
@@ -810,7 +858,7 @@ async def _handle_completions(api: str, request: Request):
                     async for chunk in stream_service_response_with_retry(
                         instance_info.decoder.client,
                         api,
-                        req_data,
+                        instance_info.decoder_body,
                         request_id=instance_info.request_id,
                         max_retries=global_args.max_retries,
                         base_delay=global_args.retry_delay,
