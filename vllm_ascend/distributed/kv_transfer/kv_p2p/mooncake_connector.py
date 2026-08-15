@@ -889,7 +889,7 @@ class KVCacheRecvingThread(threading.Thread):
             logger.error(f"Failed to transfer KV cache for request {remote_request_id}: {e}", exc_info=True)
         finally:
             if split_plan is None:
-                self._send_done_signal_to_free_remote_port(
+                signalled_ports = self._send_done_signal_to_free_remote_port(
                     remote_request_id, remote_host, remote_port_send_num)
                 if all_task_done:
                     if len(req_meta["local_block_ids"]) > 0:
@@ -898,7 +898,13 @@ class KVCacheRecvingThread(threading.Thread):
                         del self.proc_not_transfer_request[request_id]
                 self.request_queue.task_done()
                 # Ordinary transfers retain their original completion message.
-                self._send_done_recv_signal(remote_request_id, remote_host, remote_handshake_port, remote_port_send_num)
+                if remote_handshake_port not in signalled_ports:
+                    self._send_done_recv_signal(
+                        remote_request_id,
+                        remote_host,
+                        remote_handshake_port,
+                        remote_port_send_num,
+                    )
             else:
                 self.request_queue.task_done()
                 self.task_tracker.complete_split_request(
@@ -921,17 +927,25 @@ class KVCacheRecvingThread(threading.Thread):
 
     def _send_done_signal_to_free_remote_port(
         self, request_id: str, remote_host: str, remote_port_send_num: dict[int, RemotePortInfo]
-    ):
+    ) -> set[int]:
+        signalled_ports: set[int] = set()
         if self.side_channel_port != self.local_handshake_port or not remote_port_send_num:
-            return
+            return signalled_ports
         if request_id not in self.proc_not_transfer_request:
             self.proc_not_transfer_request[request_id] = True
         if self.proc_not_transfer_request[request_id]:
             for remote_port in remote_port_send_num:
                 if remote_port_send_num[remote_port]["num"] == 0:
                     remote_host_ = remote_port_send_num[remote_port]["host"]
-                    self._send_done_recv_signal(request_id, remote_host_, remote_port, remote_port_send_num)
+                    if self._send_done_recv_signal(
+                        request_id,
+                        remote_host_,
+                        remote_port,
+                        remote_port_send_num,
+                    ):
+                        signalled_ports.add(remote_port)
             self.proc_not_transfer_request[request_id] = False
+        return signalled_ports
 
     def _transfer_kv_cache(self, req_meta: dict[str, Any]):
         """Handle a KV cache transfer request."""
@@ -1700,7 +1714,7 @@ class KVCacheRecvingThread(threading.Thread):
         remote_host: str,
         remote_handshake_port: int,
         remote_port_send_num: dict[int, RemotePortInfo],
-    ):
+    ) -> bool:
         logger.debug(
             "Sending done recving signal for request %s to %s:%d", request_id, remote_host, remote_handshake_port
         )
@@ -1718,11 +1732,13 @@ class KVCacheRecvingThread(threading.Thread):
                     "Failed to receive ACK for request %s from %s:%d", request_id, remote_host, remote_handshake_port
                 )
                 raise RuntimeError(f"Failed to receive ACK, resp: {resp.decode('utf-8')}")
+            return True
         except (RuntimeError, zmq.ZMQError) as e:  # type: ignore
             if isinstance(sock, zmq.Socket):  # type: ignore
                 self._discard_remote_socket(sock)
                 sock = None
                 logger.warning(f"Unexpected error occurred in socket, {e}, closing the original channel")
+            return False
         finally:
             if sock is not None:
                 self._return_remote_socket(sock, remote_host, remote_handshake_port)

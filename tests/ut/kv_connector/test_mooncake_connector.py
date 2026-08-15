@@ -955,6 +955,49 @@ class TestCoreFunctionality(unittest.TestCase):
             "req1")
         self.mock_queue.task_done.assert_called_once()
 
+    @patch.object(KVCacheRecvingThread, '_transfer_kv_cache')
+    @patch.object(KVCacheRecvingThread, '_send_done_recv_signal')
+    def test_zero_transfer_port_sends_completion_once(
+        self, mock_send, mock_transfer
+    ):
+        mock_send.return_value = True
+        self.thread.side_channel_port = self.thread.local_handshake_port
+        request = dict(
+            self.test_req,
+            remote_port_send_num={
+                6666: {"host": "localhost", "num": 0},
+            },
+        )
+
+        self.thread._handle_request(request)
+
+        mock_transfer.assert_called_once_with(request)
+        mock_send.assert_called_once_with(
+            "req1",
+            "localhost",
+            6666,
+            {6666: {"host": "localhost", "num": 0}},
+        )
+
+    @patch.object(KVCacheRecvingThread, '_transfer_kv_cache')
+    @patch.object(KVCacheRecvingThread, '_send_done_recv_signal')
+    def test_zero_transfer_port_retries_failed_completion(
+        self, mock_send, mock_transfer
+    ):
+        mock_send.side_effect = [False, True]
+        self.thread.side_channel_port = self.thread.local_handshake_port
+        request = dict(
+            self.test_req,
+            remote_port_send_num={
+                6666: {"host": "localhost", "num": 0},
+            },
+        )
+
+        self.thread._handle_request(request)
+
+        mock_transfer.assert_called_once_with(request)
+        self.assertEqual(mock_send.call_count, 2)
+
     @patch.object(KVCacheRecvingThread, '_get_remote_metadata')
     def test_transfer_kv_cache(self, mock_get_meta):
         with patch(

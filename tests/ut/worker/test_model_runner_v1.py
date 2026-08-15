@@ -1185,7 +1185,7 @@ class TestStagedSFADummyBatch(unittest.TestCase):
         ):
             self.assertEqual(runner._staged_sfa_dummy_batch_size(**kwargs), 4)
 
-    def test_fixed_width_mtp_live_route_uses_request_capacity(self):
+    def test_fixed_width_mtp_cold_resume_uses_native_first_step(self):
         runner = self._build_runner()
         runner.speculative_config = SimpleNamespace(
             method="mtp",
@@ -1216,19 +1216,8 @@ class TestStagedSFADummyBatch(unittest.TestCase):
                 ]
             ),
         )
-        route = runner._staged_sfa_live_route(
-            local_route=local,
-            dp_route_action=StagedSFARouteAction.STAGED,
-            cudagraph_mode=CUDAGraphMode.PIECEWISE,
-            batch_descriptor=BatchDescriptor(num_tokens=4),
-            num_tokens_unpadded=4,
-            num_tokens_padded=4,
-            num_reqs=2,
-            should_ubatch=False,
-        )
-        self.assertEqual(local.cold_compact_resumes, ())
-        self.assertEqual(route.action, StagedSFARouteAction.STAGED)
-        self.assertEqual(route.graph_key, StagedSFAGraphKey.fixed_spec(2, 2))
+        self.assertEqual(local.action, StagedSFARouteAction.SAFE_NATIVE)
+        self.assertEqual(local.reason, StagedSFARouteReason.COLD_COMPACT_LAYOUT)
 
     def test_mtp_request_three_and_five_use_different_graph_capacities(self):
         query_width = 2

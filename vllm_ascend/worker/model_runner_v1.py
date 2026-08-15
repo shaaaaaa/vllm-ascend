@@ -3426,6 +3426,26 @@ class NPUModelRunner(GPUModelRunner):
                     )
                     return native(StagedSFARouteReason.COLD_COMPACT_LAYOUT)
         else:
+            # The fixed-width speculative graph has not established the
+            # first-resume compact-layout contract.  In particular, its two
+            # query rows can observe restored and newly written KV in one
+            # replay.  Running it on the first cold-compact step has produced
+            # deterministic token corruption in production.  Use the native
+            # path for this one step; subsequent decode steps no longer carry
+            # the cold-resume marker and remain graph eligible.
+            if any(cold_resumes):
+                log_cold_perf_event(
+                    "decoder_cold_compact_graph_reject",
+                    request_ids=request_ids,
+                    once=True,
+                    failed_invariants=["speculative_first_resume"],
+                    cold_resume_indices=[
+                        i
+                        for i, resume in enumerate(cold_resumes)
+                        if resume
+                    ],
+                )
+                return native(StagedSFARouteReason.COLD_COMPACT_LAYOUT)
             cold_resumes = ()
         scratch_capacity = query_width * index_topk
         if any(
