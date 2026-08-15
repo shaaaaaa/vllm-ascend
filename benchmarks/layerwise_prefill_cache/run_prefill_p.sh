@@ -9,11 +9,19 @@ case "${MODE}" in
     LAYERWISE=false
     DEFAULT_MAX_MODEL_LEN=66000
     ALLOW_LONG_MAX_MODEL_LEN=0
+    DEFAULT_GPU_MEMORY_UTILIZATION=0.96
+    DEFAULT_PREFILL_GRAPH=false
     ;;
   on)
     LAYERWISE=true
     DEFAULT_MAX_MODEL_LEN=264000
     ALLOW_LONG_MAX_MODEL_LEN=1
+    # Leave room for the prefill ACL graph pool. Layerwise prefill needs only
+    # about 1 GiB of KV cache per rank for one 264K-token request, so trading
+    # part of the oversized KV slab for graph memory does not reduce the
+    # configured single-request context capacity.
+    DEFAULT_GPU_MEMORY_UTILIZATION=0.94
+    DEFAULT_PREFILL_GRAPH=true
     ;;
   *)
     echo "mode must be off or on" >&2
@@ -25,7 +33,8 @@ MODEL="${MODEL:-/workspace/models/GLM-5.1-w4a8}"
 LMCACHE_CONFIG="${LMCACHE_CONFIG:-/workspace/lmy/lmcache_config.yaml}"
 CHUNK_SIZE="${CHUNK_SIZE:-2048}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-${DEFAULT_MAX_MODEL_LEN}}"
-GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.96}"
+GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-${DEFAULT_GPU_MEMORY_UTILIZATION}}"
+PREFILL_GRAPH="${PREFILL_GRAPH:-${DEFAULT_PREFILL_GRAPH}}"
 PREFILL_PROFILE_ALL_CHUNKS="${PREFILL_PROFILE_ALL_CHUNKS:-false}"
 PREFILL_TRACE="${PREFILL_TRACE:-false}"
 PORT="${PORT:-9960}"
@@ -34,9 +43,25 @@ OUTPUT_DIR="/workspace/lmy/layerwise-prefill-bench/${MODE}-${RUN_ID}"
 LOG="${OUTPUT_DIR}/server.log"
 PROFILE_DIR="${PROFILE_DIR:-${OUTPUT_DIR}/profile}"
 
+case "${PREFILL_GRAPH}" in
+  true)
+    COMPILATION_CONFIG="$(printf \
+      '{"cudagraph_mode":"PIECEWISE","cudagraph_capture_sizes":[%s]}' \
+      "${CHUNK_SIZE}")"
+    ;;
+  false)
+    COMPILATION_CONFIG='{"cudagraph_mode":"PIECEWISE"}'
+    ;;
+  *)
+    echo "PREFILL_GRAPH must be true or false" >&2
+    exit 2
+    ;;
+esac
+
 mkdir -p "${OUTPUT_DIR}" "${PROFILE_DIR}"
-printf 'MODE=%s\nLAYERWISE=%s\nMAX_MODEL_LEN=%s\nPREFILL_PROFILE_ALL_CHUNKS=%s\nPREFILL_TRACE=%s\nLOG=%s\nPROFILE_DIR=%s\n' \
-  "${MODE}" "${LAYERWISE}" "${MAX_MODEL_LEN}" \
+printf 'MODE=%s\nLAYERWISE=%s\nMAX_MODEL_LEN=%s\nCHUNK_SIZE=%s\nGPU_MEMORY_UTILIZATION=%s\nPREFILL_GRAPH=%s\nCOMPILATION_CONFIG=%s\nPREFILL_PROFILE_ALL_CHUNKS=%s\nPREFILL_TRACE=%s\nLOG=%s\nPROFILE_DIR=%s\n' \
+  "${MODE}" "${LAYERWISE}" "${MAX_MODEL_LEN}" "${CHUNK_SIZE}" \
+  "${GPU_MEMORY_UTILIZATION}" "${PREFILL_GRAPH}" "${COMPILATION_CONFIG}" \
   "${PREFILL_PROFILE_ALL_CHUNKS}" "${PREFILL_TRACE}" \
   "${LOG}" "${PROFILE_DIR}"
 
@@ -74,7 +99,7 @@ vllm serve "${MODEL}" \
   --port "${PORT}" \
   --no-enable-prefix-caching \
   --quantization ascend \
-  --compilation-config '{"cudagraph_mode":"PIECEWISE"}' \
+  --compilation-config "${COMPILATION_CONFIG}" \
   --profiler-config \
     "{\"profiler\":\"torch\",\"torch_profiler_dir\":\"${PROFILE_DIR}\",\"torch_profiler_with_stack\":false,\"torch_profiler_with_memory\":false,\"ignore_frontend\":true}" \
   --kv-transfer-config \
