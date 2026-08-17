@@ -246,6 +246,12 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
             # This is really strange since vLLM slices them as well
             block_table_tensor=self.block_table_tensor,
             slot_mapping=self.slot_mapping,
+            # Preserve the independent Group-1 address space for the MTP
+            # drafter. Dropping either field here makes the SFA draft layer
+            # fall back to Group-0 addresses after padded target metadata is
+            # converted to its unpadded view.
+            indexer_block_table_tensor=self.indexer_block_table_tensor,
+            indexer_slot_mapping=self.indexer_slot_mapping,
             causal=self.causal,
             actual_seq_lengths_q=self.actual_seq_lengths_q[:num_actual_tokens],
             positions=self.positions,
@@ -254,6 +260,11 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
             num_input_tokens=self.num_input_tokens,
             prefill_context_parallel_metadata=self.prefill_context_parallel_metadata,
             max_seq_len=self.max_seq_len,
+            prompt_lens_cpu=(
+                self.prompt_lens_cpu[:num_actual_reqs]
+                if self.prompt_lens_cpu is not None
+                else None
+            ),
             request_ids=(self.request_ids[:num_actual_reqs] if self.request_ids is not None else None),
             cold_compact_resumes=self.cold_compact_resumes[
                 :num_actual_reqs

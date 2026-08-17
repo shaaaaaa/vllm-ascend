@@ -2207,6 +2207,19 @@ class SpecDecodeBaseProposer(EagleProposer):
             common_attn_metadata.slot_mapping[token_indices]
         )
         common_attn_metadata.slot_mapping[token_indices.shape[0] :].fill_(-1)
+        indexer_slot_mapping = getattr(
+            common_attn_metadata,
+            "indexer_slot_mapping",
+            None,
+        )
+        if indexer_slot_mapping is not None:
+            # Group 1 follows the same accepted-token compaction as Group 0,
+            # but its physical block ids are independent. Compact its own
+            # slots instead of reusing the latent slots.
+            indexer_slot_mapping[: token_indices.shape[0]].copy_(
+                indexer_slot_mapping[token_indices]
+            )
+            indexer_slot_mapping[token_indices.shape[0] :].fill_(-1)
 
         # NOTE: Currently positions and seq_lens are not used in attn forward
         # so we do not need to fixed them. But if they are used in the future,
@@ -2223,6 +2236,43 @@ class SpecDecodeBaseProposer(EagleProposer):
             max_query_len=new_query_len_per_req.max().item(),
             block_table_tensor=common_attn_metadata.block_table_tensor,
             slot_mapping=common_attn_metadata.slot_mapping,
+            indexer_block_table_tensor=getattr(
+                common_attn_metadata,
+                "indexer_block_table_tensor",
+                None,
+            ),
+            indexer_slot_mapping=indexer_slot_mapping,
+            prompt_lens_cpu=getattr(
+                common_attn_metadata,
+                "prompt_lens_cpu",
+                None,
+            ),
+            request_ids=getattr(common_attn_metadata, "request_ids", None),
+            cold_compact_resumes=getattr(
+                common_attn_metadata,
+                "cold_compact_resumes",
+                (),
+            ),
+            resident_state_indices=getattr(
+                common_attn_metadata,
+                "resident_state_indices",
+                None,
+            ),
+            resident_state_generations=getattr(
+                common_attn_metadata,
+                "resident_state_generations",
+                None,
+            ),
+            resident_state_indices_cpu=getattr(
+                common_attn_metadata,
+                "resident_state_indices_cpu",
+                None,
+            ),
+            resident_state_generations_cpu=getattr(
+                common_attn_metadata,
+                "resident_state_generations_cpu",
+                None,
+            ),
             actual_seq_lengths_q=self.runner.actual_seq_lengths_q,
             positions=common_attn_metadata.positions[token_indices],
             attn_state=self.runner.attn_state,
@@ -2302,6 +2352,47 @@ class SpecDecodeBaseProposer(EagleProposer):
             actual_seq_lengths_q=self.runner.actual_seq_lengths_q,
             block_table_tensor=common_attn_metadata.block_table_tensor,
             slot_mapping=common_attn_metadata.slot_mapping,
+            indexer_block_table_tensor=getattr(
+                common_attn_metadata,
+                "indexer_block_table_tensor",
+                None,
+            ),
+            indexer_slot_mapping=getattr(
+                common_attn_metadata,
+                "indexer_slot_mapping",
+                None,
+            ),
+            prompt_lens_cpu=getattr(
+                common_attn_metadata,
+                "prompt_lens_cpu",
+                None,
+            ),
+            request_ids=getattr(common_attn_metadata, "request_ids", None),
+            cold_compact_resumes=getattr(
+                common_attn_metadata,
+                "cold_compact_resumes",
+                (),
+            ),
+            resident_state_indices=getattr(
+                common_attn_metadata,
+                "resident_state_indices",
+                None,
+            ),
+            resident_state_generations=getattr(
+                common_attn_metadata,
+                "resident_state_generations",
+                None,
+            ),
+            resident_state_indices_cpu=getattr(
+                common_attn_metadata,
+                "resident_state_indices_cpu",
+                None,
+            ),
+            resident_state_generations_cpu=getattr(
+                common_attn_metadata,
+                "resident_state_generations_cpu",
+                None,
+            ),
             positions=common_attn_metadata.positions,
             attn_state=self.runner.attn_state,
             decode_token_per_req=self.runner.decode_token_per_req,

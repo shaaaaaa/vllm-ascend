@@ -258,3 +258,57 @@ def test_two_group_indexer_never_falls_back_to_latent_addresses() -> None:
         and any(isinstance(child, ast.Raise) for child in ast.walk(node))
     ]
     assert len(table_guards) == 1
+
+
+def test_spec_decode_metadata_rebuilds_preserve_group1_addresses() -> None:
+    """MTP metadata transforms must not erase the independent index group."""
+    repository_root = Path(__file__).resolve().parents[2]
+    tree = ast.parse(
+        (
+            repository_root
+            / "vllm_ascend/spec_decode/eagle_proposer.py"
+        ).read_text(encoding="utf-8")
+    )
+    proposer = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ClassDef)
+        and node.name == "SpecDecodeBaseProposer"
+    )
+    functions = {
+        node.name: node
+        for node in proposer.body
+        if isinstance(node, ast.FunctionDef)
+    }
+    required_fields = {
+        "indexer_block_table_tensor",
+        "indexer_slot_mapping",
+        "prompt_lens_cpu",
+        "request_ids",
+        "cold_compact_resumes",
+        "resident_state_indices",
+        "resident_state_generations",
+        "resident_state_indices_cpu",
+        "resident_state_generations_cpu",
+    }
+
+    for function_name in ("prepare_inputs", "prepare_inputs_padded"):
+        constructors = [
+            node
+            for node in ast.walk(functions[function_name])
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "AscendCommonAttentionMetadata"
+        ]
+        assert len(constructors) == 1
+        keyword_names = {
+            keyword.arg for keyword in constructors[0].keywords
+        }
+        assert required_fields <= keyword_names
+
+    prepare_inputs_source = ast.unparse(functions["prepare_inputs"])
+    assert "indexer_slot_mapping[token_indices]" in prepare_inputs_source
+    assert (
+        "indexer_slot_mapping[token_indices.shape[0]:].fill_(-1)"
+        in prepare_inputs_source
+    )
