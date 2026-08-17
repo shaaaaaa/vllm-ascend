@@ -210,6 +210,7 @@ class TestNPUPlatform(TestBase):
         vllm_config = TestNPUPlatform.mock_vllm_config()
         vllm_config.model_config = None
         vllm_config.kv_transfer_config = None
+        vllm_config.parallel_config.pipeline_parallel_size = 1
 
         with self.assertRaisesRegex(
             ValueError, "VLLM_ASCEND_ENABLE_MATMUL_ALLREDUCE=0"
