@@ -1674,6 +1674,7 @@ class TestStagedSFAGraphPoc(TestBase):
                 padding_tokens = token_capacity - actual_tokens
                 impl = self._make_eligible_impl()
                 impl.decode_threshold = query_width
+                impl._staged_sfa_graph_capture_sizes = (token_capacity,)
                 graph_key = StagedSFAGraphKey.fixed_spec(
                     request_capacity,
                     query_width,
@@ -1723,6 +1724,18 @@ class TestStagedSFAGraphPoc(TestBase):
                     staged_sfa_graph_dummy_run=False,
                     cudagraph_runtime_mode=CUDAGraphMode.PIECEWISE,
                 )
+
+                eager_context = SimpleNamespace(
+                    cudagraph_runtime_mode=CUDAGraphMode.NONE,
+                )
+                with patch.object(
+                    sfa_v1,
+                    "get_forward_context",
+                    return_value=eager_context,
+                ):
+                    impl._ensure_staged_sfa_bridge_buffers(
+                        torch.empty(token_capacity, 4)
+                    )
 
                 with (
                     patch.object(
@@ -2982,15 +2995,22 @@ class TestAscendSFAMetadataBuilder(TestBase):
         )
         assert ordinary_transition.num_decode_tokens == 0
 
+        cold_frontier = builder.scratch_capacity
         cold_transition = builder.build(
             common_prefix_len=0,
             common_attn_metadata=common_metadata(
-                [0, 1], [8], [9], ["cold"], (True,)
+                [0, 1],
+                [cold_frontier],
+                [cold_frontier + 1],
+                ["cold"],
+                (True,),
             ),
         )
         assert cold_transition.decode_req_indices.tolist() == [0]
         assert cold_transition.decode_row_offsets.tolist() == [0]
-        assert cold_transition.split_boundary.tolist() == [9]
+        assert cold_transition.split_boundary.tolist() == [
+            cold_frontier + 1
+        ]
         assert cold_transition.num_decode_tokens == 1
         with patch.object(
             sfa_v1, "_decode_window_save_window_size", return_value=0
@@ -3000,9 +3020,9 @@ class TestAscendSFAMetadataBuilder(TestBase):
                 ["cold"],
                 is_dummy_run=False,
                 index_topk=16,
-                cached_tokens=(8,),
+                cached_tokens=(cold_frontier,),
             )
-        assert boundary.tolist() == [8]
+        assert boundary.tolist() == [cold_frontier]
 
         first = builder.build(
             common_prefix_len=0,
