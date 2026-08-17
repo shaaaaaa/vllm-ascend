@@ -89,6 +89,11 @@ from vllm_ascend.distributed.kv_transfer.sparse_offload.resident_sorted_cache im
     sorted_resident_workspace_prefix,
 )
 from vllm_ascend.distributed.utils import all_gather_async
+from vllm_ascend.lmcache_diagnostics import (
+    npu_content_diagnostics_enabled,
+    queue_group1_first_consume,
+    queue_selected_topk_fingerprint,
+)
 from vllm_ascend.ops.layer_shard_linear import (
     is_hidden_layer,
     post_process_after_loading_for_shard_weight_series,
@@ -116,19 +121,6 @@ from vllm_ascend.worker.npu_input_batch import NPUInputBatch
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
-
-try:
-    from lmcache_ascend.v1.content_diagnostics import (
-        queue_group1_first_consume,
-        queue_selected_topk_fingerprint,
-    )
-except ImportError:
-    # LMCache-Ascend is optional for non-LMCache deployments.
-    def queue_group1_first_consume(**_: Any) -> None:
-        return
-
-    def queue_selected_topk_fingerprint(**_: Any) -> None:
-        return
 
 # token count limits within bmm_transpose operator
 BMM_TRANS_MAX_SUPPORTED_TOKENS = 1024
@@ -4122,6 +4114,10 @@ class AscendSFAImpl(MLAAttentionImpl):
 
             k_li = self._get_full_kv(k_li, attn_metadata)
 
+        content_diagnostics_enabled = (
+            bool(attn_metadata.req_ids)
+            and npu_content_diagnostics_enabled()
+        )
         if kv_cache is not None:
             if index_lmcache_enabled:
                 # A cold shared-cache decode needs prompt index rows before
@@ -4129,15 +4125,18 @@ class AscendSFAImpl(MLAAttentionImpl):
                 # and does not advance the group-0 latent-layer cursor.
                 with _dsa_prof.section("lmc_index_retrieve"):
                     wait_for_kv_layer_from_connector(index_layer_name)
-                queue_group1_first_consume(
-                    req_ids=attn_metadata.req_ids,
-                    layer_name=index_layer_name,
-                    indexer_cache=kv_cache[2],
-                    indexer_block_table=attn_metadata.indexer_block_table,
-                    seq_lens_cpu=attn_metadata.seq_lens_cpu,
-                    block_size=self.block_size,
-                    row_request_indices=attn_metadata.decode_req_indices_cpu,
-                )
+                if content_diagnostics_enabled:
+                    queue_group1_first_consume(
+                        req_ids=attn_metadata.req_ids,
+                        layer_name=index_layer_name,
+                        indexer_cache=kv_cache[2],
+                        indexer_block_table=attn_metadata.indexer_block_table,
+                        seq_lens_cpu=attn_metadata.seq_lens_cpu,
+                        block_size=self.block_size,
+                        row_request_indices=(
+                            attn_metadata.decode_req_indices_cpu
+                        ),
+                    )
 
             if self.is_kv_producer:
                 attn_metadata.reshape_cache_event = torch.npu.Event()
@@ -4166,12 +4165,13 @@ class AscendSFAImpl(MLAAttentionImpl):
                 actual_seq_lengths_query=actual_seq_lengths_query,
                 actual_seq_lengths_key=actual_seq_lengths_key,
             )
-            queue_selected_topk_fingerprint(
-                req_ids=attn_metadata.req_ids,
-                layer_name=index_layer_name or layer_name,
-                topk_indices=topk_indices,
-                row_request_indices=attn_metadata.decode_req_indices_cpu,
-            )
+            if content_diagnostics_enabled:
+                queue_selected_topk_fingerprint(
+                    req_ids=attn_metadata.req_ids,
+                    layer_name=index_layer_name or layer_name,
+                    topk_indices=topk_indices,
+                    row_request_indices=attn_metadata.decode_req_indices_cpu,
+                )
 
         # DSA Step B2 (compact-scratch decode): the indexer just produced topk.
         # Remap LMCache-selected entries to compact scratch rows [0..n_ret)

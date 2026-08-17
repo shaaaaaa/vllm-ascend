@@ -172,23 +172,11 @@ from vllm_ascend.utils import (
 from vllm_ascend.worker.dsa_shared_pool import reshape_dsa_shared_pool_raw
 from vllm_ascend.worker.npu_input_batch import NPUInputBatch
 from vllm_ascend.worker.pcp_utils import PCPManager
-
-try:
-    from lmcache_ascend.v1.content_diagnostics import (
-        begin_deferred_diagnostic_step,
-        flush_deferred_diagnostics,
-        npu_content_diagnostics_enabled,
-    )
-except ImportError:
-    # LMCache-Ascend is optional for non-LMCache deployments.
-    def begin_deferred_diagnostic_step() -> None:
-        return
-
-    def flush_deferred_diagnostics() -> None:
-        return
-
-    def npu_content_diagnostics_enabled() -> bool:
-        return False
+from vllm_ascend.lmcache_diagnostics import (
+    begin_deferred_diagnostic_step,
+    flush_deferred_diagnostics,
+    npu_content_diagnostics_enabled,
+)
 
 from vllm_ascend.ascend_forward_context import (  # isort: skip
     MoECommType,

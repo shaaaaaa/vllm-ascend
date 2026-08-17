@@ -54,6 +54,11 @@ from vllm_ascend import envs as ascend_envs
 from vllm_ascend.ascend_config import get_ascend_config, init_ascend_config
 from vllm_ascend.distributed.kv_transfer.utils.mooncake_transfer_engine import global_te
 from vllm_ascend.distributed.kv_transfer.utils.utils import get_transfer_timeout_value
+from vllm_ascend.lmcache_diagnostics import (
+    fingerprint_compact_group1,
+    npu_content_diagnostics_enabled,
+    register_group1_source_fingerprint,
+)
 from vllm_ascend.utils import enable_custom_op, is_vl_model
 
 # isort: off
@@ -222,19 +227,13 @@ def _fingerprint_live_group1_destination(
     expected: dict[str, Any] | None,
 ) -> None:
     """Call the optional LMCache-Ascend diagnostic after synchronous DMA."""
-    if layout is None or expected is None:
+    if (
+        layout is None
+        or expected is None
+        or not npu_content_diagnostics_enabled()
+    ):
         return
     try:
-        # LMCache-Ascend is optional for ordinary Mooncake deployments.  Keep
-        # this import on the explicitly enabled diagnostic path.
-        from lmcache_ascend.v1.content_diagnostics import (
-            fingerprint_compact_group1,
-            npu_content_diagnostics_enabled,
-            register_group1_source_fingerprint,
-        )
-
-        if not npu_content_diagnostics_enabled():
-            return
         owners: list[torch.Tensor] = []
         for cache_or_caches in kv_caches.values():
             if isinstance(cache_or_caches, torch.Tensor):
