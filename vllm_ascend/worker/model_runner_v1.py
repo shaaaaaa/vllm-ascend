@@ -173,6 +173,23 @@ from vllm_ascend.worker.dsa_shared_pool import reshape_dsa_shared_pool_raw
 from vllm_ascend.worker.npu_input_batch import NPUInputBatch
 from vllm_ascend.worker.pcp_utils import PCPManager
 
+try:
+    from lmcache_ascend.v1.content_diagnostics import (
+        begin_deferred_diagnostic_step,
+        flush_deferred_diagnostics,
+        npu_content_diagnostics_enabled,
+    )
+except ImportError:
+    # LMCache-Ascend is optional for non-LMCache deployments.
+    def begin_deferred_diagnostic_step() -> None:
+        return
+
+    def flush_deferred_diagnostics() -> None:
+        return
+
+    def npu_content_diagnostics_enabled() -> bool:
+        return False
+
 from vllm_ascend.ascend_forward_context import (  # isort: skip
     MoECommType,
     StagedSFAGraphKey,
@@ -2070,9 +2087,16 @@ class NPUModelRunner(GPUModelRunner):
                 once=True,
                 total_num_scheduled_tokens=num_tokens_padded,
             )
+            content_diagnostics_enabled = (
+                npu_content_diagnostics_enabled()
+            )
+            if content_diagnostics_enabled:
+                begin_deferred_diagnostic_step()
             hidden_states = self._model_forward(
                 num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
             )
+            if content_diagnostics_enabled:
+                flush_deferred_diagnostics()
             if cold_perf_req_ids:
                 log_cold_perf_event(
                     "decoder_forward_return",

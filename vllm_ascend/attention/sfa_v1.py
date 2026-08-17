@@ -117,6 +117,19 @@ from vllm_ascend.worker.npu_input_batch import NPUInputBatch
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
 
+try:
+    from lmcache_ascend.v1.content_diagnostics import (
+        queue_group1_first_consume,
+        queue_selected_topk_fingerprint,
+    )
+except ImportError:
+    # LMCache-Ascend is optional for non-LMCache deployments.
+    def queue_group1_first_consume(**_: Any) -> None:
+        return
+
+    def queue_selected_topk_fingerprint(**_: Any) -> None:
+        return
+
 # token count limits within bmm_transpose operator
 BMM_TRANS_MAX_SUPPORTED_TOKENS = 1024
 # Fence the first sparse load once in each worker process by default.
@@ -4116,6 +4129,15 @@ class AscendSFAImpl(MLAAttentionImpl):
                 # and does not advance the group-0 latent-layer cursor.
                 with _dsa_prof.section("lmc_index_retrieve"):
                     wait_for_kv_layer_from_connector(index_layer_name)
+                queue_group1_first_consume(
+                    req_ids=attn_metadata.req_ids,
+                    layer_name=index_layer_name,
+                    indexer_cache=kv_cache[2],
+                    indexer_block_table=attn_metadata.indexer_block_table,
+                    seq_lens_cpu=attn_metadata.seq_lens_cpu,
+                    block_size=self.block_size,
+                    row_request_indices=attn_metadata.decode_req_indices_cpu,
+                )
 
             if self.is_kv_producer:
                 attn_metadata.reshape_cache_event = torch.npu.Event()
@@ -4143,6 +4165,12 @@ class AscendSFAImpl(MLAAttentionImpl):
                 sin=sin,
                 actual_seq_lengths_query=actual_seq_lengths_query,
                 actual_seq_lengths_key=actual_seq_lengths_key,
+            )
+            queue_selected_topk_fingerprint(
+                req_ids=attn_metadata.req_ids,
+                layer_name=index_layer_name or layer_name,
+                topk_indices=topk_indices,
+                row_request_indices=attn_metadata.decode_req_indices_cpu,
             )
 
         # DSA Step B2 (compact-scratch decode): the indexer just produced topk.

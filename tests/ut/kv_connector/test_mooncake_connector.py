@@ -360,6 +360,116 @@ def test_compact_source_canonicalizes_layer_buffers() -> None:
     assert LIVE_SPLIT_COMPACT_CAPABILITY
 
 
+def test_compact_source_preserves_bounded_content_diagnostics() -> None:
+    scheduler = MooncakeConnectorScheduler.__new__(MooncakeConnectorScheduler)
+    scheduler.live_split_source_groups = (1,)
+    scheduler.local_source_metadata = {
+        (0, 0): MooncakeAgentMetadata(
+            engine_id="engine",
+            te_rpc_port=1,
+            kv_caches_base_addr=[1000, 2000],
+            kv_caches_buffer_sizes=(128, 128),
+            buffer_group_ids=(1, 1),
+            num_blocks=1,
+        )
+    }
+    content_diagnostics = {
+        "schema": 1,
+        "algorithm": "blake2b-128",
+        "sample_layer_ids": [0, 1],
+        "sample_logical_tokens": [0, 3],
+        "row_hashes": {
+            "0:0": "0" * 32,
+            "0:3": "1" * 32,
+            "1:0": "2" * 32,
+            "1:3": "3" * 32,
+        },
+        "layer_hashes": {"0": "4" * 32, "1": "5" * 32},
+        "combined_hash": "6" * 32,
+        "readback_may_synchronize": True,
+    }
+    descriptor = {
+        "format": "layer_slot_runs_v1",
+        "tp_rank": 0,
+        "dp_rank": 0,
+        "group_byte_totals": [0, 64],
+        "content_diagnostics": content_diagnostics,
+        "compact_layout": {
+            "group_id": 1,
+            "token_count": 4,
+            "layers": [
+                {"layer_id": 0, "buffer_base": 1000,
+                 "token_bytes": 8, "slot_capacity": 16},
+                {"layer_id": 1, "buffer_base": 2000,
+                 "token_bytes": 8, "slot_capacity": 16},
+            ],
+            "runs": [{"logical_token_start": 0,
+                      "physical_slot_start": 3, "token_count": 4}],
+        },
+    }
+
+    canonical = scheduler._canonicalize_source_descriptor(descriptor)
+    normalized = canonical["descriptors"][0]
+    assert normalized["content_diagnostics"] == content_diagnostics
+
+    source = MooncakeConnectorMetadata._parse_source_descriptor(canonical)
+    assert source is not None
+    plan = MooncakeConnectorMetadata._merge_source_and_destinations(
+        source[0],
+        {
+            "tp_rank": 0,
+            "dp_rank": 0,
+            "requested_groups": [1],
+            "group_byte_totals": [0, 64],
+            "segments": [],
+            "compact_layout": {
+                "group_id": 1,
+                "token_count": 4,
+                "layers": [
+                    {"layer_id": 0, "buffer_base": 3000,
+                     "token_bytes": 8, "slot_capacity": 16},
+                    {"layer_id": 1, "buffer_base": 4000,
+                     "token_bytes": 8, "slot_capacity": 16},
+                ],
+                "runs": [{"logical_token_start": 0,
+                          "physical_slot_start": 4, "token_count": 4}],
+            },
+        },
+    )
+    assert plan.content_diagnostics == content_diagnostics
+
+
+def test_invalid_content_diagnostics_are_dropped_not_fatal() -> None:
+    descriptor = {
+        "tp_rank": 0,
+        "dp_rank": 0,
+        "group_byte_totals": [0, 8],
+        "content_diagnostics": {
+            "schema": 1,
+            "algorithm": "blake2b-128",
+            "sample_layer_ids": [0],
+            "sample_logical_tokens": [0],
+            "row_hashes": {"0:0": "not-a-hash"},
+            "layer_hashes": {"0": "0" * 32},
+            "combined_hash": "1" * 32,
+        },
+        "compact_layout": {
+            "group_id": 1,
+            "token_count": 1,
+            "layers": [{"layer_id": 0, "buffer_base": 1000,
+                        "buffer_index": 0, "token_bytes": 8,
+                        "slot_capacity": 8}],
+            "runs": [{"logical_token_start": 0,
+                      "physical_slot_start": 0, "token_count": 1}],
+        },
+    }
+
+    parsed = MooncakeConnectorMetadata._parse_source_descriptor(descriptor)
+
+    assert parsed is not None
+    assert parsed[0].content_diagnostics is None
+
+
 def test_compact_source_rejects_incomplete_layer_registration() -> None:
     scheduler = MooncakeConnectorScheduler.__new__(MooncakeConnectorScheduler)
     scheduler.live_split_source_groups = (1,)

@@ -79,6 +79,10 @@ SPLIT_DONE_MAX_ATTEMPTS = 3
 CONTROL_ACK_MAX_ATTEMPTS = 3
 THREAD_SHUTDOWN_TIMEOUT = 30.0
 MAX_WIRE_INTEGER = (1 << 63) - 1
+CONTENT_DIAGNOSTIC_SCHEMA = 1
+CONTENT_DIAGNOSTIC_ALGORITHM = "blake2b-128"
+MAX_CONTENT_DIAGNOSTIC_LAYERS = 3
+MAX_CONTENT_DIAGNOSTIC_TOKENS = 24
 
 
 def _wire_int(value: Any, field: str) -> int:
@@ -89,6 +93,95 @@ def _wire_int(value: Any, field: str) -> int:
     if not -MAX_WIRE_INTEGER <= parsed <= MAX_WIRE_INTEGER:
         raise ValueError(f"{field} is outside the supported integer range")
     return parsed
+
+
+def _sanitize_content_diagnostics(
+    raw: Any, *, token_count: int, layer_ids: tuple[int, ...]
+) -> dict[str, Any] | None:
+    """Validate optional debug metadata without making P2P depend on it."""
+    if raw is None:
+        return None
+    try:
+        if not isinstance(raw, dict):
+            raise ValueError("content diagnostics must be a mapping")
+        if _wire_int(raw.get("schema"), "diagnostic.schema") != 1:
+            raise ValueError("unknown content diagnostic schema")
+        if raw.get("algorithm") != CONTENT_DIAGNOSTIC_ALGORITHM:
+            raise ValueError("unknown content diagnostic algorithm")
+        layers = [
+            _wire_int(value, "diagnostic.layer_id")
+            for value in raw.get("sample_layer_ids", ())
+        ]
+        valid_layer_ids = set(layer_ids)
+        tokens = [
+            _wire_int(value, "diagnostic.logical_token")
+            for value in raw.get("sample_logical_tokens", ())
+        ]
+        if (
+            not layers
+            or len(layers) > MAX_CONTENT_DIAGNOSTIC_LAYERS
+            or layers != sorted(set(layers))
+            or any(value not in valid_layer_ids for value in layers)
+        ):
+            raise ValueError("invalid diagnostic layer samples")
+        if (
+            not tokens
+            or len(tokens) > MAX_CONTENT_DIAGNOSTIC_TOKENS
+            or tokens != sorted(set(tokens))
+            or any(not 0 <= value < token_count for value in tokens)
+        ):
+            raise ValueError("invalid diagnostic token samples")
+
+        def hashes(name: str, limit: int) -> dict[str, str]:
+            values = raw.get(name, {})
+            if not isinstance(values, dict) or len(values) > limit:
+                raise ValueError(f"invalid diagnostic {name}")
+            result = {str(key): str(value) for key, value in values.items()}
+            if any(
+                len(value) != 32
+                or any(character not in "0123456789abcdef" for character in value)
+                for value in result.values()
+            ):
+                raise ValueError(f"invalid diagnostic {name} hash")
+            return result
+
+        row_hashes = hashes("row_hashes", len(layers) * len(tokens))
+        layer_hashes = hashes("layer_hashes", len(layers))
+        expected_row_keys = {
+            f"{layer_id}:{logical_token}"
+            for layer_id in layers
+            for logical_token in tokens
+        }
+        if set(row_hashes) != expected_row_keys:
+            raise ValueError("diagnostic row hashes do not match samples")
+        if set(layer_hashes) != {str(layer_id) for layer_id in layers}:
+            raise ValueError("diagnostic layer hashes do not match samples")
+        combined_hash = str(raw.get("combined_hash", ""))
+        if (
+            len(combined_hash) != 32
+            or any(
+                character not in "0123456789abcdef"
+                for character in combined_hash
+            )
+        ):
+            raise ValueError("invalid diagnostic combined hash")
+        return {
+            "schema": CONTENT_DIAGNOSTIC_SCHEMA,
+            "algorithm": CONTENT_DIAGNOSTIC_ALGORITHM,
+            "sample_layer_ids": layers,
+            "sample_logical_tokens": tokens,
+            "row_hashes": row_hashes,
+            "layer_hashes": layer_hashes,
+            "combined_hash": combined_hash,
+            "readback_may_synchronize": bool(
+                raw.get("readback_may_synchronize", True)
+            ),
+        }
+    except (KeyError, TypeError, ValueError) as error:
+        logger.warning(
+            "Ignoring invalid optional NPU content diagnostics: %s", error
+        )
+        return None
 
 
 def _cold_live_log(event: str, **fields: Any) -> None:
@@ -116,6 +209,66 @@ def _cold_live_log(event: str, **fields: Any) -> None:
             separators=(",", ":"),
         ),
     )
+
+
+def _fingerprint_live_group1_destination(
+    *,
+    req_id: str,
+    transfer_id: str | None,
+    tp_rank: int,
+    dp_rank: int,
+    kv_caches: dict[str, Any],
+    layout: "SplitCompactLayout | None",
+    expected: dict[str, Any] | None,
+) -> None:
+    """Call the optional LMCache-Ascend diagnostic after synchronous DMA."""
+    if layout is None or expected is None:
+        return
+    try:
+        # LMCache-Ascend is optional for ordinary Mooncake deployments.  Keep
+        # this import on the explicitly enabled diagnostic path.
+        from lmcache_ascend.v1.content_diagnostics import (
+            fingerprint_compact_group1,
+            npu_content_diagnostics_enabled,
+            register_group1_source_fingerprint,
+        )
+
+        if not npu_content_diagnostics_enabled():
+            return
+        owners: list[torch.Tensor] = []
+        for cache_or_caches in kv_caches.values():
+            if isinstance(cache_or_caches, torch.Tensor):
+                owners.append(cache_or_caches)
+            else:
+                owners.extend(
+                    cache
+                    for cache in cache_or_caches
+                    if isinstance(cache, torch.Tensor)
+                )
+        fingerprint_compact_group1(
+            event="group1_destination_fingerprint",
+            req_id=req_id,
+            transfer_id=transfer_id,
+            owners=owners,
+            layers=layout.layers,
+            runs=layout.runs,
+            token_count=layout.token_count,
+            chunk_size=0,
+            tp_rank=tp_rank,
+            dp_rank=dp_rank,
+            sample_layer_ids=expected["sample_layer_ids"],
+            sample_logical_tokens=expected["sample_logical_tokens"],
+            expected=expected,
+        )
+        register_group1_source_fingerprint(req_id, expected)
+    except Exception:
+        # Diagnostics must never turn a successful transfer into a fallback or
+        # failed request.  The content module emits detailed errors for normal
+        # fingerprint failures; this catches import/integration errors.
+        logger.warning(
+            "Failed to emit optional Group-1 destination fingerprint",
+            exc_info=True,
+        )
 
 
 class RemotePortInfo(TypedDict):
@@ -221,6 +374,7 @@ class SplitSourceDescriptor:
     dp_rank: int
     compact_layout: SplitCompactLayout | None = None
     latent_layout: SplitLatentLayout | None = None
+    content_diagnostics: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -236,6 +390,7 @@ class SplitTransferPlan:
     latent_destination_pages: tuple[SplitLatentDestinationPage, ...] = ()
     source_tp_rank: int | None = None
     source_dp_rank: int | None = None
+    content_diagnostics: dict[str, Any] | None = None
 
     @property
     def source_rank(self) -> tuple[int, int]:
@@ -1161,6 +1316,8 @@ class KVCacheRecvingThread(threading.Thread):
         transfer_started = time.perf_counter()
         compact = plan.compact_source is not None
         latent = plan.latent_source is not None
+        diagnostic_destination = plan.compact_destination
+        content_diagnostics = plan.content_diagnostics
         local_dp_rank = int(
             getattr(
                 self.vllm_config.parallel_config,
@@ -1481,6 +1638,15 @@ class KVCacheRecvingThread(threading.Thread):
             unregister_ms=round((released_at - native_done_at) * 1000, 3),
             elapsed_ms=round((released_at - transfer_started) * 1000, 3),
         )
+        _fingerprint_live_group1_destination(
+            req_id=str(req_meta.get("request_id", "")),
+            transfer_id=req_meta.get("split_transfer_id"),
+            tp_rank=int(self.tp_rank),
+            dp_rank=local_dp_rank,
+            kv_caches=self.kv_caches,
+            layout=diagnostic_destination,
+            expected=content_diagnostics,
+        )
 
     @staticmethod
     def _expand_compact_split_plan(
@@ -1596,6 +1762,7 @@ class KVCacheRecvingThread(threading.Thread):
             requested_groups=plan.requested_groups,
             source_tp_rank=plan.source_tp_rank,
             source_dp_rank=plan.source_dp_rank,
+            content_diagnostics=plan.content_diagnostics,
         )
 
     def reformat_kv_cache_with_fused_op(self, block_ids: list[list[int]], tp_num_need_pulls: int):
@@ -2302,6 +2469,19 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
                 latent_layout = MooncakeConnectorMetadata._parse_latent_layout(
                     raw.get("latent_layout")
                 )
+                compact_layout = MooncakeConnectorMetadata._parse_compact_layout(
+                    raw.get("compact_layout")
+                )
+                diagnostic_token_count = (
+                    compact_layout.token_count
+                    if compact_layout is not None else 0
+                )
+                diagnostic_layer_ids = (
+                    tuple(
+                        layer.layer_id for layer in compact_layout.layers
+                    )
+                    if compact_layout is not None else ()
+                )
                 parsed_descriptors.append(SplitSourceDescriptor(
                     segments=tuple(
                         SplitSourceSegment(
@@ -2333,12 +2513,13 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
                     ),
                     tp_rank=_wire_int(raw["tp_rank"], "source.tp_rank"),
                     dp_rank=_wire_int(raw["dp_rank"], "source.dp_rank"),
-                    compact_layout=(
-                        MooncakeConnectorMetadata._parse_compact_layout(
-                            raw.get("compact_layout")
-                        )
-                    ),
+                    compact_layout=compact_layout,
                     latent_layout=latent_layout,
+                    content_diagnostics=_sanitize_content_diagnostics(
+                        raw.get("content_diagnostics"),
+                        token_count=diagnostic_token_count,
+                        layer_ids=diagnostic_layer_ids,
+                    ),
                 ))
             descriptors = tuple(parsed_descriptors)
         identities: set[tuple[int, int]] = set()
@@ -2541,6 +2722,7 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
                 compact_destination=compact_destination,
                 latent_source=source.latent_layout if hybrid else None,
                 latent_destination_pages=latent_pages if hybrid else (),
+                content_diagnostics=source.content_diagnostics,
             )
         destinations = plan["segments"]
         merged: list[SplitTransferSegment] = []
@@ -2601,6 +2783,7 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
             source_tp_rank=source.tp_rank,
             source_dp_rank=source.dp_rank,
             requested_groups=requested_groups,
+            content_diagnostics=source.content_diagnostics,
         )
 
     @staticmethod
@@ -2689,6 +2872,28 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
                     None
                     if plan.get("source_dp_rank") is None
                     else _wire_int(plan["source_dp_rank"], "plan.source_dp_rank")
+                ),
+                content_diagnostics=_sanitize_content_diagnostics(
+                    plan.get("content_diagnostics"),
+                    token_count=(
+                        _wire_int(
+                            plan["compact_layout"]["token_count"],
+                            "plan.compact.token_count",
+                        )
+                        if plan.get("compact_layout") is not None else 0
+                    ),
+                    layer_ids=(
+                        tuple(
+                            _wire_int(
+                                layer["layer_id"],
+                                "plan.compact.layer_id",
+                            )
+                            for layer in plan["compact_layout"].get(
+                                "layers", ()
+                            )
+                        )
+                        if plan.get("compact_layout") is not None else ()
+                    ),
                 ),
             )
         if len(parsed.group_byte_totals) != 2:
@@ -2791,6 +2996,7 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
                         ),
                         source_tp_rank=plan.source_tp_rank,
                         source_dp_rank=plan.source_dp_rank,
+                        content_diagnostics=plan.content_diagnostics,
                     )
                 meta.split_plan = plan
             except (KeyError, TypeError, ValueError) as error:
@@ -3268,7 +3474,21 @@ class MooncakeConnectorScheduler:
                     or legacy_hybrid_valid
                 ):
                     raise ValueError("Compact live split byte total differs")
-                normalized.append({
+                content_diagnostics = _sanitize_content_diagnostics(
+                    raw.get("content_diagnostics"),
+                    token_count=(
+                        parsed_compact.token_count
+                        if parsed_compact is not None else 0
+                    ),
+                    layer_ids=(
+                        tuple(
+                            layer.layer_id
+                            for layer in parsed_compact.layers
+                        )
+                        if parsed_compact is not None else ()
+                    ),
+                )
+                normalized_descriptor = {
                     **raw,
                     # Preserve the established group-1 carrier on the wire.
                     # New decoders promote latent_group_byte_total only after
@@ -3276,7 +3496,14 @@ class MooncakeConnectorScheduler:
                     "group_byte_totals": list(base_totals),
                     "compact_layout": compact,
                     "latent_layout": latent,
-                })
+                }
+                if content_diagnostics is None:
+                    normalized_descriptor.pop("content_diagnostics", None)
+                else:
+                    normalized_descriptor["content_diagnostics"] = (
+                        content_diagnostics
+                    )
+                normalized.append(normalized_descriptor)
                 continue
             segments = []
             for segment in raw["segments"]:
