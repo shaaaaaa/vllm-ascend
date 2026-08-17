@@ -1,5 +1,6 @@
 import os
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 from unittest.mock import MagicMock, patch
 
@@ -9,10 +10,12 @@ from vllm import config
 from tests.ut.base import TestBase
 from vllm_ascend import ascend_config
 from vllm_ascend.distributed import parallel_state
-from vllm_ascend.ops.linear import (AscendMergedColumnParallelLinear,
-                                    AscendReplicatedLinear,
-                                    AscendRowParallelLinear,
-                                    AscendUnquantizedLinearMethod)
+from vllm_ascend.ops.linear import (
+    AscendMergedColumnParallelLinear,
+    AscendReplicatedLinear,
+    AscendRowParallelLinear,
+    AscendUnquantizedLinearMethod,
+)
 
 
 class BaseLinearTest(unittest.TestCase):
@@ -82,6 +85,64 @@ class TestAscendUnquantizedLinearMethod(TestBase):
 
 
 class TestAscendRowParallelLinear(BaseLinearTest):
+
+    def test_pre_reduce_callback_runs_between_local_matmul_and_allreduce(self):
+        events = []
+        local_output = torch.ones(2, 4)
+        reduced_output = torch.full((2, 4), 2.0)
+        quant_method = SimpleNamespace(
+            apply=lambda *_args, **_kwargs: (
+                events.append("local_matmul") or local_output
+            )
+        )
+        linear = SimpleNamespace(
+            custom_op=None,
+            input_is_parallel=True,
+            tp_size=8,
+            tp_rank=0,
+            skip_bias_add=False,
+            bias=None,
+            quant_method=quant_method,
+            reduce_results=True,
+            return_bias=True,
+        )
+
+        def allreduce(output):
+            self.assertIs(output, local_output)
+            events.append("allreduce")
+            return reduced_output
+
+        with patch(
+            "vllm_ascend.ops.linear.tensor_model_parallel_all_reduce",
+            side_effect=allreduce,
+        ):
+            result, output_bias = (
+                AscendRowParallelLinear.forward_with_pre_reduce_callback(
+                    linear,
+                    torch.empty(2, 4),
+                    lambda: events.append("callback"),
+                )
+            )
+
+        self.assertIs(result, reduced_output)
+        self.assertIsNone(output_bias)
+        self.assertEqual(
+            events,
+            ["local_matmul", "callback", "allreduce"],
+        )
+
+    def test_pre_reduce_callback_rejects_custom_or_fused_row_op(self):
+        callback = MagicMock()
+        linear = SimpleNamespace(custom_op=SimpleNamespace())
+
+        with self.assertRaisesRegex(RuntimeError, "custom or fused"):
+            AscendRowParallelLinear.forward_with_pre_reduce_callback(
+                linear,
+                torch.empty(1),
+                callback,
+            )
+
+        callback.assert_not_called()
 
     @patch("vllm_ascend.ops.linear_op.get_weight_prefetch_method",
            return_value=MagicMock())

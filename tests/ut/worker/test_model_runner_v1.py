@@ -281,7 +281,6 @@ class TestLayerwisePrefillBlockTables(unittest.TestCase):
         runner.input_batch.layerwise_prefill_block_tables = (
             runner.input_batch.block_table,
             MagicMock(name="bank_1_table"),
-            MagicMock(name="bank_2_table"),
         )
         runner.requests = {
             "req-a": SimpleNamespace(
@@ -289,7 +288,6 @@ class TestLayerwisePrefillBlockTables(unittest.TestCase):
                 block_ids_by_bank=(
                     ([1], [2]),
                     ([11], [12]),
-                    ([21], [22]),
                 ),
                 block_allocation_mode=(
                     DSABlockAllocationMode.PREFILL_CHILD
@@ -300,7 +298,6 @@ class TestLayerwisePrefillBlockTables(unittest.TestCase):
                 block_ids_by_bank=(
                     ([3], [4]),
                     ([13], [14]),
-                    ([23], [24]),
                 ),
                 block_allocation_mode=(
                     DSABlockAllocationMode.PREFILL_CHILD
@@ -322,13 +319,6 @@ class TestLayerwisePrefillBlockTables(unittest.TestCase):
                 call(([11], [12]), 1),
             ],
         )
-        self.assertEqual(
-            tables[2].add_row.call_args_list,
-            [
-                call(([23], [24]), 0),
-                call(([21], [22]), 1),
-            ],
-        )
 
     def test_refresh_is_noop_when_feature_is_disabled(self):
         runner = self._build_runner(enabled=False)
@@ -339,7 +329,6 @@ class TestLayerwisePrefillBlockTables(unittest.TestCase):
             tables, runner.input_batch.layerwise_prefill_block_tables
         )
         tables[1].add_row.assert_not_called()
-        tables[2].add_row.assert_not_called()
 
     def test_refresh_rejects_invalid_request_metadata(self):
         cases = (
@@ -350,7 +339,7 @@ class TestLayerwisePrefillBlockTables(unittest.TestCase):
                     "layerwise_prefill_block_tables",
                     (runner.input_batch.block_table,),
                 ),
-                "exactly three block tables",
+                "exactly two block tables",
             ),
             (
                 "allocation mode",
@@ -366,16 +355,16 @@ class TestLayerwisePrefillBlockTables(unittest.TestCase):
                 lambda runner: setattr(
                     runner.requests["req-b"],
                     "block_ids_by_bank",
-                    (([3], [4]), ([13], [14])),
+                    (([3], [4]),),
                 ),
-                "missing its three physical block banks",
+                "missing its two physical block banks",
             ),
             (
                 "primary mismatch",
                 lambda runner: setattr(
                     runner.requests["req-b"],
                     "block_ids_by_bank",
-                    (([99], [4]), ([13], [14]), ([23], [24])),
+                    (([99], [4]), ([13], [14])),
                 ),
                 "differs from bank 0",
             ),
@@ -401,8 +390,8 @@ class TestLayerwisePrefillBlockTables(unittest.TestCase):
             ),
             (
                 ("layer-0", 0),
-                ("layer-2", 2),
-                ("layer-3", 0),
+                ("layer-2", 0),
+                ("layer-3", 1),
                 ("layer-6", 0),
             ),
         )
@@ -419,8 +408,8 @@ class TestLayerwisePrefillBlockTables(unittest.TestCase):
             kv_cache_groups=[object(), object()]
         )
         bank_tensors = {
-            (0, 2): (torch.empty(1), torch.empty(2, dtype=torch.long)),
-            (1, 2): (torch.empty(3), torch.empty(4, dtype=torch.long)),
+            (0, 1): (torch.empty(1), torch.empty(2, dtype=torch.long)),
+            (1, 1): (torch.empty(3), torch.empty(4, dtype=torch.long)),
         }
         common = SimpleNamespace(
             block_table_tensor=torch.empty(5),
@@ -435,23 +424,23 @@ class TestLayerwisePrefillBlockTables(unittest.TestCase):
         )
 
         selected = runner._layerwise_prefill_common_attn_metadata(
-            common, 0, 2, getter
+            common, 0, 1, getter
         )
 
         self.assertIsNot(selected, common)
-        self.assertIs(selected.block_table_tensor, bank_tensors[(0, 2)][0])
-        self.assertIs(selected.slot_mapping, bank_tensors[(0, 2)][1])
+        self.assertIs(selected.block_table_tensor, bank_tensors[(0, 1)][0])
+        self.assertIs(selected.slot_mapping, bank_tensors[(0, 1)][1])
         self.assertIs(
             selected.indexer_block_table_tensor,
-            bank_tensors[(1, 2)][0],
+            bank_tensors[(1, 1)][0],
         )
         self.assertIs(
             selected.indexer_slot_mapping,
-            bank_tensors[(1, 2)][1],
+            bank_tensors[(1, 1)][1],
         )
         self.assertEqual(getter.call_args_list, [
-            call(0, 2),
-            call(1, 2),
+            call(0, 1),
+            call(1, 1),
         ])
         self.assertIs(common.block_table_tensor, original_table)
         self.assertIs(common.indexer_block_table_tensor, original_indexer_table)
@@ -1858,34 +1847,168 @@ class TestSFALayerwiseGraphModeCompatibility(unittest.TestCase):
             runner._validate_sfa_layerwise_connector_cudagraph_mode()
 
     def test_full_graph_modes_are_rejected_for_layerwise_connector(self):
-        connector = SimpleNamespace(uses_layerwise_model_callbacks=True)
-        for mode in (
-            CUDAGraphMode.FULL,
-            CUDAGraphMode.FULL_DECODE_ONLY,
-        ):
-            with (
-                self.subTest(mode=mode),
-                patch.object(
-                    model_runner_module,
-                    "has_kv_transfer_group",
-                    return_value=True,
-                ),
-                patch.object(
-                    model_runner_module,
-                    "get_kv_transfer_group",
-                    return_value=connector,
-                ),
-                self.assertRaisesRegex(ValueError, "PIECEWISE"),
+        connectors = (
+            SimpleNamespace(uses_layerwise_model_callbacks=True),
+            SimpleNamespace(
+                uses_layerwise_model_callbacks=False,
+                supports_layerwise_prefill_transfer_window=True,
+            ),
+        )
+        for connector in connectors:
+            for mode in (
+                CUDAGraphMode.FULL,
+                CUDAGraphMode.FULL_DECODE_ONLY,
             ):
-                runner = self._build_runner(mode)
-                runner.vllm_config = object()
-                runner.parallel_config = SimpleNamespace(data_parallel_size=1)
-                with patch.object(
-                    model_runner_module,
-                    "staged_sfa_graph_configured",
-                    return_value=False,
+                with (
+                    self.subTest(mode=mode, connector=connector),
+                    patch.object(
+                        model_runner_module,
+                        "has_kv_transfer_group",
+                        return_value=True,
+                    ),
+                    patch.object(
+                        model_runner_module,
+                        "get_kv_transfer_group",
+                        return_value=connector,
+                    ),
+                    self.assertRaisesRegex(ValueError, "PIECEWISE"),
                 ):
-                    runner._validate_sfa_layerwise_connector_cudagraph_mode()
+                    runner = self._build_runner(mode)
+                    runner.vllm_config = object()
+                    runner.parallel_config = SimpleNamespace(data_parallel_size=1)
+                    with patch.object(
+                        model_runner_module,
+                        "staged_sfa_graph_configured",
+                        return_value=False,
+                    ):
+                        runner._validate_sfa_layerwise_connector_cudagraph_mode()
+
+    def test_p_node_rejects_staged_cross_layer_graph(self):
+        runner = self._build_runner(CUDAGraphMode.PIECEWISE)
+        runner.vllm_config = object()
+        runner.layerwise_prefill_p_node = True
+
+        with (
+            patch.object(
+                model_runner_module,
+                "staged_sfa_graph_configured",
+                return_value=True,
+            ),
+            self.assertRaisesRegex(ValueError, "standard PIECEWISE"),
+        ):
+            runner._validate_sfa_layerwise_connector_cudagraph_mode()
+
+    def test_p_node_requires_two_bank_connector_capability(self):
+        runner = self._build_runner(CUDAGraphMode.PIECEWISE)
+        runner.vllm_config = object()
+        runner.layerwise_prefill_p_node = True
+
+        with (
+            patch.object(
+                model_runner_module,
+                "staged_sfa_graph_configured",
+                return_value=False,
+            ),
+            patch.object(
+                model_runner_module,
+                "has_kv_transfer_group",
+                return_value=False,
+            ),
+            self.assertRaisesRegex(ValueError, "active KV connector"),
+        ):
+            runner._validate_sfa_layerwise_connector_cudagraph_mode()
+
+        connector = SimpleNamespace(
+            supports_layerwise_prefill_transfer_window=False,
+            supports_dsa_index_lmcache=True,
+        )
+        with (
+            patch.object(
+                model_runner_module,
+                "staged_sfa_graph_configured",
+                return_value=False,
+            ),
+            patch.object(
+                model_runner_module,
+                "has_kv_transfer_group",
+                return_value=True,
+            ),
+            patch.object(
+                model_runner_module,
+                "get_kv_transfer_group",
+                return_value=connector,
+            ),
+            self.assertRaisesRegex(ValueError, "dense direct load/store"),
+        ):
+            runner._validate_sfa_layerwise_connector_cudagraph_mode()
+
+    def test_p_node_accepts_standard_piecewise_two_bank_connector(self):
+        runner = self._build_runner(CUDAGraphMode.PIECEWISE)
+        runner.vllm_config = object()
+        runner.layerwise_prefill_p_node = True
+        connector = SimpleNamespace(
+            supports_layerwise_prefill_transfer_window=True,
+            supports_dsa_index_lmcache=True,
+        )
+
+        with (
+            patch.object(
+                model_runner_module,
+                "staged_sfa_graph_configured",
+                return_value=False,
+            ),
+            patch.object(
+                model_runner_module,
+                "has_kv_transfer_group",
+                return_value=True,
+            ),
+            patch.object(
+                model_runner_module,
+                "get_kv_transfer_group",
+                return_value=connector,
+            ),
+            patch.object(
+                model_runner_module.envs_ascend,
+                "VLLM_ASCEND_DSA_DISABLE_INDEX_LMCACHE",
+                False,
+            ),
+        ):
+            runner._validate_sfa_layerwise_connector_cudagraph_mode()
+
+    def test_p_node_rejects_split_transfer_and_index_capabilities(self):
+        runner = self._build_runner(CUDAGraphMode.PIECEWISE)
+        runner.vllm_config = object()
+        runner.layerwise_prefill_p_node = True
+        connector = SimpleNamespace(
+            supports_layerwise_prefill_transfer_window=True,
+            supports_dsa_index_lmcache=True,
+            supports_layerwise_prefill_dsa_index_transfer_window=False,
+        )
+
+        with (
+            patch.object(
+                model_runner_module,
+                "staged_sfa_graph_configured",
+                return_value=False,
+            ),
+            patch.object(
+                model_runner_module,
+                "has_kv_transfer_group",
+                return_value=True,
+            ),
+            patch.object(
+                model_runner_module,
+                "get_kv_transfer_group",
+                return_value=connector,
+            ),
+            patch.object(
+                model_runner_module.envs_ascend,
+                "VLLM_ASCEND_DSA_DISABLE_INDEX_LMCACHE",
+                False,
+            ),
+            self.assertRaisesRegex(ValueError, "same transfer-window"),
+        ):
+            runner._validate_sfa_layerwise_connector_cudagraph_mode()
 
     def test_compatible_modes_and_connectors_are_accepted(self):
         cases = (

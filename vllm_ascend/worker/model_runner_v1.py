@@ -55,7 +55,10 @@ from vllm.v1.attention.backend import AttentionBackend, AttentionMetadata
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
 from vllm.v1.attention.selector import get_attn_backend  # type: ignore
-from vllm.v1.core.dsa_shared_pool import DSABlockAllocationMode
+from vllm.v1.core.dsa_shared_pool import (
+    LAYERWISE_PREFILL_BANK_COUNT,
+    DSABlockAllocationMode,
+)
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
@@ -1010,7 +1013,7 @@ class NPUModelRunner(GPUModelRunner):
         return batch_desc.num_reqs
 
     def _refresh_layerwise_prefill_block_tables(self):
-        """Rebuild the two shadow-bank tables in current request-row order."""
+        """Rebuild the shadow-bank table in current request-row order."""
         tables = getattr(
             self.input_batch,
             "layerwise_prefill_block_tables",
@@ -1018,9 +1021,9 @@ class NPUModelRunner(GPUModelRunner):
         )
         if not self.layerwise_prefill_p_node:
             return tables
-        if len(tables) != 3:
+        if len(tables) != LAYERWISE_PREFILL_BANK_COUNT:
             raise RuntimeError(
-                "Layerwise-prefill P node requires exactly three block tables"
+                "Layerwise-prefill P node requires exactly two block tables"
             )
 
         for req_index, req_id in enumerate(self.input_batch.req_ids):
@@ -1035,9 +1038,12 @@ class NPUModelRunner(GPUModelRunner):
                     f"mode={request.block_allocation_mode}"
                 )
             bank_ids = request.block_ids_by_bank
-            if bank_ids is None or len(bank_ids) != 3:
+            if (
+                bank_ids is None
+                or len(bank_ids) != LAYERWISE_PREFILL_BANK_COUNT
+            ):
                 raise RuntimeError(
-                    "Layerwise-prefill request is missing its three physical "
+                    "Layerwise-prefill request is missing its two physical "
                     f"block banks: request_id={req_id}"
                 )
             if bank_ids[0] != request.block_ids:
@@ -1046,7 +1052,6 @@ class NPUModelRunner(GPUModelRunner):
                     f"request_id={req_id}"
                 )
             tables[1].add_row(bank_ids[1], req_index)
-            tables[2].add_row(bank_ids[2], req_index)
         return tables
 
     @staticmethod
@@ -1070,7 +1075,10 @@ class NPUModelRunner(GPUModelRunner):
                 f"group: {missing}"
             )
         return tuple(
-            (layer_name, layer_positions[layer_name] % 3)
+            (
+                layer_name,
+                layer_positions[layer_name] % LAYERWISE_PREFILL_BANK_COUNT,
+            )
             for layer_name in attn_group.layer_names
         )
 
@@ -4281,9 +4289,18 @@ class NPUModelRunner(GPUModelRunner):
 
     def _validate_sfa_layerwise_connector_cudagraph_mode(self) -> None:
         """Reject full-model replay that would bypass layerwise retrieval."""
+        layerwise_prefill_p_node = bool(
+            getattr(self, "layerwise_prefill_p_node", False)
+        )
         staged_graph_configured = staged_sfa_graph_configured(
             self.vllm_config
         )
+        if staged_graph_configured and layerwise_prefill_p_node:
+            raise ValueError(
+                "Layerwise-prefill P nodes require the standard PIECEWISE "
+                "mla_forward boundary and do not support the staged "
+                "cross-layer SFA graph path."
+            )
         if (
             envs_ascend.VLLM_ASCEND_SFA_STAGED_GRAPH
             and not staged_graph_configured
@@ -4311,15 +4328,66 @@ class NPUModelRunner(GPUModelRunner):
                     "reliable per-request frontier metadata, and a consumer "
                     "role (kv_both or kv_consumer)."
                 )
+        if layerwise_prefill_p_node:
+            if not has_kv_transfer_group():
+                raise ValueError(
+                    "Layerwise-prefill P nodes require an active KV connector "
+                    "that supports the two-bank transfer window."
+                )
+            connector = get_kv_transfer_group()
+            transfer_window_supported = getattr(
+                connector,
+                "supports_layerwise_prefill_transfer_window",
+                False,
+            )
+            if callable(transfer_window_supported):
+                transfer_window_supported = transfer_window_supported()
+            if transfer_window_supported is not True:
+                raise ValueError(
+                    "Layerwise-prefill P nodes require a layerwise, "
+                    "producer-capable connector with dense direct load/store "
+                    "support."
+                )
+            index_lmcache_supported = bool(
+                getattr(connector, "supports_dsa_index_lmcache", False)
+            )
+            complete_protocol_supported = getattr(
+                connector,
+                "supports_layerwise_prefill_dsa_index_transfer_window",
+                None,
+            )
+            if callable(complete_protocol_supported):
+                complete_protocol_supported = complete_protocol_supported()
+            if complete_protocol_supported is None:
+                complete_protocol_supported = bool(
+                    transfer_window_supported and index_lmcache_supported
+                )
+            if (
+                envs_ascend.VLLM_ASCEND_DSA_DISABLE_INDEX_LMCACHE
+                or not index_lmcache_supported
+                or complete_protocol_supported is not True
+            ):
+                raise ValueError(
+                    "Layerwise-prefill P nodes require LMCache persistence "
+                    "for both the latent and DSA index KV groups in the same "
+                    "transfer-window connector."
+                )
         mode = self.compilation_config.cudagraph_mode
         if not self.use_sparse or not mode.has_full_cudagraphs():
             return
         if not has_kv_transfer_group():
             return
         connector = get_kv_transfer_group()
-        if not bool(
+        uses_layerwise_callbacks = bool(
             getattr(connector, "uses_layerwise_model_callbacks", False)
-        ):
+        ) or bool(
+            getattr(
+                connector,
+                "supports_layerwise_prefill_transfer_window",
+                False,
+            )
+        )
+        if not uses_layerwise_callbacks:
             return
         raise ValueError(
             "SFA with a layerwise KV connector does not support FULL or "

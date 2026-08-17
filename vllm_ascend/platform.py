@@ -280,6 +280,12 @@ class NPUPlatform(Platform):
                     "VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE=true requires "
                     "pipeline_parallel_size == 1"
                 )
+            if envs_ascend.VLLM_ASCEND_ENABLE_MATMUL_ALLREDUCE:
+                raise ValueError(
+                    "VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE=true requires "
+                    "VLLM_ASCEND_ENABLE_MATMUL_ALLREDUCE=0 so load/save can "
+                    "be submitted before the separate HCOM all-reduce"
+                )
         if ascend_compilation_config:
             vllm_config.additional_config.setdefault("ascend_compilation_config", {}).update(
                 vars(ascend_compilation_config)

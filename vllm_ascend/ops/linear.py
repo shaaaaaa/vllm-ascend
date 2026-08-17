@@ -20,11 +20,17 @@ AscendMergedColumnParallelLinear, AscendMergedColumnParallelLinear,
 AscendRowParallelLinear and AscendColumnParallelLinear.
 """
 
+from collections.abc import Callable
+
 import torch
 import torch.nn as nn
 from torch.nn.parameter import Parameter
 from vllm.config import get_current_vllm_config
-from vllm.distributed import divide
+from vllm.distributed import (
+    divide,
+    split_tensor_along_last_dim,
+    tensor_model_parallel_all_reduce,
+)
 from vllm.model_executor.layers.linear import (  # noqa
     WEIGHT_LOADER_V2_SUPPORTED,
     ColumnParallelLinear,
@@ -313,6 +319,51 @@ class AscendRowParallelLinear(RowParallelLinear):
             return self.custom_op.apply(input_)
 
         return super().forward(input_)
+
+    def forward_with_pre_reduce_callback(
+        self,
+        input_: torch.Tensor,
+        callback: Callable[[], None],
+    ) -> torch.Tensor | tuple[torch.Tensor, Parameter | None]:
+        """Run ``callback`` after local GEMM and before TP all-reduce.
+
+        The callback boundary is only available on the ordinary row-parallel
+        implementation.  Ascend custom row operators can fuse or replace the
+        reduction, so accepting a callback there would silently miss the HCOM
+        overlap window.
+        """
+        if self.custom_op is not None:
+            raise RuntimeError(
+                "The layerwise-prefill pre-reduce callback requires the "
+                "ordinary Ascend row-parallel path; custom or fused row "
+                f"operator {type(self.custom_op).__name__} is unsupported"
+            )
+
+        if self.input_is_parallel:
+            input_parallel = input_
+        else:
+            split_input = split_tensor_along_last_dim(
+                input_, num_partitions=self.tp_size
+            )
+            input_parallel = split_input[self.tp_rank].contiguous()
+
+        assert self.quant_method is not None
+        bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
+        output_parallel = self.quant_method.apply(
+            self, input_parallel, bias_
+        )
+
+        callback()
+
+        if self.reduce_results and self.tp_size > 1:
+            output = tensor_model_parallel_all_reduce(output_parallel)
+        else:
+            output = output_parallel
+
+        if not self.return_bias:
+            return output
+        output_bias = self.bias if self.skip_bias_add else None
+        return output, output_bias
 
 
 class AscendColumnParallelLinear(ColumnParallelLinear):

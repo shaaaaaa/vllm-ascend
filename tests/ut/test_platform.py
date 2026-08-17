@@ -189,6 +189,33 @@ class TestNPUPlatform(TestBase):
         ):
             self.platform.check_and_update_config(vllm_config)
 
+    @patch(
+        "vllm_ascend.platform.envs_ascend."
+        "VLLM_ASCEND_ENABLE_MATMUL_ALLREDUCE",
+        True,
+    )
+    @patch(
+        "vllm_ascend.platform.envs_ascend."
+        "VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE",
+        True,
+    )
+    @patch("vllm_ascend.platform.init_ascend_config")
+    @patch.object(NPUPlatform, "_fix_incompatible_config")
+    def test_layerwise_prefill_p_node_rejects_fused_matmul_allreduce(
+        self, _mock_fix_config, mock_init_ascend
+    ):
+        mock_init_ascend.return_value = (
+            TestNPUPlatform.mock_vllm_ascend_config()
+        )
+        vllm_config = TestNPUPlatform.mock_vllm_config()
+        vllm_config.model_config = None
+        vllm_config.kv_transfer_config = None
+
+        with self.assertRaisesRegex(
+            ValueError, "VLLM_ASCEND_ENABLE_MATMUL_ALLREDUCE=0"
+        ):
+            self.platform.check_and_update_config(vllm_config)
+
     @patch("vllm_ascend.platform.refresh_block_size")
     @patch("vllm_ascend.platform.get_ascend_device_type", return_value=AscendDeviceType.A3)
     @patch("vllm_ascend.platform.enable_sp", return_value=False)

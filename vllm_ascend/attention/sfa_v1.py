@@ -65,7 +65,12 @@ from vllm_ascend.attention.utils import (
     ascend_chunked_prefill_workspace_size,
     enable_cp,
     get_lmcache_sparse_cached_tokens,
+    layerwise_prefill_transfer_window_supported,
+    maybe_finish_layerwise_prefill_save,
+    maybe_save_kv_layer_in_layerwise_prefill_transfer_window,
+    maybe_save_kv_layer_outside_layerwise_prefill_transfer_window,
     maybe_save_kv_layer_to_connector,
+    maybe_submit_layerwise_prefill_load,
     staged_sfa_connector_supports_sparse_load,
     trans_rope_weight,
     transdata,
@@ -2316,6 +2321,32 @@ class AscendSFAImpl(MLAAttentionImpl):
         )
         return hidden_states, ql_nope, q_pe, q_c
 
+    def _sfa_preprocess_with_mlapo_after_layerwise_wait(
+        self,
+        layer_name: str,
+        attn_metadata: M,
+        hidden_states: torch.Tensor,
+        kv_cache: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        num_input_tokens: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Fence the current bank before MLAPO writes latent KV into it."""
+        if not (
+            self.dsa_shrink_latent
+            and attn_metadata.num_decode_tokens > 0
+        ):
+            wait_for_kv_layer_from_connector(layer_name)
+        return self._sfa_preprocess_with_mlapo(
+            hidden_states=hidden_states,
+            kv_cache=kv_cache,
+            cos=cos,
+            sin=sin,
+            slot_mapping=slot_mapping,
+            num_input_tokens=num_input_tokens,
+        )
+
     def indexer_select_pre_process(
         self,
         x: torch.Tensor,
@@ -2838,6 +2869,95 @@ class AscendSFAImpl(MLAAttentionImpl):
                 layer_name,
                 kv_caches,
             )
+
+    def _submit_sfa_transfer_window_save_operations(
+        self,
+        save_operations: list[tuple[str, list[torch.Tensor]]],
+    ) -> None:
+        for layer_name, kv_caches in save_operations:
+            maybe_save_kv_layer_in_layerwise_prefill_transfer_window(
+                layer_name,
+                kv_caches,
+            )
+
+    def _submit_sfa_post_transfer_window_save_operations(
+        self,
+        save_operations: list[tuple[str, list[torch.Tensor]]],
+    ) -> None:
+        for layer_name, kv_caches in save_operations:
+            maybe_save_kv_layer_outside_layerwise_prefill_transfer_window(
+                layer_name,
+                kv_caches,
+            )
+
+    def _forward_o_proj_with_layerwise_transfer_window(
+        self,
+        attn_output: torch.Tensor,
+        output: torch.Tensor,
+        save_operations: list[tuple[str, list[torch.Tensor]]],
+    ) -> None:
+        """Submit layerwise transfers between local o_proj and its HCOM."""
+        layer_names = [layer_name for layer_name, _ in save_operations]
+        if len(layer_names) != len(set(layer_names)):
+            raise RuntimeError(
+                "Layerwise-prefill transfer window received duplicate KV "
+                f"groups: {layer_names}"
+            )
+
+        pre_reduce_forward = getattr(
+            self.o_proj,
+            "forward_with_pre_reduce_callback",
+            None,
+        )
+        if not callable(pre_reduce_forward):
+            raise RuntimeError(
+                "The active layerwise-prefill connector requires an o_proj "
+                "pre-reduce callback, but the configured o_proj does not "
+                "support one"
+            )
+
+        callback_invoked = False
+
+        def submit_transfers() -> None:
+            nonlocal callback_invoked
+            if callback_invoked:
+                raise RuntimeError(
+                    "o_proj invoked the layerwise-prefill pre-reduce "
+                    "callback more than once"
+                )
+            callback_invoked = True
+
+            # Queue both saves before either next-layer load.  This preserves
+            # the latent/indexer group's common layer boundary while allowing
+            # their transfer streams to overlap the following HCOM.
+            self._submit_sfa_transfer_window_save_operations(save_operations)
+            for layer_name in layer_names:
+                if not maybe_submit_layerwise_prefill_load(layer_name):
+                    raise RuntimeError(
+                        "The active KV connector stopped supporting the "
+                        "layerwise-prefill transfer window during o_proj"
+                    )
+
+        projected = pre_reduce_forward(attn_output, submit_transfers)
+        if not callback_invoked:
+            raise RuntimeError(
+                "o_proj did not invoke the layerwise-prefill pre-reduce "
+                "callback"
+            )
+        # The TP reduction has now been submitted.  Resume each capable
+        # connector's storer here so CPU publication/batched_put cannot extend
+        # the pre-HCOM callback and delay the collective.
+        for layer_name in layer_names:
+            if not maybe_finish_layerwise_prefill_save(layer_name):
+                raise RuntimeError(
+                    "The active KV connector stopped supporting the "
+                    "layerwise-prefill post-HCOM save hook during o_proj"
+                )
+        # A MultiConnector can contain legacy children that do not support the
+        # pre-HCOM transfer window. Preserve their original ordering without
+        # saving capable children twice.
+        self._submit_sfa_post_transfer_window_save_operations(save_operations)
+        output[...] = projected[0]
 
     def _prepare_sorted_resident_sparse_cache(
         self,
@@ -3967,13 +4087,17 @@ class AscendSFAImpl(MLAAttentionImpl):
 
         # run mlapo ops when dsa-cp is disabled, and ensure that num_tokens satisfies the count limitation
         if self.enable_mlapo and num_input_tokens <= MLAPO_MAX_SUPPORTED_TOKENS:
-            hidden_states, ql_nope, q_pe, q_c = self._sfa_preprocess_with_mlapo(
-                hidden_states=hidden_states,
-                kv_cache=kv_cache,
-                cos=cos,
-                sin=sin,
-                slot_mapping=slot_mapping,
-                num_input_tokens=num_input_tokens,
+            hidden_states, ql_nope, q_pe, q_c = (
+                self._sfa_preprocess_with_mlapo_after_layerwise_wait(
+                    layer_name=layer_name,
+                    attn_metadata=attn_metadata,
+                    hidden_states=hidden_states,
+                    kv_cache=kv_cache,
+                    cos=cos,
+                    sin=sin,
+                    slot_mapping=slot_mapping,
+                    num_input_tokens=num_input_tokens,
+                )
             )
             k_li, k_li_scale = self.indexer_select_pre_process(x=hidden_states, cos=cos, sin=sin)
         # native
@@ -4903,6 +5027,39 @@ class AscendSFAImpl(MLAAttentionImpl):
             _dsa_prof.step()
 
         attn_output = self._v_up_proj(attn_output)
+
+        # Offload to LMCache. Legacy un-bundled connectors save only the
+        # latent (k_nope, k_pe). Connectors declaring DSA index LMCache support
+        # also save the sibling indexer layer whenever that path is enabled.
+        # A pure decode step in shrink-latent mode skips this unless decode
+        # window saving is enabled.
+        _decode_window_save_enabled = _decode_window_save_window_size() > 0
+        _skip_decode_save = (
+            bool(self.dsa_shrink_latent)
+            and _is_pure_decode
+            and not _decode_window_save_enabled
+        )
+        save_operations: list[tuple[str, list[torch.Tensor]]] = []
+        if not _skip_decode_save:
+            if self.dsa_offload_unbundle and len(kv_cache) >= 2:
+                save_operations.append(
+                    (layer_name, [kv_cache[0], kv_cache[1]])
+                )
+                if (
+                    len(kv_cache) >= 3
+                    and index_layer_name is not None
+                    and index_lmcache_enabled
+                ):
+                    save_operations.append(
+                        (index_layer_name, [kv_cache[2]])
+                    )
+            else:
+                save_operations.append((layer_name, list(kv_cache)))
+
+        use_layerwise_transfer_window = bool(
+            save_operations
+        ) and layerwise_prefill_transfer_window_supported()
+
         weight_prefetch_method = get_weight_prefetch_method()
         weight_prefetch_method.maybe_prefetch_mla_or_sla_weight_in_current_stream(
             inputs=self.o_proj.weight,
@@ -4912,6 +5069,11 @@ class AscendSFAImpl(MLAAttentionImpl):
         )
 
         if self.enable_dsa_cp_with_o_proj_tp:
+            if use_layerwise_transfer_window:
+                raise RuntimeError(
+                    "Layerwise-prefill HCOM overlap is incompatible with "
+                    "the SFA context-parallel o_proj path"
+                )
             # When using SFA-CP with pd mixed, o_proj has two cases:
             # 1. prefill: o_proj is a TP weight, we need to all-gather o_proj weight to switch TP=1.
             # 2. decode: all-to-all the hidden_state before the o_proj forward.
@@ -4936,33 +5098,16 @@ class AscendSFAImpl(MLAAttentionImpl):
             attn_output = torch.empty_like(send)
             torch.distributed.all_to_all_single(attn_output, send, group=get_tp_group().device_group)
 
-        output[...] = self.o_proj(attn_output)[0]
-
-        # Offload to LMCache. Legacy un-bundled connectors save only the latent
-        # (k_nope, k_pe). Connectors declaring DSA index LMCache support also
-        # Save the sibling indexer layer whenever the LMCache indexer path is
-        # enabled. Bundled path saves the whole tuple as before.
-        # Shrink-latent: a pure-decode step's latent lives in the resident tail and is
-        # never reloaded from LMCache, so saving it every decode layer is redundant
-        # connector work (scales with batch). Skip save on steps with no prefill tokens
-        # gated per step (num_prefills is shared by all layers), so the layerwise save
-        # generator is never created that step and wait_for_save tolerates its absence.
-        # NOTE: the SFA builder never populates attn_metadata.num_prefills (stays at
-        # its dataclass default 0 on every step, prefill included), so gating on it
-        # skipped the save unconditionally. Gate on attn_state instead, which the
-        # builder does set: pure-decode steps are DecodeOnly/SpecDecoding.
-        _decode_window_save_enabled = _decode_window_save_window_size() > 0
-        _skip_decode_save = bool(self.dsa_shrink_latent) and _is_pure_decode and not _decode_window_save_enabled
-        save_operations: list[tuple[str, list[torch.Tensor]]] = []
-        if not _skip_decode_save:
-            if self.dsa_offload_unbundle and len(kv_cache) >= 2:
-                save_operations.append((layer_name, [kv_cache[0], kv_cache[1]]))
-                if len(kv_cache) >= 3 and index_layer_name is not None and index_lmcache_enabled:
-                    save_operations.append((index_layer_name, [kv_cache[2]]))
-            else:
-                save_operations.append((layer_name, list(kv_cache)))
-
-        self._submit_sfa_save_operations(save_operations)
+        if use_layerwise_transfer_window:
+            self._forward_o_proj_with_layerwise_transfer_window(
+                attn_output,
+                output,
+                save_operations,
+            )
+        else:
+            output[...] = self.o_proj(attn_output)[0]
+            # Keep legacy/non-P connector ordering unchanged.
+            self._submit_sfa_save_operations(save_operations)
 
         _dsa_prof.end(_sfa_t)
         return output_padded

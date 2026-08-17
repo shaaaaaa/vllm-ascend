@@ -627,9 +627,84 @@ def wait_for_kv_layer_from_connector(
         )
 
 
-def maybe_save_kv_layer_to_connector(
+def layerwise_prefill_transfer_window_supported() -> bool:
+    """Return whether the active connector exposes split wait/submit loads."""
+    if not has_kv_transfer_group() or not is_v1_kv_transfer_group():
+        return False
+
+    connector = get_kv_transfer_group()
+    submit_load = getattr(
+        connector,
+        "submit_layerwise_prefill_load",
+        None,
+    )
+    finish_save = getattr(
+        connector,
+        "finish_layerwise_prefill_save",
+        None,
+    )
+    capability = getattr(
+        connector,
+        "supports_layerwise_prefill_transfer_window",
+        False,
+    )
+    return (
+        capability is True
+        and callable(submit_load)
+        and callable(finish_save)
+    )
+
+
+def maybe_submit_layerwise_prefill_load(layer_name: str) -> bool:
+    """Submit the load following ``layer_name`` when explicitly supported."""
+    if not has_kv_transfer_group() or not is_v1_kv_transfer_group():
+        return False
+
+    connector = get_kv_transfer_group()
+    submit_load = getattr(
+        connector,
+        "submit_layerwise_prefill_load",
+        None,
+    )
+    capability = getattr(
+        connector,
+        "supports_layerwise_prefill_transfer_window",
+        False,
+    )
+    if capability is not True or not callable(submit_load):
+        return False
+
+    submit_load(layer_name)
+    return True
+
+
+def maybe_finish_layerwise_prefill_save(layer_name: str) -> bool:
+    """Run post-HCOM host work for a pre-HCOM layer save."""
+    if not has_kv_transfer_group() or not is_v1_kv_transfer_group():
+        return False
+
+    connector = get_kv_transfer_group()
+    finish_save = getattr(
+        connector,
+        "finish_layerwise_prefill_save",
+        None,
+    )
+    capability = getattr(
+        connector,
+        "supports_layerwise_prefill_transfer_window",
+        False,
+    )
+    if capability is not True or not callable(finish_save):
+        return False
+
+    finish_save(layer_name)
+    return True
+
+
+def _maybe_save_kv_layer_to_connector_with_method(
     layer_name: str,
     kv_cache_layer: list[torch.Tensor],
+    method_name: str,
 ):
     if not has_kv_transfer_group() or not is_v1_kv_transfer_group():
         return
@@ -651,7 +726,13 @@ def maybe_save_kv_layer_to_connector(
             type(attn_metadata).__name__,
         )
     try:
-        connector.save_kv_layer(layer_name, kv_cache_layer, attn_metadata)
+        save_layer = getattr(connector, method_name, None)
+        if not callable(save_layer):
+            raise RuntimeError(
+                f"KV connector {type(connector).__name__} does not expose "
+                f"required save method {method_name}"
+            )
+        save_layer(layer_name, kv_cache_layer, attn_metadata)
     except Exception:
         logger.exception(
             "[DSA_INDEX_LMCACHE] connector_save_error layer=%s connector=%s kv_cache_layer=%s attn_metadata=%s",
@@ -667,6 +748,39 @@ def maybe_save_kv_layer_to_connector(
             layer_name,
             type(connector).__name__,
         )
+
+
+def maybe_save_kv_layer_to_connector(
+    layer_name: str,
+    kv_cache_layer: list[torch.Tensor],
+):
+    _maybe_save_kv_layer_to_connector_with_method(
+        layer_name,
+        kv_cache_layer,
+        "save_kv_layer",
+    )
+
+
+def maybe_save_kv_layer_in_layerwise_prefill_transfer_window(
+    layer_name: str,
+    kv_cache_layer: list[torch.Tensor],
+):
+    _maybe_save_kv_layer_to_connector_with_method(
+        layer_name,
+        kv_cache_layer,
+        "save_kv_layer_in_layerwise_prefill_transfer_window",
+    )
+
+
+def maybe_save_kv_layer_outside_layerwise_prefill_transfer_window(
+    layer_name: str,
+    kv_cache_layer: list[torch.Tensor],
+):
+    _maybe_save_kv_layer_to_connector_with_method(
+        layer_name,
+        kv_cache_layer,
+        "save_kv_layer_outside_layerwise_prefill_transfer_window",
+    )
 
 
 def round_up(val: int, align: int) -> int:

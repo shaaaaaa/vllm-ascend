@@ -46,6 +46,204 @@ def test_sfa_metadata_declares_cached_decode_split_boundary() -> None:
     assert field.default is None
 
 
+def test_layerwise_prefill_load_submit_requires_explicit_capability() -> None:
+    connector = SimpleNamespace(
+        supports_layerwise_prefill_transfer_window=False,
+        submit_layerwise_prefill_load=MagicMock(),
+        finish_layerwise_prefill_save=MagicMock(),
+    )
+    with (
+        patch.object(attention_utils, "has_kv_transfer_group", return_value=True),
+        patch.object(
+            attention_utils,
+            "is_v1_kv_transfer_group",
+            return_value=True,
+        ),
+        patch.object(
+            attention_utils,
+            "get_kv_transfer_group",
+            return_value=connector,
+        ),
+    ):
+        assert not attention_utils.layerwise_prefill_transfer_window_supported()
+        assert not attention_utils.maybe_submit_layerwise_prefill_load(
+            "layer-0"
+        )
+
+        connector.supports_layerwise_prefill_transfer_window = True
+        assert attention_utils.layerwise_prefill_transfer_window_supported()
+        assert attention_utils.maybe_submit_layerwise_prefill_load("layer-0")
+        assert attention_utils.maybe_finish_layerwise_prefill_save("layer-0")
+
+    connector.submit_layerwise_prefill_load.assert_called_once_with("layer-0")
+    connector.finish_layerwise_prefill_save.assert_called_once_with("layer-0")
+
+
+def test_layerwise_prefill_load_submit_rejects_missing_method() -> None:
+    connector = SimpleNamespace(
+        supports_layerwise_prefill_transfer_window=True,
+        submit_layerwise_prefill_load=None,
+        finish_layerwise_prefill_save=MagicMock(),
+    )
+    with (
+        patch.object(attention_utils, "has_kv_transfer_group", return_value=True),
+        patch.object(
+            attention_utils,
+            "is_v1_kv_transfer_group",
+            return_value=True,
+        ),
+        patch.object(
+            attention_utils,
+            "get_kv_transfer_group",
+            return_value=connector,
+        ),
+    ):
+        assert not attention_utils.layerwise_prefill_transfer_window_supported()
+        assert not attention_utils.maybe_submit_layerwise_prefill_load(
+            "layer-0"
+        )
+
+
+def test_layerwise_prefill_transfer_window_rejects_missing_finish() -> None:
+    connector = SimpleNamespace(
+        supports_layerwise_prefill_transfer_window=True,
+        submit_layerwise_prefill_load=MagicMock(),
+        finish_layerwise_prefill_save=None,
+    )
+    with (
+        patch.object(attention_utils, "has_kv_transfer_group", return_value=True),
+        patch.object(
+            attention_utils,
+            "is_v1_kv_transfer_group",
+            return_value=True,
+        ),
+        patch.object(
+            attention_utils,
+            "get_kv_transfer_group",
+            return_value=connector,
+        ),
+    ):
+        assert not attention_utils.layerwise_prefill_transfer_window_supported()
+        assert not attention_utils.maybe_finish_layerwise_prefill_save(
+            "layer-0"
+        )
+
+
+def test_sfa_transfer_window_runs_save_then_load_on_every_runtime_call() -> None:
+    events: list[str] = []
+    fake_impl = SimpleNamespace()
+    fake_impl._submit_sfa_transfer_window_save_operations = (
+        lambda operations: events.extend(
+            f"save:{layer_name}" for layer_name, _ in operations
+        )
+    )
+    fake_impl._submit_sfa_post_transfer_window_save_operations = (
+        lambda operations: events.extend(
+            f"post-save:{layer_name}" for layer_name, _ in operations
+        )
+    )
+
+    class FakeOProj:
+        @staticmethod
+        def forward_with_pre_reduce_callback(input_, callback):
+            events.append("local_matmul")
+            callback()
+            events.append("allreduce")
+            return input_, None
+
+    fake_impl.o_proj = FakeOProj()
+    save_operations = [
+        ("layer-0.attn", [torch.empty(1)]),
+        ("layer-0.indexer", [torch.empty(1)]),
+    ]
+
+    def submit_load(layer_name: str) -> bool:
+        events.append(f"load:{layer_name}")
+        return True
+
+    def finish_save(layer_name: str) -> bool:
+        events.append(f"finish:{layer_name}")
+        return True
+
+    with (
+        patch.object(
+            sfa_v1,
+            "maybe_submit_layerwise_prefill_load",
+            side_effect=submit_load,
+        ),
+        patch.object(
+            sfa_v1,
+            "maybe_finish_layerwise_prefill_save",
+            side_effect=finish_save,
+        ),
+    ):
+        for _ in range(2):
+            AscendSFAImpl._forward_o_proj_with_layerwise_transfer_window(
+                fake_impl,
+                torch.ones(1),
+                torch.empty(1),
+                save_operations,
+            )
+
+    expected_runtime_order = [
+        "local_matmul",
+        "save:layer-0.attn",
+        "save:layer-0.indexer",
+        "load:layer-0.attn",
+        "load:layer-0.indexer",
+        "allreduce",
+        "finish:layer-0.attn",
+        "finish:layer-0.indexer",
+        "post-save:layer-0.attn",
+        "post-save:layer-0.indexer",
+    ]
+    assert events == expected_runtime_order * 2
+
+
+@pytest.mark.parametrize(
+    ("shrink_latent", "num_decode_tokens", "expected"),
+    [
+        (0, 0, ["wait", "mlapo"]),
+        (2, 1, ["mlapo"]),
+    ],
+)
+def test_mlapo_fences_layerwise_bank_before_fused_kv_write(
+    shrink_latent: int,
+    num_decode_tokens: int,
+    expected: list[str],
+) -> None:
+    events: list[str] = []
+    fake_impl = SimpleNamespace(
+        dsa_shrink_latent=shrink_latent,
+        _sfa_preprocess_with_mlapo=(
+            lambda **_kwargs: events.append("mlapo") or (1, 2, 3, 4)
+        ),
+    )
+    with patch.object(
+        sfa_v1,
+        "wait_for_kv_layer_from_connector",
+        side_effect=lambda _layer_name: events.append("wait"),
+    ):
+        result = (
+            AscendSFAImpl._sfa_preprocess_with_mlapo_after_layerwise_wait(
+                fake_impl,
+                layer_name="model.layers.4.self_attn.attn",
+                attn_metadata=SimpleNamespace(
+                    num_decode_tokens=num_decode_tokens
+                ),
+                hidden_states=MagicMock(),
+                kv_cache=MagicMock(),
+                cos=MagicMock(),
+                sin=MagicMock(),
+                slot_mapping=MagicMock(),
+                num_input_tokens=1,
+            )
+        )
+
+    assert events == expected
+    assert result == (1, 2, 3, 4)
+
+
 def test_sparse_boundary_updates_preallocated_storage_in_place():
     boundary_cpu = torch.tensor([9, 9, 19, 0], dtype=torch.int32)
     boundary = torch.empty(4, dtype=torch.int32)

@@ -21,6 +21,7 @@ import numpy as np
 import torch
 from vllm.lora.request import LoRARequest
 from vllm.pooling_params import PoolingParams
+from vllm.v1.core.dsa_shared_pool import LAYERWISE_PREFILL_BANK_COUNT
 from vllm.v1.outputs import LogprobsTensors
 from vllm.v1.pool.metadata import PoolingStates
 from vllm.v1.sample.logits_processor import BatchUpdateBuilder, LogitsProcessors
@@ -123,7 +124,7 @@ class NPUInputBatch(InputBatch):
                             cp_kv_cache_interleave_size
                         ),
                     )
-                    for _ in range(2)
+                    for _ in range(LAYERWISE_PREFILL_BANK_COUNT - 1)
                 ),
             )
 

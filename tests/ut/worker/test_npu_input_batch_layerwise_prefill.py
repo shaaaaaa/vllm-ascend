@@ -46,17 +46,16 @@ def test_ordinary_input_batch_reuses_primary_block_table() -> None:
     )
 
 
-def test_layerwise_prefill_input_batch_owns_three_matching_tables() -> None:
+def test_layerwise_prefill_input_batch_owns_two_matching_tables() -> None:
     input_batch = _make_input_batch(layerwise_prefill=True)
     tables = input_batch.layerwise_prefill_block_tables
 
-    assert len(tables) == 3
+    assert len(tables) == 2
     assert tables[0] is input_batch.block_table
-    assert len({id(table) for table in tables}) == 3
-    assert [len(table.block_tables) for table in tables] == [2, 2, 2]
+    assert len({id(table) for table in tables}) == 2
+    assert [len(table.block_tables) for table in tables] == [2, 2]
 
     tables[1].add_row(([10, 11], [20]), row_idx=0)
     assert tables[1][0].num_blocks_per_row[0] == 2
     assert tables[1][1].num_blocks_per_row[0] == 1
     assert tables[0][0].num_blocks_per_row[0] == 0
-    assert tables[2][0].num_blocks_per_row[0] == 0
