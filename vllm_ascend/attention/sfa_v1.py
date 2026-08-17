@@ -4125,18 +4125,26 @@ class AscendSFAImpl(MLAAttentionImpl):
                 # and does not advance the group-0 latent-layer cursor.
                 with _dsa_prof.section("lmc_index_retrieve"):
                     wait_for_kv_layer_from_connector(index_layer_name)
-                if content_diagnostics_enabled:
-                    queue_group1_first_consume(
-                        req_ids=attn_metadata.req_ids,
-                        layer_name=index_layer_name,
-                        indexer_cache=kv_cache[2],
-                        indexer_block_table=attn_metadata.indexer_block_table,
-                        seq_lens_cpu=attn_metadata.seq_lens_cpu,
-                        block_size=self.block_size,
-                        row_request_indices=(
-                            attn_metadata.decode_req_indices_cpu
-                        ),
-                    )
+            # Live Group-1 P2P populates the model cache without enabling the
+            # persistent LMCache indexer-load path.  Diagnose the exact
+            # model-visible rows for both transports, after any required wait
+            # and before this step scatters the current token into the cache.
+            if content_diagnostics_enabled:
+                queue_group1_first_consume(
+                    req_ids=attn_metadata.req_ids,
+                    layer_name=index_layer_name,
+                    indexer_cache=kv_cache[2],
+                    indexer_block_table=attn_metadata.indexer_block_table,
+                    seq_lens_cpu=attn_metadata.seq_lens_cpu,
+                    block_size=self.block_size,
+                    row_request_indices=attn_metadata.decode_req_indices_cpu,
+                    num_decode_tokens=attn_metadata.num_decode_tokens,
+                    num_actual_tokens=attn_metadata.num_actual_tokens,
+                    attn_state=attn_metadata.attn_state,
+                    decode_valid_rows_all=(
+                        attn_metadata.decode_valid_rows_all
+                    ),
+                )
 
             if self.is_kv_producer:
                 attn_metadata.reshape_cache_event = torch.npu.Event()
@@ -4171,6 +4179,13 @@ class AscendSFAImpl(MLAAttentionImpl):
                     layer_name=index_layer_name or layer_name,
                     topk_indices=topk_indices,
                     row_request_indices=attn_metadata.decode_req_indices_cpu,
+                    seq_lens_cpu=attn_metadata.seq_lens_cpu,
+                    num_decode_tokens=attn_metadata.num_decode_tokens,
+                    num_actual_tokens=attn_metadata.num_actual_tokens,
+                    attn_state=attn_metadata.attn_state,
+                    decode_valid_rows_all=(
+                        attn_metadata.decode_valid_rows_all
+                    ),
                 )
 
         # DSA Step B2 (compact-scratch decode): the indexer just produced topk.

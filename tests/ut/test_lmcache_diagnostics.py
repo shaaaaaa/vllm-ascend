@@ -99,3 +99,42 @@ def test_model_and_transfer_modules_do_not_import_lmcache_ascend(
         module == "lmcache_ascend" or module.startswith("lmcache_ascend.")
         for module in imported_modules
     )
+
+
+def test_live_p2p_first_consume_diagnostic_is_not_persistent_load_gated() -> None:
+    """Keep live P2P observable when the persistent index load is disabled."""
+    repository_root = Path(__file__).resolve().parents[2]
+    tree = ast.parse(
+        (repository_root / "vllm_ascend/attention/sfa_v1.py").read_text(
+            encoding="utf-8"
+        )
+    )
+    parents: dict[ast.AST, ast.AST] = {}
+    for parent in ast.walk(tree):
+        for child in ast.iter_child_nodes(parent):
+            parents[child] = parent
+
+    calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "queue_group1_first_consume"
+    ]
+    assert len(calls) == 1
+    call = calls[0]
+    ancestor = parents.get(call)
+    while ancestor is not None:
+        if isinstance(ancestor, ast.If):
+            assert "index_lmcache_enabled" not in ast.unparse(ancestor.test)
+        ancestor = parents.get(ancestor)
+
+    keyword_names = {keyword.arg for keyword in call.keywords}
+    assert {
+        "seq_lens_cpu",
+        "row_request_indices",
+        "num_decode_tokens",
+        "num_actual_tokens",
+        "attn_state",
+        "decode_valid_rows_all",
+    } <= keyword_names
