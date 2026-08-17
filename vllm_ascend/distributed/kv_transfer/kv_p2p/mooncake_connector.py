@@ -70,6 +70,7 @@ SPLIT_DONE_MSG = b"split_done_msg_v2"
 LIVE_SPLIT_CAPABILITY = "ascend_live_split_v2"
 LIVE_SPLIT_COMPACT_CAPABILITY = "ascend_live_split_compact_v1"
 LIVE_SPLIT_LATENT_CPU_CAPABILITY = "ascend_live_split_latent_cpu_v1"
+LIVE_SPLIT_DP_ROUTING_CAPABILITY = "ascend_live_split_dp_routing_v1"
 LIVE_SPLIT_SOURCE_DESCRIPTOR = "ascend_live_split_source_v1"
 MAX_PENDING_SPLIT_REQUESTS = 64
 MAX_TASK_HISTORY_SIZE = 16000
@@ -233,6 +234,19 @@ class SplitTransferPlan:
     compact_destination: SplitCompactLayout | None = None
     latent_source: SplitLatentLayout | None = None
     latent_destination_pages: tuple[SplitLatentDestinationPage, ...] = ()
+    source_tp_rank: int | None = None
+    source_dp_rank: int | None = None
+
+    @property
+    def source_rank(self) -> tuple[int, int]:
+        return (
+            self.tp_rank if self.source_tp_rank is None else self.source_tp_rank,
+            self.dp_rank if self.source_dp_rank is None else self.source_dp_rank,
+        )
+
+    @property
+    def destination_rank(self) -> tuple[int, int]:
+        return self.tp_rank, self.dp_rank
 
 
 @dataclass
@@ -249,6 +263,7 @@ class ReqMeta:
     remote_ptp_size: int | None
     remote_multi_nodes_meta_mapping: dict[str, dict[str, Any]]
     num_prompt_blocks: int
+    remote_dp_rank: int | None = None
     split_plan: SplitTransferPlan | None = None
     split_negotiated: bool = False
     split_fallback: bool = False
@@ -629,6 +644,9 @@ class KVCacheRecvingThread(threading.Thread):
         self.remote_buffer_group_ids: dict[str, dict[int, tuple[int, ...]]] = (
             SizedDict()
         )
+        self.remote_rank_identities: dict[
+            tuple[str, int], tuple[int, int]
+        ] = {}
         self.block_len = block_len
         # TODO(jianzs): find a better way to detect MLA.
         self.use_mla = len(block_len) == 2
@@ -1143,7 +1161,15 @@ class KVCacheRecvingThread(threading.Thread):
         transfer_started = time.perf_counter()
         compact = plan.compact_source is not None
         latent = plan.latent_source is not None
-        if plan.tp_rank != self.tp_rank or plan.dp_rank != self.vllm_config.parallel_config.data_parallel_rank_local:
+        local_dp_rank = int(
+            getattr(
+                self.vllm_config.parallel_config,
+                "data_parallel_index",
+                0,
+            )
+            or 0
+        )
+        if plan.destination_rank != (self.tp_rank, local_dp_rank):
             raise RuntimeError("Split destination TP/DP rank mismatch")
         requested_groups = set(plan.requested_groups)
         if not requested_groups or not requested_groups.issubset({0, 1}):
@@ -1219,6 +1245,21 @@ class KVCacheRecvingThread(threading.Thread):
         )
         if LIVE_SPLIT_CAPABILITY not in capabilities:
             raise RuntimeError("Remote Mooncake peer lacks live split capability")
+        remote_identity = self.remote_rank_identities.get(
+            (remote_engine_id, remote_port)
+        )
+        if (
+            LIVE_SPLIT_DP_ROUTING_CAPABILITY in capabilities
+            and remote_identity != plan.source_rank
+        ):
+            raise RuntimeError(
+                "Remote Mooncake peer rank does not match the split source"
+            )
+        if (
+            plan.source_rank != plan.destination_rank
+            and LIVE_SPLIT_DP_ROUTING_CAPABILITY not in capabilities
+        ):
+            raise RuntimeError("Remote Mooncake peer lacks DP split routing capability")
         if compact and LIVE_SPLIT_COMPACT_CAPABILITY not in capabilities:
             raise RuntimeError("Remote Mooncake peer lacks compact split capability")
         if latent and LIVE_SPLIT_LATENT_CPU_CAPABILITY not in capabilities:
@@ -1553,6 +1594,8 @@ class KVCacheRecvingThread(threading.Thread):
             tp_rank=plan.tp_rank,
             dp_rank=plan.dp_rank,
             requested_groups=plan.requested_groups,
+            source_tp_rank=plan.source_tp_rank,
+            source_dp_rank=plan.source_dp_rank,
         )
 
     def reformat_kv_cache_with_fused_op(self, block_ids: list[list[int]], tp_num_need_pulls: int):
@@ -1693,6 +1736,10 @@ class KVCacheRecvingThread(threading.Thread):
             if not hasattr(self, "remote_capabilities"):
                 self.remote_capabilities = {}
             self.remote_capabilities[(engine_id, remote_handshake_port)] = agent_meta.capabilities
+            self.remote_rank_identities[(engine_id, remote_handshake_port)] = (
+                int(agent_meta.tp_rank),
+                int(agent_meta.dp_rank),
+            )
             healthy = True
         finally:
             if sock is not None:
@@ -1844,13 +1891,22 @@ class KVCacheRecvingThread(threading.Thread):
 
 
 class MooncakeConnectorMetadata(KVConnectorMetadata):
-    def __init__(self, live_split_topology_supported: bool = True):
+    def __init__(
+        self,
+        live_split_topology_supported: bool = True,
+        live_split_dp_routing_required: bool = False,
+        live_split_source_dp_size: int = 1,
+    ):
         self.requests: dict[str, ReqMeta] = {}
         self.requests_to_send: dict[str, float] = {}
         self.reqs_in_batch: set[str] = set()
         self.split_requests_to_send: set[str] = set()
         self.split_transfer_ids: dict[str, str] = {}
         self.live_split_topology_supported = live_split_topology_supported
+        self.live_split_dp_routing_required = live_split_dp_routing_required
+        self.live_split_source_dp_size = max(
+            1, int(live_split_source_dp_size)
+        )
 
     def add_new_req(
         self,
@@ -1883,10 +1939,76 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
             )
             split_source = None
             split_source_invalid = True
-        capabilities = kv_transfer_params.get("live_split_capabilities", ())
+        raw_capabilities = kv_transfer_params.get(
+            "live_split_capabilities", ()
+        )
+        capabilities = (
+            tuple(raw_capabilities)
+            if isinstance(
+                raw_capabilities, (list, tuple, set, frozenset)
+            )
+            and all(isinstance(item, str) for item in raw_capabilities)
+            else ()
+        )
         split_negotiated = (
             LIVE_SPLIT_CAPABILITY in capabilities or split_plan is not None
         )
+        remote_dp_rank = None
+        remote_dp_rank_raw = kv_transfer_params.get("remote_dp_rank")
+        if remote_dp_rank_raw is not None:
+            try:
+                remote_dp_rank = _wire_int(
+                    remote_dp_rank_raw,
+                    "remote_dp_rank",
+                )
+                if not 0 <= remote_dp_rank < self.live_split_source_dp_size:
+                    raise ValueError(
+                        "remote_dp_rank is outside the configured prefiller "
+                        "DP topology"
+                    )
+            except (TypeError, ValueError):
+                logger.warning(
+                    "Invalid remote DP rank for request %s; using "
+                    "persistent fallback",
+                    request_id,
+                )
+                remote_dp_rank = None
+                split_source_invalid = True
+        if (
+            remote_dp_rank is not None
+            and split_plan is not None
+            and split_plan.source_rank[1] != remote_dp_rank
+        ):
+            logger.warning(
+                "Eager live-split source DP rank does not match the routed "
+                "prefiller rank for request %s; using persistent fallback",
+                request_id,
+            )
+            split_plan = None
+            split_source_invalid = True
+        if remote_dp_rank is not None and split_source is not None and any(
+            descriptor.dp_rank != remote_dp_rank
+            for descriptor in split_source
+        ):
+            logger.warning(
+                "Live-split source descriptor DP rank does not match the "
+                "routed prefiller rank for request %s; using persistent "
+                "fallback",
+                request_id,
+            )
+            split_source = None
+            split_source_invalid = True
+        if (
+            split_negotiated
+            and self.live_split_dp_routing_required
+            and (
+                LIVE_SPLIT_DP_ROUTING_CAPABILITY not in capabilities
+                or remote_dp_rank is None
+            )
+        ):
+            split_plan = None
+            split_source = None
+            split_source_invalid = True
         split_transfer_id = kv_transfer_params.get("live_split_transfer_id")
         _cold_live_log(
             "live_source_decoder_ingest",
@@ -1918,13 +2040,15 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
             remote_pcp_size=kv_transfer_params.get("remote_pcp_size", 1),
             remote_dcp_size=kv_transfer_params.get("remote_dcp_size", 1),
             remote_ptp_size=kv_transfer_params.get("remote_ptp_size"),
+            remote_dp_rank=remote_dp_rank,
             remote_multi_nodes_meta_mapping=kv_transfer_params.get("remote_multi_nodes_meta_mapping", {}),
             num_prompt_blocks=kv_transfer_params.get("num_prompt_blocks", 0),
             split_plan=split_plan,
             split_negotiated=split_negotiated,
             split_source=split_source,
             split_source_invalid=split_source_invalid,
-            split_fallback=split_negotiated and split_transfer_id is None,
+            split_fallback=split_negotiated
+            and (split_transfer_id is None or split_source_invalid),
             split_transfer_id=split_transfer_id,
         )
 
@@ -2306,9 +2430,9 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
             )
         tp_rank = _wire_int(plan["tp_rank"], "destination.tp_rank")
         dp_rank = _wire_int(plan["dp_rank"], "destination.dp_rank")
-        if (tp_rank, dp_rank) != (source.tp_rank, source.dp_rank):
+        if tp_rank != source.tp_rank:
             raise ValueError(
-                "source/destination ranks differ: "
+                "source/destination TP ranks differ: "
                 f"source={(source.tp_rank, source.dp_rank)}, "
                 f"destination={(tp_rank, dp_rank)}"
             )
@@ -2410,6 +2534,8 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
                 ),
                 tp_rank=tp_rank,
                 dp_rank=dp_rank,
+                source_tp_rank=source.tp_rank,
+                source_dp_rank=source.dp_rank,
                 requested_groups=requested_groups,
                 compact_source=source.compact_layout,
                 compact_destination=compact_destination,
@@ -2472,6 +2598,8 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
             ),
             tp_rank=tp_rank,
             dp_rank=dp_rank,
+            source_tp_rank=source.tp_rank,
+            source_dp_rank=source.dp_rank,
             requested_groups=requested_groups,
         )
 
@@ -2552,6 +2680,16 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
                     )
                     for page in plan.get("latent_destination_pages", ())
                 ),
+                source_tp_rank=(
+                    None
+                    if plan.get("source_tp_rank") is None
+                    else _wire_int(plan["source_tp_rank"], "plan.source_tp_rank")
+                ),
+                source_dp_rank=(
+                    None
+                    if plan.get("source_dp_rank") is None
+                    else _wire_int(plan["source_dp_rank"], "plan.source_dp_rank")
+                ),
             )
         if len(parsed.group_byte_totals) != 2:
             raise ValueError("Live split byte totals require exactly two groups")
@@ -2559,7 +2697,9 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
 
     def needs_late_split_plans(self) -> bool:
         return any(
-            meta.split_negotiated and meta.split_plan is None
+            meta.split_negotiated
+            and not meta.split_source_invalid
+            and meta.split_plan is None
             for meta in self.requests.values()
         )
 
@@ -2593,20 +2733,21 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
                         )
                 source = None
                 if meta.split_source is not None and raw_plan is not None:
-                    identity = (
-                        _wire_int(raw_plan["tp_rank"], "destination.tp_rank"),
-                        _wire_int(raw_plan["dp_rank"], "destination.dp_rank"),
+                    destination_tp_rank = _wire_int(
+                        raw_plan["tp_rank"], "destination.tp_rank"
                     )
-                    source = next(
-                        (
-                            item
-                            for item in meta.split_source
-                            if (item.tp_rank, item.dp_rank) == identity
-                        ),
-                        None,
+                    candidates = tuple(
+                        item
+                        for item in meta.split_source
+                        if item.tp_rank == destination_tp_rank
+                        and (
+                            meta.remote_dp_rank is None
+                            or item.dp_rank == meta.remote_dp_rank
+                        )
                     )
-                    if source is None:
+                    if len(candidates) != 1:
                         raise ValueError("Missing live split source rank")
+                    source = candidates[0]
                 plan = (
                     self._merge_source_and_destinations(
                         source, raw_plan, supported_groups
@@ -2648,6 +2789,8 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
                             plan.latent_destination_pages
                             if 0 in requested_groups else ()
                         ),
+                        source_tp_rank=plan.source_tp_rank,
+                        source_dp_rank=plan.source_dp_rank,
                     )
                 meta.split_plan = plan
             except (KeyError, TypeError, ValueError) as error:
@@ -2912,7 +3055,7 @@ class MooncakeConnectorScheduler:
         # Handshake base port
         self.side_channel_port = (
             vllm_config.kv_transfer_config.kv_port
-            + vllm_config.parallel_config.data_parallel_rank
+            + vllm_config.parallel_config.data_parallel_index
             * vllm_config.parallel_config.tensor_parallel_size
             * vllm_config.parallel_config.pipeline_parallel_size
             * self.pcp_size
@@ -2938,8 +3081,12 @@ class MooncakeConnectorScheduler:
             and self.pcp_size == 1
             and self.dcp_size == 1
             and self._live_prefill_tp_size == self._live_decode_tp_size
-            and self._live_prefill_dp_size == self._live_decode_dp_size == 1
+            and self._live_prefill_dp_size == self._live_decode_dp_size
+            and self._live_prefill_dp_size > 0
         )
+
+    def _live_split_dp_routing_required(self) -> bool:
+        return self._live_prefill_dp_size > 1
 
     def _canonicalize_source_descriptor(self, descriptor: Any) -> dict[str, Any]:
         if not isinstance(descriptor, dict):
@@ -3241,7 +3388,9 @@ class MooncakeConnectorScheduler:
         scheduler_output: SchedulerOutput,
     ) -> KVConnectorMetadata:
         meta = MooncakeConnectorMetadata(
-            self._live_split_topology_supported()
+            self._live_split_topology_supported(),
+            self._live_split_dp_routing_required(),
+            self._live_prefill_dp_size,
         )
 
         # Loop through scheduled reqs and convert to ReqMeta.
@@ -3314,6 +3463,7 @@ class MooncakeConnectorScheduler:
             remote_pcp_size=self.pcp_size,
             remote_dcp_size=self.dcp_size,
             remote_ptp_size=self.tp_size,
+            remote_dp_rank=self.vllm_config.parallel_config.data_parallel_index,
             last_token_id=request.output_token_ids[-1],
             remote_multi_nodes_meta_mapping=self.multi_nodes_meta_mapping,
             num_prompt_blocks=num_prompt_blocks,
@@ -3329,6 +3479,7 @@ class MooncakeConnectorScheduler:
             capabilities = [
                 LIVE_SPLIT_CAPABILITY,
                 LIVE_SPLIT_COMPACT_CAPABILITY,
+                LIVE_SPLIT_DP_ROUTING_CAPABILITY,
             ]
             if 0 in self.live_split_source_groups:
                 capabilities.append(LIVE_SPLIT_LATENT_CPU_CAPABILITY)
@@ -3417,7 +3568,9 @@ class MooncakeConnectorWorker:
         self.tp_size = vllm_config.parallel_config.tensor_parallel_size
         self.tp_group = get_tp_group()
         self.pp_rank = get_pp_group().rank_in_group
-        self.dp_rank = vllm_config.parallel_config.data_parallel_rank_local
+        self.dp_rank = vllm_config.parallel_config.data_parallel_index
+        # Protocol identities use the global DP index, but device-counting
+        # logic must remain node-local in multi-node deployments.
         self.dp_size = vllm_config.parallel_config.data_parallel_size_local
         self.pp_size = vllm_config.parallel_config.pipeline_parallel_size
         self.kv_caches: dict[str, torch.Tensor] = {}
@@ -3436,7 +3589,7 @@ class MooncakeConnectorWorker:
         # Handshake base port
         self.side_channel_port = (
             vllm_config.kv_transfer_config.kv_port
-            + vllm_config.parallel_config.data_parallel_rank
+            + vllm_config.parallel_config.data_parallel_index
             * vllm_config.parallel_config.tensor_parallel_size
             * vllm_config.parallel_config.pipeline_parallel_size
             * self.pcp_size
@@ -3559,22 +3712,49 @@ class MooncakeConnectorWorker:
 
     def _validate_local_parallel_config(self, vllm_config: VllmConfig) -> None:
         actual_tp_size = vllm_config.parallel_config.tensor_parallel_size
+        actual_dp_size = vllm_config.parallel_config.data_parallel_size
         actual_pp_size = vllm_config.parallel_config.pipeline_parallel_size
         kv_role = vllm_config.kv_transfer_config.kv_role
 
-        sides: list[tuple[str, int, int]] = []
+        sides: list[tuple[str, int, int, int]] = []
         if kv_role == "kv_producer":
-            sides.append(("prefill", self._prefill_tp_size, self._prefill_pp_size))
+            sides.append(
+                (
+                    "prefill",
+                    self._prefill_tp_size,
+                    self._prefill_dp_size,
+                    self._prefill_pp_size,
+                )
+            )
         elif kv_role == "kv_consumer":
-            sides.append(("decode", self._decode_tp_size, self._decode_pp_size))
+            sides.append(
+                (
+                    "decode",
+                    self._decode_tp_size,
+                    self._decode_dp_size,
+                    self._decode_pp_size,
+                )
+            )
         elif kv_role == "kv_both":
             matches = [
-                (side, tp_size, pp_size)
-                for side, tp_size, pp_size in (
-                    ("prefill", self._prefill_tp_size, self._prefill_pp_size),
-                    ("decode", self._decode_tp_size, self._decode_pp_size),
+                (side, tp_size, dp_size, pp_size)
+                for side, tp_size, dp_size, pp_size in (
+                    (
+                        "prefill",
+                        self._prefill_tp_size,
+                        self._prefill_dp_size,
+                        self._prefill_pp_size,
+                    ),
+                    (
+                        "decode",
+                        self._decode_tp_size,
+                        self._decode_dp_size,
+                        self._decode_pp_size,
+                    ),
                 )
-                if tp_size == actual_tp_size and pp_size == actual_pp_size
+                if tp_size == actual_tp_size
+                and dp_size == actual_dp_size
+                and pp_size == actual_pp_size
             ]
             if not matches:
                 raise ValueError(
@@ -3585,7 +3765,7 @@ class MooncakeConnectorWorker:
         else:
             raise ValueError(f"Unsupported Mooncake kv_role: {kv_role}")
 
-        for side, configured_tp_size, configured_pp_size in sides:
+        for side, configured_tp_size, configured_dp_size, configured_pp_size in sides:
             if configured_tp_size != actual_tp_size:
                 raise ValueError(
                     "MooncakeConnector kv_connector_extra_config."
@@ -3593,6 +3773,14 @@ class MooncakeConnectorWorker:
                     f"actual --tensor-parallel-size ({actual_tp_size}) for "
                     f"kv_role={kv_role}. Update either --tensor-parallel-size "
                     f"or kv_connector_extra_config.{side}.tp_size."
+                )
+            if configured_dp_size != actual_dp_size:
+                raise ValueError(
+                    "MooncakeConnector kv_connector_extra_config."
+                    f"{side}.dp_size ({configured_dp_size}) must match the "
+                    f"actual --data-parallel-size ({actual_dp_size}) for "
+                    f"kv_role={kv_role}. Update either --data-parallel-size "
+                    f"or kv_connector_extra_config.{side}.dp_size."
                 )
             if configured_pp_size != actual_pp_size:
                 raise ValueError(
@@ -3689,7 +3877,11 @@ class MooncakeConnectorWorker:
             list(storage_regions), list(storage_regions.values())
         )
         # After KV Caches registered, start the sending or receiving thread.
-        capabilities = [LIVE_SPLIT_CAPABILITY, LIVE_SPLIT_COMPACT_CAPABILITY]
+        capabilities = [
+            LIVE_SPLIT_CAPABILITY,
+            LIVE_SPLIT_COMPACT_CAPABILITY,
+            LIVE_SPLIT_DP_ROUTING_CAPABILITY,
+        ]
         if (
             getattr(self, "live_latent_source_enabled", False)
             and self.kv_role in ("kv_producer", "kv_both")
@@ -3706,14 +3898,7 @@ class MooncakeConnectorWorker:
             kv_caches_buffer_sizes=tuple(lengths),
             buffer_group_ids=tuple(buffer_group_ids),
             tp_rank=self.tp_rank,
-            dp_rank=int(
-                getattr(
-                    self.vllm_config.parallel_config,
-                    "data_parallel_rank_local",
-                    0,
-                )
-                or 0
-            ),
+            dp_rank=self.dp_rank,
         )
         self.xfer_handshake_metadata = metadata
 
@@ -4098,7 +4283,7 @@ class MooncakeConnectorWorker:
                         raise RuntimeError(
                             "Live split does not encode prefiller PP rank"
                         )
-                    remote_ranks = (meta.split_plan.tp_rank,)
+                    remote_ranks = (meta.split_plan.source_rank[0],)
                 else:
                     remote_ranks = tuple(
                         self._get_remote_rank(remote_req_id, prefill_tp_size)

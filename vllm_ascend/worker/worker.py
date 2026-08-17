@@ -476,7 +476,16 @@ class NPUWorker(WorkerBase):
                 comm_postprocess=comm_postprocess,
             )
 
-        output = self.model_runner.execute_model(scheduler_output, intermediate_tensors)
+        try:
+            output = self.model_runner.execute_model(
+                scheduler_output, intermediate_tensors
+            )
+        except BaseException:
+            # A speculative target pass can fail after connector metadata was
+            # intentionally kept bound for sample_tokens(). Never carry that
+            # failed step's request binding into a later scheduler iteration.
+            self.model_runner.abort_kv_connector_finalize()
+            raise
         if isinstance(output, (ModelRunnerOutput, AsyncModelRunnerOutput, NoneType)):
             return output
 
@@ -499,8 +508,10 @@ class NPUWorker(WorkerBase):
             return None
 
         # In case of PP with kv transfer, we need to pass through the
-        # kv_connector_output
-        if not kv_connector_output.finished_sending and not kv_connector_output.finished_recving:
+        # kv_connector_output. Worker metadata, invalid block IDs, completed
+        # saves, stats, and cache events are also scheduler-visible output;
+        # do not discard them merely because no request finished this step.
+        if kv_connector_output.is_empty():
             return EMPTY_MODEL_RUNNER_OUTPUT
         output = copy.copy(EMPTY_MODEL_RUNNER_OUTPUT)
         output.kv_connector_output = kv_connector_output
@@ -508,7 +519,14 @@ class NPUWorker(WorkerBase):
 
     @torch.inference_mode()
     def sample_tokens(self, grammar_output: "GrammarOutput") -> ModelRunnerOutput | AsyncModelRunnerOutput:
-        return self.model_runner.sample_tokens(grammar_output)
+        try:
+            return self.model_runner.sample_tokens(grammar_output)
+        except BaseException:
+            # Speculative execution defers connector finalization until after
+            # the draft pass. A failed draft/sample must not leave request
+            # metadata bound for the next scheduler step.
+            self.model_runner.abort_kv_connector_finalize()
+            raise
 
     def load_model(self) -> None:
         if self.vllm_config.model_config.enable_sleep_mode:

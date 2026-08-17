@@ -2117,6 +2117,20 @@ class NPUModelRunner(GPUModelRunner):
                 if not get_pp_group().is_last_rank:
                     # Return the intermediate tensors.
                     assert isinstance(hidden_states, IntermediateTensors)
+                    # This branch returns before speculative drafting, so a
+                    # deferred connector lifecycle must be closed here.
+                    if not clear_kv_metadata:
+                        finalized = self.finalize_kv_connector(
+                            scheduler_output.finished_req_ids
+                        )
+                        if not finalized.is_empty():
+                            kv_connector_output = (
+                                finalized
+                                if kv_connector_output is None
+                                else KVConnectorOutput.merge(
+                                    kv_connector_output, finalized
+                                )
+                            )
                     hidden_states.kv_connector_output = kv_connector_output
                     self.kv_connector_output = kv_connector_output
                     if self.debugger is not None:
@@ -2125,6 +2139,19 @@ class NPUModelRunner(GPUModelRunner):
                     return hidden_states
                 if self.is_pooling_model:
                     # Return the pooling output.
+                    # Pooling also has no draft pass after the target model.
+                    if not clear_kv_metadata:
+                        finalized = self.finalize_kv_connector(
+                            scheduler_output.finished_req_ids
+                        )
+                        if not finalized.is_empty():
+                            kv_connector_output = (
+                                finalized
+                                if kv_connector_output is None
+                                else KVConnectorOutput.merge(
+                                    kv_connector_output, finalized
+                                )
+                            )
                     output = self._pool(
                         hidden_states, num_scheduled_tokens, num_scheduled_tokens_np, kv_connector_output
                     )
@@ -2370,7 +2397,9 @@ class NPUModelRunner(GPUModelRunner):
 
             if has_kv_transfer_group():
                 if self.speculative_config:
-                    completed_decode_window_saves = self.finalize_kv_connector()
+                    finalized = self.finalize_kv_connector(
+                        scheduler_output.finished_req_ids
+                    )
                     diag_req_ids = getattr(
                         self, "_mtp_dw_diag_current_req_ids", set()
                     )
@@ -2387,21 +2416,15 @@ class NPUModelRunner(GPUModelRunner):
                             deferred=True,
                             order=3,
                             completed_window_end=(
-                                completed_decode_window_saves.get(req_id)
+                                finalized.completed_decode_window_saves.get(req_id)
                             ),
                         )
-                    if completed_decode_window_saves:
-                        if kv_connector_output is None:
-                            kv_connector_output = KVConnectorOutput()
-                        for req_id, window_end in completed_decode_window_saves.items():
-                            kv_connector_output.completed_decode_window_saves[
-                                req_id
-                            ] = max(
-                                kv_connector_output.completed_decode_window_saves.get(
-                                    req_id, 0
-                                ),
-                                window_end,
-                            )
+                    if not finalized.is_empty():
+                        kv_connector_output = (
+                            finalized
+                            if kv_connector_output is None
+                            else KVConnectorOutput.merge(kv_connector_output, finalized)
+                        )
 
         if self.model_config.enable_return_routed_experts:
             capturer = RoutedExpertsCapturer.get_instance()

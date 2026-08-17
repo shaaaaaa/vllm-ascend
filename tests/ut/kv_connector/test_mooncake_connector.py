@@ -50,6 +50,7 @@ from vllm_ascend.distributed.kv_transfer.ascend_multi_connector import (  # noqa
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector import (  # noqa: E402
     LIVE_SPLIT_CAPABILITY,
     LIVE_SPLIT_COMPACT_CAPABILITY,
+    LIVE_SPLIT_DP_ROUTING_CAPABILITY,
     LIVE_SPLIT_LATENT_CPU_CAPABILITY,
     LIVE_SPLIT_SOURCE_DESCRIPTOR,
     KVCacheRecvingThread,
@@ -1058,6 +1059,7 @@ class TestCoreFunctionality(unittest.TestCase):
         self.thread.tp_rank = 7
         self.thread.tp_size = 8
         self.vllm_config.parallel_config.data_parallel_rank_local = 1
+        self.vllm_config.parallel_config.data_parallel_index = 1
         self.thread.kv_caches_base_addr["remote_engine"] = {
             6666: [0x3000, 0x5000]
         }
@@ -1117,6 +1119,7 @@ class TestCoreFunctionality(unittest.TestCase):
         mock_register.return_value = contextlib.nullcontext()
         self.thread.tp_rank = 0
         self.vllm_config.parallel_config.data_parallel_rank_local = 0
+        self.vllm_config.parallel_config.data_parallel_index = 0
         self.thread.kv_caches_base_addr["remote_engine"] = {
             6666: [1000, 2000]
         }
@@ -1190,6 +1193,7 @@ class TestCoreFunctionality(unittest.TestCase):
         mock_register.return_value = contextlib.nullcontext()
         self.thread.tp_rank = 0
         self.vllm_config.parallel_config.data_parallel_rank_local = 0
+        self.vllm_config.parallel_config.data_parallel_index = 0
         self.thread.kv_caches_base_addr["remote_engine"] = {
             6666: [0x3000, 0x5000]
         }
@@ -1236,6 +1240,7 @@ class TestCoreFunctionality(unittest.TestCase):
         mock_register.return_value = contextlib.nullcontext()
         self.thread.tp_rank = 0
         self.vllm_config.parallel_config.data_parallel_rank_local = 0
+        self.vllm_config.parallel_config.data_parallel_index = 0
         self.thread.kv_caches_base_addr["remote_engine"] = {
             6666: [2000]
         }
@@ -1385,6 +1390,7 @@ class TestCoreFunctionality(unittest.TestCase):
 
     def test_split_transfer_rejects_wrong_dp_rank(self):
         self.vllm_config.parallel_config.data_parallel_rank_local = 1
+        self.vllm_config.parallel_config.data_parallel_index = 1
         plan = SplitTransferPlan(
             segments=(
                 SplitTransferSegment(0, 0, 0, 0x8000, 1, "cpu"),
@@ -1399,6 +1405,30 @@ class TestCoreFunctionality(unittest.TestCase):
             self.thread._transfer_kv_cache(dict(self.test_req,
                                                 split_plan=plan))
 
+    def test_split_transfer_rejects_wrong_remote_source_identity(self):
+        self.thread.tp_rank = 0
+        self.vllm_config.parallel_config.data_parallel_index = 1
+        self.thread.kv_caches_base_addr["remote_engine"] = {6666: [0x5000]}
+        self.thread.remote_capabilities = {
+            ("remote_engine", 6666): (
+                LIVE_SPLIT_CAPABILITY,
+                LIVE_SPLIT_DP_ROUTING_CAPABILITY,
+            )
+        }
+        self.thread.remote_rank_identities[("remote_engine", 6666)] = (0, 1)
+        plan = SplitTransferPlan(
+            segments=(),
+            group_byte_totals=(0, 0),
+            tp_rank=0,
+            dp_rank=1,
+            requested_groups=(1,),
+            source_tp_rank=0,
+            source_dp_rank=0,
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "split source"):
+            self.thread._transfer_split_destinations(self.test_req, plan)
+
     @patch(
         'vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector.global_te.temporary_registration'
     )
@@ -1407,6 +1437,7 @@ class TestCoreFunctionality(unittest.TestCase):
     ):
         mock_register.return_value = contextlib.nullcontext()
         self.vllm_config.parallel_config.data_parallel_rank_local = 0
+        self.vllm_config.parallel_config.data_parallel_index = 0
         self.thread.kv_caches_base_addr["remote_engine"] = {6666: [0x5000]}
         self.thread.remote_num_blocks["remote_engine"] = {6666: 2}
         self.thread.remote_buffer_sizes["remote_engine"] = {6666: (4096,)}
@@ -1480,6 +1511,7 @@ class TestCoreFunctionality(unittest.TestCase):
 
     def test_split_rejects_zero_or_missing_requested_group(self):
         self.vllm_config.parallel_config.data_parallel_rank_local = 0
+        self.vllm_config.parallel_config.data_parallel_index = 0
         self.thread.local_registered_bases = (0xA000,)
         self.thread.local_buffer_sizes = (4096,)
         self.thread.local_buffer_group_ids = (1,)
@@ -1731,6 +1763,10 @@ class TestMetadataHandling(unittest.TestCase):
             self.assertEqual(
                 self.thread.kv_caches_base_addr["remote_engine"][5555],
                 [0x3000, 0x4000])
+            self.assertEqual(
+                self.thread.remote_rank_identities[("remote_engine", 5555)],
+                (0, 0),
+            )
 
     @patch(
         'vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector.ensure_zmq_send'
@@ -1814,6 +1850,8 @@ class MockVllmConfig:
         self.model_config.use_mla = True
         self.parallel_config.tensor_parallel_size = 2
         self.parallel_config.data_parallel_rank = 0
+        self.parallel_config.data_parallel_index = 0
+        self.parallel_config.data_parallel_size = 1
         self.parallel_config.data_parallel_size_local = 1
         self.parallel_config.pipeline_parallel_size = 1
         self.parallel_config.prefill_context_parallel_size = 1
@@ -2755,6 +2793,170 @@ class TestMooncakeConnectorMetadata(unittest.TestCase):
              (4, 36, 0x3000, 16), (5, 64, 0x7000, 8)],
         )
 
+    def test_dp2_live_split_routes_all_source_destination_pairs(self):
+        for source_dp_rank in range(2):
+            for destination_dp_rank in range(2):
+                with self.subTest(source=source_dp_rank,
+                                  destination=destination_dp_rank):
+                    metadata = MooncakeConnectorMetadata(
+                        live_split_dp_routing_required=True,
+                        live_split_source_dp_size=2,
+                    )
+                    metadata.add_new_req(
+                        "req", [1], 16, {
+                            "remote_block_ids": [9],
+                            "remote_engine_id": "remote",
+                            "remote_request_id": "remote-req",
+                            "remote_host": "host",
+                            "remote_port": 30000,
+                            "remote_dp_rank": source_dp_rank,
+                            "live_split_capabilities": (
+                                LIVE_SPLIT_CAPABILITY,
+                                LIVE_SPLIT_DP_ROUTING_CAPABILITY,
+                            ),
+                            "live_split_transfer_id": "generation-a",
+                            LIVE_SPLIT_SOURCE_DESCRIPTOR: {
+                                "segments": [{
+                                    "group_id": 1,
+                                    "source_buffer_index": 0,
+                                    "source_buffer_base": 0x5000,
+                                    "source_offset": 0,
+                                    "length": 8,
+                                }],
+                                "group_byte_totals": [0, 8],
+                                "tp_rank": 0,
+                                "dp_rank": source_dp_rank,
+                            },
+                        })
+                    metadata.accept_late_split_plans({"req": {
+                        "segments": [{
+                            "group_id": 1,
+                            "destination_address": 0x9000,
+                            "length": 8,
+                            "destination_kind": "npu",
+                        }],
+                        "group_byte_totals": [0, 8],
+                        "tp_rank": 0,
+                        "dp_rank": destination_dp_rank,
+                        "requested_groups": [1],
+                    }}, supported_groups=(1,))
+
+                    plan = metadata.requests["req"].split_plan
+                    self.assertIsNotNone(plan)
+                    self.assertEqual(plan.source_rank, (0, source_dp_rank))
+                    self.assertEqual(
+                        plan.destination_rank, (0, destination_dp_rank))
+
+    def test_dp2_peer_without_routing_capability_uses_persistent_path(self):
+        metadata = MooncakeConnectorMetadata(
+            live_split_dp_routing_required=True,
+            live_split_source_dp_size=2,
+        )
+        metadata.add_new_req(
+            "req", [1], 16, {
+                "remote_block_ids": [9],
+                "remote_engine_id": "remote",
+                "remote_request_id": "remote-req",
+                "remote_host": "host",
+                "remote_port": 30000,
+                "live_split_capabilities": (LIVE_SPLIT_CAPABILITY,),
+                "live_split_transfer_id": "generation-a",
+            })
+
+        request = metadata.requests["req"]
+        self.assertTrue(request.split_negotiated)
+        self.assertTrue(request.split_source_invalid)
+        self.assertIsNone(request.split_plan)
+        self.assertTrue(request.split_fallback)
+        self.assertFalse(metadata.needs_late_split_plans())
+
+        metadata.accept_late_split_plans({"req": {}}, supported_groups=(1,))
+
+        self.assertTrue(request.split_fallback)
+
+    def test_malformed_capability_container_does_not_negotiate_split(self):
+        metadata = MooncakeConnectorMetadata()
+        metadata.add_new_req(
+            "req", [1], 16, {
+                "remote_block_ids": [9],
+                "remote_engine_id": "remote",
+                "remote_request_id": "remote-req",
+                "remote_host": "host",
+                "remote_port": 30000,
+                "live_split_capabilities": None,
+            })
+
+        request = metadata.requests["req"]
+        self.assertFalse(request.split_negotiated)
+        self.assertFalse(request.split_fallback)
+
+    def test_dp2_out_of_range_source_rank_falls_back_before_late_plan(self):
+        metadata = MooncakeConnectorMetadata(
+            live_split_dp_routing_required=True,
+            live_split_source_dp_size=2,
+        )
+        metadata.add_new_req(
+            "req", [1], 16, {
+                "remote_block_ids": [9],
+                "remote_engine_id": "remote",
+                "remote_request_id": "remote-req",
+                "remote_host": "host",
+                "remote_port": 30000,
+                "remote_dp_rank": 2,
+                "live_split_capabilities": (
+                    LIVE_SPLIT_CAPABILITY,
+                    LIVE_SPLIT_DP_ROUTING_CAPABILITY,
+                ),
+                "live_split_transfer_id": "generation-a",
+            })
+
+        request = metadata.requests["req"]
+        self.assertIsNone(request.remote_dp_rank)
+        self.assertTrue(request.split_source_invalid)
+        self.assertTrue(request.split_fallback)
+        self.assertFalse(metadata.needs_late_split_plans())
+
+    def test_eager_source_dp_identity_mismatch_falls_back(self):
+        metadata = MooncakeConnectorMetadata(
+            live_split_dp_routing_required=True,
+            live_split_source_dp_size=2,
+        )
+        metadata.add_new_req(
+            "req", [1], 16, {
+                "remote_block_ids": [9],
+                "remote_engine_id": "remote",
+                "remote_request_id": "remote-req",
+                "remote_host": "host",
+                "remote_port": 30000,
+                "remote_dp_rank": 1,
+                "live_split_capabilities": (
+                    LIVE_SPLIT_CAPABILITY,
+                    LIVE_SPLIT_DP_ROUTING_CAPABILITY,
+                ),
+                "live_split_transfer_id": "generation-a",
+                LIVE_SPLIT_CAPABILITY: {
+                    "segments": [{
+                        "group_id": 1,
+                        "source_buffer_index": 0,
+                        "source_offset": 0,
+                        "destination_address": 0x9000,
+                        "length": 8,
+                        "destination_kind": "npu",
+                    }],
+                    "group_byte_totals": [0, 8],
+                    "tp_rank": 0,
+                    "dp_rank": 1,
+                    "source_tp_rank": 0,
+                    "source_dp_rank": 0,
+                    "requested_groups": [1],
+                },
+            })
+
+        request = metadata.requests["req"]
+        self.assertIsNone(request.split_plan)
+        self.assertTrue(request.split_fallback)
+        self.assertFalse(metadata.needs_late_split_plans())
+
     def test_source_descriptor_rank_mismatch_falls_back(self):
         metadata = MooncakeConnectorMetadata()
         params = {
@@ -3618,6 +3820,11 @@ class TestMooncakeConnectorScheduler(unittest.TestCase):
         self.assertTrue(delay_free)
         self.assertEqual(params[LIVE_SPLIT_SOURCE_DESCRIPTOR], source)
         self.assertIsNot(params[LIVE_SPLIT_SOURCE_DESCRIPTOR], source)
+        self.assertIn(
+            LIVE_SPLIT_DP_ROUTING_CAPABILITY,
+            params["live_split_capabilities"],
+        )
+        self.assertEqual(params["remote_dp_rank"], 0)
         transfer_id = params["live_split_transfer_id"]
         self.assertTrue(transfer_id)
 
@@ -3643,6 +3850,13 @@ class TestMooncakeConnectorScheduler(unittest.TestCase):
         self.assertNotIn("live_split_capabilities", params)
         self.assertNotIn("live_split_transfer_id", params)
         self.assertNotIn("req1", self.scheduler._split_reqs_need_send)
+
+    def test_live_split_topology_supports_matching_dp2(self):
+        self.scheduler._live_prefill_dp_size = 2
+        self.scheduler._live_decode_dp_size = 2
+
+        self.assertTrue(self.scheduler._live_split_topology_supported())
+        self.assertTrue(self.scheduler._live_split_dp_routing_required())
 
     def test_decoder_local_topology_rejects_live_split(self):
         self.scheduler.pp_size = 2
@@ -3984,6 +4198,19 @@ class TestMooncakeConnectorWorker(unittest.TestCase):
         for p in self.patches:
             p.stop()  # type: ignore
 
+    def test_worker_uses_global_dp_identity_and_local_device_count(self):
+        self.vllm_config.parallel_config.data_parallel_rank_local = 0
+        self.vllm_config.parallel_config.data_parallel_index = 1
+        self.vllm_config.parallel_config.data_parallel_size_local = 1
+        self.vllm_config.parallel_config.data_parallel_size = 2
+
+        worker = MooncakeConnectorWorker(self.vllm_config, self.engine_id)
+
+        self.assertEqual(worker.dp_rank, 1)
+        self.assertEqual(worker.dp_size, 1)
+        self.assertEqual(worker.max_device_id, 2)
+        self.assertEqual(worker.side_channel_port, 5002)
+
     def test_register_kv_caches_producer(self):
         worker = MooncakeConnectorWorker(self.vllm_config, self.engine_id)
         worker.register_kv_caches(self.kv_caches)
@@ -4156,6 +4383,22 @@ class TestMooncakeConnectorWorker(unittest.TestCase):
         with self.assertRaisesRegex(
                 ValueError,
                 r"prefill\.tp_size \(8\).*--tensor-parallel-size \(2\)"):
+            MooncakeConnectorWorker(self.vllm_config, self.engine_id)
+
+    def test_local_parallel_config_validates_consumer_decode_dp(self):
+        self.vllm_config.kv_transfer_config.kv_role = "kv_consumer"
+        self.vllm_config.parallel_config.data_parallel_size = 2
+        self.vllm_config.kv_transfer_config.get_from_extra_config.side_effect = (
+            lambda key, default: {
+                "prefill": {"tp_size": 2, "dp_size": 2, "pp_size": 1},
+                "decode": {"tp_size": 2, "dp_size": 1, "pp_size": 1},
+            }.get(key, default)
+        )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            r"decode\.dp_size \(1\).*--data-parallel-size \(2\)",
+        ):
             MooncakeConnectorWorker(self.vllm_config, self.engine_id)
 
     def test_local_parallel_config_both_accepts_matching_local_side(self):
