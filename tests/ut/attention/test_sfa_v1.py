@@ -1393,14 +1393,22 @@ class TestStagedSFAGraphPoc(TestBase):
         )
 
     @staticmethod
-    def _make_pre_outputs(token_rows: int = 1, request_rows: int = 1):
+    def _make_pre_outputs(
+        token_rows: int = 1,
+        request_rows: int = 1,
+        scratch_capacity: int = 4,
+    ):
         return (
             torch.empty(token_rows, 2, 2),
             torch.empty(token_rows, 2, 2),
             torch.empty(token_rows, 1, 4, dtype=torch.int32),
-            torch.empty(request_rows, 4, dtype=torch.int32),
+            torch.empty(
+                request_rows,
+                scratch_capacity,
+                dtype=torch.int32,
+            ),
             torch.empty(request_rows, dtype=torch.int32),
-            torch.empty(request_rows, 4, dtype=torch.long),
+            torch.empty(request_rows, scratch_capacity, dtype=torch.long),
         )
 
     @staticmethod
@@ -1711,6 +1719,9 @@ class TestStagedSFAGraphPoc(TestBase):
                     return_value=self._make_pre_outputs(
                         token_capacity,
                         request_capacity,
+                        scratch_capacity=(
+                            query_width * impl.index_topk
+                        ),
                     )
                 )
                 context = SimpleNamespace(
