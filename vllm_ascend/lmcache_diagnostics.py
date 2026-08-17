@@ -24,6 +24,7 @@ class NPUContentDiagnosticCallbacks:
     fingerprint_compact_group1: DiagnosticCallback
     register_group1_source: DiagnosticCallback
     queue_group1_first_consume: DiagnosticCallback
+    queue_cache_tail: DiagnosticCallback
     queue_selected_topk: DiagnosticCallback
 
 
@@ -78,6 +79,12 @@ def queue_group1_first_consume(**kwargs: Any) -> None:
     callbacks = _CALLBACKS
     if callbacks is not None:
         callbacks.queue_group1_first_consume(**kwargs)
+
+
+def queue_cache_tail_fingerprint(**kwargs: Any) -> None:
+    callbacks = _CALLBACKS
+    if callbacks is not None:
+        callbacks.queue_cache_tail(**kwargs)
 
 
 def queue_selected_topk_fingerprint(**kwargs: Any) -> None:

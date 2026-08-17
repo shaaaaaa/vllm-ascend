@@ -25,6 +25,7 @@ def test_bridge_is_disabled_and_noop_by_default() -> None:
     bridge.flush_deferred_diagnostics()
     bridge.register_group1_source_fingerprint("request", {})
     bridge.queue_group1_first_consume(value="unused")
+    bridge.queue_cache_tail_fingerprint(value="unused")
     bridge.queue_selected_topk_fingerprint(value="unused")
 
 
@@ -45,6 +46,7 @@ def test_installed_callback_bundle_routes_every_operation() -> None:
             fingerprint_compact_group1=callback("fingerprint", "digest"),
             register_group1_source=callback("register"),
             queue_group1_first_consume=callback("consume"),
+            queue_cache_tail=callback("tail"),
             queue_selected_topk=callback("topk"),
         )
     )
@@ -54,6 +56,7 @@ def test_installed_callback_bundle_routes_every_operation() -> None:
     assert bridge.fingerprint_compact_group1(req_id="request") == "digest"
     bridge.register_group1_source_fingerprint("request", {"hash": "digest"})
     bridge.queue_group1_first_consume(req_ids=["request"])
+    bridge.queue_cache_tail_fingerprint(req_ids=["request"])
     bridge.queue_selected_topk_fingerprint(req_ids=["request"])
     bridge.flush_deferred_diagnostics()
 
@@ -62,6 +65,7 @@ def test_installed_callback_bundle_routes_every_operation() -> None:
         "fingerprint",
         "register",
         "consume",
+        "tail",
         "topk",
         "flush",
     ]
@@ -139,3 +143,118 @@ def test_live_p2p_first_consume_diagnostic_is_not_persistent_load_gated() -> Non
         "decode_valid_rows_all",
         "group1_connector_wait_called",
     } <= keyword_names
+
+
+def test_cache_boundary_diagnostics_cover_both_groups_and_scatter_sides() -> None:
+    repository_root = Path(__file__).resolve().parents[2]
+    tree = ast.parse(
+        (repository_root / "vllm_ascend/attention/sfa_v1.py").read_text(
+            encoding="utf-8"
+        )
+    )
+    calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "queue_cache_tail_fingerprint"
+    ]
+    assert len(calls) == 4
+    stages = {
+        ast.literal_eval(keyword.value)
+        for call in calls
+        for keyword in call.keywords
+        if keyword.arg == "stage"
+    }
+    assert stages == {
+        "group0_after_load_before_current_scatter",
+        "group0_after_current_scatter",
+        "group1_after_load_before_current_scatter",
+        "group1_after_current_scatter",
+    }
+    for call in calls:
+        keyword_names = {keyword.arg for keyword in call.keywords}
+        assert {
+            "req_ids",
+            "layer_name",
+            "kv_group",
+            "stage",
+            "cache_parts",
+            "slot_mapping",
+            "query_start_loc_cpu",
+            "seq_lens_cpu",
+            "num_actual_tokens",
+            "attn_state",
+        } <= keyword_names
+
+
+def test_group1_scatter_excludes_graph_and_speculative_padding() -> None:
+    """Group 1 must obey the same real-row frontier as Group 0."""
+    repository_root = Path(__file__).resolve().parents[2]
+    tree = ast.parse(
+        (repository_root / "vllm_ascend/attention/sfa_v1.py").read_text(
+            encoding="utf-8"
+        )
+    )
+    scatter_calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "npu_scatter_nd_update_"
+        and node.args
+        and "kv_cache[" in ast.unparse(node.args[0])
+    ]
+    group1_calls = [
+        call
+        for call in scatter_calls
+        if ast.unparse(call.args[0]).startswith("kv_cache[2]")
+        or ast.unparse(call.args[0]).startswith("kv_cache[3]")
+    ]
+    assert len(group1_calls) == 2
+    for call in group1_calls:
+        assert len(call.args) == 3
+        assert "[:actual_tokens]" in ast.unparse(call.args[1])
+        assert "[:actual_tokens]" in ast.unparse(call.args[2])
+
+
+def test_two_group_indexer_never_falls_back_to_latent_addresses() -> None:
+    repository_root = Path(__file__).resolve().parents[2]
+    tree = ast.parse(
+        (repository_root / "vllm_ascend/attention/sfa_v1.py").read_text(
+            encoding="utf-8"
+        )
+    )
+    impl_class = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "AscendSFAImpl"
+    )
+    functions = {
+        node.name: node
+        for node in impl_class.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+
+    forward = functions["forward"]
+    forward_guards = [
+        node
+        for node in ast.walk(forward)
+        if isinstance(node, ast.If)
+        and "index_lmcache_enabled" in ast.unparse(node.test)
+        and "indexer_slot_mapping" in ast.unparse(node.test)
+        and "indexer_block_table" in ast.unparse(node.test)
+        and any(isinstance(child, ast.Raise) for child in ast.walk(node))
+    ]
+    assert len(forward_guards) == 1
+
+    post_process = functions["indexer_select_post_process"]
+    table_guards = [
+        node
+        for node in ast.walk(post_process)
+        if isinstance(node, ast.If)
+        and "_dsa_index_lmcache_enabled()" in ast.unparse(node.test)
+        and "indexer_block_table" in ast.unparse(node.test)
+        and any(isinstance(child, ast.Raise) for child in ast.walk(node))
+    ]
+    assert len(table_guards) == 1

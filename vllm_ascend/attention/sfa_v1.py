@@ -91,6 +91,7 @@ from vllm_ascend.distributed.kv_transfer.sparse_offload.resident_sorted_cache im
 from vllm_ascend.distributed.utils import all_gather_async
 from vllm_ascend.lmcache_diagnostics import (
     npu_content_diagnostics_enabled,
+    queue_cache_tail_fingerprint,
     queue_group1_first_consume,
     queue_selected_topk_fingerprint,
 )
@@ -898,6 +899,7 @@ class AscendSFAMetadata:
 
     # For logging.
     num_input_tokens: int = 0  # Number of tokens including padding.
+    query_start_loc_cpu: Any = None
     # The dimension of the attention heads
     head_dim: int | None = None
     attn_mask: torch.Tensor = None
@@ -1610,6 +1612,9 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             cum_query_lens=cum_query_lens,
             seq_lens=seq_lens,
             seq_lens_cpu=seq_lens_cpu,
+            query_start_loc_cpu=common_attn_metadata.query_start_loc_cpu[
+                : num_reqs + 1
+            ],
             slot_mapping=slot_mapping,
             head_dim=self.model_config.get_head_size(),
             attn_mask=self.attn_mask_builder.get_attention_mask(self.model_config),
@@ -2185,6 +2190,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         kv_cache: tuple,
         slots: torch.Tensor,
         attn_metadata: M,
+        diagnostic_layer_name: str | None = None,
     ):
         B = kv_no_split.shape[0]
         N = self.num_kv_heads
@@ -2192,6 +2198,26 @@ class AscendSFAImpl(MLAAttentionImpl):
         # npu_kv_rmsnorm_rope_cache needs [B, N, S, D]
         kv_no_split = kv_no_split.view(B, N, S, self.kv_lora_rank + self.qk_rope_head_dim)
         cache_mode = "PA"
+
+        diagnose_cache_tail = (
+            attn_metadata is not None
+            and diagnostic_layer_name is not None
+            and not self.enable_dsa_cp
+            and bool(attn_metadata.req_ids)
+        )
+        if diagnose_cache_tail:
+            queue_cache_tail_fingerprint(
+                req_ids=attn_metadata.req_ids,
+                layer_name=diagnostic_layer_name,
+                kv_group=0,
+                stage="group0_after_load_before_current_scatter",
+                cache_parts={"nope": kv_cache[0], "pe": kv_cache[1]},
+                slot_mapping=slots,
+                query_start_loc_cpu=attn_metadata.query_start_loc_cpu,
+                seq_lens_cpu=attn_metadata.seq_lens_cpu,
+                num_actual_tokens=attn_metadata.num_actual_tokens,
+                attn_state=attn_metadata.attn_state,
+            )
 
         if self.enable_dsa_cp:
             _, _, k_pe, k_nope = torch_npu.npu_kv_rmsnorm_rope_cache(
@@ -2225,6 +2251,20 @@ class AscendSFAImpl(MLAAttentionImpl):
                 cache_mode=cache_mode,
                 is_output_kv=True,
             )
+            if diagnose_cache_tail:
+                queue_cache_tail_fingerprint(
+                    req_ids=attn_metadata.req_ids,
+                    layer_name=diagnostic_layer_name,
+                    kv_group=0,
+                    stage="group0_after_current_scatter",
+                    cache_parts={"nope": kv_cache[0], "pe": kv_cache[1]},
+                    produced_parts={"nope": k_nope, "pe": k_pe},
+                    slot_mapping=slots,
+                    query_start_loc_cpu=attn_metadata.query_start_loc_cpu,
+                    seq_lens_cpu=attn_metadata.seq_lens_cpu,
+                    num_actual_tokens=attn_metadata.num_actual_tokens,
+                    attn_state=attn_metadata.attn_state,
+                )
             return k_pe, k_nope
 
     # Return `ql_nope`, `q_pe`
@@ -2379,6 +2419,16 @@ class AscendSFAImpl(MLAAttentionImpl):
             indexer_block_table = indexer_block_table_override
         else:
             assert attn_metadata is not None
+            if (
+                self.dsa_offload_unbundle
+                and _dsa_index_lmcache_enabled()
+                and attn_metadata.indexer_block_table is None
+            ):
+                raise RuntimeError(
+                    "Unbundled two-group DSA top-k selection has no indexer "
+                    "block table; refusing to read Group 1 through the latent "
+                    "block table."
+                )
             indexer_block_table = (
                 attn_metadata.indexer_block_table
                 if attn_metadata.indexer_block_table is not None
@@ -3942,10 +3992,29 @@ class AscendSFAImpl(MLAAttentionImpl):
         cos = attn_metadata.cos
         sin = attn_metadata.sin
         slot_mapping = attn_metadata.slot_mapping
-        # DSA two-group mode: the indexer cache write must use the indexer
-        # group's own slots; falls back to the shared slots in single-group mode.
+        # Once LMCache exposes an unbundled DSA index group, its block ids are
+        # independent from the latent group's ids.  Falling back to latent
+        # mappings here writes Group-1 index rows into the wrong address space
+        # and can silently corrupt later prefix hits.
+        if index_lmcache_enabled and (
+            attn_metadata.indexer_slot_mapping is None
+            or attn_metadata.indexer_block_table is None
+        ):
+            raise RuntimeError(
+                "Unbundled two-group DSA requires both indexer_slot_mapping "
+                "and indexer_block_table before cache write/read; refusing "
+                f"the latent-address fallback for layer {layer_name}."
+            )
+        # Legacy single-group unbundled layouts intentionally share latent
+        # block ids and therefore retain their original fallback.
         idx_slot_mapping = (
-            attn_metadata.indexer_slot_mapping if attn_metadata.indexer_slot_mapping is not None else slot_mapping
+            attn_metadata.indexer_slot_mapping
+            if attn_metadata.indexer_slot_mapping is not None
+            else slot_mapping
+        )
+        content_diagnostics_enabled = (
+            bool(attn_metadata.req_ids)
+            and npu_content_diagnostics_enabled()
         )
         slot_mapping_cp = None
         if self.enable_dsa_cp:
@@ -4008,7 +4077,17 @@ class AscendSFAImpl(MLAAttentionImpl):
 
             if self.enable_dsa_cp:
                 assert slot_mapping_cp is not None
-                k_pe, k_nope = self.exec_kv(kv_no_split, cos, sin, kv_cache, slot_mapping_cp, attn_metadata)
+                k_pe, k_nope = self.exec_kv(
+                    kv_no_split,
+                    cos,
+                    sin,
+                    kv_cache,
+                    slot_mapping_cp,
+                    attn_metadata,
+                    diagnostic_layer_name=(
+                        layer_name if content_diagnostics_enabled else None
+                    ),
+                )
             else:
                 _fc = get_forward_context()
                 _dsa_mgr_xkv = getattr(_fc, "dsa_offload_manager", None)
@@ -4029,10 +4108,34 @@ class AscendSFAImpl(MLAAttentionImpl):
                             decode=attn_metadata.attn_state == AscendAttentionState.DecodeOnly,
                         )
                     with _dsa_prof.section("exec_kv_op"):
-                        k_pe, k_nope = self.exec_kv(kv_no_split, cos, sin, (_pknope, _pkpe), _pslots, attn_metadata)
+                        k_pe, k_nope = self.exec_kv(
+                            kv_no_split,
+                            cos,
+                            sin,
+                            (_pknope, _pkpe),
+                            _pslots,
+                            attn_metadata,
+                            diagnostic_layer_name=(
+                                layer_name
+                                if content_diagnostics_enabled
+                                else None
+                            ),
+                        )
                 else:
                     with _dsa_prof.section("exec_kv"):
-                        k_pe, k_nope = self.exec_kv(kv_no_split, cos, sin, kv_cache, slot_mapping, attn_metadata)
+                        k_pe, k_nope = self.exec_kv(
+                            kv_no_split,
+                            cos,
+                            sin,
+                            kv_cache,
+                            slot_mapping,
+                            attn_metadata,
+                            diagnostic_layer_name=(
+                                layer_name
+                                if content_diagnostics_enabled
+                                else None
+                            ),
+                        )
 
             if self.enable_dsa_cp:
                 assert k_pe is not None
@@ -4114,10 +4217,6 @@ class AscendSFAImpl(MLAAttentionImpl):
 
             k_li = self._get_full_kv(k_li, attn_metadata)
 
-        content_diagnostics_enabled = (
-            bool(attn_metadata.req_ids)
-            and npu_content_diagnostics_enabled()
-        )
         if kv_cache is not None:
             if index_lmcache_enabled:
                 # A cold shared-cache decode needs prompt index rows before
@@ -4146,22 +4245,64 @@ class AscendSFAImpl(MLAAttentionImpl):
                     ),
                     group1_connector_wait_called=index_lmcache_enabled,
                 )
+                group1_cache_parts = {"index": kv_cache[2]}
+                group1_produced_parts = {"index": k_li}
+                if self.use_sparse_c8_indexer:
+                    assert len(kv_cache) == 4
+                    assert k_li_scale is not None
+                    group1_cache_parts["scale"] = kv_cache[3]
+                    group1_produced_parts["scale"] = k_li_scale
+                queue_cache_tail_fingerprint(
+                    req_ids=attn_metadata.req_ids,
+                    layer_name=index_layer_name or layer_name,
+                    kv_group=1,
+                    stage="group1_after_load_before_current_scatter",
+                    cache_parts=group1_cache_parts,
+                    produced_parts=group1_produced_parts,
+                    slot_mapping=idx_slot_mapping,
+                    query_start_loc_cpu=attn_metadata.query_start_loc_cpu,
+                    seq_lens_cpu=attn_metadata.seq_lens_cpu,
+                    num_actual_tokens=attn_metadata.num_actual_tokens,
+                    attn_state=attn_metadata.attn_state,
+                )
 
             if self.is_kv_producer:
                 attn_metadata.reshape_cache_event = torch.npu.Event()
+            # Match the latent-group write above: graph/speculative batches
+            # may pad both ``k_li`` and ``indexer_slot_mapping`` to
+            # ``num_input_tokens``.  Padding slots are not cache ownership and
+            # may be -1 or stale graph-buffer values, so they must never reach
+            # the persistent model-visible indexer cache.
+            actual_tokens = attn_metadata.num_actual_tokens
             torch_npu.npu_scatter_nd_update_(
-                kv_cache[2].view(-1, k_li.shape[-1]), idx_slot_mapping.view(-1, 1), k_li.view(-1, k_li.shape[-1])
+                kv_cache[2].view(-1, k_li.shape[-1]),
+                idx_slot_mapping[:actual_tokens].view(-1, 1),
+                k_li[:actual_tokens].view(-1, k_li.shape[-1]),
             )  # b, s, n, d
             if self.use_sparse_c8_indexer:
                 assert len(kv_cache) == 4
                 assert k_li_scale is not None
                 torch_npu.npu_scatter_nd_update_(
                     kv_cache[3].view(-1, k_li_scale.shape[-1]),
-                    idx_slot_mapping.view(-1, 1),
-                    k_li_scale.view(-1, k_li_scale.shape[-1]),
+                    idx_slot_mapping[:actual_tokens].view(-1, 1),
+                    k_li_scale[:actual_tokens].view(-1, k_li_scale.shape[-1]),
                 )
             if self.is_kv_producer:
                 attn_metadata.reshape_cache_event.record()
+            if content_diagnostics_enabled:
+                queue_cache_tail_fingerprint(
+                    req_ids=attn_metadata.req_ids,
+                    layer_name=index_layer_name or layer_name,
+                    kv_group=1,
+                    stage="group1_after_current_scatter",
+                    cache_parts=group1_cache_parts,
+                    produced_parts=group1_produced_parts,
+                    slot_mapping=idx_slot_mapping,
+                    query_start_loc_cpu=attn_metadata.query_start_loc_cpu,
+                    seq_lens_cpu=attn_metadata.seq_lens_cpu,
+                    num_actual_tokens=attn_metadata.num_actual_tokens,
+                    attn_state=attn_metadata.attn_state,
+                )
 
         with _dsa_prof.section("indexer"):
             topk_indices = self.indexer_select_post_process(

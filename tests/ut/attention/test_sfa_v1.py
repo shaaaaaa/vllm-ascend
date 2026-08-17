@@ -2679,6 +2679,7 @@ class TestAscendSFAMetadata(TestBase):
         self.assertIs(metadata.sin, sin)
         self.assertIs(metadata.cos, cos)
         self.assertEqual(metadata.num_input_tokens, num_input_tokens)
+        self.assertIsNone(metadata.query_start_loc_cpu)
         self.assertIs(metadata.head_dim, head_dim)
         self.assertIs(metadata.attn_mask, attn_mask)
         self.assertEqual(metadata.attn_state, attn_state)
