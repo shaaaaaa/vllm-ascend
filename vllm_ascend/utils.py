@@ -115,6 +115,9 @@ class StagedSFARouteReason(str, Enum):
     FRONTIER_TOO_SHORT = "frontier_too_short"
     FRONTIER_COUNT_MISMATCH = "frontier_count_mismatch"
     DUPLICATE_SPARSE_LOAD = "duplicate_sparse_load"
+    DUPLICATE_MAIN_METADATA = "duplicate_main_metadata"
+    INVALID_FRONTIER = "invalid_frontier"
+    DENSE_PREFIX_NOT_RESIDENT = "dense_prefix_not_resident"
     COLD_COMPACT_LAYOUT = "cold_compact_layout"
     RUNNER_LAYER_MISMATCH = "runner_layer_mismatch"
 

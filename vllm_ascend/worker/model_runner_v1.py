@@ -1953,6 +1953,11 @@ class NPUModelRunner(GPUModelRunner):
             # __enter__. Sample committed frontiers only after that point so the
             # first forward that can retrieve a new window also forces a remap
             # diagnostic for the same window.
+            if (
+                self._staged_sfa_graph_capture_sizes
+                and staged_sfa_graph_key is None
+            ):
+                self._synchronize_staged_sfa_capture_unsafe_loads()
             if diag_enabled and dsa_req_ids is not None:
                 decode_requests = scheduled_decode_requests(
                     dsa_req_ids,
@@ -3226,13 +3231,9 @@ class NPUModelRunner(GPUModelRunner):
             )
         if not self._staged_sfa_graph_capture_sizes:
             return native(StagedSFARouteReason.NOT_CONFIGURED)
-        if getattr(self, "calculate_kv_scales", False):
-            return native(StagedSFARouteReason.RUNTIME_MODE)
         query_width = 1 + int(
             getattr(self.speculative_config, "num_speculative_tokens", 0)
         )
-        if getattr(self.vllm_config, "lora_config", None) is not None:
-            return native(StagedSFARouteReason.LORA)
         expected_state = (
             AscendAttentionState.DecodeOnly
             if query_width == 1
@@ -3240,6 +3241,25 @@ class NPUModelRunner(GPUModelRunner):
         )
         if self.attn_state != expected_state:
             return native(StagedSFARouteReason.NOT_DECODE)
+        metadata_reason, frontiers, cold_resumes = (
+            staged_sfa_metadata_sparse_route(
+                kv_connector_metadata,
+                request_ids,
+            )
+        )
+        if metadata_reason not in (
+            StagedSFARouteReason.ELIGIBLE,
+            StagedSFARouteReason.DENSE_PREFIX_HIT,
+            StagedSFARouteReason.MIXED_CONNECTOR_LOAD,
+        ):
+            return StagedSFARouteDecision(
+                StagedSFARouteAction.FATAL,
+                metadata_reason,
+            )
+        if getattr(self, "calculate_kv_scales", False):
+            return native(StagedSFARouteReason.RUNTIME_MODE)
+        if getattr(self.vllm_config, "lora_config", None) is not None:
+            return native(StagedSFARouteReason.LORA)
         if has_cascade_attention:
             return native(StagedSFARouteReason.CASCADE)
         batch_size = int(num_tokens_unpadded)
@@ -3256,22 +3276,6 @@ class NPUModelRunner(GPUModelRunner):
             scheduled == query_width
         ):
             return native(StagedSFARouteReason.NON_Q1)
-        metadata_reason, frontiers, cold_resumes = (
-            staged_sfa_metadata_sparse_route(
-                kv_connector_metadata,
-                request_ids,
-            )
-        )
-        if metadata_reason in (
-            StagedSFARouteReason.DENSE_PREFIX_HIT,
-            StagedSFARouteReason.MIXED_CONNECTOR_LOAD,
-        ):
-            return native(metadata_reason)
-        if metadata_reason != StagedSFARouteReason.ELIGIBLE:
-            return StagedSFARouteDecision(
-                StagedSFARouteAction.FATAL,
-                metadata_reason,
-            )
         if len(frontiers) != num_reqs:
             return StagedSFARouteDecision(
                 StagedSFARouteAction.FATAL,
@@ -3306,10 +3310,70 @@ class NPUModelRunner(GPUModelRunner):
             )
         return StagedSFARouteDecision(
             StagedSFARouteAction.STAGED,
-            StagedSFARouteReason.ELIGIBLE,
+            metadata_reason,
             frontiers=frontiers,
             cold_compact_resumes=cold_resumes,
         )
+
+    def _synchronize_staged_sfa_capture_unsafe_loads(self) -> None:
+        """Keep background cold loads out of serving-time graph capture."""
+        if not has_kv_transfer_group():
+            return
+        connector = get_kv_transfer_group()
+        synchronize = getattr(
+            connector,
+            "synchronize_staged_sfa_capture_unsafe_loads",
+            None,
+        )
+        local_error: BaseException | None = None
+        try:
+            if callable(synchronize):
+                synchronize()
+            elif bool(
+                getattr(
+                    connector,
+                    "supports_dsa_compact_external_load",
+                    False,
+                )
+            ):
+                local_error = RuntimeError(
+                    "The staged SFA native fallback requires an LMCache "
+                    "connector with a capture-unsafe load barrier. Update "
+                    "LMCache before enabling asynchronous DSA cold compact "
+                    "loads."
+                )
+        except BaseException as exc:
+            local_error = exc
+
+        cpu_groups = []
+        tp_group = get_tp_group()
+        if tp_group.world_size > 1:
+            cpu_groups.append(tp_group.cpu_group)
+        # Internal-DP replicas have independent scheduler and connector flow;
+        # idle replicas in _dummy_run do not enter this conditional barrier.
+        if not cpu_groups:
+            if local_error is not None:
+                raise RuntimeError(
+                    "The staged SFA capture-unsafe load barrier failed"
+                ) from local_error
+            return
+
+        failure = torch.tensor(
+            [int(local_error is not None)],
+            dtype=torch.int32,
+        )
+        for cpu_group in cpu_groups:
+            dist.all_reduce(failure, op=dist.ReduceOp.MAX, group=cpu_group)
+        if int(failure.item()) != 0:
+            if local_error is not None:
+                raise RuntimeError(
+                    "The staged SFA capture-unsafe load barrier failed "
+                    "on this worker"
+                ) from local_error
+            raise RuntimeError(
+                "The staged SFA capture-unsafe load barrier failed on a peer "
+                "worker"
+            )
 
     def _staged_sfa_live_route(
         self,

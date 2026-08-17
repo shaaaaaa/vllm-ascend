@@ -576,6 +576,134 @@ class TestStagedSFADummyBatch(unittest.TestCase):
                 runner._staged_sfa_dummy_batch_size(**kwargs)
             )
 
+    def test_native_execution_waits_for_capture_unsafe_connector_loads(self):
+        runner = self._build_runner()
+        barrier = MagicMock()
+        connector = SimpleNamespace(
+            synchronize_staged_sfa_capture_unsafe_loads=barrier,
+        )
+        with (
+            patch.object(
+                model_runner_module,
+                "has_kv_transfer_group",
+                return_value=True,
+            ),
+            patch.object(
+                model_runner_module,
+                "get_kv_transfer_group",
+                return_value=connector,
+            ),
+            patch.object(
+                model_runner_module,
+                "get_tp_group",
+                return_value=SimpleNamespace(world_size=1),
+            ),
+        ):
+            runner._synchronize_staged_sfa_capture_unsafe_loads()
+
+        barrier.assert_called_once_with()
+
+    def test_native_load_barrier_does_not_collect_across_internal_dp(self):
+        runner = self._build_runner()
+        runner.parallel_config.data_parallel_size = 2
+        barrier = MagicMock()
+        connector = SimpleNamespace(
+            synchronize_staged_sfa_capture_unsafe_loads=barrier,
+        )
+        with (
+            patch.object(
+                model_runner_module,
+                "has_kv_transfer_group",
+                return_value=True,
+            ),
+            patch.object(
+                model_runner_module,
+                "get_kv_transfer_group",
+                return_value=connector,
+            ),
+            patch.object(
+                model_runner_module,
+                "get_tp_group",
+                return_value=SimpleNamespace(world_size=1),
+            ),
+            patch.object(model_runner_module, "get_dp_group") as get_dp_group,
+            patch.object(model_runner_module.dist, "all_reduce") as all_reduce,
+        ):
+            runner._synchronize_staged_sfa_capture_unsafe_loads()
+
+        barrier.assert_called_once_with()
+        get_dp_group.assert_not_called()
+        all_reduce.assert_not_called()
+
+    def test_native_execution_fails_closed_without_load_barrier(self):
+        runner = self._build_runner()
+        connector = SimpleNamespace(
+            supports_dsa_compact_external_load=True,
+        )
+        with (
+            patch.object(
+                model_runner_module,
+                "has_kv_transfer_group",
+                return_value=True,
+            ),
+            patch.object(
+                model_runner_module,
+                "get_kv_transfer_group",
+                return_value=connector,
+            ),
+            patch.object(
+                model_runner_module,
+                "get_tp_group",
+                return_value=SimpleNamespace(world_size=1),
+            ),
+            self.assertRaisesRegex(
+                RuntimeError,
+                "capture-unsafe load barrier failed",
+            ),
+        ):
+            runner._synchronize_staged_sfa_capture_unsafe_loads()
+
+    def test_native_execution_propagates_peer_load_barrier_failure(self):
+        runner = self._build_runner()
+        barrier = MagicMock()
+        cpu_group = object()
+
+        def report_peer_failure(failure, **_kwargs):
+            failure.fill_(1)
+
+        with (
+            patch.object(
+                model_runner_module,
+                "has_kv_transfer_group",
+                return_value=True,
+            ),
+            patch.object(
+                model_runner_module,
+                "get_kv_transfer_group",
+                return_value=SimpleNamespace(
+                    synchronize_staged_sfa_capture_unsafe_loads=barrier,
+                ),
+            ),
+            patch.object(
+                model_runner_module,
+                "get_tp_group",
+                return_value=SimpleNamespace(
+                    world_size=2,
+                    cpu_group=cpu_group,
+                ),
+            ),
+            patch.object(
+                model_runner_module.dist,
+                "all_reduce",
+                side_effect=report_peer_failure,
+            ) as all_reduce,
+            self.assertRaisesRegex(RuntimeError, "peer worker"),
+        ):
+            runner._synchronize_staged_sfa_capture_unsafe_loads()
+
+        barrier.assert_called_once_with()
+        self.assertIs(all_reduce.call_args.kwargs["group"], cpu_group)
+
     def test_dp_sync_agrees_route_in_existing_collective(self):
         runner = self._build_runner()
         runner.dp_size = 2
@@ -774,6 +902,8 @@ class TestStagedSFADummyBatch(unittest.TestCase):
                     SimpleNamespace(
                         req_id=req_id,
                         is_sparse_decode=True,
+                        dsa_current_released_frontier=4096,
+                        dsa_nonresident_frontier=4096,
                         load_spec=SimpleNamespace(
                             can_load=True,
                             lmcache_cached_tokens=4096,
@@ -849,6 +979,8 @@ class TestStagedSFADummyBatch(unittest.TestCase):
                             SimpleNamespace(
                                 req_id=req_id,
                                 is_sparse_decode=False,
+                                dsa_current_released_frontier=0,
+                                dsa_nonresident_frontier=0,
                                 load_spec=SimpleNamespace(can_load=True),
                             )
                             for req_id in request_ids
@@ -861,6 +993,12 @@ class TestStagedSFADummyBatch(unittest.TestCase):
                             SimpleNamespace(
                                 req_id=req_id,
                                 is_sparse_decode=index >= 2,
+                                dsa_current_released_frontier=(
+                                    4096 if index >= 2 else 0
+                                ),
+                                dsa_nonresident_frontier=(
+                                    4096 if index >= 2 else 0
+                                ),
                                 load_spec=SimpleNamespace(
                                     can_load=True,
                                     lmcache_cached_tokens=4096,
@@ -876,6 +1014,8 @@ class TestStagedSFADummyBatch(unittest.TestCase):
                             SimpleNamespace(
                                 req_id=req_id,
                                 is_sparse_decode=True,
+                                dsa_current_released_frontier=0,
+                                dsa_nonresident_frontier=0,
                                 load_spec=SimpleNamespace(
                                     can_load=True,
                                     lmcache_cached_tokens=1024,
@@ -895,7 +1035,14 @@ class TestStagedSFADummyBatch(unittest.TestCase):
                         (
                             StagedSFARouteAction.FATAL
                             if name == "short_frontier"
-                            else StagedSFARouteAction.SAFE_NATIVE
+                            else (
+                                StagedSFARouteAction.STAGED
+                                if name in (
+                                    "dense_prefix_hit",
+                                    "mixed_connector_load",
+                                )
+                                else StagedSFARouteAction.SAFE_NATIVE
+                            )
                         ),
                     )
                     if name == "dense_prefix_hit":
@@ -908,6 +1055,7 @@ class TestStagedSFADummyBatch(unittest.TestCase):
                             route.reason,
                             StagedSFARouteReason.MIXED_CONNECTOR_LOAD,
                         )
+                        self.assertEqual(route.frontiers, (0, 0, 4096, 4096))
                     elif name == "short_frontier":
                         self.assertEqual(
                             route.reason,
@@ -968,6 +1116,8 @@ class TestStagedSFADummyBatch(unittest.TestCase):
                 SimpleNamespace(
                     req_id="cold",
                     is_sparse_decode=True,
+                    dsa_current_released_frontier=0,
+                    dsa_nonresident_frontier=8192,
                     load_spec=SimpleNamespace(
                         can_load=True,
                         lmcache_cached_tokens=8193,
@@ -1015,6 +1165,8 @@ class TestStagedSFADummyBatch(unittest.TestCase):
                         SimpleNamespace(
                             req_id="cold",
                             is_sparse_decode=True,
+                            dsa_current_released_frontier=0,
+                            dsa_nonresident_frontier=7936,
                             load_spec=SimpleNamespace(
                                 can_load=True,
                                 dsa_committed_end=7936,
@@ -1130,6 +1282,8 @@ class TestStagedSFADummyBatch(unittest.TestCase):
                     SimpleNamespace(
                         req_id=req_id,
                         is_sparse_decode=True,
+                        dsa_current_released_frontier=4096,
+                        dsa_nonresident_frontier=4096,
                         load_spec=SimpleNamespace(
                             can_load=True,
                             lmcache_cached_tokens=4096,
@@ -1188,6 +1342,8 @@ class TestStagedSFADummyBatch(unittest.TestCase):
                             SimpleNamespace(
                                 req_id=req_id,
                                 is_sparse_decode=True,
+                                dsa_current_released_frontier=131_584,
+                                dsa_nonresident_frontier=131_584,
                                 load_spec=SimpleNamespace(
                                     can_load=True,
                                     lmcache_cached_tokens=131_584,
@@ -1244,6 +1400,8 @@ class TestStagedSFADummyBatch(unittest.TestCase):
                     SimpleNamespace(
                         req_id="req-0",
                         is_sparse_decode=True,
+                        dsa_current_released_frontier=0,
+                        dsa_nonresident_frontier=0,
                         load_spec=SimpleNamespace(
                             can_load=True,
                             lmcache_cached_tokens=257,

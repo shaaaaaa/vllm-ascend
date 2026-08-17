@@ -437,6 +437,8 @@ def test_sparse_boundary_prefers_explicit_committed_end():
             SimpleNamespace(
                 req_id="resident",
                 is_sparse_decode=True,
+                dsa_current_released_frontier=0,
+                dsa_nonresident_frontier=0,
                 load_spec=SimpleNamespace(
                     can_load=True,
                     lmcache_cached_tokens=3072,
@@ -447,6 +449,8 @@ def test_sparse_boundary_prefers_explicit_committed_end():
             SimpleNamespace(
                 req_id="scratch-full",
                 is_sparse_decode=True,
+                dsa_current_released_frontier=0,
+                dsa_nonresident_frontier=0,
                 load_spec=SimpleNamespace(
                     can_load=True,
                     lmcache_cached_tokens=4096,
@@ -457,6 +461,8 @@ def test_sparse_boundary_prefers_explicit_committed_end():
             SimpleNamespace(
                 req_id="offloaded",
                 is_sparse_decode=True,
+                dsa_current_released_frontier=0,
+                dsa_nonresident_frontier=8192,
                 load_spec=SimpleNamespace(
                     can_load=True,
                     lmcache_cached_tokens=8192,
@@ -581,6 +587,8 @@ class TestLMCacheSparseFrontier(TestBase):
         sparse = SimpleNamespace(
             req_id="req-0",
             is_sparse_decode=True,
+            dsa_current_released_frontier=0,
+            dsa_nonresident_frontier=0,
             load_spec=SimpleNamespace(
                 can_load=True,
                 lmcache_cached_tokens=128,
@@ -601,7 +609,7 @@ class TestLMCacheSparseFrontier(TestBase):
                 metadata,
                 ["req-0"],
             ),
-            (StagedSFARouteReason.DUPLICATE_SPARSE_LOAD, ()),
+            (StagedSFARouteReason.DUPLICATE_MAIN_METADATA, ()),
         )
 
     def test_missing_active_request_frontier_fails_closed(self):
@@ -610,6 +618,8 @@ class TestLMCacheSparseFrontier(TestBase):
                 SimpleNamespace(
                     req_id="req-0",
                     is_sparse_decode=True,
+                    dsa_current_released_frontier=0,
+                    dsa_nonresident_frontier=0,
                     load_spec=SimpleNamespace(
                         can_load=True,
                         lmcache_cached_tokens=128,
@@ -625,12 +635,136 @@ class TestLMCacheSparseFrontier(TestBase):
             (StagedSFARouteReason.MISSING_CONNECTOR_METADATA, ()),
         )
 
+    def test_save_only_metadata_is_ignored_and_main_must_be_unique(self):
+        main = SimpleNamespace(
+            req_id="req-0",
+            is_sparse_decode=False,
+            is_decode_window_save=False,
+            dsa_current_released_frontier=0,
+            dsa_nonresident_frontier=0,
+            load_spec=None,
+        )
+        save_only = SimpleNamespace(
+            req_id="req-0",
+            is_sparse_decode=False,
+            is_decode_window_save=True,
+            load_spec=None,
+        )
+        metadata = SimpleNamespace(requests=[save_only, main])
+        self.assertEqual(
+            attention_utils.staged_sfa_metadata_sparse_load(
+                metadata,
+                ["req-0"],
+            ),
+            (StagedSFARouteReason.DENSE_PREFIX_HIT, (0,)),
+        )
+
+        metadata.requests.append(main)
+        self.assertEqual(
+            attention_utils.staged_sfa_metadata_sparse_load(
+                metadata,
+                ["req-0"],
+            ),
+            (StagedSFARouteReason.DUPLICATE_MAIN_METADATA, ()),
+        )
+
+    def test_nonresident_dense_or_unloadable_sparse_fails_closed(self):
+        request = SimpleNamespace(
+            req_id="req-0",
+            is_sparse_decode=False,
+            dsa_current_released_frontier=0,
+            dsa_nonresident_frontier=4096,
+            load_spec=None,
+        )
+        metadata = SimpleNamespace(requests=[request])
+        self.assertEqual(
+            attention_utils.staged_sfa_metadata_sparse_load(
+                metadata,
+                ["req-0"],
+            ),
+            (StagedSFARouteReason.DENSE_PREFIX_NOT_RESIDENT, ()),
+        )
+
+        request.is_sparse_decode = True
+        request.load_spec = SimpleNamespace(can_load=False)
+        self.assertEqual(
+            attention_utils.staged_sfa_metadata_sparse_load(
+                metadata,
+                ["req-0"],
+            ),
+            (StagedSFARouteReason.SPARSE_LOAD_UNAVAILABLE, ()),
+        )
+
+    def test_invalid_frontier_invariants_fail_closed(self):
+        valid_load = {
+            "can_load": True,
+            "lmcache_cached_tokens": 8192,
+            "dsa_committed_end": 8192,
+            "dsa_remap_frontier": 8192,
+        }
+        cases = {
+            "missing_current": SimpleNamespace(
+                req_id="req-0",
+                is_sparse_decode=True,
+                dsa_nonresident_frontier=0,
+                load_spec=SimpleNamespace(**valid_load),
+            ),
+            "negative_nonresident": SimpleNamespace(
+                req_id="req-0",
+                is_sparse_decode=True,
+                dsa_current_released_frontier=0,
+                dsa_nonresident_frontier=-1,
+                load_spec=SimpleNamespace(**valid_load),
+            ),
+            "current_above_nonresident": SimpleNamespace(
+                req_id="req-0",
+                is_sparse_decode=True,
+                dsa_current_released_frontier=8192,
+                dsa_nonresident_frontier=4096,
+                load_spec=SimpleNamespace(**valid_load),
+            ),
+            "committed_above_cached": SimpleNamespace(
+                req_id="req-0",
+                is_sparse_decode=True,
+                dsa_current_released_frontier=0,
+                dsa_nonresident_frontier=0,
+                load_spec=SimpleNamespace(
+                    can_load=True,
+                    lmcache_cached_tokens=4096,
+                    dsa_committed_end=8192,
+                ),
+            ),
+            "nonresident_above_remap": SimpleNamespace(
+                req_id="req-0",
+                is_sparse_decode=True,
+                dsa_current_released_frontier=0,
+                dsa_nonresident_frontier=8192,
+                load_spec=SimpleNamespace(
+                    can_load=True,
+                    lmcache_cached_tokens=8192,
+                    dsa_committed_end=8192,
+                    dsa_remap_frontier=7936,
+                ),
+            ),
+        }
+        for name, request in cases.items():
+            with self.subTest(name=name):
+                self.assertEqual(
+                    attention_utils.staged_sfa_metadata_sparse_load(
+                        SimpleNamespace(requests=[request]),
+                        ["req-0"],
+                    ),
+                    (StagedSFARouteReason.INVALID_FRONTIER, ()),
+                )
+
     def test_frontiers_preserve_native_request_order(self):
         metadata = SimpleNamespace(
             requests=[
                 SimpleNamespace(
                     req_id="req-1",
                     is_sparse_decode=True,
+                    dsa_current_released_frontier=0,
+                    dsa_nonresident_frontier=0,
                     load_spec=SimpleNamespace(
                         can_load=True,
                         lmcache_cached_tokens=256,
@@ -639,6 +773,8 @@ class TestLMCacheSparseFrontier(TestBase):
                 SimpleNamespace(
                     req_id="req-0",
                     is_sparse_decode=True,
+                    dsa_current_released_frontier=0,
+                    dsa_nonresident_frontier=0,
                     load_spec=SimpleNamespace(
                         can_load=True,
                         lmcache_cached_tokens=128,
@@ -660,6 +796,8 @@ class TestLMCacheSparseFrontier(TestBase):
                 SimpleNamespace(
                     req_id="req-0",
                     is_sparse_decode=False,
+                    dsa_current_released_frontier=0,
+                    dsa_nonresident_frontier=0,
                     load_spec=SimpleNamespace(
                         can_load=True,
                         lmcache_cached_tokens=18879,
@@ -670,7 +808,7 @@ class TestLMCacheSparseFrontier(TestBase):
 
         self.assertEqual(
             attention_utils.staged_sfa_metadata_sparse_load(metadata, ["req-0"]),
-            (StagedSFARouteReason.DENSE_PREFIX_HIT, ()),
+            (StagedSFARouteReason.DENSE_PREFIX_HIT, (0,)),
         )
         self.assertEqual(
             self._remap_frontiers(metadata, ["req-0"]),
@@ -693,9 +831,11 @@ class TestLMCacheSparseFrontier(TestBase):
                 SimpleNamespace(
                     req_id="resident",
                     is_sparse_decode=True,
+                    dsa_current_released_frontier=0,
+                    dsa_nonresident_frontier=0,
                     load_spec=SimpleNamespace(
                         can_load=True,
-                        lmcache_cached_tokens=1024,
+                        lmcache_cached_tokens=3072,
                         dsa_committed_end=3072,
                         dsa_scratch_capacity=4096,
                     ),
@@ -703,6 +843,8 @@ class TestLMCacheSparseFrontier(TestBase):
                 SimpleNamespace(
                     req_id="offloaded",
                     is_sparse_decode=True,
+                    dsa_current_released_frontier=8192,
+                    dsa_nonresident_frontier=8192,
                     load_spec=SimpleNamespace(
                         can_load=True,
                         lmcache_cached_tokens=8192,
@@ -726,6 +868,8 @@ class TestLMCacheSparseFrontier(TestBase):
                 SimpleNamespace(
                     req_id="cold-compact",
                     is_sparse_decode=True,
+                    dsa_current_released_frontier=0,
+                    dsa_nonresident_frontier=8192,
                     load_spec=SimpleNamespace(
                         can_load=True,
                         lmcache_cached_tokens=8193,
@@ -756,17 +900,21 @@ class TestLMCacheSparseFrontier(TestBase):
             (StagedSFARouteReason.ELIGIBLE, (8192,), (True,)),
         )
 
-    def test_mixed_load_requires_every_row_to_be_loadable(self):
+    def test_mixed_resident_sparse_row_uses_zero_frontier(self):
         metadata = SimpleNamespace(
             requests=[
                 SimpleNamespace(
                     req_id="dense",
                     is_sparse_decode=False,
+                    dsa_current_released_frontier=0,
+                    dsa_nonresident_frontier=0,
                     load_spec=SimpleNamespace(can_load=True),
                 ),
                 SimpleNamespace(
                     req_id="sparse",
                     is_sparse_decode=True,
+                    dsa_current_released_frontier=0,
+                    dsa_nonresident_frontier=0,
                     load_spec=SimpleNamespace(can_load=False),
                 ),
             ]
@@ -777,7 +925,7 @@ class TestLMCacheSparseFrontier(TestBase):
                 metadata,
                 ["dense", "sparse"],
             ),
-            (StagedSFARouteReason.MIXED_CONNECTOR_LOAD, ()),
+            (StagedSFARouteReason.MIXED_CONNECTOR_LOAD, (0, 0)),
         )
 
     def test_native_remap_frontiers_preserve_dense_sparse_request_order(
@@ -788,6 +936,8 @@ class TestLMCacheSparseFrontier(TestBase):
                 SimpleNamespace(
                     req_id="sparse",
                     is_sparse_decode=True,
+                    dsa_current_released_frontier=0,
+                    dsa_nonresident_frontier=0,
                     load_spec=SimpleNamespace(
                         can_load=True,
                         lmcache_cached_tokens=8192,
@@ -797,6 +947,8 @@ class TestLMCacheSparseFrontier(TestBase):
                 SimpleNamespace(
                     req_id="dense",
                     is_sparse_decode=False,
+                    dsa_current_released_frontier=0,
+                    dsa_nonresident_frontier=0,
                     load_spec=SimpleNamespace(
                         can_load=True,
                         lmcache_cached_tokens=120000,
