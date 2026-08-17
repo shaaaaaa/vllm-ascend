@@ -16,9 +16,9 @@ fake_torch_npu = types.ModuleType("torch_npu")
 fake_torch_npu.atb = SimpleNamespace(npu_paged_cache_load=MagicMock())
 sys.modules.setdefault("torch_npu", fake_torch_npu)
 
-from vllm.distributed.kv_transfer.kv_connector.v1.base import SupportsHMA  # noqa: E402
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (  # noqa: E402
     KVConnectorRole,
+    SupportsHMA,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import (  # noqa: E402
     MultiKVConnectorMetadata,
@@ -66,6 +66,31 @@ def test_lmcache_ascend_connector_advertises_dsa_index_support():
     )
 
     assert getattr(LMCacheConnectorV1, "supports_dsa_index_lmcache", False) is True
+
+
+def test_ascend_multi_delegates_dsa_index_lmcache_capability():
+    multi = object.__new__(AscendMultiConnector)
+    assert multi.supports_dsa_index_lmcache is False
+
+    children = [
+        SimpleNamespace(supports_dsa_index_lmcache=False),
+        SimpleNamespace(supports_dsa_index_lmcache=True),
+    ]
+    multi._supports_dsa_index_lmcache = any(
+        multi._supports_dsa_index_cache(child) for child in children
+    )
+
+    assert multi.supports_dsa_index_lmcache is True
+
+    children = [
+        SimpleNamespace(supports_dsa_index_lmcache=False),
+        SimpleNamespace(),
+    ]
+    multi._supports_dsa_index_lmcache = any(
+        multi._supports_dsa_index_cache(child) for child in children
+    )
+
+    assert multi.supports_dsa_index_lmcache is False
 
 
 def test_ascend_multi_init_supports_legacy_child_connector_signature(monkeypatch):

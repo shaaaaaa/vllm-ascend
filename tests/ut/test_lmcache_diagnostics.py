@@ -137,4 +137,5 @@ def test_live_p2p_first_consume_diagnostic_is_not_persistent_load_gated() -> Non
         "num_actual_tokens",
         "attn_state",
         "decode_valid_rows_all",
+        "group1_connector_wait_called",
     } <= keyword_names

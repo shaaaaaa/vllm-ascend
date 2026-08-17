@@ -140,6 +140,13 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
         )
         return bool(capability() if callable(capability) else capability)
 
+    @staticmethod
+    def _supports_dsa_index_cache(connector: Any) -> bool:
+        capability = getattr(
+            connector, "supports_dsa_index_lmcache", False
+        )
+        return bool(capability() if callable(capability) else capability)
+
     @property
     def supports_dsa_compact_external_load(self) -> bool:
         # The scheduler reads this immediately after matched-token lookup.
@@ -154,6 +161,11 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
             getattr(connector, "uses_layerwise_model_callbacks", False)
             for connector in self._connectors
         )
+
+    @property
+    def supports_dsa_index_lmcache(self) -> bool:
+        """Advertise Group-1 callbacks when any child owns that cache."""
+        return getattr(self, "_supports_dsa_index_lmcache", False)
 
     def _staged_sfa_connector(self):
         return next(
@@ -307,6 +319,14 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
                 connector = connector_cls(temp_config, role)
             self._connectors.append(connector)
             self._ktc_kv_transfer_config.append(temp_config.kv_transfer_config)
+
+        # SFA reads this capability on every attention layer.  Resolve it once
+        # after child construction so Group-1 save/load callbacks are exposed
+        # without adding a connector scan to the model hot path.
+        self._supports_dsa_index_lmcache = any(
+            self._supports_dsa_index_cache(connector)
+            for connector in self._connectors
+        )
 
         # A mapping from request id to the index of the connector chosen to
         # load the request from (if any).

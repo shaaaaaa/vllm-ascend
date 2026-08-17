@@ -4144,6 +4144,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                     decode_valid_rows_all=(
                         attn_metadata.decode_valid_rows_all
                     ),
+                    group1_connector_wait_called=index_lmcache_enabled,
                 )
 
             if self.is_kv_producer:
