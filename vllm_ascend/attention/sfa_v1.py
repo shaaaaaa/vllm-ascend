@@ -1422,12 +1422,27 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
                     plen = int(plens_cpu[r])
                     first_decode = max(s, s + plen - int(computed[r]))
                     if cold_resumes and cold_resumes[r]:
-                        if e - s != 1 or int(computed[r]) != plen - 1:
+                        expected_width = (
+                            self.decode_threshold
+                            if common_attn_metadata.attn_state
+                            == AscendAttentionState.SpecDecoding
+                            else 1
+                        )
+                        if (
+                            e - s != expected_width
+                            or int(computed[r]) != plen - 1
+                        ):
                             raise RuntimeError(
-                                "Invalid cold-compact Q1 resume layout: "
+                                "Invalid cold-compact resume layout: "
                                 f"request={r}, rows={e - s}, prompt={plen}, "
-                                f"computed={int(computed[r])}."
+                                f"computed={int(computed[r])}, "
+                                f"expected_rows={expected_width}."
                             )
+                        # The first real row recomputes the final prompt token;
+                        # later rows validate speculative tokens.  Every one of
+                        # them consumes sparse prefix KV and must participate in
+                        # compact retrieval/remapping.  Treating the first row
+                        # as padding leaves it reading stale scratch contents.
                         first_decode = s
                     if first_decode < e:
                         count = e - first_decode

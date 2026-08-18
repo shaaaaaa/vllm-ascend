@@ -3361,10 +3361,17 @@ class NPUModelRunner(GPUModelRunner):
         prompt_lens: Any = None,
     ) -> StagedSFARouteDecision:
         """Classify local scheduler/connector state before DP coordination."""
-        def native(reason):
+        def native(
+            reason,
+            *,
+            frontiers: tuple[int, ...] = (),
+            cold_compact_resumes: tuple[bool, ...] = (),
+        ):
             return StagedSFARouteDecision(
                 StagedSFARouteAction.SAFE_NATIVE,
                 reason,
+                frontiers=frontiers,
+                cold_compact_resumes=cold_compact_resumes,
             )
         if not self._staged_sfa_graph_capture_sizes:
             return native(StagedSFARouteReason.NOT_CONFIGURED)
@@ -3421,46 +3428,53 @@ class NPUModelRunner(GPUModelRunner):
                 StagedSFARouteAction.FATAL,
                 StagedSFARouteReason.FRONTIER_COUNT_MISMATCH,
             )
-        if query_width == 1:
-            if any(cold_resumes):
-                computed = np.asarray(num_computed_tokens).reshape(-1)
-                prompts = np.asarray(prompt_lens).reshape(-1)
-                layout_failures: list[str] = []
-                if len(cold_resumes) != num_reqs:
-                    layout_failures.append("resume_count")
-                if computed.shape != (num_reqs,):
-                    layout_failures.append("computed_shape")
-                if prompts.shape != (num_reqs,):
-                    layout_failures.append("prompt_shape")
-                if not layout_failures:
-                    for i, resume in enumerate(cold_resumes):
-                        if not resume:
-                            continue
-                        if int(computed[i]) != int(prompts[i]) - 1:
-                            layout_failures.append(
-                                f"computed_prompt_minus_one[{i}]"
-                            )
-                        if frontiers[i] != int(computed[i]):
-                            layout_failures.append(
-                                f"frontier_computed[{i}]"
-                            )
-                if layout_failures:
-                    log_cold_perf_event(
-                        "decoder_cold_compact_graph_reject",
-                        request_ids=request_ids,
-                        once=True,
-                        failed_invariants=layout_failures,
-                        cold_resume_indices=[
-                            i
-                            for i, resume in enumerate(cold_resumes)
-                            if resume
-                        ],
-                        num_computed_tokens=computed.tolist(),
-                        prompt_lens=prompts.tolist(),
-                        remap_frontiers=list(frontiers),
-                    )
-                    return native(StagedSFARouteReason.COLD_COMPACT_LAYOUT)
-        else:
+        if any(cold_resumes):
+            computed = (
+                np.asarray(num_computed_tokens).reshape(-1)
+                if num_computed_tokens is not None
+                else np.empty(0, dtype=np.int64)
+            )
+            prompts = (
+                np.asarray(prompt_lens).reshape(-1)
+                if prompt_lens is not None
+                else np.empty(0, dtype=np.int64)
+            )
+            layout_failures: list[str] = []
+            if len(cold_resumes) != num_reqs:
+                layout_failures.append("resume_count")
+            if computed.shape != (num_reqs,):
+                layout_failures.append("computed_shape")
+            if prompts.shape != (num_reqs,):
+                layout_failures.append("prompt_shape")
+            if not layout_failures:
+                for i, resume in enumerate(cold_resumes):
+                    if not resume:
+                        continue
+                    if int(computed[i]) != int(prompts[i]) - 1:
+                        layout_failures.append(
+                            f"computed_prompt_minus_one[{i}]"
+                        )
+                    if frontiers[i] != int(computed[i]):
+                        layout_failures.append(
+                            f"frontier_computed[{i}]"
+                        )
+            if layout_failures:
+                log_cold_perf_event(
+                    "decoder_cold_compact_graph_reject",
+                    request_ids=request_ids,
+                    once=True,
+                    failed_invariants=layout_failures,
+                    cold_resume_indices=[
+                        i
+                        for i, resume in enumerate(cold_resumes)
+                        if resume
+                    ],
+                    num_computed_tokens=computed.tolist(),
+                    prompt_lens=prompts.tolist(),
+                    remap_frontiers=list(frontiers),
+                )
+                return native(StagedSFARouteReason.COLD_COMPACT_LAYOUT)
+        if query_width != 1:
             # The fixed-width speculative graph has not established the
             # first-resume compact-layout contract.  In particular, its two
             # query rows can observe restored and newly written KV in one
@@ -3480,7 +3494,14 @@ class NPUModelRunner(GPUModelRunner):
                         if resume
                     ],
                 )
-                return native(StagedSFARouteReason.COLD_COMPACT_LAYOUT)
+                # Keep the validated marker on the eager/native route.  The
+                # SFA metadata builder needs it to classify the recomputed
+                # prompt-tail row as request-owned instead of graph padding.
+                return native(
+                    StagedSFARouteReason.COLD_COMPACT_LAYOUT,
+                    frontiers=frontiers,
+                    cold_compact_resumes=cold_resumes,
+                )
             cold_resumes = ()
         scratch_capacity = query_width * index_topk
         if any(

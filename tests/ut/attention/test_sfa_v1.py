@@ -2789,16 +2789,21 @@ class TestAscendSFAMetadataBuilder(TestBase):
             prompt_lens,
             request_ids,
             cold_compact_resumes=(),
+            *,
+            attn_state=AscendAttentionState.DecodeOnly,
+            num_input_tokens=None,
         ):
             num_reqs = len(request_ids)
-            num_tokens = int(query_start_loc[-1])
+            num_actual_tokens = int(query_start_loc[-1])
+            if num_input_tokens is None:
+                num_input_tokens = num_actual_tokens
             return SimpleNamespace(
                 num_reqs=num_reqs,
-                num_actual_tokens=num_tokens,
-                num_input_tokens=num_tokens,
+                num_actual_tokens=num_actual_tokens,
+                num_input_tokens=num_input_tokens,
                 block_table_tensor=torch.zeros((num_reqs, 4), dtype=torch.int32),
-                slot_mapping=torch.arange(num_tokens, dtype=torch.int64),
-                positions=torch.arange(num_tokens, dtype=torch.int64),
+                slot_mapping=torch.arange(num_input_tokens, dtype=torch.int64),
+                positions=torch.arange(num_input_tokens, dtype=torch.int64),
                 indexer_block_table_tensor=None,
                 indexer_slot_mapping=None,
                 prompt_lens_cpu=prompt_lens,
@@ -2808,7 +2813,7 @@ class TestAscendSFAMetadataBuilder(TestBase):
                 seq_lens=torch.tensor(computed, dtype=torch.int32),
                 seq_lens_cpu=torch.tensor(computed, dtype=torch.int32),
                 request_ids=request_ids,
-                attn_state=AscendAttentionState.DecodeOnly,
+                attn_state=attn_state,
                 cold_compact_resumes=cold_compact_resumes,
             )
 
@@ -2841,6 +2846,43 @@ class TestAscendSFAMetadataBuilder(TestBase):
                 cached_tokens=(8,),
             )
         assert boundary.tolist() == [8]
+
+        speculative_cold_transition = builder.build(
+            common_prefix_len=0,
+            common_attn_metadata=common_metadata(
+                [0, 2],
+                [8],
+                [9],
+                ["cold-spec"],
+                (True,),
+                attn_state=AscendAttentionState.SpecDecoding,
+                num_input_tokens=4,
+            ),
+        )
+        assert speculative_cold_transition.decode_req_indices.tolist() == [
+            0,
+            0,
+            -1,
+            -1,
+        ]
+        assert speculative_cold_transition.decode_row_offsets.tolist() == [
+            0,
+            1,
+            0,
+            0,
+        ]
+        assert speculative_cold_transition.split_boundary.tolist() == [
+            9,
+            9,
+            0,
+            0,
+        ]
+        assert (
+            speculative_cold_transition.decode_valid_row_indices.tolist()
+            == [0, 1]
+        )
+        assert speculative_cold_transition.num_decode_tokens == 2
+        assert not speculative_cold_transition.decode_valid_rows_all
 
         first = builder.build(
             common_prefix_len=0,

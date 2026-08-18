@@ -1113,6 +1113,79 @@ class TestStagedSFADummyBatch(unittest.TestCase):
             remap_frontiers=[7936],
         )
 
+    def test_speculative_cold_resume_keeps_marker_on_native_route(self):
+        runner = self._build_runner()
+        runner.speculative_config = SimpleNamespace(
+            num_speculative_tokens=1,
+        )
+        runner.attn_state = AscendAttentionState.SpecDecoding
+        runner._staged_sfa_graph_capture_sizes = (2, 4)
+        metadata = SimpleNamespace(
+            requests=[
+                SimpleNamespace(
+                    req_id="cold-spec",
+                    is_sparse_decode=True,
+                    load_spec=SimpleNamespace(
+                        can_load=False,
+                        lmcache_cached_tokens=8193,
+                        dsa_committed_end=8192,
+                        dsa_cold_compact_resume=True,
+                    ),
+                )
+            ]
+        )
+        kwargs = dict(
+            num_tokens_unpadded=2,
+            num_reqs=1,
+            num_scheduled_tokens=np.array([2], dtype=np.int32),
+            index_topk=2048,
+            has_cascade_attention=False,
+            request_ids=["cold-spec"],
+            kv_connector_metadata=metadata,
+            num_computed_tokens=np.array([8192], dtype=np.int32),
+            prompt_lens=np.array([8193], dtype=np.int32),
+        )
+
+        with patch.object(
+            model_runner_module, "log_cold_perf_event"
+        ) as log_event:
+            route = runner._staged_sfa_local_route(**kwargs)
+
+        self.assertEqual(
+            route.action,
+            StagedSFARouteAction.SAFE_NATIVE,
+        )
+        self.assertEqual(
+            route.reason,
+            StagedSFARouteReason.COLD_COMPACT_LAYOUT,
+        )
+        self.assertEqual(route.frontiers, (8192,))
+        self.assertEqual(route.cold_compact_resumes, (True,))
+        log_event.assert_called_once_with(
+            "decoder_cold_compact_graph_reject",
+            request_ids=["cold-spec"],
+            once=True,
+            failed_invariants=["speculative_first_resume"],
+            cold_resume_indices=[0],
+        )
+
+        rejected = runner._staged_sfa_local_route(
+            **{
+                **kwargs,
+                "num_computed_tokens": np.array([8191], dtype=np.int32),
+            }
+        )
+        self.assertEqual(
+            rejected.action,
+            StagedSFARouteAction.SAFE_NATIVE,
+        )
+        self.assertEqual(
+            rejected.reason,
+            StagedSFARouteReason.COLD_COMPACT_LAYOUT,
+        )
+        self.assertEqual(rejected.frontiers, ())
+        self.assertEqual(rejected.cold_compact_resumes, ())
+
     def test_native_route_logs_once_per_reason(self):
         runner = self._build_runner()
         route = model_runner_module.StagedSFARouteDecision(
