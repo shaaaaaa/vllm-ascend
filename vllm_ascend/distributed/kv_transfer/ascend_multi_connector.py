@@ -482,6 +482,25 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
             )
             connector.register_kv_caches(kv_caches if requires_full else latent_only)
 
+    def capture_live_source_event_handoff(
+        self, forward_context: "ForwardContext"
+    ) -> bool:
+        """Forward a published producer event to the owning child connector."""
+
+        captured = False
+        for connector in self._connectors:
+            capture = getattr(
+                connector, "capture_live_source_event_handoff", None
+            )
+            if not callable(capture):
+                engine = getattr(connector, "_lmcache_engine", None)
+                capture = getattr(
+                    engine, "capture_live_source_event_handoff", None
+                )
+            if callable(capture):
+                captured = bool(capture(forward_context)) or captured
+        return captured
+
     def start_load_kv(
         self, forward_context: "ForwardContext", **kwargs: Any
     ) -> None:

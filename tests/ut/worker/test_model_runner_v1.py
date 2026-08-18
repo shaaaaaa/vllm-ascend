@@ -25,6 +25,85 @@ from vllm_ascend.worker.block_table import MultiGroupBlockTable
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
 
 
+class TestLiveSourceEventPublication(unittest.TestCase):
+    def test_publication_is_captured_before_forward_context_exits(self):
+        forward_context = SimpleNamespace(
+            additional_kwargs={
+                model_runner_module.LIVE_SOURCE_EVENT_HANDOFF_KEY: object()
+            }
+        )
+        connector = SimpleNamespace(
+            capture_live_source_event_handoff=MagicMock()
+        )
+        with (
+            patch.object(
+                model_runner_module,
+                "get_forward_context",
+                return_value=forward_context,
+            ),
+            patch.object(
+                model_runner_module,
+                "has_kv_transfer_group",
+                return_value=True,
+            ),
+            patch.object(
+                model_runner_module,
+                "get_kv_transfer_group",
+                return_value=connector,
+            ),
+        ):
+            model_runner_module._capture_live_source_event_handoff()
+
+        connector.capture_live_source_event_handoff.assert_called_once_with(
+            forward_context
+        )
+
+    def test_unarmed_forward_has_no_connector_lookup(self):
+        forward_context = SimpleNamespace(additional_kwargs={})
+        with (
+            patch.object(
+                model_runner_module,
+                "get_forward_context",
+                return_value=forward_context,
+            ),
+            patch.object(
+                model_runner_module,
+                "has_kv_transfer_group",
+            ) as has_group,
+        ):
+            model_runner_module._publish_live_source_event_handoff()
+
+        has_group.assert_not_called()
+
+    def test_model_forward_publishes_step_scoped_handoff(self):
+        runner = NPUModelRunner.__new__(NPUModelRunner)
+        hidden_states = object()
+        runner.model = MagicMock(return_value=hidden_states)
+        runner.use_sparse = False
+        forward_context = SimpleNamespace(
+            cudagraph_runtime_mode=CUDAGraphMode.NONE,
+            capturing=False,
+            flash_comm_v1_enabled=False,
+            additional_kwargs={},
+        )
+
+        with (
+            patch.object(
+                model_runner_module,
+                "get_forward_context",
+                return_value=forward_context,
+            ),
+            patch.object(
+                model_runner_module,
+                "_capture_live_source_event_handoff",
+            ) as publish,
+        ):
+            result = runner._model_forward(1)
+
+        self.assertIs(result, hidden_states)
+        publish.assert_called_once_with()
+
+
 class TestFixedDecodeLayoutArrays(unittest.TestCase):
     def test_q1_layout_is_identity(self):
         req_indices, offsets, cumulative = (

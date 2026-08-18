@@ -93,6 +93,23 @@ def test_ascend_multi_delegates_dsa_index_lmcache_capability():
     assert multi.supports_dsa_index_lmcache is False
 
 
+def test_ascend_multi_forwards_live_source_event_to_lmcache_engine():
+    forward_context = object()
+    capture = MagicMock(return_value=True)
+    multi = object.__new__(AscendMultiConnector)
+    multi._connectors = [
+        SimpleNamespace(),
+        SimpleNamespace(
+            _lmcache_engine=SimpleNamespace(
+                capture_live_source_event_handoff=capture
+            )
+        ),
+    ]
+
+    assert multi.capture_live_source_event_handoff(forward_context)
+    capture.assert_called_once_with(forward_context)
+
+
 def test_ascend_multi_init_supports_legacy_child_connector_signature(monkeypatch):
     calls = []
 

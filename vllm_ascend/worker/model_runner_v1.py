@@ -140,6 +140,14 @@ from vllm_ascend.eplb.core.eplb_device_transfer_loader import D2DExpertWeightLoa
 from vllm_ascend.eplb.core.eplb_worker import EplbProcess
 from vllm_ascend.eplb.eplb_updator import EplbUpdator
 from vllm_ascend.eplb.utils import model_register
+from vllm_ascend.live_source_handoff import (
+    LIVE_SOURCE_EVENT_HANDOFF_KEY,
+)
+from vllm_ascend.lmcache_diagnostics import (
+    begin_deferred_diagnostic_step,
+    flush_deferred_diagnostics,
+    npu_content_diagnostics_enabled,
+)
 from vllm_ascend.ops.rotary_embedding import set_cos_and_sin, update_cos_sin
 from vllm_ascend.patch.worker.patch_draft_quarot import patch_load_weights
 from vllm_ascend.patch.worker.patch_module import patch_torch_npu_argsort
@@ -172,11 +180,6 @@ from vllm_ascend.utils import (
 from vllm_ascend.worker.dsa_shared_pool import reshape_dsa_shared_pool_raw
 from vllm_ascend.worker.npu_input_batch import NPUInputBatch
 from vllm_ascend.worker.pcp_utils import PCPManager
-from vllm_ascend.lmcache_diagnostics import (
-    begin_deferred_diagnostic_step,
-    flush_deferred_diagnostics,
-    npu_content_diagnostics_enabled,
-)
 
 from vllm_ascend.ascend_forward_context import (  # isort: skip
     MoECommType,
@@ -194,6 +197,40 @@ if TYPE_CHECKING:
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 else:
     xgr = LazyLoader("xgr", globals(), "xgrammar")
+
+
+def _capture_live_source_event_handoff() -> None:
+    """Let the connector retain an explicitly armed post-forward event."""
+
+    forward_context = get_forward_context()
+    if (
+        LIVE_SOURCE_EVENT_HANDOFF_KEY
+        not in forward_context.additional_kwargs
+    ):
+        return
+    if not has_kv_transfer_group():
+        forward_context.additional_kwargs.pop(LIVE_SOURCE_EVENT_HANDOFF_KEY, None)
+        return
+
+    connector = get_kv_transfer_group()
+    capture = getattr(connector, "capture_live_source_event_handoff", None)
+    if not callable(capture):
+        # Support a direct LMCacheConnectorV1 deployment in addition to the
+        # production AscendMultiConnector composition without changing vLLM.
+        engine = getattr(connector, "_lmcache_engine", None)
+        capture = getattr(engine, "capture_live_source_event_handoff", None)
+    if not callable(capture):
+        forward_context.additional_kwargs.pop(LIVE_SOURCE_EVENT_HANDOFF_KEY, None)
+        return
+    try:
+        capture(forward_context)
+    except Exception:
+        # A missing handoff must retain the established persistent fallback;
+        # it must not fail an otherwise valid model execution.
+        forward_context.additional_kwargs.pop(LIVE_SOURCE_EVENT_HANDOFF_KEY, None)
+        logger.exception(
+            "Live-source producer event capture failed; using persistent fallback"
+        )
 
 
 def _staged_sfa_dummy_remap_boundaries(
@@ -2682,6 +2719,11 @@ class NPUModelRunner(GPUModelRunner):
         )
         forward_context = get_forward_context()
         assert forward_context is not None
+        # Prefix-hit SFA resumes intentionally suppress ordinary decode-save
+        # callbacks.  Preserve the real final Group-1 scatter dependency for
+        # an explicitly armed live P/D export without adding a layer callback,
+        # tensor copy, or device synchronization to the decode path.
+        _capture_live_source_event_handoff()
         if (
             forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL
             and not forward_context.capturing
