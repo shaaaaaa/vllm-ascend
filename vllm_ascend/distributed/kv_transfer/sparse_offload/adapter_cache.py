@@ -6,7 +6,7 @@ This wires the on-NPU latent pool (the adapter) into the DSA decode path so the
 sparse-attention kernel reads the resident pool *in place* (zero-copy), with the
 adapter handling residency (hit/miss) and eviction-to-LMCache.
 
-Design (aligned in review, see DESIGN.md / INTEGRATION.md):
+Design (aligned in review, see DESIGN.md):
   * Two pools per layer (``k_nope`` of ``kv_lora_rank`` and ``k_pe`` of
     ``qk_rope_head_dim``) share **one** slot mapping — block ``i`` lives at the
     same physical slot in both pools. This mirrors how vLLM already allocates the
@@ -36,8 +36,8 @@ from __future__ import annotations
 import math
 import os
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Callable
 
 import torch
 

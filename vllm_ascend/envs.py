@@ -138,7 +138,7 @@ env_variables: dict[str, Callable[[], Any]] = {
     # write so the offload path can be compared against native sparse attention.
     # 1 (Stage 3): stop writing the paged latent (it lives only in LMCache + decode
     # store) to actually free NPU memory. Default 0. Only effective with the offload
-    # flag on AND the SFA kernel-redirect wiring done (see sparse_offload/INTEGRATION.md).
+    # flag on AND the SFA kernel-redirect wiring done (see sparse_offload/DESIGN.md).
     "VLLM_ASCEND_DSA_OFFLOAD_FREE_PAGED": lambda: bool(int(os.getenv("VLLM_ASCEND_DSA_OFFLOAD_FREE_PAGED", "0"))),
     # DSA latent offload parity check (bring-up). When 1, the SFA decode path runs both
     # the scratch-gather and the native paged sparse attention and logs/asserts their

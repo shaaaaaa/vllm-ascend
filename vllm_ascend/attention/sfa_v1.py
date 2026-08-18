@@ -919,7 +919,7 @@ class AscendSFAMetadata:
     # (resident) sources. None unless latent offload is enabled.
     # HW-VERIFY: confirm the source — req_ids/prompt_lens live on the runner's
     # input_batch, not on CommonAttentionMetadata; the runner may need to thread them
-    # in (see sparse_offload/INTEGRATION.md section B).
+    # in (see sparse_offload/DESIGN.md, "Lightning Indexer" and NPU integration).
     req_ids: list[str] | None = None
     resident_state_indices: torch.Tensor | None = None
     resident_state_generations: torch.Tensor | None = None
