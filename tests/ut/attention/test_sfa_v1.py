@@ -513,12 +513,13 @@ def test_sparse_boundary_uses_wrapped_connector_metadata():
         ]
 
 
-def _staged_route(frontiers=(4096,)):
+def _staged_route(frontiers=(4096,), cold_compact_resumes=()):
     return StagedSFARouteDecision(
         StagedSFARouteAction.STAGED,
         StagedSFARouteReason.ELIGIBLE,
         STAGED_SFA_SINGLETON_GRAPH_KEY,
         frontiers,
+        cold_compact_resumes,
     )
 
 
@@ -1894,6 +1895,7 @@ class TestStagedSFAGraphPoc(TestBase):
 
     def test_cross_layer_bootstrap_prepares_boundary_before_index_wait(self):
         impl = self._make_eligible_impl()
+        impl.decode_threshold = 2
         impl._staged_sfa_capture_state.runtime = (
             None,
             None,
@@ -1904,7 +1906,7 @@ class TestStagedSFAGraphPoc(TestBase):
         context = SimpleNamespace(
             attn_metadata={"layer-0.attn": metadata},
             staged_sfa_route=_staged_route(),
-            staged_sfa_graph_key=STAGED_SFA_SINGLETON_GRAPH_KEY,
+            staged_sfa_graph_key=StagedSFAGraphKey.fixed_spec(1, 2),
         )
         order = []
         with (
@@ -1919,11 +1921,59 @@ class TestStagedSFAGraphPoc(TestBase):
                 "wait_for_kv_layer_from_connector",
                 side_effect=lambda *args, **kwargs: order.append("index"),
             ) as wait_for_layer,
+            patch.object(sfa_v1.torch.npu, "current_stream") as current_stream,
         ):
             impl.bootstrap_cross_layer("layer-0.attn")
 
         self.assertEqual(order, ["boundary", "index"])
         wait_for_layer.assert_called_once_with("layer-0.indexer.k_cache")
+        current_stream.assert_not_called()
+
+    def test_cross_layer_cold_mtp_bootstrap_orders_index_wait(self):
+        impl = self._make_eligible_impl()
+        impl.decode_threshold = 2
+        metadata = self._make_decode_metadata()
+        for index_enabled in (False, True):
+            with self.subTest(index_enabled=index_enabled):
+                impl._staged_sfa_capture_state.runtime = (
+                    None,
+                    None,
+                    "layer-0.indexer.k_cache",
+                    index_enabled,
+                )
+                context = SimpleNamespace(
+                    attn_metadata={"layer-0.attn": metadata},
+                    staged_sfa_route=_staged_route(
+                        cold_compact_resumes=(True,)
+                    ),
+                    staged_sfa_graph_key=StagedSFAGraphKey.fixed_spec(1, 2),
+                )
+                order = []
+                with (
+                    patch.object(
+                        sfa_v1, "get_forward_context", return_value=context
+                    ),
+                    patch.object(
+                        sfa_v1,
+                        "_prepare_sfa_remap_boundary",
+                        side_effect=lambda *args, order=order, **kwargs: (
+                            order.append("boundary")
+                        ),
+                    ),
+                    patch.object(
+                        sfa_v1,
+                        "wait_for_kv_layer_from_connector",
+                        side_effect=lambda *args, order=order, **kwargs: (
+                            order.append("index")
+                        ),
+                    ),
+                ):
+                    impl.bootstrap_cross_layer("layer-0.attn")
+
+                expected = ["boundary"]
+                if index_enabled:
+                    expected.append("index")
+                self.assertEqual(order, expected)
 
     def test_cross_layer_dummy_bootstrap_skips_index_wait(self):
         impl = self._make_eligible_impl()
@@ -2906,6 +2956,17 @@ class TestAscendSFAMetadataBuilder(TestBase):
         assert speculative_cold_transition.num_decode_tokens == 2
         assert not speculative_cold_transition.decode_valid_rows_all
         assert builder._dsa_fixed_layout_signature is not None
+        with patch.object(
+            sfa_v1, "_decode_window_save_window_size", return_value=0
+        ):
+            boundary = sfa_v1._prepare_sfa_remap_boundary(
+                speculative_cold_transition,
+                ["cold-spec"],
+                is_dummy_run=False,
+                index_topk=16,
+                cached_tokens=(8,),
+            )
+        assert boundary.tolist() == [8, 8, 0, 0]
 
         mixed_cold_transition = builder.build(
             common_prefix_len=0,

@@ -3403,11 +3403,7 @@ class NPUModelRunner(GPUModelRunner):
         prompt_lens: Any = None,
     ) -> StagedSFARouteDecision:
         """Classify local scheduler/connector state before DP coordination."""
-        if not self._staged_sfa_graph_capture_sizes:
-            return StagedSFARouteDecision(
-                StagedSFARouteAction.SAFE_NATIVE,
-                StagedSFARouteReason.NOT_CONFIGURED,
-            )
+        graph_configured = bool(self._staged_sfa_graph_capture_sizes)
         query_width = 1 + int(
             getattr(self.speculative_config, "num_speculative_tokens", 0)
         )
@@ -3417,7 +3413,21 @@ class NPUModelRunner(GPUModelRunner):
             else AscendAttentionState.SpecDecoding
         )
         is_decode_state = self.attn_state == expected_state
-        if is_decode_state:
+        possible_cold_resume = False
+        if (
+            is_decode_state
+            and not graph_configured
+            and num_computed_tokens is not None
+            and prompt_lens is not None
+        ):
+            computed_probe = np.asarray(num_computed_tokens).reshape(-1)
+            prompt_probe = np.asarray(prompt_lens).reshape(-1)
+            possible_cold_resume = (
+                computed_probe.shape == (num_reqs,)
+                and prompt_probe.shape == (num_reqs,)
+                and bool(np.any(computed_probe < prompt_probe))
+            )
+        if is_decode_state and (graph_configured or possible_cold_resume):
             metadata_reason, frontiers, cold_resumes = (
                 staged_sfa_metadata_sparse_route(
                     unwrap_staged_sfa_connector_metadata(
@@ -3438,6 +3448,8 @@ class NPUModelRunner(GPUModelRunner):
                 cold_compact_resumes=cold_resumes,
             )
 
+        if not graph_configured:
+            return native(StagedSFARouteReason.NOT_CONFIGURED)
         if is_decode_state:
             if any(cold_resumes):
                 computed = (

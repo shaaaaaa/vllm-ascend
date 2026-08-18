@@ -1259,14 +1259,35 @@ class TestStagedSFADummyBatch(unittest.TestCase):
         with patch.object(
             model_runner_module,
             "unwrap_staged_sfa_connector_metadata",
+            wraps=model_runner_module.unwrap_staged_sfa_connector_metadata,
         ) as unwrap_metadata:
             not_configured = runner._staged_sfa_local_route(**kwargs)
-        unwrap_metadata.assert_not_called()
+        unwrap_metadata.assert_called_once_with(metadata)
         self.assertEqual(
             not_configured.reason, StagedSFARouteReason.NOT_CONFIGURED
         )
-        self.assertEqual(not_configured.frontiers, ())
-        self.assertEqual(not_configured.cold_compact_resumes, ())
+        self.assertEqual(not_configured.frontiers, (8192,))
+        self.assertEqual(not_configured.cold_compact_resumes, (True,))
+
+        with patch.object(
+            model_runner_module,
+            "unwrap_staged_sfa_connector_metadata",
+        ) as unwrap_metadata:
+            ordinary_not_configured = runner._staged_sfa_local_route(
+                **{
+                    **kwargs,
+                    "num_computed_tokens": np.array(
+                        [8193], dtype=np.int32
+                    ),
+                }
+            )
+        unwrap_metadata.assert_not_called()
+        self.assertEqual(
+            ordinary_not_configured.reason,
+            StagedSFARouteReason.NOT_CONFIGURED,
+        )
+        self.assertEqual(ordinary_not_configured.frontiers, ())
+        self.assertEqual(ordinary_not_configured.cold_compact_resumes, ())
         runner._staged_sfa_graph_capture_sizes = (2, 4)
 
         for name, overrides in {
