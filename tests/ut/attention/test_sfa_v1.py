@@ -815,6 +815,22 @@ class TestLMCacheSparseFrontier(TestBase):
             (StagedSFARouteReason.MIXED_CONNECTOR_LOAD, ()),
         )
 
+        metadata.requests[1].load_spec = SimpleNamespace(
+            can_load=False,
+            dsa_committed_end=8192,
+            dsa_cold_compact_resume=True,
+        )
+        self.assertEqual(
+            attention_utils.staged_sfa_metadata_sparse_route(
+                metadata, ["dense", "sparse"]
+            ),
+            (
+                StagedSFARouteReason.MIXED_CONNECTOR_LOAD,
+                (0, 8192),
+                (False, True),
+            ),
+        )
+
     def test_native_remap_frontiers_preserve_dense_sparse_request_order(
         self,
     ) -> None:
@@ -2793,10 +2809,15 @@ class TestAscendSFAMetadataBuilder(TestBase):
             attn_state=AscendAttentionState.DecodeOnly,
             num_input_tokens=None,
         ):
-            num_reqs = len(request_ids)
             num_actual_tokens = int(query_start_loc[-1])
             if num_input_tokens is None:
                 num_input_tokens = num_actual_tokens
+            num_reqs = max(
+                len(request_ids),
+                num_input_tokens // 2
+                if attn_state == AscendAttentionState.SpecDecoding
+                else 0,
+            )
             return SimpleNamespace(
                 num_reqs=num_reqs,
                 num_actual_tokens=num_actual_tokens,
@@ -2835,6 +2856,7 @@ class TestAscendSFAMetadataBuilder(TestBase):
         assert cold_transition.decode_row_offsets.tolist() == [0]
         assert cold_transition.split_boundary.tolist() == [9]
         assert cold_transition.num_decode_tokens == 1
+        assert builder._dsa_fixed_layout_signature is not None
         with patch.object(
             sfa_v1, "_decode_window_save_window_size", return_value=0
         ):
@@ -2883,6 +2905,28 @@ class TestAscendSFAMetadataBuilder(TestBase):
         )
         assert speculative_cold_transition.num_decode_tokens == 2
         assert not speculative_cold_transition.decode_valid_rows_all
+        assert builder._dsa_fixed_layout_signature is not None
+
+        mixed_cold_transition = builder.build(
+            common_prefix_len=0,
+            common_attn_metadata=common_metadata(
+                [0, 2, 4], [8, 10], [9, 9], ["cold", "warm"],
+                (True, False),
+                attn_state=AscendAttentionState.SpecDecoding,
+            ),
+        )
+        assert mixed_cold_transition.decode_req_indices.tolist() == [0, 0, 1, 1]
+
+        with self.assertRaisesRegex(
+            RuntimeError, "Invalid cold-compact resume layout"
+        ):
+            builder.build(
+                common_prefix_len=0,
+                common_attn_metadata=common_metadata(
+                    [0, 2], [9], [9], ["invalid-cold"], (True,),
+                    attn_state=AscendAttentionState.SpecDecoding,
+                ),
+            )
 
         first = builder.build(
             common_prefix_len=0,

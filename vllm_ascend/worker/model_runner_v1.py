@@ -3403,34 +3403,102 @@ class NPUModelRunner(GPUModelRunner):
         prompt_lens: Any = None,
     ) -> StagedSFARouteDecision:
         """Classify local scheduler/connector state before DP coordination."""
-        def native(
-            reason,
-            *,
-            frontiers: tuple[int, ...] = (),
-            cold_compact_resumes: tuple[bool, ...] = (),
-        ):
+        if not self._staged_sfa_graph_capture_sizes:
             return StagedSFARouteDecision(
                 StagedSFARouteAction.SAFE_NATIVE,
-                reason,
-                frontiers=frontiers,
-                cold_compact_resumes=cold_compact_resumes,
+                StagedSFARouteReason.NOT_CONFIGURED,
             )
-        if not self._staged_sfa_graph_capture_sizes:
-            return native(StagedSFARouteReason.NOT_CONFIGURED)
-        if getattr(self, "calculate_kv_scales", False):
-            return native(StagedSFARouteReason.RUNTIME_MODE)
         query_width = 1 + int(
             getattr(self.speculative_config, "num_speculative_tokens", 0)
         )
-        if getattr(self.vllm_config, "lora_config", None) is not None:
-            return native(StagedSFARouteReason.LORA)
         expected_state = (
             AscendAttentionState.DecodeOnly
             if query_width == 1
             else AscendAttentionState.SpecDecoding
         )
-        if self.attn_state != expected_state:
+        is_decode_state = self.attn_state == expected_state
+        if is_decode_state:
+            metadata_reason, frontiers, cold_resumes = (
+                staged_sfa_metadata_sparse_route(
+                    unwrap_staged_sfa_connector_metadata(
+                        kv_connector_metadata
+                    ),
+                    request_ids,
+                )
+            )
+        else:
+            frontiers = ()
+            cold_resumes = ()
+
+        def native(reason):
+            return StagedSFARouteDecision(
+                StagedSFARouteAction.SAFE_NATIVE,
+                reason,
+                frontiers=frontiers if cold_resumes else (),
+                cold_compact_resumes=cold_resumes,
+            )
+
+        if is_decode_state:
+            if any(cold_resumes):
+                computed = (
+                    np.asarray(num_computed_tokens).reshape(-1)
+                    if num_computed_tokens is not None
+                    else np.empty(0, dtype=np.int64)
+                )
+                prompts = (
+                    np.asarray(prompt_lens).reshape(-1)
+                    if prompt_lens is not None
+                    else np.empty(0, dtype=np.int64)
+                )
+                marker_failures: list[str] = []
+                if query_width != self.decode_threshold:
+                    marker_failures.append("query_width")
+                if len(cold_resumes) != num_reqs:
+                    marker_failures.append("resume_count")
+                if len(frontiers) != num_reqs:
+                    marker_failures.append("frontier_count")
+                if computed.shape != (num_reqs,):
+                    marker_failures.append("computed_shape")
+                if prompts.shape != (num_reqs,):
+                    marker_failures.append("prompt_shape")
+                if not marker_failures:
+                    for i, resume in enumerate(cold_resumes):
+                        if not resume:
+                            continue
+                        if int(computed[i]) != int(prompts[i]) - 1:
+                            marker_failures.append(
+                                f"computed_prompt_minus_one[{i}]"
+                            )
+                        if frontiers[i] != int(computed[i]):
+                            marker_failures.append(
+                                f"frontier_computed[{i}]"
+                            )
+                if marker_failures:
+                    log_cold_perf_event(
+                        "decoder_cold_compact_graph_reject",
+                        request_ids=request_ids,
+                        once=True,
+                        failed_invariants=marker_failures,
+                        cold_resume_indices=[
+                            i
+                            for i, resume in enumerate(cold_resumes)
+                            if resume
+                        ],
+                        num_computed_tokens=computed.tolist(),
+                        prompt_lens=prompts.tolist(),
+                        remap_frontiers=list(frontiers),
+                    )
+                    return native(
+                        StagedSFARouteReason.COLD_COMPACT_LAYOUT
+                    )
+        if getattr(self, "calculate_kv_scales", False):
+            return native(StagedSFARouteReason.RUNTIME_MODE)
+        if getattr(self.vllm_config, "lora_config", None) is not None:
+            return native(StagedSFARouteReason.LORA)
+        if not is_decode_state:
             return native(StagedSFARouteReason.NOT_DECODE)
+        if query_width not in (1, 2):
+            return native(StagedSFARouteReason.SPECULATIVE_DECODE)
         if has_cascade_attention:
             return native(StagedSFARouteReason.CASCADE)
         batch_size = int(num_tokens_unpadded)
@@ -3447,14 +3515,6 @@ class NPUModelRunner(GPUModelRunner):
             scheduled == query_width
         ):
             return native(StagedSFARouteReason.NON_Q1)
-        metadata_reason, frontiers, cold_resumes = (
-            staged_sfa_metadata_sparse_route(
-                unwrap_staged_sfa_connector_metadata(
-                    kv_connector_metadata
-                ),
-                request_ids,
-            )
-        )
         if metadata_reason in (
             StagedSFARouteReason.DENSE_PREFIX_HIT,
             StagedSFARouteReason.MIXED_CONNECTOR_LOAD,
@@ -3471,35 +3531,10 @@ class NPUModelRunner(GPUModelRunner):
                 StagedSFARouteReason.FRONTIER_COUNT_MISMATCH,
             )
         if any(cold_resumes):
-            computed = (
-                np.asarray(num_computed_tokens).reshape(-1)
-                if num_computed_tokens is not None
-                else np.empty(0, dtype=np.int64)
-            )
-            prompts = (
-                np.asarray(prompt_lens).reshape(-1)
-                if prompt_lens is not None
-                else np.empty(0, dtype=np.int64)
-            )
             layout_failures: list[str] = []
-            if len(cold_resumes) != num_reqs:
-                layout_failures.append("resume_count")
-            if computed.shape != (num_reqs,):
-                layout_failures.append("computed_shape")
-            if prompts.shape != (num_reqs,):
-                layout_failures.append("prompt_shape")
-            if not layout_failures:
-                for i, resume in enumerate(cold_resumes):
-                    if not resume:
-                        continue
-                    if int(computed[i]) != int(prompts[i]) - 1:
-                        layout_failures.append(
-                            f"computed_prompt_minus_one[{i}]"
-                        )
-                    if frontiers[i] != int(computed[i]):
-                        layout_failures.append(
-                            f"frontier_computed[{i}]"
-                        )
+            for i, resume in enumerate(cold_resumes):
+                if not resume and int(computed[i]) < int(prompts[i]):
+                    layout_failures.append(f"computed_prompt[{i}]")
             if layout_failures:
                 log_cold_perf_event(
                     "decoder_cold_compact_graph_reject",
@@ -3515,36 +3550,9 @@ class NPUModelRunner(GPUModelRunner):
                     prompt_lens=prompts.tolist(),
                     remap_frontiers=list(frontiers),
                 )
-                return native(StagedSFARouteReason.COLD_COMPACT_LAYOUT)
-        if query_width != 1:
-            # The fixed-width speculative graph has not established the
-            # first-resume compact-layout contract.  In particular, its two
-            # query rows can observe restored and newly written KV in one
-            # replay.  Running it on the first cold-compact step has produced
-            # deterministic token corruption in production.  Use the native
-            # path for this one step; subsequent decode steps no longer carry
-            # the cold-resume marker and remain graph eligible.
-            if any(cold_resumes):
-                log_cold_perf_event(
-                    "decoder_cold_compact_graph_reject",
-                    request_ids=request_ids,
-                    once=True,
-                    failed_invariants=["speculative_first_resume"],
-                    cold_resume_indices=[
-                        i
-                        for i, resume in enumerate(cold_resumes)
-                        if resume
-                    ],
-                )
-                # Keep the validated marker on the eager/native route.  The
-                # SFA metadata builder needs it to classify the recomputed
-                # prompt-tail row as request-owned instead of graph padding.
                 return native(
                     StagedSFARouteReason.COLD_COMPACT_LAYOUT,
-                    frontiers=frontiers,
-                    cold_compact_resumes=cold_resumes,
                 )
-            cold_resumes = ()
         scratch_capacity = query_width * index_topk
         if any(
             frontier != 0 and frontier < scratch_capacity
@@ -3574,6 +3582,14 @@ class NPUModelRunner(GPUModelRunner):
         should_ubatch: bool,
     ) -> StagedSFARouteDecision:
         """Bind a DP-agreed local route to one captured graph capacity."""
+        def native(reason: StagedSFARouteReason) -> StagedSFARouteDecision:
+            return StagedSFARouteDecision(
+                StagedSFARouteAction.SAFE_NATIVE,
+                reason,
+                frontiers=local_route.frontiers,
+                cold_compact_resumes=local_route.cold_compact_resumes,
+            )
+
         if (
             dp_route_action is not None
             and dp_route_action != StagedSFARouteAction.STAGED
@@ -3583,27 +3599,20 @@ class NPUModelRunner(GPUModelRunner):
             return StagedSFARouteDecision(
                 dp_route_action,
                 StagedSFARouteReason.RUNTIME_PARALLELISM,
+                frontiers=local_route.frontiers,
+                cold_compact_resumes=local_route.cold_compact_resumes,
             )
         if local_route.action != StagedSFARouteAction.STAGED:
             return local_route
         if cudagraph_mode != CUDAGraphMode.PIECEWISE:
-            return StagedSFARouteDecision(
-                StagedSFARouteAction.SAFE_NATIVE,
-                StagedSFARouteReason.RUNTIME_MODE,
-            )
+            return native(StagedSFARouteReason.RUNTIME_MODE)
         if should_ubatch:
-            return StagedSFARouteDecision(
-                StagedSFARouteAction.SAFE_NATIVE,
-                StagedSFARouteReason.UBATCH,
-            )
+            return native(StagedSFARouteReason.UBATCH)
         batch_size = int(num_tokens_unpadded)
         capacity = int(num_tokens_padded)
         query_width = self.decode_threshold
         if capacity % query_width:
-            return StagedSFARouteDecision(
-                StagedSFARouteAction.SAFE_NATIVE,
-                StagedSFARouteReason.PADDED_BATCH,
-            )
+            return native(StagedSFARouteReason.PADDED_BATCH)
         graph_key = (
             StagedSFAGraphKey.exact_q1(capacity)
             if query_width == 1
@@ -3619,15 +3628,9 @@ class NPUModelRunner(GPUModelRunner):
             or capacity
             not in self._staged_sfa_graph_capture_sizes
         ):
-            return StagedSFARouteDecision(
-                StagedSFARouteAction.SAFE_NATIVE,
-                StagedSFARouteReason.PADDED_BATCH,
-            )
+            return native(StagedSFARouteReason.PADDED_BATCH)
         if batch_descriptor != graph_key.to_legacy_batch_descriptor():
-            return StagedSFARouteDecision(
-                StagedSFARouteAction.SAFE_NATIVE,
-                StagedSFARouteReason.BATCH_DESCRIPTOR,
-            )
+            return native(StagedSFARouteReason.BATCH_DESCRIPTOR)
         return StagedSFARouteDecision(
             StagedSFARouteAction.STAGED,
             StagedSFARouteReason.ELIGIBLE,

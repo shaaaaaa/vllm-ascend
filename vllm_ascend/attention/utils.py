@@ -516,7 +516,19 @@ def staged_sfa_metadata_sparse_route(
     loadable_request_ids = dense_request_ids.union(sparse_frontiers)
     if loadable_request_ids == active_request_id_set:
         if dense_request_ids and sparse_frontiers:
-            return StagedSFARouteReason.MIXED_CONNECTOR_LOAD, (), ()
+            if not cold_resumes:
+                return StagedSFARouteReason.MIXED_CONNECTOR_LOAD, (), ()
+            ordered_cold = tuple(
+                req_id in cold_resumes for req_id in active_request_ids
+            )
+            return (
+                StagedSFARouteReason.MIXED_CONNECTOR_LOAD,
+                tuple(
+                    sparse_frontiers.get(req_id, 0)
+                    for req_id in active_request_ids
+                ),
+                ordered_cold,
+            )
         if sparse_frontiers:
             return (
                 StagedSFARouteReason.ELIGIBLE,
@@ -541,7 +553,7 @@ def staged_sfa_metadata_sparse_load(
     reason, frontiers, _ = staged_sfa_metadata_sparse_route(
         metadata, request_ids
     )
-    return reason, frontiers
+    return reason, frontiers if reason == StagedSFARouteReason.ELIGIBLE else ()
 
 
 def wait_for_kv_layer_from_connector(

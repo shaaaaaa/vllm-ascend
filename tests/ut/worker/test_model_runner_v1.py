@@ -1192,11 +1192,12 @@ class TestStagedSFADummyBatch(unittest.TestCase):
             remap_frontiers=[7936],
         )
 
-    def test_speculative_cold_resume_keeps_marker_on_native_route(self):
+    def test_speculative_cold_resume_uses_staged_graph(self):
         runner = self._build_runner()
         runner.speculative_config = SimpleNamespace(
             num_speculative_tokens=1,
         )
+        runner.decode_threshold = 2
         runner.attn_state = AscendAttentionState.SpecDecoding
         runner._staged_sfa_graph_capture_sizes = (2, 4)
         metadata = SimpleNamespace(
@@ -1232,21 +1233,74 @@ class TestStagedSFADummyBatch(unittest.TestCase):
 
         self.assertEqual(
             route.action,
-            StagedSFARouteAction.SAFE_NATIVE,
+            StagedSFARouteAction.STAGED,
         )
         self.assertEqual(
             route.reason,
-            StagedSFARouteReason.COLD_COMPACT_LAYOUT,
+            StagedSFARouteReason.ELIGIBLE,
         )
         self.assertEqual(route.frontiers, (8192,))
         self.assertEqual(route.cold_compact_resumes, (True,))
-        log_event.assert_called_once_with(
-            "decoder_cold_compact_graph_reject",
-            request_ids=["cold-spec"],
-            once=True,
-            failed_invariants=["speculative_first_resume"],
-            cold_resume_indices=[0],
+        log_event.assert_not_called()
+        live = runner._staged_sfa_live_route(
+            local_route=route,
+            dp_route_action=StagedSFARouteAction.STAGED,
+            cudagraph_mode=CUDAGraphMode.PIECEWISE,
+            batch_descriptor=BatchDescriptor(num_tokens=2),
+            num_tokens_unpadded=2,
+            num_tokens_padded=2,
+            num_reqs=1,
+            should_ubatch=False,
         )
+        self.assertEqual(live.graph_key, StagedSFAGraphKey.fixed_spec(1, 2))
+        self.assertEqual(live.cold_compact_resumes, (True,))
+
+        runner._staged_sfa_graph_capture_sizes = ()
+        with patch.object(
+            model_runner_module,
+            "unwrap_staged_sfa_connector_metadata",
+        ) as unwrap_metadata:
+            not_configured = runner._staged_sfa_local_route(**kwargs)
+        unwrap_metadata.assert_not_called()
+        self.assertEqual(
+            not_configured.reason, StagedSFARouteReason.NOT_CONFIGURED
+        )
+        self.assertEqual(not_configured.frontiers, ())
+        self.assertEqual(not_configured.cold_compact_resumes, ())
+        runner._staged_sfa_graph_capture_sizes = (2, 4)
+
+        for name, overrides in {
+            "dp_fallback": {
+                "dp_route_action": StagedSFARouteAction.SAFE_NATIVE,
+            },
+            "runtime_mode": {"cudagraph_mode": CUDAGraphMode.NONE},
+            "ubatch": {"should_ubatch": True},
+            "missing_capture": {"num_tokens_padded": 6},
+            "descriptor": {
+                "batch_descriptor": BatchDescriptor(num_tokens=4),
+            },
+        }.items():
+            downgraded = runner._staged_sfa_live_route(
+                local_route=route,
+                **{
+                    "dp_route_action": StagedSFARouteAction.STAGED,
+                    "cudagraph_mode": CUDAGraphMode.PIECEWISE,
+                    "batch_descriptor": BatchDescriptor(num_tokens=2),
+                    "num_tokens_unpadded": 2,
+                    "num_tokens_padded": 2,
+                    "num_reqs": 1,
+                    "should_ubatch": False,
+                    **overrides,
+                },
+            )
+            with self.subTest(name=name):
+                self.assertEqual(
+                    downgraded.action, StagedSFARouteAction.SAFE_NATIVE
+                )
+                self.assertEqual(downgraded.frontiers, (8192,))
+                self.assertEqual(
+                    downgraded.cold_compact_resumes, (True,)
+                )
 
         rejected = runner._staged_sfa_local_route(
             **{
@@ -1262,8 +1316,45 @@ class TestStagedSFADummyBatch(unittest.TestCase):
             rejected.reason,
             StagedSFARouteReason.COLD_COMPACT_LAYOUT,
         )
-        self.assertEqual(rejected.frontiers, ())
-        self.assertEqual(rejected.cold_compact_resumes, ())
+        self.assertEqual(rejected.frontiers, (8192,))
+        self.assertEqual(rejected.cold_compact_resumes, (True,))
+
+    def test_wider_mtp_cold_resume_keeps_marker_on_native_route(self):
+        runner = self._build_runner()
+        runner.speculative_config = SimpleNamespace(num_speculative_tokens=2)
+        runner.decode_threshold = 3
+        runner.attn_state = AscendAttentionState.SpecDecoding
+        runner._staged_sfa_graph_capture_sizes = (3, 6)
+        route = runner._staged_sfa_local_route(
+            num_tokens_unpadded=3,
+            num_reqs=1,
+            num_scheduled_tokens=np.array([3], dtype=np.int32),
+            index_topk=2048,
+            has_cascade_attention=False,
+            request_ids=["cold-spec"],
+            kv_connector_metadata=SimpleNamespace(
+                requests=[
+                    SimpleNamespace(
+                        req_id="cold-spec",
+                        is_sparse_decode=True,
+                        load_spec=SimpleNamespace(
+                            can_load=False,
+                            lmcache_cached_tokens=8193,
+                            dsa_committed_end=8192,
+                            dsa_cold_compact_resume=True,
+                        ),
+                    )
+                ]
+            ),
+            num_computed_tokens=np.array([8192], dtype=np.int32),
+            prompt_lens=np.array([8193], dtype=np.int32),
+        )
+        self.assertEqual(route.action, StagedSFARouteAction.SAFE_NATIVE)
+        self.assertEqual(
+            route.reason, StagedSFARouteReason.SPECULATIVE_DECODE
+        )
+        self.assertEqual(route.frontiers, (8192,))
+        self.assertEqual(route.cold_compact_resumes, (True,))
 
     def test_native_route_logs_once_per_reason(self):
         runner = self._build_runner()
@@ -1337,7 +1428,7 @@ class TestStagedSFADummyBatch(unittest.TestCase):
         ):
             self.assertEqual(runner._staged_sfa_dummy_batch_size(**kwargs), 4)
 
-    def test_fixed_width_mtp_cold_resume_uses_native_first_step(self):
+    def test_fixed_width_mtp_accepts_mixed_cold_resume(self):
         runner = self._build_runner()
         runner.speculative_config = SimpleNamespace(
             method="mtp",
@@ -1346,30 +1437,77 @@ class TestStagedSFADummyBatch(unittest.TestCase):
         runner.decode_threshold = 2
         runner.attn_state = AscendAttentionState.SpecDecoding
         request_ids = ["req-0", "req-1"]
-        local = runner._staged_sfa_local_route(
+        metadata = SimpleNamespace(
+            requests=[
+                SimpleNamespace(
+                    req_id=req_id,
+                    is_sparse_decode=True,
+                    load_spec=SimpleNamespace(
+                        can_load=True,
+                        lmcache_cached_tokens=8192,
+                        dsa_cold_compact_resume=(req_id == "req-0"),
+                    ),
+                )
+                for req_id in request_ids
+            ]
+        )
+        kwargs = dict(
             num_tokens_unpadded=4,
             num_reqs=2,
             num_scheduled_tokens=np.full(2, 2, dtype=np.int32),
             index_topk=2048,
             has_cascade_attention=False,
             request_ids=request_ids,
-            kv_connector_metadata=SimpleNamespace(
-                requests=[
-                    SimpleNamespace(
-                        req_id=req_id,
-                        is_sparse_decode=True,
-                        load_spec=SimpleNamespace(
-                            can_load=True,
-                            lmcache_cached_tokens=4096,
-                            dsa_cold_compact_resume=True,
-                        ),
-                    )
-                    for req_id in request_ids
-                ]
-            ),
+            kv_connector_metadata=metadata,
+            num_computed_tokens=np.array([8192, 8193], dtype=np.int32),
+            prompt_lens=np.array([8193, 8193], dtype=np.int32),
         )
-        self.assertEqual(local.action, StagedSFARouteAction.SAFE_NATIVE)
-        self.assertEqual(local.reason, StagedSFARouteReason.COLD_COMPACT_LAYOUT)
+        local = runner._staged_sfa_local_route(**kwargs)
+        self.assertEqual(local.action, StagedSFARouteAction.STAGED)
+        self.assertEqual(local.cold_compact_resumes, (True, False))
+
+        mixed = runner._staged_sfa_local_route(
+            **{
+                **kwargs,
+                "kv_connector_metadata": SimpleNamespace(
+                    requests=[
+                        SimpleNamespace(
+                            req_id="req-0",
+                            is_sparse_decode=False,
+                            load_spec=SimpleNamespace(can_load=True),
+                        ),
+                        SimpleNamespace(
+                            req_id="req-1",
+                            is_sparse_decode=True,
+                            load_spec=SimpleNamespace(
+                                can_load=False,
+                                dsa_committed_end=8192,
+                                dsa_cold_compact_resume=True,
+                            ),
+                        ),
+                    ]
+                ),
+                "num_computed_tokens": np.array(
+                    [8193, 8192], dtype=np.int32
+                ),
+            }
+        )
+        self.assertEqual(mixed.action, StagedSFARouteAction.SAFE_NATIVE)
+        self.assertEqual(
+            mixed.reason, StagedSFARouteReason.MIXED_CONNECTOR_LOAD
+        )
+        self.assertEqual(mixed.frontiers, (0, 8192))
+        self.assertEqual(mixed.cold_compact_resumes, (False, True))
+
+        rejected = runner._staged_sfa_local_route(
+            **{
+                **kwargs,
+                "request_ids": request_ids[::-1],
+                "num_computed_tokens": np.array([8191, 8192], dtype=np.int32),
+            }
+        )
+        self.assertEqual(rejected.action, StagedSFARouteAction.SAFE_NATIVE)
+        self.assertEqual(rejected.cold_compact_resumes, (False, True))
 
     def test_mtp_request_three_and_five_use_different_graph_capacities(self):
         query_width = 2

@@ -1327,9 +1327,17 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
                 and num_actual_tokens
                 == len(plens_cpu) * fixed_decode_width
                 and n_real == len(plens_cpu)
-                and np.all(computed >= plens_cpu[:n_real])
                 and np.array_equal(qsl, fixed_query_starts)
             )
+            if fixed_width_decode:
+                computed_layout = computed >= plens_cpu[:n_real]
+                if cold_resumes:
+                    resume_mask = np.asarray(cold_resumes, dtype=bool)
+                    computed_layout[resume_mask] = (
+                        computed[resume_mask]
+                        == plens_cpu[:n_real][resume_mask] - 1
+                    )
+                fixed_width_decode = np.all(computed_layout)
             if fixed_width_decode:
                 num_decode_rows = num_actual_tokens
                 signature = (
