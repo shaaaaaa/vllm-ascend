@@ -142,6 +142,7 @@ def test_live_p2p_first_consume_diagnostic_is_not_persistent_load_gated() -> Non
         "attn_state",
         "decode_valid_rows_all",
         "group1_connector_wait_called",
+        "num_hidden_layers",
     } <= keyword_names
 
 

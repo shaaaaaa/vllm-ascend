@@ -1762,7 +1762,23 @@ class AscendSFAImpl(MLAAttentionImpl):
         self.local_num_heads = self.num_heads
         self.vllm_config = get_current_vllm_config()
         self.block_size = self.vllm_config.cache_config.block_size
+        self.diagnostic_num_hidden_layers = int(
+            self.vllm_config.model_config.get_num_layers(
+                self.vllm_config.parallel_config
+            )
+        )
         speculative_config = self.vllm_config.speculative_config
+        if (
+            speculative_config is not None
+            and speculative_config.method in ("deepseek_mtp", "mtp")
+        ):
+            self.diagnostic_num_hidden_layers += int(
+                getattr(
+                    self.vllm_config.model_config.hf_config,
+                    "num_nextn_predict_layers",
+                    0,
+                )
+            )
         self.decode_threshold = 1 + (
             speculative_config.num_speculative_tokens
             if speculative_config is not None
@@ -4244,6 +4260,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                         attn_metadata.decode_valid_rows_all
                     ),
                     group1_connector_wait_called=index_lmcache_enabled,
+                    num_hidden_layers=self.diagnostic_num_hidden_layers,
                 )
                 group1_cache_parts = {"index": kv_cache[2]}
                 group1_produced_parts = {"index": k_li}
@@ -4328,6 +4345,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                     decode_valid_rows_all=(
                         attn_metadata.decode_valid_rows_all
                     ),
+                    num_hidden_layers=self.diagnostic_num_hidden_layers,
                 )
 
         # DSA Step B2 (compact-scratch decode): the indexer just produced topk.
