@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""Client companion for ``examples/run_glm51_tp4_dp2_8layers.sh``.
+"""Client companion for ``examples/run_glm51_tp_dp_8layers.sh``.
 
 Compare prefill throughput and TTFT at concurrency 1 and 2. Prompts are sent
 as token IDs to keep tokenization outside the timed region. Every request asks
@@ -74,7 +74,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base-url", default="http://127.0.0.1:9960")
     parser.add_argument("--endpoint", default="/v1/completions")
-    parser.add_argument("--model", default="glm51-tp4-dp2-8layers")
+    parser.add_argument("--model", default="glm51-prefill-8layers")
     parser.add_argument("--prompt-tokens", type=int, default=DEFAULT_PROMPT_TOKENS)
     parser.add_argument(
         "--concurrencies",
@@ -93,7 +93,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output",
         type=Path,
-        default=Path("/workspace/lmy/layerwise-prefill-results/tp4-dp2-prefill.json"),
+        default=Path("/workspace/lmy/layerwise-prefill-results/prefill-dp.json"),
     )
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args()

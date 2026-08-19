@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
+# Usage: run_glm51_tp_dp_8layers.sh [DP_SIZE], where DP_SIZE is 1 or 2.
+
 unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY
 
 rm -rf /dev/shm/*
@@ -11,10 +13,32 @@ WORK_DIR="${WORK_DIR:-$(cd -- "${SCRIPT_DIR}/.." && pwd)}"
 LMCACHE_CONFIG="${LMCACHE_CONFIG:-/workspace/lmy/lmcache_config.yaml}"
 HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-9960}"
-SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-glm51-tp4-dp2-8layers}"
-LOG_DIR="${LOG_DIR:-${WORK_DIR}/tp4_dp2_8layers_logs}"
-PROFILE_DIR="${PROFILE_DIR:-${WORK_DIR}/vllm_profile/tp4_dp2_8layers}"
 CHUNK_SIZE="${CHUNK_SIZE:-4096}"
+DP_SIZE="${1:-${DP_SIZE:-2}}"
+
+if [[ $# -gt 1 ]]; then
+    echo "usage: $0 [1|2]" >&2
+    exit 2
+fi
+
+case "${DP_SIZE}" in
+    1)
+        TP_SIZE=8
+        ;;
+    2)
+        TP_SIZE=4
+        ;;
+    *)
+        echo "DP_SIZE must be 1 or 2, got: ${DP_SIZE}" >&2
+        exit 2
+        ;;
+esac
+
+DP_LOCAL_SIZE="${DP_SIZE}"
+TOPOLOGY="tp${TP_SIZE}_dp${DP_SIZE}"
+SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-glm51-prefill-8layers}"
+LOG_DIR="${LOG_DIR:-${WORK_DIR}/${TOPOLOGY}_8layers_logs}"
+PROFILE_DIR="${PROFILE_DIR:-${WORK_DIR}/vllm_profile/${TOPOLOGY}_8layers}"
 
 if [[ ! -f "${LMCACHE_CONFIG}" ]]; then
     echo "LMCache config does not exist: ${LMCACHE_CONFIG}" >&2
@@ -68,7 +92,7 @@ PROFILER_CONFIG="$(printf \
 echo "MODEL_PATH=${MODEL_PATH}"
 echo "LMCACHE_CONFIG=${LMCACHE_CONFIG}"
 echo "LAYERWISE_PREFILL_P_NODE=${VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE}"
-echo "TP=4 DP=2 DP_LOCAL=2 DP_BACKEND=mp"
+echo "TP=${TP_SIZE} DP=${DP_SIZE} DP_LOCAL=${DP_LOCAL_SIZE} DP_BACKEND=mp"
 echo "ASCEND_RT_VISIBLE_DEVICES=${ASCEND_RT_VISIBLE_DEVICES}"
 echo "LOG_FILE=${LOG_FILE}"
 echo "PROFILE_DIR=${PROFILE_DIR}"
@@ -79,17 +103,17 @@ cd "${WORK_DIR}"
 # this reduced-model smoke launcher intentionally does not enable speculative
 # decoding. vllm_skip_extra_layer_weights lets the loader ignore layers 8+ in
 # the original checkpoint instead of treating them as unexpected weights.
-# max-num-seqs is per DP replica. One sequence on each of the two local
-# replicas gives two concurrent long-prefill requests without reserving
-# layerwise shared-pool capacity for unused sequences.
+# max-num-seqs is per DP replica. Each local replica accepts one long-prefill
+# request without reserving layerwise shared-pool capacity for unused
+# sequences.
 vllm serve "${MODEL_PATH}" \
     --host "${HOST}" \
     --port "${PORT}" \
     --served-model-name "${SERVED_MODEL_NAME}" \
-    --tensor-parallel-size 4 \
+    --tensor-parallel-size "${TP_SIZE}" \
     --pipeline-parallel-size 1 \
-    --data-parallel-size 2 \
-    --data-parallel-size-local 2 \
+    --data-parallel-size "${DP_SIZE}" \
+    --data-parallel-size-local "${DP_LOCAL_SIZE}" \
     --data-parallel-backend mp \
     --enable-expert-parallel \
     --gpu-memory-utilization 0.93 \
