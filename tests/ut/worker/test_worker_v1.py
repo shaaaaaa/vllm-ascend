@@ -893,7 +893,12 @@ class TestNPUWorker(TestBase):
         worker.model_runner.profile_run.assert_called_once_with()
         self.assertEqual(result, 5000)
         self.assertEqual(worker.available_kv_cache_memory_bytes, 5000)
-        mock_logger.info_once.assert_called_once()
+        mock_logger.info_once.assert_called_once_with(
+            "Available KV cache memory: %d bytes (%.2f GiB)",
+            5000,
+            5000 / (1 << 30),
+            scope="local",
+        )
 
     def test_determine_available_memory_with_non_torch_allocations(self):
         """Test non-torch usage folded into non_kv_cache_memory."""

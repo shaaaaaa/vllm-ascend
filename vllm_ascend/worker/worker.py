@@ -485,7 +485,10 @@ class NPUWorker(WorkerBase):
 
         logger.debug(profile_result)
         logger.info_once(
-            "Available KV cache memory: %.2f GiB", GiB(self.available_kv_cache_memory_bytes), scope="local"
+            "Available KV cache memory: %d bytes (%.2f GiB)",
+            int(self.available_kv_cache_memory_bytes),
+            GiB(self.available_kv_cache_memory_bytes),
+            scope="local",
         )
 
         return int(self.available_kv_cache_memory_bytes)
