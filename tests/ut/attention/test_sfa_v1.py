@@ -129,7 +129,7 @@ def test_layerwise_prefill_transfer_window_rejects_missing_finish() -> None:
         )
 
 
-def test_sfa_transfer_window_runs_save_then_load_on_every_runtime_call() -> None:
+def test_sfa_transfer_window_runs_after_sfa_with_opaque_o_proj() -> None:
     events: list[str] = []
     fake_impl = SimpleNamespace()
     fake_impl._submit_sfa_transfer_window_save_operations = (
@@ -142,16 +142,13 @@ def test_sfa_transfer_window_runs_save_then_load_on_every_runtime_call() -> None
             f"post-save:{layer_name}" for layer_name, _ in operations
         )
     )
+    fake_impl._v_up_proj = (
+        lambda value: events.append("v_up_proj") or value
+    )
+    fake_impl.o_proj = (
+        lambda value: events.append("sequence_row_parallel") or (value, None)
+    )
 
-    class FakeOProj:
-        @staticmethod
-        def forward_with_pre_reduce_callback(input_, callback):
-            events.append("local_matmul")
-            callback()
-            events.append("allreduce")
-            return input_, None
-
-    fake_impl.o_proj = FakeOProj()
     save_operations = [
         ("layer-0.attn", [torch.empty(1)]),
         ("layer-0.indexer", [torch.empty(1)]),
@@ -178,20 +175,27 @@ def test_sfa_transfer_window_runs_save_then_load_on_every_runtime_call() -> None
         ),
     ):
         for _ in range(2):
-            AscendSFAImpl._forward_o_proj_with_layerwise_transfer_window(
+            events.append("sparse_attention")
+            layer_names = AscendSFAImpl._submit_sfa_layerwise_transfer_window(
                 fake_impl,
-                torch.ones(1),
-                torch.empty(1),
                 save_operations,
+            )
+            attn_output = fake_impl._v_up_proj(torch.ones(1))
+            fake_impl.o_proj(attn_output)
+            AscendSFAImpl._finish_sfa_layerwise_transfer_window(
+                fake_impl,
+                save_operations,
+                layer_names,
             )
 
     expected_runtime_order = [
-        "local_matmul",
+        "sparse_attention",
         "save:layer-0.attn",
         "save:layer-0.indexer",
         "load:layer-0.attn",
         "load:layer-0.indexer",
-        "allreduce",
+        "v_up_proj",
+        "sequence_row_parallel",
         "finish:layer-0.attn",
         "finish:layer-0.indexer",
         "post-save:layer-0.attn",

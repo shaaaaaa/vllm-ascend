@@ -2890,13 +2890,11 @@ class AscendSFAImpl(MLAAttentionImpl):
                 kv_caches,
             )
 
-    def _forward_o_proj_with_layerwise_transfer_window(
+    def _submit_sfa_layerwise_transfer_window(
         self,
-        attn_output: torch.Tensor,
-        output: torch.Tensor,
         save_operations: list[tuple[str, list[torch.Tensor]]],
-    ) -> None:
-        """Submit layerwise transfers between local o_proj and its HCOM."""
+    ) -> list[str]:
+        """Submit layerwise transfers after SFA and before output projection."""
         layer_names = [layer_name for layer_name, _ in save_operations]
         if len(layer_names) != len(set(layer_names)):
             raise RuntimeError(
@@ -2904,60 +2902,33 @@ class AscendSFAImpl(MLAAttentionImpl):
                 f"groups: {layer_names}"
             )
 
-        pre_reduce_forward = getattr(
-            self.o_proj,
-            "forward_with_pre_reduce_callback",
-            None,
-        )
-        if not callable(pre_reduce_forward):
-            raise RuntimeError(
-                "The active layerwise-prefill connector requires an o_proj "
-                "pre-reduce callback, but the configured o_proj does not "
-                "support one"
-            )
-
-        callback_invoked = False
-
-        def submit_transfers() -> None:
-            nonlocal callback_invoked
-            if callback_invoked:
+        # The transfer streams wait for the current compute stream. Submitting
+        # here releases save(N) and load(N+1) when SFA finishes, then v_up and
+        # the opaque output projection can be enqueued without an inner hook.
+        self._submit_sfa_transfer_window_save_operations(save_operations)
+        for layer_name in layer_names:
+            if not maybe_submit_layerwise_prefill_load(layer_name):
                 raise RuntimeError(
-                    "o_proj invoked the layerwise-prefill pre-reduce "
-                    "callback more than once"
+                    "The active KV connector stopped supporting the "
+                    "layerwise-prefill transfer window after SFA"
                 )
-            callback_invoked = True
+        return layer_names
 
-            # Queue both saves before either next-layer load.  This preserves
-            # the latent/indexer group's common layer boundary while allowing
-            # their transfer streams to overlap the following HCOM.
-            self._submit_sfa_transfer_window_save_operations(save_operations)
-            for layer_name in layer_names:
-                if not maybe_submit_layerwise_prefill_load(layer_name):
-                    raise RuntimeError(
-                        "The active KV connector stopped supporting the "
-                        "layerwise-prefill transfer window during o_proj"
-                    )
-
-        projected = pre_reduce_forward(attn_output, submit_transfers)
-        if not callback_invoked:
-            raise RuntimeError(
-                "o_proj did not invoke the layerwise-prefill pre-reduce "
-                "callback"
-            )
-        # The TP reduction has now been submitted.  Resume each capable
-        # connector's storer here so CPU publication/batched_put cannot extend
-        # the pre-HCOM callback and delay the collective.
+    def _finish_sfa_layerwise_transfer_window(
+        self,
+        save_operations: list[tuple[str, list[torch.Tensor]]],
+        layer_names: list[str],
+    ) -> None:
         for layer_name in layer_names:
             if not maybe_finish_layerwise_prefill_save(layer_name):
                 raise RuntimeError(
                     "The active KV connector stopped supporting the "
-                    "layerwise-prefill post-HCOM save hook during o_proj"
+                    "layerwise-prefill post-projection save hook"
                 )
         # A MultiConnector can contain legacy children that do not support the
-        # pre-HCOM transfer window. Preserve their original ordering without
+        # layerwise transfer window. Preserve their original ordering without
         # saving capable children twice.
         self._submit_sfa_post_transfer_window_save_operations(save_operations)
-        output[...] = projected[0]
 
     def _prepare_sorted_resident_sparse_cache(
         self,
@@ -5026,8 +4997,6 @@ class AscendSFAImpl(MLAAttentionImpl):
             # logs mean ms/layer-call periodically (mirrors the manager path).
             _dsa_prof.step()
 
-        attn_output = self._v_up_proj(attn_output)
-
         # Offload to LMCache. Legacy un-bundled connectors save only the
         # latent (k_nope, k_pe). Connectors declaring DSA index LMCache support
         # also save the sibling indexer layer whenever that path is enabled.
@@ -5060,6 +5029,20 @@ class AscendSFAImpl(MLAAttentionImpl):
             save_operations
         ) and layerwise_prefill_transfer_window_supported()
 
+        if self.enable_dsa_cp_with_o_proj_tp and use_layerwise_transfer_window:
+            raise RuntimeError(
+                "Layerwise-prefill transfer overlap is incompatible with "
+                "the SFA context-parallel o_proj path"
+            )
+
+        transfer_window_layer_names: list[str] = []
+        if use_layerwise_transfer_window:
+            transfer_window_layer_names = (
+                self._submit_sfa_layerwise_transfer_window(save_operations)
+            )
+
+        attn_output = self._v_up_proj(attn_output)
+
         weight_prefetch_method = get_weight_prefetch_method()
         weight_prefetch_method.maybe_prefetch_mla_or_sla_weight_in_current_stream(
             inputs=self.o_proj.weight,
@@ -5069,11 +5052,6 @@ class AscendSFAImpl(MLAAttentionImpl):
         )
 
         if self.enable_dsa_cp_with_o_proj_tp:
-            if use_layerwise_transfer_window:
-                raise RuntimeError(
-                    "Layerwise-prefill HCOM overlap is incompatible with "
-                    "the SFA context-parallel o_proj path"
-                )
             # When using SFA-CP with pd mixed, o_proj has two cases:
             # 1. prefill: o_proj is a TP weight, we need to all-gather o_proj weight to switch TP=1.
             # 2. decode: all-to-all the hidden_state before the o_proj forward.
@@ -5098,14 +5076,13 @@ class AscendSFAImpl(MLAAttentionImpl):
             attn_output = torch.empty_like(send)
             torch.distributed.all_to_all_single(attn_output, send, group=get_tp_group().device_group)
 
+        output[...] = self.o_proj(attn_output)[0]
         if use_layerwise_transfer_window:
-            self._forward_o_proj_with_layerwise_transfer_window(
-                attn_output,
-                output,
+            self._finish_sfa_layerwise_transfer_window(
                 save_operations,
+                transfer_window_layer_names,
             )
         else:
-            output[...] = self.o_proj(attn_output)[0]
             # Keep legacy/non-P connector ordering unchanged.
             self._submit_sfa_save_operations(save_operations)
 
