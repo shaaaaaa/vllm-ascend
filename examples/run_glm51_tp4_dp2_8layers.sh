@@ -14,6 +14,7 @@ PORT="${PORT:-9960}"
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-glm51-tp4-dp2-8layers}"
 LOG_DIR="${LOG_DIR:-${WORK_DIR}/tp4_dp2_8layers_logs}"
 PROFILE_DIR="${PROFILE_DIR:-${WORK_DIR}/vllm_profile/tp4_dp2_8layers}"
+CHUNK_SIZE="${CHUNK_SIZE:-4096}"
 
 if [[ ! -f "${LMCACHE_CONFIG}" ]]; then
     echo "LMCache config does not exist: ${LMCACHE_CONFIG}" >&2
@@ -94,12 +95,13 @@ vllm serve "${MODEL_PATH}" \
     --gpu-memory-utilization 0.93 \
     --max-model-len 140000 \
     --max-num-seqs 1 \
-    --max-num-batched-tokens 4096 \
+    --max-num-batched-tokens "${CHUNK_SIZE}" \
     --enable-chunked-prefill \
     --seed 1024 \
     --trust-remote-code \
     --quantization ascend \
-    --enforce-eager \
+    --compilation-config \
+        "{\"cudagraph_mode\":\"PIECEWISE\",\"cudagraph_capture_sizes\":[${CHUNK_SIZE}]}" \
     --hf-overrides \
         '{"num_hidden_layers":8,"num_nextn_predict_layers":0,"vllm_skip_extra_layer_weights":true}' \
     --additional-config \

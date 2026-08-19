@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""Compare prefill throughput and TTFT at concurrency 1 and 2.
+"""Client companion for ``examples/run_glm51_tp4_dp2_8layers.sh``.
 
-Prompts are sent as token IDs to keep tokenization outside the timed region.
-Every request asks for one streamed output token, so TTFT covers request
-submission, scheduling, chunked prefill, sampling, and delivery of that token,
-without running a separate decode forward.
+Compare prefill throughput and TTFT at concurrency 1 and 2. Prompts are sent
+as token IDs to keep tokenization outside the timed region. Every request asks
+for one streamed output token, so TTFT covers request submission, scheduling,
+chunked prefill, sampling, and delivery of that token, without running a
+separate decode forward.
 """
 
 from __future__ import annotations
