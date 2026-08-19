@@ -3,6 +3,8 @@ set -Eeuo pipefail
 
 unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY
 
+rm -rf /dev/shm/*
+
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 MODEL_PATH="${MODEL_PATH:-/workspace/models/GLM-5.1-w4a8}"
 WORK_DIR="${WORK_DIR:-$(cd -- "${SCRIPT_DIR}/.." && pwd)}"
