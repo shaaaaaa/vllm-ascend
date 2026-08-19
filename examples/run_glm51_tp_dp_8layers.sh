@@ -44,8 +44,10 @@ case "${LAYERWISE_MODE}" in
         ;;
     off)
         LAYERWISE_PREFILL_P_NODE=false
-        DSA_SHARED_POOL=0
-        LMCACHE_USE_LAYERWISE_VALUE=false
+        # Preserve the original bundle-pool + layerwise LMCache connector.
+        # Only disable the P-node two-bank KV-cache reuse protocol.
+        DSA_SHARED_POOL=1
+        LMCACHE_USE_LAYERWISE_VALUE=true
         LMCACHE_ASYNC_DECODE_SAVE_VALUE=false
         ;;
     *)
