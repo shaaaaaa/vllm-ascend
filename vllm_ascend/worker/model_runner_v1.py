@@ -2100,6 +2100,11 @@ class NPUModelRunner(GPUModelRunner):
                         forward_context.mtp_dw_deep_diag_req_ids = (
                             diag_deep_req_ids
                         )
+            content_diagnostics_enabled = (
+                npu_content_diagnostics_enabled()
+            )
+            if content_diagnostics_enabled:
+                begin_deferred_diagnostic_step()
             if staged_sfa_graph_key is not None:
                 first_layer_name, first_impl = self._staged_sfa_impls[0]
                 first_impl.bootstrap_cross_layer(first_layer_name)
@@ -2112,16 +2117,9 @@ class NPUModelRunner(GPUModelRunner):
                 once=True,
                 total_num_scheduled_tokens=num_tokens_padded,
             )
-            content_diagnostics_enabled = (
-                npu_content_diagnostics_enabled()
-            )
-            if content_diagnostics_enabled:
-                begin_deferred_diagnostic_step()
             hidden_states = self._model_forward(
                 num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
             )
-            if content_diagnostics_enabled:
-                flush_deferred_diagnostics()
             if cold_perf_req_ids:
                 log_cold_perf_event(
                     "decoder_forward_return",
@@ -2185,6 +2183,8 @@ class NPUModelRunner(GPUModelRunner):
                     if self.debugger is not None:
                         self.debugger.stop()
                         self.debugger.step()
+                    if content_diagnostics_enabled:
+                        flush_deferred_diagnostics()
                     return hidden_states
                 if self.is_pooling_model:
                     # Return the pooling output.
@@ -2208,6 +2208,8 @@ class NPUModelRunner(GPUModelRunner):
                     if self.debugger is not None:
                         self.debugger.stop()
                         self.debugger.step()
+                    if content_diagnostics_enabled:
+                        flush_deferred_diagnostics()
                     return output
 
                 sample_hidden_states = hidden_states[logits_indices]
@@ -2518,6 +2520,22 @@ class NPUModelRunner(GPUModelRunner):
             pp = get_pp_group()
             if pp.world_size > 1 and pp.is_last_rank:
                 self._pp_broadcast_prev_sampled_token_ids(sampler_output.sampled_token_ids)
+
+        # Host readback can synchronize the device.  Keep it after sampling,
+        # MTP draft proposal, connector finalization, async state update, and
+        # PP broadcast so diagnostics cannot repair a production ordering bug.
+        if npu_content_diagnostics_enabled():
+            if staged_sfa_graph_key is not None:
+                for layer_name, impl in self._staged_sfa_impls:
+                    metadata = attn_metadata.get(layer_name)
+                    if metadata is None:
+                        continue
+                    impl.queue_staged_graph_post_diagnostic(
+                        layer_name,
+                        staged_sfa_graph_key,
+                        metadata,
+                    )
+            flush_deferred_diagnostics()
 
         if not self.use_async_scheduling:
             return model_runner_output

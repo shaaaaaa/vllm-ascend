@@ -1,3 +1,4 @@
+import inspect
 import os
 import sys
 from pathlib import Path
@@ -1227,6 +1228,8 @@ class TestStagedSFAGraphPoc(TestBase):
         impl.vllm_config.cache_config.block_size = 128
         impl.vllm_config.speculative_config = None
         impl.vllm_config.lora_config = None
+        impl.diagnostic_num_cache_layers = 79
+        impl._staged_graph_diagnostic_layer_ids = frozenset((0, 39, 78))
         impl._staged_sfa_capture_state = sfa_v1._StagedSFACaptureState()
         impl._staged_sfa_graph_capture_sizes = (1, 4)
         impl._staged_sfa_bridge_buffers = None
@@ -1394,11 +1397,22 @@ class TestStagedSFAGraphPoc(TestBase):
         impl = self._make_eligible_impl()
         kv_cache = self._make_eligible_kv_cache()
         impl._staged_sfa_capture_state.initialized_cache_capacity = 1
-        impl._staged_sfa_capture_state.producer_event = MagicMock()
+        producer_event = MagicMock()
+        operation_order = []
+        producer_event.reset.side_effect = lambda: operation_order.append(
+            "reset"
+        )
+        producer_event.record.side_effect = lambda: operation_order.append(
+            "record"
+        )
+        impl._staged_sfa_capture_state.producer_event = producer_event
         impl._cross_layer_kv_cache = MagicMock(return_value=(kv_cache, "index-0", True))
         impl._cross_layer_ineligible_reason = MagicMock(return_value=None)
         impl._cross_layer_pre_compute = MagicMock(
-            return_value=self._make_pre_outputs()
+            side_effect=lambda *args: (
+                operation_order.append("compute")
+                or self._make_pre_outputs()
+            )
         )
         eager_metadata = self._make_decode_metadata()
         capture_metadata = self._make_decode_metadata()
@@ -1464,7 +1478,19 @@ class TestStagedSFAGraphPoc(TestBase):
             impl._staged_sfa_capture_state.bindings.keys(),
             {STAGED_SFA_SINGLETON_GRAPH_KEY},
         )
+        self.assertEqual(
+            operation_order,
+            ["reset", "compute", "record"] * 2,
+        )
         self.assertTrue(all(tensor.shape[0] == 4 for result in outputs for tensor in result))
+
+    def test_staged_producer_uses_graph_external_event(self):
+        source = inspect.getsource(
+            sfa_v1.AscendSFAImpl.cross_layer_graph_pre
+        )
+
+        self.assertIn("torch.npu.ExternalEvent()", source)
+        self.assertNotIn("producer_event = torch.npu.Event()", source)
 
     def test_cross_layer_padding_uses_fixed_graph_rows(self):
         impl = self._make_eligible_impl()
@@ -1610,6 +1636,52 @@ class TestStagedSFAGraphPoc(TestBase):
                     torch.count_nonzero(args[7] < 0).item(),
                     padding_tokens,
                 )
+
+    def test_staged_index_scatter_masks_padding_idempotently(self):
+        slots = torch.tensor([17, 18, -1, -1], dtype=torch.int64)
+        updates = torch.arange(16, dtype=torch.float32).reshape(4, 4)
+        row_owners = torch.tensor([0, 0, -1, -1], dtype=torch.int32)
+        flat_cache = torch.zeros(32, 4)
+
+        masked_slots, masked_updates = (
+            sfa_v1.AscendSFAImpl._mask_staged_index_scatter_padding(
+                slots,
+                updates,
+                row_owners,
+                flat_cache,
+            )
+        )
+
+        self.assertEqual(masked_slots.tolist(), [17, 18, 17, 17])
+        self.assertTrue(torch.equal(masked_updates[:2], updates[:2]))
+        self.assertTrue(torch.equal(masked_updates[2], updates[0]))
+        self.assertTrue(torch.equal(masked_updates[3], updates[0]))
+        self.assertTrue(torch.equal(slots, torch.tensor([17, 18, -1, -1])))
+        self.assertTrue(
+            torch.equal(
+                updates,
+                torch.arange(16, dtype=torch.float32).reshape(4, 4),
+            )
+        )
+
+    def test_staged_index_scatter_all_padding_uses_valid_alias(self):
+        slots = torch.full((2,), 99, dtype=torch.int64)
+        updates = torch.arange(8, dtype=torch.float32).reshape(2, 4)
+        row_owners = torch.full((2,), -1, dtype=torch.int32)
+        flat_cache = torch.arange(32, dtype=torch.float32).reshape(8, 4)
+
+        masked_slots, masked_updates = (
+            sfa_v1.AscendSFAImpl._mask_staged_index_scatter_padding(
+                slots,
+                updates,
+                row_owners,
+                flat_cache,
+            )
+        )
+
+        self.assertEqual(masked_slots.tolist(), [7, 7])
+        self.assertTrue(torch.equal(masked_updates[0], flat_cache[7]))
+        self.assertTrue(torch.equal(masked_updates[1], flat_cache[7]))
 
     def test_bridge_storage_is_preallocated_and_reused_for_q1(self):
         impl = self._make_eligible_impl()
@@ -1892,6 +1964,214 @@ class TestStagedSFAGraphPoc(TestBase):
 
         args = impl._cross_layer_post_compute.call_args.args
         self.assertEqual([tensor.shape[0] for tensor in args[:3]], [1] * 3)
+
+    def test_graph_post_diagnostic_is_captured_and_queued_after_replay(self):
+        impl = self._make_eligible_impl()
+        impl.decode_threshold = 2
+        kv_cache = self._make_eligible_kv_cache()
+        impl._cross_layer_kv_cache = MagicMock(
+            return_value=(kv_cache, "index-0", True)
+        )
+        impl._cross_layer_post_compute = MagicMock()
+        graph_key = StagedSFAGraphKey.fixed_spec(1, 2)
+        metadata = self._make_decode_metadata(2)
+        metadata.decode_request_ids_compact = ["req-0"]
+        metadata.req_ids = ["req-0"]
+        metadata.decode_req_indices_cpu = [0, 0]
+        metadata.seq_lens_cpu = [9]
+        metadata.seq_lens = torch.tensor([9], dtype=torch.int32)
+        layer_name = "model.layers.0.self_attn.attn"
+        context = SimpleNamespace(
+            staged_sfa_graph_key=graph_key,
+            cudagraph_runtime_mode=CUDAGraphMode.NONE,
+            attn_metadata={layer_name: metadata},
+        )
+        output = torch.arange(2 * 512, dtype=torch.float32).reshape(2, 512)
+
+        with (
+            patch.object(sfa_v1, "get_forward_context", return_value=context),
+            patch.object(
+                sfa_v1,
+                "npu_content_diagnostics_enabled",
+                return_value=True,
+            ),
+            patch.object(
+                sfa_v1,
+                "queue_staged_graph_stage_fingerprint",
+            ) as queue_stage,
+        ):
+            impl.cross_layer_graph_post(
+                layer_name,
+                torch.empty(2, 2, 4),
+                torch.empty(2, 2, 2),
+                torch.empty(2, 1, 16, dtype=torch.int32),
+                kv_cache,
+                metadata,
+                output,
+            )
+            context.cudagraph_runtime_mode = CUDAGraphMode.PIECEWISE
+            impl.queue_staged_graph_post_diagnostic(
+                layer_name,
+                graph_key,
+                metadata,
+            )
+
+        snapshot = impl._staged_sfa_capture_state.post_diagnostic_buffers[
+            graph_key
+        ]
+        self.assertEqual(tuple(snapshot.shape), (2, 256))
+        self.assertTrue(torch.equal(snapshot, output[:, :256]))
+        queue_stage.assert_called_once()
+        kwargs = queue_stage.call_args.kwargs
+        self.assertEqual(kwargs["stage"], "after_graph_post")
+        self.assertEqual(
+            kwargs["components"]["attention_output"].data_ptr(),
+            snapshot.data_ptr(),
+        )
+
+    def test_graph_pre_diagnostic_captures_hidden_input(self):
+        impl = self._make_eligible_impl()
+        kv_cache = self._make_eligible_kv_cache()
+        impl._staged_sfa_capture_state.initialized_cache_capacity = 1
+        impl._staged_sfa_capture_state.producer_event = MagicMock()
+        impl._cross_layer_kv_cache = MagicMock(
+            return_value=(kv_cache, "index-0", True)
+        )
+        impl._cross_layer_ineligible_reason = MagicMock(return_value=None)
+        impl._cross_layer_pre_compute = MagicMock(
+            return_value=self._make_pre_outputs(2)
+        )
+        graph_key = StagedSFAGraphKey.fixed_spec(1, 2)
+        metadata = self._make_decode_metadata(2)
+        metadata.decode_req_indices.fill_(0)
+        metadata.decode_req_indices_cpu = [0, 0]
+        metadata.seq_lens = metadata.seq_lens[:1]
+        metadata.seq_lens_cpu = metadata.seq_lens_cpu[:1]
+        metadata.decode_request_ids_compact = ["req-0"]
+        metadata.req_ids = ["req-0"]
+        layer_name = "model.layers.0.self_attn.attn"
+        context = SimpleNamespace(
+            staged_sfa_graph_dummy_run=True,
+            staged_sfa_graph_key=graph_key,
+            staged_sfa_route=StagedSFARouteDecision(
+                StagedSFARouteAction.STAGED,
+                StagedSFARouteReason.ELIGIBLE,
+                graph_key,
+                (8,),
+            ),
+            cudagraph_runtime_mode=CUDAGraphMode.NONE,
+        )
+        hidden = torch.arange(2 * 512, dtype=torch.float32).reshape(
+            2, 512
+        )
+
+        with (
+            patch.object(sfa_v1, "get_forward_context", return_value=context),
+            patch.object(
+                sfa_v1,
+                "npu_content_diagnostics_enabled",
+                return_value=True,
+            ),
+        ):
+            impl.cross_layer_graph_pre(
+                layer_name,
+                hidden,
+                kv_cache,
+                metadata,
+                False,
+                torch.empty_like(hidden),
+            )
+
+        snapshot = impl._staged_sfa_capture_state.input_diagnostic_buffers[
+            graph_key
+        ]
+        self.assertEqual(tuple(snapshot.shape), (2, 256))
+        self.assertTrue(torch.equal(snapshot, hidden[:, :256]))
+
+    def test_graph_pre_diagnostic_waits_for_producer_event(self):
+        source = inspect.getsource(
+            sfa_v1.AscendSFAImpl.cross_layer_lmcache_retrieve
+        )
+
+        wait = source.index(
+            "torch.npu.current_stream().wait_event(producer_event)"
+        )
+        snapshot = source.index("queue_selected_topk_fingerprint(")
+        connector = source.index("wait_for_kv_layer_from_connector(")
+        self.assertLess(wait, snapshot)
+        self.assertLess(snapshot, connector)
+
+    def test_graph_post_diagnostic_buffer_is_updated_in_piecewise_replay(self):
+        impl = self._make_eligible_impl()
+        impl.decode_threshold = 2
+        kv_cache = self._make_eligible_kv_cache()
+        impl._cross_layer_kv_cache = MagicMock(
+            return_value=(kv_cache, "index-0", True)
+        )
+        impl._cross_layer_post_compute = MagicMock()
+        graph_key = StagedSFAGraphKey.fixed_spec(1, 2)
+        metadata = self._make_decode_metadata(2)
+        metadata.decode_request_ids_compact = ["req-0"]
+        metadata.decode_req_indices_cpu = [0, 0]
+        metadata.seq_lens_cpu = [9]
+        layer_name = "model.layers.0.self_attn.attn"
+        context = SimpleNamespace(
+            staged_sfa_graph_key=graph_key,
+            cudagraph_runtime_mode=CUDAGraphMode.NONE,
+        )
+        eager_output = torch.zeros(2, 512)
+        replay_output = torch.arange(
+            2 * 512, dtype=torch.float32
+        ).reshape(2, 512)
+
+        with (
+            patch.object(sfa_v1, "get_forward_context", return_value=context),
+            patch.object(
+                sfa_v1,
+                "npu_content_diagnostics_enabled",
+                return_value=True,
+            ),
+            patch.object(
+                sfa_v1,
+                "queue_staged_graph_stage_fingerprint",
+            ) as queue_stage,
+        ):
+            # Eager warmup owns the stable buffer subsequently written by the
+            # captured PIECEWISE graph.
+            impl.cross_layer_graph_post(
+                layer_name,
+                torch.empty(2, 2, 4),
+                torch.empty(2, 2, 2),
+                torch.empty(2, 1, 16, dtype=torch.int32),
+                kv_cache,
+                metadata,
+                eager_output,
+            )
+            context.cudagraph_runtime_mode = CUDAGraphMode.PIECEWISE
+            impl.cross_layer_graph_post(
+                layer_name,
+                torch.empty(2, 2, 4),
+                torch.empty(2, 2, 2),
+                torch.empty(2, 1, 16, dtype=torch.int32),
+                kv_cache,
+                metadata,
+                replay_output,
+            )
+            impl.queue_staged_graph_post_diagnostic(
+                layer_name,
+                graph_key,
+                metadata,
+            )
+
+        snapshot = impl._staged_sfa_capture_state.post_diagnostic_buffers[
+            graph_key
+        ]
+        self.assertTrue(torch.equal(snapshot, replay_output[:, :256]))
+        queue_stage.assert_called_once()
+        self.assertEqual(
+            queue_stage.call_args.kwargs["stage"],
+            "after_graph_post",
+        )
 
     def test_cross_layer_bootstrap_prepares_boundary_before_index_wait(self):
         impl = self._make_eligible_impl()

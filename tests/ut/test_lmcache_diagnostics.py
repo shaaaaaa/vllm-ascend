@@ -27,6 +27,7 @@ def test_bridge_is_disabled_and_noop_by_default() -> None:
     bridge.queue_group1_first_consume(value="unused")
     bridge.queue_cache_tail_fingerprint(value="unused")
     bridge.queue_selected_topk_fingerprint(value="unused")
+    bridge.queue_staged_graph_stage_fingerprint(value="unused")
 
 
 def test_installed_callback_bundle_routes_every_operation() -> None:
@@ -48,6 +49,7 @@ def test_installed_callback_bundle_routes_every_operation() -> None:
             queue_group1_first_consume=callback("consume"),
             queue_cache_tail=callback("tail"),
             queue_selected_topk=callback("topk"),
+            queue_staged_graph_stage=callback("staged"),
         )
     )
 
@@ -58,6 +60,7 @@ def test_installed_callback_bundle_routes_every_operation() -> None:
     bridge.queue_group1_first_consume(req_ids=["request"])
     bridge.queue_cache_tail_fingerprint(req_ids=["request"])
     bridge.queue_selected_topk_fingerprint(req_ids=["request"])
+    bridge.queue_staged_graph_stage_fingerprint(req_ids=["request"])
     bridge.flush_deferred_diagnostics()
 
     assert [event for event, _, _ in events] == [
@@ -67,6 +70,7 @@ def test_installed_callback_bundle_routes_every_operation() -> None:
         "consume",
         "tail",
         "topk",
+        "staged",
         "flush",
     ]
 
@@ -217,6 +221,94 @@ def test_group1_scatter_excludes_graph_and_speculative_padding() -> None:
         assert len(call.args) == 3
         assert "[:actual_tokens]" in ast.unparse(call.args[1])
         assert "[:actual_tokens]" in ast.unparse(call.args[2])
+
+
+def test_graph_bootstrap_snapshot_is_not_cleared_before_forward() -> None:
+    repository_root = Path(__file__).resolve().parents[2]
+    tree = ast.parse(
+        (repository_root / "vllm_ascend/worker/model_runner_v1.py").read_text(
+            encoding="utf-8"
+        )
+    )
+    runner = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "NPUModelRunner"
+    )
+    execute_model = next(
+        node
+        for node in runner.body
+        if isinstance(node, ast.FunctionDef) and node.name == "execute_model"
+    )
+    calls = {
+        ast.unparse(node.func): node.lineno
+        for node in ast.walk(execute_model)
+        if isinstance(node, ast.Call)
+        and ast.unparse(node.func)
+        in {
+            "begin_deferred_diagnostic_step",
+            "first_impl.bootstrap_cross_layer",
+        }
+    }
+    assert calls["begin_deferred_diagnostic_step"] < calls[
+        "first_impl.bootstrap_cross_layer"
+    ]
+
+
+def test_graph_bootstrap_waits_for_group1_before_snapshot() -> None:
+    repository_root = Path(__file__).resolve().parents[2]
+    tree = ast.parse(
+        (repository_root / "vllm_ascend/attention/sfa_v1.py").read_text(
+            encoding="utf-8"
+        )
+    )
+    implementation = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "AscendSFAImpl"
+    )
+    bootstrap = next(
+        node
+        for node in implementation.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "bootstrap_cross_layer"
+    )
+    calls = {
+        ast.unparse(node.func): node.lineno
+        for node in ast.walk(bootstrap)
+        if isinstance(node, ast.Call)
+    }
+
+    assert calls["wait_for_kv_layer_from_connector"] < calls[
+        "queue_staged_graph_stage_fingerprint"
+    ]
+
+
+def test_graph_post_readback_occurs_after_behavior_critical_sampling() -> None:
+    repository_root = Path(__file__).resolve().parents[2]
+    tree = ast.parse(
+        (repository_root / "vllm_ascend/worker/model_runner_v1.py").read_text(
+            encoding="utf-8"
+        )
+    )
+    runner = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "NPUModelRunner"
+    )
+    sample_tokens = next(
+        node
+        for node in runner.body
+        if isinstance(node, ast.FunctionDef) and node.name == "sample_tokens"
+    )
+    source = ast.unparse(sample_tokens)
+    queue = source.index("impl.queue_staged_graph_post_diagnostic")
+    flush = source.index("flush_deferred_diagnostics")
+    assert source.index("propose_draft_token_ids(") < queue
+    assert source.index("self.finalize_kv_connector(") < queue
+    assert source.index("self._update_states_after_model_execute(") < queue
+    assert source.index("self._pp_broadcast_prev_sampled_token_ids(") < queue
+    assert queue < flush
 
 
 def test_two_group_indexer_never_falls_back_to_latent_addresses() -> None:

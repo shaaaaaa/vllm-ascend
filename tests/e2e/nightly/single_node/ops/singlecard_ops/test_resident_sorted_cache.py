@@ -1765,6 +1765,61 @@ def test_sorted_resident_keeps_multiple_request_states_isolated(mtp):
 
 
 @pytest.mark.parametrize("mtp", [1, 2])
+def test_sorted_resident_zeroes_staged_graph_padding_rows(mtp):
+    requests = 2
+    capacity = mtp * INDEX_TOPK
+    source = torch.cat((_source(mtp, 0), _source(mtp, 5000)), dim=0)
+    values = source.npu()
+    boundaries = torch.tensor(
+        [1500] * mtp + [0] * mtp,
+        dtype=torch.int32,
+        device="npu",
+    )
+    row_requests = torch.tensor(
+        [0] * mtp + [-1] * mtp,
+        dtype=torch.int32,
+        device="npu",
+    )
+    request_states = torch.tensor([0, -1], dtype=torch.int32, device="npu")
+    request_generations = torch.tensor([11, 0], dtype=torch.int64, device="npu")
+    workspace = allocate_sorted_resident_workspace(
+        requests, mtp, device=torch.device("npu")
+    )
+    state = allocate_sorted_resident_state(
+        requests, requests, mtp, device=torch.device("npu")
+    )
+    blocks_per_request = capacity // 128
+    block_table = torch.arange(
+        requests * blocks_per_request,
+        dtype=torch.int32,
+        device="npu",
+    ).reshape(requests, blocks_per_request)
+
+    prepare_resident_sharded_union_(
+        values,
+        boundaries,
+        row_requests,
+        request_states,
+        request_generations,
+        state,
+        workspace,
+        mtp=mtp,
+    )
+    prepare_sorted_resident_cache_fused_(
+        values,
+        block_table,
+        request_states,
+        request_generations,
+        state,
+        workspace,
+        block_size=128,
+    )
+    torch.npu.synchronize()
+
+    assert int(torch.count_nonzero(values[mtp:]).cpu()) == 0
+
+
+@pytest.mark.parametrize("mtp", [1, 2])
 def test_sorted_resident_negative_state_uses_request_private_dummy_row(mtp):
     requests = 1
     shard_count = resident_shard_count(mtp)

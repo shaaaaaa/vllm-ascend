@@ -26,6 +26,7 @@ class NPUContentDiagnosticCallbacks:
     queue_group1_first_consume: DiagnosticCallback
     queue_cache_tail: DiagnosticCallback
     queue_selected_topk: DiagnosticCallback
+    queue_staged_graph_stage: DiagnosticCallback
 
 
 _CALLBACKS: NPUContentDiagnosticCallbacks | None = None
@@ -91,3 +92,9 @@ def queue_selected_topk_fingerprint(**kwargs: Any) -> None:
     callbacks = _CALLBACKS
     if callbacks is not None:
         callbacks.queue_selected_topk(**kwargs)
+
+
+def queue_staged_graph_stage_fingerprint(**kwargs: Any) -> None:
+    callbacks = _CALLBACKS
+    if callbacks is not None:
+        callbacks.queue_staged_graph_stage(**kwargs)

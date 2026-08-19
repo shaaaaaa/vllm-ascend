@@ -94,6 +94,7 @@ from vllm_ascend.lmcache_diagnostics import (
     queue_cache_tail_fingerprint,
     queue_group1_first_consume,
     queue_selected_topk_fingerprint,
+    queue_staged_graph_stage_fingerprint,
 )
 from vllm_ascend.ops.layer_shard_linear import (
     is_hidden_layer,
@@ -202,6 +203,12 @@ class _StagedSFACaptureState:
     remap_boundary: torch.Tensor | None = None
     runtime: tuple[Any, ...] | None = None
     initialized_cache_capacity: int = 0
+    input_diagnostic_buffers: dict[
+        StagedSFAGraphKey, torch.Tensor
+    ] = field(default_factory=dict)
+    post_diagnostic_buffers: dict[StagedSFAGraphKey, torch.Tensor] = field(
+        default_factory=dict,
+    )
     bindings: dict[StagedSFAGraphKey, _StagedSFALayerBinding] = field(
         default_factory=dict,
     )
@@ -1785,10 +1792,15 @@ class AscendSFAImpl(MLAAttentionImpl):
         self.local_num_heads = self.num_heads
         self.vllm_config = get_current_vllm_config()
         self.block_size = self.vllm_config.cache_config.block_size
-        self.diagnostic_num_hidden_layers = int(
+        diagnostic_model_layers = int(
             self.vllm_config.model_config.get_num_layers(
                 self.vllm_config.parallel_config
             )
+        )
+        self.diagnostic_num_hidden_layers = diagnostic_model_layers
+        self.diagnostic_num_cache_layers = diagnostic_model_layers
+        self._staged_graph_diagnostic_layer_ids = frozenset(
+            (0, diagnostic_model_layers // 2, diagnostic_model_layers - 1)
         )
         speculative_config = self.vllm_config.speculative_config
         if (
@@ -3124,10 +3136,18 @@ class AscendSFAImpl(MLAAttentionImpl):
         q_pe = self.rope_single(q_pe, cos, sin)
         k_li = self._get_full_kv(k_li, None)
 
+        indexer_slot_mapping, k_li_for_scatter = (
+            self._mask_staged_index_scatter_padding(
+                indexer_slot_mapping,
+                k_li,
+                row_req_indices,
+                indexer_cache.view(-1, k_li.shape[-1]),
+            )
+        )
         torch_npu.npu_scatter_nd_update_(
             indexer_cache.view(-1, k_li.shape[-1]),
             indexer_slot_mapping.view(-1, 1),
-            k_li.view(-1, k_li.shape[-1]),
+            k_li_for_scatter.view(-1, k_li.shape[-1]),
         )
         topk_indices = self.indexer_select_post_process(
             x=hidden_states,
@@ -3178,6 +3198,59 @@ class AscendSFAImpl(MLAAttentionImpl):
             selected_count_values,
             target_slot_mapping,
         )
+
+    @staticmethod
+    def _mask_staged_index_scatter_padding(
+        slot_mapping: torch.Tensor,
+        updates: torch.Tensor,
+        row_request_indices: torch.Tensor,
+        flat_cache: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Replace graph-padding writes with an idempotent real-row write."""
+        rows = int(slot_mapping.numel())
+        if (
+            rows <= 0
+            or int(updates.shape[0]) != rows
+            or int(row_request_indices.numel()) != rows
+            or flat_cache.ndim != 2
+            or int(flat_cache.shape[0]) <= 0
+            or int(updates[0].numel()) != int(flat_cache.shape[1])
+        ):
+            raise RuntimeError(
+                "staged index scatter inputs do not share one fixed row count"
+            )
+        valid_rows = row_request_indices.reshape(-1) >= 0
+        safe_slots = (
+            slot_mapping.reshape(-1)[:1]
+            .clamp(min=0, max=int(flat_cache.shape[0]) - 1)
+            .expand(rows)
+        )
+        masked_slots = torch.where(
+            valid_rows,
+            slot_mapping.reshape(-1),
+            safe_slots,
+        )
+        update_mask = valid_rows.reshape(
+            (rows,) + (1,) * (updates.ndim - 1)
+        )
+        # Runtime rows are request-major, so row zero is real whenever this
+        # rank owns any request. An entirely idle DP rank has only padding;
+        # write back the aliased slot's current value rather than dummy data.
+        existing = flat_cache.index_select(
+            0,
+            safe_slots[:1].long(),
+        ).reshape((1,) + tuple(updates.shape[1:]))
+        first_is_real = valid_rows[:1].reshape(
+            (1,) + (1,) * (updates.ndim - 1)
+        )
+        safe_update = torch.where(first_is_real, updates[:1], existing)
+        safe_updates = safe_update.expand_as(updates)
+        masked_updates = torch.where(
+            update_mask,
+            updates,
+            safe_updates,
+        )
+        return masked_slots, masked_updates
 
     def _cross_layer_post_compute(
         self,
@@ -3239,6 +3312,21 @@ class AscendSFAImpl(MLAAttentionImpl):
         hidden_states: torch.Tensor,
     ) -> tuple[torch.Tensor, ...]:
         return self._ensure_staged_sfa_bridge_buffers(hidden_states)
+
+    def _staged_graph_content_diagnostic_enabled(
+        self,
+        layer_name: str,
+    ) -> bool:
+        if not npu_content_diagnostics_enabled():
+            return False
+        marker = ".layers."
+        try:
+            layer_id = int(
+                str(layer_name).split(marker, 1)[1].split(".", 1)[0]
+            )
+        except (IndexError, ValueError):
+            return False
+        return layer_id in self._staged_graph_diagnostic_layer_ids
 
     def reset_staged_sfa_capture(self) -> None:
         self._staged_sfa_capture_state = _StagedSFACaptureState()
@@ -3386,6 +3474,40 @@ class AscendSFAImpl(MLAAttentionImpl):
 
         is_dummy = bool(getattr(context, "staged_sfa_graph_dummy_run", False))
         state = self._staged_sfa_capture_state
+        if self._staged_graph_content_diagnostic_enabled(layer_name):
+            diagnostic_rows = min(graph_key.token_capacity, 4)
+            diagnostic_input = hidden_states[:diagnostic_rows].reshape(
+                diagnostic_rows, -1
+            )[:, :256]
+            snapshot = state.input_diagnostic_buffers.get(graph_key)
+            if snapshot is None:
+                if context.cudagraph_runtime_mode != CUDAGraphMode.NONE:
+                    raise RuntimeError(
+                        "staged SFA input diagnostic buffer was not created "
+                        "by eager warmup"
+                    )
+                snapshot = torch.empty_like(diagnostic_input)
+                state.input_diagnostic_buffers[graph_key] = snapshot
+            if tuple(snapshot.shape) != tuple(diagnostic_input.shape):
+                raise RuntimeError(
+                    "staged SFA input diagnostic buffer shape changed"
+                )
+            snapshot.copy_(diagnostic_input)
+        producer_event = state.producer_event
+        if producer_event is None:
+            if context.cudagraph_runtime_mode != CUDAGraphMode.NONE:
+                raise RuntimeError(
+                    "staged SFA producer event was not created by eager "
+                    "warmup"
+                )
+            producer_event = torch.npu.ExternalEvent()
+            state.producer_event = producer_event
+        else:
+            # ExternalEvent is the graph-visible fence consumed by LMCache
+            # between Graph A and Graph B.  Reset before each captured/replayed
+            # producer interval, then record only after every bridge output is
+            # stable.
+            producer_event.reset()
         initialized_capacity = state.initialized_cache_capacity
         if is_dummy and graph_key.request_capacity > initialized_capacity:
             for cache in kv_cache:
@@ -3479,12 +3601,6 @@ class AscendSFAImpl(MLAAttentionImpl):
             hidden_states,
             outputs,
         )
-        producer_event = state.producer_event
-        if producer_event is None:
-            if context.cudagraph_runtime_mode != CUDAGraphMode.NONE:
-                raise RuntimeError("staged SFA producer event was not created by eager warmup")
-            producer_event = torch.npu.Event()
-            state.producer_event = producer_event
         attn_metadata.reshape_cache_event = producer_event
         producer_event.record()
         state.runtime = (
@@ -3879,6 +3995,116 @@ class AscendSFAImpl(MLAAttentionImpl):
             if request_ids is None:
                 raise RuntimeError("staged SFA request ids are unavailable")
             request_count = len(request_ids)
+            content_diagnostic = (
+                self._staged_graph_content_diagnostic_enabled(layer_name)
+            )
+            graph_key = context.staged_sfa_graph_key
+            actual_rows = min(
+                int(attn_metadata.num_actual_tokens),
+                int(graph_key.token_capacity),
+            )
+            diagnostic_rows = min(actual_rows, 4)
+            diagnostic_width = 8
+            bridge = self._staged_sfa_bridge_buffers
+            if content_diagnostic and bridge is not None:
+                if producer_event is not None:
+                    # Match the production LMCache dependency before reading
+                    # Graph-A bridge buffers. This is a device-side stream
+                    # wait, not a host synchronization.
+                    torch.npu.current_stream().wait_event(producer_event)
+                queue_selected_topk_fingerprint(
+                    req_ids=request_ids,
+                    layer_name=layer_name,
+                    topk_indices=bridge[2][: graph_key.token_capacity],
+                    row_request_indices=attn_metadata.decode_req_indices_cpu,
+                    seq_lens_cpu=attn_metadata.seq_lens_cpu,
+                    num_decode_tokens=attn_metadata.num_decode_tokens,
+                    num_actual_tokens=attn_metadata.num_actual_tokens,
+                    attn_state=attn_metadata.attn_state,
+                    decode_valid_rows_all=(
+                        attn_metadata.decode_valid_rows_all
+                    ),
+                    num_hidden_layers=self.diagnostic_num_cache_layers,
+                )
+                runtime = state.runtime
+                pre_components = {
+                    "ql_nope": bridge[0][:diagnostic_rows],
+                    "q_pe": bridge[1][:diagnostic_rows],
+                    "raw_topk_sample": bridge[2][:diagnostic_rows]
+                    .reshape(diagnostic_rows, -1)[:, :diagnostic_width],
+                    "selected_packed_sample": selected_packed[
+                        :request_count, :diagnostic_width
+                    ],
+                    "selected_counts": selected_counts[:request_count],
+                    "target_slots_sample": target_slots[
+                        :request_count, :diagnostic_width
+                    ],
+                    "row_req_indices": attn_metadata.decode_req_indices[
+                        : graph_key.token_capacity
+                    ],
+                    "cum_query_lens": attn_metadata.cum_query_lens,
+                    "seq_lens": attn_metadata.seq_lens,
+                    "slot_mapping": attn_metadata.slot_mapping[
+                        : graph_key.token_capacity
+                    ],
+                    "indexer_slot_mapping": (
+                        attn_metadata.indexer_slot_mapping[
+                            : graph_key.token_capacity
+                        ]
+                    ),
+                }
+                input_snapshot = state.input_diagnostic_buffers.get(
+                    graph_key
+                )
+                if input_snapshot is not None:
+                    pre_components["hidden_input_sample"] = (
+                        input_snapshot[:diagnostic_rows]
+                    )
+                if actual_rows < graph_key.token_capacity:
+                    pre_components["padding_topk_sample"] = bridge[2][
+                        actual_rows : graph_key.token_capacity
+                    ].reshape(
+                        graph_key.token_capacity - actual_rows, -1
+                    )[:, :diagnostic_width]
+                if runtime is not None and diagnostic_rows:
+                    kv_cache = runtime[1]
+                    flat_index = kv_cache[2].reshape(
+                        -1, *kv_cache[2].shape[2:]
+                    )
+                    current_index_slots = (
+                        attn_metadata.indexer_slot_mapping[
+                            :diagnostic_rows
+                        ]
+                        .clamp(
+                            min=0,
+                            max=int(flat_index.shape[0]) - 1,
+                        )
+                        .long()
+                    )
+                    pre_components.update(
+                        {
+                            "current_index": flat_index.index_select(
+                                0, current_index_slots
+                            ),
+                        }
+                    )
+                if state.remap_boundary is not None:
+                    pre_components["remap_boundary"] = (
+                        state.remap_boundary[:actual_rows]
+                    )
+                queue_staged_graph_stage_fingerprint(
+                    req_ids=request_ids,
+                    layer_name=layer_name,
+                    stage="after_graph_pre_before_retrieve",
+                    components=pre_components,
+                    row_request_indices=attn_metadata.decode_req_indices_cpu,
+                    seq_lens_cpu=attn_metadata.seq_lens_cpu,
+                    num_decode_tokens=attn_metadata.num_decode_tokens,
+                    num_actual_tokens=attn_metadata.num_actual_tokens,
+                    attn_state=attn_metadata.attn_state,
+                    num_hidden_layers=self.diagnostic_num_cache_layers,
+                    graph_key=graph_key,
+                )
             target_diagnostic = self._target_sfa_diag_pre_retrieve(
                 layer_name,
                 selected_packed,
@@ -3898,6 +4124,57 @@ class AscendSFAImpl(MLAAttentionImpl):
                 payload_event=producer_event,
             )
             self._target_sfa_diag_post_retrieve(target_diagnostic)
+            if content_diagnostic and request_count:
+                sample_width = min(8, int(target_slots.shape[-1]))
+                sampled_slots = target_slots[
+                    :request_count, :sample_width
+                ].reshape(-1)
+                runtime = state.runtime
+                if runtime is not None:
+                    kv_cache = runtime[1]
+                    flat_nope = kv_cache[0].reshape(
+                        -1, *kv_cache[0].shape[2:]
+                    )
+                    flat_pe = kv_cache[1].reshape(
+                        -1, *kv_cache[1].shape[2:]
+                    )
+                    safe_slots = sampled_slots.clamp(
+                        min=0,
+                        max=min(
+                            int(flat_nope.shape[0]),
+                            int(flat_pe.shape[0]),
+                        )
+                        - 1,
+                    ).long()
+                    queue_staged_graph_stage_fingerprint(
+                        req_ids=request_ids,
+                        layer_name=layer_name,
+                        stage="after_selective_retrieve_before_graph_post",
+                        components={
+                            "selected_counts": selected_counts[
+                                :request_count
+                            ],
+                            "selected_packed_sample": selected_packed[
+                                :request_count, :sample_width
+                            ],
+                            "target_slots_sample": sampled_slots,
+                            "retrieved_nope_sample": flat_nope.index_select(
+                                0, safe_slots
+                            ),
+                            "retrieved_pe_sample": flat_pe.index_select(
+                                0, safe_slots
+                            ),
+                        },
+                        row_request_indices=(
+                            attn_metadata.decode_req_indices_cpu
+                        ),
+                        seq_lens_cpu=attn_metadata.seq_lens_cpu,
+                        num_decode_tokens=attn_metadata.num_decode_tokens,
+                        num_actual_tokens=attn_metadata.num_actual_tokens,
+                        attn_state=attn_metadata.attn_state,
+                        num_hidden_layers=self.diagnostic_num_cache_layers,
+                        graph_key=graph_key,
+                    )
             if getattr(self, "_lmcache_load_stat_enabled", False):
                 self._record_lmcache_load_stat(
                     layer_name,
@@ -3937,8 +4214,53 @@ class AscendSFAImpl(MLAAttentionImpl):
                 ),
             )
             runtime = self._staged_sfa_capture_state.runtime
+            graph_key = getattr(context, "staged_sfa_graph_key", None)
             if not is_dummy and runtime and runtime[2] is not None and runtime[3]:
                 wait_for_kv_layer_from_connector(runtime[2])
+            if (
+                not is_dummy
+                and graph_key is not None
+                and runtime is not None
+                and self._staged_graph_content_diagnostic_enabled(layer_name)
+            ):
+                kv_cache = runtime[1]
+                flat_index = kv_cache[2].reshape(
+                    -1, *kv_cache[2].shape[2:]
+                )
+                actual_rows = min(
+                    int(metadata.num_actual_tokens),
+                    int(graph_key.token_capacity),
+                )
+                current_slots = (
+                    metadata.indexer_slot_mapping[:actual_rows]
+                    .clamp(min=0, max=int(flat_index.shape[0]) - 1)
+                    .long()
+                )
+                queue_staged_graph_stage_fingerprint(
+                    req_ids=metadata.decode_request_ids_compact,
+                    layer_name=layer_name,
+                    stage="before_graph_pre",
+                    components={
+                        "slot_mapping": metadata.slot_mapping[
+                            : graph_key.token_capacity
+                        ],
+                        "indexer_slot_mapping": (
+                            metadata.indexer_slot_mapping[
+                                : graph_key.token_capacity
+                            ]
+                        ),
+                        "current_index": flat_index.index_select(
+                            0, current_slots
+                        ),
+                    },
+                    row_request_indices=metadata.decode_req_indices_cpu,
+                    seq_lens_cpu=metadata.seq_lens_cpu,
+                    num_decode_tokens=metadata.num_decode_tokens,
+                    num_actual_tokens=metadata.num_actual_tokens,
+                    attn_state=metadata.attn_state,
+                    num_hidden_layers=self.diagnostic_num_cache_layers,
+                    graph_key=graph_key,
+                )
 
     def cross_layer_graph_post(
         self,
@@ -3966,6 +4288,58 @@ class AscendSFAImpl(MLAAttentionImpl):
             attn_metadata.block_table,
             output,
             trace_label="cross_layer",
+        )
+        if self._staged_graph_content_diagnostic_enabled(layer_name):
+            state = self._staged_sfa_capture_state
+            diagnostic_rows = min(rows, 4)
+            diagnostic_output = output[:diagnostic_rows].reshape(
+                diagnostic_rows, -1
+            )[:, :256]
+            snapshot = state.post_diagnostic_buffers.get(graph_key)
+            if snapshot is None:
+                if get_forward_context().cudagraph_runtime_mode != CUDAGraphMode.NONE:
+                    raise RuntimeError(
+                        "staged SFA output diagnostic buffer was not created "
+                        "by eager warmup"
+                    )
+                snapshot = torch.empty_like(diagnostic_output)
+                state.post_diagnostic_buffers[graph_key] = snapshot
+            if tuple(snapshot.shape) != tuple(diagnostic_output.shape):
+                raise RuntimeError(
+                    "staged SFA output diagnostic buffer shape changed"
+                )
+            snapshot.copy_(diagnostic_output)
+
+    def queue_staged_graph_post_diagnostic(
+        self,
+        layer_name: str,
+        graph_key: StagedSFAGraphKey,
+        metadata: AscendSFAMetadata,
+    ) -> None:
+        """Queue the graph-captured post output after replay has completed."""
+        if not self._staged_graph_content_diagnostic_enabled(layer_name):
+            return
+        snapshot = self._staged_sfa_capture_state.post_diagnostic_buffers.get(
+            graph_key
+        )
+        if snapshot is None:
+            return
+        actual_rows = min(
+            int(metadata.num_actual_tokens),
+            int(snapshot.shape[0]),
+        )
+        queue_staged_graph_stage_fingerprint(
+            req_ids=metadata.decode_request_ids_compact,
+            layer_name=layer_name,
+            stage="after_graph_post",
+            components={"attention_output": snapshot[:actual_rows]},
+            row_request_indices=metadata.decode_req_indices_cpu,
+            seq_lens_cpu=metadata.seq_lens_cpu,
+            num_decode_tokens=metadata.num_decode_tokens,
+            num_actual_tokens=metadata.num_actual_tokens,
+            attn_state=metadata.attn_state,
+            num_hidden_layers=self.diagnostic_num_cache_layers,
+            graph_key=graph_key,
         )
 
     def submit_cross_layer_save(self) -> None:
