@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 # Usage:
-#   run_glm51_tp_dp_8layers.sh \
+#   run_glm51_tp_dp.sh \
 #       [--dp-size 1|2] \
 #       [--layerwise-prefill on|off] \
 #       [--load-8-layers true|false]

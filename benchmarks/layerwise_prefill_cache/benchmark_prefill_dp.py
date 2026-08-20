@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""Client companion for ``examples/run_glm51_tp_dp_8layers.sh``.
+"""Client companion for ``examples/run_glm51_tp_dp.sh``.
 
 Compare prefill throughput and TTFT at concurrency 1 and 2. Prompts are sent
 as token IDs to keep tokenization outside the timed region. Every request asks
