@@ -99,6 +99,185 @@ class TestNPUWorker(TestBase):
             with self.subTest(metadata=metadata):
                 self.assertIsNone(worker.get_mooncake_placement_info())
 
+    def test_remote_fill_placement_uses_its_routable_dp_identity(self):
+        from vllm_ascend.worker.worker import NPUWorker
+
+        worker = NPUWorker.__new__(NPUWorker)
+        worker.vllm_config = SimpleNamespace(
+            parallel_config=SimpleNamespace(
+                data_parallel_rank=1,
+                data_parallel_rank_local=0,
+                data_parallel_index=5,
+                local_engines_only=True,
+            )
+        )
+        worker.get_kv_connector_handshake_metadata = MagicMock(
+            return_value=None
+        )
+        remote_fill = {
+            "enabled": True,
+            "dp_rank": 5,
+            "tp_rank": 0,
+        }
+        connector = SimpleNamespace(
+            get_remote_fill_placement_info=lambda: remote_fill
+        )
+
+        with (
+            patch(
+                "vllm_ascend.worker.worker.has_kv_transfer_group",
+                return_value=True,
+            ),
+            patch(
+                "vllm_ascend.worker.worker.get_kv_transfer_group",
+                return_value=connector,
+            ),
+        ):
+            self.assertEqual(
+                worker.get_mooncake_placement_info(),
+                {"dp_rank": 5, "segment": None, "remote_fill": remote_fill},
+            )
+
+    def test_remote_fill_fatal_latch_exits_before_health_probe(self):
+        from vllm_ascend.worker.worker import NPUWorker
+
+        worker = NPUWorker.__new__(NPUWorker)
+        connector = SimpleNamespace(
+            remote_fill_requires_paired_restart=lambda: True
+        )
+        with (
+            patch(
+                "vllm_ascend.worker.worker.has_kv_transfer_group",
+                return_value=True,
+            ),
+            patch(
+                "vllm_ascend.worker.worker.get_kv_transfer_group",
+                return_value=connector,
+            ),
+            patch("subprocess.run") as run,
+            self.assertRaises(SystemExit),
+        ):
+            worker.check_health()
+        run.assert_not_called()
+
+    def test_remote_fill_fatal_latched_during_health_probe_still_exits(self):
+        from vllm_ascend.worker.worker import NPUWorker
+
+        worker = NPUWorker.__new__(NPUWorker)
+        worker.local_rank = 0
+        fatal = MagicMock(side_effect=(False, True))
+        connector = SimpleNamespace(
+            remote_fill_requires_paired_restart=fatal
+        )
+        result = SimpleNamespace(returncode=0, stdout="Health : OK", stderr="")
+        with (
+            patch(
+                "vllm_ascend.worker.worker.has_kv_transfer_group",
+                return_value=True,
+            ),
+            patch(
+                "vllm_ascend.worker.worker.get_kv_transfer_group",
+                return_value=connector,
+            ),
+            patch("subprocess.run", return_value=result),
+            self.assertRaises(SystemExit),
+        ):
+            worker.check_health()
+        self.assertEqual(fatal.call_count, 2)
+
+    def test_execute_model_converts_new_remote_fill_fatal_to_system_exit(self):
+        from vllm_ascend.worker.worker import NPUWorker
+
+        worker = NPUWorker.__new__(NPUWorker)
+        worker._pp_send_work = []
+        worker.model_runner = MagicMock()
+        worker.model_runner.execute_model.side_effect = RuntimeError("finalize failed")
+        fatal = MagicMock(side_effect=(False, True))
+        connector = SimpleNamespace(
+            remote_fill_requires_paired_restart=fatal
+        )
+        scheduler_output = SimpleNamespace(total_num_scheduled_tokens=0)
+        with (
+            patch(
+                "vllm_ascend.worker.worker.has_kv_transfer_group",
+                return_value=True,
+            ),
+            patch(
+                "vllm_ascend.worker.worker.get_kv_transfer_group",
+                return_value=connector,
+            ),
+            self.assertRaises(SystemExit),
+        ):
+            worker.execute_model(scheduler_output)
+
+        worker.model_runner.abort_kv_connector_finalize.assert_called_once_with()
+        self.assertEqual(fatal.call_count, 2)
+
+    def test_execute_model_checks_remote_fill_fatal_after_success(self):
+        from vllm.v1.outputs import ModelRunnerOutput
+
+        from vllm_ascend.worker.worker import NPUWorker
+
+        worker = NPUWorker.__new__(NPUWorker)
+        worker._pp_send_work = []
+        worker.model_runner = MagicMock()
+        worker.model_runner.execute_model.return_value = MagicMock(
+            spec=ModelRunnerOutput
+        )
+        fatal = MagicMock(side_effect=(False, True))
+        connector = SimpleNamespace(
+            remote_fill_requires_paired_restart=fatal
+        )
+        scheduler_output = SimpleNamespace(total_num_scheduled_tokens=0)
+        with (
+            patch(
+                "vllm_ascend.worker.worker.has_kv_transfer_group",
+                return_value=True,
+            ),
+            patch(
+                "vllm_ascend.worker.worker.get_kv_transfer_group",
+                return_value=connector,
+            ),
+            self.assertRaises(SystemExit),
+        ):
+            worker.execute_model(scheduler_output)
+
+        self.assertEqual(fatal.call_count, 2)
+
+    def test_sample_tokens_checks_fatal_latch_after_success_and_failure(self):
+        from vllm_ascend.worker.worker import NPUWorker
+
+        for sample_error in (None, RuntimeError("sample failed")):
+            with self.subTest(sample_error=sample_error):
+                worker = NPUWorker.__new__(NPUWorker)
+                worker.model_runner = MagicMock()
+                if sample_error is None:
+                    worker.model_runner.sample_tokens.return_value = object()
+                else:
+                    worker.model_runner.sample_tokens.side_effect = sample_error
+                fatal = MagicMock(side_effect=(False, True))
+                connector = SimpleNamespace(
+                    remote_fill_requires_paired_restart=fatal
+                )
+                with (
+                    patch(
+                        "vllm_ascend.worker.worker.has_kv_transfer_group",
+                        return_value=True,
+                    ),
+                    patch(
+                        "vllm_ascend.worker.worker.get_kv_transfer_group",
+                        return_value=connector,
+                    ),
+                    self.assertRaises(SystemExit),
+                ):
+                    worker.sample_tokens(MagicMock())
+
+                if sample_error is None:
+                    worker.model_runner.abort_kv_connector_finalize.assert_not_called()
+                else:
+                    worker.model_runner.abort_kv_connector_finalize.assert_called_once_with()
+                self.assertEqual(fatal.call_count, 2)
+
     @patch("vllm_ascend.utils.adapt_patch")
     @patch("vllm_ascend.ops")
     @patch("vllm_ascend.worker.worker._register_atb_extensions")

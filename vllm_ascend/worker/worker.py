@@ -444,10 +444,33 @@ class NPUWorker(WorkerBase):
 
         return int(self.available_kv_cache_memory_bytes)
 
+    def _raise_if_remote_fill_restart_required(self) -> None:
+        """Terminate this worker when LMCache reports unsafe remote DMA."""
+
+        if not has_kv_transfer_group():
+            return
+        connector = get_kv_transfer_group()
+        check = getattr(
+            connector,
+            "remote_fill_requires_paired_restart",
+            None,
+        )
+        if callable(check) and bool(check()):
+            logger.critical(
+                "Remote-fill armed transfer requires paired P+D restart"
+            )
+            # WorkerProc catches Exception for ordinary RPC failures but lets
+            # SystemExit reach the process boundary. Its monitor then tears
+            # down the full executor instead of continuing with unsafe memory.
+            raise SystemExit(
+                "remote-fill armed transfer requires paired P+D restart"
+            )
+
     def execute_model(
         self,
         scheduler_output: "SchedulerOutput",
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
+        self._raise_if_remote_fill_restart_required()
         # enable msMonitor to monitor the performance of vllm-ascend
         if envs_ascend.MSMONITOR_USE_DAEMON:
             dp.step()
@@ -484,9 +507,13 @@ class NPUWorker(WorkerBase):
             # A speculative target pass can fail after connector metadata was
             # intentionally kept bound for sample_tokens(). Never carry that
             # failed step's request binding into a later scheduler iteration.
-            self.model_runner.abort_kv_connector_finalize()
+            try:
+                self.model_runner.abort_kv_connector_finalize()
+            finally:
+                self._raise_if_remote_fill_restart_required()
             raise
         if isinstance(output, (ModelRunnerOutput, AsyncModelRunnerOutput, NoneType)):
+            self._raise_if_remote_fill_restart_required()
             return output
 
         assert isinstance(output, IntermediateTensors)
@@ -505,6 +532,7 @@ class NPUWorker(WorkerBase):
 
         kv_connector_output = output.kv_connector_output
         if not kv_connector_output:
+            self._raise_if_remote_fill_restart_required()
             return None
 
         # In case of PP with kv transfer, we need to pass through the
@@ -512,21 +540,29 @@ class NPUWorker(WorkerBase):
         # saves, stats, and cache events are also scheduler-visible output;
         # do not discard them merely because no request finished this step.
         if kv_connector_output.is_empty():
+            self._raise_if_remote_fill_restart_required()
             return EMPTY_MODEL_RUNNER_OUTPUT
         output = copy.copy(EMPTY_MODEL_RUNNER_OUTPUT)
         output.kv_connector_output = kv_connector_output
+        self._raise_if_remote_fill_restart_required()
         return output
 
     @torch.inference_mode()
     def sample_tokens(self, grammar_output: "GrammarOutput") -> ModelRunnerOutput | AsyncModelRunnerOutput:
+        self._raise_if_remote_fill_restart_required()
         try:
-            return self.model_runner.sample_tokens(grammar_output)
+            output = self.model_runner.sample_tokens(grammar_output)
         except BaseException:
             # Speculative execution defers connector finalization until after
             # the draft pass. A failed draft/sample must not leave request
             # metadata bound for the next scheduler step.
-            self.model_runner.abort_kv_connector_finalize()
+            try:
+                self.model_runner.abort_kv_connector_finalize()
+            finally:
+                self._raise_if_remote_fill_restart_required()
             raise
+        self._raise_if_remote_fill_restart_required()
+        return output
 
     def load_model(self) -> None:
         if self.vllm_config.model_config.enable_sleep_mode:
@@ -597,17 +633,27 @@ class NPUWorker(WorkerBase):
             return None
         return {self.rank: metadata}
 
-    def get_mooncake_placement_info(self) -> dict[str, int | str] | None:
-        """Expose this decoder DP rank's TP0 Mooncake segment."""
+    def get_mooncake_placement_info(
+        self,
+    ) -> dict[str, int | str | dict[str, int | str | bool] | None] | None:
+        """Expose this decoder DP rank's TP0 storage/control placement."""
+        connector = get_kv_transfer_group() if has_kv_transfer_group() else None
+        remote_fill = None
+        placement_getter = getattr(connector, "get_remote_fill_placement_info", None)
+        if callable(placement_getter):
+            remote_fill = placement_getter()
+            if remote_fill is not None and not isinstance(remote_fill, dict):
+                raise TypeError("Remote-fill placement must be a dictionary")
         metadata_by_rank = self.get_kv_connector_handshake_metadata()
-        if not metadata_by_rank:
-            return None
-        metadata = next(iter(metadata_by_rank.values()))
-        local_ip = getattr(metadata, "local_ip", "")
-        te_rpc_port = getattr(metadata, "te_rpc_port", None)
-        if getattr(metadata, "tp_rank", None) != 0 or not local_ip:
-            return None
-        if not isinstance(te_rpc_port, int) or te_rpc_port <= 0:
+        segment = None
+        if metadata_by_rank:
+            metadata = next(iter(metadata_by_rank.values()))
+            local_ip = getattr(metadata, "local_ip", "")
+            te_rpc_port = getattr(metadata, "te_rpc_port", None)
+            if getattr(metadata, "tp_rank", None) == 0 and local_ip:
+                if isinstance(te_rpc_port, int) and te_rpc_port > 0:
+                    segment = f"{local_ip}:{te_rpc_port}"
+        if segment is None and remote_fill is None:
             return None
         parallel_config = self.vllm_config.parallel_config
         local_dp_rank = getattr(parallel_config, "data_parallel_rank_local", None)
@@ -617,10 +663,28 @@ class NPUWorker(WorkerBase):
             and local_dp_rank is not None
             else parallel_config.data_parallel_rank
         )
-        return {
+        if remote_fill is not None:
+            advertised_dp_rank = remote_fill.get("dp_rank")
+            if (
+                isinstance(advertised_dp_rank, bool)
+                or not isinstance(advertised_dp_rank, int)
+                or advertised_dp_rank < 0
+            ):
+                raise ValueError(
+                    "Remote-fill placement has an invalid data-parallel rank"
+                )
+            # LMCache initializes the decoder service with vLLM's routable
+            # data_parallel_index. Keep the outer collective record bound to
+            # that same identity even when local-engine legacy Mooncake
+            # placement uses a node-local rank.
+            route_dp_rank = advertised_dp_rank
+        placement = {
             "dp_rank": route_dp_rank,
-            "segment": f"{local_ip}:{te_rpc_port}",
+            "segment": segment,
         }
+        if remote_fill is not None:
+            placement["remote_fill"] = remote_fill
+        return placement
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         return self.model_runner.get_kv_cache_spec()
@@ -765,6 +829,7 @@ class NPUWorker(WorkerBase):
         return self.model_runner.take_draft_token_ids()
 
     def check_health(self) -> None:
+        self._raise_if_remote_fill_restart_required()
         import subprocess
 
         logger.info("check_health Start!")
@@ -787,6 +852,7 @@ class NPUWorker(WorkerBase):
             logger.info("npu-smi tool not found.")
         except Exception as e:
             logger.info(f"query NPU card {self.local_rank} fail: {e}")
+        self._raise_if_remote_fill_restart_required()
         return
 
 
