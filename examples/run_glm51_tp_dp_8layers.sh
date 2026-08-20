@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# Usage: run_glm51_tp_dp_8layers.sh [DP_SIZE] [on|off].
+# Usage:
+#   run_glm51_tp_dp_8layers.sh \
+#       [--dp-size 1|2] \
+#       [--layerwise-prefill on|off] \
+#       [--load-8-layers true|false]
 
 unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY
 
@@ -14,13 +18,42 @@ LMCACHE_CONFIG="${LMCACHE_CONFIG:-/workspace/lmy/lmcache_config.yaml}"
 HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-9960}"
 CHUNK_SIZE="${CHUNK_SIZE:-4096}"
-DP_SIZE="${1:-${DP_SIZE:-2}}"
-LAYERWISE_MODE="${2:-on}"
+DP_SIZE="${DP_SIZE:-2}"
+LAYERWISE_MODE="${LAYERWISE_MODE:-on}"
+LOAD_8_LAYERS="${LOAD_8_LAYERS:-false}"
 
-if [[ $# -gt 2 ]]; then
-    echo "usage: $0 [1|2] [on|off]" >&2
-    exit 2
-fi
+usage() {
+    echo "usage: $0 [--dp-size 1|2] [--layerwise-prefill on|off] [--load-8-layers true|false]" >&2
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --dp-size)
+            [[ $# -ge 2 ]] || { usage; exit 2; }
+            DP_SIZE="$2"
+            shift 2
+            ;;
+        --layerwise-prefill)
+            [[ $# -ge 2 ]] || { usage; exit 2; }
+            LAYERWISE_MODE="$2"
+            shift 2
+            ;;
+        --load-8-layers)
+            [[ $# -ge 2 ]] || { usage; exit 2; }
+            LOAD_8_LAYERS="$2"
+            shift 2
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            echo "unknown argument: $1" >&2
+            usage
+            exit 2
+            ;;
+    esac
+done
 
 case "${DP_SIZE}" in
     1)
@@ -31,6 +64,24 @@ case "${DP_SIZE}" in
         ;;
     *)
         echo "DP_SIZE must be 1 or 2, got: ${DP_SIZE}" >&2
+        exit 2
+        ;;
+esac
+
+case "${LOAD_8_LAYERS}" in
+    true)
+        MODEL_VARIANT="8layers"
+        HF_OVERRIDES_ARGS=(
+            --hf-overrides
+            '{"num_hidden_layers":8,"num_nextn_predict_layers":0,"vllm_skip_extra_layer_weights":true}'
+        )
+        ;;
+    false)
+        MODEL_VARIANT="full"
+        HF_OVERRIDES_ARGS=()
+        ;;
+    *)
+        echo "LOAD_8_LAYERS must be true or false, got: ${LOAD_8_LAYERS}" >&2
         exit 2
         ;;
 esac
@@ -58,9 +109,9 @@ esac
 
 DP_LOCAL_SIZE="${DP_SIZE}"
 TOPOLOGY="tp${TP_SIZE}_dp${DP_SIZE}"
-SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-glm51-prefill-8layers}"
-LOG_DIR="${LOG_DIR:-${WORK_DIR}/${TOPOLOGY}_${LAYERWISE_MODE}_8layers_logs}"
-PROFILE_DIR="${PROFILE_DIR:-${WORK_DIR}/vllm_profile/${TOPOLOGY}_${LAYERWISE_MODE}_8layers}"
+SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-glm51-prefill}"
+LOG_DIR="${LOG_DIR:-${WORK_DIR}/${TOPOLOGY}_${LAYERWISE_MODE}_${MODEL_VARIANT}_logs}"
+PROFILE_DIR="${PROFILE_DIR:-${WORK_DIR}/vllm_profile/${TOPOLOGY}_${LAYERWISE_MODE}_${MODEL_VARIANT}}"
 
 if [[ ! -f "${LMCACHE_CONFIG}" ]]; then
     echo "LMCache config does not exist: ${LMCACHE_CONFIG}" >&2
@@ -115,6 +166,8 @@ PROFILER_CONFIG="$(printf \
 echo "MODEL_PATH=${MODEL_PATH}"
 echo "LMCACHE_CONFIG=${LMCACHE_CONFIG}"
 echo "LAYERWISE_MODE=${LAYERWISE_MODE}"
+echo "LOAD_8_LAYERS=${LOAD_8_LAYERS}"
+echo "MODEL_VARIANT=${MODEL_VARIANT}"
 echo "LAYERWISE_PREFILL_P_NODE=${VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE}"
 echo "LMCACHE_USE_LAYERWISE=${LMCACHE_USE_LAYERWISE}"
 echo "LMCACHE_ASYNC_DECODE_SAVE=${LMCACHE_ASYNC_DECODE_SAVE}"
@@ -126,10 +179,8 @@ echo "PROFILE_DIR=${PROFILE_DIR}"
 
 cd "${WORK_DIR}"
 
-# num_nextn_predict_layers=0 means that no MTP draft layer is constructed, so
-# this reduced-model smoke launcher intentionally does not enable speculative
-# decoding. vllm_skip_extra_layer_weights lets the loader ignore layers 8+ in
-# the original checkpoint instead of treating them as unexpected weights.
+# In reduced mode, num_nextn_predict_layers=0 avoids constructing an MTP draft
+# layer and vllm_skip_extra_layer_weights ignores checkpoint layers 8+.
 # max-num-seqs is per DP replica. Each local replica accepts one long-prefill
 # request without reserving layerwise shared-pool capacity for unused
 # sequences.
@@ -153,8 +204,7 @@ vllm serve "${MODEL_PATH}" \
     --quantization ascend \
     --compilation-config \
         "{\"cudagraph_mode\":\"PIECEWISE\",\"cudagraph_capture_sizes\":[${CHUNK_SIZE}]}" \
-    --hf-overrides \
-        '{"num_hidden_layers":8,"num_nextn_predict_layers":0,"vllm_skip_extra_layer_weights":true}' \
+    "${HF_OVERRIDES_ARGS[@]}" \
     --additional-config \
         '{
             "recompute_scheduler_enable": false,

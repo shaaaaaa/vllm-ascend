@@ -74,7 +74,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base-url", default="http://127.0.0.1:9960")
     parser.add_argument("--endpoint", default="/v1/completions")
-    parser.add_argument("--model", default="glm51-prefill-8layers")
+    parser.add_argument("--model", default="glm51-prefill")
     parser.add_argument("--prompt-tokens", type=int, default=DEFAULT_PROMPT_TOKENS)
     parser.add_argument(
         "--concurrencies",
