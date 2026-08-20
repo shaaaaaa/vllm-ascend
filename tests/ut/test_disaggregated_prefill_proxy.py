@@ -88,7 +88,7 @@ class TestProxyColdPerfLogging(unittest.TestCase):
         server.client.post.assert_awaited_once_with(
             "http://decoder:8002/collective_rpc",
             json={"method": "get_mooncake_placement_info"},
-            headers={"Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}"},
+            headers=proxy._service_auth_headers(),
             timeout=0.75,
         )
         response.raise_for_status.assert_called_once_with()
@@ -170,6 +170,7 @@ class TestProxyColdPerfLogging(unittest.TestCase):
             decoder_remote_fill_discovered=False,
             decoder_rank_active_tokens={1: 0.0},
             decoder_placement_task=None,
+            static_decoder_mooncake_segments={1: "static-decoder:1234"},
         )
         state = proxy.ProxyState.__new__(proxy.ProxyState)
         state.decoders = [decoder]
@@ -210,6 +211,116 @@ class TestProxyColdPerfLogging(unittest.TestCase):
         )
         self.assertEqual(decoder.decoder_remote_fill, {1: discovered_remote_fill})
         self.assertTrue(decoder.decoder_remote_fill_discovered)
+
+    def test_static_rank_mismatch_disables_remote_fill(self):
+        decoder = SimpleNamespace(
+            client=object(),
+            url="http://decoder:8002/v1",
+            decoder_mooncake_segments={0: "static-decoder:1234"},
+            static_decoder_mooncake_segments={0: "static-decoder:1234"},
+            decoder_remote_fill={},
+            decoder_remote_fill_discovered=False,
+            decoder_rank_active_tokens={0: 0.0},
+            decoder_placement_task=None,
+        )
+        state = proxy.ProxyState.__new__(proxy.ProxyState)
+        state.enable_remote_lmcache_store = True
+        state.decoder_placement_discovery_timeout_seconds = 0.5
+
+        async def discover(server, **_kwargs):
+            server.decoder_remote_fill = {1: {"control_endpoint": "tcp://d:1"}}
+            return {1: None}
+
+        with (
+            patch.object(
+                proxy,
+                "_discover_decoder_mooncake_segments",
+                AsyncMock(side_effect=discover),
+            ),
+            patch.object(proxy, "_log_proxy_cold_perf_event"),
+        ):
+            asyncio.run(
+                state.ensure_decoder_mooncake_segments(
+                    decoder, "request-1", "/completions"
+                )
+            )
+
+        self.assertEqual(decoder.decoder_remote_fill, {})
+        self.assertEqual(
+            decoder.decoder_mooncake_segments,
+            {0: "static-decoder:1234"},
+        )
+
+    def test_successful_negative_discovery_is_retried_after_short_ttl(self):
+        decoder = SimpleNamespace(
+            url="http://decoder:8002/v1",
+            decoder_mooncake_segments={0: "static-decoder:1234"},
+            static_decoder_mooncake_segments={0: "static-decoder:1234"},
+            decoder_remote_fill={},
+            decoder_remote_fill_discovered=False,
+            decoder_rank_active_tokens={0: 0.0},
+            decoder_placement_task=None,
+        )
+        state = proxy.ProxyState.__new__(proxy.ProxyState)
+        state.enable_remote_lmcache_store = True
+        state.decoder_placement_discovery_timeout_seconds = 0.5
+        state.decoder_placement_positive_ttl_seconds = 30.0
+        state.decoder_placement_negative_ttl_seconds = 3.0
+        remote_fill = {"control_endpoint": "tcp://decoder:19000"}
+
+        async def discover(server, **_kwargs):
+            if discover.call_count == 2:
+                server.decoder_remote_fill = {0: remote_fill}
+            return {0: "decoder:1234"}
+
+        discover = AsyncMock(side_effect=discover)
+        with (
+            patch.object(proxy, "_discover_decoder_mooncake_segments", discover),
+            patch.object(proxy, "_log_proxy_cold_perf_event"),
+        ):
+            asyncio.run(
+                state.ensure_decoder_mooncake_segments(
+                    decoder, "request-1", "/completions"
+                )
+            )
+            asyncio.run(
+                state.ensure_decoder_mooncake_segments(
+                    decoder, "request-2", "/completions"
+                )
+            )
+            self.assertEqual(discover.await_count, 1)
+            decoder.decoder_placement_discovered_at -= 4.0
+            asyncio.run(
+                state.ensure_decoder_mooncake_segments(
+                    decoder, "request-3", "/completions"
+                )
+            )
+
+        self.assertEqual(discover.await_count, 2)
+        self.assertEqual(decoder.decoder_remote_fill, {0: remote_fill})
+
+    def test_reset_decoder_placement_preserves_only_static_mapping(self):
+        task = MagicMock()
+        task.done.return_value = False
+        decoder = SimpleNamespace(
+            decoder_placement_task=task,
+            decoder_remote_fill={0: {"destination_engine_epoch": 7}},
+            decoder_remote_fill_discovered=True,
+            decoder_placement_discovered_at=10.0,
+            decoder_placement_last_attempt_at=9.0,
+            decoder_mooncake_segments={0: "dynamic:1"},
+            static_decoder_mooncake_segments={1: "static:2"},
+            decoder_rank_active_tokens={0: 123.0},
+        )
+
+        proxy.ProxyState.reset_decoder_placement(decoder)
+
+        task.cancel.assert_called_once_with()
+        self.assertIsNone(decoder.decoder_placement_task)
+        self.assertEqual(decoder.decoder_remote_fill, {})
+        self.assertFalse(decoder.decoder_remote_fill_discovered)
+        self.assertEqual(decoder.decoder_mooncake_segments, {1: "static:2"})
+        self.assertEqual(decoder.decoder_rank_active_tokens, {1: 0.0})
 
     def test_decoder_placement_discovery_is_cached(self):
         decoder = SimpleNamespace(
@@ -421,6 +532,24 @@ class TestProxyColdPerfLogging(unittest.TestCase):
             )
 
         print_line.assert_not_called()
+
+    def test_service_auth_header_is_omitted_without_api_key(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(proxy._service_auth_headers(), {})
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "secret"}, clear=True):
+            self.assertEqual(
+                proxy._service_auth_headers(),
+                {"Authorization": "Bearer secret"},
+            )
+
+    def test_dynamic_topology_is_rejected_for_remote_fill_prototype(self):
+        state = proxy.ProxyState.__new__(proxy.ProxyState)
+        state.enable_remote_lmcache_store = True
+
+        with self.assertRaisesRegex(RuntimeError, "Dynamic topology"):
+            asyncio.run(state.add_instances(proxy.InstanceType.DECODE, []))
+        with self.assertRaisesRegex(RuntimeError, "Dynamic topology"):
+            state.remove_decoders([object()])
 
     def test_prefiller_payload_is_encoded_once_and_reused_for_retry(self):
         response = SimpleNamespace(
@@ -702,6 +831,7 @@ class TestProxyColdPerfLogging(unittest.TestCase):
         async def send_prefill(*_args, **kwargs):
             handoff = kwargs["remote_fill_handoff"]
             self.assertIsNone(kwargs["preferred_mooncake_segment"])
+            self.assertEqual(kwargs["max_retries"], 1)
             self.assertEqual(handoff["source_engine_id"], "prefiller:8001")
             terminal = {
                 "outcome": "LOCAL_FULL",

@@ -155,9 +155,10 @@ class TestNPUWorker(TestBase):
                 return_value=connector,
             ),
             patch("subprocess.run") as run,
-            self.assertRaises(SystemExit),
+            self.assertRaises(SystemExit) as raised,
         ):
             worker.check_health()
+        self.assertEqual(raised.exception.code, 86)
         run.assert_not_called()
 
     def test_remote_fill_fatal_latched_during_health_probe_still_exits(self):

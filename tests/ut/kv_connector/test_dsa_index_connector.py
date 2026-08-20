@@ -154,6 +154,128 @@ def test_ascend_multi_init_supports_legacy_child_connector_signature(monkeypatch
     ]
 
 
+def test_ascend_multi_forwards_remote_fill_child_contract(monkeypatch):
+    placement = {"enabled": True, "destination_engine_epoch": 7}
+    metrics = {"transactions_started": 3}
+
+    class LMCacheChild:
+        def __init__(self, _config, _role):
+            self.fatal = False
+
+        def get_remote_fill_placement_info(self):
+            return placement
+
+        def remote_fill_requires_paired_restart(self):
+            return self.fatal
+
+        def get_remote_fill_metrics(self):
+            return metrics
+
+    class MooncakeChild:
+        def __init__(self, _config, _role):
+            pass
+
+    top_config = SimpleNamespace(kv_transfer_config=object())
+    child_configs = [
+        SimpleNamespace(kv_transfer_config="lmcache"),
+        SimpleNamespace(kv_transfer_config="mooncake"),
+    ]
+    monkeypatch.setattr(
+        AscendMultiConnector,
+        "_get_connector_classes_and_configs",
+        classmethod(
+            lambda cls, config: list(
+                zip((LMCacheChild, MooncakeChild), child_configs, strict=True)
+            )
+        ),
+    )
+
+    multi = AscendMultiConnector(top_config, object())
+
+    assert multi.get_remote_fill_placement_info() == placement
+    assert multi.get_remote_fill_metrics() == metrics
+    assert multi.remote_fill_requires_paired_restart() is False
+    multi._connectors[0].fatal = True
+    assert multi.remote_fill_requires_paired_restart() is True
+
+
+def test_ascend_multi_forwards_real_lmcache_ascend_wrapper(monkeypatch):
+    pytest.importorskip("lmcache_ascend")
+    from lmcache_ascend.integration.vllm.lmcache_ascend_connector_v1 import (
+        LMCacheAscendConnectorV1Dynamic,
+    )
+
+    placement = {"enabled": True, "destination_engine_epoch": 17}
+    engine = SimpleNamespace(
+        use_layerwise=True,
+        get_remote_fill_placement_info=lambda: placement,
+        get_remote_fill_metrics=lambda: {"active_transactions": 1},
+        remote_fill_requires_paired_restart=lambda: True,
+    )
+
+    def init_lmcache(self, _config, _role):
+        self._lmcache_engine = SimpleNamespace(lmcache_engine=engine)
+
+    class MooncakeChild:
+        def __init__(self, _config, _role):
+            pass
+
+    monkeypatch.setattr(
+        LMCacheAscendConnectorV1Dynamic,
+        "__init__",
+        init_lmcache,
+    )
+    monkeypatch.setattr(
+        AscendMultiConnector,
+        "_get_connector_classes_and_configs",
+        classmethod(
+            lambda cls, config: [
+                (
+                    LMCacheAscendConnectorV1Dynamic,
+                    SimpleNamespace(kv_transfer_config="lmcache"),
+                ),
+                (
+                    MooncakeChild,
+                    SimpleNamespace(kv_transfer_config="mooncake"),
+                ),
+            ]
+        ),
+    )
+
+    multi = AscendMultiConnector(
+        SimpleNamespace(kv_transfer_config=object()), object()
+    )
+
+    assert multi.get_remote_fill_placement_info() == placement
+    assert multi.get_remote_fill_metrics() == {"active_transactions": 1}
+    assert multi.remote_fill_requires_paired_restart() is True
+
+
+def test_ascend_multi_rejects_conflicting_remote_fill_owners():
+    multi = object.__new__(AscendMultiConnector)
+    multi._remote_fill_placement_providers = (
+        lambda: {"destination_engine_epoch": 1},
+        lambda: {"destination_engine_epoch": 2},
+    )
+    multi._remote_fill_metrics_providers = (lambda: {"started": 1},) * 2
+    multi._remote_fill_restart_providers = (lambda: False,)
+
+    with pytest.raises(RuntimeError, match="conflicting remote-fill placement"):
+        multi.get_remote_fill_placement_info()
+    assert multi.get_remote_fill_metrics() == {"started": 1}
+
+
+def test_ascend_multi_fails_closed_when_restart_probe_raises():
+    multi = object.__new__(AscendMultiConnector)
+
+    def broken_probe():
+        raise RuntimeError("child unavailable")
+
+    multi._remote_fill_restart_providers = (broken_probe,)
+
+    assert multi.remote_fill_requires_paired_restart() is True
+
+
 def test_live_latent_requires_capable_provider_and_hybrid_consumer():
     class Provider:
         supports_dsa_live_latent_split_source = True

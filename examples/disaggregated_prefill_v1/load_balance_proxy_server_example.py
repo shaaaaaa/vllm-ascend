@@ -147,6 +147,13 @@ except ImportError:
 _COLD_PERF_FALSE_VALUES = ("", "0", "false", "no", "off")
 
 
+def _service_auth_headers() -> dict[str, str]:
+    """Return an authorization header only when a key is configured."""
+
+    api_key = os.environ.get("OPENAI_API_KEY")
+    return {"Authorization": f"Bearer {api_key}"} if api_key else {}
+
+
 def _encode_json_payload(payload: Any) -> bytes:
     """Encode a service payload once so retries can reuse the same bytes."""
     return json.dumps(
@@ -231,8 +238,11 @@ class ServerState:
         self.active_requests = 0  # Number of active requests
         self.aborted_requests = set()  # Track aborted requests
         self.decoder_mooncake_segments: dict[int, str | None] | None = None
+        self.static_decoder_mooncake_segments: dict[int, str] | None = None
         self.decoder_remote_fill: dict[int, dict[str, Any]] = {}
         self.decoder_remote_fill_discovered = False
+        self.decoder_placement_discovered_at = 0.0
+        self.decoder_placement_last_attempt_at = 0.0
         self.decoder_rank_active_tokens: dict[int, float] = {}
         self.decoder_placement_task: asyncio.Task[dict[int, str | None]] | None = None
         # Removed individual server lock - will use global locks instead
@@ -270,12 +280,12 @@ class ProxyState:
         decoder_mooncake_segments: list[dict[int, str]] | None = None,
         enable_remote_lmcache_store: bool = False,
         decoder_placement_discovery_timeout_seconds: float = 2.0,
+        decoder_placement_positive_ttl_seconds: float = 30.0,
+        decoder_placement_negative_ttl_seconds: float = 3.0,
     ) -> None:
         self.request_num = 0
         self.tainted_prefillers: list[ServerState] = []
         self.tainted_decoders: list[ServerState] = []
-        self.node_listener = NodeListener(self)
-
         self.prefillers: list[ServerState] = [ServerState(h, p) for h, p in prefiller_instances]
         self.decoders: list[ServerState] = [ServerState(h, p) for h, p in decoder_instances]
         self.decoder_mooncake_segments = decoder_mooncake_segments
@@ -285,6 +295,16 @@ class ProxyState:
         self.decoder_placement_discovery_timeout_seconds = float(
             decoder_placement_discovery_timeout_seconds
         )
+        if decoder_placement_positive_ttl_seconds <= 0:
+            raise ValueError("Positive decoder placement TTL must be positive")
+        if decoder_placement_negative_ttl_seconds <= 0:
+            raise ValueError("Negative decoder placement TTL must be positive")
+        self.decoder_placement_positive_ttl_seconds = float(
+            decoder_placement_positive_ttl_seconds
+        )
+        self.decoder_placement_negative_ttl_seconds = float(
+            decoder_placement_negative_ttl_seconds
+        )
         if decoder_mooncake_segments is not None:
             if len(decoder_mooncake_segments) != len(self.decoders):
                 raise ValueError(
@@ -292,6 +312,7 @@ class ProxyState:
                 )
             for server, rank_segments in zip(self.decoders, decoder_mooncake_segments):
                 server.decoder_mooncake_segments = dict(rank_segments)
+                server.static_decoder_mooncake_segments = dict(rank_segments)
                 server.decoder_rank_active_tokens = {
                     dp_rank: 0.0 for dp_rank in rank_segments
                 }
@@ -306,6 +327,12 @@ class ProxyState:
         self.decoder_heap = [(0.0, i, server) for i, server in enumerate(self.decoders)]
         heapq.heapify(self.prefiller_heap)
         heapq.heapify(self.decoder_heap)
+        # Dynamic topology mutates these heaps from a background thread. Keep
+        # the prototype's paired P+D+proxy topology static while RemoteFill is
+        # enabled; endpoint replacement then occurs through a full restart.
+        self.node_listener = (
+            None if self.enable_remote_lmcache_store else NodeListener(self)
+        )
 
     def _update_prefiller_priority(self, server_idx: int):
         """Update the priority of a prefiller server in the heap."""
@@ -449,6 +476,47 @@ class ProxyState:
         reservation.remote_fill = dict(remote_fill) if remote_fill is not None else None
         return reservation
 
+    @staticmethod
+    def reset_decoder_placement(server: ServerState) -> None:
+        """Invalidate request-independent placement after a lifecycle change."""
+
+        task = server.decoder_placement_task
+        if task is not None and not task.done():
+            task.cancel()
+        server.decoder_placement_task = None
+        server.decoder_remote_fill = {}
+        server.decoder_remote_fill_discovered = False
+        server.decoder_placement_discovered_at = 0.0
+        server.decoder_placement_last_attempt_at = 0.0
+        static_segments = getattr(server, "static_decoder_mooncake_segments", None)
+        server.decoder_mooncake_segments = (
+            dict(static_segments) if static_segments is not None else None
+        )
+        server.decoder_rank_active_tokens = {
+            dp_rank: 0.0 for dp_rank in (static_segments or {})
+        }
+
+    def _decoder_placement_is_fresh(self, server: ServerState, now: float) -> bool:
+        if not self.enable_remote_lmcache_store:
+            return server.decoder_mooncake_segments is not None
+        if server.decoder_remote_fill_discovered:
+            ttl = (
+                getattr(self, "decoder_placement_positive_ttl_seconds", 30.0)
+                if server.decoder_remote_fill
+                else getattr(
+                    self, "decoder_placement_negative_ttl_seconds", 3.0
+                )
+            )
+            return now - getattr(server, "decoder_placement_discovered_at", 0.0) < ttl
+        # A failed discovery may be negatively cached only when a static
+        # persistent placement remains available for this request.
+        return bool(
+            server.decoder_mooncake_segments is not None
+            and getattr(server, "decoder_placement_last_attempt_at", 0.0)
+            and now - getattr(server, "decoder_placement_last_attempt_at", 0.0)
+            < getattr(self, "decoder_placement_negative_ttl_seconds", 3.0)
+        )
+
     async def ensure_decoder_mooncake_segments(
         self,
         server: ServerState,
@@ -457,12 +525,12 @@ class ProxyState:
     ) -> None:
         """Discover and cache one decoder endpoint's TP0 Mooncake segments."""
         discover_remote_fill = getattr(self, "enable_remote_lmcache_store", False)
-        if server.decoder_mooncake_segments is not None and (
-            not discover_remote_fill or server.decoder_remote_fill_discovered
-        ):
+        now = time.monotonic()
+        if self._decoder_placement_is_fresh(server, now):
             return
         task = server.decoder_placement_task
         if task is None:
+            server.decoder_placement_last_attempt_at = now
             task = asyncio.create_task(
                 _discover_decoder_mooncake_segments(
                     server,
@@ -499,12 +567,26 @@ class ProxyState:
             )
             return
 
+        static_ranks = set(
+            getattr(server, "static_decoder_mooncake_segments", None) or {}
+        )
+        remote_fill_ranks = set(server.decoder_remote_fill)
+        if static_ranks and remote_fill_ranks and static_ranks != remote_fill_ranks:
+            logger.error(
+                "Disabling remote fill for decoder %s because static Mooncake "
+                "ranks %s differ from discovered RemoteFill ranks %s",
+                server.url,
+                sorted(static_ranks),
+                sorted(remote_fill_ranks),
+            )
+            server.decoder_remote_fill = {}
         if server.decoder_mooncake_segments is None:
             server.decoder_mooncake_segments = rank_segments
             server.decoder_rank_active_tokens = {
                 dp_rank: 0.0 for dp_rank in rank_segments
             }
         server.decoder_remote_fill_discovered = discover_remote_fill
+        server.decoder_placement_discovered_at = time.monotonic()
         server.decoder_placement_task = None
         _log_proxy_cold_perf_event(
             "proxy_decoder_placement_discovered",
@@ -554,6 +636,12 @@ class ProxyState:
         return request_length
 
     async def add_instances(self, instance_type: str, instances: list[ServerState]) -> tuple[list[str], list[str]]:
+        if self.enable_remote_lmcache_store:
+            raise RuntimeError(
+                "Dynamic topology is disabled while remote LMCache store is enabled; "
+                "restart the paired proxy, prefiller, and decoder deployment"
+            )
+        assert self.node_listener is not None
         added_nodes, waiting_nodes = [], []
         for server in instances:
             is_valid = await self.node_listener.check_instance_status(server.client)
@@ -602,6 +690,10 @@ class ProxyState:
     def remove_prefillers(self, instances: list[ServerState]) -> bool:
         if not instances:
             return False
+        if self.enable_remote_lmcache_store:
+            raise RuntimeError(
+                "Dynamic topology is disabled while remote LMCache store is enabled"
+            )
 
         if self.request_num > 0:
             logger.warning(f"Start to taint prefill instances {instances}.")
@@ -628,6 +720,10 @@ class ProxyState:
     def remove_decoders(self, instances: list[ServerState]) -> bool:
         if not instances:
             return False
+        if self.enable_remote_lmcache_store:
+            raise RuntimeError(
+                "Dynamic topology is disabled while remote LMCache store is enabled"
+            )
 
         if self.request_num > 0:
             logger.warning(f"Start to taint decode instances {instances}.")
@@ -725,9 +821,8 @@ class NodeListener:
     @staticmethod
     async def check_instance_status(client: httpx.AsyncClient) -> bool:
         endpoint = "/models"
-        headers = {"Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}"}
         try:
-            response = await client.get(endpoint, headers=headers)
+            response = await client.get(endpoint, headers=_service_auth_headers())
             response.raise_for_status()
             return True
         except (httpx.RequestError, httpx.HTTPStatusError):
@@ -883,7 +978,7 @@ async def _discover_decoder_mooncake_segments(
     response = await server.client.post(
         collective_rpc_url,
         json={"method": "get_mooncake_placement_info"},
-        headers={"Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}"},
+        headers=_service_auth_headers(),
         timeout=timeout_seconds,
     )
     response.raise_for_status()
@@ -982,6 +1077,18 @@ def parse_args() -> argparse.Namespace:
         default=2.0,
         help="Timeout for the decoder placement collective RPC",
     )
+    parser.add_argument(
+        "--decoder-placement-positive-ttl-seconds",
+        type=float,
+        default=30.0,
+        help="Refresh interval for a usable decoder RemoteFill placement",
+    )
+    parser.add_argument(
+        "--decoder-placement-negative-ttl-seconds",
+        type=float,
+        default=3.0,
+        help="Retry interval after discovery returns no RemoteFill placement",
+    )
     parser.add_argument("--max-retries", type=int, default=3, help="Maximum number of retries for HTTP requests")
     parser.add_argument(
         "--retry-delay", type=float, default=0.001, help="Base delay (seconds) for exponential backoff retries"
@@ -1002,6 +1109,10 @@ def parse_args() -> argparse.Namespace:
         raise ValueError("Number of decoder hosts must match number of decoder ports")
     if args.decoder_placement_discovery_timeout_seconds <= 0:
         raise ValueError("Decoder placement discovery timeout must be positive")
+    if args.decoder_placement_positive_ttl_seconds <= 0:
+        raise ValueError("Positive decoder placement TTL must be positive")
+    if args.decoder_placement_negative_ttl_seconds <= 0:
+        raise ValueError("Negative decoder placement TTL must be positive")
     args.prefiller_instances = list(zip(args.prefiller_hosts, args.prefiller_ports))
     args.decoder_instances = list(zip(args.decoder_hosts, args.decoder_ports))
     args.decoder_mooncake_segments = _parse_decoder_mooncake_segments(
@@ -1026,8 +1137,23 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             "decoder_placement_discovery_timeout_seconds",
             2.0,
         ),
+        getattr(global_args, "decoder_placement_positive_ttl_seconds", 30.0),
+        getattr(global_args, "decoder_placement_negative_ttl_seconds", 3.0),
     )
     print(f"Initialized {len(proxy_state.prefillers)} prefill clients and {len(proxy_state.decoders)} decode clients.")
+    if proxy_state.enable_remote_lmcache_store:
+        # Warm discovery during application startup so the first user request
+        # does not pay the collective-RPC timeout.
+        await asyncio.gather(
+            *(
+                proxy_state.ensure_decoder_mooncake_segments(
+                    decoder,
+                    f"proxy-startup-{index}",
+                    "startup",
+                )
+                for index, decoder in enumerate(proxy_state.decoders)
+            )
+        )
     yield
     for p in proxy_state.prefillers:
         await p.client.aclose()
@@ -1113,7 +1239,7 @@ async def send_request_to_service(
         body_bytes=len(request_content),
     )
     headers = {
-        "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}",
+        **_service_auth_headers(),
         "X-Request-Id": request_id,
         "Content-Type": "application/json",
     }
@@ -1147,7 +1273,7 @@ async def stream_service_response_with_retry(
     decoder_dp_rank: int | None = None,
 ) -> AsyncIterator[bytes]:
     headers = {
-        "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}",
+        **_service_auth_headers(),
         "X-Request-Id": request_id,
         "Content-Type": "application/json",
     }
@@ -1222,9 +1348,9 @@ async def _handle_select_instance(
         )
         # Discovery is a first-use operation. Keep the stable request path
         # synchronous once this endpoint has a mapping (or a cached fallback).
-        if getattr(decoder, "decoder_mooncake_segments", None) is None or (
-            getattr(proxy_state, "enable_remote_lmcache_store", False)
-            and not getattr(decoder, "decoder_remote_fill_discovered", False)
+        if (
+            getattr(decoder, "decoder_mooncake_segments", None) is None
+            or getattr(proxy_state, "enable_remote_lmcache_store", False)
         ):
             await proxy_state.ensure_decoder_mooncake_segments(
                 decoder, request_id, api
@@ -1261,7 +1387,10 @@ async def _handle_select_instance(
             api,
             req_data,
             request_id,
-            max_retries=global_args.max_retries,
+            # Retrying the same complete prefill HTTP body after a lost
+            # response is not yet proven idempotent. RemoteFill protocol
+            # operation IDs cannot deduplicate a second model execution.
+            max_retries=(1 if remote_fill_handoff is not None else global_args.max_retries),
             base_delay=global_args.retry_delay,
             preferred_mooncake_segment=(
                 reservation.preferred_segment

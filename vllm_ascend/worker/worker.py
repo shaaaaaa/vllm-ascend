@@ -76,6 +76,9 @@ torch._dynamo.trace_rules.torch_name_rule_map.append(torch_non_c_binding_in_grap
 
 _STAGED_SFA_GRAPH_MEMORY_MARGIN_BYTES = 64 << 20
 _STAGED_SFA_GRAPH_MEMORY_MARGIN_RATIO = 1.1
+# Distinct supervisor-visible status for an unsafe armed RemoteFill DMA.
+# Deployment policy must restart the paired P+D serving group on this code.
+REMOTE_FILL_PAIRED_RESTART_EXIT_CODE = 86
 
 
 def _staged_sfa_graph_memory_reservation(estimate: int) -> int:
@@ -462,9 +465,7 @@ class NPUWorker(WorkerBase):
             # WorkerProc catches Exception for ordinary RPC failures but lets
             # SystemExit reach the process boundary. Its monitor then tears
             # down the full executor instead of continuing with unsafe memory.
-            raise SystemExit(
-                "remote-fill armed transfer requires paired P+D restart"
-            )
+            raise SystemExit(REMOTE_FILL_PAIRED_RESTART_EXIT_CODE)
 
     def execute_model(
         self,

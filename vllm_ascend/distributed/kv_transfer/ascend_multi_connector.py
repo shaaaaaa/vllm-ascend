@@ -327,6 +327,34 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
             self._supports_dsa_index_cache(connector)
             for connector in self._connectors
         )
+        # These methods are queried through the top-level connector. Cache the
+        # bound callables once: the paired-restart check runs on model-execution
+        # boundaries and must not reflect over every child on each token step.
+        self._remote_fill_placement_providers = tuple(
+            provider
+            for connector in self._connectors
+            if callable(
+                provider := getattr(
+                    connector, "get_remote_fill_placement_info", None
+                )
+            )
+        )
+        self._remote_fill_restart_providers = tuple(
+            provider
+            for connector in self._connectors
+            if callable(
+                provider := getattr(
+                    connector, "remote_fill_requires_paired_restart", None
+                )
+            )
+        )
+        self._remote_fill_metrics_providers = tuple(
+            provider
+            for connector in self._connectors
+            if callable(
+                provider := getattr(connector, "get_remote_fill_metrics", None)
+            )
+        )
 
         # A mapping from request id to the index of the connector chosen to
         # load the request from (if any).
@@ -346,6 +374,57 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
             [connector.__class__.__name__ for connector in self._connectors],
         )
         self._configure_live_latent_split()
+
+    @staticmethod
+    def _one_consistent_remote_fill_value(
+        values: list[Any], capability: str
+    ) -> Any | None:
+        """Return one child value, rejecting ambiguous multi-owner state."""
+
+        values = [value for value in values if value is not None]
+        if not values:
+            return None
+        first = values[0]
+        if any(value != first for value in values[1:]):
+            raise RuntimeError(
+                "AscendMultiConnector children reported conflicting "
+                f"{capability}"
+            )
+        return first
+
+    def get_remote_fill_placement_info(self) -> dict[str, Any] | None:
+        """Forward decoder placement without allowing multiple owners."""
+
+        providers = getattr(self, "_remote_fill_placement_providers", ())
+        return self._one_consistent_remote_fill_value(
+            [provider() for provider in providers],
+            "remote-fill placement",
+        )
+
+    def remote_fill_requires_paired_restart(self) -> bool:
+        """Fail closed when any RemoteFill child reports native ambiguity."""
+
+        providers = getattr(self, "_remote_fill_restart_providers", ())
+        for provider in providers:
+            try:
+                if provider():
+                    return True
+            except Exception:
+                logger.exception(
+                    "Remote-fill paired-restart state probe failed; "
+                    "terminating fail-closed"
+                )
+                return True
+        return False
+
+    def get_remote_fill_metrics(self) -> dict[str, Any] | None:
+        """Expose the child RemoteFill snapshot through the wrapper."""
+
+        providers = getattr(self, "_remote_fill_metrics_providers", ())
+        return self._one_consistent_remote_fill_value(
+            [provider() for provider in providers],
+            "remote-fill metrics",
+        )
 
     def _configure_live_latent_split(self) -> None:
         """Enable hybrid group-0 only when owner and borrower both support it."""
