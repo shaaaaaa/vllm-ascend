@@ -5,7 +5,8 @@ set -Eeuo pipefail
 #   run_glm51_tp_dp.sh \
 #       [--dp-size 1|2] \
 #       [--layerwise-prefill on|off] \
-#       [--load-8-layers true|false]
+#       [--load-8-layers true|false] \
+#       [--max-model-len N|-1]
 
 unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY
 
@@ -21,9 +22,10 @@ CHUNK_SIZE="${CHUNK_SIZE:-4096}"
 DP_SIZE="${DP_SIZE:-2}"
 LAYERWISE_MODE="${LAYERWISE_MODE:-on}"
 LOAD_8_LAYERS="${LOAD_8_LAYERS:-false}"
+MAX_MODEL_LEN="${MAX_MODEL_LEN:-}"
 
 usage() {
-    echo "usage: $0 [--dp-size 1|2] [--layerwise-prefill on|off] [--load-8-layers true|false]" >&2
+    echo "usage: $0 [--dp-size 1|2] [--layerwise-prefill on|off] [--load-8-layers true|false] [--max-model-len N|-1]" >&2
 }
 
 while [[ $# -gt 0 ]]; do
@@ -41,6 +43,11 @@ while [[ $# -gt 0 ]]; do
         --load-8-layers)
             [[ $# -ge 2 ]] || { usage; exit 2; }
             LOAD_8_LAYERS="$2"
+            shift 2
+            ;;
+        --max-model-len)
+            [[ $# -ge 2 ]] || { usage; exit 2; }
+            MAX_MODEL_LEN="$2"
             shift 2
             ;;
         -h|--help)
@@ -107,6 +114,21 @@ case "${LAYERWISE_MODE}" in
         ;;
 esac
 
+if [[ -z "${MAX_MODEL_LEN}" ]]; then
+    if [[ "${MODEL_VARIANT}" == "full" && "${LAYERWISE_MODE}" == "off" ]]; then
+        # A full 78-layer resident KV cache cannot hold 140K tokens on the
+        # current 64-GiB setup. Let vLLM fit the largest context that actually
+        # fits instead of failing startup.
+        MAX_MODEL_LEN=-1
+    else
+        MAX_MODEL_LEN=140000
+    fi
+fi
+if [[ ! "${MAX_MODEL_LEN}" =~ ^(-1|[1-9][0-9]*)$ ]]; then
+    echo "MAX_MODEL_LEN must be -1 or a positive integer, got: ${MAX_MODEL_LEN}" >&2
+    exit 2
+fi
+
 DP_LOCAL_SIZE="${DP_SIZE}"
 TOPOLOGY="tp${TP_SIZE}_dp${DP_SIZE}"
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-glm51-prefill}"
@@ -169,6 +191,7 @@ echo "LMCACHE_CONFIG=${LMCACHE_CONFIG}"
 echo "LAYERWISE_MODE=${LAYERWISE_MODE}"
 echo "LOAD_8_LAYERS=${LOAD_8_LAYERS}"
 echo "MODEL_VARIANT=${MODEL_VARIANT}"
+echo "MAX_MODEL_LEN=${MAX_MODEL_LEN}"
 echo "LAYERWISE_PREFILL_P_NODE=${VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE}"
 echo "LMCACHE_USE_LAYERWISE=${LMCACHE_USE_LAYERWISE}"
 echo "LMCACHE_ASYNC_DECODE_SAVE=${LMCACHE_ASYNC_DECODE_SAVE}"
@@ -197,7 +220,7 @@ vllm serve "${MODEL_PATH}" \
     --data-parallel-backend mp \
     --enable-expert-parallel \
     --gpu-memory-utilization 0.93 \
-    --max-model-len 140000 \
+    --max-model-len "${MAX_MODEL_LEN}" \
     --max-num-seqs 1 \
     --max-num-batched-tokens "${CHUNK_SIZE}" \
     --enable-chunked-prefill \
