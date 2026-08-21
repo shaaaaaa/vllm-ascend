@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""Capture all chunks of a 65,536-token P-node prefill.
+"""Capture all chunks of one P-node prefill request batch.
 
 Run this once against an ``off`` server and once against an ``on`` server.
 Both captures use the same deterministic measured prompt. A distinct prompt is
@@ -9,7 +9,7 @@ an LMCache prefix hit for the measured request.
 
 The script follows ``staged_sfa_graph_smoke.py``: it controls the worker-only
 profiler through ``/start_profile`` and ``/stop_profile``. The worker records
-all 32 chunks into one ``all-32`` directory. This script invokes the bounded
+all chunks into one ``all-N`` directory. This script invokes the bounded
 ``torch_npu.profiler.analyse`` subprocess and waits for one stable
 ``trace_view.json`` per TP rank.
 It deliberately does not aggregate operator times; open the resulting profile
@@ -22,6 +22,7 @@ import argparse
 import hashlib
 import http.client
 import json
+import math
 import random
 import subprocess
 import sys
@@ -30,8 +31,10 @@ import urllib.error
 import urllib.request
 from array import array
 from collections.abc import Iterable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
+from threading import Barrier
 from urllib.parse import urlparse
 
 PROMPT_TOKENS = 65_536
@@ -128,17 +131,19 @@ def require_worker_only_profiling(
     if expected not in log_text:
         raise SmokeFailure(
             "server is not configured to capture all prefill chunks; "
-            "start it with PREFILL_PROFILE_ALL_CHUNKS=true"
+            "start it with VLLM_ASCEND_PREFILL_PROFILE_ALL_CHUNKS=true"
         )
 
 
-def expected_chunk_markers() -> tuple[str, ...]:
-    total_chunks = PROMPT_TOKENS // PROFILE_CHUNK_TOKENS
+def expected_chunk_markers(
+    prompt_tokens: int = PROMPT_TOKENS,
+) -> tuple[str, ...]:
+    total_chunks = math.ceil(prompt_tokens / PROFILE_CHUNK_TOKENS)
     return tuple(
         "prefill_profile::all::"
         f"chunk_{chunk}_of_{total_chunks}::"
         f"tokens_{(chunk - 1) * PROFILE_CHUNK_TOKENS}_"
-        f"{chunk * PROFILE_CHUNK_TOKENS}"
+        f"{min(chunk * PROFILE_CHUNK_TOKENS, prompt_tokens)}"
         for chunk in range(1, total_chunks + 1)
     )
 
@@ -161,8 +166,9 @@ def validate_chunk_markers(
     traces: list[Path],
     *,
     expected_ranks: int,
+    prompt_tokens: int = PROMPT_TOKENS,
 ) -> None:
-    markers = expected_chunk_markers()
+    markers = expected_chunk_markers(prompt_tokens)
     valid_traces = 0
     failures = []
     for trace in traces:
@@ -280,6 +286,37 @@ class CompletionClient:
         )
 
 
+def run_prompt_batch(
+    args: argparse.Namespace,
+    prompts: list[Prompt],
+    *,
+    phase: str,
+) -> list[RequestTiming]:
+    barrier = Barrier(len(prompts) + 1)
+
+    def run_one(index: int, prompt: Prompt) -> RequestTiming:
+        client = CompletionClient(args.base_url, args.request_timeout)
+        try:
+            barrier.wait(timeout=30)
+            return client.run(
+                model=args.model,
+                prompt=prompt,
+                request_id=(
+                    f"prefill-profile-{args.label}-{phase}-{index}"
+                ),
+            )
+        finally:
+            client.close()
+
+    with ThreadPoolExecutor(max_workers=len(prompts)) as executor:
+        futures = [
+            executor.submit(run_one, index, prompt)
+            for index, prompt in enumerate(prompts)
+        ]
+        barrier.wait(timeout=30)
+        return [future.result() for future in futures]
+
+
 def analyse_profile_data(
     profile_dir: Path,
     expected_ranks: int,
@@ -361,40 +398,50 @@ def wait_for_new_traces(
 
 
 def run_capture(args: argparse.Namespace) -> list[Path]:
-    warmup = make_prompt(
-        args.warmup_seed,
-        cache_chunk_tokens=args.cache_chunk_tokens,
-    )
-    measured = make_prompt(
-        args.seed,
-        cache_chunk_tokens=args.cache_chunk_tokens,
-    )
-    if warmup.first_chunk_digest == measured.first_chunk_digest:
+    warmups = [
+        make_prompt(
+            args.warmup_seed + index,
+            prompt_tokens=args.prompt_tokens,
+            cache_chunk_tokens=args.cache_chunk_tokens,
+        )
+        for index in range(args.concurrency)
+    ]
+    measured = [
+        make_prompt(
+            args.seed + index,
+            prompt_tokens=args.prompt_tokens,
+            cache_chunk_tokens=args.cache_chunk_tokens,
+        )
+        for index in range(args.concurrency)
+    ]
+    first_chunk_digests = {
+        prompt.first_chunk_digest for prompt in [*warmups, *measured]
+    }
+    if len(first_chunk_digests) != 2 * args.concurrency:
         raise SmokeFailure(
-            "warmup and measured prompts share the first LMCache chunk"
+            "warmup and measured prompts contain a duplicate first LMCache chunk"
         )
 
-    client = CompletionClient(args.base_url, args.request_timeout)
     profile_start_attempted = False
     profile_stop_attempted = False
     try:
         print(
-            f"warmup: prompt_tokens={PROMPT_TOKENS}, "
-            f"hash={warmup.digest[:16]}, profiler=off",
+            f"warmup: prompt_tokens={args.prompt_tokens}, "
+            f"concurrency={args.concurrency}, "
+            f"hashes={[prompt.digest[:16] for prompt in warmups]}, "
+            "profiler=off",
             flush=True,
         )
-        warmup_timing = client.run(
-            model=args.model,
-            prompt=warmup,
-            request_id=f"prefill-profile-{args.label}-warmup",
-        )
+        warmup_timings = run_prompt_batch(args, warmups, phase="warmup")
         print(
-            f"warmup complete: ttft={warmup_timing.ttft_ms:.3f} ms, "
-            f"e2e={warmup_timing.e2e_ms:.3f} ms",
+            "warmup complete: ttft_ms="
+            f"{[round(timing.ttft_ms, 3) for timing in warmup_timings]}, "
+            "e2e_ms="
+            f"{[round(timing.e2e_ms, 3) for timing in warmup_timings]}",
             flush=True,
         )
 
-        total_chunks = PROMPT_TOKENS // PROFILE_CHUNK_TOKENS
+        total_chunks = math.ceil(args.prompt_tokens / PROFILE_CHUNK_TOKENS)
         profile_dir = args.profile_dir / f"all-{total_chunks}"
         before_traces = trace_snapshot(profile_dir)
         profile_start_attempted = True
@@ -404,14 +451,16 @@ def run_capture(args: argparse.Namespace) -> list[Path]:
             args.profile_control_timeout,
         )
         print(
-            f"capture: label={args.label}, prompt_tokens={PROMPT_TOKENS}, "
-            f"hash={measured.digest[:16]}, profiler=all_{total_chunks}_chunks",
+            f"capture: label={args.label}, prompt_tokens={args.prompt_tokens}, "
+            f"concurrency={args.concurrency}, "
+            f"hashes={[prompt.digest[:16] for prompt in measured]}, "
+            f"profiler=all_{total_chunks}_chunks",
             flush=True,
         )
-        measured_timing = client.run(
-            model=args.model,
-            prompt=measured,
-            request_id=f"prefill-profile-{args.label}-measure",
+        measured_timings = run_prompt_batch(
+            args,
+            measured,
+            phase="measure",
         )
         profile_stop_attempted = True
         profile_control(
@@ -420,7 +469,6 @@ def run_capture(args: argparse.Namespace) -> list[Path]:
             args.profile_control_timeout,
         )
     finally:
-        client.close()
         if profile_start_attempted and not profile_stop_attempted:
             profile_stop_attempted = True
             try:
@@ -432,14 +480,17 @@ def run_capture(args: argparse.Namespace) -> list[Path]:
             except Exception as exc:
                 print(f"warning: failed to stop profiler: {exc}", file=sys.stderr)
 
-    if measured_timing.prompt_tokens_reported not in (None, PROMPT_TOKENS):
-        raise SmokeFailure(
-            "server reported unexpected prompt length: expected="
-            f"{PROMPT_TOKENS}, actual={measured_timing.prompt_tokens_reported}"
-        )
+    for timing in measured_timings:
+        if timing.prompt_tokens_reported not in (None, args.prompt_tokens):
+            raise SmokeFailure(
+                "server reported unexpected prompt length: expected="
+                f"{args.prompt_tokens}, actual={timing.prompt_tokens_reported}"
+            )
     print(
-        f"capture request complete: ttft={measured_timing.ttft_ms:.3f} ms, "
-        f"e2e={measured_timing.e2e_ms:.3f} ms",
+        "capture requests complete: ttft_ms="
+        f"{[round(timing.ttft_ms, 3) for timing in measured_timings]}, "
+        "e2e_ms="
+        f"{[round(timing.e2e_ms, 3) for timing in measured_timings]}",
         flush=True,
     )
     analyse_profile_data(
@@ -456,6 +507,7 @@ def run_capture(args: argparse.Namespace) -> list[Path]:
     validate_chunk_markers(
         traces,
         expected_ranks=args.expected_ranks,
+        prompt_tokens=args.prompt_tokens,
     )
     return traces
 
@@ -468,6 +520,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--label", required=True, choices=("off", "on"))
     parser.add_argument("--base-url", default="http://127.0.0.1:9960")
     parser.add_argument("--model", default="glm51-prefill")
+    parser.add_argument("--prompt-tokens", type=int, default=PROMPT_TOKENS)
+    parser.add_argument("--concurrency", type=int, default=1)
     parser.add_argument("--server-log", type=Path, required=True)
     parser.add_argument("--profile-dir", type=Path, required=True)
     parser.add_argument("--expected-ranks", type=int, default=8)
@@ -487,9 +541,13 @@ def parse_args() -> argparse.Namespace:
 
     if args.expected_ranks <= 0:
         parser.error("--expected-ranks must be positive")
+    if args.prompt_tokens <= 0:
+        parser.error("--prompt-tokens must be positive")
+    if args.concurrency <= 0:
+        parser.error("--concurrency must be positive")
     if args.seed == args.warmup_seed:
         parser.error("--seed and --warmup-seed must differ")
-    if not 0 < args.cache_chunk_tokens <= PROMPT_TOKENS:
+    if not 0 < args.cache_chunk_tokens <= args.prompt_tokens:
         parser.error("--cache-chunk-tokens must be within the prompt")
     for name in (
         "ready_timeout",
@@ -520,13 +578,12 @@ def main() -> int:
         return 1
 
     print("\nPREFILL PROFILE CAPTURE PASSED")
+    total_chunks = math.ceil(args.prompt_tokens / PROFILE_CHUNK_TOKENS)
     print(
-        f"label={args.label} prompt_tokens={PROMPT_TOKENS} "
-        f"profile_chunks={PROMPT_TOKENS // PROFILE_CHUNK_TOKENS}"
+        f"label={args.label} prompt_tokens={args.prompt_tokens} "
+        f"profile_chunks={total_chunks}"
     )
-    profile_dir = args.profile_dir / (
-        f"all-{PROMPT_TOKENS // PROFILE_CHUNK_TOKENS}"
-    )
+    profile_dir = args.profile_dir / f"all-{total_chunks}"
     print(f"MindStudio all-chunk profile root: {profile_dir}")
     for trace in traces:
         print(f"trace: {trace}")

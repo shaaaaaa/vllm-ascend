@@ -1,11 +1,30 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 from tools import layerwise_prefill_profile_smoke as smoke
+
+
+def test_cli_defaults_to_one_request(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "layerwise_prefill_profile_smoke.py",
+            "--label",
+            "on",
+            "--server-log",
+            "/tmp/server.log",
+            "--profile-dir",
+            "/tmp/profile",
+        ],
+    )
+
+    assert smoke.parse_args().concurrency == 1
 
 
 def test_prompts_are_deterministic_and_warmup_has_distinct_cache_chunk():
@@ -44,6 +63,17 @@ def test_expected_chunk_markers_cover_all_32_chunks():
     )
 
 
+def test_expected_chunk_markers_include_partial_final_chunk():
+    markers = smoke.expected_chunk_markers(14_000)
+    assert len(markers) == 7
+    assert markers[-2] == (
+        "prefill_profile::all::chunk_6_of_7::tokens_10240_12288"
+    )
+    assert markers[-1] == (
+        "prefill_profile::all::chunk_7_of_7::tokens_12288_14000"
+    )
+
+
 def test_trace_requires_every_final_chunk_marker(tmp_path: Path):
     markers = smoke.expected_chunk_markers()
     trace = tmp_path / "trace_view.json"
@@ -79,6 +109,8 @@ def _capture_args(tmp_path: Path) -> SimpleNamespace:
         label="off",
         base_url="http://127.0.0.1:9960",
         model="glm51-prefill",
+        prompt_tokens=14_000,
+        concurrency=1,
         profile_dir=tmp_path,
         expected_ranks=8,
         seed=smoke.DEFAULT_SEED,
@@ -104,7 +136,7 @@ def test_capture_profiles_only_measured_request(
 
         def run(self, *, model, prompt, request_id):
             events.append(("request", request_id, prompt.digest))
-            return smoke.RequestTiming(1.0, 2.0, smoke.PROMPT_TOKENS)
+            return smoke.RequestTiming(1.0, 2.0, 14_000)
 
         def close(self):
             events.append(("close",))
@@ -139,18 +171,20 @@ def test_capture_profiles_only_measured_request(
     assert event_names == [
         "client",
         "request",
+        "close",
         "snapshot",
         "profile",
+        "client",
         "request",
-        "profile",
         "close",
+        "profile",
         "analyse",
     ]
-    assert events[1][1].endswith("-warmup")
-    assert events[4][1].endswith("-measure")
-    assert events[3] == ("profile", "start")
-    assert events[5] == ("profile", "stop")
-    assert events[1][2] != events[4][2]
+    assert events[1][1].endswith("-warmup-0")
+    assert events[6][1].endswith("-measure-0")
+    assert events[4] == ("profile", "start")
+    assert events[8] == ("profile", "stop")
+    assert events[1][2] != events[6][2]
 
 
 def test_stop_failure_is_not_retried(
@@ -164,7 +198,7 @@ def test_stop_failure_is_not_retried(
             pass
 
         def run(self, **kwargs):
-            return smoke.RequestTiming(1.0, 2.0, smoke.PROMPT_TOKENS)
+            return smoke.RequestTiming(1.0, 2.0, 14_000)
 
         def close(self):
             pass
