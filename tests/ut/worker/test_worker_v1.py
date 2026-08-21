@@ -380,6 +380,27 @@ class TestNPUWorker(TestBase):
         self.assertTrue(worker._prefill_profile_complete)
         self.assertEqual(worker._prefill_profile_chunks_seen, 32)
 
+    def test_deferred_prefill_profile_stop_skips_idle_dp_replica(self):
+        from vllm_ascend.worker.worker import NPUWorker
+
+        with patch.object(NPUWorker, "__init__", lambda self: None):
+            worker = NPUWorker()
+
+        worker._profile_prefill_window(
+            is_start=True,
+            profile_prefix=None,
+        )
+        worker._profile_prefill_window(
+            is_start=False,
+            profile_prefix=None,
+        )
+
+        self.assertFalse(worker._prefill_profile_armed)
+        self.assertFalse(worker._prefill_profile_active)
+        self.assertFalse(worker._prefill_profile_complete)
+        self.assertEqual(worker._prefill_profile_chunks_seen, 0)
+        self.assertEqual(worker._prefill_profile_total_chunks, 0)
+
     def test_deferred_prefill_profile_uses_all_chunks_directory(self):
         from vllm_ascend.worker.worker import NPUWorker
 

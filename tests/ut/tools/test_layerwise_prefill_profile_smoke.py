@@ -52,6 +52,48 @@ def test_requires_worker_only_full_profile_configuration(tmp_path: Path):
         smoke.require_worker_only_profiling(server_log)
 
 
+def test_expected_ranks_follow_active_dp_replicas(tmp_path: Path):
+    server_log = tmp_path / "server.log"
+    server_log.write_text(
+        "TP=4 DP=2 DP_LOCAL=2 DP_BACKEND=mp\n",
+        encoding="utf-8",
+    )
+
+    assert smoke.resolve_expected_ranks(
+        server_log,
+        concurrency=1,
+        configured=None,
+    ) == 4
+    assert smoke.resolve_expected_ranks(
+        server_log,
+        concurrency=2,
+        configured=None,
+    ) == 8
+    assert smoke.resolve_expected_ranks(
+        server_log,
+        concurrency=1,
+        configured=7,
+    ) == 7
+
+
+def test_expected_ranks_are_inferred_from_dp_worker_log_names(tmp_path: Path):
+    server_log = tmp_path / "server.log"
+    server_log.write_text(
+        "\n".join(
+            f"(Worker_DP{dp}_TP{tp}_EP0 pid=1) ready"
+            for dp in range(2)
+            for tp in range(4)
+        ),
+        encoding="utf-8",
+    )
+
+    assert smoke.resolve_expected_ranks(
+        server_log,
+        concurrency=1,
+        configured=None,
+    ) == 4
+
+
 def test_expected_chunk_markers_cover_all_32_chunks():
     markers = smoke.expected_chunk_markers()
     assert len(markers) == 32

@@ -24,6 +24,7 @@ import http.client
 import json
 import math
 import random
+import re
 import subprocess
 import sys
 import time
@@ -49,6 +50,10 @@ FRONTEND_PROFILER_ENABLED = (
     "Torch profiler enabled. AsyncLLM CPU traces will be collected under"
 )
 DEFERRED_PROFILE_ENABLED = "Deferred full prefill profiler enabled:"
+TOPOLOGY_PATTERN = re.compile(r"\bTP=(\d+) DP=(\d+)\b")
+DP_WORKER_PATTERN = re.compile(r"\bWorker_DP(\d+)_TP(\d+)_")
+TP_WORKER_PATTERN = re.compile(r"\bWorker_TP(\d+)\b")
+DEFAULT_EXPECTED_RANKS = 8
 
 
 class SmokeFailure(RuntimeError):
@@ -133,6 +138,41 @@ def require_worker_only_profiling(
             "server is not configured to capture all prefill chunks; "
             "start it with VLLM_ASCEND_PREFILL_PROFILE_ALL_CHUNKS=true"
         )
+
+
+def resolve_expected_ranks(
+    server_log: Path,
+    *,
+    concurrency: int,
+    configured: int | None,
+) -> int:
+    if configured is not None:
+        return configured
+    log_text = server_log.read_text(encoding="utf-8", errors="replace")
+    matches = TOPOLOGY_PATTERN.findall(log_text)
+    if matches:
+        tp_size, dp_size = map(int, matches[-1])
+        return tp_size * min(dp_size, concurrency)
+
+    dp_workers = {
+        (int(dp_rank), int(tp_rank))
+        for dp_rank, tp_rank in DP_WORKER_PATTERN.findall(log_text)
+    }
+    if dp_workers:
+        dp_size = max(dp_rank for dp_rank, _ in dp_workers) + 1
+        tp_size = max(tp_rank for _, tp_rank in dp_workers) + 1
+        return tp_size * min(dp_size, concurrency)
+
+    tp_workers = {int(rank) for rank in TP_WORKER_PATTERN.findall(log_text)}
+    if tp_workers:
+        return max(tp_workers) + 1
+
+    print(
+        "warning: could not infer TP/DP topology from server log; "
+        f"using {DEFAULT_EXPECTED_RANKS} expected worker traces",
+        file=sys.stderr,
+    )
+    return DEFAULT_EXPECTED_RANKS
 
 
 def expected_chunk_markers(
@@ -524,7 +564,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--concurrency", type=int, default=1)
     parser.add_argument("--server-log", type=Path, required=True)
     parser.add_argument("--profile-dir", type=Path, required=True)
-    parser.add_argument("--expected-ranks", type=int, default=8)
+    parser.add_argument("--expected-ranks", type=int)
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
     parser.add_argument("--warmup-seed", type=int, default=DEFAULT_WARMUP_SEED)
     parser.add_argument(
@@ -539,7 +579,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--trace-timeout", type=float, default=900)
     args = parser.parse_args()
 
-    if args.expected_ranks <= 0:
+    if args.expected_ranks is not None and args.expected_ranks <= 0:
         parser.error("--expected-ranks must be positive")
     if args.prompt_tokens <= 0:
         parser.error("--prompt-tokens must be positive")
@@ -567,6 +607,16 @@ def main() -> int:
         wait_until_ready(args.base_url, args.ready_timeout)
         require_worker_only_profiling(
             args.server_log,
+        )
+        args.expected_ranks = resolve_expected_ranks(
+            args.server_log,
+            concurrency=args.concurrency,
+            configured=args.expected_ranks,
+        )
+        print(
+            f"expecting {args.expected_ranks} worker traces for "
+            f"concurrency={args.concurrency}",
+            flush=True,
         )
         traces = run_capture(args)
     except (

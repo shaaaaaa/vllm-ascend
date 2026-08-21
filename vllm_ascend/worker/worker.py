@@ -806,11 +806,23 @@ class NPUWorker(WorkerBase):
             logger.info("Armed profiler for all prefill chunks")
             return
 
+        was_armed = self._prefill_profile_armed
         self._prefill_profile_armed = False
         if getattr(self, "_prefill_profile_active", False):
             assert self._prefill_profile_profiler is not None
             self._prefill_profile_profiler.stop()
             self._prefill_profile_active = False
+        if (
+            was_armed
+            and not getattr(self, "_prefill_profile_complete", False)
+            and self._prefill_profile_chunks_seen == 0
+            and self._prefill_profile_total_chunks == 0
+        ):
+            logger.info(
+                "Stopped idle full prefill profiler; this DP replica "
+                "received no profiled request"
+            )
+            return
         if not getattr(self, "_prefill_profile_complete", False):
             raise RuntimeError(
                 "full prefill profile did not complete: "
