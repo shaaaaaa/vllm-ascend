@@ -460,7 +460,12 @@ class NPUWorker(WorkerBase):
         )
         if callable(check) and bool(check()):
             logger.critical(
-                "Remote-fill armed transfer requires paired P+D restart"
+                "[LMCACHE_REMOTE_FILL_VALIDATION] code=RF-D-900 "
+                "stage=worker_process_boundary "
+                "action=PAIRED_RESTART_REQUIRED: an armed native transfer "
+                "has uncertain completion; this worker is exiting deliberately "
+                "so the supervisor cannot continue with reusable destination "
+                "memory"
             )
             # WorkerProc catches Exception for ordinary RPC failures but lets
             # SystemExit reach the process boundary. Its monitor then tears
