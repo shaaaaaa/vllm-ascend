@@ -905,3 +905,84 @@ def test_ascend_multi_request_finished_all_groups_merges_params():
         request,
         ([10], [20]),
     )
+
+
+def test_ascend_multi_remote_fill_echo_yields_to_sibling_envelope():
+    """Regression: the LMCache remote-fill response echoes the prefiller's
+    incoming routing keys, which must not clash with the decoder-directed
+    envelope authored by the Mooncake P2P producer child."""
+
+    multi = object.__new__(AscendMultiConnector)
+    lmcache_connector = MagicMock()
+    lmcache_connector.request_finished.return_value = (
+        False,
+        {
+            "do_remote_decode": True,
+            "do_remote_prefill": False,
+            "remote_engine_id": None,
+            "remote_block_ids": None,
+            "remote_host": None,
+            "remote_port": None,
+            "lmcache.remote_fill": {"terminal": {"outcome": "PERSISTENT_ONLY"}},
+        },
+    )
+    mooncake_connector = MagicMock()
+    mooncake_connector.request_finished.return_value = (
+        True,
+        {
+            "do_remote_prefill": True,
+            "do_remote_decode": False,
+            "remote_engine_id": "prefiller",
+            "remote_block_ids": [10, 11],
+            "remote_host": "7.150.4.174",
+            "remote_port": "30000",
+            "remote_request_id": "req-1",
+            "last_token_id": 42,
+            "num_prompt_blocks": 2,
+        },
+    )
+    multi._connectors = [lmcache_connector, mooncake_connector]
+    multi._requests_to_connector = {"req-1": 0}
+    multi._extra_async_saves = {}
+    request = SimpleNamespace(request_id="req-1")
+
+    async_save, params = multi.request_finished_all_groups(request, ([10], [11]))
+
+    assert async_save is True
+    assert params == {
+        "do_remote_prefill": True,
+        "do_remote_decode": False,
+        "remote_engine_id": "prefiller",
+        "remote_block_ids": [10, 11],
+        "remote_host": "7.150.4.174",
+        "remote_port": "30000",
+        "remote_request_id": "req-1",
+        "last_token_id": 42,
+        "num_prompt_blocks": 2,
+        "lmcache.remote_fill": {"terminal": {"outcome": "PERSISTENT_ONLY"}},
+    }
+
+
+def test_ascend_multi_remote_fill_echo_preserved_without_sibling_params():
+    """Without a sibling envelope the remote-fill response keeps its echo."""
+
+    multi = object.__new__(AscendMultiConnector)
+    lmcache_connector = MagicMock()
+    echoed = {
+        "do_remote_decode": True,
+        "do_remote_prefill": False,
+        "remote_engine_id": None,
+        "lmcache.remote_fill": {"terminal": {"outcome": "LOCAL_FULL"}},
+    }
+    lmcache_connector.request_finished.return_value = (False, echoed)
+    idle_connector = MagicMock()
+    idle_connector.request_finished.return_value = (False, None)
+    multi._connectors = [lmcache_connector, idle_connector]
+    multi._requests_to_connector = {"req-1": 0}
+    multi._extra_async_saves = {}
+    request = SimpleNamespace(request_id="req-1")
+
+    async_save, params = multi.request_finished_all_groups(request, ([10],))
+
+    assert async_save is False
+    assert params == echoed

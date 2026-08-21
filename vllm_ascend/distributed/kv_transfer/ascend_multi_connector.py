@@ -824,6 +824,7 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
         )
         async_saves = 0
         kv_transfer_params: dict[str, Any] | None = None
+        remote_fill_params: dict[str, Any] | None = None
 
         connectors = self._connectors
         params = getattr(request, "kv_transfer_params", None)
@@ -877,8 +878,33 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
                 params["ascend_live_split_source_v1"] = txfer_params.pop(
                     "ascend_live_split_source_v1"
                 )
+            if (
+                isinstance(txfer_params, dict)
+                and "lmcache.remote_fill" in txfer_params
+            ):
+                # The LMCache remote-fill response echoes the prefiller's
+                # incoming routing keys (do_remote_decode, remote_engine_id,
+                # ...) so a standalone LMCache deployment still returns a
+                # complete envelope to the router. Here a sibling child
+                # (the Mooncake P2P producer) authors the decoder-directed
+                # envelope, so the echoed keys must yield to it. Defer this
+                # response and merge it after the others.
+                remote_fill_params = self._merge_kv_transfer_params(
+                    remote_fill_params, txfer_params
+                )
+            else:
+                kv_transfer_params = self._merge_kv_transfer_params(
+                    kv_transfer_params, txfer_params
+                )
+
+        if remote_fill_params is not None:
+            if kv_transfer_params is not None:
+                # Drop the echoed routing keys owned by sibling responses;
+                # keep the keys only the remote-fill response provides.
+                for key in kv_transfer_params:
+                    remote_fill_params.pop(key, None)
             kv_transfer_params = self._merge_kv_transfer_params(
-                kv_transfer_params, txfer_params
+                kv_transfer_params, remote_fill_params
             )
 
         _cold_live_log(
