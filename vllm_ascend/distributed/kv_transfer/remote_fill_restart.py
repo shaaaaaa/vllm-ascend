@@ -11,11 +11,23 @@ from time import time_ns
 from typing import Any, Protocol
 
 IDENTITY_FIELDS = (
+    "source_incarnation_id",
+    "destination_incarnation_id",
     "source_engine_epoch",
     "destination_engine_epoch",
     "source_session",
     "destination_session",
+    "global_te_registration_generation",
     "shared_cache_generation",
+    "shared_cache_incarnation_id",
+)
+FRESHNESS_FIELDS = (
+    "source_incarnation_id",
+    "destination_incarnation_id",
+    "source_engine_epoch",
+    "destination_engine_epoch",
+    "global_te_registration_generation",
+    "shared_cache_incarnation_id",
 )
 
 
@@ -43,16 +55,31 @@ class PairedRestartAdapter(Protocol):
 
 def _identity(identity: Mapping[str, Any]) -> dict[str, Any]:
     epochs = ("source_engine_epoch", "destination_engine_epoch")
-    sessions = ("source_session", "destination_session")
+    strings = (
+        "source_incarnation_id",
+        "destination_incarnation_id",
+        "source_session",
+        "destination_session",
+        "shared_cache_incarnation_id",
+    )
     invalid = [
         field
         for field in epochs
         if isinstance(identity.get(field), bool) or not isinstance(identity.get(field), int) or identity[field] <= 0
     ]
-    invalid.extend(field for field in sessions if not isinstance(identity.get(field), str) or not identity[field])
-    generation = identity.get("shared_cache_generation")
-    if isinstance(generation, bool) or not isinstance(generation, int) or generation < 0:
-        invalid.append("shared_cache_generation")
+    invalid.extend(
+        field
+        for field in strings
+        if not isinstance(identity.get(field), str) or not identity[field]
+    )
+    for field in ("global_te_registration_generation", "shared_cache_generation"):
+        generation = identity.get(field)
+        if (
+            isinstance(generation, bool)
+            or not isinstance(generation, int)
+            or generation < 0
+        ):
+            invalid.append(field)
     if invalid:
         raise RuntimeError("paired restart identity is invalid: " + ", ".join(invalid))
     return {field: identity[field] for field in IDENTITY_FIELDS}
@@ -95,21 +122,37 @@ def restart_affected_pair(
         for expected, actual in stop_counts
     ):
         raise RuntimeError("paired restart did not stop every P and D process")
-    run("engine_groups_started", lambda: adapter.start_engine_groups(pair_id))
-    new = _identity(
-        run(
-            "fresh_identity_discovered",
-            lambda: adapter.discover_identity(pair_id, timeout_seconds),
+    started = False
+    try:
+        run("engine_groups_started", lambda: adapter.start_engine_groups(pair_id))
+        started = True
+        new = _identity(
+            run(
+                "fresh_identity_discovered",
+                lambda: adapter.discover_identity(pair_id, timeout_seconds),
+            )
         )
-    )
-    stale = [field for field in IDENTITY_FIELDS if new[field] == old[field]]
-    if stale:
-        raise RuntimeError("paired restart reused identity: " + ", ".join(stale))
-    run(
-        "proxy_placement_published",
-        lambda: adapter.publish_proxy_placement(pair_id, new),
-    )
-    run("admission_restored", lambda: adapter.restore_admission(pair_id))
+        stale = [field for field in FRESHNESS_FIELDS if new[field] == old[field]]
+        if stale:
+            raise RuntimeError("paired restart reused identity: " + ", ".join(stale))
+        run(
+            "proxy_placement_published",
+            lambda: adapter.publish_proxy_placement(pair_id, new),
+        )
+        run("admission_restored", lambda: adapter.restore_admission(pair_id))
+    except BaseException:
+        if started:
+            run(
+                "failed_restart_groups_terminated",
+                lambda: adapter.terminate_engine_groups(pair_id),
+            )
+            run(
+                "failed_restart_groups_stopped",
+                lambda: adapter.wait_engine_groups_stopped(
+                    pair_id, timeout_seconds
+                ),
+            )
+        raise
     return {
         "schema": 1,
         "kind": "remote_fill_paired_restart_record",

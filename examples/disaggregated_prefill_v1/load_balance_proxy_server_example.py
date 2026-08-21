@@ -147,6 +147,7 @@ except ImportError:
 
 
 _COLD_PERF_FALSE_VALUES = ("", "0", "false", "no", "off")
+_REMOTE_FILL_VERIFICATION_CAPABILITY_BYTES = 32
 
 
 def _clock_domain() -> tuple[str, str]:
@@ -883,6 +884,7 @@ def _parse_decoder_remote_fill_response(payload: Any) -> dict[int, dict[str, Any
             "destination_engine_id",
             "control_endpoint",
             "token_hash_algorithm",
+            "descriptor_verification_capability",
         )
         if any(
             not isinstance(remote_fill.get(name), str)
@@ -917,6 +919,22 @@ def _parse_decoder_remote_fill_response(payload: Any) -> dict[int, dict[str, Any
             raise ValueError("Decoder remote-fill native capability is invalid")
         if not global_te_push:
             continue
+        verification_capability = remote_fill[
+            "descriptor_verification_capability"
+        ]
+        try:
+            verification_key = bytes.fromhex(verification_capability)
+        except ValueError as error:
+            raise ValueError(
+                "Decoder remote-fill verification capability is invalid"
+            ) from error
+        if (
+            len(verification_key) != _REMOTE_FILL_VERIFICATION_CAPABILITY_BYTES
+            or verification_key.hex() != verification_capability
+        ):
+            raise ValueError(
+                "Decoder remote-fill verification capability is invalid"
+            )
         python_hash_seed = remote_fill.get("python_hash_seed", "")
         if not isinstance(python_hash_seed, str) or (
             remote_fill["token_hash_algorithm"] == "builtin"
@@ -934,6 +952,7 @@ def _parse_decoder_remote_fill_response(payload: Any) -> dict[int, dict[str, Any
             "global_te_push": global_te_push,
             "token_hash_algorithm": remote_fill["token_hash_algorithm"].strip(),
             "python_hash_seed": python_hash_seed,
+            "descriptor_verification_capability": verification_capability,
         }
         existing = placements.get(dp_rank)
         if existing is not None and existing != placement:

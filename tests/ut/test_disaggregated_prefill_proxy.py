@@ -25,6 +25,7 @@ class TestProxyColdPerfLogging(unittest.TestCase):
             "global_te_push": True,
             "token_hash_algorithm": "builtin",
             "python_hash_seed": "0",
+            "descriptor_verification_capability": "ab" * 32,
             "tp_rank": 0,
             "dp_rank": 1,
         }
@@ -129,6 +130,7 @@ class TestProxyColdPerfLogging(unittest.TestCase):
             ("destination_dp_size", True),
             ("destination_dp_size", 1),
             ("global_te_push", "yes"),
+            ("descriptor_verification_capability", "bad"),
             ("tp_rank", 1),
             ("dp_rank", 0),
         ):
@@ -691,6 +693,12 @@ class TestProxyColdPerfLogging(unittest.TestCase):
         self.assertEqual(
             payload["kv_transfer_params"]["lmcache.remote_fill"], handoff
         )
+        self.assertEqual(
+            payload["kv_transfer_params"]["lmcache.remote_fill"][
+                "descriptor_verification_capability"
+            ],
+            "ab" * 32,
+        )
         self.assertNotIn("kv_transfer_params", request_data)
 
     def test_instance_selection_logs_handoff_boundaries(self):
@@ -865,6 +873,7 @@ class TestProxyColdPerfLogging(unittest.TestCase):
                     "lmcache.remote_fill": {
                         "terminal": terminal,
                         "must_not_reach_decoder": "secret-control-state",
+                        "descriptor_verification_capability": "ab" * 32,
                     },
                 }
             }
@@ -907,6 +916,10 @@ class TestProxyColdPerfLogging(unittest.TestCase):
         self.assertNotIn("lmcache.remote_fill", req_data["kv_transfer_params"])
         self.assertNotIn(
             "must_not_reach_decoder",
+            result.decoder_body.decode(),
+        )
+        self.assertNotIn(
+            "descriptor_verification_capability",
             result.decoder_body.decode(),
         )
 
