@@ -4,6 +4,7 @@ import os
 import time
 from typing import TYPE_CHECKING, Any
 
+from vllm.distributed.kv_transfer.diagnostics import cold_perf_clock_fields
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
     SupportsHMA,
@@ -46,6 +47,7 @@ def _cold_live_log(event: str, **fields: Any) -> None:
                 "event": event,
                 "pid": os.getpid(),
                 "monotonic_ms": round(time.perf_counter() * 1000, 3),
+                **cold_perf_clock_fields(),
                 **fields,
             },
             default=str,

@@ -121,6 +121,7 @@ import heapq
 import ipaddress
 import json
 import os
+import socket
 import sys
 import threading
 import time
@@ -128,6 +129,7 @@ import uuid
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -145,6 +147,18 @@ except ImportError:
 
 
 _COLD_PERF_FALSE_VALUES = ("", "0", "false", "no", "off")
+
+
+def _clock_domain() -> tuple[str, str]:
+    host = socket.gethostname()
+    try:
+        boot = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+    except OSError:
+        boot = str(round(time.time() - time.monotonic()))
+    return host, f"{host}:{boot}"
+
+
+_HOST, _CLOCK_DOMAIN = _clock_domain()
 
 
 def _service_auth_headers() -> dict[str, str]:
@@ -186,6 +200,9 @@ def _log_proxy_cold_perf_event(
         "event": event,
         "pid": os.getpid(),
         "monotonic_ms": round(time.perf_counter() * 1000, 3),
+        "wall_time_ns": time.time_ns(),
+        "host": _HOST,
+        "clock_domain": _CLOCK_DOMAIN,
         "req_id": req_id,
         "proxy_request_id": request_id,
         "endpoint": endpoint,
@@ -1298,6 +1315,14 @@ async def stream_service_response_with_retry(
             ) as response:
                 response.raise_for_status()
                 async for chunk in response.aiter_bytes():
+                    if not first_chunk_sent:
+                        _log_proxy_cold_perf_event(
+                            "proxy_decoder_first_byte_received",
+                            request_id,
+                            endpoint=endpoint,
+                            attempt=attempt,
+                            response_bytes=len(chunk),
+                        )
                     first_chunk_sent = True
                     yield chunk
                 return  # Success, exit after streaming
@@ -1329,11 +1354,23 @@ async def stream_service_response_with_retry(
 
 
 async def _handle_select_instance(
-    api: str, req_data: Any, request_length: int
+    api: str,
+    req_data: Any,
+    request_length: int,
+    *,
+    request_id: str | None = None,
+    log_request_received: bool = True,
 ) -> "InstanceInfo":
     prefiller_score = proxy_state.calculate_prefill_scores(request_length)
     logger.debug(f"Request length: {request_length}, Prefiller score: {prefiller_score}")
-    request_id = await proxy_state.next_req_id()
+    request_id = request_id or await proxy_state.next_req_id()
+    if log_request_received:
+        _log_proxy_cold_perf_event(
+            "proxy_request_received",
+            request_id,
+            endpoint=api,
+            request_bytes=request_length,
+        )
     decoder_score = proxy_state.calculate_decode_scores(request_length)
     logger.debug("Decoder score: %f", decoder_score)
     prefiller_idx = None
@@ -1381,6 +1418,13 @@ async def _handle_select_instance(
                 "request_attempt": 1,
                 "source_engine_id": str(prefiller),
             }
+        _log_proxy_cold_perf_event(
+            "proxy_prefiller_dispatch",
+            request_id,
+            endpoint=api,
+            prefiller_url=str(getattr(prefiller, "url", "")),
+            request_bytes=request_length,
+        )
         response = await send_request_to_service(
             prefiller.client,
             prefiller_idx,
@@ -1480,6 +1524,11 @@ async def _handle_select_instance(
             decoder_url=decoder.url,
             request_bytes=request_length,
             kv_transfer_param_keys=sorted(str(key) for key in kv_transfer_params),
+            remote_fill_transfer_id=(
+                remote_fill_handoff["transfer_id"]
+                if remote_fill_handoff is not None
+                else None
+            ),
         )
         logger.debug("Using %s %s", prefiller.url, decoder.url)
         return InstanceInfo(
@@ -1568,10 +1617,29 @@ async def _handle_completions(
 
     try:
         proxy_state.request_num += 1
+        request_id = str(uuid.uuid4())
+        headers = getattr(request, "headers", {})
+        content_length = headers.get("content-length") if headers else None
+        _log_proxy_cold_perf_event(
+            "proxy_request_received",
+            request_id,
+            endpoint=api,
+            request_bytes=(
+                int(content_length)
+                if isinstance(content_length, str) and content_length.isdigit()
+                else None
+            ),
+        )
         req_data = await request.json()
         req_body = await request.body()
         request_length = len(req_body)
-        instance_info = await _handle_select_instance(api, req_data, request_length)
+        instance_info = await _handle_select_instance(
+            api,
+            req_data,
+            request_length,
+            request_id=request_id,
+            log_request_received=False,
+        )
         stream_flag = bool(req_data.get("stream", False))
         chat_flag = "messages" in req_data
 
@@ -1709,6 +1777,7 @@ async def _handle_completions(
         response = _CleanupStreamingResponse(
             generate_stream(),
             media_type=media_type,
+            headers={"X-Request-Id": instance_info.request_id},
             cleanup=cleanup_current_request,
         )
         response_owns_cleanup = True

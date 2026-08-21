@@ -2111,25 +2111,60 @@ class NPUModelRunner(GPUModelRunner):
             cold_perf_forward_start = (
                 time.perf_counter() if cold_perf_req_ids else 0.0
             )
+            cold_perf_role = None
+            cold_perf_tp_rank = None
+            cold_perf_dp_rank = None
+            if cold_perf_req_ids:
+                cold_perf_role = "local"
+                if self.is_kv_producer:
+                    cold_perf_role = "producer"
+                elif self.is_kv_consumer:
+                    cold_perf_role = "consumer"
+                cold_perf_tp_rank = get_tp_group().rank_in_group
+                cold_perf_dp_rank = get_dp_group().rank_in_group
             log_cold_perf_event(
                 "decoder_forward_start",
                 request_ids=cold_perf_req_ids,
                 once=True,
                 total_num_scheduled_tokens=num_tokens_padded,
+                kv_role=cold_perf_role,
+                tp_rank=cold_perf_tp_rank,
+                dp_rank=cold_perf_dp_rank,
             )
             hidden_states = self._model_forward(
                 num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
             )
             if cold_perf_req_ids:
+                cold_perf_forward_end = time.perf_counter()
                 log_cold_perf_event(
                     "decoder_forward_return",
                     request_ids=cold_perf_req_ids,
                     once=True,
                     cpu_elapsed_ms=round(
-                        (time.perf_counter() - cold_perf_forward_start) * 1000,
+                        (cold_perf_forward_end - cold_perf_forward_start) * 1000,
                         3,
                     ),
+                    kv_role=cold_perf_role,
+                    tp_rank=cold_perf_tp_rank,
+                    dp_rank=cold_perf_dp_rank,
                 )
+                if self.is_kv_producer:
+                    log_cold_perf_event(
+                        "prefiller_model_chunk_complete",
+                        request_ids=cold_perf_req_ids,
+                        tp_rank=cold_perf_tp_rank,
+                        dp_rank=cold_perf_dp_rank,
+                        model_started_monotonic_ms=round(
+                            cold_perf_forward_start * 1000, 3
+                        ),
+                        model_ended_monotonic_ms=round(
+                            cold_perf_forward_end * 1000, 3
+                        ),
+                        model_forward_cpu_ms=round(
+                            (cold_perf_forward_end - cold_perf_forward_start) * 1000,
+                            3,
+                        ),
+                    )
             target_diag_session = getattr(
                 get_forward_context(),
                 "_target_sfa_diag_session",

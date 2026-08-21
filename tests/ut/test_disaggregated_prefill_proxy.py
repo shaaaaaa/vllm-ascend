@@ -519,6 +519,9 @@ class TestProxyColdPerfLogging(unittest.TestCase):
         self.assertEqual(payload["req_id"], "cmpl-request-uuid")
         self.assertEqual(payload["proxy_request_id"], "request-uuid")
         self.assertEqual(payload["attempt"], 1)
+        self.assertGreater(payload["wall_time_ns"], 0)
+        self.assertEqual(payload["host"], proxy._HOST)
+        self.assertEqual(payload["clock_domain"], proxy._CLOCK_DOMAIN)
 
     def test_log_event_is_disabled_by_default(self):
         with (
@@ -756,6 +759,19 @@ class TestProxyColdPerfLogging(unittest.TestCase):
             log_event.call_args_list,
             [
                 call(
+                    "proxy_request_received",
+                    request_id,
+                    endpoint="/completions",
+                    request_bytes=4096,
+                ),
+                call(
+                    "proxy_prefiller_dispatch",
+                    request_id,
+                    endpoint="/completions",
+                    prefiller_url=prefiller.url,
+                    request_bytes=4096,
+                ),
+                call(
                     "proxy_prefill_response_received",
                     request_id,
                     endpoint="/completions",
@@ -779,6 +795,7 @@ class TestProxyColdPerfLogging(unittest.TestCase):
                     decoder_url=decoder.url,
                     request_bytes=4096,
                     kv_transfer_param_keys=["source"],
+                    remote_fill_transfer_id=None,
                 ),
             ],
         )
@@ -1124,7 +1141,20 @@ class TestProxyColdPerfLogging(unittest.TestCase):
             json.loads(result.decoder_body)["kv_transfer_params"],
             {"source": "live"},
         )
-        placement_event = log_event.call_args_list[0]
+        self.assertEqual(
+            log_event.call_args_list[0],
+            call(
+                "proxy_request_received",
+                request_id,
+                endpoint="/completions",
+                request_bytes=4096,
+            ),
+        )
+        placement_event = next(
+            item
+            for item in log_event.call_args_list
+            if item.args[0] == "proxy_decoder_placement_reserved"
+        )
         self.assertEqual(
             placement_event.args[:2],
             ("proxy_decoder_placement_reserved", request_id),
@@ -1322,13 +1352,25 @@ class TestProxyColdPerfLogging(unittest.TestCase):
             chunks = asyncio.run(collect_chunks())
 
         self.assertEqual(chunks, [b"chunk"])
-        log_event.assert_called_once_with(
-            "proxy_decoder_send_start",
-            "request-uuid",
-            endpoint="/completions",
-            attempt=1,
-            decoder_url="http://decoder:8002/v1/",
-            body_bytes=2,
+        self.assertEqual(
+            log_event.call_args_list,
+            [
+                call(
+                    "proxy_decoder_send_start",
+                    "request-uuid",
+                    endpoint="/completions",
+                    attempt=1,
+                    decoder_url="http://decoder:8002/v1/",
+                    body_bytes=2,
+                ),
+                call(
+                    "proxy_decoder_first_byte_received",
+                    "request-uuid",
+                    endpoint="/completions",
+                    attempt=1,
+                    response_bytes=5,
+                ),
+            ],
         )
         stream_kwargs = client.stream.call_args.kwargs
         self.assertEqual(stream_kwargs["content"], b"{}")
@@ -1473,6 +1515,7 @@ class TestProxyColdPerfLogging(unittest.TestCase):
                 "/completions",
                 request,
             )
+            self.assertEqual(response.headers["x-request-id"], "request-uuid")
             self.assertEqual(state.request_num, 1)
             chunks = [chunk async for chunk in response.body_iterator]
             self.assertEqual(state.request_num, 0)
@@ -1506,12 +1549,19 @@ class TestProxyColdPerfLogging(unittest.TestCase):
             chunks,
             [b'data: {"choices":[{"text":"x"}]}\n\n'],
         )
-        log_event.assert_called_once_with(
-            "proxy_decoder_generator_entry",
-            "request-uuid",
-            endpoint="/completions",
-            decoder_url=decoder.url,
-            request_bytes=len(b'{"prompt":"hello"}'),
+        self.assertEqual(
+            log_event.call_args_list[0].args[0],
+            "proxy_request_received",
+        )
+        self.assertEqual(
+            log_event.call_args_list[-1],
+            call(
+                "proxy_decoder_generator_entry",
+                "request-uuid",
+                endpoint="/completions",
+                decoder_url=decoder.url,
+                request_bytes=len(b'{"prompt":"hello"}'),
+            ),
         )
         state.release_decoder_reservation.assert_called_once()
 

@@ -28,13 +28,16 @@ from mooncake.engine import TransferEngine  # type: ignore
 from vllm import envs
 from vllm.config import VllmConfig
 from vllm.distributed import get_pcp_group
+from vllm.distributed.kv_transfer.diagnostics import (
+    cold_perf_clock_fields,
+    mark_cold_perf_requests,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
     KVConnectorHandshakeMetadata,
     KVConnectorMetadata,
     KVConnectorRole,
 )
-from vllm.distributed.kv_transfer.diagnostics import mark_cold_perf_requests
 from vllm.distributed.parallel_state import (
     get_decode_context_model_parallel_rank,
     get_decode_context_model_parallel_world_size,
@@ -208,6 +211,7 @@ def _cold_live_log(event: str, **fields: Any) -> None:
                 "event": event,
                 "pid": os.getpid(),
                 "monotonic_ms": round(time.perf_counter() * 1000, 3),
+                **cold_perf_clock_fields(),
                 **fields,
             },
             default=str,
