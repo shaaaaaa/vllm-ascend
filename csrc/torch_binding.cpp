@@ -1413,7 +1413,8 @@ at::Tensor resident_sharded_union_common_(
     at::Tensor &shard_miss_positions,
     at::Tensor &shard_evictable_slots,
     int64_t mtp,
-    int64_t dummy_state_base)
+    int64_t dummy_state_base,
+    const c10::optional<at::Tensor> &row_offsets)
 {
     const auto device = topk_indices.device();
     TORCH_CHECK(
@@ -1493,11 +1494,10 @@ at::Tensor resident_sharded_union_common_(
 
     const int64_t row_count = topk_indices.size(0);
     const int64_t request_count = shard_packed.size(0);
-    TORCH_CHECK(
-        request_count > 0 && row_count > 0 &&
-            row_count % request_count == 0,
-        "resident sharded-sort rows must be request-major");
-    const int64_t rows_per_request = row_count / request_count;
+    TORCH_CHECK(request_count > 0 && row_count > 0,
+                "resident sharded-sort rows and requests must be non-empty");
+    const bool fragmented_layout = row_offsets.has_value();
+    const int64_t rows_per_request = mtp;
     const int64_t row_width = topk_indices.numel() / row_count;
     const int64_t request_width = rows_per_request * row_width;
     const int64_t shard_count = shard_packed.size(1);
@@ -1508,8 +1508,23 @@ at::Tensor resident_sharded_union_common_(
     const int64_t state_row_count = state_tokens.size(0);
     const int64_t generation_stride = state_generations.size(1);
     TORCH_CHECK(
-        mtp >= 1 && mtp <= 2 && rows_per_request == mtp,
+        mtp >= 1 && mtp <= 2,
         "resident sharded union currently requires MTP=1 or MTP=2");
+    if (fragmented_layout) {
+        TORCH_CHECK(
+            row_offsets->device() == device &&
+                row_offsets->scalar_type() == at::kInt &&
+                row_offsets->is_contiguous() &&
+                row_offsets->dim() == 1 &&
+                row_offsets->numel() >= row_count,
+            "resident fragment row offsets must be a contiguous int32 NPU "
+            "vector covering every local row");
+    } else {
+        TORCH_CHECK(
+            row_count == request_count * rows_per_request,
+            "resident sharded-sort rows must be request-major unless "
+            "fragment row offsets are supplied");
+    }
     TORCH_CHECK(
         row_width == 2048 &&
             shard_count >= 1 && shard_count <= 8 &&
@@ -1573,6 +1588,9 @@ at::Tensor resident_sharded_union_common_(
     void* topk_ptr = topk_indices.data_ptr();
     void* boundary_ptr = split_boundary.data_ptr();
     void* row_request_ptr = row_req_indices.data_ptr();
+    void* row_offsets_ptr = fragmented_layout
+        ? row_offsets->data_ptr()
+        : nullptr;
     void* packed_ptr = shard_packed.data_ptr();
     void* mapping_ptr = shard_mapping.data_ptr();
     void* count_ptr = shard_counts.data_ptr();
@@ -1590,24 +1608,26 @@ at::Tensor resident_sharded_union_common_(
     at_npu::native::OpCommand cmd;
     cmd.Name("npu_dsa_resident_sharded_union_");
     cmd.SetCustomHandler([
-        stream, topk_ptr, boundary_ptr, row_request_ptr,
+        stream, topk_ptr, boundary_ptr, row_request_ptr, row_offsets_ptr,
         packed_ptr, mapping_ptr, count_ptr, request_state_ptr,
         request_generation_ptr, state_token_ptr, state_slot_ptr,
         state_count_ptr, state_generation_ptr, prior_slot_ptr,
         shard_miss_token_ptr, shard_miss_position_ptr,
         shard_evictable_slot_ptr,
-        request_count, state_row_count, dummy_state_base,
+        request_count, row_count, state_row_count, dummy_state_base,
         rows_per_request, row_width, shard_count, shard_capacity,
         shard_count_stride, shard_count_request_stride,
-        generation_stride, core_count]() -> int {
+        generation_stride, core_count, fragmented_layout]() -> int {
         dsa_resident_sharded_union_impl(
             stream, topk_ptr, boundary_ptr, row_request_ptr,
+            row_offsets_ptr,
             packed_ptr, mapping_ptr, count_ptr, request_state_ptr,
             request_generation_ptr, state_token_ptr, state_slot_ptr,
             state_count_ptr, state_generation_ptr, prior_slot_ptr,
             shard_miss_token_ptr, shard_miss_position_ptr,
             shard_evictable_slot_ptr,
             static_cast<uint32_t>(request_count),
+            static_cast<uint32_t>(row_count),
             static_cast<uint32_t>(state_row_count),
             static_cast<uint32_t>(dummy_state_base),
             static_cast<uint32_t>(rows_per_request),
@@ -1617,7 +1637,7 @@ at::Tensor resident_sharded_union_common_(
             static_cast<uint32_t>(shard_count_stride),
             static_cast<uint32_t>(shard_count_request_stride),
             static_cast<uint32_t>(generation_stride),
-            core_count);
+            core_count, fragmented_layout);
         return 0;
     });
     cmd.Run();
@@ -1644,7 +1664,8 @@ at::Tensor npu_dsa_resident_sharded_union_(
     at::Tensor &shard_miss_positions,
     at::Tensor &shard_evictable_slots,
     int64_t mtp,
-    int64_t dummy_state_base)
+    int64_t dummy_state_base,
+    const c10::optional<at::Tensor> &row_offsets)
 {
     return resident_sharded_union_common_(
         topk_indices, split_boundary, row_req_indices,
@@ -1652,7 +1673,7 @@ at::Tensor npu_dsa_resident_sharded_union_(
         request_state_indices, request_state_generations,
         state_tokens, state_slots, state_counts, state_generations,
         prior_slots, shard_miss_tokens, shard_miss_positions,
-        shard_evictable_slots, mtp, dummy_state_base);
+        shard_evictable_slots, mtp, dummy_state_base, row_offsets);
 }
 
 static at::Tensor resident_sorted_plan_common_(
@@ -1676,6 +1697,8 @@ static at::Tensor resident_sorted_plan_common_(
     at::Tensor &target_slots,
     int64_t block_size,
     int64_t dummy_state_base,
+    const c10::optional<at::Tensor> &row_req_indices,
+    const c10::optional<at::Tensor> &row_offsets,
     bool fused_remap)
 {
     const auto device = topk_indices.device();
@@ -1766,13 +1789,43 @@ static at::Tensor resident_sorted_plan_common_(
     const int64_t shard_count = shard_packed.size(1);
     const int64_t capacity = shard_packed.size(2);
     const int64_t row_count = topk_indices.size(0);
-    TORCH_CHECK(
-        request_count > 0 && row_count > 0 &&
-            row_count % request_count == 0,
-        "sorted-resident top-k rows must be request-major");
-    const int64_t rows_per_request = row_count / request_count;
+    TORCH_CHECK(request_count > 0 && row_count > 0,
+                "sorted-resident rows and requests must be non-empty");
     const int64_t row_width = topk_indices.numel() / row_count;
+    TORCH_CHECK(
+        row_width > 0 && capacity % row_width == 0,
+        "sorted-resident capacity must contain a whole number of top-k rows");
+    const int64_t rows_per_request = capacity / row_width;
     const int64_t request_width = rows_per_request * row_width;
+    const bool fragmented_layout =
+        row_req_indices.has_value() || row_offsets.has_value();
+    TORCH_CHECK(
+        row_req_indices.has_value() == row_offsets.has_value(),
+        "sorted-resident fragment request ids and row offsets must be "
+        "supplied together");
+    TORCH_CHECK(
+        !fragmented_layout || fused_remap,
+        "fragmented sorted-resident rows require the fused remap planner");
+    if (fragmented_layout) {
+        TORCH_CHECK(
+            row_req_indices->device() == device &&
+                row_offsets->device() == device &&
+                row_req_indices->scalar_type() == at::kInt &&
+                row_offsets->scalar_type() == at::kInt &&
+                row_req_indices->is_contiguous() &&
+                row_offsets->is_contiguous() &&
+                row_req_indices->dim() == 1 &&
+                row_offsets->dim() == 1 &&
+                row_req_indices->numel() >= row_count &&
+                row_offsets->numel() >= row_count,
+            "sorted-resident fragment metadata must be contiguous int32 "
+            "NPU vectors covering every local row");
+    } else {
+        TORCH_CHECK(
+            row_count == request_count * rows_per_request,
+            "sorted-resident top-k rows must be request-major unless "
+            "fragment metadata is supplied");
+    }
     const int64_t state_row_count = state_tokens.size(0);
     const int64_t shard_count_stride = shard_counts.size(2);
     const int64_t shard_count_request_stride =
@@ -1787,6 +1840,9 @@ static at::Tensor resident_sorted_plan_common_(
             shard_count >= 1 && shard_count <= 8 &&
             (shard_count & (shard_count - 1)) == 0 &&
             request_width % (16 * shard_count) == 0 &&
+            (!fragmented_layout ||
+             (request_width / shard_count <= row_width &&
+              row_width % (request_width / shard_count) == 0)) &&
             block_size > 0 &&
             block_table_width * block_size >= capacity,
         "sorted-resident dimensions are unsupported");
@@ -1850,6 +1906,12 @@ static at::Tensor resident_sorted_plan_common_(
         resident_vector_core_count(topk_indices);
     aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
     void* topk_ptr = topk_indices.data_ptr();
+    void* row_request_ptr = fragmented_layout
+        ? row_req_indices->data_ptr()
+        : nullptr;
+    void* row_offsets_ptr = fragmented_layout
+        ? row_offsets->data_ptr()
+        : nullptr;
     void* packed_ptr = shard_packed.data_ptr();
     void* mapping_ptr = shard_mapping.data_ptr();
     void* shard_count_ptr = shard_counts.data_ptr();
@@ -1874,45 +1936,66 @@ static at::Tensor resident_sorted_plan_common_(
             ? "npu_dsa_resident_sorted_plan_"
             : "npu_dsa_resident_sorted_plan_no_remap_");
     cmd.SetCustomHandler([
-        stream, topk_ptr, packed_ptr, mapping_ptr,
+        stream, topk_ptr, row_request_ptr, row_offsets_ptr,
+        packed_ptr, mapping_ptr,
         shard_count_ptr, block_table_ptr, request_state_ptr,
         request_generation_ptr, state_token_ptr, state_slot_ptr,
         state_count_ptr, state_generation_ptr,
         prior_slot_ptr, shard_miss_token_ptr,
         shard_miss_position_ptr, shard_evictable_slot_ptr,
         miss_token_ptr, miss_count_ptr, target_ptr,
-        request_count, state_row_count, dummy_state_base,
+        request_count, row_count, state_row_count, dummy_state_base,
         rows_per_request, row_width, shard_count, capacity,
         shard_count_stride, shard_count_request_stride,
         miss_count_stride, generation_stride,
-        block_table_width, block_size, fused_remap,
+        block_table_width, block_size, fragmented_layout, fused_remap,
         core_count]() -> int {
-        auto impl = fused_remap
-            ? dsa_resident_sorted_plan_impl
-            : dsa_resident_sorted_plan_no_remap_impl;
-        impl(
-            stream, topk_ptr, packed_ptr, mapping_ptr,
-            shard_count_ptr, block_table_ptr, request_state_ptr,
-            request_generation_ptr, state_token_ptr, state_slot_ptr,
-            state_count_ptr, state_generation_ptr,
-            prior_slot_ptr, shard_miss_token_ptr,
-            shard_miss_position_ptr, shard_evictable_slot_ptr,
-            miss_token_ptr, miss_count_ptr,
-            target_ptr,
-            static_cast<uint32_t>(request_count),
-            static_cast<uint32_t>(state_row_count),
-            static_cast<uint32_t>(dummy_state_base),
-            static_cast<uint32_t>(rows_per_request),
-            static_cast<uint32_t>(row_width),
-            static_cast<uint32_t>(shard_count),
-            static_cast<uint32_t>(capacity),
-            static_cast<uint32_t>(shard_count_stride),
-            static_cast<uint32_t>(shard_count_request_stride),
-            static_cast<uint32_t>(miss_count_stride),
-            static_cast<uint32_t>(generation_stride),
-            static_cast<uint32_t>(block_table_width),
-            static_cast<uint32_t>(block_size),
-            core_count);
+        if (fused_remap) {
+            dsa_resident_sorted_plan_impl(
+                stream, topk_ptr, row_request_ptr, row_offsets_ptr,
+                packed_ptr, mapping_ptr, shard_count_ptr, block_table_ptr,
+                request_state_ptr, request_generation_ptr, state_token_ptr,
+                state_slot_ptr, state_count_ptr, state_generation_ptr,
+                prior_slot_ptr, shard_miss_token_ptr,
+                shard_miss_position_ptr, shard_evictable_slot_ptr,
+                miss_token_ptr, miss_count_ptr, target_ptr,
+                static_cast<uint32_t>(request_count),
+                static_cast<uint32_t>(row_count),
+                static_cast<uint32_t>(state_row_count),
+                static_cast<uint32_t>(dummy_state_base),
+                static_cast<uint32_t>(rows_per_request),
+                static_cast<uint32_t>(row_width),
+                static_cast<uint32_t>(shard_count),
+                static_cast<uint32_t>(capacity),
+                static_cast<uint32_t>(shard_count_stride),
+                static_cast<uint32_t>(shard_count_request_stride),
+                static_cast<uint32_t>(miss_count_stride),
+                static_cast<uint32_t>(generation_stride),
+                static_cast<uint32_t>(block_table_width),
+                static_cast<uint32_t>(block_size), core_count,
+                fragmented_layout);
+        } else {
+            dsa_resident_sorted_plan_no_remap_impl(
+                stream, topk_ptr, packed_ptr, mapping_ptr,
+                shard_count_ptr, block_table_ptr, request_state_ptr,
+                request_generation_ptr, state_token_ptr, state_slot_ptr,
+                state_count_ptr, state_generation_ptr, prior_slot_ptr,
+                shard_miss_token_ptr, shard_miss_position_ptr,
+                shard_evictable_slot_ptr, miss_token_ptr, miss_count_ptr,
+                target_ptr, static_cast<uint32_t>(request_count),
+                static_cast<uint32_t>(state_row_count),
+                static_cast<uint32_t>(dummy_state_base),
+                static_cast<uint32_t>(rows_per_request),
+                static_cast<uint32_t>(row_width),
+                static_cast<uint32_t>(shard_count),
+                static_cast<uint32_t>(capacity),
+                static_cast<uint32_t>(shard_count_stride),
+                static_cast<uint32_t>(shard_count_request_stride),
+                static_cast<uint32_t>(miss_count_stride),
+                static_cast<uint32_t>(generation_stride),
+                static_cast<uint32_t>(block_table_width),
+                static_cast<uint32_t>(block_size), core_count);
+        }
         return 0;
     });
     cmd.Run();
@@ -1939,7 +2022,9 @@ at::Tensor npu_dsa_resident_sorted_plan_(
     at::Tensor &miss_counts,
     at::Tensor &target_slots,
     int64_t block_size,
-    int64_t dummy_state_base)
+    int64_t dummy_state_base,
+    const c10::optional<at::Tensor> &row_req_indices,
+    const c10::optional<at::Tensor> &row_offsets)
 {
     return resident_sorted_plan_common_(
         topk_indices, shard_packed, shard_mapping, shard_counts,
@@ -1948,7 +2033,7 @@ at::Tensor npu_dsa_resident_sorted_plan_(
         state_counts, state_generations, prior_slots,
         shard_miss_tokens, shard_miss_positions, shard_evictable_slots,
         miss_tokens, miss_counts, target_slots,
-        block_size, dummy_state_base, true);
+        block_size, dummy_state_base, row_req_indices, row_offsets, true);
 }
 
 at::Tensor npu_dsa_resident_sorted_plan_no_remap_(
@@ -1971,7 +2056,9 @@ at::Tensor npu_dsa_resident_sorted_plan_no_remap_(
     at::Tensor &miss_counts,
     at::Tensor &target_slots,
     int64_t block_size,
-    int64_t dummy_state_base)
+    int64_t dummy_state_base,
+    const c10::optional<at::Tensor> &row_req_indices,
+    const c10::optional<at::Tensor> &row_offsets)
 {
     return resident_sorted_plan_common_(
         topk_indices, shard_packed, shard_mapping, shard_counts,
@@ -1980,7 +2067,7 @@ at::Tensor npu_dsa_resident_sorted_plan_no_remap_(
         state_counts, state_generations, prior_slots,
         shard_miss_tokens, shard_miss_positions, shard_evictable_slots,
         miss_tokens, miss_counts, target_slots,
-        block_size, dummy_state_base, false);
+        block_size, dummy_state_base, row_req_indices, row_offsets, false);
 }
 
 at::Tensor npu_dsa_resident_finalize_coordinator_(
@@ -2981,6 +3068,7 @@ at::Tensor npu_dsa_prepare_sparse_indices_staged_common_(
     int64_t mtp,
     bool need_packed,
     bool clear_invalid_rows,
+    const c10::optional<at::Tensor> &row_offsets,
     bool use_sharded_sort)
 {
     TORCH_CHECK(mtp == 1 || mtp == 2,
@@ -3036,8 +3124,24 @@ at::Tensor npu_dsa_prepare_sparse_indices_staged_common_(
     const int64_t row_width = topk_indices.numel() / row_count;
     const int64_t scratch_capacity = selected_packed.size(1);
     const int64_t block_table_width = request_block_table.size(1);
-    TORCH_CHECK(row_count == request_count * mtp,
-                "fixed staged layout requires exactly MTP rows per request");
+    const bool fragmented_layout = row_offsets.has_value();
+    TORCH_CHECK(
+        fragmented_layout || row_count == request_count * mtp,
+        "fixed staged layout requires exactly MTP rows per request unless "
+        "fragment row offsets are supplied");
+    TORCH_CHECK(
+        !fragmented_layout || use_sharded_sort,
+        "fragmented staged layout requires the production sharded-sort path");
+    if (fragmented_layout) {
+        TORCH_CHECK(
+            row_offsets->device() == device &&
+                row_offsets->scalar_type() == at::kInt &&
+                row_offsets->is_contiguous() &&
+                row_offsets->dim() == 1 &&
+                row_offsets->numel() >= row_count,
+            "fragment row offsets must be a contiguous int32 NPU vector "
+            "covering every local row");
+    }
     TORCH_CHECK(row_width == 2048,
                 "staged sort union currently requires top-k width 2048");
     TORCH_CHECK(split_boundary.numel() >= row_count &&
@@ -3146,6 +3250,9 @@ at::Tensor npu_dsa_prepare_sparse_indices_staged_common_(
     void* topk_ptr = topk_indices.data_ptr();
     void* boundary_ptr = split_boundary.data_ptr();
     void* row_req_ptr = row_req_indices.data_ptr();
+    void* row_offsets_ptr = fragmented_layout
+        ? row_offsets->data_ptr()
+        : nullptr;
     void* table_ptr = request_block_table.data_ptr();
     void* packed_ptr = selected_packed.data_ptr();
     void* counts_ptr = selected_counts.data_ptr();
@@ -3164,25 +3271,28 @@ at::Tensor npu_dsa_prepare_sparse_indices_staged_common_(
             ? "npu_dsa_prepare_sparse_indices_sharded_"
             : "npu_dsa_prepare_sparse_indices_staged_");
     cmd.SetCustomHandler([
-        stream, topk_ptr, boundary_ptr, row_req_ptr, table_ptr, packed_ptr,
+        stream, topk_ptr, boundary_ptr, row_req_ptr, row_offsets_ptr,
+        table_ptr, packed_ptr,
         counts_ptr, slots_ptr, map_ptr, shard_packed_ptr,
         shard_mapping_ptr, shard_counts_ptr, row_count, row_width,
         request_count, mtp, scratch_capacity, block_table_width,
         selected_count_stride, block_size, core_count, need_packed,
-        clear_invalid_rows, use_sharded_sort]() -> int {
+        clear_invalid_rows, fragmented_layout, use_sharded_sort]() -> int {
         if (use_sharded_sort) {
             dsa_prepare_sparse_indices_sharded_impl(
-                stream, topk_ptr, boundary_ptr, row_req_ptr, table_ptr,
+                stream, topk_ptr, boundary_ptr, row_req_ptr,
+                row_offsets_ptr, table_ptr,
                 packed_ptr, counts_ptr, slots_ptr, map_ptr,
                 shard_packed_ptr, shard_mapping_ptr, shard_counts_ptr,
                 static_cast<uint32_t>(request_count),
+                static_cast<uint32_t>(row_count),
                 static_cast<uint32_t>(mtp),
                 static_cast<uint32_t>(row_width),
                 static_cast<uint32_t>(scratch_capacity),
                 static_cast<uint32_t>(block_table_width),
                 static_cast<uint32_t>(selected_count_stride),
                 static_cast<uint32_t>(block_size), core_count, need_packed,
-                clear_invalid_rows);
+                clear_invalid_rows, fragmented_layout);
         } else {
             dsa_prepare_sparse_indices_staged_impl(
                 stream, topk_ptr, boundary_ptr, row_req_ptr, table_ptr,
@@ -3215,14 +3325,15 @@ at::Tensor npu_dsa_prepare_sparse_indices_staged_(
     int64_t block_size,
     int64_t mtp,
     bool need_packed,
-    bool clear_invalid_rows)
+    bool clear_invalid_rows,
+    const c10::optional<at::Tensor> &row_offsets)
 {
     return npu_dsa_prepare_sparse_indices_staged_common_(
         topk_indices, split_boundary, row_req_indices, request_block_table,
         selected_packed, selected_counts, target_slots,
         local_to_union_workspace, nullptr, nullptr, nullptr,
         block_size, mtp, need_packed,
-        clear_invalid_rows, false);
+        clear_invalid_rows, row_offsets, false);
 }
 
 at::Tensor npu_dsa_prepare_sparse_indices_sharded_(
@@ -3240,7 +3351,8 @@ at::Tensor npu_dsa_prepare_sparse_indices_sharded_(
     int64_t block_size,
     int64_t mtp,
     bool need_packed,
-    bool clear_invalid_rows)
+    bool clear_invalid_rows,
+    const c10::optional<at::Tensor> &row_offsets)
 {
     return npu_dsa_prepare_sparse_indices_staged_common_(
         topk_indices, split_boundary, row_req_indices, request_block_table,
@@ -3248,7 +3360,7 @@ at::Tensor npu_dsa_prepare_sparse_indices_sharded_(
         local_to_union_workspace, &shard_packed_workspace,
         &shard_mapping_workspace, &shard_counts_workspace,
         block_size, mtp, need_packed,
-        clear_invalid_rows, true);
+        clear_invalid_rows, row_offsets, true);
 }
 
 void bgmv_shrink(at::Tensor &x, at::Tensor &weight, at::Tensor &indices, at::Tensor &y, double scale)
@@ -3771,7 +3883,7 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "Tensor(b!) selected_packed, Tensor(c!) selected_counts, "
         "Tensor(d!) target_slots, Tensor(e!) local_to_union_workspace, "
         "int block_size, int mtp, bool need_packed, "
-        "bool clear_invalid_rows) -> Tensor(c!)");
+        "bool clear_invalid_rows, Tensor? row_offsets=None) -> Tensor(c!)");
     ops.impl(
         "npu_dsa_prepare_sparse_indices_staged_",
         torch::kPrivateUse1,
@@ -3786,7 +3898,7 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "Tensor(g!) shard_mapping_workspace, "
         "Tensor(h!) shard_counts_workspace, "
         "int block_size, int mtp, bool need_packed, "
-        "bool clear_invalid_rows) -> Tensor(c!)");
+        "bool clear_invalid_rows, Tensor? row_offsets=None) -> Tensor(c!)");
     ops.impl(
         "npu_dsa_prepare_sparse_indices_sharded_",
         torch::kPrivateUse1,
@@ -3894,7 +4006,8 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "Tensor(f!) shard_miss_tokens, "
         "Tensor(g!) shard_miss_positions, "
         "Tensor(h!) shard_evictable_slots, "
-        "int mtp, int dummy_state_base) -> Tensor(c!)");
+        "int mtp, int dummy_state_base, "
+        "Tensor? row_offsets=None) -> Tensor(c!)");
     ops.impl(
         "npu_dsa_resident_sharded_union_",
         torch::kPrivateUse1,
@@ -3911,7 +4024,8 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "Tensor shard_miss_positions, Tensor shard_evictable_slots, "
         "Tensor(g!) miss_tokens, Tensor(h!) miss_counts, "
         "Tensor(i!) target_slots, int block_size, "
-        "int dummy_state_base) -> Tensor(h!)");
+        "int dummy_state_base, Tensor? row_req_indices=None, "
+        "Tensor? row_offsets=None) -> Tensor(h!)");
     ops.impl(
         "npu_dsa_resident_sorted_plan_",
         torch::kPrivateUse1,
@@ -3929,7 +4043,8 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "Tensor shard_miss_positions, Tensor shard_evictable_slots, "
         "Tensor(g!) miss_tokens, Tensor(h!) miss_counts, "
         "Tensor(i!) target_slots, int block_size, "
-        "int dummy_state_base) -> Tensor(h!)");
+        "int dummy_state_base, Tensor? row_req_indices=None, "
+        "Tensor? row_offsets=None) -> Tensor(h!)");
     ops.impl(
         "npu_dsa_resident_sorted_plan_no_remap_",
         torch::kPrivateUse1,

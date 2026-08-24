@@ -1,7 +1,7 @@
 import json
 import os
 from contextlib import nullcontext
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from functools import lru_cache
 from threading import Lock
 from time import monotonic
@@ -923,6 +923,9 @@ class DSACPContext:
     slot_mapping_cp: torch.Tensor
     actual_seq_lengths_query: torch.Tensor
     actual_seq_lengths_key: torch.Tensor
+    indexer_slot_mapping_cp: torch.Tensor | None = None
+    local_request_start: int = 0
+    local_request_end: int = 0
 
 
 @dataclass
@@ -987,6 +990,7 @@ class AscendSFAMetadata:
     decode_req_indices_compact_cpu: Any = None
     decode_request_ids_compact: list[str] | None = None
     decode_row_offsets: torch.Tensor | None = None
+    decode_row_offsets_cpu: Any = None
     decode_current_positions_cpu: Any = None
     split_boundary: torch.Tensor | None = None
     decode_split_boundary_cpu: Any = None
@@ -1008,6 +1012,38 @@ class AscendSFAMetadata:
     prompt_lens_cpu_rows: Any = None
     decode_remap_boundary: torch.Tensor | None = None
     decode_remap_boundary_ready: bool = False
+    # Fixed-layout staged SFA uses a TP-local request-major view when DSA-CP
+    # is active. The parent metadata remains global for the native path.
+    staged_sfa_local_metadata: Any = None
+    staged_sfa_fragmented_layout: bool = False
+
+
+def _staged_sfa_metadata_view(
+    attn_metadata: AscendSFAMetadata,
+) -> AscendSFAMetadata:
+    local_metadata = getattr(
+        attn_metadata,
+        "staged_sfa_local_metadata",
+        None,
+    )
+    if isinstance(local_metadata, AscendSFAMetadata):
+        return local_metadata
+    return attn_metadata
+
+
+def _staged_sfa_local_frontiers(
+    attn_metadata: AscendSFAMetadata,
+    frontiers: tuple[int, ...] | None,
+) -> tuple[int, ...] | None:
+    local_metadata = _staged_sfa_metadata_view(attn_metadata)
+    if local_metadata is attn_metadata or frontiers is None:
+        return frontiers
+    cp_context = attn_metadata.dsa_cp_context
+    if cp_context is None:
+        return frontiers
+    start = cp_context.local_request_start
+    count = len(local_metadata.decode_request_ids_compact or ())
+    return tuple(frontiers[start : start + count])
 
 
 M = TypeVar("M", bound=AscendSFAMetadata)
@@ -1213,6 +1249,67 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             self.decode_remap_boundary
         )
         self.decode_scratch_base = torch.empty_like(self.decode_remap_boundary)
+        if self.dsa_shrink_latent and self.enable_dsa_cp:
+            tp_size = get_tp_group().world_size
+            max_local_rows = (
+                vllm_config.scheduler_config.max_num_batched_tokens
+                + tp_size
+                - 1
+            ) // tp_size
+            self._dsa_cp_metadata_cpu = np.empty(
+                3 * max_local_rows,
+                dtype=np.int32,
+            )
+            self._dsa_cp_metadata_cpu_tensor = torch.from_numpy(
+                self._dsa_cp_metadata_cpu
+            )
+            self._dsa_cp_metadata = torch.empty(
+                3 * max_local_rows,
+                dtype=torch.int32,
+                device=device,
+            )
+            self._dsa_cp_req_indices_cpu = self._dsa_cp_metadata_cpu[
+                :max_local_rows
+            ]
+            self._dsa_cp_prompt_lens_cpu = self._dsa_cp_metadata_cpu[
+                max_local_rows : 2 * max_local_rows
+            ]
+            self._dsa_cp_row_offsets_cpu = self._dsa_cp_metadata_cpu[
+                2 * max_local_rows :
+            ]
+            self._dsa_cp_req_indices_cpu_tensor = (
+                self._dsa_cp_metadata_cpu_tensor[:max_local_rows]
+            )
+            self._dsa_cp_prompt_lens_cpu_tensor = (
+                self._dsa_cp_metadata_cpu_tensor[
+                    max_local_rows : 2 * max_local_rows
+                ]
+            )
+            self._dsa_cp_row_offsets_cpu_tensor = (
+                self._dsa_cp_metadata_cpu_tensor[2 * max_local_rows :]
+            )
+            self._dsa_cp_req_indices = self._dsa_cp_metadata[
+                :max_local_rows
+            ]
+            self._dsa_cp_prompt_lens = self._dsa_cp_metadata[
+                max_local_rows : 2 * max_local_rows
+            ]
+            self._dsa_cp_row_offsets = self._dsa_cp_metadata[
+                2 * max_local_rows :
+            ]
+        else:
+            self._dsa_cp_metadata_cpu = None
+            self._dsa_cp_metadata_cpu_tensor = None
+            self._dsa_cp_metadata = None
+            self._dsa_cp_req_indices_cpu = None
+            self._dsa_cp_req_indices_cpu_tensor = None
+            self._dsa_cp_req_indices = None
+            self._dsa_cp_prompt_lens_cpu = None
+            self._dsa_cp_prompt_lens_cpu_tensor = None
+            self._dsa_cp_prompt_lens = None
+            self._dsa_cp_row_offsets_cpu = None
+            self._dsa_cp_row_offsets_cpu_tensor = None
+            self._dsa_cp_row_offsets = None
 
     @staticmethod
     def determine_chunked_prefill_workspace_size(vllm_config: VllmConfig) -> int:
@@ -1300,6 +1397,8 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
         split_boundary_rows = None
         current_positions = None
         plens_cpu = common_attn_metadata.prompt_lens_cpu if self.dsa_shrink_latent else None
+        fixed_decode_width = 0
+        fixed_width_decode = False
         if plens_cpu is not None:
             assert self._dsa_prompt_lens_cpu is not None
             assert self._dsa_split_boundary_cpu is not None
@@ -1345,7 +1444,6 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
                     "Cold-compact resume markers do not match active requests: "
                     f"markers={len(cold_resumes)}, requests={n_real}."
                 )
-            fixed_decode_width = 0
             if (
                 common_attn_metadata.attn_state
                 == AscendAttentionState.DecodeOnly
@@ -1371,8 +1469,7 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
                 qsl = None
                 fixed_query_starts = None
             fixed_width_decode = (
-                not self.enable_dsa_cp
-                and fixed_decode_width in (1, 2)
+                fixed_decode_width in (1, 2)
                 and num_input_tokens
                 == num_reqs * fixed_decode_width
                 and num_actual_tokens
@@ -1586,7 +1683,10 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             num_tokens_per_device = num_tokens_pad // global_tp_size
             local_start = get_tp_group().rank_in_group * num_tokens_per_device
             local_end_with_pad = local_start + num_tokens_per_device
-            local_end = min(local_end_with_pad, num_actual_tokens)
+            local_end = max(
+                local_start,
+                min(local_end_with_pad, num_actual_tokens),
+            )
 
             pad_size = num_tokens_pad - cos.shape[0]
             assert cos.shape == sin.shape, f"cos.shape must be equal to sin.shape, got {cos.shape} and {sin.shape}"
@@ -1601,6 +1701,24 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             else:
                 slot_mapping = slot_mapping[:num_tokens_pad]
             slot_mapping_cp = slot_mapping[local_start:local_end_with_pad]
+            indexer_slot_mapping_cp = slot_mapping_cp
+            if indexer_slot_mapping is not None:
+                pad_size_indexer_slot = (
+                    num_tokens_pad - indexer_slot_mapping.shape[0]
+                )
+                if pad_size_indexer_slot > 0:
+                    indexer_slot_mapping = nn.functional.pad(
+                        indexer_slot_mapping,
+                        (0, pad_size_indexer_slot),
+                        value=-1,
+                    )
+                else:
+                    indexer_slot_mapping = indexer_slot_mapping[
+                        :num_tokens_pad
+                    ]
+                indexer_slot_mapping_cp = indexer_slot_mapping[
+                    local_start:local_end_with_pad
+                ]
 
             cos = cos[local_start:local_end_with_pad]
             sin = sin[local_start:local_end_with_pad]
@@ -1631,7 +1749,10 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
 
                 req_local_start = max(global_start, local_start)
                 req_local_end = min(global_end, local_end_with_pad)
-                num_local_tokens = req_local_end - req_local_start
+                num_local_tokens = max(
+                    0,
+                    req_local_end - req_local_start,
+                )
 
                 if num_local_tokens > 0:
                     cum += num_local_tokens
@@ -1646,6 +1767,25 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             actual_seq_lengths_query = actual_seq_lengths_query[:num_reqs]
             actual_seq_lengths_key = actual_seq_lengths_key[:num_reqs]
 
+            local_request_start = 0
+            local_request_end = 0
+            if fixed_width_decode:
+                local_capacity_end = min(local_end_with_pad, num_tokens)
+                if local_start < local_capacity_end:
+                    local_request_start = (
+                        local_start // fixed_decode_width
+                    )
+                    local_request_end = (
+                        local_capacity_end + fixed_decode_width - 1
+                    ) // fixed_decode_width
+                else:
+                    # Keep fixed non-empty request tensors on a TP rank whose
+                    # equal token shard contains only context-parallel padding.
+                    # Every local row is marked invalid, so the fused planner
+                    # uses this row only as shape-safe backing storage.
+                    local_request_start = max(0, num_reqs - 1)
+                    local_request_end = num_reqs
+
             dsa_cp_context = DSACPContext(
                 num_tokens=num_tokens,
                 num_tokens_pad=num_tokens_pad,
@@ -1655,9 +1795,12 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
                 slot_mapping_cp=slot_mapping_cp,
                 actual_seq_lengths_query=actual_seq_lengths_query,
                 actual_seq_lengths_key=actual_seq_lengths_key,
+                indexer_slot_mapping_cp=indexer_slot_mapping_cp,
+                local_request_start=local_request_start,
+                local_request_end=local_request_end,
             )
 
-        return self.metadata_cls(  # type: ignore
+        metadata = self.metadata_cls(  # type: ignore
             num_input_tokens=common_attn_metadata.num_input_tokens,
             num_actual_tokens=num_actual_tokens,
             cum_query_lens=cum_query_lens,
@@ -1703,6 +1846,9 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             decode_req_indices_compact_cpu=decode_req_indices_compact_cpu,
             decode_request_ids_compact=decode_request_ids_compact,
             decode_row_offsets=row_offsets_rows,
+            decode_row_offsets_cpu=(
+                row_offsets if row_offsets_rows is not None else None
+            ),
             decode_current_positions_cpu=(
                 current_positions if decode_req_indices_rows is not None else None
             ),
@@ -1726,6 +1872,255 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             decode_remap_boundary_ready=False,
             num_decode_tokens=num_decode_rows,
         )
+        if (
+            self.enable_dsa_cp
+            and fixed_width_decode
+            and dsa_cp_context is not None
+        ):
+            if decode_selected_counts is None:
+                raise RuntimeError(
+                    "DSA-CP staged SFA global count storage is unavailable"
+                )
+            # Non-local request rows must remain zero so LMCache can preserve
+            # its global request ordering without transferring them.
+            decode_selected_counts.zero_()
+            local_request_slice = slice(
+                dsa_cp_context.local_request_start,
+                dsa_cp_context.local_request_end,
+            )
+            local_token_capacity = (
+                dsa_cp_context.local_end_with_pad
+                - dsa_cp_context.local_start
+            )
+            local_request_capacity = (
+                dsa_cp_context.local_request_end
+                - dsa_cp_context.local_request_start
+            )
+            assert decode_req_indices_cpu is not None
+            assert self._dsa_cp_req_indices_cpu is not None
+            assert self._dsa_cp_req_indices_cpu_tensor is not None
+            assert self._dsa_cp_req_indices is not None
+            assert self._dsa_cp_prompt_lens_cpu is not None
+            assert self._dsa_cp_prompt_lens_cpu_tensor is not None
+            assert self._dsa_cp_prompt_lens is not None
+            assert self._dsa_cp_row_offsets_cpu is not None
+            assert self._dsa_cp_row_offsets_cpu_tensor is not None
+            assert self._dsa_cp_row_offsets is not None
+            local_req_indices_cpu = self._dsa_cp_req_indices_cpu[
+                :local_token_capacity
+            ]
+            local_prompt_lens_cpu = self._dsa_cp_prompt_lens_cpu[
+                :local_token_capacity
+            ]
+            local_row_offsets_cpu = self._dsa_cp_row_offsets_cpu[
+                :local_token_capacity
+            ]
+            local_req_indices_cpu.fill(-1)
+            local_prompt_lens_cpu.fill(0)
+            local_row_offsets_cpu.fill(0)
+            local_capacity_end = min(
+                dsa_cp_context.local_end_with_pad,
+                dsa_cp_context.num_tokens,
+            )
+            copied_rows = max(
+                0,
+                local_capacity_end - dsa_cp_context.local_start,
+            )
+            if copied_rows:
+                source_rows = slice(
+                    dsa_cp_context.local_start,
+                    local_capacity_end,
+                )
+                local_req_indices_cpu[:copied_rows] = np.asarray(
+                    decode_req_indices_cpu[source_rows],
+                    dtype=np.int32,
+                )
+                local_prompt_lens_cpu[:copied_rows] = np.asarray(
+                    rows[source_rows],
+                    dtype=np.int32,
+                )
+                assert row_offsets_rows is not None
+                local_row_offsets_cpu[:copied_rows] = np.asarray(
+                    self._dsa_row_offsets_cpu[source_rows],
+                    dtype=np.int32,
+                )
+            valid_local_rows = local_req_indices_cpu >= 0
+            local_req_indices_cpu[valid_local_rows] -= (
+                dsa_cp_context.local_request_start
+            )
+            local_actual_tokens = int(np.count_nonzero(valid_local_rows))
+            fragmented_layout = bool(
+                dsa_cp_context.local_start % fixed_decode_width
+                or copied_rows != local_token_capacity
+                or copied_rows
+                != local_request_capacity * fixed_decode_width
+            )
+            if fragmented_layout:
+                assert self._dsa_cp_metadata is not None
+                assert self._dsa_cp_metadata_cpu_tensor is not None
+                self._dsa_cp_metadata.copy_(
+                    self._dsa_cp_metadata_cpu_tensor
+                )
+                local_prompt_lens = self._dsa_cp_prompt_lens[
+                    :local_token_capacity
+                ]
+                local_row_offsets = self._dsa_cp_row_offsets[
+                    :local_token_capacity
+                ]
+            else:
+                self._dsa_cp_req_indices[:local_token_capacity].copy_(
+                    self._dsa_cp_req_indices_cpu_tensor[
+                        :local_token_capacity
+                    ]
+                )
+                assert prompt_lens_rows is not None
+                assert row_offsets_rows is not None
+                local_prompt_lens = prompt_lens_rows[
+                    dsa_cp_context.local_start :
+                    dsa_cp_context.local_start + local_token_capacity
+                ]
+                local_row_offsets = row_offsets_rows[
+                    dsa_cp_context.local_start :
+                    dsa_cp_context.local_start + local_token_capacity
+                ]
+
+            request_ids = list(decode_request_ids_compact or ())
+            local_actual_requests = (
+                int(local_req_indices_cpu[valid_local_rows].max()) + 1
+                if np.any(valid_local_rows)
+                else 0
+            )
+            local_request_ids = request_ids[
+                dsa_cp_context.local_request_start :
+                dsa_cp_context.local_request_start + local_actual_requests
+            ]
+            all_request_ids = list(
+                getattr(common_attn_metadata, "request_ids", None) or ()
+            )
+            local_all_request_ids = all_request_ids[
+                dsa_cp_context.local_request_start :
+                dsa_cp_context.local_request_start + local_actual_requests
+            ]
+            local_metadata = replace(
+                metadata,
+                num_input_tokens=local_token_capacity,
+                num_actual_tokens=local_actual_tokens,
+                num_decode_tokens=local_actual_tokens,
+                cum_query_lens=(
+                    dsa_cp_context.actual_seq_lengths_query[
+                        local_request_slice
+                    ]
+                ),
+                seq_lens=(
+                    dsa_cp_context.actual_seq_lengths_key[
+                        local_request_slice
+                    ]
+                ),
+                seq_lens_cpu=seq_lens_cpu[local_request_slice],
+                slot_mapping=dsa_cp_context.slot_mapping_cp,
+                block_table=block_table[local_request_slice],
+                indexer_block_table=(
+                    indexer_block_table[local_request_slice]
+                    if indexer_block_table is not None
+                    else None
+                ),
+                indexer_slot_mapping=(
+                    dsa_cp_context.indexer_slot_mapping_cp
+                ),
+                req_ids=local_all_request_ids,
+                resident_state_indices=(
+                    metadata.resident_state_indices[local_request_slice]
+                    if metadata.resident_state_indices is not None
+                    else None
+                ),
+                resident_state_generations=(
+                    metadata.resident_state_generations[
+                        local_request_slice
+                    ]
+                    if metadata.resident_state_generations is not None
+                    else None
+                ),
+                resident_state_indices_cpu=(
+                    metadata.resident_state_indices_cpu[
+                        local_request_slice
+                    ]
+                    if metadata.resident_state_indices_cpu is not None
+                    else None
+                ),
+                resident_state_generations_cpu=(
+                    metadata.resident_state_generations_cpu[
+                        local_request_slice
+                    ]
+                    if metadata.resident_state_generations_cpu is not None
+                    else None
+                ),
+                prompt_lens=local_prompt_lens,
+                prompt_lens_cpu_rows=(
+                    local_prompt_lens_cpu
+                ),
+                decode_req_indices=(
+                    self._dsa_cp_req_indices[:local_token_capacity]
+                ),
+                decode_req_indices_cpu=local_req_indices_cpu,
+                decode_request_ids_compact=local_request_ids,
+                decode_row_offsets=local_row_offsets,
+                decode_row_offsets_cpu=local_row_offsets_cpu,
+                decode_current_positions_cpu=None,
+                decode_split_boundary_cpu=(
+                    local_prompt_lens_cpu
+                ),
+                split_boundary=local_prompt_lens,
+                decode_split_boundary_cpu_tensor=(
+                    self._dsa_cp_prompt_lens_cpu_tensor[
+                        :local_token_capacity
+                    ]
+                ),
+                decode_scratch_base=None,
+                decode_target_slot_mapping=(
+                    decode_target_slot_mapping[local_request_slice]
+                    if decode_target_slot_mapping is not None
+                    else None
+                ),
+                decode_selected_tokens=(
+                    decode_selected_tokens[local_request_slice]
+                    if decode_selected_tokens is not None
+                    else None
+                ),
+                decode_selected_counts=(
+                    decode_selected_counts[local_request_slice]
+                    if decode_selected_counts is not None
+                    else None
+                ),
+                decode_union_mapping_workspace=(
+                    decode_union_mapping_workspace[local_request_slice]
+                    if decode_union_mapping_workspace is not None
+                    else None
+                ),
+                decode_shard_packed_workspace=(
+                    decode_shard_packed_workspace[local_request_slice]
+                    if decode_shard_packed_workspace is not None
+                    else None
+                ),
+                decode_shard_mapping_workspace=(
+                    decode_shard_mapping_workspace[local_request_slice]
+                    if decode_shard_mapping_workspace is not None
+                    else None
+                ),
+                decode_shard_counts_workspace=(
+                    decode_shard_counts_workspace[local_request_slice]
+                    if decode_shard_counts_workspace is not None
+                    else None
+                ),
+                decode_remap_boundary=self.decode_remap_boundary[
+                    dsa_cp_context.local_start :
+                    dsa_cp_context.local_start + local_token_capacity
+                ],
+                decode_remap_boundary_ready=False,
+                staged_sfa_local_metadata=None,
+                staged_sfa_fragmented_layout=fragmented_layout,
+            )
+            metadata.staged_sfa_local_metadata = local_metadata
+        return metadata
 
     def build_for_graph_capture(
         self,
@@ -1864,6 +2259,16 @@ class AscendSFAImpl(MLAAttentionImpl):
                 "staged sparse-index preparation only supports MTP=1 or "
                 f"MTP=2; got MTP={self.decode_threshold}"
             )
+        self.enable_staged_sfa_graph = staged_sfa_graph_configured(
+            self.vllm_config
+        )
+        self._staged_sfa_graph_capture_sizes = (
+            staged_sfa_graph_capture_sizes(self.vllm_config)
+            if self.enable_staged_sfa_graph
+            else ()
+        )
+        # Effective in SFA when FlashComm is enabled.
+        self.enable_dsa_cp = enable_dsa_cp()
         # Select one startup-static branch so graph replay keeps fixed tensor
         # addresses and never reads an environment variable.
         self.dsa_resident_cache = bool(
@@ -1906,18 +2311,19 @@ class AscendSFAImpl(MLAAttentionImpl):
                 device=state_device,
                 shard_count=resident_shards,
             )
+            workspace_requests = max_requests
+            if self.enable_staged_sfa_graph and self.enable_dsa_cp:
+                workspace_requests = (
+                    max_requests + self.tp_size - 1
+                ) // self.tp_size
             self._sorted_resident_workspace = (
                 allocate_sorted_resident_workspace(
-                    max_requests,
+                    workspace_requests,
                     self.decode_threshold,
                     device=state_device,
                     shard_count=resident_shards,
                 )
             )
-        self.enable_staged_sfa_graph = staged_sfa_graph_configured(self.vllm_config)
-        self._staged_sfa_graph_capture_sizes = (
-            staged_sfa_graph_capture_sizes(self.vllm_config) if self.enable_staged_sfa_graph else ()
-        )
         self._staged_sfa_capture_state = _StagedSFACaptureState()
         self._staged_sfa_bridge_buffers: tuple[torch.Tensor, ...] | None = None
         # dsa c8
@@ -1925,9 +2331,6 @@ class AscendSFAImpl(MLAAttentionImpl):
         if self.use_sparse_c8_indexer:
             self.c8_k_cache_dtype = torch.int8
             self.c8_k_scale_cache_dtype = torch.float16
-
-        # Effective in SFA when FlashComm is enabled.
-        self.enable_dsa_cp = enable_dsa_cp()
 
         # Enable layer sharding via DSA-CP on the P node in the PD-disaggregated setup.
         self.enable_dsa_cp_with_layer_shard = enable_dsa_cp_with_layer_shard()
@@ -2629,7 +3032,10 @@ class AscendSFAImpl(MLAAttentionImpl):
         if runtime_mode != CUDAGraphMode.PIECEWISE and not (staged_dummy_run and runtime_mode == CUDAGraphMode.NONE):
             return "the runtime graph mode is not PIECEWISE"
 
-        token_capacity = int(hidden_states.shape[0])
+        local_metadata = _staged_sfa_metadata_view(attn_metadata)
+        token_capacity = int(local_metadata.num_input_tokens)
+        if int(hidden_states.shape[0]) != token_capacity:
+            return "the TP-local hidden-state row count does not match metadata"
         capture_sizes = getattr(
             self,
             "_staged_sfa_graph_capture_sizes",
@@ -2643,20 +3049,28 @@ class AscendSFAImpl(MLAAttentionImpl):
             "staged_sfa_graph_key",
             None,
         )
-        if authorized_key is None or authorized_key.token_capacity != token_capacity:
+        if (
+            authorized_key is None
+            or authorized_key.token_capacity
+            != int(attn_metadata.num_input_tokens)
+        ):
             return "the runner did not authorize this staged SFA token capacity"
         graph_key = authorized_key
         if graph_key.max_query_len > 2:
             return "staged sparse-index preparation only supports MTP=1 or MTP=2"
         if graph_key.query_profile == StagedSFAQueryProfile.DECODE_Q1:
-            if graph_key.max_query_len != 1 or graph_key.request_capacity != token_capacity:
+            if (
+                graph_key.max_query_len != 1
+                or graph_key.request_capacity
+                != int(attn_metadata.num_input_tokens)
+            ):
                 return "the Q1 staged SFA graph key is structurally invalid"
         elif graph_key.query_profile == StagedSFAQueryProfile.SPEC_FIXED:
             if (
                 graph_key.max_query_len != self.decode_threshold
                 or graph_key.max_query_len <= 1
                 or graph_key.request_capacity * graph_key.max_query_len
-                != token_capacity
+                != int(attn_metadata.num_input_tokens)
             ):
                 return "the fixed-width MTP staged SFA graph key is structurally invalid"
         else:
@@ -2688,15 +3102,36 @@ class AscendSFAImpl(MLAAttentionImpl):
         actual_rows = int(attn_metadata.num_actual_tokens)
         actual_requests = len(attn_metadata.decode_request_ids_compact or ())
         if (
-            attn_metadata.num_input_tokens != token_capacity
+            attn_metadata.num_input_tokens != graph_key.token_capacity
             or actual_rows <= 0
-            or actual_rows > token_capacity
+            or actual_rows > graph_key.token_capacity
             or attn_metadata.num_decode_tokens != actual_rows
             or actual_requests <= 0
             or actual_requests > graph_key.request_capacity
             or actual_rows != actual_requests * graph_key.max_query_len
         ):
             return "the real decode layout does not match the fixed staged graph width"
+        if self.enable_dsa_cp:
+            if local_metadata is attn_metadata:
+                return "DSA-CP staged SFA local metadata is unavailable"
+            local_request_capacity = (
+                int(local_metadata.block_table.shape[0])
+                if local_metadata.block_table is not None
+                else 0
+            )
+        else:
+            local_request_capacity = graph_key.request_capacity
+        local_actual_rows = int(local_metadata.num_actual_tokens)
+        local_actual_requests = len(
+            local_metadata.decode_request_ids_compact or ()
+        )
+        if (
+            local_actual_rows < 0
+            or local_actual_rows > token_capacity
+            or local_metadata.num_decode_tokens != local_actual_rows
+            or local_actual_requests > local_request_capacity
+        ):
+            return "the TP-local decode fragment exceeds the graph layout"
         if self.dsa_shrink_latent != 2:
             return "SHRINK_LATENT must be 2"
         if (
@@ -2709,10 +3144,12 @@ class AscendSFAImpl(MLAAttentionImpl):
         weight_prefetch_method = get_weight_prefetch_method()
         if weight_prefetch_method is not None and weight_prefetch_method.mla_sfa_prefetch_enable:
             return "weight prefetch is enabled"
-        if self.enable_dsa_cp:
+        if self.enable_dsa_cp and local_metadata is attn_metadata:
             return "DSA context parallelism is enabled"
         if self.enable_dsa_cp_with_o_proj_tp:
             return "DSA o_proj tensor parallelism is enabled"
+        if self.enable_dsa_cp_with_layer_shard:
+            return "DSA-CP layer-sharded producer mode is enabled"
         if self.use_sparse_c8_indexer:
             return "the sparse C8 indexer is enabled"
         if self.dsa_offload_free_paged:
@@ -2760,42 +3197,87 @@ class AscendSFAImpl(MLAAttentionImpl):
             return "q_a_layernorm is unavailable"
 
         required_token_tensors = (
-            attn_metadata.cos,
-            attn_metadata.sin,
-            attn_metadata.slot_mapping,
-            attn_metadata.indexer_slot_mapping,
+            local_metadata.cos,
+            local_metadata.sin,
+            local_metadata.slot_mapping,
+            local_metadata.indexer_slot_mapping,
         )
         if any(tensor is None for tensor in required_token_tensors):
             return "required fixed-shape attention metadata is unavailable"
         if any(int(tensor.shape[0]) != token_capacity for tensor in required_token_tensors):
             return "the fixed-shape attention row count does not match the graph key"
         if (
-            attn_metadata.cum_query_lens is None
-            or attn_metadata.seq_lens is None
-            or int(attn_metadata.cum_query_lens.shape[0])
-            != graph_key.request_capacity
-            or int(attn_metadata.seq_lens.shape[0])
-            != graph_key.request_capacity
+            local_metadata.cum_query_lens is None
+            or local_metadata.seq_lens is None
+            or int(local_metadata.cum_query_lens.shape[0])
+            != local_request_capacity
+            or int(local_metadata.seq_lens.shape[0])
+            != local_request_capacity
         ):
             return "the request metadata does not match the graph key"
         if (
-            attn_metadata.block_table is None
-            or attn_metadata.indexer_block_table is None
-            or int(attn_metadata.block_table.shape[0])
-            != graph_key.request_capacity
-            or int(attn_metadata.indexer_block_table.shape[0])
-            != graph_key.request_capacity
+            local_metadata.block_table is None
+            or local_metadata.indexer_block_table is None
+            or int(local_metadata.block_table.shape[0])
+            != local_request_capacity
+            or int(local_metadata.indexer_block_table.shape[0])
+            != local_request_capacity
         ):
             return "the native block-table row count does not match the graph key"
         if (
             not staged_dummy_run
-            and not attn_metadata.need_sparse_lmcache_payload
+            and not local_metadata.need_sparse_lmcache_payload
         ):
             return "the v1 sparse LMCache payload path is unavailable"
         if (
-            attn_metadata.decode_req_indices is None
-            or int(attn_metadata.decode_req_indices.numel()) != token_capacity
-            or attn_metadata.decode_selected_tokens is None
+            local_metadata.decode_req_indices is None
+            or int(local_metadata.decode_req_indices.numel()) != token_capacity
+            or local_metadata.decode_row_offsets is None
+            or int(local_metadata.decode_row_offsets.numel())
+            != token_capacity
+            or local_metadata.decode_selected_tokens is None
+            or int(local_metadata.decode_selected_tokens.shape[0])
+            != local_request_capacity
+            or local_metadata.decode_selected_counts is None
+            or int(local_metadata.decode_selected_counts.shape[0])
+            != local_request_capacity
+            or local_metadata.decode_target_slot_mapping is None
+            or int(local_metadata.decode_target_slot_mapping.shape[0])
+            != local_request_capacity
+            or local_metadata.decode_union_mapping_workspace is None
+            or int(local_metadata.decode_union_mapping_workspace.shape[0])
+            != local_request_capacity
+            or local_metadata.decode_union_mapping_workspace.shape
+            != local_metadata.decode_selected_tokens.shape
+            or local_metadata.decode_shard_packed_workspace is None
+            or int(local_metadata.decode_shard_packed_workspace.shape[0])
+            != local_request_capacity
+            or int(local_metadata.decode_shard_packed_workspace.shape[1])
+            != 2
+            or int(local_metadata.decode_shard_packed_workspace.shape[2])
+            != int(local_metadata.decode_selected_tokens.shape[1])
+            or local_metadata.decode_shard_mapping_workspace is None
+            or local_metadata.decode_shard_mapping_workspace.shape
+            != local_metadata.decode_shard_packed_workspace.shape
+            or local_metadata.decode_shard_counts_workspace is None
+            or tuple(local_metadata.decode_shard_counts_workspace.shape)
+            != (local_request_capacity, 2, 16)
+        ):
+            return "the request-union remap buffers do not match the graph key"
+        if self.dsa_resident_cache and (
+            local_metadata.resident_state_indices is None
+            or local_metadata.resident_state_generations is None
+            or tuple(local_metadata.resident_state_indices.shape)
+            != (local_request_capacity,)
+            or tuple(local_metadata.resident_state_generations.shape)
+            != (local_request_capacity,)
+        ):
+            return (
+                "the resident sparse-cache request state does not match the "
+                "graph key"
+            )
+        if self.enable_dsa_cp and (
+            attn_metadata.decode_selected_tokens is None
             or int(attn_metadata.decode_selected_tokens.shape[0])
             != graph_key.request_capacity
             or attn_metadata.decode_selected_counts is None
@@ -2804,87 +3286,109 @@ class AscendSFAImpl(MLAAttentionImpl):
             or attn_metadata.decode_target_slot_mapping is None
             or int(attn_metadata.decode_target_slot_mapping.shape[0])
             != graph_key.request_capacity
-            or attn_metadata.decode_union_mapping_workspace is None
-            or int(attn_metadata.decode_union_mapping_workspace.shape[0])
-            != graph_key.request_capacity
-            or attn_metadata.decode_union_mapping_workspace.shape
-            != attn_metadata.decode_selected_tokens.shape
-            or attn_metadata.decode_shard_packed_workspace is None
-            or int(attn_metadata.decode_shard_packed_workspace.shape[0])
-            != graph_key.request_capacity
-            or int(attn_metadata.decode_shard_packed_workspace.shape[1]) != 2
-            or int(attn_metadata.decode_shard_packed_workspace.shape[2])
-            != int(attn_metadata.decode_selected_tokens.shape[1])
-            or attn_metadata.decode_shard_mapping_workspace is None
-            or attn_metadata.decode_shard_mapping_workspace.shape
-            != attn_metadata.decode_shard_packed_workspace.shape
-            or attn_metadata.decode_shard_counts_workspace is None
-            or tuple(attn_metadata.decode_shard_counts_workspace.shape)
-            != (graph_key.request_capacity, 2, 16)
-        ):
-            return "the request-union remap buffers do not match the graph key"
-        if self.dsa_resident_cache and (
-            attn_metadata.resident_state_indices is None
-            or attn_metadata.resident_state_generations is None
-            or tuple(attn_metadata.resident_state_indices.shape)
-            != (graph_key.request_capacity,)
-            or tuple(attn_metadata.resident_state_generations.shape)
-            != (graph_key.request_capacity,)
         ):
             return (
-                "the resident sparse-cache request state does not match the "
+                "the global DSA-CP LMCache payload does not match the "
                 "graph key"
             )
 
-        request_ids = attn_metadata.decode_request_ids_compact
-        full_request_ids = attn_metadata.req_ids
+        request_ids = local_metadata.decode_request_ids_compact
+        full_request_ids = local_metadata.req_ids
         if (
             request_ids is None
             or full_request_ids is None
-            or len(request_ids) != actual_requests
-            or len(full_request_ids) != actual_requests
+            or len(request_ids) != local_actual_requests
+            or len(full_request_ids) != local_actual_requests
             or tuple(request_ids) != tuple(full_request_ids)
-            or len(set(request_ids)) != actual_requests
+            or len(set(request_ids)) != local_actual_requests
         ):
             return "the compact LMCache request ids are not the unique native request order"
         if (
-            attn_metadata.prompt_lens_cpu_rows is None
-            or attn_metadata.decode_req_indices_cpu is None
-            or attn_metadata.seq_lens_cpu is None
-            or attn_metadata.decode_remap_boundary is None
-            or int(attn_metadata.decode_remap_boundary.shape[0])
+            local_metadata.prompt_lens_cpu_rows is None
+            or local_metadata.decode_req_indices_cpu is None
+            or local_metadata.decode_row_offsets_cpu is None
+            or local_metadata.seq_lens_cpu is None
+            or local_metadata.decode_remap_boundary is None
+            or int(local_metadata.decode_remap_boundary.shape[0])
             != token_capacity
         ):
             return "the persistent remap-boundary metadata is unavailable"
 
         prompt_rows = np.asarray(
-            attn_metadata.prompt_lens_cpu_rows,
+            local_metadata.prompt_lens_cpu_rows,
             dtype=np.int64,
         ).reshape(-1)
         request_rows = np.asarray(
-            attn_metadata.decode_req_indices_cpu,
+            local_metadata.decode_req_indices_cpu,
             dtype=np.int64,
         ).reshape(-1)
-        seq_lens_cpu = attn_metadata.seq_lens_cpu
+        seq_lens_cpu = local_metadata.seq_lens_cpu
         if isinstance(seq_lens_cpu, torch.Tensor):
             if seq_lens_cpu.device.type != "cpu":
                 return "sequence-length validation metadata is not on CPU"
             seq_rows = seq_lens_cpu.detach().numpy().reshape(-1)
         else:
             seq_rows = np.asarray(seq_lens_cpu).reshape(-1)
-        expected_request_rows = np.full(token_capacity, -1, dtype=np.int64)
-        expected_request_rows[:actual_rows] = np.repeat(
-            np.arange(actual_requests, dtype=np.int64),
-            graph_key.max_query_len,
+        row_offsets_cpu = np.asarray(
+            local_metadata.decode_row_offsets_cpu,
+            dtype=np.int64,
+        ).reshape(-1)
+        valid_row_mask = request_rows >= 0
+        valid_row_positions = np.flatnonzero(valid_row_mask)
+        valid_request_rows = request_rows[valid_row_mask]
+        unique_request_rows = np.unique(valid_request_rows)
+        expected_request_rows = np.arange(
+            local_actual_requests,
+            dtype=np.int64,
         )
+        request_step_pairs = set(
+            zip(
+                map(int, valid_request_rows),
+                map(int, row_offsets_cpu[valid_row_mask]),
+                strict=True,
+            )
+        )
+        fragment_is_contiguous = True
+        if local_actual_rows:
+            first_step = int(row_offsets_cpu[0])
+            logical_rows = np.arange(
+                first_step,
+                first_step + local_actual_rows,
+                dtype=np.int64,
+            )
+            fragment_is_contiguous = bool(
+                np.array_equal(
+                    valid_request_rows,
+                    logical_rows // graph_key.max_query_len,
+                )
+                and np.array_equal(
+                    row_offsets_cpu[valid_row_mask],
+                    logical_rows % graph_key.max_query_len,
+                )
+            )
         if (
             prompt_rows.size != token_capacity
-            or np.any(prompt_rows[actual_rows:] != 0)
             or request_rows.size != token_capacity
-            or not np.array_equal(request_rows, expected_request_rows)
-            or seq_rows.size != graph_key.request_capacity
+            or row_offsets_cpu.size != token_capacity
+            or not np.array_equal(
+                valid_row_positions,
+                np.arange(local_actual_rows),
+            )
+            or not np.array_equal(
+                unique_request_rows,
+                expected_request_rows,
+            )
+            or np.any(row_offsets_cpu[valid_row_mask] < 0)
+            or np.any(
+                row_offsets_cpu[valid_row_mask]
+                >= graph_key.max_query_len
+            )
+            or len(request_step_pairs) != local_actual_rows
+            or not fragment_is_contiguous
+            or np.any(prompt_rows[~valid_row_mask] != 0)
+            or seq_rows.size != local_request_capacity
         ):
-            return "the CPU row metadata does not match the staged graph layout"
+            return "the CPU row metadata does not match the staged fragment layout"
         return None
 
     def _submit_sfa_save_operations(
@@ -2902,11 +3406,15 @@ class AscendSFAImpl(MLAAttentionImpl):
         topk_indices: torch.Tensor,
         split_boundary: torch.Tensor,
         row_req_indices: torch.Tensor,
+        row_offsets: torch.Tensor | None,
         request_block_table: torch.Tensor,
         request_state_indices: torch.Tensor | None,
         request_state_generations: torch.Tensor | None,
         *,
         mtp: int,
+        selected_packed: torch.Tensor | None = None,
+        selected_counts: torch.Tensor | None = None,
+        target_slot_mapping: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         if (
             request_state_indices is None
@@ -2919,7 +3427,10 @@ class AscendSFAImpl(MLAAttentionImpl):
                 "workspace, or request metadata is unavailable"
             )
         request_count = int(request_block_table.shape[0])
-        if int(topk_indices.shape[0]) != request_count * mtp:
+        if (
+            row_offsets is None
+            and int(topk_indices.shape[0]) != request_count * mtp
+        ):
             raise RuntimeError(
                 "sorted resident cache requires request-major decode rows: "
                 f"rows={topk_indices.shape[0]}, requests={request_count}, "
@@ -2932,6 +3443,26 @@ class AscendSFAImpl(MLAAttentionImpl):
                 request_count,
             )
             self._sorted_resident_workspace_views[request_count] = workspace
+        payload_outputs = (
+            selected_packed,
+            selected_counts,
+            target_slot_mapping,
+        )
+        if any(output is not None for output in payload_outputs):
+            if any(output is None for output in payload_outputs):
+                raise RuntimeError(
+                    "sorted resident payload outputs must be supplied "
+                    "together"
+                )
+            assert selected_packed is not None
+            assert selected_counts is not None
+            assert target_slot_mapping is not None
+            workspace = replace(
+                workspace,
+                miss_tokens=selected_packed,
+                miss_counts=selected_counts,
+                target_slots=target_slot_mapping,
+            )
         recorder = _sfa_flight_recorder()
         record_sfa_flight_event(
             recorder,
@@ -2949,6 +3480,7 @@ class AscendSFAImpl(MLAAttentionImpl):
             self._sorted_resident_state,
             workspace,
             mtp=mtp,
+            row_offsets=row_offsets,
         )
         record_sfa_flight_event(
             recorder,
@@ -2973,6 +3505,8 @@ class AscendSFAImpl(MLAAttentionImpl):
                 self._sorted_resident_state,
                 workspace,
                 block_size=self.block_size,
+                row_req_indices=row_req_indices,
+                row_offsets=row_offsets,
             )
         )
         record_sfa_flight_event(
@@ -2994,6 +3528,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         topk_indices: torch.Tensor,
         split_boundary: torch.Tensor,
         row_req_indices: torch.Tensor,
+        row_offsets: torch.Tensor | None,
         request_block_table: torch.Tensor,
         selected_packed: torch.Tensor,
         selected_counts: torch.Tensor,
@@ -3032,10 +3567,14 @@ class AscendSFAImpl(MLAAttentionImpl):
                 topk_indices,
                 split_boundary,
                 row_req_indices,
+                row_offsets,
                 request_block_table,
                 request_state_indices,
                 request_state_generations,
                 mtp=staged_mtp,
+                selected_packed=selected_packed,
+                selected_counts=selected_counts,
+                target_slot_mapping=target_slot_mapping,
             )
         return prepare_sparse_indices(
             topk_indices,
@@ -3053,6 +3592,7 @@ class AscendSFAImpl(MLAAttentionImpl):
             shard_mapping_workspace=shard_mapping_workspace,
             shard_counts_workspace=shard_counts_workspace,
             staged_mtp=staged_mtp,
+            row_offsets=row_offsets,
         )
 
     def _cross_layer_pre_compute(
@@ -3065,11 +3605,14 @@ class AscendSFAImpl(MLAAttentionImpl):
         sin: torch.Tensor,
         slot_mapping: torch.Tensor,
         indexer_slot_mapping: torch.Tensor,
+        global_slot_mapping: torch.Tensor,
+        global_indexer_slot_mapping: torch.Tensor,
         actual_seq_lengths_query: torch.Tensor,
         actual_seq_lengths_key: torch.Tensor,
         indexer_block_table: torch.Tensor,
         remap_boundary: torch.Tensor,
         row_req_indices: torch.Tensor,
+        row_offsets: torch.Tensor | None,
         request_block_table: torch.Tensor,
         selected_packed: torch.Tensor,
         selected_counts: torch.Tensor,
@@ -3104,7 +3647,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         )
         assert k_li_scale is None
         kv_cache = (kv_cache_nope, kv_cache_pe, indexer_cache)
-        self.exec_kv(
+        k_pe, k_nope = self.exec_kv(
             kv_no_split,
             cos,
             sin,
@@ -3112,14 +3655,52 @@ class AscendSFAImpl(MLAAttentionImpl):
             slot_mapping,
             None,
         )
+        fused_kv_no_split = None
+        kv_ag_handle = None
+        if self.enable_dsa_cp:
+            fused_kv_no_split, kv_ag_handle = all_gather_async(
+                torch.cat(
+                    [
+                        k_pe.view(-1, k_pe.shape[-1]),
+                        k_nope.view(-1, k_nope.shape[-1]),
+                        k_li.view(-1, k_li.shape[-1]),
+                    ],
+                    dim=1,
+                ),
+                get_tp_group(),
+                async_op=False,
+            )
 
         ql_nope, q_pe = self._q_proj_and_k_up_proj(q_c)
         q_pe = self.rope_single(q_pe, cos, sin)
+        if self.enable_dsa_cp:
+            if kv_ag_handle is not None:
+                kv_ag_handle.wait()
+            assert fused_kv_no_split is not None
+            k_pe, k_nope, k_li = fused_kv_no_split.split(
+                [
+                    self.qk_rope_head_dim,
+                    self.kv_lora_rank,
+                    self.head_dim,
+                ],
+                dim=-1,
+            )
+            DeviceOperator.reshape_and_cache(
+                key=k_nope.view(k_nope.shape[0], 1, -1),
+                value=k_pe.view(k_pe.shape[0], 1, -1),
+                key_cache=kv_cache_nope,
+                value_cache=kv_cache_pe,
+                slot_mapping=global_slot_mapping,
+            )
         k_li = self._get_full_kv(k_li, None)
 
         torch_npu.npu_scatter_nd_update_(
             indexer_cache.view(-1, k_li.shape[-1]),
-            indexer_slot_mapping.view(-1, 1),
+            (
+                global_indexer_slot_mapping
+                if self.enable_dsa_cp
+                else indexer_slot_mapping
+            ).view(-1, 1),
             k_li.view(-1, k_li.shape[-1]),
         )
         topk_indices = self.indexer_select_post_process(
@@ -3133,10 +3714,10 @@ class AscendSFAImpl(MLAAttentionImpl):
             actual_seq_lengths_key=actual_seq_lengths_key,
             indexer_block_table_override=indexer_block_table,
         )
-        staged_mtp = (
-            int(topk_indices.shape[0])
-            // int(request_block_table.shape[0])
-        )
+        staged_mtp = self.decode_threshold
+        payload_selected_packed = selected_packed
+        payload_selected_counts = selected_counts
+        payload_target_slot_mapping = target_slot_mapping
         (
             topk_indices,
             selected_packed,
@@ -3146,6 +3727,7 @@ class AscendSFAImpl(MLAAttentionImpl):
             topk_indices,
             remap_boundary,
             row_req_indices,
+            row_offsets,
             request_block_table,
             selected_packed,
             selected_counts,
@@ -3163,6 +3745,26 @@ class AscendSFAImpl(MLAAttentionImpl):
         assert selected_packed is not None
         assert selected_count_values is not None
         assert target_slot_mapping is not None
+        if self.enable_dsa_cp:
+            if (
+                selected_packed.data_ptr()
+                != payload_selected_packed.data_ptr()
+            ):
+                payload_selected_packed.copy_(selected_packed)
+                selected_packed = payload_selected_packed
+            payload_count_values = payload_selected_counts[:, 0]
+            if (
+                selected_count_values.data_ptr()
+                != payload_count_values.data_ptr()
+            ):
+                payload_count_values.copy_(selected_count_values)
+                selected_count_values = payload_count_values
+            if (
+                target_slot_mapping.data_ptr()
+                != payload_target_slot_mapping.data_ptr()
+            ):
+                payload_target_slot_mapping.copy_(target_slot_mapping)
+                target_slot_mapping = payload_target_slot_mapping
         return (
             ql_nope,
             q_pe,
@@ -3244,13 +3846,53 @@ class AscendSFAImpl(MLAAttentionImpl):
     ) -> None:
         self._staged_sfa_capture_state.seal(graph_keys)
 
+    def staged_sfa_bridge_token_capacity(
+        self,
+        global_token_capacity: int,
+    ) -> int:
+        if not self.enable_dsa_cp:
+            return global_token_capacity
+        return (
+            global_token_capacity + self.tp_size - 1
+        ) // self.tp_size
+
+    def staged_sfa_bridge_request_capacity(
+        self,
+        global_token_capacity: int,
+    ) -> int:
+        global_request_capacity = (
+            global_token_capacity // self.decode_threshold
+        )
+        if not self.enable_dsa_cp:
+            return global_request_capacity
+        local_token_capacity = self.staged_sfa_bridge_token_capacity(
+            global_token_capacity
+        )
+        local_start = get_tp_group().rank_in_group * local_token_capacity
+        local_end = min(
+            local_start + local_token_capacity,
+            global_token_capacity,
+        )
+        if local_start >= local_end:
+            return 1
+        local_request_start = local_start // self.decode_threshold
+        local_request_end = (
+            local_end + self.decode_threshold - 1
+        ) // self.decode_threshold
+        return max(1, local_request_end - local_request_start)
+
     def _ensure_staged_sfa_bridge_buffers(
         self,
         hidden_states: torch.Tensor,
     ) -> tuple[torch.Tensor, ...]:
         buffers = getattr(self, "_staged_sfa_bridge_buffers", None)
-        max_tokens = self._staged_sfa_graph_capture_sizes[-1]
-        max_requests = max_tokens // self.decode_threshold
+        global_max_tokens = self._staged_sfa_graph_capture_sizes[-1]
+        max_tokens = self.staged_sfa_bridge_token_capacity(
+            global_max_tokens
+        )
+        max_requests = self.staged_sfa_bridge_request_capacity(
+            global_max_tokens
+        )
         scratch_capacity = self.decode_threshold * self.index_topk
         if buffers is None:
             context = get_forward_context()
@@ -3320,7 +3962,9 @@ class AscendSFAImpl(MLAAttentionImpl):
                 "staged SFA pre returned an unexpected bridge arity: "
                 f"{len(outputs)}"
             )
-        for source, destination in zip(outputs, buffers, strict=True):
+        for index, (source, destination) in enumerate(
+            zip(outputs, buffers, strict=True)
+        ):
             rows = int(source.shape[0])
             if (
                 rows > int(destination.shape[0])
@@ -3332,6 +3976,12 @@ class AscendSFAImpl(MLAAttentionImpl):
                     f"source={tuple(source.shape)}, "
                     f"destination={tuple(destination.shape)}"
                 )
+            if self.enable_dsa_cp and index >= 3:
+                # DSA-CP keeps the sparse LMCache payload in its global
+                # builder-owned buffers so request identity remains aligned
+                # with connector metadata. These bridge tensors only preserve
+                # the custom-op schema and are not consumed.
+                continue
             destination[:rows].copy_(source)
         return buffers
 
@@ -3376,6 +4026,7 @@ class AscendSFAImpl(MLAAttentionImpl):
             raise RuntimeError(
                 f"[SFA cross-layer graph] runner-authorized key became ineligible in {layer_name}: {reason}"
             )
+        staged_metadata = _staged_sfa_metadata_view(attn_metadata)
 
         is_dummy = bool(getattr(context, "staged_sfa_graph_dummy_run", False))
         state = self._staged_sfa_capture_state
@@ -3388,7 +4039,7 @@ class AscendSFAImpl(MLAAttentionImpl):
             # ACL capture cannot include the host copy in boundary preparation.
             # The immediately preceding eager warmup filled this stable buffer.
             capture_boundary = state.remap_boundary
-            boundary = attn_metadata.decode_remap_boundary
+            boundary = staged_metadata.decode_remap_boundary
             if (
                 capture_boundary is None
                 or boundary is None
@@ -3401,33 +4052,41 @@ class AscendSFAImpl(MLAAttentionImpl):
             remap_boundary = capture_boundary
         else:
             remap_boundary = _prepare_sfa_remap_boundary(
-                attn_metadata,
-                attn_metadata.req_ids,
+                staged_metadata,
+                staged_metadata.req_ids,
                 is_dummy_run=is_dummy,
                 index_topk=self.index_topk,
-                cached_tokens=getattr(
-                    getattr(context, "staged_sfa_route", None),
-                    "frontiers",
-                    None,
+                cached_tokens=_staged_sfa_local_frontiers(
+                    attn_metadata,
+                    getattr(
+                        getattr(context, "staged_sfa_route", None),
+                        "frontiers",
+                        None,
+                    ),
                 ),
             )
             if is_dummy:
                 state.remap_boundary = remap_boundary
-        row_req_indices = attn_metadata.decode_req_indices
-        selected_packed = attn_metadata.decode_selected_tokens
-        selected_counts = attn_metadata.decode_selected_counts
-        target_slots = attn_metadata.decode_target_slot_mapping
+        row_req_indices = staged_metadata.decode_req_indices
+        row_offsets = (
+            staged_metadata.decode_row_offsets
+            if staged_metadata.staged_sfa_fragmented_layout
+            else None
+        )
+        selected_packed = staged_metadata.decode_selected_tokens
+        selected_counts = staged_metadata.decode_selected_counts
+        target_slots = staged_metadata.decode_target_slot_mapping
         local_to_union_workspace = (
-            attn_metadata.decode_union_mapping_workspace
+            staged_metadata.decode_union_mapping_workspace
         )
         shard_packed_workspace = (
-            attn_metadata.decode_shard_packed_workspace
+            staged_metadata.decode_shard_packed_workspace
         )
         shard_mapping_workspace = (
-            attn_metadata.decode_shard_mapping_workspace
+            staged_metadata.decode_shard_mapping_workspace
         )
         shard_counts_workspace = (
-            attn_metadata.decode_shard_counts_workspace
+            staged_metadata.decode_shard_counts_workspace
         )
         if any(
             value is None
@@ -3448,16 +4107,23 @@ class AscendSFAImpl(MLAAttentionImpl):
             kv_cache[0],
             kv_cache[1],
             kv_cache[2],
-            attn_metadata.cos,
-            attn_metadata.sin,
+            staged_metadata.cos,
+            staged_metadata.sin,
+            staged_metadata.slot_mapping,
+            staged_metadata.indexer_slot_mapping,
             attn_metadata.slot_mapping,
-            attn_metadata.indexer_slot_mapping,
-            attn_metadata.cum_query_lens,
-            attn_metadata.seq_lens,
-            attn_metadata.indexer_block_table,
+            (
+                attn_metadata.indexer_slot_mapping
+                if attn_metadata.indexer_slot_mapping is not None
+                else attn_metadata.slot_mapping
+            ),
+            staged_metadata.cum_query_lens,
+            staged_metadata.seq_lens,
+            staged_metadata.indexer_block_table,
             remap_boundary,
             row_req_indices,
-            attn_metadata.block_table,
+            row_offsets,
+            staged_metadata.block_table,
             selected_packed,
             selected_counts,
             target_slots,
@@ -3465,8 +4131,8 @@ class AscendSFAImpl(MLAAttentionImpl):
             shard_packed_workspace,
             shard_mapping_workspace,
             shard_counts_workspace,
-            attn_metadata.resident_state_indices,
-            attn_metadata.resident_state_generations,
+            staged_metadata.resident_state_indices,
+            staged_metadata.resident_state_generations,
         )
         outputs = self._copy_to_staged_sfa_bridge(
             hidden_states,
@@ -3852,12 +4518,16 @@ class AscendSFAImpl(MLAAttentionImpl):
             graph_key = getattr(context, "staged_sfa_graph_key", None)
             if attn_metadata is None or graph_key is None:
                 return
+            staged_metadata = _staged_sfa_metadata_view(attn_metadata)
             if getattr(context, "staged_sfa_graph_dummy_run", False):
                 if next_layer_name:
                     next_metadata = context.attn_metadata[next_layer_name]
+                    next_staged_metadata = _staged_sfa_metadata_view(
+                        next_metadata
+                    )
                     _prepare_sfa_remap_boundary(
-                        next_metadata,
-                        next_metadata.req_ids,
+                        next_staged_metadata,
+                        next_staged_metadata.req_ids,
                         is_dummy_run=True,
                         index_topk=self.index_topk,
                     )
@@ -3868,19 +4538,71 @@ class AscendSFAImpl(MLAAttentionImpl):
             producer_event = state.producer_event
             if producer_event is not None:
                 attn_metadata.reshape_cache_event = producer_event
-            request_ids = attn_metadata.decode_request_ids_compact
-            if request_ids is None:
+            local_request_ids = (
+                staged_metadata.decode_request_ids_compact
+            )
+            if local_request_ids is None:
                 raise RuntimeError("staged SFA request ids are unavailable")
-            request_count = len(request_ids)
+            local_request_count = len(local_request_ids)
+            diagnostic_selected_packed = selected_packed
+            diagnostic_selected_counts = selected_counts
+            diagnostic_target_slots = target_slots
+            if staged_metadata is not attn_metadata:
+                local_selected_packed = (
+                    staged_metadata.decode_selected_tokens
+                )
+                local_selected_counts = (
+                    staged_metadata.decode_selected_counts
+                )
+                local_target_slots = (
+                    staged_metadata.decode_target_slot_mapping
+                )
+                if (
+                    local_selected_packed is not None
+                    and local_selected_counts is not None
+                    and local_target_slots is not None
+                ):
+                    diagnostic_selected_packed = local_selected_packed
+                    diagnostic_selected_counts = (
+                        local_selected_counts[:, 0]
+                    )
+                    diagnostic_target_slots = local_target_slots
             target_diagnostic = self._target_sfa_diag_pre_retrieve(
                 layer_name,
-                selected_packed,
-                selected_counts,
-                target_slots,
-                attn_metadata,
+                diagnostic_selected_packed,
+                diagnostic_selected_counts,
+                diagnostic_target_slots,
+                staged_metadata,
                 context,
-                request_count,
+                local_request_count,
             )
+            if staged_metadata is not attn_metadata:
+                request_ids = attn_metadata.decode_request_ids_compact
+                global_selected_packed = (
+                    attn_metadata.decode_selected_tokens
+                )
+                global_selected_counts = (
+                    attn_metadata.decode_selected_counts
+                )
+                global_target_slots = (
+                    attn_metadata.decode_target_slot_mapping
+                )
+                if (
+                    request_ids is None
+                    or global_selected_packed is None
+                    or global_selected_counts is None
+                    or global_target_slots is None
+                ):
+                    raise RuntimeError(
+                        "DSA-CP staged SFA global LMCache payload is "
+                        "unavailable"
+                    )
+                selected_packed = global_selected_packed
+                selected_counts = global_selected_counts[:, 0]
+                target_slots = global_target_slots
+            else:
+                request_ids = local_request_ids
+            request_count = len(request_ids)
             recorder = _sfa_flight_recorder()
             record_sfa_flight_event(
                 recorder,
@@ -3890,15 +4612,16 @@ class AscendSFAImpl(MLAAttentionImpl):
                 graph_key=str(graph_key),
                 is_capturing=_current_npu_capture_state(),
             )
-            wait_for_kv_layer_from_connector(
-                layer_name,
-                selected_tokens=selected_packed[:request_count],
-                token_start_index=None,
-                request_ids=request_ids,
-                target_slot_mapping=target_slots[:request_count],
-                selected_token_counts=selected_counts[:request_count],
-                payload_event=producer_event,
-            )
+            if request_count:
+                wait_for_kv_layer_from_connector(
+                    layer_name,
+                    selected_tokens=selected_packed[:request_count],
+                    token_start_index=None,
+                    request_ids=request_ids,
+                    target_slot_mapping=target_slots[:request_count],
+                    selected_token_counts=selected_counts[:request_count],
+                    payload_event=producer_event,
+                )
             record_sfa_flight_event(
                 recorder,
                 "lmcache_retrieve_end",
@@ -3913,18 +4636,26 @@ class AscendSFAImpl(MLAAttentionImpl):
                     layer_name,
                     selected_counts,
                     request_count=request_count,
-                    decode_rows=request_count * self.decode_threshold,
+                    decode_rows=(
+                        local_request_count * self.decode_threshold
+                    ),
                 )
             if _LMCACHE_SPARSE_WAIT_SYNC_ONCE and not _lmcache_sparse_wait_sync_once_done:
                 _sync_compute_stream_after_lmcache_sparse_wait()
             if next_layer_name:
                 next_metadata = context.attn_metadata[next_layer_name]
+                next_staged_metadata = _staged_sfa_metadata_view(
+                    next_metadata
+                )
                 _prepare_sfa_remap_boundary(
-                    next_metadata,
-                    next_metadata.req_ids,
+                    next_staged_metadata,
+                    next_staged_metadata.req_ids,
                     is_dummy_run=False,
                     index_topk=self.index_topk,
-                    cached_tokens=route.frontiers,
+                    cached_tokens=_staged_sfa_local_frontiers(
+                        next_metadata,
+                        route.frontiers,
+                    ),
                 )
                 if index_enabled:
                     wait_for_kv_layer_from_connector(_dsa_indexer_layer_name(next_layer_name))
@@ -3934,6 +4665,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         with _staged_sfa_profile_scope("sfa_cross_layer::bootstrap"):
             context = get_forward_context()
             metadata = context.attn_metadata[layer_name]
+            staged_metadata = _staged_sfa_metadata_view(metadata)
             is_dummy = bool(getattr(context, "staged_sfa_graph_dummy_run", False))
             recorder = _sfa_flight_recorder()
             record_sfa_flight_event(
@@ -3947,14 +4679,17 @@ class AscendSFAImpl(MLAAttentionImpl):
                 boundary_ready=bool(metadata.decode_remap_boundary_ready),
             )
             _prepare_sfa_remap_boundary(
-                metadata,
-                metadata.req_ids,
+                staged_metadata,
+                staged_metadata.req_ids,
                 is_dummy_run=is_dummy,
                 index_topk=self.index_topk,
                 cached_tokens=(
                     None
                     if is_dummy
-                    else context.staged_sfa_route.frontiers
+                    else _staged_sfa_local_frontiers(
+                        metadata,
+                        context.staged_sfa_route.frontiers,
+                    )
                 ),
             )
             record_sfa_flight_event(
@@ -3984,7 +4719,8 @@ class AscendSFAImpl(MLAAttentionImpl):
         graph_key = getattr(get_forward_context(), "staged_sfa_graph_key", None)
         if attn_metadata is None or graph_key is None:
             return
-        rows = graph_key.token_capacity
+        staged_metadata = _staged_sfa_metadata_view(attn_metadata)
+        rows = int(staged_metadata.num_input_tokens)
         kv_cache, _, _ = self._cross_layer_kv_cache(layer_name, kv_cache)
         self._cross_layer_post_compute(
             ql_nope[:rows],
@@ -3992,9 +4728,9 @@ class AscendSFAImpl(MLAAttentionImpl):
             topk_indices[:rows],
             kv_cache[0],
             kv_cache[1],
-            attn_metadata.cum_query_lens,
-            attn_metadata.seq_lens,
-            attn_metadata.block_table,
+            staged_metadata.cum_query_lens,
+            staged_metadata.seq_lens,
+            staged_metadata.block_table,
             output,
             trace_label="cross_layer",
         )
@@ -4363,6 +5099,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                     topk_indices,
                     _split_boundary,
                     _row_req_indices,
+                    None,
                     attn_metadata.block_table,
                     attn_metadata.decode_selected_tokens,
                     attn_metadata.decode_selected_counts,

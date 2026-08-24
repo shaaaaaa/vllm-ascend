@@ -140,6 +140,7 @@ public:
         __gm__ int32_t* topkIndices,
         __gm__ int32_t* splitBoundary,
         __gm__ int32_t* rowReqIndices,
+        __gm__ int32_t* rowOffsets,
         __gm__ int32_t* shardPacked,
         __gm__ int16_t* shardMapping,
         __gm__ int32_t* shardCounts,
@@ -154,6 +155,7 @@ public:
         __gm__ int16_t* shardMissPositions,
         __gm__ int16_t* shardEvictableSlots,
         uint32_t requestCount,
+        uint32_t rowCount,
         uint32_t stateRowCount,
         uint32_t dummyStateBase,
         uint32_t rowsPerRequest,
@@ -162,9 +164,11 @@ public:
         uint32_t shardCapacity,
         uint32_t shardCountStride,
         uint32_t shardCountRequestStride,
-        uint32_t generationStride)
+        uint32_t generationStride,
+        bool fragmentedLayout)
     {
         requestCount_ = requestCount;
+        rowCount_ = rowCount;
         stateRowCount_ = stateRowCount;
         dummyStateBase_ = dummyStateBase;
         rowsPerRequest_ = rowsPerRequest;
@@ -175,6 +179,7 @@ public:
         shardCountStride_ = shardCountStride;
         shardCountRequestStride_ = shardCountRequestStride;
         generationStride_ = generationStride;
+        fragmentedLayout_ = fragmentedLayout;
         deduplicate_ = rowsPerRequest_ > 1;
         uint32_t shifted = shardCount_;
         while (shifted > 1) {
@@ -184,13 +189,14 @@ public:
 
         topkIndices_.SetGlobalBuffer(
             topkIndices,
-            static_cast<uint64_t>(requestCount_) * requestWidth_);
+            static_cast<uint64_t>(rowCount_) * rowWidth_);
         splitBoundary_.SetGlobalBuffer(
-            splitBoundary,
-            static_cast<uint64_t>(requestCount_) * rowsPerRequest_);
+            splitBoundary, rowCount_);
         rowReqIndices_.SetGlobalBuffer(
-            rowReqIndices,
-            static_cast<uint64_t>(requestCount_) * rowsPerRequest_);
+            rowReqIndices, rowCount_);
+        if (fragmentedLayout_) {
+            rowOffsets_.SetGlobalBuffer(rowOffsets, rowCount_);
+        }
         shardPacked_.SetGlobalBuffer(
             shardPacked,
             static_cast<uint64_t>(requestCount_) * shardCount_
@@ -288,6 +294,16 @@ public:
             static_cast<uint64_t>(request) * shardCountRequestStride_
             + shard * shardCountStride_;
 
+        if (fragmentedLayout_ && !RequestHasRows(request)) {
+            for (uint32_t field = kShardCurrentCount;
+                 field <= kShardSelectedEvictCount; ++field) {
+                shardCounts_.SetValue(
+                    countOffset + field, static_cast<int32_t>(0));
+            }
+            PublishGlobalCacheLine(shardCounts_, countOffset);
+            return;
+        }
+
         auto input = inputBuf_.Get<int32_t>();
         auto work = workBuf_.Get<int32_t>();
         auto clamped = clampedBuf_.Get<int32_t>();
@@ -319,14 +335,19 @@ public:
         uint32_t compactEnd = 0;
         uint32_t selectedElements = 0;
         for (uint32_t mtpRow = 0; mtpRow < rowsPerRequest_; ++mtpRow) {
-            const uint32_t row = request * rowsPerRequest_ + mtpRow;
+            uint32_t row = request * rowsPerRequest_ + mtpRow;
+            if (fragmentedLayout_) {
+                row = FindRow(request, mtpRow);
+                if (row == rowCount_) {
+                    continue;
+                }
+            }
             if (ReadGlobalScalarFresh(rowReqIndices_, row) !=
                 static_cast<int32_t>(request)) {
                 continue;
             }
             const uint64_t inputOffset =
-                static_cast<uint64_t>(request) * requestWidth_
-                + static_cast<uint64_t>(mtpRow) * rowWidth_;
+                static_cast<uint64_t>(row) * rowWidth_;
             const int32_t boundary =
                 ReadGlobalScalarFresh(splitBoundary_, row);
             AscendC::DataCopy(
@@ -622,6 +643,33 @@ public:
     }
 
 private:
+    __aicore__ inline uint32_t FindRow(
+        uint32_t request, uint32_t mtpRow)
+    {
+        const int32_t candidate = static_cast<int32_t>(
+            request * rowsPerRequest_ + mtpRow)
+            - ReadGlobalScalarFresh(rowOffsets_, 0);
+        if (candidate >= 0 &&
+            candidate < static_cast<int32_t>(rowCount_) &&
+            ReadGlobalScalarFresh(rowReqIndices_, candidate) ==
+                static_cast<int32_t>(request) &&
+            ReadGlobalScalarFresh(rowOffsets_, candidate) ==
+                static_cast<int32_t>(mtpRow)) {
+            return static_cast<uint32_t>(candidate);
+        }
+        return rowCount_;
+    }
+
+    __aicore__ inline bool RequestHasRows(uint32_t request)
+    {
+        for (uint32_t mtpRow = 0; mtpRow < rowsPerRequest_; ++mtpRow) {
+            if (FindRow(request, mtpRow) != rowCount_) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     __aicore__ inline uint32_t SortElementCount(uint32_t count)
     {
         uint32_t groups =
@@ -691,6 +739,7 @@ private:
     AscendC::GlobalTensor<int32_t> topkIndices_;
     AscendC::GlobalTensor<int32_t> splitBoundary_;
     AscendC::GlobalTensor<int32_t> rowReqIndices_;
+    AscendC::GlobalTensor<int32_t> rowOffsets_;
     AscendC::GlobalTensor<int32_t> shardPacked_;
     AscendC::GlobalTensor<int16_t> shardMapping_;
     AscendC::GlobalTensor<int32_t> shardCounts_;
@@ -722,6 +771,7 @@ private:
         beforeBoundaryMaskBuf_;
     AscendC::TBuf<AscendC::TPosition::VECCALC> selectedMaskBuf_;
     uint32_t requestCount_ = 0;
+    uint32_t rowCount_ = 0;
     uint32_t stateRowCount_ = 0;
     uint32_t dummyStateBase_ = 0;
     uint32_t rowsPerRequest_ = 0;
@@ -734,6 +784,7 @@ private:
     uint32_t generationStride_ = 0;
     uint32_t shardBits_ = 0;
     bool deduplicate_ = false;
+    bool fragmentedLayout_ = false;
 };
 
 // Test-only read probe. It never mutates resident state. For every shard it
@@ -1607,6 +1658,8 @@ class DSAResidentSortedUpdateKernel {
 public:
     __aicore__ inline void Init(
         __gm__ int32_t* topkIndices,
+        __gm__ int32_t* rowReqIndices,
+        __gm__ int32_t* rowOffsets,
         __gm__ int32_t* shardPacked,
         __gm__ int16_t* shardMapping,
         __gm__ int32_t* shardCounts,
@@ -1618,6 +1671,7 @@ public:
         __gm__ int32_t* stateCounts,
         __gm__ int64_t* stateGenerations,
         uint32_t requestCount,
+        uint32_t rowCount,
         uint32_t stateRowCount,
         uint32_t dummyStateBase,
         uint32_t rowsPerRequest,
@@ -1626,9 +1680,11 @@ public:
         uint32_t capacity,
         uint32_t shardCountStride,
         uint32_t shardCountRequestStride,
-        uint32_t generationStride)
+        uint32_t generationStride,
+        bool fragmentedLayout)
     {
         requestCount_ = requestCount;
+        rowCount_ = rowCount;
         stateRowCount_ = stateRowCount;
         dummyStateBase_ = dummyStateBase;
         rowsPerRequest_ = rowsPerRequest;
@@ -1639,8 +1695,9 @@ public:
         shardCountStride_ = shardCountStride;
         shardCountRequestStride_ = shardCountRequestStride;
         generationStride_ = generationStride;
+        fragmentedLayout_ = fragmentedLayout;
         const uint64_t requestElements =
-            static_cast<uint64_t>(requestCount_) * requestWidth_;
+            static_cast<uint64_t>(rowCount_) * rowWidth_;
         const uint64_t requestShardElements =
             static_cast<uint64_t>(requestCount_) * shardCount_
             * capacity_;
@@ -1648,6 +1705,10 @@ public:
             static_cast<uint64_t>(stateRowCount_)
             * shardCount_ * capacity_;
         topkIndices_.SetGlobalBuffer(topkIndices, requestElements);
+        if (fragmentedLayout_) {
+            rowReqIndices_.SetGlobalBuffer(rowReqIndices, rowCount_);
+            rowOffsets_.SetGlobalBuffer(rowOffsets, rowCount_);
+        }
         shardPacked_.SetGlobalBuffer(
             shardPacked, requestShardElements);
         shardMapping_.SetGlobalBuffer(
@@ -1727,6 +1788,9 @@ public:
     {
         const uint32_t request = block / shardCount_;
         const uint32_t shard = block % shardCount_;
+        if (fragmentedLayout_ && !RequestHasRows(request)) {
+            return;
+        }
         const int32_t state =
             ReadGlobalScalarFresh(requestStateIndices_, request);
         const bool realState =
@@ -2041,6 +2105,33 @@ public:
     }
 
 private:
+    __aicore__ inline uint32_t FindRow(
+        uint32_t request, uint32_t mtpRow)
+    {
+        const int32_t candidate = static_cast<int32_t>(
+            request * rowsPerRequest_ + mtpRow)
+            - ReadGlobalScalarFresh(rowOffsets_, 0);
+        if (candidate >= 0 &&
+            candidate < static_cast<int32_t>(rowCount_) &&
+            ReadGlobalScalarFresh(rowReqIndices_, candidate) ==
+                static_cast<int32_t>(request) &&
+            ReadGlobalScalarFresh(rowOffsets_, candidate) ==
+                static_cast<int32_t>(mtpRow)) {
+            return static_cast<uint32_t>(candidate);
+        }
+        return rowCount_;
+    }
+
+    __aicore__ inline bool RequestHasRows(uint32_t request)
+    {
+        for (uint32_t mtpRow = 0; mtpRow < rowsPerRequest_; ++mtpRow) {
+            if (FindRow(request, mtpRow) != rowCount_) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     __aicore__ inline void RemapPositionPartition(
         uint32_t request,
         uint32_t part,
@@ -2048,8 +2139,17 @@ private:
     {
         const uint32_t partWidth = requestWidth_ / shardCount_;
         const uint32_t begin = part * partWidth;
-        const uint64_t requestOffset =
-            static_cast<uint64_t>(request) * requestWidth_;
+        uint64_t inputOffset =
+            static_cast<uint64_t>(request) * requestWidth_ + begin;
+        if (fragmentedLayout_) {
+            const uint32_t mtpRow = begin / rowWidth_;
+            const uint32_t row = FindRow(request, mtpRow);
+            if (row == rowCount_) {
+                return;
+            }
+            inputOffset = static_cast<uint64_t>(row) * rowWidth_
+                + begin % rowWidth_;
+        }
         const uint64_t mappingBase =
             static_cast<uint64_t>(request) * shardCount_
             * requestWidth_;
@@ -2076,7 +2176,7 @@ private:
 
         CopyGlobalToLocalExact(
             input,
-            topkIndices_[requestOffset + begin],
+            topkIndices_[inputOffset],
             partWidth);
         Sync<AscendC::HardEvent::MTE2_V>();
         AscendC::Duplicate(
@@ -2211,12 +2311,14 @@ private:
 
         Sync<AscendC::HardEvent::V_MTE3>();
         CopyLocalToGlobalExact(
-            topkIndices_[requestOffset + begin],
+            topkIndices_[inputOffset],
             ranksOrOutput,
             partWidth);
     }
 
     AscendC::GlobalTensor<int32_t> topkIndices_;
+    AscendC::GlobalTensor<int32_t> rowReqIndices_;
+    AscendC::GlobalTensor<int32_t> rowOffsets_;
     AscendC::GlobalTensor<int32_t> shardPacked_;
     AscendC::GlobalTensor<int16_t> shardMapping_;
     AscendC::GlobalTensor<int32_t> shardCounts_;
@@ -2240,6 +2342,7 @@ private:
     AscendC::TBuf<AscendC::TPosition::VECCALC> remapOffsetBuf_;
     AscendC::TBuf<AscendC::TPosition::VECCALC> remapGatheredBuf_;
     uint32_t requestCount_ = 0;
+    uint32_t rowCount_ = 0;
     uint32_t stateRowCount_ = 0;
     uint32_t dummyStateBase_ = 0;
     uint32_t rowsPerRequest_ = 0;
@@ -2250,6 +2353,7 @@ private:
     uint32_t shardCountStride_ = 0;
     uint32_t shardCountRequestStride_ = 0;
     uint32_t generationStride_ = 0;
+    bool fragmentedLayout_ = false;
 };
 
 // Split-path remap. One AIV owns one contiguous 1024-position partition,
@@ -2509,6 +2613,7 @@ dsa_resident_sharded_union_kernel(
     __gm__ int32_t* topkIndices,
     __gm__ int32_t* splitBoundary,
     __gm__ int32_t* rowReqIndices,
+    __gm__ int32_t* rowOffsets,
     __gm__ int32_t* shardPacked,
     __gm__ int16_t* shardMapping,
     __gm__ int32_t* shardCounts,
@@ -2523,6 +2628,7 @@ dsa_resident_sharded_union_kernel(
     __gm__ int16_t* shardMissPositions,
     __gm__ int16_t* shardEvictableSlots,
     uint32_t requestCount,
+    uint32_t rowCount,
     uint32_t stateRowCount,
     uint32_t dummyStateBase,
     uint32_t rowsPerRequest,
@@ -2531,20 +2637,22 @@ dsa_resident_sharded_union_kernel(
     uint32_t shardCapacity,
     uint32_t shardCountStride,
     uint32_t shardCountRequestStride,
-    uint32_t generationStride)
+    uint32_t generationStride,
+    bool fragmentedLayout)
 {
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
     DSAResidentShardedUnionKernel op;
     op.Init(
-        topkIndices, splitBoundary, rowReqIndices,
+        topkIndices, splitBoundary, rowReqIndices, rowOffsets,
         shardPacked, shardMapping, shardCounts,
         requestStateIndices, requestStateGenerations,
         stateTokens, stateSlots, stateCounts, stateGenerations,
         priorSlots, shardMissTokens, shardMissPositions,
         shardEvictableSlots,
-        requestCount, stateRowCount, dummyStateBase,
+        requestCount, rowCount, stateRowCount, dummyStateBase,
         rowsPerRequest, rowWidth, shardCount, shardCapacity,
-        shardCountStride, shardCountRequestStride, generationStride);
+        shardCountStride, shardCountRequestStride, generationStride,
+        fragmentedLayout);
     op.Process();
 }
 
@@ -2608,6 +2716,8 @@ dsa_resident_sorted_finalize_kernel(
 extern "C" __global__ __aicore__ void
 dsa_resident_sorted_update_kernel(
     __gm__ int32_t* topkIndices,
+    __gm__ int32_t* rowReqIndices,
+    __gm__ int32_t* rowOffsets,
     __gm__ int32_t* shardPacked,
     __gm__ int16_t* shardMapping,
     __gm__ int32_t* shardCounts,
@@ -2619,6 +2729,7 @@ dsa_resident_sorted_update_kernel(
     __gm__ int32_t* stateCounts,
     __gm__ int64_t* stateGenerations,
     uint32_t requestCount,
+    uint32_t rowCount,
     uint32_t stateRowCount,
     uint32_t dummyStateBase,
     uint32_t rowsPerRequest,
@@ -2627,19 +2738,21 @@ dsa_resident_sorted_update_kernel(
     uint32_t capacity,
     uint32_t shardCountStride,
     uint32_t shardCountRequestStride,
-    uint32_t generationStride)
+    uint32_t generationStride,
+    bool fragmentedLayout)
 {
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
     DSAResidentSortedUpdateKernel op;
     op.Init(
-        topkIndices, shardPacked, shardMapping, shardCounts,
+        topkIndices, rowReqIndices, rowOffsets,
+        shardPacked, shardMapping, shardCounts,
         priorSlots,
         requestStateIndices, requestStateGenerations,
         stateTokens, stateSlots, stateCounts, stateGenerations,
-        requestCount, stateRowCount,
+        requestCount, rowCount, stateRowCount,
         dummyStateBase, rowsPerRequest, rowWidth, shardCount,
         capacity, shardCountStride, shardCountRequestStride,
-        generationStride);
+        generationStride, fragmentedLayout);
     op.Process();
 }
 
@@ -2670,14 +2783,15 @@ dsa_resident_sorted_state_update_kernel(
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
     DSAResidentSortedUpdateKernel op;
     op.Init(
-        topkIndices, shardPacked, shardMapping, shardCounts,
+        topkIndices, topkIndices, topkIndices,
+        shardPacked, shardMapping, shardCounts,
         priorSlots,
         requestStateIndices, requestStateGenerations,
         stateTokens, stateSlots, stateCounts, stateGenerations,
-        requestCount, stateRowCount,
+        requestCount, requestCount * rowsPerRequest, stateRowCount,
         dummyStateBase, rowsPerRequest, rowWidth, shardCount,
         capacity, shardCountStride, shardCountRequestStride,
-        generationStride);
+        generationStride, false);
     op.ProcessStateOnly();
 }
 
@@ -2726,6 +2840,7 @@ void dsa_resident_sharded_union_impl(
     void* topkIndices,
     void* splitBoundary,
     void* rowReqIndices,
+    void* rowOffsets,
     void* shardPacked,
     void* shardMapping,
     void* shardCounts,
@@ -2740,6 +2855,7 @@ void dsa_resident_sharded_union_impl(
     void* shardMissPositions,
     void* shardEvictableSlots,
     uint32_t requestCount,
+    uint32_t rowCount,
     uint32_t stateRowCount,
     uint32_t dummyStateBase,
     uint32_t rowsPerRequest,
@@ -2749,7 +2865,8 @@ void dsa_resident_sharded_union_impl(
     uint32_t shardCountStride,
     uint32_t shardCountRequestStride,
     uint32_t generationStride,
-    uint32_t coreCount)
+    uint32_t coreCount,
+    bool fragmentedLayout)
 {
     const uint32_t logicalBlockCount = requestCount * shardCount;
     dsa_resident_sharded_union_kernel<<<
@@ -2758,6 +2875,7 @@ void dsa_resident_sharded_union_impl(
         static_cast<int32_t*>(topkIndices),
         static_cast<int32_t*>(splitBoundary),
         static_cast<int32_t*>(rowReqIndices),
+        static_cast<int32_t*>(rowOffsets),
         static_cast<int32_t*>(shardPacked),
         static_cast<int16_t*>(shardMapping),
         static_cast<int32_t*>(shardCounts),
@@ -2771,14 +2889,16 @@ void dsa_resident_sharded_union_impl(
         static_cast<int32_t*>(shardMissTokens),
         static_cast<int16_t*>(shardMissPositions),
         static_cast<int16_t*>(shardEvictableSlots),
-        requestCount, stateRowCount, dummyStateBase, rowsPerRequest,
+        requestCount, rowCount, stateRowCount, dummyStateBase, rowsPerRequest,
         rowWidth, shardCount, shardCapacity, shardCountStride,
-        shardCountRequestStride, generationStride);
+        shardCountRequestStride, generationStride, fragmentedLayout);
 }
 
 void dsa_resident_sorted_plan_impl(
     void* stream,
     void* topkIndices,
+    void* rowReqIndices,
+    void* rowOffsets,
     void* shardPacked,
     void* shardMapping,
     void* shardCounts,
@@ -2797,6 +2917,7 @@ void dsa_resident_sorted_plan_impl(
     void* missCounts,
     void* targetSlots,
     uint32_t requestCount,
+    uint32_t rowCount,
     uint32_t stateRowCount,
     uint32_t dummyStateBase,
     uint32_t rowsPerRequest,
@@ -2809,7 +2930,8 @@ void dsa_resident_sorted_plan_impl(
     uint32_t generationStride,
     uint32_t blockTableWidth,
     uint32_t blockSize,
-    uint32_t coreCount)
+    uint32_t coreCount,
+    bool fragmentedLayout)
 {
     dsa_resident_sorted_finalize_kernel<<<
         ResidentPhysicalBlockCount(requestCount, coreCount),
@@ -2833,6 +2955,8 @@ void dsa_resident_sorted_plan_impl(
         ResidentPhysicalBlockCount(logicalBlockCount, coreCount),
         nullptr, stream>>>(
         static_cast<int32_t*>(topkIndices),
+        static_cast<int32_t*>(rowReqIndices),
+        static_cast<int32_t*>(rowOffsets),
         static_cast<int32_t*>(shardPacked),
         static_cast<int16_t*>(shardMapping),
         static_cast<int32_t*>(shardCounts),
@@ -2843,10 +2967,10 @@ void dsa_resident_sorted_plan_impl(
         static_cast<int16_t*>(stateSlots),
         static_cast<int32_t*>(stateCounts),
         static_cast<int64_t*>(stateGenerations),
-        requestCount, stateRowCount, dummyStateBase,
+        requestCount, rowCount, stateRowCount, dummyStateBase,
         rowsPerRequest, rowWidth, shardCount, capacity,
         shardCountStride, shardCountRequestStride,
-        generationStride);
+        generationStride, fragmentedLayout);
 }
 
 void dsa_resident_sorted_update_debug_impl(
@@ -2879,6 +3003,8 @@ void dsa_resident_sorted_update_debug_impl(
         ResidentPhysicalBlockCount(logicalBlockCount, coreCount),
         nullptr, stream>>>(
         static_cast<int32_t*>(topkIndices),
+        static_cast<int32_t*>(topkIndices),
+        static_cast<int32_t*>(topkIndices),
         static_cast<int32_t*>(shardPacked),
         static_cast<int16_t*>(shardMapping),
         static_cast<int32_t*>(shardCounts),
@@ -2889,10 +3015,11 @@ void dsa_resident_sorted_update_debug_impl(
         static_cast<int16_t*>(stateSlots),
         static_cast<int32_t*>(stateCounts),
         static_cast<int64_t*>(stateGenerations),
-        requestCount, stateRowCount, dummyStateBase,
+        requestCount, requestCount * rowsPerRequest,
+        stateRowCount, dummyStateBase,
         rowsPerRequest, rowWidth, shardCount, capacity,
         shardCountStride, shardCountRequestStride,
-        generationStride);
+        generationStride, false);
 }
 
 void dsa_resident_sorted_plan_no_remap_impl(

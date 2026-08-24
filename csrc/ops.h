@@ -101,6 +101,7 @@ namespace vllm_ascend {
     void* topk_indices,
     void* split_boundary,
     void* row_req_indices,
+    void* row_offsets,
     void* request_block_table,
     void* selected_packed,
     void* selected_count,
@@ -110,6 +111,7 @@ namespace vllm_ascend {
     void* shard_mapping,
     void* shard_counts,
     uint32_t request_count,
+    uint32_t row_count,
     uint32_t rows_per_request,
     uint32_t row_width,
     uint32_t scratch_capacity,
@@ -118,7 +120,8 @@ namespace vllm_ascend {
     uint32_t block_size,
     uint32_t core_count,
     bool need_packed,
-    bool clear_invalid_rows);
+    bool clear_invalid_rows,
+    bool fragmented_layout);
 
   extern void dsa_staged_hash_union_impl(
     void* stream,
@@ -271,6 +274,7 @@ namespace vllm_ascend {
     void* topk_indices,
     void* split_boundary,
     void* row_req_indices,
+    void* row_offsets,
     void* shard_packed,
     void* shard_mapping,
     void* shard_counts,
@@ -285,6 +289,7 @@ namespace vllm_ascend {
     void* shard_miss_positions,
     void* shard_evictable_slots,
     uint32_t request_count,
+    uint32_t row_count,
     uint32_t state_row_count,
     uint32_t dummy_state_base,
     uint32_t rows_per_request,
@@ -294,11 +299,14 @@ namespace vllm_ascend {
     uint32_t shard_count_stride,
     uint32_t shard_count_request_stride,
     uint32_t generation_stride,
-    uint32_t core_count);
+    uint32_t core_count,
+    bool fragmented_layout);
 
   extern void dsa_resident_sorted_plan_impl(
     void* stream,
     void* topk_indices,
+    void* row_req_indices,
+    void* row_offsets,
     void* shard_packed,
     void* shard_mapping,
     void* shard_counts,
@@ -317,6 +325,7 @@ namespace vllm_ascend {
     void* miss_counts,
     void* target_slots,
     uint32_t request_count,
+    uint32_t row_count,
     uint32_t state_row_count,
     uint32_t dummy_state_base,
     uint32_t rows_per_request,
@@ -329,7 +338,8 @@ namespace vllm_ascend {
     uint32_t generation_stride,
     uint32_t block_table_width,
     uint32_t block_size,
-    uint32_t core_count);
+    uint32_t core_count,
+    bool fragmented_layout);
 
   extern void dsa_resident_sorted_plan_no_remap_impl(
     void* stream,

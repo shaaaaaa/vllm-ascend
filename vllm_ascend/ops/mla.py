@@ -203,10 +203,11 @@ class AscendMultiHeadLatentAttention(MultiHeadLatentAttentionWrapper):
                 impl.kv_lora_rank,
                 impl.qk_rope_head_dim,
                 impl.index_topk,
-                impl._staged_sfa_graph_capture_sizes[-1],
-                (
+                impl.staged_sfa_bridge_token_capacity(
                     impl._staged_sfa_graph_capture_sizes[-1]
-                    // impl.decode_threshold
+                ),
+                impl.staged_sfa_bridge_request_capacity(
+                    impl._staged_sfa_graph_capture_sizes[-1]
                 ),
                 impl.decode_threshold * impl.index_topk,
             )

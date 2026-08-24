@@ -382,6 +382,154 @@ def test_resident_union_is_sorted_per_fixed_token_shard(mtp):
     _assert_union_outputs(source, boundaries, workspace, mtp=mtp)
 
 
+@pytest.mark.parametrize("capture_graph", [False, True])
+def test_sorted_resident_mtp2_supports_fragmented_request_rows(
+    capture_graph,
+):
+    """Exercise a CP shard containing request 0 step 1 and request 1."""
+    requests = 2
+    mtp = 2
+    capacity = mtp * 2048
+    shard_count = resident_shard_count(mtp)
+    full_source = torch.cat(
+        (_source(mtp, 0), _source(mtp, 5000)),
+        dim=0,
+    )
+    source = full_source[1:].clone()
+    values = source.npu()
+    boundaries = torch.tensor(
+        [1500, 6500, 6500],
+        dtype=torch.int32,
+        device="npu",
+    )
+    row_requests = torch.tensor(
+        [0, 1, 1],
+        dtype=torch.int32,
+        device="npu",
+    )
+    row_offsets = torch.tensor(
+        [1, 0, 1],
+        dtype=torch.int32,
+        device="npu",
+    )
+    request_states = torch.arange(
+        requests,
+        dtype=torch.int32,
+        device="npu",
+    )
+    request_generations = torch.tensor(
+        [11, 22],
+        dtype=torch.int64,
+        device="npu",
+    )
+    workspace = allocate_sorted_resident_workspace(
+        requests,
+        mtp,
+        device=torch.device("npu"),
+    )
+    state = allocate_sorted_resident_state(
+        requests,
+        requests,
+        mtp,
+        device=torch.device("npu"),
+    )
+    blocks_per_request = capacity // 128
+    block_table = torch.arange(
+        requests * blocks_per_request,
+        dtype=torch.int32,
+        device="npu",
+    ).reshape(requests, blocks_per_request)
+
+    source_2d = source.reshape(3, 2048)
+    row_requests_cpu = row_requests.cpu()
+    boundaries_cpu = boundaries.cpu()
+    expected_shards: list[list[list[int]]] = []
+    for request in range(requests):
+        union = set()
+        for row in range(source_2d.shape[0]):
+            if int(row_requests_cpu[row]) != request:
+                continue
+            boundary = int(boundaries_cpu[row])
+            union.update(
+                int(token)
+                for token in source_2d[row].tolist()
+                if 0 <= token < boundary
+            )
+        expected_shards.append(
+            [
+                sorted(
+                    token
+                    for token in union
+                    if token % shard_count == shard
+                )
+                for shard in range(shard_count)
+            ]
+        )
+
+    def invoke():
+        prepare_resident_sharded_union_(
+            values,
+            boundaries,
+            row_requests,
+            request_states,
+            request_generations,
+            state,
+            workspace,
+            mtp=mtp,
+            row_offsets=row_offsets,
+        )
+        prepare_sorted_resident_cache_fused_(
+            values,
+            block_table,
+            request_states,
+            request_generations,
+            state,
+            workspace,
+            block_size=128,
+            row_req_indices=row_requests,
+            row_offsets=row_offsets,
+        )
+
+    if capture_graph:
+        graph = torch.npu.NPUGraph()
+        with torch.npu.graph(graph):
+            invoke()
+        values.copy_(source.npu())
+        graph.replay()
+    else:
+        invoke()
+    torch.npu.synchronize()
+
+    references = []
+    for request in range(requests):
+        reference, expected_misses, _ = _reference_step(
+            expected_shards[request],
+            {},
+            capacity,
+        )
+        references.append(reference)
+        assert _state_dict(state, request, shard_count) == reference
+        if not capture_graph:
+            assert int(workspace.miss_counts[request, 0].cpu()) == len(
+                expected_misses
+            )
+
+    actual = values.reshape(3, 2048).cpu()
+    for row in range(source_2d.shape[0]):
+        request = int(row_requests_cpu[row])
+        boundary = int(boundaries_cpu[row])
+        expected = source_2d[row].clone()
+        selected = (expected >= 0) & (expected < boundary)
+        expected[selected] = torch.tensor(
+            [
+                references[request][int(token)]
+                for token in expected[selected].tolist()
+            ],
+            dtype=torch.int32,
+        )
+        assert torch.equal(actual[row], expected)
+
+
 @pytest.mark.parametrize("mtp", [1, 2])
 def test_resident_union_zero_boundary_is_empty(mtp):
     requests = 1

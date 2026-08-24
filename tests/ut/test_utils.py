@@ -255,6 +255,36 @@ class TestUtils(TestBase):
                 (3, 6, 12),
             )
 
+    def test_staged_sfa_dsa_cp_capture_sizes_allow_fragmented_requests(self):
+        vllm_config = mock.MagicMock()
+        vllm_config.parallel_config.tensor_parallel_size = 8
+        vllm_config.model_config.hf_text_config.index_topk = 2048
+        vllm_config.speculative_config.num_speculative_tokens = 1
+        vllm_config.scheduler_config.max_num_seqs = 64
+        vllm_config.scheduler_config.max_num_batched_tokens = 128
+        with (
+            mock.patch.object(
+                utils,
+                "staged_sfa_graph_configured",
+                return_value=True,
+            ),
+            mock.patch.object(
+                utils.envs_ascend,
+                "VLLM_ASCEND_ENABLE_FLASHCOMM1",
+                True,
+            ),
+            mock.patch.dict(
+                os.environ,
+                {
+                    "VLLM_ASCEND_SFA_STAGED_GRAPH_CAPTURE_SIZES": "10,20,25,32"
+                },
+            ),
+        ):
+            self.assertEqual(
+                utils.staged_sfa_graph_capture_sizes(vllm_config),
+                (20, 40, 50, 64),
+            )
+
     def test_staged_sfa_configuration_accepts_model_specific_mtp_method(self):
         vllm_config = mock.MagicMock()
         vllm_config.speculative_config.method = "glm4_moe_mtp"

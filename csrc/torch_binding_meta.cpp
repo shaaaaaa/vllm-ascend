@@ -87,7 +87,8 @@ at::Tensor npu_dsa_prepare_sparse_indices_staged_meta(
     int64_t block_size,
     int64_t mtp,
     bool need_packed,
-    bool clear_invalid_rows)
+    bool clear_invalid_rows,
+    const c10::optional<at::Tensor> &row_offsets)
 {
     (void)topk_indices;
     (void)split_boundary;
@@ -100,6 +101,7 @@ at::Tensor npu_dsa_prepare_sparse_indices_staged_meta(
     (void)mtp;
     (void)need_packed;
     (void)clear_invalid_rows;
+    (void)row_offsets;
     return selected_counts;
 }
 
@@ -118,7 +120,8 @@ at::Tensor npu_dsa_prepare_sparse_indices_sharded_meta(
     int64_t block_size,
     int64_t mtp,
     bool need_packed,
-    bool clear_invalid_rows)
+    bool clear_invalid_rows,
+    const c10::optional<at::Tensor> &row_offsets)
 {
     (void)shard_packed_workspace;
     (void)shard_mapping_workspace;
@@ -127,7 +130,7 @@ at::Tensor npu_dsa_prepare_sparse_indices_sharded_meta(
         topk_indices, split_boundary, row_req_indices, request_block_table,
         selected_packed, selected_counts, target_slots,
         local_to_union_workspace, block_size, mtp, need_packed,
-        clear_invalid_rows);
+        clear_invalid_rows, row_offsets);
 }
 
 at::Tensor npu_dsa_resident_lookup_rows_meta(
@@ -200,7 +203,8 @@ at::Tensor npu_dsa_resident_sharded_union_meta(
     at::Tensor &shard_miss_positions,
     at::Tensor &shard_evictable_slots,
     int64_t mtp,
-    int64_t dummy_state_base)
+    int64_t dummy_state_base,
+    const c10::optional<at::Tensor> &row_offsets)
 {
     (void)topk_indices;
     (void)split_boundary;
@@ -219,6 +223,7 @@ at::Tensor npu_dsa_resident_sharded_union_meta(
     (void)shard_evictable_slots;
     (void)mtp;
     (void)dummy_state_base;
+    (void)row_offsets;
     return shard_counts;
 }
 
@@ -242,7 +247,9 @@ at::Tensor npu_dsa_resident_sorted_plan_meta(
     at::Tensor &miss_counts,
     at::Tensor &target_slots,
     int64_t block_size,
-    int64_t dummy_state_base)
+    int64_t dummy_state_base,
+    const c10::optional<at::Tensor> &row_req_indices,
+    const c10::optional<at::Tensor> &row_offsets)
 {
     (void)topk_indices;
     (void)shard_packed;
@@ -263,6 +270,8 @@ at::Tensor npu_dsa_resident_sorted_plan_meta(
     (void)target_slots;
     (void)block_size;
     (void)dummy_state_base;
+    (void)row_req_indices;
+    (void)row_offsets;
     return miss_counts;
 }
 

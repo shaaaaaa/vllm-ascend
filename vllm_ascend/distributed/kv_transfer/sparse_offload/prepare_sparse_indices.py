@@ -131,6 +131,7 @@ def prepare_sparse_indices(
     shard_mapping_workspace: torch.Tensor | None = None,
     shard_counts_workspace: torch.Tensor | None = None,
     staged_mtp: int | None = None,
+    row_offsets: torch.Tensor | None = None,
 ):
     """Remap absolute top-k indices for the compact-scratch decode path.
 
@@ -165,6 +166,10 @@ def prepare_sparse_indices(
             the legacy staged operator as a compatibility fallback. Values at
             or above each row's split boundary are ignored by the union and
             remain absolute. Values greater than 2 are not supported.
+        row_offsets: optional MTP step for each local row. DSA context
+            parallelism supplies this only when a TP-local token shard starts
+            or ends inside a request. The default request-major path remains
+            unchanged when this is None.
 
     Returns:
         new_indices: same shape as topk_indices. LMCache-selected entries are
@@ -184,6 +189,20 @@ def prepare_sparse_indices(
             "local_to_union_workspace is required when staged_mtp is enabled"
         )
     op_name = _sparse_index_op_name(staged_mtp)
+    if row_offsets is not None:
+        if staged_mtp is None:
+            raise ValueError(
+                "row_offsets requires the staged MTP planner"
+            )
+        if row_offsets.shape != row_req_indices.shape:
+            raise ValueError(
+                "row_offsets must match row_req_indices"
+            )
+        if not envs.VLLM_ASCEND_DSA_MTP_SHARDED_SORT:
+            # The legacy staged sort assumes dense request-major rows. Its
+            # established arbitrary-row operator remains the compatibility
+            # path when production sharded sort is explicitly disabled.
+            op_name = "npu_dsa_prepare_sparse_indices_"
     sharded_workspaces = (
         shard_packed_workspace,
         shard_mapping_workspace,
@@ -211,7 +230,7 @@ def prepare_sparse_indices(
             "extension"
         ) from exc
 
-    if staged_mtp is None:
+    if op_name == "npu_dsa_prepare_sparse_indices_":
         fused_op(
             topk_indices,
             split_boundary,
@@ -238,6 +257,7 @@ def prepare_sparse_indices(
             staged_mtp,
             need_packed,
             clear_invalid_rows,
+            row_offsets,
         )
     else:
         assert shard_packed_workspace is not None
@@ -259,6 +279,7 @@ def prepare_sparse_indices(
             staged_mtp,
             need_packed,
             clear_invalid_rows,
+            row_offsets,
         )
     return (
         topk_indices,

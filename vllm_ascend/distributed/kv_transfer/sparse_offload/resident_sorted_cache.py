@@ -207,6 +207,7 @@ def prepare_resident_sharded_union_(
     workspace: SortedResidentWorkspace,
     *,
     mtp: int,
+    row_offsets: torch.Tensor | None = None,
 ) -> None:
     """Create sorted shards and intersect them with resident state."""
     resident_shard_count(mtp)
@@ -235,6 +236,7 @@ def prepare_resident_sharded_union_(
         workspace.shard_evictable_slots,
         mtp,
         state.dummy_state_base,
+        row_offsets,
     )
 
 
@@ -248,6 +250,8 @@ def _run_sorted_resident_plan_(
     workspace: SortedResidentWorkspace,
     *,
     block_size: int,
+    row_req_indices: torch.Tensor | None = None,
+    row_offsets: torch.Tensor | None = None,
 ) -> None:
     op(
         topk_indices,
@@ -270,6 +274,8 @@ def _run_sorted_resident_plan_(
         workspace.target_slots,
         block_size,
         state.dummy_state_base,
+        row_req_indices,
+        row_offsets,
     )
 
 
@@ -363,6 +369,8 @@ def prepare_sorted_resident_cache_fused_(
     workspace: SortedResidentWorkspace,
     *,
     block_size: int,
+    row_req_indices: torch.Tensor | None = None,
+    row_offsets: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Run the production fused state update and top-k remap."""
     try:
@@ -380,6 +388,8 @@ def prepare_sorted_resident_cache_fused_(
         state,
         workspace,
         block_size=block_size,
+        row_req_indices=row_req_indices,
+        row_offsets=row_offsets,
     )
     return (
         workspace.miss_tokens,

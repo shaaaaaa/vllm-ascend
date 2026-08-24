@@ -89,6 +89,8 @@ def _run_production_staged(
     *,
     capture_graph: bool = False,
     use_sharded_sort: bool = True,
+    row_requests: torch.Tensor | None = None,
+    row_offsets: torch.Tensor | None = None,
 ):
     row_width = source.numel() // source.shape[0]
     capacity = mtp * row_width
@@ -96,11 +98,15 @@ def _run_production_staged(
     table_width = capacity // block_size
     values = source.npu()
     boundaries_npu = boundaries.npu()
-    row_requests = torch.arange(
-        request_count,
-        dtype=torch.int32,
-        device="npu",
-    ).repeat_interleave(mtp)
+    if row_requests is None:
+        row_requests = torch.arange(
+            request_count,
+            dtype=torch.int32,
+        ).repeat_interleave(mtp)
+    row_requests_npu = row_requests.npu()
+    row_offsets_npu = (
+        row_offsets.npu() if row_offsets is not None else None
+    )
     selected, counts, targets = _buffers(request_count, capacity)
     mapping = torch.empty_like(selected)
     shard_packed = torch.empty(
@@ -142,7 +148,7 @@ def _run_production_staged(
         args = [
             values,
             boundaries_npu,
-            row_requests,
+            row_requests_npu,
             block_table,
             selected,
             counts,
@@ -151,7 +157,10 @@ def _run_production_staged(
         ]
         if use_sharded_sort:
             args.extend((shard_packed, shard_mapping, shard_counts))
-        op(*args, block_size, mtp, True, True)
+        args.extend((block_size, mtp, True, True))
+        if row_offsets_npu is not None:
+            args.append(row_offsets_npu)
+        op(*args)
 
     if capture_graph:
         graph = torch.npu.NPUGraph()
@@ -183,6 +192,93 @@ def _run_production_staged(
         targets.cpu(),
         block_table.cpu(),
     )
+
+
+@pytest.mark.parametrize("capture_graph", [False, True])
+def test_production_sharded_mtp2_supports_fragmented_request_rows(
+    capture_graph,
+):
+    """A CP shard may begin at MTP step 1 and end after a full request."""
+    request_count = 2
+    mtp = 2
+    topk = 2048
+    full_source = torch.stack(
+        tuple(
+            torch.roll(
+                torch.arange(
+                    request * 8192 + step * 1024,
+                    request * 8192 + step * 1024 + topk,
+                    dtype=torch.int32,
+                ),
+                137 * (request * mtp + step + 1),
+            )
+            for request in range(request_count)
+            for step in range(mtp)
+        )
+    ).unsqueeze(1)
+    source = full_source[1:].clone()
+    row_requests = torch.tensor([0, 1, 1], dtype=torch.int32)
+    row_offsets = torch.tensor([1, 0, 1], dtype=torch.int32)
+    boundaries = torch.tensor(
+        [int(row.max()) - 100 for row in source.reshape(3, topk)],
+        dtype=torch.int32,
+    )
+    table_width = mtp * topk // 128
+    block_table = torch.arange(
+        request_count * table_width,
+        dtype=torch.int32,
+    ).reshape(request_count, table_width)
+    expected = _prepare_sparse_indices_torch(
+        source,
+        boundaries,
+        row_req_indices=row_requests,
+        request_block_table=block_table,
+        block_size=128,
+    )
+
+    actual = _run_production_staged(
+        source,
+        boundaries,
+        request_count,
+        mtp,
+        capture_graph=capture_graph,
+        use_sharded_sort=True,
+        row_requests=row_requests,
+        row_offsets=row_offsets,
+    )
+
+    assert torch.equal(actual[2], expected[2])
+    source_2d = source.reshape(3, topk)
+    remapped = actual[0].reshape(3, topk)
+    selected_mask = (
+        (source_2d >= 0)
+        & (source_2d < boundaries.reshape(-1, 1))
+    )
+    safe_ranks = torch.where(
+        selected_mask,
+        remapped,
+        torch.zeros_like(remapped),
+    )
+    reconstructed_selected = torch.gather(
+        actual[1][row_requests.to(torch.long)],
+        1,
+        safe_ranks.to(torch.long),
+    )
+    reconstructed = torch.where(
+        selected_mask,
+        reconstructed_selected,
+        remapped,
+    )
+    assert torch.equal(reconstructed, source_2d)
+    for request, count in enumerate(expected[2].tolist()):
+        assert torch.equal(
+            torch.sort(actual[1][request, :count]).values,
+            expected[1][request, :count],
+        )
+        assert torch.equal(
+            actual[3][request, :count],
+            expected[3][request, :count],
+        )
 
 
 def _run_vector_sharded_union(
