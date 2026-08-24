@@ -181,6 +181,14 @@ env_variables: dict[str, Callable[[], Any]] = {
     # incompatible model/runtime features fail fast during startup capture so
     # an explicitly requested POC cannot silently remain inactive.
     "VLLM_ASCEND_SFA_STAGED_GRAPH": lambda: bool(int(os.getenv("VLLM_ASCEND_SFA_STAGED_GRAPH", "0"))),
+    # Start the staged SFA DSA-CP KV/indexer all-gather asynchronously and
+    # overlap it with the independent Q projection and RoPE work. Disabled by
+    # default until the graph-captured HCCL path is validated on the target
+    # deployment. Read once during model initialization; changing it requires
+    # a worker restart.
+    "VLLM_ASCEND_SFA_STAGED_ASYNC_KV_ALL_GATHER": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_SFA_STAGED_ASYNC_KV_ALL_GATHER", "0"))
+    ),
     # Independently capture the MTP drafter as a FULL graph while the target
     # model uses staged SFA. Disabled by default; the target staged graph and
     # resident scratch reuse do not depend on this opt-in. Non-sensitive; read

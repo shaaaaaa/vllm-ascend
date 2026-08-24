@@ -97,3 +97,11 @@ class TestEnvVariables(TestBase):
             self.assertFalse(getattr(envs_ascend, name))
         with patch.dict(os.environ, {name: "1"}):
             self.assertTrue(getattr(envs_ascend, name))
+
+    def test_staged_async_kv_all_gather_defaults_off_and_can_be_enabled(self):
+        name = "VLLM_ASCEND_SFA_STAGED_ASYNC_KV_ALL_GATHER"
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(name, None)
+            self.assertFalse(getattr(envs_ascend, name))
+        with patch.dict(os.environ, {name: "1"}):
+            self.assertTrue(getattr(envs_ascend, name))

@@ -2262,6 +2262,9 @@ class AscendSFAImpl(MLAAttentionImpl):
         self.enable_staged_sfa_graph = staged_sfa_graph_configured(
             self.vllm_config
         )
+        self.enable_staged_sfa_async_kv_all_gather = bool(
+            envs.VLLM_ASCEND_SFA_STAGED_ASYNC_KV_ALL_GATHER
+        )
         self._staged_sfa_graph_capture_sizes = (
             staged_sfa_graph_capture_sizes(self.vllm_config)
             if self.enable_staged_sfa_graph
@@ -3668,7 +3671,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                     dim=1,
                 ),
                 get_tp_group(),
-                async_op=False,
+                async_op=self.enable_staged_sfa_async_kv_all_gather,
             )
 
         ql_nope, q_pe = self._q_proj_and_k_up_proj(q_c)

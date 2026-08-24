@@ -1260,6 +1260,7 @@ class TestStagedSFAGraphPoc(TestBase):
         impl.enable_dsa_cp = False
         impl.enable_dsa_cp_with_layer_shard = False
         impl.enable_dsa_cp_with_o_proj_tp = False
+        impl.enable_staged_sfa_async_kv_all_gather = False
         impl.use_sparse_c8_indexer = False
         impl.dsa_offload_free_paged = False
         impl.q_lora_rank = 4
@@ -2665,6 +2666,7 @@ class TestStagedSFAGraphPoc(TestBase):
     def test_cross_layer_pre_compute_uses_native_dsa_cp_kv_gather(self):
         impl = self._make_eligible_impl()
         impl.enable_dsa_cp = True
+        impl.enable_staged_sfa_async_kv_all_gather = True
         impl.tp_size = 2
         impl.dsa_resident_cache = False
         impl.fused_qkv_a_proj = MagicMock(
@@ -2680,15 +2682,20 @@ class TestStagedSFAGraphPoc(TestBase):
                 torch.empty(2, 1, 2),
             )
         )
+        operation_order = []
+
+        def q_proj_side_effect(*_args):
+            operation_order.append("q_proj")
+            return torch.empty(2, 2, 2), torch.empty(2, 2, 2)
+
+        def rope_side_effect(query, *_args):
+            operation_order.append("rope")
+            return query
+
         impl._q_proj_and_k_up_proj = MagicMock(
-            return_value=(
-                torch.empty(2, 2, 2),
-                torch.empty(2, 2, 2),
-            )
+            side_effect=q_proj_side_effect
         )
-        impl.rope_single = MagicMock(
-            side_effect=lambda query, *_: query
-        )
+        impl.rope_single = MagicMock(side_effect=rope_side_effect)
         impl._get_full_kv = MagicMock(side_effect=lambda value, _: value)
         impl.indexer_select_post_process = MagicMock(
             return_value=torch.zeros(2, 1, 4, dtype=torch.int32)
@@ -2708,6 +2715,18 @@ class TestStagedSFAGraphPoc(TestBase):
         global_slots = torch.arange(4)
         global_indexer_slots = torch.arange(4) + 16
         prefetch = MagicMock()
+        gather_handle = MagicMock()
+        gather_handle.wait.side_effect = lambda: operation_order.append(
+            "wait"
+        )
+
+        def gather_side_effect(*_args, **_kwargs):
+            operation_order.append("gather")
+            return gathered, gather_handle
+
+        def cache_side_effect(**_kwargs):
+            operation_order.append("cache")
+
         with (
             patch.object(
                 sfa_v1,
@@ -2717,11 +2736,12 @@ class TestStagedSFAGraphPoc(TestBase):
             patch.object(
                 sfa_v1,
                 "all_gather_async",
-                return_value=(gathered, None),
+                side_effect=gather_side_effect,
             ) as gather,
             patch.object(
                 sfa_v1.DeviceOperator,
                 "reshape_and_cache",
+                side_effect=cache_side_effect,
             ) as reshape_and_cache,
             patch.object(
                 sfa_v1.torch_npu,
@@ -2758,6 +2778,11 @@ class TestStagedSFAGraphPoc(TestBase):
             )
 
         gather.assert_called_once()
+        self.assertTrue(gather.call_args.kwargs["async_op"])
+        self.assertEqual(
+            operation_order[:5],
+            ["gather", "q_proj", "rope", "wait", "cache"],
+        )
         self.assertIs(
             reshape_and_cache.call_args.kwargs["slot_mapping"],
             global_slots,
