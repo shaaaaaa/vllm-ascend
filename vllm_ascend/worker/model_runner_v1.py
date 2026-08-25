@@ -215,8 +215,8 @@ def _capture_live_source_event_handoff() -> None:
     connector = get_kv_transfer_group()
     capture = getattr(connector, "capture_live_source_event_handoff", None)
     if not callable(capture):
-        # Support a direct LMCacheConnectorV1 deployment in addition to the
-        # production AscendMultiConnector composition without changing vLLM.
+        # Preserve compatibility with older direct LMCache connectors that
+        # expose the hook only through their worker implementation.
         engine = getattr(connector, "_lmcache_engine", None)
         capture = getattr(engine, "capture_live_source_event_handoff", None)
     if not callable(capture):
@@ -2772,10 +2772,9 @@ class NPUModelRunner(GPUModelRunner):
         )
         forward_context = get_forward_context()
         assert forward_context is not None
-        # Prefix-hit SFA resumes intentionally suppress ordinary decode-save
-        # callbacks.  Preserve the real final Group-1 scatter dependency for
-        # an explicitly armed live P/D export without adding a layer callback,
-        # tensor copy, or device synchronization to the decode path.
+        # Export the already-recorded post-forward dependency for an explicitly
+        # armed live or RemoteFill submission without adding a layer callback,
+        # tensor copy, or device synchronization to the compute path.
         _capture_live_source_event_handoff()
         if (
             forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL
