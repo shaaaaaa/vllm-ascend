@@ -815,6 +815,81 @@ steps to a proven safe path; it cannot retroactively fall back a mutated step.
    availability data shows that bounded execute timeout plus engine restart is
    insufficient. Any success-path synchronization must pass a signed TPOT gate.
 
+### Outstanding real-NPU and integration checklist
+
+- [x] **Validate output quality and KV data integrity for the production
+  cold-prefix path on real NPU hardware.** The GLM DP2/TP8/MTP path now produces
+  acceptable output on first and repeated full-prefix requests with content
+  diagnostics both enabled and disabled. The qualified run exercised cold-
+  compact Group 0 loading, live-P2P Group 1 loading, and the first MTP resume in
+  the staged SFA graph. Its sampled Group 0 source/destination fingerprints,
+  Group 1 tail/scatter fingerprints, rank completion, and request ownership
+  contract were consistent. The diagnostics-off performance run also remained
+  correct, so diagnostic synchronization is not masking the fixed lifecycle.
+- [ ] **Complete extended lifecycle and topology soak qualification.** Preserve
+  the completed production-path quality gate while adding cold/warm prefix
+  miss, partial hit, and full hit; decode-window save/release; cancellation,
+  retry, preemption, mixed concurrency, every TP rank, and every DP2 route.
+  Require deterministic output parity and prove that no request, rank, layer,
+  page, slot, or generation can consume stale or cross-request state.
+- [x] **Enable the decoder's first MTP cold-prefix resume in the qualified
+  staged SFA graph.** The graph now preserves cold-resume row ownership and
+  installs the prepared Group 0 retriever before replay; invalid padded sparse
+  rows are cleared before graph-buffer reuse. Real-NPU runs report
+  `staged_graph_selected=true`, `cold_compact_resume_count=1`, and correct
+  output with diagnostics on and off. The first resumed forward fell from about
+  631 ms on the native route to about 43 ms on graph replay, and measured TTFT
+  improved from 39.26 s to 38.74 s. Keep parity and graph-route assertions in
+  regression tests so an unsupported topology fails closed to native execution.
+- [ ] **Fix and qualify partial-prefix MLAPO retrieval with dense two-group
+  LMCache loading.** A stale-proxy failure exposed a concrete unqualified case:
+  an 18,879-token request with an 18,432-token external-cache prefix entered the
+  MLAPO tail-prefill branch, where Group 1 waited but Group 0 could bypass its
+  per-layer connector wait. Audit and unify advancement of both group
+  retrievers, fail closed if either prepared retriever is missing, and add unit
+  plus real-NPU regressions for partial hits at 1..1024-token suffix lengths.
+- [ ] **Compare live P2P with asynchronous Mooncake storage for Group 1 and
+  select the faster qualified route.** Run both transports on the same DP2/TP8
+  topology, prompt set, concurrency, cache state, and output-quality gate.
+  Measure end-to-end TTFT p50/p90/p99, Group 1 ready time, effective bandwidth,
+  prefill/transfer/decode overlap, CPU/NPU overhead, and tail behavior rather
+  than isolated transfer duration. Retain the slower path as a correctness-safe
+  fallback only if its lifecycle and data-integrity contract is proven; choose
+  the default from repeatable end-to-end results.
+- [ ] **Implement direct remote LMCache LocalCPU storage for both DSA groups.**
+  During chunked prefill, let the prefiller asynchronously write completed KV
+  windows directly from P NPU memory into hidden, pinned LocalCPU pages reserved
+  by decoder TP0 (`save_only_first_rank=true`). Decoder LMCache owns allocation,
+  timeout-safe pinning, validation, atomic put-if-absent publication, and abort;
+  the prefiller waits for all asynchronous writes before request finalization.
+  Keep Mooncake persistence as a separate asynchronous prefiller responsibility
+  so later prefiller and decoder prefix lookups remain valid; evaluate writing
+  local Mooncake first to avoid competing with the direct remote transfer.
+  Gate implementation on a small P-NPU-to-D-registered-CPU TransferEngine test
+  proving destination visibility at completion. Bound control metadata by
+  compact windows/runs rather than prompt length, preserve incremental chunked-
+  prefill progress, and require output parity plus no active-decode TPOT/ITL
+  regression. Target at least a 70% reduction of the roughly 1.2 s decoder
+  external-cache load critical path. The detailed protocol is maintained in
+  `C:\Users\q00856117\Desktop\LMCache-overall\new_design.txt`.
+- [ ] **Restore the vLLM/vLLM-Ascend ownership boundary for deferred connector
+  finalization.** Remove any staged-SFA-specific request-lifecycle policy from
+  generic vLLM core when the existing lifecycle can express the operation.
+  Keep Ascend/LMCache-specific deferred save completion, worker metadata
+  collection, and descriptor merging in the plugin or connector adapter. Prove
+  the causal order `wait_for_save -> build/merge worker metadata -> publish the
+  same ModelRunnerOutput`, including normal, no-forward, abort, cancellation,
+  and exception paths. The refactor must not add success-path collectives,
+  polling, tensor scans, or other replay overhead.
+- [ ] **Calibrate staged-SFA ACL-graph stream accounting on the production
+  topology.** Treat `_MAX_ACL_GRAPH_ENTRIES=1800` as the existing conservative
+  stream budget, not an HBM budget, and keep graph-memory profiling separate.
+  On the same GLM DP2/TP8/EP/AIV/MTP configuration, qualify 4, 5, and 6 capture
+  keys through startup capture and actual replay of every key on every rank;
+  require numerical/output parity, repeated mixed-key soak, bounded graph HBM,
+  and no CANN stream-creation or replay failure. If 5/6 keys pass, correct the
+  staged topology multiplier or replace it with measured stream accounting;
+  do not raise the global 1800 ceiling solely because spare HBM is available.
 ### W0: prove the cross-layer partition and capture contract
 
 Status: **implementation and functional/performance checkpoint complete;

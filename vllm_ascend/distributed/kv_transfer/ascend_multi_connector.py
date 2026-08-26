@@ -24,6 +24,7 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_dsa_index_connector imp
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector import (
     MooncakeLayerwiseConnector,
 )
+from vllm_ascend.lmcache_cold_perf import cold_perf_clock_fields
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -48,6 +49,7 @@ def _cold_live_log(event: str, **fields: Any) -> None:
                 "event": event,
                 "pid": os.getpid(),
                 "monotonic_ms": round(time.perf_counter() * 1000, 3),
+                **cold_perf_clock_fields(),
                 **fields,
             },
             default=str,
@@ -348,6 +350,34 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
             self._supports_dsa_index_cache(connector)
             for connector in self._connectors
         )
+        # These methods are queried through the top-level connector. Cache the
+        # bound callables once: the paired-restart check runs on model-execution
+        # boundaries and must not reflect over every child on each token step.
+        self._remote_fill_placement_providers = tuple(
+            provider
+            for connector in self._connectors
+            if callable(
+                provider := getattr(
+                    connector, "get_remote_fill_placement_info", None
+                )
+            )
+        )
+        self._remote_fill_restart_providers = tuple(
+            provider
+            for connector in self._connectors
+            if callable(
+                provider := getattr(
+                    connector, "remote_fill_requires_paired_restart", None
+                )
+            )
+        )
+        self._remote_fill_metrics_providers = tuple(
+            provider
+            for connector in self._connectors
+            if callable(
+                provider := getattr(connector, "get_remote_fill_metrics", None)
+            )
+        )
 
         # A mapping from request id to the index of the connector chosen to
         # load the request from (if any).
@@ -367,6 +397,57 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
             [connector.__class__.__name__ for connector in self._connectors],
         )
         self._configure_live_latent_split()
+
+    @staticmethod
+    def _one_consistent_remote_fill_value(
+        values: list[Any], capability: str
+    ) -> Any | None:
+        """Return one child value, rejecting ambiguous multi-owner state."""
+
+        values = [value for value in values if value is not None]
+        if not values:
+            return None
+        first = values[0]
+        if any(value != first for value in values[1:]):
+            raise RuntimeError(
+                "AscendMultiConnector children reported conflicting "
+                f"{capability}"
+            )
+        return first
+
+    def get_remote_fill_placement_info(self) -> dict[str, Any] | None:
+        """Forward decoder placement without allowing multiple owners."""
+
+        providers = getattr(self, "_remote_fill_placement_providers", ())
+        return self._one_consistent_remote_fill_value(
+            [provider() for provider in providers],
+            "remote-fill placement",
+        )
+
+    def remote_fill_requires_paired_restart(self) -> bool:
+        """Fail closed when any RemoteFill child reports native ambiguity."""
+
+        providers = getattr(self, "_remote_fill_restart_providers", ())
+        for provider in providers:
+            try:
+                if provider():
+                    return True
+            except Exception:
+                logger.exception(
+                    "Remote-fill paired-restart state probe failed; "
+                    "terminating fail-closed"
+                )
+                return True
+        return False
+
+    def get_remote_fill_metrics(self) -> dict[str, Any] | None:
+        """Expose the child RemoteFill snapshot through the wrapper."""
+
+        providers = getattr(self, "_remote_fill_metrics_providers", ())
+        return self._one_consistent_remote_fill_value(
+            [provider() for provider in providers],
+            "remote-fill metrics",
+        )
 
     def _configure_live_latent_split(self) -> None:
         """Enable hybrid group-0 only when owner and borrower both support it."""
@@ -764,6 +845,7 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
         )
         async_saves = 0
         kv_transfer_params: dict[str, Any] | None = None
+        remote_fill_params: dict[str, Any] | None = None
 
         connectors = self._connectors
         params = getattr(request, "kv_transfer_params", None)
@@ -817,8 +899,33 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
                 params["ascend_live_split_source_v1"] = txfer_params.pop(
                     "ascend_live_split_source_v1"
                 )
+            if (
+                isinstance(txfer_params, dict)
+                and "lmcache.remote_fill" in txfer_params
+            ):
+                # The LMCache remote-fill response echoes the prefiller's
+                # incoming routing keys (do_remote_decode, remote_engine_id,
+                # ...) so a standalone LMCache deployment still returns a
+                # complete envelope to the router. Here a sibling child
+                # (the Mooncake P2P producer) authors the decoder-directed
+                # envelope, so the echoed keys must yield to it. Defer this
+                # response and merge it after the others.
+                remote_fill_params = self._merge_kv_transfer_params(
+                    remote_fill_params, txfer_params
+                )
+            else:
+                kv_transfer_params = self._merge_kv_transfer_params(
+                    kv_transfer_params, txfer_params
+                )
+
+        if remote_fill_params is not None:
+            if kv_transfer_params is not None:
+                # Drop the echoed routing keys owned by sibling responses;
+                # keep the keys only the remote-fill response provides.
+                for key in kv_transfer_params:
+                    remote_fill_params.pop(key, None)
             kv_transfer_params = self._merge_kv_transfer_params(
-                kv_transfer_params, txfer_params
+                kv_transfer_params, remote_fill_params
             )
 
         _cold_live_log(

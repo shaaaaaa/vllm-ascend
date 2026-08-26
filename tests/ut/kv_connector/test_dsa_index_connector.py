@@ -172,6 +172,128 @@ def test_ascend_multi_init_supports_legacy_child_connector_signature(monkeypatch
     ]
 
 
+def test_ascend_multi_forwards_remote_fill_child_contract(monkeypatch):
+    placement = {"enabled": True, "destination_engine_epoch": 7}
+    metrics = {"transactions_started": 3}
+
+    class LMCacheChild:
+        def __init__(self, _config, _role):
+            self.fatal = False
+
+        def get_remote_fill_placement_info(self):
+            return placement
+
+        def remote_fill_requires_paired_restart(self):
+            return self.fatal
+
+        def get_remote_fill_metrics(self):
+            return metrics
+
+    class MooncakeChild:
+        def __init__(self, _config, _role):
+            pass
+
+    top_config = SimpleNamespace(kv_transfer_config=object())
+    child_configs = [
+        SimpleNamespace(kv_transfer_config="lmcache"),
+        SimpleNamespace(kv_transfer_config="mooncake"),
+    ]
+    monkeypatch.setattr(
+        AscendMultiConnector,
+        "_get_connector_classes_and_configs",
+        classmethod(
+            lambda cls, config: list(
+                zip((LMCacheChild, MooncakeChild), child_configs, strict=True)
+            )
+        ),
+    )
+
+    multi = AscendMultiConnector(top_config, object())
+
+    assert multi.get_remote_fill_placement_info() == placement
+    assert multi.get_remote_fill_metrics() == metrics
+    assert multi.remote_fill_requires_paired_restart() is False
+    multi._connectors[0].fatal = True
+    assert multi.remote_fill_requires_paired_restart() is True
+
+
+def test_ascend_multi_forwards_real_lmcache_ascend_wrapper(monkeypatch):
+    pytest.importorskip("lmcache_ascend")
+    from lmcache_ascend.integration.vllm.lmcache_ascend_connector_v1 import (
+        LMCacheAscendConnectorV1Dynamic,
+    )
+
+    placement = {"enabled": True, "destination_engine_epoch": 17}
+    engine = SimpleNamespace(
+        use_layerwise=True,
+        get_remote_fill_placement_info=lambda: placement,
+        get_remote_fill_metrics=lambda: {"active_transactions": 1},
+        remote_fill_requires_paired_restart=lambda: True,
+    )
+
+    def init_lmcache(self, _config, _role):
+        self._lmcache_engine = SimpleNamespace(lmcache_engine=engine)
+
+    class MooncakeChild:
+        def __init__(self, _config, _role):
+            pass
+
+    monkeypatch.setattr(
+        LMCacheAscendConnectorV1Dynamic,
+        "__init__",
+        init_lmcache,
+    )
+    monkeypatch.setattr(
+        AscendMultiConnector,
+        "_get_connector_classes_and_configs",
+        classmethod(
+            lambda cls, config: [
+                (
+                    LMCacheAscendConnectorV1Dynamic,
+                    SimpleNamespace(kv_transfer_config="lmcache"),
+                ),
+                (
+                    MooncakeChild,
+                    SimpleNamespace(kv_transfer_config="mooncake"),
+                ),
+            ]
+        ),
+    )
+
+    multi = AscendMultiConnector(
+        SimpleNamespace(kv_transfer_config=object()), object()
+    )
+
+    assert multi.get_remote_fill_placement_info() == placement
+    assert multi.get_remote_fill_metrics() == {"active_transactions": 1}
+    assert multi.remote_fill_requires_paired_restart() is True
+
+
+def test_ascend_multi_rejects_conflicting_remote_fill_owners():
+    multi = object.__new__(AscendMultiConnector)
+    multi._remote_fill_placement_providers = (
+        lambda: {"destination_engine_epoch": 1},
+        lambda: {"destination_engine_epoch": 2},
+    )
+    multi._remote_fill_metrics_providers = (lambda: {"started": 1},) * 2
+    multi._remote_fill_restart_providers = (lambda: False,)
+
+    with pytest.raises(RuntimeError, match="conflicting remote-fill placement"):
+        multi.get_remote_fill_placement_info()
+    assert multi.get_remote_fill_metrics() == {"started": 1}
+
+
+def test_ascend_multi_fails_closed_when_restart_probe_raises():
+    multi = object.__new__(AscendMultiConnector)
+
+    def broken_probe():
+        raise RuntimeError("child unavailable")
+
+    multi._remote_fill_restart_providers = (broken_probe,)
+
+    assert multi.remote_fill_requires_paired_restart() is True
+
+
 def test_live_latent_requires_capable_provider_and_hybrid_consumer():
     class Provider:
         supports_dsa_live_latent_split_source = True
@@ -801,3 +923,84 @@ def test_ascend_multi_request_finished_all_groups_merges_params():
         request,
         ([10], [20]),
     )
+
+
+def test_ascend_multi_remote_fill_echo_yields_to_sibling_envelope():
+    """Regression: the LMCache remote-fill response echoes the prefiller's
+    incoming routing keys, which must not clash with the decoder-directed
+    envelope authored by the Mooncake P2P producer child."""
+
+    multi = object.__new__(AscendMultiConnector)
+    lmcache_connector = MagicMock()
+    lmcache_connector.request_finished.return_value = (
+        False,
+        {
+            "do_remote_decode": True,
+            "do_remote_prefill": False,
+            "remote_engine_id": None,
+            "remote_block_ids": None,
+            "remote_host": None,
+            "remote_port": None,
+            "lmcache.remote_fill": {"terminal": {"outcome": "PERSISTENT_ONLY"}},
+        },
+    )
+    mooncake_connector = MagicMock()
+    mooncake_connector.request_finished.return_value = (
+        True,
+        {
+            "do_remote_prefill": True,
+            "do_remote_decode": False,
+            "remote_engine_id": "prefiller",
+            "remote_block_ids": [10, 11],
+            "remote_host": "7.150.4.174",
+            "remote_port": "30000",
+            "remote_request_id": "req-1",
+            "last_token_id": 42,
+            "num_prompt_blocks": 2,
+        },
+    )
+    multi._connectors = [lmcache_connector, mooncake_connector]
+    multi._requests_to_connector = {"req-1": 0}
+    multi._extra_async_saves = {}
+    request = SimpleNamespace(request_id="req-1")
+
+    async_save, params = multi.request_finished_all_groups(request, ([10], [11]))
+
+    assert async_save is True
+    assert params == {
+        "do_remote_prefill": True,
+        "do_remote_decode": False,
+        "remote_engine_id": "prefiller",
+        "remote_block_ids": [10, 11],
+        "remote_host": "7.150.4.174",
+        "remote_port": "30000",
+        "remote_request_id": "req-1",
+        "last_token_id": 42,
+        "num_prompt_blocks": 2,
+        "lmcache.remote_fill": {"terminal": {"outcome": "PERSISTENT_ONLY"}},
+    }
+
+
+def test_ascend_multi_remote_fill_echo_preserved_without_sibling_params():
+    """Without a sibling envelope the remote-fill response keeps its echo."""
+
+    multi = object.__new__(AscendMultiConnector)
+    lmcache_connector = MagicMock()
+    echoed = {
+        "do_remote_decode": True,
+        "do_remote_prefill": False,
+        "remote_engine_id": None,
+        "lmcache.remote_fill": {"terminal": {"outcome": "LOCAL_FULL"}},
+    }
+    lmcache_connector.request_finished.return_value = (False, echoed)
+    idle_connector = MagicMock()
+    idle_connector.request_finished.return_value = (False, None)
+    multi._connectors = [lmcache_connector, idle_connector]
+    multi._requests_to_connector = {"req-1": 0}
+    multi._extra_async_saves = {}
+    request = SimpleNamespace(request_id="req-1")
+
+    async_save, params = multi.request_finished_all_groups(request, ([10],))
+
+    assert async_save is False
+    assert params == echoed

@@ -53,7 +53,10 @@ from vllm_ascend import envs as ascend_envs
 from vllm_ascend.ascend_config import get_ascend_config, init_ascend_config
 from vllm_ascend.distributed.kv_transfer.utils.mooncake_transfer_engine import global_te
 from vllm_ascend.distributed.kv_transfer.utils.utils import get_transfer_timeout_value
-from vllm_ascend.lmcache_cold_perf import mark_cold_perf_requests
+from vllm_ascend.lmcache_cold_perf import (
+    cold_perf_clock_fields,
+    mark_cold_perf_requests,
+)
 from vllm_ascend.lmcache_diagnostics import (
     fingerprint_compact_group1,
     npu_content_diagnostics_enabled,
@@ -208,6 +211,7 @@ def _cold_live_log(event: str, **fields: Any) -> None:
                 "event": event,
                 "pid": os.getpid(),
                 "monotonic_ms": round(time.perf_counter() * 1000, 3),
+                **cold_perf_clock_fields(),
                 **fields,
             },
             default=str,
