@@ -837,6 +837,24 @@ class RecomputeScheduler(Scheduler):
             # count to trigger recomputation of the invalid blocks.
             failed_kv_load_req_ids = self._handle_invalid_blocks(kv_connector_output.invalid_block_ids)
 
+        if (
+            kv_connector_output
+            and kv_connector_output.kv_connector_worker_meta is not None
+            and self.connector
+        ):
+            update_worker_metadata = getattr(
+                self.connector, "update_connector_worker_metadata", None
+            )
+            if callable(update_worker_metadata):
+                update_worker_metadata(
+                    kv_connector_output.kv_connector_worker_meta,
+                    {
+                        req_id
+                        for req_id, request in self.requests.items()
+                        if not request.is_finished()
+                    },
+                )
+
         # return recomputed requests as EngineCoreOutput
         if scheduler_output.recomputed_reqs is not None:
             for req_info in scheduler_output.recomputed_reqs:

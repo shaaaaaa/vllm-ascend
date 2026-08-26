@@ -175,6 +175,11 @@ def set_ascend_forward_context(
         forward_context.staged_sfa_graph_dummy_run = staged_sfa_graph_dummy_run
         forward_context.staged_sfa_route = staged_sfa_route
         forward_context.staged_sfa_graph_key = staged_sfa_graph_key
+        forward_context.staged_sfa_cold_mtp_replay = bool(
+            staged_sfa_graph_key is not None
+            and getattr(staged_sfa_graph_key, "max_query_len", 1) > 1
+            and any(getattr(staged_sfa_route, "cold_compact_resumes", ()))
+        )
         # Async staged PIECEWISE replay fences only the first graph island in
         # one model forward. ForwardContext is the ownership boundary for that
         # state: MTP rows and all layer islands in this forward share it, while

@@ -89,6 +89,13 @@ from vllm_ascend.distributed.kv_transfer.sparse_offload.resident_sorted_cache im
     sorted_resident_workspace_prefix,
 )
 from vllm_ascend.distributed.utils import all_gather_async
+from vllm_ascend.lmcache_diagnostics import (
+    npu_content_diagnostics_enabled,
+    queue_cache_tail_fingerprint,
+    queue_group1_first_consume,
+    queue_selected_topk_fingerprint,
+    queue_staged_graph_stage_fingerprint,
+)
 from vllm_ascend.ops.layer_shard_linear import (
     is_hidden_layer,
     post_process_after_loading_for_shard_weight_series,
@@ -196,6 +203,12 @@ class _StagedSFACaptureState:
     remap_boundary: torch.Tensor | None = None
     runtime: tuple[Any, ...] | None = None
     initialized_cache_capacity: int = 0
+    input_diagnostic_buffers: dict[
+        StagedSFAGraphKey, torch.Tensor
+    ] = field(default_factory=dict)
+    post_diagnostic_buffers: dict[StagedSFAGraphKey, torch.Tensor] = field(
+        default_factory=dict,
+    )
     bindings: dict[StagedSFAGraphKey, _StagedSFALayerBinding] = field(
         default_factory=dict,
     )
@@ -893,6 +906,7 @@ class AscendSFAMetadata:
 
     # For logging.
     num_input_tokens: int = 0  # Number of tokens including padding.
+    query_start_loc_cpu: Any = None
     # The dimension of the attention heads
     head_dim: int | None = None
     attn_mask: torch.Tensor = None
@@ -1320,9 +1334,17 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
                 and num_actual_tokens
                 == len(plens_cpu) * fixed_decode_width
                 and n_real == len(plens_cpu)
-                and np.all(computed >= plens_cpu[:n_real])
                 and np.array_equal(qsl, fixed_query_starts)
             )
+            if fixed_width_decode:
+                computed_layout = computed >= plens_cpu[:n_real]
+                if cold_resumes:
+                    resume_mask = np.asarray(cold_resumes, dtype=bool)
+                    computed_layout[resume_mask] = (
+                        computed[resume_mask]
+                        == plens_cpu[:n_real][resume_mask] - 1
+                    )
+                fixed_width_decode = np.all(computed_layout)
             if fixed_width_decode:
                 num_decode_rows = num_actual_tokens
                 signature = (
@@ -1415,12 +1437,27 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
                     plen = int(plens_cpu[r])
                     first_decode = max(s, s + plen - int(computed[r]))
                     if cold_resumes and cold_resumes[r]:
-                        if e - s != 1 or int(computed[r]) != plen - 1:
+                        expected_width = (
+                            self.decode_threshold
+                            if common_attn_metadata.attn_state
+                            == AscendAttentionState.SpecDecoding
+                            else 1
+                        )
+                        if (
+                            e - s != expected_width
+                            or int(computed[r]) != plen - 1
+                        ):
                             raise RuntimeError(
-                                "Invalid cold-compact Q1 resume layout: "
+                                "Invalid cold-compact resume layout: "
                                 f"request={r}, rows={e - s}, prompt={plen}, "
-                                f"computed={int(computed[r])}."
+                                f"computed={int(computed[r])}, "
+                                f"expected_rows={expected_width}."
                             )
+                        # The first real row recomputes the final prompt token;
+                        # later rows validate speculative tokens.  Every one of
+                        # them consumes sparse prefix KV and must participate in
+                        # compact retrieval/remapping.  Treating the first row
+                        # as padding leaves it reading stale scratch contents.
                         first_decode = s
                     if first_decode < e:
                         count = e - first_decode
@@ -1605,6 +1642,9 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             cum_query_lens=cum_query_lens,
             seq_lens=seq_lens,
             seq_lens_cpu=seq_lens_cpu,
+            query_start_loc_cpu=common_attn_metadata.query_start_loc_cpu[
+                : num_reqs + 1
+            ],
             slot_mapping=slot_mapping,
             head_dim=self.model_config.get_head_size(),
             attn_mask=self.attn_mask_builder.get_attention_mask(self.model_config),
@@ -1752,7 +1792,28 @@ class AscendSFAImpl(MLAAttentionImpl):
         self.local_num_heads = self.num_heads
         self.vllm_config = get_current_vllm_config()
         self.block_size = self.vllm_config.cache_config.block_size
+        diagnostic_model_layers = int(
+            self.vllm_config.model_config.get_num_layers(
+                self.vllm_config.parallel_config
+            )
+        )
+        self.diagnostic_num_hidden_layers = diagnostic_model_layers
+        self.diagnostic_num_cache_layers = diagnostic_model_layers
+        self._staged_graph_diagnostic_layer_ids = frozenset(
+            (0, diagnostic_model_layers // 2, diagnostic_model_layers - 1)
+        )
         speculative_config = self.vllm_config.speculative_config
+        if (
+            speculative_config is not None
+            and speculative_config.method in ("deepseek_mtp", "mtp")
+        ):
+            self.diagnostic_num_hidden_layers += int(
+                getattr(
+                    self.vllm_config.model_config.hf_config,
+                    "num_nextn_predict_layers",
+                    0,
+                )
+            )
         self.decode_threshold = 1 + (
             speculative_config.num_speculative_tokens
             if speculative_config is not None
@@ -2180,6 +2241,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         kv_cache: tuple,
         slots: torch.Tensor,
         attn_metadata: M,
+        diagnostic_layer_name: str | None = None,
     ):
         B = kv_no_split.shape[0]
         N = self.num_kv_heads
@@ -2187,6 +2249,26 @@ class AscendSFAImpl(MLAAttentionImpl):
         # npu_kv_rmsnorm_rope_cache needs [B, N, S, D]
         kv_no_split = kv_no_split.view(B, N, S, self.kv_lora_rank + self.qk_rope_head_dim)
         cache_mode = "PA"
+
+        diagnose_cache_tail = (
+            attn_metadata is not None
+            and diagnostic_layer_name is not None
+            and not self.enable_dsa_cp
+            and bool(attn_metadata.req_ids)
+        )
+        if diagnose_cache_tail:
+            queue_cache_tail_fingerprint(
+                req_ids=attn_metadata.req_ids,
+                layer_name=diagnostic_layer_name,
+                kv_group=0,
+                stage="group0_after_load_before_current_scatter",
+                cache_parts={"nope": kv_cache[0], "pe": kv_cache[1]},
+                slot_mapping=slots,
+                query_start_loc_cpu=attn_metadata.query_start_loc_cpu,
+                seq_lens_cpu=attn_metadata.seq_lens_cpu,
+                num_actual_tokens=attn_metadata.num_actual_tokens,
+                attn_state=attn_metadata.attn_state,
+            )
 
         if self.enable_dsa_cp:
             _, _, k_pe, k_nope = torch_npu.npu_kv_rmsnorm_rope_cache(
@@ -2220,6 +2302,20 @@ class AscendSFAImpl(MLAAttentionImpl):
                 cache_mode=cache_mode,
                 is_output_kv=True,
             )
+            if diagnose_cache_tail:
+                queue_cache_tail_fingerprint(
+                    req_ids=attn_metadata.req_ids,
+                    layer_name=diagnostic_layer_name,
+                    kv_group=0,
+                    stage="group0_after_current_scatter",
+                    cache_parts={"nope": kv_cache[0], "pe": kv_cache[1]},
+                    produced_parts={"nope": k_nope, "pe": k_pe},
+                    slot_mapping=slots,
+                    query_start_loc_cpu=attn_metadata.query_start_loc_cpu,
+                    seq_lens_cpu=attn_metadata.seq_lens_cpu,
+                    num_actual_tokens=attn_metadata.num_actual_tokens,
+                    attn_state=attn_metadata.attn_state,
+                )
             return k_pe, k_nope
 
     # Return `ql_nope`, `q_pe`
@@ -2374,6 +2470,16 @@ class AscendSFAImpl(MLAAttentionImpl):
             indexer_block_table = indexer_block_table_override
         else:
             assert attn_metadata is not None
+            if (
+                self.dsa_offload_unbundle
+                and _dsa_index_lmcache_enabled()
+                and attn_metadata.indexer_block_table is None
+            ):
+                raise RuntimeError(
+                    "Unbundled two-group DSA top-k selection has no indexer "
+                    "block table; refusing to read Group 1 through the latent "
+                    "block table."
+                )
             indexer_block_table = (
                 attn_metadata.indexer_block_table
                 if attn_metadata.indexer_block_table is not None
@@ -3030,10 +3136,18 @@ class AscendSFAImpl(MLAAttentionImpl):
         q_pe = self.rope_single(q_pe, cos, sin)
         k_li = self._get_full_kv(k_li, None)
 
+        indexer_slot_mapping, k_li_for_scatter = (
+            self._mask_staged_index_scatter_padding(
+                indexer_slot_mapping,
+                k_li,
+                row_req_indices,
+                indexer_cache.view(-1, k_li.shape[-1]),
+            )
+        )
         torch_npu.npu_scatter_nd_update_(
             indexer_cache.view(-1, k_li.shape[-1]),
             indexer_slot_mapping.view(-1, 1),
-            k_li.view(-1, k_li.shape[-1]),
+            k_li_for_scatter.view(-1, k_li.shape[-1]),
         )
         topk_indices = self.indexer_select_post_process(
             x=hidden_states,
@@ -3084,6 +3198,59 @@ class AscendSFAImpl(MLAAttentionImpl):
             selected_count_values,
             target_slot_mapping,
         )
+
+    @staticmethod
+    def _mask_staged_index_scatter_padding(
+        slot_mapping: torch.Tensor,
+        updates: torch.Tensor,
+        row_request_indices: torch.Tensor,
+        flat_cache: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Replace graph-padding writes with an idempotent real-row write."""
+        rows = int(slot_mapping.numel())
+        if (
+            rows <= 0
+            or int(updates.shape[0]) != rows
+            or int(row_request_indices.numel()) != rows
+            or flat_cache.ndim != 2
+            or int(flat_cache.shape[0]) <= 0
+            or int(updates[0].numel()) != int(flat_cache.shape[1])
+        ):
+            raise RuntimeError(
+                "staged index scatter inputs do not share one fixed row count"
+            )
+        valid_rows = row_request_indices.reshape(-1) >= 0
+        safe_slots = (
+            slot_mapping.reshape(-1)[:1]
+            .clamp(min=0, max=int(flat_cache.shape[0]) - 1)
+            .expand(rows)
+        )
+        masked_slots = torch.where(
+            valid_rows,
+            slot_mapping.reshape(-1),
+            safe_slots,
+        )
+        update_mask = valid_rows.reshape(
+            (rows,) + (1,) * (updates.ndim - 1)
+        )
+        # Runtime rows are request-major, so row zero is real whenever this
+        # rank owns any request. An entirely idle DP rank has only padding;
+        # write back the aliased slot's current value rather than dummy data.
+        existing = flat_cache.index_select(
+            0,
+            safe_slots[:1].long(),
+        ).reshape((1,) + tuple(updates.shape[1:]))
+        first_is_real = valid_rows[:1].reshape(
+            (1,) + (1,) * (updates.ndim - 1)
+        )
+        safe_update = torch.where(first_is_real, updates[:1], existing)
+        safe_updates = safe_update.expand_as(updates)
+        masked_updates = torch.where(
+            update_mask,
+            updates,
+            safe_updates,
+        )
+        return masked_slots, masked_updates
 
     def _cross_layer_post_compute(
         self,
@@ -3145,6 +3312,21 @@ class AscendSFAImpl(MLAAttentionImpl):
         hidden_states: torch.Tensor,
     ) -> tuple[torch.Tensor, ...]:
         return self._ensure_staged_sfa_bridge_buffers(hidden_states)
+
+    def _staged_graph_content_diagnostic_enabled(
+        self,
+        layer_name: str,
+    ) -> bool:
+        if not npu_content_diagnostics_enabled():
+            return False
+        marker = ".layers."
+        try:
+            layer_id = int(
+                str(layer_name).split(marker, 1)[1].split(".", 1)[0]
+            )
+        except (IndexError, ValueError):
+            return False
+        return layer_id in self._staged_graph_diagnostic_layer_ids
 
     def reset_staged_sfa_capture(self) -> None:
         self._staged_sfa_capture_state = _StagedSFACaptureState()
@@ -3292,6 +3474,40 @@ class AscendSFAImpl(MLAAttentionImpl):
 
         is_dummy = bool(getattr(context, "staged_sfa_graph_dummy_run", False))
         state = self._staged_sfa_capture_state
+        if self._staged_graph_content_diagnostic_enabled(layer_name):
+            diagnostic_rows = min(graph_key.token_capacity, 4)
+            diagnostic_input = hidden_states[:diagnostic_rows].reshape(
+                diagnostic_rows, -1
+            )[:, :256]
+            snapshot = state.input_diagnostic_buffers.get(graph_key)
+            if snapshot is None:
+                if context.cudagraph_runtime_mode != CUDAGraphMode.NONE:
+                    raise RuntimeError(
+                        "staged SFA input diagnostic buffer was not created "
+                        "by eager warmup"
+                    )
+                snapshot = torch.empty_like(diagnostic_input)
+                state.input_diagnostic_buffers[graph_key] = snapshot
+            if tuple(snapshot.shape) != tuple(diagnostic_input.shape):
+                raise RuntimeError(
+                    "staged SFA input diagnostic buffer shape changed"
+                )
+            snapshot.copy_(diagnostic_input)
+        producer_event = state.producer_event
+        if producer_event is None:
+            if context.cudagraph_runtime_mode != CUDAGraphMode.NONE:
+                raise RuntimeError(
+                    "staged SFA producer event was not created by eager "
+                    "warmup"
+                )
+            producer_event = torch.npu.ExternalEvent()
+            state.producer_event = producer_event
+        else:
+            # ExternalEvent is the graph-visible fence consumed by LMCache
+            # between Graph A and Graph B.  Reset before each captured/replayed
+            # producer interval, then record only after every bridge output is
+            # stable.
+            producer_event.reset()
         initialized_capacity = state.initialized_cache_capacity
         if is_dummy and graph_key.request_capacity > initialized_capacity:
             for cache in kv_cache:
@@ -3385,12 +3601,6 @@ class AscendSFAImpl(MLAAttentionImpl):
             hidden_states,
             outputs,
         )
-        producer_event = state.producer_event
-        if producer_event is None:
-            if context.cudagraph_runtime_mode != CUDAGraphMode.NONE:
-                raise RuntimeError("staged SFA producer event was not created by eager warmup")
-            producer_event = torch.npu.Event()
-            state.producer_event = producer_event
         attn_metadata.reshape_cache_event = producer_event
         producer_event.record()
         state.runtime = (
@@ -3785,6 +3995,116 @@ class AscendSFAImpl(MLAAttentionImpl):
             if request_ids is None:
                 raise RuntimeError("staged SFA request ids are unavailable")
             request_count = len(request_ids)
+            content_diagnostic = (
+                self._staged_graph_content_diagnostic_enabled(layer_name)
+            )
+            graph_key = context.staged_sfa_graph_key
+            actual_rows = min(
+                int(attn_metadata.num_actual_tokens),
+                int(graph_key.token_capacity),
+            )
+            diagnostic_rows = min(actual_rows, 4)
+            diagnostic_width = 8
+            bridge = self._staged_sfa_bridge_buffers
+            if content_diagnostic and bridge is not None:
+                if producer_event is not None:
+                    # Match the production LMCache dependency before reading
+                    # Graph-A bridge buffers. This is a device-side stream
+                    # wait, not a host synchronization.
+                    torch.npu.current_stream().wait_event(producer_event)
+                queue_selected_topk_fingerprint(
+                    req_ids=request_ids,
+                    layer_name=layer_name,
+                    topk_indices=bridge[2][: graph_key.token_capacity],
+                    row_request_indices=attn_metadata.decode_req_indices_cpu,
+                    seq_lens_cpu=attn_metadata.seq_lens_cpu,
+                    num_decode_tokens=attn_metadata.num_decode_tokens,
+                    num_actual_tokens=attn_metadata.num_actual_tokens,
+                    attn_state=attn_metadata.attn_state,
+                    decode_valid_rows_all=(
+                        attn_metadata.decode_valid_rows_all
+                    ),
+                    num_hidden_layers=self.diagnostic_num_cache_layers,
+                )
+                runtime = state.runtime
+                pre_components = {
+                    "ql_nope": bridge[0][:diagnostic_rows],
+                    "q_pe": bridge[1][:diagnostic_rows],
+                    "raw_topk_sample": bridge[2][:diagnostic_rows]
+                    .reshape(diagnostic_rows, -1)[:, :diagnostic_width],
+                    "selected_packed_sample": selected_packed[
+                        :request_count, :diagnostic_width
+                    ],
+                    "selected_counts": selected_counts[:request_count],
+                    "target_slots_sample": target_slots[
+                        :request_count, :diagnostic_width
+                    ],
+                    "row_req_indices": attn_metadata.decode_req_indices[
+                        : graph_key.token_capacity
+                    ],
+                    "cum_query_lens": attn_metadata.cum_query_lens,
+                    "seq_lens": attn_metadata.seq_lens,
+                    "slot_mapping": attn_metadata.slot_mapping[
+                        : graph_key.token_capacity
+                    ],
+                    "indexer_slot_mapping": (
+                        attn_metadata.indexer_slot_mapping[
+                            : graph_key.token_capacity
+                        ]
+                    ),
+                }
+                input_snapshot = state.input_diagnostic_buffers.get(
+                    graph_key
+                )
+                if input_snapshot is not None:
+                    pre_components["hidden_input_sample"] = (
+                        input_snapshot[:diagnostic_rows]
+                    )
+                if actual_rows < graph_key.token_capacity:
+                    pre_components["padding_topk_sample"] = bridge[2][
+                        actual_rows : graph_key.token_capacity
+                    ].reshape(
+                        graph_key.token_capacity - actual_rows, -1
+                    )[:, :diagnostic_width]
+                if runtime is not None and diagnostic_rows:
+                    kv_cache = runtime[1]
+                    flat_index = kv_cache[2].reshape(
+                        -1, *kv_cache[2].shape[2:]
+                    )
+                    current_index_slots = (
+                        attn_metadata.indexer_slot_mapping[
+                            :diagnostic_rows
+                        ]
+                        .clamp(
+                            min=0,
+                            max=int(flat_index.shape[0]) - 1,
+                        )
+                        .long()
+                    )
+                    pre_components.update(
+                        {
+                            "current_index": flat_index.index_select(
+                                0, current_index_slots
+                            ),
+                        }
+                    )
+                if state.remap_boundary is not None:
+                    pre_components["remap_boundary"] = (
+                        state.remap_boundary[:actual_rows]
+                    )
+                queue_staged_graph_stage_fingerprint(
+                    req_ids=request_ids,
+                    layer_name=layer_name,
+                    stage="after_graph_pre_before_retrieve",
+                    components=pre_components,
+                    row_request_indices=attn_metadata.decode_req_indices_cpu,
+                    seq_lens_cpu=attn_metadata.seq_lens_cpu,
+                    num_decode_tokens=attn_metadata.num_decode_tokens,
+                    num_actual_tokens=attn_metadata.num_actual_tokens,
+                    attn_state=attn_metadata.attn_state,
+                    num_hidden_layers=self.diagnostic_num_cache_layers,
+                    graph_key=graph_key,
+                )
             target_diagnostic = self._target_sfa_diag_pre_retrieve(
                 layer_name,
                 selected_packed,
@@ -3804,6 +4124,57 @@ class AscendSFAImpl(MLAAttentionImpl):
                 payload_event=producer_event,
             )
             self._target_sfa_diag_post_retrieve(target_diagnostic)
+            if content_diagnostic and request_count:
+                sample_width = min(8, int(target_slots.shape[-1]))
+                sampled_slots = target_slots[
+                    :request_count, :sample_width
+                ].reshape(-1)
+                runtime = state.runtime
+                if runtime is not None:
+                    kv_cache = runtime[1]
+                    flat_nope = kv_cache[0].reshape(
+                        -1, *kv_cache[0].shape[2:]
+                    )
+                    flat_pe = kv_cache[1].reshape(
+                        -1, *kv_cache[1].shape[2:]
+                    )
+                    safe_slots = sampled_slots.clamp(
+                        min=0,
+                        max=min(
+                            int(flat_nope.shape[0]),
+                            int(flat_pe.shape[0]),
+                        )
+                        - 1,
+                    ).long()
+                    queue_staged_graph_stage_fingerprint(
+                        req_ids=request_ids,
+                        layer_name=layer_name,
+                        stage="after_selective_retrieve_before_graph_post",
+                        components={
+                            "selected_counts": selected_counts[
+                                :request_count
+                            ],
+                            "selected_packed_sample": selected_packed[
+                                :request_count, :sample_width
+                            ],
+                            "target_slots_sample": sampled_slots,
+                            "retrieved_nope_sample": flat_nope.index_select(
+                                0, safe_slots
+                            ),
+                            "retrieved_pe_sample": flat_pe.index_select(
+                                0, safe_slots
+                            ),
+                        },
+                        row_request_indices=(
+                            attn_metadata.decode_req_indices_cpu
+                        ),
+                        seq_lens_cpu=attn_metadata.seq_lens_cpu,
+                        num_decode_tokens=attn_metadata.num_decode_tokens,
+                        num_actual_tokens=attn_metadata.num_actual_tokens,
+                        attn_state=attn_metadata.attn_state,
+                        num_hidden_layers=self.diagnostic_num_cache_layers,
+                        graph_key=graph_key,
+                    )
             if getattr(self, "_lmcache_load_stat_enabled", False):
                 self._record_lmcache_load_stat(
                     layer_name,
@@ -3843,8 +4214,53 @@ class AscendSFAImpl(MLAAttentionImpl):
                 ),
             )
             runtime = self._staged_sfa_capture_state.runtime
+            graph_key = getattr(context, "staged_sfa_graph_key", None)
             if not is_dummy and runtime and runtime[2] is not None and runtime[3]:
                 wait_for_kv_layer_from_connector(runtime[2])
+            if (
+                not is_dummy
+                and graph_key is not None
+                and runtime is not None
+                and self._staged_graph_content_diagnostic_enabled(layer_name)
+            ):
+                kv_cache = runtime[1]
+                flat_index = kv_cache[2].reshape(
+                    -1, *kv_cache[2].shape[2:]
+                )
+                actual_rows = min(
+                    int(metadata.num_actual_tokens),
+                    int(graph_key.token_capacity),
+                )
+                current_slots = (
+                    metadata.indexer_slot_mapping[:actual_rows]
+                    .clamp(min=0, max=int(flat_index.shape[0]) - 1)
+                    .long()
+                )
+                queue_staged_graph_stage_fingerprint(
+                    req_ids=metadata.decode_request_ids_compact,
+                    layer_name=layer_name,
+                    stage="before_graph_pre",
+                    components={
+                        "slot_mapping": metadata.slot_mapping[
+                            : graph_key.token_capacity
+                        ],
+                        "indexer_slot_mapping": (
+                            metadata.indexer_slot_mapping[
+                                : graph_key.token_capacity
+                            ]
+                        ),
+                        "current_index": flat_index.index_select(
+                            0, current_slots
+                        ),
+                    },
+                    row_request_indices=metadata.decode_req_indices_cpu,
+                    seq_lens_cpu=metadata.seq_lens_cpu,
+                    num_decode_tokens=metadata.num_decode_tokens,
+                    num_actual_tokens=metadata.num_actual_tokens,
+                    attn_state=metadata.attn_state,
+                    num_hidden_layers=self.diagnostic_num_cache_layers,
+                    graph_key=graph_key,
+                )
 
     def cross_layer_graph_post(
         self,
@@ -3872,6 +4288,58 @@ class AscendSFAImpl(MLAAttentionImpl):
             attn_metadata.block_table,
             output,
             trace_label="cross_layer",
+        )
+        if self._staged_graph_content_diagnostic_enabled(layer_name):
+            state = self._staged_sfa_capture_state
+            diagnostic_rows = min(rows, 4)
+            diagnostic_output = output[:diagnostic_rows].reshape(
+                diagnostic_rows, -1
+            )[:, :256]
+            snapshot = state.post_diagnostic_buffers.get(graph_key)
+            if snapshot is None:
+                if get_forward_context().cudagraph_runtime_mode != CUDAGraphMode.NONE:
+                    raise RuntimeError(
+                        "staged SFA output diagnostic buffer was not created "
+                        "by eager warmup"
+                    )
+                snapshot = torch.empty_like(diagnostic_output)
+                state.post_diagnostic_buffers[graph_key] = snapshot
+            if tuple(snapshot.shape) != tuple(diagnostic_output.shape):
+                raise RuntimeError(
+                    "staged SFA output diagnostic buffer shape changed"
+                )
+            snapshot.copy_(diagnostic_output)
+
+    def queue_staged_graph_post_diagnostic(
+        self,
+        layer_name: str,
+        graph_key: StagedSFAGraphKey,
+        metadata: AscendSFAMetadata,
+    ) -> None:
+        """Queue the graph-captured post output after replay has completed."""
+        if not self._staged_graph_content_diagnostic_enabled(layer_name):
+            return
+        snapshot = self._staged_sfa_capture_state.post_diagnostic_buffers.get(
+            graph_key
+        )
+        if snapshot is None:
+            return
+        actual_rows = min(
+            int(metadata.num_actual_tokens),
+            int(snapshot.shape[0]),
+        )
+        queue_staged_graph_stage_fingerprint(
+            req_ids=metadata.decode_request_ids_compact,
+            layer_name=layer_name,
+            stage="after_graph_post",
+            components={"attention_output": snapshot[:actual_rows]},
+            row_request_indices=metadata.decode_req_indices_cpu,
+            seq_lens_cpu=metadata.seq_lens_cpu,
+            num_decode_tokens=metadata.num_decode_tokens,
+            num_actual_tokens=metadata.num_actual_tokens,
+            attn_state=metadata.attn_state,
+            num_hidden_layers=self.diagnostic_num_cache_layers,
+            graph_key=graph_key,
         )
 
     def submit_cross_layer_save(self) -> None:
@@ -3937,10 +4405,29 @@ class AscendSFAImpl(MLAAttentionImpl):
         cos = attn_metadata.cos
         sin = attn_metadata.sin
         slot_mapping = attn_metadata.slot_mapping
-        # DSA two-group mode: the indexer cache write must use the indexer
-        # group's own slots; falls back to the shared slots in single-group mode.
+        # Once LMCache exposes an unbundled DSA index group, its block ids are
+        # independent from the latent group's ids.  Falling back to latent
+        # mappings here writes Group-1 index rows into the wrong address space
+        # and can silently corrupt later prefix hits.
+        if index_lmcache_enabled and (
+            attn_metadata.indexer_slot_mapping is None
+            or attn_metadata.indexer_block_table is None
+        ):
+            raise RuntimeError(
+                "Unbundled two-group DSA requires both indexer_slot_mapping "
+                "and indexer_block_table before cache write/read; refusing "
+                f"the latent-address fallback for layer {layer_name}."
+            )
+        # Legacy single-group unbundled layouts intentionally share latent
+        # block ids and therefore retain their original fallback.
         idx_slot_mapping = (
-            attn_metadata.indexer_slot_mapping if attn_metadata.indexer_slot_mapping is not None else slot_mapping
+            attn_metadata.indexer_slot_mapping
+            if attn_metadata.indexer_slot_mapping is not None
+            else slot_mapping
+        )
+        content_diagnostics_enabled = (
+            bool(attn_metadata.req_ids)
+            and npu_content_diagnostics_enabled()
         )
         slot_mapping_cp = None
         if self.enable_dsa_cp:
@@ -4003,7 +4490,17 @@ class AscendSFAImpl(MLAAttentionImpl):
 
             if self.enable_dsa_cp:
                 assert slot_mapping_cp is not None
-                k_pe, k_nope = self.exec_kv(kv_no_split, cos, sin, kv_cache, slot_mapping_cp, attn_metadata)
+                k_pe, k_nope = self.exec_kv(
+                    kv_no_split,
+                    cos,
+                    sin,
+                    kv_cache,
+                    slot_mapping_cp,
+                    attn_metadata,
+                    diagnostic_layer_name=(
+                        layer_name if content_diagnostics_enabled else None
+                    ),
+                )
             else:
                 _fc = get_forward_context()
                 _dsa_mgr_xkv = getattr(_fc, "dsa_offload_manager", None)
@@ -4024,10 +4521,34 @@ class AscendSFAImpl(MLAAttentionImpl):
                             decode=attn_metadata.attn_state == AscendAttentionState.DecodeOnly,
                         )
                     with _dsa_prof.section("exec_kv_op"):
-                        k_pe, k_nope = self.exec_kv(kv_no_split, cos, sin, (_pknope, _pkpe), _pslots, attn_metadata)
+                        k_pe, k_nope = self.exec_kv(
+                            kv_no_split,
+                            cos,
+                            sin,
+                            (_pknope, _pkpe),
+                            _pslots,
+                            attn_metadata,
+                            diagnostic_layer_name=(
+                                layer_name
+                                if content_diagnostics_enabled
+                                else None
+                            ),
+                        )
                 else:
                     with _dsa_prof.section("exec_kv"):
-                        k_pe, k_nope = self.exec_kv(kv_no_split, cos, sin, kv_cache, slot_mapping, attn_metadata)
+                        k_pe, k_nope = self.exec_kv(
+                            kv_no_split,
+                            cos,
+                            sin,
+                            kv_cache,
+                            slot_mapping,
+                            attn_metadata,
+                            diagnostic_layer_name=(
+                                layer_name
+                                if content_diagnostics_enabled
+                                else None
+                            ),
+                        )
 
             if self.enable_dsa_cp:
                 assert k_pe is not None
@@ -4116,22 +4637,86 @@ class AscendSFAImpl(MLAAttentionImpl):
                 # and does not advance the group-0 latent-layer cursor.
                 with _dsa_prof.section("lmc_index_retrieve"):
                     wait_for_kv_layer_from_connector(index_layer_name)
+            # Live Group-1 P2P populates the model cache without enabling the
+            # persistent LMCache indexer-load path.  Diagnose the exact
+            # model-visible rows for both transports, after any required wait
+            # and before this step scatters the current token into the cache.
+            if content_diagnostics_enabled:
+                queue_group1_first_consume(
+                    req_ids=attn_metadata.req_ids,
+                    layer_name=index_layer_name,
+                    indexer_cache=kv_cache[2],
+                    indexer_block_table=attn_metadata.indexer_block_table,
+                    seq_lens_cpu=attn_metadata.seq_lens_cpu,
+                    block_size=self.block_size,
+                    row_request_indices=attn_metadata.decode_req_indices_cpu,
+                    num_decode_tokens=attn_metadata.num_decode_tokens,
+                    num_actual_tokens=attn_metadata.num_actual_tokens,
+                    attn_state=attn_metadata.attn_state,
+                    decode_valid_rows_all=(
+                        attn_metadata.decode_valid_rows_all
+                    ),
+                    group1_connector_wait_called=index_lmcache_enabled,
+                    num_hidden_layers=self.diagnostic_num_hidden_layers,
+                )
+                group1_cache_parts = {"index": kv_cache[2]}
+                group1_produced_parts = {"index": k_li}
+                if self.use_sparse_c8_indexer:
+                    assert len(kv_cache) == 4
+                    assert k_li_scale is not None
+                    group1_cache_parts["scale"] = kv_cache[3]
+                    group1_produced_parts["scale"] = k_li_scale
+                queue_cache_tail_fingerprint(
+                    req_ids=attn_metadata.req_ids,
+                    layer_name=index_layer_name or layer_name,
+                    kv_group=1,
+                    stage="group1_after_load_before_current_scatter",
+                    cache_parts=group1_cache_parts,
+                    produced_parts=group1_produced_parts,
+                    slot_mapping=idx_slot_mapping,
+                    query_start_loc_cpu=attn_metadata.query_start_loc_cpu,
+                    seq_lens_cpu=attn_metadata.seq_lens_cpu,
+                    num_actual_tokens=attn_metadata.num_actual_tokens,
+                    attn_state=attn_metadata.attn_state,
+                )
 
             if self.is_kv_producer:
                 attn_metadata.reshape_cache_event = torch.npu.Event()
+            # Match the latent-group write above: graph/speculative batches
+            # may pad both ``k_li`` and ``indexer_slot_mapping`` to
+            # ``num_input_tokens``.  Padding slots are not cache ownership and
+            # may be -1 or stale graph-buffer values, so they must never reach
+            # the persistent model-visible indexer cache.
+            actual_tokens = attn_metadata.num_actual_tokens
             torch_npu.npu_scatter_nd_update_(
-                kv_cache[2].view(-1, k_li.shape[-1]), idx_slot_mapping.view(-1, 1), k_li.view(-1, k_li.shape[-1])
+                kv_cache[2].view(-1, k_li.shape[-1]),
+                idx_slot_mapping[:actual_tokens].view(-1, 1),
+                k_li[:actual_tokens].view(-1, k_li.shape[-1]),
             )  # b, s, n, d
             if self.use_sparse_c8_indexer:
                 assert len(kv_cache) == 4
                 assert k_li_scale is not None
                 torch_npu.npu_scatter_nd_update_(
                     kv_cache[3].view(-1, k_li_scale.shape[-1]),
-                    idx_slot_mapping.view(-1, 1),
-                    k_li_scale.view(-1, k_li_scale.shape[-1]),
+                    idx_slot_mapping[:actual_tokens].view(-1, 1),
+                    k_li_scale[:actual_tokens].view(-1, k_li_scale.shape[-1]),
                 )
             if self.is_kv_producer:
                 attn_metadata.reshape_cache_event.record()
+            if content_diagnostics_enabled:
+                queue_cache_tail_fingerprint(
+                    req_ids=attn_metadata.req_ids,
+                    layer_name=index_layer_name or layer_name,
+                    kv_group=1,
+                    stage="group1_after_current_scatter",
+                    cache_parts=group1_cache_parts,
+                    produced_parts=group1_produced_parts,
+                    slot_mapping=idx_slot_mapping,
+                    query_start_loc_cpu=attn_metadata.query_start_loc_cpu,
+                    seq_lens_cpu=attn_metadata.seq_lens_cpu,
+                    num_actual_tokens=attn_metadata.num_actual_tokens,
+                    attn_state=attn_metadata.attn_state,
+                )
 
         with _dsa_prof.section("indexer"):
             topk_indices = self.indexer_select_post_process(
@@ -4144,6 +4729,21 @@ class AscendSFAImpl(MLAAttentionImpl):
                 actual_seq_lengths_query=actual_seq_lengths_query,
                 actual_seq_lengths_key=actual_seq_lengths_key,
             )
+            if content_diagnostics_enabled:
+                queue_selected_topk_fingerprint(
+                    req_ids=attn_metadata.req_ids,
+                    layer_name=index_layer_name or layer_name,
+                    topk_indices=topk_indices,
+                    row_request_indices=attn_metadata.decode_req_indices_cpu,
+                    seq_lens_cpu=attn_metadata.seq_lens_cpu,
+                    num_decode_tokens=attn_metadata.num_decode_tokens,
+                    num_actual_tokens=attn_metadata.num_actual_tokens,
+                    attn_state=attn_metadata.attn_state,
+                    decode_valid_rows_all=(
+                        attn_metadata.decode_valid_rows_all
+                    ),
+                    num_hidden_layers=self.diagnostic_num_hidden_layers,
+                )
 
         # DSA Step B2 (compact-scratch decode): the indexer just produced topk.
         # Remap LMCache-selected entries to compact scratch rows [0..n_ret)

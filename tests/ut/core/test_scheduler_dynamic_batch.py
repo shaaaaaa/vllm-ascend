@@ -15,11 +15,12 @@ from vllm.v1.core.kv_cache_utils import (get_request_block_hasher,
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import (FullAttentionSpec, KVCacheConfig,
                                         KVCacheGroupSpec)
-from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
+from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.structured_output import StructuredOutputManager
 
 from tests.ut.base import TestBase
+from vllm_ascend.core.recompute_scheduler import RecomputeScheduler
 from vllm_ascend.core.scheduler_dynamic_batch import SchedulerDynamicBatch
 
 EOS_TOKEN_ID = 50256
@@ -539,6 +540,43 @@ class TestSchedulerDynamicBatch(TestBase):
         self.assertFalse(requests[0].is_finished())
         self.assertEqual(list(requests[0].output_token_ids),
                          [EOS_TOKEN_ID, 10, 11])
+
+    def test_recompute_worker_metadata_precedes_same_step_finish(self):
+        scheduler = self.create_scheduler()
+        request = create_requests(num_requests=1, max_tokens=1)[0]
+        scheduler.add_request(request)
+        scheduler_output = scheduler.schedule()
+        scheduler_output.recomputed_reqs = None
+        connector = scheduler.connector = MagicMock()
+        calls = []
+        connector.update_connector_worker_metadata.side_effect = (
+            lambda *_args: calls.append("metadata")
+        )
+        connector.request_finished.side_effect = (
+            lambda *_args: calls.append("finished") or (False, None)
+        )
+        connector.update_connector_output.side_effect = (
+            lambda *_args: calls.append("output")
+        )
+        connector.take_events.return_value = None
+
+        model_output = ModelRunnerOutput(
+            req_ids=[request.request_id],
+            req_id_to_index={request.request_id: 0},
+            sampled_token_ids=[[EOS_TOKEN_ID]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+            kv_connector_output=KVConnectorOutput(
+                kv_connector_worker_meta=MagicMock()
+            ),
+        )
+
+        RecomputeScheduler.update_from_output(
+            scheduler, scheduler_output, model_output
+        )
+
+        self.assertEqual(calls, ["metadata", "finished", "output"])
 
     def test_schedule_concurrent_batches(self):
         global MAX_NUM_BATCHED_TOKENS

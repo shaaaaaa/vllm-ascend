@@ -21,7 +21,9 @@ import json
 import math
 import os
 import sys
+import time
 from collections import defaultdict
+from collections.abc import Iterator
 from contextlib import contextmanager, nullcontext
 from copy import copy, deepcopy
 from dataclasses import dataclass
@@ -39,6 +41,7 @@ from vllm.config import CompilationMode, CUDAGraphMode, VllmConfig, get_layers_f
 from vllm.distributed import get_tensor_model_parallel_world_size, tensor_model_parallel_all_gather
 from vllm.distributed.ec_transfer import get_ec_transfer, has_ec_transfer
 from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
+from vllm.distributed.kv_transfer.kv_connector.base import KVConnectorBase
 from vllm.distributed.parallel_state import get_dcp_group, get_dp_group, get_pcp_group, get_pp_group, get_tp_group
 from vllm.forward_context import BatchDescriptor, get_forward_context
 from vllm.logger import logger
@@ -111,6 +114,7 @@ from vllm_ascend.attention.utils import (
     get_lmcache_sparse_cached_tokens,
     staged_sfa_connector_supports_sparse_load,
     staged_sfa_metadata_sparse_route,
+    unwrap_staged_sfa_connector_metadata,
     using_paged_attention,
 )
 
@@ -132,6 +136,20 @@ from vllm_ascend.eplb.core.eplb_device_transfer_loader import D2DExpertWeightLoa
 from vllm_ascend.eplb.core.eplb_worker import EplbProcess
 from vllm_ascend.eplb.eplb_updator import EplbUpdator
 from vllm_ascend.eplb.utils import model_register
+from vllm_ascend.live_source_handoff import (
+    LIVE_SOURCE_EVENT_HANDOFF_KEY,
+)
+from vllm_ascend.lmcache_cold_perf import (
+    cold_perf_enabled,
+    forget_cold_perf_request,
+    is_cold_perf_request,
+    log_cold_perf_event,
+)
+from vllm_ascend.lmcache_diagnostics import (
+    begin_deferred_diagnostic_step,
+    flush_deferred_diagnostics,
+    npu_content_diagnostics_enabled,
+)
 from vllm_ascend.ops.rotary_embedding import set_cos_and_sin, update_cos_sin
 from vllm_ascend.patch.worker.patch_draft_quarot import patch_load_weights
 from vllm_ascend.patch.worker.patch_module import patch_torch_npu_argsort
@@ -181,6 +199,40 @@ if TYPE_CHECKING:
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 else:
     xgr = LazyLoader("xgr", globals(), "xgrammar")
+
+
+def _capture_live_source_event_handoff() -> None:
+    """Let the connector retain an explicitly armed post-forward event."""
+
+    forward_context = get_forward_context()
+    if (
+        LIVE_SOURCE_EVENT_HANDOFF_KEY
+        not in forward_context.additional_kwargs
+    ):
+        return
+    if not has_kv_transfer_group():
+        forward_context.additional_kwargs.pop(LIVE_SOURCE_EVENT_HANDOFF_KEY, None)
+        return
+
+    connector = get_kv_transfer_group()
+    capture = getattr(connector, "capture_live_source_event_handoff", None)
+    if not callable(capture):
+        # Support a direct LMCacheConnectorV1 deployment in addition to the
+        # production AscendMultiConnector composition without changing vLLM.
+        engine = getattr(connector, "_lmcache_engine", None)
+        capture = getattr(engine, "capture_live_source_event_handoff", None)
+    if not callable(capture):
+        forward_context.additional_kwargs.pop(LIVE_SOURCE_EVENT_HANDOFF_KEY, None)
+        return
+    try:
+        capture(forward_context)
+    except Exception:
+        # A missing handoff must retain the established persistent fallback;
+        # it must not fail an otherwise valid model execution.
+        forward_context.additional_kwargs.pop(LIVE_SOURCE_EVENT_HANDOFF_KEY, None)
+        logger.exception(
+            "Live-source producer event capture failed; using persistent fallback"
+        )
 
 
 def _staged_sfa_dummy_remap_boundaries(
@@ -279,6 +331,24 @@ PerLayerAttnMetadata: TypeAlias = list[AttnMetadataDict] | AttnMetadataDict
 
 SEQ_LEN_WITH_MAX_PA_WORKSPACE = 6144
 _STAGED_SFA_ROUTE_ACTIONS = tuple(StagedSFARouteAction)
+
+
+def _merge_kv_connector_outputs(
+    *outputs: KVConnectorOutput,
+) -> KVConnectorOutput:
+    """Merge connector output without dropping same-step worker metadata."""
+    merged = KVConnectorOutput.merge(*outputs)
+    worker_metadata = [
+        output.kv_connector_worker_meta
+        for output in outputs
+        if output.kv_connector_worker_meta is not None
+    ]
+    if worker_metadata:
+        combined = worker_metadata[0]
+        for metadata in worker_metadata[1:]:
+            combined = combined.aggregate(metadata)
+        merged.kv_connector_worker_meta = combined
+    return merged
 
 
 @dataclass
@@ -399,6 +469,104 @@ def _fill_fixed_decode_positions(
 
 
 class NPUModelRunner(GPUModelRunner):
+    @staticmethod
+    @contextmanager
+    def maybe_get_kv_connector_output(
+        scheduler_output: SchedulerOutput,
+        defer_finalize: bool = False,
+    ) -> Iterator[KVConnectorOutput | None]:
+        """Defer worker metadata and cleanup until post-draft finalization."""
+        if not has_kv_transfer_group():
+            yield None
+            return
+
+        output = KVConnectorOutput()
+        connector = get_kv_transfer_group()
+        assert isinstance(connector, KVConnectorBase)
+        assert scheduler_output.kv_connector_metadata is not None
+        connector.bind_connector_metadata(
+            scheduler_output.kv_connector_metadata
+        )
+
+        defer_clear = defer_finalize
+        try:
+            connector.start_load_kv(get_forward_context())
+            try:
+                yield output
+            finally:
+                if not defer_finalize:
+                    connector.wait_for_save()
+                output.finished_sending, output.finished_recving = (
+                    connector.get_finished(scheduler_output.finished_req_ids)
+                )
+                output.invalid_block_ids = (
+                    connector.get_block_ids_with_load_errors()
+                )
+                get_completed = getattr(
+                    connector, "get_completed_decode_window_saves", None
+                )
+                if callable(get_completed):
+                    output.completed_decode_window_saves = get_completed()
+                output.kv_connector_stats = (
+                    connector.get_kv_connector_stats()
+                )
+                output.kv_cache_events = (
+                    connector.get_kv_connector_kv_cache_events()
+                )
+                if not defer_finalize:
+                    output.kv_connector_worker_meta = (
+                        connector.build_connector_worker_meta()
+                    )
+        except BaseException:
+            defer_clear = False
+            raise
+        finally:
+            if not defer_clear:
+                connector.clear_connector_metadata()
+
+    @staticmethod
+    def finalize_kv_connector(
+        finished_req_ids: set[str] | None = None,
+    ) -> KVConnectorOutput:
+        """Finalize a deferred connector lifecycle into one complete output."""
+        output = KVConnectorOutput()
+        if not has_kv_transfer_group():
+            return output
+        connector = get_kv_transfer_group()
+        try:
+            connector.wait_for_save()
+            output.finished_sending, output.finished_recving = (
+                connector.get_finished(finished_req_ids or set())
+            )
+            output.invalid_block_ids = (
+                connector.get_block_ids_with_load_errors()
+            )
+            get_completed = getattr(
+                connector, "get_completed_decode_window_saves", None
+            )
+            if callable(get_completed):
+                output.completed_decode_window_saves = get_completed()
+            output.kv_connector_stats = connector.get_kv_connector_stats()
+            output.kv_cache_events = (
+                connector.get_kv_connector_kv_cache_events()
+            )
+            output.kv_connector_worker_meta = (
+                connector.build_connector_worker_meta()
+            )
+            return output
+        finally:
+            connector.clear_connector_metadata()
+
+    @staticmethod
+    def abort_kv_connector_finalize() -> None:
+        """Clear a deferred connector binding after model execution fails."""
+        if not has_kv_transfer_group():
+            return
+        try:
+            get_kv_transfer_group().clear_connector_metadata()
+        except Exception:
+            logger.exception("Failed to abort deferred KV connector metadata")
+
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         # TODO(qcs): These manual pad and unpad for GPUModelRunner are
         # used to expand some buffers, which need to be reverted after
@@ -1602,6 +1770,25 @@ class NPUModelRunner(GPUModelRunner):
         ):
             scheduler_output = deepcopy(scheduler_output)
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
+        cold_perf_req_ids = (
+            [
+                req_id
+                for req_id in scheduler_output.num_scheduled_tokens
+                if is_cold_perf_request(req_id)
+            ]
+            if cold_perf_enabled()
+            else []
+        )
+        cold_perf_execute_start = (
+            time.perf_counter() if cold_perf_req_ids else 0.0
+        )
+        self._cold_perf_current_req_ids = cold_perf_req_ids
+        log_cold_perf_event(
+            "decoder_worker_execute_entry",
+            request_ids=cold_perf_req_ids,
+            once=True,
+            total_num_scheduled_tokens=num_scheduled_tokens,
+        )
         with record_function_or_nullcontext("prepare input"):
             with self.synchronize_input_prep():
                 # Update persistent batch states.
@@ -1726,6 +1913,7 @@ class NPUModelRunner(GPUModelRunner):
                     num_reqs=num_reqs,
                     should_ubatch=should_ubatch,
                 )
+                dispatched_cudagraph_mode = cudagraph_mode
                 staged_sfa_graph_key = self._apply_staged_sfa_route(
                     staged_sfa_route
                 )
@@ -1734,6 +1922,28 @@ class NPUModelRunner(GPUModelRunner):
                     and staged_sfa_graph_key is None
                 ):
                     cudagraph_mode = CUDAGraphMode.NONE
+                log_cold_perf_event(
+                    "decoder_execution_route",
+                    request_ids=cold_perf_req_ids,
+                    once=True,
+                    dispatched_graph_mode=str(dispatched_cudagraph_mode),
+                    runtime_graph_mode=str(cudagraph_mode),
+                    graph_enabled=cudagraph_mode != CUDAGraphMode.NONE,
+                    staged_graph_selected=staged_sfa_graph_key is not None,
+                    staged_action=staged_sfa_route.action.value,
+                    staged_reason=staged_sfa_route.reason.value,
+                    staged_graph_key=(
+                        str(staged_sfa_graph_key)
+                        if staged_sfa_graph_key is not None
+                        else None
+                    ),
+                    cold_compact_resume_count=sum(
+                        bool(value)
+                        for value in staged_sfa_route.cold_compact_resumes
+                    ),
+                    num_tokens_unpadded=num_tokens_unpadded,
+                    num_tokens_padded=num_tokens_padded,
+                )
                 num_reqs_padded = batch_desc.num_reqs if batch_desc.num_reqs is not None else num_reqs
                 ubatch_slices, ubatch_slices_padded = maybe_create_ubatch_slices(
                     should_ubatch,
@@ -1832,6 +2042,17 @@ class NPUModelRunner(GPUModelRunner):
 
             # update global cos, sin
             update_cos_sin(positions)
+
+        if cold_perf_req_ids:
+            log_cold_perf_event(
+                "decoder_input_prepare_complete",
+                request_ids=cold_perf_req_ids,
+                once=True,
+                total_num_scheduled_tokens=num_scheduled_tokens,
+                elapsed_ms=round(
+                    (time.perf_counter() - cold_perf_execute_start) * 1000, 3
+                ),
+            )
 
         if self.dynamic_eplb:
             with record_function_or_nullcontext("EPLB weight D2D"):
@@ -2002,12 +2223,36 @@ class NPUModelRunner(GPUModelRunner):
                         forward_context.mtp_dw_deep_diag_req_ids = (
                             diag_deep_req_ids
                         )
+            content_diagnostics_enabled = (
+                npu_content_diagnostics_enabled()
+            )
+            if content_diagnostics_enabled:
+                begin_deferred_diagnostic_step()
             if staged_sfa_graph_key is not None:
                 first_layer_name, first_impl = self._staged_sfa_impls[0]
                 first_impl.bootstrap_cross_layer(first_layer_name)
+            cold_perf_forward_start = (
+                time.perf_counter() if cold_perf_req_ids else 0.0
+            )
+            log_cold_perf_event(
+                "decoder_forward_start",
+                request_ids=cold_perf_req_ids,
+                once=True,
+                total_num_scheduled_tokens=num_tokens_padded,
+            )
             hidden_states = self._model_forward(
                 num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
             )
+            if cold_perf_req_ids:
+                log_cold_perf_event(
+                    "decoder_forward_return",
+                    request_ids=cold_perf_req_ids,
+                    once=True,
+                    cpu_elapsed_ms=round(
+                        (time.perf_counter() - cold_perf_forward_start) * 1000,
+                        3,
+                    ),
+                )
             target_diag_session = getattr(
                 get_forward_context(),
                 "_target_sfa_diag_session",
@@ -2042,14 +2287,43 @@ class NPUModelRunner(GPUModelRunner):
                 if not get_pp_group().is_last_rank:
                     # Return the intermediate tensors.
                     assert isinstance(hidden_states, IntermediateTensors)
+                    # This branch returns before speculative drafting, so a
+                    # deferred connector lifecycle must be closed here.
+                    if not clear_kv_metadata:
+                        finalized = self.finalize_kv_connector(
+                            scheduler_output.finished_req_ids
+                        )
+                        if not finalized.is_empty():
+                            kv_connector_output = (
+                                finalized
+                                if kv_connector_output is None
+                                else _merge_kv_connector_outputs(
+                                    kv_connector_output, finalized
+                                )
+                            )
                     hidden_states.kv_connector_output = kv_connector_output
                     self.kv_connector_output = kv_connector_output
                     if self.debugger is not None:
                         self.debugger.stop()
                         self.debugger.step()
+                    if content_diagnostics_enabled:
+                        flush_deferred_diagnostics()
                     return hidden_states
                 if self.is_pooling_model:
                     # Return the pooling output.
+                    # Pooling also has no draft pass after the target model.
+                    if not clear_kv_metadata:
+                        finalized = self.finalize_kv_connector(
+                            scheduler_output.finished_req_ids
+                        )
+                        if not finalized.is_empty():
+                            kv_connector_output = (
+                                finalized
+                                if kv_connector_output is None
+                                else _merge_kv_connector_outputs(
+                                    kv_connector_output, finalized
+                                )
+                            )
                     output = self._pool(
                         hidden_states, num_scheduled_tokens, num_scheduled_tokens_np, kv_connector_output
                     )
@@ -2057,6 +2331,8 @@ class NPUModelRunner(GPUModelRunner):
                     if self.debugger is not None:
                         self.debugger.stop()
                         self.debugger.step()
+                    if content_diagnostics_enabled:
+                        flush_deferred_diagnostics()
                     return output
 
                 sample_hidden_states = hidden_states[logits_indices]
@@ -2114,6 +2390,15 @@ class NPUModelRunner(GPUModelRunner):
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors:
         kv_connector_output = self.kv_connector_output
         self.kv_connector_output = None
+        cold_perf_req_ids = getattr(self, "_cold_perf_current_req_ids", ())
+        cold_perf_sample_start = (
+            time.perf_counter() if cold_perf_req_ids else 0.0
+        )
+        log_cold_perf_event(
+            "decoder_sample_start",
+            request_ids=cold_perf_req_ids,
+            once=True,
+        )
 
         if self.execute_model_state is None:
             # Nothing to do (PP non-final rank case), output isn't used.
@@ -2216,6 +2501,18 @@ class NPUModelRunner(GPUModelRunner):
             scheduler_output.total_num_scheduled_tokens,
             spec_decode_metadata,
         )
+        if cold_perf_req_ids:
+            log_cold_perf_event(
+                "decoder_sample_complete",
+                request_ids=cold_perf_req_ids,
+                once=True,
+                elapsed_ms=round(
+                    (time.perf_counter() - cold_perf_sample_start) * 1000, 3
+                ),
+                output_request_count=len(req_ids_output_copy),
+            )
+            for req_id in cold_perf_req_ids:
+                forget_cold_perf_request(req_id)
         _mtp_dw_for_requests(
             self,
             scheduler_output,
@@ -2274,7 +2571,9 @@ class NPUModelRunner(GPUModelRunner):
 
             if has_kv_transfer_group():
                 if self.speculative_config:
-                    completed_decode_window_saves = self.finalize_kv_connector()
+                    finalized = self.finalize_kv_connector(
+                        scheduler_output.finished_req_ids
+                    )
                     diag_req_ids = getattr(
                         self, "_mtp_dw_diag_current_req_ids", set()
                     )
@@ -2291,21 +2590,17 @@ class NPUModelRunner(GPUModelRunner):
                             deferred=True,
                             order=3,
                             completed_window_end=(
-                                completed_decode_window_saves.get(req_id)
+                                finalized.completed_decode_window_saves.get(req_id)
                             ),
                         )
-                    if completed_decode_window_saves:
-                        if kv_connector_output is None:
-                            kv_connector_output = KVConnectorOutput()
-                        for req_id, window_end in completed_decode_window_saves.items():
-                            kv_connector_output.completed_decode_window_saves[
-                                req_id
-                            ] = max(
-                                kv_connector_output.completed_decode_window_saves.get(
-                                    req_id, 0
-                                ),
-                                window_end,
+                    if not finalized.is_empty():
+                        kv_connector_output = (
+                            finalized
+                            if kv_connector_output is None
+                            else _merge_kv_connector_outputs(
+                                kv_connector_output, finalized
                             )
+                        )
 
         if self.model_config.enable_return_routed_experts:
             capturer = RoutedExpertsCapturer.get_instance()
@@ -2350,6 +2645,22 @@ class NPUModelRunner(GPUModelRunner):
             pp = get_pp_group()
             if pp.world_size > 1 and pp.is_last_rank:
                 self._pp_broadcast_prev_sampled_token_ids(sampler_output.sampled_token_ids)
+
+        # Host readback can synchronize the device.  Keep it after sampling,
+        # MTP draft proposal, connector finalization, async state update, and
+        # PP broadcast so diagnostics cannot repair a production ordering bug.
+        if npu_content_diagnostics_enabled():
+            if staged_sfa_graph_key is not None:
+                for layer_name, impl in self._staged_sfa_impls:
+                    metadata = attn_metadata.get(layer_name)
+                    if metadata is None:
+                        continue
+                    impl.queue_staged_graph_post_diagnostic(
+                        layer_name,
+                        staged_sfa_graph_key,
+                        metadata,
+                    )
+            flush_deferred_diagnostics()
 
         if not self.use_async_scheduling:
             return model_runner_output
@@ -2551,6 +2862,11 @@ class NPUModelRunner(GPUModelRunner):
         )
         forward_context = get_forward_context()
         assert forward_context is not None
+        # Prefix-hit SFA resumes intentionally suppress ordinary decode-save
+        # callbacks.  Preserve the real final Group-1 scatter dependency for
+        # an explicitly armed live P/D export without adding a layer callback,
+        # tensor copy, or device synchronization to the decode path.
+        _capture_live_source_event_handoff()
         if (
             forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL
             and not forward_context.capturing
@@ -2625,7 +2941,13 @@ class NPUModelRunner(GPUModelRunner):
         if self.dp_size == 1:
             return False, None, cudagraph_mode, staged_sfa_route_action
 
-        rows = 3 if staged_sfa_route_action is not None else 2
+        # Collective shape is a wire protocol and must match on every DP rank.
+        # A neutral/bootstrap rank may have no local route while its peer uses
+        # staged SFA, so retain the route row whenever staged SFA is configured.
+        staged_route_protocol = bool(
+            getattr(self, "_staged_sfa_graph_capture_sizes", ())
+        ) or staged_sfa_route_action is not None
+        rows = 3 if staged_route_protocol else 2
         tensor = self._dp_batch_sync_buffers.get(rows)
         if tensor is None or tensor.shape[1] != self.dp_size:
             tensor = torch.empty(
@@ -3224,13 +3546,7 @@ class NPUModelRunner(GPUModelRunner):
         prompt_lens: Any = None,
     ) -> StagedSFARouteDecision:
         """Classify local scheduler/connector state before DP coordination."""
-        def native(reason):
-            return StagedSFARouteDecision(
-                StagedSFARouteAction.SAFE_NATIVE,
-                reason,
-            )
-        if not self._staged_sfa_graph_capture_sizes:
-            return native(StagedSFARouteReason.NOT_CONFIGURED)
+        graph_configured = bool(self._staged_sfa_graph_capture_sizes)
         query_width = 1 + int(
             getattr(self.speculative_config, "num_speculative_tokens", 0)
         )
@@ -3239,27 +3555,105 @@ class NPUModelRunner(GPUModelRunner):
             if query_width == 1
             else AscendAttentionState.SpecDecoding
         )
-        if self.attn_state != expected_state:
-            return native(StagedSFARouteReason.NOT_DECODE)
-        metadata_reason, frontiers, cold_resumes = (
-            staged_sfa_metadata_sparse_route(
-                kv_connector_metadata,
-                request_ids,
-            )
-        )
-        if metadata_reason not in (
-            StagedSFARouteReason.ELIGIBLE,
-            StagedSFARouteReason.DENSE_PREFIX_HIT,
-            StagedSFARouteReason.MIXED_CONNECTOR_LOAD,
+        is_decode_state = self.attn_state == expected_state
+        possible_cold_resume = False
+        if (
+            is_decode_state
+            and not graph_configured
+            and num_computed_tokens is not None
+            and prompt_lens is not None
         ):
-            return StagedSFARouteDecision(
-                StagedSFARouteAction.FATAL,
-                metadata_reason,
+            computed_probe = np.asarray(num_computed_tokens).reshape(-1)
+            prompt_probe = np.asarray(prompt_lens).reshape(-1)
+            possible_cold_resume = (
+                computed_probe.shape == (num_reqs,)
+                and prompt_probe.shape == (num_reqs,)
+                and bool(np.any(computed_probe < prompt_probe))
             )
+        if is_decode_state and (graph_configured or possible_cold_resume):
+            metadata_reason, frontiers, cold_resumes = (
+                staged_sfa_metadata_sparse_route(
+                    unwrap_staged_sfa_connector_metadata(
+                        kv_connector_metadata
+                    ),
+                    request_ids,
+                )
+            )
+        else:
+            frontiers = ()
+            cold_resumes = ()
+
+        def native(reason):
+            return StagedSFARouteDecision(
+                StagedSFARouteAction.SAFE_NATIVE,
+                reason,
+                frontiers=frontiers if cold_resumes else (),
+                cold_compact_resumes=cold_resumes,
+            )
+
+        if not graph_configured:
+            return native(StagedSFARouteReason.NOT_CONFIGURED)
+        if is_decode_state:
+            if any(cold_resumes):
+                computed = (
+                    np.asarray(num_computed_tokens).reshape(-1)
+                    if num_computed_tokens is not None
+                    else np.empty(0, dtype=np.int64)
+                )
+                prompts = (
+                    np.asarray(prompt_lens).reshape(-1)
+                    if prompt_lens is not None
+                    else np.empty(0, dtype=np.int64)
+                )
+                marker_failures: list[str] = []
+                if query_width != self.decode_threshold:
+                    marker_failures.append("query_width")
+                if len(cold_resumes) != num_reqs:
+                    marker_failures.append("resume_count")
+                if len(frontiers) != num_reqs:
+                    marker_failures.append("frontier_count")
+                if computed.shape != (num_reqs,):
+                    marker_failures.append("computed_shape")
+                if prompts.shape != (num_reqs,):
+                    marker_failures.append("prompt_shape")
+                if not marker_failures:
+                    for i, resume in enumerate(cold_resumes):
+                        if not resume:
+                            continue
+                        if int(computed[i]) != int(prompts[i]) - 1:
+                            marker_failures.append(
+                                f"computed_prompt_minus_one[{i}]"
+                            )
+                        if frontiers[i] != int(computed[i]):
+                            marker_failures.append(
+                                f"frontier_computed[{i}]"
+                            )
+                if marker_failures:
+                    log_cold_perf_event(
+                        "decoder_cold_compact_graph_reject",
+                        request_ids=request_ids,
+                        once=True,
+                        failed_invariants=marker_failures,
+                        cold_resume_indices=[
+                            i
+                            for i, resume in enumerate(cold_resumes)
+                            if resume
+                        ],
+                        num_computed_tokens=computed.tolist(),
+                        prompt_lens=prompts.tolist(),
+                        remap_frontiers=list(frontiers),
+                    )
+                    return native(
+                        StagedSFARouteReason.COLD_COMPACT_LAYOUT
+                    )
         if getattr(self, "calculate_kv_scales", False):
             return native(StagedSFARouteReason.RUNTIME_MODE)
         if getattr(self.vllm_config, "lora_config", None) is not None:
             return native(StagedSFARouteReason.LORA)
+        if not is_decode_state:
+            return native(StagedSFARouteReason.NOT_DECODE)
+        if query_width not in (1, 2):
+            return native(StagedSFARouteReason.SPECULATIVE_DECODE)
         if has_cascade_attention:
             return native(StagedSFARouteReason.CASCADE)
         batch_size = int(num_tokens_unpadded)
@@ -3276,29 +3670,44 @@ class NPUModelRunner(GPUModelRunner):
             scheduled == query_width
         ):
             return native(StagedSFARouteReason.NON_Q1)
+        if metadata_reason in (
+            StagedSFARouteReason.DENSE_PREFIX_HIT,
+            StagedSFARouteReason.MIXED_CONNECTOR_LOAD,
+        ):
+            return native(metadata_reason)
+        if metadata_reason != StagedSFARouteReason.ELIGIBLE:
+            return StagedSFARouteDecision(
+                StagedSFARouteAction.FATAL,
+                metadata_reason,
+            )
         if len(frontiers) != num_reqs:
             return StagedSFARouteDecision(
                 StagedSFARouteAction.FATAL,
                 StagedSFARouteReason.FRONTIER_COUNT_MISMATCH,
             )
-        if query_width == 1:
-            if any(cold_resumes):
-                computed = np.asarray(num_computed_tokens).reshape(-1)
-                prompts = np.asarray(prompt_lens).reshape(-1)
-                if (
-                    len(cold_resumes) != num_reqs
-                    or computed.shape != (num_reqs,)
-                    or prompts.shape != (num_reqs,)
-                    or any(
-                        int(computed[i]) != int(prompts[i]) - 1
-                        or frontiers[i] != int(computed[i])
+        if any(cold_resumes):
+            layout_failures: list[str] = []
+            for i, resume in enumerate(cold_resumes):
+                if not resume and int(computed[i]) < int(prompts[i]):
+                    layout_failures.append(f"computed_prompt[{i}]")
+            if layout_failures:
+                log_cold_perf_event(
+                    "decoder_cold_compact_graph_reject",
+                    request_ids=request_ids,
+                    once=True,
+                    failed_invariants=layout_failures,
+                    cold_resume_indices=[
+                        i
                         for i, resume in enumerate(cold_resumes)
                         if resume
-                    )
-                ):
-                    return native(StagedSFARouteReason.COLD_COMPACT_LAYOUT)
-        else:
-            cold_resumes = ()
+                    ],
+                    num_computed_tokens=computed.tolist(),
+                    prompt_lens=prompts.tolist(),
+                    remap_frontiers=list(frontiers),
+                )
+                return native(
+                    StagedSFARouteReason.COLD_COMPACT_LAYOUT,
+                )
         scratch_capacity = query_width * index_topk
         if any(
             frontier != 0 and frontier < scratch_capacity
@@ -3388,6 +3797,14 @@ class NPUModelRunner(GPUModelRunner):
         should_ubatch: bool,
     ) -> StagedSFARouteDecision:
         """Bind a DP-agreed local route to one captured graph capacity."""
+        def native(reason: StagedSFARouteReason) -> StagedSFARouteDecision:
+            return StagedSFARouteDecision(
+                StagedSFARouteAction.SAFE_NATIVE,
+                reason,
+                frontiers=local_route.frontiers,
+                cold_compact_resumes=local_route.cold_compact_resumes,
+            )
+
         if (
             dp_route_action is not None
             and dp_route_action != StagedSFARouteAction.STAGED
@@ -3397,27 +3814,20 @@ class NPUModelRunner(GPUModelRunner):
             return StagedSFARouteDecision(
                 dp_route_action,
                 StagedSFARouteReason.RUNTIME_PARALLELISM,
+                frontiers=local_route.frontiers,
+                cold_compact_resumes=local_route.cold_compact_resumes,
             )
         if local_route.action != StagedSFARouteAction.STAGED:
             return local_route
         if cudagraph_mode != CUDAGraphMode.PIECEWISE:
-            return StagedSFARouteDecision(
-                StagedSFARouteAction.SAFE_NATIVE,
-                StagedSFARouteReason.RUNTIME_MODE,
-            )
+            return native(StagedSFARouteReason.RUNTIME_MODE)
         if should_ubatch:
-            return StagedSFARouteDecision(
-                StagedSFARouteAction.SAFE_NATIVE,
-                StagedSFARouteReason.UBATCH,
-            )
+            return native(StagedSFARouteReason.UBATCH)
         batch_size = int(num_tokens_unpadded)
         capacity = int(num_tokens_padded)
         query_width = self.decode_threshold
         if capacity % query_width:
-            return StagedSFARouteDecision(
-                StagedSFARouteAction.SAFE_NATIVE,
-                StagedSFARouteReason.PADDED_BATCH,
-            )
+            return native(StagedSFARouteReason.PADDED_BATCH)
         graph_key = (
             StagedSFAGraphKey.exact_q1(capacity)
             if query_width == 1
@@ -3433,15 +3843,9 @@ class NPUModelRunner(GPUModelRunner):
             or capacity
             not in self._staged_sfa_graph_capture_sizes
         ):
-            return StagedSFARouteDecision(
-                StagedSFARouteAction.SAFE_NATIVE,
-                StagedSFARouteReason.PADDED_BATCH,
-            )
+            return native(StagedSFARouteReason.PADDED_BATCH)
         if batch_descriptor != graph_key.to_legacy_batch_descriptor():
-            return StagedSFARouteDecision(
-                StagedSFARouteAction.SAFE_NATIVE,
-                StagedSFARouteReason.BATCH_DESCRIPTOR,
-            )
+            return native(StagedSFARouteReason.BATCH_DESCRIPTOR)
         return StagedSFARouteDecision(
             StagedSFARouteAction.STAGED,
             StagedSFARouteReason.ELIGIBLE,

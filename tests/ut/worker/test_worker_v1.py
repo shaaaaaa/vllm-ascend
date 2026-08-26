@@ -51,6 +51,54 @@ class TestNPUWorker(TestBase):
         self.distributed_init_method = "tcp://localhost:12345"
         self.is_driver_worker = False
 
+    def test_mooncake_placement_info_reports_tp0_with_routable_dp_rank(self):
+        from vllm_ascend.worker.worker import NPUWorker
+
+        worker = NPUWorker.__new__(NPUWorker)
+        worker.vllm_config = SimpleNamespace(
+            parallel_config=SimpleNamespace(data_parallel_rank=3)
+        )
+        worker.get_kv_connector_handshake_metadata = MagicMock(
+            return_value={
+                0: SimpleNamespace(
+                    tp_rank=0,
+                    local_ip="7.150.7.133",
+                    te_rpc_port=12345,
+                )
+            }
+        )
+
+        self.assertEqual(
+            worker.get_mooncake_placement_info(),
+            {"dp_rank": 3, "segment": "7.150.7.133:12345"},
+        )
+
+        worker.vllm_config.parallel_config.local_engines_only = True
+        worker.vllm_config.parallel_config.data_parallel_rank_local = 0
+        self.assertEqual(
+            worker.get_mooncake_placement_info(),
+            {"dp_rank": 0, "segment": "7.150.7.133:12345"},
+        )
+
+    def test_mooncake_placement_info_ignores_non_tp0_and_invalid_metadata(self):
+        from vllm_ascend.worker.worker import NPUWorker
+
+        worker = NPUWorker.__new__(NPUWorker)
+        worker.vllm_config = SimpleNamespace(
+            parallel_config=SimpleNamespace(data_parallel_rank=3)
+        )
+        for metadata in (
+            None,
+            SimpleNamespace(tp_rank=1, local_ip="host", te_rpc_port=1),
+            SimpleNamespace(tp_rank=0, local_ip="", te_rpc_port=1),
+            SimpleNamespace(tp_rank=0, local_ip="host", te_rpc_port=0),
+        ):
+            worker.get_kv_connector_handshake_metadata = MagicMock(
+                return_value=None if metadata is None else {0: metadata}
+            )
+            with self.subTest(metadata=metadata):
+                self.assertIsNone(worker.get_mooncake_placement_info())
+
     @patch("vllm_ascend.utils.adapt_patch")
     @patch("vllm_ascend.ops")
     @patch("vllm_ascend.worker.worker._register_atb_extensions")

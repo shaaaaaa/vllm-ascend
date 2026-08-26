@@ -263,11 +263,19 @@ class ACLGraphWrapper:
             and self.runtime_mode == CUDAGraphMode.PIECEWISE
         )
         async_scheduling = self.vllm_config.scheduler_config.async_scheduling
+        cold_staged_replay = (
+            staged_piecewise_replay
+            and getattr(
+                forward_context,
+                "staged_sfa_cold_mtp_replay",
+                False,
+            )
+        )
         stream_ordered_staged_replay = staged_piecewise_replay and (
-            async_scheduling is False
+            getattr(forward_context, "staged_sfa_replay_fenced", False)
             or (
-                async_scheduling is True
-                and getattr(forward_context, "staged_sfa_replay_fenced", False)
+                async_scheduling is False
+                and not cold_staged_replay
             )
         )
         # If we do not in main model and in full-graph mode when using merge-eagle-graph,
@@ -278,7 +286,7 @@ class ACLGraphWrapper:
             else False
         )
         if (
-            self.synchronize_before_replay
+            (self.synchronize_before_replay or cold_staged_replay)
             and not stream_ordered_staged_replay
             and (
                 self.runtime_mode != CUDAGraphMode.FULL
@@ -287,7 +295,9 @@ class ACLGraphWrapper:
             )
         ):
             torch.npu.current_stream().synchronize()
-            if staged_piecewise_replay and async_scheduling is True:
+            if staged_piecewise_replay and (
+                async_scheduling is True or cold_staged_replay
+            ):
                 forward_context.staged_sfa_replay_fenced = True
         entry.aclgraph.replay()
         return entry.output

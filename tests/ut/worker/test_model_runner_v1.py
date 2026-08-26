@@ -25,6 +25,210 @@ from vllm_ascend.worker.block_table import MultiGroupBlockTable
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
 
 
+class TestKVConnectorCompatibility(unittest.TestCase):
+    def test_merge_preserves_worker_metadata(self):
+        first_metadata = MagicMock()
+        second_metadata = MagicMock()
+        combined_metadata = object()
+        first_metadata.aggregate.return_value = combined_metadata
+
+        merged = model_runner_module._merge_kv_connector_outputs(
+            model_runner_module.KVConnectorOutput(
+                kv_connector_worker_meta=first_metadata
+            ),
+            model_runner_module.KVConnectorOutput(
+                kv_connector_worker_meta=second_metadata
+            ),
+        )
+
+        self.assertIs(merged.kv_connector_worker_meta, combined_metadata)
+        first_metadata.aggregate.assert_called_once_with(second_metadata)
+
+    def test_deferred_context_builds_worker_metadata_only_at_finalize(self):
+        connector = MagicMock(spec=model_runner_module.KVConnectorBase)
+        forward_context = object()
+        scheduler_output = SimpleNamespace(
+            kv_connector_metadata=object(), finished_req_ids={"finished"}
+        )
+        with (
+            patch.object(
+                model_runner_module,
+                "has_kv_transfer_group",
+                return_value=True,
+            ),
+            patch.object(
+                model_runner_module,
+                "get_kv_transfer_group",
+                return_value=connector,
+            ),
+            patch.object(
+                model_runner_module,
+                "get_forward_context",
+                return_value=forward_context,
+            ),
+            NPUModelRunner.maybe_get_kv_connector_output(
+                scheduler_output, defer_finalize=True
+            ) as output,
+        ):
+            self.assertIsNotNone(output)
+
+        connector.wait_for_save.assert_not_called()
+        connector.build_connector_worker_meta.assert_not_called()
+        connector.clear_connector_metadata.assert_not_called()
+        connector.bind_connector_metadata.assert_called_once_with(
+            scheduler_output.kv_connector_metadata
+        )
+        connector.start_load_kv.assert_called_once_with(forward_context)
+
+    def test_deferred_context_clears_metadata_on_failure(self):
+        connector = MagicMock(spec=model_runner_module.KVConnectorBase)
+        scheduler_output = SimpleNamespace(
+            kv_connector_metadata=object(), finished_req_ids=set()
+        )
+        with (
+            patch.object(
+                model_runner_module,
+                "has_kv_transfer_group",
+                return_value=True,
+            ),
+            patch.object(
+                model_runner_module,
+                "get_kv_transfer_group",
+                return_value=connector,
+            ),
+            patch.object(
+                model_runner_module,
+                "get_forward_context",
+                return_value=object(),
+            ),
+            self.assertRaisesRegex(RuntimeError, "forward failed"),
+            NPUModelRunner.maybe_get_kv_connector_output(
+                scheduler_output, defer_finalize=True
+            ),
+        ):
+            raise RuntimeError("forward failed")
+
+        connector.clear_connector_metadata.assert_called_once_with()
+
+    def test_finalize_returns_complete_connector_output(self):
+        connector = MagicMock()
+        connector.get_finished.return_value = ({"sent"}, {"received"})
+        connector.get_block_ids_with_load_errors.return_value = {7}
+        connector.get_completed_decode_window_saves.return_value = {
+            "request": 1024
+        }
+        connector.get_kv_connector_stats.return_value = object()
+        connector.get_kv_connector_kv_cache_events.return_value = object()
+        connector.build_connector_worker_meta.return_value = object()
+        with (
+            patch.object(
+                model_runner_module,
+                "has_kv_transfer_group",
+                return_value=True,
+            ),
+            patch.object(
+                model_runner_module,
+                "get_kv_transfer_group",
+                return_value=connector,
+            ),
+        ):
+            output = NPUModelRunner.finalize_kv_connector({"finished"})
+
+        connector.wait_for_save.assert_called_once_with()
+        connector.get_finished.assert_called_once_with({"finished"})
+        connector.clear_connector_metadata.assert_called_once_with()
+        self.assertEqual(output.finished_sending, {"sent"})
+        self.assertEqual(output.finished_recving, {"received"})
+        self.assertEqual(output.invalid_block_ids, {7})
+        self.assertEqual(
+            output.completed_decode_window_saves,
+            {"request": 1024},
+        )
+        self.assertIs(
+            output.kv_connector_worker_meta,
+            connector.build_connector_worker_meta.return_value,
+        )
+
+
+class TestLiveSourceEventPublication(unittest.TestCase):
+    def test_publication_is_captured_before_forward_context_exits(self):
+        forward_context = SimpleNamespace(
+            additional_kwargs={
+                model_runner_module.LIVE_SOURCE_EVENT_HANDOFF_KEY: object()
+            }
+        )
+        connector = SimpleNamespace(
+            capture_live_source_event_handoff=MagicMock()
+        )
+        with (
+            patch.object(
+                model_runner_module,
+                "get_forward_context",
+                return_value=forward_context,
+            ),
+            patch.object(
+                model_runner_module,
+                "has_kv_transfer_group",
+                return_value=True,
+            ),
+            patch.object(
+                model_runner_module,
+                "get_kv_transfer_group",
+                return_value=connector,
+            ),
+        ):
+            model_runner_module._capture_live_source_event_handoff()
+
+        connector.capture_live_source_event_handoff.assert_called_once_with(
+            forward_context
+        )
+
+    def test_unarmed_forward_has_no_connector_lookup(self):
+        forward_context = SimpleNamespace(additional_kwargs={})
+        with (
+            patch.object(
+                model_runner_module,
+                "get_forward_context",
+                return_value=forward_context,
+            ),
+            patch.object(
+                model_runner_module,
+                "has_kv_transfer_group",
+            ) as has_group,
+        ):
+            model_runner_module._publish_live_source_event_handoff()
+
+        has_group.assert_not_called()
+
+    def test_model_forward_publishes_step_scoped_handoff(self):
+        runner = NPUModelRunner.__new__(NPUModelRunner)
+        hidden_states = object()
+        runner.model = MagicMock(return_value=hidden_states)
+        runner.use_sparse = False
+        forward_context = SimpleNamespace(
+            cudagraph_runtime_mode=CUDAGraphMode.NONE,
+            capturing=False,
+            flash_comm_v1_enabled=False,
+            additional_kwargs={},
+        )
+
+        with (
+            patch.object(
+                model_runner_module,
+                "get_forward_context",
+                return_value=forward_context,
+            ),
+            patch.object(
+                model_runner_module,
+                "_capture_live_source_event_handoff",
+            ) as publish,
+        ):
+            result = runner._model_forward(1)
+
+        self.assertIs(result, hidden_states)
+        publish.assert_called_once_with()
+
+
 class TestFixedDecodeLayoutArrays(unittest.TestCase):
     def test_q1_layout_is_identity(self):
         req_indices, offsets, cumulative = (
@@ -753,6 +957,7 @@ class TestStagedSFADummyBatch(unittest.TestCase):
         runner = self._build_runner()
         runner.dp_size = 2
         runner.dp_rank = 0
+        runner._staged_sfa_graph_capture_sizes = ()
         runner._skip_all_reduce_across_dp_group = MagicMock(return_value=False)
 
         def all_reduce(tensor, group):
@@ -780,6 +985,43 @@ class TestStagedSFADummyBatch(unittest.TestCase):
 
         self.assertEqual(sizes.tolist(), [4, 4])
         self.assertEqual(mode, CUDAGraphMode.PIECEWISE.value)
+        self.assertIsNone(action)
+
+    def test_dp_sync_keeps_staged_shape_for_neutral_rank(self):
+        runner = self._build_runner()
+        runner.dp_size = 2
+        runner.dp_rank = 0
+        runner._skip_all_reduce_across_dp_group = MagicMock(return_value=False)
+
+        def all_reduce(tensor, group):
+            self.assertEqual(tuple(tensor.shape), (3, 2))
+            self.assertEqual(tensor[2, 0].item(), 0)
+            tensor[0, 1] = 4
+            tensor[1, 1] = CUDAGraphMode.PIECEWISE.value
+            tensor[2, 1] = tuple(StagedSFARouteAction).index(
+                StagedSFARouteAction.STAGED
+            )
+
+        with (
+            patch.object(
+                model_runner_module,
+                "get_dp_group",
+                return_value=SimpleNamespace(cpu_group=object()),
+            ),
+            patch.object(
+                model_runner_module.dist,
+                "all_reduce",
+                side_effect=all_reduce,
+            ),
+        ):
+            _, sizes, mode, action = runner._sync_batch_across_dp(
+                num_tokens_padded=1,
+                cudagraph_mode=CUDAGraphMode.NONE.value,
+                allow_dp_padding=False,
+            )
+
+        self.assertEqual(sizes.tolist(), [1, 4])
+        self.assertEqual(mode, CUDAGraphMode.NONE.value)
         self.assertIsNone(action)
 
     def test_dp_redispatches_only_when_agreement_changes_the_key(self):
@@ -1119,7 +1361,7 @@ class TestStagedSFADummyBatch(unittest.TestCase):
                     dsa_current_released_frontier=0,
                     dsa_nonresident_frontier=8192,
                     load_spec=SimpleNamespace(
-                        can_load=True,
+                        can_load=False,
                         lmcache_cached_tokens=8193,
                         dsa_committed_end=8192,
                         dsa_cold_compact_resume=True,
@@ -1188,6 +1430,229 @@ class TestStagedSFADummyBatch(unittest.TestCase):
                     rejected.reason,
                     StagedSFARouteReason.COLD_COMPACT_LAYOUT,
                 )
+
+        bad_frontier = SimpleNamespace(
+            requests=[
+                SimpleNamespace(
+                    req_id="cold",
+                    is_sparse_decode=True,
+                    load_spec=SimpleNamespace(
+                        can_load=True,
+                        dsa_committed_end=7936,
+                        dsa_cold_compact_resume=True,
+                    ),
+                )
+            ]
+        )
+        with patch.object(
+            model_runner_module, "log_cold_perf_event"
+        ) as log_event:
+            rejected = runner._staged_sfa_local_route(
+                **{
+                    **kwargs,
+                    "kv_connector_metadata": bad_frontier,
+                }
+            )
+
+        self.assertEqual(
+            rejected.reason,
+            StagedSFARouteReason.COLD_COMPACT_LAYOUT,
+        )
+        log_event.assert_called_once_with(
+            "decoder_cold_compact_graph_reject",
+            request_ids=["cold"],
+            once=True,
+            failed_invariants=["frontier_computed[0]"],
+            cold_resume_indices=[0],
+            num_computed_tokens=[8192],
+            prompt_lens=[8193],
+            remap_frontiers=[7936],
+        )
+
+    def test_speculative_cold_resume_uses_staged_graph(self):
+        runner = self._build_runner()
+        runner.speculative_config = SimpleNamespace(
+            num_speculative_tokens=1,
+        )
+        runner.decode_threshold = 2
+        runner.attn_state = AscendAttentionState.SpecDecoding
+        runner._staged_sfa_graph_capture_sizes = (2, 4)
+        metadata = SimpleNamespace(
+            requests=[
+                SimpleNamespace(
+                    req_id="cold-spec",
+                    is_sparse_decode=True,
+                    load_spec=SimpleNamespace(
+                        can_load=False,
+                        lmcache_cached_tokens=8193,
+                        dsa_committed_end=8192,
+                        dsa_cold_compact_resume=True,
+                    ),
+                )
+            ]
+        )
+        kwargs = dict(
+            num_tokens_unpadded=2,
+            num_reqs=1,
+            num_scheduled_tokens=np.array([2], dtype=np.int32),
+            index_topk=2048,
+            has_cascade_attention=False,
+            request_ids=["cold-spec"],
+            kv_connector_metadata=metadata,
+            num_computed_tokens=np.array([8192], dtype=np.int32),
+            prompt_lens=np.array([8193], dtype=np.int32),
+        )
+
+        with patch.object(
+            model_runner_module, "log_cold_perf_event"
+        ) as log_event:
+            route = runner._staged_sfa_local_route(**kwargs)
+
+        self.assertEqual(
+            route.action,
+            StagedSFARouteAction.STAGED,
+        )
+        self.assertEqual(
+            route.reason,
+            StagedSFARouteReason.ELIGIBLE,
+        )
+        self.assertEqual(route.frontiers, (8192,))
+        self.assertEqual(route.cold_compact_resumes, (True,))
+        log_event.assert_not_called()
+        live = runner._staged_sfa_live_route(
+            local_route=route,
+            dp_route_action=StagedSFARouteAction.STAGED,
+            cudagraph_mode=CUDAGraphMode.PIECEWISE,
+            batch_descriptor=BatchDescriptor(num_tokens=2),
+            num_tokens_unpadded=2,
+            num_tokens_padded=2,
+            num_reqs=1,
+            should_ubatch=False,
+        )
+        self.assertEqual(live.graph_key, StagedSFAGraphKey.fixed_spec(1, 2))
+        self.assertEqual(live.cold_compact_resumes, (True,))
+
+        runner._staged_sfa_graph_capture_sizes = ()
+        with patch.object(
+            model_runner_module,
+            "unwrap_staged_sfa_connector_metadata",
+            wraps=model_runner_module.unwrap_staged_sfa_connector_metadata,
+        ) as unwrap_metadata:
+            not_configured = runner._staged_sfa_local_route(**kwargs)
+        unwrap_metadata.assert_called_once_with(metadata)
+        self.assertEqual(
+            not_configured.reason, StagedSFARouteReason.NOT_CONFIGURED
+        )
+        self.assertEqual(not_configured.frontiers, (8192,))
+        self.assertEqual(not_configured.cold_compact_resumes, (True,))
+
+        with patch.object(
+            model_runner_module,
+            "unwrap_staged_sfa_connector_metadata",
+        ) as unwrap_metadata:
+            ordinary_not_configured = runner._staged_sfa_local_route(
+                **{
+                    **kwargs,
+                    "num_computed_tokens": np.array(
+                        [8193], dtype=np.int32
+                    ),
+                }
+            )
+        unwrap_metadata.assert_not_called()
+        self.assertEqual(
+            ordinary_not_configured.reason,
+            StagedSFARouteReason.NOT_CONFIGURED,
+        )
+        self.assertEqual(ordinary_not_configured.frontiers, ())
+        self.assertEqual(ordinary_not_configured.cold_compact_resumes, ())
+        runner._staged_sfa_graph_capture_sizes = (2, 4)
+
+        for name, overrides in {
+            "dp_fallback": {
+                "dp_route_action": StagedSFARouteAction.SAFE_NATIVE,
+            },
+            "runtime_mode": {"cudagraph_mode": CUDAGraphMode.NONE},
+            "ubatch": {"should_ubatch": True},
+            "missing_capture": {"num_tokens_padded": 6},
+            "descriptor": {
+                "batch_descriptor": BatchDescriptor(num_tokens=4),
+            },
+        }.items():
+            downgraded = runner._staged_sfa_live_route(
+                local_route=route,
+                **{
+                    "dp_route_action": StagedSFARouteAction.STAGED,
+                    "cudagraph_mode": CUDAGraphMode.PIECEWISE,
+                    "batch_descriptor": BatchDescriptor(num_tokens=2),
+                    "num_tokens_unpadded": 2,
+                    "num_tokens_padded": 2,
+                    "num_reqs": 1,
+                    "should_ubatch": False,
+                    **overrides,
+                },
+            )
+            with self.subTest(name=name):
+                self.assertEqual(
+                    downgraded.action, StagedSFARouteAction.SAFE_NATIVE
+                )
+                self.assertEqual(downgraded.frontiers, (8192,))
+                self.assertEqual(
+                    downgraded.cold_compact_resumes, (True,)
+                )
+
+        rejected = runner._staged_sfa_local_route(
+            **{
+                **kwargs,
+                "num_computed_tokens": np.array([8191], dtype=np.int32),
+            }
+        )
+        self.assertEqual(
+            rejected.action,
+            StagedSFARouteAction.SAFE_NATIVE,
+        )
+        self.assertEqual(
+            rejected.reason,
+            StagedSFARouteReason.COLD_COMPACT_LAYOUT,
+        )
+        self.assertEqual(rejected.frontiers, (8192,))
+        self.assertEqual(rejected.cold_compact_resumes, (True,))
+
+    def test_wider_mtp_cold_resume_keeps_marker_on_native_route(self):
+        runner = self._build_runner()
+        runner.speculative_config = SimpleNamespace(num_speculative_tokens=2)
+        runner.decode_threshold = 3
+        runner.attn_state = AscendAttentionState.SpecDecoding
+        runner._staged_sfa_graph_capture_sizes = (3, 6)
+        route = runner._staged_sfa_local_route(
+            num_tokens_unpadded=3,
+            num_reqs=1,
+            num_scheduled_tokens=np.array([3], dtype=np.int32),
+            index_topk=2048,
+            has_cascade_attention=False,
+            request_ids=["cold-spec"],
+            kv_connector_metadata=SimpleNamespace(
+                requests=[
+                    SimpleNamespace(
+                        req_id="cold-spec",
+                        is_sparse_decode=True,
+                        load_spec=SimpleNamespace(
+                            can_load=False,
+                            lmcache_cached_tokens=8193,
+                            dsa_committed_end=8192,
+                            dsa_cold_compact_resume=True,
+                        ),
+                    )
+                ]
+            ),
+            num_computed_tokens=np.array([8192], dtype=np.int32),
+            prompt_lens=np.array([8193], dtype=np.int32),
+        )
+        self.assertEqual(route.action, StagedSFARouteAction.SAFE_NATIVE)
+        self.assertEqual(
+            route.reason, StagedSFARouteReason.SPECULATIVE_DECODE
+        )
+        self.assertEqual(route.frontiers, (8192,))
+        self.assertEqual(route.cold_compact_resumes, (True,))
 
     def test_native_route_logs_once_per_reason(self):
         runner = self._build_runner()
@@ -1287,7 +1752,6 @@ class TestStagedSFADummyBatch(unittest.TestCase):
                         load_spec=SimpleNamespace(
                             can_load=True,
                             lmcache_cached_tokens=4096,
-                            dsa_cold_compact_resume=True,
                         ),
                     )
                     for req_id in request_ids
@@ -1307,6 +1771,95 @@ class TestStagedSFADummyBatch(unittest.TestCase):
         self.assertEqual(local.cold_compact_resumes, ())
         self.assertEqual(route.action, StagedSFARouteAction.STAGED)
         self.assertEqual(route.graph_key, StagedSFAGraphKey.fixed_spec(2, 2))
+
+    def test_fixed_width_mtp_accepts_mixed_cold_resume(self):
+        runner = self._build_runner()
+        runner.speculative_config = SimpleNamespace(
+            method="mtp",
+            num_speculative_tokens=1,
+        )
+        runner.decode_threshold = 2
+        runner.attn_state = AscendAttentionState.SpecDecoding
+        request_ids = ["req-0", "req-1"]
+        metadata = SimpleNamespace(
+            requests=[
+                SimpleNamespace(
+                    req_id=req_id,
+                    is_sparse_decode=True,
+                    dsa_current_released_frontier=8192,
+                    dsa_nonresident_frontier=8192,
+                    load_spec=SimpleNamespace(
+                        can_load=True,
+                        lmcache_cached_tokens=8192,
+                        dsa_committed_end=8192,
+                        dsa_cold_compact_resume=(req_id == "req-0"),
+                    ),
+                )
+                for req_id in request_ids
+            ]
+        )
+        kwargs = dict(
+            num_tokens_unpadded=4,
+            num_reqs=2,
+            num_scheduled_tokens=np.full(2, 2, dtype=np.int32),
+            index_topk=2048,
+            has_cascade_attention=False,
+            request_ids=request_ids,
+            kv_connector_metadata=metadata,
+            num_computed_tokens=np.array([8192, 8193], dtype=np.int32),
+            prompt_lens=np.array([8193, 8193], dtype=np.int32),
+        )
+        local = runner._staged_sfa_local_route(**kwargs)
+        self.assertEqual(local.action, StagedSFARouteAction.STAGED)
+        self.assertEqual(local.cold_compact_resumes, (True, False))
+
+        mixed = runner._staged_sfa_local_route(
+            **{
+                **kwargs,
+                "kv_connector_metadata": SimpleNamespace(
+                    requests=[
+                        SimpleNamespace(
+                            req_id="req-0",
+                            is_sparse_decode=False,
+                            dsa_current_released_frontier=0,
+                            dsa_nonresident_frontier=0,
+                            load_spec=SimpleNamespace(can_load=True),
+                        ),
+                        SimpleNamespace(
+                            req_id="req-1",
+                            is_sparse_decode=True,
+                            dsa_current_released_frontier=8192,
+                            dsa_nonresident_frontier=8192,
+                            load_spec=SimpleNamespace(
+                                can_load=True,
+                                lmcache_cached_tokens=8192,
+                                dsa_committed_end=8192,
+                                dsa_cold_compact_resume=True,
+                            ),
+                        ),
+                    ]
+                ),
+                "num_computed_tokens": np.array(
+                    [8193, 8192], dtype=np.int32
+                ),
+            }
+        )
+        self.assertEqual(mixed.action, StagedSFARouteAction.SAFE_NATIVE)
+        self.assertEqual(
+            mixed.reason, StagedSFARouteReason.MIXED_CONNECTOR_LOAD
+        )
+        self.assertEqual(mixed.frontiers, (0, 8192))
+        self.assertEqual(mixed.cold_compact_resumes, (False, True))
+
+        rejected = runner._staged_sfa_local_route(
+            **{
+                **kwargs,
+                "request_ids": request_ids[::-1],
+                "num_computed_tokens": np.array([8191, 8192], dtype=np.int32),
+            }
+        )
+        self.assertEqual(rejected.action, StagedSFARouteAction.SAFE_NATIVE)
+        self.assertEqual(rejected.cold_compact_resumes, (False, True))
 
     def test_mtp_request_three_and_five_use_different_graph_capacities(self):
         query_width = 2

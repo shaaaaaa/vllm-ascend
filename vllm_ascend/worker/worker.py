@@ -476,7 +476,16 @@ class NPUWorker(WorkerBase):
                 comm_postprocess=comm_postprocess,
             )
 
-        output = self.model_runner.execute_model(scheduler_output, intermediate_tensors)
+        try:
+            output = self.model_runner.execute_model(
+                scheduler_output, intermediate_tensors
+            )
+        except BaseException:
+            # A speculative target pass can fail after connector metadata was
+            # intentionally kept bound for sample_tokens(). Never carry that
+            # failed step's request binding into a later scheduler iteration.
+            self.model_runner.abort_kv_connector_finalize()
+            raise
         if isinstance(output, (ModelRunnerOutput, AsyncModelRunnerOutput, NoneType)):
             return output
 
@@ -499,8 +508,10 @@ class NPUWorker(WorkerBase):
             return None
 
         # In case of PP with kv transfer, we need to pass through the
-        # kv_connector_output
-        if not kv_connector_output.finished_sending and not kv_connector_output.finished_recving:
+        # kv_connector_output. Worker metadata, invalid block IDs, completed
+        # saves, stats, and cache events are also scheduler-visible output;
+        # do not discard them merely because no request finished this step.
+        if kv_connector_output.is_empty():
             return EMPTY_MODEL_RUNNER_OUTPUT
         output = copy.copy(EMPTY_MODEL_RUNNER_OUTPUT)
         output.kv_connector_output = kv_connector_output
@@ -508,7 +519,14 @@ class NPUWorker(WorkerBase):
 
     @torch.inference_mode()
     def sample_tokens(self, grammar_output: "GrammarOutput") -> ModelRunnerOutput | AsyncModelRunnerOutput:
-        return self.model_runner.sample_tokens(grammar_output)
+        try:
+            return self.model_runner.sample_tokens(grammar_output)
+        except BaseException:
+            # Speculative execution defers connector finalization until after
+            # the draft pass. A failed draft/sample must not leave request
+            # metadata bound for the next scheduler step.
+            self.model_runner.abort_kv_connector_finalize()
+            raise
 
     def load_model(self) -> None:
         if self.vllm_config.model_config.enable_sleep_mode:
@@ -578,6 +596,31 @@ class NPUWorker(WorkerBase):
         if (metadata := connector.get_handshake_metadata()) is None:
             return None
         return {self.rank: metadata}
+
+    def get_mooncake_placement_info(self) -> dict[str, int | str] | None:
+        """Expose this decoder DP rank's TP0 Mooncake segment."""
+        metadata_by_rank = self.get_kv_connector_handshake_metadata()
+        if not metadata_by_rank:
+            return None
+        metadata = next(iter(metadata_by_rank.values()))
+        local_ip = getattr(metadata, "local_ip", "")
+        te_rpc_port = getattr(metadata, "te_rpc_port", None)
+        if getattr(metadata, "tp_rank", None) != 0 or not local_ip:
+            return None
+        if not isinstance(te_rpc_port, int) or te_rpc_port <= 0:
+            return None
+        parallel_config = self.vllm_config.parallel_config
+        local_dp_rank = getattr(parallel_config, "data_parallel_rank_local", None)
+        route_dp_rank = (
+            local_dp_rank
+            if getattr(parallel_config, "local_engines_only", False)
+            and local_dp_rank is not None
+            else parallel_config.data_parallel_rank
+        )
+        return {
+            "dp_rank": route_dp_rank,
+            "segment": f"{local_ip}:{te_rpc_port}",
+        }
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         return self.model_runner.get_kv_cache_spec()

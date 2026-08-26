@@ -246,6 +246,12 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
             # This is really strange since vLLM slices them as well
             block_table_tensor=self.block_table_tensor,
             slot_mapping=self.slot_mapping,
+            # Preserve the independent Group-1 address space for the MTP
+            # drafter. Dropping either field here makes the SFA draft layer
+            # fall back to Group-0 addresses after padded target metadata is
+            # converted to its unpadded view.
+            indexer_block_table_tensor=self.indexer_block_table_tensor,
+            indexer_slot_mapping=self.indexer_slot_mapping,
             causal=self.causal,
             actual_seq_lengths_q=self.actual_seq_lengths_q[:num_actual_tokens],
             positions=self.positions,
@@ -254,6 +260,11 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
             num_input_tokens=self.num_input_tokens,
             prefill_context_parallel_metadata=self.prefill_context_parallel_metadata,
             max_seq_len=self.max_seq_len,
+            prompt_lens_cpu=(
+                self.prompt_lens_cpu[:num_actual_reqs]
+                if self.prompt_lens_cpu is not None
+                else None
+            ),
             request_ids=(self.request_ids[:num_actual_reqs] if self.request_ids is not None else None),
             cold_compact_resumes=self.cold_compact_resumes[
                 :num_actual_reqs
@@ -366,9 +377,25 @@ def staged_sfa_connector_supports_sparse_load() -> bool:
         return False
 
 
+def unwrap_staged_sfa_connector_metadata(metadata: Any) -> Any:
+    """Select staged-SFA child metadata when the active connector is wrapped."""
+    if not has_kv_transfer_group() or not is_v1_kv_transfer_group():
+        return metadata
+    connector = get_kv_transfer_group()
+    unwrap = getattr(
+        connector, "_unwrap_staged_sfa_connector_metadata", None
+    )
+    return unwrap(metadata) if callable(unwrap) else metadata
+
+
 def _dsa_remap_frontier(load_spec: Any) -> int:
     """Derive the operator boundary without changing LMCache commit progress."""
-    if load_spec is None or not getattr(load_spec, "can_load", False):
+    if load_spec is None:
+        return 0
+    cold_compact_resume = bool(
+        getattr(load_spec, "dsa_cold_compact_resume", False)
+    )
+    if not getattr(load_spec, "can_load", False) and not cold_compact_resume:
         return 0
     remap_value = getattr(load_spec, "dsa_remap_frontier", None)
     committed_value = (
@@ -409,13 +436,15 @@ def get_lmcache_sparse_cached_tokens(request_ids: Any) -> list[int]:
             "staged sparse selective-load/frontier contract."
         )
 
-    get_metadata = getattr(get_kv_transfer_group(), "_get_connector_metadata", None)
+    connector = get_kv_transfer_group()
+    get_metadata = getattr(connector, "_get_connector_metadata", None)
     if not callable(get_metadata):
         raise RuntimeError("[SFA sparse remap] connector frontier metadata is unavailable.")
     try:
         metadata = get_metadata()
     except Exception as exc:
         raise RuntimeError("[SFA sparse remap] connector frontier metadata lookup failed.") from exc
+    metadata = unwrap_staged_sfa_connector_metadata(metadata)
 
     reason, frontiers, _ = staged_sfa_metadata_sparse_route(
         metadata,
@@ -542,7 +571,7 @@ def staged_sfa_metadata_sparse_load(
     reason, frontiers, _ = staged_sfa_metadata_sparse_route(
         metadata, request_ids
     )
-    return reason, frontiers
+    return reason, frontiers if reason == StagedSFARouteReason.ELIGIBLE else ()
 
 
 def wait_for_kv_layer_from_connector(
