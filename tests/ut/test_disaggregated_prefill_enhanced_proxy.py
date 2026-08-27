@@ -1,4 +1,5 @@
 import asyncio
+import json
 import time
 import unittest
 from types import SimpleNamespace
@@ -47,12 +48,31 @@ def _prime_remote_fill(state, dp_rank: int = 0):
     return decoder
 
 
+def _reserve_instance(state, request_id: str = "request", tokens: int = 100):
+    prefiller_score = state.calculate_prefill_scores(tokens)
+    decoder_score = state.calculate_decode_scores(tokens)
+    prefiller_idx = state.select_prefiller(prefiller_score)
+    state.release_prefiller(prefiller_idx, prefiller_score)
+    decoder_idx = state.select_decoder(decoder_score)
+    return proxy.InstanceInfo(
+        request_id,
+        prefiller_idx,
+        prefiller_score,
+        state.prefillers[prefiller_idx],
+        decoder_idx,
+        decoder_score,
+        state.decoders[decoder_idx],
+    )
+
+
 class TestEnhancedRemoteFillProxy(unittest.TestCase):
     def setUp(self) -> None:
         proxy.global_args = SimpleNamespace(
             max_retries=3,
             retry_delay=0.001,
             use_original_lb=True,
+            backend_request_timeout=600.0,
+            decoder_read_timeout=120.0,
         )
 
     def tearDown(self) -> None:
@@ -99,15 +119,56 @@ class TestEnhancedRemoteFillProxy(unittest.TestCase):
         )
         proxy.proxy_state = state
         decoder = _prime_remote_fill(state)
-        decoder.decoder_rank_active_tokens[0] = 10.0
+        decoder.decoder_remote_fill[1] = dict(decoder.decoder_remote_fill[0]) | {
+            "destination_dp_rank": 1
+        }
+        decoder.decoder_rank_active_tokens = {0: 10.0, 1: 0.0}
         decoder.decoder_placement_discovered_at = 0.0
         with patch.object(
             proxy,
             "_discover_decoder_remote_fill",
-            AsyncMock(return_value=decoder.decoder_remote_fill),
+            AsyncMock(return_value={1: decoder.decoder_remote_fill[1]}),
         ):
-            asyncio.run(state.ensure_decoder_remote_fill(decoder))
-        self.assertEqual(decoder.decoder_rank_active_tokens, {0: 10.0})
+            asyncio.run(
+                state.ensure_decoder_remote_fill(decoder, wait_for_result=True)
+            )
+        self.assertEqual(decoder.decoder_rank_active_tokens, {0: 10.0, 1: 0.0})
+        state.release_decoder(0, 10.0, 0)
+        self.assertEqual(decoder.decoder_rank_active_tokens, {1: 0.0})
+
+    def test_stale_placement_refresh_does_not_block_selection(self):
+        state = proxy.ProxyState(
+            [("prefiller", 8001)],
+            [("decoder", 8002)],
+            enable_remote_lmcache_store=True,
+        )
+        proxy.proxy_state = state
+        decoder = _prime_remote_fill(state)
+        decoder.decoder_placement_discovered_at = 0.0
+        decoder.decoder_placement_last_attempt_at = 0.0
+
+        async def run() -> None:
+            started = asyncio.Event()
+            release = asyncio.Event()
+
+            async def discover(*args, **kwargs):
+                started.set()
+                await release.wait()
+                return decoder.decoder_remote_fill
+
+            with patch.object(
+                proxy,
+                "_discover_decoder_remote_fill",
+                side_effect=discover,
+            ):
+                await state.ensure_decoder_remote_fill(decoder)
+                await started.wait()
+                self.assertIsNotNone(decoder.decoder_placement_task)
+                self.assertIn(0, decoder.decoder_remote_fill)
+                release.set()
+                await decoder.decoder_placement_task
+
+        asyncio.run(run())
 
     def test_remote_fill_selects_decoder_first_and_scrubs_capability(self):
         state = proxy.ProxyState(
@@ -381,10 +442,9 @@ class TestEnhancedRemoteFillProxy(unittest.TestCase):
 
             async def aiter_bytes(self):
                 yield b"data: {}\n\n"
+                yield b"data: [DONE]\n\n"
 
         class Client:
-            base_url = "http://decoder:8002/v1"
-
             def stream(self, method, endpoint, **kwargs):
                 captured.update(method=method, endpoint=endpoint, **kwargs)
                 return Response()
@@ -392,7 +452,7 @@ class TestEnhancedRemoteFillProxy(unittest.TestCase):
         async def collect() -> list[bytes]:
             return [
                 chunk
-                async for chunk in proxy.stream_service_response_with_retry(
+                async for chunk in proxy.stream_decoder_response(
                     Client(),
                     "/completions",
                     {},
@@ -401,15 +461,15 @@ class TestEnhancedRemoteFillProxy(unittest.TestCase):
                 )
             ]
 
-        self.assertEqual(asyncio.run(collect()), [b"data: {}\n\n"])
+        self.assertEqual(
+            asyncio.run(collect()),
+            [b"data: {}\n\n", b"data: [DONE]\n\n"],
+        )
         self.assertEqual(captured["headers"]["X-data-parallel-rank"], "3")
         self.assertEqual(captured["json"], {})
 
-    def test_decoder_transport_does_not_retry_after_streaming_started(self):
+    def test_decoder_transport_rejects_clean_eof_without_done(self):
         class Response:
-            def __init__(self, attempt: int):
-                self.attempt = attempt
-
             async def __aenter__(self):
                 return self
 
@@ -420,36 +480,207 @@ class TestEnhancedRemoteFillProxy(unittest.TestCase):
                 return None
 
             async def aiter_bytes(self):
-                yield f"data: {self.attempt}\n\n".encode()
-                if self.attempt == 1:
-                    raise httpx.ReadError(
-                        "stream failed",
-                        request=httpx.Request("POST", "http://decoder"),
-                    )
+                yield b"data: {}\n\n"
+
+        class Client:
+            def stream(self, *args, **kwargs):
+                return Response()
+
+        async def collect() -> None:
+            async for _ in proxy.stream_decoder_response(
+                Client(), "/completions", {}, "request"
+            ):
+                pass
+
+        with self.assertRaisesRegex(RuntimeError, "without \\[DONE\\]"):
+            asyncio.run(collect())
+
+    def test_decoder_transport_does_not_retry_after_streaming_started(self):
+        class Response:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+            def raise_for_status(self):
+                return None
+
+            async def aiter_bytes(self):
+                yield b"data: 1\n\n"
+                raise httpx.ReadError(
+                    "stream failed",
+                    request=httpx.Request("POST", "http://decoder"),
+                )
 
         class Client:
             calls = 0
 
             def stream(self, *args, **kwargs):
                 self.calls += 1
-                return Response(self.calls)
+                return Response()
 
         client = Client()
 
-        async def collect() -> list[bytes]:
-            return [
-                chunk
-                async for chunk in proxy.stream_service_response_with_retry(
+        chunks = []
+
+        async def collect() -> None:
+            async for chunk in proxy.stream_decoder_response(
                     client,
                     "/completions",
                     {},
                     "request",
-                    base_delay=0,
-                )
-            ]
+                ):
+                chunks.append(chunk)
 
-        self.assertEqual(asyncio.run(collect()), [b"data: 1\n\n"])
+        with self.assertRaises(httpx.ReadError):
+            asyncio.run(collect())
+        self.assertEqual(chunks, [b"data: 1\n\n"])
         self.assertEqual(client.calls, 1)
+
+    def test_prefiller_timeout_restores_unsent_abort_ids(self):
+        state = proxy.ProxyState([("prefiller", 8001)], [("decoder", 8002)])
+        proxy.proxy_state = state
+        state.prefillers[0].aborted_requests.add("old-request")
+        proxy.global_args.backend_request_timeout = 0.01
+
+        class Client:
+            calls = 0
+
+            async def post(self, *args, **kwargs):
+                self.calls += 1
+                await asyncio.Future()
+
+        client = Client()
+        with self.assertRaises(asyncio.TimeoutError):
+            asyncio.run(
+                proxy.send_request_to_service(
+                    client,
+                    0,
+                    "/completions",
+                    {},
+                    "request",
+                )
+            )
+        self.assertEqual(client.calls, 1)
+        self.assertEqual(
+            state.prefillers[0].aborted_requests,
+            {"old-request"},
+        )
+
+    def test_nonstream_decoder_response_is_returned_eagerly(self):
+        state = proxy.ProxyState([("prefiller", 8001)], [("decoder", 8002)])
+        proxy.proxy_state = state
+        info = _reserve_instance(state)
+        request = SimpleNamespace(
+            json=AsyncMock(return_value={"prompt": "hello", "stream": False}),
+            body=AsyncMock(return_value=b"hello"),
+        )
+        backend_response = httpx.Response(
+            200,
+            json={"choices": [{"text": "ok", "finish_reason": "stop"}]},
+            headers={"content-type": "application/json"},
+            request=httpx.Request("POST", "http://decoder"),
+        )
+        with (
+            patch.object(
+                proxy,
+                "_handle_select_instance",
+                AsyncMock(return_value=info),
+            ),
+            patch.object(
+                info.decoder.client,
+                "post",
+                AsyncMock(return_value=backend_response),
+            ),
+        ):
+            response = asyncio.run(
+                proxy._handle_completions("/completions", request)
+            )
+
+        self.assertNotIsInstance(response, proxy.StreamingResponse)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(json.loads(response.body)["choices"][0]["text"], "ok")
+        self.assertEqual(state.request_num, 0)
+        self.assertEqual(state.prefillers[0].active_kv_cache, 0)
+        self.assertEqual(state.decoders[0].active_tokens, 0)
+
+    def test_stream_failure_emits_error_and_done(self):
+        state = proxy.ProxyState([("prefiller", 8001)], [("decoder", 8002)])
+        proxy.proxy_state = state
+        info = _reserve_instance(state)
+        request = SimpleNamespace(
+            json=AsyncMock(return_value={"prompt": "hello", "stream": True}),
+            body=AsyncMock(return_value=b"hello"),
+        )
+
+        async def stream(*args, **kwargs):
+            yield b'data: {"choices":[{"text":"x"}]}\n\n'
+            raise httpx.ReadError(
+                "stream failed",
+                request=httpx.Request("POST", "http://decoder"),
+            )
+
+        with (
+            patch.object(
+                proxy,
+                "_handle_select_instance",
+                AsyncMock(return_value=info),
+            ),
+            patch.object(proxy, "stream_decoder_response", stream),
+        ):
+            response = asyncio.run(
+                proxy._handle_completions("/completions", request)
+            )
+
+            async def consume() -> list[bytes]:
+                return [chunk async for chunk in response.body_iterator]
+
+            chunks = asyncio.run(consume())
+
+        self.assertIn(b'"code":"decoder_backend_error"', chunks[-2])
+        self.assertEqual(chunks[-1], b"data: [DONE]\n\n")
+        self.assertEqual(state.request_num, 0)
+        self.assertEqual(state.prefillers[0].active_kv_cache, 0)
+        self.assertEqual(state.decoders[0].active_tokens, 0)
+
+    def test_recompute_after_forwarded_event_fails_without_replacement(self):
+        state = proxy.ProxyState([("prefiller", 8001)], [("decoder", 8002)])
+        proxy.proxy_state = state
+        info = _reserve_instance(state)
+        request = SimpleNamespace(
+            json=AsyncMock(return_value={"prompt": "hello", "stream": True}),
+            body=AsyncMock(return_value=b"hello"),
+        )
+
+        async def stream(*args, **kwargs):
+            yield b'data: {"choices":[{"text":"visible"}]}\n\n'
+            yield (
+                b'data: {"choices":[{"delta":{},'
+                b'"finish_reason":"recomputed"}]}\n\n'
+            )
+
+        select = AsyncMock(return_value=info)
+        with (
+            patch.object(proxy, "_handle_select_instance", select),
+            patch.object(proxy, "stream_decoder_response", stream),
+        ):
+            response = asyncio.run(
+                proxy._handle_completions("/completions", request)
+            )
+
+            async def consume() -> list[bytes]:
+                return [chunk async for chunk in response.body_iterator]
+
+            chunks = asyncio.run(consume())
+
+        self.assertEqual(select.await_count, 1)
+        self.assertEqual(len(chunks), 3)
+        self.assertIn(b'"code":"decoder_recompute_error"', chunks[-2])
+        self.assertEqual(chunks[-1], b"data: [DONE]\n\n")
+        self.assertEqual(state.request_num, 0)
+        self.assertEqual(state.prefillers[0].active_kv_cache, 0)
+        self.assertEqual(state.decoders[0].active_tokens, 0)
 
     def test_failed_recompute_does_not_release_old_attempt_twice(self):
         state = proxy.ProxyState([("prefiller", 8001)], [("decoder", 8002)])
@@ -486,7 +717,7 @@ class TestEnhancedRemoteFillProxy(unittest.TestCase):
         state.release_decoder = release_decoder
         with (
             patch.object(proxy, "_handle_select_instance", select),
-            patch.object(proxy, "stream_service_response_with_retry", stream),
+            patch.object(proxy, "stream_decoder_response", stream),
         ):
             response = asyncio.run(proxy._handle_completions("/completions", request))
 

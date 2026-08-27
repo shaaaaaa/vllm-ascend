@@ -57,6 +57,9 @@ _REMOTE_FILL_VERIFICATION_CAPABILITY_BYTES = 32
 _DECODER_PLACEMENT_DISCOVERY_TIMEOUT_SECONDS = 2.0
 _DECODER_PLACEMENT_POSITIVE_TTL_SECONDS = 30.0
 _DECODER_PLACEMENT_NEGATIVE_TTL_SECONDS = 3.0
+_BACKEND_CONNECT_TIMEOUT_SECONDS = 10.0
+_BACKEND_REQUEST_TIMEOUT_SECONDS = 600.0
+_DECODER_READ_TIMEOUT_SECONDS = 120.0
 
 try:
     import uvloop
@@ -139,7 +142,7 @@ class ServerState:
         self.decoder_placement_discovered_at = 0.0
         self.decoder_placement_last_attempt_at = 0.0
         self.decoder_rank_active_tokens: dict[int, float] = {}
-        self.decoder_placement_task: asyncio.Task[dict[int, dict[str, Any]]] | None = None
+        self.decoder_placement_task: asyncio.Task[None] | None = None
 
     def __eq__(self, other):
         self_host = self.host.replace("localhost", "0.0.0.0").replace("127.0.0.1", "0.0.0.0")
@@ -1238,6 +1241,11 @@ class ProxyState:
                     0.0,
                     server.decoder_rank_active_tokens[dp_rank] - token_count,
                 )
+                if (
+                    server.decoder_rank_active_tokens[dp_rank] == 0
+                    and dp_rank not in server.decoder_remote_fill
+                ):
+                    server.decoder_rank_active_tokens.pop(dp_rank)
             if self.decoders[idx].active_tokens >= token_count:
                 self.decoders[idx].active_tokens -= token_count
             elif self.decoders[idx].active_tokens > 0:
@@ -1247,18 +1255,21 @@ class ProxyState:
     def assign_decoder_rank(
         self, reservation: DecoderReservation
     ) -> DecoderReservation:
-        server = reservation.server
-        if not server.decoder_remote_fill:
+        with self._state_lock:
+            server = reservation.server
+            if not server.decoder_remote_fill:
+                return reservation
+            dp_rank = min(
+                server.decoder_remote_fill,
+                key=lambda rank: (server.decoder_rank_active_tokens[rank], rank),
+            )
+            server.decoder_rank_active_tokens[dp_rank] += reservation.decoder_score
+            reservation.dp_rank = dp_rank
+            remote_fill = server.decoder_remote_fill.get(dp_rank)
+            reservation.remote_fill = (
+                dict(remote_fill) if remote_fill is not None else None
+            )
             return reservation
-        dp_rank = min(
-            server.decoder_remote_fill,
-            key=lambda rank: (server.decoder_rank_active_tokens[rank], rank),
-        )
-        server.decoder_rank_active_tokens[dp_rank] += reservation.decoder_score
-        reservation.dp_rank = dp_rank
-        remote_fill = server.decoder_remote_fill.get(dp_rank)
-        reservation.remote_fill = dict(remote_fill) if remote_fill is not None else None
-        return reservation
 
     def _decoder_placement_is_fresh(self, server: ServerState, now: float) -> bool:
         if server.decoder_placement_discovered_at:
@@ -1267,47 +1278,58 @@ class ProxyState:
                 if server.decoder_remote_fill
                 else _DECODER_PLACEMENT_NEGATIVE_TTL_SECONDS
             )
-            return now - server.decoder_placement_discovered_at < ttl
+            if now - server.decoder_placement_discovered_at < ttl:
+                return True
         return (
             server.decoder_placement_last_attempt_at > 0
             and now - server.decoder_placement_last_attempt_at
             < _DECODER_PLACEMENT_NEGATIVE_TTL_SECONDS
         )
 
-    async def ensure_decoder_remote_fill(self, server: ServerState) -> None:
+    async def _refresh_decoder_remote_fill(self, server: ServerState) -> None:
+        task = asyncio.current_task()
+        try:
+            remote_fill = await _discover_decoder_remote_fill(
+                server,
+                timeout_seconds=_DECODER_PLACEMENT_DISCOVERY_TIMEOUT_SECONDS,
+            )
+        except (httpx.RequestError, httpx.HTTPStatusError, ValueError) as exc:
+            logger.warning(
+                "Mooncake placement discovery failed for decoder %s: %s",
+                server.url,
+                exc,
+            )
+        else:
+            with self._state_lock:
+                for dp_rank in remote_fill:
+                    server.decoder_rank_active_tokens.setdefault(dp_rank, 0.0)
+                server.decoder_remote_fill = remote_fill
+                for dp_rank, load in list(
+                    server.decoder_rank_active_tokens.items()
+                ):
+                    if dp_rank not in remote_fill and load == 0:
+                        server.decoder_rank_active_tokens.pop(dp_rank)
+                server.decoder_placement_discovered_at = time.monotonic()
+        finally:
+            if server.decoder_placement_task is task:
+                server.decoder_placement_task = None
+
+    async def ensure_decoder_remote_fill(
+        self,
+        server: ServerState,
+        *,
+        wait_for_result: bool = False,
+    ) -> None:
         now = time.monotonic()
         if self._decoder_placement_is_fresh(server, now):
             return
         task = server.decoder_placement_task
         if task is None:
             server.decoder_placement_last_attempt_at = now
-            task = asyncio.create_task(
-                _discover_decoder_remote_fill(
-                    server,
-                    timeout_seconds=_DECODER_PLACEMENT_DISCOVERY_TIMEOUT_SECONDS,
-                )
-            )
+            task = asyncio.create_task(self._refresh_decoder_remote_fill(server))
             server.decoder_placement_task = task
-        try:
-            remote_fill = await asyncio.shield(task)
-        except (httpx.RequestError, httpx.HTTPStatusError, ValueError) as exc:
-            if server.decoder_placement_task is task:
-                server.decoder_placement_task = None
-                server.decoder_remote_fill = {}
-                server.decoder_placement_discovered_at = 0.0
-            logger.warning(
-                "Mooncake placement discovery failed for decoder %s: %s",
-                server.url,
-                exc,
-            )
-            return
-        server.decoder_remote_fill = remote_fill
-        server.decoder_rank_active_tokens = {
-            dp_rank: server.decoder_rank_active_tokens.get(dp_rank, 0.0)
-            for dp_rank in remote_fill
-        }
-        server.decoder_placement_discovered_at = time.monotonic()
-        server.decoder_placement_task = None
+        if wait_for_result:
+            await asyncio.shield(task)
 
     async def add_instances(self, instance_type: str, instances: list[ServerState]) -> tuple[list[str], list[str]]:
         added_nodes, waiting_nodes = [], []
@@ -1654,14 +1676,44 @@ async def _discover_decoder_remote_fill(
 # Request Handlers (from original)
 # ============================================================================
 
+def _http_timeout(read_timeout: float) -> httpx.Timeout:
+    return httpx.Timeout(
+        connect=_BACKEND_CONNECT_TIMEOUT_SECONDS,
+        read=read_timeout,
+        write=_BACKEND_CONNECT_TIMEOUT_SECONDS,
+        pool=_BACKEND_CONNECT_TIMEOUT_SECONDS,
+    )
+
+
+def _decoder_headers(
+    request_id: str,
+    decoder_dp_rank: int | None,
+) -> dict[str, str]:
+    headers = {
+        "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}",
+        "X-Request-Id": request_id,
+    }
+    if decoder_dp_rank is not None:
+        headers["X-data-parallel-rank"] = str(decoder_dp_rank)
+    return headers
+
+
+def _sse_error(code: str, message: str) -> bytes:
+    error = {"error": {"message": message, "type": "backend_error", "code": code}}
+    payload = json.dumps(error, separators=(",", ":"))
+    return f"data: {payload}\n\n".encode()
+
+
+class _IncompleteDecoderStreamError(RuntimeError):
+    pass
+
+
 async def send_request_to_service(
     client: httpx.AsyncClient,
     prefiller_id: int,
     endpoint: str,
     req_data: dict,
     request_id: str,
-    max_retries: int = 3,
-    base_delay: float = 0.2,
     remote_fill_handoff: dict[str, Any] | None = None,
 ):
     aborted_requests = proxy_state.acquire_aborted_prefiller_requests(prefiller_id)
@@ -1687,74 +1739,59 @@ async def send_request_to_service(
     if "stream_options" in req_data:
         del req_data["stream_options"]
     headers = {"Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}", "X-Request-Id": request_id}
-    last_exc = None
-    for attempt in range(1, max_retries + 1):
-        try:
-            response = await client.post(endpoint, json=req_data, headers=headers)
-            response.raise_for_status()
-            return response
-        except (httpx.RequestError, httpx.HTTPStatusError) as e:
-            logger.warning(f"Attempt {attempt} failed for {endpoint}: {str(e)}")
-            last_exc = e
-            if attempt < max_retries:
-                await asyncio.sleep(base_delay * (2 ** (attempt - 1)))
-            else:
-                logger.error(f"All {max_retries} attempts failed for {endpoint}.")
-                raise last_exc
+    try:
+        response = await asyncio.wait_for(
+            client.post(
+                endpoint,
+                json=req_data,
+                headers=headers,
+                timeout=_http_timeout(global_args.backend_request_timeout),
+            ),
+            timeout=global_args.backend_request_timeout,
+        )
+        response.raise_for_status()
+        return response
+    except BaseException:
+        if prefiller_id < len(proxy_state.prefillers):
+            proxy_state.prefillers[prefiller_id].aborted_requests.update(
+                aborted_requests
+            )
+        raise
 
 
-async def stream_service_response_with_retry(
+async def stream_decoder_response(
     client: httpx.AsyncClient,
     endpoint: str,
     req_data: dict,
     request_id: str,
-    max_retries: int = 3,
-    base_delay: float = 0.2,
     decoder_dp_rank: int | None = None,
 ):
-    headers = {"Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}", "X-Request-Id": request_id}
-    if decoder_dp_rank is not None:
-        headers["X-data-parallel-rank"] = str(decoder_dp_rank)
-    for attempt in range(1, max_retries + 1):
-        first_chunk_sent = False
-        try:
-            async with client.stream("POST", endpoint, json=req_data, headers=headers) as response:
-                response.raise_for_status()
-                sse_buffer = bytearray()
-                async for raw_chunk in response.aiter_bytes():
-                    sse_buffer.extend(raw_chunk)
-                    while b"\n\n" in sse_buffer:
-                        event_end = sse_buffer.index(b"\n\n") + 2
-                        event = bytes(sse_buffer[:event_end])
-                        del sse_buffer[:event_end]
-                        first_chunk_sent = True
-                        logger.debug(f"[SSE_BUFFER] yield event: {event[:300]}")
-                        yield event
-                if sse_buffer:
-                    first_chunk_sent = True
-                    yield bytes(sse_buffer)
-                return
-        except (httpx.RequestError, httpx.HTTPStatusError) as e:
-            if first_chunk_sent:
-                logger.error(f"Streaming to client interrupted after response started: {str(e)}")
-                return
-            if attempt < max_retries:
-                logger.warning(f"Attempt {attempt} failed for streaming {endpoint}: {str(e)}")
-                await asyncio.sleep(base_delay * (2 ** (attempt - 1)))
-            else:
-                logger.error(f"All {max_retries} attempts failed for streaming {endpoint}.")
-                raise e
-        except Exception as e:
-            if first_chunk_sent:
-                logger.error(f"Streaming to client interrupted after response started: {str(e)}")
-                return
-            else:
-                if attempt < max_retries:
-                    logger.warning(f"Attempt {attempt} failed for streaming {endpoint}: {str(e)}")
-                    await asyncio.sleep(base_delay * (2 ** (attempt - 1)))
-                else:
-                    logger.error(f"All {max_retries} attempts failed for streaming {endpoint}.")
-                    raise e
+    async with client.stream(
+        "POST",
+        endpoint,
+        json=req_data,
+        headers=_decoder_headers(request_id, decoder_dp_rank),
+        timeout=_http_timeout(global_args.decoder_read_timeout),
+    ) as response:
+        response.raise_for_status()
+        sse_buffer = bytearray()
+        async for raw_chunk in response.aiter_bytes():
+            sse_buffer.extend(raw_chunk)
+            while b"\n\n" in sse_buffer:
+                event_end = sse_buffer.index(b"\n\n") + 2
+                event = bytes(sse_buffer[:event_end])
+                del sse_buffer[:event_end]
+                logger.debug(f"[SSE_BUFFER] yield event: {event[:300]}")
+                yield event
+                if event == b"data: [DONE]\n\n":
+                    return
+        if sse_buffer:
+            raise _IncompleteDecoderStreamError(
+                "decoder stream ended with an incomplete SSE event"
+            )
+        raise _IncompleteDecoderStreamError(
+            "decoder stream ended without [DONE]"
+        )
 
 
 async def _handle_select_instance(
@@ -1794,8 +1831,6 @@ async def _handle_select_instance(
             api,
             req_data,
             request_id,
-            max_retries=(1 if remote_fill_handoff else global_args.max_retries),
-            base_delay=global_args.retry_delay,
             remote_fill_handoff=remote_fill_handoff,
         )
         proxy_state.release_prefiller(prefiller_idx, prefiller_score)
@@ -2281,7 +2316,60 @@ async def _handle_completions(api: str, request: Request):
         
         original_request_id = instance_info.request_id
         stream_flag = bool(req_data.get("stream", False))
-        chat_flag = "messages" in req_data
+
+        if not stream_flag:
+            retry_count = 0
+            while True:
+                dp_rank = instance_info.reservation.dp_rank if instance_info.reservation else None
+                response = await asyncio.wait_for(
+                    instance_info.decoder.client.post(
+                        api,
+                        json=req_data,
+                        headers=_decoder_headers(instance_info.request_id, dp_rank),
+                        timeout=_http_timeout(global_args.backend_request_timeout),
+                    ),
+                    timeout=global_args.backend_request_timeout,
+                )
+                response.raise_for_status()
+                if not released_kv:
+                    proxy_state.release_prefiller_kv(instance_info.prefiller_idx, instance_info.prefiller_score)
+                    released_kv = True
+                try:
+                    response_json = response.json()
+                except (TypeError, ValueError):
+                    response_json = None
+                if not isinstance(response_json, dict):
+                    return Response(
+                        content=json.dumps({"error": "Decoder returned malformed JSON"}),
+                        status_code=502,
+                        media_type="application/json",
+                    )
+                choices = response_json.get("choices") or []
+                choice = choices[0] if choices and isinstance(choices[0], dict) else {}
+                stop_reason = choice.get("stop_reason") or choice.get("finish_reason")
+                if stop_reason not in {"recomputed", "force_free_recomputed"}:
+                    content_type = response.headers.get("content-type", "application/json")
+                    return Response(
+                        content=response.content,
+                        status_code=response.status_code,
+                        headers={"content-type": content_type},
+                    )
+                retry_count += 1
+                if retry_count > MAX_RECOMPUTE_RETRIES:
+                    return Response(
+                        content=json.dumps({"error": "Decoder recompute limit exceeded"}),
+                        status_code=502,
+                        media_type="application/json",
+                    )
+                _release_decoder_reservation(instance_info)
+                instance_info = await _handle_select_instance(
+                    api,
+                    req_data,
+                    request_length,
+                    analysis,
+                    original_request_id=original_request_id,
+                )
+                released_kv = False
         
         async def generate_stream():
             nonlocal instance_info, released_kv
@@ -2295,22 +2383,23 @@ async def _handle_completions(api: str, request: Request):
             final_usage_completion_tokens = None
             response_chunks_raw = []
             empty_delta_count = 0
+            attempt_event_forwarded = False
+            decoder_events = None
             try:
                 while retry:
                     retry = False
-                    async for chunk in stream_service_response_with_retry(
+                    decoder_events = stream_decoder_response(
                         instance_info.decoder.client,
                         api,
                         req_data,
                         request_id=instance_info.request_id,
-                        max_retries=global_args.max_retries,
-                        base_delay=global_args.retry_delay,
                         decoder_dp_rank=(
                             instance_info.reservation.dp_rank
                             if instance_info.reservation
                             else None
                         ),
-                    ):
+                    )
+                    async for chunk in decoder_events:
                         if not released_kv and chunk:
                             proxy_state.release_prefiller_kv(instance_info.prefiller_idx, instance_info.prefiller_score)
                             released_kv = True
@@ -2319,6 +2408,7 @@ async def _handle_completions(api: str, request: Request):
                             chunk_str = chunk.decode("utf-8").strip()
                         except UnicodeDecodeError:
                             logger.warning(f"[PARSE] {original_request_id}: UnicodeDecodeError, parse skipped (chunk still forwarded): {repr(chunk[:100])}")
+                            attempt_event_forwarded = True
                             yield chunk
                             continue
                         if not chunk_str:
@@ -2326,16 +2416,19 @@ async def _handle_completions(api: str, request: Request):
                         if chunk_str.startswith("data: "):
                             chunk_str = chunk_str[len("data: ") :]
                         if chunk_str == "[DONE]":
+                            attempt_event_forwarded = True
                             yield chunk
                             continue
                         try:
                             chunk_json = json.loads(chunk_str)
                         except json.JSONDecodeError:
                             logger.warning(f"[PARSE] {original_request_id}: JSONDecodeError, parse skipped (chunk still forwarded): {chunk_str[:200]}")
+                            attempt_event_forwarded = True
                             yield chunk
                             continue
                         if not isinstance(chunk_json, dict):
                             logger.warning(f"[PARSE] {original_request_id}: chunk_json is not dict (type={type(chunk_json).__name__}), parse skipped (chunk still forwarded): {chunk_str[:200]}")
+                            attempt_event_forwarded = True
                             yield chunk
                             continue
                         choices = chunk_json.get("choices") or []
@@ -2345,6 +2438,7 @@ async def _handle_completions(api: str, request: Request):
                                 final_usage_completion_tokens = usage.get("completion_tokens")
                             if chunk_json:
                                 logger.debug(f"[PARSE] {original_request_id}: no valid choices, extracted usage: {usage}")
+                            attempt_event_forwarded = True
                             yield chunk
                             continue
                         
@@ -2354,24 +2448,23 @@ async def _handle_completions(api: str, request: Request):
                         content = delta.get("content") or message.get("content") or choice.get("text") or ""
                         generated_token += content
 
-                        if stream_flag:
-                            delta_is_empty = (
-                                delta.get("role") is None
-                                and delta.get("content") is None
-                                and delta.get("tool_calls") is None
-                                and delta.get("function_call") is None
-                                and delta.get("reasoning_content") is None
-                                and delta.get("reasoning") is None
-                            )
-                            if delta_is_empty:
-                                empty_delta_count += 1
-                                if empty_delta_count == 1:
-                                    logger.debug(
-                                        f"[EMPTY_DELTA] {original_request_id}: "
-                                        f"first empty delta encountered, finish_reason={choice.get('finish_reason')}, "
-                                        f"stop_reason={choice.get('stop_reason')}, "
-                                        f"raw_chunk_preview={chunk_str[:200]}"
-                                    )
+                        delta_is_empty = (
+                            delta.get("role") is None
+                            and delta.get("content") is None
+                            and delta.get("tool_calls") is None
+                            and delta.get("function_call") is None
+                            and delta.get("reasoning_content") is None
+                            and delta.get("reasoning") is None
+                        )
+                        if delta_is_empty:
+                            empty_delta_count += 1
+                            if empty_delta_count == 1:
+                                logger.debug(
+                                    f"[EMPTY_DELTA] {original_request_id}: "
+                                    f"first empty delta encountered, finish_reason={choice.get('finish_reason')}, "
+                                    f"stop_reason={choice.get('stop_reason')}, "
+                                    f"raw_chunk_preview={chunk_str[:200]}"
+                                )
 
                         if delta.get("tool_calls") is not None or message.get("tool_calls") is not None:
                             has_tool_calls = True
@@ -2382,11 +2475,7 @@ async def _handle_completions(api: str, request: Request):
                         usage = chunk_json.get("usage") or {}
                         if usage.get("completion_tokens") is not None:
                             final_usage_completion_tokens = usage.get("completion_tokens")
-                        completion_tokens = (
-                            (completion_tokens + 1)
-                            if stream_flag
-                            else (completion_tokens + usage.get("completion_tokens"))
-                        )
+                        completion_tokens += 1
                         if stop_reason and stop_reason not in ("recomputed", "force_free_recomputed"):
                             final_stop_reason = stop_reason
                         if stop_reason in ("recomputed", "force_free_recomputed"):
@@ -2399,13 +2488,24 @@ async def _handle_completions(api: str, request: Request):
                                 f"kv_in_req={bool(req_data.get('kv_transfer_params'))}, "
                                 f"output_tokens_so_far={final_usage_completion_tokens}"
                             )
+                            if attempt_event_forwarded:
+                                yield _sse_error(
+                                    "decoder_recompute_error",
+                                    "Decoder requested recompute after output was sent",
+                                )
+                                yield b"data: [DONE]\n\n"
+                                return
                             if retry_count > MAX_RECOMPUTE_RETRIES:
                                 logger.error(
                                     f"[RECOMPUTE] {original_request_id}: "
                                     f"max retries ({MAX_RECOMPUTE_RETRIES}) exceeded, giving up"
                                 )
-                                retry = False
-                                break
+                                yield _sse_error(
+                                    "decoder_recompute_error",
+                                    "Decoder recompute limit exceeded",
+                                )
+                                yield b"data: [DONE]\n\n"
+                                return
                             retry = True
                             
                             # Release old P/D resources before recompute replaces instance_info.
@@ -2422,46 +2522,24 @@ async def _handle_completions(api: str, request: Request):
                             final_usage_completion_tokens = None
                             response_chunks_raw = []
                             empty_delta_count = 0
-                            
-                            # Recalculate request length for recompute
-                            tmp_request_length = len(json.dumps(req_data).encode("utf-8"))
-                            new_analysis = None
-                            if proxy_state.vllm_token_counter:
-                                try:
-                                    token_info = await asyncio.to_thread(
-                                        proxy_state.vllm_token_counter.analyze_request,
-                                        messages=req_data.get("messages"), tools=req_data.get("tools"),
-                                    )
-                                    new_analysis = RequestAnalysis()
-                                    new_analysis.prompt_tokens = token_info.get("prompt_tokens", tmp_request_length)
-                                    new_analysis.analysis_time_ms = token_info.get("analysis_time_ms", 0)
-                                    new_analysis.system_tokens = token_info.get("system_tokens", 0)
-                                    new_analysis.tool_tokens = token_info.get("tool_tokens", 0)
-                                    new_analysis.content_tokens = token_info.get("content_tokens", 0)
-                                    tmp_request_length = new_analysis.prompt_tokens
-                                except Exception as e:
-                                    logger.debug(f"VLLMTokenCounter failed for recompute: {e}")
-                            if not new_analysis and proxy_state.tokenizer_analyzer:
-                                try:
-                                    new_analysis = await proxy_state.tokenizer_analyzer.analyze_request_async(req_data)
-                                    tmp_request_length = new_analysis.prompt_tokens
-                                except Exception as e:
-                                    logger.debug(f"Tokenizer failed for recompute: {e}")
-                            replacement = await _handle_select_instance(api, req_data, tmp_request_length, new_analysis, original_request_id=original_request_id)
-                            instance_info = replacement
+                            attempt_event_forwarded = False
+                            instance_info = await _handle_select_instance(
+                                api,
+                                req_data,
+                                request_length,
+                                analysis,
+                                original_request_id=original_request_id,
+                            )
                             released_kv = False
                             logger.info(
                                 f"[RECOMPUTE] {original_request_id}: "
                                 f"new_req_id={instance_info.request_id}"
                             )
                             break
-                        if retry_count > 0 and not stream_flag:
-                            if chat_flag:
-                                choice["message"]["content"] = generated_token
-                            else:
-                                choice["text"] = generated_token
-                            chunk = json.dumps(chunk_json).encode("utf-8")
+                        attempt_event_forwarded = True
                         yield chunk
+                    await decoder_events.aclose()
+                    decoder_events = None
             except Exception as e:
                 logger.error(
                     f"Error during streaming from decoder {instance_info.decoder.url}: {str(e)} "
@@ -2472,8 +2550,23 @@ async def _handle_completions(api: str, request: Request):
                 if not released_kv:
                     proxy_state.release_prefiller_kv(instance_info.prefiller_idx, instance_info.prefiller_score)
                     released_kv = True
+                if isinstance(e, (asyncio.TimeoutError, httpx.TimeoutException)):
+                    error_code = "decoder_timeout"
+                    error_message = "Decoder stream timed out"
+                elif isinstance(e, _IncompleteDecoderStreamError):
+                    error_code = "decoder_stream_incomplete"
+                    error_message = "Decoder stream ended before completion"
+                else:
+                    error_code = "decoder_backend_error"
+                    error_message = "Decoder stream interrupted"
+                yield _sse_error(error_code, error_message)
+                yield b"data: [DONE]\n\n"
             finally:
-                cleanup_current_request()
+                try:
+                    if decoder_events is not None:
+                        await decoder_events.aclose()
+                finally:
+                    cleanup_current_request()
                 if empty_delta_count > 0:
                     logger.debug(
                         f"[EMPTY_DELTA_SUMMARY] {original_request_id}: "
@@ -2644,6 +2737,14 @@ async def _handle_completions(api: str, request: Request):
         response_owns_cleanup = True
         return response
     
+    except asyncio.TimeoutError:
+        logger.error("Backend model request timed out")
+        return Response(
+            content=json.dumps({"error": "Backend model request timed out"}),
+            status_code=504,
+            media_type="application/json",
+        )
+
     except httpx.HTTPStatusError as e:
         # Backend returned error status code - propagate to client
         logger.error(f"Backend returned error status {e.response.status_code}: {str(e)}")
@@ -2662,10 +2763,10 @@ async def _handle_completions(api: str, request: Request):
     
     except httpx.RequestError as e:
         # Network error - backend unavailable
-        logger.error(f"Backend unavailable after retries: {str(e)}")
+        logger.error(f"Backend unavailable: {str(e)}")
         
         return Response(
-            content=json.dumps({"error": "Backend service unavailable after retries"}),
+            content=json.dumps({"error": "Backend service unavailable"}),
             status_code=503,
             media_type="application/json"
         )
@@ -2764,6 +2865,18 @@ def parse_args():
     )
     parser.add_argument("--max-retries", type=int, default=3, help="Maximum number of retries")
     parser.add_argument("--retry-delay", type=float, default=0.001, help="Base delay for exponential backoff")
+    parser.add_argument(
+        "--backend-request-timeout",
+        type=float,
+        default=_BACKEND_REQUEST_TIMEOUT_SECONDS,
+        help="Total prefiller and non-stream decoder timeout in seconds",
+    )
+    parser.add_argument(
+        "--decoder-read-timeout",
+        type=float,
+        default=_DECODER_READ_TIMEOUT_SECONDS,
+        help="Decoder streaming read-idle timeout in seconds",
+    )
     parser.add_argument("--max-waiting-retries", type=int, default=3, help="Maximum retries for waiting nodes")
     parser.add_argument("--waiting-retry-interval", type=float, default=10, help="Check interval for waiting nodes")
     # Enhanced arguments
@@ -2796,6 +2909,11 @@ def parse_args():
         raise ValueError("Number of prefiller hosts must match number of prefiller ports")
     if len(args.decoder_hosts) != len(args.decoder_ports):
         raise ValueError("Number of decoder hosts must match number of decoder ports")
+    if min(
+        args.backend_request_timeout,
+        args.decoder_read_timeout,
+    ) <= 0:
+        raise ValueError("Backend timeout values must be positive")
     args.prefiller_instances = list(zip(args.prefiller_hosts, args.prefiller_ports))
     args.decoder_instances = list(zip(args.decoder_hosts, args.decoder_ports))
     return args
@@ -2928,7 +3046,8 @@ async def lifespan(app: FastAPI):
         await asyncio.gather(
             *(
                 proxy_state.ensure_decoder_remote_fill(
-                    decoder
+                    decoder,
+                    wait_for_result=True,
                 )
                 for decoder in proxy_state.decoders
             )
