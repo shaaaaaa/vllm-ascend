@@ -140,6 +140,7 @@ class TestEnhancedRemoteFillProxy(unittest.TestCase):
                 json=lambda: {
                     "kv_transfer_params": {
                         "remote_engine_id": "persistent",
+                        "remote_block_ids": None,
                         "lmcache.remote_fill": {
                             "terminal": {
                                 "outcome": "LOCAL_FULL",

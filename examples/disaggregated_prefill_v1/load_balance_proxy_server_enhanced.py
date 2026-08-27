@@ -1847,7 +1847,7 @@ async def _handle_select_instance(
         if kv_transfer_params:
             logger.debug(f"[{request_id}] KV transfer params received from P-node: "
                          f"engine_id={kv_transfer_params.get('remote_engine_id')}, "
-                         f"block_ids_count={len(kv_transfer_params.get('remote_block_ids', []))}, "
+                         f"block_ids_count={len(kv_transfer_params.get('remote_block_ids') or ())}, "
                          f"host={kv_transfer_params.get('remote_host')}, "
                          f"port={kv_transfer_params.get('remote_port')}")
         else:
