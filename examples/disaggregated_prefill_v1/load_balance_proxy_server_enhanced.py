@@ -34,7 +34,8 @@ import sys
 import threading
 import time
 import uuid
-from contextlib import asynccontextmanager
+from collections.abc import Callable
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -52,6 +53,10 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 MAX_RECOMPUTE_RETRIES = 3
+_REMOTE_FILL_VERIFICATION_CAPABILITY_BYTES = 32
+_DECODER_PLACEMENT_DISCOVERY_TIMEOUT_SECONDS = 2.0
+_DECODER_PLACEMENT_POSITIVE_TTL_SECONDS = 30.0
+_DECODER_PLACEMENT_NEGATIVE_TTL_SECONDS = 3.0
 
 try:
     import uvloop
@@ -130,6 +135,11 @@ class ServerState:
         self.backend_running = 0
         self.backend_waiting = 0
         self.backend_kv_usage = 0.0
+        self.decoder_remote_fill: dict[int, dict[str, Any]] = {}
+        self.decoder_placement_discovered_at = 0.0
+        self.decoder_placement_last_attempt_at = 0.0
+        self.decoder_rank_active_tokens: dict[int, float] = {}
+        self.decoder_placement_task: asyncio.Task[dict[int, dict[str, Any]]] | None = None
 
     def __eq__(self, other):
         self_host = self.host.replace("localhost", "0.0.0.0").replace("127.0.0.1", "0.0.0.0")
@@ -156,15 +166,32 @@ class ServerState:
 # ============================================================================
 
 @dataclass
+class DecoderReservation:
+    server: ServerState
+    decoder_idx: int
+    decoder_score: float
+    dp_rank: int | None = None
+    remote_fill: dict[str, Any] | None = None
+
+
 @dataclass
 class InstanceInfo:
     request_id: str
     prefiller_idx: int
-    prefiller_score: float  # Score (not real tokens)
+    prefiller_score: float
     prefiller: ServerState
     decoder_idx: int
-    decoder_score: float    # Score (not real tokens)
+    decoder_score: float
     decoder: ServerState
+    reservation: DecoderReservation | None = None
+
+    def __post_init__(self) -> None:
+        if self.reservation is None:
+            self.reservation = DecoderReservation(
+                self.decoder,
+                self.decoder_idx,
+                self.decoder_score,
+            )
 
 
 # ============================================================================
@@ -1063,7 +1090,7 @@ class ProxyState:
     def __init__(self, prefiller_instances, decoder_instances, 
                  tokenizer_analyzer=None, metrics_aggregator=None, max_model_len=None,
                  vllm_token_counter=None, default_max_tokens=None, override_max_tokens=None,
-                 context_length_margin=None):
+                 context_length_margin=None, enable_remote_lmcache_store=False):
         # Original fields
         self.request_num = 0
         self.tainted_prefillers: list[ServerState] = []
@@ -1072,6 +1099,7 @@ class ProxyState:
         
         self.prefillers: list[ServerState] = [ServerState(h, p) for h, p in prefiller_instances]
         self.decoders: list[ServerState] = [ServerState(h, p) for h, p in decoder_instances]
+        self.enable_remote_lmcache_store = bool(enable_remote_lmcache_store)
         self.req_to_prefiller = {}
         self.req_id_lock = asyncio.Lock()
         
@@ -1199,17 +1227,88 @@ class ProxyState:
             self._update_decoder_priority(chosen)
             return chosen
     
-    def release_decoder(self, idx: int, token_count):
+    def release_decoder(self, idx: int, token_count, dp_rank: int | None = None):
         """Release decode phase (decode completed)."""
         with self._state_lock:
             if idx >= len(self.decoders):
                 return
+            server = self.decoders[idx]
+            if dp_rank in server.decoder_rank_active_tokens:
+                server.decoder_rank_active_tokens[dp_rank] = max(
+                    0.0,
+                    server.decoder_rank_active_tokens[dp_rank] - token_count,
+                )
             if self.decoders[idx].active_tokens >= token_count:
                 self.decoders[idx].active_tokens -= token_count
             elif self.decoders[idx].active_tokens > 0:
                 self.decoders[idx].active_tokens = 0
             self._update_decoder_priority(idx)
-    
+
+    def assign_decoder_rank(
+        self, reservation: DecoderReservation
+    ) -> DecoderReservation:
+        server = reservation.server
+        if not server.decoder_remote_fill:
+            return reservation
+        dp_rank = min(
+            server.decoder_remote_fill,
+            key=lambda rank: (server.decoder_rank_active_tokens[rank], rank),
+        )
+        server.decoder_rank_active_tokens[dp_rank] += reservation.decoder_score
+        reservation.dp_rank = dp_rank
+        remote_fill = server.decoder_remote_fill.get(dp_rank)
+        reservation.remote_fill = dict(remote_fill) if remote_fill is not None else None
+        return reservation
+
+    def _decoder_placement_is_fresh(self, server: ServerState, now: float) -> bool:
+        if server.decoder_placement_discovered_at:
+            ttl = (
+                _DECODER_PLACEMENT_POSITIVE_TTL_SECONDS
+                if server.decoder_remote_fill
+                else _DECODER_PLACEMENT_NEGATIVE_TTL_SECONDS
+            )
+            return now - server.decoder_placement_discovered_at < ttl
+        return (
+            server.decoder_placement_last_attempt_at > 0
+            and now - server.decoder_placement_last_attempt_at
+            < _DECODER_PLACEMENT_NEGATIVE_TTL_SECONDS
+        )
+
+    async def ensure_decoder_remote_fill(self, server: ServerState) -> None:
+        now = time.monotonic()
+        if self._decoder_placement_is_fresh(server, now):
+            return
+        task = server.decoder_placement_task
+        if task is None:
+            server.decoder_placement_last_attempt_at = now
+            task = asyncio.create_task(
+                _discover_decoder_remote_fill(
+                    server,
+                    timeout_seconds=_DECODER_PLACEMENT_DISCOVERY_TIMEOUT_SECONDS,
+                )
+            )
+            server.decoder_placement_task = task
+        try:
+            remote_fill = await asyncio.shield(task)
+        except (httpx.RequestError, httpx.HTTPStatusError, ValueError) as exc:
+            if server.decoder_placement_task is task:
+                server.decoder_placement_task = None
+                server.decoder_remote_fill = {}
+                server.decoder_placement_discovered_at = 0.0
+            logger.warning(
+                "Mooncake placement discovery failed for decoder %s: %s",
+                server.url,
+                exc,
+            )
+            return
+        server.decoder_remote_fill = remote_fill
+        server.decoder_rank_active_tokens = {
+            dp_rank: server.decoder_rank_active_tokens.get(dp_rank, 0.0)
+            for dp_rank in remote_fill
+        }
+        server.decoder_placement_discovered_at = time.monotonic()
+        server.decoder_placement_task = None
+
     async def add_instances(self, instance_type: str, instances: list[ServerState]) -> tuple[list[str], list[str]]:
         added_nodes, waiting_nodes = [], []
         for server in instances:
@@ -1427,6 +1526,130 @@ class NodeListener:
             return False
 
 
+def _parse_decoder_remote_fill_response(payload: Any) -> dict[int, dict[str, Any]]:
+    if not isinstance(payload, dict) or not isinstance(payload.get("results"), list):
+        raise ValueError("Decoder collective RPC returned an invalid response")
+    placements: dict[int, dict[str, Any]] = {}
+    for result in payload["results"]:
+        if result is None:
+            continue
+        if not isinstance(result, dict):
+            raise ValueError("Decoder placement result must be a dictionary")
+        remote_fill = result.get("remote_fill")
+        if remote_fill is None:
+            continue
+        if not isinstance(remote_fill, dict):
+            raise ValueError("Decoder remote-fill placement must be a dictionary")
+        if remote_fill.get("enabled") is not True:
+            continue
+        dp_rank = result.get("dp_rank")
+        advertised_dp_rank = remote_fill.get("dp_rank")
+        advertised_tp_rank = remote_fill.get("tp_rank")
+        if (
+            isinstance(dp_rank, bool)
+            or not isinstance(dp_rank, int)
+            or dp_rank < 0
+            or isinstance(advertised_dp_rank, bool)
+            or not isinstance(advertised_dp_rank, int)
+            or advertised_dp_rank != dp_rank
+            or isinstance(advertised_tp_rank, bool)
+            or not isinstance(advertised_tp_rank, int)
+            or advertised_tp_rank != 0
+        ):
+            raise ValueError("Decoder remote-fill placement is not bound to its TP0/DP rank")
+        required_strings = (
+            "destination_engine_id",
+            "control_endpoint",
+            "token_hash_algorithm",
+            "descriptor_verification_capability",
+        )
+        if any(
+            not isinstance(remote_fill.get(name), str)
+            or not remote_fill[name].strip()
+            for name in required_strings
+        ):
+            raise ValueError("Decoder remote-fill string identity is invalid")
+        epoch = remote_fill.get("destination_engine_epoch")
+        generation = remote_fill.get("shared_cache_generation")
+        tp_size = remote_fill.get("destination_tp_size")
+        dp_size = remote_fill.get("destination_dp_size")
+        if isinstance(epoch, bool) or not isinstance(epoch, int) or epoch <= 0:
+            raise ValueError("Decoder remote-fill engine epoch is invalid")
+        if (
+            isinstance(generation, bool)
+            or not isinstance(generation, int)
+            or generation < 0
+        ):
+            raise ValueError("Decoder remote-fill shared-cache generation is invalid")
+        if (
+            isinstance(tp_size, bool)
+            or not isinstance(tp_size, int)
+            or tp_size <= 0
+            or isinstance(dp_size, bool)
+            or not isinstance(dp_size, int)
+            or dp_size <= 0
+            or dp_rank >= dp_size
+        ):
+            raise ValueError("Decoder remote-fill parallel topology is invalid")
+        global_te_push = remote_fill.get("global_te_push")
+        if not isinstance(global_te_push, bool):
+            raise ValueError("Decoder remote-fill native capability is invalid")
+        if not global_te_push:
+            continue
+        verification_capability = remote_fill["descriptor_verification_capability"]
+        try:
+            verification_key = bytes.fromhex(verification_capability)
+        except ValueError as error:
+            raise ValueError("Decoder remote-fill verification capability is invalid") from error
+        if (
+            len(verification_key) != _REMOTE_FILL_VERIFICATION_CAPABILITY_BYTES
+            or verification_key.hex() != verification_capability
+        ):
+            raise ValueError("Decoder remote-fill verification capability is invalid")
+        python_hash_seed = remote_fill.get("python_hash_seed", "")
+        if not isinstance(python_hash_seed, str) or (
+            remote_fill["token_hash_algorithm"] == "builtin" and not python_hash_seed
+        ):
+            raise ValueError("Decoder remote-fill hash identity is invalid")
+        placement = {
+            "destination_engine_id": remote_fill["destination_engine_id"].strip(),
+            "destination_engine_epoch": epoch,
+            "control_endpoint": remote_fill["control_endpoint"].strip(),
+            "destination_dp_rank": dp_rank,
+            "shared_cache_generation": generation,
+            "destination_tp_size": tp_size,
+            "destination_dp_size": dp_size,
+            "global_te_push": global_te_push,
+            "token_hash_algorithm": remote_fill["token_hash_algorithm"].strip(),
+            "python_hash_seed": python_hash_seed,
+            "descriptor_verification_capability": verification_capability,
+        }
+        existing = placements.get(dp_rank)
+        if existing is not None and existing != placement:
+            raise ValueError(
+                f"Decoder DP rank {dp_rank} reported conflicting remote-fill metadata"
+            )
+        placements[dp_rank] = placement
+    return placements
+
+
+async def _discover_decoder_remote_fill(
+    server: ServerState,
+    *,
+    timeout_seconds: float = 2.0,
+) -> dict[int, dict[str, Any]]:
+    collective_rpc_url = server.url.removesuffix("/v1") + "/collective_rpc"
+    response = await server.client.post(
+        collective_rpc_url,
+        json={"method": "get_mooncake_placement_info"},
+        headers={"Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}"},
+        timeout=timeout_seconds,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    return _parse_decoder_remote_fill_response(payload)
+
+
 # ============================================================================
 # Request Handlers (from original)
 # ============================================================================
@@ -1439,6 +1662,7 @@ async def send_request_to_service(
     request_id: str,
     max_retries: int = 3,
     base_delay: float = 0.2,
+    remote_fill_handoff: dict[str, Any] | None = None,
 ):
     aborted_requests = proxy_state.acquire_aborted_prefiller_requests(prefiller_id)
     req_data = req_data.copy()
@@ -1451,6 +1675,10 @@ async def send_request_to_service(
         "remote_port": None,
         "aborted_request": list(aborted_requests),
     }
+    if remote_fill_handoff is not None:
+        req_data["kv_transfer_params"]["lmcache.remote_fill"] = dict(
+            remote_fill_handoff
+        )
     req_data["stream"] = False
     req_data["max_tokens"] = 1
     req_data["min_tokens"] = 1
@@ -1482,13 +1710,16 @@ async def stream_service_response_with_retry(
     request_id: str,
     max_retries: int = 3,
     base_delay: float = 0.2,
+    decoder_dp_rank: int | None = None,
 ):
     headers = {"Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}", "X-Request-Id": request_id}
+    if decoder_dp_rank is not None:
+        headers["X-data-parallel-rank"] = str(decoder_dp_rank)
     for attempt in range(1, max_retries + 1):
+        first_chunk_sent = False
         try:
             async with client.stream("POST", endpoint, json=req_data, headers=headers) as response:
                 response.raise_for_status()
-                first_chunk_sent = False
                 sse_buffer = bytearray()
                 async for raw_chunk in response.aiter_bytes():
                     sse_buffer.extend(raw_chunk)
@@ -1504,6 +1735,9 @@ async def stream_service_response_with_retry(
                     yield bytes(sse_buffer)
                 return
         except (httpx.RequestError, httpx.HTTPStatusError) as e:
+            if first_chunk_sent:
+                logger.error(f"Streaming to client interrupted after response started: {str(e)}")
+                return
             if attempt < max_retries:
                 logger.warning(f"Attempt {attempt} failed for streaming {endpoint}: {str(e)}")
                 await asyncio.sleep(base_delay * (2 ** (attempt - 1)))
@@ -1511,7 +1745,7 @@ async def stream_service_response_with_retry(
                 logger.error(f"All {max_retries} attempts failed for streaming {endpoint}.")
                 raise e
         except Exception as e:
-            if "first_chunk_sent" in locals() and first_chunk_sent:
+            if first_chunk_sent:
                 logger.error(f"Streaming to client interrupted after response started: {str(e)}")
                 return
             else:
@@ -1523,94 +1757,215 @@ async def stream_service_response_with_retry(
                     raise e
 
 
-async def _handle_select_instance(api: str, req_data: Any, request_length: int, analysis=None, original_request_id=None):
-    """Original flow: calculate scores first, then select based on scores."""
+async def _handle_select_instance(
+    api: str,
+    req_data: Any,
+    request_length: int,
+    analysis=None,
+    original_request_id=None,
+):
     prefiller_score = proxy_state.calculate_prefill_scores(request_length)
+    decoder_score = proxy_state.calculate_decode_scores(request_length)
     request_id = await proxy_state.next_req_id()
-    
-    # Select prefiller based on score
-    prefiller_idx = proxy_state.select_prefiller(prefiller_score)
-    prefiller = proxy_state.prefillers[prefiller_idx]
-    
-    # Send request to prefiller and wait for completion
-    # If prefiller fails after all retries, release acquired resources immediately
-    # to prevent permanent score accumulation and load imbalance
+    prefiller_idx = None
+    prefiller_active_released = False
+    reservation = None
     try:
+        if proxy_state.enable_remote_lmcache_store:
+            decoder_idx = proxy_state.select_decoder(decoder_score)
+            decoder = proxy_state.decoders[decoder_idx]
+            reservation = DecoderReservation(decoder, decoder_idx, decoder_score)
+            await proxy_state.ensure_decoder_remote_fill(decoder)
+            proxy_state.assign_decoder_rank(reservation)
+
+        prefiller_idx = proxy_state.select_prefiller(prefiller_score)
+        prefiller = proxy_state.prefillers[prefiller_idx]
+        remote_fill_handoff = None
+        if reservation is not None and reservation.remote_fill is not None:
+            remote_fill_handoff = {
+                **reservation.remote_fill,
+                "transfer_id": uuid.uuid4().hex,
+                "request_attempt": 1,
+                "source_engine_id": str(prefiller),
+            }
         response = await send_request_to_service(
             prefiller.client,
             prefiller_idx,
             api,
             req_data,
             request_id,
-            max_retries=global_args.max_retries,
+            max_retries=(1 if remote_fill_handoff else global_args.max_retries),
             base_delay=global_args.retry_delay,
+            remote_fill_handoff=remote_fill_handoff,
         )
-    except Exception:
         proxy_state.release_prefiller(prefiller_idx, prefiller_score)
-        proxy_state.release_prefiller_kv(prefiller_idx, prefiller_score)
-        raise
-    
-    proxy_state.release_prefiller(prefiller_idx, prefiller_score)
-    try:
+        prefiller_active_released = True
         response_json = response.json()
-    except Exception:
-        proxy_state.release_prefiller_kv(prefiller_idx, prefiller_score)
-        raise ValueError(f"P-node returned non-JSON response for request {request_id}: status={response.status_code}, body={response.text[:200]}")
-    if response_json is None or not isinstance(response_json, dict):
-        proxy_state.release_prefiller_kv(prefiller_idx, prefiller_score)
-        raise ValueError(f"P-node returned invalid JSON for request {request_id}: type={type(response_json).__name__}, body={response.text[:200]}")
-    kv_transfer_params = response_json.get("kv_transfer_params", {})
-    if kv_transfer_params:
+        if not isinstance(response_json, dict):
+            raise ValueError(
+                f"P-node returned invalid JSON for request {request_id}: "
+                f"type={type(response_json).__name__}"
+            )
+        returned_params = response_json.get("kv_transfer_params", {})
+        if not isinstance(returned_params, dict):
+            raise TypeError("Prefiller kv_transfer_params must be a dictionary")
+        kv_transfer_params = dict(returned_params)
+        returned_remote_fill = kv_transfer_params.pop("lmcache.remote_fill", None)
+        kv_transfer_params.pop("lmcache.remote_fill_result", None)
+        if remote_fill_handoff is not None:
+            if not isinstance(returned_remote_fill, dict):
+                raise RuntimeError("Prefiller omitted remote-fill terminal result")
+            terminal = returned_remote_fill.get("terminal")
+            if not isinstance(terminal, dict):
+                raise RuntimeError("Prefiller returned invalid remote-fill terminal result")
+            outcome = terminal.get("outcome")
+            persistent_end = terminal.get("persistent_common_end")
+            required_end = terminal.get("required_store_end")
+            if (
+                outcome not in {"LOCAL_FULL", "PERSISTENT_ONLY"}
+                or isinstance(persistent_end, bool)
+                or not isinstance(persistent_end, int)
+                or isinstance(required_end, bool)
+                or not isinstance(required_end, int)
+                or persistent_end < required_end
+                or required_end < 0
+                or terminal.get("transfer_id") != remote_fill_handoff["transfer_id"]
+            ):
+                raise RuntimeError(
+                    "Prefiller remote-fill result is not safe for decoder forwarding"
+                )
+            if outcome == "LOCAL_FULL":
+                kv_transfer_params["lmcache.remote_fill_result"] = {
+                    "outcome": outcome,
+                    "required_store_end": required_end,
+                    "destination_engine_epoch": remote_fill_handoff[
+                        "destination_engine_epoch"
+                    ],
+                }
+        kv_transfer_params.pop("lmcache.mooncake_preferred_segment", None)
         req_data["kv_transfer_params"] = kv_transfer_params
-        logger.debug(f"[{request_id}] KV transfer params received from P-node: "
-                     f"engine_id={kv_transfer_params.get('remote_engine_id')}, "
-                     f"block_ids_count={len(kv_transfer_params.get('remote_block_ids', []))}, "
-                     f"host={kv_transfer_params.get('remote_host')}, "
-                     f"port={kv_transfer_params.get('remote_port')}")
-    else:
-        logger.warning(f"[{request_id}] P-node returned EMPTY kv_transfer_params! "
-                       f"D-node will not have KV cache location info. "
-                       f"P-node response keys: {list(response_json.keys())}, "
-                       f"P-node: {prefiller}")
-    
-    # Select decoder based on score
-    decoder_score = proxy_state.calculate_decode_scores(request_length)
-    decoder_idx = proxy_state.select_decoder(decoder_score)
-    decoder = proxy_state.decoders[decoder_idx]
-    
-    # Print consolidated routing info (all in one line)
-    max_tokens = req_data.get("max_completion_tokens")
-    if max_tokens is None:
-        max_tokens = req_data.get("max_tokens")
-    if max_tokens is None:
-        max_tokens = "default"
-    analysis_time_str = ""
-    if analysis and analysis.analysis_time_ms > 0:
-        analysis_time_str = f"analysis={analysis.analysis_time_ms:.1f}ms, "
-    
-    if analysis:
-        token_info = f"prompt={analysis.prompt_tokens}, max_gen={max_tokens}"
-        if analysis.system_tokens > 0 or analysis.tool_tokens > 0:
-            token_info += f", sys={analysis.system_tokens}, tools={analysis.tool_tokens}, content={analysis.content_tokens}"
-        token_info += f", total={analysis.total_tokens}"
-    else:
-        token_info = f"bytes={request_length}"
-    
-    logger.info(f"[{request_id}] {analysis_time_str}{token_info} → P:{prefiller}({prefiller_score:.1f}) → D:{decoder}({decoder_score:.1f})" + (f" [recompute of {original_request_id}]" if original_request_id else ""))
-    
-    return InstanceInfo(
-        request_id=request_id,
-        prefiller_idx=prefiller_idx,
-        prefiller_score=prefiller_score,
-        prefiller=prefiller,
-        decoder_idx=decoder_idx,
-        decoder_score=decoder_score,
-        decoder=decoder,
+        if kv_transfer_params:
+            logger.debug(f"[{request_id}] KV transfer params received from P-node: "
+                         f"engine_id={kv_transfer_params.get('remote_engine_id')}, "
+                         f"block_ids_count={len(kv_transfer_params.get('remote_block_ids', []))}, "
+                         f"host={kv_transfer_params.get('remote_host')}, "
+                         f"port={kv_transfer_params.get('remote_port')}")
+        else:
+            logger.warning(f"[{request_id}] P-node returned EMPTY kv_transfer_params! "
+                           f"D-node will not have KV cache location info. "
+                           f"P-node response keys: {list(response_json.keys())}, "
+                           f"P-node: {prefiller}")
+
+        if reservation is None:
+            decoder_idx = proxy_state.select_decoder(decoder_score)
+            decoder = proxy_state.decoders[decoder_idx]
+            reservation = DecoderReservation(decoder, decoder_idx, decoder_score)
+
+        max_tokens = req_data.get("max_completion_tokens")
+        if max_tokens is None:
+            max_tokens = req_data.get("max_tokens")
+        if max_tokens is None:
+            max_tokens = "default"
+        analysis_time_str = ""
+        if analysis and analysis.analysis_time_ms > 0:
+            analysis_time_str = f"analysis={analysis.analysis_time_ms:.1f}ms, "
+
+        if analysis:
+            token_info = f"prompt={analysis.prompt_tokens}, max_gen={max_tokens}"
+            if analysis.system_tokens > 0 or analysis.tool_tokens > 0:
+                token_info += f", sys={analysis.system_tokens}, tools={analysis.tool_tokens}, content={analysis.content_tokens}"
+            token_info += f", total={analysis.total_tokens}"
+        else:
+            token_info = f"bytes={request_length}"
+
+        logger.info(f"[{request_id}] {analysis_time_str}{token_info} → P:{prefiller}({prefiller_score:.1f}) → D:{decoder}({decoder_score:.1f})" + (f" [recompute of {original_request_id}]" if original_request_id else ""))
+        return InstanceInfo(
+            request_id=request_id,
+            prefiller_idx=prefiller_idx,
+            prefiller_score=prefiller_score,
+            prefiller=prefiller,
+            decoder_idx=reservation.decoder_idx,
+            decoder_score=decoder_score,
+            decoder=decoder,
+            reservation=reservation,
+        )
+    except BaseException:
+        if reservation is not None:
+            proxy_state.release_decoder(
+                reservation.decoder_idx,
+                reservation.decoder_score,
+                reservation.dp_rank,
+            )
+        if prefiller_idx is not None:
+            if not prefiller_active_released:
+                proxy_state.release_prefiller(prefiller_idx, prefiller_score)
+            proxy_state.abort_prefiller_request(prefiller_idx, request_id)
+            proxy_state.release_prefiller_kv(prefiller_idx, prefiller_score)
+        raise
+
+
+def _release_decoder_reservation(instance_info: InstanceInfo) -> None:
+    reservation = instance_info.reservation
+    if reservation is None:
+        return
+    instance_info.reservation = None
+    proxy_state.release_decoder(
+        reservation.decoder_idx,
+        reservation.decoder_score,
+        reservation.dp_rank,
     )
+
+
+class _CleanupStreamingResponse(StreamingResponse):
+    def __init__(
+        self,
+        *args: Any,
+        cleanup: Callable[[], None],
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        self._cleanup = cleanup
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            self._cleanup()
 
 
 async def _handle_completions(api: str, request: Request):
     instance_info = None
+    response_owns_cleanup = False
+    request_count_released = False
+    released_kv = True
+
+    def release_request_count() -> None:
+        nonlocal request_count_released
+        if request_count_released:
+            return
+        proxy_state.request_num = max(0, proxy_state.request_num - 1)
+        request_count_released = True
+
+    def cleanup_current_request() -> None:
+        nonlocal released_kv
+        try:
+            if instance_info is not None and not released_kv:
+                proxy_state.abort_prefiller_request(
+                    instance_info.prefiller_idx,
+                    instance_info.request_id,
+                )
+                proxy_state.release_prefiller_kv(
+                    instance_info.prefiller_idx,
+                    instance_info.prefiller_score,
+                )
+                released_kv = True
+        finally:
+            try:
+                if instance_info is not None:
+                    _release_decoder_reservation(instance_info)
+            finally:
+                release_request_count()
+
     try:
         proxy_state.request_num += 1
         req_data = await request.json()
@@ -1656,7 +2011,7 @@ async def _handle_completions(api: str, request: Request):
                             mm_part_types.add("image_url")
         
         if mm_parts_found:
-            proxy_state.request_num -= 1
+            release_request_count()
             logger.info(f"[REJECTED] Multimodal content detected: {mm_part_types}. "
                          f"Model {proxy_state.vllm_token_counter.model_name if proxy_state.vllm_token_counter else 'unknown'} "
                          f"is not a multimodal model.")
@@ -1772,7 +2127,7 @@ async def _handle_completions(api: str, request: Request):
                     analysis.content_tokens = token_info['content_tokens']
                     
                     if exceeds:
-                        proxy_state.request_num -= 1
+                        release_request_count()
                         max_gen_display = user_max_tokens if user_specified_max_tokens else "default"
                         logger.info(f"[REJECTED] VLLMTokenCounter: prompt={prompt_tokens}, max_gen={max_gen_display}, effective={effective_max_tokens}, "
                               f"total={total}, margin={proxy_state.context_length_margin}% → {int(total * margin)} > limit={proxy_state.max_model_len}")
@@ -1826,7 +2181,7 @@ async def _handle_completions(api: str, request: Request):
                 analysis.analysis_time_ms = (analysis_end - analysis_start) * 1000
                 
                 if analysis.exceeds_limit:
-                    proxy_state.request_num -= 1
+                    release_request_count()
                     
                     user_max_tokens = req_data.get("max_completion_tokens")
                     if user_max_tokens is None:
@@ -1874,7 +2229,7 @@ async def _handle_completions(api: str, request: Request):
                     )
             except asyncio.TimeoutError:
                 logger.warning(f"Tokenizer analysis timeout (>5s)")
-                proxy_state.request_num -= 1
+                release_request_count()
                 return Response(
                     content=json.dumps({"error": "Tokenizer analysis timeout"}),
                     status_code=500,
@@ -1882,7 +2237,7 @@ async def _handle_completions(api: str, request: Request):
                 )
             except Exception as e:
                 logger.warning(f"Tokenizer analysis failed: {e}")
-                proxy_state.request_num -= 1
+                release_request_count()
                 return Response(
                     content=json.dumps({"error": f"Tokenizer analysis failed: {e}"}),
                     status_code=500,
@@ -1922,16 +2277,15 @@ async def _handle_completions(api: str, request: Request):
                 request_length = max(content_chars // 4, 1)
         
         instance_info = await _handle_select_instance(api, req_data, request_length, analysis)
+        released_kv = False
         
         original_request_id = instance_info.request_id
         stream_flag = bool(req_data.get("stream", False))
         chat_flag = "messages" in req_data
         
         async def generate_stream():
-            nonlocal instance_info
+            nonlocal instance_info, released_kv
             generated_token = ""
-            released_kv = False
-            released_decoder = False
             retry_count = 0
             retry = True
             completion_tokens = 0
@@ -1951,6 +2305,11 @@ async def _handle_completions(api: str, request: Request):
                         request_id=instance_info.request_id,
                         max_retries=global_args.max_retries,
                         base_delay=global_args.retry_delay,
+                        decoder_dp_rank=(
+                            instance_info.reservation.dp_rank
+                            if instance_info.reservation
+                            else None
+                        ),
                     ):
                         if not released_kv and chunk:
                             proxy_state.release_prefiller_kv(instance_info.prefiller_idx, instance_info.prefiller_score)
@@ -2052,9 +2411,8 @@ async def _handle_completions(api: str, request: Request):
                             # Release old P/D resources before recompute replaces instance_info.
                             if not released_kv:
                                 proxy_state.release_prefiller_kv(instance_info.prefiller_idx, instance_info.prefiller_score)
-                            proxy_state.release_decoder(instance_info.decoder_idx, instance_info.decoder_score)
-                            released_kv = False
-                            released_decoder = False
+                                released_kv = True
+                            _release_decoder_reservation(instance_info)
                             
                             generated_token = ""
                             completion_tokens = 0
@@ -2089,7 +2447,9 @@ async def _handle_completions(api: str, request: Request):
                                     tmp_request_length = new_analysis.prompt_tokens
                                 except Exception as e:
                                     logger.debug(f"Tokenizer failed for recompute: {e}")
-                            instance_info = await _handle_select_instance(api, req_data, tmp_request_length, new_analysis, original_request_id=original_request_id)
+                            replacement = await _handle_select_instance(api, req_data, tmp_request_length, new_analysis, original_request_id=original_request_id)
+                            instance_info = replacement
+                            released_kv = False
                             logger.info(
                                 f"[RECOMPUTE] {original_request_id}: "
                                 f"new_req_id={instance_info.request_id}"
@@ -2112,17 +2472,8 @@ async def _handle_completions(api: str, request: Request):
                 if not released_kv:
                     proxy_state.release_prefiller_kv(instance_info.prefiller_idx, instance_info.prefiller_score)
                     released_kv = True
-                if not released_decoder:
-                    proxy_state.release_decoder(instance_info.decoder_idx, instance_info.decoder_score)
-                    released_decoder = True
             finally:
-                # Release D node resources on successful completion.
-                # Without this, D node active_tokens accumulates permanently,
-                # causing load imbalance (one node gets 2x+ requests).
-                if not released_kv:
-                    proxy_state.release_prefiller_kv(instance_info.prefiller_idx, instance_info.prefiller_score)
-                if not released_decoder:
-                    proxy_state.release_decoder(instance_info.decoder_idx, instance_info.decoder_score)
+                cleanup_current_request()
                 if empty_delta_count > 0:
                     logger.debug(
                         f"[EMPTY_DELTA_SUMMARY] {original_request_id}: "
@@ -2285,18 +2636,17 @@ async def _handle_completions(api: str, request: Request):
         
         # Determine the correct media type based on stream flag
         media_type = "text/event-stream; charset=utf-8" if stream_flag else "application/json"
-        return StreamingResponse(generate_stream(), media_type=media_type)
+        response = _CleanupStreamingResponse(
+            generate_stream(),
+            media_type=media_type,
+            cleanup=cleanup_current_request,
+        )
+        response_owns_cleanup = True
+        return response
     
     except httpx.HTTPStatusError as e:
         # Backend returned error status code - propagate to client
         logger.error(f"Backend returned error status {e.response.status_code}: {str(e)}")
-        proxy_state.request_num -= 1
-        
-        # Release load balance resources that were acquired but never released
-        if instance_info:
-            proxy_state.release_prefiller(instance_info.prefiller_idx, instance_info.prefiller_score)
-            proxy_state.release_prefiller_kv(instance_info.prefiller_idx, instance_info.prefiller_score)
-            proxy_state.release_decoder(instance_info.decoder_idx, instance_info.decoder_score)
         
         # Try to get error body from backend
         try:
@@ -2313,13 +2663,6 @@ async def _handle_completions(api: str, request: Request):
     except httpx.RequestError as e:
         # Network error - backend unavailable
         logger.error(f"Backend unavailable after retries: {str(e)}")
-        proxy_state.request_num -= 1
-        
-        # Release load balance resources
-        if instance_info:
-            proxy_state.release_prefiller(instance_info.prefiller_idx, instance_info.prefiller_score)
-            proxy_state.release_prefiller_kv(instance_info.prefiller_idx, instance_info.prefiller_score)
-            proxy_state.release_decoder(instance_info.decoder_idx, instance_info.decoder_score)
         
         return Response(
             content=json.dumps({"error": "Backend service unavailable after retries"}),
@@ -2335,19 +2678,14 @@ async def _handle_completions(api: str, request: Request):
         logger.error(str(e))
         logger.info("".join(traceback.format_exception(*exc_info)))
         
-        proxy_state.request_num -= 1
-        
-        # Release load balance resources
-        if instance_info:
-            proxy_state.release_prefiller(instance_info.prefiller_idx, instance_info.prefiller_score)
-            proxy_state.release_prefiller_kv(instance_info.prefiller_idx, instance_info.prefiller_score)
-            proxy_state.release_decoder(instance_info.decoder_idx, instance_info.decoder_score)
-        
         return Response(
             content=json.dumps({"error": f"Internal proxy error: {str(e)}"}),
             status_code=500,
             media_type="application/json"
         )
+    finally:
+        if not response_owns_cleanup:
+            cleanup_current_request()
 
 
 async def _handle_adjust_instances(adjust_mode: str, request: Request):
@@ -2357,14 +2695,17 @@ async def _handle_adjust_instances(adjust_mode: str, request: Request):
         instances = req_data.get("instances", [])
         if isinstance(instances, str):
             instances = [instances]
-        instances = trans_instances(instances)
-        all_msg = f"{adjust_mode} {instance_type} instances: {[str(server) for server in instances]}."
-        
         if instance_type not in [InstanceType.PREFILL, InstanceType.DECODE]:
             return {
                 "error": f"Instance type {instance_type} is not supported. "
                 f"Only support '{InstanceType.PREFILL}' and '{InstanceType.DECODE}'."
             }
+        if proxy_state.enable_remote_lmcache_store:
+            return {
+                "error": "Dynamic topology is disabled in placement-aware mode; restart the paired proxy/P/D topology."
+            }
+        instances = trans_instances(instances)
+        all_msg = f"{adjust_mode} {instance_type} instances: {[str(server) for server in instances]}."
         
         if adjust_mode == "add":
             added_nodes, waiting_nodes = await proxy_state.add_instances(instance_type, instances)
@@ -2416,6 +2757,11 @@ def parse_args():
     parser.add_argument("--prefiller-ports", type=int, nargs="+", default=[8001])
     parser.add_argument("--decoder-hosts", type=str, nargs="+", default=["localhost"])
     parser.add_argument("--decoder-ports", type=int, nargs="+", default=[8002])
+    parser.add_argument(
+        "--enable-remote-lmcache-store",
+        action="store_true",
+        help="Enable decoder RemoteFill discovery and direct remote LMCache storage",
+    )
     parser.add_argument("--max-retries", type=int, default=3, help="Maximum number of retries")
     parser.add_argument("--retry-delay", type=float, default=0.001, help="Base delay for exponential backoff")
     parser.add_argument("--max-waiting-retries", type=int, default=3, help="Maximum retries for waiting nodes")
@@ -2472,11 +2818,21 @@ def with_cancellation(handler_func):
         request = kwargs["request"]
         handler_task = asyncio.create_task(handler_func(*args, **kwargs))
         cancellation_task = asyncio.create_task(listen_for_disconnect(request))
-        done, pending = await asyncio.wait([handler_task, cancellation_task], return_when=asyncio.FIRST_COMPLETED)
+        try:
+            done, pending = await asyncio.wait([handler_task, cancellation_task], return_when=asyncio.FIRST_COMPLETED)
+        except BaseException:
+            handler_task.cancel()
+            cancellation_task.cancel()
+            await asyncio.gather(
+                handler_task, cancellation_task, return_exceptions=True
+            )
+            raise
         for task in pending:
             task.cancel()
         if handler_task in done:
             return handler_task.result()
+        with suppress(asyncio.CancelledError):
+            await handler_task
         return None
     return wrapper
 
@@ -2558,6 +2914,7 @@ async def lifespan(app: FastAPI):
         default_max_tokens=default_max_tokens,
         override_max_tokens=override_max_tokens,
         context_length_margin=global_args.context_length_margin,
+        enable_remote_lmcache_store=global_args.enable_remote_lmcache_store,
     )
     
     # Enhanced: set metrics aggregator references
@@ -2567,6 +2924,15 @@ async def lifespan(app: FastAPI):
         metrics_aggregator.start()
     
     logger.info(f"Initialized {len(proxy_state.prefillers)} prefill clients and {len(proxy_state.decoders)} decode clients.")
+    if proxy_state.enable_remote_lmcache_store:
+        await asyncio.gather(
+            *(
+                proxy_state.ensure_decoder_remote_fill(
+                    decoder
+                )
+                for decoder in proxy_state.decoders
+            )
+        )
     
     # Print load balance mode
     if global_args.use_original_lb:
