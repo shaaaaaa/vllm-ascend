@@ -86,6 +86,58 @@ class TestEnhancedRemoteFillProxy(unittest.TestCase):
             asyncio.run(close_clients())
         proxy.proxy_state = None
 
+    def test_disable_tokenizer_analysis_skips_both_exact_analyzers(self):
+        proxy.global_args = SimpleNamespace(
+            model_name="model",
+            max_model_len=131072,
+            chat_template=None,
+            trust_remote_code=False,
+            disable_tokenizer_analysis=True,
+            default_max_tokens=None,
+            override_max_tokens=None,
+            context_length_margin=5,
+            disable_metrics=True,
+            disable_metrics_polling=True,
+            metrics_poll_interval=5.0,
+            prefiller_instances=[("prefiller", 8001)],
+            decoder_instances=[("decoder", 8002)],
+            enable_remote_lmcache_store=True,
+            use_original_lb=False,
+        )
+
+        async def run() -> None:
+            with (
+                patch.object(proxy, "VLLM_TOKEN_COUNTER_AVAILABLE", True),
+                patch.object(proxy, "VLLMTokenCounter") as counter,
+                patch.object(proxy, "TokenizerAnalyzer") as analyzer,
+            ):
+                async with proxy.lifespan(None):
+                    counter.assert_not_called()
+                    analyzer.assert_not_called()
+                    self.assertIsNone(proxy.proxy_state.vllm_token_counter)
+                    self.assertIsNone(proxy.proxy_state.tokenizer_analyzer)
+                    self.assertTrue(proxy.proxy_state.enable_remote_lmcache_store)
+
+        asyncio.run(run())
+        proxy.proxy_state = None
+
+    def test_no_analyzer_uses_existing_character_estimate(self):
+        proxy.global_args.use_original_lb = False
+        state = proxy.ProxyState([("prefiller", 8001)], [("decoder", 8002)])
+        proxy.proxy_state = state
+        info = _reserve_instance(state)
+        request = SimpleNamespace(
+            json=AsyncMock(return_value={"prompt": "abcdefgh", "stream": True}),
+            body=AsyncMock(return_value=b"unused"),
+        )
+        select = AsyncMock(return_value=info)
+
+        with patch.object(proxy, "_handle_select_instance", select):
+            response = asyncio.run(proxy._handle_completions("/completions", request))
+
+        self.assertEqual(select.await_args.args[2:], (2, None))
+        response._cleanup()
+
     def test_remote_fill_only_placement_is_valid(self):
         placement = _remote_fill()
         payload = {

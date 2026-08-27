@@ -2889,8 +2889,8 @@ def parse_args():
     parser.add_argument("--max-model-len", type=int, default=8192, help="Maximum model context length")
     parser.add_argument("--chat-template", type=str, default=None, 
                         help="Path to custom chat template file for tokenizer (e.g., for Code Agent scenarios)")
-    parser.add_argument("--disable-tokenizer-analysis", action="store_true", 
-                        help="Disable tokenizer analysis completely (for testing)")
+    parser.add_argument("--disable-tokenizer-analysis", action="store_true",
+                        help="Disable exact tokenization and use approximate load accounting")
     parser.add_argument("--disable-metrics", action="store_true", help="Disable metrics polling")
     parser.add_argument("--disable-metrics-polling", action="store_true", 
                         help="Disable background metrics polling only (API endpoints still available)")
@@ -2971,7 +2971,11 @@ async def lifespan(app: FastAPI):
     override_max_tokens = None
     
     # NEW: Initialize VLLMTokenCounter (highest priority)
-    if global_args.model_name and VLLM_TOKEN_COUNTER_AVAILABLE:
+    if (
+        global_args.model_name
+        and VLLM_TOKEN_COUNTER_AVAILABLE
+        and not global_args.disable_tokenizer_analysis
+    ):
         try:
             vllm_token_counter = VLLMTokenCounter(
                 model_name=global_args.model_name,
@@ -3053,10 +3057,10 @@ async def lifespan(app: FastAPI):
         logger.info("[INFO] Using ORIGINAL load balance logic (byte-based)")
     else:
         logger.info("[INFO] Using ENHANCED load balance logic (token-based)")
-        if proxy_state.tokenizer_analyzer:
-            logger.info(f"[INFO] Tokenizer enabled: model={global_args.model_name}")
+        if proxy_state.vllm_token_counter or proxy_state.tokenizer_analyzer:
+            logger.info(f"[INFO] Exact tokenizer analysis enabled: model={global_args.model_name}")
         else:
-            logger.info("[INFO] Tokenizer disabled - will use byte length fallback")
+            logger.info("[INFO] Exact tokenizer analysis disabled; using character estimate")
     
     yield
     
