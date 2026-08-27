@@ -259,6 +259,88 @@ class TestEnhancedRemoteFillProxy(unittest.TestCase):
         self.assertEqual(state.prefillers[0].active_kv_cache, 0)
         self.assertEqual(state.decoders[0].active_tokens, 0)
 
+    def test_first_request_lazily_discovers_remote_fill(self):
+        state = proxy.ProxyState(
+            [("prefiller", 8001)],
+            [("decoder", 8002)],
+            enable_remote_lmcache_store=True,
+        )
+        proxy.proxy_state = state
+        placement = {
+            key: value
+            for key, value in _remote_fill().items()
+            if key not in {"enabled", "tp_rank", "dp_rank"}
+        } | {"destination_dp_rank": 0}
+
+        async def send(*args, **kwargs):
+            handoff = kwargs["remote_fill_handoff"]
+            self.assertIsNotNone(handoff)
+            return SimpleNamespace(
+                json=lambda: {
+                    "kv_transfer_params": {
+                        "lmcache.remote_fill": {
+                            "terminal": {
+                                "outcome": "LOCAL_FULL",
+                                "persistent_common_end": 1024,
+                                "required_store_end": 1024,
+                                "transfer_id": handoff["transfer_id"],
+                            }
+                        }
+                    }
+                }
+            )
+
+        req_data = {"prompt": "x"}
+        with (
+            patch.object(
+                proxy,
+                "_discover_decoder_remote_fill",
+                AsyncMock(return_value={0: placement}),
+            ) as discover,
+            patch.object(proxy, "send_request_to_service", side_effect=send),
+        ):
+            info = asyncio.run(
+                proxy._handle_select_instance("/completions", req_data, 1024)
+            )
+
+        discover.assert_awaited_once()
+        self.assertEqual(info.reservation.dp_rank, 0)
+        proxy._release_decoder_reservation(info)
+        state.release_prefiller_kv(info.prefiller_idx, info.prefiller_score)
+
+    def test_unavailable_remote_fill_accepts_null_prefiller_params(self):
+        state = proxy.ProxyState(
+            [("prefiller", 8001)],
+            [("decoder", 8002)],
+            enable_remote_lmcache_store=True,
+        )
+        proxy.proxy_state = state
+        req_data = {"prompt": "x"}
+        with (
+            patch.object(
+                proxy,
+                "_discover_decoder_remote_fill",
+                AsyncMock(return_value={}),
+            ),
+            patch.object(
+                proxy,
+                "send_request_to_service",
+                AsyncMock(
+                    return_value=SimpleNamespace(
+                        json=lambda: {"kv_transfer_params": None}
+                    )
+                ),
+            ),
+        ):
+            info = asyncio.run(
+                proxy._handle_select_instance("/completions", req_data, 100)
+            )
+
+        self.assertEqual(req_data["kv_transfer_params"], {})
+        self.assertIsNone(info.reservation.remote_fill)
+        proxy._release_decoder_reservation(info)
+        state.release_prefiller_kv(info.prefiller_idx, info.prefiller_score)
+
     def test_disabled_mode_keeps_prefiller_then_decoder_order(self):
         state = proxy.ProxyState([("prefiller", 8001)], [("decoder", 8002)])
         proxy.proxy_state = state

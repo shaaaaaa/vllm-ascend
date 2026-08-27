@@ -1812,7 +1812,10 @@ async def _handle_select_instance(
             decoder_idx = proxy_state.select_decoder(decoder_score)
             decoder = proxy_state.decoders[decoder_idx]
             reservation = DecoderReservation(decoder, decoder_idx, decoder_score)
-            await proxy_state.ensure_decoder_remote_fill(decoder)
+            await proxy_state.ensure_decoder_remote_fill(
+                decoder,
+                wait_for_result=not decoder.decoder_remote_fill,
+            )
             proxy_state.assign_decoder_rank(reservation)
 
         prefiller_idx = proxy_state.select_prefiller(prefiller_score)
@@ -1841,7 +1844,9 @@ async def _handle_select_instance(
                 f"P-node returned invalid JSON for request {request_id}: "
                 f"type={type(response_json).__name__}"
             )
-        returned_params = response_json.get("kv_transfer_params", {})
+        returned_params = response_json.get("kv_transfer_params")
+        if returned_params is None:
+            returned_params = {}
         if not isinstance(returned_params, dict):
             raise TypeError("Prefiller kv_transfer_params must be a dictionary")
         kv_transfer_params = dict(returned_params)
@@ -3042,16 +3047,6 @@ async def lifespan(app: FastAPI):
         metrics_aggregator.start()
     
     logger.info(f"Initialized {len(proxy_state.prefillers)} prefill clients and {len(proxy_state.decoders)} decode clients.")
-    if proxy_state.enable_remote_lmcache_store:
-        await asyncio.gather(
-            *(
-                proxy_state.ensure_decoder_remote_fill(
-                    decoder,
-                    wait_for_result=True,
-                )
-                for decoder in proxy_state.decoders
-            )
-        )
     
     # Print load balance mode
     if global_args.use_original_lb:
