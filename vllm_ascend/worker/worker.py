@@ -21,6 +21,7 @@ import copy
 import faulthandler
 import gc
 import time
+from functools import wraps
 from types import NoneType
 
 import torch
@@ -55,8 +56,12 @@ from vllm_ascend.cpu_binding import bind_cpus
 from vllm_ascend.device_allocator.camem import CaMemAllocator
 from vllm_ascend.distributed.parallel_state import init_ascend_model_parallel
 from vllm_ascend.lmcache_cold_perf import (
+    cold_perf_enabled,
     forget_cold_perf_request,
+    is_cold_perf_request,
     log_cold_perf_event,
+    mark_cold_perf_connector_requests,
+    mark_cold_perf_requests,
 )
 from vllm_ascend.ops.triton.triton_utils import init_device_properties_triton
 from vllm_ascend.utils import (
@@ -85,7 +90,90 @@ _STAGED_SFA_GRAPH_MEMORY_MARGIN_RATIO = 1.1
 # Distinct supervisor-visible status for an unsafe armed RemoteFill DMA.
 # Deployment policy must restart the paired P+D serving group on this code.
 REMOTE_FILL_PAIRED_RESTART_EXIT_CODE = 86
-_COLD_PERF_SAMPLE_STALL_SECONDS = 60
+_COLD_PERF_STALL_SECONDS = 60
+
+
+def _trace_first_cold_perf_execute(method):
+    """Trace the first non-empty batch and every marked cold resume."""
+
+    @wraps(method)
+    def wrapped(self, scheduler_output, *args, **kwargs):
+        if not cold_perf_enabled():
+            return method(self, scheduler_output, *args, **kwargs)
+        scheduled = tuple(
+            str(req_id)
+            for req_id, count in getattr(
+                scheduler_output, "num_scheduled_tokens", {}
+            ).items()
+            if count
+        )
+        mark_cold_perf_connector_requests(
+            getattr(scheduler_output, "kv_connector_metadata", None)
+        )
+        if scheduled and not getattr(self, "_cold_perf_first_execute_marked", False):
+            self._cold_perf_first_execute_marked = True
+            mark_cold_perf_requests(scheduled)
+        request_ids = tuple(
+            req_id for req_id in scheduled if is_cold_perf_request(req_id)
+        )
+        if not request_ids:
+            return method(self, scheduler_output, *args, **kwargs)
+
+        started = time.perf_counter()
+        log_cold_perf_event(
+            "decoder_execute_rpc_entry", request_ids=request_ids, once=True
+        )
+        log_cold_perf_event(
+            "decoder_execute_stall_watchdog_armed",
+            request_ids=request_ids,
+            once=True,
+            timeout_seconds=_COLD_PERF_STALL_SECONDS,
+        )
+        watchdog_armed = False
+        try:
+            try:
+                faulthandler.dump_traceback_later(_COLD_PERF_STALL_SECONDS)
+                watchdog_armed = True
+            except Exception as exc:
+                log_cold_perf_event(
+                    "decoder_execute_stall_watchdog_error",
+                    request_ids=request_ids,
+                    once=True,
+                    operation="arm",
+                    error_type=type(exc).__name__,
+                )
+            output = method(self, scheduler_output, *args, **kwargs)
+            log_cold_perf_event(
+                "decoder_execute_rpc_return",
+                request_ids=request_ids,
+                once=True,
+                elapsed_ms=round((time.perf_counter() - started) * 1000, 3),
+                output_type=type(output).__name__,
+            )
+            return output
+        except BaseException as exc:
+            log_cold_perf_event(
+                "decoder_execute_rpc_error",
+                request_ids=request_ids,
+                once=True,
+                elapsed_ms=round((time.perf_counter() - started) * 1000, 3),
+                error_type=type(exc).__name__,
+            )
+            raise
+        finally:
+            if watchdog_armed:
+                try:
+                    faulthandler.cancel_dump_traceback_later()
+                except Exception as exc:
+                    log_cold_perf_event(
+                        "decoder_execute_stall_watchdog_error",
+                        request_ids=request_ids,
+                        once=True,
+                        operation="cancel",
+                        error_type=type(exc).__name__,
+                    )
+
+    return wrapped
 
 
 def _staged_sfa_graph_memory_reservation(estimate: int) -> int:
@@ -481,6 +569,7 @@ class NPUWorker(WorkerBase):
             # down the full executor instead of continuing with unsafe memory.
             raise SystemExit(REMOTE_FILL_PAIRED_RESTART_EXIT_CODE)
 
+    @_trace_first_cold_perf_execute
     def execute_model(
         self,
         scheduler_output: "SchedulerOutput",
@@ -580,11 +669,11 @@ class NPUWorker(WorkerBase):
                 "decoder_sample_stall_watchdog_armed",
                 request_ids=request_ids,
                 once=True,
-                timeout_seconds=_COLD_PERF_SAMPLE_STALL_SECONDS,
+                timeout_seconds=_COLD_PERF_STALL_SECONDS,
             )
             try:
                 faulthandler.dump_traceback_later(
-                    _COLD_PERF_SAMPLE_STALL_SECONDS
+                    _COLD_PERF_STALL_SECONDS
                 )
                 watchdog_armed = True
             except Exception as exc:

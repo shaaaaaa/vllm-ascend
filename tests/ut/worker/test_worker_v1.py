@@ -245,6 +245,66 @@ class TestNPUWorker(TestBase):
 
         self.assertEqual(fatal.call_count, 2)
 
+    def test_execute_model_traces_only_first_nonempty_batch(self):
+        from vllm.v1.outputs import ModelRunnerOutput
+
+        from vllm_ascend.worker.worker import NPUWorker
+
+        worker = NPUWorker.__new__(NPUWorker)
+        worker._pp_send_work = []
+        worker._raise_if_remote_fill_restart_required = MagicMock()
+        worker.model_runner = MagicMock()
+        output = worker.model_runner.execute_model.return_value = MagicMock(
+            spec=ModelRunnerOutput
+        )
+        first = SimpleNamespace(
+            total_num_scheduled_tokens=1,
+            num_scheduled_tokens={"first": 1},
+            kv_connector_metadata=None,
+        )
+        second = SimpleNamespace(
+            total_num_scheduled_tokens=1,
+            num_scheduled_tokens={"second": 1},
+            kv_connector_metadata=None,
+        )
+
+        with (
+            patch(
+                "vllm_ascend.worker.worker.cold_perf_enabled",
+                return_value=True,
+            ),
+            patch("vllm_ascend.worker.worker.mark_cold_perf_requests") as mark,
+            patch(
+                "vllm_ascend.worker.worker.is_cold_perf_request",
+                side_effect=lambda req_id: req_id == "first",
+            ),
+            patch("vllm_ascend.worker.worker.log_cold_perf_event") as log,
+            patch(
+                "vllm_ascend.worker.worker.faulthandler.dump_traceback_later"
+            ) as arm,
+            patch(
+                "vllm_ascend.worker.worker.faulthandler.cancel_dump_traceback_later"
+            ) as cancel,
+            patch(
+                "vllm_ascend.worker.worker.get_pp_group",
+                return_value=SimpleNamespace(is_first_rank=True),
+            ),
+        ):
+            self.assertIs(worker.execute_model(first), output)
+            self.assertIs(worker.execute_model(second), output)
+
+        mark.assert_called_once_with(("first",))
+        self.assertEqual(
+            [call.args[0] for call in log.call_args_list],
+            [
+                "decoder_execute_rpc_entry",
+                "decoder_execute_stall_watchdog_armed",
+                "decoder_execute_rpc_return",
+            ],
+        )
+        arm.assert_called_once_with(60)
+        cancel.assert_called_once_with()
+
     def test_sample_tokens_checks_fatal_latch_after_success_and_failure(self):
         from vllm_ascend.worker.worker import NPUWorker
 

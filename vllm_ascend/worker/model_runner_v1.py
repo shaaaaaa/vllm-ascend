@@ -2169,6 +2169,12 @@ class NPUModelRunner(GPUModelRunner):
                 deferred=not clear_kv_metadata,
                 order=0,
             )
+        if cold_perf_req_ids:
+            log_cold_perf_event(
+                "decoder_connector_load_start",
+                request_ids=cold_perf_req_ids,
+                once=True,
+            )
         with (
             record_function_or_nullcontext("forward"),
             set_ascend_forward_context(
@@ -2199,6 +2205,12 @@ class NPUModelRunner(GPUModelRunner):
                 ),
             ) as kv_connector_output,
         ):
+            if cold_perf_req_ids:
+                log_cold_perf_event(
+                    "decoder_connector_load_complete",
+                    request_ids=cold_perf_req_ids,
+                    once=True,
+                )
             # Connector metadata is bound by maybe_get_kv_connector_output's
             # __enter__. Sample committed frontiers only after that point so the
             # first forward that can retrieve a new window also forces a remap
@@ -2207,7 +2219,19 @@ class NPUModelRunner(GPUModelRunner):
                 self._staged_sfa_graph_capture_sizes
                 and staged_sfa_graph_key is None
             ):
+                if cold_perf_req_ids:
+                    log_cold_perf_event(
+                        "decoder_capture_unsafe_sync_start",
+                        request_ids=cold_perf_req_ids,
+                        once=True,
+                    )
                 self._synchronize_staged_sfa_capture_unsafe_loads()
+                if cold_perf_req_ids:
+                    log_cold_perf_event(
+                        "decoder_capture_unsafe_sync_complete",
+                        request_ids=cold_perf_req_ids,
+                        once=True,
+                    )
             if diag_enabled and dsa_req_ids is not None:
                 decode_requests = scheduled_decode_requests(
                     dsa_req_ids,
