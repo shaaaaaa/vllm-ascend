@@ -279,6 +279,40 @@ class TestNPUWorker(TestBase):
                     worker.model_runner.abort_kv_connector_finalize.assert_called_once_with()
                 self.assertEqual(fatal.call_count, 2)
 
+    def test_sample_tokens_traces_marked_cold_request(self):
+        from vllm_ascend.worker.worker import NPUWorker
+
+        worker = NPUWorker.__new__(NPUWorker)
+        worker.model_runner = MagicMock()
+        worker.model_runner._cold_perf_current_req_ids = ("cold",)
+        worker.model_runner.sample_tokens.return_value = "output"
+        worker._raise_if_remote_fill_restart_required = MagicMock()
+
+        with (
+            patch("vllm_ascend.worker.worker.log_cold_perf_event") as log,
+            patch(
+                "vllm_ascend.worker.worker.faulthandler.dump_traceback_later"
+            ) as arm,
+            patch(
+                "vllm_ascend.worker.worker.faulthandler.cancel_dump_traceback_later"
+            ) as cancel,
+            patch("vllm_ascend.worker.worker.forget_cold_perf_request") as forget,
+        ):
+            output = worker.sample_tokens(MagicMock())
+
+        self.assertEqual(output, "output")
+        self.assertEqual(
+            [call.args[0] for call in log.call_args_list],
+            [
+                "decoder_sample_rpc_entry",
+                "decoder_sample_stall_watchdog_armed",
+                "decoder_sample_rpc_return",
+            ],
+        )
+        arm.assert_called_once_with(60)
+        cancel.assert_called_once_with()
+        forget.assert_called_once_with("cold")
+
     @patch("vllm_ascend.utils.adapt_patch")
     @patch("vllm_ascend.ops")
     @patch("vllm_ascend.worker.worker._register_atb_extensions")

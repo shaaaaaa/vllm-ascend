@@ -54,6 +54,21 @@ def mark_cold_perf_requests(request_ids: Any) -> None:
     _cold_perf_request_ids.update(str(req_id) for req_id in request_ids)
 
 
+def mark_cold_perf_connector_requests(metadata: Any) -> None:
+    """Mark LMCache cold-compact resumes carried by connector metadata."""
+    if not cold_perf_enabled():
+        return
+    mark_cold_perf_requests(
+        request.req_id
+        for request in getattr(metadata, "requests", ())
+        if getattr(
+            getattr(request, "load_spec", None),
+            "dsa_cold_compact_resume",
+            False,
+        )
+    )
+
+
 def is_cold_perf_request(request_id: str) -> bool:
     return cold_perf_enabled() and request_id in _cold_perf_request_ids
 

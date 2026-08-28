@@ -18,7 +18,9 @@
 #
 
 import copy
+import faulthandler
 import gc
+import time
 from types import NoneType
 
 import torch
@@ -52,6 +54,10 @@ from vllm_ascend.batch_invariant import init_batch_invariance
 from vllm_ascend.cpu_binding import bind_cpus
 from vllm_ascend.device_allocator.camem import CaMemAllocator
 from vllm_ascend.distributed.parallel_state import init_ascend_model_parallel
+from vllm_ascend.lmcache_cold_perf import (
+    forget_cold_perf_request,
+    log_cold_perf_event,
+)
 from vllm_ascend.ops.triton.triton_utils import init_device_properties_triton
 from vllm_ascend.utils import (
     AscendDeviceType,
@@ -79,6 +85,7 @@ _STAGED_SFA_GRAPH_MEMORY_MARGIN_RATIO = 1.1
 # Distinct supervisor-visible status for an unsafe armed RemoteFill DMA.
 # Deployment policy must restart the paired P+D serving group on this code.
 REMOTE_FILL_PAIRED_RESTART_EXIT_CODE = 86
+_COLD_PERF_SAMPLE_STALL_SECONDS = 60
 
 
 def _staged_sfa_graph_memory_reservation(estimate: int) -> int:
@@ -557,20 +564,88 @@ class NPUWorker(WorkerBase):
 
     @torch.inference_mode()
     def sample_tokens(self, grammar_output: "GrammarOutput") -> ModelRunnerOutput | AsyncModelRunnerOutput:
-        self._raise_if_remote_fill_restart_required()
-        try:
-            output = self.model_runner.sample_tokens(grammar_output)
-        except BaseException:
-            # Speculative execution defers connector finalization until after
-            # the draft pass. A failed draft/sample must not leave request
-            # metadata bound for the next scheduler step.
+        request_ids = tuple(
+            getattr(self.model_runner, "_cold_perf_current_req_ids", ()) or ()
+        )
+        rpc_started = time.perf_counter() if request_ids else 0.0
+        diagnostic_active = bool(request_ids)
+        watchdog_armed = False
+        if diagnostic_active:
+            log_cold_perf_event(
+                "decoder_sample_rpc_entry",
+                request_ids=request_ids,
+                once=True,
+            )
+            log_cold_perf_event(
+                "decoder_sample_stall_watchdog_armed",
+                request_ids=request_ids,
+                once=True,
+                timeout_seconds=_COLD_PERF_SAMPLE_STALL_SECONDS,
+            )
             try:
-                self.model_runner.abort_kv_connector_finalize()
-            finally:
-                self._raise_if_remote_fill_restart_required()
+                faulthandler.dump_traceback_later(
+                    _COLD_PERF_SAMPLE_STALL_SECONDS
+                )
+                watchdog_armed = True
+            except Exception as exc:
+                log_cold_perf_event(
+                    "decoder_sample_stall_watchdog_error",
+                    request_ids=request_ids,
+                    once=True,
+                    operation="arm",
+                    error_type=type(exc).__name__,
+                )
+        try:
+            self._raise_if_remote_fill_restart_required()
+            try:
+                output = self.model_runner.sample_tokens(grammar_output)
+            except BaseException:
+                # Speculative execution defers connector finalization until
+                # after the draft pass. A failed draft/sample must not leave
+                # request metadata bound for the next scheduler step.
+                try:
+                    self.model_runner.abort_kv_connector_finalize()
+                finally:
+                    self._raise_if_remote_fill_restart_required()
+                raise
+            self._raise_if_remote_fill_restart_required()
+            if diagnostic_active:
+                log_cold_perf_event(
+                    "decoder_sample_rpc_return",
+                    request_ids=request_ids,
+                    once=True,
+                    elapsed_ms=round(
+                        (time.perf_counter() - rpc_started) * 1000, 3
+                    ),
+                    output_type=type(output).__name__,
+                )
+            return output
+        except BaseException as exc:
+            if diagnostic_active:
+                log_cold_perf_event(
+                    "decoder_sample_rpc_error",
+                    request_ids=request_ids,
+                    once=True,
+                    elapsed_ms=round(
+                        (time.perf_counter() - rpc_started) * 1000, 3
+                    ),
+                    error_type=type(exc).__name__,
+                )
             raise
-        self._raise_if_remote_fill_restart_required()
-        return output
+        finally:
+            if watchdog_armed:
+                try:
+                    faulthandler.cancel_dump_traceback_later()
+                except Exception as exc:
+                    log_cold_perf_event(
+                        "decoder_sample_stall_watchdog_error",
+                        request_ids=request_ids,
+                        once=True,
+                        operation="cancel",
+                        error_type=type(exc).__name__,
+                    )
+            for request_id in request_ids:
+                forget_cold_perf_request(request_id)
 
     def load_model(self) -> None:
         if self.vllm_config.model_config.enable_sleep_mode:

@@ -141,9 +141,9 @@ from vllm_ascend.live_source_handoff import (
 )
 from vllm_ascend.lmcache_cold_perf import (
     cold_perf_enabled,
-    forget_cold_perf_request,
     is_cold_perf_request,
     log_cold_perf_event,
+    mark_cold_perf_connector_requests,
 )
 from vllm_ascend.lmcache_diagnostics import (
     begin_deferred_diagnostic_step,
@@ -1787,13 +1787,18 @@ class NPUModelRunner(GPUModelRunner):
         ):
             scheduler_output = deepcopy(scheduler_output)
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
+        cold_perf_active = cold_perf_enabled()
+        if cold_perf_active:
+            mark_cold_perf_connector_requests(
+                getattr(scheduler_output, "kv_connector_metadata", None)
+            )
         cold_perf_req_ids = (
             [
                 req_id
                 for req_id in scheduler_output.num_scheduled_tokens
                 if is_cold_perf_request(req_id)
             ]
-            if cold_perf_enabled()
+            if cold_perf_active
             else []
         )
         cold_perf_execute_start = (
@@ -2453,11 +2458,12 @@ class NPUModelRunner(GPUModelRunner):
         cold_perf_sample_start = (
             time.perf_counter() if cold_perf_req_ids else 0.0
         )
-        log_cold_perf_event(
-            "decoder_sample_start",
-            request_ids=cold_perf_req_ids,
-            once=True,
-        )
+        if cold_perf_req_ids:
+            log_cold_perf_event(
+                "decoder_sample_start",
+                request_ids=cold_perf_req_ids,
+                once=True,
+            )
 
         if self.execute_model_state is None:
             # Nothing to do (PP non-final rank case), output isn't used.
@@ -2507,6 +2513,15 @@ class NPUModelRunner(GPUModelRunner):
 
         with record_function_or_nullcontext("sample_token"):
             sampler_output = self._sample(logits, spec_decode_metadata)
+        if cold_perf_req_ids:
+            log_cold_perf_event(
+                "decoder_sample_target_complete",
+                request_ids=cold_perf_req_ids,
+                once=True,
+                elapsed_ms=round(
+                    (time.perf_counter() - cold_perf_sample_start) * 1000, 3
+                ),
+            )
         if envs_ascend.VLLM_ASCEND_MTP_DRAFT_DEBUG:
             target_tail_boundary(
                 getattr(self, "_target_sfa_diag_session", None),
@@ -2545,6 +2560,12 @@ class NPUModelRunner(GPUModelRunner):
                 )
             self._copy_draft_token_ids_to_cpu(scheduler_output)
 
+        if cold_perf_req_ids:
+            log_cold_perf_event(
+                "decoder_sample_bookkeeping_start",
+                request_ids=cold_perf_req_ids,
+                once=True,
+            )
         (
             logprobs_lists,
             valid_sampled_token_ids,
@@ -2562,7 +2583,7 @@ class NPUModelRunner(GPUModelRunner):
         )
         if cold_perf_req_ids:
             log_cold_perf_event(
-                "decoder_sample_complete",
+                "decoder_sample_bookkeeping_complete",
                 request_ids=cold_perf_req_ids,
                 once=True,
                 elapsed_ms=round(
@@ -2570,8 +2591,6 @@ class NPUModelRunner(GPUModelRunner):
                 ),
                 output_request_count=len(req_ids_output_copy),
             )
-            for req_id in cold_perf_req_ids:
-                forget_cold_perf_request(req_id)
         _mtp_dw_for_requests(
             self,
             scheduler_output,
@@ -2584,6 +2603,13 @@ class NPUModelRunner(GPUModelRunner):
 
         with record_function_or_nullcontext("draft_token"):
             if self.speculative_config:
+                if cold_perf_req_ids:
+                    log_cold_perf_event(
+                        "decoder_sample_draft_start",
+                        request_ids=cold_perf_req_ids,
+                        once=True,
+                        draft_method=getattr(self.drafter, "method", None),
+                    )
                 use_padded_batch = (
                     self.speculative_config
                     and (self.speculative_config.use_eagle() or self.speculative_config.uses_draft_model())
@@ -2597,6 +2623,19 @@ class NPUModelRunner(GPUModelRunner):
                     # ngram and other speculative decoding methods use the sampled
                     # tokens on the CPU, so they are run after bookkeeping.
                     propose_draft_token_ids(valid_sampled_token_ids)
+
+                if cold_perf_req_ids:
+                    log_cold_perf_event(
+                        "decoder_sample_draft_complete",
+                        request_ids=cold_perf_req_ids,
+                        once=True,
+                        elapsed_ms=round(
+                            (time.perf_counter() - cold_perf_sample_start)
+                            * 1000,
+                            3,
+                        ),
+                        draft_method=getattr(self.drafter, "method", None),
+                    )
 
                 if _mtp_dw_diag_enabled():
                     draft_counts = {}
@@ -2630,9 +2669,26 @@ class NPUModelRunner(GPUModelRunner):
 
             if has_kv_transfer_group():
                 if self.speculative_config:
+                    if cold_perf_req_ids:
+                        log_cold_perf_event(
+                            "decoder_connector_finalize_start",
+                            request_ids=cold_perf_req_ids,
+                            once=True,
+                        )
                     finalized = self.finalize_kv_connector(
                         scheduler_output.finished_req_ids
                     )
+                    if cold_perf_req_ids:
+                        log_cold_perf_event(
+                            "decoder_connector_finalize_complete",
+                            request_ids=cold_perf_req_ids,
+                            once=True,
+                            elapsed_ms=round(
+                                (time.perf_counter() - cold_perf_sample_start)
+                                * 1000,
+                                3,
+                            ),
+                        )
                     diag_req_ids = getattr(
                         self, "_mtp_dw_diag_current_req_ids", set()
                     )
@@ -2690,12 +2746,28 @@ class NPUModelRunner(GPUModelRunner):
 
         if self.need_accepted_tokens:
             assert self.sampling_done_event is not None
+            if cold_perf_req_ids:
+                log_cold_perf_event(
+                    "decoder_sample_state_update_start",
+                    request_ids=cold_perf_req_ids,
+                    once=True,
+                )
             with (
                 record_function_or_nullcontext("async_state_update"),
                 torch.npu.stream(global_stream()),
             ):
                 global_stream().wait_event(self.sampling_done_event)
                 self._update_states_after_model_execute(sampler_output.sampled_token_ids, scheduler_output)
+            if cold_perf_req_ids:
+                log_cold_perf_event(
+                    "decoder_sample_state_update_complete",
+                    request_ids=cold_perf_req_ids,
+                    once=True,
+                    elapsed_ms=round(
+                        (time.perf_counter() - cold_perf_sample_start) * 1000,
+                        3,
+                    ),
+                )
 
         # In async scheduling + PP, broadcast sampled token ids from the
         # last PP rank so other PP ranks can receive them without going
@@ -2720,6 +2792,17 @@ class NPUModelRunner(GPUModelRunner):
                         metadata,
                     )
             flush_deferred_diagnostics()
+
+        if cold_perf_req_ids:
+            log_cold_perf_event(
+                "decoder_sample_complete",
+                request_ids=cold_perf_req_ids,
+                once=True,
+                elapsed_ms=round(
+                    (time.perf_counter() - cold_perf_sample_start) * 1000, 3
+                ),
+                output_request_count=len(req_ids_output_copy),
+            )
 
         if not self.use_async_scheduling:
             return model_runner_output
