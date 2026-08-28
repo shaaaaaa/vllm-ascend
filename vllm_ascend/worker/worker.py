@@ -460,7 +460,9 @@ class NPUWorker(WorkerBase):
         )
         if callable(check) and bool(check()):
             logger.critical(
-                "[LMCACHE_REMOTE_FILL_VALIDATION] code=RF-D-900 "
+                "[LMCACHE_REMOTE_FILL_DIAGNOSTIC] "
+                "event=remote_fill_fatal_restart "
+                "diagnostic_name=decoder_memory_safety_uncertain code=RF-D-900 "
                 "stage=worker_process_boundary "
                 "action=PAIRED_RESTART_REQUIRED: an armed native transfer "
                 "has uncertain completion; this worker is exiting deliberately "
