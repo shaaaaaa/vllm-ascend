@@ -1,6 +1,12 @@
 from types import SimpleNamespace
 
+from vllm.logger import logger
+
 import vllm_ascend.lmcache_cold_perf as cold_perf
+
+
+def test_uses_configured_vllm_logger():
+    assert cold_perf.logger is logger
 
 
 def test_marks_only_lmcache_cold_compact_resumes(monkeypatch):

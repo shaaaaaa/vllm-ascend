@@ -289,6 +289,10 @@ class TestNPUWorker(TestBase):
                 "vllm_ascend.worker.worker.get_pp_group",
                 return_value=SimpleNamespace(is_first_rank=True),
             ),
+            patch(
+                "vllm_ascend.worker.worker.get_tp_group",
+                return_value=SimpleNamespace(rank_in_group=3),
+            ),
         ):
             self.assertIs(worker.execute_model(first), output)
             self.assertIs(worker.execute_model(second), output)
@@ -302,8 +306,10 @@ class TestNPUWorker(TestBase):
                 "decoder_execute_rpc_return",
             ],
         )
-        arm.assert_called_once_with(60)
+        arm.assert_called_once_with(75)
         cancel.assert_called_once_with()
+        self.assertEqual(log.call_args_list[0].kwargs["tp_rank"], 3)
+        self.assertEqual(log.call_args_list[1].kwargs["timeout_seconds"], 75)
 
     def test_sample_tokens_checks_fatal_latch_after_success_and_failure(self):
         from vllm_ascend.worker.worker import NPUWorker
@@ -357,6 +363,10 @@ class TestNPUWorker(TestBase):
                 "vllm_ascend.worker.worker.faulthandler.cancel_dump_traceback_later"
             ) as cancel,
             patch("vllm_ascend.worker.worker.forget_cold_perf_request") as forget,
+            patch(
+                "vllm_ascend.worker.worker.get_tp_group",
+                return_value=SimpleNamespace(rank_in_group=2),
+            ),
         ):
             output = worker.sample_tokens(MagicMock())
 
@@ -369,9 +379,11 @@ class TestNPUWorker(TestBase):
                 "decoder_sample_rpc_return",
             ],
         )
-        arm.assert_called_once_with(60)
+        arm.assert_called_once_with(70)
         cancel.assert_called_once_with()
         forget.assert_called_once_with("cold")
+        self.assertEqual(log.call_args_list[0].kwargs["tp_rank"], 2)
+        self.assertEqual(log.call_args_list[1].kwargs["timeout_seconds"], 70)
 
     @patch("vllm_ascend.utils.adapt_patch")
     @patch("vllm_ascend.ops")

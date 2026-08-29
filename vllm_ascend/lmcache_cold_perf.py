@@ -8,9 +8,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from vllm.logger import init_logger
-
-logger = init_logger(__name__)
+from vllm.logger import logger
 
 _FALSE_VALUES = ("", "0", "false", "no", "off")
 _COLD_PERF_ENABLED = os.environ.get(

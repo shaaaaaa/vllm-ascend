@@ -91,6 +91,18 @@ _STAGED_SFA_GRAPH_MEMORY_MARGIN_RATIO = 1.1
 # Deployment policy must restart the paired P+D serving group on this code.
 REMOTE_FILL_PAIRED_RESTART_EXIT_CODE = 86
 _COLD_PERF_STALL_SECONDS = 60
+_COLD_PERF_STALL_STAGGER_SECONDS = 5
+
+
+def _cold_perf_watchdog_rank_and_timeout() -> tuple[int, int]:
+    try:
+        tp_rank = int(get_tp_group().rank_in_group)
+    except Exception:
+        tp_rank = 0
+    return tp_rank, (
+        _COLD_PERF_STALL_SECONDS
+        + tp_rank * _COLD_PERF_STALL_STAGGER_SECONDS
+    )
 
 
 def _trace_first_cold_perf_execute(method):
@@ -120,19 +132,24 @@ def _trace_first_cold_perf_execute(method):
             return method(self, scheduler_output, *args, **kwargs)
 
         started = time.perf_counter()
+        tp_rank, watchdog_timeout = _cold_perf_watchdog_rank_and_timeout()
         log_cold_perf_event(
-            "decoder_execute_rpc_entry", request_ids=request_ids, once=True
+            "decoder_execute_rpc_entry",
+            request_ids=request_ids,
+            once=True,
+            tp_rank=tp_rank,
         )
         log_cold_perf_event(
             "decoder_execute_stall_watchdog_armed",
             request_ids=request_ids,
             once=True,
-            timeout_seconds=_COLD_PERF_STALL_SECONDS,
+            tp_rank=tp_rank,
+            timeout_seconds=watchdog_timeout,
         )
         watchdog_armed = False
         try:
             try:
-                faulthandler.dump_traceback_later(_COLD_PERF_STALL_SECONDS)
+                faulthandler.dump_traceback_later(watchdog_timeout)
                 watchdog_armed = True
             except Exception as exc:
                 log_cold_perf_event(
@@ -660,21 +677,22 @@ class NPUWorker(WorkerBase):
         diagnostic_active = bool(request_ids)
         watchdog_armed = False
         if diagnostic_active:
+            tp_rank, watchdog_timeout = _cold_perf_watchdog_rank_and_timeout()
             log_cold_perf_event(
                 "decoder_sample_rpc_entry",
                 request_ids=request_ids,
                 once=True,
+                tp_rank=tp_rank,
             )
             log_cold_perf_event(
                 "decoder_sample_stall_watchdog_armed",
                 request_ids=request_ids,
                 once=True,
-                timeout_seconds=_COLD_PERF_STALL_SECONDS,
+                tp_rank=tp_rank,
+                timeout_seconds=watchdog_timeout,
             )
             try:
-                faulthandler.dump_traceback_later(
-                    _COLD_PERF_STALL_SECONDS
-                )
+                faulthandler.dump_traceback_later(watchdog_timeout)
                 watchdog_armed = True
             except Exception as exc:
                 log_cold_perf_event(
