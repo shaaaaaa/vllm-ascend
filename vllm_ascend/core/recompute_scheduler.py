@@ -46,6 +46,13 @@ from vllm.v1.sample.rejection_sampler import PLACEHOLDER_TOKEN_ID
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.utils import ConstantList, record_function_or_nullcontext
 
+from vllm_ascend.lmcache_cold_perf import (
+    cold_perf_enabled,
+    is_cold_perf_request,
+    log_cold_perf_event,
+    mark_cold_perf_connector_requests,
+)
+
 
 # `spec_manager_map` in single_type_kv_cache_manager is a module-level dict
 # whose keys are class objects bound at import time.  When the async
@@ -242,6 +249,8 @@ class RecomputeScheduler(Scheduler):
 
         # For logging.
         scheduled_timestamp = time.monotonic()
+        cold_perf_active = cold_perf_enabled()
+        cold_perf_schedule_operands: dict[str, dict[str, object]] = {}
 
         self.kv_cache_manager.new_step_starts()
 
@@ -388,6 +397,16 @@ class RecomputeScheduler(Scheduler):
             request_id = request.request_id
             req_to_new_blocks[request_id] = new_blocks
             num_scheduled_tokens[request_id] = num_new_tokens
+            if cold_perf_active:
+                cold_perf_schedule_operands[request_id] = {
+                    "queue": "running",
+                    "status": str(request.status),
+                    "num_scheduled_tokens": num_new_tokens,
+                    "num_tokens_with_spec": request.num_tokens_with_spec,
+                    "num_computed_tokens": request.num_computed_tokens,
+                    "num_output_placeholders": request.num_output_placeholders,
+                    "spec_token_count": len(request.spec_token_ids),
+                }
             token_budget -= num_new_tokens
             req_index += 1
 
@@ -653,6 +672,17 @@ class RecomputeScheduler(Scheduler):
                     request.num_computed_tokens = num_computed_tokens
                     continue
 
+                if cold_perf_active:
+                    cold_perf_schedule_operands[request_id] = {
+                        "queue": "waiting",
+                        "status": str(request.status),
+                        "num_scheduled_tokens": num_new_tokens,
+                        "num_tokens_with_spec": request.num_tokens_with_spec,
+                        "num_computed_tokens": num_computed_tokens,
+                        "num_output_placeholders": request.num_output_placeholders,
+                        "spec_token_count": len(request.spec_token_ids),
+                    }
+
                 # For spec_token_ids, the waiting queue has the same processing
                 # as the running queue.
                 if self.is_mtp_kv_consumer and request.spec_token_ids:
@@ -792,6 +822,22 @@ class RecomputeScheduler(Scheduler):
         if self.connector is not None:
             meta: KVConnectorMetadata = self.connector.build_connector_meta(scheduler_output)
             scheduler_output.kv_connector_metadata = meta
+            if cold_perf_active:
+                mark_cold_perf_connector_requests(meta)
+                cold_req_ids = [
+                    req_id
+                    for req_id in num_scheduled_tokens
+                    if is_cold_perf_request(req_id)
+                ]
+                log_cold_perf_event(
+                    "decoder_schedule_operands",
+                    request_ids=cold_req_ids,
+                    once=True,
+                    requests=[
+                        {"request_id": req_id, **cold_perf_schedule_operands[req_id]}
+                        for req_id in cold_req_ids
+                    ],
+                )
 
         # Build the connector meta for ECConnector
         if self.ec_connector is not None:

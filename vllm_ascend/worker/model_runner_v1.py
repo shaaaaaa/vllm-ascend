@@ -1944,28 +1944,47 @@ class NPUModelRunner(GPUModelRunner):
                     and staged_sfa_graph_key is None
                 ):
                     cudagraph_mode = CUDAGraphMode.NONE
-                log_cold_perf_event(
-                    "decoder_execution_route",
-                    request_ids=cold_perf_req_ids,
-                    once=True,
-                    dispatched_graph_mode=str(dispatched_cudagraph_mode),
-                    runtime_graph_mode=str(cudagraph_mode),
-                    graph_enabled=cudagraph_mode != CUDAGraphMode.NONE,
-                    staged_graph_selected=staged_sfa_graph_key is not None,
-                    staged_action=staged_sfa_route.action.value,
-                    staged_reason=staged_sfa_route.reason.value,
-                    staged_graph_key=(
-                        str(staged_sfa_graph_key)
-                        if staged_sfa_graph_key is not None
-                        else None
-                    ),
-                    cold_compact_resume_count=sum(
-                        bool(value)
-                        for value in staged_sfa_route.cold_compact_resumes
-                    ),
-                    num_tokens_unpadded=num_tokens_unpadded,
-                    num_tokens_padded=num_tokens_padded,
-                )
+                if cold_perf_req_ids:
+                    log_cold_perf_event(
+                        "decoder_execution_route",
+                        request_ids=cold_perf_req_ids,
+                        once=True,
+                        batch_request_ids=list(
+                            self.input_batch.req_ids[:num_reqs]
+                        ),
+                        dispatched_graph_mode=str(dispatched_cudagraph_mode),
+                        runtime_graph_mode=str(cudagraph_mode),
+                        graph_enabled=cudagraph_mode != CUDAGraphMode.NONE,
+                        staged_graph_selected=staged_sfa_graph_key is not None,
+                        staged_action=staged_sfa_route.action.value,
+                        staged_reason=staged_sfa_route.reason.value,
+                        staged_graph_key=(
+                            str(staged_sfa_graph_key)
+                            if staged_sfa_graph_key is not None
+                            else None
+                        ),
+                        cold_compact_resume_count=sum(
+                            bool(value)
+                            for value in staged_sfa_route.cold_compact_resumes
+                        ),
+                        num_reqs=num_reqs,
+                        num_scheduled_tokens=num_scheduled_tokens_np.tolist(),
+                        query_width=1
+                        + int(
+                            getattr(
+                                self.speculative_config,
+                                "num_speculative_tokens",
+                                0,
+                            )
+                        ),
+                        decode_threshold=self.decode_threshold,
+                        attention_state=str(self.attn_state),
+                        staged_graph_capture_token_sizes=list(
+                            self._staged_sfa_graph_capture_sizes
+                        ),
+                        num_tokens_unpadded=num_tokens_unpadded,
+                        num_tokens_padded=num_tokens_padded,
+                    )
                 num_reqs_padded = batch_desc.num_reqs if batch_desc.num_reqs is not None else num_reqs
                 ubatch_slices, ubatch_slices_padded = maybe_create_ubatch_slices(
                     should_ubatch,
