@@ -98,7 +98,12 @@ class TestSchedulerDynamicBatch(TestBase):
 
     @patch("vllm.config.ModelConfig.__post_init__", MagicMock())
     @patch("vllm.config.VllmConfig.__post_init__", MagicMock())
-    def create_scheduler(self, *, multimodal: bool = True):
+    def create_scheduler(
+        self,
+        *,
+        multimodal: bool = True,
+        scheduler_cls=SchedulerDynamicBatch,
+    ):
         use_kv_connector = False
         block_size = 16
 
@@ -180,7 +185,7 @@ class TestSchedulerDynamicBatch(TestBase):
         kv_cache_config.hash_block_size = block_size
         cache_config.num_gpu_blocks = 10000
 
-        scheduler = SchedulerDynamicBatch(
+        scheduler = scheduler_cls(
             vllm_config=vllm_config,
             kv_cache_config=kv_cache_config,
             block_size=block_size,
@@ -288,6 +293,42 @@ class TestSchedulerDynamicBatch(TestBase):
         self.assertEqual(request.status, RequestStatus.WAITING_FOR_REMOTE_KVS)
         self.assertEqual(request.num_external_computed_tokens, external_tokens)
         self.assertEqual(request.num_computed_tokens, external_tokens)
+
+    def test_recompute_remote_load_preserves_admitted_frontier(self):
+        scheduler = self.create_scheduler(
+            multimodal=False, scheduler_cls=RecomputeScheduler
+        )
+        request = create_requests(num_requests=1, num_tokens=20)[0]
+        admitted_tokens = 13
+        request.num_computed_tokens = admitted_tokens
+        request.num_external_computed_tokens = admitted_tokens
+        request.num_cached_tokens = 4
+        request.num_preemptions = 1
+        request.status = RequestStatus.WAITING_FOR_REMOTE_KVS
+        scheduler.connector = MagicMock()
+        scheduler.finished_recving_kv_req_ids.add(request.request_id)
+
+        with (
+            patch.object(
+                scheduler.kv_cache_manager, "cache_blocks"
+            ) as cache_blocks,
+            patch.object(
+                scheduler.kv_cache_manager,
+                "get_block_ids",
+                return_value=([1, 2], [3, 4]),
+            ) as get_block_ids,
+        ):
+            promoted = scheduler._try_promote_blocked_waiting_request(request)
+
+        self.assertTrue(promoted)
+        cache_blocks.assert_called_once_with(request, admitted_tokens)
+        get_block_ids.assert_not_called()
+        self.assertNotIn(
+            request.request_id, scheduler.finished_recving_kv_req_ids
+        )
+        self.assertEqual(request.status, RequestStatus.PREEMPTED)
+        self.assertEqual(request.num_computed_tokens, admitted_tokens)
+        self.assertEqual(request.num_cached_tokens, admitted_tokens)
 
     def test_schedule_multimodal_requests(self):
         scheduler = self.create_scheduler()
