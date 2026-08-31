@@ -33,7 +33,7 @@ def _remote_fill(dp_rank: int = 0) -> dict:
     }
 
 
-def _prime_remote_fill(state, dp_rank: int = 0):
+def _prime_remote_fill(state, dp_rank: int = 0, api_dp_rank: int | None = None):
     decoder = state.decoders[0]
     decoder.decoder_remote_fill = {
         dp_rank: {
@@ -41,7 +41,10 @@ def _prime_remote_fill(state, dp_rank: int = 0):
             for key, value in _remote_fill(dp_rank).items()
             if key not in {"enabled", "tp_rank", "dp_rank"}
         }
-        | {"destination_dp_rank": dp_rank}
+        | {
+            "api_dp_rank": dp_rank if api_dp_rank is None else api_dp_rank,
+            "destination_dp_rank": dp_rank,
+        }
     }
     decoder.decoder_rank_active_tokens = {dp_rank: 0.0}
     decoder.decoder_placement_discovered_at = time.monotonic()
@@ -141,7 +144,14 @@ class TestEnhancedRemoteFillProxy(unittest.TestCase):
     def test_remote_fill_only_placement_is_valid(self):
         placement = _remote_fill()
         payload = {
-            "results": [{"dp_rank": 0, "segment": None, "remote_fill": placement}]
+            "results": [
+                {
+                    "dp_rank": 0,
+                    "api_dp_rank": 0,
+                    "segment": None,
+                    "remote_fill": placement,
+                }
+            ]
         }
         self.assertEqual(
             proxy._parse_decoder_remote_fill_response(payload)[0][
@@ -155,13 +165,40 @@ class TestEnhancedRemoteFillProxy(unittest.TestCase):
         payload = {
             "results": [
                 None,
-                {"dp_rank": 1, "segment": None, "remote_fill": remote_fill},
+                {
+                    "dp_rank": 1,
+                    "api_dp_rank": 0,
+                    "segment": None,
+                    "remote_fill": remote_fill,
+                },
             ]
         }
-        self.assertEqual(
-            proxy._parse_decoder_remote_fill_response(payload),
-            example_proxy._parse_decoder_remote_fill_response(payload),
-        )
+        parsed = proxy._parse_decoder_remote_fill_response(payload)
+        self.assertEqual(parsed[1].pop("api_dp_rank"), 0)
+        self.assertEqual(parsed, example_proxy._parse_decoder_remote_fill_response(payload))
+
+    def test_remote_fill_parser_requires_api_dp_rank(self):
+        payload = {
+            "results": [
+                {"dp_rank": 1, "segment": None, "remote_fill": _remote_fill(1)}
+            ]
+        }
+        with self.assertRaisesRegex(ValueError, "TP0/DP rank"):
+            proxy._parse_decoder_remote_fill_response(payload)
+
+    def test_external_dp_reservation_separates_api_and_remote_fill_ranks(self):
+        state = proxy.ProxyState([("prefiller", 8001)], [("decoder", 8002)])
+        proxy.proxy_state = state
+        _prime_remote_fill(state, dp_rank=1, api_dp_rank=0)
+        info = _reserve_instance(state)
+
+        state.assign_decoder_rank(info.reservation)
+
+        self.assertEqual(info.reservation.dp_rank, 1)
+        self.assertEqual(info.reservation.api_dp_rank, 0)
+        self.assertEqual(info.reservation.remote_fill["destination_dp_rank"], 1)
+        self.assertNotIn("api_dp_rank", info.reservation.remote_fill)
+        proxy._release_decoder_reservation(info)
 
     def test_discovery_refresh_preserves_active_rank_load(self):
         state = proxy.ProxyState(
@@ -322,7 +359,7 @@ class TestEnhancedRemoteFillProxy(unittest.TestCase):
             key: value
             for key, value in _remote_fill().items()
             if key not in {"enabled", "tp_rank", "dp_rank"}
-        } | {"destination_dp_rank": 0}
+        } | {"api_dp_rank": 0, "destination_dp_rank": 0}
 
         async def send(*args, **kwargs):
             handoff = kwargs["remote_fill_handoff"]
@@ -561,7 +598,7 @@ class TestEnhancedRemoteFillProxy(unittest.TestCase):
         transform.assert_not_called()
         self.assertIn("disabled", result["error"])
 
-    def test_decoder_transport_sends_reserved_dp_rank(self):
+    def test_decoder_transport_sends_api_dp_rank(self):
         captured = {}
 
         class Response:
@@ -591,7 +628,7 @@ class TestEnhancedRemoteFillProxy(unittest.TestCase):
                     "/completions",
                     {},
                     "request",
-                    decoder_dp_rank=3,
+                    decoder_api_dp_rank=3,
                 )
             ]
 
@@ -706,6 +743,8 @@ class TestEnhancedRemoteFillProxy(unittest.TestCase):
         state = proxy.ProxyState([("prefiller", 8001)], [("decoder", 8002)])
         proxy.proxy_state = state
         info = _reserve_instance(state)
+        info.reservation.dp_rank = 1
+        info.reservation.api_dp_rank = 0
         request = SimpleNamespace(
             json=AsyncMock(return_value={"prompt": "hello", "stream": False}),
             body=AsyncMock(return_value=b"hello"),
@@ -716,6 +755,7 @@ class TestEnhancedRemoteFillProxy(unittest.TestCase):
             headers={"content-type": "application/json"},
             request=httpx.Request("POST", "http://decoder"),
         )
+        post = AsyncMock(return_value=backend_response)
         with (
             patch.object(
                 proxy,
@@ -725,7 +765,7 @@ class TestEnhancedRemoteFillProxy(unittest.TestCase):
             patch.object(
                 info.decoder.client,
                 "post",
-                AsyncMock(return_value=backend_response),
+                post,
             ),
         ):
             response = asyncio.run(
@@ -735,6 +775,7 @@ class TestEnhancedRemoteFillProxy(unittest.TestCase):
         self.assertNotIsInstance(response, proxy.StreamingResponse)
         self.assertEqual(response.status_code, 200)
         self.assertEqual(json.loads(response.body)["choices"][0]["text"], "ok")
+        self.assertEqual(post.await_args.kwargs["headers"]["X-data-parallel-rank"], "0")
         self.assertEqual(state.request_num, 0)
         self.assertEqual(state.prefillers[0].active_kv_cache, 0)
         self.assertEqual(state.decoders[0].active_tokens, 0)
@@ -743,12 +784,15 @@ class TestEnhancedRemoteFillProxy(unittest.TestCase):
         state = proxy.ProxyState([("prefiller", 8001)], [("decoder", 8002)])
         proxy.proxy_state = state
         info = _reserve_instance(state)
+        info.reservation.dp_rank = 1
+        info.reservation.api_dp_rank = 0
         request = SimpleNamespace(
             json=AsyncMock(return_value={"prompt": "hello", "stream": True}),
             body=AsyncMock(return_value=b"hello"),
         )
 
         async def stream(*args, **kwargs):
+            self.assertEqual(kwargs["decoder_api_dp_rank"], 0)
             yield b'data: {"choices":[{"text":"x"}]}\n\n'
             raise httpx.ReadError(
                 "stream failed",

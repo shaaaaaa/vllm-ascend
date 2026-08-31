@@ -847,12 +847,13 @@ class NPUWorker(WorkerBase):
             return None
         parallel_config = self.vllm_config.parallel_config
         local_dp_rank = getattr(parallel_config, "data_parallel_rank_local", None)
-        route_dp_rank = (
+        api_dp_rank = (
             local_dp_rank
             if getattr(parallel_config, "local_engines_only", False)
             and local_dp_rank is not None
             else parallel_config.data_parallel_rank
         )
+        placement_dp_rank = api_dp_rank
         if remote_fill is not None:
             advertised_dp_rank = remote_fill.get("dp_rank")
             if (
@@ -863,16 +864,15 @@ class NPUWorker(WorkerBase):
                 raise ValueError(
                     "Remote-fill placement has an invalid data-parallel rank"
                 )
-            # LMCache initializes the decoder service with vLLM's routable
-            # data_parallel_index. Keep the outer collective record bound to
-            # that same identity even when local-engine legacy Mooncake
-            # placement uses a node-local rank.
-            route_dp_rank = advertised_dp_rank
+            # RemoteFill uses the global data_parallel_index, while the API
+            # header addresses this server's local engine list.
+            placement_dp_rank = advertised_dp_rank
         placement = {
-            "dp_rank": route_dp_rank,
+            "dp_rank": placement_dp_rank,
             "segment": segment,
         }
         if remote_fill is not None:
+            placement["api_dp_rank"] = api_dp_rank
             placement["remote_fill"] = remote_fill
         return placement
 

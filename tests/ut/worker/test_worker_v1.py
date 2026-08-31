@@ -135,7 +135,12 @@ class TestNPUWorker(TestBase):
         ):
             self.assertEqual(
                 worker.get_mooncake_placement_info(),
-                {"dp_rank": 5, "segment": None, "remote_fill": remote_fill},
+                {
+                    "dp_rank": 5,
+                    "api_dp_rank": 0,
+                    "segment": None,
+                    "remote_fill": remote_fill,
+                },
             )
 
     def test_remote_fill_fatal_latch_exits_before_health_probe(self):

@@ -174,6 +174,7 @@ class DecoderReservation:
     decoder_idx: int
     decoder_score: float
     dp_rank: int | None = None
+    api_dp_rank: int | None = None
     remote_fill: dict[str, Any] | None = None
 
 
@@ -1266,9 +1267,9 @@ class ProxyState:
             server.decoder_rank_active_tokens[dp_rank] += reservation.decoder_score
             reservation.dp_rank = dp_rank
             remote_fill = server.decoder_remote_fill.get(dp_rank)
-            reservation.remote_fill = (
-                dict(remote_fill) if remote_fill is not None else None
-            )
+            if remote_fill is not None:
+                reservation.remote_fill = dict(remote_fill)
+                reservation.api_dp_rank = reservation.remote_fill.pop("api_dp_rank")
             return reservation
 
     def _decoder_placement_is_fresh(self, server: ServerState, now: float) -> bool:
@@ -1565,6 +1566,7 @@ def _parse_decoder_remote_fill_response(payload: Any) -> dict[int, dict[str, Any
         if remote_fill.get("enabled") is not True:
             continue
         dp_rank = result.get("dp_rank")
+        api_dp_rank = result.get("api_dp_rank")
         advertised_dp_rank = remote_fill.get("dp_rank")
         advertised_tp_rank = remote_fill.get("tp_rank")
         if (
@@ -1574,6 +1576,9 @@ def _parse_decoder_remote_fill_response(payload: Any) -> dict[int, dict[str, Any
             or isinstance(advertised_dp_rank, bool)
             or not isinstance(advertised_dp_rank, int)
             or advertised_dp_rank != dp_rank
+            or isinstance(api_dp_rank, bool)
+            or not isinstance(api_dp_rank, int)
+            or api_dp_rank < 0
             or isinstance(advertised_tp_rank, bool)
             or not isinstance(advertised_tp_rank, int)
             or advertised_tp_rank != 0
@@ -1634,6 +1639,7 @@ def _parse_decoder_remote_fill_response(payload: Any) -> dict[int, dict[str, Any
         ):
             raise ValueError("Decoder remote-fill hash identity is invalid")
         placement = {
+            "api_dp_rank": api_dp_rank,
             "destination_engine_id": remote_fill["destination_engine_id"].strip(),
             "destination_engine_epoch": epoch,
             "control_endpoint": remote_fill["control_endpoint"].strip(),
@@ -1687,14 +1693,14 @@ def _http_timeout(read_timeout: float) -> httpx.Timeout:
 
 def _decoder_headers(
     request_id: str,
-    decoder_dp_rank: int | None,
+    decoder_api_dp_rank: int | None,
 ) -> dict[str, str]:
     headers = {
         "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}",
         "X-Request-Id": request_id,
     }
-    if decoder_dp_rank is not None:
-        headers["X-data-parallel-rank"] = str(decoder_dp_rank)
+    if decoder_api_dp_rank is not None:
+        headers["X-data-parallel-rank"] = str(decoder_api_dp_rank)
     return headers
 
 
@@ -1764,13 +1770,13 @@ async def stream_decoder_response(
     endpoint: str,
     req_data: dict,
     request_id: str,
-    decoder_dp_rank: int | None = None,
+    decoder_api_dp_rank: int | None = None,
 ):
     async with client.stream(
         "POST",
         endpoint,
         json=req_data,
-        headers=_decoder_headers(request_id, decoder_dp_rank),
+        headers=_decoder_headers(request_id, decoder_api_dp_rank),
         timeout=_http_timeout(global_args.decoder_read_timeout),
     ) as response:
         response.raise_for_status()
@@ -2325,12 +2331,18 @@ async def _handle_completions(api: str, request: Request):
         if not stream_flag:
             retry_count = 0
             while True:
-                dp_rank = instance_info.reservation.dp_rank if instance_info.reservation else None
+                api_dp_rank = (
+                    instance_info.reservation.api_dp_rank
+                    if instance_info.reservation
+                    else None
+                )
                 response = await asyncio.wait_for(
                     instance_info.decoder.client.post(
                         api,
                         json=req_data,
-                        headers=_decoder_headers(instance_info.request_id, dp_rank),
+                        headers=_decoder_headers(
+                            instance_info.request_id, api_dp_rank
+                        ),
                         timeout=_http_timeout(global_args.backend_request_timeout),
                     ),
                     timeout=global_args.backend_request_timeout,
@@ -2398,8 +2410,8 @@ async def _handle_completions(api: str, request: Request):
                         api,
                         req_data,
                         request_id=instance_info.request_id,
-                        decoder_dp_rank=(
-                            instance_info.reservation.dp_rank
+                        decoder_api_dp_rank=(
+                            instance_info.reservation.api_dp_rank
                             if instance_info.reservation
                             else None
                         ),
