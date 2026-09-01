@@ -2404,12 +2404,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         # Dispose kv_b_proj since it is replaced by W_UV and W_UK_T to save memory
         dispose_layer(self.kv_b_proj)
         if self.enable_dsa_cp:
-            if self.enable_dsa_cp_with_layer_shard:
-                for layer in self.layer_sharding_kwargs or []:
-                    if is_hidden_layer(layer):
-                        post_process_after_loading_for_shard_weight_series(layer)
-            else:
-                self._init_o_proj_tp_full_params()
+            self._post_process_dsa_cp_weights()
 
         if self.enable_mlapo:
             quant_method = getattr(
@@ -2554,6 +2549,14 @@ class AscendSFAImpl(MLAAttentionImpl):
         x = x.view(B, N, S, D)
         x = torch_npu.npu_interleave_rope(x, cos, sin)
         return x.view(B, N, D)
+
+    def _post_process_dsa_cp_weights(self) -> None:
+        if self.enable_dsa_cp_with_layer_shard:
+            for layer in self.layer_sharding_kwargs or []:
+                if is_hidden_layer(layer):
+                    post_process_after_loading_for_shard_weight_series(layer)
+        elif self.enable_dsa_cp_with_o_proj_tp:
+            self._init_o_proj_tp_full_params()
 
     def _init_o_proj_tp_full_params(self):
         """

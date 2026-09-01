@@ -46,6 +46,24 @@ def test_sfa_metadata_declares_cached_decode_split_boundary() -> None:
     assert field.default is None
 
 
+@pytest.mark.parametrize(
+    ("enable_o_proj_tp", "expected_calls"),
+    [(False, 0), (True, 1)],
+)
+def test_dsa_cp_full_o_proj_postprocess_requires_o_proj_tp_mode(
+    enable_o_proj_tp: bool,
+    expected_calls: int,
+) -> None:
+    impl = AscendSFAImpl.__new__(AscendSFAImpl)
+    impl.enable_dsa_cp_with_layer_shard = False
+    impl.enable_dsa_cp_with_o_proj_tp = enable_o_proj_tp
+    impl._init_o_proj_tp_full_params = MagicMock()
+
+    impl._post_process_dsa_cp_weights()
+
+    assert impl._init_o_proj_tp_full_params.call_count == expected_calls
+
+
 def test_sparse_boundary_updates_preallocated_storage_in_place():
     boundary_cpu = torch.tensor([9, 9, 19, 0], dtype=torch.int32)
     boundary = torch.empty(4, dtype=torch.int32)
