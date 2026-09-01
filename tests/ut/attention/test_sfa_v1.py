@@ -192,6 +192,86 @@ def test_lmcache_load_stat_disabled_does_not_touch_tensor_or_clock():
     assert impl._lmcache_load_stat_tokens is None
 
 
+def test_dsa_cp_o_proj_input_redistributes_tokens_and_heads():
+    impl = AscendSFAImpl.__new__(AscendSFAImpl)
+    impl.tp_size = 4
+    impl.num_heads = 2
+    impl.v_head_dim = 3
+    local_tokens = 5
+    attn_output = torch.arange(
+        local_tokens * impl.tp_size * impl.num_heads * impl.v_head_dim,
+        dtype=torch.float32,
+    ).reshape(local_tokens, -1)
+    expected_send = (
+        attn_output.view(local_tokens, impl.tp_size, -1)
+        .permute(1, 0, 2)
+        .reshape(local_tokens * impl.tp_size, -1)
+    )
+    tp_group = SimpleNamespace(device_group=object())
+
+    def copy_all_to_all(output, send, *, group):
+        assert group is tp_group.device_group
+        output.copy_(send)
+
+    with (
+        patch.object(sfa_v1, "get_tp_group", return_value=tp_group),
+        patch.object(
+            sfa_v1.torch.distributed,
+            "all_to_all_single",
+            side_effect=copy_all_to_all,
+        ) as all_to_all,
+    ):
+        actual = impl._redistribute_dsa_cp_o_proj_input(attn_output)
+
+    all_to_all.assert_called_once()
+    assert actual.shape == (local_tokens * impl.tp_size, 6)
+    assert torch.equal(actual, expected_send)
+
+
+def test_cross_layer_post_redistributes_dsa_cp_before_o_proj():
+    impl = AscendSFAImpl.__new__(AscendSFAImpl)
+    impl.enable_dsa_cp = True
+    sparse_output = torch.empty(2, 4, 3)
+    full_head_output = torch.empty(2, 24)
+    redistributed = torch.empty(8, 6)
+    projected = torch.empty(2, 7)
+    impl._execute_sparse_flash_attention_process = MagicMock(
+        return_value=sparse_output
+    )
+    impl._v_up_proj = MagicMock(return_value=full_head_output)
+    impl._redistribute_dsa_cp_o_proj_input = MagicMock(
+        return_value=redistributed
+    )
+    impl.o_proj = MagicMock(return_value=(projected, None))
+    impl.o_proj.weight = MagicMock()
+    prefetch = MagicMock()
+    output = torch.empty_like(projected)
+
+    with patch.object(
+        sfa_v1,
+        "get_weight_prefetch_method",
+        return_value=prefetch,
+    ):
+        actual = impl._cross_layer_post_compute(
+            torch.empty(2, 4, 3),
+            torch.empty(2, 4, 2),
+            torch.empty(2, 1, 8, dtype=torch.int32),
+            torch.empty(2, 4, 1, 3),
+            torch.empty(2, 4, 1, 2),
+            torch.tensor([2], dtype=torch.int32),
+            torch.tensor([8], dtype=torch.int32),
+            torch.empty(1, 1, dtype=torch.int32),
+            output,
+            trace_label="test",
+        )
+
+    impl._redistribute_dsa_cp_o_proj_input.assert_called_once_with(
+        full_head_output
+    )
+    impl.o_proj.assert_called_once_with(redistributed)
+    assert actual is output
+
+
 def test_target_sfa_diagnostics_save_layer_io_and_retrieve_state():
     impl = AscendSFAImpl.__new__(AscendSFAImpl)
     impl.tp_rank = 3

@@ -2623,18 +2623,34 @@ class AscendSFAImpl(MLAAttentionImpl):
 
             return output, False
         else:
-            # For decode scenario: perform all-to-all communication on o_proj input activations
-            # Reshape for all-to-all: [batch * seq, tp_size, head_dim] -> [tp_size, batch * seq, head_dim]
-            send = (
-                attn_output.view(-1, self.tp_size, self.num_heads * self.v_head_dim)
-                .permute(1, 0, 2)
-                .reshape(-1, self.num_heads * self.v_head_dim)
+            return self._redistribute_dsa_cp_o_proj_input(attn_output), True
+
+    def _redistribute_dsa_cp_o_proj_input(
+        self,
+        attn_output: torch.Tensor,
+    ) -> torch.Tensor:
+        """Convert token-sharded/full-head output to token-full/head-sharded."""
+        local_hidden_size = self.num_heads * self.v_head_dim
+        expected_hidden_size = self.tp_size * local_hidden_size
+        if int(attn_output.shape[-1]) != expected_hidden_size:
+            raise RuntimeError(
+                "DSA-CP o_proj input has an unexpected hidden dimension: "
+                f"got {attn_output.shape[-1]}, expected "
+                f"TP({self.tp_size}) * local({local_hidden_size})"
             )
-
-            attn_output = torch.empty_like(send)
-            torch.distributed.all_to_all_single(attn_output, send, group=get_tp_group().device_group)
-
-            return attn_output, True
+        send = (
+            attn_output.view(-1, self.tp_size, local_hidden_size)
+            .permute(1, 0, 2)
+            .contiguous()
+            .view(-1, local_hidden_size)
+        )
+        redistributed = torch.empty_like(send)
+        torch.distributed.all_to_all_single(
+            redistributed,
+            send,
+            group=get_tp_group().device_group,
+        )
+        return redistributed
 
     def _get_full_kv(self, k, attn_metadata):
         return k
@@ -3820,6 +3836,10 @@ class AscendSFAImpl(MLAAttentionImpl):
             max_size=MAX_O_PROJ_PREFETCH_SIZE,
             linear_layer=self.o_proj,
         )
+        if self.enable_dsa_cp:
+            attn_output = self._redistribute_dsa_cp_o_proj_input(
+                attn_output
+            )
         output[...] = self.o_proj(attn_output)[0]
         return output
 
@@ -5801,14 +5821,20 @@ class AscendSFAImpl(MLAAttentionImpl):
             attn_output = result
 
         if self.enable_dsa_cp_strict_accuracy:
-            send = (
-                attn_output.view(-1, self.tp_size, self.num_heads * self.v_head_dim)
-                .permute(1, 0, 2)
-                .reshape(-1, self.num_heads * self.v_head_dim)
+            attn_output = self._redistribute_dsa_cp_o_proj_input(
+                attn_output
             )
-
-            attn_output = torch.empty_like(send)
-            torch.distributed.all_to_all_single(attn_output, send, group=get_tp_group().device_group)
+        elif (
+            self.enable_dsa_cp
+            and not self.enable_dsa_cp_with_layer_shard
+            and not self.enable_dsa_cp_with_o_proj_tp
+        ):
+            # kv_both decode nodes still use the ordinary TP-sharded o_proj.
+            # Restore the layout even though they are neither the producer
+            # layer-sharding mode nor the connector-free PD-mix mode.
+            attn_output = self._redistribute_dsa_cp_o_proj_input(
+                attn_output
+            )
 
         output[...] = self.o_proj(attn_output)[0]
 
