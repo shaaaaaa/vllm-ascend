@@ -175,6 +175,7 @@ class DecoderReservation:
     decoder_score: float
     dp_rank: int | None = None
     api_dp_rank: int | None = None
+    preferred_segment: str | None = None
     remote_fill: dict[str, Any] | None = None
 
 
@@ -1270,6 +1271,9 @@ class ProxyState:
             if remote_fill is not None:
                 reservation.remote_fill = dict(remote_fill)
                 reservation.api_dp_rank = reservation.remote_fill.pop("api_dp_rank")
+                reservation.preferred_segment = reservation.remote_fill.pop(
+                    "mooncake_preferred_segment", None
+                )
             return reservation
 
     def _decoder_placement_is_fresh(self, server: ServerState, now: float) -> bool:
@@ -1638,6 +1642,26 @@ def _parse_decoder_remote_fill_response(payload: Any) -> dict[int, dict[str, Any
             remote_fill["token_hash_algorithm"] == "builtin" and not python_hash_seed
         ):
             raise ValueError("Decoder remote-fill hash identity is invalid")
+        advertised_segment = remote_fill.get("destination_remote_session")
+        if advertised_segment is not None and (
+            not isinstance(advertised_segment, str)
+            or not advertised_segment.strip()
+        ):
+            raise ValueError("Decoder remote-fill Mooncake segment is invalid")
+        if advertised_segment is not None:
+            advertised_segment = advertised_segment.strip()
+        segment = result.get("segment")
+        if segment is not None and (
+            not isinstance(segment, str) or not segment.strip()
+        ):
+            raise ValueError("Decoder Mooncake segment is invalid")
+        if (
+            segment is not None
+            and advertised_segment is not None
+            and segment.strip() != advertised_segment
+        ):
+            raise ValueError("Decoder Mooncake placement identities disagree")
+        segment = segment.strip() if segment is not None else advertised_segment
         placement = {
             "api_dp_rank": api_dp_rank,
             "destination_engine_id": remote_fill["destination_engine_id"].strip(),
@@ -1652,6 +1676,8 @@ def _parse_decoder_remote_fill_response(payload: Any) -> dict[int, dict[str, Any
             "python_hash_seed": python_hash_seed,
             "descriptor_verification_capability": verification_capability,
         }
+        if segment is not None:
+            placement["mooncake_preferred_segment"] = segment
         existing = placements.get(dp_rank)
         if existing is not None and existing != placement:
             raise ValueError(
@@ -1721,6 +1747,7 @@ async def send_request_to_service(
     req_data: dict,
     request_id: str,
     remote_fill_handoff: dict[str, Any] | None = None,
+    preferred_mooncake_segment: str | None = None,
 ):
     aborted_requests = proxy_state.acquire_aborted_prefiller_requests(prefiller_id)
     req_data = req_data.copy()
@@ -1737,6 +1764,10 @@ async def send_request_to_service(
         req_data["kv_transfer_params"]["lmcache.remote_fill"] = dict(
             remote_fill_handoff
         )
+        if preferred_mooncake_segment is not None:
+            req_data["kv_transfer_params"][
+                "lmcache.mooncake_preferred_segment"
+            ] = preferred_mooncake_segment
     req_data["stream"] = False
     req_data["max_tokens"] = 1
     req_data["min_tokens"] = 1
@@ -1841,6 +1872,11 @@ async def _handle_select_instance(
             req_data,
             request_id,
             remote_fill_handoff=remote_fill_handoff,
+            preferred_mooncake_segment=(
+                reservation.preferred_segment
+                if remote_fill_handoff is not None and reservation is not None
+                else None
+            ),
         )
         proxy_state.release_prefiller(prefiller_idx, prefiller_score)
         prefiller_active_released = True
@@ -1889,6 +1925,7 @@ async def _handle_select_instance(
                     ],
                 }
         kv_transfer_params.pop("lmcache.mooncake_preferred_segment", None)
+        kv_transfer_params.pop("lmcache.mooncake_preferred_kv_group", None)
         req_data["kv_transfer_params"] = kv_transfer_params
         if kv_transfer_params:
             logger.debug(f"[{request_id}] KV transfer params received from P-node: "

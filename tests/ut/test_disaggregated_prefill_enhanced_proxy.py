@@ -27,6 +27,7 @@ def _remote_fill(dp_rank: int = 0) -> dict:
         "global_te_push": True,
         "token_hash_algorithm": "builtin",
         "python_hash_seed": "0",
+        "destination_remote_session": "decoder:12345",
         "descriptor_verification_capability": "ab" * 32,
         "tp_rank": 0,
         "dp_rank": dp_rank,
@@ -44,6 +45,7 @@ def _prime_remote_fill(state, dp_rank: int = 0, api_dp_rank: int | None = None):
         | {
             "api_dp_rank": dp_rank if api_dp_rank is None else api_dp_rank,
             "destination_dp_rank": dp_rank,
+            "mooncake_preferred_segment": "decoder:12345",
         }
     }
     decoder.decoder_rank_active_tokens = {dp_rank: 0.0}
@@ -143,6 +145,7 @@ class TestEnhancedRemoteFillProxy(unittest.TestCase):
 
     def test_remote_fill_only_placement_is_valid(self):
         placement = _remote_fill()
+        placement.pop("destination_remote_session")
         payload = {
             "results": [
                 {
@@ -153,11 +156,44 @@ class TestEnhancedRemoteFillProxy(unittest.TestCase):
                 }
             ]
         }
+        parsed = proxy._parse_decoder_remote_fill_response(payload)[0]
+        self.assertEqual(parsed["destination_engine_epoch"], 7)
+        self.assertNotIn("mooncake_preferred_segment", parsed)
+
+    def test_remote_fill_placement_carries_decoder_mooncake_segment(self):
+        payload = {
+            "results": [
+                {
+                    "dp_rank": 0,
+                    "api_dp_rank": 0,
+                    "segment": "decoder:12345",
+                    "remote_fill": _remote_fill(),
+                }
+            ]
+        }
+
+        placement = proxy._parse_decoder_remote_fill_response(payload)[0]
+
         self.assertEqual(
-            proxy._parse_decoder_remote_fill_response(payload)[0][
-                "destination_engine_epoch"
-            ],
-            7,
+            placement["mooncake_preferred_segment"], "decoder:12345"
+        )
+
+    def test_remote_fill_placement_uses_advertised_native_session(self):
+        payload = {
+            "results": [
+                {
+                    "dp_rank": 0,
+                    "api_dp_rank": 0,
+                    "segment": None,
+                    "remote_fill": _remote_fill(),
+                }
+            ]
+        }
+
+        placement = proxy._parse_decoder_remote_fill_response(payload)[0]
+
+        self.assertEqual(
+            placement["mooncake_preferred_segment"], "decoder:12345"
         )
 
     def test_remote_fill_parser_matches_qualified_example(self):
@@ -175,7 +211,25 @@ class TestEnhancedRemoteFillProxy(unittest.TestCase):
         }
         parsed = proxy._parse_decoder_remote_fill_response(payload)
         self.assertEqual(parsed[1].pop("api_dp_rank"), 0)
+        self.assertEqual(
+            parsed[1].pop("mooncake_preferred_segment"), "decoder:12345"
+        )
         self.assertEqual(parsed, example_proxy._parse_decoder_remote_fill_response(payload))
+
+    def test_remote_fill_parser_rejects_conflicting_mooncake_segment(self):
+        payload = {
+            "results": [
+                {
+                    "dp_rank": 0,
+                    "api_dp_rank": 0,
+                    "segment": "other-decoder:12345",
+                    "remote_fill": _remote_fill(),
+                }
+            ]
+        }
+
+        with self.assertRaisesRegex(ValueError, "placement identities disagree"):
+            proxy._parse_decoder_remote_fill_response(payload)
 
     def test_remote_fill_parser_requires_api_dp_rank(self):
         payload = {
@@ -196,6 +250,7 @@ class TestEnhancedRemoteFillProxy(unittest.TestCase):
 
         self.assertEqual(info.reservation.dp_rank, 1)
         self.assertEqual(info.reservation.api_dp_rank, 0)
+        self.assertEqual(info.reservation.preferred_segment, "decoder:12345")
         self.assertEqual(info.reservation.remote_fill["destination_dp_rank"], 1)
         self.assertNotIn("api_dp_rank", info.reservation.remote_fill)
         proxy._release_decoder_reservation(info)
@@ -285,6 +340,9 @@ class TestEnhancedRemoteFillProxy(unittest.TestCase):
         async def send(*args, **kwargs):
             order.append("send")
             handoff = kwargs["remote_fill_handoff"]
+            self.assertEqual(
+                kwargs["preferred_mooncake_segment"], "decoder:12345"
+            )
             return SimpleNamespace(
                 content=b"{}",
                 json=lambda: {
