@@ -1643,25 +1643,20 @@ def _parse_decoder_remote_fill_response(payload: Any) -> dict[int, dict[str, Any
         ):
             raise ValueError("Decoder remote-fill hash identity is invalid")
         advertised_segment = remote_fill.get("destination_remote_session")
-        if advertised_segment is not None and (
-            not isinstance(advertised_segment, str)
-            or not advertised_segment.strip()
-        ):
-            raise ValueError("Decoder remote-fill Mooncake segment is invalid")
-        if advertised_segment is not None:
-            advertised_segment = advertised_segment.strip()
         segment = result.get("segment")
-        if segment is not None and (
-            not isinstance(segment, str) or not segment.strip()
+        if any(
+            value is not None
+            and (not isinstance(value, str) or not value.strip())
+            for value in (advertised_segment, segment)
         ):
             raise ValueError("Decoder Mooncake segment is invalid")
-        if (
-            segment is not None
-            and advertised_segment is not None
-            and segment.strip() != advertised_segment
-        ):
+        advertised_segment = (
+            advertised_segment.strip() if advertised_segment else None
+        )
+        segment = segment.strip() if segment else None
+        if segment and advertised_segment and segment != advertised_segment:
             raise ValueError("Decoder Mooncake placement identities disagree")
-        segment = segment.strip() if segment is not None else advertised_segment
+        segment = segment or advertised_segment
         placement = {
             "api_dp_rank": api_dp_rank,
             "destination_engine_id": remote_fill["destination_engine_id"].strip(),
