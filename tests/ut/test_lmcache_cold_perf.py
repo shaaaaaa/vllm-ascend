@@ -1,3 +1,4 @@
+import json
 from types import SimpleNamespace
 
 from vllm.logger import logger
@@ -32,3 +33,20 @@ def test_marks_only_lmcache_cold_compact_resumes(monkeypatch):
     assert not cold_perf.is_cold_perf_request("ordinary")
     assert not cold_perf.is_cold_perf_request("save-only")
     cold_perf._cold_perf_request_ids.clear()
+
+
+def test_process_event_does_not_require_a_marked_request(monkeypatch):
+    records = []
+    monkeypatch.setattr(cold_perf, "_COLD_PERF_ENABLED", True)
+    monkeypatch.setattr(
+        cold_perf,
+        "logger",
+        SimpleNamespace(
+            info=lambda _format, payload: records.append(json.loads(payload))
+        ),
+    )
+
+    cold_perf.log_cold_perf_process_event("decoder_execute_slow", elapsed_ms=800)
+
+    assert records[0]["event"] == "decoder_execute_slow"
+    assert records[0]["elapsed_ms"] == 800

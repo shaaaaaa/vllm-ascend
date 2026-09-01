@@ -118,3 +118,21 @@ def log_cold_perf_event(
         "[LMCACHE_COLD_PERF] %s",
         json.dumps(payload, default=str, separators=(",", ":")),
     )
+
+
+def log_cold_perf_process_event(event: str, **fields: Any) -> None:
+    """Log a process-level anomaly that is not tied to a marked request."""
+    if not cold_perf_enabled():
+        return
+    payload = {
+        "schema": 1,
+        "event": event,
+        "pid": os.getpid(),
+        "monotonic_ms": round(time.perf_counter() * 1000, 3),
+        **cold_perf_clock_fields(),
+        **fields,
+    }
+    logger.info(
+        "[LMCACHE_COLD_PERF] %s",
+        json.dumps(payload, default=str, separators=(",", ":")),
+    )

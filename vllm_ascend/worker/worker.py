@@ -60,6 +60,7 @@ from vllm_ascend.lmcache_cold_perf import (
     forget_cold_perf_request,
     is_cold_perf_request,
     log_cold_perf_event,
+    log_cold_perf_process_event,
     mark_cold_perf_connector_requests,
     mark_cold_perf_requests,
 )
@@ -92,6 +93,7 @@ _STAGED_SFA_GRAPH_MEMORY_MARGIN_RATIO = 1.1
 REMOTE_FILL_PAIRED_RESTART_EXIT_CODE = 86
 _COLD_PERF_STALL_SECONDS = 60
 _COLD_PERF_STALL_STAGGER_SECONDS = 5
+_COLD_PERF_SLOW_EXECUTE_MS = 500
 
 
 def _cold_perf_watchdog_rank_and_timeout() -> tuple[int, int]:
@@ -112,6 +114,7 @@ def _trace_first_cold_perf_execute(method):
     def wrapped(self, scheduler_output, *args, **kwargs):
         if not cold_perf_enabled():
             return method(self, scheduler_output, *args, **kwargs)
+        entry_started = time.perf_counter()
         scheduled = tuple(
             str(req_id)
             for req_id, count in getattr(
@@ -119,6 +122,40 @@ def _trace_first_cold_perf_execute(method):
             ).items()
             if count
         )
+        previous_return = getattr(self, "_cold_perf_last_execute_return", None)
+        previous_requests = getattr(
+            self, "_cold_perf_last_execute_requests", frozenset()
+        )
+        overlap = previous_requests.intersection(scheduled)
+        if previous_return is not None and overlap:
+            gap_ms = (entry_started - previous_return) * 1000
+            if gap_ms >= _COLD_PERF_SLOW_EXECUTE_MS:
+                tp_rank, _ = _cold_perf_watchdog_rank_and_timeout()
+                log_cold_perf_process_event(
+                    "decoder_submission_gap",
+                    tp_rank=tp_rank,
+                    gap_ms=round(gap_ms, 3),
+                    shared_request_count=len(overlap),
+                    shared_request_ids=sorted(overlap)[:8],
+                    previous_batch_size=len(previous_requests),
+                    current_batch_size=len(scheduled),
+                )
+
+        def record_finish() -> None:
+            completed = time.perf_counter()
+            elapsed_ms = (completed - entry_started) * 1000
+            if scheduled and elapsed_ms >= _COLD_PERF_SLOW_EXECUTE_MS:
+                tp_rank, _ = _cold_perf_watchdog_rank_and_timeout()
+                log_cold_perf_process_event(
+                    "decoder_execute_slow",
+                    tp_rank=tp_rank,
+                    elapsed_ms=round(elapsed_ms, 3),
+                    batch_size=len(scheduled),
+                    request_ids=list(scheduled[:8]),
+                )
+            self._cold_perf_last_execute_return = completed
+            self._cold_perf_last_execute_requests = frozenset(scheduled)
+
         mark_cold_perf_connector_requests(
             getattr(scheduler_output, "kv_connector_metadata", None)
         )
@@ -129,9 +166,11 @@ def _trace_first_cold_perf_execute(method):
             req_id for req_id in scheduled if is_cold_perf_request(req_id)
         )
         if not request_ids:
-            return method(self, scheduler_output, *args, **kwargs)
+            try:
+                return method(self, scheduler_output, *args, **kwargs)
+            finally:
+                record_finish()
 
-        started = time.perf_counter()
         tp_rank, watchdog_timeout = _cold_perf_watchdog_rank_and_timeout()
         log_cold_perf_event(
             "decoder_execute_rpc_entry",
@@ -164,7 +203,9 @@ def _trace_first_cold_perf_execute(method):
                 "decoder_execute_rpc_return",
                 request_ids=request_ids,
                 once=True,
-                elapsed_ms=round((time.perf_counter() - started) * 1000, 3),
+                elapsed_ms=round(
+                    (time.perf_counter() - entry_started) * 1000, 3
+                ),
                 output_type=type(output).__name__,
             )
             return output
@@ -173,7 +214,9 @@ def _trace_first_cold_perf_execute(method):
                 "decoder_execute_rpc_error",
                 request_ids=request_ids,
                 once=True,
-                elapsed_ms=round((time.perf_counter() - started) * 1000, 3),
+                elapsed_ms=round(
+                    (time.perf_counter() - entry_started) * 1000, 3
+                ),
                 error_type=type(exc).__name__,
             )
             raise
@@ -189,6 +232,7 @@ def _trace_first_cold_perf_execute(method):
                         operation="cancel",
                         error_type=type(exc).__name__,
                     )
+            record_finish()
 
     return wrapped
 

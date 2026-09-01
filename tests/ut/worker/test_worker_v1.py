@@ -316,6 +316,60 @@ class TestNPUWorker(TestBase):
         self.assertEqual(log.call_args_list[0].kwargs["tp_rank"], 3)
         self.assertEqual(log.call_args_list[1].kwargs["timeout_seconds"], 75)
 
+    def test_execute_model_reports_only_slow_execution_and_submission_gaps(self):
+        from vllm.v1.outputs import ModelRunnerOutput
+
+        from vllm_ascend.worker.worker import NPUWorker
+
+        worker = NPUWorker.__new__(NPUWorker)
+        worker._pp_send_work = []
+        worker._raise_if_remote_fill_restart_required = MagicMock()
+        worker.model_runner = MagicMock()
+        worker.model_runner.execute_model.return_value = MagicMock(
+            spec=ModelRunnerOutput
+        )
+        scheduler_output = SimpleNamespace(
+            total_num_scheduled_tokens=1,
+            num_scheduled_tokens={"warm": 1},
+            kv_connector_metadata=None,
+        )
+
+        with (
+            patch(
+                "vllm_ascend.worker.worker.cold_perf_enabled",
+                return_value=True,
+            ),
+            patch(
+                "vllm_ascend.worker.worker.is_cold_perf_request",
+                return_value=False,
+            ),
+            patch(
+                "vllm_ascend.worker.worker.time.perf_counter",
+                side_effect=(1.0, 1.1, 2.0, 2.8),
+            ),
+            patch(
+                "vllm_ascend.worker.worker.log_cold_perf_process_event"
+            ) as log,
+            patch(
+                "vllm_ascend.worker.worker.get_tp_group",
+                return_value=SimpleNamespace(rank_in_group=2),
+            ),
+            patch(
+                "vllm_ascend.worker.worker.get_pp_group",
+                return_value=SimpleNamespace(is_first_rank=True),
+            ),
+        ):
+            worker.execute_model(scheduler_output)
+            worker.execute_model(scheduler_output)
+
+        self.assertEqual(
+            [call.args[0] for call in log.call_args_list],
+            ["decoder_submission_gap", "decoder_execute_slow"],
+        )
+        self.assertEqual(log.call_args_list[0].kwargs["gap_ms"], 900.0)
+        self.assertEqual(log.call_args_list[1].kwargs["elapsed_ms"], 800.0)
+        self.assertEqual(log.call_args_list[1].kwargs["tp_rank"], 2)
+
     def test_sample_tokens_checks_fatal_latch_after_success_and_failure(self):
         from vllm_ascend.worker.worker import NPUWorker
 
