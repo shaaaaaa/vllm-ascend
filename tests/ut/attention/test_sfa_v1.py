@@ -1070,6 +1070,8 @@ def test_sorted_resident_helper_uses_active_fixed_address_prefix(mtp):
     assert outputs[1] is active_workspace.miss_tokens
     assert outputs[2].data_ptr() == active_workspace.miss_counts.data_ptr()
     assert outputs[3] is active_workspace.target_slots
+    assert finalize.call_args.kwargs["row_req_indices"] is None
+    assert finalize.call_args.kwargs["row_offsets"] is None
 
 
 def test_sorted_resident_helper_forwards_fragment_row_layout():

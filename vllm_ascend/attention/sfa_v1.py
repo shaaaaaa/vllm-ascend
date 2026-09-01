@@ -3502,6 +3502,12 @@ class AscendSFAImpl(MLAAttentionImpl):
             mtp=int(mtp),
             is_capturing=_current_npu_capture_state(),
         )
+        # The fused planner infers request-major rows from its fixed MTP
+        # shape. Fragment request IDs are meaningful only together with the
+        # explicit row offsets that describe a TP-local split request.
+        fragment_row_req_indices = (
+            row_req_indices if row_offsets is not None else None
+        )
         miss_tokens, miss_counts, target_slots = (
             prepare_sorted_resident_cache_fused_(
                 topk_indices,
@@ -3511,7 +3517,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                 self._sorted_resident_state,
                 workspace,
                 block_size=self.block_size,
-                row_req_indices=row_req_indices,
+                row_req_indices=fragment_row_req_indices,
                 row_offsets=row_offsets,
             )
         )
