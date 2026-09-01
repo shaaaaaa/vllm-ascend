@@ -91,6 +91,7 @@ class StagedSFAConfigReason(str, Enum):
     CONTEXT_PARALLEL = "context_parallel"
     LEGACY_DSA_OFFLOAD = "legacy_dsa_offload"
     ADAPTER_CACHE = "adapter_cache"
+    LAYER_SHARDING = "layer_sharding"
 
 
 class StagedSFARouteReason(str, Enum):
@@ -586,6 +587,9 @@ def staged_sfa_graph_configuration_reasons(
         reasons.append(StagedSFAConfigReason.LEGACY_DSA_OFFLOAD)
     if envs_ascend.VLLM_ASCEND_DSA_USE_ADAPTER_CACHE:
         reasons.append(StagedSFAConfigReason.ADAPTER_CACHE)
+    additional_config = getattr(vllm_config, "additional_config", None)
+    if isinstance(additional_config, dict) and additional_config.get("layer_sharding"):
+        reasons.append(StagedSFAConfigReason.LAYER_SHARDING)
     return tuple(reasons)
 
 
@@ -604,6 +608,7 @@ _STAGED_SFA_CONFIG_MESSAGES = {
     StagedSFAConfigReason.CONTEXT_PARALLEL: "context parallel staged graphs are not implemented",
     StagedSFAConfigReason.LEGACY_DSA_OFFLOAD: "legacy DSA latent offload is not supported by staged graphs",
     StagedSFAConfigReason.ADAPTER_CACHE: "the DSA adapter cache is not supported by staged graphs",
+    StagedSFAConfigReason.LAYER_SHARDING: "weight layer sharding is not supported by staged graphs",
 }
 
 
@@ -1433,6 +1438,12 @@ def enable_dsa_cp() -> bool:
 @lru_cache(maxsize=1)
 def enable_dsa_cp_with_layer_shard() -> bool:
     if not enable_dsa_cp():
+        return False
+    # ``kv_both`` is both a producer and a consumer, so producer capability
+    # alone cannot identify a layer-sharded prefill instance. Layer sharding is
+    # a static model-layout choice and must be explicitly configured. This also
+    # keeps decode instances with ``kv_both`` on the normal DSA-CP path.
+    if not get_ascend_config().layer_sharding:
         return False
     from vllm.config import get_current_vllm_config
 

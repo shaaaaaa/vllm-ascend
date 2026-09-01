@@ -747,6 +747,7 @@ class TestUtils(TestBase):
         vllm_config.kv_transfer_config = mock.MagicMock()
         vllm_config.speculative_config = None
         vllm_config.lora_config = None
+        vllm_config.additional_config = {}
 
         with (
             mock.patch.multiple(
@@ -778,6 +779,50 @@ class TestUtils(TestBase):
             compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
             vllm_config.kv_transfer_config = None
             self.assertFalse(utils.staged_sfa_graph_configured(vllm_config))
+
+            vllm_config.kv_transfer_config = mock.MagicMock()
+            vllm_config.additional_config = {
+                "layer_sharding": ["q_b_proj"],
+            }
+            self.assertFalse(utils.staged_sfa_graph_configured(vllm_config))
+            self.assertIn(
+                utils.StagedSFAConfigReason.LAYER_SHARDING,
+                utils.staged_sfa_graph_configuration_reasons(vllm_config),
+            )
+
+    def test_dsa_cp_layer_sharding_requires_explicit_config(self):
+        vllm_config = mock.MagicMock()
+        # kv_both exposes producer capability as well as consumer capability.
+        vllm_config.kv_transfer_config.is_kv_producer = True
+        self.addCleanup(utils.enable_dsa_cp_with_layer_shard.cache_clear)
+
+        cases = (
+            (None, True, False),
+            ([], True, False),
+            (["q_b_proj"], True, True),
+            (["q_b_proj"], False, False),
+        )
+        for layer_sharding, is_producer, expected in cases:
+            vllm_config.kv_transfer_config.is_kv_producer = is_producer
+            ascend_config = mock.MagicMock()
+            ascend_config.layer_sharding = layer_sharding
+            utils.enable_dsa_cp_with_layer_shard.cache_clear()
+            with (
+                mock.patch.object(utils, "enable_dsa_cp", return_value=True),
+                mock.patch.object(
+                    utils,
+                    "get_ascend_config",
+                    return_value=ascend_config,
+                ),
+                mock.patch(
+                    "vllm.config.get_current_vllm_config",
+                    return_value=vllm_config,
+                ),
+            ):
+                self.assertEqual(
+                    utils.enable_dsa_cp_with_layer_shard(),
+                    expected,
+                )
 
     def test_staged_sfa_configuration_errors_report_unsupported_modes(self):
         vllm_config = mock.MagicMock()
