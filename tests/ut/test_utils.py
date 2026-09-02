@@ -225,6 +225,12 @@ class TestUtils(TestBase):
                 "staged_sfa_graph_configured",
                 return_value=True,
             ),
+            mock.patch.object(utils, "enable_sp", return_value=False),
+            mock.patch.object(
+                utils,
+                "enable_sp_by_pass",
+                return_value=False,
+            ),
             mock.patch.dict(
                 os.environ,
                 {"VLLM_ASCEND_SFA_STAGED_GRAPH_CAPTURE_SIZES": " 4,1,4,2 "},
@@ -244,6 +250,12 @@ class TestUtils(TestBase):
                 utils,
                 "staged_sfa_graph_configured",
                 return_value=True,
+            ),
+            mock.patch.object(utils, "enable_sp", return_value=False),
+            mock.patch.object(
+                utils,
+                "enable_sp_by_pass",
+                return_value=False,
             ),
             mock.patch.dict(
                 os.environ,
@@ -269,9 +281,14 @@ class TestUtils(TestBase):
                 return_value=True,
             ),
             mock.patch.object(
-                utils.envs_ascend,
-                "VLLM_ASCEND_ENABLE_FLASHCOMM1",
-                True,
+                utils,
+                "enable_sp",
+                return_value=True,
+            ),
+            mock.patch.object(
+                utils,
+                "enable_sp_by_pass",
+                return_value=False,
             ),
             mock.patch.dict(
                 os.environ,
@@ -282,7 +299,35 @@ class TestUtils(TestBase):
         ):
             self.assertEqual(
                 utils.staged_sfa_graph_capture_sizes(vllm_config),
-                (20, 40, 50, 64),
+                (24, 40, 56, 64),
+            )
+
+    def test_staged_sfa_capture_sizes_match_tp4_mtp_padding(self):
+        vllm_config = mock.MagicMock()
+        vllm_config.parallel_config.tensor_parallel_size = 4
+        vllm_config.speculative_config.num_speculative_tokens = 1
+        vllm_config.scheduler_config.max_num_seqs = 32
+        vllm_config.scheduler_config.max_num_batched_tokens = 128
+        with (
+            mock.patch.object(
+                utils,
+                "staged_sfa_graph_configured",
+                return_value=True,
+            ),
+            mock.patch.object(utils, "enable_sp", return_value=True),
+            mock.patch.object(
+                utils,
+                "enable_sp_by_pass",
+                return_value=False,
+            ),
+            mock.patch.dict(
+                os.environ,
+                {"VLLM_ASCEND_SFA_STAGED_GRAPH_CAPTURE_SIZES": "5,10,15,20"},
+            ),
+        ):
+            self.assertEqual(
+                utils.staged_sfa_graph_capture_sizes(vllm_config),
+                (12, 20, 32, 40),
             )
 
     def test_staged_sfa_configuration_accepts_model_specific_mtp_method(self):
@@ -374,6 +419,12 @@ class TestUtils(TestBase):
                     "staged_sfa_graph_configured",
                     return_value=True,
                 ),
+                mock.patch.object(utils, "enable_sp", return_value=False),
+                mock.patch.object(
+                    utils,
+                    "enable_sp_by_pass",
+                    return_value=False,
+                ),
                 mock.patch.dict(
                     os.environ,
                     {"VLLM_ASCEND_SFA_STAGED_GRAPH_CAPTURE_SIZES": "1,16,32"},
@@ -416,6 +467,12 @@ class TestUtils(TestBase):
                 utils,
                 "staged_sfa_graph_configured",
                 return_value=True,
+            ),
+            mock.patch.object(utils, "enable_sp", return_value=False),
+            mock.patch.object(
+                utils,
+                "enable_sp_by_pass",
+                return_value=False,
             ),
             mock.patch.dict(
                 os.environ,
@@ -462,6 +519,12 @@ class TestUtils(TestBase):
                 utils,
                 "staged_sfa_graph_configured",
                 return_value=True,
+            ),
+            mock.patch.object(utils, "enable_sp", return_value=False),
+            mock.patch.object(
+                utils,
+                "enable_sp_by_pass",
+                return_value=False,
             ),
             mock.patch.dict(
                 os.environ,

@@ -632,7 +632,15 @@ def staged_sfa_graph_configured(vllm_config: VllmConfig) -> bool:
 def staged_sfa_graph_capture_sizes(
     vllm_config: VllmConfig,
 ) -> tuple[int, ...]:
-    """Return configured fixed-layout cross-layer token capacities."""
+    """Return fixed-layout cross-layer token capacities.
+
+    Configured values are request capacities. Fixed-width speculative decode
+    expands each request to ``query_width`` token rows. Sequence parallelism
+    then requires the row count to be divisible by TP size, so round the token
+    capacity up to their least common multiple. Keeping it divisible by both
+    values preserves an integral (possibly padded) request capacity while
+    matching the padding performed by ``NPUModelRunner``.
+    """
     if not staged_sfa_graph_configured(vllm_config):
         return ()
 
@@ -655,6 +663,25 @@ def staged_sfa_graph_capture_sizes(
     query_width = 1 + (
         speculative_tokens if isinstance(speculative_tokens, int) else 0
     )
+    token_alignment = query_width
+    if enable_sp(vllm_config) or enable_sp_by_pass():
+        parallel_config = getattr(vllm_config, "parallel_config", None)
+        tensor_parallel_size = getattr(
+            parallel_config,
+            "tensor_parallel_size",
+            1,
+        )
+        if not isinstance(tensor_parallel_size, int) or tensor_parallel_size <= 0:
+            tensor_parallel_size = 1
+        token_alignment = math.lcm(query_width, tensor_parallel_size)
+    capture_sizes = tuple(
+        sorted(
+            {
+                _round_up(size * query_width, token_alignment)
+                for size in sizes
+            }
+        )
+    )
     max_requests = getattr(scheduler_config, "max_num_seqs", None)
     max_tokens = getattr(
         scheduler_config,
@@ -662,25 +689,25 @@ def staged_sfa_graph_capture_sizes(
         None,
     )
     oversized = [
-        size
-        for size in sizes
+        capture_size
+        for capture_size in capture_sizes
         if (
             isinstance(max_requests, int)
             and max_requests > 0
-            and size > max_requests
+            and capture_size // query_width > max_requests
         )
         or (
             isinstance(max_tokens, int)
             and max_tokens > 0
-            and size * query_width > max_tokens
+            and capture_size > max_tokens
         )
     ]
     if oversized:
         raise ValueError(
-            "Staged SFA request capture sizes exceed scheduler capacity "
+            "Staged SFA token capture sizes exceed scheduler capacity "
             f"for query_width={query_width}: {oversized}."
         )
-    return tuple(size * query_width for size in sizes)
+    return capture_sizes
 
 
 def _max_aclgraph_keys(
