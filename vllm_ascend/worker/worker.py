@@ -835,7 +835,22 @@ class NPUWorker(WorkerBase):
             logger.info("Compile and warming up model for size %d", size)
             self.model_runner._dummy_run(size)
         if not self.model_config.enforce_eager:
+            capture_started = time.perf_counter() if cold_perf_enabled() else None
+            if capture_started is not None:
+                log_cold_perf_process_event(
+                    "decoder_graph_capture_start",
+                    staged_sfa=staged_sfa_graph_configured(self.vllm_config),
+                    capture_sizes=self.vllm_config.compilation_config.cudagraph_capture_sizes,
+                )
             self.model_runner.capture_model()
+            if capture_started is not None:
+                log_cold_perf_process_event(
+                    "decoder_graph_capture_complete",
+                    elapsed_ms=round(
+                        (time.perf_counter() - capture_started) * 1000,
+                        3,
+                    ),
+                )
         # Call ATB matmul to warm up; otherwise, the first operation (ReshapeAndCache)
         # may cause performance degradation at runtime.
         if get_ascend_device_type() != AscendDeviceType.A5:

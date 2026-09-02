@@ -1497,9 +1497,22 @@ class TestNPUWorker(TestBase):
             # Verify atb warm up
             mock_warm_up_atb.assert_called_once()
 
+    @patch("vllm_ascend.worker.worker.log_cold_perf_process_event")
+    @patch("vllm_ascend.worker.worker.cold_perf_enabled", return_value=True)
+    @patch(
+        "vllm_ascend.worker.worker.staged_sfa_graph_configured",
+        return_value=False,
+    )
     @patch("vllm_ascend.worker.worker.logger")
     @patch("vllm_ascend.worker.worker.NPUWorker._warm_up_atb")
-    def test_compile_or_warm_up_model_with_graph_capture(self, mock_warm_up_atb, mock_logger):
+    def test_compile_or_warm_up_model_with_graph_capture(
+        self,
+        mock_warm_up_atb,
+        mock_logger,
+        _mock_staged_sfa_graph_configured,
+        _mock_cold_perf_enabled,
+        mock_perf_log,
+    ):
         """Test compile_or_warm_up_model method - with graph capture enabled"""
         from vllm_ascend.worker.worker import NPUWorker
 
@@ -1526,6 +1539,19 @@ class TestNPUWorker(TestBase):
 
             # Should call capture_model in non-eager mode
             worker.model_runner.capture_model.assert_called_once()
+
+            self.assertEqual(
+                [call.args[0] for call in mock_perf_log.call_args_list],
+                [
+                    "decoder_graph_capture_start",
+                    "decoder_graph_capture_complete",
+                ],
+            )
+            self.assertEqual(
+                mock_perf_log.call_args_list[0].kwargs["capture_sizes"],
+                [4, 8],
+            )
+            self.assertIn("elapsed_ms", mock_perf_log.call_args_list[1].kwargs)
 
             # Verify atb warm up
             mock_warm_up_atb.assert_called_once()
