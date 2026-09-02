@@ -115,6 +115,8 @@ def _trace_first_cold_perf_execute(method):
         if not cold_perf_enabled():
             return method(self, scheduler_output, *args, **kwargs)
         entry_started = time.perf_counter()
+        entry_process_cpu_ns = time.process_time_ns()
+        entry_thread_cpu_ns = time.thread_time_ns()
         scheduled = tuple(
             str(req_id)
             for req_id, count in getattr(
@@ -123,6 +125,12 @@ def _trace_first_cold_perf_execute(method):
             if count
         )
         previous_return = getattr(self, "_cold_perf_last_execute_return", None)
+        previous_process_cpu_ns = getattr(
+            self, "_cold_perf_last_execute_process_cpu_ns", None
+        )
+        previous_thread_cpu_ns = getattr(
+            self, "_cold_perf_last_execute_thread_cpu_ns", None
+        )
         previous_requests = getattr(
             self, "_cold_perf_last_execute_requests", frozenset()
         )
@@ -139,10 +147,30 @@ def _trace_first_cold_perf_execute(method):
                     shared_request_ids=sorted(overlap)[:8],
                     previous_batch_size=len(previous_requests),
                     current_batch_size=len(scheduled),
+                    process_cpu_ms=(
+                        round(
+                            (entry_process_cpu_ns - previous_process_cpu_ns)
+                            / 1_000_000,
+                            3,
+                        )
+                        if previous_process_cpu_ns is not None
+                        else None
+                    ),
+                    main_thread_cpu_ms=(
+                        round(
+                            (entry_thread_cpu_ns - previous_thread_cpu_ns)
+                            / 1_000_000,
+                            3,
+                        )
+                        if previous_thread_cpu_ns is not None
+                        else None
+                    ),
                 )
 
         def record_finish() -> None:
             completed = time.perf_counter()
+            completed_process_cpu_ns = time.process_time_ns()
+            completed_thread_cpu_ns = time.thread_time_ns()
             elapsed_ms = (completed - entry_started) * 1000
             if scheduled and elapsed_ms >= _COLD_PERF_SLOW_EXECUTE_MS:
                 tp_rank, _ = _cold_perf_watchdog_rank_and_timeout()
@@ -152,8 +180,20 @@ def _trace_first_cold_perf_execute(method):
                     elapsed_ms=round(elapsed_ms, 3),
                     batch_size=len(scheduled),
                     request_ids=list(scheduled[:8]),
+                    process_cpu_ms=round(
+                        (completed_process_cpu_ns - entry_process_cpu_ns)
+                        / 1_000_000,
+                        3,
+                    ),
+                    main_thread_cpu_ms=round(
+                        (completed_thread_cpu_ns - entry_thread_cpu_ns)
+                        / 1_000_000,
+                        3,
+                    ),
                 )
             self._cold_perf_last_execute_return = completed
+            self._cold_perf_last_execute_process_cpu_ns = completed_process_cpu_ns
+            self._cold_perf_last_execute_thread_cpu_ns = completed_thread_cpu_ns
             self._cold_perf_last_execute_requests = frozenset(scheduled)
 
         mark_cold_perf_connector_requests(
