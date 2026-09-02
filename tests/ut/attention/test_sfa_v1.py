@@ -3675,6 +3675,15 @@ class TestAscendSFAMetadataBuilder(TestBase):
             [36, 37, 38, 39],
         )
         self.assertEqual(local.decode_selected_tokens.shape[0], 4)
+        self.assertEqual(local.decode_remap_boundary.shape[0], 8)
+        self.assertEqual(
+            local.decode_remap_boundary.data_ptr(),
+            builder._dsa_cp_remap_boundary.data_ptr(),
+        )
+        self.assertEqual(
+            builder._dsa_cp_remap_boundary[:4].data_ptr(),
+            builder._dsa_cp_remap_boundary[:8].data_ptr(),
+        )
 
     @patch("vllm_ascend.attention.sfa_v1.get_cos_and_sin_mla")
     @patch("vllm_ascend.attention.sfa_v1.enable_dsa_cp")

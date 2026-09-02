@@ -1268,6 +1268,15 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
                 dtype=torch.int32,
                 device=device,
             )
+            # Keep the DSA-CP Graph-A boundary at a fixed base address. A
+            # view into the global boundary at ``local_start`` changes its
+            # data pointer with the graph capture size and breaks replay
+            # bindings across staged graph keys.
+            self._dsa_cp_remap_boundary = torch.empty(
+                max_local_rows,
+                dtype=torch.int32,
+                device=device,
+            )
             self._dsa_cp_req_indices_cpu = self._dsa_cp_metadata_cpu[
                 :max_local_rows
             ]
@@ -1301,6 +1310,7 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             self._dsa_cp_metadata_cpu = None
             self._dsa_cp_metadata_cpu_tensor = None
             self._dsa_cp_metadata = None
+            self._dsa_cp_remap_boundary = None
             self._dsa_cp_req_indices_cpu = None
             self._dsa_cp_req_indices_cpu_tensor = None
             self._dsa_cp_req_indices = None
@@ -1906,6 +1916,7 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             assert self._dsa_cp_row_offsets_cpu is not None
             assert self._dsa_cp_row_offsets_cpu_tensor is not None
             assert self._dsa_cp_row_offsets is not None
+            assert self._dsa_cp_remap_boundary is not None
             local_req_indices_cpu = self._dsa_cp_req_indices_cpu[
                 :local_token_capacity
             ]
@@ -2111,9 +2122,8 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
                     if decode_shard_counts_workspace is not None
                     else None
                 ),
-                decode_remap_boundary=self.decode_remap_boundary[
-                    dsa_cp_context.local_start :
-                    dsa_cp_context.local_start + local_token_capacity
+                decode_remap_boundary=self._dsa_cp_remap_boundary[
+                    :local_token_capacity
                 ],
                 decode_remap_boundary_ready=False,
                 staged_sfa_local_metadata=None,
