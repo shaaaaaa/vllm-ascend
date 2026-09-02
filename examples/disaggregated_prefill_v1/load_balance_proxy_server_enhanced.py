@@ -2040,7 +2040,7 @@ async def _handle_select_instance(
             reservation = DecoderReservation(decoder, decoder_idx, decoder_score)
             await proxy_state.ensure_decoder_remote_fill(
                 decoder,
-                wait_for_result=not decoder.decoder_remote_fill,
+                wait_for_result=True,
             )
             proxy_state.assign_decoder_rank(
                 reservation, known_affinity.dp_rank if affinity_selected else None
@@ -2064,7 +2064,7 @@ async def _handle_select_instance(
                 reservation = DecoderReservation(decoder, decoder_idx, decoder_score)
                 await proxy_state.ensure_decoder_remote_fill(
                     decoder,
-                    wait_for_result=not decoder.decoder_remote_fill,
+                    wait_for_result=True,
                 )
                 proxy_state.assign_decoder_rank(reservation)
 
