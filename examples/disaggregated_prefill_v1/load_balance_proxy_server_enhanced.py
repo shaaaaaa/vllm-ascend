@@ -34,6 +34,7 @@ import sys
 import threading
 import time
 import uuid
+from collections import OrderedDict
 from collections.abc import Callable
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
@@ -60,6 +61,16 @@ _DECODER_PLACEMENT_NEGATIVE_TTL_SECONDS = 3.0
 _BACKEND_CONNECT_TIMEOUT_SECONDS = 10.0
 _BACKEND_REQUEST_TIMEOUT_SECONDS = 600.0
 _DECODER_READ_TIMEOUT_SECONDS = 120.0
+_PREFIX_AFFINITY_HEADER = "x-lmcache-prefix-affinity"
+_PREFIX_AFFINITY_MAX_HEADER_BYTES = 512
+_PREFIX_AFFINITY_MAX_ANCHORS = 4
+_PREFIX_AFFINITY_MAX_KEY_BYTES = 64
+_PREFIX_AFFINITY_KEY_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+_PREFIX_AFFINITY_CACHE_SIZE = 65536
+_PREFIX_AFFINITY_TTL_SECONDS = 1800.0
+_PREFIX_AFFINITY_MIN_TOKENS = 8192
+_PREFIX_AFFINITY_MIN_RATIO = 0.25
+_PREFIX_AFFINITY_LOAD_SLACK = 1.0
 
 try:
     import uvloop
@@ -179,6 +190,23 @@ class DecoderReservation:
     remote_fill: dict[str, Any] | None = None
 
 
+@dataclass(frozen=True)
+class PrefixAffinityAnchor:
+    key: str
+    token_end: int
+
+
+@dataclass(frozen=True)
+class PrefixAffinityRecord:
+    prefiller_idx: int
+    decoder_idx: int
+    dp_rank: int
+    preferred_segment: str
+    destination_engine_epoch: int
+    local_tokens: int
+    expires_at: float
+
+
 @dataclass
 class InstanceInfo:
     request_id: str
@@ -197,6 +225,34 @@ class InstanceInfo:
                 self.decoder_idx,
                 self.decoder_score,
             )
+
+
+def _parse_prefix_affinity_header(raw_value: str | None) -> tuple[PrefixAffinityAnchor, ...]:
+    """Parse bounded ``token_end=opaque_key`` affinity hints."""
+    if not raw_value or len(raw_value.encode("utf-8")) > _PREFIX_AFFINITY_MAX_HEADER_BYTES:
+        return ()
+    items = raw_value.split(",")
+    if len(items) > _PREFIX_AFFINITY_MAX_ANCHORS:
+        return ()
+    anchors: dict[str, int] = {}
+    for item in items:
+        token_end_text, separator, key = item.partition("=")
+        key = key.strip()
+        try:
+            token_end = int(token_end_text.strip())
+        except ValueError:
+            return ()
+        if (
+            not separator
+            or token_end <= 0
+            or not key
+            or len(key.encode("utf-8")) > _PREFIX_AFFINITY_MAX_KEY_BYTES
+            or _PREFIX_AFFINITY_KEY_RE.fullmatch(key) is None
+        ):
+            return ()
+        anchors[key] = max(token_end, anchors.get(key, 0))
+    ordered = sorted(anchors.items(), key=lambda item: item[1], reverse=True)
+    return tuple(PrefixAffinityAnchor(key, token_end) for key, token_end in ordered)
 
 
 # ============================================================================
@@ -1095,7 +1151,8 @@ class ProxyState:
     def __init__(self, prefiller_instances, decoder_instances, 
                  tokenizer_analyzer=None, metrics_aggregator=None, max_model_len=None,
                  vllm_token_counter=None, default_max_tokens=None, override_max_tokens=None,
-                 context_length_margin=None, enable_remote_lmcache_store=False):
+                 context_length_margin=None, enable_remote_lmcache_store=False,
+                 enable_prefix_affinity_routing=False):
         # Original fields
         self.request_num = 0
         self.tainted_prefillers: list[ServerState] = []
@@ -1105,6 +1162,10 @@ class ProxyState:
         self.prefillers: list[ServerState] = [ServerState(h, p) for h, p in prefiller_instances]
         self.decoders: list[ServerState] = [ServerState(h, p) for h, p in decoder_instances]
         self.enable_remote_lmcache_store = bool(enable_remote_lmcache_store)
+        self.enable_prefix_affinity_routing = bool(
+            enable_prefix_affinity_routing and enable_remote_lmcache_store
+        )
+        self.prefix_affinity: OrderedDict[str, PrefixAffinityRecord] = OrderedDict()
         self.req_to_prefiller = {}
         self.req_id_lock = asyncio.Lock()
         
@@ -1189,12 +1250,16 @@ class ProxyState:
             # ENHANCED: scaled to avoid huge scores
             return request_length * 0.1
     
-    def select_prefiller(self, token_count):
+    def select_prefiller(self, token_count, preferred_idx: int | None = None):
         """Select prefiller based on score. Returns idx."""
         with self._state_lock:
             if not self.prefiller_heap:
                 raise RuntimeError("No prefiller servers available")
-            priority, timestamp, chosen, server = heapq.heappop(self.prefiller_heap)
+            if preferred_idx is not None and not 0 <= preferred_idx < len(self.prefillers):
+                raise IndexError("Preferred prefiller index is out of range")
+            chosen = preferred_idx
+            if chosen is None:
+                chosen = heapq.heappop(self.prefiller_heap)[2]
             self.prefillers[chosen].active_tokens += token_count
             self.prefillers[chosen].active_kv_cache += token_count
             self._update_prefiller_priority(chosen)
@@ -1222,12 +1287,16 @@ class ProxyState:
                 self.prefillers[idx].active_kv_cache = 0
             self._update_prefiller_priority(idx)
     
-    def select_decoder(self, token_count):
+    def select_decoder(self, token_count, preferred_idx: int | None = None):
         """Select decoder based on score. Returns idx."""
         with self._state_lock:
             if not self.decoder_heap:
                 raise RuntimeError("No decoder servers available")
-            priority, timestamp, chosen, server = heapq.heappop(self.decoder_heap)
+            if preferred_idx is not None and not 0 <= preferred_idx < len(self.decoders):
+                raise IndexError("Preferred decoder index is out of range")
+            chosen = preferred_idx
+            if chosen is None:
+                chosen = heapq.heappop(self.decoder_heap)[2]
             self.decoders[chosen].active_tokens += token_count
             self._update_decoder_priority(chosen)
             return chosen
@@ -1255,16 +1324,20 @@ class ProxyState:
             self._update_decoder_priority(idx)
 
     def assign_decoder_rank(
-        self, reservation: DecoderReservation
+        self,
+        reservation: DecoderReservation,
+        preferred_dp_rank: int | None = None,
     ) -> DecoderReservation:
         with self._state_lock:
             server = reservation.server
             if not server.decoder_remote_fill:
                 return reservation
-            dp_rank = min(
-                server.decoder_remote_fill,
-                key=lambda rank: (server.decoder_rank_active_tokens[rank], rank),
-            )
+            if preferred_dp_rank not in server.decoder_remote_fill:
+                preferred_dp_rank = min(
+                    server.decoder_remote_fill,
+                    key=lambda rank: (server.decoder_rank_active_tokens[rank], rank),
+                )
+            dp_rank = preferred_dp_rank
             server.decoder_rank_active_tokens[dp_rank] += reservation.decoder_score
             reservation.dp_rank = dp_rank
             remote_fill = server.decoder_remote_fill.get(dp_rank)
@@ -1275,6 +1348,114 @@ class ProxyState:
                     "mooncake_preferred_segment", None
                 )
             return reservation
+
+    def _affinity_record_is_current(self, record: PrefixAffinityRecord) -> bool:
+        if record.prefiller_idx >= len(self.prefillers) or record.decoder_idx >= len(self.decoders):
+            return False
+        decoder = self.decoders[record.decoder_idx]
+        placement = decoder.decoder_remote_fill.get(record.dp_rank)
+        return bool(
+            placement
+            and record.dp_rank in decoder.decoder_rank_active_tokens
+            and placement.get("mooncake_preferred_segment") == record.preferred_segment
+            and placement.get("destination_engine_epoch")
+            == record.destination_engine_epoch
+        )
+
+    def _affinity_is_meaningful(
+        self,
+        anchor: PrefixAffinityAnchor,
+        record: PrefixAffinityRecord,
+        request_tokens: int,
+    ) -> bool:
+        local_tokens = min(anchor.token_end, record.local_tokens)
+        return (
+            local_tokens >= _PREFIX_AFFINITY_MIN_TOKENS
+            and local_tokens / max(request_tokens, 1)
+            >= _PREFIX_AFFINITY_MIN_RATIO
+        )
+
+    def resolve_prefix_affinity(
+        self,
+        anchors: tuple[PrefixAffinityAnchor, ...],
+        request_tokens: int,
+        prefiller_score: float,
+        decoder_score: float,
+    ) -> tuple[PrefixAffinityAnchor | None, PrefixAffinityRecord | None, bool]:
+        """Return the longest known prefix and whether its owner is admissible."""
+        if not self.enable_prefix_affinity_routing or not anchors:
+            return None, None, False
+        request_tokens = max(request_tokens, anchors[0].token_end)
+        now = time.monotonic()
+        with self._state_lock:
+            for anchor in anchors:
+                record = self.prefix_affinity.get(anchor.key)
+                if record is None:
+                    continue
+                if record.expires_at <= now or not self._affinity_record_is_current(
+                    record
+                ):
+                    self.prefix_affinity.pop(anchor.key, None)
+                    continue
+                self.prefix_affinity.move_to_end(anchor.key)
+                if not self._affinity_is_meaningful(anchor, record, request_tokens):
+                    return anchor, record, False
+                prefiller = self.prefillers[record.prefiller_idx]
+                decoder = self.decoders[record.decoder_idx]
+                rank_best = min(decoder.decoder_rank_active_tokens.values())
+                selected = (
+                    prefiller not in self.tainted_prefillers
+                    and decoder not in self.tainted_decoders
+                    and prefiller.active_tokens + prefiller.active_kv_cache * 0.3
+                    <= self.prefiller_heap[0][0]
+                    + prefiller_score * _PREFIX_AFFINITY_LOAD_SLACK
+                    and decoder.active_tokens
+                    <= self.decoder_heap[0][0]
+                    + decoder_score * _PREFIX_AFFINITY_LOAD_SLACK
+                    and decoder.decoder_rank_active_tokens[record.dp_rank]
+                    <= rank_best
+                    + decoder_score * _PREFIX_AFFINITY_LOAD_SLACK
+                )
+                return anchor, record, selected
+        return None, None, False
+
+    def record_prefix_affinity(
+        self,
+        anchors: tuple[PrefixAffinityAnchor, ...],
+        required_end: int,
+        prefiller_idx: int,
+        reservation: DecoderReservation,
+        local_tokens: int,
+    ) -> str | None:
+        if (
+            not self.enable_prefix_affinity_routing
+            or reservation.dp_rank is None
+            or reservation.preferred_segment is None
+            or reservation.remote_fill is None
+        ):
+            return None
+        anchor = next((item for item in anchors if (
+            _PREFIX_AFFINITY_MIN_TOKENS <= item.token_end <= required_end
+        )), None)
+        if anchor is None:
+            return None
+        epoch = reservation.remote_fill.get("destination_engine_epoch")
+        if isinstance(epoch, bool) or not isinstance(epoch, int):
+            return None
+        with self._state_lock:
+            self.prefix_affinity[anchor.key] = PrefixAffinityRecord(
+                prefiller_idx=prefiller_idx,
+                decoder_idx=reservation.decoder_idx,
+                dp_rank=reservation.dp_rank,
+                preferred_segment=reservation.preferred_segment,
+                destination_engine_epoch=epoch,
+                local_tokens=min(max(local_tokens, 0), anchor.token_end),
+                expires_at=time.monotonic() + _PREFIX_AFFINITY_TTL_SECONDS,
+            )
+            self.prefix_affinity.move_to_end(anchor.key)
+            while len(self.prefix_affinity) > _PREFIX_AFFINITY_CACHE_SIZE:
+                self.prefix_affinity.popitem(last=False)
+        return anchor.key
 
     def _decoder_placement_is_fresh(self, server: ServerState, now: float) -> bool:
         if server.decoder_placement_discovered_at:
@@ -1832,25 +2013,65 @@ async def _handle_select_instance(
     request_length: int,
     analysis=None,
     original_request_id=None,
+    prefix_anchors: tuple[PrefixAffinityAnchor, ...] = (),
 ):
     prefiller_score = proxy_state.calculate_prefill_scores(request_length)
     decoder_score = proxy_state.calculate_decode_scores(request_length)
+    known_anchor, known_affinity, affinity_selected = (
+        proxy_state.resolve_prefix_affinity(
+            prefix_anchors,
+            request_length,
+            prefiller_score,
+            decoder_score,
+        )
+    )
     request_id = await proxy_state.next_req_id()
     prefiller_idx = None
     prefiller_active_released = False
     reservation = None
+    learned_affinity_key = None
     try:
         if proxy_state.enable_remote_lmcache_store:
-            decoder_idx = proxy_state.select_decoder(decoder_score)
+            decoder_idx = proxy_state.select_decoder(
+                decoder_score,
+                known_affinity.decoder_idx if affinity_selected else None,
+            )
             decoder = proxy_state.decoders[decoder_idx]
             reservation = DecoderReservation(decoder, decoder_idx, decoder_score)
             await proxy_state.ensure_decoder_remote_fill(
                 decoder,
                 wait_for_result=not decoder.decoder_remote_fill,
             )
-            proxy_state.assign_decoder_rank(reservation)
+            proxy_state.assign_decoder_rank(
+                reservation, known_affinity.dp_rank if affinity_selected else None
+            )
+            if affinity_selected and (
+                reservation.dp_rank != known_affinity.dp_rank
+                or reservation.preferred_segment
+                != known_affinity.preferred_segment
+                or reservation.remote_fill is None
+                or reservation.remote_fill.get("destination_engine_epoch")
+                != known_affinity.destination_engine_epoch
+            ):
+                proxy_state.release_decoder(
+                    reservation.decoder_idx,
+                    reservation.decoder_score,
+                    reservation.dp_rank,
+                )
+                affinity_selected = False
+                decoder_idx = proxy_state.select_decoder(decoder_score)
+                decoder = proxy_state.decoders[decoder_idx]
+                reservation = DecoderReservation(decoder, decoder_idx, decoder_score)
+                await proxy_state.ensure_decoder_remote_fill(
+                    decoder,
+                    wait_for_result=not decoder.decoder_remote_fill,
+                )
+                proxy_state.assign_decoder_rank(reservation)
 
-        prefiller_idx = proxy_state.select_prefiller(prefiller_score)
+        prefiller_idx = proxy_state.select_prefiller(
+            prefiller_score,
+            known_affinity.prefiller_idx if affinity_selected else None,
+        )
         prefiller = proxy_state.prefillers[prefiller_idx]
         remote_fill_handoff = None
         if reservation is not None and reservation.remote_fill is not None:
@@ -1919,6 +2140,29 @@ async def _handle_select_instance(
                         "destination_engine_epoch"
                     ],
                 }
+            known_is_meaningful = bool(known_anchor and known_affinity and (
+                proxy_state._affinity_is_meaningful(
+                    known_anchor,
+                    known_affinity,
+                    max(request_length, prefix_anchors[0].token_end),
+                )
+            ))
+            if affinity_selected and known_anchor and known_affinity:
+                local_tokens = known_affinity.local_tokens + max(
+                    0, required_end - known_anchor.token_end
+                )
+            elif known_is_meaningful:
+                local_tokens = -1
+            else:
+                local_tokens = required_end - (known_anchor.token_end if known_anchor else 0)
+            if local_tokens >= 0:
+                learned_affinity_key = proxy_state.record_prefix_affinity(
+                    prefix_anchors,
+                    required_end,
+                    prefiller_idx,
+                    reservation,
+                    local_tokens,
+                )
         kv_transfer_params.pop("lmcache.mooncake_preferred_segment", None)
         kv_transfer_params.pop("lmcache.mooncake_preferred_kv_group", None)
         req_data["kv_transfer_params"] = kv_transfer_params
@@ -1956,7 +2200,26 @@ async def _handle_select_instance(
         else:
             token_info = f"bytes={request_length}"
 
-        logger.info(f"[{request_id}] {analysis_time_str}{token_info} → P:{prefiller}({prefiller_score:.1f}) → D:{decoder}({decoder_score:.1f})" + (f" [recompute of {original_request_id}]" if original_request_id else ""))
+        affinity_info = ""
+        if affinity_selected and known_anchor:
+            affinity_info = f", affinity=local:{known_anchor.token_end}"
+        elif known_anchor:
+            affinity_info = f", affinity=balanced:{known_anchor.token_end}"
+        elif learned_affinity_key:
+            affinity_info = ", affinity=learned"
+        recompute_info = f" [recompute of {original_request_id}]" if original_request_id else ""
+        logger.info(
+            "[%s] %s%s%s → P:%s(%.1f) → D:%s(%.1f)%s",
+            request_id,
+            analysis_time_str,
+            token_info,
+            affinity_info,
+            prefiller,
+            prefiller_score,
+            decoder,
+            decoder_score,
+            recompute_info,
+        )
         return InstanceInfo(
             request_id=request_id,
             prefiller_idx=prefiller_idx,
@@ -2047,6 +2310,9 @@ async def _handle_completions(api: str, request: Request):
     try:
         proxy_state.request_num += 1
         req_data = await request.json()
+        prefix_anchors = _parse_prefix_affinity_header(
+            getattr(request, "headers", {}).get(_PREFIX_AFFINITY_HEADER)
+        )
         
         # Normalize tool_calls[].function.arguments: dict → JSON string
         # OpenAI API spec requires arguments to be a JSON string, but some
@@ -2354,7 +2620,13 @@ async def _handle_completions(api: str, request: Request):
                         content_chars = sum(len(p) for p in prompt if isinstance(p, str))
                 request_length = max(content_chars // 4, 1)
         
-        instance_info = await _handle_select_instance(api, req_data, request_length, analysis)
+        instance_info = await _handle_select_instance(
+            api,
+            req_data,
+            request_length,
+            analysis,
+            prefix_anchors=prefix_anchors,
+        )
         released_kv = False
         
         original_request_id = instance_info.request_id
@@ -2417,6 +2689,7 @@ async def _handle_completions(api: str, request: Request):
                     request_length,
                     analysis,
                     original_request_id=original_request_id,
+                    prefix_anchors=prefix_anchors,
                 )
                 released_kv = False
         
@@ -2578,6 +2851,7 @@ async def _handle_completions(api: str, request: Request):
                                 request_length,
                                 analysis,
                                 original_request_id=original_request_id,
+                                prefix_anchors=prefix_anchors,
                             )
                             released_kv = False
                             logger.info(
@@ -2912,6 +3186,14 @@ def parse_args():
         action="store_true",
         help="Enable decoder RemoteFill discovery and direct remote LMCache storage",
     )
+    parser.add_argument(
+        "--enable-prefix-affinity-routing",
+        action="store_true",
+        help=(
+            "Route bounded X-LMCache-Prefix-Affinity token_end=opaque_key hints "
+            "to their learned P/D placement"
+        ),
+    )
     parser.add_argument("--max-retries", type=int, default=3, help="Maximum number of retries")
     parser.add_argument("--retry-delay", type=float, default=0.001, help="Base delay for exponential backoff")
     parser.add_argument(
@@ -2963,6 +3245,11 @@ def parse_args():
         args.decoder_read_timeout,
     ) <= 0:
         raise ValueError("Backend timeout values must be positive")
+    if args.enable_prefix_affinity_routing and not args.enable_remote_lmcache_store:
+        raise ValueError(
+            "--enable-prefix-affinity-routing requires "
+            "--enable-remote-lmcache-store"
+        )
     args.prefiller_instances = list(zip(args.prefiller_hosts, args.prefiller_ports))
     args.decoder_instances = list(zip(args.decoder_hosts, args.decoder_ports))
     return args
@@ -3086,6 +3373,9 @@ async def lifespan(app: FastAPI):
         override_max_tokens=override_max_tokens,
         context_length_margin=global_args.context_length_margin,
         enable_remote_lmcache_store=global_args.enable_remote_lmcache_store,
+        enable_prefix_affinity_routing=getattr(
+            global_args, "enable_prefix_affinity_routing", False
+        ),
     )
     
     # Enhanced: set metrics aggregator references
@@ -3095,6 +3385,10 @@ async def lifespan(app: FastAPI):
         metrics_aggregator.start()
     
     logger.info(f"Initialized {len(proxy_state.prefillers)} prefill clients and {len(proxy_state.decoders)} decode clients.")
+    if proxy_state.enable_prefix_affinity_routing:
+        logger.info(
+            "Prefix-affinity routing enabled via %s", _PREFIX_AFFINITY_HEADER
+        )
     
     # Print load balance mode
     if global_args.use_original_lb:

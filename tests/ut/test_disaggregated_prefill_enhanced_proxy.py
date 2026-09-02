@@ -34,8 +34,14 @@ def _remote_fill(dp_rank: int = 0) -> dict:
     }
 
 
-def _prime_remote_fill(state, dp_rank: int = 0, api_dp_rank: int | None = None):
-    decoder = state.decoders[0]
+def _prime_remote_fill(
+    state,
+    dp_rank: int = 0,
+    api_dp_rank: int | None = None,
+    decoder_idx: int = 0,
+    segment: str = "decoder:12345",
+):
+    decoder = state.decoders[decoder_idx]
     decoder.decoder_remote_fill = {
         dp_rank: {
             key: value
@@ -45,7 +51,7 @@ def _prime_remote_fill(state, dp_rank: int = 0, api_dp_rank: int | None = None):
         | {
             "api_dp_rank": dp_rank if api_dp_rank is None else api_dp_rank,
             "destination_dp_rank": dp_rank,
-            "mooncake_preferred_segment": "decoder:12345",
+            "mooncake_preferred_segment": segment,
         }
     }
     decoder.decoder_rank_active_tokens = {dp_rank: 0.0}
@@ -142,6 +148,132 @@ class TestEnhancedRemoteFillProxy(unittest.TestCase):
 
         self.assertEqual(select.await_args.args[2:], (2, None))
         response._cleanup()
+
+    def test_prefix_affinity_header_is_bounded_and_sorted(self):
+        anchors = proxy._parse_prefix_affinity_header(
+            "1800=system-v1,42000=conversation-v7,12000=project-v2"
+        )
+        self.assertEqual(
+            [(item.key, item.token_end) for item in anchors],
+            [
+                ("conversation-v7", 42000),
+                ("project-v2", 12000),
+                ("system-v1", 1800),
+            ],
+        )
+        self.assertEqual(proxy._parse_prefix_affinity_header("bad"), ())
+        self.assertEqual(
+            proxy._parse_prefix_affinity_header(
+                "1=a,2=b,3=c,4=d,5=e"
+            ),
+            (),
+        )
+
+    def test_prefix_affinity_ignores_common_prefix_and_load_skew(self):
+        state = proxy.ProxyState(
+            [("prefiller-0", 8001), ("prefiller-1", 8001)],
+            [("decoder-0", 8002), ("decoder-1", 8002)],
+            enable_remote_lmcache_store=True,
+            enable_prefix_affinity_routing=True,
+        )
+        proxy.proxy_state = state
+        _prime_remote_fill(state, decoder_idx=1, segment="decoder-1:12345")
+        reservation = proxy.DecoderReservation(
+            state.decoders[1],
+            1,
+            100.0,
+            dp_rank=0,
+            preferred_segment="decoder-1:12345",
+            remote_fill={"destination_engine_epoch": 7},
+        )
+        full = proxy.PrefixAffinityAnchor("conversation", 20000)
+        state.record_prefix_affinity((full,), 20000, 1, reservation, 20000)
+
+        anchor, record, selected = state.resolve_prefix_affinity(
+            (full,), 20000, 800.0, 2000.0
+        )
+        self.assertEqual((anchor, record.prefiller_idx, selected), (full, 1, True))
+
+        state.prefillers[1].active_tokens = 10000
+        state._update_prefiller_priority(1)
+        self.assertFalse(
+            state.resolve_prefix_affinity(
+                (full,), 20000, 800.0, 2000.0
+            )[2]
+        )
+
+        system = proxy.PrefixAffinityAnchor("system", 9000)
+        state.record_prefix_affinity((system,), 9000, 1, reservation, 9000)
+        self.assertFalse(
+            state.resolve_prefix_affinity(
+                (system,), 60000, 800.0, 2000.0
+            )[2]
+        )
+
+        state.decoders[1].decoder_remote_fill[0]["destination_engine_epoch"] = 8
+        self.assertEqual(
+            state.resolve_prefix_affinity((full,), 20000, 800.0, 2000.0),
+            (None, None, False),
+        )
+        self.assertNotIn(full.key, state.prefix_affinity)
+
+    def test_terminal_persistence_learns_and_reuses_exact_placement(self):
+        state = proxy.ProxyState(
+            [("prefiller-0", 8001), ("prefiller-1", 8001)],
+            [("decoder-0", 8002), ("decoder-1", 8002)],
+            enable_remote_lmcache_store=True,
+            enable_prefix_affinity_routing=True,
+        )
+        proxy.proxy_state = state
+        _prime_remote_fill(state, decoder_idx=0, segment="decoder-0:12345")
+        _prime_remote_fill(state, decoder_idx=1, segment="decoder-1:12345")
+        anchors = (proxy.PrefixAffinityAnchor("full-prompt", 10000),)
+        calls = []
+
+        async def send(*args, **kwargs):
+            calls.append((args[1], kwargs["preferred_mooncake_segment"]))
+            handoff = kwargs["remote_fill_handoff"]
+            return SimpleNamespace(
+                json=lambda: {
+                    "kv_transfer_params": {
+                        "lmcache.remote_fill": {
+                            "terminal": {
+                                "outcome": "PERSISTENT_ONLY",
+                                "persistent_common_end": 10000,
+                                "required_store_end": 10000,
+                                "transfer_id": handoff["transfer_id"],
+                            }
+                        }
+                    }
+                }
+            )
+
+        with patch.object(proxy, "send_request_to_service", side_effect=send):
+            first = asyncio.run(
+                proxy._handle_select_instance(
+                    "/completions",
+                    {"prompt": "x"},
+                    10000,
+                    prefix_anchors=anchors,
+                )
+            )
+            self.assertEqual((first.prefiller_idx, first.decoder_idx), (0, 0))
+            proxy._release_decoder_reservation(first)
+            state.release_prefiller_kv(first.prefiller_idx, first.prefiller_score)
+
+            second = asyncio.run(
+                proxy._handle_select_instance(
+                    "/completions",
+                    {"prompt": "x"},
+                    10000,
+                    prefix_anchors=anchors,
+                )
+            )
+
+        self.assertEqual((second.prefiller_idx, second.decoder_idx), (0, 0))
+        self.assertEqual(calls, [(0, "decoder-0:12345")] * 2)
+        proxy._release_decoder_reservation(second)
+        state.release_prefiller_kv(second.prefiller_idx, second.prefiller_score)
 
     def test_remote_fill_only_placement_is_valid(self):
         placement = _remote_fill()
@@ -326,13 +458,13 @@ class TestEnhancedRemoteFillProxy(unittest.TestCase):
         original_select_decoder = state.select_decoder
         original_select_prefiller = state.select_prefiller
 
-        def select_decoder(score):
+        def select_decoder(score, preferred_idx=None):
             order.append("decoder")
-            return original_select_decoder(score)
+            return original_select_decoder(score, preferred_idx)
 
-        def select_prefiller(score):
+        def select_prefiller(score, preferred_idx=None):
             order.append("prefiller")
-            return original_select_prefiller(score)
+            return original_select_prefiller(score, preferred_idx)
 
         state.select_decoder = select_decoder
         state.select_prefiller = select_prefiller
@@ -495,13 +627,13 @@ class TestEnhancedRemoteFillProxy(unittest.TestCase):
         original_select_decoder = state.select_decoder
         original_select_prefiller = state.select_prefiller
 
-        def select_decoder(score):
+        def select_decoder(score, preferred_idx=None):
             order.append("decoder")
-            return original_select_decoder(score)
+            return original_select_decoder(score, preferred_idx)
 
-        def select_prefiller(score):
+        def select_prefiller(score, preferred_idx=None):
             order.append("prefiller")
-            return original_select_prefiller(score)
+            return original_select_prefiller(score, preferred_idx)
 
         async def send(*args, **kwargs):
             order.append("send")
