@@ -2849,7 +2849,7 @@ class NPUModelRunner(GPUModelRunner):
 
         if not self.use_async_scheduling:
             return model_runner_output
-        return AsyncGPUModelRunnerOutput(
+        output = AsyncGPUModelRunnerOutput(
             model_runner_output=model_runner_output,
             sampled_token_ids=sampler_output.sampled_token_ids,
             logprobs_tensors=sampler_output.logprobs_tensors,
@@ -2857,6 +2857,9 @@ class NPUModelRunner(GPUModelRunner):
             async_output_copy_stream=self.async_output_copy_stream,
             vocab_size=self.input_batch.vocab_size,
         )
+        if cold_perf_req_ids:
+            output._ascend_cold_perf_request_ids = cold_perf_req_ids
+        return output
 
     # overwrite _sample for lmhead_tp_enable and need_accepted_tokens
     def _sample(self, logits, spec_decode_metadata):

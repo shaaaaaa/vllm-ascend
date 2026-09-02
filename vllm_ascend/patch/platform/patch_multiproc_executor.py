@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 import weakref
 from collections import deque
 from collections.abc import Callable
@@ -19,6 +20,52 @@ from vllm.v1.executor.multiproc_executor import (
     WorkerProc,
     set_multiprocessing_worker_envs,
 )
+
+from vllm_ascend.lmcache_cold_perf import (
+    cold_perf_enabled,
+    log_cold_perf_process_event,
+)
+
+_COLD_PERF_REQUEST_IDS = "_ascend_cold_perf_request_ids"
+_COLD_PERF_QUEUED_NS = "_ascend_cold_perf_queued_ns"
+_SLOW_ASYNC_OUTPUT_MS = 100.0
+_worker_handle_output = WorkerProc.handle_output
+_worker_enqueue_output = WorkerProc.enqueue_output
+
+
+def _handle_output(self: WorkerProc, output):
+    if getattr(output, _COLD_PERF_REQUEST_IDS, ()):
+        setattr(output, _COLD_PERF_QUEUED_NS, time.perf_counter_ns())
+    _worker_handle_output(self, output)
+
+
+def _enqueue_output(self: WorkerProc, output):
+    queued_ns = getattr(output, _COLD_PERF_QUEUED_NS, None)
+    if queued_ns is None:
+        return _worker_enqueue_output(self, output)
+
+    output_start_ns = time.perf_counter_ns()
+    output_cpu_start_ns = time.thread_time_ns()
+    request_ids = getattr(output, _COLD_PERF_REQUEST_IDS)
+    output = output.get_output()
+    output_end_ns = time.perf_counter_ns()
+    output_cpu_end_ns = time.thread_time_ns()
+    _worker_enqueue_output(self, output)
+    completed_ns = time.perf_counter_ns()
+    total_ms = (completed_ns - queued_ns) / 1e6
+    if total_ms >= _SLOW_ASYNC_OUTPUT_MS:
+        log_cold_perf_process_event(
+            "decoder_async_output_slow",
+            request_ids=request_ids,
+            rank=self.rank,
+            queue_wait_ms=round((output_start_ns - queued_ns) / 1e6, 3),
+            get_output_ms=round((output_end_ns - output_start_ns) / 1e6, 3),
+            get_output_thread_cpu_ms=round(
+                (output_cpu_end_ns - output_cpu_start_ns) / 1e6, 3
+            ),
+            response_enqueue_ms=round((completed_ns - output_end_ns) / 1e6, 3),
+            total_ms=round(total_ms, 3),
+        )
 
 
 class AscendMultiprocExecutor(MultiprocExecutor):
@@ -208,4 +255,7 @@ class AscendWorkerProc(WorkerProc):
         return UnreadyWorkerProcHandle(proc, rank, ready_reader, death_writer)
 
 
+if cold_perf_enabled():
+    WorkerProc.handle_output = _handle_output
+    WorkerProc.enqueue_output = _enqueue_output
 vllm.v1.executor.multiproc_executor.MultiprocExecutor = AscendMultiprocExecutor
