@@ -134,7 +134,12 @@ class TestEnhancedRemoteFillProxy(unittest.TestCase):
 
     def test_no_analyzer_uses_existing_character_estimate(self):
         proxy.global_args.use_original_lb = False
-        state = proxy.ProxyState([("prefiller", 8001)], [("decoder", 8002)])
+        state = proxy.ProxyState(
+            [("prefiller", 8001)],
+            [("decoder", 8002)],
+            enable_remote_lmcache_store=True,
+            enable_prefix_affinity_routing=True,
+        )
         proxy.proxy_state = state
         info = _reserve_instance(state)
         request = SimpleNamespace(
@@ -147,7 +152,20 @@ class TestEnhancedRemoteFillProxy(unittest.TestCase):
             response = asyncio.run(proxy._handle_completions("/completions", request))
 
         self.assertEqual(select.await_args.args[2:], (2, None))
+        anchors = select.await_args.kwargs["prefix_anchors"]
+        self.assertEqual(len(anchors), 1)
+        self.assertEqual(anchors[0].token_end, 2)
+        self.assertTrue(anchors[0].key.startswith("auto-"))
         response._cleanup()
+
+    def test_automatic_affinity_uses_progressive_bounded_prefixes(self):
+        common = b"x" * (70 << 10)
+        first = proxy._automatic_prefix_affinity_anchors(common + b"a", 18000)
+        second = proxy._automatic_prefix_affinity_anchors(common + b"b", 18000)
+
+        self.assertLessEqual(len(first), 4)
+        self.assertNotEqual(first[0].key, second[0].key)
+        self.assertEqual(first[-2:], second[-2:])
 
     def test_prefix_affinity_header_is_bounded_and_sorted(self):
         anchors = proxy._parse_prefix_affinity_header(
@@ -227,7 +245,10 @@ class TestEnhancedRemoteFillProxy(unittest.TestCase):
         proxy.proxy_state = state
         _prime_remote_fill(state, decoder_idx=0, segment="decoder-0:12345")
         _prime_remote_fill(state, decoder_idx=1, segment="decoder-1:12345")
-        anchors = (proxy.PrefixAffinityAnchor("full-prompt", 10000),)
+        anchors = (
+            proxy.PrefixAffinityAnchor("full-prompt", 10000),
+            proxy.PrefixAffinityAnchor("partial-prompt", 8192),
+        )
         calls = []
 
         async def send(*args, **kwargs):
@@ -258,6 +279,7 @@ class TestEnhancedRemoteFillProxy(unittest.TestCase):
                 )
             )
             self.assertEqual((first.prefiller_idx, first.decoder_idx), (0, 0))
+            self.assertIn("partial-prompt", state.prefix_affinity)
             proxy._release_decoder_reservation(first)
             state.release_prefiller_kv(first.prefiller_idx, first.prefiller_score)
 

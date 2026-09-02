@@ -24,6 +24,7 @@
 import argparse
 import asyncio
 import functools
+import hashlib
 import heapq
 import ipaddress
 import json
@@ -253,6 +254,30 @@ def _parse_prefix_affinity_header(raw_value: str | None) -> tuple[PrefixAffinity
         anchors[key] = max(token_end, anchors.get(key, 0))
     ordered = sorted(anchors.items(), key=lambda item: item[1], reverse=True)
     return tuple(PrefixAffinityAnchor(key, token_end) for key, token_end in ordered)
+
+
+def _automatic_prefix_affinity_anchors(
+    request_body: bytes, request_tokens: int
+) -> tuple[PrefixAffinityAnchor, ...]:
+    """Hash bounded progressive prefixes; affinity is only a placement hint."""
+    if not request_body:
+        return ()
+    body_bytes = len(request_body)
+    ends = [end for end in (32 << 10, 64 << 10, 128 << 10, 256 << 10)
+            if end < body_bytes]
+    if len(ends) < _PREFIX_AFFINITY_MAX_ANCHORS:
+        ends.append(body_bytes)
+    digest = hashlib.blake2s(digest_size=16)
+    anchors = []
+    previous = 0
+    for end in ends[:_PREFIX_AFFINITY_MAX_ANCHORS]:
+        digest.update(request_body[previous:end])
+        anchors.append(PrefixAffinityAnchor(
+            f"auto-{end:x}-{digest.hexdigest()}",
+            max(int(request_tokens) * end // body_bytes, 1),
+        ))
+        previous = end
+    return tuple(reversed(anchors))
 
 
 # ============================================================================
@@ -1434,28 +1459,30 @@ class ProxyState:
             or reservation.remote_fill is None
         ):
             return None
-        anchor = next((item for item in anchors if (
+        valid_anchors = tuple(item for item in anchors if (
             _PREFIX_AFFINITY_MIN_TOKENS <= item.token_end <= required_end
-        )), None)
-        if anchor is None:
+        ))
+        if not valid_anchors:
             return None
         epoch = reservation.remote_fill.get("destination_engine_epoch")
         if isinstance(epoch, bool) or not isinstance(epoch, int):
             return None
         with self._state_lock:
-            self.prefix_affinity[anchor.key] = PrefixAffinityRecord(
-                prefiller_idx=prefiller_idx,
-                decoder_idx=reservation.decoder_idx,
-                dp_rank=reservation.dp_rank,
-                preferred_segment=reservation.preferred_segment,
-                destination_engine_epoch=epoch,
-                local_tokens=min(max(local_tokens, 0), anchor.token_end),
-                expires_at=time.monotonic() + _PREFIX_AFFINITY_TTL_SECONDS,
-            )
-            self.prefix_affinity.move_to_end(anchor.key)
+            expires_at = time.monotonic() + _PREFIX_AFFINITY_TTL_SECONDS
+            for anchor in valid_anchors:
+                self.prefix_affinity[anchor.key] = PrefixAffinityRecord(
+                    prefiller_idx=prefiller_idx,
+                    decoder_idx=reservation.decoder_idx,
+                    dp_rank=reservation.dp_rank,
+                    preferred_segment=reservation.preferred_segment,
+                    destination_engine_epoch=epoch,
+                    local_tokens=min(max(local_tokens, 0), anchor.token_end),
+                    expires_at=expires_at,
+                )
+                self.prefix_affinity.move_to_end(anchor.key)
             while len(self.prefix_affinity) > _PREFIX_AFFINITY_CACHE_SIZE:
                 self.prefix_affinity.popitem(last=False)
-        return anchor.key
+        return valid_anchors[0].key
 
     def _decoder_placement_is_fresh(self, server: ServerState, now: float) -> bool:
         if server.decoder_placement_discovered_at:
@@ -2619,6 +2646,11 @@ async def _handle_completions(api: str, request: Request):
                     elif isinstance(prompt, list):
                         content_chars = sum(len(p) for p in prompt if isinstance(p, str))
                 request_length = max(content_chars // 4, 1)
+
+        if proxy_state.enable_prefix_affinity_routing and not prefix_anchors:
+            prefix_anchors = _automatic_prefix_affinity_anchors(
+                req_body, request_length
+            )
         
         instance_info = await _handle_select_instance(
             api,
@@ -3387,7 +3419,8 @@ async def lifespan(app: FastAPI):
     logger.info(f"Initialized {len(proxy_state.prefillers)} prefill clients and {len(proxy_state.decoders)} decode clients.")
     if proxy_state.enable_prefix_affinity_routing:
         logger.info(
-            "Prefix-affinity routing enabled via %s", _PREFIX_AFFINITY_HEADER
+            "Prefix-affinity routing enabled via %s or automatic request fingerprint",
+            _PREFIX_AFFINITY_HEADER,
         )
     
     # Print load balance mode
