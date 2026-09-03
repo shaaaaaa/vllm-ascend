@@ -25,6 +25,34 @@ from vllm_ascend.worker.block_table import MultiGroupBlockTable
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
 
 
+class TestColdPerfSampleTiming(unittest.TestCase):
+    def test_slow_sample_summary_is_thresholded_and_attributed(self):
+        stages = {"target_sampling_ms": 300.0, "mtp_draft_ms": 100.0}
+        with patch.object(
+            model_runner_module, "log_cold_perf_event"
+        ) as log_event:
+            model_runner_module._log_slow_sample_invocation(
+                ("request",), 499.0, 20.0, 40.0, stages
+            )
+            log_event.assert_not_called()
+
+            model_runner_module._log_slow_sample_invocation(
+                ("request",), 650.0, 30.0, 60.0, stages
+            )
+
+        log_event.assert_called_once_with(
+            "decoder_sample_invocation_slow",
+            request_ids=("request",),
+            require_active=False,
+            total_wall_ms=650.0,
+            total_thread_cpu_ms=30.0,
+            total_process_cpu_ms=60.0,
+            unattributed_wall_ms=250.0,
+            target_sampling_ms=300.0,
+            mtp_draft_ms=100.0,
+        )
+
+
 class TestKVConnectorCompatibility(unittest.TestCase):
     def test_merge_preserves_worker_metadata(self):
         first_metadata = MagicMock()

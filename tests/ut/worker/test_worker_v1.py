@@ -444,6 +444,37 @@ class TestNPUWorker(TestBase):
         self.assertEqual(log.call_args_list[0].kwargs["tp_rank"], 2)
         self.assertEqual(log.call_args_list[1].kwargs["timeout_seconds"], 70)
 
+    def test_sample_tokens_propagates_followup_trace_without_watchdog(self):
+        from vllm_ascend.worker.worker import NPUWorker
+
+        worker = NPUWorker.__new__(NPUWorker)
+        worker.model_runner = MagicMock()
+        worker.model_runner._cold_perf_current_req_ids = ()
+        worker.model_runner._cold_perf_sample_trace_req_ids = ("followup",)
+        output = SimpleNamespace()
+        worker.model_runner.sample_tokens.return_value = output
+        worker._raise_if_remote_fill_restart_required = MagicMock()
+
+        with (
+            patch("vllm_ascend.worker.worker.log_cold_perf_event") as log,
+            patch(
+                "vllm_ascend.worker.worker.faulthandler.dump_traceback_later"
+            ) as arm,
+            patch(
+                "vllm_ascend.worker.worker.faulthandler.cancel_dump_traceback_later"
+            ) as cancel,
+            patch("vllm_ascend.worker.worker.forget_cold_perf_request") as forget,
+        ):
+            result = worker.sample_tokens(MagicMock())
+
+        self.assertIs(result, output)
+        self.assertEqual(output._ascend_cold_perf_request_ids, ("followup",))
+        self.assertIsInstance(output._ascend_cold_perf_sample_return_ns, int)
+        log.assert_not_called()
+        arm.assert_not_called()
+        cancel.assert_not_called()
+        forget.assert_not_called()
+
     @patch("vllm_ascend.utils.adapt_patch")
     @patch("vllm_ascend.ops")
     @patch("vllm_ascend.worker.worker._register_atb_extensions")

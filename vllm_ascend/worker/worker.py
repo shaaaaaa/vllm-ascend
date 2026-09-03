@@ -756,11 +756,24 @@ class NPUWorker(WorkerBase):
 
     @torch.inference_mode()
     def sample_tokens(self, grammar_output: "GrammarOutput") -> ModelRunnerOutput | AsyncModelRunnerOutput:
-        request_ids = tuple(
+        active_request_ids = tuple(
             getattr(self.model_runner, "_cold_perf_current_req_ids", ()) or ()
         )
+        request_ids = tuple(
+            dict.fromkeys(
+                active_request_ids
+                + tuple(
+                    getattr(
+                        self.model_runner,
+                        "_cold_perf_sample_trace_req_ids",
+                        (),
+                    )
+                    or ()
+                )
+            )
+        )
         rpc_started = time.perf_counter() if request_ids else 0.0
-        diagnostic_active = bool(request_ids)
+        diagnostic_active = bool(active_request_ids)
         watchdog_armed = False
         if diagnostic_active:
             tp_rank, watchdog_timeout = _cold_perf_watchdog_rank_and_timeout()
@@ -802,8 +815,9 @@ class NPUWorker(WorkerBase):
                     self._raise_if_remote_fill_restart_required()
                 raise
             self._raise_if_remote_fill_restart_required()
-            if diagnostic_active:
+            if request_ids:
                 sample_return_ns = time.perf_counter_ns()
+                rpc_elapsed_ms = (time.perf_counter() - rpc_started) * 1000
                 for diagnostic_output in (
                     output,
                     getattr(output, "_model_runner_output", None),
@@ -821,22 +835,30 @@ class NPUWorker(WorkerBase):
                         )
                     except (AttributeError, TypeError):
                         pass
-                log_cold_perf_event(
-                    "decoder_sample_rpc_return",
-                    request_ids=request_ids,
-                    once=True,
-                    elapsed_ms=round(
-                        (time.perf_counter() - rpc_started) * 1000, 3
-                    ),
-                    output_type=type(output).__name__,
-                )
+                if diagnostic_active:
+                    log_cold_perf_event(
+                        "decoder_sample_rpc_return",
+                        request_ids=request_ids,
+                        once=True,
+                        elapsed_ms=round(rpc_elapsed_ms, 3),
+                        output_type=type(output).__name__,
+                    )
+                elif rpc_elapsed_ms >= _COLD_PERF_SLOW_EXECUTE_MS:
+                    log_cold_perf_event(
+                        "decoder_sample_rpc_slow",
+                        request_ids=request_ids,
+                        require_active=False,
+                        elapsed_ms=round(rpc_elapsed_ms, 3),
+                        output_type=type(output).__name__,
+                    )
             return output
         except BaseException as exc:
-            if diagnostic_active:
+            if request_ids:
                 log_cold_perf_event(
                     "decoder_sample_rpc_error",
                     request_ids=request_ids,
                     once=True,
+                    require_active=diagnostic_active,
                     elapsed_ms=round(
                         (time.perf_counter() - rpc_started) * 1000, 3
                     ),
@@ -855,7 +877,7 @@ class NPUWorker(WorkerBase):
                         operation="cancel",
                         error_type=type(exc).__name__,
                     )
-            for request_id in request_ids:
+            for request_id in active_request_ids:
                 forget_cold_perf_request(request_id)
 
     def load_model(self) -> None:

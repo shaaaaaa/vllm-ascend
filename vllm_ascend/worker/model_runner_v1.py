@@ -201,6 +201,39 @@ else:
     xgr = LazyLoader("xgr", globals(), "xgrammar")
 
 
+_COLD_PERF_SAMPLE_TRACE_CALLS = 2
+_COLD_PERF_SLOW_SAMPLE_MS = 500.0
+
+
+def _record_sample_stage(
+    stages: dict[str, float], name: str, started: float
+) -> None:
+    stages[name] = (time.perf_counter() - started) * 1000
+
+
+def _log_slow_sample_invocation(
+    request_ids: tuple[str, ...],
+    elapsed_ms: float,
+    thread_cpu_ms: float,
+    process_cpu_ms: float,
+    stages: dict[str, float],
+) -> None:
+    if elapsed_ms < _COLD_PERF_SLOW_SAMPLE_MS:
+        return
+    log_cold_perf_event(
+        "decoder_sample_invocation_slow",
+        request_ids=request_ids,
+        require_active=False,
+        total_wall_ms=round(elapsed_ms, 3),
+        total_thread_cpu_ms=round(thread_cpu_ms, 3),
+        total_process_cpu_ms=round(process_cpu_ms, 3),
+        unattributed_wall_ms=round(
+            max(0.0, elapsed_ms - sum(stages.values())), 3
+        ),
+        **{name: round(value, 3) for name, value in stages.items()},
+    )
+
+
 def _capture_live_source_event_handoff() -> None:
     """Let the connector retain an explicitly armed post-forward event."""
 
@@ -1801,6 +1834,27 @@ class NPUModelRunner(GPUModelRunner):
             if cold_perf_active
             else []
         )
+        if cold_perf_active:
+            sample_trace_budget = {
+                req_id: remaining
+                for req_id, remaining in getattr(
+                    self, "_cold_perf_sample_trace_budget", {}
+                ).items()
+                if req_id in scheduler_output.num_scheduled_tokens
+            }
+            for req_id in cold_perf_req_ids:
+                sample_trace_budget.setdefault(
+                    req_id, _COLD_PERF_SAMPLE_TRACE_CALLS
+                )
+            self._cold_perf_sample_trace_budget = sample_trace_budget
+            self._cold_perf_sample_trace_req_ids = tuple(
+                req_id
+                for req_id in scheduler_output.num_scheduled_tokens
+                if sample_trace_budget.get(req_id, 0) > 0
+            )
+        else:
+            self._cold_perf_sample_trace_budget = {}
+            self._cold_perf_sample_trace_req_ids = ()
         cold_perf_execute_start = (
             time.perf_counter() if cold_perf_req_ids else 0.0
         )
@@ -2498,9 +2552,19 @@ class NPUModelRunner(GPUModelRunner):
         kv_connector_output = self.kv_connector_output
         self.kv_connector_output = None
         cold_perf_req_ids = getattr(self, "_cold_perf_current_req_ids", ())
-        cold_perf_sample_start = (
-            time.perf_counter() if cold_perf_req_ids else 0.0
+        sample_trace_req_ids = tuple(
+            getattr(self, "_cold_perf_sample_trace_req_ids", ())
         )
+        cold_perf_sample_start = (
+            time.perf_counter() if sample_trace_req_ids else 0.0
+        )
+        cold_perf_sample_thread_start = (
+            time.thread_time_ns() if sample_trace_req_ids else 0
+        )
+        cold_perf_sample_process_start = (
+            time.process_time_ns() if sample_trace_req_ids else 0
+        )
+        cold_perf_sample_stages: dict[str, float] = {}
         if cold_perf_req_ids:
             log_cold_perf_event(
                 "decoder_sample_start",
@@ -2526,6 +2590,13 @@ class NPUModelRunner(GPUModelRunner):
             output.kv_connector_output = kv_connector_output
             return output
 
+        if sample_trace_req_ids:
+            sample_trace_budget = self._cold_perf_sample_trace_budget
+            for req_id in sample_trace_req_ids:
+                sample_trace_budget[req_id] = max(
+                    0, sample_trace_budget.get(req_id, 0) - 1
+                )
+
         # Unpack ephemeral state.
         (
             scheduler_output,
@@ -2546,6 +2617,7 @@ class NPUModelRunner(GPUModelRunner):
         self.execute_model_state = None
 
         # Apply structured output bitmasks if present.
+        stage_started = time.perf_counter() if sample_trace_req_ids else 0.0
         if grammar_output is not None:
             # here we are different from gpu_model_runner,
             # the apply_grammar_bitmask uses torch.compile to optimize this,ascend does not support it now
@@ -2553,9 +2625,18 @@ class NPUModelRunner(GPUModelRunner):
             logits = logits.to("cpu").float()
             apply_grammar_bitmask(scheduler_output, grammar_output, self.input_batch, logits)
             logits = logits.to(self.device).to(logits_dtype)
+        if sample_trace_req_ids:
+            _record_sample_stage(
+                cold_perf_sample_stages, "grammar_ms", stage_started
+            )
 
+        stage_started = time.perf_counter() if sample_trace_req_ids else 0.0
         with record_function_or_nullcontext("sample_token"):
             sampler_output = self._sample(logits, spec_decode_metadata)
+        if sample_trace_req_ids:
+            _record_sample_stage(
+                cold_perf_sample_stages, "target_sampling_ms", stage_started
+            )
         if cold_perf_req_ids:
             log_cold_perf_event(
                 "decoder_sample_target_complete",
@@ -2609,6 +2690,7 @@ class NPUModelRunner(GPUModelRunner):
                 request_ids=cold_perf_req_ids,
                 once=True,
             )
+        stage_started = time.perf_counter() if sample_trace_req_ids else 0.0
         (
             logprobs_lists,
             valid_sampled_token_ids,
@@ -2624,6 +2706,10 @@ class NPUModelRunner(GPUModelRunner):
             scheduler_output.total_num_scheduled_tokens,
             spec_decode_metadata,
         )
+        if sample_trace_req_ids:
+            _record_sample_stage(
+                cold_perf_sample_stages, "bookkeeping_ms", stage_started
+            )
         if cold_perf_req_ids:
             log_cold_perf_event(
                 "decoder_sample_bookkeeping_complete",
@@ -2646,6 +2732,9 @@ class NPUModelRunner(GPUModelRunner):
 
         with record_function_or_nullcontext("draft_token"):
             if self.speculative_config:
+                stage_started = (
+                    time.perf_counter() if sample_trace_req_ids else 0.0
+                )
                 if cold_perf_req_ids:
                     log_cold_perf_event(
                         "decoder_sample_draft_start",
@@ -2666,6 +2755,11 @@ class NPUModelRunner(GPUModelRunner):
                     # ngram and other speculative decoding methods use the sampled
                     # tokens on the CPU, so they are run after bookkeeping.
                     propose_draft_token_ids(valid_sampled_token_ids)
+
+                if sample_trace_req_ids:
+                    _record_sample_stage(
+                        cold_perf_sample_stages, "mtp_draft_ms", stage_started
+                    )
 
                 if cold_perf_req_ids:
                     log_cold_perf_event(
@@ -2712,6 +2806,9 @@ class NPUModelRunner(GPUModelRunner):
 
             if has_kv_transfer_group():
                 if self.speculative_config:
+                    stage_started = (
+                        time.perf_counter() if sample_trace_req_ids else 0.0
+                    )
                     if cold_perf_req_ids:
                         log_cold_perf_event(
                             "decoder_connector_finalize_start",
@@ -2721,6 +2818,12 @@ class NPUModelRunner(GPUModelRunner):
                     finalized = self.finalize_kv_connector(
                         scheduler_output.finished_req_ids
                     )
+                    if sample_trace_req_ids:
+                        _record_sample_stage(
+                            cold_perf_sample_stages,
+                            "connector_finalize_ms",
+                            stage_started,
+                        )
                     if cold_perf_req_ids:
                         log_cold_perf_event(
                             "decoder_connector_finalize_complete",
@@ -2767,6 +2870,7 @@ class NPUModelRunner(GPUModelRunner):
             else:
                 logger.warning("RoutedExpertsCapturer is not initialized.")
 
+        stage_started = time.perf_counter() if sample_trace_req_ids else 0.0
         model_runner_output = ModelRunnerOutput(
             req_ids=req_ids_output_copy,
             req_id_to_index=req_id_to_index_output_copy,
@@ -2778,6 +2882,10 @@ class NPUModelRunner(GPUModelRunner):
             ec_connector_output=ec_connector_output if self.supports_mm_inputs else None,
             cudagraph_stats=cudagraph_stats,
         )
+        if sample_trace_req_ids:
+            _record_sample_stage(
+                cold_perf_sample_stages, "output_build_ms", stage_started
+            )
 
         if self.dynamic_eplb:
             with record_function_or_nullcontext("EPLB update"):
@@ -2795,12 +2903,17 @@ class NPUModelRunner(GPUModelRunner):
                     request_ids=cold_perf_req_ids,
                     once=True,
                 )
+            stage_started = time.perf_counter() if sample_trace_req_ids else 0.0
             with (
                 record_function_or_nullcontext("async_state_update"),
                 torch.npu.stream(global_stream()),
             ):
                 global_stream().wait_event(self.sampling_done_event)
                 self._update_states_after_model_execute(sampler_output.sampled_token_ids, scheduler_output)
+            if sample_trace_req_ids:
+                _record_sample_stage(
+                    cold_perf_sample_stages, "state_update_ms", stage_started
+                )
             if cold_perf_req_ids:
                 log_cold_perf_event(
                     "decoder_sample_state_update_complete",
@@ -2823,6 +2936,7 @@ class NPUModelRunner(GPUModelRunner):
         # Host readback can synchronize the device.  Keep it after sampling,
         # MTP draft proposal, connector finalization, async state update, and
         # PP broadcast so diagnostics cannot repair a production ordering bug.
+        stage_started = time.perf_counter() if sample_trace_req_ids else 0.0
         if npu_content_diagnostics_enabled():
             if staged_sfa_graph_key is not None:
                 for layer_name, impl in self._staged_sfa_impls:
@@ -2835,6 +2949,12 @@ class NPUModelRunner(GPUModelRunner):
                         metadata,
                     )
             flush_deferred_diagnostics()
+        if sample_trace_req_ids:
+            _record_sample_stage(
+                cold_perf_sample_stages,
+                "content_diagnostics_ms",
+                stage_started,
+            )
 
         if cold_perf_req_ids:
             log_cold_perf_event(
@@ -2847,18 +2967,33 @@ class NPUModelRunner(GPUModelRunner):
                 output_request_count=len(req_ids_output_copy),
             )
 
-        if not self.use_async_scheduling:
-            return model_runner_output
-        output = AsyncGPUModelRunnerOutput(
-            model_runner_output=model_runner_output,
-            sampled_token_ids=sampler_output.sampled_token_ids,
-            logprobs_tensors=sampler_output.logprobs_tensors,
-            invalid_req_indices=invalid_req_indices,
-            async_output_copy_stream=self.async_output_copy_stream,
-            vocab_size=self.input_batch.vocab_size,
-        )
-        if cold_perf_req_ids:
-            output._ascend_cold_perf_request_ids = cold_perf_req_ids
+        stage_started = time.perf_counter() if sample_trace_req_ids else 0.0
+        if self.use_async_scheduling:
+            output = AsyncGPUModelRunnerOutput(
+                model_runner_output=model_runner_output,
+                sampled_token_ids=sampler_output.sampled_token_ids,
+                logprobs_tensors=sampler_output.logprobs_tensors,
+                invalid_req_indices=invalid_req_indices,
+                async_output_copy_stream=self.async_output_copy_stream,
+                vocab_size=self.input_batch.vocab_size,
+            )
+            if sample_trace_req_ids:
+                output._ascend_cold_perf_request_ids = sample_trace_req_ids
+        else:
+            output = model_runner_output
+        if sample_trace_req_ids:
+            _record_sample_stage(
+                cold_perf_sample_stages,
+                "async_output_build_ms",
+                stage_started,
+            )
+            _log_slow_sample_invocation(
+                sample_trace_req_ids,
+                (time.perf_counter() - cold_perf_sample_start) * 1000,
+                (time.thread_time_ns() - cold_perf_sample_thread_start) / 1e6,
+                (time.process_time_ns() - cold_perf_sample_process_start) / 1e6,
+                cold_perf_sample_stages,
+            )
         return output
 
     # overwrite _sample for lmhead_tp_enable and need_accepted_tokens
