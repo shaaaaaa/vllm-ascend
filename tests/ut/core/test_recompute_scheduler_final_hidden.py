@@ -3,7 +3,45 @@ from types import SimpleNamespace
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.request import RequestStatus
 
-from vllm_ascend.core.recompute_scheduler import RecomputeScheduler
+from vllm_ascend.core.recompute_scheduler import (
+    AsyncRecomputeScheduler,
+    RecomputeScheduler,
+)
+
+
+def test_async_scheduler_initializes_bootstrap_sample_gate(monkeypatch):
+    parallel_config = SimpleNamespace(
+        data_parallel_rank=0,
+        data_parallel_size=1,
+        pipeline_parallel_size=1,
+        prefill_context_parallel_size=1,
+        decode_context_parallel_size=1,
+    )
+
+    def initialize_scheduler(scheduler, *args, **kwargs):
+        scheduler.vllm_config = SimpleNamespace(
+            speculative_config=None,
+            kv_transfer_config=None,
+            model_config=SimpleNamespace(
+                hf_text_config=SimpleNamespace(model_type="glm_moe_dsa"),
+            ),
+            parallel_config=parallel_config,
+        )
+        scheduler.parallel_config = parallel_config
+        scheduler.log_stats = False
+        scheduler.is_encoder_decoder = False
+        scheduler.num_spec_tokens = 1
+
+    monkeypatch.setattr(Scheduler, "__init__", initialize_scheduler)
+    monkeypatch.setattr(
+        "vllm_ascend.core.recompute_scheduler."
+        "register_ascend_mla_spec_in_manager",
+        lambda: None,
+    )
+
+    scheduler = AsyncRecomputeScheduler()
+
+    assert scheduler._bootstrap_sample_ready is False
 
 
 def test_bootstrap_remote_full_hit_keeps_all_prompt_tokens():

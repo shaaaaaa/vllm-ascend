@@ -144,6 +144,7 @@ class RecomputeScheduler(Scheduler):
         )
         # AsyncRecomputeScheduler is the production Ascend PD scheduler. Its
         # bootstrap step is isolated, so async scheduling itself is supported.
+        self._bootstrap_sample_ready = False
         self.final_hidden_bootstrap_supported = (
             not self.is_encoder_decoder
             and self.parallel_config.pipeline_parallel_size == 1
