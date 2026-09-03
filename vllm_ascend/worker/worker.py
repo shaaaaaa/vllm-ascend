@@ -94,6 +94,8 @@ REMOTE_FILL_PAIRED_RESTART_EXIT_CODE = 86
 _COLD_PERF_STALL_SECONDS = 60
 _COLD_PERF_STALL_STAGGER_SECONDS = 5
 _COLD_PERF_SLOW_EXECUTE_MS = 500
+_COLD_PERF_REQUEST_IDS_ATTR = "_ascend_cold_perf_request_ids"
+_COLD_PERF_SAMPLE_RETURN_NS_ATTR = "_ascend_cold_perf_sample_return_ns"
 
 
 def _cold_perf_watchdog_rank_and_timeout() -> tuple[int, int]:
@@ -801,6 +803,24 @@ class NPUWorker(WorkerBase):
                 raise
             self._raise_if_remote_fill_restart_required()
             if diagnostic_active:
+                sample_return_ns = time.perf_counter_ns()
+                for diagnostic_output in (
+                    output,
+                    getattr(output, "_model_runner_output", None),
+                ):
+                    try:
+                        setattr(
+                            diagnostic_output,
+                            _COLD_PERF_REQUEST_IDS_ATTR,
+                            request_ids,
+                        )
+                        setattr(
+                            diagnostic_output,
+                            _COLD_PERF_SAMPLE_RETURN_NS_ATTR,
+                            sample_return_ns,
+                        )
+                    except (AttributeError, TypeError):
+                        pass
                 log_cold_perf_event(
                     "decoder_sample_rpc_return",
                     request_ids=request_ids,

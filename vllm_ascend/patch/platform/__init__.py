@@ -33,7 +33,12 @@ import vllm_ascend.patch.platform.patch_torch_accelerator  # noqa
 import vllm_ascend.patch.platform.patch_minimax_usage_accounting  # noqa
 import vllm_ascend.patch.platform.patch_glm_tool_call_parser  # noqa
 
-if os.getenv("DYNAMIC_EPLB", "false").lower() in ("true", "1") or os.getenv("EXPERT_MAP_RECORD", "false") == "true":
+if (
+    os.getenv("DYNAMIC_EPLB", "false").lower() in ("true", "1")
+    or os.getenv("EXPERT_MAP_RECORD", "false") == "true"
+    or os.getenv("LMCACHE_COLD_START_PERF", "0").lower()
+    not in ("", "0", "false", "no", "off")
+):
     import vllm_ascend.patch.platform.patch_multiproc_executor  # noqa
 
 if envs.VLLM_ASCEND_BALANCE_SCHEDULING:

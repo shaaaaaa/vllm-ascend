@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import os
 import time
 import weakref
 from collections import deque
 from collections.abc import Callable
+from concurrent.futures import InvalidStateError
+from contextlib import suppress
 from multiprocessing.synchronize import Lock as LockType
 
 import vllm.v1.executor.multiproc_executor
@@ -24,18 +27,28 @@ from vllm.v1.executor.multiproc_executor import (
 from vllm_ascend.lmcache_cold_perf import (
     cold_perf_enabled,
     log_cold_perf_event,
+    log_cold_perf_process_event,
 )
 
 _COLD_PERF_REQUEST_IDS = "_ascend_cold_perf_request_ids"
+_COLD_PERF_SAMPLE_RETURN_NS = "_ascend_cold_perf_sample_return_ns"
 _COLD_PERF_QUEUED_NS = "_ascend_cold_perf_queued_ns"
+_COLD_PERF_WORKER_TIMING = "_ascend_cold_perf_worker_timing"
 _SLOW_ASYNC_OUTPUT_MS = 100.0
 _worker_handle_output = WorkerProc.handle_output
 _worker_enqueue_output = WorkerProc.enqueue_output
+_worker_hook_reported = False
 
 
 def _handle_output(self: WorkerProc, output):
+    global _worker_hook_reported
     if getattr(output, _COLD_PERF_REQUEST_IDS, ()):
         setattr(output, _COLD_PERF_QUEUED_NS, time.perf_counter_ns())
+        if not _worker_hook_reported:
+            _worker_hook_reported = True
+            log_cold_perf_process_event(
+                "decoder_async_output_hook_active", rank=self.rank
+            )
     _worker_handle_output(self, output)
 
 
@@ -47,12 +60,27 @@ def _enqueue_output(self: WorkerProc, output):
     output_start_ns = time.perf_counter_ns()
     output_cpu_start_ns = time.thread_time_ns()
     request_ids = getattr(output, _COLD_PERF_REQUEST_IDS)
+    sample_return_ns = getattr(output, _COLD_PERF_SAMPLE_RETURN_NS, queued_ns)
     output = output.get_output()
     output_end_ns = time.perf_counter_ns()
     output_cpu_end_ns = time.thread_time_ns()
+    worker_timing = {
+        "sample_return_ns": sample_return_ns,
+        "worker_enqueue_start_ns": output_end_ns,
+        "sample_return_to_handle_ms": round(
+            (queued_ns - sample_return_ns) / 1e6, 3
+        ),
+        "queue_wait_ms": round((output_start_ns - queued_ns) / 1e6, 3),
+        "get_output_ms": round((output_end_ns - output_start_ns) / 1e6, 3),
+        "get_output_thread_cpu_ms": round(
+            (output_cpu_end_ns - output_cpu_start_ns) / 1e6, 3
+        ),
+    }
+    setattr(output, _COLD_PERF_REQUEST_IDS, request_ids)
+    setattr(output, _COLD_PERF_WORKER_TIMING, worker_timing)
     _worker_enqueue_output(self, output)
     completed_ns = time.perf_counter_ns()
-    total_ms = (completed_ns - queued_ns) / 1e6
+    total_ms = (completed_ns - sample_return_ns) / 1e6
     if total_ms >= _SLOW_ASYNC_OUTPUT_MS:
         log_cold_perf_event(
             "decoder_async_output_slow",
@@ -60,14 +88,63 @@ def _enqueue_output(self: WorkerProc, output):
             # sample_tokens has already retired these captured request IDs.
             require_active=False,
             rank=self.rank,
-            queue_wait_ms=round((output_start_ns - queued_ns) / 1e6, 3),
-            get_output_ms=round((output_end_ns - output_start_ns) / 1e6, 3),
-            get_output_thread_cpu_ms=round(
-                (output_cpu_end_ns - output_cpu_start_ns) / 1e6, 3
-            ),
+            **{
+                key: value
+                for key, value in worker_timing.items()
+                if not key.endswith("_ns")
+            },
             response_enqueue_ms=round((completed_ns - output_end_ns) / 1e6, 3),
             total_ms=round(total_ms, 3),
         )
+
+
+def _wait_for_response(self: FutureWrapper, get_response):
+    wait_started_ns = time.perf_counter_ns()
+    try:
+        response = get_response()
+        response_received_ns = time.perf_counter_ns()
+        response = self.aggregate(response)
+        aggregate_done_ns = time.perf_counter_ns()
+        with suppress(InvalidStateError):
+            self.set_result(response)
+    except Exception as exc:
+        with suppress(InvalidStateError):
+            self.set_exception(exc)
+        return
+
+    request_ids = getattr(response, _COLD_PERF_REQUEST_IDS, ())
+    worker_timing = getattr(response, _COLD_PERF_WORKER_TIMING, None)
+    sample_return_ns = getattr(response, _COLD_PERF_SAMPLE_RETURN_NS, None)
+    if not request_ids or not isinstance(sample_return_ns, int):
+        return
+    worker_enqueue_ns = (
+        worker_timing.get("worker_enqueue_start_ns")
+        if isinstance(worker_timing, dict)
+        else None
+    )
+    worker_to_future_ms = (aggregate_done_ns - sample_return_ns) / 1e6
+    future_wait_ms = (aggregate_done_ns - wait_started_ns) / 1e6
+    if max(worker_to_future_ms, future_wait_ms) < _SLOW_ASYNC_OUTPUT_MS:
+        return
+    log_cold_perf_event(
+        "decoder_parent_response_slow",
+        request_ids=request_ids,
+        require_active=False,
+        worker_hook_timing_present=isinstance(worker_timing, dict),
+        sample_return_to_future_ms=round(worker_to_future_ms, 3),
+        worker_enqueue_to_future_ms=(
+            round((aggregate_done_ns - worker_enqueue_ns) / 1e6, 3)
+            if isinstance(worker_enqueue_ns, int)
+            else None
+        ),
+        response_dequeue_ms=round(
+            (response_received_ns - wait_started_ns) / 1e6, 3
+        ),
+        aggregate_ms=round(
+            (aggregate_done_ns - response_received_ns) / 1e6, 3
+        ),
+        future_wait_ms=round(future_wait_ms, 3),
+    )
 
 
 class AscendMultiprocExecutor(MultiprocExecutor):
@@ -260,4 +337,11 @@ class AscendWorkerProc(WorkerProc):
 if cold_perf_enabled():
     WorkerProc.handle_output = _handle_output
     WorkerProc.enqueue_output = _enqueue_output
-vllm.v1.executor.multiproc_executor.MultiprocExecutor = AscendMultiprocExecutor
+    FutureWrapper.wait_for_response = _wait_for_response
+if (
+    os.getenv("DYNAMIC_EPLB", "false").lower() in ("true", "1")
+    or os.getenv("EXPERT_MAP_RECORD", "false") == "true"
+):
+    vllm.v1.executor.multiproc_executor.MultiprocExecutor = (
+        AscendMultiprocExecutor
+    )
