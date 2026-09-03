@@ -57,7 +57,8 @@ def _enqueue_output(self: WorkerProc, output):
         log_cold_perf_event(
             "decoder_async_output_slow",
             request_ids=request_ids,
-            once=True,
+            # sample_tokens has already retired these captured request IDs.
+            require_active=False,
             rank=self.rank,
             queue_wait_ms=round((output_start_ns - queued_ns) / 1e6, 3),
             get_output_ms=round((output_end_ns - output_start_ns) / 1e6, 3),

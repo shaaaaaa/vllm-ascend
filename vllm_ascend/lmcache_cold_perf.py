@@ -86,13 +86,15 @@ def log_cold_perf_event(
     request_id: str | None = None,
     request_ids: Any = None,
     once: bool = False,
+    require_active: bool = True,
     **fields: Any,
 ) -> None:
     if not cold_perf_enabled():
         return
     ids = [request_id] if request_id is not None else list(request_ids or ())
     ids = [str(req_id) for req_id in ids if req_id is not None]
-    ids = [req_id for req_id in ids if req_id in _cold_perf_request_ids]
+    if require_active:
+        ids = [req_id for req_id in ids if req_id in _cold_perf_request_ids]
     if once:
         ids = [
             req_id

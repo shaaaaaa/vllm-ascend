@@ -50,3 +50,33 @@ def test_process_event_does_not_require_a_marked_request(monkeypatch):
 
     assert records[0]["event"] == "decoder_execute_slow"
     assert records[0]["elapsed_ms"] == 800
+
+
+def test_late_request_event_uses_captured_request_id(monkeypatch):
+    records = []
+    monkeypatch.setattr(cold_perf, "_COLD_PERF_ENABLED", True)
+    cold_perf._cold_perf_request_ids.clear()
+    monkeypatch.setattr(
+        cold_perf,
+        "logger",
+        SimpleNamespace(
+            info=lambda _format, payload: records.append(json.loads(payload))
+        ),
+    )
+
+    cold_perf.log_cold_perf_event(
+        "ordinary_request_event",
+        request_ids=("completed-cold-request",),
+    )
+    assert records == []
+
+    cold_perf.log_cold_perf_event(
+        "decoder_async_output_slow",
+        request_ids=("completed-cold-request",),
+        require_active=False,
+        total_ms=1200,
+    )
+
+    assert records[0]["event"] == "decoder_async_output_slow"
+    assert records[0]["request_ids"] == ["completed-cold-request"]
+    assert records[0]["total_ms"] == 1200
