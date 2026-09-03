@@ -23,7 +23,7 @@ from vllm.v1.executor.multiproc_executor import (
 
 from vllm_ascend.lmcache_cold_perf import (
     cold_perf_enabled,
-    log_cold_perf_process_event,
+    log_cold_perf_event,
 )
 
 _COLD_PERF_REQUEST_IDS = "_ascend_cold_perf_request_ids"
@@ -54,9 +54,10 @@ def _enqueue_output(self: WorkerProc, output):
     completed_ns = time.perf_counter_ns()
     total_ms = (completed_ns - queued_ns) / 1e6
     if total_ms >= _SLOW_ASYNC_OUTPUT_MS:
-        log_cold_perf_process_event(
+        log_cold_perf_event(
             "decoder_async_output_slow",
             request_ids=request_ids,
+            once=True,
             rank=self.rank,
             queue_wait_ms=round((output_start_ns - queued_ns) / 1e6, 3),
             get_output_ms=round((output_end_ns - output_start_ns) / 1e6, 3),
