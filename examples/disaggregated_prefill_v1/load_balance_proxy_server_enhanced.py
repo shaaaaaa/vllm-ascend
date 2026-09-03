@@ -68,7 +68,6 @@ _PREFIX_AFFINITY_MAX_ANCHORS = 4
 _PREFIX_AFFINITY_MAX_KEY_BYTES = 64
 _PREFIX_AFFINITY_KEY_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 _PREFIX_AFFINITY_CACHE_SIZE = 65536
-_PREFIX_AFFINITY_TTL_SECONDS = 1800.0
 _PREFIX_AFFINITY_MIN_TOKENS = 8192
 _PREFIX_AFFINITY_MIN_RATIO = 0.25
 _PREFIX_AFFINITY_LOAD_SLACK = 1.0
@@ -205,7 +204,6 @@ class PrefixAffinityRecord:
     preferred_segment: str
     destination_engine_epoch: int
     local_tokens: int
-    expires_at: float
 
 
 @dataclass
@@ -1411,15 +1409,12 @@ class ProxyState:
         if not self.enable_prefix_affinity_routing or not anchors:
             return None, None, False
         request_tokens = max(request_tokens, anchors[0].token_end)
-        now = time.monotonic()
         with self._state_lock:
             for anchor in anchors:
                 record = self.prefix_affinity.get(anchor.key)
                 if record is None:
                     continue
-                if record.expires_at <= now or not self._affinity_record_is_current(
-                    record
-                ):
+                if not self._affinity_record_is_current(record):
                     self.prefix_affinity.pop(anchor.key, None)
                     continue
                 self.prefix_affinity.move_to_end(anchor.key)
@@ -1468,7 +1463,6 @@ class ProxyState:
         if isinstance(epoch, bool) or not isinstance(epoch, int):
             return None
         with self._state_lock:
-            expires_at = time.monotonic() + _PREFIX_AFFINITY_TTL_SECONDS
             for anchor in valid_anchors:
                 self.prefix_affinity[anchor.key] = PrefixAffinityRecord(
                     prefiller_idx=prefiller_idx,
@@ -1477,7 +1471,6 @@ class ProxyState:
                     preferred_segment=reservation.preferred_segment,
                     destination_engine_epoch=epoch,
                     local_tokens=min(max(local_tokens, 0), anchor.token_end),
-                    expires_at=expires_at,
                 )
                 self.prefix_affinity.move_to_end(anchor.key)
             while len(self.prefix_affinity) > _PREFIX_AFFINITY_CACHE_SIZE:
