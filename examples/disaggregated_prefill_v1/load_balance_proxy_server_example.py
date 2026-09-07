@@ -179,6 +179,13 @@ def _encode_json_payload(payload: Any) -> bytes:
     ).encode("utf-8")
 
 
+def _proxy_cold_perf_enabled() -> bool:
+    return (
+        os.environ.get("LMCACHE_COLD_START_PERF", "0").strip().lower()
+        not in _COLD_PERF_FALSE_VALUES
+    )
+
+
 def _log_proxy_cold_perf_event(
     event: str,
     request_id: str,
@@ -186,10 +193,7 @@ def _log_proxy_cold_perf_event(
     endpoint: str,
     **fields: Any,
 ) -> None:
-    if (
-        os.environ.get("LMCACHE_COLD_START_PERF", "0").lower()
-        in _COLD_PERF_FALSE_VALUES
-    ):
+    if not _proxy_cold_perf_enabled():
         return
     if request_id.startswith(("cmpl-", "chatcmpl-")):
         req_id = request_id
@@ -211,7 +215,7 @@ def _log_proxy_cold_perf_event(
     }
     print(
         "[LMCACHE_COLD_PERF] "
-        + json.dumps(payload, default=str, separators=(",", ":")),
+        + json.dumps(payload, default=lambda _value: "<non-JSON value>", separators=(",", ":")),
         file=sys.stderr,
         flush=True,
     )
@@ -576,13 +580,14 @@ class ProxyState:
                 server.url,
                 exc,
             )
-            _log_proxy_cold_perf_event(
-                "proxy_decoder_placement_discovery_failed",
-                request_id,
-                endpoint=endpoint,
-                decoder_url=server.url,
-                error=str(exc),
-            )
+            if _proxy_cold_perf_enabled():
+                _log_proxy_cold_perf_event(
+                    "proxy_decoder_placement_discovery_failed",
+                    request_id,
+                    endpoint=endpoint,
+                    decoder_url=server.url,
+                    error=str(exc),
+                )
             return
 
         static_ranks = set(
@@ -606,13 +611,14 @@ class ProxyState:
         server.decoder_remote_fill_discovered = discover_remote_fill
         server.decoder_placement_discovered_at = time.monotonic()
         server.decoder_placement_task = None
-        _log_proxy_cold_perf_event(
-            "proxy_decoder_placement_discovered",
-            request_id,
-            endpoint=endpoint,
-            decoder_url=server.url,
-            rank_segments=rank_segments,
-        )
+        if _proxy_cold_perf_enabled():
+            _log_proxy_cold_perf_event(
+                "proxy_decoder_placement_discovered",
+                request_id,
+                endpoint=endpoint,
+                decoder_url=server.url,
+                rank_segments=rank_segments,
+            )
 
     def release_decoder_reservation(
         self, reservation: DecoderReservation
@@ -1265,15 +1271,16 @@ async def send_request_to_service(
         req_data["max_completion_tokens"] = 1
     if "stream_options" in req_data:
         del req_data["stream_options"]
-    encode_started = time.perf_counter()
+    encode_started = time.perf_counter() if _proxy_cold_perf_enabled() else 0.0
     request_content = _encode_json_payload(req_data)
-    _log_proxy_cold_perf_event(
-        "proxy_prefill_body_encode_complete",
-        request_id,
-        endpoint=endpoint,
-        encode_ms=round((time.perf_counter() - encode_started) * 1000, 3),
-        body_bytes=len(request_content),
-    )
+    if _proxy_cold_perf_enabled():
+        _log_proxy_cold_perf_event(
+            "proxy_prefill_body_encode_complete",
+            request_id,
+            endpoint=endpoint,
+            encode_ms=round((time.perf_counter() - encode_started) * 1000, 3),
+            body_bytes=len(request_content),
+        )
     headers = {
         **_service_auth_headers(),
         "X-Request-Id": request_id,
@@ -1318,14 +1325,15 @@ async def stream_service_response_with_retry(
     for attempt in range(1, max_retries + 1):
         first_chunk_sent = False
         try:
-            _log_proxy_cold_perf_event(
-                "proxy_decoder_send_start",
-                request_id,
-                endpoint=endpoint,
-                attempt=attempt,
-                decoder_url=str(getattr(client, "base_url", "")),
-                body_bytes=len(request_content),
-            )
+            if _proxy_cold_perf_enabled():
+                _log_proxy_cold_perf_event(
+                    "proxy_decoder_send_start",
+                    request_id,
+                    endpoint=endpoint,
+                    attempt=attempt,
+                    decoder_url=str(getattr(client, "base_url", "")),
+                    body_bytes=len(request_content),
+                )
             async with client.stream(
                 "POST",
                 endpoint,
@@ -1335,13 +1343,14 @@ async def stream_service_response_with_retry(
                 response.raise_for_status()
                 async for chunk in response.aiter_bytes():
                     if not first_chunk_sent:
-                        _log_proxy_cold_perf_event(
-                            "proxy_decoder_first_byte_received",
-                            request_id,
-                            endpoint=endpoint,
-                            attempt=attempt,
-                            response_bytes=len(chunk),
-                        )
+                        if _proxy_cold_perf_enabled():
+                            _log_proxy_cold_perf_event(
+                                "proxy_decoder_first_byte_received",
+                                request_id,
+                                endpoint=endpoint,
+                                attempt=attempt,
+                                response_bytes=len(chunk),
+                            )
                     first_chunk_sent = True
                     yield chunk
                 return  # Success, exit after streaming
@@ -1384,12 +1393,13 @@ async def _handle_select_instance(
     logger.debug(f"Request length: {request_length}, Prefiller score: {prefiller_score}")
     request_id = request_id or await proxy_state.next_req_id()
     if log_request_received:
-        _log_proxy_cold_perf_event(
-            "proxy_request_received",
-            request_id,
-            endpoint=api,
-            request_bytes=request_length,
-        )
+        if _proxy_cold_perf_enabled():
+            _log_proxy_cold_perf_event(
+                "proxy_request_received",
+                request_id,
+                endpoint=api,
+                request_bytes=request_length,
+            )
     decoder_score = proxy_state.calculate_decode_scores(request_length)
     logger.debug("Decoder score: %f", decoder_score)
     prefiller_idx = None
@@ -1413,16 +1423,17 @@ async def _handle_select_instance(
             )
         proxy_state.assign_decoder_rank(reservation)
         if reservation.preferred_segment is not None:
-            _log_proxy_cold_perf_event(
-                "proxy_decoder_placement_reserved",
-                request_id,
-                endpoint=api,
-                decoder_url=decoder.url,
-                decoder_idx=reservation.decoder_idx,
-                dp_rank=reservation.dp_rank,
-                preferred_segment=reservation.preferred_segment,
-                request_bytes=request_length,
-            )
+            if _proxy_cold_perf_enabled():
+                _log_proxy_cold_perf_event(
+                    "proxy_decoder_placement_reserved",
+                    request_id,
+                    endpoint=api,
+                    decoder_url=decoder.url,
+                    decoder_idx=reservation.decoder_idx,
+                    dp_rank=reservation.dp_rank,
+                    preferred_segment=reservation.preferred_segment,
+                    request_bytes=request_length,
+                )
 
         prefiller_idx = proxy_state.select_prefiller(prefiller_score)
         prefiller = proxy_state.prefillers[prefiller_idx]
@@ -1437,13 +1448,14 @@ async def _handle_select_instance(
                 "request_attempt": 1,
                 "source_engine_id": str(prefiller),
             }
-        _log_proxy_cold_perf_event(
-            "proxy_prefiller_dispatch",
-            request_id,
-            endpoint=api,
-            prefiller_url=str(getattr(prefiller, "url", "")),
-            request_bytes=request_length,
-        )
+        if _proxy_cold_perf_enabled():
+            _log_proxy_cold_perf_event(
+                "proxy_prefiller_dispatch",
+                request_id,
+                endpoint=api,
+                prefiller_url=str(getattr(prefiller, "url", "")),
+                request_bytes=request_length,
+            )
         response = await send_request_to_service(
             prefiller.client,
             prefiller_idx,
@@ -1462,14 +1474,15 @@ async def _handle_select_instance(
             ),
             remote_fill_handoff=remote_fill_handoff,
         )
-        _log_proxy_cold_perf_event(
-            "proxy_prefill_response_received",
-            request_id,
-            endpoint=api,
-            prefiller_url=prefiller.url,
-            response_bytes=len(response.content),
-            request_bytes=request_length,
-        )
+        if _proxy_cold_perf_enabled():
+            _log_proxy_cold_perf_event(
+                "proxy_prefill_response_received",
+                request_id,
+                endpoint=api,
+                prefiller_url=prefiller.url,
+                response_bytes=len(response.content),
+                request_bytes=request_length,
+            )
         proxy_state.release_prefiller(prefiller_idx, prefiller_score)
         prefiller_active_released = True
         response_json = response.json()
@@ -1527,28 +1540,30 @@ async def _handle_select_instance(
         )
         req_data["kv_transfer_params"] = kv_transfer_params
 
-        encode_started = time.perf_counter()
+        encode_started = time.perf_counter() if _proxy_cold_perf_enabled() else 0.0
         decoder_body = _encode_json_payload(req_data)
-        _log_proxy_cold_perf_event(
-            "proxy_decoder_body_encode_complete",
-            request_id,
-            endpoint=api,
-            encode_ms=round((time.perf_counter() - encode_started) * 1000, 3),
-            body_bytes=len(decoder_body),
-        )
-        _log_proxy_cold_perf_event(
-            "proxy_decoder_dispatch_ready",
-            request_id,
-            endpoint=api,
-            decoder_url=decoder.url,
-            request_bytes=request_length,
-            kv_transfer_param_keys=sorted(str(key) for key in kv_transfer_params),
-            remote_fill_transfer_id=(
-                remote_fill_handoff["transfer_id"]
-                if remote_fill_handoff is not None
-                else None
-            ),
-        )
+        if _proxy_cold_perf_enabled():
+            _log_proxy_cold_perf_event(
+                "proxy_decoder_body_encode_complete",
+                request_id,
+                endpoint=api,
+                encode_ms=round((time.perf_counter() - encode_started) * 1000, 3),
+                body_bytes=len(decoder_body),
+            )
+        if _proxy_cold_perf_enabled():
+            _log_proxy_cold_perf_event(
+                "proxy_decoder_dispatch_ready",
+                request_id,
+                endpoint=api,
+                decoder_url=decoder.url,
+                request_bytes=request_length,
+                kv_transfer_param_keys=sorted(str(key) for key in kv_transfer_params),
+                remote_fill_transfer_id=(
+                    remote_fill_handoff["transfer_id"]
+                    if remote_fill_handoff is not None
+                    else None
+                ),
+            )
         logger.debug("Using %s %s", prefiller.url, decoder.url)
         return InstanceInfo(
             request_id=request_id,
@@ -1639,16 +1654,17 @@ async def _handle_completions(
         request_id = str(uuid.uuid4())
         headers = getattr(request, "headers", {})
         content_length = headers.get("content-length") if headers else None
-        _log_proxy_cold_perf_event(
-            "proxy_request_received",
-            request_id,
-            endpoint=api,
-            request_bytes=(
-                int(content_length)
-                if isinstance(content_length, str) and content_length.isdigit()
-                else None
-            ),
-        )
+        if _proxy_cold_perf_enabled():
+            _log_proxy_cold_perf_event(
+                "proxy_request_received",
+                request_id,
+                endpoint=api,
+                request_bytes=(
+                    int(content_length)
+                    if isinstance(content_length, str) and content_length.isdigit()
+                    else None
+                ),
+            )
         req_data = await request.json()
         req_body = await request.body()
         request_length = len(req_body)
@@ -1696,13 +1712,14 @@ async def _handle_completions(
 
         async def generate_stream() -> AsyncIterator[bytes]:
             nonlocal instance_info, released_kv
-            _log_proxy_cold_perf_event(
-                "proxy_decoder_generator_entry",
-                instance_info.request_id,
-                endpoint=api,
-                decoder_url=instance_info.decoder.url,
-                request_bytes=request_length,
-            )
+            if _proxy_cold_perf_enabled():
+                _log_proxy_cold_perf_event(
+                    "proxy_decoder_generator_entry",
+                    instance_info.request_id,
+                    endpoint=api,
+                    decoder_url=instance_info.decoder.url,
+                    request_bytes=request_length,
+                )
             generated_token = ""
             retry_count = 0
             retry = True

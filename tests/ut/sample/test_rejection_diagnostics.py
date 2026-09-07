@@ -9,6 +9,16 @@ from vllm_ascend.sample.rejection_diagnostics import (
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
 
 
+def test_ordinary_perf_does_not_create_device_events():
+    runner = NPUModelRunner.__new__(NPUModelRunner)
+    with (
+        patch.object(model_runner_module, "cold_perf_device_timing_enabled", return_value=False),
+        patch.object(model_runner_module.torch.npu, "Event", side_effect=AssertionError("device timing disabled")),
+        patch.object(model_runner_module.time, "perf_counter", side_effect=AssertionError("timing disabled")),
+    ):
+        assert runner._run_cold_perf_npu_stage("test", ("req",), lambda value: value + 1, 2) == 3
+
+
 def test_rejection_stage_recorder_is_scoped():
     calls = []
 
@@ -76,12 +86,11 @@ def test_deferred_npu_timing_queries_without_synchronizing():
     runner = NPUModelRunner.__new__(NPUModelRunner)
     runner._cold_perf_current_sample_npu_intervals = []
     with (
+        patch.object(model_runner_module, "cold_perf_device_timing_enabled", return_value=True),
         patch.object(model_runner_module.torch.npu, "Event", side_effect=make_event),
         patch.object(model_runner_module, "log_cold_perf_event") as log_event,
     ):
-        result = runner._run_cold_perf_npu_stage(
-            "rejection_total", ("request",), lambda: "result"
-        )
+        result = runner._run_cold_perf_npu_stage("rejection_total", ("request",), lambda: "result")
         runner._cold_perf_pending_npu_intervals[0].force_emit = True
         runner._drain_cold_perf_npu_intervals()
 

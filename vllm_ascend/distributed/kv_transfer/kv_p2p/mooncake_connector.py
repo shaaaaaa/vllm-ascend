@@ -2,7 +2,6 @@
 import contextlib
 import copy
 import hashlib
-import json
 import math
 import os
 import queue
@@ -54,7 +53,8 @@ from vllm_ascend.ascend_config import get_ascend_config, init_ascend_config
 from vllm_ascend.distributed.kv_transfer.utils.mooncake_transfer_engine import global_te
 from vllm_ascend.distributed.kv_transfer.utils.utils import get_transfer_timeout_value
 from vllm_ascend.lmcache_cold_perf import (
-    cold_perf_clock_fields,
+    cold_perf_enabled,
+    log_cold_perf_process_event,
     mark_cold_perf_requests,
 )
 from vllm_ascend.lmcache_diagnostics import (
@@ -193,9 +193,7 @@ def _sanitize_content_diagnostics(
 
 
 def _cold_live_log(event: str, **fields: Any) -> None:
-    if os.environ.get("LMCACHE_COLD_START_PERF", "0").lower() in (
-        "", "0", "false", "no", "off"
-    ):
+    if not cold_perf_enabled():
         return
     request_ids = fields.get("request_ids")
     request_id = fields.get("req_id")
@@ -203,21 +201,7 @@ def _cold_live_log(event: str, **fields: Any) -> None:
         mark_cold_perf_requests((request_id,))
     if request_ids:
         mark_cold_perf_requests(request_ids)
-    logger.info(
-        "[LMCACHE_COLD_PERF] %s",
-        json.dumps(
-            {
-                "schema": 1,
-                "event": event,
-                "pid": os.getpid(),
-                "monotonic_ms": round(time.perf_counter() * 1000, 3),
-                **cold_perf_clock_fields(),
-                **fields,
-            },
-            default=str,
-            separators=(",", ":"),
-        ),
-    )
+    log_cold_perf_process_event(event, **fields)
 
 
 def _fingerprint_live_group1_destination(
@@ -1202,7 +1186,8 @@ class KVCacheRecvingThread(threading.Thread):
         num_blocks = len(local_block_ids)
         session_id = f"{remote_host}:{remote_transfer_port}"
 
-        req_start_time = time.perf_counter()
+        perf_enabled = cold_perf_enabled()
+        req_start_time = time.perf_counter() if perf_enabled else 0.0
         src_list, dst_list, length_list = [], [], []
         block_length = len(self.block_len)
         for k, (src_layer_base_addr, dst_layer_base_addr) in enumerate(
@@ -1223,19 +1208,20 @@ class KVCacheRecvingThread(threading.Thread):
             logger.error("Mooncake transfer failed for request %s", req_meta["remote_request_id"])
             raise RuntimeError(f"Mooncake transfer failed, ret: {ret}")
 
-        req_end_time = time.perf_counter()
-        req_transfer_elapsed = (req_end_time - req_start_time) * 1000
-        logger.info(
-            "KV cache transfer for request %s took %.2f ms (%d groups,"
-            " %d blocks). local_ip %s local_device_id %s remote_session_id %s",
-            remote_request_id,
-            req_transfer_elapsed,
-            num_transfer_groups,
-            num_blocks,
-            get_ip(),
-            self.tp_rank,
-            session_id,
-        )
+        if perf_enabled:
+            req_end_time = time.perf_counter()
+            req_transfer_elapsed = (req_end_time - req_start_time) * 1000
+            logger.info(
+                "KV cache transfer for request %s took %.2f ms (%d groups,"
+                " %d blocks). local_ip %s local_device_id %s remote_session_id %s",
+                remote_request_id,
+                req_transfer_elapsed,
+                num_transfer_groups,
+                num_blocks,
+                get_ip(),
+                self.tp_rank,
+                session_id,
+            )
 
         # Determine if the current position is the offset position at the end of
         # the KV transmission.

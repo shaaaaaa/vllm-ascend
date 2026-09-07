@@ -66,6 +66,7 @@ from vllm_ascend.distributed.kv_transfer.utils.utils import (
     kv_alltoall_and_rearrange,
     parallel_info,
 )
+from vllm_ascend.lmcache_cold_perf import cold_perf_enabled
 from vllm_ascend.utils import npu_stream_switch, trans_nd_to_nz
 
 # isort: off
@@ -473,7 +474,8 @@ class KVCacheSendingLayerThread(threading.Thread):
 
         for session_id, transfer_meta in session_meta.items():
             if len(transfer_meta.src) > 0:
-                req_start_time = time.perf_counter()
+                perf_enabled = cold_perf_enabled()
+                req_start_time = time.perf_counter() if perf_enabled else 0.0
                 ret = self.engine.batch_transfer_sync_write(
                     session_id, transfer_meta.src, transfer_meta.dst, transfer_meta.length
                 )
@@ -489,16 +491,17 @@ class KVCacheSendingLayerThread(threading.Thread):
                                     req_id, req_meta, layer_group_idx
                                 )  # TODO Send a signal indicating transmission failure
                 else:
-                    req_end_time = time.perf_counter()
-                    total_transfer_size = sum(transfer_meta.length) / 1024
-                    req_transfer_elapsed = (req_end_time - req_start_time) * 1000
-                    logger.debug(
-                        "Layer%d KV cache transfer task %dKB to remote_session_id [%s] took %.3f ms.",
-                        send_task.layer_idx,
-                        total_transfer_size,
-                        session_id,
-                        req_transfer_elapsed,
-                    )
+                    if perf_enabled:
+                        req_end_time = time.perf_counter()
+                        total_transfer_size = sum(transfer_meta.length) / 1024
+                        req_transfer_elapsed = (req_end_time - req_start_time) * 1000
+                        logger.debug(
+                            "Layer%d KV cache transfer task %dKB to remote_session_id [%s] took %.3f ms.",
+                            send_task.layer_idx,
+                            total_transfer_size,
+                            session_id,
+                            req_transfer_elapsed,
+                        )
                     if send_task.layer_idx == (self.total_layers - 1):
                         for req_id in transfer_meta.req_ids:
                             req_meta = send_task.send_request[req_id]

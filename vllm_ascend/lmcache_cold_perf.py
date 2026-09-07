@@ -11,11 +11,13 @@ from typing import Any
 from vllm.logger import logger
 
 _FALSE_VALUES = ("", "0", "false", "no", "off")
-_COLD_PERF_ENABLED = os.environ.get(
-    "LMCACHE_COLD_START_PERF", "0"
-).lower() not in _FALSE_VALUES
+_COLD_PERF_MODE = os.environ.get("LMCACHE_COLD_START_PERF", "0").strip().lower()
+_COLD_PERF_ENABLED = _COLD_PERF_MODE not in _FALSE_VALUES
+# Ordinary perf logging is host-only. Device timing requires explicit opt-in;
+# it records stream events and must not be treated as an overhead-free timer.
+_COLD_PERF_DEVICE_TIMING_ENABLED = _COLD_PERF_MODE == "device"
 _cold_perf_request_ids: set[str] = set()
-_cold_perf_emitted: set[tuple[str, str]] = set()
+_cold_perf_emitted: dict[str, set[str]] = {}
 
 
 def _clock_domain() -> tuple[str, str]:
@@ -41,6 +43,17 @@ def cold_perf_clock_fields() -> dict[str, Any]:
 
 def cold_perf_enabled() -> bool:
     return _COLD_PERF_ENABLED
+
+
+def cold_perf_device_timing_enabled() -> bool:
+    """Whether explicit device-event diagnostics were selected at startup."""
+    return _COLD_PERF_DEVICE_TIMING_ENABLED
+
+
+def _non_json_field(_value: Any) -> str:
+    # Never invoke repr/str on tensors or other caller-owned objects: formatting
+    # a device tensor can read it back and synchronize the serving thread.
+    return "<non-JSON value>"
 
 
 def mark_cold_perf_requests(request_ids: Any) -> None:
@@ -75,9 +88,7 @@ def forget_cold_perf_request(request_id: str) -> None:
     if not cold_perf_enabled():
         return
     _cold_perf_request_ids.discard(request_id)
-    _cold_perf_emitted.difference_update(
-        {item for item in _cold_perf_emitted if item[1] == request_id}
-    )
+    _cold_perf_emitted.pop(request_id, None)
 
 
 def log_cold_perf_event(
@@ -96,12 +107,9 @@ def log_cold_perf_event(
     if require_active:
         ids = [req_id for req_id in ids if req_id in _cold_perf_request_ids]
     if once:
-        ids = [
-            req_id
-            for req_id in ids
-            if (event, req_id) not in _cold_perf_emitted
-        ]
-        _cold_perf_emitted.update((event, req_id) for req_id in ids)
+        ids = [req_id for req_id in ids if event not in _cold_perf_emitted.get(req_id, ())]
+        for req_id in ids:
+            _cold_perf_emitted.setdefault(req_id, set()).add(event)
     if not ids:
         return
     payload = {
@@ -118,7 +126,7 @@ def log_cold_perf_event(
         payload["request_ids"] = ids
     logger.info(
         "[LMCACHE_COLD_PERF] %s",
-        json.dumps(payload, default=str, separators=(",", ":")),
+        json.dumps(payload, default=_non_json_field, separators=(",", ":")),
     )
 
 
@@ -136,5 +144,5 @@ def log_cold_perf_process_event(event: str, **fields: Any) -> None:
     }
     logger.info(
         "[LMCACHE_COLD_PERF] %s",
-        json.dumps(payload, default=str, separators=(",", ":")),
+        json.dumps(payload, default=_non_json_field, separators=(",", ":")),
     )

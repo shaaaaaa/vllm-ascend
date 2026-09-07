@@ -54,6 +54,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+
+def _cold_start_perf_enabled() -> bool:
+    return os.environ.get("LMCACHE_COLD_START_PERF", "0").strip().lower() not in (
+        "", "0", "false", "no", "off"
+    )
+
 MAX_RECOMPUTE_RETRIES = 3
 _REMOTE_FILL_VERIFICATION_CAPABILITY_BYTES = 32
 _DECODER_PLACEMENT_DISCOVERY_TIMEOUT_SECONDS = 2.0
@@ -2209,7 +2215,7 @@ async def _handle_select_instance(
         if max_tokens is None:
             max_tokens = "default"
         analysis_time_str = ""
-        if analysis and analysis.analysis_time_ms > 0:
+        if _cold_start_perf_enabled() and analysis and analysis.analysis_time_ms > 0:
             analysis_time_str = f"analysis={analysis.analysis_time_ms:.1f}ms, "
 
         if analysis:
@@ -2414,7 +2420,7 @@ async def _handle_completions(api: str, request: Request):
                         user_max_tokens = req_data.get("max_tokens")
                     user_specified_max_tokens = user_max_tokens is not None
                     
-                    analysis_start = time.perf_counter()
+                    analysis_start = (time.perf_counter() if _cold_start_perf_enabled() else 0.0)
                     # Use asyncio.to_thread to avoid blocking event loop
                     token_info = await asyncio.to_thread(
                         proxy_state.vllm_token_counter.analyze_request,
@@ -2429,7 +2435,7 @@ async def _handle_completions(api: str, request: Request):
                         user_max_tokens = req_data.get("max_tokens")
                     user_specified_max_tokens = user_max_tokens is not None
                     
-                    analysis_start = time.perf_counter()
+                    analysis_start = (time.perf_counter() if _cold_start_perf_enabled() else 0.0)
                     prompt_tokens = await asyncio.to_thread(
                         proxy_state.vllm_token_counter.count_prompt_tokens,
                         prompt=prompt,
@@ -2473,10 +2479,15 @@ async def _handle_completions(api: str, request: Request):
                         exceeds = prompt_tokens * margin > proxy_state.max_model_len
                         exceeded_by = int(prompt_tokens * margin) - proxy_state.max_model_len if exceeds else 0
                     
-                    analysis_end = time.perf_counter()
+                    analysis_end = (time.perf_counter() if _cold_start_perf_enabled() else 0.0)
                     analysis_time_ms = (analysis_end - analysis_start) * 1000
                     
-                    logger.debug(f"analyze_request succeeded: prompt={prompt_tokens}, sys={token_info['system_tokens']}, tools={token_info['tool_tokens']}, content={token_info['content_tokens']}, time={analysis_time_ms:.1f}ms")
+                    if _cold_start_perf_enabled():
+                        logger.debug(
+                            "analyze_request succeeded: prompt=%s, sys=%s, tools=%s, content=%s, time=%.1fms",
+                            prompt_tokens, token_info["system_tokens"], token_info["tool_tokens"],
+                            token_info["content_tokens"], analysis_time_ms,
+                        )
                     
                     # Create RequestAnalysis with detailed breakdown
                     analysis = RequestAnalysis()
@@ -2536,12 +2547,12 @@ async def _handle_completions(api: str, request: Request):
         if not analysis and proxy_state.tokenizer_analyzer:
             logger.debug("Falling back to TokenizerAnalyzer")
             try:
-                analysis_start = time.perf_counter()
+                analysis_start = (time.perf_counter() if _cold_start_perf_enabled() else 0.0)
                 analysis = await asyncio.wait_for(
                     proxy_state.tokenizer_analyzer.analyze_request_async(req_data),
                     timeout=5.0
                 )
-                analysis_end = time.perf_counter()
+                analysis_end = (time.perf_counter() if _cold_start_perf_enabled() else 0.0)
                 analysis.analysis_time_ms = (analysis_end - analysis_start) * 1000
                 
                 if analysis.exceeds_limit:
@@ -2555,11 +2566,11 @@ async def _handle_completions(api: str, request: Request):
                     margin = 1 + proxy_state.context_length_margin / 100.0
                     
                     if analysis.system_tokens > 0 or analysis.tool_tokens > 0:
-                        logger.info(f"[REJECTED] analysis={analysis.analysis_time_ms:.1f}ms, prompt={analysis.prompt_tokens}, max_gen={max_gen_display}, "
+                        logger.info(f"[REJECTED] prompt={analysis.prompt_tokens}, max_gen={max_gen_display}, "
                               f"sys={analysis.system_tokens}, tools={analysis.tool_tokens}, content={analysis.content_tokens}, "
                               f"total={analysis.total_tokens} > limit={proxy_state.max_model_len} (+{analysis.exceeded_by})")
                     else:
-                        logger.info(f"[REJECTED] analysis={analysis.analysis_time_ms:.1f}ms, prompt={analysis.prompt_tokens}, max_gen={max_gen_display}, "
+                        logger.info(f"[REJECTED] prompt={analysis.prompt_tokens}, max_gen={max_gen_display}, "
                               f"total={analysis.total_tokens} > limit={proxy_state.max_model_len} (+{analysis.exceeded_by})")
                     
                     inflated_total = int(analysis.total_tokens * margin)

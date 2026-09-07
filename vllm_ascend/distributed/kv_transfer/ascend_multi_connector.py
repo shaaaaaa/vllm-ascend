@@ -1,7 +1,4 @@
 import inspect
-import json
-import os
-import time
 from typing import TYPE_CHECKING, Any
 
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
@@ -24,7 +21,7 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_dsa_index_connector imp
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector import (
     MooncakeLayerwiseConnector,
 )
-from vllm_ascend.lmcache_cold_perf import cold_perf_clock_fields
+from vllm_ascend.lmcache_cold_perf import log_cold_perf_process_event
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -37,25 +34,7 @@ logger = init_logger(__name__)
 
 
 def _cold_live_log(event: str, **fields: Any) -> None:
-    if os.environ.get("LMCACHE_COLD_START_PERF", "0").lower() in (
-        "", "0", "false", "no", "off"
-    ):
-        return
-    logger.info(
-        "[LMCACHE_COLD_PERF] %s",
-        json.dumps(
-            {
-                "schema": 1,
-                "event": event,
-                "pid": os.getpid(),
-                "monotonic_ms": round(time.perf_counter() * 1000, 3),
-                **cold_perf_clock_fields(),
-                **fields,
-            },
-            default=str,
-            separators=(",", ":"),
-        ),
-    )
+    log_cold_perf_process_event(event, **fields)
 
 
 def _is_single_tensor_kv(kv_cache: Any) -> bool:

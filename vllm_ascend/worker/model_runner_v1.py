@@ -140,6 +140,7 @@ from vllm_ascend.live_source_handoff import (
     LIVE_SOURCE_EVENT_HANDOFF_KEY,
 )
 from vllm_ascend.lmcache_cold_perf import (
+    cold_perf_device_timing_enabled,
     cold_perf_enabled,
     is_cold_perf_request,
     log_cold_perf_event,
@@ -206,6 +207,7 @@ else:
 _COLD_PERF_SAMPLE_TRACE_CALLS = 2
 _COLD_PERF_SLOW_SAMPLE_MS = 500.0
 _COLD_PERF_SLOW_NPU_INTERVAL_MS = 100.0
+_COLD_PERF_MAX_PENDING_NPU_INTERVALS = 32
 
 
 @dataclass
@@ -2650,6 +2652,12 @@ class NPUModelRunner(GPUModelRunner):
         metrics: dict[str, float] | None = None,
         **kwargs,
     ):
+        # The ordinary cold-perf knob must not create device events. Optional
+        # device diagnostics are also bounded when completion is delayed.
+        if not cold_perf_device_timing_enabled() or len(
+            getattr(self, "_cold_perf_pending_npu_intervals", ())
+        ) >= _COLD_PERF_MAX_PENDING_NPU_INTERVALS:
+            return operation(*args, **kwargs)
         try:
             start_event = torch.npu.Event(enable_timing=True)
             end_event = torch.npu.Event(enable_timing=True)
@@ -2693,8 +2701,11 @@ class NPUModelRunner(GPUModelRunner):
                 self._cold_perf_last_npu_interval = interval
 
     def _drain_cold_perf_npu_intervals(self) -> None:
+        pending = getattr(self, "_cold_perf_pending_npu_intervals", ())
+        if not pending:
+            return
         remaining = []
-        for interval in getattr(self, "_cold_perf_pending_npu_intervals", ()):
+        for interval in pending:
             try:
                 if not interval.end_event.query():
                     remaining.append(interval)
