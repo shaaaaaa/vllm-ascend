@@ -6408,6 +6408,14 @@ class NPUModelRunner(GPUModelRunner):
                 graph_entry_count,
                 draft_graph_count,
             )
+            if (
+                not self._profiling_cudagraph_memory
+                and not getattr(self.vllm_config.model_config, "enable_sleep_mode", False)
+                and has_kv_transfer_group()
+            ):
+                seal = getattr(get_kv_transfer_group(), "seal_sparse_destination_layout", None)
+                if callable(seal):
+                    seal()
         return graph_memory_bytes
 
     def profile_cudagraph_memory(self) -> int:

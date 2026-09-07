@@ -2547,6 +2547,53 @@ class TestStagedSFAStartupCaptureValidation(unittest.TestCase):
         seal_entries.assert_called_once_with(graph_keys, 2)
         draft_seal.assert_called_once_with((1, 2))
 
+    def test_destination_seal_runs_only_after_successful_final_capture(self):
+        for mode in ("ready", "profile", "sleep", "nonstaged", "old_connector", "failure"):
+            with self.subTest(mode=mode):
+                runner = self._build_runner()
+                runner._profiling_cudagraph_memory = mode == "profile"
+                runner.vllm_config.model_config.enable_sleep_mode = mode == "sleep"
+                calls = []
+                seal = MagicMock(side_effect=lambda calls=calls: calls.append("destination"))
+                connector = (
+                    object() if mode == "old_connector" else SimpleNamespace(seal_sparse_destination_layout=seal)
+                )
+                impl = SimpleNamespace(
+                    seal_staged_sfa_capture=MagicMock(
+                        side_effect=RuntimeError("incomplete")
+                        if mode == "failure"
+                        else lambda _keys, calls=calls: calls.append("layers")
+                    )
+                )
+                with (
+                    patch.object(model_runner_module, "staged_sfa_graph_configured", return_value=mode != "nonstaged"),
+                    patch.object(model_runner_module, "_torch_cuda_wrapper", return_value=nullcontext()),
+                    patch.object(
+                        model_runner_module, "_replace_gpu_model_runner_function_wrapper", return_value=nullcontext()
+                    ),
+                    patch.object(model_runner_module, "has_kv_transfer_group", return_value=True),
+                    patch.object(model_runner_module, "get_kv_transfer_group", return_value=connector),
+                    patch.object(model_runner_module.envs_ascend, "VLLM_ASCEND_MTP_DRAFT_DEBUG", False),
+                    patch.object(runner, "_reset_staged_sfa_startup_capture"),
+                    patch.object(model_runner_module.GPUModelRunner, "capture_model", return_value=123),
+                    patch.object(runner, "_collect_staged_sfa_impls", return_value=(("layer", impl),)),
+                    patch.object(
+                        model_runner_module.ACLGraphWrapper,
+                        "seal_staged_entries",
+                        side_effect=lambda *_args, calls=calls: calls.append("graphs") or 2,
+                    ),
+                ):
+                    if mode == "failure":
+                        with self.assertRaisesRegex(RuntimeError, "incomplete"):
+                            runner.capture_model()
+                    else:
+                        self.assertEqual(runner.capture_model(), 123)
+                if mode == "ready":
+                    self.assertEqual(calls, ["layers", "graphs", "destination"])
+                    seal.assert_called_once_with()
+                else:
+                    seal.assert_not_called()
+
     def test_capture_model_seals_target_staged_graph_when_draft_graph_is_off(self):
         runner = self._build_runner()
         runner.vllm_config.speculative_config = SimpleNamespace(
