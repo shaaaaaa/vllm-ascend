@@ -628,9 +628,14 @@ class RecomputeScheduler(Scheduler):
                 # For spec_token_ids, the waiting queue has the same processing
                 # as the running queue.
                 if self.is_mtp_kv_consumer and request.spec_token_ids:
+                    # Use the admitted cache-hit frontier. For a synchronous
+                    # prefix load, request.num_computed_tokens is still stale
+                    # until the request is moved to RUNNING below. Dropping a
+                    # scheduled draft here also undercounts async output
+                    # placeholders and breaks the next batch's query width.
                     num_scheduled_spec_tokens = (
                         num_new_tokens
-                        + request.num_computed_tokens
+                        + num_computed_tokens
                         - request.num_tokens
                         - request.num_output_placeholders
                     )

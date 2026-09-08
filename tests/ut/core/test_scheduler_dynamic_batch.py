@@ -20,7 +20,7 @@ from vllm.v1.request import Request, RequestStatus
 from vllm.v1.structured_output import StructuredOutputManager
 
 from tests.ut.base import TestBase
-from vllm_ascend.core.recompute_scheduler import RecomputeScheduler
+from vllm_ascend.core.recompute_scheduler import AsyncRecomputeScheduler, RecomputeScheduler
 from vllm_ascend.core.scheduler_dynamic_batch import SchedulerDynamicBatch
 
 EOS_TOKEN_ID = 50256
@@ -329,6 +329,234 @@ class TestSchedulerDynamicBatch(TestBase):
         self.assertEqual(request.status, RequestStatus.PREEMPTED)
         self.assertEqual(request.num_computed_tokens, admitted_tokens)
         self.assertEqual(request.num_cached_tokens, admitted_tokens)
+
+    def create_mtp_recompute_scheduler(self, *, async_scheduling=True,
+                                     num_spec_tokens=1):
+        scheduler_cls = (AsyncRecomputeScheduler if async_scheduling
+                         else RecomputeScheduler)
+        with patch(f"{__name__}.NUM_SPECULATIVE_TOKENS", num_spec_tokens):
+            scheduler = self.create_scheduler(multimodal=False,
+                                              scheduler_cls=scheduler_cls)
+        scheduler.scheduler_config.async_scheduling = async_scheduling
+        scheduler.is_mtp_kv_consumer = True
+        scheduler.connector = MagicMock()
+        scheduler.connector.get_num_new_matched_tokens.return_value = (130,
+                                                                       False)
+        scheduler.connector.take_events.return_value = []
+        scheduler.connector.request_finished.return_value = (False, None)
+        scheduler.connector.request_finished_all_groups.return_value = (False, None)
+        return scheduler
+
+    def test_recompute_sync_prefix_hit_marks_scheduled_draft(self):
+        for async_scheduling in (False, True):
+            with self.subTest(async_scheduling=async_scheduling):
+                scheduler = self.create_mtp_recompute_scheduler(
+                    async_scheduling=async_scheduling)
+                request = create_requests(num_requests=1, num_tokens=131)[0]
+                scheduler.add_request(request)
+                initial_drafts = request.spec_token_ids.copy()
+
+                output = scheduler.schedule()
+
+                self.assertEqual(output.num_scheduled_tokens,
+                                 {request.request_id: 2})
+                self.assertEqual(output.scheduled_spec_decode_tokens,
+                                 {request.request_id: initial_drafts})
+                self.assertEqual(
+                    output.scheduled_new_reqs[0].num_computed_tokens, 130)
+                self.assertEqual(request.num_computed_tokens, 132)
+                if async_scheduling:
+                    self.assertEqual(request.num_output_placeholders, 2)
+
+    def test_recompute_sync_hit_keeps_next_async_batch_uniform(self):
+        scheduler = self.create_mtp_recompute_scheduler()
+        resumed = create_requests(num_requests=1, num_tokens=4096)[0]
+        resumed.request_id = "cold-resume"
+        scheduler.connector.get_num_new_matched_tokens.return_value = (4095,
+                                                                       True)
+        scheduler.add_request(resumed)
+        self.assertEqual(scheduler.schedule().num_scheduled_tokens, {})
+        self.assertEqual(resumed.status, RequestStatus.WAITING_FOR_REMOTE_KVS)
+
+        scheduler.connector.get_num_new_matched_tokens.return_value = (130,
+                                                                       False)
+        request = create_requests(num_requests=1, num_tokens=131)[0]
+        scheduler.add_request(request)
+        scheduler.schedule()
+
+        # Complete the asynchronous load before the short request's first
+        # output returns. Both requests need a target token plus one draft.
+        scheduler.finished_recving_kv_req_ids.add(resumed.request_id)
+
+        output = scheduler.schedule()
+
+        self.assertEqual(output.num_scheduled_tokens,
+                         {request.request_id: 2, resumed.request_id: 2})
+        self.assertEqual(output.total_num_scheduled_tokens, 4)
+        for req_id in output.num_scheduled_tokens:
+            self.assertEqual(len(output.scheduled_spec_decode_tokens[req_id]),
+                             1)
+        self.assertEqual(request.num_output_placeholders, 4)
+        self.assertEqual(resumed.num_output_placeholders, 2)
+
+    def test_recompute_sync_hit_does_not_mark_unscheduled_draft(self):
+        scheduler = self.create_mtp_recompute_scheduler()
+        scheduler.max_num_scheduled_tokens = 1
+        request = create_requests(num_requests=1, num_tokens=131)[0]
+        scheduler.add_request(request)
+
+        output = scheduler.schedule()
+
+        self.assertEqual(output.num_scheduled_tokens, {request.request_id: 1})
+        self.assertEqual(output.scheduled_spec_decode_tokens, {})
+        self.assertEqual(request.num_computed_tokens, 131)
+        self.assertEqual(request.num_output_placeholders, 1)
+
+    def test_recompute_async_prefix_load_keeps_draft_until_admission(self):
+        scheduler = self.create_mtp_recompute_scheduler()
+        scheduler.connector.get_num_new_matched_tokens.return_value = (130,
+                                                                       True)
+        request = create_requests(num_requests=1, num_tokens=131)[0]
+        scheduler.add_request(request)
+        initial_drafts = request.spec_token_ids.copy()
+
+        pending = scheduler.schedule()
+
+        self.assertEqual(pending.num_scheduled_tokens, {})
+        self.assertEqual(request.status, RequestStatus.WAITING_FOR_REMOTE_KVS)
+        self.assertEqual(request.spec_token_ids, initial_drafts)
+        scheduler.finished_recving_kv_req_ids.add(request.request_id)
+
+        ready = scheduler.schedule()
+
+        self.assertEqual(ready.num_scheduled_tokens, {request.request_id: 2})
+        self.assertEqual(ready.scheduled_spec_decode_tokens,
+                         {request.request_id: initial_drafts})
+        self.assertEqual(request.num_output_placeholders, 2)
+
+    def test_recompute_admission_covers_only_scheduled_draft_positions(self):
+        # (cached tokens, budget, draft count): miss, partial/full prefix,
+        # partial prefill, exact prompt boundary and partial draft coverage.
+        cases = [(0, 64, 1), (0, 132, 1), (64, 32, 1), (64, 67, 1),
+                 (64, 68, 1), (130, 1, 3), (130, 2, 3), (130, 4, 3)]
+        for async_scheduling in (False, True):
+            for cached, budget, draft_count in cases:
+                with self.subTest(async_scheduling=async_scheduling,
+                                  cached=cached, budget=budget,
+                                  draft_count=draft_count):
+                    scheduler = self.create_mtp_recompute_scheduler(
+                        async_scheduling=async_scheduling,
+                        num_spec_tokens=draft_count)
+                    scheduler.max_num_scheduled_tokens = budget
+                    scheduler.connector.get_num_new_matched_tokens.return_value = (
+                        cached, False)
+                    request = create_requests(num_requests=1, num_tokens=131)[0]
+                    scheduler.add_request(request)
+                    initial_drafts = request.spec_token_ids.copy()
+
+                    output = scheduler.schedule()
+
+                    scheduled = output.num_scheduled_tokens[request.request_id]
+                    self.assertEqual(scheduled, min(budget, 131 + draft_count - cached))
+                    draft_positions = [p for p in range(cached, cached + scheduled)
+                                       if 131 <= p < 131 + draft_count]
+                    self.assertEqual(
+                        output.scheduled_spec_decode_tokens.get(request.request_id, []),
+                        initial_drafts[:len(draft_positions)])
+                    self.assertEqual(request.num_computed_tokens, cached + scheduled)
+                    expected_pending = (1 + len(draft_positions)
+                                        if async_scheduling and cached + scheduled >= 131
+                                        else 0)
+                    self.assertEqual(request.num_output_placeholders, expected_pending)
+
+    def test_recompute_admission_allocation_failure_keeps_drafts(self):
+        scheduler = self.create_mtp_recompute_scheduler()
+        request = create_requests(num_requests=1, num_tokens=131)[0]
+        scheduler.add_request(request)
+        initial_drafts = request.spec_token_ids.copy()
+        with patch.object(scheduler.kv_cache_manager, "allocate_slots", return_value=None):
+            output = scheduler.schedule()
+        self.assertEqual(output.num_scheduled_tokens, {})
+        self.assertEqual(request.status, RequestStatus.WAITING)
+        self.assertEqual(request.num_computed_tokens, 0)
+        self.assertEqual(request.num_output_placeholders, 0)
+        self.assertEqual(request.spec_token_ids, initial_drafts)
+        retry = scheduler.schedule()
+        self.assertEqual(retry.scheduled_spec_decode_tokens,
+                         {request.request_id: initial_drafts})
+
+    def test_recompute_admission_rejection_with_output_in_flight(self):
+        for accepted_later in (0, 1):
+            with self.subTest(accepted_later=accepted_later):
+                scheduler = self.create_mtp_recompute_scheduler()
+                request = create_requests(num_requests=1, num_tokens=131)[0]
+                scheduler.add_request(request)
+                first = scheduler.schedule()
+                second = scheduler.schedule()
+
+                # The initial -1 draft is rejected. Its result arrives after
+                # another step has already reserved output placeholders.
+                result = make_output(scheduler)
+                result.sampled_token_ids = [[10]]
+                scheduler.update_from_output(first, result)
+                self.assertEqual(request.num_computed_tokens, 133)
+                self.assertEqual(request.num_output_placeholders, 2)
+                self.assertEqual(list(request.output_token_ids), [10])
+
+                result.sampled_token_ids = [[11, 12][:1 + accepted_later]]
+                scheduler.update_from_output(second, result)
+                self.assertEqual(request.num_output_placeholders, 0)
+                self.assertEqual(request.num_computed_tokens, request.num_tokens - 1)
+                self.assertEqual(list(request.output_token_ids),
+                                 [10, 11, 12][:2 + accepted_later])
+                self.assertEqual(scheduler.schedule().num_scheduled_tokens,
+                                 {request.request_id: 2})
+
+    def test_recompute_admission_rejection_obeys_stop_limits(self):
+        for stop in ("eos", "length"):
+            with self.subTest(stop=stop):
+                scheduler = self.create_mtp_recompute_scheduler()
+                request = create_requests(num_requests=1, num_tokens=131,
+                                          max_tokens=1 if stop == "length" else 16)[0]
+                if stop == "eos":
+                    request.sampling_params.eos_token_id = 10
+                scheduler.add_request(request)
+                scheduled = scheduler.schedule()
+                result = make_output(scheduler)
+                result.sampled_token_ids = [[10]]
+
+                scheduler.update_from_output(scheduled, result)
+
+                self.assertTrue(request.is_finished())
+                self.assertEqual(list(request.output_token_ids), [10])
+                self.assertEqual(request.num_output_placeholders, 0)
+                self.assertEqual(scheduler.schedule().num_scheduled_tokens, {})
+
+    def test_recompute_preemption_clears_admission_drafts(self):
+        scheduler = self.create_mtp_recompute_scheduler()
+        request = create_requests(num_requests=1, num_tokens=131)[0]
+        scheduler.add_request(request)
+        first = scheduler.schedule()
+        result = make_output(scheduler)
+        result.sampled_token_ids = [[10]]
+        scheduler.update_from_output(first, result)
+
+        scheduler.running.remove(request)
+        scheduler._preempt_request(request, 0.0)
+        self.assertEqual(request.spec_token_ids, [])
+        self.assertEqual(request.num_computed_tokens, 0)
+        self.assertEqual(request.num_preemptions, 1)
+        scheduler.connector.get_num_new_matched_tokens.return_value = (64, False)
+        # A preempted request is not also resumed in its preemption step.
+        budget = scheduler.max_num_scheduled_tokens
+        scheduler.max_num_scheduled_tokens = 0
+        scheduler.schedule()
+        scheduler.max_num_scheduled_tokens = budget
+
+        resumed = scheduler.schedule()
+
+        self.assertEqual(resumed.num_scheduled_tokens, {request.request_id: 68})
+        self.assertEqual(resumed.scheduled_spec_decode_tokens, {})
 
     def test_schedule_multimodal_requests(self):
         scheduler = self.create_scheduler()
