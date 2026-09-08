@@ -34,7 +34,7 @@ from vllm.config import CUDAGraphMode, VllmConfig, set_current_vllm_config
 from vllm.distributed import ensure_model_parallel_initialized, init_distributed_environment
 from vllm.distributed.ec_transfer import ensure_ec_transfer_initialized
 from vllm.distributed.kv_transfer import ensure_kv_transfer_initialized, get_kv_transfer_group, has_kv_transfer_group
-from vllm.distributed.parallel_state import Handle, get_pp_group, get_tp_group
+from vllm.distributed.parallel_state import Handle, get_ep_group, get_pp_group, get_tp_group
 from vllm.logger import logger
 from vllm.lora.request import LoRARequest
 from vllm.sequence import IntermediateTensors
@@ -893,7 +893,36 @@ class NPUWorker(WorkerBase):
         with context, set_current_vllm_config(self.vllm_config):
             self.model_runner.load_model()
 
+    def _wait_for_decoder_ep_startup(self) -> None:
+        kv_config = self.vllm_config.kv_transfer_config
+        parallel_config = self.vllm_config.parallel_config
+        if (
+            kv_config is None
+            or not kv_config.is_kv_consumer
+            or not self.model_config.is_moe
+            or not parallel_config.enable_expert_parallel
+            or parallel_config.data_parallel_size <= 1
+            or parallel_config.enable_elastic_ep
+        ):
+            return
+
+        # Each DP executor waits only for its own TP workers to initialize KV
+        # caches. A peer DP may still be registering its shared CPU slab when
+        # we reach warmup. Wait on the EP CPU group before launching any model
+        # collectives, whose device timeout would otherwise include that wait.
+        # Elastic EP has a separate startup/reconfiguration protocol.
+        started = time.perf_counter() if cold_perf_enabled() else None
+        if started is not None:
+            log_cold_perf_process_event("decoder_ep_startup_wait_start")
+        get_ep_group().barrier()
+        if started is not None:
+            log_cold_perf_process_event(
+                "decoder_ep_startup_wait_complete",
+                elapsed_ms=round((time.perf_counter() - started) * 1000, 3),
+            )
+
     def compile_or_warm_up_model(self) -> float:
+        self._wait_for_decoder_ep_startup()
         # Note: need to adapt for graph mode.
         warmup_sizes = (self.vllm_config.compilation_config.compile_sizes or []).copy()
         if not self.model_config.enforce_eager:

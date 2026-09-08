@@ -1498,6 +1498,7 @@ class TestNPUWorker(TestBase):
             worker = NPUWorker()
             worker.model_runner = MagicMock()
             worker.vllm_config = MagicMock()
+            worker.vllm_config.kv_transfer_config = None
             worker.model_config = MagicMock()
             worker.model_config.enforce_eager = True
             worker.model_config.seed = 12345
@@ -1552,6 +1553,7 @@ class TestNPUWorker(TestBase):
             worker = NPUWorker()
             worker.model_runner = MagicMock()
             worker.vllm_config = MagicMock()
+            worker.vllm_config.kv_transfer_config = None
             worker.model_config = MagicMock()
             worker.model_config.enforce_eager = False  # Enable graph capture
             worker.model_config.seed = 67890
@@ -1586,6 +1588,91 @@ class TestNPUWorker(TestBase):
 
             # Verify atb warm up
             mock_warm_up_atb.assert_called_once()
+
+    def test_decoder_ep_wait_precedes_all_warmup_and_capture(self):
+        from vllm_ascend.worker.worker import NPUWorker
+
+        for eager in (False, True):
+            for perf in (False, True):
+                with self.subTest(eager=eager, perf=perf):
+                    worker = NPUWorker.__new__(NPUWorker)
+                    worker.model_config = SimpleNamespace(is_moe=True, enforce_eager=eager, seed=0)
+                    worker.vllm_config = SimpleNamespace(
+                        kv_transfer_config=SimpleNamespace(is_kv_consumer=True),
+                        parallel_config=SimpleNamespace(
+                            enable_expert_parallel=True, data_parallel_size=4, enable_elastic_ep=False
+                        ),
+                        compilation_config=SimpleNamespace(
+                            compile_sizes=[1],
+                            cudagraph_mode=None,
+                            cudagraph_capture_sizes=[],
+                            get_compile_ranges=lambda: [],
+                            compilation_time=0,
+                        ),
+                    )
+                    events = []
+                    group = SimpleNamespace(barrier=lambda events=events: events.append("ready"))
+                    worker.model_runner = SimpleNamespace(
+                        _dummy_run=lambda _size, events=events: events.append("warmup"),
+                        capture_model=lambda events=events: events.append("capture"),
+                    )
+                    worker._warm_up_atb = lambda events=events: events.append("atb")
+                    with (
+                        patch("vllm_ascend.worker.worker.get_ep_group", return_value=group),
+                        patch("vllm_ascend.worker.worker.cold_perf_enabled", return_value=perf),
+                        patch("vllm_ascend.worker.worker.log_cold_perf_process_event") as log,
+                        patch("vllm_ascend.worker.worker.staged_sfa_graph_configured", return_value=False),
+                        patch("vllm_ascend.worker.worker.get_ascend_device_type", return_value=None),
+                        patch("vllm_ascend.worker.worker.set_random_seed"),
+                    ):
+                        worker.compile_or_warm_up_model()
+                    self.assertEqual(events, ["ready", "warmup"] + ([] if eager else ["capture"]) + ["atb"])
+                    if not perf:
+                        log.assert_not_called()
+                    else:
+                        self.assertEqual(log.call_args_list[0].args[0], "decoder_ep_startup_wait_start")
+                        self.assertEqual(log.call_args_list[1].args[0], "decoder_ep_startup_wait_complete")
+
+    def test_decoder_ep_startup_wait_is_scoped_to_fixed_ep_decoders(self):
+        from vllm_ascend.worker.worker import NPUWorker
+
+        for excluded in ("no_connector", "sender", "dense", "no_ep", "single_dp", "elastic"):
+            with self.subTest(excluded=excluded):
+                worker = NPUWorker.__new__(NPUWorker)
+                worker.model_config = SimpleNamespace(is_moe=excluded != "dense")
+                worker.vllm_config = SimpleNamespace(
+                    kv_transfer_config=(
+                        None if excluded == "no_connector" else SimpleNamespace(is_kv_consumer=excluded != "sender")
+                    ),
+                    parallel_config=SimpleNamespace(
+                        enable_expert_parallel=excluded != "no_ep",
+                        data_parallel_size=1 if excluded == "single_dp" else 4,
+                        enable_elastic_ep=excluded == "elastic",
+                    ),
+                )
+                with patch("vllm_ascend.worker.worker.get_ep_group") as group:
+                    worker._wait_for_decoder_ep_startup()
+                group.assert_not_called()
+
+    def test_decoder_ep_startup_failure_does_not_launch_warmup(self):
+        from vllm_ascend.worker.worker import NPUWorker
+
+        worker = NPUWorker.__new__(NPUWorker)
+        worker.model_config = SimpleNamespace(is_moe=True)
+        worker.vllm_config = SimpleNamespace(
+            kv_transfer_config=SimpleNamespace(is_kv_consumer=True),
+            parallel_config=SimpleNamespace(enable_expert_parallel=True, data_parallel_size=4, enable_elastic_ep=False),
+        )
+        group = SimpleNamespace(barrier=MagicMock(side_effect=RuntimeError("peer initialization failed")))
+        worker.model_runner = MagicMock()
+        with (
+            patch("vllm_ascend.worker.worker.get_ep_group", return_value=group),
+            patch("vllm_ascend.worker.worker.cold_perf_enabled", return_value=False),
+            self.assertRaisesRegex(RuntimeError, "peer initialization failed"),
+        ):
+            worker.compile_or_warm_up_model()
+        worker.model_runner._dummy_run.assert_not_called()
+        worker.model_runner.capture_model.assert_not_called()
 
     @patch("vllm_ascend.worker.worker.CaMemAllocator")
     def test_initialize_from_config_with_sleep_mode(
