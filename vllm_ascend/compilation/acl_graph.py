@@ -168,6 +168,8 @@ class ACLGraphWrapper:
 
     def __call__(self, *args, **kwargs):
         forward_context = get_forward_context()
+        if getattr(forward_context, "sfa_full_graph_active", False):
+            return self.runnable(*args, **kwargs)
         batch_descriptor = forward_context.batch_descriptor
         aclgraph_runtime_mode = forward_context.cudagraph_runtime_mode
 

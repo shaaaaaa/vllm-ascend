@@ -3150,6 +3150,69 @@ class AscendSFAImpl(MLAAttentionImpl):
         self._staged_sfa_capture_state = _StagedSFACaptureState()
         self._dsa_idx_cache_t = None
         self._staged_sfa_bridge_buffers = None
+        self._full_graph_transfer = None
+
+    def prepare_full_graph_layer(
+        self, layer_name: str, max_tokens: int, source: Any = None, layer_id: int = 0
+    ) -> dict[str, Any]:
+        """Resolve host metadata and upload source tables before root replay."""
+        # Optional connector dependency is loaded only for this opt-in path,
+        # including memory profiling before the worker connector is registered.
+        from lmcache.integration.vllm.utils import lmcache_get_or_create_config
+        from lmcache_ascend.v1.npu_connector.sparse_graph import SparseGraphTransfer
+
+        context = get_forward_context()
+        state = self._staged_sfa_capture_state
+        if state.runtime is None:
+            raise RuntimeError(f"Full SFA graph layer was not warmed up: {layer_name}")
+        metadata = context.attn_metadata[layer_name]
+        reason = self._cross_layer_ineligible_reason(
+            self._staged_sfa_bridge_buffers[0][:context.staged_sfa_graph_key.token_capacity],
+            state.runtime[1],
+            metadata,
+        )
+        if reason is not None:
+            raise RuntimeError(f"Full SFA graph metadata is ineligible for {layer_name}: {reason}")
+        boundary = _prepare_sfa_remap_boundary(
+            metadata,
+            metadata.req_ids,
+            is_dummy_run=context.staged_sfa_graph_dummy_run,
+            index_topk=self.index_topk,
+            cached_tokens=context.staged_sfa_route.frontiers,
+        )
+        if context.staged_sfa_graph_dummy_run:
+            state.remap_boundary = boundary
+        transfer = getattr(self, "_full_graph_transfer", None)
+        if transfer is None:
+            if not context.staged_sfa_graph_dummy_run:
+                raise RuntimeError("Full SFA graph transfer was not allocated at startup")
+            transfer = SparseGraphTransfer(
+                tuple(state.runtime[1][:2]),
+                metadata.decode_target_slot_mapping,
+                lmcache_get_or_create_config().chunk_size,
+                max_tokens,
+            )
+            self._full_graph_transfer = transfer
+        if source is not None:
+            transfer.bind(source, layer_id)
+        else:
+            transfer.clear_source()
+        # The root replay is fenced before graph-external saves; do not expose
+        # an event which was only recorded during the startup eager warmup.
+        metadata.reshape_cache_event = None
+        # Replaying a root graph skips layer-side address checks. Include every
+        # builder-owned device input in the root signature so a new request or
+        # shape can update contents but cannot silently replace captured storage.
+        fields = (
+            "cos", "sin", "slot_mapping", "indexer_slot_mapping", "cum_query_lens", "seq_lens",
+            "block_table", "indexer_block_table", "decode_remap_boundary", "decode_req_indices",
+            "decode_selected_tokens", "decode_selected_counts", "decode_target_slot_mapping",
+            "decode_union_mapping_workspace", "decode_shard_packed_workspace", "decode_shard_mapping_workspace",
+            "decode_shard_counts_workspace", "resident_state_indices", "resident_state_generations",
+        )
+        inputs = {name: getattr(metadata, name) for name in fields}
+        inputs["kv_caches"] = state.runtime[1]
+        return inputs
 
     def seal_staged_sfa_capture(
         self,
@@ -3392,7 +3455,8 @@ class AscendSFAImpl(MLAAttentionImpl):
             producer_event = torch.npu.Event()
             state.producer_event = producer_event
         attn_metadata.reshape_cache_event = producer_event
-        producer_event.record()
+        if not getattr(context, "sfa_full_graph_active", False):
+            producer_event.record()
         state.runtime = (
             layer_name,
             kv_cache,
@@ -3764,6 +3828,9 @@ class AscendSFAImpl(MLAAttentionImpl):
         with _staged_sfa_profile_scope("sfa_cross_layer::lmcache_retrieve"):
             graph_key = getattr(context, "staged_sfa_graph_key", None)
             if attn_metadata is None or graph_key is None:
+                return
+            if getattr(context, "sfa_full_graph_active", False):
+                self._full_graph_transfer.load(selected_packed, selected_counts, target_slots)
                 return
             if getattr(context, "staged_sfa_graph_dummy_run", False):
                 if next_layer_name:
