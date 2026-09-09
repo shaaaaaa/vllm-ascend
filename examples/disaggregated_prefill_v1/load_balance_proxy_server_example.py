@@ -146,7 +146,6 @@ except ImportError:
     logger = logging.getLogger(__name__)
 
 
-_REMOTE_FILL_VERIFICATION_CAPABILITY_BYTES = 32
 
 
 def _clock_domain() -> tuple[str, str]:
@@ -179,8 +178,10 @@ def _encode_json_payload(payload: Any) -> bytes:
 
 
 if __package__:
+    from .remote_fill_placement import validate_remote_fill_placement
     from .pd_serving_perf import serving_perf_enabled as _proxy_cold_perf_enabled
 else:
+    from remote_fill_placement import validate_remote_fill_placement
     from pd_serving_perf import serving_perf_enabled as _proxy_cold_perf_enabled
 
 
@@ -884,80 +885,9 @@ def _parse_decoder_remote_fill_response(payload: Any) -> dict[int, dict[str, Any
             raise ValueError(
                 "Decoder remote-fill placement is not bound to its TP0/DP rank"
             )
-        required_strings = (
-            "destination_engine_id",
-            "control_endpoint",
-            "token_hash_algorithm",
-            "descriptor_verification_capability",
-        )
-        if any(
-            not isinstance(remote_fill.get(name), str)
-            or not remote_fill[name].strip()
-            for name in required_strings
-        ):
-            raise ValueError("Decoder remote-fill string identity is invalid")
-        epoch = remote_fill.get("destination_engine_epoch")
-        generation = remote_fill.get("shared_cache_generation")
-        tp_size = remote_fill.get("destination_tp_size")
-        dp_size = remote_fill.get("destination_dp_size")
-        if isinstance(epoch, bool) or not isinstance(epoch, int) or epoch <= 0:
-            raise ValueError("Decoder remote-fill engine epoch is invalid")
-        if (
-            isinstance(generation, bool)
-            or not isinstance(generation, int)
-            or generation < 0
-        ):
-            raise ValueError("Decoder remote-fill shared-cache generation is invalid")
-        if (
-            isinstance(tp_size, bool)
-            or not isinstance(tp_size, int)
-            or tp_size <= 0
-            or isinstance(dp_size, bool)
-            or not isinstance(dp_size, int)
-            or dp_size <= 0
-            or dp_rank >= dp_size
-        ):
-            raise ValueError("Decoder remote-fill parallel topology is invalid")
-        global_te_push = remote_fill.get("global_te_push")
-        if not isinstance(global_te_push, bool):
-            raise ValueError("Decoder remote-fill native capability is invalid")
-        if not global_te_push:
+        placement = validate_remote_fill_placement(remote_fill, dp_rank)
+        if placement is None:
             continue
-        verification_capability = remote_fill[
-            "descriptor_verification_capability"
-        ]
-        try:
-            verification_key = bytes.fromhex(verification_capability)
-        except ValueError as error:
-            raise ValueError(
-                "Decoder remote-fill verification capability is invalid"
-            ) from error
-        if (
-            len(verification_key) != _REMOTE_FILL_VERIFICATION_CAPABILITY_BYTES
-            or verification_key.hex() != verification_capability
-        ):
-            raise ValueError(
-                "Decoder remote-fill verification capability is invalid"
-            )
-        python_hash_seed = remote_fill.get("python_hash_seed", "")
-        if not isinstance(python_hash_seed, str) or (
-            remote_fill["token_hash_algorithm"] == "builtin"
-            and not python_hash_seed
-        ):
-            raise ValueError("Decoder remote-fill hash identity is invalid")
-        placement = {
-            "destination_engine_id": remote_fill["destination_engine_id"].strip(),
-            "destination_engine_epoch": epoch,
-            "control_endpoint": remote_fill["control_endpoint"].strip(),
-            "destination_dp_rank": dp_rank,
-            "shared_cache_generation": generation,
-            "destination_tp_size": tp_size,
-            "destination_dp_size": dp_size,
-            "global_te_push": global_te_push,
-            "token_hash_algorithm": remote_fill["token_hash_algorithm"].strip(),
-            "python_hash_seed": python_hash_seed,
-            "descriptor_verification_capability": verification_capability,
-        }
         existing = placements.get(dp_rank)
         if existing is not None and existing != placement:
             raise ValueError(
