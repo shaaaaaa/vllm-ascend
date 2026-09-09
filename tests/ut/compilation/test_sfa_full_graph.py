@@ -127,3 +127,21 @@ def test_metadata_storage_cannot_be_replaced_between_replays(graph_module):
     wrapper.run(Mock(), graph_inputs={"seq_lens": metadata})
     with pytest.raises(RuntimeError, match="address or layout"):
         wrapper.run(Mock(), graph_inputs={"seq_lens": metadata.clone()})
+
+
+def test_preflight_checks_do_not_capture_or_replay(graph_module):
+    module, context, captures, _ = graph_module
+    wrapper = module.SFAFullGraph()
+    x = torch.zeros(1)
+    wrapper.validate_inputs(input_ids=x)
+    assert not captures
+    wrapper.run(lambda **kw: x, input_ids=x)
+    wrapper.seal(("q2",))
+    context.staged_sfa_graph_dummy_run = False
+    wrapper.validate_inputs(input_ids=x)
+    with pytest.raises(RuntimeError, match="address or layout"):
+        wrapper.validate_inputs(input_ids=x.clone())
+    context.staged_sfa_graph_key = "missing"
+    with pytest.raises(RuntimeError, match="live capture is prohibited"):
+        wrapper.validate_inputs(input_ids=x)
+    captures[0][0].replay.assert_not_called()

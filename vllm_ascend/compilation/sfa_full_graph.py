@@ -60,17 +60,28 @@ class SFAFullGraph:
         self.sealed = True
         return len(self.entries)
 
+    def validate_inputs(self, *, graph_inputs: Any = None, **kwargs: Any) -> Any:
+        """Check replay inputs before workers agree to enter graph collectives."""
+        context = get_forward_context()
+        key = context.staged_sfa_graph_key
+        signature = tensor_signature((kwargs, graph_inputs))
+        entry = self.entries.get(key)
+        if entry is None:
+            if self.sealed or not context.staged_sfa_graph_dummy_run:
+                raise RuntimeError(f"Full SFA graph missing at runtime: {key}; live capture is prohibited")
+        elif entry.signature != signature:
+            raise RuntimeError(f"Full SFA graph inputs changed address or layout: {key}")
+        return signature
+
     def run(self, runnable: Callable[..., Any], *, graph_inputs: Any = None, **kwargs: Any) -> Any:
         """Capture or replay a whole target forward using stable runner inputs."""
         context = get_forward_context()
         key = context.staged_sfa_graph_key
         if context.cudagraph_runtime_mode == CUDAGraphMode.NONE:
             return runnable(**kwargs)
-        signature = tensor_signature((kwargs, graph_inputs))
+        signature = self.validate_inputs(graph_inputs=graph_inputs, **kwargs)
         entry = self.entries.get(key)
         if entry is None:
-            if self.sealed or not context.staged_sfa_graph_dummy_run:
-                raise RuntimeError(f"Full SFA graph missing at runtime: {key}; live capture is prohibited")
             validate_cudagraph_capturing_enabled()
             graph = torch.npu.NPUGraph()
             previous_capturing = context.capturing
@@ -86,8 +97,6 @@ class SFAFullGraph:
             self.entries[key] = SFAFullGraphEntry(graph, output, signature)
             compilation_counter.num_cudagraph_captured += 1
             return output
-        if entry.signature != signature:
-            raise RuntimeError(f"Full SFA graph inputs changed address or layout: {key}")
         with torch.profiler.record_function("sfa_full_graph::target_replay"):
             entry.graph.replay()
         # One model-boundary fence protects shared CPU source leases and staged

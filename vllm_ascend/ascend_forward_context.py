@@ -37,6 +37,7 @@ class StagedSFAQueryProfile(str, Enum):
 
     DECODE_Q1 = "decode_q1"
     SPEC_FIXED = "spec_fixed"
+    DECODE_BOUNDED = "decode_bounded"
 
 
 @dataclass(frozen=True)
@@ -65,6 +66,9 @@ class StagedSFAGraphKey:
                     "DECODE_Q1 requires equal token/request capacity and "
                     "max_query_len=1."
                 )
+        elif self.query_profile == StagedSFAQueryProfile.DECODE_BOUNDED:
+            if self.max_query_len not in (1, 2) or self.token_capacity != self.request_capacity * self.max_query_len:
+                raise ValueError("Bounded decode requires Q<=2 and token_capacity=request_capacity*Q")
         elif (
             self.max_query_len <= 1
             or self.token_capacity
@@ -84,6 +88,11 @@ class StagedSFAGraphKey:
             query_profile=StagedSFAQueryProfile.DECODE_Q1,
             max_query_len=1,
         )
+
+    @classmethod
+    def bounded_decode(cls, request_capacity: int, query_width: int) -> "StagedSFAGraphKey":
+        """One topology for mixed Q1/Q2 rows, with a separate attention padding lane."""
+        return cls(request_capacity * query_width, request_capacity, StagedSFAQueryProfile.DECODE_BOUNDED, query_width)
 
     @classmethod
     def fixed_spec(

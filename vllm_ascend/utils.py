@@ -627,6 +627,13 @@ def staged_sfa_graph_configured(vllm_config: VllmConfig) -> bool:
     return bool(envs_ascend.VLLM_ASCEND_SFA_STAGED_GRAPH and not staged_sfa_graph_configuration_reasons(vllm_config))
 
 
+def sfa_full_graph_enabled(vllm_config: VllmConfig) -> bool:
+    """Explicit eager (e.g. a P worker) takes precedence over the shared graph flag."""
+    return bool(
+        envs_ascend.VLLM_ASCEND_SFA_FULL_GRAPH and not getattr(vllm_config.model_config, "enforce_eager", False)
+    )
+
+
 def staged_sfa_graph_capture_sizes(
     vllm_config: VllmConfig,
 ) -> tuple[int, ...]:
@@ -679,12 +686,8 @@ def staged_sfa_graph_capture_sizes(
             f"for query_width={query_width}: {oversized}."
         )
     token_sizes = tuple(size * query_width for size in sizes)
-    if envs_ascend.VLLM_ASCEND_SFA_FULL_GRAPH:
-        if sizes != (1,) or query_width not in (1, 2):
-            raise ValueError("SFA_FULL_GRAPH requires singleton capture and MTP width 1 or 2")
-        # A target Q1 forward can occur even when MTP is configured. Capture
-        # both topologies at startup; never lazily capture on a live request.
-        return tuple(sorted({1, *token_sizes}))
+    if envs_ascend.VLLM_ASCEND_SFA_FULL_GRAPH and query_width not in (1, 2):
+        raise ValueError("SFA_FULL_GRAPH supports at most one MTP draft token")
     return token_sizes
 
 
