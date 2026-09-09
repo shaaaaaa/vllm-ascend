@@ -32,6 +32,20 @@ keeps its bounded queue, queries completion and does not add a host synchronize.
 Measure normal throughput with performance tracing disabled; use separate
 diagnostic runs for attribution.
 
+`prefiller_sample_slow` samples TP0 producer prefill batches at most once every
+five seconds and logs completed calls taking at least 500 ms. It separates
+grammar/sampling, bookkeeping, MTP proposal/readback, connector finalization and
+output-tail host intervals. These intervals include any existing device waits;
+they are not measurements of pure NPU compute time. This probe adds no device
+events or readbacks. Both roles may use `kv_both`, so it selects prefill-sized
+batches; ordinary decoder batches are excluded. It can also describe actual
+prefill recomputation on a decoder. `sample_started_monotonic_ms` locates the
+call relative to the worker's execution-return timestamp.
+
+The existing `remote_fill_producer_fence_decision` event also reports
+`pending_sync_wait_ms`, the nested wait for pending synchronous stores. Correlate
+it by request and time; do not add it to the encompassing connector interval.
+
 Content fingerprints (`enable_npu_content_diagnostics`), MTP/target crash dumps
 and existing tensor-trace controls remain separate. They can read device data,
 write files or intentionally fence execution, so they are not throughput runs.

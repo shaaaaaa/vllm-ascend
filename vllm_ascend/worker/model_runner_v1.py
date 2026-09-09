@@ -200,6 +200,8 @@ from vllm_ascend.worker.serving_perf import (
     ServingPerfMixin,
     _COLD_PERF_SAMPLE_TRACE_CALLS,
     _COLD_PERF_SLOW_SAMPLE_MS,
+    _PREFILL_PERF_INTERVAL_SECONDS,
+    _log_prefill_sample,
     _log_slow_sample_invocation,
     _record_sample_stage,
 )
@@ -750,6 +752,10 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
         if vllm_config.kv_transfer_config is not None:
             self.is_kv_producer = vllm_config.kv_transfer_config.is_kv_producer
             self.is_kv_consumer = vllm_config.kv_transfer_config.is_kv_consumer
+        self._prefill_sample_perf = (
+            cold_perf_enabled() and self.is_kv_producer and get_tp_group().rank_in_group == 0
+        )
+        self._prefill_sample_perf_next = 0.0
 
         set_cos_and_sin(vllm_config, self.max_num_reqs, self.uniform_decode_query_len, self.dtype, self.device)
         set_mc2_tokens_capacity(vllm_config, self.max_num_reqs, self.uniform_decode_query_len)
@@ -2671,6 +2677,18 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
         # Clear ephemeral state.
         self.execute_model_state = None
 
+        # Both P and D use kv_both: sample prefill shapes, never ordinary decode.
+        # Keep this independent of cold-resume marking and device-event timing.
+        prefill_marks = None
+        if self._prefill_sample_perf and (
+            scheduler_output.total_num_scheduled_tokens
+            > len(scheduler_output.num_scheduled_tokens) * self.uniform_decode_query_len
+        ):
+            now = time.perf_counter()
+            if now >= self._prefill_sample_perf_next:
+                self._prefill_sample_perf_next = now + _PREFILL_PERF_INTERVAL_SECONDS
+                prefill_marks = [now]
+
         # Apply structured output bitmasks if present.
         stage_started = time.perf_counter() if sample_trace_req_ids else 0.0
         if grammar_output is not None:
@@ -2691,6 +2709,8 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                 sampler_output = self._sample(logits, spec_decode_metadata)
         finally:
             self._cold_perf_active_sample_stages = None
+        if prefill_marks is not None:
+            prefill_marks.append(time.perf_counter())
         if sample_trace_req_ids:
             _record_sample_stage(
                 cold_perf_sample_stages, "target_sampling_ms", stage_started
@@ -2785,6 +2805,8 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
             req_id_to_index_output_copy,
             invalid_req_indices,
         ) = bookkeeping_result
+        if prefill_marks is not None:
+            prefill_marks.append(time.perf_counter())
         if sample_trace_req_ids:
             _record_sample_stage(
                 cold_perf_sample_stages, "bookkeeping_ms", stage_started
@@ -2899,6 +2921,8 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                             draft_count=draft_counts.get(req_id),
                         )
 
+            if prefill_marks is not None:
+                prefill_marks.append(time.perf_counter())
             if has_kv_transfer_group():
                 if self.speculative_config:
                     stage_started = (
@@ -2966,6 +2990,8 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                             )
                         )
 
+        if prefill_marks is not None:
+            prefill_marks.append(time.perf_counter())
         if self.model_config.enable_return_routed_experts:
             capturer = RoutedExpertsCapturer.get_instance()
             if capturer is not None:
@@ -3128,6 +3154,8 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
             )
             self._drain_cold_perf_npu_intervals()
         self._cold_perf_current_sample_npu_intervals = None
+        if prefill_marks is not None:
+            _log_prefill_sample(scheduler_output, prefill_marks, self.use_async_scheduling)
         return output
 
     # overwrite _sample for lmhead_tp_enable and need_accepted_tokens

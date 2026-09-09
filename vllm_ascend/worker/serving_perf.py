@@ -9,6 +9,7 @@ existing queue bound and failure handling.
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from itertools import islice
 from typing import Any
 
 import torch
@@ -19,6 +20,7 @@ from vllm_ascend.serving_perf import (
 )
 
 _COLD_PERF_SAMPLE_TRACE_CALLS = 2
+_PREFILL_PERF_INTERVAL_SECONDS = 5.0
 
 
 _COLD_PERF_SLOW_SAMPLE_MS = 500.0
@@ -64,6 +66,29 @@ def _log_slow_sample_invocation(
         total_process_cpu_ms=round(process_cpu_ms, 3),
         unattributed_wall_ms=round(max(0.0, elapsed_ms - sum(stages.values())), 3),
         **{name: round(value, 3) for name, value in stages.items()},
+    )
+
+
+def _log_prefill_sample(scheduler_output: Any, marks: list[float], async_scheduling: bool) -> None:
+    """Emit one slow host-only sample; adjacent intervals include device waits."""
+    ended = time.perf_counter()
+    elapsed_ms = (ended - marks[0]) * 1000
+    if elapsed_ms < _COLD_PERF_SLOW_SAMPLE_MS:
+        return
+    log_cold_perf_event(
+        "prefiller_sample_slow",
+        request_ids=tuple(islice(scheduler_output.num_scheduled_tokens, 8)),
+        require_active=False,
+        sample_started_monotonic_ms=round(marks[0] * 1000, 3),
+        total_wall_ms=round(elapsed_ms, 3),
+        grammar_sampling_wall_ms=round((marks[1] - marks[0]) * 1000, 3),
+        bookkeeping_wall_ms=round((marks[2] - marks[1]) * 1000, 3),
+        mtp_proposal_readback_wall_ms=round((marks[3] - marks[2]) * 1000, 3),
+        connector_finalize_wall_ms=round((marks[4] - marks[3]) * 1000, 3),
+        output_tail_wall_ms=round((ended - marks[4]) * 1000, 3),
+        num_scheduled_tokens=scheduler_output.total_num_scheduled_tokens,
+        num_reqs=len(scheduler_output.num_scheduled_tokens),
+        async_scheduling=async_scheduling,
     )
 
 
