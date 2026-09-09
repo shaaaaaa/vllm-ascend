@@ -24,7 +24,6 @@ VLLMTokenCounter - 使用vLLM原生接口进行Token计数
 """
 
 import json
-import os
 import time
 from typing import Any, Optional, List, Dict, Tuple
 
@@ -42,10 +41,10 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def _cold_start_perf_enabled() -> bool:
-    return os.environ.get("LMCACHE_COLD_START_PERF", "0").strip().lower() not in (
-        "", "0", "false", "no", "off"
-    )
+if __package__:
+    from .pd_serving_perf import serving_perf_enabled as _serving_perf_enabled
+else:
+    from pd_serving_perf import serving_perf_enabled as _serving_perf_enabled
 
 
 def _check_vllm_available():
@@ -109,7 +108,7 @@ class VLLMTokenCounter:
         self.max_model_len = max_model_len
         self.chat_template_path = chat_template
         
-        start = (time.perf_counter() if _cold_start_perf_enabled() else 0.0)
+        start = (time.perf_counter() if _serving_perf_enabled() else 0.0)
         
         # 创建最小化的ModelConfig
         self.model_config = ModelConfig(
@@ -144,8 +143,8 @@ class VLLMTokenCounter:
         else:
             self.custom_chat_template = None
         
-        elapsed = ((time.perf_counter() if _cold_start_perf_enabled() else 0.0) - start) * 1000
-        if _cold_start_perf_enabled():
+        elapsed = ((time.perf_counter() if _serving_perf_enabled() else 0.0) - start) * 1000
+        if _serving_perf_enabled():
             logger.info(
                 f"VLLMTokenCounter initialized in {elapsed:.1f}ms: "
                 f"model={model_name}, max_len={max_model_len}"

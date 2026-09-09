@@ -499,7 +499,7 @@ class TestProxyColdPerfLogging(unittest.TestCase):
 
     def test_log_event_uses_correlatable_completion_request_id(self):
         with (
-            patch.dict(os.environ, {"LMCACHE_COLD_START_PERF": "1"}),
+            patch.object(proxy, "_proxy_cold_perf_enabled", return_value=True),
             patch.object(proxy.time, "perf_counter", return_value=12.345),
             patch("builtins.print") as print_line,
         ):
@@ -527,7 +527,7 @@ class TestProxyColdPerfLogging(unittest.TestCase):
 
     def test_log_event_is_disabled_by_default(self):
         with (
-            patch.dict(os.environ, {}, clear=True),
+            patch.object(proxy, "_proxy_cold_perf_enabled", return_value=False),
             patch("builtins.print") as print_line,
         ):
             proxy._log_proxy_cold_perf_event(

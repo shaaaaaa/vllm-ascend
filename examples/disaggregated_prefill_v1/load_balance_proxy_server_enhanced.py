@@ -55,10 +55,10 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def _cold_start_perf_enabled() -> bool:
-    return os.environ.get("LMCACHE_COLD_START_PERF", "0").strip().lower() not in (
-        "", "0", "false", "no", "off"
-    )
+if __package__:
+    from .pd_serving_perf import serving_perf_enabled as _serving_perf_enabled
+else:
+    from pd_serving_perf import serving_perf_enabled as _serving_perf_enabled
 
 MAX_RECOMPUTE_RETRIES = 3
 _REMOTE_FILL_VERIFICATION_CAPABILITY_BYTES = 32
@@ -2215,7 +2215,7 @@ async def _handle_select_instance(
         if max_tokens is None:
             max_tokens = "default"
         analysis_time_str = ""
-        if _cold_start_perf_enabled() and analysis and analysis.analysis_time_ms > 0:
+        if _serving_perf_enabled() and analysis and analysis.analysis_time_ms > 0:
             analysis_time_str = f"analysis={analysis.analysis_time_ms:.1f}ms, "
 
         if analysis:
@@ -2420,7 +2420,7 @@ async def _handle_completions(api: str, request: Request):
                         user_max_tokens = req_data.get("max_tokens")
                     user_specified_max_tokens = user_max_tokens is not None
                     
-                    analysis_start = (time.perf_counter() if _cold_start_perf_enabled() else 0.0)
+                    analysis_start = (time.perf_counter() if _serving_perf_enabled() else 0.0)
                     # Use asyncio.to_thread to avoid blocking event loop
                     token_info = await asyncio.to_thread(
                         proxy_state.vllm_token_counter.analyze_request,
@@ -2435,7 +2435,7 @@ async def _handle_completions(api: str, request: Request):
                         user_max_tokens = req_data.get("max_tokens")
                     user_specified_max_tokens = user_max_tokens is not None
                     
-                    analysis_start = (time.perf_counter() if _cold_start_perf_enabled() else 0.0)
+                    analysis_start = (time.perf_counter() if _serving_perf_enabled() else 0.0)
                     prompt_tokens = await asyncio.to_thread(
                         proxy_state.vllm_token_counter.count_prompt_tokens,
                         prompt=prompt,
@@ -2479,10 +2479,10 @@ async def _handle_completions(api: str, request: Request):
                         exceeds = prompt_tokens * margin > proxy_state.max_model_len
                         exceeded_by = int(prompt_tokens * margin) - proxy_state.max_model_len if exceeds else 0
                     
-                    analysis_end = (time.perf_counter() if _cold_start_perf_enabled() else 0.0)
+                    analysis_end = (time.perf_counter() if _serving_perf_enabled() else 0.0)
                     analysis_time_ms = (analysis_end - analysis_start) * 1000
                     
-                    if _cold_start_perf_enabled():
+                    if _serving_perf_enabled():
                         logger.debug(
                             "analyze_request succeeded: prompt=%s, sys=%s, tools=%s, content=%s, time=%.1fms",
                             prompt_tokens, token_info["system_tokens"], token_info["tool_tokens"],
@@ -2547,12 +2547,12 @@ async def _handle_completions(api: str, request: Request):
         if not analysis and proxy_state.tokenizer_analyzer:
             logger.debug("Falling back to TokenizerAnalyzer")
             try:
-                analysis_start = (time.perf_counter() if _cold_start_perf_enabled() else 0.0)
+                analysis_start = (time.perf_counter() if _serving_perf_enabled() else 0.0)
                 analysis = await asyncio.wait_for(
                     proxy_state.tokenizer_analyzer.analyze_request_async(req_data),
                     timeout=5.0
                 )
-                analysis_end = (time.perf_counter() if _cold_start_perf_enabled() else 0.0)
+                analysis_end = (time.perf_counter() if _serving_perf_enabled() else 0.0)
                 analysis.analysis_time_ms = (analysis_end - analysis_start) * 1000
                 
                 if analysis.exceeds_limit:

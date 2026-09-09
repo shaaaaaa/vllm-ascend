@@ -1204,7 +1204,17 @@ class TestCoreFunctionality(unittest.TestCase):
         )
         request = dict(self.test_req, split_plan=plan)
 
-        self.thread._transfer_kv_cache(request)
+        with (
+            patch(
+                "vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector.cold_perf_enabled",
+                return_value=False,
+            ),
+            patch(
+                "vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector.time.perf_counter",
+                side_effect=AssertionError("disabled transfer timing"),
+            ),
+        ):
+            self.thread._transfer_kv_cache(request)
 
         mock_register.assert_called_once_with(
             [0x8000, 0xA000],

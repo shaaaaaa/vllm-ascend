@@ -23,7 +23,7 @@ import os
 import sys
 import time
 from collections import defaultdict
-from collections.abc import Callable, Iterator
+from collections.abc import Iterator
 from contextlib import contextmanager, nullcontext
 from copy import copy, deepcopy
 from dataclasses import dataclass
@@ -139,8 +139,7 @@ from vllm_ascend.eplb.utils import model_register
 from vllm_ascend.live_source_handoff import (
     LIVE_SOURCE_EVENT_HANDOFF_KEY,
 )
-from vllm_ascend.lmcache_cold_perf import (
-    cold_perf_device_timing_enabled,
+from vllm_ascend.serving_perf import (
     cold_perf_enabled,
     is_cold_perf_request,
     log_cold_perf_event,
@@ -197,58 +196,19 @@ from vllm_ascend.ascend_forward_context import (  # isort: skip
 )
 from vllm.model_executor.layers.fused_moe.routed_experts_capturer import RoutedExpertsCapturer
 
+from vllm_ascend.worker.serving_perf import (
+    ServingPerfMixin,
+    _COLD_PERF_SAMPLE_TRACE_CALLS,
+    _COLD_PERF_SLOW_SAMPLE_MS,
+    _log_slow_sample_invocation,
+    _record_sample_stage,
+)
+
 if TYPE_CHECKING:
     import xgrammar as xgr  # type: ignore[import-untyped]
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 else:
     xgr = LazyLoader("xgr", globals(), "xgrammar")
-
-
-_COLD_PERF_SAMPLE_TRACE_CALLS = 2
-_COLD_PERF_SLOW_SAMPLE_MS = 500.0
-_COLD_PERF_SLOW_NPU_INTERVAL_MS = 100.0
-_COLD_PERF_MAX_PENDING_NPU_INTERVALS = 32
-
-
-@dataclass
-class _ColdPerfNPUInterval:
-    request_ids: tuple[str, ...]
-    stage: str
-    start_event: Any
-    end_event: Any
-    host_wall_ms: float
-    host_thread_cpu_ms: float
-    host_process_cpu_ms: float
-    force_emit: bool = False
-
-
-def _record_sample_stage(
-    stages: dict[str, float], name: str, started: float
-) -> None:
-    stages[name] = (time.perf_counter() - started) * 1000
-
-
-def _log_slow_sample_invocation(
-    request_ids: tuple[str, ...],
-    elapsed_ms: float,
-    thread_cpu_ms: float,
-    process_cpu_ms: float,
-    stages: dict[str, float],
-) -> None:
-    if elapsed_ms < _COLD_PERF_SLOW_SAMPLE_MS:
-        return
-    log_cold_perf_event(
-        "decoder_sample_invocation_slow",
-        request_ids=request_ids,
-        require_active=False,
-        total_wall_ms=round(elapsed_ms, 3),
-        total_thread_cpu_ms=round(thread_cpu_ms, 3),
-        total_process_cpu_ms=round(process_cpu_ms, 3),
-        unattributed_wall_ms=round(
-            max(0.0, elapsed_ms - sum(stages.values())), 3
-        ),
-        **{name: round(value, 3) for name, value in stages.items()},
-    )
 
 
 def _capture_live_source_event_handoff() -> None:
@@ -518,7 +478,7 @@ def _fill_fixed_decode_positions(
     positions += position_offsets[:num_tokens]
 
 
-class NPUModelRunner(GPUModelRunner):
+class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
     @staticmethod
     @contextmanager
     def maybe_get_kv_connector_output(
@@ -1897,7 +1857,7 @@ class NPUModelRunner(GPUModelRunner):
                 if is_cold_perf_request(req_id)
             ]
             if cold_perf_active
-            else []
+            else ()
         )
         if cold_perf_active:
             sample_trace_budget = {
@@ -1919,18 +1879,18 @@ class NPUModelRunner(GPUModelRunner):
             )
             self._drain_cold_perf_npu_intervals()
         else:
-            self._cold_perf_sample_trace_budget = {}
             self._cold_perf_sample_trace_req_ids = ()
         cold_perf_execute_start = (
             time.perf_counter() if cold_perf_req_ids else 0.0
         )
         self._cold_perf_current_req_ids = cold_perf_req_ids
-        log_cold_perf_event(
-            "decoder_worker_execute_entry",
-            request_ids=cold_perf_req_ids,
-            once=True,
-            total_num_scheduled_tokens=num_scheduled_tokens,
-        )
+        if cold_perf_req_ids:
+            log_cold_perf_event(
+                "decoder_worker_execute_entry",
+                request_ids=cold_perf_req_ids,
+                once=True,
+                total_num_scheduled_tokens=num_scheduled_tokens,
+            )
         with record_function_or_nullcontext("prepare input"):
             with self.synchronize_input_prep():
                 # Update persistent batch states.
@@ -2437,15 +2397,16 @@ class NPUModelRunner(GPUModelRunner):
                     cold_perf_role = "consumer"
                 cold_perf_tp_rank = get_tp_group().rank_in_group
                 cold_perf_dp_rank = get_dp_group().rank_in_group
-            log_cold_perf_event(
-                "decoder_forward_start",
-                request_ids=cold_perf_req_ids,
-                once=True,
-                total_num_scheduled_tokens=num_tokens_padded,
-                kv_role=cold_perf_role,
-                tp_rank=cold_perf_tp_rank,
-                dp_rank=cold_perf_dp_rank,
-            )
+            if cold_perf_req_ids:
+                log_cold_perf_event(
+                    "decoder_forward_start",
+                    request_ids=cold_perf_req_ids,
+                    once=True,
+                    total_num_scheduled_tokens=num_tokens_padded,
+                    kv_role=cold_perf_role,
+                    tp_rank=cold_perf_tp_rank,
+                    dp_rank=cold_perf_dp_rank,
+                )
             self._cold_perf_forward_interval = None
             if self._cold_perf_sample_trace_req_ids:
                 self._cold_perf_last_npu_interval = None
@@ -2627,106 +2588,6 @@ class NPUModelRunner(GPUModelRunner):
             self.kv_connector_output = kv_connector_output
         return None
 
-    def _cold_perf_npu_error(self, interval, operation: str, exc: Exception) -> None:
-        request_ids, stage = (
-            (interval.request_ids, interval.stage)
-            if isinstance(interval, _ColdPerfNPUInterval)
-            else interval
-        )
-        log_cold_perf_event(
-            "decoder_npu_interval_error",
-            request_ids=request_ids,
-            require_active=False,
-            once=True,
-            stage=stage,
-            operation=operation,
-            error_type=type(exc).__name__,
-        )
-
-    def _run_cold_perf_npu_stage(
-        self,
-        stage: str,
-        request_ids: tuple[str, ...],
-        operation: Callable[..., Any],
-        *args,
-        metrics: dict[str, float] | None = None,
-        **kwargs,
-    ):
-        # The ordinary cold-perf knob must not create device events. Optional
-        # device diagnostics are also bounded when completion is delayed.
-        if not cold_perf_device_timing_enabled() or len(
-            getattr(self, "_cold_perf_pending_npu_intervals", ())
-        ) >= _COLD_PERF_MAX_PENDING_NPU_INTERVALS:
-            return operation(*args, **kwargs)
-        try:
-            start_event = torch.npu.Event(enable_timing=True)
-            end_event = torch.npu.Event(enable_timing=True)
-            start_event.record()
-        except Exception as exc:
-            self._cold_perf_npu_error((request_ids, stage), "start", exc)
-            return operation(*args, **kwargs)
-
-        wall_start = time.perf_counter()
-        thread_start = time.thread_time_ns()
-        process_start = time.process_time_ns()
-        try:
-            return operation(*args, **kwargs)
-        finally:
-            interval = _ColdPerfNPUInterval(
-                request_ids,
-                stage,
-                start_event,
-                end_event,
-                (time.perf_counter() - wall_start) * 1000,
-                (time.thread_time_ns() - thread_start) / 1e6,
-                (time.process_time_ns() - process_start) / 1e6,
-            )
-            if metrics is not None:
-                metrics.update(
-                    {
-                        f"{stage}_wall_ms": interval.host_wall_ms,
-                        f"{stage}_thread_cpu_ms": interval.host_thread_cpu_ms,
-                        f"{stage}_process_cpu_ms": interval.host_process_cpu_ms,
-                    }
-                )
-            try:
-                end_event.record()
-            except Exception as exc:
-                self._cold_perf_npu_error(interval, "end", exc)
-            else:
-                self.__dict__.setdefault("_cold_perf_pending_npu_intervals", []).append(interval)
-                current = getattr(self, "_cold_perf_current_sample_npu_intervals", None)
-                if current is not None:
-                    current.append(interval)
-                self._cold_perf_last_npu_interval = interval
-
-    def _drain_cold_perf_npu_intervals(self) -> None:
-        pending = getattr(self, "_cold_perf_pending_npu_intervals", ())
-        if not pending:
-            return
-        remaining = []
-        for interval in pending:
-            try:
-                if not interval.end_event.query():
-                    remaining.append(interval)
-                    continue
-                device_ms = interval.start_event.elapsed_time(interval.end_event)
-            except Exception as exc:
-                self._cold_perf_npu_error(interval, "query", exc)
-                continue
-            if interval.force_emit or device_ms >= _COLD_PERF_SLOW_NPU_INTERVAL_MS:
-                log_cold_perf_event(
-                    "decoder_npu_interval_slow",
-                    request_ids=interval.request_ids,
-                    require_active=False,
-                    stage=interval.stage,
-                    device_elapsed_ms=round(device_ms, 3),
-                    host_wall_ms=round(interval.host_wall_ms, 3),
-                    host_thread_cpu_ms=round(interval.host_thread_cpu_ms, 3),
-                    host_process_cpu_ms=round(interval.host_process_cpu_ms, 3),
-                    forced_by_sample_stall=interval.force_emit,
-                )
-        self._cold_perf_pending_npu_intervals = remaining
 
     @torch.inference_mode()
     def sample_tokens(
@@ -2747,7 +2608,7 @@ class NPUModelRunner(GPUModelRunner):
         cold_perf_sample_process_start = (
             time.process_time_ns() if sample_trace_req_ids else 0
         )
-        cold_perf_sample_stages: dict[str, float] = {}
+        cold_perf_sample_stages = {} if sample_trace_req_ids else None
         if cold_perf_req_ids:
             log_cold_perf_event(
                 "decoder_sample_start",
@@ -4267,20 +4128,21 @@ class NPUModelRunner(GPUModelRunner):
                                 f"frontier_computed[{i}]"
                             )
                 if marker_failures:
-                    log_cold_perf_event(
-                        "decoder_cold_compact_graph_reject",
-                        request_ids=request_ids,
-                        once=True,
-                        failed_invariants=marker_failures,
-                        cold_resume_indices=[
-                            i
-                            for i, resume in enumerate(cold_resumes)
-                            if resume
-                        ],
-                        num_computed_tokens=computed.tolist(),
-                        prompt_lens=prompts.tolist(),
-                        remap_frontiers=list(frontiers),
-                    )
+                    if cold_perf_enabled():
+                        log_cold_perf_event(
+                            "decoder_cold_compact_graph_reject",
+                            request_ids=request_ids,
+                            once=True,
+                            failed_invariants=marker_failures,
+                            cold_resume_indices=[
+                                i
+                                for i, resume in enumerate(cold_resumes)
+                                if resume
+                            ],
+                            num_computed_tokens=computed.tolist(),
+                            prompt_lens=prompts.tolist(),
+                            remap_frontiers=list(frontiers),
+                        )
                     return native(
                         StagedSFARouteReason.COLD_COMPACT_LAYOUT
                     )
@@ -4329,20 +4191,21 @@ class NPUModelRunner(GPUModelRunner):
                 if not resume and int(computed[i]) < int(prompts[i]):
                     layout_failures.append(f"computed_prompt[{i}]")
             if layout_failures:
-                log_cold_perf_event(
-                    "decoder_cold_compact_graph_reject",
-                    request_ids=request_ids,
-                    once=True,
-                    failed_invariants=layout_failures,
-                    cold_resume_indices=[
-                        i
-                        for i, resume in enumerate(cold_resumes)
-                        if resume
-                    ],
-                    num_computed_tokens=computed.tolist(),
-                    prompt_lens=prompts.tolist(),
-                    remap_frontiers=list(frontiers),
-                )
+                if cold_perf_enabled():
+                    log_cold_perf_event(
+                        "decoder_cold_compact_graph_reject",
+                        request_ids=request_ids,
+                        once=True,
+                        failed_invariants=layout_failures,
+                        cold_resume_indices=[
+                            i
+                            for i, resume in enumerate(cold_resumes)
+                            if resume
+                        ],
+                        num_computed_tokens=computed.tolist(),
+                        prompt_lens=prompts.tolist(),
+                        remap_frontiers=list(frontiers),
+                    )
                 return native(
                     StagedSFARouteReason.COLD_COMPACT_LAYOUT,
                 )
@@ -6243,7 +6106,6 @@ class NPUModelRunner(GPUModelRunner):
                 set_draft_graph_params(sorted(draft_graph_sizes))
 
 
-
     def _collect_staged_sfa_impls(self) -> tuple[tuple[str, Any], ...]:
         """Return each target-model staged SFA implementation exactly once."""
         attn_layers = get_layers_from_vllm_config(
@@ -6295,9 +6157,6 @@ class NPUModelRunner(GPUModelRunner):
         self._staged_sfa_impls = ()
         for _layer_name, impl in self._collect_staged_sfa_impls():
             impl.reset_staged_sfa_capture()
-
-
-
 
 
     def capture_model(self) -> int:

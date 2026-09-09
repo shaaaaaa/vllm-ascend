@@ -55,7 +55,7 @@ from vllm_ascend.batch_invariant import init_batch_invariance
 from vllm_ascend.cpu_binding import bind_cpus
 from vllm_ascend.device_allocator.camem import CaMemAllocator
 from vllm_ascend.distributed.parallel_state import init_ascend_model_parallel
-from vllm_ascend.lmcache_cold_perf import (
+from vllm_ascend.serving_perf import (
     cold_perf_enabled,
     forget_cold_perf_request,
     is_cold_perf_request,

@@ -46,7 +46,7 @@ from vllm.v1.sample.rejection_sampler import PLACEHOLDER_TOKEN_ID
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.utils import ConstantList, record_function_or_nullcontext
 
-from vllm_ascend.lmcache_cold_perf import (
+from vllm_ascend.serving_perf import (
     cold_perf_enabled,
     is_cold_perf_request,
     log_cold_perf_event,

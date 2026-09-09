@@ -1,5 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Request-scoped LMCache cold-path performance logging."""
+"""PD serving performance events and request correlation.
+
+PD_SERVING_PERF is resolved at startup. Existing event names and log markers
+remain stable so historical traces and extraction tools stay comparable.
+"""
 
 import json
 import os
@@ -10,8 +14,10 @@ from typing import Any
 
 from vllm.logger import logger
 
+from vllm_ascend import envs
+
 _FALSE_VALUES = ("", "0", "false", "no", "off")
-_COLD_PERF_MODE = os.environ.get("LMCACHE_COLD_START_PERF", "0").strip().lower()
+_COLD_PERF_MODE = envs.PD_SERVING_PERF
 _COLD_PERF_ENABLED = _COLD_PERF_MODE not in _FALSE_VALUES
 # Ordinary perf logging is host-only. Device timing requires explicit opt-in;
 # it records stream events and must not be treated as an overhead-free timer.

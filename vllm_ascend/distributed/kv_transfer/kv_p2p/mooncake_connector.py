@@ -52,7 +52,7 @@ from vllm_ascend import envs as ascend_envs
 from vllm_ascend.ascend_config import get_ascend_config, init_ascend_config
 from vllm_ascend.distributed.kv_transfer.utils.mooncake_transfer_engine import global_te
 from vllm_ascend.distributed.kv_transfer.utils.utils import get_transfer_timeout_value
-from vllm_ascend.lmcache_cold_perf import (
+from vllm_ascend.serving_perf import (
     cold_perf_enabled,
     log_cold_perf_process_event,
     mark_cold_perf_requests,
@@ -1302,7 +1302,8 @@ class KVCacheRecvingThread(threading.Thread):
     def _transfer_split_destinations(
         self, req_meta: dict[str, Any], plan: SplitTransferPlan
     ) -> None:
-        transfer_started = time.perf_counter()
+        perf_enabled = cold_perf_enabled()
+        transfer_started = time.perf_counter() if perf_enabled else 0.0
         compact = plan.compact_source is not None
         latent = plan.latent_source is not None
         diagnostic_destination = plan.compact_destination
@@ -1363,21 +1364,11 @@ class KVCacheRecvingThread(threading.Thread):
                 for left, right in zip(page_ranges, page_ranges[1:])
             ):
                 raise RuntimeError("Latent destination pages overlap")
-        compact_source_runs = (
-            len(plan.compact_source.runs) if plan.compact_source is not None else 0
-        )
-        compact_destination_runs = (
-            len(plan.compact_destination.runs)
-            if plan.compact_destination is not None else 0
-        )
-        latent_layer_count = (
-            len(plan.latent_source.layers)
-            if plan.latent_source is not None else 0
-        )
-        latent_page_count = (
-            len(plan.latent_destination_pages)
-            if plan.latent_source is not None else 0
-        )
+        if perf_enabled:
+            compact_source_runs = len(plan.compact_source.runs) if plan.compact_source is not None else 0
+            compact_destination_runs = len(plan.compact_destination.runs) if plan.compact_destination is not None else 0
+            latent_layer_count = len(plan.latent_source.layers) if plan.latent_source is not None else 0
+            latent_page_count = len(plan.latent_destination_pages) if plan.latent_source is not None else 0
         remote_host = req_meta["remote_host"]
         remote_port = req_meta["remote_handshake_port"]
         remote_engine_id = req_meta["remote_engine_id"]
@@ -1443,21 +1434,22 @@ class KVCacheRecvingThread(threading.Thread):
             or latent
         ):
             plan = self._expand_compact_split_plan(plan)
-        expanded_at = time.perf_counter()
-        _cold_live_log(
-            "live_source_native_transfer_entry",
-            req_id=req_meta.get("request_id"),
-            transfer_id=req_meta.get("split_transfer_id"),
-            segment_count=len(plan.segments),
-            requested_groups=plan.requested_groups,
-            group_byte_totals=plan.group_byte_totals,
-            compact=compact,
-            compact_source_runs=compact_source_runs,
-            compact_destination_runs=compact_destination_runs,
-            latent=latent,
-            latent_layer_count=latent_layer_count,
-            latent_page_count=latent_page_count,
-        )
+        expanded_at = time.perf_counter() if perf_enabled else 0.0
+        if perf_enabled:
+            _cold_live_log(
+                "live_source_native_transfer_entry",
+                req_id=req_meta.get("request_id"),
+                transfer_id=req_meta.get("split_transfer_id"),
+                segment_count=len(plan.segments),
+                requested_groups=plan.requested_groups,
+                group_byte_totals=plan.group_byte_totals,
+                compact=compact,
+                compact_source_runs=compact_source_runs,
+                compact_destination_runs=compact_destination_runs,
+                latent=latent,
+                latent_layer_count=latent_layer_count,
+                latent_page_count=latent_page_count,
+            )
         totals = [0, 0]
         split_native_groups = len(requested_groups) > 1
         native_segments_by_group: dict[int, list[SplitTransferSegment]] = (
@@ -1578,7 +1570,7 @@ class KVCacheRecvingThread(threading.Thread):
         registration_ptrs, registration_sizes = map(
             list, zip(*registration_regions, strict=True)
         )
-        native_group_ms: dict[str, float] = {}
+        native_group_ms = {} if perf_enabled else None
         native_failure: tuple[int, int] | None = None
         with global_te.temporary_registration(
             registration_ptrs,
@@ -1586,9 +1578,9 @@ class KVCacheRecvingThread(threading.Thread):
             require_existing=latent,
             adopted_only=latent,
         ):
-            registered_at = time.perf_counter()
+            registered_at = time.perf_counter() if perf_enabled else 0.0
             for group_id, segments in native_batches:
-                batch_started = time.perf_counter()
+                batch_started = time.perf_counter() if perf_enabled else 0.0
                 ret = self.engine.batch_transfer_sync_read(
                     session_id,
                     [segment.destination_address for segment in segments],
@@ -1599,34 +1591,34 @@ class KVCacheRecvingThread(threading.Thread):
                     ],
                     [segment.length for segment in segments],
                 )
-                native_group_ms[str(group_id)] = round(
-                    (time.perf_counter() - batch_started) * 1000, 3
-                )
+                if native_group_ms is not None:
+                    native_group_ms[str(group_id)] = round((time.perf_counter() - batch_started) * 1000, 3)
                 if ret < 0:
                     native_failure = (group_id, ret)
                     break
-            native_done_at = time.perf_counter()
-        released_at = time.perf_counter()
+            native_done_at = time.perf_counter() if perf_enabled else 0.0
+        released_at = time.perf_counter() if perf_enabled else 0.0
         if native_failure is not None:
             failed_group, failure_code = native_failure
             raise RuntimeError(
                 "Mooncake split transfer failed for group "
                 f"{failed_group}, ret: {failure_code}"
             )
-        _cold_live_log(
-            "live_source_native_transfer_complete",
-            req_id=req_meta.get("request_id"),
-            transfer_id=req_meta.get("split_transfer_id"),
-            vector_count=len(plan.segments),
-            native_batch_count=len(native_batches),
-            native_group_ms=native_group_ms,
-            registration_region_count=len(registration_regions),
-            expand_ms=round((expanded_at - transfer_started) * 1000, 3),
-            registration_ms=round((registered_at - expanded_at) * 1000, 3),
-            native_ms=round((native_done_at - registered_at) * 1000, 3),
-            unregister_ms=round((released_at - native_done_at) * 1000, 3),
-            elapsed_ms=round((released_at - transfer_started) * 1000, 3),
-        )
+        if perf_enabled:
+            _cold_live_log(
+                "live_source_native_transfer_complete",
+                req_id=req_meta.get("request_id"),
+                transfer_id=req_meta.get("split_transfer_id"),
+                vector_count=len(plan.segments),
+                native_batch_count=len(native_batches),
+                native_group_ms=native_group_ms,
+                registration_region_count=len(registration_regions),
+                expand_ms=round((expanded_at - transfer_started) * 1000, 3),
+                registration_ms=round((registered_at - expanded_at) * 1000, 3),
+                native_ms=round((native_done_at - registered_at) * 1000, 3),
+                unregister_ms=round((released_at - native_done_at) * 1000, 3),
+                elapsed_ms=round((released_at - transfer_started) * 1000, 3),
+            )
         _fingerprint_live_group1_destination(
             req_id=str(req_meta.get("request_id", "")),
             transfer_id=req_meta.get("split_transfer_id"),
@@ -2166,15 +2158,16 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
             split_source = None
             split_source_invalid = True
         split_transfer_id = kv_transfer_params.get("live_split_transfer_id")
-        _cold_live_log(
-            "live_source_decoder_ingest",
-            req_id=request_id,
-            source_present=LIVE_SPLIT_SOURCE_DESCRIPTOR in kv_transfer_params,
-            source_valid=split_source is not None,
-            split_negotiated=split_negotiated,
-            transfer_id_present=isinstance(split_transfer_id, str),
-            transfer_param_keys=sorted(kv_transfer_params),
-        )
+        if cold_perf_enabled():
+            _cold_live_log(
+                "live_source_decoder_ingest",
+                req_id=request_id,
+                source_present=LIVE_SPLIT_SOURCE_DESCRIPTOR in kv_transfer_params,
+                source_valid=split_source is not None,
+                split_negotiated=split_negotiated,
+                transfer_id_present=isinstance(split_transfer_id, str),
+                transfer_param_keys=sorted(kv_transfer_params),
+            )
         if split_negotiated and not self.live_split_topology_supported:
             split_plan = None
             split_source_invalid = True
@@ -2906,13 +2899,14 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
             if meta.split_source_invalid:
                 meta.split_fallback = True
                 continue
-            _cold_live_log(
-                "live_source_late_plan_entry",
-                req_id=request_id,
-                source_present=meta.split_source is not None,
-                destination_present=request_id in plans,
-                supported_groups=supported_groups,
-            )
+            if cold_perf_enabled():
+                _cold_live_log(
+                    "live_source_late_plan_entry",
+                    req_id=request_id,
+                    source_present=meta.split_source is not None,
+                    destination_present=request_id in plans,
+                    supported_groups=supported_groups,
+                )
             try:
                 raw_plan = plans.get(request_id)
                 if isinstance(raw_plan, dict) and meta.split_source is None:
@@ -3702,14 +3696,15 @@ class MooncakeConnectorScheduler:
             transfer_params["live_split_capabilities"] = tuple(capabilities)
             transfer_params["live_split_transfer_id"] = split_transfer_id
             source_descriptor = params.get(LIVE_SPLIT_SOURCE_DESCRIPTOR)
-            _cold_live_log(
-                "live_source_mooncake_input",
-                req_id=request.request_id,
-                request_live_split=True,
-                source_present=source_descriptor is not None,
-                topology_supported=True,
-                request_param_keys=sorted(params),
-            )
+            if cold_perf_enabled():
+                _cold_live_log(
+                    "live_source_mooncake_input",
+                    req_id=request.request_id,
+                    request_live_split=True,
+                    source_present=source_descriptor is not None,
+                    topology_supported=True,
+                    request_param_keys=sorted(params),
+                )
             if source_descriptor is not None:
                 # This descriptor is created by the prefiller-side compact
                 # provider, which owns the registered source layout.  The
@@ -3731,14 +3726,13 @@ class MooncakeConnectorScheduler:
                         request.request_id,
                         exc_info=True,
                     )
-            _cold_live_log(
-                "live_source_mooncake_emit",
-                req_id=request.request_id,
-                source_present=(
-                    LIVE_SPLIT_SOURCE_DESCRIPTOR in transfer_params
-                ),
-                transfer_param_keys=sorted(transfer_params),
-            )
+            if cold_perf_enabled():
+                _cold_live_log(
+                    "live_source_mooncake_emit",
+                    req_id=request.request_id,
+                    source_present=(LIVE_SPLIT_SOURCE_DESCRIPTOR in transfer_params),
+                    transfer_param_keys=sorted(transfer_params),
+                )
         return delay_free_blocks, transfer_params
 
     def set_xfer_handshake_metadata(self, metadata: dict[int, KVConnectorHandshakeMetadata]) -> None:
@@ -4412,15 +4406,12 @@ class MooncakeConnectorWorker:
     def start_load_kv(self, metadata: MooncakeConnectorMetadata):
         """Start loading KV blocks from remote engine."""
         if metadata.requests:
-            _cold_live_log(
-                "live_source_worker_load_entry",
-                request_ids=sorted(metadata.requests),
-                split_requests=[
-                    req_id
-                    for req_id, meta in metadata.requests.items()
-                    if meta.split_negotiated
-                ],
-            )
+            if cold_perf_enabled():
+                _cold_live_log(
+                    "live_source_worker_load_entry",
+                    request_ids=sorted(metadata.requests),
+                    split_requests=[req_id for req_id, meta in metadata.requests.items() if meta.split_negotiated],
+                )
         if self.kv_recv_thread is not None:
             for req_id, request_meta in metadata.requests.items():
                 self.kv_recv_thread.task_tracker.add_req_to_process(

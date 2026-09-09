@@ -1,9 +1,33 @@
 import json
+import runpy
+from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 from vllm.logger import logger
 
-import vllm_ascend.lmcache_cold_perf as cold_perf
+import vllm_ascend.serving_perf as cold_perf
+
+
+@pytest.mark.parametrize(
+    "mode,enabled,device",
+    [
+        ("", False, False),
+        ("0", False, False),
+        (" FALSE ", False, False),
+        ("no", False, False),
+        ("off", False, False),
+        ("1", True, False),
+        (" Detail ", True, False),
+        ("DEVICE", True, True),
+    ],
+)
+def test_startup_mode_is_stable(monkeypatch, mode, enabled, device):
+    monkeypatch.setenv("PD_SERVING_PERF", mode)
+    namespace = runpy.run_path(str(Path(__file__).parents[2] / "vllm_ascend/serving_perf.py"))
+    monkeypatch.setenv("PD_SERVING_PERF", "0" if enabled else "1")
+    assert namespace["cold_perf_enabled"]() is enabled
+    assert namespace["cold_perf_device_timing_enabled"]() is device
 
 
 def test_unknown_fields_are_not_stringified(monkeypatch):
@@ -16,7 +40,8 @@ def test_unknown_fields_are_not_stringified(monkeypatch):
     records = []
     monkeypatch.setattr(cold_perf, "_COLD_PERF_ENABLED", True)
     monkeypatch.setattr(
-        cold_perf, "logger",
+        cold_perf,
+        "logger",
         SimpleNamespace(info=lambda _format, raw: records.append(json.loads(raw))),
     )
     cold_perf.log_cold_perf_process_event("safe", values=[NoReadback()])
@@ -73,9 +98,7 @@ def test_process_event_does_not_require_a_marked_request(monkeypatch):
     monkeypatch.setattr(
         cold_perf,
         "logger",
-        SimpleNamespace(
-            info=lambda _format, payload: records.append(json.loads(payload))
-        ),
+        SimpleNamespace(info=lambda _format, payload: records.append(json.loads(payload))),
     )
 
     cold_perf.log_cold_perf_process_event("decoder_execute_slow", elapsed_ms=800)
@@ -91,9 +114,7 @@ def test_late_request_event_uses_captured_request_id(monkeypatch):
     monkeypatch.setattr(
         cold_perf,
         "logger",
-        SimpleNamespace(
-            info=lambda _format, payload: records.append(json.loads(payload))
-        ),
+        SimpleNamespace(info=lambda _format, payload: records.append(json.loads(payload))),
     )
 
     cold_perf.log_cold_perf_event(

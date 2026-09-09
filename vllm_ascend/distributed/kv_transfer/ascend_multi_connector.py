@@ -21,7 +21,7 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_dsa_index_connector imp
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector import (
     MooncakeLayerwiseConnector,
 )
-from vllm_ascend.lmcache_cold_perf import log_cold_perf_process_event
+from vllm_ascend.serving_perf import cold_perf_enabled, log_cold_perf_process_event
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -433,7 +433,8 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
         source_providers: list[Any] = []
         destination_providers: list[Any] = []
         hybrid_consumers: list[Any] = []
-        capability_details: list[dict[str, Any]] = []
+        perf_enabled = cold_perf_enabled()
+        capability_details = [] if perf_enabled else None
         for child in self._connectors:
             configure = getattr(child, "configure_live_latent_source", None)
             source_capability = getattr(
@@ -469,25 +470,27 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
             )
             if callable(configure_transport) and transport_supported:
                 hybrid_consumers.append(child)
-            capability_details.append(
-                {
-                    "connector": child.__class__.__name__,
-                    "configurable_provider": callable(configure),
-                    "source": source_supported,
-                    "destination": destination_supported,
-                    "configurable_transport": callable(configure_transport),
-                    "transport": transport_supported,
-                }
-            )
+            if capability_details is not None:
+                capability_details.append(
+                    {
+                        "connector": child.__class__.__name__,
+                        "configurable_provider": callable(configure),
+                        "source": source_supported,
+                        "destination": destination_supported,
+                        "configurable_transport": callable(configure_transport),
+                        "transport": transport_supported,
+                    }
+                )
 
         source_enabled = bool(source_providers and hybrid_consumers)
         destination_enabled = bool(destination_providers and hybrid_consumers)
-        _cold_live_log(
-            "live_source_capability_config",
-            children=capability_details,
-            source_enabled=source_enabled,
-            destination_enabled=destination_enabled,
-        )
+        if perf_enabled:
+            _cold_live_log(
+                "live_source_capability_config",
+                children=capability_details,
+                source_enabled=source_enabled,
+                destination_enabled=destination_enabled,
+            )
         for child in self._connectors:
             configure_transport = getattr(
                 child, "configure_live_latent_transport", None
@@ -604,11 +607,12 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
             for connector in self._connectors:
                 connector.start_load_kv(forward_context, **kwargs)
             return
-        _cold_live_log(
-            "live_source_ascend_multi_load_entry",
-            late_consumers=[c.__class__.__name__ for c in late_consumers],
-            children=[c.__class__.__name__ for c in self._connectors],
-        )
+        if cold_perf_enabled():
+            _cold_live_log(
+                "live_source_ascend_multi_load_entry",
+                late_consumers=[c.__class__.__name__ for c in late_consumers],
+                children=[c.__class__.__name__ for c in self._connectors],
+            )
 
         handled_groups: set[int] = set()
         for connector in late_consumers:
@@ -869,12 +873,13 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
                 and "ascend_live_split_source_v1" in txfer_params
             ):
                 source = txfer_params["ascend_live_split_source_v1"]
-                _cold_live_log(
-                    "live_source_multi_handoff",
-                    req_id=request.request_id,
-                    provider=connector.__class__.__name__,
-                    descriptor_count=len(source.get("descriptors", ())),
-                )
+                if cold_perf_enabled():
+                    _cold_live_log(
+                        "live_source_multi_handoff",
+                        req_id=request.request_id,
+                        provider=connector.__class__.__name__,
+                        descriptor_count=len(source.get("descriptors", ())),
+                    )
                 params["ascend_live_split_source_v1"] = txfer_params.pop(
                     "ascend_live_split_source_v1"
                 )
@@ -907,18 +912,16 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
                 kv_transfer_params, remote_fill_params
             )
 
-        _cold_live_log(
-            "live_source_multi_finish",
-            req_id=request.request_id,
-            request_live_split=bool(
-                isinstance(params, dict) and params.get("request_live_split")
-            ),
-            source_attached=bool(
-                isinstance(kv_transfer_params, dict)
-                and "ascend_live_split_source_v1" in kv_transfer_params
-            ),
-            child_count=len(connectors),
-        )
+        if cold_perf_enabled():
+            _cold_live_log(
+                "live_source_multi_finish",
+                req_id=request.request_id,
+                request_live_split=bool(isinstance(params, dict) and params.get("request_live_split")),
+                source_attached=bool(
+                    isinstance(kv_transfer_params, dict) and "ascend_live_split_source_v1" in kv_transfer_params
+                ),
+                child_count=len(connectors),
+            )
         if async_saves > 1:
             self._extra_async_saves[request.request_id] = async_saves - 1
 

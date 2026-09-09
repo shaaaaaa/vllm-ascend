@@ -146,7 +146,6 @@ except ImportError:
     logger = logging.getLogger(__name__)
 
 
-_COLD_PERF_FALSE_VALUES = ("", "0", "false", "no", "off")
 _REMOTE_FILL_VERIFICATION_CAPABILITY_BYTES = 32
 
 
@@ -179,11 +178,10 @@ def _encode_json_payload(payload: Any) -> bytes:
     ).encode("utf-8")
 
 
-def _proxy_cold_perf_enabled() -> bool:
-    return (
-        os.environ.get("LMCACHE_COLD_START_PERF", "0").strip().lower()
-        not in _COLD_PERF_FALSE_VALUES
-    )
+if __package__:
+    from .pd_serving_perf import serving_perf_enabled as _proxy_cold_perf_enabled
+else:
+    from pd_serving_perf import serving_perf_enabled as _proxy_cold_perf_enabled
 
 
 def _log_proxy_cold_perf_event(

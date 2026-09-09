@@ -24,7 +24,7 @@ from vllm.v1.executor.multiproc_executor import (
     set_multiprocessing_worker_envs,
 )
 
-from vllm_ascend.lmcache_cold_perf import (
+from vllm_ascend.serving_perf import (
     cold_perf_enabled,
     log_cold_perf_event,
     log_cold_perf_process_event,

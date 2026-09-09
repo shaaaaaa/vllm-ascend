@@ -66,7 +66,7 @@ from vllm_ascend.distributed.kv_transfer.utils.utils import (
     kv_alltoall_and_rearrange,
     parallel_info,
 )
-from vllm_ascend.lmcache_cold_perf import cold_perf_enabled
+from vllm_ascend.serving_perf import cold_perf_enabled
 from vllm_ascend.utils import npu_stream_switch, trans_nd_to_nz
 
 # isort: off
