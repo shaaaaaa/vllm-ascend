@@ -1008,6 +1008,15 @@ class TestSocketManagement(unittest.TestCase):
 
 class TestCoreFunctionality(unittest.TestCase):
 
+    def _prime_split_peer(self):
+        """Provide the handshake that precedes destination validation."""
+        self.thread.kv_caches_base_addr["remote_engine"] = {6666: [0x5000]}
+        self.thread.remote_buffer_sizes["remote_engine"] = {6666: (4096,)}
+        self.thread.remote_buffer_group_ids["remote_engine"] = {6666: (1,)}
+        self.thread.remote_capabilities = {
+            ("remote_engine", 6666): (LIVE_SPLIT_CAPABILITY,),
+        }
+
     def setUp(self):
         self.engine = MagicMock()
         self.ready_event = threading.Event()
@@ -1033,6 +1042,7 @@ class TestCoreFunctionality(unittest.TestCase):
         self.thread.request_queue = self.mock_queue
         self.test_req = {
             "request_id": "req1",
+            "remote_request_id": "req1",
             "local_block_ids": [1, 2],
             "remote_block_ids": [3, 4],
             "remote_engine_id": "remote_engine",
@@ -1492,6 +1502,7 @@ class TestCoreFunctionality(unittest.TestCase):
             self.assertEqual(destinations[page_base], expected)
 
     def test_split_rejects_npu_destination_outside_local_group1(self):
+        self._prime_split_peer()
         self.thread.local_registered_bases = (0x1000, 0x2000)
         self.thread.local_buffer_sizes = (0x100, 0x100)
         self.thread.local_buffer_group_ids = (0, 1)
@@ -1603,7 +1614,7 @@ class TestCoreFunctionality(unittest.TestCase):
         }
         plan = SplitTransferPlan(
             segments=(
-                SplitTransferSegment(1, 0, 64, 0xA000, 512, "npu"),
+                SplitTransferSegment(1, 0, 64, 0xA000, 512, "npu", 0x5000),
             ),
             group_byte_totals=(0, 512),
             tp_rank=0,
@@ -1615,6 +1626,7 @@ class TestCoreFunctionality(unittest.TestCase):
             self.thread._transfer_split_destinations(self.test_req, plan)
 
     def test_split_rejects_overlapping_destinations(self):
+        self._prime_split_peer()
         plan = SplitTransferPlan(
             segments=(
                 SplitTransferSegment(1, 0, 0, 0xA000, 16, "npu"),
@@ -1630,6 +1642,7 @@ class TestCoreFunctionality(unittest.TestCase):
             self.thread._transfer_split_destinations(self.test_req, plan)
 
     def test_split_rejects_zero_or_missing_requested_group(self):
+        self._prime_split_peer()
         self.vllm_config.parallel_config.data_parallel_rank_local = 0
         self.vllm_config.parallel_config.data_parallel_index = 0
         self.thread.local_registered_bases = (0xA000,)
@@ -2556,6 +2569,7 @@ class TestMooncakeConnectorMetadata(unittest.TestCase):
                          kv_transfer_params={
                              "remote_block_ids": [4, 5, 6],
                              "remote_engine_id": "remote_engine",
+                             "remote_request_id": "req1",
                              "remote_host": "localhost",
                              "remote_port": 5000,
                              "remote_pcp_size": 1,
@@ -2732,6 +2746,7 @@ class TestMooncakeConnectorMetadata(unittest.TestCase):
                 "remote_host": "host",
                 "remote_port": 30000,
                 "live_split_capabilities": (LIVE_SPLIT_CAPABILITY,),
+                "live_split_transfer_id": "generation-a",
             })
 
         self.assertTrue(meta.needs_late_split_plans())
@@ -2877,6 +2892,56 @@ class TestMooncakeConnectorMetadata(unittest.TestCase):
                 "live_split_transfer_id": "generation-a",
                 LIVE_SPLIT_SOURCE_DESCRIPTOR: {
                     "segments": [
+                        {"group_id": 1, "source_buffer_index": 2,
+                         "source_buffer_base": 0x5000,
+                         "source_offset": 96, "length": 12},
+                        {"group_id": 1, "source_buffer_index": 4,
+                         "source_buffer_base": 0x9000,
+                         "source_offset": 32, "length": 20},
+                        {"group_id": 1, "source_buffer_index": 5,
+                         "source_buffer_base": 0xB000,
+                         "source_offset": 64, "length": 8},
+                    ],
+                    "group_byte_totals": [0, 40],
+                    "tp_rank": 3, "dp_rank": 1,
+                },
+            })
+        metadata.accept_late_split_plans({"req": {
+            "segments": [
+                {"group_id": 1, "destination_address": 0x1000,
+                 "length": 16, "destination_kind": "npu"},
+                {"group_id": 1, "destination_address": 0x3000,
+                 "length": 16, "destination_kind": "npu"},
+                {"group_id": 1, "destination_address": 0x7000,
+                 "length": 8, "destination_kind": "npu"},
+            ],
+            "group_byte_totals": [0, 40],
+            "tp_rank": 3, "dp_rank": 1,
+            "requested_groups": [1],
+        }})
+
+        plan = metadata.requests["req"].split_plan
+        self.assertIsNotNone(plan)
+        self.assertEqual(
+            [(s.source_buffer_index, s.source_offset,
+              s.destination_address, s.length) for s in plan.segments],
+            [(2, 96, 0x1000, 12), (4, 32, 0x100C, 4),
+             (4, 36, 0x3000, 16), (5, 64, 0x7000, 8)],
+        )
+
+    def test_flat_group0_source_is_rejected_without_latent_page_plan(self):
+        metadata = MooncakeConnectorMetadata()
+        metadata.add_new_req(
+            "req", [1], 16, {
+                "remote_block_ids": [9, 11],
+                "remote_engine_id": "remote",
+                "remote_request_id": "remote-req",
+                "remote_host": "host",
+                "remote_port": 30000,
+                "live_split_capabilities": (LIVE_SPLIT_CAPABILITY,),
+                "live_split_transfer_id": "generation-a",
+                LIVE_SPLIT_SOURCE_DESCRIPTOR: {
+                    "segments": [
                         {"group_id": 0, "source_buffer_index": 2,
                          "source_buffer_base": 0x5000,
                          "source_offset": 96, "length": 12},
@@ -2891,7 +2956,7 @@ class TestMooncakeConnectorMetadata(unittest.TestCase):
                     "tp_rank": 3, "dp_rank": 1,
                 },
             })
-        metadata.accept_late_split_plans({"req": {
+        destination = {
             "segments": [
                 {"group_id": 0, "destination_address": 0x1000,
                  "length": 16, "destination_kind": "cpu"},
@@ -2902,16 +2967,12 @@ class TestMooncakeConnectorMetadata(unittest.TestCase):
             ],
             "group_byte_totals": [32, 8],
             "tp_rank": 3, "dp_rank": 1,
-        }})
+        }
 
-        plan = metadata.requests["req"].split_plan
-        self.assertIsNotNone(plan)
-        self.assertEqual(
-            [(s.source_buffer_index, s.source_offset,
-              s.destination_address, s.length) for s in plan.segments],
-            [(2, 96, 0x1000, 12), (4, 32, 0x100C, 4),
-             (4, 36, 0x3000, 16), (5, 64, 0x7000, 8)],
-        )
+        with self.assertRaisesRegex(ValueError, "Incomplete latent CPU split plan"):
+            metadata._merge_source_and_destinations(
+                metadata.requests["req"].split_source[0], destination,
+            )
 
     def test_dp2_live_split_routes_all_source_destination_pairs(self):
         for source_dp_rank in range(2):
