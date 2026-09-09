@@ -374,17 +374,48 @@ class NPUPlatform(Platform):
                 "CompilationMode.VLLM_COMPILE and compilation_config.cudagraph_mode == CUDAGraphMode.VLLM_COMPILE"
             )
             cross_layer_sfa = staged_sfa_graph_configured(vllm_config)
+            lmcache_full_graph = bool(
+                cross_layer_sfa
+                and envs_ascend.VLLM_ASCEND_SFA_LMCACHE_FULL_GRAPH
+            )
+            if lmcache_full_graph and envs_ascend.VLLM_ASCEND_MTP_DRAFT_DEBUG:
+                raise ValueError(
+                    "VLLM_ASCEND_SFA_LMCACHE_FULL_GRAPH is incompatible with "
+                    "VLLM_ASCEND_MTP_DRAFT_DEBUG because diagnostics synchronize "
+                    "and inspect the graph-internal LMCache boundary."
+                )
+            if (
+                lmcache_full_graph
+                and envs_ascend.VLLM_ASCEND_SFA_STAGED_MTP_DRAFT_GRAPH
+            ):
+                raise ValueError(
+                    "VLLM_ASCEND_SFA_LMCACHE_FULL_GRAPH currently requires "
+                    "VLLM_ASCEND_SFA_STAGED_MTP_DRAFT_GRAPH=0 so trailing "
+                    "draft-layer LMCache callbacks remain active."
+                )
             if cross_layer_sfa:
-                # Keep retrieve as an eager FX subgraph so its neighboring
-                # regions become cross-layer ACL graphs.
+                # The ordinary staged path splits around the Python retrieve.
+                # Full-graph LMCache instead captures its device-only transfer.
                 compilation_config.use_inductor_graph_partition = False
             compilation_config.set_splitting_ops_for_v1(
                 all2all_backend=vllm_config.parallel_config.all2all_backend,
                 data_parallel_size=vllm_config.parallel_config.data_parallel_size,
             )
             compilation_config.use_inductor = False
-            mla_split_op = "vllm::sfa_lmcache_retrieve" if cross_layer_sfa else "vllm::mla_forward"
-            if mla_split_op not in compilation_config.splitting_ops:
+            mla_split_op = (
+                "vllm::sfa_lmcache_retrieve"
+                if cross_layer_sfa
+                else "vllm::mla_forward"
+            )
+            if (
+                lmcache_full_graph
+                and mla_split_op in compilation_config.splitting_ops
+            ):
+                compilation_config.splitting_ops.remove(mla_split_op)
+            if (
+                not lmcache_full_graph
+                and mla_split_op not in compilation_config.splitting_ops
+            ):
                 compilation_config.splitting_ops.append(mla_split_op)
             if (
                 cross_layer_sfa

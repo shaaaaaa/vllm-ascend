@@ -214,6 +214,8 @@ class AscendMultiHeadLatentAttention(MultiHeadLatentAttentionWrapper):
                 selected_packed,
                 selected_counts,
                 target_slots,
+                kv_cache[0],
+                kv_cache[1],
                 output,
                 self.prefix,
                 self.next_layer_name,
@@ -371,6 +373,8 @@ def sfa_lmcache_retrieve(
     selected_packed: torch.Tensor,
     selected_counts: torch.Tensor,
     target_slots: torch.Tensor,
+    kv_cache_nope: torch.Tensor,
+    kv_cache_pe: torch.Tensor,
     output: torch.Tensor,
     layer_name: str,
     next_layer_name: str,
@@ -382,6 +386,7 @@ def sfa_lmcache_retrieve(
         selected_packed,
         selected_counts,
         target_slots,
+        (kv_cache_nope, kv_cache_pe),
         attn_metadata,
         context,
     )
@@ -391,6 +396,8 @@ def sfa_lmcache_retrieve_fake(
     selected_packed: torch.Tensor,
     selected_counts: torch.Tensor,
     target_slots: torch.Tensor,
+    kv_cache_nope: torch.Tensor,
+    kv_cache_pe: torch.Tensor,
     output: torch.Tensor,
     layer_name: str,
     next_layer_name: str,
@@ -466,7 +473,7 @@ direct_register_custom_op(
 direct_register_custom_op(
     op_name="sfa_lmcache_retrieve",
     op_func=sfa_lmcache_retrieve,
-    mutates_args=["output"],
+    mutates_args=["kv_cache_nope", "kv_cache_pe", "output"],
     fake_impl=sfa_lmcache_retrieve_fake,
     dispatch_key="PrivateUse1",
 )

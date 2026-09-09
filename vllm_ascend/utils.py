@@ -84,6 +84,7 @@ class StagedSFAConfigReason(str, Enum):
     MODEL_NOT_MLA = "model_not_mla"
     INDEX_TOPK_MISSING = "index_topk_missing"
     CONNECTOR_MISSING = "connector_missing"
+    FULL_GRAPH_CONNECTOR = "full_graph_connector"
     SPECULATIVE_DECODE = "speculative_decode"
     LORA = "lora"
     DATA_PARALLEL = "data_parallel"
@@ -552,6 +553,12 @@ def staged_sfa_graph_configuration_reasons(
         reasons.append(StagedSFAConfigReason.INDEX_TOPK_MISSING)
     if getattr(vllm_config, "kv_transfer_config", None) is None:
         reasons.append(StagedSFAConfigReason.CONNECTOR_MISSING)
+    elif (
+        envs_ascend.VLLM_ASCEND_SFA_LMCACHE_FULL_GRAPH
+        and getattr(vllm_config.kv_transfer_config, "kv_connector", None)
+        != "LMCacheAscendConnectorV1Dynamic"
+    ):
+        reasons.append(StagedSFAConfigReason.FULL_GRAPH_CONNECTOR)
     speculative_config = getattr(vllm_config, "speculative_config", None)
     speculative_method = getattr(speculative_config, "method", "mtp")
     if (
@@ -600,6 +607,10 @@ _STAGED_SFA_CONFIG_MESSAGES = {
     StagedSFAConfigReason.MODEL_NOT_MLA: "the model must use MLA/SFA",
     StagedSFAConfigReason.INDEX_TOPK_MISSING: "the model must expose index_topk",
     StagedSFAConfigReason.CONNECTOR_MISSING: "a KV transfer connector must be configured",
+    StagedSFAConfigReason.FULL_GRAPH_CONNECTOR: (
+        "VLLM_ASCEND_SFA_LMCACHE_FULL_GRAPH requires "
+        "LMCacheAscendConnectorV1Dynamic"
+    ),
     StagedSFAConfigReason.SPECULATIVE_DECODE: "only fixed-width MTP speculative decoding is supported",
     StagedSFAConfigReason.LORA: "LoRA is not implemented",
     StagedSFAConfigReason.DATA_PARALLEL: "external-launcher data parallel staged graphs are not implemented",

@@ -536,6 +536,30 @@ two-wrapper commit remains the reference and rollback route until the
 cross-layer target has its own numerical, lifecycle, trace, and performance
 qualification; production registry/resource work is built for outer islands.
 
+### Experimental LMCache-inclusive replay
+
+`VLLM_ASCEND_SFA_LMCACHE_FULL_GRAPH=1` removes
+`vllm::sfa_lmcache_retrieve` from the PIECEWISE split list and captures its two
+device-only latent copy kernels. This mode still uses the staged structural
+keys and `cudagraph_mode=PIECEWISE`; “full” here means that the LMCache boundary
+is inside the target graph, not that every unrelated model operation is forced
+into one graph.
+
+Admission is deliberately narrower than the retrieve-split route. Every active
+request must have a sealed prepared source, the DSA index group must already be
+resident, and the request frontier must match that source. Cold loads, resume,
+and decode-window frontier changes run the native eager path for that step.
+Before replay the connector binds all request lanes into stable per-layer NPU
+pointer tables. Source owners are pinned until an event recorded after replay
+completes. Target layers are skipped in the prepared LMCache generator while
+trailing MTP draft layers retain the existing callback protocol.
+
+The startup command must use `LMCacheAscendConnectorV1Dynamic`. Target debug
+mode is incompatible because it synchronizes and reads the now graph-internal
+boundary. Server qualification must cover batch reorder/shrink/growth, partial
+chunks, cold-to-warm transitions, frontier changes, TP/DP agreement, and the
+native eager fallback before this opt-in is treated as production-ready.
+
 ## Padded Q1 design
 
 Use bounded capacity buckets selected by the resource planner. A graph captured

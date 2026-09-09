@@ -329,7 +329,11 @@ class TestAscendMultiHeadLatentAttention(TestBase):
                 torch.ops.aten.sin.default,
             ],
         )
-        retrieve_output = torch.ops.vllm.sfa_lmcache_retrieve.default._schema.arguments[1]
-        self.assertTrue(retrieve_output.alias_info.is_write)
+        retrieve_arguments = {
+            argument.name: argument
+            for argument in torch.ops.vllm.sfa_lmcache_retrieve.default._schema.arguments
+        }
+        for name in ("kv_cache_nope", "kv_cache_pe", "output"):
+            self.assertTrue(retrieve_arguments[name].alias_info.is_write)
         diag_tensor = torch.ops.vllm.sfa_target_layer_diag.default._schema.arguments[0]
         self.assertTrue(diag_tensor.alias_info.is_write)

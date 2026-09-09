@@ -181,6 +181,12 @@ env_variables: dict[str, Callable[[], Any]] = {
     # incompatible model/runtime features fail fast during startup capture so
     # an explicitly requested POC cannot silently remain inactive.
     "VLLM_ASCEND_SFA_STAGED_GRAPH": lambda: bool(int(os.getenv("VLLM_ASCEND_SFA_STAGED_GRAPH", "0"))),
+    # Capture the LMCache selective latent transfer inside each staged target
+    # graph. Sources are rebound once per step through stable NPU pointer
+    # tables; cold/frontier-changing requests fall back to eager execution.
+    "VLLM_ASCEND_SFA_LMCACHE_FULL_GRAPH": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_SFA_LMCACHE_FULL_GRAPH", "0"))
+    ),
     # Independently capture the MTP drafter as a FULL graph while the target
     # model uses staged SFA. Disabled by default; the target staged graph and
     # resident scratch reuse do not depend on this opt-in. Non-sensitive; read

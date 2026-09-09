@@ -3758,12 +3758,46 @@ class AscendSFAImpl(MLAAttentionImpl):
         selected_packed: torch.Tensor,
         selected_counts: torch.Tensor,
         target_slots: torch.Tensor,
+        latent_kv_caches: tuple[torch.Tensor, torch.Tensor],
         attn_metadata: M | None,
         context: Any,
     ) -> None:
         with _staged_sfa_profile_scope("sfa_cross_layer::lmcache_retrieve"):
             graph_key = getattr(context, "staged_sfa_graph_key", None)
             if attn_metadata is None or graph_key is None:
+                return
+            if envs.VLLM_ASCEND_SFA_LMCACHE_FULL_GRAPH:
+                if not has_kv_transfer_group() or not is_v1_kv_transfer_group():
+                    raise RuntimeError(
+                        "Full-graph sparse load requires a v1 KV connector"
+                    )
+                connector = get_kv_transfer_group()
+                graph_load = getattr(
+                    connector, "sparse_decode_graph_load", None
+                )
+                if graph_load is None:
+                    raise RuntimeError(
+                        "Configured KV connector has no sparse graph load API"
+                    )
+                graph_load(
+                    graph_key,
+                    layer_name,
+                    latent_kv_caches,
+                    selected_packed,
+                    selected_counts,
+                    target_slots,
+                )
+                if (
+                    getattr(context, "staged_sfa_graph_dummy_run", False)
+                    and next_layer_name
+                ):
+                    next_metadata = context.attn_metadata[next_layer_name]
+                    _prepare_sfa_remap_boundary(
+                        next_metadata,
+                        next_metadata.req_ids,
+                        is_dummy_run=True,
+                        index_topk=self.index_topk,
+                    )
                 return
             if getattr(context, "staged_sfa_graph_dummy_run", False):
                 if next_layer_name:
@@ -3843,7 +3877,21 @@ class AscendSFAImpl(MLAAttentionImpl):
                 ),
             )
             runtime = self._staged_sfa_capture_state.runtime
-            if not is_dummy and runtime and runtime[2] is not None and runtime[3]:
+            graph_load_ready = bool(
+                envs.VLLM_ASCEND_SFA_LMCACHE_FULL_GRAPH
+                and getattr(
+                    context,
+                    "kv_connector_sparse_decode_graph_ready",
+                    False,
+                )
+            )
+            if (
+                not is_dummy
+                and not graph_load_ready
+                and runtime
+                and runtime[2] is not None
+                and runtime[3]
+            ):
                 wait_for_kv_layer_from_connector(runtime[2])
 
     def cross_layer_graph_post(

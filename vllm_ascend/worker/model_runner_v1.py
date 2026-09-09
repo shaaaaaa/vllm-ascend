@@ -1977,6 +1977,26 @@ class NPUModelRunner(GPUModelRunner):
             # __enter__. Sample committed frontiers only after that point so the
             # first forward that can retrieve a new window also forces a remap
             # diagnostic for the same window.
+            forward_context = get_forward_context()
+            if (
+                envs_ascend.VLLM_ASCEND_SFA_LMCACHE_FULL_GRAPH
+                and staged_sfa_graph_key is not None
+                and not getattr(
+                    forward_context,
+                    "kv_connector_sparse_decode_graph_ready",
+                    False,
+                )
+            ):
+                staged_sfa_route = StagedSFARouteDecision(
+                    StagedSFARouteAction.SAFE_NATIVE,
+                    StagedSFARouteReason.SPARSE_LOAD_UNAVAILABLE,
+                )
+                staged_sfa_graph_key = None
+                cudagraph_mode = CUDAGraphMode.NONE
+                forward_context.staged_sfa_route = staged_sfa_route
+                forward_context.staged_sfa_graph_key = None
+                forward_context.cudagraph_runtime_mode = CUDAGraphMode.NONE
+                self._apply_staged_sfa_route(staged_sfa_route)
             if (
                 self._staged_sfa_graph_capture_sizes
                 and staged_sfa_graph_key is None
@@ -2027,8 +2047,13 @@ class NPUModelRunner(GPUModelRunner):
                             diag_deep_req_ids
                         )
             if staged_sfa_graph_key is not None:
-                first_layer_name, first_impl = self._staged_sfa_impls[0]
-                first_impl.bootstrap_cross_layer(first_layer_name)
+                bootstrap_impls = (
+                    self._staged_sfa_impls
+                    if envs_ascend.VLLM_ASCEND_SFA_LMCACHE_FULL_GRAPH
+                    else self._staged_sfa_impls[:1]
+                )
+                for layer_name, impl in bootstrap_impls:
+                    impl.bootstrap_cross_layer(layer_name)
             hidden_states = self._model_forward(
                 num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
             )
@@ -4209,6 +4234,22 @@ class NPUModelRunner(GPUModelRunner):
                     "reliable per-request frontier metadata, and a consumer "
                     "role (kv_both or kv_consumer)."
                 )
+            if (
+                envs_ascend.VLLM_ASCEND_SFA_LMCACHE_FULL_GRAPH
+                and not self._profiling_cudagraph_memory
+            ):
+                connector = get_kv_transfer_group()
+                if not bool(
+                    getattr(
+                        connector,
+                        "supports_sparse_decode_graph_load",
+                        False,
+                    )
+                ):
+                    raise ValueError(
+                        "VLLM_ASCEND_SFA_LMCACHE_FULL_GRAPH requires a "
+                        "connector with device-graph sparse load support."
+                    )
         mode = self.compilation_config.cudagraph_mode
         if not self.use_sparse or not mode.has_full_cudagraphs():
             return
@@ -5352,12 +5393,35 @@ class NPUModelRunner(GPUModelRunner):
                         "[SFA cross-layer graph] eager warmup/capture was "
                         f"incomplete for {layer_name}: {exc}"
                     ) from exc
+            if envs_ascend.VLLM_ASCEND_SFA_LMCACHE_FULL_GRAPH:
+                connector = get_kv_transfer_group()
+                validate_graph_capture = getattr(
+                    connector,
+                    "validate_sparse_decode_graph_capture",
+                    None,
+                )
+                if validate_graph_capture is None:
+                    raise RuntimeError(
+                        "Sparse LMCache connector has no graph capture "
+                        "validation API"
+                    )
+                validate_graph_capture(
+                    graph_keys,
+                    tuple(
+                        layer_name
+                        for layer_name, _ in self._staged_sfa_impls
+                    ),
+                )
             # The normal retrieve split creates one outer island per target
             # layer plus the model tail.  Target diagnostics add graph-external
             # input and output boundaries around every target layer, creating
             # two additional islands per layer.  Keep the exact-count check so
             # a genuinely incomplete debug capture still fails at startup.
-            expected_outer_islands = len(self._staged_sfa_impls) + 1
+            expected_outer_islands = (
+                1
+                if envs_ascend.VLLM_ASCEND_SFA_LMCACHE_FULL_GRAPH
+                else len(self._staged_sfa_impls) + 1
+            )
             if envs_ascend.VLLM_ASCEND_MTP_DRAFT_DEBUG:
                 expected_outer_islands += 2 * len(self._staged_sfa_impls)
             graph_entry_count = ACLGraphWrapper.seal_staged_entries(
@@ -5382,9 +5446,14 @@ class NPUModelRunner(GPUModelRunner):
                     )
                 )
             logger.info(
-                "[SFA cross-layer graph] captured retrieve-split outer graphs "
+                "[SFA cross-layer graph] captured %s outer graphs "
                 "for %d local SFA layers and %d keys; entries=%d, "
                 "draft_full_graphs=%d",
+                (
+                    "LMCache-inclusive"
+                    if envs_ascend.VLLM_ASCEND_SFA_LMCACHE_FULL_GRAPH
+                    else "retrieve-split"
+                ),
                 len(self._staged_sfa_impls),
                 len(graph_keys),
                 graph_entry_count,

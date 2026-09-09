@@ -1893,6 +1893,7 @@ class TestStagedSFAGraphPoc(TestBase):
             attn_metadata={"layer-1.attn": next_metadata},
         )
         waits = []
+        latent_caches = self._make_eligible_kv_cache()[:2]
         with (
             patch.object(
                 sfa_v1,
@@ -1908,6 +1909,7 @@ class TestStagedSFAGraphPoc(TestBase):
                 torch.ones(4, 4, dtype=torch.int32),
                 torch.ones(4, dtype=torch.int32),
                 torch.zeros(4, 4, dtype=torch.long),
+                latent_caches,
                 metadata,
                 context,
             )
@@ -1948,6 +1950,7 @@ class TestStagedSFAGraphPoc(TestBase):
             staged_sfa_graph_dummy_run=True,
             attn_metadata={"layer-1.attn": next_metadata},
         )
+        latent_caches = self._make_eligible_kv_cache()[:2]
         with (
             patch.object(sfa_v1, "_prepare_sfa_remap_boundary") as prepare_boundary,
             patch.object(sfa_v1, "wait_for_kv_layer_from_connector") as wait_for_layer,
@@ -1958,6 +1961,7 @@ class TestStagedSFAGraphPoc(TestBase):
                 torch.ones(4, 4, dtype=torch.int32),
                 torch.ones(4, dtype=torch.int32),
                 torch.zeros(4, 4, dtype=torch.long),
+                latent_caches,
                 metadata,
                 context,
             )
@@ -1969,6 +1973,56 @@ class TestStagedSFAGraphPoc(TestBase):
             index_topk=impl.index_topk,
         )
         wait_for_layer.assert_not_called()
+
+    def test_cross_layer_full_graph_retrieve_uses_device_connector(self):
+        impl = self._make_eligible_impl()
+        graph_key = StagedSFAGraphKey.exact_q1(4)
+        metadata = self._make_decode_metadata()
+        context = SimpleNamespace(
+            staged_sfa_graph_key=graph_key,
+            staged_sfa_graph_dummy_run=False,
+        )
+        selected = torch.ones(4, 4, dtype=torch.int32)
+        counts = torch.ones(4, dtype=torch.int32)
+        slots = torch.zeros(4, 4, dtype=torch.long)
+        latent_caches = self._make_eligible_kv_cache()[:2]
+        connector = SimpleNamespace(sparse_decode_graph_load=MagicMock())
+
+        with (
+            patch.object(
+                sfa_v1.envs,
+                "VLLM_ASCEND_SFA_LMCACHE_FULL_GRAPH",
+                True,
+            ),
+            patch.object(sfa_v1, "has_kv_transfer_group", return_value=True),
+            patch.object(sfa_v1, "is_v1_kv_transfer_group", return_value=True),
+            patch.object(
+                sfa_v1,
+                "get_kv_transfer_group",
+                return_value=connector,
+            ),
+            patch.object(sfa_v1, "wait_for_kv_layer_from_connector") as wait,
+        ):
+            impl.cross_layer_lmcache_retrieve(
+                "layer-0",
+                "",
+                selected,
+                counts,
+                slots,
+                latent_caches,
+                metadata,
+                context,
+            )
+
+        connector.sparse_decode_graph_load.assert_called_once_with(
+            graph_key,
+            "layer-0",
+            latent_caches,
+            selected,
+            counts,
+            slots,
+        )
+        wait.assert_not_called()
 
     def test_cross_layer_post_ignores_padded_bridge_rows(self):
         impl = self._make_eligible_impl()
