@@ -161,16 +161,40 @@ native compilation requirement; missing native exports still require a rebuild.
 
 The default is designed for one host with eight 64-GB NPUs (devices 0 through 7),
 not a single 64-GB card. Reducing the layer count alone does not guarantee that
-the model fits on one card. The test starts two fresh engines sequentially,
-each using **TP8/DP1**, eight target layers, MTP1 and dummy weights. TP shards the
-weights across the eight cards; DP is not used to replicate the whole model.
+the model fits on one card. The test starts two fresh engines sequentially, but
+**computes real prefill only once**. Both use **TP8/DP1**, eight target layers,
+MTP1 and dummy weights. TP shards the weights across the eight cards; DP is not
+used to replicate the whole model.
 The test reads the original depth from `config.json` and remaps the original
 MTP layer's entire ModelSlim quantization namespace to follow the eight target
 layers, including head, attention, experts and FA/indexer metadata. This is an
 in-memory test fixture adjustment; checkpoint files and normal serving are
 unchanged. Missing original MTP quantization is an error, not a FLOAT fallback.
-First run **both staged/full graph disabled with
-enforce_eager**, then the root graph path. Normal serving is not instrumented.
+The reference runs **both staged/full graph disabled with enforce_eager**. It
+computes the original chunked prefill, exports immutable target/MTP checkpoints,
+then runs the original decode. The graph engine imports those checkpoints
+**without calling the prefill models**, then runs the production root-graph
+decode. No compiled-prefill-versus-eager comparison is involved. Normal serving
+is not instrumented.
+
+Each checkpoint contains model inputs/outputs, latent K/PE, indexer KV, live
+sorted-resident state and Torch CPU/NPU RNG state. Cache blocks are mapped into
+the second process's allocations without replacing graph-captured tensors.
+The recorded original wait/save callback order rebuilds local LMCache sources,
+partial tails, generators and request bookkeeping through the real connector
+APIs. Scheduler and MTP input preparation still run normally; target and initial
+MTP prefill computation do not run again. Imported bytes and input/position/
+sequence metadata are checked exactly. Missing state, changed block aliases,
+unsupported callbacks or a duplicate prefill computation fail; there is no
+fallback that silently recomputes prefill. Subsequent eager and graph decode
+trajectories use independent mutable caches.
+
+The graph log distinguishes `prefill=IMPORTED` (with
+`target_prefill_model_calls=0`) from `phase=decode ... PASS replay_per_rank=1`.
+The final coverage gate requires all 4351 prompt tokens to have been computed
+once in the reference and imported in the graph engine, with **zero graph-engine
+target/MTP prefill model calls**. Startup dummy warmup/capture remains enabled
+and is not real request prefill.
 For another model directory/device set, the equivalent driver accepts
 `python tools/sfa_full_graph_parity.py --model /path/to/model --devices 0,1,2,3,4,5,6,7`.
 Explicit lists of 1/2/4/8 distinct devices are supported; fewer cards require
@@ -181,8 +205,8 @@ The test deliberately uses an isolated local CPU LMCache instead of inheriting
 a server's shared/remote cache. Every TP rank stores its own KV and participates
 in lookup (`save_only_first_rank=false`); the CPU cache cap is 2 GB per rank.
 It exercises the model's real TP communication, but does not test Mooncake, DP,
-EP, request recovery, or generated-language quality. Temporary reference files
-(potentially tens of GB for all eight ranks' complete prefill) are managed and removed by the driver;
+EP, request recovery, or generated-language quality. Temporary prefill checkpoints
+and decode references are managed and removed by the driver;
 only console output needs to be kept. No native rebuild is introduced.
 
 ### What must match
@@ -200,10 +224,11 @@ only console output needs to be kept. No native rebuild is introduced.
   views fail explicitly with the tensor name instead of being skipped.
 - Actual token IDs, positions, sequence lengths and query boundaries before
   every target forward. Target sampling and submitted MTP proposals are fixed
-  to the same token. MTP computation and its KV callbacks still execute, but
+  to the same token. On decode, MTP computation and its KV callbacks still execute, but
   this does **not** test natural draft choices or rejection behavior.
-- Every target layer's hidden/residual inputs and outputs, including all real
-  rows of chunked prefill, followed by the final target hidden states.
+- The one prefill's checkpoint inputs and imported KV/state bytes exactly.
+- On decode, every target layer's hidden/residual inputs and outputs,
+  followed by the final target hidden states.
 - On decode: Q, logical top-k, history boundary, and the complete K/PE vectors
   at every valid top-k entry **as attention consumes them**. Physical slots and
   planner misses are recorded for diagnosis, not compared as numerical results:
@@ -248,6 +273,11 @@ tails, empty sources and fixed pointer-table addresses on CPU. Native calls
 and prevalidated attention metadata are fixtures; this is not a kernel test.
 It skips if the sibling repositories are absent. Driver preflight/error-order
 tests are in `tests/ut/tools/test_sfa_full_graph_parity.py`.
+`tests/ut/compilation/test_sfa_prefill_checkpoint.py` checks exact import bytes,
+physical block remapping, live-versus-dummy resident-state bindings, callback
+order, immutable snapshots, zero prefill recomputation and untouched decode
+dispatch. It executes the actual worker checkpoint path on CPU fixtures; this
+is not a real NPU kernel test.
 Real CPU/Gloo two- and eight-process failure-agreement tests are in
 `tests/ut/compilation/test_sfa_parity_gloo.py`. They do not replace the real
 eight-NPU/model test above. The small single-card probe replay test remains in
@@ -255,7 +285,7 @@ eight-NPU/model test above. The small single-card probe replay test remains in
 
 ### Diagnosing a residual mismatch
 
-For a failure such as `step=0 layer=2 output.residual`, run the separate
+For a decode residual mismatch, run the separate
 fine-probe diagnostic from **vllm-ascend**, still on TP8/DP1:
 
 ```bash
@@ -264,9 +294,10 @@ python -m pytest -q -s --confcutdir=tests/e2e/multicard tests/e2e/multicard/test
 ```
 
 The equivalent driver option is `--trace-residual`. Both fresh engines use the
-same fine probes and weights. The eager reference still disables staged/full
-graph and compilation; the graph engine keeps its existing compilation and
-fusion configuration. Neither tolerance nor model computation is changed.
+same fine probes and weights. Prefill still computes once and is imported by
+the graph engine. The eager decode reference disables staged/full graph and
+compilation; graph decode retains its compilation/fusion configuration.
+Decode tolerances are unchanged.
 
 In addition to the original layer/attention observations, every target layer
 records input RMSNorm outputs, attention output, both actual operands entering
@@ -275,8 +306,8 @@ copied before any in-place update, including after intervening FP16 scaling.
 There are no per-layer host reads, synchronization or diagnostic collectives;
 copies/counters are captured, and analysis runs after the complete forward.
 All extra buffers are included in the worker's memory budget. At BF16/6144
-hidden size and 512 rows, these add about 336 MiB per rank; temporary reference
-files for the entire TP8 run can approach 40 GiB. They are removed by the driver.
+hidden size and 512 rows, these add about 336 MiB per rank. Checkpoints and
+decode reference files are removed by the driver.
 
 On failure, `[SFA_TRACE]` reports the actual phase, row count, root replay count,
 earliest **elementwise difference** (even within tolerance), and stage comparisons
@@ -285,8 +316,8 @@ operands, their FP64 sum, the sum rounded to the output dtype, and the observed
 residual at the failing coordinate. This distinguishes changed operands from
 a differing addition result, but does not identify a particular fused kernel
 or prove that a small difference is harmless. Earlier stages passing tolerance
-does not imply bitwise-identical inputs. A first-prefill failure provides no
-live decode replay evidence.
+does not imply bitwise-identical inputs. An import/checkpoint failure is a setup
+failure, not a numerical comparison of two prefills or decode replay evidence.
 
 `max_rel_nonzero` excludes exactly-zero reference values; their differences are
 reported as `zero_ref_max_abs`. The pass/fail formula remains

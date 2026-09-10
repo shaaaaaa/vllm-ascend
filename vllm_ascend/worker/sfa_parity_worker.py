@@ -8,6 +8,7 @@ only tensor copies/counter increments, traced into the existing target graph;
 SFA probes run inside existing opaque SFA ops during capture, not live replay.
 """
 
+import importlib
 import inspect
 import json
 import re
@@ -28,6 +29,16 @@ from vllm_ascend.attention.sfa_parity import (
     gather_sparse_kv,
     residual_trace_report,
     weight_fingerprint,
+)
+from vllm_ascend.attention.sfa_prefill_checkpoint import (
+    CacheBinding,
+    assert_same_tree,
+    capture_caches,
+    copy_tree,
+    plan_cache_restore,
+    restore_prefill,
+    validate_callbacks,
+    verify_cache_restore,
 )
 from vllm_ascend.attention.sfa_v1 import AscendSFAImpl
 from vllm_ascend.worker.worker import NPUWorker
@@ -311,6 +322,14 @@ class SFAParityWorker(NPUWorker):
         self.parity_tp_size = self.parity_group.world_size
         self.parity_options = options
         self.parity_step = 0
+        self.parity_prefill_steps = 0
+        self.parity_prefill_tokens = 0
+        self.parity_prefill_model_calls = 0
+        self.parity_prefill_imports = 0
+        self.parity_draft_prefill_model_calls = 0
+        self.parity_draft_prefill_imports = 0
+        self.parity_last_target_decode = None
+        self.parity_last_target_step = None
         self.parity_decode_steps = 0
         self.parity_q2_steps = 0
         self.parity_draft_calls = 0
@@ -337,31 +356,7 @@ class SFAParityWorker(NPUWorker):
         signature = inspect.signature(original_forward)
 
         def forward(*args, **kwargs):
-            context = get_forward_context()
-            live = runner.input_batch.num_reqs > 0 and not getattr(context, "staged_sfa_graph_dummy_run", False)
-            if not live:
-                return original_forward(*args, **kwargs)
-            state = self._check(
-                lambda: self._prepare_step(signature.bind(*args, **kwargs).arguments, context),
-                f"step={self.parity_step} before target",
-            )
-            before = runner._sfa_full_graph.replay_count
-            # Do not put a failure collective around the model itself: a kernel
-            # failure may leave other ranks inside HCCL. vLLM's supervisor owns
-            # that failure path. Diagnostic checks are coordinated only outside.
-            result = original_forward(*args, **kwargs)
-            replays = runner._sfa_full_graph.replay_count - before
-            self._check(lambda: self._observe_step(state, result, replays), f"step={self.parity_step} after target")
-            if self.parity_is_graph and self.parity_rank == 0:
-                print(
-                    f"[SFA_PARITY] step={self.parity_step} rows={state['rows']} decode={state['decode']} "
-                    f"ranks={self.parity_tp_size} layers=8 PASS replay_per_rank={replays}",
-                    flush=True,
-                )
-            self.parity_step += 1
-            self.parity_decode_steps += int(state["decode"])
-            self.parity_q2_steps += int(state["decode"] and state["rows"] == QUERY_WIDTH)
-            return result
+            return self._parity_forward(original_forward, signature, *args, **kwargs)
 
         original_propose = runner.propose_draft_token_ids
 
@@ -379,6 +374,220 @@ class SFAParityWorker(NPUWorker):
 
         runner._model_forward = forward
         runner.propose_draft_token_ids = propose
+        original_draft = runner.drafter._run_mtp_draft_layer_with_diagnostics
+
+        def draft(model_kwargs, **kwargs):
+            return self._parity_draft_forward(original_draft, model_kwargs, **kwargs)
+
+        runner.drafter._run_mtp_draft_layer_with_diagnostics = draft
+
+    def _parity_forward(self, original_forward, signature, *args, **kwargs):
+        runner = self.model_runner
+        context = get_forward_context()
+        live = runner.input_batch.num_reqs > 0 and not getattr(context, "staged_sfa_graph_dummy_run", False)
+        if not live:
+            # Profiling, compilation and root capture retain the production path.
+            return original_forward(*args, **kwargs)
+        state = self._check(
+            lambda: self._prepare_step(signature.bind(*args, **kwargs).arguments, context),
+            f"step={self.parity_step} before target",
+        )
+        before = runner._sfa_full_graph.replay_count
+        self.parity_last_target_decode = state["decode"]
+        self.parity_last_target_step = self.parity_step
+        if state["decode"]:
+            # Leave the production eager/root-replay paths completely intact.
+            # No failure collective around NPU/HCCL model execution itself.
+            result = original_forward(*args, **kwargs)
+        else:
+            result = self._prefill_pass(
+                "target",
+                self.parity_step,
+                self.parity_attention_names,
+                signature.bind(*args, **kwargs).arguments,
+                lambda: original_forward(*args, **kwargs),
+            )
+            self.parity_prefill_model_calls += int(not self.parity_is_graph)
+            self.parity_prefill_imports += int(self.parity_is_graph)
+        replays = runner._sfa_full_graph.replay_count - before
+        if state["decode"]:
+            self._check(lambda: self._observe_step(state, result, replays), f"step={self.parity_step} after target")
+        elif replays:
+            raise ParityError("Prefill checkpoint import must not replay the target graph")
+        if self.parity_is_graph and self.parity_rank == 0:
+            if state["decode"]:
+                print(
+                    f"[SFA_PARITY] step={self.parity_step} phase=decode rows={state['rows']} "
+                    f"ranks={self.parity_tp_size} layers=8 PASS replay_per_rank={replays}",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"[SFA_PARITY] step={self.parity_step} prefill=IMPORTED rows={state['rows']} "
+                    "target_prefill_model_calls=0",
+                    flush=True,
+                )
+        self.parity_step += 1
+        self.parity_prefill_steps += int(not state["decode"])
+        self.parity_prefill_tokens += state["rows"] if not state["decode"] else 0
+        self.parity_decode_steps += int(state["decode"])
+        self.parity_q2_steps += int(state["decode"] and state["rows"] == QUERY_WIDTH)
+        return result
+
+    def _parity_draft_forward(self, original, model_kwargs, **kwargs):
+        # MTP's initial cache is part of the common decode starting point too.
+        # Startup dummy/profile runs and every real decode draft are untouched.
+        if self.model_runner.input_batch.num_reqs == 0 or self.parity_last_target_decode is not False:
+            return original(model_kwargs, **kwargs)
+        if kwargs["draft_step"] != 0:
+            raise ParityError("Prefill checkpoint requires MTP=1")
+        result = self._prefill_pass(
+            "draft",
+            self.parity_last_target_step,
+            self.model_runner.drafter.attn_layer_names,
+            {
+                "model_kwargs": model_kwargs,
+                "draft_step": kwargs["draft_step"],
+                "runtime_inputs": kwargs["runtime_inputs"],
+            },
+            lambda: original(model_kwargs, **kwargs),
+        )
+        self.parity_draft_prefill_model_calls += int(not self.parity_is_graph)
+        self.parity_draft_prefill_imports += int(self.parity_is_graph)
+        return result
+
+    def _prefill_bindings(self, context, attention_names):
+        bindings, persistent, metadata = {}, {}, {}
+        for name in attention_names:
+            layer = context.no_compile_layers[name]
+            impl = layer.impl
+            if not isinstance(impl, AscendSFAImpl) or not impl.dsa_offload_unbundle:
+                raise ParityError("Prefill checkpoint requires unbundled SFA caches")
+            caches, index_name, enabled = impl._cross_layer_kv_cache(name, layer.kv_cache[context.virtual_engine])
+            if len(caches) != 3 or not enabled:
+                raise ParityError("Prefill checkpoint requires latent K/PE and LMCache-enabled indexer")
+            item = context.attn_metadata[name]
+            index_table = item.indexer_block_table if item.indexer_block_table is not None else item.block_table
+            bindings[name] = CacheBinding(tuple(caches[:2]), item.block_table[:1])
+            bindings[index_name] = CacheBinding((caches[2],), index_table[:1])
+            metadata[name] = {
+                key: copy_tree(getattr(item, key, None))
+                for key in (
+                    "num_actual_tokens",
+                    "num_decode_tokens",
+                    "seq_lens",
+                    "cum_query_lens",
+                    "resident_state_indices",
+                    "resident_state_generations",
+                )
+            }
+            resident = impl._sorted_resident_state
+            if resident is not None:
+                # These slots are scratch-relative, not physical KV addresses.
+                # Do not overwrite the graph-capture-only dummy state rows.
+                for field in ("tokens", "slots", "counts", "generations"):
+                    persistent[f"{name}.{field}"] = getattr(resident, field)[: resident.dummy_state_base]
+        return bindings, persistent, metadata
+
+    def _prefill_pass(self, kind, step, attention_names, inputs, runnable):
+        """Compute/export once; the graph process can only import, never compute."""
+        context = get_forward_context()
+        phase = f"{kind} prefill checkpoint step={step}"
+        path = self.parity_directory / f"{kind}-prefill-{step:06d}.pt"
+        bindings, persistent, metadata = self._check(
+            lambda: self._prefill_bindings(context, attention_names), phase + " bindings"
+        )
+        header = self._check(
+            lambda: {
+                "schema": 1,
+                "kind": kind,
+                "step": step,
+                "rank": self.parity_rank,
+                "tp_size": self.parity_tp_size,
+                "inputs": copy_tree(inputs),
+                "metadata": metadata,
+            },
+            phase + " inputs",
+        )
+        sfa = importlib.import_module("vllm_ascend.attention.sfa_v1")
+        wait, save = sfa.wait_for_kv_layer_from_connector, sfa.maybe_save_kv_layer_to_connector
+        if self.parity_is_graph:
+
+            def prepare():
+                snapshot = torch.load(path, map_location="cpu", weights_only=True)
+                assert_same_tree(snapshot["header"], header, phase + " inputs")
+                validate_callbacks(snapshot["callbacks"], bindings)
+                plan = plan_cache_restore(snapshot["caches"], bindings)
+                if snapshot["persistent"].keys() != persistent.keys():
+                    raise ParityError("Prefill resident-state coverage differs")
+                for name, value in persistent.items():
+                    ref = snapshot["persistent"][name]
+                    if ref.shape != value.shape or ref.dtype != value.dtype:
+                        raise ParityError(f"{name}: prefill resident-state layout differs")
+                return snapshot, plan
+
+            snapshot, plan = self._check(prepare, phase + " validate")
+            # No model, indexer/top-k, MLP or attention execution in this branch.
+            # Rebuild generators/CPU sources through their real public callbacks.
+            restore_prefill(snapshot, bindings, plan, wait=wait, save=save)
+            for name, value in persistent.items():
+                value.copy_(snapshot["persistent"][name])
+            torch.set_rng_state(snapshot["cpu_rng"])
+            torch.npu.set_rng_state(snapshot["npu_rng"])
+            context.moe_layer_index = snapshot["moe_layer_index"]
+            output = copy_tree(snapshot["output"], self.device)
+
+            def verify():
+                verify_cache_restore(snapshot["caches"], bindings, plan)
+                assert_same_tree(snapshot["persistent"], persistent, phase + " resident state")
+                assert_same_tree(snapshot["output"], output, phase + " output")
+
+            self._check(verify, phase + " imported bytes")
+            return output
+
+        def unused_checkpoint():
+            if path.exists():
+                raise ParityError(f"Refusing to compute the same prefill twice: {path.name}")
+
+        self._check(unused_checkpoint, phase + " single computation")
+
+        callbacks = []
+
+        def record_wait(name, *args, **kwargs):
+            # Diagnose unsupported sparse-load callbacks AFTER the model returns,
+            # not between TP collectives. Normal prefill waits take only a name.
+            callbacks.append(("unsupported_wait" if args or kwargs else "wait", name))
+            return wait(name, *args, **kwargs)
+
+        def record_save(name, caches):
+            callbacks.append(("save", name))
+            return save(name, caches)
+
+        with (
+            patch.object(sfa, "wait_for_kv_layer_from_connector", record_wait),
+            patch.object(sfa, "maybe_save_kv_layer_to_connector", record_save),
+        ):
+            output = runnable()  # Original eager prefill, exactly once.
+
+        def export():
+            torch.npu.synchronize()
+            validate_callbacks(callbacks, bindings)
+            torch.save(
+                {
+                    "header": header,
+                    "callbacks": callbacks,
+                    "caches": capture_caches(bindings),
+                    "persistent": copy_tree(persistent),
+                    "output": copy_tree(output),
+                    "cpu_rng": torch.get_rng_state(),
+                    "npu_rng": torch.npu.get_rng_state(),
+                    "moe_layer_index": getattr(context, "moe_layer_index", 0),
+                },
+                path,
+            )
+
+        self._check(export, phase + " export")
+        return output
 
     def _prepare_quant_config(self) -> None:
         # Test-worker-only import; normal serving keeps the checkpoint config.
@@ -464,6 +673,14 @@ class SFAParityWorker(NPUWorker):
         decode = metadata.num_decode_tokens > 0
         if decode and rows > QUERY_WIDTH:
             raise ParityError("Expected Q1/Q2 singleton decode")
+        if not decode and (
+            getattr(context, "staged_sfa_graph_key", None) is not None
+            or getattr(context, "capturing", False)
+            or getattr(context, "sfa_full_graph_active", False)
+        ):
+            raise ParityError("Live prefill unexpectedly routed to graph capture/replay")
+        if decode and self.parity_is_graph and context.skip_compiled:
+            raise ParityError("Decode must retain the production compiled root-replay path")
         state = {
             "rank": self.parity_rank,
             "tp_size": self.parity_tp_size,
@@ -484,6 +701,8 @@ class SFAParityWorker(NPUWorker):
 
     def _observe_step(self, state, result, replays):
         rows, decode = state["rows"], state["decode"]
+        if not decode:
+            raise ParityError("Prefill must use checkpoint export/import, never the decode comparator")
         state["root_replays"] = replays
         if decode and replays != int(self.parity_is_graph):
             raise ParityError(
@@ -549,17 +768,44 @@ class SFAParityWorker(NPUWorker):
         return self._check(self._local_summary, "final coverage")
 
     def _local_summary(self):
+        if self.parity_prefill_steps < 1 or self.parity_prefill_tokens < 1:
+            raise ParityError("No single-prefill checkpoint setup was checked")
+        if self.parity_step != self.parity_prefill_steps + self.parity_decode_steps:
+            raise ParityError("Incomplete prefill/decode phase coverage")
         if self.parity_decode_steps < 2 or self.parity_q2_steps < 2 or self.parity_draft_calls < 2:
             raise ParityError("Insufficient live decode/Q2/MTP coverage")
         if not all(count > 0 for count in self.parity_transfers):
             raise ParityError(f"No historical KV transfer observed in some target layers: {self.parity_transfers}")
-        expected_steps = len(list(self.parity_directory.glob("step-*.pt")))
+        expected_prefills = len(list(self.parity_directory.glob("target-prefill-*.pt")))
+        expected_draft_prefills = len(list(self.parity_directory.glob("draft-prefill-*.pt")))
+        if expected_prefills != self.parity_prefill_steps or expected_draft_prefills < 1:
+            raise ParityError("Incomplete target/MTP prefill checkpoint coverage")
+        expected_counts = (
+            (0, expected_prefills, 0, expected_draft_prefills)
+            if self.parity_is_graph
+            else (expected_prefills, 0, expected_draft_prefills, 0)
+        )
+        actual_counts = (
+            self.parity_prefill_model_calls,
+            self.parity_prefill_imports,
+            self.parity_draft_prefill_model_calls,
+            self.parity_draft_prefill_imports,
+        )
+        if actual_counts != expected_counts:
+            raise ParityError(f"Prefill must compute once, then import: {actual_counts} != {expected_counts}")
+        expected_steps = len(list(self.parity_directory.glob("step-*.pt"))) + expected_prefills
         if self.parity_step != expected_steps:
             raise ParityError(f"Incomplete step comparison: {self.parity_step} != {expected_steps}")
         return {
             "rank": self.parity_rank,
             "tp_size": self.parity_tp_size,
             "steps": self.parity_step,
+            "prefill_steps": self.parity_prefill_steps,
+            "prefill_tokens": self.parity_prefill_tokens,
+            "prefill_model_calls": self.parity_prefill_model_calls,
+            "prefill_imports": self.parity_prefill_imports,
+            "draft_prefill_model_calls": self.parity_draft_prefill_model_calls,
+            "draft_prefill_imports": self.parity_draft_prefill_imports,
             "decode_steps": self.parity_decode_steps,
             "q2_steps": self.parity_q2_steps,
             "draft_calls": self.parity_draft_calls,

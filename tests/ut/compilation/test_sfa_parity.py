@@ -24,7 +24,18 @@ def parity(monkeypatch):
 
 
 @pytest.fixture
-def worker(parity, monkeypatch):
+def checkpoint(parity, monkeypatch):
+    monkeypatch.setitem(sys.modules, "vllm_ascend.attention.sfa_parity", parity)
+    path = Path(__file__).resolve().parents[3] / "vllm_ascend/attention/sfa_prefill_checkpoint.py"
+    spec = importlib.util.spec_from_file_location("vllm_ascend.attention.sfa_prefill_checkpoint", path)
+    module = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, spec.name, module)
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.fixture
+def worker(parity, checkpoint, monkeypatch):
     env = SimpleNamespace(VLLM_ASCEND_SFA_FULL_GRAPH=True, VLLM_ASCEND_SFA_STAGED_GRAPH=True)
     for name, attributes in {
         "vllm_ascend": {"envs": env},

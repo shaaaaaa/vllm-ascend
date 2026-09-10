@@ -88,6 +88,12 @@ def test_pair_checks_coverage_not_identical_cache_allocation_counts(
                 "rank": rank,
                 "tp_size": 8,
                 "steps": 12,
+                "prefill_steps": 9,
+                "prefill_tokens": driver.PROMPT_TOKENS,
+                "prefill_model_calls": 9 if mode == "eager" else 0,
+                "prefill_imports": 0 if mode == "eager" else 9,
+                "draft_prefill_model_calls": 9 if mode == "eager" else 0,
+                "draft_prefill_imports": 0 if mode == "eager" else 9,
                 "decode_steps": 3,
                 "q2_steps": 3,
                 "draft_calls": 3,
@@ -247,12 +253,18 @@ def test_explicit_devices_define_tp_size(driver, devices, expected):
     assert driver.parse_devices(devices) == expected
 
 
-def reports():
+def reports(mode="eager"):
     return [
         {
             "rank": rank,
             "tp_size": 8,
             "steps": 12,
+            "prefill_steps": 9,
+            "prefill_tokens": 4351,
+            "prefill_model_calls": 9 if mode == "eager" else 0,
+            "prefill_imports": 0 if mode == "eager" else 9,
+            "draft_prefill_model_calls": 9 if mode == "eager" else 0,
+            "draft_prefill_imports": 0 if mode == "eager" else 9,
             "decode_steps": 3,
             "q2_steps": 3,
             "draft_calls": 3,
@@ -263,12 +275,26 @@ def reports():
 
 
 def test_rpc_order_does_not_define_rank_identity(driver):
-    driver.validate_summaries(reports(), list(reversed(reports())), 8)
+    driver.validate_summaries(reports(), list(reversed(reports("graph"))), 8)
 
 
-@pytest.mark.parametrize("kind", ["missing", "duplicate", "world", "step", "no_q2", "no_transfer"])
+@pytest.mark.parametrize(
+    "kind",
+    [
+        "missing",
+        "duplicate",
+        "world",
+        "step",
+        "no_q2",
+        "no_transfer",
+        "prefill_recomputed",
+        "prefill_skipped",
+        "draft_recomputed",
+        "short_prompt",
+    ],
+)
 def test_rank_zero_success_cannot_hide_peer_failure(driver, kind):
-    actual = reports()
+    actual = reports("graph")
     if kind == "missing":
         actual.pop()
     elif kind == "duplicate":
@@ -279,6 +305,14 @@ def test_rank_zero_success_cannot_hide_peer_failure(driver, kind):
         actual[7]["steps"] -= 1
     elif kind == "no_q2":
         actual[7]["q2_steps"] = 0
+    elif kind == "prefill_recomputed":
+        actual[7]["prefill_model_calls"] = 1
+    elif kind == "prefill_skipped":
+        actual[7]["prefill_imports"] = 0
+    elif kind == "draft_recomputed":
+        actual[7]["draft_prefill_model_calls"] = 1
+    elif kind == "short_prompt":
+        actual[7]["prefill_tokens"] -= 1
     else:
         actual[7]["loaded_tokens_per_layer"][5] = 0
     with pytest.raises(AssertionError):
@@ -315,6 +349,7 @@ def test_child_constructs_tp8_not_eight_dp_replicas(driver, monkeypatch, tmp_pat
     assert not config["enable_expert_parallel"]
     assert config["hf_overrides"] == {"num_hidden_layers": 8}
     assert config["speculative_config"]["num_speculative_tokens"] == 1
+    assert config["speculative_config"]["enforce_eager"] is True
     assert not config["compilation_config"]["pass_config"]["enable_sp"]
     assert config["enforce_eager"] == (mode == "eager")
     assert config["worker_cls"].endswith(".SFAParityWorker")

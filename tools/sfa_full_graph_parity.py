@@ -3,9 +3,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Run an isolated eight-layer, TP8/DP1/MTP1 parity test on one eight-NPU host.
 
-No HTTP server/client is needed. The eager process writes reference snapshots;
-the second process compares each target forward as it runs. Temporary reference
-files are managed internally; the only user-facing output is stdout/stderr.
+No HTTP server/client is needed. Prefill computes once in the eager process.
+The graph process imports that checkpoint without executing prefill, then
+compares live decode. Temporary files are managed internally; output is stdout.
 """
 
 import argparse
@@ -206,7 +206,7 @@ def run_child(args: argparse.Namespace) -> None:
         gpu_memory_utilization=0.9,
         seed=0,
         enforce_eager=not graph,
-        speculative_config={"num_speculative_tokens": 1, "method": "deepseek_mtp"},
+        speculative_config={"num_speculative_tokens": 1, "method": "deepseek_mtp", "enforce_eager": True},
         compilation_config={
             "mode": 3 if graph else 0,
             "cudagraph_mode": "PIECEWISE" if graph else "NONE",
@@ -257,7 +257,7 @@ def run_child(args: argparse.Namespace) -> None:
 def validate_summaries(eager: list[dict], graph: list[dict], tp_size: int) -> None:
     """Require every TP rank, irrespective of RPC result ordering."""
     by_mode = []
-    fields = ("steps", "decode_steps", "q2_steps", "draft_calls")
+    fields = ("steps", "prefill_steps", "prefill_tokens", "decode_steps", "q2_steps", "draft_calls")
     for name, reports in (("eager", eager), ("graph", graph)):
         ranks = {report["rank"]: report for report in reports}
         if len(reports) != tp_size or set(ranks) != set(range(tp_size)):
@@ -267,12 +267,36 @@ def validate_summaries(eager: list[dict], graph: list[dict], tp_size: int) -> No
                 raise AssertionError(f"{name}: rank={rank} has inconsistent TP/step coverage")
             if report["decode_steps"] < 2 or report["q2_steps"] < 2 or report["draft_calls"] < 2:
                 raise AssertionError(f"{name}: rank={rank} lacks live decode/Q2/MTP coverage")
+            if (
+                report["prefill_steps"] < 1
+                or report["prefill_tokens"] != PROMPT_TOKENS
+                or report["steps"] != report["prefill_steps"] + report["decode_steps"]
+            ):
+                raise AssertionError(f"{name}: rank={rank} lacks complete single-prefill checkpoint coverage")
+            if name == "eager":
+                valid_prefill = (
+                    report["prefill_model_calls"] == report["prefill_steps"]
+                    and report["prefill_imports"] == 0
+                    and report["draft_prefill_model_calls"] > 0
+                    and report["draft_prefill_imports"] == 0
+                )
+            else:
+                valid_prefill = (
+                    report["prefill_model_calls"] == 0
+                    and report["prefill_imports"] == report["prefill_steps"]
+                    and report["draft_prefill_model_calls"] == 0
+                    and report["draft_prefill_imports"] > 0
+                )
+            if not valid_prefill:
+                raise AssertionError(f"{name}: rank={rank} recomputed or skipped the shared prefill")
             if len(report["loaded_tokens_per_layer"]) != 8 or not all(x > 0 for x in report["loaded_tokens_per_layer"]):
                 raise AssertionError(f"{name}: rank={rank} lacks historical KV coverage in all eight layers")
         by_mode.append(ranks)
     for rank in range(tp_size):
         if any(by_mode[0][rank][k] != by_mode[1][rank][k] for k in fields):
             raise AssertionError(f"rank={rank}: eager/graph execution coverage differs")
+        if by_mode[0][rank]["draft_prefill_model_calls"] != by_mode[1][rank]["draft_prefill_imports"]:
+            raise AssertionError(f"rank={rank}: MTP initial checkpoint coverage differs")
 
 
 def run_pair(
@@ -289,6 +313,7 @@ def run_pair(
     if any(not math.isfinite(value) or value < 0 for value in (atol, rtol)):
         raise ValueError("Tolerances must be finite and nonnegative")
     tp_size = len(parse_devices(devices))
+    print("[SFA_PARITY] scope=target_decode; prefill computes ONCE; graph imports target+MTP checkpoints", flush=True)
     with TemporaryDirectory(prefix="sfa-parity-") as directory:
         for mode in ("preflight", "eager", "graph"):
             subprocess.run(
@@ -320,7 +345,7 @@ def run_pair(
     status = "DIAGNOSTIC PASS (extra probes; original acceptance still required)" if trace_residual else "PASS"
     print(
         f"[SFA_PARITY] {status}: all {tp_size} ranks, 8 target layers, "
-        f"live Q2 replays, historical KV; TP{tp_size}/DP1/MTP1",
+        f"prefill computed once, graph prefill calls=0, live Q2 replays, historical KV; TP{tp_size}/DP1/MTP1",
         flush=True,
     )
 
