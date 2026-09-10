@@ -147,6 +147,11 @@ not a single 64-GB card. Reducing the layer count alone does not guarantee that
 the model fits on one card. The test starts two fresh engines sequentially,
 each using **TP8/DP1**, eight target layers, MTP1 and dummy weights. TP shards the
 weights across the eight cards; DP is not used to replicate the whole model.
+The test reads the original depth from `config.json` and remaps the original
+MTP layer's entire ModelSlim quantization namespace to follow the eight target
+layers, including head, attention, experts and FA/indexer metadata. This is an
+in-memory test fixture adjustment; checkpoint files and normal serving are
+unchanged. Missing original MTP quantization is an error, not a FLOAT fallback.
 First run **both staged/full graph disabled with
 enforce_eager**, then the root graph path. Normal serving is not instrumented.
 For another model directory/device set, the equivalent driver accepts

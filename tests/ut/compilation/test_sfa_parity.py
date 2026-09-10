@@ -30,7 +30,7 @@ def worker(parity, monkeypatch):
         "vllm.distributed": {"get_tp_group": lambda: None},
         "vllm.model_executor.model_loader.dummy_loader": {"DummyModelLoader": type("DummyLoader", (), {})},
         "vllm_ascend.attention.sfa_v1": {"AscendSFAImpl": type("FakeSFAImpl", (), {})},
-        "vllm_ascend.worker.worker": {"NPUWorker": object},
+        "vllm_ascend.worker.worker": {"NPUWorker": type("NPUWorker", (), {})},
     }.items():
         stub = ModuleType(name)
         stub.__dict__.update(attributes)
@@ -42,6 +42,164 @@ def worker(parity, monkeypatch):
     monkeypatch.setitem(sys.modules, spec.name, module)
     spec.loader.exec_module(module)
     return module
+
+
+@pytest.fixture
+def modelslim(worker, monkeypatch):
+    # Import the real parser/metadata/lookup code; only its hardware/model
+    # dependencies are stubbed. No fake successful model inference here.
+    dependencies = {
+        "vllm.config": {"get_current_vllm_config": lambda: None},
+        "vllm.logger": {"logger": SimpleNamespace(info=lambda *args: None)},
+        "vllm.model_executor.layers.attention_layer_base": {"AttentionLayerBase": type("Attention", (), {})},
+        "vllm.model_executor.layers.fused_moe": {"FusedMoE": type("MoE", (), {})},
+        "vllm.model_executor.layers.linear": {"LinearBase": type("Linear", (), {})},
+        "vllm.model_executor.layers.quantization": {"register_quantization_config": lambda name: lambda cls: cls},
+        "vllm.model_executor.layers.quantization.base_config": {
+            "QuantizationConfig": object,
+            "QuantizeMethodBase": object,
+        },
+        "vllm.model_executor.layers.vocab_parallel_embedding": {
+            "UnquantizedEmbeddingMethod": object,
+            "VocabParallelEmbedding": type("Embedding", (), {}),
+        },
+        "vllm.model_executor.models.utils": {"WeightsMapper": object},
+        "vllm_ascend.utils": {"ASCEND_QUANTIZATION_METHOD": "ascend", "calc_split_factor": lambda *args: 1},
+        "vllm_ascend.quantization.methods": {"get_scheme_class": lambda *args: None},
+    }
+    for name, attributes in dependencies.items():
+        stub = ModuleType(name)
+        stub.__dict__.update(attributes)
+        monkeypatch.setitem(sys.modules, name, stub)
+    path = Path(__file__).resolve().parents[3] / "vllm_ascend/quantization/modelslim_config.py"
+    spec = importlib.util.spec_from_file_location("vllm_ascend.quantization.modelslim_config", path)
+    module = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, spec.name, module)
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.mark.parametrize("source", [8, 78, 80])
+@pytest.mark.parametrize("head_quant", ["FLOAT", "W8A8"])
+def test_truncated_mtp_uses_original_quantization_not_decoder_layer_eight(worker, modelslim, source, head_quant):
+    description = {f"model.layers.{i}.self_attn.q_proj.weight": "W8A8" for i in range(9)}
+    description.update(
+        {
+            "fa_quant_type": "C8",
+            "indexer_quant_type": "INT8",
+            "is_rot_used": True,
+            "model.layers.8.indexer.quant_type": "INT8",  # stale dropped target metadata
+            "model.layers.8.decoder_only.weight": "FLOAT",
+            f"model.layers.{source}.shared_head.head.weight": head_quant,
+            f"model.layers.{source}.self_attn.q_proj.weight": "W8A8_DYNAMIC",
+            f"model.layers.{source}.mlp.experts.0.gate_proj.weight_packed": "W4A8_DYNAMIC",
+            f"model.layers.{source}.mlp.experts.0.up_proj.weight_packed": "W4A8_DYNAMIC",
+            f"model.layers.{source}.fa_k.scale": "C8",
+        }
+    )
+    before = description.copy()
+    if source != 8:
+        with pytest.raises(KeyError, match=r"model.layers.8.head.weight"):
+            modelslim.get_linear_quant_type(description, "model.layers.8.head", {})
+    remapped = worker.remap_mtp_quant_description(description, source, 1)
+    config = modelslim.AscendModelSlimConfig(remapped)
+
+    def get_type(prefix, packed=None):
+        return modelslim.get_linear_quant_type(config.quant_description, prefix, packed or {})
+
+    assert get_type("model.layers.8.head") == head_quant
+    assert config.is_layer_skipped_ascend("model.layers.8.head") == (head_quant == "FLOAT")
+    assert get_type("model.layers.8.self_attn.q_proj") == "W8A8_DYNAMIC"
+    assert (
+        get_type("model.layers.8.mlp.experts.0.gate_up_proj", {"gate_up_proj": ["gate_proj", "up_proj"]})
+        == "W4A8_DYNAMIC"
+    )
+    assert config.is_fa_quant_layer("model.layers.8.self_attn")
+    assert config.is_indexer_quant_layer("model.layers.8.self_attn") == (source == 8)
+    if source != 8:
+        assert "model.layers.8.decoder_only.weight" not in config.quant_description
+    for i in range(8):
+        assert get_type(f"model.layers.{i}.self_attn.q_proj") == "W8A8"
+    assert config.quant_description["is_rot_used"] is True
+    assert description == before  # no mutation of the checkpoint description
+
+
+def test_mtp_remap_copies_all_draft_layers_without_prefix_collisions(worker):
+    description = {
+        "model.layers.78.head.weight": "FLOAT",
+        "model.layers.79.head.weight": "W8A8",
+        "model.layers.780.head.weight": "DO_NOT_COPY",
+        "model.layers.8.stale.weight": "FLOAT",
+        "model.layers.9.stale.weight": "FLOAT",
+    }
+    remapped = worker.remap_mtp_quant_description(description, 78, 2)
+    assert remapped["model.layers.8.head.weight"] == "FLOAT"
+    assert remapped["model.layers.9.head.weight"] == "W8A8"
+    assert remapped["model.layers.780.head.weight"] == "DO_NOT_COPY"
+    assert "model.layers.8.stale.weight" not in remapped
+    assert "model.layers.9.stale.weight" not in remapped
+
+
+@pytest.mark.parametrize("source,count", [(7, 1), (True, 1), (78.0, 1), (78, 0), (78, True), (78, 1)])
+def test_bad_or_missing_original_mtp_quantization_fails_closed(worker, source, count):
+    # Even an existing destination head must not hide absent original MTP data.
+    description = {"model.layers.8.head.weight": "FLOAT"}
+    with pytest.raises(ValueError):
+        worker.remap_mtp_quant_description(description, source, count)
+    assert description == {"model.layers.8.head.weight": "FLOAT"}
+
+
+@pytest.mark.parametrize("graph", [False, True])
+def test_worker_remaps_before_model_construction_in_both_modes(worker, modelslim, monkeypatch, tmp_path, graph):
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    checkpoint = '{"num_hidden_layers": 80}'
+    (model_dir / "config.json").write_text(checkpoint)
+    original = modelslim.AscendModelSlimConfig({"model.layers.80.shared_head.head.weight": "FLOAT"})
+    target = SimpleNamespace(
+        model=str(model_dir), hf_config=SimpleNamespace(num_hidden_layers=8), enforce_eager=not graph
+    )
+    subject = worker.SFAParityWorker()
+    subject.model_config = target
+    subject.vllm_config = SimpleNamespace(
+        model_config=target,
+        load_config=SimpleNamespace(load_format="dummy"),
+        quant_config=original,
+        speculative_config=SimpleNamespace(
+            num_speculative_tokens=1,
+            draft_model_config=SimpleNamespace(
+                hf_config=SimpleNamespace(model_type="deepseek_mtp", num_nextn_predict_layers=1)
+            ),
+        ),
+        parallel_config=SimpleNamespace(
+            tensor_parallel_size=8, data_parallel_size=1, pipeline_parallel_size=1, enable_expert_parallel=False
+        ),
+        additional_config={"sfa_parity": {"mode": "graph" if graph else "eager", "reference": str(tmp_path)}},
+    )
+    monkeypatch.setattr(worker.envs, "VLLM_ASCEND_SFA_FULL_GRAPH", graph)
+    monkeypatch.setattr(worker.envs, "VLLM_ASCEND_SFA_STAGED_GRAPH", graph)
+    monkeypatch.setattr(worker, "get_tp_group", lambda: SimpleNamespace(rank_in_group=0, world_size=8))
+    subject._check = lambda check, phase: check()  # coordination is covered by the real Gloo tests
+    original_load = lambda *args: None
+    monkeypatch.setattr(worker.DummyModelLoader, "load_weights", original_load, raising=False)
+
+    class StopBeforeHardware(RuntimeError):
+        pass
+
+    def start_model(self):
+        config = self.vllm_config.quant_config
+        assert config is not original
+        assert modelslim.get_linear_quant_type(config.quant_description, "model.layers.8.head", {}) == "FLOAT"
+        assert self.model_config.hf_config.num_hidden_layers == 8
+        assert self.vllm_config.speculative_config.num_speculative_tokens == 1
+        raise StopBeforeHardware
+
+    monkeypatch.setattr(worker.NPUWorker, "load_model", start_model, raising=False)
+    with pytest.raises(StopBeforeHardware):
+        subject.load_model()
+    assert worker.DummyModelLoader.load_weights is original_load
+    assert "model.layers.8.head.weight" not in original.quant_description
+    assert (model_dir / "config.json").read_text() == checkpoint
 
 
 def test_snapshot_is_a_copy_not_an_alias(parity):

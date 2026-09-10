@@ -36,6 +36,31 @@ QUERY_WIDTH = 2
 HASH_CHUNK_BYTES = 8 * 1024 * 1024
 
 
+def remap_mtp_quant_description(description: dict, source_start: int, num_mtp_layers: int) -> dict:
+    """Move the original MTP quantization namespace into the truncated fixture.
+
+    DeepSeekMTP constructs its layers after the *target* depth (eight here),
+    while the checkpoint description still names them after the original
+    target depth. Replace the whole destination namespace: ordinary decoder
+    layer 8 may have different quantization, including FA/indexer metadata.
+    Never modify the caller's description or invent a FLOAT fallback.
+    """
+    if type(source_start) is not int or source_start < TARGET_LAYERS:
+        raise ValueError("Original model num_hidden_layers must be an integer >= 8")
+    if type(num_mtp_layers) is not int or num_mtp_layers < 1:
+        raise ValueError("The parity fixture requires at least one MTP layer")
+    destinations = tuple(f"model.layers.{TARGET_LAYERS + i}." for i in range(num_mtp_layers))
+    result = {key: value for key, value in description.items() if not key.startswith(destinations)}
+    for offset, destination in enumerate(destinations):
+        source = f"model.layers.{source_start + offset}."
+        if source + "head.weight" not in description and source + "shared_head.head.weight" not in description:
+            raise ValueError(f"Missing original MTP head quantization at {source}; refusing a fallback")
+        result.update(
+            (destination + key[len(source) :], value) for key, value in description.items() if key.startswith(source)
+        )
+    return result
+
+
 def weight_fingerprint(model: torch.nn.Module) -> str:
     """Hash the complete state, not a sample, in bounded CPU chunks."""
     digest = hashlib.sha256()
@@ -249,6 +274,7 @@ class SFAParityWorker(NPUWorker):
             raise ValueError("Parity mode and full-graph flag disagree")
         if not self.parity_is_graph and (envs.VLLM_ASCEND_SFA_STAGED_GRAPH or not self.model_config.enforce_eager):
             raise ValueError("The reference must disable both staged/full graph and enforce eager")
+        self._check(self._prepare_quant_config, "startup MTP quantization")
         original_load = DummyModelLoader.load_weights
 
         def load(loader, model, model_config):
@@ -304,6 +330,30 @@ class SFAParityWorker(NPUWorker):
 
         runner._model_forward = forward
         runner.propose_draft_token_ids = propose
+
+    def _prepare_quant_config(self) -> None:
+        # Test-worker-only import; normal serving keeps the checkpoint config.
+        from vllm_ascend.quantization.modelslim_config import AscendModelSlimConfig
+
+        config = self.vllm_config
+        if (
+            config.load_config.load_format != "dummy"
+            or config.model_config.hf_config.num_hidden_layers != TARGET_LAYERS
+        ):
+            raise ValueError("MTP quantization remapping is only for the eight-layer dummy parity fixture")
+        speculative = config.speculative_config
+        if speculative is None or speculative.num_speculative_tokens != 1:
+            raise ValueError("SFA parity requires MTP=1")
+        draft = speculative.draft_model_config.hf_config
+        if draft.model_type != "deepseek_mtp" or not isinstance(config.quant_config, AscendModelSlimConfig):
+            raise ValueError("SFA parity requires a DeepSeek MTP draft with Ascend ModelSlim quantization")
+        original = json.loads((Path(config.model_config.model) / "config.json").read_text(encoding="utf-8"))
+        description = remap_mtp_quant_description(
+            config.quant_config.quant_description, original["num_hidden_layers"], draft.num_nextn_predict_layers
+        )
+        # Reconstruct to refresh FA/indexer layer lists and shared-head/packed
+        # aliases as well. Existing target layer 0..7 descriptions stay intact.
+        config.quant_config = AscendModelSlimConfig(description)
 
     def _prepare_probes(self):
         runner = self.model_runner
