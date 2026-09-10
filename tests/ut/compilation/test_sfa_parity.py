@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """CPU tests of comparison/probe logic, not evidence of real NPU/model parity."""
 
+import hashlib
 import importlib.util
 import sys
 from pathlib import Path
@@ -425,6 +426,88 @@ def test_dummy_integer_weights_and_fingerprint_are_deterministic(worker):
     assert worker.weight_fingerprint(a) == worker.weight_fingerprint(b)
     b.packed[3, 1] += 1
     assert worker.weight_fingerprint(a) != worker.weight_fingerprint(b)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.int8, torch.int32, torch.int64])
+def test_fingerprint_internal_storage_never_uses_tensor_or_storage_cpu(parity, monkeypatch, dtype):
+    payload = torch.arange(48).to(dtype).reshape(3, 16)
+
+    class InternalTensor:
+        shape, device = payload.shape, SimpleNamespace(type="npu")
+
+        def __init__(self):
+            self.dtype = dtype
+
+        def detach(self):
+            return self
+
+        def is_contiguous(self):
+            return True
+
+        def storage_offset(self):
+            return 0
+
+        def untyped_storage(self):
+            return payload.untyped_storage()
+
+        def numel(self):
+            return payload.numel()
+
+        def element_size(self):
+            return payload.element_size()
+
+        def forbidden(self, *args, **kwargs):
+            raise AssertionError("No slicing, reshaping, conversion or Tensor.cpu on internal-format weights")
+
+        __getitem__ = cpu = split = contiguous = reshape = view = forbidden
+
+    def forbidden_storage_cpu(*args):
+        raise AssertionError("Storage.cpu would reintroduce the NPU format conversion")
+
+    monkeypatch.setattr(torch.UntypedStorage, "cpu", forbidden_storage_cpu)
+    stub = ModuleType("torch_npu")
+    stub.get_npu_format = lambda tensor: 29
+    monkeypatch.setitem(sys.modules, "torch_npu", stub)
+    monkeypatch.setattr(parity, "WEIGHT_HASH_CHUNK_BYTES", 7)
+    model = SimpleNamespace(state_dict=lambda: {"packed": InternalTensor()})
+    expected = hashlib.sha256(f"packed:{dtype}:{tuple(payload.shape)}:format=29".encode())
+    expected.update(payload.reshape(-1).view(torch.uint8).numpy().tobytes())
+    before = parity.weight_fingerprint(model)
+    assert before == expected.hexdigest()
+    payload.reshape(-1)[-1] += 1  # Last byte/chunk cannot be omitted.
+    assert parity.weight_fingerprint(model) != before
+
+
+@pytest.mark.parametrize("kind", ["padding", "offset", "transpose"])
+def test_internal_storage_hash_rejects_padding_and_partial_views(parity, kind):
+    payload = torch.arange(64, dtype=torch.int32).reshape(8, 8)
+    value = {"padding": payload[:7], "offset": payload[1:], "transpose": payload.T}[kind]
+    with pytest.raises(parity.ParityError, match="complete unpadded storage"):
+        parity._weight_bytes_on_cpu(value, 29)
+
+
+@pytest.mark.parametrize("shape", [(), (0,), (0, 3), (2, 0), (3, 5)])
+def test_fingerprint_handles_scalar_empty_and_noncontiguous_cpu_values(parity, shape):
+    payload = torch.ones(shape, dtype=torch.bfloat16)
+    if len(shape) == 2:
+        payload = payload.T
+    model = torch.nn.Module()
+    model.register_buffer("value", payload)
+    same = torch.nn.Module()
+    same.register_buffer("value", payload.contiguous())
+    assert parity.weight_fingerprint(model) == parity.weight_fingerprint(same)
+
+
+def test_fingerprint_error_keeps_tensor_name_and_metadata(parity, monkeypatch):
+    model = torch.nn.Module()
+    model.register_buffer("broken_weight", torch.ones((2, 4), dtype=torch.int32))
+
+    def fail(*args):
+        raise RuntimeError("Identity/TransData failed")
+
+    monkeypatch.setattr(parity, "_weight_bytes_on_cpu", fail)
+    with pytest.raises(parity.ParityError, match=r"name=broken_weight shape=\(2, 4\) dtype=torch.int32.*TransData"):
+        parity.weight_fingerprint(model)
 
 
 @pytest.mark.parametrize(

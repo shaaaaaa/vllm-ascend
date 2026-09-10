@@ -8,7 +8,6 @@ only tensor copies/counter increments, traced into the existing target graph;
 SFA probes run inside existing opaque SFA ops during capture, not live replay.
 """
 
-import hashlib
 import inspect
 import json
 import re
@@ -27,6 +26,7 @@ from vllm_ascend.attention.sfa_parity import (
     compare_step,
     coordinated_check,
     gather_sparse_kv,
+    weight_fingerprint,
 )
 from vllm_ascend.attention.sfa_v1 import AscendSFAImpl
 from vllm_ascend.worker.worker import NPUWorker
@@ -59,21 +59,6 @@ def remap_mtp_quant_description(description: dict, source_start: int, num_mtp_la
             (destination + key[len(source) :], value) for key, value in description.items() if key.startswith(source)
         )
     return result
-
-
-def weight_fingerprint(model: torch.nn.Module) -> str:
-    """Hash the complete state, not a sample, in bounded CPU chunks."""
-    digest = hashlib.sha256()
-    for name, value in sorted(model.state_dict().items()):
-        digest.update(f"{name}:{value.dtype}:{tuple(value.shape)}".encode())
-        value = value.detach()
-        if value.ndim == 0:
-            value = value.reshape(1)
-        stride_bytes = value[0].numel() * value.element_size() if value.shape[0] else 1
-        chunk_rows = max(1, HASH_CHUNK_BYTES // max(1, stride_bytes))
-        for chunk in value.split(chunk_rows):
-            digest.update(chunk.cpu().contiguous().view(torch.uint8).numpy().tobytes())
-    return digest.hexdigest()
 
 
 def deterministic_dummy_load(original, loader, model, model_config) -> None:
@@ -282,6 +267,8 @@ class SFAParityWorker(NPUWorker):
 
         with patch.object(DummyModelLoader, "load_weights", load):
             super().load_model()
+        # Separate pending post-load kernel failures from fingerprint readback.
+        self._check(torch.npu.synchronize, "startup post-load synchronization")
         self._check(self._prepare_probes, "startup weights/probes")
         runner = self.model_runner
         original_forward = runner._model_forward

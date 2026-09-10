@@ -7,12 +7,16 @@ Their device operations can be captured by the target's existing root graph.
 Nothing in this module is enabled by the normal serving worker.
 """
 
+import hashlib
 import math
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
 import torch
+
+WEIGHT_HASH_CHUNK_BYTES = 8 * 1024 * 1024
+NPU_BASE_FORMATS = (0, 2)  # NCHW, ND
 
 
 class ParityError(AssertionError):
@@ -22,6 +26,59 @@ class ParityError(AssertionError):
         super().__init__(message)
         self.label = label
         self.index = index
+
+
+def _weight_bytes_on_cpu(value: torch.Tensor, npu_format: int | None) -> torch.Tensor:
+    """Read without slicing or converting packed NZ weights on the device."""
+    if npu_format is not None and npu_format not in NPU_BASE_FORMATS:
+        storage = value.untyped_storage()
+        # Internal-format padding is not model data and may be uninitialized.
+        # Only hash raw storage when every byte belongs to this tensor. Never
+        # silently include padding, adjacent tensors or skip such a weight.
+        if (
+            not value.is_contiguous()
+            or value.storage_offset() != 0
+            or storage.nbytes() != value.numel() * value.element_size()
+        ):
+            raise ParityError("Internal-format weight must cover complete unpadded storage for bytewise hashing")
+        host_storage = torch.UntypedStorage(storage.nbytes(), device="cpu")
+        # Do NOT use storage.cpu(): torch_npu overrides it to construct a typed
+        # tensor and invoke Tensor.cpu(), reintroducing Identity/TransData.
+        host_storage.copy_(storage, non_blocking=False)
+        return torch.empty(0, dtype=torch.uint8, device="cpu").set_(host_storage)
+    # Ordinary layouts may be views. Copy the whole logical tensor first; all
+    # contiguous/reshape/dtype-view operations below execute on the CPU.
+    return value.cpu().contiguous().reshape(-1).view(torch.uint8)
+
+
+def weight_fingerprint(model: torch.nn.Module) -> str:
+    """Hash every state byte, using at most one host tensor plus a hash chunk.
+
+    Eager and graph must have identical logical metadata and device formats.
+    Packed internal layouts are compared byte-for-byte without a format cast.
+    This startup diagnostic never mutates model weights or executes in replay.
+    """
+    digest = hashlib.sha256()
+    for name, value in sorted(model.state_dict().items()):
+        npu_format = None
+        try:
+            value = value.detach()
+            if value.device.type == "npu":
+                import torch_npu  # Lazy: CPU-only tests need no NPU runtime.
+
+                npu_format = torch_npu.get_npu_format(value)
+            digest.update(f"{name}:{value.dtype}:{tuple(value.shape)}:format={npu_format}".encode())
+            raw = _weight_bytes_on_cpu(value, npu_format)
+            for chunk in raw.split(WEIGHT_HASH_CHUNK_BYTES):
+                digest.update(chunk.numpy().tobytes())
+            # Release the whole host tensor before allocating the next one.
+            del chunk, raw
+        except Exception as exc:
+            raise ParityError(
+                f"weight fingerprint name={name} shape={tuple(value.shape)} dtype={value.dtype} "
+                f"device={value.device} format={npu_format}: {type(exc).__name__}: {exc}"
+            ) from exc
+    return digest.hexdigest()
 
 
 def coordinated_check(check: Callable[[], Any], *, group: Any, phase: str) -> Any:

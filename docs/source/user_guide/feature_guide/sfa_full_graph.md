@@ -175,6 +175,12 @@ only console output needs to be kept. No native rebuild is introduced.
   compared to each other. Integer dummy weights are
   deterministically initialized as part of this test fixture, since the
   upstream dummy loader only initializes floating-point tensors.
+  Internal-format weights are hashed from complete, unpadded storage bytes
+  without slicing or converting their device layout (including packed INT4
+  represented as INT32/NZ). Ordinary tensor views are copied to CPU before
+  hashing. Only one tensor's host copy and an 8-MiB hash chunk are retained;
+  weights are never changed by fingerprinting. Unsupported padded/internal
+  views fail explicitly with the tensor name instead of being skipped.
 - Actual token IDs, positions, sequence lengths and query boundaries before
   every target forward. Target sampling and submitted MTP proposals are fixed
   to the same token. MTP computation and its KV callbacks still execute, but
