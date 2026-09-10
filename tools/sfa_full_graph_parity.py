@@ -9,6 +9,8 @@ files are managed internally; the only user-facing output is stdout/stderr.
 """
 
 import argparse
+import importlib
+import inspect
 import json
 import math
 import os
@@ -23,6 +25,108 @@ PROMPT_TOKENS = 4351  # Beyond the 4096-token MTP scratch prefix, next to a 256 
 OUTPUT_TOKENS = 16
 PREFILL_CHUNK = 512
 FIXED_TOKEN = 100
+
+
+def preflight_dependencies() -> None:
+    """Check the *imported* cross-repo API before either expensive engine starts.
+
+    Run only in a disposable child with the graph environment. LMCache-Ascend
+    patches imports, so this must not pollute the eager reference process.
+    Signature binding does not instantiate connectors or allocate NPU tensors.
+    Native checks verify exports, not hardware/kernel correctness.
+    """
+    modules = {}
+    failures = []
+
+    def load(name):
+        if name not in modules:
+            try:
+                modules[name] = importlib.import_module(name)
+            except Exception as exc:
+                modules[name] = None
+                failures.append(f"{name}: {type(exc).__name__}: {exc}")
+        return modules[name]
+
+    # Match the runtime's Ascend patch ordering before importing LMCache's
+    # adapter; importing its CUDA implementation first is not equivalent.
+    for name in ("vllm", "vllm_ascend", "lmcache_ascend", "lmcache"):
+        load(name)
+
+    # Arguments mirror the production call sites. Do not accept an old
+    # singleton transfer by dropping request_capacity or bind_batch.
+    contracts = (
+        (
+            "lmcache_ascend.v1.npu_connector.sparse_graph",
+            "SparseGraphTransfer",
+            (None, None, 256, 4399),
+            {"request_capacity": 1},
+        ),
+        ("lmcache_ascend.v1.npu_connector.sparse_graph", "SparseGraphTransfer.bind_batch", (None, (), 0), {}),
+        ("lmcache_ascend.v1.npu_connector.sparse_graph", "SparseGraphTransfer.load", (None, None, None, None), {}),
+        (
+            "lmcache_ascend.integration.vllm.lmcache_ascend_connector_v1",
+            "LMCacheAscendConnectorV1Dynamic.prepare_sparse_graph_step",
+            (None, ("layer",)),
+            {"request_ids": ("request",), "frontiers": (4096,), "allow_empty": False},
+        ),
+        (
+            "lmcache.integration.vllm.vllm_v1_adapter",
+            "LMCacheConnectorV1Impl.prepare_sparse_graph_step",
+            (None, ("layer",)),
+            {"request_ids": ("request",), "frontiers": (4096,), "allow_empty": False},
+        ),
+        (
+            "lmcache.v1.gpu_connector.sparse",
+            "PreparedSparseSource",
+            (),
+            {"layers": (), "total_tokens": 0, "chunk_token_counts": (), "pointer_device": None},
+        ),
+        (
+            "lmcache.v1.gpu_connector.sparse",
+            "PreparedSparseSourceLayer",
+            (),
+            {"tensors": (), "chunk_ptrs_npu": None, "memory_objs": ()},
+        ),
+        (
+            "lmcache_ascend.v1.npu_connector.utils",
+            "prepare_sparse_direct_destination_state",
+            (None, None, 6, 0, 0, 0),
+            {},
+        ),
+        (
+            "lmcache_ascend.v1.npu_connector.utils",
+            "sparse_mla_dsa_batched_direct_kv_transfer_prepared",
+            (None, None, None, None, 256, 4608, False, None),
+            {},
+        ),
+    )
+    for module_name, attribute, args, kwargs in contracts:
+        module = load(module_name)
+        if module is None:
+            continue
+        try:
+            target = module
+            for part in attribute.split("."):
+                target = getattr(target, part)
+            inspect.signature(target).bind(*args, **kwargs)
+        except (AttributeError, TypeError, ValueError) as exc:
+            failures.append(f"{module_name}.{attribute}: {exc}")
+
+    native = load("lmcache_ascend.c_ops")
+    if native is not None:
+        for name in ("prepare_sparse_direct_destination_state", "sparse_mla_dsa_batched_direct_kv_transfer_prepared"):
+            if not callable(getattr(native, name, None)):
+                failures.append(f"lmcache_ascend.c_ops.{name}: native export missing; rebuild LMCache-Ascend")
+    paths = "\n".join(f"  {name}: {getattr(module, '__file__', '<import failed>')}" for name, module in modules.items())
+    if failures:
+        raise RuntimeError(
+            "[SFA_PARITY] dependency preflight failed BEFORE model loading:\n  "
+            + "\n  ".join(failures)
+            + f"\nPython: {sys.executable}\nImported modules:\n{paths}\n"
+            "Update all four repos to feat/decode-full-graph and ensure this Python imports those checkouts "
+            "(not stale site-packages). No inference or numerical comparison has run."
+        )
+    print(f"[SFA_PARITY] dependency interfaces OK; Python: {sys.executable}\n{paths}", flush=True)
 
 
 def parse_devices(devices: str) -> tuple[int, ...]:
@@ -180,7 +284,7 @@ def run_pair(
         raise ValueError("Tolerances must be finite and nonnegative")
     tp_size = len(parse_devices(devices))
     with TemporaryDirectory(prefix="sfa-parity-") as directory:
-        for mode in ("eager", "graph"):
+        for mode in ("preflight", "eager", "graph"):
             subprocess.run(
                 [
                     sys.executable,
@@ -198,7 +302,7 @@ def run_pair(
                     "--rtol",
                     str(rtol),
                 ],
-                env=child_environment(mode, devices),
+                env=child_environment("graph" if mode == "preflight" else mode, devices),
                 check=True,
             )
         eager = json.loads(Path(directory, "eager-summary.json").read_text())
@@ -219,10 +323,12 @@ def main() -> None:
     parser.add_argument("--devices", default=DEFAULT_DEVICES)
     parser.add_argument("--atol", type=float, default=1e-7)
     parser.add_argument("--rtol", type=float, default=1e-2)
-    parser.add_argument("--child", choices=("eager", "graph"), help=argparse.SUPPRESS)
+    parser.add_argument("--child", choices=("preflight", "eager", "graph"), help=argparse.SUPPRESS)
     parser.add_argument("--reference", help=argparse.SUPPRESS)
     args = parser.parse_args()
-    if args.child:
+    if args.child == "preflight":
+        preflight_dependencies()
+    elif args.child:
         if not args.reference:
             parser.error("Internal child requires a reference directory")
         run_child(args)

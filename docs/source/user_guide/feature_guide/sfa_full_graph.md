@@ -145,6 +145,20 @@ python -m pytest -q -s --confcutdir=tests/e2e/multicard tests/e2e/multicard/test
 
 This requires the existing native extensions and the local model configuration
 at `/workspace/models/GLM-5.1-w4a8`. It does not need an HTTP server or a client.
+All four repositories (`vllm`, `vllm-ascend`, `LMCache`, `LMCache-Ascend`) must use
+the matching `feat/decode-full-graph` code; updating only vllm-ascend is not
+sufficient. In particular, LMCache-Ascend needs `SparseGraphTransfer`'s
+`request_capacity` argument and `bind_batch`, and both connector layers need
+the ordered `request_ids`/`frontiers` preparation API.
+
+Before either engine starts, an isolated preflight process checks the actual
+imported Python interfaces and required LMCache-Ascend native exports. It
+prints their import paths, so an old installed package cannot be mistaken for
+an updated checkout. Failure stops before loading weights or launching TP
+workers. The preflight neither executes transfer kernels nor proves numerical
+parity. These checks and the request-capacity Python update introduce no new
+native compilation requirement; missing native exports still require a rebuild.
+
 The default is designed for one host with eight 64-GB NPUs (devices 0 through 7),
 not a single 64-GB card. Reducing the layer count alone does not guarantee that
 the model fits on one card. The test starts two fresh engines sequentially,
@@ -226,6 +240,14 @@ benchmark or a proof that the uninstrumented path is race-free.
 The CPU regression tests for the observer/comparator live in
 `tests/ut/compilation/test_sfa_parity.py`. They inject incorrect KV, mapping,
 token and layer data, and verify compiled hooks and stale-probe detection.
+`tests/ut/compilation/test_sfa_transfer_contract.py` executes the actual SFA
+layer preparation method with LMCache's source dataclasses, LMCache-Ascend's
+transfer class and its native Python wrappers from sibling checkouts. It
+covers startup allocation, eight layer indices, request lanes, changing chunk
+tails, empty sources and fixed pointer-table addresses on CPU. Native calls
+and prevalidated attention metadata are fixtures; this is not a kernel test.
+It skips if the sibling repositories are absent. Driver preflight/error-order
+tests are in `tests/ut/tools/test_sfa_full_graph_parity.py`.
 Real CPU/Gloo two- and eight-process failure-agreement tests are in
 `tests/ut/compilation/test_sfa_parity_gloo.py`. They do not replace the real
 eight-NPU/model test above. The small single-card probe replay test remains in

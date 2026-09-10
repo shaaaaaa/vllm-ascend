@@ -6,6 +6,7 @@ import importlib.util
 import json
 import subprocess
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock
@@ -57,11 +58,11 @@ def test_invalid_configuration_never_starts_engine(driver, tmp_path, monkeypatch
 
 def test_eager_failure_stops_before_graph_and_propagates_exit_status(driver, tmp_path, monkeypatch):
     (tmp_path / "config.json").write_text("{}")
-    launch = Mock(side_effect=subprocess.CalledProcessError(1, "eager"))
+    launch = Mock(side_effect=[None, subprocess.CalledProcessError(1, "eager")])
     monkeypatch.setattr(driver.subprocess, "run", launch)
     with pytest.raises(subprocess.CalledProcessError):
         driver.run_pair(str(tmp_path))
-    assert launch.call_count == 1
+    assert launch.call_count == 2
     assert launch.call_args.args[0][3] == "eager"
 
 
@@ -75,6 +76,9 @@ def test_pair_checks_coverage_not_identical_cache_allocation_counts(driver, tmp_
         mode = argv[argv.index("--child") + 1]
         assert argv[argv.index("--devices") + 1] == "0,1,2,3,4,5,6,7"
         assert env["ASCEND_RT_VISIBLE_DEVICES"] == "0,1,2,3,4,5,6,7"
+        if mode == "preflight":
+            assert env["VLLM_ASCEND_SFA_FULL_GRAPH"] == "1"
+            return
         summary = [
             {
                 "rank": rank,
@@ -91,7 +95,138 @@ def test_pair_checks_coverage_not_identical_cache_allocation_counts(driver, tmp_
 
     monkeypatch.setattr(driver.subprocess, "run", launch)
     driver.run_pair(str(tmp_path))
-    assert launches == ["eager", "graph"]
+    assert launches == ["preflight", "eager", "graph"]
+
+
+def test_preflight_failure_never_starts_either_engine(driver, tmp_path, monkeypatch):
+    (tmp_path / "config.json").write_text("{}")
+    launch = Mock(side_effect=subprocess.CalledProcessError(1, "preflight"))
+    monkeypatch.setattr(driver.subprocess, "run", launch)
+    with pytest.raises(subprocess.CalledProcessError):
+        driver.run_pair(str(tmp_path))
+    assert launch.call_count == 1
+    assert launch.call_args.args[0][3] == "preflight"
+
+
+@pytest.fixture
+def dependency_modules(driver, monkeypatch):
+    """API diagnostic tests only; real cross-repo calls have a separate test."""
+
+    class Transfer:
+        def __init__(self, caches, slots, chunk_size, max_tokens, request_capacity=1):
+            raise AssertionError("Preflight must not allocate transfer buffers")
+
+        def bind_batch(self, sources, layer_id):
+            raise AssertionError("Preflight must not bind a source")
+
+        def load(self, selected, counts, slots):
+            raise AssertionError("Preflight must not transfer KV")
+
+    class Connector:
+        def prepare_sparse_graph_step(self, names, *, allow_empty=False, request_ids=None, frontiers=None):
+            raise AssertionError("Preflight must not initialize a connector")
+
+    @dataclass
+    class Source:
+        layers: tuple
+        total_tokens: int
+        chunk_token_counts: tuple = ()
+        pointer_device: object = None
+
+    @dataclass
+    class Layer:
+        tensors: tuple
+        chunk_ptrs_npu: object
+        memory_objs: tuple = ()
+
+    def destination(caches, slots, fmt, k, v, dsa):
+        raise AssertionError("Preflight must not invoke native kernels")
+
+    def transfer(state, slots, selected, ptrs, chunk_size, total_tokens, interleaved, counts=None):
+        raise AssertionError("Preflight must not invoke native kernels")
+
+    attrs = {
+        "lmcache_ascend.v1.npu_connector.sparse_graph": {"SparseGraphTransfer": Transfer},
+        "lmcache_ascend.integration.vllm.lmcache_ascend_connector_v1": {"LMCacheAscendConnectorV1Dynamic": Connector},
+        "lmcache.integration.vllm.vllm_v1_adapter": {"LMCacheConnectorV1Impl": Connector},
+        "lmcache.v1.gpu_connector.sparse": {"PreparedSparseSource": Source, "PreparedSparseSourceLayer": Layer},
+        "lmcache_ascend.v1.npu_connector.utils": {
+            "prepare_sparse_direct_destination_state": destination,
+            "sparse_mla_dsa_batched_direct_kv_transfer_prepared": transfer,
+        },
+        "lmcache_ascend.c_ops": {
+            "prepare_sparse_direct_destination_state": destination,
+            "sparse_mla_dsa_batched_direct_kv_transfer_prepared": transfer,
+        },
+    }
+    modules = {
+        name: SimpleNamespace(__file__=f"/site-packages/{name}.py", **members) for name, members in attrs.items()
+    }
+    modules.update(
+        {
+            name: SimpleNamespace(__file__=f"/{name}/__init__.py")
+            for name in ("vllm", "vllm_ascend", "lmcache_ascend", "lmcache")
+        }
+    )
+    monkeypatch.setattr(driver.importlib, "import_module", modules.__getitem__)
+    return modules
+
+
+def test_preflight_checks_interfaces_without_executing_them(driver, dependency_modules, capsys):
+    driver.preflight_dependencies()
+    assert "dependency interfaces OK" in capsys.readouterr().out
+
+
+def test_preflight_reports_legacy_transfer_and_actual_import_path(driver, dependency_modules):
+    class LegacyTransfer:
+        def __init__(self, caches, slots, chunk_size, max_tokens):
+            raise AssertionError("No device allocations allowed")
+
+        def load(self, selected, counts, slots):
+            pass
+
+    dependency_modules["lmcache_ascend.v1.npu_connector.sparse_graph"].SparseGraphTransfer = LegacyTransfer
+    with pytest.raises(RuntimeError) as error:
+        driver.preflight_dependencies()
+    message = str(error.value)
+    assert "request_capacity" in message and "bind_batch" in message
+    assert "/site-packages/lmcache_ascend.v1.npu_connector.sparse_graph.py" in message
+    assert "BEFORE model loading" in message
+
+
+def test_preflight_collects_adapter_and_native_errors_together(driver, dependency_modules):
+    class LegacyAdapter:
+        def prepare_sparse_graph_step(self, names, *, allow_empty=False):
+            pass
+
+    dependency_modules["lmcache.integration.vllm.vllm_v1_adapter"].LMCacheConnectorV1Impl = LegacyAdapter
+    del dependency_modules["lmcache_ascend.c_ops"].sparse_mla_dsa_batched_direct_kv_transfer_prepared
+    with pytest.raises(RuntimeError) as error:
+        driver.preflight_dependencies()
+    assert "request_ids" in str(error.value)
+    assert "native export missing" in str(error.value)
+
+
+def test_preflight_import_failure_preserves_module_and_exception(driver, dependency_modules, monkeypatch):
+    def load(name):
+        if name == "lmcache_ascend.c_ops":
+            raise ImportError("undefined symbol: broken_binary")
+        return dependency_modules[name]
+
+    monkeypatch.setattr(driver.importlib, "import_module", load)
+    with pytest.raises(RuntimeError, match="lmcache_ascend.c_ops: ImportError: undefined symbol: broken_binary"):
+        driver.preflight_dependencies()
+
+
+def test_preflight_cli_never_enters_inference_child(driver, monkeypatch):
+    preflight = Mock()
+    child = Mock()
+    monkeypatch.setattr(driver, "preflight_dependencies", preflight)
+    monkeypatch.setattr(driver, "run_child", child)
+    monkeypatch.setattr(sys, "argv", ["driver", "--child", "preflight"])
+    driver.main()
+    preflight.assert_called_once_with()
+    child.assert_not_called()
 
 
 @pytest.mark.parametrize("devices", ["", "0,", "-1", "0,0", "0,1,2", "0, 1", "０", "0,a"])
