@@ -3652,6 +3652,37 @@ class NPUModelRunner(GPUModelRunner):
             for request_index in range(batch_size)
         ]
 
+    def _staged_sfa_dummy_seq_len(self, *, requested_seq_len: int, query_width: int) -> int:
+        """Bound synthetic capture data by the model and both logical KV tables.
+
+        The PA workspace heuristic is not a minimum SFA sequence length. SFA
+        keeps sequence lengths as live replay inputs; only its synthetic warmup
+        data is bounded here. Physical pool sizes are checked separately when
+        dummy rows are mapped, since each row reuses one block for its history.
+        """
+        if requested_seq_len <= 0 or query_width <= 0:
+            raise ValueError("Staged SFA dummy sequence length and query width must be positive")
+        block_tables = getattr(self.input_batch.block_table, "block_tables", None)
+        if block_tables is None or len(block_tables) != 2:
+            raise RuntimeError("The staged SFA dummy batch requires exactly two KV block tables")
+        capacity = int(self.max_model_len)
+        for block_table in block_tables:
+            cp_world_size = max(
+                1,
+                int(getattr(block_table, "dcp_world_size", 1))
+                * int(getattr(block_table, "pcp_world_size", 1)),
+            )
+            logical_capacity = (
+                int(block_table.block_table.np.shape[1]) * int(block_table.block_size) * cp_world_size
+            )
+            capacity = min(capacity, logical_capacity)
+        if capacity < query_width:
+            raise RuntimeError(
+                "Staged SFA dummy capacity cannot hold one decode query: "
+                f"capacity={capacity}, query_width={query_width}"
+            )
+        return max(query_width, min(int(requested_seq_len), capacity))
+
     def _prepare_staged_sfa_dummy_block_tables(
         self,
         *,
@@ -3988,18 +4019,22 @@ class NPUModelRunner(GPUModelRunner):
             # seq_lens. We use this seq_len only when capturing graph, and still use max_query_len
             # in inference. This will be removed once npu_fused_infer_attention_score
             # outperforms _npu_paged_attention on all cases.
-            # The staged SFA POC reuses 6144 only as bounded dummy data. Its
-            # indexer/SFA capacity is fixed by the max-model-length block-table
-            # width, while seq_lens remains a live tensor input during replay.
-            # That makes changing lengths plausible, but the torch_npu
-            # lightning-indexer branch still requires live numerical parity.
-            if profile_seq_lens is not None:
+            # Staged SFA also uses this heuristic, but its synthetic positions
+            # must fit the configured context and every logical block table.
+            # seq_lens remains a live tensor input during replay.
+            if staged_sfa_graph_dummy_run:
+                seq_lens = self._staged_sfa_dummy_seq_len(
+                    requested_seq_len=(
+                        profile_seq_lens if profile_seq_lens is not None else SEQ_LEN_WITH_MAX_PA_WORKSPACE
+                    ),
+                    query_width=staged_query_width,
+                )
+            elif profile_seq_lens is not None:
                 seq_lens = profile_seq_lens
             else:
                 seq_lens = (
                     SEQ_LEN_WITH_MAX_PA_WORKSPACE
-                    if staged_sfa_graph_dummy_run
-                    or (
+                    if (
                         is_graph_capturing
                         and using_paged_attention(
                             num_tokens,

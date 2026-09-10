@@ -54,6 +54,9 @@ additional attention-only sequence absorbs padding without extending the last
 real request's causal query length. A 256-token frontier change does not cause
 recapture. Graph-memory profiling uses disposable graphs and source
 tables, cleared before the temporary KV cache is released.
+Synthetic warmup/capture sequence lengths are bounded by `max_model_len` and
+both KV groups' logical block-table capacities. The 6144-token workspace
+heuristic is not a minimum context length; live request lengths are unchanged.
 
 ## Execution contract
 
