@@ -1339,10 +1339,14 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             if fixed_width_decode:
                 computed_layout = computed >= plens_cpu[:n_real]
                 if cold_resumes:
+                    cold_ends = getattr(common_attn_metadata.cold_compact_resumes, "computed_ends", ())
+                    if cold_ends and len(cold_ends) != n_real:
+                        raise RuntimeError("Cold resume frontiers do not match active requests")
+                    expected_cold_ends = np.asarray(cold_ends) if cold_ends else plens_cpu[:n_real] - 1
                     resume_mask = np.asarray(cold_resumes, dtype=bool)
                     computed_layout[resume_mask] = (
                         computed[resume_mask]
-                        == plens_cpu[:n_real][resume_mask] - 1
+                        == expected_cold_ends[resume_mask]
                     )
                 fixed_width_decode = np.all(computed_layout)
             if fixed_width_decode:
@@ -1437,6 +1441,10 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
                     plen = int(plens_cpu[r])
                     first_decode = max(s, s + plen - int(computed[r]))
                     if cold_resumes and cold_resumes[r]:
+                        cold_ends = getattr(common_attn_metadata.cold_compact_resumes, "computed_ends", ())
+                        if cold_ends and len(cold_ends) != n_real:
+                            raise RuntimeError("Cold resume frontiers do not match active requests")
+                        expected_end = int(cold_ends[r]) if cold_ends else plen - 1
                         expected_width = (
                             self.decode_threshold
                             if common_attn_metadata.attn_state
@@ -1445,7 +1453,7 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
                         )
                         if (
                             e - s != expected_width
-                            or int(computed[r]) != plen - 1
+                            or int(computed[r]) != expected_end
                         ):
                             raise RuntimeError(
                                 "Invalid cold-compact resume layout: "

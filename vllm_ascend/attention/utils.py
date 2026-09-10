@@ -20,6 +20,28 @@ from vllm_ascend.utils import (
 
 logger = init_logger(__name__)
 
+
+class ColdResumeMarkers(tuple):
+    """Existing boolean row mask with verified cold-resume KV frontiers.
+
+    Only a cold resume constructs this tuple. Existing metadata copying and
+    unpadding carry its proof without extra fields/checks in ordinary decoding.
+    """
+
+    def __new__(cls, markers: tuple[bool, ...], computed_ends: tuple[int, ...]):
+        result = super().__new__(cls, markers)
+        if len(result) != len(computed_ends):
+            raise ValueError("Cold resume markers and frontiers must have equal lengths")
+        result.computed_ends = tuple(computed_ends)
+        return result
+
+    def __getitem__(self, index):
+        result = super().__getitem__(index)
+        return type(self)(result, self.computed_ends[index]) if isinstance(index, slice) else result
+
+    def __getnewargs__(self):
+        return tuple(self), self.computed_ends
+
 _DSA_LMCACHE_TRACE = envs.VLLM_ASCEND_DSA_LMCACHE_TRACE
 
 

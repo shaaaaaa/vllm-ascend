@@ -11,6 +11,7 @@ from vllm.distributed import get_dp_group, get_ep_group, get_tensor_model_parall
 from vllm.forward_context import BatchDescriptor, get_forward_context, set_forward_context
 
 import vllm_ascend.envs as envs_ascend
+from vllm_ascend.core.mc2_recovery import calculate_mc2_tokens_capacity
 from vllm_ascend.utils import (
     AscendDeviceType,
     StagedSFARouteDecision,
@@ -290,15 +291,7 @@ def set_mc2_tokens_capacity(vllm_config, max_num_reqs, uniform_decode_query_len)
     global _mc2_tokens_capacity
     if _mc2_tokens_capacity is not None:
         return
-    if vllm_config.compilation_config.cudagraph_capture_sizes:
-        max_num_tokens = vllm_config.compilation_config.max_cudagraph_capture_size
-    else:
-        # NOTE: To save memory, we cap the max number of tokens to 512.
-        max_num_tokens = min(max_num_reqs * uniform_decode_query_len, 512)
-    tp_size = vllm_config.parallel_config.tensor_parallel_size
-    # Use integer arithmetic for ceiling division.
-    num_tokens_per_tp_rank = (max_num_tokens + tp_size - 1) // tp_size
-    _mc2_tokens_capacity = num_tokens_per_tp_rank * tp_size
+    _mc2_tokens_capacity = calculate_mc2_tokens_capacity(vllm_config, max_num_reqs, uniform_decode_query_len)
 
 
 def get_mc2_tokens_capacity():

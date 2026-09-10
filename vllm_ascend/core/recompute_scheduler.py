@@ -46,6 +46,8 @@ from vllm.v1.sample.rejection_sampler import PLACEHOLDER_TOKEN_ID
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.utils import ConstantList, record_function_or_nullcontext
 
+from vllm_ascend.core.mc2_recovery import decoder_recovery_budget
+from vllm_ascend.utils import is_moe_model
 from vllm_ascend.serving_perf import (
     cold_perf_enabled,
     is_cold_perf_request,
@@ -81,6 +83,7 @@ def register_ascend_mla_spec_in_manager():
 @dataclass
 class RecomputeSchedulerConfig(SchedulerConfig):
     scheduler_cls: str | type[object] = "vllm_ascend.core.recompute_scheduler.RecomputeScheduler"
+    mc2_recovery_token_budget: int | None = None
 
     @classmethod
     def initialize_from_config(cls, vllm_config: VllmConfig):
@@ -96,6 +99,9 @@ class RecomputeSchedulerConfig(SchedulerConfig):
             scheduler_config["scheduler_cls"] = "vllm_ascend.core.recompute_scheduler.RecomputeScheduler"
         scheduler_config["max_model_len"] = vllm_config.model_config.max_model_len
         scheduler_config["is_encoder_decoder"] = vllm_config.model_config.is_encoder_decoder
+        scheduler_config["mc2_recovery_token_budget"] = (
+            decoder_recovery_budget(vllm_config) if is_moe_model(vllm_config) else None
+        )
         return cls(**scheduler_config)
 
 
@@ -118,6 +124,11 @@ class RecomputeScheduler(Scheduler):
         register_ascend_mla_spec_in_manager()
 
         super().__init__(*args, **kwargs)
+        self.max_num_scheduled_tokens = (
+            getattr(self.scheduler_config, "mc2_recovery_token_budget", None)
+            or self.max_num_scheduled_tokens
+        )
+        self._checkpoint_capture_enabled = bool(getattr(self.connector, "supports_preemption_checkpoint", False))
         # When is_mtp_kv_consumer is true, we will fill request.spec_token_ids
         # with placeholder tokens to enable full graph when decode nodes pull
         # the KV cache of one request from prefill nodes.
@@ -324,6 +335,15 @@ class RecomputeScheduler(Scheduler):
                         else:
                             preempted_req = self.running.pop()
 
+                        if self._checkpoint_capture_enabled and preempted_req.num_output_tokens > 0:
+                            self.connector.prepare_preemption_checkpoint((
+                                preempted_req.request_id,
+                                preempted_req.num_preemptions + 1,
+                                tuple(tuple(ids) for ids in self.kv_cache_manager.get_blocks(
+                                    preempted_req.request_id
+                                ).get_block_ids()),
+                                preempted_req.num_computed_tokens,
+                            ))
                         self._preempt_request(preempted_req, scheduled_timestamp)
                         preempted_reqs.append(preempted_req)
                         if preempted_req == request:
@@ -493,6 +513,15 @@ class RecomputeScheduler(Scheduler):
                     num_new_tokens = 0
                 else:
                     # Number of tokens to be scheduled.
+                    if (
+                        self._checkpoint_capture_enabled
+                        and self.is_mtp_kv_consumer
+                        and getattr(request, "kv_resume_checkpoint", None) == (
+                            request.num_preemptions, request.num_tokens, num_computed_tokens
+                        )
+                        and num_computed_tokens == request.num_tokens - 1
+                    ):
+                        request.spec_token_ids = [PLACEHOLDER_TOKEN_ID] * self.num_spec_tokens
                     # We use `request.num_tokens` instead of
                     # `request.num_prompt_tokens` to consider the resumed
                     # requests, which have output tokens.

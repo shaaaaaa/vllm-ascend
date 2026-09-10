@@ -105,6 +105,29 @@ def _callable_accepts_args(
 
 
 class AscendMultiConnector(MultiConnector, SupportsHMA):
+    def prepare_preemption_checkpoint(self, snapshot: tuple) -> None:
+        """Notify checkpoint children only when the scheduler selects a victim."""
+        for child in self._connectors:
+            if getattr(child, "supports_preemption_checkpoint", False):
+                child.prepare_preemption_checkpoint(snapshot)
+
+    @property
+    def supports_preemption_checkpoint(self) -> bool:
+        """Expose snapshot support without coupling the scheduler to a child."""
+        return any(getattr(child, "supports_preemption_checkpoint", False) for child in self._connectors)
+
+    def handle_preemptions_with_metadata(
+        self, preempted_req_ids: set[str], metadata: MultiKVConnectorMetadata
+    ) -> None:
+        """Avoid binding unrelated children, whose bind can enqueue new I/O."""
+        if not isinstance(metadata, MultiKVConnectorMetadata):
+            raise TypeError("Preemption requires matching MultiConnector metadata")
+        for child, child_metadata in zip(self._connectors, metadata.metadata, strict=True):
+            if getattr(child, "supports_preemption_checkpoint", False):
+                child.handle_preemptions_with_metadata(preempted_req_ids, child_metadata)
+            else:
+                child.handle_preemptions(preempted_req_ids)
+
     # DSA unbundle needs the model runner to pass both latent and indexer KV
     # caches so this connector can route them to different children.
     requires_full_dsa_kv_caches = True

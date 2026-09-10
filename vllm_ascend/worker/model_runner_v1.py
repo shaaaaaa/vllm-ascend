@@ -111,6 +111,7 @@ from vllm_ascend.attention.target_sfa_diagnostics import (
 )
 from vllm_ascend.attention.utils import (
     AscendCommonAttentionMetadata,
+    ColdResumeMarkers,
     get_lmcache_sparse_cached_tokens,
     staged_sfa_connector_supports_sparse_load,
     staged_sfa_metadata_sparse_route,
@@ -760,6 +761,17 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
         set_cos_and_sin(vllm_config, self.max_num_reqs, self.uniform_decode_query_len, self.dtype, self.device)
         set_mc2_tokens_capacity(vllm_config, self.max_num_reqs, self.uniform_decode_query_len)
         set_mc2_mask(vllm_config, self.device)
+        # Model topology, drafter shape and MC2 allocation are fixed at startup.
+        # Do not rediscover the recovery communication contract every step.
+        self._dp_metadata_skip = (
+            self._can_skip_dp_metadata(False),
+            self._can_skip_dp_metadata(True)
+            if (self.speculative_config is not None
+                and self.speculative_config.draft_model_config is not None) else False,
+        )
+        if (getattr(vllm_config.scheduler_config, "mc2_recovery_token_budget", None)
+                and max(self.compilation_config.cudagraph_capture_sizes or (0,)) > get_mc2_tokens_capacity()):
+            raise ValueError("Graph padding exceeds the bounded MC2 allocation")
         self.decode_threshold = 1 + (self.speculative_config.num_speculative_tokens if self.speculative_config else 0)
         if self.decode_threshold in (1, 2):
             (
@@ -906,6 +918,10 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
             registry.release(tuple(scheduler_output.finished_req_ids))
         super()._update_states(scheduler_output)
 
+    def _reject_work_after_preemption_failure(self, *args, **kwargs):
+        """Poison queued execution only after a capture/drain failure."""
+        raise RuntimeError("A prior preemption failed; refusing queued model work before block reuse")
+
     def _prepare_resident_request_state(
         self,
         *,
@@ -1041,13 +1057,16 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
         )
 
     def _skip_all_reduce_across_dp_group(self, is_draft_model=False) -> bool:
+        return self._dp_metadata_skip[is_draft_model]
+
+    def _can_skip_dp_metadata(self, is_draft_model=False) -> bool:
         """
         Decide whether to skip the all-reduce across the data-parallel (DP) group.
 
         Skipping is applicable for all dense models and for moe models only on ranks
         that act as KV consumers. We skip the DP all-reduce when either:
         - Both the prefill and decode communication methods are MC2 (or FUSED_MC2), or
-        - Decode requires MC2 and ascend_config.recompute_scheduler_enable is True.
+        - Decode requires MC2 and the scheduler enforces the MC2 recovery bound.
         """
         # For dense models, since we don't actually need dp communication, we simply skip it.
         # This usually happens when main model is moe while eagle draft model is dense.
@@ -1062,7 +1081,9 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
             return False
 
         def needs_mc2(num_tokens: int) -> bool:
-            return select_moe_comm_method(num_tokens, self.vllm_config) in {MoECommType.MC2, MoECommType.FUSED_MC2}
+            return select_moe_comm_method(num_tokens, self.vllm_config, is_draft_model) in {
+                MoECommType.MC2, MoECommType.FUSED_MC2
+            }
 
         # Determine whether decode must use MC2. Use max cudagraph capture size
         # if available, otherwise use the maximal uniform decode token count.
@@ -1076,9 +1097,27 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
         # batch.
         prefill_must_use_mc2 = needs_mc2(self.vllm_config.scheduler_config.max_num_batched_tokens)
 
-        # Skip all-reduce if decode requires MC2 and either prefill also
-        # requires MC2 or recompute-based scheduler is enabled.
-        return decode_must_use_mc2 and (prefill_must_use_mc2 or self.ascend_config.recompute_scheduler_enable)
+        # A recompute scheduler can still recover locally with kv_both. Only
+        # its explicit token bound justifies skipping DP agreement for recovery.
+        recovery_budget = getattr(self.vllm_config.scheduler_config, "mc2_recovery_token_budget", None)
+        scheduler_cls = self.vllm_config.scheduler_config.scheduler_cls
+        if isinstance(scheduler_cls, type):
+            scheduler_cls = f"{scheduler_cls.__module__}.{scheduler_cls.__name__}"
+        bounded_recovery = (
+            recovery_budget is not None
+            and scheduler_cls in (
+                "vllm_ascend.core.recompute_scheduler.RecomputeScheduler",
+                "vllm_ascend.core.recompute_scheduler.AsyncRecomputeScheduler",
+            )
+            and 0 < recovery_budget <= get_mc2_tokens_capacity()
+            and needs_mc2(recovery_budget)
+            and self.pcp_size == 1
+            and self.dcp_size == 1
+            and self.parallel_config.pipeline_parallel_size == 1
+            and not self.parallel_config.enable_dbo
+            and not getattr(getattr(self, "drafter", None), "needs_extra_input_slots", False)
+        )
+        return decode_must_use_mc2 and (prefill_must_use_mc2 or bounded_recovery)
 
     def _sync_metadata_across_dp(
         self, num_tokens: int, with_prefill: bool = False, is_draft_model: bool = False
@@ -1839,6 +1878,23 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                 logger.warning("RoutedExpertsCapturer is not initialized.")
         if self.execute_model_state is not None:
             raise RuntimeError("State error: sample_tokens() must be called after execute_model() returns None.")
+        if scheduler_output.preempted_req_ids and has_kv_transfer_group():
+            connector = get_kv_transfer_group()
+            try:
+                if (getattr(connector, "supports_preemption_checkpoint", False)
+                        and scheduler_output.kv_connector_metadata is not None):
+                    connector.handle_preemptions_with_metadata(
+                        scheduler_output.preempted_req_ids, scheduler_output.kv_connector_metadata
+                    )
+                else:
+                    # Preserve vLLM's plain hook for other connectors. Binding
+                    # their next-step metadata here can enqueue stores twice.
+                    connector.handle_preemptions(scheduler_output.preempted_req_ids)
+            except BaseException:
+                # Multiprocess workers can receive already queued calls before
+                # EngineCore observes this failure and tears the executor down.
+                self.execute_model = self._reject_work_after_preemption_failure
+                raise
         # self._draft_token_ids is None when `input_fits_in_drafter=False`
         # and there is no draft tokens scheduled. so it need to update the
         # spec_decoding info in scheduler_output with async_scheduling.
@@ -4132,6 +4188,7 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                     if prompt_lens is not None
                     else np.empty(0, dtype=np.int64)
                 )
+                histories = self.input_batch.num_tokens_no_spec[:num_reqs]
                 marker_failures: list[str] = []
                 if query_width != self.decode_threshold:
                     marker_failures.append("query_width")
@@ -4143,13 +4200,15 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                     marker_failures.append("computed_shape")
                 if prompts.shape != (num_reqs,):
                     marker_failures.append("prompt_shape")
+                if histories.shape != (num_reqs,):
+                    marker_failures.append("history_shape")
                 if not marker_failures:
                     for i, resume in enumerate(cold_resumes):
                         if not resume:
                             continue
-                        if int(computed[i]) != int(prompts[i]) - 1:
+                        if int(computed[i]) != int(histories[i]) - 1:
                             marker_failures.append(
-                                f"computed_prompt_minus_one[{i}]"
+                                f"computed_history_minus_one[{i}]"
                             )
                         if frontiers[i] != int(computed[i]):
                             marker_failures.append(
@@ -4174,6 +4233,7 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                     return native(
                         StagedSFARouteReason.COLD_COMPACT_LAYOUT
                     )
+                cold_resumes = ColdResumeMarkers(cold_resumes, frontiers)
         if getattr(self, "calculate_kv_scales", False):
             return native(StagedSFARouteReason.RUNTIME_MODE)
         if getattr(self.vllm_config, "lora_config", None) is not None:
