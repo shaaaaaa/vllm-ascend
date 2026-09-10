@@ -130,3 +130,70 @@ and attention must be in that graph; there must be no target-layer
 `sfa_cross_layer::lmcache_retrieve` Python scopes between replay calls. Draft
 and save callbacks outside the target-forward scope are expected. Startup
 logs and CPU unit tests alone do not prove graph capture or output parity.
+
+## Eight-layer numerical parity (one NPU)
+
+To check data rather than generated text, run from **vllm-ascend**:
+
+```bash
+set -o pipefail
+python -m pytest -q -s --confcutdir=tests/e2e/singlecard tests/e2e/singlecard/test_sfa_full_graph_parity.py 2>&1 | tee log.log
+```
+
+This requires the existing native extensions and the local model configuration
+at `/workspace/models/GLM-5.1-w4a8`. It does not need an HTTP server or a client.
+The test starts two fresh engines sequentially on NPU 0: eight target layers,
+TP1/DP1, MTP1, dummy weights, first **both staged/full graph disabled with
+enforce_eager**, then the root graph path. Normal serving is not instrumented.
+For another model directory/device, the equivalent driver accepts
+`python tools/sfa_full_graph_parity.py --model /path/to/model --device 0`.
+
+The test deliberately uses an isolated local CPU LMCache instead of inheriting
+a server's shared/remote cache. It does not test Mooncake, TP/DP communication,
+request recovery, or generated-language quality. Temporary reference files
+(several GB for the complete prefill) are managed and removed by the driver;
+only console output needs to be kept. No native rebuild is introduced.
+
+### What must match
+
+- Complete target and draft weight fingerprints. Integer dummy weights are
+  deterministically initialized as part of this test fixture, since the
+  upstream dummy loader only initializes floating-point tensors.
+- Actual token IDs, positions, sequence lengths and query boundaries before
+  every target forward. Target sampling and submitted MTP proposals are fixed
+  to the same token. MTP computation and its KV callbacks still execute, but
+  this does **not** test natural draft choices or rejection behavior.
+- Every target layer's hidden/residual inputs and outputs, including all real
+  rows of chunked prefill, followed by the final target hidden states.
+- On decode: Q, logical top-k, history boundary, and the complete K/PE vectors
+  at every valid top-k entry **as attention consumes them**. Physical slots and
+  planner misses are recorded for diagnosis, not compared as numerical results:
+  independently allocated caches can legitimately have different slot numbers
+  and the Q1/bounded-Q2 planners can have different residency decisions.
+
+The 4351-token prompt exceeds the MTP scratch prefix and is adjacent to a
+256-token window boundary. Sixteen forced output tokens exercise repeated Q2
+decode. Each of the eight layers must actually plan historical KV loads, and
+every live target decode must execute exactly **one root replay**. Missing
+probes, stale snapshots, missing eager steps, wrong input tokens, invalid KV
+addresses and NaN/Inf (even on both sides) fail the test. A hardware/model skip
+is not a pass.
+
+All snapshot buffers are allocated before capture. Decoder hooks trace device
+copies into the graph; SFA probes add device operations inside existing opaque
+SFA operators during capture. No new splitting operator or per-layer host fence
+is added. Device counters must advance exactly once for each layer observation
+on each live replay. Reading/comparison happens **after the whole forward**.
+
+The first mismatch reports its step, layer, tensor, coordinate, values, maximum
+absolute/relative error and mismatch count. Integer top-k is compared exactly;
+floating-point defaults are `atol=1e-7, rtol=1e-2`. A top-k difference near tied
+scores is a divergence to investigate, not by itself proof of a graph bug;
+do not automatically loosen tolerances until a test passes. Instrumentation
+adds memory traffic and can change race timing, so this is not a performance
+benchmark or a proof that the uninstrumented path is race-free.
+
+The CPU regression tests for the observer/comparator live in
+`tests/ut/compilation/test_sfa_parity.py`. They inject incorrect KV, mapping,
+token and layer data, and verify compiled hooks and stale-probe detection.
+They do not replace the real NPU/model test above.
