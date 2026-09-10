@@ -225,6 +225,7 @@ def run_child(args: argparse.Namespace) -> None:
                 "token_id": FIXED_TOKEN,
                 "atol": args.atol,
                 "rtol": args.rtol,
+                "trace_residual": getattr(args, "trace_residual", False),
             }
         },
     )
@@ -275,7 +276,12 @@ def validate_summaries(eager: list[dict], graph: list[dict], tp_size: int) -> No
 
 
 def run_pair(
-    model: str = DEFAULT_MODEL, *, devices: str = DEFAULT_DEVICES, atol: float = 1e-7, rtol: float = 1e-2
+    model: str = DEFAULT_MODEL,
+    *,
+    devices: str = DEFAULT_DEVICES,
+    atol: float = 1e-7,
+    rtol: float = 1e-2,
+    trace_residual: bool = False,
 ) -> None:
     """Start two sequential fresh engines, sharing weights across selected NPUs."""
     if not Path(model, "config.json").is_file():
@@ -301,6 +307,7 @@ def run_pair(
                     str(atol),
                     "--rtol",
                     str(rtol),
+                    *(["--trace-residual"] if trace_residual else []),
                 ],
                 env=child_environment("graph" if mode == "preflight" else mode, devices),
                 check=True,
@@ -310,8 +317,9 @@ def run_pair(
         # Different planner layouts can legitimately load different numbers of
         # misses. Both workers separately require positive transfer coverage.
         validate_summaries(eager, graph, tp_size)
+    status = "DIAGNOSTIC PASS (extra probes; original acceptance still required)" if trace_residual else "PASS"
     print(
-        f"[SFA_PARITY] PASS: all {tp_size} ranks, 8 target layers, "
+        f"[SFA_PARITY] {status}: all {tp_size} ranks, 8 target layers, "
         f"live Q2 replays, historical KV; TP{tp_size}/DP1/MTP1",
         flush=True,
     )
@@ -323,6 +331,7 @@ def main() -> None:
     parser.add_argument("--devices", default=DEFAULT_DEVICES)
     parser.add_argument("--atol", type=float, default=1e-7)
     parser.add_argument("--rtol", type=float, default=1e-2)
+    parser.add_argument("--trace-residual", action="store_true", help="Add residual-path probes for mismatch diagnosis")
     parser.add_argument("--child", choices=("preflight", "eager", "graph"), help=argparse.SUPPRESS)
     parser.add_argument("--reference", help=argparse.SUPPRESS)
     args = parser.parse_args()
@@ -333,7 +342,7 @@ def main() -> None:
             parser.error("Internal child requires a reference directory")
         run_child(args)
     else:
-        run_pair(args.model, devices=args.devices, atol=args.atol, rtol=args.rtol)
+        run_pair(args.model, devices=args.devices, atol=args.atol, rtol=args.rtol, trace_residual=args.trace_residual)
 
 
 if __name__ == "__main__":

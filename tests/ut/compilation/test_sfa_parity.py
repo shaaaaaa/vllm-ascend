@@ -4,6 +4,7 @@
 
 import hashlib
 import importlib.util
+import json
 import sys
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -287,6 +288,26 @@ def test_float_tolerance_and_small_signal_error(parity):
         parity.compare_tensor(torch.tensor([1e-5]), torch.tensor([0.0]), label="lost signal")
 
 
+def test_logged_residual_difference_still_fails_with_honest_zero_reference_diagnostic(parity):
+    ref = torch.tensor([-7.724761962890625e-05, 0.0], dtype=torch.bfloat16)
+    val = torch.tensor([-7.82012939453125e-05, 1.7462298274040222e-10], dtype=torch.bfloat16)
+    with pytest.raises(parity.ParityError) as error:
+        parity.compare_tensor(ref, val, label="logged residual")
+    assert error.value.index == (0,)
+    assert "mismatches=1/2" in str(error.value)
+    assert "max_rel_nonzero=0.0123457" in str(error.value)
+    assert "zero_ref_max_abs=1.74623e-10" in str(error.value)
+    assert "dtype=torch.bfloat16" in str(error.value)
+
+
+@pytest.mark.parametrize("value", [0.0, 1e-10])
+def test_zero_reference_metric_does_not_change_absolute_tolerance_gate(parity, value):
+    stats = parity.compare_tensor(torch.zeros(1), torch.tensor([value]), label="near zero")
+    assert stats.max_rel == 0 and stats.zero_ref_max_abs == pytest.approx(value)
+    with pytest.raises(parity.ParityError):
+        parity.compare_tensor(torch.zeros(1), torch.tensor([1e-5]), label="missing signal")
+
+
 def test_integer_difference_is_exact_despite_float_tolerance(parity):
     with pytest.raises(parity.ParityError, match="first_index"):
         parity.compare_tensor(torch.tensor([2048]), torch.tensor([2049]), label="topk", atol=100, rtol=1)
@@ -359,6 +380,48 @@ class TinyDecoder(torch.nn.Module):
         return hidden_states * 2, residual
 
 
+class TinyResidualNorm(torch.nn.Module):
+    """Small CPU hook fixture, including an in-place residual update."""
+
+    def __init__(self):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.ones(4))
+
+    def forward(self, x, residual=None):
+        if residual is None:
+            return x * self.weight
+        residual.add_(x)
+        return residual * self.weight, residual
+
+
+class TinyResidualDecoder(torch.nn.Module):
+    def __init__(self, keyword_norm=True):
+        super().__init__()
+        self.keyword_norm = keyword_norm
+        self.input_layernorm = TinyResidualNorm()
+        self.self_attn = torch.nn.Linear(4, 4, bias=False)
+        with torch.no_grad():
+            self.self_attn.weight.copy_(torch.eye(4) * 2)
+        self.post_attention_layernorm = TinyResidualNorm()
+
+    def forward(self, positions, hidden_states, residual):
+        if residual is None:
+            residual = hidden_states.clone()
+            hidden_states = self.input_layernorm(hidden_states)
+        else:
+            hidden_states, residual = self.input_layernorm(hidden_states, residual)
+        hidden_states = self.self_attn(hidden_states)
+        # Verify that the probe captures the real add operands, not the
+        # attention output before intervening scaling or residual mutations.
+        hidden_states = hidden_states * 0.5
+        residual.mul_(0.25)
+        if self.keyword_norm:
+            hidden_states, residual = self.post_attention_layernorm(x=hidden_states, residual=residual)
+        else:
+            hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        return hidden_states * 3, residual
+
+
 def fake_impl():
     return SimpleNamespace(
         index_topk=2,
@@ -388,6 +451,133 @@ def test_decoder_hooks_are_traceable_tensor_operations(worker):
         assert torch.equal(tensors["layer=0 input.hidden"], x)
         assert torch.equal(tensors["layer=0 output.hidden"], x * 2)
         assert not tensors["layer=0 input.residual"].any()
+
+
+@pytest.mark.parametrize("initial_residual", [None, 2.0])
+@pytest.mark.parametrize("keyword_norm", [False, True])
+def test_fine_residual_hooks_compile_and_copy_before_inplace_mutation(worker, initial_residual, keyword_norm):
+    layer = TinyResidualDecoder(keyword_norm)
+    probes = worker.LayerSnapshots(layer, fake_impl(), 0, 4, torch.device("cpu"), trace_residual=True)
+    compiled = torch.compile(layer, backend="eager", fullgraph=True)
+    pointers = {name: probe.value.data_ptr() for name, probe in probes.probes.items()}
+    with torch.no_grad():
+        for rows in (2, 1, 2):
+            probes.reset()
+            x = torch.arange(rows * 4.0).reshape(rows, 4) + 1
+            residual = None if initial_residual is None else torch.full_like(x, initial_residual)
+            compiled(torch.arange(rows), x, residual)
+            tensors, _ = probes.read(rows, decode=False)
+            norm = x if initial_residual is None else x + initial_residual
+            expected = {
+                "input.hidden": x,
+                "input.residual": torch.zeros_like(x)
+                if initial_residual is None
+                else torch.full_like(x, initial_residual),
+                "input_norm.residual": torch.zeros_like(x) if initial_residual is None else norm,
+                "input_norm.hidden": norm,
+                "attention.output": norm * 2,
+                "post_norm.input.hidden": norm,
+                "post_norm.input.residual": norm * 0.25,
+                "post_norm.output.residual": norm * 1.25,
+                "post_norm.output.hidden": norm * 1.25,
+                "output.residual": norm * 1.25,
+                "output.hidden": norm * 3.75,
+            }
+            assert list(tensors) == [f"layer=0 {name}" for name in expected]
+            for name, value in expected.items():
+                torch.testing.assert_close(tensors[f"layer=0 {name}"], value)
+            assert pointers == {name: probe.value.data_ptr() for name, probe in probes.probes.items()}
+
+
+def test_normal_acceptance_has_no_fine_hooks_or_extra_buffers(worker):
+    layer = TinyResidualDecoder()
+    probes = worker.LayerSnapshots(layer, fake_impl(), 0, 4, torch.device("cpu"))
+    assert not any(name.startswith(("input_norm.", "post_norm.", "attention.")) for name in probes.probes)
+    assert not layer.input_layernorm._forward_hooks
+    assert not layer.self_attn._forward_hooks
+    assert not layer.post_attention_layernorm._forward_hooks
+    assert not layer.post_attention_layernorm._forward_pre_hooks
+
+
+def test_fine_hooks_never_read_host_inside_forward(worker, monkeypatch):
+    layer = TinyResidualDecoder()
+    probes = worker.LayerSnapshots(layer, fake_impl(), 0, 4, torch.device("cpu"), trace_residual=True)
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("No host observation inside forward")
+
+    with torch.no_grad(), monkeypatch.context() as scoped:
+        scoped.setattr(torch.Tensor, "cpu", forbidden)
+        scoped.setattr(torch.Tensor, "item", forbidden)
+        layer(torch.arange(2), torch.ones(2, 4), None)
+    probes.read(2, decode=False)
+
+
+def test_missing_fine_hook_is_not_silently_skipped(worker):
+    layer = TinyResidualDecoder()
+    probes = worker.LayerSnapshots(layer, fake_impl(), 0, 4, torch.device("cpu"), trace_residual=True)
+    with torch.no_grad():
+        layer(torch.arange(2), torch.ones(2, 4), None)
+    probes.probes["post_norm.input.hidden"].reset()
+    with pytest.raises(worker.ParityError, match="post_norm.input.hidden.*one fresh"):
+        probes.read(2, decode=False)
+
+
+def test_fine_hook_does_not_silently_cast_activation_dtype(worker):
+    layer = TinyResidualDecoder()
+    probes = worker.LayerSnapshots(layer, fake_impl(), 0, 4, torch.device("cpu"), trace_residual=True)
+    with pytest.raises(worker.ParityError, match="dtype"):
+        probes.after_attention(layer.self_attn, (), torch.ones(2, 4, dtype=torch.float16))
+
+
+def test_trace_distinguishes_early_small_difference_from_later_threshold_failure(parity):
+    ref, val = make_step(), make_step()
+    for snapshot in (ref, val):
+        snapshot.update(trace_residual=True, decode=False, root_replays=0, runtime_mode="NONE")
+        snapshot["tensors"] = {
+            "layer=0 input.hidden": torch.ones(2, 3),
+            "layer=0 attention.output": torch.ones(2, 3),
+            "layer=2 post_norm.input.hidden": torch.ones(2, 3),
+            "layer=2 post_norm.input.residual": torch.ones(2, 3),
+            "layer=2 post_norm.output.residual": torch.full((2, 3), 2.0),
+        }
+    val["tensors"]["layer=0 attention.output"][0, 0] += 0.001  # Within 1%, but not equal.
+    val["tensors"]["layer=2 post_norm.output.residual"][1, 2] += 0.1
+    with pytest.raises(parity.ParityError) as error:
+        parity.compare_step(ref, val, atol=1e-7, rtol=1e-2)
+    report = parity.residual_trace_report(ref, val, error.value, atol=1e-7, rtol=1e-2)
+    assert report["phase"] == "prefill" and report["root_replays"] == 0
+    first = report["first_numeric_difference"]
+    assert first["name"] == "layer=0 attention.output" and first["abs_error"] < first["limit"]
+    assert [stage["within_tolerance"] for stage in report["stages"]] == [True, True, False]
+    assert report["residual_add"]["eager"]["matches_rounded_sum"]
+    assert not report["residual_add"]["graph"]["matches_rounded_sum"]
+    assert report["residual_add"]["graph"]["index"] == (1, 2)
+    assert report["residual_add"]["graph"]["hidden"] == report["residual_add"]["eager"]["hidden"] == 1
+    assert json.loads(json.dumps(report))["phase"] == "prefill"
+
+
+def test_residual_audit_exposes_changed_operand_with_correct_add_on_both_sides(parity):
+    ref, val = make_step(), make_step()
+    for snapshot, operand in ((ref, 1.0), (val, 1.1)):
+        snapshot["tensors"] = {
+            "layer=2 post_norm.input.hidden": torch.full((2, 3), operand),
+            "layer=2 post_norm.input.residual": torch.ones(2, 3),
+            "layer=2 post_norm.output.residual": torch.full((2, 3), operand) + 1,
+        }
+    error = parity.ParityError("sum differs", label="layer=2 post_norm.output.residual", index=(0, 0))
+    report = parity.residual_trace_report(ref, val, error, atol=1e-7, rtol=1e-2)
+    assert report["first_numeric_difference"]["name"].endswith("input.hidden")
+    for mode in ("eager", "graph"):
+        assert report["residual_add"][mode]["matches_rounded_sum"]
+    assert report["residual_add"]["eager"]["hidden"] != report["residual_add"]["graph"]["hidden"]
+
+
+def test_probe_profile_mismatch_cannot_pass(parity):
+    ref, val = make_step(), make_step()
+    val["trace_residual"] = True
+    with pytest.raises(parity.ParityError, match="probe profiles"):
+        parity.compare_step(ref, val, atol=1e-7, rtol=1e-2)
 
 
 def test_attention_probes_capture_current_kv_and_mask_planner_tail(worker):
@@ -572,16 +762,20 @@ def test_diagnostic_phase_mismatch_fails_closed(parity, monkeypatch):
         parity.coordinated_check(lambda: None, group=group, phase="prepare")
 
 
-def test_eight_rank_weight_manifests_are_isolated(worker, tmp_path):
+@pytest.mark.parametrize("trace_residual", [False, True])
+def test_eight_rank_weight_manifests_are_isolated(worker, tmp_path, trace_residual):
     def subject(rank, graph):
         instance = worker.SFAParityWorker()
         instance.parity_rank, instance.parity_tp_size = rank, 8
         instance.parity_directory = tmp_path / f"rank-{rank}"
         instance.parity_is_graph = graph
+        instance.parity_options = {"trace_residual": trace_residual}
         instance.device = torch.device("cpu")
         instance.vllm_config = SimpleNamespace(scheduler_config=SimpleNamespace(max_num_batched_tokens=4))
         model = torch.nn.Module()
-        model.layers = torch.nn.ModuleList([TinyDecoder() for _ in range(8)])
+        model.layers = torch.nn.ModuleList(
+            [TinyResidualDecoder() if trace_residual else TinyDecoder() for _ in range(8)]
+        )
         for index, layer in enumerate(model.layers):
             layer.attn = torch.nn.Module()
             layer.attn.layer_name = f"layers.{index}.attn"
@@ -601,6 +795,13 @@ def test_eight_rank_weight_manifests_are_isolated(worker, tmp_path):
         eager = subject(rank, False)
         eager._prepare_probes()
         assert eager.model_runner.model_memory_usage > 0
+        assert all(layer.trace_residual == trace_residual for layer in eager.parity_layers)
+        expected_bytes = sum(
+            probe.value.numel() * probe.value.element_size() + probe.writes.numel() * probe.writes.element_size()
+            for layer in eager.parity_layers
+            for probe in layer.probes.values()
+        )
+        assert eager.model_runner.model_memory_usage == expected_bytes
     assert len(list(tmp_path.glob("rank-*/weights.json"))) == 8
     for rank in range(8):
         subject(rank, True)._prepare_probes()
@@ -610,7 +811,10 @@ def test_eight_rank_weight_manifests_are_isolated(worker, tmp_path):
         wrong_rank._prepare_probes()
 
 
-def test_eight_rank_forward_snapshots_compare_only_matching_shards(worker, monkeypatch, tmp_path):
+@pytest.mark.parametrize("trace_residual", [False, True])
+def test_eight_rank_forward_snapshots_compare_only_matching_shards(
+    worker, monkeypatch, tmp_path, capsys, trace_residual
+):
     monkeypatch.setattr(
         torch, "npu", SimpleNamespace(current_stream=lambda: SimpleNamespace(synchronize=lambda: None)), raising=False
     )
@@ -622,7 +826,7 @@ def test_eight_rank_forward_snapshots_compare_only_matching_shards(worker, monke
         instance.parity_directory = tmp_path / f"rank-{rank}"
         instance.parity_directory.mkdir(exist_ok=True)
         instance.parity_is_graph = graph
-        instance.parity_options = {"atol": 0, "rtol": 0}
+        instance.parity_options = {"atol": 0, "rtol": 0, "trace_residual": trace_residual}
         instance.parity_transfers = [0] * 8
         instance.parity_layers = []
         for layer in range(8):
@@ -640,6 +844,7 @@ def test_eight_rank_forward_snapshots_compare_only_matching_shards(worker, monke
     def state(rank):
         result = make_step()
         result["rank"] = rank
+        result["trace_residual"] = trace_residual
         return result
 
     for rank in range(8):
@@ -649,5 +854,15 @@ def test_eight_rank_forward_snapshots_compare_only_matching_shards(worker, monke
         subject(rank, True)._observe_step(state(rank), torch.full((2, 4), float(rank + 1)), 1)
     with pytest.raises(worker.ParityError, match="rank=7 step=2 layer=3"):
         subject(7, True, corrupt=True)._observe_step(state(7), torch.full((2, 4), 8.0), 1)
+    assert ("[SFA_TRACE]" in capsys.readouterr().out) == trace_residual
+    if trace_residual:
+
+        def broken_report(*args, **kwargs):
+            raise RuntimeError("diagnostic failure")
+
+        monkeypatch.setattr(worker, "residual_trace_report", broken_report)
+        with pytest.raises(worker.ParityError, match="rank=7 step=2 layer=3"):
+            subject(7, True, corrupt=True)._observe_step(state(7), torch.full((2, 4), 8.0), 1)
+        assert "diagnostic failed" in capsys.readouterr().out
     with pytest.raises(worker.ParityError, match="expected 1 root replay, got 0"):
         subject(7, True)._observe_step(state(7), torch.full((2, 4), 8.0), 0)

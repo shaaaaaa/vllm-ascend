@@ -9,6 +9,7 @@ Nothing in this module is enabled by the normal serving worker.
 
 import hashlib
 import math
+import re
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
@@ -185,6 +186,7 @@ class TensorDifference:
     max_rel: float
     mismatches: int
     elements: int
+    zero_ref_max_abs: float = 0.0
 
 
 def compare_tensor(
@@ -198,7 +200,8 @@ def compare_tensor(
     """Compare all elements; integers exactly, floats with explicit tolerance.
 
     Even matching NaNs/infinities fail: a broken dummy model is not a reference.
-    Reports the first bad coordinate and the maximum absolute/relative errors.
+    Relative-error diagnostics exclude exact-zero references; those have a
+    separate absolute-error diagnostic. This does not change the tolerance gate.
     """
     if any(not math.isfinite(tolerance) or tolerance < 0 for tolerance in (atol, rtol)):
         raise ValueError("Tolerances must be finite and nonnegative")
@@ -215,9 +218,16 @@ def compare_tensor(
                 raise ParityError(f"{label}: {name} contains NaN/Inf; numerical parity is invalid")
         ref, val = reference.double(), actual.double()
         error = (ref - val).abs()
-        relative = error / ref.abs().clamp_min(torch.finfo(torch.float64).tiny)
+        nonzero = ref != 0
+        relative = torch.where(nonzero, error / torch.where(nonzero, ref.abs(), 1.0), 0.0)
         different = error > atol + rtol * ref.abs()
-        result = TensorDifference(float(error.max()), float(relative.max()), int(different.sum()), ref.numel())
+        result = TensorDifference(
+            float(error.max()),
+            float(relative.max()),
+            int(different.sum()),
+            ref.numel(),
+            float(error.masked_fill(nonzero, 0).max()),
+        )
     else:
         different = reference != actual
         result = TensorDifference(0.0, 0.0, int(different.sum()), reference.numel())
@@ -226,7 +236,9 @@ def compare_tensor(
         raise ParityError(
             f"{label}: first_index={index} eager={reference[index].item()} graph={actual[index].item()} "
             f"mismatches={result.mismatches}/{result.elements} "
-            f"max_abs={result.max_abs:.6g} max_rel={result.max_rel:.6g} atol={atol} rtol={rtol}",
+            f"max_abs={result.max_abs:.6g} max_rel_nonzero={result.max_rel:.6g} "
+            f"zero_ref_max_abs={result.zero_ref_max_abs:.6g} dtype={reference.dtype} "
+            f"atol={atol} rtol={rtol}",
             label=label,
             index=index,
         )
@@ -236,6 +248,8 @@ def compare_tensor(
 def compare_step(reference: dict, actual: dict, *, atol: float, rtol: float) -> None:
     """Fail at the earliest layer/phase, checking step alignment first."""
     label = f"rank={actual['rank']} step={actual['step']}"
+    if reference.get("trace_residual", False) != actual.get("trace_residual", False):
+        raise ParityError(f"{label}: different residual probe profiles")
     for key in ("rank", "tp_size", "step", "decode", "rows", "layers"):
         if reference[key] != actual[key]:
             raise ParityError(f"{label}: incomparable {key}: eager={reference[key]}, graph={actual[key]}")
@@ -245,3 +259,77 @@ def compare_step(reference: dict, actual: dict, *, atol: float, rtol: float) -> 
         raise ParityError(f"{label}: different probe coverage between eager and graph")
     for key, ref in reference["tensors"].items():
         compare_tensor(ref, actual["tensors"][key], label=f"{label} {key}", atol=atol, rtol=rtol)
+
+
+def residual_trace_report(reference: dict, actual: dict, error: ParityError, *, atol: float, rtol: float) -> dict:
+    """Explain a failure from existing CPU snapshots, never inside forward.
+
+    Records the earliest elementwise difference even if within tolerance, then
+    stage statistics in the failing layer. The scalar add audit uses the exact
+    operands at post-attention RMSNorm's call boundary (after any FP16 scaling).
+    It is a diagnostic rounded-add reference, not a replacement model/kernel.
+    """
+    report = {
+        "rank": actual["rank"],
+        "step": actual["step"],
+        "phase": "decode" if actual["decode"] else "prefill",
+        "rows": actual["rows"],
+        "root_replays": actual.get("root_replays"),
+        "runtime_mode": actual.get("runtime_mode"),
+        "first_numeric_difference": None,
+        "failure": str(error),
+        "stages": [],
+    }
+    pairs = [(key, reference[key], actual[key]) for key in ("input_ids", "positions", "seq_lens", "query_ends")]
+    pairs += [(key, ref, actual["tensors"].get(key)) for key, ref in reference["tensors"].items()]
+    match = re.search(r"layer=(\d+) ", error.label)
+    prefix = f"layer={match[1]} " if match else None
+    for name, ref, val in pairs:
+        if val is None or ref.shape != val.shape or ref.dtype != val.dtype or not ref.numel():
+            continue
+        if ref.device.type != "cpu" or val.device.type != "cpu":
+            raise ValueError("Residual trace diagnostics require completed CPU snapshots")
+        needs_first = report["first_numeric_difference"] is None
+        in_layer = prefix is not None and name.startswith(prefix)
+        if not needs_first and not in_layer:
+            continue
+        changed = ref != val
+        count = int(changed.sum())
+        stats = {"name": name, "dtype": str(ref.dtype), "changed": count, "elements": ref.numel()}
+        if count:
+            index = tuple(changed.nonzero()[0].tolist())
+            a, b = ref[index].item(), val[index].item()
+            limit = atol + rtol * abs(a) if ref.is_floating_point() else 0
+            stats.update(index=index, eager=a, graph=b, abs_error=abs(a - b), limit=limit)
+            if needs_first:
+                report["first_numeric_difference"] = dict(stats)
+        if in_layer:
+            try:
+                compare_tensor(ref, val, label=name, atol=atol, rtol=rtol)
+                stats["within_tolerance"] = True
+            except ParityError as stage_error:
+                stats["within_tolerance"] = False
+                stats["detail"] = str(stage_error)
+            report["stages"].append(stats)
+
+    if prefix and error.index and error.label.endswith(("post_norm.output.residual", "output.residual")):
+        audit = {}
+        for mode, snapshot in (("eager", reference), ("graph", actual)):
+            tensors = snapshot["tensors"]
+            names = ("post_norm.input.hidden", "post_norm.input.residual", "post_norm.output.residual")
+            if any(prefix + name not in tensors for name in names):
+                continue
+            x, residual, output = (tensors[prefix + name][error.index] for name in names)
+            total = x.double() + residual.double()
+            rounded = total.to(output.dtype)
+            audit[mode] = {
+                "index": error.index,
+                "hidden": x.item(),
+                "residual": residual.item(),
+                "sum_fp64": total.item(),
+                "rounded_sum": rounded.item(),
+                "observed_sum": output.item(),
+                "matches_rounded_sum": bool(rounded == output),
+            }
+        report["residual_add"] = audit
+    return report

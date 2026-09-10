@@ -66,7 +66,10 @@ def test_eager_failure_stops_before_graph_and_propagates_exit_status(driver, tmp
     assert launch.call_args.args[0][3] == "eager"
 
 
-def test_pair_checks_coverage_not_identical_cache_allocation_counts(driver, tmp_path, monkeypatch):
+@pytest.mark.parametrize("trace_residual", [False, True])
+def test_pair_checks_coverage_not_identical_cache_allocation_counts(
+    driver, tmp_path, monkeypatch, capsys, trace_residual
+):
     (tmp_path / "config.json").write_text("{}")
     launches = []
 
@@ -76,6 +79,7 @@ def test_pair_checks_coverage_not_identical_cache_allocation_counts(driver, tmp_
         mode = argv[argv.index("--child") + 1]
         assert argv[argv.index("--devices") + 1] == "0,1,2,3,4,5,6,7"
         assert env["ASCEND_RT_VISIBLE_DEVICES"] == "0,1,2,3,4,5,6,7"
+        assert ("--trace-residual" in argv) == trace_residual
         if mode == "preflight":
             assert env["VLLM_ASCEND_SFA_FULL_GRAPH"] == "1"
             return
@@ -94,8 +98,9 @@ def test_pair_checks_coverage_not_identical_cache_allocation_counts(driver, tmp_
         (directory / f"{mode}-summary.json").write_text(json.dumps(summary))
 
     monkeypatch.setattr(driver.subprocess, "run", launch)
-    driver.run_pair(str(tmp_path))
+    driver.run_pair(str(tmp_path), trace_residual=trace_residual)
     assert launches == ["preflight", "eager", "graph"]
+    assert ("DIAGNOSTIC PASS" in capsys.readouterr().out) == trace_residual
 
 
 def test_preflight_failure_never_starts_either_engine(driver, tmp_path, monkeypatch):
@@ -281,7 +286,8 @@ def test_rank_zero_success_cannot_hide_peer_failure(driver, kind):
 
 
 @pytest.mark.parametrize("mode", ["eager", "graph"])
-def test_child_constructs_tp8_not_eight_dp_replicas(driver, monkeypatch, tmp_path, mode):
+@pytest.mark.parametrize("trace_residual", [False, True])
+def test_child_constructs_tp8_not_eight_dp_replicas(driver, monkeypatch, tmp_path, mode, trace_residual):
     # Configuration wiring only: this stub is not an inference parity test.
     llm = Mock()
     llm.generate.return_value = [SimpleNamespace(outputs=[SimpleNamespace(token_ids=[driver.FIXED_TOKEN] * 16)])]
@@ -299,6 +305,7 @@ def test_child_constructs_tp8_not_eight_dp_replicas(driver, monkeypatch, tmp_pat
             reference=str(tmp_path),
             atol=1e-7,
             rtol=1e-2,
+            trace_residual=trace_residual,
         )
     )
     config = constructor.call_args.kwargs
@@ -311,3 +318,12 @@ def test_child_constructs_tp8_not_eight_dp_replicas(driver, monkeypatch, tmp_pat
     assert not config["compilation_config"]["pass_config"]["enable_sp"]
     assert config["enforce_eager"] == (mode == "eager")
     assert config["worker_cls"].endswith(".SFAParityWorker")
+    assert config["additional_config"]["sfa_parity"]["trace_residual"] == trace_residual
+
+
+def test_residual_trace_cli_is_forwarded_to_pair(driver, monkeypatch):
+    run = Mock()
+    monkeypatch.setattr(driver, "run_pair", run)
+    monkeypatch.setattr(sys, "argv", ["driver", "--trace-residual"])
+    driver.main()
+    assert run.call_args.kwargs["trace_residual"] is True

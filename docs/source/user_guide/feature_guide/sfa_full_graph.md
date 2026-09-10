@@ -252,3 +252,50 @@ Real CPU/Gloo two- and eight-process failure-agreement tests are in
 `tests/ut/compilation/test_sfa_parity_gloo.py`. They do not replace the real
 eight-NPU/model test above. The small single-card probe replay test remains in
 `tests/e2e/singlecard/test_sfa_parity_probe_npu.py`; it does not load the model.
+
+### Diagnosing a residual mismatch
+
+For a failure such as `step=0 layer=2 output.residual`, run the separate
+fine-probe diagnostic from **vllm-ascend**, still on TP8/DP1:
+
+```bash
+set -o pipefail
+python -m pytest -q -s --confcutdir=tests/e2e/multicard tests/e2e/multicard/test_sfa_residual_trace.py 2>&1 | tee log.log
+```
+
+The equivalent driver option is `--trace-residual`. Both fresh engines use the
+same fine probes and weights. The eager reference still disables staged/full
+graph and compilation; the graph engine keeps its existing compilation and
+fusion configuration. Neither tolerance nor model computation is changed.
+
+In addition to the original layer/attention observations, every target layer
+records input RMSNorm outputs, attention output, both actual operands entering
+post-attention RMSNorm, and its normalized/residual outputs. The operands are
+copied before any in-place update, including after intervening FP16 scaling.
+There are no per-layer host reads, synchronization or diagnostic collectives;
+copies/counters are captured, and analysis runs after the complete forward.
+All extra buffers are included in the worker's memory budget. At BF16/6144
+hidden size and 512 rows, these add about 336 MiB per rank; temporary reference
+files for the entire TP8 run can approach 40 GiB. They are removed by the driver.
+
+On failure, `[SFA_TRACE]` reports the actual phase, row count, root replay count,
+earliest **elementwise difference** (even within tolerance), and stage comparisons
+in the first failing layer. For a residual-output failure it also prints both
+operands, their FP64 sum, the sum rounded to the output dtype, and the observed
+residual at the failing coordinate. This distinguishes changed operands from
+a differing addition result, but does not identify a particular fused kernel
+or prove that a small difference is harmless. Earlier stages passing tolerance
+does not imply bitwise-identical inputs. A first-prefill failure provides no
+live decode replay evidence.
+
+`max_rel_nonzero` excludes exactly-zero reference values; their differences are
+reported as `zero_ref_max_abs`. The pass/fail formula remains
+`abs(actual-reference) <= atol + rtol*abs(reference)` at every element. NaN/Inf,
+missing probes, wrong tokens/top-k/KV and incorrect root replay counts still fail.
+
+Fine probes add observable intermediate values and **can change compiler
+fusion**. A successful diagnostic prints `DIAGNOSTIC PASS`, not an acceptance
+result. If the original mismatch disappears only with these probes, investigate
+fusion/timing effects; the original `test_sfa_full_graph_parity.py` must still
+pass separately. CPU regressions test hook ordering, in-place alias isolation,
+fullgraph traceability, failure localization and the unchanged tolerance gate.

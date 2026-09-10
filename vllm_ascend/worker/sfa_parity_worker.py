@@ -26,6 +26,7 @@ from vllm_ascend.attention.sfa_parity import (
     compare_step,
     coordinated_check,
     gather_sparse_kv,
+    residual_trace_report,
     weight_fingerprint,
 )
 from vllm_ascend.attention.sfa_v1 import AscendSFAImpl
@@ -88,8 +89,11 @@ def deterministic_dummy_load(original, loader, model, model_config) -> None:
 class LayerSnapshots:
     """Fixed buffers for one complete decoder layer and its sparse attention."""
 
-    def __init__(self, layer, impl: AscendSFAImpl, index: int, rows: int, device: torch.device) -> None:
+    def __init__(
+        self, layer, impl: AscendSFAImpl, index: int, rows: int, device: torch.device, *, trace_residual: bool = False
+    ) -> None:
         self.index = index
+        self.trace_residual = trace_residual
         # The first parameter may be packed INT4 weights; activations follow RMSNorm.
         dtype = layer.input_layernorm.weight.dtype
         hidden = layer.input_layernorm.weight.numel()
@@ -101,6 +105,17 @@ class LayerSnapshots:
         for phase in ("input", "output"):
             for component in ("hidden", "residual"):
                 allocate(f"{phase}.{component}", (rows, hidden))
+        if trace_residual:
+            for name in (
+                "input_norm.hidden",
+                "input_norm.residual",
+                "attention.output",
+                "post_norm.input.hidden",
+                "post_norm.input.residual",
+                "post_norm.output.hidden",
+                "post_norm.output.residual",
+            ):
+                allocate(name, (rows, hidden))
         allocate("topk", (QUERY_WIDTH, impl.index_topk), torch.int32)
         allocate("q_nope", (QUERY_WIDTH, impl.local_num_heads, impl.kv_lora_rank))
         allocate("q_pe", (QUERY_WIDTH, impl.local_num_heads, impl.qk_rope_head_dim))
@@ -119,6 +134,13 @@ class LayerSnapshots:
         # root replay the recorded copy_ and add_ operations refresh the probes.
         layer.register_forward_pre_hook(self.before_layer, with_kwargs=True)
         layer.register_forward_hook(self.after_layer)
+        if trace_residual:
+            # These extra observable values can affect compiler fusion. Keep
+            # this opt-in diagnosis separate from the original acceptance run.
+            layer.input_layernorm.register_forward_hook(self.after_input_norm)
+            layer.self_attn.register_forward_hook(self.after_attention)
+            layer.post_attention_layernorm.register_forward_pre_hook(self.before_post_norm, with_kwargs=True)
+            layer.post_attention_layernorm.register_forward_hook(self.after_post_norm)
         self.install_sfa_probes(impl)
 
     def before_layer(self, module, args, kwargs) -> None:
@@ -134,6 +156,36 @@ class LayerSnapshots:
         hidden, residual = output
         self.probes["output.hidden"].write(hidden)
         self.probes["output.residual"].write(residual)
+
+    def _write_trace(self, name, value) -> None:
+        probe = self.probes[name]
+        if value.ndim != 2 or value.dtype != probe.value.dtype:
+            raise ParityError(f"Residual probe {name} requires a 2D activation of dtype {probe.value.dtype}")
+        probe.write(value)
+
+    def after_input_norm(self, module, args, output) -> None:
+        if isinstance(output, tuple):
+            hidden, residual = output
+            self._write_trace("input_norm.residual", residual)
+        else:
+            # First decoder layer calls RMSNorm without a residual operand.
+            hidden = output
+            self.probes["input_norm.residual"].write_absent()
+        self._write_trace("input_norm.hidden", hidden)
+
+    def after_attention(self, module, args, output) -> None:
+        self._write_trace("attention.output", output)
+
+    def before_post_norm(self, module, args, kwargs) -> None:
+        hidden = kwargs["x"] if "x" in kwargs else args[0]
+        residual = kwargs["residual"] if "residual" in kwargs else args[1]
+        self._write_trace("post_norm.input.hidden", hidden)
+        self._write_trace("post_norm.input.residual", residual)
+
+    def after_post_norm(self, module, args, output) -> None:
+        hidden, residual = output
+        self._write_trace("post_norm.output.residual", residual)
+        self._write_trace("post_norm.output.hidden", hidden)
 
     def install_sfa_probes(self, impl: AscendSFAImpl) -> None:
         indexer = impl.indexer_select_post_process
@@ -193,6 +245,8 @@ class LayerSnapshots:
         values, addresses = {}, {}
         # Numerical data in execution order, so the first mismatch is useful.
         names = ["input.hidden", "input.residual"]
+        if self.trace_residual:
+            names += ["input_norm.residual", "input_norm.hidden"]
         if decode:
             names += [
                 "q_nope",
@@ -209,7 +263,15 @@ class LayerSnapshots:
                 "remapped_topk",
                 "target_slots",
             ]
-        names += ["output.hidden", "output.residual"]
+        if self.trace_residual:
+            names += [
+                "attention.output",
+                "post_norm.input.hidden",
+                "post_norm.input.residual",
+                "post_norm.output.residual",
+                "post_norm.output.hidden",
+            ]
+        names += ["output.residual", "output.hidden"]
         for name in names:
             label = f"layer={self.index} {name}"
             count = 1 if name in ("miss_count", "miss_tokens", "target_slots") else rows
@@ -375,7 +437,12 @@ class SFAParityWorker(NPUWorker):
             self.parity_attention_names.append(attn_name)
             self.parity_layers.append(
                 LayerSnapshots(
-                    layer, impl, int(match[1]), self.vllm_config.scheduler_config.max_num_batched_tokens, self.device
+                    layer,
+                    impl,
+                    int(match[1]),
+                    self.vllm_config.scheduler_config.max_num_batched_tokens,
+                    self.device,
+                    trace_residual=getattr(self, "parity_options", {}).get("trace_residual", False),
                 )
             )
         if [layer.index for layer in self.parity_layers] != list(range(TARGET_LAYERS)):
@@ -404,6 +471,8 @@ class SFAParityWorker(NPUWorker):
             "decode": decode,
             "rows": rows,
             "layers": TARGET_LAYERS,
+            "trace_residual": self.parity_options.get("trace_residual", False),
+            "runtime_mode": str(getattr(context, "cudagraph_runtime_mode", None)),
             "input_ids": inputs["input_ids"][:rows].detach().cpu().clone(),
             "positions": inputs["positions"][:rows].detach().cpu().clone(),
             "seq_lens": metadata.seq_lens[:1].detach().cpu().clone(),
@@ -415,6 +484,7 @@ class SFAParityWorker(NPUWorker):
 
     def _observe_step(self, state, result, replays):
         rows, decode = state["rows"], state["decode"]
+        state["root_replays"] = replays
         if decode and replays != int(self.parity_is_graph):
             raise ParityError(
                 f"step={self.parity_step}: expected {int(self.parity_is_graph)} root replay, got {replays}"
@@ -437,6 +507,20 @@ class SFAParityWorker(NPUWorker):
             try:
                 compare_step(reference, state, atol=self.parity_options["atol"], rtol=self.parity_options["rtol"])
             except ParityError as error:
+                if self.parity_options.get("trace_residual", False):
+                    # Read/format only after the complete forward. A diagnostic
+                    # failure must not replace the original parity failure.
+                    try:
+                        report = residual_trace_report(
+                            reference,
+                            state,
+                            error,
+                            atol=self.parity_options["atol"],
+                            rtol=self.parity_options["rtol"],
+                        )
+                        print("[SFA_TRACE] " + json.dumps(report), flush=True)
+                    except Exception as diagnostic_error:
+                        print(f"[SFA_TRACE] rank={self.parity_rank} diagnostic failed: {diagnostic_error}", flush=True)
                 self._log_mapping_error(error, reference, state)
                 raise
         else:
