@@ -331,6 +331,7 @@ class SFAParityWorker(NPUWorker):
         self.parity_last_target_decode = None
         self.parity_last_target_step = None
         self.parity_decode_steps = 0
+        self.parity_decode_observations = 0
         self.parity_q2_steps = 0
         self.parity_draft_calls = 0
         self.parity_transfers = [0] * TARGET_LAYERS
@@ -362,15 +363,7 @@ class SFAParityWorker(NPUWorker):
 
         def propose(*args, **kwargs):
             tokens = original_propose(*args, **kwargs)
-
-            def fix_tokens():
-                if not isinstance(tokens, torch.Tensor) or tokens.shape[-1] != 1:
-                    raise ParityError("MTP did not produce one draft token per request")
-                self.parity_draft_calls += 1
-                # Only the choice is overridden. Draft computation/KV callbacks run.
-                return torch.full_like(tokens, options["token_id"])
-
-            return self._check(fix_tokens, f"step={self.parity_step} after draft")
+            return self._check(lambda: self._parity_draft_tokens(tokens), f"step={self.parity_step} after draft")
 
         runner._model_forward = forward
         runner.propose_draft_token_ids = propose
@@ -380,6 +373,17 @@ class SFAParityWorker(NPUWorker):
             return self._parity_draft_forward(original_draft, model_kwargs, **kwargs)
 
         runner.drafter._run_mtp_draft_layer_with_diagnostics = draft
+
+    def _parity_draft_tokens(self, tokens):
+        if not isinstance(tokens, torch.Tensor) or tokens.ndim < 1 or tokens.shape[-1] != 1:
+            raise ParityError("MTP did not produce one draft token per request")
+        self.parity_draft_calls += 1
+        if self.parity_options.get("compare_output", False):
+            # Output comparison must keep the model's real proposals. Returning
+            # a fixed token here could conceal acceptance/output differences.
+            return tokens
+        # Only the choice is overridden in the original layer-parity test.
+        return torch.full_like(tokens, self.parity_options["token_id"])
 
     def _parity_forward(self, original_forward, signature, *args, **kwargs):
         runner = self.model_runner
@@ -416,9 +420,10 @@ class SFAParityWorker(NPUWorker):
             raise ParityError("Prefill checkpoint import must not replay the target graph")
         if self.parity_is_graph and self.parity_rank == 0:
             if state["decode"]:
+                status = "OBSERVED (output-only)" if self.parity_options.get("compare_output", False) else "PASS"
                 print(
                     f"[SFA_PARITY] step={self.parity_step} phase=decode rows={state['rows']} "
-                    f"ranks={self.parity_tp_size} layers=8 PASS replay_per_rank={replays}",
+                    f"ranks={self.parity_tp_size} layers=8 {status} replay_per_rank={replays}",
                     flush=True,
                 )
             else:
@@ -718,6 +723,19 @@ class SFAParityWorker(NPUWorker):
                 self.parity_transfers[layer.index] += int(addresses[f"layer={layer.index} miss_count"].sum())
         final_hidden = result[0] if isinstance(result, tuple) else result
         state["tensors"]["target.final_hidden"] = final_hidden[:rows].detach().cpu().clone()
+        if self.parity_options.get("compare_output", False):
+            # Free-running target/draft tokens can diverge, so step N need not
+            # have the same prefix or speculative rows in the two processes.
+            # Do not compare those states or force them back into alignment.
+            # Keep observation freshness, address and replay checks above, and
+            # reject invalid numerical data independently on each side.
+            for name, value in state["tensors"].items():
+                if not value.numel():
+                    raise ParityError(f"{name}: empty output-mode observation")
+                if value.is_floating_point() and not torch.isfinite(value).all():
+                    raise ParityError(f"{name}: output-mode observation contains NaN/Inf")
+            self.parity_decode_observations += 1
+            return
         path = self.parity_directory / f"step-{self.parity_step:06d}.pt"
         if self.parity_is_graph:
             if not path.is_file():
@@ -793,9 +811,14 @@ class SFAParityWorker(NPUWorker):
         )
         if actual_counts != expected_counts:
             raise ParityError(f"Prefill must compute once, then import: {actual_counts} != {expected_counts}")
-        expected_steps = len(list(self.parity_directory.glob("step-*.pt"))) + expected_prefills
-        if self.parity_step != expected_steps:
-            raise ParityError(f"Incomplete step comparison: {self.parity_step} != {expected_steps}")
+        compare_output = self.parity_options.get("compare_output", False)
+        if compare_output:
+            if self.parity_decode_observations != self.parity_decode_steps:
+                raise ParityError("Incomplete output-mode decode observation coverage")
+        else:
+            expected_steps = len(list(self.parity_directory.glob("step-*.pt"))) + expected_prefills
+            if self.parity_step != expected_steps:
+                raise ParityError(f"Incomplete step comparison: {self.parity_step} != {expected_steps}")
         return {
             "rank": self.parity_rank,
             "tp_size": self.parity_tp_size,
@@ -810,4 +833,6 @@ class SFAParityWorker(NPUWorker):
             "q2_steps": self.parity_q2_steps,
             "draft_calls": self.parity_draft_calls,
             "loaded_tokens_per_layer": self.parity_transfers,
+            "compare_output": compare_output,
+            "decode_observations": getattr(self, "parity_decode_observations", 0),
         }

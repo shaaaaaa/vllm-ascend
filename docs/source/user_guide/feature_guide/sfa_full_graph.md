@@ -209,6 +209,42 @@ EP, request recovery, or generated-language quality. Temporary prefill checkpoin
 and decode references are managed and removed by the driver;
 only console output needs to be kept. No native rebuild is introduced.
 
+### Comparing actual generated output
+
+To finish both generations without stopping at intermediate tolerance
+differences, run from **vllm-ascend** on the same eight-NPU host:
+
+```bash
+set -o pipefail
+python tools/sfa_full_graph_parity.py --compare-output 2>&1 | tee log.log
+```
+
+This still uses eight target layers, dummy weights, TP8/DP1/MTP1 and **one
+computed prefill** imported by the graph engine. Both modes then generate
+16 tokens greedily (`temperature=0`). Unlike the layer-parity test, there is
+**no target vocabulary restriction and no replacement of MTP's proposed
+tokens**. EOS is ignored for this fixed-length diagnostic. Actual token IDs and
+decoded text (including special tokens) are printed under `[SFA_OUTPUT]`.
+
+In this mode, intermediate tensors are checked for freshness, invalid KV
+addresses and NaN/Inf, but are **not** compared across modes or tolerance-gated.
+Every graph decode must still execute one root replay on every rank, and every
+layer must exercise historical KV loads. Both generations run to completion
+before the driver compares their complete output token sequences and text.
+Natural MTP acceptance can give different forward counts; the driver does not
+force their decode histories or step counts back into alignment. The original
+layer-parity mode and its tolerances are unchanged. `--compare-output` cannot
+be combined with `--trace-residual`, which adds fusion-affecting fine probes.
+
+`OUTPUT MATCH` means this case's generated tokens and text match, **not** that
+all intermediate tensors match or that the implementation is generally
+correct. `OUTPUT DIFFERENT` reports the first differing token (one-based) and
+returns a failing exit status after printing both completed outputs. Different
+outputs establish an observable divergence, not its cause: near-tied logits
+and implementation errors still require further diagnosis. Identical decoded
+text alone cannot hide differing token IDs. Runtime/coverage failures remain
+failures, never an output match. No native rebuild is needed for this mode.
+
 ### What must match
 
 - Complete target and draft weight fingerprints **for each matching TP rank**.

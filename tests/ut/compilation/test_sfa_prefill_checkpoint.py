@@ -320,20 +320,32 @@ def test_actual_sfa_cache_binding_preserves_groups_and_excludes_capture_dummy_st
 
 
 @pytest.mark.parametrize("graph", [False, True])
-def test_final_gate_requires_zero_graph_prefill_compute_and_real_decode(worker, tmp_path, graph):
+@pytest.mark.parametrize("compare_output", [False, True])
+def test_final_gate_requires_zero_graph_prefill_compute_and_real_decode(worker, tmp_path, graph, compare_output):
     subject = worker.SFAParityWorker()
     subject.parity_directory = tmp_path
     subject.parity_is_graph = graph
     subject.parity_rank, subject.parity_tp_size = 0, 8
     subject.parity_step, subject.parity_prefill_steps, subject.parity_prefill_tokens = 3, 1, 4351
     subject.parity_decode_steps = subject.parity_q2_steps = subject.parity_draft_calls = 2
+    subject.parity_options = {"compare_output": compare_output}
+    subject.parity_decode_observations = 2
     subject.parity_transfers = [10] * 8
     subject.parity_prefill_model_calls = subject.parity_draft_prefill_model_calls = int(not graph)
     subject.parity_prefill_imports = subject.parity_draft_prefill_imports = int(graph)
-    for name in ("target-prefill-000000.pt", "draft-prefill-000000.pt", "step-000001.pt", "step-000002.pt"):
+    names = ["target-prefill-000000.pt", "draft-prefill-000000.pt"]
+    if not compare_output:
+        names += ["step-000001.pt", "step-000002.pt"]
+    for name in names:
         (tmp_path / name).touch()
     summary = subject._local_summary()
     assert summary["prefill_model_calls"] == int(not graph)
+    assert summary["compare_output"] == compare_output
+    if compare_output:
+        subject.parity_decode_observations -= 1
+        with pytest.raises(worker.ParityError, match="observation coverage"):
+            subject._local_summary()
+        subject.parity_decode_observations += 1
     subject.parity_prefill_model_calls += 1
     with pytest.raises(worker.ParityError, match="compute once"):
         subject._local_summary()

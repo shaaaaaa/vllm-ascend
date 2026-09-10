@@ -186,6 +186,7 @@ def run_child(args: argparse.Namespace) -> None:
     from vllm import LLM, SamplingParams
 
     graph = args.child == "graph"
+    compare_output = getattr(args, "compare_output", False)
     tp_size = len(parse_devices(args.devices))
     llm = LLM(
         model=args.model,
@@ -226,12 +227,13 @@ def run_child(args: argparse.Namespace) -> None:
                 "atol": args.atol,
                 "rtol": args.rtol,
                 "trace_residual": getattr(args, "trace_residual", False),
+                "compare_output": compare_output,
             }
         },
     )
     # Explicit token IDs remove tokenizer/chat-template ambiguity. Varied prompt
-    # IDs avoid a degenerate repeated-token cache. Accepted and proposed tokens
-    # are fixed independently, while both target and MTP computation still run.
+    # IDs avoid a degenerate repeated-token cache. The default layer test fixes
+    # target/proposed tokens; output comparison keeps BOTH choices unrestricted.
     prompt = {"prompt_token_ids": [FIXED_TOKEN + i % 257 for i in range(PROMPT_TOKENS)]}
     outputs = llm.generate(
         prompt,
@@ -241,20 +243,30 @@ def run_child(args: argparse.Namespace) -> None:
             max_tokens=OUTPUT_TOKENS,
             min_tokens=OUTPUT_TOKENS,
             ignore_eos=True,
-            allowed_token_ids=[FIXED_TOKEN],
-            detokenize=False,
+            allowed_token_ids=None if compare_output else [FIXED_TOKEN],
+            detokenize=compare_output,
+            skip_special_tokens=False,
         ),
         use_tqdm=False,
     )
-    tokens = outputs[0].outputs[0].token_ids
-    if list(tokens) != [FIXED_TOKEN] * OUTPUT_TOKENS:
+    output = outputs[0].outputs[0]
+    tokens = list(output.token_ids)
+    if len(tokens) != OUTPUT_TOKENS:
+        raise AssertionError(f"Incomplete generation: {len(tokens)}/{OUTPUT_TOKENS} tokens")
+    if not compare_output and tokens != [FIXED_TOKEN] * OUTPUT_TOKENS:
         raise AssertionError(f"Teacher-forced target tokens were not honored: {tokens}")
     summary = llm.collective_rpc("parity_summary")
     Path(args.reference, f"{args.child}-summary.json").write_text(json.dumps(summary))
-    print(f"[SFA_PARITY] {args.child}: {summary}", flush=True)
+    if compare_output:
+        Path(args.reference, f"{args.child}-output.json").write_text(
+            json.dumps({"token_ids": tokens, "text": output.text, "finish_reason": output.finish_reason}),
+            encoding="utf-8",
+        )
+    else:
+        print(f"[SFA_PARITY] {args.child}: {summary}", flush=True)
 
 
-def validate_summaries(eager: list[dict], graph: list[dict], tp_size: int) -> None:
+def validate_summaries(eager: list[dict], graph: list[dict], tp_size: int, *, compare_output: bool = False) -> None:
     """Require every TP rank, irrespective of RPC result ordering."""
     by_mode = []
     fields = ("steps", "prefill_steps", "prefill_tokens", "decode_steps", "q2_steps", "draft_calls")
@@ -263,6 +275,10 @@ def validate_summaries(eager: list[dict], graph: list[dict], tp_size: int) -> No
         if len(reports) != tp_size or set(ranks) != set(range(tp_size)):
             raise AssertionError(f"{name}: incomplete/duplicate TP rank coverage: {[r['rank'] for r in reports]}")
         for rank, report in ranks.items():
+            if report.get("compare_output", False) != compare_output:
+                raise AssertionError(f"{name}: rank={rank} used the wrong output/layer comparison mode")
+            if compare_output and report.get("decode_observations") != report["decode_steps"]:
+                raise AssertionError(f"{name}: rank={rank} lacks complete decode observations")
             if report["tp_size"] != tp_size or any(report[k] != ranks[0][k] for k in fields):
                 raise AssertionError(f"{name}: rank={rank} has inconsistent TP/step coverage")
             if report["decode_steps"] < 2 or report["q2_steps"] < 2 or report["draft_calls"] < 2:
@@ -292,11 +308,41 @@ def validate_summaries(eager: list[dict], graph: list[dict], tp_size: int) -> No
             if len(report["loaded_tokens_per_layer"]) != 8 or not all(x > 0 for x in report["loaded_tokens_per_layer"]):
                 raise AssertionError(f"{name}: rank={rank} lacks historical KV coverage in all eight layers")
         by_mode.append(ranks)
+    # Natural MTP proposals/acceptance can change the number of forwards, even
+    # for identical final tokens. Require common prefill, not forced alignment.
+    shared_fields = ("prefill_steps", "prefill_tokens") if compare_output else fields
     for rank in range(tp_size):
-        if any(by_mode[0][rank][k] != by_mode[1][rank][k] for k in fields):
+        if any(by_mode[0][rank][k] != by_mode[1][rank][k] for k in shared_fields):
             raise AssertionError(f"rank={rank}: eager/graph execution coverage differs")
         if by_mode[0][rank]["draft_prefill_model_calls"] != by_mode[1][rank]["draft_prefill_imports"]:
             raise AssertionError(f"rank={rank}: MTP initial checkpoint coverage differs")
+
+
+def compare_generated_outputs(eager: dict, graph: dict) -> dict:
+    """Compare actual greedy generations, never a teacher-forced token stream."""
+    for mode, output in (("eager", eager), ("graph", graph)):
+        tokens = output.get("token_ids")
+        if (
+            not isinstance(tokens, list)
+            or len(tokens) != OUTPUT_TOKENS
+            or any(type(token) is not int or token < 0 for token in tokens)
+            or not isinstance(output.get("text"), str)
+        ):
+            raise AssertionError(f"{mode}: missing/invalid complete generation")
+    first = next(
+        (
+            {"token_number": index + 1, "eager": a, "graph": b}
+            for index, (a, b) in enumerate(zip(eager["token_ids"], graph["token_ids"]))
+            if a != b
+        ),
+        None,
+    )
+    return {
+        "tokens_equal": first is None,
+        "text_equal": eager["text"] == graph["text"],
+        "first_token_difference": first,
+        "tokens_compared": len(eager["token_ids"]),
+    }
 
 
 def run_pair(
@@ -306,14 +352,21 @@ def run_pair(
     atol: float = 1e-7,
     rtol: float = 1e-2,
     trace_residual: bool = False,
+    compare_output: bool = False,
 ) -> None:
     """Start two sequential fresh engines, sharing weights across selected NPUs."""
     if not Path(model, "config.json").is_file():
         raise FileNotFoundError(f"Local model config not found: {model}/config.json")
     if any(not math.isfinite(value) or value < 0 for value in (atol, rtol)):
         raise ValueError("Tolerances must be finite and nonnegative")
+    if trace_residual and compare_output:
+        raise ValueError("Output comparison uses the original probes; do not combine with --trace-residual")
     tp_size = len(parse_devices(devices))
     print("[SFA_PARITY] scope=target_decode; prefill computes ONCE; graph imports target+MTP checkpoints", flush=True)
+    if compare_output:
+        print(
+            f"[SFA_OUTPUT] unrestricted greedy target + real MTP proposals; generate {OUTPUT_TOKENS} tokens", flush=True
+        )
     with TemporaryDirectory(prefix="sfa-parity-") as directory:
         for mode in ("preflight", "eager", "graph"):
             subprocess.run(
@@ -333,6 +386,7 @@ def run_pair(
                     "--rtol",
                     str(rtol),
                     *(["--trace-residual"] if trace_residual else []),
+                    *(["--compare-output"] if compare_output else []),
                 ],
                 env=child_environment("graph" if mode == "preflight" else mode, devices),
                 check=True,
@@ -341,7 +395,27 @@ def run_pair(
         graph = json.loads(Path(directory, "graph-summary.json").read_text())
         # Different planner layouts can legitimately load different numbers of
         # misses. Both workers separately require positive transfer coverage.
-        validate_summaries(eager, graph, tp_size)
+        validate_summaries(eager, graph, tp_size, compare_output=compare_output)
+        if compare_output:
+            outputs = [
+                json.loads(Path(directory, f"{mode}-output.json").read_text(encoding="utf-8"))
+                for mode in ("eager", "graph")
+            ]
+            result = compare_generated_outputs(*outputs)
+            for mode, output in zip(("eager", "graph"), outputs):
+                print(f"[SFA_OUTPUT] {mode}: " + json.dumps(output, ensure_ascii=False), flush=True)
+            print("[SFA_OUTPUT] " + json.dumps(result), flush=True)
+            if not result["tokens_equal"] or not result["text_equal"]:
+                raise AssertionError(
+                    "[SFA_OUTPUT] OUTPUT DIFFERENT: both generations completed; see first_token_difference"
+                )
+            print(
+                f"[SFA_OUTPUT] OUTPUT MATCH: {OUTPUT_TOKENS} greedy tokens and text; "
+                "single prefill, one target replay per decode/rank. "
+                "This case's output matches; intermediate numerical parity is not asserted.",
+                flush=True,
+            )
+            return
     status = "DIAGNOSTIC PASS (extra probes; original acceptance still required)" if trace_residual else "PASS"
     print(
         f"[SFA_PARITY] {status}: all {tp_size} ranks, 8 target layers, "
@@ -356,7 +430,13 @@ def main() -> None:
     parser.add_argument("--devices", default=DEFAULT_DEVICES)
     parser.add_argument("--atol", type=float, default=1e-7)
     parser.add_argument("--rtol", type=float, default=1e-2)
-    parser.add_argument("--trace-residual", action="store_true", help="Add residual-path probes for mismatch diagnosis")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--trace-residual", action="store_true", help="Add residual-path probes for mismatch diagnosis")
+    mode.add_argument(
+        "--compare-output",
+        action="store_true",
+        help="Finish both unrestricted greedy generations and compare tokens/text",
+    )
     parser.add_argument("--child", choices=("preflight", "eager", "graph"), help=argparse.SUPPRESS)
     parser.add_argument("--reference", help=argparse.SUPPRESS)
     args = parser.parse_args()
@@ -367,7 +447,14 @@ def main() -> None:
             parser.error("Internal child requires a reference directory")
         run_child(args)
     else:
-        run_pair(args.model, devices=args.devices, atol=args.atol, rtol=args.rtol, trace_residual=args.trace_residual)
+        run_pair(
+            args.model,
+            devices=args.devices,
+            atol=args.atol,
+            rtol=args.rtol,
+            trace_residual=args.trace_residual,
+            compare_output=args.compare_output,
+        )
 
 
 if __name__ == "__main__":
