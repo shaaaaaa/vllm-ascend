@@ -8,7 +8,9 @@ Nothing in this module is enabled by the normal serving worker.
 """
 
 import math
+from collections.abc import Callable
 from dataclasses import dataclass
+from typing import Any
 
 import torch
 
@@ -20,6 +22,30 @@ class ParityError(AssertionError):
         super().__init__(message)
         self.label = label
         self.index = index
+
+
+def coordinated_check(check: Callable[[], Any], *, group: Any, phase: str) -> Any:
+    """Agree diagnostic failures at model boundaries before further collectives.
+
+    ``check`` must not itself enter distributed collectives. This coordinates
+    reference I/O/shape/numerical failures, not a failed or hung NPU/HCCL kernel;
+    the worker supervisor remains responsible for device/process failures.
+    """
+    result, error = None, None
+    try:
+        result = check()
+    except Exception as exc:
+        error = f"rank={group.rank_in_group} {type(exc).__name__}: {exc}"
+    statuses = [(phase, error)]
+    if group.world_size > 1:
+        statuses = [None] * group.world_size
+        torch.distributed.all_gather_object(statuses, (phase, error), group=group.cpu_group)
+    if any(item[0] != phase for item in statuses):
+        raise ParityError(f"TP parity diagnostic phases diverged: {statuses}")
+    failures = [item[1] for item in statuses if item[1] is not None]
+    if failures:
+        raise ParityError(f"{phase}: " + " | ".join(failures))
+    return result
 
 
 class DeviceSnapshot:
@@ -152,8 +178,8 @@ def compare_tensor(
 
 def compare_step(reference: dict, actual: dict, *, atol: float, rtol: float) -> None:
     """Fail at the earliest layer/phase, checking step alignment first."""
-    label = f"step={actual['step']}"
-    for key in ("step", "decode", "rows", "layers"):
+    label = f"rank={actual['rank']} step={actual['step']}"
+    for key in ("rank", "tp_size", "step", "decode", "rows", "layers"):
         if reference[key] != actual[key]:
             raise ParityError(f"{label}: incomparable {key}: eager={reference[key]}, graph={actual[key]}")
     for key in ("input_ids", "positions", "seq_lens", "query_ends"):

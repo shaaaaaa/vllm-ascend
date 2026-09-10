@@ -16,11 +16,18 @@ from pathlib import Path
 from unittest.mock import patch
 
 import torch
+from vllm.distributed import get_tp_group
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.model_loader.dummy_loader import DummyModelLoader
 
 from vllm_ascend import envs
-from vllm_ascend.attention.sfa_parity import DeviceSnapshot, ParityError, compare_step, gather_sparse_kv
+from vllm_ascend.attention.sfa_parity import (
+    DeviceSnapshot,
+    ParityError,
+    compare_step,
+    coordinated_check,
+    gather_sparse_kv,
+)
 from vllm_ascend.attention.sfa_v1 import AscendSFAImpl
 from vllm_ascend.worker.worker import NPUWorker
 
@@ -210,7 +217,10 @@ class LayerSnapshots:
 
 
 class SFAParityWorker(NPUWorker):
-    """Isolated single-card test worker; cannot be used without parity config."""
+    """Isolated single-host TP test worker; never enabled in normal serving."""
+
+    def _check(self, check, phase):
+        return coordinated_check(check, group=self.parity_group, phase=phase)
 
     def load_model(self) -> None:
         options = self.vllm_config.additional_config.get("sfa_parity")
@@ -218,18 +228,22 @@ class SFAParityWorker(NPUWorker):
             raise ValueError("SFAParityWorker must be launched by the parity test driver")
         parallel = self.vllm_config.parallel_config
         if (
-            parallel.tensor_parallel_size != 1
+            parallel.tensor_parallel_size not in (1, 2, 4, 8)
             or parallel.data_parallel_size != 1
             or parallel.pipeline_parallel_size != 1
+            or parallel.enable_expert_parallel
         ):
-            raise ValueError("This parity test supports only TP=1, DP=1, PP=1")
+            raise ValueError("This parity test requires TP=1/2/4/8, DP=1, PP=1 and EP disabled")
+        self.parity_group = get_tp_group()
+        self.parity_rank = self.parity_group.rank_in_group
+        self.parity_tp_size = self.parity_group.world_size
         self.parity_options = options
         self.parity_step = 0
         self.parity_decode_steps = 0
         self.parity_q2_steps = 0
         self.parity_draft_calls = 0
         self.parity_transfers = [0] * TARGET_LAYERS
-        self.parity_directory = Path(options["reference"])
+        self.parity_directory = Path(options["reference"]) / f"rank-{self.parity_rank}"
         self.parity_is_graph = options["mode"] == "graph"
         if self.parity_is_graph != bool(envs.VLLM_ASCEND_SFA_FULL_GRAPH):
             raise ValueError("Parity mode and full-graph flag disagree")
@@ -242,16 +256,72 @@ class SFAParityWorker(NPUWorker):
 
         with patch.object(DummyModelLoader, "load_weights", load):
             super().load_model()
+        self._check(self._prepare_probes, "startup weights/probes")
+        runner = self.model_runner
+        original_forward = runner._model_forward
+        signature = inspect.signature(original_forward)
+
+        def forward(*args, **kwargs):
+            context = get_forward_context()
+            live = runner.input_batch.num_reqs > 0 and not getattr(context, "staged_sfa_graph_dummy_run", False)
+            if not live:
+                return original_forward(*args, **kwargs)
+            state = self._check(
+                lambda: self._prepare_step(signature.bind(*args, **kwargs).arguments, context),
+                f"step={self.parity_step} before target",
+            )
+            before = runner._sfa_full_graph.replay_count
+            # Do not put a failure collective around the model itself: a kernel
+            # failure may leave other ranks inside HCCL. vLLM's supervisor owns
+            # that failure path. Diagnostic checks are coordinated only outside.
+            result = original_forward(*args, **kwargs)
+            replays = runner._sfa_full_graph.replay_count - before
+            self._check(lambda: self._observe_step(state, result, replays), f"step={self.parity_step} after target")
+            if self.parity_is_graph and self.parity_rank == 0:
+                print(
+                    f"[SFA_PARITY] step={self.parity_step} rows={state['rows']} decode={state['decode']} "
+                    f"ranks={self.parity_tp_size} layers=8 PASS replay_per_rank={replays}",
+                    flush=True,
+                )
+            self.parity_step += 1
+            self.parity_decode_steps += int(state["decode"])
+            self.parity_q2_steps += int(state["decode"] and state["rows"] == QUERY_WIDTH)
+            return result
+
+        original_propose = runner.propose_draft_token_ids
+
+        def propose(*args, **kwargs):
+            tokens = original_propose(*args, **kwargs)
+
+            def fix_tokens():
+                if not isinstance(tokens, torch.Tensor) or tokens.shape[-1] != 1:
+                    raise ParityError("MTP did not produce one draft token per request")
+                self.parity_draft_calls += 1
+                # Only the choice is overridden. Draft computation/KV callbacks run.
+                return torch.full_like(tokens, options["token_id"])
+
+            return self._check(fix_tokens, f"step={self.parity_step} after draft")
+
+        runner._model_forward = forward
+        runner.propose_draft_token_ids = propose
+
+    def _prepare_probes(self):
         runner = self.model_runner
         if runner.speculative_config is None or runner.speculative_config.num_speculative_tokens != 1:
             raise ValueError("SFA parity requires MTP=1")
         model = runner.get_model()
-        manifest = {"target": weight_fingerprint(model), "draft": weight_fingerprint(runner.drafter.model)}
+        manifest = {
+            "rank": self.parity_rank,
+            "tp_size": self.parity_tp_size,
+            "target": weight_fingerprint(model),
+            "draft": weight_fingerprint(runner.drafter.model),
+        }
         manifest_path = self.parity_directory / "weights.json"
         if self.parity_is_graph:
             if json.loads(manifest_path.read_text()) != manifest:
                 raise ParityError("Eager/graph weights differ; refusing to compare different models")
         else:
+            self.parity_directory.mkdir(parents=True, exist_ok=False)
             manifest_path.write_text(json.dumps(manifest))
         self.parity_layers = []
         self.parity_attention_names = []
@@ -273,103 +343,91 @@ class SFAParityWorker(NPUWorker):
             )
         if [layer.index for layer in self.parity_layers] != list(range(TARGET_LAYERS)):
             raise ParityError("Parity worker did not find all eight target decoder layers")
-        original_forward = runner._model_forward
-        signature = inspect.signature(original_forward)
+        # These persistent allocations happen after load_model's weight memory
+        # measurement. Include them when the worker budgets its KV cache.
+        snapshot_bytes = sum(
+            probe.value.numel() * probe.value.element_size() + probe.writes.numel() * probe.writes.element_size()
+            for layer in self.parity_layers
+            for probe in layer.probes.values()
+        )
+        runner.model_memory_usage = getattr(runner, "model_memory_usage", 0) + snapshot_bytes
 
-        def forward(*args, **kwargs):
-            context = get_forward_context()
-            live = runner.input_batch.num_reqs > 0 and not getattr(context, "staged_sfa_graph_dummy_run", False)
-            if not live:
-                return original_forward(*args, **kwargs)
-            if runner.input_batch.num_reqs != 1:
-                raise ParityError("Parity driver must submit one request at a time")
-            metadata = context.attn_metadata[self.parity_attention_names[0]]
-            rows = metadata.num_actual_tokens
-            decode = metadata.num_decode_tokens > 0
-            if decode and rows > QUERY_WIDTH:
-                raise ParityError("Expected Q1/Q2 singleton decode")
-            inputs = signature.bind(*args, **kwargs).arguments
-            # These copies are at the forward boundary, before any layer runs.
-            state = {
-                "step": self.parity_step,
-                "decode": decode,
-                "rows": rows,
-                "layers": TARGET_LAYERS,
-                "input_ids": inputs["input_ids"][:rows].detach().cpu().clone(),
-                "positions": inputs["positions"][:rows].detach().cpu().clone(),
-                "seq_lens": metadata.seq_lens[:1].detach().cpu().clone(),
-                "query_ends": metadata.cum_query_lens[:1].detach().cpu().clone(),
-            }
-            for layer in self.parity_layers:
-                layer.reset()
-            before = runner._sfa_full_graph.replay_count
-            result = original_forward(*args, **kwargs)
-            replays = runner._sfa_full_graph.replay_count - before
-            if decode and replays != int(self.parity_is_graph):
-                raise ParityError(
-                    f"step={self.parity_step}: expected {int(self.parity_is_graph)} root replay, got {replays}"
-                )
-            # Exactly one observation boundary after the entire target forward.
-            torch.npu.current_stream().synchronize()
-            state["tensors"], state["addresses"] = {}, {}
-            for layer in self.parity_layers:
-                tensors, addresses = layer.read(rows, decode)
-                state["tensors"].update(tensors)
-                state["addresses"].update(addresses)
-                if decode:
-                    self.parity_transfers[layer.index] += int(addresses[f"layer={layer.index} miss_count"].sum())
-            final_hidden = result[0] if isinstance(result, tuple) else result
-            state["tensors"]["target.final_hidden"] = final_hidden[:rows].detach().cpu().clone()
-            path = self.parity_directory / f"step-{self.parity_step:06d}.pt"
-            if self.parity_is_graph:
-                if not path.is_file():
-                    raise ParityError(f"step={self.parity_step}: no matching eager step")
-                reference = torch.load(path, map_location="cpu", weights_only=True)
-                try:
-                    compare_step(reference, state, atol=options["atol"], rtol=options["rtol"])
-                except ParityError as error:
-                    layer_match = re.search(r"layer=(\d+)", error.label)
-                    if layer_match and decode and error.label.endswith(("topk", "kv_nope", "kv_pe", "valid")):
-                        prefix = f"layer={layer_match[1]}"
-                        row = error.index[0] if error.index else 0
-                        selected_column = error.index[1] if len(error.index) > 1 else 0
-                        for mode, snapshot in (("eager", reference), ("graph", state)):
-                            slots = snapshot["addresses"][f"{prefix} physical_slots"]
-                            column = min(selected_column, slots.shape[1] - 1)
-                            print(
-                                f"[SFA_PARITY] {mode} {prefix} query_row={row} topk_column={column} "
-                                f"logical_token={snapshot['tensors'][f'{prefix} topk'][row, column].item()} "
-                                f"physical_slot={slots[row, column].item()} "
-                                f"miss_count={snapshot['addresses'][f'{prefix} miss_count'].tolist()}",
-                                flush=True,
-                            )
-                    raise
-                print(
-                    f"[SFA_PARITY] step={self.parity_step} rows={rows} decode={decode} layers=8 PASS replay={replays}",
-                    flush=True,
-                )
-            else:
-                torch.save(state, path)
-            self.parity_step += 1
-            self.parity_decode_steps += int(decode)
-            self.parity_q2_steps += int(decode and rows == QUERY_WIDTH)
-            return result
+    def _prepare_step(self, inputs, context):
+        if self.model_runner.input_batch.num_reqs != 1:
+            raise ParityError("Parity driver must submit one request at a time")
+        metadata = context.attn_metadata[self.parity_attention_names[0]]
+        rows = metadata.num_actual_tokens
+        decode = metadata.num_decode_tokens > 0
+        if decode and rows > QUERY_WIDTH:
+            raise ParityError("Expected Q1/Q2 singleton decode")
+        state = {
+            "rank": self.parity_rank,
+            "tp_size": self.parity_tp_size,
+            "step": self.parity_step,
+            "decode": decode,
+            "rows": rows,
+            "layers": TARGET_LAYERS,
+            "input_ids": inputs["input_ids"][:rows].detach().cpu().clone(),
+            "positions": inputs["positions"][:rows].detach().cpu().clone(),
+            "seq_lens": metadata.seq_lens[:1].detach().cpu().clone(),
+            "query_ends": metadata.cum_query_lens[:1].detach().cpu().clone(),
+        }
+        for layer in self.parity_layers:
+            layer.reset()
+        return state
 
-        original_propose = runner.propose_draft_token_ids
+    def _observe_step(self, state, result, replays):
+        rows, decode = state["rows"], state["decode"]
+        if decode and replays != int(self.parity_is_graph):
+            raise ParityError(
+                f"step={self.parity_step}: expected {int(self.parity_is_graph)} root replay, got {replays}"
+            )
+        torch.npu.current_stream().synchronize()
+        state["tensors"], state["addresses"] = {}, {}
+        for layer in self.parity_layers:
+            tensors, addresses = layer.read(rows, decode)
+            state["tensors"].update(tensors)
+            state["addresses"].update(addresses)
+            if decode:
+                self.parity_transfers[layer.index] += int(addresses[f"layer={layer.index} miss_count"].sum())
+        final_hidden = result[0] if isinstance(result, tuple) else result
+        state["tensors"]["target.final_hidden"] = final_hidden[:rows].detach().cpu().clone()
+        path = self.parity_directory / f"step-{self.parity_step:06d}.pt"
+        if self.parity_is_graph:
+            if not path.is_file():
+                raise ParityError(f"step={self.parity_step}: no matching eager step")
+            reference = torch.load(path, map_location="cpu", weights_only=True)
+            try:
+                compare_step(reference, state, atol=self.parity_options["atol"], rtol=self.parity_options["rtol"])
+            except ParityError as error:
+                self._log_mapping_error(error, reference, state)
+                raise
+        else:
+            torch.save(state, path)
 
-        def propose(*args, **kwargs):
-            tokens = original_propose(*args, **kwargs)
-            if not isinstance(tokens, torch.Tensor) or tokens.shape[-1] != 1:
-                raise ParityError("MTP did not produce one draft token per request")
-            self.parity_draft_calls += 1
-            # Only the choice is overridden. Draft computation/KV callbacks run.
-            return torch.full_like(tokens, options["token_id"])
-
-        runner._model_forward = forward
-        runner.propose_draft_token_ids = propose
+    def _log_mapping_error(self, error, reference, state):
+        layer_match = re.search(r"layer=(\d+)", error.label)
+        if not (layer_match and state["decode"] and error.label.endswith(("topk", "kv_nope", "kv_pe", "valid"))):
+            return
+        prefix = f"layer={layer_match[1]}"
+        row = error.index[0] if error.index else 0
+        selected_column = error.index[1] if len(error.index) > 1 else 0
+        for mode, snapshot in (("eager", reference), ("graph", state)):
+            slots = snapshot["addresses"][f"{prefix} physical_slots"]
+            column = min(selected_column, slots.shape[1] - 1)
+            print(
+                f"[SFA_PARITY] rank={self.parity_rank} {mode} {prefix} query_row={row} topk_column={column} "
+                f"logical_token={snapshot['tensors'][f'{prefix} topk'][row, column].item()} "
+                f"physical_slot={slots[row, column].item()} "
+                f"miss_count={snapshot['addresses'][f'{prefix} miss_count'].tolist()}",
+                flush=True,
+            )
 
     def parity_summary(self) -> dict:
         """RPC completion gate: no replay, stale hooks, or no transfers cannot pass."""
+        return self._check(self._local_summary, "final coverage")
+
+    def _local_summary(self):
         if self.parity_decode_steps < 2 or self.parity_q2_steps < 2 or self.parity_draft_calls < 2:
             raise ParityError("Insufficient live decode/Q2/MTP coverage")
         if not all(count > 0 for count in self.parity_transfers):
@@ -378,6 +436,8 @@ class SFAParityWorker(NPUWorker):
         if self.parity_step != expected_steps:
             raise ParityError(f"Incomplete step comparison: {self.parity_step} != {expected_steps}")
         return {
+            "rank": self.parity_rank,
+            "tp_size": self.parity_tp_size,
             "steps": self.parity_step,
             "decode_steps": self.parity_decode_steps,
             "q2_steps": self.parity_q2_steps,

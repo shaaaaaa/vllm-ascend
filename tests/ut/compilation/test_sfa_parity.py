@@ -27,8 +27,9 @@ def worker(parity, monkeypatch):
     for name, attributes in {
         "vllm_ascend": {"envs": env},
         "vllm.forward_context": {"get_forward_context": lambda: None},
+        "vllm.distributed": {"get_tp_group": lambda: None},
         "vllm.model_executor.model_loader.dummy_loader": {"DummyModelLoader": type("DummyLoader", (), {})},
-        "vllm_ascend.attention.sfa_v1": {"AscendSFAImpl": object},
+        "vllm_ascend.attention.sfa_v1": {"AscendSFAImpl": type("FakeSFAImpl", (), {})},
         "vllm_ascend.worker.worker": {"NPUWorker": object},
     }.items():
         stub = ModuleType(name)
@@ -140,6 +141,8 @@ def test_shape_or_dtype_mismatch_fails(parity, actual):
 
 def make_step():
     return {
+        "rank": 0,
+        "tp_size": 8,
         "step": 2,
         "decode": True,
         "rows": 2,
@@ -272,9 +275,138 @@ def test_dummy_integer_weights_and_fingerprint_are_deterministic(worker):
 )
 def test_completion_cannot_pass_without_live_coverage(worker, tmp_path, field, value):
     subject = worker.SFAParityWorker()
+    subject.parity_group = SimpleNamespace(world_size=1, rank_in_group=0)
     subject.parity_decode_steps = subject.parity_q2_steps = subject.parity_draft_calls = 3
     subject.parity_transfers = [4] * 8
     subject.parity_directory = tmp_path
     setattr(subject, field, value)
     with pytest.raises(worker.ParityError, match="coverage|historical KV"):
         subject.parity_summary()
+
+
+def test_wrong_tp_rank_or_world_size_is_not_a_valid_reference(parity):
+    ref, val = make_step(), make_step()
+    val["rank"] = 7
+    with pytest.raises(parity.ParityError, match="incomparable rank"):
+        parity.compare_step(ref, val, atol=0, rtol=0)
+    val["rank"] = 0
+    val["tp_size"] = 1
+    with pytest.raises(parity.ParityError, match="incomparable tp_size"):
+        parity.compare_step(ref, val, atol=0, rtol=0)
+
+
+def test_one_rank_failure_is_seen_by_every_rank(parity, monkeypatch):
+    statuses = [("after target", None)] * 8
+    statuses[5] = ("after target", "rank=5 ParityError: layer=3 kv mismatch")
+
+    def gather(output, value, *, group):
+        output[:] = statuses
+
+    monkeypatch.setattr(torch.distributed, "all_gather_object", gather)
+    for rank in range(8):
+        group = SimpleNamespace(world_size=8, rank_in_group=rank, cpu_group="gloo")
+        with pytest.raises(parity.ParityError, match="rank=5.*layer=3"):
+            parity.coordinated_check(lambda: None, group=group, phase="after target")
+
+
+def test_rank_success_returns_its_own_local_result(parity, monkeypatch):
+    monkeypatch.setattr(
+        torch.distributed,
+        "all_gather_object",
+        lambda output, value, **kwargs: output.__setitem__(slice(None), [("prepare", None)] * 8),
+    )
+    for rank in range(8):
+        group = SimpleNamespace(world_size=8, rank_in_group=rank, cpu_group="gloo")
+        assert parity.coordinated_check(lambda rank=rank: rank, group=group, phase="prepare") == rank
+
+
+def test_diagnostic_phase_mismatch_fails_closed(parity, monkeypatch):
+    monkeypatch.setattr(
+        torch.distributed,
+        "all_gather_object",
+        lambda output, value, **kwargs: output.__setitem__(slice(None), [("prepare", None), ("observe", None)]),
+    )
+    group = SimpleNamespace(world_size=2, rank_in_group=0, cpu_group="gloo")
+    with pytest.raises(parity.ParityError, match="phases diverged"):
+        parity.coordinated_check(lambda: None, group=group, phase="prepare")
+
+
+def test_eight_rank_weight_manifests_are_isolated(worker, tmp_path):
+    def subject(rank, graph):
+        instance = worker.SFAParityWorker()
+        instance.parity_rank, instance.parity_tp_size = rank, 8
+        instance.parity_directory = tmp_path / f"rank-{rank}"
+        instance.parity_is_graph = graph
+        instance.device = torch.device("cpu")
+        instance.vllm_config = SimpleNamespace(scheduler_config=SimpleNamespace(max_num_batched_tokens=4))
+        model = torch.nn.Module()
+        model.layers = torch.nn.ModuleList([TinyDecoder() for _ in range(8)])
+        for index, layer in enumerate(model.layers):
+            layer.attn = torch.nn.Module()
+            layer.attn.layer_name = f"layers.{index}.attn"
+            layer.attn.impl = worker.AscendSFAImpl()
+            layer.attn.impl.__dict__.update(fake_impl().__dict__)
+            # Different shards need not have identical weights across ranks.
+            with torch.no_grad():
+                layer.input_layernorm.weight.fill_(rank + 1)
+        instance.model_runner = SimpleNamespace(
+            get_model=lambda: model,
+            drafter=SimpleNamespace(model=TinyDecoder()),
+            speculative_config=SimpleNamespace(num_speculative_tokens=1),
+        )
+        return instance
+
+    for rank in range(8):
+        eager = subject(rank, False)
+        eager._prepare_probes()
+        assert eager.model_runner.model_memory_usage > 0
+    assert len(list(tmp_path.glob("rank-*/weights.json"))) == 8
+    for rank in range(8):
+        subject(rank, True)._prepare_probes()
+    wrong_rank = subject(7, True)
+    wrong_rank.parity_directory = tmp_path / "rank-0"
+    with pytest.raises(worker.ParityError, match="weights differ"):
+        wrong_rank._prepare_probes()
+
+
+def test_eight_rank_forward_snapshots_compare_only_matching_shards(worker, monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        torch, "npu", SimpleNamespace(current_stream=lambda: SimpleNamespace(synchronize=lambda: None)), raising=False
+    )
+
+    def subject(rank, graph, *, corrupt=False):
+        instance = worker.SFAParityWorker()
+        instance.parity_rank, instance.parity_tp_size = rank, 8
+        instance.parity_step = 2
+        instance.parity_directory = tmp_path / f"rank-{rank}"
+        instance.parity_directory.mkdir(exist_ok=True)
+        instance.parity_is_graph = graph
+        instance.parity_options = {"atol": 0, "rtol": 0}
+        instance.parity_transfers = [0] * 8
+        instance.parity_layers = []
+        for layer in range(8):
+
+            def read(rows, decode, layer=layer):
+                value = rank + 1 + int(corrupt and layer == 3)
+                return (
+                    {f"layer={layer} input.hidden": torch.full((rows, 4), float(value))},
+                    {f"layer={layer} miss_count": torch.tensor([2])},
+                )
+
+            instance.parity_layers.append(SimpleNamespace(index=layer, read=read))
+        return instance
+
+    def state(rank):
+        result = make_step()
+        result["rank"] = rank
+        return result
+
+    for rank in range(8):
+        subject(rank, False)._observe_step(state(rank), torch.full((2, 4), float(rank + 1)), 0)
+    assert len(list(tmp_path.glob("rank-*/step-000002.pt"))) == 8
+    for rank in range(8):
+        subject(rank, True)._observe_step(state(rank), torch.full((2, 4), float(rank + 1)), 1)
+    with pytest.raises(worker.ParityError, match="rank=7 step=2 layer=3"):
+        subject(7, True, corrupt=True)._observe_step(state(7), torch.full((2, 4), 8.0), 1)
+    with pytest.raises(worker.ParityError, match="expected 1 root replay, got 0"):
+        subject(7, True)._observe_step(state(7), torch.full((2, 4), 8.0), 0)

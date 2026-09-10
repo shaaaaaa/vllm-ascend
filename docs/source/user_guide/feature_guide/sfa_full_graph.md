@@ -131,32 +131,43 @@ and attention must be in that graph; there must be no target-layer
 and save callbacks outside the target-forward scope are expected. Startup
 logs and CPU unit tests alone do not prove graph capture or output parity.
 
-## Eight-layer numerical parity (one NPU)
+## Eight-layer numerical parity (one host, eight NPUs)
 
 To check data rather than generated text, run from **vllm-ascend**:
 
 ```bash
 set -o pipefail
-python -m pytest -q -s --confcutdir=tests/e2e/singlecard tests/e2e/singlecard/test_sfa_full_graph_parity.py 2>&1 | tee log.log
+python -m pytest -q -s --confcutdir=tests/e2e/multicard tests/e2e/multicard/test_sfa_full_graph_parity.py 2>&1 | tee log.log
 ```
 
 This requires the existing native extensions and the local model configuration
 at `/workspace/models/GLM-5.1-w4a8`. It does not need an HTTP server or a client.
-The test starts two fresh engines sequentially on NPU 0: eight target layers,
-TP1/DP1, MTP1, dummy weights, first **both staged/full graph disabled with
+The default is designed for one host with eight 64-GB NPUs (devices 0 through 7),
+not a single 64-GB card. Reducing the layer count alone does not guarantee that
+the model fits on one card. The test starts two fresh engines sequentially,
+each using **TP8/DP1**, eight target layers, MTP1 and dummy weights. TP shards the
+weights across the eight cards; DP is not used to replicate the whole model.
+First run **both staged/full graph disabled with
 enforce_eager**, then the root graph path. Normal serving is not instrumented.
-For another model directory/device, the equivalent driver accepts
-`python tools/sfa_full_graph_parity.py --model /path/to/model --device 0`.
+For another model directory/device set, the equivalent driver accepts
+`python tools/sfa_full_graph_parity.py --model /path/to/model --devices 0,1,2,3,4,5,6,7`.
+Explicit lists of 1/2/4/8 distinct devices are supported; fewer cards require
+enough memory for the larger weight shard. This test disables EP, FlashComm,
+sequence parallelism and context parallelism to keep target-row layouts aligned.
 
 The test deliberately uses an isolated local CPU LMCache instead of inheriting
-a server's shared/remote cache. It does not test Mooncake, TP/DP communication,
-request recovery, or generated-language quality. Temporary reference files
-(several GB for the complete prefill) are managed and removed by the driver;
+a server's shared/remote cache. Every TP rank stores its own KV and participates
+in lookup (`save_only_first_rank=false`); the CPU cache cap is 2 GB per rank.
+It exercises the model's real TP communication, but does not test Mooncake, DP,
+EP, request recovery, or generated-language quality. Temporary reference files
+(potentially tens of GB for all eight ranks' complete prefill) are managed and removed by the driver;
 only console output needs to be kept. No native rebuild is introduced.
 
 ### What must match
 
-- Complete target and draft weight fingerprints. Integer dummy weights are
+- Complete target and draft weight fingerprints **for each matching TP rank**.
+  Reference files are isolated by rank; different ranks' weight shards are not
+  compared to each other. Integer dummy weights are
   deterministically initialized as part of this test fixture, since the
   upstream dummy loader only initializes floating-point tensors.
 - Actual token IDs, positions, sequence lengths and query boundaries before
@@ -174,7 +185,8 @@ only console output needs to be kept. No native rebuild is introduced.
 The 4351-token prompt exceeds the MTP scratch prefix and is adjacent to a
 256-token window boundary. Sixteen forced output tokens exercise repeated Q2
 decode. Each of the eight layers must actually plan historical KV loads, and
-every live target decode must execute exactly **one root replay**. Missing
+every live target decode must execute exactly **one root replay per TP rank**.
+All eight ranks must pass; success on rank 0 alone is insufficient. Missing
 probes, stale snapshots, missing eager steps, wrong input tokens, invalid KV
 addresses and NaN/Inf (even on both sides) fail the test. A hardware/model skip
 is not a pass.
@@ -184,8 +196,12 @@ copies into the graph; SFA probes add device operations inside existing opaque
 SFA operators during capture. No new splitting operator or per-layer host fence
 is added. Device counters must advance exactly once for each layer observation
 on each live replay. Reading/comparison happens **after the whole forward**.
+CPU/Gloo agreement at startup and before/after target forwards propagates a
+diagnostic or reference-file failure on any rank to all peers before the next
+model collective. There are no per-layer diagnostic collectives. This does not
+recover from a failed/hung NPU/HCCL kernel; vLLM's worker supervisor handles that.
 
-The first mismatch reports its step, layer, tensor, coordinate, values, maximum
+The first mismatch reports its rank, step, layer, tensor, coordinate, values, maximum
 absolute/relative error and mismatch count. Integer top-k is compared exactly;
 floating-point defaults are `atol=1e-7, rtol=1e-2`. A top-k difference near tied
 scores is a divergence to investigate, not by itself proof of a graph bug;
@@ -196,4 +212,7 @@ benchmark or a proof that the uninstrumented path is race-free.
 The CPU regression tests for the observer/comparator live in
 `tests/ut/compilation/test_sfa_parity.py`. They inject incorrect KV, mapping,
 token and layer data, and verify compiled hooks and stale-probe detection.
-They do not replace the real NPU/model test above.
+Real CPU/Gloo two- and eight-process failure-agreement tests are in
+`tests/ut/compilation/test_sfa_parity_gloo.py`. They do not replace the real
+eight-NPU/model test above. The small single-card probe replay test remains in
+`tests/e2e/singlecard/test_sfa_parity_probe_npu.py`; it does not load the model.
