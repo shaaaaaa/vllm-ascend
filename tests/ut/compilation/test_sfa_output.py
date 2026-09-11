@@ -3,6 +3,7 @@
 """CPU wiring/guard tests for free generation; not real NPU inference."""
 
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -63,8 +64,8 @@ def output_worker(worker, tmp_path, monkeypatch):
         raise AssertionError("Free generation must not compare/reload teacher-forced steps")
 
     monkeypatch.setattr(worker, "compare_step", forbidden)
-    monkeypatch.setattr(torch, "load", forbidden)
-    monkeypatch.setattr(torch, "save", forbidden)
+    # Statistics persistence/alignment has separate real CPU tensor tests.
+    subject._observe_output_statistics = Mock()
     return subject
 
 
@@ -76,6 +77,7 @@ def test_all_decode_steps_observed_without_intermediate_tolerance_abort(output_w
         output_worker._observe_step({"rows": 2, "decode": True}, torch.ones(2, 4) * index, int(graph))
     assert output_worker.parity_decode_observations == 12
     assert output_worker.parity_transfers == [12] * 8
+    assert output_worker._observe_output_statistics.call_count == 12
     assert not list(output_worker.parity_directory.iterdir())
 
 

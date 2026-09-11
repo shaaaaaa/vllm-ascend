@@ -31,6 +31,7 @@ from vllm_ascend.attention.sfa_parity import (
     residual_trace_report,
     weight_fingerprint,
 )
+from vllm_ascend.attention.sfa_parity_stats import add_step, alignment_reason
 from vllm_ascend.attention.sfa_prefill_checkpoint import (
     CacheBinding,
     assert_same_tree,
@@ -421,7 +422,7 @@ class SFAParityWorker(NPUWorker):
             raise ParityError("Prefill checkpoint import must not replay the target graph")
         if self.parity_is_graph and self.parity_rank == 0:
             if state["decode"]:
-                status = "OBSERVED (output-only)" if self.parity_options.get("compare_output", False) else "PASS"
+                status = "OBSERVED (output/statistics)" if self.parity_options.get("compare_output", False) else "PASS"
                 print(
                     f"[SFA_PARITY] step={self.parity_step} phase=decode rows={state['rows']} "
                     f"ranks={self.parity_tp_size} layers=8 {status} replay_per_rank={replays}",
@@ -725,16 +726,15 @@ class SFAParityWorker(NPUWorker):
         final_hidden = result[0] if isinstance(result, tuple) else result
         state["tensors"]["target.final_hidden"] = final_hidden[:rows].detach().cpu().clone()
         if self.parity_options.get("compare_output", False):
-            # Free-running target/draft tokens can diverge, so step N need not
-            # have the same prefix or speculative rows in the two processes.
-            # Do not compare those states or force them back into alignment.
-            # Keep observation freshness, address and replay checks above, and
-            # reject invalid numerical data independently on each side.
+            # Keep free generation and invalid-data guards. Descriptive CPU
+            # statistics have no numerical threshold and never align tokens by
+            # force; stop pairing after the first input/history divergence.
             for name, value in state["tensors"].items():
                 if not value.numel():
                     raise ParityError(f"{name}: empty output-mode observation")
                 if value.is_floating_point() and not torch.isfinite(value).all():
                     raise ParityError(f"{name}: output-mode observation contains NaN/Inf")
+            self._observe_output_statistics(state)
             self.parity_decode_observations += 1
             return
         path = self.parity_directory / f"step-{self.parity_step:06d}.pt"
@@ -763,6 +763,46 @@ class SFAParityWorker(NPUWorker):
                 raise
         else:
             torch.save(state, path)
+
+    def _observe_output_statistics(self, state):
+        ordinal = self.parity_decode_observations
+        path = self.parity_directory / f"output-step-{ordinal:06d}.pt"
+        if not self.parity_is_graph:
+            # Only eager snapshots go to disk; graph statistics are reduced
+            # online after forward, without a second set of large KV files.
+            torch.save(state, path)
+            return
+        stats = getattr(self, "parity_absolute_statistics", None)
+        if stats is None:
+            summaries = json.loads((self.parity_directory.parent / "eager-summary.json").read_text())
+            own = [summary for summary in summaries if summary["rank"] == self.parity_rank]
+            if len(own) != 1:
+                raise ParityError("Missing/duplicate eager statistics rank")
+            count = own[0]["decode_observations"]
+            expected = {f"output-step-{index:06d}.pt" for index in range(count)}
+            if not expected or {p.name for p in self.parity_directory.glob("output-step-*.pt")} != expected:
+                raise ParityError("Missing/extra eager statistics snapshots")
+            stats = self.parity_absolute_statistics = {
+                "eager_steps": count,
+                "graph_steps": 0,
+                "compared_steps": 0,
+                "first_unaligned": None,
+                "stages": {},
+            }
+        if ordinal != stats["graph_steps"]:
+            raise ParityError("Nonsequential output statistics observations")
+        if stats["first_unaligned"] is None:
+            if ordinal >= stats["eager_steps"]:
+                reason = "eager generation has no further target forward"
+            else:
+                reference = torch.load(path, map_location="cpu", weights_only=True)
+                reason = alignment_reason(reference, state)
+                if reason is None:
+                    add_step(stats["stages"], reference, state)
+                    stats["compared_steps"] += 1
+            if reason is not None:
+                stats["first_unaligned"] = {"step": state["step"], "reason": reason}
+        stats["graph_steps"] += 1
 
     def _log_mapping_error(self, error, reference, state):
         layer_match = re.search(r"layer=(\d+)", error.label)
@@ -843,6 +883,10 @@ class SFAParityWorker(NPUWorker):
         if compare_output:
             if self.parity_decode_observations != self.parity_decode_steps:
                 raise ParityError("Incomplete output-mode decode observation coverage")
+            if not self.parity_is_graph:
+                expected = {f"output-step-{index:06d}.pt" for index in range(self.parity_decode_observations)}
+                if {p.name for p in self.parity_directory.glob("output-step-*.pt")} != expected:
+                    raise ParityError("Incomplete eager statistics snapshot coverage")
         else:
             expected_steps = len(list(self.parity_directory.glob("step-*.pt"))) + expected_prefills
             if self.parity_step != expected_steps:
@@ -863,4 +907,5 @@ class SFAParityWorker(NPUWorker):
             "loaded_tokens_per_layer": self.parity_transfers,
             "compare_output": compare_output,
             "decode_observations": getattr(self, "parity_decode_observations", 0),
+            "absolute_statistics": getattr(self, "parity_absolute_statistics", None),
         }

@@ -336,6 +336,8 @@ def test_final_gate_requires_zero_graph_prefill_compute_and_real_decode(worker, 
     names = ["target-prefill-000000.pt", "draft-prefill-000000.pt"]
     if not compare_output:
         names += ["step-000001.pt", "step-000002.pt"]
+    else:
+        names += ["output-step-000000.pt", "output-step-000001.pt"]
     for name in names:
         (tmp_path / name).touch()
     summary = subject._local_summary()

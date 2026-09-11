@@ -36,6 +36,11 @@ def checkpoint(parity, monkeypatch):
 
 @pytest.fixture
 def worker(parity, checkpoint, monkeypatch):
+    stats_path = Path(__file__).resolve().parents[3] / "vllm_ascend/attention/sfa_parity_stats.py"
+    stats_spec = importlib.util.spec_from_file_location("vllm_ascend.attention.sfa_parity_stats", stats_path)
+    stats_module = importlib.util.module_from_spec(stats_spec)
+    monkeypatch.setitem(sys.modules, stats_spec.name, stats_module)
+    stats_spec.loader.exec_module(stats_module)
     env = SimpleNamespace(VLLM_ASCEND_SFA_FULL_GRAPH=True, VLLM_ASCEND_SFA_STAGED_GRAPH=True)
     for name, attributes in {
         "vllm_ascend": {"envs": env},

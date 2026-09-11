@@ -227,14 +227,50 @@ tokens**. EOS is ignored for this fixed-length diagnostic. Actual token IDs and
 decoded text (including special tokens) are printed under `[SFA_OUTPUT]`.
 
 In this mode, intermediate tensors are checked for freshness, invalid KV
-addresses and NaN/Inf, but are **not** compared across modes or tolerance-gated.
+addresses and NaN/Inf. `[SFA_STATS]` reports descriptive absolute statistics
+for each layer/stage and the target's final hidden state, without a floating-point
+tolerance gate. Three distributions are shown: `diff_abs = abs(graph - eager)`,
+`eager_abs = abs(eager)`, and `graph_abs = abs(graph)`. Each includes mean,
+standard deviation, population variance, maximum and nonzero element count.
+There is no percentage, denominator, epsilon or small-error pass/fail threshold.
+Variance is in squared units; standard deviation is in the tensor's units.
+All-zero observations are included and explicitly show `nonzero=0`.
+
+Statistics are element-weighted across all aligned decode steps and TP ranks,
+not averages of per-step/rank means or variances. `n` is the number of compared
+elements, including TP-replicated observations. Maximum error is retained across
+all ranks/steps. KV statistics exclude padding and entries where logical top-k
+selections differ; `excluded` counts these elements. Top-k and validity tensors
+are also reported, so exclusions do not hide selection differences. Statistics
+of integer token indices are not floating-point activation error metrics.
+
+The eager engine writes the existing CPU snapshots; graph collects statistics
+after each complete forward, with no new per-layer synchronization or graph
+split. It does not save a second set of large graph KV snapshots. Input token,
+position, sequence length and speculative-row alignment is checked first.
+After the first divergence, later steps are not pooled even if their latest
+tokens happen to match again. Per-rank `COMPLETE`/`PARTIAL` lines disclose the
+coverage and first alignment failure. Missing snapshots/probes and zero compared
+steps cannot be reported as successful statistics. Temporary files are removed
+by the driver as before.
+
 Every graph decode must still execute one root replay on every rank, and every
 layer must exercise historical KV loads. Both generations run to completion
 before the driver compares their complete output token sequences and text.
 Natural MTP acceptance can give different forward counts; the driver does not
 force their decode histories or step counts back into alignment. The original
-layer-parity mode and its tolerances are unchanged. `--compare-output` cannot
-be combined with `--trace-residual`, which adds fusion-affecting fine probes.
+layer-parity mode and its tolerances are unchanged. The default statistics reuse
+the original layer input/output, Q, top-k and KV probes. To also observe input
+RMSNorm, attention output and post-attention RMSNorm stages, explicitly add
+`--trace-residual`:
+
+```bash
+python tools/sfa_full_graph_parity.py --compare-output --trace-residual 2>&1 | tee log.log
+```
+
+These extra probes can change compiler fusion and their run is diagnostic, not
+an acceptance result for the original uninstrumented path. This mode still
+does not stop on small finite differences or recompute prefill.
 
 `OUTPUT MATCH` means this case's generated tokens and text match, **not** that
 all intermediate tensors match or that the implementation is generally

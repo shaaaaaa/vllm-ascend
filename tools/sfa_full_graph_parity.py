@@ -418,6 +418,13 @@ def compare_generated_outputs(eager: dict, graph: dict) -> dict:
     }
 
 
+def print_stage_statistics(eager: list[dict], graph: list[dict]) -> None:
+    # Both engines have exited; this module only operates on CPU summaries.
+    from vllm_ascend.attention.sfa_parity_stats import print_statistics
+
+    print_statistics(eager, graph)
+
+
 def run_pair(
     model: str = DEFAULT_MODEL,
     *,
@@ -432,14 +439,14 @@ def run_pair(
         raise FileNotFoundError(f"Local model config not found: {model}/config.json")
     if any(not math.isfinite(value) or value < 0 for value in (atol, rtol)):
         raise ValueError("Tolerances must be finite and nonnegative")
-    if trace_residual and compare_output:
-        raise ValueError("Output comparison uses the original probes; do not combine with --trace-residual")
     tp_size = len(parse_devices(devices))
     print("[SFA_PARITY] scope=target_decode; prefill computes ONCE; graph imports target+MTP checkpoints", flush=True)
     if compare_output:
         print(
             f"[SFA_OUTPUT] unrestricted greedy target + real MTP proposals; generate {OUTPUT_TOKENS} tokens", flush=True
         )
+        if trace_residual:
+            print("[SFA_STATS] extra norm/attention probes enabled; these can affect compiler fusion", flush=True)
     with TemporaryDirectory(prefix="sfa-parity-") as directory:
         for mode in ("preflight", "eager", "graph"):
             subprocess.run(
@@ -478,6 +485,7 @@ def run_pair(
             for mode, output in zip(("eager", "graph"), outputs):
                 print(f"[SFA_OUTPUT] {mode}: " + json.dumps(output, ensure_ascii=False), flush=True)
             print("[SFA_OUTPUT] " + json.dumps(result), flush=True)
+            print_stage_statistics(eager, graph)
             if not result["tokens_equal"] or not result["text_equal"]:
                 raise AssertionError(
                     "[SFA_OUTPUT] OUTPUT DIFFERENT: both generations completed; see first_token_difference"
@@ -503,12 +511,11 @@ def main() -> None:
     parser.add_argument("--devices", default=DEFAULT_DEVICES)
     parser.add_argument("--atol", type=float, default=1e-7)
     parser.add_argument("--rtol", type=float, default=1e-2)
-    mode = parser.add_mutually_exclusive_group()
-    mode.add_argument("--trace-residual", action="store_true", help="Add residual-path probes for mismatch diagnosis")
-    mode.add_argument(
+    parser.add_argument("--trace-residual", action="store_true", help="Add residual-path probes for mismatch diagnosis")
+    parser.add_argument(
         "--compare-output",
         action="store_true",
-        help="Finish both unrestricted greedy generations and compare tokens/text",
+        help="Finish both greedy generations, compare tokens/text and report absolute stage statistics",
     )
     parser.add_argument("--child", choices=("preflight", "eager", "graph"), help=argparse.SUPPRESS)
     parser.add_argument("--reference", help=argparse.SUPPRESS)

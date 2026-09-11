@@ -112,14 +112,18 @@ def test_missing_or_partial_outputs_cannot_match(driver, corruption):
 
 
 @pytest.mark.parametrize("difference", [None, "tokens", "text"])
-def test_pair_completes_both_runs_then_reports_output_result(driver, monkeypatch, tmp_path, capsys, difference):
+@pytest.mark.parametrize("trace_residual", [False, True])
+def test_pair_completes_both_runs_then_reports_output_result(
+    driver, monkeypatch, tmp_path, capsys, difference, trace_residual
+):
     (tmp_path / "config.json").write_text("{}")
     calls = []
 
     def run(argv, **kwargs):
         mode = argv[argv.index("--child") + 1]
         calls.append(mode)
-        assert "--compare-output" in argv and "--trace-residual" not in argv
+        assert "--compare-output" in argv
+        assert ("--trace-residual" in argv) == trace_residual
         if mode == "preflight":
             return
         directory = Path(argv[argv.index("--reference") + 1])
@@ -133,12 +137,15 @@ def test_pair_completes_both_runs_then_reports_output_result(driver, monkeypatch
         (directory / f"{mode}-output.json").write_text(json.dumps(generated), encoding="utf-8")
 
     monkeypatch.setattr(driver.subprocess, "run", run)
+    statistics = Mock()
+    monkeypatch.setattr(driver, "print_stage_statistics", statistics)
     if difference:
         with pytest.raises(AssertionError, match="OUTPUT DIFFERENT"):
-            driver.run_pair(str(tmp_path), compare_output=True)
+            driver.run_pair(str(tmp_path), compare_output=True, trace_residual=trace_residual)
     else:
-        driver.run_pair(str(tmp_path), compare_output=True)
+        driver.run_pair(str(tmp_path), compare_output=True, trace_residual=trace_residual)
     assert calls == ["preflight", "eager", "graph"]
+    statistics.assert_called_once_with(output_reports("eager"), output_reports("graph"))
     printed = capsys.readouterr().out
     assert "[SFA_OUTPUT] eager:" in printed and "[SFA_OUTPUT] graph:" in printed
     assert ("OUTPUT MATCH" in printed) == (difference is None)
@@ -156,10 +163,10 @@ def test_cli_forwards_output_mode(driver, monkeypatch):
     assert run.call_args.kwargs["trace_residual"] is False
 
 
-def test_extra_probes_cannot_silently_change_output_test(driver, monkeypatch):
+def test_extra_probes_are_explicitly_opted_in_for_output_statistics(driver, monkeypatch):
     run = Mock()
     monkeypatch.setattr(driver, "run_pair", run)
     monkeypatch.setattr(sys, "argv", ["driver", "--compare-output", "--trace-residual"])
-    with pytest.raises(SystemExit):
-        driver.main()
-    run.assert_not_called()
+    driver.main()
+    assert run.call_args.kwargs["compare_output"] is True
+    assert run.call_args.kwargs["trace_residual"] is True
