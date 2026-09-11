@@ -19,12 +19,54 @@ import sys
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+import psutil
+
 DEFAULT_MODEL = "/workspace/models/GLM-5.1-w4a8"
 DEFAULT_DEVICES = "0,1,2,3,4,5,6,7"
 PROMPT_TOKENS = 4351  # Beyond the 4096-token MTP scratch prefix, next to a 256 boundary.
 OUTPUT_TOKENS = 16
 PREFILL_CHUNK = 512
 FIXED_TOKEN = 100
+ENGINE_SHUTDOWN_TIMEOUT = 60
+
+
+def track_workers(reports: list[dict], tp_size: int) -> list:
+    """Keep process identities before shutdown, including PID reuse protection."""
+    if (
+        len(reports) != tp_size
+        or {report.get("rank") for report in reports} != set(range(tp_size))
+        or any(type(report.get("pid")) is not int or report["pid"] <= 0 for report in reports)
+        or len({report["pid"] for report in reports}) != tp_size
+    ):
+        raise RuntimeError("Incomplete/duplicate parity worker process identities")
+    workers = [psutil.Process(report["pid"]) for report in reports]
+    for worker in workers:
+        worker.create_time()
+    return workers
+
+
+def shutdown_engine(llm, workers: list) -> None:
+    """Close this engine explicitly and refuse overlap with the next engine."""
+    try:
+        llm.llm_engine.engine_core.shutdown(timeout=ENGINE_SHUTDOWN_TIMEOUT)
+    finally:
+        _, alive = psutil.wait_procs(live_workers(workers), timeout=ENGINE_SHUTDOWN_TIMEOUT)
+        alive = live_workers(alive)
+        if alive:
+            raise RuntimeError(f"Parity workers still alive after engine shutdown: {[worker.pid for worker in alive]}")
+
+
+def live_workers(workers: list) -> list:
+    # Workers are grandchildren. On Linux an exited worker may remain a zombie
+    # until its parent reaps it; it no longer owns sockets/device resources.
+    alive = []
+    for worker in workers:
+        try:
+            if worker.is_running() and worker.status() != psutil.STATUS_ZOMBIE:
+                alive.append(worker)
+        except psutil.NoSuchProcess:
+            pass
+    return alive
 
 
 def preflight_dependencies() -> None:
@@ -233,10 +275,35 @@ def engine_options(args: argparse.Namespace) -> dict:
 def run_child(args: argparse.Namespace) -> None:
     # Lazy imports: each process sees its final environment before loading any
     # vLLM/LMCache/plugin module or allocating a device context.
-    from vllm import LLM, SamplingParams
+    from vllm import LLM
+
+    llm = LLM(**engine_options(args))
+    workers = []
+    try:
+        identities = llm.collective_rpc("parity_process_info", timeout=ENGINE_SHUTDOWN_TIMEOUT)
+        workers = track_workers(identities, len(parse_devices(args.devices)))
+        run_generation(llm, args)
+        released = llm.collective_rpc("parity_release_resources", timeout=ENGINE_SHUTDOWN_TIMEOUT)
+        if sorted(released, key=lambda report: report["rank"]) != sorted(identities, key=lambda report: report["rank"]):
+            raise RuntimeError("Not all parity workers acknowledged resource release")
+    finally:
+        original_error = sys.exc_info()[1]
+        try:
+            shutdown_engine(llm, workers)
+        except Exception as cleanup_error:
+            if original_error is None:
+                raise
+            original_error.add_note(f"Parity engine cleanup also failed: {cleanup_error}")
+            print(f"[SFA_PARITY] {args.child} cleanup FAILED: {cleanup_error}", flush=True)
+    print(f"[SFA_PARITY] {args.child} cleanup complete: all {len(workers)} workers exited", flush=True)
+
+
+def run_generation(llm, args: argparse.Namespace) -> None:
+    # The lifecycle wrapper must also clean up generation, validation and I/O
+    # failures; none of these checks may leave an engine for the next mode.
+    from vllm import SamplingParams
 
     compare_output = getattr(args, "compare_output", False)
-    llm = LLM(**engine_options(args))
     # Explicit token IDs remove tokenizer/chat-template ambiguity. Varied prompt
     # IDs avoid a degenerate repeated-token cache. The default layer test fixes
     # target/proposed tokens; output comparison keeps BOTH choices unrestricted.

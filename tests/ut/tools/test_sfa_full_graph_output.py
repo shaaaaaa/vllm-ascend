@@ -43,6 +43,7 @@ def test_real_greedy_sampling_without_target_mask(driver, monkeypatch, tmp_path,
     stub = ModuleType("vllm")
     stub.LLM, stub.SamplingParams = constructor, Mock()
     monkeypatch.setitem(sys.modules, "vllm", stub)
+    monkeypatch.setattr(driver, "track_workers", lambda reports, tp_size: [])
     driver.run_child(
         SimpleNamespace(
             child=mode,

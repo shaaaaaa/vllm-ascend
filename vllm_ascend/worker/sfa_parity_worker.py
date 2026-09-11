@@ -11,6 +11,7 @@ SFA probes run inside existing opaque SFA ops during capture, not live replay.
 import importlib
 import inspect
 import json
+import os
 import re
 from pathlib import Path
 from unittest.mock import patch
@@ -784,6 +785,33 @@ class SFAParityWorker(NPUWorker):
     def parity_summary(self) -> dict:
         """RPC completion gate: no replay, stale hooks, or no transfers cannot pass."""
         return self._check(self._local_summary, "final coverage")
+
+    def parity_process_info(self) -> dict:
+        """Identify this test-owned worker before the driver closes the engine."""
+        return {"rank": self.rank, "pid": os.getpid()}
+
+    def parity_release_resources(self) -> dict:
+        """Finish NPU work and close test-owned cache/Ascend groups before exit."""
+        # Import on teardown, not before the original worker initialization.
+        from vllm.distributed.kv_transfer import ensure_kv_transfer_shutdown
+
+        from vllm_ascend.distributed.parallel_state import destroy_ascend_model_parallel
+
+        if not getattr(self, "_parity_resources_released", False):
+            if torch.npu.is_initialized():
+                torch.npu.synchronize()
+            try:
+                ensure_kv_transfer_shutdown()
+            finally:
+                destroy_ascend_model_parallel()
+            self._parity_resources_released = True
+        return self.parity_process_info()
+
+    def shutdown(self) -> None:
+        try:
+            self.parity_release_resources()
+        finally:
+            super().shutdown()
 
     def _local_summary(self):
         if self.parity_prefill_steps < 1 or self.parity_prefill_tokens < 1:

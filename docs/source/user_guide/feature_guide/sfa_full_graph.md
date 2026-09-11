@@ -362,6 +362,14 @@ tails, empty sources and fixed pointer-table addresses on CPU. Native calls
 and prevalidated attention metadata are fixtures; this is not a kernel test.
 It skips if the sibling repositories are absent. Driver preflight/error-order
 tests are in `tests/ut/tools/test_sfa_full_graph_parity.py`.
+Each parity engine explicitly releases its cache connector and Ascend process
+groups after generation, shuts down the engine, and waits for its identified
+workers to exit before the next engine starts. A release/exit failure aborts
+the comparison; the driver does not kill unrelated processes or change HCCL
+ports. CPU process-lifecycle regressions are in
+`tests/ut/tools/test_sfa_parity_shutdown.py`, and mocked worker release-order
+tests are in `tests/ut/compilation/test_sfa_parity_worker_shutdown.py`. These do not
+verify native HCCL port release on NPU hardware.
 `tests/ut/compilation/test_sfa_prefill_checkpoint.py` checks exact import bytes,
 physical block remapping, live-versus-dummy resident-state bindings, callback
 order, immutable snapshots, zero prefill recomputation and untouched decode

@@ -331,6 +331,7 @@ def test_child_constructs_tp8_not_eight_dp_replicas(driver, monkeypatch, tmp_pat
     stub.LLM = constructor
     stub.SamplingParams = Mock()
     monkeypatch.setitem(sys.modules, "vllm", stub)
+    monkeypatch.setattr(driver, "track_workers", lambda reports, tp_size: [])
     driver.run_child(
         SimpleNamespace(
             child=mode,
@@ -354,6 +355,7 @@ def test_child_constructs_tp8_not_eight_dp_replicas(driver, monkeypatch, tmp_pat
     assert config["enforce_eager"] == (mode == "eager")
     assert config["worker_cls"].endswith(".SFAParityWorker")
     assert config["additional_config"]["sfa_parity"]["trace_residual"] == trace_residual
+    llm.llm_engine.engine_core.shutdown.assert_called_once_with(timeout=driver.ENGINE_SHUTDOWN_TIMEOUT)
 
 
 def test_residual_trace_cli_is_forwarded_to_pair(driver, monkeypatch):
