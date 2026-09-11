@@ -245,6 +245,59 @@ and implementation errors still require further diagnosis. Identical decoded
 text alone cannot hide differing token IDs. Runtime/coverage failures remain
 failures, never an output match. No native rebuild is needed for this mode.
 
+### Diagnosing startup HCCL bind failures
+
+From **vllm-ascend**, run the following on the eight-NPU host (no rebuild for
+these Python-only diagnostic additions):
+
+```bash
+set -o pipefail
+python tools/sfa_startup_diagnostic.py 2>&1 | tee log.log
+```
+
+This uses the parity test's TP8/DP1/MTP1 configuration, runs its dependency
+preflight in a separate process, then starts the real vLLM multiprocessing
+executor. By default it creates the original worker/model-runner buffers and
+runs the failing W4A8 MoE scheme constructor, including its MC2 communicator
+lookup. **It does not load model weights, allocate KV caches, run prefill, or
+capture/replay a graph.** It is a reduction of the startup path, not a claim
+that the complete model constructor has been reproduced.
+
+`[SFA_STARTUP]` records PID, parent PID, rank, assigned/current device,
+visibility-derived device ID, optional device UUID, communication group
+members, call stacks and begin/end/error events. It also records the worker's
+already-loaded Torch/NPU versions and HCCL library paths. Native communicator-name
+calls are observed without making extra calls. Multiple name lookups can hit
+a native cache; their count alone does **not** prove duplicate socket binds.
+The script enables INFO native logs and appends current-run PID-matched host
+bind records under `[SFA_NATIVE_BIND]`, including on failure. Missing native
+records are reported explicitly, not interpreted as an unoccupied port.
+It does not change HCCL port settings, reset devices or kill existing jobs.
+On timeout/interrupt it stops only its own newly created process session.
+
+If the reduced startup passes, add `--load-model` to trace the original
+eight-layer dummy target/draft model load. This still stops before profiling
+and inference. Add `--skip-preflight` only to isolate the dependency-import
+process from startup. `--model`, `--devices`, and `--timeout` are optional;
+the defaults are the same GLM model path, devices 0 through 7 and 300 seconds
+per child. All output can use `log.log`; scratch trace files are managed and
+removed by the script.
+
+For a controlled merge comparison, keep these diagnostic tools fixed and use
+`--repo-root /path/to/old-checkouts`, whose children must be named `vllm`,
+`vllm-ascend`, `LMCache`, and `LMCache-Ascend`. Run the same absolute diagnostic
+script with the current and old roots. The root is checked before launching
+workers and again after startup; resolved package paths and Git revisions are
+logged. This option does not fetch, switch branches, or rebuild extensions:
+each selected checkout must have compatible, already-built native extensions.
+It does not claim binary-level A/B isolation when external libraries differ.
+
+`STARTUP PASS` requires every rank's startup report, complete unique device
+mapping and observed communicator-name calls. It is **not** an inference or
+full-graph correctness result. CPU tests in
+`tests/ut/tools/test_sfa_startup_diagnostic.py` cover transparent tracing,
+error propagation, mapping checks, native log filtering and executor scope.
+
 ### What must match
 
 - Complete target and draft weight fingerprints **for each matching TP rank**.

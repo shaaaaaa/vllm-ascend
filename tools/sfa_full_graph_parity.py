@@ -180,15 +180,12 @@ def child_environment(mode: str, devices: str) -> dict[str, str]:
     return environment
 
 
-def run_child(args: argparse.Namespace) -> None:
-    # Lazy imports: each process sees its final environment before loading any
-    # vLLM/LMCache/plugin module or allocating a device context.
-    from vllm import LLM, SamplingParams
-
+def engine_options(args: argparse.Namespace) -> dict:
+    """Share the exact parity configuration with startup-only diagnostics."""
     graph = args.child == "graph"
     compare_output = getattr(args, "compare_output", False)
     tp_size = len(parse_devices(args.devices))
-    llm = LLM(
+    return dict(
         model=args.model,
         trust_remote_code=True,
         load_format="dummy",
@@ -231,6 +228,15 @@ def run_child(args: argparse.Namespace) -> None:
             }
         },
     )
+
+
+def run_child(args: argparse.Namespace) -> None:
+    # Lazy imports: each process sees its final environment before loading any
+    # vLLM/LMCache/plugin module or allocating a device context.
+    from vllm import LLM, SamplingParams
+
+    compare_output = getattr(args, "compare_output", False)
+    llm = LLM(**engine_options(args))
     # Explicit token IDs remove tokenizer/chat-template ambiguity. Varied prompt
     # IDs avoid a degenerate repeated-token cache. The default layer test fixes
     # target/proposed tokens; output comparison keeps BOTH choices unrestricted.
