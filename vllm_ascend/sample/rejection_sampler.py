@@ -1,12 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 
+from dataclasses import replace
+
 import torch
 from vllm.triton_utils import HAS_TRITON, triton
+from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.rejection_sampler import (
     GREEDY_TEMPERATURE,
     MAX_SPEC_LEN,
     PLACEHOLDER_TOKEN_ID,
+    RejectionSampler,
     generate_uniform_probs,
 )
 
@@ -18,9 +22,71 @@ from vllm_ascend.ops.triton.reject_sample import (
     rejection_random_sample_kernel,
     sample_recovered_tokens_kernel,
 )
+from vllm_ascend.sample.rejection_diagnostics import (
+    diagnostic_stage,
+    record_stage,
+    stage_recorder_active,
+)
 from vllm_ascend.sample.sampler import apply_top_k_top_p
 
 
+class AscendRejectionSampler(RejectionSampler):
+    def forward(self, metadata, draft_probs, logits, sampling_metadata):
+        if not stage_recorder_active():
+            return super().forward(metadata, draft_probs, logits, sampling_metadata)
+
+        assert metadata.max_spec_len <= MAX_SPEC_LEN and logits is not None
+        bonus_logits = record_stage(
+            "bonus_index", logits.__getitem__, metadata.bonus_logits_indices
+        )
+        bonus_output = record_stage(
+            "bonus_sampler",
+            self.sampler,
+            logits=bonus_logits,
+            sampling_metadata=replace(sampling_metadata, max_num_logprobs=-1),
+            predict_bonus_token=True,
+            logprobs_mode_override=(
+                "processed_logits" if self.is_processed_logprobs_mode else "raw_logits"
+            ),
+        )
+
+        def prepare_target_logits():
+            raw_logits = logits[metadata.target_logits_indices].to(torch.float32)
+            return raw_logits, raw_logits if self.is_processed_logprobs_mode else raw_logits.clone()
+
+        raw_target_logits, target_logits = record_stage("target_index_cast", prepare_target_logits)
+        target_logits = record_stage(
+            "logits_processors", self.apply_logits_processors, target_logits, sampling_metadata, metadata
+        )
+        target_logits = apply_sampling_constraints(
+            target_logits, metadata.cu_num_draft_tokens, sampling_metadata
+        )
+        output_token_ids = rejection_sample(
+            metadata.draft_token_ids,
+            metadata.num_draft_tokens,
+            metadata.max_spec_len,
+            metadata.cu_num_draft_tokens,
+            draft_probs,
+            target_logits,
+            bonus_output.sampled_token_ids,
+            sampling_metadata,
+        )
+        logprobs_tensors = None
+        if sampling_metadata.max_num_logprobs is not None:
+            logprobs_tensors = record_stage(
+                "logprobs",
+                self._get_logprobs_tensors,
+                sampling_metadata.max_num_logprobs,
+                metadata,
+                logits,
+                target_logits if self.is_processed_logprobs_mode else raw_target_logits,
+                bonus_output.logprobs_tensors.logprobs,
+                output_token_ids,
+            )
+        return SamplerOutput(sampled_token_ids=output_token_ids, logprobs_tensors=logprobs_tensors)
+
+
+@diagnostic_stage("sampling_constraints")
 def apply_sampling_constraints(
     logits: torch.Tensor,  # [num_tokens, vocab_size]
     cu_num_draft_tokens: torch.Tensor,  # [batch_size]
@@ -79,6 +145,7 @@ def apply_sampling_constraints(
     return apply_top_k_top_p(logits, top_k, top_p)
 
 
+@diagnostic_stage("rejection_kernel")
 def rejection_sample(
     # [num_tokens]
     draft_token_ids: torch.Tensor,

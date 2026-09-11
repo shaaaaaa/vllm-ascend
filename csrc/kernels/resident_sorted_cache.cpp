@@ -318,12 +318,43 @@ public:
         gatherParams.src1RepeatStride = 8;
         uint32_t compactEnd = 0;
         uint32_t selectedElements = 0;
+        bool paddingZeroReady = false;
+        bool paddingWritePending = false;
         for (uint32_t mtpRow = 0; mtpRow < rowsPerRequest_; ++mtpRow) {
             const uint32_t row = request * rowsPerRequest_ + mtpRow;
             if (ReadGlobalScalarFresh(rowReqIndices_, row) !=
                 static_cast<int32_t>(request)) {
+                // The standalone planner clears graph-padding rows.  Keep
+                // the resident planner's contract identical: its remapper
+                // deliberately preserves positions that were not selected,
+                // so leaving this row untouched would forward arbitrary
+                // indexer output into sparse attention.  Shard zero is the
+                // sole writer; sibling shards already skip this row.
+                if (shard == 0) {
+                    if (!paddingZeroReady) {
+                        AscendC::Duplicate(
+                            input, static_cast<int32_t>(0), rowWidth_);
+                        AscendC::PipeBarrier<PIPE_V>();
+                        Sync<AscendC::HardEvent::V_MTE3>();
+                        paddingZeroReady = true;
+                    }
+                    const uint64_t paddingOffset =
+                        static_cast<uint64_t>(request) * requestWidth_
+                        + static_cast<uint64_t>(mtpRow) * rowWidth_;
+                    CopyLocalToGlobalExact(
+                        topkIndices_[paddingOffset], input, rowWidth_);
+                    paddingWritePending = true;
+                }
                 continue;
             }
+            if (paddingWritePending) {
+                // A later valid MTP row reuses ``input`` as its MTE2
+                // destination.  Do not overwrite the zero source until all
+                // earlier padding writes have consumed it.
+                Sync<AscendC::HardEvent::MTE3_MTE2>();
+                paddingWritePending = false;
+            }
+            paddingZeroReady = false;
             const uint64_t inputOffset =
                 static_cast<uint64_t>(request) * requestWidth_
                 + static_cast<uint64_t>(mtpRow) * rowWidth_;
@@ -421,6 +452,13 @@ public:
                 static_cast<uint32_t>(tokenElements);
             compactEnd =
                 compactOffset + static_cast<uint32_t>(tokenElements);
+        }
+        if (paddingWritePending) {
+            // This AIV may process another request and reuse ``input`` from
+            // either MTE2 or V.  Finish the final padding write before both
+            // possible producer pipes are allowed to overwrite that UB.
+            Sync<AscendC::HardEvent::MTE3_MTE2>();
+            Sync<AscendC::HardEvent::MTE3_V>();
         }
 
         const uint32_t sortElements = SortElementCount(compactEnd);

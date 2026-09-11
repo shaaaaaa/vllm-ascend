@@ -51,6 +51,430 @@ class TestNPUWorker(TestBase):
         self.distributed_init_method = "tcp://localhost:12345"
         self.is_driver_worker = False
 
+    def test_mooncake_placement_info_reports_tp0_with_routable_dp_rank(self):
+        from vllm_ascend.worker.worker import NPUWorker
+
+        worker = NPUWorker.__new__(NPUWorker)
+        worker.vllm_config = SimpleNamespace(
+            parallel_config=SimpleNamespace(data_parallel_rank=3)
+        )
+        worker.get_kv_connector_handshake_metadata = MagicMock(
+            return_value={
+                0: SimpleNamespace(
+                    tp_rank=0,
+                    local_ip="7.150.7.133",
+                    te_rpc_port=12345,
+                )
+            }
+        )
+
+        self.assertEqual(
+            worker.get_mooncake_placement_info(),
+            {"dp_rank": 3, "segment": "7.150.7.133:12345"},
+        )
+
+        worker.vllm_config.parallel_config.local_engines_only = True
+        worker.vllm_config.parallel_config.data_parallel_rank_local = 0
+        self.assertEqual(
+            worker.get_mooncake_placement_info(),
+            {"dp_rank": 0, "segment": "7.150.7.133:12345"},
+        )
+
+    def test_mooncake_placement_info_ignores_non_tp0_and_invalid_metadata(self):
+        from vllm_ascend.worker.worker import NPUWorker
+
+        worker = NPUWorker.__new__(NPUWorker)
+        worker.vllm_config = SimpleNamespace(
+            parallel_config=SimpleNamespace(data_parallel_rank=3)
+        )
+        for metadata in (
+            None,
+            SimpleNamespace(tp_rank=1, local_ip="host", te_rpc_port=1),
+            SimpleNamespace(tp_rank=0, local_ip="", te_rpc_port=1),
+            SimpleNamespace(tp_rank=0, local_ip="host", te_rpc_port=0),
+        ):
+            worker.get_kv_connector_handshake_metadata = MagicMock(
+                return_value=None if metadata is None else {0: metadata}
+            )
+            with self.subTest(metadata=metadata):
+                self.assertIsNone(worker.get_mooncake_placement_info())
+
+    def test_remote_fill_placement_uses_its_routable_dp_identity(self):
+        from vllm_ascend.worker.worker import NPUWorker
+
+        worker = NPUWorker.__new__(NPUWorker)
+        worker.vllm_config = SimpleNamespace(
+            parallel_config=SimpleNamespace(
+                data_parallel_rank=1,
+                data_parallel_rank_local=0,
+                data_parallel_index=5,
+                local_engines_only=True,
+            )
+        )
+        worker.get_kv_connector_handshake_metadata = MagicMock(
+            return_value=None
+        )
+        remote_fill = {
+            "enabled": True,
+            "dp_rank": 5,
+            "tp_rank": 0,
+        }
+        connector = SimpleNamespace(
+            get_remote_fill_placement_info=lambda: remote_fill
+        )
+
+        with (
+            patch(
+                "vllm_ascend.worker.worker.has_kv_transfer_group",
+                return_value=True,
+            ),
+            patch(
+                "vllm_ascend.worker.worker.get_kv_transfer_group",
+                return_value=connector,
+            ),
+        ):
+            self.assertEqual(
+                worker.get_mooncake_placement_info(),
+                {
+                    "dp_rank": 5,
+                    "api_dp_rank": 0,
+                    "segment": None,
+                    "remote_fill": remote_fill,
+                },
+            )
+
+    def test_remote_fill_fatal_latch_exits_before_health_probe(self):
+        from vllm_ascend.worker.worker import NPUWorker
+
+        worker = NPUWorker.__new__(NPUWorker)
+        connector = SimpleNamespace(
+            remote_fill_requires_paired_restart=lambda: True
+        )
+        with (
+            patch(
+                "vllm_ascend.worker.worker.has_kv_transfer_group",
+                return_value=True,
+            ),
+            patch(
+                "vllm_ascend.worker.worker.get_kv_transfer_group",
+                return_value=connector,
+            ),
+            patch("subprocess.run") as run,
+            self.assertRaises(SystemExit) as raised,
+        ):
+            worker.check_health()
+        self.assertEqual(raised.exception.code, 86)
+        run.assert_not_called()
+
+    def test_remote_fill_fatal_latched_during_health_probe_still_exits(self):
+        from vllm_ascend.worker.worker import NPUWorker
+
+        worker = NPUWorker.__new__(NPUWorker)
+        worker.local_rank = 0
+        fatal = MagicMock(side_effect=(False, True))
+        connector = SimpleNamespace(
+            remote_fill_requires_paired_restart=fatal
+        )
+        result = SimpleNamespace(returncode=0, stdout="Health : OK", stderr="")
+        with (
+            patch(
+                "vllm_ascend.worker.worker.has_kv_transfer_group",
+                return_value=True,
+            ),
+            patch(
+                "vllm_ascend.worker.worker.get_kv_transfer_group",
+                return_value=connector,
+            ),
+            patch("subprocess.run", return_value=result),
+            self.assertRaises(SystemExit),
+        ):
+            worker.check_health()
+        self.assertEqual(fatal.call_count, 2)
+
+    def test_execute_model_converts_new_remote_fill_fatal_to_system_exit(self):
+        from vllm_ascend.worker.worker import NPUWorker
+
+        worker = NPUWorker.__new__(NPUWorker)
+        worker._pp_send_work = []
+        worker.model_runner = MagicMock()
+        worker.model_runner.execute_model.side_effect = RuntimeError("finalize failed")
+        fatal = MagicMock(side_effect=(False, True))
+        connector = SimpleNamespace(
+            remote_fill_requires_paired_restart=fatal
+        )
+        scheduler_output = SimpleNamespace(total_num_scheduled_tokens=0)
+        with (
+            patch(
+                "vllm_ascend.worker.worker.has_kv_transfer_group",
+                return_value=True,
+            ),
+            patch(
+                "vllm_ascend.worker.worker.get_kv_transfer_group",
+                return_value=connector,
+            ),
+            self.assertRaises(SystemExit),
+        ):
+            worker.execute_model(scheduler_output)
+
+        worker.model_runner.abort_kv_connector_finalize.assert_called_once_with()
+        self.assertEqual(fatal.call_count, 2)
+
+    def test_execute_model_checks_remote_fill_fatal_after_success(self):
+        from vllm.v1.outputs import ModelRunnerOutput
+
+        from vllm_ascend.worker.worker import NPUWorker
+
+        worker = NPUWorker.__new__(NPUWorker)
+        worker._pp_send_work = []
+        worker.model_runner = MagicMock()
+        worker.model_runner.execute_model.return_value = MagicMock(
+            spec=ModelRunnerOutput
+        )
+        fatal = MagicMock(side_effect=(False, True))
+        connector = SimpleNamespace(
+            remote_fill_requires_paired_restart=fatal
+        )
+        scheduler_output = SimpleNamespace(total_num_scheduled_tokens=0)
+        with (
+            patch(
+                "vllm_ascend.worker.worker.has_kv_transfer_group",
+                return_value=True,
+            ),
+            patch(
+                "vllm_ascend.worker.worker.get_kv_transfer_group",
+                return_value=connector,
+            ),
+            self.assertRaises(SystemExit),
+        ):
+            worker.execute_model(scheduler_output)
+
+        self.assertEqual(fatal.call_count, 2)
+
+    def test_execute_model_traces_only_first_nonempty_batch(self):
+        from vllm.v1.outputs import ModelRunnerOutput
+
+        from vllm_ascend.worker.worker import NPUWorker
+
+        worker = NPUWorker.__new__(NPUWorker)
+        worker._pp_send_work = []
+        worker._raise_if_remote_fill_restart_required = MagicMock()
+        worker.model_runner = MagicMock()
+        output = worker.model_runner.execute_model.return_value = MagicMock(
+            spec=ModelRunnerOutput
+        )
+        first = SimpleNamespace(
+            total_num_scheduled_tokens=1,
+            num_scheduled_tokens={"first": 1},
+            kv_connector_metadata=None,
+        )
+        second = SimpleNamespace(
+            total_num_scheduled_tokens=1,
+            num_scheduled_tokens={"second": 1},
+            kv_connector_metadata=None,
+        )
+
+        with (
+            patch(
+                "vllm_ascend.worker.worker.cold_perf_enabled",
+                return_value=True,
+            ),
+            patch("vllm_ascend.worker.worker.mark_cold_perf_requests") as mark,
+            patch(
+                "vllm_ascend.worker.worker.is_cold_perf_request",
+                side_effect=lambda req_id: req_id == "first",
+            ),
+            patch("vllm_ascend.worker.worker.log_cold_perf_event") as log,
+            patch(
+                "vllm_ascend.worker.worker.faulthandler.dump_traceback_later"
+            ) as arm,
+            patch(
+                "vllm_ascend.worker.worker.faulthandler.cancel_dump_traceback_later"
+            ) as cancel,
+            patch(
+                "vllm_ascend.worker.worker.get_pp_group",
+                return_value=SimpleNamespace(is_first_rank=True),
+            ),
+            patch(
+                "vllm_ascend.worker.worker.get_tp_group",
+                return_value=SimpleNamespace(rank_in_group=3),
+            ),
+        ):
+            self.assertIs(worker.execute_model(first), output)
+            self.assertIs(worker.execute_model(second), output)
+
+        mark.assert_called_once_with(("first",))
+        self.assertEqual(
+            [call.args[0] for call in log.call_args_list],
+            [
+                "decoder_execute_rpc_entry",
+                "decoder_execute_stall_watchdog_armed",
+                "decoder_execute_rpc_return",
+            ],
+        )
+        arm.assert_called_once_with(75)
+        cancel.assert_called_once_with()
+        self.assertEqual(log.call_args_list[0].kwargs["tp_rank"], 3)
+        self.assertEqual(log.call_args_list[1].kwargs["timeout_seconds"], 75)
+
+    def test_execute_model_reports_only_slow_execution_and_submission_gaps(self):
+        from vllm.v1.outputs import ModelRunnerOutput
+
+        from vllm_ascend.worker.worker import NPUWorker
+
+        worker = NPUWorker.__new__(NPUWorker)
+        worker._pp_send_work = []
+        worker._raise_if_remote_fill_restart_required = MagicMock()
+        worker.model_runner = MagicMock()
+        worker.model_runner.execute_model.return_value = MagicMock(
+            spec=ModelRunnerOutput
+        )
+        scheduler_output = SimpleNamespace(
+            total_num_scheduled_tokens=1,
+            num_scheduled_tokens={"warm": 1},
+            kv_connector_metadata=None,
+        )
+
+        with (
+            patch(
+                "vllm_ascend.worker.worker.cold_perf_enabled",
+                return_value=True,
+            ),
+            patch(
+                "vllm_ascend.worker.worker.is_cold_perf_request",
+                return_value=False,
+            ),
+            patch(
+                "vllm_ascend.worker.worker.time.perf_counter",
+                side_effect=(1.0, 1.1, 2.0, 2.8),
+            ),
+            patch(
+                "vllm_ascend.worker.worker.log_cold_perf_process_event"
+            ) as log,
+            patch(
+                "vllm_ascend.worker.worker.get_tp_group",
+                return_value=SimpleNamespace(rank_in_group=2),
+            ),
+            patch(
+                "vllm_ascend.worker.worker.get_pp_group",
+                return_value=SimpleNamespace(is_first_rank=True),
+            ),
+        ):
+            worker.execute_model(scheduler_output)
+            worker.execute_model(scheduler_output)
+
+        self.assertEqual(
+            [call.args[0] for call in log.call_args_list],
+            ["decoder_submission_gap", "decoder_execute_slow"],
+        )
+        self.assertEqual(log.call_args_list[0].kwargs["gap_ms"], 900.0)
+        self.assertEqual(log.call_args_list[1].kwargs["elapsed_ms"], 800.0)
+        self.assertEqual(log.call_args_list[1].kwargs["tp_rank"], 2)
+
+    def test_sample_tokens_checks_fatal_latch_after_success_and_failure(self):
+        from vllm_ascend.worker.worker import NPUWorker
+
+        for sample_error in (None, RuntimeError("sample failed")):
+            with self.subTest(sample_error=sample_error):
+                worker = NPUWorker.__new__(NPUWorker)
+                worker.model_runner = MagicMock()
+                if sample_error is None:
+                    worker.model_runner.sample_tokens.return_value = object()
+                else:
+                    worker.model_runner.sample_tokens.side_effect = sample_error
+                fatal = MagicMock(side_effect=(False, True))
+                connector = SimpleNamespace(
+                    remote_fill_requires_paired_restart=fatal
+                )
+                with (
+                    patch(
+                        "vllm_ascend.worker.worker.has_kv_transfer_group",
+                        return_value=True,
+                    ),
+                    patch(
+                        "vllm_ascend.worker.worker.get_kv_transfer_group",
+                        return_value=connector,
+                    ),
+                    self.assertRaises(SystemExit),
+                ):
+                    worker.sample_tokens(MagicMock())
+
+                if sample_error is None:
+                    worker.model_runner.abort_kv_connector_finalize.assert_not_called()
+                else:
+                    worker.model_runner.abort_kv_connector_finalize.assert_called_once_with()
+                self.assertEqual(fatal.call_count, 2)
+
+    def test_sample_tokens_traces_marked_cold_request(self):
+        from vllm_ascend.worker.worker import NPUWorker
+
+        worker = NPUWorker.__new__(NPUWorker)
+        worker.model_runner = MagicMock()
+        worker.model_runner._cold_perf_current_req_ids = ("cold",)
+        worker.model_runner.sample_tokens.return_value = "output"
+        worker._raise_if_remote_fill_restart_required = MagicMock()
+
+        with (
+            patch("vllm_ascend.worker.worker.log_cold_perf_event") as log,
+            patch(
+                "vllm_ascend.worker.worker.faulthandler.dump_traceback_later"
+            ) as arm,
+            patch(
+                "vllm_ascend.worker.worker.faulthandler.cancel_dump_traceback_later"
+            ) as cancel,
+            patch("vllm_ascend.worker.worker.forget_cold_perf_request") as forget,
+            patch(
+                "vllm_ascend.worker.worker.get_tp_group",
+                return_value=SimpleNamespace(rank_in_group=2),
+            ),
+        ):
+            output = worker.sample_tokens(MagicMock())
+
+        self.assertEqual(output, "output")
+        self.assertEqual(
+            [call.args[0] for call in log.call_args_list],
+            [
+                "decoder_sample_rpc_entry",
+                "decoder_sample_stall_watchdog_armed",
+                "decoder_sample_rpc_return",
+            ],
+        )
+        arm.assert_called_once_with(70)
+        cancel.assert_called_once_with()
+        forget.assert_called_once_with("cold")
+        self.assertEqual(log.call_args_list[0].kwargs["tp_rank"], 2)
+        self.assertEqual(log.call_args_list[1].kwargs["timeout_seconds"], 70)
+
+    def test_sample_tokens_propagates_followup_trace_without_watchdog(self):
+        from vllm_ascend.worker.worker import NPUWorker
+
+        worker = NPUWorker.__new__(NPUWorker)
+        worker.model_runner = MagicMock()
+        worker.model_runner._cold_perf_current_req_ids = ()
+        worker.model_runner._cold_perf_sample_trace_req_ids = ("followup",)
+        output = SimpleNamespace()
+        worker.model_runner.sample_tokens.return_value = output
+        worker._raise_if_remote_fill_restart_required = MagicMock()
+
+        with (
+            patch("vllm_ascend.worker.worker.log_cold_perf_event") as log,
+            patch(
+                "vllm_ascend.worker.worker.faulthandler.dump_traceback_later"
+            ) as arm,
+            patch(
+                "vllm_ascend.worker.worker.faulthandler.cancel_dump_traceback_later"
+            ) as cancel,
+            patch("vllm_ascend.worker.worker.forget_cold_perf_request") as forget,
+        ):
+            result = worker.sample_tokens(MagicMock())
+
+        self.assertIs(result, output)
+        self.assertEqual(output._ascend_cold_perf_request_ids, ("followup",))
+        self.assertIsInstance(output._ascend_cold_perf_sample_return_ns, int)
+        log.assert_not_called()
+        arm.assert_not_called()
+        cancel.assert_not_called()
+        forget.assert_not_called()
+
     @patch("vllm_ascend.utils.adapt_patch")
     @patch("vllm_ascend.ops")
     @patch("vllm_ascend.worker.worker._register_atb_extensions")
@@ -1074,6 +1498,7 @@ class TestNPUWorker(TestBase):
             worker = NPUWorker()
             worker.model_runner = MagicMock()
             worker.vllm_config = MagicMock()
+            worker.vllm_config.kv_transfer_config = None
             worker.model_config = MagicMock()
             worker.model_config.enforce_eager = True
             worker.model_config.seed = 12345
@@ -1104,9 +1529,22 @@ class TestNPUWorker(TestBase):
             # Verify atb warm up
             mock_warm_up_atb.assert_called_once()
 
+    @patch("vllm_ascend.worker.worker.log_cold_perf_process_event")
+    @patch("vllm_ascend.worker.worker.cold_perf_enabled", return_value=True)
+    @patch(
+        "vllm_ascend.worker.worker.staged_sfa_graph_configured",
+        return_value=False,
+    )
     @patch("vllm_ascend.worker.worker.logger")
     @patch("vllm_ascend.worker.worker.NPUWorker._warm_up_atb")
-    def test_compile_or_warm_up_model_with_graph_capture(self, mock_warm_up_atb, mock_logger):
+    def test_compile_or_warm_up_model_with_graph_capture(
+        self,
+        mock_warm_up_atb,
+        mock_logger,
+        _mock_staged_sfa_graph_configured,
+        _mock_cold_perf_enabled,
+        mock_perf_log,
+    ):
         """Test compile_or_warm_up_model method - with graph capture enabled"""
         from vllm_ascend.worker.worker import NPUWorker
 
@@ -1115,6 +1553,7 @@ class TestNPUWorker(TestBase):
             worker = NPUWorker()
             worker.model_runner = MagicMock()
             worker.vllm_config = MagicMock()
+            worker.vllm_config.kv_transfer_config = None
             worker.model_config = MagicMock()
             worker.model_config.enforce_eager = False  # Enable graph capture
             worker.model_config.seed = 67890
@@ -1134,8 +1573,106 @@ class TestNPUWorker(TestBase):
             # Should call capture_model in non-eager mode
             worker.model_runner.capture_model.assert_called_once()
 
+            self.assertEqual(
+                [call.args[0] for call in mock_perf_log.call_args_list],
+                [
+                    "decoder_graph_capture_start",
+                    "decoder_graph_capture_complete",
+                ],
+            )
+            self.assertEqual(
+                mock_perf_log.call_args_list[0].kwargs["capture_sizes"],
+                [4, 8],
+            )
+            self.assertIn("elapsed_ms", mock_perf_log.call_args_list[1].kwargs)
+
             # Verify atb warm up
             mock_warm_up_atb.assert_called_once()
+
+    def test_decoder_ep_wait_precedes_all_warmup_and_capture(self):
+        from vllm_ascend.worker.worker import NPUWorker
+
+        for eager in (False, True):
+            for perf in (False, True):
+                with self.subTest(eager=eager, perf=perf):
+                    worker = NPUWorker.__new__(NPUWorker)
+                    worker.model_config = SimpleNamespace(is_moe=True, enforce_eager=eager, seed=0)
+                    worker.vllm_config = SimpleNamespace(
+                        kv_transfer_config=SimpleNamespace(is_kv_consumer=True),
+                        parallel_config=SimpleNamespace(
+                            enable_expert_parallel=True, data_parallel_size=4, enable_elastic_ep=False
+                        ),
+                        compilation_config=SimpleNamespace(
+                            compile_sizes=[1],
+                            cudagraph_mode=None,
+                            cudagraph_capture_sizes=[],
+                            get_compile_ranges=lambda: [],
+                            compilation_time=0,
+                        ),
+                    )
+                    events = []
+                    group = SimpleNamespace(barrier=lambda events=events: events.append("ready"))
+                    worker.model_runner = SimpleNamespace(
+                        _dummy_run=lambda _size, events=events: events.append("warmup"),
+                        capture_model=lambda events=events: events.append("capture"),
+                    )
+                    worker._warm_up_atb = lambda events=events: events.append("atb")
+                    with (
+                        patch("vllm_ascend.worker.worker.get_ep_group", return_value=group),
+                        patch("vllm_ascend.worker.worker.cold_perf_enabled", return_value=perf),
+                        patch("vllm_ascend.worker.worker.log_cold_perf_process_event") as log,
+                        patch("vllm_ascend.worker.worker.staged_sfa_graph_configured", return_value=False),
+                        patch("vllm_ascend.worker.worker.get_ascend_device_type", return_value=None),
+                        patch("vllm_ascend.worker.worker.set_random_seed"),
+                    ):
+                        worker.compile_or_warm_up_model()
+                    self.assertEqual(events, ["ready", "warmup"] + ([] if eager else ["capture"]) + ["atb"])
+                    if not perf:
+                        log.assert_not_called()
+                    else:
+                        self.assertEqual(log.call_args_list[0].args[0], "decoder_ep_startup_wait_start")
+                        self.assertEqual(log.call_args_list[1].args[0], "decoder_ep_startup_wait_complete")
+
+    def test_decoder_ep_startup_wait_is_scoped_to_fixed_ep_decoders(self):
+        from vllm_ascend.worker.worker import NPUWorker
+
+        for excluded in ("no_connector", "sender", "dense", "no_ep", "single_dp", "elastic"):
+            with self.subTest(excluded=excluded):
+                worker = NPUWorker.__new__(NPUWorker)
+                worker.model_config = SimpleNamespace(is_moe=excluded != "dense")
+                worker.vllm_config = SimpleNamespace(
+                    kv_transfer_config=(
+                        None if excluded == "no_connector" else SimpleNamespace(is_kv_consumer=excluded != "sender")
+                    ),
+                    parallel_config=SimpleNamespace(
+                        enable_expert_parallel=excluded != "no_ep",
+                        data_parallel_size=1 if excluded == "single_dp" else 4,
+                        enable_elastic_ep=excluded == "elastic",
+                    ),
+                )
+                with patch("vllm_ascend.worker.worker.get_ep_group") as group:
+                    worker._wait_for_decoder_ep_startup()
+                group.assert_not_called()
+
+    def test_decoder_ep_startup_failure_does_not_launch_warmup(self):
+        from vllm_ascend.worker.worker import NPUWorker
+
+        worker = NPUWorker.__new__(NPUWorker)
+        worker.model_config = SimpleNamespace(is_moe=True)
+        worker.vllm_config = SimpleNamespace(
+            kv_transfer_config=SimpleNamespace(is_kv_consumer=True),
+            parallel_config=SimpleNamespace(enable_expert_parallel=True, data_parallel_size=4, enable_elastic_ep=False),
+        )
+        group = SimpleNamespace(barrier=MagicMock(side_effect=RuntimeError("peer initialization failed")))
+        worker.model_runner = MagicMock()
+        with (
+            patch("vllm_ascend.worker.worker.get_ep_group", return_value=group),
+            patch("vllm_ascend.worker.worker.cold_perf_enabled", return_value=False),
+            self.assertRaisesRegex(RuntimeError, "peer initialization failed"),
+        ):
+            worker.compile_or_warm_up_model()
+        worker.model_runner._dummy_run.assert_not_called()
+        worker.model_runner.capture_model.assert_not_called()
 
     @patch("vllm_ascend.worker.worker.CaMemAllocator")
     def test_initialize_from_config_with_sleep_mode(

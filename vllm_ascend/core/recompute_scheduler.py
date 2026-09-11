@@ -46,6 +46,13 @@ from vllm.v1.sample.rejection_sampler import PLACEHOLDER_TOKEN_ID
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.utils import ConstantList, record_function_or_nullcontext
 
+from vllm_ascend.serving_perf import (
+    cold_perf_enabled,
+    is_cold_perf_request,
+    log_cold_perf_event,
+    mark_cold_perf_connector_requests,
+)
+
 
 # `spec_manager_map` in single_type_kv_cache_manager is a module-level dict
 # whose keys are class objects bound at import time.  When the async
@@ -155,64 +162,6 @@ class RecomputeScheduler(Scheduler):
             if self.log_stats:
                 request.record_event(EngineCoreEventType.QUEUED)
 
-    def _update_waiting_for_remote_kv(self, request: Request) -> None:
-        """
-        KV Connector: update request state after async recv is finished.
-
-        The finished_recving_kv_req_ids list is populated
-        on the previous steps()'s update_from_output based
-        on the worker side connector.
-
-        When the kv transfer is ready, we cache the blocks
-        and the request state will be moved back to WAITING from
-        WAITING_FOR_REMOTE_KV.
-
-        NOTE: The check for whether request.request_id is in
-        finished_recving_kv_req_ids is now done by the caller
-        (_try_promote_blocked_waiting_request in the parent Scheduler),
-        so this method is only called when the recv is confirmed finished.
-        """
-        assert self.connector is not None
-
-        if request.request_id in self.failed_recving_kv_req_ids:
-            # Request had KV load failures; num_computed_tokens was already
-            # updated in _update_requests_with_invalid_blocks
-            if request.num_computed_tokens:
-                # Cache any valid computed tokens.
-                self.kv_cache_manager.cache_blocks(request, request.num_computed_tokens)
-            else:
-                # No valid computed tokens, release allocated blocks.
-                # There may be a local cache hit on retry.
-                self.kv_cache_manager.free(request)
-
-            self.failed_recving_kv_req_ids.remove(request.request_id)
-        else:
-            # Now that the blocks are ready, actually cache them.
-            # Use Ascend-specific block_ids logic to handle multi-group KV
-            # cache configurations (e.g. MLA) where len(block_ids) > 1.
-            block_ids = self.kv_cache_manager.get_block_ids(request.request_id)
-            if len(block_ids) == 1:
-                num_computed_tokens = len(block_ids[0]) * self.block_size
-                # Handle the case where num request tokens less than one block.
-                num_computed_tokens = min(num_computed_tokens, request.num_tokens)
-            else:
-                num_computed_tokens = request.num_tokens
-            # on a full prompt hit, we need to re-compute the last token
-            # in order to be able to sample the next token
-            if num_computed_tokens == request.num_tokens:
-                num_computed_tokens -= 1
-            # This will cache the blocks iff caching is enabled.
-            self.kv_cache_manager.cache_blocks(request, num_computed_tokens)
-
-            # Update the request state for scheduling.
-            request.num_computed_tokens = num_computed_tokens
-
-            # Count the number of prefix cached tokens.
-            if request.num_cached_tokens < 0:
-                request.num_cached_tokens = request.num_computed_tokens
-
-        self.finished_recving_kv_req_ids.remove(request.request_id)
-
     def schedule(self) -> RecomputeSchedulerOutput:
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
@@ -242,6 +191,8 @@ class RecomputeScheduler(Scheduler):
 
         # For logging.
         scheduled_timestamp = time.monotonic()
+        cold_perf_active = cold_perf_enabled()
+        cold_perf_schedule_operands: dict[str, dict[str, object]] = {}
 
         self.kv_cache_manager.new_step_starts()
 
@@ -388,6 +339,16 @@ class RecomputeScheduler(Scheduler):
             request_id = request.request_id
             req_to_new_blocks[request_id] = new_blocks
             num_scheduled_tokens[request_id] = num_new_tokens
+            if cold_perf_active:
+                cold_perf_schedule_operands[request_id] = {
+                    "queue": "running",
+                    "status": str(request.status),
+                    "num_scheduled_tokens": num_new_tokens,
+                    "num_tokens_with_spec": request.num_tokens_with_spec,
+                    "num_computed_tokens": request.num_computed_tokens,
+                    "num_output_placeholders": request.num_output_placeholders,
+                    "spec_token_count": len(request.spec_token_ids),
+                }
             token_budget -= num_new_tokens
             req_index += 1
 
@@ -653,12 +614,28 @@ class RecomputeScheduler(Scheduler):
                     request.num_computed_tokens = num_computed_tokens
                     continue
 
+                if cold_perf_active:
+                    cold_perf_schedule_operands[request_id] = {
+                        "queue": "waiting",
+                        "status": str(request.status),
+                        "num_scheduled_tokens": num_new_tokens,
+                        "num_tokens_with_spec": request.num_tokens_with_spec,
+                        "num_computed_tokens": num_computed_tokens,
+                        "num_output_placeholders": request.num_output_placeholders,
+                        "spec_token_count": len(request.spec_token_ids),
+                    }
+
                 # For spec_token_ids, the waiting queue has the same processing
                 # as the running queue.
                 if self.is_mtp_kv_consumer and request.spec_token_ids:
+                    # Use the admitted cache-hit frontier. For a synchronous
+                    # prefix load, request.num_computed_tokens is still stale
+                    # until the request is moved to RUNNING below. Dropping a
+                    # scheduled draft here also undercounts async output
+                    # placeholders and breaks the next batch's query width.
                     num_scheduled_spec_tokens = (
                         num_new_tokens
-                        + request.num_computed_tokens
+                        + num_computed_tokens
                         - request.num_tokens
                         - request.num_output_placeholders
                     )
@@ -792,6 +769,22 @@ class RecomputeScheduler(Scheduler):
         if self.connector is not None:
             meta: KVConnectorMetadata = self.connector.build_connector_meta(scheduler_output)
             scheduler_output.kv_connector_metadata = meta
+            if cold_perf_active:
+                mark_cold_perf_connector_requests(meta)
+                cold_req_ids = [
+                    req_id
+                    for req_id in num_scheduled_tokens
+                    if is_cold_perf_request(req_id)
+                ]
+                log_cold_perf_event(
+                    "decoder_schedule_operands",
+                    request_ids=cold_req_ids,
+                    once=True,
+                    requests=[
+                        {"request_id": req_id, **cold_perf_schedule_operands[req_id]}
+                        for req_id in cold_req_ids
+                    ],
+                )
 
         # Build the connector meta for ECConnector
         if self.ec_connector is not None:
@@ -836,6 +829,24 @@ class RecomputeScheduler(Scheduler):
             # load. Identify affected requests and adjust their computed token
             # count to trigger recomputation of the invalid blocks.
             failed_kv_load_req_ids = self._handle_invalid_blocks(kv_connector_output.invalid_block_ids)
+
+        if (
+            kv_connector_output
+            and kv_connector_output.kv_connector_worker_meta is not None
+            and self.connector
+        ):
+            update_worker_metadata = getattr(
+                self.connector, "update_connector_worker_metadata", None
+            )
+            if callable(update_worker_metadata):
+                update_worker_metadata(
+                    kv_connector_output.kv_connector_worker_meta,
+                    {
+                        req_id
+                        for req_id, request in self.requests.items()
+                        if not request.is_finished()
+                    },
+                )
 
         # return recomputed requests as EngineCoreOutput
         if scheduler_output.recomputed_reqs is not None:

@@ -1,3 +1,4 @@
+import inspect
 import os
 import sys
 from pathlib import Path
@@ -487,12 +488,45 @@ def test_sparse_boundary_prefers_explicit_committed_end():
         ) == [0, 4096, 8192]
 
 
-def _staged_route(frontiers=(4096,)):
+def test_sparse_boundary_uses_wrapped_connector_metadata():
+    from vllm_ascend.attention import utils as attention_utils
+
+    child_metadata = SimpleNamespace(
+        requests=[
+            SimpleNamespace(
+                req_id="wrapped",
+                is_sparse_decode=True,
+                load_spec=SimpleNamespace(
+                    can_load=True,
+                    dsa_committed_end=8192,
+                ),
+            )
+        ]
+    )
+    connector = SimpleNamespace(
+        supports_staged_sfa_sparse_load=True,
+        uses_layerwise_model_callbacks=True,
+        wait_for_layer_load=lambda *_args, **_kwargs: None,
+        _get_connector_metadata=lambda: SimpleNamespace(metadata=[]),
+        _unwrap_staged_sfa_connector_metadata=lambda _metadata: child_metadata,
+    )
+    with (
+        patch.object(attention_utils, "has_kv_transfer_group", return_value=True),
+        patch.object(attention_utils, "is_v1_kv_transfer_group", return_value=True),
+        patch.object(attention_utils, "get_kv_transfer_group", return_value=connector),
+    ):
+        assert attention_utils.get_lmcache_sparse_cached_tokens(["wrapped"]) == [
+            8192
+        ]
+
+
+def _staged_route(frontiers=(4096,), cold_compact_resumes=()):
     return StagedSFARouteDecision(
         StagedSFARouteAction.STAGED,
         StagedSFARouteReason.ELIGIBLE,
         STAGED_SFA_SINGLETON_GRAPH_KEY,
         frontiers,
+        cold_compact_resumes,
     )
 
 
@@ -871,7 +905,10 @@ class TestLMCacheSparseFrontier(TestBase):
                     dsa_current_released_frontier=0,
                     dsa_nonresident_frontier=8192,
                     load_spec=SimpleNamespace(
-                        can_load=True,
+                        # The async cold load has already completed, so the
+                        # scheduler correctly clears the load action while the
+                        # restored sparse frontier remains valid.
+                        can_load=False,
                         lmcache_cached_tokens=8193,
                         dsa_committed_end=8193,
                         dsa_remap_frontier=8192,
@@ -926,6 +963,22 @@ class TestLMCacheSparseFrontier(TestBase):
                 ["dense", "sparse"],
             ),
             (StagedSFARouteReason.MIXED_CONNECTOR_LOAD, (0, 0)),
+        )
+
+        metadata.requests[1].load_spec = SimpleNamespace(
+            can_load=False,
+            dsa_committed_end=8192,
+            dsa_cold_compact_resume=True,
+        )
+        self.assertEqual(
+            attention_utils.staged_sfa_metadata_sparse_route(
+                metadata, ["dense", "sparse"]
+            ),
+            (
+                StagedSFARouteReason.MIXED_CONNECTOR_LOAD,
+                (0, 8192),
+                (False, True),
+            ),
         )
 
     def test_native_remap_frontiers_preserve_dense_sparse_request_order(
@@ -1327,6 +1380,8 @@ class TestStagedSFAGraphPoc(TestBase):
         impl.vllm_config.cache_config.block_size = 128
         impl.vllm_config.speculative_config = None
         impl.vllm_config.lora_config = None
+        impl.diagnostic_num_cache_layers = 79
+        impl._staged_graph_diagnostic_layer_ids = frozenset((0, 39, 78))
         impl._staged_sfa_capture_state = sfa_v1._StagedSFACaptureState()
         impl._staged_sfa_graph_capture_sizes = (1, 4)
         impl._staged_sfa_bridge_buffers = None
@@ -1494,11 +1549,22 @@ class TestStagedSFAGraphPoc(TestBase):
         impl = self._make_eligible_impl()
         kv_cache = self._make_eligible_kv_cache()
         impl._staged_sfa_capture_state.initialized_cache_capacity = 1
-        impl._staged_sfa_capture_state.producer_event = MagicMock()
+        producer_event = MagicMock()
+        operation_order = []
+        producer_event.reset.side_effect = lambda: operation_order.append(
+            "reset"
+        )
+        producer_event.record.side_effect = lambda: operation_order.append(
+            "record"
+        )
+        impl._staged_sfa_capture_state.producer_event = producer_event
         impl._cross_layer_kv_cache = MagicMock(return_value=(kv_cache, "index-0", True))
         impl._cross_layer_ineligible_reason = MagicMock(return_value=None)
         impl._cross_layer_pre_compute = MagicMock(
-            return_value=self._make_pre_outputs()
+            side_effect=lambda *args: (
+                operation_order.append("compute")
+                or self._make_pre_outputs()
+            )
         )
         eager_metadata = self._make_decode_metadata()
         capture_metadata = self._make_decode_metadata()
@@ -1564,7 +1630,19 @@ class TestStagedSFAGraphPoc(TestBase):
             impl._staged_sfa_capture_state.bindings.keys(),
             {STAGED_SFA_SINGLETON_GRAPH_KEY},
         )
+        self.assertEqual(
+            operation_order,
+            ["reset", "compute", "record"] * 2,
+        )
         self.assertTrue(all(tensor.shape[0] == 4 for result in outputs for tensor in result))
+
+    def test_staged_producer_uses_graph_external_event(self):
+        source = inspect.getsource(
+            sfa_v1.AscendSFAImpl.cross_layer_graph_pre
+        )
+
+        self.assertIn("torch.npu.ExternalEvent()", source)
+        self.assertNotIn("producer_event = torch.npu.Event()", source)
 
     def test_cross_layer_padding_uses_fixed_graph_rows(self):
         impl = self._make_eligible_impl()
@@ -1710,6 +1788,52 @@ class TestStagedSFAGraphPoc(TestBase):
                     torch.count_nonzero(args[7] < 0).item(),
                     padding_tokens,
                 )
+
+    def test_staged_index_scatter_masks_padding_idempotently(self):
+        slots = torch.tensor([17, 18, -1, -1], dtype=torch.int64)
+        updates = torch.arange(16, dtype=torch.float32).reshape(4, 4)
+        row_owners = torch.tensor([0, 0, -1, -1], dtype=torch.int32)
+        flat_cache = torch.zeros(32, 4)
+
+        masked_slots, masked_updates = (
+            sfa_v1.AscendSFAImpl._mask_staged_index_scatter_padding(
+                slots,
+                updates,
+                row_owners,
+                flat_cache,
+            )
+        )
+
+        self.assertEqual(masked_slots.tolist(), [17, 18, 17, 17])
+        self.assertTrue(torch.equal(masked_updates[:2], updates[:2]))
+        self.assertTrue(torch.equal(masked_updates[2], updates[0]))
+        self.assertTrue(torch.equal(masked_updates[3], updates[0]))
+        self.assertTrue(torch.equal(slots, torch.tensor([17, 18, -1, -1])))
+        self.assertTrue(
+            torch.equal(
+                updates,
+                torch.arange(16, dtype=torch.float32).reshape(4, 4),
+            )
+        )
+
+    def test_staged_index_scatter_all_padding_uses_valid_alias(self):
+        slots = torch.full((2,), 99, dtype=torch.int64)
+        updates = torch.arange(8, dtype=torch.float32).reshape(2, 4)
+        row_owners = torch.full((2,), -1, dtype=torch.int32)
+        flat_cache = torch.arange(32, dtype=torch.float32).reshape(8, 4)
+
+        masked_slots, masked_updates = (
+            sfa_v1.AscendSFAImpl._mask_staged_index_scatter_padding(
+                slots,
+                updates,
+                row_owners,
+                flat_cache,
+            )
+        )
+
+        self.assertEqual(masked_slots.tolist(), [7, 7])
+        self.assertTrue(torch.equal(masked_updates[0], flat_cache[7]))
+        self.assertTrue(torch.equal(masked_updates[1], flat_cache[7]))
 
     def test_bridge_storage_is_preallocated_and_reused_for_q1(self):
         impl = self._make_eligible_impl()
@@ -1993,8 +2117,217 @@ class TestStagedSFAGraphPoc(TestBase):
         args = impl._cross_layer_post_compute.call_args.args
         self.assertEqual([tensor.shape[0] for tensor in args[:3]], [1] * 3)
 
+    def test_graph_post_diagnostic_is_captured_and_queued_after_replay(self):
+        impl = self._make_eligible_impl()
+        impl.decode_threshold = 2
+        kv_cache = self._make_eligible_kv_cache()
+        impl._cross_layer_kv_cache = MagicMock(
+            return_value=(kv_cache, "index-0", True)
+        )
+        impl._cross_layer_post_compute = MagicMock()
+        graph_key = StagedSFAGraphKey.fixed_spec(1, 2)
+        metadata = self._make_decode_metadata(2)
+        metadata.decode_request_ids_compact = ["req-0"]
+        metadata.req_ids = ["req-0"]
+        metadata.decode_req_indices_cpu = [0, 0]
+        metadata.seq_lens_cpu = [9]
+        metadata.seq_lens = torch.tensor([9], dtype=torch.int32)
+        layer_name = "model.layers.0.self_attn.attn"
+        context = SimpleNamespace(
+            staged_sfa_graph_key=graph_key,
+            cudagraph_runtime_mode=CUDAGraphMode.NONE,
+            attn_metadata={layer_name: metadata},
+        )
+        output = torch.arange(2 * 512, dtype=torch.float32).reshape(2, 512)
+
+        with (
+            patch.object(sfa_v1, "get_forward_context", return_value=context),
+            patch.object(
+                sfa_v1,
+                "npu_content_diagnostics_enabled",
+                return_value=True,
+            ),
+            patch.object(
+                sfa_v1,
+                "queue_staged_graph_stage_fingerprint",
+            ) as queue_stage,
+        ):
+            impl.cross_layer_graph_post(
+                layer_name,
+                torch.empty(2, 2, 4),
+                torch.empty(2, 2, 2),
+                torch.empty(2, 1, 16, dtype=torch.int32),
+                kv_cache,
+                metadata,
+                output,
+            )
+            context.cudagraph_runtime_mode = CUDAGraphMode.PIECEWISE
+            impl.queue_staged_graph_post_diagnostic(
+                layer_name,
+                graph_key,
+                metadata,
+            )
+
+        snapshot = impl._staged_sfa_capture_state.post_diagnostic_buffers[
+            graph_key
+        ]
+        self.assertEqual(tuple(snapshot.shape), (2, 256))
+        self.assertTrue(torch.equal(snapshot, output[:, :256]))
+        queue_stage.assert_called_once()
+        kwargs = queue_stage.call_args.kwargs
+        self.assertEqual(kwargs["stage"], "after_graph_post")
+        self.assertEqual(
+            kwargs["components"]["attention_output"].data_ptr(),
+            snapshot.data_ptr(),
+        )
+
+    def test_graph_pre_diagnostic_captures_hidden_input(self):
+        impl = self._make_eligible_impl()
+        kv_cache = self._make_eligible_kv_cache()
+        impl._staged_sfa_capture_state.initialized_cache_capacity = 1
+        impl._staged_sfa_capture_state.producer_event = MagicMock()
+        impl._cross_layer_kv_cache = MagicMock(
+            return_value=(kv_cache, "index-0", True)
+        )
+        impl._cross_layer_ineligible_reason = MagicMock(return_value=None)
+        impl._cross_layer_pre_compute = MagicMock(
+            return_value=self._make_pre_outputs(2)
+        )
+        graph_key = StagedSFAGraphKey.fixed_spec(1, 2)
+        metadata = self._make_decode_metadata(2)
+        metadata.decode_req_indices.fill_(0)
+        metadata.decode_req_indices_cpu = [0, 0]
+        metadata.seq_lens = metadata.seq_lens[:1]
+        metadata.seq_lens_cpu = metadata.seq_lens_cpu[:1]
+        metadata.decode_request_ids_compact = ["req-0"]
+        metadata.req_ids = ["req-0"]
+        layer_name = "model.layers.0.self_attn.attn"
+        context = SimpleNamespace(
+            staged_sfa_graph_dummy_run=True,
+            staged_sfa_graph_key=graph_key,
+            staged_sfa_route=StagedSFARouteDecision(
+                StagedSFARouteAction.STAGED,
+                StagedSFARouteReason.ELIGIBLE,
+                graph_key,
+                (8,),
+            ),
+            cudagraph_runtime_mode=CUDAGraphMode.NONE,
+        )
+        hidden = torch.arange(2 * 512, dtype=torch.float32).reshape(
+            2, 512
+        )
+
+        with (
+            patch.object(sfa_v1, "get_forward_context", return_value=context),
+            patch.object(
+                sfa_v1,
+                "npu_content_diagnostics_enabled",
+                return_value=True,
+            ),
+        ):
+            impl.cross_layer_graph_pre(
+                layer_name,
+                hidden,
+                kv_cache,
+                metadata,
+                False,
+                torch.empty_like(hidden),
+            )
+
+        snapshot = impl._staged_sfa_capture_state.input_diagnostic_buffers[
+            graph_key
+        ]
+        self.assertEqual(tuple(snapshot.shape), (2, 256))
+        self.assertTrue(torch.equal(snapshot, hidden[:, :256]))
+
+    def test_graph_pre_diagnostic_waits_for_producer_event(self):
+        source = inspect.getsource(
+            sfa_v1.AscendSFAImpl.cross_layer_lmcache_retrieve
+        )
+
+        wait = source.index(
+            "torch.npu.current_stream().wait_event(producer_event)"
+        )
+        snapshot = source.index("queue_selected_topk_fingerprint(")
+        connector = source.index("wait_for_kv_layer_from_connector(")
+        self.assertLess(wait, snapshot)
+        self.assertLess(snapshot, connector)
+
+    def test_graph_post_diagnostic_buffer_is_updated_in_piecewise_replay(self):
+        impl = self._make_eligible_impl()
+        impl.decode_threshold = 2
+        kv_cache = self._make_eligible_kv_cache()
+        impl._cross_layer_kv_cache = MagicMock(
+            return_value=(kv_cache, "index-0", True)
+        )
+        impl._cross_layer_post_compute = MagicMock()
+        graph_key = StagedSFAGraphKey.fixed_spec(1, 2)
+        metadata = self._make_decode_metadata(2)
+        metadata.decode_request_ids_compact = ["req-0"]
+        metadata.decode_req_indices_cpu = [0, 0]
+        metadata.seq_lens_cpu = [9]
+        layer_name = "model.layers.0.self_attn.attn"
+        context = SimpleNamespace(
+            staged_sfa_graph_key=graph_key,
+            cudagraph_runtime_mode=CUDAGraphMode.NONE,
+        )
+        eager_output = torch.zeros(2, 512)
+        replay_output = torch.arange(
+            2 * 512, dtype=torch.float32
+        ).reshape(2, 512)
+
+        with (
+            patch.object(sfa_v1, "get_forward_context", return_value=context),
+            patch.object(
+                sfa_v1,
+                "npu_content_diagnostics_enabled",
+                return_value=True,
+            ),
+            patch.object(
+                sfa_v1,
+                "queue_staged_graph_stage_fingerprint",
+            ) as queue_stage,
+        ):
+            # Eager warmup owns the stable buffer subsequently written by the
+            # captured PIECEWISE graph.
+            impl.cross_layer_graph_post(
+                layer_name,
+                torch.empty(2, 2, 4),
+                torch.empty(2, 2, 2),
+                torch.empty(2, 1, 16, dtype=torch.int32),
+                kv_cache,
+                metadata,
+                eager_output,
+            )
+            context.cudagraph_runtime_mode = CUDAGraphMode.PIECEWISE
+            impl.cross_layer_graph_post(
+                layer_name,
+                torch.empty(2, 2, 4),
+                torch.empty(2, 2, 2),
+                torch.empty(2, 1, 16, dtype=torch.int32),
+                kv_cache,
+                metadata,
+                replay_output,
+            )
+            impl.queue_staged_graph_post_diagnostic(
+                layer_name,
+                graph_key,
+                metadata,
+            )
+
+        snapshot = impl._staged_sfa_capture_state.post_diagnostic_buffers[
+            graph_key
+        ]
+        self.assertTrue(torch.equal(snapshot, replay_output[:, :256]))
+        queue_stage.assert_called_once()
+        self.assertEqual(
+            queue_stage.call_args.kwargs["stage"],
+            "after_graph_post",
+        )
+
     def test_cross_layer_bootstrap_prepares_boundary_before_index_wait(self):
         impl = self._make_eligible_impl()
+        impl.decode_threshold = 2
         impl._staged_sfa_capture_state.runtime = (
             None,
             None,
@@ -2005,7 +2338,7 @@ class TestStagedSFAGraphPoc(TestBase):
         context = SimpleNamespace(
             attn_metadata={"layer-0.attn": metadata},
             staged_sfa_route=_staged_route(),
-            staged_sfa_graph_key=STAGED_SFA_SINGLETON_GRAPH_KEY,
+            staged_sfa_graph_key=StagedSFAGraphKey.fixed_spec(1, 2),
         )
         order = []
         with (
@@ -2020,11 +2353,59 @@ class TestStagedSFAGraphPoc(TestBase):
                 "wait_for_kv_layer_from_connector",
                 side_effect=lambda *args, **kwargs: order.append("index"),
             ) as wait_for_layer,
+            patch.object(sfa_v1.torch.npu, "current_stream") as current_stream,
         ):
             impl.bootstrap_cross_layer("layer-0.attn")
 
         self.assertEqual(order, ["boundary", "index"])
         wait_for_layer.assert_called_once_with("layer-0.indexer.k_cache")
+        current_stream.assert_not_called()
+
+    def test_cross_layer_cold_mtp_bootstrap_orders_index_wait(self):
+        impl = self._make_eligible_impl()
+        impl.decode_threshold = 2
+        metadata = self._make_decode_metadata()
+        for index_enabled in (False, True):
+            with self.subTest(index_enabled=index_enabled):
+                impl._staged_sfa_capture_state.runtime = (
+                    None,
+                    None,
+                    "layer-0.indexer.k_cache",
+                    index_enabled,
+                )
+                context = SimpleNamespace(
+                    attn_metadata={"layer-0.attn": metadata},
+                    staged_sfa_route=_staged_route(
+                        cold_compact_resumes=(True,)
+                    ),
+                    staged_sfa_graph_key=StagedSFAGraphKey.fixed_spec(1, 2),
+                )
+                order = []
+                with (
+                    patch.object(
+                        sfa_v1, "get_forward_context", return_value=context
+                    ),
+                    patch.object(
+                        sfa_v1,
+                        "_prepare_sfa_remap_boundary",
+                        side_effect=lambda *args, order=order, **kwargs: (
+                            order.append("boundary")
+                        ),
+                    ),
+                    patch.object(
+                        sfa_v1,
+                        "wait_for_kv_layer_from_connector",
+                        side_effect=lambda *args, order=order, **kwargs: (
+                            order.append("index")
+                        ),
+                    ),
+                ):
+                    impl.bootstrap_cross_layer("layer-0.attn")
+
+                expected = ["boundary"]
+                if index_enabled:
+                    expected.append("index")
+                self.assertEqual(order, expected)
 
     def test_cross_layer_dummy_bootstrap_skips_index_wait(self):
         impl = self._make_eligible_impl()
@@ -2796,6 +3177,7 @@ class TestAscendSFAMetadata(TestBase):
         self.assertIs(metadata.sin, sin)
         self.assertIs(metadata.cos, cos)
         self.assertEqual(metadata.num_input_tokens, num_input_tokens)
+        self.assertIsNone(metadata.query_start_loc_cpu)
         self.assertIs(metadata.head_dim, head_dim)
         self.assertIs(metadata.attn_mask, attn_mask)
         self.assertEqual(metadata.attn_state, attn_state)
@@ -2905,16 +3287,26 @@ class TestAscendSFAMetadataBuilder(TestBase):
             prompt_lens,
             request_ids,
             cold_compact_resumes=(),
+            *,
+            attn_state=AscendAttentionState.DecodeOnly,
+            num_input_tokens=None,
         ):
-            num_reqs = len(request_ids)
-            num_tokens = int(query_start_loc[-1])
+            num_actual_tokens = int(query_start_loc[-1])
+            if num_input_tokens is None:
+                num_input_tokens = num_actual_tokens
+            num_reqs = max(
+                len(request_ids),
+                num_input_tokens // 2
+                if attn_state == AscendAttentionState.SpecDecoding
+                else 0,
+            )
             return SimpleNamespace(
                 num_reqs=num_reqs,
-                num_actual_tokens=num_tokens,
-                num_input_tokens=num_tokens,
+                num_actual_tokens=num_actual_tokens,
+                num_input_tokens=num_input_tokens,
                 block_table_tensor=torch.zeros((num_reqs, 4), dtype=torch.int32),
-                slot_mapping=torch.arange(num_tokens, dtype=torch.int64),
-                positions=torch.arange(num_tokens, dtype=torch.int64),
+                slot_mapping=torch.arange(num_input_tokens, dtype=torch.int64),
+                positions=torch.arange(num_input_tokens, dtype=torch.int64),
                 indexer_block_table_tensor=None,
                 indexer_slot_mapping=None,
                 prompt_lens_cpu=prompt_lens,
@@ -2924,7 +3316,7 @@ class TestAscendSFAMetadataBuilder(TestBase):
                 seq_lens=torch.tensor(computed, dtype=torch.int32),
                 seq_lens_cpu=torch.tensor(computed, dtype=torch.int32),
                 request_ids=request_ids,
-                attn_state=AscendAttentionState.DecodeOnly,
+                attn_state=attn_state,
                 cold_compact_resumes=cold_compact_resumes,
             )
 
@@ -2946,6 +3338,7 @@ class TestAscendSFAMetadataBuilder(TestBase):
         assert cold_transition.decode_row_offsets.tolist() == [0]
         assert cold_transition.split_boundary.tolist() == [9]
         assert cold_transition.num_decode_tokens == 1
+        assert builder._dsa_fixed_layout_signature is not None
         with patch.object(
             sfa_v1, "_decode_window_save_window_size", return_value=0
         ):
@@ -2957,6 +3350,76 @@ class TestAscendSFAMetadataBuilder(TestBase):
                 cached_tokens=(8,),
             )
         assert boundary.tolist() == [8]
+
+        speculative_cold_transition = builder.build(
+            common_prefix_len=0,
+            common_attn_metadata=common_metadata(
+                [0, 2],
+                [8],
+                [9],
+                ["cold-spec"],
+                (True,),
+                attn_state=AscendAttentionState.SpecDecoding,
+                num_input_tokens=4,
+            ),
+        )
+        assert speculative_cold_transition.decode_req_indices.tolist() == [
+            0,
+            0,
+            -1,
+            -1,
+        ]
+        assert speculative_cold_transition.decode_row_offsets.tolist() == [
+            0,
+            1,
+            0,
+            0,
+        ]
+        assert speculative_cold_transition.split_boundary.tolist() == [
+            9,
+            9,
+            0,
+            0,
+        ]
+        assert (
+            speculative_cold_transition.decode_valid_row_indices.tolist()
+            == [0, 1]
+        )
+        assert speculative_cold_transition.num_decode_tokens == 2
+        assert not speculative_cold_transition.decode_valid_rows_all
+        assert builder._dsa_fixed_layout_signature is not None
+        with patch.object(
+            sfa_v1, "_decode_window_save_window_size", return_value=0
+        ):
+            boundary = sfa_v1._prepare_sfa_remap_boundary(
+                speculative_cold_transition,
+                ["cold-spec"],
+                is_dummy_run=False,
+                index_topk=16,
+                cached_tokens=(8,),
+            )
+        assert boundary.tolist() == [8, 8, 0, 0]
+
+        mixed_cold_transition = builder.build(
+            common_prefix_len=0,
+            common_attn_metadata=common_metadata(
+                [0, 2, 4], [8, 10], [9, 9], ["cold", "warm"],
+                (True, False),
+                attn_state=AscendAttentionState.SpecDecoding,
+            ),
+        )
+        assert mixed_cold_transition.decode_req_indices.tolist() == [0, 0, 1, 1]
+
+        with self.assertRaisesRegex(
+            RuntimeError, "Invalid cold-compact resume layout"
+        ):
+            builder.build(
+                common_prefix_len=0,
+                common_attn_metadata=common_metadata(
+                    [0, 2], [9], [9], ["invalid-cold"], (True,),
+                    attn_state=AscendAttentionState.SpecDecoding,
+                ),
+            )
 
         first = builder.build(
             common_prefix_len=0,

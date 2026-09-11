@@ -86,6 +86,7 @@ class _DraftStepMetadataArena:
     seq_lens_cpu: torch.Tensor
     num_computed_tokens_cpu: torch.Tensor
     block_table_tensor: torch.Tensor
+    indexer_block_table_tensor: torch.Tensor | None
     positions: torch.Tensor
 
 
@@ -182,8 +183,7 @@ class SpecDecodeBaseProposer(EagleProposer):
             and staged_sfa_graph_configured(vllm_config)
         )
         self.use_cuda_graph = self.runner._use_aclgraph() and (
-            not self.speculative_config.enforce_eager
-            or staged_mtp_graph_requested
+            not self.speculative_config.enforce_eager or staged_mtp_graph_requested
         )
         if self.method == "mtp":
             self.use_cuda_graph = (
@@ -191,9 +191,7 @@ class SpecDecodeBaseProposer(EagleProposer):
                 and not self.use_async_scheduling
                 and not self.speculative_config.disable_padded_drafter_batch
             )
-        self.use_staged_mtp_draft_graph = (
-            staged_mtp_graph_requested and self.use_cuda_graph
-        )
+        self.use_staged_mtp_draft_graph = staged_mtp_graph_requested and self.use_cuda_graph
         self._staged_mtp_max_request_capacity = 0
         if self.use_staged_mtp_draft_graph:
             capture_sizes = staged_sfa_graph_capture_sizes(vllm_config)
@@ -221,13 +219,25 @@ class SpecDecodeBaseProposer(EagleProposer):
             torch.zeros(slot_mapping_lens, dtype=torch.int32, device=device, pin_memory=self.runner.pin_memory)
             for _ in range(self.num_speculative_tokens)
         ]
-        self._staged_mtp_metadata_arenas: list[
-            _DraftStepMetadataArena
-        ] = []
+        # Multi-step MTP must keep one stable slot buffer per draft step for
+        # each physical KV group.  Allocate the second set only when it can be
+        # used so the common MTP=1 path pays no memory or copy overhead.
+        self.indexer_slot_mapping_group = (
+            [
+                torch.zeros(
+                    slot_mapping_lens,
+                    dtype=torch.int32,
+                    device=device,
+                    pin_memory=self.runner.pin_memory,
+                )
+                for _ in range(self.num_speculative_tokens)
+            ]
+            if getattr(self.runner, "dsa_two_groups", False) is True and self.num_speculative_tokens > 1
+            else []
+        )
+        self._staged_mtp_metadata_arenas: list[_DraftStepMetadataArena] = []
         self._staged_mtp_arena_capacity = 0
-        self._mtp_draft_diag_context: (
-            _MTPDraftDiagnosticContext | None
-        ) = None
+        self._mtp_draft_diag_context: _MTPDraftDiagnosticContext | None = None
         self._mtp_draft_diag_proposal_id = 0
         self._draft_attn_layers: dict[str, Any] = {}
 
@@ -278,8 +288,7 @@ class SpecDecodeBaseProposer(EagleProposer):
         self.attn_layer_names = list(sorted(self._draft_attn_layer_names))
         draft_attn_layers_dict = get_layers_from_vllm_config(self.vllm_config, AttentionLayerBase)
         self._draft_attn_layers = {
-            layer_name: draft_attn_layers_dict[layer_name]
-            for layer_name in self.attn_layer_names
+            layer_name: draft_attn_layers_dict[layer_name] for layer_name in self.attn_layer_names
         }
         self.kernel_block_size = (
             draft_attn_layers_dict[self.attn_layer_names[0]].get_attn_backend().get_supported_kernel_block_sizes()[0]
@@ -400,8 +409,7 @@ class SpecDecodeBaseProposer(EagleProposer):
                     layer_module.shared_head.head = model.lm_head
 
         if (
-            self.vllm_config.compilation_config.cudagraph_mode.has_full_cudagraphs()
-            or self.use_staged_mtp_draft_graph
+            self.vllm_config.compilation_config.cudagraph_mode.has_full_cudagraphs() or self.use_staged_mtp_draft_graph
         ) and self.use_cuda_graph:
             self.update_stream = torch.npu.Stream()
             if self.method == "mtp":
@@ -420,10 +428,7 @@ class SpecDecodeBaseProposer(EagleProposer):
     @contextmanager
     def mtp_draft_diagnostic_scope(self):
         """Fence one live MTP proposal from the preceding target work."""
-        if (
-            self.method != "mtp"
-            or not envs_ascend.VLLM_ASCEND_MTP_DRAFT_DEBUG
-        ):
+        if self.method != "mtp" or not envs_ascend.VLLM_ASCEND_MTP_DRAFT_DEBUG:
             yield
             return
 
@@ -433,9 +438,7 @@ class SpecDecodeBaseProposer(EagleProposer):
             rank = int(get_world_group().rank)
         except Exception:
             rank = int(os.getenv("RANK", "-1"))
-        rank_dir = MTP_DRAFT_DIAG_ROOT / (
-            f"rank_{rank}_pid_{os.getpid()}"
-        )
+        rank_dir = MTP_DRAFT_DIAG_ROOT / (f"rank_{rank}_pid_{os.getpid()}")
         output_dir = rank_dir / f"slot_{proposal_id % 2}"
         context = _MTPDraftDiagnosticContext(
             proposal_id=proposal_id,
@@ -822,46 +825,31 @@ class SpecDecodeBaseProposer(EagleProposer):
         """Validate every draft-local FULL graph captured at startup."""
         if not self.use_staged_mtp_draft_graph:
             raise RuntimeError(
-                "staged MTP draft graph sealing was requested while the "
-                "draft-local graph path is disabled"
+                "staged MTP draft graph sealing was requested while the draft-local graph path is disabled"
             )
         if not isinstance(self.model, ACLGraphWrapper):
-            raise RuntimeError(
-                "staged MTP draft model is not wrapped by ACLGraphWrapper"
-            )
-        expected = {
-            BatchDescriptor(num_tokens=capacity)
-            for capacity in request_capacities
-        }
+            raise RuntimeError("staged MTP draft model is not wrapped by ACLGraphWrapper")
+        expected = {BatchDescriptor(num_tokens=capacity) for capacity in request_capacities}
         entries = self.model.concrete_aclgraph_entries
         missing = expected.difference(entries)
         incomplete = tuple(
             descriptor
             for descriptor in expected
             if descriptor in entries
-            and (
-                entries[descriptor].aclgraph is None
-                or entries[descriptor].input_addresses is None
-            )
+            and (entries[descriptor].aclgraph is None or entries[descriptor].input_addresses is None)
         )
         graph_params = get_draft_graph_params()
         if graph_params is None:
-            raise RuntimeError(
-                "staged MTP draft graph parameters were not initialized"
-            )
+            raise RuntimeError("staged MTP draft graph parameters were not initialized")
         missing_params = tuple(
             capacity
             for capacity in request_capacities
-            if (
-                capacity not in graph_params.attn_params
-                or not graph_params.attn_params[capacity]
-            )
+            if (capacity not in graph_params.attn_params or not graph_params.attn_params[capacity])
         )
         arena_error = None
         max_capacity = max(request_capacities, default=0)
         if (
-            len(self._staged_mtp_metadata_arenas)
-            != self.num_speculative_tokens
+            len(self._staged_mtp_metadata_arenas) != self.num_speculative_tokens
             or self._staged_mtp_arena_capacity < max_capacity
         ):
             arena_error = (
@@ -871,11 +859,19 @@ class SpecDecodeBaseProposer(EagleProposer):
                 f"capacity={self._staged_mtp_arena_capacity}/"
                 f"{max_capacity}"
             )
-        elif len({
-            arena.block_table_tensor.data_ptr()
-            for arena in self._staged_mtp_metadata_arenas
-        }) != self.num_speculative_tokens:
+        elif (
+            len({arena.block_table_tensor.data_ptr() for arena in self._staged_mtp_metadata_arenas})
+            != self.num_speculative_tokens
+        ):
             arena_error = "draft steps alias the same block-table buffer"
+        elif getattr(self.runner, "dsa_two_groups", False) is True and self.num_speculative_tokens > 1:
+            indexer_arenas = [arena.indexer_block_table_tensor for arena in self._staged_mtp_metadata_arenas]
+            if (
+                any(arena is None for arena in indexer_arenas)
+                or len({arena.data_ptr() for arena in indexer_arenas if arena is not None})
+                != self.num_speculative_tokens
+            ):
+                arena_error = "draft steps have missing or aliased Group-1 block-table buffers"
         if missing or incomplete or missing_params or arena_error:
             raise RuntimeError(
                 "staged MTP draft FULL graph capture is incomplete: "
@@ -904,6 +900,8 @@ class SpecDecodeBaseProposer(EagleProposer):
                 f"old={self._staged_mtp_arena_capacity}, new={capacity}"
             )
         block_width = source.block_table_tensor.shape[1]
+        source_indexer_block_table = getattr(source, "indexer_block_table_tensor", None)
+        indexer_block_width = source_indexer_block_table.shape[1] if source_indexer_block_table is not None else 0
         position_shape = (capacity,)
         if source.positions.dim() > 1:
             position_shape = (*source.positions.shape[:-1], capacity)
@@ -942,6 +940,15 @@ class SpecDecodeBaseProposer(EagleProposer):
                     dtype=source.block_table_tensor.dtype,
                     device=self.device,
                 ),
+                indexer_block_table_tensor=(
+                    torch.empty(
+                        (capacity, indexer_block_width),
+                        dtype=source_indexer_block_table.dtype,
+                        device=self.device,
+                    )
+                    if source_indexer_block_table is not None
+                    else None
+                ),
                 positions=torch.empty(
                     position_shape,
                     dtype=source.positions.dtype,
@@ -965,20 +972,17 @@ class SpecDecodeBaseProposer(EagleProposer):
         arena = self._staged_mtp_metadata_arenas[draft_step]
         result = self.shallow_copy_metadata(common)
         arena.query_start_loc.copy_(self.arange[: capacity + 1])
-        arena.query_start_loc_cpu.copy_(
-            self.arange_cpu[: capacity + 1]
-        )
+        arena.query_start_loc_cpu.copy_(self.arange_cpu[: capacity + 1])
         arena.seq_lens.zero_()
         arena.seq_lens_cpu.zero_()
         arena.num_computed_tokens_cpu.zero_()
         arena.block_table_tensor.fill_(-1)
+        if arena.indexer_block_table_tensor is not None:
+            arena.indexer_block_table_tensor.fill_(-1)
         arena.positions.zero_()
         source_block_table = common.block_table_tensor
         if source_block_table.shape[0] < capacity:
-            source_block_table = (
-                self.runner.input_batch.block_table[0]
-                .get_device_tensor()[:capacity]
-            )
+            source_block_table = self.runner.input_batch.block_table[0].get_device_tensor()[:capacity]
         if source_block_table.shape[0] < capacity:
             raise RuntimeError(
                 "staged MTP draft block table is smaller than its graph "
@@ -986,36 +990,41 @@ class SpecDecodeBaseProposer(EagleProposer):
                 f"capacity={capacity}"
             )
         arena.seq_lens[:actual_reqs].copy_(common.seq_lens[:actual_reqs])
-        arena.seq_lens_cpu[:actual_reqs].copy_(
-            common.seq_lens_cpu[:actual_reqs]
-        )
-        arena.num_computed_tokens_cpu[:actual_reqs].copy_(
-            common.num_computed_tokens_cpu[:actual_reqs]
-        )
-        arena.block_table_tensor[:capacity].copy_(
-            source_block_table[:capacity]
-        )
-        source_positions = (
-            common.positions if positions is None else positions
-        )
+        arena.seq_lens_cpu[:actual_reqs].copy_(common.seq_lens_cpu[:actual_reqs])
+        arena.num_computed_tokens_cpu[:actual_reqs].copy_(common.num_computed_tokens_cpu[:actual_reqs])
+        arena.block_table_tensor[:capacity].copy_(source_block_table[:capacity])
+        source_indexer_block_table = getattr(common, "indexer_block_table_tensor", None)
+        if source_indexer_block_table is not None:
+            if arena.indexer_block_table_tensor is None:
+                raise RuntimeError("staged MTP metadata lost its Group-1 block-table arena")
+            if source_indexer_block_table.shape[0] < capacity:
+                block_tables = self.runner.input_batch.block_table
+                if len(block_tables) < 2:
+                    raise RuntimeError("two-group staged MTP has no Group-1 input block table")
+                source_indexer_block_table = block_tables[1].get_device_tensor()[:capacity]
+            if source_indexer_block_table.shape[0] < capacity:
+                raise RuntimeError(
+                    "staged MTP Group-1 block table is smaller than its graph "
+                    f"capacity: rows={source_indexer_block_table.shape[0]}, "
+                    f"capacity={capacity}"
+                )
+            arena.indexer_block_table_tensor[:capacity].copy_(source_indexer_block_table[:capacity])
+        elif arena.indexer_block_table_tensor is not None:
+            raise RuntimeError("staged MTP metadata dropped Group-1 after arena allocation")
+        source_positions = common.positions if positions is None else positions
         if source_positions.dim() > 1:
-            arena.positions[..., :actual_reqs].copy_(
-                source_positions[..., :actual_reqs]
-            )
+            arena.positions[..., :actual_reqs].copy_(source_positions[..., :actual_reqs])
         else:
-            arena.positions[:actual_reqs].copy_(
-                source_positions[:actual_reqs]
-            )
+            arena.positions[:actual_reqs].copy_(source_positions[:actual_reqs])
         result.query_start_loc = arena.query_start_loc[: capacity + 1]
-        result.query_start_loc_cpu = (
-            arena.query_start_loc_cpu[: capacity + 1]
-        )
+        result.query_start_loc_cpu = arena.query_start_loc_cpu[: capacity + 1]
         result.seq_lens = arena.seq_lens[:capacity]
         result.seq_lens_cpu = arena.seq_lens_cpu[:capacity]
-        result.num_computed_tokens_cpu = (
-            arena.num_computed_tokens_cpu[:capacity]
-        )
+        result.num_computed_tokens_cpu = arena.num_computed_tokens_cpu[:capacity]
         result.block_table_tensor = arena.block_table_tensor[:capacity]
+        result.indexer_block_table_tensor = (
+            arena.indexer_block_table_tensor[:capacity] if arena.indexer_block_table_tensor is not None else None
+        )
         if arena.positions.dim() > 1:
             result.positions = arena.positions[..., :capacity]
         else:
@@ -1027,6 +1036,54 @@ class SpecDecodeBaseProposer(EagleProposer):
         # Currently, new objects will be assigned to the lists in attn_metadata
         # when update. So we can use the shallow copy.
         return copy.copy(attn_metadata)
+
+    def _validate_independent_group1_metadata(
+        self,
+        common_attn_metadata: AscendCommonAttentionMetadata,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        indexer_block_table = getattr(common_attn_metadata, "indexer_block_table_tensor", None)
+        indexer_slot_mapping = getattr(common_attn_metadata, "indexer_slot_mapping", None)
+        if (indexer_block_table is None) != (indexer_slot_mapping is None):
+            raise RuntimeError(
+                "two-group MTP metadata is incomplete: Group-1 block table and slot mapping must be present together"
+            )
+        if (
+            getattr(getattr(self, "runner", None), "dsa_two_groups", False) is True
+            and self.num_speculative_tokens > 1
+            and indexer_block_table is None
+        ):
+            raise RuntimeError("two-group multi-token MTP metadata is missing the Group-1 block table and slot mapping")
+        return indexer_block_table, indexer_slot_mapping
+
+    def _set_draft_indexer_slot_mapping(
+        self,
+        *,
+        draft_step: int,
+        old_common_metadata: AscendCommonAttentionMetadata,
+        common_attn_metadata: AscendCommonAttentionMetadata,
+        block_numbers: torch.Tensor,
+        clamped_positions: torch.Tensor,
+        block_size: int,
+        exceeds_max_model_len: torch.Tensor,
+    ) -> None:
+        indexer_block_table, old_indexer_slot_mapping = self._validate_independent_group1_metadata(old_common_metadata)
+        if indexer_block_table is None:
+            if getattr(common_attn_metadata, "indexer_slot_mapping", None) is not None:
+                raise RuntimeError("two-group MTP metadata lost its Group-1 block table")
+            return
+        if old_indexer_slot_mapping is None:
+            raise RuntimeError("two-group MTP has no Group-1 slot mapping")
+        if len(self.indexer_slot_mapping_group) != self.num_speculative_tokens:
+            raise RuntimeError("multi-token MTP has no per-step Group-1 slot buffers")
+
+        indexer_block_ids = indexer_block_table.gather(dim=1, index=block_numbers.view(-1, 1)).view(-1)
+        position_values = clamped_positions[0] if self.uses_mrope else clamped_positions
+        indexer_slot_mapping = indexer_block_ids * block_size + position_values % block_size
+        indexer_slot_mapping.masked_fill_(exceeds_max_model_len, PADDING_SLOT_ID)
+        target = self.indexer_slot_mapping_group[draft_step]
+        target[: indexer_slot_mapping.shape[0]].copy_(indexer_slot_mapping.to(torch.int32))
+        target[indexer_slot_mapping.shape[0] :].fill_(PADDING_SLOT_ID)
+        common_attn_metadata.indexer_slot_mapping = target
 
     @torch.inference_mode()
     def dummy_run(
@@ -1072,6 +1129,16 @@ class SpecDecodeBaseProposer(EagleProposer):
                 block_table_tensor=self.runner.input_batch.block_table[0].get_device_tensor()[:num_reqs],
                 # This is used to hold a position.
                 slot_mapping=self.runner.input_batch.block_table[0].slot_mapping.gpu,
+                indexer_block_table_tensor=(
+                    self.runner.input_batch.block_table[1].get_device_tensor()[:num_reqs]
+                    if getattr(self.runner, "dsa_two_groups", False) is True
+                    else None
+                ),
+                indexer_slot_mapping=(
+                    self.runner.input_batch.block_table[1].slot_mapping.gpu
+                    if getattr(self.runner, "dsa_two_groups", False) is True
+                    else None
+                ),
                 positions=self.runner.positions.gpu,
                 attn_state=self.runner.attn_state,
                 decode_token_per_req=self.runner.decode_token_per_req,
@@ -1083,26 +1150,42 @@ class SpecDecodeBaseProposer(EagleProposer):
                 common_attn_metadata.block_table_tensor = self.runner.input_batch.block_table[0].get_device_tensor()[
                     : num_reqs * self.decode_threshold
                 ]
+                if common_attn_metadata.indexer_block_table_tensor is not None:
+                    common_attn_metadata.indexer_block_table_tensor = self.runner.input_batch.block_table[
+                        1
+                    ].get_device_tensor()[: num_reqs * self.decode_threshold]
+
+            if (
+                self.pcp_size * self.dcp_size > 1
+                and self.num_speculative_tokens > 1
+                and common_attn_metadata.indexer_block_table_tensor is not None
+            ):
+                raise RuntimeError(
+                    "multi-token MTP with independent Group-1 KV cache is "
+                    "unsupported under PCP/DCP because no Group-1 CP slot "
+                    "plan exists"
+                )
 
             assert len(self.draft_attn_groups) > 0
             builder = self.draft_attn_groups[0].get_metadata_builder()
             # update the tensor's address for each step.
             for draft_step in range(self.num_speculative_tokens):
                 if staged_mtp_draft_graph:
-                    common_attn_metadata = (
-                        self._bind_staged_mtp_metadata_arena(
-                            common_attn_metadata,
-                            draft_step=draft_step,
-                            capacity=num_tokens,
-                            actual_reqs=num_reqs,
-                        )
+                    common_attn_metadata = self._bind_staged_mtp_metadata_arena(
+                        common_attn_metadata,
+                        draft_step=draft_step,
+                        capacity=num_tokens,
+                        actual_reqs=num_reqs,
                     )
                 else:
-                    common_attn_metadata = self.shallow_copy_metadata(
-                        common_attn_metadata
-                    )
+                    common_attn_metadata = self.shallow_copy_metadata(common_attn_metadata)
                 # Set the real slot_mapping.
                 common_attn_metadata.slot_mapping = self.slot_mapping_group[draft_step]
+                if common_attn_metadata.indexer_block_table_tensor is not None:
+                    if self.indexer_slot_mapping_group:
+                        common_attn_metadata.indexer_slot_mapping = self.indexer_slot_mapping_group[draft_step]
+                    elif common_attn_metadata.indexer_slot_mapping is None:
+                        raise RuntimeError("two-group MTP graph capture has no Group-1 slot mapping")
                 attn_metadata_eagle = builder.build_for_graph_capture(
                     common_attn_metadata,
                     AscendAttentionState.SpecDecoding if self.method == "mtp" else AscendAttentionState.ChunkedPrefill,
@@ -1114,11 +1197,7 @@ class SpecDecodeBaseProposer(EagleProposer):
 
         model_positions = self._get_positions(num_tokens)
 
-        batch_size = (
-            num_tokens
-            if staged_mtp_draft_graph
-            else max(num_tokens // (self.num_speculative_tokens + 1), 1)
-        )
+        batch_size = num_tokens if staged_mtp_draft_graph else max(num_tokens // (self.num_speculative_tokens + 1), 1)
         if is_profile:
             batch_size = min(batch_size, self.runner.max_num_reqs)
 
@@ -1214,10 +1293,7 @@ class SpecDecodeBaseProposer(EagleProposer):
             assert long_seq_args is not None
             query_lens_d, ori_token_indices_to_sample = long_seq_args
         assert self.runner is not None
-        use_staged_mtp_draft_graph = (
-            self.use_staged_mtp_draft_graph
-            and target_staged_sfa_graph_key is not None
-        )
+        use_staged_mtp_draft_graph = self.use_staged_mtp_draft_graph and target_staged_sfa_graph_key is not None
         if use_staged_mtp_draft_graph:
             if num_tokens > target_staged_sfa_graph_key.request_capacity:
                 raise RuntimeError(
@@ -1227,9 +1303,7 @@ class SpecDecodeBaseProposer(EagleProposer):
                     "capacity="
                     f"{target_staged_sfa_graph_key.request_capacity}."
                 )
-            num_input_tokens = (
-                target_staged_sfa_graph_key.request_capacity
-            )
+            num_input_tokens = target_staged_sfa_graph_key.request_capacity
         elif self.use_cuda_graph and num_tokens <= self.runner.cudagraph_batch_sizes[-1]:
             num_input_tokens = self.runner.cudagraph_dispatcher._bs_to_padded_graph_size[num_tokens]
         else:
@@ -1255,10 +1329,7 @@ class SpecDecodeBaseProposer(EagleProposer):
             aclgraph_runtime_mode = CUDAGraphMode.NONE
             batch_descriptor = None
 
-        if (
-            aclgraph_runtime_mode == CUDAGraphMode.FULL
-            and not use_staged_mtp_draft_graph
-        ):
+        if aclgraph_runtime_mode == CUDAGraphMode.FULL and not use_staged_mtp_draft_graph:
             # TODO: Due to the inconsistency between the proposer `dispatcher` and model runner, this padding
             # should have been done in model runner but not. For example, at prefill stage, target model
             # is run in eager mode currently, which means `_pad_query_start_loc_for_fia` is not called,
@@ -1273,6 +1344,11 @@ class SpecDecodeBaseProposer(EagleProposer):
             common_attn_metadata.block_table_tensor = self._pad_tensor(
                 common_attn_metadata.block_table_tensor, num_reqs_padded
             )
+            if common_attn_metadata.indexer_block_table_tensor is not None:
+                common_attn_metadata.indexer_block_table_tensor = self._pad_tensor(
+                    common_attn_metadata.indexer_block_table_tensor,
+                    num_reqs_padded,
+                )
             common_attn_metadata.seq_lens = self.runner.seq_lens.gpu[:num_reqs_padded]
             common_attn_metadata.seq_lens_cpu = self.runner.seq_lens.cpu[:num_reqs_padded]
 
@@ -1287,13 +1363,9 @@ class SpecDecodeBaseProposer(EagleProposer):
             inputs_embeds = None
 
         if self.uses_mrope:
-            used_update_positions = self.mrope_positions[
-                :, token_indices_to_sample
-            ]
+            used_update_positions = self.mrope_positions[:, token_indices_to_sample]
         else:
-            used_update_positions = self.positions[
-                token_indices_to_sample
-            ]
+            used_update_positions = self.positions[token_indices_to_sample]
 
         if use_staged_mtp_draft_graph:
             common_attn_metadata = self._bind_staged_mtp_metadata_arena(
@@ -1313,6 +1385,19 @@ class SpecDecodeBaseProposer(EagleProposer):
         self.slot_mapping_group[0][:slot_mapping_lens].copy_(common_attn_metadata.slot_mapping[:slot_mapping_lens])
         self.slot_mapping_group[0][slot_mapping_lens:].fill_(-1)
         common_attn_metadata.slot_mapping = self.slot_mapping_group[0]
+        if self.num_speculative_tokens > 1:
+            indexer_block_table, indexer_slot_mapping = self._validate_independent_group1_metadata(common_attn_metadata)
+        else:
+            indexer_block_table, indexer_slot_mapping = None, None
+        if indexer_block_table is not None:
+            if indexer_slot_mapping is None or len(self.indexer_slot_mapping_group) != self.num_speculative_tokens:
+                raise RuntimeError("multi-token MTP has no per-step Group-1 slot buffers")
+            indexer_slot_mapping_lens = indexer_slot_mapping.shape[0]
+            self.indexer_slot_mapping_group[0][:indexer_slot_mapping_lens].copy_(
+                indexer_slot_mapping[:indexer_slot_mapping_lens]
+            )
+            self.indexer_slot_mapping_group[0][indexer_slot_mapping_lens:].fill_(PADDING_SLOT_ID)
+            common_attn_metadata.indexer_slot_mapping = self.indexer_slot_mapping_group[0]
         common_attn_metadata.num_input_tokens = num_input_tokens
         # FIXME(woosuk): The below two ops cause synchronization. Optimize.
         assert len(self.draft_attn_groups) > 0
@@ -1327,21 +1412,30 @@ class SpecDecodeBaseProposer(EagleProposer):
 
         # Copy the old attn_metadata and update
         attn_metadata_i = per_layer_attn_metadata[self.attn_layer_names[0]]
-        if (
-            use_staged_mtp_draft_graph
-            and attn_metadata_i.num_prefills
-        ):
+        if use_staged_mtp_draft_graph and attn_metadata_i.num_prefills:
             raise RuntimeError(
-                "staged MTP draft FULL graph is decode-only, but draft "
-                "attention metadata contains prefill rows"
+                "staged MTP draft FULL graph is decode-only, but draft attention metadata contains prefill rows"
             )
 
         # Clone the data so that when calculating the data at position 2 and position 3
         # in the merged graph, it does not affect position 1
         # FIXME(lilinsiman)
         if not use_staged_mtp_draft_graph:
-            common_attn_metadata.block_table_tensor = (
-                common_attn_metadata.block_table_tensor.clone()
+            common_attn_metadata.block_table_tensor = common_attn_metadata.block_table_tensor.clone()
+            if self.num_speculative_tokens > 1 and common_attn_metadata.indexer_block_table_tensor is not None:
+                common_attn_metadata.indexer_block_table_tensor = (
+                    common_attn_metadata.indexer_block_table_tensor.clone()
+                )
+
+        if (
+            self.pcp_size * self.dcp_size > 1
+            and self.num_speculative_tokens > 1
+            and common_attn_metadata.indexer_block_table_tensor is not None
+        ):
+            raise RuntimeError(
+                "multi-token MTP with independent Group-1 KV cache is "
+                "unsupported under PCP/DCP because no Group-1 CP slot plan "
+                "exists"
             )
 
         if self.pcp_size * self.dcp_size > 1:
@@ -1407,9 +1501,7 @@ class SpecDecodeBaseProposer(EagleProposer):
                                 slot_indices,
                                 mtp_slot_mapping,
                                 attn_group=attn_group,
-                                use_staged_mtp_draft_graph=(
-                                    use_staged_mtp_draft_graph
-                                ),
+                                use_staged_mtp_draft_graph=(use_staged_mtp_draft_graph),
                             )
                             for layer_name in self.attn_layer_names:
                                 per_layer_attn_metadata[layer_name] = attn_metadata
@@ -1429,9 +1521,7 @@ class SpecDecodeBaseProposer(EagleProposer):
                             used_update_positions,
                             aclgraph_runtime_mode,
                             attn_group=attn_group,
-                            use_staged_mtp_draft_graph=(
-                                use_staged_mtp_draft_graph
-                            ),
+                            use_staged_mtp_draft_graph=(use_staged_mtp_draft_graph),
                         )
                         for layer_name in self.attn_layer_names:
                             per_layer_attn_metadata[layer_name] = attn_metadata
@@ -1914,19 +2004,19 @@ class SpecDecodeBaseProposer(EagleProposer):
                 actual_reqs=batch_size,
             )
         else:
-            common_attn_metadata = self.shallow_copy_metadata(
-                old_common_metadata
-            )
+            common_attn_metadata = self.shallow_copy_metadata(old_common_metadata)
 
         if draft_step == 1:
-            if (
-                aclgraph_runtime_mode == CUDAGraphMode.FULL
-                and not use_staged_mtp_draft_graph
-            ):
+            if aclgraph_runtime_mode == CUDAGraphMode.FULL and not use_staged_mtp_draft_graph:
                 common_attn_metadata.num_reqs = input_batch_size
                 common_attn_metadata.block_table_tensor = self._pad_tensor(
                     common_attn_metadata.block_table_tensor, input_batch_size
                 )
+                if common_attn_metadata.indexer_block_table_tensor is not None:
+                    common_attn_metadata.indexer_block_table_tensor = self._pad_tensor(
+                        common_attn_metadata.indexer_block_table_tensor,
+                        input_batch_size,
+                    )
                 common_attn_metadata.seq_lens = self._pad_tensor(common_attn_metadata.seq_lens, input_batch_size)
                 common_attn_metadata.seq_lens_cpu = self._pad_tensor(
                     common_attn_metadata.seq_lens_cpu, input_batch_size
@@ -1960,18 +2050,10 @@ class SpecDecodeBaseProposer(EagleProposer):
         # in the merged graph, it does not affect position 1
         # FIXME(lilinsiman)
         if not use_staged_mtp_draft_graph:
-            common_attn_metadata.seq_lens = (
-                common_attn_metadata.seq_lens.clone()
-            )
-            common_attn_metadata.seq_lens_cpu = (
-                common_attn_metadata.seq_lens_cpu.clone()
-            )
-            common_attn_metadata.num_computed_tokens_cpu = (
-                common_attn_metadata.num_computed_tokens_cpu.clone()
-            )
-            common_attn_metadata.positions = (
-                common_attn_metadata.positions.clone()
-            )
+            common_attn_metadata.seq_lens = common_attn_metadata.seq_lens.clone()
+            common_attn_metadata.seq_lens_cpu = common_attn_metadata.seq_lens_cpu.clone()
+            common_attn_metadata.num_computed_tokens_cpu = common_attn_metadata.num_computed_tokens_cpu.clone()
+            common_attn_metadata.positions = common_attn_metadata.positions.clone()
 
         # NOTE(woosuk): We should handle the case where the draft model
         # generates tokens beyond the max model length. Since it is complex
@@ -2009,6 +2091,8 @@ class SpecDecodeBaseProposer(EagleProposer):
             common_attn_metadata.positions[:batch_size].copy_(clamped_positions)
 
         if self.pcp_size * self.dcp_size > 1:
+            if common_attn_metadata.indexer_block_table_tensor is not None:
+                raise RuntimeError("independent Group-1 MTP slots cannot reuse the Group-0 PCP/DCP slot plan")
             num_computed_tokens_of_pcp_dcp = self.runner.pcp_manager._get_cp_local_seq_lens(
                 ori_seq_len + draft_step + 1,
                 self.pcp_size,
@@ -2047,6 +2131,15 @@ class SpecDecodeBaseProposer(EagleProposer):
             self.slot_mapping_group[draft_step][slot_mapping.shape[0] :].fill_(PADDING_SLOT_ID)
             # Set the address of the attn_metadata.slot_mapping to the self.slot_mapping_group[idx]
             common_attn_metadata.slot_mapping = self.slot_mapping_group[draft_step]
+            self._set_draft_indexer_slot_mapping(
+                draft_step=draft_step,
+                old_common_metadata=old_common_metadata,
+                common_attn_metadata=common_attn_metadata,
+                block_numbers=block_numbers,
+                clamped_positions=clamped_positions,
+                block_size=block_size,
+                exceeds_max_model_len=exceeds_max_model_len,
+            )
 
         attn_metadata_builder = attn_group.get_metadata_builder()
 
@@ -2207,6 +2300,17 @@ class SpecDecodeBaseProposer(EagleProposer):
             common_attn_metadata.slot_mapping[token_indices]
         )
         common_attn_metadata.slot_mapping[token_indices.shape[0] :].fill_(-1)
+        indexer_slot_mapping = getattr(
+            common_attn_metadata,
+            "indexer_slot_mapping",
+            None,
+        )
+        if indexer_slot_mapping is not None:
+            # Group 1 follows the same accepted-token compaction as Group 0,
+            # but its physical block ids are independent. Compact its own
+            # slots instead of reusing the latent slots.
+            indexer_slot_mapping[: token_indices.shape[0]].copy_(indexer_slot_mapping[token_indices])
+            indexer_slot_mapping[token_indices.shape[0] :].fill_(-1)
 
         # NOTE: Currently positions and seq_lens are not used in attn forward
         # so we do not need to fixed them. But if they are used in the future,
@@ -2223,6 +2327,43 @@ class SpecDecodeBaseProposer(EagleProposer):
             max_query_len=new_query_len_per_req.max().item(),
             block_table_tensor=common_attn_metadata.block_table_tensor,
             slot_mapping=common_attn_metadata.slot_mapping,
+            indexer_block_table_tensor=getattr(
+                common_attn_metadata,
+                "indexer_block_table_tensor",
+                None,
+            ),
+            indexer_slot_mapping=indexer_slot_mapping,
+            prompt_lens_cpu=getattr(
+                common_attn_metadata,
+                "prompt_lens_cpu",
+                None,
+            ),
+            request_ids=getattr(common_attn_metadata, "request_ids", None),
+            cold_compact_resumes=getattr(
+                common_attn_metadata,
+                "cold_compact_resumes",
+                (),
+            ),
+            resident_state_indices=getattr(
+                common_attn_metadata,
+                "resident_state_indices",
+                None,
+            ),
+            resident_state_generations=getattr(
+                common_attn_metadata,
+                "resident_state_generations",
+                None,
+            ),
+            resident_state_indices_cpu=getattr(
+                common_attn_metadata,
+                "resident_state_indices_cpu",
+                None,
+            ),
+            resident_state_generations_cpu=getattr(
+                common_attn_metadata,
+                "resident_state_generations_cpu",
+                None,
+            ),
             actual_seq_lengths_q=self.runner.actual_seq_lengths_q,
             positions=common_attn_metadata.positions[token_indices],
             attn_state=self.runner.attn_state,
@@ -2302,6 +2443,47 @@ class SpecDecodeBaseProposer(EagleProposer):
             actual_seq_lengths_q=self.runner.actual_seq_lengths_q,
             block_table_tensor=common_attn_metadata.block_table_tensor,
             slot_mapping=common_attn_metadata.slot_mapping,
+            indexer_block_table_tensor=getattr(
+                common_attn_metadata,
+                "indexer_block_table_tensor",
+                None,
+            ),
+            indexer_slot_mapping=getattr(
+                common_attn_metadata,
+                "indexer_slot_mapping",
+                None,
+            ),
+            prompt_lens_cpu=getattr(
+                common_attn_metadata,
+                "prompt_lens_cpu",
+                None,
+            ),
+            request_ids=getattr(common_attn_metadata, "request_ids", None),
+            cold_compact_resumes=getattr(
+                common_attn_metadata,
+                "cold_compact_resumes",
+                (),
+            ),
+            resident_state_indices=getattr(
+                common_attn_metadata,
+                "resident_state_indices",
+                None,
+            ),
+            resident_state_generations=getattr(
+                common_attn_metadata,
+                "resident_state_generations",
+                None,
+            ),
+            resident_state_indices_cpu=getattr(
+                common_attn_metadata,
+                "resident_state_indices_cpu",
+                None,
+            ),
+            resident_state_generations_cpu=getattr(
+                common_attn_metadata,
+                "resident_state_generations_cpu",
+                None,
+            ),
             positions=common_attn_metadata.positions,
             attn_state=self.runner.attn_state,
             decode_token_per_req=self.runner.decode_token_per_req,

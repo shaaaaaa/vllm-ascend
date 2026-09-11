@@ -21,7 +21,9 @@ import json
 import math
 import os
 import sys
+import time
 from collections import defaultdict
+from collections.abc import Iterator
 from contextlib import contextmanager, nullcontext
 from copy import copy, deepcopy
 from dataclasses import dataclass
@@ -39,6 +41,7 @@ from vllm.config import CompilationMode, CUDAGraphMode, VllmConfig, get_layers_f
 from vllm.distributed import get_tensor_model_parallel_world_size, tensor_model_parallel_all_gather
 from vllm.distributed.ec_transfer import get_ec_transfer, has_ec_transfer
 from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
+from vllm.distributed.kv_transfer.kv_connector.base import KVConnectorBase
 from vllm.distributed.parallel_state import get_dcp_group, get_dp_group, get_pcp_group, get_pp_group, get_tp_group
 from vllm.forward_context import BatchDescriptor, get_forward_context
 from vllm.logger import logger
@@ -80,7 +83,7 @@ from vllm.v1.outputs import (
 )
 from vllm.v1.sample.logits_processor import build_logitsprocs
 from vllm.v1.sample.metadata import SamplingMetadata
-from vllm.v1.sample.rejection_sampler import PLACEHOLDER_TOKEN_ID, RejectionSampler
+from vllm.v1.sample.rejection_sampler import PLACEHOLDER_TOKEN_ID
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.structured_output.utils import apply_grammar_bitmask
 from vllm.v1.utils import record_function_or_nullcontext
@@ -112,6 +115,7 @@ from vllm_ascend.attention.utils import (
     get_lmcache_sparse_cached_tokens,
     staged_sfa_connector_supports_sparse_load,
     staged_sfa_metadata_sparse_route,
+    unwrap_staged_sfa_connector_metadata,
     using_paged_attention,
 )
 
@@ -134,10 +138,26 @@ from vllm_ascend.eplb.core.eplb_device_transfer_loader import D2DExpertWeightLoa
 from vllm_ascend.eplb.core.eplb_worker import EplbProcess
 from vllm_ascend.eplb.eplb_updator import EplbUpdator
 from vllm_ascend.eplb.utils import model_register
+from vllm_ascend.live_source_handoff import (
+    LIVE_SOURCE_EVENT_HANDOFF_KEY,
+)
+from vllm_ascend.serving_perf import (
+    cold_perf_enabled,
+    is_cold_perf_request,
+    log_cold_perf_event,
+    mark_cold_perf_connector_requests,
+)
+from vllm_ascend.lmcache_diagnostics import (
+    begin_deferred_diagnostic_step,
+    flush_deferred_diagnostics,
+    npu_content_diagnostics_enabled,
+)
 from vllm_ascend.ops.rotary_embedding import set_cos_and_sin, update_cos_sin
 from vllm_ascend.patch.worker.patch_draft_quarot import patch_load_weights
 from vllm_ascend.patch.worker.patch_module import patch_torch_npu_argsort
 from vllm_ascend.quantization.utils import enable_fa_quant
+from vllm_ascend.sample.rejection_diagnostics import reset_stage_recorder, set_stage_recorder
+from vllm_ascend.sample.rejection_sampler import AscendRejectionSampler
 from vllm_ascend.sample.sampler import AscendSampler
 from vllm_ascend.spec_decode import get_spec_decode_method
 from vllm_ascend.spec_decode.draft_proposer import AscendDraftModelProposer
@@ -179,11 +199,53 @@ from vllm_ascend.ascend_forward_context import (  # isort: skip
 )
 from vllm.model_executor.layers.fused_moe.routed_experts_capturer import RoutedExpertsCapturer
 
+from vllm_ascend.worker.serving_perf import (
+    ServingPerfMixin,
+    _COLD_PERF_SAMPLE_TRACE_CALLS,
+    _COLD_PERF_SLOW_SAMPLE_MS,
+    _log_slow_sample_invocation,
+    _record_sample_stage,
+)
+
 if TYPE_CHECKING:
     import xgrammar as xgr  # type: ignore[import-untyped]
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 else:
     xgr = LazyLoader("xgr", globals(), "xgrammar")
+
+
+def _capture_live_source_event_handoff() -> None:
+    """Let the connector retain an explicitly armed post-forward event."""
+
+    forward_context = get_forward_context()
+    if (
+        LIVE_SOURCE_EVENT_HANDOFF_KEY
+        not in forward_context.additional_kwargs
+    ):
+        return
+    if not has_kv_transfer_group():
+        forward_context.additional_kwargs.pop(LIVE_SOURCE_EVENT_HANDOFF_KEY, None)
+        return
+
+    connector = get_kv_transfer_group()
+    capture = getattr(connector, "capture_live_source_event_handoff", None)
+    if not callable(capture):
+        # Preserve compatibility with older direct LMCache connectors that
+        # expose the hook only through their worker implementation.
+        engine = getattr(connector, "_lmcache_engine", None)
+        capture = getattr(engine, "capture_live_source_event_handoff", None)
+    if not callable(capture):
+        forward_context.additional_kwargs.pop(LIVE_SOURCE_EVENT_HANDOFF_KEY, None)
+        return
+    try:
+        capture(forward_context)
+    except Exception:
+        # A missing handoff must retain the established persistent fallback;
+        # it must not fail an otherwise valid model execution.
+        forward_context.additional_kwargs.pop(LIVE_SOURCE_EVENT_HANDOFF_KEY, None)
+        logger.exception(
+            "Live-source producer event capture failed; using persistent fallback"
+        )
 
 
 def _staged_sfa_dummy_remap_boundaries(
@@ -282,6 +344,24 @@ PerLayerAttnMetadata: TypeAlias = list[AttnMetadataDict] | AttnMetadataDict
 
 SEQ_LEN_WITH_MAX_PA_WORKSPACE = 6144
 _STAGED_SFA_ROUTE_ACTIONS = tuple(StagedSFARouteAction)
+
+
+def _merge_kv_connector_outputs(
+    *outputs: KVConnectorOutput,
+) -> KVConnectorOutput:
+    """Merge connector output without dropping same-step worker metadata."""
+    merged = KVConnectorOutput.merge(*outputs)
+    worker_metadata = [
+        output.kv_connector_worker_meta
+        for output in outputs
+        if output.kv_connector_worker_meta is not None
+    ]
+    if worker_metadata:
+        combined = worker_metadata[0]
+        for metadata in worker_metadata[1:]:
+            combined = combined.aggregate(metadata)
+        merged.kv_connector_worker_meta = combined
+    return merged
 
 
 @dataclass
@@ -401,7 +481,105 @@ def _fill_fixed_decode_positions(
     positions += position_offsets[:num_tokens]
 
 
-class NPUModelRunner(GPUModelRunner):
+class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
+    @staticmethod
+    @contextmanager
+    def maybe_get_kv_connector_output(
+        scheduler_output: SchedulerOutput,
+        defer_finalize: bool = False,
+    ) -> Iterator[KVConnectorOutput | None]:
+        """Defer worker metadata and cleanup until post-draft finalization."""
+        if not has_kv_transfer_group():
+            yield None
+            return
+
+        output = KVConnectorOutput()
+        connector = get_kv_transfer_group()
+        assert isinstance(connector, KVConnectorBase)
+        assert scheduler_output.kv_connector_metadata is not None
+        connector.bind_connector_metadata(
+            scheduler_output.kv_connector_metadata
+        )
+
+        defer_clear = defer_finalize
+        try:
+            connector.start_load_kv(get_forward_context())
+            try:
+                yield output
+            finally:
+                if not defer_finalize:
+                    connector.wait_for_save()
+                output.finished_sending, output.finished_recving = (
+                    connector.get_finished(scheduler_output.finished_req_ids)
+                )
+                output.invalid_block_ids = (
+                    connector.get_block_ids_with_load_errors()
+                )
+                get_completed = getattr(
+                    connector, "get_completed_decode_window_saves", None
+                )
+                if callable(get_completed):
+                    output.completed_decode_window_saves = get_completed()
+                output.kv_connector_stats = (
+                    connector.get_kv_connector_stats()
+                )
+                output.kv_cache_events = (
+                    connector.get_kv_connector_kv_cache_events()
+                )
+                if not defer_finalize:
+                    output.kv_connector_worker_meta = (
+                        connector.build_connector_worker_meta()
+                    )
+        except BaseException:
+            defer_clear = False
+            raise
+        finally:
+            if not defer_clear:
+                connector.clear_connector_metadata()
+
+    @staticmethod
+    def finalize_kv_connector(
+        finished_req_ids: set[str] | None = None,
+    ) -> KVConnectorOutput:
+        """Finalize a deferred connector lifecycle into one complete output."""
+        output = KVConnectorOutput()
+        if not has_kv_transfer_group():
+            return output
+        connector = get_kv_transfer_group()
+        try:
+            connector.wait_for_save()
+            output.finished_sending, output.finished_recving = (
+                connector.get_finished(finished_req_ids or set())
+            )
+            output.invalid_block_ids = (
+                connector.get_block_ids_with_load_errors()
+            )
+            get_completed = getattr(
+                connector, "get_completed_decode_window_saves", None
+            )
+            if callable(get_completed):
+                output.completed_decode_window_saves = get_completed()
+            output.kv_connector_stats = connector.get_kv_connector_stats()
+            output.kv_cache_events = (
+                connector.get_kv_connector_kv_cache_events()
+            )
+            output.kv_connector_worker_meta = (
+                connector.build_connector_worker_meta()
+            )
+            return output
+        finally:
+            connector.clear_connector_metadata()
+
+    @staticmethod
+    def abort_kv_connector_finalize() -> None:
+        """Clear a deferred connector binding after model execution fails."""
+        if not has_kv_transfer_group():
+            return
+        try:
+            get_kv_transfer_group().clear_connector_metadata()
+        except Exception:
+            logger.exception("Failed to abort deferred KV connector metadata")
+
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         # TODO(qcs): These manual pad and unpad for GPUModelRunner are
         # used to expand some buffers, which need to be reverted after
@@ -846,7 +1024,7 @@ class NPUModelRunner(GPUModelRunner):
                 if self.speculative_config.method == "eagle3":
                     assert isinstance(self.drafter, AscendEagleProposer)
                     self.use_aux_hidden_state_outputs = self.drafter.eagle3_use_aux_hidden_state
-                self.rejection_sampler = RejectionSampler(self.sampler)
+                self.rejection_sampler = AscendRejectionSampler(self.sampler)
         self.discard_request_indices = self._make_buffer(self.max_num_reqs, dtype=torch.int64)
         self.num_discarded_requests = 0
 
@@ -1474,6 +1652,8 @@ class NPUModelRunner(GPUModelRunner):
         target_model_batch_desc: BatchDescriptor = None,
         target_staged_sfa_graph_key: StagedSFAGraphKey | None = None,
     ) -> list[list[int]] | None:
+        draft_trace_ids = tuple(getattr(self, "_cold_perf_sample_trace_req_ids", ()))
+        draft_metrics = getattr(self, "_cold_perf_active_sample_stages", None)
         if not self.drafter:
             # Speculative decoding is not enabled.
             draft_token_ids = None
@@ -1507,7 +1687,7 @@ class NPUModelRunner(GPUModelRunner):
                     "sampled_token_ids should be a torch.Tensor whenpadded-batch is enabled."
                 )
                 assert self.drafter is not None
-                next_token_ids, valid_sampled_tokens_count = self.drafter.prepare_next_token_ids_padded(
+                prepare_next_args = (
                     common_attn_metadata,
                     sampled_token_ids,
                     self.requests,
@@ -1515,7 +1695,29 @@ class NPUModelRunner(GPUModelRunner):
                     self.discard_request_indices.gpu,
                     self.num_discarded_requests,
                 )
-                self._copy_valid_sampled_token_count(next_token_ids, valid_sampled_tokens_count)
+                prepared_next = (
+                    self._run_cold_perf_npu_stage(
+                        "mtp_prepare_next",
+                        draft_trace_ids,
+                        self.drafter.prepare_next_token_ids_padded,
+                        *prepare_next_args,
+                        metrics=draft_metrics,
+                    )
+                    if draft_trace_ids
+                    else self.drafter.prepare_next_token_ids_padded(*prepare_next_args)
+                )
+                next_token_ids, valid_sampled_tokens_count = prepared_next
+                if draft_trace_ids:
+                    self._run_cold_perf_npu_stage(
+                        "mtp_valid_count_copy",
+                        draft_trace_ids,
+                        self._copy_valid_sampled_token_count,
+                        next_token_ids,
+                        valid_sampled_tokens_count,
+                        metrics=draft_metrics,
+                    )
+                else:
+                    self._copy_valid_sampled_token_count(next_token_ids, valid_sampled_tokens_count)
 
             req_scheduled_tokens = scheduler_output.num_scheduled_tokens
             if self.use_cp:
@@ -1567,10 +1769,23 @@ class NPUModelRunner(GPUModelRunner):
                     )
                 else:
                     assert self.drafter is not None
-                    common_attn_metadata, token_indices, token_indices_to_sample, num_rejected_tokens_gpu = (
-                        self.drafter.prepare_inputs_padded(
+                    prepare_inputs = self.drafter.prepare_inputs_padded
+                    if draft_trace_ids:
+                        prepared_inputs = self._run_cold_perf_npu_stage(
+                            "mtp_prepare_inputs",
+                            draft_trace_ids,
+                            prepare_inputs,
+                            common_attn_metadata,
+                            spec_decode_metadata,
+                            valid_sampled_tokens_count,
+                            metrics=draft_metrics,
+                        )
+                    else:
+                        prepared_inputs = prepare_inputs(
                             common_attn_metadata, spec_decode_metadata, valid_sampled_tokens_count
                         )
+                    common_attn_metadata, token_indices, token_indices_to_sample, num_rejected_tokens_gpu = (
+                        prepared_inputs
                     )
                 if self.pcp_size > 1:
                     target_token_ids = input_ids_pcp_full[token_indices]
@@ -1586,7 +1801,7 @@ class NPUModelRunner(GPUModelRunner):
                     else:
                         target_hidden_states = hidden_states[token_indices]
             assert self.drafter is not None
-            draft_token_ids = self.drafter._propose(
+            propose_kwargs = dict(
                 target_token_ids=target_token_ids,
                 target_positions=target_positions,
                 target_hidden_states=target_hidden_states,
@@ -1603,6 +1818,17 @@ class NPUModelRunner(GPUModelRunner):
                 num_scheduled_tokens=num_scheduled_tokens,
                 num_rejected_tokens_gpu=num_rejected_tokens_gpu,
                 target_staged_sfa_graph_key=target_staged_sfa_graph_key,
+            )
+            draft_token_ids = (
+                self._run_cold_perf_npu_stage(
+                    "mtp_graph",
+                    draft_trace_ids,
+                    self.drafter._propose,
+                    metrics=draft_metrics,
+                    **propose_kwargs,
+                )
+                if draft_trace_ids
+                else self.drafter._propose(**propose_kwargs)
             )
         else:
             raise ValueError(f"Unknown speculative decoding method: {self.speculative_config.method}")
@@ -1635,6 +1861,52 @@ class NPUModelRunner(GPUModelRunner):
         ):
             scheduler_output = deepcopy(scheduler_output)
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
+        cold_perf_active = cold_perf_enabled()
+        if cold_perf_active:
+            mark_cold_perf_connector_requests(
+                getattr(scheduler_output, "kv_connector_metadata", None)
+            )
+        cold_perf_req_ids = (
+            [
+                req_id
+                for req_id in scheduler_output.num_scheduled_tokens
+                if is_cold_perf_request(req_id)
+            ]
+            if cold_perf_active
+            else ()
+        )
+        if cold_perf_active:
+            sample_trace_budget = {
+                req_id: remaining
+                for req_id, remaining in getattr(
+                    self, "_cold_perf_sample_trace_budget", {}
+                ).items()
+                if req_id in scheduler_output.num_scheduled_tokens
+            }
+            for req_id in cold_perf_req_ids:
+                sample_trace_budget.setdefault(
+                    req_id, _COLD_PERF_SAMPLE_TRACE_CALLS
+                )
+            self._cold_perf_sample_trace_budget = sample_trace_budget
+            self._cold_perf_sample_trace_req_ids = tuple(
+                req_id
+                for req_id in scheduler_output.num_scheduled_tokens
+                if sample_trace_budget.get(req_id, 0) > 0
+            )
+            self._drain_cold_perf_npu_intervals()
+        else:
+            self._cold_perf_sample_trace_req_ids = ()
+        cold_perf_execute_start = (
+            time.perf_counter() if cold_perf_req_ids else 0.0
+        )
+        self._cold_perf_current_req_ids = cold_perf_req_ids
+        if cold_perf_req_ids:
+            log_cold_perf_event(
+                "decoder_worker_execute_entry",
+                request_ids=cold_perf_req_ids,
+                once=True,
+                total_num_scheduled_tokens=num_scheduled_tokens,
+            )
         with record_function_or_nullcontext("prepare input"):
             with self.synchronize_input_prep():
                 # Update persistent batch states.
@@ -1759,6 +2031,7 @@ class NPUModelRunner(GPUModelRunner):
                     num_reqs=num_reqs,
                     should_ubatch=should_ubatch,
                 )
+                dispatched_cudagraph_mode = cudagraph_mode
                 staged_sfa_graph_key = self._apply_staged_sfa_route(
                     staged_sfa_route
                 )
@@ -1767,6 +2040,47 @@ class NPUModelRunner(GPUModelRunner):
                     and staged_sfa_graph_key is None
                 ):
                     cudagraph_mode = CUDAGraphMode.NONE
+                if cold_perf_req_ids:
+                    log_cold_perf_event(
+                        "decoder_execution_route",
+                        request_ids=cold_perf_req_ids,
+                        once=True,
+                        batch_request_ids=list(
+                            self.input_batch.req_ids[:num_reqs]
+                        ),
+                        dispatched_graph_mode=str(dispatched_cudagraph_mode),
+                        runtime_graph_mode=str(cudagraph_mode),
+                        graph_enabled=cudagraph_mode != CUDAGraphMode.NONE,
+                        staged_graph_selected=staged_sfa_graph_key is not None,
+                        staged_action=staged_sfa_route.action.value,
+                        staged_reason=staged_sfa_route.reason.value,
+                        staged_graph_key=(
+                            str(staged_sfa_graph_key)
+                            if staged_sfa_graph_key is not None
+                            else None
+                        ),
+                        cold_compact_resume_count=sum(
+                            bool(value)
+                            for value in staged_sfa_route.cold_compact_resumes
+                        ),
+                        num_reqs=num_reqs,
+                        num_scheduled_tokens=num_scheduled_tokens_np.tolist(),
+                        query_width=1
+                        + int(
+                            getattr(
+                                self.speculative_config,
+                                "num_speculative_tokens",
+                                0,
+                            )
+                        ),
+                        decode_threshold=self.decode_threshold,
+                        attention_state=str(self.attn_state),
+                        staged_graph_capture_token_sizes=list(
+                            self._staged_sfa_graph_capture_sizes
+                        ),
+                        num_tokens_unpadded=num_tokens_unpadded,
+                        num_tokens_padded=num_tokens_padded,
+                    )
                 num_reqs_padded = batch_desc.num_reqs if batch_desc.num_reqs is not None else num_reqs
                 ubatch_slices, ubatch_slices_padded = maybe_create_ubatch_slices(
                     should_ubatch,
@@ -1875,6 +2189,17 @@ class NPUModelRunner(GPUModelRunner):
             # update global cos, sin
             update_cos_sin(positions)
 
+        if cold_perf_req_ids:
+            log_cold_perf_event(
+                "decoder_input_prepare_complete",
+                request_ids=cold_perf_req_ids,
+                once=True,
+                total_num_scheduled_tokens=num_scheduled_tokens,
+                elapsed_ms=round(
+                    (time.perf_counter() - cold_perf_execute_start) * 1000, 3
+                ),
+            )
+
         if self.dynamic_eplb:
             with record_function_or_nullcontext("EPLB weight D2D"):
                 self.eplb_updator.forward_before()
@@ -1961,6 +2286,12 @@ class NPUModelRunner(GPUModelRunner):
                 deferred=not clear_kv_metadata,
                 order=0,
             )
+        if cold_perf_req_ids:
+            log_cold_perf_event(
+                "decoder_connector_load_start",
+                request_ids=cold_perf_req_ids,
+                once=True,
+            )
         with (
             record_function_or_nullcontext("forward"),
             set_ascend_forward_context(
@@ -1991,6 +2322,12 @@ class NPUModelRunner(GPUModelRunner):
                 ),
             ) as kv_connector_output,
         ):
+            if cold_perf_req_ids:
+                log_cold_perf_event(
+                    "decoder_connector_load_complete",
+                    request_ids=cold_perf_req_ids,
+                    once=True,
+                )
             # Connector metadata is bound by maybe_get_kv_connector_output's
             # __enter__. Sample committed frontiers only after that point so the
             # first forward that can retrieve a new window also forces a remap
@@ -1999,7 +2336,19 @@ class NPUModelRunner(GPUModelRunner):
                 self._staged_sfa_graph_capture_sizes
                 and staged_sfa_graph_key is None
             ):
+                if cold_perf_req_ids:
+                    log_cold_perf_event(
+                        "decoder_capture_unsafe_sync_start",
+                        request_ids=cold_perf_req_ids,
+                        once=True,
+                    )
                 self._synchronize_staged_sfa_capture_unsafe_loads()
+                if cold_perf_req_ids:
+                    log_cold_perf_event(
+                        "decoder_capture_unsafe_sync_complete",
+                        request_ids=cold_perf_req_ids,
+                        once=True,
+                    )
             if diag_enabled and dsa_req_ids is not None:
                 decode_requests = scheduled_decode_requests(
                     dsa_req_ids,
@@ -2044,12 +2393,88 @@ class NPUModelRunner(GPUModelRunner):
                         forward_context.mtp_dw_deep_diag_req_ids = (
                             diag_deep_req_ids
                         )
+            content_diagnostics_enabled = (
+                npu_content_diagnostics_enabled()
+            )
+            if content_diagnostics_enabled:
+                begin_deferred_diagnostic_step()
             if staged_sfa_graph_key is not None and not envs_ascend.VLLM_ASCEND_SFA_FULL_GRAPH:
                 first_layer_name, first_impl = self._staged_sfa_impls[0]
                 first_impl.bootstrap_cross_layer(first_layer_name)
-            hidden_states = self._model_forward(
-                num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
+            cold_perf_forward_start = (
+                time.perf_counter() if cold_perf_req_ids else 0.0
             )
+            cold_perf_role = None
+            cold_perf_tp_rank = None
+            cold_perf_dp_rank = None
+            if cold_perf_req_ids:
+                cold_perf_role = "local"
+                if self.is_kv_producer:
+                    cold_perf_role = "producer"
+                elif self.is_kv_consumer:
+                    cold_perf_role = "consumer"
+                cold_perf_tp_rank = get_tp_group().rank_in_group
+                cold_perf_dp_rank = get_dp_group().rank_in_group
+            if cold_perf_req_ids:
+                log_cold_perf_event(
+                    "decoder_forward_start",
+                    request_ids=cold_perf_req_ids,
+                    once=True,
+                    total_num_scheduled_tokens=num_tokens_padded,
+                    kv_role=cold_perf_role,
+                    tp_rank=cold_perf_tp_rank,
+                    dp_rank=cold_perf_dp_rank,
+                )
+            self._cold_perf_forward_interval = None
+            if self._cold_perf_sample_trace_req_ids:
+                self._cold_perf_last_npu_interval = None
+                hidden_states = self._run_cold_perf_npu_stage(
+                    "target_forward",
+                    self._cold_perf_sample_trace_req_ids,
+                    self._model_forward,
+                    num_tokens_padded,
+                    input_ids,
+                    positions,
+                    intermediate_tensors,
+                    inputs_embeds,
+                    **model_kwargs,
+                )
+                self._cold_perf_forward_interval = getattr(self, "_cold_perf_last_npu_interval", None)
+            else:
+                hidden_states = self._model_forward(
+                    num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
+                )
+            if cold_perf_req_ids:
+                cold_perf_forward_end = time.perf_counter()
+                log_cold_perf_event(
+                    "decoder_forward_return",
+                    request_ids=cold_perf_req_ids,
+                    once=True,
+                    cpu_elapsed_ms=round(
+                        (cold_perf_forward_end - cold_perf_forward_start) * 1000,
+                        3,
+                    ),
+                    kv_role=cold_perf_role,
+                    tp_rank=cold_perf_tp_rank,
+                    dp_rank=cold_perf_dp_rank,
+                )
+                if self.is_kv_producer:
+                    log_cold_perf_event(
+                        "prefiller_model_chunk_complete",
+                        request_ids=cold_perf_req_ids,
+                        tp_rank=cold_perf_tp_rank,
+                        dp_rank=cold_perf_dp_rank,
+                        model_started_monotonic_ms=round(
+                            cold_perf_forward_start * 1000, 3
+                        ),
+                        model_ended_monotonic_ms=round(
+                            cold_perf_forward_end * 1000, 3
+                        ),
+                        model_forward_cpu_ms=round(
+                            (cold_perf_forward_end - cold_perf_forward_start) * 1000,
+                            3,
+                        ),
+                    )
             target_diag_session = getattr(
                 get_forward_context(),
                 "_target_sfa_diag_session",
@@ -2084,14 +2509,43 @@ class NPUModelRunner(GPUModelRunner):
                 if not get_pp_group().is_last_rank:
                     # Return the intermediate tensors.
                     assert isinstance(hidden_states, IntermediateTensors)
+                    # This branch returns before speculative drafting, so a
+                    # deferred connector lifecycle must be closed here.
+                    if not clear_kv_metadata:
+                        finalized = self.finalize_kv_connector(
+                            scheduler_output.finished_req_ids
+                        )
+                        if not finalized.is_empty():
+                            kv_connector_output = (
+                                finalized
+                                if kv_connector_output is None
+                                else _merge_kv_connector_outputs(
+                                    kv_connector_output, finalized
+                                )
+                            )
                     hidden_states.kv_connector_output = kv_connector_output
                     self.kv_connector_output = kv_connector_output
                     if self.debugger is not None:
                         self.debugger.stop()
                         self.debugger.step()
+                    if content_diagnostics_enabled:
+                        flush_deferred_diagnostics()
                     return hidden_states
                 if self.is_pooling_model:
                     # Return the pooling output.
+                    # Pooling also has no draft pass after the target model.
+                    if not clear_kv_metadata:
+                        finalized = self.finalize_kv_connector(
+                            scheduler_output.finished_req_ids
+                        )
+                        if not finalized.is_empty():
+                            kv_connector_output = (
+                                finalized
+                                if kv_connector_output is None
+                                else _merge_kv_connector_outputs(
+                                    kv_connector_output, finalized
+                                )
+                            )
                     output = self._pool(
                         hidden_states, num_scheduled_tokens, num_scheduled_tokens_np, kv_connector_output
                     )
@@ -2099,6 +2553,8 @@ class NPUModelRunner(GPUModelRunner):
                     if self.debugger is not None:
                         self.debugger.stop()
                         self.debugger.step()
+                    if content_diagnostics_enabled:
+                        flush_deferred_diagnostics()
                     return output
 
                 sample_hidden_states = hidden_states[logits_indices]
@@ -2150,12 +2606,33 @@ class NPUModelRunner(GPUModelRunner):
             self.kv_connector_output = kv_connector_output
         return None
 
+
     @torch.inference_mode()
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors:
         kv_connector_output = self.kv_connector_output
         self.kv_connector_output = None
+        cold_perf_req_ids = getattr(self, "_cold_perf_current_req_ids", ())
+        sample_trace_req_ids = tuple(
+            getattr(self, "_cold_perf_sample_trace_req_ids", ())
+        )
+        cold_perf_sample_start = (
+            time.perf_counter() if sample_trace_req_ids else 0.0
+        )
+        cold_perf_sample_thread_start = (
+            time.thread_time_ns() if sample_trace_req_ids else 0
+        )
+        cold_perf_sample_process_start = (
+            time.process_time_ns() if sample_trace_req_ids else 0
+        )
+        cold_perf_sample_stages = {} if sample_trace_req_ids else None
+        if cold_perf_req_ids:
+            log_cold_perf_event(
+                "decoder_sample_start",
+                request_ids=cold_perf_req_ids,
+                once=True,
+            )
 
         if self.execute_model_state is None:
             # Nothing to do (PP non-final rank case), output isn't used.
@@ -2174,6 +2651,24 @@ class NPUModelRunner(GPUModelRunner):
             output = copy(EMPTY_MODEL_RUNNER_OUTPUT)
             output.kv_connector_output = kv_connector_output
             return output
+
+        self._cold_perf_active_sample_stages = cold_perf_sample_stages if sample_trace_req_ids else None
+        current_npu_intervals = [] if sample_trace_req_ids else None
+        self._cold_perf_current_sample_npu_intervals = current_npu_intervals
+        forward_interval = getattr(self, "_cold_perf_forward_interval", None)
+        if (
+            current_npu_intervals is not None
+            and forward_interval is not None
+            and set(sample_trace_req_ids).intersection(forward_interval.request_ids)
+        ):
+            current_npu_intervals.append(forward_interval)
+
+        if sample_trace_req_ids:
+            sample_trace_budget = self._cold_perf_sample_trace_budget
+            for req_id in sample_trace_req_ids:
+                sample_trace_budget[req_id] = max(
+                    0, sample_trace_budget.get(req_id, 0) - 1
+                )
 
         # Unpack ephemeral state.
         (
@@ -2195,6 +2690,7 @@ class NPUModelRunner(GPUModelRunner):
         self.execute_model_state = None
 
         # Apply structured output bitmasks if present.
+        stage_started = time.perf_counter() if sample_trace_req_ids else 0.0
         if grammar_output is not None:
             # here we are different from gpu_model_runner,
             # the apply_grammar_bitmask uses torch.compile to optimize this,ascend does not support it now
@@ -2202,9 +2698,30 @@ class NPUModelRunner(GPUModelRunner):
             logits = logits.to("cpu").float()
             apply_grammar_bitmask(scheduler_output, grammar_output, self.input_batch, logits)
             logits = logits.to(self.device).to(logits_dtype)
+        if sample_trace_req_ids:
+            _record_sample_stage(
+                cold_perf_sample_stages, "grammar_ms", stage_started
+            )
 
-        with record_function_or_nullcontext("sample_token"):
-            sampler_output = self._sample(logits, spec_decode_metadata)
+        stage_started = time.perf_counter() if sample_trace_req_ids else 0.0
+        try:
+            with record_function_or_nullcontext("sample_token"):
+                sampler_output = self._sample(logits, spec_decode_metadata)
+        finally:
+            self._cold_perf_active_sample_stages = None
+        if sample_trace_req_ids:
+            _record_sample_stage(
+                cold_perf_sample_stages, "target_sampling_ms", stage_started
+            )
+        if cold_perf_req_ids:
+            log_cold_perf_event(
+                "decoder_sample_target_complete",
+                request_ids=cold_perf_req_ids,
+                once=True,
+                elapsed_ms=round(
+                    (time.perf_counter() - cold_perf_sample_start) * 1000, 3
+                ),
+            )
         if envs_ascend.VLLM_ASCEND_MTP_DRAFT_DEBUG:
             target_tail_boundary(
                 getattr(self, "_target_sfa_diag_session", None),
@@ -2241,16 +2758,25 @@ class NPUModelRunner(GPUModelRunner):
                     batch_desc,
                     staged_sfa_graph_key,
                 )
-            self._copy_draft_token_ids_to_cpu(scheduler_output)
+            if sample_trace_req_ids:
+                self._run_cold_perf_npu_stage(
+                    "mtp_readback",
+                    sample_trace_req_ids,
+                    self._copy_draft_token_ids_to_cpu,
+                    scheduler_output,
+                    metrics=cold_perf_sample_stages,
+                )
+            else:
+                self._copy_draft_token_ids_to_cpu(scheduler_output)
 
-        (
-            logprobs_lists,
-            valid_sampled_token_ids,
-            prompt_logprobs_dict,
-            req_ids_output_copy,
-            req_id_to_index_output_copy,
-            invalid_req_indices,
-        ) = self._bookkeeping_sync(
+        if cold_perf_req_ids:
+            log_cold_perf_event(
+                "decoder_sample_bookkeeping_start",
+                request_ids=cold_perf_req_ids,
+                once=True,
+            )
+        stage_started = time.perf_counter() if sample_trace_req_ids else 0.0
+        bookkeeping_args = (
             scheduler_output,
             sampler_output,
             logits,
@@ -2258,6 +2784,39 @@ class NPUModelRunner(GPUModelRunner):
             scheduler_output.total_num_scheduled_tokens,
             spec_decode_metadata,
         )
+        bookkeeping_result = (
+            self._run_cold_perf_npu_stage(
+                "bookkeeping",
+                sample_trace_req_ids,
+                self._bookkeeping_sync,
+                *bookkeeping_args,
+                metrics=cold_perf_sample_stages,
+            )
+            if sample_trace_req_ids
+            else self._bookkeeping_sync(*bookkeeping_args)
+        )
+        (
+            logprobs_lists,
+            valid_sampled_token_ids,
+            prompt_logprobs_dict,
+            req_ids_output_copy,
+            req_id_to_index_output_copy,
+            invalid_req_indices,
+        ) = bookkeeping_result
+        if sample_trace_req_ids:
+            _record_sample_stage(
+                cold_perf_sample_stages, "bookkeeping_ms", stage_started
+            )
+        if cold_perf_req_ids:
+            log_cold_perf_event(
+                "decoder_sample_bookkeeping_complete",
+                request_ids=cold_perf_req_ids,
+                once=True,
+                elapsed_ms=round(
+                    (time.perf_counter() - cold_perf_sample_start) * 1000, 3
+                ),
+                output_request_count=len(req_ids_output_copy),
+            )
         _mtp_dw_for_requests(
             self,
             scheduler_output,
@@ -2270,6 +2829,16 @@ class NPUModelRunner(GPUModelRunner):
 
         with record_function_or_nullcontext("draft_token"):
             if self.speculative_config:
+                stage_started = (
+                    time.perf_counter() if sample_trace_req_ids else 0.0
+                )
+                if cold_perf_req_ids:
+                    log_cold_perf_event(
+                        "decoder_sample_draft_start",
+                        request_ids=cold_perf_req_ids,
+                        once=True,
+                        draft_method=getattr(self.drafter, "method", None),
+                    )
                 use_padded_batch = (
                     self.speculative_config
                     and (self.speculative_config.use_eagle() or self.speculative_config.uses_draft_model())
@@ -2278,11 +2847,45 @@ class NPUModelRunner(GPUModelRunner):
                 if use_padded_batch:
                     # EAGLE speculative decoding can use the GPU sampled tokens
                     # as inputs, and does not need to wait for bookkeeping to finish.
-                    propose_draft_token_ids(sampler_output.sampled_token_ids)
+                    draft_args = (sampler_output.sampled_token_ids,)
                 if not use_padded_batch:
                     # ngram and other speculative decoding methods use the sampled
                     # tokens on the CPU, so they are run after bookkeeping.
-                    propose_draft_token_ids(valid_sampled_token_ids)
+                    draft_args = (valid_sampled_token_ids,)
+                self._cold_perf_active_sample_stages = (
+                    cold_perf_sample_stages if sample_trace_req_ids else None
+                )
+                try:
+                    if sample_trace_req_ids:
+                        self._run_cold_perf_npu_stage(
+                            "mtp_draft",
+                            sample_trace_req_ids,
+                            propose_draft_token_ids,
+                            *draft_args,
+                            metrics=cold_perf_sample_stages,
+                        )
+                    else:
+                        propose_draft_token_ids(*draft_args)
+                finally:
+                    self._cold_perf_active_sample_stages = None
+
+                if sample_trace_req_ids:
+                    _record_sample_stage(
+                        cold_perf_sample_stages, "mtp_draft_ms", stage_started
+                    )
+
+                if cold_perf_req_ids:
+                    log_cold_perf_event(
+                        "decoder_sample_draft_complete",
+                        request_ids=cold_perf_req_ids,
+                        once=True,
+                        elapsed_ms=round(
+                            (time.perf_counter() - cold_perf_sample_start)
+                            * 1000,
+                            3,
+                        ),
+                        draft_method=getattr(self.drafter, "method", None),
+                    )
 
                 if _mtp_dw_diag_enabled():
                     draft_counts = {}
@@ -2316,7 +2919,43 @@ class NPUModelRunner(GPUModelRunner):
 
             if has_kv_transfer_group():
                 if self.speculative_config:
-                    completed_decode_window_saves = self.finalize_kv_connector()
+                    stage_started = (
+                        time.perf_counter() if sample_trace_req_ids else 0.0
+                    )
+                    if cold_perf_req_ids:
+                        log_cold_perf_event(
+                            "decoder_connector_finalize_start",
+                            request_ids=cold_perf_req_ids,
+                            once=True,
+                        )
+                    finalized = (
+                        self._run_cold_perf_npu_stage(
+                            "connector_finalize",
+                            sample_trace_req_ids,
+                            self.finalize_kv_connector,
+                            scheduler_output.finished_req_ids,
+                            metrics=cold_perf_sample_stages,
+                        )
+                        if sample_trace_req_ids
+                        else self.finalize_kv_connector(scheduler_output.finished_req_ids)
+                    )
+                    if sample_trace_req_ids:
+                        _record_sample_stage(
+                            cold_perf_sample_stages,
+                            "connector_finalize_ms",
+                            stage_started,
+                        )
+                    if cold_perf_req_ids:
+                        log_cold_perf_event(
+                            "decoder_connector_finalize_complete",
+                            request_ids=cold_perf_req_ids,
+                            once=True,
+                            elapsed_ms=round(
+                                (time.perf_counter() - cold_perf_sample_start)
+                                * 1000,
+                                3,
+                            ),
+                        )
                     diag_req_ids = getattr(
                         self, "_mtp_dw_diag_current_req_ids", set()
                     )
@@ -2333,21 +2972,17 @@ class NPUModelRunner(GPUModelRunner):
                             deferred=True,
                             order=3,
                             completed_window_end=(
-                                completed_decode_window_saves.get(req_id)
+                                finalized.completed_decode_window_saves.get(req_id)
                             ),
                         )
-                    if completed_decode_window_saves:
-                        if kv_connector_output is None:
-                            kv_connector_output = KVConnectorOutput()
-                        for req_id, window_end in completed_decode_window_saves.items():
-                            kv_connector_output.completed_decode_window_saves[
-                                req_id
-                            ] = max(
-                                kv_connector_output.completed_decode_window_saves.get(
-                                    req_id, 0
-                                ),
-                                window_end,
+                    if not finalized.is_empty():
+                        kv_connector_output = (
+                            finalized
+                            if kv_connector_output is None
+                            else _merge_kv_connector_outputs(
+                                kv_connector_output, finalized
                             )
+                        )
 
         if self.model_config.enable_return_routed_experts:
             capturer = RoutedExpertsCapturer.get_instance()
@@ -2356,6 +2991,7 @@ class NPUModelRunner(GPUModelRunner):
             else:
                 logger.warning("RoutedExpertsCapturer is not initialized.")
 
+        stage_started = time.perf_counter() if sample_trace_req_ids else 0.0
         model_runner_output = ModelRunnerOutput(
             req_ids=req_ids_output_copy,
             req_id_to_index=req_id_to_index_output_copy,
@@ -2367,6 +3003,10 @@ class NPUModelRunner(GPUModelRunner):
             ec_connector_output=ec_connector_output if self.supports_mm_inputs else None,
             cudagraph_stats=cudagraph_stats,
         )
+        if sample_trace_req_ids:
+            _record_sample_stage(
+                cold_perf_sample_stages, "output_build_ms", stage_started
+            )
 
         if self.dynamic_eplb:
             with record_function_or_nullcontext("EPLB update"):
@@ -2378,12 +3018,44 @@ class NPUModelRunner(GPUModelRunner):
 
         if self.need_accepted_tokens:
             assert self.sampling_done_event is not None
+            if cold_perf_req_ids:
+                log_cold_perf_event(
+                    "decoder_sample_state_update_start",
+                    request_ids=cold_perf_req_ids,
+                    once=True,
+                )
+            stage_started = time.perf_counter() if sample_trace_req_ids else 0.0
             with (
                 record_function_or_nullcontext("async_state_update"),
                 torch.npu.stream(global_stream()),
             ):
-                global_stream().wait_event(self.sampling_done_event)
-                self._update_states_after_model_execute(sampler_output.sampled_token_ids, scheduler_output)
+                def update_states():
+                    global_stream().wait_event(self.sampling_done_event)
+                    self._update_states_after_model_execute(sampler_output.sampled_token_ids, scheduler_output)
+
+                if sample_trace_req_ids:
+                    self._run_cold_perf_npu_stage(
+                        "state_update",
+                        sample_trace_req_ids,
+                        update_states,
+                        metrics=cold_perf_sample_stages,
+                    )
+                else:
+                    update_states()
+            if sample_trace_req_ids:
+                _record_sample_stage(
+                    cold_perf_sample_stages, "state_update_ms", stage_started
+                )
+            if cold_perf_req_ids:
+                log_cold_perf_event(
+                    "decoder_sample_state_update_complete",
+                    request_ids=cold_perf_req_ids,
+                    once=True,
+                    elapsed_ms=round(
+                        (time.perf_counter() - cold_perf_sample_start) * 1000,
+                        3,
+                    ),
+                )
 
         # In async scheduling + PP, broadcast sampled token ids from the
         # last PP rank so other PP ranks can receive them without going
@@ -2393,24 +3065,107 @@ class NPUModelRunner(GPUModelRunner):
             if pp.world_size > 1 and pp.is_last_rank:
                 self._pp_broadcast_prev_sampled_token_ids(sampler_output.sampled_token_ids)
 
-        if not self.use_async_scheduling:
-            return model_runner_output
-        return AsyncGPUModelRunnerOutput(
-            model_runner_output=model_runner_output,
-            sampled_token_ids=sampler_output.sampled_token_ids,
-            logprobs_tensors=sampler_output.logprobs_tensors,
-            invalid_req_indices=invalid_req_indices,
-            async_output_copy_stream=self.async_output_copy_stream,
-            vocab_size=self.input_batch.vocab_size,
-        )
+        # Host readback can synchronize the device.  Keep it after sampling,
+        # MTP draft proposal, connector finalization, async state update, and
+        # PP broadcast so diagnostics cannot repair a production ordering bug.
+        stage_started = time.perf_counter() if sample_trace_req_ids else 0.0
+        if npu_content_diagnostics_enabled():
+            if staged_sfa_graph_key is not None:
+                for layer_name, impl in self._staged_sfa_impls:
+                    metadata = attn_metadata.get(layer_name)
+                    if metadata is None:
+                        continue
+                    impl.queue_staged_graph_post_diagnostic(
+                        layer_name,
+                        staged_sfa_graph_key,
+                        metadata,
+                    )
+            flush_deferred_diagnostics()
+        if sample_trace_req_ids:
+            _record_sample_stage(
+                cold_perf_sample_stages,
+                "content_diagnostics_ms",
+                stage_started,
+            )
+
+        if cold_perf_req_ids:
+            log_cold_perf_event(
+                "decoder_sample_complete",
+                request_ids=cold_perf_req_ids,
+                once=True,
+                elapsed_ms=round(
+                    (time.perf_counter() - cold_perf_sample_start) * 1000, 3
+                ),
+                output_request_count=len(req_ids_output_copy),
+            )
+
+        stage_started = time.perf_counter() if sample_trace_req_ids else 0.0
+        if self.use_async_scheduling:
+            output = AsyncGPUModelRunnerOutput(
+                model_runner_output=model_runner_output,
+                sampled_token_ids=sampler_output.sampled_token_ids,
+                logprobs_tensors=sampler_output.logprobs_tensors,
+                invalid_req_indices=invalid_req_indices,
+                async_output_copy_stream=self.async_output_copy_stream,
+                vocab_size=self.input_batch.vocab_size,
+            )
+            if sample_trace_req_ids:
+                output._ascend_cold_perf_request_ids = sample_trace_req_ids
+        else:
+            output = model_runner_output
+        if sample_trace_req_ids:
+            _record_sample_stage(
+                cold_perf_sample_stages,
+                "async_output_build_ms",
+                stage_started,
+            )
+            mtp_wall_ms = cold_perf_sample_stages.get("mtp_draft_wall_ms")
+            if mtp_wall_ms is not None:
+                measured_mtp_ms = sum(
+                    cold_perf_sample_stages.get(f"{name}_wall_ms", 0.0)
+                    for name in (
+                        "mtp_prepare_next",
+                        "mtp_valid_count_copy",
+                        "mtp_prepare_inputs",
+                        "mtp_graph",
+                        "mtp_readback",
+                    )
+                )
+                cold_perf_sample_stages["mtp_unattributed_wall_ms"] = max(0.0, mtp_wall_ms - measured_mtp_ms)
+            sample_elapsed_ms = (time.perf_counter() - cold_perf_sample_start) * 1000
+            if current_npu_intervals is not None:
+                sample_stalled = sample_elapsed_ms >= _COLD_PERF_SLOW_SAMPLE_MS
+                for interval in current_npu_intervals:
+                    interval.force_emit |= sample_stalled
+            _log_slow_sample_invocation(
+                sample_trace_req_ids,
+                sample_elapsed_ms,
+                (time.thread_time_ns() - cold_perf_sample_thread_start) / 1e6,
+                (time.process_time_ns() - cold_perf_sample_process_start) / 1e6,
+                cold_perf_sample_stages,
+            )
+            self._drain_cold_perf_npu_intervals()
+        self._cold_perf_current_sample_npu_intervals = None
+        return output
 
     # overwrite _sample for lmhead_tp_enable and need_accepted_tokens
     def _sample(self, logits, spec_decode_metadata):
         # Sample the next token and get logprobs if needed.
         sampling_metadata = self.input_batch.sampling_metadata
+        request_ids = tuple(getattr(self, "_cold_perf_sample_trace_req_ids", ()))
+        metrics = getattr(self, "_cold_perf_active_sample_stages", None)
         if spec_decode_metadata is None:
             if lmhead_tp_enable() and logits is not None:
                 logits = logits[: self.input_batch.num_reqs]
+            if request_ids:
+                return self._run_cold_perf_npu_stage(
+                    "ordinary_sampler",
+                    request_ids,
+                    self.sampler,
+                    logits=logits,
+                    sampling_metadata=sampling_metadata,
+                    metrics=metrics,
+                )
             return self.sampler(
                 logits=logits,
                 sampling_metadata=sampling_metadata,
@@ -2418,12 +3173,44 @@ class NPUModelRunner(GPUModelRunner):
 
         if lmhead_tp_enable() and logits is not None:
             logits = logits[: len(spec_decode_metadata.logits_indices)]
-        sampler_output = self.rejection_sampler(
-            spec_decode_metadata,
-            None,  # draft_probs
-            logits,
-            sampling_metadata,
-        )
+        if not request_ids:
+            return self.rejection_sampler(spec_decode_metadata, None, logits, sampling_metadata)
+
+        def record_rejection_stage(name, operation, args, kwargs):
+            return self._run_cold_perf_npu_stage(
+                f"rejection_{name}", request_ids, operation, *args, metrics=metrics, **kwargs
+            )
+
+        recorder_token = set_stage_recorder(record_rejection_stage)
+        try:
+            sampler_output = self._run_cold_perf_npu_stage(
+                "rejection_total",
+                request_ids,
+                self.rejection_sampler,
+                spec_decode_metadata,
+                None,
+                logits,
+                sampling_metadata,
+                metrics=metrics,
+            )
+        finally:
+            reset_stage_recorder(recorder_token)
+        if metrics is not None:
+            measured = sum(
+                metrics.get(f"rejection_{name}_wall_ms", 0.0)
+                for name in (
+                    "bonus_index",
+                    "bonus_sampler",
+                    "target_index_cast",
+                    "logits_processors",
+                    "sampling_constraints",
+                    "rejection_kernel",
+                    "logprobs",
+                )
+            )
+            metrics["rejection_unattributed_wall_ms"] = max(
+                0.0, metrics.get("rejection_total_wall_ms", 0.0) - measured
+            )
         return sampler_output
 
     # TODO: remove this func after eagle_proposer is refactored and
@@ -2472,7 +3259,7 @@ class NPUModelRunner(GPUModelRunner):
                     valid_sampled_token_ids[int(i)].clear()
             else:
                 # Includes spec decode tokens.
-                valid_sampled_token_ids, cu_num_tokens = RejectionSampler.parse_output(
+                valid_sampled_token_ids, cu_num_tokens = AscendRejectionSampler.parse_output(
                     sampled_token_ids,
                     self.input_batch.vocab_size,
                     discard_sampled_tokens_req_indices,
@@ -2646,6 +3433,10 @@ class NPUModelRunner(GPUModelRunner):
         )
         forward_context = get_forward_context()
         assert forward_context is not None
+        # Export the already-recorded post-forward dependency for an explicitly
+        # armed live or RemoteFill submission without adding a layer callback,
+        # tensor copy, or device synchronization to the compute path.
+        _capture_live_source_event_handoff()
         if (
             forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL
             and not forward_context.capturing
@@ -2727,7 +3518,13 @@ class NPUModelRunner(GPUModelRunner):
         if self.dp_size == 1:
             return False, None, cudagraph_mode, staged_sfa_route_action
 
-        rows = 3 if staged_sfa_route_action is not None else 2
+        # Collective shape is a wire protocol and must match on every DP rank.
+        # A neutral/bootstrap rank may have no local route while its peer uses
+        # staged SFA, so retain the route row whenever staged SFA is configured.
+        staged_route_protocol = bool(
+            getattr(self, "_staged_sfa_graph_capture_sizes", ())
+        ) or staged_sfa_route_action is not None
+        rows = 3 if staged_route_protocol else 2
         tensor = self._dp_batch_sync_buffers.get(rows)
         if tensor is None or tensor.shape[1] != self.dp_size:
             tensor = torch.empty(
@@ -3338,13 +4135,7 @@ class NPUModelRunner(GPUModelRunner):
         prompt_lens: Any = None,
     ) -> StagedSFARouteDecision:
         """Classify local scheduler/connector state before DP coordination."""
-        def native(reason):
-            return StagedSFARouteDecision(
-                StagedSFARouteAction.SAFE_NATIVE,
-                reason,
-            )
-        if not self._staged_sfa_graph_capture_sizes:
-            return native(StagedSFARouteReason.NOT_CONFIGURED)
+        graph_configured = bool(self._staged_sfa_graph_capture_sizes)
         query_width = 1 + int(
             getattr(self.speculative_config, "num_speculative_tokens", 0)
         )
@@ -3354,39 +4145,119 @@ class NPUModelRunner(GPUModelRunner):
             if query_width == 1
             else AscendAttentionState.SpecDecoding
         )
-        if self.attn_state != expected_state and not (
+        is_decode_state = self.attn_state == expected_state or (
             full_graph and self.attn_state == AscendAttentionState.DecodeOnly
-        ):
-            return native(StagedSFARouteReason.NOT_DECODE)
-        metadata_reason, frontiers, cold_resumes = (
-            staged_sfa_metadata_sparse_route(
-                kv_connector_metadata,
-                request_ids,
-            )
         )
-        if envs_ascend.VLLM_ASCEND_SFA_FULL_GRAPH and num_computed_tokens is not None and prompt_lens is not None:
+        possible_cold_resume = False
+        if (
+            is_decode_state
+            and not graph_configured
+            and num_computed_tokens is not None
+            and prompt_lens is not None
+        ):
+            computed_probe = np.asarray(num_computed_tokens).reshape(-1)
+            prompt_probe = np.asarray(prompt_lens).reshape(-1)
+            possible_cold_resume = (
+                computed_probe.shape == (num_reqs,)
+                and prompt_probe.shape == (num_reqs,)
+                and bool(np.any(computed_probe < prompt_probe))
+            )
+        if is_decode_state and (graph_configured or possible_cold_resume):
+            metadata_reason, frontiers, cold_resumes = (
+                staged_sfa_metadata_sparse_route(
+                    unwrap_staged_sfa_connector_metadata(
+                        kv_connector_metadata
+                    ),
+                    request_ids,
+                )
+            )
+        else:
+            frontiers = ()
+            cold_resumes = ()
+
+        def native(reason):
+            return StagedSFARouteDecision(
+                StagedSFARouteAction.SAFE_NATIVE,
+                reason,
+                frontiers=frontiers if cold_resumes else (),
+                cold_compact_resumes=cold_resumes,
+            )
+
+        if not graph_configured:
+            return native(StagedSFARouteReason.NOT_CONFIGURED)
+        if full_graph and num_computed_tokens is not None and prompt_lens is not None:
             computed = np.asarray(num_computed_tokens).reshape(-1)
             prompts = np.asarray(prompt_lens).reshape(-1)
-            # A one-token chunked-prefill tail is not a decode forward, even
-            # though attention's query-length classification calls it Q1.
+            # A one-token chunked-prefill tail is not a decode forward. A
+            # marked cold resume, however, intentionally starts at prompt - 1.
             if computed.shape == prompts.shape == (num_reqs,) and any(
-                computed[i] < prompts[i] and not (cold_resumes and cold_resumes[i])
+                computed[i] < prompts[i]
+                and not (i < len(cold_resumes) and cold_resumes[i])
                 for i in range(num_reqs)
             ):
                 return native(StagedSFARouteReason.NOT_DECODE)
-        if metadata_reason not in (
-            StagedSFARouteReason.ELIGIBLE,
-            StagedSFARouteReason.DENSE_PREFIX_HIT,
-            StagedSFARouteReason.MIXED_CONNECTOR_LOAD,
-        ):
-            return StagedSFARouteDecision(
-                StagedSFARouteAction.FATAL,
-                metadata_reason,
-            )
+        if is_decode_state:
+            if any(cold_resumes):
+                computed = (
+                    np.asarray(num_computed_tokens).reshape(-1)
+                    if num_computed_tokens is not None
+                    else np.empty(0, dtype=np.int64)
+                )
+                prompts = (
+                    np.asarray(prompt_lens).reshape(-1)
+                    if prompt_lens is not None
+                    else np.empty(0, dtype=np.int64)
+                )
+                marker_failures: list[str] = []
+                if query_width != self.decode_threshold:
+                    marker_failures.append("query_width")
+                if len(cold_resumes) != num_reqs:
+                    marker_failures.append("resume_count")
+                if len(frontiers) != num_reqs:
+                    marker_failures.append("frontier_count")
+                if computed.shape != (num_reqs,):
+                    marker_failures.append("computed_shape")
+                if prompts.shape != (num_reqs,):
+                    marker_failures.append("prompt_shape")
+                if not marker_failures:
+                    for i, resume in enumerate(cold_resumes):
+                        if not resume:
+                            continue
+                        if int(computed[i]) != int(prompts[i]) - 1:
+                            marker_failures.append(
+                                f"computed_prompt_minus_one[{i}]"
+                            )
+                        if frontiers[i] != int(computed[i]):
+                            marker_failures.append(
+                                f"frontier_computed[{i}]"
+                            )
+                if marker_failures:
+                    if cold_perf_enabled():
+                        log_cold_perf_event(
+                            "decoder_cold_compact_graph_reject",
+                            request_ids=request_ids,
+                            once=True,
+                            failed_invariants=marker_failures,
+                            cold_resume_indices=[
+                                i
+                                for i, resume in enumerate(cold_resumes)
+                                if resume
+                            ],
+                            num_computed_tokens=computed.tolist(),
+                            prompt_lens=prompts.tolist(),
+                            remap_frontiers=list(frontiers),
+                        )
+                    return native(
+                        StagedSFARouteReason.COLD_COMPACT_LAYOUT
+                    )
         if getattr(self, "calculate_kv_scales", False):
             return native(StagedSFARouteReason.RUNTIME_MODE)
         if getattr(self.vllm_config, "lora_config", None) is not None:
             return native(StagedSFARouteReason.LORA)
+        if not is_decode_state:
+            return native(StagedSFARouteReason.NOT_DECODE)
+        if query_width not in (1, 2):
+            return native(StagedSFARouteReason.SPECULATIVE_DECODE)
         if has_cascade_attention:
             return native(StagedSFARouteReason.CASCADE)
         batch_size = int(num_tokens_unpadded)
@@ -3404,29 +4275,49 @@ class NPUModelRunner(GPUModelRunner):
             ((scheduled >= 1) & (scheduled <= query_width)) if full_graph else scheduled == query_width
         ):
             return native(StagedSFARouteReason.NON_Q1)
+        if not full_graph and metadata_reason in (
+            StagedSFARouteReason.DENSE_PREFIX_HIT,
+            StagedSFARouteReason.MIXED_CONNECTOR_LOAD,
+        ):
+            return native(metadata_reason)
+        if metadata_reason not in (
+            StagedSFARouteReason.ELIGIBLE,
+            StagedSFARouteReason.DENSE_PREFIX_HIT,
+            StagedSFARouteReason.MIXED_CONNECTOR_LOAD,
+        ):
+            return StagedSFARouteDecision(
+                StagedSFARouteAction.FATAL,
+                metadata_reason,
+            )
         if len(frontiers) != num_reqs:
             return StagedSFARouteDecision(
                 StagedSFARouteAction.FATAL,
                 StagedSFARouteReason.FRONTIER_COUNT_MISMATCH,
             )
-        if query_width == 1 or full_graph:
-            if any(cold_resumes):
-                computed = np.asarray(num_computed_tokens).reshape(-1)
-                prompts = np.asarray(prompt_lens).reshape(-1)
-                if (
-                    len(cold_resumes) != num_reqs
-                    or computed.shape != (num_reqs,)
-                    or prompts.shape != (num_reqs,)
-                    or any(
-                        scheduled[i] != 1 or int(computed[i]) != int(prompts[i]) - 1
-                        or frontiers[i] != int(computed[i])
-                        for i, resume in enumerate(cold_resumes)
-                        if resume
+        if any(cold_resumes):
+            layout_failures: list[str] = []
+            for i, resume in enumerate(cold_resumes):
+                if not resume and int(computed[i]) < int(prompts[i]):
+                    layout_failures.append(f"computed_prompt[{i}]")
+            if layout_failures:
+                if cold_perf_enabled():
+                    log_cold_perf_event(
+                        "decoder_cold_compact_graph_reject",
+                        request_ids=request_ids,
+                        once=True,
+                        failed_invariants=layout_failures,
+                        cold_resume_indices=[
+                            i
+                            for i, resume in enumerate(cold_resumes)
+                            if resume
+                        ],
+                        num_computed_tokens=computed.tolist(),
+                        prompt_lens=prompts.tolist(),
+                        remap_frontiers=list(frontiers),
                     )
-                ):
-                    return native(StagedSFARouteReason.COLD_COMPACT_LAYOUT)
-        else:
-            cold_resumes = ()
+                return native(
+                    StagedSFARouteReason.COLD_COMPACT_LAYOUT,
+                )
         scratch_capacity = query_width * index_topk
         if any(
             frontier != 0 and frontier < scratch_capacity
@@ -3516,6 +4407,14 @@ class NPUModelRunner(GPUModelRunner):
         should_ubatch: bool,
     ) -> StagedSFARouteDecision:
         """Bind a DP-agreed local route to one captured graph capacity."""
+        def native(reason: StagedSFARouteReason) -> StagedSFARouteDecision:
+            return StagedSFARouteDecision(
+                StagedSFARouteAction.SAFE_NATIVE,
+                reason,
+                frontiers=local_route.frontiers,
+                cold_compact_resumes=local_route.cold_compact_resumes,
+            )
+
         if (
             dp_route_action is not None
             and dp_route_action != StagedSFARouteAction.STAGED
@@ -3525,27 +4424,20 @@ class NPUModelRunner(GPUModelRunner):
             return StagedSFARouteDecision(
                 dp_route_action,
                 StagedSFARouteReason.RUNTIME_PARALLELISM,
+                frontiers=local_route.frontiers,
+                cold_compact_resumes=local_route.cold_compact_resumes,
             )
         if local_route.action != StagedSFARouteAction.STAGED:
             return local_route
         if cudagraph_mode != CUDAGraphMode.PIECEWISE:
-            return StagedSFARouteDecision(
-                StagedSFARouteAction.SAFE_NATIVE,
-                StagedSFARouteReason.RUNTIME_MODE,
-            )
+            return native(StagedSFARouteReason.RUNTIME_MODE)
         if should_ubatch:
-            return StagedSFARouteDecision(
-                StagedSFARouteAction.SAFE_NATIVE,
-                StagedSFARouteReason.UBATCH,
-            )
+            return native(StagedSFARouteReason.UBATCH)
         batch_size = int(num_tokens_unpadded)
         capacity = int(num_tokens_padded)
         query_width = self.decode_threshold
         if capacity % query_width:
-            return StagedSFARouteDecision(
-                StagedSFARouteAction.SAFE_NATIVE,
-                StagedSFARouteReason.PADDED_BATCH,
-            )
+            return native(StagedSFARouteReason.PADDED_BATCH)
         graph_key = (
             StagedSFAGraphKey.bounded_decode(capacity // query_width, query_width)
             if sfa_full_graph_enabled(self.vllm_config)
@@ -3564,15 +4456,9 @@ class NPUModelRunner(GPUModelRunner):
             or capacity
             not in self._staged_sfa_graph_capture_sizes
         ):
-            return StagedSFARouteDecision(
-                StagedSFARouteAction.SAFE_NATIVE,
-                StagedSFARouteReason.PADDED_BATCH,
-            )
+            return native(StagedSFARouteReason.PADDED_BATCH)
         if batch_descriptor != graph_key.to_legacy_batch_descriptor():
-            return StagedSFARouteDecision(
-                StagedSFARouteAction.SAFE_NATIVE,
-                StagedSFARouteReason.BATCH_DESCRIPTOR,
-            )
+            return native(StagedSFARouteReason.BATCH_DESCRIPTOR)
         return StagedSFARouteDecision(
             StagedSFARouteAction.STAGED,
             StagedSFARouteReason.ELIGIBLE,
@@ -5432,7 +6318,6 @@ class NPUModelRunner(GPUModelRunner):
                 set_draft_graph_params(sorted(draft_graph_sizes))
 
 
-
     def _collect_staged_sfa_impls(self) -> tuple[tuple[str, Any], ...]:
         """Return each target-model staged SFA implementation exactly once."""
         attn_layers = get_layers_from_vllm_config(
@@ -5487,9 +6372,6 @@ class NPUModelRunner(GPUModelRunner):
         self._staged_sfa_impls = ()
         for _layer_name, impl in self._collect_staged_sfa_impls():
             impl.reset_staged_sfa_capture()
-
-
-
 
 
     def capture_model(self) -> int:
@@ -5615,6 +6497,14 @@ class NPUModelRunner(GPUModelRunner):
                 graph_entry_count,
                 draft_graph_count,
             )
+            if (
+                not self._profiling_cudagraph_memory
+                and not getattr(self.vllm_config.model_config, "enable_sleep_mode", False)
+                and has_kv_transfer_group()
+            ):
+                seal = getattr(get_kv_transfer_group(), "seal_sparse_destination_layout", None)
+                if callable(seal):
+                    seal()
         return graph_memory_bytes
 
     def profile_cudagraph_memory(self) -> int:

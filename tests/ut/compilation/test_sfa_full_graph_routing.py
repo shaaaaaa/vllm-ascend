@@ -49,7 +49,10 @@ def routing():
         CUDAGraphMode=modes,
         AscendAttentionState=states,
         staged_sfa_graph_configured=lambda _: True,
+        has_kv_transfer_group=lambda: False,
+        cold_perf_enabled=lambda: False,
     )
+    definitions(root / "attention/utils.py", {"unwrap_staged_sfa_connector_metadata"}, ns)
     definitions(root / "ascend_forward_context.py", {"StagedSFAQueryProfile", "StagedSFAGraphKey"}, ns)
     definitions(
         root / "utils.py",
@@ -289,6 +292,87 @@ def test_capture_sizes_use_one_bounded_graph_for_q1_and_q2(routing):
     assert ns["staged_sfa_graph_capture_sizes"](config) == (2,)
     env.VLLM_ASCEND_SFA_FULL_GRAPH = False
     assert ns["staged_sfa_graph_capture_sizes"](config) == (2,)
+
+
+@pytest.mark.parametrize("full_graph,width", [(True, 1), (True, 2), (False, 2)])
+@pytest.mark.parametrize("configured", [False, True])
+def test_cold_resume_keeps_markers_and_mtp_route_after_merge(routing, full_graph, width, configured):
+    runner, ns, env, modes, states = routing
+    env.VLLM_ASCEND_SFA_FULL_GRAPH = full_graph
+    runner.attn_state = states.DecodeOnly if width == 1 else states.SpecDecoding
+    runner._staged_sfa_graph_capture_sizes = (2,) if configured else ()
+    metadata = object()
+    wrapped = SimpleNamespace(child=metadata)
+    unwrap = Mock(side_effect=lambda value: value.child)
+    ns.update(
+        has_kv_transfer_group=lambda: True,
+        is_v1_kv_transfer_group=lambda: True,
+        get_kv_transfer_group=lambda: SimpleNamespace(_unwrap_staged_sfa_connector_metadata=unwrap),
+    )
+    route_metadata = Mock(return_value=(ns["StagedSFARouteReason"].ELIGIBLE, (8192,), (True,)))
+    ns["staged_sfa_metadata_sparse_route"] = route_metadata
+    local = runner._staged_sfa_local_route(
+        num_tokens_unpadded=width,
+        num_reqs=1,
+        num_scheduled_tokens=np.array([width]),
+        index_topk=2048,
+        has_cascade_attention=False,
+        request_ids=["cold"],
+        kv_connector_metadata=wrapped,
+        num_computed_tokens=np.array([8192]),
+        prompt_lens=np.array([8193]),
+    )
+    unwrap.assert_called_once_with(wrapped)
+    route_metadata.assert_called_once_with(metadata, ["cold"])
+    assert local.frontiers == (8192,)
+    assert local.cold_compact_resumes == (True,)
+    if not configured:
+        assert local.action == ns["StagedSFARouteAction"].SAFE_NATIVE
+        assert local.reason == ns["StagedSFARouteReason"].NOT_CONFIGURED
+        return
+    assert local.action == ns["StagedSFARouteAction"].STAGED
+    live = runner._staged_sfa_live_route(
+        local_route=local,
+        dp_route_action=local.action,
+        cudagraph_mode=modes.PIECEWISE,
+        batch_descriptor=BatchDescriptor(2),
+        num_tokens_unpadded=width,
+        num_tokens_padded=2,
+        num_reqs=1,
+        should_ubatch=False,
+    )
+    expected_profile = (
+        ns["StagedSFAQueryProfile"].DECODE_BOUNDED if full_graph else ns["StagedSFAQueryProfile"].SPEC_FIXED
+    )
+    assert live.graph_key.query_profile == expected_profile
+    assert live.cold_compact_resumes == (True,)
+
+
+@pytest.mark.parametrize("failure", ["frontier", "computed", "missing_lengths", "resume_count"])
+def test_full_graph_rejects_invalid_cold_resume_markers(routing, failure):
+    runner, ns, _, _, states = routing
+    runner.attn_state = states.SpecDecoding
+    frontiers = (8191,) if failure == "frontier" else (8192,)
+    resumes = (True, True) if failure == "resume_count" else (True,)
+    ns["staged_sfa_metadata_sparse_route"] = lambda *args: (ns["StagedSFARouteReason"].ELIGIBLE, frontiers, resumes)
+    route = runner._staged_sfa_local_route(
+        num_tokens_unpadded=2,
+        num_reqs=1,
+        num_scheduled_tokens=np.array([2]),
+        index_topk=2048,
+        has_cascade_attention=False,
+        request_ids=["cold"],
+        kv_connector_metadata=None,
+        num_computed_tokens=None
+        if failure == "missing_lengths"
+        else np.array([8191 if failure == "computed" else 8192]),
+        prompt_lens=np.array([8193]),
+    )
+    assert route.reason == ns["StagedSFARouteReason"].COLD_COMPACT_LAYOUT
+    assert route.action == ns["StagedSFARouteAction"].SAFE_NATIVE
+    # Full graph must fail closed, not silently introduce per-layer splits.
+    with pytest.raises(RuntimeError, match="cannot use a native fallback"):
+        runner._apply_staged_sfa_route(route)
 
 
 def test_decode_cannot_silently_fall_back(routing):

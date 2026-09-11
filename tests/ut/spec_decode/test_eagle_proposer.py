@@ -101,9 +101,7 @@ class TestEagleProposerInitialization(TestBase):
     def test_staged_mtp_metadata_arenas_have_stable_distinct_addresses(
         self,
     ):
-        proposer = SpecDecodeBaseProposer.__new__(
-            SpecDecodeBaseProposer
-        )
+        proposer = SpecDecodeBaseProposer.__new__(SpecDecodeBaseProposer)
         proposer.use_staged_mtp_draft_graph = True
         proposer._staged_mtp_max_request_capacity = 4
         proposer._staged_mtp_arena_capacity = 0
@@ -118,13 +116,16 @@ class TestEagleProposerInitialization(TestBase):
             query_start_loc_cpu=torch.arange(3, dtype=torch.int32),
             seq_lens=torch.tensor([8, 9], dtype=torch.int32),
             seq_lens_cpu=torch.tensor([8, 9], dtype=torch.int32),
-            num_computed_tokens_cpu=torch.tensor(
-                [7, 8], dtype=torch.int32
-            ),
+            num_computed_tokens_cpu=torch.tensor([7, 8], dtype=torch.int32),
             block_table_tensor=torch.tensor(
                 [[10, 11], [12, 13], [20, 21], [22, 23]],
                 dtype=torch.int32,
             ),
+            indexer_block_table_tensor=torch.tensor(
+                [[30, 31], [32, 33], [40, 41], [42, 43]],
+                dtype=torch.int32,
+            ),
+            indexer_slot_mapping=torch.tensor([100, 101], dtype=torch.int32),
             positions=torch.tensor([7, 8], dtype=torch.int32),
         )
 
@@ -156,6 +157,10 @@ class TestEagleProposerInitialization(TestBase):
             step0.block_table_tensor.data_ptr(),
             step1.block_table_tensor.data_ptr(),
         )
+        self.assertNotEqual(
+            step0.indexer_block_table_tensor.data_ptr(),
+            step1.indexer_block_table_tensor.data_ptr(),
+        )
         self.assertTrue(
             torch.equal(
                 step0.block_table_tensor,
@@ -164,10 +169,74 @@ class TestEagleProposerInitialization(TestBase):
         )
         self.assertTrue(
             torch.equal(
+                step0.indexer_block_table_tensor,
+                source.indexer_block_table_tensor,
+            )
+        )
+        self.assertTrue(
+            torch.equal(
                 step0.query_start_loc,
                 torch.arange(5, dtype=torch.int32),
             )
         )
+
+    def test_multi_step_mtp_uses_independent_group1_slots(self):
+        proposer = SpecDecodeBaseProposer.__new__(SpecDecodeBaseProposer)
+        proposer.num_speculative_tokens = 3
+        proposer.uses_mrope = False
+        proposer.indexer_slot_mapping_group = [
+            torch.full((6,), -99, dtype=torch.int32) for _ in range(proposer.num_speculative_tokens)
+        ]
+        old_common = SimpleNamespace(
+            indexer_block_table_tensor=torch.tensor([[10, 11], [20, 21]], dtype=torch.int32),
+            indexer_slot_mapping=torch.tensor([0, 0], dtype=torch.int32),
+        )
+        common = SimpleNamespace(
+            indexer_block_table_tensor=(old_common.indexer_block_table_tensor),
+            indexer_slot_mapping=old_common.indexer_slot_mapping,
+        )
+
+        proposer._set_draft_indexer_slot_mapping(
+            draft_step=1,
+            old_common_metadata=old_common,
+            common_attn_metadata=common,
+            block_numbers=torch.tensor([0, 1], dtype=torch.int64),
+            clamped_positions=torch.tensor([3, 5], dtype=torch.int64),
+            block_size=4,
+            exceeds_max_model_len=torch.tensor([False, False]),
+        )
+
+        self.assertIs(
+            common.indexer_slot_mapping,
+            proposer.indexer_slot_mapping_group[1],
+        )
+        self.assertTrue(
+            torch.equal(
+                common.indexer_slot_mapping,
+                torch.tensor([43, 85, -1, -1, -1, -1], dtype=torch.int32),
+            )
+        )
+
+    def test_multi_step_mtp_rejects_partial_group1_metadata(self):
+        proposer = SpecDecodeBaseProposer.__new__(SpecDecodeBaseProposer)
+        proposer.runner = SimpleNamespace(dsa_two_groups=True)
+        proposer.num_speculative_tokens = 3
+        with self.assertRaisesRegex(RuntimeError, "Group-1 block table and slot mapping"):
+            proposer._validate_independent_group1_metadata(
+                SimpleNamespace(
+                    indexer_block_table_tensor=torch.zeros((1, 1), dtype=torch.int32),
+                    indexer_slot_mapping=None,
+                )
+            )
+
+        with self.assertRaisesRegex(RuntimeError, "missing the Group-1"):
+            proposer._validate_independent_group1_metadata(
+                SimpleNamespace(
+                    indexer_block_table_tensor=None,
+                    indexer_slot_mapping=None,
+                )
+            )
+
     def test_initialization_eagle3_enforce_eager(self):
         self.vllm_config.speculative_config.method = "eagle3"
         self.vllm_config.speculative_config.draft_model_config.get_hidden_size.return_value = 2048
@@ -231,18 +300,15 @@ class TestEagleProposerInitialization(TestBase):
 
         with (
             patch(
-                "vllm_ascend.spec_decode.eagle_proposer.envs_ascend."
-                "VLLM_ASCEND_SFA_STAGED_MTP_DRAFT_GRAPH",
+                "vllm_ascend.spec_decode.eagle_proposer.envs_ascend.VLLM_ASCEND_SFA_STAGED_MTP_DRAFT_GRAPH",
                 False,
             ),
             patch(
-                "vllm_ascend.spec_decode.eagle_proposer."
-                "staged_sfa_graph_configured",
+                "vllm_ascend.spec_decode.eagle_proposer.staged_sfa_graph_configured",
                 return_value=True,
             ),
             patch(
-                "vllm_ascend.spec_decode.eagle_proposer."
-                "staged_sfa_graph_capture_sizes",
+                "vllm_ascend.spec_decode.eagle_proposer.staged_sfa_graph_capture_sizes",
                 return_value=(2, 4),
             ) as capture_sizes,
             set_current_vllm_config(self.vllm_config),
@@ -267,13 +333,11 @@ class TestEagleProposerInitialization(TestBase):
 
         with (
             patch(
-                "vllm_ascend.spec_decode.eagle_proposer.envs_ascend."
-                "VLLM_ASCEND_SFA_STAGED_MTP_DRAFT_GRAPH",
+                "vllm_ascend.spec_decode.eagle_proposer.envs_ascend.VLLM_ASCEND_SFA_STAGED_MTP_DRAFT_GRAPH",
                 False,
             ),
             patch(
-                "vllm_ascend.spec_decode.eagle_proposer."
-                "staged_sfa_graph_configured",
+                "vllm_ascend.spec_decode.eagle_proposer.staged_sfa_graph_configured",
                 return_value=True,
             ),
             set_current_vllm_config(self.vllm_config),
@@ -297,18 +361,15 @@ class TestEagleProposerInitialization(TestBase):
 
         with (
             patch(
-                "vllm_ascend.spec_decode.eagle_proposer.envs_ascend."
-                "VLLM_ASCEND_SFA_STAGED_MTP_DRAFT_GRAPH",
+                "vllm_ascend.spec_decode.eagle_proposer.envs_ascend.VLLM_ASCEND_SFA_STAGED_MTP_DRAFT_GRAPH",
                 True,
             ),
             patch(
-                "vllm_ascend.spec_decode.eagle_proposer."
-                "staged_sfa_graph_configured",
+                "vllm_ascend.spec_decode.eagle_proposer.staged_sfa_graph_configured",
                 return_value=True,
             ),
             patch(
-                "vllm_ascend.spec_decode.eagle_proposer."
-                "staged_sfa_graph_capture_sizes",
+                "vllm_ascend.spec_decode.eagle_proposer.staged_sfa_graph_capture_sizes",
                 return_value=(3, 6),
             ),
             set_current_vllm_config(self.vllm_config),
@@ -321,6 +382,7 @@ class TestEagleProposerInitialization(TestBase):
 
         self.assertTrue(proposer.use_cuda_graph)
         self.assertTrue(proposer.use_staged_mtp_draft_graph)
+
 
 class TestMTPDraftDiagnostics(TestBase):
     @staticmethod
@@ -775,9 +837,10 @@ class TestEagleProposerDummyRun(TestBase):
         set_current_vllm_config(None)
 
     # cpu does not support parallel-group, let alone `sp`
-    @patch('vllm_ascend.ascend_forward_context.get_forward_context')
-    @patch("vllm_ascend.spec_decode.eagle_proposer.get_forward_context",
-           **{"return_value.flash_comm_v1_enabled": False})
+    @patch("vllm_ascend.ascend_forward_context.get_forward_context")
+    @patch(
+        "vllm_ascend.spec_decode.eagle_proposer.get_forward_context", **{"return_value.flash_comm_v1_enabled": False}
+    )
     @patch("vllm_ascend.spec_decode.eagle_proposer.set_ascend_forward_context")
     def test_dummy_run_basic(self, mock_context, mock_get_context, mock_get_context_2):
         num_tokens = 32
@@ -791,9 +854,10 @@ class TestEagleProposerDummyRun(TestBase):
             self.assertTrue(self.proposer._runnable.call_count == 1)
 
     # cpu does not support parallel-group, let alone `sp`
-    @patch('vllm_ascend.ascend_forward_context.get_forward_context')
-    @patch("vllm_ascend.spec_decode.eagle_proposer.get_forward_context",
-           **{"return_value.flash_comm_v1_enabled": False})
+    @patch("vllm_ascend.ascend_forward_context.get_forward_context")
+    @patch(
+        "vllm_ascend.spec_decode.eagle_proposer.get_forward_context", **{"return_value.flash_comm_v1_enabled": False}
+    )
     @patch("vllm_ascend.spec_decode.eagle_proposer.set_ascend_forward_context")
     def test_dummy_run_with_prefill(self, mock_context, mock_get_context, mock_get_context_2):
         mock_context.return_value.__enter__.return_value = None
@@ -803,12 +867,13 @@ class TestEagleProposerDummyRun(TestBase):
             self.proposer.dummy_run(num_tokens=64, with_prefill=True, num_reqs=4)
             self.assertTrue(self.proposer._runnable.call_count == 1)
 
-    @patch('vllm_ascend.ascend_forward_context.get_forward_context')
+    @patch("vllm_ascend.ascend_forward_context.get_forward_context")
     @patch("vllm_ascend.spec_decode.eagle_proposer.update_full_graph_params")
     @patch("vllm_ascend.spec_decode.eagle_proposer.get_forward_context")
     @patch("vllm_ascend.spec_decode.eagle_proposer.set_ascend_forward_context")
-    def test_dummy_run_in_graph_capture(self, mock_context, mock_get_context,
-                                        mock_update_full_graph_params, mock_get_context_2):
+    def test_dummy_run_in_graph_capture(
+        self, mock_context, mock_get_context, mock_update_full_graph_params, mock_get_context_2
+    ):
         last_use_cuda_graph = self.proposer.use_cuda_graph
         mock_return_context = MagicMock()
         mock_return_context.cudagraph_runtime_mode = CUDAGraphMode.FULL
@@ -825,13 +890,14 @@ class TestEagleProposerDummyRun(TestBase):
             self.assertTrue(self.proposer._runnable.call_count == 1)
             mock_update_full_graph_params.assert_not_called()
             self.proposer.use_cuda_graph = last_use_cuda_graph
-    
-    @patch('vllm_ascend.ascend_forward_context.get_forward_context')
+
+    @patch("vllm_ascend.ascend_forward_context.get_forward_context")
     @patch("vllm_ascend.spec_decode.eagle_proposer.update_full_graph_params")
     @patch("vllm_ascend.spec_decode.eagle_proposer.get_forward_context")
     @patch("vllm_ascend.spec_decode.eagle_proposer.set_ascend_forward_context")
-    def test_dummy_run_in_graph_run(self, mock_context, mock_get_context,
-                                    mock_update_full_graph_params, mock_get_context_2):
+    def test_dummy_run_in_graph_run(
+        self, mock_context, mock_get_context, mock_update_full_graph_params, mock_get_context_2
+    ):
         last_use_cuda_graph = self.proposer.use_cuda_graph
         mock_return_context = MagicMock()
         mock_return_context.cudagraph_runtime_mode = CUDAGraphMode.FULL

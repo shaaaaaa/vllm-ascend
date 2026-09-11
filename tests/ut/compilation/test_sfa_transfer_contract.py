@@ -68,8 +68,9 @@ def contract(monkeypatch):
         allocations.append(state)
         return state
 
-    def copy(state, slots, selected, ptrs, chunk_size, total_tokens, interleaved, counts=None):
+    def copy(state, slots, selected, ptrs, chunk_size, total_tokens, interleaved, counts=None, diagnostic_layer_id=-1):
         assert interleaved is False and chunk_size == 256
+        assert diagnostic_layer_id == -1
         copies.append(
             SimpleNamespace(
                 state=state,

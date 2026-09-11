@@ -248,6 +248,7 @@ class TestACLGraphWrapper(TestBase):
                 )
                 self.mock_forward_context.staged_sfa_graph_key = graph_key
                 self.mock_forward_context.staged_sfa_replay_fenced = False
+                self.mock_forward_context.staged_sfa_route = None
                 stream = MagicMock()
 
                 with (
@@ -269,6 +270,93 @@ class TestACLGraphWrapper(TestBase):
                 else:
                     stream.synchronize.assert_not_called()
                 graph.replay.assert_called_once_with()
+
+    @patch('vllm_ascend.compilation.acl_graph.current_platform')
+    @patch('vllm_ascend.compilation.acl_graph.envs')
+    def test_cold_staged_replay_fences_once_at_replay_boundary(
+        self,
+        mock_envs,
+        mock_current_platform,
+    ):
+        mock_envs.VLLM_LOGGING_LEVEL = "INFO"
+        mock_current_platform.get_global_graph_pool.return_value = (
+            self.mock_graph_pool
+        )
+        self.mock_vllm_config.speculative_config = None
+        self.mock_vllm_config.scheduler_config.async_scheduling = False
+        staged_key = StagedSFAGraphKey.fixed_spec(1, 2)
+        graph = MagicMock()
+        wrapper = ACLGraphWrapper(
+            runnable=self.mock_runnable,
+            vllm_config=self.mock_vllm_config,
+            runtime_mode=CUDAGraphMode.PIECEWISE,
+            cudagraph_options=self.mock_cudagraph_options,
+            synchronize_before_replay=False,
+        )
+        wrapper.concrete_aclgraph_entries[staged_key] = ACLGraphEntry(
+            batch_descriptor=self.mock_batch_descriptor,
+            aclgraph=graph,
+            output=object(),
+        )
+        context = Mock(
+            batch_descriptor=self.mock_batch_descriptor,
+            cudagraph_runtime_mode=CUDAGraphMode.PIECEWISE,
+            staged_sfa_graph_key=staged_key,
+            staged_sfa_cold_mtp_replay=True,
+            staged_sfa_replay_fenced=False,
+            staged_sfa_route=Mock(cold_compact_resumes=(True,)),
+        )
+        stream = MagicMock()
+        with (
+            patch(
+                'vllm_ascend.compilation.acl_graph.get_forward_context',
+                return_value=context,
+            ),
+            patch.object(
+                torch.npu,
+                'current_stream',
+                return_value=stream,
+            ),
+        ):
+            wrapper()
+            wrapper()
+
+        stream.synchronize.assert_called_once_with()
+        self.assertTrue(context.staged_sfa_replay_fenced)
+        self.assertEqual(graph.replay.call_count, 2)
+
+        q1_context = Mock(
+            batch_descriptor=self.mock_batch_descriptor,
+            cudagraph_runtime_mode=CUDAGraphMode.PIECEWISE,
+            staged_sfa_graph_key=StagedSFAGraphKey.exact_q1(1),
+            staged_sfa_cold_mtp_replay=False,
+            staged_sfa_replay_fenced=False,
+            staged_sfa_route=Mock(cold_compact_resumes=(True,)),
+        )
+        q1_graph = MagicMock()
+        wrapper.concrete_aclgraph_entries[q1_context.staged_sfa_graph_key] = (
+            ACLGraphEntry(
+                batch_descriptor=self.mock_batch_descriptor,
+                aclgraph=q1_graph,
+                output=object(),
+            )
+        )
+        q1_stream = MagicMock()
+        with (
+            patch(
+                'vllm_ascend.compilation.acl_graph.get_forward_context',
+                return_value=q1_context,
+            ),
+            patch.object(
+                torch.npu,
+                'current_stream',
+                return_value=q1_stream,
+            ),
+        ):
+            wrapper()
+
+        q1_stream.synchronize.assert_not_called()
+        q1_graph.replay.assert_called_once_with()
 
     @patch('vllm_ascend.compilation.acl_graph.current_platform')
     @patch('vllm_ascend.compilation.acl_graph.envs')
@@ -306,6 +394,7 @@ class TestACLGraphWrapper(TestBase):
                 cudagraph_runtime_mode=CUDAGraphMode.PIECEWISE,
                 staged_sfa_graph_key=staged_key,
                 staged_sfa_replay_fenced=False,
+                staged_sfa_route=None,
             )
 
         context = forward_context()

@@ -18,7 +18,10 @@ two are composed with AscendMultiConnector.
 
 from typing import TYPE_CHECKING, Any
 
-from vllm.distributed.kv_transfer.kv_connector.v1.base import SupportsHMA
+from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+    KVConnectorRole,
+    SupportsHMA,
+)
 from vllm.logger import init_logger
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 
@@ -70,7 +73,13 @@ class MooncakeDSAIndexConnector(MooncakeConnector, SupportsHMA):
                 "(VLLM_ASCEND_DSA_UNBUNDLE=1 and VLLM_ASCEND_DSA_TWO_GROUPS=1). "
                 f"Saw {len(kv_caches)} layers, none matching '{_INDEX_LAYER_MARKER}'."
             )
-        logger.info(
+        register_full_source = (
+            getattr(self, "_latent_live_source_enabled", False)
+            and self.connector_worker is not None
+            and self.connector_worker.kv_role in ("kv_producer", "kv_both")
+            and self.connector_worker.tp_rank == 0
+        )
+        logger.debug(
             "MooncakeDSAIndexConnector: registering %d indexer-group layers "
             "(of %d total) for NPU->NPU transfer from group %d; latent group "
             "handled elsewhere.",
@@ -78,7 +87,12 @@ class MooncakeDSAIndexConnector(MooncakeConnector, SupportsHMA):
             len(kv_caches),
             self.index_group_id,
         )
-        super().register_kv_caches(index_only)
+        if register_full_source:
+            super().register_kv_caches(
+                kv_caches, ordinary_kv_caches=index_only
+            )
+        else:
+            super().register_kv_caches(index_only)
 
     def get_num_new_matched_tokens(
         self,
@@ -122,7 +136,7 @@ class MooncakeDSAIndexConnector(MooncakeConnector, SupportsHMA):
             params.get("do_remote_prefill") if params is not None else None
         )
         index_blocks = self._select_index_group_blocks(blocks)
-        logger.info(
+        logger.debug(
             "MooncakeDSAIndexConnector D alloc: request_id=%s index_group=%d "
             "external_tokens=%d local_index_blocks=%d do_remote_prefill=%s",
             request.request_id,
@@ -146,7 +160,7 @@ class MooncakeDSAIndexConnector(MooncakeConnector, SupportsHMA):
     ) -> tuple[bool, dict[str, Any] | None]:
         assert self.connector_scheduler is not None
         index_block_ids = self._select_index_group_ids(block_ids)
-        logger.info(
+        logger.debug(
             "MooncakeDSAIndexConnector P finish: request_id=%s index_group=%d "
             "remote_index_blocks=%d",
             request.request_id,

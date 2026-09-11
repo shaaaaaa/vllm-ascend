@@ -28,6 +28,12 @@ from typing import Any
 # begin-env-vars-definition
 
 env_variables: dict[str, Callable[[], Any]] = {
+    # Shared PD serving performance diagnostics across vLLM and LMCache.
+    # Non-sensitive; configure before worker startup. Default 0/off. Values:
+    # 1 = host timing, detail = extra host detail, device = opt-in device timing.
+    # Empty/0/false/no/off disable it (case-insensitive). Other nonfalse values
+    # retain host timing semantics. Content/crash diagnostics remain separate.
+    "PD_SERVING_PERF": lambda: os.getenv("PD_SERVING_PERF", "0").strip().lower(),
     # max compile thread number for package building. Usually, it is set to
     # the number of CPU cores. If not set, the default value is None, which
     # means all number of CPU cores will be used.

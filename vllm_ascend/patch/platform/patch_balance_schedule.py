@@ -498,8 +498,15 @@ class BalanceScheduler(Scheduler):
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
                 # Count the number of prefix cached tokens.
+                num_cached_tokens = min(
+                    num_computed_tokens, request.num_prompt_tokens
+                )
                 if request.num_cached_tokens < 0:
-                    request.num_cached_tokens = num_computed_tokens
+                    request.num_cached_tokens = num_cached_tokens
+                elif num_external_computed_tokens > 0:
+                    request.num_cached_tokens = max(
+                        request.num_cached_tokens, num_cached_tokens
+                    )
                 # Encoder-related.
                 if encoder_inputs_to_schedule:
                     scheduled_encoder_inputs[request_id] = encoder_inputs_to_schedule

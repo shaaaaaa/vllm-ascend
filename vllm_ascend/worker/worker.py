@@ -18,7 +18,10 @@
 #
 
 import copy
+import faulthandler
 import gc
+import time
+from functools import wraps
 from types import NoneType
 
 import torch
@@ -31,7 +34,7 @@ from vllm.config import CUDAGraphMode, VllmConfig, set_current_vllm_config
 from vllm.distributed import ensure_model_parallel_initialized, init_distributed_environment
 from vllm.distributed.ec_transfer import ensure_ec_transfer_initialized
 from vllm.distributed.kv_transfer import ensure_kv_transfer_initialized, get_kv_transfer_group, has_kv_transfer_group
-from vllm.distributed.parallel_state import Handle, get_pp_group, get_tp_group
+from vllm.distributed.parallel_state import Handle, get_ep_group, get_pp_group, get_tp_group
 from vllm.logger import logger
 from vllm.lora.request import LoRARequest
 from vllm.sequence import IntermediateTensors
@@ -52,6 +55,15 @@ from vllm_ascend.batch_invariant import init_batch_invariance
 from vllm_ascend.cpu_binding import bind_cpus
 from vllm_ascend.device_allocator.camem import CaMemAllocator
 from vllm_ascend.distributed.parallel_state import init_ascend_model_parallel
+from vllm_ascend.serving_perf import (
+    cold_perf_enabled,
+    forget_cold_perf_request,
+    is_cold_perf_request,
+    log_cold_perf_event,
+    log_cold_perf_process_event,
+    mark_cold_perf_connector_requests,
+    mark_cold_perf_requests,
+)
 from vllm_ascend.ops.triton.triton_utils import init_device_properties_triton
 from vllm_ascend.utils import (
     AscendDeviceType,
@@ -76,6 +88,195 @@ torch._dynamo.trace_rules.torch_name_rule_map.append(torch_non_c_binding_in_grap
 
 _STAGED_SFA_GRAPH_MEMORY_MARGIN_BYTES = 64 << 20
 _STAGED_SFA_GRAPH_MEMORY_MARGIN_RATIO = 1.1
+# Distinct supervisor-visible status for an unsafe armed RemoteFill DMA.
+# Deployment policy must restart the paired P+D serving group on this code.
+REMOTE_FILL_PAIRED_RESTART_EXIT_CODE = 86
+_COLD_PERF_STALL_SECONDS = 60
+_COLD_PERF_STALL_STAGGER_SECONDS = 5
+_COLD_PERF_SLOW_EXECUTE_MS = 500
+_COLD_PERF_REQUEST_IDS_ATTR = "_ascend_cold_perf_request_ids"
+_COLD_PERF_SAMPLE_RETURN_NS_ATTR = "_ascend_cold_perf_sample_return_ns"
+
+
+def _cold_perf_watchdog_rank_and_timeout() -> tuple[int, int]:
+    try:
+        tp_rank = int(get_tp_group().rank_in_group)
+    except Exception:
+        tp_rank = 0
+    return tp_rank, (
+        _COLD_PERF_STALL_SECONDS
+        + tp_rank * _COLD_PERF_STALL_STAGGER_SECONDS
+    )
+
+
+def _trace_first_cold_perf_execute(method):
+    """Trace the first non-empty batch and every marked cold resume."""
+
+    @wraps(method)
+    def wrapped(self, scheduler_output, *args, **kwargs):
+        if not cold_perf_enabled():
+            return method(self, scheduler_output, *args, **kwargs)
+        entry_started = time.perf_counter()
+        entry_process_cpu_ns = time.process_time_ns()
+        entry_thread_cpu_ns = time.thread_time_ns()
+        scheduled = tuple(
+            str(req_id)
+            for req_id, count in getattr(
+                scheduler_output, "num_scheduled_tokens", {}
+            ).items()
+            if count
+        )
+        previous_return = getattr(self, "_cold_perf_last_execute_return", None)
+        previous_process_cpu_ns = getattr(
+            self, "_cold_perf_last_execute_process_cpu_ns", None
+        )
+        previous_thread_cpu_ns = getattr(
+            self, "_cold_perf_last_execute_thread_cpu_ns", None
+        )
+        previous_requests = getattr(
+            self, "_cold_perf_last_execute_requests", frozenset()
+        )
+        overlap = previous_requests.intersection(scheduled)
+        if previous_return is not None and overlap:
+            gap_ms = (entry_started - previous_return) * 1000
+            if gap_ms >= _COLD_PERF_SLOW_EXECUTE_MS:
+                tp_rank, _ = _cold_perf_watchdog_rank_and_timeout()
+                log_cold_perf_process_event(
+                    "decoder_submission_gap",
+                    tp_rank=tp_rank,
+                    gap_ms=round(gap_ms, 3),
+                    shared_request_count=len(overlap),
+                    shared_request_ids=sorted(overlap)[:8],
+                    previous_batch_size=len(previous_requests),
+                    current_batch_size=len(scheduled),
+                    process_cpu_ms=(
+                        round(
+                            (entry_process_cpu_ns - previous_process_cpu_ns)
+                            / 1_000_000,
+                            3,
+                        )
+                        if previous_process_cpu_ns is not None
+                        else None
+                    ),
+                    main_thread_cpu_ms=(
+                        round(
+                            (entry_thread_cpu_ns - previous_thread_cpu_ns)
+                            / 1_000_000,
+                            3,
+                        )
+                        if previous_thread_cpu_ns is not None
+                        else None
+                    ),
+                )
+
+        def record_finish() -> None:
+            completed = time.perf_counter()
+            completed_process_cpu_ns = time.process_time_ns()
+            completed_thread_cpu_ns = time.thread_time_ns()
+            elapsed_ms = (completed - entry_started) * 1000
+            if scheduled and elapsed_ms >= _COLD_PERF_SLOW_EXECUTE_MS:
+                tp_rank, _ = _cold_perf_watchdog_rank_and_timeout()
+                log_cold_perf_process_event(
+                    "decoder_execute_slow",
+                    tp_rank=tp_rank,
+                    elapsed_ms=round(elapsed_ms, 3),
+                    batch_size=len(scheduled),
+                    request_ids=list(scheduled[:8]),
+                    process_cpu_ms=round(
+                        (completed_process_cpu_ns - entry_process_cpu_ns)
+                        / 1_000_000,
+                        3,
+                    ),
+                    main_thread_cpu_ms=round(
+                        (completed_thread_cpu_ns - entry_thread_cpu_ns)
+                        / 1_000_000,
+                        3,
+                    ),
+                )
+            self._cold_perf_last_execute_return = completed
+            self._cold_perf_last_execute_process_cpu_ns = completed_process_cpu_ns
+            self._cold_perf_last_execute_thread_cpu_ns = completed_thread_cpu_ns
+            self._cold_perf_last_execute_requests = frozenset(scheduled)
+
+        mark_cold_perf_connector_requests(
+            getattr(scheduler_output, "kv_connector_metadata", None)
+        )
+        if scheduled and not getattr(self, "_cold_perf_first_execute_marked", False):
+            self._cold_perf_first_execute_marked = True
+            mark_cold_perf_requests(scheduled)
+        request_ids = tuple(
+            req_id for req_id in scheduled if is_cold_perf_request(req_id)
+        )
+        if not request_ids:
+            try:
+                return method(self, scheduler_output, *args, **kwargs)
+            finally:
+                record_finish()
+
+        tp_rank, watchdog_timeout = _cold_perf_watchdog_rank_and_timeout()
+        log_cold_perf_event(
+            "decoder_execute_rpc_entry",
+            request_ids=request_ids,
+            once=True,
+            tp_rank=tp_rank,
+        )
+        log_cold_perf_event(
+            "decoder_execute_stall_watchdog_armed",
+            request_ids=request_ids,
+            once=True,
+            tp_rank=tp_rank,
+            timeout_seconds=watchdog_timeout,
+        )
+        watchdog_armed = False
+        try:
+            try:
+                faulthandler.dump_traceback_later(watchdog_timeout)
+                watchdog_armed = True
+            except Exception as exc:
+                log_cold_perf_event(
+                    "decoder_execute_stall_watchdog_error",
+                    request_ids=request_ids,
+                    once=True,
+                    operation="arm",
+                    error_type=type(exc).__name__,
+                )
+            output = method(self, scheduler_output, *args, **kwargs)
+            log_cold_perf_event(
+                "decoder_execute_rpc_return",
+                request_ids=request_ids,
+                once=True,
+                elapsed_ms=round(
+                    (time.perf_counter() - entry_started) * 1000, 3
+                ),
+                output_type=type(output).__name__,
+            )
+            return output
+        except BaseException as exc:
+            log_cold_perf_event(
+                "decoder_execute_rpc_error",
+                request_ids=request_ids,
+                once=True,
+                elapsed_ms=round(
+                    (time.perf_counter() - entry_started) * 1000, 3
+                ),
+                error_type=type(exc).__name__,
+            )
+            raise
+        finally:
+            if watchdog_armed:
+                try:
+                    faulthandler.cancel_dump_traceback_later()
+                except Exception as exc:
+                    log_cold_perf_event(
+                        "decoder_execute_stall_watchdog_error",
+                        request_ids=request_ids,
+                        once=True,
+                        operation="cancel",
+                        error_type=type(exc).__name__,
+                    )
+            record_finish()
+
+    return wrapped
 
 
 def _staged_sfa_graph_memory_reservation(estimate: int) -> int:
@@ -444,10 +645,39 @@ class NPUWorker(WorkerBase):
 
         return int(self.available_kv_cache_memory_bytes)
 
+    def _raise_if_remote_fill_restart_required(self) -> None:
+        """Terminate this worker when LMCache reports unsafe remote DMA."""
+
+        if not has_kv_transfer_group():
+            return
+        connector = get_kv_transfer_group()
+        check = getattr(
+            connector,
+            "remote_fill_requires_paired_restart",
+            None,
+        )
+        if callable(check) and bool(check()):
+            logger.critical(
+                "[LMCACHE_REMOTE_FILL_DIAGNOSTIC] "
+                "event=remote_fill_fatal_restart "
+                "diagnostic_name=decoder_memory_safety_uncertain code=RF-D-900 "
+                "stage=worker_process_boundary "
+                "action=PAIRED_RESTART_REQUIRED: an armed native transfer "
+                "has uncertain completion; this worker is exiting deliberately "
+                "so the supervisor cannot continue with reusable destination "
+                "memory"
+            )
+            # WorkerProc catches Exception for ordinary RPC failures but lets
+            # SystemExit reach the process boundary. Its monitor then tears
+            # down the full executor instead of continuing with unsafe memory.
+            raise SystemExit(REMOTE_FILL_PAIRED_RESTART_EXIT_CODE)
+
+    @_trace_first_cold_perf_execute
     def execute_model(
         self,
         scheduler_output: "SchedulerOutput",
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
+        self._raise_if_remote_fill_restart_required()
         # enable msMonitor to monitor the performance of vllm-ascend
         if envs_ascend.MSMONITOR_USE_DAEMON:
             dp.step()
@@ -476,8 +706,21 @@ class NPUWorker(WorkerBase):
                 comm_postprocess=comm_postprocess,
             )
 
-        output = self.model_runner.execute_model(scheduler_output, intermediate_tensors)
+        try:
+            output = self.model_runner.execute_model(
+                scheduler_output, intermediate_tensors
+            )
+        except BaseException:
+            # A speculative target pass can fail after connector metadata was
+            # intentionally kept bound for sample_tokens(). Never carry that
+            # failed step's request binding into a later scheduler iteration.
+            try:
+                self.model_runner.abort_kv_connector_finalize()
+            finally:
+                self._raise_if_remote_fill_restart_required()
+            raise
         if isinstance(output, (ModelRunnerOutput, AsyncModelRunnerOutput, NoneType)):
+            self._raise_if_remote_fill_restart_required()
             return output
 
         assert isinstance(output, IntermediateTensors)
@@ -496,19 +739,146 @@ class NPUWorker(WorkerBase):
 
         kv_connector_output = output.kv_connector_output
         if not kv_connector_output:
+            self._raise_if_remote_fill_restart_required()
             return None
 
         # In case of PP with kv transfer, we need to pass through the
-        # kv_connector_output
-        if not kv_connector_output.finished_sending and not kv_connector_output.finished_recving:
+        # kv_connector_output. Worker metadata, invalid block IDs, completed
+        # saves, stats, and cache events are also scheduler-visible output;
+        # do not discard them merely because no request finished this step.
+        if kv_connector_output.is_empty():
+            self._raise_if_remote_fill_restart_required()
             return EMPTY_MODEL_RUNNER_OUTPUT
         output = copy.copy(EMPTY_MODEL_RUNNER_OUTPUT)
         output.kv_connector_output = kv_connector_output
+        self._raise_if_remote_fill_restart_required()
         return output
 
     @torch.inference_mode()
     def sample_tokens(self, grammar_output: "GrammarOutput") -> ModelRunnerOutput | AsyncModelRunnerOutput:
-        return self.model_runner.sample_tokens(grammar_output)
+        active_request_ids = tuple(
+            getattr(self.model_runner, "_cold_perf_current_req_ids", ()) or ()
+        )
+        request_ids = tuple(
+            dict.fromkeys(
+                active_request_ids
+                + tuple(
+                    getattr(
+                        self.model_runner,
+                        "_cold_perf_sample_trace_req_ids",
+                        (),
+                    )
+                    or ()
+                )
+            )
+        )
+        rpc_started = time.perf_counter() if request_ids else 0.0
+        diagnostic_active = bool(active_request_ids)
+        watchdog_armed = False
+        if diagnostic_active:
+            tp_rank, watchdog_timeout = _cold_perf_watchdog_rank_and_timeout()
+            log_cold_perf_event(
+                "decoder_sample_rpc_entry",
+                request_ids=request_ids,
+                once=True,
+                tp_rank=tp_rank,
+            )
+            log_cold_perf_event(
+                "decoder_sample_stall_watchdog_armed",
+                request_ids=request_ids,
+                once=True,
+                tp_rank=tp_rank,
+                timeout_seconds=watchdog_timeout,
+            )
+            try:
+                faulthandler.dump_traceback_later(watchdog_timeout)
+                watchdog_armed = True
+            except Exception as exc:
+                log_cold_perf_event(
+                    "decoder_sample_stall_watchdog_error",
+                    request_ids=request_ids,
+                    once=True,
+                    operation="arm",
+                    error_type=type(exc).__name__,
+                )
+        try:
+            self._raise_if_remote_fill_restart_required()
+            try:
+                output = self.model_runner.sample_tokens(grammar_output)
+            except BaseException:
+                # Speculative execution defers connector finalization until
+                # after the draft pass. A failed draft/sample must not leave
+                # request metadata bound for the next scheduler step.
+                try:
+                    self.model_runner.abort_kv_connector_finalize()
+                finally:
+                    self._raise_if_remote_fill_restart_required()
+                raise
+            self._raise_if_remote_fill_restart_required()
+            if request_ids:
+                sample_return_ns = time.perf_counter_ns()
+                rpc_elapsed_ms = (time.perf_counter() - rpc_started) * 1000
+                for diagnostic_output in (
+                    output,
+                    getattr(output, "_model_runner_output", None),
+                ):
+                    try:
+                        setattr(
+                            diagnostic_output,
+                            _COLD_PERF_REQUEST_IDS_ATTR,
+                            request_ids,
+                        )
+                        setattr(
+                            diagnostic_output,
+                            _COLD_PERF_SAMPLE_RETURN_NS_ATTR,
+                            sample_return_ns,
+                        )
+                    except (AttributeError, TypeError):
+                        pass
+                if diagnostic_active:
+                    log_cold_perf_event(
+                        "decoder_sample_rpc_return",
+                        request_ids=request_ids,
+                        once=True,
+                        elapsed_ms=round(rpc_elapsed_ms, 3),
+                        output_type=type(output).__name__,
+                    )
+                elif rpc_elapsed_ms >= _COLD_PERF_SLOW_EXECUTE_MS:
+                    log_cold_perf_event(
+                        "decoder_sample_rpc_slow",
+                        request_ids=request_ids,
+                        require_active=False,
+                        elapsed_ms=round(rpc_elapsed_ms, 3),
+                        output_type=type(output).__name__,
+                    )
+            return output
+        except BaseException as exc:
+            if request_ids:
+                log_cold_perf_event(
+                    "decoder_sample_rpc_error",
+                    request_ids=request_ids,
+                    once=True,
+                    require_active=diagnostic_active,
+                    elapsed_ms=round(
+                        (time.perf_counter() - rpc_started) * 1000, 3
+                    ),
+                    error_type=type(exc).__name__,
+                )
+            raise
+        finally:
+            if watchdog_armed:
+                try:
+                    faulthandler.cancel_dump_traceback_later()
+                except Exception as exc:
+                    log_cold_perf_event(
+                        "decoder_sample_stall_watchdog_error",
+                        request_ids=request_ids,
+                        once=True,
+                        operation="cancel",
+                        error_type=type(exc).__name__,
+                    )
+            for request_id in active_request_ids:
+                forget_cold_perf_request(request_id)
 
     def load_model(self) -> None:
         if self.vllm_config.model_config.enable_sleep_mode:
@@ -523,7 +893,36 @@ class NPUWorker(WorkerBase):
         with context, set_current_vllm_config(self.vllm_config):
             self.model_runner.load_model()
 
+    def _wait_for_decoder_ep_startup(self) -> None:
+        kv_config = self.vllm_config.kv_transfer_config
+        parallel_config = self.vllm_config.parallel_config
+        if (
+            kv_config is None
+            or not kv_config.is_kv_consumer
+            or not self.model_config.is_moe
+            or not parallel_config.enable_expert_parallel
+            or parallel_config.data_parallel_size <= 1
+            or parallel_config.enable_elastic_ep
+        ):
+            return
+
+        # Each DP executor waits only for its own TP workers to initialize KV
+        # caches. A peer DP may still be registering its shared CPU slab when
+        # we reach warmup. Wait on the EP CPU group before launching any model
+        # collectives, whose device timeout would otherwise include that wait.
+        # Elastic EP has a separate startup/reconfiguration protocol.
+        started = time.perf_counter() if cold_perf_enabled() else None
+        if started is not None:
+            log_cold_perf_process_event("decoder_ep_startup_wait_start")
+        get_ep_group().barrier()
+        if started is not None:
+            log_cold_perf_process_event(
+                "decoder_ep_startup_wait_complete",
+                elapsed_ms=round((time.perf_counter() - started) * 1000, 3),
+            )
+
     def compile_or_warm_up_model(self) -> float:
+        self._wait_for_decoder_ep_startup()
         # Note: need to adapt for graph mode.
         warmup_sizes = (self.vllm_config.compilation_config.compile_sizes or []).copy()
         if not self.model_config.enforce_eager:
@@ -547,7 +946,22 @@ class NPUWorker(WorkerBase):
             logger.info("Compile and warming up model for size %d", size)
             self.model_runner._dummy_run(size)
         if not self.model_config.enforce_eager:
+            capture_started = time.perf_counter() if cold_perf_enabled() else None
+            if capture_started is not None:
+                log_cold_perf_process_event(
+                    "decoder_graph_capture_start",
+                    staged_sfa=staged_sfa_graph_configured(self.vllm_config),
+                    capture_sizes=self.vllm_config.compilation_config.cudagraph_capture_sizes,
+                )
             self.model_runner.capture_model()
+            if capture_started is not None:
+                log_cold_perf_process_event(
+                    "decoder_graph_capture_complete",
+                    elapsed_ms=round(
+                        (time.perf_counter() - capture_started) * 1000,
+                        3,
+                    ),
+                )
         # Call ATB matmul to warm up; otherwise, the first operation (ReshapeAndCache)
         # may cause performance degradation at runtime.
         if get_ascend_device_type() != AscendDeviceType.A5:
@@ -578,6 +992,59 @@ class NPUWorker(WorkerBase):
         if (metadata := connector.get_handshake_metadata()) is None:
             return None
         return {self.rank: metadata}
+
+    def get_mooncake_placement_info(
+        self,
+    ) -> dict[str, int | str | dict[str, int | str | bool] | None] | None:
+        """Expose this decoder DP rank's TP0 storage/control placement."""
+        connector = get_kv_transfer_group() if has_kv_transfer_group() else None
+        remote_fill = None
+        placement_getter = getattr(connector, "get_remote_fill_placement_info", None)
+        if callable(placement_getter):
+            remote_fill = placement_getter()
+            if remote_fill is not None and not isinstance(remote_fill, dict):
+                raise TypeError("Remote-fill placement must be a dictionary")
+        metadata_by_rank = self.get_kv_connector_handshake_metadata()
+        segment = None
+        if metadata_by_rank:
+            metadata = next(iter(metadata_by_rank.values()))
+            local_ip = getattr(metadata, "local_ip", "")
+            te_rpc_port = getattr(metadata, "te_rpc_port", None)
+            if getattr(metadata, "tp_rank", None) == 0 and local_ip:
+                if isinstance(te_rpc_port, int) and te_rpc_port > 0:
+                    segment = f"{local_ip}:{te_rpc_port}"
+        if segment is None and remote_fill is None:
+            return None
+        parallel_config = self.vllm_config.parallel_config
+        local_dp_rank = getattr(parallel_config, "data_parallel_rank_local", None)
+        api_dp_rank = (
+            local_dp_rank
+            if getattr(parallel_config, "local_engines_only", False)
+            and local_dp_rank is not None
+            else parallel_config.data_parallel_rank
+        )
+        placement_dp_rank = api_dp_rank
+        if remote_fill is not None:
+            advertised_dp_rank = remote_fill.get("dp_rank")
+            if (
+                isinstance(advertised_dp_rank, bool)
+                or not isinstance(advertised_dp_rank, int)
+                or advertised_dp_rank < 0
+            ):
+                raise ValueError(
+                    "Remote-fill placement has an invalid data-parallel rank"
+                )
+            # RemoteFill uses the global data_parallel_index, while the API
+            # header addresses this server's local engine list.
+            placement_dp_rank = advertised_dp_rank
+        placement = {
+            "dp_rank": placement_dp_rank,
+            "segment": segment,
+        }
+        if remote_fill is not None:
+            placement["api_dp_rank"] = api_dp_rank
+            placement["remote_fill"] = remote_fill
+        return placement
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         return self.model_runner.get_kv_cache_spec()
@@ -722,6 +1189,7 @@ class NPUWorker(WorkerBase):
         return self.model_runner.take_draft_token_ids()
 
     def check_health(self) -> None:
+        self._raise_if_remote_fill_restart_required()
         import subprocess
 
         logger.info("check_health Start!")
@@ -744,6 +1212,7 @@ class NPUWorker(WorkerBase):
             logger.info("npu-smi tool not found.")
         except Exception as e:
             logger.info(f"query NPU card {self.local_rank} fail: {e}")
+        self._raise_if_remote_fill_restart_required()
         return
 
 

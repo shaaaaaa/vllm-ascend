@@ -1,0 +1,407 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Tests for the side-effect-free LMCache diagnostic callback bridge."""
+
+import ast
+from collections.abc import Callable, Iterator
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from vllm_ascend import lmcache_diagnostics as bridge
+
+
+@pytest.fixture(autouse=True)
+def reset_callbacks() -> Iterator[None]:
+    bridge.clear_npu_content_diagnostic_callbacks()
+    yield
+    bridge.clear_npu_content_diagnostic_callbacks()
+
+
+def test_bridge_is_disabled_and_noop_by_default() -> None:
+    assert bridge.npu_content_diagnostics_enabled() is False
+    assert bridge.fingerprint_compact_group1(value="unused") is None
+    bridge.begin_deferred_diagnostic_step()
+    bridge.flush_deferred_diagnostics()
+    bridge.register_group1_source_fingerprint("request", {})
+    bridge.queue_group1_first_consume(value="unused")
+    bridge.queue_cache_tail_fingerprint(value="unused")
+    bridge.queue_selected_topk_fingerprint(value="unused")
+    bridge.queue_staged_graph_stage_fingerprint(value="unused")
+
+
+def test_installed_callback_bundle_routes_every_operation() -> None:
+    events: list[tuple[str, tuple[Any, ...], dict[str, Any]]] = []
+
+    def callback(name: str, result: Any = None) -> Callable[..., Any]:
+        def invoke(*args: Any, **kwargs: Any) -> Any:
+            events.append((name, args, kwargs))
+            return result
+
+        return invoke
+
+    bridge.install_npu_content_diagnostic_callbacks(
+        bridge.NPUContentDiagnosticCallbacks(
+            begin_deferred_step=callback("begin"),
+            flush_deferred=callback("flush"),
+            fingerprint_compact_group1=callback("fingerprint", "digest"),
+            register_group1_source=callback("register"),
+            queue_group1_first_consume=callback("consume"),
+            queue_cache_tail=callback("tail"),
+            queue_selected_topk=callback("topk"),
+            queue_staged_graph_stage=callback("staged"),
+        )
+    )
+
+    assert bridge.npu_content_diagnostics_enabled() is True
+    bridge.begin_deferred_diagnostic_step()
+    assert bridge.fingerprint_compact_group1(req_id="request") == "digest"
+    bridge.register_group1_source_fingerprint("request", {"hash": "digest"})
+    bridge.queue_group1_first_consume(req_ids=["request"])
+    bridge.queue_cache_tail_fingerprint(req_ids=["request"])
+    bridge.queue_selected_topk_fingerprint(req_ids=["request"])
+    bridge.queue_staged_graph_stage_fingerprint(req_ids=["request"])
+    bridge.flush_deferred_diagnostics()
+
+    assert [event for event, _, _ in events] == [
+        "begin",
+        "fingerprint",
+        "register",
+        "consume",
+        "tail",
+        "topk",
+        "staged",
+        "flush",
+    ]
+
+
+@pytest.mark.parametrize(
+    "relative_path",
+    [
+        "vllm_ascend/attention/sfa_v1.py",
+        "vllm_ascend/worker/model_runner_v1.py",
+        (
+            "vllm_ascend/distributed/kv_transfer/kv_p2p/"
+            "mooncake_connector.py"
+        ),
+    ],
+)
+def test_model_and_transfer_modules_do_not_import_lmcache_ascend(
+    relative_path: str,
+) -> None:
+    """Guard the TorchDynamo startup order against eager plugin imports."""
+    repository_root = Path(__file__).resolve().parents[2]
+    tree = ast.parse((repository_root / relative_path).read_text(encoding="utf-8"))
+    imported_modules = {
+        node.module
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom) and node.module is not None
+    }
+    imported_modules.update(
+        alias.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Import)
+        for alias in node.names
+    )
+    assert not any(
+        module == "lmcache_ascend" or module.startswith("lmcache_ascend.")
+        for module in imported_modules
+    )
+
+
+def test_live_p2p_first_consume_diagnostic_is_not_persistent_load_gated() -> None:
+    """Keep live P2P observable when the persistent index load is disabled."""
+    repository_root = Path(__file__).resolve().parents[2]
+    tree = ast.parse(
+        (repository_root / "vllm_ascend/attention/sfa_v1.py").read_text(
+            encoding="utf-8"
+        )
+    )
+    parents: dict[ast.AST, ast.AST] = {}
+    for parent in ast.walk(tree):
+        for child in ast.iter_child_nodes(parent):
+            parents[child] = parent
+
+    calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "queue_group1_first_consume"
+    ]
+    assert len(calls) == 1
+    call = calls[0]
+    ancestor = parents.get(call)
+    while ancestor is not None:
+        if isinstance(ancestor, ast.If):
+            assert "index_lmcache_enabled" not in ast.unparse(ancestor.test)
+        ancestor = parents.get(ancestor)
+
+    keyword_names = {keyword.arg for keyword in call.keywords}
+    assert {
+        "seq_lens_cpu",
+        "row_request_indices",
+        "num_decode_tokens",
+        "num_actual_tokens",
+        "attn_state",
+        "decode_valid_rows_all",
+        "group1_connector_wait_called",
+        "num_hidden_layers",
+    } <= keyword_names
+
+
+def test_cache_boundary_diagnostics_cover_both_groups_and_scatter_sides() -> None:
+    repository_root = Path(__file__).resolve().parents[2]
+    tree = ast.parse(
+        (repository_root / "vllm_ascend/attention/sfa_v1.py").read_text(
+            encoding="utf-8"
+        )
+    )
+    calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "queue_cache_tail_fingerprint"
+    ]
+    assert len(calls) == 4
+    stages = {
+        ast.literal_eval(keyword.value)
+        for call in calls
+        for keyword in call.keywords
+        if keyword.arg == "stage"
+    }
+    assert stages == {
+        "group0_after_load_before_current_scatter",
+        "group0_after_current_scatter",
+        "group1_after_load_before_current_scatter",
+        "group1_after_current_scatter",
+    }
+    for call in calls:
+        keyword_names = {keyword.arg for keyword in call.keywords}
+        assert {
+            "req_ids",
+            "layer_name",
+            "kv_group",
+            "stage",
+            "cache_parts",
+            "slot_mapping",
+            "query_start_loc_cpu",
+            "seq_lens_cpu",
+            "num_actual_tokens",
+            "attn_state",
+        } <= keyword_names
+
+
+def test_group1_scatter_excludes_graph_and_speculative_padding() -> None:
+    """Group 1 must obey the same real-row frontier as Group 0."""
+    repository_root = Path(__file__).resolve().parents[2]
+    tree = ast.parse(
+        (repository_root / "vllm_ascend/attention/sfa_v1.py").read_text(
+            encoding="utf-8"
+        )
+    )
+    scatter_calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "npu_scatter_nd_update_"
+        and node.args
+        and "kv_cache[" in ast.unparse(node.args[0])
+    ]
+    group1_calls = [
+        call
+        for call in scatter_calls
+        if ast.unparse(call.args[0]).startswith("kv_cache[2]")
+        or ast.unparse(call.args[0]).startswith("kv_cache[3]")
+    ]
+    assert len(group1_calls) == 2
+    for call in group1_calls:
+        assert len(call.args) == 3
+        assert "[:actual_tokens]" in ast.unparse(call.args[1])
+        assert "[:actual_tokens]" in ast.unparse(call.args[2])
+
+
+def test_graph_bootstrap_snapshot_is_not_cleared_before_forward() -> None:
+    repository_root = Path(__file__).resolve().parents[2]
+    tree = ast.parse(
+        (repository_root / "vllm_ascend/worker/model_runner_v1.py").read_text(
+            encoding="utf-8"
+        )
+    )
+    runner = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "NPUModelRunner"
+    )
+    execute_model = next(
+        node
+        for node in runner.body
+        if isinstance(node, ast.FunctionDef) and node.name == "execute_model"
+    )
+    calls = {
+        ast.unparse(node.func): node.lineno
+        for node in ast.walk(execute_model)
+        if isinstance(node, ast.Call)
+        and ast.unparse(node.func)
+        in {
+            "begin_deferred_diagnostic_step",
+            "first_impl.bootstrap_cross_layer",
+        }
+    }
+    assert calls["begin_deferred_diagnostic_step"] < calls[
+        "first_impl.bootstrap_cross_layer"
+    ]
+
+
+def test_graph_bootstrap_waits_for_group1_before_snapshot() -> None:
+    repository_root = Path(__file__).resolve().parents[2]
+    tree = ast.parse(
+        (repository_root / "vllm_ascend/attention/sfa_v1.py").read_text(
+            encoding="utf-8"
+        )
+    )
+    implementation = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "AscendSFAImpl"
+    )
+    bootstrap = next(
+        node
+        for node in implementation.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "bootstrap_cross_layer"
+    )
+    calls = {
+        ast.unparse(node.func): node.lineno
+        for node in ast.walk(bootstrap)
+        if isinstance(node, ast.Call)
+    }
+
+    assert calls["wait_for_kv_layer_from_connector"] < calls[
+        "queue_staged_graph_stage_fingerprint"
+    ]
+
+
+def test_graph_post_readback_occurs_after_behavior_critical_sampling() -> None:
+    repository_root = Path(__file__).resolve().parents[2]
+    tree = ast.parse(
+        (repository_root / "vllm_ascend/worker/model_runner_v1.py").read_text(
+            encoding="utf-8"
+        )
+    )
+    runner = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "NPUModelRunner"
+    )
+    sample_tokens = next(
+        node
+        for node in runner.body
+        if isinstance(node, ast.FunctionDef) and node.name == "sample_tokens"
+    )
+    source = ast.unparse(sample_tokens)
+    queue = source.index("impl.queue_staged_graph_post_diagnostic")
+    flush = source.index("flush_deferred_diagnostics")
+    assert source.index("propose_draft_token_ids(") < queue
+    assert source.index("self.finalize_kv_connector(") < queue
+    assert source.index("self._update_states_after_model_execute(") < queue
+    assert source.index("self._pp_broadcast_prev_sampled_token_ids(") < queue
+    assert queue < flush
+
+
+def test_two_group_indexer_never_falls_back_to_latent_addresses() -> None:
+    repository_root = Path(__file__).resolve().parents[2]
+    tree = ast.parse(
+        (repository_root / "vllm_ascend/attention/sfa_v1.py").read_text(
+            encoding="utf-8"
+        )
+    )
+    impl_class = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "AscendSFAImpl"
+    )
+    functions = {
+        node.name: node
+        for node in impl_class.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+
+    forward = functions["forward"]
+    forward_guards = [
+        node
+        for node in ast.walk(forward)
+        if isinstance(node, ast.If)
+        and "index_lmcache_enabled" in ast.unparse(node.test)
+        and "indexer_slot_mapping" in ast.unparse(node.test)
+        and "indexer_block_table" in ast.unparse(node.test)
+        and any(isinstance(child, ast.Raise) for child in ast.walk(node))
+    ]
+    assert len(forward_guards) == 1
+
+    post_process = functions["indexer_select_post_process"]
+    table_guards = [
+        node
+        for node in ast.walk(post_process)
+        if isinstance(node, ast.If)
+        and "_dsa_index_lmcache_enabled()" in ast.unparse(node.test)
+        and "indexer_block_table" in ast.unparse(node.test)
+        and any(isinstance(child, ast.Raise) for child in ast.walk(node))
+    ]
+    assert len(table_guards) == 1
+
+
+def test_spec_decode_metadata_rebuilds_preserve_group1_addresses() -> None:
+    """MTP metadata transforms must not erase the independent index group."""
+    repository_root = Path(__file__).resolve().parents[2]
+    tree = ast.parse(
+        (
+            repository_root
+            / "vllm_ascend/spec_decode/eagle_proposer.py"
+        ).read_text(encoding="utf-8")
+    )
+    proposer = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ClassDef)
+        and node.name == "SpecDecodeBaseProposer"
+    )
+    functions = {
+        node.name: node
+        for node in proposer.body
+        if isinstance(node, ast.FunctionDef)
+    }
+    required_fields = {
+        "indexer_block_table_tensor",
+        "indexer_slot_mapping",
+        "prompt_lens_cpu",
+        "request_ids",
+        "cold_compact_resumes",
+        "resident_state_indices",
+        "resident_state_generations",
+        "resident_state_indices_cpu",
+        "resident_state_generations_cpu",
+    }
+
+    for function_name in ("prepare_inputs", "prepare_inputs_padded"):
+        constructors = [
+            node
+            for node in ast.walk(functions[function_name])
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "AscendCommonAttentionMetadata"
+        ]
+        assert len(constructors) == 1
+        keyword_names = {
+            keyword.arg for keyword in constructors[0].keywords
+        }
+        assert required_fields <= keyword_names
+
+    prepare_inputs_source = ast.unparse(functions["prepare_inputs"])
+    assert "indexer_slot_mapping[token_indices]" in prepare_inputs_source
+    assert (
+        "indexer_slot_mapping[token_indices.shape[0]:].fill_(-1)"
+        in prepare_inputs_source
+    )

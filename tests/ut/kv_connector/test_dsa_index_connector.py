@@ -16,11 +16,21 @@ fake_torch_npu = types.ModuleType("torch_npu")
 fake_torch_npu.atb = SimpleNamespace(npu_paged_cache_load=MagicMock())
 sys.modules.setdefault("torch_npu", fake_torch_npu)
 
-from vllm.distributed.kv_transfer.kv_connector.v1.base import SupportsHMA  # noqa: E402
+from vllm.distributed.kv_transfer.kv_connector.v1.base import (  # noqa: E402
+    KVConnectorRole,
+    SupportsHMA,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import (  # noqa: E402
+    MultiKVConnectorMetadata,
+    MultiKVConnectorWorkerMetadata,
+)
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks  # noqa: E402
 
 from vllm_ascend.distributed.kv_transfer.ascend_multi_connector import (  # noqa: E402
     AscendMultiConnector,
+)
+from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector import (  # noqa: E402
+    MooncakeConnector,
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_dsa_index_connector import (  # noqa: E402
     MooncakeDSAIndexConnector,
@@ -57,6 +67,65 @@ def test_lmcache_ascend_connector_advertises_dsa_index_support():
     )
 
     assert getattr(LMCacheConnectorV1, "supports_dsa_index_lmcache", False) is True
+
+
+def test_ascend_multi_delegates_dsa_index_lmcache_capability():
+    multi = object.__new__(AscendMultiConnector)
+    assert multi.supports_dsa_index_lmcache is False
+
+    children = [
+        SimpleNamespace(supports_dsa_index_lmcache=False),
+        SimpleNamespace(supports_dsa_index_lmcache=True),
+    ]
+    multi._supports_dsa_index_lmcache = any(
+        multi._supports_dsa_index_cache(child) for child in children
+    )
+
+    assert multi.supports_dsa_index_lmcache is True
+
+    children = [
+        SimpleNamespace(supports_dsa_index_lmcache=False),
+        SimpleNamespace(),
+    ]
+    multi._supports_dsa_index_lmcache = any(
+        multi._supports_dsa_index_cache(child) for child in children
+    )
+
+    assert multi.supports_dsa_index_lmcache is False
+
+
+def test_ascend_multi_routes_same_step_worker_metadata():
+    update = MagicMock()
+    multi = object.__new__(AscendMultiConnector)
+    multi._connectors = [
+        SimpleNamespace(update_connector_worker_metadata=update),
+        SimpleNamespace(),
+    ]
+    metadata = object()
+
+    multi.update_connector_worker_metadata(
+        MultiKVConnectorWorkerMetadata(metadata=(metadata, None)),
+        {"active"},
+    )
+
+    update.assert_called_once_with(metadata, {"active"})
+
+
+def test_ascend_multi_forwards_live_source_event_to_lmcache_engine():
+    forward_context = object()
+    capture = MagicMock(return_value=True)
+    multi = object.__new__(AscendMultiConnector)
+    multi._connectors = [
+        SimpleNamespace(),
+        SimpleNamespace(
+            _lmcache_engine=SimpleNamespace(
+                capture_live_source_event_handoff=capture
+            )
+        ),
+    ]
+
+    assert multi.capture_live_source_event_handoff(forward_context)
+    capture.assert_called_once_with(forward_context)
 
 
 def test_ascend_multi_init_supports_legacy_child_connector_signature(monkeypatch):
@@ -101,6 +170,203 @@ def test_ascend_multi_init_supports_legacy_child_connector_signature(monkeypatch
         ("legacy", legacy_config, role, None),
         ("new", new_config, role, kv_cache_config),
     ]
+
+
+def test_ascend_multi_forwards_remote_fill_child_contract(monkeypatch):
+    placement = {"enabled": True, "destination_engine_epoch": 7}
+    metrics = {"transactions_started": 3}
+
+    class LMCacheChild:
+        def __init__(self, _config, _role):
+            self.fatal = False
+
+        def get_remote_fill_placement_info(self):
+            return placement
+
+        def remote_fill_requires_paired_restart(self):
+            return self.fatal
+
+        def get_remote_fill_metrics(self):
+            return metrics
+
+    class MooncakeChild:
+        def __init__(self, _config, _role):
+            pass
+
+    top_config = SimpleNamespace(kv_transfer_config=object())
+    child_configs = [
+        SimpleNamespace(kv_transfer_config="lmcache"),
+        SimpleNamespace(kv_transfer_config="mooncake"),
+    ]
+    monkeypatch.setattr(
+        AscendMultiConnector,
+        "_get_connector_classes_and_configs",
+        classmethod(
+            lambda cls, config: list(
+                zip((LMCacheChild, MooncakeChild), child_configs, strict=True)
+            )
+        ),
+    )
+
+    multi = AscendMultiConnector(top_config, object())
+
+    assert multi.get_remote_fill_placement_info() == placement
+    assert multi.get_remote_fill_metrics() == metrics
+    assert multi.remote_fill_requires_paired_restart() is False
+    multi._connectors[0].fatal = True
+    assert multi.remote_fill_requires_paired_restart() is True
+
+
+def test_ascend_multi_forwards_real_lmcache_ascend_wrapper(monkeypatch):
+    pytest.importorskip("lmcache_ascend")
+    from lmcache_ascend.integration.vllm.lmcache_ascend_connector_v1 import (
+        LMCacheAscendConnectorV1Dynamic,
+    )
+
+    placement = {"enabled": True, "destination_engine_epoch": 17}
+    engine = SimpleNamespace(
+        use_layerwise=True,
+        get_remote_fill_placement_info=lambda: placement,
+        get_remote_fill_metrics=lambda: {"active_transactions": 1},
+        remote_fill_requires_paired_restart=lambda: True,
+    )
+
+    def init_lmcache(self, _config, _role):
+        self._lmcache_engine = SimpleNamespace(lmcache_engine=engine)
+
+    class MooncakeChild:
+        def __init__(self, _config, _role):
+            pass
+
+    monkeypatch.setattr(
+        LMCacheAscendConnectorV1Dynamic,
+        "__init__",
+        init_lmcache,
+    )
+    monkeypatch.setattr(
+        AscendMultiConnector,
+        "_get_connector_classes_and_configs",
+        classmethod(
+            lambda cls, config: [
+                (
+                    LMCacheAscendConnectorV1Dynamic,
+                    SimpleNamespace(kv_transfer_config="lmcache"),
+                ),
+                (
+                    MooncakeChild,
+                    SimpleNamespace(kv_transfer_config="mooncake"),
+                ),
+            ]
+        ),
+    )
+
+    multi = AscendMultiConnector(
+        SimpleNamespace(kv_transfer_config=object()), object()
+    )
+
+    assert multi.get_remote_fill_placement_info() == placement
+    assert multi.get_remote_fill_metrics() == {"active_transactions": 1}
+    assert multi.remote_fill_requires_paired_restart() is True
+
+
+def test_ascend_multi_rejects_conflicting_remote_fill_owners():
+    multi = object.__new__(AscendMultiConnector)
+    multi._remote_fill_placement_providers = (
+        lambda: {"destination_engine_epoch": 1},
+        lambda: {"destination_engine_epoch": 2},
+    )
+    multi._remote_fill_metrics_providers = (lambda: {"started": 1},) * 2
+    multi._remote_fill_restart_providers = (lambda: False,)
+
+    with pytest.raises(RuntimeError, match="conflicting remote-fill placement"):
+        multi.get_remote_fill_placement_info()
+    assert multi.get_remote_fill_metrics() == {"started": 1}
+
+
+def test_ascend_multi_fails_closed_when_restart_probe_raises():
+    multi = object.__new__(AscendMultiConnector)
+
+    def broken_probe():
+        raise RuntimeError("child unavailable")
+
+    multi._remote_fill_restart_providers = (broken_probe,)
+
+    assert multi.remote_fill_requires_paired_restart() is True
+
+
+def test_live_latent_requires_capable_provider_and_hybrid_consumer():
+    class Provider:
+        supports_dsa_live_latent_split_source = True
+
+        def __init__(self):
+            self.decisions = []
+
+        def configure_live_latent_source(self, enabled):
+            self.decisions.append(enabled)
+
+    provider = Provider()
+    multi = object.__new__(AscendMultiConnector)
+    multi._connectors = [provider]
+    multi._configure_live_latent_split()
+    assert provider.decisions == [False]
+
+    consumer = object.__new__(MooncakeDSAIndexConnector)
+    consumer._latent_live_enabled = False
+    consumer.connector_scheduler = None
+    consumer.connector_worker = SimpleNamespace(kv_role="kv_consumer")
+    multi._connectors = [provider, consumer]
+    multi._configure_live_latent_split()
+
+    assert provider.decisions == [False, True]
+    assert consumer._latent_live_enabled is True
+
+
+def test_live_latent_accepts_capability_based_transport_wrapper():
+    class Provider:
+        supports_dsa_live_latent_split_source = True
+
+        def __init__(self):
+            self.decisions = []
+
+        def configure_live_latent_source(self, enabled):
+            self.decisions.append(enabled)
+
+    class WrappedTransport:
+        supports_dsa_live_latent_transport = True
+
+        def __init__(self):
+            self.decisions = []
+
+        def configure_live_latent_transport(
+            self, source_enabled, destination_enabled
+        ):
+            self.decisions.append((source_enabled, destination_enabled))
+
+    provider = Provider()
+    transport = WrappedTransport()
+    multi = object.__new__(AscendMultiConnector)
+    multi._connectors = [provider, transport]
+
+    multi._configure_live_latent_split()
+
+    assert provider.decisions == [True]
+    assert transport.decisions == [(True, False)]
+
+
+def test_live_latent_old_or_unconfigurable_provider_fails_closed():
+    class OldProvider:
+        supports_dsa_live_latent_split_source = True
+
+    consumer = object.__new__(MooncakeDSAIndexConnector)
+    consumer._latent_live_enabled = True
+    consumer.connector_scheduler = None
+    consumer.connector_worker = None
+    multi = object.__new__(AscendMultiConnector)
+    multi._connectors = [OldProvider(), consumer]
+
+    multi._configure_live_latent_split()
+
+    assert consumer._latent_live_enabled is False
 
 
 def test_dsa_index_connector_supports_hma_and_selects_index_group():
@@ -185,6 +451,177 @@ def test_dsa_index_registers_only_indexer_layers():
     )
 
 
+def test_dsa_index_live_latent_registers_full_source_only_on_tp0():
+    connector = object.__new__(MooncakeDSAIndexConnector)
+    connector.index_group_id = 1
+    connector._latent_live_enabled = True
+    connector._latent_live_source_enabled = True
+    connector._latent_live_destination_enabled = False
+    connector._dsa_role = KVConnectorRole.WORKER
+    connector.connector_scheduler = None
+    connector.connector_worker = MagicMock(kv_role="kv_producer", tp_rank=0)
+    latent = (object(), object())
+    indexer = (object(),)
+    caches = {"layer": latent, "layer.indexer": indexer}
+
+    connector.register_kv_caches(caches)
+
+    connector.connector_worker.register_kv_caches.assert_called_once_with(
+        caches, ordinary_kv_caches={"layer.indexer": indexer}
+    )
+
+
+def test_dsa_index_live_latent_registers_full_source_for_kv_both_tp0():
+    connector = object.__new__(MooncakeDSAIndexConnector)
+    connector.index_group_id = 1
+    connector._latent_live_enabled = True
+    connector._latent_live_source_enabled = True
+    connector._latent_live_destination_enabled = True
+    connector._dsa_role = KVConnectorRole.WORKER
+    connector.connector_scheduler = None
+    connector.connector_worker = MagicMock(kv_role="kv_both", tp_rank=0)
+    latent = (object(), object())
+    indexer = (object(),)
+    caches = {"layer": latent, "layer.indexer": indexer}
+
+    assert connector._live_split_source_groups() == (0, 1)
+    connector.register_kv_caches(caches)
+
+    connector.connector_worker.register_kv_caches.assert_called_once_with(
+        caches, ordinary_kv_caches={"layer.indexer": indexer}
+    )
+
+
+def test_dsa_index_live_latent_negotiation_supports_kv_both_worker():
+    connector = object.__new__(MooncakeDSAIndexConnector)
+    connector.index_group_id = 1
+    connector._latent_live_enabled = False
+    connector.connector_scheduler = MagicMock()
+    connector.connector_worker = MagicMock(kv_role="kv_both", tp_rank=0)
+
+    connector.configure_live_latent_source(True)
+
+    assert connector._latent_live_enabled is True
+    assert connector.connector_scheduler.live_split_source_groups == (0, 1)
+    assert connector.connector_worker.live_latent_enabled is True
+
+
+def test_ascend_multi_enables_provider_for_kv_both_transport():
+    class Provider:
+        supports_dsa_live_latent_split_source = True
+
+        def __init__(self):
+            self.decisions = []
+
+        def configure_live_latent_source(self, enabled):
+            self.decisions.append(enabled)
+
+    provider = Provider()
+    consumer = object.__new__(MooncakeDSAIndexConnector)
+    consumer._latent_live_enabled = False
+    consumer.connector_scheduler = None
+    consumer.connector_worker = SimpleNamespace(kv_role="kv_both")
+    multi = object.__new__(AscendMultiConnector)
+    multi._connectors = [provider, consumer]
+
+    multi._configure_live_latent_split()
+
+    assert provider.decisions == [True]
+    assert consumer._latent_live_enabled is True
+
+
+def test_ascend_multi_enables_generic_mooncake_hybrid_transport():
+    class Provider:
+        supports_dsa_live_latent_split_source = True
+
+        def __init__(self):
+            self.decisions = []
+
+        def configure_live_latent_source(self, enabled):
+            self.decisions.append(enabled)
+
+    provider = Provider()
+    transport = object.__new__(MooncakeConnector)
+    transport._latent_live_enabled = False
+    transport._latent_live_source_enabled = False
+    transport._latent_live_destination_enabled = False
+    transport.connector_scheduler = None
+    transport.connector_worker = SimpleNamespace(
+        kv_role="kv_producer", tp_rank=0
+    )
+    multi = object.__new__(AscendMultiConnector)
+    multi._connectors = [provider, transport]
+
+    multi._configure_live_latent_split()
+
+    assert provider.decisions == [True]
+    assert transport._latent_live_enabled is True
+    assert transport._latent_live_source_enabled is True
+    assert transport._latent_live_destination_enabled is False
+    assert transport.connector_worker.live_latent_source_enabled is True
+
+
+def test_generic_mooncake_live_latent_decoder_groups_are_rank_aware():
+    connector = object.__new__(MooncakeConnector)
+    connector._latent_live_enabled = False
+    connector._latent_live_source_enabled = False
+    connector._latent_live_destination_enabled = False
+    connector._dsa_role = KVConnectorRole.WORKER
+    connector.connector_scheduler = None
+    connector.connector_worker = SimpleNamespace(
+        kv_role="kv_consumer", tp_rank=0
+    )
+
+    connector.configure_live_latent_transport(False, True)
+
+    assert connector._live_split_source_groups() == (0, 1)
+    connector.connector_worker.tp_rank = 1
+    assert connector._live_split_source_groups() == (1,)
+
+
+def test_ascend_multi_separates_source_and_destination_transport():
+    class Provider:
+        supports_dsa_live_latent_split_source = False
+        supports_dsa_live_latent_split_destination = True
+
+        def __init__(self):
+            self.decisions = []
+
+        def configure_live_latent_source(self, enabled):
+            self.decisions.append(enabled)
+
+    provider = Provider()
+    transport = object.__new__(MooncakeDSAIndexConnector)
+    transport._latent_live_enabled = False
+    transport._latent_live_source_enabled = False
+    transport._latent_live_destination_enabled = False
+    transport.connector_scheduler = None
+    transport.connector_worker = SimpleNamespace(kv_role="kv_both")
+    multi = object.__new__(AscendMultiConnector)
+    multi._connectors = [provider, transport]
+
+    multi._configure_live_latent_split()
+
+    assert provider.decisions == [True]
+    assert transport._latent_live_source_enabled is False
+    assert transport._latent_live_destination_enabled is True
+
+
+def test_dsa_index_live_latent_decoder_groups_are_rank_aware():
+    connector = object.__new__(MooncakeDSAIndexConnector)
+    connector.index_group_id = 1
+    connector._latent_live_enabled = True
+    connector._latent_live_source_enabled = False
+    connector._latent_live_destination_enabled = True
+    connector._dsa_role = KVConnectorRole.WORKER
+    connector.connector_scheduler = None
+    connector.connector_worker = SimpleNamespace(kv_role="kv_consumer", tp_rank=0)
+    assert connector._live_split_source_groups() == (0, 1)
+
+    connector.connector_worker.tp_rank = 1
+    assert connector._live_split_source_groups() == (1,)
+
+
 def test_ascend_multi_registers_latent_and_indexer_separately():
     multi = object.__new__(AscendMultiConnector)
     latent_connector = MagicMock()
@@ -205,6 +642,111 @@ def test_ascend_multi_registers_latent_and_indexer_separately():
         {"model.layers.0.self_attn": latent}
     )
     index_connector.register_kv_caches.assert_called_once_with(kv_caches)
+
+
+def test_ascend_multi_registers_all_groups_with_hma_child():
+    class HMAConnector(SupportsHMA):
+        def __init__(self):
+            self.register_kv_caches = MagicMock()
+
+        def request_finished_all_groups(self, request, block_ids):
+            raise NotImplementedError
+
+    multi = object.__new__(AscendMultiConnector)
+    hma_connector = HMAConnector()
+    index_connector = object.__new__(MooncakeDSAIndexConnector)
+    index_connector.register_kv_caches = MagicMock()
+    multi._connectors = [hma_connector, index_connector]
+
+    latent = (object(), object())
+    indexer = (object(),)
+    kv_caches = {
+        "model.layers.0.self_attn": latent,
+        "model.layers.0.self_attn.indexer": indexer,
+    }
+
+    multi.register_kv_caches(kv_caches)
+
+    hma_connector.register_kv_caches.assert_called_once_with(kv_caches)
+    index_connector.register_kv_caches.assert_called_once_with(kv_caches)
+
+
+def test_ascend_multi_keeps_generic_mooncake_on_latent_group():
+    multi = object.__new__(AscendMultiConnector)
+    mooncake = object.__new__(MooncakeConnector)
+    mooncake.register_kv_caches = MagicMock()
+    multi._connectors = [mooncake]
+    kv_caches = {
+        "model.layers.0.self_attn": (object(), object()),
+        "model.layers.0.self_attn.indexer": (object(),),
+    }
+
+    multi.register_kv_caches(kv_caches)
+
+    mooncake.register_kv_caches.assert_called_once_with(
+        {"model.layers.0.self_attn": kv_caches["model.layers.0.self_attn"]}
+    )
+
+
+def test_ascend_multi_forwards_staged_sfa_capabilities():
+    multi = object.__new__(AscendMultiConnector)
+    multi._connectors = [
+        SimpleNamespace(
+            supports_staged_sfa_sparse_load=False,
+            uses_layerwise_model_callbacks=False,
+        ),
+        SimpleNamespace(
+            supports_staged_sfa_sparse_load=True,
+            uses_layerwise_model_callbacks=True,
+            wait_for_layer_load=lambda _layer_name: None,
+            _get_connector_metadata=lambda: object(),
+        ),
+    ]
+
+    assert multi.uses_layerwise_model_callbacks
+    assert multi.supports_staged_sfa_sparse_load
+
+
+def test_ascend_multi_rejects_split_staged_sfa_capabilities():
+    multi = object.__new__(AscendMultiConnector)
+    multi._connectors = [
+        SimpleNamespace(
+            supports_staged_sfa_sparse_load=True,
+            uses_layerwise_model_callbacks=False,
+            wait_for_layer_load=lambda _layer_name: None,
+            _get_connector_metadata=lambda: object(),
+        ),
+        SimpleNamespace(
+            supports_staged_sfa_sparse_load=False,
+            uses_layerwise_model_callbacks=True,
+            wait_for_layer_load=lambda _layer_name: None,
+        ),
+    ]
+
+    assert multi.uses_layerwise_model_callbacks
+    assert not multi.supports_staged_sfa_sparse_load
+
+
+def test_ascend_multi_unwraps_scheduler_metadata_from_capable_child():
+    target_metadata = object()
+    multi = object.__new__(AscendMultiConnector)
+    multi._connectors = [
+        SimpleNamespace(_get_connector_metadata=lambda: object()),
+        SimpleNamespace(
+            supports_staged_sfa_sparse_load=True,
+            uses_layerwise_model_callbacks=True,
+            wait_for_layer_load=lambda _layer_name: None,
+            _get_connector_metadata=lambda: object(),
+        ),
+    ]
+    metadata = MultiKVConnectorMetadata(
+        metadata=(object(), target_metadata)
+    )
+
+    assert (
+        multi._unwrap_staged_sfa_connector_metadata(metadata)
+        is target_metadata
+    )
 
 
 def test_ascend_multi_wait_for_layer_load_forwards_supported_extra_args():
@@ -381,3 +923,84 @@ def test_ascend_multi_request_finished_all_groups_merges_params():
         request,
         ([10], [20]),
     )
+
+
+def test_ascend_multi_remote_fill_echo_yields_to_sibling_envelope():
+    """Regression: the LMCache remote-fill response echoes the prefiller's
+    incoming routing keys, which must not clash with the decoder-directed
+    envelope authored by the Mooncake P2P producer child."""
+
+    multi = object.__new__(AscendMultiConnector)
+    lmcache_connector = MagicMock()
+    lmcache_connector.request_finished.return_value = (
+        False,
+        {
+            "do_remote_decode": True,
+            "do_remote_prefill": False,
+            "remote_engine_id": None,
+            "remote_block_ids": None,
+            "remote_host": None,
+            "remote_port": None,
+            "lmcache.remote_fill": {"terminal": {"outcome": "PERSISTENT_ONLY"}},
+        },
+    )
+    mooncake_connector = MagicMock()
+    mooncake_connector.request_finished.return_value = (
+        True,
+        {
+            "do_remote_prefill": True,
+            "do_remote_decode": False,
+            "remote_engine_id": "prefiller",
+            "remote_block_ids": [10, 11],
+            "remote_host": "7.150.4.174",
+            "remote_port": "30000",
+            "remote_request_id": "req-1",
+            "last_token_id": 42,
+            "num_prompt_blocks": 2,
+        },
+    )
+    multi._connectors = [lmcache_connector, mooncake_connector]
+    multi._requests_to_connector = {"req-1": 0}
+    multi._extra_async_saves = {}
+    request = SimpleNamespace(request_id="req-1")
+
+    async_save, params = multi.request_finished_all_groups(request, ([10], [11]))
+
+    assert async_save is True
+    assert params == {
+        "do_remote_prefill": True,
+        "do_remote_decode": False,
+        "remote_engine_id": "prefiller",
+        "remote_block_ids": [10, 11],
+        "remote_host": "7.150.4.174",
+        "remote_port": "30000",
+        "remote_request_id": "req-1",
+        "last_token_id": 42,
+        "num_prompt_blocks": 2,
+        "lmcache.remote_fill": {"terminal": {"outcome": "PERSISTENT_ONLY"}},
+    }
+
+
+def test_ascend_multi_remote_fill_echo_preserved_without_sibling_params():
+    """Without a sibling envelope the remote-fill response keeps its echo."""
+
+    multi = object.__new__(AscendMultiConnector)
+    lmcache_connector = MagicMock()
+    echoed = {
+        "do_remote_decode": True,
+        "do_remote_prefill": False,
+        "remote_engine_id": None,
+        "lmcache.remote_fill": {"terminal": {"outcome": "LOCAL_FULL"}},
+    }
+    lmcache_connector.request_finished.return_value = (False, echoed)
+    idle_connector = MagicMock()
+    idle_connector.request_finished.return_value = (False, None)
+    multi._connectors = [lmcache_connector, idle_connector]
+    multi._requests_to_connector = {"req-1": 0}
+    multi._extra_async_saves = {}
+    request = SimpleNamespace(request_id="req-1")
+
+    async_save, params = multi.request_finished_all_groups(request, ([10],))
+
+    assert async_save is False
+    assert params == echoed
