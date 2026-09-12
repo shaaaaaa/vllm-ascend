@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""TP8/eight-layer staged vs full graph: unprofiled TPOT, then decode traces.
+"""TP8/eight-layer staged vs full graph: TPOT, optional diagnostics or traces.
 
 No server/client is needed. Each mode has a fresh engine and ordinary prefill;
 this is a performance test, NOT the one-prefill numerical-parity test.
@@ -196,6 +196,116 @@ def distribution(values: list[float]) -> dict:
     }
 
 
+def diagnose_request(llm, args, ordinal: int) -> dict:
+    """One separate request; worker gating excludes ALL chunked prefill steps.
+
+    Arm before submission, stop after completion: no mid-request control RPCs
+    and no engine/client progress race when selecting the decode interval.
+    """
+    attempted = False
+    workers = None
+    try:
+        attempted = True
+        llm.collective_rpc("benchmark_start_decode_timing", args=(args.prompt_tokens,), timeout=ENGINE_SHUTDOWN_TIMEOUT)
+        request = generate_request(llm, args, ordinal)
+    finally:
+        if attempted:
+            error = sys.exc_info()[1]
+            try:
+                workers = llm.collective_rpc("benchmark_stop_decode_timing", timeout=ENGINE_SHUTDOWN_TIMEOUT)
+            except Exception as stop_error:
+                if error is None:
+                    raise
+                error.add_note(f"Decode timing stop also failed: {stop_error}")
+    expected = set(range(len(parse_devices(args.devices))))
+    if len(workers) != len(expected) or {w["rank"] for w in workers} != expected:
+        raise RuntimeError("Missing/duplicate decode timing ranks")
+    for worker in workers:
+        steps = worker["decode_steps"]
+        target_calls = worker["stages"].get("target.forward", {}).get("wall", {}).get("count", 0)
+        replays = worker["root_replays"]
+        if steps <= 0 or target_calls != steps:
+            raise RuntimeError(f"Decode timing missed target forwards on rank {worker['rank']}")
+        if replays != (steps if args.child == "full" else 0):
+            raise RuntimeError(f"Decode timing root coverage mismatch on rank {worker['rank']}")
+        stages = worker["stages"]
+        if args.child == "full" and stages.get("root.replay_submit", {}).get("wall", {}).get("count", 0) != steps:
+            raise RuntimeError(f"Root replay timing hook was not reached on rank {worker['rank']}")
+        for index in range(8):
+            expected_stage = f"metadata.L{index}" if args.child == "full" else f"retrieve.L{index}"
+            if stages.get(expected_stage, {}).get("wall", {}).get("count", 0) != steps:
+                raise RuntimeError(f"Incomplete {expected_stage} timing on rank {worker['rank']}")
+            if args.child == "full" and stages.get(f"retrieve.L{index}", {}).get("wall", {}).get("count", 0):
+                raise RuntimeError("Full target replay unexpectedly executed a Python layer retrieval")
+    if len({w["decode_steps"] for w in workers}) != 1:
+        raise RuntimeError("Decode step counts differ across TP ranks")
+    return {
+        "mode": args.child,
+        "scope": "separate instrumented decode request; not a performance sample; no profiler",
+        "request": request,
+        "workers": sorted(workers, key=lambda w: w["rank"]),
+    }
+
+
+def print_decode_timing(report: dict) -> None:
+    mode, workers, request = report["mode"], report["workers"], report["request"]
+    steps = workers[0]["decode_steps"]
+    print(
+        f"[SFA_TIMING] {mode} diagnostic-only: decode={request['decode_ms']:.3f}ms "
+        f"committed={request['decode_tokens']} forwards={steps} "
+        f"committed/forward={request['decode_tokens'] / steps:.3f}; excluded from TPOT comparison",
+        flush=True,
+    )
+    for worker in workers:
+        print(
+            f"[SFA_TIMING] {mode} rank={worker['rank']} forwards={worker['decode_steps']} "
+            f"roots={worker['root_replays']} source_updates={worker['source_binding_updates']} "
+            f"Q_hist={worker['query_tokens_histogram']} sampled_hist={worker['sampled_tokens_histogram']} "
+            f"prefill_excluded={worker['prefill_steps_excluded']} "
+            f"event_drops={worker['device_intervals_dropped']}",
+            flush=True,
+        )
+    print(
+        f"[SFA_TIMING] {mode} ms/forward: wall/self=rank mean(max rank); "
+        "cpu=exclusive thread CPU; call_max=slowest call; stream=mean(max rank) current-stream span. "
+        "Nested wall times and stream spans MUST NOT be added together.",
+        flush=True,
+    )
+    names = sorted({name for w in workers for name in w["stages"]})
+    for name in names:
+        metrics = [w["stages"].get(name, {}) for w in workers]
+
+        def normalized(key, metrics=metrics):
+            values = [m.get(key, {}).get("total_ms", 0.0) / w["decode_steps"] for m, w in zip(metrics, workers)]
+            return f"{statistics.mean(values):.3f}({max(values):.3f})"
+
+        calls = [m.get("wall", {}).get("count", 0) / w["decode_steps"] for m, w in zip(metrics, workers)]
+        call_max = max(m.get("wall", {}).get("max_ms", 0.0) for m in metrics)
+        device = f" stream={normalized('stream_span')}" if any("stream_span" in m for m in metrics) else ""
+        print(
+            f"[SFA_TIMING] {mode} {name} calls/fwd={min(calls):.2f}..{max(calls):.2f} "
+            f"wall={normalized('wall')} self={normalized('self_wall')} "
+            f"cpu={normalized('self_cpu')} call_max={call_max:.3f}{device}",
+            flush=True,
+        )
+    # Same decode interval, but this residual also includes result transport,
+    # worker idle gaps and boundary skew. Do not label it pure scheduler time.
+    worker_times = [
+        sum(
+            w["stages"].get(name, {}).get("wall", {}).get("total_ms", 0.0)
+            for name in ("worker.execute", "worker.sample")
+        )
+        for w in workers
+    ]
+    residuals = [(request["decode_ms"] - value) / steps for value in worker_times]
+    print(
+        f"[SFA_TIMING] {mode} engine_minus_worker ms/forward="
+        f"{min(residuals):.3f}..{max(residuals):.3f} (IPC/scheduling/idle + boundary skew; not pure scheduler). "
+        "root.run self is mostly the existing completion fence plus bookkeeping, NOT proof of fence overhead.",
+        flush=True,
+    )
+
+
 def run_child(args) -> None:
     from vllm import LLM
 
@@ -240,6 +350,12 @@ def run_child(args) -> None:
         Path(args.run_dir, f"{args.child}.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
         if args.profile:
             generate_request(llm, args, args.warmups + args.repeats, profile=True)
+        if args.diagnose:
+            diagnostic = diagnose_request(llm, args, args.warmups + args.repeats)
+            Path(args.run_dir, f"{args.child}-timing.json").write_text(
+                json.dumps(diagnostic, indent=2), encoding="utf-8"
+            )
+            print_decode_timing(diagnostic)
         released = llm.collective_rpc("benchmark_release_resources", timeout=ENGINE_SHUTDOWN_TIMEOUT)
         if sorted((r["rank"], r["pid"]) for r in released) != [(r["rank"], r["pid"]) for r in state]:
             raise RuntimeError("Some benchmark workers did not acknowledge resource release")
@@ -273,6 +389,8 @@ def compare_results(staged: dict, full: dict) -> dict:
 
 
 def validate_args(args) -> None:
+    if args.profile and args.diagnose:
+        raise ValueError("Choose --diagnose (no profiler) OR --profile")
     parse_devices(args.devices)
     if not Path(args.model, "config.json").is_file():
         raise FileNotFoundError(f"Missing model configuration: {args.model}/config.json")
@@ -290,7 +408,7 @@ def run_pair(args) -> None:
     root.mkdir(parents=True, exist_ok=True)
     args.run_dir = mkdtemp(prefix="sfa-", dir=root)
     print(f"[SFA_BENCH] results/traces: {args.run_dir}", flush=True)
-    print("[SFA_BENCH] staged vs full; no parity probes; performance BEFORE separate decode profiling", flush=True)
+    print("[SFA_BENCH] staged vs full; performance BEFORE separate diagnostics/profile; no parity probes", flush=True)
     for mode in ("preflight", *args.order.split(",")):
         subprocess.run(
             [
@@ -315,6 +433,7 @@ def run_pair(args) -> None:
                 "--repeats",
                 str(args.repeats),
                 *(["--profile"] if args.profile else []),
+                *(["--diagnose"] if args.diagnose else []),
             ],
             env=benchmark_environment("full" if mode == "preflight" else mode, args.devices),
             check=True,
@@ -373,7 +492,13 @@ def main() -> None:
     parser.add_argument("--output-tokens", type=int, default=512)
     parser.add_argument("--warmups", type=int, default=1)
     parser.add_argument("--repeats", type=int, default=5)
-    parser.add_argument("--profile", action="store_true", help="Also capture separate decode-only traces in both modes")
+    diagnostic = parser.add_mutually_exclusive_group()
+    diagnostic.add_argument(
+        "--profile", action="store_true", help="Also capture separate decode-only traces in both modes"
+    )
+    diagnostic.add_argument(
+        "--diagnose", action="store_true", help="Separate decode timing in the log, without profiling"
+    )
     parser.add_argument("--profile-tokens", type=int, default=32)
     parser.add_argument("--profile-dir", type=Path, default=Path("profile"))
     parser.add_argument("--order", choices=("staged,full", "full,staged"), default="staged,full")

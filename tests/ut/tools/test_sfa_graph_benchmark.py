@@ -37,6 +37,7 @@ def args(tmp_path):
         warmups=1,
         repeats=5,
         profile=True,
+        diagnose=False,
         profile_dir=tmp_path / "profile",
         run_dir=str(tmp_path),
         order="staged,full",
@@ -496,3 +497,155 @@ def test_short_context_remains_an_explicit_cli_override(driver, monkeypatch):
     monkeypatch.setattr(driver, "run_pair", lambda options: seen.append(options))
     driver.main()
     assert seen[0].prompt_tokens == 4351
+
+
+def diagnostic_workers(mode="full", steps=3):
+    metrics = {"count": steps, "total_ms": 12.0, "mean_ms": 4.0, "std_ms": 1.0, "max_ms": 6.0}
+    names = ["worker.execute", "worker.sample", "target.forward"]
+    names.extend(f"metadata.L{i}" if mode == "full" else f"retrieve.L{i}" for i in range(8))
+    if mode == "full":
+        names.append("root.replay_submit")
+    return [
+        dict(
+            rank=rank,
+            decode_steps=steps,
+            root_replays=steps if mode == "full" else 0,
+            source_binding_updates=1,
+            query_tokens_histogram={2: steps},
+            sampled_tokens_histogram={2: steps},
+            prefill_steps_excluded=10,
+            device_intervals_dropped=0,
+            stages={name: {key: dict(metrics) for key in ("wall", "self_wall", "self_cpu")} for name in names},
+        )
+        for rank in range(8)
+    ]
+
+
+def test_diagnose_has_no_mid_request_rpcs_or_profiler(driver, args, monkeypatch):
+    args.profile, args.diagnose = False, True
+    events = []
+
+    def rpc(method, **kwargs):
+        events.append(method)
+        if method == "benchmark_start_decode_timing":
+            assert kwargs["args"] == (4351,)
+        return diagnostic_workers()
+
+    def generate(*a):
+        events.append("request")
+        return {"decode_ms": 80, "decode_tokens": 6, "tpot_ms": 80 / 6}
+
+    llm = SimpleNamespace(collective_rpc=rpc)
+    monkeypatch.setattr(driver, "generate_request", generate)
+    result = driver.diagnose_request(llm, args, 6)
+    assert events == ["benchmark_start_decode_timing", "request", "benchmark_stop_decode_timing"]
+    assert len(result["workers"]) == 8
+    assert "no profiler" in result["scope"]
+    assert "profiler_config" not in driver.benchmark_options(args)
+
+
+def test_diagnostic_generation_error_attempts_stop_and_preserves_original(driver, args, monkeypatch):
+    llm = SimpleNamespace(collective_rpc=Mock(side_effect=[None, RuntimeError("stop failed")]))
+    monkeypatch.setattr(driver, "generate_request", Mock(side_effect=ValueError("original failure")))
+    with pytest.raises(ValueError, match="original failure") as error:
+        driver.diagnose_request(llm, args, 6)
+    assert "stop failed" in error.value.__notes__[0]
+    assert llm.collective_rpc.call_count == 2
+
+
+@pytest.mark.parametrize(
+    "failure",
+    ["missing_rank", "duplicate_rank", "missing_target", "missing_root", "rank_skew", "missing_layer", "callback"],
+)
+def test_diagnose_rejects_incomplete_coverage(driver, args, monkeypatch, failure):
+    reports = diagnostic_workers()
+    if failure == "missing_rank":
+        reports.pop()
+    elif failure == "duplicate_rank":
+        reports[-1]["rank"] = 0
+    elif failure == "missing_target":
+        reports[-1]["stages"].pop("target.forward")
+    elif failure == "missing_root":
+        reports[-1]["root_replays"] = 0
+    elif failure == "missing_layer":
+        reports[-1]["stages"].pop("metadata.L7")
+    elif failure == "callback":
+        reports[-1]["stages"]["retrieve.L3"] = {"wall": {"count": 1}}
+    else:
+        reports[-1] = diagnostic_workers(steps=4)[-1]
+    llm = SimpleNamespace(collective_rpc=Mock(side_effect=[None, reports]))
+    monkeypatch.setattr(driver, "generate_request", lambda *a: sample())
+    with pytest.raises(RuntimeError):
+        driver.diagnose_request(llm, args, 6)
+
+
+def test_diagnostic_log_is_compact_includes_all_ranks_and_no_tokens(driver, capsys):
+    driver.print_decode_timing(
+        {
+            "mode": "full",
+            "workers": diagnostic_workers(),
+            "request": {"decode_ms": 80, "decode_tokens": 6, "token_ids": [999999] * 512},
+        }
+    )
+    output = capsys.readouterr().out
+    assert len(output) < 5000
+    assert "999999" not in output
+    assert all(f"rank={rank} " in output for rank in range(8))
+    assert "wall=4.000(4.000) self=4.000(4.000)" in output
+    assert "committed/forward=2.000" in output
+    assert "MUST NOT be added" in output
+    assert "not pure scheduler" in output
+
+
+def test_diagnose_and_profile_are_mutually_exclusive(driver, args, monkeypatch):
+    args.profile = args.diagnose = True
+    with pytest.raises(ValueError, match="OR --profile"):
+        driver.validate_args(args)
+    monkeypatch.setattr(sys, "argv", ["benchmark", "--diagnose", "--profile"])
+    with pytest.raises(SystemExit):
+        driver.main()
+
+
+def test_diagnose_cli_never_runs_trace_export_or_analysis(driver, args, monkeypatch):
+    args.profile, args.diagnose = False, True
+    launches = []
+
+    def launch(argv, **kwargs):
+        assert "--child" in argv and "--diagnose" in argv and "--profile" not in argv
+        mode = argv[argv.index("--child") + 1]
+        launches.append(mode)
+        if mode != "preflight":
+            Path(args.run_dir, f"{mode}.json").write_text(json.dumps(report(mode)))
+
+    monkeypatch.setattr(driver.subprocess, "run", launch)
+    monkeypatch.setattr(driver, "analyse_traces", Mock(side_effect=AssertionError("No profiler analysis")))
+    driver.run_pair(args)
+    assert launches == ["preflight", "staged", "full"]
+
+
+def test_diagnostics_installed_only_after_all_performance_samples(driver, args, monkeypatch):
+    args.profile, args.diagnose = False, True
+    events = []
+    stub = ModuleType("vllm")
+    stub.LLM = lambda **kw: SimpleNamespace(
+        collective_rpc=lambda *a, **kw: [{"rank": r["rank"], "pid": r["pid"]} for r in states()]
+    )
+    monkeypatch.setitem(sys.modules, "vllm", stub)
+    counters = iter([0] + [value for i in range(5) for value in (i * 5, (i + 1) * 5)])
+    monkeypatch.setattr(driver, "worker_state", lambda *a: states(count=next(counters)))
+    monkeypatch.setattr(driver, "track_workers", lambda *a: [])
+    monkeypatch.setattr(driver, "shutdown_engine", lambda *a: events.append("shutdown"))
+    monkeypatch.setattr(driver, "generate_request", lambda *a: (events.append("performance"), sample())[1])
+
+    def diagnose(*a):
+        saved = json.loads(Path(args.run_dir, "full.json").read_text())
+        assert len(saved["samples"]) == 5
+        assert events == ["performance"] * 6
+        events.append("diagnose")
+        return {"diagnostic_only": True}
+
+    monkeypatch.setattr(driver, "diagnose_request", diagnose)
+    monkeypatch.setattr(driver, "print_decode_timing", lambda *a: events.append("print"))
+    driver.run_child(args)
+    assert events == ["performance"] * 6 + ["diagnose", "print", "shutdown"]
+    assert Path(args.run_dir, "full-timing.json").is_file()

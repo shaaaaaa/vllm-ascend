@@ -178,7 +178,9 @@ additional committed tokens. This handles MTP multi-token emissions and includes
 scheduling, IPC, MTP, sampling and cache work, not just target graph execution.
 Startup, warmup, prefill and the separate profiler request are not timed as
 decode. Worker state/synchronization RPCs run only outside timed requests.
-There is no per-layer or per-step benchmark worker instrumentation.
+There is no per-layer or per-step benchmark instrumentation in these measured
+requests. Optional diagnostics are installed only afterwards, for a separate
+request; ordinary serving is never instrumented by this tool.
 
 Full-graph source binding now compares ordered request IDs and immutable
 `PreparedSparseSource` snapshot identities **before** enumerating transfers.
@@ -237,6 +239,87 @@ python tools/sfa_graph_benchmark.py --order full,staged 2>&1 | tee log.log
 
 Use repeated runs in both orders to distinguish gains from run-to-run noise,
 thermal state or cache effects; there is no hard-coded performance pass threshold.
+
+### Compact timing diagnostics without a profiler
+
+For a regression on the 5000-token workload, keep that same length:
+
+```bash
+set -o pipefail
+python tools/sfa_graph_benchmark.py --prompt-tokens 5000 --diagnose 2>&1 | tee log.log
+```
+
+`--diagnose` and `--profile` are mutually exclusive. This mode never starts
+the profiler, exports a trace, or calls the trace analyser. Each engine first
+finishes its normal warmup and five uninstrumented performance requests. Only
+then are temporary timing wrappers installed for one additional 512-token
+generation. They are restored afterwards. There are no changes to the captured
+graph, KV values, sampling or production forward implementation.
+
+The worker uses scheduler `num_computed_tokens` and `num_output_tokens` to
+exclude prefill, including a final one-token prefill chunk. It does **not**
+guess decode from query length or arm timing with a mid-request RPC. Start/stop
+RPCs and their synchronization happen outside the diagnostic request. There
+are no new per-layer or per-step synchronization calls. Current-stream timing
+events are recorded only at target-forward, root-replay and MTP boundaries;
+elapsed times are read after the request finishes. Event storage is bounded;
+`event_drops` warns if an unusually long diagnostic request exceeds the cap.
+
+Both modes print compact `[SFA_TIMING]` lines directly to `log.log`. To share
+only the summary, without any large trace:
+
+```bash
+grep -aF '[SFA_TIMING]' log.log
+```
+
+Each rank reports actual decode forwards, root replays, source binding updates,
+query-size and sampled-token-count histograms. The tool rejects missing ranks,
+inconsistent forward counts or a full-mode forward without a root replay.
+`committed/forward` and the histograms help identify changed MTP work even when
+the final token IDs match. Sampled worker tokens can exceed final committed
+tokens at the generation length boundary; this is not an exact acceptance-rate
+counter. Source update/root counters span the diagnostic request; phase timings
+and histograms exclude prefill.
+
+Per-stage lines include `wall`, `self`, `cpu`, `call_max`, and (at coarse
+boundaries) `stream`:
+
+- `wall`: inclusive host elapsed time, normalized by target forwards.
+- `self`: host elapsed time excluding measured child scopes. Use this to avoid
+  counting source preparation, metadata and replay time twice.
+- `cpu`: exclusive CPU time of the worker's execution thread, not process CPU
+  usage. A large wall/self time with low CPU can be waiting, driver activity or
+  descheduling; it does not identify a particular kernel.
+- Numbers such as `1.200(1.800)` are the rank mean and the largest rank mean in
+  ms/forward. `call_max` is the slowest individual host call in milliseconds.
+- `stream`: NPU current-stream elapsed time, including dependencies and host
+  submission gaps. It is **not pure kernel time**, and overlapping intervals
+  must not be summed. With nonzero `event_drops`, it is only partial coverage.
+
+Useful comparisons are `source.prepare`, `source.bind`, `metadata.L0` through
+`metadata.L7`, `signature.validate`, `target.forward`, `root.replay_submit`,
+`mtp.propose`, `sampling`, and `bookkeeping`. Staged retrieval has one
+`retrieve.L*` row per target layer, with KV waits distinguished from MTP waits.
+Full mode should not execute these Python retrieval callbacks in target
+replay. `signature.validate` currently runs twice per full target forward;
+the timings deliberately include both calls.
+
+`root.run` exclusive time is mostly the **existing** post-replay completion
+fence plus bookkeeping/profiler-scope overhead, after subtracting signature
+validation and replay submission. A large number here does not by itself
+prove that the fence is wasted overhead: it may be waiting for real device
+work, including work submitted before replay. Compare it with target/root
+stream spans and with staged MTP/readback waits. `engine_minus_worker` is a
+signed residual including scheduling, IPC, idle gaps and interval-boundary
+skew, not a precise scheduler measurement or a sum across TP ranks.
+
+Small `staged-timing.json` and `full-timing.json` files retain each rank's
+per-call mean/standard deviation/max alongside the existing benchmark JSON
+under the printed `profile/sfa-.../` result directory. No large profile is
+created. Diagnostic timings are labelled separately and never enter
+`comparison.json` or its TPOT speedup calculation. Local CPU tests cover the
+gating, nesting, real root replay/fence call order, wrapper restoration and
+driver orchestration; NPU performance still requires this host run.
 
 With `--profile`, each engine makes one additional request **after its timed
 requests**, starts the profiler after eight committed output tokens (past
