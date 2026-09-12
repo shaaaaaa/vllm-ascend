@@ -99,8 +99,8 @@ def test_distinct_reproducible_prompts_do_not_share_prefix(driver):
         {"prompt_tokens": 4096},
         {"output_tokens": 1},
         {"profile_tokens": 1},
-        {"warmups": 0},
-        {"repeats": 1},
+        {"warmups": -1},
+        {"repeats": 0},
         {"devices": "0,0"},
         {"warmups": 256},
         {"model": "missing-sfa-model"},
@@ -280,6 +280,25 @@ def test_comparison_reports_gain_and_regression_without_threshold(driver):
     assert result["tokens_equal"]
     assert result["staged_tpot_ms"]["std"] == 5
     assert driver.compare_results(report("staged"), report("full", (20, 40)))["tpot_reduction_percent"] == -100
+
+
+@pytest.mark.parametrize("instrumented", [False, True])
+def test_single_sample_statistics_are_explicit_about_count_variance_and_overhead(driver, instrumented):
+    staged, full = report("staged", (10,)), report("full", (5,))
+    for value in (staged, full):
+        value["instrumented_measurements"] = instrumented
+    result = driver.compare_results(staged, full)
+    assert result["decode_speedup"] == 2 and result["tokens_equal"]
+    assert result["staged_tpot_ms"] == {"count": 1, "mean": 10, "median": 10, "std": None, "min": 10, "max": 10}
+    assert result["instrumented_measurements"] is instrumented
+    assert ("includes diagnostic timing overhead" in result["scope"]) == instrumented
+
+
+def test_comparison_rejects_mixed_timing_instrumentation(driver):
+    staged, full = report("staged", (10,)), report("full", (5,))
+    full["instrumented_measurements"] = True
+    with pytest.raises(ValueError, match="instrumented and uninstrumented"):
+        driver.compare_results(staged, full)
 
 
 def test_changed_outputs_are_explicit_not_a_numerical_pass(driver):
@@ -483,6 +502,8 @@ def test_default_long_context_cli_and_options(driver, args, monkeypatch):
     monkeypatch.setattr(driver, "run_pair", lambda options: seen.append(options))
     driver.main()
     assert seen[0].prompt_tokens == 30000 and seen[0].output_tokens == 512
+    assert seen[0].warmups == 0 and seen[0].repeats == 1
+    assert not seen[0].diagnose and not seen[0].profile
     args.prompt_tokens = seen[0].prompt_tokens
     driver.validate_args(args)
     options = driver.benchmark_options(args)
@@ -650,3 +671,90 @@ def test_diagnostics_installed_only_after_all_performance_samples(driver, args, 
     driver.run_child(args)
     assert events == ["performance"] * 6 + ["diagnose", "print", "shutdown"]
     assert Path(args.run_dir, "full-timing.json").is_file()
+
+
+@pytest.mark.parametrize("mode", ["staged", "full"])
+@pytest.mark.parametrize("diagnose", [False, True])
+def test_single_request_mode_never_generates_hidden_warmup_or_extra_diagnostics(
+    driver, args, monkeypatch, capsys, mode, diagnose
+):
+    args.child, args.warmups, args.repeats = mode, 0, 1
+    args.profile, args.diagnose = False, diagnose
+    driver.validate_args(args)
+    events, generations = [], []
+
+    def rpc(name, **kwargs):
+        events.append(name)
+        if name == "benchmark_stop_decode_timing":
+            return diagnostic_workers(mode)
+        return [{"rank": r["rank"], "pid": r["pid"]} for r in states(mode)]
+
+    stub = ModuleType("vllm")
+    llm = SimpleNamespace(collective_rpc=rpc)
+    stub.LLM = lambda **kw: llm
+    monkeypatch.setitem(sys.modules, "vllm", stub)
+    monkeypatch.setattr(driver, "track_workers", lambda *a: [])
+    monkeypatch.setattr(
+        driver, "worker_state", lambda *a: states(mode, count=3 * len(generations) if mode == "full" else 0)
+    )
+    monkeypatch.setattr(driver, "shutdown_engine", lambda *a: events.append("shutdown"))
+
+    def generate(llm, args, ordinal, *, profile=False):
+        assert not profile
+        generations.append(ordinal)
+        events.append("request")
+        return {**sample(), "decode_ms": 20, "decode_tokens": 2}
+
+    monkeypatch.setattr(driver, "generate_request", generate)
+    # Execute the actual run_child -> diagnose_request -> generate_request
+    # orchestration. One inline request must produce BOTH reports, not two runs.
+    driver.run_child(args)
+    assert generations == [0]
+    expected = ["benchmark_process_info"]
+    expected += (
+        ["benchmark_start_decode_timing", "request", "benchmark_stop_decode_timing"] if diagnose else ["request"]
+    )
+    expected += ["benchmark_release_resources", "shutdown"]
+    assert events == expected
+    saved = json.loads(Path(args.run_dir, f"{mode}.json").read_text())
+    assert len(saved["samples"]) == 1
+    assert saved["tpot_ms"]["std"] is None and saved["tpot_ms"]["count"] == 1
+    assert saved["instrumented_measurements"] is diagnose
+    timing = Path(args.run_dir, f"{mode}-timing.json")
+    assert timing.exists() == diagnose
+    if diagnose:
+        diagnostic = json.loads(timing.read_text())
+        assert len(diagnostic["workers"]) == 8
+        assert "single instrumented" in diagnostic["scope"]
+        assert diagnostic["request"]["token_ids"] == saved["samples"][0]["token_ids"]
+    output = capsys.readouterr().out
+    assert f"[SFA_BENCH] {mode} 1/1" in output
+    assert ("[SFA_TIMING]" in output) == diagnose
+
+
+@pytest.mark.parametrize("diagnose", [False, True])
+def test_single_request_parent_prints_and_saves_comparison(driver, args, monkeypatch, capsys, diagnose):
+    args.warmups, args.repeats, args.profile, args.diagnose = 0, 1, False, diagnose
+    launches = []
+
+    def launch(argv, **kwargs):
+        mode = argv[argv.index("--child") + 1]
+        launches.append(mode)
+        assert argv[argv.index("--warmups") + 1] == "0"
+        assert argv[argv.index("--repeats") + 1] == "1"
+        assert ("--diagnose" in argv) == diagnose
+        if mode != "preflight":
+            value = report(mode, (10 if mode == "staged" else 5,))
+            value["instrumented_measurements"] = diagnose
+            Path(args.run_dir, f"{mode}.json").write_text(json.dumps(value))
+
+    monkeypatch.setattr(driver.subprocess, "run", launch)
+    monkeypatch.setattr(driver, "analyse_traces", Mock(side_effect=AssertionError("No profile")))
+    driver.run_pair(args)
+    assert launches == ["preflight", "staged", "full"]
+    result = json.loads(Path(args.run_dir, "comparison.json").read_text())
+    assert result["config"]["repeats"] == 1 and result["config"]["warmups"] == 0
+    assert result["instrumented_measurements"] is diagnose
+    output = capsys.readouterr().out
+    assert "std=n/a (one request)" in output and "speedup=2.000x" in output
+    assert ("TPOT INCLUDES diagnostic overhead" in output) == diagnose

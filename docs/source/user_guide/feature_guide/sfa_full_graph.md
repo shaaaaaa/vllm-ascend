@@ -163,9 +163,11 @@ The driver starts and fully closes two engines sequentially:
 - `full`: the single-target-forward path, `SFA_FULL_GRAPH=1`.
 
 Both retain `SFA_STAGED_GRAPH=1` and PIECEWISE compilation; the baseline is
-**not enforce-eager**. Each engine performs one warmup and five measured,
-single-request generations, with identical prompts/seeds across modes and
-distinct prefixes between requests. EOS is ignored to fix the output length.
+**not enforce-eager**. By default each engine performs exactly **one request**,
+with **zero extra warmup requests** (`--warmups 0 --repeats 1`). Prompts/seeds
+match across modes. EOS is ignored to fix the output length. Startup model
+initialization and mandatory graph capture still run. To explicitly restore
+the longer benchmark, pass `--warmups 1 --repeats 5`.
 Prefill executes normally in each engine, but is excluded from decode timing.
 This is a performance experiment, **not** the one-prefill numerical comparison.
 The 30000-token length is the **input context**, not 30000 generated tokens.
@@ -179,9 +181,12 @@ additional committed tokens. This handles MTP multi-token emissions and includes
 scheduling, IPC, MTP, sampling and cache work, not just target graph execution.
 Startup, warmup, prefill and the separate profiler request are not timed as
 decode. Worker state/synchronization RPCs run only outside timed requests.
-There is no per-layer or per-step benchmark instrumentation in these measured
-requests. Optional diagnostics are installed only afterwards, for a separate
-request; ordinary serving is never instrumented by this tool.
+Without `--diagnose`, measured requests have no per-layer or per-step benchmark
+instrumentation. With `--diagnose` and the single-request defaults, that sole
+request also supplies the stage statistics; its TPOT is labelled as including
+diagnostic overhead. Explicit multi-request configurations retain separate
+diagnostics after the uninstrumented measurements. Ordinary serving is never
+instrumented by this tool.
 
 Full-graph source binding now compares ordered request IDs and immutable
 `PreparedSparseSource` snapshot identities **before** enumerating transfers.
@@ -259,6 +264,12 @@ reduction = (staged_mean_TPOT - full_mean_TPOT) / staged_mean_TPOT * 100%
 speedup   = staged_mean_TPOT / full_mean_TPOT
 ```
 
+For one request, `count=1` and `std=null` (`n/a` in the log): there is no
+between-request variability estimate. Per-stage diagnostic statistics still
+cover all measured decode forwards within that request. With no request
+warmup, first-request lazy setup may affect the result; this is a quick
+comparison, not evidence of multi-request stability.
+
 A negative reduction is a slowdown. `tokens_equal=false` is reported explicitly:
 different outputs can change MTP acceptance or MoE routing and confound timing.
 Even matching dummy outputs do not prove numerical correctness. These results
@@ -269,7 +280,7 @@ For a performance-only repeat in reverse order, use:
 python tools/sfa_graph_benchmark.py --order full,staged 2>&1 | tee log.log
 ```
 
-Use repeated runs in both orders to distinguish gains from run-to-run noise,
+For a rigorous performance study, use repeated runs in both orders to distinguish gains from run-to-run noise,
 thermal state or cache effects; there is no hard-coded performance pass threshold.
 
 ### Compact timing diagnostics without a profiler
@@ -282,11 +293,14 @@ python tools/sfa_graph_benchmark.py --prompt-tokens 5000 --diagnose 2>&1 | tee l
 ```
 
 `--diagnose` and `--profile` are mutually exclusive. This mode never starts
-the profiler, exports a trace, or calls the trace analyser. Each engine first
-finishes its normal warmup and five uninstrumented performance requests. Only
-then are temporary timing wrappers installed for one additional 512-token
-generation. They are restored afterwards. There are no changes to the captured
-graph, KV values, sampling or production forward implementation.
+the profiler, exports a trace, or calls the trace analyser. With the defaults,
+each engine runs only **one 512-token generation**, and temporary timing wrappers
+collect statistics during that same request. There is no hidden warmup or
+second diagnostic generation. They are restored afterwards. Both the log and
+`comparison.json` flag that TPOT includes diagnostic overhead; it is not a clean
+performance measurement. There are no changes to the captured graph, KV values,
+sampling or production forward implementation. With explicit `--warmups 1
+--repeats 5`, diagnostics instead run once after the ordinary measurements.
 
 The worker uses scheduler `num_computed_tokens` and `num_output_tokens` to
 exclude prefill, including a final one-token prefill chunk. It does **not**
@@ -353,8 +367,11 @@ skew, not a precise scheduler measurement or a sum across TP ranks.
 Small `staged-timing.json` and `full-timing.json` files retain each rank's
 per-call mean/standard deviation/max alongside the existing benchmark JSON
 under the printed `profile/sfa-.../` result directory. No large profile is
-created. Diagnostic timings are labelled separately and never enter
-`comparison.json` or its TPOT speedup calculation. Local CPU tests cover the
+created. In single-request diagnostic mode, `comparison.json` contains the same
+request's TPOT with `instrumented_measurements=true`; comparisons mixing an
+instrumented and uninstrumented mode are rejected. In explicit multi-request
+mode, the additional diagnostic request is excluded from performance statistics.
+Local CPU tests cover the
 gating, nesting, asynchronous root replay call order, wrapper restoration and
 driver orchestration; NPU performance still requires this host run.
 
@@ -368,7 +385,7 @@ printed as `profile/sfa-.../`; new runs never overwrite earlier traces:
 
 ```text
 comparison.json           TPOT comparison, configuration and output-match flag
-staged.json / full.json    individual unprofiled samples and token IDs
+staged.json / full.json    samples, token IDs and timing-instrumentation flag
 staged/ / full/            rank-specific MindStudio profile directories
 *-trace-check.json         per-rank CPU-scope audit and trace paths
 ```
