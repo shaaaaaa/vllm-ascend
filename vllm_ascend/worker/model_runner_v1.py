@@ -128,6 +128,7 @@ from vllm_ascend.compilation.acl_graph import (
     set_graph_params,
     update_full_graph_params,
 )
+from vllm_ascend.compilation.sfa_fail_stop import exit_failed_sfa_worker, uses_local_sfa_fail_stop
 from vllm_ascend.compilation.sfa_full_graph import SFAFullGraph
 from vllm_ascend.distributed.kv_transfer.sparse_offload.resident_sparse_cache import (
     MAX_INT16_SCRATCH_CAPACITY,
@@ -3406,16 +3407,32 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                     self._sfa_full_graph.validate_inputs(graph_inputs=graph_inputs, **graph_kwargs)
                 except Exception as exc:
                     local_error = exc
-                # All workers, including idle DP replicas, must fail together
-                # before any peer enters captured EP/TP collectives.
-                failed = torch.tensor([int(local_error is not None)], dtype=torch.int32)
-                for group in (get_tp_group(), get_dp_group()):
-                    if group.world_size > 1:
-                        dist.all_reduce(failed, op=dist.ReduceOp.MAX, group=group.cpu_group)
-                if failed.item():
-                    raise RuntimeError(
-                        "[SFA full graph] source/metadata preparation failed on this or a peer worker"
-                    ) from local_error
+                if (
+                    not context.staged_sfa_graph_dummy_run
+                    and uses_local_sfa_fail_stop(self.vllm_config.parallel_config)
+                ):
+                    # One local supervisor owns this TP-only worker cohort.
+                    # Healthy forwards need no CPU collective or failure tensor.
+                    # A known failure exits instead of being swallowed by the RPC
+                    # loop; the independent sentinel monitor stops blocked peers.
+                    if local_error is not None:
+                        logger.critical(
+                            "[SFA full graph] source/metadata preparation failed; "
+                            "exiting worker to notify the local executor supervisor",
+                            exc_info=(type(local_error), local_error, local_error.__traceback__),
+                        )
+                        exit_failed_sfa_worker(local_error)
+                else:
+                    # Capture and unsupported executor topologies still agree
+                    # before entering EP/TP collectives (including idle DP ranks).
+                    failed = torch.tensor([int(local_error is not None)], dtype=torch.int32)
+                    for group in (get_tp_group(), get_dp_group()):
+                        if group.world_size > 1:
+                            dist.all_reduce(failed, op=dist.ReduceOp.MAX, group=group.cpu_group)
+                    if failed.item():
+                        raise RuntimeError(
+                            "[SFA full graph] source/metadata preparation failed on this or a peer worker"
+                        ) from local_error
             output = self._sfa_full_graph.run(
                 self._run_sfa_full_graph_target,
                 graph_inputs=graph_inputs,

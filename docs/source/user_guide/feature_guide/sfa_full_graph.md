@@ -75,8 +75,10 @@ The transfer uses two batched single-plane kernels (K and PE) inside the same gr
 This keeps the existing native kernel ABI while allowing partial-tail PE
 offsets, source pointers and token limits to change via fixed device buffers.
 Each request has a separate virtual chunk-address range; no-history and padded
-lanes are masked on device. Source, metadata and input-signature errors are agreed
-across TP/DP before any worker enters captured collectives.
+lanes are masked on device. Source, metadata and input-signature errors use
+error-only worker fail-stop for live, single-node TP-only `mp` execution;
+startup capture and other topologies agree across TP/DP before entering
+captured collectives. See the failure-handling details below.
 This is not a claim that two kernels are optimal: benchmark the added kernel
 cost against the removed host dispatch overhead.
 
@@ -190,9 +192,25 @@ per-step attention metadata/address validation. Those metadata checks still
 visit layers; this optimization removes the **source rebinding** loop and its
 device work, not every graph-external Python loop.
 
-The pre-replay TP/DP CPU error agreement and post-replay source-lease fence are
-unchanged. A worker exception is not guaranteed to immediately kill all peers;
-removing agreement can strand another rank in a captured collective.
+For **single-node, TP-only, DP1/PP1 `mp` worker processes**, live target decode
+no longer performs the pre-replay TP CPU error all-reduce. Source and metadata
+validation still run locally. A preparation failure logs the original traceback
+and raises `SystemExit`, bypassing the worker RPC loop's catch-and-continue
+handler. The existing independent process-sentinel monitor then shuts down the
+owned peer workers, even if their computation threads are blocked. Only on
+failure, a five-second daemon timer is armed to exit the failed process if its
+cleanup stalls. Healthy forwards start no timers and perform no health polling
+or error-agreement communication. This is fail-stop requiring engine restart,
+not retry or recovery of the failed forward.
+
+Startup capture, multi-node/multi-DP jobs and other/custom executors retain
+the existing synchronous error agreement. The post-replay source-lease fence
+also remains. This change does not remove model TP collectives or replace
+HCCL/native hang detection when no Python preparation error has occurred.
+CPU tests in `test_sfa_fail_stop.py` execute the sibling vLLM RPC loop and
+sentinel-monitor methods with two/eight real child processes, including a
+nonzero-rank failure, blocked cleanup and unrelated-process isolation. They
+verify process supervision, **not native HCCL cancellation on an NPU**.
 `full.json` records `source_binding_updates_per_rank` beside
 `root_replays_per_rank`, sampled only before/after each request. The timing line
 also shows rank 0's counts. Long steady requests should have many more replays

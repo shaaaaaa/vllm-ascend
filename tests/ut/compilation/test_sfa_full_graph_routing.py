@@ -51,8 +51,10 @@ def routing():
         staged_sfa_graph_configured=lambda _: True,
         has_kv_transfer_group=lambda: False,
         cold_perf_enabled=lambda: False,
+        parent_process=lambda: object(),  # Fixture represents a worker child.
     )
     definitions(root / "attention/utils.py", {"unwrap_staged_sfa_connector_metadata"}, ns)
+    definitions(root / "compilation/sfa_fail_stop.py", {"uses_local_sfa_fail_stop"}, ns)
     definitions(root / "ascend_forward_context.py", {"StagedSFAQueryProfile", "StagedSFAGraphKey"}, ns)
     definitions(
         root / "utils.py",
@@ -87,6 +89,7 @@ def routing():
     runner.vllm_config = SimpleNamespace(lora_config=None, model_config=SimpleNamespace(enforce_eager=False))
     runner.model_config = runner.vllm_config.model_config
     runner.parallel_config = SimpleNamespace(data_parallel_size=4)
+    runner.vllm_config.parallel_config = runner.parallel_config
     runner._staged_sfa_graph_capture_sizes = (2,)
     ns["logger"] = SimpleNamespace(info=lambda *args: None)
     ns["staged_sfa_metadata_sparse_route"] = lambda *args: (ns["StagedSFARouteReason"].ELIGIBLE, (4096,), (False,))
@@ -623,3 +626,107 @@ def test_preparation_and_signatures_are_agreed_before_collective_replay(routing,
         layer.prepare_full_graph_layer.assert_called_once_with("layer0", 140000, bind_source=False)
         assert runner._sfa_full_graph.bind_sources.call_args.args[:2] == ((None,), ("r1",))
     assert groups == ["tp", "dp"]
+
+
+@pytest.mark.parametrize("failure", [None, "source", "binding", "signature"])
+def test_local_supervised_decode_has_no_per_step_error_collective(routing, failure):
+    runner, ns, _, modes, _ = routing
+    runner.model = Mock()
+    runner.model_config.max_model_len = 30544
+    runner.vllm_config.parallel_config = SimpleNamespace(
+        distributed_executor_backend="mp", nnodes=1, data_parallel_size=1, pipeline_parallel_size=1
+    )
+    runner.input_batch = SimpleNamespace(req_ids=["r"], num_reqs=1)
+    layer = SimpleNamespace(prepare_full_graph_layer=Mock(return_value={}))
+    runner._staged_sfa_impls = [("layer0", layer)]
+    runner._run_sfa_full_graph_target = Mock()
+    runner._sfa_full_graph = SimpleNamespace(
+        bind_sources=Mock(), validate_inputs=Mock(), run=Mock(return_value="output")
+    )
+    connector = SimpleNamespace(prepare_sparse_graph_step=Mock(return_value=(None,)))
+    context = SimpleNamespace(
+        staged_sfa_graph_key="r1q2",
+        cudagraph_runtime_mode=modes.PIECEWISE,
+        staged_sfa_graph_dummy_run=False,
+        staged_sfa_route=SimpleNamespace(frontiers=(0,)),
+    )
+    forbidden = Mock(side_effect=AssertionError("no failure tensor, group query, or collective on the live fast path"))
+    original = ValueError("injected source preparation failure")
+
+    def exit_worker(error):
+        assert error is original
+        raise SystemExit(1) from error
+
+    ns.update(
+        torch=SimpleNamespace(tensor=forbidden),
+        get_forward_context=lambda: context,
+        get_kv_transfer_group=lambda: connector,
+        get_tp_group=forbidden,
+        get_dp_group=forbidden,
+        dist=SimpleNamespace(all_reduce=forbidden),
+        logger=Mock(),
+        exit_failed_sfa_worker=Mock(side_effect=exit_worker),
+    )
+    if failure:
+        target = {
+            "source": connector.prepare_sparse_graph_step,
+            "binding": runner._sfa_full_graph.bind_sources,
+            "signature": runner._sfa_full_graph.validate_inputs,
+        }[failure]
+        target.side_effect = original
+        with pytest.raises(SystemExit) as error:
+            runner._model_forward(2)
+        assert error.value.__cause__ is original
+        runner._sfa_full_graph.run.assert_not_called()
+        ns["exit_failed_sfa_worker"].assert_called_once_with(original)
+        assert ns["logger"].critical.call_args.kwargs["exc_info"][1] is original
+    else:
+        for _ in range(300):
+            assert runner._model_forward(2) == "output"
+        assert runner._sfa_full_graph.run.call_count == 300
+        ns["exit_failed_sfa_worker"].assert_not_called()
+    forbidden.assert_not_called()
+
+
+@pytest.mark.parametrize("failed", [False, True])
+def test_local_startup_capture_retains_error_agreement(routing, failed):
+    runner, ns, _, modes, _ = routing
+    runner.model = Mock()
+    runner.model_config.max_model_len = 30544
+    runner.vllm_config.parallel_config = SimpleNamespace(
+        distributed_executor_backend="mp", nnodes=1, data_parallel_size=1, pipeline_parallel_size=1
+    )
+    layer = SimpleNamespace(prepare_full_graph_layer=Mock(return_value={}))
+    runner._staged_sfa_impls = [("layer0", layer)]
+    runner._run_sfa_full_graph_target = Mock()
+    runner._sfa_full_graph = SimpleNamespace(
+        bind_sources=Mock(side_effect=ValueError("bad startup binding") if failed else None),
+        validate_inputs=Mock(),
+        run=Mock(return_value="capture"),
+    )
+    context = SimpleNamespace(
+        staged_sfa_graph_key="r1q2", cudagraph_runtime_mode=modes.PIECEWISE, staged_sfa_graph_dummy_run=True
+    )
+    policy = Mock(side_effect=AssertionError("startup must not rely on a ready worker supervisor"))
+    calls = []
+
+    def agree(tensor, *, op, group):
+        calls.append(group)
+        assert tensor.item() == int(failed)
+
+    ns.update(
+        torch=torch,
+        get_forward_context=lambda: context,
+        uses_local_sfa_fail_stop=policy,
+        get_tp_group=lambda: SimpleNamespace(world_size=8, cpu_group="tp"),
+        get_dp_group=lambda: SimpleNamespace(world_size=1),
+        dist=SimpleNamespace(all_reduce=agree, ReduceOp=SimpleNamespace(MAX="max")),
+    )
+    if failed:
+        with pytest.raises(RuntimeError, match="preparation failed"):
+            runner._model_forward(2)
+        runner._sfa_full_graph.run.assert_not_called()
+    else:
+        assert runner._model_forward(2) == "capture"
+    assert calls == ["tp"]
+    policy.assert_not_called()
