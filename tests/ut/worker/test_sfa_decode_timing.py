@@ -462,7 +462,8 @@ def test_sampling_hooks_use_real_scoped_recorder_and_restore_on_failure(timing_m
     assert runner._sample is sample and sampler.sample is original_method
 
 
-def test_worker_reads_graph_events_only_after_request_fence():
+@pytest.mark.parametrize("supported", [False, True])
+def test_worker_reads_graph_events_only_after_request_fence(supported):
     events = []
     bounds = object()
     timing = SimpleNamespace(close=lambda: events.append("restore"), report=lambda: {}, last_target_events=bounds)
@@ -486,7 +487,13 @@ def test_worker_reads_graph_events_only_after_request_fence():
         model_runner=SimpleNamespace(_sfa_full_graph=SimpleNamespace(replay_count=3, source_binding_count=1)),
         benchmark_process_info=lambda: {"rank": 0},
     )
-    assert stop(worker)["graph_phases"] == {"status": "complete"}
+    if not supported:
+        worker._graph_phase_timing = None
+        worker._graph_phase_support = {"status": "unavailable", "reason": "event recorder null", "stages": {}}
+        # Missing capture capability must not try to read ANY event timestamps.
+        del timing.last_target_events
+    result = stop(worker)
+    assert result["graph_phases"] == ({"status": "complete"} if supported else worker._graph_phase_support)
 
 
 @pytest.mark.parametrize("processed", [False, True])

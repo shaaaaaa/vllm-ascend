@@ -184,8 +184,9 @@ decode. Worker state/synchronization RPCs run only outside timed requests.
 Without `--diagnose`, measured requests have no per-layer or per-step benchmark
 instrumentation. With `--diagnose` and the single-request defaults, that sole
 request also supplies the stage statistics; its TPOT is labelled as including
-diagnostic overhead. With `--diagnose`, captured timing markers also remain in
-graphs during explicit multi-request measurements; those are instrumented too.
+diagnostic overhead. With `--diagnose`, supported captured timing markers also
+remain in graphs during explicit multi-request measurements; diagnostic runs
+are conservatively labelled instrumented even if these markers are unavailable.
 Ordinary serving is never instrumented by this tool.
 
 Full-graph source binding now compares ordered request IDs and immutable
@@ -299,11 +300,12 @@ each engine runs only **one 512-token generation**, and temporary timing wrapper
 collect statistics during that same request. There is no hidden warmup or
 second diagnostic generation. They are restored afterwards. Both the log and
 `comparison.json` flag that TPOT includes diagnostic overhead; it is not a clean
-performance measurement. Timing event records are added inside existing opaque
-SFA and TP operations at startup capture; replay has no new per-layer Python
+performance measurement. If the runtime passes the captured-event capability
+check, timing records are added inside existing opaque SFA and TP operations at
+startup capture; replay has no new per-layer Python
 callbacks or graph splits. KV values and sampling computations are unchanged.
 With explicit `--warmups 1 --repeats 5`, host diagnostics run once after the
-measured requests, but the captured markers remain in all requests. Omit
+measured requests, but supported captured markers remain in all requests. Omit
 `--diagnose` for clean performance measurements.
 
 The worker uses scheduler `num_computed_tokens` and `num_output_tokens` to
@@ -320,9 +322,23 @@ after the request finishes. Event storage is bounded;
 
 A tiny startup check, before loading weights, captures and replays timing
 events twice to verify that this torch_npu/CANN version refreshes their
-timestamps. Unsupported or stale event semantics fail explicitly rather than
-reporting startup capture time as live decode time. This check is automatic;
-it does not run an extra model request.
+timestamps. A known optional timestamp limitation (including
+`Event.recorded_time()` reporting `event recorder null`, code `507000`), a missing
+timestamp API or stale timestamps disables graph-internal markers on **all TP
+ranks**. `query()==True` alone does not establish that a readable recorder exists.
+The log and JSON explicitly report `graph_phases UNAVAILABLE`; no per-layer
+numbers or success claim are invented. Detailed host sampling and graph-external
+NPU intervals continue without a profiler or an eager-model fallback. This
+reduced mode cannot identify individual graph-internal kernels or transfer
+durations. Actual capture/replay/synchronize failures and unrelated runtime
+errors still stop startup; they are not swallowed as capability limitations.
+The check and TP agreement happen at startup only and do not run an extra model
+request or add a per-forward collective.
+
+This is an event-readback limitation, not evidence of broken KV or model output.
+An external synchronization event is not a substitute timing event: the
+[CANN external-record API](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/920beta1/API/runtimeapi/aclcppdevg_03_2282.html)
+requires a synchronization-only event flag for that path.
 
 Both modes print compact `[SFA_TIMING]` lines directly to `log.log`. To share
 only the summary, without any large trace:
@@ -356,7 +372,8 @@ Per-stage lines include `wall`, `self`, `cpu`, `call_max`, and optional `stream`
   sampled totals are never divided by all decode forwards. With nonzero
   `event_drops`, it is only partial coverage.
 
-`graph_last.L0` through `graph_last.L7` split the **last target decode only**:
+When captured timestamps are supported, `graph_last.L0` through `graph_last.L7`
+split the **last target decode only**:
 
 - `pre`: projections, KV/indexer update, indexer and sparse-index preparation.
   Nested `indexer` and `select` identify top-k and its mapping/deduplication work.
@@ -420,11 +437,13 @@ created. In single-request diagnostic mode, `comparison.json` contains the same
 request's TPOT with `instrumented_measurements=true`; comparisons mixing an
 instrumented and uninstrumented mode are rejected. In explicit multi-request
 mode, the additional host diagnostic request is excluded from the TPOT samples,
-but those samples still include captured marker overhead and are labelled
-instrumented. Local CPU tests cover gating, nesting, asynchronous replay call
+but supported captured markers still contribute overhead and diagnostic runs
+remain labelled instrumented. Local CPU tests cover gating, nesting, asynchronous replay call
 order, stale timestamp rejection, phase coverage, sampled-event normalization,
-wrapper restoration, sampling-forward equivalence against the sibling vLLM
-implementation and driver orchestration. Real captured-event support and NPU
+wrapper restoration, the server's `query()==True`/`event recorder null` failure,
+all-rank capability agreement, propagation of unrelated device errors,
+sampling-forward equivalence against the sibling vLLM implementation and driver
+orchestration. Real captured-event support and NPU
 timings still require this host run.
 
 With `--profile`, each engine makes one additional request **after its timed

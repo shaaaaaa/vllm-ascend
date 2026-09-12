@@ -257,7 +257,7 @@ def diagnose_request(llm, args, ordinal: int) -> dict:
         "scope": (
             "single instrumented decode request; TPOT includes timing overhead; no profiler"
             if single_request_diagnostics(args)
-            else "separate instrumented decode request; all graphs carry timing markers; no profiler"
+            else "separate instrumented decode request; graphs carry markers if supported; no profiler"
         ),
         "request": request,
         "workers": sorted(workers, key=lambda w: w["rank"]),
@@ -338,6 +338,15 @@ def print_decode_timing(report: dict) -> None:
 def print_graph_phases(mode: str, workers: list[dict]) -> None:
     reports = [worker.get("graph_phases", {}) for worker in workers]
     if not any(reports):
+        return
+    if all(report.get("status") == "unavailable" for report in reports):
+        reasons = sorted({report.get("reason", "unknown") for report in reports})
+        print(
+            f"[SFA_TIMING] {mode} graph_phases UNAVAILABLE ranks={len(workers)}/{len(workers)}: "
+            + "; ".join(reasons)
+            + "; sampling and graph-external timing retained; no per-layer graph measurements",
+            flush=True,
+        )
         return
     complete = sum(report.get("status") == "complete" for report in reports)
     print(
@@ -499,7 +508,7 @@ def run_pair(args) -> None:
         print(
             f"[SFA_BENCH] staged/full: {args.warmups} warmups + {args.repeats} measured requests each; "
             + (
-                "TPOT INCLUDES captured timing markers; separate host diagnostics; no profiler"
+                "captured markers used if supported; separate host diagnostics; no profiler"
                 if args.diagnose
                 else "performance BEFORE optional separate profiling"
             ),

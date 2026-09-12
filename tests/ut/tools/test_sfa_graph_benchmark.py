@@ -386,7 +386,8 @@ def test_parent_never_continues_after_preflight_or_engine_failure(driver, args, 
 
 
 @pytest.mark.parametrize("diagnose", [False, True])
-def test_worker_uses_only_fixture_loading_not_parity_execution(monkeypatch, diagnose):
+@pytest.mark.parametrize("supported", [False, True])
+def test_worker_uses_only_fixture_loading_not_parity_execution(monkeypatch, diagnose, supported):
     events = []
 
     class Dummy:
@@ -412,7 +413,7 @@ def test_worker_uses_only_fixture_loading_not_parity_execution(monkeypatch, diag
 
     modules = {
         "vllm": {},
-        "vllm.distributed": {"get_tp_group": lambda: None},
+        "vllm.distributed": {"get_tp_group": lambda: SimpleNamespace(rank_in_group=0)},
         "vllm.forward_context": {"get_forward_context": lambda: None},
         "vllm.model_executor.model_loader.dummy_loader": {"DummyModelLoader": Dummy},
         "vllm_ascend": {"envs": SimpleNamespace()},
@@ -420,7 +421,11 @@ def test_worker_uses_only_fixture_loading_not_parity_execution(monkeypatch, diag
         "vllm_ascend.worker.sfa_parity_worker": {"SFAParityWorker": Parity, "deterministic_dummy_load": dummy_load},
         "vllm_ascend.worker.worker": {"NPUWorker": NPU},
         "vllm_ascend.worker.sfa_graph_timing": {
-            "verify_captured_timing_events": lambda torch: events.append("event support check"),
+            "probe_captured_timing_support": lambda torch: (
+                events.append("event support check"),
+                {"status": "supported" if supported else "unavailable", "reason": "event recorder null (507000)"},
+            )[1],
+            "agree_captured_timing_support": lambda torch, group, local: local,
             "install_graph_phase_timing": lambda *a: (events.append("install capture probes"), "probes")[1],
         },
     }
@@ -443,9 +448,9 @@ def test_worker_uses_only_fixture_loading_not_parity_execution(monkeypatch, diag
     worker.load_model()
     expected = ["quant remap"] + (["event support check"] if diagnose else [])
     expected += ["original weights", "integer weights", "production load"]
-    expected += ["install capture probes"] if diagnose else []
+    expected += ["install capture probes"] if diagnose and supported else []
     assert events == expected
-    assert getattr(worker, "_graph_phase_timing", None) == ("probes" if diagnose else None)
+    assert getattr(worker, "_graph_phase_timing", None) == ("probes" if diagnose and supported else None)
     assert Dummy.load_weights is original
     assert not isinstance(worker, Parity)
     assert set(module.SFABenchmarkWorker.__dict__) >= {"load_model", "benchmark_state", "shutdown"}
@@ -717,6 +722,20 @@ def test_graph_phase_log_is_last_decode_not_mean_and_missing_is_not_zero(driver,
     assert "graph_last.L0 pre=unobserved" in output
     assert "graph_last.TP.all_reduce span=unobserved" in output
     assert "not whole-request averages" in output
+
+
+def test_unsupported_graph_timer_keeps_sampling_summary_without_fake_layer_rows(driver, capsys):
+    workers = diagnostic_workers()
+    for worker in workers:
+        worker["graph_phases"] = {"status": "unavailable", "reason": "event recorder null (507000)", "stages": {}}
+        worker["stages"]["sampling.bonus_index"] = worker["stages"]["target.forward"]
+    driver.print_decode_timing({"mode": "full", "workers": workers, "request": {"decode_ms": 80, "decode_tokens": 6}})
+    output = capsys.readouterr().out
+    assert "graph_phases UNAVAILABLE ranks=8/8" in output
+    assert "sampling.bonus_index " in output
+    assert "no per-layer graph measurements" in output
+    assert "graph_last.L" not in output
+    assert "LAST_DECODE_ONLY" not in output
 
 
 @pytest.mark.parametrize("mode", ["staged", "full"])

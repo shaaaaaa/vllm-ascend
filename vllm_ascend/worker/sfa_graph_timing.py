@@ -22,6 +22,28 @@ class CapturedInterval:
     end: Any
 
 
+class CapturedTimingUnavailable(RuntimeError):
+    """Optional event timestamps are unsupported; not a model/kernel failure."""
+
+
+def _captured_timestamp(event):
+    read = getattr(event, "recorded_time", None)
+    if read is None:
+        raise CapturedTimingUnavailable("torch_npu events have no recorded_time API")
+    try:
+        return read()
+    except RuntimeError as error:
+        # A captured event can report query()==True without having a host-
+        # readable recorder. Do not turn this known readback limitation into
+        # a worker startup failure, or swallow unrelated NPU execution errors.
+        message = str(error)
+        if "507000" not in message or "event recorder null" not in message:
+            raise
+        raise CapturedTimingUnavailable(
+            "captured Event.recorded_time is unavailable: event recorder null (507000)"
+        ) from error
+
+
 def verify_captured_timing_events(torch) -> None:
     """Small startup check, before loading model weights. No profiler needed."""
     value = torch.ones(1, device="npu")
@@ -38,21 +60,57 @@ def verify_captured_timing_events(torch) -> None:
 
     def timestamps():
         if not start.query() or not end.query():
-            raise RuntimeError("SFA captured timing events did not complete after replay")
-        return start.recorded_time(), end.recorded_time()
+            raise CapturedTimingUnavailable("SFA captured timing events did not complete after replay")
+        return _captured_timestamp(start), _captured_timestamp(end)
 
     first = timestamps()
     graph.replay()
     torch.npu.synchronize()
     second = timestamps()
     if not (0 < first[0] <= first[1] < second[0] <= second[1]):
-        raise RuntimeError(
+        raise CapturedTimingUnavailable(
             "SFA diagnostics require timing events refreshed by NPUGraph replay; "
             "this torch_npu/CANN combination returned stale captured timestamps"
         )
     elapsed = start.elapsed_time(end)
     if not math.isfinite(elapsed) or elapsed < 0:
-        raise RuntimeError("SFA captured event timing returned an invalid duration")
+        raise CapturedTimingUnavailable("SFA captured event timing returned an invalid duration")
+
+
+def probe_captured_timing_support(torch) -> dict:
+    """Only a known optional timestamp limitation permits reduced diagnostics.
+
+    Capture/replay/synchronize failures still escape and stop startup. They may
+    indicate a poisoned device context and must never be treated as support
+    detection. No profiler or eager model fallback is started here.
+    """
+    try:
+        verify_captured_timing_events(torch)
+    except CapturedTimingUnavailable as error:
+        return {"status": "unavailable", "reason": str(error), "stages": {}}
+    return {"status": "supported"}
+
+
+def agree_captured_timing_support(torch, group, local: dict) -> dict:
+    """Startup only: all TP ranks either install markers or omit them."""
+    statuses = [local]
+    if group.world_size > 1:
+        statuses = [None] * group.world_size
+        torch.distributed.all_gather_object(statuses, local, group=group.cpu_group)
+    if any(
+        not isinstance(value, dict) or value.get("status") not in ("supported", "unavailable") for value in statuses
+    ):
+        raise RuntimeError("Incomplete captured-timing capability agreement")
+    unavailable = [(rank, value) for rank, value in enumerate(statuses) if value["status"] == "unavailable"]
+    if unavailable:
+        reasons = sorted({value["reason"] for _, value in unavailable})
+        return {
+            "status": "unavailable",
+            "reason": "; ".join(reasons),
+            "unsupported_ranks": [rank for rank, _ in unavailable],
+            "stages": {},
+        }
+    return {"status": "supported"}
 
 
 class GraphPhaseTiming:

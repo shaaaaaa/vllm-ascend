@@ -44,15 +44,24 @@ class SFABenchmarkWorker(NPUWorker):
 
         graph_timing = self.vllm_config.additional_config.get("sfa_benchmark_graph_timing", False)
         if graph_timing:
-            from vllm_ascend.worker.sfa_graph_timing import verify_captured_timing_events
+            from vllm_ascend.worker.sfa_graph_timing import agree_captured_timing_support, probe_captured_timing_support
 
-            # Reject unsupported event semantics before spending time loading
-            # the eight-layer fixture, rather than printing capture-only times.
-            coordinated_check(
-                lambda: verify_captured_timing_events(torch),
+            # A known optional timestamp limitation must not block loading.
+            # Actual capture/replay/device errors still fail all ranks here.
+            support = coordinated_check(
+                lambda: probe_captured_timing_support(torch),
                 group=get_tp_group(),
                 phase="benchmark captured timing event support",
             )
+            self._graph_phase_support = agree_captured_timing_support(torch, get_tp_group(), support)
+            graph_timing = self._graph_phase_support["status"] == "supported"
+            if not graph_timing and get_tp_group().rank_in_group == 0:
+                print(
+                    "[SFA_TIMING] graph_phases UNAVAILABLE: "
+                    + self._graph_phase_support["reason"]
+                    + "; continuing with sampling substages and graph-external timing; no profiler",
+                    flush=True,
+                )
 
         def load(loader, model, model_config):
             deterministic_dummy_load(original, loader, model, model_config)
@@ -126,6 +135,8 @@ class SFABenchmarkWorker(NPUWorker):
                 result["graph_phases"] = graph_timing.report(
                     timing.last_target_events, full=bool(envs.VLLM_ASCEND_SFA_FULL_GRAPH)
                 )
+            elif getattr(self, "_graph_phase_support", {}).get("status") == "unavailable":
+                result["graph_phases"] = dict(self._graph_phase_support)
             return result
         finally:
             timing.close()

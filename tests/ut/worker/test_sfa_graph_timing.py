@@ -193,8 +193,10 @@ def test_hooks_collectives_inside_opaque_op_not_dynamo_visible_public_method(mod
     assert isinstance(impls[0][1]._cross_layer_pre_compute, Mock)
 
 
-@pytest.mark.parametrize("refresh,ready", [(False, True), (True, True), (True, False)])
-def test_startup_smoke_detects_events_that_do_not_refresh_on_replay(module, refresh, ready):
+@pytest.mark.parametrize(
+    "refresh,ready,recorder_null", [(False, True, False), (True, True, False), (True, False, False), (True, True, True)]
+)
+def test_startup_smoke_detects_events_that_do_not_refresh_on_replay(module, refresh, ready, recorder_null):
     state = SimpleNamespace(events=[], stamp=0, replays=0, fenced=False)
 
     class CapturedEvent(Event):
@@ -203,6 +205,9 @@ def test_startup_smoke_detects_events_that_do_not_refresh_on_replay(module, refr
 
         def recorded_time(self):
             assert state.fenced, "Startup timestamps may only be read after a fence"
+            if recorder_null:
+                # Actual server signature: query succeeds, timestamp fails.
+                raise RuntimeError("AclrtEventGetTimestamp error code is 507000; reason=event recorder null")
             return super().recorded_time()
 
     def replay():
@@ -231,9 +236,53 @@ def test_startup_smoke_detects_events_that_do_not_refresh_on_replay(module, refr
             module.verify_captured_timing_events(torch)
         assert state.replays == 1
         return
+    if recorder_null:
+        result = module.probe_captured_timing_support(torch)
+        assert result["status"] == "unavailable"
+        assert result["stages"] == {} and "event recorder null (507000)" in result["reason"]
+        assert state.replays == 1
+        return
     if refresh:
         module.verify_captured_timing_events(torch)
     else:
         with pytest.raises(RuntimeError, match="stale captured timestamps"):
             module.verify_captured_timing_events(torch)
     assert state.replays == 2
+
+
+@pytest.mark.parametrize("message", ["device synchronize failed 507035", "507000 other failure", "HCCL timeout"])
+def test_timestamp_probe_never_swallows_unrelated_runtime_errors(module, monkeypatch, message):
+    error = RuntimeError(message)
+    event = SimpleNamespace(recorded_time=Mock(side_effect=error))
+    monkeypatch.setattr(module, "verify_captured_timing_events", lambda torch: module._captured_timestamp(event))
+    with pytest.raises(RuntimeError) as caught:
+        module.probe_captured_timing_support(None)
+    assert caught.value is error
+
+
+def test_no_recorded_time_api_is_an_explicit_capability_limitation(module, monkeypatch):
+    monkeypatch.setattr(module, "verify_captured_timing_events", lambda torch: module._captured_timestamp(object()))
+    assert module.probe_captured_timing_support(None)["status"] == "unavailable"
+
+
+@pytest.mark.parametrize("unsupported_rank", [None, 0, 7])
+def test_startup_capability_agreement_disables_markers_on_all_ranks(module, unsupported_rank):
+    def gather(destination, local, *, group):
+        assert group == "cpu group"
+        destination[:] = [{"status": "supported"} for _ in range(8)]
+        if unsupported_rank is not None:
+            destination[unsupported_rank] = {"status": "unavailable", "reason": "event recorder null"}
+
+    torch = SimpleNamespace(distributed=SimpleNamespace(all_gather_object=gather))
+    group = SimpleNamespace(world_size=8, cpu_group="cpu group")
+    result = module.agree_captured_timing_support(torch, group, {"status": "supported"})
+    if unsupported_rank is None:
+        assert result == {"status": "supported"}
+    else:
+        assert result["status"] == "unavailable" and result["stages"] == {}
+        assert result["unsupported_ranks"] == [unsupported_rank]
+
+
+def test_tp1_capability_agreement_never_uses_collectives(module):
+    result = module.agree_captured_timing_support(None, SimpleNamespace(world_size=1), {"status": "supported"})
+    assert result == {"status": "supported"}
