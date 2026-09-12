@@ -67,7 +67,8 @@ heuristic is not a minimum context length; live request lengths are unchanged.
 2. The target graph computes each layer's live top-k, plans resident misses,
    copies the selected CPU KV, and performs sparse attention, all in compute
    stream order. No target-layer generator is advanced during replay.
-3. A single model-boundary stream fence protects source leases. Existing save
+3. A completion event protects independently retained source allocations;
+   replay returns without a CPU stream synchronization. Existing save
    callbacks and MTP draft retrieval remain outside the target graph. Prepared
    draft generators start at the first draft layer, not layer zero.
 
@@ -210,14 +211,21 @@ memoizing mutable metadata across steps:
   layers with different metadata or stricter resident requirements get their
   own check. Layer-local KV layout/dtype/configuration checks remain in place.
 
-These changes do not remove the post-replay stream fence. It waits for queued
-device work, including graph-internal reads of CPU KV source pointers, before
-graph-external consumers or request cleanup can invalidate those resources.
-It is a conservative model-boundary CPU wait, not a requirement that every
-same-stream downstream operator must wait on the CPU. Moving the wait requires
-auditing cross-stream consumers and tying source-lease retirement to a replay
-completion event; keeping a Python pointer-table snapshot alive alone does not
-pin the allocator/shared-memory owners of its raw source addresses.
+Replay no longer calls `current_stream().synchronize()`. A changed source batch
+acquires independent `TensorMemoryObj` references once (including rank 0's real
+shared-slab allocations and passive-rank views). Each replay records a completion
+event. On replacement or request finish, the old batch enters a retirement queue;
+nonblocking event queries release completed batches. Unchanged batches neither
+rescan owners/layers nor wait. Tensor-only and proxy/no-op-refcount sources are
+rejected before replay because Python references cannot prevent allocator reuse.
+
+Pointer uploads and replay must remain on the same runner stream. Existing KV
+stores enqueue `store_stream.wait_stream(current_stream)`, so removing the CPU
+fence does not permit stores to overtake graph writes. Sampling/readbacks and
+store publication can still wait for their actual data dependencies. Reset and
+shutdown drain work before releasing leases or closing the allocator. A failed
+submission retains owners until teardown; a non-completing retirement backlog
+is bounded at 64 batches and fails closed, not by freeing in-flight memory.
 
 For **single-node, TP-only, DP1/PP1 `mp` worker processes**, live target decode
 no longer performs the pre-replay TP CPU error all-reduce. Source and metadata
@@ -231,8 +239,7 @@ or error-agreement communication. This is fail-stop requiring engine restart,
 not retry or recovery of the failed forward.
 
 Startup capture, multi-node/multi-DP jobs and other/custom executors retain
-the existing synchronous error agreement. The post-replay source-lease fence
-also remains. This change does not remove model TP collectives or replace
+the existing synchronous error agreement. This change does not remove model TP collectives or replace
 HCCL/native hang detection when no Python preparation error has occurred.
 CPU tests in `test_sfa_fail_stop.py` execute the sibling vLLM RPC loop and
 sentinel-monitor methods with two/eight real child processes, including a
@@ -334,13 +341,12 @@ all eight layers share metadata and resident-state policy, not eight.
 layer-local KV checks. Its inclusive time includes `metadata.shared_check`
 when that layer is the first consumer; do not add those nested times twice.
 
-`root.run` exclusive time is mostly the **existing** post-replay completion
-fence plus bookkeeping/profiler-scope overhead, after subtracting replay
-submission. The single input validation now runs before `root.run`, under
-`target.forward`. A large number here does not by itself
-prove that the fence is wasted overhead: it may be waiting for real device
-work, including work submitted before replay. Compare it with target/root
-stream spans and with staged MTP/readback waits. `engine_minus_worker` is a
+`root.run` exclusive time now covers completion-event recording and bookkeeping,
+not a post-replay CPU completion fence. The single input validation runs before
+`root.run`, under `target.forward`. Older results included a blocking fence here.
+Some wait time may move to real downstream sampling/readback dependencies;
+removing this fence alone does not prove a TPOT gain. Compare target/root
+stream spans and MTP/readback waits. `engine_minus_worker` is a
 signed residual including scheduling, IPC, idle gaps and interval-boundary
 skew, not a precise scheduler measurement or a sum across TP ranks.
 
@@ -349,7 +355,7 @@ per-call mean/standard deviation/max alongside the existing benchmark JSON
 under the printed `profile/sfa-.../` result directory. No large profile is
 created. Diagnostic timings are labelled separately and never enter
 `comparison.json` or its TPOT speedup calculation. Local CPU tests cover the
-gating, nesting, real root replay/fence call order, wrapper restoration and
+gating, nesting, asynchronous root replay call order, wrapper restoration and
 driver orchestration; NPU performance still requires this host run.
 
 With `--profile`, each engine makes one additional request **after its timed

@@ -1188,6 +1188,16 @@ class NPUWorker(WorkerBase):
     def take_draft_token_ids(self) -> DraftTokenIds | None:
         return self.model_runner.take_draft_token_ids()
 
+    def release_sfa_graph_resources(self) -> None:
+        """Drain graph-owned CPU allocations before closing the cache allocator."""
+        graph = getattr(getattr(self, "model_runner", None), "_sfa_full_graph", None)
+        if graph is not None:
+            graph.clear()
+
+    def shutdown(self) -> None:
+        self.release_sfa_graph_resources()
+        super().shutdown()
+
     def check_health(self) -> None:
         self._raise_if_remote_fill_restart_required()
         import subprocess

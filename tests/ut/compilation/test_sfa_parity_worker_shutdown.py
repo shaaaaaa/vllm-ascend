@@ -26,6 +26,9 @@ def cleanup(worker, monkeypatch):
     monkeypatch.setitem(sys.modules, connector.__name__, connector)
     monkeypatch.setitem(sys.modules, ascend.__name__, ascend)
     monkeypatch.setattr(worker.NPUWorker, "shutdown", lambda self: events.append("base"), raising=False)
+    monkeypatch.setattr(
+        worker.NPUWorker, "release_sfa_graph_resources", lambda self: events.append("graph"), raising=False
+    )
     instance = object.__new__(worker.SFAParityWorker)
     instance.rank = 3
     return instance, npu, connector, events
@@ -39,20 +42,20 @@ def test_worker_drains_and_releases_once_before_base_shutdown(cleanup):
     assert instance.parity_release_resources() == identity
     assert instance.parity_release_resources() == identity
     instance.shutdown()
-    assert events == ["sync", "cache", "ascend_groups", "base"]
+    assert events == ["sync", "graph", "cache", "ascend_groups", "base"]
 
 
 def test_worker_shutdown_also_cleans_up_without_prior_success_rpc(cleanup):
     instance, _, _, events = cleanup
     instance.shutdown()
-    assert events == ["sync", "cache", "ascend_groups", "base"]
+    assert events == ["sync", "graph", "cache", "ascend_groups", "base"]
 
 
 def test_uninitialized_npu_is_not_synchronized(cleanup):
     instance, npu, _, events = cleanup
     npu.is_initialized = lambda: False
     instance.shutdown()
-    assert events == ["cache", "ascend_groups", "base"]
+    assert events == ["graph", "cache", "ascend_groups", "base"]
 
 
 def test_cache_failure_still_destroys_ascend_groups_and_calls_base(cleanup):
@@ -65,7 +68,7 @@ def test_cache_failure_still_destroys_ascend_groups_and_calls_base(cleanup):
     connector.ensure_kv_transfer_shutdown = fail
     with pytest.raises(RuntimeError, match="cache shutdown failed"):
         instance.shutdown()
-    assert events == ["sync", "cache", "ascend_groups", "base"]
+    assert events == ["sync", "graph", "cache", "ascend_groups", "base"]
     assert not getattr(instance, "_parity_resources_released", False)
 
 

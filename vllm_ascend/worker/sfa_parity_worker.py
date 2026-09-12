@@ -12,10 +12,10 @@ import importlib
 import inspect
 import json
 import os
-import re
 from pathlib import Path
 from unittest.mock import patch
 
+import regex as re
 import torch
 from vllm.distributed import get_tp_group
 from vllm.forward_context import get_forward_context
@@ -840,6 +840,7 @@ class SFAParityWorker(NPUWorker):
         if not getattr(self, "_parity_resources_released", False):
             if torch.npu.is_initialized():
                 torch.npu.synchronize()
+            self.release_sfa_graph_resources()
             try:
                 ensure_kv_transfer_shutdown()
             finally:

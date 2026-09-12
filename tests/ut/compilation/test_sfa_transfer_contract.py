@@ -15,6 +15,7 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -108,6 +109,17 @@ def contract(monkeypatch):
     extract(path, {"_prepare_sfa_remap_boundary"}, namespace)
     extract(path, {"prepare_full_graph_layer"}, namespace, class_name="AscendSFAImpl")
     namespace["dataclass"] = dataclass
+    namespace["SFASourceLease"] = lambda sources: SimpleNamespace(close=Mock())
+    namespace["MAX_PENDING_SOURCE_RETIREMENTS"] = 64
+    stream = SimpleNamespace()
+    monkeypatch.setattr(
+        torch,
+        "npu",
+        SimpleNamespace(
+            current_stream=lambda: stream, Event=lambda: SimpleNamespace(record=Mock(), query=lambda: True)
+        ),
+        raising=False,
+    )
     extract(root / "vllm_ascend/compilation/sfa_full_graph.py", {"SFASourceBinding", "SFAFullGraph"}, namespace)
     impl_type = type("RealLayerPreparation", (), {"prepare_full_graph_layer": namespace["prepare_full_graph_layer"]})
     return SimpleNamespace(

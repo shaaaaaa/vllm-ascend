@@ -114,6 +114,7 @@ class SFABenchmarkWorker(NPUWorker):
         if not getattr(self, "_benchmark_released", False):
             if torch.npu.is_initialized():
                 torch.npu.synchronize()
+            self.release_sfa_graph_resources()
             try:
                 ensure_kv_transfer_shutdown()
             finally:

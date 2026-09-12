@@ -142,7 +142,7 @@ def test_multi_request_gate_rejected(timing_module):
 
 
 def actual_root_run(events):
-    """Exercise the real replay/validate/fence implementation, without NPU imports."""
+    """Exercise the real asynchronous replay implementation, without NPU imports."""
     path = ROOT / "vllm_ascend/compilation/sfa_full_graph.py"
     tree = ast.parse(path.read_text(encoding="utf-8"))
     cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "SFAFullGraph")
@@ -150,6 +150,7 @@ def actual_root_run(events):
     prepare = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "prepare_run")
     call_type = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "SFAValidatedCall")
     context = SimpleNamespace(staged_sfa_graph_key="key", cudagraph_runtime_mode="full")
+    stream = SimpleNamespace(synchronize=lambda: events.append("fence"))
     namespace = {
         "__name__": __name__,
         "dataclass": dataclass,
@@ -157,7 +158,7 @@ def actual_root_run(events):
         "CUDAGraphMode": SimpleNamespace(NONE="none"),
         "torch": SimpleNamespace(
             profiler=SimpleNamespace(record_function=lambda name: nullcontext()),
-            npu=SimpleNamespace(current_stream=lambda: SimpleNamespace(synchronize=lambda: events.append("fence"))),
+            npu=SimpleNamespace(current_stream=lambda: stream),
         ),
     }
     module = ast.parse("from __future__ import annotations")
@@ -181,6 +182,11 @@ def fake_worker(events, *, full=True):
         validate_inputs=Mock(),
         replay_count=0,
         _generation=0,
+        _submission_failed=False,
+        _stream=None,
+        source_bindings={
+            None: SimpleNamespace(completion=SimpleNamespace(record=lambda stream: events.append("record")))
+        },
     )
     run, prepare = actual_root_run(events)
     graph.run = run.__get__(graph)
@@ -266,7 +272,7 @@ def test_installation_calls_original_code_and_restores_all_handles(timing_module
     assert stages["kv.wait.mtp"]["wall"]["count"] == 3
     assert timing.sampled_tokens == {2: 3}
     if full:
-        assert events == ["replay", "fence"] * 3
+        assert events == ["replay", "record"] * 3
         assert stages["root.replay_submit"]["wall"]["count"] == 3
         assert stages["signature.validate"]["wall"]["count"] == 3
         assert "retrieve.L0" not in stages

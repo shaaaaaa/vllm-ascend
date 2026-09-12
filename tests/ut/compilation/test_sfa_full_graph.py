@@ -36,6 +36,9 @@ def graph_module(monkeypatch):
         monkeypatch.setitem(sys.modules, name, module)
     captures = []
     stream = SimpleNamespace(synchronize=Mock())
+    lifetime = ModuleType("vllm_ascend.compilation.sfa_source_lifetime")
+    lifetime.SFASourceLease = Mock(side_effect=lambda sources: SimpleNamespace(close=Mock()))
+    monkeypatch.setitem(sys.modules, lifetime.__name__, lifetime)
 
     @contextmanager
     def capture(graph, pool):
@@ -50,6 +53,8 @@ def graph_module(monkeypatch):
             NPUGraph=lambda: SimpleNamespace(replay=Mock()),
             graph=capture,
             current_stream=lambda: stream,
+            synchronize=Mock(),
+            Event=lambda: SimpleNamespace(record=Mock(), query=Mock(return_value=True)),
         ),
         raising=False,
     )
@@ -75,7 +80,7 @@ def test_one_replay_without_reentering_target_python(graph_module):
     assert target.call_count == 1
     assert len(captures) == 1
     assert captures[0][0].replay.call_count == 3
-    assert stream.synchronize.call_count == 3
+    stream.synchronize.assert_not_called()
     assert wrapper.replay_count == 3
 
 
@@ -261,7 +266,7 @@ def test_invalid_source_lanes_fail_before_binding(graph_module, sources, request
     lazy.assert_not_called()
 
 
-def test_runner_handoff_checks_inputs_once_per_forward_and_keeps_fence(graph_module, monkeypatch):
+def test_runner_handoff_checks_inputs_once_per_forward_without_fence(graph_module, monkeypatch):
     module, context, captures, stream = graph_module
     graph = module.SFAFullGraph()
     x = torch.ones(2)
@@ -275,7 +280,7 @@ def test_runner_handoff_checks_inputs_once_per_forward_and_keeps_fence(graph_mod
         assert graph.run(Mock(side_effect=AssertionError("target Python")), prepared=prepared) is output
     assert validate.call_count == 20
     assert captures[0][0].replay.call_count == 20
-    assert stream.synchronize.call_count == 20
+    stream.synchronize.assert_not_called()
     with pytest.raises(RuntimeError, match="address or layout"):
         graph.prepare_run(input_ids=x.clone())
     assert captures[0][0].replay.call_count == 20

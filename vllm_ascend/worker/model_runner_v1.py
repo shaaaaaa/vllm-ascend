@@ -900,6 +900,8 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
         torch.npu.synchronize()
 
     def _update_states(self, scheduler_output: SchedulerOutput) -> None:
+        if self._sfa_full_graph is not None:
+            self._sfa_full_graph.release_requests(scheduler_output.finished_req_ids)
         registry = self._resident_state_registry
         if registry is not None:
             registry.release(tuple(scheduler_output.finished_req_ids))

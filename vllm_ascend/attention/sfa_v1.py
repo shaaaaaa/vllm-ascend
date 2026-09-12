@@ -3461,8 +3461,8 @@ class AscendSFAImpl(MLAAttentionImpl):
         self._full_graph_transfer = transfer
         if bind_source:
             transfer.bind_batch(source or (), layer_id)
-        # The root replay is fenced before graph-external saves; do not expose
-        # an event which was only recorded during the startup eager warmup.
+        # Graph-external saves use store_stream.wait_stream(current_stream).
+        # Do not expose an event recorded only during startup eager warmup.
         metadata.reshape_cache_event = None
         # Replaying a root graph skips layer-side address checks. Include every
         # builder-owned device input in the root signature so a new request or
