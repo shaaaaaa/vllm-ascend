@@ -60,6 +60,7 @@ class SFABenchmarkWorker(NPUWorker):
             "staged": bool(envs.VLLM_ASCEND_SFA_STAGED_GRAPH),
             "full": bool(envs.VLLM_ASCEND_SFA_FULL_GRAPH),
             "root_replays": graph.replay_count,
+            "source_binding_updates": graph.source_binding_count,
             "root_sealed": graph.sealed,
             "root_keys": len(graph.entries),
         }

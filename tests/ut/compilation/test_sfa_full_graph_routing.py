@@ -569,7 +569,7 @@ def test_ragged_dispatch_reserves_request_capacity_not_just_token_sum(routing):
     assert reserved == [32]
 
 
-@pytest.mark.parametrize("failure", [None, "source", "signature", "peer"])
+@pytest.mark.parametrize("failure", [None, "source", "binding", "signature", "peer"])
 def test_preparation_and_signatures_are_agreed_before_collective_replay(routing, failure):
     runner, ns, _, modes, _ = routing
     runner.model = Mock()
@@ -578,7 +578,9 @@ def test_preparation_and_signatures_are_agreed_before_collective_replay(routing,
     layer = SimpleNamespace(prepare_full_graph_layer=Mock(return_value={}))
     runner._staged_sfa_impls = [("layer0", layer)]
     runner._run_sfa_full_graph_target = Mock()
-    runner._sfa_full_graph = SimpleNamespace(validate_inputs=Mock(), run=Mock(return_value="output"))
+    runner._sfa_full_graph = SimpleNamespace(
+        bind_sources=Mock(), validate_inputs=Mock(), run=Mock(return_value="output")
+    )
     connector = SimpleNamespace(prepare_sparse_graph_step=Mock(return_value=(None,)))
     context = SimpleNamespace(
         staged_sfa_graph_key="r4q2",
@@ -595,6 +597,8 @@ def test_preparation_and_signatures_are_agreed_before_collective_replay(routing,
     )
     if failure == "source":
         connector.prepare_sparse_graph_step.side_effect = ValueError("missing source")
+    elif failure == "binding":
+        runner._sfa_full_graph.bind_sources.side_effect = ValueError("bad source table")
     elif failure == "signature":
         runner._sfa_full_graph.validate_inputs.side_effect = ValueError("changed address")
 
@@ -603,7 +607,7 @@ def test_preparation_and_signatures_are_agreed_before_collective_replay(routing,
     def agree(failed, *, op, group):
         groups.append(group)
         runner._sfa_full_graph.run.assert_not_called()
-        assert bool(failed.item()) == (failure in ("source", "signature"))
+        assert bool(failed.item()) == (failure in ("source", "binding", "signature"))
         if failure == "peer" and group == "dp":
             failed.fill_(1)
 
@@ -616,4 +620,6 @@ def test_preparation_and_signatures_are_agreed_before_collective_replay(routing,
         assert runner._model_forward(8) == "output"
         runner._sfa_full_graph.validate_inputs.assert_called_once()
         runner._sfa_full_graph.run.assert_called_once()
+        layer.prepare_full_graph_layer.assert_called_once_with("layer0", 140000, bind_source=False)
+        assert runner._sfa_full_graph.bind_sources.call_args.args[:2] == ((None,), ("r1",))
     assert groups == ["tp", "dp"]

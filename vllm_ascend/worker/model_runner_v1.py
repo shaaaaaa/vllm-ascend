@@ -3386,16 +3386,23 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                 local_error = None
                 try:
                     source = ()
+                    request_ids = ()
                     if not context.staged_sfa_graph_dummy_run:
+                        request_ids = tuple(self.input_batch.req_ids[:self.input_batch.num_reqs])
                         source = get_kv_transfer_group().prepare_sparse_graph_step(
                             tuple(name for name, _ in impls),
-                            request_ids=tuple(self.input_batch.req_ids[:self.input_batch.num_reqs]),
+                            request_ids=request_ids,
                             frontiers=tuple(context.staged_sfa_route.frontiers),
                         )
-                    for layer_id, (name, impl) in enumerate(impls):
+                    for name, impl in impls:
                         graph_inputs[name] = impl.prepare_full_graph_layer(
-                            name, self.model_config.max_model_len, source, layer_id
+                            name, self.model_config.max_model_len, bind_source=False
                         )
+                    self._sfa_full_graph.bind_sources(
+                        source,
+                        request_ids,
+                        lambda: tuple(impl._full_graph_transfer for _, impl in impls),
+                    )
                     self._sfa_full_graph.validate_inputs(graph_inputs=graph_inputs, **graph_kwargs)
                 except Exception as exc:
                     local_error = exc

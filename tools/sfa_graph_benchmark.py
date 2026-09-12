@@ -23,7 +23,6 @@ from sfa_full_graph_parity import (
     DEFAULT_MODEL,
     ENGINE_SHUTDOWN_TIMEOUT,
     FIXED_TOKEN,
-    PROMPT_TOKENS,
     child_environment,
     engine_options,
     parse_devices,
@@ -34,6 +33,7 @@ from sfa_full_graph_parity import (
 from sfa_graph_trace import analyse_traces
 
 PROFILE_SKIP_TOKENS = 8
+BENCHMARK_PROMPT_TOKENS = 30000
 
 
 def benchmark_environment(mode: str, devices: str) -> dict[str, str]:
@@ -213,10 +213,20 @@ def run_child(args) -> None:
             sample = generate_request(llm, args, args.warmups + index)
             after = worker_state(llm, args)
             sample["root_replays_per_rank"] = replay_delta(before, after, args.child)
+            sample["source_binding_updates_per_rank"] = [
+                b["source_binding_updates"] - a["source_binding_updates"] for a, b in zip(before, after)
+            ]
             samples.append(sample)
+            binding_note = (
+                f" source_updates(rank0)={sample['source_binding_updates_per_rank'][0]}"
+                f" root_replays(rank0)={sample['root_replays_per_rank'][0]}"
+                if args.child == "full"
+                else ""
+            )
             print(
                 f"[SFA_BENCH] {args.child} {index + 1}/{args.repeats} "
-                f"TPOT={sample['tpot_ms']:.3f} ms/token decode={sample['decode_tokens_per_second']:.2f} token/s",
+                f"TPOT={sample['tpot_ms']:.3f} ms/token decode={sample['decode_tokens_per_second']:.2f} token/s"
+                f"{binding_note}",
                 flush=True,
             )
         report = {
@@ -359,7 +369,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument("--devices", default=DEFAULT_DEVICES)
-    parser.add_argument("--prompt-tokens", type=int, default=PROMPT_TOKENS)
+    parser.add_argument("--prompt-tokens", type=int, default=BENCHMARK_PROMPT_TOKENS)
     parser.add_argument("--output-tokens", type=int, default=512)
     parser.add_argument("--warmups", type=int, default=1)
     parser.add_argument("--repeats", type=int, default=5)

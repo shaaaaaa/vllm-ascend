@@ -3373,9 +3373,19 @@ class AscendSFAImpl(MLAAttentionImpl):
         self._full_graph_transfers = {}
 
     def prepare_full_graph_layer(
-        self, layer_name: str, max_tokens: int, source: Any = None, layer_id: int = 0
+        self,
+        layer_name: str,
+        max_tokens: int,
+        source: Any = None,
+        layer_id: int = 0,
+        *,
+        bind_source: bool = True,
     ) -> dict[str, Any]:
-        """Resolve host metadata and upload source tables before root replay."""
+        """Validate live metadata; optionally bind source tables before replay.
+
+        The runner batches source binding outside this per-layer metadata check,
+        so unchanged requests issue no source-table tensor operations at all.
+        """
         # Optional connector dependency is loaded only for this opt-in path,
         # including memory profiling before the worker connector is registered.
         from lmcache.integration.vllm.utils import lmcache_get_or_create_config
@@ -3419,7 +3429,8 @@ class AscendSFAImpl(MLAAttentionImpl):
             )
             transfers[capacity] = transfer
         self._full_graph_transfer = transfer
-        transfer.bind_batch(source or (), layer_id)
+        if bind_source:
+            transfer.bind_batch(source or (), layer_id)
         # The root replay is fenced before graph-external saves; do not expose
         # an event which was only recorded during the startup eager warmup.
         metadata.reshape_cache_event = None

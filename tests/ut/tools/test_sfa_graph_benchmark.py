@@ -227,6 +227,7 @@ def states(mode="full", count=0):
             "staged": True,
             "full": mode == "full",
             "root_replays": count,
+            "source_binding_updates": count // 5,
             "root_sealed": mode == "full",
             "root_keys": 1,
         }
@@ -305,6 +306,7 @@ def test_child_order_measurement_persistence_profile_and_cleanup(driver, args, m
         if profile:
             saved = json.loads(Path(args.run_dir, "full.json").read_text())
             assert len(saved["samples"]) == 5 and not saved["profiled_measurements"]
+            assert all(s["source_binding_updates_per_rank"] == [1] * 8 for s in saved["samples"])
         return sample()
 
     monkeypatch.setattr(driver, "generate_request", generate)
@@ -472,3 +474,25 @@ def test_actual_sibling_vllm_request_id_contract():
     output = make_output(state, request.external_req_id, [SimpleNamespace(token_ids=[1])], False)
     assert output.request_id == "sfa-benchmark-2"
     assert output.request_id != request.request_id
+
+
+def test_default_long_context_cli_and_options(driver, args, monkeypatch):
+    seen = []
+    monkeypatch.setattr(sys, "argv", ["sfa_graph_benchmark.py"])
+    monkeypatch.setattr(driver, "run_pair", lambda options: seen.append(options))
+    driver.main()
+    assert seen[0].prompt_tokens == 30000 and seen[0].output_tokens == 512
+    args.prompt_tokens = seen[0].prompt_tokens
+    driver.validate_args(args)
+    options = driver.benchmark_options(args)
+    assert options["max_model_len"] == 30544
+    assert options["max_num_batched_tokens"] == 512  # Keep bounded prefill memory.
+    assert len(driver.prompt_ids(args.prompt_tokens, 1)) == 30000
+
+
+def test_short_context_remains_an_explicit_cli_override(driver, monkeypatch):
+    seen = []
+    monkeypatch.setattr(sys, "argv", ["sfa_graph_benchmark.py", "--prompt-tokens", "4351"])
+    monkeypatch.setattr(driver, "run_pair", lambda options: seen.append(options))
+    driver.main()
+    assert seen[0].prompt_tokens == 4351

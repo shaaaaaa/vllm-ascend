@@ -12,6 +12,7 @@ import ast
 import importlib.util
 import logging
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
@@ -106,6 +107,8 @@ def contract(monkeypatch):
     path = root / "vllm_ascend/attention/sfa_v1.py"
     extract(path, {"_prepare_sfa_remap_boundary"}, namespace)
     extract(path, {"prepare_full_graph_layer"}, namespace, class_name="AscendSFAImpl")
+    namespace["dataclass"] = dataclass
+    extract(root / "vllm_ascend/compilation/sfa_full_graph.py", {"SFASourceBinding", "SFAFullGraph"}, namespace)
     impl_type = type("RealLayerPreparation", (), {"prepare_full_graph_layer": namespace["prepare_full_graph_layer"]})
     return SimpleNamespace(
         context=context,
@@ -114,6 +117,7 @@ def contract(monkeypatch):
         allocations=allocations,
         copies=copies,
         transfer_type=transfer_module.SparseGraphTransfer,
+        graph_type=namespace["SFAFullGraph"],
     )
 
 
@@ -237,3 +241,47 @@ def test_real_layer_rejects_incompatible_singleton_transfer(contract, monkeypatc
     impl, _ = make_layer(contract, 1)
     with pytest.raises(TypeError, match="request_capacity"):
         impl.prepare_full_graph_layer("target", 1024)
+
+
+def test_real_transfer_tables_stay_untouched_while_topk_changes(contract):
+    impl, metadata = make_layer(contract, 2)
+    impl.prepare_full_graph_layer("target", 1024, bind_source=False)
+    transfer = impl._full_graph_transfer
+    graph = contract.graph_type()
+    source_a = make_source(contract, 1000, [256, 13])
+    source_b = make_source(contract, 100000, [256, 17])
+    sources = (source_a, source_b)
+    requests = ("a", "b")
+    contract.context.staged_sfa_graph_dummy_run = False
+    assert graph.bind_sources(sources, requests, lambda: (transfer,))
+    versions = (transfer.ptrs._version, transfer.valid_tokens._version)
+    addresses = (transfer.ptrs.data_ptr(), transfer.valid_tokens.data_ptr())
+
+    def must_not_visit_layers():
+        pytest.fail("unchanged sources must not enumerate any transfers")
+
+    for step in range(32):
+        # Execute actual SFA metadata preparation too: it must no longer bind
+        # independently of the runner's request-level source cache.
+        impl.prepare_full_graph_layer("target", 1024, bind_source=False)
+        assert not graph.bind_sources(sources, requests, must_not_visit_layers)
+        selected = torch.tensor([[step, 268, 269, -1], [step + 1, 272, 273, -1]])
+        transfer.load(selected, torch.tensor([4, 4]), torch.arange(8).reshape(2, 4))
+        assert contract.copies[-1].selected[:, 0].tolist() == [step, 1024 + step + 1]
+        assert contract.copies[-1].slots[:, 2:].eq(-1).all()
+        assert versions == (transfer.ptrs._version, transfer.valid_tokens._version)
+
+    # Growth changes the tail's PE offset; equal-length replacement/restore and
+    # lane removal/reorder must also update the real tables, without recapture.
+    grown = make_source(contract, 200000, [256, 256, 1])
+    assert graph.bind_sources((grown, source_b), requests, lambda: (transfer,))
+    assert transfer.ptrs[1, 2].item() == 202000 + 512 * 4
+    replacement = make_source(contract, 300000, [256, 256, 1])
+    assert graph.bind_sources((replacement, source_b), requests, lambda: (transfer,))
+    assert transfer.ptrs[0, 0].item() == 300000
+    assert graph.bind_sources((source_b, None), ("b", "padding"), lambda: (transfer,))
+    assert transfer.valid_tokens[:, 0].tolist() == [273, 0]
+    assert not transfer.ptrs[:, transfer.capacity :].any()
+    assert graph.bind_sources((), (), lambda: (transfer,))
+    assert not transfer.ptrs.any() and not transfer.valid_tokens.any()
+    assert addresses == (transfer.ptrs.data_ptr(), transfer.valid_tokens.data_ptr())

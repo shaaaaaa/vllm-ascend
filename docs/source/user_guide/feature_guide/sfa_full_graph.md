@@ -148,7 +148,7 @@ No HTTP server or client is needed. The four matching repositories and their
 existing native extensions must already be installed. This Python-only tool
 does not require a new native build. Defaults are the local
 `/workspace/models/GLM-5.1-w4a8` configuration, **TP8/DP1, eight target layers,
-MTP1, dummy weights, 4351 input tokens and 512 output tokens**. It preserves the
+MTP1, dummy weights, 30000 input tokens and 512 output tokens**. It preserves the
 parity fixture's MTP quantization remapping and deterministic integer weight
 initialization, but does **not** install parity hooks, tensor snapshots,
 checkpoint save/restore, per-layer fences or replacement sampling. EP,
@@ -165,6 +165,10 @@ single-request generations, with identical prompts/seeds across modes and
 distinct prefixes between requests. EOS is ignored to fix the output length.
 Prefill executes normally in each engine, but is excluded from decode timing.
 This is a performance experiment, **not** the one-prefill numerical comparison.
+The 30000-token length is the **input context**, not 30000 generated tokens.
+Prefill remains chunked at 512 tokens to bound temporary memory. Use
+`--prompt-tokens 4351` to repeat the earlier short-context workload; do not
+attribute differences between 4351-token and 30000-token runs to this patch.
 
 TPOT is measured at the offline engine's output boundary: elapsed time from
 the first committed-token emission to the last, divided by the number of
@@ -173,6 +177,28 @@ scheduling, IPC, MTP, sampling and cache work, not just target graph execution.
 Startup, warmup, prefill and the separate profiler request are not timed as
 decode. Worker state/synchronization RPCs run only outside timed requests.
 There is no per-layer or per-step benchmark worker instrumentation.
+
+Full-graph source binding now compares ordered request IDs and immutable
+`PreparedSparseSource` snapshot identities **before** enumerating transfers.
+Unchanged sources skip every layer's `bind_batch`: no source-table clearing,
+chunk-count uploads, PE-pointer arithmetic or pointer copies. Newly published
+windows, source replacement/restore, changed request lanes and empty batches
+rebind; source references are retained to prevent identity reuse. Graph keys
+sharing request capacity share a last-binding cache, reset with startup capture.
+This does not freeze top-k, suppress actual graph-internal KV loads, or bypass
+per-step attention metadata/address validation. Those metadata checks still
+visit layers; this optimization removes the **source rebinding** loop and its
+device work, not every graph-external Python loop.
+
+The pre-replay TP/DP CPU error agreement and post-replay source-lease fence are
+unchanged. A worker exception is not guaranteed to immediately kill all peers;
+removing agreement can strand another rank in a captured collective.
+`full.json` records `source_binding_updates_per_rank` beside
+`root_replays_per_rank`, sampled only before/after each request. The timing line
+also shows rank 0's counts. Long steady requests should have many more replays
+than source updates; frequent updates require investigating source publication,
+not assuming the cache is effective. These counters cover the whole request,
+not just the interval between first and last token emissions.
 
 `[SFA_BENCH]` prints mean/median/standard deviation of request TPOT and:
 
