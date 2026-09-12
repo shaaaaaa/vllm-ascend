@@ -99,7 +99,12 @@ def scheduler_type(request):
                 node.body = [
                     n
                     for n in node.body
-                    if getattr(n, "name", None) in {"has_requests", "_preempt_request", "reset_prefix_cache"}
+                    if getattr(n, "name", None)
+                    in {"has_requests", "_preempt_request", "reset_prefix_cache", "_update_waiting_for_remote_kv"}
+                    or (isinstance(n, ast.Assign) and any(
+                        isinstance(t, ast.Name) and t.id == "supports_checkpoint_restore_retry"
+                        for t in n.targets
+                    ))
                 ] or [ast.Pass()]
                 nodes.append(node)
     prefix = ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0)
@@ -113,6 +118,8 @@ def scheduler_type(request):
     cls = ns[request.param]
     assert cls.has_requests is ns["RecomputeScheduler"].has_requests
     assert cls._preempt_request is ns["RecomputeScheduler"]._preempt_request
+    assert cls._update_waiting_for_remote_kv is ns["RecomputeScheduler"]._update_waiting_for_remote_kv
+    assert cls.supports_checkpoint_restore_retry is True
     return cls
 
 

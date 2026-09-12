@@ -119,6 +119,7 @@ class RecomputeSchedulerOutput(SchedulerOutput):
 
 class RecomputeScheduler(Scheduler):
     running: list[Request]
+    supports_checkpoint_restore_retry = True
 
     def __init__(self, *args, **kwargs):
         register_ascend_mla_spec_in_manager()
@@ -155,6 +156,22 @@ class RecomputeScheduler(Scheduler):
         assert request.status == RequestStatus.RUNNING, "Only running requests can be preempted"
         request.kv_resume_checkpoint = None
         super()._preempt_request(request, timestamp)
+
+    def _update_waiting_for_remote_kv(self, request: Request) -> None:
+        """Retry an expected checkpoint miss after all-worker receive completion."""
+        retry = request.__dict__.pop("kv_resume_checkpoint_retry", None)
+        if retry is None:
+            return super()._update_waiting_for_remote_kv(request)
+        if retry[0] != request.num_preemptions:
+            raise RuntimeError("Stale checkpoint retry reached scheduler promotion")
+        self.failed_recving_kv_req_ids.add(request.request_id)
+        request.num_computed_tokens = 0
+        request.num_cached_tokens = 0
+        request.num_external_computed_tokens = 0
+        request.bootstrap_sample_pending = False
+        request.bootstrap_final_hidden = None
+        super()._update_waiting_for_remote_kv(request)
+        request.dsa_compact_allocated = False
 
     def add_request(self, request: Request) -> None:
         existing = self.requests.get(request.request_id)
