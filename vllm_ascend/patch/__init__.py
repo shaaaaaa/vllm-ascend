@@ -312,12 +312,17 @@
 #    How：
 #       - add npu_top_k_top_p to 'apply_sampling_constraints' func
 #       - add custom triton kernel to `expand_batch_to_tokens` and `rejection_sample`
+#       - replace MinTokensLogitsProcessor.apply_with_spec_decode's pageable
+#         index uploads with immutable cached pinned/NPU indices, avoiding
+#         implicit stream synchronization without changing stop-token masking.
 #    Related PR (if no, explain why):
 #       Let vLLM support triton ops dispatch.
 #    Future Plan:
 #       1. make these functions as class func of RejectionSampler, create AscendRejectionSampler
 #           to override them, then delete the patch file `worker/patch_rejection_sampler.py`.
 #       2. make these functions as costom op, then remove AscendRejectionSampler
+#       3. upstream safe asynchronous spec-decode min_tokens index preparation,
+#          then remove the MinTokensLogitsProcessor method patch.
 #
 # ** 6a. File: worker/patch_logprobs.py**
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

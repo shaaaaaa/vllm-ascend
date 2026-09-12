@@ -408,6 +408,25 @@ values or forcing data readiness. `target.compute_logits` isolates logits work;
 `target.before_replay` uses existing events to show the current-stream interval
 between target entry and root submission, including preparation gaps.
 
+`sampling.min_tokens.layout`, `allocate`, `fill`, `h2d` and `mask` further
+separate the speculative stop-token processor under `sampling.logits_processors`.
+The benchmark retains `min_tokens=output_tokens`: stop-token masking and sampling
+semantics are unchanged. In both staged and full modes, this processor now caches
+the actual mask's immutable pinned-host/NPU index buffers, uploading both index
+vectors together only when the mask or stream/device changes. A growing output
+history alone does not invalidate an unchanged mask. Cache hits have `layout`
+and `mask` rows but no `h2d` call; request/batch changes, draft-length changes and
+the min-token boundary can require a new mask. A changed mask gets a new pinned
+allocation, never an in-place overwrite of an in-flight DMA source. The pinned
+allocator defers recycling old sources; no per-step synchronization or readiness
+query is added. Only the most recent mask is retained by the processor.
+
+This is also enabled without `--diagnose`; timing is not. The optimization avoids
+torch_npu's synchronous fallback for ordinary NumPy-backed host memory even when
+the copy specifies `non_blocking=True`. A reduction in the processor's host wait
+is not by itself a TPOT gain: pending target work can instead be waited on at a
+later dependency. Compare the whole request and downstream sampling/MTP timings.
+
 Useful comparisons are `source.prepare`, `source.bind`, `metadata.L0` through
 `metadata.L7`, `signature.validate`, `target.forward`, `root.replay_submit`,
 `mtp.propose`, `sampling`, and `bookkeeping`. Staged retrieval has one
