@@ -143,6 +143,19 @@ class RecomputeScheduler(Scheduler):
             or "qwen3_5" in self.vllm_config.model_config.hf_text_config.model_type
         )
 
+    def has_requests(self) -> bool:
+        """Dispatch idle checkpoint releases without querying active decode."""
+        if self.has_unfinished_requests() or self.has_finished_requests():
+            return True
+        pending = getattr(self.connector, "has_pending_control", None)
+        return bool(pending and pending())
+
+    def _preempt_request(self, request: Request, timestamp: float) -> None:
+        """Invalidate the lazy checkpoint proof before releasing source blocks."""
+        assert request.status == RequestStatus.RUNNING, "Only running requests can be preempted"
+        request.kv_resume_checkpoint = None
+        super()._preempt_request(request, timestamp)
+
     def add_request(self, request: Request) -> None:
         existing = self.requests.get(request.request_id)
         if existing is not None:
