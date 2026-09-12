@@ -229,6 +229,22 @@ device/runtime correlations manually; the checker never equates unrelated
 threads just because their timestamps overlap. Missing/duplicate rank traces
 also fail. Existing performance JSON is retained if subsequent profiling fails.
 
+If the CPU trace check fails after export, **do not rerun the model**. Recheck
+the latest profiled run using its existing `trace_view.json` files:
+
+```bash
+python tools/sfa_graph_trace.py --latest profile 2>&1 | tee -a log.log
+```
+
+To select an older run, replace `--latest profile` with
+`--run-dir profile/sfa-...`. The default is eight ranks; use `--ranks N` for a
+different TP size. This command does not import vLLM/torch_npu, capture, or
+re-export anything. It only regenerates `*-trace-check.json`; original trace
+and performance files remain unchanged. The parser accepts numeric strings
+and JSON numbers for timestamps/durations, preserves decimal boundary
+precision, and reports malformed timing as `UNVERIFIED`, never silently
+drops it to claim success.
+
 ## Eight-layer numerical parity (one host, eight NPUs)
 
 To check data rather than generated text, run from **vllm-ascend**:
