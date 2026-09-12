@@ -7,6 +7,7 @@ import importlib.util
 import sys
 import threading
 from contextlib import nullcontext
+from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock
@@ -146,8 +147,13 @@ def actual_root_run(events):
     tree = ast.parse(path.read_text(encoding="utf-8"))
     cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "SFAFullGraph")
     run = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "run")
+    prepare = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "prepare_run")
+    call_type = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "SFAValidatedCall")
+    context = SimpleNamespace(staged_sfa_graph_key="key", cudagraph_runtime_mode="full")
     namespace = {
-        "get_forward_context": lambda: SimpleNamespace(staged_sfa_graph_key="key", cudagraph_runtime_mode="full"),
+        "__name__": __name__,
+        "dataclass": dataclass,
+        "get_forward_context": lambda: context,
         "CUDAGraphMode": SimpleNamespace(NONE="none"),
         "torch": SimpleNamespace(
             profiler=SimpleNamespace(record_function=lambda name: nullcontext()),
@@ -155,9 +161,9 @@ def actual_root_run(events):
         ),
     }
     module = ast.parse("from __future__ import annotations")
-    module.body.append(run)
+    module.body.extend([call_type, prepare, run])
     exec(compile(ast.fix_missing_locations(module), str(path), "exec"), namespace)
-    return namespace["run"]
+    return namespace["run"], namespace["prepare_run"]
 
 
 def fake_worker(events, *, full=True):
@@ -174,13 +180,18 @@ def fake_worker(events, *, full=True):
         bind_sources=Mock(),
         validate_inputs=Mock(),
         replay_count=0,
+        _generation=0,
     )
-    graph.run = actual_root_run(events).__get__(graph)
+    run, prepare = actual_root_run(events)
+    graph.run = run.__get__(graph)
+    graph.prepare_run = prepare.__get__(graph)
     impls = tuple(
         (
             f"layer.{i}",
             SimpleNamespace(
-                prepare_full_graph_layer=Mock(), cross_layer_lmcache_retrieve=lambda: connector.wait_for_layer_load()
+                prepare_full_graph_layer=Mock(),
+                cross_layer_lmcache_retrieve=lambda: connector.wait_for_layer_load(),
+                _cross_layer_metadata_ineligible_reason=Mock(),
             ),
         )
         for i in range(8)
@@ -207,8 +218,8 @@ def fake_worker(events, *, full=True):
             for _, impl in impls:
                 impl.prepare_full_graph_layer()
             graph.bind_sources()
-            graph.validate_inputs()
-            return graph.run(None)
+            prepared = graph.prepare_run()
+            return graph.run(None, prepared=prepared)
         for _, impl in impls:
             impl.cross_layer_lmcache_retrieve()
         return "hidden"
@@ -257,7 +268,7 @@ def test_installation_calls_original_code_and_restores_all_handles(timing_module
     if full:
         assert events == ["replay", "fence"] * 3
         assert stages["root.replay_submit"]["wall"]["count"] == 3
-        assert stages["signature.validate"]["wall"]["count"] == 6
+        assert stages["signature.validate"]["wall"]["count"] == 3
         assert "retrieve.L0" not in stages
         assert all(stages[f"metadata.L{i}"]["wall"]["count"] == 3 for i in range(8))
     else:

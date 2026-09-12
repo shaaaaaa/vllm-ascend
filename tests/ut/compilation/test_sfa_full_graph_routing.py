@@ -581,9 +581,7 @@ def test_preparation_and_signatures_are_agreed_before_collective_replay(routing,
     layer = SimpleNamespace(prepare_full_graph_layer=Mock(return_value={}))
     runner._staged_sfa_impls = [("layer0", layer)]
     runner._run_sfa_full_graph_target = Mock()
-    runner._sfa_full_graph = SimpleNamespace(
-        bind_sources=Mock(), validate_inputs=Mock(), run=Mock(return_value="output")
-    )
+    runner._sfa_full_graph = SimpleNamespace(bind_sources=Mock(), prepare_run=Mock(), run=Mock(return_value="output"))
     connector = SimpleNamespace(prepare_sparse_graph_step=Mock(return_value=(None,)))
     context = SimpleNamespace(
         staged_sfa_graph_key="r4q2",
@@ -603,7 +601,7 @@ def test_preparation_and_signatures_are_agreed_before_collective_replay(routing,
     elif failure == "binding":
         runner._sfa_full_graph.bind_sources.side_effect = ValueError("bad source table")
     elif failure == "signature":
-        runner._sfa_full_graph.validate_inputs.side_effect = ValueError("changed address")
+        runner._sfa_full_graph.prepare_run.side_effect = ValueError("changed address")
 
     groups = []
 
@@ -621,9 +619,12 @@ def test_preparation_and_signatures_are_agreed_before_collective_replay(routing,
         runner._sfa_full_graph.run.assert_not_called()
     else:
         assert runner._model_forward(8) == "output"
-        runner._sfa_full_graph.validate_inputs.assert_called_once()
+        runner._sfa_full_graph.prepare_run.assert_called_once()
         runner._sfa_full_graph.run.assert_called_once()
-        layer.prepare_full_graph_layer.assert_called_once_with("layer0", 140000, bind_source=False)
+        layer.prepare_full_graph_layer.assert_called_once_with("layer0", 140000, bind_source=False, metadata_checks={})
+        assert runner._sfa_full_graph.run.call_args.kwargs == {
+            "prepared": runner._sfa_full_graph.prepare_run.return_value
+        }
         assert runner._sfa_full_graph.bind_sources.call_args.args[:2] == ((None,), ("r1",))
     assert groups == ["tp", "dp"]
 
@@ -640,9 +641,7 @@ def test_local_supervised_decode_has_no_per_step_error_collective(routing, failu
     layer = SimpleNamespace(prepare_full_graph_layer=Mock(return_value={}))
     runner._staged_sfa_impls = [("layer0", layer)]
     runner._run_sfa_full_graph_target = Mock()
-    runner._sfa_full_graph = SimpleNamespace(
-        bind_sources=Mock(), validate_inputs=Mock(), run=Mock(return_value="output")
-    )
+    runner._sfa_full_graph = SimpleNamespace(bind_sources=Mock(), prepare_run=Mock(), run=Mock(return_value="output"))
     connector = SimpleNamespace(prepare_sparse_graph_step=Mock(return_value=(None,)))
     context = SimpleNamespace(
         staged_sfa_graph_key="r1q2",
@@ -671,7 +670,7 @@ def test_local_supervised_decode_has_no_per_step_error_collective(routing, failu
         target = {
             "source": connector.prepare_sparse_graph_step,
             "binding": runner._sfa_full_graph.bind_sources,
-            "signature": runner._sfa_full_graph.validate_inputs,
+            "signature": runner._sfa_full_graph.prepare_run,
         }[failure]
         target.side_effect = original
         with pytest.raises(SystemExit) as error:
@@ -684,6 +683,9 @@ def test_local_supervised_decode_has_no_per_step_error_collective(routing, failu
         for _ in range(300):
             assert runner._model_forward(2) == "output"
         assert runner._sfa_full_graph.run.call_count == 300
+        assert runner._sfa_full_graph.prepare_run.call_count == 300
+        memos = [c.kwargs["metadata_checks"] for c in layer.prepare_full_graph_layer.call_args_list]
+        assert len({id(memo) for memo in memos}) == 300
         ns["exit_failed_sfa_worker"].assert_not_called()
     forbidden.assert_not_called()
 
@@ -701,7 +703,7 @@ def test_local_startup_capture_retains_error_agreement(routing, failed):
     runner._run_sfa_full_graph_target = Mock()
     runner._sfa_full_graph = SimpleNamespace(
         bind_sources=Mock(side_effect=ValueError("bad startup binding") if failed else None),
-        validate_inputs=Mock(),
+        prepare_run=Mock(),
         run=Mock(return_value="capture"),
     )
     context = SimpleNamespace(

@@ -229,6 +229,8 @@ def diagnose_request(llm, args, ordinal: int) -> dict:
         if replays != (steps if args.child == "full" else 0):
             raise RuntimeError(f"Decode timing root coverage mismatch on rank {worker['rank']}")
         stages = worker["stages"]
+        if args.child == "full" and stages.get("signature.validate", {}).get("wall", {}).get("count", 0) != steps:
+            raise RuntimeError(f"Expected one input validation per target forward on rank {worker['rank']}")
         if args.child == "full" and stages.get("root.replay_submit", {}).get("wall", {}).get("count", 0) != steps:
             raise RuntimeError(f"Root replay timing hook was not reached on rank {worker['rank']}")
         for index in range(8):

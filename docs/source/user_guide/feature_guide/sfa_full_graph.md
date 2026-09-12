@@ -194,6 +194,31 @@ per-step attention metadata/address validation. Those metadata checks still
 visit layers; this optimization removes the **source rebinding** loop and its
 device work, not every graph-external Python loop.
 
+Full-graph validation now removes duplication **within a forward**, without
+memoizing mutable metadata across steps:
+
+- Input address/layout validation runs once, before the existing error
+  agreement/fail-stop boundary. `prepare_run()` hands `run()` a single-use
+  validated call containing the actual model kwargs. Another context, graph
+  key, owner, reset generation or entry cannot reuse it; overriding its inputs
+  or replaying it twice is rejected. The caller must not mutate input layouts
+  between these adjacent preparation and launch phases.
+- The signature walk inspects each identical Tensor object once per call.
+  Distinct views are checked independently, even if their pointers match.
+- Shared attention-metadata eligibility is checked once per implementation
+  type, metadata object, graph key and resident-state policy. A fresh memo is created every forward;
+  layers with different metadata or stricter resident requirements get their
+  own check. Layer-local KV layout/dtype/configuration checks remain in place.
+
+These changes do not remove the post-replay stream fence. It waits for queued
+device work, including graph-internal reads of CPU KV source pointers, before
+graph-external consumers or request cleanup can invalidate those resources.
+It is a conservative model-boundary CPU wait, not a requirement that every
+same-stream downstream operator must wait on the CPU. Moving the wait requires
+auditing cross-stream consumers and tying source-lease retirement to a replay
+completion event; keeping a Python pointer-table snapshot alive alone does not
+pin the allocator/shared-memory owners of its raw source addresses.
+
 For **single-node, TP-only, DP1/PP1 `mp` worker processes**, live target decode
 no longer performs the pre-replay TP CPU error all-reduce. Source and metadata
 validation still run locally. A preparation failure logs the original traceback
@@ -301,12 +326,18 @@ Useful comparisons are `source.prepare`, `source.bind`, `metadata.L0` through
 `mtp.propose`, `sampling`, and `bookkeeping`. Staged retrieval has one
 `retrieve.L*` row per target layer, with KV waits distinguished from MTP waits.
 Full mode should not execute these Python retrieval callbacks in target
-replay. `signature.validate` currently runs twice per full target forward;
-the timings deliberately include both calls.
+replay. `signature.validate` must now run exactly once per full target forward;
+the diagnostic rejects repeated or missing calls. `metadata.shared_check`
+counts the actual shared eligibility checks: normally one per forward when
+all eight layers share metadata and resident-state policy, not eight.
+`metadata.L*` still measures each layer's preparation, including its necessary
+layer-local KV checks. Its inclusive time includes `metadata.shared_check`
+when that layer is the first consumer; do not add those nested times twice.
 
 `root.run` exclusive time is mostly the **existing** post-replay completion
-fence plus bookkeeping/profiler-scope overhead, after subtracting signature
-validation and replay submission. A large number here does not by itself
+fence plus bookkeeping/profiler-scope overhead, after subtracting replay
+submission. The single input validation now runs before `root.run`, under
+`target.forward`. A large number here does not by itself
 prove that the fence is wasted overhead: it may be waiting for real device
 work, including work submitted before replay. Compare it with target/root
 stream spans and with staged MTP/readback waits. `engine_minus_worker` is a

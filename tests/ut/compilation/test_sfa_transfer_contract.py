@@ -157,7 +157,7 @@ def make_layer(contract, request_capacity):
     impl._staged_sfa_bridge_buffers = (torch.zeros(request_capacity * 2, 1),)
     # Graph routing/layout eligibility is covered separately; this test starts
     # from validated metadata and checks the cross-repo allocation/binding edge.
-    impl._cross_layer_ineligible_reason = lambda *args: None
+    impl._cross_layer_ineligible_reason = lambda *args, **kwargs: None
     contract.context.staged_sfa_graph_key = SimpleNamespace(
         request_capacity=request_capacity, token_capacity=request_capacity * 2
     )

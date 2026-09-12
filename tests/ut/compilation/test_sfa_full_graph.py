@@ -259,3 +259,125 @@ def test_invalid_source_lanes_fail_before_binding(graph_module, sources, request
     with pytest.raises(ValueError, match="source lanes"):
         module.SFAFullGraph().bind_sources(sources, requests, lazy)
     lazy.assert_not_called()
+
+
+def test_runner_handoff_checks_inputs_once_per_forward_and_keeps_fence(graph_module, monkeypatch):
+    module, context, captures, stream = graph_module
+    graph = module.SFAFullGraph()
+    x = torch.ones(2)
+    output = graph.run(lambda **kw: x, input_ids=x)
+    graph.seal(("q2",))
+    context.staged_sfa_graph_dummy_run = False
+    validate = Mock(wraps=graph.validate_inputs)
+    monkeypatch.setattr(graph, "validate_inputs", validate)
+    for _ in range(20):
+        prepared = graph.prepare_run(input_ids=x)
+        assert graph.run(Mock(side_effect=AssertionError("target Python")), prepared=prepared) is output
+    assert validate.call_count == 20
+    assert captures[0][0].replay.call_count == 20
+    assert stream.synchronize.call_count == 20
+    with pytest.raises(RuntimeError, match="address or layout"):
+        graph.prepare_run(input_ids=x.clone())
+    assert captures[0][0].replay.call_count == 20
+
+
+@pytest.mark.parametrize(
+    "change", ["consume", "owner", "clear", "key", "context", "entry", "kwargs", "eager", "boolean"]
+)
+def test_prepared_call_cannot_skip_checks_on_other_calls(graph_module, monkeypatch, change):
+    module, context, captures, _ = graph_module
+    graph = module.SFAFullGraph()
+    x = torch.ones(2)
+    graph.run(lambda **kw: x, input_ids=x)
+    context.staged_sfa_graph_dummy_run = False
+    prepared = graph.prepare_run(input_ids=x)
+    kwargs = {"prepared": prepared}
+    if change == "consume":
+        graph.run(Mock(), **kwargs)
+    elif change == "owner":
+        graph = module.SFAFullGraph()
+    elif change == "clear":
+        graph.clear()
+    elif change == "key":
+        context.staged_sfa_graph_key = "other"
+    elif change == "context":
+        monkeypatch.setattr(module, "get_forward_context", lambda: SimpleNamespace(**vars(context)))
+    elif change == "entry":
+        graph.entries["q2"] = module.SFAFullGraphEntry(None, None, prepared.signature)
+    elif change == "kwargs":
+        kwargs["input_ids"] = x.clone()
+    elif change == "boolean":
+        kwargs["prepared"] = True
+    else:
+        context.cudagraph_runtime_mode = "none"
+    before = captures[0][0].replay.call_count
+    with pytest.raises(RuntimeError):
+        graph.run(Mock(), **kwargs)
+    assert captures[0][0].replay.call_count == before
+
+
+def test_capture_uses_prevalidated_kwargs_and_cannot_reuse_after_failure(graph_module):
+    module, context, _, _ = graph_module
+    graph = module.SFAFullGraph()
+    x = torch.ones(1)
+    prepared = graph.prepare_run(input_ids=x)
+    target = Mock(side_effect=ValueError("capture failed"))
+    with pytest.raises(ValueError, match="capture failed"):
+        graph.run(target, prepared=prepared)
+    target.assert_called_once_with(input_ids=x)
+    with pytest.raises(RuntimeError, match="consumed"):
+        graph.run(target, prepared=prepared)
+    assert not context.capturing and not context.sfa_full_graph_active
+
+
+def test_tensor_signature_memo_is_identity_based_and_only_per_call(graph_module, monkeypatch):
+    module, _, _, _ = graph_module
+
+    class Tensor:
+        dtype = "float16"
+        device = "npu"
+        shape = (2, 3)
+
+        def __init__(self, ptr):
+            self.ptr, self.reads = ptr, 0
+
+        def data_ptr(self):
+            self.reads += 1
+            return self.ptr
+
+        def stride(self):
+            return (3, 1)
+
+        def __eq__(self, other):
+            raise AssertionError("Do not compare device tensor values")
+
+    monkeypatch.setattr(module.torch, "Tensor", Tensor)
+    shared, separate_view = Tensor(10), Tensor(10)
+    separate_view.shape = (1, 6)
+    inputs = {str(i): {"seq": shared, "kv": separate_view} for i in range(8)}
+    first = module.tensor_signature(inputs)
+    assert shared.reads == separate_view.reads == 1
+    assert first[0][1][0][1] != first[0][1][1][1]  # Same address, different layout.
+    shared.ptr = 20
+    second = module.tensor_signature(inputs)
+    assert shared.reads == separate_view.reads == 2
+    assert first != second  # No stale identity-only memo across forwards.
+
+
+@pytest.mark.parametrize("mutation", ["shape", "stride", "storage"])
+def test_same_real_tensor_layout_or_storage_mutation_is_rechecked(graph_module, mutation):
+    module, context, _, _ = graph_module
+    graph = module.SFAFullGraph()
+    value = torch.zeros(2, 2)
+    inputs = {str(i): {"shared_metadata": value} for i in range(8)}
+    graph.run(lambda: value, graph_inputs=inputs)
+    graph.seal(("q2",))
+    context.staged_sfa_graph_dummy_run = False
+    if mutation == "shape":
+        value.resize_(4)
+    elif mutation == "stride":
+        value.transpose_(0, 1)
+    else:
+        value.set_(torch.ones(2, 2))
+    with pytest.raises(RuntimeError, match="address or layout"):
+        graph.prepare_run(graph_inputs=inputs)

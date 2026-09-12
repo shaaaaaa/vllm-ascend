@@ -233,6 +233,7 @@ def install_decode_timing(worker, connector, *, prompt_tokens: int, event_factor
             raise RuntimeError(f"Expected eight benchmark target layers, got {len(impls)}")
         for index, (_, impl) in enumerate(impls):
             timing.observe(impl, "prepare_full_graph_layer", f"metadata.L{index}")
+            timing.observe(impl, "_cross_layer_metadata_ineligible_reason", "metadata.shared_check")
             timing.observe(impl, "cross_layer_lmcache_retrieve", f"retrieve.L{index}")
     except BaseException:
         timing.close()

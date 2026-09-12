@@ -15,16 +15,30 @@ from vllm.platforms import current_platform
 
 
 def tensor_signature(value: Any) -> Any:
-    """Describe nested fixed-address inputs, including keyword arguments."""
-    if isinstance(value, torch.Tensor):
-        return (value.data_ptr(), tuple(value.shape), value.stride(), value.dtype, value.device)
-    if isinstance(value, dict):
-        return tuple((k, tensor_signature(v)) for k, v in sorted(value.items()))
-    if isinstance(value, (tuple, list)):
-        return tuple(tensor_signature(v) for v in value)
-    if value is None or isinstance(value, (bool, int, float, str)):
-        return value
-    raise TypeError(f"Unsupported full SFA graph input: {type(value)}")
+    """Describe inputs, inspecting each shared tensor once within THIS call.
+
+    Attention layers often share builder-owned metadata tensors. Never retain
+    this memo across forwards: in-place layout/storage changes must be caught.
+    """
+    tensors: dict[int, tuple[Any, Any]] = {}
+
+    def visit(item: Any) -> Any:
+        if isinstance(item, torch.Tensor):
+            previous = tensors.get(id(item))
+            if previous is not None:
+                return previous[1]
+            signature = (item.data_ptr(), tuple(item.shape), item.stride(), item.dtype, item.device)
+            tensors[id(item)] = (item, signature)
+            return signature
+        if isinstance(item, dict):
+            return tuple((k, visit(v)) for k, v in sorted(item.items()))
+        if isinstance(item, (tuple, list)):
+            return tuple(visit(v) for v in item)
+        if item is None or isinstance(item, (bool, int, float, str)):
+            return item
+        raise TypeError(f"Unsupported full SFA graph input: {type(item)}")
+
+    return visit(value)
 
 
 @dataclass
@@ -32,6 +46,24 @@ class SFAFullGraphEntry:
     graph: Any
     output: Any
     signature: Any
+
+
+@dataclass
+class SFAValidatedCall:
+    """Single-use, same-context handoff from error agreement to graph launch.
+
+    Own the actual model kwargs rather than accepting a boolean 'skip checks'.
+    The runner must not mutate input layouts between preparation and run.
+    """
+
+    owner: Any
+    generation: int
+    context: Any
+    key: Hashable
+    entry: SFAFullGraphEntry | None
+    signature: Any
+    kwargs: dict[str, Any]
+    consumed: bool = False
 
 
 @dataclass(frozen=True)
@@ -65,6 +97,7 @@ class SFAFullGraph:
         self.graph_pool = None
         self.source_bindings: dict[int, SFASourceBinding] = {}
         self.source_binding_count = 0
+        self._generation = 0
 
     def clear(self) -> None:
         """Discard graphs before profiling's temporary KV storage is released."""
@@ -73,6 +106,7 @@ class SFAFullGraph:
         self.replay_count = 0
         self.source_bindings.clear()
         self.source_binding_count = 0
+        self._generation += 1
 
     def bind_sources(
         self,
@@ -123,15 +157,49 @@ class SFAFullGraph:
             raise RuntimeError(f"Full SFA graph inputs changed address or layout: {key}")
         return signature
 
-    def run(self, runnable: Callable[..., Any], *, graph_inputs: Any = None, **kwargs: Any) -> Any:
+    def prepare_run(self, *, graph_inputs: Any = None, **kwargs: Any) -> SFAValidatedCall:
+        """Validate once, before the runner's existing fail-stop/error agreement."""
+        signature = self.validate_inputs(graph_inputs=graph_inputs, **kwargs)
+        context = get_forward_context()
+        key = context.staged_sfa_graph_key
+        return SFAValidatedCall(self, self._generation, context, key, self.entries.get(key), signature, kwargs)
+
+    def run(
+        self,
+        runnable: Callable[..., Any],
+        *,
+        prepared: SFAValidatedCall | None = None,
+        graph_inputs: Any = None,
+        **kwargs: Any,
+    ) -> Any:
         """Capture or replay a whole target forward using stable runner inputs."""
         context = get_forward_context()
         key = context.staged_sfa_graph_key
         if context.cudagraph_runtime_mode == CUDAGraphMode.NONE:
+            if prepared is not None:
+                raise RuntimeError("Cannot use validated graph inputs for eager execution")
             return runnable(**kwargs)
-        signature = self.validate_inputs(graph_inputs=graph_inputs, **kwargs)
+        if prepared is None:
+            prepared = self.prepare_run(graph_inputs=graph_inputs, **kwargs)
+        elif kwargs or graph_inputs is not None:
+            raise RuntimeError("Cannot replace already validated full SFA graph inputs")
+        if (
+            not isinstance(prepared, SFAValidatedCall)
+            or prepared.owner is not self
+            or prepared.generation != self._generation
+            or prepared.context is not context
+            or prepared.key != key
+            or prepared.consumed
+            or self.entries.get(key) is not prepared.entry
+        ):
+            raise RuntimeError("Stale, foreign or consumed full SFA graph validation")
+        prepared.consumed = True
+        signature = prepared.signature
+        kwargs = prepared.kwargs
         entry = self.entries.get(key)
         if entry is None:
+            if self.sealed or not context.staged_sfa_graph_dummy_run:
+                raise RuntimeError("Full SFA capture authorization changed after validation")
             validate_cudagraph_capturing_enabled()
             graph = torch.npu.NPUGraph()
             previous_capturing = context.capturing

@@ -505,6 +505,7 @@ def diagnostic_workers(mode="full", steps=3):
     names.extend(f"metadata.L{i}" if mode == "full" else f"retrieve.L{i}" for i in range(8))
     if mode == "full":
         names.append("root.replay_submit")
+        names.append("signature.validate")
     return [
         dict(
             rank=rank,
