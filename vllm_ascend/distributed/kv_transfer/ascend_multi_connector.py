@@ -105,6 +105,14 @@ def _callable_accepts_args(
 
 
 class AscendMultiConnector(MultiConnector, SupportsHMA):
+    def has_pending_control(self) -> bool:
+        """Let idle child cleanup use the ordinary no-forward connector step."""
+        for child in self._connectors:
+            pending = getattr(child, "has_pending_control", None)
+            if pending and pending():
+                return True
+        return False
+
     def prepare_preemption_checkpoint(self, snapshot: tuple) -> None:
         """Notify checkpoint children only when the scheduler selects a victim."""
         for child in self._connectors:
