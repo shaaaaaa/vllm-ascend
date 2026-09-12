@@ -134,6 +134,101 @@ and attention must be in that graph; there must be no target-layer
 and save callbacks outside the target-forward scope are expected. Startup
 logs and CPU unit tests alone do not prove graph capture or output parity.
 
+## Eight-layer performance and MindStudio profile
+
+Use the independent benchmark, **not the numerical-parity driver**, to measure
+the optimization. From vllm-ascend on the existing eight-NPU host:
+
+```bash
+set -o pipefail
+python tools/sfa_graph_benchmark.py --profile 2>&1 | tee log.log
+```
+
+No HTTP server or client is needed. The four matching repositories and their
+existing native extensions must already be installed. This Python-only tool
+does not require a new native build. Defaults are the local
+`/workspace/models/GLM-5.1-w4a8` configuration, **TP8/DP1, eight target layers,
+MTP1, dummy weights, 4351 input tokens and 512 output tokens**. It preserves the
+parity fixture's MTP quantization remapping and deterministic integer weight
+initialization, but does **not** install parity hooks, tensor snapshots,
+checkpoint save/restore, per-layer fences or replacement sampling. EP,
+FlashComm and sequence parallelism remain disabled, as in the parity fixture.
+
+The driver starts and fully closes two engines sequentially:
+
+- `staged`: the original staged retrieve-split path, `SFA_FULL_GRAPH=0`.
+- `full`: the single-target-forward path, `SFA_FULL_GRAPH=1`.
+
+Both retain `SFA_STAGED_GRAPH=1` and PIECEWISE compilation; the baseline is
+**not enforce-eager**. Each engine performs one warmup and five measured,
+single-request generations, with identical prompts/seeds across modes and
+distinct prefixes between requests. EOS is ignored to fix the output length.
+Prefill executes normally in each engine, but is excluded from decode timing.
+This is a performance experiment, **not** the one-prefill numerical comparison.
+
+TPOT is measured at the offline engine's output boundary: elapsed time from
+the first committed-token emission to the last, divided by the number of
+additional committed tokens. This handles MTP multi-token emissions and includes
+scheduling, IPC, MTP, sampling and cache work, not just target graph execution.
+Startup, warmup, prefill and the separate profiler request are not timed as
+decode. Worker state/synchronization RPCs run only outside timed requests.
+There is no per-layer or per-step benchmark worker instrumentation.
+
+`[SFA_BENCH]` prints mean/median/standard deviation of request TPOT and:
+
+```text
+reduction = (staged_mean_TPOT - full_mean_TPOT) / staged_mean_TPOT * 100%
+speedup   = staged_mean_TPOT / full_mean_TPOT
+```
+
+A negative reduction is a slowdown. `tokens_equal=false` is reported explicitly:
+different outputs can change MTP acceptance or MoE routing and confound timing.
+Even matching dummy outputs do not prove numerical correctness. These results
+only describe this truncated dummy workload, not full-depth production speed.
+For a performance-only repeat in reverse order, use:
+
+```bash
+python tools/sfa_graph_benchmark.py --order full,staged 2>&1 | tee log.log
+```
+
+Use repeated runs in both orders to distinguish gains from run-to-run noise,
+thermal state or cache effects; there is no hard-coded performance pass threshold.
+
+With `--profile`, each engine makes one additional request **after its timed
+requests**, starts the profiler after eight committed output tokens (past
+prefill), and finishes after 32 additional output tokens. The control RPC can
+take effect a few steps later; this is not an exact step-count capture. Profiled
+request timings are deliberately discarded. Both engines exit before offline
+trace parsing, which uses at most two analysis processes. The generated path is
+printed as `profile/sfa-.../`; new runs never overwrite earlier traces:
+
+```text
+comparison.json           TPOT comparison, configuration and output-match flag
+staged.json / full.json    individual unprofiled samples and token IDs
+staged/ / full/            rank-specific MindStudio profile directories
+*-trace-check.json         per-rank CPU-scope audit and trace paths
+```
+
+Open the `full/` and `staged/` profiles in MindStudio Insight. In **each rank's
+steady-state decode**, locate `sfa_full_graph::target_replay`:
+
+1. There should be one target ACL model-execute submission per root scope.
+2. Follow its device execution and check that all eight target layers' top-k,
+   KV transfer and attention are covered, without target-layer Python retrieval
+   gaps. Many kernels inside one graph are expected.
+3. Do not count prefill, MTP draft, sampling or cache saves outside the target
+   scope as splits of that target graph.
+
+The tool checks every rank's trace. `ONE_EXECUTE_PER_ROOT` means the recorded
+**CPU scopes** each contain one outermost known ACL execute API; nested API
+aliases are not double-counted. This alone does not prove device-side coverage
+or KV correctness. `SPLIT_DETECTED` fails the trace check. `UNVERIFIED` is **not
+a pass**: for example, a CANN version may place runtime events under remapped
+pid/tid lanes, or omit the known API names. Keep the traces and inspect their
+device/runtime correlations manually; the checker never equates unrelated
+threads just because their timestamps overlap. Missing/duplicate rank traces
+also fail. Existing performance JSON is retained if subsequent profiling fails.
+
 ## Eight-layer numerical parity (one host, eight NPUs)
 
 To check data rather than generated text, run from **vllm-ascend**:
