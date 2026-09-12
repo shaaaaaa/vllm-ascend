@@ -49,6 +49,7 @@ def test_baseline_and_full_only_differ_in_production_switch(driver, monkeypatch)
     monkeypatch.setenv("LMCACHE_CONFIG_FILE", "server.yaml")
     monkeypatch.setenv("ASCEND_LAUNCH_BLOCKING", "1")
     monkeypatch.setenv("VLLM_ASCEND_MTP_DW_DEEP_DIAG", "1")
+    monkeypatch.setenv("PD_SERVING_PERF", "device")
     staged = driver.benchmark_environment("staged", "0,1")
     full = driver.benchmark_environment("full", "0,1")
     assert {k for k in full if full[k] != staged[k]} == {"VLLM_ASCEND_SFA_FULL_GRAPH"}
@@ -56,6 +57,7 @@ def test_baseline_and_full_only_differ_in_production_switch(driver, monkeypatch)
     assert full["VLLM_ASCEND_SFA_FULL_GRAPH"] == "1"
     assert full["VLLM_ASCEND_SFA_STAGED_GRAPH"] == "1"
     assert full["VLLM_ASCEND_MTP_DW_DEEP_DIAG"] == "0"
+    assert full["PD_SERVING_PERF"] == "0"
     assert "LMCACHE_CONFIG_FILE" not in full and "ASCEND_LAUNCH_BLOCKING" not in full
     assert full["LMCACHE_ENABLE_SHARED_CPU_CACHE"] == "false"
     assert full["VLLM_WORKER_MULTIPROC_METHOD"] == "spawn"
@@ -383,7 +385,8 @@ def test_parent_never_continues_after_preflight_or_engine_failure(driver, args, 
     assert launch.call_count == failure
 
 
-def test_worker_uses_only_fixture_loading_not_parity_execution(monkeypatch):
+@pytest.mark.parametrize("diagnose", [False, True])
+def test_worker_uses_only_fixture_loading_not_parity_execution(monkeypatch, diagnose):
     events = []
 
     class Dummy:
@@ -394,6 +397,7 @@ def test_worker_uses_only_fixture_loading_not_parity_execution(monkeypatch):
         def load_model(self):
             Dummy().load_weights(None, None)
             events.append("production load")
+            self.model_runner = object()
 
     class Parity:
         def load_model(self):
@@ -409,11 +413,16 @@ def test_worker_uses_only_fixture_loading_not_parity_execution(monkeypatch):
     modules = {
         "vllm": {},
         "vllm.distributed": {"get_tp_group": lambda: None},
+        "vllm.forward_context": {"get_forward_context": lambda: None},
         "vllm.model_executor.model_loader.dummy_loader": {"DummyModelLoader": Dummy},
         "vllm_ascend": {"envs": SimpleNamespace()},
         "vllm_ascend.attention.sfa_parity": {"coordinated_check": lambda check, **kw: check()},
         "vllm_ascend.worker.sfa_parity_worker": {"SFAParityWorker": Parity, "deterministic_dummy_load": dummy_load},
         "vllm_ascend.worker.worker": {"NPUWorker": NPU},
+        "vllm_ascend.worker.sfa_graph_timing": {
+            "verify_captured_timing_events": lambda torch: events.append("event support check"),
+            "install_graph_phase_timing": lambda *a: (events.append("install capture probes"), "probes")[1],
+        },
     }
     for name, attributes in modules.items():
         stub = ModuleType(name)
@@ -425,14 +434,18 @@ def test_worker_uses_only_fixture_loading_not_parity_execution(monkeypatch):
     spec.loader.exec_module(module)
     worker = module.SFABenchmarkWorker()
     worker.vllm_config = SimpleNamespace(
-        additional_config={"sfa_benchmark": True},
+        additional_config={"sfa_benchmark": True, "sfa_benchmark_graph_timing": diagnose},
         parallel_config=SimpleNamespace(
             tensor_parallel_size=8, data_parallel_size=1, pipeline_parallel_size=1, enable_expert_parallel=False
         ),
     )
     original = Dummy.load_weights
     worker.load_model()
-    assert events == ["quant remap", "original weights", "integer weights", "production load"]
+    expected = ["quant remap"] + (["event support check"] if diagnose else [])
+    expected += ["original weights", "integer weights", "production load"]
+    expected += ["install capture probes"] if diagnose else []
+    assert events == expected
+    assert getattr(worker, "_graph_phase_timing", None) == ("probes" if diagnose else None)
     assert Dummy.load_weights is original
     assert not isinstance(worker, Parity)
     assert set(module.SFABenchmarkWorker.__dict__) >= {"load_model", "benchmark_state", "shutdown"}
@@ -645,7 +658,7 @@ def test_diagnose_cli_never_runs_trace_export_or_analysis(driver, args, monkeypa
     assert launches == ["preflight", "staged", "full"]
 
 
-def test_diagnostics_installed_only_after_all_performance_samples(driver, args, monkeypatch):
+def test_host_diagnostics_after_samples_but_all_diagnose_graphs_are_instrumented(driver, args, monkeypatch):
     args.profile, args.diagnose = False, True
     events = []
     stub = ModuleType("vllm")
@@ -662,6 +675,7 @@ def test_diagnostics_installed_only_after_all_performance_samples(driver, args, 
     def diagnose(*a):
         saved = json.loads(Path(args.run_dir, "full.json").read_text())
         assert len(saved["samples"]) == 5
+        assert saved["instrumented_measurements"] is True
         assert events == ["performance"] * 6
         events.append("diagnose")
         return {"diagnostic_only": True}
@@ -671,6 +685,38 @@ def test_diagnostics_installed_only_after_all_performance_samples(driver, args, 
     driver.run_child(args)
     assert events == ["performance"] * 6 + ["diagnose", "print", "shutdown"]
     assert Path(args.run_dir, "full-timing.json").is_file()
+
+
+def test_only_diagnose_enables_captured_timing_events(driver, args):
+    args.diagnose, args.profile = True, False
+    assert driver.benchmark_options(args)["additional_config"]["sfa_benchmark_graph_timing"] is True
+    args.diagnose = False
+    assert "sfa_benchmark_graph_timing" not in driver.benchmark_options(args)["additional_config"]
+
+
+def test_sampled_stream_times_are_not_divided_by_all_forwards(driver, capsys):
+    workers = diagnostic_workers(steps=511)
+    for worker in workers:
+        worker["stages"]["sampling.bonus_index"] = {"stream_span": {"count": 19, "total_ms": 38}}
+    driver.print_decode_timing(
+        {"mode": "full", "workers": workers, "request": {"decode_ms": 15000, "decode_tokens": 511}}
+    )
+    line = next(line for line in capsys.readouterr().out.splitlines() if "sampling.bonus_index " in line)
+    assert "stream=2.000(2.000) stream_samples=19..19" in line
+
+
+def test_graph_phase_log_is_last_decode_not_mean_and_missing_is_not_zero(driver, capsys):
+    workers = diagnostic_workers()
+    for worker in workers:
+        worker["graph_phases"] = {"status": "complete", "stages": {"L0.pre": {"total_ms": 1.5}}}
+    workers[-1]["graph_phases"] = {"status": "incomplete", "missing": ["L0.pre"], "stages": {}}
+    driver.print_graph_phases("full", workers)
+    output = capsys.readouterr().out
+    assert "LAST_DECODE_ONLY complete_ranks=7/8" in output
+    assert "rank=7 INCOMPLETE" in output
+    assert "graph_last.L0 pre=unobserved" in output
+    assert "graph_last.TP.all_reduce span=unobserved" in output
+    assert "not whole-request averages" in output
 
 
 @pytest.mark.parametrize("mode", ["staged", "full"])

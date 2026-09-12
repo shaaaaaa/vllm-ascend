@@ -184,9 +184,9 @@ decode. Worker state/synchronization RPCs run only outside timed requests.
 Without `--diagnose`, measured requests have no per-layer or per-step benchmark
 instrumentation. With `--diagnose` and the single-request defaults, that sole
 request also supplies the stage statistics; its TPOT is labelled as including
-diagnostic overhead. Explicit multi-request configurations retain separate
-diagnostics after the uninstrumented measurements. Ordinary serving is never
-instrumented by this tool.
+diagnostic overhead. With `--diagnose`, captured timing markers also remain in
+graphs during explicit multi-request measurements; those are instrumented too.
+Ordinary serving is never instrumented by this tool.
 
 Full-graph source binding now compares ordered request IDs and immutable
 `PreparedSparseSource` snapshot identities **before** enumerating transfers.
@@ -265,8 +265,9 @@ speedup   = staged_mean_TPOT / full_mean_TPOT
 ```
 
 For one request, `count=1` and `std=null` (`n/a` in the log): there is no
-between-request variability estimate. Per-stage diagnostic statistics still
-cover all measured decode forwards within that request. With no request
+between-request variability estimate. Host diagnostic statistics still
+cover all measured decode forwards within that request; captured graph events
+describe only its last decode, as labelled in the log. With no request
 warmup, first-request lazy setup may affect the result; this is a quick
 comparison, not evidence of multi-request stability.
 
@@ -298,18 +299,30 @@ each engine runs only **one 512-token generation**, and temporary timing wrapper
 collect statistics during that same request. There is no hidden warmup or
 second diagnostic generation. They are restored afterwards. Both the log and
 `comparison.json` flag that TPOT includes diagnostic overhead; it is not a clean
-performance measurement. There are no changes to the captured graph, KV values,
-sampling or production forward implementation. With explicit `--warmups 1
---repeats 5`, diagnostics instead run once after the ordinary measurements.
+performance measurement. Timing event records are added inside existing opaque
+SFA and TP operations at startup capture; replay has no new per-layer Python
+callbacks or graph splits. KV values and sampling computations are unchanged.
+With explicit `--warmups 1 --repeats 5`, host diagnostics run once after the
+measured requests, but the captured markers remain in all requests. Omit
+`--diagnose` for clean performance measurements.
 
 The worker uses scheduler `num_computed_tokens` and `num_output_tokens` to
 exclude prefill, including a final one-token prefill chunk. It does **not**
 guess decode from query length or arm timing with a mid-request RPC. Start/stop
 RPCs and their synchronization happen outside the diagnostic request. There
-are no new per-layer or per-step synchronization calls. Current-stream timing
-events are recorded only at target-forward, root-replay and MTP boundaries;
-elapsed times are read after the request finishes. Event storage is bounded;
+are no new per-layer or per-step synchronization calls. Coarse current-stream
+events cover target-forward, root-replay, logits and MTP boundaries. Fine host-side
+events for sampling substages and staged retrieval are limited to the first
+four decode forwards and then every 32 forwards. Host wall/CPU statistics still
+cover every decode forward. All event timestamps and elapsed times are read
+after the request finishes. Event storage is bounded;
 `event_drops` warns if an unusually long diagnostic request exceeds the cap.
+
+A tiny startup check, before loading weights, captures and replays timing
+events twice to verify that this torch_npu/CANN version refreshes their
+timestamps. Unsupported or stale event semantics fail explicitly rather than
+reporting startup capture time as live decode time. This check is automatic;
+it does not run an extra model request.
 
 Both modes print compact `[SFA_TIMING]` lines directly to `log.log`. To share
 only the summary, without any large trace:
@@ -327,8 +340,7 @@ tokens at the generation length boundary; this is not an exact acceptance-rate
 counter. Source update/root counters span the diagnostic request; phase timings
 and histograms exclude prefill.
 
-Per-stage lines include `wall`, `self`, `cpu`, `call_max`, and (at coarse
-boundaries) `stream`:
+Per-stage lines include `wall`, `self`, `cpu`, `call_max`, and optional `stream`:
 
 - `wall`: inclusive host elapsed time, normalized by target forwards.
 - `self`: host elapsed time excluding measured child scopes. Use this to avoid
@@ -338,9 +350,46 @@ boundaries) `stream`:
   descheduling; it does not identify a particular kernel.
 - Numbers such as `1.200(1.800)` are the rank mean and the largest rank mean in
   ms/forward. `call_max` is the slowest individual host call in milliseconds.
-- `stream`: NPU current-stream elapsed time, including dependencies and host
+- `stream`: mean NPU current-stream elapsed time per recorded interval, including dependencies and host
   submission gaps. It is **not pure kernel time**, and overlapping intervals
-  must not be summed. With nonzero `event_drops`, it is only partial coverage.
+  must not be summed. `stream_samples` gives the actual event sample count;
+  sampled totals are never divided by all decode forwards. With nonzero
+  `event_drops`, it is only partial coverage.
+
+`graph_last.L0` through `graph_last.L7` split the **last target decode only**:
+
+- `pre`: projections, KV/indexer update, indexer and sparse-index preparation.
+  Nested `indexer` and `select` identify top-k and its mapping/deduplication work.
+- `pre_to_post`: the gap between pre-compute and post-compute, including bridge
+  copies, retrieval and dependencies/host submission gaps.
+- `transfer`: full graph's captured sparse KV transfer. Staged retrieval is
+  outside the graph, so this field is `unobserved`; use `pre_to_post` and the
+  sampled `retrieve.L*` stream intervals for that mode, not a zero estimate.
+- `post`: sparse attention and output projection, including nested `attention`.
+- `after_post`: end of this attention's post-compute to the next attention's
+  pre-compute, exposing FFN/MoE, residual/norm, TP and submission gaps outside
+  SFA. The last layer extends to target-forward completion. This is not an
+  isolated FFN kernel time.
+- `graph_last.TP.*`: captured model collective spans, including dependencies,
+  not the removed CPU error-check collective. Fused/custom paths bypassing the
+  observed group methods are `unobserved`, never claimed to have zero cost.
+
+These graph events are overwritten on replay, so they are **not request-wide
+averages**. Only timestamps enclosed by the last live target-forward boundary
+are accepted; other graph keys, capture-only and MTP timestamps are excluded.
+`complete_ranks=8/8` means all required layer phases and gaps were observed exactly
+once on every rank. `INCOMPLETE` lists missing or duplicate phases; do not treat
+such output as complete localization. Nested phases and TP spans must not be
+added together. No per-layer completion waits are introduced to obtain them.
+
+`sampling.bonus_index`, `bonus_sampler`, `target_index_cast`,
+`logits_processors`, `sampling_constraints`, `rejection_kernel` and optional
+`logprobs` split rejection sampling using its existing scoped recorder. Nested
+`sampling.sampler.*` rows identify sampler processors, sampling and logprob
+gathering. They call the original operations once, without reading tensor
+values or forcing data readiness. `target.compute_logits` isolates logits work;
+`target.before_replay` uses existing events to show the current-stream interval
+between target entry and root submission, including preparation gaps.
 
 Useful comparisons are `source.prepare`, `source.bind`, `metadata.L0` through
 `metadata.L7`, `signature.validate`, `target.forward`, `root.replay_submit`,
@@ -370,10 +419,13 @@ under the printed `profile/sfa-.../` result directory. No large profile is
 created. In single-request diagnostic mode, `comparison.json` contains the same
 request's TPOT with `instrumented_measurements=true`; comparisons mixing an
 instrumented and uninstrumented mode are rejected. In explicit multi-request
-mode, the additional diagnostic request is excluded from performance statistics.
-Local CPU tests cover the
-gating, nesting, asynchronous root replay call order, wrapper restoration and
-driver orchestration; NPU performance still requires this host run.
+mode, the additional host diagnostic request is excluded from the TPOT samples,
+but those samples still include captured marker overhead and are labelled
+instrumented. Local CPU tests cover gating, nesting, asynchronous replay call
+order, stale timestamp rejection, phase coverage, sampled-event normalization,
+wrapper restoration, sampling-forward equivalence against the sibling vLLM
+implementation and driver orchestration. Real captured-event support and NPU
+timings still require this host run.
 
 With `--profile`, each engine makes one additional request **after its timed
 requests**, starts the profiler after eight committed output tokens (past

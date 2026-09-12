@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Eight-layer fixture; optional timing hooks run only after performance samples."""
+"""Eight-layer fixture; optional diagnostics, disabled in clean performance runs."""
 
 import os
 from unittest.mock import patch
@@ -42,11 +42,31 @@ class SFABenchmarkWorker(NPUWorker):
         )
         original = DummyModelLoader.load_weights
 
+        graph_timing = self.vllm_config.additional_config.get("sfa_benchmark_graph_timing", False)
+        if graph_timing:
+            from vllm_ascend.worker.sfa_graph_timing import verify_captured_timing_events
+
+            # Reject unsupported event semantics before spending time loading
+            # the eight-layer fixture, rather than printing capture-only times.
+            coordinated_check(
+                lambda: verify_captured_timing_events(torch),
+                group=get_tp_group(),
+                phase="benchmark captured timing event support",
+            )
+
         def load(loader, model, model_config):
             deterministic_dummy_load(original, loader, model, model_config)
 
         with patch.object(DummyModelLoader, "load_weights", load):
             super().load_model()
+        if graph_timing:
+            from vllm.forward_context import get_forward_context
+
+            from vllm_ascend.worker.sfa_graph_timing import install_graph_phase_timing
+
+            self._graph_phase_timing = install_graph_phase_timing(
+                self.model_runner, torch, get_forward_context, get_tp_group()
+            )
 
     def benchmark_state(self) -> dict:
         """Called between requests, NEVER from a timed forward."""
@@ -101,6 +121,11 @@ class SFABenchmarkWorker(NPUWorker):
             graph = self.model_runner._sfa_full_graph
             result["root_replays"] = graph.replay_count - self._decode_timing_root_start
             result["source_binding_updates"] = graph.source_binding_count - self._decode_timing_source_start
+            graph_timing = getattr(self, "_graph_phase_timing", None)
+            if graph_timing is not None:
+                result["graph_phases"] = graph_timing.report(
+                    timing.last_target_events, full=bool(envs.VLLM_ASCEND_SFA_FULL_GRAPH)
+                )
             return result
         finally:
             timing.close()
@@ -115,6 +140,11 @@ class SFABenchmarkWorker(NPUWorker):
             if torch.npu.is_initialized():
                 torch.npu.synchronize()
             self.release_sfa_graph_resources()
+            graph_timing = getattr(self, "_graph_phase_timing", None)
+            if graph_timing is not None:
+                graph_timing.close()
+                # Staged graphs may still be held by the runner until process
+                # teardown. Retain their event handles even after unpatching.
             try:
                 ensure_kv_transfer_shutdown()
             finally:

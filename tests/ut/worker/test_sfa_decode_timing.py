@@ -7,7 +7,7 @@ import importlib.util
 import sys
 import threading
 from contextlib import nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock
@@ -390,3 +390,201 @@ def test_actual_worker_wrapper_dispatches_to_installed_probe(timing_module):
         assert timing.scopes["target.forward"]["wall"].count == 1
     finally:
         timing.close()
+
+
+def test_target_boundary_events_and_pre_replay_span_are_retained(timing_module):
+    events = []
+
+    def factory():
+        event = SimpleNamespace(record=Mock(), elapsed_time=lambda end: 1)
+        events.append(event)
+        return event
+
+    timing = timing_module.DecodeTiming(factory)
+    timing.active = True
+    for _ in range(2):
+        with timing.scope("target.forward", device=True), timing.scope("root.replay_submit", device=True):
+            pass
+    assert timing.last_target_events == (events[4], events[5])
+    assert timing.pending[-3] == ("target.before_replay", events[4], events[6])
+    assert timing.report()["stages"]["target.before_replay"]["stream_span"]["count"] == 2
+
+
+@pytest.mark.parametrize("step,expected", [(1, True), (4, True), (5, False), (31, False), (32, True), (33, False)])
+def test_sampling_device_event_stride_does_not_change_host_coverage(timing_module, step, expected):
+    timing = timing_module.DecodeTiming()
+    timing.decode_steps = step
+    assert timing.detail_device_sample is expected
+
+
+@pytest.mark.parametrize("failure", [False, True])
+def test_sampling_hooks_use_real_scoped_recorder_and_restore_on_failure(timing_module, monkeypatch, failure):
+    path = ROOT / "vllm_ascend/sample/rejection_diagnostics.py"
+    name = "vllm_ascend.sample.rejection_diagnostics"
+    spec = importlib.util.spec_from_file_location(name, path)
+    recorder = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(recorder)
+    monkeypatch.setitem(sys.modules, name, recorder)
+    sampler = SimpleNamespace(
+        **{
+            method: Mock(side_effect=lambda value: value + 1)
+            for method in ("apply_logits_processors", "sample", "gather_logprobs")
+        }
+    )
+    original_method = sampler.sample
+
+    def sample(value):
+        output = recorder.record_stage("bonus_sampler", sampler.sample, value)
+        if failure:
+            raise ValueError("original sample error")
+        return output
+
+    runner = SimpleNamespace(_sample=sample, sampler=sampler)
+    timing = timing_module.DecodeTiming(event_factory=Mock(side_effect=AssertionError("Unsampled step")))
+    timing.decode_steps = 5  # Host-only sample: no event allocation.
+    timing_module.install_sampling_timing(runner, timing)
+    try:
+        for active in (False, True):
+            timing.active = active
+            if failure:
+                with pytest.raises(ValueError, match="original sample error"):
+                    runner._sample(8)
+            else:
+                assert runner._sample(8) == 9
+            assert not recorder.stage_recorder_active()
+            if not active:
+                assert not timing.scopes
+        assert timing.report()["stages"]["sampling.bonus_sampler"]["wall"]["count"] == 1
+        assert timing.report()["stages"]["sampling.sampler.sample"]["wall"]["count"] == 1
+        assert original_method.call_count == 2  # Never sample twice for a probe.
+    finally:
+        timing.close()
+    assert runner._sample is sample and sampler.sample is original_method
+
+
+def test_worker_reads_graph_events_only_after_request_fence():
+    events = []
+    bounds = object()
+    timing = SimpleNamespace(close=lambda: events.append("restore"), report=lambda: {}, last_target_events=bounds)
+
+    def graph_report(actual_bounds, *, full):
+        assert events == ["restore", "sync"]
+        assert actual_bounds is bounds and full
+        return {"status": "complete"}
+
+    _, stop = benchmark_rpc_methods(
+        {
+            "torch": SimpleNamespace(npu=SimpleNamespace(synchronize=lambda: events.append("sync"))),
+            "envs": SimpleNamespace(VLLM_ASCEND_SFA_FULL_GRAPH=True),
+        }
+    )
+    worker = SimpleNamespace(
+        _decode_timing=timing,
+        _graph_phase_timing=SimpleNamespace(report=graph_report),
+        _decode_timing_root_start=0,
+        _decode_timing_source_start=0,
+        model_runner=SimpleNamespace(_sfa_full_graph=SimpleNamespace(replay_count=3, source_binding_count=1)),
+        benchmark_process_info=lambda: {"rank": 0},
+    )
+    assert stop(worker)["graph_phases"] == {"status": "complete"}
+
+
+@pytest.mark.parametrize("processed", [False, True])
+@pytest.mark.parametrize("logprobs", [None, 1])
+def test_actual_instrumented_rejection_forward_matches_sibling_baseline_on_cpu(processed, logprobs):
+    """Execute both real forward bodies; compare tensors and operation order.
+
+    Kernel shims are shared CPU operations, not a claim of NPU kernel parity.
+    This catches diagnostic-only extra sampling or altered processor inputs.
+    """
+    import torch
+
+    baseline_path = ROOT.parent / "vllm/vllm/v1/sample/rejection_sampler.py"
+    if not baseline_path.is_file():
+        pytest.skip("Requires matching sibling vllm checkout")
+
+    def forward(path, cls, namespace):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        owner = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == cls)
+        body = next(n for n in owner.body if isinstance(n, ast.FunctionDef) and n.name == "forward")
+        body.decorator_list = []
+        module = ast.parse("from __future__ import annotations")
+        module.body.append(body)
+        exec(compile(ast.fix_missing_locations(module), str(path), "exec"), namespace)
+        return namespace["forward"]
+
+    @dataclass
+    class Sampling:
+        max_num_logprobs: int | None
+
+    calls, tensors, stages = [], [], []
+
+    def capture(name, value):
+        calls.append(name)
+        tensors.append(value.detach().clone())
+
+    def bonus(*, logits, sampling_metadata, **kwargs):
+        assert sampling_metadata.max_num_logprobs == -1
+        capture("bonus", logits)
+        return SimpleNamespace(sampled_token_ids=logits.argmax(-1), logprobs_tensors=SimpleNamespace(logprobs=logits))
+
+    def processors(logits, *args):
+        capture("processors", logits)
+        return logits.add_(0.25)
+
+    def constraints(logits, *args):
+        capture("constraints", logits)
+        return logits
+
+    def rejection(*args):
+        capture("rejection", args[5])
+        return args[5].argmax(-1)
+
+    def get_logprobs(*args):
+        capture("logprobs", args[3])
+        return args[3].clone()
+
+    def record(name, operation, *args, **kwargs):
+        stages.append(name)
+        return operation(*args, **kwargs)
+
+    namespace = dict(
+        torch=torch,
+        MAX_SPEC_LEN=8,
+        replace=replace,
+        SamplerOutput=SimpleNamespace,
+        stage_recorder_active=lambda: True,
+        record_stage=record,
+        apply_sampling_constraints=constraints,
+        rejection_sample=rejection,
+    )
+    baseline = forward(baseline_path, "RejectionSampler", dict(namespace))
+    observed = forward(ROOT / "vllm_ascend/sample/rejection_sampler.py", "AscendRejectionSampler", dict(namespace))
+    sampler = SimpleNamespace(
+        sampler=bonus,
+        is_processed_logprobs_mode=processed,
+        apply_logits_processors=processors,
+        _get_logprobs_tensors=get_logprobs,
+    )
+    metadata = SimpleNamespace(
+        max_spec_len=1,
+        bonus_logits_indices=torch.tensor([1]),
+        target_logits_indices=torch.tensor([0]),
+        cu_num_draft_tokens=torch.tensor([1]),
+        draft_token_ids=torch.tensor([2]),
+        num_draft_tokens=[1],
+    )
+    logits = torch.arange(8, dtype=torch.bfloat16).reshape(2, 4)
+    expected = baseline(sampler, metadata, None, logits.clone(), Sampling(logprobs))
+    expected_calls, expected_tensors = list(calls), list(tensors)
+    calls.clear()
+    tensors.clear()
+    actual = observed(sampler, metadata, None, logits.clone(), Sampling(logprobs))
+    assert calls == expected_calls
+    assert all(torch.equal(a, b) for a, b in zip(tensors, expected_tensors))
+    assert torch.equal(actual.sampled_token_ids, expected.sampled_token_ids)
+    if logprobs is not None:
+        assert torch.equal(actual.logprobs_tensors, expected.logprobs_tensors)
+    else:
+        assert actual.logprobs_tensors is expected.logprobs_tensors is None
+    assert stages[:4] == ["bonus_index", "bonus_sampler", "target_index_cast", "logits_processors"]
