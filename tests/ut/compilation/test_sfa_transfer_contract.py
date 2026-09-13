@@ -65,21 +65,20 @@ def contract(monkeypatch):
     allocations, copies = [], []
 
     def prepare(caches, slots, fmt, k, v, dsa):
-        assert len(caches) == 1 and isinstance(caches, tuple)
-        state = SimpleNamespace(cache=caches[0], slots=slots, fmt=fmt)
+        assert len(caches) == 2 and isinstance(caches, tuple) and fmt == 5
+        state = SimpleNamespace(caches=caches, slots=slots, fmt=fmt)
         allocations.append(state)
         return state
 
-    def copy(state, slots, selected, ptrs, chunk_size, total_tokens, interleaved, counts=None, diagnostic_layer_id=-1):
-        assert interleaved is False and chunk_size == 256
-        assert diagnostic_layer_id == -1
+    def copy(state, slots, selected, counts, ptrs, limits, chunk_size):
+        assert chunk_size == 256
         copies.append(
             SimpleNamespace(
                 state=state,
                 slots=slots.clone(),
                 selected=selected.clone(),
                 ptrs=ptrs.clone(),
-                total_tokens=total_tokens,
+                limits=limits.clone(),
                 counts=counts.clone(),
             )
         )
@@ -87,16 +86,14 @@ def contract(monkeypatch):
     utils = module(
         "lmcache_ascend.v1.npu_connector.utils",
         torch=torch,
-        lmc_ops=SimpleNamespace(
-            prepare_sparse_direct_destination_state=prepare, sparse_mla_dsa_batched_direct_kv_transfer_prepared=copy
-        ),
+        lmc_ops=SimpleNamespace(prepare_sparse_direct_destination_state=prepare, sparse_graph_kv_transfer=copy),
     )
     extract(
         ascend / "v1/npu_connector/utils.py",
         {
             "_normalize_vllm_kv_caches",
             "prepare_sparse_direct_destination_state",
-            "sparse_mla_dsa_batched_direct_kv_transfer_prepared",
+            "sparse_graph_kv_transfer",
         },
         utils.__dict__,
     )
@@ -196,7 +193,7 @@ def test_real_layer_startup_and_source_rebinding(contract, request_capacity, lay
     transfer = impl._full_graph_transfer
     assert type(transfer) is contract.transfer_type
     assert transfer.request_capacity == request_capacity
-    assert len(contract.allocations) == 2
+    assert len(contract.allocations) == 1
     assert inputs["decode_target_slot_mapping"] is metadata.decode_target_slot_mapping
     assert inputs["kv_caches"] is impl._staged_sfa_capture_state.runtime[1]
     assert metadata.reshape_cache_event is None
@@ -218,20 +215,23 @@ def test_real_layer_startup_and_source_rebinding(contract, request_capacity, lay
                 transfer.ptrs[1, start : start + len(counts)], ptrs + torch.tensor(counts) * 512 * 4
             )
         selected = torch.tensor([[0, sum(counts) - 1, sum(counts), -1]]).repeat(request_capacity, 1)
-        transfer.load(selected, torch.full((request_capacity,), 4), torch.arange(4).repeat(request_capacity, 1))
-        for call in contract.copies[-2:]:
-            assert call.total_tokens == request_capacity * 1024
-            torch.testing.assert_close(call.slots, torch.tensor([[0, 1, -1, -1]]).repeat(request_capacity, 1))
-            assert call.selected.dtype == call.counts.dtype == torch.int32
-            for lane in range(request_capacity):
-                assert call.selected[lane].tolist() == [lane * 1024, lane * 1024 + sum(counts) - 1, 0, 0]
+        before = len(contract.copies)
+        transfer.load(
+            selected, torch.full((request_capacity,), 4, dtype=torch.int32), torch.arange(4).repeat(request_capacity, 1)
+        )
+        assert len(contract.copies) == before + 1
+        call = contract.copies[-1]
+        torch.testing.assert_close(call.selected, selected)
+        torch.testing.assert_close(call.slots, torch.arange(4).repeat(request_capacity, 1))
+        assert call.counts.dtype == torch.int32 and call.limits.eq(sum(counts)).all()
+        assert call.ptrs.shape == (2, request_capacity * 4)
 
     # An empty/finished/padded request cannot reuse the last step's pointers.
     impl.prepare_full_graph_layer("target", 1024, (None,) * request_capacity, layer_id)
     transfer.load(selected, torch.full((request_capacity,), 4), metadata.decode_target_slot_mapping)
     assert not transfer.ptrs.any() and not transfer.valid_tokens.any()
-    assert contract.copies[-1].slots.eq(-1).all() and not contract.copies[-1].counts.any()
-    assert len(contract.allocations) == 2
+    assert not contract.copies[-1].limits.any()
+    assert len(contract.allocations) == 1
 
 
 def test_real_layer_cannot_allocate_new_transfer_during_live_decode(contract):
@@ -279,8 +279,8 @@ def test_real_transfer_tables_stay_untouched_while_topk_changes(contract):
         assert not graph.bind_sources(sources, requests, must_not_visit_layers)
         selected = torch.tensor([[step, 268, 269, -1], [step + 1, 272, 273, -1]])
         transfer.load(selected, torch.tensor([4, 4]), torch.arange(8).reshape(2, 4))
-        assert contract.copies[-1].selected[:, 0].tolist() == [step, 1024 + step + 1]
-        assert contract.copies[-1].slots[:, 2:].eq(-1).all()
+        assert contract.copies[-1].selected[:, 0].tolist() == [step, step + 1]
+        assert contract.copies[-1].limits[:, 0].tolist() == [269, 273]
         assert versions == (transfer.ptrs._version, transfer.valid_tokens._version)
 
     # Growth changes the tail's PE offset; equal-length replacement/restore and

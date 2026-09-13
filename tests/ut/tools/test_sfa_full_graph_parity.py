@@ -156,6 +156,9 @@ def dependency_modules(driver, monkeypatch):
     def transfer(state, slots, selected, ptrs, chunk_size, total_tokens, interleaved, counts=None):
         raise AssertionError("Preflight must not invoke native kernels")
 
+    def graph_transfer(state, slots, selected, counts, ptrs, limits, chunk_size):
+        raise AssertionError("Preflight must not invoke native kernels")
+
     attrs = {
         "lmcache_ascend.v1.npu_connector.sparse_graph": {"SparseGraphTransfer": Transfer},
         "lmcache_ascend.integration.vllm.lmcache_ascend_connector_v1": {"LMCacheAscendConnectorV1Dynamic": Connector},
@@ -164,10 +167,12 @@ def dependency_modules(driver, monkeypatch):
         "lmcache_ascend.v1.npu_connector.utils": {
             "prepare_sparse_direct_destination_state": destination,
             "sparse_mla_dsa_batched_direct_kv_transfer_prepared": transfer,
+            "sparse_graph_kv_transfer": graph_transfer,
         },
         "lmcache_ascend.c_ops": {
             "prepare_sparse_direct_destination_state": destination,
             "sparse_mla_dsa_batched_direct_kv_transfer_prepared": transfer,
+            "sparse_graph_kv_transfer": graph_transfer,
         },
     }
     modules = {
@@ -205,13 +210,16 @@ def test_preflight_reports_legacy_transfer_and_actual_import_path(driver, depend
     assert "BEFORE model loading" in message
 
 
-def test_preflight_collects_adapter_and_native_errors_together(driver, dependency_modules):
+@pytest.mark.parametrize(
+    "missing_export", ["sparse_mla_dsa_batched_direct_kv_transfer_prepared", "sparse_graph_kv_transfer"]
+)
+def test_preflight_collects_adapter_and_native_errors_together(driver, dependency_modules, missing_export):
     class LegacyAdapter:
         def prepare_sparse_graph_step(self, names, *, allow_empty=False):
             pass
 
     dependency_modules["lmcache.integration.vllm.vllm_v1_adapter"].LMCacheConnectorV1Impl = LegacyAdapter
-    del dependency_modules["lmcache_ascend.c_ops"].sparse_mla_dsa_batched_direct_kv_transfer_prepared
+    delattr(dependency_modules["lmcache_ascend.c_ops"], missing_export)
     with pytest.raises(RuntimeError) as error:
         driver.preflight_dependencies()
     assert "request_ids" in str(error.value)

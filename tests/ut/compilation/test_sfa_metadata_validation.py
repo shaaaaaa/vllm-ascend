@@ -287,3 +287,50 @@ def test_shared_checker_depends_on_no_unkeyed_layer_attributes(checks):
         if isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name) and n.value.id == "self"
     }
     assert attributes == {"dsa_resident_cache"}
+
+
+@pytest.mark.parametrize("dummy", [False, True])
+def test_full_graph_static_checks_only_run_at_startup(dummy):
+    path = Path(__file__).resolve().parents[3] / "vllm_ascend/attention/sfa_v1.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "AscendSFAImpl")
+    method = next(n for n in cls.body if getattr(n, "name", "") == "prepare_full_graph_layer")
+    # Deliberately no tensor metadata attributes: replay must not enumerate them.
+    metadata = SimpleNamespace(req_ids=["request"], reshape_cache_event=object())
+    context = SimpleNamespace(
+        attn_metadata={"L0": metadata},
+        staged_sfa_graph_dummy_run=dummy,
+        staged_sfa_graph_key=GraphKey(),
+        staged_sfa_route=SimpleNamespace(frontiers=(4096,)),
+    )
+    boundary = Mock(return_value=object())
+    namespace = {"get_forward_context": lambda: context, "_prepare_sfa_remap_boundary": boundary}
+    module = ast.parse("from __future__ import annotations")
+    module.body.append(method)
+    exec(compile(ast.fix_missing_locations(module), str(path), "exec"), namespace)
+    transfer = Mock()
+    impl = SimpleNamespace(
+        _staged_sfa_capture_state=SimpleNamespace(runtime=(None, [object(), object()])),
+        _staged_sfa_bridge_buffers=(torch.empty(2),),
+        _cross_layer_ineligible_reason=Mock(return_value="static failure"),
+        _full_graph_transfers={1: transfer},
+        index_topk=2048,
+    )
+    prepare = namespace["prepare_full_graph_layer"]
+    if dummy:
+        with pytest.raises(RuntimeError, match="static failure"):
+            prepare(impl, "L0", 65536, bind_source=False)
+        impl._cross_layer_ineligible_reason.assert_called_once()
+        boundary.assert_not_called()
+    else:
+        for frontier in (4096, 4352):
+            context.staged_sfa_route.frontiers = (frontier,)
+            assert prepare(impl, "L0", 65536, bind_source=False) == {}
+            assert boundary.call_args.kwargs["cached_tokens"] == (frontier,)
+            assert impl._full_graph_transfer is transfer
+            assert metadata.reshape_cache_event is None
+        impl._cross_layer_ineligible_reason.assert_not_called()
+        transfer.bind_batch.assert_not_called()
+        impl._full_graph_transfers.clear()
+        with pytest.raises(RuntimeError, match="not allocated at startup"):
+            prepare(impl, "L0", 65536, bind_source=False)

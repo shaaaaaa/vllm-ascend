@@ -3410,29 +3410,25 @@ class AscendSFAImpl(MLAAttentionImpl):
         bind_source: bool = True,
         metadata_checks: dict | None = None,
     ) -> dict[str, Any]:
-        """Validate live metadata; optionally bind source tables before replay.
+        """Update live boundaries; validate fixed graph inputs only at startup.
 
         The runner batches source binding outside this per-layer metadata check,
         so unchanged requests issue no source-table tensor operations at all.
         """
-        # Optional connector dependency is loaded only for this opt-in path,
-        # including memory profiling before the worker connector is registered.
-        from lmcache.integration.vllm.utils import lmcache_get_or_create_config
-        from lmcache_ascend.v1.npu_connector.sparse_graph import SparseGraphTransfer
-
         context = get_forward_context()
         state = self._staged_sfa_capture_state
         if state.runtime is None:
             raise RuntimeError(f"Full SFA graph layer was not warmed up: {layer_name}")
         metadata = context.attn_metadata[layer_name]
-        reason = self._cross_layer_ineligible_reason(
-            self._staged_sfa_bridge_buffers[0][:context.staged_sfa_graph_key.token_capacity],
-            state.runtime[1],
-            metadata,
-            metadata_checks=metadata_checks,
-        )
-        if reason is not None:
-            raise RuntimeError(f"Full SFA graph metadata is ineligible for {layer_name}: {reason}")
+        if context.staged_sfa_graph_dummy_run:
+            reason = self._cross_layer_ineligible_reason(
+                self._staged_sfa_bridge_buffers[0][:context.staged_sfa_graph_key.token_capacity],
+                state.runtime[1],
+                metadata,
+                metadata_checks=metadata_checks,
+            )
+            if reason is not None:
+                raise RuntimeError(f"Full SFA graph metadata is ineligible for {layer_name}: {reason}")
         boundary = _prepare_sfa_remap_boundary(
             metadata,
             metadata.req_ids,
@@ -3450,6 +3446,9 @@ class AscendSFAImpl(MLAAttentionImpl):
         if transfer is None:
             if not context.staged_sfa_graph_dummy_run:
                 raise RuntimeError("Full SFA graph transfer was not allocated at startup")
+            from lmcache.integration.vllm.utils import lmcache_get_or_create_config
+            from lmcache_ascend.v1.npu_connector.sparse_graph import SparseGraphTransfer
+
             transfer = SparseGraphTransfer(
                 tuple(state.runtime[1][:2]),
                 metadata.decode_target_slot_mapping,
@@ -3464,9 +3463,11 @@ class AscendSFAImpl(MLAAttentionImpl):
         # Graph-external saves use store_stream.wait_stream(current_stream).
         # Do not expose an event recorded only during startup eager warmup.
         metadata.reshape_cache_event = None
-        # Replaying a root graph skips layer-side address checks. Include every
-        # builder-owned device input in the root signature so a new request or
-        # shape can update contents but cannot silently replace captured storage.
+        if not context.staged_sfa_graph_dummy_run:
+            return {}
+        # The builder owns these stable allocations, just as in staged replay.
+        # Retain a startup signature for explicit diagnostics, not a per-step
+        # walk over every layer's tensors and static model configuration.
         fields = (
             "cos", "sin", "slot_mapping", "indexer_slot_mapping", "cum_query_lens", "seq_lens",
             "block_table", "indexer_block_table", "decode_remap_boundary", "decode_req_indices",

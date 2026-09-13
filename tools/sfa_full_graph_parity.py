@@ -141,6 +141,12 @@ def preflight_dependencies() -> None:
             (None, None, None, None, 256, 4608, False, None),
             {},
         ),
+        (
+            "lmcache_ascend.v1.npu_connector.utils",
+            "sparse_graph_kv_transfer",
+            (None, None, None, None, None, None, 256),
+            {},
+        ),
     )
     for module_name, attribute, args, kwargs in contracts:
         module = load(module_name)
@@ -156,7 +162,11 @@ def preflight_dependencies() -> None:
 
     native = load("lmcache_ascend.c_ops")
     if native is not None:
-        for name in ("prepare_sparse_direct_destination_state", "sparse_mla_dsa_batched_direct_kv_transfer_prepared"):
+        for name in (
+            "prepare_sparse_direct_destination_state",
+            "sparse_mla_dsa_batched_direct_kv_transfer_prepared",
+            "sparse_graph_kv_transfer",
+        ):
             if not callable(getattr(native, name, None)):
                 failures.append(f"lmcache_ascend.c_ops.{name}: native export missing; rebuild LMCache-Ascend")
     paths = "\n".join(f"  {name}: {getattr(module, '__file__', '<import failed>')}" for name, module in modules.items())

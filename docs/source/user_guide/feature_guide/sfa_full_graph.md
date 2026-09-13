@@ -72,16 +72,18 @@ heuristic is not a minimum context length; live request lengths are unchanged.
    callbacks and MTP draft retrieval remain outside the target graph. Prepared
    draft generators start at the first draft layer, not layer zero.
 
-The transfer uses two batched single-plane kernels (K and PE) inside the same graph.
-This keeps the existing native kernel ABI while allowing partial-tail PE
-offsets, source pointers and token limits to change via fixed device buffers.
-Each request has a separate virtual chunk-address range; no-history and padded
-lanes are masked on device. Source, metadata and input-signature errors use
+The transfer uses one `sparse_graph_kv_transfer` kernel per layer for both K and PE.
+Separate device pointer tables preserve each physical tail's PE offset without
+capturing a host-side tail length. The same kernel reads live top-k, counts and
+logical history limits, resolves request lanes and skips invalid tokens/slots.
+There are no separate `where`, index-cast or virtual-lane-offset operators in
+the copy path. Rebuild **LMCache-Ascend** after pulling this change; the existing
+staged transfer kernel is unchanged, and the submodule needs no new revision.
+Source and dynamic preparation errors use
 error-only worker fail-stop for live, single-node TP-only `mp` execution;
 startup capture and other topologies agree across TP/DP before entering
 captured collectives. See the failure-handling details below.
-This is not a claim that two kernels are optimal: benchmark the added kernel
-cost against the removed host dispatch overhead.
+Measure TPOT again; fewer launches alone do not establish a performance gain.
 
 Q1 and Q2 share request-major planner lanes and resident state in the bounded
 topology. Zero-frontier steps disable copies on-device. Request changes
@@ -196,26 +198,17 @@ chunk-count uploads, PE-pointer arithmetic or pointer copies. Newly published
 windows, source replacement/restore, changed request lanes and empty batches
 rebind; source references are retained to prevent identity reuse. Graph keys
 sharing request capacity share a last-binding cache, reset with startup capture.
-This does not freeze top-k, suppress actual graph-internal KV loads, or bypass
-per-step attention metadata/address validation. Those metadata checks still
-visit layers; this optimization removes the **source rebinding** loop and its
-device work, not every graph-external Python loop.
+This does not freeze top-k or suppress graph-internal KV loads.
 
-Full-graph validation now removes duplication **within a forward**, without
-memoizing mutable metadata across steps:
-
-- Input address/layout validation runs once, before the existing error
-  agreement/fail-stop boundary. `prepare_run()` hands `run()` a single-use
-  validated call containing the actual model kwargs. Another context, graph
-  key, owner, reset generation or entry cannot reuse it; overriding its inputs
-  or replaying it twice is rejected. The caller must not mutate input layouts
-  between these adjacent preparation and launch phases.
-- The signature walk inspects each identical Tensor object once per call.
-  Distinct views are checked independently, even if their pointers match.
-- Shared attention-metadata eligibility is checked once per implementation
-  type, metadata object, graph key and resident-state policy. A fresh memo is created every forward;
-  layers with different metadata or stricter resident requirements get their
-  own check. Layer-local KV layout/dtype/configuration checks remain in place.
+Fixed configuration, KV layouts, shared metadata eligibility and full input
+signatures are validated during startup warmup/capture, **not each decode**.
+Like ordinary staged ACL replay, this relies on runner/builder-owned stable
+allocations: update contents in place; replacing storage requires clear and
+recapture. `validate_inputs()` remains an explicit diagnostic, not a serving
+hook. Dynamic history boundaries still update before replay, once per shared
+metadata object. Source changes still acquire/update leases and pointer tables.
+The constant-time graph-key/lifecycle handoff checks remain; there is no
+per-layer tensor/signature walk or repeated model/configuration validation.
 
 Replay no longer calls `current_stream().synchronize()`. A changed source batch
 acquires independent `TensorMemoryObj` references once (including rank 0's real
@@ -234,8 +227,8 @@ submission retains owners until teardown; a non-completing retirement backlog
 is bounded at 64 batches and fails closed, not by freeing in-flight memory.
 
 For **single-node, TP-only, DP1/PP1 `mp` worker processes**, live target decode
-no longer performs the pre-replay TP CPU error all-reduce. Source and metadata
-validation still run locally. A preparation failure logs the original traceback
+no longer performs the pre-replay TP CPU error all-reduce. Source replacement
+and dynamic boundary preparation still run locally. A preparation failure logs the original traceback
 and raises `SystemExit`, bypassing the worker RPC loop's catch-and-continue
 handler. The existing independent process-sentinel monitor then shuts down the
 owned peer workers, even if their computation threads are blocked. Only on
@@ -432,17 +425,15 @@ Useful comparisons are `source.prepare`, `source.bind`, `metadata.L0` through
 `mtp.propose`, `sampling`, and `bookkeeping`. Staged retrieval has one
 `retrieve.L*` row per target layer, with KV waits distinguished from MTP waits.
 Full mode should not execute these Python retrieval callbacks in target
-replay. `signature.validate` must now run exactly once per full target forward;
-the diagnostic rejects repeated or missing calls. `metadata.shared_check`
-counts the actual shared eligibility checks: normally one per forward when
-all eight layers share metadata and resident-state policy, not eight.
-`metadata.L*` still measures each layer's preparation, including its necessary
-layer-local KV checks. Its inclusive time includes `metadata.shared_check`
-when that layer is the first consumer; do not add those nested times twice.
+replay. `signature.validate` and `metadata.shared_check` should be absent
+(zero calls) during live decode; static checks now happen only at startup.
+The diagnostic rejects hot-path signature checks. `metadata.L*` measures the
+remaining dynamic boundary preparation and preallocated transfer selection,
+not repeated KV layout/model checks.
 
 `root.run` exclusive time now covers completion-event recording and bookkeeping,
-not a post-replay CPU completion fence. The single input validation runs before
-`root.run`, under `target.forward`. Older results included a blocking fence here.
+not a post-replay CPU completion fence. No input signature walk runs before
+`root.run` in live decode. Older results included a blocking fence here.
 Some wait time may move to real downstream sampling/readback dependencies;
 removing this fence alone does not prove a TPOT gain. Compare target/root
 stream spans and MTP/readback waits. `engine_minus_worker` is a

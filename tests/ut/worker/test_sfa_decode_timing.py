@@ -149,7 +149,9 @@ def actual_root_run(events):
     run = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "run")
     prepare = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "prepare_run")
     call_type = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "SFAValidatedCall")
-    context = SimpleNamespace(staged_sfa_graph_key="key", cudagraph_runtime_mode="full")
+    context = SimpleNamespace(
+        staged_sfa_graph_key="key", cudagraph_runtime_mode="full", staged_sfa_graph_dummy_run=False
+    )
     stream = SimpleNamespace(synchronize=lambda: events.append("fence"))
     namespace = {
         "__name__": __name__,
@@ -176,7 +178,9 @@ def fake_worker(events, *, full=True):
     )
     graph = SimpleNamespace(
         entries={
-            "key": SimpleNamespace(graph=SimpleNamespace(replay=lambda: events.append("replay")), output="hidden")
+            "key": SimpleNamespace(
+                graph=SimpleNamespace(replay=lambda: events.append("replay")), output="hidden", signature=()
+            )
         },
         bind_sources=Mock(),
         validate_inputs=Mock(),
@@ -274,7 +278,8 @@ def test_installation_calls_original_code_and_restores_all_handles(timing_module
     if full:
         assert events == ["replay", "record"] * 3
         assert stages["root.replay_submit"]["wall"]["count"] == 3
-        assert stages["signature.validate"]["wall"]["count"] == 3
+        assert "signature.validate" not in stages
+        original_validate.assert_not_called()
         assert "retrieve.L0" not in stages
         assert all(stages[f"metadata.L{i}"]["wall"]["count"] == 3 for i in range(8))
     else:

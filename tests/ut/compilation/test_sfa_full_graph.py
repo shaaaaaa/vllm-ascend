@@ -92,7 +92,7 @@ def test_no_live_capture_or_changed_keyword_addresses(graph_module):
     wrapper.seal(("q2",))
     context.staged_sfa_graph_dummy_run = False
     with pytest.raises(RuntimeError, match="address or layout"):
-        wrapper.run(Mock(), positions=x.clone())
+        wrapper.validate_inputs(positions=x.clone())
     context.staged_sfa_graph_key = "q1"
     with pytest.raises(RuntimeError, match="live capture is prohibited"):
         wrapper.run(Mock(), positions=x)
@@ -121,7 +121,7 @@ def test_eager_warmup_never_captures(graph_module):
     assert not captures
 
 
-def test_metadata_storage_cannot_be_replaced_between_replays(graph_module):
+def test_explicit_validation_detects_metadata_storage_replacement(graph_module):
     module, context, _, _ = graph_module
     wrapper = module.SFAFullGraph()
     metadata = torch.zeros(1, dtype=torch.int32)
@@ -131,7 +131,7 @@ def test_metadata_storage_cannot_be_replaced_between_replays(graph_module):
     metadata.fill_(512)
     wrapper.run(Mock(), graph_inputs={"seq_lens": metadata})
     with pytest.raises(RuntimeError, match="address or layout"):
-        wrapper.run(Mock(), graph_inputs={"seq_lens": metadata.clone()})
+        wrapper.validate_inputs(graph_inputs={"seq_lens": metadata.clone()})
 
 
 def test_preflight_checks_do_not_capture_or_replay(graph_module):
@@ -266,7 +266,7 @@ def test_invalid_source_lanes_fail_before_binding(graph_module, sources, request
     lazy.assert_not_called()
 
 
-def test_runner_handoff_checks_inputs_once_per_forward_without_fence(graph_module, monkeypatch):
+def test_runner_handoff_does_not_walk_inputs_or_fence_on_live_replay(graph_module, monkeypatch):
     module, context, captures, stream = graph_module
     graph = module.SFAFullGraph()
     x = torch.ones(2)
@@ -278,11 +278,11 @@ def test_runner_handoff_checks_inputs_once_per_forward_without_fence(graph_modul
     for _ in range(20):
         prepared = graph.prepare_run(input_ids=x)
         assert graph.run(Mock(side_effect=AssertionError("target Python")), prepared=prepared) is output
-    assert validate.call_count == 20
+    validate.assert_not_called()
     assert captures[0][0].replay.call_count == 20
     stream.synchronize.assert_not_called()
     with pytest.raises(RuntimeError, match="address or layout"):
-        graph.prepare_run(input_ids=x.clone())
+        graph.validate_inputs(input_ids=x.clone())
     assert captures[0][0].replay.call_count == 20
 
 
@@ -385,4 +385,4 @@ def test_same_real_tensor_layout_or_storage_mutation_is_rechecked(graph_module, 
     else:
         value.set_(torch.ones(2, 2))
     with pytest.raises(RuntimeError, match="address or layout"):
-        graph.prepare_run(graph_inputs=inputs)
+        graph.validate_inputs(graph_inputs=inputs)
