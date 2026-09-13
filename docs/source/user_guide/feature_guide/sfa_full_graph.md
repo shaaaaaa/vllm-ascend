@@ -210,6 +210,26 @@ metadata object. Source changes still acquire/update leases and pointer tables.
 The constant-time graph-key/lifecycle handoff checks remain; there is no
 per-layer tensor/signature walk or repeated model/configuration validation.
 
+Full decode also reuses unchanged history boundaries. A builder-owned CPU
+shadow computes the same `min(floor((seq_len - 1) / window) * window, frontier)`
+values using CPU metadata, without per-step NumPy allocation/unique/validation
+passes. Only changed values or row layouts issue an H2D copy. Frontier growth
+or shrink, padding, Q1/Q2 layout and graph-capacity changes are still applied;
+eager/staged/dummy writes invalidate the shadow. In the CPU regression fixture,
+511 consecutive steps cross three windows and issue three uploads, not 511.
+Top-k and selected KV are never cached by this optimization. The staged
+benchmark keeps its original boundary path.
+
+LMCache resolves warm source readiness once per step; only cold bootstrap
+requires another resolution after publication. This is not a cross-step source
+cache: equal-length replacements, index residency and pending loads remain live.
+MTP draft suffixes are initialized at their first payload instead of before the
+target replay. This permits their CPU setup to overlap already-submitted target
+work; it does not remove the draft work or its stream dependencies. Cancelled
+unused suffixes perform no connector setup. Compare total TPOT and MTP timing,
+not just the reduced `source.prepare`/`metadata.L0` times. These changes are
+Python-only in **vllm-ascend and LMCache**; no further native rebuild is needed.
+
 Replay no longer calls `current_stream().synchronize()`. A changed source batch
 acquires independent `TensorMemoryObj` references once (including rank 0's real
 shared-slab allocations and passive-rank views). Each replay records a completion

@@ -3398,9 +3398,9 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                             request_ids=request_ids,
                             frontiers=tuple(context.staged_sfa_route.frontiers),
                         )
-                    # Only memoize within this forward. Layers with distinct
-                    # metadata or different resident-state requirements cannot
-                    # share a validation result; layer-local KV checks remain.
+                    # Startup-only static validation shares one temporary memo.
+                    # Live preparation updates dynamic boundaries and selects
+                    # preallocated transfers; it does not walk tensor layouts.
                     metadata_checks = {}
                     for name, impl in impls:
                         graph_inputs[name] = impl.prepare_full_graph_layer(
