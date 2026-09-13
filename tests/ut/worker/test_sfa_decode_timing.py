@@ -46,6 +46,24 @@ def test_moments(timing_module):
             values.add(value)
 
 
+def test_route_histogram_counts_actual_selected_profile_without_tensor_reads(timing_module):
+    timing = timing_module.DecodeTiming()
+    routes = [
+        SimpleNamespace(graph_key=SimpleNamespace(query_profile=SimpleNamespace(value=profile)))
+        for profile in ("spec_fixed", "decode_bounded", "spec_fixed")
+    ]
+    original = Mock(side_effect=[SimpleNamespace(graph_key=None), *routes])
+    runner = SimpleNamespace(_staged_sfa_live_route=original)
+    timing_module.install_route_timing(runner, timing)
+    runner._staged_sfa_live_route()  # Excluded prefill.
+    timing.active = True
+    for expected in routes:
+        assert runner._staged_sfa_live_route() is expected
+    assert timing.report()["graph_profiles_histogram"] == {"spec_fixed": 2, "decode_bounded": 1}
+    timing.close()
+    assert runner._staged_sfa_live_route is original
+
+
 def test_exclusive_wall_and_cpu_do_not_double_count(timing_module, monkeypatch):
     ticks = iter([0, 1_000_000, 4_000_000, 10_000_000])
     cpu = iter([0, 1_000_000, 2_000_000, 3_000_000])
@@ -207,6 +225,7 @@ def fake_worker(events, *, full=True):
         for i in range(8)
     )
     runner = SimpleNamespace(
+        _staged_sfa_live_route=Mock(return_value=SimpleNamespace(graph_key=None)),
         _sfa_full_graph=graph,
         _staged_sfa_impls=impls,
         **{

@@ -80,6 +80,9 @@ def routing():
         "_model_forward",
         "_staged_sfa_dummy_seq_len",
         "_prepare_staged_sfa_dummy_block_tables",
+        "_staged_sfa_capture_keys",
+        "_staged_sfa_dummy_graph_key",
+        "_warmup_and_capture",
     }
     definitions(root / "worker/model_runner_v1.py", names, ns, class_name="NPUModelRunner")
     runner_type = type("RunnerRouting", (), {name: ns[name] for name in names})
@@ -268,7 +271,9 @@ def test_mtp_target_routes_both_query_widths_to_one_root(routing, width):
         should_ubatch=False,
     )
     assert runner._apply_staged_sfa_route(live).max_query_len == 2
-    assert live.graph_key.query_profile == ns["StagedSFAQueryProfile"].DECODE_BOUNDED
+    assert live.graph_key.query_profile == (
+        ns["StagedSFAQueryProfile"].SPEC_FIXED if width == 2 else ns["StagedSFAQueryProfile"].DECODE_BOUNDED
+    )
     assert (
         runner._staged_sfa_dummy_batch_size(
             is_profile=False,
@@ -286,7 +291,7 @@ def test_mtp_target_routes_both_query_widths_to_one_root(routing, width):
     )
 
 
-def test_capture_sizes_use_one_bounded_graph_for_q1_and_q2(routing):
+def test_capture_token_capacities_stay_shared_between_profiles(routing):
     _, ns, env, _, _ = routing
     config = SimpleNamespace(
         scheduler_config=SimpleNamespace(max_num_seqs=1, max_num_batched_tokens=4096),
@@ -345,7 +350,7 @@ def test_cold_resume_keeps_markers_and_mtp_route_after_merge(routing, full_graph
         should_ubatch=False,
     )
     expected_profile = (
-        ns["StagedSFAQueryProfile"].DECODE_BOUNDED if full_graph else ns["StagedSFAQueryProfile"].SPEC_FIXED
+        ns["StagedSFAQueryProfile"].DECODE_BOUNDED if width == 1 else ns["StagedSFAQueryProfile"].SPEC_FIXED
     )
     assert live.graph_key.query_profile == expected_profile
     assert live.cold_compact_resumes == (True,)
@@ -455,7 +460,218 @@ def test_dp4_bounded_decode_buckets(routing, capacity, pattern):
         should_ubatch=False,
     )
     key = runner._apply_staged_sfa_route(live)
-    assert key == ns["StagedSFAGraphKey"].bounded_decode(capacity, 2)
+    expected = ns["StagedSFAGraphKey"].fixed_spec if pattern == "q2" else ns["StagedSFAGraphKey"].bounded_decode
+    assert key == expected(capacity, 2)
+
+
+@pytest.mark.parametrize("count", [1, 2, 8, 64])
+@pytest.mark.parametrize("padded", [False, True])
+@pytest.mark.parametrize("pattern", ["q2", "q1", "mixed"])
+def test_layout_classification_uses_every_request_not_mtp_toggle(routing, count, padded, pattern):
+    runner, ns, _, modes, states = routing
+    capacity = count + int(padded)
+    runner._staged_sfa_graph_capture_sizes = (capacity * 2,)
+    widths = np.full(count, 2, dtype=np.int32)
+    if pattern == "q1":
+        widths[:] = 1
+    elif pattern == "mixed":
+        widths[-1] = 1  # A late Q1 must not be hidden by the first request.
+    runner.attn_state = states.SpecDecoding if np.any(widths == 2) else states.DecodeOnly
+    ns["staged_sfa_metadata_sparse_route"] = lambda *args: (
+        ns["StagedSFARouteReason"].ELIGIBLE,
+        (4096,) * count,
+        (False,) * count,
+    )
+    local = runner._staged_sfa_local_route(
+        num_tokens_unpadded=int(widths.sum()),
+        num_reqs=count,
+        num_scheduled_tokens=widths,
+        index_topk=2048,
+        has_cascade_attention=False,
+        request_ids=list(map(str, range(count))),
+        kv_connector_metadata=None,
+    )
+    assert local.uniform_query_len == (2 if pattern == "q2" else 0)
+    live = runner._staged_sfa_live_route(
+        local_route=local,
+        dp_route_action=local.action,
+        cudagraph_mode=modes.PIECEWISE,
+        batch_descriptor=BatchDescriptor(capacity * 2),
+        num_tokens_unpadded=int(widths.sum()),
+        num_tokens_padded=capacity * 2,
+        num_reqs=count,
+        should_ubatch=False,
+    )
+    key = runner._apply_staged_sfa_route(live)
+    assert key in runner._staged_sfa_capture_keys(capacity * 2)
+    assert key.query_profile == (
+        ns["StagedSFAQueryProfile"].SPEC_FIXED if pattern == "q2" else ns["StagedSFAQueryProfile"].DECODE_BOUNDED
+    )
+
+
+@pytest.mark.parametrize("widths", [[2, 0], [2, 3], [2, -1], [2], [2, 2, 2]])
+def test_invalid_scheduled_widths_cannot_select_uniform(routing, widths):
+    runner, ns, _, _, states = routing
+    runner.attn_state = states.SpecDecoding
+    runner._staged_sfa_graph_capture_sizes = (4,)
+    local = runner._staged_sfa_local_route(
+        num_tokens_unpadded=4,
+        num_reqs=2,
+        num_scheduled_tokens=np.array(widths),
+        index_topk=2048,
+        has_cascade_attention=False,
+        request_ids=["a", "b"],
+        kv_connector_metadata=None,
+    )
+    assert local.reason == ns["StagedSFARouteReason"].NON_Q1
+    assert local.uniform_query_len == 0
+
+
+@pytest.mark.parametrize("width", [1, 2])
+@pytest.mark.parametrize("full", [False, True])
+def test_capture_warms_both_profiles_and_restores_selector(routing, width, full):
+    runner, ns, env, modes, _ = routing
+    env.VLLM_ASCEND_SFA_FULL_GRAPH = full
+    runner.decode_threshold = width
+    runner._staged_sfa_graph_capture_sizes = (8 * width,)
+    captured = []
+
+    def parent_capture(owner, desc, **kwargs):
+        # The parent calls dummy_run for warmup then capture. Both must select
+        # the SAME topology, including graph-memory profiling's seq-len override.
+        warm = owner._staged_sfa_dummy_graph_key(desc.num_tokens, dp_idle=False)
+        capture = owner._staged_sfa_dummy_graph_key(desc.num_tokens, dp_idle=False)
+        assert warm == capture
+        assert kwargs["profile_seq_lens"] == 6144
+        captured.append(capture)
+
+    ns["GPUModelRunner"] = SimpleNamespace(_warmup_and_capture=parent_capture)
+    runner._warmup_and_capture(
+        SimpleNamespace(num_tokens=8 * width, uniform=False), modes.PIECEWISE, profile_seq_lens=6144
+    )
+    assert tuple(captured) == runner._staged_sfa_capture_keys(8 * width)
+    assert len(captured) == (2 if full else 1)
+    assert len(set(captured)) == len(captured)
+    assert getattr(runner, "_sfa_capture_graph_key", None) is None
+    if full:
+        runner._sfa_capture_graph_key = captured[0]
+        assert runner._staged_sfa_dummy_graph_key(8 * width, dp_idle=True) == captured[1]
+        with pytest.raises(RuntimeError, match="capacity"):
+            runner._staged_sfa_dummy_graph_key(9 * width, dp_idle=False)
+
+
+def test_capture_failure_restores_selector(routing):
+    runner, ns, _, modes, _ = routing
+    ns["GPUModelRunner"] = SimpleNamespace(_warmup_and_capture=Mock(side_effect=RuntimeError("capture error")))
+    with pytest.raises(RuntimeError, match="capture error"):
+        runner._warmup_and_capture(SimpleNamespace(num_tokens=2, uniform=False), modes.PIECEWISE)
+    assert runner._sfa_capture_graph_key is None
+
+
+@pytest.mark.parametrize("kind", ["not_configured", "uniform_descriptor", "other_mode"])
+def test_non_sfa_capture_delegates_once(routing, kind):
+    runner, ns, _, modes, _ = routing
+    parent = Mock(return_value="original")
+    ns["GPUModelRunner"] = SimpleNamespace(_warmup_and_capture=parent)
+    if kind == "not_configured":
+        runner._staged_sfa_graph_capture_sizes = ()
+    desc = SimpleNamespace(num_tokens=2, uniform=kind == "uniform_descriptor")
+    assert runner._warmup_and_capture(desc, modes.FULL if kind == "other_mode" else modes.PIECEWISE) == "original"
+    parent.assert_called_once()
+    assert not hasattr(runner, "_sfa_capture_graph_key")
+
+
+def test_no_mtp_uses_original_q1_layout(routing):
+    runner, ns, _, modes, states = routing
+    runner.speculative_config = None
+    runner.decode_threshold = 1
+    runner._staged_sfa_graph_capture_sizes = (8,)
+    runner.attn_state = states.DecodeOnly
+    ns["staged_sfa_metadata_sparse_route"] = lambda *args: (
+        ns["StagedSFARouteReason"].ELIGIBLE,
+        (4096,) * 8,
+        (False,) * 8,
+    )
+    local = runner._staged_sfa_local_route(
+        num_tokens_unpadded=8,
+        num_reqs=8,
+        num_scheduled_tokens=np.ones(8, dtype=np.int32),
+        index_topk=2048,
+        has_cascade_attention=False,
+        request_ids=list(map(str, range(8))),
+        kv_connector_metadata=None,
+    )
+    live = runner._staged_sfa_live_route(
+        local_route=local,
+        dp_route_action=local.action,
+        cudagraph_mode=modes.PIECEWISE,
+        batch_descriptor=BatchDescriptor(8),
+        num_tokens_unpadded=8,
+        num_tokens_padded=8,
+        num_reqs=8,
+        should_ubatch=False,
+    )
+    assert live.graph_key == ns["StagedSFAGraphKey"].exact_q1(8)
+
+
+def test_live_runner_passes_bounded_flag_only_to_ragged_metadata(routing):
+    runner, ns, _, _, _ = routing
+    path = Path(__file__).resolve().parents[3] / "vllm_ascend/worker/model_runner_v1.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    method = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "execute_model")
+    expressions = [
+        kw.value
+        for n in ast.walk(method)
+        if isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Attribute)
+        and n.func.attr in ("_pad_query_start_loc_for_fia", "_build_attention_metadata")
+        for kw in n.keywords
+        if kw.arg == "full_graph"
+    ]
+    assert len(expressions) == 2
+    for key, expected in zip((*runner._staged_sfa_capture_keys(8), None), (False, True, False)):
+        ns["staged_sfa_graph_key"] = key
+        for expr in expressions:
+            assert eval(compile(ast.Expression(expr), str(path), "eval"), ns) is expected
+
+
+def test_seal_uses_both_captured_profiles(routing):
+    runner, ns, _, _, _ = routing
+    path = Path(__file__).resolve().parents[3] / "vllm_ascend/worker/model_runner_v1.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    method = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "capture_model")
+    expr = next(
+        n.value
+        for n in ast.walk(method)
+        if isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "graph_keys" for t in n.targets)
+    )
+    ns.update(self=runner, capture_sizes=(2, 8, 16))
+    keys = eval(compile(ast.Expression(expr), str(path), "eval"), ns)
+    assert keys == tuple(k for size in (2, 8, 16) for k in runner._staged_sfa_capture_keys(size))
+    assert len(set(keys)) == 6
+    draft = next(
+        n
+        for n in ast.walk(method)
+        if isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Attribute)
+        and n.func.attr == "seal_staged_mtp_draft_graphs"
+    )
+    ns["graph_keys"] = keys
+    assert eval(compile(ast.Expression(draft.args[0]), str(path), "eval"), ns) == (1, 4, 8)
+
+
+@pytest.mark.parametrize("count,capacity", [(1, 1), (1, 4), (8, 8), (8, 16), (64, 64)])
+def test_uniform_query_padding_only_uploads_when_padding_needed(routing, count, capacity):
+    runner, _, _, modes, _ = routing
+    data = np.full(capacity + 1, -99, dtype=np.int32)
+    data[: count + 1] = np.arange(count + 1) * 2
+    upload = Mock()
+    runner.uniform_decode_query_len = 2
+    runner.arange_np = np.arange(capacity + 1)
+    runner.query_start_loc = SimpleNamespace(np=data, copy_to_gpu=upload)
+    assert runner._pad_query_start_loc_for_fia(capacity * 2, count, count, modes.PIECEWISE, capacity) == capacity
+    assert data.tolist() == (np.arange(capacity + 1) * 2).tolist()
+    assert upload.call_count == int(count < capacity)
 
 
 def test_p_worker_explicit_eager_ignores_global_full_flag(routing):

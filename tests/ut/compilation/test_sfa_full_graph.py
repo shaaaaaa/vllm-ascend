@@ -5,6 +5,7 @@
 import importlib.util
 import sys
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock
@@ -82,6 +83,41 @@ def test_one_replay_without_reentering_target_python(graph_module):
     assert captures[0][0].replay.call_count == 3
     stream.synchronize.assert_not_called()
     assert wrapper.replay_count == 3
+
+
+def test_uniform_and_bounded_switch_replays_once_and_share_source_tables(graph_module):
+    module, context, captures, stream = graph_module
+
+    @dataclass(frozen=True)
+    class Key:
+        request_capacity: int
+        query_profile: str
+
+    keys = (Key(8, "spec_fixed"), Key(8, "decode_bounded"))
+    wrapper = module.SFAFullGraph()
+    x = torch.ones(16)
+    target = Mock(side_effect=lambda **kwargs: kwargs["input_ids"] + 2)
+    transfers = tuple(SimpleNamespace(bind_batch=Mock()) for _ in range(8))
+    lazy = Mock(return_value=transfers)
+    for key in keys:
+        context.staged_sfa_graph_key = key
+        wrapper.bind_sources((), (), lazy)
+        wrapper.run(target, input_ids=x)
+    assert wrapper.seal(keys) == 2
+    assert len(captures) == target.call_count == 2
+    context.staged_sfa_graph_dummy_run = False
+    for key in (keys[0], keys[1], keys[0], keys[1], keys[0]):
+        context.staged_sfa_graph_key = key
+        wrapper.bind_sources((None,) * 8, tuple(map(str, range(8))), lazy)
+        assert wrapper.run(target, input_ids=x) is wrapper.entries[key].output
+    assert captures[0][0].replay.call_count == 3
+    assert captures[1][0].replay.call_count == 2
+    assert wrapper.replay_count == 5
+    assert target.call_count == 2  # No target Python reentry during live replay.
+    assert lazy.call_count == 2  # Empty capture batch, then the live batch only.
+    for transfer in transfers:
+        assert transfer.bind_batch.call_count == 2
+    stream.synchronize.assert_not_called()
 
 
 def test_no_live_capture_or_changed_keyword_addresses(graph_module):

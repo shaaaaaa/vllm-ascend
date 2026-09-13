@@ -47,12 +47,27 @@ group iteration. Once all ranks are decoding or idle, target forwards use one
 root replay. MTP draft and prefill remain outside the target graph. Thus this
 does not claim one replay on a decoding rank while a peer is doing prefill.
 
-Each request bucket captures one bounded-query topology at startup. The same
-graph handles Q1, Q2 and mixed batches: device-only packing groups live top-k
-by request for the sparse planner, then restores packed token order. An
-additional attention-only sequence absorbs padding without extending the last
-real request's causal query length. A 256-token frontier change does not cause
-recapture. Graph-memory profiling uses disposable graphs and source
+Each request bucket captures two target topologies at startup. Before forward,
+the runner checks every request's scheduled query length on the CPU, once.
+An all-Q2 MTP batch uses `spec_fixed`: the original uniform planner layout, no
+per-layer pack/unpack, no extra attention table copies, and no second query-start
+upload when there is no padding. This applies to any supported request count,
+not just a single request. Without MTP, all-Q1 uses `decode_q1` similarly.
+
+With MTP enabled, a Q1-only or mixed Q1/Q2 batch uses `decode_bounded`: device-only
+packing groups live top-k by request, then restores token order. Its additional
+attention-only sequence absorbs padding without extending the last real request's
+causal query length. Both paths still execute **one root replay per forward**.
+MTP being enabled alone is not proof of all-Q2; scheduler token budgets and context
+limits can truncate the query. Draft rejection alone does not imply Q1 next step.
+DP peers may use different local layouts at the same coordinated token capacity;
+the target TP/EP collective shapes/order are unchanged. Idle DP peers retain the
+bounded path's private zero-length attention tables. No layout collective is added.
+
+Both graphs share source tables and resident state for the same request capacity.
+A layout switch or 256-token frontier change does not cause live recapture.
+Capturing the extra uniform topology can increase startup time/graph memory;
+graph-memory profiling includes both variants and uses disposable graphs and source
 tables, cleared before the temporary KV cache is released.
 Synthetic warmup/capture sequence lengths are bounded by `max_model_len` and
 both KV groups' logical block-table capacities. The 6144-token workspace
@@ -85,8 +100,8 @@ startup capture and other topologies agree across TP/DP before entering
 captured collectives. See the failure-handling details below.
 Measure TPOT again; fewer launches alone do not establish a performance gain.
 
-Q1 and Q2 share request-major planner lanes and resident state in the bounded
-topology. Zero-frontier steps disable copies on-device. Request changes
+Q1 and Q2 share request-major planner lanes and resident state across both
+topologies. Zero-frontier steps disable copies on-device. Request changes
 replace pointer-table contents without retaining the previous request lease.
 
 Per-layer target host tensor probes cannot run during a replay. The startup
@@ -363,6 +378,10 @@ grep -aF '[SFA_TIMING]' log.log
 Each rank reports actual decode forwards, root replays, source binding updates,
 query-size and sampled-token-count histograms. The tool rejects missing ranks,
 inconsistent forward counts or a full-mode forward without a root replay.
+`graph_profiles={'spec_fixed': 511}` confirms all 511 measured target forwards
+selected the all-Q2 fast path; `decode_bounded` counts MTP Q1/mixed-layout forwards.
+These counters are diagnostic-only and do not inspect device tensors. A full-mode
+report must still have one root replay for every forward, regardless of profile.
 `committed/forward` and the histograms help identify changed MTP work even when
 the final token IDs match. Sampled worker tokens can exceed final committed
 tokens at the generation length boundary; this is not an exact acceptance-rate

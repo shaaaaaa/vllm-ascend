@@ -65,6 +65,7 @@ class DecodeTiming:
         self.prefill_steps = 0
         self.query_tokens: Counter = Counter()
         self.sampled_tokens: Counter = Counter()
+        self.graph_profiles: Counter = Counter()
         self.last_target_events = None
 
     @property
@@ -171,6 +172,7 @@ class DecodeTiming:
             "prefill_steps_excluded": self.prefill_steps,
             "query_tokens_histogram": dict(self.query_tokens),
             "sampled_tokens_histogram": dict(self.sampled_tokens),
+            "graph_profiles_histogram": dict(self.graph_profiles),
             "device_intervals_dropped": self.device_intervals_dropped,
             "detail_event_stride": DETAIL_EVENT_STRIDE,
             "stages": {
@@ -192,6 +194,20 @@ class ReplayProbe:
 
     def __getattr__(self, name):
         return getattr(self.graph, name)
+
+
+def install_route_timing(runner, timing: DecodeTiming) -> None:
+    original = runner._staged_sfa_live_route
+
+    def route(*args, **kwargs):
+        result = original(*args, **kwargs)
+        if timing.recording:
+            key = result.graph_key
+            label = key.query_profile.value if key is not None else "native"
+            timing.graph_profiles[label] += 1
+        return result
+
+    timing.patches.enter_context(patch.object(runner, "_staged_sfa_live_route", route))
 
 
 def install_sampling_timing(runner, timing: DecodeTiming) -> None:
@@ -253,6 +269,7 @@ def install_decode_timing(worker, connector, *, prompt_tokens: int, event_factor
     try:
         timing.patches.enter_context(patch.object(worker, "execute_model", execute))
         timing.patches.enter_context(patch.object(worker, "sample_tokens", sample))
+        install_route_timing(runner, timing)
         for method, stage, device in (
             ("_model_forward", "target.forward", True),
             ("_prepare_inputs", "inputs.prepare", False),

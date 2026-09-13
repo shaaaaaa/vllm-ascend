@@ -279,6 +279,7 @@ def print_decode_timing(report: dict) -> None:
             f"[SFA_TIMING] {mode} rank={worker['rank']} forwards={worker['decode_steps']} "
             f"roots={worker['root_replays']} source_updates={worker['source_binding_updates']} "
             f"Q_hist={worker['query_tokens_histogram']} sampled_hist={worker['sampled_tokens_histogram']} "
+            f"graph_profiles={worker.get('graph_profiles_histogram', {})} "
             f"prefill_excluded={worker['prefill_steps_excluded']} "
             f"event_drops={worker['device_intervals_dropped']}",
             flush=True,

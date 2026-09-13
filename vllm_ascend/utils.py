@@ -129,6 +129,8 @@ class StagedSFARouteDecision:
     graph_key: Any = None
     frontiers: tuple[int, ...] = ()
     cold_compact_resumes: tuple[bool, ...] = ()
+    # CPU scheduler verdict; 0 means not the configured uniform query width.
+    uniform_query_len: int = 0
 
 
 _DYNAMIC_EPLB_BUFFER_SIZE = 100
