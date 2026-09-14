@@ -29,6 +29,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadat
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
 from vllm.logger import logger
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
+from vllm.v1.core.single_type_kv_cache_manager import DSALatentManager
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.interface import PauseState
 from vllm.v1.core.sched.output import NewRequestData, SchedulerOutput
@@ -130,6 +131,13 @@ class RecomputeScheduler(Scheduler):
             or self.max_num_scheduled_tokens
         )
         self._checkpoint_capture_enabled = bool(getattr(self.connector, "supports_preemption_checkpoint", False))
+        if self._checkpoint_capture_enabled:
+            alignment = self.connector.preemption_checkpoint_chunk_size
+            for manager in self.kv_cache_manager.coordinator.single_type_managers:
+                if isinstance(manager, DSALatentManager):
+                    if type(alignment) is not int or alignment <= 0 or alignment % manager.block_size:
+                        raise ValueError("Checkpoint chunk size must align to latent blocks")
+                    manager.checkpoint_tail_alignment = alignment
         # When is_mtp_kv_consumer is true, we will fill request.spec_token_ids
         # with placeholder tokens to enable full graph when decode nodes pull
         # the KV cache of one request from prefill nodes.

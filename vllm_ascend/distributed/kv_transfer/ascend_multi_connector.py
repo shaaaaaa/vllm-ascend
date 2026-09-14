@@ -124,6 +124,15 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
         """Expose snapshot support without coupling the scheduler to a child."""
         return any(getattr(child, "supports_preemption_checkpoint", False) for child in self._connectors)
 
+    @property
+    def preemption_checkpoint_chunk_size(self) -> int:
+        """Require one boundary alignment across checkpoint providers."""
+        sizes = {child.preemption_checkpoint_chunk_size for child in self._connectors
+                 if getattr(child, "supports_preemption_checkpoint", False)}
+        if len(sizes) != 1:
+            raise ValueError("Checkpoint providers must agree on chunk size")
+        return sizes.pop()
+
     def handle_preemptions_with_metadata(
         self, preempted_req_ids: set[str], metadata: MultiKVConnectorMetadata
     ) -> None:
