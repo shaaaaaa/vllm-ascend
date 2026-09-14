@@ -1,0 +1,40 @@
+cmake_minimum_required(VERSION 3.16)
+project(resident_kernel_experiment LANGUAGES CXX)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type")
+set(RUN_MODE npu CACHE STRING "AscendC run mode")
+if(NOT SOC_VERSION OR NOT ASCEND_HOME_PATH OR NOT TORCH_NPU_PATH)
+    message(FATAL_ERROR "Pass SOC_VERSION, ASCEND_HOME_PATH and TORCH_NPU_PATH; see build.sh")
+endif()
+string(TOLOWER "${SOC_VERSION}" resident_soc)
+if(resident_soc MATCHES "ascend310p")
+    message(FATAL_ERROR "The production resident kernels do not support 310P")
+endif()
+set(ASCEND_CANN_PACKAGE_PATH "${ASCEND_HOME_PATH}")
+foreach(suffix tools/tikcpp/ascendc_kernel_cmake
+               compiler/tikcpp/ascendc_kernel_cmake
+               ascendc_devkit/tikcpp/samples/cmake)
+    if(EXISTS "${ASCEND_HOME_PATH}/${suffix}/ascendc.cmake")
+        set(ASCENDC_CMAKE_DIR "${ASCEND_HOME_PATH}/${suffix}")
+        break()
+    endif()
+endforeach()
+if(NOT ASCENDC_CMAKE_DIR)
+    message(FATAL_ERROR "Cannot find the CANN AscendC CMake helper")
+endif()
+include("${ASCENDC_CMAKE_DIR}/ascendc.cmake")
+ascendc_library(resident_experiment_kernels SHARED baseline.cpp optimized.cpp)
+
+find_package(Torch REQUIRED)
+add_library(resident_experiment_ops SHARED binding.cpp)
+target_include_directories(resident_experiment_ops PRIVATE
+    ${TORCH_INCLUDE_DIRS} "${TORCH_NPU_PATH}/include" "${ASCEND_HOME_PATH}/include")
+separate_arguments(torch_flags NATIVE_COMMAND "${TORCH_CXX_FLAGS}")
+target_compile_options(resident_experiment_ops PRIVATE ${torch_flags})
+target_link_directories(resident_experiment_ops PRIVATE
+    "${TORCH_NPU_PATH}/lib" "${ASCEND_HOME_PATH}/lib64")
+target_link_libraries(resident_experiment_ops PRIVATE
+    ${TORCH_LIBRARIES} torch_npu ascendcl resident_experiment_kernels)
+set_target_properties(resident_experiment_ops PROPERTIES BUILD_RPATH
+    "$ORIGIN;${TORCH_NPU_PATH}/lib;${ASCEND_HOME_PATH}/lib64")

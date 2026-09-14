@@ -16,6 +16,12 @@
 
 #include "kernel_operator.h"
 
+// Only the isolated experimental translation unit enables these fast paths.
+// The serving build keeps the original kernels without runtime flag checks.
+#ifndef RESIDENT_EXPERIMENT_SKIP_UNCHANGED
+#define RESIDENT_EXPERIMENT_SKIP_UNCHANGED 0
+#endif
+
 namespace {
 
 constexpr uint32_t kDataBlockBytes = 32;
@@ -1352,12 +1358,14 @@ private:
                 blockTableEntries_ * sizeof(int32_t)),
             0,
             0};
-        AscendC::DataCopyPad(
-            blockTable,
-            requestBlockTable_[
-                static_cast<uint64_t>(request) * blockTableWidth_],
-            blockTableCopy,
-            {});
+        if constexpr (!RESIDENT_EXPERIMENT_SKIP_UNCHANGED) {
+            AscendC::DataCopyPad(
+                blockTable,
+                requestBlockTable_[
+                    static_cast<uint64_t>(request) * blockTableWidth_],
+                blockTableCopy,
+                {});
+        }
 
         uint32_t currentCounts[kMaxResidentShards] = {};
         uint32_t missCounts[kMaxResidentShards] = {};
@@ -1406,7 +1414,8 @@ private:
             evictableCounts[shard] = evictableCount;
             priorOffsets[shard] = priorOffset;
             missOffsets[shard] = missOffset;
-            if (currentCount > 0) {
+            if (currentCount > 0 &&
+                (!RESIDENT_EXPERIMENT_SKIP_UNCHANGED || shardMissCount > 0)) {
                 CopyGlobalToLocalExact(
                     packedPriorSlots[priorOffset],
                     priorSlots_[shardOffset],
@@ -1427,6 +1436,31 @@ private:
             totalMissCount += shardMissCount;
             totalEvictableCount += evictableCount;
             totalOldCount += oldCount;
+        }
+
+        if constexpr (RESIDENT_EXPERIMENT_SKIP_UNCHANGED) {
+            if (totalMissCount == 0) {
+                // Union already wrote every hit's prior slot. Clear stale
+                // eviction decisions from the previous replay, but do not
+                // copy payloads or read the block table for a zero-miss plan.
+                for (uint32_t shard = 0; shard < shardCount_; ++shard) {
+                    const uint64_t offset =
+                        static_cast<uint64_t>(request) * shardCountRequestStride_
+                        + shard * shardCountStride_;
+                    shardCounts_.SetValue(offset + kShardSelectedEvictCount, 0);
+                    PublishGlobalCacheLine(shardCounts_, offset);
+                }
+                WriteGlobalScalarVisible(
+                    missCounts_,
+                    static_cast<uint64_t>(request) * missCountStride_, 0);
+                return;
+            }
+            AscendC::DataCopyPad(
+                blockTable,
+                requestBlockTable_[
+                    static_cast<uint64_t>(request) * blockTableWidth_],
+                blockTableCopy,
+                {});
         }
 
         // Finalize consumes evictable slots shard-major. Only copy the
@@ -1539,7 +1573,8 @@ private:
         Sync<AscendC::HardEvent::S_MTE3>();
         for (uint32_t shard = 0; shard < shardCount_; ++shard) {
             const uint32_t currentCount = currentCounts[shard];
-            if (currentCount == 0) {
+            if (currentCount == 0 ||
+                (RESIDENT_EXPERIMENT_SKIP_UNCHANGED && missCounts[shard] == 0)) {
                 continue;
             }
             const uint64_t shardOffset =
@@ -1802,6 +1837,26 @@ public:
         const uint64_t oldStateOffset =
             (static_cast<uint64_t>(safeState) * shardCount_ + shard)
             * capacity_;
+
+        if constexpr (RESIDENT_EXPERIMENT_SKIP_UNCHANGED) {
+            const uint32_t missCount = static_cast<uint32_t>(
+                shardCounts_.GetValue(requestCountOffset + kShardMissCount));
+            if (missCount == 0 && selectedEvictCount == 0) {
+                // Current is a subset of resident, and no resident entry was
+                // selected for eviction. Preserve state bytes/counts, while
+                // still remapping every top-k partition and publishing the
+                // request generation (including empty/dummy requests).
+                RemapPositionPartition(request, shard, requestShardBase);
+                if (shard == 0) {
+                    WriteGlobalScalarVisible(
+                        stateGenerations_,
+                        static_cast<uint64_t>(safeState) * generationStride_,
+                        requestedGeneration);
+                }
+                Sync<AscendC::HardEvent::MTE3_S>();
+                return;
+            }
+        }
 
         auto oldTokens = oldTokenBuf_.Get<int32_t>();
         auto oldSlots = oldSlotBuf_.Get<int16_t>();
