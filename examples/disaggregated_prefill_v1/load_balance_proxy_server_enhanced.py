@@ -1534,9 +1534,11 @@ class ProxyState:
         wait_for_result: bool = False,
     ) -> None:
         now = time.monotonic()
-        if self._decoder_placement_is_fresh(server, now):
-            return
         task = server.decoder_placement_task
+        # A recent attempt may still be in flight; mandatory callers must
+        # await that shared result before deciding whether a handoff exists.
+        if task is None and self._decoder_placement_is_fresh(server, now):
+            return
         if task is None:
             server.decoder_placement_last_attempt_at = now
             task = asyncio.create_task(self._refresh_decoder_remote_fill(server))
