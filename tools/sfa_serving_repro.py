@@ -37,6 +37,12 @@ def serving_environment(mode: str, devices: str, *, diagnose: bool) -> dict[str,
             "VLLM_ASCEND_DSA_DISABLE_TARGET_SLOT_MAPPING": "0",
             "VLLM_ASCEND_BALANCE_SCHEDULING": "1",
             "LMCACHE_ENABLE_DSA_COLD_COMPACT_LOAD": "true",
+            # The offline parity fixture uses independent per-rank CPU caches.
+            # Serving cold-compact loading instead needs a shared rank0 store
+            # with passive TP readers. Override the inherited policy together.
+            "LMCACHE_ENABLE_SHARED_CPU_CACHE": "true",
+            "LMCACHE_SHARED_CPU_CACHE_STRICT": "true",
+            "LMCACHE_EXTRA_CONFIG": '{"save_only_first_rank": true}',
             "LMCACHE_ASCEND_SPARSE_TRANSFER_TOPK": "2048",
             "LMCACHE_MAX_LOCAL_CPU_SIZE": "8",
             "HCCL_OP_EXPANSION_MODE": "AIV",

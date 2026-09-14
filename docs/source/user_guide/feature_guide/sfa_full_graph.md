@@ -154,6 +154,36 @@ and attention must be in that graph; there must be no target-layer
 and save callbacks outside the target-forward scope are expected. Startup
 logs and CPU unit tests alone do not prove graph capture or output parity.
 
+## Online serving performance reproduction
+
+For the serving regression, use the online TP4 x DP2 + EP reproducer on one
+eight-NPU host, rather than the TP8/DP1 offline benchmark below:
+
+```bash
+set -o pipefail
+python tools/sfa_serving_repro.py --diagnose --prompt-tokens 131614 --output-tokens 1000 2>&1 | tee log.log
+grep -aE '\[SFA_SERVING(_TIMING)?\]' log.log
+```
+
+Both modes use an eight-layer dummy model, the recompute scheduler, the serving
+capture buckets and one active request routed to DP0, with DP1 idle. They keep
+cold-compact loading enabled, **shared CPU cache enabled**, strict shared-cache
+handling and `save_only_first_rank=true`. Each TP group has its own rank0 store
+and passive TP readers. These settings intentionally override the offline
+fixture's independent per-rank cache policy: cold-compact loading with
+`enable_shared_cpu_cache=false` is invalid and fails before inference.
+
+The existing 8-GiB CPU-cache budget is per DP group; the two local groups require
+approximately 16 GiB of free `/dev/shm` in total. No remote cache is used. These
+cache settings are identical between staged and full modes; only
+`VLLM_ASCEND_SFA_FULL_GRAPH` differs. `--diagnose` adds host timings, not a profile;
+omit it for clean latency measurements. Full server logs are retained under
+`profile/sfa-serving-*/{staged,full}/server.log`.
+
+CPU tests execute the matching sibling LMCache's complete configuration
+validator against the script's settings and reproduce the formerly invalid
+combination. They do not validate NPU startup or establish a performance gain.
+
 ## Eight-layer performance and MindStudio profile
 
 Use the independent benchmark, **not the numerical-parity driver**, to measure
