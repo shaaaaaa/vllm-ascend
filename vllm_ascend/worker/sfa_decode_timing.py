@@ -272,6 +272,12 @@ def install_decode_timing(worker, connector, *, prompt_tokens: int, event_factor
         install_route_timing(runner, timing)
         for method, stage, device in (
             ("_model_forward", "target.forward", True),
+            ("_sync_batch_across_dp", "dp.batch_sync", False),
+            (
+                "_coordinate_sfa_full_graph_preparation",
+                "full.prepare_agreement",
+                False,
+            ),
             ("_prepare_inputs", "inputs.prepare", False),
             ("_build_attention_metadata", "attention.metadata", False),
             ("propose_draft_token_ids", "mtp.propose", True),

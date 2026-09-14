@@ -387,7 +387,8 @@ def test_parent_never_continues_after_preflight_or_engine_failure(driver, args, 
 
 @pytest.mark.parametrize("diagnose", [False, True])
 @pytest.mark.parametrize("supported", [False, True])
-def test_worker_uses_only_fixture_loading_not_parity_execution(monkeypatch, diagnose, supported):
+@pytest.mark.parametrize("serving", [False, True])
+def test_worker_uses_only_fixture_loading_not_parity_execution(monkeypatch, diagnose, supported, serving):
     events = []
 
     class Dummy:
@@ -439,9 +440,16 @@ def test_worker_uses_only_fixture_loading_not_parity_execution(monkeypatch, diag
     spec.loader.exec_module(module)
     worker = module.SFABenchmarkWorker()
     worker.vllm_config = SimpleNamespace(
-        additional_config={"sfa_benchmark": True, "sfa_benchmark_graph_timing": diagnose},
+        additional_config={
+            "sfa_benchmark": True,
+            "sfa_benchmark_graph_timing": diagnose,
+            "sfa_benchmark_serving": serving,
+        },
         parallel_config=SimpleNamespace(
-            tensor_parallel_size=8, data_parallel_size=1, pipeline_parallel_size=1, enable_expert_parallel=False
+            tensor_parallel_size=4 if serving else 8,
+            data_parallel_size=2 if serving else 1,
+            pipeline_parallel_size=1,
+            enable_expert_parallel=serving,
         ),
     )
     original = Dummy.load_weights

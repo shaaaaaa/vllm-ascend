@@ -25,14 +25,20 @@ class SFABenchmarkWorker(NPUWorker):
 
     def load_model(self) -> None:
         parallel = self.vllm_config.parallel_config
-        if (
-            self.vllm_config.additional_config.get("sfa_benchmark") is not True
-            or parallel.tensor_parallel_size not in (1, 2, 4, 8)
-            or parallel.data_parallel_size != 1
-            or parallel.pipeline_parallel_size != 1
-            or parallel.enable_expert_parallel
-        ):
-            raise ValueError("Use the isolated TP-only SFA benchmark driver")
+        serving_repro = self.vllm_config.additional_config.get("sfa_benchmark_serving") is True
+        valid_topology = (
+            parallel.tensor_parallel_size == 4
+            and parallel.data_parallel_size == 2
+            and parallel.pipeline_parallel_size == 1
+            and parallel.enable_expert_parallel
+            if serving_repro
+            else parallel.tensor_parallel_size in (1, 2, 4, 8)
+            and parallel.data_parallel_size == 1
+            and parallel.pipeline_parallel_size == 1
+            and not parallel.enable_expert_parallel
+        )
+        if self.vllm_config.additional_config.get("sfa_benchmark") is not True or not valid_topology:
+            raise ValueError("Use the isolated SFA benchmark drivers and their exact TP/DP topology")
         # This method only reads/replaces vllm_config.quant_config. It installs
         # no hooks and needs no parity request/reference state.
         coordinated_check(
@@ -103,6 +109,7 @@ class SFABenchmarkWorker(NPUWorker):
 
         from vllm_ascend.worker.sfa_decode_timing import install_decode_timing
 
+        prompt_tokens = int(prompt_tokens)
         if getattr(self, "_decode_timing", None) is not None:
             raise RuntimeError("Decode timing is already active")
         if self.model_runner.use_async_scheduling:

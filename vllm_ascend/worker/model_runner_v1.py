@@ -3372,6 +3372,46 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
             )
         return NPUModelRunner._all_gather_hidden_states(hidden_states)
 
+    def _coordinate_sfa_full_graph_preparation(
+        self,
+        local_error: BaseException | None,
+        dummy_run: bool,
+    ) -> None:
+        """Propagate graph-preparation failure before target collectives."""
+        if not dummy_run and uses_local_sfa_fail_stop(
+            self.vllm_config.parallel_config
+        ):
+            # One local supervisor owns this TP-only worker cohort. Healthy
+            # forwards need no CPU collective or failure tensor.
+            if local_error is not None:
+                logger.critical(
+                    "[SFA full graph] source/metadata preparation failed; "
+                    "exiting worker to notify the local executor supervisor",
+                    exc_info=(
+                        type(local_error),
+                        local_error,
+                        local_error.__traceback__,
+                    ),
+                )
+                exit_failed_sfa_worker(local_error)
+            return
+
+        # Capture and unsupported executor topologies still agree before
+        # entering EP/TP collectives (including idle DP ranks).
+        failed = torch.tensor([int(local_error is not None)], dtype=torch.int32)
+        for group in (get_tp_group(), get_dp_group()):
+            if group.world_size > 1:
+                dist.all_reduce(
+                    failed,
+                    op=dist.ReduceOp.MAX,
+                    group=group.cpu_group,
+                )
+        if failed.item():
+            raise RuntimeError(
+                "[SFA full graph] source/metadata preparation failed on this "
+                "or a peer worker"
+            ) from local_error
+
     def _model_forward(
         self,
         num_tokens_padded: int,
@@ -3425,32 +3465,10 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                     prepared_call = self._sfa_full_graph.prepare_run(graph_inputs=graph_inputs, **graph_kwargs)
                 except Exception as exc:
                     local_error = exc
-                if (
-                    not context.staged_sfa_graph_dummy_run
-                    and uses_local_sfa_fail_stop(self.vllm_config.parallel_config)
-                ):
-                    # One local supervisor owns this TP-only worker cohort.
-                    # Healthy forwards need no CPU collective or failure tensor.
-                    # A known failure exits instead of being swallowed by the RPC
-                    # loop; the independent sentinel monitor stops blocked peers.
-                    if local_error is not None:
-                        logger.critical(
-                            "[SFA full graph] source/metadata preparation failed; "
-                            "exiting worker to notify the local executor supervisor",
-                            exc_info=(type(local_error), local_error, local_error.__traceback__),
-                        )
-                        exit_failed_sfa_worker(local_error)
-                else:
-                    # Capture and unsupported executor topologies still agree
-                    # before entering EP/TP collectives (including idle DP ranks).
-                    failed = torch.tensor([int(local_error is not None)], dtype=torch.int32)
-                    for group in (get_tp_group(), get_dp_group()):
-                        if group.world_size > 1:
-                            dist.all_reduce(failed, op=dist.ReduceOp.MAX, group=group.cpu_group)
-                    if failed.item():
-                        raise RuntimeError(
-                            "[SFA full graph] source/metadata preparation failed on this or a peer worker"
-                        ) from local_error
+                self._coordinate_sfa_full_graph_preparation(
+                    local_error,
+                    context.staged_sfa_graph_dummy_run,
+                )
             output = self._sfa_full_graph.run(
                 self._run_sfa_full_graph_target,
                 **({"prepared": prepared_call} if prepared_call is not None else graph_kwargs),

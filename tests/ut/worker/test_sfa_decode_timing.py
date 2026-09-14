@@ -233,6 +233,8 @@ def fake_worker(events, *, full=True):
             for name in (
                 "_prepare_inputs",
                 "_build_attention_metadata",
+                "_sync_batch_across_dp",
+                "_coordinate_sfa_full_graph_preparation",
                 "_sample",
                 "_bookkeeping_sync",
                 "_copy_draft_token_ids_to_cpu",
@@ -371,7 +373,7 @@ def test_worker_rpcs_only_fence_outside_measurement_and_always_restore(monkeypat
         model_runner=SimpleNamespace(_sfa_full_graph=graph, use_async_scheduling=False),
         benchmark_process_info=lambda: {"rank": 1, "pid": 123},
     )
-    assert start(worker, 5000) == {"rank": 1, "pid": 123}
+    assert start(worker, "5000") == {"rank": 1, "pid": 123}
     assert events == ["sync", "install"]
     assert install.call_args.kwargs["prompt_tokens"] == 5000
     assert worker._decode_timing is timing

@@ -77,6 +77,7 @@ def routing():
         "_validate_sfa_layerwise_connector_cudagraph_mode",
         "_sync_batch_across_dp",
         "_determine_batch_execution_and_padding",
+        "_coordinate_sfa_full_graph_preparation",
         "_model_forward",
         "_staged_sfa_dummy_seq_len",
         "_prepare_staged_sfa_dummy_block_tables",
