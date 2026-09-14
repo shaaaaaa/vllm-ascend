@@ -146,6 +146,11 @@ def client_command(args: argparse.Namespace, mode_dir: Path) -> list[str]:
         "/v1/completions",
         "--model",
         SERVED_MODEL,
+        # The API alias is not a Hugging Face model/tokenizer identifier.
+        # Load the same local tokenizer and custom code as the server.
+        "--tokenizer",
+        args.model,
+        "--trust-remote-code",
         "--header",
         "X-data-parallel-rank=0",
         "--dataset-name",

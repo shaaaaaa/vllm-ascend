@@ -165,6 +165,11 @@ python tools/sfa_serving_repro.py --diagnose --prompt-tokens 131614 --output-tok
 grep -aE '\[SFA_SERVING(_TIMING)?\]' log.log
 ```
 
+The benchmark client loads its tokenizer from the local `--model` directory
+(by default `/workspace/models/GLM-5.1-w4a8`), with `--trust-remote-code` matching
+the server. `sfa-serving-repro` is only the API model alias, not a Hugging Face
+repository to download. The local model directory must include tokenizer files.
+
 Both modes use an eight-layer dummy model, the recompute scheduler, the serving
 capture buckets and one active request routed to DP0, with DP1 idle. They keep
 cold-compact loading enabled, **shared CPU cache enabled**, strict shared-cache

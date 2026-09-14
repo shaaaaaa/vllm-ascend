@@ -2,7 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """CPU contracts for the online TP4 x DP2 SFA reproducer."""
 
+import argparse
 import ast
+import asyncio
 import copy
 import importlib.util
 import io
@@ -181,6 +183,83 @@ def test_client_is_exactly_one_request_without_hidden_probe_or_warmup(repro, arg
     assert argument(command, "--percentile-metrics") == "ttft,tpot,itl,e2el"
     assert "--ignore-eos" in command and "--save-detailed" in command
     assert "--num-warmups" not in command
+
+
+@pytest.mark.parametrize("model_directory", ["GLM-5.1-w4a8", "custom model"])
+def test_client_loads_local_tokenizer_but_requests_server_alias(repro, args, tmp_path, model_directory):
+    args.model = str(tmp_path / model_directory)
+    command = repro.client_command(args, tmp_path)
+    assert argument(command, "--tokenizer") == args.model
+    assert "--trust-remote-code" in command
+    assert argument(command, "--model") == argument(repro.server_command(args, "full"), "--served-model-name")
+
+
+@pytest.mark.parametrize("omit_tokenizer", [False, True])
+def test_real_bench_tokenizer_selection(repro, args, tmp_path, omit_tokenizer):
+    """Exercise upstream CLI definitions and model/tokenizer selection on CPU.
+
+    Only these startup blocks are isolated; tokenizer loading is mocked so the
+    test never imports the NPU stack or downloads a model. The negative case
+    reproduces why an API alias alone was wrongly treated as a Hugging Face ID.
+    """
+    source_dir = Path(__file__).resolve().parents[4] / "vllm/vllm/benchmarks"
+    if not (source_dir / "serve.py").is_file():
+        pytest.skip("Requires the matching sibling vLLM checkout")
+    serve = ast.parse((source_dir / "serve.py").read_text(encoding="utf-8"))
+    datasets = ast.parse((source_dir / "datasets.py").read_text(encoding="utf-8"))
+    cli = next(n for n in serve.body if isinstance(n, ast.FunctionDef) and n.name == "add_cli_args")
+    dataset_cli = next(n for n in datasets.body if isinstance(n, ast.FunctionDef) and n.name == "add_dataset_parser")
+    flags = {
+        "--model",
+        "--served-model-name",
+        "--tokenizer",
+        "--tokenizer-mode",
+        "--skip-tokenizer-init",
+        "--trust-remote-code",
+    }
+    definitions = [
+        node
+        for node in cli.body + dataset_cli.body
+        if isinstance(node, ast.Expr)
+        and isinstance(node.value, ast.Call)
+        and isinstance(node.value.func, ast.Attribute)
+        and node.value.func.attr == "add_argument"
+        and node.value.args
+        and isinstance(node.value.args[0], ast.Constant)
+        and node.value.args[0].value in flags
+    ]
+    assert len(definitions) == len(flags)
+    parser = argparse.ArgumentParser()
+    exec(compile(ast.Module(body=definitions, type_ignores=[]), "<bench CLI>", "exec"), {"parser": parser})
+    command = repro.client_command(args, tmp_path)[3:]
+    if omit_tokenizer:
+        index = command.index("--tokenizer")
+        del command[index : index + 2]
+    parsed, _ = parser.parse_known_args(command)
+    main = next(n for n in serve.body if isinstance(n, ast.AsyncFunctionDef) and n.name == "main_async")
+    selection = [
+        node
+        for node in main.body
+        if isinstance(node, ast.If) and ast.unparse(node.test) in {"args.model is None", "args.skip_tokenizer_init"}
+    ]
+    assert len(selection) == 2
+    # Keep the original async blocks intact (model discovery contains await).
+    select = ast.AsyncFunctionDef(
+        name="select",
+        args=ast.arguments(posonlyargs=[], args=[], kwonlyargs=[], kw_defaults=[], defaults=[]),
+        body=selection,
+        decorator_list=[],
+    )
+    namespace = {"args": parsed, "get_tokenizer": Mock()}
+    exec(
+        compile(ast.fix_missing_locations(ast.Module(body=[select], type_ignores=[])), "<bench selection>", "exec"),
+        namespace,
+    )
+    asyncio.run(namespace["select"]())
+    namespace["get_tokenizer"].assert_called_once_with(
+        repro.SERVED_MODEL if omit_tokenizer else args.model, tokenizer_mode="auto", trust_remote_code=True
+    )
+    assert parsed.model == repro.SERVED_MODEL
 
 
 def test_reported_long_context_diagnostic_arguments(repro, args, tmp_path):
