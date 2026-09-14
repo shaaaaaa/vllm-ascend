@@ -112,8 +112,6 @@ class SFABenchmarkWorker(NPUWorker):
         prompt_tokens = int(prompt_tokens)
         if getattr(self, "_decode_timing", None) is not None:
             raise RuntimeError("Decode timing is already active")
-        if self.model_runner.use_async_scheduling:
-            raise RuntimeError("Decode timing requires synchronous benchmark scheduling")
         torch.npu.synchronize()
         self._decode_timing_root_start = self.model_runner._sfa_full_graph.replay_count
         self._decode_timing_source_start = self.model_runner._sfa_full_graph.source_binding_count

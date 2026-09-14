@@ -5,11 +5,14 @@
 import ast
 import copy
 import importlib.util
+import io
 import json
 import logging
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock
+from urllib.error import HTTPError
 
 import pytest
 
@@ -154,6 +157,10 @@ def test_server_reproduces_serving_topology_and_only_mode_switch_differs(repro, 
     assert argument(full, "--max-model-len") == "140000"
     assert json.loads(argument(full, "--additional-config"))["recompute_scheduler_enable"] is True
     assert "enforce_eager" not in json.loads(argument(full, "--speculative-config"))
+    # Diagnostics must support the server's existing scheduling policy, not
+    # change it to make an offline-only timing wrapper accept the server.
+    assert "--no-async-scheduling" not in full
+    assert "--async-scheduling" not in full
 
     staged_env = repro.serving_environment("staged", args.devices, diagnose=False)
     full_env = repro.serving_environment("full", args.devices, diagnose=False)
@@ -229,6 +236,49 @@ def test_diagnostics_disable_other_recorder_and_rpc_serializes_prompt(repro, arg
     monkeypatch.setattr(repro, "request_json", lambda url, body, timeout: captured.append((url, body, timeout)) or {})
     repro.timing_rpc(args, "benchmark_start_decode_timing")
     assert captured[0][1]["args"] == ["30000"]
+
+
+@pytest.mark.parametrize("with_server_log", [False, True])
+def test_rpc_error_preserves_http_body_and_worker_trace(repro, args, monkeypatch, tmp_path, with_server_log):
+    error = HTTPError(
+        "http://127.0.0.1:9000/collective_rpc",
+        500,
+        "Internal Server Error",
+        {},
+        io.BytesIO(b'{"detail":"Worker failed during diagnostic setup"}'),
+    )
+    opener = SimpleNamespace(open=Mock(side_effect=error))
+    build_opener = Mock(return_value=opener)
+    monkeypatch.setattr(repro.urllib.request, "build_opener", build_opener)
+    monkeypatch.setenv("http_proxy", "http://proxy.invalid:8080")
+    log_path = tmp_path / "server.log"
+    log_path.write_text("old line\n" * 10000 + "RuntimeError: actual worker exception\n", encoding="utf-8")
+    with pytest.raises(RuntimeError) as caught:
+        repro.timing_rpc(args, "benchmark_start_decode_timing", server_log=log_path if with_server_log else None)
+    assert caught.value.__cause__ is error
+    message = str(caught.value)
+    assert "benchmark_start_decode_timing failed: HTTP 500" in message
+    assert "Worker failed during diagnostic setup" in message
+    if with_server_log:
+        assert str(log_path) in message
+        assert "RuntimeError: actual worker exception" in message
+        assert len(message) < 8192
+    assert build_opener.call_args.args[0].proxies == {}
+    request = opener.open.call_args.args[0]
+    assert json.loads(request.data)["args"] == ["30000"]
+
+
+def test_unreadable_server_log_does_not_hide_rpc_error(repro, args, monkeypatch, tmp_path):
+    error = HTTPError("http://127.0.0.1:9000/collective_rpc", 500, "Internal Server Error", {}, io.BytesIO(b"failed"))
+    monkeypatch.setattr(repro, "request_json", Mock(side_effect=error))
+    with pytest.raises(RuntimeError, match="HTTP 500") as caught:
+        repro.timing_rpc(args, "benchmark_stop_decode_timing", server_log=tmp_path / "missing.log")
+    assert "Unable to read" in str(caught.value)
+
+
+def test_timing_summary_exposes_actual_async_policy(repro, capsys):
+    repro.print_timing("full", {"results": [{"async_scheduling": True}, {"async_scheduling": True}]})
+    assert "full async_workers=2/2" in capsys.readouterr().out
 
 
 def test_diagnostic_summary_separates_dp_and_failure_agreement(repro, capsys):

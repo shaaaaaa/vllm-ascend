@@ -51,10 +51,11 @@ class Moments:
 
 
 class DecodeTiming:
-    def __init__(self, event_factory=None):
+    def __init__(self, event_factory=None, *, async_scheduling: bool = False):
         self.active = False
         self.thread_id = threading.get_ident()
         self.event_factory = event_factory
+        self.async_scheduling = async_scheduling
         self.scopes: dict[str, dict[str, Moments]] = {}
         self.stack: list[dict[str, Any]] = []
         self.pending: list[tuple[str, Any, Any]] = []
@@ -168,10 +169,12 @@ class DecodeTiming:
             self.add(stage, "stream_span", float(start.elapsed_time(end)))
         self.pending.clear()
         return {
+            "async_scheduling": self.async_scheduling,
             "decode_steps": self.decode_steps,
             "prefill_steps_excluded": self.prefill_steps,
             "query_tokens_histogram": dict(self.query_tokens),
             "sampled_tokens_histogram": dict(self.sampled_tokens),
+            "sampled_tokens_histogram_available": not self.async_scheduling,
             "graph_profiles_histogram": dict(self.graph_profiles),
             "device_intervals_dropped": self.device_intervals_dropped,
             "detail_event_stride": DETAIL_EVENT_STRIDE,
@@ -245,8 +248,8 @@ def install_sampling_timing(runner, timing: DecodeTiming) -> None:
 
 def install_decode_timing(worker, connector, *, prompt_tokens: int, event_factory=None) -> DecodeTiming:
     """Install for the diagnostic request; restore everything on stop/error."""
-    timing = DecodeTiming(event_factory)
     runner = worker.model_runner
+    timing = DecodeTiming(event_factory, async_scheduling=bool(getattr(runner, "use_async_scheduling", False)))
     original_execute, original_sample = worker.execute_model, worker.sample_tokens
 
     def execute(scheduler_output, *args, **kwargs):
@@ -257,9 +260,11 @@ def install_decode_timing(worker, connector, *, prompt_tokens: int, event_factor
     def sample(*args, **kwargs):
         with timing.scope("worker.sample"):
             result = original_sample(*args, **kwargs)
-        if timing.recording and result is not None:
-            # Async scheduling is disabled by the benchmark. Never read a tensor
-            # or trigger device transfers just to count output tokens.
+        if timing.recording and result is not None and not timing.async_scheduling:
+            # Synchronous results already contain CPU token lists. Async results
+            # must remain deferred: never inspect their tensors or call
+            # get_output() just for diagnostics. The client measures output
+            # tokens/TPOT; this worker histogram is unavailable in async mode.
             rows = result.sampled_token_ids
             if not isinstance(rows, list) or any(not isinstance(row, list) for row in rows):
                 raise RuntimeError("Expected synchronous CPU sampled token lists")

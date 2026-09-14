@@ -225,15 +225,33 @@ def stop_server(process: subprocess.Popen) -> None:
         process.wait(timeout=30)
 
 
-def timing_rpc(args: argparse.Namespace, method: str) -> dict | None:
+def server_log_tail(log_path: Path) -> str:
+    """Keep errors self-contained without reading a potentially huge server log."""
+    try:
+        with log_path.open("rb") as log:
+            log.seek(0, os.SEEK_END)
+            log.seek(max(0, log.tell() - 65536))
+            return "\n".join(log.read().decode("utf-8", errors="replace").splitlines()[-80:])
+    except OSError as exc:
+        return f"Unable to read {log_path}: {exc}"
+
+
+def timing_rpc(args: argparse.Namespace, method: str, *, server_log: Path | None = None) -> dict | None:
     body: dict = {"method": method, "timeout": SERVER_READY_TIMEOUT}
     if method == "benchmark_start_decode_timing":
         body["args"] = [str(args.prompt_tokens)]
-    return request_json(
-        f"http://127.0.0.1:{args.port}/collective_rpc",
-        body,
-        timeout=SERVER_READY_TIMEOUT,
-    )
+    try:
+        return request_json(
+            f"http://127.0.0.1:{args.port}/collective_rpc",
+            body,
+            timeout=SERVER_READY_TIMEOUT,
+        )
+    except urllib.error.HTTPError as exc:
+        detail = exc.read(8192).decode("utf-8", errors="replace")
+        message = f"{method} failed: HTTP {exc.code} {exc.reason}\nResponse: {detail}"
+        if server_log is not None:
+            message += f"\nServer log: {server_log}\n{server_log_tail(server_log)}"
+        raise RuntimeError(message) from exc
 
 
 def run_mode(args: argparse.Namespace, mode: str, root: Path) -> dict:
@@ -253,10 +271,10 @@ def run_mode(args: argparse.Namespace, mode: str, root: Path) -> dict:
         try:
             wait_until_ready(process, args.port, log_path)
             if args.diagnose:
-                timing_rpc(args, "benchmark_start_decode_timing")
+                timing_rpc(args, "benchmark_start_decode_timing", server_log=log_path)
             subprocess.run(client_command(args, mode_dir), check=True, env=client_environment())
             if args.diagnose:
-                timing = timing_rpc(args, "benchmark_stop_decode_timing")
+                timing = timing_rpc(args, "benchmark_stop_decode_timing", server_log=log_path)
                 (mode_dir / "timing.json").write_text(json.dumps(timing, indent=2), encoding="utf-8")
                 print_timing(mode, timing)
         finally:
@@ -271,6 +289,13 @@ def print_timing(mode: str, response: dict | None) -> None:
     workers = response.get("results", []) if isinstance(response, dict) else []
     if not workers:
         raise RuntimeError(f"{mode} diagnostic RPC returned no worker timings")
+    if all("async_scheduling" in worker for worker in workers):
+        async_workers = sum(bool(worker["async_scheduling"]) for worker in workers)
+        print(
+            f"[SFA_SERVING_TIMING] {mode} async_workers={async_workers}/{len(workers)} "
+            "(async output-token histograms are unavailable; client TPOT is unchanged)",
+            flush=True,
+        )
     stage_names = (
         "dp.batch_sync",
         "target.forward",

@@ -180,6 +180,17 @@ cache settings are identical between staged and full modes; only
 omit it for clean latency measurements. Full server logs are retained under
 `profile/sfa-serving-*/{staged,full}/server.log`.
 
+Diagnostics preserve the server's scheduling policy, including async scheduling;
+they do not add `--no-async-scheduling`. With async outputs, the recorder measures
+worker launch/prepare/forward/sampling scopes but does not read token tensors or
+force deferred output completion. Worker `sampled_tokens_histogram` is empty and
+`sampled_tokens_histogram_available=false`; output-token counts and TPOT still
+come from the benchmark client. `async_workers=N/M` reports the actual policy
+of the workers returned by the RPC. Host spans do not include deferred readback
+completion; do not interpret them as full token latency or add overlapping spans.
+If a diagnostic RPC fails, `log.log` includes its method, HTTP response body and
+the tail of the corresponding server log, rather than only `HTTP Error 500`.
+
 CPU tests execute the matching sibling LMCache's complete configuration
 validator against the script's settings and reproduce the formerly invalid
 combination. They do not validate NPU startup or establish a performance gain.

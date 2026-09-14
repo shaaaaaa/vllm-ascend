@@ -350,7 +350,8 @@ def benchmark_rpc_methods(namespace):
 
 
 @pytest.mark.parametrize("report_failure", [False, True])
-def test_worker_rpcs_only_fence_outside_measurement_and_always_restore(monkeypatch, report_failure):
+@pytest.mark.parametrize("async_scheduling", [False, True])
+def test_worker_rpcs_only_fence_outside_measurement_and_always_restore(monkeypatch, report_failure, async_scheduling):
     events = []
     timing = SimpleNamespace(
         close=lambda: events.append("restore"),
@@ -370,7 +371,7 @@ def test_worker_rpcs_only_fence_outside_measurement_and_always_restore(monkeypat
     start, stop = benchmark_rpc_methods({"torch": SimpleNamespace(npu=npu)})
     graph = SimpleNamespace(replay_count=100, source_binding_count=5)
     worker = SimpleNamespace(
-        model_runner=SimpleNamespace(_sfa_full_graph=graph, use_async_scheduling=False),
+        model_runner=SimpleNamespace(_sfa_full_graph=graph, use_async_scheduling=async_scheduling),
         benchmark_process_info=lambda: {"rank": 1, "pid": 123},
     )
     assert start(worker, "5000") == {"rank": 1, "pid": 123}
@@ -395,6 +396,49 @@ def test_worker_rpcs_only_fence_outside_measurement_and_always_restore(monkeypat
     assert worker._decode_timing is None
     assert events[2:4] == ["restore", "sync"]
     assert events[-1] == "restore"
+
+
+@pytest.mark.parametrize("full", [False, True])
+def test_async_timing_leaves_deferred_outputs_unmaterialized(timing_module, full):
+    worker, connector = fake_worker([], full=full)
+    worker.model_runner.use_async_scheduling = True
+
+    class DeferredOutput:
+        @property
+        def sampled_token_ids(self):
+            raise AssertionError("Diagnostics must not read deferred token IDs")
+
+        def get_output(self):
+            raise AssertionError("Diagnostics must not force asynchronous output completion")
+
+    deferred_output = DeferredOutput()
+    original_sample = worker.sample_tokens
+
+    def async_sample():
+        original_sample()
+        return deferred_output
+
+    worker.sample_tokens = async_sample
+    original_execute = worker.execute_model
+    timing = timing_module.install_decode_timing(worker, connector, prompt_tokens=5000)
+    worker.execute_model(schedule(4999, 0, 1))
+    assert worker.sample_tokens() is deferred_output
+    assert not timing.scopes
+    for index in range(3):
+        assert worker.execute_model(schedule(5001 + index, index + 1)) == "hidden"
+        assert worker.sample_tokens() is deferred_output
+    report = timing.report()
+    assert report["async_scheduling"] is True
+    assert report["decode_steps"] == 3
+    assert report["prefill_steps_excluded"] == 1
+    assert report["sampled_tokens_histogram_available"] is False
+    assert report["sampled_tokens_histogram"] == {}
+    for stage in ("target.forward", "worker.sample", "sampling", "mtp.propose"):
+        assert report["stages"][stage]["wall"]["count"] == 3
+    timing.close()
+    assert worker.execute_model is original_execute
+    assert worker.sample_tokens is async_sample
+    assert worker.model_runner.use_async_scheduling is True
 
 
 def test_actual_worker_wrapper_dispatches_to_installed_probe(timing_module):
