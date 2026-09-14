@@ -1,6 +1,7 @@
 import json
 import os
 from contextlib import nullcontext
+from copy import copy
 from dataclasses import dataclass, field
 from functools import lru_cache
 from threading import Lock
@@ -1749,6 +1750,41 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             decode_remap_boundary_ready=False,
             num_decode_tokens=num_decode_rows,
         )
+
+    def rebind_layerwise_prefill_metadata(
+        self,
+        template: AscendSFAMetadata,
+        common_attn_metadata: AscendCommonAttentionMetadata,
+    ) -> AscendSFAMetadata | None:
+        """Reuse one group's build within a single P-node prefill forward.
+
+        RoPE, sequence lengths and masks do not depend on the rotating bank.
+        Keep each layer's metadata object separate, and replace *all* bank
+        views, including clearing indexer views on shared-indexer layers.
+        Never cache this template across forwards. CP derives additional slot
+        mappings, and decode has mutable sparse state: use normal build there.
+        """
+        if (
+            self.enable_dsa_cp
+            or template.attn_state not in (
+                AscendAttentionState.PrefillNoCache,
+                AscendAttentionState.PrefillCacheHit,
+                AscendAttentionState.ChunkedPrefill,
+            )
+            or template.num_decode_tokens
+        ):
+            return None
+        metadata = copy(template)
+        num_reqs = common_attn_metadata.num_reqs
+        num_tokens = common_attn_metadata.num_input_tokens
+        metadata.block_table = common_attn_metadata.block_table_tensor[:num_reqs]
+        metadata.slot_mapping = common_attn_metadata.slot_mapping[:num_tokens]
+        metadata.indexer_block_table = None
+        metadata.indexer_slot_mapping = None
+        if common_attn_metadata.indexer_block_table_tensor is not None:
+            metadata.indexer_block_table = common_attn_metadata.indexer_block_table_tensor[:num_reqs]
+            metadata.indexer_slot_mapping = common_attn_metadata.indexer_slot_mapping[:num_tokens]
+        return metadata
 
     def build_for_graph_capture(
         self,

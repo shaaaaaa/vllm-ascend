@@ -538,6 +538,11 @@ class NPUModelRunner(GPUModelRunner):
             logger.info(
                 "Layerwise-prefill P node enabled: two-bank global DSA slab."
             )
+        # Initialize before validating the explicit D-node role.
+        # Step B staging (1 = B2 compact-scratch decode read; 2 = +B1 freeing).
+        self.dsa_shrink_latent = (
+            int(envs_ascend.VLLM_ASCEND_DSA_SHRINK_LATENT) if self.dsa_two_groups else 0
+        )
         if self.dsa_sparse_decode_d_node:
             if not self.dsa_shared_pool:
                 raise ValueError(
@@ -553,10 +558,6 @@ class NPUModelRunner(GPUModelRunner):
                 "Pure sparse-decode D node enabled: role-aware capacity and "
                 "bootstrap admission contract."
             )
-        # Step B staging (1 = B2 compact-scratch decode read; 2 = +B1 freeing).
-        self.dsa_shrink_latent = (
-            int(envs_ascend.VLLM_ASCEND_DSA_SHRINK_LATENT) if self.dsa_two_groups else 0
-        )
         if self.dsa_shrink_latent:
             logger.info("DSA shrink-latent stage %d enabled (B2 compact-scratch decode).", self.dsa_shrink_latent)
         # dsa c8
@@ -2985,10 +2986,24 @@ class NPUModelRunner(GPUModelRunner):
                 num_reqs,
             )
 
+        # P layers revisit the same four (KV group, bank) views. Prepare their
+        # padding once per forward, not once per layer. Keep CP and routed-expert
+        # side effects on their existing path.
+        prefill_bank_views = (
+            {}
+            if self.layerwise_prefill_p_node and not self.use_cp
+            and not self.model_config.enable_return_routed_experts
+            else None
+        )
+
         def _get_block_table_and_slot_mapping(
             kv_cache_gid: int,
             bank: int = 0,
         ):
+            if prefill_bank_views is not None:
+                cached_views = prefill_bank_views.get((kv_cache_gid, bank))
+                if cached_views is not None:
+                    return cached_views
             assert num_reqs_padded is not None and num_tokens_padded is not None
             kv_cache_spec = kv_cache_groups[kv_cache_gid].kv_cache_spec
             if self.pcp_size > 1:
@@ -3042,6 +3057,8 @@ class NPUModelRunner(GPUModelRunner):
                 )
             if self.model_config.enable_return_routed_experts and kv_cache_gid == 0:
                 self.cpu_slot_mapping = slot_mapping.cpu().numpy()
+            if prefill_bank_views is not None:
+                prefill_bank_views[kv_cache_gid, bank] = blk_table_tensor, slot_mapping
             return blk_table_tensor, slot_mapping
 
         block_table_gid_0, slot_mapping_gid_0 = _get_block_table_and_slot_mapping(0)
@@ -3179,7 +3196,8 @@ class NPUModelRunner(GPUModelRunner):
             common_attn_metadata: CommonAttentionMetadata,
             ubid: int | None = None,
             layer_names: tuple[str, ...] | None = None,
-        ) -> None:
+            shared_prefill_metadata: AttentionMetadata | None = None,
+        ) -> AttentionMetadata:
             attn_group = self.attn_groups[kv_cache_gid][attn_gid]
             builder = attn_group.get_metadata_builder(ubid or 0)
             cascade_attn_prefix_len = (
@@ -3195,9 +3213,15 @@ class NPUModelRunner(GPUModelRunner):
                     num_decode_draft_tokens_cpu=self.num_decode_draft_tokens.cpu[:num_reqs_padded],
                 )
 
+            attn_metadata_i = None
+            if shared_prefill_metadata is not None and not for_cudagraph_capture:
+                rebind = getattr(builder, "rebind_layerwise_prefill_metadata", None)
+                if rebind is not None:
+                    attn_metadata_i = rebind(shared_prefill_metadata, common_attn_metadata)
+
             if for_cudagraph_capture:
                 attn_metadata_i = builder.build_for_cudagraph_capture(common_attn_metadata)
-            else:
+            elif attn_metadata_i is None:
                 attn_metadata_i = builder.build(
                     common_prefix_len=cascade_attn_prefix_len,
                     common_attn_metadata=common_attn_metadata,
@@ -3219,6 +3243,7 @@ class NPUModelRunner(GPUModelRunner):
 
             for layer_name in layer_names or tuple(attn_group.layer_names):
                 attn_metadata_dict[layer_name] = attn_metadata_i
+            return attn_metadata_i
 
         # Prepare the attention metadata for each KV cache group and make layers
         # in the same group share the same metadata.
@@ -3281,6 +3306,9 @@ class NPUModelRunner(GPUModelRunner):
 
                 attn_group = self.attn_groups[kv_cache_gid][attn_gid]
                 refs = self._layerwise_prefill_refs()
+                # Only reuse within this group and this forward. Each layer
+                # still owns a separate metadata object with its own bank views.
+                shared_prefill_metadata = None
                 for layer_name in attn_group.layer_names:
                     ref = refs.get(layer_name)
                     if ref is None:
@@ -3311,11 +3339,12 @@ class NPUModelRunner(GPUModelRunner):
                                 _get_block_table_and_slot_mapping,
                             )
                         )
-                    _build_attn_group_metadata(
+                    shared_prefill_metadata = _build_attn_group_metadata(
                         kv_cache_gid,
                         attn_gid,
                         layer_cm,
                         layer_names=(layer_name,),
+                        shared_prefill_metadata=shared_prefill_metadata,
                     )
                     if (
                         self.speculative_config
