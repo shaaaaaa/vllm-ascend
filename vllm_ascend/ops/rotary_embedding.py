@@ -126,6 +126,47 @@ def _record_cos_and_sin_cache_interleaved(cos_sin_cache):
     _sin_cache = sin_cache.squeeze(1)
 
 
+def _required_rope_cache_rows() -> int:
+    """Rows the rotary cache must cover for the accepted engine length."""
+    try:
+        vllm_config = get_current_vllm_config()
+    except Exception:
+        return 0
+    if vllm_config is None or getattr(vllm_config, "model_config", None) is None:
+        return 0
+    max_model_len = int(vllm_config.model_config.max_model_len)
+    spec_tokens = getattr(vllm_config, "num_speculative_tokens", 0)
+    if spec_tokens is None and getattr(vllm_config, "speculative_config", None) is not None:
+        spec_tokens = vllm_config.speculative_config.num_speculative_tokens
+    return max_model_len + int(spec_tokens or 0) + 1
+
+
+def validate_rope_cache_lengths(model: torch.nn.Module, required_rows: int) -> tuple[int, int]:
+    """Validate every rotary cache covers ``required_rows`` positions.
+
+    Returns ``(num_rotary_modules, min_cache_rows)``. Raises when any module
+    would be indexed out of range by the configured maximum sequence length.
+    """
+    checked = 0
+    min_rows: int | None = None
+    for module in model.modules():
+        cache = getattr(module, "cos_sin_cache", None)
+        if not isinstance(cache, torch.Tensor):
+            continue
+        rows = int(cache.shape[0])
+        checked += 1
+        if min_rows is None or rows < min_rows:
+            min_rows = rows
+        if rows < required_rows:
+            raise ValueError(
+                "RoPE cache is too short for the configured length: "
+                f"module={type(module).__name__} rows={rows} "
+                f"required={required_rows}. The rotary cache must cover "
+                "max_model_len + num_speculative_tokens + 1 positions."
+            )
+    return checked, min_rows or 0
+
+
 def update_cos_sin(positions):
     global _cos
     global _sin
@@ -227,6 +268,19 @@ class AscendRotaryEmbedding(RotaryEmbedding):
         super().__init__(head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype, init_cache)
         vllm_config = get_current_vllm_config()
         self.use_mtp = vllm_config.speculative_config and vllm_config.speculative_config.method == "mtp"
+        required_rows = _required_rope_cache_rows()
+        cache = getattr(self, "cos_sin_cache", None)
+        if isinstance(cache, torch.Tensor) and required_rows > int(cache.shape[0]):
+            # Extend only the number of rows; the frequency parameters and the
+            # original max_position_embeddings stay untouched so YaRN-style
+            # correction ranges do not change.
+            original_max_positions = self.max_position_embeddings
+            try:
+                self.max_position_embeddings = required_rows
+                extended = self._compute_cos_sin_cache().to(self.dtype)
+            finally:
+                self.max_position_embeddings = original_max_positions
+            self.register_buffer("cos_sin_cache", extended, persistent=False)
         _record_cos_sin_cache(self.cos_sin_cache)
         _record_cos_and_sin_cache_interleaved(self.cos_sin_cache)
 
@@ -331,6 +385,11 @@ class AscendDeepseekScalingRotaryEmbedding(DeepseekScalingRotaryEmbedding):
 
         # NOTE: For ascend friendly computing, reorder sin and cos cache
         self.max_seq_len = math.ceil(max_position_embeddings * scaling_factor)
+        required_rows = _required_rope_cache_rows()
+        if required_rows > self.max_seq_len:
+            # Only the number of rows changes; inv_freq keeps using the original
+            # max_position_embeddings, base, scaling factor and mscale.
+            self.max_seq_len = required_rows
         self._set_cos_sin_cache(self.max_seq_len, device=NPUPlatform.device_type, dtype=dtype)
 
     def _yarn_get_mscale(self, scale: float = 1, mscale: float = 1) -> float:

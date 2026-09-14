@@ -55,6 +55,12 @@ from vllm.v1.attention.backend import AttentionBackend, AttentionMetadata
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
 from vllm.v1.attention.selector import get_attn_backend  # type: ignore
+from vllm.v1.core.dsa_shared_pool import (
+    LAYERWISE_PREFILL_BANK_COUNT,
+    DSABlockAllocationMode,
+    PrefillLayerRef,
+    build_prefill_layer_refs,
+)
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
@@ -511,6 +517,41 @@ class NPUModelRunner(GPUModelRunner):
             logger.warning(
                 "VLLM_ASCEND_DSA_SHARED_POOL requires DSA_UNBUNDLE=1 and "
                 "DSA_TWO_GROUPS=1; ignoring."
+            )
+        self.layerwise_prefill_p_node = bool(
+            envs_ascend.VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE
+        )
+        self.dsa_sparse_decode_d_node = bool(
+            envs_ascend.VLLM_ASCEND_DSA_SPARSE_DECODE_D_NODE
+        )
+        if self.layerwise_prefill_p_node and self.dsa_sparse_decode_d_node:
+            raise ValueError(
+                "VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE and "
+                "VLLM_ASCEND_DSA_SPARSE_DECODE_D_NODE are mutually exclusive"
+            )
+        if self.layerwise_prefill_p_node and not self.dsa_shared_pool:
+            raise ValueError(
+                "Layerwise-prefill P nodes require DSA unbundle, two groups, "
+                "and the DSA shared pool"
+            )
+        if self.layerwise_prefill_p_node:
+            logger.info(
+                "Layerwise-prefill P node enabled: two-bank global DSA slab."
+            )
+        if self.dsa_sparse_decode_d_node:
+            if not self.dsa_shared_pool:
+                raise ValueError(
+                    "VLLM_ASCEND_DSA_SPARSE_DECODE_D_NODE=true requires DSA "
+                    "unbundle, two groups, and the DSA shared pool"
+                )
+            if not self.dsa_shrink_latent:
+                raise ValueError(
+                    "VLLM_ASCEND_DSA_SPARSE_DECODE_D_NODE=true requires "
+                    "VLLM_ASCEND_DSA_SHRINK_LATENT=2 so LATENT stays sparse."
+                )
+            logger.info(
+                "Pure sparse-decode D node enabled: role-aware capacity and "
+                "bootstrap admission contract."
             )
         # Step B staging (1 = B2 compact-scratch decode read; 2 = +B1 freeing).
         self.dsa_shrink_latent = (
@@ -993,6 +1034,103 @@ class NPUModelRunner(GPUModelRunner):
             return staged_sfa_graph_key.request_capacity
         return batch_desc.num_reqs
 
+    def _refresh_layerwise_prefill_block_tables(self):
+        """Rebuild the shadow-bank table in current request-row order."""
+        tables = getattr(
+            self.input_batch,
+            "layerwise_prefill_block_tables",
+            (self.input_batch.block_table,),
+        )
+        if not self.layerwise_prefill_p_node:
+            return tables
+        if len(tables) != LAYERWISE_PREFILL_BANK_COUNT:
+            raise RuntimeError(
+                "Layerwise-prefill P node requires exactly two block tables"
+            )
+
+        for req_index, req_id in enumerate(self.input_batch.req_ids):
+            request = self.requests[req_id]
+            if (
+                request.block_allocation_mode
+                != DSABlockAllocationMode.PREFILL_CHILD
+            ):
+                raise RuntimeError(
+                    "Layerwise-prefill request has the wrong allocation mode: "
+                    f"request_id={req_id}, "
+                    f"mode={request.block_allocation_mode}"
+                )
+            bank_ids = request.block_ids_by_bank
+            if (
+                bank_ids is None
+                or len(bank_ids) != LAYERWISE_PREFILL_BANK_COUNT
+            ):
+                raise RuntimeError(
+                    "Layerwise-prefill request is missing its two physical "
+                    f"block banks: request_id={req_id}"
+                )
+            if bank_ids[0] != request.block_ids:
+                raise RuntimeError(
+                    "Layerwise-prefill primary block table differs from bank 0: "
+                    f"request_id={req_id}"
+                )
+            tables[1].add_row(bank_ids[1], req_index)
+        return tables
+
+    def _layerwise_prefill_refs(self) -> dict[str, PrefillLayerRef]:
+        refs = getattr(self, "_lp_layer_refs", None)
+        if refs is not None:
+            return refs
+        groups = self.kv_cache_config.kv_cache_groups
+        if len(groups) != 2:
+            raise RuntimeError(
+                "Layerwise-prefill P node requires exactly two KV groups"
+            )
+        latent_group = max(
+            groups, key=lambda g: g.kv_cache_spec.page_size_bytes
+        )
+        indexer_group = min(
+            groups, key=lambda g: g.kv_cache_spec.page_size_bytes
+        )
+        refs = dict(
+            build_prefill_layer_refs(
+                latent_group.layer_names,
+                indexer_group.layer_names,
+            )
+        )
+        self._lp_layer_refs = refs
+        return refs
+
+    def _layerwise_prefill_common_attn_metadata(
+        self,
+        common_attn_metadata: CommonAttentionMetadata,
+        block_table_gid: int,
+        block_table_bank: int,
+        indexer_bank: int | None,
+        block_table_getter: Any,
+    ) -> CommonAttentionMetadata:
+        """Copy common metadata and select the physical bank per KV group.
+
+        The LATENT and INDEXER groups rotate independently, so the caller
+        resolves each sibling's own bank instead of reusing one bank for both.
+        """
+        layer_cm = copy(common_attn_metadata)
+        (
+            layer_cm.block_table_tensor,
+            layer_cm.slot_mapping,
+        ) = block_table_getter(block_table_gid, block_table_bank)
+        if indexer_bank is not None:
+            (
+                layer_cm.indexer_block_table_tensor,
+                layer_cm.indexer_slot_mapping,
+            ) = block_table_getter(1, indexer_bank)
+        else:
+            layer_cm.indexer_block_table_tensor = None
+            layer_cm.indexer_slot_mapping = None
+        return layer_cm
+
+    def _layerwise_prefill_indexer_sibling(self, layer_name: str) -> str:
+        return layer_name.rsplit(".", 1)[0] + ".indexer.k_cache"
+
     def _prepare_inputs(
         self,
         scheduler_output: "SchedulerOutput",
@@ -1012,7 +1150,9 @@ class NPUModelRunner(GPUModelRunner):
 
         # OPTIMIZATION: Start copying the block table first.
         # This way, we can overlap the copy with the following CPU operations.
-        self.input_batch.block_table.commit_block_table(num_reqs)
+        block_tables_by_bank = self._refresh_layerwise_prefill_block_tables()
+        for block_table in block_tables_by_bank:
+            block_table.commit_block_table(num_reqs)
 
         # Get the attention state.
         if not scheduler_output.scheduled_spec_decode_tokens:
@@ -1080,8 +1220,9 @@ class NPUModelRunner(GPUModelRunner):
             cu_num_tokens, arange = self._get_cumsum_and_arange(num_scheduled_tokens)
             np.add(self.input_batch.num_computed_tokens_cpu[req_indices], arange, out=positions_np)
 
-        self.input_batch.block_table.compute_slot_mapping(req_indices, positions_np)
-        self.input_batch.block_table.commit_slot_mapping(total_num_scheduled_tokens)
+        for block_table in block_tables_by_bank:
+            block_table.compute_slot_mapping(req_indices, positions_np)
+            block_table.commit_slot_mapping(total_num_scheduled_tokens)
 
         if self.use_cp:
             self.pcp_manager.init_batch_info(
@@ -2844,7 +2985,10 @@ class NPUModelRunner(GPUModelRunner):
                 num_reqs,
             )
 
-        def _get_block_table_and_slot_mapping(kv_cache_gid: int):
+        def _get_block_table_and_slot_mapping(
+            kv_cache_gid: int,
+            bank: int = 0,
+        ):
             assert num_reqs_padded is not None and num_tokens_padded is not None
             kv_cache_spec = kv_cache_groups[kv_cache_gid].kv_cache_spec
             if self.pcp_size > 1:
@@ -2869,7 +3013,16 @@ class NPUModelRunner(GPUModelRunner):
                     device=self.device,
                 )
             else:
-                blk_table = self.input_batch.block_table[kv_cache_gid]
+                block_tables_by_bank = getattr(
+                    self.input_batch,
+                    "layerwise_prefill_block_tables",
+                    (self.input_batch.block_table,),
+                )
+                if bank < 0 or bank >= len(block_tables_by_bank):
+                    raise RuntimeError(
+                        f"invalid layerwise-prefill bank {bank}"
+                    )
+                blk_table = block_tables_by_bank[bank][kv_cache_gid]
                 slot_mapping = blk_table.slot_mapping.gpu[:maybe_pcp_full_tokens]
                 maybe_num_reqs_padded = num_reqs_padded * self.decode_token_per_req if self.use_cp else num_reqs_padded
                 blk_table_tensor = blk_table.get_device_tensor()[:maybe_num_reqs_padded]
@@ -3025,6 +3178,7 @@ class NPUModelRunner(GPUModelRunner):
             attn_gid: int,
             common_attn_metadata: CommonAttentionMetadata,
             ubid: int | None = None,
+            layer_names: tuple[str, ...] | None = None,
         ) -> None:
             attn_group = self.attn_groups[kv_cache_gid][attn_gid]
             builder = attn_group.get_metadata_builder(ubid or 0)
@@ -3063,7 +3217,7 @@ class NPUModelRunner(GPUModelRunner):
                 assert isinstance(attn_metadata, list)
                 attn_metadata_dict = attn_metadata[ubid]
 
-            for layer_name in attn_group.layer_names:
+            for layer_name in layer_names or tuple(attn_group.layer_names):
                 attn_metadata_dict[layer_name] = attn_metadata_i
 
         # Prepare the attention metadata for each KV cache group and make layers
@@ -3109,7 +3263,11 @@ class NPUModelRunner(GPUModelRunner):
                         else self.input_batch.num_prompt_tokens[:num_reqs]
                     )
                     cm.prompt_lens_cpu = plens_np
-            if self.speculative_config and spec_decode_common_attn_metadata is None:
+            if (
+                self.speculative_config
+                and spec_decode_common_attn_metadata is None
+                and not self.layerwise_prefill_p_node
+            ):
                 if isinstance(self.drafter, AscendEagleProposer | AscendDraftModelProposer):
                     if self.drafter.attn_layer_names[0] in kv_cache_group.layer_names:
                         spec_decode_common_attn_metadata = cm
@@ -3117,7 +3275,62 @@ class NPUModelRunner(GPUModelRunner):
                     spec_decode_common_attn_metadata = cm
 
             for attn_gid in range(len(self.attn_groups[kv_cache_gid])):
-                _build_attn_group_metadata(kv_cache_gid, attn_gid, cm)
+                if not self.layerwise_prefill_p_node:
+                    _build_attn_group_metadata(kv_cache_gid, attn_gid, cm)
+                    continue
+
+                attn_group = self.attn_groups[kv_cache_gid][attn_gid]
+                refs = self._layerwise_prefill_refs()
+                for layer_name in attn_group.layer_names:
+                    ref = refs.get(layer_name)
+                    if ref is None:
+                        raise RuntimeError(
+                            "Layerwise-prefill layer is missing its bank "
+                            f"reference: {layer_name}"
+                        )
+                    if ref.kv_group == 0:
+                        indexer_ref = refs.get(
+                            self._layerwise_prefill_indexer_sibling(layer_name)
+                        )
+                        layer_cm = (
+                            self._layerwise_prefill_common_attn_metadata(
+                                cm,
+                                0,
+                                ref.bank,
+                                None if indexer_ref is None else indexer_ref.bank,
+                                _get_block_table_and_slot_mapping,
+                            )
+                        )
+                    else:
+                        layer_cm = (
+                            self._layerwise_prefill_common_attn_metadata(
+                                cm,
+                                1,
+                                ref.bank,
+                                None,
+                                _get_block_table_and_slot_mapping,
+                            )
+                        )
+                    _build_attn_group_metadata(
+                        kv_cache_gid,
+                        attn_gid,
+                        layer_cm,
+                        layer_names=(layer_name,),
+                    )
+                    if (
+                        self.speculative_config
+                        and self.layerwise_prefill_p_node
+                        and spec_decode_common_attn_metadata is None
+                        and isinstance(
+                            self.drafter,
+                            AscendEagleProposer | AscendDraftModelProposer,
+                        )
+                        and layer_name in self.drafter.attn_layer_names
+                    ):
+                        # The MTP cache row uses its own rotating bank; the
+                        # proposer must build draft metadata from this banked
+                        # metadata, not from the target's default bank.
+                        spec_decode_common_attn_metadata = layer_cm
         if self.is_mm_prefix_lm:
             req_doc_ranges = {}
             for req_id in self.input_batch.req_ids:
@@ -4148,17 +4361,47 @@ class NPUModelRunner(GPUModelRunner):
                 self.model = self.load_lora_model(self.model, self.vllm_config, self.device)
         self.model_memory_usage = m.consumed_memory
         logger.info("Loading model weights took %.4f GB", m.consumed_memory / float(2**30))
+        self._validate_rope_cache_lengths()
 
         # wrap the model with full graph wrapper if needed.
         if self.compilation_config.cudagraph_mode.has_full_cudagraphs():
             self.update_stream: torch.npu.Stream = torch.npu.Stream()
             self.model = ACLGraphWrapper(self.model, self.vllm_config, runtime_mode=CUDAGraphMode.FULL)
 
+    def _validate_rope_cache_lengths(self) -> None:
+        """Validate that every rotary cache covers the accepted length."""
+        from vllm_ascend.ops.rotary_embedding import validate_rope_cache_lengths
+
+        spec_tokens = getattr(self.vllm_config, "num_speculative_tokens", 0)
+        if spec_tokens is None and self.speculative_config is not None:
+            spec_tokens = self.speculative_config.num_speculative_tokens
+        required_rows = (
+            int(self.model_config.max_model_len) + int(spec_tokens or 0) + 1
+        )
+        checked, min_rows = validate_rope_cache_lengths(
+            self.model, required_rows
+        )
+        logger.info(
+            "RoPE cache validation: modules=%d min_rows=%d required=%d",
+            checked,
+            min_rows,
+            required_rows,
+        )
+
     def _validate_sfa_layerwise_connector_cudagraph_mode(self) -> None:
         """Reject full-model replay that would bypass layerwise retrieval."""
+        layerwise_prefill_p_node = bool(
+            getattr(self, "layerwise_prefill_p_node", False)
+        )
         staged_graph_configured = staged_sfa_graph_configured(
             self.vllm_config
         )
+        if staged_graph_configured and layerwise_prefill_p_node:
+            raise ValueError(
+                "Layerwise-prefill P nodes require the standard PIECEWISE "
+                "mla_forward boundary and do not support the staged "
+                "cross-layer SFA graph path."
+            )
         if (
             envs_ascend.VLLM_ASCEND_SFA_STAGED_GRAPH
             and not staged_graph_configured
@@ -4186,21 +4429,108 @@ class NPUModelRunner(GPUModelRunner):
                     "reliable per-request frontier metadata, and a consumer "
                     "role (kv_both or kv_consumer)."
                 )
+        if layerwise_prefill_p_node:
+            if not has_kv_transfer_group():
+                raise ValueError(
+                    "Layerwise-prefill P nodes require an active KV connector "
+                    "that supports the two-bank transfer window."
+                )
+            connector = get_kv_transfer_group()
+            transfer_window_supported = getattr(
+                connector,
+                "supports_layerwise_prefill_transfer_window",
+                False,
+            )
+            if callable(transfer_window_supported):
+                transfer_window_supported = transfer_window_supported()
+            if transfer_window_supported is not True:
+                raise ValueError(
+                    "Layerwise-prefill P nodes require a layerwise, "
+                    "producer-capable connector with dense direct load/store "
+                    "support."
+                )
+            index_lmcache_supported = bool(
+                getattr(connector, "supports_dsa_index_lmcache", False)
+            )
+            complete_protocol_supported = getattr(
+                connector,
+                "supports_layerwise_prefill_dsa_index_transfer_window",
+                None,
+            )
+            if callable(complete_protocol_supported):
+                complete_protocol_supported = complete_protocol_supported()
+            if complete_protocol_supported is None:
+                complete_protocol_supported = bool(
+                    transfer_window_supported and index_lmcache_supported
+                )
+            if (
+                envs_ascend.VLLM_ASCEND_DSA_DISABLE_INDEX_LMCACHE
+                or not index_lmcache_supported
+                or complete_protocol_supported is not True
+            ):
+                raise ValueError(
+                    "Layerwise-prefill P nodes require LMCache persistence "
+                    "for both the latent and DSA index KV groups in the same "
+                    "transfer-window connector."
+                )
         mode = self.compilation_config.cudagraph_mode
         if not self.use_sparse or not mode.has_full_cudagraphs():
             return
         if not has_kv_transfer_group():
             return
         connector = get_kv_transfer_group()
-        if not bool(
+        uses_layerwise_callbacks = bool(
             getattr(connector, "uses_layerwise_model_callbacks", False)
-        ):
+        ) or bool(
+            getattr(
+                connector,
+                "supports_layerwise_prefill_transfer_window",
+                False,
+            )
+        )
+        if not uses_layerwise_callbacks:
             return
         raise ValueError(
             "SFA with a layerwise KV connector does not support FULL or "
             "FULL_DECODE_ONLY graph mode: full-model replay bypasses the "
             "Python per-layer retrieval callbacks. Use PIECEWISE graph mode."
         )
+
+    def _validate_dsa_sparse_decode_d_node(
+        self, kv_cache_config: KVCacheConfig
+    ) -> None:
+        """Fail closed before serving if the D bootstrap contract is unmet."""
+        if not getattr(self, "dsa_sparse_decode_d_node", False):
+            return
+        if len(kv_cache_config.kv_cache_groups) != 2:
+            raise ValueError(
+                "VLLM_ASCEND_DSA_SPARSE_DECODE_D_NODE=true requires exactly "
+                "two registered KV cache groups (latent + indexer)."
+            )
+        if not has_kv_transfer_group():
+            raise ValueError(
+                "VLLM_ASCEND_DSA_SPARSE_DECODE_D_NODE=true requires an active "
+                "LMCache connector for the PD bootstrap source."
+            )
+        if not staged_sfa_graph_configured(self.vllm_config):
+            raise ValueError(
+                "VLLM_ASCEND_DSA_SPARSE_DECODE_D_NODE=true requires the "
+                "staged SFA sparse-load path (VLLM_ASCEND_SFA_STAGED_GRAPH=1)."
+            )
+        connector = get_kv_transfer_group()
+        if not bool(
+            getattr(connector, "supports_dsa_compact_external_load", False)
+        ):
+            raise ValueError(
+                "VLLM_ASCEND_DSA_SPARSE_DECODE_D_NODE=true requires a "
+                "connector that supports DSA cold compact external load."
+            )
+        if int(os.environ.get("LMCACHE_DECODE_WINDOW_SAVE_WINDOW_SIZE", "0")) <= 0:
+            raise ValueError(
+                "VLLM_ASCEND_DSA_SPARSE_DECODE_D_NODE=true requires "
+                "LMCACHE_DECODE_WINDOW_SAVE_WINDOW_SIZE > 0 so the resident "
+                "LATENT tail is bounded."
+            )
 
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
         """
@@ -4227,6 +4557,7 @@ class NPUModelRunner(GPUModelRunner):
         self.maybe_add_kv_sharing_layers_to_kv_cache_groups(kv_cache_config)
         # NOTE(cmq): initialize_attn_backend must before using self.attn_groups
         self.initialize_attn_backend(kv_cache_config)
+        self._validate_dsa_sparse_decode_d_node(kv_cache_config)
         self.use_hybrid_blocks = len(self.attn_groups) > 1
         # NOTE: Currently, we determine whether we need `num_accepted_tokens` through `MambaSpec`.
         self.need_accepted_tokens = any(
@@ -4432,6 +4763,7 @@ class NPUModelRunner(GPUModelRunner):
         """
         # init kv cache tensors
         kv_cache_raw_tensors: dict[str, torch.Tensor | torch.Tensor | None | None] = {}
+        self._layerwise_prefill_global_raw_backing = None
         # prefill disaggregation need the addr of cache tensor be aligned with 2M
         alignment = 2 * 1024 * 1024
         layer_kv_cache_spec = self._get_layer_kv_cache_specs(kv_cache_config)
@@ -4457,12 +4789,28 @@ class NPUModelRunner(GPUModelRunner):
             ):
                 if self.use_sparse_c8_indexer:
                     raise RuntimeError("DSA shared pool does not support sparse C8 indexer.")
-                if self.vllm_config.kv_transfer_config is None:
+                if (
+                    self.vllm_config.kv_transfer_config is None
+                    and not self.layerwise_prefill_p_node
+                ):
                     raw_tensor = torch.zeros(kv_cache_tensor.size, dtype=torch.int8, device=self.device)
                 else:
                     cache_size_aligned = kv_cache_tensor.size + alignment
-                    raw_tensor = torch.zeros(cache_size_aligned, dtype=torch.int8, device=self.device)
-                    raw_tensor = self._align_memory(raw_tensor, alignment)[: kv_cache_tensor.size]
+                    raw_backing = torch.zeros(
+                        cache_size_aligned,
+                        dtype=torch.int8,
+                        device=self.device,
+                    )
+                    raw_tensor = self._align_memory(
+                        raw_backing, alignment
+                    )[: kv_cache_tensor.size]
+                    if self.layerwise_prefill_p_node:
+                        if self._layerwise_prefill_global_raw_backing is not None:
+                            raise RuntimeError(
+                                "Layerwise-prefill P node received more than "
+                                "one global DSA shared tensor"
+                            )
+                        self._layerwise_prefill_global_raw_backing = raw_backing
                 for layer_name_inner in kv_cache_tensor.shared_by:
                     kv_cache_raw_tensors[layer_name_inner] = (raw_tensor,)
                 continue
@@ -4638,6 +4986,10 @@ class NPUModelRunner(GPUModelRunner):
         """
         kv_caches: dict[str, torch.Tensor] = {}
         layer_kv_cache_spec = self._get_layer_kv_cache_specs(kv_cache_config)
+        dsa_shared_views: dict[
+            int,
+            tuple[tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]],
+        ] = {}
         for group in self._kv_cache_spec_attn_group_iterator():
             attn_backend = group.backend
             for layer_name in group.layer_names:
@@ -4657,16 +5009,35 @@ class NPUModelRunner(GPUModelRunner):
                     elt = get_dtype_size(spec.dtype)
                     kv_lora_rank, qk_rope_head_dim, index_head_dim = self.sparse_head_dim
                     if self.dsa_shared_pool and len(raws) == 1:
-                        kv_caches[layer_name] = reshape_dsa_shared_pool_raw(
-                            raws[0],
-                            spec.dtype,
-                            bs,
-                            nh,
-                            kv_lora_rank,
-                            qk_rope_head_dim,
-                            index_head_dim,
-                            is_indexer="indexer" in layer_name,
-                        )
+                        raw = raws[0]
+                        raw_key = id(raw)
+                        views = dsa_shared_views.get(raw_key)
+                        if views is None:
+                            latent_views = reshape_dsa_shared_pool_raw(
+                                raw,
+                                spec.dtype,
+                                bs,
+                                nh,
+                                kv_lora_rank,
+                                qk_rope_head_dim,
+                                index_head_dim,
+                                is_indexer=False,
+                            )
+                            indexer_views = reshape_dsa_shared_pool_raw(
+                                raw,
+                                spec.dtype,
+                                bs,
+                                nh,
+                                kv_lora_rank,
+                                qk_rope_head_dim,
+                                index_head_dim,
+                                is_indexer=True,
+                            )
+                            views = (latent_views, indexer_views)
+                            dsa_shared_views[raw_key] = views
+                        kv_caches[layer_name] = views[
+                            int("indexer" in layer_name)
+                        ]
                         continue
                     # Discriminate by LAYER NAME (grouping may rewrite sparse_head_dim).
                     if "indexer" in layer_name:  # single vector cache

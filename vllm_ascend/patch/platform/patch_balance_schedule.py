@@ -327,6 +327,7 @@ class BalanceScheduler(Scheduler):
 
                 num_external_computed_tokens = 0
                 load_kv_async = False
+                dsa_compact_external_load = False
                 connector_prefix_cache_queries, connector_prefix_cache_hits = 0, 0
 
                 # Get already-cached tokens.
@@ -340,6 +341,13 @@ class BalanceScheduler(Scheduler):
                     if self.connector is not None:
                         ext_tokens, load_kv_async = self.connector.get_num_new_matched_tokens(
                             request, num_new_local_computed_tokens
+                        )
+                        dsa_compact_external_load = load_kv_async and bool(
+                            getattr(
+                                self.connector,
+                                "supports_dsa_compact_external_load",
+                                False,
+                            )
                         )
 
                         if ext_tokens is None:
@@ -442,6 +450,7 @@ class BalanceScheduler(Scheduler):
                     num_external_computed_tokens=num_external_computed_tokens,
                     delay_cache_blocks=load_kv_async,
                     num_encoder_tokens=num_encoder_tokens,
+                    dsa_compact_external_load=dsa_compact_external_load,
                 )
 
                 if new_blocks is None:
@@ -546,12 +555,27 @@ class BalanceScheduler(Scheduler):
                     req,
                     req_to_new_blocks[req.request_id].get_block_ids(),
                     req._all_token_ids,
+                    block_ids_by_bank=req_to_new_blocks[
+                        req.request_id
+                    ].get_block_ids_by_bank(),
+                    block_allocation_mode=req_to_new_blocks[
+                        req.request_id
+                    ].get_allocation_mode(),
                 )
                 for req in scheduled_new_reqs
             ]
         else:
             new_reqs_data = [
-                NewRequestData.from_request(req, req_to_new_blocks[req.request_id].get_block_ids())
+                NewRequestData.from_request(
+                    req,
+                    req_to_new_blocks[req.request_id].get_block_ids(),
+                    block_ids_by_bank=req_to_new_blocks[
+                        req.request_id
+                    ].get_block_ids_by_bank(),
+                    block_allocation_mode=req_to_new_blocks[
+                        req.request_id
+                    ].get_allocation_mode(),
+                )
                 for req in scheduled_new_reqs
             ]
 

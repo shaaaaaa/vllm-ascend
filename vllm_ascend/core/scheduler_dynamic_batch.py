@@ -540,7 +540,16 @@ class SchedulerDynamicBatch(Scheduler):
             num_common_prefix_blocks = self.kv_cache_manager.get_num_common_prefix_blocks(any_request.request_id)
         # Construct the scheduler output.
         new_reqs_data = [
-            NewRequestData.from_request(req, req_to_new_blocks[req.request_id].get_block_ids())
+            NewRequestData.from_request(
+                req,
+                req_to_new_blocks[req.request_id].get_block_ids(),
+                block_ids_by_bank=req_to_new_blocks[
+                    req.request_id
+                ].get_block_ids_by_bank(),
+                block_allocation_mode=req_to_new_blocks[
+                    req.request_id
+                ].get_allocation_mode(),
+            )
             for req in scheduled_new_reqs
         ]
         cached_reqs_data = self._make_cached_request_data(

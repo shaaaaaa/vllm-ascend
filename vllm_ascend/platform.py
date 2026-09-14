@@ -274,6 +274,34 @@ class NPUPlatform(Platform):
         parallel_config = vllm_config.parallel_config
         cache_config = vllm_config.cache_config
         ascend_compilation_config = ascend_config.ascend_compilation_config
+        layerwise_prefill_p_node = envs_ascend.VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE
+        sparse_decode_d_node = envs_ascend.VLLM_ASCEND_DSA_SPARSE_DECODE_D_NODE
+        if layerwise_prefill_p_node and sparse_decode_d_node:
+            raise ValueError(
+                "VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE and "
+                "VLLM_ASCEND_DSA_SPARSE_DECODE_D_NODE are mutually exclusive"
+            )
+        if layerwise_prefill_p_node or sparse_decode_d_node:
+            role = "P" if layerwise_prefill_p_node else "D"
+            if parallel_config.pipeline_parallel_size != 1:
+                raise ValueError(
+                    f"{role} node mode requires pipeline_parallel_size == 1"
+                )
+            if parallel_config.prefill_context_parallel_size != 1:
+                raise ValueError(
+                    f"{role} node mode requires prefill_context_parallel_size == 1"
+                )
+            if parallel_config.decode_context_parallel_size != 1:
+                raise ValueError(
+                    f"{role} node mode requires decode_context_parallel_size == 1 "
+                    "(no DCP; each rank restores the full history)"
+                )
+        if layerwise_prefill_p_node and envs_ascend.VLLM_ASCEND_ENABLE_MATMUL_ALLREDUCE:
+            raise ValueError(
+                "VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE=true requires "
+                "VLLM_ASCEND_ENABLE_MATMUL_ALLREDUCE=0 so load/save can "
+                "be submitted before the separate HCOM all-reduce"
+            )
         if ascend_compilation_config:
             vllm_config.additional_config.setdefault("ascend_compilation_config", {}).update(
                 vars(ascend_compilation_config)
