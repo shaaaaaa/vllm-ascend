@@ -4536,15 +4536,26 @@ class NPUModelRunner(GPUModelRunner):
                 "VLLM_ASCEND_DSA_SPARSE_DECODE_D_NODE=true requires exactly "
                 "two registered KV cache groups (latent + indexer)."
             )
-        if not has_kv_transfer_group():
-            raise ValueError(
-                "VLLM_ASCEND_DSA_SPARSE_DECODE_D_NODE=true requires an active "
-                "LMCache connector for the PD bootstrap source."
-            )
         if not staged_sfa_graph_configured(self.vllm_config):
             raise ValueError(
                 "VLLM_ASCEND_DSA_SPARSE_DECODE_D_NODE=true requires the "
                 "staged SFA sparse-load path (VLLM_ASCEND_SFA_STAGED_GRAPH=1)."
+            )
+        if int(os.environ.get("LMCACHE_DECODE_WINDOW_SAVE_WINDOW_SIZE", "0")) <= 0:
+            raise ValueError(
+                "VLLM_ASCEND_DSA_SPARSE_DECODE_D_NODE=true requires "
+                "LMCACHE_DECODE_WINDOW_SAVE_WINDOW_SIZE > 0 so the resident "
+                "LATENT tail is bounded."
+            )
+        # Graph-memory profiling initializes a temporary KV cache before
+        # Worker.initialize_from_config creates the connector. Defer only the
+        # connector checks; final KV initialization must enforce them again.
+        if self._profiling_cudagraph_memory:
+            return
+        if not has_kv_transfer_group():
+            raise ValueError(
+                "VLLM_ASCEND_DSA_SPARSE_DECODE_D_NODE=true requires an active "
+                "LMCache connector for the PD bootstrap source."
             )
         connector = get_kv_transfer_group()
         if not bool(
@@ -4553,12 +4564,6 @@ class NPUModelRunner(GPUModelRunner):
             raise ValueError(
                 "VLLM_ASCEND_DSA_SPARSE_DECODE_D_NODE=true requires a "
                 "connector that supports DSA cold compact external load."
-            )
-        if int(os.environ.get("LMCACHE_DECODE_WINDOW_SAVE_WINDOW_SIZE", "0")) <= 0:
-            raise ValueError(
-                "VLLM_ASCEND_DSA_SPARSE_DECODE_D_NODE=true requires "
-                "LMCACHE_DECODE_WINDOW_SAVE_WINDOW_SIZE > 0 so the resident "
-                "LATENT tail is bounded."
             )
 
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
