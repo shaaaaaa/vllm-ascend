@@ -4441,8 +4441,9 @@ class AscendSFAImpl(MLAAttentionImpl):
                     index_topk=self.index_topk,
                     cached_tokens=route.frontiers,
                 )
-                if index_enabled and self._layer_has_indexer_by_name(
-                    context, next_layer_name
+                if index_enabled and (
+                    not self.index_cache_enabled
+                    or self._layer_has_indexer_by_name(context, next_layer_name)
                 ):
                     # Only producer layers own an indexer cache to wait for;
                     # shared consumers load no group-1 rows.

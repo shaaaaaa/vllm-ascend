@@ -76,6 +76,7 @@ def test_staged_consumer_prepares_the_next_physical_indexer():
     exec(compile(ast.fix_missing_locations(ast.Module(body=[future, *nodes], type_ignores=[])), str(path), "exec"), ns)
     obj = type("Consumer", (), {name: ns[name] for name in names})()
     obj.has_indexer, obj.dsa_offload_unbundle = False, True
+    obj.index_cache_enabled = True
     current, following = "model.layers.5.self_attn.attn", "model.layers.6.self_attn.attn"
     cache, index_name, enabled = obj._cross_layer_kv_cache(current, (object(), object()))
     assert index_name is None and enabled
@@ -97,3 +98,15 @@ def test_staged_consumer_prepares_the_next_physical_indexer():
     next_impl.has_indexer = False
     obj.cross_layer_lmcache_retrieve(current, following, payload, payload, payload, metadata, context)
     assert waits == [current]
+
+    # A full-indexer model already knows that every following layer owns one;
+    # do not add name parsing / wrapper lookup to its decode callback.
+    obj.has_indexer = next_impl.has_indexer = True
+    obj.index_cache_enabled = False
+    def unexpected_lookup(*args):
+        raise AssertionError("legacy decode performed a shared-indexer lookup")
+
+    obj._layer_has_indexer_by_name = unexpected_lookup
+    waits.clear()
+    obj.cross_layer_lmcache_retrieve(current, following, payload, payload, payload, metadata, context)
+    assert waits == [current, "model.layers.6.self_attn.indexer.k_cache"]
