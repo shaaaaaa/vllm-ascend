@@ -273,6 +273,33 @@ def test_reported_long_context_diagnostic_arguments(repro, args, tmp_path):
     assert argument(repro.server_command(args, "full"), "--max-model-len") == "140000"
 
 
+@pytest.mark.parametrize("mode", ["full", "staged"])
+def test_single_mode_diagnostic_does_not_launch_peer_or_claim_speedup(repro, args, tmp_path, monkeypatch, capsys, mode):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "sfa_serving_repro.py",
+            "--model",
+            args.model,
+            "--output-dir",
+            str(tmp_path / "results"),
+            "--order",
+            mode,
+            "--diagnose",
+        ],
+    )
+    run = Mock(return_value={"output_lens": [512], "mean_tpot_ms": 42})
+    compare = Mock(side_effect=AssertionError("Single-mode run has no comparison"))
+    monkeypatch.setattr(repro, "run_mode", run)
+    monkeypatch.setattr(repro, "compare_results", compare)
+    repro.main()
+    assert run.call_count == 1 and run.call_args.args[1] == mode
+    assert run.call_args.args[0].diagnose is True
+    compare.assert_not_called()
+    assert "single-mode run, no speedup comparison" in capsys.readouterr().out
+
+
 def test_comparison_requires_paired_token_lengths_and_reports_regression(repro):
     staged = {
         "input_lens": [30000],
@@ -353,6 +380,59 @@ def test_unreadable_server_log_does_not_hide_rpc_error(repro, args, monkeypatch,
     with pytest.raises(RuntimeError, match="HTTP 500") as caught:
         repro.timing_rpc(args, "benchmark_stop_decode_timing", server_log=tmp_path / "missing.log")
     assert "Unable to read" in str(caught.value)
+
+
+def test_stall_snapshots_survive_later_error_log_tail(repro, tmp_path, capsys):
+    log = tmp_path / "server.log"
+    reports = [json.dumps({"dp_rank": rank, "last_phase": "execute_dummy_batch.enter"}) for rank in (0, 1)]
+    log.write_text(
+        "\n".join("(Worker) [SFA_SERVING_STALL] " + report for report in reports)
+        + "\n"
+        + "later engine error\n" * 10000,
+        encoding="utf-8",
+    )
+    repro.print_stall_snapshots("full", log)
+    output = capsys.readouterr().out
+    assert output.count("[SFA_SERVING_STALL] mode=full") == 2
+    assert all(report in output for report in reports)
+    assert "later engine error" not in output
+
+
+@pytest.mark.parametrize("output_tokens", [1, 512])
+def test_run_mode_preserves_stall_evidence_on_incomplete_output_or_rpc_error(
+    repro, args, tmp_path, monkeypatch, capsys, output_tokens
+):
+    args.diagnose = True
+    process = Mock()
+
+    def launch(*a, **kwargs):
+        kwargs["stdout"].write('(Worker) [SFA_SERVING_STALL] {"dp_rank": 1}\n')
+        kwargs["stdout"].flush()
+        return process
+
+    def client(*a, **kwargs):
+        (tmp_path / "full/client.json").write_text(
+            json.dumps({"completed": 1, "failed": 0, "output_lens": [output_tokens]}), encoding="utf-8"
+        )
+
+    def rpc(args, method, **kwargs):
+        if method == "benchmark_stop_decode_timing":
+            raise RuntimeError("stop RPC failed")
+        return {}
+
+    stop = Mock()
+    call_rpc = Mock(side_effect=rpc)
+    monkeypatch.setattr(repro.subprocess, "Popen", launch)
+    monkeypatch.setattr(repro.subprocess, "run", client)
+    monkeypatch.setattr(repro, "wait_until_ready", Mock())
+    monkeypatch.setattr(repro, "timing_rpc", call_rpc)
+    monkeypatch.setattr(repro, "stop_server", stop)
+    match = "incomplete generation.*512 output tokens" if output_tokens == 1 else "stop RPC failed"
+    with pytest.raises(RuntimeError, match=match):
+        repro.run_mode(args, "full", tmp_path)
+    assert call_rpc.call_count == (1 if output_tokens == 1 else 2)
+    stop.assert_called_once_with(process)
+    assert '[SFA_SERVING_STALL] mode=full {"dp_rank": 1}' in capsys.readouterr().out
 
 
 def test_timing_summary_exposes_actual_async_policy(repro, capsys):

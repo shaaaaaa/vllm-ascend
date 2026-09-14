@@ -316,6 +316,12 @@ def install_decode_timing(worker, connector, *, prompt_tokens: int, event_factor
             timing.observe(impl, "prepare_full_graph_layer", f"metadata.L{index}")
             timing.observe(impl, "_cross_layer_metadata_ineligible_reason", "metadata.shared_check")
             timing.observe(impl, "cross_layer_lmcache_retrieve", f"retrieve.L{index}", device=True, sample_device=True)
+        config = getattr(worker, "vllm_config", None)
+        if config is not None and config.additional_config.get("sfa_benchmark_serving") is True:
+            from vllm_ascend.worker.sfa_serving_stall import ServingStallDiagnostic
+
+            stall = ServingStallDiagnostic(worker, timing).start()
+            timing.patches.callback(stall.close)
     except BaseException:
         timing.close()
         raise

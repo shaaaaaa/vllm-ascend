@@ -196,6 +196,30 @@ completion; do not interpret them as full token latency or add overlapping spans
 If a diagnostic RPC fails, `log.log` includes its method, HTTP response body and
 the tail of the corresponding server log, rather than only `HTTP Error 500`.
 
+In serving `--diagnose` mode, each worker also watches host RPC progress,
+including idle-DP dummy batches and gaps after asynchronous output submission.
+After 30 seconds without progress, it emits one `[SFA_SERVING_STALL]` JSON
+snapshot with DP/TP identity, the last RPC phase, submitted root-replay count,
+and execution/async-output thread stacks. A background thread checks every
+5 seconds; it adds no per-layer hooks, device queries, barriers or tensor reads.
+This is a host-stall observation, not proof that a particular device kernel is
+at fault; a legitimately long RPC can also trigger it. The observer is absent
+from clean runs and the offline benchmark, and is removed when timing stops.
+Snapshots are copied from the server log into `log.log` during server cleanup,
+even if the engine died before the stop-timing RPC. To diagnose a full-only
+failure without repeating the successful staged run:
+
+```bash
+python tools/sfa_serving_repro.py --order full --diagnose --prompt-tokens 131614 --output-tokens 1000 2>&1 | tee log.log
+grep -aF '[SFA_SERVING_STALL]' log.log
+```
+
+Single-mode runs retain their client/server results but do not report speedup.
+
+The driver rejects incomplete generation even if `vllm bench` labels the stream
+successful: the single response must contain the requested output-token count.
+An interrupted one-token response is not a valid zero-TPOT measurement.
+
 CPU tests execute the matching sibling LMCache's complete configuration
 validator against the script's settings and reproduce the formerly invalid
 combination. They do not validate NPU startup or establish a performance gain.

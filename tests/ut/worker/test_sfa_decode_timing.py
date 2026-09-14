@@ -325,6 +325,43 @@ def test_failed_install_restores_previously_patched_methods(timing_module):
     assert worker.execute_model is original
 
 
+@pytest.mark.parametrize("serving", [False, True])
+def test_stall_observer_is_serving_only_and_closes_before_timing_handles(timing_module, monkeypatch, serving):
+    path = ROOT / "vllm_ascend/worker/sfa_serving_stall.py"
+    spec = importlib.util.spec_from_file_location("vllm_ascend.worker.sfa_serving_stall", path)
+    module = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, spec.name, module)
+    spec.loader.exec_module(module)
+    start = Mock(wraps=module.ServingStallDiagnostic.start)
+    # Preserve binding for the real observer; retain its instance for cleanup assertions.
+    monkeypatch.setattr(module.ServingStallDiagnostic, "start", lambda self: start(self))
+    worker, connector = fake_worker([])
+    worker.rank = 0
+    worker.vllm_config = SimpleNamespace(
+        additional_config={"sfa_benchmark_serving": serving},
+        parallel_config=SimpleNamespace(data_parallel_rank=0, tensor_parallel_size=4),
+    )
+    original_execute = worker.execute_model
+    original_dummy = worker.execute_dummy_batch = Mock()
+    timing = timing_module.install_decode_timing(worker, connector, prompt_tokens=5000)
+    try:
+        worker.execute_model(schedule(5001, 1))
+        worker.sample_tokens()
+        worker.execute_dummy_batch()
+        if serving:
+            observer = start.call_args.args[0]
+            assert observer.progress[0] == "execute_dummy_batch.return"
+            assert observer.thread.is_alive()
+        else:
+            start.assert_not_called()
+    finally:
+        timing.close()
+    if serving:
+        assert not observer.thread.is_alive()
+    assert worker.execute_model is original_execute
+    assert worker.execute_dummy_batch is original_dummy
+
+
 def test_scope_failure_keeps_original_exception_and_unwinds_stack(timing_module):
     timing = timing_module.DecodeTiming()
     timing.active = True
