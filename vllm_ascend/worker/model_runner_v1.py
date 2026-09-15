@@ -107,6 +107,7 @@ from vllm_ascend.attention.mtp_dw_diag import (
     post_commit_sample_requests,
     scheduled_decode_requests,
 )
+from vllm_ascend.attention.sfa_remap_boundary import prepare_native_sparse_boundaries
 from vllm_ascend.attention.target_sfa_diagnostics import (
     target_tail_boundary,
 )
@@ -3484,6 +3485,8 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                     context.staged_sfa_graph_key,
                 )
             return output
+        if envs_ascend.VLLM_ASCEND_SFA_FULL_GRAPH:
+            prepare_native_sparse_boundaries(self._staged_sfa_impls, context.attn_metadata)
         hidden_states = self.model(
             input_ids=input_ids,
             positions=positions,

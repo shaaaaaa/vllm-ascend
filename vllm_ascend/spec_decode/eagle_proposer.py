@@ -50,6 +50,7 @@ from vllm_ascend.ascend_forward_context import (
 )
 from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
+from vllm_ascend.attention.sfa_remap_boundary import prepare_native_sparse_boundaries
 from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
 from vllm_ascend.compilation.acl_graph import (
     ACLGraphWrapper,
@@ -664,6 +665,14 @@ class SpecDecodeBaseProposer(EagleProposer):
         per_layer_attn_metadata: Any,
         runtime_inputs: dict[str, Any],
     ) -> Any:
+        if (
+            self.method == "mtp" and envs_ascend.VLLM_ASCEND_SFA_FULL_GRAPH
+            and get_forward_context().cudagraph_runtime_mode != CUDAGraphMode.FULL
+        ):
+            prepare_native_sparse_boundaries(
+                ((name, layer.impl) for name, layer in self._draft_attn_layers.items()),
+                per_layer_attn_metadata,
+            )
         context = getattr(self, "_mtp_draft_diag_context", None)
         if self.method != "mtp" or context is None:
             return self.model(**model_kwargs)

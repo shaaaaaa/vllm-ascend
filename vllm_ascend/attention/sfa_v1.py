@@ -414,6 +414,8 @@ def _update_dsa_split_boundary_in_place(
 def _resolve_sparse_cached_tokens_by_request(
     attn_metadata: Any,
     request_ids: Any,
+    *,
+    compact: bool = False,
 ) -> list[int]:
     """Resolve strict connector frontiers in the native request order."""
     row_req_indices = attn_metadata.decode_req_indices_cpu
@@ -435,6 +437,8 @@ def _resolve_sparse_cached_tokens_by_request(
         request_ids[request_index] for request_index in decode_request_indices
     ]
     resolved = get_lmcache_sparse_cached_tokens(decode_request_ids)
+    if compact:
+        return list(resolved)
     cached_tokens = [0] * int(attn_metadata.seq_lens_cpu.shape[0])
     for request_index, committed_end in zip(
         decode_request_indices, resolved, strict=True
@@ -467,7 +471,11 @@ def _prepare_sfa_remap_boundary(
 
     buffer = getattr(attn_metadata, "decode_remap_boundary_buffer", None)
     if buffer is not None:
-        if reuse_unchanged and cached_tokens is not None and not is_dummy_run:
+        if reuse_unchanged and not is_dummy_run:
+            if cached_tokens is None:
+                cached_tokens = tuple(_resolve_sparse_cached_tokens_by_request(
+                    attn_metadata, request_ids, compact=True,
+                ))
             buffer.update(
                 attn_metadata.decode_req_indices_cpu,
                 attn_metadata.prompt_lens_cpu_rows,
@@ -3423,6 +3431,23 @@ class AscendSFAImpl(MLAAttentionImpl):
         self._staged_sfa_bridge_buffers = None
         self._full_graph_transfer = None
         self._full_graph_transfers = {}
+
+    def prepare_native_sparse_boundary(self, metadata: M | None) -> None:
+        """Resolve live frontiers before native target or draft attention launches."""
+        if (
+            not self.dsa_shrink_latent or metadata is None
+            or metadata.split_boundary is None or metadata.num_decode_tokens <= 0
+            or not (metadata.need_sparse_lmcache_payload or self.dsa_shrink_latent == 3)
+            or metadata.decode_remap_boundary_buffer is None
+        ):
+            return
+        # Other draft steps/modes can share the allocation, so revalidate values
+        # at every forward boundary rather than trusting an old metadata marker.
+        metadata.decode_remap_boundary_ready = False
+        metadata.decode_split_boundary = _prepare_sfa_remap_boundary(
+            metadata, metadata.req_ids, is_dummy_run=False,
+            index_topk=self.index_topk, reuse_unchanged=True,
+        )
 
     def prepare_full_graph_layer(
         self,
