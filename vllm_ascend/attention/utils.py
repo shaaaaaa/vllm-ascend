@@ -246,6 +246,12 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
             # This is really strange since vLLM slices them as well
             block_table_tensor=self.block_table_tensor,
             slot_mapping=self.slot_mapping,
+            # DSA indexer addresses belong to a separate KV group (and may
+            # use a different prefill bank). Keep its physical views just as
+            # for LATENT; dropping them makes MTP fall back to LATENT addresses.
+            indexer_block_table_tensor=self.indexer_block_table_tensor,
+            indexer_slot_mapping=self.indexer_slot_mapping,
+            prompt_lens_cpu=(self.prompt_lens_cpu[:num_actual_reqs] if self.prompt_lens_cpu is not None else None),
             causal=self.causal,
             actual_seq_lengths_q=self.actual_seq_lengths_q[:num_actual_tokens],
             positions=self.positions,
