@@ -49,7 +49,8 @@ does not claim one replay on a decoding rank while a peer is doing prefill.
 
 Each request bucket captures two target topologies at startup. Before forward,
 the runner checks every request's scheduled query length on the CPU, once.
-An all-Q2 MTP batch uses `spec_fixed`: the original uniform planner layout, no
+An all-Q2 MTP batch uses `spec_fixed` when all participating DP ranks agree on
+the uniform layout: the original uniform planner layout, no
 per-layer pack/unpack, no extra attention table copies, and no second query-start
 upload when there is no padding. This applies to any supported request count,
 not just a single request. Without MTP, all-Q1 uses `decode_q1` similarly.
@@ -60,9 +61,14 @@ attention-only sequence absorbs padding without extending the last real request'
 causal query length. Both paths still execute **one root replay per forward**.
 MTP being enabled alone is not proof of all-Q2; scheduler token budgets and context
 limits can truncate the query. Draft rejection alone does not imply Q1 next step.
-DP peers may use different local layouts at the same coordinated token capacity;
-the target TP/EP collective shapes/order are unchanged. Idle DP peers retain the
-bounded path's private zero-length attention tables. No layout collective is added.
+DP peers select the same target graph profile as well as the same token capacity.
+An idle or ragged peer votes for `decode_bounded`, including on an otherwise
+all-Q2 active peer. Idle peers retain the bounded path's private zero-length
+attention tables; live block ownership is not changed. The vote is one additional
+row in the existing DP coordination message, not an additional collective. It is
+refreshed every iteration, so an all-busy, all-Q2 cohort returns to `spec_fixed`.
+TP-only Q2 execution is unchanged. Matching token counts alone is not used as
+evidence that separately captured graph profiles can safely mix across EP ranks.
 
 Both graphs share source tables and resident state for the same request capacity.
 A layout switch or 256-token frontier change does not cause live recapture.

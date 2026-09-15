@@ -627,6 +627,7 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
         )
         # Ephemeral output of the existing batch/DP coordination pass.
         self._staged_sfa_dp_route_action: StagedSFARouteAction | None = None
+        self._staged_sfa_dp_bounded_decode = True
         self._dp_batch_sync_buffers: dict[int, torch.Tensor] = {}
         self._staged_sfa_startup_capture_attempted = False
         self._profiling_cudagraph_memory = False
@@ -3536,6 +3537,7 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
         cudagraph_mode: int = 0,
         allow_dp_padding: bool = False,
         staged_sfa_route_action: StagedSFARouteAction | None = None,
+        staged_sfa_bounded_decode: bool = True,
     ) -> tuple[
         bool,
         torch.Tensor | None,
@@ -3552,6 +3554,8 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
             cudagraph_mode: The cudagraph mode for this rank (0=NONE, 1=PIECEWISE, 2=FULL)
             staged_sfa_route_action: Optional staged-SFA admission verdict for
                 this rank, packed into the same DP collective.
+            staged_sfa_bounded_decode: Whether this rank needs the bounded
+                target layout (ragged queries or idle participation).
 
         Returns: tuple[
             ubatch_slices: if this is set then all DP ranks have agreed to
@@ -3574,6 +3578,8 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
         # FIXME: Restore the `or self.vllm_config.model_config.enforce_eager` here
         # immediately once the other two flags are no longer needed.
 
+        # Never reuse a previous step's layout agreement.
+        self._staged_sfa_dp_bounded_decode = True
         if self.dp_size == 1:
             return False, None, cudagraph_mode, staged_sfa_route_action
 
@@ -3583,7 +3589,8 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
         staged_route_protocol = bool(
             getattr(self, "_staged_sfa_graph_capture_sizes", ())
         ) or staged_sfa_route_action is not None
-        rows = 3 if staged_route_protocol else 2
+        full_layout_protocol = staged_route_protocol and sfa_full_graph_enabled(self.vllm_config)
+        rows = 4 if full_layout_protocol else 3 if staged_route_protocol else 2
         tensor = self._dp_batch_sync_buffers.get(rows)
         if tensor is None or tensor.shape[1] != self.dp_size:
             tensor = torch.empty(
@@ -3611,7 +3618,11 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
             tensor[2, self.dp_rank] = _STAGED_SFA_ROUTE_ACTIONS.index(
                 staged_sfa_route_action
             )
+        if full_layout_protocol:
+            tensor[3, self.dp_rank] = int(staged_sfa_bounded_decode)
         dist.all_reduce(tensor, group=get_dp_group().cpu_group)
+        if full_layout_protocol:
+            self._staged_sfa_dp_bounded_decode = bool(tensor[3].max().item())
 
         max_num_tokens = int(num_tokens_across_dp.max().item())
         synced_route_action = (
@@ -3653,6 +3664,7 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
         force_num_active_loras: int | None = None,
         num_encoder_reqs: int = 0,
         staged_sfa_route_action: StagedSFARouteAction | None = None,
+        staged_sfa_dp_idle: bool = False,
     ) -> tuple[
         CUDAGraphMode,
         BatchDescriptor,
@@ -3720,6 +3732,10 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                 cudagraph_mode=cudagraph_mode.value,
                 allow_dp_padding=(cudagraph_mode != CUDAGraphMode.NONE) or enable_sp(self.vllm_config),
                 staged_sfa_route_action=staged_sfa_route_action,
+                # Dummy Q2 rows are not real uniform requests: the idle rank
+                # must use private zero-length tables. Agree on the topology,
+                # not just the token count, before replaying captured EP ops.
+                staged_sfa_bounded_decode=staged_sfa_dp_idle or not uniform_decode,
             )
 
             # Extract DP padding if there is any
@@ -4503,7 +4519,13 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
             return native(StagedSFARouteReason.PADDED_BATCH)
         graph_key = (
             StagedSFAGraphKey.bounded_decode(capacity // query_width, query_width)
-            if sfa_full_graph_enabled(self.vllm_config) and local_route.uniform_query_len != query_width
+            if sfa_full_graph_enabled(self.vllm_config) and (
+                local_route.uniform_query_len != query_width
+                or (
+                    self.parallel_config.data_parallel_size > 1
+                    and self._staged_sfa_dp_bounded_decode
+                )
+            )
             else StagedSFAGraphKey.exact_q1(capacity)
             if query_width == 1
             else StagedSFAGraphKey.fixed_spec(
@@ -4873,6 +4895,7 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
             force_has_lora=num_active_loras > 0,
             force_num_active_loras=num_active_loras,
             staged_sfa_route_action=dummy_route_action,
+            staged_sfa_dp_idle=dp_idle,
         )
         dp_route_action = self._staged_sfa_dp_route_action
         if self.use_cp:

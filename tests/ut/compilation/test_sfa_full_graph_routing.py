@@ -94,6 +94,9 @@ def routing():
     runner.model_config = runner.vllm_config.model_config
     runner.parallel_config = SimpleNamespace(data_parallel_size=4)
     runner.vllm_config.parallel_config = runner.parallel_config
+    # Local-layout tests represent an already agreed all-uniform DP cohort.
+    # Protocol tests below execute the actual collective method instead.
+    runner._staged_sfa_dp_bounded_decode = False
     runner._staged_sfa_graph_capture_sizes = (2,)
     ns["logger"] = SimpleNamespace(info=lambda *args: None)
     ns["staged_sfa_metadata_sparse_route"] = lambda *args: (ns["StagedSFARouteReason"].ELIGIBLE, (4096,), (False,))
@@ -735,6 +738,191 @@ def test_full_graph_overrides_recompute_dp_sync_bypass(routing):
     ns["dist"].all_reduce.assert_called_once()
     assert sizes.tolist() == [32, 32, 32, 32]
     assert mode == 1 and action == ns["StagedSFARouteAction"].STAGED
+
+
+def test_active_q2_and_idle_dp_peer_select_the_same_full_graph(routing):
+    runner, ns, _, modes, _ = routing
+    runner._staged_sfa_graph_capture_sizes = (8,)
+    # The idle peer needs private, zero-length attention tables. Its vote must
+    # also select the bounded graph on the active Q2 peer, not just its size.
+    runner._staged_sfa_dp_bounded_decode = True
+    local = ns["StagedSFARouteDecision"](
+        ns["StagedSFARouteAction"].STAGED,
+        ns["StagedSFARouteReason"].ELIGIBLE,
+        uniform_query_len=2,
+    )
+    active = runner._staged_sfa_live_route(
+        local_route=local,
+        dp_route_action=local.action,
+        cudagraph_mode=modes.PIECEWISE,
+        batch_descriptor=BatchDescriptor(8),
+        num_tokens_unpadded=2,
+        num_tokens_padded=8,
+        num_reqs=1,
+        should_ubatch=False,
+    )
+    idle = runner._staged_sfa_dummy_graph_key(8, dp_idle=True)
+    assert active.graph_key == idle
+    assert idle == ns["StagedSFAGraphKey"].bounded_decode(4, 2)
+
+
+@pytest.mark.parametrize("rank", range(4))
+@pytest.mark.parametrize("votes", [[False] * 4, [False, True, False, False], [True, False, True, False]])
+def test_dp_layout_vote_reuses_one_collective_and_refreshes_each_step(routing, rank, votes):
+    runner, ns, _, modes, _ = routing
+    actions = tuple(ns["StagedSFARouteAction"])
+    staged = ns["StagedSFARouteAction"].STAGED
+    runner.dp_size, runner.dp_rank = 4, rank
+    runner._dp_batch_sync_buffers = {}
+    runner._skip_all_reduce_across_dp_group = lambda: True
+    runner._staged_sfa_graph_capture_sizes = (8,)
+    ns.update(
+        torch=torch,
+        _STAGED_SFA_ROUTE_ACTIONS=actions,
+        get_dp_group=lambda: SimpleNamespace(cpu_group="dp"),
+        _post_process_cudagraph_mode=lambda tensor: int(tensor[1].min()),
+    )
+    peer_votes = votes
+    buffers = []
+
+    def all_reduce(tensor, group):
+        assert group == "dp" and tensor.shape == (4, 4)
+        assert tensor[3, rank].item() == int(peer_votes[rank])
+        # Other columns must be cleared, not left over from the previous step.
+        assert torch.count_nonzero(tensor[3]).item() == int(peer_votes[rank])
+        tensor[0].fill_(8)
+        tensor[1].fill_(1)
+        tensor[2].fill_(actions.index(staged))
+        tensor[3] = torch.tensor(peer_votes, dtype=torch.int32)
+        buffers.append(tensor.data_ptr())
+
+    ns["dist"] = SimpleNamespace(all_reduce=Mock(side_effect=all_reduce))
+    # Idle -> busy and ragged -> uniform transitions must restore the fast
+    # graph, rather than permanently forcing bounded after one idle step.
+    for peer_votes in (votes, [False] * 4, [False, False, False, True]):
+        _, _, _, action = runner._sync_batch_across_dp(8, 1, True, staged, staged_sfa_bounded_decode=peer_votes[rank])
+        assert runner._staged_sfa_dp_bounded_decode == any(peer_votes)
+        local = ns["StagedSFARouteDecision"](
+            staged,
+            ns["StagedSFARouteReason"].ELIGIBLE,
+            uniform_query_len=0 if peer_votes[rank] else 2,
+        )
+        route = runner._staged_sfa_live_route(
+            local_route=local,
+            dp_route_action=action,
+            cudagraph_mode=modes.PIECEWISE,
+            batch_descriptor=BatchDescriptor(8),
+            num_tokens_unpadded=2,
+            num_tokens_padded=8,
+            num_reqs=1,
+            should_ubatch=False,
+        )
+        expected = ns["StagedSFAGraphKey"].bounded_decode if any(peer_votes) else ns["StagedSFAGraphKey"].fixed_spec
+        assert route.graph_key == expected(4, 2)
+    assert ns["dist"].all_reduce.call_count == 3  # One existing collective/step.
+    assert len(set(buffers)) == 1
+
+
+@pytest.mark.parametrize("idle", [False, True])
+@pytest.mark.parametrize("widths", [[2, 2], [1, 1], [2, 1]])
+def test_dispatch_sends_real_layout_and_idle_vote(routing, idle, widths):
+    runner, ns, _, _, _ = routing
+    runner.model_config.is_encoder_decoder = False
+    runner.uniform_decode_query_len = 2
+    runner.input_batch = SimpleNamespace(num_computed_tokens_cpu=np.ones(2), lora_id_to_lora_request={})
+    runner._pad_for_sequence_parallelism = lambda value: value
+    runner.cudagraph_dispatcher = SimpleNamespace(
+        dispatch=lambda **kwargs: (SimpleNamespace(value=1), BatchDescriptor(8))
+    )
+    ns["enable_sp"] = lambda *_: False
+    observed = []
+
+    class StopAtCollective(Exception):
+        pass
+
+    def sync(**kwargs):
+        observed.append(kwargs["staged_sfa_bounded_decode"])
+        raise StopAtCollective
+
+    runner._sync_batch_across_dp = sync
+    with pytest.raises(StopAtCollective):
+        runner._determine_batch_execution_and_padding(
+            sum(widths),
+            2,
+            np.array(widths),
+            max(widths),
+            False,
+            force_uniform_decode=True if idle else None,
+            staged_sfa_route_action=ns["StagedSFARouteAction"].STAGED,
+            staged_sfa_dp_idle=idle,
+        )
+    assert observed == [idle or widths != [2, 2]]
+
+
+def test_dummy_dispatch_passes_idle_status_to_layout_agreement():
+    path = Path(__file__).resolve().parents[3] / "vllm_ascend/worker/model_runner_v1.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    dummy = next(node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef) and node.name == "_dummy_run")
+    dispatch = next(
+        node
+        for node in ast.walk(dummy)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "_determine_batch_execution_and_padding"
+    )
+    vote = next(keyword.value for keyword in dispatch.keywords if keyword.arg == "staged_sfa_dp_idle")
+    assert isinstance(vote, ast.Name) and vote.id == "dp_idle"
+
+
+@pytest.mark.parametrize("configured,full", [(False, False), (False, True), (True, False)])
+def test_non_full_sync_preserves_existing_wire_format(routing, configured, full):
+    runner, ns, env, _, _ = routing
+    env.VLLM_ASCEND_SFA_FULL_GRAPH = full
+    runner._staged_sfa_graph_capture_sizes = (8,) if configured else ()
+    runner.dp_size, runner.dp_rank = 2, 0
+    runner._dp_batch_sync_buffers = {}
+    runner._skip_all_reduce_across_dp_group = lambda: False
+    actions = tuple(ns["StagedSFARouteAction"])
+    staged = ns["StagedSFARouteAction"].STAGED
+
+    def all_reduce(tensor, group):
+        assert tensor.shape == (3 if configured else 2, 2)
+        tensor[0].fill_(8)
+        tensor[1].fill_(1)
+        if configured:
+            tensor[2].fill_(actions.index(staged))
+
+    ns.update(
+        torch=torch,
+        _STAGED_SFA_ROUTE_ACTIONS=actions,
+        get_dp_group=lambda: SimpleNamespace(cpu_group="dp"),
+        _post_process_cudagraph_mode=lambda tensor: int(tensor[1].min()),
+        dist=SimpleNamespace(all_reduce=Mock(side_effect=all_reduce)),
+    )
+    runner._sync_batch_across_dp(8, 1, True, staged if configured else None)
+    ns["dist"].all_reduce.assert_called_once()
+
+
+def test_tp_only_q2_does_not_consume_dp_layout_state(routing):
+    runner, ns, _, modes, _ = routing
+    runner.parallel_config.data_parallel_size = 1
+    runner._staged_sfa_dp_bounded_decode = True
+    local = ns["StagedSFARouteDecision"](
+        ns["StagedSFARouteAction"].STAGED,
+        ns["StagedSFARouteReason"].ELIGIBLE,
+        uniform_query_len=2,
+    )
+    route = runner._staged_sfa_live_route(
+        local_route=local,
+        dp_route_action=None,
+        cudagraph_mode=modes.PIECEWISE,
+        batch_descriptor=BatchDescriptor(2),
+        num_tokens_unpadded=2,
+        num_tokens_padded=2,
+        num_reqs=1,
+        should_ubatch=False,
+    )
+    assert route.graph_key == ns["StagedSFAGraphKey"].fixed_spec(1, 2)
 
 
 @pytest.mark.parametrize("rank", range(4))
