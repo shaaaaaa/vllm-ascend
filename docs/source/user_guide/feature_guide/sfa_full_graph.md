@@ -176,7 +176,29 @@ The benchmark client loads its tokenizer from the local `--model` directory
 the server. `sfa-serving-repro` is only the API model alias, not a Hugging Face
 repository to download. The local model directory must include tokenizer files.
 
-Both modes use an eight-layer dummy model, the recompute scheduler, the serving
+By default both modes use an eight-layer dummy model. For the complete model
+with real checkpoint weights, use:
+
+```bash
+set -o pipefail
+python tools/sfa_serving_repro.py --full-model --diagnose --prompt-tokens 131614 --output-tokens 1000 2>&1 | tee log.log
+```
+
+`--full-model` removes the layer override and uses `--load-format auto`. It
+keeps checkpoint MTP quantization untouched, skips deterministic dummy-weight
+initialization, and times every target layer reported by the model config.
+It also disables the fixture's debug sparse-transfer top-k cap. The client
+explicitly uses `--temperature 0` in both modes. Model depth/weight mode are
+printed at startup and recorded in `comparison.json`.
+
+The TP4 x DP2 + EP topology remains unchanged: this does not silently turn
+into TP8/DP1, which would remove the idle-DP peer being investigated. Full
+checkpoint weights, KV caches, runtime buffers and graphs must fit on eight
+NPUs; eight 64-GB cards are not a verified guarantee of capacity. A smaller
+`--cpu-cache-gb` does not reduce NPU weight memory. Dummy-model MTP acceptance
+(including 0% acceptance) is not representative of a real-weight deployment.
+
+Both weight modes keep the recompute scheduler, the serving
 capture buckets and one active request routed to DP0, with DP1 idle. They keep
 cold-compact loading enabled, **shared CPU cache enabled**, strict shared-cache
 handling and `save_only_first_rank=true`. Each TP group has its own rank0 store
@@ -184,8 +206,10 @@ and passive TP readers. These settings intentionally override the offline
 fixture's independent per-rank cache policy: cold-compact loading with
 `enable_shared_cpu_cache=false` is invalid and fails before inference.
 
-The existing 8-GiB CPU-cache budget is per DP group; the two local groups require
-approximately 16 GiB of free `/dev/shm` in total. No remote cache is used. These
+The CPU-cache budget is per DP group: 8 GiB for the fixture, or 32 GiB with
+`--full-model`. The two local groups therefore need approximately 16 or 64 GiB
+of free `/dev/shm`, respectively, plus room for IPC. `--cpu-cache-gb` overrides
+the per-group budget; larger contexts may require more. No remote cache is used. These
 cache settings are identical between staged and full modes; only
 `VLLM_ASCEND_SFA_FULL_GRAPH` differs. `--diagnose` adds host timings, not a profile;
 omit it for clean latency measurements. Full server logs are retained under

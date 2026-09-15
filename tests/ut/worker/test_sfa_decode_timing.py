@@ -187,7 +187,7 @@ def actual_root_run(events):
     return namespace["run"], namespace["prepare_run"]
 
 
-def fake_worker(events, *, full=True):
+def fake_worker(events, *, full=True, layers=8):
     connector = SimpleNamespace(
         **{
             name: Mock()
@@ -222,7 +222,7 @@ def fake_worker(events, *, full=True):
                 _cross_layer_metadata_ineligible_reason=Mock(),
             ),
         )
-        for i in range(8)
+        for i in range(layers)
     )
     runner = SimpleNamespace(
         _staged_sfa_live_route=Mock(return_value=SimpleNamespace(graph_key=None)),
@@ -272,13 +272,19 @@ def fake_worker(events, *, full=True):
 
     runner._model_forward = forward
     runner.propose_draft_token_ids = lambda: connector.wait_for_layer_load()
-    return SimpleNamespace(model_runner=runner, execute_model=execute, sample_tokens=sample), connector
+    return SimpleNamespace(
+        model_runner=runner,
+        model_config=SimpleNamespace(hf_config=SimpleNamespace(num_hidden_layers=layers)),
+        execute_model=execute,
+        sample_tokens=sample,
+    ), connector
 
 
 @pytest.mark.parametrize("full", [True, False])
-def test_installation_calls_original_code_and_restores_all_handles(timing_module, full):
+@pytest.mark.parametrize("layers", [8, 61, 79])
+def test_installation_calls_original_code_and_restores_all_handles(timing_module, full, layers):
     events = []
-    worker, connector = fake_worker(events, full=full)
+    worker, connector = fake_worker(events, full=full, layers=layers)
     graph = worker.model_runner._sfa_full_graph
     original_graph = graph.entries["key"].graph
     original_execute, original_forward = worker.execute_model, worker.model_runner._model_forward
@@ -302,18 +308,27 @@ def test_installation_calls_original_code_and_restores_all_handles(timing_module
         assert "signature.validate" not in stages
         original_validate.assert_not_called()
         assert "retrieve.L0" not in stages
-        assert all(stages[f"metadata.L{i}"]["wall"]["count"] == 3 for i in range(8))
+        assert all(stages[f"metadata.L{i}"]["wall"]["count"] == 3 for i in range(layers))
     else:
         assert not events
         assert "root.replay_submit" not in stages
-        assert stages["kv.wait.target"]["wall"]["count"] == 24
-        assert all(stages[f"retrieve.L{i}"]["wall"]["count"] == 3 for i in range(8))
+        assert stages["kv.wait.target"]["wall"]["count"] == 3 * layers
+        assert all(stages[f"retrieve.L{i}"]["wall"]["count"] == 3 for i in range(layers))
     timing.close()
     timing.close()
     assert worker.execute_model is original_execute
     assert worker.model_runner._model_forward is original_forward
     assert graph.entries["key"].graph is original_graph
     assert graph.validate_inputs is original_validate
+
+
+def test_actual_model_layer_mismatch_restores_timing_patches(timing_module):
+    worker, connector = fake_worker([], layers=79)
+    worker.model_runner._staged_sfa_impls = worker.model_runner._staged_sfa_impls[:-1]
+    original_execute = worker.execute_model
+    with pytest.raises(RuntimeError, match="Expected 79 benchmark target layers, got 78"):
+        timing_module.install_decode_timing(worker, connector, prompt_tokens=5000)
+    assert worker.execute_model is original_execute
 
 
 def test_failed_install_restores_previously_patched_methods(timing_module):

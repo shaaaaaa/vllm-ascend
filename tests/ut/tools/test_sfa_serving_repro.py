@@ -40,6 +40,8 @@ def args(tmp_path):
         output_tokens=512,
         port=9000,
         diagnose=False,
+        full_model=False,
+        cpu_cache_gb=None,
     )
 
 
@@ -172,6 +174,85 @@ def test_server_reproduces_serving_topology_and_only_mode_switch_differs(repro, 
     assert full_env["PD_SERVING_PERF"] == "1"
 
 
+@pytest.mark.parametrize("layers", [61, 78, 79])
+def test_full_model_preserves_checkpoint_layers_weights_and_serving_topology(repro, args, layers):
+    args.full_model = True
+    Path(args.model, "config.json").write_text(json.dumps({"num_hidden_layers": layers}), encoding="utf-8")
+    repro.validate_args(args)
+    assert repro.model_layers(args) == layers
+    staged, full = [repro.server_command(args, mode) for mode in ("staged", "full")]
+    assert staged == full
+    assert "--hf-overrides" not in full
+    assert argument(full, "--load-format") == "auto"
+    assert argument(full, "--tensor-parallel-size") == "4"
+    assert argument(full, "--data-parallel-size") == "2"
+    assert json.loads(argument(full, "--additional-config"))["sfa_benchmark_full_model"] is True
+
+
+@pytest.mark.parametrize("cache_gb,expected", [(None, 32), (48, 48)])
+def test_full_model_cache_budget_and_uncapped_sparse_transfer(
+    repro, args, validate_lmcache_environment, cache_gb, expected
+):
+    environments = [
+        repro.serving_environment(mode, args.devices, diagnose=True, full_model=True, cpu_cache_gb=cache_gb)
+        for mode in ("staged", "full")
+    ]
+    for env in environments:
+        config = validate_lmcache_environment(env)
+        assert config.max_local_cpu_size == expected
+        assert config.enable_shared_cpu_cache and config.shared_cpu_cache_strict
+        assert env["LMCACHE_ASCEND_SPARSE_TRANSFER_TOPK"] == "0"
+    assert {name for name in environments[0] if environments[0][name] != environments[1][name]} == {
+        "VLLM_ASCEND_SFA_FULL_GRAPH"
+    }
+
+
+@pytest.mark.parametrize("layers", [None, 0, -1, True, "79"])
+def test_full_model_requires_valid_original_layer_count(repro, args, layers):
+    args.full_model = True
+    Path(args.model, "config.json").write_text(json.dumps({"num_hidden_layers": layers}), encoding="utf-8")
+    with pytest.raises(ValueError, match="num_hidden_layers"):
+        repro.validate_args(args)
+
+
+def test_full_model_cli_records_real_settings_and_keeps_one_request_per_mode(
+    repro, args, tmp_path, monkeypatch, capsys
+):
+    Path(args.model, "config.json").write_text(json.dumps({"num_hidden_layers": 79}), encoding="utf-8")
+    output = tmp_path / "full-model-results"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "sfa_serving_repro.py",
+            "--model",
+            args.model,
+            "--full-model",
+            "--cpu-cache-gb",
+            "48",
+            "--output-dir",
+            str(output),
+        ],
+    )
+    result = {
+        "input_lens": [30000],
+        "output_lens": [512],
+        "generated_texts": ["same"],
+        "mean_tpot_ms": 40,
+    }
+    run = Mock(return_value=result)
+    monkeypatch.setattr(repro, "run_mode", run)
+    repro.main()
+    assert [call.args[1] for call in run.call_args_list] == ["staged", "full"]
+    for call in run.call_args_list:
+        assert call.args[0].full_model and call.args[0].cpu_cache_gb == 48
+    comparison = json.loads(next(output.glob("*/comparison.json")).read_text(encoding="utf-8"))
+    assert comparison["config"]["layers"] == 79
+    assert comparison["config"]["weights"] == "checkpoint"
+    assert comparison["config"]["cpu_cache_gb_per_dp"] == 48
+    assert "layers=79 weights=checkpoint topology=TP4xDP2+EP" in capsys.readouterr().out
+
+
 def test_client_is_exactly_one_request_without_hidden_probe_or_warmup(repro, args, tmp_path):
     command = repro.client_command(args, tmp_path)
     assert argument(command, "--num-prompts") == "1"
@@ -183,6 +264,7 @@ def test_client_is_exactly_one_request_without_hidden_probe_or_warmup(repro, arg
     assert argument(command, "--percentile-metrics") == "ttft,tpot,itl,e2el"
     assert "--ignore-eos" in command and "--save-detailed" in command
     assert "--num-warmups" not in command
+    assert argument(command, "--temperature") == "0"
 
 
 @pytest.mark.parametrize("model_directory", ["GLM-5.1-w4a8", "custom model"])
@@ -327,6 +409,9 @@ def test_comparison_requires_paired_token_lengths_and_reports_regression(repro):
         ({"output_tokens": 1}, "output_tokens"),
         ({"port": 0}, "Port"),
         ({"model": "missing"}, "Missing model"),
+        ({"cpu_cache_gb": 0}, "cpu-cache-gb"),
+        ({"cpu_cache_gb": float("inf")}, "cpu-cache-gb"),
+        ({"cpu_cache_gb": float("nan")}, "cpu-cache-gb"),
     ],
 )
 def test_invalid_reproduction_fails_before_launch(repro, args, change, error):

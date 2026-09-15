@@ -5,13 +5,14 @@
 
 This intentionally differs from ``sfa_graph_benchmark.py``: it launches the
 online server as TP4 x DP2 with expert parallelism, production request buckets
-and the recompute scheduler.  The eight-layer dummy model keeps it runnable on
-one eight-NPU host; it does not claim to reproduce real-weight kernel time or
-cross-node DP latency.
+and the recompute scheduler. By default it uses an eight-layer dummy fixture;
+--full-model keeps all checkpoint layers and loads real weights. Neither mode
+reproduces cross-node DP latency; full-model memory must fit on this host.
 """
 
 import argparse
 import json
+import math
 import os
 import signal
 import subprocess
@@ -29,7 +30,9 @@ SERVER_READY_TIMEOUT = 1800
 SERVER_STOP_TIMEOUT = 120
 
 
-def serving_environment(mode: str, devices: str, *, diagnose: bool) -> dict[str, str]:
+def serving_environment(
+    mode: str, devices: str, *, diagnose: bool, full_model: bool = False, cpu_cache_gb: float | None = None
+) -> dict[str, str]:
     environment = benchmark_environment(mode, devices)
     environment.update(
         {
@@ -43,8 +46,9 @@ def serving_environment(mode: str, devices: str, *, diagnose: bool) -> dict[str,
             "LMCACHE_ENABLE_SHARED_CPU_CACHE": "true",
             "LMCACHE_SHARED_CPU_CACHE_STRICT": "true",
             "LMCACHE_EXTRA_CONFIG": '{"save_only_first_rank": true}',
-            "LMCACHE_ASCEND_SPARSE_TRANSFER_TOPK": "2048",
-            "LMCACHE_MAX_LOCAL_CPU_SIZE": "8",
+            # Real weights use the model's full sparse selection, not a debug cap.
+            "LMCACHE_ASCEND_SPARSE_TRANSFER_TOPK": "0" if full_model else "2048",
+            "LMCACHE_MAX_LOCAL_CPU_SIZE": str(cpu_cache_gb if cpu_cache_gb is not None else (32 if full_model else 8)),
             "HCCL_OP_EXPANSION_MODE": "AIV",
             "HCCL_BUFFSIZE": "256",
             "OMP_PROC_BIND": "false",
@@ -78,6 +82,7 @@ def server_command(args: argparse.Namespace, mode: str) -> list[str]:
         "enable_npugraph_ex": True,
         "sfa_benchmark": True,
         "sfa_benchmark_serving": True,
+        "sfa_benchmark_full_model": args.full_model,
     }
     kv_transfer = {
         "kv_connector": "LMCacheAscendConnectorV1Dynamic",
@@ -85,7 +90,7 @@ def server_command(args: argparse.Namespace, mode: str) -> list[str]:
         "kv_connector_module_path": "lmcache_ascend.integration.vllm.lmcache_ascend_connector_v1",
         "engine_id": "sfa-serving-repro",
     }
-    return [
+    command = [
         "vllm",
         "serve",
         args.model,
@@ -97,9 +102,7 @@ def server_command(args: argparse.Namespace, mode: str) -> list[str]:
         str(args.port),
         "--trust-remote-code",
         "--load-format",
-        "dummy",
-        "--hf-overrides",
-        json.dumps({"num_hidden_layers": 8}),
+        "auto" if args.full_model else "dummy",
         "--quantization",
         "ascend",
         "--gpu-memory-utilization",
@@ -131,6 +134,9 @@ def server_command(args: argparse.Namespace, mode: str) -> list[str]:
         "--kv-transfer-config",
         json.dumps(kv_transfer),
     ]
+    if not args.full_model:
+        command.extend(["--hf-overrides", json.dumps({"num_hidden_layers": 8})])
+    return command
 
 
 def client_command(args: argparse.Namespace, mode_dir: Path) -> list[str]:
@@ -180,6 +186,8 @@ def client_command(args: argparse.Namespace, mode_dir: Path) -> list[str]:
         "--result-filename",
         "client.json",
         "--seed",
+        "0",
+        "--temperature",
         "0",
     ]
 
@@ -280,7 +288,9 @@ def run_mode(args: argparse.Namespace, mode: str, root: Path) -> dict:
     with log_path.open("w", encoding="utf-8") as log:
         process = subprocess.Popen(
             command,
-            env=serving_environment(mode, args.devices, diagnose=args.diagnose),
+            env=serving_environment(
+                mode, args.devices, diagnose=args.diagnose, full_model=args.full_model, cpu_cache_gb=args.cpu_cache_gb
+            ),
             stdout=log,
             stderr=subprocess.STDOUT,
             start_new_session=True,
@@ -387,12 +397,29 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("Use prompt_tokens > 4096 and output_tokens >= 2")
     if not (1 <= args.port <= 65535):
         raise ValueError("Port must be between 1 and 65535")
+    if args.cpu_cache_gb is not None and (not math.isfinite(args.cpu_cache_gb) or args.cpu_cache_gb <= 0):
+        raise ValueError("cpu-cache-gb must be finite and positive")
+    model_layers(args)
+
+
+def model_layers(args: argparse.Namespace) -> int:
+    if not args.full_model:
+        return 8
+    config = json.loads(Path(args.model, "config.json").read_text(encoding="utf-8"))
+    layers = config.get("num_hidden_layers")
+    if type(layers) is not int or layers <= 0:
+        raise ValueError("Full-model config.json must contain a positive integer num_hidden_layers")
+    return layers
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument("--devices", default=DEFAULT_DEVICES)
+    parser.add_argument("--full-model", action="store_true", help="Load all checkpoint layers with real weights")
+    parser.add_argument(
+        "--cpu-cache-gb", type=float, help="Shared CPU cache GiB per DP group (default: 8 fixture / 32 full model)"
+    )
     parser.add_argument("--prompt-tokens", type=int, default=30000)
     parser.add_argument("--output-tokens", type=int, default=512)
     parser.add_argument("--port", type=int, default=9000)
@@ -404,6 +431,11 @@ def main() -> None:
     args.output_dir.mkdir(parents=True, exist_ok=True)
     root = Path(mkdtemp(prefix="sfa-serving-", dir=args.output_dir.resolve()))
     print(f"[SFA_SERVING] results: {root}", flush=True)
+    print(
+        f"[SFA_SERVING] model layers={model_layers(args)} weights={'checkpoint' if args.full_model else 'dummy'} "
+        "topology=TP4xDP2+EP",
+        flush=True,
+    )
     results = {mode: run_mode(args, mode, root) for mode in args.order.split(",")}
     if len(results) == 1:
         mode, result = next(iter(results.items()))
@@ -418,8 +450,10 @@ def main() -> None:
         "model": args.model,
         "devices": args.devices,
         "topology": "TP4xDP2+EP; one active request and one idle DP rank",
-        "layers": 8,
-        "weights": "dummy",
+        "layers": model_layers(args),
+        "weights": "checkpoint" if args.full_model else "dummy",
+        "cpu_cache_gb_per_dp": args.cpu_cache_gb if args.cpu_cache_gb is not None else (32 if args.full_model else 8),
+        "temperature": 0,
         "capture_request_sizes": [4, 8, 12, 16],
         "prompt_tokens": args.prompt_tokens,
         "output_tokens": args.output_tokens,

@@ -310,8 +310,9 @@ def install_decode_timing(worker, connector, *, prompt_tokens: int, event_factor
         for entry in graph.entries.values():
             timing.patches.enter_context(patch.object(entry, "graph", ReplayProbe(entry.graph, timing)))
         impls = runner._staged_sfa_impls or runner._collect_staged_sfa_impls()
-        if len(impls) != 8:
-            raise RuntimeError(f"Expected eight benchmark target layers, got {len(impls)}")
+        expected_layers = worker.model_config.hf_config.num_hidden_layers
+        if not impls or len(impls) != expected_layers:
+            raise RuntimeError(f"Expected {expected_layers} benchmark target layers, got {len(impls)}")
         for index, (_, impl) in enumerate(impls):
             timing.observe(impl, "prepare_full_graph_layer", f"metadata.L{index}")
             timing.observe(impl, "_cross_layer_metadata_ineligible_reason", "metadata.shared_check")
