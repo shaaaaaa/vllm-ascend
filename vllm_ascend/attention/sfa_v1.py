@@ -1185,6 +1185,8 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             self._dsa_shard_counts = None
             self._dsa_fixed_query_starts_cpu = None
         self._dsa_fixed_layout_signature = None
+        self._dsa_general_layout_signature = None
+        self._dsa_general_decode_rows = 0
         self.actual_seq_lengths_query = torch.zeros(max_num_reqs + 1, dtype=torch.int32, device=device)
         self.actual_seq_lengths_key = torch.empty_like(self.actual_seq_lengths_query)
         self._full_graph_tables = None
@@ -1378,7 +1380,21 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
                         == plens_cpu[:n_real][resume_mask] - 1
                     )
                 fixed_width_decode = np.all(computed_layout)
+            general_signature = None
+            if (
+                not fixed_width_decode and not self.enable_dsa_cp
+                and current_positions is None and qsl is not None
+                and not any(cold_resumes) and np.all(computed >= plens_cpu[:n_real])
+            ):
+                widths = np.diff(qsl)
+                if np.all((widths >= 1) & (widths <= 2)):
+                    # After the prompt, advancing positions cannot change row ownership.
+                    general_signature = (
+                        num_reqs, num_actual_tokens, num_input_tokens,
+                        tuple(qsl), tuple(plens_cpu), tuple(common_attn_metadata.request_ids or ()),
+                    )
             if fixed_width_decode:
+                self._dsa_general_layout_signature = None
                 num_decode_rows = num_actual_tokens
                 signature = (
                     fixed_decode_width,
@@ -1454,8 +1470,11 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
                             dtype=np.int32,
                         )
                     )
+            elif general_signature is not None and general_signature == self._dsa_general_layout_signature:
+                num_decode_rows = self._dsa_general_decode_rows
             else:
                 self._dsa_fixed_layout_signature = None
+                self._dsa_general_layout_signature = None
                 rows.fill(0)
                 boundary_rows.fill(0)
                 req_rows.fill(-1)
@@ -1532,6 +1551,9 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
                             :num_decode_rows
                         ]
                     )
+
+                self._dsa_general_decode_rows = num_decode_rows
+                self._dsa_general_layout_signature = general_signature
 
             split_boundary_cpu = boundary_rows
             decode_req_indices_cpu = req_rows

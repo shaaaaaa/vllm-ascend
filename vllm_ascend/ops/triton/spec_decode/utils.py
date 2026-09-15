@@ -19,6 +19,32 @@ from vllm.triton_utils import tl, triton
 
 
 @triton.jit(do_not_specialize=["num_reqs"])
+def prepare_next_mtp_tokens_kernel(
+    sampled, backup, next_tokens, valid_counts,
+    num_reqs, vocab_size, row_stride, token_stride,
+    WIDTH: tl.constexpr, BLOCK_SIZE: tl.constexpr,
+):
+    """Fuse the existing Ascend next-token/count rule for one-draft MTP."""
+    pid = tl.program_id(0)
+    step = tl.num_programs(0) * BLOCK_SIZE
+    for start in tl.range(pid * BLOCK_SIZE, num_reqs, step):
+        rows = start + tl.arange(0, BLOCK_SIZE)
+        mask = rows < num_reqs
+        first = tl.load(sampled + rows * row_stride, mask, other=-1)
+        second = tl.full((BLOCK_SIZE,), -1, tl.int32)
+        if WIDTH == 2:
+            second = tl.load(sampled + rows * row_stride + token_stride, mask, other=-1)
+        count = ((first != -1) & (first < vocab_size)).to(tl.int32)
+        count += ((second != -1) & (second < vocab_size)).to(tl.int32)
+        fallback = tl.load(backup + rows, mask & (count == 0), other=0)
+        # Match gather(count - 1), including irregular validity patterns;
+        # selecting the last valid physical index would change the old rule.
+        token = tl.where(count == 2, second, first)
+        tl.store(next_tokens + rows, tl.where(count > 0, token, fallback), mask)
+        tl.store(valid_counts + rows, count, mask)
+
+
+@triton.jit(do_not_specialize=["num_reqs"])
 def prepare_inputs_padded_kernel(
     cu_num_draft_tokens_ptr,  # [num_reqs]
     valid_sampled_tokens_count_ptr,  # [num_reqs]

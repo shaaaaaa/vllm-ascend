@@ -453,6 +453,14 @@ def _fixed_decode_layout_arrays(
     return request_indices, position_offsets, cumulative_tokens
 
 
+def _fixed_mtp_metadata_arrays(max_num_reqs: int, device: torch.device) -> tuple[torch.Tensor, ...]:
+    """Immutable contiguous indices for one draft plus one bonus row per request."""
+    drafts = torch.arange(1, max_num_reqs + 1, dtype=torch.int32, device=device)
+    targets = torch.arange(0, 2 * max_num_reqs, 2, dtype=torch.int32, device=device)
+    logits = torch.arange(2 * max_num_reqs, dtype=torch.int64, device=device)
+    return drafts, targets + 2, targets, targets + 1, logits.to(torch.int32), logits
+
+
 def _fill_fixed_decode_positions(
     positions: np.ndarray,
     computed_tokens: np.ndarray,
@@ -777,6 +785,12 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
             self._fixed_decode_req_indices = None
             self._fixed_decode_position_offsets = None
             self._fixed_decode_cu_num_tokens = None
+
+        self._fixed_mtp_metadata = (
+            _fixed_mtp_metadata_arrays(self.max_num_reqs, self.device)
+            if self.speculative_config and self.speculative_config.method == "mtp"
+            and self.decode_threshold == 2 and not self.use_cp else None
+        )
 
         self.use_aclgraph = self._use_aclgraph()
 
@@ -1565,12 +1579,71 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
         input_ids = self.input_ids.gpu[:num_forward_tokens]
         input_ids.masked_fill_(input_ids == PLACEHOLDER_TOKEN_ID, 0)
 
+    def _prepare_input_ids(
+        self,
+        scheduler_output: SchedulerOutput,
+        total_num_scheduled_tokens: int,
+        cu_num_tokens: np.ndarray,
+    ) -> None:
+        batch = self.input_batch
+        num_reqs = batch.num_reqs
+        sampled, draft = batch.prev_sampled_token_ids, self._draft_token_ids
+        previous = batch.prev_req_id_to_index
+        if (
+            self._fixed_mtp_metadata is not None and self.use_async_scheduling
+            and not self.enable_prompt_embeds and num_reqs > 0
+            and not scheduler_output.scheduled_new_reqs
+            and not scheduler_output.finished_req_ids
+            and not scheduler_output.scheduled_cached_reqs.resumed_req_ids
+            and total_num_scheduled_tokens == 2 * num_reqs
+            and np.array_equal(cu_num_tokens, self._fixed_decode_cu_num_tokens[:num_reqs])
+            and previous is not None and len(previous) == num_reqs
+            and isinstance(sampled, torch.Tensor) and sampled.shape == (num_reqs, 1)
+            and isinstance(draft, torch.Tensor) and draft.shape == (num_reqs, 1)
+            and sampled.dtype == self.input_ids.gpu.dtype == torch.int32
+            and draft.dtype in (torch.int32, torch.int64)
+            and sampled.device == draft.device == self.input_ids.gpu.device
+            and all(
+                previous.get(req_id) == row
+                and len(scheduler_output.scheduled_spec_decode_tokens.get(req_id, ())) == 1
+                for req_id, row in batch.req_id_to_index.items()
+            )
+        ):
+            # The values are fresh device outputs; only their alternating
+            # destinations are fixed. Preserve padding and compute-stream order.
+            rows = self.input_ids.gpu[:total_num_scheduled_tokens].view(num_reqs, 2)
+            rows[:, 0].copy_(sampled[:, 0], non_blocking=True)
+            rows[:, 1].copy_(draft[:, 0], non_blocking=True)
+            return
+        super()._prepare_input_ids(scheduler_output, total_num_scheduled_tokens, cu_num_tokens)
+
     def _calc_spec_decode_metadata(
         self,
         num_draft_tokens: np.ndarray,
         cu_num_scheduled_tokens: np.ndarray,
         num_pcp_pads: np.ndarray | None,
     ) -> SpecDecodeMetadata:
+        fixed = self._fixed_mtp_metadata
+        num_reqs = len(num_draft_tokens)
+        if (
+            fixed is not None and self.pcp_size == 1 and 0 < num_reqs <= self.max_num_reqs
+            and num_draft_tokens.ndim == 1 and num_draft_tokens.dtype == np.int32
+            and cu_num_scheduled_tokens.dtype in (np.int32, np.int64)
+            and np.all(num_draft_tokens == 1)
+            and np.array_equal(cu_num_scheduled_tokens, self._fixed_decode_cu_num_tokens[:num_reqs])
+        ):
+            drafts, sampled, targets, bonus, logits32, logits64 = fixed
+            bonus = bonus[:num_reqs]
+            # Only the structural indices are constant; token IDs must be fresh.
+            return SpecDecodeMetadata(
+                draft_token_ids=self.input_ids.gpu[bonus],
+                num_draft_tokens=num_draft_tokens.tolist(),
+                cu_num_draft_tokens=drafts[:num_reqs],
+                cu_num_sampled_tokens=sampled[:num_reqs],
+                target_logits_indices=targets[:num_reqs],
+                bonus_logits_indices=bonus,
+                logits_indices=(logits64 if cu_num_scheduled_tokens.dtype == np.int64 else logits32)[:2 * num_reqs],
+            )
         # Inputs:
         # cu_num_scheduled_tokens:  [  4, 104, 107, 207, 209]
         # num_draft_tokens:         [  3,   0,   2,   0,   1]

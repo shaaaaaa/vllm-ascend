@@ -57,7 +57,7 @@ from vllm_ascend.compilation.acl_graph import (
     get_draft_graph_params,
     update_full_graph_params,
 )
-from vllm_ascend.ops.triton.spec_decode.utils import prepare_inputs_padded_kernel
+from vllm_ascend.ops.triton.spec_decode.utils import prepare_inputs_padded_kernel, prepare_next_mtp_tokens_kernel
 from vllm_ascend.ops.triton.triton_utils import get_vectorcore_num
 from vllm_ascend.spec_decode.mtp_draft_diagnostics import (
     MTP_DRAFT_DIAG_ROOT,
@@ -2195,6 +2195,24 @@ class SpecDecodeBaseProposer(EagleProposer):
             ]
         )
         self.backup_next_token_ids.copy_to_gpu(num_reqs)
+
+        if (
+            HAS_TRITON and self.method == "mtp" and self.num_speculative_tokens == 1
+            and num_discarded_requests == 0
+            and sampled_token_ids.ndim == 2 and sampled_token_ids.shape[0] == num_reqs > 0
+            and sampled_token_ids.shape[1] in (1, 2)
+            and sampled_token_ids.dtype == self.backup_next_token_ids.gpu.dtype == torch.int32
+        ):
+            next_token_ids = sampled_token_ids.new_empty(num_reqs)
+            valid_sampled_tokens_count = sampled_token_ids.new_empty(num_reqs, dtype=torch.int64)
+            grid = (min(triton.cdiv(num_reqs, _PREPARE_INPUTS_BLOCK_SIZE), get_vectorcore_num()),)
+            prepare_next_mtp_tokens_kernel[grid](
+                sampled_token_ids, self.backup_next_token_ids.gpu,
+                next_token_ids, valid_sampled_tokens_count, num_reqs, gpu_input_batch.vocab_size,
+                sampled_token_ids.stride(0), sampled_token_ids.stride(1),
+                WIDTH=sampled_token_ids.shape[1], BLOCK_SIZE=_PREPARE_INPUTS_BLOCK_SIZE,
+            )
+            return next_token_ids, valid_sampled_tokens_count
 
         # Mask out the sampled tokens indices that should not be sampled.
         discard_sampled_tokens_req_indices = discard_request_indices[:num_discarded_requests]
