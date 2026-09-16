@@ -11,15 +11,14 @@ from vllm.model_executor.model_loader.dummy_loader import DummyModelLoader
 
 from vllm_ascend import envs
 from vllm_ascend.attention.sfa_parity import coordinated_check
-from vllm_ascend.worker.sfa_parity_worker import SFAParityWorker, deterministic_dummy_load
+from vllm_ascend.worker.sfa_fixture import deterministic_dummy_load, prepare_dummy_quant_config
 from vllm_ascend.worker.worker import NPUWorker
 
 
 class SFABenchmarkWorker(NPUWorker):
     """Only explicitly selected by the offline/serving benchmark drivers.
 
-    Deliberately NOT a subclass of SFAParityWorker. Reuse its startup-only
-    quantization adjustment, not its load_model, forward wrappers, snapshots,
+    Reuse the neutral startup fixture, not parity load_model, forward wrappers, snapshots,
     checkpoint import/export, sampling changes, or per-step collectives.
     """
 
@@ -47,7 +46,7 @@ class SFABenchmarkWorker(NPUWorker):
             # Only the truncated dummy fixture needs its MTP quantization
             # entries remapped. Real checkpoints keep their original config.
             coordinated_check(
-                lambda: SFAParityWorker._prepare_quant_config(self),
+                lambda: prepare_dummy_quant_config(self.vllm_config),
                 group=get_tp_group(),
                 phase="benchmark startup MTP quantization",
             )

@@ -12,24 +12,12 @@ from unittest.mock import Mock
 import numpy as np
 import pytest
 import torch
+from sfa_test_support import definitions
 
 
 @dataclass(frozen=True)
 class BatchDescriptor:
     num_tokens: int
-
-
-def definitions(path, names, namespace, *, class_name=None):
-    tree = ast.parse(path.read_text(encoding="utf-8"))
-    if class_name:
-        tree = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == class_name)
-    body = [node for node in tree.body if getattr(node, "name", None) in names]
-    assert len(body) == len(names)
-    module = ast.Module(
-        body=[ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0), *body],
-        type_ignores=[],
-    )
-    exec(compile(ast.fix_missing_locations(module), str(path), "exec"), namespace)
 
 
 @pytest.fixture
@@ -97,6 +85,7 @@ def routing():
     # Local-layout tests represent an already agreed all-uniform DP cohort.
     # Protocol tests below execute the actual collective method instead.
     runner._staged_sfa_dp_bounded_decode = False
+    runner._staged_sfa_layer_names = ("layer0",)
     runner._staged_sfa_graph_capture_sizes = (2,)
     ns["logger"] = SimpleNamespace(info=lambda *args: None)
     ns["staged_sfa_metadata_sparse_route"] = lambda *args: (ns["StagedSFARouteReason"].ELIGIBLE, (4096,), (False,))
@@ -1028,7 +1017,9 @@ def test_preparation_and_signatures_are_agreed_before_collective_replay(routing,
         assert runner._model_forward(8) == "output"
         runner._sfa_full_graph.prepare_run.assert_called_once()
         runner._sfa_full_graph.run.assert_called_once()
-        layer.prepare_full_graph_layer.assert_called_once_with("layer0", 140000, bind_source=False, metadata_checks={})
+        layer.prepare_full_graph_layer.assert_called_once_with(
+            "layer0", 140000, bind_source=False, metadata_checks=None
+        )
         assert runner._sfa_full_graph.run.call_args.kwargs == {
             "prepared": runner._sfa_full_graph.prepare_run.return_value
         }
@@ -1092,7 +1083,10 @@ def test_local_supervised_decode_has_no_per_step_error_collective(routing, failu
         assert runner._sfa_full_graph.run.call_count == 300
         assert runner._sfa_full_graph.prepare_run.call_count == 300
         memos = [c.kwargs["metadata_checks"] for c in layer.prepare_full_graph_layer.call_args_list]
-        assert len({id(memo) for memo in memos}) == 300
+        assert memos == [None] * 300
+        assert all(call.kwargs["graph_inputs"] is None for call in runner._sfa_full_graph.prepare_run.call_args_list)
+        assert all(call.args[0] is runner._staged_sfa_layer_names
+                   for call in connector.prepare_sparse_graph_step.call_args_list)
         ns["exit_failed_sfa_worker"].assert_not_called()
     forbidden.assert_not_called()
 
@@ -1137,5 +1131,44 @@ def test_local_startup_capture_retains_error_agreement(routing, failed):
         runner._sfa_full_graph.run.assert_not_called()
     else:
         assert runner._model_forward(2) == "capture"
+        assert runner._sfa_full_graph.prepare_run.call_args.kwargs["graph_inputs"] == {"layer0": {}}
+        assert layer.prepare_full_graph_layer.call_args.kwargs["metadata_checks"] == {}
     assert calls == ["tp"]
     policy.assert_not_called()
+
+
+@pytest.mark.parametrize("failed_reset", [False, True])
+def test_target_names_follow_collection_reset_and_recollection(failed_reset):
+    path = Path(__file__).resolve().parents[3] / "vllm_ascend/worker/model_runner_v1.py"
+    events = []
+    names = [f"model.layers.{i}.self_attn.attn" for i in range(3)]
+    impls = [SimpleNamespace(enable_staged_sfa_graph=True,
+                             reset_staged_sfa_capture=lambda: events.append("reset")) for _ in names]
+    layers = {name: SimpleNamespace(layer_name=name, impl=impl) for name, impl in zip(names, impls)}
+    layers["alias"] = layers[names[0]]
+    ns = dict(AttentionLayerBase=object, get_layers_from_vllm_config=lambda *args: layers,
+              parse_layer_idx=lambda name: int(name.split(".")[2]),
+              logger=Mock(), envs_ascend=SimpleNamespace(VLLM_ASCEND_SFA_FULL_GRAPH=True))
+    methods = {"_collect_staged_sfa_impls", "_reset_staged_sfa_startup_capture"}
+    definitions(path, methods, ns, class_name="NPUModelRunner")
+    runner = type("Registry", (), {name: ns[name] for name in methods})()
+    runner.vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(hf_text_config=SimpleNamespace(num_hidden_layers=2))
+    )
+    runner._sfa_full_graph = SimpleNamespace(clear=lambda: events.append("clear"))
+    runner._staged_sfa_impls = runner._collect_staged_sfa_impls()
+    assert runner._staged_sfa_layer_names == tuple(names[:2])
+    assert len(runner._staged_sfa_impls) == 2  # Alias deduplicated, draft excluded.
+    if failed_reset:
+        impls[0].reset_staged_sfa_capture = Mock(side_effect=RuntimeError("reset failed"))
+        with pytest.raises(RuntimeError, match="reset failed"):
+            runner._reset_staged_sfa_startup_capture()
+        assert runner._staged_sfa_impls == runner._staged_sfa_layer_names == ()
+        return
+    runner._reset_staged_sfa_startup_capture()
+    assert events == ["clear", "reset", "reset"]
+    assert runner._staged_sfa_impls == runner._staged_sfa_layer_names == ()
+    del layers[names[0]]
+    del layers["alias"]
+    runner._staged_sfa_impls = runner._collect_staged_sfa_impls()
+    assert runner._staged_sfa_layer_names == (names[1],)

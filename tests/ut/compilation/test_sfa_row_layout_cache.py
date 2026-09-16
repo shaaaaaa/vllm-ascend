@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Real builder row-layout execution on CPU, without loading the NPU runtime."""
 
-import ast
 import importlib.util
 from pathlib import Path
 from types import SimpleNamespace
@@ -10,17 +9,13 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
+from sfa_test_support import definitions, extract
 from torch.utils._python_dispatch import TorchDispatchMode
 
 PATH = Path(__file__).resolve().parents[3] / "vllm_ascend/attention/sfa_v1.py"
 
 
 def builder():
-    tree = ast.parse(PATH.read_text(encoding="utf8"))
-    cls = next(n for n in tree.body if getattr(n, "name", "") == "AscendSFAMetadataBuilder")
-    method = next(n for n in cls.body if getattr(n, "name", "") == "build")
-    code = ast.parse("from __future__ import annotations")
-    code.body.append(method)
     namespace = {
         "np": np,
         "torch": torch,
@@ -33,7 +28,7 @@ def builder():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     namespace["FullGraphAttentionBuffers"] = module.FullGraphAttentionBuffers
-    exec(compile(ast.fix_missing_locations(code), str(PATH), "exec"), namespace)
+    definitions(PATH, {"build"}, namespace, class_name="AscendSFAMetadataBuilder")
     result = type("RealRowBuilder", (), {"build": namespace["build"]})()
     result.dsa_shrink_latent, result.decode_threshold, result.scratch_capacity = 2, 2, 16
     result._dsa_max_num_rows, result._dsa_max_num_reqs = 32, 8
@@ -204,13 +199,8 @@ def test_noneligible_layouts_keep_rebuilding(path):
 def test_legacy_native_boundary_writes_remain_consistent_on_cache_hit():
     subject, _ = builder()
     item = common()
-    tree = ast.parse(PATH.read_text(encoding="utf8"))
-    helper = next(n for n in tree.body if getattr(n, "name", "") == "_update_dsa_split_boundary_in_place")
-    code = ast.parse("from __future__ import annotations")
-    code.body.append(helper)
     namespace = {"np": np, "torch": torch}
-    exec(compile(ast.fix_missing_locations(code), str(PATH), "exec"), namespace)
-    update = namespace[helper.name]
+    update = extract(PATH, "_update_dsa_split_boundary_in_place", namespace)
     for step in range(3):
         actual = subject.build(0, item)
         fresh, _ = builder()

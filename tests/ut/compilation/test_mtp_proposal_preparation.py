@@ -8,7 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from test_sfa_async_mtp import ROOT, extract
+from sfa_test_support import ROOT, extract
 from torch.utils._python_dispatch import TorchDispatchMode
 
 PROPOSER = ROOT / "vllm_ascend/spec_decode/eagle_proposer.py"

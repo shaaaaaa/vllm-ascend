@@ -634,6 +634,7 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
         self.sampler = AscendSampler()
         self.attn_state: AscendAttentionState | None = None
         self._staged_sfa_impls: tuple[tuple[str, Any], ...] = ()
+        self._staged_sfa_layer_names: tuple[str, ...] = ()
         self._sfa_full_graph = SFAFullGraph()
         self._staged_sfa_graph_capture_sizes = staged_sfa_graph_capture_sizes(
             vllm_config
@@ -3593,7 +3594,7 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
         assert self.model is not None
         context = get_forward_context()
         if envs_ascend.VLLM_ASCEND_SFA_FULL_GRAPH and getattr(context, "staged_sfa_graph_key", None) is not None:
-            graph_inputs = {}
+            graph_inputs = {} if context.staged_sfa_graph_dummy_run else None
             prepared_call = None
             graph_kwargs = dict(
                 input_ids=input_ids,
@@ -3611,21 +3612,23 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                     if not context.staged_sfa_graph_dummy_run:
                         request_ids = tuple(self.input_batch.req_ids[:self.input_batch.num_reqs])
                         source = get_kv_transfer_group().prepare_sparse_graph_step(
-                            tuple(name for name, _ in impls),
+                            self._staged_sfa_layer_names,
                             request_ids=request_ids,
                             frontiers=tuple(context.staged_sfa_route.frontiers),
                         )
                     # Startup-only static validation shares one temporary memo.
                     # Live preparation updates dynamic boundaries and selects
                     # preallocated transfers; it does not walk tensor layouts.
-                    metadata_checks = {}
+                    metadata_checks = {} if graph_inputs is not None else None
                     for name, impl in impls:
-                        graph_inputs[name] = impl.prepare_full_graph_layer(
+                        inputs = impl.prepare_full_graph_layer(
                             name,
                             self.model_config.max_model_len,
                             bind_source=False,
                             metadata_checks=metadata_checks,
                         )
+                        if graph_inputs is not None:
+                            graph_inputs[name] = inputs
                     self._sfa_full_graph.bind_sources(
                         source,
                         request_ids,
@@ -6669,7 +6672,7 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
 
 
     def _collect_staged_sfa_impls(self) -> tuple[tuple[str, Any], ...]:
-        """Return each target-model staged SFA implementation exactly once."""
+        """Collect target implementations and cache their ordered layer names."""
         attn_layers = get_layers_from_vllm_config(
             self.vllm_config,
             AttentionLayerBase,
@@ -6712,6 +6715,7 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                 id(impl),
                 (canonical_name, impl),
             )
+        self._staged_sfa_layer_names = tuple(name for name, _ in staged_impls.values())
         return tuple(staged_impls.values())
 
     def _reset_staged_sfa_startup_capture(self) -> None:
@@ -6719,8 +6723,10 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
         if envs_ascend.VLLM_ASCEND_SFA_FULL_GRAPH:
             self._sfa_full_graph.clear()
             self._sfa_full_graph_live_replay_logged = False
-        self._staged_sfa_impls = ()
-        for _layer_name, impl in self._collect_staged_sfa_impls():
+        self._staged_sfa_impls = self._staged_sfa_layer_names = ()
+        impls = self._collect_staged_sfa_impls()
+        self._staged_sfa_layer_names = ()
+        for _layer_name, impl in impls:
             impl.reset_staged_sfa_capture()
 
 

@@ -3,7 +3,6 @@
 """CPU tests of comparison/probe logic, not evidence of real NPU/model parity."""
 
 import hashlib
-import importlib.util
 import json
 import sys
 from pathlib import Path
@@ -11,6 +10,7 @@ from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
+from sfa_test_support import load_module
 
 
 @pytest.mark.parametrize("skip_topk", [False, True])
@@ -34,31 +34,22 @@ def test_shared_consumer_probe_reads_the_actual_topk_source(worker, skip_topk):
 @pytest.fixture
 def parity(monkeypatch):
     path = Path(__file__).resolve().parents[3] / "vllm_ascend/attention/sfa_parity.py"
-    spec = importlib.util.spec_from_file_location("tested_sfa_parity", path)
-    module = importlib.util.module_from_spec(spec)
-    monkeypatch.setitem(sys.modules, spec.name, module)
-    spec.loader.exec_module(module)
-    return module
+    return load_module(path, "tested_sfa_parity", monkeypatch)
 
 
 @pytest.fixture
 def checkpoint(parity, monkeypatch):
     monkeypatch.setitem(sys.modules, "vllm_ascend.attention.sfa_parity", parity)
     path = Path(__file__).resolve().parents[3] / "vllm_ascend/attention/sfa_prefill_checkpoint.py"
-    spec = importlib.util.spec_from_file_location("vllm_ascend.attention.sfa_prefill_checkpoint", path)
-    module = importlib.util.module_from_spec(spec)
-    monkeypatch.setitem(sys.modules, spec.name, module)
-    spec.loader.exec_module(module)
-    return module
+    return load_module(path, "vllm_ascend.attention.sfa_prefill_checkpoint", monkeypatch)
 
 
 @pytest.fixture
 def worker(parity, checkpoint, monkeypatch):
     stats_path = Path(__file__).resolve().parents[3] / "vllm_ascend/attention/sfa_parity_stats.py"
-    stats_spec = importlib.util.spec_from_file_location("vllm_ascend.attention.sfa_parity_stats", stats_path)
-    stats_module = importlib.util.module_from_spec(stats_spec)
-    monkeypatch.setitem(sys.modules, stats_spec.name, stats_module)
-    stats_spec.loader.exec_module(stats_module)
+    load_module(stats_path, "vllm_ascend.attention.sfa_parity_stats", monkeypatch)
+    fixture_path = stats_path.parents[1] / "worker/sfa_fixture.py"
+    load_module(fixture_path, "vllm_ascend.worker.sfa_fixture", monkeypatch)
     env = SimpleNamespace(VLLM_ASCEND_SFA_FULL_GRAPH=True, VLLM_ASCEND_SFA_STAGED_GRAPH=True)
     for name, attributes in {
         "vllm_ascend": {"envs": env},
@@ -73,11 +64,7 @@ def worker(parity, checkpoint, monkeypatch):
         monkeypatch.setitem(sys.modules, name, stub)
     monkeypatch.setitem(sys.modules, "vllm_ascend.attention.sfa_parity", parity)
     path = Path(__file__).resolve().parents[3] / "vllm_ascend/worker/sfa_parity_worker.py"
-    spec = importlib.util.spec_from_file_location("tested_sfa_parity_worker", path)
-    module = importlib.util.module_from_spec(spec)
-    monkeypatch.setitem(sys.modules, spec.name, module)
-    spec.loader.exec_module(module)
-    return module
+    return load_module(path, "tested_sfa_parity_worker", monkeypatch)
 
 
 @pytest.fixture
@@ -108,16 +95,14 @@ def modelslim(worker, monkeypatch):
         stub.__dict__.update(attributes)
         monkeypatch.setitem(sys.modules, name, stub)
     path = Path(__file__).resolve().parents[3] / "vllm_ascend/quantization/modelslim_config.py"
-    spec = importlib.util.spec_from_file_location("vllm_ascend.quantization.modelslim_config", path)
-    module = importlib.util.module_from_spec(spec)
-    monkeypatch.setitem(sys.modules, spec.name, module)
-    spec.loader.exec_module(module)
-    return module
+    return load_module(path, "vllm_ascend.quantization.modelslim_config", monkeypatch)
 
 
 @pytest.mark.parametrize("source", [8, 78, 80])
 @pytest.mark.parametrize("head_quant", ["FLOAT", "W8A8"])
-def test_truncated_mtp_uses_original_quantization_not_decoder_layer_eight(worker, modelslim, source, head_quant):
+def test_truncated_mtp_uses_original_quantization_not_decoder_layer_eight(
+    worker, modelslim, source, head_quant, tmp_path
+):
     description = {f"model.layers.{i}.self_attn.q_proj.weight": "W8A8" for i in range(9)}
     description.update(
         {
@@ -137,8 +122,16 @@ def test_truncated_mtp_uses_original_quantization_not_decoder_layer_eight(worker
     if source != 8:
         with pytest.raises(KeyError, match=r"model.layers.8.head.weight"):
             modelslim.get_linear_quant_type(description, "model.layers.8.head", {})
-    remapped = worker.remap_mtp_quant_description(description, source, 1)
-    config = modelslim.AscendModelSlimConfig(remapped)
+    (tmp_path / "config.json").write_text(json.dumps({"num_hidden_layers": source}))
+    vllm_config = SimpleNamespace(
+        load_config=SimpleNamespace(load_format="dummy"),
+        model_config=SimpleNamespace(model=str(tmp_path), hf_config=SimpleNamespace(num_hidden_layers=8)),
+        speculative_config=SimpleNamespace(num_speculative_tokens=1, draft_model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(model_type="deepseek_mtp", num_nextn_predict_layers=1))),
+        quant_config=modelslim.AscendModelSlimConfig(description.copy()),
+    )
+    worker.SFAParityWorker._prepare_quant_config(SimpleNamespace(vllm_config=vllm_config))
+    config = vllm_config.quant_config
 
     def get_type(prefix, packed=None):
         return modelslim.get_linear_quant_type(config.quant_description, prefix, packed or {})

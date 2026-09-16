@@ -3,7 +3,6 @@
 """CPU ordering/gate contracts and an optional actual NPU metadata-kernel test."""
 
 import ast
-import importlib.util
 import sys
 from contextlib import contextmanager
 from copy import copy, deepcopy
@@ -15,7 +14,7 @@ from typing import Any
 import numpy as np
 import pytest
 import torch
-from test_mtp_next_tokens import HostTL, Pointer, extract
+from sfa_test_support import HostTL, Pointer, extract, load_module
 from torch.utils._python_dispatch import TorchDispatchMode
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -228,6 +227,7 @@ def setup():
         "l0",
     )
     runner._staged_sfa_impls = (("l0", object()), ("l1", object()))
+    runner._staged_sfa_layer_names = ("l0", "l1")
     runner._async_pending = runner._async_built = None
     runner._async_epoch = runner._async_counts_epoch = 1
     runner._async_counts = torch.tensor([1, 2, 1], dtype=torch.int64)
@@ -503,6 +503,20 @@ def test_non_target_indexer_metadata_does_not_disable_async_entry(setup):
     r._model_forward()
 
 
+def test_snapshot_uses_cached_target_names_without_rewalking_registry(setup):
+    r, _, shape, _, _ = setup
+
+    class NoTraversal:
+        def __iter__(self):
+            raise AssertionError("snapshot rebuilt static target names")
+
+    r._staged_sfa_impls = NoTraversal()
+    r._async_built = (r.normal_metadata, tuple(shape.values()))
+    for _ in range(3):
+        r._remember(seed=False)
+        assert r._async_snapshot.target_name == r._staged_sfa_layer_names[0]
+
+
 def test_unpadded_draft_lengths_and_padded_target_lengths(setup):
     r, s, shape, events, _ = setup
     common = r._async_snapshot.common
@@ -650,10 +664,7 @@ def test_actual_npu_metadata_kernel_matches_cpu_slots_and_padding(monkeypatch):
     pytest.importorskip("triton")
     if not torch.npu.is_available():
         pytest.skip("Requires NPU")
-    spec = importlib.util.spec_from_file_location("async_mtp_metadata_npu", KERNEL)
-    module = importlib.util.module_from_spec(spec)
-    monkeypatch.setitem(sys.modules, spec.name, module)
-    spec.loader.exec_module(module)
+    module = load_module(KERNEL, "async_mtp_metadata_npu", monkeypatch)
     held = []
     for n, capacity in ((1, 8), (3, 8), (4, 8), (16, 32)):
         common_capacity = capacity // 2

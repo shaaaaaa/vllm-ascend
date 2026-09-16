@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """CPU contract tests; runnable with --confcutdir=tests/ut/compilation."""
 
-import importlib.util
 import sys
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -12,6 +11,7 @@ from unittest.mock import Mock
 
 import pytest
 import torch
+from sfa_test_support import load_module
 
 
 @pytest.fixture
@@ -60,10 +60,7 @@ def graph_module(monkeypatch):
         raising=False,
     )
     path = Path(__file__).resolve().parents[3] / "vllm_ascend/compilation/sfa_full_graph.py"
-    spec = importlib.util.spec_from_file_location("tested_sfa_full_graph", path)
-    module = importlib.util.module_from_spec(spec)
-    monkeypatch.setitem(sys.modules, spec.name, module)
-    spec.loader.exec_module(module)
+    module = load_module(path, "tested_sfa_full_graph", monkeypatch)
     return module, context, captures, stream
 
 

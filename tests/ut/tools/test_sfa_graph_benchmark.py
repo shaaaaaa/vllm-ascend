@@ -408,13 +408,6 @@ def test_worker_selects_fixture_or_checkpoint_loading_not_parity_execution(
             events.append("production load")
             self.model_runner = object()
 
-    class Parity:
-        def load_model(self):
-            raise AssertionError("Parity hooks must never be installed")
-
-        def _prepare_quant_config(self):
-            events.append("quant remap")
-
     def dummy_load(original, loader, model, config):
         original(loader, model, config)
         events.append("integer weights")
@@ -426,7 +419,10 @@ def test_worker_selects_fixture_or_checkpoint_loading_not_parity_execution(
         "vllm.model_executor.model_loader.dummy_loader": {"DummyModelLoader": Dummy},
         "vllm_ascend": {"envs": SimpleNamespace()},
         "vllm_ascend.attention.sfa_parity": {"coordinated_check": lambda check, **kw: check()},
-        "vllm_ascend.worker.sfa_parity_worker": {"SFAParityWorker": Parity, "deterministic_dummy_load": dummy_load},
+        "vllm_ascend.worker.sfa_fixture": {
+            "prepare_dummy_quant_config": lambda config: events.append("quant remap"),
+            "deterministic_dummy_load": dummy_load,
+        },
         "vllm_ascend.worker.worker": {"NPUWorker": NPU},
         "vllm_ascend.worker.sfa_graph_timing": {
             "probe_captured_timing_support": lambda torch: (
@@ -441,6 +437,8 @@ def test_worker_selects_fixture_or_checkpoint_loading_not_parity_execution(
         stub = ModuleType(name)
         stub.__dict__.update(attributes)
         monkeypatch.setitem(sys.modules, name, stub)
+    # A benchmark must not import the parity worker just to prepare its fixture.
+    monkeypatch.setitem(sys.modules, "vllm_ascend.worker.sfa_parity_worker", None)
     path = Path(__file__).resolve().parents[3] / "vllm_ascend/worker/sfa_benchmark_worker.py"
     spec = importlib.util.spec_from_file_location("tested_benchmark_worker", path)
     module = importlib.util.module_from_spec(spec)
@@ -478,7 +476,7 @@ def test_worker_selects_fixture_or_checkpoint_loading_not_parity_execution(
     assert events == expected
     assert getattr(worker, "_graph_phase_timing", None) == ("probes" if diagnose and supported else None)
     assert Dummy.load_weights is original
-    assert not isinstance(worker, Parity)
+    assert module.SFABenchmarkWorker.__bases__ == (NPU,)
     assert set(module.SFABenchmarkWorker.__dict__) >= {"load_model", "benchmark_state", "shutdown"}
     assert "execute_model" not in module.SFABenchmarkWorker.__dict__
     if full_model:

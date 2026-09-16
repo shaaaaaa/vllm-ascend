@@ -9,7 +9,8 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
-from test_sfa_async_mtp import ROOT, extract, setup  # noqa: F401
+from sfa_test_support import ROOT, extract
+from test_sfa_async_mtp import setup  # noqa: F401
 
 
 @pytest.fixture

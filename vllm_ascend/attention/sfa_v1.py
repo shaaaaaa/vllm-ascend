@@ -2922,14 +2922,9 @@ class AscendSFAImpl(MLAAttentionImpl):
             return "the runtime graph mode is not PIECEWISE"
 
         token_capacity = int(hidden_states.shape[0])
-        capture_sizes = getattr(
-            self,
-            "_staged_sfa_graph_capture_sizes",
-            None,
-        )
-        if capture_sizes is None:
+        if getattr(self, "_staged_sfa_graph_capture_sizes", None) is None:
             # Compatibility for lightweight test/downstream implementations.
-            capture_sizes = staged_sfa_graph_capture_sizes(self.vllm_config)
+            staged_sfa_graph_capture_sizes(self.vllm_config)
         authorized_key = getattr(
             forward_context,
             "staged_sfa_graph_key",
@@ -3703,7 +3698,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         *,
         bind_source: bool = True,
         metadata_checks: dict | None = None,
-    ) -> dict[str, Any]:
+    ) -> dict[str, Any] | None:
         """Update live boundaries; validate fixed graph inputs only at startup.
 
         The runner batches source binding outside this per-layer metadata check,
@@ -3759,7 +3754,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         # Do not expose an event recorded only during startup eager warmup.
         metadata.reshape_cache_event = None
         if not context.staged_sfa_graph_dummy_run:
-            return {}
+            return None
         # The builder owns these stable allocations, just as in staged replay.
         # Retain a startup signature for explicit diagnostics, not a per-step
         # walk over every layer's tensors and static model configuration.

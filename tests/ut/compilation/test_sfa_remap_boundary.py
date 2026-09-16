@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """CPU comparison against the original remap helper, including cache lifetime."""
 
-import ast
 import importlib.util
 from functools import partial
 from pathlib import Path
@@ -12,6 +11,7 @@ from unittest.mock import Mock
 import numpy as np
 import pytest
 import torch
+from sfa_test_support import definitions, extract
 from torch.utils._python_dispatch import TorchDispatchMode
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -23,10 +23,7 @@ SPEC.loader.exec_module(remap)
 @pytest.fixture
 def original():
     path = ROOT / "vllm_ascend/attention/sfa_v1.py"
-    tree = ast.parse(path.read_text(encoding="utf-8"))
     names = {"_prepare_sfa_remap_boundary", "_validate_dsa_scratch_capacity"}
-    code = ast.parse("from __future__ import annotations")
-    code.body.extend(n for n in tree.body if getattr(n, "name", None) in names)
     config = SimpleNamespace(window=256)
     namespace = {
         "torch": torch,
@@ -34,7 +31,7 @@ def original():
         "_decode_window_save_window_size": lambda: config.window,
         "get_lmcache_sparse_cached_tokens": Mock(side_effect=AssertionError("unexpected connector lookup")),
     }
-    exec(compile(ast.fix_missing_locations(code), str(path), "exec"), namespace)
+    definitions(path, names, namespace)
     prepare = namespace["_prepare_sfa_remap_boundary"]
     return partial(prepare, reuse_unchanged=True), config
 
@@ -337,13 +334,7 @@ def test_async_failed_record_retains_source_and_refuses_reuse(deferred_uploads):
 @pytest.fixture
 def native_preparation():
     path = ROOT / "vllm_ascend/attention/sfa_v1.py"
-    tree = ast.parse(path.read_text(encoding="utf-8"))
     names = {"_prepare_sfa_remap_boundary", "_resolve_sparse_cached_tokens_by_request"}
-    cls = next(n for n in tree.body if getattr(n, "name", "") == "AscendSFAImpl")
-    method = next(n for n in cls.body if getattr(n, "name", "") == "prepare_native_sparse_boundary")
-    code = ast.parse("from __future__ import annotations")
-    code.body.extend(n for n in tree.body if getattr(n, "name", None) in names)
-    code.body.append(method)
     frontiers = {"a": 8192, "b": 12288}
     lookup = Mock(side_effect=lambda ids: [frontiers[key] for key in ids])
     ns = {
@@ -352,8 +343,9 @@ def native_preparation():
         "get_lmcache_sparse_cached_tokens": lookup,
         "_decode_window_save_window_size": lambda: 256,
     }
-    exec(compile(ast.fix_missing_locations(code), str(path), "exec"), ns)
-    impl_type = type("NativeImpl", (), {"prepare_native_sparse_boundary": ns[method.name]})
+    definitions(path, names, ns)
+    prepare = extract(path, "prepare_native_sparse_boundary", ns)
+    impl_type = type("NativeImpl", (), {"prepare_native_sparse_boundary": prepare})
     impl = impl_type()
     impl.dsa_shrink_latent, impl.index_topk = 2, 2048
     return impl, frontiers, lookup
@@ -402,12 +394,6 @@ def test_native_preparation_deduplicates_shared_metadata_and_skips_other_backend
 @pytest.mark.parametrize("enabled", [False, True])
 def test_draft_hook_prepares_each_step_before_native_model_only(mode, enabled):
     path = ROOT / "vllm_ascend/spec_decode/eagle_proposer.py"
-    tree = ast.parse(path.read_text(encoding="utf-8"))
-    method = next(
-        n
-        for n in ast.walk(tree)
-        if isinstance(n, ast.FunctionDef) and n.name == "_run_mtp_draft_layer_with_diagnostics"
-    )
     calls = []
     ns = {
         "envs_ascend": SimpleNamespace(VLLM_ASCEND_SFA_FULL_GRAPH=enabled),
@@ -415,9 +401,7 @@ def test_draft_hook_prepares_each_step_before_native_model_only(mode, enabled):
         "CUDAGraphMode": SimpleNamespace(FULL="FULL"),
         "prepare_native_sparse_boundaries": remap.prepare_native_sparse_boundaries,
     }
-    code = ast.parse("from __future__ import annotations")
-    code.body.append(method)
-    exec(compile(ast.fix_missing_locations(code), str(path), "exec"), ns)
+    run_draft = extract(path, "_run_mtp_draft_layer_with_diagnostics", ns)
     impl = SimpleNamespace(prepare_native_sparse_boundary=lambda item: calls.append(("prepare", item)))
     runner = SimpleNamespace(
         method="mtp",
@@ -425,7 +409,7 @@ def test_draft_hook_prepares_each_step_before_native_model_only(mode, enabled):
         model=lambda **kwargs: calls.append(("model", kwargs["step"])),
     )
     for step in (0, 1):
-        ns[method.name](
+        run_draft(
             runner, {"step": step}, draft_step=step, per_layer_attn_metadata={"draft": step}, runtime_inputs={}
         )
     expected = [("prepare", 0), ("model", 0), ("prepare", 1), ("model", 1)]
@@ -434,8 +418,6 @@ def test_draft_hook_prepares_each_step_before_native_model_only(mode, enabled):
 
 def test_target_fallback_prepares_after_context_binding_before_model():
     path = ROOT / "vllm_ascend/worker/model_runner_v1.py"
-    tree = ast.parse(path.read_text(encoding="utf-8"))
-    method = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "_model_forward")
     calls = []
     context = SimpleNamespace(
         attn_metadata={"target": "bound"}, cudagraph_runtime_mode="NONE", flash_comm_v1_enabled=False
@@ -447,12 +429,10 @@ def test_target_fallback_prepares_after_context_binding_before_model():
         "prepare_native_sparse_boundaries": remap.prepare_native_sparse_boundaries,
         "_capture_live_source_event_handoff": lambda: None,
     }
-    code = ast.parse("from __future__ import annotations")
-    code.body.append(method)
-    exec(compile(ast.fix_missing_locations(code), str(path), "exec"), ns)
+    forward = extract(path, "_model_forward", ns)
     impl = SimpleNamespace(prepare_native_sparse_boundary=lambda item: calls.append(item))
     runner = SimpleNamespace(_staged_sfa_impls=[("target", impl)], model=lambda **kwargs: calls.append("model"))
-    ns[method.name](runner, 1)
+    forward(runner, 1)
     assert calls == ["bound", "model"]
 
 

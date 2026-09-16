@@ -391,7 +391,7 @@ class AsyncSFAModelRunner(NPUModelRunner):
             return
         (metadata, common), shape = self._async_built
         ids = tuple(self.input_batch.req_ids)
-        names = tuple(name for name, _ in self._staged_sfa_impls)
+        names = self._staged_sfa_layer_names
         if not metadata or common is None or not ids or not names:
             return
         item = metadata.get(names[0])

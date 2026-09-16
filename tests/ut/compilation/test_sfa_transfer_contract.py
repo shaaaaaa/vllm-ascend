@@ -8,8 +8,6 @@ The caller, constructor, source dataclasses, bind/load and native Python
 wrappers are real code: a permissive transfer Mock cannot hide API drift.
 """
 
-import ast
-import importlib.util
 import logging
 import sys
 from dataclasses import dataclass
@@ -19,25 +17,16 @@ from unittest.mock import Mock
 
 import pytest
 import torch
-
-
-def extract(path, names, namespace, *, class_name=None):
-    tree = ast.parse(path.read_text(encoding="utf-8"))
-    if class_name:
-        tree = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == class_name)
-    body = [node for node in tree.body if getattr(node, "name", None) in names]
-    assert len(body) == len(names)
-    module = ast.Module(
-        body=[ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0), *body],
-        type_ignores=[],
-    )
-    exec(compile(ast.fix_missing_locations(module), str(path), "exec"), namespace)
+from sfa_test_support import definitions as extract
+from sfa_test_support import load_module
 
 
 @pytest.fixture
 def contract(monkeypatch):
     root = Path(__file__).resolve().parents[3]
     lmcache = root.parent / "LMCache/lmcache"
+    if not lmcache.is_dir():
+        lmcache = root.parent / "LMCache-NPU/lmcache"
     ascend = root.parent / "LMCache-Ascend/lmcache_ascend"
     if (
         not (lmcache / "v1/gpu_connector/sparse.py").is_file()
@@ -52,11 +41,7 @@ def contract(monkeypatch):
         return value
 
     def load(name, path):
-        spec = importlib.util.spec_from_file_location(name, path)
-        value = importlib.util.module_from_spec(spec)
-        monkeypatch.setitem(sys.modules, name, value)
-        spec.loader.exec_module(value)
-        return value
+        return load_module(path, name, monkeypatch)
 
     module("lmcache.v1.memory_management", MemoryObj=object)
     module("lmcache.logging", init_logger=logging.getLogger)

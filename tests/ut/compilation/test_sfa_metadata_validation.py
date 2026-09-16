@@ -11,6 +11,7 @@ from unittest.mock import Mock
 import numpy as np
 import pytest
 import torch
+from sfa_test_support import definitions, extract
 
 
 @dataclass(frozen=True)
@@ -32,10 +33,7 @@ class GraphKey:
 @pytest.fixture
 def checks():
     path = Path(__file__).resolve().parents[3] / "vllm_ascend/attention/sfa_v1.py"
-    tree = ast.parse(path.read_text(encoding="utf-8"))
-    cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "AscendSFAImpl")
     names = ("_cross_layer_ineligible_reason", "_cross_layer_metadata_ineligible_reason")
-    functions = [n for n in cls.body if getattr(n, "name", None) in names]
     context = SimpleNamespace(
         staged_sfa_graph_key=GraphKey(),
         cudagraph_runtime_mode="piecewise",
@@ -55,9 +53,7 @@ def checks():
         "staged_sfa_connector_supports_sparse_load": lambda: True,
         "get_weight_prefetch_method": lambda: None,
     }
-    module = ast.parse("from __future__ import annotations")
-    module.body.extend(functions)
-    exec(compile(ast.fix_missing_locations(module), str(path), "exec"), namespace)
+    definitions(path, names, namespace, class_name="AscendSFAImpl")
     impl_type = type("RealChecks", (), {name: namespace[name] for name in names})
 
     def make_impl():
@@ -126,6 +122,20 @@ def checks():
         return impl._cross_layer_ineligible_reason(hidden, caches, metadata, metadata_checks=memo)
 
     return make_impl, make_metadata, check, context
+
+
+def test_missing_constructor_capture_validation_is_still_enforced(checks, monkeypatch):
+    make_impl, make_metadata, check, _ = checks
+    impl, metadata = make_impl(), make_metadata()
+    validation = Mock(side_effect=ValueError("invalid capture configuration"))
+    monkeypatch.setitem(type(impl)._cross_layer_ineligible_reason.__globals__,
+                        "staged_sfa_graph_capture_sizes", validation)
+    assert check(impl, metadata) is None
+    validation.assert_not_called()
+    del impl._staged_sfa_graph_capture_sizes
+    with pytest.raises(ValueError, match="invalid capture configuration"):
+        check(impl, metadata)
+    validation.assert_called_once_with(impl.vllm_config)
 
 
 @pytest.mark.parametrize("layers", [1, 8, 80])
@@ -312,9 +322,6 @@ def test_shared_checker_depends_on_no_unkeyed_layer_attributes(checks):
 @pytest.mark.parametrize("dummy", [False, True])
 def test_full_graph_static_checks_only_run_at_startup(dummy):
     path = Path(__file__).resolve().parents[3] / "vllm_ascend/attention/sfa_v1.py"
-    tree = ast.parse(path.read_text(encoding="utf-8"))
-    cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "AscendSFAImpl")
-    method = next(n for n in cls.body if getattr(n, "name", "") == "prepare_full_graph_layer")
     # Deliberately no tensor metadata attributes: replay must not enumerate them.
     metadata = SimpleNamespace(req_ids=["request"], reshape_cache_event=object())
     context = SimpleNamespace(
@@ -325,9 +332,7 @@ def test_full_graph_static_checks_only_run_at_startup(dummy):
     )
     boundary = Mock(return_value=object())
     namespace = {"get_forward_context": lambda: context, "_prepare_sfa_remap_boundary": boundary}
-    module = ast.parse("from __future__ import annotations")
-    module.body.append(method)
-    exec(compile(ast.fix_missing_locations(module), str(path), "exec"), namespace)
+    extract(path, "prepare_full_graph_layer", namespace)
     transfer = Mock()
     impl = SimpleNamespace(
         _staged_sfa_capture_state=SimpleNamespace(runtime=(None, [object(), object()])),
@@ -345,7 +350,7 @@ def test_full_graph_static_checks_only_run_at_startup(dummy):
     else:
         for frontier in (4096, 4352):
             context.staged_sfa_route.frontiers = (frontier,)
-            assert prepare(impl, "L0", 65536, bind_source=False) == {}
+            assert prepare(impl, "L0", 65536, bind_source=False) is None
             assert boundary.call_args.kwargs["cached_tokens"] == (frontier,)
             assert impl._full_graph_transfer is transfer
             assert metadata.reshape_cache_event is None

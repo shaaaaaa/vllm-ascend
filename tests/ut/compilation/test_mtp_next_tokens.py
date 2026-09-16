@@ -7,69 +7,16 @@ verify arithmetic/addressing, not Triton compilation or NPU execution, which is
 covered by the hardware test at the end of this file.
 """
 
-import ast
-import importlib.util
-import sys
 from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
 import torch
+from sfa_test_support import HostTL, Pointer, extract, load_module
 
 ROOT = Path(__file__).resolve().parents[3]
 KERNEL_PATH = ROOT / "vllm_ascend/ops/triton/spec_decode/utils.py"
-
-
-def extract(path, name, namespace):
-    node = next(
-        n
-        for n in ast.walk(ast.parse(path.read_text(encoding="utf8")))
-        if isinstance(n, ast.FunctionDef) and n.name == name
-    )
-    node.decorator_list = []
-    tree = ast.parse("from __future__ import annotations")
-    tree.body.append(node)
-    exec(compile(ast.fix_missing_locations(tree), str(path), "exec"), namespace)
-    return namespace[name]
-
-
-class Pointer:
-    def __init__(self, tensor, offset=0):
-        count = tensor.untyped_storage().nbytes() // tensor.element_size() - tensor.storage_offset()
-        self.data = tensor.as_strided((count,), (1,))
-        self.offset = offset
-
-    def __add__(self, offset):
-        return Pointer(self.data, self.offset + offset)
-
-
-class HostTL:
-    int32 = torch.int32
-    range = staticmethod(range)
-    arange = staticmethod(torch.arange)
-    where = staticmethod(torch.where)
-    full = staticmethod(lambda shape, value, dtype: torch.full(shape, value, dtype=dtype))
-
-    def program_id(self, axis):
-        return self.pid
-
-    def num_programs(self, axis):
-        return self.programs
-
-    @staticmethod
-    def load(ptr, mask, other):
-        offsets, mask = torch.broadcast_tensors(torch.as_tensor(ptr.offset), torch.as_tensor(mask))
-        result = torch.full(offsets.shape, other, dtype=ptr.data.dtype)
-        result[mask] = ptr.data[offsets[mask].long()]
-        return result
-
-    @staticmethod
-    def store(ptr, value, mask):
-        offsets, values, mask = torch.broadcast_tensors(
-            torch.as_tensor(ptr.offset), torch.as_tensor(value), torch.as_tensor(mask)
-        )
-        ptr.data[offsets[mask].long()] = values[mask].to(ptr.data.dtype)
 
 
 class HostKernel:
@@ -204,10 +151,7 @@ def test_npu_fused_selection_and_count_readback(methods, monkeypatch):
     pytest.importorskip("triton")
     if not torch.npu.is_available():
         pytest.skip("Requires an NPU")
-    spec = importlib.util.spec_from_file_location("mtp_next_tokens_npu_kernel", KERNEL_PATH)
-    module = importlib.util.module_from_spec(spec)
-    monkeypatch.setitem(sys.modules, spec.name, module)
-    spec.loader.exec_module(module)
+    module = load_module(KERNEL_PATH, "mtp_next_tokens_npu_kernel", monkeypatch)
     run, ns, _ = methods
     ns["prepare_next_mtp_tokens_kernel"] = module.prepare_next_mtp_tokens_kernel
     copy_stream = torch.npu.Stream()
