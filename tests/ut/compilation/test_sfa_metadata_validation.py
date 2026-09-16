@@ -143,6 +143,25 @@ def test_shared_metadata_checked_once_but_again_next_forward(checks, layers):
     assert check(impls[0], metadata, {}) == "invalid bounded-decode request ownership"
 
 
+@pytest.mark.parametrize("consumer_first", [False, True])
+def test_glm52_shared_consumer_keeps_layer_guards_with_shared_metadata_memo(checks, consumer_first):
+    make_impl, make_metadata, check, _ = checks
+    producer, consumer = make_impl(), make_impl()
+    consumer.has_indexer = False
+    consumer.topk_indices_buffer = torch.zeros(2, 4, dtype=torch.int32)
+    caches = tuple(torch.zeros(5, 4, 1, dim, dtype=torch.float16) for dim in (4, 2, 3))
+    metadata, memo = make_metadata(), {}
+    layers = [(producer, caches), (consumer, caches[:2])]
+    for impl, planes in reversed(layers) if consumer_first else layers:
+        assert check(impl, metadata, memo, planes) is None
+    assert sum(x._cross_layer_metadata_ineligible_reason.call_count for x in (producer, consumer)) == 1
+    # Memoization cannot authorize a consumer without its raw top-k source.
+    consumer.topk_indices_buffer = None
+    assert "shared top-k buffer" in check(consumer, metadata, memo, caches[:2])
+    # Nor can a consumer's successful check authorize a producer without Group 1.
+    assert "indexer plane" in check(producer, metadata, memo, caches[:2])
+
+
 def test_distinct_metadata_objects_are_not_merged(checks):
     make_impl, make_metadata, check, _ = checks
     impls = [make_impl() for _ in range(8)]
