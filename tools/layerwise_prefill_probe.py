@@ -2,7 +2,9 @@
 """Opt-in worker hooks. No hooks are installed by importing this module.
 
 The diagnostic intentionally synchronizes/copies tensors; it is NOT a benchmark.
-Hooks are installed after warmup through collective_rpc, with eager execution.
+Hooks are installed after warmup through collective_rpc. Ordinary PIECEWISE
+graphs retain the eager mla_forward boundary; full/staged SFA graphs cannot
+be used to observe every layer with these Python hooks.
 """
 
 import functools
@@ -28,12 +30,14 @@ def slots_for_positions(cache, block_table, positions):
 
 
 class KVRecorder:
-    def __init__(self, root, rank, prompt_len):
+    def __init__(self, root, rank, prompt_len, flush_rows=256):
         self.root = Path(root) / "kv" / f"rank{rank}"
         self.root.mkdir(parents=True, exist_ok=True)
         self.prompt_len = prompt_len
         self.seen = {}
         self.count = 0
+        self.flush_rows = flush_rows
+        self.pending = {}
 
     def save(self, layer, part, kind, positions, cache, slots):
         positions = positions.detach().cpu().long().reshape(-1)
@@ -54,6 +58,19 @@ class KVRecorder:
         if not positions.numel():
             return
         values = rows_from_slots(cache, slots)
+        key = (layer, part, kind)
+        pending = self.pending.setdefault(key, [])
+        pending.append((positions.clone(), values))
+        if sum(row.numel() for row, _ in pending) >= self.flush_rows:
+            self._flush_key(key)
+
+    def _flush_key(self, key):
+        pending = self.pending.pop(key, [])
+        if not pending:
+            return
+        layer, part, kind = key
+        positions = torch.cat([row for row, _ in pending])
+        values = torch.cat([value for _, value in pending])
         name = f"{self.count:07d}_{hashlib.sha256(layer.encode()).hexdigest()[:12]}_{part}.pt"
         torch.save({"positions": positions, "values": values}, self.root / name)
         with (self.root / "index.jsonl").open("a", encoding="utf-8") as out:
@@ -62,8 +79,25 @@ class KVRecorder:
             )
         self.count += 1
 
+    def flush(self):
+        for key in list(self.pending):
+            self._flush_key(key)
+
+
+def validate_probe_graph_mode(config):
+    if config.model_config.enforce_eager:
+        return
+    compilation = config.compilation_config
+    mode = getattr(compilation.cudagraph_mode, "name", str(compilation.cudagraph_mode))
+    if mode != "PIECEWISE" or "vllm::mla_forward" not in (compilation.splitting_ops or []):
+        raise RuntimeError("KV probes require PIECEWISE with the mla_forward boundary, or P-node eager execution")
+
 
 class PrefillValidationWorker:
+    def finish_prefill_validation(self):
+        self.prefill_validation_recorder.flush()
+        return {"rank": self.rank, "kv_files": self.prefill_validation_recorder.count}
+
     def install_prefill_validation(self, root, prompt_len):
         # Lazy: this RPC runs only after NPU/TP and the model are initialized.
         from vllm.forward_context import get_forward_context
@@ -72,6 +106,8 @@ class PrefillValidationWorker:
 
         if hasattr(self, "prefill_validation_recorder"):
             raise RuntimeError("Validation hooks already installed")
+        if getattr(self, "vllm_config", None) is not None:
+            validate_probe_graph_mode(self.vllm_config)
         recorder = KVRecorder(root, self.rank, prompt_len)
         self.prefill_validation_recorder = recorder
         original_forward = sfa.AscendSFAImpl.forward

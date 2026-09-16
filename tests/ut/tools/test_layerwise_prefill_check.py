@@ -1,18 +1,26 @@
 # SPDX-License-Identifier: Apache-2.0
 """CPU contracts for the opt-in three-pass diagnostic, without vLLM/NPU imports."""
 
+import abc
 import ast
 import asyncio
+import ctypes
+import hashlib
 import importlib.util
 import json
 import subprocess
 import sys
+import threading
+from dataclasses import dataclass
+from enum import Enum, auto
+from functools import cached_property, wraps
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
 import torch
+from sortedcontainers import SortedList
 
 TOOLS = Path(__file__).resolve().parents[3] / "tools"
 
@@ -209,7 +217,7 @@ def test_main_records_prompt_path_and_reuses_parent_tokenization(tmp_path, monke
 
 def test_full_model_three_separate_roles():
     for stage, role in zip(CHECK.STAGES, ("kv_both", "kv_producer", "kv_consumer"), strict=True):
-        options = CHECK.engine_options(args(), 15000, stage)
+        options = CHECK.engine_options(args(), 12000, stage)
         assert options["load_format"] == "safetensors"
         assert "hf_overrides" not in options
         assert "speculative_config" not in options
@@ -217,7 +225,21 @@ def test_full_model_three_separate_roles():
         assert options["gpu_memory_utilization"] == 0.96
         assert options["max_model_len"] == 16384
         assert options["kv_transfer_config"]["kv_role"] == role
-        assert options["enforce_eager"]
+        if stage == "prefill":
+            assert options["enforce_eager"]
+        else:
+            assert "enforce_eager" not in options
+            assert options["compilation_config"]["cudagraph_mode"] == "PIECEWISE"
+            assert options["compilation_config"]["cudagraph_capture_sizes"] == [1]
+
+
+def test_long_output_default_and_article_not_limited_to_short_summary():
+    assert args().output_tokens == 4000
+    text = args().prompt_file.read_text(encoding="utf-8")
+    assert "约200字" not in text
+    CHECK.validate_sequence_length(12384, 4000)
+    with pytest.raises(ValueError, match="shorter --prompt-file"):
+        CHECK.validate_sequence_length(12385, 4000)
 
 
 @pytest.mark.parametrize("stage", CHECK.STAGES)
@@ -333,6 +355,7 @@ def test_loaded_rows_dedup_but_current_writes_retained(tmp_path):
     for _ in range(2):
         rec.save("layer0", "nope", "loaded", torch.tensor([0, 1, 3]), cache, torch.tensor([0, 1, 3]))
     rec.save("layer0", "nope", "current", torch.tensor([3]), cache, torch.tensor([3]))
+    rec.flush()
     index = CHECK.read_index(tmp_path)
     loaded = index[("rank0", "layer0", "nope", "loaded")]
     assert len(loaded) == 1
@@ -461,6 +484,184 @@ def test_reload_allocation_failure_releases_memory(connector_module, tmp_path):
     assert allocated[0].released == 1
 
 
+@pytest.fixture(scope="module")
+def real_cpu_memory():
+    """Execute production allocators/objects unchanged, without service imports."""
+    root = TOOLS.parents[1] / "LMCache/lmcache"
+    namespace = dict(
+        __name__=__name__,
+        abc=abc,
+        ctypes=ctypes,
+        dataclass=dataclass,
+        Enum=Enum,
+        auto=auto,
+        cached_property=cached_property,
+        wraps=wraps,
+        threading=threading,
+        torch=torch,
+        SortedList=SortedList,
+        LMCStatsMonitor=Mock(),
+        logger=Mock(),
+        _lmcache_nvtx_annotate=lambda f: f,
+    )
+    for path, names in (
+        (root / "integration/vllm/utils.py", {"get_size_bytes"}),
+        (
+            root / "v1/memory_management.py",
+            {
+                "_group_prefix_sums",
+                "synchronized",
+                "MemoryFormat",
+                "FreeBlock",
+                "MemoryObjMetadata",
+                "_TensorAllocationBatch",
+                "MemoryObj",
+                "TensorMemoryObj",
+                "MemoryAllocatorInterface",
+                "AddressManager",
+                "TensorMemoryAllocator",
+            },
+        ),
+    ):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        nodes = [n for n in tree.body if getattr(n, "name", None) in names]
+        assert {n.name for n in nodes} == names
+        module = ast.Module(
+            body=[ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0), *nodes],
+            type_ignores=[],
+        )
+        exec(compile(ast.fix_missing_locations(module), str(path), "exec"), namespace)
+    return SimpleNamespace(**namespace)
+
+
+@pytest.mark.parametrize("tokens", [1, 17, 32, 97, 255, 256])
+@pytest.mark.parametrize("layout", ["latent", "indexer", "mixed_dtype"])
+@pytest.mark.parametrize("legacy", [False, True])
+def test_real_batched_store_single_reload_tail_padding(
+    connector_module,
+    real_cpu_memory,
+    tmp_path,
+    tokens,
+    layout,
+    legacy,
+):
+    api = real_cpu_memory
+    connector_module.MemoryFormat = api.MemoryFormat
+    allocator = api.TensorMemoryAllocator(torch.zeros(2 * 1024**2, dtype=torch.uint8))
+    if layout == "latent":
+        shapes, dtypes = [torch.Size([tokens * 576])], [torch.bfloat16]
+        fmt = api.MemoryFormat.KV_MLA_LATENT_FMT
+    elif layout == "indexer":
+        shapes, dtypes = [torch.Size([tokens * 128])], [torch.bfloat16]
+        fmt = api.MemoryFormat.KV_DSA_INDEX_FMT
+    else:
+        shapes = [torch.Size([tokens * 128]), torch.Size([tokens])]
+        dtypes, fmt = [torch.int8, torch.float32], api.MemoryFormat.KV_DSA_INDEX_FMT
+    sources = allocator.batched_allocate(shapes, dtypes, batch_size=2, fmt=fmt)
+    source = sources[0]
+    source.meta.valid_tokens = tokens
+    source.meta.cached_positions = torch.arange(37 * 256, 37 * 256 + tokens)
+    logical = api.get_size_bytes(shapes, dtypes)
+    expected = torch.arange(logical, dtype=torch.int64).remainder(251).to(torch.uint8)
+    source.raw_data.fill_(255)  # Padding must not become part of the saved KV.
+    source.raw_data[:logical].copy_(expected)
+    conn, key, _ = make_connector(connector_module, tmp_path)
+    conn.local_cpu_backend.allocate = lambda s, d, f, busy_loop: allocator.allocate(s, d, f)
+    asyncio.run(conn.put(key, source))
+    path = conn.path_for(key)
+    payload = torch.load(path, weights_only=True)
+    assert payload["logical_bytes"] == logical
+    assert torch.equal(payload["raw"], expected)
+    if legacy:
+        del payload["logical_bytes"]
+        payload["raw"] = torch.frombuffer(bytearray(source.byte_array), dtype=torch.uint8).clone()
+        payload["sha256"] = hashlib.sha256(payload["raw"].numpy().tobytes()).hexdigest()
+        torch.save(payload, path)
+    original_file = path.read_bytes()
+    restored = asyncio.run(conn.get(key))
+    assert restored.get_shapes() == shapes and restored.get_dtypes() == dtypes
+    assert restored.get_num_tokens() == tokens
+    assert torch.equal(restored.meta.cached_positions, source.meta.cached_positions)
+    assert torch.equal(restored.raw_data, expected)
+    assert source.raw_data.numel() == allocator.address_manager.compute_aligned_size(logical)
+    assert restored.raw_data.numel() == logical
+    if logical % api.AddressManager.ALIGN_BYTES:
+        # This exact mismatch tripped the old connector's dst == raw assertion.
+        assert source.raw_data.numel() > restored.raw_data.numel()
+    assert path.read_bytes() == original_file  # No rewriting the sealed P archive.
+    read_log = next(conn.stage_dir.glob("archive_reads_*.jsonl"))
+    read = json.loads(read_log.read_text(encoding="utf-8"))
+    assert read["sha256"] == payload["sha256"]
+    assert read["logical_bytes"] == logical
+    restored.ref_count_down()
+    for obj in sources:
+        obj.ref_count_down()
+    assert allocator.total_allocated_size == 0
+
+
+def test_reload_accepts_padded_destination_with_correct_metadata(connector_module, tmp_path):
+    conn, key, _ = make_connector(connector_module, tmp_path)
+    asyncio.run(conn.put(key, Memory(torch.arange(12, dtype=torch.uint8))))
+    dst = Memory(torch.full((4096,), 255, dtype=torch.uint8))
+    dst.get_shapes = lambda: [torch.Size([12])]
+    conn.local_cpu_backend.allocate = lambda *a, **kw: dst
+    restored = asyncio.run(conn.get(key))
+    assert torch.equal(restored.raw_data[:12], torch.arange(12, dtype=torch.uint8))
+    assert torch.all(restored.raw_data[12:] == 255)
+
+
+def test_legacy_padding_is_still_checksum_checked(connector_module, tmp_path):
+    conn, key, _ = make_connector(connector_module, tmp_path)
+    asyncio.run(conn.put(key, Memory(torch.arange(12, dtype=torch.uint8))))
+    path = conn.path_for(key)
+    payload = torch.load(path, weights_only=True)
+    del payload["logical_bytes"]
+    payload["raw"] = torch.cat([payload["raw"], torch.zeros(4, dtype=torch.uint8)])
+    payload["sha256"] = hashlib.sha256(payload["raw"].numpy().tobytes()).hexdigest()
+    payload["raw"][-1] = 255
+    torch.save(payload, path)
+    with pytest.raises(RuntimeError, match="checksum"):
+        asyncio.run(conn.get(key))
+
+
+def test_truncated_source_rejected_before_publication(connector_module, tmp_path):
+    conn, key, _ = make_connector(connector_module, tmp_path)
+    source = Memory(torch.zeros(11, dtype=torch.uint8))
+    source.get_shapes = lambda: [torch.Size([12])]
+    with pytest.raises(RuntimeError, match="source is truncated"):
+        asyncio.run(conn.put(key, source))
+    assert not conn.exists_sync(key)
+    assert source.released == 0
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_truncated_archive_cannot_be_hidden_by_padding_fix(connector_module, tmp_path, legacy):
+    conn, key, allocated = make_connector(connector_module, tmp_path)
+    asyncio.run(conn.put(key, Memory(torch.arange(12, dtype=torch.uint8))))
+    path = conn.path_for(key)
+    payload = torch.load(path, weights_only=True)
+    if legacy:
+        del payload["logical_bytes"]
+    payload["raw"] = payload["raw"][:-1]
+    payload["sha256"] = hashlib.sha256(payload["raw"].numpy().tobytes()).hexdigest()
+    torch.save(payload, path)
+    with pytest.raises(RuntimeError, match="truncated"):
+        asyncio.run(conn.get(key))
+    assert allocated == []
+
+
+def test_archive_size_metadata_mismatch_rejected(connector_module, tmp_path):
+    conn, key, allocated = make_connector(connector_module, tmp_path)
+    asyncio.run(conn.put(key, Memory(torch.arange(12, dtype=torch.uint8))))
+    path = conn.path_for(key)
+    payload = torch.load(path, weights_only=True)
+    payload["logical_bytes"] = 11
+    torch.save(payload, path)
+    with pytest.raises(RuntimeError, match="logical size metadata"):
+        asyncio.run(conn.get(key))
+    assert allocated == []
+
+
 @pytest.mark.parametrize("read_only", [False, True])
 def test_real_instrumented_put_releases_exactly_once(connector_module, tmp_path, read_only):
     source_path = TOOLS.parents[1] / "LMCache/lmcache/v1/storage_backend/connector/instrumented_connector.py"
@@ -528,6 +729,7 @@ def test_real_worker_hooks_observe_writes_and_loads(monkeypatch, tmp_path):
         indexer_block_table=torch.tensor([[1, 0]]),
     )
     assert Impl().forward("layer", None, parts, meta) == "output"
+    worker.finish_prefill_validation()
     manifest = CHECK.read_index(tmp_path)
     for part, expected in (("nope", 90), ("pe", 91), ("index", 92)):
         positions, values = CHECK.load_rows(manifest[("rank0", "layer", part, "current")], 0, 3)
@@ -557,6 +759,7 @@ def test_three_pass_report_keeps_small_differences_and_real_output_divergence(co
                 rec.save("layer", part, "loaded", torch.arange(3), cache, torch.arange(3))
             if stage != "prefill":
                 rec.save("layer", part, "current", torch.tensor([4]), cache, torch.tensor([4]))
+        rec.flush()
     CHECK.write_json(tmp_path / "prompt.json", {"length": 4, "sha256": "same"})
     for stage in ("baseline", "prefill"):
         conn, key, _ = make_connector(connector_module, tmp_path / stage)
@@ -579,3 +782,40 @@ def test_three_pass_report_keeps_small_differences_and_real_output_divergence(co
     assert (tmp_path / "kv_statistics.csv").is_file()
     written = [row for row in result["kv"] if row["comparison"] == "prefill_written"]
     assert all(0 < row["stats"]["abs_diff"]["mean"] < 1e-7 for row in written)
+
+
+def test_decode_probe_batches_files_without_losing_rows_or_duplicate_writes(tmp_path):
+    recorder = PROBE.KVRecorder(tmp_path, 0, 4, flush_rows=3)
+    cache = torch.arange(6).reshape(3, 2, 1, 1)
+    for pos in (1, 2, 2, 3):
+        recorder.save("layer", "nope", "current", torch.tensor([pos]), cache, torch.tensor([pos]))
+    assert recorder.count == 1
+    recorder.flush()
+    recorder.flush()
+    assert recorder.count == 2
+    files = CHECK.read_index(tmp_path)[("rank0", "layer", "nope", "current")]
+    payloads = [torch.load(path, weights_only=True) for path in files]
+    assert torch.cat([payload["positions"] for payload in payloads]).tolist() == [1, 2, 2, 3]
+    assert torch.cat([payload["values"].reshape(-1) for payload in payloads]).tolist() == [1, 2, 2, 3]
+
+
+@pytest.mark.parametrize(
+    "mode, splits, valid",
+    [
+        ("PIECEWISE", ["vllm::mla_forward"], True),
+        ("PIECEWISE", ["vllm::sfa_lmcache_retrieve"], False),
+        ("FULL", [], False),
+    ],
+)
+def test_probe_graph_mode_must_preserve_per_layer_callback(mode, splits, valid):
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(enforce_eager=False),
+        compilation_config=SimpleNamespace(cudagraph_mode=SimpleNamespace(name=mode), splitting_ops=splits),
+    )
+    if valid:
+        PROBE.validate_probe_graph_mode(config)
+    else:
+        with pytest.raises(RuntimeError, match="mla_forward"):
+            PROBE.validate_probe_graph_mode(config)
+    config.model_config.enforce_eager = True
+    PROBE.validate_probe_graph_mode(config)

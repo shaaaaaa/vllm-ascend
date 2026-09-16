@@ -16,13 +16,18 @@ python -u tools/layerwise_prefill_check.py 2>&1 | tee log.log
 
 只 tokenize 一次并打印实际 token 数，三次复用同一组 token IDs。
 实际长度由模型 tokenizer 决定，不保证恰好 12k；必须超过 4096-token prefill
-计算 chunk 和 256-token LMCache chunk。输出最多 128 token，允许正常 EOS。
+计算 chunk 和 256-token LMCache chunk。baseline/D 输出最多 4000 token，允许正常 EOS；
+这里的单位是 token，不是词。文章的“约 200 字”摘要限制已删除。
 `--prompt-tokens` 现在仅是可选的最小长度检查，不会补齐或截断固定输入。
 
 三次运行统一使用 `max_model_len=16384`、`gpu_memory_utilization=0.96`。
 实际 prompt 加输出长度超出 16384 时，在启动模型前报错，不静默截断文章。
+使用默认 4000-token 输出预算时，prompt 最多 12384 token；精确 token 数必须
+由实际 GLM tokenizer 计算，不能用文章英文词数替代。
 普通单机服务脚本 `tools/serve_glm52_baseline.sh` 也使用 `16384 / 0.96`；
-其原有 MTP、图模式等其他配置不变。
+其 MTP 保留开启，不加 `--enforce-eager`，仍使用本地 CPU 缓存，不启用 NPU 直传。
+**该 shell 脚本沿用清空 `/dev/shm/*` 的行为，只能在专用环境运行。**
+下述三阶段验证仍使用磁盘交接，不需要 Mooncake 服务。
 
 脚本入口不再先导入 torch，会立即输出启动提示；随后分别打印读取输入、
 加载 tokenizer、tokenize、启动各模型阶段的进度。子进程使用无缓冲输出。
@@ -53,6 +58,8 @@ python -u tools/layerwise_prefill_check.py 2>&1 | tee log.log
 - `baseline/output.txt`、`prefill/output.txt`、`decode/output.txt`：模型输出。
   对应 `output.json` 同时记录 token IDs。
 - 各阶段 `kv/rank*/`：全部 TP rank、各层、按逻辑 token 位置记录的原始 KV。
+  短 decode 写入按每层/分量累计 256 行落盘，结束时刷新尾部；不减少采样行，
+  避免 4000-token 输出产生数百万个单行文件。
 - `baseline/archive/`、`prefill/archive/`：实际 LMCache 保存的数据。
 - `kv_statistics.csv`：逐 rank/层/分量，baseline 与候选值及其绝对值的均值、
   总体方差、最大值；`diff = candidate - baseline` 和 `abs_diff` 的同类统计。
@@ -77,10 +84,18 @@ python tools/layerwise_prefill_check.py --analyse-only --run-dir /实际结果�
 
 ## 测试边界
 
-三次均为 **eager、关闭 MTP**，保证 Python 探针观测每次执行且 token 位置一致。
+三次均关闭 MTP；仅 P 阶段使用 eager，baseline/D 使用普通 **PIECEWISE** 图，
+保留 `vllm::mla_forward` 的逐层回调边界。探针安装时检查实际图配置，防止
+切到 FULL/staged 后只记录 capture 而漏掉真实 decode。`output.json` 记录实际
+`enforce_eager`、生成 token 数、上限和停止原因。
 探针有同步和拷贝开销，可能改变重叠时序，不是性能测试，也不能证明不存在
 仅在异步时序下出现的竞争。没有修改默认生产执行路径。
 
 磁盘 connector 是测试专用持久化传输，保留 flat KV 的 `valid_tokens` 等元数据，
-不持久化进程指针。**不验证 Mooncake 网络/租约、跨机 PD、MTP 接受率或图模式精度。**
+不持久化进程指针或分配器末尾的对齐填充。旧版 archive 含有对齐填充时，仍校验
+整个文件载荷的 checksum，再按 shapes/dtypes 恢复实际 KV 字节，不改写原文件；
+避免尾部不足一个 chunk 时，P 批量分配与 D 单次分配的 raw view 长度不同导致加载失败。
+截断数据或校验不一致仍会报错，不会补零冒充有效 KV。
+**不验证 Mooncake 网络/租约、跨机 PD、MTP 接受率或 FULL/staged 图。**
+NPU 直传暂不接入本测试。
 当前本地只能跑 CPU 合约回归；完整 NPU 三段执行需要在服务器验证。

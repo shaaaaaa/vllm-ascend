@@ -4,7 +4,8 @@
 
 Usage: python tools/layerwise_prefill_check.py 2>&1 | tee log.log
 No profiler, no dummy weights, no hidden-layer override, no numeric pass/fail
-threshold. Eager, MTP-off diagnostic: do not use its timings as performance data.
+threshold. Baseline/D use PIECEWISE graphs; only P is eager. MTP remains off.
+The KV probes copy/synchronize data: do not use these timings as performance data.
 """
 
 import argparse
@@ -202,13 +203,13 @@ def validate_sequence_length(prompt_len, output_tokens):
     if prompt_len + output_tokens > MAX_MODEL_LEN:
         raise ValueError(
             f"Prompt ({prompt_len}) + output ({output_tokens}) exceeds max_model_len={MAX_MODEL_LEN}; "
-            "reduce --prompt-tokens or --output-tokens"
+            "use a shorter --prompt-file or reduce --output-tokens"
         )
 
 
 def engine_options(args, prompt_len, stage):
     validate_sequence_length(prompt_len, args.output_tokens)
-    return {
+    options = {
         "model": args.model,
         "trust_remote_code": True,
         "load_format": "safetensors",
@@ -226,8 +227,6 @@ def engine_options(args, prompt_len, stage):
         "async_scheduling": False,
         "gpu_memory_utilization": 0.96,
         "seed": 1024,
-        # Python probes must observe every forward, never just graph capture.
-        "enforce_eager": True,
         "worker_extension_cls": "layerwise_prefill_probe.PrefillValidationWorker",
         "additional_config": {
             "recompute_scheduler_enable": False,
@@ -243,6 +242,13 @@ def engine_options(args, prompt_len, stage):
             "kv_connector_module_path": "lmcache_ascend.integration.vllm.lmcache_ascend_connector_v1",
         },
     }
+    if stage == "prefill":
+        options["enforce_eager"] = True
+    else:
+        # Ordinary PIECEWISE keeps mla_forward outside capture, so the KV
+        # hooks still execute on each real request, not only during warmup.
+        options["compilation_config"] = {"cudagraph_mode": "PIECEWISE", "cudagraph_capture_sizes": [1]}
+    return options
 
 
 def run_child(args):
@@ -269,6 +275,8 @@ def run_child(args):
             ),
             use_tqdm=False,
         )
+        traces = llm.collective_rpc("finish_prefill_validation", timeout=300)
+        write_json(root / args.stage / "trace_coverage.json", traces)
         if len(output) != 1 or len(output[0].outputs) != 1:
             raise RuntimeError("Expected one completed request")
         result = output[0]
@@ -281,11 +289,18 @@ def run_child(args):
             "num_cached_tokens": result.num_cached_tokens,
             "kv_transfer_params": result.kv_transfer_params,
             "finish_reason": completion.finish_reason,
+            "output_tokens": len(completion.token_ids),
+            "output_token_limit": 1 if args.stage == "prefill" else args.output_tokens,
+            "enforce_eager": llm.llm_engine.model_config.enforce_eager,
             "num_hidden_layers": llm.llm_engine.model_config.hf_config.num_hidden_layers,
         }
         write_json(root / args.stage / "output.json", record)
         (root / args.stage / "output.txt").write_text(completion.text, encoding="utf-8")
-        print(f"[PREFILL_CHECK] {args.stage} output: {completion.text!r}", flush=True)
+        print(
+            f"[PREFILL_CHECK] {args.stage} output_tokens={len(completion.token_ids)}, "
+            f"finish_reason={completion.finish_reason}; output: {completion.text!r}",
+            flush=True,
+        )
     finally:
         # Same shutdown used by the offline engine client; parent also fences
         # the process group it created before starting the next model copy.
@@ -567,7 +582,7 @@ def analyse(root, ranks):
     summary = {
         "prompt_tokens": length,
         "mtp": False,
-        "eager": True,
+        "enforce_eager": {stage: outputs[stage].get("enforce_eager") for stage in STAGES},
         "full_model": True,
         "tokens_equal": mismatch is None,
         "first_different_output_token_index": mismatch,
@@ -625,7 +640,7 @@ def parser():
     cli.add_argument(
         "--prompt-tokens", type=int, help="Optional minimum length check; never pads or truncates the fixed prompt"
     )
-    cli.add_argument("--output-tokens", type=int, default=128)
+    cli.add_argument("--output-tokens", type=int, default=4000, help="Maximum generated tokens (not words); allow EOS")
     cli.add_argument("--prefill-chunk-tokens", type=int, default=4096)
     cli.add_argument("--cpu-cache-gb", type=float, default=8)
     cli.add_argument("--run-dir", type=Path)

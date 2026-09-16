@@ -17,6 +17,14 @@ from lmcache.v1.memory_management import MemoryFormat
 from lmcache.v1.storage_backend.connector.base_connector import RemoteConnector
 
 
+def logical_nbytes(shapes, dtypes):
+    """Size of packed KV planes, excluding allocator alignment padding."""
+    size = sum(torch.Size(shape).numel() * dtype.itemsize for shape, dtype in zip(shapes, dtypes, strict=True))
+    if size <= 0:
+        raise RuntimeError("Archive must contain non-empty KV data")
+    return size
+
+
 class ValidationFileConnector(RemoteConnector):
     def __init__(self, loop, local_cpu_backend, config):
         # The scheduler uses a metadata-less CPU stub, so do not initialize
@@ -51,17 +59,25 @@ class ValidationFileConnector(RemoteConnector):
         positions = memory_obj.meta.cached_positions
         if positions is not None:
             positions = torch.as_tensor(positions, dtype=torch.int64).detach().cpu().clone()
+        shapes, dtypes = memory_obj.get_shapes(), memory_obj.get_dtypes()
+        size = logical_nbytes(shapes, dtypes)
+        raw = torch.frombuffer(bytearray(memory_obj.byte_array), dtype=torch.uint8)
+        if raw.numel() < size:
+            raise RuntimeError(f"Archive source is truncated: logical_bytes={size}, raw_bytes={raw.numel()}")
         payload = {
             "key": key.to_string(),
             "kv_group": key.kv_group,
             "layer_id": getattr(key, "layer_id", None),
             "worker_id": key.worker_id,
-            "shapes": [list(s) for s in memory_obj.get_shapes()],
-            "dtypes": [str(d) for d in memory_obj.get_dtypes()],
+            "shapes": [list(s) for s in shapes],
+            "dtypes": [str(d) for d in dtypes],
             "fmt": memory_obj.get_memory_format().value,
             "valid_tokens": int(memory_obj.meta.valid_tokens) if memory_obj.meta.valid_tokens is not None else None,
             "cached_positions": positions,
-            "raw": torch.frombuffer(bytearray(memory_obj.byte_array), dtype=torch.uint8).clone(),
+            # batched_allocate exposes an aligned raw view; allocate exposes
+            # only logical bytes. Padding is not KV and must not be serialized.
+            "logical_bytes": size,
+            "raw": raw[:size].clone(),
         }
         payload["sha256"] = hashlib.sha256(payload["raw"].numpy().tobytes()).hexdigest()
         path = self.path_for(key)
@@ -77,28 +93,47 @@ class ValidationFileConnector(RemoteConnector):
         if payload["key"] != key.to_string():
             raise RuntimeError("Archive key mismatch")
         raw = payload["raw"]
+        if raw.dtype != torch.uint8 or raw.ndim != 1:
+            raise RuntimeError("Archive raw data must be a flat byte tensor")
         digest = hashlib.sha256(raw.numpy().tobytes()).hexdigest()
         if digest != payload["sha256"]:
             raise RuntimeError(f"Archive checksum mismatch: {path}")
+        shapes = [torch.Size(s) for s in payload["shapes"]]
+        dtypes = [getattr(torch, d.removeprefix("torch.")) for d in payload["dtypes"]]
+        size = logical_nbytes(shapes, dtypes)
+        if raw.numel() < size:
+            raise RuntimeError(f"Archive data is truncated: logical_bytes={size}, raw_bytes={raw.numel()}")
+        if "logical_bytes" in payload and (payload["logical_bytes"] != size or raw.numel() != size):
+            raise RuntimeError("Archive logical size metadata mismatch")
+        # Legacy archives included the batched allocator's trailing padding.
+        # Verify the ENTIRE saved checksum above, but restore only KV bytes.
+        # Keep that original digest in the read log for sealed-archive checks.
         obj = self.local_cpu_backend.allocate(
-            [torch.Size(s) for s in payload["shapes"]],
-            [getattr(torch, d.removeprefix("torch.")) for d in payload["dtypes"]],
+            shapes,
+            dtypes,
             MemoryFormat(payload["fmt"]),
             busy_loop=False,
         )
         if obj is None:
             raise RuntimeError("Insufficient CPU cache capacity for archive reload")
         try:
-            dst = obj.raw_data.view(torch.uint8).reshape(-1)
-            if dst.numel() != raw.numel():
-                raise RuntimeError("Archive allocation size mismatch")
-            dst.copy_(raw)
+            # Flat objects also need this metadata on the cleanup/error path.
             obj.meta.valid_tokens = payload["valid_tokens"]
             obj.meta.cached_positions = payload["cached_positions"]
+            dst = obj.raw_data.view(torch.uint8).reshape(-1)
+            if obj.get_shapes() != shapes or obj.get_dtypes() != dtypes or dst.numel() < size:
+                raise RuntimeError(f"Archive allocation size mismatch: logical_bytes={size}, raw_bytes={dst.numel()}")
+            dst[:size].copy_(raw[:size])
             with (self.stage_dir / f"archive_reads_{os.getpid()}.jsonl").open("a", encoding="utf-8") as out:
                 out.write(
                     json.dumps(
-                        {"key": payload["key"], "sha256": digest, "kv_group": payload["kv_group"], "bytes": raw.numel()}
+                        {
+                            "key": payload["key"],
+                            "sha256": digest,
+                            "kv_group": payload["kv_group"],
+                            "bytes": raw.numel(),
+                            "logical_bytes": size,
+                        }
                     )
                     + "\n"
                 )
