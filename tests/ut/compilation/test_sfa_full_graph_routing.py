@@ -13,6 +13,7 @@ import numpy as np
 import pytest
 import torch
 from sfa_test_support import definitions
+from test_sfa_async_mtp import setup  # noqa: F401
 
 
 @dataclass(frozen=True)
@@ -1172,3 +1173,82 @@ def test_target_names_follow_collection_reset_and_recollection(failed_reset):
     del layers["alias"]
     runner._staged_sfa_impls = runner._collect_staged_sfa_impls()
     assert runner._staged_sfa_layer_names == (names[1],)
+
+
+@pytest.mark.parametrize(
+    "change", ["none", "replacement", "wrapper", "order", "missing", "fallback", "cascade", "width"]
+)
+def test_async_route_reuses_only_current_validated_metadata(routing, request, monkeypatch, change):
+    base, ns, _, _, states = routing
+    runner, scheduled, _, _, async_ns = request.getfixturevalue("setup")
+    root = Path(__file__).resolve().parents[3] / "vllm_ascend"
+    definitions(root / "attention/utils.py", {"_dsa_remap_frontier", "staged_sfa_metadata_sparse_route"}, ns)
+    parse = ns["staged_sfa_metadata_sparse_route"]
+    calls = []
+
+    def counted(metadata, ids):
+        calls.append(metadata)
+        return parse(metadata, ids)
+
+    ns["staged_sfa_metadata_sparse_route"] = counted
+    async_ns["staged_sfa_metadata_sparse_route"] = counted
+    async_ns["StagedSFARouteReason"] = ns["StagedSFARouteReason"]
+    monkeypatch.setattr(
+        async_ns["NPUModelRunner"], "_staged_sfa_local_route", ns["_staged_sfa_local_route"], raising=False
+    )
+    runner.speculative_config = base.speculative_config
+    runner.vllm_config = base.vllm_config
+    runner.attn_state = states.SpecDecoding
+    runner._staged_sfa_graph_capture_sizes = (8, 16)
+    runner.decode_threshold = 2
+    scheduled.kv_connector_metadata = SimpleNamespace(
+        requests=[
+            SimpleNamespace(
+                req_id=rid,
+                is_sparse_decode=True,
+                dsa_current_released_frontier=4096,
+                dsa_nonresident_frontier=4096,
+                load_spec=SimpleNamespace(can_load=True, lmcache_cached_tokens=4096, dsa_committed_end=4096),
+            )
+            for rid in runner.input_batch.req_ids
+        ]
+    )
+    runner._update_states(scheduled)
+    assert runner._async_pending is scheduled and len(calls) == 1
+    original = scheduled.kv_connector_metadata
+    metadata = original
+    ids = list(runner.input_batch.req_ids)
+    if change in ("replacement", "wrapper"):
+        metadata = SimpleNamespace(requests=list(original.requests))
+        if change == "wrapper":
+            child = metadata
+            metadata = object()
+            ns["unwrap_staged_sfa_connector_metadata"] = lambda m: child
+    elif change == "order":
+        ids.reverse()
+    elif change == "missing":
+        ids = None
+    elif change == "fallback":
+        runner._async_pending = None
+    kwargs = dict(
+        num_tokens_unpadded=6,
+        num_reqs=3,
+        num_scheduled_tokens=np.array([3, 2, 2]) if change == "width" else np.full(3, 2),
+        index_topk=2048,
+        has_cascade_attention=change == "cascade",
+        request_ids=ids,
+        kv_connector_metadata=metadata,
+        num_computed_tokens=runner.input_batch.num_computed_tokens_cpu,
+        prompt_lens=runner.input_batch.num_prompt_tokens,
+    )
+    actual = runner._staged_sfa_local_route(**kwargs)
+    reused = change in ("none", "cascade", "width")
+    assert len(calls) == (1 if reused else 2)
+    expected = ns["_staged_sfa_local_route"](runner, **kwargs)
+    assert actual == expected
+    if change in ("cascade", "width"):
+        assert actual.action == ns["StagedSFARouteAction"].SAFE_NATIVE
+    # A new step must validate fresh metadata; no route result lives across steps.
+    runner._async_pending = None
+    runner._staged_sfa_local_route(**kwargs)
+    assert len(calls) == (3 if reused else 4)

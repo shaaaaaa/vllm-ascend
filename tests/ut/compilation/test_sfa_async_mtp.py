@@ -728,3 +728,44 @@ def test_actual_npu_metadata_kernel_matches_cpu_slots_and_padding(monkeypatch):
         assert torch.all(lengths[len(expected_len) :] == 0)
         for actual, expected in zip(slots, expected_slots):
             torch.testing.assert_close(actual.cpu(), expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("valid", [False, True])
+def test_zero_window_eligibility_uses_frontiers_without_boundary_rebuild(setup, valid):
+    runner, scheduled, _, _, ns = setup
+    assert runner._async_snapshot.window == 0
+    if not valid:
+        runner._async_snapshot.boundary = (0, 0, 0)
+
+    def forbidden(*args):
+        raise AssertionError("zero-window eligibility must not rebuild boundaries")
+
+    ns["_boundary"] = forbidden
+    assert runner._eligible(scheduled) is valid
+
+
+@pytest.mark.parametrize("window", [1, 16, 1024, 4096])
+@pytest.mark.parametrize("crossing", [False, True])
+def test_nonzero_window_retains_acceptance_boundary_checks(setup, window, crossing):
+    runner, scheduled, _, _, ns = setup
+    snapshot = runner._async_snapshot
+    snapshot.window = window
+    snapshot.frontiers = scheduled.kv_connector_metadata.frontiers = (8192,) * 3
+    if crossing and window <= 1024:
+        snapshot.bases[:] = ((5000 // window) + 1) * window - 2
+        scheduled.scheduled_cached_reqs.num_computed_tokens = (snapshot.bases + 2).tolist()
+    boundary = ns["_boundary"]
+    snapshot.boundary = boundary(snapshot.bases, snapshot.frontiers, window)
+    expected = (
+        boundary(snapshot.bases + 1, snapshot.frontiers, window) == snapshot.boundary
+        and boundary(snapshot.bases + 2, snapshot.frontiers, window) == snapshot.boundary
+    )
+    calls = []
+
+    def observed(*args):
+        calls.append(1)
+        return boundary(*args)
+
+    ns["_boundary"] = observed
+    assert runner._eligible(scheduled) == expected
+    assert len(calls) in (1, 2)

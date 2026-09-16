@@ -4390,6 +4390,7 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
         kv_connector_metadata: Any,
         num_computed_tokens: Any = None,
         prompt_lens: Any = None,
+        _validated_sparse_route: tuple[Any, tuple] | None = None,
     ) -> StagedSFARouteDecision:
         """Classify local scheduler/connector state before DP coordination."""
         graph_configured = bool(self._staged_sfa_graph_capture_sizes)
@@ -4420,14 +4421,12 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                 and bool(np.any(computed_probe < prompt_probe))
             )
         if is_decode_state and (graph_configured or possible_cold_resume):
-            metadata_reason, frontiers, cold_resumes = (
-                staged_sfa_metadata_sparse_route(
-                    unwrap_staged_sfa_connector_metadata(
-                        kv_connector_metadata
-                    ),
-                    request_ids,
-                )
-            )
+            metadata = unwrap_staged_sfa_connector_metadata(kv_connector_metadata)
+            # Reuse only the same metadata object validated by this async step.
+            if _validated_sparse_route is not None and _validated_sparse_route[0] is metadata:
+                metadata_reason, frontiers, cold_resumes = _validated_sparse_route[1]
+            else:
+                metadata_reason, frontiers, cold_resumes = staged_sfa_metadata_sparse_route(metadata, request_ids)
         else:
             frontiers = ()
             cold_resumes = ()
