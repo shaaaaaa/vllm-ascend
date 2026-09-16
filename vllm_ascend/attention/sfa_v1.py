@@ -49,6 +49,8 @@ from vllm_ascend.attention.mtp_dw_diag import (
     scratch_live_slot_aliases,
     scratch_target_safety,
 )
+from vllm_ascend.attention.sfa_graph_layout import FullGraphAttentionBuffers, pack_decode_lanes, unpack_decode_lanes
+from vllm_ascend.attention.sfa_remap_boundary import SFARemapBoundaryBuffer
 from vllm_ascend.attention.target_sfa_diagnostics import (
     TARGET_SFA_DIAG_SCHEMA_VERSION,
     active_resident_state_snapshot,
@@ -484,6 +486,8 @@ def _update_dsa_split_boundary_in_place(
 def _resolve_sparse_cached_tokens_by_request(
     attn_metadata: Any,
     request_ids: Any,
+    *,
+    compact: bool = False,
 ) -> list[int]:
     """Resolve strict connector frontiers in the native request order."""
     row_req_indices = attn_metadata.decode_req_indices_cpu
@@ -505,6 +509,8 @@ def _resolve_sparse_cached_tokens_by_request(
         request_ids[request_index] for request_index in decode_request_indices
     ]
     resolved = get_lmcache_sparse_cached_tokens(decode_request_ids)
+    if compact:
+        return list(resolved)
     cached_tokens = [0] * int(attn_metadata.seq_lens_cpu.shape[0])
     for request_index, committed_end in zip(
         decode_request_indices, resolved, strict=True
@@ -520,18 +526,42 @@ def _prepare_sfa_remap_boundary(
     is_dummy_run: bool,
     index_topk: int,
     cached_tokens: tuple[int, ...] | None = None,
+    reuse_unchanged: bool = False,
 ) -> torch.Tensor:
-    """Fill the stable Graph-A remap-boundary input once per step.
+    """Prepare the stable Graph-A remap-boundary input for this step.
 
     Connector metadata and request/row mapping are host objects and therefore
     cannot be frozen into the captured runnable. Resolve them eagerly on CPU,
     then copy the final per-row boundary into the builder-owned NPU tensor.
+    Full replay may reuse unchanged values; other paths invalidate that shadow.
     """
     boundary = attn_metadata.decode_remap_boundary
     if boundary is None:
         raise RuntimeError("[SFA sparse remap] boundary storage is unavailable.")
     if attn_metadata.decode_remap_boundary_ready:
         return boundary
+
+    buffer = getattr(attn_metadata, "decode_remap_boundary_buffer", None)
+    if buffer is not None:
+        if reuse_unchanged and not is_dummy_run:
+            if cached_tokens is None:
+                cached_tokens = tuple(_resolve_sparse_cached_tokens_by_request(
+                    attn_metadata, request_ids, compact=True,
+                ))
+            buffer.update(
+                attn_metadata.decode_req_indices_cpu,
+                attn_metadata.prompt_lens_cpu_rows,
+                attn_metadata.seq_lens_cpu,
+                cached_tokens,
+                _decode_window_save_window_size(),
+                index_topk,
+                attn_metadata.decode_scratch_capacity,
+            )
+            attn_metadata.decode_remap_boundary_ready = True
+            return boundary
+        # Another execution mode shares this builder allocation. Its eager write
+        # below must invalidate the full-graph CPU shadow before changing data.
+        buffer.invalidate()
 
     prompt_rows = attn_metadata.prompt_lens_cpu_rows
     row_req_indices = attn_metadata.decode_req_indices_cpu
@@ -1036,6 +1066,7 @@ class AscendSFAMetadata:
     prompt_lens_cpu_rows: Any = None
     decode_remap_boundary: torch.Tensor | None = None
     decode_remap_boundary_ready: bool = False
+    decode_remap_boundary_buffer: SFARemapBoundaryBuffer | None = None
 
 
 M = TypeVar("M", bound=AscendSFAMetadata)
@@ -1226,8 +1257,11 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             self._dsa_shard_counts = None
             self._dsa_fixed_query_starts_cpu = None
         self._dsa_fixed_layout_signature = None
+        self._dsa_general_layout_signature = None
+        self._dsa_general_decode_rows = 0
         self.actual_seq_lengths_query = torch.zeros(max_num_reqs + 1, dtype=torch.int32, device=device)
         self.actual_seq_lengths_key = torch.empty_like(self.actual_seq_lengths_query)
+        self._full_graph_tables = None
         # Staged SHRINK_LATENT=2 graph input. The address must survive metadata
         # rebuilds across decode steps, so keep one builder-owned device buffer
         # and overwrite only its contents before Graph A replay.
@@ -1236,6 +1270,7 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             dtype=torch.int32,
             device=device,
         )
+        self.decode_remap_boundary_buffer = SFARemapBoundaryBuffer(self.decode_remap_boundary)
         self.decode_valid_row_indices = torch.empty_like(self.decode_remap_boundary)
         self.decode_req_indices_compact = torch.empty_like(
             self.decode_remap_boundary
@@ -1421,7 +1456,21 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
                         == expected_cold_ends[resume_mask]
                     )
                 fixed_width_decode = np.all(computed_layout)
+            general_signature = None
+            if (
+                not fixed_width_decode and not self.enable_dsa_cp
+                and current_positions is None and qsl is not None
+                and not any(cold_resumes) and np.all(computed >= plens_cpu[:n_real])
+            ):
+                widths = np.diff(qsl)
+                if np.all((widths >= 1) & (widths <= 2)):
+                    # After the prompt, advancing positions cannot change row ownership.
+                    general_signature = (
+                        num_reqs, num_actual_tokens, num_input_tokens,
+                        tuple(qsl), tuple(plens_cpu), tuple(common_attn_metadata.request_ids or ()),
+                    )
             if fixed_width_decode:
+                self._dsa_general_layout_signature = None
                 num_decode_rows = num_actual_tokens
                 signature = (
                     fixed_decode_width,
@@ -1497,8 +1546,11 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
                             dtype=np.int32,
                         )
                     )
+            elif general_signature is not None and general_signature == self._dsa_general_layout_signature:
+                num_decode_rows = self._dsa_general_decode_rows
             else:
                 self._dsa_fixed_layout_signature = None
+                self._dsa_general_layout_signature = None
                 rows.fill(0)
                 boundary_rows.fill(0)
                 req_rows.fill(-1)
@@ -1580,6 +1632,9 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
                         ]
                     )
 
+                self._dsa_general_decode_rows = num_decode_rows
+                self._dsa_general_layout_signature = general_signature
+
             split_boundary_cpu = boundary_rows
             decode_req_indices_cpu = req_rows
             split_boundary_cpu_tensor = self._dsa_split_boundary_cpu_tensor[:num_input_tokens]
@@ -1634,6 +1689,17 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
         cum_query_lens = common_attn_metadata.query_start_loc[1 : num_reqs + 1]
         seq_lens = common_attn_metadata.seq_lens[:num_reqs]
         seq_lens_cpu = common_attn_metadata.seq_lens_cpu[:num_reqs]
+
+        if getattr(common_attn_metadata, "sfa_full_graph", False):
+            # One additional attention-only sequence owns trailing padding.
+            # Real query lengths must stay unchanged for causal Q1/Q2 attention.
+            if self._full_graph_tables is None:
+                self._full_graph_tables = FullGraphAttentionBuffers(
+                    self._dsa_max_num_reqs, block_table, indexer_block_table, cum_query_lens, seq_lens
+                )
+            block_table, indexer_block_table, cum_query_lens, seq_lens, seq_lens_cpu = self._full_graph_tables.update(
+                block_table, indexer_block_table, cum_query_lens, seq_lens, seq_lens_cpu, num_input_tokens
+            )
 
         cos, sin = get_cos_and_sin_mla(input_positions, True)
 
@@ -1786,6 +1852,7 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             prompt_lens_cpu_rows=rows if plens_cpu is not None else None,
             decode_remap_boundary=self.decode_remap_boundary[:num_input_tokens],
             decode_remap_boundary_ready=False,
+            decode_remap_boundary_buffer=self.decode_remap_boundary_buffer,
             num_decode_tokens=num_decode_rows,
         )
 
@@ -2834,6 +2901,8 @@ class AscendSFAImpl(MLAAttentionImpl):
         hidden_states: torch.Tensor,
         kv_cache: tuple[torch.Tensor, ...],
         attn_metadata: M,
+        *,
+        metadata_checks: dict | None = None,
     ) -> str | None:
         """Return why this step cannot use its authorized fixed-layout graph."""
         forward_context = get_forward_context()
@@ -2869,6 +2938,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         if authorized_key is None or authorized_key.token_capacity != token_capacity:
             return "the runner did not authorize this staged SFA token capacity"
         graph_key = authorized_key
+        bounded_decode = graph_key.query_profile == StagedSFAQueryProfile.DECODE_BOUNDED
         if graph_key.max_query_len > 2:
             return "staged sparse-index preparation only supports MTP=1 or MTP=2"
         if graph_key.query_profile == StagedSFAQueryProfile.DECODE_Q1:
@@ -2882,7 +2952,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                 != token_capacity
             ):
                 return "the fixed-width MTP staged SFA graph key is structurally invalid"
-        else:
+        elif not bounded_decode:
             return "the staged SFA query profile is unsupported"
 
         batch_descriptor = getattr(
@@ -2901,25 +2971,6 @@ class AscendSFAImpl(MLAAttentionImpl):
 
         if self.vllm_config.lora_config is not None:
             return "LoRA is configured"
-        expected_state = (
-            AscendAttentionState.DecodeOnly
-            if graph_key.query_profile == StagedSFAQueryProfile.DECODE_Q1
-            else AscendAttentionState.SpecDecoding
-        )
-        if attn_metadata.attn_state != expected_state:
-            return "the attention state does not match the staged query profile"
-        actual_rows = int(attn_metadata.num_actual_tokens)
-        actual_requests = len(attn_metadata.decode_request_ids_compact or ())
-        if (
-            attn_metadata.num_input_tokens != token_capacity
-            or actual_rows <= 0
-            or actual_rows > token_capacity
-            or attn_metadata.num_decode_tokens != actual_rows
-            or actual_requests <= 0
-            or actual_requests > graph_key.request_capacity
-            or actual_rows != actual_requests * graph_key.max_query_len
-        ):
-            return "the real decode layout does not match the fixed staged graph width"
         if self.dsa_shrink_latent != 2:
             return "SHRINK_LATENT must be 2"
         if (
@@ -2993,6 +3044,56 @@ class AscendSFAImpl(MLAAttentionImpl):
         if self.q_a_layernorm is None:
             return "q_a_layernorm is unavailable"
 
+        # The runner passes a NEW memo for each forward. Retain the metadata
+        # object as well as its id, and include every layer-specific policy
+        # used by the shared checker. Do not skip the layer/KV checks above.
+        check_key = (type(self), id(attn_metadata), graph_key, bool(self.dsa_resident_cache), staged_dummy_run)
+        if metadata_checks is not None and check_key in metadata_checks:
+            checked_metadata, reason = metadata_checks[check_key]
+            if checked_metadata is attn_metadata:
+                return reason
+        reason = self._cross_layer_metadata_ineligible_reason(
+            attn_metadata, graph_key, staged_dummy_run=staged_dummy_run,
+        )
+        if metadata_checks is not None:
+            metadata_checks[check_key] = (attn_metadata, reason)
+        return reason
+
+    def _cross_layer_metadata_ineligible_reason(
+        self,
+        attn_metadata: M,
+        graph_key: StagedSFAGraphKey,
+        *,
+        staged_dummy_run: bool,
+    ) -> str | None:
+        """Check shared step metadata once, independently of layer KV layout."""
+        token_capacity = graph_key.token_capacity
+        bounded_decode = graph_key.query_profile == StagedSFAQueryProfile.DECODE_BOUNDED
+        attention_capacity = graph_key.request_capacity + int(bounded_decode)
+        expected_state = (
+            AscendAttentionState.DecodeOnly
+            if graph_key.query_profile == StagedSFAQueryProfile.DECODE_Q1
+            else AscendAttentionState.SpecDecoding
+        )
+        if attn_metadata.attn_state != expected_state and not (
+            bounded_decode and attn_metadata.attn_state == AscendAttentionState.DecodeOnly
+        ):
+            return "the attention state does not match the staged query profile"
+        actual_rows = int(attn_metadata.num_actual_tokens)
+        actual_requests = len(attn_metadata.decode_request_ids_compact or ())
+        if (
+            attn_metadata.num_input_tokens != token_capacity
+            or actual_rows <= 0
+            or actual_rows > token_capacity
+            or attn_metadata.num_decode_tokens != actual_rows
+            or actual_requests <= 0
+            or actual_requests > graph_key.request_capacity
+            or (not bounded_decode and actual_rows != actual_requests * graph_key.max_query_len)
+            or actual_rows < actual_requests
+            or actual_rows > actual_requests * graph_key.max_query_len
+        ):
+            return "the real decode layout does not match the fixed staged graph width"
+
         required_token_tensors = (
             attn_metadata.cos,
             attn_metadata.sin,
@@ -3006,19 +3107,15 @@ class AscendSFAImpl(MLAAttentionImpl):
         if (
             attn_metadata.cum_query_lens is None
             or attn_metadata.seq_lens is None
-            or int(attn_metadata.cum_query_lens.shape[0])
-            != graph_key.request_capacity
-            or int(attn_metadata.seq_lens.shape[0])
-            != graph_key.request_capacity
+            or int(attn_metadata.cum_query_lens.shape[0]) != attention_capacity
+            or int(attn_metadata.seq_lens.shape[0]) != attention_capacity
         ):
             return "the request metadata does not match the graph key"
         if (
             attn_metadata.block_table is None
             or attn_metadata.indexer_block_table is None
-            or int(attn_metadata.block_table.shape[0])
-            != graph_key.request_capacity
-            or int(attn_metadata.indexer_block_table.shape[0])
-            != graph_key.request_capacity
+            or int(attn_metadata.block_table.shape[0]) != attention_capacity
+            or int(attn_metadata.indexer_block_table.shape[0]) != attention_capacity
         ):
             return "the native block-table row count does not match the graph key"
         if (
@@ -3107,16 +3204,24 @@ class AscendSFAImpl(MLAAttentionImpl):
         else:
             seq_rows = np.asarray(seq_lens_cpu).reshape(-1)
         expected_request_rows = np.full(token_capacity, -1, dtype=np.int64)
+        widths = graph_key.max_query_len
+        if bounded_decode:
+            live_rows = request_rows[:actual_rows]
+            if np.any(live_rows < 0) or np.any(live_rows >= actual_requests):
+                return "invalid bounded-decode request ownership"
+            widths = np.bincount(live_rows, minlength=actual_requests)
+            if np.any(widths < 1) or np.any(widths > graph_key.max_query_len):
+                return "bounded decode exceeds the captured query width"
         expected_request_rows[:actual_rows] = np.repeat(
             np.arange(actual_requests, dtype=np.int64),
-            graph_key.max_query_len,
+            widths,
         )
         if (
             prompt_rows.size != token_capacity
             or np.any(prompt_rows[actual_rows:] != 0)
             or request_rows.size != token_capacity
             or not np.array_equal(request_rows, expected_request_rows)
-            or seq_rows.size != graph_key.request_capacity
+            or seq_rows.size != attention_capacity
         ):
             return "the CPU row metadata does not match the staged graph layout"
         return None
@@ -3375,6 +3480,18 @@ class AscendSFAImpl(MLAAttentionImpl):
                 # skip-layer graph As in the same step read fresh indices from
                 # the stable shared buffer.
                 self._update_indexcache_topk_indices(topk_indices)
+        graph_key = getattr(get_forward_context(), "staged_sfa_graph_key", None)
+        bounded_decode = graph_key is not None and graph_key.query_profile == StagedSFAQueryProfile.DECODE_BOUNDED
+        if bounded_decode:
+            original_requests = row_req_indices
+            request_block_table = request_block_table[: graph_key.request_capacity]
+            topk_indices, remap_boundary, row_req_indices, inverse = pack_decode_lanes(
+                topk_indices,
+                remap_boundary,
+                row_req_indices,
+                actual_seq_lengths_query[: graph_key.request_capacity],
+                graph_key.max_query_len,
+            )
         staged_mtp = (
             int(topk_indices.shape[0])
             // int(request_block_table.shape[0])
@@ -3405,6 +3522,8 @@ class AscendSFAImpl(MLAAttentionImpl):
         assert selected_packed is not None
         assert selected_count_values is not None
         assert target_slot_mapping is not None
+        if bounded_decode:
+            topk_indices = unpack_decode_lanes(topk_indices, inverse, original_requests)
         return (
             ql_nope,
             q_pe,
@@ -3555,6 +3674,105 @@ class AscendSFAImpl(MLAAttentionImpl):
         self._staged_sfa_capture_state = _StagedSFACaptureState()
         self._dsa_idx_cache_t = None
         self._staged_sfa_bridge_buffers = None
+        self._full_graph_transfer = None
+        self._full_graph_transfers = {}
+
+    def prepare_native_sparse_boundary(self, metadata: M | None) -> None:
+        """Resolve live frontiers before native target or draft attention launches."""
+        if (
+            not self.dsa_shrink_latent or metadata is None
+            or metadata.split_boundary is None or metadata.num_decode_tokens <= 0
+            or not (metadata.need_sparse_lmcache_payload or self.dsa_shrink_latent == 3)
+            or metadata.decode_remap_boundary_buffer is None
+        ):
+            return
+        # Other draft steps/modes can share the allocation, so revalidate values
+        # at every forward boundary rather than trusting an old metadata marker.
+        metadata.decode_remap_boundary_ready = False
+        metadata.decode_split_boundary = _prepare_sfa_remap_boundary(
+            metadata, metadata.req_ids, is_dummy_run=False,
+            index_topk=self.index_topk, reuse_unchanged=True,
+        )
+
+    def prepare_full_graph_layer(
+        self,
+        layer_name: str,
+        max_tokens: int,
+        source: Any = None,
+        layer_id: int = 0,
+        *,
+        bind_source: bool = True,
+        metadata_checks: dict | None = None,
+    ) -> dict[str, Any]:
+        """Update live boundaries; validate fixed graph inputs only at startup.
+
+        The runner batches source binding outside this per-layer metadata check,
+        so unchanged requests issue no source-table tensor operations at all.
+        """
+        context = get_forward_context()
+        state = self._staged_sfa_capture_state
+        if state.runtime is None:
+            raise RuntimeError(f"Full SFA graph layer was not warmed up: {layer_name}")
+        metadata = context.attn_metadata[layer_name]
+        if context.staged_sfa_graph_dummy_run:
+            reason = self._cross_layer_ineligible_reason(
+                self._staged_sfa_bridge_buffers[0][:context.staged_sfa_graph_key.token_capacity],
+                state.runtime[1],
+                metadata,
+                metadata_checks=metadata_checks,
+            )
+            if reason is not None:
+                raise RuntimeError(f"Full SFA graph metadata is ineligible for {layer_name}: {reason}")
+        boundary = _prepare_sfa_remap_boundary(
+            metadata,
+            metadata.req_ids,
+            is_dummy_run=context.staged_sfa_graph_dummy_run,
+            index_topk=self.index_topk,
+            cached_tokens=context.staged_sfa_route.frontiers,
+            reuse_unchanged=True,
+        )
+        if context.staged_sfa_graph_dummy_run:
+            state.remap_boundary = boundary
+        transfers = getattr(self, "_full_graph_transfers", None)
+        if transfers is None:
+            transfers = self._full_graph_transfers = {}
+        capacity = context.staged_sfa_graph_key.request_capacity
+        transfer = transfers.get(capacity)
+        if transfer is None:
+            if not context.staged_sfa_graph_dummy_run:
+                raise RuntimeError("Full SFA graph transfer was not allocated at startup")
+            from lmcache.integration.vllm.utils import lmcache_get_or_create_config
+            from lmcache_ascend.v1.npu_connector.sparse_graph import SparseGraphTransfer
+
+            transfer = SparseGraphTransfer(
+                tuple(state.runtime[1][:2]),
+                metadata.decode_target_slot_mapping,
+                lmcache_get_or_create_config().chunk_size,
+                max_tokens,
+                request_capacity=capacity,
+            )
+            transfers[capacity] = transfer
+        self._full_graph_transfer = transfer
+        if bind_source:
+            transfer.bind_batch(source or (), layer_id)
+        # Graph-external saves use store_stream.wait_stream(current_stream).
+        # Do not expose an event recorded only during startup eager warmup.
+        metadata.reshape_cache_event = None
+        if not context.staged_sfa_graph_dummy_run:
+            return {}
+        # The builder owns these stable allocations, just as in staged replay.
+        # Retain a startup signature for explicit diagnostics, not a per-step
+        # walk over every layer's tensors and static model configuration.
+        fields = (
+            "cos", "sin", "slot_mapping", "indexer_slot_mapping", "cum_query_lens", "seq_lens",
+            "block_table", "indexer_block_table", "decode_remap_boundary", "decode_req_indices",
+            "decode_selected_tokens", "decode_selected_counts", "decode_target_slot_mapping",
+            "decode_union_mapping_workspace", "decode_shard_packed_workspace", "decode_shard_mapping_workspace",
+            "decode_shard_counts_workspace", "resident_state_indices", "resident_state_generations",
+        )
+        inputs = {name: getattr(metadata, name) for name in fields}
+        inputs["kv_caches"] = state.runtime[1]
+        return inputs
 
     def seal_staged_sfa_capture(
         self,
@@ -3825,7 +4043,8 @@ class AscendSFAImpl(MLAAttentionImpl):
             outputs,
         )
         attn_metadata.reshape_cache_event = producer_event
-        producer_event.record()
+        if not getattr(context, "sfa_full_graph_active", False):
+            producer_event.record()
         state.runtime = (
             layer_name,
             kv_cache,
@@ -4222,6 +4441,12 @@ class AscendSFAImpl(MLAAttentionImpl):
         with _staged_sfa_profile_scope("sfa_cross_layer::lmcache_retrieve"):
             graph_key = getattr(context, "staged_sfa_graph_key", None)
             if attn_metadata is None or graph_key is None:
+                return
+            if getattr(context, "sfa_full_graph_active", False):
+                capacity = graph_key.request_capacity
+                self._full_graph_transfer.load(
+                    selected_packed[:capacity], selected_counts[:capacity], target_slots[:capacity]
+                )
                 return
             if getattr(context, "staged_sfa_graph_dummy_run", False):
                 if next_layer_name:

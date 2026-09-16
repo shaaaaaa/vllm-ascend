@@ -49,6 +49,7 @@ from vllm.model_executor.layers.attention import Attention, MLAAttention
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.mamba.abstract import MambaBase
 from vllm.model_executor.model_loader import get_model
+from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.utils.import_utils import LazyLoader
 from vllm.utils.math_utils import cdiv, round_up
@@ -106,6 +107,7 @@ from vllm_ascend.attention.mtp_dw_diag import (
     post_commit_sample_requests,
     scheduled_decode_requests,
 )
+from vllm_ascend.attention.sfa_remap_boundary import prepare_native_sparse_boundaries
 from vllm_ascend.attention.target_sfa_diagnostics import (
     target_tail_boundary,
 )
@@ -128,6 +130,8 @@ from vllm_ascend.compilation.acl_graph import (
     set_graph_params,
     update_full_graph_params,
 )
+from vllm_ascend.compilation.sfa_fail_stop import exit_failed_sfa_worker, uses_local_sfa_fail_stop
+from vllm_ascend.compilation.sfa_full_graph import SFAFullGraph
 from vllm_ascend.distributed.kv_transfer.sparse_offload.resident_sparse_cache import (
     MAX_INT16_SCRATCH_CAPACITY,
     ResidentRequestStateRegistry,
@@ -179,6 +183,7 @@ from vllm_ascend.utils import (
     parse_layer_idx,
     set_weight_prefetch_method,
     sparse_kv_cache_has_indexer,
+    sfa_full_graph_enabled,
     staged_sfa_graph_capture_sizes,
     staged_sfa_graph_configuration_errors,
     staged_sfa_graph_configured,
@@ -190,6 +195,7 @@ from vllm_ascend.worker.pcp_utils import PCPManager
 from vllm_ascend.ascend_forward_context import (  # isort: skip
     MoECommType,
     StagedSFAGraphKey,
+    StagedSFAQueryProfile,
     get_mc2_tokens_capacity,
     select_moe_comm_method,
     set_ascend_forward_context,
@@ -451,6 +457,14 @@ def _fixed_decode_layout_arrays(
     return request_indices, position_offsets, cumulative_tokens
 
 
+def _fixed_mtp_metadata_arrays(max_num_reqs: int, device: torch.device) -> tuple[torch.Tensor, ...]:
+    """Immutable contiguous indices for one draft plus one bonus row per request."""
+    drafts = torch.arange(1, max_num_reqs + 1, dtype=torch.int32, device=device)
+    targets = torch.arange(0, 2 * max_num_reqs, 2, dtype=torch.int32, device=device)
+    logits = torch.arange(2 * max_num_reqs, dtype=torch.int64, device=device)
+    return drafts, targets + 2, targets, targets + 1, logits.to(torch.int32), logits
+
+
 def _fill_fixed_decode_positions(
     positions: np.ndarray,
     computed_tokens: np.ndarray,
@@ -620,11 +634,13 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
         self.sampler = AscendSampler()
         self.attn_state: AscendAttentionState | None = None
         self._staged_sfa_impls: tuple[tuple[str, Any], ...] = ()
+        self._sfa_full_graph = SFAFullGraph()
         self._staged_sfa_graph_capture_sizes = staged_sfa_graph_capture_sizes(
             vllm_config
         )
         # Ephemeral output of the existing batch/DP coordination pass.
         self._staged_sfa_dp_route_action: StagedSFARouteAction | None = None
+        self._staged_sfa_dp_bounded_decode = True
         self._dp_batch_sync_buffers: dict[int, torch.Tensor] = {}
         self._staged_sfa_startup_capture_attempted = False
         self._profiling_cudagraph_memory = False
@@ -789,6 +805,12 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
             self._fixed_decode_position_offsets = None
             self._fixed_decode_cu_num_tokens = None
 
+        self._fixed_mtp_metadata = (
+            _fixed_mtp_metadata_arrays(self.max_num_reqs, self.device)
+            if self.speculative_config and self.speculative_config.method == "mtp"
+            and self.decode_threshold == 2 and not self.use_cp else None
+        )
+
         self.use_aclgraph = self._use_aclgraph()
 
         eplb_config = self.ascend_config.eplb_config
@@ -914,6 +936,8 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
         torch.npu.synchronize()
 
     def _update_states(self, scheduler_output: SchedulerOutput) -> None:
+        if self._sfa_full_graph is not None:
+            self._sfa_full_graph.release_requests(scheduler_output.finished_req_ids)
         registry = self._resident_state_registry
         if registry is not None:
             registry.release(tuple(scheduler_output.finished_req_ids))
@@ -1172,6 +1196,7 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
         num_reqs: int,
         cudagraph_runtime_mode: CUDAGraphMode | None = None,
         batch_desc_num_reqs: int | None = None,
+        full_graph: bool = False,
     ) -> int:
         """
         This function is only designed to satisfied the constraint that when the layout is TND,
@@ -1185,6 +1210,14 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
         else:
             num_reqs_padded = batch_desc_num_reqs if batch_desc_num_reqs is not None else num_reqs
 
+        if full_graph:
+            # Bounded layout only; uniform full graphs use the original path
+            # below. Keep true Q1/Q2 lengths. The builder adds a separate dummy
+            # attention sequence for trailing token padding, never extending
+            # the last real request (which would change causal attention).
+            self.query_start_loc.np[num_reqs + 1:num_reqs_padded + 1] = self.query_start_loc.np[num_reqs]
+            self.query_start_loc.copy_to_gpu()
+            return num_reqs_padded
         if num_tokens_padded == num_reqs_padded * self.uniform_decode_query_len:
             # Uniform-batch case: num_reqs must be no greater than num_reqs_padded
             assert num_reqs <= num_reqs_padded
@@ -1546,7 +1579,11 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
         # We assume it is the decode stage, where prefill occurs but only one token is not hit in cache.
         elif np.all(num_scheduled_tokens == 1):
             attn_state = AscendAttentionState.DecodeOnly
-            if self.speculative_config and self.speculative_config.method == "mtp":
+            if (
+                self.speculative_config
+                and self.speculative_config.method == "mtp"
+                and not sfa_full_graph_enabled(self.vllm_config)
+            ):
                 # SpecDecoding now supports seq_len=1 and seq_len=2
                 # In Prefilling Decoding Disaggregation scenario, SpecDecoding need to supports seq_len=1
                 attn_state = AscendAttentionState.SpecDecoding
@@ -1588,12 +1625,71 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
         input_ids = self.input_ids.gpu[:num_forward_tokens]
         input_ids.masked_fill_(input_ids == PLACEHOLDER_TOKEN_ID, 0)
 
+    def _prepare_input_ids(
+        self,
+        scheduler_output: SchedulerOutput,
+        total_num_scheduled_tokens: int,
+        cu_num_tokens: np.ndarray,
+    ) -> None:
+        batch = self.input_batch
+        num_reqs = batch.num_reqs
+        sampled, draft = batch.prev_sampled_token_ids, self._draft_token_ids
+        previous = batch.prev_req_id_to_index
+        if (
+            self._fixed_mtp_metadata is not None and self.use_async_scheduling
+            and not self.enable_prompt_embeds and num_reqs > 0
+            and not scheduler_output.scheduled_new_reqs
+            and not scheduler_output.finished_req_ids
+            and not scheduler_output.scheduled_cached_reqs.resumed_req_ids
+            and total_num_scheduled_tokens == 2 * num_reqs
+            and np.array_equal(cu_num_tokens, self._fixed_decode_cu_num_tokens[:num_reqs])
+            and previous is not None and len(previous) == num_reqs
+            and isinstance(sampled, torch.Tensor) and sampled.shape == (num_reqs, 1)
+            and isinstance(draft, torch.Tensor) and draft.shape == (num_reqs, 1)
+            and sampled.dtype == self.input_ids.gpu.dtype == torch.int32
+            and draft.dtype in (torch.int32, torch.int64)
+            and sampled.device == draft.device == self.input_ids.gpu.device
+            and all(
+                previous.get(req_id) == row
+                and len(scheduler_output.scheduled_spec_decode_tokens.get(req_id, ())) == 1
+                for req_id, row in batch.req_id_to_index.items()
+            )
+        ):
+            # The values are fresh device outputs; only their alternating
+            # destinations are fixed. Preserve padding and compute-stream order.
+            rows = self.input_ids.gpu[:total_num_scheduled_tokens].view(num_reqs, 2)
+            rows[:, 0].copy_(sampled[:, 0], non_blocking=True)
+            rows[:, 1].copy_(draft[:, 0], non_blocking=True)
+            return
+        super()._prepare_input_ids(scheduler_output, total_num_scheduled_tokens, cu_num_tokens)
+
     def _calc_spec_decode_metadata(
         self,
         num_draft_tokens: np.ndarray,
         cu_num_scheduled_tokens: np.ndarray,
         num_pcp_pads: np.ndarray | None,
     ) -> SpecDecodeMetadata:
+        fixed = self._fixed_mtp_metadata
+        num_reqs = len(num_draft_tokens)
+        if (
+            fixed is not None and self.pcp_size == 1 and 0 < num_reqs <= self.max_num_reqs
+            and num_draft_tokens.ndim == 1 and num_draft_tokens.dtype == np.int32
+            and cu_num_scheduled_tokens.dtype in (np.int32, np.int64)
+            and np.all(num_draft_tokens == 1)
+            and np.array_equal(cu_num_scheduled_tokens, self._fixed_decode_cu_num_tokens[:num_reqs])
+        ):
+            drafts, sampled, targets, bonus, logits32, logits64 = fixed
+            bonus = bonus[:num_reqs]
+            # Only the structural indices are constant; token IDs must be fresh.
+            return SpecDecodeMetadata(
+                draft_token_ids=self.input_ids.gpu[bonus],
+                num_draft_tokens=num_draft_tokens.tolist(),
+                cu_num_draft_tokens=drafts[:num_reqs],
+                cu_num_sampled_tokens=sampled[:num_reqs],
+                target_logits_indices=targets[:num_reqs],
+                bonus_logits_indices=bonus,
+                logits_indices=(logits64 if cu_num_scheduled_tokens.dtype == np.int64 else logits32)[:2 * num_reqs],
+            )
         # Inputs:
         # cu_num_scheduled_tokens:  [  4, 104, 107, 207, 209]
         # num_draft_tokens:         [  3,   0,   2,   0,   1]
@@ -1824,6 +1920,15 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                     if self.use_aux_hidden_state_outputs:
                         target_hidden_states = torch.cat([h for h in aux_hidden_states], dim=-1)
                 else:
+                    # Padded MTP retains every token in order. The proposer
+                    # copies these views into its own buffers on this stream.
+                    if (
+                        self.drafter.method == "mtp" and self.num_spec_tokens == 1
+                        and not self.use_cp
+                        and not self.drafter.needs_extra_input_slots
+                        and not self.vllm_config.speculative_config.disable_padded_drafter_batch
+                    ):
+                        token_indices = slice(0, token_indices.numel())
                     target_token_ids = self.input_ids.gpu[token_indices]
                     target_positions = self._get_positions(token_indices)
                     if self.use_aux_hidden_state_outputs:
@@ -2178,6 +2283,10 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                             staged_sfa_graph_key,
                             batch_desc,
                         ),
+                        full_graph=(
+                            staged_sfa_graph_key is not None
+                            and staged_sfa_graph_key.query_profile == StagedSFAQueryProfile.DECODE_BOUNDED
+                        ),
                     )
                     if enable_sp() and num_tokens_padded == num_tokens_unpadded:
                         if num_reqs_padded > old_num_reqs_padded:
@@ -2206,6 +2315,10 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                         if staged_sfa_route.action
                         == StagedSFARouteAction.STAGED
                         else None
+                    ),
+                    full_graph=(
+                        staged_sfa_graph_key is not None
+                        and staged_sfa_graph_key.query_profile == StagedSFAQueryProfile.DECODE_BOUNDED
                     ),
                 )
 
@@ -2443,7 +2556,7 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
             )
             if content_diagnostics_enabled:
                 begin_deferred_diagnostic_step()
-            if staged_sfa_graph_key is not None:
+            if staged_sfa_graph_key is not None and not envs_ascend.VLLM_ASCEND_SFA_FULL_GRAPH:
                 first_layer_name, first_impl = self._staged_sfa_impls[0]
                 first_impl.bootstrap_cross_layer(first_layer_name)
             cold_perf_forward_start = (
@@ -3428,6 +3541,46 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
             )
         return NPUModelRunner._all_gather_hidden_states(hidden_states)
 
+    def _coordinate_sfa_full_graph_preparation(
+        self,
+        local_error: BaseException | None,
+        dummy_run: bool,
+    ) -> None:
+        """Propagate graph-preparation failure before target collectives."""
+        if not dummy_run and uses_local_sfa_fail_stop(
+            self.vllm_config.parallel_config
+        ):
+            # One local supervisor owns this TP-only worker cohort. Healthy
+            # forwards need no CPU collective or failure tensor.
+            if local_error is not None:
+                logger.critical(
+                    "[SFA full graph] source/metadata preparation failed; "
+                    "exiting worker to notify the local executor supervisor",
+                    exc_info=(
+                        type(local_error),
+                        local_error,
+                        local_error.__traceback__,
+                    ),
+                )
+                exit_failed_sfa_worker(local_error)
+            return
+
+        # Capture and unsupported executor topologies still agree before
+        # entering EP/TP collectives (including idle DP ranks).
+        failed = torch.tensor([int(local_error is not None)], dtype=torch.int32)
+        for group in (get_tp_group(), get_dp_group()):
+            if group.world_size > 1:
+                dist.all_reduce(
+                    failed,
+                    op=dist.ReduceOp.MAX,
+                    group=group.cpu_group,
+                )
+        if failed.item():
+            raise RuntimeError(
+                "[SFA full graph] source/metadata preparation failed on this "
+                "or a peer worker"
+            ) from local_error
+
     def _model_forward(
         self,
         num_tokens_padded: int,
@@ -3438,6 +3591,69 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
         **model_kwargs: dict[str, Any],
     ):
         assert self.model is not None
+        context = get_forward_context()
+        if envs_ascend.VLLM_ASCEND_SFA_FULL_GRAPH and getattr(context, "staged_sfa_graph_key", None) is not None:
+            graph_inputs = {}
+            prepared_call = None
+            graph_kwargs = dict(
+                input_ids=input_ids,
+                positions=positions,
+                intermediate_tensors=intermediate_tensors,
+                inputs_embeds=inputs_embeds,
+                **model_kwargs,
+            )
+            if context.cudagraph_runtime_mode != CUDAGraphMode.NONE:
+                impls = self._staged_sfa_impls or self._collect_staged_sfa_impls()
+                local_error = None
+                try:
+                    source = ()
+                    request_ids = ()
+                    if not context.staged_sfa_graph_dummy_run:
+                        request_ids = tuple(self.input_batch.req_ids[:self.input_batch.num_reqs])
+                        source = get_kv_transfer_group().prepare_sparse_graph_step(
+                            tuple(name for name, _ in impls),
+                            request_ids=request_ids,
+                            frontiers=tuple(context.staged_sfa_route.frontiers),
+                        )
+                    # Startup-only static validation shares one temporary memo.
+                    # Live preparation updates dynamic boundaries and selects
+                    # preallocated transfers; it does not walk tensor layouts.
+                    metadata_checks = {}
+                    for name, impl in impls:
+                        graph_inputs[name] = impl.prepare_full_graph_layer(
+                            name,
+                            self.model_config.max_model_len,
+                            bind_source=False,
+                            metadata_checks=metadata_checks,
+                        )
+                    self._sfa_full_graph.bind_sources(
+                        source,
+                        request_ids,
+                        lambda: tuple(impl._full_graph_transfer for _, impl in impls),
+                    )
+                    prepared_call = self._sfa_full_graph.prepare_run(graph_inputs=graph_inputs, **graph_kwargs)
+                except Exception as exc:
+                    local_error = exc
+                self._coordinate_sfa_full_graph_preparation(
+                    local_error,
+                    context.staged_sfa_graph_dummy_run,
+                )
+            output = self._sfa_full_graph.run(
+                self._run_sfa_full_graph_target,
+                **({"prepared": prepared_call} if prepared_call is not None else graph_kwargs),
+            )
+            if (
+                not getattr(self, "_sfa_full_graph_live_replay_logged", False)
+                and not context.staged_sfa_graph_dummy_run
+            ):
+                self._sfa_full_graph_live_replay_logged = True
+                logger.info(
+                    "[SFA full graph] first target replay: key=%s layer_transfer_splits=0",
+                    context.staged_sfa_graph_key,
+                )
+            return output
+        if envs_ascend.VLLM_ASCEND_SFA_FULL_GRAPH:
+            prepare_native_sparse_boundaries(self._staged_sfa_impls, context.attn_metadata)
         hidden_states = self.model(
             input_ids=input_ids,
             positions=positions,
@@ -3470,6 +3686,13 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
             hidden_states = self._all_gather_hidden_states_and_aux(hidden_states)
         return hidden_states
 
+    def _run_sfa_full_graph_target(self, **kwargs: Any) -> Any:
+        """Include the target tail gather in the root capture, not in replay Python."""
+        hidden_states = self.model(**kwargs)
+        if get_forward_context().flash_comm_v1_enabled and not isinstance(hidden_states, IntermediateTensors):
+            hidden_states = self._all_gather_hidden_states_and_aux(hidden_states)
+        return hidden_states
+
     def _pad_for_sequence_parallelism(self, num_scheduled_tokens: int) -> int:
         # Pad tokens to multiple of tensor_parallel_size when
         # enabled collective fusion for SP
@@ -3484,6 +3707,7 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
         cudagraph_mode: int = 0,
         allow_dp_padding: bool = False,
         staged_sfa_route_action: StagedSFARouteAction | None = None,
+        staged_sfa_bounded_decode: bool = True,
     ) -> tuple[
         bool,
         torch.Tensor | None,
@@ -3500,6 +3724,8 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
             cudagraph_mode: The cudagraph mode for this rank (0=NONE, 1=PIECEWISE, 2=FULL)
             staged_sfa_route_action: Optional staged-SFA admission verdict for
                 this rank, packed into the same DP collective.
+            staged_sfa_bounded_decode: Whether this rank needs the bounded
+                target layout (ragged queries or idle participation).
 
         Returns: tuple[
             ubatch_slices: if this is set then all DP ranks have agreed to
@@ -3522,6 +3748,8 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
         # FIXME: Restore the `or self.vllm_config.model_config.enforce_eager` here
         # immediately once the other two flags are no longer needed.
 
+        # Never reuse a previous step's layout agreement.
+        self._staged_sfa_dp_bounded_decode = True
         if self.dp_size == 1:
             return False, None, cudagraph_mode, staged_sfa_route_action
 
@@ -3531,7 +3759,8 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
         staged_route_protocol = bool(
             getattr(self, "_staged_sfa_graph_capture_sizes", ())
         ) or staged_sfa_route_action is not None
-        rows = 3 if staged_route_protocol else 2
+        full_layout_protocol = staged_route_protocol and sfa_full_graph_enabled(self.vllm_config)
+        rows = 4 if full_layout_protocol else 3 if staged_route_protocol else 2
         tensor = self._dp_batch_sync_buffers.get(rows)
         if tensor is None or tensor.shape[1] != self.dp_size:
             tensor = torch.empty(
@@ -3544,7 +3773,7 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
         tensor.zero_()
         num_tokens_across_dp = tensor[0]
 
-        if self._skip_all_reduce_across_dp_group():
+        if self._skip_all_reduce_across_dp_group() and not sfa_full_graph_enabled(self.vllm_config):
             num_tokens_across_dp.fill_(num_tokens_padded)
             return (
                 False,
@@ -3559,7 +3788,11 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
             tensor[2, self.dp_rank] = _STAGED_SFA_ROUTE_ACTIONS.index(
                 staged_sfa_route_action
             )
+        if full_layout_protocol:
+            tensor[3, self.dp_rank] = int(staged_sfa_bounded_decode)
         dist.all_reduce(tensor, group=get_dp_group().cpu_group)
+        if full_layout_protocol:
+            self._staged_sfa_dp_bounded_decode = bool(tensor[3].max().item())
 
         max_num_tokens = int(num_tokens_across_dp.max().item())
         synced_route_action = (
@@ -3568,7 +3801,12 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
             else None
         )
 
-        if allow_dp_padding:
+        if allow_dp_padding or (
+            sfa_full_graph_enabled(self.vllm_config) and staged_sfa_route_action is not None
+        ):
+            # A decode rank may have requested graph padding while a prefill
+            # peer requested eager. Keep the token vector identical on both
+            # sides even when the group chooses the native route.
             num_tokens_across_dp.fill_(max_num_tokens)
 
         # Synchronize cudagraph_mode across ranks (take min)
@@ -3596,6 +3834,7 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
         force_num_active_loras: int | None = None,
         num_encoder_reqs: int = 0,
         staged_sfa_route_action: StagedSFARouteAction | None = None,
+        staged_sfa_dp_idle: bool = False,
     ) -> tuple[
         CUDAGraphMode,
         BatchDescriptor,
@@ -3603,7 +3842,12 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
         torch.Tensor | None,
         CUDAGraphStat | None,
     ]:
-        num_tokens_padded = self._pad_for_sequence_parallelism(num_tokens)
+        full_decode = (
+            sfa_full_graph_enabled(self.vllm_config)
+            and staged_sfa_route_action == StagedSFARouteAction.STAGED
+        )
+        graph_tokens = num_reqs * self.decode_threshold if full_decode else num_tokens
+        num_tokens_padded = self._pad_for_sequence_parallelism(graph_tokens)
         is_all_decode = np.all(self.input_batch.num_computed_tokens_cpu[:num_reqs] > 0)
         uniform_decode = (
             (
@@ -3658,6 +3902,10 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                 cudagraph_mode=cudagraph_mode.value,
                 allow_dp_padding=(cudagraph_mode != CUDAGraphMode.NONE) or enable_sp(self.vllm_config),
                 staged_sfa_route_action=staged_sfa_route_action,
+                # Dummy Q2 rows are not real uniform requests: the idle rank
+                # must use private zero-length tables. Agree on the topology,
+                # not just the token count, before replaying captured EP ops.
+                staged_sfa_bounded_decode=staged_sfa_dp_idle or not uniform_decode,
             )
 
             # Extract DP padding if there is any
@@ -3710,6 +3958,7 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
         cascade_attn_prefix_lens: list[list[int]] | None = None,
         cold_compact_resumes: tuple[bool, ...] = (),
         resident_remap_frontiers: tuple[int, ...] | None = None,
+        full_graph: bool = False,
     ) -> tuple[PerLayerAttnMetadata, CommonAttentionMetadata | None]:
         """
         :return: tuple[attn_metadata, spec_decode_common_attn_metadata]
@@ -3809,7 +4058,7 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
             else None
         )
         if staged_sfa_graph_dummy_run:
-            query_width = self.decode_threshold
+            query_width = max_query_len if envs_ascend.VLLM_ASCEND_SFA_FULL_GRAPH else self.decode_threshold
             assert scheduled is not None
             if (
                 num_tokens != num_reqs * query_width
@@ -3858,11 +4107,11 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                     AscendAttentionState.DecodeOnly,
                     AscendAttentionState.SpecDecoding,
                 )
-                and num_tokens == num_reqs * self.decode_threshold
+                and (full_graph or num_tokens == num_reqs * self.decode_threshold)
                 and num_tokens_padded == num_reqs_padded * self.decode_threshold
                 and scheduled is not None
                 and scheduled.shape == (num_reqs,)
-                and np.all(scheduled == self.decode_threshold)
+                and np.all((scheduled >= 1) & (scheduled <= self.decode_threshold))
             )
         )
         (
@@ -3919,6 +4168,7 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
             resident_state_generations=resident_state_generations,
             resident_state_indices_cpu=resident_state_indices_cpu,
             resident_state_generations_cpu=resident_state_generations_cpu,
+            sfa_full_graph=full_graph,
         )
 
         if logits_indices is not None and self.cache_config.kv_sharing_fast_prefill:
@@ -4134,12 +4384,15 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
         query_width = 1 + int(
             getattr(self.speculative_config, "num_speculative_tokens", 0)
         )
+        full_graph = sfa_full_graph_enabled(self.vllm_config)
         expected_state = (
             AscendAttentionState.DecodeOnly
             if query_width == 1
             else AscendAttentionState.SpecDecoding
         )
-        is_decode_state = self.attn_state == expected_state
+        is_decode_state = self.attn_state == expected_state or (
+            full_graph and self.attn_state == AscendAttentionState.DecodeOnly
+        )
         possible_cold_resume = False
         if (
             is_decode_state
@@ -4177,6 +4430,17 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
 
         if not graph_configured:
             return native(StagedSFARouteReason.NOT_CONFIGURED)
+        if full_graph and num_computed_tokens is not None and prompt_lens is not None:
+            computed = np.asarray(num_computed_tokens).reshape(-1)
+            prompts = np.asarray(prompt_lens).reshape(-1)
+            # A one-token chunked-prefill tail is not a decode forward. A
+            # marked cold resume, however, intentionally starts at prompt - 1.
+            if computed.shape == prompts.shape == (num_reqs,) and any(
+                computed[i] < prompts[i]
+                and not (i < len(cold_resumes) and cold_resumes[i])
+                for i in range(num_reqs)
+            ):
+                return native(StagedSFARouteReason.NOT_DECODE)
         if is_decode_state:
             if any(cold_resumes):
                 computed = (
@@ -4251,20 +4515,28 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
             batch_size <= 0
             or not capture_sizes
             or batch_size > capture_sizes[-1]
-            or num_reqs * query_width != batch_size
+            or (not full_graph and num_reqs * query_width != batch_size)
+            or (full_graph and num_reqs * query_width > capture_sizes[-1])
         ):
             return native(StagedSFARouteReason.UNSUPPORTED_BATCH)
         scheduled = np.asarray(num_scheduled_tokens).reshape(-1)
-        if scheduled.shape != (num_reqs,) or not np.all(
-            scheduled == query_width
+        uniform_query_len = (
+            query_width if scheduled.shape == (num_reqs,) and np.all(scheduled == query_width) else 0
+        )
+        if scheduled.shape != (num_reqs,) or (
+            not uniform_query_len and (not full_graph or not np.all((scheduled >= 1) & (scheduled <= query_width)))
         ):
             return native(StagedSFARouteReason.NON_Q1)
-        if metadata_reason in (
+        if not full_graph and metadata_reason in (
             StagedSFARouteReason.DENSE_PREFIX_HIT,
             StagedSFARouteReason.MIXED_CONNECTOR_LOAD,
         ):
             return native(metadata_reason)
-        if metadata_reason != StagedSFARouteReason.ELIGIBLE:
+        if metadata_reason not in (
+            StagedSFARouteReason.ELIGIBLE,
+            StagedSFARouteReason.DENSE_PREFIX_HIT,
+            StagedSFARouteReason.MIXED_CONNECTOR_LOAD,
+        ):
             return StagedSFARouteDecision(
                 StagedSFARouteAction.FATAL,
                 metadata_reason,
@@ -4312,6 +4584,7 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
             metadata_reason,
             frontiers=frontiers,
             cold_compact_resumes=cold_resumes,
+            uniform_query_len=uniform_query_len,
         )
 
     def _synchronize_staged_sfa_capture_unsafe_loads(self) -> None:
@@ -4419,7 +4692,15 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
         if capacity % query_width:
             return native(StagedSFARouteReason.PADDED_BATCH)
         graph_key = (
-            StagedSFAGraphKey.exact_q1(capacity)
+            StagedSFAGraphKey.bounded_decode(capacity // query_width, query_width)
+            if sfa_full_graph_enabled(self.vllm_config) and (
+                local_route.uniform_query_len != query_width
+                or (
+                    self.parallel_config.data_parallel_size > 1
+                    and self._staged_sfa_dp_bounded_decode
+                )
+            )
+            else StagedSFAGraphKey.exact_q1(capacity)
             if query_width == 1
             else StagedSFAGraphKey.fixed_spec(
                 capacity // query_width,
@@ -4428,7 +4709,8 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
         )
         if (
             batch_size <= 0
-            or batch_size != num_reqs * query_width
+            or (not sfa_full_graph_enabled(self.vllm_config) and batch_size != num_reqs * query_width)
+            or num_reqs * query_width > capacity
             or batch_size > capacity
             or capacity
             not in self._staged_sfa_graph_capture_sizes
@@ -4442,6 +4724,7 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
             graph_key=graph_key,
             frontiers=local_route.frontiers,
             cold_compact_resumes=local_route.cold_compact_resumes,
+            uniform_query_len=local_route.uniform_query_len,
         )
 
     def _apply_staged_sfa_route(
@@ -4450,6 +4733,17 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
     ) -> StagedSFAGraphKey | None:
         if route.action == StagedSFARouteAction.STAGED:
             return route.graph_key
+        if (
+            sfa_full_graph_enabled(self.vllm_config)
+            and self.attn_state in (AscendAttentionState.DecodeOnly, AscendAttentionState.SpecDecoding)
+            and route.reason != StagedSFARouteReason.NOT_DECODE
+            and not (route.action == StagedSFARouteAction.SAFE_NATIVE
+                     and route.reason == StagedSFARouteReason.RUNTIME_PARALLELISM
+                     and self.parallel_config.data_parallel_size > 1)
+        ):
+            raise RuntimeError(
+                f"[SFA full graph] decode cannot use a native fallback: {route.reason.value}"
+            )
         message = (
             f"[SFA_ROUTE] action={route.action.value} "
             f"reason={route.reason.value}"
@@ -4503,6 +4797,37 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
             f'staged-sfa-graph-dummy-{request_index}'
             for request_index in range(batch_size)
         ]
+
+    def _staged_sfa_dummy_seq_len(self, *, requested_seq_len: int, query_width: int) -> int:
+        """Bound synthetic capture data by the model and both logical KV tables.
+
+        The PA workspace heuristic is not a minimum SFA sequence length. SFA
+        keeps sequence lengths as live replay inputs; only its synthetic warmup
+        data is bounded here. Physical pool sizes are checked separately when
+        dummy rows are mapped, since each row reuses one block for its history.
+        """
+        if requested_seq_len <= 0 or query_width <= 0:
+            raise ValueError("Staged SFA dummy sequence length and query width must be positive")
+        block_tables = getattr(self.input_batch.block_table, "block_tables", None)
+        if block_tables is None or len(block_tables) != 2:
+            raise RuntimeError("The staged SFA dummy batch requires exactly two KV block tables")
+        capacity = int(self.max_model_len)
+        for block_table in block_tables:
+            cp_world_size = max(
+                1,
+                int(getattr(block_table, "dcp_world_size", 1))
+                * int(getattr(block_table, "pcp_world_size", 1)),
+            )
+            logical_capacity = (
+                int(block_table.block_table.np.shape[1]) * int(block_table.block_size) * cp_world_size
+            )
+            capacity = min(capacity, logical_capacity)
+        if capacity < query_width:
+            raise RuntimeError(
+                "Staged SFA dummy capacity cannot hold one decode query: "
+                f"capacity={capacity}, query_width={query_width}"
+            )
+        return max(query_width, min(int(requested_seq_len), capacity))
 
     def _prepare_staged_sfa_dummy_block_tables(
         self,
@@ -4674,8 +4999,9 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
             and not remove_lora
             and bool(self._staged_sfa_graph_capture_sizes)
         )
+        staged_query_width = self.decode_threshold
         max_query_len = (
-            self.decode_threshold
+            staged_query_width
             if staged_capture_candidate
             else self.uniform_decode_query_len
             if uniform_decode
@@ -4743,6 +5069,7 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
             force_has_lora=num_active_loras > 0,
             force_num_active_loras=num_active_loras,
             staged_sfa_route_action=dummy_route_action,
+            staged_sfa_dp_idle=dp_idle,
         )
         dp_route_action = self._staged_sfa_dp_route_action
         if self.use_cp:
@@ -4762,7 +5089,19 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
             )
         num_tokens_padded = batch_desc.num_tokens
         num_reqs_padded = batch_desc.num_reqs if batch_desc.num_reqs is not None else num_reqs
-        if num_tokens_across_dp is not None and num_tokens_padded != num_tokens:
+        if (
+            sfa_full_graph_enabled(self.vllm_config)
+            and dummy_route_action == StagedSFARouteAction.STAGED
+            and dp_route_action == StagedSFARouteAction.STAGED
+        ):
+            # Idle replicas run the same capacity as active EP peers.
+            num_reqs = num_tokens_padded // staged_query_width
+            num_reqs_padded = num_reqs
+            num_tokens_unpadded = num_tokens_padded
+            num_scheduled_tokens = np.full(num_reqs, staged_query_width, dtype=np.int32)
+            self.query_lens = torch.from_numpy(num_scheduled_tokens)
+            num_sampled_tokens = np.ones(num_reqs, dtype=np.int32)
+        elif num_tokens_across_dp is not None and num_tokens_padded != num_tokens:
             # pad is needed if the pad of `num_tokens` is triggered inside CudagraphDispatcher
             num_tokens_across_dp[:] = num_tokens_padded
             num_scheduled_tokens = num_scheduled_tokens.repeat(num_reqs_padded)
@@ -4782,6 +5121,11 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
             dp_route_action=dp_route_action,
         )
         staged_sfa_graph_dummy_run = staged_sfa_dummy_batch_size is not None
+        staged_dummy_key = self._staged_sfa_dummy_graph_key(staged_sfa_dummy_batch_size, dp_idle=dp_idle)
+        bounded_dummy_layout = (
+            staged_dummy_key is not None
+            and staged_dummy_key.query_profile == StagedSFAQueryProfile.DECODE_BOUNDED
+        )
         if (
             dummy_route_action is not None
             and not staged_sfa_graph_dummy_run
@@ -4818,23 +5162,31 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                     self.attn_state = AscendAttentionState.SpecDecoding
                 else:
                     self.attn_state = AscendAttentionState.ChunkedPrefill
+            if staged_sfa_graph_dummy_run and envs_ascend.VLLM_ASCEND_SFA_FULL_GRAPH:
+                self.attn_state = (
+                    AscendAttentionState.DecodeOnly if staged_query_width == 1 else AscendAttentionState.SpecDecoding
+                )
             # The reason why we use a fixed seq_len rather than max_query_len is that
             # _npu_paged_attention_get_workspace only returns max workspace with specific
             # seq_lens. We use this seq_len only when capturing graph, and still use max_query_len
             # in inference. This will be removed once npu_fused_infer_attention_score
             # outperforms _npu_paged_attention on all cases.
-            # The staged SFA POC reuses 6144 only as bounded dummy data. Its
-            # indexer/SFA capacity is fixed by the max-model-length block-table
-            # width, while seq_lens remains a live tensor input during replay.
-            # That makes changing lengths plausible, but the torch_npu
-            # lightning-indexer branch still requires live numerical parity.
-            if profile_seq_lens is not None:
+            # Staged SFA also uses this heuristic, but its synthetic positions
+            # must fit the configured context and every logical block table.
+            # seq_lens remains a live tensor input during replay.
+            if staged_sfa_graph_dummy_run:
+                seq_lens = self._staged_sfa_dummy_seq_len(
+                    requested_seq_len=(
+                        profile_seq_lens if profile_seq_lens is not None else SEQ_LEN_WITH_MAX_PA_WORKSPACE
+                    ),
+                    query_width=staged_query_width,
+                )
+            elif profile_seq_lens is not None:
                 seq_lens = profile_seq_lens
             else:
                 seq_lens = (
                     SEQ_LEN_WITH_MAX_PA_WORKSPACE
-                    if staged_sfa_graph_dummy_run
-                    or (
+                    if (
                         is_graph_capturing
                         and using_paged_attention(
                             num_tokens,
@@ -4848,22 +5200,23 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
             self.seq_lens.copy_to_gpu()
 
             if staged_sfa_graph_dummy_run:
-                self._prepare_staged_sfa_dummy_block_tables(
-                    batch_size=num_reqs,
-                    positions=(
-                        self.seq_lens.np[:num_reqs]
-                        .astype(np.int64)
-                        .reshape(-1, 1)
-                        - self.decode_threshold
-                        + np.arange(
-                            self.decode_threshold,
-                            dtype=np.int64,
-                        ).reshape(1, -1)
-                    ).reshape(-1),
-                )
+                if not (dp_idle and sfa_full_graph_enabled(self.vllm_config)):
+                    self._prepare_staged_sfa_dummy_block_tables(
+                        batch_size=num_reqs,
+                        positions=(
+                            self.seq_lens.np[:num_reqs]
+                            .astype(np.int64)
+                            .reshape(-1, 1)
+                            - staged_query_width
+                            + np.arange(
+                                staged_query_width,
+                                dtype=np.int64,
+                            ).reshape(1, -1)
+                        ).reshape(-1),
+                    )
                 query_start_locs = self._staged_sfa_query_start_locs(
                     num_reqs,
-                    query_width=self.decode_threshold,
+                    query_width=staged_query_width,
                     dtype=self.query_start_loc.np.dtype,
                 )
                 self.query_start_loc.np[
@@ -4883,10 +5236,11 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                 num_reqs,
                 cudagraph_runtime_mode,
                 (
-                    staged_sfa_dummy_batch_size // self.decode_threshold
+                    staged_sfa_dummy_batch_size // staged_query_width
                     if staged_sfa_graph_dummy_run
                     else batch_desc.num_reqs
                 ),
+                full_graph=bounded_dummy_layout,
             )
 
             pad_attn = cudagraph_runtime_mode == CUDAGraphMode.FULL
@@ -4896,7 +5250,7 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                 num_reqs=num_reqs,
                 num_reqs_padded=num_reqs_padded,
                 max_query_len=(
-                    self.decode_threshold
+                    staged_query_width
                     if staged_sfa_graph_dummy_run
                     else max_query_len
                 ),
@@ -4904,7 +5258,23 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                 for_cudagraph_capture=is_graph_capturing,
                 num_scheduled_tokens_np=num_scheduled_tokens,
                 staged_sfa_graph_dummy_run=staged_sfa_graph_dummy_run,
+                full_graph=bounded_dummy_layout,
             )
+
+            if dp_idle and staged_sfa_graph_dummy_run and sfa_full_graph_enabled(self.vllm_config):
+                # Idle participation must not write dummy K/index entries into
+                # physical blocks that may belong to paused/waiting requests.
+                for metadata in attn_metadata.values():
+                    for field_name in ("slot_mapping", "indexer_slot_mapping"):
+                        value = getattr(metadata, field_name, None)
+                        if value is not None:
+                            value.fill_(-1)
+                    # Builder-owned extended tables: do not mutate the live
+                    # input batch's block table or cached physical ownership.
+                    if getattr(metadata, "decode_remap_boundary", None) is not None:
+                        metadata.block_table.zero_()
+                        metadata.indexer_block_table.zero_()
+                        metadata.seq_lens.zero_()
 
         with self.maybe_dummy_run_with_lora(
             self.lora_config,
@@ -4971,16 +5341,6 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                 if hasattr(self.drafter, "model") and hasattr(self.drafter.model, "compute_logits"):
                     return self.drafter.model.compute_logits(hidden_states[dummy_indices])
 
-            staged_dummy_key = None
-            if staged_sfa_dummy_batch_size is not None:
-                staged_dummy_key = (
-                    StagedSFAGraphKey.exact_q1(staged_sfa_dummy_batch_size)
-                    if self.decode_threshold == 1
-                    else StagedSFAGraphKey.fixed_spec(
-                        staged_sfa_dummy_batch_size // self.decode_threshold,
-                        self.decode_threshold,
-                    )
-                )
             with set_ascend_forward_context(
                 attn_metadata,
                 self.vllm_config,
@@ -5149,9 +5509,24 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
 
     def _validate_sfa_layerwise_connector_cudagraph_mode(self) -> None:
         """Reject full-model replay that would bypass layerwise retrieval."""
+        if envs_ascend.VLLM_ASCEND_SFA_FULL_GRAPH and self.model_config.enforce_eager:
+            logger.info("[SFA full graph] disabled on this worker by --enforce-eager (P-node mode)")
+            return
         staged_graph_configured = staged_sfa_graph_configured(
             self.vllm_config
         )
+        if envs_ascend.VLLM_ASCEND_SFA_FULL_GRAPH:
+            if not staged_graph_configured:
+                errors = list(staged_sfa_graph_configuration_errors(self.vllm_config))
+                if not envs_ascend.VLLM_ASCEND_SFA_STAGED_GRAPH:
+                    errors.insert(0, "VLLM_ASCEND_SFA_STAGED_GRAPH must be 1")
+                raise ValueError("SFA_FULL_GRAPH configuration: " + "; ".join(errors))
+            if envs_ascend.VLLM_ASCEND_MTP_DRAFT_DEBUG:
+                raise ValueError("SFA_FULL_GRAPH cannot capture host-side MTP_DRAFT_DEBUG tensor probes")
+            if not self._profiling_cudagraph_memory and not callable(
+                getattr(get_kv_transfer_group(), "prepare_sparse_graph_step", None)
+            ):
+                raise ValueError("SFA_FULL_GRAPH requires the graph-capable LMCache-Ascend connector")
         if (
             envs_ascend.VLLM_ASCEND_SFA_STAGED_GRAPH
             and not staged_graph_configured
@@ -6341,10 +6716,71 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
 
     def _reset_staged_sfa_startup_capture(self) -> None:
         """Discard staged state before the one real startup capture."""
+        if envs_ascend.VLLM_ASCEND_SFA_FULL_GRAPH:
+            self._sfa_full_graph.clear()
+            self._sfa_full_graph_live_replay_logged = False
         self._staged_sfa_impls = ()
         for _layer_name, impl in self._collect_staged_sfa_impls():
             impl.reset_staged_sfa_capture()
 
+
+    def _staged_sfa_capture_keys(self, token_capacity: int) -> tuple[StagedSFAGraphKey, ...]:
+        """Uniform and ragged layouts have distinct graphs, but identical token capacity."""
+        width = self.decode_threshold
+        if token_capacity % width:
+            raise ValueError("SFA capture capacity must be divisible by the query width")
+        uniform = (
+            StagedSFAGraphKey.exact_q1(token_capacity)
+            if width == 1
+            else StagedSFAGraphKey.fixed_spec(token_capacity // width, width)
+        )
+        if not sfa_full_graph_enabled(self.vllm_config):
+            return (uniform,)
+        # Keep the bounded variant for mixed/Q1 MTP batches and idle DP peers.
+        return (uniform, StagedSFAGraphKey.bounded_decode(token_capacity // width, width))
+
+    def _staged_sfa_dummy_graph_key(self, token_capacity: int | None, *, dp_idle: bool) -> StagedSFAGraphKey | None:
+        if token_capacity is None:
+            return None
+        capture_key = getattr(self, "_sfa_capture_graph_key", None)
+        if capture_key is not None and not dp_idle:
+            if capture_key.token_capacity != token_capacity:
+                raise RuntimeError("SFA dummy capacity differs from the selected capture key")
+            return capture_key
+        # Idle EP participants require private zero-length attention tables;
+        # do not zero the live block tables used by the uniform graph.
+        return self._staged_sfa_capture_keys(token_capacity)[-1]
+
+    def _warmup_and_capture(
+        self,
+        desc: BatchDescriptor,
+        cudagraph_runtime_mode: CUDAGraphMode,
+        profile_seq_lens: int | None = None,
+        allow_microbatching: bool = False,
+        num_warmups: int | None = None,
+    ):
+        kwargs = dict(
+            cudagraph_runtime_mode=cudagraph_runtime_mode,
+            profile_seq_lens=profile_seq_lens,
+            allow_microbatching=allow_microbatching,
+            num_warmups=num_warmups,
+        )
+        if not (
+            sfa_full_graph_enabled(self.vllm_config)
+            and desc.num_tokens in self._staged_sfa_graph_capture_sizes
+            and not desc.uniform
+            and cudagraph_runtime_mode == CUDAGraphMode.PIECEWISE
+        ):
+            return GPUModelRunner._warmup_and_capture(self, desc, **kwargs)
+        previous_key = getattr(self, "_sfa_capture_graph_key", None)
+        try:
+            for key in self._staged_sfa_capture_keys(desc.num_tokens):
+                self._sfa_capture_graph_key = key
+                # Each topology needs its own eager warmup before root capture.
+                # This also runs during graph-memory profiling, not just startup.
+                GPUModelRunner._warmup_and_capture(self, desc, **kwargs)
+        finally:
+            self._sfa_capture_graph_key = previous_key
 
     def capture_model(self) -> int:
         staged_graph_configured = staged_sfa_graph_configured(
@@ -6389,7 +6825,7 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                     f"configured={query_width}, runtime={runtime_query_width}"
                 )
             capture_sizes = staged_sfa_graph_capture_sizes(self.vllm_config)
-            if query_width > 1 and any(
+            if not envs_ascend.VLLM_ASCEND_SFA_FULL_GRAPH and query_width > 1 and any(
                 size % query_width for size in capture_sizes
             ):
                 raise RuntimeError(
@@ -6398,15 +6834,9 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                     f"sizes={capture_sizes}"
                 )
             graph_keys = tuple(
-                (
-                    StagedSFAGraphKey.exact_q1(size)
-                    if query_width == 1
-                    else StagedSFAGraphKey.fixed_spec(
-                        size // query_width,
-                        query_width,
-                    )
-                )
+                key
                 for size in capture_sizes
+                for key in self._staged_sfa_capture_keys(size)
             )
             for layer_name, impl in self._staged_sfa_impls:
                 try:
@@ -6424,10 +6854,19 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
             expected_outer_islands = len(self._staged_sfa_impls) + 1
             if envs_ascend.VLLM_ASCEND_MTP_DRAFT_DEBUG:
                 expected_outer_islands += 2 * len(self._staged_sfa_impls)
-            graph_entry_count = ACLGraphWrapper.seal_staged_entries(
-                graph_keys,
-                expected_outer_islands,
-            )
+            if envs_ascend.VLLM_ASCEND_SFA_FULL_GRAPH:
+                graph_entry_count = self._sfa_full_graph.seal(graph_keys)
+                logger.info(
+                    "[SFA full graph] target_layers=%d keys=%d graphs_per_forward=1 "
+                    "layer_transfer_splits=0; target per-layer host diagnostics are omitted "
+                    "during replay (connector/window boundary diagnostics remain enabled)",
+                    len(self._staged_sfa_impls), len(graph_keys),
+                )
+            else:
+                graph_entry_count = ACLGraphWrapper.seal_staged_entries(
+                    graph_keys,
+                    expected_outer_islands,
+                )
             draft_graph_count = 0
             if (
                 getattr(self, "drafter", None) is not None
@@ -6439,15 +6878,16 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
             ):
                 draft_graph_count = (
                     self.drafter.seal_staged_mtp_draft_graphs(
-                        tuple(
-                            graph_key.request_capacity
-                            for graph_key in graph_keys
-                        )
+                        tuple(dict.fromkeys(graph_key.request_capacity for graph_key in graph_keys))
                     )
                 )
+            capture_label = (
+                "[SFA full graph] captured target outer graphs "
+                if envs_ascend.VLLM_ASCEND_SFA_FULL_GRAPH
+                else "[SFA cross-layer graph] captured retrieve-split outer graphs "
+            )
             logger.info(
-                "[SFA cross-layer graph] captured retrieve-split outer graphs "
-                "for %d local SFA layers and %d keys; entries=%d, "
+                capture_label + "for %d local SFA layers and %d keys; entries=%d, "
                 "draft_full_graphs=%d",
                 len(self._staged_sfa_impls),
                 len(graph_keys),
@@ -6479,6 +6919,9 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
         )
         completed = False
         self._profiling_cudagraph_memory = True
+        if envs_ascend.VLLM_ASCEND_SFA_FULL_GRAPH:
+            original_full_graph_pool = self._sfa_full_graph.graph_pool
+            self._sfa_full_graph.graph_pool = current_platform.graph_pool_handle()
         try:
             with (
                 _torch_cuda_wrapper(),
@@ -6491,6 +6934,8 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                 return result
         finally:
             self._profiling_cudagraph_memory = False
+            if envs_ascend.VLLM_ASCEND_SFA_FULL_GRAPH:
+                self._sfa_full_graph.graph_pool = original_full_graph_pool
             reset_graph_params()
             if not completed:
                 set_cudagraph_capturing_enabled(False)
@@ -6505,6 +6950,13 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                 )
                 self._cleanup_profiling_kv_cache()
             self._reset_staged_sfa_startup_capture()
+
+    def _cleanup_profiling_kv_cache(self) -> None:
+        # Parent profiling releases temporary KV before returning. Root graphs
+        # are not in ACLGraphWrapper's weak registry, so clear them first.
+        if envs_ascend.VLLM_ASCEND_SFA_FULL_GRAPH:
+            self._reset_staged_sfa_startup_capture()
+        super()._cleanup_profiling_kv_cache()
 
     def _prepare_multimodal_fields(self):
         """

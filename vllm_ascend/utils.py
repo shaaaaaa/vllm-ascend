@@ -129,6 +129,8 @@ class StagedSFARouteDecision:
     graph_key: Any = None
     frontiers: tuple[int, ...] = ()
     cold_compact_resumes: tuple[bool, ...] = ()
+    # CPU scheduler verdict; 0 means not the configured uniform query width.
+    uniform_query_len: int = 0
 
 
 _DYNAMIC_EPLB_BUFFER_SIZE = 100
@@ -627,6 +629,13 @@ def staged_sfa_graph_configured(vllm_config: VllmConfig) -> bool:
     return bool(envs_ascend.VLLM_ASCEND_SFA_STAGED_GRAPH and not staged_sfa_graph_configuration_reasons(vllm_config))
 
 
+def sfa_full_graph_enabled(vllm_config: VllmConfig) -> bool:
+    """Explicit eager (e.g. a P worker) takes precedence over the shared graph flag."""
+    return bool(
+        envs_ascend.VLLM_ASCEND_SFA_FULL_GRAPH and not getattr(vllm_config.model_config, "enforce_eager", False)
+    )
+
+
 def staged_sfa_graph_capture_sizes(
     vllm_config: VllmConfig,
 ) -> tuple[int, ...]:
@@ -678,7 +687,10 @@ def staged_sfa_graph_capture_sizes(
             "Staged SFA request capture sizes exceed scheduler capacity "
             f"for query_width={query_width}: {oversized}."
         )
-    return tuple(size * query_width for size in sizes)
+    token_sizes = tuple(size * query_width for size in sizes)
+    if envs_ascend.VLLM_ASCEND_SFA_FULL_GRAPH and query_width not in (1, 2):
+        raise ValueError("SFA_FULL_GRAPH supports at most one MTP draft token")
+    return token_sizes
 
 
 def _max_aclgraph_keys(

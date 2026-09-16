@@ -14,7 +14,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[2]
 
 
-def route_api():
+def route_api(full_graph=False):
     ns = dict(Enum=Enum, dataclass=dataclass, Any=Any, np=np)
     utils = ast.parse((ROOT / "vllm_ascend/utils.py").read_text(encoding="utf-8"))
     definitions = [
@@ -30,6 +30,7 @@ def route_api():
     source = ast.parse((ROOT / "vllm_ascend/worker/model_runner_v1.py").read_text(encoding="utf-8"))
     method = next(n for n in ast.walk(source) if isinstance(n, ast.FunctionDef) and n.name == "_staged_sfa_local_route")
     ns.update(
+        sfa_full_graph_enabled=lambda _: full_graph,
         cold_perf_enabled=lambda: False,
         AscendAttentionState=NS(DecodeOnly="decode", SpecDecoding="spec"),
         unwrap_staged_sfa_connector_metadata=lambda x: x,
@@ -48,8 +49,9 @@ def route_api():
         (3000, 3100, 3100, "safe_native"),
     ],
 )
-def test_only_last_token_cold_resume_can_enter_graph(prompt, history, computed, expected):
-    ns = route_api()
+@pytest.mark.parametrize("full_graph", [False, True])
+def test_only_last_token_cold_resume_can_enter_graph(prompt, history, computed, expected, full_graph):
+    ns = route_api(full_graph)
     runner = NS(
         _staged_sfa_graph_capture_sizes=[8, 16, 24, 32],
         speculative_config=NS(num_speculative_tokens=1),

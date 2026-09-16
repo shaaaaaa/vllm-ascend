@@ -1,0 +1,719 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""CPU contracts for opt-in timing. These tests do not claim NPU performance."""
+
+import ast
+import importlib.util
+import sys
+import threading
+from contextlib import nullcontext
+from dataclasses import dataclass, replace
+from pathlib import Path
+from types import ModuleType, SimpleNamespace
+from unittest.mock import Mock
+
+import pytest
+
+ROOT = Path(__file__).resolve().parents[3]
+
+
+@pytest.fixture
+def timing_module(monkeypatch):
+    path = ROOT / "vllm_ascend/worker/sfa_decode_timing.py"
+    spec = importlib.util.spec_from_file_location("tested_sfa_decode_timing", path)
+    module = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, spec.name, module)
+    spec.loader.exec_module(module)
+    return module
+
+
+def schedule(computed, outputs, query=2, *, new=False):
+    return SimpleNamespace(
+        num_scheduled_tokens={"request": query},
+        scheduled_cached_reqs=SimpleNamespace(
+            req_ids=[] if new else ["request"], num_computed_tokens=[computed], num_output_tokens=[outputs]
+        ),
+    )
+
+
+def test_moments(timing_module):
+    values = timing_module.Moments()
+    for value in (0, 1, 2, 3):
+        values.add(value)
+    assert values.report() == {"count": 4, "total_ms": 6, "mean_ms": 1.5, "std_ms": 1.25**0.5, "max_ms": 3}
+    for value in (float("nan"), float("inf"), -1):
+        with pytest.raises(ValueError):
+            values.add(value)
+
+
+def test_route_histogram_counts_actual_selected_profile_without_tensor_reads(timing_module):
+    timing = timing_module.DecodeTiming()
+    routes = [
+        SimpleNamespace(graph_key=SimpleNamespace(query_profile=SimpleNamespace(value=profile)))
+        for profile in ("spec_fixed", "decode_bounded", "spec_fixed")
+    ]
+    original = Mock(side_effect=[SimpleNamespace(graph_key=None), *routes])
+    runner = SimpleNamespace(_staged_sfa_live_route=original)
+    timing_module.install_route_timing(runner, timing)
+    runner._staged_sfa_live_route()  # Excluded prefill.
+    timing.active = True
+    for expected in routes:
+        assert runner._staged_sfa_live_route() is expected
+    assert timing.report()["graph_profiles_histogram"] == {"spec_fixed": 2, "decode_bounded": 1}
+    timing.close()
+    assert runner._staged_sfa_live_route is original
+
+
+def test_exclusive_wall_and_cpu_do_not_double_count(timing_module, monkeypatch):
+    ticks = iter([0, 1_000_000, 4_000_000, 10_000_000])
+    cpu = iter([0, 1_000_000, 2_000_000, 3_000_000])
+    monkeypatch.setattr(timing_module.time, "perf_counter_ns", lambda: next(ticks))
+    monkeypatch.setattr(timing_module.time, "thread_time_ns", lambda: next(cpu))
+    timing = timing_module.DecodeTiming()
+    timing.active = True
+    with timing.scope("parent"), timing.scope("child"):
+        pass
+    stages = timing.report()["stages"]
+    assert stages["parent"]["wall"]["total_ms"] == 10
+    assert stages["parent"]["self_wall"]["total_ms"] == 7
+    assert stages["child"]["self_wall"]["total_ms"] == 3
+    assert stages["parent"]["self_cpu"]["total_ms"] == 2
+
+
+def test_disabled_and_other_threads_never_time_or_record_events(timing_module, monkeypatch):
+    clock, factory = Mock(side_effect=AssertionError("No clocks")), Mock(side_effect=AssertionError("No events"))
+    timing = timing_module.DecodeTiming(factory)
+    monkeypatch.setattr(timing_module.time, "perf_counter_ns", clock)
+    with timing.scope("prefill", device=True):
+        pass
+    timing.active = True
+    called = []
+
+    def background():
+        with timing.scope("background", device=True):
+            called.append(True)
+
+    thread = threading.Thread(target=background)
+    thread.start()
+    thread.join(timeout=5)
+    assert called == [True] and not thread.is_alive()
+    clock.assert_not_called()
+    factory.assert_not_called()
+    assert not timing.scopes
+
+
+def test_event_intervals_are_bounded_read_only_after_request(timing_module, monkeypatch):
+    monkeypatch.setattr(timing_module, "MAX_DEVICE_INTERVALS", 2)
+    events = []
+    ready = False
+
+    class Event:
+        def __init__(self):
+            self.recorded = False
+            events.append(self)
+
+        def record(self):
+            self.recorded = True
+
+        def elapsed_time(self, end):
+            assert ready and self.recorded and end.recorded
+            return 3
+
+    timing = timing_module.DecodeTiming(Event)
+    timing.active = True
+    for _ in range(4):
+        with timing.scope("target", device=True):
+            pass
+    assert len(events) == 4
+    assert "stream_span" not in timing.scopes["target"]
+    ready = True
+    report = timing.report()
+    assert report["device_intervals_dropped"] == 2
+    assert report["stages"]["target"]["stream_span"]["total_ms"] == 6
+    assert timing.report() == report  # Event intervals are drained only once.
+
+
+@pytest.mark.parametrize(
+    "computed,outputs,query,new,active",
+    [
+        (0, 0, 512, True, False),
+        (4999, 0, 1, False, False),
+        (5000, 0, 1, False, False),
+        (5000, 1, 1, False, True),
+        (5001, 2, 2, False, True),
+    ],
+)
+def test_decode_gate_uses_scheduler_history_not_query_shape(timing_module, computed, outputs, query, new, active):
+    timing = timing_module.DecodeTiming()
+    timing.begin_step(schedule(computed, outputs, query, new=new), 5000)
+    assert timing.active is active
+    assert timing.decode_steps == int(active)
+    assert timing.prefill_steps == int(not active)
+    timing.begin_step(SimpleNamespace(num_scheduled_tokens={}), 5000)
+    assert not timing.active
+
+
+def test_multi_request_gate_rejected(timing_module):
+    timing = timing_module.DecodeTiming()
+    with pytest.raises(RuntimeError, match="exactly one"):
+        timing.begin_step(SimpleNamespace(num_scheduled_tokens={"a": 1, "b": 2}), 5000)
+
+
+def actual_root_run(events):
+    """Exercise the real asynchronous replay implementation, without NPU imports."""
+    path = ROOT / "vllm_ascend/compilation/sfa_full_graph.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "SFAFullGraph")
+    run = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "run")
+    prepare = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "prepare_run")
+    call_type = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "SFAValidatedCall")
+    context = SimpleNamespace(
+        staged_sfa_graph_key="key", cudagraph_runtime_mode="full", staged_sfa_graph_dummy_run=False
+    )
+    stream = SimpleNamespace(synchronize=lambda: events.append("fence"))
+    namespace = {
+        "__name__": __name__,
+        "dataclass": dataclass,
+        "get_forward_context": lambda: context,
+        "CUDAGraphMode": SimpleNamespace(NONE="none"),
+        "torch": SimpleNamespace(
+            profiler=SimpleNamespace(record_function=lambda name: nullcontext()),
+            npu=SimpleNamespace(current_stream=lambda: stream),
+        ),
+    }
+    module = ast.parse("from __future__ import annotations")
+    module.body.extend([call_type, prepare, run])
+    exec(compile(ast.fix_missing_locations(module), str(path), "exec"), namespace)
+    return namespace["run"], namespace["prepare_run"]
+
+
+def fake_worker(events, *, full=True, layers=8):
+    connector = SimpleNamespace(
+        **{
+            name: Mock()
+            for name in ("prepare_sparse_graph_step", "start_load_kv", "wait_for_layer_load", "wait_for_save")
+        }
+    )
+    graph = SimpleNamespace(
+        entries={
+            "key": SimpleNamespace(
+                graph=SimpleNamespace(replay=lambda: events.append("replay")), output="hidden", signature=()
+            )
+        },
+        bind_sources=Mock(),
+        validate_inputs=Mock(),
+        replay_count=0,
+        _generation=0,
+        _submission_failed=False,
+        _stream=None,
+        source_bindings={
+            None: SimpleNamespace(completion=SimpleNamespace(record=lambda stream: events.append("record")))
+        },
+    )
+    run, prepare = actual_root_run(events)
+    graph.run = run.__get__(graph)
+    graph.prepare_run = prepare.__get__(graph)
+    impls = tuple(
+        (
+            f"layer.{i}",
+            SimpleNamespace(
+                prepare_full_graph_layer=Mock(),
+                cross_layer_lmcache_retrieve=lambda: connector.wait_for_layer_load(),
+                _cross_layer_metadata_ineligible_reason=Mock(),
+            ),
+        )
+        for i in range(layers)
+    )
+    runner = SimpleNamespace(
+        _staged_sfa_live_route=Mock(return_value=SimpleNamespace(graph_key=None)),
+        _sfa_full_graph=graph,
+        _staged_sfa_impls=impls,
+        **{
+            name: Mock()
+            for name in (
+                "_prepare_inputs",
+                "_build_attention_metadata",
+                "_sync_batch_across_dp",
+                "_coordinate_sfa_full_graph_preparation",
+                "_sample",
+                "_bookkeeping_sync",
+                "_copy_draft_token_ids_to_cpu",
+                "finalize_kv_connector",
+            )
+        },
+    )
+
+    def forward():
+        if full:
+            connector.prepare_sparse_graph_step()
+            for _, impl in impls:
+                impl.prepare_full_graph_layer()
+            graph.bind_sources()
+            prepared = graph.prepare_run()
+            return graph.run(None, prepared=prepared)
+        for _, impl in impls:
+            impl.cross_layer_lmcache_retrieve()
+        return "hidden"
+
+    def execute(scheduler):
+        connector.start_load_kv()
+        runner._prepare_inputs()
+        runner._build_attention_metadata()
+        return runner._model_forward()
+
+    def sample():
+        runner._sample()
+        runner.propose_draft_token_ids()
+        runner._copy_draft_token_ids_to_cpu()
+        runner._bookkeeping_sync()
+        connector.wait_for_save()
+        runner.finalize_kv_connector()
+        return SimpleNamespace(sampled_token_ids=[[10, 11, -1]])
+
+    runner._model_forward = forward
+    runner.propose_draft_token_ids = lambda: connector.wait_for_layer_load()
+    return SimpleNamespace(
+        model_runner=runner,
+        model_config=SimpleNamespace(hf_config=SimpleNamespace(num_hidden_layers=layers)),
+        execute_model=execute,
+        sample_tokens=sample,
+    ), connector
+
+
+@pytest.mark.parametrize("full", [True, False])
+@pytest.mark.parametrize("layers", [8, 61, 79])
+def test_installation_calls_original_code_and_restores_all_handles(timing_module, full, layers):
+    events = []
+    worker, connector = fake_worker(events, full=full, layers=layers)
+    graph = worker.model_runner._sfa_full_graph
+    original_graph = graph.entries["key"].graph
+    original_execute, original_forward = worker.execute_model, worker.model_runner._model_forward
+    original_validate = graph.validate_inputs
+    timing = timing_module.install_decode_timing(worker, connector, prompt_tokens=5000)
+    # A final prefill chunk with Q1 is still excluded, including MTP sampling.
+    worker.execute_model(schedule(4999, 0, 1))
+    worker.sample_tokens()
+    assert not timing.scopes
+    events.clear()
+    for _ in range(3):
+        assert worker.execute_model(schedule(5001, 2)) == "hidden"
+        worker.sample_tokens()
+    stages = timing.report()["stages"]
+    assert stages["target.forward"]["wall"]["count"] == 3
+    assert stages["kv.wait.mtp"]["wall"]["count"] == 3
+    assert timing.sampled_tokens == {2: 3}
+    if full:
+        assert events == ["replay", "record"] * 3
+        assert stages["root.replay_submit"]["wall"]["count"] == 3
+        assert "signature.validate" not in stages
+        original_validate.assert_not_called()
+        assert "retrieve.L0" not in stages
+        assert all(stages[f"metadata.L{i}"]["wall"]["count"] == 3 for i in range(layers))
+    else:
+        assert not events
+        assert "root.replay_submit" not in stages
+        assert stages["kv.wait.target"]["wall"]["count"] == 3 * layers
+        assert all(stages[f"retrieve.L{i}"]["wall"]["count"] == 3 for i in range(layers))
+    timing.close()
+    timing.close()
+    assert worker.execute_model is original_execute
+    assert worker.model_runner._model_forward is original_forward
+    assert graph.entries["key"].graph is original_graph
+    assert graph.validate_inputs is original_validate
+
+
+def test_actual_model_layer_mismatch_restores_timing_patches(timing_module):
+    worker, connector = fake_worker([], layers=79)
+    worker.model_runner._staged_sfa_impls = worker.model_runner._staged_sfa_impls[:-1]
+    original_execute = worker.execute_model
+    with pytest.raises(RuntimeError, match="Expected 79 benchmark target layers, got 78"):
+        timing_module.install_decode_timing(worker, connector, prompt_tokens=5000)
+    assert worker.execute_model is original_execute
+
+
+def test_failed_install_restores_previously_patched_methods(timing_module):
+    worker, connector = fake_worker([])
+    del worker.model_runner._sample
+    original = worker.execute_model
+    with pytest.raises(AttributeError):
+        timing_module.install_decode_timing(worker, connector, prompt_tokens=5000)
+    assert worker.execute_model is original
+
+
+@pytest.mark.parametrize("serving", [False, True])
+def test_stall_observer_is_serving_only_and_closes_before_timing_handles(timing_module, monkeypatch, serving):
+    path = ROOT / "vllm_ascend/worker/sfa_serving_stall.py"
+    spec = importlib.util.spec_from_file_location("vllm_ascend.worker.sfa_serving_stall", path)
+    module = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, spec.name, module)
+    spec.loader.exec_module(module)
+    start = Mock(wraps=module.ServingStallDiagnostic.start)
+    # Preserve binding for the real observer; retain its instance for cleanup assertions.
+    monkeypatch.setattr(module.ServingStallDiagnostic, "start", lambda self: start(self))
+    worker, connector = fake_worker([])
+    worker.rank = 0
+    worker.vllm_config = SimpleNamespace(
+        additional_config={"sfa_benchmark_serving": serving},
+        parallel_config=SimpleNamespace(data_parallel_rank=0, tensor_parallel_size=4),
+    )
+    original_execute = worker.execute_model
+    original_dummy = worker.execute_dummy_batch = Mock()
+    timing = timing_module.install_decode_timing(worker, connector, prompt_tokens=5000)
+    try:
+        worker.execute_model(schedule(5001, 1))
+        worker.sample_tokens()
+        worker.execute_dummy_batch()
+        if serving:
+            observer = start.call_args.args[0]
+            assert observer.progress[0] == "execute_dummy_batch.return"
+            assert observer.thread.is_alive()
+        else:
+            start.assert_not_called()
+    finally:
+        timing.close()
+    if serving:
+        assert not observer.thread.is_alive()
+    assert worker.execute_model is original_execute
+    assert worker.execute_dummy_batch is original_dummy
+
+
+def test_scope_failure_keeps_original_exception_and_unwinds_stack(timing_module):
+    timing = timing_module.DecodeTiming()
+    timing.active = True
+    with pytest.raises(ValueError, match="original"), timing.scope("parent"), timing.scope("child"):
+        raise ValueError("original")
+    assert not timing.stack
+    assert set(timing.report()["stages"]) == {"parent", "child"}
+
+
+def benchmark_rpc_methods(namespace):
+    path = ROOT / "vllm_ascend/worker/sfa_benchmark_worker.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "SFABenchmarkWorker")
+    methods = [
+        n
+        for n in cls.body
+        if getattr(n, "name", "") in ("benchmark_start_decode_timing", "benchmark_stop_decode_timing")
+    ]
+    module = ast.parse("from __future__ import annotations")
+    module.body.extend(methods)
+    exec(compile(ast.fix_missing_locations(module), str(path), "exec"), namespace)
+    return namespace["benchmark_start_decode_timing"], namespace["benchmark_stop_decode_timing"]
+
+
+@pytest.mark.parametrize("report_failure", [False, True])
+@pytest.mark.parametrize("async_scheduling", [False, True])
+def test_worker_rpcs_only_fence_outside_measurement_and_always_restore(monkeypatch, report_failure, async_scheduling):
+    events = []
+    timing = SimpleNamespace(
+        close=lambda: events.append("restore"),
+        report=lambda: (events.append("report"), {"decode_steps": 3})[1],
+    )
+    if report_failure:
+        timing.report = Mock(side_effect=ValueError("event error"))
+    install = Mock(side_effect=lambda *a, **kw: (events.append("install"), timing)[1])
+    for name, fields in {
+        "vllm.distributed.kv_transfer": {"get_kv_transfer_group": lambda: "connector"},
+        "vllm_ascend.worker.sfa_decode_timing": {"install_decode_timing": install},
+    }.items():
+        stub = ModuleType(name)
+        stub.__dict__.update(fields)
+        monkeypatch.setitem(sys.modules, name, stub)
+    npu = SimpleNamespace(synchronize=lambda: events.append("sync"), Event=Mock())
+    start, stop = benchmark_rpc_methods({"torch": SimpleNamespace(npu=npu)})
+    graph = SimpleNamespace(replay_count=100, source_binding_count=5)
+    worker = SimpleNamespace(
+        model_runner=SimpleNamespace(_sfa_full_graph=graph, use_async_scheduling=async_scheduling),
+        benchmark_process_info=lambda: {"rank": 1, "pid": 123},
+    )
+    assert start(worker, "5000") == {"rank": 1, "pid": 123}
+    assert events == ["sync", "install"]
+    assert install.call_args.kwargs["prompt_tokens"] == 5000
+    assert worker._decode_timing is timing
+    with pytest.raises(RuntimeError, match="already active"):
+        start(worker, 5000)
+    graph.replay_count += 3
+    graph.source_binding_count += 1
+    if report_failure:
+        with pytest.raises(ValueError, match="event error"):
+            stop(worker)
+    else:
+        assert stop(worker) == {
+            "decode_steps": 3,
+            "rank": 1,
+            "pid": 123,
+            "root_replays": 3,
+            "source_binding_updates": 1,
+        }
+    assert worker._decode_timing is None
+    assert events[2:4] == ["restore", "sync"]
+    assert events[-1] == "restore"
+
+
+@pytest.mark.parametrize("full", [False, True])
+def test_async_timing_leaves_deferred_outputs_unmaterialized(timing_module, full):
+    worker, connector = fake_worker([], full=full)
+    worker.model_runner.use_async_scheduling = True
+
+    class DeferredOutput:
+        @property
+        def sampled_token_ids(self):
+            raise AssertionError("Diagnostics must not read deferred token IDs")
+
+        def get_output(self):
+            raise AssertionError("Diagnostics must not force asynchronous output completion")
+
+    deferred_output = DeferredOutput()
+    original_sample = worker.sample_tokens
+
+    def async_sample():
+        original_sample()
+        return deferred_output
+
+    worker.sample_tokens = async_sample
+    original_execute = worker.execute_model
+    timing = timing_module.install_decode_timing(worker, connector, prompt_tokens=5000)
+    worker.execute_model(schedule(4999, 0, 1))
+    assert worker.sample_tokens() is deferred_output
+    assert not timing.scopes
+    for index in range(3):
+        assert worker.execute_model(schedule(5001 + index, index + 1)) == "hidden"
+        assert worker.sample_tokens() is deferred_output
+    report = timing.report()
+    assert report["async_scheduling"] is True
+    assert report["decode_steps"] == 3
+    assert report["prefill_steps_excluded"] == 1
+    assert report["sampled_tokens_histogram_available"] is False
+    assert report["sampled_tokens_histogram"] == {}
+    for stage in ("target.forward", "worker.sample", "sampling", "mtp.propose"):
+        assert report["stages"][stage]["wall"]["count"] == 3
+    timing.close()
+    assert worker.execute_model is original_execute
+    assert worker.sample_tokens is async_sample
+    assert worker.model_runner.use_async_scheduling is True
+
+
+def test_actual_worker_wrapper_dispatches_to_installed_probe(timing_module):
+    path = ROOT.parent / "vllm/vllm/v1/worker/worker_base.py"
+    if not path.is_file():
+        pytest.skip("Requires sibling vllm checkout")
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "WorkerWrapperBase")
+    method = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "execute_model")
+    module = ast.parse("from __future__ import annotations")
+    module.body.append(method)
+    namespace = {}
+    exec(compile(ast.fix_missing_locations(module), str(path), "exec"), namespace)
+    worker, connector = fake_worker([])
+    timing = timing_module.install_decode_timing(worker, connector, prompt_tokens=5000)
+    wrapper = SimpleNamespace(worker=worker, _apply_mm_cache=lambda scheduler: None)
+    try:
+        namespace["execute_model"](wrapper, schedule(5001, 2))
+        assert timing.scopes["target.forward"]["wall"].count == 1
+    finally:
+        timing.close()
+
+
+def test_target_boundary_events_and_pre_replay_span_are_retained(timing_module):
+    events = []
+
+    def factory():
+        event = SimpleNamespace(record=Mock(), elapsed_time=lambda end: 1)
+        events.append(event)
+        return event
+
+    timing = timing_module.DecodeTiming(factory)
+    timing.active = True
+    for _ in range(2):
+        with timing.scope("target.forward", device=True), timing.scope("root.replay_submit", device=True):
+            pass
+    assert timing.last_target_events == (events[4], events[5])
+    assert timing.pending[-3] == ("target.before_replay", events[4], events[6])
+    assert timing.report()["stages"]["target.before_replay"]["stream_span"]["count"] == 2
+
+
+@pytest.mark.parametrize("step,expected", [(1, True), (4, True), (5, False), (31, False), (32, True), (33, False)])
+def test_sampling_device_event_stride_does_not_change_host_coverage(timing_module, step, expected):
+    timing = timing_module.DecodeTiming()
+    timing.decode_steps = step
+    assert timing.detail_device_sample is expected
+
+
+@pytest.mark.parametrize("failure", [False, True])
+def test_sampling_hooks_use_real_scoped_recorder_and_restore_on_failure(timing_module, monkeypatch, failure):
+    path = ROOT / "vllm_ascend/sample/rejection_diagnostics.py"
+    name = "vllm_ascend.sample.rejection_diagnostics"
+    spec = importlib.util.spec_from_file_location(name, path)
+    recorder = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(recorder)
+    monkeypatch.setitem(sys.modules, name, recorder)
+    sampler = SimpleNamespace(
+        **{
+            method: Mock(side_effect=lambda value: value + 1)
+            for method in ("apply_logits_processors", "sample", "gather_logprobs")
+        }
+    )
+    original_method = sampler.sample
+
+    def sample(value):
+        output = recorder.record_stage("bonus_sampler", sampler.sample, value)
+        if failure:
+            raise ValueError("original sample error")
+        return output
+
+    runner = SimpleNamespace(_sample=sample, sampler=sampler)
+    timing = timing_module.DecodeTiming(event_factory=Mock(side_effect=AssertionError("Unsampled step")))
+    timing.decode_steps = 5  # Host-only sample: no event allocation.
+    timing_module.install_sampling_timing(runner, timing)
+    try:
+        for active in (False, True):
+            timing.active = active
+            if failure:
+                with pytest.raises(ValueError, match="original sample error"):
+                    runner._sample(8)
+            else:
+                assert runner._sample(8) == 9
+            assert not recorder.stage_recorder_active()
+            if not active:
+                assert not timing.scopes
+        assert timing.report()["stages"]["sampling.bonus_sampler"]["wall"]["count"] == 1
+        assert timing.report()["stages"]["sampling.sampler.sample"]["wall"]["count"] == 1
+        assert original_method.call_count == 2  # Never sample twice for a probe.
+    finally:
+        timing.close()
+    assert runner._sample is sample and sampler.sample is original_method
+
+
+@pytest.mark.parametrize("supported", [False, True])
+def test_worker_reads_graph_events_only_after_request_fence(supported):
+    events = []
+    bounds = object()
+    timing = SimpleNamespace(close=lambda: events.append("restore"), report=lambda: {}, last_target_events=bounds)
+
+    def graph_report(actual_bounds, *, full):
+        assert events == ["restore", "sync"]
+        assert actual_bounds is bounds and full
+        return {"status": "complete"}
+
+    _, stop = benchmark_rpc_methods(
+        {
+            "torch": SimpleNamespace(npu=SimpleNamespace(synchronize=lambda: events.append("sync"))),
+            "envs": SimpleNamespace(VLLM_ASCEND_SFA_FULL_GRAPH=True),
+        }
+    )
+    worker = SimpleNamespace(
+        _decode_timing=timing,
+        _graph_phase_timing=SimpleNamespace(report=graph_report),
+        _decode_timing_root_start=0,
+        _decode_timing_source_start=0,
+        model_runner=SimpleNamespace(_sfa_full_graph=SimpleNamespace(replay_count=3, source_binding_count=1)),
+        benchmark_process_info=lambda: {"rank": 0},
+    )
+    if not supported:
+        worker._graph_phase_timing = None
+        worker._graph_phase_support = {"status": "unavailable", "reason": "event recorder null", "stages": {}}
+        # Missing capture capability must not try to read ANY event timestamps.
+        del timing.last_target_events
+    result = stop(worker)
+    assert result["graph_phases"] == ({"status": "complete"} if supported else worker._graph_phase_support)
+
+
+@pytest.mark.parametrize("processed", [False, True])
+@pytest.mark.parametrize("logprobs", [None, 1])
+def test_actual_instrumented_rejection_forward_matches_sibling_baseline_on_cpu(processed, logprobs):
+    """Execute both real forward bodies; compare tensors and operation order.
+
+    Kernel shims are shared CPU operations, not a claim of NPU kernel parity.
+    This catches diagnostic-only extra sampling or altered processor inputs.
+    """
+    import torch
+
+    baseline_path = ROOT.parent / "vllm/vllm/v1/sample/rejection_sampler.py"
+    if not baseline_path.is_file():
+        pytest.skip("Requires matching sibling vllm checkout")
+
+    def forward(path, cls, namespace):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        owner = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == cls)
+        body = next(n for n in owner.body if isinstance(n, ast.FunctionDef) and n.name == "forward")
+        body.decorator_list = []
+        module = ast.parse("from __future__ import annotations")
+        module.body.append(body)
+        exec(compile(ast.fix_missing_locations(module), str(path), "exec"), namespace)
+        return namespace["forward"]
+
+    @dataclass
+    class Sampling:
+        max_num_logprobs: int | None
+
+    calls, tensors, stages = [], [], []
+
+    def capture(name, value):
+        calls.append(name)
+        tensors.append(value.detach().clone())
+
+    def bonus(*, logits, sampling_metadata, **kwargs):
+        assert sampling_metadata.max_num_logprobs == -1
+        capture("bonus", logits)
+        return SimpleNamespace(sampled_token_ids=logits.argmax(-1), logprobs_tensors=SimpleNamespace(logprobs=logits))
+
+    def processors(logits, *args):
+        capture("processors", logits)
+        return logits.add_(0.25)
+
+    def constraints(logits, *args):
+        capture("constraints", logits)
+        return logits
+
+    def rejection(*args):
+        capture("rejection", args[5])
+        return args[5].argmax(-1)
+
+    def get_logprobs(*args):
+        capture("logprobs", args[3])
+        return args[3].clone()
+
+    def record(name, operation, *args, **kwargs):
+        stages.append(name)
+        return operation(*args, **kwargs)
+
+    namespace = dict(
+        torch=torch,
+        MAX_SPEC_LEN=8,
+        replace=replace,
+        SamplerOutput=SimpleNamespace,
+        stage_recorder_active=lambda: True,
+        record_stage=record,
+        apply_sampling_constraints=constraints,
+        rejection_sample=rejection,
+    )
+    baseline = forward(baseline_path, "RejectionSampler", dict(namespace))
+    observed = forward(ROOT / "vllm_ascend/sample/rejection_sampler.py", "AscendRejectionSampler", dict(namespace))
+    sampler = SimpleNamespace(
+        sampler=bonus,
+        is_processed_logprobs_mode=processed,
+        apply_logits_processors=processors,
+        _get_logprobs_tensors=get_logprobs,
+    )
+    metadata = SimpleNamespace(
+        max_spec_len=1,
+        bonus_logits_indices=torch.tensor([1]),
+        target_logits_indices=torch.tensor([0]),
+        cu_num_draft_tokens=torch.tensor([1]),
+        draft_token_ids=torch.tensor([2]),
+        num_draft_tokens=[1],
+    )
+    logits = torch.arange(8, dtype=torch.bfloat16).reshape(2, 4)
+    expected = baseline(sampler, metadata, None, logits.clone(), Sampling(logprobs))
+    expected_calls, expected_tensors = list(calls), list(tensors)
+    calls.clear()
+    tensors.clear()
+    actual = observed(sampler, metadata, None, logits.clone(), Sampling(logprobs))
+    assert calls == expected_calls
+    assert all(torch.equal(a, b) for a, b in zip(tensors, expected_tensors))
+    assert torch.equal(actual.sampled_token_ids, expected.sampled_token_ids)
+    if logprobs is not None:
+        assert torch.equal(actual.logprobs_tensors, expected.logprobs_tensors)
+    else:
+        assert actual.logprobs_tensors is expected.logprobs_tensors is None
+    assert stages[:4] == ["bonus_index", "bonus_sampler", "target_index_cast", "logits_processors"]

@@ -69,6 +69,9 @@ python3 -m pip install -v --no-build-isolation -e .
 
 ### Usage
 
+For the experimental singleton DSA decode path with one target-model graph
+replay, see [Single-forward SFA graph](sfa_full_graph.md).
+
 We introduce a dynamic KVConnector via LMCacheAscendConnectorV1Dynamic, therefore LMCache-Ascend Connector can be used via the kv transfer config in the two following setting.
 
 #### Online serving

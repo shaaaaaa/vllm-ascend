@@ -1,0 +1,551 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Run an isolated eight-layer, TP8/DP1/MTP1 parity test on one eight-NPU host.
+
+No HTTP server/client is needed. Prefill computes once in the eager process.
+The graph process imports that checkpoint without executing prefill, then
+compares live decode. Temporary files are managed internally; output is stdout.
+"""
+
+import argparse
+import importlib
+import inspect
+import json
+import math
+import os
+import subprocess
+import sys
+from pathlib import Path
+from tempfile import TemporaryDirectory
+
+import psutil
+
+DEFAULT_MODEL = "/workspace/models/GLM-5.1-w4a8"
+DEFAULT_DEVICES = "0,1,2,3,4,5,6,7"
+PROMPT_TOKENS = 4351  # Beyond the 4096-token MTP scratch prefix, next to a 256 boundary.
+OUTPUT_TOKENS = 16
+PREFILL_CHUNK = 512
+FIXED_TOKEN = 100
+ENGINE_SHUTDOWN_TIMEOUT = 60
+
+
+def track_workers(reports: list[dict], tp_size: int) -> list:
+    """Keep process identities before shutdown, including PID reuse protection."""
+    if (
+        len(reports) != tp_size
+        or {report.get("rank") for report in reports} != set(range(tp_size))
+        or any(type(report.get("pid")) is not int or report["pid"] <= 0 for report in reports)
+        or len({report["pid"] for report in reports}) != tp_size
+    ):
+        raise RuntimeError("Incomplete/duplicate parity worker process identities")
+    workers = [psutil.Process(report["pid"]) for report in reports]
+    for worker in workers:
+        worker.create_time()
+    return workers
+
+
+def shutdown_engine(llm, workers: list) -> None:
+    """Close this engine explicitly and refuse overlap with the next engine."""
+    try:
+        llm.llm_engine.engine_core.shutdown(timeout=ENGINE_SHUTDOWN_TIMEOUT)
+    finally:
+        _, alive = psutil.wait_procs(live_workers(workers), timeout=ENGINE_SHUTDOWN_TIMEOUT)
+        alive = live_workers(alive)
+        if alive:
+            raise RuntimeError(f"Parity workers still alive after engine shutdown: {[worker.pid for worker in alive]}")
+
+
+def live_workers(workers: list) -> list:
+    # Workers are grandchildren. On Linux an exited worker may remain a zombie
+    # until its parent reaps it; it no longer owns sockets/device resources.
+    alive = []
+    for worker in workers:
+        try:
+            if worker.is_running() and worker.status() != psutil.STATUS_ZOMBIE:
+                alive.append(worker)
+        except psutil.NoSuchProcess:
+            pass
+    return alive
+
+
+def preflight_dependencies() -> None:
+    """Check the *imported* cross-repo API before either expensive engine starts.
+
+    Run only in a disposable child with the graph environment. LMCache-Ascend
+    patches imports, so this must not pollute the eager reference process.
+    Signature binding does not instantiate connectors or allocate NPU tensors.
+    Native checks verify exports, not hardware/kernel correctness.
+    """
+    modules = {}
+    failures = []
+
+    def load(name):
+        if name not in modules:
+            try:
+                modules[name] = importlib.import_module(name)
+            except Exception as exc:
+                modules[name] = None
+                failures.append(f"{name}: {type(exc).__name__}: {exc}")
+        return modules[name]
+
+    # Match the runtime's Ascend patch ordering before importing LMCache's
+    # adapter; importing its CUDA implementation first is not equivalent.
+    for name in ("vllm", "vllm_ascend", "lmcache_ascend", "lmcache"):
+        load(name)
+
+    # Arguments mirror the production call sites. Do not accept an old
+    # singleton transfer by dropping request_capacity or bind_batch.
+    contracts = (
+        (
+            "lmcache_ascend.v1.npu_connector.sparse_graph",
+            "SparseGraphTransfer",
+            (None, None, 256, 4399),
+            {"request_capacity": 1},
+        ),
+        ("lmcache_ascend.v1.npu_connector.sparse_graph", "SparseGraphTransfer.bind_batch", (None, (), 0), {}),
+        ("lmcache_ascend.v1.npu_connector.sparse_graph", "SparseGraphTransfer.load", (None, None, None, None), {}),
+        (
+            "lmcache_ascend.integration.vllm.lmcache_ascend_connector_v1",
+            "LMCacheAscendConnectorV1Dynamic.prepare_sparse_graph_step",
+            (None, ("layer",)),
+            {"request_ids": ("request",), "frontiers": (4096,), "allow_empty": False},
+        ),
+        (
+            "lmcache.integration.vllm.vllm_v1_adapter",
+            "LMCacheConnectorV1Impl.prepare_sparse_graph_step",
+            (None, ("layer",)),
+            {"request_ids": ("request",), "frontiers": (4096,), "allow_empty": False},
+        ),
+        (
+            "lmcache.v1.gpu_connector.sparse",
+            "PreparedSparseSource",
+            (),
+            {"layers": (), "total_tokens": 0, "chunk_token_counts": (), "pointer_device": None},
+        ),
+        (
+            "lmcache.v1.gpu_connector.sparse",
+            "PreparedSparseSourceLayer",
+            (),
+            {"tensors": (), "chunk_ptrs_npu": None, "memory_objs": ()},
+        ),
+        (
+            "lmcache_ascend.v1.npu_connector.utils",
+            "prepare_sparse_direct_destination_state",
+            (None, None, 6, 0, 0, 0),
+            {},
+        ),
+        (
+            "lmcache_ascend.v1.npu_connector.utils",
+            "sparse_mla_dsa_batched_direct_kv_transfer_prepared",
+            (None, None, None, None, 256, 4608, False, None),
+            {},
+        ),
+        (
+            "lmcache_ascend.v1.npu_connector.utils",
+            "sparse_graph_kv_transfer",
+            (None, None, None, None, None, None, 256),
+            {},
+        ),
+    )
+    for module_name, attribute, args, kwargs in contracts:
+        module = load(module_name)
+        if module is None:
+            continue
+        try:
+            target = module
+            for part in attribute.split("."):
+                target = getattr(target, part)
+            inspect.signature(target).bind(*args, **kwargs)
+        except (AttributeError, TypeError, ValueError) as exc:
+            failures.append(f"{module_name}.{attribute}: {exc}")
+
+    native = load("lmcache_ascend.c_ops")
+    if native is not None:
+        for name in (
+            "prepare_sparse_direct_destination_state",
+            "sparse_mla_dsa_batched_direct_kv_transfer_prepared",
+            "sparse_graph_kv_transfer",
+        ):
+            if not callable(getattr(native, name, None)):
+                failures.append(f"lmcache_ascend.c_ops.{name}: native export missing; rebuild LMCache-Ascend")
+    paths = "\n".join(f"  {name}: {getattr(module, '__file__', '<import failed>')}" for name, module in modules.items())
+    if failures:
+        raise RuntimeError(
+            "[SFA_PARITY] dependency preflight failed BEFORE model loading:\n  "
+            + "\n  ".join(failures)
+            + f"\nPython: {sys.executable}\nImported modules:\n{paths}\n"
+            "Update all four repos to feat/decode-full-graph and ensure this Python imports those checkouts "
+            "(not stale site-packages). No inference or numerical comparison has run."
+        )
+    print(f"[SFA_PARITY] dependency interfaces OK; Python: {sys.executable}\n{paths}", flush=True)
+
+
+def parse_devices(devices: str) -> tuple[int, ...]:
+    """Require an explicit, unique single-host device list (TP1/2/4/8)."""
+    parts = devices.split(",")
+    if any(not part.isascii() or not part.isdecimal() for part in parts):
+        raise ValueError("Devices must be comma-separated nonnegative integer indices")
+    indices = tuple(int(part) for part in parts)
+    if len(indices) not in (1, 2, 4, 8) or len(set(indices)) != len(indices):
+        raise ValueError("Select 1, 2, 4 or 8 distinct NPU devices on one host")
+    return indices
+
+
+def child_environment(mode: str, devices: str) -> dict[str, str]:
+    """Use local fresh CPU caches, never a running server's remote/shared store."""
+    environment = {
+        k: v for k, v in os.environ.items() if not k.startswith(("LMCACHE_", "VLLM_")) and k != "MOONCAKE_CONFIG_PATH"
+    }
+    environment.update(
+        {
+            "PYTHONHASHSEED": "0",
+            "HCCL_DETERMINISTIC": "strict",
+            "ASCEND_RT_VISIBLE_DEVICES": devices,
+            "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
+            "LMCACHE_CHUNK_SIZE": "256",
+            "LMCACHE_LOCAL_CPU": "true",
+            "LMCACHE_MAX_LOCAL_CPU_SIZE": "2",
+            "LMCACHE_USE_LAYERWISE": "true",
+            "LMCACHE_ENABLE_SPARSE_ATTENTION": "true",
+            "LMCACHE_SAVE_DECODE_CACHE": "false",
+            "LMCACHE_SAVE_UNFULL_CHUNK": "true",
+            "LMCACHE_SAVE_FULL_CHUNK_IN_DECODE": "false",
+            "LMCACHE_DSA_TWO_GROUPS": "true",
+            "LMCACHE_ENABLE_SHARED_CPU_CACHE": "false",
+            "LMCACHE_EXTRA_CONFIG": '{"save_only_first_rank": false}',
+            "LMCACHE_DECODE_WINDOW_SAVE_WINDOW_SIZE": "256",
+            "VLLM_ASCEND_DSA_DISABLE_INDEX_LMCACHE": "0",
+            "VLLM_ASCEND_DSA_UNBUNDLE": "1",
+            "VLLM_ASCEND_DSA_TWO_GROUPS": "1",
+            "VLLM_ASCEND_DSA_SHRINK_LATENT": "2",
+            "VLLM_ASCEND_SFA_STAGED_GRAPH": str(int(mode == "graph")),
+            "VLLM_ASCEND_SFA_FULL_GRAPH": str(int(mode == "graph")),
+            "VLLM_ASCEND_SFA_STAGED_GRAPH_CAPTURE_SIZES": "1",
+            "VLLM_ASCEND_MTP_DRAFT_DEBUG": "0",
+            "VLLM_ASCEND_MTP_DW_DIAG": "0",
+            "VLLM_ASCEND_MTP_DW_DEEP_DIAG": "0",
+            "VLLM_ASCEND_ENABLE_FLASHCOMM1": "0",
+            "VLLM_ASCEND_FLASHCOMM2_PARALLEL_SIZE": "0",
+        }
+    )
+    return environment
+
+
+def engine_options(args: argparse.Namespace) -> dict:
+    """Share the exact parity configuration with startup-only diagnostics."""
+    graph = args.child == "graph"
+    compare_output = getattr(args, "compare_output", False)
+    tp_size = len(parse_devices(args.devices))
+    return dict(
+        model=args.model,
+        trust_remote_code=True,
+        load_format="dummy",
+        quantization="ascend",
+        hf_overrides={"num_hidden_layers": 8},
+        tensor_parallel_size=tp_size,
+        data_parallel_size=1,
+        distributed_executor_backend="mp",
+        enable_expert_parallel=False,
+        max_model_len=PROMPT_TOKENS + OUTPUT_TOKENS + 32,
+        max_num_seqs=1,
+        max_num_batched_tokens=PREFILL_CHUNK,
+        enable_chunked_prefill=True,
+        enable_prefix_caching=False,
+        async_scheduling=False,
+        gpu_memory_utilization=0.9,
+        seed=0,
+        enforce_eager=not graph,
+        speculative_config={"num_speculative_tokens": 1, "method": "deepseek_mtp", "enforce_eager": True},
+        compilation_config={
+            "mode": 3 if graph else 0,
+            "cudagraph_mode": "PIECEWISE" if graph else "NONE",
+            "pass_config": {"enable_sp": False},
+        },
+        worker_cls="vllm_ascend.worker.sfa_parity_worker.SFAParityWorker",
+        kv_transfer_config={
+            "kv_connector": "LMCacheAscendConnectorV1Dynamic",
+            "kv_role": "kv_both",
+            "kv_connector_module_path": "lmcache_ascend.integration.vllm.lmcache_ascend_connector_v1",
+        },
+        additional_config={
+            "sfa_parity": {
+                "mode": args.child,
+                "reference": args.reference,
+                "token_id": FIXED_TOKEN,
+                "atol": args.atol,
+                "rtol": args.rtol,
+                "trace_residual": getattr(args, "trace_residual", False),
+                "compare_output": compare_output,
+            }
+        },
+    )
+
+
+def run_child(args: argparse.Namespace) -> None:
+    # Lazy imports: each process sees its final environment before loading any
+    # vLLM/LMCache/plugin module or allocating a device context.
+    from vllm import LLM
+
+    llm = LLM(**engine_options(args))
+    workers = []
+    try:
+        identities = llm.collective_rpc("parity_process_info", timeout=ENGINE_SHUTDOWN_TIMEOUT)
+        workers = track_workers(identities, len(parse_devices(args.devices)))
+        run_generation(llm, args)
+        released = llm.collective_rpc("parity_release_resources", timeout=ENGINE_SHUTDOWN_TIMEOUT)
+        if sorted(released, key=lambda report: report["rank"]) != sorted(identities, key=lambda report: report["rank"]):
+            raise RuntimeError("Not all parity workers acknowledged resource release")
+    finally:
+        original_error = sys.exc_info()[1]
+        try:
+            shutdown_engine(llm, workers)
+        except Exception as cleanup_error:
+            if original_error is None:
+                raise
+            original_error.add_note(f"Parity engine cleanup also failed: {cleanup_error}")
+            print(f"[SFA_PARITY] {args.child} cleanup FAILED: {cleanup_error}", flush=True)
+    print(f"[SFA_PARITY] {args.child} cleanup complete: all {len(workers)} workers exited", flush=True)
+
+
+def run_generation(llm, args: argparse.Namespace) -> None:
+    # The lifecycle wrapper must also clean up generation, validation and I/O
+    # failures; none of these checks may leave an engine for the next mode.
+    from vllm import SamplingParams
+
+    compare_output = getattr(args, "compare_output", False)
+    # Explicit token IDs remove tokenizer/chat-template ambiguity. Varied prompt
+    # IDs avoid a degenerate repeated-token cache. The default layer test fixes
+    # target/proposed tokens; output comparison keeps BOTH choices unrestricted.
+    prompt = {"prompt_token_ids": [FIXED_TOKEN + i % 257 for i in range(PROMPT_TOKENS)]}
+    outputs = llm.generate(
+        prompt,
+        SamplingParams(
+            temperature=0,
+            seed=0,
+            max_tokens=OUTPUT_TOKENS,
+            min_tokens=OUTPUT_TOKENS,
+            ignore_eos=True,
+            allowed_token_ids=None if compare_output else [FIXED_TOKEN],
+            detokenize=compare_output,
+            skip_special_tokens=False,
+        ),
+        use_tqdm=False,
+    )
+    output = outputs[0].outputs[0]
+    tokens = list(output.token_ids)
+    if len(tokens) != OUTPUT_TOKENS:
+        raise AssertionError(f"Incomplete generation: {len(tokens)}/{OUTPUT_TOKENS} tokens")
+    if not compare_output and tokens != [FIXED_TOKEN] * OUTPUT_TOKENS:
+        raise AssertionError(f"Teacher-forced target tokens were not honored: {tokens}")
+    summary = llm.collective_rpc("parity_summary")
+    Path(args.reference, f"{args.child}-summary.json").write_text(json.dumps(summary))
+    if compare_output:
+        Path(args.reference, f"{args.child}-output.json").write_text(
+            json.dumps({"token_ids": tokens, "text": output.text, "finish_reason": output.finish_reason}),
+            encoding="utf-8",
+        )
+    else:
+        print(f"[SFA_PARITY] {args.child}: {summary}", flush=True)
+
+
+def validate_summaries(eager: list[dict], graph: list[dict], tp_size: int, *, compare_output: bool = False) -> None:
+    """Require every TP rank, irrespective of RPC result ordering."""
+    by_mode = []
+    fields = ("steps", "prefill_steps", "prefill_tokens", "decode_steps", "q2_steps", "draft_calls")
+    for name, reports in (("eager", eager), ("graph", graph)):
+        ranks = {report["rank"]: report for report in reports}
+        if len(reports) != tp_size or set(ranks) != set(range(tp_size)):
+            raise AssertionError(f"{name}: incomplete/duplicate TP rank coverage: {[r['rank'] for r in reports]}")
+        for rank, report in ranks.items():
+            if report.get("compare_output", False) != compare_output:
+                raise AssertionError(f"{name}: rank={rank} used the wrong output/layer comparison mode")
+            if compare_output and report.get("decode_observations") != report["decode_steps"]:
+                raise AssertionError(f"{name}: rank={rank} lacks complete decode observations")
+            if report["tp_size"] != tp_size or any(report[k] != ranks[0][k] for k in fields):
+                raise AssertionError(f"{name}: rank={rank} has inconsistent TP/step coverage")
+            if report["decode_steps"] < 2 or report["q2_steps"] < 2 or report["draft_calls"] < 2:
+                raise AssertionError(f"{name}: rank={rank} lacks live decode/Q2/MTP coverage")
+            if (
+                report["prefill_steps"] < 1
+                or report["prefill_tokens"] != PROMPT_TOKENS
+                or report["steps"] != report["prefill_steps"] + report["decode_steps"]
+            ):
+                raise AssertionError(f"{name}: rank={rank} lacks complete single-prefill checkpoint coverage")
+            if name == "eager":
+                valid_prefill = (
+                    report["prefill_model_calls"] == report["prefill_steps"]
+                    and report["prefill_imports"] == 0
+                    and report["draft_prefill_model_calls"] > 0
+                    and report["draft_prefill_imports"] == 0
+                )
+            else:
+                valid_prefill = (
+                    report["prefill_model_calls"] == 0
+                    and report["prefill_imports"] == report["prefill_steps"]
+                    and report["draft_prefill_model_calls"] == 0
+                    and report["draft_prefill_imports"] > 0
+                )
+            if not valid_prefill:
+                raise AssertionError(f"{name}: rank={rank} recomputed or skipped the shared prefill")
+            if len(report["loaded_tokens_per_layer"]) != 8 or not all(x > 0 for x in report["loaded_tokens_per_layer"]):
+                raise AssertionError(f"{name}: rank={rank} lacks historical KV coverage in all eight layers")
+        by_mode.append(ranks)
+    # Natural MTP proposals/acceptance can change the number of forwards, even
+    # for identical final tokens. Require common prefill, not forced alignment.
+    shared_fields = ("prefill_steps", "prefill_tokens") if compare_output else fields
+    for rank in range(tp_size):
+        if any(by_mode[0][rank][k] != by_mode[1][rank][k] for k in shared_fields):
+            raise AssertionError(f"rank={rank}: eager/graph execution coverage differs")
+        if by_mode[0][rank]["draft_prefill_model_calls"] != by_mode[1][rank]["draft_prefill_imports"]:
+            raise AssertionError(f"rank={rank}: MTP initial checkpoint coverage differs")
+
+
+def compare_generated_outputs(eager: dict, graph: dict) -> dict:
+    """Compare actual greedy generations, never a teacher-forced token stream."""
+    for mode, output in (("eager", eager), ("graph", graph)):
+        tokens = output.get("token_ids")
+        if (
+            not isinstance(tokens, list)
+            or len(tokens) != OUTPUT_TOKENS
+            or any(type(token) is not int or token < 0 for token in tokens)
+            or not isinstance(output.get("text"), str)
+        ):
+            raise AssertionError(f"{mode}: missing/invalid complete generation")
+    first = next(
+        (
+            {"token_number": index + 1, "eager": a, "graph": b}
+            for index, (a, b) in enumerate(zip(eager["token_ids"], graph["token_ids"]))
+            if a != b
+        ),
+        None,
+    )
+    return {
+        "tokens_equal": first is None,
+        "text_equal": eager["text"] == graph["text"],
+        "first_token_difference": first,
+        "tokens_compared": len(eager["token_ids"]),
+    }
+
+
+def print_stage_statistics(eager: list[dict], graph: list[dict]) -> None:
+    # Both engines have exited; this module only operates on CPU summaries.
+    from vllm_ascend.attention.sfa_parity_stats import print_statistics
+
+    print_statistics(eager, graph)
+
+
+def run_pair(
+    model: str = DEFAULT_MODEL,
+    *,
+    devices: str = DEFAULT_DEVICES,
+    atol: float = 1e-7,
+    rtol: float = 1e-2,
+    trace_residual: bool = False,
+    compare_output: bool = False,
+) -> None:
+    """Start two sequential fresh engines, sharing weights across selected NPUs."""
+    if not Path(model, "config.json").is_file():
+        raise FileNotFoundError(f"Local model config not found: {model}/config.json")
+    if any(not math.isfinite(value) or value < 0 for value in (atol, rtol)):
+        raise ValueError("Tolerances must be finite and nonnegative")
+    tp_size = len(parse_devices(devices))
+    print("[SFA_PARITY] scope=target_decode; prefill computes ONCE; graph imports target+MTP checkpoints", flush=True)
+    if compare_output:
+        print(
+            f"[SFA_OUTPUT] unrestricted greedy target + real MTP proposals; generate {OUTPUT_TOKENS} tokens", flush=True
+        )
+        if trace_residual:
+            print("[SFA_STATS] extra norm/attention probes enabled; these can affect compiler fusion", flush=True)
+    with TemporaryDirectory(prefix="sfa-parity-") as directory:
+        for mode in ("preflight", "eager", "graph"):
+            subprocess.run(
+                [
+                    sys.executable,
+                    str(Path(__file__).resolve()),
+                    "--child",
+                    mode,
+                    "--reference",
+                    directory,
+                    "--model",
+                    model,
+                    "--devices",
+                    devices,
+                    "--atol",
+                    str(atol),
+                    "--rtol",
+                    str(rtol),
+                    *(["--trace-residual"] if trace_residual else []),
+                    *(["--compare-output"] if compare_output else []),
+                ],
+                env=child_environment("graph" if mode == "preflight" else mode, devices),
+                check=True,
+            )
+        eager = json.loads(Path(directory, "eager-summary.json").read_text())
+        graph = json.loads(Path(directory, "graph-summary.json").read_text())
+        # Different planner layouts can legitimately load different numbers of
+        # misses. Both workers separately require positive transfer coverage.
+        validate_summaries(eager, graph, tp_size, compare_output=compare_output)
+        if compare_output:
+            outputs = [
+                json.loads(Path(directory, f"{mode}-output.json").read_text(encoding="utf-8"))
+                for mode in ("eager", "graph")
+            ]
+            result = compare_generated_outputs(*outputs)
+            for mode, output in zip(("eager", "graph"), outputs):
+                print(f"[SFA_OUTPUT] {mode}: " + json.dumps(output, ensure_ascii=False), flush=True)
+            print("[SFA_OUTPUT] " + json.dumps(result), flush=True)
+            print_stage_statistics(eager, graph)
+            if not result["tokens_equal"] or not result["text_equal"]:
+                raise AssertionError(
+                    "[SFA_OUTPUT] OUTPUT DIFFERENT: both generations completed; see first_token_difference"
+                )
+            print(
+                f"[SFA_OUTPUT] OUTPUT MATCH: {OUTPUT_TOKENS} greedy tokens and text; "
+                "single prefill, one target replay per decode/rank. "
+                "This case's output matches; intermediate numerical parity is not asserted.",
+                flush=True,
+            )
+            return
+    status = "DIAGNOSTIC PASS (extra probes; original acceptance still required)" if trace_residual else "PASS"
+    print(
+        f"[SFA_PARITY] {status}: all {tp_size} ranks, 8 target layers, "
+        f"prefill computed once, graph prefill calls=0, live Q2 replays, historical KV; TP{tp_size}/DP1/MTP1",
+        flush=True,
+    )
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--model", default=DEFAULT_MODEL)
+    parser.add_argument("--devices", default=DEFAULT_DEVICES)
+    parser.add_argument("--atol", type=float, default=1e-7)
+    parser.add_argument("--rtol", type=float, default=1e-2)
+    parser.add_argument("--trace-residual", action="store_true", help="Add residual-path probes for mismatch diagnosis")
+    parser.add_argument(
+        "--compare-output",
+        action="store_true",
+        help="Finish both greedy generations, compare tokens/text and report absolute stage statistics",
+    )
+    parser.add_argument("--child", choices=("preflight", "eager", "graph"), help=argparse.SUPPRESS)
+    parser.add_argument("--reference", help=argparse.SUPPRESS)
+    args = parser.parse_args()
+    if args.child == "preflight":
+        preflight_dependencies()
+    elif args.child:
+        if not args.reference:
+            parser.error("Internal child requires a reference directory")
+        run_child(args)
+    else:
+        run_pair(
+            args.model,
+            devices=args.devices,
+            atol=args.atol,
+            rtol=args.rtol,
+            trace_residual=args.trace_residual,
+            compare_output=args.compare_output,
+        )
+
+
+if __name__ == "__main__":
+    main()

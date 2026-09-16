@@ -50,13 +50,14 @@ from vllm_ascend.ascend_forward_context import (
 )
 from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
+from vllm_ascend.attention.sfa_remap_boundary import prepare_native_sparse_boundaries
 from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
 from vllm_ascend.compilation.acl_graph import (
     ACLGraphWrapper,
     get_draft_graph_params,
     update_full_graph_params,
 )
-from vllm_ascend.ops.triton.spec_decode.utils import prepare_inputs_padded_kernel
+from vllm_ascend.ops.triton.spec_decode.utils import prepare_inputs_padded_kernel, prepare_next_mtp_tokens_kernel
 from vllm_ascend.ops.triton.triton_utils import get_vectorcore_num
 from vllm_ascend.spec_decode.mtp_draft_diagnostics import (
     MTP_DRAFT_DIAG_ROOT,
@@ -664,6 +665,14 @@ class SpecDecodeBaseProposer(EagleProposer):
         per_layer_attn_metadata: Any,
         runtime_inputs: dict[str, Any],
     ) -> Any:
+        if (
+            self.method == "mtp" and envs_ascend.VLLM_ASCEND_SFA_FULL_GRAPH
+            and get_forward_context().cudagraph_runtime_mode != CUDAGraphMode.FULL
+        ):
+            prepare_native_sparse_boundaries(
+                ((name, layer.impl) for name, layer in self._draft_attn_layers.items()),
+                per_layer_attn_metadata,
+            )
         context = getattr(self, "_mtp_draft_diag_context", None)
         if self.method != "mtp" or context is None:
             return self.model(**model_kwargs)
@@ -1362,10 +1371,12 @@ class SpecDecodeBaseProposer(EagleProposer):
         else:
             inputs_embeds = None
 
-        if self.uses_mrope:
-            used_update_positions = self.mrope_positions[:, token_indices_to_sample]
-        else:
-            used_update_positions = self.positions[token_indices_to_sample]
+        used_update_positions = None
+        if use_staged_mtp_draft_graph or self.num_speculative_tokens > 1:
+            if self.uses_mrope:
+                used_update_positions = self.mrope_positions[:, token_indices_to_sample]
+            else:
+                used_update_positions = self.positions[token_indices_to_sample]
 
         if use_staged_mtp_draft_graph:
             common_attn_metadata = self._bind_staged_mtp_metadata_arena(
@@ -1420,9 +1431,9 @@ class SpecDecodeBaseProposer(EagleProposer):
         # Clone the data so that when calculating the data at position 2 and position 3
         # in the merged graph, it does not affect position 1
         # FIXME(lilinsiman)
-        if not use_staged_mtp_draft_graph:
+        if not use_staged_mtp_draft_graph and self.num_speculative_tokens > 1:
             common_attn_metadata.block_table_tensor = common_attn_metadata.block_table_tensor.clone()
-            if self.num_speculative_tokens > 1 and common_attn_metadata.indexer_block_table_tensor is not None:
+            if common_attn_metadata.indexer_block_table_tensor is not None:
                 common_attn_metadata.indexer_block_table_tensor = (
                     common_attn_metadata.indexer_block_table_tensor.clone()
                 )
@@ -2157,6 +2168,20 @@ class SpecDecodeBaseProposer(EagleProposer):
 
         return common_attn_metadata, attn_metadata
 
+    def warmup_next_mtp_tokens(self):
+        """Compile the usual one-draft layouts with private startup buffers."""
+        n = self.runner.max_num_reqs
+        backup = torch.zeros(n, dtype=torch.int32, device=self.device)
+        output = torch.empty_like(backup)
+        counts = torch.empty(n, dtype=torch.int64, device=self.device)
+        grid = (min(triton.cdiv(n, _PREPARE_INPUTS_BLOCK_SIZE), get_vectorcore_num()),)
+        for width in (1, 2):
+            sampled = torch.zeros((n, width), dtype=torch.int32, device=self.device)
+            prepare_next_mtp_tokens_kernel[grid](
+                sampled, backup, output, counts, n, self.runner.input_batch.vocab_size,
+                sampled.stride(0), sampled.stride(1), WIDTH=width, BLOCK_SIZE=_PREPARE_INPUTS_BLOCK_SIZE,
+            )
+
     def prepare_next_token_ids_padded(
         self,
         common_attn_metadata: CommonAttentionMetadata,
@@ -2186,6 +2211,24 @@ class SpecDecodeBaseProposer(EagleProposer):
             ]
         )
         self.backup_next_token_ids.copy_to_gpu(num_reqs)
+
+        if (
+            HAS_TRITON and self.method == "mtp" and self.num_speculative_tokens == 1
+            and num_discarded_requests == 0
+            and sampled_token_ids.ndim == 2 and sampled_token_ids.shape[0] == num_reqs > 0
+            and sampled_token_ids.shape[1] in (1, 2)
+            and sampled_token_ids.dtype == self.backup_next_token_ids.gpu.dtype == torch.int32
+        ):
+            next_token_ids = sampled_token_ids.new_empty(num_reqs)
+            valid_sampled_tokens_count = sampled_token_ids.new_empty(num_reqs, dtype=torch.int64)
+            grid = (min(triton.cdiv(num_reqs, _PREPARE_INPUTS_BLOCK_SIZE), get_vectorcore_num()),)
+            prepare_next_mtp_tokens_kernel[grid](
+                sampled_token_ids, self.backup_next_token_ids.gpu,
+                next_token_ids, valid_sampled_tokens_count, num_reqs, gpu_input_batch.vocab_size,
+                sampled_token_ids.stride(0), sampled_token_ids.stride(1),
+                WIDTH=sampled_token_ids.shape[1], BLOCK_SIZE=_PREPARE_INPUTS_BLOCK_SIZE,
+            )
+            return next_token_ids, valid_sampled_tokens_count
 
         # Mask out the sampled tokens indices that should not be sampled.
         discard_sampled_tokens_req_indices = discard_request_indices[:num_discarded_requests]
