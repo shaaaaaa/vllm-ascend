@@ -787,6 +787,7 @@ class TestStagedSFADummyBatch(unittest.TestCase):
         runner.vllm_config = object()
         runner.speculative_config = None
         runner.decode_threshold = 1
+        runner.dsa_shrink_latent = 2
         runner.parallel_config = SimpleNamespace(data_parallel_size=1)
         runner.attn_state = AscendAttentionState.DecodeOnly
         runner._staged_sfa_graph_capture_sizes = (1, 4)

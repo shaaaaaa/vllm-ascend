@@ -784,12 +784,27 @@ class RecomputeScheduler(Scheduler):
                     req,
                     req_to_new_blocks[req.request_id].get_block_ids(),
                     req._all_token_ids,
+                    block_ids_by_bank=req_to_new_blocks[
+                        req.request_id
+                    ].get_block_ids_by_bank(),
+                    block_allocation_mode=req_to_new_blocks[
+                        req.request_id
+                    ].get_allocation_mode(),
                 )
                 for req in scheduled_new_reqs
             ]
         else:
             new_reqs_data = [
-                NewRequestData.from_request(req, req_to_new_blocks[req.request_id].get_block_ids())
+                NewRequestData.from_request(
+                    req,
+                    req_to_new_blocks[req.request_id].get_block_ids(),
+                    block_ids_by_bank=req_to_new_blocks[
+                        req.request_id
+                    ].get_block_ids_by_bank(),
+                    block_allocation_mode=req_to_new_blocks[
+                        req.request_id
+                    ].get_allocation_mode(),
+                )
                 for req in scheduled_new_reqs
             ]
 

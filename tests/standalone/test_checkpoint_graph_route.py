@@ -33,7 +33,10 @@ def route_api():
         cold_perf_enabled=lambda: False,
         AscendAttentionState=NS(DecodeOnly="decode", SpecDecoding="spec"),
         unwrap_staged_sfa_connector_metadata=lambda x: x,
-        staged_sfa_metadata_sparse_route=lambda meta, ids: (ns["StagedSFARouteReason"].ELIGIBLE, meta[0], meta[1]),
+        staged_sfa_metadata_sparse_route=lambda meta, ids: (
+            ns["StagedSFARouteReason"].ELIGIBLE, meta[0],
+            ns["ColdResumeMarkers"](meta[1], meta[0]) if meta[1] else (),
+        ),
     )
     exec(compile(ast.Module(body=[method], type_ignores=[]), "route", "exec"), ns)
     return ns
@@ -81,6 +84,7 @@ def test_historical_recovery_is_not_relabelled_as_speculative_decode():
         _staged_sfa_graph_capture_sizes=[8, 16, 24, 32],
         speculative_config=NS(num_speculative_tokens=1),
         attn_state="prefill",
+        dsa_shrink_latent=2,
         decode_threshold=2,
         vllm_config=NS(lora_config=None),
         input_batch=NS(num_tokens_no_spec=np.array([3100])),
