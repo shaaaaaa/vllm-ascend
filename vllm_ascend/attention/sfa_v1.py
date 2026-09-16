@@ -1523,18 +1523,21 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
                             == AscendAttentionState.SpecDecoding
                             else 1
                         )
+                        # Prompt-only recovery may have no draft token. Native
+                        # MTP accepts a shorter query; the restored frontier
+                        # must still match before any sparse rows are exposed.
                         if (
-                            e - s != expected_width
+                            not 1 <= e - s <= expected_width
                             or int(computed[r]) != expected_end
                         ):
                             raise RuntimeError(
                                 "Invalid cold-compact resume layout: "
                                 f"request={r}, rows={e - s}, prompt={plen}, "
                                 f"computed={int(computed[r])}, "
-                                f"expected_rows={expected_width}."
+                                f"allowed_rows=1..{expected_width}."
                             )
-                        # The first real row recomputes the final prompt token;
-                        # later rows validate speculative tokens.  Every one of
+                        # The first row processes the pending history token;
+                        # any later rows validate speculative tokens. Every one of
                         # them consumes sparse prefix KV and must participate in
                         # compact retrieval/remapping.  Treating the first row
                         # as padding leaves it reading stale scratch contents.
