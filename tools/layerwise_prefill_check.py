@@ -20,7 +20,9 @@ import tempfile
 import threading
 import time
 from collections import defaultdict
+from collections.abc import Mapping
 from contextlib import suppress
+from numbers import Integral
 from pathlib import Path
 
 CHUNK_SIZE = 256
@@ -95,6 +97,23 @@ def first_difference(left, right):
     return None if len(left) == len(right) else min(len(left), len(right))
 
 
+def normalize_prompt_token_ids(encoded) -> list[int]:
+    """Extract one sequence, not the number of BatchEncoding fields or rows."""
+    if isinstance(encoded, Mapping):
+        if "input_ids" not in encoded:
+            raise ValueError("Tokenizer result has no input_ids")
+        encoded = encoded["input_ids"]
+    if hasattr(encoded, "tolist"):
+        encoded = encoded.tolist()
+    if isinstance(encoded, (list, tuple)) and len(encoded) == 1 and isinstance(encoded[0], (list, tuple)):
+        encoded = encoded[0]
+    if not isinstance(encoded, (list, tuple)) or not encoded:
+        raise ValueError("Tokenizer must return a non-empty token ID sequence")
+    if any(not isinstance(token, Integral) or isinstance(token, bool) or token < 0 for token in encoded):
+        raise ValueError("Tokenizer must return one sequence of non-negative integer token IDs")
+    return [int(token) for token in encoded]
+
+
 def prepare_prompt(args, root):
     # Read a committed, reviewable input; never generate or pad it at runtime.
     source = args.prompt_file.resolve()
@@ -108,7 +127,12 @@ def prepare_prompt(args, root):
     print(f"[PREFILL_CHECK] loading tokenizer: {args.model}", flush=True)
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
     print("[PREFILL_CHECK] tokenizing fixed article once", flush=True)
-    ids = tokenizer.apply_chat_template([{"role": "user", "content": text}], tokenize=True, add_generation_prompt=True)
+    encoded = tokenizer.apply_chat_template(
+        [{"role": "user", "content": text}], tokenize=True, add_generation_prompt=True, return_dict=False
+    )
+    # Some custom tokenizers still return a mapping/tensor; normalize before
+    # measuring length, hashing, persisting, or passing IDs to any engine.
+    ids = normalize_prompt_token_ids(encoded)
     print(f"[PREFILL_CHECK] prompt_tokens={len(ids)}, output_tokens={args.output_tokens}", flush=True)
     if len(ids) <= max(args.prefill_chunk_tokens, CHUNK_SIZE):
         raise ValueError("Prompt must span multiple compute-prefill chunks AND LMCache chunks")

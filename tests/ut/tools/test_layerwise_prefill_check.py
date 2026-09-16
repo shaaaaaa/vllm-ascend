@@ -67,7 +67,7 @@ def test_fixed_prompt_tokenized_once_and_preserved(tmp_path, fake_tokenizer, cap
     text = options.prompt_file.read_text(encoding="utf-8")
     assert CHECK.prepare_prompt(options, tmp_path) == 12288
     fake_tokenizer.apply_chat_template.assert_called_once_with(
-        [{"role": "user", "content": text}], tokenize=True, add_generation_prompt=True
+        [{"role": "user", "content": text}], tokenize=True, add_generation_prompt=True, return_dict=False
     )
     assert (tmp_path / "prompt.txt").read_text(encoding="utf-8") == text
     record = json.loads((tmp_path / "prompt.json").read_text(encoding="utf-8"))
@@ -75,6 +75,75 @@ def test_fixed_prompt_tokenized_once_and_preserved(tmp_path, fake_tokenizer, cap
     assert record["source"] == str(options.prompt_file.resolve())
     output = capsys.readouterr().out
     assert "loading tokenizer" in output and "prompt_tokens=12288" in output
+
+
+@pytest.mark.parametrize(
+    "encoded",
+    [
+        [7, 9, 11],
+        (7, 9, 11),
+        [[7, 9, 11]],
+        {"input_ids": [7, 9, 11], "attention_mask": [1, 1, 1]},
+        {"input_ids": [[7, 9, 11]], "attention_mask": [[1, 1, 1]]},
+        torch.tensor([7, 9, 11]),
+        torch.tensor([[7, 9, 11]]),
+        {"input_ids": torch.tensor([[7, 9, 11]])},
+    ],
+)
+def test_normalize_tokenizer_result_preserves_actual_ids(encoded):
+    assert CHECK.normalize_prompt_token_ids(encoded) == [7, 9, 11]
+
+
+@pytest.mark.parametrize(
+    "encoded", [[], [[]], "rendered text", {"attention_mask": [1]}, [[1, 2], [3, 4]], [1.0], [True], [-1]]
+)
+def test_invalid_tokenizer_payload_is_not_silently_counted(encoded):
+    with pytest.raises(ValueError, match="Tokenizer"):
+        CHECK.normalize_prompt_token_ids(encoded)
+
+
+def test_prepare_prompt_handles_custom_tokenizer_returning_mapping(tmp_path, fake_tokenizer):
+    fake_tokenizer.apply_chat_template.return_value = {
+        "input_ids": list(range(12288)),
+        "attention_mask": [1] * 12288,
+    }
+    assert CHECK.prepare_prompt(args(), tmp_path) == 12288
+    record = json.loads((tmp_path / "prompt.json").read_text(encoding="utf-8"))
+    assert record["token_ids"] == list(range(12288))
+    assert fake_tokenizer.apply_chat_template.call_count == 1
+
+
+def test_real_hf_tokenizer_mapping_and_prepare_prompt(tmp_path, monkeypatch):
+    # Fully offline: use a real HF chat template and BatchEncoding with a tiny
+    # local vocabulary. No model download, vLLM import, or NPU is required.
+    from tokenizers import Tokenizer
+    from tokenizers.models import WordLevel
+    from tokenizers.pre_tokenizers import Whitespace
+    from transformers import AutoTokenizer, PreTrainedTokenizerFast
+
+    raw = Tokenizer(WordLevel({"[UNK]": 0, "hello": 1}, unk_token="[UNK]"))
+    raw.pre_tokenizer = Whitespace()
+    tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=raw,
+        unk_token="[UNK]",
+        model_input_names=["input_ids", "attention_mask"],
+        chat_template="{% for message in messages %}{{ message.content }}{% endfor %}",
+    )
+    messages = [{"role": "user", "content": "hello hello hello"}]
+    encoded = tokenizer.apply_chat_template(messages, tokenize=True, return_dict=True)
+    assert len(encoded) == 2  # Fields, not tokens: reproduce the reported bug.
+    assert CHECK.normalize_prompt_token_ids(encoded) == [1, 1, 1]
+    calls = Mock(wraps=tokenizer.apply_chat_template)
+    monkeypatch.setattr(tokenizer, "apply_chat_template", calls)
+    monkeypatch.setattr(AutoTokenizer, "from_pretrained", lambda *a, **kw: tokenizer)
+    source = tmp_path / "article.txt"
+    source.write_text("hello " * 5000, encoding="utf-8")
+    options = CHECK.parser().parse_args(["--prompt-file", str(source)])
+    assert CHECK.prepare_prompt(options, tmp_path) == 5000
+    assert calls.call_count == 1
+    assert calls.call_args.kwargs["return_dict"] is False
+    record = json.loads((tmp_path / "prompt.json").read_text(encoding="utf-8"))
+    assert record["token_ids"] == [1] * 5000
 
 
 @pytest.mark.parametrize(
