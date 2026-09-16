@@ -5,6 +5,7 @@
 import ast
 import importlib.util
 import sys
+from contextlib import contextmanager
 from copy import copy, deepcopy
 from dataclasses import dataclass
 from pathlib import Path
@@ -122,6 +123,7 @@ def setup():
         logger=SimpleNamespace(info=lambda *args: None),
         torch=torch,
         copy=copy,
+        contextmanager=contextmanager,
         dataclass=dataclass,
         Any=Any,
         NPUModelRunner=Base,
@@ -178,6 +180,10 @@ def setup():
         rid: SimpleNamespace(prev_num_draft_len=1, num_computed_tokens=int(base)) for rid, base in zip(ids, bases)
     }
     runner.seq_lens, runner.positions = Buffer(4), Buffer(capacity, torch.int64)
+    runner.input_ids = Buffer(capacity)
+    runner._async_live_execute = False
+    runner._async_host_write = runner._async_query_layout = None
+    runner.prepare_inputs_event = None
     runner.positions.gpu[: 2 * n] = torch.from_numpy(np.repeat(bases, 2) + np.tile([0, 1], n))
     runner.seq_lens.np[:n] = bases + 2
     runner.seq_lens.gpu.copy_(runner.seq_lens.cpu)
@@ -534,6 +540,7 @@ def test_kernel_warmup_is_after_capture_and_uses_private_outputs(setup, monkeypa
     r._sfa_full_graph = SimpleNamespace(entries=[r._async_snapshot.key])
     r._async_bases = torch.zeros(4, dtype=torch.int32)
     r.max_num_reqs = 4
+    r.drafter = SimpleNamespace(warmup_next_mtp_tokens=lambda: events.append("next_token_warmup"))
     for group in r.input_batch.block_table.block_tables:
         group.block_table = SimpleNamespace(gpu=group.table)
     monkeypatch.setattr(
@@ -544,7 +551,7 @@ def test_kernel_warmup_is_after_capture_and_uses_private_outputs(setup, monkeypa
     )
     before = tuple(t.clone() for t in (r.positions.gpu, r.seq_lens.gpu, r.item.slot_mapping))
     assert r.capture_model() == "captured"
-    assert events == ["capture", "kernel", "startup_sync"]
+    assert events == ["capture", "kernel", "next_token_warmup", "startup_sync"]
     for current, old in zip((r.positions.gpu, r.seq_lens.gpu, r.item.slot_mapping), before):
         torch.testing.assert_close(current, old, rtol=0, atol=0)
 

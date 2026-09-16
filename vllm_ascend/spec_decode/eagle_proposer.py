@@ -1371,10 +1371,12 @@ class SpecDecodeBaseProposer(EagleProposer):
         else:
             inputs_embeds = None
 
-        if self.uses_mrope:
-            used_update_positions = self.mrope_positions[:, token_indices_to_sample]
-        else:
-            used_update_positions = self.positions[token_indices_to_sample]
+        used_update_positions = None
+        if use_staged_mtp_draft_graph or self.num_speculative_tokens > 1:
+            if self.uses_mrope:
+                used_update_positions = self.mrope_positions[:, token_indices_to_sample]
+            else:
+                used_update_positions = self.positions[token_indices_to_sample]
 
         if use_staged_mtp_draft_graph:
             common_attn_metadata = self._bind_staged_mtp_metadata_arena(
@@ -1429,9 +1431,9 @@ class SpecDecodeBaseProposer(EagleProposer):
         # Clone the data so that when calculating the data at position 2 and position 3
         # in the merged graph, it does not affect position 1
         # FIXME(lilinsiman)
-        if not use_staged_mtp_draft_graph:
+        if not use_staged_mtp_draft_graph and self.num_speculative_tokens > 1:
             common_attn_metadata.block_table_tensor = common_attn_metadata.block_table_tensor.clone()
-            if self.num_speculative_tokens > 1 and common_attn_metadata.indexer_block_table_tensor is not None:
+            if common_attn_metadata.indexer_block_table_tensor is not None:
                 common_attn_metadata.indexer_block_table_tensor = (
                     common_attn_metadata.indexer_block_table_tensor.clone()
                 )
@@ -2165,6 +2167,20 @@ class SpecDecodeBaseProposer(EagleProposer):
                 attn_metadata.decode_meta.num_computed_tokens_of_pcp_dcp = num_computed_tokens_of_pcp_dcp
 
         return common_attn_metadata, attn_metadata
+
+    def warmup_next_mtp_tokens(self):
+        """Compile the usual one-draft layouts with private startup buffers."""
+        n = self.runner.max_num_reqs
+        backup = torch.zeros(n, dtype=torch.int32, device=self.device)
+        output = torch.empty_like(backup)
+        counts = torch.empty(n, dtype=torch.int64, device=self.device)
+        grid = (min(triton.cdiv(n, _PREPARE_INPUTS_BLOCK_SIZE), get_vectorcore_num()),)
+        for width in (1, 2):
+            sampled = torch.zeros((n, width), dtype=torch.int32, device=self.device)
+            prepare_next_mtp_tokens_kernel[grid](
+                sampled, backup, output, counts, n, self.runner.input_batch.vocab_size,
+                sampled.stride(0), sampled.stride(1), WIDTH=width, BLOCK_SIZE=_PREPARE_INPUTS_BLOCK_SIZE,
+            )
 
     def prepare_next_token_ids_padded(
         self,

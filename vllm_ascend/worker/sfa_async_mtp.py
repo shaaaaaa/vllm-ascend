@@ -6,6 +6,7 @@ Only device metadata is advanced early. All request/bookkeeping mutations still
 run through the original runner, with real counts, after successful submission.
 """
 
+from contextlib import contextmanager
 from copy import copy
 from dataclasses import dataclass
 from typing import Any
@@ -54,6 +55,9 @@ def _boundary(bases, frontiers, window):
 
 class AsyncSFAModelRunner(NPUModelRunner):
     def __init__(self, *args, **kwargs):
+        self._async_live_execute = False
+        self._async_host_write = None
+        self._async_query_layout = None
         super().__init__(*args, **kwargs)
         if not (
             HAS_TRITON
@@ -72,6 +76,7 @@ class AsyncSFAModelRunner(NPUModelRunner):
 
     @torch.inference_mode()
     def capture_model(self, *args, **kwargs):
+        self._async_snapshot = self._async_query_layout = None
         result = super().capture_model(*args, **kwargs)
         # Compile each metadata specialization outside capture and before serving,
         # using private outputs. Never pay first-use compilation in a live batch.
@@ -102,7 +107,69 @@ class AsyncSFAModelRunner(NPUModelRunner):
                     groups[1].block_size,
                     BLOCK=32,
                 )
+            self.drafter.warmup_next_mtp_tokens()
             torch.npu.current_stream().synchronize()
+        return result
+
+    def execute_model(self, *args, **kwargs):
+        self._async_live_execute = True
+        try:
+            return super().execute_model(*args, **kwargs)
+        except BaseException:
+            self._async_snapshot = self._async_pending = self._async_query_layout = None
+            raise
+        finally:
+            self._async_live_execute = False
+
+    @contextmanager
+    def synchronize_input_prep(self):
+        if not self._async_live_execute:
+            with super().synchronize_input_prep():
+                yield
+            return
+        self._async_host_write = False
+        try:
+            yield
+        finally:
+            try:
+                if self._async_host_write and self.prepare_inputs_event is not None:
+                    self.prepare_inputs_event.record()
+            finally:
+                self._async_host_write = None
+
+    def _ensure_host_staging_ready(self):
+        # Lazy fence: read-only eligibility and device-only preparation need no
+        # host-source protection. Every ordinary writer enters through here.
+        if self._async_host_write is False:
+            if self.prepare_inputs_event is not None:
+                self.prepare_inputs_event.synchronize()
+            self._async_host_write = True
+
+    def _dummy_run(self, *args, **kwargs):
+        live, self._async_live_execute = self._async_live_execute, False
+        self._async_snapshot = self._async_query_layout = None
+        try:
+            return super()._dummy_run(*args, **kwargs)
+        finally:
+            self._async_live_execute = live
+            self._async_snapshot = self._async_query_layout = None
+
+    def _pad_query_start_loc_for_fia(
+        self, num_tokens_padded, num_reqs_padded, num_reqs,
+        cudagraph_runtime_mode=None, batch_desc_num_reqs=None, full_graph=False,
+    ):
+        args = (num_tokens_padded, num_reqs_padded, num_reqs, cudagraph_runtime_mode, batch_desc_num_reqs, full_graph)
+        signature = (args, self.compilation_config.cudagraph_mode)
+        cached = self._async_query_layout
+        if self._async_pending is not None and cached is not None and cached[0] == signature:
+            # The caller's SP adjustment can still write the host dummy row.
+            if num_tokens_padded == 2 * num_reqs and cached[1] > num_reqs_padded:
+                self._ensure_host_staging_ready()
+            return cached[1]
+        self._ensure_host_staging_ready()
+        self._async_query_layout = None
+        result = super()._pad_query_start_loc_for_fia(*args)
+        self._async_query_layout = signature, result
         return result
 
     def _copy_valid_sampled_token_count(self, next_token_ids, valid_sampled_tokens_count):
@@ -150,6 +217,7 @@ class AsyncSFAModelRunner(NPUModelRunner):
         ):
             return False
         ids = tuple(batch.req_ids)
+        sampled, draft = batch.prev_sampled_token_ids, self._draft_token_ids
         if (
             ids != s.ids
             or set(scheduled.num_scheduled_tokens) != set(ids)
@@ -163,8 +231,13 @@ class AsyncSFAModelRunner(NPUModelRunner):
                 for request in s.requests
                 for field in ("structured_outputs", "logits_processors", "min_tokens")
             )
-            or not isinstance(self._draft_token_ids, torch.Tensor)
-            or tuple(self._draft_token_ids.shape) != (len(ids), 1)
+            or not isinstance(draft, torch.Tensor)
+            or tuple(draft.shape) != (len(ids), 1)
+            or not isinstance(sampled, torch.Tensor)
+            or tuple(sampled.shape) != (len(ids), 1)
+            or sampled.dtype != self.input_ids.gpu.dtype or sampled.dtype != torch.int32
+            or draft.dtype not in (torch.int32, torch.int64)
+            or sampled.device != draft.device or sampled.device != self.input_ids.gpu.device
         ):
             return False
         cached = scheduled.scheduled_cached_reqs
@@ -204,11 +277,14 @@ class AsyncSFAModelRunner(NPUModelRunner):
     def _update_states(self, scheduler_output):
         self._async_pending = scheduler_output if self._eligible(scheduler_output) else None
         if self._async_pending is None:
+            self._ensure_host_staging_ready()
             self._async_snapshot = None
             super()._update_states(scheduler_output)
 
     def _prepare_inputs(self, scheduler_output, num_scheduled_tokens):
         if self._async_pending is None:
+            self._ensure_host_staging_ready()
+            self._async_query_layout = None
             return super()._prepare_inputs(scheduler_output, num_scheduled_tokens)
         n = self.input_batch.num_reqs
         self.attn_state, self.with_prefill = AscendAttentionState.SpecDecoding, False
@@ -233,6 +309,7 @@ class AsyncSFAModelRunner(NPUModelRunner):
     def _apply_staged_sfa_route(self, route):
         key = super()._apply_staged_sfa_route(route)
         if self._async_pending is not None and key != self._async_snapshot.key:
+            self._ensure_host_staging_ready()
             scheduled = self._reconcile()
             self._async_snapshot = None
             self._prepare_inputs(scheduled, np.full(self.input_batch.num_reqs, 2, dtype=np.int32))
