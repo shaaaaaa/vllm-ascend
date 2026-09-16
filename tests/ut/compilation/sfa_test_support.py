@@ -26,7 +26,8 @@ def load_module(path, name, monkeypatch):
 
 def extract(path, name, namespace):
     node = next(
-        n for n in ast.walk(ast.parse(path.read_text(encoding="utf8")))
+        n
+        for n in ast.walk(ast.parse(path.read_text(encoding="utf8")))
         if isinstance(n, ast.FunctionDef) and n.name == name
     )
     node.decorator_list = []
@@ -83,3 +84,24 @@ class HostTL:
             torch.as_tensor(ptr.offset), torch.as_tensor(value), torch.as_tensor(mask)
         )
         ptr.data[offsets[mask].long()] = values[mask].to(ptr.data.dtype)
+
+
+class AsyncMTPTokenKernel:
+    """Run the production token kernel's address arithmetic on CPU tensors."""
+
+    def __init__(self, events=None):
+        self.tl = HostTL()
+        self.body = extract(
+            ROOT / "vllm_ascend/ops/triton/spec_decode/async_mtp.py", "prepare_async_mtp_tokens_kernel", {"tl": self.tl}
+        )
+        self.events = events
+
+    def __getitem__(self, grid):
+        def launch(*args, **kwargs):
+            if self.events is not None:
+                self.events.append("token_kernel")
+            for pid in range(grid[0]):
+                self.tl.pid = pid
+                self.body(*(Pointer(t) for t in args[:4]), *args[4:], **kwargs)
+
+        return launch

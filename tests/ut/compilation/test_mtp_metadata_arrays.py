@@ -12,7 +12,7 @@ from types import MethodType, SimpleNamespace
 import numpy as np
 import pytest
 import torch
-from sfa_test_support import extract
+from sfa_test_support import AsyncMTPTokenKernel, extract
 from torch.utils._python_dispatch import TorchDispatchMode
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -246,6 +246,7 @@ def test_validated_async_preparation_reuses_fixed_helpers(
     baseline = runner(methods)
     baseline._fixed_mtp_metadata = None
     subject._async_pending = object()
+    subject._async_padded_logits = None
     subject.uniform_decode_query_len = 2
     subject._fixed_decode_cu_num_tokens = subject._fixed_decode_cu_num_tokens.astype(index_dtype)
     subject.input_batch = SimpleNamespace(
@@ -253,13 +254,15 @@ def test_validated_async_preparation_reuses_fixed_helpers(
         prev_sampled_token_ids=torch.arange(requests, dtype=torch.int32).view(-1, 1),
     )
     subject._draft_token_ids = torch.arange(requests, dtype=draft_dtype).view(-1, 1) + 100
-    path = ROOT / "vllm_ascend/worker/model_runner_v1.py"
-    subject._prepare_fixed_mtp_input_ids = MethodType(extract(path, "_prepare_fixed_mtp_input_ids", {}), subject)
     prepare = extract(
         ROOT / "vllm_ascend/worker/sfa_async_mtp.py",
         "_prepare_inputs",
         dict(
-            torch=torch, AscendAttentionState=SimpleNamespace(SpecDecoding="spec"), lmhead_tp_enable=lambda: lmhead_tp
+            torch=torch,
+            AscendAttentionState=SimpleNamespace(SpecDecoding="spec"),
+            lmhead_tp_enable=lambda: lmhead_tp,
+            prepare_async_mtp_tokens_kernel=AsyncMTPTokenKernel(),
+            triton=SimpleNamespace(cdiv=lambda n, d: (n + d - 1) // d),
         ),
     )
 
@@ -269,6 +272,7 @@ def test_validated_async_preparation_reuses_fixed_helpers(
     subject._prepare_input_ids = subject._calc_spec_decode_metadata = forbidden
     monkeypatch.setattr(np, "ones", forbidden)
     padding = subject.input_ids.gpu[2 * requests :].clone()
+    previous_logits = previous_spec = previous_draft = None
     for step in range(2):
         subject.input_batch.prev_sampled_token_ids.add_(7)
         subject._draft_token_ids.add_(11)
@@ -277,7 +281,16 @@ def test_validated_async_preparation_reuses_fixed_helpers(
         expected = methods[0]["_calc_spec_decode_metadata"](
             baseline, np.full(requests, 1, dtype=np.int32), subject._fixed_decode_cu_num_tokens[:requests], None
         )
-        logits, actual, count = prepare(subject, None, None)
+        with monkeypatch.context() as patch:
+            if step:
+                patch.setattr(torch.nn.functional, "pad", forbidden)
+            logits, actual, count = prepare(subject, None, None)
+        if step:
+            if lmhead_tp:
+                assert logits is previous_logits
+            torch.testing.assert_close(previous_spec.draft_token_ids, previous_draft)
+        previous_logits, previous_spec = logits, actual
+        previous_draft = actual.draft_token_ids.clone()
         compare(actual, expected)
         assert count == 2 * requests
         torch.testing.assert_close(subject.input_ids.gpu[2 * requests :], padding)

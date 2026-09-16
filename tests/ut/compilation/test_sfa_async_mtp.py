@@ -14,7 +14,7 @@ from typing import Any
 import numpy as np
 import pytest
 import torch
-from sfa_test_support import HostTL, Pointer, extract, load_module
+from sfa_test_support import AsyncMTPTokenKernel, HostTL, Pointer, extract, load_module
 from torch.utils._python_dispatch import TorchDispatchMode
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -137,6 +137,7 @@ def setup():
         StagedSFARouteReason=SimpleNamespace(ELIGIBLE="eligible"),
         AscendAttentionState=SimpleNamespace(SpecDecoding="decode"),
         prepare_async_mtp_kernel=Kernel(events),
+        prepare_async_mtp_tokens_kernel=AsyncMTPTokenKernel(events),
         get_cos_and_sin_mla=rope,
         triton=SimpleNamespace(cdiv=lambda n, d: (n + d - 1) // d),
     )
@@ -181,7 +182,7 @@ def setup():
     runner.seq_lens, runner.positions = Buffer(4), Buffer(capacity, torch.int64)
     runner.input_ids = Buffer(capacity)
     runner._async_live_execute = False
-    runner._async_host_write = runner._async_query_layout = None
+    runner._async_host_write = runner._async_query_layout = runner._async_padded_logits = None
     runner.prepare_inputs_event = None
     runner.positions.gpu[: 2 * n] = torch.from_numpy(np.repeat(bases, 2) + np.tile([0, 1], n))
     runner.seq_lens.np[:n] = bases + 2
@@ -282,7 +283,7 @@ def test_replay_precedes_real_count_readback_and_cpu_update(setup):
     assert common.seq_lens_cpu is None and metadata["l0"].seq_lens_cpu is None
     assert np.array_equal(runner.input_batch.num_computed_tokens_cpu, original)
     assert runner._model_forward() == "output"
-    assert events == ["input_ids", "kernel", "rope", "replay", "sync", "state_update"]
+    assert events == ["token_kernel", "kernel", "rope", "replay", "sync", "state_update"]
     expected = original + np.array([1, 2, 1])
     assert runner.input_batch.num_computed_tokens_cpu.tolist() == expected.tolist()
     assert runner.positions.gpu[:6].tolist() == (np.repeat(expected, 2) + [0, 1, 0, 1, 0, 1]).tolist()
@@ -366,7 +367,7 @@ def test_changed_graph_key_reconciles_without_submitting_metadata_kernel(setup):
     r._update_states(s)
     r._prepare_inputs(s, np.array([2, 2, 2]))
     assert r._apply_staged_sfa_route(None) is None
-    assert events == ["input_ids", "sync", "state_update", "normal_prepare"]
+    assert events == ["token_kernel", "sync", "state_update", "normal_prepare"]
     assert r._async_pending is None and r._async_snapshot is None
 
 
@@ -567,7 +568,7 @@ def test_kernel_warmup_is_after_capture_and_uses_private_outputs(setup, monkeypa
     )
     before = tuple(t.clone() for t in (r.positions.gpu, r.seq_lens.gpu, r.item.slot_mapping))
     assert r.capture_model() == "captured"
-    assert events == ["capture", "kernel", "next_token_warmup", "startup_sync"]
+    assert events == ["capture", "kernel", "token_kernel", "token_kernel", "next_token_warmup", "startup_sync"]
     for current, old in zip((r.positions.gpu, r.seq_lens.gpu, r.item.slot_mapping), before):
         torch.testing.assert_close(current, old, rtol=0, atol=0)
 

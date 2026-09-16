@@ -43,3 +43,14 @@ def prepare_async_mtp_kernel(
         tl.store(positions + token, tl.where(active, position, 0), token < token_capacity)
         tl.store(slots0 + token, tl.where(active, block_id0 * block0 + position % block0, -1), token < token_capacity)
         tl.store(slots1 + token, tl.where(active, block_id1 * block1 + position % block1, -1), token < token_capacity)
+
+
+@triton.jit(do_not_specialize=["num_reqs"])
+def prepare_async_mtp_tokens_kernel(sampled, draft, input_ids, draft_ids, num_reqs, BLOCK: tl.constexpr):
+    rows = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    active = rows < num_reqs
+    sample = tl.load(sampled + rows, active, other=0)
+    proposal = tl.load(draft + rows, active, other=0).to(tl.int32)
+    tl.store(input_ids + 2 * rows, sample, active)
+    tl.store(input_ids + 2 * rows + 1, proposal, active)
+    tl.store(draft_ids + rows, proposal, active)

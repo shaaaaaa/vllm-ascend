@@ -1666,12 +1666,14 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
         rows[:, 0].copy_(self.input_batch.prev_sampled_token_ids[:, 0], non_blocking=True)
         rows[:, 1].copy_(self._draft_token_ids[:, 0], non_blocking=True)
 
-    def _fixed_spec_decode_metadata(self, num_reqs: int, index_dtype) -> SpecDecodeMetadata:
+    def _fixed_spec_decode_metadata(
+        self, num_reqs: int, index_dtype, draft_token_ids: torch.Tensor
+    ) -> SpecDecodeMetadata:
         """Build metadata for a validated one-draft layout using fresh token IDs."""
         drafts, sampled, targets, bonus, logits32, logits64 = self._fixed_mtp_metadata
         bonus = bonus[:num_reqs]
         return SpecDecodeMetadata(
-            draft_token_ids=self.input_ids.gpu[bonus],
+            draft_token_ids=draft_token_ids,
             num_draft_tokens=[1] * num_reqs,
             cu_num_draft_tokens=drafts[:num_reqs],
             cu_num_sampled_tokens=sampled[:num_reqs],
@@ -1695,7 +1697,9 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
             and np.all(num_draft_tokens == 1)
             and np.array_equal(cu_num_scheduled_tokens, self._fixed_decode_cu_num_tokens[:num_reqs])
         ):
-            return self._fixed_spec_decode_metadata(num_reqs, cu_num_scheduled_tokens.dtype)
+            return self._fixed_spec_decode_metadata(
+                num_reqs, cu_num_scheduled_tokens.dtype, self.input_ids.gpu[fixed[3][:num_reqs]]
+            )
         # Inputs:
         # cu_num_scheduled_tokens:  [  4, 104, 107, 207, 209]
         # num_draft_tokens:         [  3,   0,   2,   0,   1]
