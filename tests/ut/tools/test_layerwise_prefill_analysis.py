@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """CPU-only concurrency and bounded-I/O regressions for saved KV analysis."""
 
+import hashlib
 import importlib.util
 import json
 import threading
@@ -30,12 +31,14 @@ def test_one_load_per_trace_and_cached_results_match_independent_comparisons(tmp
         "prefill": save_rows(tmp_path / "p.pt", [2, 0, 1]),
         "decode": save_rows(tmp_path / "d.pt", [2, 3]),
         "loaded": save_rows(tmp_path / "l.pt", [0, 1]),
+        "prefill_loaded": save_rows(tmp_path / "pl.pt", [0, 1]),
     }
     key = ("rank0", "layer0", "nope", "current")
     loader = Mock(wraps=torch.load)
     monkeypatch.setattr(torch, "load", loader)
-    actual, errors = CHECK.compare_trace_job((key, files, 3, cutoff))
+    actual, chunks, errors = CHECK.compare_trace_job((key, files, 3, cutoff, 2))
     assert errors == []
+    assert len(chunks) == 4
     counts = Counter(call.args[0] for call in loader.call_args_list)
     assert counts == {paths[0]: 1 for paths in files.values()}
     for row, (left, right, start, stop) in zip(
@@ -45,6 +48,7 @@ def test_one_load_per_trace_and_cached_results_match_independent_comparisons(tmp
             ("prefill", "loaded", 0, 3),
             ("baseline", "decode", 3, cutoff),
             ("baseline", "decode", 0, 3),
+            ("prefill", "prefill_loaded", 0, 3),
         ],
         strict=True,
     ):
@@ -176,3 +180,143 @@ def test_analysis_worker_limit_is_positive(tmp_path):
     assert CHECK.parser().parse_args(["--analysis-workers", "4"]).analysis_workers == 4
     with pytest.raises(ValueError, match="positive"):
         CHECK.analyse(tmp_path, 1, workers=0)
+
+
+def test_real_9565_token_three_chunk_drift_and_prefill_reload_corruption(tmp_path):
+    length = 9565
+    base = torch.arange(length, dtype=torch.float64).reshape(-1, 1)
+    prefill = base.clone()
+    prefill[4096:8192] += 1
+    prefill[8192:] += 2
+    reloaded = prefill[:8192].clone()
+    reloaded[4100] += 10  # Only the reload is damaged, not P's own original KV.
+    files = {}
+    for name, pos, values in (
+        ("baseline", torch.arange(length), base),
+        ("prefill", torch.arange(length), prefill),
+        ("prefill_loaded", torch.arange(8192), reloaded),
+        ("loaded", torch.arange(length), prefill),
+        ("decode", torch.tensor([9564]), prefill[-1:]),
+    ):
+        path = tmp_path / f"{name}.pt"
+        torch.save({"positions": pos, "values": values}, path)
+        files[name] = [path]
+    hashes = {name: hashlib.sha256(paths[0].read_bytes()).hexdigest() for name, paths in files.items()}
+    rows, chunks, errors = CHECK.compare_trace_job(
+        (("rank0", "model.layers.2.self_attn.attn", "nope", "current"), files, length, length, 4096)
+    )
+    assert errors == []
+    written = [row for row in chunks if row["comparison"] == "prefill_written"]
+    assert [(r["position_start"], r["position_end_exclusive"]) for r in written] == [
+        (0, 4096),
+        (4096, 8192),
+        (8192, 9565),
+    ]
+    assert [r["matched_rows"] for r in written] == [4096, 4096, 1373]
+    assert [r["stats"]["abs_diff"]["mean"] for r in written] == [0, 1, 2]
+    reloads = [row for row in chunks if row["comparison"] == "prefill_reloaded"]
+    assert reloads[0]["stats"]["abs_diff"]["max"] == 0
+    assert reloads[1]["stats"]["abs_diff"]["max"] == 10
+    assert reloads[1]["stats"]["abs_diff"]["mean"] == pytest.approx(10 / 4096)
+    assert reloads[2]["status"] == "not_observed" and "stats" not in reloads[2]
+    total_reload = next(row for row in rows if row["comparison"] == "prefill_reloaded")
+    assert total_reload["matched_rows"] == 8192
+    assert total_reload["baseline_only_rows"] == 1373
+    assert total_reload["stats"]["abs_diff"]["mean"] == pytest.approx(10 / 8192)
+    total_written = next(row for row in rows if row["comparison"] == "prefill_written")
+    reference = CHECK.tensor_statistics(base, prefill)
+    for metric in reference:
+        assert total_written["stats"][metric] == pytest.approx(reference[metric])
+    assert {name: hashlib.sha256(paths[0].read_bytes()).hexdigest() for name, paths in files.items()} == hashes
+
+
+def test_nonfinite_statistics_survive_position_band_merge(tmp_path):
+    positions = torch.arange(6)
+    base = torch.tensor([0, 1, float("nan"), 3, 4, 5], dtype=torch.float64).reshape(-1, 1)
+    other = torch.tensor([0, float("inf"), 2, 2.5, 4, 6], dtype=torch.float64).reshape(-1, 1)
+    for path, values in ((tmp_path / "a.pt", base), (tmp_path / "b.pt", other)):
+        torch.save({"positions": positions, "values": values}, path)
+    cache = {}
+    reports = [CHECK.compare_rows([tmp_path / "a.pt"], [tmp_path / "b.pt"], i, i + 2, cache) for i in range(0, 6, 2)]
+    combined = CHECK.merge_comparisons(reports)
+    reference = CHECK.tensor_statistics(base, other)
+    for metric in reference:
+        assert combined["stats"][metric] == pytest.approx(reference[metric])
+    assert combined["stats"]["abs_diff"]["nonfinite"] == 2
+    json.dumps(combined, allow_nan=False)
+
+
+@pytest.mark.parametrize(
+    "source,field",
+    [
+        ("run.json", "prefill_chunk_tokens"),
+        ("prefill/engine_options.json", "max_num_batched_tokens"),
+        ("baseline/engine_options.json", "max_num_batched_tokens"),
+    ],
+)
+def test_analysis_uses_original_compute_chunk_size(tmp_path, source, field):
+    path = tmp_path / source
+    path.parent.mkdir(parents=True, exist_ok=True)
+    CHECK.write_json(path, {field: 3072})
+    assert CHECK.saved_prefill_chunk_size(tmp_path) == (3072, source)
+
+
+def test_prefill_engine_options_win_and_legacy_fallback_is_explicit(tmp_path):
+    assert CHECK.saved_prefill_chunk_size(tmp_path) == (4096, "fallback_default_4096")
+    CHECK.write_json(tmp_path / "run.json", {"prefill_chunk_tokens": 4096})
+    (tmp_path / "prefill").mkdir()
+    CHECK.write_json(tmp_path / "prefill/engine_options.json", {"max_num_batched_tokens": 2048})
+    assert CHECK.saved_prefill_chunk_size(tmp_path) == (2048, "prefill/engine_options.json")
+
+
+@pytest.mark.parametrize("bad", [0, -1, 3.5, "4096", True])
+def test_invalid_saved_chunk_size_is_not_silently_replaced(tmp_path, bad):
+    CHECK.write_json(tmp_path / "run.json", {"prefill_chunk_tokens": bad})
+    with pytest.raises(ValueError, match="Invalid saved"):
+        CHECK.saved_prefill_chunk_size(tmp_path)
+
+
+def test_layers_are_sorted_numerically_and_missing_reload_is_not_printed_as_zero(capsys):
+    rows = [
+        {
+            "rank": "rank0",
+            "layer": f"model.layers.{index}.self_attn.attn",
+            "part": "nope",
+            "comparison": "prefill_reloaded",
+            "status": "not_observed",
+            "matched_rows": 0,
+            "candidate_rows": 0,
+        }
+        for index in (10, 2, 1)
+    ]
+    rows.sort(key=CHECK.kv_row_sort_key)
+    assert [row["layer"] for row in rows] == [f"model.layers.{index}.self_attn.attn" for index in (1, 2, 10)]
+    CHECK.print_prefill_diagnostics(rows, [])
+    output = capsys.readouterr().out
+    assert output.count("status=not_observed") == 3
+    assert "mean=None,max=None" in output
+    assert "mean=0" not in output
+
+
+@pytest.mark.parametrize(
+    "base,candidate,matched,status",
+    [
+        (10, 0, 0, "not_observed"),
+        (0, 10, 0, "missing_reference"),
+        (10, 10, 0, "no_overlap"),
+        (10, 10, 5, "partial_overlap"),
+        (10, 5, 5, "compared"),
+    ],
+)
+def test_reload_coverage_status(base, candidate, matched, status):
+    assert (
+        CHECK.comparison_status(
+            {
+                "baseline_rows": base,
+                "candidate_rows": candidate,
+                "matched_rows": matched,
+                "candidate_only_rows": candidate - matched,
+            }
+        )
+        == status
+    )

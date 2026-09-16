@@ -63,6 +63,9 @@ python -u tools/layerwise_prefill_check.py 2>&1 | tee log.log
 - `baseline/archive/`、`prefill/archive/`：实际 LMCache 保存的数据。
 - `kv_statistics.csv`：逐 rank/层/分量，baseline 与候选值及其绝对值的均值、
   总体方差、最大值；`diff = candidate - baseline` 和 `abs_diff` 的同类统计。
+- `kv_chunk_statistics.csv`：按 prefill token 位置区间拆分的上述统计，包含
+  `prefill_written`（baseline 写出 vs P 写出）和 `prefill_reloaded`（P 写出 vs P 回灌）。
+  两种对比均覆盖所有已记录的 rank/层/分量，按层号自然排序。
 - `summary.json`：上述统计、持久化 KV 的逐组/层对比、缓存命中证据、
   输出 token 是否相同及首次分叉的位置。
 - `analysis_progress.jsonl`：每项统计完成即追加结果、耗时和分析进程 PID；
@@ -90,10 +93,30 @@ decode 的 KV 只在两次输出的共同 token 前缀内进行数值对比；�
 不冒充已验证，覆盖行数在 CSV 中单独列出。Indexer 按自己的 block table 对齐。
 历史行只记录首次消费，当前 token 写入全部记录。
 
+`prefill_reloaded` 的参考值是 **P 自己写出的 KV**，不是 baseline 的 KV；因此可以
+单独判断已观测到的 P 历史回灌是否保持数据不变，不把 baseline/P 的计算差异混进来。
+这些统计位于 `summary.json` 的 `kv`（整层）和 `kv_by_prefill_chunk`（分区间）中。
+`status: compared` 只表示观测行有对应参考值，不代表数值相等；`not_observed` 表示没有
+加载记录，统计值留空，绝不当成差异为零。覆盖行数与非有限值计数仍需一起查看。
+
+分区大小优先读取原运行的 `prefill/engine_options.json` 中的 `max_num_batched_tokens`，
+其次读取 `run.json`，再读取 baseline 的 engine options；旧结果都未记录时才使用 4096，
+并在日志和 summary 中明确标出来源。对于 9565-token prompt、4096-token 预算，
+区间为 `[0,4096)`、`[4096,8192)`、`[8192,9565)`。这是按原计算预算划分的
+**源 token 位置区间**，不是实际调度 step 或加载时间：例如第三次 forward 中加载的
+早期 token，仍属于它自己的源位置区间。
+
+旧探针只保存同一 token 的首次观测加载，后续重复回灌没有留档，不能通过离线分析补出。
+P 最后一个区间没有后续 prefill 计算使用时，没有回灌记录是正常的；报告不会宣称它已验证。
+控制台新增 `[PREFILL_CHUNK]` 和 `[PREFILL_RELOAD]`，仅打印 rank0 的 latent-nope
+逐层摘要；indexer、pe 和其他 rank 的完整均值、方差、最大值及覆盖数在 CSV/JSON 中。
+分区统计合并得到整层结果，不重复做一遍整层张量归约，同一任务仍只读取一次原始文件。
+
 无需重新跑模型即可重新汇总：
 
 ```bash
 python -u tools/layerwise_prefill_check.py --analyse-only --run-dir /实际结果目录 2>&1 | tee log.log
+grep -aE '\[PREFILL_(CHUNK|RELOAD)\]' log.log
 ```
 
 先停止仍在运行的旧统计进程，避免同时读同一批 KV、同时写同一份报告。

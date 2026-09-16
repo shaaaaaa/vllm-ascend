@@ -747,6 +747,7 @@ def test_real_worker_hooks_observe_writes_and_loads(monkeypatch, tmp_path, reque
 def test_three_pass_report_keeps_small_differences_and_real_output_divergence(
     connector_module, tmp_path, missing_prefill_trace, workers
 ):
+    CHECK.write_json(tmp_path / "run.json", {"prefill_chunk_tokens": 2})
     for stage, tokens in (("baseline", [7, 8]), ("prefill", [7]), ("decode", [7, 9])):
         directory = tmp_path / stage
         directory.mkdir()
@@ -765,6 +766,8 @@ def test_three_pass_report_keeps_small_differences_and_real_output_divergence(
             rec.save("layer", part, "current", positions, cache, positions)
             if stage == "decode":
                 rec.save("layer", part, "loaded", torch.arange(3), cache, torch.arange(3))
+            if stage == "prefill":
+                rec.save("layer", part, "loaded", torch.arange(2), cache, torch.arange(2))
             if stage != "prefill":
                 rec.save("layer", part, "current", torch.tensor([4]), cache, torch.tensor([4]))
         rec.flush()
@@ -814,7 +817,7 @@ def test_three_pass_report_keeps_small_differences_and_real_output_divergence(
             serial = json.loads((tmp_path / "summary.json").read_text(encoding="utf-8"))
         else:
             serial = CHECK.analyse(tmp_path, 1, workers=1)
-        for field in ("kv", "persisted_kv", "structural_errors", "reload", "tokens_equal"):
+        for field in ("kv", "kv_by_prefill_chunk", "persisted_kv", "structural_errors", "reload", "tokens_equal"):
             assert result[field] == serial[field]
     elif missing_prefill_trace:
         with pytest.raises(RuntimeError, match="Trace coverage incomplete; report saved"):
@@ -828,6 +831,11 @@ def test_three_pass_report_keeps_small_differences_and_real_output_divergence(
     assert result["first_different_output_token_index"] == 1
     assert result["decode_compare_position_exclusive"] == 5
     assert (tmp_path / "kv_statistics.csv").is_file()
+    assert (tmp_path / "kv_chunk_statistics.csv").is_file()
+    assert result["prefill_chunk_tokens"] == 2
+    assert result["prefill_chunk_size_source"] == "run.json"
+    reloads = [row for row in result["kv"] if row["comparison"] == "prefill_reloaded"]
+    assert len(reloads) == 3
     if missing_prefill_trace:
         errors = result["structural_errors"]
         assert any("Incomplete prefill trace" in error for error in errors)
@@ -835,10 +843,19 @@ def test_three_pass_report_keeps_small_differences_and_real_output_divergence(
         assert not any("No observed NPU reload" in error for error in errors)
         assert result["persisted_kv"]["common_keys"] == 2
         assert all(row["stats"]["abs_diff"]["max"] == 0 for row in result["persisted_kv"]["per_layer"])
+        assert all(row["status"] == "not_observed" and "stats" not in row for row in reloads)
         return
     assert result["structural_errors"] == []
     written = [row for row in result["kv"] if row["comparison"] == "prefill_written"]
     assert all(0 < row["stats"]["abs_diff"]["mean"] < 1e-7 for row in written)
+    assert all(row["matched_rows"] == 2 and row["stats"]["abs_diff"]["max"] == 0 for row in reloads)
+    assert all(row["status"] == "compared" for row in reloads)
+    last_band_reload = [
+        row
+        for row in result["kv_by_prefill_chunk"]
+        if row["comparison"] == "prefill_reloaded" and row["chunk_index"] == 1
+    ]
+    assert all(row["status"] == "not_observed" and "stats" not in row for row in last_band_reload)
 
 
 def test_decode_probe_batches_files_without_losing_rows_or_duplicate_writes(tmp_path):

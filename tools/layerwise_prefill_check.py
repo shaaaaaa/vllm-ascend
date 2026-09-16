@@ -14,6 +14,7 @@ import hashlib
 import json
 import multiprocessing
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -30,6 +31,7 @@ from pathlib import Path
 
 CHUNK_SIZE = 256
 MAX_MODEL_LEN = 16384
+DEFAULT_PREFILL_CHUNK_TOKENS = 4096
 DEFAULT_ANALYSIS_WORKERS = 64
 ARCHIVE_BATCH_FILES = 64
 ANALYSIS_PROGRESS_SECONDS = 5
@@ -458,6 +460,64 @@ def compare_rows(base_files, candidate_files, start, stop, cache=None):
     return report
 
 
+def merge_comparisons(reports):
+    """Combine disjoint position bands without evaluating tensor stats twice."""
+    result = {
+        field: sum(row[field] for row in reports)
+        for field in ("baseline_rows", "candidate_rows", "matched_rows", "baseline_only_rows", "candidate_only_rows")
+    }
+    metrics = {}
+    for row in reports:
+        for name, stats in row.get("stats", {}).items():
+            partial = Moments()
+            partial.n = stats["count"]
+            partial.mean = stats["mean"] if partial.n else 0.0
+            partial.m2 = stats["variance"] * partial.n if partial.n else 0.0
+            partial.maximum = stats["max"]
+            partial.nonfinite = stats["nonfinite"]
+            metrics.setdefault(name, Moments()).merge(partial)
+    if metrics:
+        result["stats"] = {name: value.result() for name, value in metrics.items()}
+    return result
+
+
+def comparison_status(report):
+    if not report["candidate_rows"]:
+        return "not_observed"
+    if not report["baseline_rows"]:
+        return "missing_reference"
+    if not report["matched_rows"]:
+        return "no_overlap"
+    if report["candidate_only_rows"]:
+        return "partial_overlap"
+    return "compared"
+
+
+def saved_prefill_chunk_size(root):
+    # Analyse-only must use the original run's size, not today's CLI default.
+    for relative, field in (
+        ("prefill/engine_options.json", "max_num_batched_tokens"),
+        ("run.json", "prefill_chunk_tokens"),
+        ("baseline/engine_options.json", "max_num_batched_tokens"),
+    ):
+        path = root / relative
+        if path.is_file():
+            value = json.loads(path.read_text(encoding="utf-8")).get(field)
+            if value is None:
+                continue
+            if type(value) is not int or value <= 0:
+                raise ValueError(f"Invalid saved prefill chunk size in {path}: {value!r}")
+            return value, relative
+    return DEFAULT_PREFILL_CHUNK_TOKENS, "fallback_default_4096"
+
+
+def kv_row_sort_key(row):
+    def natural(value):
+        return tuple(int(item) if item.isdigit() else item for item in re.split(r"(\d+)", value))
+
+    return (natural(row["rank"]), natural(row["layer"]), row["part"], row["comparison"], row.get("position_start", 0))
+
+
 def init_analysis_worker():
     # Spawned CPU-only workers do not inherit the model/NPU runtime. Avoid each
     # of the processes starting another full-size OpenMP thread pool.
@@ -524,18 +584,39 @@ def analysis_results(function, jobs, executor, workers, phase):
 
 
 def compare_trace_job(job):
-    key, files, length, cutoff = job
+    key, files, length, cutoff, prefill_chunk_tokens = job
     rank, layer, part, _ = key
     cache = {}  # One rank/layer/part only; released before this worker's next job.
-    rows, errors = [], []
+    rows, chunk_rows, errors = [], [], []
     for label, left, right, start, stop in (
         ("prefill_written", "baseline", "prefill", 0, length),
         ("decode_reloaded", "prefill", "loaded", 0, length),
         ("decode_written_same_prefix", "baseline", "decode", length, cutoff),
         ("decode_recomputed_prompt_tail", "baseline", "decode", 0, length),
+        ("prefill_reloaded", "prefill", "prefill_loaded", 0, length),
     ):
         row = {"comparison": label, "rank": rank, "layer": layer, "part": part}
-        row.update(compare_rows(files[left], files[right], start, stop, cache))
+        if label in ("prefill_written", "prefill_reloaded"):
+            bands = []
+            for chunk_index, chunk_start in enumerate(range(0, length, prefill_chunk_tokens)):
+                chunk_stop = min(chunk_start + prefill_chunk_tokens, length)
+                report = compare_rows(files[left], files[right], chunk_start, chunk_stop, cache)
+                bands.append(report)
+                chunk_rows.append(
+                    {
+                        **row,
+                        "chunk_index": chunk_index,
+                        "position_start": chunk_start,
+                        "position_end_exclusive": chunk_stop,
+                        **report,
+                        "status": comparison_status(report),
+                    }
+                )
+            row.update(merge_comparisons(bands))
+        else:
+            row.update(compare_rows(files[left], files[right], start, stop, cache))
+        if label == "prefill_reloaded":
+            row["status"] = comparison_status(row)
         if label == "prefill_written" and row["matched_rows"] != length:
             errors.append(f"Incomplete prefill trace: {rank}/{layer}/{part}")
         if label == "decode_reloaded":
@@ -548,7 +629,7 @@ def compare_trace_job(job):
         if label == "decode_recomputed_prompt_tail" and row["candidate_rows"] > CHUNK_SIZE:
             errors.append(f"D recomputed more than the uncached prompt tail: {rank}/{layer}/{part}")
         rows.append(row)
-    return rows, errors
+    return rows, chunk_rows, errors
 
 
 def compare_archive_job(job):
@@ -693,7 +774,7 @@ def analyse(root, ranks, workers=DEFAULT_ANALYSIS_WORKERS):
         raise RuntimeError("Three runs used different prompts")
     mismatch = first_difference(outputs["baseline"]["token_ids"], outputs["decode"]["token_ids"])
     cutoff = length + (mismatch if mismatch is not None else len(outputs["baseline"]["token_ids"]))
-    rows, errors = [], []
+    rows, chunk_rows, errors = [], [], []
     summary = {
         "analysis_status": "running",
         "analysis_workers": workers,
@@ -708,6 +789,13 @@ def analyse(root, ranks, workers=DEFAULT_ANALYSIS_WORKERS):
         "reload": None,
         "structural_errors": errors,
         "kv": rows,
+        "kv_by_prefill_chunk": chunk_rows,
+        "prefill_reload_scope": (
+            "P current writes vs P loaded rows at first observed consumption only; "
+            "repeated loads of the same position were not recorded. Position bands "
+            "refer to source tokens, NOT the step that reloaded them. Missing rows "
+            "are not evidence of equality."
+        ),
         "persisted_kv": None,
     }
     last_snapshot = started
@@ -727,6 +815,14 @@ def analyse(root, ranks, workers=DEFAULT_ANALYSIS_WORKERS):
         flush=True,
     )
     try:
+        prefill_chunk_tokens, chunk_size_source = saved_prefill_chunk_size(root)
+        summary["prefill_chunk_tokens"] = prefill_chunk_tokens
+        summary["prefill_chunk_size_source"] = chunk_size_source
+        print(
+            f"[PREFILL_CHECK] prefill position bands: size={prefill_chunk_tokens}, source={chunk_size_source}; "
+            "P reload compares first-observed rows only",
+            flush=True,
+        )
         indices = {stage: read_index(root / stage) for stage in STAGES}
         base_keys = {key for key in indices["baseline"] if key[-1] == "current"}
         if {key[0] for key in base_keys} != {f"rank{i}" for i in range(ranks)}:
@@ -740,7 +836,8 @@ def analyse(root, ranks, workers=DEFAULT_ANALYSIS_WORKERS):
         for key in sorted(base_keys):
             files = {stage: indices[stage].get(key, []) for stage in STAGES}
             files["loaded"] = indices["decode"].get((*key[:3], "loaded"), [])
-            jobs.append((key, files, length, cutoff))
+            files["prefill_loaded"] = indices["prefill"].get((*key[:3], "loaded"), [])
+            jobs.append((key, files, length, cutoff, prefill_chunk_tokens))
         try:
             reload = validate_reload(root, length)
             verify_archive_reads(root)
@@ -766,13 +863,24 @@ def analyse(root, ranks, workers=DEFAULT_ANALYSIS_WORKERS):
                 if time.monotonic() - last_snapshot >= ANALYSIS_PROGRESS_SECONDS:
                     snapshot()
 
-            for index, (new_rows, new_errors), timing in analysis_results(
+            for index, (new_rows, new_chunk_rows, new_errors), timing in analysis_results(
                 compare_trace_job, jobs, executor, workers, "kv"
             ):
                 rows.extend(new_rows)
+                chunk_rows.extend(new_chunk_rows)
                 errors.extend(new_errors)
-                record({"phase": "kv", "key": jobs[index][0], "rows": new_rows, "errors": new_errors, **timing})
-            rows.sort(key=lambda row: (row["rank"], row["layer"], row["part"], row["comparison"]))
+                record(
+                    {
+                        "phase": "kv",
+                        "key": jobs[index][0],
+                        "rows": new_rows,
+                        "chunk_rows": new_chunk_rows,
+                        "errors": new_errors,
+                        **timing,
+                    }
+                )
+            rows.sort(key=kv_row_sort_key)
+            chunk_rows.sort(key=kv_row_sort_key)
             snapshot()
             archive = compare_archives(root, executor, workers, record)
             if not archive["common_keys"]:
@@ -787,28 +895,11 @@ def analyse(root, ranks, workers=DEFAULT_ANALYSIS_WORKERS):
     summary["analysis_status"] = "complete"
     summary["analysis_phase"] = "complete"
     snapshot()
-    fields = [
-        "comparison",
-        "rank",
-        "layer",
-        "part",
-        "baseline_rows",
-        "candidate_rows",
-        "matched_rows",
-        "baseline_only_rows",
-        "candidate_only_rows",
-    ]
-    for metric in ("baseline", "candidate", "baseline_abs", "candidate_abs", "diff", "abs_diff"):
-        fields.extend(f"{metric}_{stat}" for stat in ("mean", "variance", "max", "nonfinite"))
-    with (root / "kv_statistics.csv").open("w", encoding="utf-8", newline="") as file:
-        writer = csv.DictWriter(file, fieldnames=fields)
-        writer.writeheader()
-        for row in rows:
-            flat = {k: v for k, v in row.items() if k != "stats"}
-            for metric, stats in row.get("stats", {}).items():
-                flat.update({f"{metric}_{name}": value for name, value in stats.items() if name != "count"})
-            writer.writerow(flat)
+    write_kv_csv(root / "kv_statistics.csv", rows)
+    write_kv_csv(root / "kv_chunk_statistics.csv", chunk_rows, chunked=True)
     print(f"[PREFILL_CHECK] tokens_equal={mismatch is None}, first_difference={mismatch}; {root / 'kv_statistics.csv'}")
+    print(f"[PREFILL_CHECK] P reload and per-chunk statistics: {root / 'kv_chunk_statistics.csv'}", flush=True)
+    print_prefill_diagnostics(rows, chunk_rows)
     # Print rank0 per-layer summaries too; CSV/JSON retain every TP rank.
     for row in rows:
         if row["rank"] == "rank0" and row["comparison"] in ("prefill_written", "decode_written_same_prefix"):
@@ -825,6 +916,60 @@ def analyse(root, ranks, workers=DEFAULT_ANALYSIS_WORKERS):
     return summary
 
 
+def write_kv_csv(path, rows, chunked=False):
+    fields = [
+        "comparison",
+        "rank",
+        "layer",
+        "part",
+        "status",
+        "baseline_rows",
+        "candidate_rows",
+        "matched_rows",
+        "baseline_only_rows",
+        "candidate_only_rows",
+    ]
+    if chunked:
+        fields.extend(("chunk_index", "position_start", "position_end_exclusive"))
+    for metric in ("baseline", "candidate", "baseline_abs", "candidate_abs", "diff", "abs_diff"):
+        fields.extend(f"{metric}_{stat}" for stat in ("mean", "variance", "max", "nonfinite"))
+    with path.open("w", encoding="utf-8", newline="") as file:
+        writer = csv.DictWriter(file, fieldnames=fields)
+        writer.writeheader()
+        for row in rows:
+            flat = {k: v for k, v in row.items() if k != "stats"}
+            for metric, stats in row.get("stats", {}).items():
+                flat.update({f"{metric}_{name}": value for name, value in stats.items() if name != "count"})
+            writer.writerow(flat)
+
+
+def print_prefill_diagnostics(rows, chunk_rows):
+    # Compact log: one line per layer for rank0 latent-nope, not thousands of
+    # rank/part/chunk records. JSON/CSV retain every comparison and coverage.
+    by_layer = defaultdict(list)
+    for row in chunk_rows:
+        if row["rank"] == "rank0" and row["part"] == "nope" and row["comparison"] == "prefill_written":
+            by_layer[row["layer"]].append(row)
+    for layer, bands in by_layer.items():
+        details = []
+        for band in bands:
+            stats = band.get("stats", {}).get("abs_diff", {})
+            details.append(
+                f"[{band['position_start']},{band['position_end_exclusive']}):"
+                f"mean={stats.get('mean')},max={stats.get('max')},rows={band['matched_rows']}"
+            )
+        print(f"[PREFILL_CHUNK] {layer} nope " + "; ".join(details), flush=True)
+    for row in rows:
+        if row["rank"] == "rank0" and row["part"] == "nope" and row["comparison"] == "prefill_reloaded":
+            stats = row.get("stats", {}).get("abs_diff", {})
+            print(
+                f"[PREFILL_RELOAD] {row['layer']} nope status={row['status']} "
+                f"matched={row['matched_rows']}/{row['candidate_rows']} observed_load_rows; "
+                f"mean={stats.get('mean')},max={stats.get('max')}",
+                flush=True,
+            )
+
+
 def parser():
     cli = argparse.ArgumentParser(description=__doc__)
     cli.add_argument("--model", default="/workspace/models/GLM-5.2-w4a8c8-0723")
@@ -834,7 +979,7 @@ def parser():
         "--prompt-tokens", type=int, help="Optional minimum length check; never pads or truncates the fixed prompt"
     )
     cli.add_argument("--output-tokens", type=int, default=4000, help="Maximum generated tokens (not words); allow EOS")
-    cli.add_argument("--prefill-chunk-tokens", type=int, default=4096)
+    cli.add_argument("--prefill-chunk-tokens", type=int, default=DEFAULT_PREFILL_CHUNK_TOKENS)
     cli.add_argument("--cpu-cache-gb", type=float, default=8)
     cli.add_argument("--run-dir", type=Path)
     cli.add_argument("--stage", choices=STAGES, help=argparse.SUPPRESS)
