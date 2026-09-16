@@ -209,7 +209,9 @@ class AsyncSFAModelRunner(NPUModelRunner):
             or self.calculate_kv_scales
             or self.need_accepted_tokens
             or self.lora_config
-            or self.cascade_attn_enabled
+            # Ascend enables this flag globally; zero shared-prefix blocks
+            # cannot use cascade attention or need reconciled CPU positions.
+            or (self.cascade_attn_enabled and any(scheduled.num_common_prefix_blocks))
             or self.enable_prompt_embeds
             or self.input_batch.req_prompt_embeds
             or self.is_multimodal_model

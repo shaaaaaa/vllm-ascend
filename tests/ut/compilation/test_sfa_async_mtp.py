@@ -246,13 +246,14 @@ def setup():
         "calculate_kv_scales",
         "need_accepted_tokens",
         "lora_config",
-        "cascade_attn_enabled",
         "enable_prompt_embeds",
         "is_multimodal_model",
         "num_prompt_logprobs",
         "dynamic_eplb",
     ):
         setattr(runner, flag, False)
+    # Ascend normalizes disable_cascade_attn=False even when no batch uses it.
+    runner.cascade_attn_enabled = True
     runner.debugger = None
     runner.max_model_len = 16384
     runner.model_config = SimpleNamespace(is_hybrid=False, enable_return_routed_experts=False)
@@ -263,6 +264,7 @@ def setup():
         scheduled_encoder_inputs={},
         free_encoder_mm_hashes=[],
         num_scheduled_tokens=dict.fromkeys(ids, 2),
+        num_common_prefix_blocks=[0, 0],
         scheduled_spec_decode_tokens={rid: [-1] for rid in ids},
         scheduled_cached_reqs=SimpleNamespace(
             req_ids=list(ids), new_block_ids=[None] * n, num_computed_tokens=(bases + 2).tolist(), resumed_req_ids=set()
@@ -270,6 +272,53 @@ def setup():
         kv_connector_metadata=SimpleNamespace(reason="eligible", frontiers=(4096,) * n, cold=(), requests=[]),
     )
     return runner, scheduled, shape, events, ns
+
+
+def test_ascend_startup_cascade_flag_allows_zero_prefix_batch(setup):
+    runner, scheduled, shape, events, _ = setup
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(disable_cascade_attn=True),
+        cache_config=SimpleNamespace(enable_prefix_caching=False),
+        observability_config=None, scheduler_config=None, speculative_config=None,
+        kv_transfer_config=None, attention_config=None,
+    )
+    normalize = extract(
+        ROOT / "vllm_ascend/platform.py", "_fix_incompatible_config",
+        {"logger": SimpleNamespace(warning=lambda *args: None)},
+    )
+    normalize(config)
+    runner.cascade_attn_enabled = not config.model_config.disable_cascade_attn
+    assert runner.cascade_attn_enabled
+    # The real cascade calculation returns before reading unreconciled counts
+    # or consulting a backend whenever this group's shared prefix is empty.
+    cascade_prefix = extract(
+        ROOT.parent / "vllm/vllm/v1/worker/gpu_model_runner.py", "_compute_cascade_attn_prefix_len", {}
+    )
+    for blocks in scheduled.num_common_prefix_blocks:
+        assert cascade_prefix(runner, None, None, blocks, SimpleNamespace(block_size=128), None) == 0
+    assert runner._eligible(scheduled)
+    runner._update_states(scheduled)
+    runner._prepare_inputs(scheduled, np.array([2, 2, 2]))
+    runner._build_attention_metadata(**shape)
+    runner._model_forward()
+    assert events.index("replay") < events.index("sync") < events.index("state_update")
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("blocks", [[0, 0], [1, 0], [0, 1], [1, 1]])
+def test_cascade_guard_preserves_fallback_for_either_kv_group(setup, enabled, blocks):
+    runner, scheduled, _, events, _ = setup
+    runner.cascade_attn_enabled = enabled
+    scheduled.num_common_prefix_blocks = blocks
+    eligible = not (enabled and any(blocks))
+    assert runner._eligible(scheduled) == eligible
+    runner._update_states(scheduled)
+    if eligible:
+        assert runner._async_pending is scheduled and events == []
+    else:
+        runner._prepare_inputs(scheduled, np.array([2, 2, 2]))
+        assert runner._async_pending is None
+        assert events == ["sync", "state_update", "normal_prepare"]
 
 
 def test_replay_precedes_real_count_readback_and_cpu_update(setup):
