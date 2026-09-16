@@ -527,13 +527,20 @@ class NPUWorker(WorkerBase):
         num_ubatches = 1
         init_workspace_manager(self.device, num_ubatches)
         # Init ModelRunner here, so that we have access to self.device.
+        if self.use_v2_model_runner and envs_ascend.VLLM_ASCEND_SFA_ASYNC_MTP_PREP:
+            raise ValueError("SFA async MTP preparation requires the V1 model runner")
         if self.use_v2_model_runner:
             logger.warning("npu model runner v2 is in developing, some features doesn't work for now.")
             from vllm_ascend.worker.v2.model_runner import NPUModelRunner as NPUModelRunnerV2
 
             self.model_runner = NPUModelRunnerV2(self.vllm_config, self.device)
         else:
-            self.model_runner = NPUModelRunner(self.vllm_config, self.device)
+            runner_cls = NPUModelRunner
+            if envs_ascend.VLLM_ASCEND_SFA_ASYNC_MTP_PREP:
+                from vllm_ascend.worker.sfa_async_mtp import AsyncSFAModelRunner
+
+                runner_cls = AsyncSFAModelRunner
+            self.model_runner = runner_cls(self.vllm_config, self.device)
 
     @torch.inference_mode()
     def determine_available_memory(self) -> int:
