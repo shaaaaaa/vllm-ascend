@@ -134,10 +134,17 @@ class PrefillValidationWorker:
 
         @functools.wraps(original_forward)
         def forward(impl, layer_name, hidden_states, kv_cache, attn_metadata, *args, **kwargs):
-            if attn_metadata is None or not attn_metadata.req_ids:
+            if attn_metadata is None:
                 return original_forward(impl, layer_name, hidden_states, kv_cache, attn_metadata, *args, **kwargs)
             meta = attn_metadata
-            if len(meta.req_ids) != 1:
+            # SHRINK_LATENT=0 (the P stage) does not populate req_ids. Hooks
+            # are installed after warmup; use the real query/sequence spans
+            # to validate this single-request run instead of skipping P.
+            if (
+                len(meta.seq_lens_cpu) != 1
+                or len(meta.query_start_loc_cpu) != 2
+                or (meta.req_ids is not None and len(meta.req_ids) != 1)
+            ):
                 raise RuntimeError("Three-pass validation supports one request, not padded/mixed batches")
             qlen = int(meta.query_start_loc_cpu[1] - meta.query_start_loc_cpu[0])
             end = int(meta.seq_lens_cpu[0])

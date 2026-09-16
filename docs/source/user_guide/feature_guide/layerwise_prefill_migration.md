@@ -37,6 +37,10 @@ prepared transfer 快路径、性能日志开关，以及 latent/indexer 两组�
 producer-capable LMCache Ascend connector。P 使用 `SHRINK_LATENT=0`；
 D 保持其原有配置，不需要新增上述纯 D-node 开关。
 
+P 节点可以关闭 MTP；启用时 `num_speculative_tokens` 必须为 1，启动时会拒绝
+大于 1 的配置，避免重复执行 MTP 层推进同一套逐层加载/保存游标。
+关闭 P-node 开关时不受此限制。
+
 保留源功能的限制：PP/PCP/DCP 均为 1；不能启用跳过逐层回调的 FULL/staged
 SFA 图，也不能使用不兼容的 fused matmul-allreduce。可使用普通 PIECEWISE
 边界。关闭 P-node 开关时仍走原有驻留和传输路径。

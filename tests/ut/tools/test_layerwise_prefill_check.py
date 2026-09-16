@@ -686,7 +686,8 @@ def test_real_instrumented_put_releases_exactly_once(connector_module, tmp_path,
     assert source.released == 1
 
 
-def test_real_worker_hooks_observe_writes_and_loads(monkeypatch, tmp_path):
+@pytest.mark.parametrize("request_ids", [None, ["r"]])
+def test_real_worker_hooks_observe_writes_and_loads(monkeypatch, tmp_path, request_ids):
     sfa = ModuleType("vllm_ascend.attention.sfa_v1")
     sfa._dsa_indexer_layer_name = lambda name: name + ".index"
     sfa.wait_for_kv_layer_from_connector = lambda name, **kwargs: None
@@ -719,7 +720,8 @@ def test_real_worker_hooks_observe_writes_and_loads(monkeypatch, tmp_path):
     worker.rank = 0
     worker.install_prefill_validation(str(tmp_path), 3)
     meta = SimpleNamespace(
-        req_ids=["r"],
+        # P uses SHRINK_LATENT=0, so its real metadata has no request IDs.
+        req_ids=request_ids,
         num_actual_tokens=1,
         query_start_loc_cpu=torch.tensor([0, 1]),
         seq_lens_cpu=torch.tensor([3]),
@@ -740,7 +742,10 @@ def test_real_worker_hooks_observe_writes_and_loads(monkeypatch, tmp_path):
     assert values.reshape(-1).tolist() == [202, 203]
 
 
-def test_three_pass_report_keeps_small_differences_and_real_output_divergence(connector_module, tmp_path):
+@pytest.mark.parametrize("missing_prefill_trace", [False, True])
+def test_three_pass_report_keeps_small_differences_and_real_output_divergence(
+    connector_module, tmp_path, missing_prefill_trace
+):
     for stage, tokens in (("baseline", [7, 8]), ("prefill", [7]), ("decode", [7, 9])):
         directory = tmp_path / stage
         directory.mkdir()
@@ -748,6 +753,8 @@ def test_three_pass_report_keeps_small_differences_and_real_output_divergence(co
             directory / "output.json",
             {"token_ids": tokens, "prompt_sha256": "same", "num_hidden_layers": 1, "num_cached_tokens": 3},
         )
+        if stage == "prefill" and missing_prefill_trace:
+            continue
         rec = PROBE.KVRecorder(directory, 0, 4)
         for part in ("nope", "pe", "index"):
             cache = torch.ones(3, 2, 1, 1, dtype=torch.float64)
@@ -774,12 +781,25 @@ def test_three_pass_report_keeps_small_differences_and_real_output_divergence(co
             file.write(
                 json.dumps({"key": f"group{group}", "sha256": sealed[f"group{group}"], "kv_group": group}) + "\n"
             )
-    result = CHECK.analyse(tmp_path, 1)
+    if missing_prefill_trace:
+        with pytest.raises(RuntimeError, match="Trace coverage incomplete; report saved"):
+            CHECK.analyse(tmp_path, 1)
+        result = json.loads((tmp_path / "summary.json").read_text(encoding="utf-8"))
+    else:
+        result = CHECK.analyse(tmp_path, 1)
     assert result["tokens_equal"] is False
     assert result["first_different_output_token_index"] == 1
     assert result["decode_compare_position_exclusive"] == 5
-    assert result["structural_errors"] == []
     assert (tmp_path / "kv_statistics.csv").is_file()
+    if missing_prefill_trace:
+        errors = result["structural_errors"]
+        assert any("Incomplete prefill trace" in error for error in errors)
+        assert any("Missing P reference trace" in error for error in errors)
+        assert not any("No observed NPU reload" in error for error in errors)
+        assert result["persisted_kv"]["common_keys"] == 2
+        assert all(row["stats"]["abs_diff"]["max"] == 0 for row in result["persisted_kv"]["per_layer"])
+        return
+    assert result["structural_errors"] == []
     written = [row for row in result["kv"] if row["comparison"] == "prefill_written"]
     assert all(0 < row["stats"]["abs_diff"]["mean"] < 1e-7 for row in written)
 

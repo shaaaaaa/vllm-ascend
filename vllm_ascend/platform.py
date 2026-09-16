@@ -277,6 +277,15 @@ class NPUPlatform(Platform):
         layerwise_prefill_p_node = envs_ascend.VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE
         if layerwise_prefill_p_node:
             role = "P"
+            speculative_config = vllm_config.speculative_config
+            if speculative_config is not None and speculative_config.num_speculative_tokens > 1:
+                # The two-bank load/store cursors visit each physical layer
+                # once per forward; repeated MTP calls would advance them twice.
+                raise ValueError(
+                    "VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE=true requires "
+                    "num_speculative_tokens <= 1; repeated MTP forwards are "
+                    "not supported by the layerwise prefill load/store protocol"
+                )
             if parallel_config.pipeline_parallel_size != 1:
                 raise ValueError(
                     f"{role} node mode requires pipeline_parallel_size == 1"

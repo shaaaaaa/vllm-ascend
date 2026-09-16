@@ -565,8 +565,13 @@ def analyse(root, ranks):
             )
             if label == "prefill_written" and row["matched_rows"] != length:
                 errors.append(f"Incomplete prefill trace: {rank}/{layer}/{part}")
-            if label == "decode_reloaded" and not row["matched_rows"]:
-                errors.append(f"No observed NPU reload: {rank}/{layer}/{part}")
+            if label == "decode_reloaded":
+                if not row["candidate_rows"]:
+                    errors.append(f"No observed NPU reload: {rank}/{layer}/{part}")
+                elif not row["baseline_rows"]:
+                    errors.append(f"Missing P reference trace for NPU reload comparison: {rank}/{layer}/{part}")
+                elif not row["matched_rows"]:
+                    errors.append(f"No common P/D reload positions: {rank}/{layer}/{part}")
             if label == "decode_recomputed_prompt_tail" and row["candidate_rows"] > CHUNK_SIZE:
                 errors.append(f"D recomputed more than the uncached prompt tail: {rank}/{layer}/{part}")
             rows.append(row)

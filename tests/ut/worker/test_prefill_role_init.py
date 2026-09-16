@@ -51,3 +51,43 @@ def test_disabled_prefill_role_preserves_compact_decode():
     runner = initialize_roles(p_node=False, shrink=2)
     assert runner.dsa_shrink_latent == 2
     assert not runner.layerwise_prefill_p_node
+
+
+def validate_platform_prefill_role(*, p_node, speculative_tokens):
+    """Run the production P-role config guard without importing NPU modules."""
+    path = Path(__file__).resolve().parents[3] / "vllm_ascend/platform.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "NPUPlatform")
+    method = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "check_and_update_config")
+    guard = next(
+        n
+        for n in method.body
+        if isinstance(n, ast.If) and isinstance(n.test, ast.Name) and n.test.id == "layerwise_prefill_p_node"
+    )
+    speculative_config = (
+        None if speculative_tokens is None else SimpleNamespace(num_speculative_tokens=speculative_tokens, method="mtp")
+    )
+    namespace = dict(
+        layerwise_prefill_p_node=p_node,
+        vllm_config=SimpleNamespace(speculative_config=speculative_config),
+        parallel_config=SimpleNamespace(
+            pipeline_parallel_size=1, prefill_context_parallel_size=1, decode_context_parallel_size=1
+        ),
+    )
+    exec(compile(ast.fix_missing_locations(ast.Module(body=[guard], type_ignores=[])), str(path), "exec"), namespace)
+
+
+@pytest.mark.parametrize("speculative_tokens", [None, 1])
+def test_prefill_role_allows_no_mtp_or_one_draft_token(speculative_tokens):
+    validate_platform_prefill_role(p_node=True, speculative_tokens=speculative_tokens)
+
+
+@pytest.mark.parametrize("speculative_tokens", [2, 4])
+def test_prefill_role_rejects_repeated_mtp_before_worker_start(speculative_tokens):
+    with pytest.raises(ValueError, match="num_speculative_tokens <= 1"):
+        validate_platform_prefill_role(p_node=True, speculative_tokens=speculative_tokens)
+
+
+@pytest.mark.parametrize("speculative_tokens", [None, 1, 2, 4])
+def test_disabled_prefill_role_does_not_restrict_mtp(speculative_tokens):
+    validate_platform_prefill_role(p_node=False, speculative_tokens=speculative_tokens)
