@@ -975,13 +975,25 @@ def test_preparation_and_signatures_are_agreed_before_collective_replay(routing,
     runner.model = Mock()
     runner.model_config.max_model_len = 140000
     runner.input_batch = SimpleNamespace(req_ids=["r1"], num_reqs=1)
-    layer = SimpleNamespace(prepare_full_graph_layer=Mock(return_value={}))
+    layer = SimpleNamespace(
+        prepare_full_graph_layer=Mock(return_value={}),
+        prepare_full_graph_metadata=Mock(),
+        _staged_sfa_capture_state=SimpleNamespace(runtime=object()),
+        _full_graph_transfer=object(),
+    )
     runner._staged_sfa_impls = [("layer0", layer)]
     runner._run_sfa_full_graph_target = Mock()
-    runner._sfa_full_graph = SimpleNamespace(bind_sources=Mock(), prepare_run=Mock(), run=Mock(return_value="output"))
+    runner._sfa_full_graph = SimpleNamespace(
+        bind_sources=Mock(),
+        prepare_run=Mock(),
+        run=Mock(return_value="output"),
+        get_transfers=Mock(),
+        register_transfers=Mock(),
+    )
     connector = SimpleNamespace(prepare_sparse_graph_step=Mock(return_value=(None,)))
     context = SimpleNamespace(
-        staged_sfa_graph_key="r4q2",
+        staged_sfa_graph_key=SimpleNamespace(request_capacity=4),
+        attn_metadata={"layer0": object()},
         cudagraph_runtime_mode=modes.PIECEWISE,
         staged_sfa_graph_dummy_run=False,
         staged_sfa_route=SimpleNamespace(frontiers=(0,)),
@@ -1018,9 +1030,8 @@ def test_preparation_and_signatures_are_agreed_before_collective_replay(routing,
         assert runner._model_forward(8) == "output"
         runner._sfa_full_graph.prepare_run.assert_called_once()
         runner._sfa_full_graph.run.assert_called_once()
-        layer.prepare_full_graph_layer.assert_called_once_with(
-            "layer0", 140000, bind_source=False, metadata_checks=None
-        )
+        layer.prepare_full_graph_layer.assert_not_called()
+        layer.prepare_full_graph_metadata.assert_called_once_with(context.attn_metadata["layer0"], context)
         assert runner._sfa_full_graph.run.call_args.kwargs == {
             "prepared": runner._sfa_full_graph.prepare_run.return_value
         }
@@ -1037,13 +1048,25 @@ def test_local_supervised_decode_has_no_per_step_error_collective(routing, failu
         distributed_executor_backend="mp", nnodes=1, data_parallel_size=1, pipeline_parallel_size=1
     )
     runner.input_batch = SimpleNamespace(req_ids=["r"], num_reqs=1)
-    layer = SimpleNamespace(prepare_full_graph_layer=Mock(return_value={}))
+    layer = SimpleNamespace(
+        prepare_full_graph_layer=Mock(return_value={}),
+        prepare_full_graph_metadata=Mock(),
+        _staged_sfa_capture_state=SimpleNamespace(runtime=object()),
+        _full_graph_transfer=object(),
+    )
     runner._staged_sfa_impls = [("layer0", layer)]
     runner._run_sfa_full_graph_target = Mock()
-    runner._sfa_full_graph = SimpleNamespace(bind_sources=Mock(), prepare_run=Mock(), run=Mock(return_value="output"))
+    runner._sfa_full_graph = SimpleNamespace(
+        bind_sources=Mock(),
+        prepare_run=Mock(),
+        run=Mock(return_value="output"),
+        get_transfers=Mock(),
+        register_transfers=Mock(),
+    )
     connector = SimpleNamespace(prepare_sparse_graph_step=Mock(return_value=(None,)))
     context = SimpleNamespace(
-        staged_sfa_graph_key="r1q2",
+        staged_sfa_graph_key=SimpleNamespace(request_capacity=1),
+        attn_metadata={"layer0": object()},
         cudagraph_runtime_mode=modes.PIECEWISE,
         staged_sfa_graph_dummy_run=False,
         staged_sfa_route=SimpleNamespace(frontiers=(0,)),
@@ -1083,11 +1106,13 @@ def test_local_supervised_decode_has_no_per_step_error_collective(routing, failu
             assert runner._model_forward(2) == "output"
         assert runner._sfa_full_graph.run.call_count == 300
         assert runner._sfa_full_graph.prepare_run.call_count == 300
-        memos = [c.kwargs["metadata_checks"] for c in layer.prepare_full_graph_layer.call_args_list]
-        assert memos == [None] * 300
+        layer.prepare_full_graph_layer.assert_not_called()
+        assert layer.prepare_full_graph_metadata.call_count == 300
         assert all(call.kwargs["graph_inputs"] is None for call in runner._sfa_full_graph.prepare_run.call_args_list)
-        assert all(call.args[0] is runner._staged_sfa_layer_names
-                   for call in connector.prepare_sparse_graph_step.call_args_list)
+        assert all(
+            call.args[0] is runner._staged_sfa_layer_names
+            for call in connector.prepare_sparse_graph_step.call_args_list
+        )
         ns["exit_failed_sfa_worker"].assert_not_called()
     forbidden.assert_not_called()
 
@@ -1100,16 +1125,26 @@ def test_local_startup_capture_retains_error_agreement(routing, failed):
     runner.vllm_config.parallel_config = SimpleNamespace(
         distributed_executor_backend="mp", nnodes=1, data_parallel_size=1, pipeline_parallel_size=1
     )
-    layer = SimpleNamespace(prepare_full_graph_layer=Mock(return_value={}))
+    layer = SimpleNamespace(
+        prepare_full_graph_layer=Mock(return_value={}),
+        prepare_full_graph_metadata=Mock(),
+        _staged_sfa_capture_state=SimpleNamespace(runtime=object()),
+        _full_graph_transfer=object(),
+    )
     runner._staged_sfa_impls = [("layer0", layer)]
     runner._run_sfa_full_graph_target = Mock()
     runner._sfa_full_graph = SimpleNamespace(
         bind_sources=Mock(side_effect=ValueError("bad startup binding") if failed else None),
         prepare_run=Mock(),
         run=Mock(return_value="capture"),
+        register_transfers=Mock(),
+        get_transfers=Mock(),
     )
     context = SimpleNamespace(
-        staged_sfa_graph_key="r1q2", cudagraph_runtime_mode=modes.PIECEWISE, staged_sfa_graph_dummy_run=True
+        staged_sfa_graph_key=SimpleNamespace(request_capacity=1),
+        attn_metadata={"layer0": object()},
+        cudagraph_runtime_mode=modes.PIECEWISE,
+        staged_sfa_graph_dummy_run=True,
     )
     policy = Mock(side_effect=AssertionError("startup must not rely on a ready worker supervisor"))
     calls = []
@@ -1143,13 +1178,19 @@ def test_target_names_follow_collection_reset_and_recollection(failed_reset):
     path = Path(__file__).resolve().parents[3] / "vllm_ascend/worker/model_runner_v1.py"
     events = []
     names = [f"model.layers.{i}.self_attn.attn" for i in range(3)]
-    impls = [SimpleNamespace(enable_staged_sfa_graph=True,
-                             reset_staged_sfa_capture=lambda: events.append("reset")) for _ in names]
+    impls = [
+        SimpleNamespace(enable_staged_sfa_graph=True, reset_staged_sfa_capture=lambda: events.append("reset"))
+        for _ in names
+    ]
     layers = {name: SimpleNamespace(layer_name=name, impl=impl) for name, impl in zip(names, impls)}
     layers["alias"] = layers[names[0]]
-    ns = dict(AttentionLayerBase=object, get_layers_from_vllm_config=lambda *args: layers,
-              parse_layer_idx=lambda name: int(name.split(".")[2]),
-              logger=Mock(), envs_ascend=SimpleNamespace(VLLM_ASCEND_SFA_FULL_GRAPH=True))
+    ns = dict(
+        AttentionLayerBase=object,
+        get_layers_from_vllm_config=lambda *args: layers,
+        parse_layer_idx=lambda name: int(name.split(".")[2]),
+        logger=Mock(),
+        envs_ascend=SimpleNamespace(VLLM_ASCEND_SFA_FULL_GRAPH=True),
+    )
     methods = {"_collect_staged_sfa_impls", "_reset_staged_sfa_startup_capture"}
     definitions(path, methods, ns, class_name="NPUModelRunner")
     runner = type("Registry", (), {name: ns[name] for name in methods})()
@@ -1252,3 +1293,71 @@ def test_async_route_reuses_only_current_validated_metadata(routing, request, mo
     runner._async_pending = None
     runner._staged_sfa_local_route(**kwargs)
     assert len(calls) == (3 if reused else 4)
+
+
+@pytest.mark.parametrize("groups", [1, 3])
+@pytest.mark.parametrize("failure", [None, "missing_layer", "reset_layer", "missing_bundle"])
+def test_live_preparation_groups_current_metadata_and_keeps_all_layer_guards(routing, groups, failure):
+    runner, ns, _, modes, _ = routing
+    path = Path(__file__).resolve().parents[3] / "vllm_ascend/attention/sfa_v1.py"
+    from sfa_test_support import extract
+
+    boundary = extract(path, "_prepare_sfa_remap_boundary", {})
+    prepare = extract(path, "prepare_full_graph_metadata", {"_prepare_sfa_remap_boundary": boundary})
+    items = [
+        SimpleNamespace(
+            req_ids=["r"],
+            decode_remap_boundary=torch.zeros(2),
+            decode_remap_boundary_ready=True,
+            seq_lens_cpu=None,
+            reshape_cache_event=object(),
+        )
+        for _ in range(groups)
+    ]
+    names = tuple(f"layer{i}" for i in range(6))
+    context = SimpleNamespace(
+        staged_sfa_graph_key=SimpleNamespace(request_capacity=4),
+        staged_sfa_graph_dummy_run=False,
+        cudagraph_runtime_mode=modes.PIECEWISE,
+        staged_sfa_route=SimpleNamespace(frontiers=(0,)),
+        attn_metadata={name: items[i % groups] for i, name in enumerate(names)},
+    )
+    layers = []
+    for name in names:
+        impl = SimpleNamespace(index_topk=2048, _staged_sfa_capture_state=SimpleNamespace(runtime=object()))
+        impl.prepare_full_graph_metadata = Mock(side_effect=lambda md, ctx, impl=impl: prepare(impl, md, ctx))
+        impl.prepare_full_graph_layer = Mock(side_effect=AssertionError("live static preparation"))
+        layers.append(impl)
+    runner.model = Mock()
+    runner.input_batch = SimpleNamespace(req_ids=["r"], num_reqs=1)
+    runner._staged_sfa_impls = tuple(zip(names, layers))
+    runner._staged_sfa_layer_names = names
+    runner._run_sfa_full_graph_target = Mock()
+    runner._sfa_full_graph = SimpleNamespace(
+        get_transfers=Mock(return_value=()), bind_sources=Mock(), prepare_run=Mock(), run=Mock(return_value="output")
+    )
+
+    def coordinate(error, dummy):
+        if error is not None:
+            raise error
+
+    runner._coordinate_sfa_full_graph_preparation = coordinate
+    ns["get_forward_context"] = lambda: context
+    ns["get_kv_transfer_group"] = lambda: SimpleNamespace(prepare_sparse_graph_step=lambda *a, **kw: (None,))
+    if failure == "missing_layer":
+        del context.attn_metadata[names[-1]]
+    elif failure == "reset_layer":
+        layers[-1]._staged_sfa_capture_state.runtime = None
+    elif failure == "missing_bundle":
+        runner._sfa_full_graph.get_transfers.side_effect = RuntimeError("no bundle")
+    if failure:
+        with pytest.raises((RuntimeError, KeyError)):
+            runner._model_forward(8)
+        runner._sfa_full_graph.run.assert_not_called()
+    else:
+        assert runner._model_forward(8) == "output"
+        assert sum(layer.prepare_full_graph_metadata.call_count for layer in layers) == groups
+        assert all(item.reshape_cache_event is None for item in items)
+        assert all(item.decode_remap_boundary_ready for item in items)
+    for layer in layers:
+        layer.prepare_full_graph_layer.assert_not_called()

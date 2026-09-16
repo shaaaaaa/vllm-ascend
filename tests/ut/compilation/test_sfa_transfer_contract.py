@@ -89,7 +89,7 @@ def contract(monkeypatch):
     namespace = {"get_forward_context": lambda: context, "torch": torch}
     path = root / "vllm_ascend/attention/sfa_v1.py"
     extract(path, {"_prepare_sfa_remap_boundary"}, namespace)
-    extract(path, {"prepare_full_graph_layer"}, namespace, class_name="AscendSFAImpl")
+    extract(path, {"prepare_full_graph_layer", "prepare_full_graph_metadata"}, namespace, class_name="AscendSFAImpl")
     namespace["dataclass"] = dataclass
     namespace["SFASourceLease"] = lambda sources: SimpleNamespace(close=Mock())
     namespace["MAX_PENDING_SOURCE_RETIREMENTS"] = 64
@@ -103,7 +103,11 @@ def contract(monkeypatch):
         raising=False,
     )
     extract(root / "vllm_ascend/compilation/sfa_full_graph.py", {"SFASourceBinding", "SFAFullGraph"}, namespace)
-    impl_type = type("RealLayerPreparation", (), {"prepare_full_graph_layer": namespace["prepare_full_graph_layer"]})
+    impl_type = type(
+        "RealLayerPreparation",
+        (),
+        {name: namespace[name] for name in ("prepare_full_graph_layer", "prepare_full_graph_metadata")},
+    )
     return SimpleNamespace(
         context=context,
         impl_type=impl_type,

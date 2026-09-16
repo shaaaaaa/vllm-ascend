@@ -3641,24 +3641,28 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                             request_ids=request_ids,
                             frontiers=tuple(context.staged_sfa_route.frontiers),
                         )
-                    # Startup-only static validation shares one temporary memo.
-                    # Live preparation updates dynamic boundaries and selects
-                    # preallocated transfers; it does not walk tensor layouts.
-                    metadata_checks = {} if graph_inputs is not None else None
-                    for name, impl in impls:
-                        inputs = impl.prepare_full_graph_layer(
-                            name,
-                            self.model_config.max_model_len,
-                            bind_source=False,
-                            metadata_checks=metadata_checks,
+                    capacity = context.staged_sfa_graph_key.request_capacity
+                    if graph_inputs is not None:
+                        metadata_checks = {}
+                        for name, impl in impls:
+                            graph_inputs[name] = impl.prepare_full_graph_layer(
+                                name, self.model_config.max_model_len, bind_source=False,
+                                metadata_checks=metadata_checks,
+                            )
+                        self._sfa_full_graph.register_transfers(
+                            capacity, tuple(impl._full_graph_transfer for _, impl in impls)
                         )
-                        if graph_inputs is not None:
-                            graph_inputs[name] = inputs
-                    self._sfa_full_graph.bind_sources(
-                        source,
-                        request_ids,
-                        lambda: tuple(impl._full_graph_transfer for _, impl in impls),
-                    )
+                    else:
+                        self._sfa_full_graph.get_transfers(capacity)
+                        seen = set()
+                        for name, impl in impls:
+                            if impl._staged_sfa_capture_state.runtime is None:
+                                raise RuntimeError(f"Full SFA graph layer was not warmed up: {name}")
+                            metadata = context.attn_metadata[name]
+                            if id(metadata) not in seen:
+                                impl.prepare_full_graph_metadata(metadata, context)
+                                seen.add(id(metadata))
+                    self._sfa_full_graph.bind_sources(source, request_ids)
                     prepared_call = self._sfa_full_graph.prepare_run(graph_inputs=graph_inputs, **graph_kwargs)
                 except Exception as exc:
                     local_error = exc

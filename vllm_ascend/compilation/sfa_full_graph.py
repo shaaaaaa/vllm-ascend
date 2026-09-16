@@ -103,6 +103,8 @@ class SFAFullGraph:
         self.graph_pool = None
         self.source_bindings: dict[int, SFASourceBinding] = {}
         self.source_binding_count = 0
+        self._transfer_bundles: dict[int, tuple] = {}
+        self._table_history: dict[int, tuple] = {}
         self._generation = 0
         self.retired_sources: list[SFASourceBinding] = []
         self._submission_failed = False
@@ -112,7 +114,7 @@ class SFAFullGraph:
         """Discard graphs before profiling's temporary KV storage is released."""
         # Lifecycle boundary only, never a forward boundary. Include partial
         # submissions for which recording a completion event may have failed.
-        if self.entries or self.source_bindings or self.retired_sources:
+        if self.entries or self.source_bindings or self.retired_sources or self._transfer_bundles:
             torch.npu.synchronize()
         for binding in (*self.source_bindings.values(), *self.retired_sources):
             binding.lease.close()
@@ -120,6 +122,8 @@ class SFAFullGraph:
         self.sealed = False
         self.replay_count = 0
         self.source_bindings.clear()
+        self._transfer_bundles.clear()
+        self._table_history.clear()
         self.source_binding_count = 0
         self._generation += 1
         self.retired_sources.clear()
@@ -149,11 +153,50 @@ class SFAFullGraph:
         if self.retired_sources:
             self.collect_retired_sources()
 
+    def register_transfers(self, capacity: int, transfers: tuple[Any, ...]) -> None:
+        """Register startup-owned tables; identical capacities share one bundle."""
+        if self.sealed or not get_forward_context().staged_sfa_graph_dummy_run or not transfers:
+            raise RuntimeError("Full SFA transfers must be registered during startup")
+        previous = self._transfer_bundles.get(capacity)
+        if previous is not None:
+            if len(previous[0]) != len(transfers) or any(a is not b for a, b in zip(previous[0], transfers)):
+                raise RuntimeError("Full SFA transfer bundle changed without clear/recapture")
+            return
+        first = transfers[0]
+        layout = (
+            type(first),
+            getattr(first, "request_capacity", None),
+            getattr(first, "capacity", None),
+            getattr(first, "chunk_size", None),
+        )
+        planner = getattr(first, "plan_bind_update", None)
+        if (
+            not callable(planner)
+            or layout[1] != capacity
+            or any(
+                (
+                    type(t),
+                    getattr(t, "request_capacity", None),
+                    getattr(t, "capacity", None),
+                    getattr(t, "chunk_size", None),
+                )
+                != layout
+                for t in transfers
+            )
+        ):
+            planner = None
+        self._transfer_bundles[capacity] = transfers, planner
+
+    def get_transfers(self, capacity: int) -> tuple[Any, ...]:
+        if capacity not in self._transfer_bundles:
+            raise RuntimeError("Full SFA transfer bundle was not registered at startup")
+        return self._transfer_bundles[capacity][0]
+
     def bind_sources(
         self,
         sources: tuple[Any, ...],
         request_ids: tuple[str, ...],
-        transfers: Callable[[], tuple[Any, ...]],
+        transfers: Callable[[], tuple[Any, ...]] | None = None,
     ) -> bool:
         """Rebind layers only when the request-owned source batch changes.
 
@@ -176,6 +219,25 @@ class SFAFullGraph:
         self._stream = stream
         if len(self.retired_sources) >= MAX_PENDING_SOURCE_RETIREMENTS:
             raise RuntimeError("Full SFA source retirements are not completing; refusing unbounded retention")
+        bundle = self._transfer_bundles.get(capacity)
+        if transfers is None:
+            self.get_transfers(capacity)  # Fail before acquiring owners or writing.
+        elif bundle is not None:
+            raise RuntimeError("Cannot replace registered full SFA transfers with a callback")
+        tokens = None
+        lanes = None
+        if bundle is not None and bundle[1] is not None:
+            tokens = tuple(None if s is None else getattr(s, "binding_token", None) for s in sources)
+            if any(s is not None and token is None for s, token in zip(sources, tokens)):
+                tokens = None
+            old = self._table_history.get(capacity)
+            if tokens is not None and old is not None:
+                changed = tuple(
+                    i
+                    for i in range(max(len(old), len(tokens)))
+                    if (old[i] if i < len(old) else None) is not (tokens[i] if i < len(tokens) else None)
+                )
+                lanes = bundle[1](sources, changed)
         lease = SFASourceLease(sources)
         try:
             completion = torch.npu.Event()
@@ -185,12 +247,17 @@ class SFAFullGraph:
         binding = SFASourceBinding(request_ids, sources, lease, completion)
         # A failure can leave partially updated tables. Never allow retrying the
         # old batch to hit the old memoized binding after such a partial write.
+        self._table_history.pop(capacity, None)
         self.source_bindings.pop(capacity, None)
         if previous is not None:
             self.retired_sources.append(previous)
         try:
-            for layer_id, transfer in enumerate(transfers()):
-                transfer.bind_batch(sources, layer_id)
+            if lanes != ():
+                for layer_id, transfer in enumerate(bundle[0] if bundle is not None else transfers()):
+                    if lanes is None:
+                        transfer.bind_batch(sources, layer_id)
+                    else:
+                        transfer.bind_batch(sources, layer_id, lanes=lanes)
         except BaseException:
             # Even a failed bind can have enqueued pointer-table copies.
             self.retired_sources.append(binding)
@@ -205,6 +272,8 @@ class SFAFullGraph:
         except BaseException:
             self._submission_failed = True
             raise
+        if tokens is not None:
+            self._table_history[capacity] = tokens
         self.source_binding_count += 1
         return True
 
@@ -212,6 +281,10 @@ class SFAFullGraph:
         """Require precisely one startup graph per authorized shape."""
         if set(self.entries) != set(keys):
             raise RuntimeError(f"Incomplete full SFA capture: expected={keys}, actual={tuple(self.entries)}")
+        if self._transfer_bundles and any(
+            getattr(key, "request_capacity", None) not in self._transfer_bundles for key in keys
+        ):
+            raise RuntimeError("Full SFA capture is missing a transfer bundle")
         # Startup capture uses a dedicated stream; live forwards use the runner
         # stream. Finish capture once before allowing that stream handoff.
         if self._stream is not None:

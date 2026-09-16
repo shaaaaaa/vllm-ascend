@@ -128,8 +128,9 @@ def test_missing_constructor_capture_validation_is_still_enforced(checks, monkey
     make_impl, make_metadata, check, _ = checks
     impl, metadata = make_impl(), make_metadata()
     validation = Mock(side_effect=ValueError("invalid capture configuration"))
-    monkeypatch.setitem(type(impl)._cross_layer_ineligible_reason.__globals__,
-                        "staged_sfa_graph_capture_sizes", validation)
+    monkeypatch.setitem(
+        type(impl)._cross_layer_ineligible_reason.__globals__, "staged_sfa_graph_capture_sizes", validation
+    )
     assert check(impl, metadata) is None
     validation.assert_not_called()
     del impl._staged_sfa_graph_capture_sizes
@@ -333,6 +334,7 @@ def test_full_graph_static_checks_only_run_at_startup(dummy):
     boundary = Mock(return_value=object())
     namespace = {"get_forward_context": lambda: context, "_prepare_sfa_remap_boundary": boundary}
     extract(path, "prepare_full_graph_layer", namespace)
+    extract(path, "prepare_full_graph_metadata", namespace)
     transfer = Mock()
     impl = SimpleNamespace(
         _staged_sfa_capture_state=SimpleNamespace(runtime=(None, [object(), object()])),
@@ -340,6 +342,9 @@ def test_full_graph_static_checks_only_run_at_startup(dummy):
         _cross_layer_ineligible_reason=Mock(return_value="static failure"),
         _full_graph_transfers={1: transfer},
         index_topk=2048,
+    )
+    impl.prepare_full_graph_metadata = lambda metadata, ctx: namespace["prepare_full_graph_metadata"](
+        impl, metadata, ctx
     )
     prepare = namespace["prepare_full_graph_layer"]
     if dummy:

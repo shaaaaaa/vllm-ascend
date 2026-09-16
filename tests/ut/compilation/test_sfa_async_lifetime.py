@@ -31,6 +31,8 @@ def asynchronous(graph_module, monkeypatch):
     root = Path(__file__).resolve().parents[3]
     memory_path = root.parent / "LMCache/lmcache/v1/memory_management.py"
     if not memory_path.exists():
+        memory_path = root.parent / "LMCache-NPU/lmcache/v1/memory_management.py"
+    if not memory_path.exists():
         pytest.skip("Ownership contract needs the sibling LMCache checkout")
     # Use LMCache's actual locked increment/decrement/free logic, avoiding its
     # optional native imports and global monitor initialization on this host.

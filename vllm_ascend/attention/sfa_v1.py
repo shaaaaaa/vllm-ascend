@@ -3689,6 +3689,19 @@ class AscendSFAImpl(MLAAttentionImpl):
             index_topk=self.index_topk, reuse_unchanged=True,
         )
 
+    def prepare_full_graph_metadata(self, metadata: M, context: Any) -> torch.Tensor:
+        """Refresh one shared metadata object without changing transfer selection."""
+        boundary = _prepare_sfa_remap_boundary(
+            metadata,
+            metadata.req_ids,
+            is_dummy_run=context.staged_sfa_graph_dummy_run,
+            index_topk=self.index_topk,
+            cached_tokens=context.staged_sfa_route.frontiers,
+            reuse_unchanged=True,
+        )
+        metadata.reshape_cache_event = None
+        return boundary
+
     def prepare_full_graph_layer(
         self,
         layer_name: str,
@@ -3718,14 +3731,7 @@ class AscendSFAImpl(MLAAttentionImpl):
             )
             if reason is not None:
                 raise RuntimeError(f"Full SFA graph metadata is ineligible for {layer_name}: {reason}")
-        boundary = _prepare_sfa_remap_boundary(
-            metadata,
-            metadata.req_ids,
-            is_dummy_run=context.staged_sfa_graph_dummy_run,
-            index_topk=self.index_topk,
-            cached_tokens=context.staged_sfa_route.frontiers,
-            reuse_unchanged=True,
-        )
+        boundary = self.prepare_full_graph_metadata(metadata, context)
         if context.staged_sfa_graph_dummy_run:
             state.remap_boundary = boundary
         transfers = getattr(self, "_full_graph_transfers", None)
@@ -3750,9 +3756,6 @@ class AscendSFAImpl(MLAAttentionImpl):
         self._full_graph_transfer = transfer
         if bind_source:
             transfer.bind_batch(source or (), layer_id)
-        # Graph-external saves use store_stream.wait_stream(current_stream).
-        # Do not expose an event recorded only during startup eager warmup.
-        metadata.reshape_cache_event = None
         if not context.staged_sfa_graph_dummy_run:
             return None
         # The builder owns these stable allocations, just as in staged replay.
