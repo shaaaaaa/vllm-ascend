@@ -47,10 +47,13 @@ def prepare_async_mtp_kernel(
 
 @triton.jit(do_not_specialize=["num_reqs"])
 def prepare_async_mtp_tokens_kernel(sampled, draft, input_ids, draft_ids, num_reqs, BLOCK: tl.constexpr):
+    # Contiguous output avoids Ascend's masked strided-store interleave pass.
+    tokens = tl.program_id(0) * (2 * BLOCK) + tl.arange(0, 2 * BLOCK)
+    active_tokens = tokens < 2 * num_reqs
+    sample = tl.load(sampled + tokens // 2, active_tokens, other=0)
+    proposal = tl.load(draft + tokens // 2, active_tokens, other=0).to(tl.int32)
+    tl.store(input_ids + tokens, tl.where(tokens % 2 == 0, sample, proposal), active_tokens)
     rows = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     active = rows < num_reqs
-    sample = tl.load(sampled + rows, active, other=0)
     proposal = tl.load(draft + rows, active, other=0).to(tl.int32)
-    tl.store(input_ids + 2 * rows, sample, active)
-    tl.store(input_ids + 2 * rows + 1, proposal, active)
     tl.store(draft_ids + rows, proposal, active)

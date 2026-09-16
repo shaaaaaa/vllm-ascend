@@ -9,6 +9,31 @@ from test_sfa_async_mtp import setup  # noqa: F401
 from torch.utils._python_dispatch import TorchDispatchMode
 
 
+@pytest.mark.parametrize("n", [0, 1, 31, 32, 33, 65])
+def test_token_packing_uses_contiguous_masked_stores(n, monkeypatch):
+    kernel = AsyncMTPTokenKernel()
+    store = kernel.tl.store
+    writes = []
+
+    def checked_store(ptr, value, mask):
+        # Ascend's interleave optimization crashes on paired masked stride-2
+        # stores. Both output arrays must use contiguous stores instead.
+        assert torch.all(torch.diff(ptr.offset) == 1)
+        writes.append(int(mask.sum()))
+        store(ptr, value, mask)
+
+    monkeypatch.setattr(kernel.tl, "store", checked_store)
+    sampled = torch.arange(n, dtype=torch.int32)
+    draft = sampled + 100
+    inputs = torch.full((2 * n + 7,), -77, dtype=torch.int32)
+    output = torch.empty(n, dtype=torch.int32)
+    kernel[(max(1, (n + 31) // 32),)](sampled, draft, inputs, output, n, BLOCK=32)
+    assert sum(writes) == 3 * n
+    torch.testing.assert_close(inputs[: 2 * n], torch.stack((sampled, draft), dim=1).flatten())
+    torch.testing.assert_close(output, draft)
+    assert torch.all(inputs[2 * n :] == -77)
+
+
 @pytest.mark.parametrize("n", [1, 3, 16, 31, 32, 33, 65])
 @pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
 def test_fused_tokens_match_copies_and_gather(n, dtype):
