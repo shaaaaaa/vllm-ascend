@@ -89,7 +89,7 @@ def test_padded_identity_selection_matches_gather_and_draft_owned_outputs(n, acc
             "AscendCommonAttentionMetadata": SimpleNamespace,
         },
     )
-    first = extract(PROPOSER, "set_inputs_first_pass", {"torch": torch})
+    first = extract(PROPOSER, "set_inputs_first_pass", {"torch": torch, "HAS_TRITON": False})
     total = n * 2
     ids, positions = torch.arange(total + 8, dtype=torch.int32), torch.arange(total + 8)
     hidden = torch.arange((total + 8) * 32, dtype=torch.float32).view(total + 8, 32)
@@ -214,6 +214,17 @@ def test_warmup_uses_private_buffers_and_serving_specializations():
 
             return call
 
+    packs = []
+
+    class PackingKernel:
+        def __getitem__(self, grid):
+            def call(tokens, positions, out_tokens, out_positions, n, **kwargs):
+                packs.append(positions.dtype)
+                assert n == 10 and kwargs == {"BLOCK": 128}
+                assert len({t.data_ptr() for t in (tokens, positions, out_tokens, out_positions)}) == 4
+
+            return call
+
     warmup = extract(
         PROPOSER,
         "warmup_next_mtp_tokens",
@@ -223,6 +234,7 @@ def test_warmup_uses_private_buffers_and_serving_specializations():
             "get_vectorcore_num": lambda: 8,
             "_PREPARE_INPUTS_BLOCK_SIZE": 4,
             "prepare_next_mtp_tokens_kernel": Kernel(),
+            "pack_mtp_tokens_positions_kernel": PackingKernel(),
         },
     )
     live = torch.full((5,), 99, dtype=torch.int32)
@@ -232,10 +244,19 @@ def test_warmup_uses_private_buffers_and_serving_specializations():
         backup_next_token_ids=live,
     )
     warmup(subject)
-    assert len(calls) == 2 and torch.all(live == 99)
-    for call, width in zip(calls, (1, 2)):
+    assert len(calls) == 4 and torch.all(live == 99)
+    assert packs == [torch.int32, torch.int64] and subject._fixed_mtp_pipeline_ready
+    for call, width, fixed in zip(calls, (1, 1, 2, 2), (False, True, False, True)):
         grid, shape, backup_ptr, output_ptr, count_type, n, vocab, row_stride, token_stride, kwargs = call
         assert grid == (2,) and shape == (5, width) and n == 5 and vocab == 1000
         assert row_stride == width and token_stride == 1 and count_type == torch.int64
         assert live.data_ptr() not in (backup_ptr, output_ptr)
-        assert kwargs == {"WIDTH": width, "BLOCK_SIZE": 4}
+        assert kwargs["WIDTH"] == width and kwargs["BLOCK_SIZE"] == 4 and kwargs["FIXED_Q2"] is fixed
+        if fixed:
+            assert kwargs["sample_indices"].dtype == kwargs["rejected_counts"].dtype == torch.int32
+            assert (
+                len({backup_ptr, output_ptr, kwargs["sample_indices"].data_ptr(), kwargs["rejected_counts"].data_ptr()})
+                == 4
+            )
+        else:
+            assert kwargs["sample_indices"] is kwargs["rejected_counts"] is None

@@ -23,6 +23,7 @@ def prepare_next_mtp_tokens_kernel(
     sampled, backup, next_tokens, valid_counts,
     num_reqs, vocab_size, row_stride, token_stride,
     WIDTH: tl.constexpr, BLOCK_SIZE: tl.constexpr,
+    sample_indices=None, rejected_counts=None, FIXED_Q2: tl.constexpr = False,
 ):
     """Fuse the existing Ascend next-token/count rule for one-draft MTP."""
     pid = tl.program_id(0)
@@ -42,6 +43,10 @@ def prepare_next_mtp_tokens_kernel(
         token = tl.where(count == 2, second, first)
         tl.store(next_tokens + rows, tl.where(count > 0, token, fallback), mask)
         tl.store(valid_counts + rows, count, mask)
+        if FIXED_Q2:
+            # One draft per row: last query index minus (2 - accepted count).
+            tl.store(sample_indices + rows, 2 * rows + count - 1, mask)
+            tl.store(rejected_counts + rows, 2 - count, mask)
 
 
 @triton.jit(do_not_specialize=["num_reqs"])
@@ -89,3 +94,13 @@ def prepare_inputs_padded_kernel(
         index_to_sample = q_last_tok_idx - num_rejected
         tl.store(token_indices_to_sample_ptr + offsets, index_to_sample, mask=mask)
         tl.store(num_rejected_tokens_gpu_ptr + offsets, num_rejected, mask=mask)
+
+
+@triton.jit(do_not_specialize=["num_tokens"])
+def pack_mtp_tokens_positions_kernel(tokens, positions, out_tokens, out_positions, num_tokens, BLOCK: tl.constexpr):
+    rows = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    # Leave the final token slot untouched, matching the original shift.
+    shifted = tl.load(tokens + rows + 1, rows + 1 < num_tokens, other=0)
+    tl.store(out_tokens + rows, shifted, rows + 1 < num_tokens)
+    position = tl.load(positions + rows, rows < num_tokens, other=0)
+    tl.store(out_positions + rows, position, rows < num_tokens)

@@ -57,7 +57,11 @@ from vllm_ascend.compilation.acl_graph import (
     get_draft_graph_params,
     update_full_graph_params,
 )
-from vllm_ascend.ops.triton.spec_decode.utils import prepare_inputs_padded_kernel, prepare_next_mtp_tokens_kernel
+from vllm_ascend.ops.triton.spec_decode.utils import (
+    pack_mtp_tokens_positions_kernel,
+    prepare_inputs_padded_kernel,
+    prepare_next_mtp_tokens_kernel,
+)
 from vllm_ascend.ops.triton.triton_utils import get_vectorcore_num
 from vllm_ascend.spec_decode.mtp_draft_diagnostics import (
     MTP_DRAFT_DIAG_ROOT,
@@ -1539,7 +1543,13 @@ class SpecDecodeBaseProposer(EagleProposer):
                     multi_steps_attn_metadata.append(per_layer_attn_metadata)
 
         token_indices_to_sample_len = token_indices_to_sample.shape[0]
-        self.token_indices_to_sample[:token_indices_to_sample_len].copy_(token_indices_to_sample)
+        if (
+            token_indices_to_sample.data_ptr() != self.token_indices_to_sample.data_ptr()
+            or token_indices_to_sample.stride() != (1,)
+            or token_indices_to_sample.dtype != self.token_indices_to_sample.dtype
+            or token_indices_to_sample.device != self.token_indices_to_sample.device
+        ):
+            self.token_indices_to_sample[:token_indices_to_sample_len].copy_(token_indices_to_sample)
 
         with set_ascend_forward_context(
             multi_steps_attn_metadata[0],
@@ -1831,7 +1841,25 @@ class SpecDecodeBaseProposer(EagleProposer):
             num_tokens = target_token_ids.shape[0]
             # Shift the input ids by one token.
             # E.g., [a1, b1, b2, c1, c2, c3] -> [b1, b2, c1, c2, c3, c3]
-            self.input_ids[: num_tokens - 1] = target_token_ids[1:]
+            packed = (
+                HAS_TRITON and getattr(self, "_fixed_mtp_pipeline_ready", False)
+                and self.method == "mtp" and self.num_speculative_tokens == 1
+                and self.pcp_size == self.dcp_size == 1 and not self.uses_mrope and not self.uses_xdrope_dim
+                and not self.vllm_config.model_config.uses_mrope
+                and token_indices_to_sample.data_ptr() == self.token_indices_to_sample.data_ptr()
+                and target_positions.ndim == target_token_ids.ndim == 1
+                and target_positions.is_contiguous() and target_token_ids.is_contiguous() and num_tokens > 0
+                and target_token_ids.dtype == self.input_ids.dtype == torch.int32
+                and target_positions.dtype in (torch.int32, torch.int64) and self.positions.dtype == torch.int32
+                and target_positions.device == self.positions.device
+                and target_token_ids.device == self.input_ids.device
+            )
+            if packed:
+                pack_mtp_tokens_positions_kernel[(triton.cdiv(num_tokens, 128),)](
+                    target_token_ids, target_positions, self.input_ids, self.positions, num_tokens, BLOCK=128,
+                )
+            else:
+                self.input_ids[: num_tokens - 1] = target_token_ids[1:]
             # Replace the last token with the next token.
             # E.g., [b1, b2, c1, c2, c3, c3] -> [a2, b2, b3, c2, c3, c4]
             self.input_ids[token_indices_to_sample] = next_token_ids
@@ -1902,7 +1930,8 @@ class SpecDecodeBaseProposer(EagleProposer):
             if self.uses_xdrope_dim > 0 and self.draft_uses_xdrope_dim == 0:
                 target_positions = target_positions[0]
 
-            self._set_positions(num_tokens, target_positions)
+            if not packed:
+                self._set_positions(num_tokens, target_positions)
             self.hidden_states[:num_tokens] = target_hidden_states
 
             return num_tokens, token_indices_to_sample, cad, (query_lens_d, ori_token_indices_to_sample)
@@ -2170,6 +2199,7 @@ class SpecDecodeBaseProposer(EagleProposer):
 
     def warmup_next_mtp_tokens(self):
         """Compile the usual one-draft layouts with private startup buffers."""
+        self._fixed_mtp_pipeline_ready = False
         n = self.runner.max_num_reqs
         backup = torch.zeros(n, dtype=torch.int32, device=self.device)
         output = torch.empty_like(backup)
@@ -2177,10 +2207,21 @@ class SpecDecodeBaseProposer(EagleProposer):
         grid = (min(triton.cdiv(n, _PREPARE_INPUTS_BLOCK_SIZE), get_vectorcore_num()),)
         for width in (1, 2):
             sampled = torch.zeros((n, width), dtype=torch.int32, device=self.device)
-            prepare_next_mtp_tokens_kernel[grid](
-                sampled, backup, output, counts, n, self.runner.input_batch.vocab_size,
-                sampled.stride(0), sampled.stride(1), WIDTH=width, BLOCK_SIZE=_PREPARE_INPUTS_BLOCK_SIZE,
+            for fixed_q2 in (False, True):
+                indices = torch.empty_like(output) if fixed_q2 else None
+                rejected = torch.empty_like(output) if fixed_q2 else None
+                prepare_next_mtp_tokens_kernel[grid](
+                    sampled, backup, output, counts, n, self.runner.input_batch.vocab_size,
+                    sampled.stride(0), sampled.stride(1), WIDTH=width, BLOCK_SIZE=_PREPARE_INPUTS_BLOCK_SIZE,
+                    sample_indices=indices, rejected_counts=rejected, FIXED_Q2=fixed_q2,
+                )
+        tokens = torch.zeros(2 * n, dtype=torch.int32, device=self.device)
+        for dtype in (torch.int32, torch.int64):
+            positions = torch.zeros(2 * n, dtype=dtype, device=self.device)
+            pack_mtp_tokens_positions_kernel[(triton.cdiv(2 * n, 128),)](
+                tokens, positions, tokens.clone(), tokens.clone(), 2 * n, BLOCK=128,
             )
+        self._fixed_mtp_pipeline_ready = True
 
     def prepare_next_token_ids_padded(
         self,
@@ -2190,6 +2231,7 @@ class SpecDecodeBaseProposer(EagleProposer):
         gpu_input_batch: InputBatch,
         discard_request_indices: torch.Tensor,
         num_discarded_requests: int,
+        spec_decode_metadata: SpecDecodeMetadata | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         This function is used to prepare the inputs for speculative decoding.
@@ -2202,6 +2244,7 @@ class SpecDecodeBaseProposer(EagleProposer):
         """
         # TODO(Ben): Combine this into a custom fused kernel
 
+        self._prepared_mtp_inputs = None
         # Precompute get_token_id for when there is no valid next token
         num_reqs = gpu_input_batch.num_reqs
         seq_lens = common_attn_metadata.seq_lens_cpu[:num_reqs].tolist() if num_reqs else ()
@@ -2219,13 +2262,34 @@ class SpecDecodeBaseProposer(EagleProposer):
         ):
             next_token_ids = sampled_token_ids.new_empty(num_reqs)
             valid_sampled_tokens_count = sampled_token_ids.new_empty(num_reqs, dtype=torch.int64)
+            fixed = getattr(self.runner, "_fixed_mtp_metadata", None) if spec_decode_metadata is not None else None
+            fixed_q2 = (
+                fixed is not None and getattr(self, "_fixed_mtp_pipeline_ready", False) and self.use_async_scheduling
+                and self.pcp_size == self.dcp_size == 1 and not self.needs_extra_input_slots
+                and sampled_token_ids.stride() == (sampled_token_ids.shape[1], 1)
+                and common_attn_metadata.num_reqs == num_reqs
+                and common_attn_metadata.num_actual_tokens == 2 * num_reqs and common_attn_metadata.max_query_len == 2
+                and common_attn_metadata.query_start_loc_cpu.shape == (num_reqs + 1,)
+                and spec_decode_metadata.cu_num_draft_tokens.shape == (num_reqs,)
+                and spec_decode_metadata.cu_num_draft_tokens.stride() == (1,)
+                and spec_decode_metadata.cu_num_draft_tokens.dtype == fixed[0].dtype
+                and spec_decode_metadata.cu_num_draft_tokens.device == fixed[0].device
+                and spec_decode_metadata.cu_num_draft_tokens.data_ptr() == fixed[0].data_ptr()
+            )
+            indices = self.token_indices_to_sample[:num_reqs] if fixed_q2 else None
+            rejected = sampled_token_ids.new_empty(num_reqs) if fixed_q2 else None
             grid = (min(triton.cdiv(num_reqs, _PREPARE_INPUTS_BLOCK_SIZE), get_vectorcore_num()),)
             prepare_next_mtp_tokens_kernel[grid](
                 sampled_token_ids, self.backup_next_token_ids.gpu,
                 next_token_ids, valid_sampled_tokens_count, num_reqs, gpu_input_batch.vocab_size,
                 sampled_token_ids.stride(0), sampled_token_ids.stride(1),
                 WIDTH=sampled_token_ids.shape[1], BLOCK_SIZE=_PREPARE_INPUTS_BLOCK_SIZE,
+                sample_indices=indices, rejected_counts=rejected, FIXED_Q2=fixed_q2,
             )
+            if fixed_q2:
+                self._prepared_mtp_inputs = (
+                    common_attn_metadata, spec_decode_metadata, valid_sampled_tokens_count, indices, rejected
+                )
             return next_token_ids, valid_sampled_tokens_count
 
         # Mask out the sampled tokens indices that should not be sampled.
@@ -2427,7 +2491,13 @@ class SpecDecodeBaseProposer(EagleProposer):
         used as padding and filtered out later by `token_indices_to_sample`.
         No blocking CPU operations should be introduced in this function.
         """
-        if HAS_TRITON:
+        prepared = getattr(self, "_prepared_mtp_inputs", None)
+        self._prepared_mtp_inputs = None
+        fixed_q2 = (prepared is not None and prepared[0] is common_attn_metadata
+                    and prepared[1] is spec_decode_metadata and prepared[2] is valid_sampled_tokens_count)
+        if fixed_q2:
+            token_indices_to_sample, num_rejected_tokens_gpu = prepared[3:]
+        elif HAS_TRITON:
             num_reqs = common_attn_metadata.num_reqs
             device = valid_sampled_tokens_count.device
 
@@ -2465,9 +2535,12 @@ class SpecDecodeBaseProposer(EagleProposer):
 
         query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
 
-        new_query_len_per_req = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
-
-        total_num_tokens = query_start_loc_cpu[-1].item()
+        if fixed_q2:
+            total_num_tokens, max_query_len = 2 * common_attn_metadata.num_reqs, 2
+        else:
+            new_query_len_per_req = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
+            total_num_tokens = query_start_loc_cpu[-1].item()
+            max_query_len = new_query_len_per_req.max().item()
         token_indices = self.arange[:total_num_tokens]
 
         # NOTE: Currently positions and seq_lens are not used in attn forward
@@ -2480,7 +2553,7 @@ class SpecDecodeBaseProposer(EagleProposer):
             num_reqs=common_attn_metadata.num_reqs,
             num_actual_tokens=common_attn_metadata.num_actual_tokens if self.pcp_size > 1 else total_num_tokens,
             num_input_tokens=common_attn_metadata.num_input_tokens,
-            max_query_len=new_query_len_per_req.max().item(),
+            max_query_len=max_query_len,
             actual_seq_lengths_q=self.runner.actual_seq_lengths_q,
             block_table_tensor=common_attn_metadata.block_table_tensor,
             slot_mapping=common_attn_metadata.slot_mapping,

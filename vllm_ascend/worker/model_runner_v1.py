@@ -1626,6 +1626,21 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
         input_ids = self.input_ids.gpu[:num_forward_tokens]
         input_ids.masked_fill_(input_ids == PLACEHOLDER_TOKEN_ID, 0)
 
+    def _select_sample_hidden_states(self, hidden_states, logits_indices):
+        fixed = self._fixed_mtp_metadata
+        if fixed is not None and self.parallel_config.pipeline_parallel_size == 1:
+            identity = fixed[5] if logits_indices.dtype == torch.int64 else fixed[4]
+            if (
+                logits_indices.ndim == 1 and logits_indices.stride() == (1,)
+                and logits_indices.dtype == identity.dtype and logits_indices.device == identity.device
+                and logits_indices.data_ptr() == identity.data_ptr()
+                and logits_indices.numel() <= min(identity.numel(), hidden_states.shape[0])
+                and hidden_states.device == identity.device and hidden_states.is_contiguous()
+            ):
+                # Sampling/drafting is submitted before another target replay can overwrite this view.
+                return hidden_states[:logits_indices.numel()]
+        return hidden_states[logits_indices]
+
     def _prepare_input_ids(
         self,
         scheduler_output: SchedulerOutput,
@@ -1830,6 +1845,7 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                     self.input_batch,
                     self.discard_request_indices.gpu,
                     self.num_discarded_requests,
+                    spec_decode_metadata,
                 )
                 prepared_next = (
                     self._run_cold_perf_npu_stage(
@@ -2725,7 +2741,7 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                         flush_deferred_diagnostics()
                     return output
 
-                sample_hidden_states = hidden_states[logits_indices]
+                sample_hidden_states = self._select_sample_hidden_states(hidden_states, logits_indices)
                 logits = self.model.compute_logits(sample_hidden_states)
             else:
                 # Rare case.
