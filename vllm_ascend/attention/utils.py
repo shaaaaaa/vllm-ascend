@@ -585,6 +585,37 @@ def staged_sfa_metadata_sparse_route(
     return StagedSFARouteReason.DENSE_PREFIX_HIT, tuple(frontiers), ()
 
 
+def native_sfa_cold_resume_layout(
+    metadata: Any, request_ids: Any, num_computed_tokens: Any,
+) -> tuple[tuple[int, ...], tuple[bool, ...]]:
+    """Preserve cold-load proofs even when other batch rows require prefill."""
+    cold_ids = {
+        str(request.req_id)
+        for request in getattr(metadata, "requests", ())
+        if not getattr(request, "is_decode_window_save", False)
+        and getattr(getattr(request, "load_spec", None), "dsa_cold_compact_resume", False)
+    }
+    if not cold_ids:
+        return (), ()
+    active_ids = [str(req_id) for req_id in request_ids] if request_ids is not None else []
+    ordered_cold_ids = [req_id for req_id in active_ids if req_id in cold_ids]
+    if not ordered_cold_ids:
+        return (), ()
+    # Other prefill rows can legitimately have no connector load/save entry.
+    # Validate cold sources with the same resolver used by the graph route.
+    reason, cold_frontiers, _ = staged_sfa_metadata_sparse_route(metadata, ordered_cold_ids)
+    if reason != StagedSFARouteReason.ELIGIBLE:
+        raise RuntimeError(f"Invalid native cold-resume metadata: {reason.value}")
+    if num_computed_tokens is None or len(num_computed_tokens) != len(active_ids):
+        raise RuntimeError("Native cold-resume computed tokens do not match active requests")
+    by_request = dict(zip(ordered_cold_ids, cold_frontiers))
+    frontiers = tuple(by_request.get(req_id, 0) for req_id in active_ids)
+    markers = tuple(req_id in by_request for req_id in active_ids)
+    if any(marker and int(num_computed_tokens[i]) != frontiers[i] for i, marker in enumerate(markers)):
+        raise RuntimeError("Native cold-resume frontier does not match computed tokens")
+    return frontiers, ColdResumeMarkers(markers, frontiers)
+
+
 def staged_sfa_metadata_sparse_load(
     metadata: Any,
     request_ids: Any,

@@ -1521,11 +1521,15 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
                             self.decode_threshold
                             if common_attn_metadata.attn_state
                             == AscendAttentionState.SpecDecoding
-                            else 1
+                            else (
+                                1
+                                if common_attn_metadata.attn_state == AscendAttentionState.DecodeOnly
+                                else common_attn_metadata.max_query_len
+                            )
                         )
                         # Prompt-only recovery may have no draft token. Native
-                        # MTP accepts a shorter query; the restored frontier
-                        # must still match before any sparse rows are exposed.
+                        # prefill can also include longer history recomputation.
+                        # Both require the actual restored frontier to match.
                         if (
                             not 1 <= e - s <= expected_width
                             or int(computed[r]) != expected_end
