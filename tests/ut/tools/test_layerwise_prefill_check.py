@@ -206,7 +206,7 @@ def test_main_records_prompt_path_and_reuses_parent_tokenization(tmp_path, monke
     stages = []
     monkeypatch.setattr(CHECK, "run_stage", lambda options, directory, stage: stages.append(stage))
     monkeypatch.setattr(CHECK, "seal_archive", lambda directory: None)
-    monkeypatch.setattr(CHECK, "analyse", lambda directory, ranks: None)
+    monkeypatch.setattr(CHECK, "analyse", lambda directory, ranks, workers: None)
     CHECK.main()
     assert stages == list(CHECK.STAGES)
     assert fake_tokenizer.apply_chat_template.call_count == 1
@@ -743,8 +743,9 @@ def test_real_worker_hooks_observe_writes_and_loads(monkeypatch, tmp_path, reque
 
 
 @pytest.mark.parametrize("missing_prefill_trace", [False, True])
+@pytest.mark.parametrize("workers", [1, 2])
 def test_three_pass_report_keeps_small_differences_and_real_output_divergence(
-    connector_module, tmp_path, missing_prefill_trace
+    connector_module, tmp_path, missing_prefill_trace, workers
 ):
     for stage, tokens in (("baseline", [7, 8]), ("prefill", [7]), ("decode", [7, 9])):
         directory = tmp_path / stage
@@ -781,12 +782,48 @@ def test_three_pass_report_keeps_small_differences_and_real_output_divergence(
             file.write(
                 json.dumps({"key": f"group{group}", "sha256": sealed[f"group{group}"], "kv_group": group}) + "\n"
             )
-    if missing_prefill_trace:
+    if workers > 1:
+        # Exercise real spawn/pickle/CPU workers through the public CLI, not a
+        # mocked executor. Saved artifacts suffice: no model or NPU is loaded.
+        process = subprocess.run(
+            [
+                sys.executable,
+                str(TOOLS / "layerwise_prefill_check.py"),
+                "--analyse-only",
+                "--run-dir",
+                str(tmp_path),
+                "--devices",
+                "0",
+                "--analysis-workers",
+                str(workers),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=90,
+        )
+        assert process.returncode == int(missing_prefill_trace), process.stdout + process.stderr
+        assert "analyse kv:" in process.stdout and "analyse archive:" in process.stdout
+        result = json.loads((tmp_path / "summary.json").read_text(encoding="utf-8"))
+        progress = [json.loads(line) for line in (tmp_path / "analysis_progress.jsonl").read_text().splitlines()]
+        assert {item["phase"] for item in progress} == {"kv", "archive"}
+        assert all(item["pid"] > 0 and item["seconds"] >= 0 for item in progress)
+        assert len([item for item in progress if item["phase"] == "kv"]) == 3
+        if missing_prefill_trace:
+            with pytest.raises(RuntimeError, match="Trace coverage incomplete; report saved"):
+                CHECK.analyse(tmp_path, 1, workers=1)
+            serial = json.loads((tmp_path / "summary.json").read_text(encoding="utf-8"))
+        else:
+            serial = CHECK.analyse(tmp_path, 1, workers=1)
+        for field in ("kv", "persisted_kv", "structural_errors", "reload", "tokens_equal"):
+            assert result[field] == serial[field]
+    elif missing_prefill_trace:
         with pytest.raises(RuntimeError, match="Trace coverage incomplete; report saved"):
-            CHECK.analyse(tmp_path, 1)
+            CHECK.analyse(tmp_path, 1, workers=1)
         result = json.loads((tmp_path / "summary.json").read_text(encoding="utf-8"))
     else:
-        result = CHECK.analyse(tmp_path, 1)
+        result = CHECK.analyse(tmp_path, 1, workers=1)
+    assert result["analysis_status"] == "complete"
+    assert result["analysis_workers"] == workers
     assert result["tokens_equal"] is False
     assert result["first_different_output_token_index"] == 1
     assert result["decode_compare_position_exclusive"] == 5

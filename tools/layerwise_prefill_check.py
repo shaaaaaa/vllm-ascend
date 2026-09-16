@@ -12,6 +12,7 @@ import argparse
 import csv
 import hashlib
 import json
+import multiprocessing
 import os
 import shutil
 import signal
@@ -22,12 +23,16 @@ import threading
 import time
 from collections import defaultdict
 from collections.abc import Mapping
-from contextlib import suppress
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
+from contextlib import nullcontext, suppress
 from numbers import Integral
 from pathlib import Path
 
 CHUNK_SIZE = 256
 MAX_MODEL_LEN = 16384
+DEFAULT_ANALYSIS_WORKERS = 64
+ARCHIVE_BATCH_FILES = 64
+ANALYSIS_PROGRESS_SECONDS = 5
 STAGES = ("baseline", "prefill", "decode")
 DEFAULT_PROMPT_FILE = Path(__file__).resolve().parents[1] / "examples/layerwise_prefill/article_summary.txt"
 
@@ -74,6 +79,17 @@ class Moments:
             "max": self.maximum,
             "nonfinite": self.nonfinite,
         }
+
+    def merge(self, other):
+        self.nonfinite += other.nonfinite
+        if not other.n:
+            return
+        delta = other.mean - self.mean
+        total = self.n + other.n
+        self.m2 += other.m2 + delta * delta * self.n * other.n / total
+        self.mean += delta * other.n / total
+        self.n = total
+        self.maximum = other.maximum if self.maximum is None else max(self.maximum, other.maximum)
 
 
 def tensor_statistics(base, candidate):
@@ -391,28 +407,38 @@ def read_index(stage_dir):
     return index
 
 
-def load_rows(files, start, stop):
+def load_rows(files, start, stop, cache=None):
     import torch
 
-    chunks = [torch.load(path, map_location="cpu", weights_only=True) for path in files]
-    if not chunks:
+    if stop <= start or not files:
         return torch.empty(0, dtype=torch.long), None
-    pos = torch.cat([item["positions"] for item in chunks])
-    values = torch.cat([item["values"] for item in chunks])
-    keep = (pos >= start) & (pos < stop)
-    pos, values = pos[keep], values[keep]
-    order = torch.argsort(pos)
-    pos, values = pos[order], values[order]
+    key = tuple(files)
+    cached = cache.get(key) if cache is not None else None
+    if cached is None:
+        chunks = [torch.load(path, map_location="cpu", weights_only=True) for path in files]
+        pos = torch.cat([item["positions"] for item in chunks])
+        values = torch.cat([item["values"] for item in chunks])
+        del chunks
+        if pos.numel() > 1 and bool((pos[1:] < pos[:-1]).any()):
+            order = torch.argsort(pos)
+            pos, values = pos[order], values[order]
+        if cache is not None:
+            cache[key] = (pos, values)
+    else:
+        pos, values = cached
+    # Sorted positions allow slicing without copying a complete KV plane again.
+    begin, end = torch.searchsorted(pos, torch.tensor([start, stop], dtype=pos.dtype)).tolist()
+    pos, values = pos[begin:end], values[begin:end]
     if pos.numel() > 1 and bool((pos[1:] == pos[:-1]).any()):
         raise RuntimeError("Duplicate logical KV writes: trace cannot be aligned unambiguously")
     return pos, values
 
 
-def compare_rows(base_files, candidate_files, start, stop):
+def compare_rows(base_files, candidate_files, start, stop, cache=None):
     import torch
 
-    bp, bv = load_rows(base_files, start, stop)
-    cp, cv = load_rows(candidate_files, start, stop)
+    bp, bv = load_rows(base_files, start, stop, cache)
+    cp, cv = load_rows(candidate_files, start, stop, cache)
     report = {
         "baseline_rows": bp.numel(),
         "candidate_rows": cp.numel(),
@@ -432,17 +458,108 @@ def compare_rows(base_files, candidate_files, start, stop):
     return report
 
 
-def compare_archives(root):
+def init_analysis_worker():
+    # Spawned CPU-only workers do not inherit the model/NPU runtime. Avoid each
+    # of the processes starting another full-size OpenMP thread pool.
     import torch
 
+    torch.set_num_threads(1)
+
+
+def run_analysis_job(function, job):
+    started = time.monotonic()
+    return function(job), {"seconds": time.monotonic() - started, "pid": os.getpid()}
+
+
+def analysis_results(function, jobs, executor, workers, phase):
+    """Bound queued work; only paths enter workers and small statistics return."""
+    started = time.monotonic()
+    last_progress = started
+
+    def report(completed, timing=None, inflight=0):
+        nonlocal last_progress
+        now = time.monotonic()
+        if completed not in (1, len(jobs)) and now - last_progress < ANALYSIS_PROGRESS_SECONDS:
+            return
+        last_progress = now
+        detail = f"job={timing['seconds']:.2f}s" if timing is not None else f"inflight={inflight}"
+        print(
+            f"[PREFILL_CHECK] analyse {phase}: {completed}/{len(jobs)}, {detail}, elapsed={now - started:.1f}s",
+            flush=True,
+        )
+
+    if executor is None:
+        for index, job in enumerate(jobs):
+            result, timing = run_analysis_job(function, job)
+            report(index + 1, timing)
+            yield index, result, timing
+        return
+    pending = {}
+    remaining = iter(enumerate(jobs))
+
+    def submit_next():
+        item = next(remaining, None)
+        if item is not None:
+            index, job = item
+            pending[executor.submit(run_analysis_job, function, job)] = index
+
+    for _ in range(min(workers, len(jobs))):
+        submit_next()
+    completed = 0
+    try:
+        while pending:
+            done, _ = wait(pending, timeout=ANALYSIS_PROGRESS_SECONDS, return_when=FIRST_COMPLETED)
+            if not done:
+                report(completed, inflight=len(pending))
+            for future in done:
+                index = pending.pop(future)
+                result, timing = future.result()
+                completed += 1
+                report(completed, timing)
+                yield index, result, timing
+                submit_next()
+    finally:
+        for future in pending:
+            future.cancel()
+
+
+def compare_trace_job(job):
+    key, files, length, cutoff = job
+    rank, layer, part, _ = key
+    cache = {}  # One rank/layer/part only; released before this worker's next job.
+    rows, errors = [], []
+    for label, left, right, start, stop in (
+        ("prefill_written", "baseline", "prefill", 0, length),
+        ("decode_reloaded", "prefill", "loaded", 0, length),
+        ("decode_written_same_prefix", "baseline", "decode", length, cutoff),
+        ("decode_recomputed_prompt_tail", "baseline", "decode", 0, length),
+    ):
+        row = {"comparison": label, "rank": rank, "layer": layer, "part": part}
+        row.update(compare_rows(files[left], files[right], start, stop, cache))
+        if label == "prefill_written" and row["matched_rows"] != length:
+            errors.append(f"Incomplete prefill trace: {rank}/{layer}/{part}")
+        if label == "decode_reloaded":
+            if not row["candidate_rows"]:
+                errors.append(f"No observed NPU reload: {rank}/{layer}/{part}")
+            elif not row["baseline_rows"]:
+                errors.append(f"Missing P reference trace for NPU reload comparison: {rank}/{layer}/{part}")
+            elif not row["matched_rows"]:
+                errors.append(f"No common P/D reload positions: {rank}/{layer}/{part}")
+        if label == "decode_recomputed_prompt_tail" and row["candidate_rows"] > CHUNK_SIZE:
+            errors.append(f"D recomputed more than the uncached prompt tail: {rank}/{layer}/{part}")
+        rows.append(row)
+    return rows, errors
+
+
+def compare_archive_job(job):
+    import torch
+
+    base_dir, candidate_dir, names = job
     reports = []
-    base_dir, candidate_dir = root / "baseline/archive", root / "prefill/archive"
-    left_names = {p.name for p in base_dir.glob("*.pt")}
-    right_names = {p.name for p in candidate_dir.glob("*.pt")}
     # Compare saved values, not just pre-D2H device snapshots; this catches
     # corruption in bank reuse / D2H / deferred publication itself.
     aggregates = {}
-    for name in sorted(left_names & right_names):
+    for name in names:
         left = torch.load(base_dir / name, weights_only=True, map_location="cpu")
         right = torch.load(candidate_dir / name, weights_only=True, map_location="cpu")
         group = (left["worker_id"], left["kv_group"], left["layer_id"])
@@ -461,15 +578,53 @@ def compare_archives(root):
             for metric, data in zip(metrics.values(), (a, b, b - a, (b - a).abs()), strict=True):
                 metric.add(data)
             offset += count
-    for group, metrics in sorted(aggregates.items()):
-        reports.append(
-            {
-                "worker": group[0],
-                "kv_group": group[1],
-                "layer_ordinal": group[2],
-                "stats": {name: m.result() for name, m in metrics.items()},
-            }
-        )
+    return reports, aggregates
+
+
+def archive_layer_reports(aggregates):
+    return [
+        {
+            "worker": group[0],
+            "kv_group": group[1],
+            "layer_ordinal": group[2],
+            "stats": {name: m.result() for name, m in metrics.items()},
+        }
+        for group, metrics in sorted(aggregates.items())
+    ]
+
+
+def compare_archives(root, executor=None, workers=1, on_progress=None):
+    base_dir, candidate_dir = root / "baseline/archive", root / "prefill/archive"
+    left_names = {p.name for p in base_dir.glob("*.pt")}
+    right_names = {p.name for p in candidate_dir.glob("*.pt")}
+    names = sorted(left_names & right_names)
+    jobs = [
+        (base_dir, candidate_dir, names[i : i + ARCHIVE_BATCH_FILES]) for i in range(0, len(names), ARCHIVE_BATCH_FILES)
+    ]
+    partials = {}
+    for index, result, timing in analysis_results(compare_archive_job, jobs, executor, workers, "archive"):
+        partials[index] = result
+        if on_progress is not None:
+            reports, aggregates = result
+            on_progress(
+                {
+                    "phase": "archive",
+                    "batch": index,
+                    "partial": True,
+                    "layers": reports + archive_layer_reports(aggregates),
+                    **timing,
+                }
+            )
+    # Merge in file order, not completion order, for reproducible reductions.
+    reports, aggregates = [], {}
+    for index in sorted(partials):
+        batch_reports, batch_aggregates = partials[index]
+        reports.extend(batch_reports)
+        for group, metrics in batch_aggregates.items():
+            merged = aggregates.setdefault(group, {name: Moments() for name in metrics})
+            for name, metric in metrics.items():
+                merged[name].merge(metric)
+    reports.extend(archive_layer_reports(aggregates))
     return {
         "common_keys": len(left_names & right_names),
         "baseline_only_keys": len(left_names - right_names),
@@ -526,7 +681,11 @@ def verify_archive_reads(root):
                 raise RuntimeError("D read bytes that were not in the sealed P output")
 
 
-def analyse(root, ranks):
+def analyse(root, ranks, workers=DEFAULT_ANALYSIS_WORKERS):
+    if workers < 1:
+        raise ValueError("Analysis workers must be positive")
+    started = time.monotonic()
+    print(f"[PREFILL_CHECK] analysing saved KV with {workers} CPU workers; no model will be started", flush=True)
     prompt = json.loads((root / "prompt.json").read_text(encoding="utf-8"))
     length = prompt["length"]
     outputs = {stage: json.loads((root / stage / "output.json").read_text(encoding="utf-8")) for stage in STAGES}
@@ -534,57 +693,10 @@ def analyse(root, ranks):
         raise RuntimeError("Three runs used different prompts")
     mismatch = first_difference(outputs["baseline"]["token_ids"], outputs["decode"]["token_ids"])
     cutoff = length + (mismatch if mismatch is not None else len(outputs["baseline"]["token_ids"]))
-    indices = {stage: read_index(root / stage) for stage in STAGES}
-    base_keys = {key for key in indices["baseline"] if key[-1] == "current"}
-    if {key[0] for key in base_keys} != {f"rank{i}" for i in range(ranks)}:
-        raise RuntimeError("Missing baseline worker KV traces")
-    rows = []
-    errors = []
-    expected_layers = outputs["baseline"]["num_hidden_layers"]
-    for rank in range(ranks):
-        layers = {key[1] for key in base_keys if key[0] == f"rank{rank}"}
-        if len(layers) != expected_layers:
-            errors.append(f"rank{rank} traced {len(layers)} layers, expected {expected_layers}")
-    for rank, layer, part, kind in sorted(base_keys):
-        key = (rank, layer, part, kind)
-        for label, stage, other_kind, start, stop in (
-            ("prefill_written", "prefill", "current", 0, length),
-            ("decode_reloaded", "decode", "loaded", 0, length),
-            ("decode_written_same_prefix", "decode", "current", length, cutoff),
-            ("decode_recomputed_prompt_tail", "decode", "current", 0, length),
-        ):
-            left_stage = "prefill" if label == "decode_reloaded" else "baseline"
-            row = {"comparison": label, "rank": rank, "layer": layer, "part": part}
-            row.update(
-                compare_rows(
-                    indices[left_stage].get(key, []),
-                    indices[stage].get((rank, layer, part, other_kind), []),
-                    start,
-                    stop,
-                )
-            )
-            if label == "prefill_written" and row["matched_rows"] != length:
-                errors.append(f"Incomplete prefill trace: {rank}/{layer}/{part}")
-            if label == "decode_reloaded":
-                if not row["candidate_rows"]:
-                    errors.append(f"No observed NPU reload: {rank}/{layer}/{part}")
-                elif not row["baseline_rows"]:
-                    errors.append(f"Missing P reference trace for NPU reload comparison: {rank}/{layer}/{part}")
-                elif not row["matched_rows"]:
-                    errors.append(f"No common P/D reload positions: {rank}/{layer}/{part}")
-            if label == "decode_recomputed_prompt_tail" and row["candidate_rows"] > CHUNK_SIZE:
-                errors.append(f"D recomputed more than the uncached prompt tail: {rank}/{layer}/{part}")
-            rows.append(row)
-    try:
-        reload = validate_reload(root, length)
-        verify_archive_reads(root)
-    except RuntimeError as error:
-        errors.append(str(error))
-        reload = {"error": str(error)}
-    archive = compare_archives(root)
-    if not archive["common_keys"]:
-        errors.append("No common persisted baseline/P KV keys")
+    rows, errors = [], []
     summary = {
+        "analysis_status": "running",
+        "analysis_workers": workers,
         "prompt_tokens": length,
         "mtp": False,
         "enforce_eager": {stage: outputs[stage].get("enforce_eager") for stage in STAGES},
@@ -593,12 +705,88 @@ def analyse(root, ranks):
         "first_different_output_token_index": mismatch,
         "prefill_first_token_equal": outputs["baseline"]["token_ids"][:1] == outputs["prefill"]["token_ids"][:1],
         "decode_compare_position_exclusive": cutoff,
-        "reload": reload,
+        "reload": None,
         "structural_errors": errors,
         "kv": rows,
-        "persisted_kv": archive,
+        "persisted_kv": None,
     }
-    write_json(root / "summary.json", summary)
+    last_snapshot = started
+
+    def snapshot():
+        nonlocal last_snapshot
+        last_snapshot = time.monotonic()
+        summary["analysis_elapsed_seconds"] = last_snapshot - started
+        temp = root / "summary.json.tmp"
+        write_json(temp, summary)
+        temp.replace(root / "summary.json")
+
+    snapshot()
+    print(
+        f"[PREFILL_CHECK] tokens_equal={mismatch is None}, first_difference={mismatch}; "
+        f"partial summary: {root / 'summary.json'}",
+        flush=True,
+    )
+    try:
+        indices = {stage: read_index(root / stage) for stage in STAGES}
+        base_keys = {key for key in indices["baseline"] if key[-1] == "current"}
+        if {key[0] for key in base_keys} != {f"rank{i}" for i in range(ranks)}:
+            raise RuntimeError("Missing baseline worker KV traces")
+        expected_layers = outputs["baseline"]["num_hidden_layers"]
+        for rank in range(ranks):
+            layers = {key[1] for key in base_keys if key[0] == f"rank{rank}"}
+            if len(layers) != expected_layers:
+                errors.append(f"rank{rank} traced {len(layers)} layers, expected {expected_layers}")
+        jobs = []
+        for key in sorted(base_keys):
+            files = {stage: indices[stage].get(key, []) for stage in STAGES}
+            files["loaded"] = indices["decode"].get((*key[:3], "loaded"), [])
+            jobs.append((key, files, length, cutoff))
+        try:
+            reload = validate_reload(root, length)
+            verify_archive_reads(root)
+        except RuntimeError as error:
+            errors.append(str(error))
+            reload = {"error": str(error)}
+        summary["reload"] = reload
+        pool = (
+            ProcessPoolExecutor(
+                max_workers=workers,
+                mp_context=multiprocessing.get_context("spawn"),
+                initializer=init_analysis_worker,
+            )
+            if workers > 1
+            else nullcontext(None)
+        )
+        with pool as executor, (root / "analysis_progress.jsonl").open("w", encoding="utf-8") as progress:
+
+            def record(data):
+                progress.write(json.dumps(data, ensure_ascii=False, allow_nan=False) + "\n")
+                progress.flush()
+                summary["analysis_phase"] = data["phase"]
+                if time.monotonic() - last_snapshot >= ANALYSIS_PROGRESS_SECONDS:
+                    snapshot()
+
+            for index, (new_rows, new_errors), timing in analysis_results(
+                compare_trace_job, jobs, executor, workers, "kv"
+            ):
+                rows.extend(new_rows)
+                errors.extend(new_errors)
+                record({"phase": "kv", "key": jobs[index][0], "rows": new_rows, "errors": new_errors, **timing})
+            rows.sort(key=lambda row: (row["rank"], row["layer"], row["part"], row["comparison"]))
+            snapshot()
+            archive = compare_archives(root, executor, workers, record)
+            if not archive["common_keys"]:
+                errors.append("No common persisted baseline/P KV keys")
+            summary["persisted_kv"] = archive
+    except BaseException as error:
+        summary["analysis_status"] = "failed"
+        summary["analysis_error"] = str(error)
+        snapshot()
+        raise
+    errors.sort()
+    summary["analysis_status"] = "complete"
+    summary["analysis_phase"] = "complete"
+    snapshot()
     fields = [
         "comparison",
         "rank",
@@ -651,19 +839,27 @@ def parser():
     cli.add_argument("--run-dir", type=Path)
     cli.add_argument("--stage", choices=STAGES, help=argparse.SUPPRESS)
     cli.add_argument("--analyse-only", action="store_true")
+    cli.add_argument(
+        "--analysis-workers",
+        type=int,
+        default=DEFAULT_ANALYSIS_WORKERS,
+        help="CPU processes for offline KV statistics (default: %(default)s; 1 for serial analysis)",
+    )
     return cli
 
 
 def main():
     print(f"[PREFILL_CHECK] starting; max_model_len={MAX_MODEL_LEN}, gpu_memory_utilization=0.96", flush=True)
     args = parser().parse_args()
+    if args.analysis_workers < 1:
+        raise ValueError("--analysis-workers must be positive")
     if args.stage:
         run_child(args)
         return
     if args.analyse_only:
         if not args.run_dir:
             raise ValueError("--analyse-only needs --run-dir")
-        analyse(args.run_dir.resolve(), len(args.devices.split(",")))
+        analyse(args.run_dir.resolve(), len(args.devices.split(",")), args.analysis_workers)
         return
     if sys.platform != "linux":
         raise RuntimeError("Run the model test on the Linux Ascend server; CPU unit tests run separately")
@@ -694,7 +890,7 @@ def main():
         run_stage(args, root, stage)
         if stage == "prefill":
             seal_archive(root)
-    analyse(root, len(args.devices.split(",")))
+    analyse(root, len(args.devices.split(",")), args.analysis_workers)
 
 
 if __name__ == "__main__":

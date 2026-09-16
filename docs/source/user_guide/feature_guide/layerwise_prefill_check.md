@@ -65,6 +65,20 @@ python -u tools/layerwise_prefill_check.py 2>&1 | tee log.log
   总体方差、最大值；`diff = candidate - baseline` 和 `abs_diff` 的同类统计。
 - `summary.json`：上述统计、持久化 KV 的逐组/层对比、缓存命中证据、
   输出 token 是否相同及首次分叉的位置。
+- `analysis_progress.jsonl`：每项统计完成即追加结果、耗时和分析进程 PID；
+  archive 的中间记录是分批统计（`partial: true`），最终逐层合并值以 summary 为准。
+
+D 结束后，离线统计默认使用 **64 个 CPU 分析进程**：按 rank/层/KV 分量并发，
+持久化 archive 按文件批次并发。每个进程仅保留当前任务的数据，不把全模型 KV
+传回父进程；同一任务的 trace 文件只读取一次，共同 decode 区间为空时不读文件。
+每个分析子进程限制为 1 个 PyTorch 计算线程，避免多进程再各自展开大型线程池。
+可用 `--analysis-workers N` 调整并发数，`1` 为串行；这不改变 baseline/P/D 的运行顺序。
+64 并发面向多核、大内存服务器；相比 4 并发会增加 CPU 内存和磁盘 I/O 压力。
+
+开始统计时即写出 token 对比，`summary.json` 的 `analysis_status: running` 表示
+结果尚不完整；统计期间约每 5 秒更新快照和控制台进度，JSONL 则逐任务落盘。
+`analysis_status: complete` 表示统计结束，仍需查看 `structural_errors`，不代表精度通过。
+分析异常时保存已完成的统计并标记 `failed`。这些改动只影响离线分析，不改变推理路径。
 
 **不使用数值差异阈值，不因 1e-7 或更小差异中断。** NaN/Inf 单独计数，
 不会当作相等。缺层、缺 rank、加载失败、缓存命中不足、实际重新算了整个
@@ -79,8 +93,11 @@ decode 的 KV 只在两次输出的共同 token 前缀内进行数值对比；�
 无需重新跑模型即可重新汇总：
 
 ```bash
-python tools/layerwise_prefill_check.py --analyse-only --run-dir /实际结果目录
+python -u tools/layerwise_prefill_check.py --analyse-only --run-dir /实际结果目录 2>&1 | tee log.log
 ```
+
+先停止仍在运行的旧统计进程，避免同时读同一批 KV、同时写同一份报告。
+重新分析不会启动模型、重新生成 KV 或改写原始 trace/archive 文件。
 
 ## 测试边界
 
