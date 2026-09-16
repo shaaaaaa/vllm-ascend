@@ -58,8 +58,8 @@ vllm serve "$model_path" \
     --data-parallel-size 1 \
     --distributed-executor-backend mp \
     --enable-expert-parallel \
-    --gpu-memory-utilization 0.93 \
-    --max-model-len 140000 \
+    --gpu-memory-utilization 0.96 \
+    --max-model-len 16384 \
     --max-num-seqs 1 \
     --max-num-batched-tokens 4096 \
     --enable-chunked-prefill \

@@ -5,6 +5,7 @@ import ast
 import asyncio
 import importlib.util
 import json
+import subprocess
 import sys
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -29,6 +30,112 @@ PROBE = load_tool("layerwise_prefill_probe")
 
 def args():
     return CHECK.parser().parse_args([])
+
+
+def test_server_launcher_matches_validation_memory_limits():
+    script = (TOOLS / "serve_glm52_baseline.sh").read_text(encoding="utf-8")
+    assert "--max-model-len 16384" in script
+    assert "--gpu-memory-utilization 0.96" in script
+    assert "--enforce-eager" not in script
+
+
+def test_default_prompt_is_committed_article_independent_of_cwd(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    path = args().prompt_file
+    assert path.is_absolute()
+    text = path.read_text(encoding="utf-8")
+    assert text.startswith("请阅读")
+    assert "END OF ARTICLE" in text
+    assert 7500 < len(text.split()) < 9000
+    assert "fourteen percent" in text and "six percent" in text
+    assert text.count("Field record ") == 36
+
+
+@pytest.fixture
+def fake_tokenizer(monkeypatch):
+    tokenizer = Mock()
+    tokenizer.apply_chat_template.return_value = list(range(12288))
+    module = ModuleType("transformers")
+    module.AutoTokenizer = Mock()
+    module.AutoTokenizer.from_pretrained.return_value = tokenizer
+    monkeypatch.setitem(sys.modules, "transformers", module)
+    return tokenizer
+
+
+def test_fixed_prompt_tokenized_once_and_preserved(tmp_path, fake_tokenizer, capsys):
+    options = args()
+    text = options.prompt_file.read_text(encoding="utf-8")
+    assert CHECK.prepare_prompt(options, tmp_path) == 12288
+    fake_tokenizer.apply_chat_template.assert_called_once_with(
+        [{"role": "user", "content": text}], tokenize=True, add_generation_prompt=True
+    )
+    assert (tmp_path / "prompt.txt").read_text(encoding="utf-8") == text
+    record = json.loads((tmp_path / "prompt.json").read_text(encoding="utf-8"))
+    assert record["token_ids"] == list(range(12288))
+    assert record["source"] == str(options.prompt_file.resolve())
+    output = capsys.readouterr().out
+    assert "loading tokenizer" in output and "prompt_tokens=12288" in output
+
+
+@pytest.mark.parametrize(
+    "length, minimum, message", [(4096, None, "multiple"), (16384, None, "exceeds"), (5000, 6000, "below")]
+)
+def test_fixed_prompt_not_padded_or_truncated(tmp_path, fake_tokenizer, length, minimum, message):
+    fake_tokenizer.apply_chat_template.return_value = list(range(length))
+    options = args()
+    options.prompt_tokens = minimum
+    with pytest.raises(ValueError, match=message):
+        CHECK.prepare_prompt(options, tmp_path)
+    assert fake_tokenizer.apply_chat_template.call_count == 1
+    assert not (tmp_path / "prompt.json").exists()
+
+
+def test_prompt_file_override_and_empty_input(tmp_path, fake_tokenizer):
+    source = tmp_path / "custom.txt"
+    source.write_text("自定义文章\n", encoding="utf-8")
+    options = CHECK.parser().parse_args(["--prompt-file", str(source)])
+    CHECK.prepare_prompt(options, tmp_path)
+    assert fake_tokenizer.apply_chat_template.call_args.args[0][0]["content"] == "自定义文章\n"
+    source.write_text(" \n", encoding="utf-8")
+    with pytest.raises(ValueError, match="Empty prompt"):
+        CHECK.prepare_prompt(options, tmp_path)
+
+
+def test_startup_and_help_do_not_import_ml_dependencies():
+    script = str(TOOLS / "layerwise_prefill_check.py")
+    code = f"""
+import importlib.abc
+import runpy
+import sys
+class NoMLImports(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname.split('.')[0] in {{'torch', 'transformers', 'vllm', 'torch_npu'}}:
+            raise RuntimeError('Unexpected early import: ' + fullname)
+sys.meta_path.insert(0, NoMLImports())
+sys.argv = [{script!r}, '--help']
+runpy.run_path({script!r}, run_name='__main__')
+"""
+    result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stderr
+    assert "[PREFILL_CHECK] starting" in result.stdout
+    assert "--prompt-file" in result.stdout
+
+
+def test_main_records_prompt_path_and_reuses_parent_tokenization(tmp_path, monkeypatch, fake_tokenizer):
+    root = tmp_path / "run"
+    monkeypatch.setattr(sys, "argv", ["check", "--run-dir", str(root)])
+    monkeypatch.setattr(CHECK, "sys", SimpleNamespace(platform="linux"))
+    monkeypatch.setattr(CHECK.shutil, "disk_usage", lambda path: SimpleNamespace(free=16 * 1024**3))
+    stages = []
+    monkeypatch.setattr(CHECK, "run_stage", lambda options, directory, stage: stages.append(stage))
+    monkeypatch.setattr(CHECK, "seal_archive", lambda directory: None)
+    monkeypatch.setattr(CHECK, "analyse", lambda directory, ranks: None)
+    CHECK.main()
+    assert stages == list(CHECK.STAGES)
+    assert fake_tokenizer.apply_chat_template.call_count == 1
+    record = json.loads((root / "run.json").read_text(encoding="utf-8"))
+    assert record["prompt_file"] == str(CHECK.DEFAULT_PROMPT_FILE)
+    assert record["actual_prompt_tokens"] == 12288
 
 
 def test_full_model_three_separate_roles():

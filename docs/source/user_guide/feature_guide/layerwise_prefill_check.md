@@ -4,17 +4,28 @@
 
 ```bash
 cd /workspace/lmy/vllm-ascend
-python tools/layerwise_prefill_check.py 2>&1 | tee log.log
+python -u tools/layerwise_prefill_check.py 2>&1 | tee log.log
 ```
 
 默认完整 GLM-5.2 真实权重 `/workspace/models/GLM-5.2-w4a8c8-0723`，
-单机 TP8，设备 0–7。不裁层，不用 dummy 权重。自动生成文章并加总结指令，
-只 tokenize 一次；prompt 至少 12288 token，跨多个 4096-token prefill
+单机 TP8，设备 0–7。不裁层，不用 dummy 权重。默认读取仓库自带的
+`examples/layerwise_prefill/article_summary.txt`：中文总结指令，加一份约 8200
+英文词的虚构公共图书馆改造评估报告，包含 36 份现场记录。文件可以直接打开
+阅读，不再运行时生成、重复追加段落或凑 token。模型路径可用 `--model` 修改，
+输入文件可用 `--prompt-file` 修改。
+
+只 tokenize 一次并打印实际 token 数，三次复用同一组 token IDs。
+实际长度由模型 tokenizer 决定，不保证恰好 12k；必须超过 4096-token prefill
 计算 chunk 和 256-token LMCache chunk。输出最多 128 token，允许正常 EOS。
-模型路径可用 `--model` 修改。
+`--prompt-tokens` 现在仅是可选的最小长度检查，不会补齐或截断固定输入。
 
 三次运行统一使用 `max_model_len=16384`、`gpu_memory_utilization=0.96`。
 实际 prompt 加输出长度超出 16384 时，在启动模型前报错，不静默截断文章。
+普通单机服务脚本 `tools/serve_glm52_baseline.sh` 也使用 `16384 / 0.96`；
+其原有 MTP、图模式等其他配置不变。
+
+脚本入口不再先导入 torch，会立即输出启动提示；随后分别打印读取输入、
+加载 tokenizer、tokenize、启动各模型阶段的进度。子进程使用无缓冲输出。
 
 ## 三次执行
 
@@ -38,6 +49,7 @@ python tools/layerwise_prefill_check.py 2>&1 | tee log.log
 启动时打印结果目录 `layerwise-prefill-...`：
 
 - `prompt.txt`、`prompt.json`：文章、实际 prompt token IDs、摘要校验。
+  `prompt.txt` 保留输入文件的完整文本，`prompt.json` 同时记录原文件路径。
 - `baseline/output.txt`、`prefill/output.txt`、`decode/output.txt`：模型输出。
   对应 `output.json` 同时记录 token IDs。
 - 各阶段 `kv/rank*/`：全部 TP rank、各层、按逻辑 token 位置记录的原始 KV。

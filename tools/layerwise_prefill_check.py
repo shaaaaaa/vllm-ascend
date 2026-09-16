@@ -23,11 +23,10 @@ from collections import defaultdict
 from contextlib import suppress
 from pathlib import Path
 
-import torch
-
 CHUNK_SIZE = 256
 MAX_MODEL_LEN = 16384
 STAGES = ("baseline", "prefill", "decode")
+DEFAULT_PROMPT_FILE = Path(__file__).resolve().parents[1] / "examples/layerwise_prefill/article_summary.txt"
 
 
 def write_json(path, data):
@@ -45,6 +44,8 @@ class Moments:
         self.nonfinite = 0
 
     def add(self, tensor):
+        import torch
+
         values = tensor.detach().double().reshape(-1)
         finite = torch.isfinite(values)
         self.nonfinite += int((~finite).sum())
@@ -95,35 +96,27 @@ def first_difference(left, right):
 
 
 def prepare_prompt(args, root):
-    # Tokenize once in the parent; all three engines get exactly these IDs.
+    # Read a committed, reviewable input; never generate or pad it at runtime.
+    source = args.prompt_file.resolve()
+    text = source.read_text(encoding="utf-8")
+    if not text.strip():
+        raise ValueError(f"Empty prompt file: {source}")
+    (root / "prompt.txt").write_text(text, encoding="utf-8")
+    print(f"[PREFILL_CHECK] prompt: {source}; importing tokenizer dependencies", flush=True)
     from transformers import AutoTokenizer
 
+    print(f"[PREFILL_CHECK] loading tokenizer: {args.model}", flush=True)
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
-    paragraphs = []
-    ids = []
-    while len(ids) < args.prompt_tokens:
-        for _ in range(16):
-            i = len(paragraphs) + 1
-            paragraphs.append(
-                f"Section {i}: In the fictional city of Riverhaven, district {i} installed {120 + i} solar panels "
-                f"and planted {300 + 3 * i} trees. Engineers measured electricity use for twelve months. "
-                "They compared a renovated library with an unchanged school, recording weather, visitor counts, "
-                "maintenance cost, and indoor temperature. The library used less electricity in summer, but "
-                "winter savings were smaller. Residents liked the shade and quieter streets; shopkeepers worried "
-                "about construction delays. The report cautioned that weather and building occupancy changed "
-                "between years, so the observed savings cannot all be attributed to the renovation. The next "
-                "phase will keep a control group and publish monthly measurements, including unsuccessful trials."
-            )
-        article = "\n\n".join(paragraphs)
-        text = "请总结下面这篇文章，概括项目成果、证据的局限以及后续计划，不要逐段复述。\n\n" + article
-        ids = tokenizer.apply_chat_template(
-            [{"role": "user", "content": text}], tokenize=True, add_generation_prompt=True
-        )
+    print("[PREFILL_CHECK] tokenizing fixed article once", flush=True)
+    ids = tokenizer.apply_chat_template([{"role": "user", "content": text}], tokenize=True, add_generation_prompt=True)
+    print(f"[PREFILL_CHECK] prompt_tokens={len(ids)}, output_tokens={args.output_tokens}", flush=True)
     if len(ids) <= max(args.prefill_chunk_tokens, CHUNK_SIZE):
         raise ValueError("Prompt must span multiple compute-prefill chunks AND LMCache chunks")
+    if args.prompt_tokens is not None and len(ids) < args.prompt_tokens:
+        raise ValueError(f"Fixed prompt has {len(ids)} tokens, below --prompt-tokens={args.prompt_tokens}")
+    validate_sequence_length(len(ids), args.output_tokens)
     digest = hashlib.sha256(json.dumps(ids, separators=(",", ":")).encode()).hexdigest()
-    (root / "prompt.txt").write_text(text, encoding="utf-8")
-    write_json(root / "prompt.json", {"token_ids": ids, "sha256": digest, "length": len(ids)})
+    write_json(root / "prompt.json", {"token_ids": ids, "sha256": digest, "length": len(ids), "source": str(source)})
     return len(ids)
 
 
@@ -229,6 +222,7 @@ def engine_options(args, prompt_len, stage):
 
 
 def run_child(args):
+    print(f"[PREFILL_CHECK] {args.stage}: importing vLLM", flush=True)
     from vllm import LLM, SamplingParams
 
     root = Path(args.run_dir)
@@ -296,6 +290,7 @@ def run_stage(args, root, stage):
     stage_dir.mkdir()
     command = [
         sys.executable,
+        "-u",
         str(Path(__file__).resolve()),
         "--stage",
         stage,
@@ -358,6 +353,8 @@ def read_index(stage_dir):
 
 
 def load_rows(files, start, stop):
+    import torch
+
     chunks = [torch.load(path, map_location="cpu", weights_only=True) for path in files]
     if not chunks:
         return torch.empty(0, dtype=torch.long), None
@@ -373,6 +370,8 @@ def load_rows(files, start, stop):
 
 
 def compare_rows(base_files, candidate_files, start, stop):
+    import torch
+
     bp, bv = load_rows(base_files, start, stop)
     cp, cv = load_rows(candidate_files, start, stop)
     report = {
@@ -395,6 +394,8 @@ def compare_rows(base_files, candidate_files, start, stop):
 
 
 def compare_archives(root):
+    import torch
+
     reports = []
     base_dir, candidate_dir = root / "baseline/archive", root / "prefill/archive"
     left_names = {p.name for p in base_dir.glob("*.pt")}
@@ -461,6 +462,8 @@ def validate_reload(root, prompt_len):
 
 
 def seal_archive(root):
+    import torch
+
     manifest = {}
     groups = set()
     for path in (root / "prefill/archive").glob("*.pt"):
@@ -594,8 +597,9 @@ def parser():
     cli = argparse.ArgumentParser(description=__doc__)
     cli.add_argument("--model", default="/workspace/models/GLM-5.2-w4a8c8-0723")
     cli.add_argument("--devices", default="0,1,2,3,4,5,6,7")
+    cli.add_argument("--prompt-file", type=Path, default=DEFAULT_PROMPT_FILE, help="Fixed UTF-8 summarization prompt")
     cli.add_argument(
-        "--prompt-tokens", type=int, default=12288, help="Minimum; keep the complete article/chat template"
+        "--prompt-tokens", type=int, help="Optional minimum length check; never pads or truncates the fixed prompt"
     )
     cli.add_argument("--output-tokens", type=int, default=128)
     cli.add_argument("--prefill-chunk-tokens", type=int, default=4096)
@@ -607,6 +611,7 @@ def parser():
 
 
 def main():
+    print(f"[PREFILL_CHECK] starting; max_model_len={MAX_MODEL_LEN}, gpu_memory_utilization=0.96", flush=True)
     args = parser().parse_args()
     if args.stage:
         run_child(args)
@@ -618,8 +623,8 @@ def main():
         return
     if sys.platform != "linux":
         raise RuntimeError("Run the model test on the Linux Ascend server; CPU unit tests run separately")
-    if args.output_tokens < 2 or args.prompt_tokens <= args.prefill_chunk_tokens:
-        raise ValueError("Need at least two output tokens and a prompt longer than a prefill chunk")
+    if args.output_tokens < 2:
+        raise ValueError("Need at least two output tokens")
     if args.cpu_cache_gb <= 0:
         raise ValueError("CPU cache size must be positive")
     if shutil.disk_usage("/dev/shm").free < args.cpu_cache_gb * 1024**3:
@@ -632,7 +637,15 @@ def main():
     print(f"[PREFILL_CHECK] results: {root}", flush=True)
     prompt_len = prepare_prompt(args, root)
     validate_sequence_length(prompt_len, args.output_tokens)
-    write_json(root / "run.json", {**vars(args), "run_dir": str(root), "actual_prompt_tokens": prompt_len})
+    write_json(
+        root / "run.json",
+        {
+            **vars(args),
+            "prompt_file": str(args.prompt_file.resolve()),
+            "run_dir": str(root),
+            "actual_prompt_tokens": prompt_len,
+        },
+    )
     for stage in STAGES:
         run_stage(args, root, stage)
         if stage == "prefill":
