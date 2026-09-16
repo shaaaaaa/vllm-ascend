@@ -78,10 +78,10 @@ def setup():
             self.seq_lens.gpu[:n] = torch.from_numpy(bases + 2)
             return torch.arange(2 * n), object(), 2 * n
 
-        def _prepare_input_ids(self, scheduled, count, ends):
+        def _prepare_fixed_mtp_input_ids(self, count):
             events.append("input_ids")
 
-        def _calc_spec_decode_metadata(self, *args):
+        def _fixed_spec_decode_metadata(self, *args):
             return SimpleNamespace(logits_indices=torch.arange(2 * self.input_batch.num_reqs))
 
         def _apply_staged_sfa_route(self, route):
@@ -357,6 +357,8 @@ def test_ineligible_transitions_read_real_counts_before_preparation(setup, case)
     assert not r._eligible(s)
     r._update_states(s)
     assert events[:2] == ["sync", "state_update"] and r._async_pending is None
+    r._prepare_inputs(s, np.full(3, 2))
+    assert events[-1] == "normal_prepare" and "input_ids" not in events
 
 
 def test_changed_graph_key_reconciles_without_submitting_metadata_kernel(setup):

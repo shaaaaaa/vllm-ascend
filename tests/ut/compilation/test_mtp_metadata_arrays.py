@@ -7,11 +7,12 @@ import importlib.metadata
 import importlib.util
 import sys
 from pathlib import Path
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 
 import numpy as np
 import pytest
 import torch
+from sfa_test_support import extract
 from torch.utils._python_dispatch import TorchDispatchMode
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -47,7 +48,9 @@ def methods():
         and any(isinstance(t, ast.Attribute) and t.attr == "_fixed_mtp_metadata" for t in n.targets)
     )
     code = ast.parse("from __future__ import annotations")
-    code.body.extend([factory, calc])
+    code.body.extend(
+        [factory, calc, next(n for n in cls.body if getattr(n, "name", "") == "_fixed_spec_decode_metadata")]
+    )
     ns = dict(torch=torch, np=np, SpecDecodeMetadata=module.SpecDecodeMetadata)
     exec(compile(ast.fix_missing_locations(code), str(path), "exec"), ns)
     initialize = compile(ast.Module(body=[assignment], type_ignores=[]), str(path), "exec")
@@ -67,6 +70,7 @@ def runner(methods, *, method="mtp", width=2, cp=False, capacity=16):
         arange_np=np.arange(512, dtype=np.int64),
         _fixed_decode_cu_num_tokens=np.arange(1, capacity + 1, dtype=np.int64) * width,
     )
+    subject._fixed_spec_decode_metadata = MethodType(ns["_fixed_spec_decode_metadata"], subject)
     exec(initialize, dict(ns, self=subject))
     return subject
 
@@ -229,3 +233,58 @@ def test_real_npu_fixed_metadata_matches_general_path(methods):
     torch.npu.synchronize()
     for actual, expected in held:
         compare(actual, expected)
+
+
+@pytest.mark.parametrize("requests", [1, 3, 16])
+@pytest.mark.parametrize("index_dtype", [np.int32, np.int64])
+@pytest.mark.parametrize("draft_dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("lmhead_tp", [False, True])
+def test_validated_async_preparation_reuses_fixed_helpers(
+    methods, monkeypatch, pin_calls, requests, index_dtype, draft_dtype, lmhead_tp
+):
+    subject = runner(methods)
+    baseline = runner(methods)
+    baseline._fixed_mtp_metadata = None
+    subject._async_pending = object()
+    subject.uniform_decode_query_len = 2
+    subject._fixed_decode_cu_num_tokens = subject._fixed_decode_cu_num_tokens.astype(index_dtype)
+    subject.input_batch = SimpleNamespace(
+        num_reqs=requests,
+        prev_sampled_token_ids=torch.arange(requests, dtype=torch.int32).view(-1, 1),
+    )
+    subject._draft_token_ids = torch.arange(requests, dtype=draft_dtype).view(-1, 1) + 100
+    path = ROOT / "vllm_ascend/worker/model_runner_v1.py"
+    subject._prepare_fixed_mtp_input_ids = MethodType(extract(path, "_prepare_fixed_mtp_input_ids", {}), subject)
+    prepare = extract(
+        ROOT / "vllm_ascend/worker/sfa_async_mtp.py",
+        "_prepare_inputs",
+        dict(
+            torch=torch, AscendAttentionState=SimpleNamespace(SpecDecoding="spec"), lmhead_tp_enable=lambda: lmhead_tp
+        ),
+    )
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("validated preparation must not allocate ones or repeat generic validation")
+
+    subject._prepare_input_ids = subject._calc_spec_decode_metadata = forbidden
+    monkeypatch.setattr(np, "ones", forbidden)
+    padding = subject.input_ids.gpu[2 * requests :].clone()
+    for step in range(2):
+        subject.input_batch.prev_sampled_token_ids.add_(7)
+        subject._draft_token_ids.add_(11)
+        baseline.input_ids.gpu[: 2 * requests : 2] = subject.input_batch.prev_sampled_token_ids[:, 0]
+        baseline.input_ids.gpu[1 : 2 * requests : 2] = subject._draft_token_ids[:, 0]
+        expected = methods[0]["_calc_spec_decode_metadata"](
+            baseline, np.full(requests, 1, dtype=np.int32), subject._fixed_decode_cu_num_tokens[:requests], None
+        )
+        logits, actual, count = prepare(subject, None, None)
+        compare(actual, expected)
+        assert count == 2 * requests
+        torch.testing.assert_close(subject.input_ids.gpu[2 * requests :], padding)
+        if lmhead_tp:
+            expected_logits = torch.nn.functional.pad(
+                expected.logits_indices, (0, 2 * (subject.max_num_reqs - requests))
+            )
+        else:
+            expected_logits = expected.logits_indices
+        torch.testing.assert_close(logits, expected_logits)

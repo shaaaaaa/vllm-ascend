@@ -32,7 +32,7 @@ def runner_class():
     path = ROOT / "vllm_ascend/worker/model_runner_v1.py"
     tree = ast.parse("from __future__ import annotations\nclass Base: pass\nclass Subject(Base): pass")
     tree.body[1].body = [method(upstream, "_prepare_input_ids")]
-    tree.body[2].body = [method(path, "_prepare_input_ids")]
+    tree.body[2].body = [method(path, name) for name in ("_prepare_input_ids", "_prepare_fixed_mtp_input_ids")]
     ns = dict(torch=torch, np=np)
     exec(compile(ast.fix_missing_locations(tree), str(path), "exec"), ns)
     base = ns["Base"]._prepare_input_ids

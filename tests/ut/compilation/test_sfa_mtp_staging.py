@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
-from sfa_test_support import ROOT, extract
+from sfa_test_support import ROOT, extract, load_module
 from test_sfa_async_mtp import setup  # noqa: F401
 
 
@@ -188,14 +188,21 @@ def test_inputs_that_could_take_host_fallback_are_not_eligible(staging, kind):
     assert not r._eligible(s)
 
 
-def test_real_ascend_update_and_device_interleave_remain_in_the_mro(staging):
+def test_real_ascend_update_and_device_interleave_remain_in_the_mro(staging, monkeypatch):
     r, s, shape, events, ns = staging
     source = ast.parse((ROOT / "vllm_ascend/worker/model_runner_v1.py").read_text(encoding="utf8"))
     ascend = next(n for n in source.body if isinstance(n, ast.ClassDef) and n.name == "NPUModelRunner")
     tree = ast.parse("from __future__ import annotations\nclass Ascend(GPU): pass")
     tree.body[1].body = [
-        n for n in ascend.body if isinstance(n, ast.FunctionDef) and n.name in ("_update_states", "_prepare_input_ids")
+        n
+        for n in ascend.body
+        if isinstance(n, ast.FunctionDef)
+        and n.name
+        in ("_update_states", "_prepare_input_ids", "_prepare_fixed_mtp_input_ids", "_fixed_spec_decode_metadata")
     ]
+    ns["SpecDecodeMetadata"] = load_module(
+        ROOT.parent / "vllm/vllm/v1/spec_decode/metadata.py", "mtp_staging_metadata", monkeypatch
+    ).SpecDecodeMetadata
     ns["GPU"] = ns["NPUModelRunner"]
     exec(compile(ast.fix_missing_locations(tree), "ascend_dispatch", "exec"), ns)
     ns["NPUModelRunner"] = ns["Ascend"]
@@ -204,7 +211,9 @@ def test_real_ascend_update_and_device_interleave_remain_in_the_mro(staging):
     exec(compile(ast.fix_missing_locations(source), "async_dispatch", "exec"), ns)
     actual = ns["AsyncSFAModelRunner"].__new__(ns["AsyncSFAModelRunner"])
     actual.__dict__.update(vars(r))
-    actual._fixed_mtp_metadata = ()
+    actual._fixed_mtp_metadata = extract(
+        ROOT / "vllm_ascend/worker/model_runner_v1.py", "_fixed_mtp_metadata_arrays", {"torch": torch}
+    )(3, "cpu")
     actual.use_async_scheduling = True
     actual.input_batch.prev_sampled_token_ids = torch.tensor([[11], [22], [33]], dtype=torch.int32)
     actual._draft_token_ids = torch.tensor([[101], [202], [303]], dtype=torch.int64)
@@ -213,9 +222,13 @@ def test_real_ascend_update_and_device_interleave_remain_in_the_mro(staging):
     actual._async_live_execute = True
     with actual.synchronize_input_prep():
         actual._update_states(s)
-        actual._prepare_inputs(s, np.full(3, 2, dtype=np.int32))
+        logits, spec, count = actual._prepare_inputs(s, np.full(3, 2, dtype=np.int32))
         actual._build_attention_metadata(**shape)
     assert actual.input_ids.gpu[:6].tolist() == [11, 101, 22, 202, 33, 303]
+    assert spec.draft_token_ids.tolist() == [101, 202, 303]
+    assert spec.num_draft_tokens == [1, 1, 1] and count == 6
+    assert logits.tolist() == list(range(6))
+    assert logits.dtype == torch.int64
     assert "input_ids" not in events  # The GPU parent's fallback stub was not called.
     assert "staging_wait" not in events and "staging_record" not in events
     actual._model_forward()

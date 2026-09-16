@@ -288,8 +288,9 @@ class AsyncSFAModelRunner(NPUModelRunner):
             return super()._prepare_inputs(scheduler_output, num_scheduled_tokens)
         n = self.input_batch.num_reqs
         self.attn_state, self.with_prefill = AscendAttentionState.SpecDecoding, False
-        self._prepare_input_ids(scheduler_output, 2 * n, self._fixed_decode_cu_num_tokens[:n])
-        spec = self._calc_spec_decode_metadata(np.ones(n, dtype=np.int32), self._fixed_decode_cu_num_tokens[:n], None)
+        # _eligible has already validated request order, tensor layout and Q2 scheduling.
+        self._prepare_fixed_mtp_input_ids(n)
+        spec = self._fixed_spec_decode_metadata(n, self._fixed_decode_cu_num_tokens.dtype)
         self.logits_indices = spec.logits_indices
         logits_indices = spec.logits_indices
         if lmhead_tp_enable():
