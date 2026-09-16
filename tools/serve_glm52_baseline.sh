@@ -49,6 +49,7 @@ export LMCACHE_ENABLE_SHARED_CPU_CACHE=true
 export LMCACHE_SHARED_CPU_CACHE_STRICT=true
 export LMCACHE_EXTRA_CONFIG='{"save_only_first_rank": true}'
 
+# FLASHCOMM1 sequence parallelism needs a TP8-aligned graph capture size.
 vllm serve "$model_path" \
     --trust-remote-code \
     --load-format safetensors \
@@ -64,8 +65,8 @@ vllm serve "$model_path" \
     --enable-chunked-prefill \
     --no-enable-prefix-caching \
     --seed 1024 \
-    --enforce-eager \
-    --speculative-config '{"num_speculative_tokens": 1, "method": "deepseek_mtp", "enforce_eager": true}' \
+    --speculative-config '{"num_speculative_tokens": 1, "method": "deepseek_mtp"}' \
+    --compilation-config '{"cudagraph_capture_sizes": [8]}' \
     --additional-config '{"recompute_scheduler_enable": false, "multistream_overlap_shared_expert": false, "fuse_muls_add": true, "fuse_qknorm_rope": false, "enable_npugraph_ex": true, "layer_sharding": ["q_b_proj"]}' \
     --tool-call-parser glm47 \
     --reasoning-parser glm45 \
