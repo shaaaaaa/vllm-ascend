@@ -81,6 +81,7 @@ def test_historical_recovery_is_not_relabelled_as_speculative_decode():
         _staged_sfa_graph_capture_sizes=[8, 16, 24, 32],
         speculative_config=NS(num_speculative_tokens=1),
         attn_state="prefill",
+        dsa_shrink_latent=2,
         decode_threshold=2,
         vllm_config=NS(lora_config=None),
         input_batch=NS(num_tokens_no_spec=np.array([3100])),

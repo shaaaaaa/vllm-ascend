@@ -238,6 +238,10 @@ def test_bank_table_padding_prepared_once_per_forward(p_node, routed):
 
 @pytest.mark.parametrize("capture,has_rebind", [(False, False), (False, True), (True, False), (True, True)])
 def test_capture_and_unsupported_builders_keep_original_build_path(capture, has_rebind):
+    class LayerNames(list):
+        def __len__(self):
+            raise AssertionError("ordinary metadata build copied the layer-name collection")
+
     cls = source_class("vllm_ascend/worker/model_runner_v1.py", "NPUModelRunner")
     fn = next(n for n in cls.body if getattr(n, "name", None) == "_build_attention_metadata")
     helper = next(n for n in fn.body if getattr(n, "name", None) == "_build_attn_group_metadata")
@@ -246,7 +250,7 @@ def test_capture_and_unsupported_builders_keep_original_build_path(capture, has_
     )
     if has_rebind:
         builder.rebind_layerwise_prefill_metadata = Mock(return_value=None)
-    group = SimpleNamespace(layer_names=["a", "b"], get_metadata_builder=lambda _: builder)
+    group = SimpleNamespace(layer_names=LayerNames(["a", "b"]), get_metadata_builder=lambda _: builder)
     runner = SimpleNamespace(
         attn_groups=[[group]],
         vllm_config=SimpleNamespace(

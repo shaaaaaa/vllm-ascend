@@ -119,6 +119,7 @@ from vllm_ascend.attention.utils import (
     AscendCommonAttentionMetadata,
     ColdResumeMarkers,
     get_lmcache_sparse_cached_tokens,
+    native_sfa_cold_resume_layout,
     staged_sfa_connector_supports_sparse_load,
     staged_sfa_metadata_sparse_route,
     unwrap_staged_sfa_connector_metadata,
@@ -4122,7 +4123,7 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                 assert isinstance(attn_metadata, list)
                 attn_metadata_dict = attn_metadata[ubid]
 
-            for layer_name in layer_names or tuple(attn_group.layer_names):
+            for layer_name in layer_names or attn_group.layer_names:
                 attn_metadata_dict[layer_name] = attn_metadata_i
             return attn_metadata_i
 
@@ -4360,8 +4361,8 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
         is_decode_state = self.attn_state == expected_state
         possible_cold_resume = False
         if (
-            is_decode_state
-            and not graph_configured
+            not (is_decode_state and graph_configured)
+            and self.dsa_shrink_latent
             and num_computed_tokens is not None
             and prompt_lens is not None
         ):
@@ -4372,7 +4373,7 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                 and prompt_probe.shape == (num_reqs,)
                 and bool(np.any(computed_probe < prompt_probe))
             )
-        if is_decode_state and (graph_configured or possible_cold_resume):
+        if is_decode_state and graph_configured:
             metadata_reason, frontiers, cold_resumes = (
                 staged_sfa_metadata_sparse_route(
                     unwrap_staged_sfa_connector_metadata(
@@ -4380,6 +4381,12 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                     ),
                     request_ids,
                 )
+            )
+        elif possible_cold_resume:
+            frontiers, cold_resumes = native_sfa_cold_resume_layout(
+                unwrap_staged_sfa_connector_metadata(kv_connector_metadata),
+                request_ids,
+                num_computed_tokens,
             )
         else:
             frontiers = ()
