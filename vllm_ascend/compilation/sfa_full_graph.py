@@ -130,6 +130,8 @@ class SFAFullGraph:
         """Poll retired snapshots without waiting; never release on query error."""
         if self._submission_failed:
             raise RuntimeError("Full SFA submission failed; source leases retained until shutdown")
+        if not self.retired_sources:
+            return
         pending = []
         for binding in self.retired_sources:
             if binding.completion.query():

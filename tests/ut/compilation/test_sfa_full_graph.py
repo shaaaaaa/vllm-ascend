@@ -419,3 +419,15 @@ def test_same_real_tensor_layout_or_storage_mutation_is_rechecked(graph_module, 
         value.set_(torch.ones(2, 2))
     with pytest.raises(RuntimeError, match="address or layout"):
         graph.validate_inputs(graph_inputs=inputs)
+
+
+def test_empty_retirement_poll_keeps_failure_guard_and_allocates_no_new_list(graph_module):
+    module, _, _, _ = graph_module
+    graph = module.SFAFullGraph()
+    empty = graph.retired_sources
+    for _ in range(3):
+        graph.collect_retired_sources()
+        assert graph.retired_sources is empty
+    graph._submission_failed = True
+    with pytest.raises(RuntimeError, match="submission failed"):
+        graph.collect_retired_sources()

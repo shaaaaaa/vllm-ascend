@@ -2204,12 +2204,10 @@ class SpecDecodeBaseProposer(EagleProposer):
 
         # Precompute get_token_id for when there is no valid next token
         num_reqs = gpu_input_batch.num_reqs
-        self.backup_next_token_ids.np[:num_reqs] = np.array(
-            [
-                requests[gpu_input_batch.req_ids[i]].get_token_id(common_attn_metadata.seq_lens_cpu[i].item())
-                for i in range(num_reqs)
-            ]
-        )
+        seq_lens = common_attn_metadata.seq_lens_cpu[:num_reqs].tolist() if num_reqs else ()
+        self.backup_next_token_ids.np[:num_reqs] = [
+            requests[gpu_input_batch.req_ids[i]].get_token_id(seq_lens[i]) for i in range(num_reqs)
+        ]
         self.backup_next_token_ids.copy_to_gpu(num_reqs)
 
         if (

@@ -175,3 +175,67 @@ def test_npu_fused_selection_and_count_readback(methods, monkeypatch):
         for a, b in zip(actual, expected):
             torch.testing.assert_close(a, b, rtol=0, atol=0)
         torch.testing.assert_close(host, expected[1].cpu(), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("strided", [False, True])
+def test_backup_ids_keep_real_request_lookup_and_active_length_order(methods, monkeypatch, dtype, strided):
+    run, _, _ = methods
+    owner, args = arguments(6, 2, [])
+    common, sampled, requests, batch, *_ = args
+    get_token_id = extract(ROOT.parent / "vllm/vllm/v1/worker/gpu_input_batch.py", "get_token_id", {})
+    request_type = type("Request", (), {"get_token_id": get_token_id})
+    for rid in batch.req_ids:
+        request = request_type()
+        request.num_prompt_tokens, request.prompt_token_ids, request.output_token_ids = 3, [11, 12, 13], [21, 22]
+        requests[rid] = request
+    lengths = torch.tensor([0, 2, 3, 4, 5, -1, 999], dtype=dtype)
+    if strided:
+        storage = torch.zeros(2 * len(lengths), dtype=dtype)
+        storage[::2] = lengths
+        lengths = storage[::2]
+    common.seq_lens_cpu = lengths
+    # Independent reference: exact old preparation, including the missing-token -1.
+    expected = np.array([requests[rid].get_token_id(lengths[i].item()) for i, rid in enumerate(batch.req_ids)])
+    sampled.fill_(-1)
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("backup preparation must not read per-row scalars or allocate np.array")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(torch.Tensor, "item", forbidden)
+        patch.setattr(np, "array", forbidden)
+        next_ids, counts = run(owner, *args)
+    assert next_ids.tolist() == expected.tolist()
+    assert counts.tolist() == [0] * 6
+    assert owner.backup_next_token_ids.np[:6].tolist() == expected.tolist()
+    assert owner.backup_next_token_ids.copies == 1
+    assert owner.backup_next_token_ids.gpu[6:].tolist() == [-77] * 3
+
+
+@pytest.mark.parametrize("failure", ["short_lengths", "unknown_prompt_id"])
+def test_backup_failure_does_not_upload_or_partly_overwrite_host_buffer(methods, failure):
+    run, _, _ = methods
+    owner, args = arguments(3, 2, [])
+    if failure == "short_lengths":
+        args[0].seq_lens_cpu = torch.tensor([20, 21])
+        error = IndexError
+    else:
+        def unavailable(index):
+            raise ValueError("prompt token ID is unknown")
+        args[2]["r1"].get_token_id = unavailable
+        error = ValueError
+    owner.backup_next_token_ids.cpu.fill_(-99)
+    with pytest.raises(error):
+        run(owner, *args)
+    assert owner.backup_next_token_ids.copies == 0
+    assert owner.backup_next_token_ids.cpu.tolist() == [-99] * 6
+
+
+def test_empty_batch_does_not_require_cpu_lengths(methods):
+    run, _, _ = methods
+    owner, args = arguments(0, 2, [])
+    args[0].seq_lens_cpu = None
+    result = run(owner, *args)
+    assert all(t.numel() == 0 for t in result)
+    assert owner.backup_next_token_ids.copies == 1
