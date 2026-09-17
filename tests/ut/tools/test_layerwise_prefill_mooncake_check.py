@@ -29,6 +29,15 @@ def options(tool):
     return args
 
 
+def copy_evidence(tool, root):
+    for stage in ("prefill", "holder0", "holder1"):
+        (root / stage).mkdir(exist_ok=True)
+    (root / "prefill/objects.jsonl").write_text('{"key":"page","size":4}\n', encoding="utf-8")
+    report = {"objects": 1, "bytes": 4, "manifest_sha256": tool.manifest_digest({"page": 4})}
+    tool.write_json(root / "holder1/ready.json", {"device": 1, "segment": "segment1"})
+    tool.write_json(root / "holder0/ready.json", {"device": 0, "segment": "segment0", "copy": report})
+
+
 def test_no_required_config_and_deployment_defaults(tool):
     defaults = tool.parser().parse_args([])
     assert defaults.master is None
@@ -138,11 +147,12 @@ def test_no_archive_or_probe_environment_leaks(tool, tmp_path, monkeypatch):
     assert env["VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE"] == "true"
 
 
-@pytest.mark.parametrize("stage", ["holder", "baseline", "prefill", "decode"])
+@pytest.mark.parametrize("stage", ["holder0", "holder1", "baseline", "prefill", "decode"])
 def test_only_holder_environment_has_a_storage_segment(tool, tmp_path, stage):
     env = tool.child_environment(options(tool), tmp_path, stage)
     extra = json.loads(env["LMCACHE_EXTRA_CONFIG"])
-    assert extra["global_segment_size"] == (8 * 1024**3 if stage == "holder" else 0)
+    assert extra["global_segment_size"] == (8 * 1024**3 if stage.startswith("holder") else 0)
+    assert extra["protocol"] == "ascend"
     assert "LMCACHE_CONFIG_FILE" not in env
 
 
@@ -152,6 +162,7 @@ def test_summary_requires_real_fresh_p_and_d_reload(tool, tmp_path, p_cached, d_
     for stage, cached, tokens in [("baseline", 0, [1, 2]), ("prefill", p_cached, [1]), ("decode", d_cached, [1, 3])]:
         (tmp_path / stage).mkdir()
         tool.write_json(tmp_path / stage / "output.json", {"num_cached_tokens": cached, "token_ids": tokens})
+    copy_evidence(tool, tmp_path)
     if valid:
         tool.analyse(tmp_path, 1024, with_baseline=True)
     else:
@@ -169,15 +180,18 @@ def test_prefill_group_is_fully_stopped_before_decode_launch(tool, tmp_path, mon
 
     def start(args, root, stage):
         actions.append(("start", stage))
-        return NS(stage=stage, poll=lambda: 0, returncode=0)
+        return NS(stage=stage, poll=lambda: None if stage.startswith("holder") else 0, returncode=0)
 
     monkeypatch.setattr(tool, "start_child", start)
     monkeypatch.setattr(tool, "finish_child", lambda proc: actions.append(("stop", proc.stage)))
+    monkeypatch.setattr(tool, "wait_for_holder", lambda *args: actions.append(("ready", "holder0")))
     args = options(tool)
     args.with_baseline = with_baseline
-    tool.run_models(args, tmp_path, NS(poll=lambda: None))
+    tool.run_models(args, tmp_path, {"holder1": NS(poll=lambda: None)})
     stages = ("baseline", "prefill", "decode") if with_baseline else ("prefill", "decode")
-    assert actions == [(action, stage) for stage in stages for action in ("start", "stop")]
+    expected = [(action, stage) for stage in stages[:-1] for action in ("start", "stop")]
+    expected += [("start", "holder0"), ("ready", "holder0"), ("start", "decode"), ("stop", "decode")]
+    assert actions == expected
 
 
 @pytest.fixture
@@ -186,15 +200,17 @@ def holder_runtime(tool, tmp_path, monkeypatch):
     actions = []
     args = options(tool)
     args.devices = "4,5,6,7"
+    args.child = "holder1"
     args.run_dir = tmp_path
-    env = tool.child_environment(args, tmp_path, "holder")
+    (tmp_path / "holder1").mkdir()
+    env = tool.child_environment(args, tmp_path, "holder1")
     monkeypatch.setenv("ASCEND_RT_VISIBLE_DEVICES", env["ASCEND_RT_VISIBLE_DEVICES"])
     monkeypatch.setenv("LMCACHE_EXTRA_CONFIG", env["LMCACHE_EXTRA_CONFIG"])
     state = NS(protocol="ascend", setup_status=0, init_error=None)
 
     def set_device(device):
-        # Physical 4 is logical 0; never pass the physical ordinal here.
-        assert device == 0
+        # Physical 5 is logical 1; never pass the physical ordinal here.
+        assert device == int(args.child[-1])
         actions.append("set_device")
 
     def init():
@@ -223,7 +239,8 @@ def holder_runtime(tool, tmp_path, monkeypatch):
 
     monkeypatch.setitem(sys.modules, "torch_npu", NS(npu=NS(set_device=set_device, init=init)))
     monkeypatch.setitem(sys.modules, "mooncake", NS())
-    monkeypatch.setitem(sys.modules, "mooncake.store", NS(MooncakeDistributedStore=Store))
+    monkeypatch.setitem(sys.modules, "mooncake.store", NS(MooncakeDistributedStore=Store, ReplicateConfig=NS))
+    monkeypatch.setattr(tool, "holder_preflight", lambda *args: actions.append("preflight"))
     monkeypatch.setattr(tool.signal, "signal", lambda *_: None)
     monkeypatch.setattr(tool.threading, "Event", lambda: NS(set=lambda: None, wait=lambda: actions.append("wait")))
     return args, actions, state
@@ -232,8 +249,8 @@ def holder_runtime(tool, tmp_path, monkeypatch):
 def test_holder_initializes_visible_npu_before_mooncake(tool, holder_runtime):
     args, actions, _ = holder_runtime
     tool.run_holder(args)
-    assert actions == ["set_device", "npu_init", "construct", "setup", "wait", "close"]
-    ready = json.loads((args.run_dir / "holder_ready.json").read_text())
+    assert actions == ["set_device", "npu_init", "construct", "setup", "preflight", "wait", "close"]
+    ready = json.loads((args.run_dir / "holder1/ready.json").read_text())
     assert ready["segment"] == "test-holder-segment"
 
 
@@ -243,7 +260,7 @@ def test_holder_npu_init_failure_does_not_start_store_or_publish_ready(tool, hol
     with pytest.raises(RuntimeError, match="NPU initialization failed"):
         tool.run_holder(args)
     assert actions == ["set_device", "npu_init"]
-    assert not (args.run_dir / "holder_ready.json").exists()
+    assert not (args.run_dir / "holder1/ready.json").exists()
 
 
 def test_holder_setup_failure_closes_store_without_publishing_ready(tool, holder_runtime):
@@ -252,18 +269,92 @@ def test_holder_setup_failure_closes_store_without_publishing_ready(tool, holder
     with pytest.raises(RuntimeError, match="Mooncake holder setup failed: -600"):
         tool.run_holder(args)
     assert actions == ["set_device", "npu_init", "construct", "setup", "close"]
-    assert not (args.run_dir / "holder_ready.json").exists()
+    assert not (args.run_dir / "holder1/ready.json").exists()
 
 
-def test_tcp_holder_does_not_initialize_npu(tool, holder_runtime, monkeypatch):
+@pytest.mark.parametrize("copy_failed", [False, True])
+def test_holder0_publishes_ready_only_after_copy(tool, holder_runtime, monkeypatch, copy_failed):
+    args, actions, _ = holder_runtime
+    args.child = "holder0"
+    copy_evidence(tool, args.run_dir)
+    ready_path = args.run_dir / "holder0/ready.json"
+    ready_path.unlink()
+    report = {"objects": 1, "bytes": 4, "manifest_sha256": tool.manifest_digest({"page": 4})}
+
+    def copy(*values):
+        assert not ready_path.exists()
+        assert values[2] == {"page": 4}
+        assert values[4] == "segment1"
+        actions.append("copy")
+        if copy_failed:
+            raise RuntimeError("copy failed")
+        return report
+
+    monkeypatch.setattr(tool, "copy_objects", copy)
+    if copy_failed:
+        with pytest.raises(RuntimeError, match="copy failed"):
+            tool.run_holder(args)
+        assert not ready_path.exists()
+        assert "wait" not in actions
+    else:
+        tool.run_holder(args)
+        assert json.loads(ready_path.read_text())["copy"] == report
+        assert actions.index("copy") < actions.index("wait")
+    assert actions[-1] == "close"
+
+
+@pytest.mark.parametrize("bad", ["digest", "device", "segment", "objects"])
+def test_ready_with_wrong_copy_evidence_cannot_launch_decode(tool, tmp_path, monkeypatch, bad):
+    copy_evidence(tool, tmp_path)
+    path = tmp_path / "holder0/ready.json"
+    record = json.loads(path.read_text())
+    if bad == "device":
+        record["device"] = 1
+    elif bad == "segment":
+        record["segment"] = "segment1"
+    elif bad == "objects":
+        record["copy"]["objects"] = 0
+    else:
+        record["copy"]["manifest_sha256"] = "wrong"
+    tool.write_json(path, record)
+    launched = []
+
+    def start(args, root, stage):
+        launched.append(stage)
+        return NS(poll=lambda: 0 if stage == "prefill" else None, returncode=0)
+
+    monkeypatch.setattr(tool, "start_child", start)
+    monkeypatch.setattr(tool, "finish_child", lambda *_: None)
+    with pytest.raises(RuntimeError, match="refusing to start D"):
+        tool.run_models(options(tool), tmp_path, {"holder1": NS(poll=lambda: None)})
+    assert launched == ["prefill", "holder0"]
+
+
+def test_holder_exit_during_copy_fails_without_waiting_for_timeout(tool, tmp_path):
+    (tmp_path / "holder0").mkdir()
+    with pytest.raises(RuntimeError, match="holder0"):
+        tool.wait_for_holder(tmp_path, "holder0", {"holder0": NS(poll=lambda: 1)}, None)
+
+
+def test_force_tcp_settings_are_not_inherited(tool, tmp_path, monkeypatch):
+    monkeypatch.setenv("MC_FORCE_TCP", "1")
+    monkeypatch.setenv("MC_FORCE_SHM", "1")
+    for stage in ("holder0", "holder1", "prefill", "decode"):
+        env = tool.child_environment(options(tool), tmp_path, stage)
+        assert "MC_FORCE_TCP" not in env and "MC_FORCE_SHM" not in env
+        assert json.loads(env["LMCACHE_EXTRA_CONFIG"])["protocol"] == "ascend"
+
+
+def test_tcp_holder_is_rejected_in_ascend_validation(tool, holder_runtime, monkeypatch):
     args, actions, state = holder_runtime
     state.protocol = "tcp"
     extra = json.loads(os.environ["LMCACHE_EXTRA_CONFIG"])
     extra["protocol"] = state.protocol
     monkeypatch.setenv("LMCACHE_EXTRA_CONFIG", json.dumps(extra))
     monkeypatch.setitem(sys.modules, "torch_npu", None)
-    tool.run_holder(args)
-    assert actions == ["construct", "setup", "wait", "close"]
+    with pytest.raises(ValueError, match="requires the Ascend transport"):
+        tool.run_holder(args)
+    assert actions == []
 
 
 def test_local_nic_detection_has_no_remote_master_dependency(tool, monkeypatch):
@@ -410,8 +501,9 @@ def test_master_death_stops_current_model_instead_of_retrying(tool, tmp_path, mo
     stopped = []
     monkeypatch.setattr(tool, "start_child", lambda *args: proc)
     monkeypatch.setattr(tool, "finish_child", stopped.append)
+    states = iter([None, 1])
     with pytest.raises(RuntimeError, match="Local Mooncake master exited"):
-        tool.run_models(options(tool), tmp_path, NS(poll=lambda: None), NS(poll=lambda: 1))
+        tool.run_models(options(tool), tmp_path, {"holder1": NS(poll=lambda: None)}, NS(poll=lambda: next(states)))
     assert stopped == [proc]
 
 
@@ -424,14 +516,15 @@ def test_run_check_keeps_storage_alive_across_p_exit(tool, tmp_path, monkeypatch
     args.prompt_file.write_text("Test article", encoding="utf-8")
     actions = []
     stages = ("baseline", "prefill", "decode") if with_baseline else ("prefill", "decode")
-    for stage in ("holder", *stages):
+    for stage in ("holder1", "holder0", *stages):
         (tmp_path / stage).mkdir()
     monkeypatch.setattr(tool, "prepare_prompt", lambda *_: 9000)
+    monkeypatch.setattr(tool, "copy_report", lambda *_: {})
 
     def start(args, root, stage):
         actions.append(("start", stage))
-        if stage == "holder":
-            tool.write_json(root / "holder_ready.json", {"pid": 10})
+        if stage.startswith("holder"):
+            tool.write_json(root / stage / "ready.json", {"pid": 10})
             return NS(stage=stage, poll=lambda: None)
         code = 1 if stage == "prefill" and prefill_failed else 0
         return NS(stage=stage, poll=lambda: code, returncode=code)
@@ -451,13 +544,17 @@ def test_run_check_keeps_storage_alive_across_p_exit(tool, tmp_path, monkeypatch
     else:
         tool.run_check(args, tmp_path, NS(poll=lambda: None))
         expected_stages = stages
-    expected = [("start", "holder")]
-    expected += [(action, stage) for stage in expected_stages for action in ("start", "stop")]
+    expected = [("start", "holder1")]
+    for stage in expected_stages:
+        if stage == "decode":
+            expected.append(("start", "holder0"))
+        expected.extend([(action, stage) for action in ("start", "stop")])
     if not prefill_failed:
         expected.append(("analyse", "outputs"))
-    expected.append(("stop", "holder"))
+        expected.append(("stop", "holder0"))
+    expected.append(("stop", "holder1"))
     assert actions == expected
-    for stage in ("prefill", "decode", "holder"):
+    for stage in ("prefill", "decode", "holder1", "holder0"):
         env = json.loads((tmp_path / stage / "lmcache_env.json").read_text())
         assert env["LMCACHE_REMOTE_URL"] == "mooncakestore://127.0.0.1:45678/"
     assert (tmp_path / "baseline").exists() == with_baseline
@@ -472,6 +569,7 @@ def test_summary_without_baseline_never_reads_or_claims_baseline_comparison(
     for stage, hits in (("prefill", 0), ("decode", cached)):
         (tmp_path / stage).mkdir()
         tool.write_json(tmp_path / stage / "output.json", {"num_cached_tokens": hits, "token_ids": [1]})
+    copy_evidence(tool, tmp_path)
     if stale_baseline:
         (tmp_path / "baseline").mkdir()
         (tmp_path / "baseline/output.json").write_text("not valid JSON", encoding="utf-8")
@@ -533,7 +631,7 @@ def test_clear_shared_memory_rejects_redirected_root(tool, monkeypatch):
         tool.clear_shared_memory()
 
 
-@pytest.mark.parametrize("stage", ["holder", "baseline", "prefill", "decode"])
+@pytest.mark.parametrize("stage", ["holder0", "holder1", "baseline", "prefill", "decode"])
 def test_child_never_clears_shared_memory(tool, monkeypatch, stage):
     args = options(tool)
     args.child = stage
@@ -543,7 +641,7 @@ def test_child_never_clears_shared_memory(tool, monkeypatch, stage):
     monkeypatch.setattr(tool, "run_holder", lambda _: actions.append("holder"))
     monkeypatch.setattr(tool, "run_model", lambda _: actions.append("model"))
     tool.main()
-    assert actions == ["holder" if stage == "holder" else "model"]
+    assert actions == ["holder" if stage.startswith("holder") else "model"]
 
 
 @pytest.mark.parametrize("cleanup_fails", [False, True])
