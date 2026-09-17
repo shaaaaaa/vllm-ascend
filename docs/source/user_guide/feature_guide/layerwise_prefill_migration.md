@@ -100,3 +100,6 @@ SFA 图，也不能使用不兼容的 fused matmul-allreduce。可使用普通 P
 后续新增的本地串行验证工具见 [单机三次验证](layerwise_prefill_check.md)：
 完整模型 baseline → layerwise prefill P → 加载 P 输出的 D，保存逐层 KV
 并汇总数值差异；这不是上述未迁入的旧 profiling 脚本。
+
+P 节点开关性能定位见 [单机 prefill profile](layerwise_prefill_profile.md)：
+完整模型 10k OFF、10k ON、100k ON，使用相同文章输入，导出 MindStudio 时间线。
