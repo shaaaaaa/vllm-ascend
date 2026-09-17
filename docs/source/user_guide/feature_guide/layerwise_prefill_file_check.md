@@ -9,7 +9,9 @@ python -u tools/layerwise_prefill_file_check.py --output-tokens 256 2>&1 | tee l
 不启动 Mooncake master、holder，不需要安装原生 Mooncake、指定 IP 或 YAML。
 默认完整 GLM-5.2 权重、TP8、`max_model_len=16384`、
 `gpu_memory_utilization=0.96`，只跑 P、D，不跑 baseline。
-只有 P 使用 eager，D 使用 PIECEWISE；MTP 关闭。
+P、D（以及可选 baseline）均开启 MTP，`num_speculative_tokens=1`。
+只有 P 使用 eager，D 使用 PIECEWISE，捕获大小为 `[1, 2]`，覆盖普通 decode 和 MTP 验证。
+不支持多 token MTP：现有 layerwise prefill 协议要求每次 forward 最多经过一次 draft 层。
 `--output-tokens` 是上限，不强制生成到该长度，EOS 可以提前结束。
 
 沿用之前要求：脚本在开始模型运行前清理一次 `/dev/shm/*`。
@@ -50,7 +52,15 @@ P 的 NPU→LocalCPU offload、后续层的 LocalCPU→NPU reload 不变。
 - `store/*.bin`：原始 KV 字节，头部包含原始 key、字节数和 SHA256。
 - 各阶段 `store-io-*.jsonl`：实际 SDK 级 put/get/exists 调用。
 - `store-sealed.json`：P 完成并退出后的存储清单。
-- `summary.json`：put/get 次数、字节数、两个 KV group 的读取证据和模型输出。
+- `summary.json`：put/get 次数、字节数、两个 KV group 的读取证据、模型输出和各阶段 MTP 统计。
+
+日志中的 `[PREFILL_FILE] decode MTP:`、各阶段 `output.json` 的 `mtp` 字段和
+`summary.json` 的 `mtp` 字段记录本次请求的 draft 验证次数、draft token 数、
+接受 token 数、接受率。计数来自生成前后的 vLLM 指标差值，不包含模型初始化计数。
+这些指标统计提交给目标模型验证的 draft，不是 draft forward 的总次数。
+P 只生成一个输出 token，通常没有 MTP 验证；若 D 提前 EOS，
+也可能没有验证，此时 `verification_observed=false`、接受率为 `null`，
+不能认为已覆盖 MTP decode。不会为了凑验证次数强制忽略 EOS。
 
 只有 D 实际通过 SDK get 读到两个 KV group、字节校验和匹配 P、
 缓存命中覆盖预期前缀，才认为本轮走到了预期加载路径。
@@ -59,5 +69,5 @@ P 的 NPU→LocalCPU offload、后续层的 LocalCPU→NPU reload 不变。
 需要输出基线时可以加 `--with-baseline`；只报告输出差异，不按微小误差中断。
 默认没有逐层 tensor dump 或统计全模型 KV 的耗时后处理。
 
-这不验证 Mooncake 原生传输、租约、网络注册、并发 RemoteFill、DP/MTP，
+这不验证 Mooncake 原生传输、租约、网络注册、并发 RemoteFill、多请求 DP，
 也不适合测性能。文件读写、校验和及本地同步拷贝均有额外测试开销。

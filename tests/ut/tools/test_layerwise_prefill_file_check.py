@@ -166,7 +166,47 @@ def test_environment_keeps_production_connector_and_isolates_old_debug(modules, 
     opts = modules.tool.engine_options(args, 9587, stage)
     assert opts["gpu_memory_utilization"] == 0.96 and opts["max_model_len"] == 16384
     assert bool(opts.get("enforce_eager")) == (stage == "prefill")
-    assert "hf_overrides" not in opts and "speculative_config" not in opts
+    assert "hf_overrides" not in opts
+    assert opts["speculative_config"] == {"method": "deepseek_mtp", "num_speculative_tokens": 1}
+    assert opts["disable_log_stats"] is False
+    if stage != "prefill":
+        assert opts["compilation_config"]["cudagraph_capture_sizes"] == [1, 2]
+        assert opts["compilation_config"]["cudagraph_mode"] == "PIECEWISE"
+    # Do not change the old archive/native tools' defaults through shared helpers.
+    assert "speculative_config" not in modules.tool.base_engine_options(args, 9587, stage)
+
+
+def test_mtp_statistics_use_request_deltas_and_ignore_unrelated_metrics(modules):
+    def snapshot(drafted, accepted):
+        return modules.tool.mtp_snapshot(
+            NS(
+                get_metrics=lambda: [
+                    NS(name="vllm:spec_decode_num_drafts", value=drafted),
+                    NS(name="vllm:spec_decode_num_draft_tokens", value=drafted),
+                    NS(name="vllm:spec_decode_num_accepted_tokens", value=accepted),
+                    NS(name="vllm:spec_decode_num_accepted_tokens_per_pos", values=[accepted]),
+                    NS(name="vllm:request_success", value=100),
+                ]
+            )
+        )
+
+    stats = modules.tool.mtp_statistics(snapshot(10, 5), snapshot(30, 20))
+    assert stats == {
+        "num_speculative_tokens": 1,
+        "num_drafts": 20,
+        "num_draft_tokens": 20,
+        "num_accepted_tokens": 15,
+        "verification_observed": True,
+        "acceptance_rate_percent": 75.0,
+    }
+
+
+@pytest.mark.parametrize("counts", [{}, {"num_drafts": 0, "num_draft_tokens": 0, "num_accepted_tokens": 0}])
+def test_mtp_enabled_without_actual_verification_is_not_reported_as_covered(modules, counts):
+    stats = modules.tool.mtp_statistics(counts, counts)
+    assert stats["verification_observed"] is False
+    assert stats["acceptance_rate_percent"] is None
+    assert stats["num_draft_tokens"] == (0 if counts else None)
 
 
 def test_private_bootstrap_covers_new_interpreters_without_native_mooncake(modules, run_root):
@@ -191,25 +231,31 @@ def test_import_does_not_patch_normal_serving(modules, monkeypatch):
     assert {k: v for k, v in sys.modules.items() if k.startswith("mooncake")} == before
 
 
-def test_real_mooncake_connector_page_put_and_direct_destination_get(modules, run_root, monkeypatch):
+@pytest.mark.parametrize("group,layer_counts", [(0, (2, 2)), (1, (2, 2)), (0, (3, 2)), (1, (3, 2))])
+def test_real_mooncake_connector_page_put_and_direct_destination_get(
+    modules, run_root, monkeypatch, group, layer_counts
+):
     # Real connector code, real page keys and buffer address ordering; only SDK
     # and allocator/model fixtures are replaced. No native Mooncake is imported.
     from lmcache.utils import CacheEngineKey
     from lmcache.v1.storage_backend.connector.mooncakestore_connector import MooncakestoreConnector
 
-    source = torch.arange(8, dtype=torch.bfloat16).reshape(2, 4)
+    # An extra draft latent layer can make the two groups asymmetric. It must
+    # survive page packing and reload; the SDK must not assume target-only KV.
+    layers = layer_counts[group]
+    source = torch.arange(layers * 4, dtype=torch.bfloat16).reshape(layers, 4)
     p = make_store(modules, run_root, "prefill", source)
     connector = MooncakestoreConnector.__new__(MooncakestoreConnector)
     connector.store = p
     connector.config = NS(transfer_timeout=5)
     connector._inflight_put_tasks = set()
     connector._page_first_multi_buffer = True
-    connector._page_group_layer_counts = (2, 2)
+    connector._page_group_layer_counts = layer_counts
     connector.local_cpu_backend = NS(metadata=NS(chunk_size=2))
     connector._metadata_for_raw_key = lambda key: (None, None, None, 4)
     connector.replica_config = modules.sdk.ReplicateConfig()
-    chunk = CacheEngineKey("model", 8, 0, 0x123, torch.bfloat16, kv_group=1)
-    keys = chunk.split_layers(2)
+    chunk = CacheEngineKey("model", 8, 0, 0x123, torch.bfloat16, kv_group=group)
+    keys = chunk.split_layers(layers)
     refs = []
     objs = [
         NS(
@@ -240,12 +286,14 @@ def test_real_mooncake_connector_page_put_and_direct_destination_get(modules, ru
 
     monkeypatch.setattr(connector, "_register_external_owners", observed_registration)
     asyncio.run(
-        connector.batched_get_external_pages([chunk], [[row.data_ptr() for row in dest]], [[8, 8]], (dest,), "request")
+        connector.batched_get_external_pages(
+            [chunk], [[row.data_ptr() for row in dest]], [[8] * layers], (dest,), "request"
+        )
     )
     assert torch.equal(dest, source)
     gets = modules.tool.io_records(run_root, "decode")
     assert gets[-1]["method"] == "batch_get_into_multi_buffers"
-    assert gets[-1]["key"].startswith("__lmcache_page_v1__@2@model@8@0@")
+    assert gets[-1]["key"].startswith(f"__lmcache_page_v1__@{layers}@model@8@0@")
 
 
 def evidence(modules, root, *, read=True):
@@ -259,7 +307,12 @@ def evidence(modules, root, *, read=True):
         d.batch_get_into(keys, [source.data_ptr()] * 2, [6] * 2)
     modules.tool.write_json(root / "prompt.json", {"length": 9587})
     for stage, tokens, cached in (("baseline", [1, 2], 0), ("prefill", [3], 0), ("decode", [4, 5], 9216)):
-        modules.tool.write_json(root / stage / "output.json", {"token_ids": tokens, "num_cached_tokens": cached})
+        before = dict.fromkeys(modules.tool.MTP_COUNTERS, 0)
+        after = {"num_drafts": 10, "num_draft_tokens": 10, "num_accepted_tokens": 7} if stage != "prefill" else before
+        modules.tool.write_json(
+            root / stage / "output.json",
+            {"token_ids": tokens, "num_cached_tokens": cached, "mtp": modules.tool.mtp_statistics(before, after)},
+        )
 
 
 @pytest.mark.parametrize("read", [True, False])
@@ -274,6 +327,9 @@ def test_summary_requires_actual_sdk_calls_and_reports_not_rejects_token_differe
     if read:
         assert summary["decode_read_groups"] == [0, 1]
         assert summary["decode_first_difference"] == 0 and not summary["prefill_first_token_equal"]
+        assert summary["mtp"]["decode"]["verification_observed"] is True
+        assert summary["mtp"]["decode"]["acceptance_rate_percent"] == 70.0
+        assert summary["mtp"]["prefill"]["verification_observed"] is False
         assert not summary["errors"]
     else:
         assert summary["errors"]
@@ -328,11 +384,28 @@ def test_generation_flush_and_shutdown_keep_original_role_and_token_limits(modul
             calls.append(method)
             return [True] * 8
 
+        def get_metrics(self):
+            generated = "generate" in calls and stage != "prefill"
+            counts = (15, 15, 6) if generated else (5, 5, 2)
+            calls.append("metrics")
+            return [
+                NS(name=f"vllm:spec_decode_{name}", value=value)
+                for name, value in zip(modules.tool.MTP_COUNTERS, counts)
+            ]
+
     monkeypatch.setitem(sys.modules, "vllm", NS(LLM=LLM, SamplingParams=NS))
     modules.tool.run_model(args)
-    expected = ["generate", "prefill_check_flush_store", "shutdown"] if stage == "prefill" else ["generate", "shutdown"]
+    expected = ["metrics", "generate", "metrics"]
+    if stage == "prefill":
+        expected.append("prefill_check_flush_store")
+    expected.append("shutdown")
     assert calls[1:] == expected
     assert bool(calls[0].get("enforce_eager")) == (stage == "prefill")
+    assert calls[0]["speculative_config"]["num_speculative_tokens"] == 1
+    output = json.loads((run_root / stage / "output.json").read_text())
+    assert output["mtp"]["verification_observed"] == (stage != "prefill")
+    assert output["mtp"]["num_draft_tokens"] == (0 if stage == "prefill" else 10)
+    assert output["mtp"]["acceptance_rate_percent"] == (None if stage == "prefill" else 40.0)
     assert (
         "worker_extension_cls" not in calls[0]
         if stage == "baseline"

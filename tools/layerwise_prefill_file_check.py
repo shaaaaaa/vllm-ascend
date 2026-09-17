@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """P -> files at the Mooncake SDK boundary -> D. No Mooncake processes.
 
-Full model, TP8, max_model_len=16384, GPU memory=.96; no baseline by default.
+Full model, TP8, MTP1, max_model_len=16384, GPU memory=.96; no baseline by default.
 Not a transport/performance test. Normal serving never imports the file shim.
 """
 
@@ -14,7 +14,8 @@ import tempfile
 from collections import Counter
 from pathlib import Path
 
-from layerwise_prefill_check import DEFAULT_PROMPT_FILE, engine_options, first_difference, prepare_prompt, write_json
+from layerwise_prefill_check import DEFAULT_PROMPT_FILE, first_difference, prepare_prompt, write_json
+from layerwise_prefill_check import engine_options as base_engine_options
 from layerwise_prefill_mooncake_check import (
     STORAGE_CHUNK_TOKENS,
     clear_shared_memory,
@@ -26,6 +27,8 @@ from layerwise_prefill_mooncake_check import (
     stage_environment,
     start_logged_process,
 )
+
+MTP_COUNTERS = ("num_drafts", "num_draft_tokens", "num_accepted_tokens")
 
 
 def parser():
@@ -42,6 +45,41 @@ def parser():
     # Same production config; the test SDK does not allocate the native segment.
     cli.set_defaults(store_gb=8, prompt_tokens=None)
     return cli
+
+
+def engine_options(args, prompt_len, stage):
+    options = base_engine_options(args, prompt_len, stage)
+    # P and D must register the same draft KV layers. The layerwise prefill
+    # protocol supports one MTP forward, not repeated multi-token drafting.
+    options["speculative_config"] = {"method": "deepseek_mtp", "num_speculative_tokens": 1}
+    options["disable_log_stats"] = False  # Expose actual verification/acceptance counts.
+    if stage != "prefill":
+        # Q1 for ordinary decode/draft, Q2 for target verification with MTP1.
+        options["compilation_config"]["cudagraph_capture_sizes"] = [1, 2]
+    return options
+
+
+def mtp_snapshot(llm):
+    counts = {}
+    for metric in llm.get_metrics():
+        for name in MTP_COUNTERS:
+            if metric.name == f"vllm:spec_decode_{name}":
+                counts[name] = counts.get(name, 0) + int(metric.value)
+    return counts
+
+
+def mtp_statistics(before, after):
+    # vLLM counts drafts presented to target verification, not every draft
+    # forward (e.g. P's last draft need never be verified). Do not claim coverage
+    # when EOS/max_tokens ends the request before any verification step.
+    counts = {name: after[name] - before[name] if name in before and name in after else None for name in MTP_COUNTERS}
+    drafted, accepted = counts["num_draft_tokens"], counts["num_accepted_tokens"]
+    return {
+        "num_speculative_tokens": 1,
+        **counts,
+        "verification_observed": drafted is not None and drafted > 0,
+        "acceptance_rate_percent": 100 * accepted / drafted if drafted and accepted is not None else None,
+    }
 
 
 def child_environment(args, root, stage):
@@ -90,12 +128,14 @@ def run_model(args):
     write_json(root / stage / "engine_options.json", options)
     llm = LLM(**options)
     try:
+        before = mtp_snapshot(llm)
         (result,) = llm.generate(
             {"prompt_token_ids": prompt["token_ids"]},
             SamplingParams(temperature=0, seed=1024, max_tokens=1 if stage == "prefill" else args.output_tokens),
             use_tqdm=False,
         )
         (completion,) = result.outputs
+        mtp = mtp_statistics(before, mtp_snapshot(llm))
         write_json(
             root / stage / "output.json",
             {
@@ -104,10 +144,12 @@ def run_model(args):
                 "token_ids": list(completion.token_ids),
                 "num_cached_tokens": result.num_cached_tokens,
                 "finish_reason": completion.finish_reason,
+                "mtp": mtp,
             },
         )
         (root / stage / "output.txt").write_text(completion.text, encoding="utf-8")
         print(f"[PREFILL_FILE] {stage}: {completion.text!r}", flush=True)
+        print(f"[PREFILL_FILE] {stage} MTP: {json.dumps(mtp)}", flush=True)
         if stage == "prefill":
             llm.collective_rpc("prefill_check_flush_store", timeout=600)
     finally:
@@ -203,9 +245,11 @@ def analyse(root, with_baseline=False):
         "decode_cached_tokens": outputs["decode"]["num_cached_tokens"],
         "expected_cached_prefix_min": required,
         "outputs": outputs,
+        "mtp": {stage: output.get("mtp") for stage, output in outputs.items()},
         "errors": errors,
-        "scope": "P/D compute, LocalCPU offload/reload and Mooncake key/page/buffer calls; NOT native transport, "
-        "network registration, concurrent RemoteFill, MTP, DP or performance",
+        "scope": "P/D compute with MTP1, LocalCPU offload/reload and Mooncake key/page/buffer calls; "
+        "check mtp.verification_observed per stage for actual MTP verification coverage; NOT native transport, "
+        "network registration, concurrent RemoteFill, DP or performance",
     }
     if with_baseline:
         summary["prefill_first_token_equal"] = (
@@ -245,7 +289,7 @@ def main():
     for stage in (*model_stages(args), "store"):
         (root / stage).mkdir()  # Never reuse old cache evidence.
     prepare_bootstrap(root)
-    print(f"[PREFILL_FILE] results: {root}; no Mooncake master/holder; max_len=16384, gpu=0.96", flush=True)
+    print(f"[PREFILL_FILE] results: {root}; no Mooncake master/holder; MTP=1, max_len=16384, gpu=0.96", flush=True)
     prepare_prompt(args, root)
     clear_shared_memory(prefix="[PREFILL_FILE]")  # Once before P; never between P and D.
     run_stages(args, root)

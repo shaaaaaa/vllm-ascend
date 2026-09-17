@@ -41,6 +41,26 @@ P 节点可以关闭 MTP；启用时 `num_speculative_tokens` 必须为 1，启�
 大于 1 的配置，避免重复执行 MTP 层推进同一套逐层加载/保存游标。
 关闭 P-node 开关时不受此限制。
 
+生产 P/D 都可使用 `--speculative-config
+'{"num_speculative_tokens":1,"method":"deepseek_mtp"}'`，不依赖测试工具开关。
+保存范围包含已注册的 draft KV 层，latent/indexer 使用各自的物理层序号；
+target forward 结束后保留 connector 元数据，MTP forward 完成后才结束保存。
+
+## 热路径开销收敛（2026-09-17）
+
+| 项目 | 处理方式及剩余开销 |
+| --- | --- |
+| 固定配置 | 初始化时解析 P-node/indexer 开关；逐层不再读取环境变量 |
+| 层名查找 | KV cache 注册/刷新时建两组序号表；逐层字典查找，不扫描列表 |
+| 传输映射 | 每个 forward、每请求、每组的两个 bank 各切片/校验一次；连续区间用 view，不调用 cat；非连续区间各拼接一次 |
+| 异步持久化 | 完成/取消请求只等自身以及复用前缀的未完成 put；不排空其他请求队列 |
+| 新增依赖记录 | 按已有 chunk key 记录尚未完成的 futures，不重新 hash prompt、不复制 KV；完成后清理 |
+| 必要等待 | 保留本地 bank 复用事件、队列满时限流、最终远端持久化及 RemoteFill 完成；退出时等待全部任务 |
+
+未新增逐层日志、TP CPU all-reduce、KV 内容扫描或设备同步。映射复用仅作用于
+deferred layerwise prefill；正常 decode 不跨 forward 复用本次新增的映射缓存。
+这减少了可确认的重复工作，不代表已经测得生产端的性能提升。
+
 保留源功能的限制：PP/PCP/DCP 均为 1；不能启用跳过逐层回调的 FULL/staged
 SFA 图，也不能使用不兼容的 fused matmul-allreduce。可使用普通 PIECEWISE
 边界。关闭 P-node 开关时仍走原有驻留和传输路径。
