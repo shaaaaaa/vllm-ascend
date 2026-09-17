@@ -1,5 +1,10 @@
 # 单机顺序验证 Mooncake 持久化
 
+仅验证 P/D 正确性、不验证原生 Mooncake 时，改用
+[SDK 接口文件存取测试](layerwise_prefill_file_check.md)：
+`python -u tools/layerwise_prefill_file_check.py --output-tokens 256 2>&1 | tee log.log`。
+该脚本不启动 master 或 holder。下文保留原生 Mooncake 测试说明。
+
 `tools/layerwise_prefill_mooncake_check.py` 使用完整 GLM-5.2、单机 TP8，
 `max_model_len=16384`、显存利用率 `0.96`。不开 profiler，不安装 KV debug
 hooks，不开 MTP。只有 P 使用 eager，baseline/D 使用普通 PIECEWISE 图。

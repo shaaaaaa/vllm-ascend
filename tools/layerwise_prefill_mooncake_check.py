@@ -437,8 +437,8 @@ def start_child(args, root, stage):
     return start_logged_process(command, child_environment(args, root, stage), root / stage / "server.log", stage)
 
 
-def start_logged_process(command, env, log_path, label):
-    print(f"[PREFILL_MOONCAKE] starting {label}: {log_path}", flush=True)
+def start_logged_process(command, env, log_path, label, *, prefix="[PREFILL_MOONCAKE]"):
+    print(f"{prefix} starting {label}: {log_path}", flush=True)
     proc = subprocess.Popen(
         command,
         env=env,
@@ -583,13 +583,13 @@ def analyse(root, chunk_size, with_baseline=False):
         raise RuntimeError("Did not exercise fresh P compute followed by D cache reload; see summary.json")
 
 
-def clear_shared_memory():
+def clear_shared_memory(*, prefix="[PREFILL_MOONCAKE]"):
     """Equivalent to rm -rf /dev/shm/*; only the parent calls this at startup."""
     root = Path("/dev/shm")
     if root.is_symlink() or root.resolve() != root or not root.is_dir():
         raise RuntimeError("Refusing to clean /dev/shm: expected a real directory at that exact path")
     print(
-        "[PREFILL_MOONCAKE] WARNING: clearing /dev/shm/* before startup; "
+        f"{prefix} WARNING: clearing /dev/shm/* before startup; "
         "other shared-memory users must be stopped. Deleted data cannot be recovered.",
         flush=True,
     )
@@ -605,7 +605,7 @@ def clear_shared_memory():
                 raise RuntimeError(f"Refusing to remove a directory outside /dev/shm: {entry}")
             shutil.rmtree(entry)
         removed += 1
-    print(f"[PREFILL_MOONCAKE] /dev/shm cleanup complete: removed {removed} entries", flush=True)
+    print(f"{prefix} /dev/shm cleanup complete: removed {removed} entries", flush=True)
 
 
 def main():
