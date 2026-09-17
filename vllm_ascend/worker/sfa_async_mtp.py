@@ -361,6 +361,9 @@ class AsyncSFAModelRunner(NPUModelRunner):
             item = copy(target)
             metadata = {name: item if value is target else value for name, value in s.metadata.items()}
             common = copy(s.common)
+            # Eligibility excludes current cold resumes. The prior step's
+            # restored-frontier proof must not follow advancing MTP positions.
+            common.cold_compact_resumes = ()
             n, capacity = len(s.ids), s.key.token_capacity
             groups = self.input_batch.block_table.block_tables
             prepare_async_mtp_kernel[(triton.cdiv(max(capacity // 2, item.seq_lens.numel()), 32),)](

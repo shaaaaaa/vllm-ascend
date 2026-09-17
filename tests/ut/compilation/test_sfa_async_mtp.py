@@ -14,7 +14,9 @@ from typing import Any
 import numpy as np
 import pytest
 import torch
-from sfa_test_support import AsyncMTPTokenKernel, HostTL, Pointer, extract, load_module
+from sfa_test_support import AsyncMTPTokenKernel, HostTL, Pointer, definitions, extract, load_module
+from test_sfa_row_layout_cache import builder as row_builder
+from test_sfa_row_layout_cache import common as row_common
 from torch.utils._python_dispatch import TorchDispatchMode
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -320,6 +322,67 @@ def test_cascade_guard_preserves_fallback_for_either_kv_group(setup, enabled, bl
         runner._prepare_inputs(scheduled, np.array([2, 2, 2]))
         assert runner._async_pending is None
         assert events == ["sync", "state_update", "normal_prepare"]
+
+
+@pytest.mark.parametrize("accepted", [1, 2])
+@pytest.mark.parametrize("cold_row", [0, 2])
+def test_continuing_mtp_drops_previous_cold_proof_before_frontier_advances(setup, accepted, cold_row):
+    runner, scheduled, shape, events, _ = setup
+    namespace = {}
+    definitions(ROOT / "vllm_ascend/attention/utils.py", {"ColdResumeMarkers"}, namespace)
+    previous = runner._async_snapshot.common
+    bases = runner._async_snapshot.bases.copy()
+    proof = namespace["ColdResumeMarkers"](tuple(i == cold_row for i in range(3)), tuple(bases))
+    previous.cold_compact_resumes = proof
+    runner._async_counts.fill_(accepted)
+    runner.valid_sampled_token_count_cpu.fill_(accepted)
+    # The current connector has no cold load, although the saved step did.
+    assert scheduled.kv_connector_metadata.cold == ()
+    assert runner._eligible(scheduled)
+    runner._update_states(scheduled)
+    runner._prepare_inputs(scheduled, np.array([2, 2, 2]))
+    _, common = runner._build_attention_metadata(**shape)
+    runner._model_forward()
+    assert events.index("replay") < events.index("sync")
+    assert common.cold_compact_resumes == ()
+    assert previous.cold_compact_resumes is proof
+    assert runner._async_snapshot.common.cold_compact_resumes == ()
+    assert common.num_computed_tokens_cpu[:3].tolist() == (bases + accepted).tolist()
+
+    # Execute the actual padded-MTP constructor and draft attention builder.
+    template = row_common(widths=(2, 2, 2), padded=8, computed=bases + accepted, prompts=(4096,) * 3)
+    for name, value in vars(template).items():
+        if not hasattr(common, name):
+            setattr(common, name, value)
+    common.num_reqs, common.num_actual_tokens = 3, 6
+    proposer = SimpleNamespace(arange=torch.arange(32), pcp_size=1,
+                               runner=SimpleNamespace(actual_seq_lengths_q=None, attn_state="spec",
+                                                      decode_token_per_req=2))
+    prepare = extract(ROOT / "vllm_ascend/spec_decode/eagle_proposer.py", "prepare_inputs_padded",
+                      dict(HAS_TRITON=False, torch=torch, AscendCommonAttentionMetadata=SimpleNamespace))
+    draft, *_ = prepare(proposer, common, SimpleNamespace(cu_num_draft_tokens=torch.tensor([1, 2, 3])),
+                        runner._async_counts)
+    builder, _ = row_builder()
+    assert builder.build(0, draft).num_decode_tokens == 6
+    # Restoring the stale proof reproduces the reported failure: width is valid.
+    draft.cold_compact_resumes = proof
+    with pytest.raises(RuntimeError, match="Invalid cold-compact resume layout"):
+        builder.build(0, draft)
+
+
+@pytest.mark.parametrize("transition", ["resume", "cold"])
+def test_current_recovery_keeps_its_proof_on_the_ordinary_path(setup, transition):
+    runner, scheduled, shape, _, _ = setup
+    proof = (False, True, False)
+    runner.normal_metadata[1].cold_compact_resumes = proof
+    if transition == "resume":
+        scheduled.scheduled_cached_reqs.resumed_req_ids = {"r1"}
+    else:
+        scheduled.kv_connector_metadata.cold = proof
+    runner._update_states(scheduled)
+    assert runner._async_pending is None
+    _, common = runner._build_attention_metadata(**shape)
+    assert common.cold_compact_resumes is proof
 
 
 def test_replay_precedes_real_count_readback_and_cpu_update(setup):
