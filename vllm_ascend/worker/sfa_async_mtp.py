@@ -6,7 +6,7 @@ Only device metadata is advanced early. All request/bookkeeping mutations still
 run through the original runner, with real counts, after successful submission.
 """
 
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from copy import copy
 from dataclasses import dataclass
 from typing import Any
@@ -158,7 +158,9 @@ class AsyncSFAModelRunner(NPUModelRunner):
         live, self._async_live_execute = self._async_live_execute, False
         self._async_snapshot = self._async_query_layout = None
         try:
-            return super()._dummy_run(*args, **kwargs)
+            with ExitStack() as input_prep:
+                input_prep.enter_context(super().synchronize_input_prep())
+                return super()._dummy_run(*args, _input_prep=input_prep, **kwargs)
         finally:
             self._async_live_execute = live
             self._async_snapshot = self._async_query_layout = None

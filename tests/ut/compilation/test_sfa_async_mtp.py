@@ -4,7 +4,7 @@
 
 import ast
 import sys
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from copy import copy, deepcopy
 from dataclasses import dataclass
 from pathlib import Path
@@ -123,6 +123,7 @@ def setup():
         torch=torch,
         copy=copy,
         contextmanager=contextmanager,
+        ExitStack=ExitStack,
         dataclass=dataclass,
         Any=Any,
         NPUModelRunner=Base,

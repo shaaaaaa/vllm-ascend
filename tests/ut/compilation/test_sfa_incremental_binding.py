@@ -120,6 +120,30 @@ def test_finish_keeps_only_identity_history_not_sources_or_allocations(managed):
     assert a.transfers[0].ptrs[0, 0] == 3000
 
 
+def test_idle_binding_clears_sources_but_preserves_inflight_owners(managed):
+    a = managed
+    owner = a.owner()
+    a.bind([a.source(owner)])
+    a.graph.run(Mock())
+    active_event = a.events[-1]
+    owner.ref_count_down()
+    a.context.staged_sfa_graph_dummy_run = True
+    a.bind([])
+    assert not owner.freed
+    for transfer in a.transfers:
+        assert transfer.ptrs.eq(0).all() and transfer.valid_tokens.eq(0).all()
+    a.graph.run(Mock())
+    assert a.graph.source_bindings[4].sources == ()
+    active_event.ready = True
+    a.graph.collect_retired_sources()
+    assert owner.freed
+    a.context.staged_sfa_graph_dummy_run = False
+    a.bind([a.source(a.owner(), ptr=9000)])
+    a.graph.run(Mock())
+    assert a.transfers[0].ptrs[0, 0] == 9000
+    torch.npu.synchronize.assert_not_called()
+
+
 def test_partial_update_failure_forces_full_retry_and_preserves_leases(managed, monkeypatch):
     a = managed
     sources = [a.source(a.owner(), ptr=1000 + i * 1000) for i in range(4)]

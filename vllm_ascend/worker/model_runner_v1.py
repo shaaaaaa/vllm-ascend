@@ -3649,9 +3649,16 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                                 name, self.model_config.max_model_len, bind_source=False,
                                 metadata_checks=metadata_checks,
                             )
-                        self._sfa_full_graph.register_transfers(
-                            capacity, tuple(impl._full_graph_transfer for _, impl in impls)
-                        )
+                        transfers = tuple(impl._full_graph_transfer for _, impl in impls)
+                        if self._sfa_full_graph.sealed:
+                            # DP idle forwards also use dummy metadata after startup.
+                            registered = self._sfa_full_graph.get_transfers(capacity)
+                            if len(registered) != len(transfers) or any(
+                                a is not b for a, b in zip(registered, transfers)
+                            ):
+                                raise RuntimeError("Full SFA transfer bundle changed after startup")
+                        else:
+                            self._sfa_full_graph.register_transfers(capacity, transfers)
                     else:
                         self._sfa_full_graph.get_transfers(capacity)
                         seen = set()
@@ -5008,6 +5015,7 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
         is_graph_capturing: bool = False,
         num_active_loras: int = 0,
         profile_seq_lens: int | None = None,
+        _input_prep: Any = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # only support eager mode and piecewise graph now
         assert cudagraph_runtime_mode is None or cudagraph_runtime_mode.valid_runtime_modes()
@@ -5372,6 +5380,10 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                 if hasattr(self.drafter, "model") and hasattr(self.drafter.model, "compute_logits"):
                     return self.drafter.model.compute_logits(hidden_states[dummy_indices])
 
+            # The async runner owns the host-source guard. End it after the
+            # uploads, before target/draft compute; ExitStack covers errors too.
+            if _input_prep is not None:
+                _input_prep.close()
             with set_ascend_forward_context(
                 attn_metadata,
                 self.vllm_config,

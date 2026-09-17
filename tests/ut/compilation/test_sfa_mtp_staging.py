@@ -3,7 +3,7 @@
 """Exercise host-source fences and cached layouts across real runner overrides."""
 
 import ast
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 
 import numpy as np
@@ -11,6 +11,7 @@ import pytest
 import torch
 from sfa_test_support import ROOT, extract, load_module
 from test_sfa_async_mtp import setup  # noqa: F401
+from test_sfa_full_graph_routing import routing  # noqa: F401
 
 
 @pytest.fixture
@@ -156,19 +157,90 @@ def test_failed_exit_event_clears_pending_state(staging, monkeypatch):
     assert r._async_host_write is None and not r._async_live_execute
 
 
-def test_dummy_run_uses_original_guard_and_invalidates_live_layout(staging, monkeypatch):
+@pytest.fixture
+def real_dummy(staging, request, monkeypatch):
     r, _, _, events, ns = staging
+    route_runner, route_ns, _, modes, _ = request.getfixturevalue("routing")
+    namespace = dict(
+        route_ns, torch=torch, cdiv=lambda n, d: (n + d - 1) // d,
+        SEQ_LEN_WITH_MAX_PA_WORKSPACE=512, update_cos_sin=lambda positions: None,
+        get_pp_group=lambda: SimpleNamespace(is_first_rank=True),
+        set_ascend_forward_context=lambda *args, **kwargs: nullcontext(),
+        lmhead_tp_enable=lambda: False,
+    )
+    method = extract(ROOT / "vllm_ascend/worker/model_runner_v1.py", "_dummy_run", namespace)
+    monkeypatch.setattr(ns["NPUModelRunner"], "_dummy_run", method, raising=False)
+    r.vllm_config = route_runner.vllm_config
+    r.vllm_config.model_config.use_mla = True
+    r.speculative_config = SimpleNamespace(method="mtp")
+    r.lora_config = None
+    r.scheduler_config = SimpleNamespace(max_num_batched_tokens=4096, max_num_seqs=16)
+    r.max_num_tokens, r.dp_size, r.decode_threshold = 4096, 4, 2
+    r._staged_sfa_graph_capture_sizes = (8, 16, 24, 32)
+    r._staged_sfa_dp_route_action = route_ns["StagedSFARouteAction"].STAGED
+    r._determine_batch_execution_and_padding = lambda **kw: (
+        modes.PIECEWISE, SimpleNamespace(num_tokens=8, num_reqs=4), False, None, None
+    )
+    r._staged_sfa_dummy_batch_size = lambda **kw: 8
+    r._staged_sfa_dummy_graph_key = lambda *args, **kw: route_ns["StagedSFAGraphKey"].bounded_decode(4, 2)
+    r._should_build_dummy_attn_metadata = lambda *args: True
+    r._staged_sfa_dummy_seq_len = lambda **kw: 512
+    r._staged_sfa_query_start_locs = lambda n, query_width, dtype: np.arange(n + 1, dtype=dtype) * query_width
+    r.maybe_dummy_run_with_lora = lambda *args, **kwargs: nullcontext()
+    r.use_aux_hidden_state_outputs = False
+    r.model = object()
+    r._staged_sfa_impls = [("l0", SimpleNamespace(bootstrap_cross_layer=lambda name: events.append("bootstrap")))]
+    r.drafter = SimpleNamespace(dummy_run=lambda **kw: events.append("draft"))
+    r._model_forward = lambda *args: (events.append("forward"), torch.zeros(8, 4))[1]
+    r.seq_lens.copy_to_gpu = lambda: events.append("sequence_upload")
+    return r, events
+
+
+@pytest.mark.parametrize("event_enabled", [False, True])
+@pytest.mark.parametrize("failure", [None, "upload", "forward"])
+def test_real_dummy_fences_uploads_before_compute(real_dummy, event_enabled, failure):
+    r, events = real_dummy
     r._async_query_layout = (((), ()), 4)
     r._async_live_execute = True
+    if not event_enabled:
+        r.prepare_inputs_event = None
 
-    def dummy(self):
-        with self.synchronize_input_prep():
-            events.append("dummy_write")
-        return "dummy"
+    class GuardedHostArray(np.ndarray):
+        def __setitem__(self, index, value):
+            if event_enabled:
+                assert events and events[0] == "staging_wait"
+            super().__setitem__(index, value)
 
-    monkeypatch.setattr(ns["NPUModelRunner"], "_dummy_run", dummy, raising=False)
-    assert r._dummy_run() == "dummy"
-    assert events == ["staging_wait", "dummy_write", "staging_record"]
+    r.seq_lens.np = r.seq_lens.np.view(GuardedHostArray)
+
+    def upload():
+        assert r.seq_lens.np.tolist() == [512] * 4
+        if event_enabled:
+            assert events[0] == "staging_wait"
+        events.append("sequence_upload")
+        if failure == "upload":
+            raise RuntimeError("upload failed")
+
+    def forward(*args):
+        events.append("forward")
+        if failure == "forward":
+            raise RuntimeError("forward failed")
+        return torch.zeros(8, 4)
+
+    r.seq_lens.copy_to_gpu, r._model_forward = upload, forward
+    if failure:
+        with pytest.raises(RuntimeError, match=failure + " failed"):
+            r._dummy_run(2, uniform_decode=True)
+    else:
+        r._dummy_run(2, uniform_decode=True)
+        assert events[-1] == "draft"
+    if event_enabled:
+        assert events.count("staging_wait") == events.count("staging_record") == 1
+        assert events.index("sequence_upload") < events.index("staging_record")
+        if failure != "upload":
+            assert events.index("query_upload") < events.index("staging_record") < events.index("forward")
+    else:
+        assert "staging_wait" not in events and "staging_record" not in events
     assert r._async_live_execute and r._async_query_layout is None and r._async_snapshot is None
 
 
