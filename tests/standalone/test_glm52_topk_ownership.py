@@ -11,9 +11,18 @@ import torch
 def consumer(shared, shrink):
     path = Path(__file__).resolve().parents[2] / "vllm_ascend/attention/sfa_v1.py"
     tree = ast.parse(path.read_text(encoding="utf8"))
-    names = {"_get_indexcache_topk_indices", "_update_indexcache_topk_indices"}
+    names = {
+        "_get_indexcache_topk_indices",
+        "_update_indexcache_topk_indices",
+        "_record_indexcache_publish",
+        "_check_indexcache_read",
+    }
     nodes = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name in names]
-    ns = dict(torch=torch)
+    ns = dict(
+        torch=torch,
+        _INDEXCACHE_PUBLISH_STATE={},
+        logger=NS(warning=lambda *args, **kwargs: None),
+    )
     exec(compile(ast.fix_missing_locations(ast.Module(body=nodes, type_ignores=[])), str(path), "exec"), ns)
     obj = type("Consumer", (), {name: ns[name] for name in names})()
     obj.topk_indices_buffer = shared

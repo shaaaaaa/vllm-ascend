@@ -359,6 +359,49 @@ def _dsa_topk_to_2d_indices(topk_indices: torch.Tensor) -> torch.Tensor:
     return topk_indices.reshape(topk_indices.shape[0], -1)
 
 
+_INDEXCACHE_PUBLISH_STATE: dict[int, list] = {}
+
+
+def _record_indexcache_publish(buffer: torch.Tensor, rows: int, width: int) -> None:
+    state = _INDEXCACHE_PUBLISH_STATE.setdefault(id(buffer), [0, 0, False])
+    state[0] = rows
+    state[1] = width
+    if width < buffer.shape[-1] and not state[2]:
+        state[2] = True
+        logger.warning(
+            "[SFA-TOPK-WIDTH] producer published top-k width %d but shared "
+            "buffer/consumer width is %d (rows=%d): columns [%d, %d) keep "
+            "uninitialized/stale values and reach npu_sparse_flash_attention",
+            width,
+            buffer.shape[-1],
+            rows,
+            width,
+            buffer.shape[-1],
+        )
+
+
+def _check_indexcache_read(buffer: torch.Tensor, rows: int) -> None:
+    state = _INDEXCACHE_PUBLISH_STATE.get(id(buffer))
+    if state is None or rows > state[0] or buffer.shape[-1] > state[1]:
+        if state is None:
+            state = [0, 0, True]
+            _INDEXCACHE_PUBLISH_STATE[id(buffer)] = state
+        elif state[2]:
+            return
+        else:
+            state[2] = True
+        logger.warning(
+            "[SFA-TOPK-STALE] consumer reads shared top-k buffer "
+            "(rows=%d, width=%d) beyond last producer publish (rows=%d, "
+            "width=%d): uninitialized/stale indices are used as sparse "
+            "attention indices",
+            rows,
+            buffer.shape[-1],
+            -1 if state is None else state[0],
+            -1 if state is None else state[1],
+        )
+
+
 @lru_cache(maxsize=1)
 def _decode_window_save_window_size() -> int:
     value = os.environ.get("LMCACHE_DECODE_WINDOW_SAVE_WINDOW_SIZE", "0")
@@ -2367,6 +2410,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                 "IndexCache requires topk_indices_buffer when skip_topk is "
                 f"enabled. layer_name={self.layer_name}."
             )
+        _check_indexcache_read(self.topk_indices_buffer, num_tokens)
         if self._indexcache_topk_staging is not None:
             topk_indices = self._indexcache_topk_staging[:num_tokens]
             topk_indices.copy_(self.topk_indices_buffer[:num_tokens])
@@ -2393,6 +2437,9 @@ class AscendSFAImpl(MLAAttentionImpl):
             assert topk_indices_to_cache.shape[1] == 1
             topk_indices_to_cache = topk_indices_to_cache.squeeze(1)
         topk_indices_buffer.copy_(topk_indices_to_cache)
+        _record_indexcache_publish(
+            self.topk_indices_buffer, num_tokens, topk_tokens
+        )
 
     def exec_kv(
         self,
