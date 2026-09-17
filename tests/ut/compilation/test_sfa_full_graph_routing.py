@@ -45,7 +45,9 @@ def routing():
         parent_process=lambda: object(),  # Fixture represents a worker child.
         record_function_or_nullcontext=lambda name: nullcontext(),
     )
-    definitions(root / "attention/utils.py", {"unwrap_staged_sfa_connector_metadata", "ColdResumeMarkers"}, ns)
+    definitions(root / "attention/utils.py", {
+        "unwrap_staged_sfa_connector_metadata", "ColdResumeMarkers", "native_sfa_cold_resume_layout",
+    }, ns)
     definitions(root / "compilation/sfa_fail_stop.py", {"uses_local_sfa_fail_stop"}, ns)
     definitions(root / "ascend_forward_context.py", {"StagedSFAQueryProfile", "StagedSFAGraphKey"}, ns)
     definitions(
@@ -308,7 +310,9 @@ def test_cold_resume_keeps_markers_and_mtp_route_after_merge(routing, full_graph
     env.VLLM_ASCEND_SFA_FULL_GRAPH = full_graph
     runner.attn_state = states.DecodeOnly if width == 1 else states.SpecDecoding
     runner._staged_sfa_graph_capture_sizes = (2,) if configured else ()
-    metadata = object()
+    metadata = SimpleNamespace(requests=[SimpleNamespace(
+        req_id="cold", load_spec=SimpleNamespace(dsa_cold_compact_resume=True),
+    )])
     wrapped = SimpleNamespace(child=metadata)
     unwrap = Mock(side_effect=lambda value: value.child)
     ns.update(

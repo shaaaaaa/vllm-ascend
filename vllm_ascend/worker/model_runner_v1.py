@@ -122,6 +122,7 @@ from vllm_ascend.attention.utils import (
     AscendCommonAttentionMetadata,
     ColdResumeMarkers,
     get_lmcache_sparse_cached_tokens,
+    native_sfa_cold_resume_layout,
     staged_sfa_connector_supports_sparse_load,
     staged_sfa_metadata_sparse_route,
     unwrap_staged_sfa_connector_metadata,
@@ -4470,8 +4471,7 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
         )
         possible_cold_resume = False
         if (
-            is_decode_state
-            and not graph_configured
+            not (is_decode_state and graph_configured)
             and num_computed_tokens is not None
             and prompt_lens is not None
         ):
@@ -4482,13 +4482,19 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                 and prompt_probe.shape == (num_reqs,)
                 and bool(np.any(computed_probe < prompt_probe))
             )
-        if is_decode_state and (graph_configured or possible_cold_resume):
+        if is_decode_state and graph_configured:
             metadata = unwrap_staged_sfa_connector_metadata(kv_connector_metadata)
             # Reuse only the same metadata object validated by this async step.
             if _validated_sparse_route is not None and _validated_sparse_route[0] is metadata:
                 metadata_reason, frontiers, cold_resumes = _validated_sparse_route[1]
             else:
                 metadata_reason, frontiers, cold_resumes = staged_sfa_metadata_sparse_route(metadata, request_ids)
+        elif possible_cold_resume:
+            frontiers, cold_resumes = native_sfa_cold_resume_layout(
+                unwrap_staged_sfa_connector_metadata(kv_connector_metadata),
+                request_ids,
+                num_computed_tokens,
+            )
         else:
             frontiers = ()
             cold_resumes = ()
