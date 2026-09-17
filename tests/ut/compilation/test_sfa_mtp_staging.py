@@ -189,6 +189,7 @@ def real_dummy(staging, request, monkeypatch):
     r.maybe_dummy_run_with_lora = lambda *args, **kwargs: nullcontext()
     r.use_aux_hidden_state_outputs = False
     r.model = object()
+    r._sfa_full_graph = SimpleNamespace(sealed=True)
     r._staged_sfa_impls = [("l0", SimpleNamespace(bootstrap_cross_layer=lambda name: events.append("bootstrap")))]
     r.drafter = SimpleNamespace(dummy_run=lambda **kw: events.append("draft"))
     r._model_forward = lambda *args: (events.append("forward"), torch.zeros(8, 4))[1]
@@ -196,10 +197,12 @@ def real_dummy(staging, request, monkeypatch):
     return r, events
 
 
+@pytest.mark.parametrize("sealed", [False, True])
 @pytest.mark.parametrize("event_enabled", [False, True])
 @pytest.mark.parametrize("failure", [None, "upload", "forward"])
-def test_real_dummy_fences_uploads_before_compute(real_dummy, event_enabled, failure):
+def test_real_dummy_fences_uploads_before_compute(real_dummy, event_enabled, failure, sealed):
     r, events = real_dummy
+    r._sfa_full_graph.sealed = sealed
     r._async_query_layout = (((), ()), 4)
     r._async_live_execute = True
     if not event_enabled:
@@ -234,6 +237,8 @@ def test_real_dummy_fences_uploads_before_compute(real_dummy, event_enabled, fai
     else:
         r._dummy_run(2, uniform_decode=True)
         assert events[-1] == "draft"
+    if failure != "upload":
+        assert ("bootstrap" in events) == (not sealed)
     if event_enabled:
         assert events.count("staging_wait") == events.count("staging_record") == 1
         assert events.index("sequence_upload") < events.index("staging_record")

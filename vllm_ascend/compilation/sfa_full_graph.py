@@ -306,6 +306,19 @@ class SFAFullGraph:
             raise RuntimeError(f"Full SFA graph inputs changed address or layout: {key}")
         return signature
 
+    def validate_idle_metadata(self, layer_names: list[str], inputs: dict[str, Any]) -> None:
+        """Check one shared metadata layout; captured KV/transfer owners stay fixed."""
+        key = get_forward_context().staged_sfa_graph_key
+        entry = self.entries.get(key)
+        if entry is None:
+            raise RuntimeError(f"Full SFA graph missing at runtime: {key}; live capture is prohibited")
+        expected_by_layer = dict(entry.signature[1] or ())
+        actual = tensor_signature(inputs)
+        for layer_name in layer_names:
+            expected = expected_by_layer.get(layer_name)
+            if expected is None or actual != tuple((k, v) for k, v in expected if k != "kv_caches"):
+                raise RuntimeError(f"Full SFA graph inputs changed address or layout: {key}, layer={layer_name}")
+
     def prepare_run(self, *, graph_inputs: Any = None, **kwargs: Any) -> SFAValidatedCall:
         """Select the captured entry; inspect tensor layouts only at startup.
 
@@ -318,7 +331,14 @@ class SFAFullGraph:
         context = get_forward_context()
         key = context.staged_sfa_graph_key
         entry = self.entries.get(key)
-        if context.staged_sfa_graph_dummy_run or entry is None:
+        if context.staged_sfa_graph_dummy_run:
+            if self.sealed and entry is not None and graph_inputs is None:
+                if tensor_signature(kwargs) != entry.signature[0]:
+                    raise RuntimeError(f"Full SFA graph inputs changed address or layout: {key}")
+                signature = entry.signature
+            else:
+                signature = self.validate_inputs(graph_inputs=graph_inputs, **kwargs)
+        elif entry is None:
             signature = self.validate_inputs(graph_inputs=graph_inputs, **kwargs)
         else:
             signature = entry.signature

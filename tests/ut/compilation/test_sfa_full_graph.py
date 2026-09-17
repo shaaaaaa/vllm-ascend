@@ -431,3 +431,23 @@ def test_empty_retirement_poll_keeps_failure_guard_and_allocates_no_new_list(gra
     graph._submission_failed = True
     with pytest.raises(RuntimeError, match="submission failed"):
         graph.collect_retired_sources()
+
+
+def test_idle_metadata_group_cannot_merge_different_captured_layouts(graph_module):
+    module, context, _, _ = graph_module
+    graph = module.SFAFullGraph()
+    first, second = torch.ones(4), torch.ones(4)
+    inputs = {"a": {"slots": first, "kv_caches": ()}, "b": {"slots": second, "kv_caches": ()}}
+    graph.run(lambda: None, graph_inputs=inputs)
+    graph.seal((context.staged_sfa_graph_key,))
+    graph.validate_idle_metadata(["a"], {"slots": first})
+    graph.validate_idle_metadata(["b"], {"slots": second})
+    with pytest.raises(RuntimeError, match="layer=b"):
+        graph.validate_idle_metadata(["a", "b"], {"slots": first})
+    # Clear/recapture must replace the expected layout without a stale memo.
+    graph.clear()
+    graph.run(lambda: None, graph_inputs={"a": {"slots": second, "kv_caches": ()}})
+    graph.seal((context.staged_sfa_graph_key,))
+    graph.validate_idle_metadata(["a"], {"slots": second})
+    with pytest.raises(RuntimeError, match="changed address or layout"):
+        graph.validate_idle_metadata(["a"], {"slots": first})

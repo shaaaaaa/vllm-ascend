@@ -3619,7 +3619,7 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
         assert self.model is not None
         context = get_forward_context()
         if envs_ascend.VLLM_ASCEND_SFA_FULL_GRAPH and getattr(context, "staged_sfa_graph_key", None) is not None:
-            graph_inputs = {} if context.staged_sfa_graph_dummy_run else None
+            graph_inputs = {} if context.staged_sfa_graph_dummy_run and not self._sfa_full_graph.sealed else None
             prepared_call = None
             graph_kwargs = dict(
                 input_ids=input_ids,
@@ -3649,16 +3649,28 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                                 name, self.model_config.max_model_len, bind_source=False,
                                 metadata_checks=metadata_checks,
                             )
-                        transfers = tuple(impl._full_graph_transfer for _, impl in impls)
-                        if self._sfa_full_graph.sealed:
-                            # DP idle forwards also use dummy metadata after startup.
-                            registered = self._sfa_full_graph.get_transfers(capacity)
-                            if len(registered) != len(transfers) or any(
-                                a is not b for a, b in zip(registered, transfers)
-                            ):
+                        self._sfa_full_graph.register_transfers(
+                            capacity, tuple(impl._full_graph_transfer for _, impl in impls)
+                        )
+                    elif context.staged_sfa_graph_dummy_run:
+                        registered = self._sfa_full_graph.get_transfers(capacity)
+                        if len(registered) != len(impls):
+                            raise RuntimeError("Full SFA transfer bundle changed after startup")
+                        metadata_groups = {}
+                        for (name, impl), transfer in zip(impls, registered):
+                            if impl._staged_sfa_capture_state.runtime is None:
+                                raise RuntimeError(f"Full SFA graph layer was not warmed up: {name}")
+                            if impl._full_graph_transfers.get(capacity) is not transfer:
                                 raise RuntimeError("Full SFA transfer bundle changed after startup")
-                        else:
-                            self._sfa_full_graph.register_transfers(capacity, transfers)
+                            metadata = context.attn_metadata[name]
+                            if id(metadata) not in metadata_groups:
+                                metadata_groups[id(metadata)] = (metadata, impl, [])
+                            metadata_groups[id(metadata)][2].append(name)
+                        for metadata, impl, names in metadata_groups.values():
+                            self._sfa_full_graph.validate_idle_metadata(
+                                names, impl.full_graph_metadata_inputs(metadata)
+                            )
+                            impl.prepare_full_graph_metadata(metadata, context, reuse_dummy=True)
                     else:
                         self._sfa_full_graph.get_transfers(capacity)
                         seen = set()
@@ -5303,7 +5315,7 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
             if dp_idle and staged_sfa_graph_dummy_run and sfa_full_graph_enabled(self.vllm_config):
                 # Idle participation must not write dummy K/index entries into
                 # physical blocks that may belong to paused/waiting requests.
-                for metadata in attn_metadata.values():
+                for metadata in {id(value): value for value in attn_metadata.values()}.values():
                     for field_name in ("slot_mapping", "indexer_slot_mapping"):
                         value = getattr(metadata, field_name, None)
                         if value is not None:
@@ -5408,7 +5420,9 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                 ),
                 staged_sfa_graph_key=staged_dummy_key,
             ):
-                if staged_dummy_key is not None and self._staged_sfa_impls:
+                if staged_dummy_key is not None and self._staged_sfa_impls and not (
+                    sfa_full_graph_enabled(self.vllm_config) and self._sfa_full_graph.sealed
+                ):
                     first_layer_name, first_impl = self._staged_sfa_impls[0]
                     first_impl.bootstrap_cross_layer(first_layer_name)
                 outputs = self._model_forward(

@@ -867,6 +867,29 @@ def test_dummy_dispatch_passes_idle_status_to_layout_agreement():
     assert isinstance(vote, ast.Name) and vote.id == "dp_idle"
 
 
+@pytest.mark.parametrize("metadata_groups", [1, 2])
+def test_idle_clears_shared_metadata_once(metadata_groups):
+    path = Path(__file__).resolve().parents[3] / "vllm_ascend/worker/model_runner_v1.py"
+    tree = ast.parse(path.read_text(encoding="utf8"))
+    dummy = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "_dummy_run")
+    branch = next(n for n in ast.walk(dummy) if isinstance(n, ast.If)
+                  and ast.unparse(n.test).startswith("dp_idle and staged_sfa_graph_dummy_run"))
+    items = [SimpleNamespace(
+        slot_mapping=torch.ones(8), indexer_slot_mapping=torch.ones(8),
+        block_table=torch.ones(5, 8), indexer_block_table=torch.ones(5, 8),
+        seq_lens=torch.ones(5), decode_remap_boundary=object(),
+    ) for _ in range(metadata_groups)]
+    tensors = [(getattr(md, field), -1 if "slot_mapping" in field else 0) for md in items
+               for field in ("slot_mapping", "indexer_slot_mapping", "block_table", "indexer_block_table", "seq_lens")]
+    versions = [t._version for t, _ in tensors]
+    scope = dict(dp_idle=True, staged_sfa_graph_dummy_run=True,
+                 sfa_full_graph_enabled=lambda cfg: True, self=SimpleNamespace(vllm_config=None),
+                 attn_metadata={str(i): items[i % metadata_groups] for i in range(78)})
+    exec(compile(ast.Module(body=[branch], type_ignores=[]), str(path), "exec"), scope)
+    for (tensor, expected), version in zip(tensors, versions):
+        assert tensor.eq(expected).all() and tensor._version == version + 1
+
+
 @pytest.mark.parametrize("configured,full", [(False, False), (False, True), (True, False)])
 def test_non_full_sync_preserves_existing_wire_format(routing, configured, full):
     runner, ns, env, _, _ = routing
@@ -1118,8 +1141,11 @@ def test_local_supervised_decode_has_no_per_step_error_collective(routing, failu
     forbidden.assert_not_called()
 
 
-@pytest.mark.parametrize("failure", [None, "missing_bundle", "changed_bundle", "missing_graph", "changed_signature"])
-def test_sealed_dp_dummy_reuses_startup_transfers(routing, request, failure):
+@pytest.mark.parametrize("layer_count", [1, 78])
+@pytest.mark.parametrize("failure", [
+    None, "missing_bundle", "changed_bundle", "missing_graph", "changed_signature", "changed_kwargs", "reset_layer",
+])
+def test_sealed_dp_dummy_reuses_startup_transfers(routing, request, failure, layer_count):
     runner, ns, _, _, _ = routing
     module, context, captures, _ = request.getfixturevalue("graph_module")
     runner.model = Mock()
@@ -1128,11 +1154,19 @@ def test_sealed_dp_dummy_reuses_startup_transfers(routing, request, failure):
     graph = runner._sfa_full_graph = module.SFAFullGraph()
     key = ns["StagedSFAGraphKey"].bounded_decode(4, 2)
     context.staged_sfa_graph_key = key
-    context.attn_metadata = {"layer0": object()}
-    transfer = SimpleNamespace(request_capacity=4, bind_batch=Mock())
     inputs = {"slots": torch.full((8,), -1, dtype=torch.int32)}
-    layer = SimpleNamespace(prepare_full_graph_layer=Mock(return_value=inputs), _full_graph_transfer=transfer)
-    runner._staged_sfa_impls = [("layer0", layer)]
+    names = [f"layer{i}" for i in range(layer_count)]
+    context.attn_metadata = dict.fromkeys(names, inputs)
+    layers = []
+    for _ in names:
+        transfer = SimpleNamespace(request_capacity=4, bind_batch=Mock())
+        layers.append(SimpleNamespace(
+            prepare_full_graph_layer=Mock(return_value=inputs), _full_graph_transfer=transfer,
+            _full_graph_transfers={4: transfer}, _staged_sfa_capture_state=SimpleNamespace(runtime=object()),
+            full_graph_metadata_inputs=lambda md: md, prepare_full_graph_metadata=Mock(),
+        ))
+    runner._staged_sfa_impls = list(zip(names, layers))
+    kwargs = {"positions": torch.arange(8)}
     groups = []
     ns.update(
         torch=torch, get_forward_context=lambda: context,
@@ -1142,37 +1176,50 @@ def test_sealed_dp_dummy_reuses_startup_transfers(routing, request, failure):
         dist=SimpleNamespace(all_reduce=lambda tensor, **kw: groups.append(kw["group"]),
                              ReduceOp=SimpleNamespace(MAX="max")),
     )
-    assert runner._model_forward(8) == "captured output"
+    assert runner._model_forward(8, **kwargs) == "captured output"
     assert graph.seal((key,)) == 1
     registered = graph.get_transfers(4)
     replay = graph.entries[key].graph.replay
+    graph.validate_inputs = Mock(wraps=graph.validate_inputs)
+    graph.validate_idle_metadata = Mock(wraps=graph.validate_idle_metadata)
     groups.clear()
     if failure == "missing_bundle":
         graph._transfer_bundles.clear()
     elif failure == "changed_bundle":
-        layer._full_graph_transfer = SimpleNamespace(request_capacity=4, bind_batch=Mock())
+        layers[-1]._full_graph_transfers[4] = SimpleNamespace(request_capacity=4, bind_batch=Mock())
     elif failure == "missing_graph":
         graph.entries.clear()
     elif failure == "changed_signature":
         inputs["slots"] = inputs["slots"].clone()
+    elif failure == "changed_kwargs":
+        kwargs["positions"] = kwargs["positions"].clone()
+    elif failure == "reset_layer":
+        layers[-1]._staged_sfa_capture_state.runtime = None
     if failure:
         with pytest.raises(RuntimeError, match="preparation failed") as error:
-            runner._model_forward(8)
+            runner._model_forward(8, **kwargs)
         expected = {
             "missing_bundle": "not registered at startup",
             "changed_bundle": "bundle changed after startup",
             "missing_graph": "missing at runtime",
             "changed_signature": "changed address or layout",
+            "changed_kwargs": "changed address or layout",
+            "reset_layer": "not warmed up",
         }[failure]
         assert expected in str(error.value.__cause__)
         replay.assert_not_called()
         assert groups == ["tp", "dp"]
     else:
         for _ in range(2):
-            assert runner._model_forward(8) == "captured output"
+            assert runner._model_forward(8, **kwargs) == "captured output"
         assert graph.get_transfers(4) is registered and graph.sealed
         assert graph.source_bindings[4].sources == graph.source_bindings[4].request_ids == ()
         assert graph.replay_count == replay.call_count == 2
+        for layer in layers:
+            layer.prepare_full_graph_layer.assert_called_once()
+        assert sum(layer.prepare_full_graph_metadata.call_count for layer in layers) == 2
+        assert graph.validate_idle_metadata.call_count == 2
+        graph.validate_inputs.assert_not_called()
         assert groups == ["tp", "dp", "tp", "dp"]
     assert len(captures) == 1 and runner._run_sfa_full_graph_target.call_count == 1
     with pytest.raises(RuntimeError, match="registered during startup"):

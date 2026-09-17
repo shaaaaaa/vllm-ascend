@@ -561,7 +561,8 @@ def _prepare_sfa_remap_boundary(
             return boundary
         # Another execution mode shares this builder allocation. Its eager write
         # below must invalidate the full-graph CPU shadow before changing data.
-        buffer.invalidate()
+        if not reuse_unchanged:
+            buffer.invalidate()
 
     prompt_rows = attn_metadata.prompt_lens_cpu_rows
     row_req_indices = attn_metadata.decode_req_indices_cpu
@@ -674,7 +675,10 @@ def _prepare_sfa_remap_boundary(
         getattr(attn_metadata, "decode_scratch_capacity", None),
     )
 
-    boundary.copy_(torch.from_numpy(boundary_rows))
+    if reuse_unchanged and buffer is not None:
+        buffer.update_prepared(tuple(map(int, boundary_rows)))
+    else:
+        boundary.copy_(torch.from_numpy(boundary_rows))
     attn_metadata.decode_remap_boundary_ready = True
     return boundary
 
@@ -3689,7 +3693,7 @@ class AscendSFAImpl(MLAAttentionImpl):
             index_topk=self.index_topk, reuse_unchanged=True,
         )
 
-    def prepare_full_graph_metadata(self, metadata: M, context: Any) -> torch.Tensor:
+    def prepare_full_graph_metadata(self, metadata: M, context: Any, *, reuse_dummy: bool = False) -> torch.Tensor:
         """Refresh one shared metadata object without changing transfer selection."""
         boundary = _prepare_sfa_remap_boundary(
             metadata,
@@ -3697,7 +3701,7 @@ class AscendSFAImpl(MLAAttentionImpl):
             is_dummy_run=context.staged_sfa_graph_dummy_run,
             index_topk=self.index_topk,
             cached_tokens=context.staged_sfa_route.frontiers,
-            reuse_unchanged=True,
+            reuse_unchanged=not context.staged_sfa_graph_dummy_run or reuse_dummy,
         )
         metadata.reshape_cache_event = None
         return boundary
@@ -3761,6 +3765,12 @@ class AscendSFAImpl(MLAAttentionImpl):
         # The builder owns these stable allocations, just as in staged replay.
         # Retain a startup signature for explicit diagnostics, not a per-step
         # walk over every layer's tensors and static model configuration.
+        inputs = self.full_graph_metadata_inputs(metadata)
+        inputs["kv_caches"] = state.runtime[1]
+        return inputs
+
+    @staticmethod
+    def full_graph_metadata_inputs(metadata: M) -> dict[str, Any]:
         fields = (
             "cos", "sin", "slot_mapping", "indexer_slot_mapping", "cum_query_lens", "seq_lens",
             "block_table", "indexer_block_table", "decode_remap_boundary", "decode_req_indices",
@@ -3768,9 +3778,7 @@ class AscendSFAImpl(MLAAttentionImpl):
             "decode_union_mapping_workspace", "decode_shard_packed_workspace", "decode_shard_mapping_workspace",
             "decode_shard_counts_workspace", "resident_state_indices", "resident_state_generations",
         )
-        inputs = {name: getattr(metadata, name) for name in fields}
-        inputs["kv_caches"] = state.runtime[1]
-        return inputs
+        return {name: getattr(metadata, name) for name in fields}
 
     def seal_staged_sfa_capture(
         self,

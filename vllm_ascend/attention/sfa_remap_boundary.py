@@ -75,6 +75,26 @@ class SFARemapBoundaryBuffer:
             raise
         self._next_upload = (index + 1) % MAX_PENDING_BOUNDARY_UPLOADS
 
+    def update_prepared(self, values: tuple[int, ...]) -> None:
+        """Upload already-validated dummy boundaries with owned staging."""
+        if self._failed:
+            raise RuntimeError("SFA boundary upload failed; staging cannot be reused")
+        if self.tensor.device.type == "npu":
+            stream = torch.npu.current_stream(self.tensor.device)
+            if self._stream is not None and self._stream != stream:
+                raise RuntimeError("SFA boundary upload and consumption must stay on one stream")
+            self._stream = stream
+        if values != self._values:
+            # Prepared values were validated by the caller, not this live layout.
+            self._layout = None
+            self._commit(values)
+
+    def _commit(self, values: tuple[int, ...]) -> None:
+        self.invalidate()
+        self._upload(values)
+        self._values = values
+        self.upload_count += 1
+
     def update(
         self,
         row_requests: Sequence[int],
@@ -134,7 +154,4 @@ class SFARemapBoundaryBuffer:
         if any(value != 0 and value < scratch_capacity for value in boundaries.values()):
             raise RuntimeError("SFA request-union scratch would alias live KV positions")
         # A failed/partial copy must not leave the previous cache entry usable.
-        self.invalidate()
-        self._upload(values)
-        self._values = values
-        self.upload_count += 1
+        self._commit(values)

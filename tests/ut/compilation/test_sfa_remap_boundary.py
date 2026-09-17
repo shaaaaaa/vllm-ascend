@@ -107,7 +107,7 @@ def test_mode_handoff_invalidates_shadow_before_external_write(original):
     prepare(live, None, is_dummy_run=False, index_topk=2048, cached_tokens=(5120,))
     assert buffer.tensor.tolist() == [5120, 5120]
     dummy = metadata([0, 0], [5000, 5000], [7000], buffer)
-    prepare(dummy, None, is_dummy_run=True, index_topk=2048)
+    prepare.func(dummy, None, is_dummy_run=True, index_topk=2048)
     assert buffer.tensor.tolist() == [6912, 6912]
     live.decode_remap_boundary_ready = False
     prepare(live, None, is_dummy_run=False, index_topk=2048, cached_tokens=(5120,))
@@ -436,7 +436,8 @@ def test_target_fallback_prepares_after_context_binding_before_model():
     assert calls == ["bound", "model"]
 
 
-def test_boundary_upload_replay_on_real_npu():
+@pytest.mark.parametrize("prepared", [False, True])
+def test_boundary_upload_replay_on_real_npu(prepared):
     pytest.importorskip("torch_npu")
     if not torch.npu.is_available():
         pytest.skip("Requires an NPU")
@@ -451,9 +452,91 @@ def test_boundary_upload_replay_on_real_npu():
     observed = []
     frontiers = (4096, 8192, 12288, 0) * 16
     for frontier in frontiers:
-        buffer.update([0, 0], [10000, 10000], [20000], (frontier,), 0, 2048, 4096)
+        if prepared:
+            buffer.update_prepared((frontier, frontier))
+        else:
+            buffer.update([0, 0], [10000, 10000], [20000], (frontier,), 0, 2048, 4096)
         graph.replay()
         observed.append(output.clone())
     torch.npu.synchronize()
     assert torch.stack(observed).cpu().tolist() == [[v, v] for v in frontiers]
     assert len(buffer._uploads) <= remap.MAX_PENDING_BOUNDARY_UPLOADS
+
+
+@pytest.mark.parametrize("window", [0, 256])
+def test_cached_dummy_boundaries_match_legacy_across_live_and_capacity_changes(original, window):
+    prepare, config = original
+    config.window = window
+    buffer = remap.SFARemapBoundaryBuffer(torch.zeros(8, dtype=torch.int32))
+    for n in (4, 1, 4):
+        rows = np.repeat(np.arange(n), 2)
+        for dummy in (True, True, False, False, True):
+            prompts, lengths = [5000] * (2 * n), [5200] * n
+            frontiers = None if dummy else (4096,) * n
+            expected = prepare.func(metadata(rows, prompts, lengths), None, is_dummy_run=dummy,
+                                    index_topk=2048, cached_tokens=frontiers)
+            old_values, old_count = buffer._values, buffer.upload_count
+            actual = prepare(metadata(rows, prompts, lengths, buffer), None, is_dummy_run=dummy,
+                             index_topk=2048, cached_tokens=frontiers)
+            torch.testing.assert_close(actual, expected)
+            if old_values == tuple(expected.tolist()):
+                assert buffer.upload_count == old_count
+
+
+def test_prepared_dummy_upload_keeps_snapshot_and_reuses_owned_staging(deferred_uploads, original):
+    state = deferred_uploads
+    prepare, config = original
+    config.window = 0
+    observed = []
+    for prompt in (5000, 6000, 6000, 7000):
+        item = metadata([0, 0], [prompt, prompt], [prompt + 2], state.buffer)
+        prepare(item, None, is_dummy_run=True, index_topk=2048)
+        item.prompt_lens_cpu_rows[:] = 9000  # Pending copies must own their source.
+        state.operations.append(lambda: observed.append(state.target.data.tolist()))
+    assert state.buffer.upload_count == 3 and len(state.events) == 2
+    assert state.waits == [1]  # Reuse waits for an upload, not the later consumer.
+    state.drain()
+    assert observed == [[5000, 5000], [6000, 6000], [6000, 6000], [7000, 7000]]
+    state.current_stream[0] = object()
+    with pytest.raises(RuntimeError, match="one stream"):
+        state.buffer.update_prepared((7000, 7000))
+
+
+def test_prepared_dummy_upload_refuses_reuse_after_record_failure(deferred_uploads):
+    state = deferred_uploads
+    state.buffer.update_prepared((5000, 5000))
+    state.buffer.update_prepared((6000, 6000))
+    state.drain()
+    state.events[0].fail_record = True
+    with pytest.raises(RuntimeError, match="record failed"):
+        state.buffer.update_prepared((7000, 7000))
+    with pytest.raises(RuntimeError, match="cannot be reused"):
+        state.buffer.update_prepared((5000, 5000))
+    state.drain()
+
+
+def test_prepared_dummy_values_do_not_inherit_live_layout_validation(original):
+    prepare, config = original
+    config.window = 0
+    buffer = remap.SFARemapBoundaryBuffer(torch.zeros(2, dtype=torch.int32))
+    buffer.update([0, 0], [12000, 12000], [14000], (8192,), 0, 2048, 8192)
+    # These values are valid for the dummy's smaller scratch reservation.
+    dummy = metadata([0, 0], [4096, 4096], [4100], buffer, capacity=4096)
+    prepare(dummy, None, is_dummy_run=True, index_topk=2048)
+    assert buffer.tensor.tolist() == [4096, 4096]
+    # Matching device values do not prove safety for the older live layout.
+    with pytest.raises(RuntimeError, match="alias live KV positions"):
+        buffer.update([0, 0], [12000, 12000], [14000], (4096,), 0, 2048, 8192)
+
+
+def test_unchanged_prepared_boundary_has_no_tensor_operations():
+    buffer = remap.SFARemapBoundaryBuffer(torch.zeros(2, dtype=torch.int32))
+    buffer.update_prepared((4096, 4096))
+
+    class NoTensorOps(TorchDispatchMode):
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            pytest.fail(f"Unchanged prepared boundary issued a tensor operation: {func}")
+
+    with NoTensorOps():
+        buffer.update_prepared((4096, 4096))
+    assert buffer.upload_count == 1
