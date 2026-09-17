@@ -3,6 +3,7 @@
 """CPU execution of the real routing methods, isolated from worker imports."""
 
 import ast
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from enum import Enum, IntEnum
 from pathlib import Path
@@ -42,6 +43,7 @@ def routing():
         has_kv_transfer_group=lambda: False,
         cold_perf_enabled=lambda: False,
         parent_process=lambda: object(),  # Fixture represents a worker child.
+        record_function_or_nullcontext=lambda name: nullcontext(),
     )
     definitions(root / "attention/utils.py", {"unwrap_staged_sfa_connector_metadata", "ColdResumeMarkers"}, ns)
     definitions(root / "compilation/sfa_fail_stop.py", {"uses_local_sfa_fail_stop"}, ns)
@@ -83,6 +85,7 @@ def routing():
     runner.vllm_config = SimpleNamespace(lora_config=None, model_config=SimpleNamespace(enforce_eager=False))
     runner.model_config = runner.vllm_config.model_config
     runner.parallel_config = SimpleNamespace(data_parallel_size=4)
+    runner._sfa_preparation_groups = None
     runner.vllm_config.parallel_config = runner.parallel_config
     # Local-layout tests represent an already agreed all-uniform DP cohort.
     # Protocol tests below execute the actual collective method instead.
@@ -994,8 +997,11 @@ def test_ragged_dispatch_reserves_request_capacity_not_just_token_sum(routing):
 
 
 @pytest.mark.parametrize("failure", [None, "source", "binding", "signature", "peer"])
-def test_preparation_and_signatures_are_agreed_before_collective_replay(routing, failure):
+@pytest.mark.parametrize("ep_agreement", [False, True])
+def test_preparation_and_signatures_are_agreed_before_collective_replay(routing, failure, ep_agreement):
     runner, ns, _, modes, _ = routing
+    if ep_agreement:
+        runner._sfa_preparation_groups = (("sfa_full_graph::prepare_agreement_ep", "ep"),)
     runner.model = Mock()
     runner.model_config.max_model_len = 140000
     runner.input_batch = SimpleNamespace(req_ids=["r1"], num_reqs=1)
@@ -1042,7 +1048,7 @@ def test_preparation_and_signatures_are_agreed_before_collective_replay(routing,
         groups.append(group)
         runner._sfa_full_graph.run.assert_not_called()
         assert bool(failed.item()) == (failure in ("source", "binding", "signature"))
-        if failure == "peer" and group == "dp":
+        if failure == "peer" and group in ("dp", "ep"):
             failed.fill_(1)
 
     ns["dist"] = SimpleNamespace(all_reduce=agree, ReduceOp=SimpleNamespace(MAX="max"))
@@ -1060,7 +1066,7 @@ def test_preparation_and_signatures_are_agreed_before_collective_replay(routing,
             "prepared": runner._sfa_full_graph.prepare_run.return_value
         }
         assert runner._sfa_full_graph.bind_sources.call_args.args[:2] == ((None,), ("r1",))
-    assert groups == ["tp", "dp"]
+    assert groups == (["ep"] if ep_agreement else ["tp", "dp"])
 
 
 @pytest.mark.parametrize("failure", [None, "source", "binding", "signature"])

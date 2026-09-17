@@ -1,20 +1,54 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Error-only fail-stop for a single supervised, local SFA worker cohort.
+"""Distributed preparation agreement and supervised local SFA fail-stop.
 
-No normal-step communication, timers or watchdog polling. WorkerProc's existing
+Local fail-stop needs no normal-step communication, timers or polling. WorkerProc's existing
 process-sentinel monitor wakes when the failed worker exits and terminates its
 peer workers, including peers blocked in an NPU collective. Ordinary Exception
 is insufficient: WorkerProc's RPC loop catches it and continues serving.
 """
 
 import os
+from collections.abc import Callable
 from multiprocessing import parent_process
 from threading import Timer
 from typing import Any, NoReturn
 
 SFA_FATAL_EXIT_CODE = 1
 SFA_FATAL_CLEANUP_TIMEOUT_SECONDS = 5.0
+
+
+def preparation_error_groups(config: Any, *, is_moe: bool, tp: Any, dp: Any,
+                             get_ep: Callable[[], Any]) -> tuple[tuple[str, Any], ...] | None:
+    """Choose once at startup; EP MAX equals TP MAX then DP MAX for this topology."""
+    if not (
+        is_moe and getattr(config, "enable_expert_parallel", False)
+        and getattr(config, "distributed_executor_backend", None) == "mp"
+        and getattr(config, "data_parallel_size", 0) > 1
+        and getattr(config, "tensor_parallel_size", 0) > 1
+        and all(getattr(config, field, 0) == 1 for field in (
+            "pipeline_parallel_size", "prefill_context_parallel_size", "decode_context_parallel_size",
+        ))
+        and not getattr(config, "enable_elastic_ep", True)
+        and not getattr(config, "enable_dbo", True)
+    ):
+        return None  # Preserve dynamic group lookup for unsupported/elastic topologies.
+    ep = get_ep()
+    width = config.tensor_parallel_size
+    ranks = ep.ranks
+    index = ep.rank_in_group
+    # Never fall back on a rank-local mismatch: peers could choose a different
+    # collective sequence. Reject the inconsistent startup topology instead.
+    if not (
+        tp.world_size == width and dp.world_size == config.data_parallel_size
+        and ep.world_size == len(ranks) == tp.world_size * dp.world_size
+        and len(set(ranks)) == len(ranks) and 0 <= index < len(ranks)
+        and ranks[index] == tp.rank == dp.rank
+        and list(tp.ranks) == list(ranks[index // width * width:(index // width + 1) * width])
+        and list(dp.ranks) == list(ranks[index % width::width])
+    ):
+        raise ValueError("SFA preparation agreement EP membership does not match TP x DP")
+    return (("sfa_full_graph::prepare_agreement_ep", ep.cpu_group),)
 
 
 def uses_local_sfa_fail_stop(parallel_config: Any) -> bool:
