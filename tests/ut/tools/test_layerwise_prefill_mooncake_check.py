@@ -34,8 +34,13 @@ def copy_evidence(tool, root):
         (root / stage).mkdir(exist_ok=True)
     (root / "prefill/objects.jsonl").write_text('{"key":"page","size":4}\n', encoding="utf-8")
     report = {"objects": 1, "bytes": 4, "manifest_sha256": tool.manifest_digest({"page": 4})}
-    tool.write_json(root / "holder1/ready.json", {"device": 1, "segment": "segment1"})
-    tool.write_json(root / "holder0/ready.json", {"device": 0, "segment": "segment0", "copy": report})
+    tool.write_json(root / "prefill/persisted.json", {"device": 0, "segment": "P0", **report})
+    tool.write_json(
+        root / "holder1/ready.json", {"device": 1, "segment": "segment1", "source_segment": "P0", "copy": report}
+    )
+    tool.write_json(
+        root / "holder0/ready.json", {"device": 0, "segment": "segment0", "source_segment": "segment1", "copy": report}
+    )
 
 
 def test_no_required_config_and_deployment_defaults(tool):
@@ -90,12 +95,12 @@ def base_config():
 
 
 @pytest.mark.parametrize("stage", ["baseline", "prefill", "decode"])
-def test_models_cannot_own_persistent_storage_or_reuse_old_cache(tool, stage):
+def test_only_prefill_model_owns_native_storage_without_reusing_old_cache(tool, stage):
     source = base_config()
     config = tool.stage_config(source, options(tool), stage)
     assert source == base_config()
-    assert config["extra_config"]["global_segment_size"] == 0
-    assert config["extra_config"]["mooncake_prefer_local_alloc"] is False
+    assert config["extra_config"]["global_segment_size"] == (8 * 1024**3 if stage == "prefill" else 0)
+    assert config["extra_config"]["mooncake_prefer_local_alloc"] == (stage == "prefill")
     assert config["shared_cpu_cache_name"] is None
     assert config["extra_config"]["shared_cpu_cache_name"] is None
     assert config["extra_config"]["shared_cpu_cache_size_gb"] == 8
@@ -148,10 +153,10 @@ def test_no_archive_or_probe_environment_leaks(tool, tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize("stage", ["holder0", "holder1", "baseline", "prefill", "decode"])
-def test_only_holder_environment_has_a_storage_segment(tool, tmp_path, stage):
+def test_holder_and_prefill_environment_have_storage_segments(tool, tmp_path, stage):
     env = tool.child_environment(options(tool), tmp_path, stage)
     extra = json.loads(env["LMCACHE_EXTRA_CONFIG"])
-    assert extra["global_segment_size"] == (8 * 1024**3 if stage.startswith("holder") else 0)
+    assert extra["global_segment_size"] == (8 * 1024**3 if stage.startswith("holder") or stage == "prefill" else 0)
     assert extra["protocol"] == "ascend"
     assert "LMCACHE_CONFIG_FILE" not in env
 
@@ -184,12 +189,18 @@ def test_prefill_group_is_fully_stopped_before_decode_launch(tool, tmp_path, mon
 
     monkeypatch.setattr(tool, "start_child", start)
     monkeypatch.setattr(tool, "finish_child", lambda proc: actions.append(("stop", proc.stage)))
+    monkeypatch.setattr(tool, "back_up_prefill", lambda *args: actions.append(("backup", "prefill")))
     monkeypatch.setattr(tool, "wait_for_holder", lambda *args: actions.append(("ready", "holder0")))
     args = options(tool)
     args.with_baseline = with_baseline
     tool.run_models(args, tmp_path, {"holder1": NS(poll=lambda: None)})
     stages = ("baseline", "prefill", "decode") if with_baseline else ("prefill", "decode")
-    expected = [(action, stage) for stage in stages[:-1] for action in ("start", "stop")]
+    expected = []
+    for stage in stages[:-1]:
+        expected.append(("start", stage))
+        if stage == "prefill":
+            expected.append(("backup", "prefill"))
+        expected.append(("stop", stage))
     expected += [("start", "holder0"), ("ready", "holder0"), ("start", "decode"), ("stop", "decode")]
     assert actions == expected
 
@@ -203,6 +214,8 @@ def holder_runtime(tool, tmp_path, monkeypatch):
     args.child = "holder1"
     args.run_dir = tmp_path
     (tmp_path / "holder1").mkdir()
+    copy_evidence(tool, tmp_path)
+    (tmp_path / "holder1/ready.json").unlink()
     env = tool.child_environment(args, tmp_path, "holder1")
     monkeypatch.setenv("ASCEND_RT_VISIBLE_DEVICES", env["ASCEND_RT_VISIBLE_DEVICES"])
     monkeypatch.setenv("LMCACHE_EXTRA_CONFIG", env["LMCACHE_EXTRA_CONFIG"])
@@ -241,6 +254,12 @@ def holder_runtime(tool, tmp_path, monkeypatch):
     monkeypatch.setitem(sys.modules, "mooncake", NS())
     monkeypatch.setitem(sys.modules, "mooncake.store", NS(MooncakeDistributedStore=Store, ReplicateConfig=NS))
     monkeypatch.setattr(tool, "holder_preflight", lambda *args: actions.append("preflight"))
+
+    def copy(*args, **kwargs):
+        actions.append("copy")
+        return {"objects": 1, "bytes": 4, "manifest_sha256": tool.manifest_digest({"page": 4})}
+
+    monkeypatch.setattr(tool, "copy_objects", copy)
     monkeypatch.setattr(tool.signal, "signal", lambda *_: None)
     monkeypatch.setattr(tool.threading, "Event", lambda: NS(set=lambda: None, wait=lambda: actions.append("wait")))
     return args, actions, state
@@ -249,7 +268,7 @@ def holder_runtime(tool, tmp_path, monkeypatch):
 def test_holder_initializes_visible_npu_before_mooncake(tool, holder_runtime):
     args, actions, _ = holder_runtime
     tool.run_holder(args)
-    assert actions == ["set_device", "npu_init", "construct", "setup", "preflight", "wait", "close"]
+    assert actions == ["set_device", "npu_init", "construct", "setup", "preflight", "copy", "wait", "close"]
     ready = json.loads((args.run_dir / "holder1/ready.json").read_text())
     assert ready["segment"] == "test-holder-segment"
 
@@ -281,7 +300,7 @@ def test_holder0_publishes_ready_only_after_copy(tool, holder_runtime, monkeypat
     ready_path.unlink()
     report = {"objects": 1, "bytes": 4, "manifest_sha256": tool.manifest_digest({"page": 4})}
 
-    def copy(*values):
+    def copy(*values, **kwargs):
         assert not ready_path.exists()
         assert values[2] == {"page": 4}
         assert values[4] == "segment1"
@@ -325,6 +344,7 @@ def test_ready_with_wrong_copy_evidence_cannot_launch_decode(tool, tmp_path, mon
 
     monkeypatch.setattr(tool, "start_child", start)
     monkeypatch.setattr(tool, "finish_child", lambda *_: None)
+    monkeypatch.setattr(tool, "back_up_prefill", lambda *_: None)
     with pytest.raises(RuntimeError, match="refusing to start D"):
         tool.run_models(options(tool), tmp_path, {"holder1": NS(poll=lambda: None)})
     assert launched == ["prefill", "holder0"]
@@ -524,8 +544,14 @@ def test_run_check_keeps_storage_alive_across_p_exit(tool, tmp_path, monkeypatch
     def start(args, root, stage):
         actions.append(("start", stage))
         if stage.startswith("holder"):
+            assert (root / "prefill/persisted.json").exists()
+            if stage == "holder0":
+                assert ("stop", "prefill") in actions
             tool.write_json(root / stage / "ready.json", {"pid": 10})
             return NS(stage=stage, poll=lambda: None)
+        if stage == "prefill" and not prefill_failed:
+            tool.write_json(root / "prefill/persisted.json", {"device": 0, "segment": "P0"})
+            return NS(stage=stage, poll=lambda: 0 if (root / "prefill/release.json").exists() else None, returncode=0)
         code = 1 if stage == "prefill" and prefill_failed else 0
         return NS(stage=stage, poll=lambda: code, returncode=code)
 
@@ -538,26 +564,120 @@ def test_run_check_keeps_storage_alive_across_p_exit(tool, tmp_path, monkeypatch
 
     monkeypatch.setattr(tool, "analyse", analyse)
     if prefill_failed:
-        with pytest.raises(RuntimeError, match="prefill failed"):
+        with pytest.raises(RuntimeError, match="P exited before"):
             tool.run_check(args, tmp_path, NS(poll=lambda: None))
         expected_stages = stages[:-1]
     else:
         tool.run_check(args, tmp_path, NS(poll=lambda: None))
         expected_stages = stages
-    expected = [("start", "holder1")]
+    expected = []
     for stage in expected_stages:
         if stage == "decode":
             expected.append(("start", "holder0"))
-        expected.extend([(action, stage) for action in ("start", "stop")])
+        expected.append(("start", stage))
+        if stage == "prefill" and not prefill_failed:
+            expected.append(("start", "holder1"))
+        expected.append(("stop", stage))
     if not prefill_failed:
         expected.append(("analyse", "outputs"))
         expected.append(("stop", "holder0"))
-    expected.append(("stop", "holder1"))
+        expected.append(("stop", "holder1"))
     assert actions == expected
     for stage in ("prefill", "decode", "holder1", "holder0"):
         env = json.loads((tmp_path / stage / "lmcache_env.json").read_text())
         assert env["LMCACHE_REMOTE_URL"] == "mooncakestore://127.0.0.1:45678/"
     assert (tmp_path / "baseline").exists() == with_baseline
+
+
+def test_failed_backup_never_releases_prefill(tool, tmp_path, monkeypatch):
+    copy_evidence(tool, tmp_path)
+    holder = NS(poll=lambda: None)
+    monkeypatch.setattr(tool, "start_child", lambda *_: holder)
+
+    def fail(*args):
+        raise RuntimeError("copy failed")
+
+    monkeypatch.setattr(tool, "wait_for_holder", fail)
+    holders = {}
+    with pytest.raises(RuntimeError, match="copy failed"):
+        tool.back_up_prefill(options(tool), tmp_path, NS(poll=lambda: None), holders, None)
+    assert holders == {"holder1": holder}
+    assert not (tmp_path / "prefill/release.json").exists()
+
+
+def test_backup_monitors_original_source_owner(tool, tmp_path, monkeypatch):
+    copy_evidence(tool, tmp_path)
+    (tmp_path / "holder1/ready.json").unlink()
+    states = iter([None, 1])
+    monkeypatch.setattr(tool, "start_child", lambda *_: NS(poll=lambda: None))
+    with pytest.raises(RuntimeError, match="prefill/server.log"):
+        tool.back_up_prefill(options(tool), tmp_path, NS(poll=lambda: next(states)), {}, None)
+    assert not (tmp_path / "prefill/release.json").exists()
+
+
+def test_prefill_exit_gate_validates_backup(tool, tmp_path):
+    copy_evidence(tool, tmp_path)
+    tool.write_json(tmp_path / "prefill/release.json", {})
+    tool.wait_for_backup_release(tmp_path)
+    target = tmp_path / "holder1/ready.json"
+    record = json.loads(target.read_text())
+    record["copy"]["bytes"] = 1
+    tool.write_json(target, record)
+    with pytest.raises(RuntimeError, match="copy does not match"):
+        tool.wait_for_backup_release(tmp_path)
+
+
+@pytest.mark.parametrize("value", [None, "0", "1"])
+def test_prefill_does_not_override_production_memcpy_setting(tool, tmp_path, monkeypatch, value):
+    if value is None:
+        monkeypatch.delenv("MC_STORE_MEMCPY", raising=False)
+    else:
+        monkeypatch.setenv("MC_STORE_MEMCPY", value)
+    assert tool.child_environment(options(tool), tmp_path, "prefill").get("MC_STORE_MEMCPY") == value
+    assert tool.child_environment(options(tool), tmp_path, "holder1")["MC_STORE_MEMCPY"] == "1"
+
+
+@pytest.mark.parametrize("failure", [None, "fence", "backup"])
+def test_model_keeps_native_store_alive_until_backup_finishes(tool, tmp_path, monkeypatch, failure):
+    args = options(tool)
+    args.run_dir, args.child = tmp_path, "prefill"
+    (tmp_path / "prefill").mkdir()
+    tool.write_json(tmp_path / "prompt.json", {"length": 9000, "token_ids": [1, 2, 3]})
+    actions = []
+
+    def generate(*args, **kwargs):
+        actions.append("generate")
+        return [NS(outputs=[NS(text="test", token_ids=[3], finish_reason="length")], num_cached_tokens=0)]
+
+    def rpc(method, **kwargs):
+        assert method == "prefill_check_seal_source"
+        actions.append("fence")
+        if failure == "fence":
+            raise RuntimeError("fence failed")
+        return [{"device": 0, "segment": "P0"}, None]
+
+    llm = NS(
+        generate=generate,
+        collective_rpc=rpc,
+        llm_engine=NS(engine_core=NS(shutdown=lambda: actions.append("shutdown"))),
+    )
+    monkeypatch.setitem(sys.modules, "vllm", NS(LLM=lambda **_: llm, SamplingParams=lambda **kwargs: kwargs))
+    monkeypatch.setattr(tool, "engine_options", lambda *_: {"worker_extension_cls": "old_probe"})
+
+    def wait(root):
+        assert actions == ["generate", "fence"]
+        assert json.loads((root / "prefill/persisted.json").read_text())["segment"] == "P0"
+        actions.append("backup")
+        if failure == "backup":
+            raise RuntimeError("backup failed")
+
+    monkeypatch.setattr(tool, "wait_for_backup_release", wait)
+    if failure:
+        with pytest.raises(RuntimeError, match=f"{failure} failed"):
+            tool.run_model(args)
+    else:
+        tool.run_model(args)
+    assert actions == ["generate", "fence", *([] if failure == "fence" else ["backup"]), "shutdown"]
 
 
 @pytest.mark.parametrize("stale_baseline", [False, True])

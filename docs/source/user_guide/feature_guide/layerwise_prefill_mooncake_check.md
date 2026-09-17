@@ -35,13 +35,15 @@ python -u tools/layerwise_prefill_mooncake_check.py --output-tokens 256 2>&1 | t
 
 1. 清理 `/dev/shm/*`；失败即停止。随后自动启动本地 master，等待监听就绪，
    打印 `local master ready: 127.0.0.1:端口`。
-2. 启动绑定逻辑卡 1 的 holder1（CPU 存储默认 8 GiB），保留到 D 完成。
-   加载模型前检查 native API、存储位置及本进程的 CPU 写入/读回。
-3. 仅指定 `--with-baseline` 时：先关闭 layerwise P offload，生成并保存 baseline 输出；
+2. 仅指定 `--with-baseline` 时：先关闭 layerwise P offload，生成并保存 baseline 输出；
    不向 Mooncake 写入。默认跳过此步骤。
-4. P：启用 layerwise P offload，逐层保存到本地 CPU，rank0 通过 Ascend 异步保存到 holder1。
-   生成一个 token 后完成最终持久化屏障，关闭 P 及其全部 worker。
-5. 启动绑定逻辑卡 0 的 holder0，经 Ascend 从 holder1 复制全部已保存对象，
+3. P：按生产配置启用 layerwise P offload，逐层保存到本地 LMCache CPU，异步保存到
+   **P 自己持有的 Mooncake segment**，保持 `mooncake_prefer_local_alloc=true`。
+   测试不改写 P 的 key、数据指针、大小和 `ReplicateConfig`；保存期间没有独立 holder。
+4. P 生成一个 token，完成保存屏障并公布原始对象清单；暂不关闭 P 及其 worker。
+   这时才启动绑定逻辑卡 1 的 holder1，经 Ascend 读取 P 已保存的原始对象，
+   保存额外副本并逐字节读回校验。只有备份成功后，才允许 P 退出、释放显存和原 segment。
+5. P 完全退出后启动绑定逻辑卡 0 的 holder0，经 Ascend 从 holder1 复制全部已保存对象，
    检查实际存储位置及逐字节读回。复制失败、不完整或落错 holder 时不启动 D。
 6. D：重新创建本地 LMCache，卡 0 读取 holder1，其余卡读取 holder0，生成输出。
 7. 输出统计后，先关闭两个 holder，再关闭本次启动的 master。中途失败也清理已启动的子进程。
@@ -53,16 +55,20 @@ holder 虽然保存的是 CPU 内存，但 `ascend` 传输仍需要 NPU 上下�
 分别绑定 `--devices` 中第二张、第一张卡（进程内逻辑编号 1、0），不加载模型权重，
 但会占用额外的设备上下文/传输资源。至少需要两张不同的可见卡。
 
-两份 KV 使用独立的测试 key 前缀，固定 D 各卡的读取来源，避免 Ascend 连接自身设备；
-不依赖 Mooncake 在两个同名副本间碰巧选对。仅本测试的 worker extension 安装路由包装，
-不修改生产 connector、模型计算或加载格式。P 的非写入 rank 仍可初始化客户端及查询元数据。
+两份**备份**使用独立的测试 key 前缀，固定 D 各卡的读取来源，避免 Ascend 连接自身设备；
+P 原始 key 不加前缀。不依赖 Mooncake 在两个同名副本间碰巧选对。
+仅本测试的 worker extension 安装 P 保存观察器和 D 读取路由，
+不修改生产 connector、模型计算或加载格式。P 的非写入 rank 仍可正常初始化及查询元数据。
 holder 对自己的 CPU segment 使用 Mooncake 本地 memcpy；跨 holder 复制及 P/D 传输仍为 Ascend，
-不切换成 TCP。脚本不会绕过缺失的 native API，会在 holder 启动自检时直接报错。
+不切换成 TCP。P 的 `MC_STORE_MEMCPY` 保持启动环境中的原值，测试不覆盖。
+脚本不会绕过缺失的 native API，会在 holder 启动自检时直接报错。
 
-P/D 的 Mooncake `global_segment_size` 都设为 0，避免数据落在会随 P 退出而
-注销的 segment。真正的数据由独立存储进程持有，而不是只保留 master 的元数据。
+P 的 Mooncake `global_segment_size` 按 `--store-gb` 分配，保留生产本地持有路径；
+D 的设为 0，只读取 P 保存后制作的两份备份。原始 segment 随 P 退出而注销，
+因此必须在 P 退出前完成第一次备份，不能先关 P 再读它的原始数据。
 每轮在文章开头添加唯一标记，避免旧缓存跳过本轮 P 的计算。
-本地 CPU cache 默认 8 GiB，两个独立存储 segment 各 8 GiB（`--store-gb` 是每份的大小），
+本地 CPU cache 默认 8 GiB，P 及两个 holder 的存储 segment 各按 8 GiB 配置
+（`--store-gb` 是每份的大小；P 与 holder0 不同时存活），
 未照搬多机配置中的 95 GB/100 GB。
 P 的 NPU 直传开关仍置为 true，以验证 bank-safe warning 和逐层 CPU 保存覆盖确实生效；
 不进行对旧 NPU bank 的远端读取。
@@ -70,9 +76,11 @@ P 的 NPU 直传开关仍置为 true，以验证 bank-safe warning 和逐层 CPU
 这不是“保留 P 的 LMCache 不退出”：当前 LocalCPU allocator 隶属于模型 worker，
 没有在这里增加独立 LMCache daemon。D 使用全新 CPU cache，可以检查跨进程重载。
 
-相较单 holder，测试额外占用一份 CPU 存储，复制阶段还使用两个最大对象大小的 CPU 缓冲区。
-额外开销包括 P 保存后的 placement 查询/对象清单写入、P 退出后的整份复制、读回与字节比较，
-以及 D 调用 native store 前的 key 前缀路由。不会在逐层计算中等待第二份复制，也不在每个
+测试额外占用备份存储，复制阶段还使用两个最大对象大小的 CPU 缓冲区。
+额外开销包括 P 成功保存后的对象清单写入、prefill 结束后的保存屏障和 placement 查询、
+两次整份备份复制/读回/字节比较，以及 D 调用 native store 前的 key 前缀路由。
+第二次复制是因为本机要先释放 P 的完整模型显存，再让独立 holder0 接管副本。
+不会在逐层计算中等待备份，也不在每个
 decode step 比较 KV。**这是正确性/传输路径测试，不应用它衡量生产性能**。
 
 日志开头打印结果目录 `layerwise-mooncake-*`，包含：
@@ -81,12 +89,14 @@ decode step 比较 KV。**这是正确性/传输路径测试，不应用它衡�
 - `master/server.log`、`master/process.json`：本次本地 master 的日志、PID、地址和启动命令。
 - `holder1/`、`holder0/` 的 `server.log`、`ready.json`：设备、segment 及复制完成记录。
 - `prefill/objects.jsonl`：P 成功保存的对象名/字节数清单，不是 KV tensor dump。
+- `prefill/persisted.json`：保存屏障完成后 P 自己的原始 segment 和清单摘要。
+- `prefill/release.json`：第一份备份校验完成后，launcher 允许 P 退出的标志。
 - `decode/route-*.json`：各客户端关闭时记录的实际 holder 路由和读取对象次数。
 - `prefill/`、`decode/` 的 `output.txt`、`output.json`、`server.log`；
   `baseline/` 仅在 `--with-baseline` 时创建。
 - 各阶段实际设置的 `lmcache_env.json` 和 `engine_options.json`；仅是记录，无须提供输入配置文件。
 - `summary.json`：默认记录 `baseline_ran=false`、P 缓存命中数量、D 命中的持久化前缀长度，
-  两份存储的路由、复制对象数/字节数/清单摘要及 D 客户端读取统计；
+  P 原始保存说明、两次复制的对象数/字节数/清单摘要及 D 客户端读取统计；
   不生成 baseline 对比结论。指定 `--with-baseline` 时，才增加 P 首 token 与 baseline 的比较、
   D 首次 token 分歧位置。
 

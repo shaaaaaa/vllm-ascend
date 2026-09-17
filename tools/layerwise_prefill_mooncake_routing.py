@@ -60,7 +60,7 @@ def manifest_digest(entries):
 
 
 class RoutedStore:
-    """Keep native buffer/transport calls intact; route only object names/placement."""
+    """Observe P without rewriting calls; route only D to post-prefill copies."""
 
     def __init__(self, store, replica_config_cls, route, current_device):
         self.store = store
@@ -73,16 +73,21 @@ class RoutedStore:
 
     def setup(self, *args, **kwargs):
         self.device = int(self.current_device())
-        self.holder = read_holder(self.route["stage"], self.device)
-        if args[4] != "ascend" or args[2] != 0:
-            raise ValueError("Model clients must use Ascend and must not own storage segments")
+        prefill = self.route["stage"] == "prefill"
+        self.holder = None if prefill else read_holder("decode", self.device)
+        if args[4] != "ascend" or (not prefill and args[2] != 0):
+            raise ValueError("Use Ascend; only P may own model-process storage")
         self.root = Path(self.route["root"])
-        self.segment = json.loads((self.root / f"holder{self.holder}/ready.json").read_text())["segment"]
-        self.prefix = f"{self.route['namespace']}/holder{self.holder}/"
+        self.prefix = "" if prefill else f"{self.route['namespace']}/holder{self.holder}/"
         status = self.store.setup(*args, **kwargs)
+        self.segment = (
+            self.store.get_hostname()
+            if prefill
+            else json.loads((self.root / f"holder{self.holder}/ready.json").read_text())["segment"]
+        )
         print(
             f"[PREFILL_MOONCAKE] route: stage={self.route['stage']}, device={self.device}, "
-            f"holder_device={self.holder}, segment={self.segment}",
+            f"source={'P-owned original' if prefill else f'holder{self.holder}'}, segment={self.segment}",
             flush=True,
         )
         return status
@@ -109,12 +114,11 @@ class RoutedStore:
         raise AttributeError(f"Test routing does not implement Mooncake API {name}")
 
     def keys(self, keys):
-        return [self.prefix + key for key in keys]
+        return [self.prefix + key for key in keys] if self.prefix else keys
 
     def read(self, method, keys, *args, **kwargs):
-        # All TP ranks initialize clients and may query metadata, including P1.
-        # P1 does not transfer KV (only P0 writes). Reject self-device DATA
-        # transfers, not client initialization or master-only existence lookup.
+        # P uses its own process's native store, without rerouting. The
+        # same-device restriction applies to D's independent holder endpoints.
         if method.startswith("batch_get") and self.device == self.holder:
             raise RuntimeError("Refusing same-device Mooncake holder data transfer")
         result = getattr(self.store, method)(self.keys(keys), *args, **kwargs)
@@ -137,31 +141,49 @@ class RoutedStore:
     def batch_get_into_multi_buffers(self, keys, *args, **kwargs):
         return self.read("batch_get_into_multi_buffers", keys, *args, **kwargs)
 
-    def put(self, method, keys, ptrs, sizes):
-        if self.route["stage"] != "prefill" or self.device != 0:
-            raise RuntimeError("Only P rank0 may write test KV")
-        config = self.replica_config_cls()
-        config.replica_num = 1
-        config.preferred_segment = self.segment
-        mapped = self.keys(keys)
-        result = getattr(self.store, method)(mapped, ptrs, sizes, config)
+    def put(self, method, keys, ptrs, sizes, config):
+        if self.route["stage"] != "prefill":
+            raise RuntimeError("Only P may write test KV")
+        # Pass the ORIGINAL keys, buffers, sizes and ReplicateConfig to native.
+        # Recording completed objects must not change production placement.
+        call_args = (keys, ptrs, sizes) if config is None else (keys, ptrs, sizes, config)
+        result = getattr(self.store, method)(*call_args)
         if result is None or len(result) != len(keys) or any(status != 0 for status in result):
             raise RuntimeError(f"Mooncake test KV put failed: {result}")
         counts = [sum(size) if isinstance(size, (tuple, list)) else size for size in sizes]
-        for key, count in zip(mapped, counts, strict=True):
-            require_placement(self.store, key, self.segment, count)
         with self.lock:
-            with (self.root / "prefill/objects.jsonl").open("a", encoding="utf-8") as output:
+            name = "objects.jsonl" if self.device == 0 else f"objects-device{self.device}.jsonl"
+            with (self.root / "prefill" / name).open("a", encoding="utf-8") as output:
                 for key, size in zip(keys, counts, strict=True):
                     output.write(json.dumps({"key": key, "size": size}) + "\n")
                     self.records += 1
         return result
 
     def batch_put_from(self, keys, ptrs, sizes, config=None):
-        return self.put("batch_put_from", keys, ptrs, sizes)
+        return self.put("batch_put_from", keys, ptrs, sizes, config)
 
     def batch_put_from_multi_buffers(self, keys, ptrs, sizes, config=None):
-        return self.put("batch_put_from_multi_buffers", keys, ptrs, sizes)
+        return self.put("batch_put_from_multi_buffers", keys, ptrs, sizes, config)
+
+    def completed_source(self):
+        """Called once AFTER the engine's store fence, never in a layer callback."""
+        if self.device != 0:
+            if self.records:
+                raise RuntimeError("This test expects production save_only_first_rank ownership")
+            return None
+        if not self.records:
+            return None
+        entries = read_manifest(self.root / "prefill/objects.jsonl")
+        for key, size in entries.items():
+            require_placement(self.store, key, self.segment, size)
+        return {
+            "device": self.device,
+            "segment": self.segment,
+            "protocol": "ascend",
+            "objects": len(entries),
+            "bytes": sum(entries.values()),
+            "manifest_sha256": manifest_digest(entries),
+        }
 
 
 def install_routing():
@@ -177,14 +199,21 @@ def install_routing():
     if getattr(native, "prefill_check_routed", False):
         return
 
+    stores = []
+
     def factory():
-        return RoutedStore(native(), mooncake.ReplicateConfig, route, torch.npu.current_device)
+        store = RoutedStore(native(), mooncake.ReplicateConfig, route, torch.npu.current_device)
+        stores.append(store)
+        return store
 
     factory.prefill_check_routed = True
+    factory.observed_stores = stores
     mooncake.MooncakeDistributedStore = factory
 
 
-def copy_objects(store, config_cls, entries, namespace, source_segment, dest_segment, allocate):
+def copy_objects(
+    store, config_cls, entries, namespace, source_segment, dest_segment, allocate, *, source_holder=1, dest_holder=0
+):
     """Copy via Ascend, bounded to two largest-object CPU buffers, then verify bytes."""
     import torch
 
@@ -201,8 +230,8 @@ def copy_objects(store, config_cls, entries, namespace, source_segment, dest_seg
         config.replica_num = 1
         config.preferred_segment = dest_segment
         for index, (key, count) in enumerate(entries.items(), 1):
-            source_key = routed_key(namespace, 1, key)
-            dest_key = routed_key(namespace, 0, key)
+            source_key = key if source_holder is None else routed_key(namespace, source_holder, key)
+            dest_key = routed_key(namespace, dest_holder, key)
             require_placement(store, source_key, source_segment, count)
             result = store.batch_get_into_multi_buffers([source_key], [[source.data_ptr()]], [[count]])
             if result != [count]:

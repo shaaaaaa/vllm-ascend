@@ -60,7 +60,9 @@ class MemoryStore:
             )
         ]
 
-    def batch_put_from_multi_buffers(self, keys, pointers, sizes, config):
+    def batch_put_from_multi_buffers(self, keys, pointers, sizes, config=None):
+        config = config or NS(preferred_segment=self.endpoint)
+        self.last_put_args = (keys, pointers, sizes, config)
         self.calls.append(("put", list(keys), config.preferred_segment))
         if self.put_failure:
             return [-1] * len(keys)
@@ -71,7 +73,7 @@ class MemoryStore:
             self.data[key] = payload, "wrong-holder" if self.bad_placement else config.preferred_segment
         return [0] * len(keys)
 
-    def batch_put_from(self, keys, pointers, sizes, config):
+    def batch_put_from(self, keys, pointers, sizes, config=None):
         return self.batch_put_from_multi_buffers(keys, [[p] for p in pointers], [[s] for s in sizes], config)
 
     def batch_get_into_multi_buffers(self, keys, pointers, sizes):
@@ -109,12 +111,13 @@ def store():
 def make_route(routing, store, root, stage, device):
     (root / "prefill").mkdir(exist_ok=True)
     (root / stage).mkdir(exist_ok=True)
-    for holder in (0, 1):
+    for holder in (0, 1) if stage == "decode" else ():
         (root / f"holder{holder}").mkdir(exist_ok=True)
         (root / f"holder{holder}/ready.json").write_text(json.dumps({"segment": f"segment{holder}"}))
     route = {"root": str(root), "namespace": "run", "stage": stage}
     result = routing.RoutedStore(store, NS, route, lambda: device)
-    assert result.setup("host", "P2PHANDSHAKE", 0, 0, "ascend", "", "master") == 0
+    segment_size = 1024 if stage == "prefill" else 0
+    assert result.setup("host", "P2PHANDSHAKE", segment_size, 0, "ascend", "", "master") == 0
     return result
 
 
@@ -138,21 +141,36 @@ def test_every_decode_rank_reads_only_other_device_copy(routing, store, tmp_path
 def test_prefill_native_byte_buffer_write_is_unchanged_and_manifested(routing, store, tmp_path):
     routed = make_route(routing, store, tmp_path, "prefill", 0)
     buffer = torch.tensor([7, 0, 255, 6], dtype=torch.uint8)
-    # Caller cannot override the holder route through preferred_segment.
+    # Production's preferred local segment must remain unchanged.
     assert routed.batch_put_from(["tail"], [buffer.data_ptr()], [4], NS(preferred_segment="segment0")) == [0]
     assert routed.batch_put_from_multi_buffers(["page"], [[buffer.data_ptr(), buffer.data_ptr() + 2]], [[2, 2]]) == [0]
-    assert store.data == {f"run/holder1/{key}": (bytes(buffer.tolist()), "segment1") for key in ("tail", "page")}
+    assert store.data == {key: (bytes(buffer.tolist()), "segment0") for key in ("tail", "page")}
     assert routing.read_manifest(tmp_path / "prefill/objects.jsonl") == {"tail": 4, "page": 4}
+    assert routed.completed_source()["segment"] == "segment0"
+    assert not (tmp_path / "holder1").exists()
 
 
-@pytest.mark.parametrize("failure", ["bad_placement", "put_failure"])
-def test_failed_or_misplaced_put_is_not_added_to_copy_manifest(routing, store, tmp_path, failure):
+def test_failed_put_is_not_added_to_copy_manifest(routing, store, tmp_path):
     routed = make_route(routing, store, tmp_path, "prefill", 0)
-    setattr(store, failure, True)
+    store.put_failure = True
     buffer = torch.zeros(4, dtype=torch.uint8)
     with pytest.raises(RuntimeError):
         routed.batch_put_from(["bad"], [buffer.data_ptr()], [4])
     assert not (tmp_path / "prefill/objects.jsonl").exists()
+
+
+def test_prefill_forwards_original_objects_and_checks_placement_only_after_save(routing, store, tmp_path):
+    routed = make_route(routing, store, tmp_path, "prefill", 0)
+    buffer = torch.tensor([9, 3, 1, 7], dtype=torch.uint8)
+    keys, pointers, sizes = ["original-key"], [[buffer.data_ptr()]], [[4]]
+    config = NS(preferred_segment="production-segment", replica_num=1, with_soft_pin=True)
+    assert routed.batch_put_from_multi_buffers(keys, pointers, sizes, config) == [0]
+    assert all(actual is expected for actual, expected in zip(store.last_put_args, (keys, pointers, sizes, config)))
+    assert store.data["original-key"] == (bytes(buffer.tolist()), "production-segment")
+    # No test redirection even when native allocation chooses a different
+    # segment. The post-save validation reports it instead of changing P.
+    with pytest.raises(RuntimeError, match="placement"):
+        routed.completed_source()
 
 
 @pytest.mark.parametrize("device", range(8))
@@ -160,16 +178,14 @@ def test_all_prefill_ranks_initialize_and_query_metadata(routing, store, tmp_pat
     routed = make_route(routing, store, tmp_path, "prefill", device)
     assert routed.batch_is_exist(["missing"]) == [0]
     assert routed.is_exist("missing") == 0
-    if device:
-        with pytest.raises(RuntimeError, match="Only P rank0"):
-            routed.batch_put_from(["key"], [123], [4])
+    assert routed.completed_source() is None
 
 
-def test_same_device_prefill_data_read_is_rejected_before_native_transfer(routing, store, tmp_path):
+def test_prefill_own_process_read_is_not_rerouted(routing, store, tmp_path):
     routed = make_route(routing, store, tmp_path, "prefill", 1)
-    with pytest.raises(RuntimeError, match="same-device"):
-        routed.batch_get_buffer(["key"])
-    assert [call[0] for call in store.calls] == ["setup"]
+    store.data["key"] = b"abcd", "segment0"
+    assert routed.batch_get_buffer(["key"]) == [b"abcd"]
+    assert [call[0] for call in store.calls] == ["setup", "get_buffer"]
 
 
 def test_close_records_actual_decode_route(routing, store, tmp_path):
@@ -183,7 +199,7 @@ def test_close_records_actual_decode_route(routing, store, tmp_path):
 
 def test_decode_cannot_modify_either_copy(routing, store, tmp_path):
     routed = make_route(routing, store, tmp_path, "decode", 0)
-    with pytest.raises(RuntimeError, match="Only P rank0"):
+    with pytest.raises(RuntimeError, match="Only P may write"):
         routed.batch_put_from(["key"], [123], [4])
     with pytest.raises(AttributeError, match="does not implement"):
         routed.unreviewed_key_api
@@ -206,6 +222,24 @@ def test_holder_copy_verifies_real_bytes_and_cleans_buffers(routing, store, bad)
         for key in entries:
             assert store.data[f"run/holder0/{key}"] == (store.data[f"run/holder1/{key}"][0], "segment0")
     assert not store.registered
+
+
+def test_first_backup_reads_original_production_keys(routing, store):
+    store.data["original-page"] = b"\x91\x01\x03", "P-rank0"
+    result = routing.copy_objects(
+        store,
+        NS,
+        {"original-page": 3},
+        "run",
+        "P-rank0",
+        "segment1",
+        lambda size: torch.empty(size, dtype=torch.uint8),
+        source_holder=None,
+        dest_holder=1,
+    )
+    assert result["bytes"] == 3
+    assert store.data["run/holder1/original-page"] == (b"\x91\x01\x03", "segment1")
+    assert store.data["original-page"] == (b"\x91\x01\x03", "P-rank0")
 
 
 @pytest.mark.parametrize("bad", [None, "short_read", "corrupt_copy", "bad_placement"])
@@ -259,4 +293,41 @@ def test_worker_extension_installs_before_connector_creates_native_store(routing
     installed = fake.MooncakeDistributedStore
     routing.install_routing()
     assert fake.MooncakeDistributedStore is installed
+    monkeypatch.delitem(sys.modules, "layerwise_prefill_mooncake_worker")
+
+
+@pytest.mark.parametrize("fail_fence", [False, True])
+def test_worker_source_is_published_only_after_native_store_fences(routing, monkeypatch, fail_fence):
+    monkeypatch.setenv("LMCACHE_EXTRA_CONFIG", "{}")
+    monkeypatch.delitem(sys.modules, "layerwise_prefill_mooncake_worker", raising=False)
+    worker = importlib.import_module("layerwise_prefill_mooncake_worker")
+    events = []
+
+    def fence(**kwargs):
+        assert kwargs == {"final": True}
+        events.append("drain")
+        if fail_fence:
+            raise RuntimeError("native store failed")
+
+    def source():
+        assert events == ["drain", "sync"]
+        events.append("publish")
+        return {"device": 0, "segment": "P0"}
+
+    engine = NS(
+        _force_layerwise_prefill_store=True,
+        poll_layerwise_prefill_puts=fence,
+        wait_for_pending_sync_stores=lambda: events.append("sync"),
+    )
+    connector = NS(_lmcache_engine=NS(lmcache_engine=engine))
+    native = NS(observed_stores=[NS(completed_source=source)])
+    monkeypatch.setitem(sys.modules, "mooncake.store", NS(MooncakeDistributedStore=native))
+    monkeypatch.setitem(sys.modules, "vllm.distributed.kv_transfer", NS(get_kv_transfer_group=lambda: connector))
+    if fail_fence:
+        with pytest.raises(RuntimeError, match="native store failed"):
+            worker.MooncakeRoutingWorker().prefill_check_seal_source()
+        assert events == ["drain"]
+    else:
+        assert worker.MooncakeRoutingWorker().prefill_check_seal_source() == {"device": 0, "segment": "P0"}
+        assert events == ["drain", "sync", "publish"]
     monkeypatch.delitem(sys.modules, "layerwise_prefill_mooncake_worker")

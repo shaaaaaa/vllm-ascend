@@ -3,8 +3,8 @@
 """Sequential full-model P/D against a surviving Mooncake segment.
 
 LMCache settings are supplied through child environment variables, no YAML.
-Starts a local master and two Ascend storage holders on logical devices 1/0.
-P writes holder1. After P exits, holder0 copies those objects through Ascend.
+P saves to its OWN native Mooncake segment, using production keys/placement.
+After prefill, holder1 backs it up before P exits; holder0 then copies holder1.
 D0 reads holder1; D1..7 read holder0. No profiler or KV tensor probes.
 This tests persistent reload, NOT simultaneous P-to-D RemoteFill negotiation.
 Baseline output comparison is opt-in with --with-baseline.
@@ -227,10 +227,10 @@ def stage_config(base, args, stage):
     )
     extra = config.setdefault("extra_config", {})
     extra.update(
-        # Neither P nor D owns a Mooncake segment; exiting P cannot erase KV.
-        global_segment_size=0,
+        # P retains production local placement. D only reads surviving copies.
+        global_segment_size=int(args.store_gb * 1024**3) if stage == "prefill" else 0,
         local_buffer_size=0,
-        mooncake_prefer_local_alloc=False,
+        mooncake_prefer_local_alloc=stage == "prefill",
         save_only_first_rank=True,
         save_chunk_meta=False,
         use_ascend_direct=True,
@@ -269,7 +269,7 @@ def child_environment(args, root, stage):
 
 
 def run_holder(args):
-    """Keep CPU KV alive on device 1, or clone it on device 0 before D starts."""
+    """Back up completed P on device1, then clone onto device0 after P exits."""
     extra = json.loads(os.environ["LMCACHE_EXTRA_CONFIG"])
     if extra["protocol"] != "ascend":
         raise ValueError("Two-holder validation requires the Ascend transport")
@@ -301,20 +301,23 @@ def run_holder(args):
         # Fail missing native APIs/descriptor bindings BEFORE loading a model.
         holder_preflight(store, ReplicateConfig, args.run_dir.name, torch)
         record = {"segment": store.get_hostname(), "pid": os.getpid(), "device": device, "protocol": "ascend"}
-        if device == 0:
-            entries = read_manifest(args.run_dir / "prefill/objects.jsonl")
-            if sum(entries.values()) > int(extra["global_segment_size"]):
-                raise ValueError("KV objects exceed --store-gb for holder0; refusing placement fallback")
-            source = json.loads((args.run_dir / "holder1/ready.json").read_text())
-            record["copy"] = copy_objects(
-                store,
-                ReplicateConfig,
-                entries,
-                args.run_dir.name,
-                source["segment"],
-                store.get_hostname(),
-                lambda size: torch.empty(size, dtype=torch.uint8, device="cpu"),
-            )
+        entries = read_manifest(args.run_dir / "prefill/objects.jsonl")
+        if sum(entries.values()) > int(extra["global_segment_size"]):
+            raise ValueError("KV objects exceed --store-gb; refusing placement fallback")
+        source_path = "prefill/persisted.json" if device == 1 else "holder1/ready.json"
+        source = json.loads((args.run_dir / source_path).read_text())
+        record["source_segment"] = source["segment"]
+        record["copy"] = copy_objects(
+            store,
+            ReplicateConfig,
+            entries,
+            args.run_dir.name,
+            source["segment"],
+            store.get_hostname(),
+            lambda size: torch.empty(size, dtype=torch.uint8, device="cpu"),
+            source_holder=None if device == 1 else 1,
+            dest_holder=device,
+        )
         # Parent polls for this file: never expose partially written JSON.
         ready_path = args.run_dir / args.child / "ready.json"
         pending_path = ready_path.with_suffix(".pending")
@@ -384,9 +387,27 @@ def run_model(args):
         )
         (root / stage / "output.txt").write_text(completion.text, encoding="utf-8")
         print(f"[PREFILL_MOONCAKE] {stage}: {completion.text!r}", flush=True)
+        if stage == "prefill":
+            sources = [source for source in llm.collective_rpc("prefill_check_seal_source", timeout=600) if source]
+            if len(sources) != 1 or sources[0]["device"] != 0:
+                raise RuntimeError("P did not expose exactly one completed rank0-owned store")
+            path = root / "prefill/persisted.json"
+            write_json(path.with_suffix(".pending"), sources[0])
+            path.with_suffix(".pending").replace(path)
+            print("[PREFILL_MOONCAKE] P saved to its own segment; waiting for post-prefill backup", flush=True)
+            wait_for_backup_release(root)
     finally:
         # P's final completion/worker close must finish remote puts before exit.
         llm.llm_engine.engine_core.shutdown()
+
+
+def wait_for_backup_release(root):
+    deadline = time.monotonic() + HOLDER_COPY_TIMEOUT_SECONDS + HOLDER_STARTUP_TIMEOUT_SECONDS
+    while not (root / "prefill/release.json").exists():
+        if time.monotonic() >= deadline:
+            raise TimeoutError("P backup did not complete; shutting down P without starting D")
+        time.sleep(0.2)
+    copy_report(root, "holder1")
 
 
 def start_child(args, root, stage):
@@ -463,7 +484,7 @@ def check_services(holders, master):
 
 
 def wait_for_holder(root, name, holders, master):
-    timeout = HOLDER_COPY_TIMEOUT_SECONDS if name == "holder0" else HOLDER_STARTUP_TIMEOUT_SECONDS
+    timeout = HOLDER_COPY_TIMEOUT_SECONDS + HOLDER_STARTUP_TIMEOUT_SECONDS
     deadline = time.monotonic() + timeout
     while not (root / name / "ready.json").exists():
         check_services(holders, master)
@@ -471,20 +492,41 @@ def wait_for_holder(root, name, holders, master):
             raise RuntimeError(f"Storage holder not ready; inspect {root / name / 'server.log'}")
         time.sleep(0.2)
     check_services(holders, master)
-    if name == "holder0":
-        copy_report(root)
+    copy_report(root, name)
 
 
-def copy_report(root):
-    source = json.loads((root / "holder1/ready.json").read_text())
-    target = json.loads((root / "holder0/ready.json").read_text())
+def copy_report(root, name="holder0"):
+    source_path = "prefill/persisted.json" if name == "holder1" else "holder1/ready.json"
+    source = json.loads((root / source_path).read_text())
+    target = json.loads((root / name / "ready.json").read_text())
     entries = read_manifest(root / "prefill/objects.jsonl")
     expected = {"objects": len(entries), "bytes": sum(entries.values()), "manifest_sha256": manifest_digest(entries)}
-    if (source["device"], target["device"]) != (1, 0) or source["segment"] == target["segment"]:
+    if name == "holder1" and any(source.get(key) != value for key, value in expected.items()):
+        raise RuntimeError("P manifest changed after the production store fence; refusing to start D")
+    expected_devices = (0, 1) if name == "holder1" else (1, 0)
+    if (
+        (source["device"], target["device"]) != expected_devices
+        or source["segment"] == target["segment"]
+        or target.get("source_segment") != source["segment"]
+    ):
         raise RuntimeError("Holder identity mismatch; refusing to start D")
     if target.get("copy") != expected:
         raise RuntimeError("Holder copy does not match P's completed manifest; refusing to start D")
     return expected
+
+
+def back_up_prefill(args, root, proc, holders, master):
+    while not (root / "prefill/persisted.json").exists():
+        if proc.poll() is not None:
+            raise RuntimeError("P exited before its production store was backed up; inspect prefill/server.log")
+        check_services(holders, master)
+        time.sleep(0.2)
+    if proc.poll() is not None:
+        raise RuntimeError("P source owner exited before backup")
+    # No independent holder exists during the production prefill save.
+    holders["holder1"] = start_child(args, root, "holder1")
+    wait_for_holder(root, "holder1", {**holders, "prefill": proc}, master)
+    write_json(root / "prefill/release.json", {"backup_complete": True})
 
 
 def run_models(args, root, holders, master=None):
@@ -496,6 +538,8 @@ def run_models(args, root, holders, master=None):
         check_services(holders, master)
         proc = start_child(args, root, stage)
         try:
+            if stage == "prefill":
+                back_up_prefill(args, root, proc, holders, master)
             while proc.poll() is None:
                 check_services(holders, master)
                 time.sleep(1)
@@ -517,6 +561,8 @@ def analyse(root, chunk_size, with_baseline=False):
     summary = {
         "transport": "ascend",
         "holder_routing": {"D0": "holder1", "D1..7": "holder0"},
+        "prefill_storage": "P-owned native segment; original keys, buffers and placement config",
+        "prefill_backup": copy_report(root, "holder1"),
         "copy": copy_report(root),
         "decode_routes": [json.loads(path.read_text()) for path in sorted((root / "decode").glob("route-*.json"))],
         "baseline_ran": with_baseline,
@@ -618,8 +664,6 @@ def run_check(args, root, master):
         raise ValueError("Prompt must cover multiple prefill and storage chunks")
     holders = {}
     try:
-        holders["holder1"] = start_child(args, root, "holder1")
-        wait_for_holder(root, "holder1", holders, master)
         run_models(args, root, holders, master)
         analyse(root, chunk_size, args.with_baseline)
     finally:
