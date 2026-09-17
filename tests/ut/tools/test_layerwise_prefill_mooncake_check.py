@@ -32,6 +32,7 @@ def test_no_required_config_and_deployment_defaults(tool):
     defaults = tool.parser().parse_args([])
     assert defaults.master is None
     assert defaults.master_bin == "mooncake_master"
+    assert defaults.with_baseline is False
     args = options(tool)
     assert not hasattr(args, "config")
     base = tool.deployment_config(args.master, args.local_hostname)
@@ -151,16 +152,18 @@ def test_summary_requires_real_fresh_p_and_d_reload(tool, tmp_path, p_cached, d_
         (tmp_path / stage).mkdir()
         tool.write_json(tmp_path / stage / "output.json", {"num_cached_tokens": cached, "token_ids": tokens})
     if valid:
-        tool.analyse(tmp_path, 1024)
+        tool.analyse(tmp_path, 1024, with_baseline=True)
     else:
         with pytest.raises(RuntimeError, match="Did not exercise"):
-            tool.analyse(tmp_path, 1024)
+            tool.analyse(tmp_path, 1024, with_baseline=True)
     summary = json.loads((tmp_path / "summary.json").read_text())
     assert summary["p_computed_and_d_reloaded"] is valid
+    assert summary["baseline_ran"] is True
     assert summary["decode_first_difference"] == 1  # differences are reported, not raised
 
 
-def test_prefill_group_is_fully_stopped_before_decode_launch(tool, tmp_path, monkeypatch):
+@pytest.mark.parametrize("with_baseline", [False, True])
+def test_prefill_group_is_fully_stopped_before_decode_launch(tool, tmp_path, monkeypatch, with_baseline):
     actions = []
 
     def start(args, root, stage):
@@ -169,8 +172,11 @@ def test_prefill_group_is_fully_stopped_before_decode_launch(tool, tmp_path, mon
 
     monkeypatch.setattr(tool, "start_child", start)
     monkeypatch.setattr(tool, "finish_child", lambda proc: actions.append(("stop", proc.stage)))
-    tool.run_models(options(tool), tmp_path, NS(poll=lambda: None))
-    assert actions == [(action, stage) for stage in ("baseline", "prefill", "decode") for action in ("start", "stop")]
+    args = options(tool)
+    args.with_baseline = with_baseline
+    tool.run_models(args, tmp_path, NS(poll=lambda: None))
+    stages = ("baseline", "prefill", "decode") if with_baseline else ("prefill", "decode")
+    assert actions == [(action, stage) for stage in stages for action in ("start", "stop")]
 
 
 @pytest.fixture
@@ -409,12 +415,15 @@ def test_master_death_stops_current_model_instead_of_retrying(tool, tmp_path, mo
 
 
 @pytest.mark.parametrize("prefill_failed", [False, True])
-def test_run_check_keeps_storage_alive_across_p_exit(tool, tmp_path, monkeypatch, prefill_failed):
+@pytest.mark.parametrize("with_baseline", [False, True])
+def test_run_check_keeps_storage_alive_across_p_exit(tool, tmp_path, monkeypatch, prefill_failed, with_baseline):
     args = options(tool)
+    args.with_baseline = with_baseline
     args.prompt_file = tmp_path / "article.txt"
     args.prompt_file.write_text("Test article", encoding="utf-8")
     actions = []
-    for stage in ("holder", "baseline", "prefill", "decode"):
+    stages = ("baseline", "prefill", "decode") if with_baseline else ("prefill", "decode")
+    for stage in ("holder", *stages):
         (tmp_path / stage).mkdir()
     monkeypatch.setattr(tool, "prepare_prompt", lambda *_: 9000)
 
@@ -428,14 +437,19 @@ def test_run_check_keeps_storage_alive_across_p_exit(tool, tmp_path, monkeypatch
 
     monkeypatch.setattr(tool, "start_child", start)
     monkeypatch.setattr(tool, "finish_child", lambda proc: actions.append(("stop", proc.stage)))
-    monkeypatch.setattr(tool, "analyse", lambda *_: actions.append(("analyse", "outputs")))
+
+    def analyse(root, chunk_size, baseline_enabled):
+        assert baseline_enabled == with_baseline
+        actions.append(("analyse", "outputs"))
+
+    monkeypatch.setattr(tool, "analyse", analyse)
     if prefill_failed:
         with pytest.raises(RuntimeError, match="prefill failed"):
             tool.run_check(args, tmp_path, NS(poll=lambda: None))
-        expected_stages = ("baseline", "prefill")
+        expected_stages = stages[:-1]
     else:
         tool.run_check(args, tmp_path, NS(poll=lambda: None))
-        expected_stages = ("baseline", "prefill", "decode")
+        expected_stages = stages
     expected = [("start", "holder")]
     expected += [(action, stage) for stage in expected_stages for action in ("start", "stop")]
     if not prefill_failed:
@@ -445,3 +459,33 @@ def test_run_check_keeps_storage_alive_across_p_exit(tool, tmp_path, monkeypatch
     for stage in ("prefill", "decode", "holder"):
         env = json.loads((tmp_path / stage / "lmcache_env.json").read_text())
         assert env["LMCACHE_REMOTE_URL"] == "mooncakestore://127.0.0.1:45678/"
+    assert (tmp_path / "baseline").exists() == with_baseline
+
+
+@pytest.mark.parametrize("stale_baseline", [False, True])
+@pytest.mark.parametrize("cached,valid", [(8192, True), (0, False)])
+def test_summary_without_baseline_never_reads_or_claims_baseline_comparison(
+    tool, tmp_path, stale_baseline, cached, valid
+):
+    tool.write_json(tmp_path / "prompt.json", {"length": 9000})
+    for stage, hits in (("prefill", 0), ("decode", cached)):
+        (tmp_path / stage).mkdir()
+        tool.write_json(tmp_path / stage / "output.json", {"num_cached_tokens": hits, "token_ids": [1]})
+    if stale_baseline:
+        (tmp_path / "baseline").mkdir()
+        (tmp_path / "baseline/output.json").write_text("not valid JSON", encoding="utf-8")
+    if valid:
+        tool.analyse(tmp_path, 1024)
+    else:
+        with pytest.raises(RuntimeError, match="Did not exercise"):
+            tool.analyse(tmp_path, 1024)
+    summary = json.loads((tmp_path / "summary.json").read_text())
+    assert summary["baseline_ran"] is False
+    assert "prefill_first_token_equal" not in summary
+    assert "decode_first_difference" not in summary
+    assert summary["p_computed_and_d_reloaded"] is valid
+
+
+def test_baseline_requires_explicit_opt_in(tool):
+    assert tool.model_stages(tool.parser().parse_args([])) == ("prefill", "decode")
+    assert tool.model_stages(tool.parser().parse_args(["--with-baseline"])) == ("baseline", "prefill", "decode")

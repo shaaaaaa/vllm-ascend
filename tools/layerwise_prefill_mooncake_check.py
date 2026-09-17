@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""Sequential full-model baseline/P/D against a surviving Mooncake segment.
+"""Sequential full-model P/D against a surviving Mooncake segment.
 
 LMCache settings are supplied through child environment variables, no YAML.
 Starts an isolated local master and storage holder by default. No
 profiler or KV probes. P exits before D starts with a fresh LocalCPU cache.
 This tests persistence/reload, NOT simultaneous P-to-D RemoteFill negotiation.
+Baseline output comparison is opt-in with --with-baseline.
 """
 
 import argparse
@@ -48,6 +49,9 @@ def parser():
     cli.add_argument("--devices", default="0,1,2,3,4,5,6,7")
     cli.add_argument("--prompt-file", type=Path, default=DEFAULT_PROMPT_FILE)
     cli.add_argument("--output-tokens", type=int, default=256, help="Upper bound; EOS can end generation earlier")
+    cli.add_argument(
+        "--with-baseline", action="store_true", help="Also run baseline before P/D and compare output tokens"
+    )
     cli.add_argument("--prefill-chunk-tokens", type=int, default=4096)
     cli.add_argument("--cpu-cache-gb", type=float, default=8)
     cli.add_argument("--store-gb", type=float, default=8, help="Independent Mooncake storage segment size")
@@ -390,8 +394,12 @@ def finish_child(proc):
         raise RuntimeError("Child process group did not release log pipe; refusing to launch another model")
 
 
+def model_stages(args):
+    return ("baseline", "prefill", "decode") if args.with_baseline else ("prefill", "decode")
+
+
 def run_models(args, root, holder, master=None):
-    for stage in ("baseline", "prefill", "decode"):
+    for stage in model_stages(args):
         proc = start_child(args, root, stage)
         try:
             while proc.poll() is None:
@@ -408,24 +416,26 @@ def run_models(args, root, holder, master=None):
         print(f"[PREFILL_MOONCAKE] {stage} exited; output: {root / stage / 'output.txt'}", flush=True)
 
 
-def analyse(root, chunk_size):
-    records = {
-        stage: json.loads((root / stage / "output.json").read_text(encoding="utf-8"))
-        for stage in ("baseline", "prefill", "decode")
-    }
+def analyse(root, chunk_size, with_baseline=False):
+    stages = ("baseline", "prefill", "decode") if with_baseline else ("prefill", "decode")
+    records = {stage: json.loads((root / stage / "output.json").read_text(encoding="utf-8")) for stage in stages}
     prompt = json.loads((root / "prompt.json").read_text(encoding="utf-8"))
     expected = (prompt["length"] - 1) // chunk_size * chunk_size
     cached = records["decode"]["num_cached_tokens"] or 0
     p_cached = records["prefill"]["num_cached_tokens"] or 0
     summary = {
-        "prefill_first_token_equal": records["baseline"]["token_ids"][:1] == records["prefill"]["token_ids"][:1],
-        "decode_first_difference": first_difference(records["baseline"]["token_ids"], records["decode"]["token_ids"]),
+        "baseline_ran": with_baseline,
         "expected_cached_prefix_min": expected,
         "decode_cached_tokens": cached,
         "prefill_cached_tokens": p_cached,
         "p_computed_and_d_reloaded": p_cached == 0 and cached >= expected,
         "scope": "single-host sequential persistent reload; no concurrent RemoteFill, MTP, DP or KV probes",
     }
+    if with_baseline:
+        summary.update(
+            prefill_first_token_equal=records["baseline"]["token_ids"][:1] == records["prefill"]["token_ids"][:1],
+            decode_first_difference=first_difference(records["baseline"]["token_ids"], records["decode"]["token_ids"]),
+        )
     write_json(root / "summary.json", summary)
     print(f"[PREFILL_MOONCAKE] {json.dumps(summary, ensure_ascii=False)}", flush=True)
     if not summary["p_computed_and_d_reloaded"]:
@@ -451,7 +461,7 @@ def main():
         else Path(tempfile.mkdtemp(prefix="layerwise-mooncake-", dir=".")).resolve()
     )
     root.mkdir(parents=True, exist_ok=True)
-    for stage in ("master", "holder", "baseline", "prefill", "decode"):
+    for stage in ("master", "holder", *model_stages(args)):
         (root / stage).mkdir()  # Never reuse an old run's output/cache evidence.
     print(
         f"[PREFILL_MOONCAKE] results: {root}; full model, TP={len(args.devices.split(','))}, max_len=16384, gpu=0.96",
@@ -464,10 +474,11 @@ def main():
 def run_check(args, root, master):
     chunk_size = STORAGE_CHUNK_TOKENS
     print(
-        f"[PREFILL_MOONCAKE] master={args.master}, local_hostname={args.local_hostname}, chunk_size={chunk_size}",
+        f"[PREFILL_MOONCAKE] master={args.master}, local_hostname={args.local_hostname}, chunk_size={chunk_size}; "
+        f"stages={','.join(model_stages(args))}, baseline={'enabled' if args.with_baseline else 'skipped'}",
         flush=True,
     )
-    for stage in ("holder", "baseline", "prefill", "decode"):
+    for stage in ("holder", *model_stages(args)):
         # Audit artifact only; children read their environment, not this file.
         env = child_environment(args, root, stage)
         write_json(root / stage / "lmcache_env.json", {k: v for k, v in env.items() if k.startswith("LMCACHE_")})
@@ -489,7 +500,7 @@ def run_check(args, root, master):
                 raise RuntimeError(f"Storage holder not ready; inspect {root / 'holder/server.log'}")
             time.sleep(0.2)
         run_models(args, root, holder, master)
-        analyse(root, chunk_size)
+        analyse(root, chunk_size, args.with_baseline)
     finally:
         # Stop holder while our master still lives; managed_master closes last.
         finish_child(holder)

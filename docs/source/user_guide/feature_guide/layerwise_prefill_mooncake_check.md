@@ -3,6 +3,8 @@
 `tools/layerwise_prefill_mooncake_check.py` 使用完整 GLM-5.2、单机 TP8，
 `max_model_len=16384`、显存利用率 `0.96`。不开 profiler，不安装 KV debug
 hooks，不开 MTP。只有 P 使用 eager，baseline/D 使用普通 PIECEWISE 图。
+**默认只跑 P → D，跳过 baseline**，避免为当前的持久化/加载排查额外加载一次模型。
+需要 baseline 输出对照时，再显式加 `--with-baseline`；它不会自动启用 KV dump。
 
 不需要 YAML 或 `--config`。脚本根据此前的部署配置，在各子进程设置 `LMCACHE_*`
 环境变量：chunk size 1024、NUMA interleave、passive writable、lookup timeout
@@ -30,11 +32,12 @@ python -u tools/layerwise_prefill_mooncake_check.py 2>&1 | tee log.log
 
 1. 自动启动本地 master，等待监听就绪，打印 `local master ready: 127.0.0.1:端口`。
 2. 启动独立的 Mooncake CPU 存储进程（默认 8 GiB），一直保留到 D 完成。
-3. baseline：关闭 layerwise P offload，生成并保存参考输出；不向 Mooncake 写入。
+3. 仅指定 `--with-baseline` 时：先关闭 layerwise P offload，生成并保存 baseline 输出；
+   不向 Mooncake 写入。默认跳过此步骤。
 4. P：启用 layerwise P offload，逐层保存到本地 CPU，异步保存到 Mooncake。
    生成一个 token 后完成最终持久化屏障，关闭 P 及其全部 worker。
 5. D：重新创建本地 LMCache，从 Mooncake 加载 P 的 KV 后生成输出。
-6. 完成对比后，先关闭 holder，再关闭本次启动的 master。中途失败也按此顺序清理。
+6. 输出统计后，先关闭 holder，再关闭本次启动的 master。中途失败也按此顺序清理。
 
 本地 master 异常退出时，launcher 会停止正在运行的模型阶段；不会一直等客户端重连。
 这些存活检查在 launcher 中执行，不在模型逐层计算或 KV 传输回调里。
@@ -58,20 +61,23 @@ P 的 NPU 直传开关仍置为 true，以验证 bank-safe warning 和逐层 CPU
 
 - `prompt.txt`、`prompt.json`：实际文章及 token IDs。
 - `master/server.log`、`master/process.json`：本次本地 master 的日志、PID、地址和启动命令。
-- `baseline/`、`prefill/`、`decode/` 的 `output.txt`、`output.json`、`server.log`。
+- `prefill/`、`decode/` 的 `output.txt`、`output.json`、`server.log`；
+  `baseline/` 仅在 `--with-baseline` 时创建。
 - 各阶段实际设置的 `lmcache_env.json` 和 `engine_options.json`；仅是记录，无须提供输入配置文件。
-- `summary.json`：P 首 token 与 baseline 的比较、D 首次 token 分歧位置，
-  以及 D 命中的持久化前缀长度。
+- `summary.json`：默认记录 `baseline_ran=false`、P 缓存命中数量、D 命中的持久化前缀长度，
+  不生成 baseline 对比结论。指定 `--with-baseline` 时，才增加 P 首 token 与 baseline 的比较、
+  D 首次 token 分歧位置。
 
 默认最多生成 256 tokens，允许 EOS 提前结束，并非强制生成 256 个。
-数值/输出不同只记录，不因此中止；P 命中旧缓存或 D 没有加载到所需缓存时则报错，
+开启 baseline 对比后，输出不同只记录，不因此中止；P 命中旧缓存或 D 没有加载到所需缓存时则报错，
 防止把重新计算 prompt 当成“PD 验证通过”。逐层 KV 数值比较仍使用原来的
 `layerwise_prefill_check.py`；它使用文件归档，不能替代这次 Mooncake 路径验证。
 
 ## 验证边界
 
 顺序测试时 D 在 P 退出后才存在，所以没有同时在线的 RemoteFill 握手/提前推送。
-通过这个测试只能说明本次输入的 P 持久化和 D 重载/输出路径通过了对照，
+默认测试检查本次输入的 P 持久化和 D 重载/生成路径，不证明输出数值正确；
+只有显式运行 baseline 才会生成输出对比。
 **不能推导生产环境剩下的唯一风险是时序问题**。还需覆盖同时在线的 RemoteFill、
 跨机网络、不同 TP/DP、并发、MTP、失败/重试及更长上下文。
 
