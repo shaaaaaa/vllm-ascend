@@ -27,6 +27,11 @@ python -u tools/layerwise_prefill_mooncake_check.py 2>&1 | tee log.log
    生成一个 token 后完成最终持久化屏障，关闭 P 及其全部 worker。
 4. D：重新创建本地 LMCache，从 Mooncake 加载 P 的 KV 后生成输出。
 
+holder 虽然保存的是 CPU 内存，但 `ascend` 传输仍需要 NPU 上下文。脚本在
+Mooncake 初始化前选择 `--devices` 中的第一张卡（进程内逻辑编号 0）并初始化
+NPU，启动后会打印 `holder Ascend context ready`。这不会加载模型权重，但会有
+额外的设备上下文/传输资源占用；该进程存活到 D 完成后才退出。
+
 P/D 的 Mooncake `global_segment_size` 都设为 0，避免数据落在会随 P 退出而
 注销的 segment。真正的数据由独立存储进程持有，而不是只保留 master 的元数据。
 每轮在文章开头添加唯一标记，避免旧缓存跳过本轮 P 的计算。

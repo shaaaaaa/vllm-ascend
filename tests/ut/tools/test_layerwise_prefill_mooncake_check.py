@@ -6,6 +6,7 @@ import copy
 import importlib
 import json
 import os
+import sys
 from pathlib import Path
 from types import SimpleNamespace as NS
 from typing import Optional
@@ -165,3 +166,89 @@ def test_prefill_group_is_fully_stopped_before_decode_launch(tool, tmp_path, mon
     monkeypatch.setattr(tool, "finish_child", lambda proc: actions.append(("stop", proc.stage)))
     tool.run_models(options(tool), tmp_path, NS(poll=lambda: None))
     assert actions == [(action, stage) for stage in ("baseline", "prefill", "decode") for action in ("start", "stop")]
+
+
+@pytest.fixture
+def holder_runtime(tool, tmp_path, monkeypatch):
+    """Fake only native boundaries; execute the actual holder startup/close."""
+    actions = []
+    args = options(tool)
+    args.devices = "4,5,6,7"
+    args.run_dir = tmp_path
+    env = tool.child_environment(args, tmp_path, "holder")
+    monkeypatch.setenv("ASCEND_RT_VISIBLE_DEVICES", env["ASCEND_RT_VISIBLE_DEVICES"])
+    monkeypatch.setenv("LMCACHE_EXTRA_CONFIG", env["LMCACHE_EXTRA_CONFIG"])
+    state = NS(protocol="ascend", setup_status=0, init_error=None)
+
+    def set_device(device):
+        # Physical 4 is logical 0; never pass the physical ordinal here.
+        assert device == 0
+        actions.append("set_device")
+
+    def init():
+        actions.append("npu_init")
+        if state.init_error:
+            raise state.init_error
+
+    class Store:
+        def __init__(self):
+            # Reproduce aclrtGetDevice failing without an initialized context.
+            if state.protocol == "ascend":
+                assert actions == ["set_device", "npu_init"], "Missing NPU initialization before Mooncake"
+            actions.append("construct")
+
+        def setup(self, *values):
+            actions.append("setup")
+            assert values[2] == 8 * 1024**3
+            assert values[4] == state.protocol
+            return state.setup_status
+
+        def get_hostname(self):
+            return "test-holder-segment"
+
+        def close(self):
+            actions.append("close")
+
+    monkeypatch.setitem(sys.modules, "torch_npu", NS(npu=NS(set_device=set_device, init=init)))
+    monkeypatch.setitem(sys.modules, "mooncake", NS())
+    monkeypatch.setitem(sys.modules, "mooncake.store", NS(MooncakeDistributedStore=Store))
+    monkeypatch.setattr(tool.signal, "signal", lambda *_: None)
+    monkeypatch.setattr(tool.threading, "Event", lambda: NS(set=lambda: None, wait=lambda: actions.append("wait")))
+    return args, actions, state
+
+
+def test_holder_initializes_visible_npu_before_mooncake(tool, holder_runtime):
+    args, actions, _ = holder_runtime
+    tool.run_holder(args)
+    assert actions == ["set_device", "npu_init", "construct", "setup", "wait", "close"]
+    ready = json.loads((args.run_dir / "holder_ready.json").read_text())
+    assert ready["segment"] == "test-holder-segment"
+
+
+def test_holder_npu_init_failure_does_not_start_store_or_publish_ready(tool, holder_runtime):
+    args, actions, state = holder_runtime
+    state.init_error = RuntimeError("NPU initialization failed")
+    with pytest.raises(RuntimeError, match="NPU initialization failed"):
+        tool.run_holder(args)
+    assert actions == ["set_device", "npu_init"]
+    assert not (args.run_dir / "holder_ready.json").exists()
+
+
+def test_holder_setup_failure_closes_store_without_publishing_ready(tool, holder_runtime):
+    args, actions, state = holder_runtime
+    state.setup_status = -600
+    with pytest.raises(RuntimeError, match="Mooncake holder setup failed: -600"):
+        tool.run_holder(args)
+    assert actions == ["set_device", "npu_init", "construct", "setup", "close"]
+    assert not (args.run_dir / "holder_ready.json").exists()
+
+
+def test_tcp_holder_does_not_initialize_npu(tool, holder_runtime, monkeypatch):
+    args, actions, state = holder_runtime
+    state.protocol = "tcp"
+    extra = json.loads(os.environ["LMCACHE_EXTRA_CONFIG"])
+    extra["protocol"] = state.protocol
+    monkeypatch.setenv("LMCACHE_EXTRA_CONFIG", json.dumps(extra))
+    monkeypatch.setitem(sys.modules, "torch_npu", None)
+    tool.run_holder(args)
+    assert actions == ["construct", "setup", "wait", "close"]

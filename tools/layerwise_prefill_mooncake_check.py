@@ -170,9 +170,25 @@ def child_environment(args, root, stage):
 
 def run_holder(args):
     """Own CPU storage independently of both model-worker lifetimes."""
+    extra = json.loads(os.environ["LMCACHE_EXTRA_CONFIG"])
+    if extra.get("protocol", "ascend") == "ascend":
+        # This process never constructs a vLLM worker. Ascend transport still
+        # calls aclrtGetDevice even when its storage segment is in CPU RAM.
+        # Initialize on the setup thread, before constructing the native store.
+        import torch_npu
+
+        # Child visibility is args.devices: logical 0 is its FIRST visible NPU,
+        # not necessarily physical card 0 (e.g. --devices 4,5,6,7).
+        torch_npu.npu.set_device(0)
+        torch_npu.npu.init()
+        print(
+            "[PREFILL_MOONCAKE] holder Ascend context ready: logical_device=0, "
+            f"visible_devices={os.environ.get('ASCEND_RT_VISIBLE_DEVICES')}; KV storage remains in CPU RAM",
+            flush=True,
+        )
+
     from mooncake.store import MooncakeDistributedStore
 
-    extra = json.loads(os.environ["LMCACHE_EXTRA_CONFIG"])
     store = MooncakeDistributedStore()
     stopped = threading.Event()
     signal.signal(signal.SIGTERM, lambda *_: stopped.set())
