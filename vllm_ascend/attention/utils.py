@@ -274,7 +274,6 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
             # converted to its unpadded view.
             indexer_block_table_tensor=self.indexer_block_table_tensor,
             indexer_slot_mapping=self.indexer_slot_mapping,
-            prompt_lens_cpu=(self.prompt_lens_cpu[:num_actual_reqs] if self.prompt_lens_cpu is not None else None),
             causal=self.causal,
             actual_seq_lengths_q=self.actual_seq_lengths_q[:num_actual_tokens],
             positions=self.positions,
@@ -283,6 +282,11 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
             num_input_tokens=self.num_input_tokens,
             prefill_context_parallel_metadata=self.prefill_context_parallel_metadata,
             max_seq_len=self.max_seq_len,
+            prompt_lens_cpu=(
+                self.prompt_lens_cpu[:num_actual_reqs]
+                if self.prompt_lens_cpu is not None
+                else None
+            ),
             request_ids=(self.request_ids[:num_actual_reqs] if self.request_ids is not None else None),
             cold_compact_resumes=self.cold_compact_resumes[
                 :num_actual_reqs
@@ -565,19 +569,7 @@ def staged_sfa_metadata_sparse_route(
             bool(getattr(load_spec, "dsa_cold_compact_resume", False))
         )
 
-    if any(cold_resumes):
-        computed_ends = list(frontiers)
-        for i, cold in enumerate(cold_resumes):
-            if not cold:
-                continue
-            spec = main_by_req[active_request_ids[i]].load_spec
-            end = int(getattr(spec, "dsa_cold_computed_end", frontiers[i]))
-            if not frontiers[i] <= end <= int(spec.lmcache_cached_tokens):
-                return StagedSFARouteReason.INVALID_FRONTIER, (), ()
-            computed_ends[i] = end
-        cold_resume_tuple = ColdResumeMarkers(tuple(cold_resumes), tuple(computed_ends))
-    else:
-        cold_resume_tuple = ()
+    cold_resume_tuple = tuple(cold_resumes) if any(cold_resumes) else ()
     if dense_request_ids and sparse_request_ids:
         return (
             StagedSFARouteReason.MIXED_CONNECTOR_LOAD,
@@ -591,39 +583,6 @@ def staged_sfa_metadata_sparse_route(
             cold_resume_tuple,
         )
     return StagedSFARouteReason.DENSE_PREFIX_HIT, tuple(frontiers), ()
-
-
-def native_sfa_cold_resume_layout(
-    metadata: Any, request_ids: Any, num_computed_tokens: Any,
-) -> tuple[tuple[int, ...], tuple[bool, ...]]:
-    """Preserve cold-load proofs even when other batch rows require prefill."""
-    cold_ids = {
-        str(request.req_id)
-        for request in getattr(metadata, "requests", ())
-        if not getattr(request, "is_decode_window_save", False)
-        and getattr(getattr(request, "load_spec", None), "dsa_cold_compact_resume", False)
-    }
-    if not cold_ids:
-        return (), ()
-    active_ids = [str(req_id) for req_id in request_ids] if request_ids is not None else []
-    ordered_cold_ids = [req_id for req_id in active_ids if req_id in cold_ids]
-    if not ordered_cold_ids:
-        return (), ()
-    # Other prefill rows can legitimately have no connector load/save entry.
-    # Validate cold sources with the same resolver used by the graph route.
-    reason, cold_frontiers, cold_markers = staged_sfa_metadata_sparse_route(metadata, ordered_cold_ids)
-    if reason != StagedSFARouteReason.ELIGIBLE:
-        raise RuntimeError(f"Invalid native cold-resume metadata: {reason.value}")
-    if num_computed_tokens is None or len(num_computed_tokens) != len(active_ids):
-        raise RuntimeError("Native cold-resume computed tokens do not match active requests")
-    by_request = dict(zip(ordered_cold_ids, cold_frontiers))
-    computed_by_request = dict(zip(ordered_cold_ids, cold_markers.computed_ends))
-    frontiers = tuple(by_request.get(req_id, 0) for req_id in active_ids)
-    computed_ends = tuple(computed_by_request.get(req_id, 0) for req_id in active_ids)
-    markers = tuple(req_id in by_request for req_id in active_ids)
-    if any(marker and int(num_computed_tokens[i]) != computed_ends[i] for i, marker in enumerate(markers)):
-        raise RuntimeError("Native cold-resume frontier does not match computed tokens")
-    return frontiers, ColdResumeMarkers(markers, computed_ends)
 
 
 def staged_sfa_metadata_sparse_load(
@@ -747,80 +706,9 @@ def wait_for_kv_layer_from_connector(
         )
 
 
-def layerwise_prefill_transfer_window_supported() -> bool:
-    """Return whether the active connector exposes split wait/submit loads."""
-    if not has_kv_transfer_group() or not is_v1_kv_transfer_group():
-        return False
-
-    connector = get_kv_transfer_group()
-    submit_load = getattr(
-        connector,
-        "submit_layerwise_prefill_load",
-        None,
-    )
-    finish_save = getattr(
-        connector,
-        "finish_layerwise_prefill_save",
-        None,
-    )
-    capability = getattr(
-        connector,
-        "supports_layerwise_prefill_transfer_window",
-        False,
-    )
-    return capability is True and callable(submit_load) and callable(finish_save)
-
-
-def maybe_submit_layerwise_prefill_load(layer_name: str) -> bool:
-    """Submit the load following ``layer_name`` when explicitly supported."""
-    if not has_kv_transfer_group() or not is_v1_kv_transfer_group():
-        return False
-
-    connector = get_kv_transfer_group()
-    submit_load = getattr(
-        connector,
-        "submit_layerwise_prefill_load",
-        None,
-    )
-    capability = getattr(
-        connector,
-        "supports_layerwise_prefill_transfer_window",
-        False,
-    )
-    if capability is not True or not callable(submit_load):
-        return False
-
-    submit_load(layer_name)
-    return True
-
-
-def maybe_finish_layerwise_prefill_save(layer_name: str) -> bool:
-    """Run post-HCOM host work for a pre-HCOM layer save."""
-    if not has_kv_transfer_group() or not is_v1_kv_transfer_group():
-        return False
-
-    connector = get_kv_transfer_group()
-    finish_save = getattr(
-        connector,
-        "finish_layerwise_prefill_save",
-        None,
-    )
-    capability = getattr(
-        connector,
-        "supports_layerwise_prefill_transfer_window",
-        False,
-    )
-    if capability is not True or not callable(finish_save):
-        return False
-
-    finish_save(layer_name)
-    return True
-
-
-def _maybe_save_kv_layer_to_connector_with_method(
+def maybe_save_kv_layer_to_connector(
     layer_name: str,
     kv_cache_layer: list[torch.Tensor],
-    method_name: str,
 ):
     if not has_kv_transfer_group() or not is_v1_kv_transfer_group():
         return
@@ -842,13 +730,7 @@ def _maybe_save_kv_layer_to_connector_with_method(
             type(attn_metadata).__name__,
         )
     try:
-        save_layer = getattr(connector, method_name, None)
-        if not callable(save_layer):
-            raise RuntimeError(
-                f"KV connector {type(connector).__name__} does not expose "
-                f"required save method {method_name}"
-            )
-        save_layer(layer_name, kv_cache_layer, attn_metadata)
+        connector.save_kv_layer(layer_name, kv_cache_layer, attn_metadata)
     except Exception:
         logger.exception(
             "[DSA_INDEX_LMCACHE] connector_save_error layer=%s connector=%s kv_cache_layer=%s attn_metadata=%s",
@@ -864,39 +746,6 @@ def _maybe_save_kv_layer_to_connector_with_method(
             layer_name,
             type(connector).__name__,
         )
-
-
-def maybe_save_kv_layer_to_connector(
-    layer_name: str,
-    kv_cache_layer: list[torch.Tensor],
-):
-    _maybe_save_kv_layer_to_connector_with_method(
-        layer_name,
-        kv_cache_layer,
-        "save_kv_layer",
-    )
-
-
-def maybe_save_kv_layer_in_layerwise_prefill_transfer_window(
-    layer_name: str,
-    kv_cache_layer: list[torch.Tensor],
-):
-    _maybe_save_kv_layer_to_connector_with_method(
-        layer_name,
-        kv_cache_layer,
-        "save_kv_layer_in_layerwise_prefill_transfer_window",
-    )
-
-
-def maybe_save_kv_layer_outside_layerwise_prefill_transfer_window(
-    layer_name: str,
-    kv_cache_layer: list[torch.Tensor],
-):
-    _maybe_save_kv_layer_to_connector_with_method(
-        layer_name,
-        kv_cache_layer,
-        "save_kv_layer_outside_layerwise_prefill_transfer_window",
-    )
 
 
 def round_up(val: int, align: int) -> int:

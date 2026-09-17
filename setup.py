@@ -431,22 +431,7 @@ class custom_install(install):
 
 ROOT_DIR = os.path.dirname(__file__)
 try:
-    VERSION = get_version(
-        write_to="vllm_ascend/_version.py",
-        # Exclude benchmark/checkpoint tags before SCM version parsing. A
-        # tag_regex alone would still select the nearest non-release tag.
-        git_describe_command=[
-            "git",
-            "describe",
-            "--dirty",
-            "--tags",
-            "--long",
-            "--match",
-            "v[0-9]*.[0-9]*",
-            "--match",
-            "[0-9]*.[0-9]*",
-        ],
-    )
+    VERSION = get_version(write_to="vllm_ascend/_version.py")
 except LookupError:
     # The checkout action in github action CI does not checkout the tag. It
     # only checks out the commit. In this case, we set a dummy version.
