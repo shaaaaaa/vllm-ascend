@@ -22,7 +22,10 @@ Ascend 传输仍使用本机网卡 IP，而非 master 的 loopback 地址；默�
 无需提供 YAML，原来的 `--output-tokens` 参数不变。
 
 只有显式传 `--master IP:端口` 时才连接已有 master，且不会启停它。
-脚本从不清理 `/dev/shm` 或停止其他任务的 Mooncake 进程。
+脚本启动时会先清理一次 `/dev/shm/*`（等价于 `rm -rf /dev/shm/*`），
+再启动 master、holder 和模型。子进程和 P → D 切换时不重复清理。
+**删除无法恢复，运行前必须停止同一共享内存命名空间中的其他任务**；
+若容器使用 `--ipc=host`，也会影响宿主机共享内存。脚本不会停止其他任务的 Mooncake 进程。
 
 ```bash
 python -u tools/layerwise_prefill_mooncake_check.py 2>&1 | tee log.log
@@ -30,7 +33,8 @@ python -u tools/layerwise_prefill_mooncake_check.py 2>&1 | tee log.log
 
 脚本顺序执行：
 
-1. 自动启动本地 master，等待监听就绪，打印 `local master ready: 127.0.0.1:端口`。
+1. 清理 `/dev/shm/*`；失败即停止。随后自动启动本地 master，等待监听就绪，
+   打印 `local master ready: 127.0.0.1:端口`。
 2. 启动独立的 Mooncake CPU 存储进程（默认 8 GiB），一直保留到 D 完成。
 3. 仅指定 `--with-baseline` 时：先关闭 layerwise P offload，生成并保存 baseline 输出；
    不向 Mooncake 写入。默认跳过此步骤。

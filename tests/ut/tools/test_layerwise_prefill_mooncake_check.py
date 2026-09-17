@@ -7,6 +7,7 @@ import importlib
 import json
 import os
 import sys
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace as NS
 from typing import Optional
@@ -489,3 +490,87 @@ def test_summary_without_baseline_never_reads_or_claims_baseline_comparison(
 def test_baseline_requires_explicit_opt_in(tool):
     assert tool.model_stages(tool.parser().parse_args([])) == ("prefill", "decode")
     assert tool.model_stages(tool.parser().parse_args(["--with-baseline"])) == ("baseline", "prefill", "decode")
+
+
+def test_clear_shared_memory_only_removes_visible_children(tool, tmp_path, monkeypatch, capsys):
+    # Redirect the fixed production path to a pytest-owned directory. Never
+    # touch this machine's /dev/shm, even when these tests run on Linux.
+    root = tmp_path.resolve()
+    (root / "cache").write_text("shared pages", encoding="utf-8")
+    (root / "nested").mkdir()
+    (root / "nested/data").write_text("shared pages", encoding="utf-8")
+    (root / ".hidden").write_text("untouched", encoding="utf-8")
+
+    def fixed_path(value):
+        assert value == "/dev/shm"
+        return root
+
+    monkeypatch.setattr(tool, "Path", fixed_path)
+    tool.clear_shared_memory()
+    assert root.is_dir()
+    assert [entry.name for entry in root.iterdir()] == [".hidden"]
+    assert "removed 2 entries" in capsys.readouterr().out
+
+
+def test_clear_shared_memory_unlinks_symlinks_without_following_them(tool, monkeypatch):
+    removed = []
+    link = NS(name="external", is_symlink=lambda: True, unlink=lambda **_: removed.append("link"))
+    root = NS(is_symlink=lambda: False, is_dir=lambda: True, iterdir=lambda: iter([link]))
+    root.resolve = lambda: root
+    monkeypatch.setattr(tool, "Path", lambda _: root)
+
+    def forbidden(*args):
+        pytest.fail("Must not recursively delete a symlink target")
+
+    monkeypatch.setattr(tool.shutil, "rmtree", forbidden)
+    tool.clear_shared_memory()
+    assert removed == ["link"]
+
+
+def test_clear_shared_memory_rejects_redirected_root(tool, monkeypatch):
+    monkeypatch.setattr(tool, "Path", lambda _: NS(is_symlink=lambda: True))
+    with pytest.raises(RuntimeError, match="expected a real directory"):
+        tool.clear_shared_memory()
+
+
+@pytest.mark.parametrize("stage", ["holder", "baseline", "prefill", "decode"])
+def test_child_never_clears_shared_memory(tool, monkeypatch, stage):
+    args = options(tool)
+    args.child = stage
+    actions = []
+    monkeypatch.setattr(tool, "parser", lambda: NS(parse_args=lambda: args))
+    monkeypatch.setattr(tool, "clear_shared_memory", lambda: pytest.fail("Child must never clear /dev/shm"))
+    monkeypatch.setattr(tool, "run_holder", lambda _: actions.append("holder"))
+    monkeypatch.setattr(tool, "run_model", lambda _: actions.append("model"))
+    tool.main()
+    assert actions == ["holder" if stage == "holder" else "model"]
+
+
+@pytest.mark.parametrize("cleanup_fails", [False, True])
+def test_parent_cleans_once_before_starting_master(tool, tmp_path, monkeypatch, cleanup_fails):
+    args = options(tool)
+    args.run_dir = tmp_path
+    actions = []
+    monkeypatch.setattr(tool, "parser", lambda: NS(parse_args=lambda: args))
+    monkeypatch.setattr(tool, "os", NS(name="posix"))
+
+    def clean():
+        actions.append("clean")
+        if cleanup_fails:
+            raise PermissionError("shared memory cleanup failed")
+
+    @contextmanager
+    def master(*args):
+        actions.append("master")
+        yield None
+
+    monkeypatch.setattr(tool, "clear_shared_memory", clean)
+    monkeypatch.setattr(tool, "managed_master", master)
+    monkeypatch.setattr(tool, "run_check", lambda *args: actions.extend(["holder", "prefill", "decode"]))
+    if cleanup_fails:
+        with pytest.raises(PermissionError, match="cleanup failed"):
+            tool.main()
+        assert actions == ["clean"]
+    else:
+        tool.main()
+        assert actions == ["clean", "master", "holder", "prefill", "decode"]

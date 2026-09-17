@@ -442,6 +442,31 @@ def analyse(root, chunk_size, with_baseline=False):
         raise RuntimeError("Did not exercise fresh P compute followed by D cache reload; see summary.json")
 
 
+def clear_shared_memory():
+    """Equivalent to rm -rf /dev/shm/*; only the parent calls this at startup."""
+    root = Path("/dev/shm")
+    if root.is_symlink() or root.resolve() != root or not root.is_dir():
+        raise RuntimeError("Refusing to clean /dev/shm: expected a real directory at that exact path")
+    print(
+        "[PREFILL_MOONCAKE] WARNING: clearing /dev/shm/* before startup; "
+        "other shared-memory users must be stopped. Deleted data cannot be recovered.",
+        flush=True,
+    )
+    removed = 0
+    for entry in root.iterdir():
+        # Match shell '*' semantics, and unlink symlinks without following them.
+        if entry.name.startswith("."):
+            continue
+        if entry.is_symlink() or not entry.is_dir():
+            entry.unlink(missing_ok=True)
+        else:
+            if entry.resolve().parent != root:
+                raise RuntimeError(f"Refusing to remove a directory outside /dev/shm: {entry}")
+            shutil.rmtree(entry)
+        removed += 1
+    print(f"[PREFILL_MOONCAKE] /dev/shm cleanup complete: removed {removed} entries", flush=True)
+
+
 def main():
     args = parser().parse_args()
     if args.child:
@@ -467,6 +492,8 @@ def main():
         f"[PREFILL_MOONCAKE] results: {root}; full model, TP={len(args.devices.split(','))}, max_len=16384, gpu=0.96",
         flush=True,
     )
+    # Never repeat in a child or between P and D: holder storage must survive.
+    clear_shared_memory()
     with managed_master(args, root) as master:
         run_check(args, root, master)
 
