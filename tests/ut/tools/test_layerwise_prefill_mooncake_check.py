@@ -22,14 +22,18 @@ def tool(monkeypatch):
 
 def options(tool):
     args = tool.parser().parse_args([])
+    # The launcher resolves its private master's port before constructing envs.
+    args.master = "127.0.0.1:45678"
     args.local_hostname = "7.150.7.133"
     return args
 
 
 def test_no_required_config_and_deployment_defaults(tool):
+    defaults = tool.parser().parse_args([])
+    assert defaults.master is None
+    assert defaults.master_bin == "mooncake_master"
     args = options(tool)
     assert not hasattr(args, "config")
-    assert args.master == "7.150.4.174:58888"
     base = tool.deployment_config(args.master, args.local_hostname)
     assert base["chunk_size"] == 1024
     assert base["pin_timeout_sec"] == 1800
@@ -115,7 +119,8 @@ def test_generated_config_passes_real_lmcache_validation(tool, stage, monkeypatc
     obj.validate()
     assert obj.chunk_size == 1024
     assert obj.extra_config["transfer_timeout"] == 120
-    assert obj.remote_url == (None if stage == "baseline" else "mooncakestore://7.150.4.174:58888/")
+    assert obj.remote_url == (None if stage == "baseline" else "mooncakestore://127.0.0.1:45678/")
+    assert obj.extra_config["master_server_address"] == "127.0.0.1:45678"
     assert obj.pd_role == ("receiver" if stage == "decode" else "sender")
 
 
@@ -252,3 +257,191 @@ def test_tcp_holder_does_not_initialize_npu(tool, holder_runtime, monkeypatch):
     monkeypatch.setitem(sys.modules, "torch_npu", None)
     tool.run_holder(args)
     assert actions == ["construct", "setup", "wait", "close"]
+
+
+def test_local_nic_detection_has_no_remote_master_dependency(tool, monkeypatch):
+    calls = []
+
+    class Probe:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def connect(self, address):
+            calls.append(address)
+
+        def getsockname(self):
+            return ("7.150.7.133", 12345)
+
+    monkeypatch.setattr(tool.socket, "socket", lambda *args: Probe())
+    assert tool.detect_local_hostname() == "7.150.7.133"
+    assert calls == [("192.0.2.1", 9)]  # routing query only, no send()
+
+
+def test_local_master_ports_are_distinct_and_available(tool):
+    ports = tool.local_master_ports()
+    assert len(set(ports)) == 2
+    for port in ports:
+        with tool.socket.socket() as probe:
+            probe.bind(("127.0.0.1", port))
+
+
+@pytest.mark.parametrize("stage_failure", [False, True])
+def test_managed_master_defaults_to_local_and_cleans_only_own_process(tool, tmp_path, monkeypatch, stage_failure):
+    args = tool.parser().parse_args([])
+    actions = []
+    proc = NS(pid=123)
+    (tmp_path / "master").mkdir()
+    monkeypatch.setenv("MOONCAKE_CONFIG_PATH", "remote.yaml")
+    monkeypatch.setenv("MOONCAKE_MASTER", "old-remote:58888")
+    monkeypatch.setattr(tool.shutil, "which", lambda _: "/usr/local/bin/mooncake_master")
+    monkeypatch.setattr(tool, "local_master_ports", lambda: (45678, 45679))
+
+    def start(command, env, log_path, label):
+        actions.append("start_master")
+        assert command == [
+            "/usr/local/bin/mooncake_master",
+            "--port=45678",
+            "--rpc_address=127.0.0.1",
+            "--metrics_port=45679",
+            "--enable_metric_reporting=false",
+            "--enable_http_metadata_server=false",
+            "--logtostderr=true",
+        ]
+        assert "MOONCAKE_CONFIG_PATH" not in env
+        assert "MOONCAKE_MASTER" not in env
+        assert log_path == tmp_path / "master/server.log"
+        return proc
+
+    monkeypatch.setattr(tool, "start_logged_process", start)
+    monkeypatch.setattr(tool, "wait_for_master", lambda *args: actions.append("ready"))
+    monkeypatch.setattr(tool, "finish_child", lambda child: actions.append(("stop", child.pid)))
+
+    def run():
+        with tool.managed_master(args, tmp_path) as child:
+            assert child is proc
+            assert args.master == "127.0.0.1:45678"
+            actions.append("run_models")
+            if stage_failure:
+                raise RuntimeError("prefill failed")
+
+    if stage_failure:
+        with pytest.raises(RuntimeError, match="prefill failed"):
+            run()
+    else:
+        run()
+    assert actions == ["start_master", "ready", "run_models", ("stop", 123)]
+
+
+def test_explicit_master_is_never_started_or_stopped(tool, tmp_path, monkeypatch):
+    args = options(tool)
+
+    def forbidden(*args):
+        pytest.fail("An existing master must not be managed")
+
+    monkeypatch.setattr(tool, "start_logged_process", forbidden)
+    monkeypatch.setattr(tool, "finish_child", forbidden)
+    with tool.managed_master(args, tmp_path) as master:
+        assert master is None
+
+
+def test_missing_master_binary_fails_before_starting_any_process(tool, tmp_path, monkeypatch):
+    args = tool.parser().parse_args(["--master-bin", str(tmp_path / "missing_master")])
+    monkeypatch.setattr(tool.shutil, "which", lambda _: None)
+    with pytest.raises(RuntimeError, match="mooncake_master executable not found"):
+        with tool.managed_master(args, tmp_path):
+            pytest.fail("Must not start test without a local master")
+
+
+def test_master_startup_failure_closes_its_process(tool, tmp_path, monkeypatch):
+    args = tool.parser().parse_args([])
+    closed = []
+    proc = NS(pid=456)
+    monkeypatch.setattr(tool.shutil, "which", lambda _: "/bin/mooncake_master")
+    monkeypatch.setattr(tool, "start_logged_process", lambda *args: proc)
+
+    def failed(*args):
+        raise RuntimeError("master bind failed")
+
+    monkeypatch.setattr(tool, "wait_for_master", failed)
+    monkeypatch.setattr(tool, "finish_child", closed.append)
+    with pytest.raises(RuntimeError, match="master bind failed"):
+        with tool.managed_master(args, tmp_path):
+            pytest.fail("Must not proceed after failed startup")
+    assert closed == [proc]
+
+
+def test_wait_for_master_checks_real_local_listener(tool):
+    with tool.socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen()
+        tool.wait_for_master(NS(poll=lambda: None), f"127.0.0.1:{listener.getsockname()[1]}", "server.log")
+
+
+def test_wait_for_master_fails_immediately_on_exit(tool):
+    with pytest.raises(RuntimeError, match=r"master exited \(7\)"):
+        tool.wait_for_master(NS(poll=lambda: 7, returncode=7), "127.0.0.1:45678", "server.log")
+
+
+def test_wait_for_master_timeout_is_bounded(tool, monkeypatch):
+    times = iter([0, 1, tool.MASTER_STARTUP_TIMEOUT_SECONDS + 1])
+    monkeypatch.setattr(tool.time, "monotonic", lambda: next(times))
+    monkeypatch.setattr(tool.time, "sleep", lambda _: None)
+
+    def refused(*args, **kwargs):
+        raise ConnectionRefusedError()
+
+    monkeypatch.setattr(tool.socket, "create_connection", refused)
+    with pytest.raises(RuntimeError, match="did not listen"):
+        tool.wait_for_master(NS(poll=lambda: None), "127.0.0.1:45678", "server.log")
+
+
+def test_master_death_stops_current_model_instead_of_retrying(tool, tmp_path, monkeypatch):
+    proc = NS(poll=lambda: None)
+    stopped = []
+    monkeypatch.setattr(tool, "start_child", lambda *args: proc)
+    monkeypatch.setattr(tool, "finish_child", stopped.append)
+    with pytest.raises(RuntimeError, match="Local Mooncake master exited"):
+        tool.run_models(options(tool), tmp_path, NS(poll=lambda: None), NS(poll=lambda: 1))
+    assert stopped == [proc]
+
+
+@pytest.mark.parametrize("prefill_failed", [False, True])
+def test_run_check_keeps_storage_alive_across_p_exit(tool, tmp_path, monkeypatch, prefill_failed):
+    args = options(tool)
+    args.prompt_file = tmp_path / "article.txt"
+    args.prompt_file.write_text("Test article", encoding="utf-8")
+    actions = []
+    for stage in ("holder", "baseline", "prefill", "decode"):
+        (tmp_path / stage).mkdir()
+    monkeypatch.setattr(tool, "prepare_prompt", lambda *_: 9000)
+
+    def start(args, root, stage):
+        actions.append(("start", stage))
+        if stage == "holder":
+            tool.write_json(root / "holder_ready.json", {"pid": 10})
+            return NS(stage=stage, poll=lambda: None)
+        code = 1 if stage == "prefill" and prefill_failed else 0
+        return NS(stage=stage, poll=lambda: code, returncode=code)
+
+    monkeypatch.setattr(tool, "start_child", start)
+    monkeypatch.setattr(tool, "finish_child", lambda proc: actions.append(("stop", proc.stage)))
+    monkeypatch.setattr(tool, "analyse", lambda *_: actions.append(("analyse", "outputs")))
+    if prefill_failed:
+        with pytest.raises(RuntimeError, match="prefill failed"):
+            tool.run_check(args, tmp_path, NS(poll=lambda: None))
+        expected_stages = ("baseline", "prefill")
+    else:
+        tool.run_check(args, tmp_path, NS(poll=lambda: None))
+        expected_stages = ("baseline", "prefill", "decode")
+    expected = [("start", "holder")]
+    expected += [(action, stage) for stage in expected_stages for action in ("start", "stop")]
+    if not prefill_failed:
+        expected.append(("analyse", "outputs"))
+    expected.append(("stop", "holder"))
+    assert actions == expected
+    for stage in ("prefill", "decode", "holder"):
+        env = json.loads((tmp_path / stage / "lmcache_env.json").read_text())
+        assert env["LMCACHE_REMOTE_URL"] == "mooncakestore://127.0.0.1:45678/"

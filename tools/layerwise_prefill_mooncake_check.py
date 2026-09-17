@@ -3,15 +3,17 @@
 """Sequential full-model baseline/P/D against a surviving Mooncake segment.
 
 LMCache settings are supplied through child environment variables, no YAML.
-Uses the previously supplied master address (must already be running). No
+Starts an isolated local master and storage holder by default. No
 profiler or KV probes. P exits before D starts with a fresh LocalCPU cache.
 This tests persistence/reload, NOT simultaneous P-to-D RemoteFill negotiation.
 """
 
 import argparse
 import copy
+import ipaddress
 import json
 import os
+import shutil
 import signal
 import socket
 import subprocess
@@ -20,6 +22,7 @@ import tempfile
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
 
 from layerwise_prefill_check import (
@@ -32,15 +35,15 @@ from layerwise_prefill_check import (
     write_json,
 )
 
-DEFAULT_MASTER = "7.150.4.174:58888"
 STORAGE_CHUNK_TOKENS = 1024
+MASTER_STARTUP_TIMEOUT_SECONDS = 30
 
 
 def parser():
     cli = argparse.ArgumentParser(description=__doc__)
-    cli.add_argument(
-        "--master", default=DEFAULT_MASTER, help="Existing Mooncake master; defaults to the supplied deployment"
-    )
+    cli.add_argument("--master", help="Optional existing master; default: start a private local master automatically")
+    cli.add_argument("--master-bin", default="mooncake_master", help="Local master executable (name or path)")
+    cli.add_argument("--local-hostname", help="Optional local IPv4 address for Ascend transport; default: auto-detect")
     cli.add_argument("--model", default="/workspace/models/GLM-5.2-w4a8c8-0723")
     cli.add_argument("--devices", default="0,1,2,3,4,5,6,7")
     cli.add_argument("--prompt-file", type=Path, default=DEFAULT_PROMPT_FILE)
@@ -53,12 +56,92 @@ def parser():
     return cli
 
 
-def detect_local_hostname(master):
-    """Select this host's source address for the master route, without a send."""
-    host, port = master.rsplit(":", 1)
-    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
-        probe.connect((host, int(port)))
-        return probe.getsockname()[0]
+def detect_local_hostname(master=None):
+    """Select a real local NIC for Ascend, separate from loopback master RPC."""
+    # UDP connect only asks the local routing table; no packet is sent. TEST-NET
+    # selects the default route without depending on any real external service.
+    host, port = master.rsplit(":", 1) if master else ("192.0.2.1", 9)
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+            probe.connect((host, int(port)))
+            address = probe.getsockname()[0]
+            if not ipaddress.ip_address(address).is_loopback:
+                return address
+    except OSError:
+        pass
+    for _, _, _, _, (address, _) in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+        if not ipaddress.ip_address(address).is_loopback and address != "0.0.0.0":
+            return address
+    raise RuntimeError("Cannot detect a local NIC address for Ascend; pass --local-hostname <this-host-IP>")
+
+
+def local_master_ports():
+    """Choose distinct available RPC/admin ports without touching other jobs."""
+    with (
+        socket.socket(socket.AF_INET, socket.SOCK_STREAM) as rpc,
+        socket.socket(socket.AF_INET, socket.SOCK_STREAM) as admin,
+    ):
+        rpc.bind(("127.0.0.1", 0))
+        admin.bind(("127.0.0.1", 0))
+        return rpc.getsockname()[1], admin.getsockname()[1]
+
+
+def wait_for_master(proc, address, log_path):
+    host, port = address.rsplit(":", 1)
+    deadline = time.monotonic() + MASTER_STARTUP_TIMEOUT_SECONDS
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            raise RuntimeError(f"Local Mooncake master exited ({proc.returncode}); inspect {log_path}")
+        try:
+            with socket.create_connection((host, int(port)), timeout=0.5):
+                if proc.poll() is None:
+                    return
+        except OSError:
+            pass
+        time.sleep(0.2)
+    raise RuntimeError(f"Local Mooncake master did not listen on {address}; inspect {log_path}")
+
+
+@contextmanager
+def managed_master(args, root):
+    """Own only our new master. Never stop an explicitly supplied service."""
+    if args.master:
+        yield None
+        return
+    binary = shutil.which(args.master_bin)
+    if binary is None:
+        # pip may install the executable beside Python without that dir on PATH.
+        candidate = (
+            Path(sys.executable).with_name(args.master_bin) if Path(args.master_bin).name == args.master_bin else None
+        )
+        if candidate is not None and candidate.is_file() and os.access(candidate, os.X_OK):
+            binary = str(candidate)
+    if binary is None:
+        raise RuntimeError(
+            "mooncake_master executable not found; install it or pass --master-bin /path/to/mooncake_master"
+        )
+    rpc_port, metrics_port = local_master_ports()
+    args.master = f"127.0.0.1:{rpc_port}"
+    command = [
+        binary,
+        f"--port={rpc_port}",
+        "--rpc_address=127.0.0.1",
+        f"--metrics_port={metrics_port}",
+        "--enable_metric_reporting=false",
+        "--enable_http_metadata_server=false",
+        "--logtostderr=true",
+    ]
+    # Do not inherit deployment YAML/HA discovery from another Mooncake cluster.
+    env = {key: value for key, value in os.environ.items() if not key.startswith(("LMCACHE_", "MOONCAKE_"))}
+    log_path = root / "master" / "server.log"
+    proc = start_logged_process(command, env, log_path, "local master")
+    try:
+        wait_for_master(proc, args.master, log_path)
+        write_json(root / "master" / "process.json", {"pid": proc.pid, "address": args.master, "command": command})
+        print(f"[PREFILL_MOONCAKE] local master ready: {args.master}", flush=True)
+        yield proc
+    finally:
+        finish_child(proc)
 
 
 def deployment_config(master, local_hostname):
@@ -270,11 +353,14 @@ def start_child(args, root, stage):
         "--store-gb",
         str(args.store_gb),
     ]
-    log_path = root / stage / "server.log"
-    print(f"[PREFILL_MOONCAKE] starting {stage}: {log_path}", flush=True)
+    return start_logged_process(command, child_environment(args, root, stage), root / stage / "server.log", stage)
+
+
+def start_logged_process(command, env, log_path, label):
+    print(f"[PREFILL_MOONCAKE] starting {label}: {log_path}", flush=True)
     proc = subprocess.Popen(
         command,
-        env=child_environment(args, root, stage),
+        env=env,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         start_new_session=True,
@@ -304,11 +390,13 @@ def finish_child(proc):
         raise RuntimeError("Child process group did not release log pipe; refusing to launch another model")
 
 
-def run_models(args, root, holder):
+def run_models(args, root, holder, master=None):
     for stage in ("baseline", "prefill", "decode"):
         proc = start_child(args, root, stage)
         try:
             while proc.poll() is None:
+                if master is not None and master.poll() is not None:
+                    raise RuntimeError("Local Mooncake master exited; inspect master/server.log")
                 if holder.poll() is not None:
                     raise RuntimeError("Storage holder exited; inspect holder/server.log")
                 time.sleep(1)
@@ -353,9 +441,8 @@ def main():
         raise RuntimeError("Run model/holder orchestration on the Linux Ascend server")
     if min(args.output_tokens, args.prefill_chunk_tokens, args.cpu_cache_gb, args.store_gb) <= 0:
         raise ValueError("Token limits and CPU/store sizes must be positive")
-    args.local_hostname = detect_local_hostname(args.master)
-    base = deployment_config(args.master, args.local_hostname)
-    chunk_size = base["chunk_size"]
+    args.local_hostname = args.local_hostname or detect_local_hostname(args.master)
+    chunk_size = STORAGE_CHUNK_TOKENS
     if chunk_size <= 0 or args.prefill_chunk_tokens % chunk_size:
         raise ValueError("prefill-chunk-tokens must be a multiple of chunk_size")
     root = (
@@ -364,19 +451,26 @@ def main():
         else Path(tempfile.mkdtemp(prefix="layerwise-mooncake-", dir=".")).resolve()
     )
     root.mkdir(parents=True, exist_ok=True)
-    for stage in ("holder", "baseline", "prefill", "decode"):
+    for stage in ("master", "holder", "baseline", "prefill", "decode"):
         (root / stage).mkdir()  # Never reuse an old run's output/cache evidence.
-        # Audit artifact only; children read their environment, not this file.
-        env = child_environment(args, root, stage)
-        write_json(root / stage / "lmcache_env.json", {k: v for k, v in env.items() if k.startswith("LMCACHE_")})
     print(
         f"[PREFILL_MOONCAKE] results: {root}; full model, TP={len(args.devices.split(','))}, max_len=16384, gpu=0.96",
         flush=True,
     )
+    with managed_master(args, root) as master:
+        run_check(args, root, master)
+
+
+def run_check(args, root, master):
+    chunk_size = STORAGE_CHUNK_TOKENS
     print(
         f"[PREFILL_MOONCAKE] master={args.master}, local_hostname={args.local_hostname}, chunk_size={chunk_size}",
         flush=True,
     )
+    for stage in ("holder", "baseline", "prefill", "decode"):
+        # Audit artifact only; children read their environment, not this file.
+        env = child_environment(args, root, stage)
+        write_json(root / stage / "lmcache_env.json", {k: v for k, v in env.items() if k.startswith("LMCACHE_")})
     original = args.prompt_file.read_text(encoding="utf-8")
     # A fresh first chunk prevents an old master entry bypassing this run's P.
     args.prompt_file = root / "input.txt"
@@ -389,13 +483,15 @@ def main():
     try:
         deadline = time.monotonic() + 120
         while not (root / "holder_ready.json").exists():
+            if master is not None and master.poll() is not None:
+                raise RuntimeError(f"Local Mooncake master exited; inspect {root / 'master/server.log'}")
             if holder.poll() is not None or time.monotonic() >= deadline:
                 raise RuntimeError(f"Storage holder not ready; inspect {root / 'holder/server.log'}")
             time.sleep(0.2)
-        run_models(args, root, holder)
+        run_models(args, root, holder, master)
         analyse(root, chunk_size)
     finally:
-        # Existing master is NOT stopped; only this launcher's holder is stopped.
+        # Stop holder while our master still lives; managed_master closes last.
         finish_child(holder)
 
 

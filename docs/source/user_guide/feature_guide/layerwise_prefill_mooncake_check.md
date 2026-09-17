@@ -10,10 +10,17 @@ hooks，不开 MTP。只有 P 使用 eager，baseline/D 使用普通 PIECEWISE �
 transfer timeout 120 s。P 使用 sender、异步保存；D 使用 receiver 和
 `persistent_direct_hbm`。
 
-Mooncake master 默认沿用 **`7.150.4.174:58888`，必须已经启动**，本机地址根据到
-master 的路由自动识别，不能把 master IP 当成本机 IP。脚本不启动或停止已有
-master、不清理 `/dev/shm`。建议使用隔离的测试 master；需要换地址时可选传
-`--master IP:端口`，无须编辑配置文件。
+默认**自动启动本机独立 Mooncake master**，客户端连接 `127.0.0.1:<自动选择的空闲端口>`，
+不再依赖远端服务。RPC 和 metrics/admin 各用独立空闲端口，不占用其他任务的固定端口。
+需要本机已经安装 `mooncake_master` 可执行文件；脚本从 PATH 或 Python 所在目录查找，
+不在这些位置时可以传 `--master-bin /path/to/mooncake_master`。找不到会在加载模型前报错。
+
+Ascend 传输仍使用本机网卡 IP，而非 master 的 loopback 地址；默认通过本机路由表
+识别地址（不向外部发送探测包），也可用 `--local-hostname 本机IP` 指定。
+无需提供 YAML，原来的 `--output-tokens` 参数不变。
+
+只有显式传 `--master IP:端口` 时才连接已有 master，且不会启停它。
+脚本从不清理 `/dev/shm` 或停止其他任务的 Mooncake 进程。
 
 ```bash
 python -u tools/layerwise_prefill_mooncake_check.py 2>&1 | tee log.log
@@ -21,11 +28,16 @@ python -u tools/layerwise_prefill_mooncake_check.py 2>&1 | tee log.log
 
 脚本顺序执行：
 
-1. 启动独立的 Mooncake CPU 存储进程（默认 8 GiB），一直保留到 D 完成。
-2. baseline：关闭 layerwise P offload，生成并保存参考输出；不向 Mooncake 写入。
-3. P：启用 layerwise P offload，逐层保存到本地 CPU，异步保存到 Mooncake。
+1. 自动启动本地 master，等待监听就绪，打印 `local master ready: 127.0.0.1:端口`。
+2. 启动独立的 Mooncake CPU 存储进程（默认 8 GiB），一直保留到 D 完成。
+3. baseline：关闭 layerwise P offload，生成并保存参考输出；不向 Mooncake 写入。
+4. P：启用 layerwise P offload，逐层保存到本地 CPU，异步保存到 Mooncake。
    生成一个 token 后完成最终持久化屏障，关闭 P 及其全部 worker。
-4. D：重新创建本地 LMCache，从 Mooncake 加载 P 的 KV 后生成输出。
+5. D：重新创建本地 LMCache，从 Mooncake 加载 P 的 KV 后生成输出。
+6. 完成对比后，先关闭 holder，再关闭本次启动的 master。中途失败也按此顺序清理。
+
+本地 master 异常退出时，launcher 会停止正在运行的模型阶段；不会一直等客户端重连。
+这些存活检查在 launcher 中执行，不在模型逐层计算或 KV 传输回调里。
 
 holder 虽然保存的是 CPU 内存，但 `ascend` 传输仍需要 NPU 上下文。脚本在
 Mooncake 初始化前选择 `--devices` 中的第一张卡（进程内逻辑编号 0）并初始化
@@ -45,6 +57,7 @@ P 的 NPU 直传开关仍置为 true，以验证 bank-safe warning 和逐层 CPU
 日志开头打印结果目录 `layerwise-mooncake-*`，包含：
 
 - `prompt.txt`、`prompt.json`：实际文章及 token IDs。
+- `master/server.log`、`master/process.json`：本次本地 master 的日志、PID、地址和启动命令。
 - `baseline/`、`prefill/`、`decode/` 的 `output.txt`、`output.json`、`server.log`。
 - 各阶段实际设置的 `lmcache_env.json` 和 `engine_options.json`；仅是记录，无须提供输入配置文件。
 - `summary.json`：P 首 token 与 baseline 的比较、D 首次 token 分歧位置，
@@ -61,3 +74,5 @@ P 的 NPU 直传开关仍置为 true，以验证 bank-safe warning 和逐层 CPU
 通过这个测试只能说明本次输入的 P 持久化和 D 重载/输出路径通过了对照，
 **不能推导生产环境剩下的唯一风险是时序问题**。还需覆盖同时在线的 RemoteFill、
 跨机网络、不同 TP/DP、并发、MTP、失败/重试及更长上下文。
+
+本地 master 的参数参考 [Mooncake 部署说明](https://github.com/kvcache-ai/Mooncake/blob/main/docs/source/deployment/mooncake-store-deployment-guide.md)。
