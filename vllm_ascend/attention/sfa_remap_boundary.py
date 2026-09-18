@@ -39,6 +39,7 @@ class SFARemapBoundaryBuffer:
         self.tensor = tensor
         self._layout: tuple | None = None
         self._requests: tuple[int, ...] = ()
+        self._wide_requests: tuple[int, ...] = ()
         self._values: tuple[int, ...] | None = None
         self._stream = None
         self._uploads: list[tuple[torch.Tensor, Any]] = []
@@ -127,8 +128,10 @@ class SFARemapBoundaryBuffer:
             if index_topk <= 0 or scratch_capacity is None or scratch_capacity < index_topk:
                 raise RuntimeError("SFA remap scratch reservation is missing or too small")
             counts = Counter(row for row in rows if row >= 0)
-            if any(count * index_topk > scratch_capacity for count in counts.values()):
-                raise RuntimeError("SFA request-union scratch reservation is too small")
+            self._wide_requests = tuple(
+                request for request, count in counts.items()
+                if count * index_topk > scratch_capacity
+            )
             self._requests = tuple(sorted(counts))
             self._layout = layout
             self.invalidate()
@@ -148,6 +151,10 @@ class SFARemapBoundaryBuffer:
             else int(frontier)
             for request, frontier in zip(self._requests, frontiers)
         }
+        # Resident rows select no external KV, regardless of query width.
+        # Recheck on every frontier change, even when the row layout is cached.
+        if self._wide_requests and any(boundaries[r] != 0 for r in self._wide_requests):
+            raise RuntimeError("SFA request-union scratch reservation is too small")
         values = tuple(prompts[i] if row < 0 else boundaries[row] for i, row in enumerate(rows))
         if values == self._values:
             return

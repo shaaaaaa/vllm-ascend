@@ -540,3 +540,36 @@ def test_unchanged_prepared_boundary_has_no_tensor_operations():
     with NoTensorOps():
         buffer.update_prepared((4096, 4096))
     assert buffer.upload_count == 1
+
+
+@pytest.mark.parametrize("rows", [3, 22])
+@pytest.mark.parametrize("cached", [False, True])
+def test_wide_resident_native_rows_need_no_union_scratch(original, rows, cached):
+    prepare, config = original
+    config.window = 0
+    buffer = remap.SFARemapBoundaryBuffer(torch.zeros(rows, dtype=torch.int32)) if cached else None
+    item = metadata([0] * rows, [131614] * rows, [131636], buffer)
+    result = prepare(item, None, is_dummy_run=False, index_topk=2048, cached_tokens=(0,))
+    assert result.tolist() == [0] * rows
+    item.decode_remap_boundary_ready = False
+    with pytest.raises(RuntimeError, match="scratch reservation is too small"):
+        prepare(item, None, is_dummy_run=False, index_topk=2048, cached_tokens=(131614,))
+    assert result.tolist() == [0] * rows
+
+
+def test_mixed_native_rows_check_only_requests_with_external_kv():
+    buffer = remap.SFARemapBoundaryBuffer(torch.zeros(24, dtype=torch.int32))
+    args = ([0, 0] + [1] * 22, [131614] * 24, [131616, 131636],
+            (131614, 0), 0, 2048, 4096)
+    buffer.update(*args)
+    assert buffer.tensor.tolist() == [131614, 131614] + [0] * 22
+    with pytest.raises(RuntimeError, match="scratch reservation is too small"):
+        buffer.update(*args[:3], (131614, 131614), *args[4:])
+
+
+def test_wide_layout_guard_recovers_after_rejected_positive_frontier():
+    buffer = remap.SFARemapBoundaryBuffer(torch.zeros(22, dtype=torch.int32))
+    with pytest.raises(RuntimeError, match="scratch reservation is too small"):
+        buffer.update([0] * 22, [131614] * 22, [131636], (131614,), 0, 2048, 4096)
+    buffer.update([0] * 22, [131614] * 22, [131636], (0,), 0, 2048, 4096)
+    assert buffer.tensor.tolist() == [0] * 22

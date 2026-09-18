@@ -713,13 +713,13 @@ def _validate_dsa_scratch_capacity(
         {int(value) for value in request_rows if int(value) >= 0}
     ):
         rows = np.flatnonzero(request_rows == request_index)
-        if rows.size * width > capacity:
+        request_boundaries = boundaries[rows]
+        if np.count_nonzero(request_boundaries) * width > capacity:
             raise RuntimeError(
                 "DSA request-union scratch reservation is too small: "
                 f"request={request_index}, rows={rows.size}, "
                 f"index_topk={width}, scratch_capacity={capacity}."
             )
-        request_boundaries = boundaries[rows]
         if np.any(
             (request_boundaries != 0)
             & (request_boundaries < capacity)
