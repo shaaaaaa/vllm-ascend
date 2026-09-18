@@ -406,6 +406,10 @@ _TOPK_VALUE_PROBE_PUBLISHED: dict[int, int] = {}
 _TOPK_VALUE_PROBE_SKIP_LOGGED = 0
 _TOPK_VALUE_PROBE_SKIP_LIMIT = 16
 _TOPK_VALUE_PROBE_MIN_TOKENS = 256
+_TOPK_VALUE_PROBE_PENDING: list[dict[str, Any]] = []
+_TOPK_VALUE_PROBE_LAST_META_ID: int | None = None
+_TOPK_VALUE_PROBE_FLUSHED = 0
+_TOPK_VALUE_PROBE_FLUSH_LIMIT = 6
 
 
 def _probe_seq_len_at(seq_lens_cpu: Any, index: int) -> int | None:
@@ -422,6 +426,12 @@ def _probe_seq_len_count(seq_lens_cpu: Any) -> int:
         return -1
 
 
+def _topk_value_probe_env_enabled() -> bool:
+    return os.environ.get(
+        "VLLM_ASCEND_SFA_TOPK_VALUE_PROBE", "0"
+    ).lower() in ("1", "true", "yes", "on")
+
+
 def _maybe_probe_indexcache_topk_values(
     buffer: torch.Tensor,
     attn_metadata: Any,
@@ -429,12 +439,7 @@ def _maybe_probe_indexcache_topk_values(
     num_input_tokens: int,
 ) -> None:
     global _TOPK_VALUE_PROBE_SKIP_LOGGED
-    if os.environ.get("VLLM_ASCEND_SFA_TOPK_VALUE_PROBE", "0").lower() not in (
-        "1",
-        "true",
-        "yes",
-        "on",
-    ):
+    if not _topk_value_probe_env_enabled():
         return
     num_actual_tokens = getattr(attn_metadata, "num_actual_tokens", None)
     seq_lens_cpu = getattr(attn_metadata, "seq_lens_cpu", None)
@@ -481,47 +486,87 @@ def _maybe_probe_indexcache_topk_values(
     if published >= 3:
         return
     _TOPK_VALUE_PROBE_PUBLISHED[ctx] = published + 1
-    try:
-        rows = buffer[:num_tokens].detach()
-        row_bounds = torch.arange(
-            1, num_tokens + 1, dtype=rows.dtype, device=rows.device
-        ).unsqueeze(1)
-        per_row_out_of_range = int((rows >= row_bounds).sum().item())
-        negative_count = int((rows < 0).sum().item())
-        last_row = rows[num_tokens - 1].to(torch.int64).cpu()
-        in_range = last_row[(last_row >= 0) & (last_row < ctx)]
-        distinct = int(torch.unique(in_range).numel())
-        boundary = last_row[max(0, ctx - 3) : ctx + 5].tolist()
+    _TOPK_VALUE_PROBE_PENDING.append(
+        {
+            "buffer": buffer,
+            "num_tokens": num_tokens,
+            "ctx": ctx,
+            "layer_name": layer_name,
+        }
+    )
+
+
+def _validate_indexcache_topk_snapshot(item: dict[str, Any]) -> None:
+    num_tokens = int(item["num_tokens"])
+    ctx = int(item["ctx"])
+    buffer = item["buffer"]
+    rows = buffer[:num_tokens].detach()
+    row_bounds = torch.arange(
+        1, num_tokens + 1, dtype=rows.dtype, device=rows.device
+    ).unsqueeze(1)
+    per_row_out_of_range = int((rows >= row_bounds).sum().item())
+    negative_count = int((rows < 0).sum().item())
+    zero_rows = int((rows == 0).all(dim=-1).sum().item())
+    last_row = rows[num_tokens - 1].to(torch.int64).cpu()
+    in_range = last_row[(last_row >= 0) & (last_row < ctx)]
+    distinct = int(torch.unique(in_range).numel())
+    boundary = last_row[max(0, ctx - 3) : ctx + 5].tolist()
+    logger.warning(
+        "[SFA-TOPK-VALUE-DEFERRED] layer=%s num_tokens=%d ctx=%d width=%d "
+        "per_row_out_of_range=%d negative=%d all_zero_rows=%d "
+        "last_row_distinct=%d last_row_boundary=%s",
+        item["layer_name"],
+        num_tokens,
+        ctx,
+        int(rows.shape[1]),
+        per_row_out_of_range,
+        negative_count,
+        zero_rows,
+        distinct,
+        boundary,
+    )
+    if per_row_out_of_range:
         logger.warning(
-            "[SFA-TOPK-VALUE] layer=%s num_tokens=%d ctx=%d width=%d "
-            "per_row_out_of_range=%d negative=%d last_row_distinct=%d "
-            "last_row_boundary=%s",
-            layer_name,
-            num_tokens,
-            ctx,
-            int(rows.shape[1]),
+            "[SFA-TOPK-VALUE-DEFERRED][BAD-INDICES] %d entries point at or "
+            "past their own row position; sparse attention consumes invalid "
+            "positions",
             per_row_out_of_range,
-            negative_count,
-            distinct,
-            boundary,
         )
-        if per_row_out_of_range:
+    if distinct < ctx and ctx <= int(rows.shape[1]):
+        logger.warning(
+            "[SFA-TOPK-VALUE-DEFERRED][NOT-ALL-SELECTED] last row covers "
+            "only %d/%d context tokens (ctx < index_topk expects a full "
+            "all-selected row)",
+            distinct,
+            ctx,
+        )
+
+
+def _indexcache_topk_probe_flush(attn_metadata: Any) -> None:
+    global _TOPK_VALUE_PROBE_LAST_META_ID, _TOPK_VALUE_PROBE_FLUSHED
+    if not _topk_value_probe_env_enabled():
+        _TOPK_VALUE_PROBE_PENDING.clear()
+        return
+    meta_id = id(attn_metadata)
+    if meta_id == _TOPK_VALUE_PROBE_LAST_META_ID:
+        return
+    _TOPK_VALUE_PROBE_LAST_META_ID = meta_id
+    pending = _TOPK_VALUE_PROBE_PENDING[:]
+    _TOPK_VALUE_PROBE_PENDING.clear()
+    if not pending or _TOPK_VALUE_PROBE_FLUSHED >= _TOPK_VALUE_PROBE_FLUSH_LIMIT:
+        return
+    _TOPK_VALUE_PROBE_FLUSHED += 1
+    try:
+        torch.npu.synchronize()
+    except Exception:
+        pass
+    for item in pending[-1:]:
+        try:
+            _validate_indexcache_topk_snapshot(item)
+        except Exception as exc:  # pragma: no cover - diagnostic only
             logger.warning(
-                "[SFA-TOPK-VALUE][BAD-INDICES] %d entries point at or past "
-                "their own row position; sparse attention consumes invalid "
-                "positions",
-                per_row_out_of_range,
+                "[SFA-TOPK-VALUE-DEFERRED] probe failed: %r", exc
             )
-        if distinct < ctx and ctx <= int(rows.shape[1]):
-            logger.warning(
-                "[SFA-TOPK-VALUE][NOT-ALL-SELECTED] last row covers only "
-                "%d/%d context tokens (ctx < index_topk expects a full "
-                "all-selected row)",
-                distinct,
-                ctx,
-            )
-    except Exception as exc:  # pragma: no cover - diagnostic only
-        logger.warning("[SFA-TOPK-VALUE] probe failed: %r", exc)
 
 
 @lru_cache(maxsize=1)
@@ -4794,6 +4839,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                         reach_layer_for_shard_weight_series(layer)
             return output.fill_(0)
 
+        _indexcache_topk_probe_flush(attn_metadata)
         _dsa_prof.set_step_kind(attn_metadata.attn_state == AscendAttentionState.DecodeOnly)
         _sfa_t = _dsa_prof.begin("sfa_fwd")
         _is_pure_decode = attn_metadata.attn_state in (
