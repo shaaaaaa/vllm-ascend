@@ -17,6 +17,14 @@ def tool(monkeypatch):
 
 
 class Tokenizer:
+    def encode(self, text, **kwargs):
+        assert kwargs == {"add_special_tokens": False}
+        return [ord(c) for c in text]
+
+    def decode(self, ids, **kwargs):
+        assert kwargs == {"skip_special_tokens": False, "clean_up_tokenization_spaces": False}
+        return "".join(chr(i) for i in ids)
+
     def apply_chat_template(self, messages, **kwargs):
         assert kwargs == {"tokenize": True, "add_generation_prompt": True, "return_dict": False}
         # Mapping/nested-list form exercises the former len(BatchEncoding)==2 bug.
@@ -24,13 +32,60 @@ class Tokenizer:
         return {"input_ids": [ids], "attention_mask": [[1] * len(ids)]}
 
 
-@pytest.mark.parametrize("length", [8192, 10000])
-def test_prompt_repeats_article_and_preserves_chat_markers(tool, length):
-    text, ids = tool.build_prompt(Tokenizer(), "Example article.\n" * 320, length)
+@pytest.mark.parametrize("length", [8192, 10000, 100000])
+def test_prompt_bounds_fixed_article_and_preserves_chat_markers(tool, length):
+    text, ids = tool.build_prompt(Tokenizer(), "Example article.\n" * 8000, length)
     assert len(ids) == length
     assert ids[0] == 1 and ids[-2:] == [2, 3]
     assert ids[1:-2] == [ord(c) for c in text]
     assert text.startswith("Example article.\n")
+
+
+def test_short_article_is_not_expanded_indefinitely(tool):
+    with pytest.raises(ValueError, match="No text expansion"):
+        tool.build_prompt(Tokenizer(), "Example article.", 100000)
+
+
+def test_capped_tokenizer_fails_without_expanding_text(tool):
+    class CappedTokenizer(Tokenizer):
+        calls = 0
+
+        def apply_chat_template(self, messages, **kwargs):
+            self.calls += 1
+            data = super().apply_chat_template(messages, **kwargs)
+            data["input_ids"][0] = data["input_ids"][0][:4096]
+            return data
+
+    tokenizer = CappedTokenizer()
+    with pytest.raises(ValueError, match="tokenized to only 4096"):
+        tool.build_prompt(tokenizer, "Report " * 20000, 100000)
+    assert tokenizer.calls == 2  # empty template + fixed input, no growth loop
+
+
+def test_unstable_template_cannot_cause_unbounded_fitting(tool):
+    class GrowingTemplate(Tokenizer):
+        calls = 0
+
+        def apply_chat_template(self, messages, **kwargs):
+            self.calls += 1
+            data = super().apply_chat_template(messages, **kwargs)
+            if messages[0]["content"]:
+                data["input_ids"][0] = [1] * 10001
+            return data
+
+    tokenizer = GrowingTemplate()
+    with pytest.raises(ValueError, match="no unbounded retry"):
+        tool.build_prompt(tokenizer, "Report " * 2000, 10000)
+    assert tokenizer.calls == 1 + tool.MAX_PROMPT_FIT_ATTEMPTS
+
+
+def test_fixed_100k_example_is_committed_text_not_runtime_generation(tool):
+    source = tool.DEFAULT_LONG_PROMPT_FILE.read_text(encoding="utf-8")
+    assert len(source) > 600000
+    assert source.startswith("请阅读") and source.rstrip().endswith("END OF REFERENCE COLLECTION")
+    assert source.count("OF 12 — REFERENCE COPY") == 12
+    text, ids = tool.build_prompt(Tokenizer(), source, 100000)
+    assert len(ids) == 100000 and ids[1:-2] == [ord(c) for c in text]
 
 
 def test_prompt_can_crop_longer_source(tool):
@@ -39,18 +94,29 @@ def test_prompt_can_crop_longer_source(tool):
     assert text == ("Report " * 10000)[:9997]
 
 
-def test_short_pair_shares_one_saved_input(tool, monkeypatch, tmp_path):
+@pytest.mark.parametrize("name, count", [("10k", 10000), ("100k", 100000)])
+def test_pair_shares_one_saved_input(tool, monkeypatch, tmp_path, name, count):
     source = tmp_path / "source.txt"
-    source.write_text("Example article.\n" * 320, encoding="utf-8")
+    source.write_text("Example article.\n" * 8000, encoding="utf-8")
     args = tool.parser().parse_args(["--prompt-file", str(source)])
     monkeypatch.setitem(sys.modules, "transformers", NS(AutoTokenizer=NS(from_pretrained=lambda *a, **kw: Tokenizer())))
-    tool.prepare_inputs(args, tmp_path, tool.CASES)
-    assert sorted(p.name for p in tmp_path.glob("*_prompt.json")) == ["10k_prompt.json"]
-    for name, count in (("10k", 10000),):
-        prompt = json.loads((tmp_path / f"{name}_prompt.json").read_text())
-        assert prompt["length"] == len(prompt["token_ids"]) == count
-        text = (tmp_path / f"{name}_input.txt").read_text(encoding="utf-8")
-        assert prompt["token_ids"] == [1, *[ord(c) for c in text], 2, 3]
+    tool.prepare_inputs(args, tmp_path, (f"{name}_off", f"{name}_on"))
+    assert sorted(p.name for p in tmp_path.glob("*_prompt.json")) == [f"{name}_prompt.json"]
+    prompt = json.loads((tmp_path / f"{name}_prompt.json").read_text())
+    assert prompt["length"] == len(prompt["token_ids"]) == count
+    text = (tmp_path / f"{name}_input.txt").read_text(encoding="utf-8")
+    assert prompt["token_ids"] == [1, *[ord(c) for c in text], 2, 3]
+    assert (tmp_path / f"{name}_article_source.txt").read_text(encoding="utf-8") == source.read_text(encoding="utf-8")
+
+
+def test_default_prepares_only_saved_long_example(tool, monkeypatch, tmp_path):
+    args = tool.parser().parse_args([])
+    monkeypatch.setitem(sys.modules, "transformers", NS(AutoTokenizer=NS(from_pretrained=lambda *a, **kw: Tokenizer())))
+    tool.prepare_inputs(args, tmp_path, (args.case,))
+    assert sorted(p.name for p in tmp_path.glob("*_prompt.json")) == ["100k_prompt.json"]
+    assert (tmp_path / "100k_article_source.txt").read_text(
+        encoding="utf-8"
+    ) == tool.DEFAULT_LONG_PROMPT_FILE.read_text(encoding="utf-8")
 
 
 def test_off_on_environment_diff_is_only_feature_switch(tool, monkeypatch):
@@ -68,7 +134,7 @@ def test_off_on_environment_diff_is_only_feature_switch(tool, monkeypatch):
     assert on["MSMONITOR_USE_DAEMON"] == "0"
 
 
-@pytest.mark.parametrize("prompt_len, expected_max", [(9999, 16384), (10000, 16384)])
+@pytest.mark.parametrize("prompt_len, expected_max", [(9999, 16384), (10000, 16384), (100000, 100352)])
 def test_full_model_mtp_and_profile_options(tool, tmp_path, prompt_len, expected_max):
     args = tool.parser().parse_args([])
     options = tool.engine_options(args, tmp_path, prompt_len)
@@ -88,7 +154,7 @@ def test_full_model_mtp_and_profile_options(tool, tmp_path, prompt_len, expected
 
 
 @pytest.mark.parametrize("generate_fails, stop_fails", [(False, False), (True, False), (True, True), (False, True)])
-def test_capture_brackets_whole_generate_and_preserves_error(tool, generate_fails, stop_fails):
+def test_capture_brackets_whole_generate_and_preserves_error(tool, generate_fails, stop_fails, capsys):
     events = []
 
     def start_profile(**kwargs):
@@ -118,24 +184,31 @@ def test_capture_brackets_whole_generate_and_preserves_error(tool, generate_fail
         output, elapsed = tool.capture_request(llm, [1, 8, 2, 3], "params", "10k_on")
         assert output == ["output"] and elapsed >= 0
     assert events == [("start", {"profile_prefix": "10k_on"}), "generate", "stop"]
+    log = capsys.readouterr().out
+    assert log.index("profiler start begin") < log.index("generate begin") < log.index("profiler stop begin")
+    assert ("generate complete" in log) is not generate_fails
+    assert ("profiler stop complete" in log) is not stop_fails
+    if not generate_fails:
+        assert log.index("generate complete") < log.index("profiler stop begin")
 
 
-def test_child_only_requests_first_token_and_shuts_down(tool, monkeypatch, tmp_path):
-    args = tool.parser().parse_args(["--child", "10k_on", "--run-dir", str(tmp_path)])
-    case_dir = tmp_path / "10k_on"
+@pytest.mark.parametrize("case, length, max_len", [("10k_on", 10000, 16384), ("100k_on", 100000, 100352)])
+def test_child_only_requests_first_token_and_shuts_down(tool, monkeypatch, tmp_path, case, length, max_len):
+    args = tool.parser().parse_args(["--child", case, "--run-dir", str(tmp_path)])
+    case_dir = tmp_path / case
     case_dir.mkdir()
-    tool.write_json(tmp_path / "10k_prompt.json", {"length": 10000, "token_ids": [9] * 10000})
+    tool.write_json(tmp_path / f"{case.split('_')[0]}_prompt.json", {"length": length, "token_ids": [9] * length})
     events = []
 
     def generate(prompt, params, **kwargs):
         events.append("generate")
-        assert len(prompt["prompt_token_ids"]) == 10000
+        assert len(prompt["prompt_token_ids"]) == length
         assert params.max_tokens == 1 and params.temperature == 0
         return [NS(num_cached_tokens=0, outputs=[NS(text="hello", token_ids=[42])])]
 
     def llm(**options):
         events.append("load")
-        assert options["max_model_len"] == 16384
+        assert options["max_model_len"] == max_len
         return NS(
             start_profile=lambda **kw: events.append("start"),
             stop_profile=lambda: events.append("stop"),
@@ -153,7 +226,7 @@ def test_sequential_cases_release_model_before_analysis_and_next_launch(tool, mo
     events = []
     args = tool.parser().parse_args(["--include-off"])
     assert args.case == "all"
-    assert tool.CASES == ("10k_off", "10k_on")
+    assert tool.LONG_CASES == ("100k_off", "100k_on")
 
     def launch(command, env, log, label, **kwargs):
         events.append((label, "start"))
@@ -165,18 +238,20 @@ def test_sequential_cases_release_model_before_analysis_and_next_launch(tool, mo
     monkeypatch.setattr(tool, "start_logged_process", launch)
     monkeypatch.setattr(tool, "finish_child", lambda p: events.append((p.label, "finish")))
     monkeypatch.setattr(tool, "analyse_case", lambda p: events.append((p.name, "analyse")))
-    tool.run_cases(args, tmp_path, tool.CASES)
-    assert events == [(case, action) for case in tool.CASES for action in ("start", "wait", "finish", "analyse")]
+    tool.run_cases(args, tmp_path, tool.LONG_CASES)
+    assert events == [(case, action) for case in tool.LONG_CASES for action in ("start", "wait", "finish", "analyse")]
 
 
 @pytest.mark.parametrize(
     "options, expected",
     [
-        ([], ("10k_on",)),
-        (["--include-off"], ("10k_off", "10k_on")),
-        (["--case", "all"], ("10k_off", "10k_on")),
+        ([], ("100k_on",)),
+        (["--include-off"], ("100k_off", "100k_on")),
+        (["--case", "all"], ("100k_off", "100k_on")),
         (["--case", "10k_off"], ("10k_off",)),
         (["--case", "10k_on"], ("10k_on",)),
+        (["--case", "100k_off"], ("100k_off",)),
+        (["--case", "100k_on"], ("100k_on",)),
     ],
 )
 def test_main_selects_requested_cases(tool, monkeypatch, tmp_path, options, expected):
@@ -201,9 +276,9 @@ def test_analyse_only_still_exports_existing_off_and_on(tool, monkeypatch, tmp_p
 
 
 @pytest.mark.parametrize("option", ["--case", "--child"])
-def test_removed_long_case_cannot_be_launched(tool, option):
+def test_unknown_case_cannot_be_launched(tool, option):
     with pytest.raises(SystemExit) as error:
-        tool.parser().parse_args([option, "100k_on"])
+        tool.parser().parse_args([option, "1000k_on"])
     assert error.value.code == 2
 
 
@@ -212,10 +287,10 @@ def test_failed_case_is_cleaned_and_no_following_case_launches(tool, monkeypatch
     monkeypatch.setattr(tool, "start_logged_process", lambda *a, **kw: NS(wait=lambda: 1))
     monkeypatch.setattr(tool, "finish_child", lambda p: events.append("finish"))
     monkeypatch.setattr(tool, "analyse_case", lambda p: pytest.fail("Must not analyse failed request as success"))
-    with pytest.raises(RuntimeError, match="10k_off failed"):
-        tool.run_cases(tool.parser().parse_args([]), tmp_path, tool.CASES)
+    with pytest.raises(RuntimeError, match="100k_off failed"):
+        tool.run_cases(tool.parser().parse_args([]), tmp_path, tool.LONG_CASES)
     assert events == ["finish"]
-    assert not (tmp_path / "10k_on").exists()
+    assert not (tmp_path / "100k_on").exists()
 
 
 def test_trace_export_writes_all_rank_paths(tool, monkeypatch, tmp_path):

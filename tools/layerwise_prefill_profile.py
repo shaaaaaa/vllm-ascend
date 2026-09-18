@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""Capture full-model TP8 P-node prefill: 10k ON (add --include-off for OFF/ON).
+"""Capture full-model TP8 P-node prefill: 100k ON (add --include-off for OFF/ON).
 
 Local LMCache CPU storage only: no Mooncake, file SDK shim, D node or KV probes.
 Each case uses a fresh model process and profiles one request through its first
@@ -19,7 +19,11 @@ from pathlib import Path
 from layerwise_prefill_check import DEFAULT_PROMPT_FILE, normalize_prompt_token_ids, write_json
 from layerwise_prefill_mooncake_check import finish_child, start_logged_process
 
-CASES = ("10k_off", "10k_on")
+CASES = ("10k_off", "10k_on", "100k_off", "100k_on")
+LONG_CASES = ("100k_off", "100k_on")
+DEFAULT_LONG_PROMPT_FILE = DEFAULT_PROMPT_FILE.with_name("article_summary_100k.txt")
+MAX_PROMPT_FIT_ATTEMPTS = 3
+MIN_PROMPT_FRACTION = 0.95
 CACHE_CHUNK_TOKENS = 1024
 SHORT_MAX_MODEL_LEN = 16384
 PREFIX = "[PREFILL_PROFILE]"
@@ -29,12 +33,14 @@ def parser():
     cli = argparse.ArgumentParser(description=__doc__)
     cli.add_argument("--model", default="/workspace/models/GLM-5.2-w4a8c8-0723")
     cli.add_argument("--devices", default="0,1,2,3,4,5,6,7")
-    cli.add_argument("--prompt-file", type=Path, default=DEFAULT_PROMPT_FILE)
+    cli.add_argument("--prompt-file", type=Path, help="Override the fixed 10k/100k example article")
     cli.add_argument("--cpu-cache-gb", type=float, default=16, help="Requires this much free /dev/shm and host RAM")
     selection = cli.add_mutually_exclusive_group()
-    selection.add_argument("--case", choices=("all", *CASES), default="10k_on")
     selection.add_argument(
-        "--include-off", action="store_const", dest="case", const="all", help="Run 10k OFF then ON instead of ON only"
+        "--case", choices=("all", *CASES), default="100k_on", help="Default: 100k_on; all: 100k OFF/ON"
+    )
+    selection.add_argument(
+        "--include-off", action="store_const", dest="case", const="all", help="Run 100k OFF then ON instead of ON only"
     )
     cli.add_argument("--run-dir", type=Path, help="New, empty results directory")
     cli.add_argument(
@@ -45,11 +51,11 @@ def parser():
 
 
 def build_prompt(tokenizer, article: str, target_tokens: int):
-    """Repeat/crop article TEXT, then apply the intact chat template.
+    """Bound the fixed article's body, then apply the intact chat template.
 
-    Tokenization need not be strictly monotonic in character count. Keep the
-    best fitting candidate encountered, report its real length, and never cut
-    encoded chat delimiters just to claim an exact token count.
+    Never grow input in a loop or binary-search the entire long text. Template
+    boundary tokenization can vary, so allow a bounded number of body trims.
+    Reject unexpectedly short tokenization instead of duplicating indefinitely.
     """
 
     def encode(text):
@@ -62,46 +68,53 @@ def build_prompt(tokenizer, article: str, target_tokens: int):
             )
         )
 
-    copies = max(1, target_tokens // len(encode(article)))
-    text = (article + "\n\n") * copies
-    while len(encode(text)) < target_tokens:
-        copies *= 2
-        text = (article + "\n\n") * copies
-    low, high = 1, len(text)
-    best = None
-    while low <= high:
-        middle = (low + high) // 2
-        candidate = text[:middle]
-        ids = encode(candidate)
+    body_ids = tokenizer.encode(article, add_special_tokens=False)
+    body_budget = target_tokens - len(encode(""))
+    for _ in range(MAX_PROMPT_FIT_ATTEMPTS):
+        if body_budget <= 0:
+            break
+        text = (
+            article
+            if len(body_ids) <= body_budget
+            else tokenizer.decode(body_ids[:body_budget], skip_special_tokens=False, clean_up_tokenization_spaces=False)
+        )
+        ids = encode(text)
         if len(ids) <= target_tokens:
-            if best is None or len(ids) > len(best[1]):
-                best = candidate, ids
-            if len(ids) == target_tokens:
-                break
-            low = middle + 1
-        else:
-            high = middle - 1
-    if best is None or len(best[1]) <= 4096:
-        raise ValueError("Article input must span multiple 4096-token prefill chunks")
-    return best
+            if len(ids) < target_tokens * MIN_PROMPT_FRACTION or len(ids) <= 4096:
+                raise ValueError(
+                    f"Fixed article tokenized to only {len(ids)} tokens for target={target_tokens}; "
+                    "check the input file/tokenizer. No text expansion was attempted."
+                )
+            return text, ids
+        body_budget -= len(ids) - target_tokens
+    raise ValueError(f"Could not fit the fixed article within {target_tokens} tokens; no unbounded retry")
 
 
 def prepare_inputs(args, root, cases):
-    print(f"{PREFIX} loading tokenizer and preparing article inputs", flush=True)
+    started = time.perf_counter()
+    print(f"{PREFIX} loading tokenizer: {args.model}", flush=True)
     from transformers import AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
-    article = args.prompt_file.read_text(encoding="utf-8")
-    if not article.strip():
-        raise ValueError(f"Empty article: {args.prompt_file}")
-    (root / "article_source.txt").write_text(article, encoding="utf-8")
-    for name, target in (("10k", 10000),):
+    print(f"{PREFIX} tokenizer loaded in {time.perf_counter() - started:.3f}s", flush=True)
+    for name, target in (("10k", 10000), ("100k", 100000)):
         if not any(case.startswith(name + "_") for case in cases):
             continue
+        source = args.prompt_file or (DEFAULT_LONG_PROMPT_FILE if name == "100k" else DEFAULT_PROMPT_FILE)
+        article = source.read_text(encoding="utf-8")
+        if not article.strip():
+            raise ValueError(f"Empty article: {source}")
+        (root / f"{name}_article_source.txt").write_text(article, encoding="utf-8")
+        started = time.perf_counter()
+        print(f"{PREFIX} {name}: tokenizing fixed file {source}; chars={len(article)}", flush=True)
         text, ids = build_prompt(tokenizer, article, target)
         (root / f"{name}_input.txt").write_text(text, encoding="utf-8")
         write_json(root / f"{name}_prompt.json", {"target_tokens": target, "length": len(ids), "token_ids": ids})
-        print(f"{PREFIX} {name}: actual prompt_tokens={len(ids)}; saved text and token IDs", flush=True)
+        print(
+            f"{PREFIX} {name}: input ready in {time.perf_counter() - started:.3f}s; "
+            f"actual prompt_tokens={len(ids)}; saved text and token IDs",
+            flush=True,
+        )
 
 
 def case_environment(args, case):
@@ -195,15 +208,22 @@ def engine_options(args, case_dir, prompt_len):
 
 def capture_request(llm, token_ids, params, case):
     # Capture all compute-prefill chunks, not a fixed number of engine steps.
+    print(f"{PREFIX} {case}: profiler start begin", flush=True)
     llm.start_profile(profile_prefix=case)
+    print(f"{PREFIX} {case}: profiler started; generate begin", flush=True)
     try:
         start = time.perf_counter()
         results = llm.generate({"prompt_token_ids": token_ids}, params, use_tqdm=False)
-        return results, time.perf_counter() - start
+        elapsed = time.perf_counter() - start
+        print(f"{PREFIX} {case}: generate complete in {elapsed:.3f}s (prefill/first token finished)", flush=True)
+        return results, elapsed
     finally:
         error_in_flight = sys.exc_info()[0] is not None
+        stopped = time.perf_counter()
+        print(f"{PREFIX} {case}: profiler stop begin", flush=True)
         try:
             llm.stop_profile()
+            print(f"{PREFIX} {case}: profiler stop complete in {time.perf_counter() - stopped:.3f}s", flush=True)
         except Exception as exc:
             if not error_in_flight:
                 raise
@@ -241,10 +261,13 @@ def run_child(args):
             raise RuntimeError("Unexpected cache hit; this trace is not a fresh prefill")
         print(f"{PREFIX} {args.child}: captured; request_seconds_with_profiler={elapsed:.3f}", flush=True)
     finally:
+        print(f"{PREFIX} {args.child}: model shutdown begin", flush=True)
         llm.llm_engine.engine_core.shutdown()
+        print(f"{PREFIX} {args.child}: model shutdown complete", flush=True)
 
 
 def analyse_case(case_dir):
+    started = time.perf_counter()
     print(f"{PREFIX} exporting {case_dir.name} traces (model has exited)", flush=True)
     subprocess.run(
         [
@@ -261,7 +284,11 @@ def analyse_case(case_dir):
     write_json(case_dir / "traces.json", traces)
     if len(traces) != expected:
         raise RuntimeError(f"Expected {expected} worker trace_view.json files, found {len(traces)} in {case_dir}")
-    print(f"{PREFIX} {case_dir.name}: {len(traces)} MindStudio traces; paths in {case_dir / 'traces.json'}", flush=True)
+    print(
+        f"{PREFIX} {case_dir.name}: export complete in {time.perf_counter() - started:.3f}s; "
+        f"{len(traces)} MindStudio traces; paths in {case_dir / 'traces.json'}",
+        flush=True,
+    )
 
 
 def run_cases(args, root, cases):
@@ -319,7 +346,7 @@ def main(argv=None):
     root.mkdir(parents=True, exist_ok=True)
     if any(root.iterdir()):
         cli.error("--run-dir must be empty (nothing was deleted)")
-    cases = CASES if args.case == "all" else (args.case,)
+    cases = LONG_CASES if args.case == "all" else (args.case,)
     print(f"{PREFIX} results: {root}; full model, TP={len(devices)}, gpu=0.96, eager P only, MTP1", flush=True)
     print(f"{PREFIX} local CPU cache={args.cpu_cache_gb} GiB; no Mooncake/file shim/KV dumps", flush=True)
     prepare_inputs(args, root, cases)
