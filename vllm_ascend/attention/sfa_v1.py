@@ -403,15 +403,32 @@ def _check_indexcache_read(buffer: torch.Tensor, rows: int) -> None:
 
 
 _TOPK_VALUE_PROBE_PUBLISHED: dict[int, int] = {}
+_TOPK_VALUE_PROBE_SKIP_LOGGED = 0
+_TOPK_VALUE_PROBE_SKIP_LIMIT = 16
+_TOPK_VALUE_PROBE_MIN_TOKENS = 256
+
+
+def _probe_seq_len_at(seq_lens_cpu: Any, index: int) -> int | None:
+    try:
+        return int(seq_lens_cpu[index])
+    except (TypeError, ValueError, IndexError, RuntimeError):
+        return None
+
+
+def _probe_seq_len_count(seq_lens_cpu: Any) -> int:
+    try:
+        return len(seq_lens_cpu)
+    except TypeError:
+        return -1
 
 
 def _maybe_probe_indexcache_topk_values(
     buffer: torch.Tensor,
-    num_tokens: int,
-    actual_seq_lengths_query: torch.Tensor,
-    actual_seq_lengths_key: torch.Tensor,
+    attn_metadata: Any,
     layer_name: Any,
+    num_input_tokens: int,
 ) -> None:
+    global _TOPK_VALUE_PROBE_SKIP_LOGGED
     if os.environ.get("VLLM_ASCEND_SFA_TOPK_VALUE_PROBE", "0").lower() not in (
         "1",
         "true",
@@ -419,13 +436,46 @@ def _maybe_probe_indexcache_topk_values(
         "on",
     ):
         return
+    num_actual_tokens = getattr(attn_metadata, "num_actual_tokens", None)
+    seq_lens_cpu = getattr(attn_metadata, "seq_lens_cpu", None)
     try:
-        if int(actual_seq_lengths_query.numel()) != 1:
-            return
-        ctx = int(actual_seq_lengths_key[0].item())
-    except (TypeError, ValueError, RuntimeError):
+        num_tokens = int(num_actual_tokens)
+    except (TypeError, ValueError):
+        num_tokens = -1
+
+    def _skip(reason: str) -> None:
+        global _TOPK_VALUE_PROBE_SKIP_LOGGED
+        if (
+            _TOPK_VALUE_PROBE_SKIP_LOGGED < _TOPK_VALUE_PROBE_SKIP_LIMIT
+            and num_tokens >= _TOPK_VALUE_PROBE_MIN_TOKENS
+        ):
+            _TOPK_VALUE_PROBE_SKIP_LOGGED += 1
+            logger.warning(
+                "[SFA-TOPK-VALUE][SKIP] layer=%s reason=%s "
+                "num_actual_tokens=%s num_input_tokens=%d seq_len_count=%d "
+                "ctx0=%s request_count=%d attn_state=%s",
+                layer_name,
+                reason,
+                num_actual_tokens,
+                num_input_tokens,
+                _probe_seq_len_count(seq_lens_cpu),
+                _probe_seq_len_at(seq_lens_cpu, 0),
+                len(getattr(attn_metadata, "req_ids", ()) or ()),
+                getattr(attn_metadata, "attn_state", None),
+            )
+
+    if num_tokens < 0 or seq_lens_cpu is None:
+        _skip("missing_metadata")
         return
-    if ctx <= 1 or num_tokens != ctx:
+    if _probe_seq_len_count(seq_lens_cpu) != 1:
+        _skip("multi_request_batch")
+        return
+    ctx = _probe_seq_len_at(seq_lens_cpu, 0)
+    if ctx is None or ctx <= 1:
+        _skip("bad_context_length")
+        return
+    if ctx != num_tokens:
+        _skip("not_full_fresh_prefill")
         return
     published = _TOPK_VALUE_PROBE_PUBLISHED.get(ctx, 0)
     if published >= 3:
@@ -462,7 +512,7 @@ def _maybe_probe_indexcache_topk_values(
                 "positions",
                 per_row_out_of_range,
             )
-        if distinct < ctx:
+        if distinct < ctx and ctx <= int(rows.shape[1]):
             logger.warning(
                 "[SFA-TOPK-VALUE][NOT-ALL-SELECTED] last row covers only "
                 "%d/%d context tokens (ctx < index_topk expects a full "
@@ -5158,10 +5208,9 @@ class AscendSFAImpl(MLAAttentionImpl):
                     self._update_indexcache_topk_indices(topk_indices)
                     _maybe_probe_indexcache_topk_values(
                         self.topk_indices_buffer,
-                        hidden_states.shape[0],
-                        actual_seq_lengths_query,
-                        actual_seq_lengths_key,
+                        attn_metadata,
                         self.layer_name,
+                        hidden_states.shape[0],
                     )
             if content_diagnostics_enabled:
                 queue_selected_topk_fingerprint(
