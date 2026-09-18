@@ -151,7 +151,7 @@ def test_child_only_requests_first_token_and_shuts_down(tool, monkeypatch, tmp_p
 
 def test_sequential_cases_release_model_before_analysis_and_next_launch(tool, monkeypatch, tmp_path):
     events = []
-    args = tool.parser().parse_args([])
+    args = tool.parser().parse_args(["--include-off"])
     assert args.case == "all"
     assert tool.CASES == ("10k_off", "10k_on")
 
@@ -167,6 +167,37 @@ def test_sequential_cases_release_model_before_analysis_and_next_launch(tool, mo
     monkeypatch.setattr(tool, "analyse_case", lambda p: events.append((p.name, "analyse")))
     tool.run_cases(args, tmp_path, tool.CASES)
     assert events == [(case, action) for case in tool.CASES for action in ("start", "wait", "finish", "analyse")]
+
+
+@pytest.mark.parametrize(
+    "options, expected",
+    [
+        ([], ("10k_on",)),
+        (["--include-off"], ("10k_off", "10k_on")),
+        (["--case", "all"], ("10k_off", "10k_on")),
+        (["--case", "10k_off"], ("10k_off",)),
+        (["--case", "10k_on"], ("10k_on",)),
+    ],
+)
+def test_main_selects_requested_cases(tool, monkeypatch, tmp_path, options, expected):
+    events = []
+    monkeypatch.setattr(tool, "os", NS(name="posix"))
+    monkeypatch.setattr(tool, "prepare_inputs", lambda args, root, cases: events.append(("prepare", cases)))
+    monkeypatch.setattr(tool, "run_cases", lambda args, root, cases: events.append(("run", cases)))
+    tool.main(["--run-dir", str(tmp_path), *options])
+    assert events == [("prepare", expected), ("run", expected)]
+
+
+def test_analyse_only_still_exports_existing_off_and_on(tool, monkeypatch, tmp_path):
+    for case in tool.CASES:
+        case_dir = tmp_path / case
+        case_dir.mkdir()
+        tool.write_json(case_dir / "engine_options.json", {})
+    analysed = []
+    monkeypatch.setattr(tool, "analyse_case", lambda path: analysed.append(path.name))
+    monkeypatch.setattr(tool, "run_cases", lambda *args: pytest.fail("Analysis must not launch models"))
+    tool.main(["--analyse-only", str(tmp_path)])
+    assert analysed == list(tool.CASES)
 
 
 @pytest.mark.parametrize("option", ["--case", "--child"])

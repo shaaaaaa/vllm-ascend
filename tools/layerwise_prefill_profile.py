@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""Capture full-model TP8 P-node prefill: 10k OFF and 10k ON.
+"""Capture full-model TP8 P-node prefill: 10k ON (add --include-off for OFF/ON).
 
 Local LMCache CPU storage only: no Mooncake, file SDK shim, D node or KV probes.
 Each case uses a fresh model process and profiles one request through its first
@@ -31,7 +31,11 @@ def parser():
     cli.add_argument("--devices", default="0,1,2,3,4,5,6,7")
     cli.add_argument("--prompt-file", type=Path, default=DEFAULT_PROMPT_FILE)
     cli.add_argument("--cpu-cache-gb", type=float, default=16, help="Requires this much free /dev/shm and host RAM")
-    cli.add_argument("--case", choices=("all", *CASES), default="all")
+    selection = cli.add_mutually_exclusive_group()
+    selection.add_argument("--case", choices=("all", *CASES), default="10k_on")
+    selection.add_argument(
+        "--include-off", action="store_const", dest="case", const="all", help="Run 10k OFF then ON instead of ON only"
+    )
     cli.add_argument("--run-dir", type=Path, help="New, empty results directory")
     cli.add_argument(
         "--analyse-only", type=Path, help="Export an existing run's raw profiles without loading the model"

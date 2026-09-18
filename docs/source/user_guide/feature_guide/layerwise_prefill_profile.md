@@ -7,12 +7,17 @@ python -u tools/layerwise_prefill_profile.py 2>&1 | tee log.log
 ```
 
 默认完整 GLM-5.2 权重 `/workspace/models/GLM-5.2-w4a8c8-0723`，TP8、DP1、
-8 张卡、MTP1、`gpu_memory_utilization=0.96`。按顺序跑两次，每次独立加载模型：
+8 张卡、MTP1、`gpu_memory_utilization=0.96`。默认只跑 `10k_on`。
+需要重新抓 OFF 对照时，加 `--include-off`，按 OFF、ON 顺序各跑一次，每次独立加载模型：
+
+```bash
+python -u tools/layerwise_prefill_profile.py --include-off 2>&1 | tee log.log
+```
 
 | 目录 | 输入 | `LAYERWISE_PREFILL_P_NODE` | max-model-len |
 | --- | --- | --- | --- |
 | `10k_off` | 约 10000 tokens | false | 16384 |
-| `10k_on` | 与第一组完全相同的 token IDs | true | 16384 |
+| `10k_on`（默认） | 约 10000 tokens；对比时与 OFF 使用相同 token IDs | true | 16384 |
 
 输入来自 `examples/layerwise_prefill/article_summary.txt`，重复/裁剪文章**正文**，
 再应用完整 chat template；保存实际文本与 token IDs，并打印实际 token 数。
@@ -55,12 +60,12 @@ parity hook 或测试文件 SDK。
 python -u tools/layerwise_prefill_profile.py --analyse-only /path/to/layerwise-profile-xxxx
 ```
 
-如只重跑开启特性的输入，使用 `--case 10k_on`。本地 CPU 单测只验证输入、配置、
+仍可用 `--case 10k_off` 单独跑 OFF，或 `--case all` 跑两组。本地 CPU 单测只验证输入、配置、
 采集生命周期和进程顺序，真实 NPU/MindStudio 结果需要在服务器上确认。
 
 ## 检查传输与通信重叠
 
-当前脚本只跑 10k OFF/ON，不再生成或运行 100k case。
+当前脚本默认只跑 10k ON，`--include-off` 才追加 OFF 对照，不再生成或运行 100k case。
 在 ON 的非首个 prefill chunk，查看同一 worker 的 compute、copy 和 HCCL
 stream：普通 `o_proj` GEMM 之后，`single_layer_paged_kv_copy` 与它的 TP
 all-reduce 应有机会并行；下一层读取对应 bank 前仍必须等 H2D 完成。

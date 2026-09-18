@@ -125,4 +125,4 @@ SFA 图，也不能使用不兼容的 fused matmul-allreduce。可使用普通 P
 并汇总数值差异；这不是上述未迁入的旧 profiling 脚本。
 
 P 节点开关性能定位见 [单机 prefill profile](layerwise_prefill_profile.md)：
-完整模型 10k OFF、10k ON，使用相同文章输入，导出 MindStudio 时间线。
+完整模型默认只跑 10k ON；加 `--include-off` 才跑 10k OFF/ON 对比，使用相同文章输入，导出 MindStudio 时间线。
