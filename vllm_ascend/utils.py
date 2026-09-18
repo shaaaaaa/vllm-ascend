@@ -918,6 +918,16 @@ def register_ascend_customop(vllm_config: VllmConfig | None = None):
         "RelPosAttention": AscendRelPosAttention,
     }
 
+    if vllm_config is not None:
+        hf_config = vllm_config.model_config.hf_text_config
+        model_type = getattr(hf_config, "model_type", None)
+        moe_router_dtype = getattr(hf_config, "moe_router_dtype", None)
+        use_fp32_router = model_type == "glm_moe_dsa" or moe_router_dtype == "float32"
+        if use_fp32_router:
+            from vllm_ascend.ops.fused_moe.gate_linear import AscendGateLinear
+
+            REGISTERED_ASCEND_OPS["GateLinear"] = AscendGateLinear
+
     # 310P: override selected ops with 310P implementations (keep minimal changes outside _310p)
     if is_310p():
         from vllm_ascend._310p.fused_moe.fused_moe import AscendFusedMoE310, AscendSharedFusedMoE310
