@@ -31,7 +31,7 @@ from vllm.logger import logger
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.interface import PauseState
-from vllm.v1.core.sched.output import NewRequestData, SchedulerOutput
+from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.request_queue import (
     SchedulingPolicy,
     create_request_queue,
@@ -772,30 +772,18 @@ class RecomputeScheduler(Scheduler):
             scheduled_new_reqs = scheduled_new_reqs + scheduled_resumed_reqs
             scheduled_resumed_reqs = []
             new_reqs_data = [
-                NewRequestData.from_request(
+                self._make_new_request_data(
                     req,
-                    req_to_new_blocks[req.request_id].get_block_ids(),
+                    req_to_new_blocks[req.request_id],
                     req._all_token_ids,
-                    block_ids_by_bank=req_to_new_blocks[
-                        req.request_id
-                    ].get_block_ids_by_bank(),
-                    block_allocation_mode=req_to_new_blocks[
-                        req.request_id
-                    ].get_allocation_mode(),
                 )
                 for req in scheduled_new_reqs
             ]
         else:
             new_reqs_data = [
-                NewRequestData.from_request(
+                self._make_new_request_data(
                     req,
-                    req_to_new_blocks[req.request_id].get_block_ids(),
-                    block_ids_by_bank=req_to_new_blocks[
-                        req.request_id
-                    ].get_block_ids_by_bank(),
-                    block_allocation_mode=req_to_new_blocks[
-                        req.request_id
-                    ].get_allocation_mode(),
+                    req_to_new_blocks[req.request_id],
                 )
                 for req in scheduled_new_reqs
             ]
