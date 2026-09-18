@@ -402,6 +402,78 @@ def _check_indexcache_read(buffer: torch.Tensor, rows: int) -> None:
         )
 
 
+_TOPK_VALUE_PROBE_PUBLISHED: dict[int, int] = {}
+
+
+def _maybe_probe_indexcache_topk_values(
+    buffer: torch.Tensor,
+    num_tokens: int,
+    actual_seq_lengths_query: torch.Tensor,
+    actual_seq_lengths_key: torch.Tensor,
+    layer_name: Any,
+) -> None:
+    if os.environ.get("VLLM_ASCEND_SFA_TOPK_VALUE_PROBE", "0").lower() not in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    ):
+        return
+    try:
+        if int(actual_seq_lengths_query.numel()) != 1:
+            return
+        ctx = int(actual_seq_lengths_key[0].item())
+    except (TypeError, ValueError, RuntimeError):
+        return
+    if ctx <= 1 or num_tokens != ctx:
+        return
+    published = _TOPK_VALUE_PROBE_PUBLISHED.get(ctx, 0)
+    if published >= 3:
+        return
+    _TOPK_VALUE_PROBE_PUBLISHED[ctx] = published + 1
+    try:
+        rows = buffer[:num_tokens].detach()
+        row_bounds = torch.arange(
+            1, num_tokens + 1, dtype=rows.dtype, device=rows.device
+        ).unsqueeze(1)
+        per_row_out_of_range = int((rows >= row_bounds).sum().item())
+        negative_count = int((rows < 0).sum().item())
+        last_row = rows[num_tokens - 1].to(torch.int64).cpu()
+        in_range = last_row[(last_row >= 0) & (last_row < ctx)]
+        distinct = int(torch.unique(in_range).numel())
+        boundary = last_row[max(0, ctx - 3) : ctx + 5].tolist()
+        logger.warning(
+            "[SFA-TOPK-VALUE] layer=%s num_tokens=%d ctx=%d width=%d "
+            "per_row_out_of_range=%d negative=%d last_row_distinct=%d "
+            "last_row_boundary=%s",
+            layer_name,
+            num_tokens,
+            ctx,
+            int(rows.shape[1]),
+            per_row_out_of_range,
+            negative_count,
+            distinct,
+            boundary,
+        )
+        if per_row_out_of_range:
+            logger.warning(
+                "[SFA-TOPK-VALUE][BAD-INDICES] %d entries point at or past "
+                "their own row position; sparse attention consumes invalid "
+                "positions",
+                per_row_out_of_range,
+            )
+        if distinct < ctx:
+            logger.warning(
+                "[SFA-TOPK-VALUE][NOT-ALL-SELECTED] last row covers only "
+                "%d/%d context tokens (ctx < index_topk expects a full "
+                "all-selected row)",
+                distinct,
+                ctx,
+            )
+    except Exception as exc:  # pragma: no cover - diagnostic only
+        logger.warning("[SFA-TOPK-VALUE] probe failed: %r", exc)
+
+
 @lru_cache(maxsize=1)
 def _decode_window_save_window_size() -> int:
     value = os.environ.get("LMCACHE_DECODE_WINDOW_SAVE_WINDOW_SIZE", "0")
@@ -5084,6 +5156,13 @@ class AscendSFAImpl(MLAAttentionImpl):
                     # Publish this batch's top-k so downstream skip layers
                     # read it from the stable shared buffer.
                     self._update_indexcache_topk_indices(topk_indices)
+                    _maybe_probe_indexcache_topk_values(
+                        self.topk_indices_buffer,
+                        hidden_states.shape[0],
+                        actual_seq_lengths_query,
+                        actual_seq_lengths_key,
+                        self.layer_name,
+                    )
             if content_diagnostics_enabled:
                 queue_selected_topk_fingerprint(
                     req_ids=attn_metadata.req_ids,
