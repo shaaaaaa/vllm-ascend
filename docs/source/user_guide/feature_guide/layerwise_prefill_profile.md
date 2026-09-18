@@ -7,21 +7,20 @@ python -u tools/layerwise_prefill_profile.py 2>&1 | tee log.log
 ```
 
 默认完整 GLM-5.2 权重 `/workspace/models/GLM-5.2-w4a8c8-0723`，TP8、DP1、
-8 张卡、MTP1、`gpu_memory_utilization=0.96`。按顺序跑三次，每次独立加载模型：
+8 张卡、MTP1、`gpu_memory_utilization=0.96`。按顺序跑两次，每次独立加载模型：
 
 | 目录 | 输入 | `LAYERWISE_PREFILL_P_NODE` | max-model-len |
 | --- | --- | --- | --- |
 | `10k_off` | 约 10000 tokens | false | 16384 |
 | `10k_on` | 与第一组完全相同的 token IDs | true | 16384 |
-| `100k_on` | 约 100000 tokens | true | 按输入向上对齐 1024，留出首 token 空间 |
 
 输入来自 `examples/layerwise_prefill/article_summary.txt`，重复/裁剪文章**正文**，
 再应用完整 chat template；保存实际文本与 token IDs，并打印实际 token 数。
 不会为了凑整数裁掉 chat 结束标记。长输入是重复文章构造的性能负载，不是新的精度测试。
 
-三组都使用 eager、4096-token chunked prefill、1024-token LMCache chunk，
+两组都使用 eager、4096-token chunked prefill、1024-token LMCache chunk，
 保留普通 MTP1 路径，但只生成首个 token，不进行后续 decode，也不跑 D 节点。
-短输入的 OFF/ON 环境只改变该特性开关；不使用八层裁剪、dummy 权重、KV dump、
+OFF/ON 环境只改变该特性开关；不使用八层裁剪、dummy 权重、KV dump、
 parity hook 或测试文件 SDK。
 
 ## 范围与资源
@@ -32,8 +31,8 @@ parity hook 或测试文件 SDK。
 `store_async=false`，逐层本地传输仍走原实现的 stream/event。
 
 默认共享 CPU cache 为 16 GiB，需要足够的主机内存和 `/dev/shm` 可用容量。
-可用 `--cpu-cache-gb` 修改；脚本不清空其他进程的共享内存。长输入不表示关闭特性时
-也能驻留这么长的 KV，因此不运行 100k OFF。实际 NPU 容量仍由启动时分配结果确认。
+可用 `--cpu-cache-gb` 修改；脚本不清空其他进程的共享内存。
+实际 NPU 容量仍由启动时分配结果确认。
 
 模型初始化、初始化阶段的预热与 profiler 导出不在采集范围内；
 采集覆盖一次真实请求的全部 prefill chunks、首 token 采样以及实际执行的 MTP。
@@ -49,12 +48,22 @@ parity hook 或测试文件 SDK。
 - `profile/`：8 个 worker 的原始 profiling 数据及导出的 `ASCEND_PROFILER_OUTPUT`。
 - `traces.json`：8 个 `trace_view.json` 的完整路径，可在 MindStudio 时间线中打开。
 
-脚本在每组模型退出后自动解析 profile。100k 全层、全 chunk、8 卡 trace 可能很大，
-导出期间会打印进度阶段，不会重新运行模型。若仅解析失败，可重新解析已有目录：
+脚本在每组模型退出后自动解析 profile，导出期间会打印进度阶段，不会重新运行模型。
+若仅解析失败，可重新解析已有目录：
 
 ```bash
 python -u tools/layerwise_prefill_profile.py --analyse-only /path/to/layerwise-profile-xxxx
 ```
 
-如只重跑长输入，使用 `--case 100k_on`。本地 CPU 单测只验证输入、配置、
+如只重跑开启特性的输入，使用 `--case 10k_on`。本地 CPU 单测只验证输入、配置、
 采集生命周期和进程顺序，真实 NPU/MindStudio 结果需要在服务器上确认。
+
+## 检查传输与通信重叠
+
+当前脚本只跑 10k OFF/ON，不再生成或运行 100k case。
+在 ON 的非首个 prefill chunk，查看同一 worker 的 compute、copy 和 HCCL
+stream：普通 `o_proj` GEMM 之后，`single_layer_paged_kv_copy` 与它的 TP
+all-reduce 应有机会并行；下一层读取对应 bank 前仍必须等 H2D 完成。
+不要把 CPU 侧 `AscendCL@hcom_allReduce` API 区间直接当作设备通信执行区间。
+比较实际设备时间线及整个 chunk 耗时；这里调整的是提交依赖，硬件资源竞争仍可能
+限制实际重叠。第一段没有历史 H2D，最后的发布/源释放等待也仍可能留下空隙。

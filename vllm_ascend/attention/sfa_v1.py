@@ -108,6 +108,7 @@ from vllm_ascend.ops.layer_shard_linear import (
     reach_layer_for_shard_weight_series,
     register_all_layers_to_shard_weight_series,
 )
+from vllm_ascend.ops.linear_op import row_parallel_with_prefill_transfer
 from vllm_ascend.ops.rotary_embedding import get_cos_and_sin_mla
 from vllm_ascend.ops.triton.rope import rope_forward_triton_siso
 from vllm_ascend.quantization.methods import AscendW8A8LinearMethod
@@ -3229,7 +3230,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         self,
         save_operations: list[tuple[str, list[torch.Tensor]]],
     ) -> list[str]:
-        """Submit layerwise transfers after SFA and before output projection."""
+        """Submit bank transfers before output-projection communication."""
         layer_names = [layer_name for layer_name, _ in save_operations]
         if len(layer_names) != len(set(layer_names)):
             raise RuntimeError(
@@ -3238,8 +3239,8 @@ class AscendSFAImpl(MLAAttentionImpl):
             )
 
         # The transfer streams wait for the current compute stream. Submitting
-        # here releases save(N) and load(N+1) when SFA finishes, then v_up and
-        # the opaque output projection can be enqueued without an inner hook.
+        # here releases save(N) and load(N+1) after o_proj GEMM, without waiting
+        # for its all-reduce. Fused/custom projections use the earlier boundary.
         self._submit_sfa_transfer_window_save_operations(save_operations)
         for layer_name in layer_names:
             if not maybe_submit_layerwise_prefill_load(layer_name):
@@ -3248,6 +3249,25 @@ class AscendSFAImpl(MLAAttentionImpl):
                     "layerwise-prefill transfer window after SFA"
                 )
         return layer_names
+
+    def _project_with_layerwise_prefill_transfer(
+        self,
+        attn_output: torch.Tensor,
+        save_operations: list[tuple[str, list[torch.Tensor]]],
+    ) -> torch.Tensor:
+        """Keep the transfer callback inside the P-only projection path."""
+        layer_names: list[str] = []
+
+        def submit_transfer() -> None:
+            layer_names.extend(
+                self._submit_sfa_layerwise_transfer_window(save_operations)
+            )
+
+        projected = row_parallel_with_prefill_transfer(
+            self.o_proj, attn_output, submit_transfer
+        )[0]
+        self._finish_sfa_layerwise_transfer_window(save_operations, layer_names)
+        return projected
 
     def _finish_sfa_layerwise_transfer_window(
         self,
@@ -5982,12 +6002,6 @@ class AscendSFAImpl(MLAAttentionImpl):
                 "the SFA context-parallel o_proj path"
             )
 
-        transfer_window_layer_names: list[str] = []
-        if use_layerwise_transfer_window:
-            transfer_window_layer_names = (
-                self._submit_sfa_layerwise_transfer_window(save_operations)
-            )
-
         attn_output = self._v_up_proj(attn_output)
         weight_prefetch_method = get_weight_prefetch_method()
         weight_prefetch_method.maybe_prefetch_mla_or_sla_weight_in_current_stream(
@@ -6022,14 +6036,13 @@ class AscendSFAImpl(MLAAttentionImpl):
             attn_output = torch.empty_like(send)
             torch.distributed.all_to_all_single(attn_output, send, group=get_tp_group().device_group)
 
-        output[...] = self.o_proj(attn_output)[0]
         if use_layerwise_transfer_window:
-            self._finish_sfa_layerwise_transfer_window(
-                save_operations,
-                transfer_window_layer_names,
+            output[...] = self._project_with_layerwise_prefill_transfer(
+                attn_output, save_operations
             )
         else:
             # Keep legacy/non-P connector ordering unchanged.
+            output[...] = self.o_proj(attn_output)[0]
             self._submit_sfa_save_operations(save_operations)
 
         _dsa_prof.end(_sfa_t)

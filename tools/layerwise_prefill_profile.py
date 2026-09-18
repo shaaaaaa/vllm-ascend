@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""Capture full-model TP8 P-node prefill: 10k OFF, 10k ON, 100k ON.
+"""Capture full-model TP8 P-node prefill: 10k OFF and 10k ON.
 
 Local LMCache CPU storage only: no Mooncake, file SDK shim, D node or KV probes.
 Each case uses a fresh model process and profiles one request through its first
@@ -19,7 +19,7 @@ from pathlib import Path
 from layerwise_prefill_check import DEFAULT_PROMPT_FILE, normalize_prompt_token_ids, write_json
 from layerwise_prefill_mooncake_check import finish_child, start_logged_process
 
-CASES = ("10k_off", "10k_on", "100k_on")
+CASES = ("10k_off", "10k_on")
 CACHE_CHUNK_TOKENS = 1024
 SHORT_MAX_MODEL_LEN = 16384
 PREFIX = "[PREFILL_PROFILE]"
@@ -91,7 +91,7 @@ def prepare_inputs(args, root, cases):
     if not article.strip():
         raise ValueError(f"Empty article: {args.prompt_file}")
     (root / "article_source.txt").write_text(article, encoding="utf-8")
-    for name, target in (("10k", 10000), ("100k", 100000)):
+    for name, target in (("10k", 10000),):
         if not any(case.startswith(name + "_") for case in cases):
             continue
         text, ids = build_prompt(tokenizer, article, target)
@@ -143,7 +143,7 @@ def case_environment(args, case):
 
 
 def engine_options(args, case_dir, prompt_len):
-    # Do not make the 10k OFF baseline reserve dense 100k KV capacity.
+    # Reserve the same KV capacity for the OFF/ON pair.
     max_len = max(SHORT_MAX_MODEL_LEN, (prompt_len // CACHE_CHUNK_TOKENS + 1) * CACHE_CHUNK_TOKENS)
     return {
         "model": args.model,

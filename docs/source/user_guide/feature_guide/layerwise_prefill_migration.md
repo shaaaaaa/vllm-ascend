@@ -61,6 +61,29 @@ target forward 结束后保留 connector 元数据，MTP forward 完成后才结
 deferred layerwise prefill；正常 decode 不跨 forward 复用本次新增的映射缓存。
 这减少了可确认的重复工作，不代表已经测得生产端的性能提升。
 
+### all-reduce 重叠窗口（2026-09-18）
+
+仅修改 P-node 的 deferred layerwise 路径，普通 decode 和非 P 路径保持原顺序。
+
+- 历史 KV 对象查找、TP 句柄广播、被动 rank 的 view 创建在每个 prefill
+  chunk 的 forward 前完成。复用原注册地址，将指针表按 KV group 一次上传；
+  不增加 KV 数据副本。页布局继续使用 compact batch，普通布局的广播次数不变。
+- 普通 `o_proj` 的提交顺序改为 `v_up -> o_proj GEMM -> KV copy -> TP all-reduce`。
+  copy stream 与通信依赖同一个 GEMM 完成点；compute stream 不在两者之间等待 copy。
+  特殊/fused projection 保留原实现，copy 在该实现之前提交，不声称拆开融合通信。
+- 删除 bank 轮转时的 CPU `event.synchronize()`；保留 load stream 等旧 D2H、
+  下一层 compute 等 H2D 的设备事件。CPU 目标对象保持存活，chunk-end drain
+  等该 group 最后一次 store event 后才发布完成，异常退出仍等待已提交传输。
+
+剩余开销：每层一个 Python 提交回调、原有 bank stream/event 依赖；每 chunk
+每组一次指针表 H2D、末尾一次 D2H 完成等待。没有新增逐层 TP collective、日志、
+KV 内容校验或后台轮询。普通非 page 的存储发布也延后到 chunk-end，因此不能据此
+宣称其逐层远端 put 重叠更快；生产 page 模式本来就在完整页完成后发布。
+历史 H2D 源释放的最终等待、持久化及 RemoteFill 的交付等待未删除。
+
+CPU 回归验证提交顺序、两组不同层数、尾块和退出生命周期；实际 kernel/HCCL
+能重叠多少仍需 10k OFF/ON profile 确认，不能保证消除全部 Free 段。
+
 保留源功能的限制：PP/PCP/DCP 均为 1；不能启用跳过逐层回调的 FULL/staged
 SFA 图，也不能使用不兼容的 fused matmul-allreduce。可使用普通 PIECEWISE
 边界。关闭 P-node 开关时仍走原有驻留和传输路径。
@@ -102,4 +125,4 @@ SFA 图，也不能使用不兼容的 fused matmul-allreduce。可使用普通 P
 并汇总数值差异；这不是上述未迁入的旧 profiling 脚本。
 
 P 节点开关性能定位见 [单机 prefill profile](layerwise_prefill_profile.md)：
-完整模型 10k OFF、10k ON、100k ON，使用相同文章输入，导出 MindStudio 时间线。
+完整模型 10k OFF、10k ON，使用相同文章输入，导出 MindStudio 时间线。

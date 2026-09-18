@@ -40,6 +40,7 @@ Row parallel op follows a similar approach - inherit from RowColumnParallelOp an
 get_row_parallel_op.
 """
 
+from collections.abc import Callable
 from functools import lru_cache
 from types import SimpleNamespace
 
@@ -81,6 +82,37 @@ from vllm_ascend.utils import (
     oproj_tp_enable,
     shared_expert_dp_enabled,
 )
+
+
+def row_parallel_with_prefill_transfer(
+    layer: nn.Module, input_: torch.Tensor, submit_transfer: Callable[[], None]
+) -> torch.Tensor | tuple[torch.Tensor, Parameter | None]:
+    """Submit bank copies after a plain o_proj GEMM, before its TP collective.
+
+    Used only by the layerwise-prefill transfer window. Fused/custom linear
+    implementations retain their own computation and communication; we cannot
+    insert into a fused GEMM+collective, so submit before that implementation.
+    Normal (non-P) forward never calls this function.
+    """
+    if getattr(layer, "custom_op", None) is not None:
+        submit_transfer()
+        return layer(input_)
+
+    if layer.input_is_parallel:
+        input_parallel = input_
+    else:
+        split_input = split_tensor_along_last_dim(input_, num_partitions=layer.tp_size)
+        input_parallel = split_input[layer.tp_rank].contiguous()
+    bias = None if (layer.tp_rank > 0 or layer.skip_bias_add) else layer.bias
+    output = layer.quant_method.apply(layer, input_parallel, bias)
+    # Both copy streams take their dependency on the current compute stream
+    # here, before all_reduce adds its completion dependency to that stream.
+    submit_transfer()
+    if layer.reduce_results and layer.tp_size > 1:
+        output = tensor_model_parallel_all_reduce(output)
+    if not layer.return_bias:
+        return output
+    return output, layer.bias if layer.skip_bias_add else None
 
 
 class CustomLinearOp:

@@ -24,7 +24,7 @@ class Tokenizer:
         return {"input_ids": [ids], "attention_mask": [[1] * len(ids)]}
 
 
-@pytest.mark.parametrize("length", [10000, 100000])
+@pytest.mark.parametrize("length", [8192, 10000])
 def test_prompt_repeats_article_and_preserves_chat_markers(tool, length):
     text, ids = tool.build_prompt(Tokenizer(), "Example article.\n" * 320, length)
     assert len(ids) == length
@@ -45,8 +45,8 @@ def test_short_pair_shares_one_saved_input(tool, monkeypatch, tmp_path):
     args = tool.parser().parse_args(["--prompt-file", str(source)])
     monkeypatch.setitem(sys.modules, "transformers", NS(AutoTokenizer=NS(from_pretrained=lambda *a, **kw: Tokenizer())))
     tool.prepare_inputs(args, tmp_path, tool.CASES)
-    assert sorted(p.name for p in tmp_path.glob("*_prompt.json")) == ["100k_prompt.json", "10k_prompt.json"]
-    for name, count in (("10k", 10000), ("100k", 100000)):
+    assert sorted(p.name for p in tmp_path.glob("*_prompt.json")) == ["10k_prompt.json"]
+    for name, count in (("10k", 10000),):
         prompt = json.loads((tmp_path / f"{name}_prompt.json").read_text())
         assert prompt["length"] == len(prompt["token_ids"]) == count
         text = (tmp_path / f"{name}_input.txt").read_text(encoding="utf-8")
@@ -62,14 +62,13 @@ def test_off_on_environment_diff_is_only_feature_switch(tool, monkeypatch):
     assert {k for k in off if off[k] != on[k]} == {"VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE"}
     assert off["VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE"] == "false"
     assert on["VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE"] == "true"
-    assert on == tool.case_environment(args, "100k_on")
     assert "LMCACHE_CONFIG_FILE" not in on and "LMCACHE_REMOTE_URL" not in on
     assert "VLLM_PREFILL_CHECK_TRACE_DIR" not in on
     assert json.loads(on["LMCACHE_EXTRA_CONFIG"]) == {"save_only_first_rank": True}
     assert on["MSMONITOR_USE_DAEMON"] == "0"
 
 
-@pytest.mark.parametrize("prompt_len, expected_max", [(10000, 16384), (100000, 100352)])
+@pytest.mark.parametrize("prompt_len, expected_max", [(9999, 16384), (10000, 16384)])
 def test_full_model_mtp_and_profile_options(tool, tmp_path, prompt_len, expected_max):
     args = tool.parser().parse_args([])
     options = tool.engine_options(args, tmp_path, prompt_len)
@@ -153,6 +152,8 @@ def test_child_only_requests_first_token_and_shuts_down(tool, monkeypatch, tmp_p
 def test_sequential_cases_release_model_before_analysis_and_next_launch(tool, monkeypatch, tmp_path):
     events = []
     args = tool.parser().parse_args([])
+    assert args.case == "all"
+    assert tool.CASES == ("10k_off", "10k_on")
 
     def launch(command, env, log, label, **kwargs):
         events.append((label, "start"))
@@ -166,6 +167,13 @@ def test_sequential_cases_release_model_before_analysis_and_next_launch(tool, mo
     monkeypatch.setattr(tool, "analyse_case", lambda p: events.append((p.name, "analyse")))
     tool.run_cases(args, tmp_path, tool.CASES)
     assert events == [(case, action) for case in tool.CASES for action in ("start", "wait", "finish", "analyse")]
+
+
+@pytest.mark.parametrize("option", ["--case", "--child"])
+def test_removed_long_case_cannot_be_launched(tool, option):
+    with pytest.raises(SystemExit) as error:
+        tool.parser().parse_args([option, "100k_on"])
+    assert error.value.code == 2
 
 
 def test_failed_case_is_cleaned_and_no_following_case_launches(tool, monkeypatch, tmp_path):
