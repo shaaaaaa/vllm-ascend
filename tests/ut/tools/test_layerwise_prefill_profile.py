@@ -215,6 +215,24 @@ def test_child_only_requests_first_token_and_shuts_down(tool, monkeypatch, tmp_p
     tool.write_json(tmp_path / f"{case.split('_')[0]}_prompt.json", {"length": length, "token_ids": [9] * length})
     events = []
 
+    def collective_rpc(method, args=()):
+        if method is tool.install_chunk_profile:
+            assert args[0] == case
+            events.append("arm")
+            return [None]
+        assert method is tool.finish_chunk_profile
+        events.append("finish_capture")
+        plan = tool.make_capture_plan(length, tool.COMPUTE_CHUNK_TOKENS)
+        return [
+            {
+                "rank": 0,
+                "windows": [w["name"] for w in plan["windows"]],
+                "chunks": [
+                    {"token_start": start, "token_end": min(start + 4096, length)} for start in range(0, length, 4096)
+                ],
+            }
+        ]
+
     def generate(prompt, params, **kwargs):
         events.append("generate")
         assert len(prompt["prompt_token_ids"]) == length
@@ -225,6 +243,7 @@ def test_child_only_requests_first_token_and_shuts_down(tool, monkeypatch, tmp_p
         events.append("load")
         assert options["max_model_len"] == max_len
         return NS(
+            collective_rpc=collective_rpc,
             start_profile=lambda **kw: events.append("start"),
             stop_profile=lambda: events.append("stop"),
             generate=generate,
@@ -233,7 +252,14 @@ def test_child_only_requests_first_token_and_shuts_down(tool, monkeypatch, tmp_p
 
     monkeypatch.setitem(sys.modules, "vllm", NS(LLM=llm, SamplingParams=NS))
     tool.run_child(args)
-    assert events == ["load", "start", "generate", "stop", "shutdown"]
+    assert events == (
+        ["load", "arm", "generate", "finish_capture", "shutdown"]
+        if case in tool.LONG_CASES
+        else ["load", "start", "generate", "stop", "shutdown"]
+    )
+    if case in tool.LONG_CASES:
+        report = json.loads((case_dir / "capture_windows.json").read_text())
+        assert report["workers"][0]["windows"] == ["head", "tail"]
     assert json.loads((case_dir / "result.json").read_text())["token_ids"] == [42]
 
 
@@ -341,3 +367,43 @@ def test_missing_trace_is_not_reported_as_success(tool, monkeypatch, tmp_path):
     monkeypatch.setattr(tool.subprocess, "run", lambda *a, **kw: None)
     with pytest.raises(RuntimeError, match="found 0"):
         tool.analyse_case(tmp_path)
+
+
+@pytest.mark.parametrize("missing_tail", [False, True])
+def test_segmented_trace_export_requires_each_window(tool, monkeypatch, tmp_path, missing_tail):
+    case_dir = tmp_path / "100k_on"
+    case_dir.mkdir()
+    tool.write_json(case_dir / "engine_options.json", {"tensor_parallel_size": 8})
+    tool.write_json(case_dir / "capture_plan.json", tool.make_capture_plan(100000, 4096))
+    for window in ("head", "extra_head" if missing_tail else "tail"):
+        for rank in range(8):
+            path = case_dir / "profile" / f"100k_on_{window}_rank{rank}" / "ASCEND_PROFILER_OUTPUT"
+            path.mkdir(parents=True)
+            (path / "trace_view.json").write_text("{}")
+    monkeypatch.setattr(tool.subprocess, "run", lambda *a, **kw: None)
+    if missing_tail:
+        with pytest.raises(RuntimeError, match="tail traces"):
+            tool.analyse_case(case_dir)
+    else:
+        tool.analyse_case(case_dir)
+        assert len(json.loads((case_dir / "traces.json").read_text())) == 16
+
+
+@pytest.mark.parametrize("stop_fails", [False, True])
+def test_segmented_generate_failure_attempts_cleanup_without_masking_error(tool, tmp_path, stop_fails):
+    events = []
+
+    def rpc(method, args=()):
+        events.append(method.__name__)
+        if method is tool.finish_chunk_profile:
+            if stop_fails:
+                raise RuntimeError("stop also failed")
+            return []
+
+    def generate(*args, **kwargs):
+        raise ValueError("model failed")
+
+    llm = NS(collective_rpc=rpc, generate=generate)
+    with pytest.raises(ValueError, match="model failed"):
+        tool.capture_request(llm, [1] * 100000, "params", "100k_on", tmp_path)
+    assert events == ["install_chunk_profile", "finish_chunk_profile"]

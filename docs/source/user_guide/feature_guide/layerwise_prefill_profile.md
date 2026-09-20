@@ -7,7 +7,9 @@ python -u tools/layerwise_prefill_profile.py 2>&1 | tee log.log
 ```
 
 默认完整 GLM-5.2 权重 `/workspace/models/GLM-5.2-w4a8c8-0723`，TP8、DP1、
-8 张卡、MTP1、`gpu_memory_utilization=0.96`。默认只跑 `100k_on`。
+8 张卡、MTP1、`gpu_memory_utilization=0.96`。默认只跑 `100k_on`，
+只采集前 3 个和最后 3 个 **compute-prefill chunk**（每个最多 4096 tokens，
+不是 1024-token LMCache 存储块）。中间 chunk 正常计算、保存/回载 KV，但不开 profiler。
 需要重新抓同长度 OFF 对照时，加 `--include-off`，按 100k OFF、ON 顺序各跑一次，每次独立加载模型：
 
 ```bash
@@ -48,8 +50,19 @@ parity hook 或测试文件 SDK。
 实际 NPU 容量仍由启动时分配结果确认。100k OFF 不使用逐层复用，完整模型可能因
 HBM 容量不足无法启动；默认不运行它，也不会偷偷改成八层或短输入。
 
-模型初始化、初始化阶段的预热与 profiler 导出不在采集范围内；
-采集覆盖一次真实请求的全部 prefill chunks、首 token 采样以及实际执行的 MTP。
+模型初始化、初始化阶段的预热与 profiler 导出不在采集范围内。
+100k 的 OFF/ON 都仅抓首尾各 3 个 prefill chunk；10k 仍采集完整请求。
+例如输入恰好 100000 tokens 时，共 25 个 chunk：`head` 抓第 1–3 个，
+token 范围 `[0, 12288)`；`tail` 抓第 23–25 个，范围 `[90112, 100000)`，
+包含最后的不足整块部分、首 token 采样以及这一段实际执行的 MTP。
+实际窗口按保存的 prompt token 数计算，不能把约 100k 的输入一律当作 25 个 chunk。
+
+工具在模型加载后通过 worker RPC 安装采集包装，不改正常服务代码，不改变调度或 KV 传输。
+每段开始/结束各同步一次 NPU（两段共 4 次），避免未完成的中间工作进入尾段 trace；
+不在每层、每个 chunk 或短 kernel 之间额外同步。窗口边界有 profiler 启停及同步开销，
+不要用边界空白衡量正常流水线，也不要把分段 profile 当成连续整段计时。
+记录所有实际 chunk 的 token 范围，结束后核对固定 4096-token 调度是否与计划一致；
+若不一致，保存报告并报错，不把不准确的窗口当作成功。
 不额外发送 warmup 请求，避免复用上次请求的 KV；真实首请求的一次性成本会出现在 trace。
 `result.json` 中的时间包含 profiler 开销，不能当作无 profiler 的性能结论。
 
@@ -60,7 +73,11 @@ HBM 容量不足无法启动；默认不运行它，也不会偷偷改成八层�
 - `server.log`：完整启动和请求日志，同时输出到终端/`log.log`。
 - `engine_options.json`、`environment.json`、`result.json`：参数、首 token 和请求统计。
 - `profile/`：8 个 worker 的原始 profiling 数据及导出的 `ASCEND_PROFILER_OUTPUT`。
-- `traces.json`：8 个 `trace_view.json` 的完整路径，可在 MindStudio 时间线中打开。
+  100k 每张卡各有 `100k_on_head_...` / `100k_on_tail_...` 两份（OFF 同理）。
+- `traces.json`：100k 共 16 个 `trace_view.json` 的完整路径，10k 仍为 8 个。
+  可在 MindStudio 时间线中分别打开首段和尾段。
+- `capture_plan.json` / `capture_windows.json`：100k 的计划窗口、各 rank 实际执行的
+  chunk 编号、token 起止范围（左闭右开）以及是否被采集。中间 chunk 的 `window` 为 `null`。
 
 根目录还有 `100k_article_source.txt`、`100k_input.txt`、`100k_prompt.json`，
 分别是固定原文副本、实际送入 chat template 的文本、实际 token IDs 和长度。
@@ -87,13 +104,15 @@ python -u tools/layerwise_prefill_profile.py --analyse-only /path/to/layerwise-p
 | `loading tokenizer` / `tokenizing fixed file` | tokenizer 加载 / 固定文本编码 |
 | `loading full model` | 模型初始化，还未采集 |
 | `profiler start begin` | 启动 profiler |
-| `generate begin` | prefill、KV 回载/保存、MTP、首 token |
+| `generate begin` | prefill、KV 回载/保存、MTP、首 token；100k 中间 chunk 不采集 |
+| `.../head` / `.../tail` 的 `profiler start` / `stop begin` | worker 的首段/尾段采集切换 |
 | `generate complete` 后的 `profiler stop begin` | 推理已完成，正在停止采集/落盘 |
 | `model shutdown begin` | 模型进程清理 |
 | `exporting ... traces (model has exited)` | NPU 模型已退出，正在离线解析 profile |
 
 输入生成在模型启动前完成；如果日志已经出现 `generate begin`，就不是文本生成循环卡住。
-100k 覆盖约 25 个 4096-token prefill chunks，trace 明显大于短输入；导出慢不等于 NPU 死锁。
+100k 仍计算约 25 个 4096-token prefill chunks，但仅采集首尾共 6 个；
+因此减少采集数据量与解析工作，不会省略中间的模型计算。导出慢不等于 NPU 死锁。
 具体根因仍需结合停住阶段和 worker 日志确认，不能仅凭输入长度判定。
 
 ## 检查传输与通信重叠

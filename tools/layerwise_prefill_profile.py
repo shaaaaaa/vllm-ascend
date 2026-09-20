@@ -3,8 +3,9 @@
 """Capture full-model TP8 P-node prefill: 100k ON (add --include-off for OFF/ON).
 
 Local LMCache CPU storage only: no Mooncake, file SDK shim, D node or KV probes.
-Each case uses a fresh model process and profiles one request through its first
-output token. Model startup is outside capture; real-request cold costs remain.
+Each case uses a fresh model process and executes one request through its first
+output token. 100k captures only the first/last three compute-prefill chunks;
+10k captures the whole request. Model startup is outside capture.
 Short-kernel low-priority H2D is enabled by default in this tool only; set
 LMCACHE_ASCEND_PREFILL_SPLIT_LOAD=0 to profile the original load path.
 """
@@ -20,6 +21,12 @@ from pathlib import Path
 
 from layerwise_prefill_check import DEFAULT_PROMPT_FILE, normalize_prompt_token_ids, write_json
 from layerwise_prefill_mooncake_check import finish_child, start_logged_process
+from layerwise_prefill_profile_worker import (
+    finish_chunk_profile,
+    install_chunk_profile,
+    make_capture_plan,
+    validate_capture,
+)
 
 from vllm_ascend import envs
 
@@ -29,6 +36,7 @@ DEFAULT_LONG_PROMPT_FILE = DEFAULT_PROMPT_FILE.with_name("article_summary_100k.t
 MAX_PROMPT_FIT_ATTEMPTS = 3
 MIN_PROMPT_FRACTION = 0.95
 CACHE_CHUNK_TOKENS = 1024
+COMPUTE_CHUNK_TOKENS = 4096
 SHORT_MAX_MODEL_LEN = 16384
 PREFIX = "[PREFILL_PROFILE]"
 
@@ -132,6 +140,7 @@ def case_environment(args, case):
             "HCCL_BUFFSIZE": "200",
             "MSMONITOR_USE_DAEMON": "0",
             "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
+            "PYTHONPATH": str(Path(__file__).resolve().parent) + os.pathsep + env.get("PYTHONPATH", ""),
             "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
             "VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE": str(case.endswith("_on")).lower(),
             "VLLM_ASCEND_DSA_SPARSE_DECODE_D_NODE": "false",
@@ -184,7 +193,7 @@ def engine_options(args, case_dir, prompt_len):
         "gpu_memory_utilization": 0.96,
         "max_model_len": max_len,
         "max_num_seqs": 1,
-        "max_num_batched_tokens": 4096,
+        "max_num_batched_tokens": COMPUTE_CHUNK_TOKENS,
         "enable_chunked_prefill": True,
         "enable_prefix_caching": False,
         "async_scheduling": False,
@@ -215,11 +224,17 @@ def engine_options(args, case_dir, prompt_len):
     }
 
 
-def capture_request(llm, token_ids, params, case):
-    # Capture all compute-prefill chunks, not a fixed number of engine steps.
+def capture_request(llm, token_ids, params, case, case_dir=None):
+    plan = make_capture_plan(len(token_ids), COMPUTE_CHUNK_TOKENS) if case in LONG_CASES else None
+    if plan:
+        write_json(case_dir / "capture_plan.json", plan)
+        print(f"{PREFIX} {case}: capture windows={plan['windows']}; middle chunks still compute", flush=True)
     print(f"{PREFIX} {case}: profiler start begin", flush=True)
-    llm.start_profile(profile_prefix=case)
-    print(f"{PREFIX} {case}: profiler started; generate begin", flush=True)
+    if plan:
+        llm.collective_rpc(install_chunk_profile, args=(case, plan))
+    else:
+        llm.start_profile(profile_prefix=case)
+    print(f"{PREFIX} {case}: profiler {'armed' if plan else 'started'}; generate begin", flush=True)
     try:
         start = time.perf_counter()
         results = llm.generate({"prompt_token_ids": token_ids}, params, use_tqdm=False)
@@ -231,7 +246,13 @@ def capture_request(llm, token_ids, params, case):
         stopped = time.perf_counter()
         print(f"{PREFIX} {case}: profiler stop begin", flush=True)
         try:
-            llm.stop_profile()
+            if plan:
+                reports = llm.collective_rpc(finish_chunk_profile)
+                write_json(case_dir / "capture_windows.json", {"plan": plan, "workers": reports})
+                if not error_in_flight:
+                    validate_capture(plan, reports)
+            else:
+                llm.stop_profile()
             print(f"{PREFIX} {case}: profiler stop complete in {time.perf_counter() - stopped:.3f}s", flush=True)
         except Exception as exc:
             if not error_in_flight:
@@ -251,7 +272,7 @@ def run_child(args):
     try:
         print(f"{PREFIX} {args.child}: capturing {prompt['length']} input tokens -> first output token", flush=True)
         results, elapsed = capture_request(
-            llm, prompt["token_ids"], SamplingParams(temperature=0, seed=1024, max_tokens=1), args.child
+            llm, prompt["token_ids"], SamplingParams(temperature=0, seed=1024, max_tokens=1), args.child, case_dir
         )
         result = results[0]
         completion = result.outputs[0]
@@ -290,9 +311,20 @@ def analyse_case(case_dir):
     )
     traces = sorted(str(path.resolve()) for path in (case_dir / "profile").rglob("trace_view.json"))
     expected = json.loads((case_dir / "engine_options.json").read_text(encoding="utf-8"))["tensor_parallel_size"]
+    plan_path = case_dir / "capture_plan.json"
+    windows = json.loads(plan_path.read_text(encoding="utf-8"))["windows"] if plan_path.exists() else None
+    if windows:
+        expected *= len(windows)
     write_json(case_dir / "traces.json", traces)
     if len(traces) != expected:
         raise RuntimeError(f"Expected {expected} worker trace_view.json files, found {len(traces)} in {case_dir}")
+    if windows:
+        ranks = expected // len(windows)
+        for window in windows:
+            marker = f"{case_dir.name}_{window['name']}_"
+            matched = [p for p in traces if marker in Path(p).relative_to(case_dir.resolve() / "profile").as_posix()]
+            if len(matched) != ranks:
+                raise RuntimeError(f"Expected {ranks} {window['name']} traces, found {len(matched)} in {case_dir}")
     print(
         f"{PREFIX} {case_dir.name}: export complete in {time.perf_counter() - started:.3f}s; "
         f"{len(traces)} MindStudio traces; paths in {case_dir / 'traces.json'}",
