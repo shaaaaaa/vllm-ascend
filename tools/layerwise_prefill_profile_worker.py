@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tool-only worker hooks: collect the ends of one fixed-budget prefill request.
 
-Installed by collective RPC AFTER model startup. No production worker changes,
+Registered as a vLLM worker extension at startup, then installed by string
+collective RPC AFTER model startup. No production worker changes,
 tensor inspection, per-layer checks, or extra per-chunk synchronization.
 """
 
@@ -102,6 +103,16 @@ def finish_chunk_profile(worker):
         return capture.finish()
     finally:
         del worker._prefill_chunk_profile_capture
+
+
+class ChunkProfileWorkerExtension:
+    """Expose tool-only capture hooks through serializable RPC method names."""
+
+    def install_chunk_profile(self, case, plan):
+        return install_chunk_profile(self, case, plan)
+
+    def finish_chunk_profile(self):
+        return finish_chunk_profile(self)
 
 
 def validate_capture(plan, workers):

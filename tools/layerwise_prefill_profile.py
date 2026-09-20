@@ -20,8 +20,6 @@ from pathlib import Path
 from layerwise_prefill_check import DEFAULT_PROMPT_FILE, normalize_prompt_token_ids, write_json
 from layerwise_prefill_mooncake_check import finish_child, start_logged_process
 from layerwise_prefill_profile_worker import (
-    finish_chunk_profile,
-    install_chunk_profile,
     make_capture_plan,
     validate_capture,
 )
@@ -180,6 +178,7 @@ def engine_options(args, case_dir, prompt_len):
         "data_parallel_size": 1,
         "pipeline_parallel_size": 1,
         "distributed_executor_backend": "mp",
+        "worker_extension_cls": "layerwise_prefill_profile_worker.ChunkProfileWorkerExtension",
         "enable_expert_parallel": True,
         "gpu_memory_utilization": 0.96,
         "max_model_len": max_len,
@@ -222,7 +221,7 @@ def capture_request(llm, token_ids, params, case, case_dir=None):
         print(f"{PREFIX} {case}: capture windows={plan['windows']}; middle chunks still compute", flush=True)
     print(f"{PREFIX} {case}: profiler start begin", flush=True)
     if plan:
-        llm.collective_rpc(install_chunk_profile, args=(case, plan))
+        llm.collective_rpc("install_chunk_profile", args=(case, plan))
     else:
         llm.start_profile(profile_prefix=case)
     print(f"{PREFIX} {case}: profiler {'armed' if plan else 'started'}; generate begin", flush=True)
@@ -238,7 +237,7 @@ def capture_request(llm, token_ids, params, case, case_dir=None):
         print(f"{PREFIX} {case}: profiler stop begin", flush=True)
         try:
             if plan:
-                reports = llm.collective_rpc(finish_chunk_profile)
+                reports = llm.collective_rpc("finish_chunk_profile")
                 write_json(case_dir / "capture_windows.json", {"plan": plan, "workers": reports})
                 if not error_in_flight:
                     validate_capture(plan, reports)
