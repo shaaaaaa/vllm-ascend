@@ -56,6 +56,16 @@ def test_forward_keeps_router_compute_and_logits_fp32() -> None:
     assert output_bias is None
 
 
+def test_forward_has_no_logging_side_effects() -> None:
+    gate = AscendGateLinear(input_size=16, output_size=4, bias=False)
+    hidden_states = torch.randn(2, 16, dtype=torch.bfloat16)
+
+    with mock.patch("vllm_ascend.ops.fused_moe.gate_linear.logger") as logger:
+        gate(hidden_states)
+
+    logger.info_once.assert_not_called()
+
+
 def test_weight_loader_keeps_gate_weight_fp32() -> None:
     gate = AscendGateLinear(
         input_size=16,

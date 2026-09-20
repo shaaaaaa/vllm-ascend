@@ -46,22 +46,15 @@ class AscendGateLinear(GateLinear):
             force_fp32_compute=True,
             prefix=prefix,
         )
+        logger.info_once(
+            "[FP32_ROUTER_CHECK] impl=%s weight=%s configured_out=%s",
+            type(self).__name__,
+            self.weight.dtype,
+            self.out_dtype,
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor | tuple[torch.Tensor, Parameter | None]:
         """Compute FP32 router logits regardless of the configured output dtype."""
-        input_dtype = x.dtype
         if x.dtype != torch.float32:
             x = x.to(torch.float32)
-
-        output, output_bias = ReplicatedLinear.forward(self, x)
-        logger.info_once(
-            "[FP32_ROUTER_CHECK] impl=%s input=%s compute_input=%s weight=%s configured_out=%s output=%s device=%s",
-            type(self).__name__,
-            input_dtype,
-            x.dtype,
-            self.weight.dtype,
-            self.out_dtype,
-            output.dtype,
-            x.device,
-        )
-        return output, output_bias
+        return ReplicatedLinear.forward(self, x)
