@@ -139,6 +139,30 @@ def test_off_on_environment_diff_is_only_feature_switch(tool, monkeypatch):
     assert on["MSMONITOR_USE_DAEMON"] == "0"
 
 
+def test_clear_shm_removes_all_nonhidden_entries(tool, tmp_path):
+    (tmp_path / "lmcache_shared_memory").write_bytes(b"cache")
+    (tmp_path / "vllm_shared_memory").write_bytes(b"cache")
+    nested = tmp_path / "torch_shared_directory"
+    nested.mkdir()
+    (nested / "data").write_bytes(b"cache")
+    (tmp_path / ".hidden").write_bytes(b"untouched by shell glob")
+
+    assert tool.clear_shm(tmp_path) == 3
+    assert sorted(path.name for path in tmp_path.iterdir()) == [".hidden"]
+
+
+def test_shm_capacity_fails_before_model_load_when_mount_is_too_small(tool, monkeypatch, tmp_path):
+    gib = 1024**3
+    monkeypatch.setattr(
+        tool.os,
+        "statvfs",
+        lambda path: NS(f_bavail=8, f_blocks=8, f_frsize=gib),
+        raising=False,
+    )
+    with pytest.raises(RuntimeError, match="Increase the container's /dev/shm capacity"):
+        tool.check_shm_capacity(tmp_path, 24)
+
+
 @pytest.mark.parametrize("prompt_len, expected_max", [(9999, 16384), (10000, 16384), (100000, 100352)])
 def test_full_model_mtp_and_profile_options(tool, tmp_path, prompt_len, expected_max):
     args = tool.parser().parse_args([])
@@ -269,8 +293,19 @@ def test_sequential_cases_release_model_before_analysis_and_next_launch(tool, mo
     monkeypatch.setattr(tool, "start_logged_process", launch)
     monkeypatch.setattr(tool, "finish_child", lambda p: events.append((p.label, "finish")))
     monkeypatch.setattr(tool, "analyse_case", lambda p: events.append((p.name, "analyse")))
+    monkeypatch.setattr(tool, "clear_shm", lambda p: events.append(("shm", "clear")))
     tool.run_cases(args, tmp_path, tool.LONG_CASES)
-    assert events == [(case, action) for case in tool.LONG_CASES for action in ("start", "wait", "finish", "analyse")]
+    assert events == [
+        ("100k_off", "start"),
+        ("100k_off", "wait"),
+        ("100k_off", "finish"),
+        ("100k_off", "analyse"),
+        ("shm", "clear"),
+        ("100k_on", "start"),
+        ("100k_on", "wait"),
+        ("100k_on", "finish"),
+        ("100k_on", "analyse"),
+    ]
 
 
 @pytest.mark.parametrize(
@@ -288,6 +323,8 @@ def test_sequential_cases_release_model_before_analysis_and_next_launch(tool, mo
 def test_main_selects_requested_cases(tool, monkeypatch, tmp_path, options, expected):
     events = []
     monkeypatch.setattr(tool, "os", NS(name="posix"))
+    monkeypatch.setattr(tool, "clear_shm", lambda *args: 0)
+    monkeypatch.setattr(tool, "check_shm_capacity", lambda *args: None)
     monkeypatch.setattr(tool, "prepare_inputs", lambda args, root, cases: events.append(("prepare", cases)))
     monkeypatch.setattr(tool, "run_cases", lambda args, root, cases: events.append(("run", cases)))
     tool.main(["--run-dir", str(tmp_path), *options])

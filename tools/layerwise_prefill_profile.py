@@ -11,6 +11,7 @@ output token. 100k captures only the first/last three compute-prefill chunks;
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -33,6 +34,50 @@ CACHE_CHUNK_TOKENS = 1024
 COMPUTE_CHUNK_TOKENS = 4096
 SHORT_MAX_MODEL_LEN = 16384
 PREFIX = "[PREFILL_PROFILE]"
+
+
+def clear_shm(shm_dir: Path) -> int:
+    """Clear /dev/shm contents before this dedicated-machine profile run."""
+    root = shm_dir.resolve(strict=True)
+    removed = 0
+    for path in root.iterdir():
+        # Match the shell's /dev/shm/* glob: hidden entries are not included.
+        if path.name.startswith("."):
+            continue
+        try:
+            if path.is_symlink():
+                path.unlink()
+            elif path.is_dir():
+                if path.resolve(strict=True).parent != root:
+                    raise RuntimeError(f"Refusing to remove a directory outside {root}: {path}")
+                shutil.rmtree(path)
+            else:
+                path.unlink()
+        except FileNotFoundError:
+            continue
+        removed += 1
+    print(f"{PREFIX} cleared {removed} /dev/shm entries", flush=True)
+    return removed
+
+
+def check_shm_capacity(shm_dir: Path, cache_gb: float) -> None:
+    usage = os.statvfs(shm_dir)
+    free_bytes = usage.f_bavail * usage.f_frsize
+    total_bytes = usage.f_blocks * usage.f_frsize
+    required_bytes = int(cache_gb * 1024**3)
+    print(
+        f"{PREFIX} /dev/shm total={total_bytes / 1024**3:.2f} GiB, "
+        f"free={free_bytes / 1024**3:.2f} GiB, "
+        f"requested CPU slab={cache_gb:g} GiB",
+        flush=True,
+    )
+    if free_bytes < required_bytes:
+        raise RuntimeError(
+            "Not enough /dev/shm after stale LMCache cleanup: "
+            f"free={free_bytes / 1024**3:.2f} GiB, required={cache_gb:g} GiB. "
+            "Increase the container's /dev/shm capacity; deleting files cannot "
+            "fix a mount whose total size is too small."
+        )
 
 
 def parser():
@@ -324,7 +369,9 @@ def analyse_case(case_dir):
 
 
 def run_cases(args, root, cases):
-    for case in cases:
+    for index, case in enumerate(cases):
+        if index:
+            clear_shm(Path("/dev/shm"))
         case_dir = root / case
         case_dir.mkdir()
         command = [
@@ -370,6 +417,8 @@ def main(argv=None):
     devices = args.devices.split(",")
     if not all(d.isdigit() for d in devices) or len(devices) != len(set(devices)) or args.cpu_cache_gb <= 0:
         cli.error("Specify distinct NPU device IDs and a positive CPU cache size")
+    clear_shm(Path("/dev/shm"))
+    check_shm_capacity(Path("/dev/shm"), args.cpu_cache_gb)
     root = (
         args.run_dir.resolve()
         if args.run_dir
