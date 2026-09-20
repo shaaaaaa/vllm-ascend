@@ -56,8 +56,10 @@ python -u tools/layerwise_prefill_profile.py --diagnose-chunk-start 2>&1 | tee l
 grep -aF '[PREFILL_START]' log.log
 ```
 
-诊断日志按 `start_load_kv_total`、`materialize_bank_maps`、`retrieve_setup_before_prime`、首两层各组的 `prime_retriever`、`dma_plan`、`second_bank_submit`、`store_chunk_scan` 和 `prime_storer` 拆分主机时间，并记录历史 token 数和已有/新存储 chunk 数。`first_bank_wait` 额外记录首层消费 bank 时的设备等待时间，可区分 CPU 准备和 H2D 尚未完成。该选项只影响本次子进程，不在默认 profile 或生产路径打日志；为读出首层设备事件，诊断模式会在首层等待后同步一次，故诊断采集的性能数字不能直接与正常采集比较。
+诊断日志按 `start_load_kv_total`、`materialize_bank_maps`、`retrieve_setup_before_prime`、首两层各组的 `prime_retriever`、`dma_plan`、`second_bank_submit`、`store_chunk_scan` 和 `prime_storer` 拆分主机时间，并记录历史 token 数和已有/新存储 chunk 数。`first_bank_wait_enqueue` 只记录首层设备依赖的非阻塞下发；`first_bank_wait_device.device_wait_ms` 在已有的 chunk-end 同步后读取事件，表示计算流实际等待加载/保存事件的时间。该选项不再额外同步首层计算流，但事件记录和日志仍有诊断开销；默认 profile 和生产路径不开启。
 
 ON 路径在 chunk 准备阶段只提交第 0 层加载；首层 SFA 入口以虚拟 N=-1 触发第 1 层异步加载（不保存或计算虚拟层），后续仍按 N+2 提交。因此 `second_bank_submit` 现在发生在首层 forward 入口，而非 `start_load_kv_total` 内。
+
+`final_load_source_sync` 是末层加载后、释放 H2D 源内存前已有的同步；`store_publish_sync` 是 chunk 结束、发布 CPU KV 前已有的 D2H 同步。两者只增加计时日志，不改变原有同步。旧版诊断的 `first_bank_wait.elapsed_ms` 包含额外的首层 `Event.synchronize()`，可能把先前排队的模型计算算进去；不能据此判断 H2D 等待。
 
 比较重叠时，查看同一 worker 的 compute、copy/DMA 和 HCCL 设备时间线；不要把 CPU 侧 `AscendCL@hcom_allReduce` API 区间直接当作 NPU 通信执行区间。ON 的下一层读取对应 bank 前仍须等待 H2D 完成。提交时机允许与其他工作重叠，但实际效果取决于设备资源竞争。
