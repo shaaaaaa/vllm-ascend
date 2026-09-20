@@ -1204,6 +1204,8 @@ class ProxyState:
         self._state_lock = threading.RLock()
         # Timestamp counter for heap tie-breaking (avoid idx bias)
         self._timestamp_counter = 0
+        self._pair_last_used: dict[tuple[ServerState, ServerState], int] = {}
+        self._placement_barrier: asyncio.Future | None = None
         
         # Priority queues: (priority, timestamp, idx, server)
         # timestamp ensures fair selection when priorities are equal
@@ -1317,18 +1319,30 @@ class ProxyState:
                 self.prefillers[idx].active_kv_cache = 0
             self._update_prefiller_priority(idx)
     
-    def select_decoder(self, token_count, preferred_idx: int | None = None):
-        """Select decoder based on score. Returns idx."""
+    def select_decoder(self, token_count, preferred_idx: int | None = None,
+                       prefiller_idx: int | None = None):
+        """Select by load, then least-recent P/D pairing when loads tie."""
         with self._state_lock:
             if not self.decoder_heap:
                 raise RuntimeError("No decoder servers available")
             if preferred_idx is not None and not 0 <= preferred_idx < len(self.decoders):
                 raise IndexError("Preferred decoder index is out of range")
+            if prefiller_idx is not None and not 0 <= prefiller_idx < len(self.prefillers):
+                raise IndexError("Prefiller pairing index is out of range")
             chosen = preferred_idx
             if chosen is None:
-                chosen = heapq.heappop(self.decoder_heap)[2]
+                if prefiller_idx is None:
+                    chosen = heapq.heappop(self.decoder_heap)[2]
+                else:
+                    prefiller = self.prefillers[prefiller_idx]
+                    chosen = min(self.decoder_heap, key=lambda entry: (
+                        entry[0], self._pair_last_used.get((prefiller, entry[3]), 0),
+                        entry[1], entry[2],
+                    ))[2]
             self.decoders[chosen].active_tokens += token_count
             self._update_decoder_priority(chosen)
+            if prefiller_idx is not None:
+                self._pair_last_used[self.prefillers[prefiller_idx], self.decoders[chosen]] = self._timestamp_counter
             return chosen
     
     def release_decoder(self, idx: int, token_count, dp_rank: int | None = None):
@@ -1546,6 +1560,36 @@ class ProxyState:
         if wait_for_result:
             await asyncio.shield(task)
 
+    def decoder_placements_ready(self) -> bool:
+        """Called under the state lock, including just before route reservation."""
+        now = time.monotonic()
+        return all(
+            server.decoder_placement_task is None
+            and self._decoder_placement_is_fresh(server, now)
+            for _, _, _, server in self.decoder_heap
+        )
+
+    async def ensure_decoder_placements(self) -> None:
+        """Share discovery across the routing cohort, not by chosen destination."""
+        while True:
+            with self._state_lock:
+                barrier = self._placement_barrier
+                if barrier is None or barrier.done():
+                    if self.decoder_placements_ready():
+                        return
+                    barrier = asyncio.gather(*(
+                        self.ensure_decoder_remote_fill(server, wait_for_result=True)
+                        for _, _, _, server in self.decoder_heap
+                    ))
+                    self._placement_barrier = barrier
+            try:
+                # Cancelling one request must not cancel discovery for its peers.
+                await asyncio.shield(barrier)
+            finally:
+                if barrier.done() and self._placement_barrier is barrier:
+                    self._placement_barrier = None
+            # Recheck additions/removals that occurred while discovery awaited.
+
     async def add_instances(self, instance_type: str, instances: list[ServerState]) -> tuple[list[str], list[str]]:
         added_nodes, waiting_nodes = [], []
         for server in instances:
@@ -1602,6 +1646,8 @@ class ProxyState:
                 return True
             instances_to_remove = set(instances)
             self.prefillers = [server for server in self.prefillers if server not in instances_to_remove]
+            self._pair_last_used = {pair: stamp for pair, stamp in self._pair_last_used.items()
+                                    if pair[0] not in instances_to_remove}
             prefiller_heap_copy = self.prefiller_heap.copy()
             prefiller_heap_copy.sort(key=lambda x: x[2])
             prefiller_heap = []
@@ -1625,6 +1671,8 @@ class ProxyState:
                 return True
             instances_to_remove = set(instances)
             self.decoders = [server for server in self.decoders if server not in instances_to_remove]
+            self._pair_last_used = {pair: stamp for pair, stamp in self._pair_last_used.items()
+                                    if pair[1] not in instances_to_remove}
             decoder_heap_copy = self.decoder_heap.copy()
             decoder_heap_copy.sort(key=lambda x: x[2])
             decoder_heap = []
@@ -1982,14 +2030,7 @@ async def _handle_select_instance(
 ):
     prefiller_score = proxy_state.calculate_prefill_scores(request_length)
     decoder_score = proxy_state.calculate_decode_scores(request_length)
-    known_anchor, known_affinity, affinity_selected = (
-        proxy_state.resolve_prefix_affinity(
-            prefix_anchors,
-            request_length,
-            prefiller_score,
-            decoder_score,
-        )
-    )
+    known_anchor, known_affinity, affinity_selected = None, None, False
     request_id = await proxy_state.next_req_id()
     prefiller_idx = None
     prefiller_active_released = False
@@ -1997,46 +2038,48 @@ async def _handle_select_instance(
     learned_affinity_key = None
     try:
         if proxy_state.enable_remote_lmcache_store:
-            decoder_idx = proxy_state.select_decoder(
-                decoder_score,
-                known_affinity.decoder_idx if affinity_selected else None,
-            )
-            decoder = proxy_state.decoders[decoder_idx]
-            reservation = DecoderReservation(decoder, decoder_idx, decoder_score)
-            await proxy_state.ensure_decoder_remote_fill(
-                decoder,
-                wait_for_result=True,
-            )
-            proxy_state.assign_decoder_rank(
-                reservation, known_affinity.dp_rank if affinity_selected else None
-            )
-            if affinity_selected and (
-                reservation.dp_rank != known_affinity.dp_rank
-                or reservation.preferred_segment
-                != known_affinity.preferred_segment
-                or reservation.remote_fill is None
-                or reservation.remote_fill.get("destination_engine_epoch")
-                != known_affinity.destination_engine_epoch
-            ):
-                proxy_state.release_decoder(
-                    reservation.decoder_idx,
-                    reservation.decoder_score,
-                    reservation.dp_rank,
-                )
-                affinity_selected = False
-                decoder_idx = proxy_state.select_decoder(decoder_score)
-                decoder = proxy_state.decoders[decoder_idx]
-                reservation = DecoderReservation(decoder, decoder_idx, decoder_score)
-                await proxy_state.ensure_decoder_remote_fill(
-                    decoder,
-                    wait_for_result=True,
-                )
-                proxy_state.assign_decoder_rank(reservation)
-
-        prefiller_idx = proxy_state.select_prefiller(
-            prefiller_score,
-            known_affinity.prefiller_idx if affinity_selected else None,
-        )
+            while True:
+                await proxy_state.ensure_decoder_placements()
+                with proxy_state._state_lock:
+                    if not proxy_state.decoder_placements_ready():
+                        continue
+                    known_anchor, known_affinity, affinity_selected = proxy_state.resolve_prefix_affinity(
+                        prefix_anchors, request_length, prefiller_score, decoder_score,
+                    )
+                    if not proxy_state.prefiller_heap:
+                        raise RuntimeError("No prefiller servers available")
+                    prefill_choice = (known_affinity.prefiller_idx if affinity_selected
+                                      else proxy_state.prefiller_heap[0][2])
+                    decoder_idx = proxy_state.select_decoder(
+                        decoder_score, known_affinity.decoder_idx if affinity_selected else None,
+                        prefiller_idx=prefill_choice,
+                    )
+                    decoder = proxy_state.decoders[decoder_idx]
+                    reservation = DecoderReservation(decoder, decoder_idx, decoder_score)
+                    proxy_state.assign_decoder_rank(
+                        reservation, known_affinity.dp_rank if affinity_selected else None,
+                    )
+                    if affinity_selected and (
+                        reservation.dp_rank != known_affinity.dp_rank
+                        or reservation.preferred_segment != known_affinity.preferred_segment
+                        or reservation.remote_fill is None
+                        or reservation.remote_fill.get("destination_engine_epoch")
+                        != known_affinity.destination_engine_epoch
+                    ):
+                        proxy_state.release_decoder(
+                            reservation.decoder_idx, reservation.decoder_score, reservation.dp_rank,
+                        )
+                        reservation = None
+                        affinity_selected = False
+                        prefill_choice = proxy_state.prefiller_heap[0][2]
+                        decoder_idx = proxy_state.select_decoder(decoder_score, prefiller_idx=prefill_choice)
+                        decoder = proxy_state.decoders[decoder_idx]
+                        reservation = DecoderReservation(decoder, decoder_idx, decoder_score)
+                        proxy_state.assign_decoder_rank(reservation)
+                    prefiller_idx = proxy_state.select_prefiller(prefiller_score, prefill_choice)
+                    break
+        else:
+            prefiller_idx = proxy_state.select_prefiller(prefiller_score)
         prefiller = proxy_state.prefillers[prefiller_idx]
         remote_fill_handoff = None
         if reservation is not None and reservation.remote_fill is not None:

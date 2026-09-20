@@ -2,6 +2,7 @@ import asyncio
 import json
 import time
 import unittest
+from collections import Counter
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -76,6 +77,16 @@ def _reserve_instance(state, request_id: str = "request", tokens: int = 100):
     )
 
 
+def _prefill_reply(handoff, end=100):
+    params = {"remote_engine_id": "persistent"}
+    if handoff is not None:
+        params["lmcache.remote_fill"] = {"terminal": {
+            "outcome": "LOCAL_FULL", "persistent_common_end": end,
+            "required_store_end": end, "transfer_id": handoff["transfer_id"],
+        }}
+    return SimpleNamespace(json=lambda: {"kv_transfer_params": params})
+
+
 class TestEnhancedRemoteFillProxy(unittest.TestCase):
     def setUp(self) -> None:
         proxy.global_args = SimpleNamespace(
@@ -96,6 +107,279 @@ class TestEnhancedRemoteFillProxy(unittest.TestCase):
 
             asyncio.run(close_clients())
         proxy.proxy_state = None
+
+    def test_burst_dispatch_stays_interleaved_with_cold_fresh_and_expired_placement(self):
+        async def run(mode):
+            state = proxy.ProxyState(
+                [(f"p{i}", 7910) for i in range(4)],
+                [(f"d{i}", 7920) for i in range(4)], enable_remote_lmcache_store=True,
+            )
+            proxy.proxy_state = state
+            placements = []
+            for i in range(4):
+                d = _prime_remote_fill(state, dp_rank=i, api_dp_rank=0, decoder_idx=i)
+                d.decoder_remote_fill[i]["destination_engine_id"] = f"engine-{i}"
+                d.decoder_remote_fill[i]["destination_dp_size"] = 4
+                placements.append(d.decoder_remote_fill)
+                if mode == "cold":
+                    d.decoder_remote_fill = {}
+                    d.decoder_placement_discovered_at = 0
+                elif mode == "expired":
+                    d.decoder_placement_discovered_at -= 31
+            started = [asyncio.Event() for _ in range(4)]
+            release = [asyncio.Event() for _ in range(4)]
+            sent, all_sent, finish = [], asyncio.Event(), asyncio.Event()
+
+            async def discover(server, **kwargs):
+                i = state.decoders.index(server)
+                started[i].set()
+                await release[i].wait()
+                return placements[i]
+
+            async def send(client, p, api, data, request_id, **kwargs):
+                handoff = kwargs["remote_fill_handoff"]
+                d = handoff["destination_dp_rank"]
+                self.assertEqual(handoff["destination_engine_id"], f"engine-{d}")
+                sent.append((p, d))
+                if len(sent) == 32:
+                    all_sent.set()
+                await finish.wait()
+                return SimpleNamespace(json=lambda: {"kv_transfer_params": {
+                    "remote_engine_id": "persistent",
+                    "lmcache.remote_fill": {"terminal": {
+                        "outcome": "LOCAL_FULL", "persistent_common_end": 100,
+                        "required_store_end": 100, "transfer_id": handoff["transfer_id"],
+                    }},
+                }})
+
+            try:
+                with patch.object(proxy, "_discover_decoder_remote_fill", side_effect=discover) as rpc, \
+                     patch.object(proxy, "send_request_to_service", side_effect=send):
+                    tasks = [asyncio.create_task(proxy._handle_select_instance(
+                        "/completions", {"prompt": "same"}, 100,
+                    )) for _ in range(32)]
+                    if mode != "fresh":
+                        await asyncio.wait_for(asyncio.gather(*(event.wait() for event in started)), 2)
+                        for event in release[:3]:
+                            event.set()
+                        for _ in range(10):
+                            await asyncio.sleep(0)
+                        self.assertEqual(sent, [])
+                        self.assertTrue(all(d.active_tokens == 0 for d in state.decoders))
+                        release[3].set()
+                    await asyncio.wait_for(all_sent.wait(), 2)
+                    self.assertEqual(rpc.call_count, 0 if mode == "fresh" else 4)
+                    self.assertEqual(Counter(d for _, d in sent), dict.fromkeys(range(4), 8))
+                    self.assertEqual(Counter(sent), {(p, d): 2 for p in range(4) for d in range(4)})
+                    for offset in range(0, 32, 4):
+                        self.assertEqual({d for _, d in sent[offset:offset + 4]}, set(range(4)))
+                    finish.set()
+                    infos = await asyncio.gather(*tasks)
+                    for info in infos:
+                        self.assertEqual(info.reservation.api_dp_rank, 0)
+                        self.assertEqual(proxy._decoder_headers(info.request_id, 0)["X-data-parallel-rank"], "0")
+                        proxy._release_decoder_reservation(info)
+                        state.release_prefiller_kv(info.prefiller_idx, info.prefiller_score)
+                    self.assertTrue(all(d.active_tokens == 0 for d in state.decoders))
+                    self.assertTrue(all(p.active_tokens == p.active_kv_cache == 0 for p in state.prefillers))
+            finally:
+                finish.set()
+                for event in release:
+                    event.set()
+                await asyncio.gather(*(s.client.aclose() for s in state.prefillers + state.decoders))
+                proxy.proxy_state = None
+
+        for mode in ("cold", "fresh", "expired"):
+            with self.subTest(mode=mode):
+                asyncio.run(run(mode))
+
+    def test_pair_tie_breaking_never_overrides_lower_load_or_preference(self):
+        state = proxy.ProxyState([("p", 7910)], [("d0", 7920), ("d1", 7920)])
+        proxy.proxy_state = state
+        state._pair_last_used[state.prefillers[0], state.decoders[0]] = 10000
+        with self.assertRaises(IndexError):
+            state.select_decoder(100, preferred_idx=0, prefiller_idx=99)
+        self.assertTrue(all(d.active_tokens == 0 for d in state.decoders))
+        self.assertEqual(state.select_decoder(100, preferred_idx=1, prefiller_idx=0), 1)
+        self.assertEqual(state.select_decoder(100, prefiller_idx=0), 0)
+        state.release_decoder(0, 100)
+        state.release_decoder(1, 100)
+        removed = state.decoders[1]
+        state.remove_decoders([removed])
+        asyncio.run(removed.client.aclose())
+        self.assertTrue(all(pair[1] in state.decoders for pair in state._pair_last_used))
+
+    def test_cancelled_request_does_not_cancel_shared_discovery_or_reserve_load(self):
+        state = proxy.ProxyState([("p", 7910)], [("d0", 7920), ("d1", 7920)],
+                                 enable_remote_lmcache_store=True)
+        proxy.proxy_state = state
+
+        async def run():
+            started = [asyncio.Event(), asyncio.Event()]
+            release = asyncio.Event()
+
+            async def discover(server, **kwargs):
+                i = state.decoders.index(server)
+                started[i].set()
+                await release.wait()
+                return {0: {"api_dp_rank": 0, "destination_dp_rank": 0,
+                            "destination_engine_epoch": 7}}
+
+            async def send(*args, **kwargs):
+                return _prefill_reply(kwargs["remote_fill_handoff"])
+
+            with patch.object(proxy, "_discover_decoder_remote_fill", side_effect=discover) as rpc, \
+                 patch.object(proxy, "send_request_to_service", side_effect=send):
+                tasks = [asyncio.create_task(proxy._handle_select_instance(
+                    "/completions", {"prompt": "x"}, 100,
+                )) for _ in range(2)]
+                await asyncio.wait_for(asyncio.gather(*(event.wait() for event in started)), 2)
+                tasks[0].cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await tasks[0]
+                self.assertFalse(state._placement_barrier.cancelled())
+                self.assertTrue(all(d.active_tokens == 0 for d in state.decoders))
+                self.assertEqual(state.prefillers[0].active_tokens, 0)
+                release.set()
+                info = await asyncio.wait_for(tasks[1], 2)
+                self.assertEqual(rpc.call_count, 2)
+                proxy._release_decoder_reservation(info)
+                state.release_prefiller_kv(info.prefiller_idx, info.prefiller_score)
+                self.assertTrue(all(d.active_tokens == 0 for d in state.decoders))
+        asyncio.run(run())
+
+    def test_discovery_failure_uses_persistent_fallback_without_repeated_rpc(self):
+        state = proxy.ProxyState([("p", 7910)], [("d0", 7920), ("d1", 7920)],
+                                 enable_remote_lmcache_store=True)
+        proxy.proxy_state = state
+        healthy = _prime_remote_fill(state, decoder_idx=1)
+
+        async def run():
+            async def discover(server, **kwargs):
+                self.assertIs(server, state.decoders[0])
+                raise httpx.ReadTimeout("discovery timed out")
+
+            async def send(*args, **kwargs):
+                return _prefill_reply(kwargs["remote_fill_handoff"])
+
+            with patch.object(proxy, "_discover_decoder_remote_fill", side_effect=discover) as rpc, \
+                 patch.object(proxy, "send_request_to_service", side_effect=send):
+                infos = [await proxy._handle_select_instance(
+                    "/completions", {"prompt": "x"}, 100,
+                ) for _ in range(2)]
+                self.assertIsNone(infos[0].reservation.remote_fill)
+                self.assertIs(infos[1].reservation.server, healthy)
+                self.assertIsNotNone(infos[1].reservation.remote_fill)
+                self.assertEqual(rpc.call_count, 1)
+                for info in infos:
+                    proxy._release_decoder_reservation(info)
+                    state.release_prefiller_kv(info.prefiller_idx, info.prefiller_score)
+                self.assertTrue(all(d.active_tokens == 0 for d in state.decoders))
+                self.assertEqual(state.prefillers[0].active_kv_cache, 0)
+        asyncio.run(run())
+
+    def test_discovery_finishes_after_sole_waiter_cancels(self):
+        state = proxy.ProxyState([("p", 7910)], [("d", 7920)],
+                                 enable_remote_lmcache_store=True)
+        proxy.proxy_state = state
+
+        async def run():
+            started, release = asyncio.Event(), asyncio.Event()
+
+            async def discover(*args, **kwargs):
+                started.set()
+                await release.wait()
+                return {}
+
+            with patch.object(proxy, "_discover_decoder_remote_fill", side_effect=discover) as rpc:
+                waiter = asyncio.create_task(state.ensure_decoder_placements())
+                await asyncio.wait_for(started.wait(), 2)
+                barrier = state._placement_barrier
+                waiter.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await waiter
+                release.set()
+                await asyncio.wait_for(asyncio.shield(barrier), 2)
+                await state.ensure_decoder_placements()
+                self.assertEqual(rpc.call_count, 1)
+                self.assertTrue(state.decoder_placements_ready())
+                self.assertEqual(state.decoders[0].active_tokens, 0)
+        asyncio.run(run())
+
+    def test_decoder_added_during_refresh_is_discovered_before_readiness(self):
+        state = proxy.ProxyState([("p", 7910)], [("d0", 7920)], enable_remote_lmcache_store=True)
+        proxy.proxy_state = state
+
+        async def run():
+            started = [asyncio.Event(), asyncio.Event()]
+            release = [asyncio.Event(), asyncio.Event()]
+
+            async def discover(server, **kwargs):
+                i = state.decoders.index(server)
+                started[i].set()
+                await release[i].wait()
+                return {}
+
+            with patch.object(proxy, "_discover_decoder_remote_fill", side_effect=discover) as rpc:
+                ready = asyncio.create_task(state.ensure_decoder_placements())
+                await asyncio.wait_for(started[0].wait(), 2)
+                state.add_decoders([proxy.ServerState("d1", 7920)])
+                release[0].set()
+                await asyncio.wait_for(started[1].wait(), 2)
+                self.assertFalse(ready.done())
+                release[1].set()
+                await asyncio.wait_for(ready, 2)
+                self.assertEqual(rpc.call_count, 2)
+                with state._state_lock:
+                    self.assertTrue(state.decoder_placements_ready())
+        asyncio.run(run())
+
+    def test_affinity_is_resolved_after_refresh_using_current_epoch_and_load(self):
+        async def run(mode):
+            state = proxy.ProxyState([("p0", 7910), ("p1", 7910)],
+                                     [("d0", 7920), ("d1", 7920)],
+                                     enable_remote_lmcache_store=True, enable_prefix_affinity_routing=True)
+            proxy.proxy_state = state
+            for i in range(2):
+                _prime_remote_fill(state, decoder_idx=i)
+                if mode != "valid":
+                    state.decoders[i].decoder_placement_discovered_at = 0
+            anchor = proxy.PrefixAffinityAnchor("prefix", 20000)
+            previous = proxy.DecoderReservation(state.decoders[1], 1, 2000,
+                                               dp_rank=0, preferred_segment="decoder:12345",
+                                               remote_fill={"destination_engine_epoch": 7})
+            state.record_prefix_affinity((anchor,), 20000, 1, previous, 20000)
+
+            async def discover(server, **kwargs):
+                result = {rank: dict(value) for rank, value in server.decoder_remote_fill.items()}
+                if mode == "epoch":
+                    result[0]["destination_engine_epoch"] = 8
+                elif server is state.decoders[1]:
+                    server.active_tokens = 1e9
+                    state._update_decoder_priority(1)
+                return result
+
+            async def send(*args, **kwargs):
+                return _prefill_reply(kwargs["remote_fill_handoff"], 20000)
+
+            try:
+                with patch.object(proxy, "_discover_decoder_remote_fill", side_effect=discover), \
+                     patch.object(proxy, "send_request_to_service", side_effect=send):
+                    info = await proxy._handle_select_instance(
+                        "/completions", {"prompt": "x"}, 20000, prefix_anchors=(anchor,),
+                    )
+                    self.assertEqual((info.prefiller_idx, info.decoder_idx),
+                                     (1, 1) if mode == "valid" else (0, 0))
+                    self.assertEqual(info.reservation.remote_fill["destination_engine_epoch"],
+                                     8 if mode == "epoch" else 7)
+                    proxy._release_decoder_reservation(info)
+                    state.release_prefiller_kv(info.prefiller_idx, info.prefiller_score)
+            finally:
+                await asyncio.gather(*(s.client.aclose() for s in state.prefillers + state.decoders))
+                proxy.proxy_state = None
+        for mode in ("valid", "epoch", "load"):
+            with self.subTest(mode=mode):
+                asyncio.run(run(mode))
 
     def test_disable_tokenizer_analysis_skips_both_exact_analyzers(self):
         proxy.global_args = SimpleNamespace(
@@ -559,9 +843,9 @@ class TestEnhancedRemoteFillProxy(unittest.TestCase):
         original_select_decoder = state.select_decoder
         original_select_prefiller = state.select_prefiller
 
-        def select_decoder(score, preferred_idx=None):
+        def select_decoder(score, preferred_idx=None, **kwargs):
             order.append("decoder")
-            return original_select_decoder(score, preferred_idx)
+            return original_select_decoder(score, preferred_idx, **kwargs)
 
         def select_prefiller(score, preferred_idx=None):
             order.append("prefiller")
@@ -728,9 +1012,9 @@ class TestEnhancedRemoteFillProxy(unittest.TestCase):
         original_select_decoder = state.select_decoder
         original_select_prefiller = state.select_prefiller
 
-        def select_decoder(score, preferred_idx=None):
+        def select_decoder(score, preferred_idx=None, **kwargs):
             order.append("decoder")
-            return original_select_decoder(score, preferred_idx)
+            return original_select_decoder(score, preferred_idx, **kwargs)
 
         def select_prefiller(score, preferred_idx=None):
             order.append("prefiller")
