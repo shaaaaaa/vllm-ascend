@@ -53,7 +53,7 @@ class Wrapper:
         return self.worker.execute_model(scheduler_output, **kwargs)
 
 
-@pytest.mark.parametrize("length", [95000, 100000, 24 * 4096, 4096, 6 * 4096, 6 * 4096 + 1])
+@pytest.mark.parametrize("length", [80000, 95000, 100000, 24 * 4096, 4096, 6 * 4096, 6 * 4096 + 1])
 @pytest.mark.parametrize("wrapped", [False, True])
 def test_capture_first_and_last_chunks_only(module, monkeypatch, length, wrapped):
     worker = Worker()
@@ -62,7 +62,7 @@ def test_capture_first_and_last_chunks_only(module, monkeypatch, length, wrapped
     fences = []
     monkeypatch.setattr(module, "synchronize_boundary", lambda: fences.append(len(worker.events)))
     plan = module.make_capture_plan(length, 4096)
-    module.install_chunk_profile(receiver, "100k_on", plan)
+    module.install_chunk_profile(receiver, "80k_on", plan)
     assert worker.profiler is None  # no startup capture
     assert not (wrapped and "profiler" in vars(receiver))
     # Idle scheduler iterations must not consume chunk indices.
@@ -87,19 +87,19 @@ def test_capture_first_and_last_chunks_only(module, monkeypatch, length, wrapped
         assert bool(execution[1]) == (i in selected)
         assert sampling[1] == execution[1]  # includes final chunk sampling/MTP
         assert execution[3] == {"test_arg": True}
-    assert [e[1] for e in worker.events if e[0] == "start"] == [f"100k_on_{w['name']}" for w in plan["windows"]]
+    assert [e[1] for e in worker.events if e[0] == "start"] == [f"80k_on_{w['name']}" for w in plan["windows"]]
     assert len(fences) == 2 * len(plan["windows"])  # never one sync per chunk
-    if length == 100000:
-        assert selected == [1, 2, 3, 23, 24, 25]
-        assert report["chunks"][-3]["token_start"] == 90112
-        assert report["chunks"][-1]["token_end"] == 100000
+    if length == 80000:
+        assert selected == [1, 2, 3, 18, 19, 20]
+        assert report["chunks"][-3]["token_start"] == 69632
+        assert report["chunks"][-1]["token_end"] == 80000
 
 
 def test_finish_restores_execute_even_if_profiler_stop_fails(module, monkeypatch):
     worker = Worker()
     original = worker.execute_model
     monkeypatch.setattr(module, "synchronize_boundary", lambda: None)
-    module.install_chunk_profile(worker, "100k_on", module.make_capture_plan(100000, 4096))
+    module.install_chunk_profile(worker, "80k_on", module.make_capture_plan(80000, 4096))
     worker.execute_model(NS(total_num_scheduled_tokens=4096))
 
     def fail(**kwargs):
@@ -115,8 +115,8 @@ def test_finish_restores_execute_even_if_profiler_stop_fails(module, monkeypatch
 def test_changed_chunk_schedule_is_reported_not_silently_mislabelled(module, monkeypatch):
     worker = Worker()
     monkeypatch.setattr(module, "synchronize_boundary", lambda: None)
-    plan = module.make_capture_plan(100000, 4096)
-    module.install_chunk_profile(worker, "100k_on", plan)
+    plan = module.make_capture_plan(80000, 4096)
+    module.install_chunk_profile(worker, "80k_on", plan)
     worker.execute_model(NS(total_num_scheduled_tokens=2048))
     report = module.finish_chunk_profile(worker)
     with pytest.raises(RuntimeError, match="actual prefill chunk layout differs"):

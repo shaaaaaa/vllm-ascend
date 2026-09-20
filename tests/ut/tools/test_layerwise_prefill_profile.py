@@ -79,13 +79,13 @@ def test_unstable_template_cannot_cause_unbounded_fitting(tool):
     assert tokenizer.calls == 1 + tool.MAX_PROMPT_FIT_ATTEMPTS
 
 
-def test_fixed_100k_example_is_committed_text_not_runtime_generation(tool):
+def test_fixed_80k_example_is_committed_text_not_runtime_generation(tool):
     source = tool.DEFAULT_LONG_PROMPT_FILE.read_text(encoding="utf-8")
-    assert len(source) > 600000
+    assert len(source) > 500000
     assert source.startswith("请阅读") and source.rstrip().endswith("END OF REFERENCE COLLECTION")
-    assert source.count("OF 12 — REFERENCE COPY") == 12
-    text, ids = tool.build_prompt(Tokenizer(), source, 100000)
-    assert len(ids) == 100000 and ids[1:-2] == [ord(c) for c in text]
+    assert source.count("OF 10 — REFERENCE COPY") == 10
+    text, ids = tool.build_prompt(Tokenizer(), source, 80000)
+    assert len(ids) == 80000 and ids[1:-2] == [ord(c) for c in text]
 
 
 def test_prompt_can_crop_longer_source(tool):
@@ -94,7 +94,7 @@ def test_prompt_can_crop_longer_source(tool):
     assert text == ("Report " * 10000)[:9997]
 
 
-@pytest.mark.parametrize("name, count", [("10k", 10000), ("100k", 100000)])
+@pytest.mark.parametrize("name, count", [("10k", 10000), ("80k", 80000)])
 def test_pair_shares_one_saved_input(tool, monkeypatch, tmp_path, name, count):
     source = tmp_path / "source.txt"
     source.write_text("Example article.\n" * 8000, encoding="utf-8")
@@ -113,8 +113,8 @@ def test_default_prepares_only_saved_long_example(tool, monkeypatch, tmp_path):
     args = tool.parser().parse_args([])
     monkeypatch.setitem(sys.modules, "transformers", NS(AutoTokenizer=NS(from_pretrained=lambda *a, **kw: Tokenizer())))
     tool.prepare_inputs(args, tmp_path, (args.case,))
-    assert sorted(p.name for p in tmp_path.glob("*_prompt.json")) == ["100k_prompt.json"]
-    assert (tmp_path / "100k_article_source.txt").read_text(
+    assert sorted(p.name for p in tmp_path.glob("*_prompt.json")) == ["80k_prompt.json"]
+    assert (tmp_path / "80k_article_source.txt").read_text(
         encoding="utf-8"
     ) == tool.DEFAULT_LONG_PROMPT_FILE.read_text(encoding="utf-8")
 
@@ -163,14 +163,14 @@ def test_shm_capacity_fails_before_model_load_when_mount_is_too_small(tool, monk
         tool.check_shm_capacity(tmp_path, 24)
 
 
-@pytest.mark.parametrize("prompt_len, expected_max", [(9999, 16384), (10000, 16384), (100000, 100352)])
+@pytest.mark.parametrize("prompt_len, expected_max", [(9999, 16384), (10000, 16384), (79000, 84000), (80000, 84000)])
 def test_full_model_mtp_and_profile_options(tool, tmp_path, prompt_len, expected_max):
     args = tool.parser().parse_args([])
     options = tool.engine_options(args, tmp_path, prompt_len)
     assert "hf_overrides" not in options and options["load_format"] == "safetensors"
     assert options["worker_extension_cls"] == "layerwise_prefill_profile_worker.ChunkProfileWorkerExtension"
     assert options["max_model_len"] == expected_max
-    assert options["gpu_memory_utilization"] == 0.96
+    assert options["gpu_memory_utilization"] == 0.97
     assert options["tensor_parallel_size"] == 8
     assert options["max_num_seqs"] == 1 and options["max_num_batched_tokens"] == 4096
     assert options["enable_prefix_caching"] is False and options["enforce_eager"] is True
@@ -221,7 +221,7 @@ def test_capture_brackets_whole_generate_and_preserves_error(tool, generate_fail
         assert log.index("generate complete") < log.index("profiler stop begin")
 
 
-@pytest.mark.parametrize("case, length, max_len", [("10k_on", 10000, 16384), ("100k_on", 100000, 100352)])
+@pytest.mark.parametrize("case, length, max_len", [("10k_on", 10000, 16384), ("80k_on", 80000, 84000)])
 def test_child_only_requests_first_token_and_shuts_down(tool, monkeypatch, tmp_path, case, length, max_len):
     args = tool.parser().parse_args(["--child", case, "--run-dir", str(tmp_path)])
     case_dir = tmp_path / case
@@ -281,7 +281,7 @@ def test_sequential_cases_release_model_before_analysis_and_next_launch(tool, mo
     events = []
     args = tool.parser().parse_args(["--include-off"])
     assert args.case == "all"
-    assert tool.LONG_CASES == ("100k_off", "100k_on")
+    assert tool.LONG_CASES == ("80k_off", "80k_on")
 
     def launch(command, env, log, label, **kwargs):
         events.append((label, "start"))
@@ -296,28 +296,28 @@ def test_sequential_cases_release_model_before_analysis_and_next_launch(tool, mo
     monkeypatch.setattr(tool, "clear_shm", lambda p: events.append(("shm", "clear")))
     tool.run_cases(args, tmp_path, tool.LONG_CASES)
     assert events == [
-        ("100k_off", "start"),
-        ("100k_off", "wait"),
-        ("100k_off", "finish"),
-        ("100k_off", "analyse"),
+        ("80k_off", "start"),
+        ("80k_off", "wait"),
+        ("80k_off", "finish"),
+        ("80k_off", "analyse"),
         ("shm", "clear"),
-        ("100k_on", "start"),
-        ("100k_on", "wait"),
-        ("100k_on", "finish"),
-        ("100k_on", "analyse"),
+        ("80k_on", "start"),
+        ("80k_on", "wait"),
+        ("80k_on", "finish"),
+        ("80k_on", "analyse"),
     ]
 
 
 @pytest.mark.parametrize(
     "options, expected",
     [
-        ([], ("100k_on",)),
-        (["--include-off"], ("100k_off", "100k_on")),
-        (["--case", "all"], ("100k_off", "100k_on")),
+        ([], ("80k_on",)),
+        (["--include-off"], ("80k_off", "80k_on")),
+        (["--case", "all"], ("80k_off", "80k_on")),
         (["--case", "10k_off"], ("10k_off",)),
         (["--case", "10k_on"], ("10k_on",)),
-        (["--case", "100k_off"], ("100k_off",)),
-        (["--case", "100k_on"], ("100k_on",)),
+        (["--case", "80k_off"], ("80k_off",)),
+        (["--case", "80k_on"], ("80k_on",)),
     ],
 )
 def test_main_selects_requested_cases(tool, monkeypatch, tmp_path, options, expected):
@@ -355,10 +355,10 @@ def test_failed_case_is_cleaned_and_no_following_case_launches(tool, monkeypatch
     monkeypatch.setattr(tool, "start_logged_process", lambda *a, **kw: NS(wait=lambda: 1))
     monkeypatch.setattr(tool, "finish_child", lambda p: events.append("finish"))
     monkeypatch.setattr(tool, "analyse_case", lambda p: pytest.fail("Must not analyse failed request as success"))
-    with pytest.raises(RuntimeError, match="100k_off failed"):
+    with pytest.raises(RuntimeError, match="80k_off failed"):
         tool.run_cases(tool.parser().parse_args([]), tmp_path, tool.LONG_CASES)
     assert events == ["finish"]
-    assert not (tmp_path / "100k_on").exists()
+    assert not (tmp_path / "80k_on").exists()
 
 
 def test_trace_export_writes_all_rank_paths(tool, monkeypatch, tmp_path):
@@ -385,13 +385,13 @@ def test_missing_trace_is_not_reported_as_success(tool, monkeypatch, tmp_path):
 
 @pytest.mark.parametrize("missing_tail", [False, True])
 def test_segmented_trace_export_requires_each_window(tool, monkeypatch, tmp_path, missing_tail):
-    case_dir = tmp_path / "100k_on"
+    case_dir = tmp_path / "80k_on"
     case_dir.mkdir()
     tool.write_json(case_dir / "engine_options.json", {"tensor_parallel_size": 8})
-    tool.write_json(case_dir / "capture_plan.json", tool.make_capture_plan(100000, 4096))
+    tool.write_json(case_dir / "capture_plan.json", tool.make_capture_plan(80000, 4096))
     for window in ("head", "extra_head" if missing_tail else "tail"):
         for rank in range(8):
-            path = case_dir / "profile" / f"100k_on_{window}_rank{rank}" / "ASCEND_PROFILER_OUTPUT"
+            path = case_dir / "profile" / f"80k_on_{window}_rank{rank}" / "ASCEND_PROFILER_OUTPUT"
             path.mkdir(parents=True)
             (path / "trace_view.json").write_text("{}")
     monkeypatch.setattr(tool.subprocess, "run", lambda *a, **kw: None)
@@ -419,5 +419,5 @@ def test_segmented_generate_failure_attempts_cleanup_without_masking_error(tool,
 
     llm = NS(collective_rpc=rpc, generate=generate)
     with pytest.raises(ValueError, match="model failed"):
-        tool.capture_request(llm, [1] * 100000, "params", "100k_on", tmp_path)
+        tool.capture_request(llm, [1] * 80000, "params", "80k_on", tmp_path)
     assert events == ["install_chunk_profile", "finish_chunk_profile"]

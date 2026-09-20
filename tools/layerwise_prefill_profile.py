@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""Capture full-model TP8 P-node prefill: 100k ON (add --include-off for OFF/ON).
+"""Capture full-model TP8 P-node prefill: 80k ON by default.
 
 Local LMCache CPU storage only: no Mooncake, file SDK shim, D node or KV probes.
 Each case uses a fresh model process and executes one request through its first
-output token. 100k captures only the first/last three compute-prefill chunks;
+output token. 80k captures only the first/last three compute-prefill chunks;
 10k captures the whole request. Model startup is outside capture.
 """
 
@@ -25,14 +25,15 @@ from layerwise_prefill_profile_worker import (
     validate_capture,
 )
 
-CASES = ("10k_off", "10k_on", "100k_off", "100k_on")
-LONG_CASES = ("100k_off", "100k_on")
-DEFAULT_LONG_PROMPT_FILE = DEFAULT_PROMPT_FILE.with_name("article_summary_100k.txt")
+CASES = ("10k_off", "10k_on", "80k_off", "80k_on")
+LONG_CASES = ("80k_off", "80k_on")
+DEFAULT_LONG_PROMPT_FILE = DEFAULT_PROMPT_FILE.with_name("article_summary_80k.txt")
 MAX_PROMPT_FIT_ATTEMPTS = 3
 MIN_PROMPT_FRACTION = 0.95
 CACHE_CHUNK_TOKENS = 1024
 COMPUTE_CHUNK_TOKENS = 4096
 SHORT_MAX_MODEL_LEN = 16384
+LONG_MAX_MODEL_LEN = 84000
 PREFIX = "[PREFILL_PROFILE]"
 
 
@@ -84,14 +85,14 @@ def parser():
     cli = argparse.ArgumentParser(description=__doc__)
     cli.add_argument("--model", default="/workspace/models/GLM-5.2-w4a8c8-0723")
     cli.add_argument("--devices", default="0,1,2,3,4,5,6,7")
-    cli.add_argument("--prompt-file", type=Path, help="Override the fixed 10k/100k example article")
+    cli.add_argument("--prompt-file", type=Path, help="Override the fixed 10k/80k example article")
     cli.add_argument("--cpu-cache-gb", type=float, default=24, help="Requires this much free /dev/shm and host RAM")
     selection = cli.add_mutually_exclusive_group()
     selection.add_argument(
-        "--case", choices=("all", *CASES), default="100k_on", help="Default: 100k_on; all: 100k OFF/ON"
+        "--case", choices=("all", *CASES), default="80k_on", help="Default: 80k ON; all: 80k OFF then ON"
     )
     selection.add_argument(
-        "--include-off", action="store_const", dest="case", const="all", help="Run 100k OFF then ON instead of ON only"
+        "--include-off", action="store_const", dest="case", const="all", help="Run 80k OFF then ON"
     )
     cli.add_argument("--run-dir", type=Path, help="New, empty results directory")
     cli.add_argument(
@@ -148,10 +149,10 @@ def prepare_inputs(args, root, cases):
 
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
     print(f"{PREFIX} tokenizer loaded in {time.perf_counter() - started:.3f}s", flush=True)
-    for name, target in (("10k", 10000), ("100k", 100000)):
+    for name, target in (("10k", 10000), ("80k", 80000)):
         if not any(case.startswith(name + "_") for case in cases):
             continue
-        source = args.prompt_file or (DEFAULT_LONG_PROMPT_FILE if name == "100k" else DEFAULT_PROMPT_FILE)
+        source = args.prompt_file or (DEFAULT_LONG_PROMPT_FILE if name == "80k" else DEFAULT_PROMPT_FILE)
         article = source.read_text(encoding="utf-8")
         if not article.strip():
             raise ValueError(f"Empty article: {source}")
@@ -213,8 +214,9 @@ def case_environment(args, case):
 
 
 def engine_options(args, case_dir, prompt_len):
-    # Reserve the same KV capacity for the OFF/ON pair.
-    max_len = max(SHORT_MAX_MODEL_LEN, (prompt_len // CACHE_CHUNK_TOKENS + 1) * CACHE_CHUNK_TOKENS)
+    # The 80k input cases reserve another 4k tokens of sequence length.
+    # Keep the OFF/ON capacity identical even if the tokenized input is a little short.
+    max_len = LONG_MAX_MODEL_LEN if prompt_len > SHORT_MAX_MODEL_LEN else SHORT_MAX_MODEL_LEN
     return {
         "model": args.model,
         "trust_remote_code": True,
@@ -226,7 +228,7 @@ def engine_options(args, case_dir, prompt_len):
         "distributed_executor_backend": "mp",
         "worker_extension_cls": "layerwise_prefill_profile_worker.ChunkProfileWorkerExtension",
         "enable_expert_parallel": True,
-        "gpu_memory_utilization": 0.96,
+        "gpu_memory_utilization": 0.97,
         "max_model_len": max_len,
         "max_num_seqs": 1,
         "max_num_batched_tokens": COMPUTE_CHUNK_TOKENS,
@@ -428,7 +430,7 @@ def main(argv=None):
     if any(root.iterdir()):
         cli.error("--run-dir must be empty (nothing was deleted)")
     cases = LONG_CASES if args.case == "all" else (args.case,)
-    print(f"{PREFIX} results: {root}; full model, TP={len(devices)}, gpu=0.96, eager P only, MTP1", flush=True)
+    print(f"{PREFIX} results: {root}; full model, TP={len(devices)}, gpu=0.97, eager P only, MTP1", flush=True)
     print(f"{PREFIX} local CPU cache={args.cpu_cache_gb} GiB; no Mooncake/file shim/KV dumps", flush=True)
     prepare_inputs(args, root, cases)
     run_cases(args, root, cases)
