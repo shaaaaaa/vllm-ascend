@@ -112,6 +112,44 @@ def install_dummy_dma():
     return lambda: setattr(ops, "layerwise_prefill_dma_copy", original)
 
 
+def install_dummy_prepare():
+    from lmcache.integration.vllm.vllm_v1_adapter import LMCacheConnectorV1Impl
+
+    # Keep scheduler/model bank metadata; bypass only worker cache work.
+    # The test generates one token, with no subsequent decode/cache consumer.
+    def start(self, *args, **kwargs):
+        self._wait_for_save_done = False
+
+    def noop(self, *args, **kwargs):
+        pass
+
+    def finish(self):
+        # Acknowledge the diagnostic request without publishing any real KV.
+        # Necessary for normal request cleanup; these results are INVALID.
+        metadata = self._parent._get_connector_metadata()
+        for request in metadata.requests:
+            self._mark_prefill_committed(request, len(request.token_ids))
+        self._complete_worker_save_step()
+
+    replacements = {
+        "start_load_kv": start,
+        "wait_for_layer_load": noop,
+        "submit_layerwise_prefill_load": noop,
+        "save_kv_layer": noop,
+        "finish_layerwise_prefill_save": noop,
+        "wait_for_save": finish,
+    }
+    originals = [(name, getattr(LMCacheConnectorV1Impl, name)) for name in replacements]
+    for name, replacement in replacements.items():
+        setattr(LMCacheConnectorV1Impl, name, replacement)
+
+    def restore():
+        for name, original in originals:
+            setattr(LMCacheConnectorV1Impl, name, original)
+
+    return restore
+
+
 def install_transfer_attribution():
     import sys
 
@@ -182,7 +220,21 @@ class ChunkProfileCapture:
         self.tokens = 0
         self.attribution = None
         # Install before the request, including all unprofiled middle chunks.
-        self.restore_dma = install_dummy_dma() if plan.get("dummy_dma", False) else None
+        dummy_prepare = plan.get("dummy_prepare", False)
+        self.restore_dma = install_dummy_dma() if plan.get("dummy_dma", False) or dummy_prepare else None
+        self.restore_prepare = None
+        try:
+            if dummy_prepare:
+                self.restore_prepare = install_dummy_prepare()
+                print(
+                    f"{PREFIX} rank={worker.rank}: DUMMY PREPARE enabled; "
+                    "LMCache worker preparation/transfer skipped; outputs INVALID",
+                    flush=True,
+                )
+        except BaseException:
+            if self.restore_dma:
+                self.restore_dma()
+            raise
         if self.restore_dma:
             print(f"{PREFIX} rank={worker.rank}: DUMMY DMA enabled for entire request; outputs INVALID", flush=True)
 
@@ -234,6 +286,9 @@ class ChunkProfileCapture:
             self.stop_window()
         finally:
             self.worker.execute_model = self.original_execute
+            if self.restore_prepare is not None:
+                self.restore_prepare()
+                self.restore_prepare = None
             if self.restore_dma is not None:
                 self.restore_dma()
                 self.restore_dma = None

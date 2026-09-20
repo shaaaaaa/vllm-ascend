@@ -84,6 +84,11 @@ def check_shm_capacity(shm_dir: Path, cache_gb: float) -> None:
 def parser():
     cli = argparse.ArgumentParser(description=__doc__)
     cli.add_argument(
+        "--dummy-prepare",
+        action="store_true",
+        help="Skip LMCache worker preparation and transfers; implies dummy DMA; outputs invalid",
+    )
+    cli.add_argument(
         "--dummy-dma", action="store_true", help="Skip layerwise KV DMA only; outputs are invalid (diagnostic run)"
     )
     cli.add_argument("--model", default="/workspace/models/GLM-5.2-w4a8c8-0723")
@@ -269,8 +274,11 @@ def engine_options(args, case_dir, prompt_len):
     }
 
 
-def capture_request(llm, token_ids, params, case, case_dir=None, dummy_dma=False):
+def capture_request(llm, token_ids, params, case, case_dir=None, dummy_dma=False, dummy_prepare=False):
+    dummy_dma = dummy_dma or dummy_prepare
     plan = make_capture_plan(len(token_ids), COMPUTE_CHUNK_TOKENS) if case in LONG_CASES or dummy_dma else None
+    if dummy_prepare:
+        plan["dummy_prepare"] = True
     if dummy_dma:
         plan["dummy_dma"] = True
     if plan:
@@ -325,12 +333,14 @@ def run_child(args):
             args.child,
             case_dir,
             dummy_dma=args.dummy_dma,
+            dummy_prepare=args.dummy_prepare,
         )
         result = results[0]
         completion = result.outputs[0]
         report = {
-            "dummy_dma": args.dummy_dma,
-            "output_valid_for_correctness": not args.dummy_dma,
+            "dummy_dma": args.dummy_dma or args.dummy_prepare,
+            "dummy_prepare": args.dummy_prepare,
+            "output_valid_for_correctness": not (args.dummy_dma or args.dummy_prepare),
             "case": args.child,
             "prompt_tokens": prompt["length"],
             "num_cached_tokens": result.num_cached_tokens,
@@ -410,6 +420,8 @@ def run_cases(args, root, cases):
         env = case_environment(args, case)
         if args.dummy_dma:
             command.append("--dummy-dma")
+        if args.dummy_prepare:
+            command.append("--dummy-prepare")
         write_json(case_dir / "environment.json", {k: v for k, v in env.items() if k.startswith(("LMCACHE_", "VLLM_"))})
         proc = start_logged_process(command, env, case_dir / "server.log", case, prefix=PREFIX)
         try:

@@ -304,3 +304,60 @@ def test_dummy_dma_skips_native_for_whole_request_and_restores(module, monkeypat
     assert not native_calls
     module.finish_chunk_profile(worker)
     assert ops.layerwise_prefill_dma_copy is original
+
+
+def test_dummy_prepare_skips_cache_work_but_acknowledges_cleanup(module, monkeypatch):
+    import sys
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("real preparation was called")
+
+    names = (
+        "start_load_kv",
+        "wait_for_layer_load",
+        "submit_layerwise_prefill_load",
+        "save_kv_layer",
+        "finish_layerwise_prefill_save",
+        "wait_for_save",
+    )
+    impl = type("Impl", (), {name: forbidden for name in names})
+    monkeypatch.setitem(sys.modules, "lmcache.integration.vllm.vllm_v1_adapter", NS(LMCacheConnectorV1Impl=impl))
+    restore = module.install_dummy_prepare()
+    instance = impl()
+    request = NS(token_ids=[1, 2, 3])
+    instance._parent = NS(_get_connector_metadata=lambda: NS(requests=[request]))
+    acknowledged = []
+    instance._mark_prefill_committed = lambda req, end: acknowledged.append((req, end))
+    instance._complete_worker_save_step = lambda: acknowledged.append("done")
+    instance.start_load_kv(None)
+    assert instance._wait_for_save_done is False
+    for name in names[1:-1]:
+        getattr(instance, name)("layer0")
+    instance.wait_for_save()
+    assert acknowledged == [(request, 3), "done"]
+    restore()
+    assert all(getattr(impl, name) is forbidden for name in names)
+
+
+def test_dummy_prepare_implies_dma_and_restores_on_stop_error(module, monkeypatch):
+    events = []
+    monkeypatch.setattr(
+        module, "install_dummy_dma", lambda: events.append("dma") or (lambda: events.append("restore_dma"))
+    )
+    monkeypatch.setattr(
+        module, "install_dummy_prepare", lambda: events.append("prepare") or (lambda: events.append("restore_prepare"))
+    )
+    monkeypatch.setattr(module, "synchronize_boundary", lambda: None)
+    worker = Worker()
+    plan = module.make_capture_plan(4096, 4096)
+    plan["dummy_prepare"] = True
+    module.install_chunk_profile(worker, "80k_on", plan)
+    worker.execute_model(NS(total_num_scheduled_tokens=4096))
+
+    def fail(**kwargs):
+        raise RuntimeError("stop failed")
+
+    worker.profile = fail
+    with pytest.raises(RuntimeError, match="stop failed"):
+        module.finish_chunk_profile(worker)
+    assert events == ["dma", "prepare", "restore_prepare", "restore_dma"]
