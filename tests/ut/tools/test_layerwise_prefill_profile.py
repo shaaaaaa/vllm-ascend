@@ -144,7 +144,7 @@ def test_full_model_mtp_and_profile_options(tool, tmp_path, prompt_len, expected
     args = tool.parser().parse_args([])
     options = tool.engine_options(args, tmp_path, prompt_len)
     assert "hf_overrides" not in options and options["load_format"] == "safetensors"
-    assert "worker_extension_cls" not in options
+    assert options["worker_extension_cls"] == "layerwise_prefill_profile_worker.ChunkProfileWorkerExtension"
     assert options["max_model_len"] == expected_max
     assert options["gpu_memory_utilization"] == 0.96
     assert options["tensor_parallel_size"] == 8
@@ -206,11 +206,11 @@ def test_child_only_requests_first_token_and_shuts_down(tool, monkeypatch, tmp_p
     events = []
 
     def collective_rpc(method, args=()):
-        if method is tool.install_chunk_profile:
+        if method == "install_chunk_profile":
             assert args[0] == case
             events.append("arm")
             return [None]
-        assert method is tool.finish_chunk_profile
+        assert method == "finish_chunk_profile"
         events.append("finish_capture")
         plan = tool.make_capture_plan(length, tool.COMPUTE_CHUNK_TOKENS)
         return [
@@ -371,8 +371,8 @@ def test_segmented_generate_failure_attempts_cleanup_without_masking_error(tool,
     events = []
 
     def rpc(method, args=()):
-        events.append(method.__name__)
-        if method is tool.finish_chunk_profile:
+        events.append(method)
+        if method == "finish_chunk_profile":
             if stop_fails:
                 raise RuntimeError("stop also failed")
             return []
