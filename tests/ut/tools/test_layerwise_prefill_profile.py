@@ -125,7 +125,12 @@ def test_off_on_environment_diff_is_only_feature_switch(tool, monkeypatch):
     args = tool.parser().parse_args([])
     off = tool.case_environment(args, "10k_off")
     on = tool.case_environment(args, "10k_on")
-    assert {k for k in off if off[k] != on[k]} == {"VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE"}
+    assert {k for k in off if off[k] != on[k]} == {
+        "VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE",
+        "LMCACHE_LAYERWISE_PREFILL_DMA",
+    }
+    assert off["LMCACHE_LAYERWISE_PREFILL_DMA"] == "0"
+    assert on["LMCACHE_LAYERWISE_PREFILL_DMA"] == "1"
     assert off["VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE"] == "false"
     assert on["VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE"] == "true"
     assert "LMCACHE_CONFIG_FILE" not in on and "LMCACHE_REMOTE_URL" not in on

@@ -108,37 +108,31 @@ def test_custom_projection_is_not_reimplemented(projection):
     assert torch.equal(output[0], torch.tensor([3.0]))
 
 
-def test_sfa_finishes_only_after_projection_collective(projection):
-    fn, events, _ = projection
-    path = ROOT / "vllm_ascend/attention/sfa_v1.py"
-    project = load_function(
-        path, "_project_with_layerwise_prefill_transfer", dict(row_parallel_with_prefill_transfer=fn)
+def test_sfa_queues_transfer_after_attention_and_before_projection():
+    tree = ast.parse((ROOT / "vllm_ascend/attention/sfa_v1.py").read_text(encoding="utf-8"))
+    forward = next(
+        n for n in ast.walk(tree)
+        if isinstance(n, ast.FunctionDef)
+        and n.name == "forward"
+        and any(
+            isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Attribute)
+            and call.func.attr == "_submit_sfa_layerwise_transfer_window"
+            for call in ast.walk(n)
+        )
     )
-    layer = NS(
-        custom_op=None,
-        input_is_parallel=True,
-        tp_rank=0,
-        tp_size=2,
-        bias=None,
-        skip_bias_add=False,
-        return_bias=True,
-        reduce_results=True,
-        quant_method=NS(apply=lambda *args: events.append("gemm") or torch.ones(1)),
+    calls = [n for n in ast.walk(forward) if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)]
+
+    def lines(name):
+        return [call.lineno for call in calls if call.func.attr == name]
+
+    assert (
+        max(lines("_execute_sparse_flash_attention_process"))
+        < min(lines("_submit_sfa_layerwise_transfer_window"))
+        < min(lines("_v_up_proj"))
+        < min(lines("o_proj"))
+        < min(lines("_finish_sfa_layerwise_transfer_window"))
     )
-    operations = [("latent", []), ("index", [])]
-
-    def submit(ops):
-        assert ops is operations
-        events.extend(["save_latent", "save_index", "load_latent", "load_index"])
-        return ["latent", "index"]
-
-    def finish(ops, names):
-        assert ops is operations and names == ["latent", "index"]
-        events.append("finish")
-
-    sfa = NS(o_proj=layer, _submit_sfa_layerwise_transfer_window=submit, _finish_sfa_layerwise_transfer_window=finish)
-    assert torch.equal(project(sfa, torch.ones(1), operations), torch.tensor([2.0]))
-    assert events == ["gemm", "save_latent", "save_index", "load_latent", "load_index", "all_reduce", "finish"]
 
 
 def test_non_p_projection_keeps_ordinary_forward():
@@ -148,7 +142,7 @@ def test_non_p_projection_keeps_ordinary_forward():
         for n in ast.walk(tree)
         if isinstance(n, ast.If)
         and ast.unparse(n.test) == "use_layerwise_transfer_window"
-        and "self._project_with_layerwise_prefill_transfer" in ast.unparse(n)
+        and "self._finish_sfa_layerwise_transfer_window" in ast.unparse(n)
     )
     events = []
     sfa = NS(
@@ -159,7 +153,8 @@ def test_non_p_projection_keeps_ordinary_forward():
     exec(
         compile(ast.fix_missing_locations(ast.Module(body=[branch], type_ignores=[])), "<projection branch>", "exec"),
         dict(
-            self=sfa, use_layerwise_transfer_window=False, attn_output=torch.ones(1), output=output, save_operations=[]
+            self=sfa, use_layerwise_transfer_window=False, attn_output=torch.ones(1), output=output,
+            save_operations=[], layerwise_submitted_names=[]
         ),
     )
     assert events == ["ordinary_projection", "ordinary_save"]

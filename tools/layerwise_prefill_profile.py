@@ -40,7 +40,7 @@ def parser():
     cli.add_argument("--model", default="/workspace/models/GLM-5.2-w4a8c8-0723")
     cli.add_argument("--devices", default="0,1,2,3,4,5,6,7")
     cli.add_argument("--prompt-file", type=Path, help="Override the fixed 10k/100k example article")
-    cli.add_argument("--cpu-cache-gb", type=float, default=16, help="Requires this much free /dev/shm and host RAM")
+    cli.add_argument("--cpu-cache-gb", type=float, default=24, help="Requires this much free /dev/shm and host RAM")
     selection = cli.add_mutually_exclusive_group()
     selection.add_argument(
         "--case", choices=("all", *CASES), default="100k_on", help="Default: 100k_on; all: 100k OFF/ON"
@@ -157,6 +157,7 @@ def case_environment(args, case):
             "LMCACHE_SAVE_DECODE_CACHE": "false",
             "LMCACHE_SAVE_UNFULL_CHUNK": "true",
             "LMCACHE_SAVE_FULL_CHUNK_IN_DECODE": "false",
+            "LMCACHE_LAYERWISE_PREFILL_DMA": "1" if case.endswith("_on") else "0",
             "LMCACHE_ENABLE_SHARED_CPU_CACHE": "true",
             "LMCACHE_SHARED_CPU_CACHE_STRICT": "true",
             "LMCACHE_SHARED_CPU_CACHE_PASSIVE_WRITABLE": "true",

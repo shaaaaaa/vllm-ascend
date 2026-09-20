@@ -63,6 +63,7 @@ from vllm.v1.core.dsa_shared_pool import (
     DSABlockAllocationMode,
     PrefillLayerRef,
     build_prefill_layer_refs,
+    layerwise_prefill_bundle_multiplier,
 )
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import (
@@ -6255,6 +6256,8 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                     blocks_per_bundle = 2
                 else:
                     blocks_per_bundle = 9
+                if self.layerwise_prefill_p_node:
+                    blocks_per_bundle *= layerwise_prefill_bundle_multiplier()
                 max_num_blocks_per_req = cdiv(
                     max_num_blocks_per_req, blocks_per_bundle
                 ) * blocks_per_bundle
