@@ -361,3 +361,33 @@ def test_dummy_prepare_implies_dma_and_restores_on_stop_error(module, monkeypatc
     with pytest.raises(RuntimeError, match="stop failed"):
         module.finish_chunk_profile(worker)
     assert events == ["dma", "prepare", "restore_prepare", "restore_dma"]
+
+
+def test_dummy_bind_only_replaces_address_constructor(module, monkeypatch):
+    import sys
+
+    original = lambda *a, **kw: [(1, 2, 3)]
+    planner = lambda *a: "real plan"
+    connector = NS(bind_copy_addresses=original, _prefill_dma_plans=planner)
+    monkeypatch.setitem(sys.modules, "lmcache_ascend.v1.npu_connector", NS(npu_connectors=connector))
+    restore = module.install_dummy_dma_bind()
+    assert connector.bind_copy_addresses("plan", device_to_host=False) == []
+    assert connector.bind_copy_addresses("plan", device_to_host=True) == []
+    assert connector._prefill_dma_plans is planner
+    restore()
+    assert connector.bind_copy_addresses is original
+
+
+def test_dummy_bind_lifetime_and_does_not_skip_prepare(module, monkeypatch):
+    events = []
+    monkeypatch.setattr(module, "install_dummy_dma", lambda: lambda: events.append("restore_dma"))
+    monkeypatch.setattr(module, "install_dummy_dma_bind", lambda: lambda: events.append("restore_bind"))
+    monkeypatch.setattr(module, "install_dummy_prepare", lambda: pytest.fail("must keep preparation"))
+    monkeypatch.setattr(module, "synchronize_boundary", lambda: None)
+    worker = Worker()
+    plan = module.make_capture_plan(4096, 4096)
+    plan["dummy_dma_bind"] = True
+    module.install_chunk_profile(worker, "80k_on", plan)
+    worker.execute_model(NS(total_num_scheduled_tokens=4096))
+    module.finish_chunk_profile(worker)
+    assert events == ["restore_bind", "restore_dma"]

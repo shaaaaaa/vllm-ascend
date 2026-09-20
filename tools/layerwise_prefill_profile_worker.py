@@ -150,6 +150,18 @@ def install_dummy_prepare():
     return restore
 
 
+def install_dummy_dma_bind():
+    from lmcache_ascend.v1.npu_connector import npu_connectors
+
+    original = npu_connectors.bind_copy_addresses
+
+    def dummy(*args, **kwargs):
+        return []
+
+    npu_connectors.bind_copy_addresses = dummy
+    return lambda: setattr(npu_connectors, "bind_copy_addresses", original)
+
+
 def install_transfer_attribution():
     import sys
 
@@ -181,6 +193,35 @@ def install_transfer_attribution():
         connector = sys.modules.get("lmcache_ascend.v1.npu_connector.npu_connectors")
         if connector is not None:
             install_dma_diagnostics(ranges, connector.lmc_ops)
+            # Attribute preparation in the real request as well as the
+            # isolated probe. These functions return normally (not generators).
+            for owner, names in (
+                (connector, ("_prefill_dma_plans", "_cached_layerwise_slot_mapping")),
+                (
+                    getattr(connector, "VLLMPagedMemLayerwiseNPUConnector", None),
+                    (
+                        "_append_sparse_chunk_ptr_rows",
+                        "_layer_page_pointer_rows",
+                        "_check_layerwise_transfer_invariants",
+                    ),
+                ),
+                (
+                    getattr(
+                        sys.modules.get("lmcache.integration.vllm.vllm_v1_adapter"), "LMCacheConnectorV1Impl", None
+                    ),
+                    ("start_load_kv", "_materialize_layerwise_prefill_slot_mappings", "_prime_dense_prefix_retrievers"),
+                ),
+                (
+                    getattr(sys.modules.get("lmcache_ascend.v1.cache_engine"), "AscendLMCacheEngine", None),
+                    ("_append_retrieve_group_cache",),
+                ),
+            ):
+                for name in names:
+                    if owner is not None and hasattr(owner, name):
+                        # Static helper needs to retain its descriptor semantics.
+                        if name == "_prime_dense_prefix_retrievers":
+                            continue
+                        ranges.wrap(owner, name, "prepare/" + name)
         return ranges
     except BaseException:
         ranges.restore()
@@ -221,9 +262,18 @@ class ChunkProfileCapture:
         self.attribution = None
         # Install before the request, including all unprofiled middle chunks.
         dummy_prepare = plan.get("dummy_prepare", False)
-        self.restore_dma = install_dummy_dma() if plan.get("dummy_dma", False) or dummy_prepare else None
+        dummy_bind = plan.get("dummy_dma_bind", False)
+        self.restore_dma = install_dummy_dma() if plan.get("dummy_dma", False) or dummy_prepare or dummy_bind else None
+        self.restore_bind = None
         self.restore_prepare = None
         try:
+            if dummy_bind:
+                self.restore_bind = install_dummy_dma_bind()
+                print(
+                    f"{PREFIX} rank={worker.rank}: DUMMY DMA BIND; "
+                    "bind_copy_addresses returns []; other preparation retained",
+                    flush=True,
+                )
             if dummy_prepare:
                 self.restore_prepare = install_dummy_prepare()
                 print(
@@ -232,6 +282,8 @@ class ChunkProfileCapture:
                     flush=True,
                 )
         except BaseException:
+            if self.restore_bind:
+                self.restore_bind()
             if self.restore_dma:
                 self.restore_dma()
             raise
@@ -286,6 +338,9 @@ class ChunkProfileCapture:
             self.stop_window()
         finally:
             self.worker.execute_model = self.original_execute
+            if self.restore_bind is not None:
+                self.restore_bind()
+                self.restore_bind = None
             if self.restore_prepare is not None:
                 self.restore_prepare()
                 self.restore_prepare = None
