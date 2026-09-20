@@ -12,6 +12,7 @@ time alone cannot prove device-side overlap.
 import argparse
 import json
 import math
+import os
 import statistics
 import tempfile
 from pathlib import Path
@@ -153,6 +154,17 @@ def trace_candidates(path):
     return matches
 
 
+def register_custom_kernels():
+    # A standalone script does not go through vLLM's platform initialization.
+    # Importing vllm_ascend_C only registers the torch operator; the CANN
+    # kernel binaries are found through ASCEND_CUSTOM_OPP_PATH, which normal
+    # vLLM startup sets via NPUPlatform.import_kernels(). Do this before the
+    # first NPU allocation/operator call.
+    from vllm_ascend.platform import NPUPlatform
+
+    NPUPlatform.import_kernels()
+
+
 def main():
     args = arguments()
     validate(args)
@@ -165,10 +177,13 @@ def main():
             raise ValueError(f"Output directory must be empty: {root}")
     print(f"[DMA_SFA] results: {root}", flush=True)
 
+    register_custom_kernels()
+
     import torch
     import torch_npu
     import vllm_ascend.vllm_ascend_C  # noqa: F401 - registers the actual SFA operator
 
+    print(f"[DMA_SFA] ASCEND_CUSTOM_OPP_PATH={os.environ.get('ASCEND_CUSTOM_OPP_PATH', '<unset>')}", flush=True)
     torch.npu.set_device(args.device)
     device = torch.device(f"npu:{args.device}")
     inputs = make_sfa_inputs(torch, args, device)
@@ -189,7 +204,12 @@ def main():
     try:
         run_once(torch, "sfa", "h2d", inputs, host, npu_buffer, compute_stream, copy_stream)
     except Exception as exc:
-        raise RuntimeError("Real npu_sparse_flash_attention smoke test failed; no substitute kernel was used") from exc
+        raise RuntimeError(
+            "Real npu_sparse_flash_attention smoke test failed; no substitute kernel was used. "
+            "If CANN reports 'The binary bin not found', check that the installed "
+            "vllm-ascend custom-ops package contains SparseFlashAttention for this NPU "
+            "and that ASCEND_CUSTOM_OPP_PATH above points to its vendor directory."
+        ) from exc
 
     for direction in directions:
         timings = {}
