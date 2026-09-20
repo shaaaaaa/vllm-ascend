@@ -757,8 +757,8 @@ def layerwise_prefill_transfer_window_supported() -> bool:
     return capability is True and callable(submit_load) and callable(finish_save)
 
 
-def maybe_submit_layerwise_prefill_load(layer_name: str) -> bool:
-    """Submit the load following ``layer_name`` when explicitly supported."""
+def maybe_submit_layerwise_prefill_load(layer_name: str | int) -> bool:
+    """Submit N+2; ``-1`` is the first-layer, load-only trigger."""
     if not has_kv_transfer_group() or not is_v1_kv_transfer_group():
         return False
 

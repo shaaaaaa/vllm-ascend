@@ -49,4 +49,15 @@ python -u tools/layerwise_prefill_profile.py --analyse-only /path/to/layerwise-p
 
 若长输入看似卡住，先看最后一条 `[PREFILL_PROFILE]`：`loading full model` 表示仍在初始化；`generate begin` 表示正在执行 prefill/KV 传输和首 token；`model shutdown begin` 表示退出模型进程；`exporting ... traces` 表示离线解析。80k 的中间 chunk 仍执行，只是不采集，因此不能仅凭 profile 文件数量判断是否卡在计算。
 
+要定位每个 chunk 开头的等待，可单独运行诊断采集：
+
+```bash
+python -u tools/layerwise_prefill_profile.py --diagnose-chunk-start 2>&1 | tee log.log
+grep -aF '[PREFILL_START]' log.log
+```
+
+诊断日志按 `start_load_kv_total`、`materialize_bank_maps`、`retrieve_setup_before_prime`、首两层各组的 `prime_retriever`、`dma_plan`、`second_bank_submit`、`store_chunk_scan` 和 `prime_storer` 拆分主机时间，并记录历史 token 数和已有/新存储 chunk 数。`first_bank_wait` 额外记录首层消费 bank 时的设备等待时间，可区分 CPU 准备和 H2D 尚未完成。该选项只影响本次子进程，不在默认 profile 或生产路径打日志；为读出首层设备事件，诊断模式会在首层等待后同步一次，故诊断采集的性能数字不能直接与正常采集比较。
+
+ON 路径在 chunk 准备阶段只提交第 0 层加载；首层 SFA 入口以虚拟 N=-1 触发第 1 层异步加载（不保存或计算虚拟层），后续仍按 N+2 提交。因此 `second_bank_submit` 现在发生在首层 forward 入口，而非 `start_load_kv_total` 内。
+
 比较重叠时，查看同一 worker 的 compute、copy/DMA 和 HCCL 设备时间线；不要把 CPU 侧 `AscendCL@hcom_allReduce` API 区间直接当作 NPU 通信执行区间。ON 的下一层读取对应 bank 前仍须等待 H2D 完成。提交时机允许与其他工作重叠，但实际效果取决于设备资源竞争。

@@ -87,6 +87,10 @@ def parser():
     cli.add_argument("--devices", default="0,1,2,3,4,5,6,7")
     cli.add_argument("--prompt-file", type=Path, help="Override the fixed 10k/80k example article")
     cli.add_argument("--cpu-cache-gb", type=float, default=24, help="Requires this much free /dev/shm and host RAM")
+    cli.add_argument(
+        "--diagnose-chunk-start", action="store_true",
+        help="Log host setup stages at each prefill chunk; opt-in profiling overhead",
+    )
     selection = cli.add_mutually_exclusive_group()
     selection.add_argument(
         "--case", choices=("all", *CASES), default="80k_on", help="Default: 80k ON; all: 80k OFF then ON"
@@ -204,6 +208,7 @@ def case_environment(args, case):
             "LMCACHE_SAVE_UNFULL_CHUNK": "true",
             "LMCACHE_SAVE_FULL_CHUNK_IN_DECODE": "false",
             "LMCACHE_LAYERWISE_PREFILL_DMA": "1" if case.endswith("_on") else "0",
+            "LMCACHE_PREFILL_START_TIMING": "1" if args.diagnose_chunk_start else "0",
             "LMCACHE_ENABLE_SHARED_CPU_CACHE": "true",
             "LMCACHE_SHARED_CPU_CACHE_STRICT": "true",
             "LMCACHE_SHARED_CPU_CACHE_PASSIVE_WRITABLE": "true",

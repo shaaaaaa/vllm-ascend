@@ -1954,9 +1954,10 @@ class AscendSFAImpl(MLAAttentionImpl):
             self.is_kv_producer and envs.VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE
         )
         self.layer_name = kwargs.get("layer_name")
-        _, layer_end = self.vllm_config.model_config.get_layers_start_end_indices(
+        layer_start, layer_end = self.vllm_config.model_config.get_layers_start_end_indices(
             self.vllm_config.parallel_config
         )
+        self._first_layerwise_prefill_layer_index = layer_start
         self._last_layerwise_prefill_layer_index = layer_end - 1
         self._last_layerwise_prefill_layer = (
             self.layer_name is not None
@@ -4779,6 +4780,14 @@ class AscendSFAImpl(MLAAttentionImpl):
             if self._layerwise_prefill_p_node
             else None
         )
+        is_first_transfer_layer = transfer_context is not None and (
+            f".layers.{self._first_layerwise_prefill_layer_index}."
+            in f".{layer_name}"
+        )
+        if is_first_transfer_layer:
+            # Virtual source N=-1: only enqueue L1 H2D. L0 was prepared by
+            # start_load_kv; L1's transfer can overlap L0 SFA on the NPU.
+            maybe_submit_layerwise_prefill_load(-1)
         pending_transfers = (
             transfer_context.pop("sfa_layerwise_prefill_pending", None)
             if transfer_context is not None

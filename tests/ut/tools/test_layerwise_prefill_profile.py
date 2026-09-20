@@ -139,6 +139,15 @@ def test_off_on_environment_diff_is_only_feature_switch(tool, monkeypatch):
     assert on["MSMONITOR_USE_DAEMON"] == "0"
 
 
+def test_chunk_start_diagnostics_are_opt_in(tool):
+    ordinary = tool.case_environment(tool.parser().parse_args([]), "80k_on")
+    diagnostic = tool.case_environment(
+        tool.parser().parse_args(["--diagnose-chunk-start"]), "80k_on"
+    )
+    assert ordinary["LMCACHE_PREFILL_START_TIMING"] == "0"
+    assert diagnostic["LMCACHE_PREFILL_START_TIMING"] == "1"
+
+
 def test_clear_shm_removes_all_nonhidden_entries(tool, tmp_path):
     (tmp_path / "lmcache_shared_memory").write_bytes(b"cache")
     (tmp_path / "vllm_shared_memory").write_bytes(b"cache")
