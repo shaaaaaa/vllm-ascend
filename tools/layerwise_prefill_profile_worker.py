@@ -34,11 +34,82 @@ class TransferAttribution:
         self.patches.clear()
 
 
+def install_dma_diagnostics(ranges, ops):
+    import inspect
+    import json
+    import os
+    import time
+
+    if getattr(ops.layerwise_prefill_dma_copy, "dummy_dma", False):
+        ranges.wrap(ops, "layerwise_prefill_dma_copy", lambda *a, **kw: "DUMMY/" + dma_range_label(*a, **kw))
+        return
+
+    diagnose = getattr(ops, "layerwise_prefill_dma_copy_diagnose", None)
+    if diagnose is None:
+        raise RuntimeError(
+            "DMA diagnostics require rebuilding LMCache-Ascend (missing layerwise_prefill_dma_copy_diagnose)"
+        )
+    original = ops.layerwise_prefill_dma_copy
+
+    def traced(copies, device_to_host):
+        # Read only the Python caller's scalar bookkeeping, never tensors.
+        frame = inspect.currentframe()
+        try:
+            caller = frame.f_back.f_locals
+            context = {key: caller.get(key) for key in ("layer_id", "kv_group", "bank")}
+        finally:
+            del frame
+            del caller
+        started = time.perf_counter()
+        with ranges.record_function("PREFILL_ATTR/" + dma_range_label(copies, device_to_host)):
+            stream_us, stream, copy_us = diagnose(copies, device_to_host)
+        elapsed_ms = (time.perf_counter() - started) * 1000
+        slowest = sorted(range(len(copy_us)), key=copy_us.__getitem__, reverse=True)[:5]
+
+        def segment(i):
+            dst, src, size = copies[i]
+            return dict(index=i, us=round(copy_us[i], 3), src=hex(src), dst=hex(dst), bytes=size)
+
+        report = dict(
+            pid=os.getpid(),
+            direction="D2H" if device_to_host else "H2D",
+            **context,
+            stream=hex(stream),
+            stream_us=round(stream_us, 3),
+            native_call_ms=round(elapsed_ms, 3),
+            memcpy_sum_us=round(sum(copy_us), 3),
+            segments=len(copies),
+            bytes=sum(c[2] for c in copies),
+            first=segment(0) if copies else None,
+            slowest=[segment(i) for i in slowest],
+            calls_over_1ms=sum(t >= 1000 for t in copy_us),
+            src_range=[hex(min(c[1] for c in copies)), hex(max(c[1] + c[2] for c in copies))] if copies else [],
+            dst_range=[hex(min(c[0] for c in copies)), hex(max(c[0] + c[2] for c in copies))] if copies else [],
+        )
+        print("[PREFILL_DMA] " + json.dumps(report, separators=(",", ":")), flush=True)
+
+    ranges.patches.append((ops, "layerwise_prefill_dma_copy", original))
+    ops.layerwise_prefill_dma_copy = traced
+
+
 def dma_range_label(copies, device_to_host):
     # These are Python address/size tuples already prepared by the connector.
     # One range per batch, NOT per segment. No tensor access or stream query.
     direction = "D2H" if device_to_host else "H2D"
     return f"dma_submit/{direction}/segments={len(copies)}/bytes={sum(c[2] for c in copies)}"
+
+
+def install_dummy_dma():
+    import lmcache_ascend.c_ops as ops
+
+    original = ops.layerwise_prefill_dma_copy
+
+    def dummy(copies, device_to_host):
+        pass
+
+    dummy.dummy_dma = True
+    ops.layerwise_prefill_dma_copy = dummy
+    return lambda: setattr(ops, "layerwise_prefill_dma_copy", original)
 
 
 def install_transfer_attribution():
@@ -71,7 +142,7 @@ def install_transfer_attribution():
                 ranges.wrap(ops, name, name)
         connector = sys.modules.get("lmcache_ascend.v1.npu_connector.npu_connectors")
         if connector is not None:
-            ranges.wrap(connector.lmc_ops, "layerwise_prefill_dma_copy", dma_range_label)
+            install_dma_diagnostics(ranges, connector.lmc_ops)
         return ranges
     except BaseException:
         ranges.restore()
@@ -110,6 +181,10 @@ class ChunkProfileCapture:
         self.chunks = []
         self.tokens = 0
         self.attribution = None
+        # Install before the request, including all unprofiled middle chunks.
+        self.restore_dma = install_dummy_dma() if plan.get("dummy_dma", False) else None
+        if self.restore_dma:
+            print(f"{PREFIX} rank={worker.rank}: DUMMY DMA enabled for entire request; outputs INVALID", flush=True)
 
     def stop_window(self):
         if self.active is not None:
@@ -159,6 +234,9 @@ class ChunkProfileCapture:
             self.stop_window()
         finally:
             self.worker.execute_model = self.original_execute
+            if self.restore_dma is not None:
+                self.restore_dma()
+                self.restore_dma = None
         return {"rank": self.worker.rank, "windows": self.recorded_windows, "chunks": self.chunks}
 
 

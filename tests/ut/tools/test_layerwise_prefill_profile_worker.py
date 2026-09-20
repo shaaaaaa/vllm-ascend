@@ -221,13 +221,16 @@ def test_real_installer_wraps_dma_and_restores_on_failure(monkeypatch):
         wait_for_kv_layer_from_connector=operation,
     )
     ops = NS(npu_lightning_indexer=operation, npu_lightning_indexer_quant=operation)
-    dma = NS(layerwise_prefill_dma_copy=operation)
+    dma = NS(
+        layerwise_prefill_dma_copy=operation,
+        layerwise_prefill_dma_copy_diagnose=lambda copies, direction: (12.0, 1234, [2000.0] * len(copies)),
+    )
     monkeypatch.setitem(sys.modules, "torch", NS(profiler=NS(record_function=record), ops=NS(_C_ascend=ops)))
     monkeypatch.setitem(sys.modules, "vllm_ascend.attention.sfa_v1", sfa)
     monkeypatch.setitem(sys.modules, "lmcache_ascend.v1.npu_connector.npu_connectors", NS(lmc_ops=dma))
     ranges = tool.install_transfer_attribution()
     assert Impl().forward(layer_name="layer0") == "ok"
-    assert dma.layerwise_prefill_dma_copy([(1, 2, 64)], True) == "ok"
+    assert dma.layerwise_prefill_dma_copy([(1, 2, 64)], True) is None
     assert labels == ["PREFILL_ATTR/mla/layer0", "PREFILL_ATTR/dma_submit/D2H/segments=1/bytes=64"]
     ranges.restore()
     assert dma.layerwise_prefill_dma_copy is operation
@@ -239,3 +242,65 @@ def test_real_installer_wraps_dma_and_restores_on_failure(monkeypatch):
         tool.install_transfer_attribution()
     assert Impl.forward is operation
     assert ops.npu_lightning_indexer is operation
+
+
+def test_dma_diagnostic_context_and_slow_calls(module, capsys):
+    import json
+    from contextlib import nullcontext
+
+    calls = []
+
+    def diagnose(copies, direction):
+        calls.append((copies, direction))
+        return 10.0, 4096, [5.0, 2000000.0, 7.0]
+
+    original = lambda *a: None
+    ops = NS(layerwise_prefill_dma_copy=original, layerwise_prefill_dma_copy_diagnose=diagnose)
+    ranges = module.TransferAttribution(lambda name: nullcontext())
+    module.install_dma_diagnostics(ranges, ops)
+
+    def submit():
+        layer_id, kv_group, bank = 7, 0, 1  # noqa: F841 - inspected by diagnostic wrapper
+        ops.layerwise_prefill_dma_copy([(100, 200, 16), (300, 400, 32), (500, 600, 64)], False)
+
+    submit()
+    report = json.loads(capsys.readouterr().out.split("[PREFILL_DMA] ")[1])
+    assert (report["layer_id"], report["kv_group"], report["bank"]) == (7, 0, 1)
+    assert report["slowest"][0] == dict(index=1, us=2000000.0, src="0x190", dst="0x12c", bytes=32)
+    assert report["memcpy_sum_us"] == 2000012.0
+    assert report["calls_over_1ms"] == 1
+    assert report["bytes"] == 112
+    assert len(calls) == 1
+    ranges.restore()
+    assert ops.layerwise_prefill_dma_copy is original
+
+
+def test_dummy_dma_skips_native_for_whole_request_and_restores(module, monkeypatch):
+    import sys
+    from contextlib import nullcontext
+
+    native_calls = []
+    original = lambda *args: native_calls.append(args)
+    ops = NS(layerwise_prefill_dma_copy=original)
+    monkeypatch.setitem(sys.modules, "lmcache_ascend", NS(c_ops=ops))
+    monkeypatch.setitem(sys.modules, "lmcache_ascend.c_ops", ops)
+    monkeypatch.setattr(module, "synchronize_boundary", lambda: None)
+
+    def attribution():
+        ranges = module.TransferAttribution(lambda name: nullcontext())
+        # No diagnostic C++ binary needed in dummy mode.
+        module.install_dma_diagnostics(ranges, ops)
+        return ranges
+
+    monkeypatch.setattr(module, "install_transfer_attribution", attribution)
+    worker = Worker()
+    plan = module.make_capture_plan(80000, 4096)
+    plan["dummy_dma"] = True
+    module.install_chunk_profile(worker, "80k_on", plan)
+    for chunk in range(20):
+        worker.execute_model(NS(total_num_scheduled_tokens=min(4096, 80000 - chunk * 4096)))
+        ops.layerwise_prefill_dma_copy([(1, 2, 64)], False)
+        ops.layerwise_prefill_dma_copy([(1, 2, 64)], True)
+    assert not native_calls
+    module.finish_chunk_profile(worker)
+    assert ops.layerwise_prefill_dma_copy is original

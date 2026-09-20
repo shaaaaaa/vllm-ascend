@@ -83,21 +83,23 @@ def check_shm_capacity(shm_dir: Path, cache_gb: float) -> None:
 
 def parser():
     cli = argparse.ArgumentParser(description=__doc__)
+    cli.add_argument(
+        "--dummy-dma", action="store_true", help="Skip layerwise KV DMA only; outputs are invalid (diagnostic run)"
+    )
     cli.add_argument("--model", default="/workspace/models/GLM-5.2-w4a8c8-0723")
     cli.add_argument("--devices", default="0,1,2,3,4,5,6,7")
     cli.add_argument("--prompt-file", type=Path, help="Override the fixed 10k/80k example article")
     cli.add_argument("--cpu-cache-gb", type=float, default=24, help="Requires this much free /dev/shm and host RAM")
     cli.add_argument(
-        "--diagnose-chunk-start", action="store_true",
+        "--diagnose-chunk-start",
+        action="store_true",
         help="Log host setup stages at each prefill chunk; opt-in profiling overhead",
     )
     selection = cli.add_mutually_exclusive_group()
     selection.add_argument(
         "--case", choices=("all", *CASES), default="80k_on", help="Default: 80k ON; all: 80k OFF then ON"
     )
-    selection.add_argument(
-        "--include-off", action="store_const", dest="case", const="all", help="Run 80k OFF then ON"
-    )
+    selection.add_argument("--include-off", action="store_const", dest="case", const="all", help="Run 80k OFF then ON")
     cli.add_argument("--run-dir", type=Path, help="New, empty results directory")
     cli.add_argument(
         "--analyse-only", type=Path, help="Export an existing run's raw profiles without loading the model"
@@ -267,8 +269,10 @@ def engine_options(args, case_dir, prompt_len):
     }
 
 
-def capture_request(llm, token_ids, params, case, case_dir=None):
-    plan = make_capture_plan(len(token_ids), COMPUTE_CHUNK_TOKENS) if case in LONG_CASES else None
+def capture_request(llm, token_ids, params, case, case_dir=None, dummy_dma=False):
+    plan = make_capture_plan(len(token_ids), COMPUTE_CHUNK_TOKENS) if case in LONG_CASES or dummy_dma else None
+    if dummy_dma:
+        plan["dummy_dma"] = True
     if plan:
         write_json(case_dir / "capture_plan.json", plan)
         print(f"{PREFIX} {case}: capture windows={plan['windows']}; middle chunks still compute", flush=True)
@@ -315,11 +319,18 @@ def run_child(args):
     try:
         print(f"{PREFIX} {args.child}: capturing {prompt['length']} input tokens -> first output token", flush=True)
         results, elapsed = capture_request(
-            llm, prompt["token_ids"], SamplingParams(temperature=0, seed=1024, max_tokens=1), args.child, case_dir
+            llm,
+            prompt["token_ids"],
+            SamplingParams(temperature=0, seed=1024, max_tokens=1),
+            args.child,
+            case_dir,
+            dummy_dma=args.dummy_dma,
         )
         result = results[0]
         completion = result.outputs[0]
         report = {
+            "dummy_dma": args.dummy_dma,
+            "output_valid_for_correctness": not args.dummy_dma,
             "case": args.child,
             "prompt_tokens": prompt["length"],
             "num_cached_tokens": result.num_cached_tokens,
@@ -397,6 +408,8 @@ def run_cases(args, root, cases):
             str(args.cpu_cache_gb),
         ]
         env = case_environment(args, case)
+        if args.dummy_dma:
+            command.append("--dummy-dma")
         write_json(case_dir / "environment.json", {k: v for k, v in env.items() if k.startswith(("LMCACHE_", "VLLM_"))})
         proc = start_logged_process(command, env, case_dir / "server.log", case, prefix=PREFIX)
         try:
