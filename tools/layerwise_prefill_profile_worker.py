@@ -10,6 +10,74 @@ EDGE_CHUNKS = 3
 PREFIX = "[PREFILL_PROFILE]"
 
 
+class TransferAttribution:
+    """Temporary CPU profiler ranges; never synchronize or inspect device data."""
+
+    def __init__(self, record_function):
+        self.record_function = record_function
+        self.patches = []
+
+    def wrap(self, owner, name, label):
+        original = getattr(owner, name)
+
+        def traced(*args, **kwargs):
+            title = label(*args, **kwargs) if callable(label) else label
+            with self.record_function("PREFILL_ATTR/" + title):
+                return original(*args, **kwargs)
+
+        self.patches.append((owner, name, original))
+        setattr(owner, name, traced)
+
+    def restore(self):
+        for owner, name, original in reversed(self.patches):
+            setattr(owner, name, original)
+        self.patches.clear()
+
+
+def dma_range_label(copies, device_to_host):
+    # These are Python address/size tuples already prepared by the connector.
+    # One range per batch, NOT per segment. No tensor access or stream query.
+    direction = "D2H" if device_to_host else "H2D"
+    return f"dma_submit/{direction}/segments={len(copies)}/bytes={sum(c[2] for c in copies)}"
+
+
+def install_transfer_attribution():
+    import sys
+
+    import torch
+
+    ranges = TransferAttribution(torch.profiler.record_function)
+    try:
+        sfa = sys.modules["vllm_ascend.attention.sfa_v1"]
+        ranges.wrap(sfa.AscendSFAImpl, "forward", lambda self, layer_name, *a, **kw: f"mla/{layer_name}")
+        for name in (
+            "exec_kv",
+            "indexer_select_pre_process",
+            "indexer_select_post_process",
+            "_update_indexcache_topk_indices",
+            "_get_indexcache_topk_indices",
+        ):
+            ranges.wrap(sfa.AscendSFAImpl, name, name)
+        for name in ("maybe_submit_layerwise_prefill_load", "wait_for_kv_layer_from_connector"):
+            ranges.wrap(sfa, name, lambda layer_name, *a, _name=name, **kw: f"{_name}/{layer_name}")
+        ranges.wrap(sfa.torch_npu, "npu_scatter_nd_update_", "indexer_cache_write")
+        if hasattr(sfa.torch_npu, "npu_lightning_indexer"):
+            ranges.wrap(sfa.torch_npu, "npu_lightning_indexer", "native_lightning_indexer")
+        # The plain custom-op invocation is nested inside post_process, so
+        # internal ACLNN copies can be distinguished from connector DMA.
+        ops = torch.ops._C_ascend
+        for name in ("npu_lightning_indexer", "npu_lightning_indexer_quant"):
+            if hasattr(ops, name):
+                ranges.wrap(ops, name, name)
+        connector = sys.modules.get("lmcache_ascend.v1.npu_connector.npu_connectors")
+        if connector is not None:
+            ranges.wrap(connector.lmc_ops, "layerwise_prefill_dma_copy", dma_range_label)
+        return ranges
+    except BaseException:
+        ranges.restore()
+        raise
+
+
 def synchronize_boundary():
     # Only four window boundaries, not every chunk/layer/kernel. Flush all
     # streams so unfinished middle-chunk work cannot leak into the tail trace.
@@ -41,12 +109,18 @@ class ChunkProfileCapture:
         self.recorded_windows = []
         self.chunks = []
         self.tokens = 0
+        self.attribution = None
 
     def stop_window(self):
         if self.active is not None:
             print(f"{PREFIX} rank={self.worker.rank}: {self.case}/{self.active} profiler stop begin", flush=True)
-            synchronize_boundary()
-            self.worker.profile(is_start=False)
+            try:
+                synchronize_boundary()
+                self.worker.profile(is_start=False)
+            finally:
+                if self.attribution is not None:
+                    self.attribution.restore()
+                    self.attribution = None
             # Worker.profile() otherwise restarts the OLD trace name. Each
             # segment needs a fresh profiler and a distinct head/tail handler.
             self.worker.profiler = None
@@ -71,6 +145,8 @@ class ChunkProfileCapture:
                     )
                     self.worker.profile(is_start=True, profile_prefix=f"{self.case}_{window}")
                     self.active = window
+                    self.attribution = install_transfer_attribution()
+                    print(f"{PREFIX} rank={self.worker.rank}: PREFILL_ATTR ranges enabled", flush=True)
                     self.recorded_windows.append(window)
             self.chunks.append(
                 {"chunk": chunk, "token_start": self.tokens, "token_end": self.tokens + count, "window": window}

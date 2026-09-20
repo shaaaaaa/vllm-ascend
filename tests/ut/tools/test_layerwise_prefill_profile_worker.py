@@ -11,7 +11,9 @@ import pytest
 @pytest.fixture
 def module(monkeypatch):
     monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[3] / "tools"))
-    return importlib.import_module("layerwise_prefill_profile_worker")
+    module = importlib.import_module("layerwise_prefill_profile_worker")
+    monkeypatch.setattr(module, "install_transfer_attribution", lambda: NS(restore=lambda: None))
+    return module
 
 
 class Worker:
@@ -121,3 +123,119 @@ def test_changed_chunk_schedule_is_reported_not_silently_mislabelled(module, mon
     report = module.finish_chunk_profile(worker)
     with pytest.raises(RuntimeError, match="actual prefill chunk layout differs"):
         module.validate_capture(plan, [report])
+
+
+def test_attribution_preserves_results_errors_and_restores(module):
+    from contextlib import contextmanager
+
+    events = []
+
+    @contextmanager
+    def record(label):
+        events.append(("begin", label))
+        try:
+            yield
+        finally:
+            events.append(("end", label))
+
+    def copy(copies, device_to_host):
+        events.append(("copy", copies, device_to_host))
+        return 42
+
+    owner = NS(copy=copy)
+    ranges = module.TransferAttribution(record)
+    ranges.wrap(owner, "copy", module.dma_range_label)
+    copies = [(1, 2, 1024), (3, 4, 2048)]
+    assert owner.copy(copies, device_to_host=False) == 42
+    assert events[0] == ("begin", "PREFILL_ATTR/dma_submit/H2D/segments=2/bytes=3072")
+    assert events[1] == ("copy", copies, False)
+    assert events[2][0] == "end"
+    ranges.restore()
+    assert owner.copy is copy
+    ranges.restore()
+
+    def fail():
+        raise ValueError("original error")
+
+    owner.fail = fail
+    ranges.wrap(owner, "fail", "failure")
+    with pytest.raises(ValueError, match="original error"):
+        owner.fail()
+    assert events[-1] == ("end", "PREFILL_ATTR/failure")
+    ranges.restore()
+    assert owner.fail is fail
+
+
+def test_attribution_only_installed_in_capture_windows(module, monkeypatch):
+    events = []
+    monkeypatch.setattr(module, "synchronize_boundary", lambda: None)
+
+    def install():
+        events.append("install")
+        return NS(restore=lambda: events.append("restore"))
+
+    monkeypatch.setattr(module, "install_transfer_attribution", install)
+    worker = Worker()
+    module.install_chunk_profile(worker, "80k_on", module.make_capture_plan(80000, 4096))
+    for chunk in range(20):
+        worker.execute_model(NS(total_num_scheduled_tokens=min(4096, 80000 - chunk * 4096)))
+        if chunk == 3:
+            assert events == ["install", "restore"]
+    module.finish_chunk_profile(worker)
+    assert events == ["install", "restore", "install", "restore"]
+
+
+def test_real_installer_wraps_dma_and_restores_on_failure(monkeypatch):
+    import sys
+    from contextlib import nullcontext
+
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[3] / "tools"))
+    tool = importlib.import_module("layerwise_prefill_profile_worker")
+    labels = []
+
+    def record(label):
+        labels.append(label)
+        return nullcontext()
+
+    def operation(*args, **kwargs):
+        return "ok"
+
+    class Impl:
+        pass
+
+    methods = (
+        "forward",
+        "exec_kv",
+        "indexer_select_pre_process",
+        "indexer_select_post_process",
+        "_update_indexcache_topk_indices",
+        "_get_indexcache_topk_indices",
+    )
+    for name in methods:
+        setattr(Impl, name, operation)
+    npu = NS(npu_scatter_nd_update_=operation, npu_lightning_indexer=operation)
+    sfa = NS(
+        AscendSFAImpl=Impl,
+        torch_npu=npu,
+        maybe_submit_layerwise_prefill_load=operation,
+        wait_for_kv_layer_from_connector=operation,
+    )
+    ops = NS(npu_lightning_indexer=operation, npu_lightning_indexer_quant=operation)
+    dma = NS(layerwise_prefill_dma_copy=operation)
+    monkeypatch.setitem(sys.modules, "torch", NS(profiler=NS(record_function=record), ops=NS(_C_ascend=ops)))
+    monkeypatch.setitem(sys.modules, "vllm_ascend.attention.sfa_v1", sfa)
+    monkeypatch.setitem(sys.modules, "lmcache_ascend.v1.npu_connector.npu_connectors", NS(lmc_ops=dma))
+    ranges = tool.install_transfer_attribution()
+    assert Impl().forward(layer_name="layer0") == "ok"
+    assert dma.layerwise_prefill_dma_copy([(1, 2, 64)], True) == "ok"
+    assert labels == ["PREFILL_ATTR/mla/layer0", "PREFILL_ATTR/dma_submit/D2H/segments=1/bytes=64"]
+    ranges.restore()
+    assert dma.layerwise_prefill_dma_copy is operation
+    assert Impl.forward is operation
+    assert npu.npu_scatter_nd_update_ is operation
+    # Installation failure must not leave partially wrapped production APIs.
+    del dma.layerwise_prefill_dma_copy
+    with pytest.raises(AttributeError):
+        tool.install_transfer_attribution()
+    assert Impl.forward is operation
+    assert ops.npu_lightning_indexer is operation
