@@ -119,12 +119,7 @@ def test_default_prepares_only_saved_long_example(tool, monkeypatch, tmp_path):
     ) == tool.DEFAULT_LONG_PROMPT_FILE.read_text(encoding="utf-8")
 
 
-@pytest.mark.parametrize("split_load", [None, "0", "1"])
-def test_off_on_environment_diff_is_only_feature_switch(tool, monkeypatch, split_load):
-    if split_load is None:
-        monkeypatch.delenv("LMCACHE_ASCEND_PREFILL_SPLIT_LOAD", raising=False)
-    else:
-        monkeypatch.setenv("LMCACHE_ASCEND_PREFILL_SPLIT_LOAD", split_load)
+def test_off_on_environment_diff_is_only_feature_switch(tool, monkeypatch):
     for key in ("LMCACHE_CONFIG_FILE", "LMCACHE_REMOTE_URL", "LMCACHE_EXTRA_CONFIG", "VLLM_PREFILL_CHECK_TRACE_DIR"):
         monkeypatch.setenv(key, "inherited-debug-config")
     args = tool.parser().parse_args([])
@@ -137,16 +132,6 @@ def test_off_on_environment_diff_is_only_feature_switch(tool, monkeypatch, split
     assert "VLLM_PREFILL_CHECK_TRACE_DIR" not in on
     assert json.loads(on["LMCACHE_EXTRA_CONFIG"]) == {"save_only_first_rank": True}
     assert on["MSMONITOR_USE_DAEMON"] == "0"
-    assert on["LMCACHE_ASCEND_PREFILL_SPLIT_LOAD"] == ("1" if split_load is None else split_load)
-
-
-def test_profile_default_does_not_change_production_default(tool, monkeypatch):
-    monkeypatch.delenv("LMCACHE_ASCEND_PREFILL_SPLIT_LOAD", raising=False)
-    assert tool.envs.LMCACHE_ASCEND_PREFILL_SPLIT_LOAD is False
-    env = tool.case_environment(tool.parser().parse_args([]), "100k_on")
-    assert env["LMCACHE_ASCEND_PREFILL_SPLIT_LOAD"] == "1"
-    assert "LMCACHE_ASCEND_PREFILL_SPLIT_LOAD" not in tool.os.environ
-    assert tool.envs.LMCACHE_ASCEND_PREFILL_SPLIT_LOAD is False
 
 
 @pytest.mark.parametrize("prompt_len, expected_max", [(9999, 16384), (10000, 16384), (100000, 100352)])
@@ -263,15 +248,7 @@ def test_child_only_requests_first_token_and_shuts_down(tool, monkeypatch, tmp_p
     assert json.loads((case_dir / "result.json").read_text())["token_ids"] == [42]
 
 
-@pytest.mark.parametrize("split_load", [None, "0", "1"])
-def test_sequential_cases_release_model_before_analysis_and_next_launch(
-    tool, monkeypatch, tmp_path, split_load, capsys
-):
-    if split_load is None:
-        monkeypatch.delenv("LMCACHE_ASCEND_PREFILL_SPLIT_LOAD", raising=False)
-    else:
-        monkeypatch.setenv("LMCACHE_ASCEND_PREFILL_SPLIT_LOAD", split_load)
-    expected_split_load = "1" if split_load is None else split_load
+def test_sequential_cases_release_model_before_analysis_and_next_launch(tool, monkeypatch, tmp_path):
     events = []
     args = tool.parser().parse_args(["--include-off"])
     assert args.case == "all"
@@ -281,7 +258,6 @@ def test_sequential_cases_release_model_before_analysis_and_next_launch(
         events.append((label, "start"))
         assert command[command.index("--child") + 1] == label
         assert env["VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE"] == str(label.endswith("_on")).lower()
-        assert env["LMCACHE_ASCEND_PREFILL_SPLIT_LOAD"] == expected_split_load
         assert log == tmp_path / label / "server.log"
         return NS(label=label, wait=lambda: events.append((label, "wait")) or 0)
 
@@ -290,10 +266,6 @@ def test_sequential_cases_release_model_before_analysis_and_next_launch(
     monkeypatch.setattr(tool, "analyse_case", lambda p: events.append((p.name, "analyse")))
     tool.run_cases(args, tmp_path, tool.LONG_CASES)
     assert events == [(case, action) for case in tool.LONG_CASES for action in ("start", "wait", "finish", "analyse")]
-    for case in tool.LONG_CASES:
-        saved = json.loads((tmp_path / case / "environment.json").read_text())
-        assert saved["LMCACHE_ASCEND_PREFILL_SPLIT_LOAD"] == expected_split_load
-    assert capsys.readouterr().out.count(f"LMCACHE_ASCEND_PREFILL_SPLIT_LOAD={expected_split_load}") == 2
 
 
 @pytest.mark.parametrize(

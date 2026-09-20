@@ -49,10 +49,6 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE": lambda: _strict_bool_env(
         "VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE"
     ),
-    # External LMCache-Ascend experimental H2D switch; non-sensitive, 0/1.
-    # Default 0: unchanged. 1: P-only D2H then <=16384-token H2D, low-priority FIFO.
-    # Shared name with LMCache-Ascend so standalone connector tests can use it.
-    "LMCACHE_ASCEND_PREFILL_SPLIT_LOAD": lambda: os.getenv("LMCACHE_ASCEND_PREFILL_SPLIT_LOAD", "0") == "1",
     # max compile thread number for package building. Usually, it is set to
     # the number of CPU cores. If not set, the default value is None, which
     # means all number of CPU cores will be used.

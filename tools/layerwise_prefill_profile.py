@@ -6,8 +6,6 @@ Local LMCache CPU storage only: no Mooncake, file SDK shim, D node or KV probes.
 Each case uses a fresh model process and executes one request through its first
 output token. 100k captures only the first/last three compute-prefill chunks;
 10k captures the whole request. Model startup is outside capture.
-Short-kernel low-priority H2D is enabled by default in this tool only; set
-LMCACHE_ASCEND_PREFILL_SPLIT_LOAD=0 to profile the original load path.
 """
 
 import argparse
@@ -27,8 +25,6 @@ from layerwise_prefill_profile_worker import (
     make_capture_plan,
     validate_capture,
 )
-
-from vllm_ascend import envs
 
 CASES = ("10k_off", "10k_on", "100k_off", "100k_on")
 LONG_CASES = ("100k_off", "100k_on")
@@ -154,11 +150,6 @@ def case_environment(args, case):
             "VLLM_ASCEND_SFA_STAGED_GRAPH": "0",
             "VLLM_ASCEND_SFA_FULL_GRAPH": "0",
             "LMCACHE_CHUNK_SIZE": str(CACHE_CHUNK_TOKENS),
-            # Tool-only default ON. Honor an explicit override without changing
-            # the connector's production default (OFF).
-            "LMCACHE_ASCEND_PREFILL_SPLIT_LOAD": str(
-                int("LMCACHE_ASCEND_PREFILL_SPLIT_LOAD" not in os.environ or envs.LMCACHE_ASCEND_PREFILL_SPLIT_LOAD)
-            ),
             "LMCACHE_LOCAL_CPU": "true",
             "LMCACHE_MAX_LOCAL_CPU_SIZE": str(args.cpu_cache_gb),
             "LMCACHE_USE_LAYERWISE": "true",
@@ -352,11 +343,6 @@ def run_cases(args, root, cases):
             str(args.cpu_cache_gb),
         ]
         env = case_environment(args, case)
-        print(
-            f"{PREFIX} {case}: LMCACHE_ASCEND_PREFILL_SPLIT_LOAD="
-            f"{env['LMCACHE_ASCEND_PREFILL_SPLIT_LOAD']}; P historical H2D only",
-            flush=True,
-        )
         write_json(case_dir / "environment.json", {k: v for k, v in env.items() if k.startswith(("LMCACHE_", "VLLM_"))})
         proc = start_logged_process(command, env, case_dir / "server.log", case, prefix=PREFIX)
         try:

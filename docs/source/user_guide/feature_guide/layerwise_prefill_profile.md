@@ -59,7 +59,7 @@ token 范围 `[0, 12288)`；`tail` 抓第 23–25 个，范围 `[90112, 100000)`
 
 工具在模型加载后通过 worker RPC 安装采集包装，不改正常服务代码，不改变调度或 KV 传输。
 每段开始/结束各同步一次 NPU（两段共 4 次），避免未完成的中间工作进入尾段 trace；
-不在每层、每个 chunk 或短 kernel 之间额外同步。窗口边界有 profiler 启停及同步开销，
+不在每层或每个 chunk 之间额外同步。窗口边界有 profiler 启停及同步开销，
 不要用边界空白衡量正常流水线，也不要把分段 profile 当成连续整段计时。
 记录所有实际 chunk 的 token 范围，结束后核对固定 4096-token 调度是否与计划一致；
 若不一致，保存报告并报错，不把不准确的窗口当作成功。
@@ -117,34 +117,10 @@ python -u tools/layerwise_prefill_profile.py --analyse-only /path/to/layerwise-p
 
 ## 检查传输与通信重叠
 
-本 profile 脚本默认开启实验性的短 kernel 低优先级回载；生产 connector 的默认值仍是 `0`。
-显式设置 `LMCACHE_ASCEND_PREFILL_SPLIT_LOAD=0` 可关闭该实验，设置 `1` 则开启。
-只影响 P-node 的逐层传输：本层 SFA 结束后，尽早把本层 D2H 和下一层 H2D
-按顺序提交到同一个低优先级 FIFO，不再等 `o_proj` 的 all-reduce 前才提交。
-D2H 保留原单 kernel（通常只保存本轮新计算的 4096 token），H2D 按最多 16384 token
-拆分；计算仅等待对应层的完成事件，不等待整个队列。D 节点、远端发布路径不变。
-需要先重新编译安装 LMCache-Ascend。
-脚本会打印实际开关值并写入每个 case 的 `environment.json`，不修改父进程环境。
-比较拆分效果时，两次都使用 `100k_on`，只切这个开关：
-
-```bash
-LMCACHE_ASCEND_PREFILL_SPLIT_LOAD=0 python -u tools/layerwise_prefill_profile.py --case 100k_on --cpu-cache-gb 32
-python -u tools/layerwise_prefill_profile.py --case 100k_on --cpu-cache-gb 32
-```
-
-初始化仅一次查询优先级支持范围；不支持则明确报错，不静默用普通流代替。
-CANN 8.5 对 A2/A3 的 stream priority 标为预留参数，不能保证服务器支持该实验。
-先在 LMCache-Ascend 执行 `python -u tools/check_prefill_split_load.py --probe-only`，
-无需加载模型即可确认 API 能力。低优先级不能抢占已执行的 kernel，也不保证只在空闲时运行。
-新增开销：每次 D2H/H2D 各两次 record、两次设备侧 stream wait；每个 H2D 分片一次
-kernel launch；每轮每组一次保存 metadata 的跨流就绪等待。D2H 不增加 kernel 数量，
-没有逐片 CPU 等待、metadata 拷贝或新校验扫描；优先级能力检查只在队列创建时做一次。
-
 当前脚本默认只跑 100k ON，`--include-off` 才追加同长度 OFF 对照。
 在 ON 的非首个 prefill chunk，查看同一 worker 的 compute、copy 和 HCCL
-stream：开启短 kernel 实验时，传输从 SFA 结束后即可开始，与后续投影及 TP
-all-reduce 有机会重叠；关闭实验时保留普通 `o_proj` GEMM 后提交的时点。
-下一层读取对应 bank 前仍必须等自己的 H2D 完成。
+stream：普通 `o_proj` GEMM 之后，`single_layer_paged_kv_copy` 与它的 TP
+all-reduce 应有机会并行；下一层读取对应 bank 前仍必须等 H2D 完成。
 不要把 CPU 侧 `AscendCL@hcom_allReduce` API 区间直接当作设备通信执行区间。
 比较实际设备时间线及整个 chunk 耗时；这里调整的是提交依赖，硬件资源竞争仍可能
 限制实际重叠。第一段没有历史 H2D，最后的发布/源释放等待也仍可能留下空隙。

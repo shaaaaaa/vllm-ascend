@@ -1900,8 +1900,6 @@ class AscendSFAImpl(MLAAttentionImpl):
         self.fused_qkv_a_proj = kwargs.get("fused_qkv_a_proj")
         self.kv_b_proj = kwargs["kv_b_proj"]
         self.o_proj = kwargs["o_proj"]
-        # Read once at construction, not in the per-layer transfer callback.
-        self._prefill_fifo_transfers = envs.LMCACHE_ASCEND_PREFILL_SPLIT_LOAD
         self.indexer = kwargs["indexer"]
         self.skip_topk = bool(kwargs.get("skip_topk", False))
         self.topk_indices_buffer = kwargs.get("topk_indices_buffer")
@@ -3241,8 +3239,8 @@ class AscendSFAImpl(MLAAttentionImpl):
             )
 
         # The transfer streams wait for the current compute stream. Submitting
-        # here releases save(N) and load(N+1). The low-priority FIFO uses the
-        # post-SFA boundary; the original path keeps its pre-all-reduce boundary.
+        # here releases save(N) and load(N+1) after o_proj GEMM, without waiting
+        # for its all-reduce. Fused/custom projections use the earlier boundary.
         self._submit_sfa_transfer_window_save_operations(save_operations)
         for layer_name in layer_names:
             if not maybe_submit_layerwise_prefill_load(layer_name):
@@ -6004,15 +6002,6 @@ class AscendSFAImpl(MLAAttentionImpl):
                 "the SFA context-parallel o_proj path"
             )
 
-        early_transfer_layer_names = None
-        if use_layerwise_transfer_window and self._prefill_fifo_transfers:
-            # SFA has finished reading the bank. Queue D2H then next-layer H2D
-            # before v_up_proj/o_proj; only the next consumer waits for its
-            # layer event. Do not wait for the entire shared transfer stream.
-            early_transfer_layer_names = self._submit_sfa_layerwise_transfer_window(
-                save_operations
-            )
-
         attn_output = self._v_up_proj(attn_output)
         weight_prefetch_method = get_weight_prefetch_method()
         weight_prefetch_method.maybe_prefetch_mla_or_sla_weight_in_current_stream(
@@ -6048,15 +6037,9 @@ class AscendSFAImpl(MLAAttentionImpl):
             torch.distributed.all_to_all_single(attn_output, send, group=get_tp_group().device_group)
 
         if use_layerwise_transfer_window:
-            if early_transfer_layer_names is None:
-                output[...] = self._project_with_layerwise_prefill_transfer(
-                    attn_output, save_operations
-                )
-            else:
-                output[...] = self.o_proj(attn_output)[0]
-                self._finish_sfa_layerwise_transfer_window(
-                    save_operations, early_transfer_layer_names
-                )
+            output[...] = self._project_with_layerwise_prefill_transfer(
+                attn_output, save_operations
+            )
         else:
             # Keep legacy/non-P connector ordering unchanged.
             output[...] = self.o_proj(attn_output)[0]
