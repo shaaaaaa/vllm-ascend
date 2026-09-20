@@ -108,7 +108,7 @@ def test_custom_projection_is_not_reimplemented(projection):
     assert torch.equal(output[0], torch.tensor([3.0]))
 
 
-def test_sfa_queues_transfer_after_attention_and_before_projection():
+def test_sfa_submits_previous_layer_before_current_kv_wait_and_sfa():
     tree = ast.parse((ROOT / "vllm_ascend/attention/sfa_v1.py").read_text(encoding="utf-8"))
     forward = next(
         n for n in ast.walk(tree)
@@ -126,13 +126,28 @@ def test_sfa_queues_transfer_after_attention_and_before_projection():
     def lines(name):
         return [call.lineno for call in calls if call.func.attr == name]
 
-    assert (
-        max(lines("_execute_sparse_flash_attention_process"))
-        < min(lines("_submit_sfa_layerwise_transfer_window"))
-        < min(lines("_v_up_proj"))
-        < min(lines("o_proj"))
-        < min(lines("_finish_sfa_layerwise_transfer_window"))
+    def function_lines(name):
+        return [
+            call.lineno
+            for call in ast.walk(forward)
+            if isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Name)
+            and call.func.id == name
+        ]
+
+    # The source layer comes from its saved operations, not from the current
+    # model layer. Submit it before N+1's first connector wait and SFA.
+    assert min(lines("_submit_sfa_layerwise_transfer_window")) < min(
+        function_lines("wait_for_kv_layer_from_connector")
     )
+    assert min(lines("_submit_sfa_layerwise_transfer_window")) < min(
+        lines("_execute_sparse_flash_attention_process")
+    )
+    # The final layer has no successor: it still submits after its own SFA.
+    assert max(lines("_execute_sparse_flash_attention_process")) < max(
+        lines("_submit_sfa_layerwise_transfer_window")
+    )
+    assert min(lines("o_proj")) < max(lines("_finish_sfa_layerwise_transfer_window"))
 
 
 def test_non_p_projection_keeps_ordinary_forward():
@@ -154,7 +169,7 @@ def test_non_p_projection_keeps_ordinary_forward():
         compile(ast.fix_missing_locations(ast.Module(body=[branch], type_ignores=[])), "<projection branch>", "exec"),
         dict(
             self=sfa, use_layerwise_transfer_window=False, attn_output=torch.ones(1), output=output,
-            save_operations=[], layerwise_submitted_names=[]
+            save_operations=[], pending_transfers=None
         ),
     )
     assert events == ["ordinary_projection", "ordinary_save"]

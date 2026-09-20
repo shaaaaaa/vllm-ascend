@@ -1950,7 +1950,18 @@ class AscendSFAImpl(MLAAttentionImpl):
         self.is_kv_producer = (
             self.vllm_config.kv_transfer_config is not None and self.vllm_config.kv_transfer_config.is_kv_producer
         )
+        self._layerwise_prefill_p_node = bool(
+            self.is_kv_producer and envs.VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE
+        )
         self.layer_name = kwargs.get("layer_name")
+        _, layer_end = self.vllm_config.model_config.get_layers_start_end_indices(
+            self.vllm_config.parallel_config
+        )
+        self._last_layerwise_prefill_layer_index = layer_end - 1
+        self._last_layerwise_prefill_layer = (
+            self.layer_name is not None
+            and f".layers.{self._last_layerwise_prefill_layer_index}." in f".{self.layer_name}"
+        )
 
         # Shared-indexer (GLM-5.2): a layer without a local Indexer must be a
         # skip_topk consumer that reads producer-written top-k indices from the
@@ -3229,7 +3240,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         self,
         save_operations: list[tuple[str, list[torch.Tensor]]],
     ) -> list[str]:
-        """Submit bank transfers after SFA's final KV use."""
+        """Submit save(N) and load(N+2) for the explicit source layer N."""
         layer_names = [layer_name for layer_name, _ in save_operations]
         if len(layer_names) != len(set(layer_names)):
             raise RuntimeError(
@@ -3237,15 +3248,15 @@ class AscendSFAImpl(MLAAttentionImpl):
                 f"groups: {layer_names}"
             )
 
-        # The transfer streams wait for SFA on the current compute stream.
-        # Enqueue save(N) and load(N+2) before v_up_proj and o_proj so their
-        # DMA can overlap the subsequent projection and all-reduce.
+        # Normally called on entry to N+1, before its first KV wait/SFA.
+        # The last target layer has no successor and is submitted after its
+        # own SFA instead.
         self._submit_sfa_transfer_window_save_operations(save_operations)
         for layer_name in layer_names:
             if not maybe_submit_layerwise_prefill_load(layer_name):
                 raise RuntimeError(
                     "The active KV connector stopped supporting the "
-                    "layerwise-prefill transfer window after SFA"
+                    "layerwise-prefill transfer window at the next layer"
                 )
         return layer_names
 
@@ -4759,6 +4770,26 @@ class AscendSFAImpl(MLAAttentionImpl):
                         reach_layer_for_shard_weight_series(layer)
             return output.fill_(0)
 
+        # A layer's KV remains in its bank after its SFA. Submit the prior
+        # layer's save and N+2 load here, before this layer's first connector
+        # wait. The name in save_operations identifies the source layer; no
+        # separate model-layer cursor is needed to choose the transfer.
+        transfer_context = (
+            get_forward_context().additional_kwargs
+            if self._layerwise_prefill_p_node
+            else None
+        )
+        pending_transfers = (
+            transfer_context.pop("sfa_layerwise_prefill_pending", None)
+            if transfer_context is not None
+            else None
+        )
+        pending_transfer_names = (
+            self._submit_sfa_layerwise_transfer_window(pending_transfers)
+            if pending_transfers is not None
+            else []
+        )
+
         _dsa_prof.set_step_kind(attn_metadata.attn_state == AscendAttentionState.DecodeOnly)
         _sfa_t = _dsa_prof.begin("sfa_fwd")
         _is_pure_decode = attn_metadata.attn_state in (
@@ -5975,6 +6006,11 @@ class AscendSFAImpl(MLAAttentionImpl):
         use_layerwise_transfer_window = bool(
             save_operations
         ) and layerwise_prefill_transfer_window_supported()
+        is_last_transfer_layer = use_layerwise_transfer_window and (
+            self._last_layerwise_prefill_layer
+            if self.layer_name is not None
+            else f".layers.{self._last_layerwise_prefill_layer_index}." in f".{layer_name}"
+        )
 
         if self.enable_dsa_cp_with_o_proj_tp and use_layerwise_transfer_window:
             raise RuntimeError(
@@ -5982,14 +6018,18 @@ class AscendSFAImpl(MLAAttentionImpl):
                 "the SFA context-parallel o_proj path"
             )
 
-        # SFA is the last consumer of this layer's KV. Queue the transfer now;
-        # its stream dependency waits for SFA without delaying the CPU enqueue
-        # of the projection kernels on the compute stream.
-        layerwise_submitted_names = (
-            self._submit_sfa_layerwise_transfer_window(save_operations)
-            if use_layerwise_transfer_window
-            else []
-        )
+        # The final target layer has no N+1 callback. Flush its transfer here
+        # after SFA, once the previous layer's save has been finished.
+        final_transfer_names: list[str] = []
+        if is_last_transfer_layer:
+            if pending_transfers is not None:
+                self._finish_sfa_layerwise_transfer_window(
+                    pending_transfers, pending_transfer_names
+                )
+                pending_transfers = None
+            final_transfer_names = self._submit_sfa_layerwise_transfer_window(
+                save_operations
+            )
 
         attn_output = self._v_up_proj(attn_output)
         weight_prefetch_method = get_weight_prefetch_method()
@@ -6027,12 +6067,25 @@ class AscendSFAImpl(MLAAttentionImpl):
 
         if use_layerwise_transfer_window:
             output[...] = self.o_proj(attn_output)[0]
-            self._finish_sfa_layerwise_transfer_window(
-                save_operations, layerwise_submitted_names
-            )
+            if pending_transfers is not None:
+                self._finish_sfa_layerwise_transfer_window(
+                    pending_transfers, pending_transfer_names
+                )
+            if is_last_transfer_layer:
+                self._finish_sfa_layerwise_transfer_window(
+                    save_operations, final_transfer_names
+                )
+            else:
+                if transfer_context is None:
+                    transfer_context = get_forward_context().additional_kwargs
+                transfer_context["sfa_layerwise_prefill_pending"] = save_operations
         else:
             # Keep legacy/non-P connector ordering unchanged.
             output[...] = self.o_proj(attn_output)[0]
+            if pending_transfers is not None:
+                self._finish_sfa_layerwise_transfer_window(
+                    pending_transfers, pending_transfer_names
+                )
             self._submit_sfa_save_operations(save_operations)
 
         _dsa_prof.end(_sfa_t)
