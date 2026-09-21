@@ -4371,6 +4371,74 @@ class AscendSFAImpl(MLAAttentionImpl):
                 selected_token_counts=selected_counts[:request_count],
                 payload_event=producer_event,
             )
+            if (
+                content_diagnostic
+                and layer_name.startswith("model.layers.0.")
+                and get_tp_group().rank_in_group == 0
+                and request_count > 0
+            ):
+                # One compact, host-readable record for the first staged
+                # sparse retrieve.  The full tensor fingerprints remain in
+                # the existing deferred diagnostics; this record makes the
+                # remap boundary and physical destination contract visible in
+                # the same line as the request.
+                row = 0
+                selected_row = selected_packed[row].detach().reshape(-1).cpu()
+                target_row = target_slots[row].detach().reshape(-1).cpu()
+                selected_valid = selected_row[selected_row >= 0]
+                target_valid = target_row[target_row >= 0]
+                boundary = state.remap_boundary
+                boundary_value = (
+                    int(boundary[row].detach().cpu().item())
+                    if boundary is not None and boundary.numel() > row
+                    else None
+                )
+                logger.info(
+                    "[FALCONKV_REMAP] %s",
+                    json.dumps(
+                        {
+                            "req_id": str(request_ids[row]),
+                            "layer": layer_name,
+                            "seq_len": int(attn_metadata.seq_lens_cpu[row]),
+                            "num_decode_tokens": int(attn_metadata.num_decode_tokens),
+                            "num_actual_tokens": int(attn_metadata.num_actual_tokens),
+                            "boundary": boundary_value,
+                            "selected_count": int(selected_counts[row].item()),
+                            "selected_min": (
+                                int(selected_valid.min().item())
+                                if selected_valid.numel()
+                                else None
+                            ),
+                            "selected_max": (
+                                int(selected_valid.max().item())
+                                if selected_valid.numel()
+                                else None
+                            ),
+                            "selected_checksum": diagnostic_int_checksum(
+                                selected_valid.tolist()
+                            ),
+                            "target_min": (
+                                int(target_valid.min().item())
+                                if target_valid.numel()
+                                else None
+                            ),
+                            "target_max": (
+                                int(target_valid.max().item())
+                                if target_valid.numel()
+                                else None
+                            ),
+                            "target_checksum": diagnostic_int_checksum(
+                                target_valid.tolist()
+                            ),
+                            "lmcache_frontiers": (
+                                [int(value) for value in route.frontiers]
+                                if route.frontiers is not None
+                                else []
+                            ),
+                        },
+                        separators=(",", ":"),
+                    ),
+                )
             self._target_sfa_diag_post_retrieve(target_diagnostic)
             if content_diagnostic and request_count:
                 sample_width = min(8, int(target_slots.shape[-1]))
