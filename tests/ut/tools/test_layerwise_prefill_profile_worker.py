@@ -363,19 +363,54 @@ def test_dummy_prepare_implies_dma_and_restores_on_stop_error(module, monkeypatc
     assert events == ["dma", "prepare", "restore_prepare", "restore_dma"]
 
 
+def test_dummy_submit_load_implies_dma_and_restores(module, monkeypatch):
+    import sys
+
+    calls = []
+
+    def submit(self, *args, **kwargs):
+        calls.append((args, kwargs))
+
+    impl = type("Impl", (), {"submit_layerwise_prefill_load": submit})
+    monkeypatch.setitem(
+        sys.modules,
+        "lmcache.integration.vllm.vllm_v1_adapter",
+        NS(LMCacheConnectorV1Impl=impl),
+    )
+    monkeypatch.setattr(
+        module,
+        "install_dummy_dma",
+        lambda: lambda: calls.append("restore_dma"),
+    )
+    worker = Worker()
+    plan = module.make_capture_plan(4096, 4096)
+    plan["dummy_submit_load"] = True
+    module.install_chunk_profile(worker, "80k_on", plan)
+    assert calls == []
+    impl().submit_layerwise_prefill_load("layer0")
+    assert calls == []
+    module.finish_chunk_profile(worker)
+    assert calls == ["restore_dma"]
+    assert impl.submit_layerwise_prefill_load is submit
+
+
 def test_dummy_bind_only_replaces_address_constructor(module, monkeypatch):
     import sys
 
     original = lambda *a, **kw: [(1, 2, 3)]
     planner = lambda *a: "real plan"
     connector = NS(bind_copy_addresses=original, _prefill_dma_plans=planner)
+    incremental = lambda *a, **kw: "incremental"
+    connector.bind_incremental_copy_addresses = incremental
     monkeypatch.setitem(sys.modules, "lmcache_ascend.v1.npu_connector", NS(npu_connectors=connector))
     restore = module.install_dummy_dma_bind()
     assert connector.bind_copy_addresses("plan", device_to_host=False) == []
     assert connector.bind_copy_addresses("plan", device_to_host=True) == []
+    assert connector.bind_incremental_copy_addresses("plan", [], [], [], [], [], 2).rows == []
     assert connector._prefill_dma_plans is planner
     restore()
     assert connector.bind_copy_addresses is original
+    assert connector.bind_incremental_copy_addresses is incremental
 
 
 def test_dummy_bind_lifetime_and_does_not_skip_prepare(module, monkeypatch):

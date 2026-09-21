@@ -150,16 +150,58 @@ def install_dummy_prepare():
     return restore
 
 
+def install_dummy_submit_load():
+    """Replace only the N+2 load-submit callback for attribution runs."""
+    from lmcache.integration.vllm.vllm_v1_adapter import LMCacheConnectorV1Impl
+
+    original = LMCacheConnectorV1Impl.submit_layerwise_prefill_load
+
+    def noop(self, *args, **kwargs):
+        # Diagnostic only: wait/save/lifecycle paths remain real, but no new
+        # deferred H2D load is submitted.  The generated output is invalid.
+        return None
+
+    LMCacheConnectorV1Impl.submit_layerwise_prefill_load = noop
+    return lambda: setattr(
+        LMCacheConnectorV1Impl, "submit_layerwise_prefill_load", original
+    )
+
+
 def install_dummy_dma_bind():
     from lmcache_ascend.v1.npu_connector import npu_connectors
+    from types import SimpleNamespace
 
-    original = npu_connectors.bind_copy_addresses
+    original_copy = npu_connectors.bind_copy_addresses
+    original_incremental = npu_connectors.bind_incremental_copy_addresses
 
     def dummy(*args, **kwargs):
         return []
 
+    def dummy_incremental(plan, source_objs, starts, ends, npu_ptrs,
+                          plane_widths, element_bytes, *args, **kwargs):
+        # Keep the connector's ownership/state protocol intact while removing
+        # only Python address-row construction. Native DMA is also replaced by
+        # install_dummy_dma, so the empty rows are never submitted.
+        return SimpleNamespace(
+            owners=tuple(source_objs),
+            owner_ids=tuple(map(id, source_objs)),
+            starts=tuple(starts),
+            ends=tuple(ends),
+            npu_ptrs=tuple(npu_ptrs),
+            plane_widths=tuple(plane_widths),
+            element_bytes=element_bytes,
+            segment_chunks=getattr(plan, "chunk", ()),
+            rows=[],
+        )
+
     npu_connectors.bind_copy_addresses = dummy
-    return lambda: setattr(npu_connectors, "bind_copy_addresses", original)
+    npu_connectors.bind_incremental_copy_addresses = dummy_incremental
+
+    def restore():
+        npu_connectors.bind_copy_addresses = original_copy
+        npu_connectors.bind_incremental_copy_addresses = original_incremental
+
+    return restore
 
 
 def install_transfer_attribution():
@@ -263,9 +305,11 @@ class ChunkProfileCapture:
         # Install before the request, including all unprofiled middle chunks.
         dummy_prepare = plan.get("dummy_prepare", False)
         dummy_bind = plan.get("dummy_dma_bind", False)
-        self.restore_dma = install_dummy_dma() if plan.get("dummy_dma", False) or dummy_prepare or dummy_bind else None
+        dummy_submit_load = plan.get("dummy_submit_load", False)
+        self.restore_dma = install_dummy_dma() if plan.get("dummy_dma", False) or dummy_prepare or dummy_bind or dummy_submit_load else None
         self.restore_bind = None
         self.restore_prepare = None
+        self.restore_submit_load = None
         try:
             if dummy_bind:
                 self.restore_bind = install_dummy_dma_bind()
@@ -281,7 +325,16 @@ class ChunkProfileCapture:
                     "LMCache worker preparation/transfer skipped; outputs INVALID",
                     flush=True,
                 )
+            if dummy_submit_load:
+                self.restore_submit_load = install_dummy_submit_load()
+                print(
+                    f"{PREFIX} rank={worker.rank}: DUMMY SUBMIT LOAD enabled; "
+                    "only submit_layerwise_prefill_load is skipped; outputs INVALID",
+                    flush=True,
+                )
         except BaseException:
+            if self.restore_submit_load:
+                self.restore_submit_load()
             if self.restore_bind:
                 self.restore_bind()
             if self.restore_dma:
@@ -341,6 +394,9 @@ class ChunkProfileCapture:
             if self.restore_bind is not None:
                 self.restore_bind()
                 self.restore_bind = None
+            if self.restore_submit_load is not None:
+                self.restore_submit_load()
+                self.restore_submit_load = None
             if self.restore_prepare is not None:
                 self.restore_prepare()
                 self.restore_prepare = None

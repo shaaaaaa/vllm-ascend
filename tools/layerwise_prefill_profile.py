@@ -87,6 +87,11 @@ def parser():
         "--dummy-dma-bind", action="store_true", help="Skip only per-layer DMA address binding; implies dummy DMA"
     )
     cli.add_argument(
+        "--dummy-submit-load",
+        action="store_true",
+        help="Skip only submit_layerwise_prefill_load; implies dummy DMA; outputs invalid",
+    )
+    cli.add_argument(
         "--dummy-prepare",
         action="store_true",
         help="Skip LMCache worker preparation and transfers; implies dummy DMA; outputs invalid",
@@ -278,16 +283,19 @@ def engine_options(args, case_dir, prompt_len):
 
 
 def capture_request(
-    llm, token_ids, params, case, case_dir=None, dummy_dma=False, dummy_prepare=False, dummy_dma_bind=False
+    llm, token_ids, params, case, case_dir=None, dummy_dma=False,
+    dummy_prepare=False, dummy_dma_bind=False, dummy_submit_load=False
 ):
-    if dummy_prepare and dummy_dma_bind:
+    if dummy_prepare and (dummy_dma_bind or dummy_submit_load):
         raise ValueError("Use --dummy-dma-bind without --dummy-prepare to isolate address construction")
-    dummy_dma = dummy_dma or dummy_prepare or dummy_dma_bind
+    dummy_dma = dummy_dma or dummy_prepare or dummy_dma_bind or dummy_submit_load
     plan = make_capture_plan(len(token_ids), COMPUTE_CHUNK_TOKENS) if case in LONG_CASES or dummy_dma else None
     if dummy_prepare:
         plan["dummy_prepare"] = True
     if dummy_dma_bind:
         plan["dummy_dma_bind"] = True
+    if dummy_submit_load:
+        plan["dummy_submit_load"] = True
     if dummy_dma:
         plan["dummy_dma"] = True
     if plan:
@@ -344,14 +352,16 @@ def run_child(args):
             dummy_dma=args.dummy_dma,
             dummy_prepare=args.dummy_prepare,
             dummy_dma_bind=args.dummy_dma_bind,
+            dummy_submit_load=args.dummy_submit_load,
         )
         result = results[0]
         completion = result.outputs[0]
         report = {
-            "dummy_dma": args.dummy_dma or args.dummy_prepare or args.dummy_dma_bind,
+            "dummy_dma": args.dummy_dma or args.dummy_prepare or args.dummy_dma_bind or args.dummy_submit_load,
             "dummy_dma_bind": args.dummy_dma_bind,
+            "dummy_submit_load": args.dummy_submit_load,
             "dummy_prepare": args.dummy_prepare,
-            "output_valid_for_correctness": not (args.dummy_dma or args.dummy_prepare or args.dummy_dma_bind),
+            "output_valid_for_correctness": not (args.dummy_dma or args.dummy_prepare or args.dummy_dma_bind or args.dummy_submit_load),
             "case": args.child,
             "prompt_tokens": prompt["length"],
             "num_cached_tokens": result.num_cached_tokens,
@@ -435,6 +445,8 @@ def run_cases(args, root, cases):
             command.append("--dummy-prepare")
         if args.dummy_dma_bind:
             command.append("--dummy-dma-bind")
+        if args.dummy_submit_load:
+            command.append("--dummy-submit-load")
         write_json(case_dir / "environment.json", {k: v for k, v in env.items() if k.startswith(("LMCACHE_", "VLLM_"))})
         proc = start_logged_process(command, env, case_dir / "server.log", case, prefix=PREFIX)
         try:
