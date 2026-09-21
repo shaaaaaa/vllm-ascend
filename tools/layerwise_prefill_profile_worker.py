@@ -163,6 +163,56 @@ def install_dummy_submit_load():
     return lambda: None
 
 
+def install_dummy_prefill_store():
+    """Disable only the P-node layerwise save path for attribution.
+
+    Keep ``start_load_kv`` and all load-side callbacks intact.  This removes
+    the deferred storer priming/all-layer save preparation and the per-layer
+    save callbacks, while acknowledging the worker save step so the request
+    can finish.  The resulting output is diagnostic-only.
+    """
+    from lmcache.integration.vllm.vllm_v1_adapter import (
+        LMCacheConnectorV1Impl,
+    )
+
+    def prepare_storers(self, *args, **kwargs):
+        # Keep the load path untouched; only suppress P-node save setup.
+        return None
+
+    def save_layer(self, *args, **kwargs):
+        return None
+
+    def finish_layer(self, *args, **kwargs):
+        return None
+
+    def finish_save(self):
+        # Match the minimum request bookkeeping needed by the diagnostic
+        # worker.  No KV is published or persisted in this mode.
+        metadata = self._parent._get_connector_metadata()
+        for request in metadata.requests:
+            self._mark_prefill_committed(request, len(request.token_ids))
+        self._complete_worker_save_step()
+
+    replacements = {
+        "_prepare_p_node_layerwise_save_storers": prepare_storers,
+        "save_kv_layer": save_layer,
+        "finish_layerwise_prefill_save": finish_layer,
+        "wait_for_save": finish_save,
+    }
+    originals = [
+        (name, getattr(LMCacheConnectorV1Impl, name))
+        for name in replacements
+    ]
+    for name, replacement in replacements.items():
+        setattr(LMCacheConnectorV1Impl, name, replacement)
+
+    def restore():
+        for name, original in originals:
+            setattr(LMCacheConnectorV1Impl, name, original)
+
+    return restore
+
+
 def install_dummy_dma_bind():
     from lmcache_ascend.v1.npu_connector import npu_connectors
     from types import SimpleNamespace
@@ -309,10 +359,12 @@ class ChunkProfileCapture:
         dummy_prepare = plan.get("dummy_prepare", False)
         dummy_bind = plan.get("dummy_dma_bind", False)
         dummy_submit_load = plan.get("dummy_submit_load", False)
+        dummy_prefill_store = plan.get("dummy_prefill_store", False)
         self.restore_dma = install_dummy_dma() if plan.get("dummy_dma", False) or dummy_prepare or dummy_bind or dummy_submit_load else None
         self.restore_bind = None
         self.restore_prepare = None
         self.restore_submit_load = None
+        self.restore_prefill_store = None
         try:
             if dummy_bind:
                 self.restore_bind = install_dummy_dma_bind()
@@ -335,7 +387,16 @@ class ChunkProfileCapture:
                     "submit/cursor retained, native load DMA disabled; outputs INVALID",
                     flush=True,
                 )
+            if dummy_prefill_store:
+                self.restore_prefill_store = install_dummy_prefill_store()
+                print(
+                    f"{PREFIX} rank={worker.rank}: DUMMY PREFILL STORE enabled; "
+                    "load path retained, save path skipped; outputs INVALID",
+                    flush=True,
+                )
         except BaseException:
+            if self.restore_prefill_store:
+                self.restore_prefill_store()
             if self.restore_submit_load:
                 self.restore_submit_load()
             if self.restore_bind:
@@ -403,6 +464,9 @@ class ChunkProfileCapture:
             if self.restore_prepare is not None:
                 self.restore_prepare()
                 self.restore_prepare = None
+            if self.restore_prefill_store is not None:
+                self.restore_prefill_store()
+                self.restore_prefill_store = None
             if self.restore_dma is not None:
                 self.restore_dma()
                 self.restore_dma = None
