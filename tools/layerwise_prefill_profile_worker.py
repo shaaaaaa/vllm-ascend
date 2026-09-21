@@ -207,6 +207,32 @@ def install_dummy_prefill_store(stage=0):
     def noop(self, *args, **kwargs):
         return None
 
+    def prime_only_prepare(self, metadata):
+        """Run production prime, but mark its frontier as diagnostic-only.
+
+        Stages 6/7 intentionally close the deferred storer before the normal
+        completion callback.  Without this flag, the engine quite correctly
+        refuses to publish a frontier for an aborted store; the next chunk
+        then replans the whole prefix.  The profile hook is not a real store,
+        so it is safe to advance only the planning frontier while preserving
+        the production callback boundary.
+        """
+        engine = getattr(self, "lmcache_engine", None)
+        had_flag = hasattr(engine, "_layerwise_prefill_diagnostic_prime_only")
+        old_flag = getattr(
+            engine, "_layerwise_prefill_diagnostic_prime_only", False
+        )
+        if engine is not None:
+            engine._layerwise_prefill_diagnostic_prime_only = True
+        try:
+            return original_prepare(self, metadata)
+        finally:
+            if engine is not None:
+                if had_flag:
+                    engine._layerwise_prefill_diagnostic_prime_only = old_flag
+                else:
+                    delattr(engine, "_layerwise_prefill_diagnostic_prime_only")
+
     def staged_create(self, request, save_spec, kv_group):
         """Mirror production setup only through the requested boundary."""
         assert self._layerwise_prefill_p_node
@@ -303,6 +329,10 @@ def install_dummy_prefill_store(stage=0):
     replacements = {}
     if stage == 0:
         replacements["_prepare_p_node_layerwise_save_storers"] = noop
+    elif 6 <= stage <= 7:
+        replacements["_prepare_p_node_layerwise_save_storers"] = (
+            prime_only_prepare
+        )
     elif stage <= 5:
         replacements["_create_p_node_layerwise_save_storer"] = staged_create
     # Stage 6 uses the complete production prepare/prime method but stops
