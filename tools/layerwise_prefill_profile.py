@@ -89,7 +89,7 @@ def parser():
     cli.add_argument(
         "--dummy-submit-load",
         action="store_true",
-        help="Skip only submit_layerwise_prefill_load; implies dummy DMA; outputs invalid",
+        help="Keep submit/cursor state but disable native load DMA; outputs invalid",
     )
     cli.add_argument(
         "--dummy-prepare",

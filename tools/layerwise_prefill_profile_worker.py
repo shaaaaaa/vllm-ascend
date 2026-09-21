@@ -151,20 +151,16 @@ def install_dummy_prepare():
 
 
 def install_dummy_submit_load():
-    """Replace only the N+2 load-submit callback for attribution runs."""
-    from lmcache.integration.vllm.vllm_v1_adapter import LMCacheConnectorV1Impl
+    """Keep submit/cursor state and rely on the dummy native DMA hook.
 
-    original = LMCacheConnectorV1Impl.submit_layerwise_prefill_load
-
-    def noop(self, *args, **kwargs):
-        # Diagnostic only: wait/save/lifecycle paths remain real, but no new
-        # deferred H2D load is submitted.  The generated output is invalid.
-        return None
-
-    LMCacheConnectorV1Impl.submit_layerwise_prefill_load = noop
-    return lambda: setattr(
-        LMCacheConnectorV1Impl, "submit_layerwise_prefill_load", original
-    )
+    ``submit_layerwise_prefill_load`` is not a pure enqueue call: it advances
+    the deferred retriever and the layer cursor. Replacing it with a no-op
+    makes the final wait observe cursor=0 and aborts the request. The native
+    DMA operation is already replaced by :func:`install_dummy_dma`, so there
+    is no transfer to suppress here; retaining the callback is the only
+    state-correct diagnostic behavior.
+    """
+    return lambda: None
 
 
 def install_dummy_dma_bind():
@@ -251,7 +247,14 @@ def install_transfer_attribution():
                     getattr(
                         sys.modules.get("lmcache.integration.vllm.vllm_v1_adapter"), "LMCacheConnectorV1Impl", None
                     ),
-                    ("start_load_kv", "_materialize_layerwise_prefill_slot_mappings", "_prime_dense_prefix_retrievers"),
+                    (
+                        "start_load_kv",
+                        "_materialize_layerwise_prefill_slot_mappings",
+                        "_prime_dense_prefix_retrievers",
+                        "submit_layerwise_prefill_load",
+                        "_advance_deferred_layerwise_prefill_load",
+                        "_advance_dense_layerwise_retriever",
+                    ),
                 ),
                 (
                     getattr(sys.modules.get("lmcache_ascend.v1.cache_engine"), "AscendLMCacheEngine", None),
@@ -329,7 +332,7 @@ class ChunkProfileCapture:
                 self.restore_submit_load = install_dummy_submit_load()
                 print(
                     f"{PREFIX} rank={worker.rank}: DUMMY SUBMIT LOAD enabled; "
-                    "only submit_layerwise_prefill_load is skipped; outputs INVALID",
+                    "submit/cursor retained, native load DMA disabled; outputs INVALID",
                     flush=True,
                 )
         except BaseException:

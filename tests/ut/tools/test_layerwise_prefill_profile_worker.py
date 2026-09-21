@@ -363,7 +363,7 @@ def test_dummy_prepare_implies_dma_and_restores_on_stop_error(module, monkeypatc
     assert events == ["dma", "prepare", "restore_prepare", "restore_dma"]
 
 
-def test_dummy_submit_load_implies_dma_and_restores(module, monkeypatch):
+def test_dummy_submit_load_keeps_cursor_callback_and_implies_dma(module, monkeypatch):
     import sys
 
     calls = []
@@ -388,9 +388,9 @@ def test_dummy_submit_load_implies_dma_and_restores(module, monkeypatch):
     module.install_chunk_profile(worker, "80k_on", plan)
     assert calls == []
     impl().submit_layerwise_prefill_load("layer0")
-    assert calls == []
+    assert calls == [(('layer0',), {})]
     module.finish_chunk_profile(worker)
-    assert calls == ["restore_dma"]
+    assert calls == [(('layer0',), {}), "restore_dma"]
     assert impl.submit_layerwise_prefill_load is submit
 
 
