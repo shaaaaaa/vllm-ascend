@@ -100,8 +100,16 @@ def parser():
         "--dummy-prefill-store",
         action="store_true",
         help=(
-            "Skip only the P-node layerwise prefill save path; keep load and "
-            "model execution; outputs invalid"
+            "Compatibility alias for --dummy-prefill-store-stage 0"
+        ),
+    )
+    cli.add_argument(
+        "--dummy-prefill-store-stage",
+        type=int,
+        choices=range(9),
+        help=(
+            "Cumulatively run P-node store preparation through stage 0..8; "
+            "all stages imply dummy DMA and produce invalid output"
         ),
     )
     cli.add_argument(
@@ -293,11 +301,24 @@ def engine_options(args, case_dir, prompt_len):
 def capture_request(
     llm, token_ids, params, case, case_dir=None, dummy_dma=False,
     dummy_prepare=False, dummy_dma_bind=False, dummy_submit_load=False,
-    dummy_prefill_store=False,
+    dummy_prefill_store=False, dummy_prefill_store_stage=None,
 ):
     if dummy_prepare and (dummy_dma_bind or dummy_submit_load):
         raise ValueError("Use --dummy-dma-bind without --dummy-prepare to isolate address construction")
-    dummy_dma = dummy_dma or dummy_prepare or dummy_dma_bind or dummy_submit_load
+    if dummy_prefill_store and dummy_prefill_store_stage is not None:
+        raise ValueError(
+            "Use either --dummy-prefill-store or "
+            "--dummy-prefill-store-stage, not both"
+        )
+    if dummy_prefill_store:
+        dummy_prefill_store_stage = 0
+    dummy_dma = (
+        dummy_dma
+        or dummy_prepare
+        or dummy_dma_bind
+        or dummy_submit_load
+        or dummy_prefill_store_stage is not None
+    )
     plan = make_capture_plan(len(token_ids), COMPUTE_CHUNK_TOKENS) if case in LONG_CASES or dummy_dma else None
     if dummy_prepare:
         plan["dummy_prepare"] = True
@@ -305,8 +326,8 @@ def capture_request(
         plan["dummy_dma_bind"] = True
     if dummy_submit_load:
         plan["dummy_submit_load"] = True
-    if dummy_prefill_store:
-        plan["dummy_prefill_store"] = True
+    if dummy_prefill_store_stage is not None:
+        plan["dummy_prefill_store_stage"] = dummy_prefill_store_stage
     if dummy_dma:
         plan["dummy_dma"] = True
     if plan:
@@ -365,18 +386,31 @@ def run_child(args):
             dummy_dma_bind=args.dummy_dma_bind,
             dummy_submit_load=args.dummy_submit_load,
             dummy_prefill_store=args.dummy_prefill_store,
+            dummy_prefill_store_stage=args.dummy_prefill_store_stage,
         )
         result = results[0]
         completion = result.outputs[0]
         report = {
-            "dummy_dma": args.dummy_dma or args.dummy_prepare or args.dummy_dma_bind or args.dummy_submit_load,
+            "dummy_dma": (
+                args.dummy_dma
+                or args.dummy_prepare
+                or args.dummy_dma_bind
+                or args.dummy_submit_load
+                or args.dummy_prefill_store
+                or args.dummy_prefill_store_stage is not None
+            ),
             "dummy_dma_bind": args.dummy_dma_bind,
             "dummy_submit_load": args.dummy_submit_load,
             "dummy_prefill_store": args.dummy_prefill_store,
+            "dummy_prefill_store_stage": (
+                0 if args.dummy_prefill_store
+                else args.dummy_prefill_store_stage
+            ),
             "dummy_prepare": args.dummy_prepare,
             "output_valid_for_correctness": not (
                 args.dummy_dma or args.dummy_prepare or args.dummy_dma_bind
                 or args.dummy_submit_load or args.dummy_prefill_store
+                or args.dummy_prefill_store_stage is not None
             ),
             "case": args.child,
             "prompt_tokens": prompt["length"],
@@ -465,6 +499,11 @@ def run_cases(args, root, cases):
             command.append("--dummy-submit-load")
         if args.dummy_prefill_store:
             command.append("--dummy-prefill-store")
+        if args.dummy_prefill_store_stage is not None:
+            command.extend([
+                "--dummy-prefill-store-stage",
+                str(args.dummy_prefill_store_stage),
+            ])
         write_json(case_dir / "environment.json", {k: v for k, v in env.items() if k.startswith(("LMCACHE_", "VLLM_"))})
         proc = start_logged_process(command, env, case_dir / "server.log", case, prefix=PREFIX)
         try:

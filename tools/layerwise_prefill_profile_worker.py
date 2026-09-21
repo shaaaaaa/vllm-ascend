@@ -163,52 +163,170 @@ def install_dummy_submit_load():
     return lambda: None
 
 
-def install_dummy_prefill_store():
-    """Disable only the P-node layerwise save path for attribution.
+PREFILL_STORE_STAGES = {
+    0: "skip_all_store_work",
+    1: "request_group_dispatch",
+    2: "refresh_and_group_lookup",
+    3: "build_store_inputs_and_mask",
+    4: "resolve_bank_slots_and_block_ids",
+    5: "construct_store_generator",
+    6: "prime_store_generator",
+    7: "run_layer_save_finish_callbacks",
+    8: "run_final_wait_drain_publish",
+}
 
-    Keep ``start_load_kv`` and all load-side callbacks intact.  This removes
-    the deferred storer priming/all-layer save preparation and the per-layer
-    save callbacks, while acknowledging the worker save step so the request
-    can finish.  The resulting output is diagnostic-only.
+
+def install_dummy_prefill_store(stage=0):
+    """Run a cumulative prefix of the P-node save path, then cut it off.
+
+    This is a profile-only bisection hook. Native DMA is independently
+    replaced with a no-op by ``ChunkProfileCapture``. Stage N executes stages
+    1..N, which makes adjacent runs directly comparable in a device trace.
     """
     from lmcache.integration.vllm.vllm_v1_adapter import (
         LMCacheConnectorV1Impl,
     )
 
-    def prepare_storers(self, *args, **kwargs):
-        # Keep the load path untouched; only suppress P-node save setup.
+    if stage not in PREFILL_STORE_STAGES:
+        raise ValueError(
+            f"Invalid prefill-store stage {stage}; expected 0..8"
+        )
+
+    original_prepare = (
+        LMCacheConnectorV1Impl._prepare_p_node_layerwise_save_storers
+    )
+    original_create = (
+        LMCacheConnectorV1Impl._create_p_node_layerwise_save_storer
+    )
+    original_save_layer = LMCacheConnectorV1Impl.save_kv_layer
+    original_finish_layer = (
+        LMCacheConnectorV1Impl.finish_layerwise_prefill_save
+    )
+    original_wait = LMCacheConnectorV1Impl.wait_for_save
+
+    def noop(self, *args, **kwargs):
         return None
 
-    def save_layer(self, *args, **kwargs):
-        return None
+    def staged_create(self, request, save_spec, kv_group):
+        """Mirror production setup only through the requested boundary."""
+        assert self._layerwise_prefill_p_node
+        if stage < 2:
+            return None
 
-    def finish_layer(self, *args, **kwargs):
-        return None
+        self._refresh_kvcaches_list()
+        kvcaches = self._kvcaches_for_group(kv_group)
+        if not kvcaches or stage < 3:
+            return None
+
+        store_inputs = self._prepare_layerwise_store_inputs(
+            request,
+            save_spec,
+            kv_group,
+            materialize_device_slot_mapping=not self._layerwise_prefill_dma,
+        )
+        if store_inputs is None:
+            return None
+        (
+            token_ids,
+            _,
+            store_mask,
+            skip_leading_tokens,
+            store_kwargs,
+            _,
+        ) = store_inputs
+        if request.is_sparse_decode:
+            raise RuntimeError(
+                "Staged P-node store received a decode request: "
+                f"req_id={request.req_id}"
+            )
+        if stage < 4:
+            return None
+
+        slot_mapping = self._layerwise_prefill_slot_mapping(
+            request, kv_group, 0
+        )
+        dma_kwargs = {}
+        if self._layerwise_prefill_dma:
+            dma_kwargs = {
+                "prefill_dma_block_ids_by_bank": (
+                    self._layerwise_prefill_dma_block_ids(
+                        request, kv_group
+                    )
+                ),
+                "prefill_dma_block_size": self._block_size,
+            }
+        if stage < 5:
+            return None
+
+        metadata = getattr(self.lmcache_engine, "metadata", None)
+        world_size = getattr(metadata, "world_size", 1) if metadata else 1
+        sync = kv_group == 0 or (
+            self._is_dsa_two_groups() and world_size > 1
+        )
+        # Calling a generator function constructs it but does not execute its
+        # body. Stage 5 deliberately stops on that exact boundary.
+        return self.lmcache_engine.store_layer(
+            token_ids,
+            mask=store_mask,
+            kvcaches=kvcaches,
+            slot_mapping=slot_mapping,
+            offset=skip_leading_tokens,
+            sync=sync,
+            deferred_layerwise_put=True,
+            layerwise_prefill_incremental=True,
+            layerwise_prefill_bank_count=2,
+            **dma_kwargs,
+            req_id=request.req_id,
+            **store_kwargs,
+        )
 
     def finish_save(self):
-        # Match the minimum request bookkeeping needed by the diagnostic
-        # worker.  No KV is published or persisted in this mode.
+        # Close staged generators so one chunk cannot leak state into the next
+        # chunk's measurement. No result is published in stages 0..7.
+        storers = getattr(self, "_layerwise_save_storers", {})
+        for storer in tuple(storers.values()):
+            close = getattr(storer, "close", None)
+            if close is not None:
+                close()
+        storers.clear()
+        getattr(
+            self, "_layerwise_prefill_prepared_storer_keys", set()
+        ).clear()
+        getattr(
+            self, "_layerwise_prefill_pending_store_finishes", {}
+        ).clear()
         metadata = self._parent._get_connector_metadata()
         for request in metadata.requests:
             self._mark_prefill_committed(request, len(request.token_ids))
         self._complete_worker_save_step()
 
-    replacements = {
-        "_prepare_p_node_layerwise_save_storers": prepare_storers,
-        "save_kv_layer": save_layer,
-        "finish_layerwise_prefill_save": finish_layer,
-        "wait_for_save": finish_save,
-    }
-    originals = [
-        (name, getattr(LMCacheConnectorV1Impl, name))
-        for name in replacements
-    ]
+    replacements = {}
+    if stage == 0:
+        replacements["_prepare_p_node_layerwise_save_storers"] = noop
+    elif stage <= 5:
+        replacements["_create_p_node_layerwise_save_storer"] = staged_create
+    # Stage 6 uses the complete production prepare/prime method but stops
+    # before per-layer callbacks. Stage 7 adds those callbacks and stops only
+    # before the final drain. Stage 8 is the full store path with dummy DMA.
+    if stage <= 6:
+        replacements["save_kv_layer"] = noop
+        replacements["finish_layerwise_prefill_save"] = noop
+    if stage <= 7:
+        replacements["wait_for_save"] = finish_save
+
     for name, replacement in replacements.items():
         setattr(LMCacheConnectorV1Impl, name, replacement)
 
     def restore():
-        for name, original in originals:
-            setattr(LMCacheConnectorV1Impl, name, original)
+        originals = {
+            "_prepare_p_node_layerwise_save_storers": original_prepare,
+            "_create_p_node_layerwise_save_storer": original_create,
+            "save_kv_layer": original_save_layer,
+            "finish_layerwise_prefill_save": original_finish_layer,
+            "wait_for_save": original_wait,
+        }
+        for name in replacements:
+            setattr(LMCacheConnectorV1Impl, name, originals[name])
 
     return restore
 
@@ -359,8 +477,16 @@ class ChunkProfileCapture:
         dummy_prepare = plan.get("dummy_prepare", False)
         dummy_bind = plan.get("dummy_dma_bind", False)
         dummy_submit_load = plan.get("dummy_submit_load", False)
-        dummy_prefill_store = plan.get("dummy_prefill_store", False)
-        self.restore_dma = install_dummy_dma() if plan.get("dummy_dma", False) or dummy_prepare or dummy_bind or dummy_submit_load else None
+        dummy_prefill_store_stage = plan.get(
+            "dummy_prefill_store_stage"
+        )
+        self.restore_dma = install_dummy_dma() if (
+            plan.get("dummy_dma", False)
+            or dummy_prepare
+            or dummy_bind
+            or dummy_submit_load
+            or dummy_prefill_store_stage is not None
+        ) else None
         self.restore_bind = None
         self.restore_prepare = None
         self.restore_submit_load = None
@@ -387,11 +513,15 @@ class ChunkProfileCapture:
                     "submit/cursor retained, native load DMA disabled; outputs INVALID",
                     flush=True,
                 )
-            if dummy_prefill_store:
-                self.restore_prefill_store = install_dummy_prefill_store()
+            if dummy_prefill_store_stage is not None:
+                self.restore_prefill_store = install_dummy_prefill_store(
+                    dummy_prefill_store_stage
+                )
                 print(
-                    f"{PREFIX} rank={worker.rank}: DUMMY PREFILL STORE enabled; "
-                    "load path retained, save path skipped; outputs INVALID",
+                    f"{PREFIX} rank={worker.rank}: PREFILL STORE STAGE "
+                    f"{dummy_prefill_store_stage}/8 "
+                    f"({PREFILL_STORE_STAGES[dummy_prefill_store_stage]}); "
+                    "later stages skipped; native DMA disabled; outputs INVALID",
                     flush=True,
                 )
         except BaseException:
