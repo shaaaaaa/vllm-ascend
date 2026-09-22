@@ -1640,17 +1640,17 @@ class TestStagedSFAGraphPoc(TestBase):
         )
         self.assertEqual(
             operation_order,
-            ["reset", "compute", "record"] * 2,
+            ["compute"] * 2,
         )
         self.assertTrue(all(tensor.shape[0] == 4 for result in outputs for tensor in result))
 
-    def test_staged_producer_uses_graph_external_event(self):
+    def test_staged_producer_uses_host_handoff_event(self):
         source = inspect.getsource(
             sfa_v1.AscendSFAImpl.cross_layer_graph_pre
         )
 
-        self.assertIn("torch.npu.ExternalEvent()", source)
-        self.assertNotIn("producer_event = torch.npu.Event()", source)
+        self.assertIn("producer_event = torch.npu.Event()", source)
+        self.assertNotIn("torch.npu.ExternalEvent()", source)
 
     def test_cross_layer_padding_uses_fixed_graph_rows(self):
         impl = self._make_eligible_impl()
@@ -2009,7 +2009,7 @@ class TestStagedSFAGraphPoc(TestBase):
         impl = self._make_eligible_impl()
         graph_key = StagedSFAGraphKey.exact_q1(4)
         impl._cross_layer_kv_cache = MagicMock(return_value=(self._make_eligible_kv_cache(), "index-0", True))
-        impl._staged_sfa_capture_state.producer_event = object()
+        impl._staged_sfa_capture_state.producer_event = MagicMock()
         impl._staged_sfa_capture_state.runtime = (None, None, None, True)
         metadata = self._make_decode_metadata()
         next_metadata = self._make_decode_metadata()
