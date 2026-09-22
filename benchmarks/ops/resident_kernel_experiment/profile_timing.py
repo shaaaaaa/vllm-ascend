@@ -1,7 +1,7 @@
 """Extract actual resident device tasks, never host enqueue spans, from a trace."""
 import json
-import math
 import statistics
+from decimal import Decimal
 from pathlib import Path
 
 import torch
@@ -54,20 +54,25 @@ def parse_trace(document, variant, stage, iterations):
         raise RuntimeError(f"Expected {iterations} device tasks per stage, got {counts}. "
                            "Inspect the saved trace; refusing to report host spans as kernel time.")
     for values in grouped.values():
-        values.sort(key=lambda e: float(e["ts"]))
+        values.sort(key=lambda e: Decimal(str(e["ts"])))
     sums, spans = [], []
     for i in range(iterations):
         tasks = [values[i] for values in grouped.values()]
         if len({(t.get("pid"), t.get("tid")) for t in tasks}) != 1:
             raise RuntimeError("Resident stages were not on one device stream")
-        ends = [float(t["ts"]) + float(t["dur"]) for t in tasks]
-        starts = [float(t["ts"]) for t in tasks]
-        if any(not math.isfinite(float(t["dur"])) or float(t["dur"]) <= 0 for t in tasks):
+        # Absolute microsecond timestamps can be too large for float to retain
+        # submicrosecond gaps. Convert only durations/differences to float.
+        starts = [Decimal(str(t["ts"])) for t in tasks]
+        durations = [Decimal(str(t["dur"])) for t in tasks]
+        if any(not d.is_finite() or d <= 0 for d in durations):
             raise RuntimeError("Device task has an invalid duration")
-        if any(ends[j] > starts[j + 1] + 0.01 for j in range(len(tasks) - 1)):
+        if any(not start.is_finite() for start in starts):
+            raise RuntimeError("Device task has an invalid timestamp")
+        ends = [start + duration for start, duration in zip(starts, durations)]
+        if any(ends[j] > starts[j + 1] + Decimal("0.01") for j in range(len(tasks) - 1)):
             raise RuntimeError("Resident stage order overlaps or is invalid")
-        sums.append(sum(float(t["dur"]) for t in tasks))
-        spans.append(max(ends) - min(starts))
+        sums.append(float(sum(durations)))
+        spans.append(float(max(ends) - min(starts)))
     return {"kernel_sum": summary(sums), "chain_span": summary(spans),
             "kernels": {name: summary([float(t["dur"]) for t in values]) for name, values in grouped.items()}}
 
@@ -98,6 +103,6 @@ def measure_profile(snapshot, variant, stage, iterations, warmup, trace_path: Pa
             prof.step()
         torch.npu.synchronize()
     prof.export_chrome_trace(str(trace_path.resolve()))
-    result = parse_trace(json.loads(trace_path.read_text()), variant, stage, iterations)
+    result = parse_trace(json.loads(trace_path.read_text(), parse_float=Decimal), variant, stage, iterations)
     result["trace"] = str(trace_path.resolve())
     return result

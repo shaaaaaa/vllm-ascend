@@ -1,3 +1,5 @@
+from decimal import Decimal
+
 import pytest
 from profile_timing import kernel_names, parse_trace
 
@@ -55,3 +57,19 @@ def test_trace_count_and_order_fail_closed(fault):
         data["traceEvents"][-1]["ts"] -= 16
     with pytest.raises(RuntimeError):
         parse_trace(data, "combined", "full", 3)
+
+
+def test_large_timestamps_keep_submicrosecond_order_and_span():
+    start = Decimal("1800000000000000.13")
+    events = [
+        {"ph": "X", "cat": "kernel", "name": name,
+         "ts": str(start + Decimal("0.15") * i), "dur": "0.13", "pid": 2, "tid": 5}
+        for i, name in enumerate(kernel_names("baseline").values())
+    ]
+    result = parse_trace(events, "baseline", "full", 1)
+    assert result["kernel_sum"]["mean_us"] == pytest.approx(0.39)
+    assert result["chain_span"]["mean_us"] == pytest.approx(0.43)
+    # Preserve rejection of real overlap at the same absolute timestamp scale.
+    events[1]["ts"] = str(start + Decimal("0.10"))
+    with pytest.raises(RuntimeError, match="overlap"):
+        parse_trace(events, "baseline", "full", 1)
