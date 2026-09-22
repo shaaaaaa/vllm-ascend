@@ -30,7 +30,8 @@ from numbers import Integral
 from pathlib import Path
 
 CHUNK_SIZE = 256
-MAX_MODEL_LEN = 16384
+MAX_MODEL_LEN = 9000
+DEFAULT_OUTPUT_TOKENS = 256
 DEFAULT_PREFILL_CHUNK_TOKENS = 4096
 DEFAULT_ANALYSIS_WORKERS = 64
 ARCHIVE_BATCH_FILES = 64
@@ -249,7 +250,7 @@ def engine_options(args, prompt_len, stage):
         "enable_chunked_prefill": True,
         "enable_prefix_caching": False,
         "async_scheduling": False,
-        "gpu_memory_utilization": 0.96,
+        "gpu_memory_utilization": 0.97,
         "seed": 1024,
         "worker_extension_cls": "layerwise_prefill_probe.PrefillValidationWorker",
         "additional_config": {
@@ -1134,7 +1135,12 @@ def parser():
     cli.add_argument(
         "--prompt-tokens", type=int, help="Optional minimum length check; never pads or truncates the fixed prompt"
     )
-    cli.add_argument("--output-tokens", type=int, default=4000, help="Maximum generated tokens (not words); allow EOS")
+    cli.add_argument(
+        "--output-tokens",
+        type=int,
+        default=DEFAULT_OUTPUT_TOKENS,
+        help="Maximum generated tokens (not words); allow EOS",
+    )
     cli.add_argument("--prefill-chunk-tokens", type=int, default=DEFAULT_PREFILL_CHUNK_TOKENS)
     cli.add_argument("--cpu-cache-gb", type=float, default=8)
     cli.add_argument("--run-dir", type=Path)
@@ -1150,7 +1156,7 @@ def parser():
 
 
 def main():
-    print(f"[PREFILL_CHECK] starting; max_model_len={MAX_MODEL_LEN}, gpu_memory_utilization=0.96", flush=True)
+    print(f"[PREFILL_CHECK] starting; max_model_len={MAX_MODEL_LEN}, gpu_memory_utilization=0.97", flush=True)
     args = parser().parse_args()
     if args.analysis_workers < 1:
         raise ValueError("--analysis-workers must be positive")

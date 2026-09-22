@@ -222,8 +222,8 @@ def test_full_model_three_separate_roles():
         assert "hf_overrides" not in options
         assert "speculative_config" not in options
         assert options["tensor_parallel_size"] == 8
-        assert options["gpu_memory_utilization"] == 0.96
-        assert options["max_model_len"] == 16384
+        assert options["gpu_memory_utilization"] == 0.97
+        assert options["max_model_len"] == 9000
         assert options["kv_transfer_config"]["kv_role"] == role
         if stage == "prefill":
             assert options["enforce_eager"]
@@ -234,20 +234,21 @@ def test_full_model_three_separate_roles():
 
 
 def test_long_output_default_and_article_not_limited_to_short_summary():
-    assert args().output_tokens == 4000
+    assert args().output_tokens == CHECK.DEFAULT_OUTPUT_TOKENS == 256
     text = args().prompt_file.read_text(encoding="utf-8")
     assert "约200字" not in text
-    CHECK.validate_sequence_length(12384, 4000)
+    CHECK.validate_sequence_length(8744, 256)
     with pytest.raises(ValueError, match="shorter --prompt-file"):
-        CHECK.validate_sequence_length(12385, 4000)
+        CHECK.validate_sequence_length(8745, 256)
 
 
 @pytest.mark.parametrize("stage", CHECK.STAGES)
 def test_fixed_model_length_boundary(stage):
-    options = CHECK.engine_options(args(), 16384 - args().output_tokens, stage)
-    assert options["max_model_len"] == 16384
-    with pytest.raises(ValueError, match="exceeds max_model_len=16384"):
-        CHECK.engine_options(args(), 16384 - args().output_tokens + 1, stage)
+    options = CHECK.engine_options(args(), 9000 - args().output_tokens, stage)
+    assert options["max_model_len"] == 9000
+    assert options["gpu_memory_utilization"] == 0.97
+    with pytest.raises(ValueError, match="exceeds max_model_len=9000"):
+        CHECK.engine_options(args(), 9000 - args().output_tokens + 1, stage)
 
 
 def test_stages_only_read_prefill_archive_and_isolate_environment(tmp_path, monkeypatch):
