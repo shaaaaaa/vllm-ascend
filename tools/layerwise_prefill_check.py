@@ -37,6 +37,8 @@ ARCHIVE_BATCH_FILES = 64
 ANALYSIS_PROGRESS_SECONDS = 5
 STAGES = ("baseline", "prefill", "decode")
 DEFAULT_PROMPT_FILE = Path(__file__).resolve().parents[1] / "examples/layerwise_prefill/article_summary.txt"
+LAYER_IO_RTOL = 1e-2
+LAYER_IO_ATOL = 1e-2
 
 
 def write_json(path, data):
@@ -186,6 +188,10 @@ def stage_environment(args, root, stage):
             "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
             "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
             "VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE": str(stage == "prefill").lower(),
+            # The ON pass must exercise the same block-ID based native DMA
+            # path used by production P nodes.  Previously this script only
+            # enabled the P-node flag and silently tested the fallback path.
+            "LMCACHE_LAYERWISE_PREFILL_DMA": "1" if stage == "prefill" else "0",
             "VLLM_ASCEND_DSA_UNBUNDLE": "1",
             "VLLM_ASCEND_DSA_TWO_GROUPS": "1",
             "VLLM_ASCEND_DSA_SHARED_POOL": "1",
@@ -280,7 +286,9 @@ def run_child(args):
     llm = LLM(**options)
     try:
         workers = llm.collective_rpc(
-            "install_prefill_validation", timeout=300, args=(str(root / args.stage), prompt["length"])
+            "install_prefill_validation",
+            timeout=300,
+            args=(str(root / args.stage), prompt["length"], args.prefill_chunk_tokens),
         )
         write_json(root / args.stage / "workers.json", workers)
         output = llm.generate(
@@ -762,6 +770,133 @@ def verify_archive_reads(root):
                 raise RuntimeError("D read bytes that were not in the sealed P output")
 
 
+def compare_layer_io(root, ranks):
+    """Compare per-layer prefill input/output summaries for OFF vs ON.
+
+    This is deliberately a tolerant numerical comparison.  It reports exact
+    shape/dtype/non-finite coverage and compares scalar statistics plus a
+    deterministic prefix sample with BF16-sized tolerances; it does not claim
+    bitwise equality for NPU kernels.
+    """
+    def compare_summary(left, right):
+        if left is None or right is None:
+            return False, {"reason": "missing_summary"}
+        if any(left.get(key) != right.get(key) for key in ("shape", "dtype", "numel", "nonfinite")):
+            return False, {"reason": "shape_dtype_or_nonfinite_difference"}
+        scalar_names = ("mean", "variance", "abs_mean", "abs_max", "min", "max")
+        scalar_diffs = {}
+        scalar_ok = True
+        for name in scalar_names:
+            a, b = left.get(name), right.get(name)
+            if a is None or b is None:
+                ok = a == b
+                difference = None
+            else:
+                difference = abs(float(b) - float(a))
+                ok = difference <= LAYER_IO_ATOL + LAYER_IO_RTOL * max(abs(float(a)), abs(float(b)))
+            scalar_diffs[name] = {"abs_diff": difference, "within_tolerance": ok}
+            scalar_ok = scalar_ok and ok
+        left_sample, right_sample = left.get("sample", []), right.get("sample", [])
+        if len(left_sample) != len(right_sample):
+            return False, {"reason": "sample_length_difference", "scalar_diffs": scalar_diffs}
+        sample_diffs = []
+        sample_mismatch = False
+        for a, b in zip(left_sample, right_sample, strict=True):
+            if a is None or b is None:
+                sample_mismatch = sample_mismatch or a != b
+                continue
+            sample_diffs.append(abs(float(b) - float(a)))
+        sample_max = max(sample_diffs, default=0.0)
+        sample_mean = sum(sample_diffs) / len(sample_diffs) if sample_diffs else 0.0
+        sample_ok = not sample_mismatch and sample_max <= LAYER_IO_ATOL + LAYER_IO_RTOL * max(
+            (abs(float(value)) for value in left_sample + right_sample if value is not None),
+            default=0.0,
+        )
+        return scalar_ok and sample_ok, {
+            "rtol": LAYER_IO_RTOL,
+            "atol": LAYER_IO_ATOL,
+            "scalar_diffs": scalar_diffs,
+            "sample_abs_diff_mean": sample_mean,
+            "sample_abs_diff_max": sample_max,
+            "sample_nonfinite_pattern_equal": not sample_mismatch,
+            "sample_within_tolerance": sample_ok,
+        }
+
+    def read(stage, rank):
+        path = root / stage / "layer_io" / f"rank{rank}.jsonl"
+        if not path.is_file():
+            return {}, str(path)
+        records = {}
+        for line in path.read_text(encoding="utf-8").splitlines():
+            item = json.loads(line)
+            key = (
+                item["layer"],
+                int(item["chunk_index"]),
+                int(item["token_start"]),
+                int(item["token_end"]),
+            )
+            if key in records:
+                raise RuntimeError(f"Duplicate layer I/O record: {stage}/rank{rank}/{key}")
+            records[key] = item
+        return records, str(path)
+
+    rows = []
+    errors = []
+    files = {"off": {}, "on": {}}
+    for rank in range(ranks):
+        off, off_path = read("baseline", rank)
+        on, on_path = read("prefill", rank)
+        files["off"][f"rank{rank}"] = off_path
+        files["on"][f"rank{rank}"] = on_path
+        keys = sorted(set(off) | set(on))
+        for key in keys:
+            left, right = off.get(key), on.get(key)
+            row = {
+                "rank": f"rank{rank}",
+                "layer": key[0],
+                "chunk_index": key[1],
+                "token_start": key[2],
+                "token_end": key[3],
+            }
+            if left is None or right is None:
+                row["status"] = "missing_off" if left is None else "missing_on"
+                errors.append(f"Layer I/O coverage incomplete: {row}")
+                rows.append(row)
+                continue
+            input_equal, input_diff = compare_summary(left.get("input"), right.get("input"))
+            output_equal, output_diff = compare_summary(left.get("output"), right.get("output"))
+            row.update(
+                {
+                    "status": "equal_within_tolerance" if input_equal and output_equal else "different",
+                    "input_equal": input_equal,
+                    "output_equal": output_equal,
+                    "input_diff": input_diff,
+                    "output_diff": output_diff,
+                    "off_input": left["input"],
+                    "on_input": right["input"],
+                    "off_output": left["output"],
+                    "on_output": right["output"],
+                }
+            )
+            if not input_equal or not output_equal:
+                errors.append(
+                    f"Layer I/O differs: rank{rank}/{key[0]}/chunk{key[1]}"
+                )
+            rows.append(row)
+    equal = sum(row.get("status") == "equal_within_tolerance" for row in rows)
+    report = {
+        "status": "equal_within_tolerance" if rows and not errors else "different" if errors else "missing",
+        "records": len(rows),
+        "equal_records": equal,
+        "different_records": sum(row.get("status") == "different" for row in rows),
+        "errors": errors,
+        "files": files,
+        "rows": rows,
+    }
+    write_json(root / "layer_io_comparison.json", report)
+    return report
+
+
 def analyse(root, ranks, workers=DEFAULT_ANALYSIS_WORKERS):
     if workers < 1:
         raise ValueError("Analysis workers must be positive")
@@ -773,6 +908,7 @@ def analyse(root, ranks, workers=DEFAULT_ANALYSIS_WORKERS):
     if any(out["prompt_sha256"] != prompt["sha256"] for out in outputs.values()):
         raise RuntimeError("Three runs used different prompts")
     mismatch = first_difference(outputs["baseline"]["token_ids"], outputs["decode"]["token_ids"])
+    prefill_mismatch = first_difference(outputs["baseline"]["token_ids"], outputs["prefill"]["token_ids"])
     cutoff = length + (mismatch if mismatch is not None else len(outputs["baseline"]["token_ids"]))
     rows, chunk_rows, errors = [], [], []
     summary = {
@@ -784,6 +920,8 @@ def analyse(root, ranks, workers=DEFAULT_ANALYSIS_WORKERS):
         "full_model": True,
         "tokens_equal": mismatch is None,
         "first_different_output_token_index": mismatch,
+        "prefill_output_tokens_equal": prefill_mismatch is None,
+        "prefill_first_different_output_token_index": prefill_mismatch,
         "prefill_first_token_equal": outputs["baseline"]["token_ids"][:1] == outputs["prefill"]["token_ids"][:1],
         "decode_compare_position_exclusive": cutoff,
         "reload": None,
@@ -821,6 +959,24 @@ def analyse(root, ranks, workers=DEFAULT_ANALYSIS_WORKERS):
         print(
             f"[PREFILL_CHECK] prefill position bands: size={prefill_chunk_tokens}, source={chunk_size_source}; "
             "P reload compares first-observed rows only",
+            flush=True,
+        )
+        layer_io = compare_layer_io(root, ranks)
+        summary["layer_io"] = {
+            key: value
+            for key, value in layer_io.items()
+            if key not in ("rows",)
+        }
+        errors.extend(layer_io["errors"])
+        print(
+            f"[PREFILL_IO] status={layer_io['status']}, "
+            f"equal={layer_io['equal_records']}/{layer_io['records']}; "
+            f"details: {root / 'layer_io_comparison.json'}",
+            flush=True,
+        )
+        print(
+            f"[PREFILL_OUTPUT] baseline_vs_prefill_equal={prefill_mismatch is None}, "
+            f"first_difference={prefill_mismatch}",
             flush=True,
         )
         indices = {stage: read_index(root / stage) for stage in STAGES}

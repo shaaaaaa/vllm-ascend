@@ -10,6 +10,7 @@ be used to observe every layer with these Python hooks.
 import functools
 import hashlib
 import json
+import math
 from pathlib import Path
 
 import torch
@@ -84,6 +85,86 @@ class KVRecorder:
             self._flush_key(key)
 
 
+LAYER_IO_SAMPLE_VALUES = 1024
+
+
+def tensor_summary(tensor):
+    """Return tolerant numerical evidence without retaining full activations.
+
+    A raw hash is intentionally not used here.  BF16/NPU kernels may differ by
+    a few ulps while remaining numerically equivalent, so the report keeps
+    population statistics and a deterministic prefix sample for a later
+    tolerance comparison.
+    """
+    value = tensor.detach().contiguous().to(device="cpu")
+    flat = value.float().reshape(-1)
+    finite = torch.isfinite(flat)
+    finite_values = flat[finite]
+    sample = flat[:LAYER_IO_SAMPLE_VALUES].tolist()
+    sample = [float(item) if math.isfinite(float(item)) else None for item in sample]
+    if finite_values.numel():
+        mean = float(finite_values.mean())
+        variance = float(finite_values.var(correction=0))
+        abs_mean = float(finite_values.abs().mean())
+        abs_max = float(finite_values.abs().max())
+        minimum = float(finite_values.min())
+        maximum = float(finite_values.max())
+    else:
+        mean = variance = abs_mean = abs_max = minimum = maximum = None
+    return {
+        "shape": list(value.shape),
+        "dtype": str(value.dtype),
+        "numel": int(value.numel()),
+        "mean": mean,
+        "variance": variance,
+        "abs_mean": abs_mean,
+        "abs_max": abs_max,
+        "min": minimum,
+        "max": maximum,
+        "nonfinite": int((~finite).sum()),
+        "sample": sample,
+    }
+
+
+def require_tensor_summary(tensor, label):
+    if not isinstance(tensor, torch.Tensor):
+        raise RuntimeError(
+            f"Prefill layer I/O probe expected a tensor for {label}, "
+            f"got {type(tensor).__name__}"
+        )
+    return tensor_summary(tensor)
+
+
+class LayerIORecorder:
+    """Persist one compact input/output summary per SFA layer and chunk."""
+
+    def __init__(self, root, rank):
+        self.path = Path(root) / "layer_io" / f"rank{rank}.jsonl"
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.pending = []
+
+    def record(self, layer, chunk_index, token_start, token_end, inputs, outputs):
+        self.pending.append(
+            {
+                "layer": layer,
+                "chunk_index": int(chunk_index),
+                "token_start": int(token_start),
+                "token_end": int(token_end),
+                "input": inputs if isinstance(inputs, dict) else tensor_summary(inputs),
+                "output": outputs if isinstance(outputs, dict) else tensor_summary(outputs),
+            }
+        )
+
+    def flush(self):
+        if not self.pending:
+            return
+        self.pending.sort(key=lambda item: (item["chunk_index"], item["layer"]))
+        with self.path.open("w", encoding="utf-8") as stream:
+            for item in self.pending:
+                stream.write(json.dumps(item, separators=(",", ":")) + "\n")
+        self.pending.clear()
+
+
 def validate_probe_graph_mode(config):
     if config.model_config.enforce_eager:
         return
@@ -95,10 +176,20 @@ def validate_probe_graph_mode(config):
 
 class PrefillValidationWorker:
     def finish_prefill_validation(self):
+        restore_dma = getattr(self, "_prefill_dma_restore", None)
+        if restore_dma is not None:
+            restore_dma()
+            self._prefill_dma_restore = None
         self.prefill_validation_recorder.flush()
-        return {"rank": self.rank, "kv_files": self.prefill_validation_recorder.count}
+        self.prefill_layer_io_recorder.flush()
+        return {
+            "rank": self.rank,
+            "kv_files": self.prefill_validation_recorder.count,
+            "layer_io_records": self.prefill_layer_io_recorder.path.as_posix(),
+            "dma": self._prefill_dma_stats,
+        }
 
-    def install_prefill_validation(self, root, prompt_len):
+    def install_prefill_validation(self, root, prompt_len, prefill_chunk_tokens=4096):
         # Lazy: this RPC runs only after NPU/TP and the model are initialized.
         from vllm.forward_context import get_forward_context
 
@@ -109,7 +200,44 @@ class PrefillValidationWorker:
         if getattr(self, "vllm_config", None) is not None:
             validate_probe_graph_mode(self.vllm_config)
         recorder = KVRecorder(root, self.rank, prompt_len)
+        layer_io_recorder = LayerIORecorder(root, self.rank)
         self.prefill_validation_recorder = recorder
+        self.prefill_layer_io_recorder = layer_io_recorder
+        self._prefill_dma_stats = {
+            "available": False,
+            "calls": 0,
+            "d2h_calls": 0,
+            "h2d_calls": 0,
+            "segments": 0,
+            "bytes": 0,
+        }
+        self._prefill_dma_restore = None
+        try:
+            import lmcache_ascend.c_ops as lmc_ops
+
+            original_dma = getattr(lmc_ops, "layerwise_prefill_dma_copy", None)
+            if original_dma is not None:
+                self._prefill_dma_stats["available"] = True
+
+                @functools.wraps(original_dma)
+                def traced_dma(copies, device_to_host):
+                    stats = self._prefill_dma_stats
+                    stats["calls"] += 1
+                    stats["d2h_calls"] += int(bool(device_to_host))
+                    stats["h2d_calls"] += int(not device_to_host)
+                    stats["segments"] += len(copies)
+                    stats["bytes"] += sum(int(copy[2]) for copy in copies)
+                    return original_dma(copies, device_to_host)
+
+                lmc_ops.layerwise_prefill_dma_copy = traced_dma
+                self._prefill_dma_restore = lambda: setattr(
+                    lmc_ops, "layerwise_prefill_dma_copy", original_dma
+                )
+        except (ImportError, OSError):
+            # CPU unit tests do not have the Ascend extension.  The production
+            # run still reports available=false instead of silently claiming
+            # that a DMA call occurred.
+            pass
         original_forward = sfa.AscendSFAImpl.forward
         original_wait = sfa.wait_for_kv_layer_from_connector
         active = []
@@ -151,9 +279,24 @@ class PrefillValidationWorker:
             if qlen != int(meta.num_actual_tokens) or not 0 < qlen <= end:
                 raise RuntimeError("Invalid single-request query span")
             active.append((impl, layer_name, kv_cache, meta, end - qlen))
+            is_prefill = end <= prompt_len and qlen > 1
+            io_input = require_tensor_summary(hidden_states, "SFA input") if is_prefill else None
             try:
                 result = original_forward(impl, layer_name, hidden_states, kv_cache, meta, *args, **kwargs)
                 torch.npu.synchronize()
+                if is_prefill:
+                    chunk_index = (end - 1) // prefill_chunk_tokens
+                    output_tensor = kwargs.get("output")
+                    if not isinstance(output_tensor, torch.Tensor):
+                        output_tensor = result
+                    layer_io_recorder.record(
+                        layer_name,
+                        chunk_index,
+                        end - qlen,
+                        end,
+                        io_input,
+                        require_tensor_summary(output_tensor, "SFA output"),
+                    )
                 positions = torch.arange(end - qlen, end)
                 for part, cache, slots, _ in parts(impl, layer_name, kv_cache, meta):
                     recorder.save(layer_name, part, "current", positions, cache, slots[:qlen])

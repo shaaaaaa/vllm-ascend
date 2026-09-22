@@ -258,6 +258,7 @@ def test_stages_only_read_prefill_archive_and_isolate_environment(tmp_path, monk
         assert "LMCACHE_CONFIG_FILE" not in env
         assert env["VLLM_ASCEND_SFA_FULL_GRAPH"] == "0"
         assert env["VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE"] == str(stage == "prefill").lower()
+        assert env["LMCACHE_LAYERWISE_PREFILL_DMA"] == ("1" if stage == "prefill" else "0")
         extra = json.loads(env["LMCACHE_EXTRA_CONFIG"])
         source = "prefill" if stage == "decode" else stage
         assert Path(extra["validation_archive"]) == tmp_path / source / "archive"
@@ -771,6 +772,17 @@ def test_three_pass_report_keeps_small_differences_and_real_output_divergence(
             if stage != "prefill":
                 rec.save("layer", part, "current", torch.tensor([4]), cache, torch.tensor([4]))
         rec.flush()
+        if stage in ("baseline", "prefill"):
+            io = PROBE.LayerIORecorder(directory, 0)
+            io.record(
+                "layer",
+                0,
+                0,
+                4,
+                {"sha256": "same", "shape": [4], "dtype": "torch.float32", "numel": 4},
+                torch.ones(4, dtype=torch.float32),
+            )
+            io.flush()
     CHECK.write_json(tmp_path / "prompt.json", {"length": 4, "sha256": "same"})
     for stage in ("baseline", "prefill"):
         conn, key, _ = make_connector(connector_module, tmp_path / stage)
