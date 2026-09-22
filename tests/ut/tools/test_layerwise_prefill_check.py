@@ -291,6 +291,7 @@ def test_stages_only_read_prefill_archive_and_isolate_environment(tmp_path, monk
         assert env["VLLM_ASCEND_SFA_FULL_GRAPH"] == "0"
         assert env["VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE"] == str(stage == "prefill").lower()
         assert env["LMCACHE_LAYERWISE_PREFILL_DMA"] == ("1" if stage == "prefill" else "0")
+        assert env["LMCACHE_SHARED_CPU_TRACE"] == "1"
         extra = json.loads(env["LMCACHE_EXTRA_CONFIG"])
         source = "prefill" if stage == "decode" else stage
         assert Path(extra["validation_archive"]) == tmp_path / source / "archive"

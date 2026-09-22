@@ -255,6 +255,10 @@ def stage_environment(args, root, stage):
             "LMCACHE_ENABLE_SPARSE_ATTENTION": "true",
             "LMCACHE_DSA_TWO_GROUPS": "true",
             "LMCACHE_STORE_ASYNC": "false",
+            # The correctness check should always explain request-owned
+            # shared-CPU retrieve decisions; this is opt-in in production,
+            # but mandatory for this diagnostic script.
+            "LMCACHE_SHARED_CPU_TRACE": "1",
             "LMCACHE_SAVE_DECODE_CACHE": "false",
             "LMCACHE_SAVE_UNFULL_CHUNK": "true",
             "LMCACHE_SAVE_FULL_CHUNK_IN_DECODE": "false",
