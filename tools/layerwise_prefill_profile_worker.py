@@ -399,6 +399,7 @@ def install_dummy_dma_bind():
 
 
 def install_transfer_attribution():
+    import importlib
     import sys
 
     import torch
@@ -427,44 +428,45 @@ def install_transfer_attribution():
             if hasattr(ops, name):
                 ranges.wrap(ops, name, name)
         connector = sys.modules.get("lmcache_ascend.v1.npu_connector.npu_connectors")
-        if connector is not None:
-            install_dma_diagnostics(ranges, connector.lmc_ops)
-            # Attribute preparation in the real request as well as the
-            # isolated probe. These functions return normally (not generators).
-            for owner, names in (
-                (connector, ("_prefill_dma_plans", "_cached_layerwise_slot_mapping")),
+        if connector is None:
+            connector = importlib.import_module("lmcache_ascend.v1.npu_connector.npu_connectors")
+        install_dma_diagnostics(ranges, connector.lmc_ops)
+        # Attribute preparation in the real request as well as the
+        # isolated probe. These functions return normally (not generators).
+        for owner, names in (
+            (connector, ("_prefill_dma_plans", "_cached_layerwise_slot_mapping")),
+            (
+                getattr(connector, "VLLMPagedMemLayerwiseNPUConnector", None),
                 (
-                    getattr(connector, "VLLMPagedMemLayerwiseNPUConnector", None),
-                    (
-                        "_append_sparse_chunk_ptr_rows",
-                        "_layer_page_pointer_rows",
-                        "_check_layerwise_transfer_invariants",
-                    ),
+                    "_append_sparse_chunk_ptr_rows",
+                    "_layer_page_pointer_rows",
+                    "_check_layerwise_transfer_invariants",
+                ),
+            ),
+            (
+                getattr(
+                    sys.modules.get("lmcache.integration.vllm.vllm_v1_adapter"), "LMCacheConnectorV1Impl", None
                 ),
                 (
-                    getattr(
-                        sys.modules.get("lmcache.integration.vllm.vllm_v1_adapter"), "LMCacheConnectorV1Impl", None
-                    ),
-                    (
-                        "start_load_kv",
-                        "_materialize_layerwise_prefill_slot_mappings",
-                        "_prime_dense_prefix_retrievers",
-                        "submit_layerwise_prefill_load",
-                        "_advance_deferred_layerwise_prefill_load",
-                        "_advance_dense_layerwise_retriever",
-                    ),
+                    "start_load_kv",
+                    "_materialize_layerwise_prefill_slot_mappings",
+                    "_prime_dense_prefix_retrievers",
+                    "submit_layerwise_prefill_load",
+                    "_advance_deferred_layerwise_prefill_load",
+                    "_advance_dense_layerwise_retriever",
                 ),
-                (
-                    getattr(sys.modules.get("lmcache_ascend.v1.cache_engine"), "AscendLMCacheEngine", None),
-                    ("_append_retrieve_group_cache",),
-                ),
-            ):
-                for name in names:
-                    if owner is not None and hasattr(owner, name):
-                        # Static helper needs to retain its descriptor semantics.
-                        if name == "_prime_dense_prefix_retrievers":
-                            continue
-                        ranges.wrap(owner, name, "prepare/" + name)
+            ),
+            (
+                getattr(sys.modules.get("lmcache_ascend.v1.cache_engine"), "AscendLMCacheEngine", None),
+                ("_append_retrieve_group_cache",),
+            ),
+        ):
+            for name in names:
+                if owner is not None and hasattr(owner, name):
+                    # Static helper needs to retain its descriptor semantics.
+                    if name == "_prime_dense_prefix_retrievers":
+                        continue
+                    ranges.wrap(owner, name, "prepare/" + name)
         return ranges
     except BaseException:
         ranges.restore()

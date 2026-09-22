@@ -275,14 +275,12 @@ def test_child_only_requests_first_token_and_shuts_down(tool, monkeypatch, tmp_p
 
     monkeypatch.setitem(sys.modules, "vllm", NS(LLM=llm, SamplingParams=NS))
     tool.run_child(args)
-    assert events == (
-        ["load", "arm", "generate", "finish_capture", "shutdown"]
-        if case in tool.LONG_CASES
-        else ["load", "start", "generate", "stop", "shutdown"]
+    assert events == ["load", "arm", "generate", "finish_capture", "shutdown"]
+    report = json.loads((case_dir / "capture_windows.json").read_text())
+    expected_windows = (
+        ["head", "tail"] if case in tool.LONG_CASES else ["all"]
     )
-    if case in tool.LONG_CASES:
-        report = json.loads((case_dir / "capture_windows.json").read_text())
-        assert report["workers"][0]["windows"] == ["head", "tail"]
+    assert report["workers"][0]["windows"] == expected_windows
     assert json.loads((case_dir / "result.json").read_text())["token_ids"] == [42]
 
 

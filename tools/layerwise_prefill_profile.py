@@ -319,7 +319,13 @@ def capture_request(
         or dummy_submit_load
         or dummy_prefill_store_stage is not None
     )
-    plan = make_capture_plan(len(token_ids), COMPUTE_CHUNK_TOKENS) if case in LONG_CASES or dummy_dma else None
+    # Always use the worker capture path for a real profile run.  The old
+    # short-input path called ``start_profile`` directly, so it never
+    # installed the transfer-attribution wrapper and consequently produced a
+    # timeline with no layerwise DMA ranges even when DMA was enabled.
+    # ``case_dir`` is optional for the small unit-test helper calls; retain the
+    # old lightweight behavior there.
+    plan = make_capture_plan(len(token_ids), COMPUTE_CHUNK_TOKENS) if case_dir is not None else None
     if dummy_prepare:
         plan["dummy_prepare"] = True
     if dummy_dma_bind:
