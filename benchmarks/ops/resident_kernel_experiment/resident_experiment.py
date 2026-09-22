@@ -42,7 +42,7 @@ NAMES = (
 STAGES = {"full": 0, "union": 1, "finalize": 2, "update": 3}
 SOURCE_FILES = (
     ROOT / "csrc/kernels/resident_sorted_cache.cpp",
-    *(HERE / name for name in ("baseline.cpp", "optimized.cpp", "binding.cpp", "launch.h", "CMakeLists.txt")),
+    *(HERE / name for name in ("generate_sources.py", "dispatch.cpp", "binding.cpp", "launch.h", "CMakeLists.txt")),
 )
 
 
@@ -60,6 +60,13 @@ def load_library(build_dir: Path) -> dict:
     stamp = json.loads((build_dir / "build-info.json").read_text())
     if stamp["source_sha256"] != source_digest():
         raise RuntimeError("Resident experiment sources changed; rerun build.sh")
+    # AscendC emits its shared library in build/lib on some CANN versions.
+    # Load it by absolute path before the binding, even if RPATH was stripped.
+    candidates = [build_dir / subdir / "libresident_experiment_kernels.so" for subdir in ("lib", "")]
+    kernel_library = next((path for path in candidates if path.is_file()), None)
+    if kernel_library is None:
+        raise FileNotFoundError("Resident kernel library is missing from build/lib or build; rerun build.sh")
+    torch.ops.load_library(str(kernel_library.resolve()))
     torch.ops.load_library(str((build_dir / "libresident_experiment_ops.so").resolve()))
     return stamp
 

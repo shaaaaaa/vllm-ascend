@@ -24,13 +24,21 @@ experiment optimizes `finalize` and fused `update + remap`:
   has zero counts published by union; stale payload tails remain invalid.
 
 The production translation unit defaults the compile-time specialization to
-zero. Only `optimized.cpp` enables it. There is no new runtime environment knob
+zero. Only the generated optimized sources enable it. There is no new runtime environment knob
 or serving dispatch check. The baseline/optimized symbols have separate suffixes
 to avoid interposition with an installed serving extension.
 
 Both variants reuse the same source rather than maintaining a second large
-kernel copy. The standalone build compiles only the resident kernel family
-(including its existing debug entry points) and a small PyTorch-NPU binding.
+kernel copy. At CMake configuration, `generate_sources.py` emits six translation
+units, each with one explicitly named AIV entry point: old/new union, finalize,
+and update. Helper/class bodies and entry-point bodies come verbatim from the
+resident source; entry names are literal, not preprocessor aliases. The host
+dispatcher preserves the same launch order. This packaging avoids the former
+multi-entry-point/include-and-macro build, which failed binary registration on
+CANN 8.5.1 with `finalize ... get kernel type failed`. Native confirmation of
+the replacement packaging is still required.
+
+The standalone build compiles only these six resident entry points and a small PyTorch-NPU binding.
 It does **not** rebuild `vllm_ascend_C` or any other model/attention/MoE kernels.
 
 ## Build on the NPU host
@@ -50,7 +58,8 @@ not a guessed marketing model name. For example, if that build uses
 and does not select a device family on your behalf. This experiment targets the
 same hardware supported by the existing resident kernels, not 310P.
 
-Output: `build/libresident_experiment_ops.so`, its resident-kernel library, and
+Output: `build/libresident_experiment_ops.so`, its resident-kernel library (under
+`build/lib` on CANN 8.5.1), generated sources under `build/generated`, and
 `build/build-info.json`. The build directory is local to this experiment. No
 package installation or root access is required. A different directory can be
 passed as the second build-script argument.
@@ -59,6 +68,19 @@ The loader rejects a stale build when the source digest changes. Use the same
 torch/torch-npu/CANN environment for building and running the resulting library.
 The wrapper uses `OpCommand`, as production does, so launches do not bypass
 torch-npu's task queue and overtake pending tensor copies.
+
+The loader explicitly loads the kernel library by absolute path before loading
+the binding. The binding also has an explicit `$ORIGIN/lib` runtime search path.
+After updating from the original packaging, use a new build directory and pass
+the actual device target, for example on the reported 910B3 host:
+
+```bash
+bash "$EXP/build.sh" ascend910b3 "$EXP/build-910b3-single-entry"
+python -m pytest --confcutdir="$EXP/tests" -o addopts= "$EXP/tests/test_kernels.py" --resident-build-dir "$EXP/build-910b3-single-entry" -k 'normal-1-1' -xq
+```
+
+If registration fails, do not benchmark: successful Python loading alone does
+not prove that the AscendC-generated registration stub accepted its binary.
 
 ## Correctness tests
 

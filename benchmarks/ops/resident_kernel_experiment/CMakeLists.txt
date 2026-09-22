@@ -24,10 +24,26 @@ if(NOT ASCENDC_CMAKE_DIR)
     message(FATAL_ERROR "Cannot find the CANN AscendC CMake helper")
 endif()
 include("${ASCENDC_CMAKE_DIR}/ascendc.cmake")
-ascendc_library(resident_experiment_kernels SHARED baseline.cpp optimized.cpp)
+find_package(Python3 REQUIRED COMPONENTS Interpreter)
+set(resident_source "${CMAKE_CURRENT_SOURCE_DIR}/../../../csrc/kernels/resident_sorted_cache.cpp")
+set(resident_generator "${CMAKE_CURRENT_SOURCE_DIR}/generate_sources.py")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+    "${resident_source}" "${resident_generator}" "${CMAKE_CURRENT_SOURCE_DIR}/launch.h")
+execute_process(COMMAND "${Python3_EXECUTABLE}" "${resident_generator}"
+    "${CMAKE_CURRENT_BINARY_DIR}/generated" RESULT_VARIABLE generated_status)
+if(NOT generated_status EQUAL 0)
+    message(FATAL_ERROR "Failed to generate isolated resident kernel sources")
+endif()
+set(resident_sources)
+foreach(variant baseline optimized)
+    foreach(stage union finalize update)
+        list(APPEND resident_sources "${CMAKE_CURRENT_BINARY_DIR}/generated/${variant}_${stage}.cpp")
+    endforeach()
+endforeach()
+ascendc_library(resident_experiment_kernels SHARED ${resident_sources})
 
 find_package(Torch REQUIRED)
-add_library(resident_experiment_ops SHARED binding.cpp)
+add_library(resident_experiment_ops SHARED binding.cpp dispatch.cpp)
 target_include_directories(resident_experiment_ops PRIVATE
     ${TORCH_INCLUDE_DIRS} "${TORCH_NPU_PATH}/include" "${ASCEND_HOME_PATH}/include")
 separate_arguments(torch_flags NATIVE_COMMAND "${TORCH_CXX_FLAGS}")
@@ -37,4 +53,6 @@ target_link_directories(resident_experiment_ops PRIVATE
 target_link_libraries(resident_experiment_ops PRIVATE
     ${TORCH_LIBRARIES} torch_npu ascendcl resident_experiment_kernels)
 set_target_properties(resident_experiment_ops PROPERTIES BUILD_RPATH
-    "$ORIGIN;${TORCH_NPU_PATH}/lib;${ASCEND_HOME_PATH}/lib64")
+    "$ORIGIN;$ORIGIN/lib;${TORCH_NPU_PATH}/lib;${ASCEND_HOME_PATH}/lib64")
+# Some AscendC helpers disable CMake RPATH generation globally.
+target_link_options(resident_experiment_ops PRIVATE "-Wl,-rpath,$ORIGIN:$ORIGIN/lib")
