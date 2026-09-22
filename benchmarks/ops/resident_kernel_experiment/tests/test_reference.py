@@ -7,7 +7,7 @@ import torch
 from resident_experiment import _state, make_case, reference
 
 
-@pytest.mark.parametrize("mtp,shards", itertools.product((1, 2), (1, 2, 4)))
+@pytest.mark.parametrize("mtp,shards", tuple(itertools.product((1, 2), (1, 2, 4))))
 @pytest.mark.parametrize(
     "scenario",
     (

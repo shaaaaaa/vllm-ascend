@@ -7,7 +7,7 @@ import torch
 from resident_experiment import assert_result, make_case, reference
 
 
-@pytest.mark.parametrize("mtp,shards", itertools.product((1, 2), (1, 2, 4)))
+@pytest.mark.parametrize("mtp,shards", tuple(itertools.product((1, 2), (1, 2, 4))))
 @pytest.mark.parametrize(
     "scenario",
     (
@@ -76,7 +76,8 @@ def test_graph_replay_changes_generation_and_padding_without_host_fences(native,
         expected, _ = reference(cpu)
         graph.replay()
         pending.append((case.clone(), expected))
-        cpu = expected
+        # Keep the saved expected result immutable while preparing the next input.
+        cpu = expected.clone()
     torch.npu.synchronize()
     for actual, expected in pending:
         assert_result(actual, expected)
