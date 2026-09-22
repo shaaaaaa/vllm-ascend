@@ -85,6 +85,37 @@ def test_fixed_prompt_tokenized_once_and_preserved(tmp_path, fake_tokenizer, cap
     assert "loading tokenizer" in output and "prompt_tokens=12288" in output
 
 
+def test_reuse_previous_baseline_without_copying_prompt_or_kv_trace(tmp_path):
+    previous = tmp_path / "previous"
+    (previous / "baseline").mkdir(parents=True)
+    CHECK.write_json(
+        previous / "prompt.json",
+        {"token_ids": [1, 2, 3], "sha256": "same", "length": 3},
+    )
+    CHECK.write_json(previous / "baseline" / "output.json", {"stage": "baseline"})
+
+    current = tmp_path / "current"
+    current.mkdir()
+    old_root, old_stage = CHECK.validate_baseline_run(
+        previous,
+        {"token_ids": [1, 2, 3], "sha256": "same", "length": 3},
+    )
+    assert old_root == previous.resolve()
+    assert old_stage == (previous / "baseline").resolve()
+    mode = CHECK.reuse_baseline_stage(current, old_stage)
+    assert mode in ("symlink", "copy")
+    assert (current / "baseline" / "output.json").is_file()
+
+
+def test_reused_baseline_rejects_different_prompt(tmp_path):
+    previous = tmp_path / "previous"
+    (previous / "baseline").mkdir(parents=True)
+    CHECK.write_json(previous / "prompt.json", {"sha256": "old"})
+    CHECK.write_json(previous / "baseline" / "output.json", {})
+    with pytest.raises(ValueError, match="does not match"):
+        CHECK.validate_baseline_run(previous, {"sha256": "new"})
+
+
 @pytest.mark.parametrize(
     "encoded",
     [

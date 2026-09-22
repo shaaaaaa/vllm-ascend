@@ -3,8 +3,10 @@
 """Three sequential full-model runs: baseline -> offload P -> archive-backed D.
 
 Usage: python tools/layerwise_prefill_check.py 2>&1 | tee log.log
-No profiler, no dummy weights, no hidden-layer override, no numeric pass/fail
-threshold. Baseline/D use PIECEWISE graphs; only P is eager. MTP remains off.
+Pass ``--baseline-run-dir`` to reuse the baseline artifacts from an earlier
+run; in that mode only P and D are started. No profiler, no dummy weights, no
+hidden-layer override, no numeric pass/fail threshold. Baseline/D use
+PIECEWISE graphs; only P is eager. MTP remains off.
 The KV probes copy/synchronize data: do not use these timings as performance data.
 """
 
@@ -44,6 +46,50 @@ LAYER_IO_ATOL = 1e-2
 
 def write_json(path, data):
     Path(path).write_text(json.dumps(data, ensure_ascii=False, indent=2, allow_nan=False), encoding="utf-8")
+
+
+def validate_baseline_run(baseline_root, prompt):
+    """Validate and return the old run's baseline directory.
+
+    The baseline is reused by reference rather than copied.  This avoids
+    duplicating potentially large KV trace files just to run P and D again.
+    """
+    baseline_root = Path(baseline_root).resolve()
+    prompt_path = baseline_root / "prompt.json"
+    stage_dir = baseline_root / "baseline"
+    output_path = stage_dir / "output.json"
+    if not prompt_path.is_file():
+        raise ValueError(f"Baseline run has no prompt.json: {prompt_path}")
+    if not stage_dir.is_dir() or not output_path.is_file():
+        raise ValueError(
+            "Baseline run has no completed baseline stage: "
+            f"{stage_dir}"
+        )
+    try:
+        old_prompt = json.loads(prompt_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"Cannot read baseline prompt metadata: {prompt_path}") from exc
+    if old_prompt.get("sha256") != prompt.get("sha256"):
+        raise ValueError(
+            "Baseline prompt does not match the current prompt: "
+            f"baseline={old_prompt.get('sha256')}, current={prompt.get('sha256')}"
+        )
+    return baseline_root, stage_dir
+
+
+def reuse_baseline_stage(root, baseline_stage):
+    """Expose an earlier baseline under the current run without copying KV files."""
+    target = Path(root) / "baseline"
+    if target.exists() or target.is_symlink():
+        raise FileExistsError(f"Baseline destination already exists: {target}")
+    try:
+        target.symlink_to(Path(baseline_stage), target_is_directory=True)
+        return "symlink"
+    except OSError:
+        # Linux test hosts support symlinks.  Keep a portable fallback for
+        # local/unit-test environments where symlink creation is restricted.
+        shutil.copytree(baseline_stage, target)
+        return "copy"
 
 
 class Moments:
@@ -1144,6 +1190,15 @@ def parser():
     cli.add_argument("--prefill-chunk-tokens", type=int, default=DEFAULT_PREFILL_CHUNK_TOKENS)
     cli.add_argument("--cpu-cache-gb", type=float, default=8)
     cli.add_argument("--run-dir", type=Path)
+    cli.add_argument(
+        "--baseline-run-dir",
+        type=Path,
+        help=(
+            "Reuse baseline artifacts from a previous completed run. "
+            "The current run then starts only prefill and decode; the "
+            "previous prompt must have the same token-ID hash."
+        ),
+    )
     cli.add_argument("--stage", choices=STAGES, help=argparse.SUPPRESS)
     cli.add_argument("--analyse-only", action="store_true")
     cli.add_argument(
@@ -1184,16 +1239,35 @@ def main():
     print(f"[PREFILL_CHECK] results: {root}", flush=True)
     prompt_len = prepare_prompt(args, root)
     validate_sequence_length(prompt_len, args.output_tokens)
+    baseline_stage = None
+    if args.baseline_run_dir is not None:
+        prompt = json.loads((root / "prompt.json").read_text(encoding="utf-8"))
+        baseline_root, baseline_stage = validate_baseline_run(
+            args.baseline_run_dir,
+            prompt,
+        )
+        mode = reuse_baseline_stage(root, baseline_stage)
+        print(
+            f"[PREFILL_CHECK] reusing baseline: {baseline_root} "
+            f"({mode}); skipping baseline model run",
+            flush=True,
+        )
     write_json(
         root / "run.json",
         {
             **vars(args),
             "prompt_file": str(args.prompt_file.resolve()),
             "run_dir": str(root),
+            "baseline_run_dir": (
+                str(args.baseline_run_dir.resolve())
+                if args.baseline_run_dir is not None
+                else None
+            ),
             "actual_prompt_tokens": prompt_len,
         },
     )
-    for stage in STAGES:
+    stages = ("prefill", "decode") if baseline_stage is not None else STAGES
+    for stage in stages:
         run_stage(args, root, stage)
         if stage == "prefill":
             seal_archive(root)
