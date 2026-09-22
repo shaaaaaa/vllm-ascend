@@ -40,8 +40,10 @@ NAMES = (
     "block_table",
 )
 STAGES = {"full": 0, "union": 1, "finalize": 2, "update": 3}
+VARIANTS = {"baseline": 0, "optimized": 1, "compact_remap": 2, "sharded_finalize": 3, "combined": 4}
 SOURCE_FILES = (
     ROOT / "csrc/kernels/resident_sorted_cache.cpp",
+    ROOT / "csrc/kernels/resident_sorted_cache_coordinated.cpp",
     *(HERE / name for name in ("generate_sources.py", "dispatch.cpp", "binding.cpp", "launch.h", "CMakeLists.txt")),
 )
 
@@ -105,8 +107,9 @@ class Case:
         for target, source in zip(self.tensors, snapshot.tensors, strict=True):
             target.copy_(source)
 
-    def run(self, optimized: bool, stage: str = "full") -> None:
-        torch.ops.resident_experiment.run_(self.tensors, self.dummy_base, self.block_size, optimized, STAGES[stage])
+    def run(self, optimized: bool | str, stage: str = "full") -> None:
+        variant = VARIANTS[optimized] if isinstance(optimized, str) else int(optimized)
+        torch.ops.resident_experiment.run_(self.tensors, self.dummy_base, self.block_size, variant, STAGES[stage])
 
 
 def _state(case: Case, row: int) -> dict[int, int]:
@@ -133,12 +136,15 @@ def _put_state(case: Case, row: int, values: dict[int, int]) -> None:
             case["state_slots"][row, shard, :count] = torch.tensor([p[1] for p in pairs])
 
 
-def make_case(requests=2, mtp=2, shards_per_row=4, hit_rate=1.0, scenario="normal", seed=17, block_size=128) -> Case:
+def make_case(requests=2, mtp=2, shards_per_row=4, hit_rate=1.0, scenario="normal", seed=17,
+              block_size=128, overlap=1024) -> Case:
     """Build valid CPU state, including adversarial padding/generation cases."""
     if requests < 1 or mtp not in (1, 2) or shards_per_row not in (1, 2, 4):
         raise ValueError("invalid requests/query width/shards")
     if not 0 <= hit_rate <= 1 or block_size < 1:
         raise ValueError("invalid hit rate/block size")
+    if not 0 <= overlap <= 2048:
+        raise ValueError("overlap must be between 0 and 2048")
     shards, capacity, dummy = mtp * shards_per_row, mtp * 2048, requests + 2
     shape = (requests, shards, capacity)
     state_shape = (dummy + requests, shards, capacity)
@@ -183,9 +189,10 @@ def make_case(requests=2, mtp=2, shards_per_row=4, hit_rate=1.0, scenario="norma
     for r in range(requests):
         base = 10000 * (r + 1)
         for q in range(mtp):
-            tokens = list(range(base + q * 1024, base + q * 1024 + 2048))
+            shift = q * (2048 - overlap)
+            tokens = list(range(base + shift, base + shift + 2048))
             if scenario == "skewed":
-                tokens = [base + (q * 1024 + i) * shards for i in range(2048)]
+                tokens = [base + (shift + i) * shards for i in range(2048)]
             rng.shuffle(tokens)
             case["topk"][r * mtp + q, 0] = torch.tensor(tokens, dtype=i32)
         current = sorted(set(case["topk"][r * mtp : (r + 1) * mtp].flatten().tolist()))

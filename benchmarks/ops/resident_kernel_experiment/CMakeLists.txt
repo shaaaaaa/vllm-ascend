@@ -28,7 +28,8 @@ find_package(Python3 REQUIRED COMPONENTS Interpreter)
 set(resident_source "${CMAKE_CURRENT_SOURCE_DIR}/../../../csrc/kernels/resident_sorted_cache.cpp")
 set(resident_generator "${CMAKE_CURRENT_SOURCE_DIR}/generate_sources.py")
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
-    "${resident_source}" "${resident_generator}" "${CMAKE_CURRENT_SOURCE_DIR}/launch.h")
+    "${resident_source}" "${resident_generator}" "${CMAKE_CURRENT_SOURCE_DIR}/launch.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../../csrc/kernels/resident_sorted_cache_coordinated.cpp")
 execute_process(COMMAND "${Python3_EXECUTABLE}" "${resident_generator}"
     "${CMAKE_CURRENT_BINARY_DIR}/generated" RESULT_VARIABLE generated_status)
 if(NOT generated_status EQUAL 0)
@@ -40,6 +41,8 @@ foreach(variant baseline optimized)
         list(APPEND resident_sources "${CMAKE_CURRENT_BINARY_DIR}/generated/${variant}_${stage}.cpp")
     endforeach()
 endforeach()
+list(APPEND resident_sources "${CMAKE_CURRENT_BINARY_DIR}/generated/compact_update.cpp"
+    "${CMAKE_CURRENT_BINARY_DIR}/generated/sharded_finalize.cpp")
 ascendc_library(resident_experiment_kernels SHARED ${resident_sources})
 
 find_package(Torch REQUIRED)

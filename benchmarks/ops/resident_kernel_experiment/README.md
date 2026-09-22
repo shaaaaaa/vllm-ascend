@@ -9,8 +9,37 @@ LMCache imports. Do not use this benchmark to claim a serving TPOT/TTFT gain.
 
 ## What changes
 
-The union/intersection algorithm is identical in both variants. This first
-experiment optimizes `finalize` and fused `update + remap`:
+The union/intersection algorithm is identical in all variants. Select variants
+with `--variants`; `baseline` is always included for comparison.
+
+| Variant | Finalize | Update/remap |
+|---|---|---|
+| `baseline` | Original | Original |
+| `optimized` | Earlier all-hit shortcut | Earlier unchanged-state shortcut |
+| `compact_remap` | Original | Compact slot gather; original state merge |
+| `sharded_finalize` | Existing experimental sharded worker | Original |
+| `combined` | Sharded worker | Compact slot gather; original state merge |
+
+The two new experiments do not enable the earlier unchanged-state shortcut.
+They keep the same three dependency stages; no cross-core spin waits or new
+host synchronization are introduced in kernel dispatch.
+
+**Compact remap:** build one packed prior-slot array in existing dead merge
+scratch, select a packed offset per original top-k position, then use one slot
+Gather. This retains the per-shard mapping reads/casts but removes repeated
+slot Gather/conversion/selection. The packed array requires at most
+`capacity + 15 * shards` int16 elements; the reused buffer holds `2 * capacity`.
+No additional UB or persistent device workspace is allocated. Buffers still
+used for state writeback are not reused. Empty selections preserve union's
+padding-zero behavior and unselected input positions.
+
+**Sharded finalize:** reuse `resident_sorted_cache_coordinated.cpp`'s existing
+worker without changing its allocation semantics or payload/cacheline ownership.
+Each request/shard computes prefixes from the existing union metadata and owns
+its outputs. This exposes more workers than the original one-per-request
+finalizer, but duplicates some reads; benefit is not guaranteed.
+
+The earlier `optimized` experiment remains available unchanged:
 
 - Finalize does not copy hit-only shards' prior slots back and forth. With no
   misses anywhere in a request, it also avoids the block-table read and payload
@@ -24,21 +53,21 @@ experiment optimizes `finalize` and fused `update + remap`:
   has zero counts published by union; stale payload tails remain invalid.
 
 The production translation unit defaults the compile-time specialization to
-zero. Only the generated optimized sources enable it. There is no new runtime environment knob
+zero. Only generated experiment sources enable them. There is no new runtime environment knob
 or serving dispatch check. The baseline/optimized symbols have separate suffixes
 to avoid interposition with an installed serving extension.
 
 Both variants reuse the same source rather than maintaining a second large
-kernel copy. At CMake configuration, `generate_sources.py` emits six translation
-units, each with one explicitly named AIV entry point: old/new union, finalize,
-and update. Helper/class bodies and entry-point bodies come verbatim from the
+kernel copy. At CMake configuration, `generate_sources.py` emits eight translation
+units, each with one explicitly named AIV entry point: the original six plus
+compact update and sharded finalize. Helper/class and entry-point bodies come from the
 resident source; entry names are literal, not preprocessor aliases. The host
 dispatcher preserves the same launch order. This packaging avoids the former
 multi-entry-point/include-and-macro build, which failed binary registration on
-CANN 8.5.1 with `finalize ... get kernel type failed`. Native confirmation of
-the replacement packaging is still required.
+CANN 8.5.1 with `finalize ... get kernel type failed`. The six-entry version was
+successfully run on the user's 910B3. The two new variants still require native validation.
 
-The standalone build compiles only these six resident entry points and a small PyTorch-NPU binding.
+The standalone build compiles only these eight resident entry points and a small PyTorch-NPU binding.
 It does **not** rebuild `vllm_ascend_C` or any other model/attention/MoE kernels.
 
 ## Build on the NPU host
@@ -75,8 +104,9 @@ After updating from the original packaging, use a new build directory and pass
 the actual device target, for example on the reported 910B3 host:
 
 ```bash
-bash "$EXP/build.sh" ascend910b3 "$EXP/build-910b3-single-entry"
-python -m pytest --confcutdir="$EXP/tests" -o addopts= "$EXP/tests/test_kernels.py" --resident-build-dir "$EXP/build-910b3-single-entry" -k 'normal-1-1' -xq
+BUILD="$EXP/build-910b3-variants"
+bash "$EXP/build.sh" ascend910b3 "$BUILD"
+python -m pytest --confcutdir="$EXP/tests" -o addopts= "$EXP/tests/test_kernels.py" --resident-build-dir "$BUILD" -k 'normal and 1-1' -xq
 ```
 
 If registration fails, do not benchmark: successful Python loading alone does
@@ -85,18 +115,20 @@ not prove that the AscendC-generated registration stub accepted its binary.
 ## Correctness tests
 
 ```bash
-python -m pytest --confcutdir="$EXP/tests" -o addopts= "$EXP/tests" -q
+python -m pytest --confcutdir="$EXP/tests" -o addopts= "$EXP/tests" --resident-build-dir "$BUILD" -q
 ```
 
 For a custom build directory/device, append
 `--resident-build-dir /path/to/build --resident-device 0`.
 
-The native tests compare both compiled variants with an independent CPU
+The native tests compare all compiled variants with an independent CPU
 set/dictionary oracle, not merely against each other. They cover query widths
 1/2, 1/2/4 shards per query row, cold/mixed/all hits, full capacity, subsets,
 cross-shard eviction, stale generations, inactive/dummy requests, padding,
 negative/out-of-boundary indices, skewed shards, grid-stride execution, and
-fragmented physical block tables. Graph tests change inputs/generations/padding
+fragmented physical block tables, and disjoint/fully overlapping MTP rows.
+Use `-k compact_remap` or `-k sharded_finalize` to select an individual variant's
+parameterized cases. Graph tests change inputs/generations/padding
 at fixed addresses and queue multiple replays before a final host fence. Launch
 shape/dtype/alias errors are rejected before a kernel is submitted.
 
@@ -108,51 +140,66 @@ metadata in the new fast path.
 
 Host-only execution requires CPU Torch and pytest; native tests skip if
 torch-npu/NPU is unavailable. **Host passes do not validate compiled kernels.**
-Initial local validation on Windows: 65 host tests passed, 79 native tests
-skipped. Native compilation and execution could not be performed on that host.
+Host validation also covers the packed-remap formulation/UB bound, variant
+source generation, profiler parsing, and replay-test snapshot ownership.
+Native compilation and execution cannot be performed on the Windows development host.
 
 ## Benchmark
 
-First run a small graph comparison:
+First run a small profiler comparison:
 
 ```bash
-python "$EXP/benchmark.py" --requests 1 8 16 --mtp 2 --shards-per-row 4 --hit-rates 0 0.9 1 --iterations 100 --warmup 20
+python "$EXP/benchmark.py" --build-dir "$BUILD" --requests 8 --mtp 2 --shards-per-row 4 --hit-rates 0.9 --variants baseline compact_remap sharded_finalize combined --iterations 30 --warmup 20 --json "$EXP/variants.json"
 ```
 
 `--mtp` means **query width**: `2` represents one speculative token plus the
 verification row; it is not the number of speculative tokens alone.
 
-The default measures the full chain and each stage independently. Baseline
-union/finalize prepare identical inputs for isolated later-stage measurements.
-All mutable state and raw top-k are restored outside the timed interval on
-**every iteration**, including warmup. Otherwise a miss-heavy fixture would
-quietly converge to all-hit residency. Old/new execution order alternates.
+The default `--mode profile --stage full` captures a graph, runs it under
+`torch_npu.profiler`, and extracts actual device kernel tasks from the exported
+trace. It reports the sum of the three kernel durations, each stage's duration,
+and the device span from union start through update completion. Python event
+intervals are not reported as device kernel time. Incomplete/ambiguous task
+counts or ordering cause an error instead of silently using host timings.
 
-Results report NPU-event mean/p50/p95 in microseconds, speedup, exact miss count,
-and the number of unchanged shards. `results.json` records build identity,
-device/runtime versions, parameters and results. The full-chain measurement is
-authoritative for the chain; summing independently measured stage timings can
-include different event/launch effects.
+All mutable state and raw top-k are restored on **every iteration**, including
+warmup. Reset-copy tasks and host submission gaps are excluded from the kernel
+duration sum. Otherwise a miss-heavy fixture would quietly converge to all-hit
+residency. Profiling runs each variant separately; repeat runs/reverse the
+variant list to check clock/thermal drift. Profiler overhead is not zero, and
+this is a kernel experiment rather than a serving latency estimate.
+
+Results report device-task mean/p50/p95 in microseconds, speedup and exact miss
+counts. JSON records build identity, runtime versions, parameters and trace
+paths. Traces go to a unique directory under `profiles/` (override using
+`--trace-dir`). If the parser rejects your CANN trace format, retain that trace;
+do not interpret a missing task as a zero-duration kernel.
+
+`--stage all` additionally measures stages in isolation; baseline union/finalize
+prepare identical valid operands. The full captured chain is the primary
+comparison. Legacy `--mode graph` / `--mode eager` retain event intervals for
+diagnosis only: their approximately 120 us submission floor can hide gains.
+
+`--overlap 0` selects 4096 unique tokens for query width 2; `--overlap 1024`
+(default) selects 3072; `--overlap 2048` selects 2048. Test all three overlap
+levels rather than treating 4096 input entries as 4096 unique selections.
 
 Additional comparisons:
 
 ```bash
 # Unchanged-state opportunity despite misses confined to one value shard.
-python "$EXP/benchmark.py" --requests 8 --mtp 2 --scenario one_shard_miss --hit-rates 1
+python "$EXP/benchmark.py" --build-dir "$BUILD" --requests 8 --mtp 2 --scenario one_shard_miss --hit-rates 1
 # Empty resident state: deliberately exercise the fallback work, not a warm hit.
-python "$EXP/benchmark.py" --requests 8 --mtp 2 --scenario cold --hit-rates 0
+python "$EXP/benchmark.py" --build-dir "$BUILD" --requests 8 --mtp 2 --scenario cold --hit-rates 0 --overlap 0
 # Shard-count sensitivity at the same request count/query width.
-python "$EXP/benchmark.py" --requests 8 --mtp 2 --shards-per-row 1 2 4 --hit-rates 0.9 1
+python "$EXP/benchmark.py" --build-dir "$BUILD" --requests 8 --mtp 2 --shards-per-row 1 2 4 --hit-rates 0.9 1
 ```
 
 Use `--json FILE` to retain separate runs, `--stage full` for just the full chain,
 and `--device N` to choose a device. Run on an otherwise idle NPU and repeat.
-`--mode eager` is available, but its event intervals can include host enqueue
-gaps; prefer the default graph mode for the production graph-kernel comparison.
 Input restoration also creates a controlled, warm-memory microbenchmark rather
 than reproducing all cache contention of a serving workload.
 
-Performance gains are expected primarily for unchanged shards/all-hit requests.
-The miss-heavy fallback may be neutral or slower because it evaluates an extra
-device-side predicate. No speedup is claimed until these measurements pass
-correctness and run on the target hardware.
+The new variants target partial hits but can lose performance from extra index
+arithmetic or duplicated reads. No speedup is claimed until these measurements
+pass correctness and run on the target hardware.

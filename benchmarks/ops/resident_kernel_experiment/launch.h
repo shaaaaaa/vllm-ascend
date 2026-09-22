@@ -11,3 +11,5 @@ struct ResidentLaunch {
 void resident_experiment_run(void* stream, const ResidentLaunch& args, int stage);
 void resident_experiment_run_optimized(
     void* stream, const ResidentLaunch& args, int stage);
+void resident_experiment_run_variant(
+    void* stream, const ResidentLaunch& args, int variant, int stage);

@@ -4,10 +4,11 @@ import itertools
 
 import pytest
 import torch
-from resident_experiment import assert_result, make_case, reference
+from resident_experiment import VARIANTS, assert_result, make_case, reference
 
 
 @pytest.mark.parametrize("mtp,shards", tuple(itertools.product((1, 2), (1, 2, 4))))
+@pytest.mark.parametrize("variant", tuple(VARIANTS))
 @pytest.mark.parametrize(
     "scenario",
     (
@@ -23,14 +24,13 @@ from resident_experiment import assert_result, make_case, reference
         "skewed",
     ),
 )
-def test_old_and_new_match_oracle(native, mtp, shards, scenario):
+def test_old_and_new_match_oracle(native, mtp, shards, scenario, variant):
     initial = make_case(2, mtp, shards, 0.9, scenario)
     expected, _ = reference(initial)
-    for optimized in (False, True):
-        device_case = initial.clone(native)
-        device_case.run(optimized)
-        torch.npu.synchronize()
-        assert_result(device_case, expected)
+    device_case = initial.clone(native)
+    device_case.run(variant)
+    torch.npu.synchronize()
+    assert_result(device_case, expected)
 
 
 @pytest.mark.parametrize("mtp,shards", [(1, 1), (1, 4), (2, 1), (2, 4)])
@@ -39,14 +39,14 @@ def test_all_hit_full_set_uses_fast_paths(native, mtp, shards):
     expected, stats = reference(initial)
     assert stats["misses"] == 0
     assert stats["unchanged_shards"] == initial.requests * initial.shards
-    for optimized in (False, True):
+    for optimized in VARIANTS:
         case = initial.clone(native)
         case.run(optimized)
         torch.npu.synchronize()
         assert_result(case, expected)
 
 
-@pytest.mark.parametrize("optimized", [False, True])
+@pytest.mark.parametrize("optimized", tuple(VARIANTS))
 @pytest.mark.parametrize("mtp,shards", [(1, 4), (2, 1), (2, 4)])
 def test_graph_replay_changes_generation_and_padding_without_host_fences(native, optimized, mtp, shards):
     initial = make_case(2, mtp, shards, 0.9)
@@ -87,7 +87,7 @@ def test_graph_replay_changes_generation_and_padding_without_host_fences(native,
 def test_grid_stride_and_fragmented_physical_blocks(native, requests, block_size):
     initial = make_case(requests, 2, 4, 0.97, block_size=block_size)
     expected, _ = reference(initial)
-    for optimized in (False, True):
+    for optimized in VARIANTS:
         case = initial.clone(native)
         case.run(optimized)
         torch.npu.synchronize()
@@ -113,4 +113,16 @@ def test_invalid_launch_rejected_before_kernel(native, fault):
     else:
         stage = 5
     with pytest.raises(RuntimeError):
-        torch.ops.resident_experiment.run_(case.tensors, case.dummy_base, case.block_size, True, stage)
+        torch.ops.resident_experiment.run_(case.tensors, case.dummy_base, case.block_size, 1, stage)
+
+
+@pytest.mark.parametrize("variant", tuple(VARIANTS))
+@pytest.mark.parametrize("overlap", [0, 2048])
+@pytest.mark.parametrize("shards", [1, 4])
+def test_extreme_mtp_overlap(native, variant, overlap, shards):
+    initial = make_case(2, 2, shards, 0.9, overlap=overlap)
+    expected, _ = reference(initial)
+    case = initial.clone(native)
+    case.run(variant)
+    torch.npu.synchronize()
+    assert_result(case, expected)

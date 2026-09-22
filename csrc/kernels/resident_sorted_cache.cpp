@@ -21,6 +21,9 @@
 #ifndef RESIDENT_EXPERIMENT_SKIP_UNCHANGED
 #define RESIDENT_EXPERIMENT_SKIP_UNCHANGED 0
 #endif
+#ifndef RESIDENT_EXPERIMENT_COMPACT_REMAP
+#define RESIDENT_EXPERIMENT_COMPACT_REMAP 0
+#endif
 
 namespace {
 
@@ -2139,6 +2142,10 @@ private:
         uint32_t part,
         uint64_t requestShardBase)
     {
+        if constexpr (RESIDENT_EXPERIMENT_COMPACT_REMAP) {
+            RemapPositionPartitionCompact(request, part, requestShardBase);
+            return;
+        }
         const uint32_t partWidth = requestWidth_ / shardCount_;
         const uint32_t begin = part * partWidth;
         const uint64_t requestOffset =
@@ -2307,6 +2314,88 @@ private:
             topkIndices_[requestOffset + begin],
             ranksOrOutput,
             partWidth);
+    }
+
+    // Existing state-merge scratch is dead here; merged writeback buffers stay
+    // untouched. Pack prior slots once, select one index per input position,
+    // then perform one slot Gather rather than one Gather per value shard.
+    __aicore__ inline void RemapPositionPartitionCompact(
+        uint32_t request, uint32_t part, uint64_t requestShardBase)
+    {
+        const uint32_t width = requestWidth_ / shardCount_;
+        const uint32_t begin = part * width;
+        const uint64_t inputOffset = static_cast<uint64_t>(request) * requestWidth_ + begin;
+        const uint64_t mappingBase = static_cast<uint64_t>(request) * shardCount_ * requestWidth_;
+        auto input = oldTokenBuf_.Get<int32_t>();
+        auto mapping = oldSlotBuf_.Get<int16_t>();
+        // 2*capacity int16 elements cover sum(counts)<=capacity plus the
+        // <=15-element alignment gap per shard, for every supported shape.
+        auto slots = currentTokenBuf_.Get<int16_t>();
+        auto ranks = survivorTokenBuf_.Get<int32_t>();
+        auto compact = survivorSlotBuf_.Get<int32_t>();
+        auto offsets = remapOffsetBuf_.Get<int32_t>();
+        auto floats = remapGatheredBuf_.Get<float>();
+        auto mask = selectedMaskBuf_.Get<uint8_t>();
+        Sync<AscendC::HardEvent::S_MTE2>();
+        Sync<AscendC::HardEvent::S_V>();
+        CopyGlobalToLocalExact(input, topkIndices_[inputOffset], width);
+        AscendC::Duplicate(compact, static_cast<int32_t>(-1), width);
+        AscendC::PipeBarrier<PIPE_V>();
+        uint32_t slotEnd = 0;
+        for (uint32_t shard = 0; shard < shardCount_; ++shard) {
+            const uint32_t count = static_cast<uint32_t>(ReadGlobalScalarFresh(
+                shardCounts_, static_cast<uint64_t>(request) * shardCountRequestStride_
+                    + shard * shardCountStride_));
+            if (count == 0) continue;
+            const uint32_t base = (slotEnd + kInt16PerDataBlock - 1) & ~(kInt16PerDataBlock - 1);
+            CopyGlobalToLocalExact(slots[base],
+                priorSlots_[requestShardBase + static_cast<uint64_t>(shard) * capacity_], count);
+            CopyGlobalToLocalExact(mapping,
+                shardMapping_[mappingBase + static_cast<uint64_t>(shard) * requestWidth_ + begin], width);
+            Sync<AscendC::HardEvent::MTE2_V>();
+            AscendC::Cast(floats, mapping, AscendC::RoundMode::CAST_NONE, width);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Cast(offsets, floats, AscendC::RoundMode::CAST_ROUND, width);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Maxs(ranks, offsets, static_cast<int32_t>(0), width);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Compare(mask, ranks, offsets, AscendC::CMPMODE::EQ, width);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Mins(ranks, ranks, static_cast<int32_t>(count - 1), width);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Adds(ranks, ranks, static_cast<int32_t>(base), width);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Select(compact.ReinterpretCast<float>(), mask,
+                ranks.ReinterpretCast<float>(), compact.ReinterpretCast<float>(),
+                AscendC::SELMODE::VSEL_TENSOR_TENSOR_MODE, width);
+            AscendC::PipeBarrier<PIPE_V>();
+            Sync<AscendC::HardEvent::V_MTE2>();
+            slotEnd = base + count;
+        }
+        if (slotEnd == 0) {
+            // No selected token: retain original (or union-zeroed padding)
+            // values. Finish outstanding input DMA before UB is reused.
+            Sync<AscendC::HardEvent::MTE2_S>();
+            return;
+        }
+        AscendC::Maxs(offsets, compact, static_cast<int32_t>(0), width);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Compare(mask, offsets, compact, AscendC::CMPMODE::EQ, width);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Muls(offsets, offsets, static_cast<int32_t>(sizeof(int16_t)), width);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Gather(mapping, slots, offsets.ReinterpretCast<uint32_t>(), static_cast<uint32_t>(0), width);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Cast(floats, mapping, AscendC::RoundMode::CAST_NONE, width);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Cast(ranks, floats, AscendC::RoundMode::CAST_ROUND, width);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Select(offsets.ReinterpretCast<float>(), mask,
+            ranks.ReinterpretCast<float>(), input.ReinterpretCast<float>(),
+            AscendC::SELMODE::VSEL_TENSOR_TENSOR_MODE, width);
+        AscendC::PipeBarrier<PIPE_V>();
+        Sync<AscendC::HardEvent::V_MTE3>();
+        CopyLocalToGlobalExact(topkIndices_[inputOffset], offsets, width);
     }
 
     AscendC::GlobalTensor<int32_t> topkIndices_;

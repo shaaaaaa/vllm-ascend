@@ -1,12 +1,14 @@
-"""Paired device-event timing of the baseline and experimental resident kernels."""
+"""Compare resident variants using device-task profiling or legacy event timing."""
 
 import argparse
 import json
 import statistics
+from datetime import datetime
 from pathlib import Path
 
 import torch
-from resident_experiment import HERE, STAGES, assert_result, load_library, make_case, reference
+from profile_timing import measure_profile
+from resident_experiment import HERE, STAGES, VARIANTS, assert_result, load_library, make_case, reference
 
 
 def summary(samples):
@@ -30,12 +32,12 @@ def stage_snapshot(cpu, device, stage):
     return case
 
 
-def measure_pair(snapshot, stage, iterations, warmup, mode):
+def measure_pair(snapshot, stage, iterations, warmup, mode, experiment="optimized"):
     cases = [snapshot.clone(), snapshot.clone()]
     for _ in range(warmup):
         for optimized, case in enumerate(cases):
             case.reset_from(snapshot)
-            case.run(bool(optimized), stage)
+            case.run(experiment if optimized else "baseline", stage)
     torch.npu.synchronize()
     graphs = []
     if mode == "graph":
@@ -43,7 +45,7 @@ def measure_pair(snapshot, stage, iterations, warmup, mode):
             case.reset_from(snapshot)
             graph = torch.npu.NPUGraph()
             with torch.npu.graph(graph):
-                case.run(bool(optimized), stage)
+                case.run(experiment if optimized else "baseline", stage)
             graphs.append(graph)
         torch.npu.synchronize()
     events = [
@@ -62,7 +64,7 @@ def measure_pair(snapshot, stage, iterations, warmup, mode):
             if mode == "graph":
                 graphs[variant].replay()
             else:
-                case.run(bool(variant), stage)
+                case.run(experiment if variant else "baseline", stage)
             end.record()
     torch.npu.synchronize()
     return [summary([begin.elapsed_time(end) * 1000 for begin, end in row]) for row in events]
@@ -78,19 +80,25 @@ def main():
     )
     parser.add_argument("--shards-per-row", type=int, choices=(1, 2, 4), nargs="+", default=[4])
     parser.add_argument("--hit-rates", type=float, nargs="+", default=[0.0, 0.9, 1.0])
+    parser.add_argument("--overlap", type=int, choices=(0, 1024, 2048), default=1024)
+    parser.add_argument("--variants", choices=tuple(VARIANTS), nargs="+",
+                        default=["baseline", "compact_remap", "sharded_finalize", "combined"])
     parser.add_argument(
         "--scenario", choices=("normal", "cold", "one_shard_miss", "subset", "zero_boundary"), default="normal"
     )
-    parser.add_argument("--iterations", type=int, default=100)
+    parser.add_argument("--iterations", type=int, default=30)
     parser.add_argument("--warmup", type=int, default=20)
-    parser.add_argument("--mode", choices=("graph", "eager"), default="graph")
-    parser.add_argument("--stage", choices=("all", *STAGES), default="all")
+    parser.add_argument("--mode", choices=("profile", "graph", "eager"), default="profile")
+    parser.add_argument("--stage", choices=("all", *STAGES), default="full")
+    parser.add_argument("--trace-dir", type=Path, default=HERE / "profiles")
     parser.add_argument("--json", type=Path, default=HERE / "results.json")
     args = parser.parse_args()
     if args.iterations < 1 or args.warmup < 1 or min(args.requests) < 1:
         parser.error("iterations, warmup and request counts must be positive")
     if any(not 0 <= rate <= 1 for rate in args.hit_rates):
         parser.error("hit rates must be in [0, 1]")
+    variants = list(dict.fromkeys(["baseline", *args.variants]))
+    run_dir = args.trace_dir / datetime.now().strftime("run_%Y%m%d_%H%M%S_%f")
     build = load_library(args.build_dir)
     torch.npu.set_device(args.device)
     device = torch.device("npu", args.device)
@@ -102,25 +110,39 @@ def main():
         "torch": torch.__version__,
         "torch_npu": torch_npu.__version__,
         "mode": args.mode,
-        "timing": "NPU events; reset/predecessor work excluded; paired alternating order",
+        "timing": ("Profiler device-task durations from graph replay; host gaps excluded"
+                   if args.mode == "profile" else "Legacy event intervals; may include host submission gaps"),
+        "overlap": args.overlap,
         "results": [],
     }
     stages = tuple(STAGES) if args.stage == "all" else (args.stage,)
     for requests in args.requests:
         for shards in args.shards_per_row:
             for rate in args.hit_rates:
-                cpu = make_case(requests, args.mtp, shards, rate, args.scenario)
+                cpu = make_case(requests, args.mtp, shards, rate, args.scenario, overlap=args.overlap)
                 expected, stats = reference(cpu)
                 actual_hit = 1 - stats["misses"] / stats["selected"] if stats["selected"] else None
                 # Correctness is a prerequisite to timing each input case.
-                for optimized in (False, True):
+                for optimized in variants:
                     actual = cpu.clone(device)
                     actual.run(optimized)
                     torch.npu.synchronize()
                     assert_result(actual, expected)
                 for stage in stages:
                     snapshot = stage_snapshot(cpu, device, stage)
-                    old, new = measure_pair(snapshot, stage, args.iterations, args.warmup, args.mode)
+                    measurements = {}
+                    if args.mode == "profile":
+                        for variant in variants:
+                            trace = run_dir / f"case_{len(report['results'])}_{variant}_{stage}.json"
+                            measurements[variant] = measure_profile(
+                                snapshot, variant, stage, args.iterations, args.warmup, trace)
+                        old = measurements["baseline"]["kernel_sum"]
+                    else:
+                        print("WARNING: event timing includes submission effects; use --mode profile for kernel cost.")
+                        for variant in variants[1:] or ["baseline"]:
+                            old, new = measure_pair(snapshot, stage, args.iterations, args.warmup, args.mode, variant)
+                            measurements[variant] = {"event_interval": new, "paired_baseline": old}
+                        measurements["baseline"] = {"event_interval": old}
                     record = {
                         "requests": requests,
                         "mtp": args.mtp,
@@ -130,19 +152,20 @@ def main():
                         "scenario": args.scenario,
                         "stage": stage,
                         "counts": stats,
-                        "baseline": old,
-                        "optimized": new,
-                        "speedup": old["mean_us"] / new["mean_us"],
+                        "measurements": measurements,
                     }
                     report["results"].append(record)
                     hit_label = f"{actual_hit:.3f}" if actual_hit is not None else "n/a"
-                    print(
-                        f"R={requests:2d} M={args.mtp} S={args.mtp * shards} hit={hit_label} "
-                        f"{stage:8s} old={old['mean_us']:.2f}us new={new['mean_us']:.2f}us "
-                        f"speedup={record['speedup']:.3f}x "
-                        f"miss={stats['misses']} unchanged_shards={stats['unchanged_shards']}",
-                        flush=True,
-                    )
+                    for variant in variants:
+                        values = measurements[variant]
+                        elapsed = values["kernel_sum" if args.mode == "profile" else "event_interval"]
+                        print(f"R={requests} M={args.mtp} S={args.mtp * shards} hit={hit_label} "
+                              f"{stage} {variant}: {elapsed['mean_us']:.2f}us "
+                              f"speedup={old['mean_us'] / elapsed['mean_us']:.3f}x "
+                              f"miss={stats['misses']}", flush=True)
+                        if args.mode == "profile":
+                            print("  kernel means:", {k: round(v['mean_us'], 3) for k, v in values['kernels'].items()},
+                                  "chain_span_us=", round(values['chain_span']['mean_us'], 3), flush=True)
                     args.json.parent.mkdir(parents=True, exist_ok=True)
                     args.json.write_text(json.dumps(report, indent=2))
                     del snapshot

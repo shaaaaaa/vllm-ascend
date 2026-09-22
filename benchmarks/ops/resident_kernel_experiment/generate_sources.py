@@ -9,6 +9,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 SOURCE = HERE.parents[2] / "csrc/kernels/resident_sorted_cache.cpp"
+SHARDED_SOURCE = SOURCE.with_name("resident_sorted_cache_coordinated.cpp")
 KERNELS = {
     "union": "dsa_resident_sharded_union_kernel",
     "finalize": "dsa_resident_sorted_finalize_kernel",
@@ -32,13 +33,14 @@ SCALARS = {
 }
 
 
-def generate(source: str, header: Path) -> dict[str, str]:
+def generate(source: str, header: Path, *, variants=(("baseline", 0), ("optimized", 1)), kernels=None,
+             compact=False, sharded=False) -> dict[str, str]:
     marker = 'extern "C" __global__ __aicore__ void\n'
     classes, separator, _ = source.partition(marker)
     if not separator:
         raise ValueError("Resident source entry-point boundary changed")
     output = {}
-    for stage, name in KERNELS.items():
+    for stage, name in (KERNELS if kernels is None else kernels).items():
         pattern = re.compile(re.escape(marker + name) + r"\((.*?)\)\n\{\n(.*?)\n\}", re.S)
         matches = list(pattern.finditer(source))
         if len(matches) != 1:
@@ -54,10 +56,10 @@ def generate(source: str, header: Path) -> dict[str, str]:
                 if scalar is None or scalar[1] not in SCALARS:
                     raise ValueError(f"Unsupported kernel parameter: {parameter}")
                 arguments.append(SCALARS[scalar[1]])
-        for variant, enabled in (("baseline", 0), ("optimized", 1)):
+        for variant, enabled in variants:
             kernel_name = f"{name}_{variant}"
             entry = match[0].replace(name, kernel_name, 1)
-            logical_blocks = "a.requests" if stage == "finalize" else "a.requests * a.shards"
+            logical_blocks = "a.requests" if stage == "finalize" and not sharded else "a.requests * a.shards"
             launch = (
                 f'\n}}  // namespace\n#include "{header.resolve().as_posix()}"\n\n'
                 f"void resident_experiment_{variant}_{stage}(void* stream, const ResidentLaunch& a)\n{{\n"
@@ -68,6 +70,7 @@ def generate(source: str, header: Path) -> dict[str, str]:
             output[f"{variant}_{stage}.cpp"] = (
                 "// Generated; do not edit. Kernel algorithm is copied verbatim.\n"
                 f"#define RESIDENT_EXPERIMENT_SKIP_UNCHANGED {enabled}\n"
+                f"#define RESIDENT_EXPERIMENT_COMPACT_REMAP {int(compact)}\n"
                 + classes + entry + launch
             )
     return output
@@ -78,7 +81,14 @@ def main() -> None:
     parser.add_argument("output", type=Path)
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
-    for name, content in generate(SOURCE.read_text(encoding="utf-8"), HERE / "launch.h").items():
+    source = SOURCE.read_text(encoding="utf-8")
+    output = generate(source, HERE / "launch.h")
+    output.update(generate(source, HERE / "launch.h", variants=(("compact", 0),),
+                           kernels={"update": KERNELS["update"]}, compact=True))
+    output.update(generate(SHARDED_SOURCE.read_text(encoding="utf-8"), HERE / "launch.h",
+                           variants=(("sharded", 0),), sharded=True,
+                           kernels={"finalize": "dsa_resident_sharded_finalize_worker_kernel"}))
+    for name, content in output.items():
         path = args.output / name
         if not path.exists() or path.read_text(encoding="utf-8") != content:
             path.write_text(content, encoding="utf-8", newline="\n")

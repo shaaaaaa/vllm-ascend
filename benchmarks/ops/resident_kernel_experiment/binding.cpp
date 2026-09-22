@@ -12,12 +12,13 @@
 
 namespace {
 void run(at::TensorList tensors, int64_t dummyBase, int64_t blockSize,
-         bool optimized, int64_t stage)
+         int64_t variant, int64_t stage)
 {
     TORCH_CHECK(tensors.size() == 20, "expected 20 resident tensors");
     const auto device = tensors[0].device();
     TORCH_CHECK(tensors[0].is_privateuseone(), "resident experiment requires NPU tensors");
     TORCH_CHECK(stage >= 0 && stage <= 3, "stage must be 0..3");
+    TORCH_CHECK(variant >= 0 && variant <= 4, "variant must be 0..4");
     TORCH_CHECK(blockSize > 0 && blockSize <= 4096, "invalid block size");
     TORCH_CHECK(tensors[3].dim() == 3 && tensors[8].dim() == 3 &&
                 tensors[19].dim() == 2 && tensors[0].dim() == 3,
@@ -88,11 +89,10 @@ void run(at::TensorList tensors, int64_t dummyBase, int64_t blockSize,
     // Use the same task-queue/stream path as production. A raw ctypes launch
     // could overtake queued torch-npu copies even if it uses the same stream.
     at_npu::native::OpCommand command;
-    command.Name(optimized ? "resident_experiment_optimized" : "resident_experiment_baseline");
-    command.SetCustomHandler([stream, a, optimized, stage,
+    command.Name("resident_experiment");
+    command.SetCustomHandler([stream, a, variant, stage,
                               owners = std::vector<at::Tensor>(tensors.begin(), tensors.end())]() -> int {
-        if (optimized) resident_experiment_run_optimized(stream, a, stage);
-        else resident_experiment_run(stream, a, stage);
+        resident_experiment_run_variant(stream, a, variant, stage);
         return 0;
     });
     command.Run();
@@ -101,7 +101,7 @@ void run(at::TensorList tensors, int64_t dummyBase, int64_t blockSize,
 
 TORCH_LIBRARY(resident_experiment, m) {
     m.def("run_(Tensor(a!)[] tensors, int dummy_base, int block_size, "
-          "bool optimized=False, int stage=0) -> ()");
+          "int variant=0, int stage=0) -> ()");
 }
 TORCH_LIBRARY_IMPL(resident_experiment, PrivateUse1, m) {
     m.impl("run_", &run);
