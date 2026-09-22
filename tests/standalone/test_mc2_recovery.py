@@ -188,10 +188,13 @@ def test_async_scheduler_inherits_the_bounded_ascend_schedule():
     for path, names in sources:
         for node in ast.parse(path.read_text(encoding="utf-8")).body:
             if isinstance(node, ast.ClassDef) and node.name in names:
-                # Retain any schedule override and the actual declared bases.
-                node.body = [n for n in node.body if getattr(n, "name", None) == "schedule"] or [ast.Pass()]
+                # Retain scheduling/preemption overrides and the declared bases.
+                node.body = [n for n in node.body if getattr(n, "name", None) in
+                             {"schedule", "_preempt_request"}] or [ast.Pass()]
                 nodes.append(node)
     ns = {"Scheduler": type("Scheduler", (), {})}
     future = ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0)
-    exec(compile(ast.fix_missing_locations(ast.Module(body=[future, *nodes], type_ignores=[])), "scheduler_mro", "exec"), ns)
+    module = ast.fix_missing_locations(ast.Module(body=[future, *nodes], type_ignores=[]))
+    exec(compile(module, "scheduler_mro", "exec"), ns)
     assert ns["AsyncRecomputeScheduler"].schedule is ns["RecomputeScheduler"].schedule
+    assert ns["AsyncRecomputeScheduler"]._preempt_request is ns["RecomputeScheduler"]._preempt_request

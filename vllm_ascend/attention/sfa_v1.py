@@ -679,13 +679,13 @@ def _validate_dsa_scratch_capacity(
         {int(value) for value in request_rows if int(value) >= 0}
     ):
         rows = np.flatnonzero(request_rows == request_index)
-        if rows.size * width > capacity:
+        request_boundaries = boundaries[rows]
+        if np.count_nonzero(request_boundaries) * width > capacity:
             raise RuntimeError(
                 "DSA request-union scratch reservation is too small: "
                 f"request={request_index}, rows={rows.size}, "
                 f"index_topk={width}, scratch_capacity={capacity}."
             )
-        request_boundaries = boundaries[rows]
         if np.any(
             (request_boundaries != 0)
             & (request_boundaries < capacity)
@@ -1521,20 +1521,27 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
                             self.decode_threshold
                             if common_attn_metadata.attn_state
                             == AscendAttentionState.SpecDecoding
-                            else 1
+                            else (
+                                1
+                                if common_attn_metadata.attn_state == AscendAttentionState.DecodeOnly
+                                else common_attn_metadata.max_query_len
+                            )
                         )
+                        # Prompt-only recovery may have no draft token. Native
+                        # prefill can also include longer history recomputation.
+                        # Both require the actual restored frontier to match.
                         if (
-                            e - s != expected_width
+                            not 1 <= e - s <= expected_width
                             or int(computed[r]) != expected_end
                         ):
                             raise RuntimeError(
                                 "Invalid cold-compact resume layout: "
                                 f"request={r}, rows={e - s}, prompt={plen}, "
                                 f"computed={int(computed[r])}, "
-                                f"expected_rows={expected_width}."
+                                f"allowed_rows=1..{expected_width}."
                             )
-                        # The first real row recomputes the final prompt token;
-                        # later rows validate speculative tokens.  Every one of
+                        # The first row processes the pending history token;
+                        # any later rows validate speculative tokens. Every one of
                         # them consumes sparse prefix KV and must participate in
                         # compact retrieval/remapping.  Treating the first row
                         # as padding leaves it reading stale scratch contents.

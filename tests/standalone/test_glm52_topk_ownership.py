@@ -64,8 +64,11 @@ def test_staged_consumer_prepares_the_next_physical_indexer():
     names = {"_cross_layer_kv_cache", "_layer_has_indexer_by_name", "cross_layer_lmcache_retrieve"}
     nodes = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name in names]
     waits = []
+    stream = object()
+    records = []
+    event = NS(record=lambda actual: records.append(actual))
     ns = dict(
-        torch=torch, _staged_sfa_profile_scope=lambda _: nullcontext(),
+        torch=NS(npu=NS(current_stream=lambda: stream)), _staged_sfa_profile_scope=lambda _: nullcontext(),
         _dsa_index_lmcache_enabled=lambda: True,
         _dsa_indexer_layer_name=lambda name: name.rsplit(".attn", 1)[0] + ".indexer.k_cache",
         wait_for_kv_layer_from_connector=lambda name, **kw: waits.append(name),
@@ -80,7 +83,7 @@ def test_staged_consumer_prepares_the_next_physical_indexer():
     current, following = "model.layers.5.self_attn.attn", "model.layers.6.self_attn.attn"
     cache, index_name, enabled = obj._cross_layer_kv_cache(current, (object(), object()))
     assert index_name is None and enabled
-    obj._staged_sfa_capture_state = NS(runtime=(current, cache, index_name, enabled), producer_event=None)
+    obj._staged_sfa_capture_state = NS(runtime=(current, cache, index_name, enabled), producer_event=event)
     obj._staged_sfa_bridge_buffers = None
     obj._staged_graph_content_diagnostic_enabled = lambda _: False
     obj._target_sfa_diag_pre_retrieve = lambda *a: None
@@ -94,6 +97,8 @@ def test_staged_consumer_prepares_the_next_physical_indexer():
     payload = torch.zeros(1, 4)
     obj.cross_layer_lmcache_retrieve(current, following, payload, payload, payload, metadata, context)
     assert waits == [current, "model.layers.6.self_attn.indexer.k_cache"]
+    assert records == [stream]
+    assert metadata.reshape_cache_event is event
     waits.clear()
     next_impl.has_indexer = False
     obj.cross_layer_lmcache_retrieve(current, following, payload, payload, payload, metadata, context)
@@ -110,3 +115,4 @@ def test_staged_consumer_prepares_the_next_physical_indexer():
     waits.clear()
     obj.cross_layer_lmcache_retrieve(current, following, payload, payload, payload, metadata, context)
     assert waits == [current, "model.layers.6.self_attn.indexer.k_cache"]
+    assert records == [stream] * 3
