@@ -226,7 +226,7 @@ def case_environment(args, case):
             "LMCACHE_USE_LAYERWISE": "true",
             "LMCACHE_ENABLE_SPARSE_ATTENTION": "true",
             "LMCACHE_DSA_TWO_GROUPS": "true",
-            "LMCACHE_STORE_ASYNC": "false",
+            "LMCACHE_STORE_ASYNC": "true",
             "LMCACHE_SAVE_DECODE_CACHE": "false",
             "LMCACHE_SAVE_UNFULL_CHUNK": "true",
             "LMCACHE_SAVE_FULL_CHUNK_IN_DECODE": "false",
