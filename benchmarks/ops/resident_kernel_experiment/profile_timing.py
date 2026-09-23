@@ -21,8 +21,10 @@ def kernel_names(variant):
     update = "compact" if variant in ("compact_remap", "combined") else union
     if variant == "vector_union":
         union = "vector"
-    elif variant == "vector_intersection":
+    elif variant in ("vector_intersection", "exact_combined"):
         union = "intersection"
+    if variant in ('vector_state_update', 'exact_combined'):
+        update = 'state'
     return {"union": f"dsa_resident_sharded_union_kernel_{union}",
             "finalize": finalize, "update": f"dsa_resident_sorted_update_kernel_{update}"}
 
@@ -35,6 +37,11 @@ def parse_trace(document, variant, stage, iterations):
     expected = kernel_names(variant)
     if stage in ("union_sort", "union_dedup"):
         expected = {stage: expected["union"] + "_" + stage.removeprefix("union_")}
+    elif stage == 'state_update':
+        suffix = 'state' if variant in ('vector_state_update', 'exact_combined') else 'baseline'
+        expected = {stage: f'dsa_resident_sorted_state_update_kernel_{suffix}'}
+    elif stage == 'remap':
+        expected = {stage: 'dsa_resident_sorted_remap_kernel_baseline'}
     elif stage != "full":
         expected = {stage: expected[stage]}
     grouped = {name: [] for name in expected}

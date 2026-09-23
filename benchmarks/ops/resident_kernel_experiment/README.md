@@ -21,6 +21,8 @@ with `--variants`; `baseline` is always included for comparison.
 | `combined` | Sharded worker | Compact slot gather; original state merge |
 | `vector_union` | Original | Original; vectorized union deduplication/mapping |
 | `vector_intersection` | Original | Original sorting/dedup; exact vector resident intersection only |
+| `vector_state_update` | Original | Exact vector state merge; original union/finalize/remap |
+| `exact_combined` | Original | Vector intersection and vector state merge; original finalize/remap |
 
 `vector_union` changes only the union kernel. Sorting, the subsequent scalar
 resident intersection, allocation policy, finalize and update remain baseline.
@@ -257,6 +259,60 @@ same tensor schema in [redesign/MATCHED_COMPARISON.md](redesign/MATCHED_COMPARIS
 Repeat with requests 1/8/16 and other selection patterns before promoting the variant.
 The report separates union, complete three-kernel planning, and total preparation.
 The prepared-per-request backend is shared by both; this is not full-model TPOT.
+
+## Exact state-update experiment
+
+`vector_state_update` preserves the exact eviction prefix and sorted token/slot
+state. It compacts old tokens absent from current, discards precisely the prefix
+selected by finalize, then uses parallel merge-path searches to merge the retained
+old entries with current tokens. Finalized current hit slots equal their old slots;
+misses keep the slots assigned by the unchanged finalizer. No token IDs are cast
+to float, and A2 comparisons use integer Min/EQ/Not with 64-lane padding.
+
+The guarded path requires `oldCount + currentCount <= 2048`. Larger/skewed shards
+use the original scalar merge. The 4096-capacity/single-shard geometry also stays
+scalar. Vector-capable geometries reserve 48 KiB additional UB (no extra GM scratch
+or payload banks); calculated explicit UB allocation is at most 164 KiB. The
+merged state buffers remain disjoint from remap scratch, and the vector-to-MTE3
+dependency is completed before original publication/remap code runs.
+
+`exact_combined` adds the previously measured vector intersection. Both variants
+remain experiment-only compile flags, disabled in the serving build. They add no
+retrieval calls or payload copies. Correctness and speed still require NPU testing.
+
+```bash
+EXP=benchmarks/ops/resident_kernel_experiment
+RED="$EXP/redesign"
+BUILD="$EXP/build-910b3-state-update"
+bash "$EXP/build.sh" ascend910b3 "$BUILD" &&
+python -m pytest --confcutdir="$EXP/tests" -o addopts= "$EXP/tests" \
+  --resident-build-dir "$BUILD" -xq
+
+python "$EXP/benchmark.py" --build-dir "$BUILD" --requests 8 --mtp 2 \
+  --shards-per-row 4 --hit-rates 0.9 \
+  --variants baseline vector_intersection vector_state_update exact_combined \
+  --stage full --iterations 30 --warmup 20 --json "$EXP/state-full-results.json"
+
+for STAGE in state_update remap; do
+  python "$EXP/benchmark.py" --build-dir "$BUILD" --requests 8 --mtp 2 \
+    --shards-per-row 4 --hit-rates 0.9 --variants baseline vector_state_update \
+    --stage "$STAGE" --iterations 30 --warmup 20 --json "$EXP/$STAGE-results.json" || break
+done
+
+python "$RED/matched.py" --original-build-dir "$BUILD" \
+  --methods original vector_intersection vector_state_update exact_combined \
+  --lmcache-ascend-dir /workspace/sqh/LMCache-Ascend \
+  --trace "$RED/sweeps/matched-r8-shift/r8-inputs.pt" \
+  --output-dir "$RED/sweeps/state-update-r8" --repeats 4
+```
+
+State-only and remap-only probes start from the same baseline union/finalize output.
+They are diagnostic components, not exact additive phase timers: separate kernels
+have different initialization and expose different writeback overlap. Judge the
+full three-kernel and matched retrieval path. The matched runner verifies exact
+state, remapped indices, miss/target arrays and source counts before timing every
+exact variant. Use `--requests 1 8 16` without `--trace` for a synthetic size sweep;
+for serving inputs use the documented pre-remap tensor trace schema.
 
 ## Isolate the union prefix cost
 

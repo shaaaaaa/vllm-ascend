@@ -24,7 +24,7 @@ from matched_data import make_trace, trace_digest, validate_trace
 from matched_runtime import Original, Replacement, Sources, load_transfer_api
 
 METHODS = ('original', 'bounded_position', 'hash_snapshot', 'direct_directory')
-EXACT_METHODS = ('original', 'vector_intersection')
+EXACT_METHODS = ('original', 'vector_intersection', 'vector_state_update', 'exact_combined')
 ORIGINAL_SYMBOLS = ('dsa_resident_sharded_union_kernel_baseline',
                     'dsa_resident_sorted_finalize_kernel_baseline',
                     'dsa_resident_sorted_update_kernel_baseline')
@@ -45,8 +45,10 @@ def device_timing(document, method, steps):
         raise RuntimeError('invalid hardware durations')
     end = [s+d for s, d in zip(start, duration, strict=True)]
     names = [str(e.get('name', '')) for e in tasks]
-    planning = ((ORIGINAL_SYMBOLS[0].replace('_baseline', '_intersection'), *ORIGINAL_SYMBOLS[1:])
-                if method == 'vector_intersection' else ORIGINAL_SYMBOLS)
+    planning = (ORIGINAL_SYMBOLS[0].replace('_baseline', '_intersection')
+                if method in ('vector_intersection', 'exact_combined') else ORIGINAL_SYMBOLS[0],
+                ORIGINAL_SYMBOLS[1], ORIGINAL_SYMBOLS[2].replace('_baseline', '_state')
+                if method in ('vector_state_update', 'exact_combined') else ORIGINAL_SYMBOLS[2])
     symbols = planning if method in EXACT_METHODS else ('resident_pack_sources_redesign',)
     for symbol in symbols:
         if sum(symbol in name for name in names) != steps:
@@ -148,7 +150,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--original-build-dir', type=Path, required=True)
     parser.add_argument('--build-dir', type=Path, help='required only for redesign replacement methods')
-    parser.add_argument('--methods', choices=(*METHODS, 'vector_intersection'), nargs='+', default=list(METHODS))
+    parser.add_argument('--methods', choices=tuple(dict.fromkeys((*METHODS, *EXACT_METHODS))), nargs='+', default=list(METHODS))
     parser.add_argument('--lmcache-ascend-dir', type=Path, required=True)
     parser.add_argument('--output-dir', type=Path, required=True)
     parser.add_argument('--trace', type=Path, help='tensor-only .pt: initial_tokens, initial_ready, steps, boundary, lengths')
@@ -212,8 +214,9 @@ def main():
                 graphs[name], misses[name] = capture(cases[name])
                 memory[name] = torch.npu.memory_allocated() - before
                 samples[name] = []
-            if 'vector_intersection' in cases:
-                verify_exact_pair(cases['original'], cases['vector_intersection'])
+            for name in methods:
+                if name != 'original' and name in EXACT_METHODS:
+                    verify_exact_pair(cases['original'], cases[name])
             for repeat in range(args.repeats):
                 order = measurement_order(repeat, methods)
                 for name in order:

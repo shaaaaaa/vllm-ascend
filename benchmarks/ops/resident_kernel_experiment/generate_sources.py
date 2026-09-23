@@ -34,7 +34,8 @@ SCALARS = {
 
 
 def generate(source: str, header: Path, *, variants=(("baseline", 0), ("optimized", 1)), kernels=None,
-             compact=False, sharded=False, vector_union=False, union_stop=0, vector_intersection=False) -> dict[str, str]:
+             compact=False, sharded=False, vector_union=False, union_stop=0, vector_intersection=False,
+             vector_state=False) -> dict[str, str]:
     marker = 'extern "C" __global__ __aicore__ void\n'
     classes, separator, _ = source.partition(marker)
     if not separator:
@@ -75,6 +76,7 @@ def generate(source: str, header: Path, *, variants=(("baseline", 0), ("optimize
                 f"#define RESIDENT_EXPERIMENT_COMPACT_REMAP {int(compact)}\n"
                 f"#define RESIDENT_EXPERIMENT_VECTOR_UNION {int(vector_union)}\n"
                 f"#define RESIDENT_EXPERIMENT_VECTOR_INTERSECTION {int(vector_intersection)}\n"
+                f"#define RESIDENT_EXPERIMENT_VECTOR_STATE {int(vector_state)}\n"
                 f"#define RESIDENT_EXPERIMENT_UNION_STOP {union_stop}\n"
                 + classes + entry + launch
             )
@@ -97,6 +99,14 @@ def main() -> None:
                            kernels={"union": KERNELS["union"]}, vector_union=True))
     output.update(generate(source, HERE / "launch.h", variants=(("intersection", 0),),
                            kernels={"union": KERNELS["union"]}, vector_intersection=True))
+    output.update(generate(source, HERE / "launch.h", variants=(("state", 0),),
+                           kernels={"update": KERNELS["update"]}, vector_state=True))
+    for variant in ('baseline', 'state'):
+        output.update(generate(source, HERE / 'launch.h', variants=((variant, 0),),
+                               kernels={'state_update': 'dsa_resident_sorted_state_update_kernel'},
+                               vector_state=variant == 'state'))
+    output.update(generate(source, HERE / 'launch.h', variants=(('baseline', 0),),
+                           kernels={'remap': 'dsa_resident_sorted_remap_kernel'}))
     for variant in ("baseline", "vector"):
         for phase, stop in (("sort", 1), ("dedup", 2)):
             output.update(generate(source, HERE / "launch.h", variants=((variant, 0),),

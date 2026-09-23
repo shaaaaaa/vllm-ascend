@@ -33,6 +33,9 @@
 #ifndef RESIDENT_EXPERIMENT_VECTOR_INTERSECTION
 #define RESIDENT_EXPERIMENT_VECTOR_INTERSECTION 0
 #endif
+#ifndef RESIDENT_EXPERIMENT_VECTOR_STATE
+#define RESIDENT_EXPERIMENT_VECTOR_STATE 0
+#endif
 
 namespace {
 
@@ -2117,6 +2120,10 @@ public:
         // both pipelines can overlap without remap overwriting MTE3 input.
         pipe_.InitBuffer(remapOffsetBuf_, remapInt32Bytes);
         pipe_.InitBuffer(remapGatheredBuf_, remapInt32Bytes);
+#if RESIDENT_EXPERIMENT_VECTOR_STATE
+        // Keep the 4096-entry/single-shard case on its original UB footprint.
+        if (VectorStateCapacity()) pipe_.InitBuffer(vectorStateBuf_, 6 * kStateWidth * sizeof(int32_t));
+#endif
     }
 
     __aicore__ inline void Process()
@@ -2227,6 +2234,12 @@ public:
         uint32_t currentIndex = 0;
         uint32_t evictableIndex = 0;
         uint32_t mergedCount = 0;
+#if RESIDENT_EXPERIMENT_VECTOR_STATE
+        if (VectorStateCapacity() && oldCount + currentCount <= kStateWidth) {
+            mergedCount = VectorStateMerge(oldCount, currentCount, selectedEvictCount);
+        } else
+#endif
+        {
         if (oldCount > 0 || currentCount > 0) {
             while (oldIndex < oldCount ||
                    currentIndex < currentCount) {
@@ -2269,6 +2282,8 @@ public:
             }
         }
 
+        }
+
         Sync<AscendC::HardEvent::S_MTE3>();
         if (mergedCount > 0) {
             CopyLocalToGlobalExact(
@@ -2308,8 +2323,8 @@ public:
         Sync<AscendC::HardEvent::MTE3_S>();
     }
 
-    // Split-path state update. Keep Process() above unchanged so the original
-    // fused update+remap kernel remains available as an exact fallback.
+    // Split-path diagnostic uses the same state-merge selection as the fused
+    // kernel. The serving/default build retains the original scalar path.
     __aicore__ inline void ProcessStateOnly()
     {
         const uint32_t logicalBlockCount = requestCount_ * shardCount_;
@@ -2393,6 +2408,12 @@ public:
         uint32_t currentIndex = 0;
         uint32_t evictableIndex = 0;
         uint32_t mergedCount = 0;
+#if RESIDENT_EXPERIMENT_VECTOR_STATE
+        if (VectorStateCapacity() && oldCount + currentCount <= kStateWidth) {
+            mergedCount = VectorStateMerge(oldCount, currentCount, selectedEvictCount);
+        } else
+#endif
+        {
         if (oldCount > 0 || currentCount > 0) {
             while (oldIndex < oldCount ||
                    currentIndex < currentCount) {
@@ -2435,6 +2456,8 @@ public:
             }
         }
 
+        }
+
         Sync<AscendC::HardEvent::S_MTE3>();
         if (mergedCount > 0) {
             CopyLocalToGlobalExact(
@@ -2468,6 +2491,166 @@ public:
     }
 
 private:
+#if RESIDENT_EXPERIMENT_VECTOR_STATE
+    static constexpr uint32_t kStateWidth = 2048;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> vectorStateBuf_;
+
+    __aicore__ inline bool VectorStateCapacity()
+    {
+        return capacity_ >= kStateWidth && (capacity_ == kStateWidth || shardCount_ > 1);
+    }
+    __aicore__ inline uint32_t StateWidth(uint32_t n) { return (n + 63U) & ~63U; }
+    __aicore__ inline void StateLess(AscendC::LocalTensor<uint8_t> mask,
+        AscendC::LocalTensor<int32_t> a, AscendC::LocalTensor<int32_t> b,
+        AscendC::LocalTensor<int32_t> tmp, uint32_t width)
+    {
+        AscendC::Min(tmp, a, b, width); AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Compare(mask, tmp, b, AscendC::CMPMODE::EQ, width); AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Not(mask.ReinterpretCast<uint16_t>(), mask.ReinterpretCast<uint16_t>(), width / 16);
+        AscendC::PipeBarrier<PIPE_V>();
+    }
+    __aicore__ inline void StateAnd(AscendC::LocalTensor<uint8_t> a,
+        AscendC::LocalTensor<uint8_t> b, uint32_t width)
+    {
+        AscendC::And(a.ReinterpretCast<uint16_t>(), a.ReinterpretCast<uint16_t>(), b.ReinterpretCast<uint16_t>(), width / 16);
+        AscendC::PipeBarrier<PIPE_V>();
+    }
+    __aicore__ inline uint32_t VectorStateMerge(uint32_t oldCount, uint32_t currentCount, uint32_t evictions)
+    {
+        if (oldCount + currentCount == 0) return 0;
+        Sync<AscendC::HardEvent::MTE2_V>();
+        auto low = vectorStateBuf_.Get<int32_t>(); auto high = low[kStateWidth];
+        auto mid = high[kStateWidth]; auto offsets = mid[kStateWidth];
+        auto a = offsets[kStateWidth]; auto b = a[kStateWidth];
+        auto missing = selectedMaskBuf_.Get<uint8_t>(); auto valid = missing[256];
+        auto less = valid[256]; auto validB = less[256]; auto chooseA = validB[256];
+        auto old = oldTokenBuf_.Get<int32_t>(); auto oldSlots = oldSlotBuf_.Get<int16_t>();
+        auto current = currentTokenBuf_.Get<int32_t>(); auto currentSlots = priorSlotBuf_.Get<int16_t>();
+        auto survivors = survivorTokenBuf_.Get<int32_t>(); auto survivorSlots = survivorSlotBuf_.Get<int16_t>();
+        auto output = mergedTokenBuf_.Get<int32_t>(); auto outputSlots = mergedSlotBuf_.Get<int16_t>();
+        uint32_t retained = 0;
+        if (oldCount > 0) {
+            const uint32_t width = StateWidth(oldCount);
+            AscendC::CreateVecIndex(mid, static_cast<int32_t>(0), width); AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Mins(a, mid, static_cast<int32_t>(oldCount - 1), width); AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Compare(valid, a, mid, AscendC::CMPMODE::EQ, width); AscendC::PipeBarrier<PIPE_V>();
+            if (currentCount == 0) {
+                AscendC::And(missing.ReinterpretCast<uint16_t>(), valid.ReinterpretCast<uint16_t>(), valid.ReinterpretCast<uint16_t>(), width / 16);
+                AscendC::PipeBarrier<PIPE_V>();
+            } else {
+                AscendC::Duplicate(low, static_cast<int32_t>(0), width);
+                AscendC::Duplicate(high, static_cast<int32_t>(currentCount), width); AscendC::PipeBarrier<PIPE_V>();
+                for (uint32_t remaining = currentCount; remaining; remaining >>= 1) {
+                    AscendC::Add(mid, low, high, width); AscendC::PipeBarrier<PIPE_V>();
+                    AscendC::ShiftRight(mid, mid, 1, width); AscendC::PipeBarrier<PIPE_V>();
+                    AscendC::Mins(offsets, mid, static_cast<int32_t>(currentCount - 1), width); AscendC::PipeBarrier<PIPE_V>();
+                    AscendC::Muls(offsets, offsets, 4, width); AscendC::PipeBarrier<PIPE_V>();
+                    AscendC::Gather(a, current, offsets.ReinterpretCast<uint32_t>(), 0, width); AscendC::PipeBarrier<PIPE_V>();
+                    StateLess(less, a, old, offsets, width);
+                    AscendC::Adds(offsets, mid, 1, width); AscendC::PipeBarrier<PIPE_V>();
+                    AscendC::Mins(offsets, offsets, static_cast<int32_t>(currentCount), width); AscendC::PipeBarrier<PIPE_V>();
+                    AscendC::Select(low.ReinterpretCast<float>(), less, offsets.ReinterpretCast<float>(), low.ReinterpretCast<float>(), AscendC::SELMODE::VSEL_TENSOR_TENSOR_MODE, width);
+                    AscendC::Select(high.ReinterpretCast<float>(), less, high.ReinterpretCast<float>(), mid.ReinterpretCast<float>(), AscendC::SELMODE::VSEL_TENSOR_TENSOR_MODE, width); AscendC::PipeBarrier<PIPE_V>();
+                }
+                AscendC::Mins(offsets, low, static_cast<int32_t>(currentCount - 1), width); AscendC::PipeBarrier<PIPE_V>();
+                AscendC::Muls(offsets, offsets, 4, width); AscendC::PipeBarrier<PIPE_V>();
+                AscendC::Gather(a, current, offsets.ReinterpretCast<uint32_t>(), 0, width); AscendC::PipeBarrier<PIPE_V>();
+                AscendC::Compare(missing, a, old, AscendC::CMPMODE::EQ, width); AscendC::PipeBarrier<PIPE_V>();
+                AscendC::Not(missing.ReinterpretCast<uint16_t>(), missing.ReinterpretCast<uint16_t>(), width / 16); AscendC::PipeBarrier<PIPE_V>();
+                StateAnd(missing, valid, width);
+            }
+            // Stable compaction preserves finalize's eviction-prefix order.
+            AscendC::Cast(b.ReinterpretCast<float>(), oldSlots, AscendC::RoundMode::CAST_NONE, width);
+            AscendC::Duplicate(a.ReinterpretCast<float>(), 0.0F, width); AscendC::PipeBarrier<PIPE_V>();
+            AscendC::GatherMaskParams p;
+            p.repeatTimes = 1; p.src0BlockStride = 1; p.src0RepeatStride = 8; p.src1RepeatStride = 8;
+            uint64_t count = 0, slotCount = 0;
+            AscendC::GatherMask(survivors, old, missing.ReinterpretCast<uint32_t>(), true, width, p, count);
+            AscendC::GatherMask(a.ReinterpretCast<float>(), b.ReinterpretCast<float>(), missing.ReinterpretCast<uint32_t>(), true, width, p, slotCount);
+            AscendC::PipeBarrier<PIPE_V>(); Sync<AscendC::HardEvent::V_S>();
+            const uint32_t absent = static_cast<uint32_t>(count);
+            retained = absent > evictions ? absent - evictions : 0;
+            if (retained > 0) {
+                AscendC::Cast(survivorSlots, a.ReinterpretCast<float>(), AscendC::RoundMode::CAST_ROUND, StateWidth(absent)); AscendC::PipeBarrier<PIPE_V>();
+                const uint32_t w = StateWidth(retained);
+                AscendC::CreateVecIndex(offsets, static_cast<int32_t>(evictions), w); AscendC::PipeBarrier<PIPE_V>();
+                AscendC::Mins(offsets, offsets, static_cast<int32_t>(absent - 1), w); AscendC::PipeBarrier<PIPE_V>();
+                AscendC::Muls(offsets, offsets, 4, w); AscendC::PipeBarrier<PIPE_V>();
+                AscendC::Gather(old, survivors, offsets.ReinterpretCast<uint32_t>(), 0, w); AscendC::PipeBarrier<PIPE_V>();
+                AscendC::ShiftRight(offsets, offsets, 1, w); AscendC::PipeBarrier<PIPE_V>();
+                AscendC::Gather(oldSlots, survivorSlots, offsets.ReinterpretCast<uint32_t>(), 0, w); AscendC::PipeBarrier<PIPE_V>();
+            }
+        }
+        const uint32_t total = currentCount + retained;
+        if (total == 0) return 0;
+        const uint32_t width = StateWidth(total);
+        if (currentCount == 0 || retained == 0) {
+            AscendC::DataCopy(output, currentCount ? current : old, width);
+            AscendC::DataCopy(outputSlots, currentCount ? currentSlots : oldSlots, width);
+            AscendC::PipeBarrier<PIPE_V>();
+        } else {
+            // Merge-path: find the current/retained partition for each output
+            // position. Inputs are disjoint sorted sets; no vector Scatter or
+            // floating-point token conversion is needed.
+            AscendC::CreateVecIndex(mid, static_cast<int32_t>(0), width); AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Adds(low, mid, -static_cast<int32_t>(retained), width); AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Maxs(low, low, 0, width); AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Mins(high, mid, static_cast<int32_t>(currentCount), width); AscendC::PipeBarrier<PIPE_V>();
+            for (uint32_t remaining = currentCount; remaining; remaining >>= 1) {
+                AscendC::Add(mid, low, high, width); AscendC::PipeBarrier<PIPE_V>();
+                AscendC::ShiftRight(mid, mid, 1, width); AscendC::PipeBarrier<PIPE_V>();
+                AscendC::Mins(offsets, mid, static_cast<int32_t>(currentCount - 1), width); AscendC::PipeBarrier<PIPE_V>();
+                AscendC::Compare(valid, offsets, mid, AscendC::CMPMODE::EQ, width); AscendC::PipeBarrier<PIPE_V>();
+                AscendC::Muls(offsets, offsets, 4, width); AscendC::PipeBarrier<PIPE_V>();
+                AscendC::Gather(a, current, offsets.ReinterpretCast<uint32_t>(), 0, width); AscendC::PipeBarrier<PIPE_V>();
+                AscendC::CreateVecIndex(offsets, static_cast<int32_t>(0), width); AscendC::PipeBarrier<PIPE_V>();
+                AscendC::Sub(offsets, offsets, mid, width); AscendC::PipeBarrier<PIPE_V>();
+                AscendC::Maxs(b, offsets, 1, width); AscendC::PipeBarrier<PIPE_V>();
+                AscendC::Compare(validB, b, offsets, AscendC::CMPMODE::EQ, width); AscendC::PipeBarrier<PIPE_V>();
+                AscendC::Adds(offsets, offsets, -1, width); AscendC::PipeBarrier<PIPE_V>();
+                AscendC::Maxs(offsets, offsets, 0, width); AscendC::PipeBarrier<PIPE_V>();
+                AscendC::Mins(offsets, offsets, static_cast<int32_t>(retained - 1), width); AscendC::PipeBarrier<PIPE_V>();
+                AscendC::Muls(offsets, offsets, 4, width); AscendC::PipeBarrier<PIPE_V>();
+                AscendC::Gather(b, old, offsets.ReinterpretCast<uint32_t>(), 0, width); AscendC::PipeBarrier<PIPE_V>();
+                StateLess(less, a, b, offsets, width); StateAnd(less, valid, width); StateAnd(less, validB, width);
+                AscendC::Adds(offsets, mid, 1, width); AscendC::PipeBarrier<PIPE_V>();
+                AscendC::Select(low.ReinterpretCast<float>(), less, offsets.ReinterpretCast<float>(), low.ReinterpretCast<float>(), AscendC::SELMODE::VSEL_TENSOR_TENSOR_MODE, width);
+                AscendC::Select(high.ReinterpretCast<float>(), less, high.ReinterpretCast<float>(), mid.ReinterpretCast<float>(), AscendC::SELMODE::VSEL_TENSOR_TENSOR_MODE, width); AscendC::PipeBarrier<PIPE_V>();
+            }
+            AscendC::Mins(offsets, low, static_cast<int32_t>(currentCount - 1), width); AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Compare(valid, offsets, low, AscendC::CMPMODE::EQ, width); AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Muls(offsets, offsets, 4, width); AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Gather(a, current, offsets.ReinterpretCast<uint32_t>(), 0, width); AscendC::PipeBarrier<PIPE_V>();
+            AscendC::CreateVecIndex(mid, static_cast<int32_t>(0), width); AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Sub(mid, mid, low, width); AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Mins(offsets, mid, static_cast<int32_t>(retained - 1), width); AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Compare(validB, offsets, mid, AscendC::CMPMODE::EQ, width); AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Muls(offsets, offsets, 4, width); AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Gather(b, old, offsets.ReinterpretCast<uint32_t>(), 0, width); AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Duplicate(offsets, static_cast<int32_t>(0x7fffffff), width); AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Select(a.ReinterpretCast<float>(), valid, a.ReinterpretCast<float>(), offsets.ReinterpretCast<float>(), AscendC::SELMODE::VSEL_TENSOR_TENSOR_MODE, width);
+            AscendC::Select(b.ReinterpretCast<float>(), validB, b.ReinterpretCast<float>(), offsets.ReinterpretCast<float>(), AscendC::SELMODE::VSEL_TENSOR_TENSOR_MODE, width); AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Min(offsets, a, b, width); AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Compare(chooseA, offsets, a, AscendC::CMPMODE::EQ, width); AscendC::PipeBarrier<PIPE_V>();
+            StateAnd(chooseA, valid, width);
+            AscendC::Select(output.ReinterpretCast<float>(), chooseA, a.ReinterpretCast<float>(), b.ReinterpretCast<float>(), AscendC::SELMODE::VSEL_TENSOR_TENSOR_MODE, width); AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Mins(offsets, low, static_cast<int32_t>(currentCount - 1), width); AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Muls(offsets, offsets, 2, width); AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Gather(a.ReinterpretCast<int16_t>(), currentSlots, offsets.ReinterpretCast<uint32_t>(), 0, width); AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Cast(b.ReinterpretCast<float>(), a.ReinterpretCast<int16_t>(), AscendC::RoundMode::CAST_NONE, width); AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Mins(offsets, mid, static_cast<int32_t>(retained - 1), width); AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Muls(offsets, offsets, 2, width); AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Gather(a.ReinterpretCast<int16_t>(), oldSlots, offsets.ReinterpretCast<uint32_t>(), 0, width); AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Cast(offsets.ReinterpretCast<float>(), a.ReinterpretCast<int16_t>(), AscendC::RoundMode::CAST_NONE, width); AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Select(offsets.ReinterpretCast<float>(), chooseA, b.ReinterpretCast<float>(), offsets.ReinterpretCast<float>(), AscendC::SELMODE::VSEL_TENSOR_TENSOR_MODE, width); AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Cast(outputSlots, offsets.ReinterpretCast<float>(), AscendC::RoundMode::CAST_ROUND, width); AscendC::PipeBarrier<PIPE_V>();
+        }
+        Sync<AscendC::HardEvent::V_MTE3>();
+        Sync<AscendC::HardEvent::V_S>();
+        return total;
+    }
+#endif
+
     __aicore__ inline void RemapPositionPartition(
         uint32_t request,
         uint32_t part,

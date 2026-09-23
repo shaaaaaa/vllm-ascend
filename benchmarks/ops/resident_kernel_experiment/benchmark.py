@@ -24,9 +24,9 @@ def summary(samples):
 
 def stage_snapshot(cpu, device, stage):
     case = cpu.clone(device)
-    if stage in ("finalize", "update"):
+    if stage in ("finalize", "update", "state_update", "remap"):
         case.run(False, "union")
-    if stage == "update":
+    if stage in ("update", "state_update", "remap"):
         case.run(False, "finalize")
     torch.npu.synchronize()
     return case
@@ -100,6 +100,8 @@ def main():
     variants = list(dict.fromkeys(["baseline", *args.variants]))
     if args.stage in ("union_sort", "union_dedup") and any(v not in ("baseline", "vector_union") for v in variants):
         parser.error("union prefix diagnostics support only baseline/vector_union")
+    if args.stage in ('state_update', 'remap') and any(v not in ('baseline', 'vector_intersection', 'vector_state_update', 'exact_combined') for v in variants):
+        parser.error('state/remap probes support baseline and exact variants only')
     run_dir = args.trace_dir / datetime.now().strftime("run_%Y%m%d_%H%M%S_%f")
     build = load_library(args.build_dir)
     torch.npu.set_device(args.device)

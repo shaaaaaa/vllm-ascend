@@ -120,7 +120,7 @@ class Sources:
 class Original:
     name = 'original'
     def __init__(self, source, trace, variant='baseline'):
-        if variant not in ('baseline', 'vector_intersection'):
+        if variant not in ('baseline', 'vector_intersection', 'vector_state_update', 'exact_combined'):
             raise ValueError('unsupported exact resident variant')
         self.variant = variant
         self.name = 'original' if variant == 'baseline' else variant

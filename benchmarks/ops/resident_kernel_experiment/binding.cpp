@@ -17,10 +17,12 @@ void run(at::TensorList tensors, int64_t dummyBase, int64_t blockSize,
     TORCH_CHECK(tensors.size() == 20, "expected 20 resident tensors");
     const auto device = tensors[0].device();
     TORCH_CHECK(tensors[0].is_privateuseone(), "resident experiment requires NPU tensors");
-    TORCH_CHECK(stage >= 0 && stage <= 5, "stage must be 0..5");
-    TORCH_CHECK(variant >= 0 && variant <= 6, "variant must be 0..6");
-    TORCH_CHECK(stage < 4 || variant == 0 || variant == 5,
+    TORCH_CHECK(stage >= 0 && stage <= 7, "stage must be 0..7");
+    TORCH_CHECK(variant >= 0 && variant <= 8, "variant must be 0..8");
+    TORCH_CHECK(stage < 4 || stage > 5 || variant == 0 || variant == 5,
                 "union prefix diagnostics support baseline/vector_union only");
+    TORCH_CHECK(stage < 6 || variant == 0 || variant >= 6,
+                "state/remap probes support baseline and exact variants only");
     TORCH_CHECK(blockSize > 0 && blockSize <= 4096, "invalid block size");
     TORCH_CHECK(tensors[3].dim() == 3 && tensors[8].dim() == 3 &&
                 tensors[19].dim() == 2 && tensors[0].dim() == 3,

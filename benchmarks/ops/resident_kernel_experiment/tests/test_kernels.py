@@ -111,7 +111,7 @@ def test_invalid_launch_rejected_before_kernel(native, fault):
     elif fault == "block_size":
         case.block_size = 0
     else:
-        stage = 6
+        stage = 8
     with pytest.raises(RuntimeError):
         torch.ops.resident_experiment.run_(case.tensors, case.dummy_base, case.block_size, 1, stage)
 

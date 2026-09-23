@@ -11,6 +11,10 @@ void resident_experiment_compact_update(void*, const ResidentLaunch&);
 void resident_experiment_sharded_finalize(void*, const ResidentLaunch&);
 void resident_experiment_vector_union(void*, const ResidentLaunch&);
 void resident_experiment_intersection_union(void*, const ResidentLaunch&);
+void resident_experiment_state_update(void*, const ResidentLaunch&);
+void resident_experiment_baseline_state_update(void*, const ResidentLaunch&);
+void resident_experiment_state_state_update(void*, const ResidentLaunch&);
+void resident_experiment_baseline_remap(void*, const ResidentLaunch&);
 void resident_experiment_baseline_union_sort(void*, const ResidentLaunch&);
 void resident_experiment_baseline_union_dedup(void*, const ResidentLaunch&);
 void resident_experiment_vector_union_sort(void*, const ResidentLaunch&);
@@ -32,6 +36,21 @@ void resident_experiment_run_optimized(void* stream, const ResidentLaunch& args,
 
 void resident_experiment_run_variant(void* stream, const ResidentLaunch& args, int variant, int stage)
 {
+    if (stage == 6) {
+        if (variant == 7 || variant == 8) resident_experiment_state_state_update(stream, args);
+        else resident_experiment_baseline_state_update(stream, args);
+        return;
+    }
+    if (stage == 7) { resident_experiment_baseline_remap(stream, args); return; }
+    if (variant == 7 || variant == 8) {
+        if (stage == 0 || stage == 1) {
+            if (variant == 8) resident_experiment_intersection_union(stream, args);
+            else resident_experiment_baseline_union(stream, args);
+        }
+        if (stage == 0 || stage == 2) resident_experiment_baseline_finalize(stream, args);
+        if (stage == 0 || stage == 3) resident_experiment_state_update(stream, args);
+        return;
+    }
     if (stage == 4) {
         if (variant == 5) resident_experiment_vector_union_sort(stream, args);
         else resident_experiment_baseline_union_sort(stream, args);

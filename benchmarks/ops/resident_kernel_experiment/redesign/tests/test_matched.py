@@ -222,9 +222,9 @@ def test_matched_adapter_state_and_payload_lifecycle_on_cpu(monkeypatch):
                 slots[kind, r, tile, i] = new[r, pos]
                 counts[kind, r, tile, 0] += 1
     monkeypatch.setattr(torch.ops, 'resident_redesign', SimpleNamespace(pack_sources_=pack))
-    for name in ('original', 'vector_intersection', 'bounded_position', 'hash_snapshot', 'direct_directory'):
+    for name in ('original', 'vector_intersection', 'vector_state_update', 'exact_combined', 'bounded_position', 'hash_snapshot', 'direct_directory'):
         runtime = (Original(source, trace, 'baseline' if name == 'original' else name)
-                   if name in ('original', 'vector_intersection') else Replacement(source, trace, name))
+                   if name in ('original', 'vector_intersection', 'vector_state_update', 'exact_combined') else Replacement(source, trace, name))
         counts = []
         for repeat in range(2):
             runtime.reset()
@@ -245,3 +245,11 @@ def test_exact_variant_profiler_includes_original_finalize_update():
     assert result['planning_three_us_per_step'] == 15
     assert result['union_us_per_step'] == 5
     assert result['complete_sum_us_per_step'] == 35
+
+
+@pytest.mark.parametrize('method', ('vector_state_update', 'exact_combined'))
+def test_state_variant_profiler_tracks_changed_update(method):
+    union = ORIGINAL_SYMBOLS[0].replace('_baseline', '_intersection') if method == 'exact_combined' else ORIGINAL_SYMBOLS[0]
+    names = (union, ORIGINAL_SYMBOLS[1], ORIGINAL_SYMBOLS[2].replace('_baseline', '_state'))
+    trace = [event(name, str(i*10), '5') for i, name in enumerate(names)]
+    assert device_timing(trace, method, 1)['planning_three_us_per_step'] == 15

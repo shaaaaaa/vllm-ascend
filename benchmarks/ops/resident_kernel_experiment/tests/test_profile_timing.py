@@ -92,3 +92,12 @@ def test_intersection_variant_changes_only_union_symbol():
     assert optimized['union'] == 'dsa_resident_sharded_union_kernel_intersection'
     assert optimized['finalize'] == original['finalize']
     assert optimized['update'] == original['update']
+
+
+@pytest.mark.parametrize('variant', ('baseline', 'vector_intersection', 'vector_state_update', 'exact_combined'))
+@pytest.mark.parametrize('stage', ('state_update', 'remap'))
+def test_state_and_remap_probes_have_exact_symbols(variant, stage):
+    suffix = 'state' if variant in ('vector_state_update', 'exact_combined') else 'baseline'
+    name = f'dsa_resident_sorted_state_update_kernel_{suffix}' if stage == 'state_update' else 'dsa_resident_sorted_remap_kernel_baseline'
+    events = [{'ph': 'X', 'cat': 'kernel', 'name': name, 'ts': 10, 'dur': 5, 'pid': 1, 'tid': 1}]
+    assert parse_trace(events, variant, stage, 1)['kernel_sum']['mean_us'] == 5
