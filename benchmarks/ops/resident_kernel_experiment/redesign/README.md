@@ -231,3 +231,49 @@ bytes. Repeat with `stable`, `permuted`, and `cold`, and request counts 1/8/16.
 Use width 64 and float32 to compare with the earlier reported fixture. Actual
 production top-k traces, registered CPU sources, and original metadata-plus-load
 chain timing remain necessary before claiming a serving speedup.
+
+## Independent tuning experiments
+
+The original row and batched-16 paths remain the defaults. Additional controls:
+
+| Option | Work changed | Correctness boundary |
+| --- | --- | --- |
+| `--copy-rows 8/16/32/64` | Number of gathered rows per output, capped by 16 KiB per bank | Row size and the final partial group bound every transfer |
+| `--copy-mode pipelined` | Two 16 KiB banks; the second gather can overlap the first output | Both banks drain before the next pair; no event is reused with an outstanding wait |
+| `--lookup-mode interior` | Removes candidate clamps and row-edge masks on bounded-lookup interior tiles | Only when the entire radius lies within the same query row; token/version/readiness checks remain |
+| `--table-mode wide` | 2048-cell slices instead of 256, reducing snapshot rescans | Disjoint ownership and ascending-source last-writer collision order are unchanged |
+
+Copy-row and interior controls require batched or pipelined mode. Lookup-only
+timings retain the selected lookup optimization but perform no copying. Wide
+construction still runs on EVERY replay; no snapshot state is silently reused.
+Wider slices can reduce parallelism at small request counts, so they are optional.
+At the maximum supported geometry, tuned lookup uses about 122 KiB of explicit
+UB buffers with two banks, and wide construction about 121 KiB. These are separate
+kernels. There are no cross-core waits, new HBM scratch allocations or serving changes.
+
+Build both old and new entrypoints and run the expanded native qualification:
+
+```bash
+RED=benchmarks/ops/resident_kernel_experiment/redesign
+RBUILD="$RED/build-910b3-tuning"
+python "$RED/build.py" --soc ascend910b3 --build-dir "$RBUILD" &&
+python -m pytest --confcutdir="$RED/tests" -o addopts= "$RED/tests" --redesign-build-dir "$RBUILD" -xq
+```
+
+The sweep compares each independent change and their combination with batched-16,
+using identical inputs. Logs and full JSON are retained; stdout ends with a compact
+per-candidate timing table. The output directory must be new to avoid mixing runs.
+
+```bash
+python "$RED/sweep.py" --output-dir "$RED/sweeps/r8-f32-64" -- \
+  --build-dir "$RBUILD" --requests 8 --query-rows 2 --topk 2048 \
+  --universe 131072 --overlap 1024 --hit-rate 0.9 --scenario rank_shift \
+  --kv-width 64 --dtype float32 --iterations 30 --warmup 10
+```
+
+Repeat with `--kv-width 576 --dtype bfloat16` and a different output directory;
+also compare request counts 1/16 and `stable`, `permuted`, `cold` scenarios.
+For a shorter first sweep, specify `--configs pipeline64 interior wide combined`
+before `--`; the reference is always included. The fastest configuration may
+differ by candidate and geometry. All source selection and table work is included;
+the synthetic HBM fixture is still not a production CPU-cache latency benchmark.

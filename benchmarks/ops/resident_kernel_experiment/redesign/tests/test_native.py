@@ -31,7 +31,7 @@ def library(request):
 @pytest.mark.parametrize('variant', tuple(MODES))
 @pytest.mark.parametrize('scenario', ('normal', 'cold', 'epoch', 'version', 'padding', 'duplicate', 'collisions'))
 @pytest.mark.parametrize('q', (1, 2))
-@pytest.mark.parametrize('copy_mode', ('row', 'batched'))
+@pytest.mark.parametrize('copy_mode', ('row', 'batched', 'pipelined'))
 def test_native_plan_and_fused_payload(variant, scenario, q, copy_mode):
     query, snap, dense = case(seed=7, b=3, q=q, k=256, universe=1025, width=16)
     if scenario == 'cold':
@@ -68,7 +68,7 @@ def test_native_plan_and_fused_payload(variant, scenario, q, copy_mode):
 
 
 @pytest.mark.parametrize('variant', tuple(MODES))
-@pytest.mark.parametrize('copy_mode', ('row', 'batched'))
+@pytest.mark.parametrize('copy_mode', ('row', 'batched', 'pipelined'))
 def test_native_2048_graph_replays_change_epochs_and_values(variant, copy_mode):
     query, snap, dense = case(b=1, q=2, k=2048, universe=8193)
     snap = replace(snap, kv=snap.kv.float())
@@ -133,7 +133,7 @@ def test_functional_candidates_on_npu(variant):
 
 @pytest.mark.parametrize('dtype', (torch.float16, torch.bfloat16, torch.uint8))
 @pytest.mark.parametrize('variant', ('fixed_position', 'hash_snapshot'))
-@pytest.mark.parametrize('copy_mode', ('row', 'batched'))
+@pytest.mark.parametrize('copy_mode', ('row', 'batched', 'pipelined'))
 def test_fused_copy_preserves_payload_dtype_bits(dtype, variant, copy_mode):
     query, snap, dense = case(b=1, q=2, k=256, universe=1025, width=32)
     if dtype == torch.uint8:
@@ -151,7 +151,8 @@ def test_fused_copy_preserves_payload_dtype_bits(dtype, variant, copy_mode):
 
 
 @pytest.mark.parametrize('width', (16, 560, 576, 4096))
-def test_batched_copy_row_sizes_and_partial_groups(width):
+@pytest.mark.parametrize('copy_rows', (8, 16, 32, 64))
+def test_batched_copy_row_sizes_and_partial_groups(width, copy_rows):
     query, snap, dense = case(b=1, q=2, k=256, universe=1025, width=width)
     dense = dense.to(torch.bfloat16)
     previous = dense.gather(1, snap.tokens.long()[..., None].expand(1, 512, width)).clone()
@@ -161,12 +162,72 @@ def test_batched_copy_row_sizes_and_partial_groups(width):
     query.boundary.fill_(512)
     expected = gather_dense(query, dense)
     plans = []
-    for mode in ('row', 'batched'):
+    for mode in ('row', 'batched', 'pipelined'):
         native = NativeCase(query.to('npu'), snap.to('npu'), dense.to('npu'),
-                            'bounded_position', copy_mode=mode)
+                            'bounded_position', copy_mode=mode, copy_rows=16 if mode == 'row' else copy_rows)
         native.run(True)
         torch.npu.synchronize()
         assert_safe(query, snap, native.plan)
         assert torch.equal(native.payload.cpu().view(torch.uint8), expected.contiguous().view(torch.uint8))
         plans.append(native.plan.source.cpu())
+    assert all(torch.equal(plans[0], plan) for plan in plans[1:])
+
+
+@pytest.mark.parametrize('variant', tuple(MODES))
+@pytest.mark.parametrize('radius', (0, 2, 32))
+def test_tuned_lookup_matches_source_slots(variant, radius):
+    query, snap, dense = case(b=1, q=2, k=2048, universe=8193, width=16)
+    query.tokens[..., ::127] = -1
+    snap = replace(snap, kv=snap.kv.float())
+    baseline = NativeCase(query.to('npu'), snap.to('npu'), dense.float().to('npu'), variant,
+                          radius=radius, copy_mode='batched')
+    tuned = NativeCase(query.to('npu'), snap.to('npu'), dense.float().to('npu'), variant,
+                       radius=radius, copy_mode='pipelined', copy_rows=64,
+                       lookup_mode='interior', table_mode='wide')
+    for fused in (False, True):
+        baseline.run(fused)
+        tuned.run(fused)
+        torch.npu.synchronize()
+        assert torch.equal(baseline.plan.source.cpu(), tuned.plan.source.cpu())
+        assert_safe(query, snap, tuned.plan)
+        if fused:
+            assert torch.equal(tuned.payload.cpu(), gather_dense(query, dense.float()))
+
+
+@pytest.mark.parametrize('variant,size', (('hash_snapshot', 256), ('hash_snapshot', 8192),
+                                         ('direct_directory', 256), ('direct_directory', 2304)))
+def test_wide_table_preserves_collision_winners(variant, size):
+    universe = 2301 if variant == 'direct_directory' and size == 2304 else 257
+    if variant == 'direct_directory' and size == 256:
+        universe = 255
+    query, snap, dense = case(b=3, q=2, k=256, universe=universe, width=16)
+    snap = replace(snap, kv=snap.kv.float())
+    tables, plans = [], []
+    for table_mode in ('baseline', 'wide'):
+        native = NativeCase(query.to('npu'), snap.to('npu'), dense.float().to('npu'), variant,
+                            buckets=size, table_mode=table_mode)
+        native.run(False)
+        torch.npu.synchronize()
+        tables.append(native.tensors[7].cpu())
+        plans.append(native.plan.source.cpu())
+    assert torch.equal(*tables)
     assert torch.equal(*plans)
+
+
+def test_pipelined_grid_stride_replay():
+    query, snap, dense = case(b=16, q=2, k=2048, universe=4097, width=16)
+    snap = replace(snap, kv=snap.kv.float())
+    native = NativeCase(query.to('npu'), snap.to('npu'), dense.float().to('npu'), 'bounded_position',
+                        copy_mode='pipelined', copy_rows=64, lookup_mode='interior')
+    native.run(True)
+    torch.npu.synchronize()
+    graph = torch.npu.NPUGraph()
+    with torch.npu.graph(graph):
+        native.run(True)
+    for step in range(4):
+        updated = replace(query, tokens=query.tokens.roll(step, dims=-1), epochs=query.epochs + step % 2)
+        native.refresh(updated.to('npu'), snap.to('npu'), dense.float().to('npu'))
+        graph.replay()
+        torch.npu.synchronize()
+        assert_safe(updated, snap, native.plan)
+        assert torch.equal(native.payload.cpu(), gather_dense(updated, dense.float()))

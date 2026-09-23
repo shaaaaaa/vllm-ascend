@@ -11,7 +11,10 @@
 #include "launch.h"
 namespace {
 static_assert(sizeof(uintptr_t) <= sizeof(uint64_t), "device address would be truncated");
-void run_impl(at::TensorList t, int64_t universe, int64_t mode, int64_t radius, bool fused, bool batched) {
+void run_impl(at::TensorList t, int64_t universe, int64_t mode, int64_t radius, bool fused, bool batched,
+              int64_t tuning = 0, bool wide = false) {
+    TORCH_CHECK(tuning == 0 || ((tuning & ~511LL) == 0 && (tuning & 127) >= 1 && (tuning & 127) <= 64),
+                "invalid copy/lookup tuning");
     TORCH_CHECK(t.size() == 12, "expected 12 redesign tensors");
     TORCH_CHECK(t[0].is_privateuseone() && t[0].dim() == 3, "requires NPU [B,Q,K] tokens");
     const auto device = t[0].device();
@@ -61,12 +64,18 @@ void run_impl(at::TensorList t, int64_t universe, int64_t mode, int64_t radius, 
                 "cannot query AIV count");
     a.requests = b; a.queries = q; a.topk = k; a.universe = universe;
     a.mode = mode; a.radius = radius; a.tableSize = size; a.rowBytes = bytes; a.cores = cores;
+    a.tuning = tuning;
     auto stream = c10_npu::getCurrentNPUStream().stream();
     at_npu::native::OpCommand command;
     command.Name("resident_redesign");
-    command.SetCustomHandler([a, stream, fused, batched, owners = std::vector<at::Tensor>(t.begin(), t.end())]() -> int {
-        if (a.mode >= 3) redesign_build(stream, a);
-        if (fused && batched) redesign_batched_copy(stream, a);
+    command.SetCustomHandler([a, stream, fused, batched, wide, owners = std::vector<at::Tensor>(t.begin(), t.end())]() -> int {
+        if (a.mode >= 3) {
+            if (wide) redesign_wide_build(stream, a);
+            else redesign_build(stream, a);
+        }
+        if (a.tuning != 0 && fused) redesign_tuned_copy(stream, a);
+        else if (a.tuning != 0) redesign_tuned_lookup(stream, a);
+        else if (fused && batched) redesign_batched_copy(stream, a);
         else if (fused) redesign_resolve_copy(stream, a);
         else redesign_lookup(stream, a);
         return 0;
@@ -79,12 +88,18 @@ void run(at::TensorList t, int64_t universe, int64_t mode, int64_t radius, bool 
 void run_batched(at::TensorList t, int64_t universe, int64_t mode, int64_t radius, bool fused) {
     run_impl(t, universe, mode, radius, fused, true);
 }
+void run_tuned(at::TensorList t, int64_t universe, int64_t mode, int64_t radius, bool fused,
+               bool batched, int64_t tuning, bool wide) {
+    run_impl(t, universe, mode, radius, fused, batched, tuning, wide);
+}
 }
 TORCH_LIBRARY(resident_redesign, m) {
     m.def("run_(Tensor(a!)[] tensors, int universe, int mode, int radius, bool fused=False) -> ()");
     m.def("run_batched_(Tensor(a!)[] tensors, int universe, int mode, int radius, bool fused=False) -> ()");
+    m.def("run_tuned_(Tensor(a!)[] tensors, int universe, int mode, int radius, bool fused, bool batched, int tuning, bool wide) -> ()");
 }
 TORCH_LIBRARY_IMPL(resident_redesign, PrivateUse1, m) {
     m.impl("run_", &run);
     m.impl("run_batched_", &run_batched);
+    m.impl("run_tuned_", &run_tuned);
 }

@@ -90,9 +90,7 @@ def profile(case, fused, iterations, warmup, path):
             prof.step()
         torch.npu.synchronize()
     prof.export_chrome_trace(str(path.resolve()))
-    symbols = (['resident_snapshot_build_redesign'] if case.mode >= 3 else [])
-    symbols += [('resident_batched_copy_redesign' if case.copy_mode == 'batched'
-                 else 'resident_resolve_copy_redesign') if fused else 'resident_lookup_redesign']
+    symbols = case.profile_symbols(fused)
     result = parse_native_trace(json.loads(path.read_text(), parse_float=Decimal), symbols, iterations)
     result['trace'] = str(path.resolve())
     return result
@@ -140,7 +138,10 @@ def main():
     parser.add_argument('--scenario', choices=('stable','permuted','rank_shift','cold'), default='rank_shift')
     parser.add_argument('--kv-width', type=int, default=64, help='normalized fixture elements, not assumed model geometry')
     parser.add_argument('--dtype', choices=('float16','bfloat16','float32'), default='float32')
-    parser.add_argument('--copy-mode', choices=('row', 'batched'), default='row')
+    parser.add_argument('--copy-mode', choices=('row', 'batched', 'pipelined'), default='row')
+    parser.add_argument('--copy-rows', type=int, choices=(8, 16, 32, 64), default=16)
+    parser.add_argument('--lookup-mode', choices=('baseline', 'interior'), default='baseline')
+    parser.add_argument('--table-mode', choices=('baseline', 'wide'), default='baseline')
     parser.add_argument('--iterations', type=int, default=30)
     parser.add_argument('--warmup', type=int, default=10)
     parser.add_argument('--radius', type=int, default=2)
@@ -148,6 +149,8 @@ def main():
     parser.add_argument('--seed', type=int, default=7)
     parser.add_argument('--json', type=Path, default=HERE / 'results.json')
     args = parser.parse_args()
+    if args.copy_mode == 'row' and (args.copy_rows != 16 or args.lookup_mode != 'baseline'):
+        parser.error('copy-rows/interior lookup require batched or pipelined copy')
     if min(args.requests,args.topk,args.kv_width,args.iterations,args.warmup) < 1 or args.universe < args.query_rows*args.topk:
         parser.error('positive sizes and universe >= query_rows*topk required')
     if not 0 <= args.hit_rate <= 1 or not 0 <= args.overlap <= args.topk or not 0 <= args.radius <= 32 or args.buckets < 1:
@@ -178,7 +181,8 @@ def main():
             timing = {'not_measured': 'CPU correctness run; no native or serving performance claim'}
         else:
             case = NativeCase(query.to(device), snap.to(device), dense.to(device), variant,
-                              radius=args.radius, buckets=args.buckets, copy_mode=args.copy_mode)
+                              radius=args.radius, buckets=args.buckets, copy_mode=args.copy_mode,
+                              copy_rows=args.copy_rows, lookup_mode=args.lookup_mode, table_mode=args.table_mode)
             # Both unfused and fused outputs are correctness-gated before timing.
             case.run(False)
             torch.npu.synchronize()
@@ -207,6 +211,7 @@ def main():
         misses, hits = int((source == -1).sum()), int((source >= 0).sum())
         record = {'variant': variant, 'correctness': 'selected_kv_and_reference_attention_pass',
                   'copy_mode': args.copy_mode, 'row_bytes': dense.element_size() * args.kv_width,
+                  'copy_rows': args.copy_rows, 'lookup_mode': args.lookup_mode, 'table_mode': args.table_mode,
                   'materialized_bytes': actual.numel() * actual.element_size(),
                   'occurrence_hits': hits, 'offload_occurrence_misses': misses,
                   'miss_payload_bytes': misses * dense.element_size() * args.kv_width,

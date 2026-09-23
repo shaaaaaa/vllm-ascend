@@ -58,10 +58,19 @@ class NativeCase:
     PCIe/LMCache. run() never publishes a new snapshot. refresh() keeps addresses
     stable for graph replay and must be ordered before that replay on its stream.
     """
-    def __init__(self, query, snapshot, dense, variant, *, radius=2, buckets=8192, copy_mode='row'):
-        if copy_mode not in ('row', 'batched'):
-            raise ValueError('copy_mode must be row or batched')
+    def __init__(self, query, snapshot, dense, variant, *, radius=2, buckets=8192, copy_mode='row',
+                 copy_rows=16, lookup_mode='baseline', table_mode='baseline'):
+        if copy_mode not in ('row', 'batched', 'pipelined'):
+            raise ValueError('invalid copy_mode')
+        if not 1 <= copy_rows <= 64 or lookup_mode not in ('baseline', 'interior') or table_mode not in ('baseline', 'wide'):
+            raise ValueError('invalid kernel tuning')
+        if copy_mode == 'row' and (copy_rows != 16 or lookup_mode != 'baseline'):
+            raise ValueError('copy_rows/interior lookup require batched or pipelined copy')
         self.copy_mode = copy_mode
+        self.wide = table_mode == 'wide'
+        self.tuning = (copy_rows | (128 if copy_mode == 'pipelined' else 0)
+                       | (256 if lookup_mode == 'interior' else 0)) if (
+                           copy_mode == 'pipelined' or copy_rows != 16 or lookup_mode == 'interior') else 0
         query.validate()
         snapshot.validate(query)
         if variant not in MODES:
@@ -103,9 +112,22 @@ class NativeCase:
         self.tensors[10].copy_(dense)
 
     def run(self, fused=False):
+        if self.tuning or self.wide:
+            torch.ops.resident_redesign.run_tuned_(self.tensors, self.universe, self.mode, self.radius,
+                                                   fused, self.copy_mode != 'row', self.tuning, self.wide)
+            return
         op = (torch.ops.resident_redesign.run_batched_ if self.copy_mode == 'batched'
               else torch.ops.resident_redesign.run_)
         op(self.tensors, self.universe, self.mode, self.radius, fused)
+
+    def profile_symbols(self, fused):
+        symbols = [('resident_wide_build_redesign' if self.wide else 'resident_snapshot_build_redesign')] if self.mode >= 3 else []
+        if self.tuning:
+            symbols.append('resident_tuned_copy_redesign' if fused else 'resident_tuned_lookup_redesign')
+        else:
+            symbols.append(('resident_batched_copy_redesign' if self.copy_mode == 'batched'
+                            else 'resident_resolve_copy_redesign') if fused else 'resident_lookup_redesign')
+        return symbols
 
     @property
     def plan(self):
