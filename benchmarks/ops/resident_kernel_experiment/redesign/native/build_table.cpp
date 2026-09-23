@@ -64,5 +64,7 @@ extern "C" __global__ __aicore__ void resident_snapshot_build_redesign(RedesignL
 }
 void redesign_build(void* stream, const RedesignLaunch& a) {
     uint32_t blocks = a.requests * (a.tableSize / redesign::T);
-    resident_snapshot_build_redesign<<<blocks < a.cores ? blocks : a.cores, nullptr, stream>>>(a);
+    // CANN's host stub marshals a by-value device struct through a host pointer.
+    RedesignLaunch launch = a;
+    resident_snapshot_build_redesign<<<blocks < a.cores ? blocks : a.cores, nullptr, stream>>>(&launch);
 }

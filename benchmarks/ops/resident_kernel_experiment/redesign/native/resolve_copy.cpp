@@ -6,5 +6,7 @@ extern "C" __global__ __aicore__ void resident_resolve_copy_redesign(RedesignLau
 }
 void redesign_resolve_copy(void* stream, const RedesignLaunch& a) {
     uint32_t blocks = a.requests * a.queries * a.topk / redesign::T;
-    resident_resolve_copy_redesign<<<blocks < a.cores ? blocks : a.cores, nullptr, stream>>>(a);
+    // CANN's host stub marshals a by-value device struct through a host pointer.
+    RedesignLaunch launch = a;
+    resident_resolve_copy_redesign<<<blocks < a.cores ? blocks : a.cores, nullptr, stream>>>(&launch);
 }
