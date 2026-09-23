@@ -27,6 +27,7 @@ def main():
     # A failed rebuild must not leave a manifest endorsing an older binary.
     stamp.unlink(missing_ok=True)
     subprocess.run(['cmake', '-S', str(HERE / 'native'), '-B', str(build),
+                    '-DCMAKE_BUILD_TYPE=Release',
                     f'-DSOC_VERSION={args.soc}', f'-DASCEND_HOME_PATH={home}',
                     f'-DTORCH_NPU_PATH={Path(torch_npu.__file__).resolve().parent}',
                     f'-DCMAKE_PREFIX_PATH={torch.utils.cmake_prefix_path}'], check=True)
