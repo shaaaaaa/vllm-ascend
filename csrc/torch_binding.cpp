@@ -15,6 +15,7 @@
  */
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <limits>
 #include <torch/extension.h>
@@ -51,6 +52,54 @@
 #include <c10/util/Logging.h>
 
 namespace vllm_ascend {
+
+namespace resident_exact {
+extern decltype(::vllm_ascend::dsa_resident_sharded_union_impl) dsa_resident_sharded_union_impl;
+extern decltype(::vllm_ascend::dsa_resident_sorted_plan_impl) dsa_resident_sorted_plan_impl;
+extern decltype(::vllm_ascend::dsa_resident_sorted_plan_no_remap_impl) dsa_resident_sorted_plan_no_remap_impl;
+extern decltype(::vllm_ascend::dsa_resident_sorted_update_debug_impl) dsa_resident_sorted_update_debug_impl;
+}
+
+namespace {
+struct ResidentLaunchers {
+    decltype(&dsa_resident_sharded_union_impl) union_launch;
+    decltype(&dsa_resident_sorted_plan_impl) plan;
+    decltype(&dsa_resident_sorted_plan_no_remap_impl) plan_no_remap;
+    decltype(&dsa_resident_sorted_update_debug_impl) update_debug;
+};
+const ResidentLaunchers baseline_resident_launchers = {
+    &dsa_resident_sharded_union_impl,
+    &dsa_resident_sorted_plan_impl,
+    &dsa_resident_sorted_plan_no_remap_impl,
+    &dsa_resident_sorted_update_debug_impl
+};
+const ResidentLaunchers exact_resident_launchers = {
+    &resident_exact::dsa_resident_sharded_union_impl,
+    &resident_exact::dsa_resident_sorted_plan_impl,
+    &resident_exact::dsa_resident_sorted_plan_no_remap_impl,
+    &resident_exact::dsa_resident_sorted_update_debug_impl
+};
+// Frozen before capture; eager launches capture a function pointer, graph replay
+// contains only the selected device kernels. No environment access in decode.
+std::atomic<const ResidentLaunchers*> resident_launchers{nullptr};
+const ResidentLaunchers& ResidentKernels() {
+    auto* selected = resident_launchers.load(std::memory_order_acquire);
+    if (!selected) {
+        resident_launchers.compare_exchange_strong(selected, &exact_resident_launchers);
+        if (!selected) selected = &exact_resident_launchers;
+    }
+    return *selected;
+}
+} // namespace
+
+void configure_dsa_resident_exact_kernels(bool enabled) {
+    const auto* desired = enabled ? &exact_resident_launchers : &baseline_resident_launchers;
+    const ResidentLaunchers* previous = nullptr;
+    const bool configured = resident_launchers.compare_exchange_strong(previous, desired);
+    TORCH_CHECK(configured || previous == desired,
+                "Resident kernel selection is frozen; restart the worker to change it");
+}
+
 void swap_blocks_impl(torch::Tensor& src, torch::Tensor& dst,
                  const torch::Tensor& block_mapping, aclrtStream stream)
 {
@@ -1589,7 +1638,8 @@ at::Tensor resident_sharded_union_common_(
     void* shard_evictable_slot_ptr = shard_evictable_slots.data_ptr();
     at_npu::native::OpCommand cmd;
     cmd.Name("npu_dsa_resident_sharded_union_");
-    cmd.SetCustomHandler([
+    auto launch = ResidentKernels().union_launch;
+    cmd.SetCustomHandler([launch,
         stream, topk_ptr, boundary_ptr, row_request_ptr,
         packed_ptr, mapping_ptr, count_ptr, request_state_ptr,
         request_generation_ptr, state_token_ptr, state_slot_ptr,
@@ -1600,7 +1650,7 @@ at::Tensor resident_sharded_union_common_(
         rows_per_request, row_width, shard_count, shard_capacity,
         shard_count_stride, shard_count_request_stride,
         generation_stride, core_count]() -> int {
-        dsa_resident_sharded_union_impl(
+        launch(
             stream, topk_ptr, boundary_ptr, row_request_ptr,
             packed_ptr, mapping_ptr, count_ptr, request_state_ptr,
             request_generation_ptr, state_token_ptr, state_slot_ptr,
@@ -1873,7 +1923,9 @@ static at::Tensor resident_sorted_plan_common_(
         fused_remap
             ? "npu_dsa_resident_sorted_plan_"
             : "npu_dsa_resident_sorted_plan_no_remap_");
-    cmd.SetCustomHandler([
+    const auto& kernels = ResidentKernels();
+    auto impl = fused_remap ? kernels.plan : kernels.plan_no_remap;
+    cmd.SetCustomHandler([impl,
         stream, topk_ptr, packed_ptr, mapping_ptr,
         shard_count_ptr, block_table_ptr, request_state_ptr,
         request_generation_ptr, state_token_ptr, state_slot_ptr,
@@ -1885,11 +1937,8 @@ static at::Tensor resident_sorted_plan_common_(
         rows_per_request, row_width, shard_count, capacity,
         shard_count_stride, shard_count_request_stride,
         miss_count_stride, generation_stride,
-        block_table_width, block_size, fused_remap,
+        block_table_width, block_size,
         core_count]() -> int {
-        auto impl = fused_remap
-            ? dsa_resident_sorted_plan_impl
-            : dsa_resident_sorted_plan_no_remap_impl;
         impl(
             stream, topk_ptr, packed_ptr, mapping_ptr,
             shard_count_ptr, block_table_ptr, request_state_ptr,
@@ -2327,7 +2376,8 @@ at::Tensor npu_dsa_resident_sorted_update_debug_(
     void* state_generation_ptr = state_generations.data_ptr();
     at_npu::native::OpCommand cmd;
     cmd.Name("npu_dsa_resident_sorted_update_debug_");
-    cmd.SetCustomHandler([
+    auto launch = ResidentKernels().update_debug;
+    cmd.SetCustomHandler([launch,
         stream, topk_ptr, packed_ptr, mapping_ptr, count_ptr,
         prior_ptr, request_state_ptr,
         request_generation_ptr, state_token_ptr, state_slot_ptr,
@@ -2336,7 +2386,7 @@ at::Tensor npu_dsa_resident_sorted_update_debug_(
         row_width, shard_count, capacity, shard_count_stride,
         shard_count_request_stride, generation_stride,
         core_count]() -> int {
-        dsa_resident_sorted_update_debug_impl(
+        launch(
             stream, topk_ptr, packed_ptr, mapping_ptr, count_ptr,
             prior_ptr, request_state_ptr,
             request_generation_ptr, state_token_ptr, state_slot_ptr,
@@ -3732,6 +3782,8 @@ std::vector<at::Tensor> moe_grouped_matmul(
 
 TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
 {
+    ops.def("configure_dsa_resident_exact_kernels(bool enabled) -> ()",
+            &vllm_ascend::configure_dsa_resident_exact_kernels);
 
     // vLLM-Ascend custom ops
     // Gemma RmsNorm

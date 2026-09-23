@@ -86,6 +86,7 @@ from vllm_ascend.distributed.kv_transfer.sparse_offload.resident_sorted_cache im
     SortedResidentWorkspace,
     allocate_sorted_resident_state,
     allocate_sorted_resident_workspace,
+    configure_resident_kernels,
     prepare_resident_sharded_union_,
     prepare_sorted_resident_cache_fused_,
     resident_shard_count,
@@ -2087,6 +2088,8 @@ class AscendSFAImpl(MLAAttentionImpl):
             int, SortedResidentWorkspace
         ] = {}
         self.dsa_resident_shards_per_row: int | None = None
+        if self.dsa_resident_cache:
+            configure_resident_kernels()
         self.shared_resident_plan: SharedResidentPlan | None = None
         layer_index = (
             parse_layer_idx(self.layer_name)

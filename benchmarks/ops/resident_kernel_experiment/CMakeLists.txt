@@ -1,0 +1,72 @@
+cmake_minimum_required(VERSION 3.16)
+project(resident_kernel_experiment LANGUAGES CXX)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type")
+set(RUN_MODE npu CACHE STRING "AscendC run mode")
+if(NOT SOC_VERSION OR NOT ASCEND_HOME_PATH OR NOT TORCH_NPU_PATH)
+    message(FATAL_ERROR "Pass SOC_VERSION, ASCEND_HOME_PATH and TORCH_NPU_PATH; see build.sh")
+endif()
+string(TOLOWER "${SOC_VERSION}" resident_soc)
+if(resident_soc MATCHES "ascend310p")
+    message(FATAL_ERROR "The production resident kernels do not support 310P")
+endif()
+set(ASCEND_CANN_PACKAGE_PATH "${ASCEND_HOME_PATH}")
+foreach(suffix tools/tikcpp/ascendc_kernel_cmake
+               compiler/tikcpp/ascendc_kernel_cmake
+               ascendc_devkit/tikcpp/samples/cmake)
+    if(EXISTS "${ASCEND_HOME_PATH}/${suffix}/ascendc.cmake")
+        set(ASCENDC_CMAKE_DIR "${ASCEND_HOME_PATH}/${suffix}")
+        break()
+    endif()
+endforeach()
+if(NOT ASCENDC_CMAKE_DIR)
+    message(FATAL_ERROR "Cannot find the CANN AscendC CMake helper")
+endif()
+include("${ASCENDC_CMAKE_DIR}/ascendc.cmake")
+find_package(Python3 REQUIRED COMPONENTS Interpreter)
+set(resident_source "${CMAKE_CURRENT_SOURCE_DIR}/../../../csrc/kernels/resident_sorted_cache.cpp")
+set(resident_generator "${CMAKE_CURRENT_SOURCE_DIR}/generate_sources.py")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+    "${resident_source}" "${resident_generator}" "${CMAKE_CURRENT_SOURCE_DIR}/launch.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../../csrc/kernels/resident_sorted_cache_coordinated.cpp")
+execute_process(COMMAND "${Python3_EXECUTABLE}" "${resident_generator}"
+    "${CMAKE_CURRENT_BINARY_DIR}/generated" RESULT_VARIABLE generated_status)
+if(NOT generated_status EQUAL 0)
+    message(FATAL_ERROR "Failed to generate isolated resident kernel sources")
+endif()
+set(resident_sources)
+foreach(variant baseline optimized)
+    foreach(stage union finalize update)
+        list(APPEND resident_sources "${CMAKE_CURRENT_BINARY_DIR}/generated/${variant}_${stage}.cpp")
+    endforeach()
+endforeach()
+list(APPEND resident_sources "${CMAKE_CURRENT_BINARY_DIR}/generated/compact_update.cpp"
+    "${CMAKE_CURRENT_BINARY_DIR}/generated/sharded_finalize.cpp")
+list(APPEND resident_sources "${CMAKE_CURRENT_BINARY_DIR}/generated/vector_union.cpp")
+list(APPEND resident_sources "${CMAKE_CURRENT_BINARY_DIR}/generated/intersection_union.cpp")
+list(APPEND resident_sources "${CMAKE_CURRENT_BINARY_DIR}/generated/state_update.cpp"
+    "${CMAKE_CURRENT_BINARY_DIR}/generated/baseline_state_update.cpp"
+    "${CMAKE_CURRENT_BINARY_DIR}/generated/state_state_update.cpp"
+    "${CMAKE_CURRENT_BINARY_DIR}/generated/baseline_remap.cpp")
+foreach(variant baseline vector)
+    foreach(phase sort dedup)
+        list(APPEND resident_sources "${CMAKE_CURRENT_BINARY_DIR}/generated/${variant}_union_${phase}.cpp")
+    endforeach()
+endforeach()
+ascendc_library(resident_experiment_kernels SHARED ${resident_sources})
+
+find_package(Torch REQUIRED)
+add_library(resident_experiment_ops SHARED binding.cpp dispatch.cpp)
+target_include_directories(resident_experiment_ops PRIVATE
+    ${TORCH_INCLUDE_DIRS} "${TORCH_NPU_PATH}/include" "${ASCEND_HOME_PATH}/include")
+separate_arguments(torch_flags NATIVE_COMMAND "${TORCH_CXX_FLAGS}")
+target_compile_options(resident_experiment_ops PRIVATE ${torch_flags})
+target_link_directories(resident_experiment_ops PRIVATE
+    "${TORCH_NPU_PATH}/lib" "${ASCEND_HOME_PATH}/lib64")
+target_link_libraries(resident_experiment_ops PRIVATE
+    ${TORCH_LIBRARIES} torch_npu ascendcl resident_experiment_kernels)
+set_target_properties(resident_experiment_ops PROPERTIES BUILD_RPATH
+    "$ORIGIN;$ORIGIN/lib;${TORCH_NPU_PATH}/lib;${ASCEND_HOME_PATH}/lib64")
+# Some AscendC helpers disable CMake RPATH generation globally.
+target_link_options(resident_experiment_ops PRIVATE "-Wl,-rpath,$ORIGIN:$ORIGIN/lib")

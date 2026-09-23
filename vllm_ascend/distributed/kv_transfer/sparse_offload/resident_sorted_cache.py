@@ -10,6 +10,7 @@ graph capture. The hot path only invokes custom NPU operators.
 """
 
 from dataclasses import dataclass, field
+from functools import lru_cache
 
 import torch
 
@@ -22,6 +23,20 @@ RESIDENT_READ_PROBE_DEBUG_INTS = 4 + 7 * MAX_RESIDENT_SHARDS
 RESIDENT_FINALIZE_DEBUG_INTS = 16
 DEFAULT_RESIDENT_SHARDS_PER_ROW = 4
 MAX_RESIDENT_SHARDS_PER_ROW = 4
+
+
+@lru_cache(maxsize=1)
+def configure_resident_kernels() -> None:
+    """Select serving kernels once before capture, never in the decode path."""
+    from vllm_ascend import envs
+
+    try:
+        configure = torch.ops._C_ascend.configure_dsa_resident_exact_kernels
+    except AttributeError as exc:
+        raise RuntimeError(
+            "Rebuild the vLLM-Ascend serving extension to select resident kernels"
+        ) from exc
+    configure(envs.VLLM_ASCEND_DSA_RESIDENT_EXACT_KERNELS)
 
 
 def resident_shard_count(
