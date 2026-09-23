@@ -104,10 +104,11 @@ def parser():
     cli.add_argument(
         "--dummy-prefill-store-stage",
         type=int,
-        choices=range(10),
+        choices=range(11),
         help=(
-            "Cumulatively run the P-node store path through stage 0..9; "
-            "stage 8 finalizes stores, stage 9 adds publish/release; "
+            "Cumulatively run the P-node store path through stage 0..10; "
+            "stage 8 stops before storer finalization, stage 9 finalizes "
+            "storers, stage 10 adds publish/release; "
             "all stages imply dummy DMA and produce invalid output"
         ),
     )

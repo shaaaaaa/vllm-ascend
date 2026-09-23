@@ -172,8 +172,9 @@ PREFILL_STORE_STAGES = {
     5: "construct_store_generator",
     6: "prime_store_generator",
     7: "run_layer_save_finish_callbacks",
-    8: "finalize_storers_and_promote_request_state",
-    9: "publish_frontier_and_release_request_pins",
+    8: "before_storer_finalization",
+    9: "finalize_storers_and_promote_request_state",
+    10: "publish_frontier_and_release_request_pins",
 }
 
 
@@ -181,17 +182,18 @@ def install_dummy_prefill_store(stage=0):
     """Run a cumulative prefix of the P-node store path for profiling.
 
     Native DMA is independently replaced by ``install_dummy_dma``.  Stages
-    0..7 stop progressively earlier in the save path. Stage 8 performs only
-    the store completion needed to carry the next chunk: it drains each
-    storer, consumes its result, and keeps the result request-owned. Stage 9
-    adds the frontier publication and lookup-pin release after stage 8. Both
-    stages are diagnostic-only because native DMA is replaced separately.
+    0..7 stop progressively earlier in the save path. Stage 8 reaches the
+    boundary immediately before the remaining storer work, then closes the
+    unfinalized generators so the next chunk can continue. Stage 9 adds
+    storer finalization and request-owned promotion. Stage 10 adds frontier
+    publication and lookup-pin release. Stages 8..10 are diagnostic-only
+    because native DMA is replaced separately.
     """
     from lmcache.integration.vllm.vllm_v1_adapter import LMCacheConnectorV1Impl
 
     if stage not in PREFILL_STORE_STAGES:
         raise ValueError(
-            f"Invalid prefill-store stage {stage}; expected 0..9"
+            f"Invalid prefill-store stage {stage}; expected 0..10"
         )
 
     original_prepare = LMCacheConnectorV1Impl._prepare_p_node_layerwise_save_storers
@@ -300,12 +302,43 @@ def install_dummy_prefill_store(stage=0):
             self._mark_prefill_committed(request, len(request.token_ids))
         self._complete_worker_save_step()
 
-    def finish_save_stage8(self, publish=False):
+    def finish_save_before_storer_finalize(self):
+        """Stop before the remaining storer work for the diagnostic split.
+
+        The generators are closed and discarded so a following chunk does not
+        inherit stale diagnostic state. No deferred-latent flush, storer
+        finalization, result consumption, publication, or pin release is run.
+        Output from this stage is intentionally invalid.
+        """
+        metadata = self._parent._get_connector_metadata()
+        if not self.use_layerwise or self.kv_role == "kv_consumer":
+            return original_wait(self)
+        try:
+            storers = getattr(self, "_layerwise_save_storers", {})
+            for storer in tuple(storers.values()):
+                close = getattr(storer, "close", None)
+                if close is not None:
+                    close()
+            storers.clear()
+            getattr(
+                self, "_layerwise_prefill_prepared_storer_keys", set()
+            ).clear()
+            getattr(
+                self, "_layerwise_prefill_pending_store_finishes", {}
+            ).clear()
+            for request in metadata.requests:
+                self._mark_prefill_committed(request, len(request.token_ids))
+            self._complete_worker_save_step()
+        except BaseException:
+            self._abort_save_step(metadata.requests)
+            raise
+
+    def finish_save_stage9(self, publish=False):
         """Complete stores needed for the following chunk.
 
         This is the smallest post-forward operation that leaves the
         layerwise storer maps in a usable state. It deliberately leaves
-        frontier publication and lookup-pin release to stage 9 so the two
+        frontier publication and lookup-pin release to stage 10 so the two
         costs can be measured separately.
         """
         metadata = self._parent._get_connector_metadata()
@@ -364,9 +397,11 @@ def install_dummy_prefill_store(stage=0):
     if stage <= 7:
         replacements["wait_for_save"] = finish_save_stage7
     elif stage == 8:
-        replacements["wait_for_save"] = finish_save_stage8
+        replacements["wait_for_save"] = finish_save_before_storer_finalize
     elif stage == 9:
-        replacements["wait_for_save"] = lambda self: finish_save_stage8(self, publish=True)
+        replacements["wait_for_save"] = finish_save_stage9
+    elif stage == 10:
+        replacements["wait_for_save"] = lambda self: finish_save_stage9(self, publish=True)
 
     for name, replacement in replacements.items():
         setattr(LMCacheConnectorV1Impl, name, replacement)
