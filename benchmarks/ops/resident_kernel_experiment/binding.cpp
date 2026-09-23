@@ -18,7 +18,7 @@ void run(at::TensorList tensors, int64_t dummyBase, int64_t blockSize,
     const auto device = tensors[0].device();
     TORCH_CHECK(tensors[0].is_privateuseone(), "resident experiment requires NPU tensors");
     TORCH_CHECK(stage >= 0 && stage <= 5, "stage must be 0..5");
-    TORCH_CHECK(variant >= 0 && variant <= 5, "variant must be 0..5");
+    TORCH_CHECK(variant >= 0 && variant <= 6, "variant must be 0..6");
     TORCH_CHECK(stage < 4 || variant == 0 || variant == 5,
                 "union prefix diagnostics support baseline/vector_union only");
     TORCH_CHECK(blockSize > 0 && blockSize <= 4096, "invalid block size");

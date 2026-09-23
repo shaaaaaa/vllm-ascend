@@ -21,6 +21,8 @@ def kernel_names(variant):
     update = "compact" if variant in ("compact_remap", "combined") else union
     if variant == "vector_union":
         union = "vector"
+    elif variant == "vector_intersection":
+        union = "intersection"
     return {"union": f"dsa_resident_sharded_union_kernel_{union}",
             "finalize": finalize, "update": f"dsa_resident_sorted_update_kernel_{update}"}
 

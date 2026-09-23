@@ -34,7 +34,7 @@ SCALARS = {
 
 
 def generate(source: str, header: Path, *, variants=(("baseline", 0), ("optimized", 1)), kernels=None,
-             compact=False, sharded=False, vector_union=False, union_stop=0) -> dict[str, str]:
+             compact=False, sharded=False, vector_union=False, union_stop=0, vector_intersection=False) -> dict[str, str]:
     marker = 'extern "C" __global__ __aicore__ void\n'
     classes, separator, _ = source.partition(marker)
     if not separator:
@@ -74,6 +74,7 @@ def generate(source: str, header: Path, *, variants=(("baseline", 0), ("optimize
                 f"#define RESIDENT_EXPERIMENT_SKIP_UNCHANGED {enabled}\n"
                 f"#define RESIDENT_EXPERIMENT_COMPACT_REMAP {int(compact)}\n"
                 f"#define RESIDENT_EXPERIMENT_VECTOR_UNION {int(vector_union)}\n"
+                f"#define RESIDENT_EXPERIMENT_VECTOR_INTERSECTION {int(vector_intersection)}\n"
                 f"#define RESIDENT_EXPERIMENT_UNION_STOP {union_stop}\n"
                 + classes + entry + launch
             )
@@ -94,6 +95,8 @@ def main() -> None:
                            kernels={"finalize": "dsa_resident_sharded_finalize_worker_kernel"}))
     output.update(generate(source, HERE / "launch.h", variants=(("vector", 0),),
                            kernels={"union": KERNELS["union"]}, vector_union=True))
+    output.update(generate(source, HERE / "launch.h", variants=(("intersection", 0),),
+                           kernels={"union": KERNELS["union"]}, vector_intersection=True))
     for variant in ("baseline", "vector"):
         for phase, stop in (("sort", 1), ("dedup", 2)):
             output.update(generate(source, HERE / "launch.h", variants=((variant, 0),),

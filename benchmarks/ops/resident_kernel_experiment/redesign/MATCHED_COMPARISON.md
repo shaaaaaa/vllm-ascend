@@ -6,6 +6,14 @@ for every method. Source identity, valid lengths, initial resident tokens and
 physical page permutations are shared. Caches evolve over consecutive steps using
 each method's own retention policy; subsequent miss counts need not be equal.
 
+For the exact union-only optimization use `--methods original vector_intersection`.
+Both methods then use the original cache/transfer adapter, and every step's valid
+resident state and miss/target arrays must match before timing. `--build-dir` is
+unnecessary for this pair; `--original-build-dir` must contain the newly built
+intersection variant. `union_us_per_step` and `planning_three_us_per_step` report
+the old/new metadata costs separately from retrieval. See the parent README for
+complete build and benchmark commands.
+
 ## Measured scope
 
 - BF16 Group-0 MLA_LATENT: separate 512-element latent and 64-element rotary planes,
@@ -15,6 +23,10 @@ each method's own retention policy; subsequent miss counts need not be equal.
 - All retrieval uses `sparse_mla_dsa_batched_direct_kv_transfer_prepared`, including
   its count-aware fixed rows. The original path loads only unique misses; resident
   hits remain in place. Its three original kernels are timed separately as well.
+  This adapter makes R prepared transfer calls per original step and 3R per
+  replacement step (including zero-count calls). It is not the newer serving
+  `SparseGraphCopy` kernel that batches requests in one launch. The report names
+  this backend explicitly; its winner is not yet a final full-graph serving winner.
 - The replacement runs lookup, a native source-descriptor packer, prepared loads
   for CPU misses, HBM resident hits and live tails, then publishes the next snapshot.
   Two disjoint paged payload banks avoid overwriting a source still being consumed.
@@ -91,6 +103,10 @@ build manifests, device identity, per-kernel timing and:
 - Original three-kernel time, excluding retrieval.
 - Complete graph device span and summed task duration, including descriptor
   adaptation, retrieval, metadata input copies and snapshot publication.
+  Timing schema 2 separates `NOTIFY_WAIT`, `NOTIFY_RECORD` and `MODEL_EXECUTE`
+  into `control_breakdown_us_per_step`: they can overlap the work they coordinate
+  and must not be added to independent kernel cost. `raw_task_sum_us_per_step`
+  preserves the unfiltered sum; complete span still covers the entire trace.
 - Median/p95 across repeated **rollout averages per step**, not per-request TPOT
   or the p95 of individual decode steps. Overlapping hardware work can make summed
   task duration exceed the wall-clock device span.

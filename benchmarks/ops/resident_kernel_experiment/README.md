@@ -20,6 +20,7 @@ with `--variants`; `baseline` is always included for comparison.
 | `sharded_finalize` | Existing experimental sharded worker | Original |
 | `combined` | Sharded worker | Compact slot gather; original state merge |
 | `vector_union` | Original | Original; vectorized union deduplication/mapping |
+| `vector_intersection` | Original | Original sorting/dedup; exact vector resident intersection only |
 
 `vector_union` changes only the union kernel. Sorting, the subsequent scalar
 resident intersection, allocation policy, finalize and update remain baseline.
@@ -200,6 +201,56 @@ diagnosis only: their approximately 120 us submission floor can hide gains.
 `--overlap 0` selects 4096 unique tokens for query width 2; `--overlap 1024`
 (default) selects 3072; `--overlap 2048` selects 2048. Test all three overlap
 levels rather than treating 4096 input entries as 4096 unique selections.
+
+## Exact intersection with unchanged retrieval
+
+`vector_intersection` replaces only the scalar resident intersection in union.
+It preserves the ordered unique misses, hit slots and eviction candidates. The
+baseline finalize/update kernels and registered-source retrieval are reused.
+Both counts must fit 2048 lanes; larger/skewed shards execute the original scalar
+merge. It reuses existing UB scratch and adds no global buffers, payload copies,
+kernel launches, runtime serving knobs or serving-path checks (the compile flag
+defaults to zero). Native performance remains to be measured on the target NPU.
+
+Build and test the standalone kernels:
+
+```bash
+EXP=benchmarks/ops/resident_kernel_experiment
+BUILD="$EXP/build-910b3-intersection"
+bash "$EXP/build.sh" ascend910b3 "$BUILD" &&
+python -m pytest --confcutdir="$EXP/tests" -o addopts= "$EXP/tests" \
+  --resident-build-dir "$BUILD" -xq
+```
+
+Profile the original/new kernels, including their unchanged finalize and update:
+
+```bash
+python "$EXP/benchmark.py" --build-dir "$BUILD" --requests 8 --mtp 2 \
+  --shards-per-row 4 --hit-rates 0.9 --variants baseline vector_intersection \
+  --stage all --iterations 30 --warmup 20 --json "$EXP/intersection-results.json"
+```
+
+Measure the same evolving workload with actual registered CPU chunks and paged
+BF16 512+64 retrieval. Both methods use the Original adapter: same miss-only loads,
+same transfer call count, same hit-in-place behavior. The runner aborts on different
+valid metadata, miss/target arrays or source counts before profiling. Only the
+standalone original-kernel library is needed; no redesign native rebuild is needed.
+
+```bash
+RED="$EXP/redesign"
+python "$RED/matched.py" --original-build-dir "$BUILD" \
+  --methods original vector_intersection --lmcache-ascend-dir /workspace/sqh/LMCache-Ascend \
+  --output-dir "$RED/sweeps/intersection-r8" --requests 8 --steps 4 --repeats 4 \
+  --scenario rank_shift
+```
+
+This last command uses eight profiler sessions. To reuse an earlier input sequence,
+add `--trace "$RED/sweeps/matched-r8-shift/r8-inputs.pt"`; that saved synthetic trace
+is not a production trace. Real captured **pre-remap** top-k sequences can use the
+same tensor schema in [redesign/MATCHED_COMPARISON.md](redesign/MATCHED_COMPARISON.md).
+Repeat with requests 1/8/16 and other selection patterns before promoting the variant.
+The report separates union, complete three-kernel planning, and total preparation.
+The prepared-per-request backend is shared by both; this is not full-model TPOT.
 
 ## Isolate the union prefix cost
 

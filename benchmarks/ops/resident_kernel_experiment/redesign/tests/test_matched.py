@@ -14,6 +14,33 @@ def test_measurement_order_is_balanced_in_each_four_repeat_block():
         orders = [measurement_order(i) for i in range(start, start+4)]
         for position in range(4):
             assert set(order[position] for order in orders) == set(METHODS)
+    pair = ('original', 'vector_intersection')
+    assert [measurement_order(i, pair) for i in range(4)] == [list(pair), list(pair[::-1]), list(pair[::-1]), list(pair)]
+
+
+@pytest.mark.parametrize('newer_binding', (False, True))
+def test_native_transfer_binding_uses_shared_eight_argument_contract(newer_binding):
+    from types import SimpleNamespace
+    from matched_runtime import bind_transfer_api, Sources
+    calls = []
+    def old(state, slots, selected, ptrs, chunk, total, interleaved, counts):
+        calls.append((state, slots, selected, ptrs, chunk, total, interleaved, counts))
+    def newer(state, slots, selected, ptrs, chunk, total, interleaved, counts, diagnostic_layer_id=-1):
+        assert diagnostic_layer_id == -1
+        old(state, slots, selected, ptrs, chunk, total, interleaved, counts)
+    def incompatible_wrapper(*args):
+        raise AssertionError('must not invoke the mismatched Python wrapper')
+    names = ('__file__', 'MlaDsaDims', 'compute_chunk_partition', 'create_pin_memory_allocator',
+             'release_pin_memory_objects', 'build_chunk_ptrs_npu',
+             'prepare_sparse_direct_destination_state', 'KV_FORMAT_MLA_LATENT')
+    helpers = SimpleNamespace(**dict.fromkeys(names, object()),
+        sparse_mla_dsa_batched_direct_kv_transfer_prepared=incompatible_wrapper)
+    native = SimpleNamespace(sparse_mla_dsa_batched_direct_kv_transfer_prepared=newer if newer_binding else old)
+    source = Sources.__new__(Sources)
+    source.api = bind_transfer_api(helpers, native)
+    source.transfer('state', 'slots', 'selected', 'counts', 'ptrs', 1024, 8192)
+    assert calls == [('state', 'slots', 'selected', 'ptrs', 1024, 8192, False, 'counts')]
+    assert helpers.sparse_mla_dsa_batched_direct_kv_transfer_prepared is incompatible_wrapper
 
 
 @pytest.mark.parametrize('scenario', ('stable', 'rank_shift', 'permuted', 'cold'))
@@ -87,6 +114,18 @@ def test_timing_preserves_large_timestamp_precision_and_overlap():
              event('transfer', '18000000000000002.25', '2.25')]
     result = device_timing(trace, 'bounded_position', 1)
     assert result['complete_span_us_per_step'] == 4.5
+
+
+def test_graph_wait_records_are_not_added_to_kernel_work():
+    trace = [event(name, str(i*5), '5') for i, name in enumerate(ORIGINAL_SYMBOLS)]
+    trace += [event('NOTIFY_WAIT', '0', '50', tid=2),
+              event('MODEL_EXECUTE', '0', '1', tid=3), event('NOTIFY_RECORD', '50', '0', tid=2)]
+    result = device_timing(trace, 'original', 1)
+    assert result['complete_sum_us_per_step'] == 15
+    assert result['raw_task_sum_us_per_step'] == 66
+    assert result['complete_span_us_per_step'] == 50
+    assert result['control_breakdown_us_per_step']['NOTIFY_WAIT'] == 50
+    assert 'NOTIFY_WAIT' not in result['kernel_breakdown_us_per_step']
 
 
 def test_partial_host_allocation_failure_releases_owned_chunks(monkeypatch):
@@ -183,8 +222,9 @@ def test_matched_adapter_state_and_payload_lifecycle_on_cpu(monkeypatch):
                 slots[kind, r, tile, i] = new[r, pos]
                 counts[kind, r, tile, 0] += 1
     monkeypatch.setattr(torch.ops, 'resident_redesign', SimpleNamespace(pack_sources_=pack))
-    for name in ('original', 'bounded_position', 'hash_snapshot', 'direct_directory'):
-        runtime = Original(source, trace) if name == 'original' else Replacement(source, trace, name)
+    for name in ('original', 'vector_intersection', 'bounded_position', 'hash_snapshot', 'direct_directory'):
+        runtime = (Original(source, trace, 'baseline' if name == 'original' else name)
+                   if name in ('original', 'vector_intersection') else Replacement(source, trace, name))
         counts = []
         for repeat in range(2):
             runtime.reset()
@@ -195,3 +235,13 @@ def test_matched_adapter_state_and_payload_lifecycle_on_cpu(monkeypatch):
                 observed.append(runtime.last_misses)
             counts.append(observed)
         assert counts[0] == counts[1]
+
+
+def test_exact_variant_profiler_includes_original_finalize_update():
+    names = (ORIGINAL_SYMBOLS[0].replace('_baseline', '_intersection'), *ORIGINAL_SYMBOLS[1:])
+    trace = [event(name, str(i*10), '5') for i, name in enumerate(names)]
+    trace.append(event('prepared_transfer', '30', '20'))
+    result = device_timing(trace, 'vector_intersection', 1)
+    assert result['planning_three_us_per_step'] == 15
+    assert result['union_us_per_step'] == 5
+    assert result['complete_sum_us_per_step'] == 35

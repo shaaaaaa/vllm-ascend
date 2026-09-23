@@ -30,6 +30,9 @@
 #ifndef RESIDENT_EXPERIMENT_UNION_STOP
 #define RESIDENT_EXPERIMENT_UNION_STOP 0
 #endif
+#ifndef RESIDENT_EXPERIMENT_VECTOR_INTERSECTION
+#define RESIDENT_EXPERIMENT_VECTOR_INTERSECTION 0
+#endif
 
 namespace {
 
@@ -608,6 +611,14 @@ public:
         uint32_t oldIndex = 0;
         uint32_t missCount = 0;
         uint32_t evictableCount = 0;
+#if RESIDENT_EXPERIMENT_VECTOR_INTERSECTION
+        if (rank <= rowWidth_ && oldCount <= rowWidth_) {
+            VectorIntersection(sortedTokens, oldTokens, oldSlots, priorSlots,
+                shardMissTokens, shardMissPositions, shardEvictableSlots,
+                rank, oldCount, missCount, evictableCount);
+        } else
+#endif
+        {
         if (rank > 0) {
             for (uint32_t currentIndex = 0;
                  currentIndex < rank;
@@ -639,6 +650,7 @@ public:
             shardEvictableSlots.SetValue(
                 evictableCount++, oldSlots.GetValue(oldIndex));
             ++oldIndex;
+        }
         }
         if (!generationMatches) {
             WriteGlobalScalarVisible(
@@ -697,6 +709,141 @@ public:
     }
 
 private:
+#if RESIDENT_EXPERIMENT_VECTOR_INTERSECTION
+    __aicore__ inline uint32_t IntersectionWidth(uint32_t count)
+    {
+        return (count + 31U) & ~31U;
+    }
+
+    // Inputs are sorted unique int32 tokens. Searches use only existing dead
+    // row/sort scratch; low retains each query's lower_bound on return.
+    __aicore__ inline void IntersectionMasks(
+        AscendC::LocalTensor<int32_t> queries, uint32_t count,
+        AscendC::LocalTensor<int32_t> target, uint32_t targetCount)
+    {
+        const uint32_t width = IntersectionWidth(count);
+        auto low = workBuf_.Get<int32_t>();
+        auto high = clampedBuf_.Get<int32_t>();
+        auto mid = indexBuf_.Get<int32_t>();
+        auto offsets = inputBuf_.Get<int32_t>();
+        auto candidate = sortSrcBuf_.Get<int32_t>()[shardCapacity_];
+        auto hit = shardMaskBuf_.Get<uint8_t>();
+        auto valid = nonNegativeMaskBuf_.Get<uint8_t>();
+        auto less = beforeBoundaryMaskBuf_.Get<uint8_t>();
+        auto missing = selectedMaskBuf_.Get<uint8_t>();
+        AscendC::CreateVecIndex(mid, static_cast<int32_t>(0), width);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Mins(candidate, mid, static_cast<int32_t>(count - 1), width);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Compare(valid, candidate, mid, AscendC::CMPMODE::EQ, width);
+        AscendC::PipeBarrier<PIPE_V>();
+        if (targetCount == 0) {
+            AscendC::Duplicate(hit.ReinterpretCast<uint16_t>(), static_cast<uint16_t>(0), width / 16);
+            AscendC::And(missing.ReinterpretCast<uint16_t>(), valid.ReinterpretCast<uint16_t>(),
+                valid.ReinterpretCast<uint16_t>(), width / 16);
+            AscendC::PipeBarrier<PIPE_V>();
+            return;
+        }
+        AscendC::Duplicate(low, static_cast<int32_t>(0), width);
+        AscendC::Duplicate(high, static_cast<int32_t>(targetCount), width);
+        AscendC::PipeBarrier<PIPE_V>();
+        for (uint32_t remaining = targetCount; remaining > 0; remaining >>= 1) {
+            AscendC::Add(mid, low, high, width); AscendC::PipeBarrier<PIPE_V>();
+            AscendC::ShiftRight(mid, mid, static_cast<int32_t>(1), width); AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Mins(offsets, mid, static_cast<int32_t>(targetCount - 1), width); AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Muls(offsets, offsets, static_cast<int32_t>(4), width); AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Gather(candidate, target, offsets.ReinterpretCast<uint32_t>(), 0, width); AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Compare(less, candidate, queries, AscendC::CMPMODE::LT, width); AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Adds(offsets, mid, static_cast<int32_t>(1), width); AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Mins(offsets, offsets, static_cast<int32_t>(targetCount), width); AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Select(low.ReinterpretCast<float>(), less, offsets.ReinterpretCast<float>(),
+                low.ReinterpretCast<float>(), AscendC::SELMODE::VSEL_TENSOR_TENSOR_MODE, width);
+            AscendC::Select(high.ReinterpretCast<float>(), less, high.ReinterpretCast<float>(),
+                mid.ReinterpretCast<float>(), AscendC::SELMODE::VSEL_TENSOR_TENSOR_MODE, width);
+            AscendC::PipeBarrier<PIPE_V>();
+        }
+        AscendC::Mins(offsets, low, static_cast<int32_t>(targetCount - 1), width); AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Muls(offsets, offsets, static_cast<int32_t>(4), width); AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Gather(candidate, target, offsets.ReinterpretCast<uint32_t>(), 0, width); AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Compare(hit, candidate, queries, AscendC::CMPMODE::EQ, width);
+        AscendC::Compare(missing, candidate, queries, AscendC::CMPMODE::NE, width);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::And(hit.ReinterpretCast<uint16_t>(), hit.ReinterpretCast<uint16_t>(), valid.ReinterpretCast<uint16_t>(), width / 16);
+        AscendC::And(missing.ReinterpretCast<uint16_t>(), missing.ReinterpretCast<uint16_t>(), valid.ReinterpretCast<uint16_t>(), width / 16);
+        AscendC::PipeBarrier<PIPE_V>();
+    }
+
+    __aicore__ inline void VectorIntersection(
+        AscendC::LocalTensor<int32_t> current, AscendC::LocalTensor<int32_t> old,
+        AscendC::LocalTensor<int16_t> oldSlots, AscendC::LocalTensor<int16_t> prior,
+        AscendC::LocalTensor<int32_t> misses, AscendC::LocalTensor<int16_t> positions,
+        AscendC::LocalTensor<int16_t> evictable, uint32_t count, uint32_t oldCount,
+        uint32_t& missCount, uint32_t& evictableCount)
+    {
+        Sync<AscendC::HardEvent::MTE2_V>();
+        Sync<AscendC::HardEvent::S_V>();
+        auto slotsFloat = sortTmpBuf_.Get<float>()[shardCapacity_];
+        auto values = sortSrcBuf_.Get<float>()[shardCapacity_];
+        auto offsets = inputBuf_.Get<int32_t>();
+        auto indices = indexBuf_.Get<int32_t>();
+        auto low = workBuf_.Get<int32_t>();
+        auto missing = selectedMaskBuf_.Get<uint8_t>();
+        AscendC::GatherMaskParams params;
+        params.repeatTimes = 1; params.src0BlockStride = 1;
+        params.src0RepeatStride = 8; params.src1RepeatStride = 8;
+        if (oldCount > 0) {
+            AscendC::Cast(slotsFloat, oldSlots, AscendC::RoundMode::CAST_NONE, IntersectionWidth(oldCount));
+            AscendC::PipeBarrier<PIPE_V>();
+        }
+        if (count > 0) {
+            const uint32_t width = IntersectionWidth(count);
+            IntersectionMasks(current, count, old, oldCount);
+            if (oldCount > 0) {
+                AscendC::Mins(offsets, low, static_cast<int32_t>(oldCount - 1), width); AscendC::PipeBarrier<PIPE_V>();
+                AscendC::Muls(offsets, offsets, static_cast<int32_t>(4), width); AscendC::PipeBarrier<PIPE_V>();
+                AscendC::Gather(values, slotsFloat, offsets.ReinterpretCast<uint32_t>(), 0, width); AscendC::PipeBarrier<PIPE_V>();
+                AscendC::Select(values, shardMaskBuf_.Get<uint8_t>(), values, -1.0F,
+                    AscendC::SELMODE::VSEL_TENSOR_SCALAR_MODE, width); AscendC::PipeBarrier<PIPE_V>();
+                AscendC::Cast(prior, values, AscendC::RoundMode::CAST_ROUND, width);
+            } else {
+                AscendC::Duplicate(prior, static_cast<int16_t>(-1), width);
+            }
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::CreateVecIndex(indices, static_cast<int32_t>(0), width);
+            AscendC::Duplicate(offsets, static_cast<int32_t>(0), width);
+            AscendC::PipeBarrier<PIPE_V>();
+            uint64_t tokenCount = 0, positionCount = 0;
+            AscendC::GatherMask(misses, current, missing.ReinterpretCast<uint32_t>(), true, width, params, tokenCount);
+            AscendC::GatherMask(offsets, indices, missing.ReinterpretCast<uint32_t>(), true, width, params, positionCount);
+            AscendC::PipeBarrier<PIPE_V>();
+            Sync<AscendC::HardEvent::V_S>();
+            missCount = static_cast<uint32_t>(tokenCount);
+            if (missCount > 0) {
+                AscendC::Cast(values, offsets, AscendC::RoundMode::CAST_NONE, IntersectionWidth(missCount));
+                AscendC::PipeBarrier<PIPE_V>();
+                AscendC::Cast(positions, values, AscendC::RoundMode::CAST_ROUND, IntersectionWidth(missCount));
+                AscendC::PipeBarrier<PIPE_V>();
+            }
+        }
+        if (oldCount > 0) {
+            const uint32_t width = IntersectionWidth(oldCount);
+            IntersectionMasks(old, oldCount, current, count);
+            AscendC::Duplicate(offsets.ReinterpretCast<float>(), 0.0F, width); AscendC::PipeBarrier<PIPE_V>();
+            uint64_t compactCount = 0;
+            AscendC::GatherMask(offsets.ReinterpretCast<float>(), slotsFloat, missing.ReinterpretCast<uint32_t>(),
+                true, width, params, compactCount);
+            AscendC::PipeBarrier<PIPE_V>();
+            Sync<AscendC::HardEvent::V_S>();
+            evictableCount = static_cast<uint32_t>(compactCount);
+            if (evictableCount > 0) {
+                AscendC::Cast(evictable, offsets.ReinterpretCast<float>(), AscendC::RoundMode::CAST_ROUND, IntersectionWidth(evictableCount));
+                AscendC::PipeBarrier<PIPE_V>();
+            }
+        }
+        Sync<AscendC::HardEvent::V_S>();
+    }
+#endif
+
     __aicore__ inline uint32_t VectorDeduplicateAndMap(
         AscendC::LocalTensor<float>& src, AscendC::LocalTensor<float>& tmp,
         AscendC::LocalTensor<int32_t>& sortedTokens,

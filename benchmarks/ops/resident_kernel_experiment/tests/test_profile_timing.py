@@ -84,3 +84,11 @@ def test_union_prefix_probe_has_its_own_device_symbol(stage, variant):
     events = [{"ph": "X", "cat": "kernel", "name": name + "_0",
                "ts": 100, "dur": 40, "pid": 2, "tid": 5}]
     assert parse_trace(events, variant, stage, 1)["kernels"][stage]["mean_us"] == 40
+
+
+def test_intersection_variant_changes_only_union_symbol():
+    original = kernel_names('baseline')
+    optimized = kernel_names('vector_intersection')
+    assert optimized['union'] == 'dsa_resident_sharded_union_kernel_intersection'
+    assert optimized['finalize'] == original['finalize']
+    assert optimized['update'] == original['update']

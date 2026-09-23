@@ -10,6 +10,7 @@ void resident_experiment_optimized_update(void*, const ResidentLaunch&);
 void resident_experiment_compact_update(void*, const ResidentLaunch&);
 void resident_experiment_sharded_finalize(void*, const ResidentLaunch&);
 void resident_experiment_vector_union(void*, const ResidentLaunch&);
+void resident_experiment_intersection_union(void*, const ResidentLaunch&);
 void resident_experiment_baseline_union_sort(void*, const ResidentLaunch&);
 void resident_experiment_baseline_union_dedup(void*, const ResidentLaunch&);
 void resident_experiment_vector_union_sort(void*, const ResidentLaunch&);
@@ -41,8 +42,11 @@ void resident_experiment_run_variant(void* stream, const ResidentLaunch& args, i
         else resident_experiment_baseline_union_dedup(stream, args);
         return;
     }
-    if (variant == 5) {
-        if (stage == 0 || stage == 1) resident_experiment_vector_union(stream, args);
+    if (variant == 5 || variant == 6) {
+        if (stage == 0 || stage == 1) {
+            if (variant == 6) resident_experiment_intersection_union(stream, args);
+            else resident_experiment_vector_union(stream, args);
+        }
         if (stage == 0 || stage == 2) resident_experiment_baseline_finalize(stream, args);
         if (stage == 0 || stage == 3) resident_experiment_baseline_update(stream, args);
         return;

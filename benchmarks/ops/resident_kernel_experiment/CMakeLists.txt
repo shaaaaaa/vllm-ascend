@@ -44,6 +44,7 @@ endforeach()
 list(APPEND resident_sources "${CMAKE_CURRENT_BINARY_DIR}/generated/compact_update.cpp"
     "${CMAKE_CURRENT_BINARY_DIR}/generated/sharded_finalize.cpp")
 list(APPEND resident_sources "${CMAKE_CURRENT_BINARY_DIR}/generated/vector_union.cpp")
+list(APPEND resident_sources "${CMAKE_CURRENT_BINARY_DIR}/generated/intersection_union.cpp")
 foreach(variant baseline vector)
     foreach(phase sort dedup)
         list(APPEND resident_sources "${CMAKE_CURRENT_BINARY_DIR}/generated/${variant}_union_${phase}.cpp")

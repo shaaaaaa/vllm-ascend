@@ -24,6 +24,7 @@ from matched_data import make_trace, trace_digest, validate_trace
 from matched_runtime import Original, Replacement, Sources, load_transfer_api
 
 METHODS = ('original', 'bounded_position', 'hash_snapshot', 'direct_directory')
+EXACT_METHODS = ('original', 'vector_intersection')
 ORIGINAL_SYMBOLS = ('dsa_resident_sharded_union_kernel_baseline',
                     'dsa_resident_sorted_finalize_kernel_baseline',
                     'dsa_resident_sorted_update_kernel_baseline')
@@ -44,18 +45,33 @@ def device_timing(document, method, steps):
         raise RuntimeError('invalid hardware durations')
     end = [s+d for s, d in zip(start, duration, strict=True)]
     names = [str(e.get('name', '')) for e in tasks]
-    symbols = ORIGINAL_SYMBOLS if method == 'original' else ('resident_pack_sources_redesign',)
+    planning = ((ORIGINAL_SYMBOLS[0].replace('_baseline', '_intersection'), *ORIGINAL_SYMBOLS[1:])
+                if method == 'vector_intersection' else ORIGINAL_SYMBOLS)
+    symbols = planning if method in EXACT_METHODS else ('resident_pack_sources_redesign',)
     for symbol in symbols:
         if sum(symbol in name for name in names) != steps:
             raise RuntimeError(f'expected {steps} {symbol} tasks; inspect trace')
-    original = sum((d for name, d in zip(names, duration, strict=True)
-                    if any(s in name for s in ORIGINAL_SYMBOLS)), Decimal(0))
-    breakdown = {}
+    planning_time = sum((d for name, d in zip(names, duration, strict=True)
+                         if method in EXACT_METHODS and any(s in name for s in planning)), Decimal(0))
+    union_time = sum((d for name, d in zip(names, duration, strict=True)
+                      if method in EXACT_METHODS and planning[0] in name), Decimal(0))
+    breakdown, control = {}, {}
+    active_duration = Decimal(0)
     for name, d in zip(names, duration, strict=True):
-        breakdown[name] = breakdown.get(name, 0.) + float(d) / steps
-    return {'complete_sum_us_per_step': float(sum(duration)) / steps,
+        # These graph-control records can overlap the kernels they wait for or
+        # dispatch. Keep them visible, but do not count them as additional work.
+        is_control = name.upper().startswith(('NOTIFY_WAIT', 'NOTIFY_RECORD', 'MODEL_EXECUTE'))
+        bucket = control if is_control else breakdown
+        bucket[name] = bucket.get(name, 0.) + float(d) / steps
+        if not is_control:
+            active_duration += d
+    return {'complete_sum_us_per_step': float(active_duration) / steps,
+            'raw_task_sum_us_per_step': float(sum(duration)) / steps,
             'complete_span_us_per_step': float(max(end)-min(start)) / steps,
-            'original_three_us_per_step': float(original) / steps,
+            'original_three_us_per_step': float(planning_time) / steps if method == 'original' else 0.,
+            'planning_three_us_per_step': float(planning_time) / steps,
+            'union_us_per_step': float(union_time) / steps,
+            'control_breakdown_us_per_step': control,
             'kernel_breakdown_us_per_step': breakdown, 'device_tasks': len(tasks),
             'hardware_tracks': len({(e.get('pid'), e.get('tid')) for e in tasks})}
 
@@ -66,10 +82,26 @@ def stats(values):
             'p95': ordered[min(len(ordered)-1, int(.95*len(ordered)))]}
 
 
-def measurement_order(repeat):
-    # Every four repeats gives every method each position exactly once.
-    order = list(METHODS[repeat % len(METHODS):] + METHODS[:repeat % len(METHODS)])
-    return order[::-1] if (repeat // len(METHODS)) % 2 else order
+def measurement_order(repeat, methods=METHODS):
+    # Every len(methods) repeats gives every method each position exactly once.
+    order = list(methods[repeat % len(methods):] + methods[:repeat % len(methods)])
+    return order[::-1] if (repeat // len(methods)) % 2 else order
+
+
+def verify_exact_pair(baseline, candidate):
+    from resident_experiment import assert_result
+    baseline.reset()
+    candidate.reset()
+    for index in range(baseline.s):
+        baseline.step(index)
+        candidate.step(index)
+        torch.npu.synchronize()
+        baseline.check(index)
+        candidate.check(index)
+        assert_result(candidate.case, baseline.case.clone('cpu'))
+        if (candidate.last_misses, candidate.last_hits, candidate.last_tail) != (
+                baseline.last_misses, baseline.last_hits, baseline.last_tail):
+            raise AssertionError('union-only optimization changed retrieval work')
 
 
 def capture(case):
@@ -115,7 +147,8 @@ def measure(case, graph, path):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--original-build-dir', type=Path, required=True)
-    parser.add_argument('--build-dir', type=Path, required=True)
+    parser.add_argument('--build-dir', type=Path, help='required only for redesign replacement methods')
+    parser.add_argument('--methods', choices=(*METHODS, 'vector_intersection'), nargs='+', default=list(METHODS))
     parser.add_argument('--lmcache-ascend-dir', type=Path, required=True)
     parser.add_argument('--output-dir', type=Path, required=True)
     parser.add_argument('--trace', type=Path, help='tensor-only .pt: initial_tokens, initial_ready, steps, boundary, lengths')
@@ -130,6 +163,9 @@ def main():
     parser.add_argument('--overlap', type=int, default=1024)
     parser.add_argument('--device', type=int, default=0)
     args = parser.parse_args()
+    methods = tuple(dict.fromkeys(('original', *args.methods)))
+    if any(name not in EXACT_METHODS for name in methods) and args.build_dir is None:
+        parser.error('--build-dir is required for redesign replacement methods')
     if min(*args.requests, args.steps, args.repeats, args.prefix, args.chunk_size) < 1 or args.tail < 0:
         parser.error('invalid geometry/repetition count')
     if args.prefix < 4096 or args.prefix % args.chunk_size:
@@ -138,7 +174,9 @@ def main():
     torch.npu.set_device(args.device)
     torch.set_num_threads(1)
     args.output_dir.mkdir(parents=True, exist_ok=False)
-    build = {'original': load_original(args.original_build_dir), 'redesign': load_library(args.build_dir)}
+    build = {'original': load_original(args.original_build_dir)}
+    if any(name not in EXACT_METHODS for name in methods):
+        build['redesign'] = load_library(args.build_dir)
     api = load_transfer_api(args.lmcache_ascend_dir)
     backend_files = [Path(api.__file__)] + [Path(importlib.import_module(name).__file__)
                      for name in ('lmcache_ascend.v1.npu_connector.utils', 'lmcache_ascend.c_ops')]
@@ -147,6 +185,8 @@ def main():
     trace_file = validate_trace(torch.load(args.trace, map_location='cpu', weights_only=True)) if args.trace else None
     requests = [trace_file['steps'].shape[1]] if trace_file is not None else args.requests
     report = {'scope': 'BF16 MLA_LATENT 512+64, block=128, registered stacked CPU chunks; cache preparation only',
+              'timing_schema': 2,
+              'transfer_backend': 'prepared_per_request; not the serving batched SparseGraphCopy backend',
               'parameters': {name: str(value) if isinstance(value, Path) else value for name, value in vars(args).items()},
               'includes': ['input metadata copies', 'lookup/state maintenance', 'source packing',
                            'prepared CPU/HBM transfers', 'snapshot publication'],
@@ -165,37 +205,46 @@ def main():
         source = Sources(api, trace, torch.device('npu', args.device), args.chunk_size)
         cases, graphs, misses, samples, memory = {}, {}, {}, {}, {}
         try:
-            for name in METHODS:
+            for name in methods:
                 before = torch.npu.memory_allocated()
-                cases[name] = Original(source, trace) if name == 'original' else Replacement(source, trace, name)
+                cases[name] = (Original(source, trace, 'baseline' if name == 'original' else name)
+                               if name in EXACT_METHODS else Replacement(source, trace, name))
                 graphs[name], misses[name] = capture(cases[name])
                 memory[name] = torch.npu.memory_allocated() - before
                 samples[name] = []
+            if 'vector_intersection' in cases:
+                verify_exact_pair(cases['original'], cases['vector_intersection'])
             for repeat in range(args.repeats):
-                order = measurement_order(repeat)
+                order = measurement_order(repeat, methods)
                 for name in order:
                     print(f'R={r} repeat={repeat+1}/{args.repeats} {name}', flush=True)
                     path = args.output_dir / f'r{r}-{name}-{repeat}.json'
                     samples[name].append(measure(cases[name], graphs[name], path))
             summary = {}
-            for name in METHODS:
+            for name in methods:
                 summary[name] = {'complete_sum_us_per_step': stats([x['complete_sum_us_per_step'] for x in samples[name]]),
                                  'complete_span_us_per_step': stats([x['complete_span_us_per_step'] for x in samples[name]]),
                                  'original_three_us_per_step': stats([x['original_three_us_per_step'] for x in samples[name]]),
+                                 'planning_three_us_per_step': stats([x['planning_three_us_per_step'] for x in samples[name]]),
+                                 'union_us_per_step': stats([x['union_us_per_step'] for x in samples[name]]),
                                  'source_counts_per_step': misses[name],
                                  'cpu_bytes_per_step': [m['cpu_rows']*1152 for m in misses[name]],
-                                 'extra_hbm_copy_bytes_per_step': [0 if name == 'original' else
+                                 'extra_hbm_copy_bytes_per_step': [0 if name in EXACT_METHODS else
                                      (m['hit_occurrences']+m['live_occurrences'])*1152 for m in misses[name]],
-                                 'resident_payload_bytes': r*4096*1152*(1 if name == 'original' else 2),
+                                 'resident_payload_bytes': r*4096*1152*(1 if name in EXACT_METHODS else 2),
+                                 'prepared_transfer_calls_per_step': r*(1 if name in EXACT_METHODS else 3),
                                  'torch_device_bytes_including_graph_and_reset_buffers': memory[name], 'samples': samples[name]}
             base = summary['original']['complete_span_us_per_step']['median']
-            for name in METHODS:
+            for name in methods:
                 value = summary[name]['complete_span_us_per_step']
                 summary[name]['speedup'] = base / value['median']
                 print(f"R={r} {name:18} median={value['median']:.2f}us p95={value['p95']:.2f}us "
                       f"speedup={base/value['median']:.3f}x CPU_rows={[m['cpu_rows'] for m in misses[name]]}")
+                if name in EXACT_METHODS:
+                    print(f"  union={summary[name]['union_us_per_step']['median']:.2f} us; "
+                          f"three kernels={summary[name]['planning_three_us_per_step']['median']:.2f} us")
             print(f"R={r} original three kernels only: {summary['original']['original_three_us_per_step']['median']:.2f} us/step")
-            winner = min(METHODS, key=lambda name: summary[name]['complete_span_us_per_step']['median'])
+            winner = min(methods, key=lambda name: summary[name]['complete_span_us_per_step']['median'])
             report['results'].append({'requests': r, 'trace_sha256': trace_digest(trace),
                                       'measured_winner': winner, 'methods': summary,
                                       'registered_payload_bytes': source.registered_payload_bytes})

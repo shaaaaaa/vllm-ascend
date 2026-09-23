@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Prepared LMCache transfer adapter; imports serving dependencies only on NPU."""
 from pathlib import Path
+from types import SimpleNamespace
 import sys
 
 import torch
@@ -10,16 +11,28 @@ from matched_data import initial_slots, payload
 from native import NativeCase
 
 
+def bind_transfer_api(helpers, native):
+    # utils.py may be newer than the installed c_ops binary. Both native versions
+    # accept eight arguments; newer bindings default diagnostic_layer_id to -1.
+    # Keep this compatibility choice local to the experiment, without monkeypatching
+    # the production module or retrying a possibly already-submitted operation.
+    names = ('__file__', 'MlaDsaDims', 'compute_chunk_partition', 'create_pin_memory_allocator',
+             'release_pin_memory_objects', 'build_chunk_ptrs_npu',
+             'prepare_sparse_direct_destination_state', 'KV_FORMAT_MLA_LATENT')
+    return SimpleNamespace(**{name: getattr(helpers, name) for name in names},
+        sparse_mla_dsa_batched_direct_kv_transfer_prepared=native.sparse_mla_dsa_batched_direct_kv_transfer_prepared)
+
+
 def load_transfer_api(root):
     helpers = Path(root) / 'benchmark/v1/kv_transfer'
     if not (helpers / 'load_benchmark_utils.py').is_file():
         raise FileNotFoundError(f'missing production transfer helpers: {helpers}')
     sys.path.insert(0, str(helpers))
     import load_benchmark_utils as api
-    import lmcache_ascend.c_ops  # noqa: F401 -- no fallback if native registration is unavailable
+    import lmcache_ascend.c_ops as native_ops
     if Path(api.__file__).resolve() != (helpers / 'load_benchmark_utils.py').resolve():
         raise RuntimeError('a different load_benchmark_utils module is already loaded; use a fresh process')
-    return api
+    return bind_transfer_api(api, native_ops)
 
 
 class Sources:
@@ -106,7 +119,11 @@ class Sources:
 
 class Original:
     name = 'original'
-    def __init__(self, source, trace):
+    def __init__(self, source, trace, variant='baseline'):
+        if variant not in ('baseline', 'vector_intersection'):
+            raise ValueError('unsupported exact resident variant')
+        self.variant = variant
+        self.name = 'original' if variant == 'baseline' else variant
         from resident_experiment import make_case, _put_state
         self.source, self.trace = source, trace
         self.s, self.r, self.q, self.k = trace['steps'].shape
@@ -136,7 +153,7 @@ class Original:
 
     def step(self, index):
         self.case['topk'].copy_(self.inputs[index])
-        self.case.run('baseline')
+        self.case.run(self.variant)
         for args in self.loads:
             self.source.transfer(*args)
 
