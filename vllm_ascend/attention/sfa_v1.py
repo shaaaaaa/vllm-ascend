@@ -4785,8 +4785,9 @@ class AscendSFAImpl(MLAAttentionImpl):
             in f".{layer_name}"
         )
         if is_first_transfer_layer:
-            # Virtual source N=-1: only enqueue L1 H2D. L0 was prepared by
-            # start_load_kv; L1's transfer can overlap L0 SFA on the NPU.
+            # start_load_kv eagerly submits L1 before model execution so the
+            # first SFA does not block on retriever/storage work.  Keep the
+            # idempotent callback for connectors that prepare the window later.
             maybe_submit_layerwise_prefill_load(-1)
         pending_transfers = (
             transfer_context.pop("sfa_layerwise_prefill_pending", None)
