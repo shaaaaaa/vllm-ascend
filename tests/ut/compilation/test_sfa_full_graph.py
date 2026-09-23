@@ -82,6 +82,23 @@ def test_one_replay_without_reentering_target_python(graph_module):
     assert wrapper.replay_count == 3
 
 
+def test_shared_plan_bindings_allow_contents_but_reject_storage_replacement(graph_module):
+    module, context, _, _ = graph_module
+    manager = module.SFAFullGraph()
+    inputs, plan = torch.zeros(2), torch.zeros(2, 4, dtype=torch.int32)
+    bindings = {"layer0": {}, "shared_resident_plans": {"producer": (plan,)}}
+    manager.run(lambda **kwargs: inputs, input_ids=inputs, graph_inputs=bindings)
+    manager.seal((context.staged_sfa_graph_key,))
+    context.staged_sfa_graph_dummy_run = False
+    plan.fill_(7)
+    manager.validate_inputs(input_ids=inputs, graph_inputs=bindings)
+    manager.validate_idle_metadata(["layer0"], {})
+    with pytest.raises(RuntimeError, match="address or layout"):
+        manager.validate_inputs(input_ids=inputs, graph_inputs={
+            "layer0": {}, "shared_resident_plans": {"producer": (plan.clone(),)}
+        })
+
+
 def test_uniform_and_bounded_switch_replays_once_and_share_source_tables(graph_module):
     module, context, captures, stream = graph_module
 

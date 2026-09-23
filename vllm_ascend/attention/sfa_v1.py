@@ -81,6 +81,7 @@ from vllm_ascend.distributed.kv_transfer.sparse_offload.prepare_sparse_indices i
 from vllm_ascend.distributed.kv_transfer.sparse_offload.resident_sorted_cache import (
     INDEX_TOPK,
     MAX_INT16_SCRATCH_CAPACITY,
+    SharedResidentPlan,
     SortedResidentState,
     SortedResidentWorkspace,
     allocate_sorted_resident_state,
@@ -118,6 +119,7 @@ from vllm_ascend.utils import (
     enable_dsa_cp_with_o_proj_tp,
     get_weight_prefetch_method,
     maybe_trans_nz,
+    parse_layer_idx,
     staged_sfa_graph_capture_sizes,
     staged_sfa_graph_configured,
 )
@@ -2085,44 +2087,20 @@ class AscendSFAImpl(MLAAttentionImpl):
             int, SortedResidentWorkspace
         ] = {}
         self.dsa_resident_shards_per_row: int | None = None
-        if self.dsa_resident_cache:
-            resident_shards_per_row, resident_shards = (
-                _configured_resident_shards(self.decode_threshold)
-            )
-            self.dsa_resident_shards_per_row = resident_shards_per_row
-            scratch_capacity = self.decode_threshold * self.index_topk
-            if not (
-                0 < scratch_capacity < MAX_INT16_SCRATCH_CAPACITY
-            ):
-                raise ValueError(
-                    "resident sparse cache requires signed-int16 scratch "
-                    "slots and 0 < MTP * index_topk < "
-                    f"{MAX_INT16_SCRATCH_CAPACITY}; got {scratch_capacity}"
-                )
-            if self.index_topk != INDEX_TOPK:
-                raise ValueError(
-                    "sorted resident cache currently requires index_topk="
-                    f"{INDEX_TOPK}; got {self.index_topk}"
-                )
-            max_requests = int(
-                self.vllm_config.scheduler_config.max_num_seqs
-            )
-            state_device = self.q_b_proj.weight.device
-            self._sorted_resident_state = allocate_sorted_resident_state(
-                max_requests,
-                max_requests,
-                self.decode_threshold,
-                device=state_device,
-                shard_count=resident_shards,
-            )
-            self._sorted_resident_workspace = (
-                allocate_sorted_resident_workspace(
-                    max_requests,
-                    self.decode_threshold,
-                    device=state_device,
-                    shard_count=resident_shards,
-                )
-            )
+        self.shared_resident_plan: SharedResidentPlan | None = None
+        layer_index = (
+            parse_layer_idx(self.layer_name)
+            if envs.VLLM_ASCEND_SFA_SHARED_RESIDENT_PLAN and self.index_cache_enabled and self.layer_name
+            else None
+        )
+        self.shared_resident_candidate = bool(
+            envs.VLLM_ASCEND_SFA_SHARED_RESIDENT_PLAN
+            and self.index_cache_enabled
+            and layer_index is not None
+            and layer_index < int((hf_text_config or hf_config).num_hidden_layers)
+        )
+        if not self.shared_resident_candidate:
+            self.initialize_sorted_resident_cache()
         self.enable_staged_sfa_graph = staged_sfa_graph_configured(self.vllm_config)
         self._staged_sfa_graph_capture_sizes = (
             staged_sfa_graph_capture_sizes(self.vllm_config) if self.enable_staged_sfa_graph else ()
@@ -2445,7 +2423,10 @@ class AscendSFAImpl(MLAAttentionImpl):
                 "IndexCache requires topk_indices_buffer when skip_topk is "
                 f"enabled. layer_name={self.layer_name}."
             )
-        if self._indexcache_topk_staging is not None:
+        group = getattr(self, "shared_resident_plan", None)
+        if group is not None and group.active:
+            topk_indices = self.topk_indices_buffer[:num_tokens]
+        elif self._indexcache_topk_staging is not None:
             topk_indices = self._indexcache_topk_staging[:num_tokens]
             topk_indices.copy_(self.topk_indices_buffer[:num_tokens])
         else:
@@ -3242,6 +3223,49 @@ class AscendSFAImpl(MLAAttentionImpl):
                 kv_caches,
             )
 
+    def initialize_sorted_resident_cache(self) -> None:
+        """Allocate once, after topology resolution for shared target layers."""
+        if self._sorted_resident_state is not None:
+            return
+        if self.dsa_resident_cache:
+            resident_shards_per_row, resident_shards = (
+                _configured_resident_shards(self.decode_threshold)
+            )
+            self.dsa_resident_shards_per_row = resident_shards_per_row
+            scratch_capacity = self.decode_threshold * self.index_topk
+            if not (
+                0 < scratch_capacity < MAX_INT16_SCRATCH_CAPACITY
+            ):
+                raise ValueError(
+                    "resident sparse cache requires signed-int16 scratch "
+                    "slots and 0 < MTP * index_topk < "
+                    f"{MAX_INT16_SCRATCH_CAPACITY}; got {scratch_capacity}"
+                )
+            if self.index_topk != INDEX_TOPK:
+                raise ValueError(
+                    "sorted resident cache currently requires index_topk="
+                    f"{INDEX_TOPK}; got {self.index_topk}"
+                )
+            max_requests = int(
+                self.vllm_config.scheduler_config.max_num_seqs
+            )
+            state_device = self.q_b_proj.weight.device
+            self._sorted_resident_state = allocate_sorted_resident_state(
+                max_requests,
+                max_requests,
+                self.decode_threshold,
+                device=state_device,
+                shard_count=resident_shards,
+            )
+            self._sorted_resident_workspace = (
+                allocate_sorted_resident_workspace(
+                    max_requests,
+                    self.decode_threshold,
+                    device=state_device,
+                    shard_count=resident_shards,
+                )
+            )
+
     def _prepare_sorted_resident_sparse_cache(
         self,
         topk_indices: torch.Tensor,
@@ -3252,6 +3276,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         request_state_generations: torch.Tensor | None,
         *,
         mtp: int,
+        resident_writes: list[torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         if (
             request_state_indices is None
@@ -3270,6 +3295,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                 f"rows={topk_indices.shape[0]}, requests={request_count}, "
                 f"MTP={mtp}"
             )
+        state = self._sorted_resident_state
         workspace = self._sorted_resident_workspace_views.get(request_count)
         if workspace is None:
             workspace = sorted_resident_workspace_prefix(
@@ -3277,13 +3303,17 @@ class AscendSFAImpl(MLAAttentionImpl):
                 request_count,
             )
             self._sorted_resident_workspace_views[request_count] = workspace
+        if resident_writes is not None:
+            # The custom-op arguments are authoritative, including under
+            # functionalization; never mutate a hidden replacement buffer.
+            state, workspace = self.shared_resident_plan.planner_storage(resident_writes, request_count)
         prepare_resident_sharded_union_(
             topk_indices,
             split_boundary,
             row_req_indices,
             request_state_indices,
             request_state_generations,
-            self._sorted_resident_state,
+            state,
             workspace,
             mtp=mtp,
         )
@@ -3293,7 +3323,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                 request_block_table,
                 request_state_indices,
                 request_state_generations,
-                self._sorted_resident_state,
+                state,
                 workspace,
                 block_size=self.block_size,
             )
@@ -3324,6 +3354,8 @@ class AscendSFAImpl(MLAAttentionImpl):
         staged_mtp: int | None,
         need_packed: bool,
         clear_invalid_rows: bool,
+        resident_reads: list[torch.Tensor] | None = None,
+        resident_writes: list[torch.Tensor] | None = None,
     ) -> tuple[
         torch.Tensor,
         torch.Tensor | None,
@@ -3331,10 +3363,24 @@ class AscendSFAImpl(MLAAttentionImpl):
         torch.Tensor | None,
     ]:
         """Select the startup-static resident or ordinary decode planner."""
+        group = getattr(self, "shared_resident_plan", None)
+        if group is not None and group.active:
+            if not (need_packed and staged_mtp == self.decode_threshold):
+                raise RuntimeError("shared resident route disagrees with the runner")
+            plan = group.plans[int(request_block_table.shape[0])]
+            if self.skip_topk:
+                if resident_reads is None:
+                    return plan
+                rows, requests = int(topk_indices.shape[0]), int(request_block_table.shape[0])
+                return (resident_reads[0][:rows], *(t[:requests] for t in resident_reads[1:4]))
+            remapped = plan[0] if resident_writes is None else resident_writes[0][:topk_indices.shape[0]]
+            remapped.copy_(topk_indices.reshape_as(remapped))
+            topk_indices = remapped
         if (
             self.dsa_resident_cache
             and need_packed
             and staged_mtp == self.decode_threshold
+            and (group is None or group.active)
         ):
             if envs.VLLM_ASCEND_MTP_DRAFT_DEBUG:
                 if local_to_union_workspace is None:
@@ -3352,6 +3398,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                 request_state_indices,
                 request_state_generations,
                 mtp=staged_mtp,
+                resident_writes=resident_writes,
             )
         return prepare_sparse_indices(
             topk_indices,
@@ -3396,6 +3443,8 @@ class AscendSFAImpl(MLAAttentionImpl):
         shard_counts_workspace: torch.Tensor,
         request_state_indices: torch.Tensor | None,
         request_state_generations: torch.Tensor | None,
+        resident_reads: list[torch.Tensor] | None = None,
+        resident_writes: list[torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, ...]:
         """Pre-retrieval compute captured by the outer PIECEWISE graph.
 
@@ -3403,8 +3452,9 @@ class AscendSFAImpl(MLAAttentionImpl):
         publish the raw top-k into the shared buffer (GLM-5.2), then prepare
         the sparse indices for the LMCache selective retrieve.
         Consumer graph A: no indexer compute/scatter; read the current batch's
-        top-k from the shared buffer written by the preceding producer graph,
-        then run the same sparse-index preparation.
+        top-k from the shared buffer written by the preceding producer graph.
+        Qualified resident consumers reuse the producer's plan; other consumers
+        retain the ordinary sparse-index preparation.
         """
         assert self.fused_qkv_a_proj is not None
         assert self.q_lora_rank is not None
@@ -3460,6 +3510,15 @@ class AscendSFAImpl(MLAAttentionImpl):
                 indexer_slot_mapping.view(-1, 1),
                 k_li_for_scatter.view(-1, k_li.shape[-1]),
             )
+        graph_key = getattr(get_forward_context(), "staged_sfa_graph_key", None)
+        bounded_decode = graph_key is not None and graph_key.query_profile == StagedSFAQueryProfile.DECODE_BOUNDED
+        group = getattr(self, "shared_resident_plan", None)
+        if bounded_decode and group is not None and group.active and self.skip_topk:
+            # Query/current KV are layer-local. Selection, packing, planning
+            # and row restoration were already done by this group's producer.
+            return (ql_nope, q_pe, *group.attention_plan(
+                graph_key.request_capacity, int(hidden_states.shape[0]), resident_reads
+            ))
         if self.skip_topk:
             # Reuse the current batch's top-k from the shared buffer
             # (GLM-5.2 shared consumers and runtime IndexCache skip layers).
@@ -3486,8 +3545,6 @@ class AscendSFAImpl(MLAAttentionImpl):
                 # skip-layer graph As in the same step read fresh indices from
                 # the stable shared buffer.
                 self._update_indexcache_topk_indices(topk_indices)
-        graph_key = getattr(get_forward_context(), "staged_sfa_graph_key", None)
-        bounded_decode = graph_key is not None and graph_key.query_profile == StagedSFAQueryProfile.DECODE_BOUNDED
         if bounded_decode:
             original_requests = row_req_indices
             request_block_table = request_block_table[: graph_key.request_capacity]
@@ -3524,12 +3581,22 @@ class AscendSFAImpl(MLAAttentionImpl):
             staged_mtp=staged_mtp,
             need_packed=True,
             clear_invalid_rows=True,
+            resident_reads=resident_reads,
+            resident_writes=resident_writes,
         )
         assert selected_packed is not None
         assert selected_count_values is not None
         assert target_slot_mapping is not None
         if bounded_decode:
             topk_indices = unpack_decode_lanes(topk_indices, inverse, original_requests)
+            if group is not None and group.active:
+                # Use the explicit writable argument under functionalization.
+                storage = group.attention_topk if resident_writes is None else resident_writes[-1]
+                if storage is None:
+                    raise RuntimeError("bounded shared resident attention storage was not allocated")
+                restored = storage[:topk_indices.shape[0]]
+                restored.copy_(topk_indices)
+                topk_indices = restored
         return (
             ql_nope,
             q_pe,
@@ -3892,6 +3959,9 @@ class AscendSFAImpl(MLAAttentionImpl):
         attn_metadata: M | None,
         need_gather_q_kv: bool,
         output: torch.Tensor,
+        *,
+        resident_reads: list[torch.Tensor] | None = None,
+        resident_writes: list[torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, ...]:
         """Run graph A, or the complete native path outside staged replay."""
         context = get_forward_context()
@@ -3903,6 +3973,8 @@ class AscendSFAImpl(MLAAttentionImpl):
                 attn_metadata,
                 need_gather_q_kv,
                 output,
+                resident_reads=resident_reads,
+                resident_writes=resident_writes,
             )
             return self._cross_layer_empty_outputs(hidden_states)
         kv_cache, index_layer_name, index_enabled = self._cross_layer_kv_cache(layer_name, kv_cache)
@@ -3915,6 +3987,8 @@ class AscendSFAImpl(MLAAttentionImpl):
                 attn_metadata,
                 need_gather_q_kv,
                 output,
+                resident_reads=resident_reads,
+                resident_writes=resident_writes,
             )
             return self._cross_layer_empty_outputs(hidden_states)
         route = getattr(context, "staged_sfa_route", None)
@@ -3954,14 +4028,10 @@ class AscendSFAImpl(MLAAttentionImpl):
                     "staged SFA producer event was not created by eager "
                     "warmup"
                 )
-            producer_event = torch.npu.ExternalEvent()
+            producer_event = torch.npu.Event()
+            # Materialize the handle in eager warmup, never inside capture.
+            producer_event.record()
             state.producer_event = producer_event
-        else:
-            # ExternalEvent is the graph-visible fence consumed by LMCache
-            # between Graph A and Graph B.  Reset before each captured/replayed
-            # producer interval, then record only after every bridge output is
-            # stable.
-            producer_event.reset()
         initialized_capacity = state.initialized_cache_capacity
         if is_dummy and graph_key.request_capacity > initialized_capacity:
             for cache in kv_cache:
@@ -4050,14 +4120,13 @@ class AscendSFAImpl(MLAAttentionImpl):
             shard_counts_workspace,
             attn_metadata.resident_state_indices,
             attn_metadata.resident_state_generations,
+            resident_reads=resident_reads,
+            resident_writes=resident_writes,
         )
         outputs = self._copy_to_staged_sfa_bridge(
             hidden_states,
             outputs,
         )
-        attn_metadata.reshape_cache_event = producer_event
-        if not getattr(context, "sfa_full_graph_active", False):
-            producer_event.record()
         state.runtime = (
             layer_name,
             kv_cache,
@@ -4475,8 +4544,13 @@ class AscendSFAImpl(MLAAttentionImpl):
             state = self._staged_sfa_capture_state
             index_enabled = bool(state.runtime and state.runtime[3])
             producer_event = state.producer_event
-            if producer_event is not None:
-                attn_metadata.reshape_cache_event = producer_event
+            if producer_event is None:
+                raise RuntimeError("staged SFA producer event was not initialized by eager warmup")
+            # Graph A replays on the current stream. Record outside capture on
+            # every handoff; an ExternalEvent recorded inside Graph A cannot
+            # refresh host wait bookkeeping on replay or serve multiple waiters.
+            producer_event.record(torch.npu.current_stream())
+            attn_metadata.reshape_cache_event = producer_event
             request_ids = attn_metadata.decode_request_ids_compact
             if request_ids is None:
                 raise RuntimeError("staged SFA request ids are unavailable")
@@ -4853,6 +4927,9 @@ class AscendSFAImpl(MLAAttentionImpl):
         attn_metadata: M,
         need_gather_q_kv: bool = False,
         output: torch.Tensor | None = None,
+        *,
+        resident_reads: list[torch.Tensor] | None = None,
+        resident_writes: list[torch.Tensor] | None = None,
     ) -> torch.Tensor:
         assert output is not None, "Output tensor must be provided."
         if attn_metadata is None:
@@ -5413,6 +5490,8 @@ class AscendSFAImpl(MLAAttentionImpl):
                     staged_mtp=_staged_mtp,
                     need_packed=_need_packed,
                     clear_invalid_rows=_is_pure_decode,
+                    resident_reads=resident_reads,
+                    resident_writes=resident_writes,
                 )
             _sparse_indices_padding_zeroed = _is_pure_decode
             _diag_context = get_forward_context() if _mtp_dw_diag_enabled() and _diag_remap_build else None

@@ -296,6 +296,7 @@ def test_real_ascend_update_and_device_interleave_remain_in_the_mro(staging, mon
     actual._draft_token_ids = torch.tensor([[101], [202], [303]], dtype=torch.int64)
     actual._sfa_full_graph = SimpleNamespace(release_requests=lambda ids: events.append("ascend_graph_release"))
     actual._resident_state_registry = SimpleNamespace(release=lambda ids: events.append("ascend_resident_release"))
+    actual._shared_resident_groups = []
     actual._async_live_execute = True
     with actual.synchronize_input_prep():
         actual._update_states(s)

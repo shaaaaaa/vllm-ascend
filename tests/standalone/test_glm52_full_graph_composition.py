@@ -22,7 +22,17 @@ def test_producer_publishes_raw_topk_before_pack_and_consumer_has_no_indexer(bou
                  and ast.unparse(n.test) == "self.has_indexer" and "npu_scatter_nd_update_" in ast.unparse(n))
     stop = next(i for i, n in enumerate(method.body) if isinstance(n, ast.Assign)
                 and any(isinstance(t, ast.Name) and t.id == "staged_mtp" for t in n.targets))
-    code = compile(ast.Module(body=method.body[start:stop], type_ignores=[]), str(path), "exec")
+    class LegacyOnly(ast.NodeTransformer):
+        def visit_Return(self, node):
+            # This test exercises the unchanged legacy branch. Shared-plan
+            # early returns are covered by the complete pre-compute tests.
+            return ast.copy_location(ast.Raise(
+                exc=ast.Call(func=ast.Name(id="AssertionError", ctx=ast.Load()),
+                             args=[ast.Constant("unexpected shared-plan route")], keywords=[]), cause=None,
+            ), node)
+
+    module = LegacyOnly().visit(ast.Module(body=method.body[start:stop], type_ignores=[]))
+    code = compile(ast.fix_missing_locations(module), str(path), "exec")
     names = {"_get_indexcache_topk_indices", "_update_indexcache_topk_indices"}
     nodes = [n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name in names]
     api = {"torch": torch}

@@ -31,6 +31,28 @@ def test_shared_consumer_probe_reads_the_actual_topk_source(worker, skip_topk):
     assert len(recorded) == 1 and torch.equal(recorded[0], raw.reshape(2, 4))
 
 
+def test_bounded_shared_consumer_probes_survive_planner_bypass(worker):
+    from unittest.mock import Mock
+
+    raw = torch.arange(8).reshape(2, 4)
+    outputs = (torch.zeros(2, 4), torch.zeros(2, 4), raw[:, None] + 100,
+               torch.tensor([[7, 9]]), torch.tensor([1]), torch.tensor([[3, 5]]))
+    impl = SimpleNamespace(
+        skip_topk=True, shared_resident_plan=SimpleNamespace(bounded=True, active=True),
+        topk_indices_buffer=raw,
+        _get_indexcache_topk_indices=Mock(side_effect=AssertionError("raw staging was bypassed")),
+        _prepare_decode_sparse_indices=Mock(side_effect=AssertionError("planner was bypassed")),
+        _execute_sparse_flash_attention_process=Mock(),
+        _cross_layer_pre_compute=lambda hidden_states, remap_boundary: outputs,
+    )
+    subject = SimpleNamespace(probes={name: Mock() for name in
+        ("topk", "boundary", "miss_count", "miss_tokens", "target_slots")})
+    worker.LayerSnapshots.install_sfa_probes(subject, impl)
+    assert impl._cross_layer_pre_compute(torch.zeros(2, 4), torch.tensor([4096, 0])) is outputs
+    assert torch.equal(subject.probes["topk"].write.call_args.args[0], raw)
+    assert subject.probes["miss_tokens"].write_padded.call_args.args[0].tolist() == [[7, -1]]
+
+
 @pytest.fixture
 def parity(monkeypatch):
     path = Path(__file__).resolve().parents[3] / "vllm_ascend/attention/sfa_parity.py"

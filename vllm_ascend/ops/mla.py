@@ -196,6 +196,11 @@ class AscendMultiHeadLatentAttention(MultiHeadLatentAttentionWrapper):
                     self.prefix,
                     "input",
                 )
+            group = impl.shared_resident_plan
+            pre_op = torch.ops.vllm.sfa_forward_pre_shared if group is not None else torch.ops.vllm.sfa_forward_pre
+            resident_args = (
+                (group.reads if impl.skip_topk else [], group.writes if not impl.skip_topk else []) if group else ()
+            )
             (
                 ql_nope,
                 q_pe,
@@ -203,7 +208,7 @@ class AscendMultiHeadLatentAttention(MultiHeadLatentAttentionWrapper):
                 selected_packed,
                 selected_counts,
                 target_slots,
-            ) = torch.ops.vllm.sfa_forward_pre(
+            ) = pre_op(
                 hidden_states,
                 need_gather_q_kv,
                 output,
@@ -218,6 +223,7 @@ class AscendMultiHeadLatentAttention(MultiHeadLatentAttentionWrapper):
                     // impl.decode_threshold
                 ),
                 impl.decode_threshold * impl.index_topk,
+                *resident_args,
             )
             torch.ops.vllm.sfa_lmcache_retrieve(
                 selected_packed,
@@ -376,6 +382,64 @@ def sfa_forward_pre_fake(
     )
 
 
+def sfa_forward_pre_shared(
+    hidden_states: torch.Tensor,
+    need_gather_q_kv: bool,
+    output: torch.Tensor,
+    layer_name: str,
+    local_num_heads: int,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    index_topk: int,
+    token_capacity: int,
+    request_capacity: int,
+    scratch_capacity: int,
+    resident_reads: list[torch.Tensor],
+    resident_writes: list[torch.Tensor],
+) -> StagedSFABridge:
+    impl, attn_layer_name, kv_cache, attn_metadata = _mla_runtime_state(layer_name)
+    return impl.cross_layer_graph_pre(
+        attn_layer_name,
+        hidden_states,
+        kv_cache,
+        attn_metadata,
+        need_gather_q_kv,
+        output,
+        resident_reads=resident_reads or None,
+        resident_writes=resident_writes or None,
+    )
+
+
+def sfa_forward_pre_shared_fake(
+    hidden_states: torch.Tensor,
+    need_gather_q_kv: bool,
+    output: torch.Tensor,
+    layer_name: str,
+    local_num_heads: int,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    index_topk: int,
+    token_capacity: int,
+    request_capacity: int,
+    scratch_capacity: int,
+    resident_reads: list[torch.Tensor],
+    resident_writes: list[torch.Tensor],
+) -> StagedSFABridge:
+    return sfa_forward_pre_fake(
+        hidden_states,
+        need_gather_q_kv,
+        output,
+        layer_name,
+        local_num_heads,
+        kv_lora_rank,
+        qk_rope_head_dim,
+        index_topk,
+        token_capacity,
+        request_capacity,
+        scratch_capacity,
+    )
+
+
 def sfa_lmcache_retrieve(
     selected_packed: torch.Tensor,
     selected_counts: torch.Tensor,
@@ -470,6 +534,13 @@ direct_register_custom_op(
     op_func=sfa_forward_pre,
     mutates_args=["output"],
     fake_impl=sfa_forward_pre_fake,
+    dispatch_key="PrivateUse1",
+)
+direct_register_custom_op(
+    op_name="sfa_forward_pre_shared",
+    op_func=sfa_forward_pre_shared,
+    mutates_args=["output", "resident_writes"],
+    fake_impl=sfa_forward_pre_shared_fake,
     dispatch_key="PrivateUse1",
 )
 direct_register_custom_op(

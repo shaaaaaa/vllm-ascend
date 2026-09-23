@@ -7,9 +7,25 @@ from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace as NS
 
+import numpy as np
 import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
+
+
+@pytest.mark.parametrize(
+    "boundaries,valid", [([0] * 8, True), ([4096] * 2, True), ([4096] * 3, False), ([2048], False)]
+)
+def test_native_scratch_bounds_count_only_external_rows(boundaries, valid):
+    path = ROOT / "vllm_ascend/attention/sfa_v1.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    method = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "_validate_dsa_scratch_capacity")
+    module = ast.parse("from __future__ import annotations")
+    module.body.append(method)
+    ns = {"np": np}
+    exec(compile(module, str(path), "exec"), ns)
+    with nullcontext() if valid else pytest.raises(RuntimeError, match="scratch"):
+        ns[method.name](boundaries, [0] * len(boundaries), None, 2048, 4096)
 
 
 class Queue(list):

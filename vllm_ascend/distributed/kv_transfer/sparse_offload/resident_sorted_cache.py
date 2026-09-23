@@ -9,7 +9,7 @@ All persistent state and launch workspaces are allocated by Python before
 graph capture. The hot path only invokes custom NPU operators.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 
@@ -83,6 +83,67 @@ class SortedResidentWorkspace:
     miss_tokens: torch.Tensor
     miss_counts: torch.Tensor
     target_slots: torch.Tensor
+
+
+@dataclass
+class SharedResidentPlan:
+    """Runner-owned common-slot plan; only the first member advances state."""
+
+    members: tuple[str, ...]
+    state: SortedResidentState
+    workspace: SortedResidentWorkspace
+    topk: torch.Tensor
+    mtp: int
+    block_size: int
+    active: bool = False
+    bounded: bool = False
+    attention_topk: torch.Tensor | None = field(init=False, default=None)
+    workspace_views: dict[int, SortedResidentWorkspace] = field(init=False)
+    plans: dict[int, tuple[torch.Tensor, ...]] = field(init=False)
+    reads: list[torch.Tensor] = field(init=False)
+    writes: list[torch.Tensor] = field(init=False)
+
+    def __post_init__(self) -> None:
+        self.workspace_views = {
+            n: sorted_resident_workspace_prefix(self.workspace, n)
+            for n in range(1, self.workspace.miss_tokens.shape[0] + 1)
+        }
+        self.plans = {
+            n: (self.topk[: n * self.mtp], w.miss_tokens, w.miss_counts[:, 0], w.target_slots)
+            for n, w in self.workspace_views.items()
+        }
+        self.reads = list(self.plans[len(self.plans)])
+        self.writes = [self.topk] + [
+            value
+            for owner in (self.state, self.workspace)
+            for value in vars(owner).values()
+            if isinstance(value, torch.Tensor)
+        ]
+        if self.bounded:
+            # Packed planner rows and native attention rows have different
+            # ordering for mixed Q1/Q2. Only full-graph groups need this buffer.
+            self.attention_topk = torch.empty_like(self.topk)
+            self.reads.append(self.attention_topk)
+            self.writes.append(self.attention_topk)
+
+    def attention_plan(
+        self, requests: int, tokens: int, reads: list[torch.Tensor] | None = None
+    ) -> tuple[torch.Tensor, ...]:
+        """Read the producer-restored bounded plan, preserving padded counts."""
+        if self.attention_topk is None or not 0 < tokens <= self.attention_topk.shape[0]:
+            raise RuntimeError("bounded shared resident attention storage is unavailable")
+        values = self.reads if reads is None else reads
+        return (values[-1][:tokens], *(t[:requests] for t in values[1:4]))
+
+    def planner_storage(
+        self, writes: list[torch.Tensor], requests: int
+    ) -> tuple[SortedResidentState, SortedResidentWorkspace]:
+        """Bind the operator's explicit tensors, including functionalized inputs."""
+        _, tokens, slots, counts, generations, *scratch = writes[:-1] if self.bounded else writes
+        return (
+            SortedResidentState(tokens, slots, counts, generations, self.state.dummy_state_base),
+            sorted_resident_workspace_prefix(SortedResidentWorkspace(*scratch), requests),
+        )
 
 
 def allocate_sorted_resident_state(

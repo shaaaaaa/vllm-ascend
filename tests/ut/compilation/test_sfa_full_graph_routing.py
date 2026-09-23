@@ -1000,13 +1000,16 @@ def test_ragged_dispatch_reserves_request_capacity_not_just_token_sum(routing):
     assert reserved == [32]
 
 
-@pytest.mark.parametrize("failure", [None, "source", "binding", "signature", "peer"])
+@pytest.mark.parametrize("failure", [None, "source", "binding", "signature", "peer", "shared"])
 @pytest.mark.parametrize("ep_agreement", [False, True])
-def test_preparation_and_signatures_are_agreed_before_collective_replay(routing, failure, ep_agreement):
+@pytest.mark.parametrize("shared", [False, True])
+def test_preparation_and_signatures_are_agreed_before_collective_replay(routing, failure, ep_agreement, shared):
     runner, ns, _, modes, _ = routing
     if ep_agreement:
         runner._sfa_preparation_groups = (("sfa_full_graph::prepare_agreement_ep", "ep"),)
     runner.model = Mock()
+    runner._shared_resident_groups = [SimpleNamespace(members=("layer0",), writes=[])] if shared else []
+    runner._prepare_shared_resident_plans = Mock()
     runner.model_config.max_model_len = 140000
     runner.input_batch = SimpleNamespace(req_ids=["r1"], num_reqs=1)
     layer = SimpleNamespace(
@@ -1046,17 +1049,19 @@ def test_preparation_and_signatures_are_agreed_before_collective_replay(routing,
     elif failure == "signature":
         runner._sfa_full_graph.prepare_run.side_effect = ValueError("changed address")
 
+    if failure == "shared" and shared:
+        runner._prepare_shared_resident_plans.side_effect = ValueError("incompatible group")
     groups = []
 
     def agree(failed, *, op, group):
         groups.append(group)
         runner._sfa_full_graph.run.assert_not_called()
-        assert bool(failed.item()) == (failure in ("source", "binding", "signature"))
+        assert bool(failed.item()) == (failure in ("source", "binding", "signature") or (failure == "shared" and shared))
         if failure == "peer" and group in ("dp", "ep"):
             failed.fill_(1)
 
     ns["dist"] = SimpleNamespace(all_reduce=agree, ReduceOp=SimpleNamespace(MAX="max"))
-    if failure:
+    if failure and (failure != "shared" or shared):
         with pytest.raises(RuntimeError, match="preparation failed"):
             runner._model_forward(8)
         runner._sfa_full_graph.run.assert_not_called()
@@ -1071,6 +1076,8 @@ def test_preparation_and_signatures_are_agreed_before_collective_replay(routing,
         }
         assert runner._sfa_full_graph.bind_sources.call_args.args[:2] == ((None,), ("r1",))
     assert groups == (["ep"] if ep_agreement else ["tp", "dp"])
+    if shared and failure != "source":
+        runner._prepare_shared_resident_plans.assert_called_once_with(8)
 
 
 @pytest.mark.parametrize("failure", [None, "source", "binding", "signature"])

@@ -75,7 +75,12 @@ def test_uniform_planner_bypasses_pack_and_matches_bounded(requests, padded, wid
         for i, n in enumerate(method.body)
         if isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "graph_key" for t in n.targets)
     )
-    code = compile(ast.Module(body=method.body[start:-1], type_ignores=[]), str(path), "exec")
+    # Graph-profile selection now precedes the shared consumer's early return.
+    # Exercise the original planner section independently of indexer/query work.
+    pack_start = next(i for i, n in enumerate(method.body)
+                      if isinstance(n, ast.If) and ast.unparse(n.test) == "bounded_decode")
+    code = compile(ast.Module(body=method.body[start:start + 3] + method.body[pack_start:-1], type_ignores=[]),
+                   str(path), "exec")
     capacity = requests + int(padded)
     tokens = capacity * width
     owners = torch.arange(capacity, dtype=torch.int32).repeat_interleave(width)
@@ -107,6 +112,8 @@ def test_uniform_planner_bypasses_pack_and_matches_bounded(requests, padded, wid
             unpack_decode_lanes=unpack,
             self=SimpleNamespace(_prepare_decode_sparse_indices=plan),
             topk_indices=topk,
+            resident_reads=None,
+            resident_writes=None,
             remap_boundary=boundary,
             row_req_indices=owners,
             request_block_table=table,

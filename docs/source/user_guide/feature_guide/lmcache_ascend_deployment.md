@@ -93,5 +93,50 @@ python \
 ktc = KVTransferConfig(
         kv_connector="LMCacheAscendConnector",
         kv_role="kv_both"
-    )
+)
 ```
+
+### Experimental shared-indexer resident planning
+
+For structural `indexer_types` groups, set
+`VLLM_ASCEND_SFA_SHARED_RESIDENT_PLAN=1` on the decoder before startup to run
+the existing resident planner once per producer/consumer group. The default
+is `0`; changing it requires a worker restart. Each layer still retrieves its
+own KV and retains its private staged bridge copies.
+
+This requires the existing two-group compact-scratch configuration
+(`VLLM_ASCEND_DSA_TWO_GROUPS=1`, `VLLM_ASCEND_DSA_UNBUNDLE=1`,
+`VLLM_ASCEND_DSA_SHRINK_LATENT=2`, resident caching enabled), top-k 2048,
+at most one speculative token, and a common latent metadata/slot layout.
+It supports fixed-width native decode, staged PIECEWISE decode, and the custom
+full-target graph's bounded Q1/Q2 layout. In bounded graphs the producer packs,
+plans and restores attention-row order once; consumers reuse that plan.
+The existing staged-SFA configuration restrictions still apply, with eager
+graph mode `NONE` also accepted. Draft layers and runtime-only IndexCache patterns are excluded.
+Incompatible structural group layouts fail startup. Mixed/prefill fallback
+uses the existing ordinary planner and invalidates shared residency.
+
+Startup logs identify each `[SFA_SHARED_PLAN]` producer and its members.
+Preemption invalidates shared residency even if a resumed request receives
+the same physical block IDs. The Ascend fusion compiler keeps the group's
+resident buffers in place instead of cloning them during functionalization.
+After a partial forward failure, restart the worker: metadata may describe
+KV fills that did not complete. Group state lives with the runner; graph
+profiling/capture uses the existing private dummy state rows, and capacity
+views never create separate real-request residency.
+
+The host regression suite is
+`tests/ut/distributed/kv_transfer/test_shared_resident_plan.py`. NPU planner
+parity, repeated graph replay, and distinct layer-specific K/PE reachability
+are covered by
+`tests/e2e/nightly/single_node/ops/singlecard_ops/test_shared_resident_plan.py`.
+Before serving rollout, additionally compare deployed SFA/model outputs and
+matched latency runs with the flag disabled/enabled. Device traces must show
+one union/finalize/update sequence per eligible group, while per-layer KV
+transfers remain. Measure bridge copies separately. Planner kernels are unchanged.
+
+For an A/B comparison on this integration branch, retain
+`VLLM_ASCEND_SFA_STAGED_GRAPH=1`, `VLLM_ASCEND_SFA_FULL_GRAPH=1`, PIECEWISE
+compilation, and the same `VLLM_ASCEND_SFA_ASYNC_MTP_PREP` setting in both runs.
+Change only `VLLM_ASCEND_SFA_SHARED_RESIDENT_PLAN` between `0` and `1`, then
+restart every D worker. The shared-plan flag does not itself enable full graphs.

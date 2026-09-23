@@ -174,8 +174,7 @@ class LayerSnapshots:
                 self.probes["topk"].write(result.reshape(result.shape[0], -1))
             return result
 
-        def planner_with_probe(topk, boundary, *args, **kwargs):
-            result = planner(topk, boundary, *args, **kwargs)
+        def record_plan(topk, boundary, result):
             if topk.shape[0] <= QUERY_WIDTH:
                 self.probes["boundary"].write(boundary.reshape(-1).to(torch.long))
                 _, tokens, counts, slots = result
@@ -185,6 +184,10 @@ class LayerSnapshots:
                     self.probes["miss_count"].write(counts)
                     self.probes["miss_tokens"].write_padded(torch.where(valid, tokens[:1], -1))
                     self.probes["target_slots"].write_padded(torch.where(valid, slots[:1], -1))
+
+        def planner_with_probe(topk, boundary, *args, **kwargs):
+            result = planner(topk, boundary, *args, **kwargs)
+            record_plan(topk, boundary, result)
             return result
 
         def attention_with_probe(q, q_pe, kv, topk, metadata, query_ends, seq_lens, **kwargs):
@@ -212,6 +215,24 @@ class LayerSnapshots:
         setattr(impl, topk_method, indexer_with_probe)
         impl._prepare_decode_sparse_indices = planner_with_probe
         impl._execute_sparse_flash_attention_process = attention_with_probe
+        group = getattr(impl, "shared_resident_plan", None)
+        if group is not None and group.bounded and impl.skip_topk:
+            # Bounded consumers deliberately bypass both selection/planner
+            # hooks. Observe their completed plan only in this test worker.
+            pre = impl._cross_layer_pre_compute
+            signature = inspect.signature(pre)
+
+            def pre_with_probe(*args, **kwargs):
+                result = pre(*args, **kwargs)
+                rows = result[2].shape[0]
+                if group.active and rows <= QUERY_WIDTH:
+                    raw = impl.topk_indices_buffer[:rows]
+                    self.probes["topk"].write(raw.reshape(rows, -1))
+                    boundary = signature.bind(*args, **kwargs).arguments["remap_boundary"]
+                    record_plan(raw, boundary, result[2:])
+                return result
+
+            impl._cross_layer_pre_compute = pre_with_probe
 
     def reset(self) -> None:
         for probe in self.probes.values():
