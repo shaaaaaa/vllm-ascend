@@ -13,3 +13,4 @@ static_assert(sizeof(RedesignLaunch) == 136, "host/device launch ABI changed");
 void redesign_build(void* stream, const RedesignLaunch& a);
 void redesign_lookup(void* stream, const RedesignLaunch& a);
 void redesign_resolve_copy(void* stream, const RedesignLaunch& a);
+void redesign_batched_copy(void* stream, const RedesignLaunch& a);

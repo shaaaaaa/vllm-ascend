@@ -11,7 +11,7 @@
 #include "launch.h"
 namespace {
 static_assert(sizeof(uintptr_t) <= sizeof(uint64_t), "device address would be truncated");
-void run(at::TensorList t, int64_t universe, int64_t mode, int64_t radius, bool fused) {
+void run_impl(at::TensorList t, int64_t universe, int64_t mode, int64_t radius, bool fused, bool batched) {
     TORCH_CHECK(t.size() == 12, "expected 12 redesign tensors");
     TORCH_CHECK(t[0].is_privateuseone() && t[0].dim() == 3, "requires NPU [B,Q,K] tokens");
     const auto device = t[0].device();
@@ -64,16 +64,27 @@ void run(at::TensorList t, int64_t universe, int64_t mode, int64_t radius, bool 
     auto stream = c10_npu::getCurrentNPUStream().stream();
     at_npu::native::OpCommand command;
     command.Name("resident_redesign");
-    command.SetCustomHandler([a, stream, fused, owners = std::vector<at::Tensor>(t.begin(), t.end())]() -> int {
+    command.SetCustomHandler([a, stream, fused, batched, owners = std::vector<at::Tensor>(t.begin(), t.end())]() -> int {
         if (a.mode >= 3) redesign_build(stream, a);
-        if (fused) redesign_resolve_copy(stream, a);
+        if (fused && batched) redesign_batched_copy(stream, a);
+        else if (fused) redesign_resolve_copy(stream, a);
         else redesign_lookup(stream, a);
         return 0;
     });
     command.Run();
 }
+void run(at::TensorList t, int64_t universe, int64_t mode, int64_t radius, bool fused) {
+    run_impl(t, universe, mode, radius, fused, false);
+}
+void run_batched(at::TensorList t, int64_t universe, int64_t mode, int64_t radius, bool fused) {
+    run_impl(t, universe, mode, radius, fused, true);
+}
 }
 TORCH_LIBRARY(resident_redesign, m) {
     m.def("run_(Tensor(a!)[] tensors, int universe, int mode, int radius, bool fused=False) -> ()");
+    m.def("run_batched_(Tensor(a!)[] tensors, int universe, int mode, int radius, bool fused=False) -> ()");
 }
-TORCH_LIBRARY_IMPL(resident_redesign, PrivateUse1, m) { m.impl("run_", &run); }
+TORCH_LIBRARY_IMPL(resident_redesign, PrivateUse1, m) {
+    m.impl("run_", &run);
+    m.impl("run_batched_", &run_batched);
+}

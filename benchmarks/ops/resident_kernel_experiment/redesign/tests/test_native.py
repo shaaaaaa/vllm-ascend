@@ -31,7 +31,8 @@ def library(request):
 @pytest.mark.parametrize('variant', tuple(MODES))
 @pytest.mark.parametrize('scenario', ('normal', 'cold', 'epoch', 'version', 'padding', 'duplicate', 'collisions'))
 @pytest.mark.parametrize('q', (1, 2))
-def test_native_plan_and_fused_payload(variant, scenario, q):
+@pytest.mark.parametrize('copy_mode', ('row', 'batched'))
+def test_native_plan_and_fused_payload(variant, scenario, q, copy_mode):
     query, snap, dense = case(seed=7, b=3, q=q, k=256, universe=1025, width=16)
     if scenario == 'cold':
         snap = replace(snap, ready=torch.zeros_like(snap.ready))
@@ -49,7 +50,7 @@ def test_native_plan_and_fused_payload(variant, scenario, q):
         query.tokens.remainder_(4).mul_(256)
     snap = replace(snap, kv=snap.kv.float())
     dense = dense.float()
-    native = NativeCase(query.to('npu'), snap.to('npu'), dense.to('npu'), variant, buckets=256)
+    native = NativeCase(query.to('npu'), snap.to('npu'), dense.to('npu'), variant, buckets=256, copy_mode=copy_mode)
     for fused in (False, True):
         native.run(fused)
         torch.npu.synchronize()
@@ -67,11 +68,12 @@ def test_native_plan_and_fused_payload(variant, scenario, q):
 
 
 @pytest.mark.parametrize('variant', tuple(MODES))
-def test_native_2048_graph_replays_change_epochs_and_values(variant):
+@pytest.mark.parametrize('copy_mode', ('row', 'batched'))
+def test_native_2048_graph_replays_change_epochs_and_values(variant, copy_mode):
     query, snap, dense = case(b=1, q=2, k=2048, universe=8193)
     snap = replace(snap, kv=snap.kv.float())
     dense = dense.float()
-    native = NativeCase(query.to('npu'), snap.to('npu'), dense.to('npu'), variant)
+    native = NativeCase(query.to('npu'), snap.to('npu'), dense.to('npu'), variant, copy_mode=copy_mode)
     native.run(True)
     torch.npu.synchronize()
     graph = torch.npu.NPUGraph()
@@ -131,7 +133,8 @@ def test_functional_candidates_on_npu(variant):
 
 @pytest.mark.parametrize('dtype', (torch.float16, torch.bfloat16, torch.uint8))
 @pytest.mark.parametrize('variant', ('fixed_position', 'hash_snapshot'))
-def test_fused_copy_preserves_payload_dtype_bits(dtype, variant):
+@pytest.mark.parametrize('copy_mode', ('row', 'batched'))
+def test_fused_copy_preserves_payload_dtype_bits(dtype, variant, copy_mode):
     query, snap, dense = case(b=1, q=2, k=256, universe=1025, width=32)
     if dtype == torch.uint8:
         dense = torch.randint(0, 256, dense.shape, dtype=dtype)
@@ -140,8 +143,30 @@ def test_fused_copy_preserves_payload_dtype_bits(dtype, variant):
     previous = dense.gather(1, snap.tokens.long()[..., None].expand(1, 512, 32)).clone()
     snap = replace(snap, kv=previous)
     query.tokens[..., :2] = -1
-    native = NativeCase(query.to('npu'), snap.to('npu'), dense.to('npu'), variant, buckets=256)
+    native = NativeCase(query.to('npu'), snap.to('npu'), dense.to('npu'), variant, buckets=256, copy_mode=copy_mode)
     native.run(True)
     torch.npu.synchronize()
     expected = gather_dense(query, dense)
     assert torch.equal(native.payload.cpu().view(torch.uint8), expected.contiguous().view(torch.uint8))
+
+
+@pytest.mark.parametrize('width', (16, 560, 576, 4096))
+def test_batched_copy_row_sizes_and_partial_groups(width):
+    query, snap, dense = case(b=1, q=2, k=256, universe=1025, width=width)
+    dense = dense.to(torch.bfloat16)
+    previous = dense.gather(1, snap.tokens.long()[..., None].expand(1, 512, width)).clone()
+    snap = replace(snap, kv=previous)
+    # Interleave invalid, hit/miss and live-tail sources within copy groups.
+    query.tokens[..., ::7] = -1
+    query.boundary.fill_(512)
+    expected = gather_dense(query, dense)
+    plans = []
+    for mode in ('row', 'batched'):
+        native = NativeCase(query.to('npu'), snap.to('npu'), dense.to('npu'),
+                            'bounded_position', copy_mode=mode)
+        native.run(True)
+        torch.npu.synchronize()
+        assert_safe(query, snap, native.plan)
+        assert torch.equal(native.payload.cpu().view(torch.uint8), expected.contiguous().view(torch.uint8))
+        plans.append(native.plan.source.cpu())
+    assert torch.equal(*plans)

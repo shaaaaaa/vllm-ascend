@@ -91,7 +91,8 @@ def profile(case, fused, iterations, warmup, path):
         torch.npu.synchronize()
     prof.export_chrome_trace(str(path.resolve()))
     symbols = (['resident_snapshot_build_redesign'] if case.mode >= 3 else [])
-    symbols += ['resident_resolve_copy_redesign' if fused else 'resident_lookup_redesign']
+    symbols += [('resident_batched_copy_redesign' if case.copy_mode == 'batched'
+                 else 'resident_resolve_copy_redesign') if fused else 'resident_lookup_redesign']
     result = parse_native_trace(json.loads(path.read_text(), parse_float=Decimal), symbols, iterations)
     result['trace'] = str(path.resolve())
     return result
@@ -139,6 +140,7 @@ def main():
     parser.add_argument('--scenario', choices=('stable','permuted','rank_shift','cold'), default='rank_shift')
     parser.add_argument('--kv-width', type=int, default=64, help='normalized fixture elements, not assumed model geometry')
     parser.add_argument('--dtype', choices=('float16','bfloat16','float32'), default='float32')
+    parser.add_argument('--copy-mode', choices=('row', 'batched'), default='row')
     parser.add_argument('--iterations', type=int, default=30)
     parser.add_argument('--warmup', type=int, default=10)
     parser.add_argument('--radius', type=int, default=2)
@@ -176,7 +178,7 @@ def main():
             timing = {'not_measured': 'CPU correctness run; no native or serving performance claim'}
         else:
             case = NativeCase(query.to(device), snap.to(device), dense.to(device), variant,
-                              radius=args.radius, buckets=args.buckets)
+                              radius=args.radius, buckets=args.buckets, copy_mode=args.copy_mode)
             # Both unfused and fused outputs are correctness-gated before timing.
             case.run(False)
             torch.npu.synchronize()
@@ -204,6 +206,8 @@ def main():
         source = plan.source.cpu()
         misses, hits = int((source == -1).sum()), int((source >= 0).sum())
         record = {'variant': variant, 'correctness': 'selected_kv_and_reference_attention_pass',
+                  'copy_mode': args.copy_mode, 'row_bytes': dense.element_size() * args.kv_width,
+                  'materialized_bytes': actual.numel() * actual.element_size(),
                   'occurrence_hits': hits, 'offload_occurrence_misses': misses,
                   'miss_payload_bytes': misses * dense.element_size() * args.kv_width,
                   'timing': timing}

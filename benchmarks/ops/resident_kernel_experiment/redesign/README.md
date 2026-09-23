@@ -195,3 +195,39 @@ Optimization objective: fewer launches, no exact union, no globally packed miss
 list, no in-place eviction dependency, and no false hits. Selecting the fastest
 candidate requires 910B3 measurements of the complete path. No winner or measured
 speedup is claimed by this patch.
+# Batched materialization experiment
+
+`--copy-mode row` preserves the original row-at-a-time implementation (default).
+`--copy-mode batched` uses the same lookup and source selection, gathers up to
+16 rows into a 16 KiB UB buffer, and writes each group contiguously. Groups shrink
+for larger rows; the final partial group is bounded. Invalid rows are zeroed;
+hits and misses still copy into a disjoint output bank. Completion fences protect
+the gather-to-output dependency and buffer reuse. This groups transfers and
+fences; it does not yet overlap separate double-buffered groups.
+
+Rebuild and run the native tests before benchmarking. Both implementations are
+in the same library and tested against the same oracle, including graph replay.
+Use a fresh build directory when adding the new translation unit:
+
+```bash
+RED=benchmarks/ops/resident_kernel_experiment/redesign
+RBUILD="$RED/build-910b3-batched"
+python "$RED/build.py" --soc ascend910b3 --build-dir "$RBUILD" &&
+python -m pytest --confcutdir="$RED/tests" -o addopts= "$RED/tests" --redesign-build-dir "$RBUILD" -xq
+for COPY in row batched; do
+  python "$RED/benchmark.py" --backend native --build-dir "$RBUILD" \
+    --variants reload bounded_position hash_snapshot --copy-mode "$COPY" \
+    --requests 8 --query-rows 2 --topk 2048 --universe 131072 \
+    --overlap 1024 --hit-rate 0.9 --scenario rank_shift \
+    --kv-width 576 --dtype bfloat16 --iterations 30 --warmup 10 \
+    --json "$RED/materialize-576-$COPY.json" || break
+done
+```
+
+576 BF16 elements model the latent row's byte width only: this remains a
+contiguous token-major HBM fixture, not production paged layout or CPU-cache DMA.
+The JSON reports row bytes and total materialized bytes separately from miss
+bytes. Repeat with `stable`, `permuted`, and `cold`, and request counts 1/8/16.
+Use width 64 and float32 to compare with the earlier reported fixture. Actual
+production top-k traces, registered CPU sources, and original metadata-plus-load
+chain timing remain necessary before claiming a serving speedup.

@@ -2,7 +2,7 @@
 #pragma once
 #include "common.h"
 namespace redesign {
-template<bool CopyKV> class Lookup {
+template<bool CopyKV, bool BatchedCopy = false> class Lookup {
     RedesignLaunch a;
     AscendC::TPipe pipe;
     AscendC::TBuf<AscendC::TPosition::VECCALC> stateBuf, tableBuf, workBuf, kvBuf;
@@ -50,7 +50,7 @@ public:
         pipe.InitBuffer(stateBuf, 3 * n * 4);
         pipe.InitBuffer(tableBuf, W * 4);
         pipe.InitBuffer(workBuf, 10 * T * 4 + 2 * (T / 8));
-        if constexpr (CopyKV) pipe.InitBuffer(kvBuf, a.rowBytes);
+        if constexpr (CopyKV) pipe.InitBuffer(kvBuf, BatchedCopy ? 16384 : a.rowBytes);
         oldTags = stateBuf.Get<int32_t>(); oldVersions = oldTags[n]; oldReady = oldVersions[n];
         localTable = tableBuf.Get<int32_t>(); token = workBuf.Get<int32_t>();
         version = token[T]; candidate = version[T]; offset = candidate[T]; tmp = offset[T];
@@ -140,7 +140,34 @@ public:
             AscendC::Cast(result, chosen, AscendC::RoundMode::CAST_RINT, T); V();
             Fence<AscendC::HardEvent::V_MTE3>();
             AscendC::DataCopy(output[base], result, T);
-            if constexpr (CopyKV) {
+            if constexpr (CopyKV && BatchedCopy) {
+                Fence<AscendC::HardEvent::V_S>();
+                auto payload = kvBuf.Get<uint8_t>();
+                uint32_t rows = 16384 / a.rowBytes;
+                if (rows > 16) rows = 16;
+                for (uint32_t first = 0; first < T; first += rows) {
+                    uint32_t count = T - first < rows ? T - first : rows;
+                    // Zero invalid rows before disjoint valid-row DMA writes.
+                    AscendC::Duplicate(payload.ReinterpretCast<uint32_t>(),
+                                       static_cast<uint32_t>(0), count * a.rowBytes / 4); V();
+                    Fence<AscendC::HardEvent::V_MTE2>();
+                    Fence<AscendC::HardEvent::V_MTE3>();
+                    for (uint32_t j = 0; j < count; ++j) {
+                        int32_t source = result.GetValue(first + j);
+                        if (source == -2) continue;
+                        uint64_t src = source >= 0
+                            ? (static_cast<uint64_t>(request) * n + source) * a.rowBytes
+                            : (static_cast<uint64_t>(request) * a.universe + token.GetValue(first + j)) * a.rowBytes;
+                        if (source >= 0) AscendC::DataCopy(payload[j * a.rowBytes], oldKV[src], a.rowBytes);
+                        else AscendC::DataCopy(payload[j * a.rowBytes], denseKV[src], a.rowBytes);
+                    }
+                    // One completion fence and contiguous output per group.
+                    Fence<AscendC::HardEvent::MTE2_MTE3>();
+                    AscendC::DataCopy(newKV[(base + first) * a.rowBytes], payload, count * a.rowBytes);
+                    Fence<AscendC::HardEvent::MTE3_MTE2>();
+                    Fence<AscendC::HardEvent::MTE3_V>();
+                }
+            } else if constexpr (CopyKV) {
                 Fence<AscendC::HardEvent::V_S>();
                 auto payload = kvBuf.Get<uint8_t>();
                 // Read-only old bank and disjoint output bank; no hit can be

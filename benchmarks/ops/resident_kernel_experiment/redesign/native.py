@@ -58,7 +58,10 @@ class NativeCase:
     PCIe/LMCache. run() never publishes a new snapshot. refresh() keeps addresses
     stable for graph replay and must be ordered before that replay on its stream.
     """
-    def __init__(self, query, snapshot, dense, variant, *, radius=2, buckets=8192):
+    def __init__(self, query, snapshot, dense, variant, *, radius=2, buckets=8192, copy_mode='row'):
+        if copy_mode not in ('row', 'batched'):
+            raise ValueError('copy_mode must be row or batched')
+        self.copy_mode = copy_mode
         query.validate()
         snapshot.validate(query)
         if variant not in MODES:
@@ -100,7 +103,9 @@ class NativeCase:
         self.tensors[10].copy_(dense)
 
     def run(self, fused=False):
-        torch.ops.resident_redesign.run_(self.tensors, self.universe, self.mode, self.radius, fused)
+        op = (torch.ops.resident_redesign.run_batched_ if self.copy_mode == 'batched'
+              else torch.ops.resident_redesign.run_)
+        op(self.tensors, self.universe, self.mode, self.radius, fused)
 
     @property
     def plan(self):
