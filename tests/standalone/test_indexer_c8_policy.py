@@ -3,7 +3,7 @@
 
 import ast
 from pathlib import Path
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 
 import pytest
 
@@ -18,7 +18,8 @@ def validate(monkeypatch):
     )
     method = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "validate_indexer_c8_layers")
     ns = {}
-    exec(compile(ast.Module(body=[method], type_ignores=[]), str(source), "exec"), ns)
+    selector = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "indexer_c8_layer_mask")
+    exec(compile(ast.Module(body=[method, selector], type_ignores=[]), str(source), "exec"), ns)
     # Isolate the upstream layer-index utility from model/device imports.
     import sys
 
@@ -28,14 +29,16 @@ def validate(monkeypatch):
         SimpleNamespace(extract_layer_index=lambda name: int(name.split("layers.")[1].split(".")[0])),
     )
 
-    def run(description, enabled=True):
+    def run(description, enabled=True, names=None, resolve=False):
         config = SimpleNamespace(
             enable_sparse_li_c8=enabled,
             vllm_config=SimpleNamespace(quant_config=SimpleNamespace(quant_description=description)),
         )
-        ns[method.name](
-            config, ["model.layers.0.self_attn.indexer.k_cache", "model.layers.3.self_attn.indexer.k_cache"]
-        )
+        config.indexer_c8_layer_mask = MethodType(ns[selector.name], config)
+        names = names or ["model.layers.0.self_attn.indexer.k_cache", "model.layers.3.self_attn.indexer.k_cache"]
+        if resolve:
+            return config.indexer_c8_layer_mask(names)
+        ns[method.name](config, names)
 
     return run
 
@@ -71,6 +74,14 @@ def test_weight_annotation_follows_upstream_selection(validate):
 
 def test_disabled_c8_does_not_enforce_artifact_filter(validate):
     validate({"model.layers.0.self_attn.indexer.quant_type": "FLOAT"}, enabled=False)
+
+
+def test_glm53_mixed_policy_preserves_six_bf16_owners(validate):
+    selected = list(range(6, 67, 4))
+    owners = [0, 1, 2, *selected, 70, 74, 78]
+    description = {f"model.layers.{i}.self_attn.indexer.quant_type": "INT8_DYNAMIC" for i in selected}
+    names = [f"model.layers.{i}.self_attn.indexer.k_cache" for i in owners]
+    assert validate(description, names=names, resolve=True) == (False,) * 3 + (True,) * 16 + (False,) * 3
 
 
 @pytest.mark.parametrize(

@@ -186,11 +186,23 @@ class AscendConfig:
         """Require uniform C8 for physical indexer owners, honoring v0.23 policy."""
         if not self.enable_sparse_li_c8:
             return
+        mask = self.indexer_c8_layer_mask(layer_names)
+        missing = [name for name, enabled in zip(layer_names, mask, strict=True) if not enabled]
+        if missing:
+            raise ValueError(
+                "Two-group indexer C8 requires uniform quantization of all physical indexer layers; "
+                f"the model quantization policy excludes {missing}"
+            )
+
+    def indexer_c8_layer_mask(self, layer_names: list[str | None]) -> tuple[bool, ...]:
+        """Resolve upstream quantization policy, preserving physical layer order."""
+        if not self.enable_sparse_li_c8:
+            return (False,) * len(layer_names)
         description = getattr(getattr(self.vllm_config, "quant_config", None), "quant_description", None)
         if not isinstance(description, dict) or not any(
             isinstance(key, str) and key.endswith(".indexer.quant_type") for key in description
         ):
-            return  # Upstream applies C8 globally when no layer filter is present.
+            return (True,) * len(layer_names)
         from vllm.model_executor.models.utils import extract_layer_index
 
         selected_names, selected_ids = set(), set()
@@ -203,19 +215,12 @@ class AscendConfig:
                 if name:
                     selected_names.add(name)
                     selected_ids.add(extract_layer_index(name))
-        missing = [
-            name
-            for name in layer_names
-            if not (
+        return tuple(
+            name is not None and (
                 any(name == prefix or name.startswith(prefix + ".") for prefix in selected_names)
                 or extract_layer_index(name) in selected_ids
-            )
-        ]
-        if missing:
-            raise ValueError(
-                "Two-group indexer C8 requires uniform quantization of all physical indexer layers; "
-                f"the model quantization policy excludes {missing}"
-            )
+            ) for name in layer_names
+        )
 
     @staticmethod
     def _set_compile_ranges(compilation_config, value):

@@ -33,6 +33,7 @@ from vllm.v1.attention.backend import (
 from vllm.v1.kv_cache_interface import AttentionSpec
 
 from vllm_ascend import envs
+from vllm_ascend.worker.dsa_shared_pool import MixedIndexerMetadata
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import (
     _EXTRA_CTX,
@@ -989,6 +990,8 @@ class AscendSFAMetadata:
     # None in single-group mode (indexer shares the latent's block ids).
     indexer_block_table: torch.Tensor | None = None
     indexer_slot_mapping: torch.Tensor | None = None
+    indexer_c8_block_table: torch.Tensor | None = None
+    indexer_c8_slot_mapping: torch.Tensor | None = None
     reshape_cache_event: torch.npu.Event = None
     sfa_cp_metadata: AscendPCPMetadata | None = None
     num_decodes: int = 0
@@ -1067,6 +1070,14 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
 
         self.block_size = vllm_config.cache_config.block_size
         self.max_blocks = (vllm_config.model_config.max_model_len + self.block_size - 1) // self.block_size
+        self._mixed_indexer_metadata = None
+        if getattr(get_ascend_config(), "indexer_c8_shared_block_factor", 1) == 2:
+            self._mixed_indexer_metadata = MixedIndexerMetadata(
+                vllm_config.scheduler_config.max_num_seqs,
+                (self.max_blocks + 8) // 9 * 9,
+                vllm_config.scheduler_config.max_num_batched_tokens,
+                device,
+            )
 
         self.speculative_config = vllm_config.speculative_config
         self.decode_threshold = 1
@@ -1293,9 +1304,14 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
         # slicing as the latent's) so the impl can address the indexer cache.
         indexer_block_table = None
         indexer_slot_mapping = None
+        indexer_c8_block_table = indexer_c8_slot_mapping = None
         if common_attn_metadata.indexer_block_table_tensor is not None:
             indexer_block_table = common_attn_metadata.indexer_block_table_tensor[:num_reqs]
             indexer_slot_mapping = common_attn_metadata.indexer_slot_mapping[:num_input_tokens]
+            if self._mixed_indexer_metadata is not None:
+                indexer_c8_block_table, indexer_c8_slot_mapping = self._mixed_indexer_metadata.update(
+                    indexer_block_table, indexer_slot_mapping
+                )
 
         # DSA shrink-latent: expand per-request prompt lengths to per-row cache
         # boundaries for sparse-index preparation. Decode rows start at the
@@ -1742,6 +1758,8 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             dsa_cp_context=dsa_cp_context,
             indexer_block_table=indexer_block_table,
             indexer_slot_mapping=indexer_slot_mapping,
+            indexer_c8_block_table=indexer_c8_block_table,
+            indexer_c8_slot_mapping=indexer_c8_slot_mapping,
             # DSA latent offload: best-effort; getattr -> None when not threaded in yet
             # (harmless unless the feature is enabled). HW-VERIFY the real source.
             req_ids=getattr(common_attn_metadata, "request_ids", None),
@@ -2061,7 +2079,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         # dsa c8
         # Shared-consumer layers have no indexer KV to quantize, so the C8
         # indexer path only applies to producer layers.
-        self.use_sparse_c8_indexer = self.has_indexer and ascend_config.enable_sparse_c8
+        self.use_sparse_c8_indexer = self.has_indexer and ascend_config.indexer_c8_layer_mask([self.layer_name])[0]
         if self.use_sparse_c8_indexer:
             if not hasattr(torch.ops._C_ascend, "npu_lightning_indexer_quant"):
                 raise RuntimeError("Indexer C8 requires the vLLM-Ascend quantized lightning-indexer operator")
@@ -2669,6 +2687,8 @@ class AscendSFAImpl(MLAAttentionImpl):
                 if attn_metadata.indexer_block_table is not None
                 else attn_metadata.block_table
             )
+            if self.use_sparse_c8_indexer and attn_metadata.indexer_c8_block_table is not None:
+                indexer_block_table = attn_metadata.indexer_c8_block_table
         weights, _ = self.weights_proj(x)
 
         q_li, _ = self.wq_b(q_c)  # [b,s,1536] @ [1536,64*128] = [b,s,64*128]
@@ -3012,7 +3032,9 @@ class AscendSFAImpl(MLAAttentionImpl):
             attn_metadata.cos,
             attn_metadata.sin,
             attn_metadata.slot_mapping,
-            attn_metadata.indexer_slot_mapping,
+            (attn_metadata.indexer_c8_slot_mapping
+             if self.use_sparse_c8_indexer and attn_metadata.indexer_c8_slot_mapping is not None
+             else attn_metadata.indexer_slot_mapping),
         )
         if any(tensor is None for tensor in required_token_tensors):
             return "required fixed-shape attention metadata is unavailable"
@@ -3838,10 +3860,14 @@ class AscendSFAImpl(MLAAttentionImpl):
             attn_metadata.cos,
             attn_metadata.sin,
             attn_metadata.slot_mapping,
-            attn_metadata.indexer_slot_mapping,
+            (attn_metadata.indexer_c8_slot_mapping
+             if self.use_sparse_c8_indexer and attn_metadata.indexer_c8_slot_mapping is not None
+             else attn_metadata.indexer_slot_mapping),
             attn_metadata.cum_query_lens,
             attn_metadata.seq_lens,
-            attn_metadata.indexer_block_table,
+            (attn_metadata.indexer_c8_block_table
+             if self.use_sparse_c8_indexer and attn_metadata.indexer_c8_block_table is not None
+             else attn_metadata.indexer_block_table),
             remap_boundary,
             row_req_indices,
             attn_metadata.block_table,
@@ -4730,6 +4756,8 @@ class AscendSFAImpl(MLAAttentionImpl):
             if attn_metadata.indexer_slot_mapping is not None
             else slot_mapping
         )
+        if self.use_sparse_c8_indexer and attn_metadata.indexer_c8_slot_mapping is not None:
+            idx_slot_mapping = attn_metadata.indexer_c8_slot_mapping
         content_diagnostics_enabled = (
             bool(attn_metadata.req_ids)
             and npu_content_diagnostics_enabled()
