@@ -191,7 +191,7 @@ def case_environment(args, case):
             "VLLM_ASCEND_DSA_SHARED_POOL": "1",
             "VLLM_ASCEND_DSA_SHRINK_LATENT": "0",
             "VLLM_ASCEND_DSA_DISABLE_INDEX_LMCACHE": "0",
-            "VLLM_ASCEND_ENABLE_FLASHCOMM1": "0",
+            "VLLM_ASCEND_ENABLE_FLASHCOMM1": "1",
             "VLLM_ASCEND_ENABLE_MATMUL_ALLREDUCE": "0",
             "LMCACHE_CHUNK_SIZE": str(CACHE_CHUNK_TOKENS),
             "LMCACHE_LOCAL_CPU": "true",
