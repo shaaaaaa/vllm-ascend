@@ -240,6 +240,7 @@ class TestAscendMultiHeadLatentAttention(TestBase):
 
         impl = MagicMock(
             enable_staged_sfa_graph=True,
+            shared_resident_plan=None,
             local_num_heads=4,
             kv_lora_rank=self.kv_lora_rank,
             qk_rope_head_dim=self.qk_rope_head_dim,

@@ -43,6 +43,39 @@ def compile_fx(graph: GraphModule, example_inputs: list, inner_compile: Callable
     return aot_autograd(fw_compiler=inner_compile)(graph, example_inputs)
 
 
+def _reuse_shared_resident_buffers(graph: fx.GraphModule) -> bool:
+    """Keep group-owned state/workspace in place after functional graph passes.
+
+    The private SFA operator's resident buffers are deliberately persistent;
+    callers never retain their old versions. AOT otherwise clones every one
+    of them per producer. Keep the existing output-buffer handling unchanged.
+    """
+    op = getattr(torch.ops.vllm, "sfa_forward_pre_shared", None)
+    if op is None:
+        return False
+    changed = False
+    for node in graph.graph.nodes:
+        if not node.args or node.args[0] != op.default:
+            continue
+        if node.target == torch.ops.higher_order.auto_functionalized and node.kwargs.get("resident_writes"):
+            names = node.kwargs.get("_only_clone_these_tensors")
+            names = ("output",) if names is None else tuple(n for n in names if n != "resident_writes")
+            node.kwargs = dict(node.kwargs, _only_clone_these_tensors=names)
+            changed = True
+        elif node.target == torch.ops.higher_order.auto_functionalized_v2 and node.kwargs.get(
+            "_resident_writes_length"
+        ):
+            resident_bases = {
+                node.kwargs[f"_resident_writes_{i}_base_index"] for i in range(node.kwargs["_resident_writes_length"])
+            }
+            resident_bases.discard(node.kwargs["_output_base_index"])
+            bases = node.kwargs.get("_only_clone_these_bases")
+            bases = range(len(node.kwargs["_all_bases"])) if bases is None else bases
+            node.kwargs = dict(node.kwargs, _only_clone_these_bases=tuple(i for i in bases if i not in resident_bases))
+            changed = True
+    return changed
+
+
 def fusion_pass_compile(
     graph: fx.GraphModule,
     example_inputs: list[Any],
@@ -53,6 +86,8 @@ def fusion_pass_compile(
     def compile_inner(graph, example_inputs):
         current_pass_manager = compiler_config[COMPILATION_PASS_KEY]
         graph = current_pass_manager(graph)
+        if _reuse_shared_resident_buffers(graph):
+            graph.recompile()
         return graph
 
     decompositions = select_decomp_table()

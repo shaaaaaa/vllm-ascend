@@ -106,6 +106,7 @@ from vllm_ascend.attention.mtp_dw_diag import (
     post_commit_sample_requests,
     scheduled_decode_requests,
 )
+from vllm_ascend.attention.sfa_v1 import _fixed_staged_decode_mtp, _get_indexer_types
 from vllm_ascend.attention.target_sfa_diagnostics import (
     target_tail_boundary,
 )
@@ -129,6 +130,7 @@ from vllm_ascend.compilation.acl_graph import (
     set_graph_params,
     update_full_graph_params,
 )
+from vllm_ascend.distributed.kv_transfer.sparse_offload.resident_sorted_cache import SharedResidentPlan
 from vllm_ascend.distributed.kv_transfer.sparse_offload.resident_sparse_cache import (
     MAX_INT16_SCRATCH_CAPACITY,
     ResidentRequestStateRegistry,
@@ -166,6 +168,7 @@ from vllm_ascend.spec_decode.medusa_proposer import AscendMedusaProposer
 from vllm_ascend.spec_decode.ngram_proposer import AscendNgramProposer
 from vllm_ascend.spec_decode.suffix_proposer import AscendSuffixDecodingProposer
 from vllm_ascend.utils import (
+    StagedSFAConfigReason,
     StagedSFARouteAction,
     StagedSFARouteDecision,
     StagedSFARouteReason,
@@ -182,6 +185,7 @@ from vllm_ascend.utils import (
     sparse_kv_cache_has_indexer,
     staged_sfa_graph_capture_sizes,
     staged_sfa_graph_configuration_errors,
+    staged_sfa_graph_configuration_reasons,
     staged_sfa_graph_configured,
 )
 from vllm_ascend.worker.dsa_shared_pool import reshape_dsa_shared_pool_raw
@@ -871,6 +875,8 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
             and envs_ascend.VLLM_ASCEND_DSA_RESIDENT_CACHE
         )
         self._resident_state_registry: ResidentRequestStateRegistry | None = None
+        self._shared_resident_groups: list[SharedResidentPlan] = []
+        self._shared_resident_failed = False
         self._resident_state_indices = None
         self._resident_state_generations = None
         self._resident_scratch_capacity = (
@@ -918,6 +924,10 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
         registry = self._resident_state_registry
         if registry is not None:
             registry.release(tuple(scheduler_output.finished_req_ids))
+            if self._shared_resident_groups and scheduler_output.preempted_req_ids:
+                # A resumed request can receive the same block IDs with new
+                # contents. The allocation signature alone cannot detect that.
+                registry.invalidate(scheduler_output.preempted_req_ids)
         super()._update_states(scheduler_output)
 
     def _reject_work_after_preemption_failure(self, *args, **kwargs):
@@ -3439,13 +3449,21 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
         **model_kwargs: dict[str, Any],
     ):
         assert self.model is not None
-        hidden_states = self.model(
-            input_ids=input_ids,
-            positions=positions,
-            intermediate_tensors=intermediate_tensors,
-            inputs_embeds=inputs_embeds,
-            **model_kwargs,
-        )
+        if self._shared_resident_groups:
+            self._prepare_shared_resident_plans(num_tokens_padded)
+        try:
+            hidden_states = self.model(
+                input_ids=input_ids,
+                positions=positions,
+                intermediate_tensors=intermediate_tensors,
+                inputs_embeds=inputs_embeds,
+                **model_kwargs,
+            )
+        except BaseException:
+            if self._shared_resident_groups:
+                # Metadata may already describe fills that never completed.
+                self._shared_resident_failed = True
+            raise
         forward_context = get_forward_context()
         assert forward_context is not None
         # Export the already-recorded post-forward dependency for an explicitly
@@ -5180,6 +5198,8 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
 
             if self.lora_config:
                 self.model = self.load_lora_model(self.model, self.vllm_config, self.device)
+            if envs_ascend.VLLM_ASCEND_SFA_SHARED_RESIDENT_PLAN:
+                self._bind_shared_resident_plans()
         self.model_memory_usage = m.consumed_memory
         logger.info("Loading model weights took %.4f GB", m.consumed_memory / float(2**30))
 
@@ -5269,6 +5289,7 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
 
         self.may_reinitialize_input_batch(kv_cache_config)
         kv_caches = self.initialize_kv_cache_tensors(kv_cache_config)
+        self._validate_shared_resident_layout(kv_caches)
         # TODO: refactor the logic of attention
         # Initialize drafter attention group initialization
         if self.speculative_config and (
@@ -6333,6 +6354,141 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                     )
                 set_draft_graph_params(sorted(draft_graph_sizes))
 
+
+    def _bind_shared_resident_plans(self) -> None:
+        """Resolve structural target groups once; never group by buffer identity."""
+        config = self.vllm_config
+        kinds = _get_indexer_types(
+            (config.model_config.hf_text_config, getattr(config.model_config, "hf_config", None))
+        )
+        if not kinds or "shared" not in kinds:
+            return
+        reasons = staged_sfa_graph_configuration_reasons(config)
+        if config.compilation_config.cudagraph_mode == CUDAGraphMode.NONE:
+            reasons = tuple(r for r in reasons if r != StagedSFAConfigReason.CUDAGRAPH_MODE)
+        if reasons or not self.dsa_resident_cache or getattr(config.parallel_config, "enable_dbo", False):
+            raise ValueError(f"shared resident planning requires serialized compact-scratch decode: {reasons}")
+        layers = get_layers_from_vllm_config(config, AttentionLayerBase)
+        candidates = {
+            id(layer.impl): layer.impl
+            for layer in layers.values()
+            if getattr(getattr(layer, "impl", None), "shared_resident_candidate", False)
+        }
+        impls = {parse_layer_idx(impl.layer_name): impl for impl in candidates.values()}
+        if len(impls) != len(candidates) or set(impls) != set(range(len(kinds))) or kinds[0] != "full":
+            raise ValueError("shared resident topology is incomplete or has no leading producer")
+        groups = []
+        for index, kind in enumerate(kinds):
+            impl = impls[index]
+            expected_role = (kind == "full", kind == "shared")
+            if kind not in ("full", "shared") or (impl.has_indexer, impl.skip_topk) != expected_role:
+                raise ValueError(f"shared resident topology disagrees at layer {index}")
+            if kind == "full":
+                groups.append([])
+            groups[-1].append(impl)
+        for members in groups:
+            producer = members[0]
+            producer.initialize_sorted_resident_cache()
+            if len(members) == 1:
+                continue
+            for impl in members:
+                if (impl.decode_threshold, impl.index_topk, impl.block_size, impl.dsa_shrink_latent) != (
+                    producer.decode_threshold,
+                    producer.index_topk,
+                    producer.block_size,
+                    producer.dsa_shrink_latent,
+                ) or impl.topk_indices_buffer is not producer.topk_indices_buffer:
+                    raise ValueError("shared resident planner geometry or raw publication buffer differs")
+                if (
+                    impl.enable_mlapo
+                    or impl.enable_dsa_cp
+                    or impl.enable_dsa_cp_with_o_proj_tp
+                    or impl.use_sparse_c8_indexer
+                ):
+                    raise ValueError("shared resident planning requires the ordinary non-CP SFA layout")
+            state, workspace = producer._sorted_resident_state, producer._sorted_resident_workspace
+            assert state is not None and workspace is not None
+            group = SharedResidentPlan(
+                tuple(impl.layer_name for impl in members),
+                state,
+                workspace,
+                torch.empty(
+                    (self.max_num_reqs * producer.decode_threshold, 1, producer.index_topk),
+                    dtype=torch.int32,
+                    device=state.tokens.device,
+                ),
+                producer.decode_threshold,
+                producer.block_size,
+            )
+            self._shared_resident_groups.append(group)
+            for impl in members:
+                impl.shared_resident_plan = group
+                impl._sorted_resident_state = group.state
+                impl._sorted_resident_workspace = group.workspace
+                impl._sorted_resident_workspace_views = group.workspace_views
+                impl.dsa_resident_shards_per_row = producer.dsa_resident_shards_per_row
+            logger.info(
+                "[SFA_SHARED_PLAN] producer=%s members=%s address_mode=COMMON_SLOT_MAP", group.members[0], group.members
+            )
+
+    def _validate_shared_resident_layout(self, kv_caches) -> None:
+        """Qualify the actual layer-local destination tensors before capture."""
+        for group in self._shared_resident_groups:
+            owners = [ag for ag in self.attn_groups[0] if group.members[0] in ag.layer_names]
+            if len(owners) != 1 or not set(group.members).issubset(owners[0].layer_names):
+                raise ValueError("shared resident members must use one latent metadata builder in KV group 0")
+            reference = kv_caches[group.members[0]][:2]
+            for name in group.members:
+                caches = kv_caches[name][:2]
+                if len(caches) != 2 or any(
+                    c.ndim != 4
+                    or c.shape[1:3] != (group.block_size, 1)
+                    or not c.is_contiguous()
+                    or c.shape != r.shape
+                    or c.stride() != r.stride()
+                    or c.dtype != r.dtype
+                    or c.device != r.device
+                    for c, r in zip(caches, reference)
+                ):
+                    raise ValueError(f"shared resident latent slot layout differs: {name}")
+
+    def _prepare_shared_resident_plans(self, token_count: int) -> None:
+        """Preflight the entire group before any layer may update its residency."""
+        if self._shared_resident_failed:
+            raise RuntimeError("a shared resident forward failed; restart before reusing planned residency")
+        context = get_forward_context()
+        metadata = context.attn_metadata
+        staged = getattr(context, "staged_sfa_graph_key", None) is not None
+        for group in self._shared_resident_groups:
+            group.active = False
+            if metadata is None:
+                continue  # Weight profiling: no attention or resident work.
+            if not isinstance(metadata, dict):
+                raise ValueError("shared resident planning does not support microbatches")
+            common = metadata[group.members[0]]
+            if any(metadata[name] is not common for name in group.members):
+                raise ValueError("shared resident members must use the same live attention metadata")
+            # Identity of the metadata guarantees identical table views, rows,
+            # boundaries and request generations without device comparisons.
+            group.active = staged or bool(
+                common.need_sparse_lmcache_payload
+                and common.split_boundary is not None
+                and common.num_decode_tokens > 0
+                and _fixed_staged_decode_mtp(
+                    common.decode_req_indices_cpu,
+                    int(common.block_table.shape[0]),
+                    token_count,
+                    pure_decode=common.attn_state in (
+                        AscendAttentionState.DecodeOnly, AscendAttentionState.SpecDecoding
+                    ),
+                ) == group.mtp
+            )
+            if group.active and (
+                common.resident_state_indices is None or common.resident_state_generations is None
+            ):
+                raise RuntimeError("shared resident request state is unavailable")
+            if not group.active and not getattr(context, "staged_sfa_graph_dummy_run", False):
+                self._resident_state_registry.invalidate(common.req_ids)
 
     def _collect_staged_sfa_impls(self) -> tuple[tuple[str, Any], ...]:
         """Return each target-model staged SFA implementation exactly once."""
