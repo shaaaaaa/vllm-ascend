@@ -5993,10 +5993,13 @@ class AscendSFAImpl(MLAAttentionImpl):
         # latent (k_nope, k_pe). Connectors declaring DSA index LMCache support
         # also save the sibling indexer layer whenever that path is enabled.
         # A pure decode step in shrink-latent mode skips this unless decode
-        # window saving is enabled.
+        # window saving is enabled. P-node banks must still save and advance
+        # their load cursor: a one-token prefill tail (and its MTP forward)
+        # can also carry DecodeOnly/SpecDecoding attention metadata.
         _decode_window_save_enabled = _decode_window_save_window_size() > 0
         _skip_decode_save = (
             bool(self.dsa_shrink_latent)
+            and not self._layerwise_prefill_p_node
             and _is_pure_decode
             and not _decode_window_save_enabled
         )
