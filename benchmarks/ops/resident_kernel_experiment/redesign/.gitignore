@@ -1,0 +1,7 @@
+__pycache__/
+.pytest_cache/
+build*/
+profiles/
+*results*.json
+*-smoke.json
+native-r*.json
