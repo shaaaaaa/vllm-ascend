@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Profile launch isolation and request diagnostics without importing an NPU runtime."""
 
+import ast
 import builtins
 import importlib.util
 import json
@@ -71,7 +72,6 @@ def test_case_launch_uses_isolated_inline_configuration(
         assert env["LMCACHE_LOCAL_CPU"] == "true"
         assert env["LMCACHE_MAX_LOCAL_CPU_SIZE"] == "24"
         assert env["LMCACHE_ENABLE_SHARED_CPU_CACHE"] == "true"
-        assert env["LMCACHE_STORE_ASYNC"] == "true"
         assert env["LMCACHE_STORE_ASYNC_MAX_QUEUE_SIZE"] == "2"
         assert env["LMCACHE_ENABLE_ASYNC_LOADING"] == "false"
         assert json.loads(env["LMCACHE_EXTRA_CONFIG"])["save_only_first_rank"] is True
@@ -80,6 +80,8 @@ def test_case_launch_uses_isolated_inline_configuration(
     switch = "VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE"
     assert off.pop(switch) == "false"
     assert on.pop(switch) == "true"
+    assert off.pop("LMCACHE_STORE_ASYNC") == "false"
+    assert on.pop("LMCACHE_STORE_ASYNC") == "true"
     assert off == on
     assert profile_tool.os.environ["LMCACHE_CONFIG_FILE"] == inherited["LMCACHE_CONFIG_FILE"]
 
@@ -90,6 +92,84 @@ def test_case_launch_uses_isolated_inline_configuration(
     assert options["max_num_batched_tokens"] == 4096
     assert options["async_scheduling"] is None
     assert options["kv_transfer_config"]["kv_role"] == "kv_both"
+
+
+@pytest.fixture
+def validate_adapter_store_configuration():
+    adapter_path = (
+        Path(__file__).resolve().parents[3] / "LMCache-Ascend/lmcache_ascend/integration/vllm/vllm_v1_adapter.py"
+    )
+    if not adapter_path.is_file():
+        pytest.skip("The sibling LMCache-Ascend checkout is required for the real adapter guard")
+    tree = ast.parse(adapter_path.read_text(encoding="utf-8"))
+    adapter = next(
+        node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "LMCacheAscendConnectorV1Impl"
+    )
+    constructor = next(node for node in adapter.body if isinstance(node, ast.FunctionDef) and node.name == "__init__")
+    fields = {
+        "use_layerwise",
+        "store_async",
+        "_force_layerwise_prefill_store",
+        "_remote_store_requested",
+        "_direct_store_requested",
+    }
+    nodes = []
+    for node in constructor.body:
+        if (
+            isinstance(node, ast.Assign)
+            and any(
+                (isinstance(target, ast.Attribute) and target.attr in fields)
+                or (isinstance(target, ast.Name) and target.id == "get_extra")
+                for target in node.targets
+            )
+            or isinstance(node, ast.If)
+            and any(
+                isinstance(child, ast.Constant) and child.value == "Layerwise storing is not supported with async store"
+                for child in ast.walk(node)
+            )
+        ):
+            nodes.append(node)
+    assert len(nodes) == len(fields) + 2
+    code = compile(ast.fix_missing_locations(ast.Module(body=nodes, type_ignores=[])), str(adapter_path), "exec")
+
+    def validate(env, kv_role):
+        extra = json.loads(env["LMCACHE_EXTRA_CONFIG"])
+        config = SimpleNamespace(
+            use_layerwise=env["LMCACHE_USE_LAYERWISE"] == "true",
+            store_async=env["LMCACHE_STORE_ASYNC"] == "true",
+            enable_remote_lmcache_store=env.get("LMCACHE_ENABLE_REMOTE_LMCACHE_STORE", "false") == "true",
+            pd_role=env.get("LMCACHE_PD_ROLE"),
+            get_extra_config_value=lambda key, default: extra.get(key, default),
+        )
+        exec(
+            code,
+            {
+                "self": SimpleNamespace(config=config, kv_role=kv_role),
+                "role": "worker",
+                "KVConnectorRole": SimpleNamespace(SCHEDULER="scheduler"),
+                "os": SimpleNamespace(getenv=env.get),
+            },
+        )
+
+    return validate
+
+
+@pytest.mark.parametrize("case", ["10k_off", "10k_on", "80k_off", "80k_on"])
+def test_profile_cases_pass_real_adapter_store_guard(
+    profile_tool, validate_adapter_store_configuration, tmp_path, case
+):
+    args = SimpleNamespace(devices="0,1,2,3,4,5,6,7", cpu_cache_gb=24, model="/models/test")
+    env = profile_tool.case_environment(args, case)
+    options = profile_tool.engine_options(args, tmp_path, 80000 if case.startswith("80k") else 10000)
+    kv_role = options["kv_transfer_config"]["kv_role"]
+
+    validate_adapter_store_configuration(env, kv_role)
+
+    # Replay the former OFF combination to prove the actual guard detects it.
+    if case.endswith("_off"):
+        env["LMCACHE_STORE_ASYNC"] = "true"
+        with pytest.raises(ValueError, match="Layerwise storing is not supported with async store"):
+            validate_adapter_store_configuration(env, kv_role)
 
 
 @pytest.fixture

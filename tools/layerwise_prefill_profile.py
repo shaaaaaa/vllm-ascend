@@ -209,7 +209,9 @@ def case_environment(args, case):
             "VLLM_ASCEND_DSA_DISABLE_TARGET_SLOT_MAPPING": "0",
             "VLLM_ASCEND_ENABLE_FLASHCOMM1": "1",
             "VLLM_ASCEND_ENABLE_MATMUL_ALLREDUCE": "0",
-            "VLLM_ASCEND_BALANCE_SCHEDULING": "1",
+            # This benchmark has DP=1 and max_num_seqs=1. The cross-DP
+            # scheduler reserves one slot, so enabling it admits no requests.
+            "VLLM_ASCEND_BALANCE_SCHEDULING": "0",
             "TASK_QUEUE_ENABLE": "1",
             "CPU_AFFINITY_CONF": "1",
             "ASCEND_AGGREGATE_ENABLE": "1",
@@ -227,7 +229,8 @@ def case_environment(args, case):
             "LMCACHE_USE_LAYERWISE": "true",
             "LMCACHE_ENABLE_SPARSE_ATTENTION": "true",
             "LMCACHE_DSA_TWO_GROUPS": "true",
-            "LMCACHE_STORE_ASYNC": "true",
+            # The original local layerwise path does not support async stores.
+            "LMCACHE_STORE_ASYNC": str(case.endswith("_on")).lower(),
             "LMCACHE_STORE_ASYNC_MAX_QUEUE_SIZE": "2",
             "LMCACHE_ENABLE_ASYNC_LOADING": "false",
             "LMCACHE_SAVE_DECODE_CACHE": "false",
