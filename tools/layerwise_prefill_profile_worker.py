@@ -6,8 +6,13 @@ collective RPC AFTER model startup. No production worker changes,
 tensor inspection, per-layer checks, or extra per-chunk synchronization.
 """
 
+import faulthandler
+import os
+from pathlib import Path
+
 EDGE_CHUNKS = 3
 PREFIX = "[PREFILL_PROFILE]"
+STARTUP_TRACEBACK_TIMEOUT_SECONDS = 120
 
 
 class TransferAttribution:
@@ -562,6 +567,8 @@ class ChunkProfileCapture:
         self.chunks = []
         self.tokens = 0
         self.attribution = None
+        self.first_execute_pending = True
+        self.startup_traceback_file = None
         # Install before the request, including all unprofiled middle chunks.
         dummy_prepare = plan.get("dummy_prepare", False)
         dummy_bind = plan.get("dummy_dma_bind", False)
@@ -626,7 +633,9 @@ class ChunkProfileCapture:
                     "outputs INVALID",
                     flush=True,
                 )
+            self.arm_startup_watchdog()
         except BaseException:
+            self.cancel_startup_watchdog()
             if self.restore_prefill_store:
                 self.restore_prefill_store()
             if self.restore_submit_load:
@@ -639,11 +648,48 @@ class ChunkProfileCapture:
         if self.restore_dma:
             print(f"{PREFIX} rank={worker.rank}: DUMMY DMA enabled for entire request; outputs INVALID", flush=True)
 
+    def arm_startup_watchdog(self):
+        directory = self.plan.get("startup_diagnostic_dir")
+        if directory is None:
+            return
+        directory = Path(directory)
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / f"worker-{self.worker.rank}-{os.getpid()}.log"
+        stream = path.open("w", encoding="utf-8")
+        try:
+            stream.write(f"case={self.case} rank={self.worker.rank} pid={os.getpid()}\n")
+            stream.flush()
+            faulthandler.dump_traceback_later(STARTUP_TRACEBACK_TIMEOUT_SECONDS, repeat=False, file=stream)
+        except BaseException:
+            stream.close()
+            raise
+        self.startup_traceback_file = stream
+        print(
+            f"{PREFIX} rank={self.worker.rank} pid={os.getpid()}: startup watchdog armed; "
+            f"timeout={STARTUP_TRACEBACK_TIMEOUT_SECONDS}s path={path}",
+            flush=True,
+        )
+
+    def cancel_startup_watchdog(self):
+        stream = self.startup_traceback_file
+        if stream is not None:
+            self.startup_traceback_file = None
+            try:
+                faulthandler.cancel_dump_traceback_later()
+            finally:
+                stream.close()
+
+    def synchronize_window_boundary(self, window, action):
+        label = f"{PREFIX} rank={self.worker.rank}: {self.case}/{window} boundary sync"
+        print(f"{label} begin; action={action}", flush=True)
+        synchronize_boundary()
+        print(f"{label} end; action={action}", flush=True)
+
     def stop_window(self):
         if self.active is not None:
             print(f"{PREFIX} rank={self.worker.rank}: {self.case}/{self.active} profiler stop begin", flush=True)
             try:
-                synchronize_boundary()
+                self.synchronize_window_boundary(self.active, "stop")
                 self.worker.profile(is_start=False)
             finally:
                 if self.attribution is not None:
@@ -655,6 +701,21 @@ class ChunkProfileCapture:
             self.active = None
 
     def execute_model(self, scheduler_output, *args, **kwargs):
+        first_execute = self.first_execute_pending
+        try:
+            if first_execute:
+                self.first_execute_pending = False
+                print(
+                    f"{PREFIX} rank={self.worker.rank} pid={os.getpid()}: first execute_model received; "
+                    f"scheduled_tokens={scheduler_output.total_num_scheduled_tokens}",
+                    flush=True,
+                )
+            return self._execute_model(scheduler_output, *args, **kwargs)
+        finally:
+            if first_execute:
+                self.cancel_startup_watchdog()
+
+    def _execute_model(self, scheduler_output, *args, **kwargs):
         count = scheduler_output.total_num_scheduled_tokens
         if count > 0:
             chunk = len(self.chunks) + 1
@@ -666,12 +727,13 @@ class ChunkProfileCapture:
                 # one: its sample_tokens/MTP RPC and async copies belong to it.
                 self.stop_window()
                 if window is not None:
-                    synchronize_boundary()
+                    self.synchronize_window_boundary(window, "start")
                     print(
                         f"{PREFIX} rank={self.worker.rank}: {self.case}/{window} profiler start; chunk={chunk}",
                         flush=True,
                     )
                     self.worker.profile(is_start=True, profile_prefix=f"{self.case}_{window}")
+                    print(f"{PREFIX} rank={self.worker.rank}: {self.case}/{window} profiler start complete", flush=True)
                     self.active = window
                     self.attribution = install_transfer_attribution()
                     print(f"{PREFIX} rank={self.worker.rank}: PREFILL_ATTR ranges enabled", flush=True)
@@ -686,6 +748,7 @@ class ChunkProfileCapture:
         try:
             self.stop_window()
         finally:
+            self.cancel_startup_watchdog()
             self.worker.execute_model = self.original_execute
             if self.restore_bind is not None:
                 self.restore_bind()

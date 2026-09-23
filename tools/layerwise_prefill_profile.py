@@ -12,9 +12,11 @@ output token. 80k captures only the first/last three compute-prefill chunks;
 Compute/runtime settings follow the serving P node, with single-host TP8/DP1
 and local CPU cache for this benchmark. Keep host IP/NIC settings in the caller
 environment; deployment paths, Mooncake and API-server options are not needed.
+All model and LMCache settings are defined below; no configuration file is read.
 """
 
 import argparse
+import faulthandler
 import json
 import os
 import shutil
@@ -22,6 +24,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 from layerwise_prefill_check import DEFAULT_PROMPT_FILE, normalize_prompt_token_ids, write_json
@@ -36,6 +39,7 @@ LONG_CASES = ("80k_off", "80k_on")
 DEFAULT_LONG_PROMPT_FILE = DEFAULT_PROMPT_FILE.with_name("article_summary_80k.txt")
 MAX_PROMPT_FIT_ATTEMPTS = 3
 MIN_PROMPT_FRACTION = 0.95
+REQUEST_SUBMISSION_TIMEOUT_SECONDS = 120
 CACHE_CHUNK_TOKENS = 1024
 COMPUTE_CHUNK_TOKENS = 4096
 SHORT_MAX_MODEL_LEN = 16384
@@ -225,6 +229,7 @@ def case_environment(args, case):
             "LMCACHE_DSA_TWO_GROUPS": "true",
             "LMCACHE_STORE_ASYNC": "true",
             "LMCACHE_STORE_ASYNC_MAX_QUEUE_SIZE": "2",
+            "LMCACHE_ENABLE_ASYNC_LOADING": "false",
             "LMCACHE_SAVE_DECODE_CACHE": "false",
             "LMCACHE_SAVE_UNFULL_CHUNK": "true",
             "LMCACHE_SAVE_FULL_CHUNK_IN_DECODE": "false",
@@ -294,9 +299,37 @@ def engine_options(args, case_dir, prompt_len):
     }
 
 
+@contextmanager
+def trace_request_submission(llm, case, case_dir):
+    """Diagnose preprocessing/enqueue stalls without tracing the compute loop."""
+    engine = llm.llm_engine
+    original_add_request = engine.add_request
+    stack_dir = case_dir / "startup-stacks"
+    stack_dir.mkdir(parents=True, exist_ok=True)
+    with (stack_dir / f"frontend-{os.getpid()}.log").open("w", encoding="utf-8") as stack_file:
+        stack_file.write(f"{PREFIX} {case}: frontend request submission; pid={os.getpid()}\n")
+        stack_file.flush()
+        faulthandler.dump_traceback_later(REQUEST_SUBMISSION_TIMEOUT_SECONDS, repeat=False, file=stack_file)
+
+        def add_request(*args, **kwargs):
+            print(f"{PREFIX} {case}: engine add_request begin", flush=True)
+            result = original_add_request(*args, **kwargs)
+            print(f"{PREFIX} {case}: engine add_request returned; waiting for execution", flush=True)
+            faulthandler.cancel_dump_traceback_later()
+            return result
+
+        engine.add_request = add_request
+        try:
+            yield
+        finally:
+            engine.add_request = original_add_request
+            faulthandler.cancel_dump_traceback_later()
+
+
 def capture_request(llm, token_ids, params, case, case_dir=None):
     plan = make_capture_plan(len(token_ids), COMPUTE_CHUNK_TOKENS) if case in LONG_CASES else None
     if plan:
+        plan["startup_diagnostic_dir"] = str((case_dir / "startup-stacks").resolve())
         write_json(case_dir / "capture_plan.json", plan)
         print(f"{PREFIX} {case}: capture windows={plan['windows']}; middle chunks still compute", flush=True)
     print(f"{PREFIX} {case}: profiler start begin", flush=True)
@@ -307,7 +340,8 @@ def capture_request(llm, token_ids, params, case, case_dir=None):
     print(f"{PREFIX} {case}: profiler {'armed' if plan else 'started'}; generate begin", flush=True)
     try:
         start = time.perf_counter()
-        results = llm.generate({"prompt_token_ids": token_ids}, params, use_tqdm=False)
+        with trace_request_submission(llm, case, case_dir):
+            results = llm.generate({"prompt_token_ids": token_ids}, params, use_tqdm=False)
         elapsed = time.perf_counter() - start
         print(f"{PREFIX} {case}: generate complete in {elapsed:.3f}s (prefill/first token finished)", flush=True)
         return results, elapsed
@@ -331,6 +365,16 @@ def capture_request(llm, token_ids, params, case, case_dir=None):
 
 
 def run_child(args):
+    # The normal launcher already removes every inherited LMCACHE_* setting.
+    # Also reject a file override when this internal entry point is used directly.
+    os.environ.pop("LMCACHE_CONFIG_FILE", None)
+    print(
+        f"{PREFIX} configuration: inline profile.py engine options + environment; "
+        "LMCACHE_CONFIG_FILE unset (LMCache's from-environment warning is expected); "
+        f"store_async={os.environ.get('LMCACHE_STORE_ASYNC')}, "
+        f"store_async_max_queue_size={os.environ.get('LMCACHE_STORE_ASYNC_MAX_QUEUE_SIZE')}",
+        flush=True,
+    )
     from vllm import LLM, SamplingParams
 
     case_dir = args.run_dir / args.child
