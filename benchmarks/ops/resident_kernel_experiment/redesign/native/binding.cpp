@@ -57,7 +57,8 @@ void run_impl(at::TensorList t, int64_t universe, int64_t mode, int64_t radius, 
     shape(5, {b,q,16}); shape(6, {b,8}); shape(7, {b,size}); shape(8, {b,n});
     shape(9, {b,n,width}); shape(10, {b,universe,width}); shape(11, {b,n,width});
     const auto bytes = width * t[9].element_size();
-    TORCH_CHECK(bytes > 0 && bytes <= 8192 && bytes % 32 == 0, "KV row must be 32-byte aligned, <=8192 bytes");
+    TORCH_CHECK((!fused && bytes == 0) || (bytes > 0 && bytes <= 8192 && bytes % 32 == 0),
+                "KV row must be 32-byte aligned, <=8192 bytes; zero width is lookup-only");
     const c10_npu::OptionalNPUGuard guard(device);
     int64_t cores = 0;
     TORCH_CHECK(aclGetDeviceCapability(device.index(), ACL_DEVICE_INFO_VECTOR_CORE_NUM, &cores) == ACL_SUCCESS && cores > 0,

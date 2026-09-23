@@ -24,9 +24,9 @@ endif()
 include("${ASCENDC_CMAKE_DIR}/ascendc.cmake")
 # Exactly one explicitly named device entry per translation unit.
 ascendc_library(resident_redesign_kernels SHARED build_table.cpp lookup.cpp resolve_copy.cpp batched_copy.cpp
-    wide_build.cpp tuned_lookup.cpp tuned_copy.cpp)
+    wide_build.cpp tuned_lookup.cpp tuned_copy.cpp pack_sources.cpp)
 find_package(Torch REQUIRED)
-add_library(resident_redesign_ops SHARED binding.cpp)
+add_library(resident_redesign_ops SHARED binding.cpp pack_binding.cpp)
 target_include_directories(resident_redesign_ops PRIVATE ${TORCH_INCLUDE_DIRS} "${TORCH_NPU_PATH}/include" "${ASCEND_HOME_PATH}/include")
 separate_arguments(torch_flags NATIVE_COMMAND "${TORCH_CXX_FLAGS}")
 target_compile_options(resident_redesign_ops PRIVATE ${torch_flags})

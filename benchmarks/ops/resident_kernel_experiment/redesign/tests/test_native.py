@@ -231,3 +231,75 @@ def test_pipelined_grid_stride_replay():
         torch.npu.synchronize()
         assert_safe(updated, snap, native.plan)
         assert torch.equal(native.payload.cpu(), gather_dense(updated, dense.float()))
+
+
+def test_pack_sources_preserves_counted_rows_and_mapping_updates():
+    r, q, k, n = 2, 2, 256, 512
+    plan = torch.arange(r*n).reshape(r, q, k).remainder(n).int()
+    plan[..., ::3] = -1
+    plan[..., 1::5] = -2
+    plan[..., 2::7] = -3
+    tokens = torch.full_like(plan, 17)
+    tokens[plan == -3] = 1031
+    old = torch.arange(n).repeat(r, 1).long()
+    new = old.flip(-1).clone()
+    boundary = torch.full((r,), 1024, dtype=torch.int32)
+    tensors = [x.to('npu') for x in (plan, tokens, old, new, boundary)] + [
+        torch.empty(3, r, n//256, 256, dtype=dtype, device='npu') for dtype in (torch.int32, torch.int64)]
+    tensors.append(torch.empty(3, r, n//256, 16, dtype=torch.int32, device='npu'))
+    for shift in (0, 13, 0):
+        mapping = old.roll(shift, -1)
+        tensors[2].copy_(mapping)
+        torch.ops.resident_redesign.pack_sources_(tensors)
+        torch.npu.synchronize()
+        ids, slots, counts = (x.cpu() for x in tensors[5:])
+        for request in range(r):
+            for tile in range(n//256):
+                bins = [[], [], []]
+                for j in range(tile*256, (tile+1)*256):
+                    src = int(plan.reshape(r, n)[request, j])
+                    if src == -2:
+                        continue
+                    kind = 0 if src == -1 else 2 if src == -3 else 1
+                    token = 17 if kind == 0 else 7 if kind == 2 else int(mapping[request, src])
+                    bins[kind].append((token, int(new[request, j])))
+                for kind, rows in enumerate(bins):
+                    assert int(counts[kind, request, tile, 0]) == len(rows)
+                    assert list(zip(ids[kind, request, tile, :len(rows)].tolist(),
+                                    slots[kind, request, tile, :len(rows)].tolist(), strict=True)) == rows
+
+
+def test_metadata_only_has_no_dense_prefix_payload():
+    query, snap, dense = case(b=1, q=2, k=256, universe=1025)
+    snap = replace(snap, kv=torch.empty(1, 512, 0, dtype=torch.bfloat16))
+    native = NativeCase(query.to('npu'), snap.to('npu'),
+                        torch.empty(1, 1025, 0, dtype=torch.bfloat16, device='npu'), 'hash_snapshot')
+    assert all(t.numel() == 0 for t in native.tensors[9:])
+    native.run(False)
+    torch.npu.synchronize()
+    assert_safe(query, snap, native.plan)
+    with pytest.raises(RuntimeError, match='zero width is lookup-only'):
+        native.run(True)
+
+
+def test_matched_registered_host_sequence(request):
+    original_dir = request.config.getoption('--matched-original-build-dir')
+    lmcache_dir = request.config.getoption('--matched-lmcache-ascend-dir')
+    if original_dir is None or lmcache_dir is None:
+        pytest.skip('provide matched original build and LMCache-Ascend paths for registered-host qualification')
+    from matched import capture, load_original
+    from matched_data import make_trace
+    from matched_runtime import Sources, Original, Replacement, load_transfer_api
+    load_original(original_dir)
+    source = Sources(load_transfer_api(lmcache_dir), make_trace(2, 3, prefix=8192), torch.device('npu', 0))
+    try:
+        for name in ('original', *MODES):
+            runtime = Original(source, source.trace) if name == 'original' else Replacement(source, source.trace, name)
+            graph, _ = capture(runtime)
+            runtime.reset()
+            graph.replay()
+            torch.npu.synchronize()
+            runtime.check(runtime.s-1)
+            del graph, runtime
+    finally:
+        source.close()

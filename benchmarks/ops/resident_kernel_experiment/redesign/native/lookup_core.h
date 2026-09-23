@@ -91,9 +91,11 @@ public:
         epochs.SetGlobalBuffer(reinterpret_cast<__gm__ int64_t*>(a.p[6]));
         table.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(a.p[7]));
         output.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(a.p[8]));
-        oldKV.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(a.p[9]));
-        denseKV.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(a.p[10]));
-        newKV.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(a.p[11]));
+        if constexpr (CopyKV) {
+            oldKV.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(a.p[9]));
+            denseKV.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(a.p[10]));
+            newKV.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(a.p[11]));
+        }
         pipe.InitBuffer(stateBuf, 3 * n * 4);
         pipe.InitBuffer(tableBuf, W * 4);
         pipe.InitBuffer(workBuf, 10 * T * 4 + 2 * (T / 8));

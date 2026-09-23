@@ -6,6 +6,11 @@ Target workload: Ascend 910B3, top-k 2048, **two query rows for one speculative 
 
 ## Status: experimental, not serving-qualified
 
+For the original-three-kernel versus registered-CPU retrieval comparison, see
+[MATCHED_COMPARISON.md](MATCHED_COMPARISON.md). That harness includes source
+adaptation and repeated-step cache maintenance; the earlier HBM-only fixture
+remains available separately.
+
 This directory adds executable candidates and independent correctness tests. It
 **does not replace production serving operators, change `sfa_v1.py`, or enable a
 new serving path**. Existing experiments and the production fallback are untouched.
