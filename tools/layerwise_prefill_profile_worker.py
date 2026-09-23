@@ -163,52 +163,184 @@ def install_dummy_submit_load():
     return lambda: None
 
 
-def install_dummy_prefill_store():
-    """Disable only the P-node layerwise save path for attribution.
+PREFILL_STORE_STAGES = {
+    0: "skip_all_store_work",
+    1: "request_group_dispatch",
+    2: "refresh_and_group_lookup",
+    3: "build_store_inputs_and_mask",
+    4: "resolve_bank_slots_and_block_ids",
+    5: "construct_store_generator",
+    6: "prime_store_generator",
+    7: "run_layer_save_finish_callbacks",
+    8: "run_final_wait_drain_publish",
+    9: "skip_shared_cpu_publication_syncs",
+}
 
-    Keep ``start_load_kv`` and all load-side callbacks intact.  This removes
-    the deferred storer priming/all-layer save preparation and the per-layer
-    save callbacks, while acknowledging the worker save step so the request
-    can finish.  The resulting output is diagnostic-only.
+
+def install_dummy_prefill_store(stage=0):
+    """Run a cumulative prefix of the P-node store path for profiling.
+
+    Native DMA is independently replaced by ``install_dummy_dma``.  Stages
+    0..7 stop progressively earlier in the save path, stage 8 runs the full
+    path, and stage 9 runs the same full path while bypassing only the two
+    foreground synchronizations used by shared CPU publication.  Stage 9 is
+    diagnostic-only: its output and publication ordering are not valid for
+    correctness decisions.
     """
-    from lmcache.integration.vllm.vllm_v1_adapter import (
-        LMCacheConnectorV1Impl,
-    )
+    from lmcache.integration.vllm.vllm_v1_adapter import LMCacheConnectorV1Impl
 
-    def prepare_storers(self, *args, **kwargs):
-        # Keep the load path untouched; only suppress P-node save setup.
+    if stage not in PREFILL_STORE_STAGES:
+        raise ValueError(
+            f"Invalid prefill-store stage {stage}; expected 0..9"
+        )
+
+    original_prepare = LMCacheConnectorV1Impl._prepare_p_node_layerwise_save_storers
+    original_create = LMCacheConnectorV1Impl._create_p_node_layerwise_save_storer
+    original_save_layer = LMCacheConnectorV1Impl.save_kv_layer
+    original_finish_layer = LMCacheConnectorV1Impl.finish_layerwise_prefill_save
+    original_wait = LMCacheConnectorV1Impl.wait_for_save
+
+    def noop(self, *args, **kwargs):
         return None
 
-    def save_layer(self, *args, **kwargs):
-        return None
+    def prime_only_prepare(self, metadata):
+        """Run production preparation while keeping stage 6/7 diagnostic."""
+        engine = getattr(self, "lmcache_engine", None)
+        had_flag = hasattr(engine, "_layerwise_prefill_diagnostic_prime_only")
+        old_flag = getattr(engine, "_layerwise_prefill_diagnostic_prime_only", False)
+        if engine is not None:
+            engine._layerwise_prefill_diagnostic_prime_only = True
+        try:
+            return original_prepare(self, metadata)
+        finally:
+            if engine is not None:
+                if had_flag:
+                    engine._layerwise_prefill_diagnostic_prime_only = old_flag
+                else:
+                    delattr(engine, "_layerwise_prefill_diagnostic_prime_only")
 
-    def finish_layer(self, *args, **kwargs):
-        return None
+    def staged_create(self, request, save_spec, kv_group):
+        """Mirror production setup only through the requested boundary."""
+        assert self._layerwise_prefill_p_node
+        if stage < 2:
+            return None
+
+        self._refresh_kvcaches_list()
+        kvcaches = self._kvcaches_for_group(kv_group)
+        if not kvcaches or stage < 3:
+            return None
+
+        store_inputs = self._prepare_layerwise_store_inputs(
+            request,
+            save_spec,
+            kv_group,
+            materialize_device_slot_mapping=not self._layerwise_prefill_dma,
+        )
+        if store_inputs is None:
+            return None
+        (
+            token_ids,
+            _,
+            store_mask,
+            skip_leading_tokens,
+            store_kwargs,
+            _,
+        ) = store_inputs
+        if request.is_sparse_decode:
+            raise RuntimeError(
+                "Staged P-node store received a decode request: "
+                f"req_id={request.req_id}"
+            )
+        if stage < 4:
+            return None
+
+        slot_mapping = self._layerwise_prefill_slot_mapping(request, kv_group, 0)
+        dma_kwargs = {}
+        if self._layerwise_prefill_dma:
+            dma_kwargs = {
+                "prefill_dma_block_ids_by_bank": self._layerwise_prefill_dma_block_ids(
+                    request, kv_group
+                ),
+                "prefill_dma_block_size": self._block_size,
+            }
+        if stage < 5:
+            return None
+
+        metadata = getattr(self.lmcache_engine, "metadata", None)
+        world_size = getattr(metadata, "world_size", 1) if metadata else 1
+        sync = kv_group == 0 or (self._is_dsa_two_groups() and world_size > 1)
+        return self.lmcache_engine.store_layer(
+            token_ids,
+            mask=store_mask,
+            kvcaches=kvcaches,
+            slot_mapping=slot_mapping,
+            offset=skip_leading_tokens,
+            sync=sync,
+            deferred_layerwise_put=True,
+            layerwise_prefill_incremental=True,
+            layerwise_prefill_bank_count=2,
+            **dma_kwargs,
+            req_id=request.req_id,
+            **store_kwargs,
+        )
 
     def finish_save(self):
-        # Match the minimum request bookkeeping needed by the diagnostic
-        # worker.  No KV is published or persisted in this mode.
+        # Close staged generators and acknowledge request cleanup. No result
+        # is published in stages 0..7.
+        storers = getattr(self, "_layerwise_save_storers", {})
+        for storer in tuple(storers.values()):
+            close = getattr(storer, "close", None)
+            if close is not None:
+                close()
+        storers.clear()
+        getattr(self, "_layerwise_prefill_prepared_storer_keys", set()).clear()
+        getattr(self, "_layerwise_prefill_pending_store_finishes", {}).clear()
         metadata = self._parent._get_connector_metadata()
         for request in metadata.requests:
             self._mark_prefill_committed(request, len(request.token_ids))
         self._complete_worker_save_step()
 
-    replacements = {
-        "_prepare_p_node_layerwise_save_storers": prepare_storers,
-        "save_kv_layer": save_layer,
-        "finish_layerwise_prefill_save": finish_layer,
-        "wait_for_save": finish_save,
-    }
-    originals = [
-        (name, getattr(LMCacheConnectorV1Impl, name))
-        for name in replacements
-    ]
+    replacements = {}
+    if stage == 0:
+        replacements["_prepare_p_node_layerwise_save_storers"] = noop
+    elif 6 <= stage <= 7:
+        replacements["_prepare_p_node_layerwise_save_storers"] = prime_only_prepare
+    elif stage <= 5:
+        replacements["_create_p_node_layerwise_save_storer"] = staged_create
+    if stage <= 6:
+        replacements["save_kv_layer"] = noop
+        replacements["finish_layerwise_prefill_save"] = noop
+    if stage <= 7:
+        replacements["wait_for_save"] = finish_save
+
     for name, replacement in replacements.items():
         setattr(LMCacheConnectorV1Impl, name, replacement)
 
+    publication_owner = None
+    original_publication_sync = None
+    if stage == 9:
+        from lmcache_ascend.v1.npu_connector import npu_connectors
+
+        publication_owner = npu_connectors.VLLMPagedMemLayerwiseNPUConnector
+        original_publication_sync = publication_owner.synchronize_shared_cpu_store_publication
+
+        def skip_publication_sync(self):
+            return None
+
+        publication_owner.synchronize_shared_cpu_store_publication = skip_publication_sync
+
     def restore():
-        for name, original in originals:
-            setattr(LMCacheConnectorV1Impl, name, original)
+        originals = {
+            "_prepare_p_node_layerwise_save_storers": original_prepare,
+            "_create_p_node_layerwise_save_storer": original_create,
+            "save_kv_layer": original_save_layer,
+            "finish_layerwise_prefill_save": original_finish_layer,
+            "wait_for_save": original_wait,
+        }
+        for name in replacements:
+            setattr(LMCacheConnectorV1Impl, name, originals[name])
+        if publication_owner is not None:
+            publication_owner.synchronize_shared_cpu_store_publication = original_publication_sync
 
     return restore
 
@@ -360,7 +492,21 @@ class ChunkProfileCapture:
         dummy_bind = plan.get("dummy_dma_bind", False)
         dummy_submit_load = plan.get("dummy_submit_load", False)
         dummy_prefill_store = plan.get("dummy_prefill_store", False)
-        self.restore_dma = install_dummy_dma() if plan.get("dummy_dma", False) or dummy_prepare or dummy_bind or dummy_submit_load else None
+        dummy_prefill_store_stage = plan.get("dummy_prefill_store_stage")
+        if dummy_prefill_store and dummy_prefill_store_stage is not None:
+            raise ValueError(
+                "capture plan cannot contain both dummy_prefill_store and "
+                "dummy_prefill_store_stage"
+            )
+        if dummy_prefill_store:
+            dummy_prefill_store_stage = 0
+        self.restore_dma = install_dummy_dma() if (
+            plan.get("dummy_dma", False)
+            or dummy_prepare
+            or dummy_bind
+            or dummy_submit_load
+            or dummy_prefill_store_stage is not None
+        ) else None
         self.restore_bind = None
         self.restore_prepare = None
         self.restore_submit_load = None
@@ -388,10 +534,21 @@ class ChunkProfileCapture:
                     flush=True,
                 )
             if dummy_prefill_store:
-                self.restore_prefill_store = install_dummy_prefill_store()
+                self.restore_prefill_store = install_dummy_prefill_store(0)
                 print(
                     f"{PREFIX} rank={worker.rank}: DUMMY PREFILL STORE enabled; "
                     "load path retained, save path skipped; outputs INVALID",
+                    flush=True,
+                )
+            elif dummy_prefill_store_stage is not None:
+                self.restore_prefill_store = install_dummy_prefill_store(
+                    dummy_prefill_store_stage
+                )
+                description = PREFILL_STORE_STAGES[dummy_prefill_store_stage]
+                print(
+                    f"{PREFIX} rank={worker.rank}: DUMMY PREFILL STORE STAGE "
+                    f"{dummy_prefill_store_stage} ({description}); "
+                    "outputs INVALID",
                     flush=True,
                 )
         except BaseException:
