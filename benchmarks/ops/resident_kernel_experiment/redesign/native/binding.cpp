@@ -23,14 +23,23 @@ void run(at::TensorList t, int64_t universe, int64_t mode, int64_t radius, bool 
     TORCH_CHECK(t[7].dim() == 2 && t[9].dim() == 3, "invalid table/payload rank");
     const auto size = t[7].size(1), width = t[9].size(2);
     TORCH_CHECK(size >= 256 && size % 256 == 0, "table must contain whole 256-cell slices");
-    if (mode == 3) TORCH_CHECK(size <= 8192 && (size & (size - 1)) == 0, "hash size must be a power of two <=8192");
-    if (mode == 4) TORCH_CHECK(size == ((universe + 255) / 256) * 256, "directory size mismatch");
-    if (mode <= 2) TORCH_CHECK(size == 256, "non-table modes require a 256-cell placeholder");
+    if (mode == 3) {
+        TORCH_CHECK(size <= 8192 && (size & (size - 1)) == 0, "hash size must be a power of two <=8192");
+    }
+    if (mode == 4) {
+        TORCH_CHECK(size == ((universe + 255) / 256) * 256, "directory size mismatch");
+    }
+    if (mode <= 2) {
+        TORCH_CHECK(size == 256, "non-table modes require a 256-cell placeholder");
+    }
     RedesignLaunch a{};
     for (size_t i = 0; i < t.size(); ++i) {
         TORCH_CHECK(t[i].device() == device && t[i].is_contiguous(), "device/contiguity mismatch at tensor ", i);
-        if (i < 9) TORCH_CHECK(t[i].scalar_type() == (i == 6 ? at::kLong : at::kInt), "metadata dtype mismatch");
-        else TORCH_CHECK(t[i].scalar_type() == t[9].scalar_type(), "KV dtypes differ");
+        if (i < 9) {
+            TORCH_CHECK(t[i].scalar_type() == (i == 6 ? at::kLong : at::kInt), "metadata dtype mismatch");
+        } else {
+            TORCH_CHECK(t[i].scalar_type() == t[9].scalar_type(), "KV dtypes differ");
+        }
         a.p[i] = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(t[i].data_ptr()));
         TORCH_CHECK(a.p[i] % 32 == 0, "unaligned buffer");
         for (size_t j = 0; j < i; ++j) {

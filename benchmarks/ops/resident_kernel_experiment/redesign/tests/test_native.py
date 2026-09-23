@@ -92,6 +92,20 @@ def test_native_2048_graph_replays_change_epochs_and_values(variant):
         torch.testing.assert_close(payload.cpu(), gather_dense(updated, dense), rtol=0, atol=0)
 
 
+@pytest.mark.parametrize('index,dtype,message', (
+    (0, torch.int64, 'metadata dtype mismatch'),
+    (6, torch.int32, 'metadata dtype mismatch'),
+    (11, torch.float16, 'KV dtypes differ'),
+))
+def test_native_rejects_mismatched_dtypes(index, dtype, message):
+    query, snap, dense = case(b=1, q=2, k=256)
+    snap = replace(snap, kv=snap.kv.float())
+    native = NativeCase(query.to('npu'), snap.to('npu'), dense.float().to('npu'), 'fixed_position')
+    native.tensors[index] = native.tensors[index].to(dtype)
+    with pytest.raises(RuntimeError, match=message):
+        native.run(True)
+
+
 def test_native_rejects_aliases():
     query, snap, dense = case(b=1, q=2, k=256)
     snap = replace(snap, kv=snap.kv.float())
