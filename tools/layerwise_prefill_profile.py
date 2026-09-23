@@ -107,6 +107,7 @@ def parser():
         choices=range(10),
         help=(
             "Cumulatively run the P-node store path through stage 0..9; "
+            "stage 8 finalizes stores, stage 9 adds publish/release; "
             "all stages imply dummy DMA and produce invalid output"
         ),
     )

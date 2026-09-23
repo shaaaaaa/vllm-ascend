@@ -172,8 +172,8 @@ PREFILL_STORE_STAGES = {
     5: "construct_store_generator",
     6: "prime_store_generator",
     7: "run_layer_save_finish_callbacks",
-    8: "run_final_wait_drain_publish",
-    9: "skip_shared_cpu_publication_syncs",
+    8: "finalize_storers_and_promote_request_state",
+    9: "publish_frontier_and_release_request_pins",
 }
 
 
@@ -181,11 +181,11 @@ def install_dummy_prefill_store(stage=0):
     """Run a cumulative prefix of the P-node store path for profiling.
 
     Native DMA is independently replaced by ``install_dummy_dma``.  Stages
-    0..7 stop progressively earlier in the save path, stage 8 runs the full
-    path, and stage 9 runs the same full path while bypassing only the two
-    foreground synchronizations used by shared CPU publication.  Stage 9 is
-    diagnostic-only: its output and publication ordering are not valid for
-    correctness decisions.
+    0..7 stop progressively earlier in the save path. Stage 8 performs only
+    the store completion needed to carry the next chunk: it drains each
+    storer, consumes its result, and keeps the result request-owned. Stage 9
+    adds the frontier publication and lookup-pin release after stage 8. Both
+    stages are diagnostic-only because native DMA is replaced separately.
     """
     from lmcache.integration.vllm.vllm_v1_adapter import LMCacheConnectorV1Impl
 
@@ -284,7 +284,7 @@ def install_dummy_prefill_store(stage=0):
             **store_kwargs,
         )
 
-    def finish_save(self):
+    def finish_save_stage7(self):
         # Close staged generators and acknowledge request cleanup. No result
         # is published in stages 0..7.
         storers = getattr(self, "_layerwise_save_storers", {})
@@ -300,6 +300,57 @@ def install_dummy_prefill_store(stage=0):
             self._mark_prefill_committed(request, len(request.token_ids))
         self._complete_worker_save_step()
 
+    def finish_save_stage8(self, publish=False):
+        """Complete stores needed for the following chunk.
+
+        This is the smallest post-forward operation that leaves the
+        layerwise storer maps in a usable state. It deliberately leaves
+        frontier publication and lookup-pin release to stage 9 so the two
+        costs can be measured separately.
+        """
+        metadata = self._parent._get_connector_metadata()
+        if not self.use_layerwise or self.kv_role == "kv_consumer":
+            return original_wait(self)
+        try:
+            if self._should_defer_latent_save_under_tp():
+                for request in metadata.requests:
+                    key = self._layerwise_save_storer_key(request, 0)
+                    if key in getattr(self, "_deferred_latent_pending", set()):
+                        self._flush_deferred_latent_store(request, request.save_spec)
+
+            for request in metadata.requests:
+                for kv_group in (0, 1):
+                    storer_key = self._layerwise_save_storer_key(request, kv_group)
+                    pending_layer = getattr(
+                        self, "_layerwise_prefill_pending_store_finishes", {}
+                    ).get(storer_key)
+                    if pending_layer is not None:
+                        raise RuntimeError(
+                            "diagnostic stage reached a storer before its "
+                            f"post-HCOM finish hook: req_id={request.req_id}, "
+                            f"kv_group={kv_group}, layer={pending_layer}"
+                        )
+                    storer = self._layerwise_save_storers.pop(storer_key, None)
+                    getattr(
+                        self, "_layerwise_prefill_prepared_storer_keys", set()
+                    ).discard(storer_key)
+                    if storer is not None:
+                        completed, store_result = self._finalize_layerwise_storer(storer)
+                        self._consume_completed_layerwise_store(
+                            request, kv_group, completed, store_result
+                        )
+
+                if publish:
+                    if self._is_decode_window_save_request(request):
+                        self._mark_decode_window_save_completed(request)
+                    self._mark_prefill_committed(request)
+                    self._mark_initial_sparse_release_ready(request)
+                    self._maybe_lookup_unpin_for_request(request)
+            self._complete_worker_save_step()
+        except BaseException:
+            self._abort_save_step(metadata.requests)
+            raise
+
     replacements = {}
     if stage == 0:
         replacements["_prepare_p_node_layerwise_save_storers"] = noop
@@ -311,23 +362,14 @@ def install_dummy_prefill_store(stage=0):
         replacements["save_kv_layer"] = noop
         replacements["finish_layerwise_prefill_save"] = noop
     if stage <= 7:
-        replacements["wait_for_save"] = finish_save
+        replacements["wait_for_save"] = finish_save_stage7
+    elif stage == 8:
+        replacements["wait_for_save"] = finish_save_stage8
+    elif stage == 9:
+        replacements["wait_for_save"] = lambda self: finish_save_stage8(self, publish=True)
 
     for name, replacement in replacements.items():
         setattr(LMCacheConnectorV1Impl, name, replacement)
-
-    publication_owner = None
-    original_publication_sync = None
-    if stage == 9:
-        from lmcache_ascend.v1.npu_connector import npu_connectors
-
-        publication_owner = npu_connectors.VLLMPagedMemLayerwiseNPUConnector
-        original_publication_sync = publication_owner.synchronize_shared_cpu_store_publication
-
-        def skip_publication_sync(self):
-            return None
-
-        publication_owner.synchronize_shared_cpu_store_publication = skip_publication_sync
 
     def restore():
         originals = {
@@ -339,9 +381,6 @@ def install_dummy_prefill_store(stage=0):
         }
         for name in replacements:
             setattr(LMCacheConnectorV1Impl, name, originals[name])
-        if publication_owner is not None:
-            publication_owner.synchronize_shared_cpu_store_publication = original_publication_sync
-
     return restore
 
 
