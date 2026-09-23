@@ -8,6 +8,10 @@ P-node layerwise path with ``VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE=true``. Each
 case uses a fresh model process and executes one request through its first
 output token. 80k captures only the first/last three compute-prefill chunks;
 10k captures the whole request. Model startup is outside capture.
+
+Compute/runtime settings follow the serving P node, with single-host TP8/DP1
+and local CPU cache for this benchmark. Keep host IP/NIC settings in the caller
+environment; deployment paths, Mooncake and API-server options are not needed.
 """
 
 import argparse
@@ -85,7 +89,7 @@ def check_shm_capacity(shm_dir: Path, cache_gb: float) -> None:
 
 def parser():
     cli = argparse.ArgumentParser(description=__doc__)
-    cli.add_argument("--model", default="/workspace/models/GLM-5.2-w4a8c8-0723")
+    cli.add_argument("--model", default="/workspace/models/GLM-5.1-w4a8")
     cli.add_argument("--devices", default="0,1,2,3,4,5,6,7")
     cli.add_argument("--prompt-file", type=Path, help="Override the fixed 10k/80k example article")
     cli.add_argument("--cpu-cache-gb", type=float, default=24, help="Requires this much free /dev/shm and host RAM")
@@ -179,20 +183,40 @@ def case_environment(args, case):
         {
             "ASCEND_RT_VISIBLE_DEVICES": args.devices,
             "PYTHONHASHSEED": "0",
-            "HCCL_DETERMINISTIC": "strict",
+            "HCCL_OP_EXPANSION_MODE": "AIV",
+            "HCCL_INTRA_ROCE_ENABLE": "1",
             "HCCL_BUFFSIZE": "200",
             "MSMONITOR_USE_DAEMON": "0",
+            "OMP_PROC_BIND": "false",
+            "OMP_NUM_THREADS": "10",
+            "VLLM_USE_V1": "1",
             "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
             "PYTHONPATH": str(Path(__file__).resolve().parent) + os.pathsep + env.get("PYTHONPATH", ""),
+            "LD_LIBRARY_PATH": "/usr/local/lib:" + env.get("LD_LIBRARY_PATH", ""),
+            "ASCEND_BUFFER_POOL": "4:8",
             "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
+            "VLLM_LOG_STATS_INTERVAL": "1",
             "VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE": str(case.endswith("_on")).lower(),
             "VLLM_ASCEND_DSA_UNBUNDLE": "1",
             "VLLM_ASCEND_DSA_TWO_GROUPS": "1",
             "VLLM_ASCEND_DSA_SHARED_POOL": "1",
-            "VLLM_ASCEND_DSA_SHRINK_LATENT": "0",
+            "VLLM_ASCEND_DSA_SHRINK_LATENT": "2",
             "VLLM_ASCEND_DSA_DISABLE_INDEX_LMCACHE": "0",
+            "VLLM_ASCEND_DSA_DISABLE_TARGET_SLOT_MAPPING": "0",
             "VLLM_ASCEND_ENABLE_FLASHCOMM1": "1",
             "VLLM_ASCEND_ENABLE_MATMUL_ALLREDUCE": "0",
+            "VLLM_ASCEND_BALANCE_SCHEDULING": "1",
+            "TASK_QUEUE_ENABLE": "1",
+            "CPU_AFFINITY_CONF": "1",
+            "ASCEND_AGGREGATE_ENABLE": "1",
+            "ASCEND_TRANSPORT_PRINT": "1",
+            "ACL_OP_INIT_MODE": "1",
+            "VLLM_NIXL_ABORT_REQUEST_TIMEOUT": "600",
+            "VLLM_ALLOW_LONG_MAX_MODEL_LEN": "1",
+            "PD_SERVING_PERF": "detail",
+            "VLLM_SERVER_DEV_MODE": "1",
+            "VLLM_ENGINE_READY_TIMEOUT_S": "1800",
+            "LMCACHE_ASCEND_SPARSE_TRANSFER_TOPK": "2048",
             "LMCACHE_CHUNK_SIZE": str(CACHE_CHUNK_TOKENS),
             "LMCACHE_LOCAL_CPU": "true",
             "LMCACHE_MAX_LOCAL_CPU_SIZE": str(args.cpu_cache_gb),
@@ -206,7 +230,12 @@ def case_environment(args, case):
             "LMCACHE_SAVE_FULL_CHUNK_IN_DECODE": "false",
             "LMCACHE_ENABLE_SHARED_CPU_CACHE": "true",
             "LMCACHE_SHARED_CPU_CACHE_STRICT": "true",
+            "LMCACHE_SHARED_CPU_CACHE_NUMA_POLICY": "interleave",
             "LMCACHE_SHARED_CPU_CACHE_PASSIVE_WRITABLE": "true",
+            "LMCACHE_LOOKUP_TIMEOUT_MS": "30000",
+            "LMCACHE_EXPERIMENTAL_SAMPLED_LAYERWISE_LOOKUP": "true",
+            "LMCACHE_PIN_TIMEOUT_SEC": "1800",
+            "LMCACHE_ENABLE_NPU_CONTENT_DIAGNOSTICS": "false",
             "LMCACHE_EXTRA_CONFIG": json.dumps({"save_only_first_rank": True}),
         }
     )
@@ -237,7 +266,7 @@ def engine_options(args, case_dir, prompt_len):
         "max_num_batched_tokens": COMPUTE_CHUNK_TOKENS,
         "enable_chunked_prefill": True,
         "enable_prefix_caching": False,
-        "async_scheduling": False,
+        "async_scheduling": None,  # Use the same automatic selection as vllm serve.
         "enforce_eager": True,  # Same P-only execution mode for OFF and ON.
         "seed": 1024,
         "speculative_config": {"method": "deepseek_mtp", "num_speculative_tokens": 1},
@@ -251,7 +280,7 @@ def engine_options(args, case_dir, prompt_len):
         },
         "kv_transfer_config": {
             "kv_connector": "LMCacheAscendConnectorV1Dynamic",
-            "kv_role": "kv_producer",
+            "kv_role": "kv_both",
             "kv_connector_module_path": "lmcache_ascend.integration.vllm.lmcache_ascend_connector_v1",
         },
         "profiler_config": {
@@ -400,7 +429,25 @@ def run_cases(args, root, cases):
             str(args.cpu_cache_gb),
         ]
         env = case_environment(args, case)
-        write_json(case_dir / "environment.json", {k: v for k, v in env.items() if k.startswith(("LMCACHE_", "VLLM_"))})
+        write_json(
+            case_dir / "environment.json",
+            {
+                k: v
+                for k, v in env.items()
+                if k.startswith(("LMCACHE_", "VLLM_", "HCCL_", "ASCEND_", "OMP_", "PYTORCH_NPU_"))
+                or k
+                in {
+                    "TASK_QUEUE_ENABLE",
+                    "CPU_AFFINITY_CONF",
+                    "ACL_OP_INIT_MODE",
+                    "PD_SERVING_PERF",
+                    "MSMONITOR_USE_DAEMON",
+                    "GLOO_SOCKET_IFNAME",
+                    "TP_SOCKET_IFNAME",
+                    "PYTHONHASHSEED",
+                }
+            },
+        )
         proc = start_logged_process(command, env, case_dir / "server.log", case, prefix=PREFIX)
         try:
             if proc.wait():
