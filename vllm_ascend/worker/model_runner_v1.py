@@ -113,6 +113,7 @@ from vllm_ascend.attention.utils import (
     AscendCommonAttentionMetadata,
     ColdResumeMarkers,
     get_lmcache_sparse_cached_tokens,
+    native_sfa_cold_resume_layout,
     staged_sfa_connector_supports_sparse_load,
     staged_sfa_metadata_sparse_route,
     unwrap_staged_sfa_connector_metadata,
@@ -178,6 +179,7 @@ from vllm_ascend.utils import (
     lmhead_tp_enable,
     parse_layer_idx,
     set_weight_prefetch_method,
+    sparse_kv_cache_has_indexer,
     staged_sfa_graph_capture_sizes,
     staged_sfa_graph_configuration_errors,
     staged_sfa_graph_configured,
@@ -4141,8 +4143,7 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
         is_decode_state = self.attn_state == expected_state
         possible_cold_resume = False
         if (
-            is_decode_state
-            and not graph_configured
+            not (is_decode_state and graph_configured)
             and num_computed_tokens is not None
             and prompt_lens is not None
         ):
@@ -4153,7 +4154,7 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                 and prompt_probe.shape == (num_reqs,)
                 and bool(np.any(computed_probe < prompt_probe))
             )
-        if is_decode_state and (graph_configured or possible_cold_resume):
+        if is_decode_state and graph_configured:
             metadata_reason, frontiers, cold_resumes = (
                 staged_sfa_metadata_sparse_route(
                     unwrap_staged_sfa_connector_metadata(
@@ -4161,6 +4162,12 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                     ),
                     request_ids,
                 )
+            )
+        elif possible_cold_resume:
+            frontiers, cold_resumes = native_sfa_cold_resume_layout(
+                unwrap_staged_sfa_connector_metadata(kv_connector_metadata),
+                request_ids,
+                num_computed_tokens,
             )
         else:
             frontiers = ()
@@ -4503,6 +4510,37 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
             for request_index in range(batch_size)
         ]
 
+    def _staged_sfa_dummy_seq_len(self, *, requested_seq_len: int, query_width: int) -> int:
+        """Bound synthetic capture data by the model and both logical KV tables.
+
+        The PA workspace heuristic is not a minimum SFA sequence length. SFA
+        keeps sequence lengths as live replay inputs; only its synthetic warmup
+        data is bounded here. Physical pool sizes are checked separately when
+        dummy rows are mapped, since each row reuses one block for its history.
+        """
+        if requested_seq_len <= 0 or query_width <= 0:
+            raise ValueError("Staged SFA dummy sequence length and query width must be positive")
+        block_tables = getattr(self.input_batch.block_table, "block_tables", None)
+        if block_tables is None or len(block_tables) != 2:
+            raise RuntimeError("The staged SFA dummy batch requires exactly two KV block tables")
+        capacity = int(self.max_model_len)
+        for block_table in block_tables:
+            cp_world_size = max(
+                1,
+                int(getattr(block_table, "dcp_world_size", 1))
+                * int(getattr(block_table, "pcp_world_size", 1)),
+            )
+            logical_capacity = (
+                int(block_table.block_table.np.shape[1]) * int(block_table.block_size) * cp_world_size
+            )
+            capacity = min(capacity, logical_capacity)
+        if capacity < query_width:
+            raise RuntimeError(
+                "Staged SFA dummy capacity cannot hold one decode query: "
+                f"capacity={capacity}, query_width={query_width}"
+            )
+        return max(query_width, min(int(requested_seq_len), capacity))
+
     def _prepare_staged_sfa_dummy_block_tables(
         self,
         *,
@@ -4822,18 +4860,22 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
             # seq_lens. We use this seq_len only when capturing graph, and still use max_query_len
             # in inference. This will be removed once npu_fused_infer_attention_score
             # outperforms _npu_paged_attention on all cases.
-            # The staged SFA POC reuses 6144 only as bounded dummy data. Its
-            # indexer/SFA capacity is fixed by the max-model-length block-table
-            # width, while seq_lens remains a live tensor input during replay.
-            # That makes changing lengths plausible, but the torch_npu
-            # lightning-indexer branch still requires live numerical parity.
-            if profile_seq_lens is not None:
+            # Staged SFA also uses this heuristic, but its synthetic positions
+            # must fit the configured context and every logical block table.
+            # seq_lens remains a live tensor input during replay.
+            if staged_sfa_graph_dummy_run:
+                seq_lens = self._staged_sfa_dummy_seq_len(
+                    requested_seq_len=(
+                        profile_seq_lens if profile_seq_lens is not None else SEQ_LEN_WITH_MAX_PA_WORKSPACE
+                    ),
+                    query_width=max_query_len,
+                )
+            elif profile_seq_lens is not None:
                 seq_lens = profile_seq_lens
             else:
                 seq_lens = (
                     SEQ_LEN_WITH_MAX_PA_WORKSPACE
-                    if staged_sfa_graph_dummy_run
-                    or (
+                    if (
                         is_graph_capturing
                         and using_paged_attention(
                             num_tokens,
@@ -5522,12 +5564,24 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                         dsa_k_tensor_size = int(kv_cache_tensor.size)  # whole page = indexer
                     elif self.use_sparse:
                         # for deepseek v3.2, we split the kv cache according to the corresponding ratio
-                        sparse_kv_cache_ratio = layer_kv_cache_spec[layer_name].sparse_kv_cache_ratio
-                        k_tensor_size = int(kv_cache_tensor.size // sparse_kv_cache_ratio[0])
-                        v_tensor_size = int(kv_cache_tensor.size // sparse_kv_cache_ratio[1])
-                        dsa_k_tensor_size = int(kv_cache_tensor.size // sparse_kv_cache_ratio[2])
-                        if self.use_sparse_c8_indexer:
-                            dsa_k_scale_tensor_size = int(kv_cache_tensor.size // sparse_kv_cache_ratio[3])
+                        # Shared-indexer consumers own no indexer key plane, so their
+                        # tensor splits into latent k/v only.
+                        has_indexer_cache = sparse_kv_cache_has_indexer(
+                            layer_kv_cache_spec[layer_name]
+                        )
+                        if has_indexer_cache:
+                            sparse_kv_cache_ratio = layer_kv_cache_spec[layer_name].sparse_kv_cache_ratio
+                            k_tensor_size = int(kv_cache_tensor.size // sparse_kv_cache_ratio[0])
+                            v_tensor_size = int(kv_cache_tensor.size // sparse_kv_cache_ratio[1])
+                            dsa_k_tensor_size = int(kv_cache_tensor.size // sparse_kv_cache_ratio[2])
+                            if self.use_sparse_c8_indexer:
+                                dsa_k_scale_tensor_size = int(kv_cache_tensor.size // sparse_kv_cache_ratio[3])
+                        else:
+                            assert not self.use_sparse_c8_indexer
+                            k_dim, v_dim, _ = layer_kv_cache_spec[layer_name].sparse_head_dim
+                            k_tensor_split_factor, v_tensor_split_factor = calc_split_factor([k_dim, v_dim])
+                            k_tensor_size = int(kv_cache_tensor.size // k_tensor_split_factor)
+                            v_tensor_size = int(kv_cache_tensor.size // v_tensor_split_factor)
                     else:
                         k_dim, v_dim = self._get_attention_kv_cache_dims(layer_name, current_kv_cache_spec)
                         assert k_dim > 0 and v_dim > 0
@@ -5664,6 +5718,7 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                 # TODO: remove this after the OOM issue is located and fixed, otherwise, some model may
                 # encounter OOM issue
                 if isinstance(current_kv_cache_spec, AttentionSpec):
+                    has_indexer_cache = sparse_kv_cache_has_indexer(current_kv_cache_spec)
                     if self.use_sparse:
                         if self.use_sparse_c8_indexer:
                             raw_k_tensor, raw_v_tensor, raw_dsa_k_tensor, raw_dsa_k_scale_tensor = kv_cache_raw_tensors[  # type: ignore
@@ -5676,6 +5731,12 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                                 + raw_dsa_k_tensor.numel()
                                 + raw_dsa_k_scale_tensor.numel()
                             )
+                        elif not has_indexer_cache:
+                            # Shared-indexer consumer: latent k/v only.
+                            assert not self.use_sparse_c8_indexer
+                            raw_k_tensor, raw_v_tensor = kv_cache_raw_tensors[  # type: ignore
+                                layer_name]
+                            sum_page_size_bytes = raw_k_tensor.numel() + raw_v_tensor.numel()
                         else:
                             raw_k_tensor, raw_v_tensor, raw_dsa_k_tensor = kv_cache_raw_tensors[  # type: ignore
                                 layer_name]
@@ -5771,33 +5832,38 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                     v_cache = raw_v_tensor.view(v_cache_dtype).view(v_shape)
 
                     if self.use_sparse:
-                        dsa_k_cache_shape = (
-                            num_blocks,
-                            current_kv_cache_spec.block_size,
-                            current_kv_cache_spec.num_kv_heads,
-                            self.model_config.hf_text_config.index_head_dim,
-                        )
-                        if self.use_sparse_c8_indexer:
-                            # dsa_k
-                            dsa_k_cache = raw_dsa_k_tensor.view(self.c8_k_cache_dtype).view(dsa_k_cache_shape)
-                            # dsa_k_scale
-                            dsa_k_scale_cache_shape = (
+                        if not has_indexer_cache:
+                            # Shared-indexer consumer: no dsa_k plane was
+                            # allocated for this layer.
+                            kv_caches[layer_name] = (k_cache, v_cache)
+                        else:
+                            dsa_k_cache_shape = (
                                 num_blocks,
                                 current_kv_cache_spec.block_size,
                                 current_kv_cache_spec.num_kv_heads,
-                                1,
+                                self.model_config.hf_text_config.index_head_dim,
                             )
-                            assert raw_dsa_k_scale_tensor is not None
-                            dsa_k_scale_cache = (
-                                raw_dsa_k_scale_tensor
-                                .view(self.c8_k_scale_cache_dtype)
-                                .view(dsa_k_scale_cache_shape)
-                            )
-                            kv_caches[layer_name] = (k_cache, v_cache, dsa_k_cache, dsa_k_scale_cache)
-                        else:
-                            # dsa_k
-                            dsa_k_cache = raw_dsa_k_tensor.view(current_kv_cache_spec.dtype).view(dsa_k_cache_shape)
-                            kv_caches[layer_name] = (k_cache, v_cache, dsa_k_cache)
+                            if self.use_sparse_c8_indexer:
+                                # dsa_k
+                                dsa_k_cache = raw_dsa_k_tensor.view(self.c8_k_cache_dtype).view(dsa_k_cache_shape)
+                                # dsa_k_scale
+                                dsa_k_scale_cache_shape = (
+                                    num_blocks,
+                                    current_kv_cache_spec.block_size,
+                                    current_kv_cache_spec.num_kv_heads,
+                                    1,
+                                )
+                                assert raw_dsa_k_scale_tensor is not None
+                                dsa_k_scale_cache = (
+                                    raw_dsa_k_scale_tensor
+                                    .view(self.c8_k_scale_cache_dtype)
+                                    .view(dsa_k_scale_cache_shape)
+                                )
+                                kv_caches[layer_name] = (k_cache, v_cache, dsa_k_cache, dsa_k_scale_cache)
+                            else:
+                                # dsa_k
+                                dsa_k_cache = raw_dsa_k_tensor.view(current_kv_cache_spec.dtype).view(dsa_k_cache_shape)
+                                kv_caches[layer_name] = (k_cache, v_cache, dsa_k_cache)
                     else:
                         kv_caches[layer_name] = (k_cache, v_cache)
                 elif isinstance(current_kv_cache_spec, MambaSpec):
@@ -6099,12 +6165,32 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                         # DSA offload (M-B): paged cache holds ONLY the indexer key;
                         # latent lives in the PagedLatentPool. Per-token page shrinks
                         # from sum(704) to index_head_dim -> ~5.5x more blocks.
+                        if not getattr(attn_module.impl, "has_indexer", True):
+                            raise NotImplementedError(
+                                "DSA free-paged offload requires every sparse "
+                                "layer to own an indexer; shared-indexer "
+                                f"consumer layer {layer_name} has none."
+                            )
                         index_head_dim = self.sparse_head_dim[-1]
                         kv_cache_spec[layer_name] = AscendMLAAttentionSpec(
                             block_size=self.block_size,
                             num_kv_heads=1,
                             head_size=index_head_dim,
                             sparse_head_dim=(index_head_dim,),
+                            dtype=self.kv_cache_dtype,
+                            cache_dtype_str=self.vllm_config.cache_config.cache_dtype,
+                            cache_sparse_c8=False,
+                        )
+                    elif not getattr(attn_module.impl, "has_indexer", True):
+                        # Bundled shared-indexer consumer (GLM-5.2): the layer
+                        # reuses a producer's top-k and owns no indexer key, so
+                        # its page covers only the latent (k_nope + k_pe).
+                        kv_lora_rank, qk_rope_head_dim = self.sparse_head_dim[:2]
+                        kv_cache_spec[layer_name] = AscendMLAAttentionSpec(
+                            block_size=self.block_size,
+                            num_kv_heads=1,
+                            head_size=kv_lora_rank + qk_rope_head_dim,
+                            sparse_head_dim=(kv_lora_rank, qk_rope_head_dim, 0),
                             dtype=self.kv_cache_dtype,
                             cache_dtype_str=self.vllm_config.cache_config.cache_dtype,
                             cache_sparse_c8=False,
@@ -6163,6 +6249,60 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
             for layer_name in attn_layer_names:
                 if kv_cache_spec[layer_name].page_size_bytes < mamba_page_size_padded:
                     object.__setattr__(kv_cache_spec[layer_name], "page_size_padded", mamba_page_size_padded)
+
+        if self.use_sparse:
+            # Startup artifact for shared-indexer models (GLM-5.2): report the
+            # registered cache topology derived from runtime construction. The
+            # expected values (e.g. 79 LATENT / 22 INDEXER with MTP1) are a
+            # validation gate, never hardcoded production constants.
+            latent_names = [
+                name
+                for name, spec in kv_cache_spec.items()
+                if isinstance(spec, MLAAttentionSpec)
+                and "indexer" not in name
+                and getattr(spec, "sparse_head_dim", None) is not None
+            ]
+            indexer_names = [
+                name
+                for name, spec in kv_cache_spec.items()
+                if isinstance(spec, MLAAttentionSpec) and "indexer" in name
+            ]
+            if indexer_names:
+                num_hidden_layers = getattr(
+                    self.model_config.hf_text_config, "num_hidden_layers", None
+                )
+                model_layers = sorted(
+                    {
+                        int(name.split(".")[2])
+                        for name in indexer_names + latent_names
+                        if len(name.split(".")) > 2 and name.split(".")[2].isdigit()
+                    }
+                )
+                logger.info(
+                    "DSA cache registration: latent_layers=%d indexer_layers=%d "
+                    "indexer_model_layers=%s mtp_layers=%s",
+                    len(latent_names),
+                    len(indexer_names),
+                    [
+                        int(name.split(".")[2])
+                        for name in indexer_names
+                        if num_hidden_layers is not None
+                        and int(name.split(".")[2]) < num_hidden_layers
+                    ],
+                    [
+                        int(name.split(".")[2])
+                        for name in indexer_names
+                        if num_hidden_layers is not None
+                        and int(name.split(".")[2]) >= num_hidden_layers
+                    ],
+                )
+                if len(latent_names) != len(model_layers):
+                    raise ValueError(
+                        "DSA cache registration is inconsistent: "
+                        f"{len(latent_names)} latent layers vs "
+                        f"{len(model_layers)} model layers with a registered "
+                        "cache. Shared consumers must still register LATENT."
+                    )
 
         return kv_cache_spec
 

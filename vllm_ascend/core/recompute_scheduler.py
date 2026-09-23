@@ -129,6 +129,8 @@ class RecomputeScheduler(Scheduler):
             getattr(self.scheduler_config, "mc2_recovery_token_budget", None)
             or self.max_num_scheduled_tokens
         )
+        # Match the per-request scratch rows reserved by DSALatentManager.
+        self._dsa_query_rows = self.kv_cache_config.dsa_num_speculative_tokens + 1
         self._checkpoint_capture_enabled = bool(getattr(self.connector, "supports_preemption_checkpoint", False))
         # When is_mtp_kv_consumer is true, we will fill request.spec_token_ids
         # with placeholder tokens to enable full graph when decode nodes pull
@@ -156,6 +158,9 @@ class RecomputeScheduler(Scheduler):
         assert request.status == RequestStatus.RUNNING, "Only running requests can be preempted"
         request.kv_resume_checkpoint = None
         super()._preempt_request(request, timestamp)
+        # The old compact blocks are gone. A new async compact allocation
+        # restores this flag; a dense cache-miss recovery must not inherit it.
+        request.dsa_compact_allocated = False
 
     def _update_waiting_for_remote_kv(self, request: Request) -> None:
         """Retry an expected checkpoint miss after all-worker receive completion."""
@@ -268,6 +273,8 @@ class RecomputeScheduler(Scheduler):
             if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
                 num_new_tokens = self.scheduler_config.long_prefill_token_threshold
             num_new_tokens = min(num_new_tokens, token_budget)
+            if num_new_tokens > self._dsa_query_rows and request.dsa_compact_allocated:
+                num_new_tokens = self._dsa_query_rows
 
             # Make sure the input position does not exceed the max model len.
             # This is necessary when using spec decoding.
@@ -571,6 +578,8 @@ class RecomputeScheduler(Scheduler):
                         break
 
                     num_new_tokens = min(num_new_tokens, token_budget)
+                    if num_new_tokens > self._dsa_query_rows and request.dsa_compact_allocated:
+                        num_new_tokens = self._dsa_query_rows
                     assert num_new_tokens > 0
 
                     # Schedule encoder inputs.

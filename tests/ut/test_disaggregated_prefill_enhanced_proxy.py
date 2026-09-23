@@ -468,6 +468,85 @@ class TestEnhancedRemoteFillProxy(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_concurrent_requests_wait_for_the_same_initial_discovery(self):
+        state = proxy.ProxyState(
+            [("prefiller", 8001)], [("decoder", 8002)],
+            enable_remote_lmcache_store=True,
+        )
+        proxy.proxy_state = state
+        decoder = state.decoders[0]
+        placement = _prime_remote_fill(state, dp_rank=1, api_dp_rank=0)
+        result = dict(placement.decoder_remote_fill)
+        decoder.decoder_remote_fill = {}
+        decoder.decoder_placement_discovered_at = 0.0
+
+        async def run():
+            started, release = asyncio.Event(), asyncio.Event()
+
+            async def discover(*args, **kwargs):
+                started.set()
+                await release.wait()
+                return result
+
+            async def reserve():
+                await state.ensure_decoder_remote_fill(decoder, wait_for_result=True)
+                reservation = proxy.DecoderReservation(decoder, 0, 1.0)
+                return state.assign_decoder_rank(reservation)
+
+            with patch.object(proxy, "_discover_decoder_remote_fill", side_effect=discover) as rpc:
+                first = asyncio.create_task(reserve())
+                await started.wait()
+                followers = [asyncio.create_task(reserve()) for _ in range(15)]
+                await asyncio.sleep(0)
+                returned_early = sum(task.done() for task in followers)
+                release.set()
+                reservations = await asyncio.gather(first, *followers)
+                self.assertEqual(returned_early, 0)
+                self.assertEqual(rpc.await_count, 1)
+                for reservation in reservations:
+                    self.assertEqual(reservation.remote_fill["destination_dp_rank"], 1)
+                    self.assertEqual(reservation.api_dp_rank, 0)
+                    state.release_decoder(0, 1.0, reservation.dp_rank)
+                await state.ensure_decoder_remote_fill(decoder, wait_for_result=True)
+                self.assertEqual(rpc.await_count, 1)
+
+        asyncio.run(run())
+
+    def test_cancelling_discovery_waiter_keeps_shared_discovery_alive(self):
+        state = proxy.ProxyState(
+            [("prefiller", 8001)], [("decoder", 8002)],
+            enable_remote_lmcache_store=True,
+        )
+        proxy.proxy_state = state
+        decoder = state.decoders[0]
+
+        async def run():
+            started, release = asyncio.Event(), asyncio.Event()
+
+            async def discover(*args, **kwargs):
+                started.set()
+                await release.wait()
+                return {}  # Negative discovery retains its existing fallback/TTL.
+
+            with patch.object(proxy, "_discover_decoder_remote_fill", side_effect=discover) as rpc:
+                first = asyncio.create_task(state.ensure_decoder_remote_fill(decoder, wait_for_result=True))
+                await started.wait()
+                second = asyncio.create_task(state.ensure_decoder_remote_fill(decoder, wait_for_result=True))
+                await asyncio.sleep(0)
+                first.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await first
+                task = decoder.decoder_placement_task
+                waiting = not second.done()
+                release.set()
+                await asyncio.gather(second, task)
+                self.assertTrue(waiting)
+                self.assertFalse(task.cancelled())
+                await state.ensure_decoder_remote_fill(decoder, wait_for_result=True)
+                self.assertEqual(rpc.await_count, 1)
+
+        asyncio.run(run())
+
     def test_remote_fill_selects_decoder_first_and_scrubs_capability(self):
         state = proxy.ProxyState(
             [("prefiller", 8001)],

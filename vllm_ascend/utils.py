@@ -918,6 +918,16 @@ def register_ascend_customop(vllm_config: VllmConfig | None = None):
         "RelPosAttention": AscendRelPosAttention,
     }
 
+    if vllm_config is not None:
+        hf_config = vllm_config.model_config.hf_text_config
+        model_type = getattr(hf_config, "model_type", None)
+        moe_router_dtype = getattr(hf_config, "moe_router_dtype", None)
+        use_fp32_router = model_type == "glm_moe_dsa" or moe_router_dtype == "float32"
+        if use_fp32_router:
+            from vllm_ascend.ops.fused_moe.gate_linear import AscendGateLinear
+
+            REGISTERED_ASCEND_OPS["GateLinear"] = AscendGateLinear
+
     # 310P: override selected ops with 310P implementations (keep minimal changes outside _310p)
     if is_310p():
         from vllm_ascend._310p.fused_moe.fused_moe import AscendFusedMoE310, AscendSharedFusedMoE310
@@ -1539,3 +1549,18 @@ def parse_layer_idx(prefix: str) -> int | None:
     """Extract the layer index from a module prefix string like 'model.layers.0.self_attn'."""
     match = re.search(r"layers\.(\d+)", prefix)
     return int(match.group(1)) if match else None
+
+
+def sparse_kv_cache_has_indexer(kv_cache_spec) -> bool:
+    """Whether a sparse MLA KV cache spec owns an indexer key plane.
+
+    Shared-indexer consumer layers (GLM-5.2 ``indexer_types``) register a
+    latent-only spec whose ``sparse_head_dim`` third entry is 0, so they must
+    not allocate or reshape an indexer cache plane.
+    """
+    sparse_head_dim = getattr(kv_cache_spec, "sparse_head_dim", None)
+    return (
+        sparse_head_dim is not None
+        and len(sparse_head_dim) == 3
+        and sparse_head_dim[2] > 0
+    )

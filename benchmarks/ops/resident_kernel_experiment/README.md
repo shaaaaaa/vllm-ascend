@@ -376,6 +376,7 @@ export VLLM_ASCEND_DSA_RESIDENT_EXACT_KERNELS=1  # or 0 for the baseline A/B run
 
 Use your deployment's actual SOC_VERSION. No LMCache YAML or graph-size change
 is needed. Missing rebuilt operators fail at initialization, before capture.
-The feature branch descends from production `sparse` commit `58cbdbbc`; it does
-not include the newer production commits automatically. Serving qualification
-must include both settings, graph replay and preemption/reuse correctness on NPU.
+The feature branch descends from production `sparse` commit `58cbdbbc` and now
+includes production through `6fc30da6` (GLM compatibility, recovery/capacity fixes
+and staged event handoff). Serving qualification must include both settings,
+graph replay and preemption/reuse correctness on NPU.
