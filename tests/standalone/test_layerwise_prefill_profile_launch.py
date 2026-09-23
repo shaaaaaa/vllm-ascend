@@ -74,7 +74,9 @@ def test_case_launch_uses_isolated_inline_configuration(
         assert env["LMCACHE_ENABLE_SHARED_CPU_CACHE"] == "true"
         assert env["LMCACHE_STORE_ASYNC_MAX_QUEUE_SIZE"] == "2"
         assert env["LMCACHE_ENABLE_ASYNC_LOADING"] == "false"
-        assert env["LMCACHE_PREFILL_START_TIMING"] == "1"
+        assert env["LMCACHE_PREFILL_START_TIMING"] == "0"
+        assert env["PD_SERVING_PERF"] == "0"
+        assert env["LMCACHE_PREFILL_REUSE_DEBUG_RANK"] == "1"
         assert json.loads(env["LMCACHE_EXTRA_CONFIG"])["save_only_first_rank"] is True
         assert env["HCCL_IF_IP"] == inherited["HCCL_IF_IP"]
 
@@ -93,6 +95,26 @@ def test_case_launch_uses_isolated_inline_configuration(
     assert options["max_num_batched_tokens"] == 4096
     assert options["async_scheduling"] is None
     assert options["kv_transfer_config"]["kv_role"] == "kv_both"
+
+
+def test_reuse_log_is_available_before_worker_launch(profile_tool, monkeypatch, tmp_path):
+    args = SimpleNamespace(devices="0,1,2,3,4,5,6,7", cpu_cache_gb=24, model="/models/test")
+    launched = []
+
+    def launch(command, env, server_log, case, **kwargs):
+        target = Path(env["LMCACHE_PREFILL_REUSE_DEBUG_FILE"])
+        assert target == (tmp_path / case / "reuse.log").resolve()
+        assert target.is_file()
+        assert env["LMCACHE_PREFILL_REUSE_DEBUG_RANK"] == "1"
+        assert env["PD_SERVING_PERF"] == env["LMCACHE_PREFILL_START_TIMING"] == "0"
+        launched.append(target)
+        return SimpleNamespace(wait=lambda: 0)
+
+    monkeypatch.setattr(profile_tool, "start_logged_process", launch)
+    monkeypatch.setattr(profile_tool, "finish_child", lambda _: None)
+    monkeypatch.setattr(profile_tool, "analyse_case", lambda _: None)
+    profile_tool.run_cases(args, tmp_path, ("80k_on",))
+    assert len(launched) == 1
 
 
 @pytest.fixture

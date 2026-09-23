@@ -219,8 +219,10 @@ def case_environment(args, case):
             "ACL_OP_INIT_MODE": "1",
             "VLLM_NIXL_ABORT_REQUEST_TIMEOUT": "600",
             "VLLM_ALLOW_LONG_MAX_MODEL_LEN": "1",
-            "PD_SERVING_PERF": "detail",
-            "LMCACHE_PREFILL_START_TIMING": "1",
+            # Compact rank-1 reuse counters replace the verbose timing stream.
+            "PD_SERVING_PERF": "0",
+            "LMCACHE_PREFILL_START_TIMING": "0",
+            "LMCACHE_PREFILL_REUSE_DEBUG_RANK": "1",
             "VLLM_SERVER_DEV_MODE": "1",
             "VLLM_ENGINE_READY_TIMEOUT_S": "1800",
             "LMCACHE_ASCEND_SPARSE_TRANSFER_TOPK": "2048",
@@ -477,6 +479,9 @@ def run_cases(args, root, cases):
             str(args.cpu_cache_gb),
         ]
         env = case_environment(args, case)
+        reuse_log = case_dir / "reuse.log"
+        reuse_log.touch()
+        env["LMCACHE_PREFILL_REUSE_DEBUG_FILE"] = str(reuse_log.resolve())
         write_json(
             case_dir / "environment.json",
             {
