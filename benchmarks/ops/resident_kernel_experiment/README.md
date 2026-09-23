@@ -354,3 +354,28 @@ than reproducing all cache contention of a serving workload.
 The new variants target partial hits but can lose performance from extra index
 arithmetic or duplicated reads. No speedup is claimed until these measurements
 pass correctness and run on the target hardware.
+
+## Serving selection (this feature branch)
+
+The normal serving extension now compiles baseline and `exact_combined` together.
+`VLLM_ASCEND_DSA_RESIDENT_EXACT_KERNELS=1` (the default) selects exact vector
+intersection and vector state update; `0` selects the original kernels.
+Set it before starting **every worker**, and restart to change it. Selection is
+cached before graph capture and cannot change within a worker. Graph replay has
+no environment lookup or device-side selection branch. Eager enqueue reads the
+frozen launcher table; retrieval, operator schemas, allocation and remap semantics
+are unchanged. Unsupported vector geometries retain their existing scalar fallback.
+
+Rebuild the **serving** extension once (the standalone experiment build is insufficient):
+
+```bash
+SOC_VERSION=ascend910b3 COMPILE_CUSTOM_KERNELS=1 python -m pip install -e . --no-build-isolation --no-deps
+export VLLM_ASCEND_DSA_RESIDENT_EXACT_KERNELS=1  # or 0 for the baseline A/B run
+# Launch the existing deployment, propagating this variable to all workers.
+```
+
+Use your deployment's actual SOC_VERSION. No LMCache YAML or graph-size change
+is needed. Missing rebuilt operators fail at initialization, before capture.
+The feature branch descends from production `sparse` commit `58cbdbbc`; it does
+not include the newer production commits automatically. Serving qualification
+must include both settings, graph replay and preemption/reuse correctness on NPU.

@@ -177,6 +177,11 @@ env_variables: dict[str, Callable[[], Any]] = {
     # The request-wide shard count is MTP * shards_per_row. The value must be
     # a power of two in [1, 4]. Read once during model initialization so graph
     # capture and replay use one fixed state/workspace layout.
+    # Exact resident union/state-update kernels. 1 (default) enables, 0 selects
+    # baseline. Non-sensitive; read before graph capture, worker restart required.
+    "VLLM_ASCEND_DSA_RESIDENT_EXACT_KERNELS": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_DSA_RESIDENT_EXACT_KERNELS", "1"))
+    ),
     "VLLM_ASCEND_DSA_RESIDENT_SHARDS_PER_ROW": lambda: int(
         os.getenv("VLLM_ASCEND_DSA_RESIDENT_SHARDS_PER_ROW", "4")
     ),
