@@ -2063,6 +2063,8 @@ class AscendSFAImpl(MLAAttentionImpl):
         # indexer path only applies to producer layers.
         self.use_sparse_c8_indexer = self.has_indexer and ascend_config.enable_sparse_c8
         if self.use_sparse_c8_indexer:
+            if not hasattr(torch.ops._C_ascend, "npu_lightning_indexer_quant"):
+                raise RuntimeError("Indexer C8 requires the vLLM-Ascend quantized lightning-indexer operator")
             self.c8_k_cache_dtype = torch.int8
             self.c8_k_scale_cache_dtype = torch.float16
 
@@ -2943,8 +2945,6 @@ class AscendSFAImpl(MLAAttentionImpl):
             return "DSA context parallelism is enabled"
         if self.enable_dsa_cp_with_o_proj_tp:
             return "DSA o_proj tensor parallelism is enabled"
-        if self.use_sparse_c8_indexer:
-            return "the sparse C8 indexer is enabled"
         if self.dsa_offload_free_paged:
             return "the free-paged offload path is enabled"
         if envs.VLLM_ASCEND_DSA_OFFLOAD_ASSERT_PARITY:
@@ -2953,7 +2953,8 @@ class AscendSFAImpl(MLAAttentionImpl):
             return "the DSA offload manager is active"
         if getattr(forward_context, "dsa_adapter_cache", None) is not None:
             return "the DSA adapter cache is active"
-        if len(kv_cache) not in ((3,) if self.has_indexer else (2, 3)):
+        producer_planes = 4 if self.use_sparse_c8_indexer else 3
+        if len(kv_cache) not in ((producer_planes,) if self.has_indexer else (2, 3)):
             return (
                 "the POC requires the indexer plane plus two latent tensors"
                 if self.has_indexer
@@ -2975,6 +2976,8 @@ class AscendSFAImpl(MLAAttentionImpl):
             if self.topk_indices_buffer is None:
                 return "the shared-consumer staged graph requires the shared top-k buffer"
             expected_hidden_dims = expected_hidden_dims[:2]
+        elif self.use_sparse_c8_indexer:
+            expected_hidden_dims += (1,)
         if tuple(int(cache.shape[-1]) for cache in kv_cache) != tuple(int(dim) for dim in expected_hidden_dims):
             return "the staged KV cache hidden dimensions do not match SFA"
         cache_block_sizes = {int(cache.shape[1]) for cache in kv_cache}
@@ -2987,7 +2990,12 @@ class AscendSFAImpl(MLAAttentionImpl):
             return "the staged KV caches do not have one safe dummy block per request"
         if len({cache.device for cache in kv_cache}) != 1:
             return "the staged KV caches are on different devices"
-        cache_dtypes = {cache.dtype for cache in kv_cache}
+        if self.has_indexer and self.use_sparse_c8_indexer:
+            if kv_cache[2].dtype != torch.int8 or kv_cache[3].dtype != torch.float16:
+                return "the C8 indexer requires int8 keys and float16 scales"
+            if kv_cache[2].shape[:3] != kv_cache[3].shape[:3]:
+                return "the C8 indexer keys and scales must share block ownership"
+        cache_dtypes = {cache.dtype for cache in (kv_cache[:2] if self.use_sparse_c8_indexer else kv_cache)}
         if len(cache_dtypes) != 1:
             return "the staged KV caches must share one dtype"
         if next(iter(cache_dtypes)) not in (
@@ -3292,6 +3300,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         shard_counts_workspace: torch.Tensor,
         request_state_indices: torch.Tensor | None,
         request_state_generations: torch.Tensor | None,
+        indexer_scale_cache: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, ...]:
         """Pre-retrieval compute captured by the outer PIECEWISE graph.
 
@@ -3323,9 +3332,13 @@ class AscendSFAImpl(MLAAttentionImpl):
                 cos=cos,
                 sin=sin,
             )
-            assert k_li_scale is None
             assert indexer_cache is not None
             kv_cache = (kv_cache_nope, kv_cache_pe, indexer_cache)
+            if self.use_sparse_c8_indexer:
+                assert k_li_scale is not None and indexer_scale_cache is not None
+                kv_cache += (indexer_scale_cache,)
+            else:
+                assert k_li_scale is None
         else:
             k_li = None
             assert indexer_cache is None
@@ -3343,6 +3356,18 @@ class AscendSFAImpl(MLAAttentionImpl):
         q_pe = self.rope_single(q_pe, cos, sin)
 
         if self.has_indexer:
+            if self.use_sparse_c8_indexer:
+                scale_slots, scale_updates = self._mask_staged_index_scatter_padding(
+                    indexer_slot_mapping,
+                    k_li_scale,
+                    row_req_indices,
+                    indexer_scale_cache.view(-1, 1),
+                )
+                torch_npu.npu_scatter_nd_update_(
+                    indexer_scale_cache.view(-1, 1),
+                    scale_slots.view(-1, 1),
+                    scale_updates.view(-1, 1),
+                )
             indexer_slot_mapping, k_li_for_scatter = (
                 self._mask_staged_index_scatter_padding(
                     indexer_slot_mapping,
@@ -3533,8 +3558,14 @@ class AscendSFAImpl(MLAAttentionImpl):
                 assert index_layer_name is not None
                 registered = context.no_compile_layers[index_layer_name].kv_cache[context.virtual_engine]
                 index_cache = registered[0] if isinstance(registered, (tuple, list)) else registered
+                if self.use_sparse_c8_indexer:
+                    if not isinstance(registered, (tuple, list)) or len(registered) != 2:
+                        raise RuntimeError("Unbundled C8 indexer requires key and scale caches")
+                    self._dsa_idx_scale_cache_t = registered[1]
                 self._dsa_idx_cache_t = index_cache
             kv_cache = (*kv_cache, index_cache)
+            if self.use_sparse_c8_indexer:
+                kv_cache += (self._dsa_idx_scale_cache_t,)
         return kv_cache, index_layer_name, index_enabled
 
     def _cross_layer_empty_outputs(
@@ -3561,6 +3592,7 @@ class AscendSFAImpl(MLAAttentionImpl):
     def reset_staged_sfa_capture(self) -> None:
         self._staged_sfa_capture_state = _StagedSFACaptureState()
         self._dsa_idx_cache_t = None
+        self._dsa_idx_scale_cache_t = None
         self._staged_sfa_bridge_buffers = None
 
     def seal_staged_sfa_capture(
@@ -3822,6 +3854,7 @@ class AscendSFAImpl(MLAAttentionImpl):
             shard_counts_workspace,
             attn_metadata.resident_state_indices,
             attn_metadata.resident_state_generations,
+            kv_cache[3] if self.has_indexer and self.use_sparse_c8_indexer else None,
         )
         outputs = self._copy_to_staged_sfa_bridge(
             hidden_states,
@@ -4665,8 +4698,14 @@ class AscendSFAImpl(MLAAttentionImpl):
                 _idx_name = index_layer_name
                 _idx_cache = _fc_ub.no_compile_layers[_idx_name].kv_cache[_fc_ub.virtual_engine]
                 _idx_t = _idx_cache[0] if isinstance(_idx_cache, (tuple, list)) else _idx_cache
+                if self.use_sparse_c8_indexer:
+                    if not isinstance(_idx_cache, (tuple, list)) or len(_idx_cache) != 2:
+                        raise RuntimeError("Unbundled C8 indexer requires key and scale caches")
+                    self._dsa_idx_scale_cache_t = _idx_cache[1]
                 self._dsa_idx_cache_t = _idx_t
             kv_cache = (kv_cache[0], kv_cache[1], _idx_t)
+            if self.use_sparse_c8_indexer:
+                kv_cache += (self._dsa_idx_scale_cache_t,)
 
         cos = attn_metadata.cos
         sin = attn_metadata.sin

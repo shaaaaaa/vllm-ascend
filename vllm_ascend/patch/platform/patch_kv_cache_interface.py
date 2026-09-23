@@ -42,9 +42,24 @@ class AscendMLAAttentionSpec(MLAAttentionSpec):
     c8_k_scale_cache_dtype: torch.dtype = torch.float16
 
     @property
+    def indexer_scale_page_size_bytes(self) -> int:
+        """Scale sidecar charged separately from shared Group-1 key storage."""
+        if self.cache_sparse_c8 and self.sparse_head_dim is not None and len(self.sparse_head_dim) == 1:
+            return self.block_size * self.num_kv_heads * get_dtype_size(self.c8_k_scale_cache_dtype)
+        return 0
+
+    @property
     def page_size_bytes(self) -> int:
         if self.cache_sparse_c8:
             assert self.sparse_head_dim is not None
+            if len(self.sparse_head_dim) == 1:
+                return (
+                    self.block_size
+                    * self.num_kv_heads
+                    * self.sparse_head_dim[0]
+                    * get_dtype_size(self.c8_k_cache_dtype)
+                    + self.indexer_scale_page_size_bytes
+                )
             assert len(self.sparse_head_dim) == 3
             num_heads_per_page = self.block_size * self.num_kv_heads
             # kv_cache[0]: bfloat16, kv_cache[1]: bfloat16
