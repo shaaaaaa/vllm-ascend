@@ -19,6 +19,22 @@ with `--variants`; `baseline` is always included for comparison.
 | `compact_remap` | Original | Compact slot gather; original state merge |
 | `sharded_finalize` | Existing experimental sharded worker | Original |
 | `combined` | Sharded worker | Compact slot gather; original state merge |
+| `vector_union` | Original | Original; vectorized union deduplication/mapping |
+
+`vector_union` changes only the union kernel. Sorting, the subsequent scalar
+resident intersection, allocation policy, finalize and update remain baseline.
+After sorting, vector adjacent comparisons plus `GatherMask` compact unique
+tokens. MTP1 uses its existing unique-row contract. Inverse mapping uses a
+bounded vector lower-bound search over the unique tokens, avoiding the original
+per-occurrence scalar `GetValue`/`SetValue` loop. It preserves each row's own
+boundary and invalid/padding behavior. It deliberately does not use local
+`Scatter`, which is not supported on the A2 training product path.
+
+The vector implementation reuses dead sort/input scratch and expands only two
+bit masks to request width (512 additional UB bytes for query width 2). There
+is no new persistent or global-memory workspace. Binary search adds vector
+passes and rereads input rows; it may be slower, especially for small shards.
+The experiment must be timed; no speedup is assumed.
 
 The two new experiments do not enable the earlier unchanged-state shortcut.
 They keep the same three dependency stages; no cross-core spin waits or new
@@ -58,16 +74,17 @@ or serving dispatch check. The baseline/optimized symbols have separate suffixes
 to avoid interposition with an installed serving extension.
 
 Both variants reuse the same source rather than maintaining a second large
-kernel copy. At CMake configuration, `generate_sources.py` emits eight translation
+kernel copy. At CMake configuration, `generate_sources.py` emits thirteen translation
 units, each with one explicitly named AIV entry point: the original six plus
-compact update and sharded finalize. Helper/class and entry-point bodies come from the
+compact update, sharded finalize, vector union, and four union-prefix probes.
+Helper/class and entry-point bodies come from the
 resident source; entry names are literal, not preprocessor aliases. The host
 dispatcher preserves the same launch order. This packaging avoids the former
 multi-entry-point/include-and-macro build, which failed binary registration on
 CANN 8.5.1 with `finalize ... get kernel type failed`. The six-entry version was
 successfully run on the user's 910B3. The two new variants still require native validation.
 
-The standalone build compiles only these eight resident entry points and a small PyTorch-NPU binding.
+The standalone build compiles only these resident entry points and a small PyTorch-NPU binding.
 It does **not** rebuild `vllm_ascend_C` or any other model/attention/MoE kernels.
 
 ## Build on the NPU host
@@ -104,7 +121,7 @@ After updating from the original packaging, use a new build directory and pass
 the actual device target, for example on the reported 910B3 host:
 
 ```bash
-BUILD="$EXP/build-910b3-variants"
+BUILD="$EXP/build-910b3-vector-union"
 bash "$EXP/build.sh" ascend910b3 "$BUILD"
 python -m pytest --confcutdir="$EXP/tests" -o addopts= "$EXP/tests/test_kernels.py" --resident-build-dir "$BUILD" -k 'normal and 1-1' -xq
 ```
@@ -149,7 +166,7 @@ Native compilation and execution cannot be performed on the Windows development 
 First run a small profiler comparison:
 
 ```bash
-python "$EXP/benchmark.py" --build-dir "$BUILD" --requests 8 --mtp 2 --shards-per-row 4 --hit-rates 0.9 --variants baseline compact_remap sharded_finalize combined --iterations 30 --warmup 20 --json "$EXP/variants.json"
+python "$EXP/benchmark.py" --build-dir "$BUILD" --requests 8 --mtp 2 --shards-per-row 4 --hit-rates 0.9 --variants baseline vector_union --iterations 30 --warmup 20 --json "$EXP/vector_union.json"
 ```
 
 `--mtp` means **query width**: `2` represents one speculative token plus the
@@ -183,6 +200,27 @@ diagnosis only: their approximately 120 us submission floor can hide gains.
 `--overlap 0` selects 4096 unique tokens for query width 2; `--overlap 1024`
 (default) selects 3072; `--overlap 2048` selects 2048. Test all three overlap
 levels rather than treating 4096 input entries as 4096 unique selections.
+
+## Isolate the union prefix cost
+
+The additional `union_sort` and `union_dedup` stages compile the same kernel
+with an early return after sorting or after deduplication/mapping. They are
+diagnostics only: they do not publish a usable resident load plan and cannot
+be followed by finalize/update. Baseline and vector variants have distinct
+symbols. No timers or phase checks are inserted into the serving build.
+
+```bash
+python "$EXP/benchmark.py" --build-dir "$BUILD" --requests 8 --mtp 2 --hit-rates 0.9 --variants baseline vector_union --stage union_sort --json "$EXP/union_sort.json"
+python "$EXP/benchmark.py" --build-dir "$BUILD" --requests 8 --mtp 2 --hit-rates 0.9 --variants baseline vector_union --stage union_dedup --json "$EXP/union_dedup.json"
+python "$EXP/benchmark.py" --build-dir "$BUILD" --requests 8 --mtp 2 --hit-rates 0.9 --variants baseline vector_union --stage union --json "$EXP/union_full.json"
+```
+
+These are cumulative prefix probes, not exact in-kernel phase timestamps. Each
+probe writes results to keep its computation observable; code generation and
+writeback differ at the cutoff. Use the differences to identify the dominant
+region, then judge benefit using the full union and full three-kernel chain.
+If through-sort already consumes most of the union latency, vectorizing only
+deduplication/mapping cannot deliver a large end-to-end gain.
 
 Additional comparisons:
 

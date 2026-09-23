@@ -24,6 +24,12 @@
 #ifndef RESIDENT_EXPERIMENT_COMPACT_REMAP
 #define RESIDENT_EXPERIMENT_COMPACT_REMAP 0
 #endif
+#ifndef RESIDENT_EXPERIMENT_VECTOR_UNION
+#define RESIDENT_EXPERIMENT_VECTOR_UNION 0
+#endif
+#ifndef RESIDENT_EXPERIMENT_UNION_STOP
+#define RESIDENT_EXPERIMENT_UNION_STOP 0
+#endif
 
 namespace {
 
@@ -266,9 +272,9 @@ public:
         pipe_.InitBuffer(
             mappingBuf_, requestWidth_ * sizeof(int16_t));
         pipe_.InitBuffer(shardMaskBuf_, maskBytes);
-        pipe_.InitBuffer(nonNegativeMaskBuf_, maskBytes);
+        pipe_.InitBuffer(nonNegativeMaskBuf_, RESIDENT_EXPERIMENT_VECTOR_UNION ? requestWidth_ / 8 : maskBytes);
         pipe_.InitBuffer(beforeBoundaryMaskBuf_, maskBytes);
-        pipe_.InitBuffer(selectedMaskBuf_, maskBytes);
+        pipe_.InitBuffer(selectedMaskBuf_, RESIDENT_EXPERIMENT_VECTOR_UNION ? requestWidth_ / 8 : maskBytes);
     }
 
     __aicore__ inline void Process()
@@ -481,6 +487,15 @@ public:
             srcInt[sortElements], compactIndices, sortElements);
         AscendC::PipeBarrier<PIPE_V>();
         SortAll(src, tmp, sortElements);
+        if constexpr (RESIDENT_EXPERIMENT_UNION_STOP == 1) {
+            // Diagnostic prefix only, never passed to finalize/update. Keep
+            // the sort observable; the writeback is part of probe overhead.
+            Sync<AscendC::HardEvent::V_MTE3>();
+            CopyLocalToGlobalExact(shardPacked_[shardOffset], srcInt, sortElements);
+            Sync<AscendC::HardEvent::MTE3_S>();
+            WriteGlobalScalarVisible(shardCounts_, countOffset, static_cast<int32_t>(selectedElements));
+            return;
+        }
         AscendC::Duplicate(
             mapping,
             static_cast<int16_t>(-1),
@@ -490,7 +505,10 @@ public:
 
         auto sortedInt = src.ReinterpretCast<int32_t>();
         uint32_t rank = 0;
-        if (selectedElements > 0 && !deduplicate_) {
+        if constexpr (RESIDENT_EXPERIMENT_VECTOR_UNION) {
+            rank = VectorDeduplicateAndMap(src, tmp, sortedTokens, mapping,
+                selectedElements, sortElements, request);
+        } else if (selectedElements > 0 && !deduplicate_) {
             // MTP=1 is unique by contract. Keep this as a separate loop so
             // the launch-time MTP choice does not add a branch per token.
             for (uint32_t i = 0; i < selectedElements; ++i) {
@@ -520,6 +538,16 @@ public:
                 mapping.SetValue(
                     original, static_cast<int16_t>(rank - 1));
             }
+        }
+
+        if constexpr (RESIDENT_EXPERIMENT_UNION_STOP == 2) {
+            Sync<AscendC::HardEvent::S_MTE3>();
+            Sync<AscendC::HardEvent::V_MTE3>();
+            CopyLocalToGlobalExact(shardPacked_[shardOffset], sortedTokens, rank);
+            CopyLocalToGlobalExact(shardMapping_[mappingOffset], mapping, requestWidth_);
+            Sync<AscendC::HardEvent::MTE3_S>();
+            WriteGlobalScalarVisible(shardCounts_, countOffset, static_cast<int32_t>(rank));
+            return;
         }
 
         // The compact-index storage is dead after sorting. Reuse its two
@@ -669,6 +697,145 @@ public:
     }
 
 private:
+    __aicore__ inline uint32_t VectorDeduplicateAndMap(
+        AscendC::LocalTensor<float>& src, AscendC::LocalTensor<float>& tmp,
+        AscendC::LocalTensor<int32_t>& sortedTokens,
+        AscendC::LocalTensor<int16_t>& mapping,
+        uint32_t selected, uint32_t width, uint32_t request)
+    {
+        if (selected == 0) return 0;
+        // Sorting is finished. Its temporary buffers and compact inputs may
+        // now be reused. The output union and mapping remain live afterward.
+        Sync<AscendC::HardEvent::S_V>();
+        auto keys = compactTokenBuf_.Get<float>();
+        auto ints = compactIndexBuf_.Get<int32_t>();
+        auto previous = tmp;
+        auto offsets = tmp[shardCapacity_].ReinterpretCast<int32_t>();
+        auto heads = selectedMaskBuf_.Get<uint8_t>();
+        auto valid = nonNegativeMaskBuf_.Get<uint8_t>();
+        AscendC::GatherMaskParams extract;
+        extract.repeatTimes = static_cast<uint8_t>(width * kPairWidth * sizeof(float) / 256);
+        extract.src0BlockStride = 1;
+        extract.src0RepeatStride = 8;
+        extract.src1RepeatStride = 0;
+        uint64_t extracted = 0;
+        AscendC::GatherMask(keys, src, static_cast<uint8_t>(1), false,
+            static_cast<uint32_t>(0), extract, extracted);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Muls(keys, keys, -1.0F, width);
+        AscendC::PipeBarrier<PIPE_V>();
+        uint32_t count = selected;
+        if (deduplicate_) {
+            AscendC::CreateVecIndex(offsets, static_cast<int32_t>(-1), width);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Maxs(offsets, offsets, static_cast<int32_t>(0), width);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Muls(offsets, offsets, static_cast<int32_t>(sizeof(float)), width);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Gather(previous, keys, offsets.ReinterpretCast<uint32_t>(), static_cast<uint32_t>(0), width);
+            AscendC::PipeBarrier<PIPE_V>();
+            Sync<AscendC::HardEvent::V_S>();
+            previous.SetValue(0, -1.0F);
+            Sync<AscendC::HardEvent::S_V>();
+            AscendC::Compare(heads, keys, previous, AscendC::CMPMODE::NE, width);
+            AscendC::CreateVecIndex(offsets, static_cast<int32_t>(0), width);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Mins(ints, offsets, static_cast<int32_t>(selected - 1), width);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Compare(valid, ints, offsets, AscendC::CMPMODE::EQ, width);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::And(heads.ReinterpretCast<uint16_t>(), heads.ReinterpretCast<uint16_t>(),
+                valid.ReinterpretCast<uint16_t>(), width / 16);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Cast(ints, keys, AscendC::RoundMode::CAST_ROUND, width);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::GatherMaskParams gather;
+            gather.repeatTimes = 1;
+            gather.src0BlockStride = 1;
+            gather.src0RepeatStride = 8;
+            gather.src1RepeatStride = 8;
+            uint64_t unique = 0;
+            AscendC::GatherMask(sortedTokens, ints, heads.ReinterpretCast<uint32_t>(),
+                true, width, gather, unique);
+            AscendC::PipeBarrier<PIPE_V>();
+            Sync<AscendC::HardEvent::V_S>();
+            count = static_cast<uint32_t>(unique);
+        } else {
+            AscendC::Cast(sortedTokens, keys, AscendC::RoundMode::CAST_ROUND, width);
+            AscendC::PipeBarrier<PIPE_V>();
+        }
+        // 910B has no local vector Scatter. Recover each original token's
+        // union rank with a bounded vector lower_bound instead of scalar
+        // GetValue/SetValue for every sorted occurrence. Negative/unselected
+        // values remain -1, and each MTP row keeps its own split boundary.
+        auto input = inputBuf_.Get<int32_t>();
+        auto low = workBuf_.Get<int32_t>();
+        auto high = clampedBuf_.Get<int32_t>();
+        auto mid = indexBuf_.Get<int32_t>();
+        auto gatherOffsets = src.ReinterpretCast<int32_t>();
+        auto candidate = src[rowWidth_].ReinterpretCast<int32_t>();
+        auto candidateFloat = tmp;
+        for (uint32_t q = 0; q < rowsPerRequest_; ++q) {
+            const uint32_t row = request * rowsPerRequest_ + q;
+            if (ReadGlobalScalarFresh(rowReqIndices_, row) != static_cast<int32_t>(request)) continue;
+            const int32_t boundary = ReadGlobalScalarFresh(splitBoundary_, row);
+            Sync<AscendC::HardEvent::V_MTE2>();
+            AscendC::DataCopy(input, topkIndices_[static_cast<uint64_t>(row) * rowWidth_], rowWidth_);
+            Sync<AscendC::HardEvent::MTE2_V>();
+            AscendC::Duplicate(low, static_cast<int32_t>(0), rowWidth_);
+            AscendC::Duplicate(high, static_cast<int32_t>(count), rowWidth_);
+            AscendC::PipeBarrier<PIPE_V>();
+            for (uint32_t remaining = count; remaining > 0; remaining >>= 1) {
+                AscendC::Add(mid, low, high, rowWidth_);
+                AscendC::PipeBarrier<PIPE_V>();
+                AscendC::ShiftRight(mid, mid, static_cast<int32_t>(1), rowWidth_);
+                AscendC::PipeBarrier<PIPE_V>();
+                AscendC::Mins(gatherOffsets, mid, static_cast<int32_t>(count - 1), rowWidth_);
+                AscendC::PipeBarrier<PIPE_V>();
+                AscendC::Muls(gatherOffsets, gatherOffsets, static_cast<int32_t>(sizeof(int32_t)), rowWidth_);
+                AscendC::PipeBarrier<PIPE_V>();
+                AscendC::Gather(candidate, sortedTokens, gatherOffsets.ReinterpretCast<uint32_t>(),
+                    static_cast<uint32_t>(0), rowWidth_);
+                AscendC::PipeBarrier<PIPE_V>();
+                AscendC::Compare(heads, candidate, input, AscendC::CMPMODE::LT, rowWidth_);
+                AscendC::Adds(gatherOffsets, mid, static_cast<int32_t>(1), rowWidth_);
+                AscendC::PipeBarrier<PIPE_V>();
+                // Saturate completed searches at count; Gather always clamps.
+                AscendC::Mins(gatherOffsets, gatherOffsets, static_cast<int32_t>(count), rowWidth_);
+                AscendC::PipeBarrier<PIPE_V>();
+                AscendC::Select(low.ReinterpretCast<float>(), heads, gatherOffsets.ReinterpretCast<float>(),
+                    low.ReinterpretCast<float>(), AscendC::SELMODE::VSEL_TENSOR_TENSOR_MODE, rowWidth_);
+                AscendC::Select(high.ReinterpretCast<float>(), heads, high.ReinterpretCast<float>(),
+                    mid.ReinterpretCast<float>(), AscendC::SELMODE::VSEL_TENSOR_TENSOR_MODE, rowWidth_);
+                AscendC::PipeBarrier<PIPE_V>();
+            }
+            AscendC::Mins(gatherOffsets, low, static_cast<int32_t>(count - 1), rowWidth_);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Muls(gatherOffsets, gatherOffsets, static_cast<int32_t>(sizeof(int32_t)), rowWidth_);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Gather(candidate, sortedTokens, gatherOffsets.ReinterpretCast<uint32_t>(),
+                static_cast<uint32_t>(0), rowWidth_);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Compare(heads, candidate, input, AscendC::CMPMODE::EQ, rowWidth_);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Mins(candidate, input, boundary - 1, rowWidth_);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Compare(valid, candidate, input, AscendC::CMPMODE::EQ, rowWidth_);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::And(heads.ReinterpretCast<uint16_t>(), heads.ReinterpretCast<uint16_t>(),
+                valid.ReinterpretCast<uint16_t>(), rowWidth_ / 16);
+            AscendC::Cast(candidateFloat, low, AscendC::RoundMode::CAST_NONE, rowWidth_);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Select(candidateFloat, heads, candidateFloat, -1.0F,
+                AscendC::SELMODE::VSEL_TENSOR_SCALAR_MODE, rowWidth_);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Cast(mapping[q * rowWidth_], candidateFloat, AscendC::RoundMode::CAST_ROUND, rowWidth_);
+            AscendC::PipeBarrier<PIPE_V>();
+        }
+        Sync<AscendC::HardEvent::V_S>();
+        return count;
+    }
+
     __aicore__ inline uint32_t SortElementCount(uint32_t count)
     {
         uint32_t groups =

@@ -16,7 +16,9 @@ def trace(variant, iterations=3):
     return {"traceEvents": events}
 
 
-@pytest.mark.parametrize("variant", ["baseline", "optimized", "compact_remap", "sharded_finalize", "combined"])
+@pytest.mark.parametrize("variant", [
+    "baseline", "optimized", "compact_remap", "sharded_finalize", "combined", "vector_union",
+])
 def test_device_durations_exclude_host_floor(variant):
     result = parse_trace(trace(variant), variant, "full", 3)
     assert result["kernel_sum"]["mean_us"] == 30
@@ -73,3 +75,12 @@ def test_large_timestamps_keep_submicrosecond_order_and_span():
     events[1]["ts"] = str(start + Decimal("0.10"))
     with pytest.raises(RuntimeError, match="overlap"):
         parse_trace(events, "baseline", "full", 1)
+
+
+@pytest.mark.parametrize("stage", ["union_sort", "union_dedup"])
+@pytest.mark.parametrize("variant", ["baseline", "vector_union"])
+def test_union_prefix_probe_has_its_own_device_symbol(stage, variant):
+    name = kernel_names(variant)["union"] + "_" + stage.removeprefix("union_")
+    events = [{"ph": "X", "cat": "kernel", "name": name + "_0",
+               "ts": 100, "dur": 40, "pid": 2, "tid": 5}]
+    assert parse_trace(events, variant, stage, 1)["kernels"][stage]["mean_us"] == 40

@@ -34,7 +34,7 @@ SCALARS = {
 
 
 def generate(source: str, header: Path, *, variants=(("baseline", 0), ("optimized", 1)), kernels=None,
-             compact=False, sharded=False) -> dict[str, str]:
+             compact=False, sharded=False, vector_union=False, union_stop=0) -> dict[str, str]:
     marker = 'extern "C" __global__ __aicore__ void\n'
     classes, separator, _ = source.partition(marker)
     if not separator:
@@ -58,6 +58,8 @@ def generate(source: str, header: Path, *, variants=(("baseline", 0), ("optimize
                 arguments.append(SCALARS[scalar[1]])
         for variant, enabled in variants:
             kernel_name = f"{name}_{variant}"
+            if union_stop:
+                kernel_name += "_" + stage.removeprefix("union_")
             entry = match[0].replace(name, kernel_name, 1)
             logical_blocks = "a.requests" if stage == "finalize" and not sharded else "a.requests * a.shards"
             launch = (
@@ -71,6 +73,8 @@ def generate(source: str, header: Path, *, variants=(("baseline", 0), ("optimize
                 "// Generated; do not edit. Kernel algorithm is copied verbatim.\n"
                 f"#define RESIDENT_EXPERIMENT_SKIP_UNCHANGED {enabled}\n"
                 f"#define RESIDENT_EXPERIMENT_COMPACT_REMAP {int(compact)}\n"
+                f"#define RESIDENT_EXPERIMENT_VECTOR_UNION {int(vector_union)}\n"
+                f"#define RESIDENT_EXPERIMENT_UNION_STOP {union_stop}\n"
                 + classes + entry + launch
             )
     return output
@@ -88,6 +92,13 @@ def main() -> None:
     output.update(generate(SHARDED_SOURCE.read_text(encoding="utf-8"), HERE / "launch.h",
                            variants=(("sharded", 0),), sharded=True,
                            kernels={"finalize": "dsa_resident_sharded_finalize_worker_kernel"}))
+    output.update(generate(source, HERE / "launch.h", variants=(("vector", 0),),
+                           kernels={"union": KERNELS["union"]}, vector_union=True))
+    for variant in ("baseline", "vector"):
+        for phase, stop in (("sort", 1), ("dedup", 2)):
+            output.update(generate(source, HERE / "launch.h", variants=((variant, 0),),
+                                   kernels={f"union_{phase}": KERNELS["union"]},
+                                   vector_union=variant == "vector", union_stop=stop))
     for name, content in output.items():
         path = args.output / name
         if not path.exists() or path.read_text(encoding="utf-8") != content:

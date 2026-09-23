@@ -82,7 +82,7 @@ def main():
     parser.add_argument("--hit-rates", type=float, nargs="+", default=[0.0, 0.9, 1.0])
     parser.add_argument("--overlap", type=int, choices=(0, 1024, 2048), default=1024)
     parser.add_argument("--variants", choices=tuple(VARIANTS), nargs="+",
-                        default=["baseline", "compact_remap", "sharded_finalize", "combined"])
+                        default=["baseline", "vector_union"])
     parser.add_argument(
         "--scenario", choices=("normal", "cold", "one_shard_miss", "subset", "zero_boundary"), default="normal"
     )
@@ -98,6 +98,8 @@ def main():
     if any(not 0 <= rate <= 1 for rate in args.hit_rates):
         parser.error("hit rates must be in [0, 1]")
     variants = list(dict.fromkeys(["baseline", *args.variants]))
+    if args.stage in ("union_sort", "union_dedup") and any(v not in ("baseline", "vector_union") for v in variants):
+        parser.error("union prefix diagnostics support only baseline/vector_union")
     run_dir = args.trace_dir / datetime.now().strftime("run_%Y%m%d_%H%M%S_%f")
     build = load_library(args.build_dir)
     torch.npu.set_device(args.device)
@@ -115,7 +117,7 @@ def main():
         "overlap": args.overlap,
         "results": [],
     }
-    stages = tuple(STAGES) if args.stage == "all" else (args.stage,)
+    stages = ("full", "union", "finalize", "update") if args.stage == "all" else (args.stage,)
     for requests in args.requests:
         for shards in args.shards_per_row:
             for rate in args.hit_rates:

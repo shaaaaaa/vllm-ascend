@@ -62,3 +62,21 @@ def test_new_variants_have_separate_single_entry_sources():
         assert "#define RESIDENT_EXPERIMENT_SKIP_UNCHANGED 0" in source
         assert "logicalBlocks = a.requests * a.shards" in source
     assert "#define RESIDENT_EXPERIMENT_COMPACT_REMAP 1" in compact["compact_update.cpp"]
+
+
+def test_vector_union_and_probes_have_distinct_entry_names():
+    source = SOURCE.read_text(encoding="utf-8")
+    symbols = []
+    for variant in ("baseline", "vector"):
+        for stage, stop in (("union", 0), ("union_sort", 1), ("union_dedup", 2)):
+            generated = generate(source, HERE / "launch.h", variants=((variant, 0),),
+                                 kernels={stage: KERNELS["union"]}, vector_union=variant == "vector", union_stop=stop)
+            assert len(generated) == 1
+            content = next(iter(generated.values()))
+            entries = re.findall(r'extern "C" __global__ __aicore__ void\n(\w+)\(', content)
+            assert len(entries) == 1
+            assert f"{entries[0]}<<<" in content
+            assert f"#define RESIDENT_EXPERIMENT_UNION_STOP {stop}" in content
+            assert f"#define RESIDENT_EXPERIMENT_VECTOR_UNION {int(variant == 'vector')}" in content
+            symbols += entries
+    assert len(set(symbols)) == 6

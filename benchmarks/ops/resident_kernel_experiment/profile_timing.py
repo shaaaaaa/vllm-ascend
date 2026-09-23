@@ -19,6 +19,8 @@ def kernel_names(variant):
                 if variant in ("sharded_finalize", "combined")
                 else f"dsa_resident_sorted_finalize_kernel_{union}")
     update = "compact" if variant in ("compact_remap", "combined") else union
+    if variant == "vector_union":
+        union = "vector"
     return {"union": f"dsa_resident_sharded_union_kernel_{union}",
             "finalize": finalize, "update": f"dsa_resident_sorted_update_kernel_{update}"}
 
@@ -29,7 +31,9 @@ def parse_trace(document, variant, stage, iterations):
                      and e.get("name") == "process_name"
                      and "ascend hardware" in str(e.get("args", {}).get("name", "")).lower()}
     expected = kernel_names(variant)
-    if stage != "full":
+    if stage in ("union_sort", "union_dedup"):
+        expected = {stage: expected["union"] + "_" + stage.removeprefix("union_")}
+    elif stage != "full":
         expected = {stage: expected[stage]}
     grouped = {name: [] for name in expected}
     for event in events:

@@ -43,6 +43,12 @@ foreach(variant baseline optimized)
 endforeach()
 list(APPEND resident_sources "${CMAKE_CURRENT_BINARY_DIR}/generated/compact_update.cpp"
     "${CMAKE_CURRENT_BINARY_DIR}/generated/sharded_finalize.cpp")
+list(APPEND resident_sources "${CMAKE_CURRENT_BINARY_DIR}/generated/vector_union.cpp")
+foreach(variant baseline vector)
+    foreach(phase sort dedup)
+        list(APPEND resident_sources "${CMAKE_CURRENT_BINARY_DIR}/generated/${variant}_union_${phase}.cpp")
+    endforeach()
+endforeach()
 ascendc_library(resident_experiment_kernels SHARED ${resident_sources})
 
 find_package(Torch REQUIRED)

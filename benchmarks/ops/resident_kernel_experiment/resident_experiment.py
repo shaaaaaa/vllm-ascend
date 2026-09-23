@@ -39,8 +39,9 @@ NAMES = (
     "target_slots",
     "block_table",
 )
-STAGES = {"full": 0, "union": 1, "finalize": 2, "update": 3}
-VARIANTS = {"baseline": 0, "optimized": 1, "compact_remap": 2, "sharded_finalize": 3, "combined": 4}
+STAGES = {"full": 0, "union": 1, "finalize": 2, "update": 3, "union_sort": 4, "union_dedup": 5}
+VARIANTS = {"baseline": 0, "optimized": 1, "compact_remap": 2, "sharded_finalize": 3, "combined": 4,
+            "vector_union": 5}
 SOURCE_FILES = (
     ROOT / "csrc/kernels/resident_sorted_cache.cpp",
     ROOT / "csrc/kernels/resident_sorted_cache_coordinated.cpp",
