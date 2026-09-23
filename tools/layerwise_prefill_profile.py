@@ -220,6 +220,7 @@ def case_environment(args, case):
             "VLLM_NIXL_ABORT_REQUEST_TIMEOUT": "600",
             "VLLM_ALLOW_LONG_MAX_MODEL_LEN": "1",
             "PD_SERVING_PERF": "detail",
+            "LMCACHE_PREFILL_START_TIMING": "1",
             "VLLM_SERVER_DEV_MODE": "1",
             "VLLM_ENGINE_READY_TIMEOUT_S": "1800",
             "LMCACHE_ASCEND_SPARSE_TRANSFER_TOPK": "2048",

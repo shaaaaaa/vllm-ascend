@@ -74,6 +74,7 @@ def test_case_launch_uses_isolated_inline_configuration(
         assert env["LMCACHE_ENABLE_SHARED_CPU_CACHE"] == "true"
         assert env["LMCACHE_STORE_ASYNC_MAX_QUEUE_SIZE"] == "2"
         assert env["LMCACHE_ENABLE_ASYNC_LOADING"] == "false"
+        assert env["LMCACHE_PREFILL_START_TIMING"] == "1"
         assert json.loads(env["LMCACHE_EXTRA_CONFIG"])["save_only_first_rank"] is True
         assert env["HCCL_IF_IP"] == inherited["HCCL_IF_IP"]
 
