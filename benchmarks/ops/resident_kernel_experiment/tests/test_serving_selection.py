@@ -52,3 +52,36 @@ def test_configuration_failure_is_not_cached(monkeypatch):
         planner.configure_resident_kernels()
     planner.configure_resident_kernels()
     assert configure.call_count == 2
+
+
+@pytest.mark.parametrize("resident,shared", [(False, False), (False, True), (True, False), (True, True)])
+def test_ascend_startup_selection_precedes_deferred_allocation(resident, shared):
+    """Exercise the actual merged constructor section, including shared deferral."""
+    import ast
+    from types import SimpleNamespace
+
+    source = ROOT / "vllm_ascend/attention/sfa_v1.py"
+    cls = next(n for n in ast.parse(source.read_text(encoding="utf-8")).body
+               if isinstance(n, ast.ClassDef) and n.name == "AscendSFAImpl")
+    init = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "__init__")
+    begin = next(i for i, n in enumerate(init.body)
+                 if isinstance(n, ast.If) and any(
+                     isinstance(call, ast.Call) and isinstance(call.func, ast.Name)
+                     and call.func.id == "configure_resident_kernels" for call in ast.walk(n)))
+    end = next(i for i in range(begin, len(init.body))
+               if isinstance(init.body[i], ast.If) and any(
+                   isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute)
+                   and call.func.attr == "initialize_sorted_resident_cache"
+                   for call in ast.walk(init.body[i])))
+    events = []
+    impl = SimpleNamespace(dsa_resident_cache=resident, index_cache_enabled=True,
+                           layer_name="model.layers.0", initialize_sorted_resident_cache=lambda: events.append("allocate"))
+    ns = dict(self=impl, configure_resident_kernels=lambda: events.append("configure"),
+              envs=SimpleNamespace(VLLM_ASCEND_SFA_SHARED_RESIDENT_PLAN=shared),
+              hf_text_config=SimpleNamespace(num_hidden_layers=2), hf_config=None,
+              parse_layer_idx=lambda _: 0)
+    tree = ast.parse("from __future__ import annotations")
+    tree.body.extend(init.body[begin:end + 1])
+    exec(compile(ast.fix_missing_locations(tree), str(source), "exec"), ns)
+    assert events == (["configure"] if resident else []) + ([] if shared else ["allocate"])
+    assert impl.shared_resident_candidate == shared
