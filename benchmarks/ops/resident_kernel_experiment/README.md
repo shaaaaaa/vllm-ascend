@@ -212,6 +212,12 @@ merge. It reuses existing UB scratch and adds no global buffers, payload copies,
 kernel launches, runtime serving knobs or serving-path checks (the compile flag
 defaults to zero). Native performance remains to be measured on the target NPU.
 
+On A2, integer `Compare` supports EQ only. The experimental searches implement
+`a < b` as `NOT(min(a,b) == b)` and integer NE by inverting equality masks; no
+floating-point conversion of token IDs is needed. Compare widths are padded to
+64 four-byte elements (256 bytes), including small shards. See the
+[CANN Compare contract](https://www.hiascend.com/document/detail/en/CANNCommunityEdition/850/API/ascendcopapi/atlasascendc_api_07_0066.html).
+
 Build and test the standalone kernels:
 
 ```bash

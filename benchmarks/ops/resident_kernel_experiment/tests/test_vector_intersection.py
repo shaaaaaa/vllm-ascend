@@ -18,7 +18,8 @@ def search_masks(query, target):
     remaining = len(target)
     while remaining:
         mid = (low + high) >> 1
-        less = target[mid.clamp_max(len(target)-1).long()] < query
+        candidate = target[mid.clamp_max(len(target)-1).long()]
+        less = ~(torch.minimum(candidate, query) == query)
         low = torch.where(less, (mid+1).clamp_max(len(target)), low)
         high = torch.where(less, high, mid)
         remaining >>= 1
@@ -54,6 +55,24 @@ def test_codegen_enables_only_intersection_and_reuses_original_arguments():
     assert '#define RESIDENT_EXPERIMENT_VECTOR_INTERSECTION 1' in code
     assert '#define RESIDENT_EXPERIMENT_VECTOR_UNION 0' in code
     assert '#define RESIDENT_EXPERIMENT_SKIP_UNCHANGED 0' in code
+
+
+def test_supported_integer_less_comparison_is_exact_at_int32_extremes():
+    values = torch.tensor([-2**31, -16777217, -1, 0, 1, 16777216, 16777217, 2**31-1], dtype=torch.int32)
+    a, b = torch.broadcast_tensors(values[:, None], values[None, :])
+    assert torch.equal(~(torch.minimum(a, b) == b), a < b)
+
+
+def test_experimental_searches_use_only_supported_a2_integer_compare_modes():
+    source = SOURCE.read_text(encoding='utf-8')
+    intersection = source.split('inline void IntersectionMasks(', 1)[1].split('inline void VectorIntersection(', 1)[0]
+    inverse = source.split('// 910B has no local vector Scatter.', 1)[1].split('inline uint32_t SortElementCount(', 1)[0]
+    for body in (intersection, inverse):
+        assert 'AscendC::Min(' in body
+        assert 'AscendC::Not(' in body
+        assert 'CMPMODE::LT' not in body
+        assert 'CMPMODE::NE' not in body
+    assert '(count + 63U) & ~63U' in source
 
 
 def assert_union_equal(actual, expected):

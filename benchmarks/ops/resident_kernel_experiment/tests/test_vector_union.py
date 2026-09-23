@@ -4,7 +4,7 @@ import random
 
 import pytest
 import torch
-from resident_experiment import make_case
+from resident_experiment import assert_result, make_case, reference
 
 
 def vector_model(rows, boundaries, shard, shards):
@@ -21,7 +21,8 @@ def vector_model(rows, boundaries, shard, shards):
             remaining = len(keys)
             while remaining:
                 mid = (low + high) >> 1
-                less = union[mid.clamp_max(len(keys) - 1).long()] < source
+                candidate = union[mid.clamp_max(len(keys) - 1).long()]
+                less = ~(torch.minimum(candidate, source) == source)
                 low = torch.where(less, (mid + 1).clamp_max(len(keys)), low)
                 high = torch.where(less, high, mid)
                 remaining >>= 1
@@ -95,3 +96,17 @@ def test_sort_probe_runs_without_publishing_resident_state(native, variant):
         assert keys.tolist() == [-float(t) for t in selected[:8]]
     for name in ("state_tokens", "state_slots", "state_counts", "state_generations"):
         assert torch.equal(initial[name], result[name])
+
+
+@pytest.mark.parametrize('mtp', (1, 2))
+@pytest.mark.parametrize('selected', (1, 31, 32, 33, 63, 64, 65, 95, 96, 97))
+def test_small_shards_cover_compare_repeat_boundaries(native, mtp, selected):
+    initial = make_case(1, mtp, 1, .9)
+    initial['topk'].fill_(-1)
+    initial['topk'].view(-1)[:selected] = torch.arange(selected, dtype=torch.int32)*initial.shards + 10000
+    expected, _ = reference(initial)
+    for variant in ('baseline', 'vector_union', 'vector_intersection'):
+        device_case = initial.clone(native)
+        device_case.run(variant)
+        torch.npu.synchronize()
+        assert_result(device_case, expected)

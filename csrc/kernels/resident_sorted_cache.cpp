@@ -712,7 +712,8 @@ private:
 #if RESIDENT_EXPERIMENT_VECTOR_INTERSECTION
     __aicore__ inline uint32_t IntersectionWidth(uint32_t count)
     {
-        return (count + 31U) & ~31U;
+        // A2 Compare requires 256 bytes: 64 int32 lanes, not a 32-lane sort group.
+        return (count + 63U) & ~63U;
     }
 
     // Inputs are sorted unique int32 tokens. Searches use only existing dead
@@ -753,7 +754,12 @@ private:
             AscendC::Mins(offsets, mid, static_cast<int32_t>(targetCount - 1), width); AscendC::PipeBarrier<PIPE_V>();
             AscendC::Muls(offsets, offsets, static_cast<int32_t>(4), width); AscendC::PipeBarrier<PIPE_V>();
             AscendC::Gather(candidate, target, offsets.ReinterpretCast<uint32_t>(), 0, width); AscendC::PipeBarrier<PIPE_V>();
-            AscendC::Compare(less, candidate, queries, AscendC::CMPMODE::LT, width); AscendC::PipeBarrier<PIPE_V>();
+            // A2 int32 Compare supports EQ only. a < b iff min(a,b) != b;
+            // this preserves all int32 values without overflow or float rounding.
+            AscendC::Min(offsets, candidate, queries, width); AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Compare(less, offsets, queries, AscendC::CMPMODE::EQ, width); AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Not(less.ReinterpretCast<uint16_t>(), less.ReinterpretCast<uint16_t>(), width / 16);
+            AscendC::PipeBarrier<PIPE_V>();
             AscendC::Adds(offsets, mid, static_cast<int32_t>(1), width); AscendC::PipeBarrier<PIPE_V>();
             AscendC::Mins(offsets, offsets, static_cast<int32_t>(targetCount), width); AscendC::PipeBarrier<PIPE_V>();
             AscendC::Select(low.ReinterpretCast<float>(), less, offsets.ReinterpretCast<float>(),
@@ -766,7 +772,8 @@ private:
         AscendC::Muls(offsets, offsets, static_cast<int32_t>(4), width); AscendC::PipeBarrier<PIPE_V>();
         AscendC::Gather(candidate, target, offsets.ReinterpretCast<uint32_t>(), 0, width); AscendC::PipeBarrier<PIPE_V>();
         AscendC::Compare(hit, candidate, queries, AscendC::CMPMODE::EQ, width);
-        AscendC::Compare(missing, candidate, queries, AscendC::CMPMODE::NE, width);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Not(missing.ReinterpretCast<uint16_t>(), hit.ReinterpretCast<uint16_t>(), width / 16);
         AscendC::PipeBarrier<PIPE_V>();
         AscendC::And(hit.ReinterpretCast<uint16_t>(), hit.ReinterpretCast<uint16_t>(), valid.ReinterpretCast<uint16_t>(), width / 16);
         AscendC::And(missing.ReinterpretCast<uint16_t>(), missing.ReinterpretCast<uint16_t>(), valid.ReinterpretCast<uint16_t>(), width / 16);
@@ -944,7 +951,12 @@ private:
                 AscendC::Gather(candidate, sortedTokens, gatherOffsets.ReinterpretCast<uint32_t>(),
                     static_cast<uint32_t>(0), rowWidth_);
                 AscendC::PipeBarrier<PIPE_V>();
-                AscendC::Compare(heads, candidate, input, AscendC::CMPMODE::LT, rowWidth_);
+                AscendC::Min(gatherOffsets, candidate, input, rowWidth_);
+                AscendC::PipeBarrier<PIPE_V>();
+                AscendC::Compare(heads, gatherOffsets, input, AscendC::CMPMODE::EQ, rowWidth_);
+                AscendC::PipeBarrier<PIPE_V>();
+                AscendC::Not(heads.ReinterpretCast<uint16_t>(), heads.ReinterpretCast<uint16_t>(), rowWidth_ / 16);
+                AscendC::PipeBarrier<PIPE_V>();
                 AscendC::Adds(gatherOffsets, mid, static_cast<int32_t>(1), rowWidth_);
                 AscendC::PipeBarrier<PIPE_V>();
                 // Saturate completed searches at count; Gather always clamps.
@@ -988,6 +1000,11 @@ private:
         uint32_t groups =
             (count + kSortGroup - 1) / kSortGroup;
         groups = groups == 0 ? 1 : groups;
+        if constexpr (RESIDENT_EXPERIMENT_VECTOR_UNION) {
+            // Vector dedup Compare needs a multiple of 64 float lanes. Round
+            // odd 32-element group counts up (including the 96-element case).
+            groups = (groups + 1U) & ~1U;
+        }
         uint32_t scale = 1;
         while (groups > kMergeWays) {
             groups = (groups + kMergeWays - 1) / kMergeWays;
