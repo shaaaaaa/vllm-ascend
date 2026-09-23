@@ -24,6 +24,7 @@ import subprocess
 import sys
 from sysconfig import get_paths
 
+from packaging.version import InvalidVersion
 from setuptools import Command, Extension, find_packages, setup
 from setuptools.command.build_ext import build_ext
 from setuptools.command.build_py import build_py
@@ -432,9 +433,9 @@ class custom_install(install):
 ROOT_DIR = os.path.dirname(__file__)
 try:
     VERSION = get_version(write_to="vllm_ascend/_version.py")
-except LookupError:
-    # The checkout action in github action CI does not checkout the tag. It
-    # only checks out the commit. In this case, we set a dummy version.
+except (LookupError, InvalidVersion):
+    # Untagged checkouts and descriptive benchmark tags are valid build inputs.
+    # Neither necessarily provides a PEP 440 package version.
     VERSION = "0.0.0"
 
 ext_modules = []
