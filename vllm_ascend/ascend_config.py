@@ -182,18 +182,6 @@ class AscendConfig:
     def _get_compile_ranges(compilation_config):
         return compilation_config.compile_ranges_endpoints or []
 
-    def validate_indexer_c8_layers(self, layer_names: list[str]) -> None:
-        """Require uniform C8 for physical indexer owners, honoring v0.23 policy."""
-        if not self.enable_sparse_li_c8:
-            return
-        mask = self.indexer_c8_layer_mask(layer_names)
-        missing = [name for name, enabled in zip(layer_names, mask, strict=True) if not enabled]
-        if missing:
-            raise ValueError(
-                "Two-group indexer C8 requires uniform quantization of all physical indexer layers; "
-                f"the model quantization policy excludes {missing}"
-            )
-
     def indexer_c8_layer_mask(self, layer_names: list[str | None]) -> tuple[bool, ...]:
         """Resolve upstream quantization policy, preserving physical layer order."""
         if not self.enable_sparse_li_c8:

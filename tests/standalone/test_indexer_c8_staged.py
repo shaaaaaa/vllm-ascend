@@ -122,3 +122,95 @@ def test_unbundled_staged_binding_retains_scales(c8, producer):
         assert name == ("index" if producer else None)
         assert enabled
     assert get_context.call_count == int(producer)
+
+
+@pytest.mark.parametrize("c8", [False, True])
+def test_first_consume_diagnostic_uses_physical_indexer_table(c8):
+    source = Path(__file__).parents[2] / "vllm_ascend/attention/sfa_v1.py"
+    tree = ast.parse(source.read_text(encoding="utf-8"))
+    call = next(
+        n
+        for n in ast.walk(tree)
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "queue_group1_first_consume"
+    )
+    expression = next(k.value for k in call.keywords if k.arg == "indexer_block_table")
+    logical = torch.tensor([[0, 1, 2]], dtype=torch.int32)
+    physical = logical * 2
+    ns = dict(
+        self=SimpleNamespace(use_sparse_c8_indexer=c8),
+        attn_metadata=SimpleNamespace(indexer_block_table=logical, indexer_c8_block_table=physical),
+    )
+    actual = eval(compile(ast.Expression(body=expression), str(source), "eval"), ns)
+    assert actual is (physical if c8 else logical)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_c8_hadamard_matches_activation_dtype_and_survives_later_model(dtype):
+    source = Path(__file__).parents[2] / "vllm_ascend/attention/sfa_v1.py"
+    cls = next(
+        n
+        for n in ast.parse(source.read_text(encoding="utf-8")).body
+        if isinstance(n, ast.ClassDef) and n.name == "AscendSFAImpl"
+    )
+    method = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "process_weights_after_loading")
+    nodes = [
+        n
+        for n in method.body
+        if isinstance(n, ast.If)
+        and any(isinstance(x, ast.Attribute) and x.attr in ("q_hadamard", "k_hadamard") for x in ast.walk(n))
+    ]
+    # Include any startup bindings immediately following the shared matrices.
+    nodes += [
+        n
+        for n in method.body
+        if isinstance(n, ast.Assign)
+        and any(isinstance(x, ast.Attribute) and x.attr in ("q_hadamard", "k_hadamard") for x in ast.walk(n))
+    ]
+    state = type("State", (), {"q_hadamard": None, "k_hadamard": None})
+
+    def host_tensor(data, **kwargs):
+        kwargs["device"] = "cpu"
+        return torch.tensor(data, **kwargs)
+
+    proxy = SimpleNamespace(tensor=host_tensor, bfloat16=torch.bfloat16)
+    # A signed Hadamard matrix generated without a SciPy test dependency.
+    basis = torch.ones(1, 1)
+    while basis.shape[0] < 128:
+        basis = torch.cat((torch.cat((basis, basis), 1), torch.cat((basis, -basis), 1)), 0)
+    code = compile(ast.Module(body=nodes, type_ignores=[]), str(source), "exec")
+    first = state()
+    first.use_sparse_c8_indexer = True
+    namespace = dict(
+        self=first,
+        AscendSFAImpl=state,
+        act_dtype=dtype,
+        torch=proxy,
+        scipy=SimpleNamespace(linalg=SimpleNamespace(hadamard=lambda _: basis.numpy())),
+    )
+    exec(code, namespace)
+    values = torch.arange(128, dtype=dtype).view(1, 128)
+    assert first.q_hadamard.dtype == first.k_hadamard.dtype == dtype
+    expected = values @ (basis.to(dtype) / (128**0.5))
+    assert torch.equal(values @ first.q_hadamard, expected)
+    second = state()
+    second.use_sparse_c8_indexer = True
+    other = torch.float16 if dtype == torch.bfloat16 else torch.bfloat16
+    exec(code, dict(namespace, self=second, act_dtype=other))
+    assert second.q_hadamard.dtype == other
+    assert first.q_hadamard.dtype == dtype
+    assert torch.equal(values @ first.k_hadamard, expected)
+    for name in ("indexer_select_pre_process", "indexer_select_post_process"):
+        compute = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == name)
+        product = next(
+            n
+            for n in ast.walk(compute)
+            if isinstance(n, ast.BinOp)
+            and isinstance(n.op, ast.MatMult)
+            and isinstance(n.right, ast.Attribute)
+            and n.right.attr in ("q_hadamard", "k_hadamard")
+        )
+        result = eval(
+            compile(ast.Expression(body=product), str(source), "eval"),
+            dict(self=first, AscendSFAImpl=state, k_li=values, q_li=values),
+        )
+        assert torch.equal(result, expected)

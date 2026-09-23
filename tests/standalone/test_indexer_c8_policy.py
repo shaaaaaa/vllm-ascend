@@ -16,10 +16,9 @@ def validate(monkeypatch):
         for n in ast.parse(source.read_text(encoding="utf-8")).body
         if isinstance(n, ast.ClassDef) and n.name == "AscendConfig"
     )
-    method = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "validate_indexer_c8_layers")
     ns = {}
     selector = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "indexer_c8_layer_mask")
-    exec(compile(ast.Module(body=[method, selector], type_ignores=[]), str(source), "exec"), ns)
+    exec(compile(ast.Module(body=[selector], type_ignores=[]), str(source), "exec"), ns)
     # Isolate the upstream layer-index utility from model/device imports.
     import sys
 
@@ -36,9 +35,7 @@ def validate(monkeypatch):
         )
         config.indexer_c8_layer_mask = MethodType(ns[selector.name], config)
         names = names or ["model.layers.0.self_attn.indexer.k_cache", "model.layers.3.self_attn.indexer.k_cache"]
-        if resolve:
-            return config.indexer_c8_layer_mask(names)
-        ns[method.name](config, names)
+        return config.indexer_c8_layer_mask(names)
 
     return run
 
@@ -58,9 +55,12 @@ def test_only_physical_cache_owners_need_c8_and_aliases_match_by_layer(validate)
     )
 
 
-def test_partial_layer_policy_rejected(validate):
-    with pytest.raises(ValueError, match="uniform quantization"):
-        validate({"model.layers.0.self_attn.indexer.quant_type": "INT8_DYNAMIC"})
+def test_partial_layer_policy_preserved(validate):
+    assert validate({"model.layers.0.self_attn.indexer.quant_type": "INT8_DYNAMIC"}) == (True, False)
+
+
+def test_all_bf16_layer_policy_preserved(validate):
+    assert validate({"model.layers.0.self_attn.indexer.quant_type": "FLOAT"}) == (False, False)
 
 
 def test_weight_annotation_follows_upstream_selection(validate):
@@ -133,3 +133,38 @@ def test_startup_c8_flags_and_supported_hardware(settings, device, error, enable
     else:
         exec(code, ns)
         assert obj.enable_sparse_c8 is obj.enable_sparse_li_c8 is enabled
+
+
+@pytest.mark.parametrize("mask", [(True, True), (False, True), (False, False)])
+@pytest.mark.parametrize("shared", [False, True])
+def test_runner_startup_uses_resolved_policy(mask, shared):
+    source = Path(__file__).parents[2] / "vllm_ascend/worker/model_runner_v1.py"
+    tree = ast.parse(source.read_text(encoding="utf-8"))
+    method = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "get_kv_cache_spec")
+    selection = next(
+        n
+        for n in ast.walk(method)
+        if isinstance(n, ast.If)
+        and isinstance(n.test, ast.Attribute)
+        and n.test.attr == "use_sparse_c8_indexer"
+        and any(
+            isinstance(x, ast.Call) and isinstance(x.func, ast.Attribute) and x.func.attr == "indexer_c8_layer_mask"
+            for x in ast.walk(n)
+        )
+    )
+    names = ["layer.0.indexer", "layer.1.indexer"]
+    specs = {name: SimpleNamespace(cache_sparse_c8=True, indexer_c8_layer_names=None) for name in names}
+    config = SimpleNamespace(indexer_c8_layer_mask=lambda _: mask)
+    runner = SimpleNamespace(
+        use_sparse_c8_indexer=True, _mixed_indexer_c8_names=None, ascend_config=config, dsa_shared_pool=shared
+    )
+    exec(
+        compile(ast.Module(body=[selection], type_ignores=[]), str(source), "exec"),
+        dict(self=runner, indexer_names=names, kv_cache_spec=specs),
+    )
+    assert runner.use_sparse_c8_indexer == any(mask)
+    mixed = any(mask) and not all(mask)
+    assert config.indexer_c8_shared_block_factor == (2 if shared and mixed else 1)
+    for spec in specs.values():
+        assert spec.cache_sparse_c8 == any(mask)
+        assert spec.indexer_c8_layer_names == ((names[1],) if mixed else None)
