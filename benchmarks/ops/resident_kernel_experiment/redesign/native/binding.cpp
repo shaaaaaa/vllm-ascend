@@ -10,6 +10,7 @@
 #include <initializer_list>
 #include "launch.h"
 namespace {
+static_assert(sizeof(uintptr_t) <= sizeof(uint64_t), "device address would be truncated");
 void run(at::TensorList t, int64_t universe, int64_t mode, int64_t radius, bool fused) {
     TORCH_CHECK(t.size() == 12, "expected 12 redesign tensors");
     TORCH_CHECK(t[0].is_privateuseone() && t[0].dim() == 3, "requires NPU [B,Q,K] tokens");
@@ -30,10 +31,10 @@ void run(at::TensorList t, int64_t universe, int64_t mode, int64_t radius, bool 
         TORCH_CHECK(t[i].device() == device && t[i].is_contiguous(), "device/contiguity mismatch at tensor ", i);
         if (i < 9) TORCH_CHECK(t[i].scalar_type() == (i == 6 ? at::kLong : at::kInt), "metadata dtype mismatch");
         else TORCH_CHECK(t[i].scalar_type() == t[9].scalar_type(), "KV dtypes differ");
-        a.p[i] = t[i].data_ptr();
-        TORCH_CHECK(reinterpret_cast<uintptr_t>(a.p[i]) % 32 == 0, "unaligned buffer");
+        a.p[i] = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(t[i].data_ptr()));
+        TORCH_CHECK(a.p[i] % 32 == 0, "unaligned buffer");
         for (size_t j = 0; j < i; ++j) {
-            auto p = reinterpret_cast<uintptr_t>(a.p[i]), r = reinterpret_cast<uintptr_t>(a.p[j]);
+            auto p = a.p[i], r = a.p[j];
             TORCH_CHECK(p + t[i].nbytes() <= r || r + t[j].nbytes() <= p, "buffers overlap");
         }
     }
