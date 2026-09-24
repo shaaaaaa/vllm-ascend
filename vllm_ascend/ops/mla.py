@@ -161,6 +161,9 @@ class AscendMultiHeadLatentAttention(MultiHeadLatentAttentionWrapper):
             else ""
         )
         self.use_cross_layer_sfa = getattr(self.mla_attn.impl, "enable_staged_sfa_graph", False) is True
+        # Model profiling compiles before KV allocation. Select the operator
+        # from startup configuration, never from a late-created cache tensor.
+        self.use_retrieval_overlap = bool(envs_ascend.VLLM_ASCEND_SFA_SHARED_RETRIEVAL_OVERLAP)
         self.target_sfa_debug = bool(
             self.use_cross_layer_sfa
             and envs_ascend.VLLM_ASCEND_MTP_DRAFT_DEBUG
@@ -233,11 +236,10 @@ class AscendMultiHeadLatentAttention(MultiHeadLatentAttentionWrapper):
                 self.prefix,
                 self.next_layer_name,
             )
-            destinations = getattr(impl, "_retrieval_prefetch_destinations", ())
-            if destinations:
+            if self.use_retrieval_overlap:
                 torch.ops.vllm.sfa_forward_post_prefetch(
                     ql_nope, q_pe, topk_indices, selected_packed, selected_counts,
-                    target_slots, output, self.prefix, destinations,
+                    target_slots, output, self.prefix,
                 )
             else:
                 torch.ops.vllm.sfa_forward_post(
@@ -509,7 +511,6 @@ def sfa_forward_post_prefetch(
     target_slots: torch.Tensor,
     output: torch.Tensor,
     layer_name: str,
-    destinations: list[torch.Tensor],
 ) -> None:
     impl, attn_layer_name, kv_cache, attn_metadata = _mla_runtime_state(layer_name)
     _, outgoing = impl._shared_retrieval_edges()
@@ -518,7 +519,7 @@ def sfa_forward_post_prefetch(
     if edge is not None:
         capacity = edge.transfer.request_capacity
         prefetch = (edge, selected_packed[:capacity], selected_counts[:capacity],
-                    target_slots[:capacity], destinations)
+                    target_slots[:capacity], edge.destinations)
     impl.cross_layer_graph_post(
         attn_layer_name, ql_nope, q_pe, topk_indices, kv_cache, attn_metadata, output,
         prefetch=prefetch,
@@ -534,7 +535,6 @@ def sfa_forward_post_prefetch_fake(
     target_slots: torch.Tensor,
     output: torch.Tensor,
     layer_name: str,
-    destinations: list[torch.Tensor],
 ) -> None:
     return
 
@@ -599,7 +599,9 @@ direct_register_custom_op(
 direct_register_custom_op(
     op_name="sfa_forward_post_prefetch",
     op_func=sfa_forward_post_prefetch,
-    mutates_args=["output", "destinations"],
+    # As with sfa_lmcache_retrieve, cache storage is resolved by layer at
+    # execution. The mutated output keeps model consumers ordered after us.
+    mutates_args=["output"],
     fake_impl=sfa_forward_post_prefetch_fake,
     dispatch_key="PrivateUse1",
 )

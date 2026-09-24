@@ -57,12 +57,17 @@ It does execute extra device event dependencies; zero device overhead is not
 claimed, particularly on all-hit steps.
 
 Layer cache destinations are checked for overlapping byte ranges before capture;
-disjoint views of the same storage remain legal. The new private post operator
-declares destination mutation explicitly. Ascend's existing AOT buffer-reuse
-pass now includes these fixed destinations: both functionalization versions
-otherwise clone them, which is incompatible with fixed native transfer pointers.
-The helper rejects substituted destinations and retains the actual payload
-arguments through graph cleanup. No extra persistent KV bank is allocated.
+disjoint views of the same storage remain legal. The prefetch-capable post
+operator is selected from the startup flag BEFORE initial model compilation.
+It resolves the current prepared edge and its fixed cache destinations inside
+the opaque operator, just as the existing retrieval operator resolves its
+cache state by layer. Its output mutation preserves the model's computation
+order; consumer pre-compute also explicitly waits for the transfer. Cache
+buffers must not be traced as late-created Python tensor attributes: vLLM's
+initial profile compiles before KV initialization and cached callables can
+bypass guards afterward. Resident plan read/write tensors remain explicit,
+with their existing AOT buffer-reuse handling unchanged. Payload arguments are
+retained through synchronized graph cleanup. No extra KV bank is allocated.
 
 Every edge joins before its consumer, so root completion still covers all KV
 transfers and protects source leases/pointer-table replacement. Uncertain
@@ -135,7 +140,8 @@ on a CPU-only development host. No measured serving speedup is claimed here.
 ## Independent audit — 2026-09-24
 
 **Fixed, reproduced defect:** graph-memory profiling cleanup left temporary KV
-alive through the overlap topology and each producer's destination list. The
+alive through the overlap topology (and the original per-layer destination
+lists, subsequently removed by the capture dispatch fix). The
 regression executes the actual Ascend runner cleanup method and checks tensor
 weak references with GC disabled; it failed before the fix. Profiling cleanup
 now releases those references after synchronized graph cleanup and before the
@@ -156,8 +162,9 @@ The source and ordering audit confirmed:
   request scheduling, recovery gates and generation invalidation are unchanged.
   This is an audit of integration with those contracts, not exhaustive native
   qualification of every storage/deployment combination.
-- Explicit destinations survive both AOT functionalization versions without
-  cloning; payload ownership, inactive/full-graph gating, duplicate suppression,
+- Prepared destinations are resolved inside the opaque operator, including
+  after initial compilation without KV. Both AOT functionalization versions,
+  payload ownership, inactive/full-graph gating, duplicate suppression,
   partial-capture fail-stop and GC-disabled cleanup have CPU regression coverage.
 - Disabled captured execution keeps its original device operator sequence.
   Eager Python does have small new attribute/optional-prefetch checks; zero
@@ -171,3 +178,22 @@ Two compilation modules needing an installed vLLM runtime and the Windows Gloo
 device tests were excluded. NPU tests remain unrun on this host. Targeted Ruff,
 syntax and whitespace checks passed. Matching sibling source snapshots were
 used for CPU tests that inspect the vLLM/LMCache integration contracts.
+
+## Capture dispatch correction — 2026-09-24
+
+A startup log showed `rtStreamWaitEvent` error 107024: a captured consumer wait
+had no corresponding event record. The original MLA forward selected the new
+operator only when a destination list populated during KV initialization was
+nonempty. Initial model profiling runs before that initialization; a cached
+compiled callable therefore retained the serial post operator even after edges
+were prepared. Consumer pre-compute could then wait for a prefetch never launched.
+
+A regression traces the actual MLA forward before KV setup and executes the
+cached graph after setup. It failed on the original dispatch. The choice is now
+fixed from the startup knob in the MLA constructor, and destinations are resolved
+at opaque-operator execution. There are no KV tensor attributes frozen into the
+compiled post call. AOT tests exercise both modes with edges installed only
+AFTER initial compilation. Startup/capture bookkeeping also rejects a join with
+no matching launch before issuing a native wait; priming events outside capture
+is not treated as a record in the captured graph. This bookkeeping never runs
+on graph replay. Native recapture still requires qualification on the NPU host.

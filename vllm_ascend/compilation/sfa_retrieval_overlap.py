@@ -37,6 +37,7 @@ class RetrievalEdge:
 
     def __post_init__(self) -> None:
         self.payload = None
+        self.pending_capture_launch = False
         self.start = torch.npu.Event(enable_timing=False)
         self.done = torch.npu.Event(enable_timing=False)
         # Initialize event resources outside capture; also join initialization.
@@ -47,6 +48,8 @@ class RetrievalEdge:
         main.wait_event(self.done)
 
     def launch(self, selected, counts, slots, destinations) -> None:
+        if self.pending_capture_launch:
+            raise RuntimeError("prefetch launched twice without a consumer join")
         # The native transfer owns fixed destinations. Reject substitutions,
         # including functionalized copies, rather than writing hidden storage.
         if len(destinations) != len(self.destinations) or any(
@@ -74,9 +77,15 @@ class RetrievalEdge:
             self.stream.wait_event(self.start)
             self.transfer.load(selected, counts, slots)
             self.done.record(self.stream)
+        self.pending_capture_launch = True
 
     def join(self) -> None:
+        # Python executes only at capture/warmup, not graph replay. Priming an
+        # event outside capture is NOT proof of a record inside this graph.
+        if not self.pending_capture_launch:
+            raise RuntimeError("consumer prefetch wait has no producer launch in this capture")
         torch.npu.current_stream().wait_event(self.done)
+        self.pending_capture_launch = False
 
 
 @dataclass
@@ -150,7 +159,6 @@ class SharedRetrievalOverlap:
         self.pairs = pairs
         for name, impl in impls:
             impl._retrieval_overlap = self
-            impl._retrieval_prefetch_destinations = list(pairs[name][1]) if name in pairs else []
 
     def prepare(self, key, impls, groups, max_cube_tokens: int) -> None:
         if self.failed:
@@ -211,6 +219,5 @@ class SharedRetrievalOverlap:
             raise RuntimeError("clear overlap graphs before releasing cache layout")
         for _, impl in impls:
             if getattr(impl, "_retrieval_overlap", None) is self:
-                impl._retrieval_prefetch_destinations = []
                 impl._retrieval_overlap = None
         self.pairs.clear()

@@ -210,6 +210,23 @@ def test_edge_retains_actual_payload_until_cleanup(runtime):
     assert all(ref() is None for ref in refs)
 
 
+def test_capture_join_requires_a_launch_not_just_a_primed_event(runtime):
+    module, log = runtime
+    edge = module.RetrievalEdge(torch.npu.Stream(), NS(load=Mock()), (torch.zeros(4),))
+    log.clear()
+    with pytest.raises(RuntimeError, match="no producer launch"):
+        edge.join()
+    assert not log  # Reject before submitting an invalid native event wait.
+    selected, counts, slots = torch.arange(4), torch.tensor([4]), torch.arange(4)
+    for _ in range(2):
+        edge.launch(selected, counts, slots, edge.destinations)
+        with pytest.raises(RuntimeError, match="twice"):
+            edge.launch(selected, counts, slots, edge.destinations)
+        edge.join()
+        with pytest.raises(RuntimeError, match="no producer launch"):
+            edge.join()
+
+
 def test_no_owner_cycle_with_gc_disabled(runtime):
     module, _ = runtime
     was_enabled = gc.isenabled()
@@ -285,19 +302,19 @@ def test_edges_are_only_used_in_root_graph(active):
 
 def test_private_post_operator_passes_call_payload_not_hidden_plan():
     selected, counts, slots = torch.ones(4, 8), torch.ones(4), torch.ones(4, 8)
-    edge = NS(transfer=NS(request_capacity=2))
+    dest = [torch.empty(4)]
+    edge = NS(transfer=NS(request_capacity=2), destinations=dest)
     impl = NS(_shared_retrieval_edges=lambda: ({}, {"producer": edge}), cross_layer_graph_post=Mock())
     op = extract(ROOT / "vllm_ascend/ops/mla.py", "sfa_forward_post_prefetch",
                  {"_mla_runtime_state": lambda name: (impl, "producer", (), NS())})
-    dest = [torch.empty(4)]
-    op(selected, selected, selected, selected, counts, slots, selected, "wrapper", dest)
+    op(selected, selected, selected, selected, counts, slots, selected, "wrapper")
     actual = impl.cross_layer_graph_post.call_args.kwargs["prefetch"]
     assert actual[0] is edge and actual[-1] is dest
     for sliced, source in zip(actual[1:4], (selected, counts, slots)):
         assert sliced.data_ptr() == source.data_ptr() and sliced.shape[0] == 2
 
 
-def test_prefetch_operator_declares_destination_writes():
+def test_prefetch_operator_preserves_output_effect_ordering():
     tree = ast.parse((ROOT / "vllm_ascend/ops/mla.py").read_text(encoding="utf-8"))
     calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
              and n.func.id == "direct_register_custom_op"]
@@ -305,7 +322,7 @@ def test_prefetch_operator_declares_destination_writes():
                                       and k.value.value == "sfa_forward_post_prefetch" for k in n.keywords)]
     assert len(matches) == 1
     writes = next(k.value for k in matches[0].keywords if k.arg == "mutates_args")
-    assert ast.literal_eval(writes) == ["output", "destinations"]
+    assert ast.literal_eval(writes) == ["output"]
 
 
 def test_partial_capture_failure_keeps_owner_until_synchronized_clear(graph_module, monkeypatch):
@@ -385,7 +402,7 @@ def test_each_layer_copies_once_with_layer_specific_values(runtime, active):
 
 @pytest.mark.parametrize("v2", [False, True])
 @pytest.mark.parametrize("shared_storage", [False, True])
-def test_ascend_aot_preserves_prefetch_destinations(v2, shared_storage):
+def test_aot_resolves_late_destinations_inside_prefetch_operator(v2, shared_storage):
     import functools
     from torch._dynamo.backends.common import aot_autograd
     from torch._inductor import config
@@ -397,20 +414,25 @@ def test_ascend_aot_preserves_prefetch_destinations(v2, shared_storage):
     destinations = ([backing[:8].view(2, 4), backing[8:].view(2, 2)] if shared_storage
                     else [torch.zeros(2, 4), torch.zeros(2, 2)])
     seen = []
-    edge = NS(transfer=NS(request_capacity=2))
+    edge = NS(transfer=NS(request_capacity=2), destinations=destinations)
+    active = NS(value=False)
     def post(*args, prefetch):
+        args[-1].copy_(args[1])
+        if prefetch is None:
+            return
         buffers = prefetch[-1]
         seen.append([t.data_ptr() for t in buffers])
         for buf in buffers:
             buf.add_(1)
         args[-1].copy_(args[1])
-    impl = NS(_shared_retrieval_edges=lambda: ({}, {"producer": edge}), cross_layer_graph_post=post)
+    impl = NS(_shared_retrieval_edges=lambda: ({}, {"producer": edge} if active.value else {}),
+              cross_layer_graph_post=post)
     ns = {"torch": torch, "_mla_runtime_state": lambda name: (impl, "producer", (), NS())}
     op_fn = extract(ROOT / "vllm_ascend/ops/mla.py", "sfa_forward_post_prefetch", ns)
     fake = extract(ROOT / "vllm_ascend/ops/mla.py", "sfa_forward_post_prefetch_fake", {})
     namespace = f"prefetch_island_{int(v2)}_{int(shared_storage)}"
     lib = torch.library.Library(namespace, "DEF")
-    lib.define("post" + torch.library.infer_schema(op_fn, mutates_args=["output", "destinations"]))
+    lib.define("post" + torch.library.infer_schema(op_fn, mutates_args=["output"]))
     lib.impl("post", op_fn, "CPU")
     lib._register_fake("post", fake)
     op = getattr(torch.ops, namespace).post
@@ -423,14 +445,17 @@ def test_ascend_aot_preserves_prefetch_destinations(v2, shared_storage):
         compiler[name] = extract(source, name, compiler)
     def backend(graph, inputs):
         return compiler["fusion_pass_compile"](graph, inputs, {"passes": lambda g: g}, None)[0]
-    def forward(x, buffers):
+    def forward(x):
         output = torch.empty_like(x)
-        op(x, x, x, x, x, x, output, "producer", buffers)
+        op(x, x, x, x, x, x, output, "producer")
         return output
     with config.patch(enable_auto_functionalized_v2=v2):
         compiled = torch.compile(forward, backend=backend, fullgraph=True, dynamic=False)
+        torch.testing.assert_close(compiled(data), data)  # Initial model profiling: no edges.
+        assert not seen
+        active.value = True  # KV setup after compilation, before capture.
         for _ in range(2):
-            torch.testing.assert_close(compiled(data, destinations), data)
+            torch.testing.assert_close(compiled(data), data)
     assert seen == [[t.data_ptr() for t in destinations]] * 2
     assert all(t.eq(2).all() for t in destinations)
 
@@ -465,7 +490,7 @@ def test_disabled_mla_keeps_original_operator_sequence():
     exec(compile(ast.fix_missing_locations(module), str(source), "exec"), ns)
     impl = NS(shared_resident_plan=None, local_num_heads=1, kv_lora_rank=4, qk_rope_head_dim=2,
               index_topk=2048, _staged_sfa_graph_capture_sizes=(4,), decode_threshold=2)
-    layer = NS(use_cross_layer_sfa=True, target_sfa_debug=False, mla_attn=NS(impl=impl),
+    layer = NS(use_cross_layer_sfa=True, use_retrieval_overlap=False, target_sfa_debug=False, mla_attn=NS(impl=impl),
                prefix="layer", next_layer_name="next")
     ns["forward"](layer, x, x)
     assert events == ["pre", "retrieve", "post"]
@@ -534,16 +559,51 @@ def test_graph_reset_retains_real_layout_but_profile_release_requires_clear(runt
     owner.prepare(Key(), tuple(impls.items()), groups, 1024)
     with pytest.raises(RuntimeError, match="clear overlap graphs"):
         owner.release_layout(tuple(impls.items()))
-    destinations = impls["g0l0"]._retrieval_prefetch_destinations
+    destinations = owner.pairs["g0l0"][1]
     owner.clear()
-    assert impls["g0l0"]._retrieval_prefetch_destinations is destinations
+    assert owner.pairs["g0l0"][1] is destinations
     owner.prepare(Key(), tuple(impls.items()), groups, 1024)
     assert owner.edges(Key())[1]["g0l0"].destinations == tuple(destinations)
     owner.clear()
     owner.release_layout(tuple(impls.items()))
-    assert not owner.pairs and not impls["g0l0"]._retrieval_prefetch_destinations
+    assert not owner.pairs
     assert impls["g0l0"]._retrieval_overlap is None
     # Final cache allocation uses the same layer objects but different storage.
     fresh = {name: tuple(t.clone() for t in values) for name, values in caches.items()}
     owner.configure(tuple(impls.items()), groups, fresh)
-    assert impls["g0l0"]._retrieval_prefetch_destinations[0] is fresh["g0l1"][0]
+    assert owner.pairs["g0l0"][1][0] is fresh["g0l1"][0]
+
+
+def test_compile_before_kv_initialization_keeps_prefetch_dispatch():
+    """Model profiling compiles without KV; later execution bypasses guards."""
+    from torch.fx.experimental.proxy_tensor import make_fx
+
+    def pre(*args):
+        return (args[0],) * 6
+
+    def serial_post(*args):
+        args[6].copy_(args[0] + 1)
+
+    def overlap_post(*args):
+        args[6].copy_(args[0] + 2)
+
+    ops = NS(sfa_forward_pre=pre, sfa_forward_pre_shared=pre,
+             sfa_lmcache_retrieve=lambda *args: None,
+             sfa_forward_post=serial_post, sfa_forward_post_prefetch=overlap_post)
+    source = ROOT / "vllm_ascend/ops/mla.py"
+    tree = ast.parse(source.read_text(encoding="utf-8"))
+    cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "AscendMultiHeadLatentAttention")
+    fn = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "forward")
+    mod = ast.parse("from __future__ import annotations")
+    mod.body.append(fn)
+    ns = {"torch": NS(empty=torch.empty, ops=NS(vllm=ops)), "_EXTRA_CTX": NS(flash_comm_v1_enabled=False)}
+    exec(compile(ast.fix_missing_locations(mod), str(source), "exec"), ns)
+    impl = NS(shared_resident_plan=None, local_num_heads=1, kv_lora_rank=4, qk_rope_head_dim=2,
+              index_topk=2048, _staged_sfa_graph_capture_sizes=(4,), decode_threshold=2)
+    layer = NS(use_cross_layer_sfa=True, use_retrieval_overlap=True, target_sfa_debug=False,
+               mla_attn=NS(impl=impl), prefix="layer", next_layer_name="next")
+    x = torch.ones(2, 4)
+    compiled = make_fx(lambda value: ns["forward"](layer, value, value))(x)
+    impl._retrieval_overlap = NS()
+    # Execute the already-compiled callable, as the no-guards runner does.
+    torch.testing.assert_close(compiled(x), x + 2)
