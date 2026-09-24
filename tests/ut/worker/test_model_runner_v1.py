@@ -1552,6 +1552,39 @@ class TestStagedSFADummyBatch(unittest.TestCase):
             remap_frontiers=[7936],
         )
 
+    def test_full_resident_decode_uses_staged_graph_with_zero_frontier(self):
+        runner = self._build_runner()
+        metadata = SimpleNamespace(
+            requests=[
+                SimpleNamespace(
+                    req_id="resident",
+                    is_sparse_decode=True,
+                    dsa_current_released_frontier=0,
+                    dsa_nonresident_frontier=0,
+                    load_spec=SimpleNamespace(
+                        can_load=False,
+                        lmcache_cached_tokens=0,
+                        dsa_committed_end=0,
+                    ),
+                )
+            ]
+        )
+        route = runner._staged_sfa_local_route(
+            num_tokens_unpadded=1,
+            num_reqs=1,
+            num_scheduled_tokens=np.ones(1, dtype=np.int32),
+            index_topk=2048,
+            has_cascade_attention=False,
+            request_ids=["resident"],
+            kv_connector_metadata=metadata,
+            num_computed_tokens=np.array([6], dtype=np.int32),
+            prompt_lens=np.array([6], dtype=np.int32),
+        )
+
+        self.assertEqual(route.action, StagedSFARouteAction.STAGED)
+        self.assertEqual(route.reason, StagedSFARouteReason.ELIGIBLE)
+        self.assertEqual(route.frontiers, (0,))
+
     def test_speculative_cold_resume_uses_staged_graph(self):
         runner = self._build_runner()
         runner.speculative_config = SimpleNamespace(
