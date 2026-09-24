@@ -586,9 +586,15 @@ class SpecDecodeBaseProposer(EagleProposer):
                 seq_lens,
             )
             indexer_block_table = getattr(metadata, "indexer_block_table", None)
+            indexer_slots = getattr(metadata, "indexer_slot_mapping", None)
+            if getattr(getattr(layer, "impl", None), "use_sparse_c8_indexer", False):
+                c8_table = getattr(metadata, "indexer_c8_block_table", None)
+                if c8_table is not None:
+                    indexer_block_table = c8_table
+                    indexer_slots = metadata.indexer_c8_slot_mapping
             indexer_block_ids = referenced_block_ids(
                 (indexer_block_table if indexer_block_table is not None else block_table),
-                (getattr(metadata, "indexer_slot_mapping", None),),
+                (indexer_slots,),
                 block_size,
                 seq_lens,
             )

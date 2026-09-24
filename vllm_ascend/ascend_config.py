@@ -153,11 +153,21 @@ class AscendConfig:
         # Disable Sparse C8 for A5
         # A5 has not been fully validated for this path and may carry hidden risks.
         # TODO(rjg-lyh): Enable A5 support after sufficient validation.
-        self.enable_sparse_c8 = (
-            additional_config.get("enable_sparse_c8", False)
-            and use_sparse
-            and get_ascend_device_type() != AscendDeviceType.A5
-        )
+        if additional_config.get("enable_sparse_sfa_c8", False):
+            raise NotImplementedError("This deployment supports indexer C8 only; keep enable_sparse_sfa_c8=false")
+        if "enable_sparse_li_c8" in additional_config and "enable_sparse_c8" in additional_config:
+            if additional_config["enable_sparse_li_c8"] != additional_config["enable_sparse_c8"]:
+                raise ValueError("enable_sparse_li_c8 conflicts with legacy enable_sparse_c8")
+        indexer_c8 = additional_config.get("enable_sparse_li_c8", additional_config.get("enable_sparse_c8", False))
+        if additional_config.get("enable_sparse_li_c8", False) and get_ascend_device_type() == AscendDeviceType.A5:
+            raise NotImplementedError("Indexer INT8/FP16-scale caching is supported on A2/A3 only")
+        self.enable_sparse_c8 = indexer_c8 and use_sparse and get_ascend_device_type() != AscendDeviceType.A5
+        self.enable_sparse_li_c8 = self.enable_sparse_c8
+        if self.enable_sparse_li_c8:
+            if get_ascend_device_type() not in (AscendDeviceType.A2, AscendDeviceType.A3):
+                raise NotImplementedError("Indexer INT8/FP16-scale caching is supported on A2/A3 only")
+            if additional_config.get("c8_enable_reshape_optim", False):
+                raise NotImplementedError("Indexer C8 currently requires the scatter-based write path")
 
         self.enable_sp_by_pass = (
             vllm_config.model_config is not None
@@ -171,6 +181,34 @@ class AscendConfig:
     @staticmethod
     def _get_compile_ranges(compilation_config):
         return compilation_config.compile_ranges_endpoints or []
+
+    def indexer_c8_layer_mask(self, layer_names: list[str | None]) -> tuple[bool, ...]:
+        """Resolve upstream quantization policy, preserving physical layer order."""
+        if not self.enable_sparse_li_c8:
+            return (False,) * len(layer_names)
+        description = getattr(getattr(self.vllm_config, "quant_config", None), "quant_description", None)
+        if not isinstance(description, dict) or not any(
+            isinstance(key, str) and key.endswith(".indexer.quant_type") for key in description
+        ):
+            return (True,) * len(layer_names)
+        from vllm.model_executor.models.utils import extract_layer_index
+
+        selected_names, selected_ids = set(), set()
+        for key, value in description.items():
+            if not isinstance(key, str) or value not in ("INT8_DYNAMIC", "W8A8_MXFP8"):
+                continue
+            suffix = next((s for s in (".indexer.quant_type", ".indexer.wq_b_weight") if key.endswith(s)), None)
+            if suffix is not None:
+                name = key[: -len(suffix)].rstrip(".")
+                if name:
+                    selected_names.add(name)
+                    selected_ids.add(extract_layer_index(name))
+        return tuple(
+            name is not None and (
+                any(name == prefix or name.startswith(prefix + ".") for prefix in selected_names)
+                or extract_layer_index(name) in selected_ids
+            ) for name in layer_names
+        )
 
     @staticmethod
     def _set_compile_ranges(compilation_config, value):

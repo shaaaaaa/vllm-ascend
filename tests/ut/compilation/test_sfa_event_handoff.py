@@ -104,6 +104,7 @@ def handoff():
         index_topk=4,
         diagnostic_num_cache_layers=2,
         has_indexer=True,
+        use_sparse_c8_indexer=False,
         index_cache_enabled=False,
     )
 

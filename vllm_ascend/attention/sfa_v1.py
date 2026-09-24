@@ -33,6 +33,7 @@ from vllm.v1.attention.backend import (
 from vllm.v1.kv_cache_interface import AttentionSpec
 
 from vllm_ascend import envs
+from vllm_ascend.worker.dsa_shared_pool import MixedIndexerMetadata
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import (
     _EXTRA_CTX,
@@ -1026,6 +1027,8 @@ class AscendSFAMetadata:
     # None in single-group mode (indexer shares the latent's block ids).
     indexer_block_table: torch.Tensor | None = None
     indexer_slot_mapping: torch.Tensor | None = None
+    indexer_c8_block_table: torch.Tensor | None = None
+    indexer_c8_slot_mapping: torch.Tensor | None = None
     reshape_cache_event: torch.npu.Event = None
     sfa_cp_metadata: AscendPCPMetadata | None = None
     num_decodes: int = 0
@@ -1105,6 +1108,14 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
 
         self.block_size = vllm_config.cache_config.block_size
         self.max_blocks = (vllm_config.model_config.max_model_len + self.block_size - 1) // self.block_size
+        self._mixed_indexer_metadata = None
+        if getattr(get_ascend_config(), "indexer_c8_shared_block_factor", 1) == 2:
+            self._mixed_indexer_metadata = MixedIndexerMetadata(
+                vllm_config.scheduler_config.max_num_seqs,
+                (self.max_blocks + 8) // 9 * 9,
+                vllm_config.scheduler_config.max_num_batched_tokens,
+                device,
+            )
 
         self.speculative_config = vllm_config.speculative_config
         self.decode_threshold = 1
@@ -1335,9 +1346,14 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
         # slicing as the latent's) so the impl can address the indexer cache.
         indexer_block_table = None
         indexer_slot_mapping = None
+        indexer_c8_block_table = indexer_c8_slot_mapping = None
         if common_attn_metadata.indexer_block_table_tensor is not None:
             indexer_block_table = common_attn_metadata.indexer_block_table_tensor[:num_reqs]
             indexer_slot_mapping = common_attn_metadata.indexer_slot_mapping[:num_input_tokens]
+            if self._mixed_indexer_metadata is not None:
+                indexer_c8_block_table, indexer_c8_slot_mapping = self._mixed_indexer_metadata.update(
+                    indexer_block_table, indexer_slot_mapping
+                )
 
         # DSA shrink-latent: expand per-request prompt lengths to per-row cache
         # boundaries for sparse-index preparation. Decode rows start at the
@@ -1815,6 +1831,8 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             dsa_cp_context=dsa_cp_context,
             indexer_block_table=indexer_block_table,
             indexer_slot_mapping=indexer_slot_mapping,
+            indexer_c8_block_table=indexer_c8_block_table,
+            indexer_c8_slot_mapping=indexer_c8_slot_mapping,
             # DSA latent offload: best-effort; getattr -> None when not threaded in yet
             # (harmless unless the feature is enabled). HW-VERIFY the real source.
             req_ids=getattr(common_attn_metadata, "request_ids", None),
@@ -2113,8 +2131,10 @@ class AscendSFAImpl(MLAAttentionImpl):
         # dsa c8
         # Shared-consumer layers have no indexer KV to quantize, so the C8
         # indexer path only applies to producer layers.
-        self.use_sparse_c8_indexer = self.has_indexer and ascend_config.enable_sparse_c8
+        self.use_sparse_c8_indexer = self.has_indexer and ascend_config.indexer_c8_layer_mask([self.layer_name])[0]
         if self.use_sparse_c8_indexer:
+            if not hasattr(torch.ops._C_ascend, "npu_lightning_indexer_quant"):
+                raise RuntimeError("Indexer C8 requires the vLLM-Ascend quantized lightning-indexer operator")
             self.c8_k_cache_dtype = torch.int8
             self.c8_k_scale_cache_dtype = torch.float16
 
@@ -2222,14 +2242,19 @@ class AscendSFAImpl(MLAAttentionImpl):
             # if mlapo, W_UK_T can't trans nz
             self.W_UK_T = maybe_trans_nz(self.W_UK_T)
 
-        if self.use_sparse_c8_indexer and AscendSFAImpl.q_hadamard is None:
-            AscendSFAImpl.q_hadamard = torch.tensor(scipy.linalg.hadamard(128), dtype=torch.bfloat16, device="npu") / (
-                128**0.5
-            )
-        if self.use_sparse_c8_indexer and AscendSFAImpl.k_hadamard is None:
-            AscendSFAImpl.k_hadamard = torch.tensor(scipy.linalg.hadamard(128), dtype=torch.bfloat16, device="npu") / (
-                128**0.5
-            )
+        if self.use_sparse_c8_indexer:
+            if AscendSFAImpl.q_hadamard is None or AscendSFAImpl.q_hadamard.dtype != act_dtype:
+                AscendSFAImpl.q_hadamard = torch.tensor(scipy.linalg.hadamard(128), dtype=act_dtype, device="npu") / (
+                    128**0.5
+                )
+            if AscendSFAImpl.k_hadamard is None or AscendSFAImpl.k_hadamard.dtype != act_dtype:
+                AscendSFAImpl.k_hadamard = torch.tensor(scipy.linalg.hadamard(128), dtype=act_dtype, device="npu") / (
+                    128**0.5
+                )
+            # Bind each layer to its constants; a later model/draft initialization
+            # with another dtype must not change an existing graph's operands.
+            self.q_hadamard = AscendSFAImpl.q_hadamard
+            self.k_hadamard = AscendSFAImpl.k_hadamard
 
     # Processing the input parameters for MLAPO by reordering and transposing
     # QKV(and part of Q) weight, applying RoPE-related dimension transformations,
@@ -2673,7 +2698,7 @@ class AscendSFAImpl(MLAAttentionImpl):
             k_li = torch.cat([k_li_pe, k_li_nope], dim=-1)  # [b*s,128]
 
         if self.use_sparse_c8_indexer:
-            k_li = k_li @ AscendSFAImpl.k_hadamard
+            k_li = k_li @ self.k_hadamard
             k_li, k_li_scale = torch_npu.npu_dynamic_quant(k_li.view(-1, self.head_dim), dst_type=self.c8_k_cache_dtype)
             k_li_scale = k_li_scale.to(self.c8_k_scale_cache_dtype)  # [b*s,]
             k_li_scale = k_li_scale.unsqueeze(-1)  # [b*s,1]
@@ -2722,6 +2747,8 @@ class AscendSFAImpl(MLAAttentionImpl):
                 if attn_metadata.indexer_block_table is not None
                 else attn_metadata.block_table
             )
+            if self.use_sparse_c8_indexer and attn_metadata.indexer_c8_block_table is not None:
+                indexer_block_table = attn_metadata.indexer_c8_block_table
         weights, _ = self.weights_proj(x)
 
         q_li, _ = self.wq_b(q_c)  # [b,s,1536] @ [1536,64*128] = [b,s,64*128]
@@ -2742,7 +2769,7 @@ class AscendSFAImpl(MLAAttentionImpl):
 
         if self.use_sparse_c8_indexer:
             q_li_shape_ori = q_li.shape
-            q_li = q_li @ AscendSFAImpl.q_hadamard
+            q_li = q_li @ self.q_hadamard
             q_li, q_li_scale = torch_npu.npu_dynamic_quant(q_li.view(-1, self.head_dim), dst_type=self.c8_k_cache_dtype)
             q_li_scale = q_li_scale.to(self.c8_k_scale_cache_dtype)
 
@@ -2977,8 +3004,6 @@ class AscendSFAImpl(MLAAttentionImpl):
             return "DSA context parallelism is enabled"
         if self.enable_dsa_cp_with_o_proj_tp:
             return "DSA o_proj tensor parallelism is enabled"
-        if self.use_sparse_c8_indexer:
-            return "the sparse C8 indexer is enabled"
         if self.dsa_offload_free_paged:
             return "the free-paged offload path is enabled"
         if envs.VLLM_ASCEND_DSA_OFFLOAD_ASSERT_PARITY:
@@ -2987,7 +3012,8 @@ class AscendSFAImpl(MLAAttentionImpl):
             return "the DSA offload manager is active"
         if getattr(forward_context, "dsa_adapter_cache", None) is not None:
             return "the DSA adapter cache is active"
-        if len(kv_cache) not in ((3,) if self.has_indexer else (2, 3)):
+        producer_planes = 4 if self.use_sparse_c8_indexer else 3
+        if len(kv_cache) not in ((producer_planes,) if self.has_indexer else (2, 3)):
             return (
                 "the POC requires the indexer plane plus two latent tensors"
                 if self.has_indexer
@@ -3009,6 +3035,8 @@ class AscendSFAImpl(MLAAttentionImpl):
             if self.topk_indices_buffer is None:
                 return "the shared-consumer staged graph requires the shared top-k buffer"
             expected_hidden_dims = expected_hidden_dims[:2]
+        elif self.use_sparse_c8_indexer:
+            expected_hidden_dims += (1,)
         if tuple(int(cache.shape[-1]) for cache in kv_cache) != tuple(int(dim) for dim in expected_hidden_dims):
             return "the staged KV cache hidden dimensions do not match SFA"
         cache_block_sizes = {int(cache.shape[1]) for cache in kv_cache}
@@ -3021,7 +3049,12 @@ class AscendSFAImpl(MLAAttentionImpl):
             return "the staged KV caches do not have one safe dummy block per request"
         if len({cache.device for cache in kv_cache}) != 1:
             return "the staged KV caches are on different devices"
-        cache_dtypes = {cache.dtype for cache in kv_cache}
+        if self.has_indexer and self.use_sparse_c8_indexer:
+            if kv_cache[2].dtype != torch.int8 or kv_cache[3].dtype != torch.float16:
+                return "the C8 indexer requires int8 keys and float16 scales"
+            if kv_cache[2].shape[:3] != kv_cache[3].shape[:3]:
+                return "the C8 indexer keys and scales must share block ownership"
+        cache_dtypes = {cache.dtype for cache in (kv_cache[:2] if self.use_sparse_c8_indexer else kv_cache)}
         if len(cache_dtypes) != 1:
             return "the staged KV caches must share one dtype"
         if next(iter(cache_dtypes)) not in (
@@ -3088,7 +3121,9 @@ class AscendSFAImpl(MLAAttentionImpl):
             attn_metadata.cos,
             attn_metadata.sin,
             attn_metadata.slot_mapping,
-            attn_metadata.indexer_slot_mapping,
+            (attn_metadata.indexer_c8_slot_mapping
+             if self.use_sparse_c8_indexer and attn_metadata.indexer_c8_slot_mapping is not None
+             else attn_metadata.indexer_slot_mapping),
         )
         if any(tensor is None for tensor in required_token_tensors):
             return "required fixed-shape attention metadata is unavailable"
@@ -3448,6 +3483,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         request_state_generations: torch.Tensor | None,
         resident_reads: list[torch.Tensor] | None = None,
         resident_writes: list[torch.Tensor] | None = None,
+        indexer_scale_cache: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, ...]:
         """Pre-retrieval compute captured by the outer PIECEWISE graph.
 
@@ -3480,9 +3516,13 @@ class AscendSFAImpl(MLAAttentionImpl):
                 cos=cos,
                 sin=sin,
             )
-            assert k_li_scale is None
             assert indexer_cache is not None
             kv_cache = (kv_cache_nope, kv_cache_pe, indexer_cache)
+            if self.use_sparse_c8_indexer:
+                assert k_li_scale is not None and indexer_scale_cache is not None
+                kv_cache += (indexer_scale_cache,)
+            else:
+                assert k_li_scale is None
         else:
             k_li = None
             assert indexer_cache is None
@@ -3500,6 +3540,18 @@ class AscendSFAImpl(MLAAttentionImpl):
         q_pe = self.rope_single(q_pe, cos, sin)
 
         if self.has_indexer:
+            if self.use_sparse_c8_indexer:
+                scale_slots, scale_updates = self._mask_staged_index_scatter_padding(
+                    indexer_slot_mapping,
+                    k_li_scale,
+                    row_req_indices,
+                    indexer_scale_cache.view(-1, 1),
+                )
+                torch_npu.npu_scatter_nd_update_(
+                    indexer_scale_cache.view(-1, 1),
+                    scale_slots.view(-1, 1),
+                    scale_updates.view(-1, 1),
+                )
             indexer_slot_mapping, k_li_for_scatter = (
                 self._mask_staged_index_scatter_padding(
                     indexer_slot_mapping,
@@ -3721,8 +3773,14 @@ class AscendSFAImpl(MLAAttentionImpl):
                 assert index_layer_name is not None
                 registered = context.no_compile_layers[index_layer_name].kv_cache[context.virtual_engine]
                 index_cache = registered[0] if isinstance(registered, (tuple, list)) else registered
+                if self.use_sparse_c8_indexer:
+                    if not isinstance(registered, (tuple, list)) or len(registered) != 2:
+                        raise RuntimeError("Unbundled C8 indexer requires key and scale caches")
+                    self._dsa_idx_scale_cache_t = registered[1]
                 self._dsa_idx_cache_t = index_cache
             kv_cache = (*kv_cache, index_cache)
+            if self.use_sparse_c8_indexer:
+                kv_cache += (self._dsa_idx_scale_cache_t,)
         return kv_cache, index_layer_name, index_enabled
 
     def _cross_layer_empty_outputs(
@@ -3749,6 +3807,7 @@ class AscendSFAImpl(MLAAttentionImpl):
     def reset_staged_sfa_capture(self) -> None:
         self._staged_sfa_capture_state = _StagedSFACaptureState()
         self._dsa_idx_cache_t = None
+        self._dsa_idx_scale_cache_t = None
         self._staged_sfa_bridge_buffers = None
         self._full_graph_transfer = None
         self._full_graph_transfers = {}
@@ -4107,10 +4166,14 @@ class AscendSFAImpl(MLAAttentionImpl):
             attn_metadata.cos,
             attn_metadata.sin,
             attn_metadata.slot_mapping,
-            attn_metadata.indexer_slot_mapping,
+            (attn_metadata.indexer_c8_slot_mapping
+             if self.use_sparse_c8_indexer and attn_metadata.indexer_c8_slot_mapping is not None
+             else attn_metadata.indexer_slot_mapping),
             attn_metadata.cum_query_lens,
             attn_metadata.seq_lens,
-            attn_metadata.indexer_block_table,
+            (attn_metadata.indexer_c8_block_table
+             if self.use_sparse_c8_indexer and attn_metadata.indexer_c8_block_table is not None
+             else attn_metadata.indexer_block_table),
             remap_boundary,
             row_req_indices,
             attn_metadata.block_table,
@@ -4125,6 +4188,7 @@ class AscendSFAImpl(MLAAttentionImpl):
             attn_metadata.resident_state_generations,
             resident_reads=resident_reads,
             resident_writes=resident_writes,
+            indexer_scale_cache=kv_cache[3] if self.has_indexer and self.use_sparse_c8_indexer else None,
         )
         outputs = self._copy_to_staged_sfa_bridge(
             hidden_states,
@@ -4977,8 +5041,14 @@ class AscendSFAImpl(MLAAttentionImpl):
                 _idx_name = index_layer_name
                 _idx_cache = _fc_ub.no_compile_layers[_idx_name].kv_cache[_fc_ub.virtual_engine]
                 _idx_t = _idx_cache[0] if isinstance(_idx_cache, (tuple, list)) else _idx_cache
+                if self.use_sparse_c8_indexer:
+                    if not isinstance(_idx_cache, (tuple, list)) or len(_idx_cache) != 2:
+                        raise RuntimeError("Unbundled C8 indexer requires key and scale caches")
+                    self._dsa_idx_scale_cache_t = _idx_cache[1]
                 self._dsa_idx_cache_t = _idx_t
             kv_cache = (kv_cache[0], kv_cache[1], _idx_t)
+            if self.use_sparse_c8_indexer:
+                kv_cache += (self._dsa_idx_scale_cache_t,)
 
         cos = attn_metadata.cos
         sin = attn_metadata.sin
@@ -5003,6 +5073,8 @@ class AscendSFAImpl(MLAAttentionImpl):
             if attn_metadata.indexer_slot_mapping is not None
             else slot_mapping
         )
+        if self.use_sparse_c8_indexer and attn_metadata.indexer_c8_slot_mapping is not None:
+            idx_slot_mapping = attn_metadata.indexer_c8_slot_mapping
         content_diagnostics_enabled = (
             bool(attn_metadata.req_ids)
             and npu_content_diagnostics_enabled()
@@ -5257,16 +5329,18 @@ class AscendSFAImpl(MLAAttentionImpl):
                     req_ids=attn_metadata.req_ids,
                     layer_name=index_layer_name,
                     indexer_cache=kv_cache[2],
-                    indexer_block_table=attn_metadata.indexer_block_table,
+                    indexer_block_table=(
+                        attn_metadata.indexer_c8_block_table
+                        if self.use_sparse_c8_indexer and attn_metadata.indexer_c8_block_table is not None
+                        else attn_metadata.indexer_block_table
+                    ),
                     seq_lens_cpu=attn_metadata.seq_lens_cpu,
                     block_size=self.block_size,
                     row_request_indices=attn_metadata.decode_req_indices_cpu,
                     num_decode_tokens=attn_metadata.num_decode_tokens,
                     num_actual_tokens=attn_metadata.num_actual_tokens,
                     attn_state=attn_metadata.attn_state,
-                    decode_valid_rows_all=(
-                        attn_metadata.decode_valid_rows_all
-                    ),
+                    decode_valid_rows_all=(attn_metadata.decode_valid_rows_all),
                     group1_connector_wait_called=index_lmcache_enabled,
                     num_hidden_layers=self.diagnostic_num_hidden_layers,
                 )

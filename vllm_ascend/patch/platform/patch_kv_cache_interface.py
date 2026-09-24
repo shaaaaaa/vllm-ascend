@@ -40,11 +40,43 @@ class AscendMLAAttentionSpec(MLAAttentionSpec):
     cache_sparse_c8: bool = False
     c8_k_cache_dtype: torch.dtype = torch.int8
     c8_k_scale_cache_dtype: torch.dtype = torch.float16
+    # None is the original homogeneous layout; a tuple selects C8 owners in
+    # a mixed group while retaining common logical block IDs for every layer.
+    indexer_c8_layer_names: tuple[str, ...] | None = None
+
+    @property
+    def shared_indexer_key_dtype(self) -> torch.dtype:
+        return self.dtype if self.indexer_c8_layer_names is not None else self.c8_k_cache_dtype
+
+    @property
+    def indexer_scale_layer_count(self) -> int | None:
+        return len(self.indexer_c8_layer_names) if self.indexer_c8_layer_names is not None else None
+
+    def is_indexer_c8_layer(self, name: str) -> bool:
+        return self.cache_sparse_c8 and (
+            self.indexer_c8_layer_names is None or name in self.indexer_c8_layer_names
+        )
+
+    @property
+    def indexer_scale_page_size_bytes(self) -> int:
+        """Scale sidecar charged separately from shared Group-1 key storage."""
+        if self.cache_sparse_c8 and self.sparse_head_dim is not None and len(self.sparse_head_dim) == 1:
+            factor = 2 if self.indexer_c8_layer_names is not None else 1
+            return factor * self.block_size * self.num_kv_heads * get_dtype_size(self.c8_k_scale_cache_dtype)
+        return 0
 
     @property
     def page_size_bytes(self) -> int:
         if self.cache_sparse_c8:
             assert self.sparse_head_dim is not None
+            if len(self.sparse_head_dim) == 1:
+                return (
+                    self.block_size
+                    * self.num_kv_heads
+                    * self.sparse_head_dim[0]
+                    * get_dtype_size(self.shared_indexer_key_dtype)
+                    + self.indexer_scale_page_size_bytes
+                )
             assert len(self.sparse_head_dim) == 3
             num_heads_per_page = self.block_size * self.num_kv_heads
             # kv_cache[0]: bfloat16, kv_cache[1]: bfloat16
@@ -135,6 +167,9 @@ class AscendMLAAttentionSpec(MLAAttentionSpec):
         assert len({spec.sparse_head_dim for spec in specs}) == 1, (
             "All attention layers in the same KV cache group must have the same sparse_head_dim."
         )
+        assert len({(spec.cache_sparse_c8, spec.indexer_c8_layer_names) for spec in specs}) == 1, (
+            "All layers in a KV group must share one indexer precision policy."
+        )
         return cls(
             block_size=specs[0].block_size,
             num_kv_heads=specs[0].num_kv_heads,
@@ -143,6 +178,7 @@ class AscendMLAAttentionSpec(MLAAttentionSpec):
             dtype=specs[0].dtype,
             cache_dtype_str=cache_dtype_str_set.pop(),
             cache_sparse_c8=specs[0].cache_sparse_c8,
+            indexer_c8_layer_names=specs[0].indexer_c8_layer_names,
         )
 
 

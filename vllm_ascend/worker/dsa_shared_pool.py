@@ -3,6 +3,29 @@ import math
 import torch
 
 
+class MixedIndexerMetadata:
+    """Stable C8 physical views over the mixed pool's common logical IDs."""
+
+    def __init__(self, max_requests: int, max_blocks: int, max_tokens: int, device: torch.device):
+        self.max_requests, self.max_blocks = max_requests, max_blocks
+        self.tables = torch.empty(max_requests * max_blocks, dtype=torch.int32, device=device)
+        self.slots = torch.empty(max_tokens, dtype=torch.int64, device=device)
+
+    def update(self, table: torch.Tensor, slots: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        if (table.ndim != 2 or slots.ndim != 1
+                or table.shape[0] > self.max_requests or table.shape[1] > self.max_blocks
+                or slots.numel() > self.slots.numel()):
+            raise ValueError("Mixed indexer metadata exceeds its preallocated capacity")
+        physical_table = self.tables[:table.numel()].view(table.shape)
+        physical_slots = self.slots[:slots.numel()]
+        torch.mul(table, 2, out=physical_table)
+        # Truncation preserves -1 padding while mapping valid logical slots to
+        # the first 128-token half of each BF16-sized shared allocation.
+        torch.div(slots, 128, rounding_mode="trunc", out=physical_slots)
+        physical_slots.mul_(128).add_(slots)
+        return physical_table, physical_slots
+
+
 def reshape_dsa_shared_pool_raw(
     raw: torch.Tensor,
     dtype: torch.dtype,
@@ -13,12 +36,18 @@ def reshape_dsa_shared_pool_raw(
     index_head_dim: int,
     *,
     is_indexer: bool,
+    indexer_dtype: torch.dtype | None = None,
+    indexer_scale: torch.Tensor | None = None,
+    shared_indexer_dtype: torch.dtype | None = None,
 ) -> tuple[torch.Tensor, ...]:
     """Create latent or indexer PA_BSND views from one DSA shared raw slab."""
 
     elt = torch.empty((), dtype=dtype).element_size()
+    indexer_dtype = dtype if indexer_dtype is None else indexer_dtype
+    index_elt = indexer_dtype.itemsize
+    shared_elt = (shared_indexer_dtype or indexer_dtype).itemsize
     latent_page = block_size * num_kv_heads * (kv_lora_rank + qk_rope_head_dim) * elt
-    indexer_page = block_size * num_kv_heads * index_head_dim * elt
+    indexer_page = block_size * num_kv_heads * index_head_dim * shared_elt
     bundle_page = math.lcm(latent_page, indexer_page)
     assert bundle_page == 9 * indexer_page, (
         "DSA shared pool expects one bundle to be nine indexer pages; "
@@ -28,19 +57,18 @@ def reshape_dsa_shared_pool_raw(
     slot_count = raw.numel() // bundle_page
     latent_blocks = slot_count * (bundle_page // latent_page)
     indexer_blocks = slot_count * (bundle_page // indexer_page)
-    nope_pages = latent_blocks * kv_lora_rank // index_head_dim
-    pe_pages = latent_blocks * qk_rope_head_dim // index_head_dim
+    nope_pages = latent_blocks * kv_lora_rank * elt // (index_head_dim * shared_elt)
+    pe_pages = latent_blocks * qk_rope_head_dim * elt // (index_head_dim * shared_elt)
     assert nope_pages + pe_pages == indexer_blocks
 
     if is_indexer:
-        return (
-            raw.view(dtype).view(
-                indexer_blocks,
-                block_size,
-                num_kv_heads,
-                index_head_dim,
-            ),
-        )
+        physical_blocks = indexer_blocks * shared_elt // index_elt
+        keys = raw.view(indexer_dtype).view(physical_blocks, block_size, num_kv_heads, index_head_dim)
+        if indexer_dtype == torch.int8:
+            if indexer_scale is None or indexer_scale.numel() != physical_blocks * block_size * num_kv_heads * 2:
+                raise ValueError("Indexer C8 shared storage requires a complete FP16 scale sidecar")
+            return keys, indexer_scale.view(torch.float16).view(physical_blocks, block_size, num_kv_heads, 1)
+        return (keys,)
 
     nope_bytes = nope_pages * indexer_page
     pe_bytes = pe_pages * indexer_page
