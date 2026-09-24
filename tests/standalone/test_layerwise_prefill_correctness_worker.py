@@ -187,7 +187,7 @@ def test_ambiguous_cp_shape_and_decode_classified_prefill_fail_closed(worker):
     assert worker.single_request_span(meta, 7) is None
 
 
-def _runtime(worker, monkeypatch, case_dir, *, map_ids=(2, 0), compare=None):
+def _runtime(worker, monkeypatch, case_dir, *, map_ids=(2, 0), compare=None, h2d_source="merged"):
     shared = {}
     operations = NS(
         npu_lightning_indexer=lambda **kw: torch.zeros((kw["query"].shape[0], 1, 2), dtype=torch.long),
@@ -258,7 +258,8 @@ def _runtime(worker, monkeypatch, case_dir, *, map_ids=(2, 0), compare=None):
     probe.install(NS(AscendSFAImpl=SFAImpl), NS(), connector, MergedPage)
 
     def batched_to_gpu():
-        return connector._layer_source_memory_objs([MergedPage()], 0)
+        source = MergedPage() if h2d_source == "merged" else object()
+        return connector._layer_source_memory_objs([source], 0)
 
     def run(start, end):
         for layer, module in enumerate(model.layers):
@@ -278,7 +279,8 @@ def _runtime(worker, monkeypatch, case_dir, *, map_ids=(2, 0), compare=None):
                 slot_mapping=all_slots[start:end],
                 indexer_slot_mapping=all_slots[start:end],
             )
-        batched_to_gpu()
+        if h2d_source is not None:
+            batched_to_gpu()
         hidden = torch.arange((end - start) * 2, dtype=torch.float32).reshape(-1, 2)
         for module in model.layers:
             hidden, _ = module(torch.arange(start, end), hidden, None)
@@ -329,11 +331,14 @@ def test_full_worker_off_on_artifacts_pass_real_comparator(worker, tmp_path, mon
         },
     )
     for case, mapping in (("off", (2, 0)), ("on", (1, 3))):
-        probe, run, _, _ = _runtime(worker, monkeypatch, tmp_path / case, map_ids=mapping)
+        probe, run, _, _ = _runtime(
+            worker, monkeypatch, tmp_path / case, map_ids=mapping, h2d_source="merged" if case == "on" else None
+        )
         run(0, 4)
         run(4, 8)
         coverage = probe.finish(NS())
         assert coverage["complete"], coverage["errors"]
+        assert coverage["merged_load_sources"] == (2 if case == "on" else 0)
         directory = tmp_path / case
         write(directory / "coverage.json", [coverage])
         write(directory / "engine_options.json", {"tensor_parallel_size": 1})
@@ -362,6 +367,47 @@ def test_full_worker_off_on_artifacts_pass_real_comparator(worker, tmp_path, mon
     assert report["counts"]["compared"] == coverage["records"]
     assert report["status"] == "equal"
     assert (tmp_path / "diff.jsonl").read_text() == ""
+
+
+def test_history_h2d_evidence_required_only_for_on(worker, tmp_path, monkeypatch):
+    for case in ("off", "on"):
+        probe, run, _, _ = _runtime(worker, monkeypatch, tmp_path / case, h2d_source=None)
+        run(0, 4)
+        run(4, 8)
+        result = probe.finish(NS())
+        assert result["merged_load_sources"] == result["legacy_load_sources"] == 0
+        history = [record for record in probe.archive.records.values() if record["kind"] == "kv_loaded"]
+        assert len(history) == 5
+        assert all(record["positions"] == [0, 4] for record in history)
+        assert result["complete"] is (case == "off")
+        assert result["errors"] == ([] if case == "off" else ["No actual merged-page H2D source was observed"])
+
+
+def test_off_without_h2d_still_requires_consumer_history(worker, tmp_path, monkeypatch):
+    probe, run, _, _ = _runtime(worker, monkeypatch, tmp_path / "off", h2d_source=None)
+    run(0, 4)
+    run(4, 8)
+    identity = (0, 1, 0, "kv_loaded", "nope")
+    del probe.archive.records[identity]
+    result = probe.finish(NS())
+    assert not result["complete"]
+    assert result["errors"] == [f"Missing required tensor {identity}"]
+
+
+@pytest.mark.parametrize("case", ["off", "on"])
+def test_legacy_h2d_evidence_still_rejected_in_both_cases(worker, tmp_path, monkeypatch, case):
+    if case == "on":
+        baseline, run, _, _ = _runtime(worker, monkeypatch, tmp_path / "off", h2d_source=None)
+        run(0, 4)
+        run(4, 8)
+        assert baseline.finish(NS())["complete"]
+    probe, run, _, _ = _runtime(worker, monkeypatch, tmp_path / case, h2d_source="legacy")
+    run(0, 4)
+    run(4, 8)
+    result = probe.finish(NS())
+    assert not result["complete"]
+    assert result["legacy_load_sources"] == 2
+    assert "Legacy nonmerged H2D source objects were observed" in result["errors"]
 
 
 def test_incomplete_coverage_is_explicit_and_hooks_restore(worker, tmp_path, monkeypatch):

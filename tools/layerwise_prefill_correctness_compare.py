@@ -25,6 +25,7 @@ VALUE_BLOCK_SIZE = 262144
 EXACT_PERCENTILE_LIMIT = 1048576
 PERCENTILE_BINS = 2048
 ALLOWED_ENV_DIFFERENCES = frozenset({"VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE", "LMCACHE_STORE_ASYNC"})
+LEGACY_OFF_RELOAD_ERROR = "No actual merged-page H2D source was observed"
 RECORD_FIELDS = frozenset(
     {"rank", "step", "layer", "kind", "name", "span", "shape", "dtype", "numel", "nonfinite", "path"}
 )
@@ -348,12 +349,46 @@ def _layer_list(value: Any, label: str, allow_empty: bool = False) -> list[int]:
     return sorted(value)
 
 
+def require_worker_completion(summary: dict[str, Any]) -> None:
+    """Reject incomplete probes while exposing their first concrete failures."""
+    _require(isinstance(summary, dict), "worker coverage summary must be an object")
+    errors = summary.get("errors")
+    if summary.get("complete") is not True or errors:
+        detail = f"rank {summary.get('rank', '?')} coverage incomplete"
+        if errors:
+            items = errors if isinstance(errors, list) else [errors]
+            detail += ": " + "; ".join(str(item) for item in items[:3])
+            if len(items) > 3:
+                detail += f"; {len(items) - 3} more errors (see coverage.json)"
+        raise ValueError(detail)
+
+
+def _normalize_off_reload_evidence(summary: dict[str, Any]) -> dict[str, Any]:
+    """Read old OFF archives without rewriting their erroneous H2D-only verdict.
+
+    OFF retains historical KV on device and need not reload it from CPU. Only
+    this exact legacy error can be corrected; all tensor/layout checks still run.
+    """
+    if (
+        summary.get("complete") is False
+        and summary.get("errors") == [LEGACY_OFF_RELOAD_ERROR]
+        and summary.get("merged_load_sources") == 0
+        and summary.get("legacy_load_sources") == 0
+    ):
+        return {**summary, "complete": True, "errors": []}
+    return summary
+
+
 def _validate_coverage(
-    summary: dict[str, Any], records: dict[tuple[Any, ...], dict[str, Any]], prompt: int, model_info: dict[str, Any]
+    summary: dict[str, Any],
+    records: dict[tuple[Any, ...], dict[str, Any]],
+    prompt: int,
+    model_info: dict[str, Any],
+    *,
+    case_name: str,
 ) -> None:
     rank = summary["rank"]
-    _require(summary.get("complete") is True, f"rank {rank} coverage incomplete")
-    _require(not summary.get("errors"), f"rank {rank} worker coverage errors: {summary.get('errors')}")
+    require_worker_completion(summary)
     _require(summary.get("records") == len(records), f"rank {rank} record count differs")
     _require(summary.get("prompt_length") == prompt, f"rank {rank} prompt length differs")
     layers = _layer_list(summary.get("decoder_layers"), "decoder_layers")
@@ -402,7 +437,7 @@ def _validate_coverage(
     _require(layout.get("production_transfer_unchanged") is True, "production DMA implementation was changed")
     _require(_integer(summary.get("merged_load_sources")), "merged load source evidence missing")
     _require(summary.get("legacy_load_sources") == 0, "legacy H2D sources observed or evidence missing")
-    if len(steps) > 1:
+    if case_name == "on" and len(steps) > 1:
         _require(summary["merged_load_sources"] > 0, "no merged H2D sources observed for historical prefix")
     declared: set[tuple[str, str, int, str]] = set()
     roles = summary.get("required_roles")
@@ -527,9 +562,12 @@ def _load_case(
         ranks = [entry.get("rank") for entry in coverage if isinstance(entry, dict)]
         _require(all(_integer(rank) for rank in ranks) and len(ranks) == len(coverage), "invalid coverage rank")
         _require(set(ranks) == expected_ranks and len(ranks) == len(set(ranks)), "coverage ranks missing/duplicated")
+        if name == "off":
+            coverage = [_normalize_off_reload_evidence(summary) for summary in coverage]
+            data["coverage"] = coverage
         for summary in coverage:
             records = {key: value for key, value in data["records"].items() if key[0] == summary["rank"]}
-            _validate_coverage(summary, records, result.get("prompt_length", 0), model_info)
+            _validate_coverage(summary, records, result.get("prompt_length", 0), model_info, case_name=name)
         first = coverage[0]
         for summary in coverage[1:]:
             for field in ("decoder_layers", "sfa_layers", "indexer_layers", "scale_layers", "steps", "required_roles"):
@@ -549,7 +587,7 @@ def validate_off_baseline(off_dir: str | Path, model_info: dict[str, Any]) -> di
     errors: list[dict[str, Any]] = []
     data = _load_case(case, errors, model_info, case_name="off")
     if errors:
-        raise ValueError(f"Invalid OFF baseline: {errors[0]['detail']}")
+        raise ValueError(f"Invalid OFF baseline: {errors[0]['detail']}; coverage: {case / 'coverage.json'}")
     return data
 
 

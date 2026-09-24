@@ -584,6 +584,64 @@ def test_comparable_environment_rejects_invalid_capacity(value):
         compare.comparable_environment({"LMCACHE_MAX_LOCAL_CPU_SIZE": value})
 
 
+@pytest.mark.parametrize("old_verdict", [False, True])
+def test_off_retained_history_is_reusable_even_if_old_probe_demanded_reload(tmp_path, old_verdict):
+    root = _fixture(tmp_path)
+    off = root / "off"
+    coverage = json.loads((off / "coverage.json").read_text())
+    for entry in coverage:
+        entry.update(
+            merged_load_sources=0,
+            complete=not old_verdict,
+            errors=["No actual merged-page H2D source was observed"] if old_verdict else [],
+        )
+    _write(off / "coverage.json", coverage)
+    # Failed ON must not contaminate a complete OFF tensor archive.
+    _write(root / "on" / "result.json", {"completed": False, "error": "ON crashed"})
+    before = {str(path): path.read_bytes() for path in off.rglob("*") if path.is_file()}
+    info = json.loads((root / "model_info.json").read_text())
+    baseline = compare.validate_off_baseline(off, info)
+    assert all(entry["complete"] for entry in baseline["coverage"])
+    assert before == {str(path): path.read_bytes() for path in off.rglob("*") if path.is_file()}
+
+
+@pytest.mark.parametrize("mutation", ["extra_error", "missing_file", "missing_history", "legacy_source", "on"])
+def test_legacy_off_reload_correction_does_not_bypass_real_coverage_failures(tmp_path, mutation):
+    root = _fixture(tmp_path)
+    case = root / ("on" if mutation == "on" else "off")
+    coverage = json.loads((case / "coverage.json").read_text())
+    entry = coverage[0]
+    entry.update(complete=False, merged_load_sources=0, errors=["No actual merged-page H2D source was observed"])
+    if mutation == "extra_error":
+        entry["errors"].append("Missing required tensor (0, 1, 1, 'attention', 'output')")
+    elif mutation == "missing_file":
+        next((case / "tensors" / "rank0").glob("*.pt")).unlink()
+    elif mutation == "missing_history":
+        path = case / "tensors" / "rank0" / "index.jsonl"
+        records = [json.loads(line) for line in path.read_text().splitlines()]
+        records = [record for record in records if record["kind"] != "kv_loaded"]
+        entry["records"] = len(records)
+        _manifest(path, records)
+    elif mutation == "legacy_source":
+        entry["legacy_load_sources"] = 1
+    _write(case / "coverage.json", coverage)
+    report = compare.compare_runs(root)
+    assert not report["passed"]
+    if mutation == "extra_error":
+        assert any("Missing required tensor" in item.get("detail", "") for item in report["errors"])
+
+
+def test_off_without_h2d_still_compares_full_values_to_on(tmp_path):
+    root = _fixture(tmp_path)
+    path = root / "off" / "coverage.json"
+    coverage = json.loads(path.read_text())
+    for entry in coverage:
+        entry.update(complete=False, merged_load_sources=0, errors=[compare.LEGACY_OFF_RELOAD_ERROR])
+    _write(path, coverage)
+    report = compare.compare_runs(root)
+    assert report["passed"] and report["counts"]["compared"] == report["counts"]["off"]
+
+
 @pytest.mark.parametrize("previous_timeout", [None, "300"])
 def test_completed_comparison_accepts_only_diagnostic_timeout_difference(tmp_path, previous_timeout):
     root = _fixture(tmp_path)

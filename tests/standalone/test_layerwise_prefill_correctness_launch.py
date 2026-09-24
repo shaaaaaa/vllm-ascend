@@ -103,6 +103,61 @@ def test_successful_exit_without_complete_result_is_not_accepted(tmp_path, monke
     assert not (tmp_path / "on").exists()
 
 
+@pytest.mark.parametrize("failure", ["incomplete", "duplicate", "missing", "invalid", None])
+def test_generated_token_does_not_hide_worker_coverage_failure(tmp_path, monkeypatch, capsys, failure):
+    args = runner.parser().parse_args(["--child", "off", "--devices", "0,1", "--run-dir", str(tmp_path)])
+    (tmp_path / "off").mkdir()
+    runner.write_json(tmp_path / "prompt.json", {"length": 10000, "token_ids": [7] * 10000})
+    summary = {
+        "rank": 0,
+        "complete": failure != "incomplete",
+        "errors": ["Missing required tensor (0, 1, 1, 'attention', 'output')"] if failure == "incomplete" else [],
+    }
+    coverage = [summary, {"rank": 1, "complete": True, "errors": []}]
+    if failure == "duplicate":
+        coverage[1]["rank"] = 0
+    elif failure == "missing":
+        coverage.pop()
+    elif failure == "invalid":
+        coverage[1]["rank"] = True
+    shutdown = []
+
+    class Model:
+        def __init__(self, **options):
+            self.llm_engine = SimpleNamespace(engine_core=SimpleNamespace(shutdown=lambda: shutdown.append(True)))
+
+        def collective_rpc(self, method, **kwargs):
+            return coverage if method == "finish_correctness_probe" else [{"rank": 0}, {"rank": 1}]
+
+        def generate(self, *args, **kwargs):
+            return [
+                SimpleNamespace(
+                    finished=True,
+                    num_cached_tokens=0,
+                    outputs=[SimpleNamespace(token_ids=[91], text="word")],
+                )
+            ]
+
+    monkeypatch.setitem(sys.modules, "vllm", SimpleNamespace(LLM=Model, SamplingParams=lambda **kwargs: kwargs))
+    monkeypatch.setitem(
+        sys.modules, "layerwise_prefill_correctness_layout", SimpleNamespace(install_local_merged_layout=lambda: None)
+    )
+    monkeypatch.setenv("VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS", "300")
+    if failure is None:
+        runner.run_child(args)
+    elif failure == "incomplete":
+        with pytest.raises(ValueError, match="Missing required tensor"):
+            runner.run_child(args)
+    else:
+        with pytest.raises(RuntimeError, match="coverage ranks"):
+            runner.run_child(args)
+    report = json.loads((tmp_path / "off" / "result.json").read_text())
+    assert report["completed"] is (failure is None) and report["token_ids"] == [91]
+    assert json.loads((tmp_path / "off" / "coverage.json").read_text()) == coverage
+    assert shutdown == [True]
+    assert ("off: complete;" in capsys.readouterr().out) is (failure is None)
+
+
 def test_existing_artifacts_are_never_overwritten(tmp_path, monkeypatch):
     sentinel = tmp_path / "off_tensor.pt"
     sentinel.write_bytes(b"baseline")

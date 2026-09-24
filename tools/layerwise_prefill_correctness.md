@@ -86,6 +86,19 @@ modified. Keep the original OFF archive and its parent `model_info.json`
 available. New logs, ON statistics and reports are written to the new directory.
 `--compare-only ./kv-check-on-next` automatically follows the saved reference.
 
+OFF can retain historical KV on the device, so it need not perform a CPU-to-NPU
+reload between prefill chunks. Its historical KV is still captured and compared
+at the attention/indexer consumers. ON must additionally demonstrate actual
+merged-page H2D reloads because it reuses two banks across layers.
+
+Older tools incorrectly required H2D evidence from OFF too. An old OFF summary
+whose only error is `No actual merged-page H2D source was observed`, with zero
+merged and legacy reload sources, is accepted after all tensor, file, model and
+layout checks pass. This correction is read-only; the saved archive is not
+rewritten. Other coverage errors remain failures and their first concrete causes
+are printed. Fresh runs check worker completion before declaring a case complete
+or proceeding from OFF to ON; producing an output token alone is insufficient.
+
 ## RPC deadline and progress
 
 The correctness launcher sets `VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS` to 1800

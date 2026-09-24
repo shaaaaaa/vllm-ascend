@@ -574,7 +574,14 @@ class CorrectnessProbe:
             missing = self.archive.baseline.keys() - self.archive.records.keys()
             if missing:
                 errors.append(f"ON did not observe {len(missing)} OFF tensor identities")
-        if any(step["span"][0] > 0 for step in self.steps) and self.merged_sources == 0:
+        # Ordinary OFF layers retain history in HBM across prefill chunks.
+        # ON's rotating banks require H2D restoration; both cases must still
+        # capture every required kv_loaded tensor at the actual consumer.
+        if (
+            self.archive.root.name == "on"
+            and any(step["span"][0] > 0 for step in self.steps)
+            and self.merged_sources == 0
+        ):
             errors.append("No actual merged-page H2D source was observed")
         if self.legacy_sources:
             errors.append("Legacy nonmerged H2D source objects were observed")

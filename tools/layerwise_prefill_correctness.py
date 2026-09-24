@@ -261,6 +261,7 @@ def compare(root):
 
 def run_child(args):
     """Install only explicitly selected tool hooks, after normal model warmup."""
+    from layerwise_prefill_correctness_compare import require_worker_completion
     from layerwise_prefill_correctness_layout import install_local_merged_layout
 
     os.environ.pop("LMCACHE_CONFIG_FILE", None)
@@ -319,6 +320,15 @@ def run_child(args):
                 "diagnostic_seconds": time.perf_counter() - started,
             }
         )
+        valid_ranks = isinstance(coverage, list) and all(
+            isinstance(summary, dict) and type(summary.get("rank")) is int for summary in coverage
+        )
+        if not valid_ranks or sorted(summary["rank"] for summary in coverage) != list(
+            range(options["tensor_parallel_size"])
+        ):
+            raise RuntimeError(f"Worker coverage ranks missing/invalid/duplicated; see {case_dir / 'coverage.json'}")
+        for summary in coverage:
+            require_worker_completion(summary)
     except BaseException as error:
         report["error"] = f"{type(error).__name__}: {error}"
         write_json(case_dir / "result.json", report)
