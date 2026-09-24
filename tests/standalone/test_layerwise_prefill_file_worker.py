@@ -231,7 +231,8 @@ def test_sparse_mapping_rejects_mismatched_rows_and_bad_physical_slots(worker):
     assert list(values.shape) == [0, 1, 1] and positions == [] and pairs.shape == (0, 2)
 
 
-def test_probe_captures_decoder_sfa_indexer_kv_and_presampling_logits(worker, tmp_path, monkeypatch):
+@pytest.mark.parametrize("invocation", ["module", "eager_decorator", "explicit_forward"])
+def test_probe_captures_decoder_sfa_indexer_kv_and_presampling_logits(worker, tmp_path, monkeypatch, invocation):
     meta = NS(num_actual_tokens=4, seq_lens_cpu=[4], query_start_loc_cpu=[0, 4])
     cache = torch.arange(8, dtype=torch.float32).reshape(2, 2, 1, 2)
     table = torch.tensor([[0, 1]])
@@ -302,7 +303,13 @@ def test_probe_captures_decoder_sfa_indexer_kv_and_presampling_logits(worker, tm
         def compute_logits(self, hidden_states):
             return hidden_states.repeat(1, 2)
 
-    model = Model()
+    class EagerDecoratedModel(Model):
+        # vLLM support_torch_compile replaces DeepSeekMTP.__call__ with this
+        # dispatch when do_not_compile is true; nn.Module hooks are bypassed.
+        def __call__(self, *args, **kwargs):
+            return self.forward(*args, **kwargs)
+
+    model = EagerDecoratedModel() if invocation == "eager_decorator" else Model()
     runner = NS(model=model, logits_indices=torch.tensor([3]))
     archive = worker.FileTensorArchive(tmp_path / "baseline", 0)
     probe = worker.FileProbe(
@@ -311,10 +318,12 @@ def test_probe_captures_decoder_sfa_indexer_kv_and_presampling_logits(worker, tm
     probe.models["main"] = model
     original = Impl.forward
     probe.install(NS(AscendSFAImpl=Impl), NS(), NS())
-    result = model(torch.tensor([10, 11, 12, 13]), torch.arange(4))
+    invoke = model.forward if invocation == "explicit_forward" else model
+    result = invoke(torch.tensor([10, 11, 12, 13]), torch.arange(4))
     logits = model.compute_logits(result[runner.logits_indices])
     summary = probe.finish()
     assert summary["complete"], summary["errors"]
+    assert len(summary["calls"]) == 1  # Ordinary nn.Module must not be observed twice.
     assert Impl.forward is original
     records = [json.loads(line) for line in (archive.directory / "index.jsonl").read_text().splitlines()]
     assert len(records) == summary["records"]

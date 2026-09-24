@@ -431,9 +431,35 @@ class FileProbe:
                 )
         self.active.pop()
 
+    def model_forward_factory(self, model_name, model):
+        """Observe the actual eager call, including vLLM's decorated MTP.
+
+        support_torch_compile.__call__ invokes self.forward directly in eager
+        mode, bypassing nn.Module's forward hooks. Wrap the bound forward on
+        this instance so both dispatch routes establish exactly one context.
+        """
+
+        def factory(original):
+            @functools.wraps(original)
+            def forward(*args, **kwargs):
+                depth = len(self.active)
+                try:
+                    self.model_pre(model_name, model, args, kwargs)
+                    result = original(*args, **kwargs)
+                    self.model_post(model_name, model, args, kwargs, result)
+                    return result
+                except BaseException as error:
+                    self.errors.append(f"Incomplete {model_name} forward: {type(error).__name__}: {error}")
+                    del self.active[depth:]
+                    raise
+
+            return forward
+
+        return factory
+
     def decoder_pre(self, model_name, layer, module, args, kwargs):
         if not self.active or self.active[-1]["model"] != model_name:
-            raise RuntimeError("Decoder ran without an observed model forward")
+            raise RuntimeError(f"Decoder ran without an observed model forward: model={model_name} layer={layer}")
         bound = inspect.signature(module.forward).bind(*args, **kwargs).arguments
         meta = self.metadata(model_name, layer)
         for name, value in (
@@ -602,12 +628,7 @@ class FileProbe:
 
         for model_name, model in self.models.items():
             self.inventories[model_name] = model_inventory(model, sfa.AscendSFAImpl)
-            self.handles.append(
-                model.register_forward_pre_hook(functools.partial(self.model_pre, model_name), with_kwargs=True)
-            )
-            self.handles.append(
-                model.register_forward_hook(functools.partial(self.model_post, model_name), with_kwargs=True)
-            )
+            self.patch(model, "forward", self.model_forward_factory(model_name, model))
             self.patch(model, "compute_logits", self.logits_factory(model_name))
             for layer, module in self.inventories[model_name][0].items():
                 self.handles.append(
