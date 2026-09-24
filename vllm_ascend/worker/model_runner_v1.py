@@ -194,6 +194,7 @@ from vllm_ascend.utils import (
 from vllm_ascend.worker.dsa_shared_pool import reshape_dsa_shared_pool_raw
 from vllm_ascend.worker.npu_input_batch import NPUInputBatch
 from vllm_ascend.worker.pcp_utils import PCPManager
+from vllm_ascend.worker.startup_trace import startup_phase
 
 from vllm_ascend.ascend_forward_context import (  # isort: skip
     MoECommType,
@@ -5617,7 +5618,8 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
         self.may_add_encoder_only_layers_to_kv_cache_config()
         self.maybe_add_kv_sharing_layers_to_kv_cache_groups(kv_cache_config)
         # NOTE(cmq): initialize_attn_backend must before using self.attn_groups
-        self.initialize_attn_backend(kv_cache_config)
+        with startup_phase(self, "attn_backend", groups=len(kv_cache_config.kv_cache_groups)):
+            self.initialize_attn_backend(kv_cache_config)
         self.use_hybrid_blocks = len(self.attn_groups) > 1
         # NOTE: Currently, we determine whether we need `num_accepted_tokens` through `MambaSpec`.
         self.need_accepted_tokens = any(
@@ -5634,7 +5636,8 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
             assert isinstance(self.drafter, AscendEagleProposer | AscendDraftModelProposer)
             block_size = (self.kernel_block_sizes[0] if isinstance(
             self.kernel_block_sizes, list) else self.kernel_block_sizes)
-            self.drafter.initialize_attn_backend(kv_cache_config, block_size)
+            with startup_phase(self, "draft_attn"):
+                self.drafter.initialize_attn_backend(kv_cache_config, block_size)
 
         if has_kv_transfer_group() and not self._profiling_cudagraph_memory:
             kv_transfer_group = get_kv_transfer_group()
@@ -5686,9 +5689,11 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                     supports_dsa_index_lmcache,
                     disable_dsa_index_lmcache,
                 )
-            kv_transfer_group.register_kv_caches(kv_caches_to_register)
+            with startup_phase(self, "kv_register", layers=len(kv_caches_to_register)):
+                kv_transfer_group.register_kv_caches(kv_caches_to_register)
 
-        self._maybe_init_dsa_latent_offload()
+        with startup_phase(self, "latent_init"):
+            self._maybe_init_dsa_latent_offload()
 
         if self.model_config.enable_return_routed_experts:
             self.init_routed_experts_capturer()
@@ -5762,9 +5767,16 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
             corresponding memory buffer for KV cache.
         """
         # Initialize the memory buffer for KV cache
-        kv_cache_raw_tensors = self._allocate_kv_cache_tensors(kv_cache_config)
+        with startup_phase(
+            self,
+            "kv_alloc",
+            buffers=len(kv_cache_config.kv_cache_tensors),
+            bytes=sum(tensor.size for tensor in kv_cache_config.kv_cache_tensors),
+        ):
+            kv_cache_raw_tensors = self._allocate_kv_cache_tensors(kv_cache_config)
         # Change the memory buffer to the desired shape
-        kv_caches = self._reshape_kv_cache_tensors(kv_cache_config, kv_cache_raw_tensors)
+        with startup_phase(self, "kv_reshape"):
+            kv_caches = self._reshape_kv_cache_tensors(kv_cache_config, kv_cache_raw_tensors)
 
         # Set up cross-layer KV cache sharing
         for layer_name, target_layer_name in self.shared_kv_cache_layers.items():

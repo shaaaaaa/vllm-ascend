@@ -74,6 +74,7 @@ from vllm_ascend.utils import (
     staged_sfa_graph_configured,
 )
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
+from vllm_ascend.worker.startup_trace import startup_phase, startup_stage
 
 torch._dynamo.trace_rules.clear_lru_cache()  # noqa: E402
 from torch._dynamo.variables import TorchInGraphFunctionVariable  # noqa: E402
@@ -518,6 +519,7 @@ class NPUWorker(WorkerBase):
                 logger.warning(f"Bind cpus failed in rank{self.local_rank}: {e} Skip binding cpu.")
         return device
 
+    @startup_stage("device_init")
     def init_device(self):
         # NOTE: KEEP device the member of `NPUWorker`, as it will be checked
         # in ray scenario. see https://github.com/vllm-project/vllm/pull/26845
@@ -535,6 +537,7 @@ class NPUWorker(WorkerBase):
         else:
             self.model_runner = NPUModelRunner(self.vllm_config, self.device)
 
+    @startup_stage("memory_profile")
     @torch.inference_mode()
     def determine_available_memory(self) -> int:
         """Profiles the peak memory usage of the model to determine how much
@@ -880,6 +883,7 @@ class NPUWorker(WorkerBase):
             for request_id in active_request_ids:
                 forget_cold_perf_request(request_id)
 
+    @startup_stage("model_load")
     def load_model(self) -> None:
         if self.vllm_config.model_config.enable_sleep_mode:
             allocator = CaMemAllocator.get_instance()
@@ -914,13 +918,17 @@ class NPUWorker(WorkerBase):
         started = time.perf_counter() if cold_perf_enabled() else None
         if started is not None:
             log_cold_perf_process_event("decoder_ep_startup_wait_start")
-        get_ep_group().barrier()
+        ep_group = get_ep_group()
+        members = {"members": ep_group.ranks} if ep_group.rank_in_group == 0 else {}
+        with startup_phase(self, "ep_barrier", ep=ep_group.rank_in_group, n=ep_group.world_size, **members):
+            ep_group.barrier()
         if started is not None:
             log_cold_perf_process_event(
                 "decoder_ep_startup_wait_complete",
                 elapsed_ms=round((time.perf_counter() - started) * 1000, 3),
             )
 
+    @startup_stage("warmup")
     def compile_or_warm_up_model(self) -> float:
         self._wait_for_decoder_ep_startup()
         # Note: need to adapt for graph mode.
@@ -942,9 +950,10 @@ class NPUWorker(WorkerBase):
                 if not any(x in compile_range for x in all_sizes):
                     warmup_sizes.append(compile_range.end)
 
-        for size in sorted(warmup_sizes, reverse=True):
-            logger.info("Compile and warming up model for size %d", size)
-            self.model_runner._dummy_run(size)
+        with startup_phase(self, "warmup_dummy", sizes=len(warmup_sizes)):
+            for size in sorted(warmup_sizes, reverse=True):
+                logger.info("Compile and warming up model for size %d", size)
+                self.model_runner._dummy_run(size)
         if not self.model_config.enforce_eager:
             capture_started = time.perf_counter() if cold_perf_enabled() else None
             if capture_started is not None:
@@ -953,7 +962,8 @@ class NPUWorker(WorkerBase):
                     staged_sfa=staged_sfa_graph_configured(self.vllm_config),
                     capture_sizes=self.vllm_config.compilation_config.cudagraph_capture_sizes,
                 )
-            self.model_runner.capture_model()
+            with startup_phase(self, "graph_capture"):
+                self.model_runner.capture_model()
             if capture_started is not None:
                 log_cold_perf_process_event(
                     "decoder_graph_capture_complete",
@@ -965,7 +975,8 @@ class NPUWorker(WorkerBase):
         # Call ATB matmul to warm up; otherwise, the first operation (ReshapeAndCache)
         # may cause performance degradation at runtime.
         if get_ascend_device_type() != AscendDeviceType.A5:
-            self._warm_up_atb()
+            with startup_phase(self, "atb_warmup"):
+                self._warm_up_atb()
         # Reset the seed to ensure that the random state is not affected by
         # the model initialization and profiling.
         set_random_seed(self.model_config.seed)
@@ -1062,9 +1073,11 @@ class NPUWorker(WorkerBase):
             self.model_runner.update_max_model_len(max_model_len)
         logger.debug("Updated max_model_len to %d", max_model_len)
 
+    @startup_stage("kv_init")
     def initialize_from_config(self, kv_cache_config: KVCacheConfig) -> None:
         """Allocate NPU KV cache with the specified kv_cache_config."""
-        ensure_kv_transfer_initialized(self.vllm_config, kv_cache_config)
+        with startup_phase(self, "kv_connector", p_node=int(envs_ascend.VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE)):
+            ensure_kv_transfer_initialized(self.vllm_config, kv_cache_config)
         if self.vllm_config.model_config.enable_sleep_mode:
             allocator = CaMemAllocator.get_instance()
             context = allocator.use_memory_pool(tag="kv_cache")
@@ -1123,6 +1136,7 @@ class NPUWorker(WorkerBase):
     def execute_dummy_batch(self) -> None:
         self.model_runner._dummy_run(num_tokens=self.model_runner.decode_token_per_req, uniform_decode=True)
 
+    @startup_stage("dist_init")
     def _init_worker_distributed_environment(self) -> None:
         """Initialize the distributed environment."""
         init_batch_invariance()
