@@ -3869,14 +3869,10 @@ class AscendSFAImpl(MLAAttentionImpl):
                     "staged SFA producer event was not created by eager "
                     "warmup"
                 )
-            producer_event = torch.npu.ExternalEvent()
+            producer_event = torch.npu.Event()
+            # Materialize the handle in eager warmup, never inside capture.
+            producer_event.record()
             state.producer_event = producer_event
-        else:
-            # ExternalEvent is the graph-visible fence consumed by LMCache
-            # between Graph A and Graph B.  Reset before each captured/replayed
-            # producer interval, then record only after every bridge output is
-            # stable.
-            producer_event.reset()
         initialized_capacity = state.initialized_cache_capacity
         if is_dummy and graph_key.request_capacity > initialized_capacity:
             for cache in kv_cache:
@@ -3970,8 +3966,6 @@ class AscendSFAImpl(MLAAttentionImpl):
             hidden_states,
             outputs,
         )
-        attn_metadata.reshape_cache_event = producer_event
-        producer_event.record()
         state.runtime = (
             layer_name,
             kv_cache,
@@ -4383,8 +4377,13 @@ class AscendSFAImpl(MLAAttentionImpl):
             state = self._staged_sfa_capture_state
             index_enabled = bool(state.runtime and state.runtime[3])
             producer_event = state.producer_event
-            if producer_event is not None:
-                attn_metadata.reshape_cache_event = producer_event
+            if producer_event is None:
+                raise RuntimeError("staged SFA producer event was not initialized by eager warmup")
+            # Graph A replays on the current stream. Record outside capture on
+            # every handoff; an ExternalEvent recorded inside Graph A cannot
+            # refresh host wait bookkeeping on replay or serve multiple waiters.
+            producer_event.record(torch.npu.current_stream())
+            attn_metadata.reshape_cache_event = producer_event
             request_ids = attn_metadata.decode_request_ids_compact
             if request_ids is None:
                 raise RuntimeError("staged SFA request ids are unavailable")
