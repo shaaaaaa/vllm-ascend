@@ -233,16 +233,23 @@ class AscendMultiHeadLatentAttention(MultiHeadLatentAttentionWrapper):
                 self.prefix,
                 self.next_layer_name,
             )
-            torch.ops.vllm.sfa_forward_post(
-                ql_nope,
-                q_pe,
-                topk_indices,
-                selected_packed,
-                selected_counts,
-                target_slots,
-                output,
-                self.prefix,
-            )
+            destinations = getattr(impl, "_retrieval_prefetch_destinations", ())
+            if destinations:
+                torch.ops.vllm.sfa_forward_post_prefetch(
+                    ql_nope, q_pe, topk_indices, selected_packed, selected_counts,
+                    target_slots, output, self.prefix, destinations,
+                )
+            else:
+                torch.ops.vllm.sfa_forward_post(
+                    ql_nope,
+                    q_pe,
+                    topk_indices,
+                    selected_packed,
+                    selected_counts,
+                    target_slots,
+                    output,
+                    self.prefix,
+                )
             if self.target_sfa_debug:
                 torch.ops.vllm.sfa_target_layer_diag(
                     output,
@@ -493,6 +500,45 @@ def sfa_forward_post(
     )
 
 
+def sfa_forward_post_prefetch(
+    ql_nope: torch.Tensor,
+    q_pe: torch.Tensor,
+    topk_indices: torch.Tensor,
+    selected_packed: torch.Tensor,
+    selected_counts: torch.Tensor,
+    target_slots: torch.Tensor,
+    output: torch.Tensor,
+    layer_name: str,
+    destinations: list[torch.Tensor],
+) -> None:
+    impl, attn_layer_name, kv_cache, attn_metadata = _mla_runtime_state(layer_name)
+    _, outgoing = impl._shared_retrieval_edges()
+    edge = outgoing.get(attn_layer_name)
+    prefetch = None
+    if edge is not None:
+        capacity = edge.transfer.request_capacity
+        prefetch = (edge, selected_packed[:capacity], selected_counts[:capacity],
+                    target_slots[:capacity], destinations)
+    impl.cross_layer_graph_post(
+        attn_layer_name, ql_nope, q_pe, topk_indices, kv_cache, attn_metadata, output,
+        prefetch=prefetch,
+    )
+
+
+def sfa_forward_post_prefetch_fake(
+    ql_nope: torch.Tensor,
+    q_pe: torch.Tensor,
+    topk_indices: torch.Tensor,
+    selected_packed: torch.Tensor,
+    selected_counts: torch.Tensor,
+    target_slots: torch.Tensor,
+    output: torch.Tensor,
+    layer_name: str,
+    destinations: list[torch.Tensor],
+) -> None:
+    return
+
+
 def sfa_forward_post_fake(
     ql_nope: torch.Tensor,
     q_pe: torch.Tensor,
@@ -548,6 +594,13 @@ direct_register_custom_op(
     op_func=sfa_lmcache_retrieve,
     mutates_args=["output"],
     fake_impl=sfa_lmcache_retrieve_fake,
+    dispatch_key="PrivateUse1",
+)
+direct_register_custom_op(
+    op_name="sfa_forward_post_prefetch",
+    op_func=sfa_forward_post_prefetch,
+    mutates_args=["output", "destinations"],
+    fake_impl=sfa_forward_post_prefetch_fake,
     dispatch_key="PrivateUse1",
 )
 direct_register_custom_op(

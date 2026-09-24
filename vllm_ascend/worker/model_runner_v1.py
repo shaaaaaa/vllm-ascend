@@ -652,6 +652,12 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
         self._staged_sfa_impls: tuple[tuple[str, Any], ...] = ()
         self._staged_sfa_layer_names: tuple[str, ...] = ()
         self._sfa_full_graph = SFAFullGraph()
+        if envs_ascend.VLLM_ASCEND_SFA_SHARED_RETRIEVAL_OVERLAP:
+            if not sfa_full_graph_enabled(vllm_config) or not envs_ascend.VLLM_ASCEND_SFA_SHARED_RESIDENT_PLAN:
+                raise ValueError("shared retrieval overlap requires full graphs and shared resident planning")
+            from vllm_ascend.compilation.sfa_retrieval_overlap import SharedRetrievalOverlap
+
+            self._sfa_full_graph.retrieval_overlap = SharedRetrievalOverlap()
         self._sfa_preparation_groups = (
             preparation_error_groups(
                 self.parallel_config, is_moe=is_moe_model(vllm_config),
@@ -3724,6 +3730,12 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                                 graph_inputs["shared_resident_plans"] = {
                                     group.members[0]: tuple(group.writes) for group in shared_groups
                                 }
+                        if graph_inputs is not None and getattr(self._sfa_full_graph, "retrieval_overlap", None) is not None:
+                            from vllm_ascend.attention.sfa_v1 import BMM_TRANS_MAX_SUPPORTED_TOKENS
+
+                            self._sfa_full_graph.retrieval_overlap.prepare(
+                                context.staged_sfa_graph_key, impls, shared_groups, BMM_TRANS_MAX_SUPPORTED_TOKENS,
+                            )
                         self._sfa_full_graph.bind_sources(source, request_ids)
                         prepared_call = self._sfa_full_graph.prepare_run(graph_inputs=graph_inputs, **graph_kwargs)
                     except Exception as exc:
@@ -5728,6 +5740,10 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
         self.may_reinitialize_input_batch(kv_cache_config)
         kv_caches = self.initialize_kv_cache_tensors(kv_cache_config)
         self._validate_shared_resident_layout(kv_caches)
+        if self._sfa_full_graph.retrieval_overlap is not None:
+            self._sfa_full_graph.retrieval_overlap.configure(
+                self._collect_staged_sfa_impls(), self._shared_resident_groups, kv_caches,
+            )
         # TODO: refactor the logic of attention
         # Initialize drafter attention group initialization
         if self.speculative_config and (
@@ -7220,6 +7236,9 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
         # are not in ACLGraphWrapper's weak registry, so clear them first.
         if envs_ascend.VLLM_ASCEND_SFA_FULL_GRAPH:
             self._reset_staged_sfa_startup_capture()
+            if self._sfa_full_graph.retrieval_overlap is not None:
+                self._sfa_full_graph.retrieval_overlap.release_layout(self._collect_staged_sfa_impls())
+                self._staged_sfa_layer_names = ()  # Keep the reset registry invalidated.
         super()._cleanup_profiling_kv_cache()
 
     def _prepare_multimodal_fields(self):

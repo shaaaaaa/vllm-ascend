@@ -3662,6 +3662,16 @@ class AscendSFAImpl(MLAAttentionImpl):
         )
         return masked_slots, masked_updates
 
+    def _shared_retrieval_edges(self):
+        context = get_forward_context()
+        owner = getattr(self, "_retrieval_overlap", None)
+        if owner is None or not getattr(context, "sfa_full_graph_active", False):
+            return {}, {}
+        group = self.shared_resident_plan
+        if group is not None and not group.active:
+            raise RuntimeError("shared retrieval plan became inactive during capture")
+        return owner.edges(context.staged_sfa_graph_key)
+
     def _cross_layer_post_compute(
         self,
         ql_nope: torch.Tensor,
@@ -3675,6 +3685,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         output: torch.Tensor,
         *,
         trace_label: str,
+        prefetch: tuple | None = None,
     ) -> torch.Tensor:
         kv_cache = (kv_cache_nope, kv_cache_pe)
         attn_output = self._execute_sparse_flash_attention_process(
@@ -3688,6 +3699,9 @@ class AscendSFAImpl(MLAAttentionImpl):
             block_table_override=block_table,
             trace_label=trace_label,
         )
+        if prefetch is not None:
+            edge, selected, counts, slots, destinations = prefetch
+            edge.launch(selected, counts, slots, destinations)
         attn_output = self._v_up_proj(attn_output)
         weight_prefetch_method = get_weight_prefetch_method()
         weight_prefetch_method.maybe_prefetch_mla_or_sla_weight_in_current_stream(
@@ -3968,6 +3982,10 @@ class AscendSFAImpl(MLAAttentionImpl):
     ) -> tuple[torch.Tensor, ...]:
         """Run graph A, or the complete native path outside staged replay."""
         context = get_forward_context()
+        if getattr(self, "_retrieval_overlap", None) is not None:
+            incoming, _ = self._shared_retrieval_edges()
+            if layer_name in incoming:
+                incoming[layer_name].join()
         if attn_metadata is None:
             self.forward(
                 layer_name,
@@ -4528,6 +4546,10 @@ class AscendSFAImpl(MLAAttentionImpl):
             if attn_metadata is None or graph_key is None:
                 return
             if getattr(context, "sfa_full_graph_active", False):
+                if getattr(self, "_retrieval_overlap", None) is not None:
+                    incoming, _ = self._shared_retrieval_edges()
+                    if layer_name in incoming:
+                        return  # Joined before this consumer's current-KV writes.
                 capacity = graph_key.request_capacity
                 self._full_graph_transfer.load(
                     selected_packed[:capacity], selected_counts[:capacity], target_slots[:capacity]
@@ -4840,6 +4862,8 @@ class AscendSFAImpl(MLAAttentionImpl):
         kv_cache: tuple[torch.Tensor, ...],
         attn_metadata: M | None,
         output: torch.Tensor,
+        *,
+        prefetch: tuple | None = None,
     ) -> None:
         graph_key = getattr(get_forward_context(), "staged_sfa_graph_key", None)
         if attn_metadata is None or graph_key is None:
@@ -4857,6 +4881,7 @@ class AscendSFAImpl(MLAAttentionImpl):
             attn_metadata.block_table,
             output,
             trace_label="cross_layer",
+            prefetch=prefetch,
         )
         if self._staged_graph_content_diagnostic_enabled(layer_name):
             state = self._staged_sfa_capture_state
