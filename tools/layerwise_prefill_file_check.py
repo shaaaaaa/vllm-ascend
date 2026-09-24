@@ -504,6 +504,9 @@ def main(argv=None):
         raise ValueError("--run-dir must be new or empty")
     root.mkdir(parents=True, exist_ok=True)
     try:
+        # Run once in the Linux parent, never on worker imports or between P/D.
+        print(f"{PREFIX} startup: rm -rf /dev/shm/*", flush=True)
+        subprocess.run(["/bin/sh", "-c", "rm -rf /dev/shm/*"], check=True)
         if args.off_dir:
             length = prepare_reused_off(args, root)
         else:

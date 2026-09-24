@@ -206,7 +206,57 @@ def test_bootstrap_has_no_native_fallback(tmp_path):
     source = (tmp_path / "bootstrap" / "sitecustomize.py").read_text()
     assert "layerwise_prefill_file_store import install" in source
     assert "os._exit(1)" in source
-    assert "clear_shared_memory" not in Path(runner.__file__).read_text()
+    assert "/dev/shm" not in source
+
+
+@pytest.mark.parametrize("reuse_off", [False, True])
+@pytest.mark.parametrize("cleanup_fails", [False, True])
+def test_parent_cleans_shm_once_before_models(tmp_path, monkeypatch, reuse_off, cleanup_fails):
+    events = []
+    monkeypatch.setattr(sys, "platform", "linux")
+
+    def cleanup(command, *, check):
+        assert command == ["/bin/sh", "-c", "rm -rf /dev/shm/*"]
+        assert check is True
+        events.append("cleanup")
+        if cleanup_fails:
+            raise subprocess.CalledProcessError(1, command)
+
+    def prepare(args, root):
+        runner.write_json(root / "model_info.json", {"num_hidden_layers": 78})
+        return 5
+
+    monkeypatch.setattr(subprocess, "run", cleanup)
+    monkeypatch.setattr(runner, "record_model_identity", lambda *_: None)
+    monkeypatch.setattr(runner, "prepare_prompt", prepare)
+    monkeypatch.setattr(runner, "prepare_reused_off", prepare)
+    monkeypatch.setattr(runner, "prepare_bootstrap", lambda *_: None)
+    monkeypatch.setattr(runner, "run_stages", lambda *_: events.append("models"))
+    monkeypatch.setattr(runner, "analyse", lambda *_: 0)
+    argv = ["--run-dir", str(tmp_path / "run")]
+    if reuse_off:
+        argv.extend(["--off-dir", str(tmp_path / "old")])
+    if cleanup_fails:
+        with pytest.raises(subprocess.CalledProcessError):
+            runner.main(argv)
+        assert events == ["cleanup"]
+    else:
+        assert runner.main(argv) == 0
+        assert events == ["cleanup", "models"]
+
+
+@pytest.mark.parametrize("mode", ["child", "compare", "help"])
+def test_non_parent_execution_never_cleans_shm(tmp_path, monkeypatch, mode):
+    monkeypatch.setattr(subprocess, "run", lambda *_args, **_kwargs: pytest.fail("Unexpected shared memory cleanup"))
+    monkeypatch.setattr(runner, "run_child", lambda *_: None)
+    monkeypatch.setattr(runner, "analyse", lambda *_: 0)
+    if mode == "help":
+        with pytest.raises(SystemExit) as exc:
+            runner.main(["--help"])
+        assert exc.value.code == 0
+    else:
+        argv = ["--child", "decode"] if mode == "child" else ["--compare-only", str(tmp_path)]
+        assert runner.main(argv) == 0
 
 
 @pytest.mark.parametrize("problem", ["rank_missing", "wrong_path", "incomplete_file"])

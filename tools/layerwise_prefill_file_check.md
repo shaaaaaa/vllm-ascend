@@ -55,7 +55,9 @@ token IDs。`--prompt-format chat` 则应用模型 chat template。至少需要�
    不把 P 的第一个输出 token 追加到 prompt。要求命中数恰好是 prompt 长度减一，
    并要求实际读取两组 DSA 的文件 payload；不会把重新做完整 prefill 算作成功。
 
-脚本仅停止自己创建的进程组，不清空 `/dev/shm`。每阶段使用自己的 LMCache
+主进程启动时先执行一次 `rm -rf /dev/shm/*`。worker 导入、阶段子进程及
+`--compare-only` 不执行清理，P/D 切换时也不会重复清理。脚本仅停止自己创建的
+进程组。每阶段使用自己的 LMCache
 实例，D 不复用 P 的共享缓存对象。`--store-gb` 只是文件 SDK 的 setup 参数，
 不会申请原生 Mooncake 大内存段；真实字节落到 `store/` 所在磁盘。
 
