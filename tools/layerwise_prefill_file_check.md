@@ -22,7 +22,8 @@ python3 tools/layerwise_prefill_file_check.py \
 `/workspace/models/GLM-5.2-w4a8c8-0723`。启动首行会打印实际模型路径。
 默认 TP8、DP1、4096 compute chunk、1024 LMCache chunk、24 GiB CPU cache、
 max-model-len 16384、显存利用率 0.97、FlashComm1=1、MTP=1。
-默认固定长文章约 10000 个输入 token，生成 256 个 token。支持
+默认固定长文章约 10000 个输入 token，OFF 和 D 各生成 64 个 token（包含
+prefill 产生的第一个 token），P 单独生成 1 个 token。支持
 `--devices 0,1,2,3`、`--output-tokens 512`、`--mtp-tokens 0` 等显式覆盖。
 
 复现之前五 token 左右的 completions 请求：
@@ -32,7 +33,7 @@ set -o pipefail
 python3 tools/layerwise_prefill_file_check.py \
   --model /workspace/models/GLM-5.3-w4a8c8 \
   --prompt '你好，请介绍一下你自己' --prompt-format raw \
-  --output-tokens 512 --run-dir /workspace/layerwise-file-short \
+  --output-tokens 64 --run-dir /workspace/layerwise-file-short \
   2>&1 | tee log.log
 ```
 
@@ -74,6 +75,9 @@ python3 tools/layerwise_prefill_file_check.py \
 也可以把 `--off-dir` 指向旧目录的 `baseline/`。旧 OFF 已完成时，即使旧 P 或
 D 失败，仍可复用。脚本校验 OFF 覆盖、tensor 文件、模型配置与运行参数，恢复
 保存的 prompt IDs 和未显式覆盖的参数，只启动新的 P、D，不修改旧目录。
+复用时输出长度也继承旧 OFF：旧 OFF 是 256 个 token，就仍跑 256 个；
+不能给该目录指定 `--output-tokens 64`，否则输出长度及完整性校验不匹配。
+要使用新的 64 token 默认值，需要一份 64 token 的 OFF 基线。
 显式给出与旧 OFF 不一致的模型或计算参数会报错。之前
 `layerwise_prefill_correctness.py` 的单 token OFF 没有 decode 记录，不能作为
 本脚本的完整基线。
@@ -110,8 +114,13 @@ python3 tools/layerwise_prefill_file_check.py \
   --compare-only /workspace/layerwise-file-glm53 2>&1 | tee compare.log
 ```
 
-完整 tensor 记录占用大量磁盘，三阶段都保留原始数据。测试统一使用 eager 并
-关闭图捕获，确保每次真实 forward 的探针都执行；CPU 回读会改变时序。因此
+完整 tensor 记录占用大量磁盘，三阶段都保留原始数据。每次探针执行都会把
+tensor 回读到 CPU、写入 `.pt` 文件并刷新索引；indexer KV 还会记录当前完整
+前缀。数值比较在三个模型阶段结束后执行，不在生成过程中执行。
+因此生成阶段显示的 token/s 包含回读和写盘开销，不能当作正常 decode 性能；
+把输出缩短到 64 token 减少总记录量，不保证单 token 的诊断速度提高。
+测试统一使用 eager 并关闭图捕获，确保每次真实 forward 的探针都执行；
+CPU 回读会改变时序。因此
 结果覆盖单请求、单机 TP 的文件恢复及 decode 数值路径，不代表四机 DP/EP、
 原生 Mooncake/RDMA、并发 RemoteFill、图回放或无探针时 DMA 竞态已通过验证。
 `--rpc-timeout-seconds` 默认 1800，`--stage-timeout-seconds` 默认 21600，包含

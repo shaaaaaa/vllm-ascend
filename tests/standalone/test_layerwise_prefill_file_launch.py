@@ -60,7 +60,7 @@ def test_process_exit_precedes_seal_and_decode_launch(tmp_path, monkeypatch):
 
     def launch(command, env, log_path, stage, **kwargs):
         events.append(f"start:{stage}")
-        assert command[command.index("--output-tokens") + 1] == "256"
+        assert command[command.index("--output-tokens") + 1] == "64"
         runner.write_json(log_path.parent / "output.json", {"completed": True})
         return SimpleNamespace(pid=42, returncode=0, stage=stage, wait=lambda **_: 0)
 

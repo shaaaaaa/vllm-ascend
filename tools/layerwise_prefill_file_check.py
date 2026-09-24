@@ -88,7 +88,13 @@ def parser():
         type=positive_int,
         help="Optional truncation for explicit prompts; default example targets 10000 tokens",
     )
-    cli.add_argument("--output-tokens", default=256, type=positive_int, action=ExplicitOption)
+    cli.add_argument(
+        "--output-tokens",
+        default=64,
+        type=positive_int,
+        action=ExplicitOption,
+        help="Total output tokens for OFF and D (default: 64; --off-dir inherits the saved count)",
+    )
     cli.add_argument("--prefill-chunk-tokens", default=4096, type=positive_int, action=ExplicitOption)
     cli.add_argument("--cpu-cache-gb", default=24, type=float, action=ExplicitOption)
     cli.add_argument(
