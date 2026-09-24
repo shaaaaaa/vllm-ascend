@@ -45,6 +45,7 @@ COMPUTE_CHUNK_TOKENS = 4096
 SHORT_MAX_MODEL_LEN = 16384
 LONG_MAX_MODEL_LEN = 80000 + COMPUTE_CHUNK_TOKENS
 PREFIX = "[PREFILL_PROFILE]"
+DEFAULT_MODEL = "/workspace/models/GLM-5.2-w4a8c8-0723"
 
 
 def clear_shm(shm_dir: Path) -> int:
@@ -93,7 +94,11 @@ def check_shm_capacity(shm_dir: Path, cache_gb: float) -> None:
 
 def parser():
     cli = argparse.ArgumentParser(description=__doc__)
-    cli.add_argument("--model", default="/workspace/models/GLM-5.1-w4a8")
+    cli.add_argument(
+        "--model",
+        default=DEFAULT_MODEL,
+        help="Checkpoint directory; defaults to GLM-5.2-w4a8c8-0723",
+    )
     cli.add_argument("--devices", default="0,1,2,3,4,5,6,7")
     cli.add_argument("--prompt-file", type=Path, help="Override the fixed 10k/80k example article")
     cli.add_argument("--cpu-cache-gb", type=float, default=24, help="Requires this much free /dev/shm and host RAM")
@@ -153,7 +158,36 @@ def build_prompt(tokenizer, article: str, target_tokens: int):
     raise ValueError(f"Could not fit the fixed article within {target_tokens} tokens; no unbounded retry")
 
 
+def record_model_identity(model, root):
+    """Record the checkpoint configuration before starting expensive workers."""
+    from transformers import AutoConfig
+
+    config = AutoConfig.from_pretrained(model, trust_remote_code=True)
+    text_config = getattr(config, "text_config", None) or config
+    indexer_types = getattr(text_config, "indexer_types", None)
+    info = {
+        "model": model,
+        "model_type": getattr(text_config, "model_type", None),
+        "num_hidden_layers": getattr(text_config, "num_hidden_layers", None),
+        "indexer_types": indexer_types,
+        "index_topk_pattern": getattr(text_config, "index_topk_pattern", None),
+    }
+    write_json(root / "model_info.json", info)
+    if indexer_types is None:
+        indexer_description = "indexer_types absent; checkpoint declares no shared-indexer schedule"
+    else:
+        producers = [i for i, kind in enumerate(indexer_types) if kind == "full"]
+        shared = sum(kind == "shared" for kind in indexer_types)
+        indexer_description = f"indexer producer layers={producers}; shared layers={shared}"
+    print(
+        f"{PREFIX} checkpoint={model}; layers={info['num_hidden_layers']}; {indexer_description}",
+        flush=True,
+    )
+    return info
+
+
 def prepare_inputs(args, root, cases):
+    record_model_identity(args.model, root)
     started = time.perf_counter()
     print(f"{PREFIX} loading tokenizer: {args.model}", flush=True)
     from transformers import AutoTokenizer
@@ -538,6 +572,7 @@ def main(argv=None):
     if any(root.iterdir()):
         cli.error("--run-dir must be empty (nothing was deleted)")
     cases = LONG_CASES if args.case == "all" else (args.case,)
+    print(f"{PREFIX} model: {args.model}", flush=True)
     print(f"{PREFIX} results: {root}; full model, TP={len(devices)}, gpu=0.97, eager P only, MTP1", flush=True)
     print(f"{PREFIX} local CPU cache={args.cpu_cache_gb} GiB; no Mooncake/file shim/KV dumps", flush=True)
     prepare_inputs(args, root, cases)

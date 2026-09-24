@@ -5,6 +5,7 @@ import ast
 import builtins
 import importlib.util
 import json
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -33,6 +34,21 @@ def profile_tool(monkeypatch):
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
     return module
+
+
+def test_checkpoint_default_and_recorded_indexer_schedule(profile_tool, tmp_path, monkeypatch, capsys):
+    assert profile_tool.parser().parse_args([]).model == "/workspace/models/GLM-5.2-w4a8c8-0723"
+    config = SimpleNamespace(
+        model_type="glm_moe_dsa", num_hidden_layers=4, indexer_types=["full", "shared", "full", "shared"]
+    )
+    monkeypatch.setitem(
+        sys.modules, "transformers", SimpleNamespace(AutoConfig=SimpleNamespace(from_pretrained=lambda *a, **k: config))
+    )
+    info = profile_tool.record_model_identity("/models/explicit-checkpoint", tmp_path)
+    assert json.loads((tmp_path / "model_info.json").read_text()) == info
+    assert info["model"] == "/models/explicit-checkpoint"
+    assert info["num_hidden_layers"] == 4
+    assert "producer layers=[0, 2]; shared layers=2" in capsys.readouterr().out
 
 
 @pytest.mark.parametrize("prompt_size,prompt_tokens,max_len", [("10k", 10000, 16384), ("80k", 80000, 84096)])
