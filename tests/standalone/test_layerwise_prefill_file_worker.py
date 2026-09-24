@@ -88,9 +88,11 @@ def test_query_context_accepts_decode_and_checks_sharded_real_positions(worker):
     meta = NS(num_actual_tokens=2, seq_lens_cpu=[7], query_start_loc_cpu=[0, 2])
     assert worker.query_context(meta, [5, 6], [21, 22]) == ([5, 6], [21, 22])
     meta.dsa_cp_context = NS(local_start=1, local_end=2, local_end_with_pad=2)
-    assert worker.query_context(meta, [6], [21, 22]) == ([5, 6], [21, 22])
+    assert worker.query_context(meta, [6], [21, 22], source_positions=[5, 6]) == ([5, 6], [21, 22])
     with pytest.raises(RuntimeError, match="disagree"):
-        worker.query_context(meta, [100], [21, 22])
+        worker.query_context(meta, [100], [21, 22], source_positions=[5, 6])
+    with pytest.raises(RuntimeError, match="require the observed"):
+        worker.query_context(meta, [6], [21, 22])
     with pytest.raises(RuntimeError, match="exactly one"):
         worker.query_context(
             NS(num_actual_tokens=2, seq_lens_cpu=[2, 4], query_start_loc_cpu=[0, 1, 2]), [1, 3], [9, 10]
@@ -104,11 +106,11 @@ def test_mtp_one_token_padding_is_not_a_global_position(worker):
         query_start_loc_cpu=[0, 1],
         dsa_cp_context=NS(local_start=1, local_end=1, local_end_with_pad=2),
     )
-    assert worker.query_context(meta, [0], [999], positions_local=True) == ([100], [999])
+    assert worker.query_context(meta, [0], [999], positions_local=True, source_positions=[100]) == ([100], [999])
     meta.dsa_cp_context = NS(local_start=0, local_end=1, local_end_with_pad=1)
-    assert worker.query_context(meta, [100], [999], positions_local=True) == ([100], [999])
+    assert worker.query_context(meta, [100], [999], positions_local=True, source_positions=[100]) == ([100], [999])
     with pytest.raises(RuntimeError, match="disagree"):
-        worker.query_context(meta, [0], [999], positions_local=True)
+        worker.query_context(meta, [0], [999], positions_local=True, source_positions=[100])
 
 
 def test_mtp_shifted_history_matches_full_prefill_and_fresh_decode(worker, tmp_path):
@@ -174,6 +176,75 @@ def test_mtp_model_output_before_allgather_has_no_rows_on_padding_rank(worker, t
     archive.close()
     record = json.loads((archive.directory / "index.jsonl").read_text())
     assert record["valid_rows"] == 0 and record["positions"] == [] and record["shape"] == [1, 4]
+
+
+@pytest.mark.parametrize("rank", [0, 1, 7])
+def test_installed_mtp_probe_uses_proposer_positions_and_keeps_raw_sum(worker, tmp_path, monkeypatch, rank):
+    class Model(torch.nn.Module):
+        def forward(self, input_ids, positions, hidden_states):
+            return hidden_states
+
+        def compute_logits(self, hidden_states):
+            return hidden_states
+
+        def __call__(self, *args, **kwargs):
+            return self.forward(*args, **kwargs)
+
+    class Impl:
+        def forward(self):
+            pass
+
+        def exec_kv(self):
+            pass
+
+        def indexer_select_post_process(self):
+            pass
+
+    model = Model()
+    source = torch.tensor([3])
+    meta = NS(
+        num_actual_tokens=1,
+        seq_lens_cpu=[4],
+        query_start_loc_cpu=[0, 1],
+        dsa_cp_context=NS(local_start=rank, local_end=min(rank + 1, 1), local_end_with_pad=rank + 1),
+    )
+    layer_name = "model.layers.78.self_attn.attn"
+    inventory = ({}, {0: (78, NS(layer_name=layer_name, impl=NS(enable_dsa_cp=True)))}, dict(required_roles=[]))
+    monkeypatch.setattr(worker, "model_inventory", lambda *args: inventory)
+    monkeypatch.setattr(torch.ops, "_C_ascend", NS(npu_sparse_flash_attention=lambda: None))
+    drafter = NS(
+        _get_positions=lambda count: source[:count],
+        _run_mtp_draft_layer_with_diagnostics=lambda model_kwargs, **kwargs: model(**model_kwargs),
+    )
+    runner = NS(drafter=drafter, parallel_config=NS(tensor_parallel_size=8))
+    archive = worker.FileTensorArchive(tmp_path / "decode", rank)
+    probe = worker.FileProbe(
+        runner,
+        archive,
+        [10, 11, 12, 13],
+        lambda: NS(attn_metadata={layer_name: meta}, flash_comm_v1_enabled=True),
+    )
+    probe.models["mtp"] = model
+    original_draft = drafter._run_mtp_draft_layer_with_diagnostics
+    probe.install(NS(AscendSFAImpl=Impl), NS(), NS())
+    raw_positions = torch.tensor([24 if rank == 0 else 0])
+    runtime = dict(num_input_tokens=1, batch_size=1, token_indices_to_sample=torch.tensor([0]))
+    drafter._run_mtp_draft_layer_with_diagnostics(
+        dict(input_ids=torch.tensor([99]), positions=raw_positions, hidden_states=torch.ones(1, 4)),
+        runtime_inputs=runtime,
+    )
+    assert probe.mtp_positions is None and probe.mtp_sample_indices is None
+    # Logits run after the draft wrapper returns and must retain its selection.
+    model.compute_logits(torch.ones(1, 4))
+    summary = probe.finish()
+    assert summary["complete"], summary["errors"]
+    assert drafter._run_mtp_draft_layer_with_diagnostics is original_draft
+    assert summary["calls"][0]["positions"] == [3]
+    assert summary["calls"][0]["context_token_ids"] == [11, 12, 13, 99]
+    records = [json.loads(line) for line in (archive.directory / "index.jsonl").read_text().splitlines()]
+    record = next(item for item in records if (item["kind"], item["name"]) == ("model_input", "positions"))
+    assert record["positions"] == ([3] if rank == 0 else [])
+    assert torch.equal(torch.load(archive.root / record["path"], weights_only=True), raw_positions)
 
 
 def test_sparse_slots_follow_actual_remapped_table_and_exclude_causal_padding(worker):

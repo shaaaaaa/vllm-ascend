@@ -84,6 +84,12 @@ tensor 指纹。记录主模型和 MTP 的模型/各层输入输出、SFA query�
 来源，不要求两个实例物理地址相同。按实际逻辑位置和输入上下文对齐，排除
 声明的 TP padding；不会直接用不同阶段的 step 编号配对。
 
+FlashComm1 的 MTP `positions` 会经过 `reduce_scatter(SUM)`，模型实际收到的
+非零位置数值是原位置乘 TP 数。探针从 proposer 的未分片 positions 读取逻辑
+位置，同时核对分片后的真实输入是否符合求和结果；文件仍保存原始 tensor，
+不会把它除以 TP 后覆盖。KV 和 token 的对齐使用逻辑位置，不从这个求和后的
+数值或 CPU 序列长度反推。
+
 `report.json` 是简短总报告，`comparisons.jsonl` 保存逐项原始数据分布、差异
 比例、绝对误差、relative L2、RMSE/std 等全量统计。各阶段 `output.json` 保存
 全部输出 token，`coverage.json` 保存每个 rank 的完整性信息；

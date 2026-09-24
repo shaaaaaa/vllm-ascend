@@ -46,7 +46,7 @@ def row_window(rows, actual, cp=None, *, prefer_local=False):
     raise RuntimeError(f"Cannot map {rows} tensor rows to {actual} query tokens")
 
 
-def query_context(meta, positions, token_ids, *, positions_local=False):
+def query_context(meta, positions, token_ids, *, positions_local=False, source_positions=None, position_scale=1):
     """Normalize actual model inputs, never assign global tokens to TP padding."""
     actual = int(meta.num_actual_tokens)
     seq = [int(x) for x in meta.seq_lens_cpu]
@@ -58,13 +58,26 @@ def query_context(meta, positions, token_ids, *, positions_local=False):
     cp = getattr(meta, "dsa_cp_context", None)
     if len(positions) >= actual and not positions_local:
         logical = positions[:actual]
+        if source_positions is not None and logical != source_positions[:actual]:
+            raise RuntimeError("Model positions disagree with the observed proposer input")
     else:
         if cp is None:
             raise RuntimeError("Model positions do not cover its query")
+        if source_positions is None or len(source_positions) < actual:
+            raise RuntimeError("Sharded model positions require the observed unsharded proposer input")
         start, end = row_window(len(positions), actual, cp, prefer_local=True)
-        logical = list(range(seq[0] - actual, seq[0]))
-        if positions[: end - start] != logical[start:end]:
-            raise RuntimeError("Sharded model positions disagree with logical query metadata")
+        logical = source_positions[:actual]
+        # FlashComm1 applies reduce_scatter(SUM) to replicated MTP positions,
+        # not a plain slice. Preserve the raw input and map it back to the
+        # observed proposer positions; seq_lens_cpu is not this input tensor.
+        expected = [position * position_scale for position in logical[start:end]]
+        observed = positions[: end - start]
+        if observed != expected:
+            raise RuntimeError(
+                "Sharded model positions disagree with the observed proposer input: "
+                f"rows={start}:{end} scale={position_scale} "
+                f"expected={expected[:4]} observed={observed[:4]}"
+            )
     if len(token_ids) < actual:
         raise RuntimeError("Model input IDs do not expose all logical query tokens")
     if len(set(logical)) != len(logical) or any(p < 0 for p in logical):
@@ -274,6 +287,7 @@ class FileProbe:
         self.logical_topk = {}
         self.counts = {}
         self.mtp_sample_indices = None
+        self.mtp_positions = None
 
     def local_model_positions(self, model_name):
         return model_name == "mtp" and bool(getattr(self.get_context(), "flash_comm_v1_enabled", False))
@@ -368,7 +382,12 @@ class FileProbe:
         meta = self.metadata(model_name)
         local_positions = self.local_model_positions(model_name)
         positions, ids = query_context(
-            meta, integer_list(bound["positions"]), integer_list(bound["input_ids"]), positions_local=local_positions
+            meta,
+            integer_list(bound["positions"]),
+            integer_list(bound["input_ids"]),
+            positions_local=local_positions,
+            source_positions=self.mtp_positions if model_name == "mtp" else None,
+            position_scale=int(self.runner.parallel_config.tensor_parallel_size) if local_positions else 1,
         )
         # MTP consumes the next token at each target-model position. Its
         # historical input context is shifted too, including a fresh D process
@@ -612,15 +631,25 @@ class FileProbe:
             drafter = getattr(self.runner, "drafter", None)
             if not callable(getattr(drafter, "_run_mtp_draft_layer_with_diagnostics", None)):
                 raise RuntimeError("MTP proposer does not expose its actual logits selection")
+            if not callable(getattr(drafter, "_get_positions", None)):
+                raise RuntimeError("MTP proposer does not expose its unsharded positions")
 
             def draft_factory(original):
                 @functools.wraps(original)
                 def draft(*args, **kwargs):
                     runtime = kwargs["runtime_inputs"]
-                    self.mtp_sample_indices = integer_list(runtime["token_indices_to_sample"])[
-                        : int(runtime["batch_size"])
-                    ]
-                    return original(*args, **kwargs)
+                    previous = self.mtp_sample_indices, self.mtp_positions
+                    try:
+                        self.mtp_sample_indices = integer_list(runtime["token_indices_to_sample"])[
+                            : int(runtime["batch_size"])
+                        ]
+                        # maybe_pad_and_reduce returns a new shard. The
+                        # proposer's buffer still contains the actual global
+                        # positions, including for a fresh D and later steps.
+                        self.mtp_positions = integer_list(drafter._get_positions(int(runtime["num_input_tokens"])))
+                        return original(*args, **kwargs)
+                    finally:
+                        self.mtp_sample_indices, self.mtp_positions = previous
 
                 return draft
 
