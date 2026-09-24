@@ -5,6 +5,7 @@ import copy
 import importlib.util
 import json
 import math
+import shutil
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -13,6 +14,7 @@ import pytest
 import torch
 
 MODULE_PATH = Path(__file__).resolve().parents[2] / "tools" / "layerwise_prefill_correctness_compare.py"
+sys.path.insert(0, str(MODULE_PATH.parent))
 SPEC = importlib.util.spec_from_file_location("correctness_compare_under_test", MODULE_PATH)
 assert SPEC and SPEC.loader
 compare = importlib.util.module_from_spec(SPEC)
@@ -520,3 +522,71 @@ def test_real_worker_archive_online_comparison_padding_contract(tmp_path, monkey
     assert right["comparison"]["numel"] == 1 and right["comparison"]["new_nonfinite"] == 0
     assert right["comparison"]["abs_diff"]["max"] == 0.25
     assert right["path"] is None and not on.errors
+
+
+def test_external_off_archive_compares_without_copying_or_writing_old_run(tmp_path):
+    old = _fixture(tmp_path / "old")
+    renamed = old / "saved_reference"
+    (old / "off").rename(renamed)
+    current = tmp_path / "new"
+    current.mkdir()
+    shutil.copyfile(old / "model_info.json", current / "model_info.json")
+    shutil.copytree(old / "on", current / "on")
+    _write(current / "off_reference.json", {"schema": 1, "off_dir": str(renamed.resolve())})
+    before = {str(path.relative_to(old)): path.read_bytes() for path in old.rglob("*") if path.is_file()}
+    model_info = json.loads((old / "model_info.json").read_text())
+    baseline = compare.validate_off_baseline(renamed, model_info)
+    assert baseline["result"]["completed"] and len(baseline["coverage"]) == 2
+    report = compare.compare_runs(current)
+    assert report["passed"] and not (current / "off").exists()
+    assert (current / "report.json").exists()
+    assert before == {str(path.relative_to(old)): path.read_bytes() for path in old.rglob("*") if path.is_file()}
+
+
+@pytest.mark.parametrize("mutation", ["missing_file", "missing_rank", "incomplete", "on_case", "capacity"])
+def test_validate_off_baseline_fails_before_model_start(tmp_path, mutation):
+    _fixture(tmp_path)
+    off = tmp_path / "off"
+    if mutation == "missing_file":
+        next((off / "tensors" / "rank1").glob("*.pt")).unlink()
+    elif mutation == "missing_rank":
+        (off / "tensors" / "rank1" / "index.jsonl").unlink()
+    elif mutation == "incomplete":
+        coverage = json.loads((off / "coverage.json").read_text())
+        coverage[1]["complete"] = False
+        _write(off / "coverage.json", coverage)
+    elif mutation == "on_case":
+        result = json.loads((off / "result.json").read_text())
+        result["case"] = "on"
+        _write(off / "result.json", result)
+    else:
+        environment = json.loads((off / "environment.json").read_text())
+        environment["LMCACHE_MAX_LOCAL_CPU_SIZE"] = "NaN"
+        _write(off / "environment.json", environment)
+    with pytest.raises(ValueError):
+        compare.validate_off_baseline(off, json.loads((tmp_path / "model_info.json").read_text()))
+
+
+@pytest.mark.parametrize("capacity,passes", [("24.0", True), ("32", False), ("0", False), ("NaN", False)])
+def test_cpu_capacity_uses_numeric_equality_without_ignoring_size(tmp_path, capacity, passes):
+    _fixture(tmp_path)
+    for case, value in (("off", "24"), ("on", capacity)):
+        path = tmp_path / case / "environment.json"
+        environment = json.loads(path.read_text())
+        environment["LMCACHE_MAX_LOCAL_CPU_SIZE"] = value
+        _write(path, environment)
+    assert compare.compare_runs(tmp_path)["passed"] is passes
+
+
+@pytest.mark.parametrize("value", ["-1", "0", "Infinity", "NaN", "garbage", None, True])
+def test_comparable_environment_rejects_invalid_capacity(value):
+    with pytest.raises(ValueError, match="positive finite"):
+        compare.comparable_environment({"LMCACHE_MAX_LOCAL_CPU_SIZE": value})
+
+
+def test_compare_invalid_reference_reports_failure_without_falling_back(tmp_path):
+    _fixture(tmp_path)
+    _write(tmp_path / "off_reference.json", {"schema": 2, "off_dir": str((tmp_path / "off").resolve())})
+    report = compare.compare_runs(tmp_path)
+    assert not report["passed"] and report["counts"]["off"] == 0
+    assert "off_reference.json schema" in report["errors"][0]["detail"]

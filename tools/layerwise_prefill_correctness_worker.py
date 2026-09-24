@@ -15,6 +15,7 @@ import re
 from pathlib import Path
 
 import torch
+from layerwise_prefill_correctness_baseline import resolve_off_directory
 from layerwise_prefill_correctness_layout import (
     install_local_merged_layout,
     validate_local_merged_engine,
@@ -122,8 +123,9 @@ class TensorArchive:
                 from layerwise_prefill_correctness_compare import compare_tensor_values
 
                 self.compare = compare_tensor_values
-            baseline_path = self.root.parent / "off" / "tensors" / f"rank{self.rank}" / "index.jsonl"
             try:
+                self.off_root = resolve_off_directory(self.root.parent)
+                baseline_path = self.off_root / "tensors" / f"rank{self.rank}" / "index.jsonl"
                 with baseline_path.open(encoding="utf-8") as source:
                     for line in source:
                         record = json.loads(line)
@@ -187,9 +189,8 @@ class TensorArchive:
                     record["comparison"] = dict(comparable=False, reason="OFF valid comparison rows differ")
                 else:
                     try:
-                        off_root = (self.root.parent / "off").resolve()
-                        source_path = (off_root / reference["path"]).resolve()
-                        source_path.relative_to(off_root)
+                        source_path = (self.off_root / reference["path"]).resolve()
+                        source_path.relative_to(self.off_root)
                         baseline = torch.load(source_path, map_location="cpu", weights_only=True)
                         reference_values = baseline[:valid_rows] if comparison_slice is not None else baseline
                         record["comparison"] = self.compare(reference_values, compared)

@@ -18,11 +18,14 @@ Full tensor readback perturbs execution; this is not a performance test or proof
 of race freedom. OFF saves complete tensors, not samples or fingerprints. ON
 loads each matching file and reports value distributions and numerical error.
 --save-on-tensors additionally keeps ON tensors. OFF archives can be very large.
+Use --off-dir OLD_RUN (or OLD_RUN/off) to reuse a completed OFF archive and run
+only ON. The saved prompt token IDs and unspecified launch settings are reused.
 """
 
 import argparse
 import json
 import os
+import shutil
 import sys
 import tempfile
 import time
@@ -60,18 +63,28 @@ ENVIRONMENT_KEYS = frozenset(
 )
 
 
+class ExplicitOption(argparse.Action):
+    """Keep ordinary defaults while tracking user overrides for OFF reuse."""
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        setattr(namespace, self.dest, values)
+        namespace.specified_options = getattr(namespace, "specified_options", frozenset()) | {self.dest}
+
+
 def parser():
     cli = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     cli.add_argument(
         "--model",
         default=DEFAULT_MODEL,
+        action=ExplicitOption,
         help="Actual checkpoint directory; defaults to GLM-5.2-w4a8c8-0723",
     )
-    cli.add_argument("--devices", default="0,1,2,3,4,5,6,7")
+    cli.add_argument("--devices", default="0,1,2,3,4,5,6,7", action=ExplicitOption)
     cli.add_argument("--prompt-file", type=Path, help="Fixed source article; tokenized once for both runs")
-    cli.add_argument("--prompt-tokens", type=int, default=DEFAULT_PROMPT_TOKENS)
-    cli.add_argument("--cpu-cache-gb", type=float, default=24)
+    cli.add_argument("--prompt-tokens", type=int, default=DEFAULT_PROMPT_TOKENS, action=ExplicitOption)
+    cli.add_argument("--cpu-cache-gb", type=float, default=24, action=ExplicitOption)
     cli.add_argument("--run-dir", type=Path, help="New, empty results directory")
+    cli.add_argument("--off-dir", type=Path, help="Previous correctness run or its off/ directory; run ON only")
     cli.add_argument(
         "--save-on-tensors",
         action="store_true",
@@ -112,6 +125,77 @@ def correctness_options(args, prompt_length):
     if prompt_length + 1 > options["max_model_len"]:
         raise ValueError("Prompt and first output token exceed max_model_len")
     return options
+
+
+def recorded_environment(env):
+    return {key: value for key, value in env.items() if key.startswith(ENVIRONMENT_PREFIXES) or key in ENVIRONMENT_KEYS}
+
+
+def require_matching_settings(label, expected, actual):
+    if not isinstance(expected, dict) or not isinstance(actual, dict):
+        raise ValueError(f"OFF {label} must be a configuration object")
+    changed = sorted(key for key in expected.keys() | actual.keys() if expected.get(key) != actual.get(key))
+    if changed:
+        raise ValueError(
+            f"OFF baseline {label} differs: {', '.join(changed)}; use matching settings or record a new OFF"
+        )
+
+
+def prepare_reused_off(args, root):
+    """Validate a read-only OFF archive before loading a model or launching ON."""
+    from layerwise_prefill_correctness_baseline import normalize_off_directory
+    from layerwise_prefill_correctness_compare import comparable_environment, validate_off_baseline
+
+    off_dir = normalize_off_directory(args.off_dir)
+    if root.resolve().is_relative_to(off_dir):
+        raise ValueError("The new --run-dir must be outside the reused OFF archive")
+    previous_root = off_dir.parent
+    previous_model = json.loads((previous_root / "model_info.json").read_text(encoding="utf-8"))
+    baseline = validate_off_baseline(off_dir, previous_model)
+    saved_prompt_path = previous_root / "prompt.json"
+    saved_prompt = json.loads(saved_prompt_path.read_text(encoding="utf-8")) if saved_prompt_path.is_file() else {}
+    result = baseline["result"]
+    length = result["prompt_length"]
+    validate_prompt_length(length)
+    if length > MAX_PROMPT_TOKENS:
+        raise ValueError(f"OFF prompt exceeds the supported {MAX_PROMPT_TOKENS} tokens")
+    if saved_prompt and saved_prompt.get("token_ids") != result["prompt_token_ids"]:
+        raise ValueError("OFF prompt.json token IDs differ from its completed result")
+    defaults = {
+        "model": baseline["engine_options"]["model"],
+        "devices": baseline["environment"]["ASCEND_RT_VISIBLE_DEVICES"],
+        "cpu_cache_gb": float(baseline["environment"]["LMCACHE_MAX_LOCAL_CPU_SIZE"]),
+        "prompt_tokens": saved_prompt.get("target_tokens", length),
+    }
+    specified = getattr(args, "specified_options", frozenset())
+    for name, value in defaults.items():
+        if name not in specified:
+            setattr(args, name, value)
+    if args.prompt_tokens != defaults["prompt_tokens"]:
+        raise ValueError("--prompt-tokens differs from OFF; reuse uses its exact saved token IDs")
+    require_matching_settings("engine_options", baseline["engine_options"], correctness_options(args, length))
+    require_matching_settings(
+        "environment",
+        comparable_environment(baseline["environment"]),
+        comparable_environment(recorded_environment(correctness_environment(args, "off"))),
+    )
+    current_model = record_model_identity(args.model, root)
+    require_matching_settings("model configuration", previous_model, current_model)
+    args.off_dir = off_dir
+    write_json(
+        root / "prompt.json",
+        {
+            **saved_prompt,
+            "length": length,
+            "token_ids": result["prompt_token_ids"],
+            "target_tokens": args.prompt_tokens,
+        },
+    )
+    if (previous_root / "prompt.txt").is_file():
+        shutil.copyfile(previous_root / "prompt.txt", root / "prompt.txt")
+    write_json(root / "off_reference.json", {"schema": 1, "off_dir": str(off_dir)})
+    print(f"{PREFIX} reuse OFF: {off_dir}; archive validated; OFF launch skipped", flush=True)
+    return length
 
 
 def validate_prompt_length(length):
@@ -230,7 +314,7 @@ def run_child(args):
 
 
 def run_cases(args, root):
-    for case in CASES:
+    for case in ("on",) if args.off_dir else CASES:
         case_dir = root / case
         case_dir.mkdir()
         command = [
@@ -255,11 +339,7 @@ def run_cases(args, root):
         env = correctness_environment(args, case)
         write_json(
             case_dir / "environment.json",
-            {
-                key: value
-                for key, value in env.items()
-                if key.startswith(ENVIRONMENT_PREFIXES) or key in ENVIRONMENT_KEYS
-            },
+            recorded_environment(env),
         )
         # Never clear all of /dev/shm: only this process group's normal engine
         # cleanup owns its resources. A failed run stops before the next case.
@@ -280,7 +360,11 @@ def main(argv=None):
     cli = parser()
     args = cli.parse_args(argv)
     if args.compare_only:
+        if args.off_dir:
+            cli.error("--compare-only reads the saved OFF reference; do not combine it with --off-dir")
         return compare(args.compare_only.resolve())
+    if args.off_dir and args.prompt_file:
+        cli.error("--off-dir uses saved prompt token IDs; do not combine it with --prompt-file")
     if not COMPUTE_CHUNK_TOKENS < args.prompt_tokens <= MAX_PROMPT_TOKENS:
         cli.error(f"--prompt-tokens must be in ({COMPUTE_CHUNK_TOKENS}, {MAX_PROMPT_TOKENS}]")
     if args.cpu_cache_gb <= 0:
@@ -304,23 +388,26 @@ def main(argv=None):
         cli.error(f"Results directory must be empty: {root}")
     root.mkdir(parents=True, exist_ok=True)
     args.run_dir = root
-    write_json(
-        root / "run.json",
-        {
-            "schema": 1,
-            "model": args.model,
-            "devices": devices,
-            "compute_chunk_tokens": COMPUTE_CHUNK_TOKENS,
-            "save_on_tensors": args.save_on_tensors,
-            "comparison": "OFF full tensors; ON online numerical errors and distributions; output tokens exact",
-            "layout": "tools-only local merged-page selection; real allocator and transfers",
-            "case_differences": ["VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE", "LMCACHE_STORE_ASYNC"],
-            "excluded": ["Mooncake transport", "MTP/decode intermediate tensors"],
-        },
-    )
     try:
-        count = prepare_prompt(args, root)
-        print(f"{PREFIX} {count} tokens; OFF then ON; results: {root}", flush=True)
+        count = prepare_reused_off(args, root) if args.off_dir else prepare_prompt(args, root)
+        write_json(
+            root / "run.json",
+            {
+                "schema": 1,
+                "model": args.model,
+                "devices": args.devices.split(","),
+                "compute_chunk_tokens": COMPUTE_CHUNK_TOKENS,
+                "save_on_tensors": args.save_on_tensors,
+                "off_source": str(args.off_dir) if args.off_dir else None,
+                "cases": ["on"] if args.off_dir else list(CASES),
+                "comparison": "OFF full tensors; ON online numerical errors and distributions; output tokens exact",
+                "layout": "tools-only local merged-page selection; real allocator and transfers",
+                "case_differences": ["VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE", "LMCACHE_STORE_ASYNC"],
+                "excluded": ["Mooncake transport", "MTP/decode intermediate tensors"],
+            },
+        )
+        sequence = "ON only against saved OFF" if args.off_dir else "OFF then ON"
+        print(f"{PREFIX} {count} tokens; {sequence}; results: {root}", flush=True)
         print(f"{PREFIX} full tensor probes perturb timing; no performance claims", flush=True)
         run_cases(args, root)
         return compare(root)

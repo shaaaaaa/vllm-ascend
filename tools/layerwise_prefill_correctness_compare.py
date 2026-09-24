@@ -15,8 +15,11 @@ import importlib
 import json
 import math
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
+
+from layerwise_prefill_correctness_baseline import normalize_off_directory, resolve_off_directory
 
 VALUE_BLOCK_SIZE = 262144
 EXACT_PERCENTILE_LIMIT = 1048576
@@ -25,6 +28,23 @@ ALLOWED_ENV_DIFFERENCES = frozenset({"VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE", "LM
 RECORD_FIELDS = frozenset(
     {"rank", "step", "layer", "kind", "name", "span", "shape", "dtype", "numel", "nonfinite", "path"}
 )
+
+
+def comparable_environment(environment: dict[str, Any]) -> dict[str, Any]:
+    """Normalize equivalent CPU capacity spellings without ignoring capacity."""
+    if not isinstance(environment, dict):
+        raise ValueError("environment must be an object")
+    result = dict(environment)
+    field = "LMCACHE_MAX_LOCAL_CPU_SIZE"
+    if field in result:
+        try:
+            capacity = Decimal(str(result[field]))
+        except (InvalidOperation, ValueError) as exc:
+            raise ValueError(f"{field} must be a positive finite number") from exc
+        if not capacity.is_finite() or capacity <= 0:
+            raise ValueError(f"{field} must be a positive finite number")
+        result[field] = str(capacity.normalize())
+    return result
 
 
 @dataclass
@@ -431,8 +451,10 @@ def _validate_coverage(
             )
 
 
-def _load_case(case: Path, errors: list[dict[str, Any]], model_info: dict[str, Any]) -> dict[str, Any]:
-    name = case.name
+def _load_case(
+    case: Path, errors: list[dict[str, Any]], model_info: dict[str, Any], *, case_name: str | None = None
+) -> dict[str, Any]:
+    name = case_name or case.name
     data: dict[str, Any] = {"records": {}, "coverage": []}
 
     def error(detail: str) -> None:
@@ -446,6 +468,7 @@ def _load_case(case: Path, errors: list[dict[str, Any]], model_info: dict[str, A
     result, options = data.get("result", {}), data.get("engine_options", {})
     try:
         _require(isinstance(result, dict) and result.get("completed") is True, "run did not complete")
+        _require("case" not in result or result["case"] == name, f"result.case differs from {name}")
         prompt = result.get("prompt_token_ids")
         _require(
             isinstance(prompt, list) and bool(prompt) and all(_integer(x) for x in prompt), "prompt tokens missing"
@@ -463,6 +486,10 @@ def _load_case(case: Path, errors: list[dict[str, Any]], model_info: dict[str, A
     if not isinstance(result, dict):
         result = {}
     environment = data.get("environment")
+    try:
+        comparable_environment(environment)
+    except ValueError as exc:
+        error(str(exc))
     for field in ALLOWED_ENV_DIFFERENCES:
         if not isinstance(environment, dict) or environment.get(field) != ("false" if name == "off" else "true"):
             error(f"{field} must be explicitly {'false' if name == 'off' else 'true'} for {name}")
@@ -511,6 +538,18 @@ def _load_case(case: Path, errors: list[dict[str, Any]], model_info: dict[str, A
     return data
 
 
+def validate_off_baseline(off_dir: str | Path, model_info: dict[str, Any]) -> dict[str, Any]:
+    """Validate every OFF manifest/file and full coverage, without writing files."""
+    case = normalize_off_directory(off_dir)
+    if not isinstance(model_info, dict) or not _integer(model_info.get("num_hidden_layers"), 1):
+        raise ValueError("OFF baseline independent model layer count is missing")
+    errors: list[dict[str, Any]] = []
+    data = _load_case(case, errors, model_info, case_name="off")
+    if errors:
+        raise ValueError(f"Invalid OFF baseline: {errors[0]['detail']}")
+    return data
+
+
 def compare_runs(root: str | Path) -> dict[str, Any]:
     """Validate OFF/ON artifacts and write report.json/diff.jsonl; return report.
 
@@ -529,10 +568,20 @@ def compare_runs(root: str | Path) -> dict[str, Any]:
     except (OSError, ValueError) as exc:
         differences.append({"type": "structure", "detail": f"independent model_info.json: {exc}"})
         model_info = {}
-    off, on = (_load_case(root / name, differences, model_info) for name in ("off", "on"))
+    try:
+        off_dir = resolve_off_directory(root)
+        off = _load_case(off_dir, differences, model_info, case_name="off")
+    except ValueError as exc:
+        differences.append({"type": "structure", "case": "off", "detail": str(exc)})
+        off = {"records": {}, "coverage": []}
+    on = _load_case(root / "on", differences, model_info, case_name="on")
     for field in ("engine_options", "environment"):
         left, right = off.get(field), on.get(field)
         if field == "environment" and isinstance(left, dict) and isinstance(right, dict):
+            try:
+                left, right = comparable_environment(left), comparable_environment(right)
+            except ValueError as exc:
+                differences.append({"type": "structure", "detail": str(exc)})
             left = {key: value for key, value in left.items() if key not in ALLOWED_ENV_DIFFERENCES}
             right = {key: value for key, value in right.items() if key not in ALLOWED_ENV_DIFFERENCES}
         if left != right or not isinstance(left, dict):

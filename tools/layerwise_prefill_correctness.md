@@ -16,7 +16,8 @@ result and are not expected to run their own lightning indexer.
 ## What runs
 
 The launcher runs the complete model twice in separate processes: OFF first,
-then ON. Both receive exactly the same saved prompt token IDs. The default
+then ON, unless `--off-dir` selects a saved baseline. Both receive exactly the
+same saved prompt token IDs. The default
 10,000-token target crosses multiple 4,096-token prefill chunks, including a
 partial final chunk. It uses TP8, DP1, FlashComm1, eager execution and MTP1, with
 the established profile memory settings. All configuration is in the Python
@@ -53,6 +54,37 @@ chunk's stored pages after request completion. The original OFF local path
 rejects asynchronous storage, so OFF uses
 synchronous store and ON exercises asynchronous store; the feature flag and
 store mode are the only environment differences between the cases.
+
+## Reuse a completed OFF run
+
+```bash
+set -o pipefail
+python tools/layerwise_prefill_correctness.py \
+    --off-dir ./kv-check-10k \
+    --run-dir ./kv-check-on-next 2>&1 | tee log.log
+```
+
+`--off-dir` accepts either the previous run directory or its `off/` subdirectory.
+Only ON is launched. The old ON may have failed or may be absent; only the OFF
+run must have completed with full coverage and all required tensor files.
+This requires a correctness archive, not a performance profile directory.
+
+The tool reuses the exact saved prompt token IDs without tokenizing again.
+Unspecified model, device list, CPU cache capacity and prompt target inherit
+the OFF settings; an 80k baseline therefore does not need `--prompt-tokens`
+again. Explicit overrides are checked for compatibility. `--prompt-file` cannot
+be combined with `--off-dir`, and a different prompt target requires a new OFF.
+
+Before model loading, it checks the checkpoint configuration, engine options,
+runtime environment, completed OFF result, rank/layer coverage and tensor file
+existence. The checkpoint at the model path should remain the same. Code commits
+may differ so that updated ON implementations can use the established baseline.
+
+The new run directory must be empty. It stores a small `off_reference.json`
+pointing to the absolute OFF path; the tensor files are neither copied nor
+modified. Keep the original OFF archive and its parent `model_info.json`
+available. New logs, ON statistics and reports are written to the new directory.
+`--compare-only ./kv-check-on-next` automatically follows the saved reference.
 
 ## Results
 

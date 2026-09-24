@@ -101,3 +101,141 @@ def test_decode_remapped_tail_is_rejected_before_model_loading(length):
 @pytest.mark.parametrize("length", [4099, 8192, 10000, 80000])
 def test_prefill_tail_with_or_without_tp_padding_is_supported(length):
     runner.validate_prompt_length(length)
+
+
+@pytest.fixture
+def saved_off(tmp_path, monkeypatch):
+    import layerwise_prefill_correctness_compare as comparator
+
+    previous = tmp_path / "previous"
+    off = previous / "off"
+    off.mkdir(parents=True)
+    (off / "tensors").mkdir()
+    (off / "tensors" / "baseline.pt").write_bytes(b"untouched baseline")
+    args = runner.parser().parse_args(["--model", "/models/baseline", "--devices", "4,5", "--prompt-tokens", "80000"])
+    ids = [7] * 79992
+    model_info = {"model": args.model, "num_hidden_layers": 2, "indexer_types": ["full", "shared"]}
+    data = {
+        "result": {"case": "off", "completed": True, "prompt_token_ids": ids, "prompt_length": len(ids)},
+        "engine_options": runner.correctness_options(args, len(ids)),
+        "environment": runner.recorded_environment(runner.correctness_environment(args, "off")),
+    }
+    assert data["environment"]["LMCACHE_MAX_LOCAL_CPU_SIZE"] == "24"
+    for name, value in data.items():
+        runner.write_json(off / f"{name}.json", value)
+    runner.write_json(previous / "model_info.json", model_info)
+    runner.write_json(previous / "prompt.json", {"length": len(ids), "token_ids": ids, "target_tokens": 80000})
+    # A failed old ON does not invalidate its successful OFF baseline.
+    runner.write_json(previous / "failure.json", {"error": "previous ON failed"})
+    (previous / "prompt.txt").write_text("saved prompt", encoding="utf-8")
+    calls = []
+
+    def validate(path, info):
+        assert path == off.resolve() and info == model_info
+        calls.append("validate")
+        return data
+
+    def identity(model, root):
+        assert calls == ["validate"]
+        assert model == args.model
+        calls.append("config")
+        runner.write_json(root / "model_info.json", model_info)
+        return model_info
+
+    monkeypatch.setattr(comparator, "validate_off_baseline", validate)
+    monkeypatch.setattr(runner, "record_model_identity", identity)
+    return SimpleNamespace(root=previous, off=off, data=data, ids=ids, calls=calls)
+
+
+@pytest.mark.parametrize("direct_case", [False, True])
+def test_reuse_inherits_long_prompt_and_launch_settings_without_copying_tensors(saved_off, tmp_path, direct_case):
+    root = tmp_path / "new"
+    root.mkdir()
+    source = saved_off.off if direct_case else saved_off.root
+    args = runner.parser().parse_args(["--off-dir", str(source)])
+    old_files = {path: path.read_bytes() for path in saved_off.root.rglob("*") if path.is_file()}
+    assert runner.prepare_reused_off(args, root) == len(saved_off.ids)
+    assert args.model == "/models/baseline" and args.devices == "4,5"
+    assert args.prompt_tokens == 80000 and args.cpu_cache_gb == 24
+    assert json.loads((root / "prompt.json").read_text())["token_ids"] == saved_off.ids
+    assert json.loads((root / "off_reference.json").read_text())["off_dir"] == str(saved_off.off.resolve())
+    assert not (root / "off").exists()
+    assert {path: path.read_bytes() for path in saved_off.root.rglob("*") if path.is_file()} == old_files
+
+
+@pytest.mark.parametrize(
+    "override,reason",
+    [
+        (["--model", "/models/different"], "engine_options differs: model"),
+        (["--devices", "0"], "engine_options differs: tensor_parallel_size"),
+        (["--cpu-cache-gb", "32"], "environment differs: LMCACHE_MAX_LOCAL_CPU_SIZE"),
+        (["--prompt-tokens", "10000"], "--prompt-tokens differs"),
+    ],
+)
+def test_reuse_rejects_incompatible_explicit_overrides_before_loading_config(saved_off, tmp_path, override, reason):
+    root = tmp_path / "new"
+    root.mkdir()
+    args = runner.parser().parse_args(["--off-dir", str(saved_off.root), *override])
+    with pytest.raises(ValueError, match=reason):
+        runner.prepare_reused_off(args, root)
+    assert saved_off.calls == ["validate"]
+    assert not (root / "off_reference.json").exists()
+
+
+def test_reuse_launches_only_on_with_saved_reference(saved_off, tmp_path, monkeypatch):
+    root = tmp_path / "new"
+    args = ["--off-dir", str(saved_off.root), "--run-dir", str(root), "--cpu-cache-gb", "24.0"]
+    monkeypatch.setattr(runner.sys, "platform", "linux")
+    monkeypatch.setattr(runner, "check_shm_capacity", lambda *_: None)
+    monkeypatch.setattr(runner, "prepare_prompt", lambda *_: pytest.fail("Reuse must not tokenize or rebuild a prompt"))
+    launches = []
+
+    def launch(command, env, log_path, case, **kwargs):
+        assert case == "on"
+        assert (root / "off_reference.json").is_file()
+        assert env["VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE"] == "true"
+        assert command[command.index("--model") + 1] == "/models/baseline"
+        assert command[command.index("--prompt-tokens") + 1] == "80000"
+        runner.write_json(root / case / "result.json", {"completed": True})
+        launches.append(case)
+        return SimpleNamespace(wait=lambda: 0)
+
+    monkeypatch.setattr(runner, "start_logged_process", launch)
+    monkeypatch.setattr(runner, "finish_child", lambda _: None)
+    monkeypatch.setattr(runner, "compare", lambda path: 0)
+    assert runner.main(args) == 0
+    assert launches == ["on"] and not (root / "off").exists()
+    metadata = json.loads((root / "run.json").read_text())
+    assert metadata["cases"] == ["on"] and metadata["devices"] == ["4", "5"]
+
+
+def test_reuse_fails_before_launch_when_baseline_is_incomplete(saved_off, tmp_path, monkeypatch):
+    import layerwise_prefill_correctness_compare as comparator
+
+    def invalid(*args):
+        raise ValueError("OFF tensor file missing")
+
+    monkeypatch.setattr(comparator, "validate_off_baseline", invalid)
+    monkeypatch.setattr(runner.sys, "platform", "linux")
+    monkeypatch.setattr(runner, "run_cases", lambda *_: pytest.fail("Invalid baseline must not launch a model"))
+    root = tmp_path / "new"
+    assert runner.main(["--off-dir", str(saved_off.root), "--run-dir", str(root)]) == 1
+    assert "OFF tensor file missing" in json.loads((root / "failure.json").read_text())["error"]
+    assert saved_off.calls == []
+
+
+def test_reuse_does_not_allow_a_different_prompt_file(tmp_path):
+    with pytest.raises(SystemExit):
+        runner.main(["--off-dir", str(tmp_path), "--prompt-file", "different.txt"])
+
+
+def test_reuse_rejects_changed_checkpoint_configuration(saved_off, tmp_path, monkeypatch):
+    root = tmp_path / "new"
+    root.mkdir()
+    args = runner.parser().parse_args(["--off-dir", str(saved_off.root)])
+    changed = json.loads((saved_off.root / "model_info.json").read_text())
+    changed["indexer_types"] = ["full", "full"]
+    monkeypatch.setattr(runner, "record_model_identity", lambda *args: changed)
+    with pytest.raises(ValueError, match="model configuration differs: indexer_types"):
+        runner.prepare_reused_off(args, root)
+    assert not (root / "off_reference.json").exists()

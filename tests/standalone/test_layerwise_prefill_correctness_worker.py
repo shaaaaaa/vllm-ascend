@@ -75,6 +75,32 @@ def test_archive_counts_nonfinite_without_rejecting_valid_negative_infinity(work
     assert archive.errors == []
 
 
+def test_on_worker_reads_external_off_during_inference_and_keeps_archive_unchanged(worker, tmp_path):
+    old = tmp_path / "old"
+    identity = dict(step=0, layer=0, kind="decoder", name="input", span=(0, 2))
+    off = worker.TensorArchive(old / "off", 1)
+    off.record(torch.tensor([1.0, 2.0]), **identity)
+    off.close()
+    (off.root / "result.json").write_text(json.dumps({"case": "off", "completed": True}))
+    (off.root / "environment.json").write_text(
+        json.dumps({"VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE": "false", "LMCACHE_STORE_ASYNC": "false"})
+    )
+    renamed = old / "renamed_baseline"
+    off.root.rename(renamed)
+    before = {str(path.relative_to(old)): path.read_bytes() for path in old.rglob("*") if path.is_file()}
+    current = tmp_path / "current"
+    current.mkdir()
+    (current / "off_reference.json").write_text(json.dumps({"schema": 1, "off_dir": str(renamed.resolve())}))
+    on = worker.TensorArchive(current / "on", 1)
+    on.record(torch.tensor([1.0, 2.5]), **identity)
+    record = next(iter(on.records.values()))
+    assert record["comparison"]["abs_diff"]["max"] == 0.5
+    assert record["path"] is None and not on.errors
+    on.close()
+    assert not (current / "off").exists()
+    assert before == {str(path.relative_to(old)): path.read_bytes() for path in old.rglob("*") if path.is_file()}
+
+
 def test_archive_rejects_duplicates_and_surfaces_disk_failure(worker, tmp_path, monkeypatch):
     archive = worker.TensorArchive(tmp_path / "off", 0)
     kwargs = dict(step=0, layer=0, kind="sfa", name="input", span=(0, 1))
