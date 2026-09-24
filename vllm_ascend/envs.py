@@ -38,6 +38,11 @@ def _strict_bool_env(name: str, default: bool = False) -> bool:
 # begin-env-vars-definition
 
 env_variables: dict[str, Callable[[], Any]] = {
+    # Raw tensors for real PD diagnostics. Empty (default) disables all hooks.
+    # Otherwise an absolute run directory, e.g. /repo/pd-tensor-dump/case-on.
+    # Non-secret setting; files contain request/model data. Requires eager,
+    # compilation mode 0 and synchronous scheduling; introduces host readback.
+    "VLLM_ASCEND_PD_TENSOR_DUMP_DIR": lambda: os.getenv("VLLM_ASCEND_PD_TENSOR_DUMP_DIR", "").strip(),
     # Shared PD serving performance diagnostics across vLLM and LMCache.
     # Non-sensitive; configure before worker startup. Default 0/off. Values:
     # 1 = host timing, detail = extra host detail, device = opt-in device timing.
