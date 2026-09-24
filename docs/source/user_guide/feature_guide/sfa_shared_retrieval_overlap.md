@@ -25,10 +25,19 @@ workers between settings; capture topology cannot change in a running worker.
 Keep `VLLM_ASCEND_DSA_RESIDENT_EXACT_KERNELS`, model, TP/DP, capture sizes, GC,
 performance logging and request workload identical between runs.
 
-These changes require **no additional native rebuild** over the matching
-`1611dc8f` serving extensions. The resident-kernel integration in that base still
-requires its own previously documented vLLM-Ascend build. No LMCache YAML changes
-or new LMCache-Ascend native symbols are introduced here.
+The original overlap scheduling change was Python-only. The later selective
+AIV policy requires updating both vLLM-Ascend and LMCache-Ascend on
+`feat/shared-layer-retrieval-overlap`, then rebuilding **LMCache-Ascend** and
+restarting workers. It adds an optional native `max_aiv_cores` argument; the
+vLLM-Ascend native extension does not change for this policy.
+
+Serial/critical-path retrieval uses the automatic hardware/payload-bounded grid.
+Only side-stream prefetch requests `max_aiv_cores=12`. This is a per-launch
+argument, not mutable transfer state, so graph keys sharing a transfer object
+cannot accidentally cap a serial fallback. The graph captures the chosen grid;
+there is no device readback or replay-time Python core selection. This replaces
+the earlier blanket 12-AIV cap, which increased measured serial retrieval
+latency from about 80 to 140 microseconds in the reported workload.
 
 ## Schedule and integration
 

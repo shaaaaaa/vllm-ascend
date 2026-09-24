@@ -34,6 +34,7 @@ class RetrievalEdge:
     stream: Any
     transfer: Any
     destinations: tuple
+    max_aiv_cores: int = 0
 
     def __post_init__(self) -> None:
         self.payload = None
@@ -75,7 +76,10 @@ class RetrievalEdge:
         self.start.record(torch.npu.current_stream())
         with torch.npu.stream(self.stream):
             self.stream.wait_event(self.start)
-            self.transfer.load(selected, counts, slots)
+            if self.max_aiv_cores:
+                self.transfer.load(selected, counts, slots, max_aiv_cores=self.max_aiv_cores)
+            else:
+                self.transfer.load(selected, counts, slots)
             self.done.record(self.stream)
         self.pending_capture_launch = True
 
@@ -192,7 +196,7 @@ class SharedRetrievalOverlap:
                         self.probe = CaptureProbe(self.stream, device)
                         self.probe.verify()
                         self.probe = None
-                    edge = RetrievalEdge(self.stream, transfer, destinations)
+                    edge = RetrievalEdge(self.stream, transfer, destinations, max_aiv_cores=12)
                     incoming[following] = outgoing[current] = edge
             except BaseException:
                 self.failed = True

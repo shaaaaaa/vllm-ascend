@@ -66,7 +66,7 @@ class Workload:
                 transfer = SparseGraphTransfer(cache, self.slots, chunk, history, request_capacity=requests)
                 transfer.bind_batch(self.sources, layer)
                 self.transfers.append(transfer)
-            self.edges = [RetrievalEdge(self.stream, self.transfers[i], self.caches[i]) for i in range(1, layers)]
+            self.edges = [RetrievalEdge(self.stream, self.transfers[i], self.caches[i], max_aiv_cores=12) for i in range(1, layers)]
             self.x = torch.ones((requests * query_rows, 16, 512), dtype=torch.bfloat16, device=self.device)
             self.weight = torch.ones((16, 512, 128), dtype=torch.bfloat16, device=self.device)
             self.products = [torch.empty((requests * query_rows, 16, 128), dtype=torch.bfloat16, device=self.device)

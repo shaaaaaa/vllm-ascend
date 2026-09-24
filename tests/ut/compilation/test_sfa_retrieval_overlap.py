@@ -375,7 +375,8 @@ def test_each_layer_copies_once_with_layer_specific_values(runtime, active):
     selected, counts, slots = torch.arange(8), torch.tensor([active]), torch.arange(8)
     copies = []
     for layer, name in enumerate(groups[0].members):
-        def load(indices, lengths, destinations, *, layer=layer, name=name):
+        def load(indices, lengths, destinations, *, layer=layer, name=name, max_aiv_cores=0):
+            assert max_aiv_cores == (0 if layer == 0 else 12)
             copies.append(name)
             for p, tensor in enumerate(caches[name]):
                 tensor.view(-1, tensor.shape[-1])[:active].fill_(layer + p + 1)
