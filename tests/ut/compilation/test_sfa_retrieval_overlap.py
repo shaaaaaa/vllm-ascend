@@ -2,6 +2,7 @@
 """CPU ordering/layout contracts; native capture has separate NPU coverage."""
 import ast
 import gc
+import symtable
 import weakref
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
@@ -17,6 +18,17 @@ from test_sfa_full_graph import graph_module as graph_fixture
 
 ROOT = Path(__file__).resolve().parents[3]
 SOURCE = ROOT / "vllm_ascend/attention/sfa_v1.py"
+
+
+def test_runner_constructor_reads_module_environment_without_local_shadowing():
+    source = ROOT / "vllm_ascend/worker/model_runner_v1.py"
+    table = symtable.symtable(source.read_text(encoding="utf-8"), str(source), "exec")
+    runner = next(t for t in table.get_children() if t.get_name() == "NPUModelRunner")
+    constructor = next(t for t in runner.get_children() if t.get_name() == "__init__")
+    environment = constructor.lookup("envs_ascend")
+    # Inspect the ENTIRE function: a later import makes even earlier reads local.
+    assert environment.is_global() and not environment.is_local()
+    assert table.lookup("envs_ascend").is_imported()
 
 
 @pytest.fixture
