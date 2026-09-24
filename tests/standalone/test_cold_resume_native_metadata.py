@@ -451,7 +451,9 @@ def test_ordinary_native_decode_still_skips_connector_inspection(native_api):
 
 def test_native_markers_follow_completed_load_handoff(native_api):
     root = Path(__file__).resolve().parents[3]
-    source = root / "LMCache-NPU/lmcache/integration/vllm/vllm_v1_adapter.py"
+    adapter_path = Path("lmcache/integration/vllm/vllm_v1_adapter.py")
+    candidates = [root / name / adapter_path for name in ("LMCache", "LMCache-NPU")]
+    source = next((path for path in candidates if path.is_file()), candidates[0])
     tree = ast.parse(source.read_text(encoding="utf-8"))
     method = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "_take_completed_cold_load")
     future = ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0)

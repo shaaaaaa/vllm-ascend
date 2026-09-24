@@ -685,13 +685,13 @@ def _validate_dsa_scratch_capacity(
         {int(value) for value in request_rows if int(value) >= 0}
     ):
         rows = np.flatnonzero(request_rows == request_index)
-        if rows.size * width > capacity:
+        request_boundaries = boundaries[rows]
+        if np.count_nonzero(request_boundaries) * width > capacity:
             raise RuntimeError(
                 "DSA request-union scratch reservation is too small: "
                 f"request={request_index}, rows={rows.size}, "
                 f"index_topk={width}, scratch_capacity={capacity}."
             )
-        request_boundaries = boundaries[rows]
         if np.any(
             (request_boundaries != 0)
             & (request_boundaries < capacity)
@@ -1954,15 +1954,16 @@ class AscendSFAImpl(MLAAttentionImpl):
             self.is_kv_producer and envs.VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE
         )
         self.layer_name = kwargs.get("layer_name")
-        layer_start, layer_end = self.vllm_config.model_config.get_layers_start_end_indices(
-            self.vllm_config.parallel_config
-        )
-        self._first_layerwise_prefill_layer_index = layer_start
-        self._last_layerwise_prefill_layer_index = layer_end - 1
-        self._last_layerwise_prefill_layer = (
-            self.layer_name is not None
-            and f".layers.{self._last_layerwise_prefill_layer_index}." in f".{self.layer_name}"
-        )
+        if self._layerwise_prefill_p_node:
+            layer_start, layer_end = self.vllm_config.model_config.get_layers_start_end_indices(
+                self.vllm_config.parallel_config
+            )
+            self._first_layerwise_prefill_layer_index = layer_start
+            self._last_layerwise_prefill_layer_index = layer_end - 1
+            self._last_layerwise_prefill_layer = (
+                self.layer_name is not None
+                and f".layers.{self._last_layerwise_prefill_layer_index}." in f".{self.layer_name}"
+            )
 
         # Shared-indexer (GLM-5.2): a layer without a local Indexer must be a
         # skip_topk consumer that reads producer-written top-k indices from the
@@ -4888,8 +4889,8 @@ class AscendSFAImpl(MLAAttentionImpl):
 
         # run mlapo ops when dsa-cp is disabled, and ensure that num_tokens satisfies the count limitation
         if self.enable_mlapo and num_input_tokens <= MLAPO_MAX_SUPPORTED_TOKENS:
-            hidden_states, ql_nope, q_pe, q_c = (
-                self._sfa_preprocess_with_mlapo_after_layerwise_wait(
+            if self._layerwise_prefill_p_node:
+                hidden_states, ql_nope, q_pe, q_c = self._sfa_preprocess_with_mlapo_after_layerwise_wait(
                     layer_name=layer_name,
                     attn_metadata=attn_metadata,
                     hidden_states=hidden_states,
@@ -4899,7 +4900,15 @@ class AscendSFAImpl(MLAAttentionImpl):
                     slot_mapping=slot_mapping,
                     num_input_tokens=num_input_tokens,
                 )
-            )
+            else:
+                hidden_states, ql_nope, q_pe, q_c = self._sfa_preprocess_with_mlapo(
+                    hidden_states=hidden_states,
+                    kv_cache=kv_cache,
+                    cos=cos,
+                    sin=sin,
+                    slot_mapping=slot_mapping,
+                    num_input_tokens=num_input_tokens,
+                )
             if self.has_indexer:
                 k_li, k_li_scale = self.indexer_select_pre_process(x=hidden_states, cos=cos, sin=sin)
             else:
@@ -5995,15 +6004,8 @@ class AscendSFAImpl(MLAAttentionImpl):
         # window saving is enabled. P-node banks must still save and advance
         # their load cursor: a one-token prefill tail (and its MTP forward)
         # can also carry DecodeOnly/SpecDecoding attention metadata.
-        _decode_window_save_enabled = _decode_window_save_window_size() > 0
-        _skip_decode_save = (
-            bool(self.dsa_shrink_latent)
-            and not self._layerwise_prefill_p_node
-            and _is_pure_decode
-            and not _decode_window_save_enabled
-        )
         save_operations: list[tuple[str, list[torch.Tensor]]] = []
-        if not _skip_decode_save:
+        if self._layerwise_prefill_p_node:
             if self.dsa_offload_unbundle and len(kv_cache) >= 2:
                 save_operations.append((layer_name, [kv_cache[0], kv_cache[1]]))
                 if (
@@ -6015,9 +6017,11 @@ class AscendSFAImpl(MLAAttentionImpl):
             else:
                 save_operations.append((layer_name, list(kv_cache)))
 
-        use_layerwise_transfer_window = bool(
-            save_operations
-        ) and layerwise_prefill_transfer_window_supported()
+        use_layerwise_transfer_window = (
+            self._layerwise_prefill_p_node
+            and bool(save_operations)
+            and layerwise_prefill_transfer_window_supported()
+        )
         is_last_transfer_layer = use_layerwise_transfer_window and (
             self._last_layerwise_prefill_layer
             if self.layer_name is not None
@@ -6098,6 +6102,16 @@ class AscendSFAImpl(MLAAttentionImpl):
                 self._finish_sfa_layerwise_transfer_window(
                     pending_transfers, pending_transfer_names
                 )
+            if not self._layerwise_prefill_p_node:
+                _decode_window_save_enabled = _decode_window_save_window_size() > 0
+                _skip_decode_save = bool(self.dsa_shrink_latent) and _is_pure_decode and not _decode_window_save_enabled
+                if not _skip_decode_save:
+                    if self.dsa_offload_unbundle and len(kv_cache) >= 2:
+                        save_operations.append((layer_name, [kv_cache[0], kv_cache[1]]))
+                        if len(kv_cache) >= 3 and index_layer_name is not None and index_lmcache_enabled:
+                            save_operations.append((index_layer_name, [kv_cache[2]]))
+                    else:
+                        save_operations.append((layer_name, list(kv_cache)))
             self._submit_sfa_save_operations(save_operations)
 
         _dsa_prof.end(_sfa_t)

@@ -51,7 +51,7 @@ def api():
     entry_start = next(i for i, n in enumerate(forward.body) if assigns(n, "transfer_context"))
     entry_end = next(i for i, n in enumerate(forward.body) if assigns(n, "pending_transfer_names"))
     pure_decode = next(n for n in forward.body if assigns(n, "_is_pure_decode"))
-    save_start = next(i for i, n in enumerate(forward.body) if assigns(n, "_decode_window_save_enabled"))
+    save_start = next(i for i, n in enumerate(forward.body) if assigns(n, "save_operations"))
     final_flush = next(
         i
         for i, n in enumerate(forward.body)
@@ -239,6 +239,23 @@ def test_d_without_shrink_still_saves(api):
     state = classify(api, computed=4096, scheduled=1)
     obj = impl(api, p_node=False, shrink=0)
     names = step(api, obj, state, decode_rows=1)
+    assert api.events == [("legacy_save", name) for name in names]
+
+
+def test_d_does_not_consult_p_transfer_capability_or_move_save_policy_before_projection(api):
+    obj = impl(api, p_node=False, window=2048)
+    del obj._first_layerwise_prefill_layer_index
+    del obj._last_layerwise_prefill_layer_index
+    order = []
+    obj.o_proj = lambda value: (order.append("projection") or value,)
+    api.namespace["_decode_window_save_window_size"] = lambda: order.append("save_policy") or 2048
+
+    def unexpected():
+        raise AssertionError("D must not consult the P transfer-window capability")
+
+    api.namespace["layerwise_prefill_transfer_window_supported"] = unexpected
+    names = step(api, obj, api.states.SpecDecoding, decode_rows=1)
+    assert order == ["projection", "save_policy"]
     assert api.events == [("legacy_save", name) for name in names]
 
 

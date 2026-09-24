@@ -274,7 +274,6 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
             # converted to its unpadded view.
             indexer_block_table_tensor=self.indexer_block_table_tensor,
             indexer_slot_mapping=self.indexer_slot_mapping,
-            prompt_lens_cpu=(self.prompt_lens_cpu[:num_actual_reqs] if self.prompt_lens_cpu is not None else None),
             causal=self.causal,
             actual_seq_lengths_q=self.actual_seq_lengths_q[:num_actual_tokens],
             positions=self.positions,
@@ -283,6 +282,11 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
             num_input_tokens=self.num_input_tokens,
             prefill_context_parallel_metadata=self.prefill_context_parallel_metadata,
             max_seq_len=self.max_seq_len,
+            prompt_lens_cpu=(
+                self.prompt_lens_cpu[:num_actual_reqs]
+                if self.prompt_lens_cpu is not None
+                else None
+            ),
             request_ids=(self.request_ids[:num_actual_reqs] if self.request_ids is not None else None),
             cold_compact_resumes=self.cold_compact_resumes[
                 :num_actual_reqs
@@ -856,11 +860,42 @@ def maybe_save_kv_layer_to_connector(
     layer_name: str,
     kv_cache_layer: list[torch.Tensor],
 ):
-    _maybe_save_kv_layer_to_connector_with_method(
-        layer_name,
-        kv_cache_layer,
-        "save_kv_layer",
-    )
+    if not has_kv_transfer_group() or not is_v1_kv_transfer_group():
+        return
+
+    connector = get_kv_transfer_group()
+
+    forward_context: ForwardContext = get_forward_context()
+    attn_metadata = forward_context.attn_metadata
+    if attn_metadata is None:
+        return
+    # TODO: assert ascendMetadata
+    should_log = _dsa_lmcache_log_layer(layer_name)
+    if should_log:
+        logger.info(
+            "[DSA_INDEX_LMCACHE] connector_save_enter layer=%s connector=%s kv_cache_layer=%s attn_metadata=%s",
+            layer_name,
+            type(connector).__name__,
+            _tensor_like_debug(kv_cache_layer),
+            type(attn_metadata).__name__,
+        )
+    try:
+        connector.save_kv_layer(layer_name, kv_cache_layer, attn_metadata)
+    except Exception:
+        logger.exception(
+            "[DSA_INDEX_LMCACHE] connector_save_error layer=%s connector=%s kv_cache_layer=%s attn_metadata=%s",
+            layer_name,
+            type(connector).__name__,
+            _tensor_like_debug(kv_cache_layer),
+            type(attn_metadata).__name__,
+        )
+        raise
+    if should_log:
+        logger.info(
+            "[DSA_INDEX_LMCACHE] connector_save_done layer=%s connector=%s",
+            layer_name,
+            type(connector).__name__,
+        )
 
 
 def maybe_save_kv_layer_in_layerwise_prefill_transfer_window(

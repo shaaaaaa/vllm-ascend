@@ -1405,9 +1405,12 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
 
         # OPTIMIZATION: Start copying the block table first.
         # This way, we can overlap the copy with the following CPU operations.
-        block_tables_by_bank = self._refresh_layerwise_prefill_block_tables()
-        for block_table in block_tables_by_bank:
-            block_table.commit_block_table(num_reqs)
+        if self.layerwise_prefill_p_node:
+            block_tables_by_bank = self._refresh_layerwise_prefill_block_tables()
+            for block_table in block_tables_by_bank:
+                block_table.commit_block_table(num_reqs)
+        else:
+            self.input_batch.block_table.commit_block_table(num_reqs)
 
         # Get the attention state.
         if not scheduler_output.scheduled_spec_decode_tokens:
@@ -1475,9 +1478,13 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
             cu_num_tokens, arange = self._get_cumsum_and_arange(num_scheduled_tokens)
             np.add(self.input_batch.num_computed_tokens_cpu[req_indices], arange, out=positions_np)
 
-        for block_table in block_tables_by_bank:
-            block_table.compute_slot_mapping(req_indices, positions_np)
-            block_table.commit_slot_mapping(total_num_scheduled_tokens)
+        if self.layerwise_prefill_p_node:
+            for block_table in block_tables_by_bank:
+                block_table.compute_slot_mapping(req_indices, positions_np)
+                block_table.commit_slot_mapping(total_num_scheduled_tokens)
+        else:
+            self.input_batch.block_table.compute_slot_mapping(req_indices, positions_np)
+            self.input_batch.block_table.commit_slot_mapping(total_num_scheduled_tokens)
 
         if self.use_cp:
             self.pcp_manager.init_batch_info(
@@ -1707,7 +1714,8 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
             max_num_reqs_across_dp = self.max_num_reqs * self.uniform_decode_query_len
             logits_indices = nn.functional.pad(logits_indices, (0, max_num_reqs_across_dp - logits_indices.shape[0]))
 
-        self._prepare_layerwise_prefill_bank_phase_masks(req_indices, num_reqs)
+        if self.layerwise_prefill_p_node:
+            self._prepare_layerwise_prefill_bank_phase_masks(req_indices, num_reqs)
 
         return (
             logits_indices,
@@ -2133,7 +2141,8 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
             with self.synchronize_input_prep():
                 # Update persistent batch states.
                 self._update_states(scheduler_output)
-                self._capture_layerwise_prefill_bank_offsets(scheduler_output)
+                if self.layerwise_prefill_p_node:
+                    self._capture_layerwise_prefill_bank_offsets(scheduler_output)
 
                 if has_ec_transfer() and get_ec_transfer().is_producer:
                     with self.maybe_get_ec_connector_output(
@@ -3948,19 +3957,20 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
             kv_cache_gid: int,
             bank: int = 0,
         ):
-            phase_value = (
-                int(phase_by_request_cpu[0])
-                if phase_by_request_cpu is not None
-                and len(phase_by_request_cpu)
-                and not mixed_bank_phase
-                else 0
-            )
-            physical_bank = bank ^ phase_value
-            cache_key = (kv_cache_gid, bank, phase_value, mixed_bank_phase)
-            if prefill_bank_views is not None:
-                cached_views = prefill_bank_views.get(cache_key)
-                if cached_views is not None:
-                    return cached_views
+            if self.layerwise_prefill_p_node:
+                phase_value = (
+                    int(phase_by_request_cpu[0])
+                    if phase_by_request_cpu is not None
+                    and len(phase_by_request_cpu)
+                    and not mixed_bank_phase
+                    else 0
+                )
+                physical_bank = bank ^ phase_value
+                cache_key = (kv_cache_gid, bank, phase_value, mixed_bank_phase)
+                if prefill_bank_views is not None:
+                    cached_views = prefill_bank_views.get(cache_key)
+                    if cached_views is not None:
+                        return cached_views
             assert num_reqs_padded is not None and num_tokens_padded is not None
             kv_cache_spec = kv_cache_groups[kv_cache_gid].kv_cache_spec
             if self.pcp_size > 1:
@@ -3985,16 +3995,19 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                     device=self.device,
                 )
             else:
-                block_tables_by_bank = getattr(
-                    self.input_batch,
-                    "layerwise_prefill_block_tables",
-                    (self.input_batch.block_table,),
-                )
-                if bank < 0 or bank >= len(block_tables_by_bank):
-                    raise RuntimeError(
-                        f"invalid layerwise-prefill bank {bank}"
+                if self.layerwise_prefill_p_node:
+                    block_tables_by_bank = getattr(
+                        self.input_batch,
+                        "layerwise_prefill_block_tables",
+                        (self.input_batch.block_table,),
                     )
-                blk_table = block_tables_by_bank[physical_bank][kv_cache_gid]
+                    if bank < 0 or bank >= len(block_tables_by_bank):
+                        raise RuntimeError(
+                            f"invalid layerwise-prefill bank {bank}"
+                        )
+                    blk_table = block_tables_by_bank[physical_bank][kv_cache_gid]
+                else:
+                    blk_table = self.input_batch.block_table[kv_cache_gid]
                 slot_mapping = blk_table.slot_mapping.gpu[:maybe_pcp_full_tokens]
                 maybe_num_reqs_padded = num_reqs_padded * self.decode_token_per_req if self.use_cp else num_reqs_padded
                 blk_table_tensor = blk_table.get_device_tensor()[:maybe_num_reqs_padded]
@@ -4476,7 +4489,10 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
         possible_cold_resume = False
         if (
             not (is_decode_state and graph_configured)
-            and self.dsa_shrink_latent
+            and (
+                not getattr(self, "layerwise_prefill_p_node", False)
+                or self.dsa_shrink_latent
+            )
             and num_computed_tokens is not None
             and prompt_lens is not None
         ):
@@ -5614,11 +5630,14 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
         connector = get_kv_transfer_group()
         uses_layerwise_callbacks = bool(
             getattr(connector, "uses_layerwise_model_callbacks", False)
-        ) or bool(
-            getattr(
-                connector,
-                "supports_layerwise_prefill_transfer_window",
-                False,
+        ) or (
+            layerwise_prefill_p_node
+            and bool(
+                getattr(
+                    connector,
+                    "supports_layerwise_prefill_transfer_window",
+                    False,
+                )
             )
         )
         if not uses_layerwise_callbacks:
@@ -6116,6 +6135,18 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                     elt = get_dtype_size(spec.dtype)
                     kv_lora_rank, qk_rope_head_dim, index_head_dim = self.sparse_head_dim
                     if self.dsa_shared_pool and len(raws) == 1:
+                        if not self.layerwise_prefill_p_node:
+                            kv_caches[layer_name] = reshape_dsa_shared_pool_raw(
+                                raws[0],
+                                spec.dtype,
+                                bs,
+                                nh,
+                                kv_lora_rank,
+                                qk_rope_head_dim,
+                                index_head_dim,
+                                is_indexer="indexer" in layer_name,
+                            )
+                            continue
                         raw = raws[0]
                         raw_key = id(raw)
                         views = dsa_shared_views.get(raw_key)
