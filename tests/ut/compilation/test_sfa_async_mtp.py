@@ -777,13 +777,15 @@ def test_runner_selection_happens_only_at_worker_startup(monkeypatch, enabled):
             initialize(worker)
 
 
-def test_actual_npu_metadata_kernel_matches_cpu_slots_and_padding(monkeypatch):
+@pytest.mark.parametrize("mixed", [False, True])
+def test_actual_npu_metadata_kernel_matches_cpu_slots_and_padding(monkeypatch, mixed):
     pytest.importorskip("torch_npu")
     pytest.importorskip("triton")
     if not torch.npu.is_available():
         pytest.skip("Requires NPU")
     module = load_module(KERNEL, "async_mtp_metadata_npu", monkeypatch)
     held = []
+    index_block = 128 if mixed else 64
     for n, capacity in ((1, 8), (3, 8), (4, 8), (16, 32)):
         common_capacity = capacity // 2
         bases = torch.arange(n, dtype=torch.int32) * 127 + 4095
@@ -796,7 +798,7 @@ def test_actual_npu_metadata_kernel_matches_cpu_slots_and_padding(monkeypatch):
             for shift in (100, 900)
         ]
         device_tables = [t.to("npu") for t in tables]
-        slots = [torch.full((capacity,), -77, dtype=torch.int32, device="npu") for _ in range(2)]
+        slots = [torch.full((capacity,), -77, dtype=torch.int32, device="npu") for _ in range(3 if mixed else 2)]
         for step in range(4):
             counts = (torch.arange(n) + step) % 2 + 1
             module.prepare_async_mtp_kernel[((common_capacity + 32) // 32,)](
@@ -806,7 +808,7 @@ def test_actual_npu_metadata_kernel_matches_cpu_slots_and_padding(monkeypatch):
                 seq_common,
                 seq_target,
                 *device_tables,
-                *slots,
+                *slots[:2],
                 n,
                 capacity,
                 common_capacity,
@@ -814,18 +816,22 @@ def test_actual_npu_metadata_kernel_matches_cpu_slots_and_padding(monkeypatch):
                 128,
                 128,
                 128,
-                64,
+                index_block,
                 BLOCK=32,
+                **({"slots_c8": slots[2], "MIXED_C8": True} if mixed else {}),
             )
             bases += counts.int()
             expected_pos = torch.cat(
                 ((bases[:, None].long() + torch.arange(2)).flatten(), torch.zeros(capacity - 2 * n, dtype=torch.int64))
             )
             expected_slots = []
-            for table, block in zip(tables, (128, 64)):
+            for table, block in zip(tables, (128, index_block)):
                 p = expected_pos[: 2 * n]
                 slot = table[torch.arange(n).repeat_interleave(2), p // block] * block + p % block
                 expected_slots.append(torch.cat((slot.int(), torch.full((capacity - 2 * n,), -1, dtype=torch.int32))))
+            if mixed:
+                logical = expected_slots[1]
+                expected_slots.append(logical + torch.div(logical, 128, rounding_mode="trunc") * 128)
             held.append(
                 (
                     positions.clone(),
@@ -886,32 +892,33 @@ def test_nonzero_window_retains_acceptance_boundary_checks(setup, window, crossi
     assert len(calls) in (1, 2)
 
 
-@pytest.mark.parametrize("accepted", [1,2])
-@pytest.mark.parametrize("base", [5118,5119,5120])
-def test_mixed_c8_slots_advance_in_existing_async_kernel(setup,accepted,base):
-    r,s,shape,events,_=setup
+@pytest.mark.parametrize("accepted", [1, 2])
+@pytest.mark.parametrize("base", [5118, 5119, 5120])
+def test_mixed_c8_slots_advance_in_existing_async_kernel(setup, accepted, base):
+    r, s, shape, events, _ = setup
     for group in r.input_batch.block_table.block_tables:
-        group.block_size=128
-        group.kernel_sizes=[128]
+        group.block_size = 128
+        group.kernel_sizes = [128]
     r._async_bases.fill_(base)
     r._async_counts.fill_(accepted)
-    r._async_snapshot.bases[:]=base
-    r.input_batch.num_computed_tokens_cpu[:]=base
-    s.scheduled_cached_reqs.num_computed_tokens=[base+2]*3
-    for req in r.requests.values(): req.num_computed_tokens=base
-    item=r.item
-    item.indexer_c8_block_table=item.indexer_block_table*2
-    item.indexer_c8_slot_mapping=torch.full_like(item.indexer_slot_mapping,-99)
-    pointers=(item.indexer_c8_block_table.data_ptr(),item.indexer_c8_slot_mapping.data_ptr())
-    table_before=item.indexer_c8_block_table.clone()
+    r._async_snapshot.bases[:] = base
+    r.input_batch.num_computed_tokens_cpu[:] = base
+    s.scheduled_cached_reqs.num_computed_tokens = [base + 2] * 3
+    for req in r.requests.values():
+        req.num_computed_tokens = base
+    item = r.item
+    item.indexer_c8_block_table = item.indexer_block_table * 2
+    item.indexer_c8_slot_mapping = torch.full_like(item.indexer_slot_mapping, -99)
+    pointers = (item.indexer_c8_block_table.data_ptr(), item.indexer_c8_slot_mapping.data_ptr())
+    table_before = item.indexer_c8_block_table.clone()
     r._update_states(s)
     assert r._async_pending is s
-    metadata,_=r._build_attention_metadata(**shape)
-    result=metadata["l0"]
-    logical=result.indexer_slot_mapping
-    expected=logical+torch.div(logical,128,rounding_mode="trunc")*128
-    assert torch.equal(result.indexer_c8_slot_mapping,expected)
+    metadata, _ = r._build_attention_metadata(**shape)
+    result = metadata["l0"]
+    logical = result.indexer_slot_mapping
+    expected = logical + torch.div(logical, 128, rounding_mode="trunc") * 128
+    assert torch.equal(result.indexer_c8_slot_mapping, expected)
     assert result.indexer_c8_slot_mapping[6:].eq(-1).all()
-    assert pointers==(result.indexer_c8_block_table.data_ptr(),result.indexer_c8_slot_mapping.data_ptr())
-    assert torch.equal(result.indexer_c8_block_table,table_before)
-    assert events.count("kernel")==1 and "sync" not in events
+    assert pointers == (result.indexer_c8_block_table.data_ptr(), result.indexer_c8_slot_mapping.data_ptr())
+    assert torch.equal(result.indexer_c8_block_table, table_before)
+    assert events.count("kernel") == 1 and "sync" not in events

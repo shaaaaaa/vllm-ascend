@@ -364,3 +364,31 @@ def test_full_graph_static_checks_only_run_at_startup(dummy):
         impl._full_graph_transfers.clear()
         with pytest.raises(RuntimeError, match="not allocated at startup"):
             prepare(impl, "L0", 65536, bind_source=False)
+
+
+@pytest.mark.parametrize("bad", [None, "slots", "table", "missing_slots", "missing_table"])
+def test_mixed_metadata_memo_validates_both_precisions(checks, bad):
+    make_impl, make_metadata, check, _ = checks
+    bf16, c8 = make_impl(), make_impl()
+    c8.use_sparse_c8_indexer = True
+    metadata = make_metadata()
+    metadata.indexer_c8_slot_mapping = torch.zeros(2)
+    metadata.indexer_c8_block_table = torch.zeros(2, 4)
+    if bad == "slots":
+        metadata.indexer_c8_slot_mapping = torch.zeros(1)
+    elif bad == "table":
+        metadata.indexer_c8_block_table = torch.zeros(1, 4)
+    elif bad == "missing_slots":
+        metadata.indexer_c8_slot_mapping = None
+    elif bad == "missing_table":
+        metadata.indexer_c8_block_table = None
+    caches = tuple(
+        torch.zeros(5, 4, 1, dim, dtype=dtype)
+        for dim, dtype in ((4, torch.float16), (2, torch.float16), (3, torch.int8), (1, torch.float16))
+    )
+    memo = {}
+    first = check(bf16, metadata, memo)
+    assert (first is None) == (bad is None)
+    assert check(c8, metadata, memo, caches) == first
+    bf16._cross_layer_metadata_ineligible_reason.assert_called_once()
+    c8._cross_layer_metadata_ineligible_reason.assert_not_called()

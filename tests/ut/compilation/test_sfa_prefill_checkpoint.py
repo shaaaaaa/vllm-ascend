@@ -265,8 +265,16 @@ def test_mtp_initial_state_import_is_separate_from_real_decode_draft(worker, gra
     assert subject.parity_draft_prefill_imports == int(graph)
 
 
-@pytest.mark.parametrize("has_indexer", [False, True])
-def test_actual_sfa_cache_binding_preserves_groups_and_excludes_capture_dummy_state(worker, monkeypatch, has_indexer):
+@pytest.mark.parametrize(
+    "has_indexer,c8,mixed", [(False, False, False), (True, False, False), (True, True, False), (True, True, True)]
+)
+def test_actual_sfa_cache_binding_preserves_groups_and_excludes_capture_dummy_state(
+    worker,  # noqa: F811 - imported pytest fixture
+    monkeypatch,
+    has_indexer,
+    c8,
+    mixed,
+):
     # Execute the real SFA cache registry method, not a fake successful binding.
     path = Path(__file__).resolve().parents[3] / "vllm_ascend/attention/sfa_v1.py"
     tree = ast.parse(path.read_text(encoding="utf-8"))
@@ -287,6 +295,7 @@ def test_actual_sfa_cache_binding_preserves_groups_and_excludes_capture_dummy_st
     index_name = "model.layers.0.self_attn.indexer.k_cache"
     impl = worker.AscendSFAImpl()
     impl.has_indexer = has_indexer
+    impl.use_sparse_c8_indexer = c8
     impl.dsa_offload_unbundle = True
     impl._sorted_resident_state = SimpleNamespace(
         dummy_state_base=1,
@@ -296,12 +305,14 @@ def test_actual_sfa_cache_binding_preserves_groups_and_excludes_capture_dummy_st
         generations=torch.full((2, 2), -1, dtype=torch.int64),
     )
     latent = (torch.ones(5, 2, 1, 4), torch.ones(5, 2, 1, 2))
-    index = torch.ones(7, 2, 1, 3)
+    index = torch.ones(14 if mixed else 7, 2, 1, 3, dtype=torch.int8 if c8 else torch.float32)
+    scales = torch.ones(index.shape[:3] + (1,), dtype=torch.float16)
     context.no_compile_layers[name] = SimpleNamespace(impl=impl, kv_cache=[latent])
-    context.no_compile_layers[index_name] = SimpleNamespace(kv_cache=[index])
+    context.no_compile_layers[index_name] = SimpleNamespace(kv_cache=[(index, scales) if c8 else index])
     context.attn_metadata[name] = SimpleNamespace(
         block_table=torch.tensor([[1, 2]], dtype=torch.int32),
         indexer_block_table=torch.tensor([[3, 4]], dtype=torch.int32),
+        indexer_c8_block_table=torch.tensor([[6, 8]], dtype=torch.int32) if mixed else None,
         num_actual_tokens=3,
         num_decode_tokens=0,
         seq_lens=torch.tensor([3]),
@@ -312,7 +323,10 @@ def test_actual_sfa_cache_binding_preserves_groups_and_excludes_capture_dummy_st
     assert groups[name].block_table.tolist() == [[1, 2]]
     if has_indexer:
         assert groups[index_name].caches[0] is index
-        assert groups[index_name].block_table.tolist() == [[3, 4]]
+        assert groups[index_name].block_table.tolist() == ([[6, 8]] if mixed else [[3, 4]])
+        assert len(groups[index_name].caches) == (2 if c8 else 1)
+        if c8:
+            assert groups[index_name].caches[1] is scales
     else:
         assert index_name not in groups
     for field in ("tokens", "slots", "counts", "generations"):
@@ -361,3 +375,27 @@ def test_final_gate_requires_zero_graph_prefill_compute_and_real_decode(worker, 
     subject.parity_decode_steps = 0
     with pytest.raises(worker.ParityError, match="phase coverage"):
         subject._local_summary()
+
+
+@pytest.mark.parametrize("mixed", [False, True])
+def test_c8_prefill_checkpoint_roundtrip_preserves_key_and_scale_bits(checkpoint, mixed):  # noqa: F811
+    factor = 2 if mixed else 1
+
+    def make(ids):
+        return {
+            "indexer": checkpoint.CacheBinding(
+                (torch.zeros(16, 2, 1, 128, dtype=torch.int8), torch.zeros(16, 2, 1, 1, dtype=torch.float16)),
+                torch.tensor([ids], dtype=torch.int32) * factor,
+            )
+        }
+
+    source, destination = make([1, 2]), make([3, 4])
+    key, scale = source["indexer"].caches
+    key.copy_(torch.arange(key.numel()).to(torch.int8).reshape(key.shape))
+    scale.view(torch.int16).copy_((torch.arange(scale.numel()) * 97).to(torch.int16).reshape(scale.shape))
+    saved = checkpoint.capture_caches(source)
+    plan = checkpoint.plan_cache_restore(saved, destination)
+    checkpoint.restore_cache_group(saved["indexer"], destination["indexer"], plan["indexer"])
+    checkpoint.verify_cache_restore(saved, destination, plan)
+    assert not destination["indexer"].caches[0][0].any()
+    assert not destination["indexer"].caches[1][0].any()

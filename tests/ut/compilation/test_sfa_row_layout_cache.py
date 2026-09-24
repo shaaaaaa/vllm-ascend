@@ -259,14 +259,14 @@ def test_mixed_c8_builder_maps_final_padding_and_keeps_addresses(full_graph):
         item = common()
         item.sfa_full_graph = full_graph
         item.indexer_block_table_tensor = item.block_table_tensor + 10 + step
-        item.indexer_slot_mapping = torch.tensor([126+step,127+step,128+step,129+step,-1,-1])
-        result = subject.build(0,item)
+        item.indexer_slot_mapping = torch.tensor([126 + step, 127 + step, 128 + step, 129 + step, -1, -1])
+        result = subject.build(0, item)
         assert torch.equal(result.indexer_c8_block_table, result.indexer_block_table * 2)
         assert result.indexer_c8_block_table.shape[0] == result.seq_lens.shape[0]
-        expected = item.indexer_slot_mapping + torch.div(item.indexer_slot_mapping,128,rounding_mode="trunc")*128
-        assert torch.equal(result.indexer_c8_slot_mapping,expected)
-        current=(result.indexer_c8_block_table.data_ptr(),result.indexer_c8_slot_mapping.data_ptr())
+        expected = item.indexer_slot_mapping + torch.div(item.indexer_slot_mapping, 128, rounding_mode="trunc") * 128
+        assert torch.equal(result.indexer_c8_slot_mapping, expected)
+        current = (result.indexer_c8_block_table.data_ptr(), result.indexer_c8_slot_mapping.data_ptr())
         assert addresses is None or addresses == current
-        addresses=current
+        addresses = current
         if full_graph:
             assert result.indexer_c8_block_table[-1].eq(0).all()

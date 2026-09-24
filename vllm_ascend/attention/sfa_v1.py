@@ -3124,10 +3124,16 @@ class AscendSFAImpl(MLAAttentionImpl):
             attn_metadata.cos,
             attn_metadata.sin,
             attn_metadata.slot_mapping,
-            (attn_metadata.indexer_c8_slot_mapping
-             if self.use_sparse_c8_indexer and attn_metadata.indexer_c8_slot_mapping is not None
-             else attn_metadata.indexer_slot_mapping),
+            attn_metadata.indexer_slot_mapping,
         )
+        # These are shared metadata too: validate both mappings before memoizing
+        # so a BF16 producer cannot authorize invalid C8 rows in a later layer.
+        c8_slots = getattr(attn_metadata, "indexer_c8_slot_mapping", None)
+        c8_table = getattr(attn_metadata, "indexer_c8_block_table", None)
+        if c8_slots is not None or c8_table is not None:
+            if c8_table is None or int(c8_table.shape[0]) != attention_capacity:
+                return "the C8 block-table row count does not match the graph key"
+            required_token_tensors += (c8_slots,)
         if any(tensor is None for tensor in required_token_tensors):
             return "required fixed-shape attention metadata is unavailable"
         if any(int(tensor.shape[0]) != token_capacity for tensor in required_token_tensors):
@@ -4661,31 +4667,23 @@ class AscendSFAImpl(MLAAttentionImpl):
                     num_hidden_layers=self.diagnostic_num_cache_layers,
                 )
                 runtime = state.runtime
+                diagnostic_index_slots = (
+                    attn_metadata.indexer_c8_slot_mapping
+                    if self.use_sparse_c8_indexer and attn_metadata.indexer_c8_slot_mapping is not None
+                    else attn_metadata.indexer_slot_mapping
+                )
                 pre_components = {
                     "ql_nope": bridge[0][:diagnostic_rows],
                     "q_pe": bridge[1][:diagnostic_rows],
-                    "raw_topk_sample": bridge[2][:diagnostic_rows]
-                    .reshape(diagnostic_rows, -1)[:, :diagnostic_width],
-                    "selected_packed_sample": selected_packed[
-                        :request_count, :diagnostic_width
-                    ],
+                    "raw_topk_sample": bridge[2][:diagnostic_rows].reshape(diagnostic_rows, -1)[:, :diagnostic_width],
+                    "selected_packed_sample": selected_packed[:request_count, :diagnostic_width],
                     "selected_counts": selected_counts[:request_count],
-                    "target_slots_sample": target_slots[
-                        :request_count, :diagnostic_width
-                    ],
-                    "row_req_indices": attn_metadata.decode_req_indices[
-                        : graph_key.token_capacity
-                    ],
+                    "target_slots_sample": target_slots[:request_count, :diagnostic_width],
+                    "row_req_indices": attn_metadata.decode_req_indices[: graph_key.token_capacity],
                     "cum_query_lens": attn_metadata.cum_query_lens,
                     "seq_lens": attn_metadata.seq_lens,
-                    "slot_mapping": attn_metadata.slot_mapping[
-                        : graph_key.token_capacity
-                    ],
-                    "indexer_slot_mapping": (
-                        attn_metadata.indexer_slot_mapping[
-                            : graph_key.token_capacity
-                        ]
-                    ),
+                    "slot_mapping": attn_metadata.slot_mapping[: graph_key.token_capacity],
+                    "indexer_slot_mapping": (diagnostic_index_slots[: graph_key.token_capacity]),
                 }
                 input_snapshot = state.input_diagnostic_buffers.get(
                     graph_key
@@ -4706,9 +4704,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                         -1, *kv_cache[2].shape[2:]
                     )
                     current_index_slots = (
-                        attn_metadata.indexer_slot_mapping[
-                            :diagnostic_rows
-                        ]
+                        diagnostic_index_slots[:diagnostic_rows]
                         .clamp(
                             min=0,
                             max=int(flat_index.shape[0]) - 1,
@@ -4722,6 +4718,10 @@ class AscendSFAImpl(MLAAttentionImpl):
                             ),
                         }
                     )
+                    if self.use_sparse_c8_indexer:
+                        pre_components["current_index_scale"] = (
+                            kv_cache[3].reshape(-1, 1).index_select(0, current_index_slots)
+                        )
                 if state.remap_boundary is not None:
                     pre_components["remap_boundary"] = (
                         state.remap_boundary[:actual_rows]
@@ -4864,6 +4864,11 @@ class AscendSFAImpl(MLAAttentionImpl):
                 and len(runtime[1]) > 2
             ):
                 kv_cache = runtime[1]
+                diagnostic_index_slots = (
+                    metadata.indexer_c8_slot_mapping
+                    if self.use_sparse_c8_indexer and metadata.indexer_c8_slot_mapping is not None
+                    else metadata.indexer_slot_mapping
+                )
                 flat_index = kv_cache[2].reshape(
                     -1, *kv_cache[2].shape[2:]
                 )
@@ -4872,25 +4877,20 @@ class AscendSFAImpl(MLAAttentionImpl):
                     int(graph_key.token_capacity),
                 )
                 current_slots = (
-                    metadata.indexer_slot_mapping[:actual_rows]
-                    .clamp(min=0, max=int(flat_index.shape[0]) - 1)
-                    .long()
+                    diagnostic_index_slots[:actual_rows].clamp(min=0, max=int(flat_index.shape[0]) - 1).long()
                 )
                 queue_staged_graph_stage_fingerprint(
                     req_ids=metadata.decode_request_ids_compact,
                     layer_name=layer_name,
                     stage="before_graph_pre",
                     components={
-                        "slot_mapping": metadata.slot_mapping[
-                            : graph_key.token_capacity
-                        ],
-                        "indexer_slot_mapping": (
-                            metadata.indexer_slot_mapping[
-                                : graph_key.token_capacity
-                            ]
-                        ),
-                        "current_index": flat_index.index_select(
-                            0, current_slots
+                        "slot_mapping": metadata.slot_mapping[: graph_key.token_capacity],
+                        "indexer_slot_mapping": (diagnostic_index_slots[: graph_key.token_capacity]),
+                        "current_index": flat_index.index_select(0, current_slots),
+                        **(
+                            {"current_index_scale": kv_cache[3].reshape(-1, 1).index_select(0, current_slots)}
+                            if self.use_sparse_c8_indexer
+                            else {}
                         ),
                     },
                     row_request_indices=metadata.decode_req_indices_cpu,

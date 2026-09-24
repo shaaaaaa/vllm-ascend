@@ -546,31 +546,33 @@ def test_compiled_producer_consumer_observe_explicit_mutation(api, mtp):
 
 @pytest.mark.parametrize("mixed", [False, True])
 @pytest.mark.parametrize("fault", [None, "missing_scale", "scale_dtype", "scale_capacity"])
-def test_c8_producer_shares_resident_plan_and_validates_scales(api,mixed,fault):
-    runner,layers,group,_=grouped(api)
-    layers[0].use_sparse_c8_indexer=True
-    runner._shared_resident_groups=[]
+def test_c8_producer_shares_resident_plan_and_validates_scales(api, mixed, fault):
+    runner, layers, group, _ = grouped(api)
+    layers[0].use_sparse_c8_indexer = True
+    runner._shared_resident_groups = []
     runner._bind_shared_resident_plans()
-    group=runner._shared_resident_groups[0]
-    group.active=True
-    runner.use_sparse_c8_indexer=True
-    index_name=group.members[0].rsplit(".",1)[0]+".indexer.k_cache"
-    runner._mixed_indexer_c8_names=frozenset([index_name]) if mixed else None
-    runner.attn_groups=[[NS(layer_names=group.members)]]
-    caches={name:(torch.empty(32,128,1,4),torch.empty(32,128,1,2)) for name in group.members}
-    blocks=64 if mixed else 32
-    key=torch.empty(blocks,128,1,128,dtype=torch.int8)
-    scale=torch.empty(blocks,128,1,1,dtype=torch.float16)
-    if fault=="scale_dtype": scale=scale.float()
-    if fault=="scale_capacity": scale=scale[:-1]
-    caches[index_name]=(key,) if fault=="missing_scale" else (key,scale)
+    group = runner._shared_resident_groups[0]
+    group.active = True
+    runner.use_sparse_c8_indexer = True
+    index_name = group.members[0].rsplit(".", 1)[0] + ".indexer.k_cache"
+    runner._mixed_indexer_c8_names = frozenset([index_name]) if mixed else None
+    runner.attn_groups = [[NS(layer_names=group.members)]]
+    caches = {name: (torch.empty(32, 128, 1, 4), torch.empty(32, 128, 1, 2)) for name in group.members}
+    blocks = 64 if mixed else 32
+    key = torch.empty(blocks, 128, 1, 128, dtype=torch.int8)
+    scale = torch.empty(blocks, 128, 1, 1, dtype=torch.float16)
+    if fault == "scale_dtype":
+        scale = scale.float()
+    if fault == "scale_capacity":
+        scale = scale[:-1]
+    caches[index_name] = (key,) if fault == "missing_scale" else (key, scale)
     if fault:
-        with pytest.raises(ValueError,match="paired key/scale"):
+        with pytest.raises(ValueError, match="paired key/scale"):
             runner._validate_shared_resident_layout(caches)
         return
     runner._validate_shared_resident_layout(caches)
-    raw=torch.zeros((1,1,2048),dtype=torch.int32)
-    produced=plan(layers[0],raw)
-    consumed=plan(layers[1],raw)
-    assert all(torch.equal(a,b) for a,b in zip(produced,consumed))
+    raw = torch.zeros((1, 1, 2048), dtype=torch.int32)
+    produced = plan(layers[0], raw)
+    consumed = plan(layers[1], raw)
+    assert all(torch.equal(a, b) for a, b in zip(produced, consumed))
     assert not layers[1].use_sparse_c8_indexer

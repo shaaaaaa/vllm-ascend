@@ -468,3 +468,35 @@ def test_idle_metadata_group_cannot_merge_different_captured_layouts(graph_modul
     graph.validate_idle_metadata(["a"], {"slots": second})
     with pytest.raises(RuntimeError, match="changed address or layout"):
         graph.validate_idle_metadata(["a"], {"slots": first})
+
+
+@pytest.mark.parametrize("mixed", [False, True])
+def test_full_graph_signature_includes_physical_c8_storage(graph_module, mixed):
+    from sfa_test_support import extract
+
+    module, _, _, _ = graph_module
+    path = Path(__file__).resolve().parents[3] / "vllm_ascend/attention/sfa_v1.py"
+    namespace = {}
+    inputs_for = extract(path, "full_graph_metadata_inputs", namespace)
+
+    class Metadata:
+        def __getattr__(self, name):
+            return None
+
+    metadata = Metadata()
+    metadata.indexer_block_table = torch.zeros(3, 4, dtype=torch.int32)
+    metadata.indexer_slot_mapping = torch.full((4,), -1, dtype=torch.long)
+    if mixed:
+        metadata.indexer_c8_block_table = torch.zeros(3, 4, dtype=torch.int32)
+        metadata.indexer_c8_slot_mapping = torch.full((4,), -1, dtype=torch.long)
+    inputs = inputs_for(metadata)
+    assert ("indexer_c8_block_table" in inputs) == mixed
+    assert ("indexer_c8_slot_mapping" in inputs) == mixed
+    signature = module.tensor_signature(inputs)
+    if mixed:
+        for name in ("indexer_c8_block_table", "indexer_c8_slot_mapping"):
+            old = getattr(metadata, name)
+            setattr(metadata, name, old.clone())
+            assert module.tensor_signature(inputs_for(metadata)) != signature
+            setattr(metadata, name, old)
+        assert module.tensor_signature(inputs_for(metadata)) == signature

@@ -46,7 +46,11 @@ def prepare_async_mtp_kernel(
         tl.store(slots0 + token, tl.where(active, block_id0 * block0 + position % block0, -1), token < token_capacity)
         tl.store(slots1 + token, tl.where(active, block_id1 * block1 + position % block1, -1), token < token_capacity)
         if MIXED_C8:
-            tl.store(slots_c8 + token, tl.where(active, block_id1 * 2 * block1 + position % block1, -1), token < token_capacity)
+            tl.store(
+                slots_c8 + token,
+                tl.where(active, block_id1 * 2 * block1 + position % block1, -1),
+                token < token_capacity,
+            )
 
 
 @triton.jit(do_not_specialize=["num_reqs"])

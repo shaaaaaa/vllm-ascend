@@ -455,13 +455,16 @@ class SFAParityWorker(NPUWorker):
             if not isinstance(impl, AscendSFAImpl) or not impl.dsa_offload_unbundle:
                 raise ParityError("Prefill checkpoint requires unbundled SFA caches")
             caches, index_name, enabled = impl._cross_layer_kv_cache(name, layer.kv_cache[context.virtual_engine])
-            if len(caches) != (3 if index_name is not None else 2) or not enabled:
+            c8 = bool(getattr(impl, "use_sparse_c8_indexer", False))
+            if len(caches) != ((4 if c8 else 3) if index_name is not None else 2) or not enabled:
                 raise ParityError("Prefill checkpoint requires latent K/PE and each owned LMCache indexer")
             item = context.attn_metadata[name]
             index_table = item.indexer_block_table if item.indexer_block_table is not None else item.block_table
+            if c8 and getattr(item, "indexer_c8_block_table", None) is not None:
+                index_table = item.indexer_c8_block_table
             bindings[name] = CacheBinding(tuple(caches[:2]), item.block_table[:1])
             if index_name is not None:
-                bindings[index_name] = CacheBinding((caches[2],), index_table[:1])
+                bindings[index_name] = CacheBinding(tuple(caches[2:]), index_table[:1])
             metadata[name] = {
                 key: copy_tree(getattr(item, key, None))
                 for key in (
