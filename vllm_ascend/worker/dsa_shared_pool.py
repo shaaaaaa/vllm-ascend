@@ -6,8 +6,22 @@ import torch
 class MixedIndexerMetadata:
     """Stable C8 physical views over the mixed pool's common logical IDs."""
 
-    def __init__(self, max_requests: int, max_blocks: int, max_tokens: int, device: torch.device):
+    def __init__(
+        self,
+        max_requests: int,
+        max_blocks: int,
+        max_tokens: int,
+        device: torch.device,
+        *,
+        block_map: tuple[int, ...] | None = None,
+    ):
         self.max_requests, self.max_blocks = max_requests, max_blocks
+        self.block_map = torch.tensor(block_map, dtype=torch.int32, device=device) if block_map is not None else None
+        self._map_device_metadata = None
+        if self.block_map is not None and self.block_map.device.type != "cpu":
+            from vllm_ascend.ops.triton.spec_decode.indexer_c8_metadata import map_indexer_metadata
+
+            self._map_device_metadata = map_indexer_metadata
         self.tables = torch.empty(max_requests * max_blocks, dtype=torch.int32, device=device)
         self.slots = torch.empty(max_tokens, dtype=torch.int64, device=device)
 
@@ -18,6 +32,14 @@ class MixedIndexerMetadata:
             raise ValueError("Mixed indexer metadata exceeds its preallocated capacity")
         physical_table = self.tables[:table.numel()].view(table.shape)
         physical_slots = self.slots[:slots.numel()]
+        if self.block_map is not None:
+            if self._map_device_metadata is None:
+                physical_table.copy_(torch.where(table >= 0, self.block_map[table.clamp(min=0).long()], table))
+                blocks = torch.div(slots.clamp(min=0), 128, rounding_mode="floor").long()
+                physical_slots.copy_(torch.where(slots >= 0, self.block_map[blocks].long() * 128 + slots % 128, slots))
+            else:
+                self._map_device_metadata(table, slots, self.block_map, physical_table, physical_slots)
+            return physical_table, physical_slots
         torch.mul(table, 2, out=physical_table)
         # Truncation preserves -1 padding while mapping valid logical slots to
         # the first 128-token half of each BF16-sized shared allocation.

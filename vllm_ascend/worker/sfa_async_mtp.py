@@ -386,7 +386,12 @@ class AsyncSFAModelRunner(NPUModelRunner):
                 groups[1].block_size,
                 BLOCK=32,
                 **(
-                    {"slots_c8": item.indexer_c8_slot_mapping, "MIXED_C8": True}
+                    {
+                        "slots_c8": item.indexer_c8_slot_mapping,
+                        "MIXED_C8": True,
+                        "table_c8": item.indexer_c8_block_table,
+                        "stride_c8": item.indexer_c8_block_table.stride(0),
+                    }
                     if getattr(item, "indexer_c8_slot_mapping", None) is not None
                     else {}
                 ),

@@ -27,6 +27,8 @@ def prepare_async_mtp_kernel(
     BLOCK: tl.constexpr,
     slots_c8=None,
     MIXED_C8: tl.constexpr = False,
+    table_c8=None,
+    stride_c8: tl.constexpr = 0,
 ):
     rows = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     active = rows < num_reqs
@@ -46,9 +48,18 @@ def prepare_async_mtp_kernel(
         tl.store(slots0 + token, tl.where(active, block_id0 * block0 + position % block0, -1), token < token_capacity)
         tl.store(slots1 + token, tl.where(active, block_id1 * block1 + position % block1, -1), token < token_capacity)
         if MIXED_C8:
+            physical = (
+                block_id1 * 2
+                if table_c8 is None
+                else tl.load(
+                    table_c8 + rows * stride_c8 + position // block1,
+                    active,
+                    other=0,
+                )
+            )
             tl.store(
                 slots_c8 + token,
-                tl.where(active, block_id1 * 2 * block1 + position % block1, -1),
+                tl.where(active, physical * block1 + position % block1, -1),
                 token < token_capacity,
             )
 

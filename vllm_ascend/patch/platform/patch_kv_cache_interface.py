@@ -44,6 +44,9 @@ class AscendMLAAttentionSpec(MLAAttentionSpec):
     # a mixed group while retaining common logical block IDs for every layer.
     indexer_c8_layer_names: tuple[str, ...] | None = None
 
+    indexer_paired_banks: bool = False
+    shared_pool_alignment_bytes: int = 0
+
     @property
     def shared_indexer_key_dtype(self) -> torch.dtype:
         return self.dtype if self.indexer_c8_layer_names is not None else self.c8_k_cache_dtype
@@ -61,7 +64,7 @@ class AscendMLAAttentionSpec(MLAAttentionSpec):
     def indexer_scale_page_size_bytes(self) -> int:
         """Scale sidecar charged separately from shared Group-1 key storage."""
         if self.cache_sparse_c8 and self.sparse_head_dim is not None and len(self.sparse_head_dim) == 1:
-            factor = 2 if self.indexer_c8_layer_names is not None else 1
+            factor = 2 if self.indexer_c8_layer_names is not None and not self.indexer_paired_banks else 1
             return factor * self.block_size * self.num_kv_heads * get_dtype_size(self.c8_k_scale_cache_dtype)
         return 0
 
@@ -167,9 +170,20 @@ class AscendMLAAttentionSpec(MLAAttentionSpec):
         assert len({spec.sparse_head_dim for spec in specs}) == 1, (
             "All attention layers in the same KV cache group must have the same sparse_head_dim."
         )
-        assert len({(spec.cache_sparse_c8, spec.indexer_c8_layer_names) for spec in specs}) == 1, (
-            "All layers in a KV group must share one indexer precision policy."
-        )
+        assert (
+            len(
+                {
+                    (
+                        spec.cache_sparse_c8,
+                        spec.indexer_c8_layer_names,
+                        spec.indexer_paired_banks,
+                        spec.shared_pool_alignment_bytes,
+                    )
+                    for spec in specs
+                }
+            )
+            == 1
+        ), "All layers in a KV group must share one indexer precision policy."
         return cls(
             block_size=specs[0].block_size,
             num_kv_heads=specs[0].num_kv_heads,
@@ -179,6 +193,8 @@ class AscendMLAAttentionSpec(MLAAttentionSpec):
             cache_dtype_str=cache_dtype_str_set.pop(),
             cache_sparse_c8=specs[0].cache_sparse_c8,
             indexer_c8_layer_names=specs[0].indexer_c8_layer_names,
+            indexer_paired_banks=specs[0].indexer_paired_banks,
+            shared_pool_alignment_bytes=specs[0].shared_pool_alignment_bytes,
         )
 
 

@@ -67,7 +67,7 @@ from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
 from vllm.v1.attention.selector import get_attn_backend  # type: ignore
 from vllm.v1.core.sched.output import SchedulerOutput
-from vllm.v1.core.dsa_shared_pool import dsa_shared_block_layout
+from vllm.v1.core.dsa_shared_pool import dsa_shared_block_layout, paired_bank_indexer_block_map
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     EncoderOnlyAttentionSpec,
@@ -5383,7 +5383,7 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                 # Idle participation must not write dummy K/index entries into
                 # physical blocks that may belong to paused/waiting requests.
                 for metadata in {id(value): value for value in attn_metadata.values()}.values():
-                    for field_name in ("slot_mapping", "indexer_slot_mapping"):
+                    for field_name in ("slot_mapping", "indexer_slot_mapping", "indexer_c8_slot_mapping"):
                         value = getattr(metadata, field_name, None)
                         if value is not None:
                             value.fill_(-1)
@@ -5392,6 +5392,9 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                     if getattr(metadata, "decode_remap_boundary", None) is not None:
                         metadata.block_table.zero_()
                         metadata.indexer_block_table.zero_()
+                        physical_table = getattr(metadata, "indexer_c8_block_table", None)
+                        if physical_table is not None:
+                            physical_table.zero_()
                         metadata.seq_lens.zero_()
 
         with self.maybe_dummy_run_with_lora(
@@ -5716,6 +5719,8 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
         self._validate_sfa_layerwise_connector_cudagraph_mode()
         kv_cache_config = deepcopy(kv_cache_config)
         self.kv_cache_config = kv_cache_config
+        slots = getattr(kv_cache_config, "dsa_paired_bank_slots", 0)
+        self.ascend_config.indexer_hbm_block_map = paired_bank_indexer_block_map(slots) if slots else None
         self._mamba_copy_bufs = None
         self.may_add_encoder_only_layers_to_kv_cache_config()
         self.maybe_add_kv_sharing_layers_to_kv_cache_groups(kv_cache_config)
@@ -5966,7 +5971,9 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                     latent_spec = next(layer_kv_cache_spec[n] for n in kv_cache_tensor.shared_by if "indexer" not in n)
                     indexer_spec = next(layer_kv_cache_spec[n] for n in kv_cache_tensor.shared_by if "indexer" in n)
                     layout = dsa_shared_block_layout(latent_spec, indexer_spec, kv_cache_config.num_blocks)
-                    shared_bytes = layout.slot_count * layout.bundle_page_size_bytes
+                    shared_bytes = layout.slot_count * layout.bundle_page_size_bytes * (
+                        layout.indexer_bank_count if layout.paired_indexer_banks and not paired_c8 else 1
+                    )
                     scale_bytes = layout.slot_count * layout.scale_bytes_per_bundle if paired_c8 else 0
                     if shared_bytes + scale_bytes != kv_cache_tensor.size:
                         raise RuntimeError("C8 shared slab and scale sidecar disagree with the allocated HBM budget")
@@ -6199,6 +6206,10 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                             indexer_scale=raws[1] if layer_c8 and "indexer" in layer_name else None,
                             shared_indexer_dtype=self.kv_cache_dtype if self._mixed_indexer_c8_names is not None else None,
                         )
+                        if "indexer" not in layer_name and getattr(self.kv_cache_config, "dsa_paired_bank_slots", 0):
+                            # Slice each plane separately: PE follows the full wider NOPE bank.
+                            blocks = 2 * self.kv_cache_config.dsa_paired_bank_slots
+                            kv_caches[layer_name] = tuple(t[:blocks] for t in kv_caches[layer_name])
                         continue
                     # Discriminate by LAYER NAME (grouping may rewrite sparse_head_dim).
                     if "indexer" in layer_name:
@@ -6789,6 +6800,10 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                         self._mixed_indexer_c8_names = frozenset(names)
                         for name in indexer_names:
                             object.__setattr__(kv_cache_spec[name], "indexer_c8_layer_names", names)
+                            object.__setattr__(kv_cache_spec[name], "indexer_paired_banks", self.dsa_shared_pool)
+                            object.__setattr__(kv_cache_spec[name], "shared_pool_alignment_bytes",
+                                               2 * 1024 * 1024 if self.dsa_shared_pool
+                                               and self.vllm_config.kv_transfer_config is not None else 0)
                     self.ascend_config.indexer_c8_shared_block_factor = (
                         2 if self._mixed_indexer_c8_names is not None and self.dsa_shared_pool else 1
                     )

@@ -875,7 +875,9 @@ def test_dummy_dispatch_passes_idle_status_to_layout_agreement():
 
 
 @pytest.mark.parametrize("metadata_groups", [1, 2])
-def test_idle_clears_shared_metadata_once(metadata_groups):
+@pytest.mark.parametrize("c8", [False, True])
+@pytest.mark.parametrize("idle", [False, True])
+def test_idle_clears_shared_metadata_once(metadata_groups, c8, idle):
     path = Path(__file__).resolve().parents[3] / "vllm_ascend/worker/model_runner_v1.py"
     tree = ast.parse(path.read_text(encoding="utf8"))
     dummy = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "_dummy_run")
@@ -886,15 +888,27 @@ def test_idle_clears_shared_metadata_once(metadata_groups):
         block_table=torch.ones(5, 8), indexer_block_table=torch.ones(5, 8),
         seq_lens=torch.ones(5), decode_remap_boundary=object(),
     ) for _ in range(metadata_groups)]
-    tensors = [(getattr(md, field), -1 if "slot_mapping" in field else 0) for md in items
-               for field in ("slot_mapping", "indexer_slot_mapping", "block_table", "indexer_block_table", "seq_lens")]
+    if c8:
+        for md in items:
+            md.indexer_c8_slot_mapping = torch.full((8,), 257, dtype=torch.int64)
+            md.indexer_c8_block_table = torch.full((5, 8), 2, dtype=torch.int32)
+    fields = ("slot_mapping", "indexer_slot_mapping", "block_table", "indexer_block_table", "seq_lens")
+    if c8:
+        fields += ("indexer_c8_slot_mapping", "indexer_c8_block_table")
+    tensors = [(getattr(md, field), -1 if "slot_mapping" in field else 0) for md in items for field in fields]
     versions = [t._version for t, _ in tensors]
-    scope = dict(dp_idle=True, staged_sfa_graph_dummy_run=True,
-                 sfa_full_graph_enabled=lambda cfg: True, self=SimpleNamespace(vllm_config=None),
-                 attn_metadata={str(i): items[i % metadata_groups] for i in range(78)})
+    originals = [t.clone() for t, _ in tensors]
+    scope = dict(
+        dp_idle=idle,
+        staged_sfa_graph_dummy_run=True,
+        sfa_full_graph_enabled=lambda cfg: True,
+        self=SimpleNamespace(vllm_config=None),
+        attn_metadata={str(i): items[i % metadata_groups] for i in range(78)},
+    )
     exec(compile(ast.Module(body=[branch], type_ignores=[]), str(path), "exec"), scope)
-    for (tensor, expected), version in zip(tensors, versions):
-        assert tensor.eq(expected).all() and tensor._version == version + 1
+    for (tensor, expected), version, original in zip(tensors, versions, originals):
+        assert tensor.eq(expected).all() if idle else torch.equal(tensor, original)
+        assert tensor._version == version + int(idle)
 
 
 @pytest.mark.parametrize("configured,full", [(False, False), (False, True), (True, False)])

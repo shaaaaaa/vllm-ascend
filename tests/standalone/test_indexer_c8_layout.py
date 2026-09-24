@@ -116,8 +116,9 @@ def test_mixed_pool_uses_common_ownership_with_c8_physical_block_mapping(api):
         assert torch.all(scale[block * 2] == 0.25)
 
 
-@pytest.mark.parametrize("shared", [False, True])
-def test_runner_allocates_mixed_indexers_and_shared_consumers(api, monkeypatch, shared):
+@pytest.mark.parametrize("shared", [False, True, "paired"])
+@pytest.mark.parametrize("aligned", [False, True])
+def test_runner_allocates_mixed_indexers_and_shared_consumers(api, monkeypatch, shared, aligned):
     core_path = ROOT.parent / "vllm/vllm/v1/core/dsa_shared_pool.py"
     spec = importlib.util.spec_from_file_location("mixed_core_layout", core_path)
     core = importlib.util.module_from_spec(spec)
@@ -126,7 +127,7 @@ def test_runner_allocates_mixed_indexers_and_shared_consumers(api, monkeypatch, 
     path = ROOT / "vllm_ascend/worker/model_runner_v1.py"
     cls = next(n for n in ast.parse(path.read_text(encoding="utf-8")).body
                if isinstance(n, ast.ClassDef) and n.name == "NPUModelRunner")
-    names = {"_allocate_kv_cache_tensors", "_reshape_kv_cache_tensors"}
+    names = {"_allocate_kv_cache_tensors", "_reshape_kv_cache_tensors", "_align_memory"}
     methods = [n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name in names]
     tree = ast.parse("from __future__ import annotations")
     tree.body.append(ast.ClassDef(name="Runner", bases=[], keywords=[], body=methods, decorator_list=[]))
@@ -137,24 +138,38 @@ def test_runner_allocates_mixed_indexers_and_shared_consumers(api, monkeypatch, 
     index_names = [f"model.layers.{i}.self_attn.indexer.k_cache" for i in range(2)]
     c8_names = (index_names[1],)
     latent_spec = api["AscendMLAAttentionSpec"](128, 1, 576, torch.bfloat16, sparse_head_dim=(512, 64))
-    index_spec = api["AscendMLAAttentionSpec"](128, 1, 128, torch.bfloat16, sparse_head_dim=(128,),
-                                             cache_sparse_c8=True, indexer_c8_layer_names=c8_names)
+    index_spec = api["AscendMLAAttentionSpec"](
+        128,
+        1,
+        128,
+        torch.bfloat16,
+        sparse_head_dim=(128,),
+        cache_sparse_c8=True,
+        indexer_c8_layer_names=c8_names,
+        indexer_paired_banks=shared == "paired",
+    )
     layer_specs = {**dict.fromkeys(latent_names, latent_spec), **dict.fromkeys(index_names, index_spec)}
     group0 = NS(layer_names=latent_names, backend=None)
     group1 = NS(layer_names=index_names, backend=None)
     tensors = []
     for i, name in enumerate(latent_names):
         paired = [name, index_names[i]] if shared and i < 2 else [name]
-        size = 3 * 294912 + (3 * 4608 if shared and i == 1 else 0)
+        size = 3 * 294912 * (2 if shared == "paired" and i == 0 else 1) + (3 * 4608 if shared and i == 1 else 0)
         tensors.append(NS(shared_by=paired, size=size))
     if not shared:
         tensors += [NS(shared_by=[name], size=5 * index_spec.page_size_bytes) for name in index_names]
-    config = NS(num_blocks=2, kv_cache_tensors=tensors, kv_cache_groups=[group0, group1])
+    config = NS(
+        num_blocks=2,
+        kv_cache_tensors=tensors,
+        kv_cache_groups=[group0, group1],
+        dsa_paired_bank_slots=3 if shared == "paired" else 0,
+    )
     runner = ns["Runner"]()
+    runner.kv_cache_config = config
     runner.dsa_shared_pool, runner.dsa_unbundle, runner.use_sparse = shared, True, True
     runner.use_sparse_c8_indexer = True
     runner._mixed_indexer_c8_names = frozenset(c8_names)
-    runner.vllm_config = NS(kv_transfer_config=None)
+    runner.vllm_config = NS(kv_transfer_config=object() if aligned else None)
     runner.device = torch.device("cpu")
     runner.kv_cache_dtype = torch.bfloat16
     runner.c8_k_cache_dtype, runner.c8_k_scale_cache_dtype = torch.int8, torch.float16
@@ -167,12 +182,17 @@ def test_runner_allocates_mixed_indexers_and_shared_consumers(api, monkeypatch, 
     bf16, c8 = views[index_names[0]], views[index_names[1]]
     assert len(bf16) == 1 and bf16[0].dtype == torch.bfloat16
     assert len(c8) == 2 and [t.dtype for t in c8] == [torch.int8, torch.float16]
-    blocks = 27 if shared else 5
+    blocks = 54 if shared == "paired" else 27 if shared else 5
     assert bf16[0].shape[0] == blocks
-    assert c8[0].shape[0] == c8[1].shape[0] == blocks * (2 if shared else 1)
+    assert c8[0].shape[0] == c8[1].shape[0] == blocks * (2 if shared is True else 1)
+    if shared == "paired":
+        assert all(t.shape[0] == 6 and t.is_contiguous() for name in latent_names for t in views[name])
     assert all(len(views[name]) == 2 for name in latent_names)
     storages = {t.untyped_storage().data_ptr(): t.untyped_storage().nbytes() for row in raw.values() for t in row}
-    assert sum(storages.values()) <= sum(t.size for t in tensors)
+    assert sum(storages.values()) <= sum(t.size for t in tensors) + (len(storages) * 2 * 1024**2 if aligned else 0)
+    if shared == "paired":
+        expected_padding = 4 * 2 * 1024**2 if aligned else 0  # two paired slabs, two consumer planes
+        assert sum(storages.values()) == sum(t.size for t in tensors) + expected_padding
 
 
 def test_mixed_indexer_metadata_keeps_stable_contiguous_buffers(api):
@@ -191,3 +211,25 @@ def test_mixed_indexer_metadata_keeps_stable_contiguous_buffers(api):
     assert original.tolist() == [[0, 1, 33], [4, 5, 6]]
     with pytest.raises(ValueError, match="capacity"):
         builder.update(torch.empty(5, 1, dtype=torch.int32), slots)
+
+
+def test_merging_specs_preserves_paired_geometry_and_alignment(api):
+    from dataclasses import replace
+
+    spec = api["AscendMLAAttentionSpec"](
+        128,
+        1,
+        128,
+        torch.bfloat16,
+        sparse_head_dim=(128,),
+        cache_sparse_c8=True,
+        indexer_c8_layer_names=("c8",),
+        indexer_paired_banks=True,
+        shared_pool_alignment_bytes=2 * 1024**2,
+    )
+    merged = type(spec).merge([spec, replace(spec)])
+    assert merged.indexer_paired_banks and merged.shared_pool_alignment_bytes == 2 * 1024**2
+    assert merged.page_size_bytes == 32768 + 256
+    for other in (replace(spec, indexer_paired_banks=False), replace(spec, shared_pool_alignment_bytes=0)):
+        with pytest.raises(AssertionError):
+            type(spec).merge([spec, other])

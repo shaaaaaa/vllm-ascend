@@ -156,7 +156,11 @@ def test_runner_startup_uses_resolved_policy(mask, shared):
     specs = {name: SimpleNamespace(cache_sparse_c8=True, indexer_c8_layer_names=None) for name in names}
     config = SimpleNamespace(indexer_c8_layer_mask=lambda _: mask)
     runner = SimpleNamespace(
-        use_sparse_c8_indexer=True, _mixed_indexer_c8_names=None, ascend_config=config, dsa_shared_pool=shared
+        use_sparse_c8_indexer=True,
+        _mixed_indexer_c8_names=None,
+        ascend_config=config,
+        dsa_shared_pool=shared,
+        vllm_config=SimpleNamespace(kv_transfer_config=None),
     )
     exec(
         compile(ast.Module(body=[selection], type_ignores=[]), str(source), "exec"),

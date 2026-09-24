@@ -1109,12 +1109,20 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
         self.block_size = vllm_config.cache_config.block_size
         self.max_blocks = (vllm_config.model_config.max_model_len + self.block_size - 1) // self.block_size
         self._mixed_indexer_metadata = None
-        if getattr(get_ascend_config(), "indexer_c8_shared_block_factor", 1) == 2:
+        ascend_config = get_ascend_config()
+        if getattr(ascend_config, "indexer_c8_shared_block_factor", 1) == 2 and (
+            getattr(ascend_config, "indexer_hbm_block_map", None) is None
+            or any(ascend_config.indexer_c8_layer_mask(layer_names))
+        ):
+            # A BF16-only draft/consumer builder never uses physical C8 metadata.
+            block_map = getattr(ascend_config, "indexer_hbm_block_map", None)
+            blocks_per_bundle = 18 if block_map is not None else 9
             self._mixed_indexer_metadata = MixedIndexerMetadata(
                 vllm_config.scheduler_config.max_num_seqs + 1,
-                (self.max_blocks + 8) // 9 * 9,
+                (self.max_blocks + blocks_per_bundle - 1) // blocks_per_bundle * blocks_per_bundle,
                 vllm_config.scheduler_config.max_num_batched_tokens,
                 device,
+                block_map=block_map,
             )
 
         self.speculative_config = vllm_config.speculative_config

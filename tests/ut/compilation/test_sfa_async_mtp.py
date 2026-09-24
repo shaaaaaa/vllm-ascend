@@ -35,8 +35,9 @@ class Kernel:
         def launch(*args, **kwargs):
             self.events.append("kernel")
             ptrs = [Pointer(t) for t in args[:9]]
-            if kwargs.get("MIXED_C8", False):
-                kwargs["slots_c8"] = Pointer(kwargs["slots_c8"])
+            for name in ("slots_c8", "table_c8"):
+                if name in kwargs:
+                    kwargs[name] = Pointer(kwargs[name])
             self.tl.programs = grid[0]
             for pid in range(grid[0]):
                 self.tl.pid = pid
@@ -798,6 +799,7 @@ def test_actual_npu_metadata_kernel_matches_cpu_slots_and_padding(monkeypatch, m
             for shift in (100, 900)
         ]
         device_tables = [t.to("npu") for t in tables]
+        physical_table = (tables[1] * 3 + 7).npu() if mixed else None
         slots = [torch.full((capacity,), -77, dtype=torch.int32, device="npu") for _ in range(3 if mixed else 2)]
         for step in range(4):
             counts = (torch.arange(n) + step) % 2 + 1
@@ -818,7 +820,11 @@ def test_actual_npu_metadata_kernel_matches_cpu_slots_and_padding(monkeypatch, m
                 128,
                 index_block,
                 BLOCK=32,
-                **({"slots_c8": slots[2], "MIXED_C8": True} if mixed else {}),
+                **(
+                    {"slots_c8": slots[2], "MIXED_C8": True, "table_c8": physical_table, "stride_c8": 128}
+                    if mixed
+                    else {}
+                ),
             )
             bases += counts.int()
             expected_pos = torch.cat(
@@ -831,7 +837,7 @@ def test_actual_npu_metadata_kernel_matches_cpu_slots_and_padding(monkeypatch, m
                 expected_slots.append(torch.cat((slot.int(), torch.full((capacity - 2 * n,), -1, dtype=torch.int32))))
             if mixed:
                 logical = expected_slots[1]
-                expected_slots.append(logical + torch.div(logical, 128, rounding_mode="trunc") * 128)
+                expected_slots.append(torch.where(logical >= 0, (logical // 128 * 3 + 7) * 128 + logical % 128, -1))
             held.append(
                 (
                     positions.clone(),
