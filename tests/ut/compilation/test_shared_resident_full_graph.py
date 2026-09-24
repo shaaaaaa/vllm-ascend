@@ -13,7 +13,8 @@ from tests.ut.distributed.kv_transfer.test_shared_resident_plan import grouped, 
 
 
 @pytest.mark.parametrize("explicit", [False, True])
-def test_bounded_group_packs_and_restores_once_per_invocation(explicit):
+@pytest.mark.parametrize("c8", [False, True])
+def test_bounded_group_packs_and_restores_once_per_invocation(explicit, c8):
     api = resident_api.__wrapped__()
     _, (producer, consumer), group, _ = grouped(api, mtp=2, bounded=True)
     layout = load_source("vllm_ascend/attention/sfa_graph_layout.py", "shared_bounded_layout")
@@ -29,6 +30,7 @@ def test_bounded_group_packs_and_restores_once_per_invocation(explicit):
     )
     methods("vllm_ascend/attention/sfa_v1.py", {"_cross_layer_pre_compute"}, ns)
     frame = {}
+    producer.use_sparse_c8_indexer = c8
     for layer, obj in enumerate((producer, consumer)):
         obj._cross_layer_pre_compute = MethodType(ns["_cross_layer_pre_compute"], obj)
         obj.fused_qkv_a_proj = Mock(
@@ -41,7 +43,12 @@ def test_bounded_group_packs_and_restores_once_per_invocation(explicit):
         obj.rope_single = lambda q, *args: q
         obj.exec_kv = Mock()
         obj.index_cache_enabled = True
-        obj.indexer_select_pre_process = Mock(side_effect=lambda x, **kwargs: (torch.empty(x.shape[0], 4), None))
+        obj.indexer_select_pre_process = Mock(
+            side_effect=lambda x, **kwargs: (
+                torch.empty(x.shape[0], 4, dtype=torch.int8 if c8 else torch.bfloat16),
+                torch.empty(x.shape[0], 1, dtype=torch.float16) if c8 else None,
+            )
+        )
         obj._mask_staged_index_scatter_padding = lambda slots, values, *args: (slots, values)
         obj.indexer_select_post_process = Mock(side_effect=lambda **kwargs: frame["raw"].clone())
     consumer._get_indexcache_topk_indices = Mock(side_effect=AssertionError("consumer staged raw top-k"))
@@ -80,7 +87,10 @@ def test_bounded_group_packs_and_restores_once_per_invocation(explicit):
             request_state_generations=torch.ones(len(widths), dtype=torch.int64),
         )
         first = producer._cross_layer_pre_compute(
-            indexer_cache=torch.empty(tokens, 4), resident_writes=writes, **kwargs
+            indexer_cache=torch.empty(tokens, 4, dtype=torch.int8 if c8 else torch.bfloat16),
+            indexer_scale_cache=torch.empty(tokens, 1, dtype=torch.float16) if c8 else None,
+            resident_writes=writes,
+            **kwargs,
         )
         second = consumer._cross_layer_pre_compute(indexer_cache=None, resident_reads=reads, **kwargs)
         expected = torch.where((rows >= 0)[:, None, None], frame["raw"] + 100, -1)
@@ -90,6 +100,8 @@ def test_bounded_group_packs_and_restores_once_per_invocation(explicit):
         assert all(torch.equal(a, b) for a, b in zip(first[2:], second[2:]))
         assert first[4].stride() == (16,)
         assert producer.exec_kv.call_count == consumer.exec_kv.call_count == step
+        assert len(producer.indexer_select_post_process.call_args.kwargs["kv_cache"]) == (4 if c8 else 3)
+        assert ns["torch_npu"].npu_scatter_nd_update_.call_count == step * (2 if c8 else 1)
         assert not torch.equal(first[0], second[0])  # Queries remain layer-local.
         assert ns["pack_decode_lanes"].call_count == ns["unpack_decode_lanes"].call_count == step
         assert api[1]["prepare_resident_sharded_union_"].call_count == step
