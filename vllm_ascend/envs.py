@@ -179,15 +179,20 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_SFA_SHARED_RESIDENT_PLAN": lambda: bool(
         int(os.getenv("VLLM_ASCEND_SFA_SHARED_RESIDENT_PLAN", "0"))
     ),
-    # Value shards assigned to each MTP row by the sorted resident planner.
-    # The request-wide shard count is MTP * shards_per_row. The value must be
-    # a power of two in [1, 4]. Read once during model initialization so graph
-    # capture and replay use one fixed state/workspace layout.
+    # Experimental Group-0 prefetch across shared-indexer layers. Non-sensitive.
+    # 0 (default): serial; 1: full-graph overlap. Worker restart required.
+    "VLLM_ASCEND_SFA_SHARED_RETRIEVAL_OVERLAP": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_SFA_SHARED_RETRIEVAL_OVERLAP", "0"))
+    ),
     # Exact resident union/state-update kernels. 1 (default) enables, 0 selects
     # baseline. Non-sensitive; read before graph capture, worker restart required.
     "VLLM_ASCEND_DSA_RESIDENT_EXACT_KERNELS": lambda: bool(
         int(os.getenv("VLLM_ASCEND_DSA_RESIDENT_EXACT_KERNELS", "1"))
     ),
+    # Value shards assigned to each MTP row by the sorted resident planner.
+    # The request-wide shard count is MTP * shards_per_row. The value must be
+    # a power of two in [1, 4]. Read once during model initialization so graph
+    # capture and replay use one fixed state/workspace layout.
     "VLLM_ASCEND_DSA_RESIDENT_SHARDS_PER_ROW": lambda: int(
         os.getenv("VLLM_ASCEND_DSA_RESIDENT_SHARDS_PER_ROW", "4")
     ),
