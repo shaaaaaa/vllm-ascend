@@ -385,6 +385,8 @@ class AsyncSFAModelRunner(NPUModelRunner):
                 groups[0].block_size,
                 groups[1].block_size,
                 BLOCK=32,
+                **({"slots_c8": item.indexer_c8_slot_mapping, "MIXED_C8": True}
+                   if getattr(item, "indexer_c8_slot_mapping", None) is not None else {}),
             )
             common.seq_lens_cpu = common.num_computed_tokens_cpu = None
             item.seq_lens_cpu = None

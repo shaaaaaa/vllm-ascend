@@ -35,6 +35,8 @@ class Kernel:
         def launch(*args, **kwargs):
             self.events.append("kernel")
             ptrs = [Pointer(t) for t in args[:9]]
+            if kwargs.get("MIXED_C8", False):
+                kwargs["slots_c8"] = Pointer(kwargs["slots_c8"])
             self.tl.programs = grid[0]
             for pid in range(grid[0]):
                 self.tl.pid = pid
@@ -882,3 +884,34 @@ def test_nonzero_window_retains_acceptance_boundary_checks(setup, window, crossi
     ns["_boundary"] = observed
     assert runner._eligible(scheduled) == expected
     assert len(calls) in (1, 2)
+
+
+@pytest.mark.parametrize("accepted", [1,2])
+@pytest.mark.parametrize("base", [5118,5119,5120])
+def test_mixed_c8_slots_advance_in_existing_async_kernel(setup,accepted,base):
+    r,s,shape,events,_=setup
+    for group in r.input_batch.block_table.block_tables:
+        group.block_size=128
+        group.kernel_sizes=[128]
+    r._async_bases.fill_(base)
+    r._async_counts.fill_(accepted)
+    r._async_snapshot.bases[:]=base
+    r.input_batch.num_computed_tokens_cpu[:]=base
+    s.scheduled_cached_reqs.num_computed_tokens=[base+2]*3
+    for req in r.requests.values(): req.num_computed_tokens=base
+    item=r.item
+    item.indexer_c8_block_table=item.indexer_block_table*2
+    item.indexer_c8_slot_mapping=torch.full_like(item.indexer_slot_mapping,-99)
+    pointers=(item.indexer_c8_block_table.data_ptr(),item.indexer_c8_slot_mapping.data_ptr())
+    table_before=item.indexer_c8_block_table.clone()
+    r._update_states(s)
+    assert r._async_pending is s
+    metadata,_=r._build_attention_metadata(**shape)
+    result=metadata["l0"]
+    logical=result.indexer_slot_mapping
+    expected=logical+torch.div(logical,128,rounding_mode="trunc")*128
+    assert torch.equal(result.indexer_c8_slot_mapping,expected)
+    assert result.indexer_c8_slot_mapping[6:].eq(-1).all()
+    assert pointers==(result.indexer_c8_block_table.data_ptr(),result.indexer_c8_slot_mapping.data_ptr())
+    assert torch.equal(result.indexer_c8_block_table,table_before)
+    assert events.count("kernel")==1 and "sync" not in events
