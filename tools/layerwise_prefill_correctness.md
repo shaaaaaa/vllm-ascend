@@ -86,6 +86,46 @@ modified. Keep the original OFF archive and its parent `model_info.json`
 available. New logs, ON statistics and reports are written to the new directory.
 `--compare-only ./kv-check-on-next` automatically follows the saved reference.
 
+## RPC deadline and progress
+
+The correctness launcher sets `VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS` to 1800
+seconds for both cases. Use the CLI option to override it; the launcher selects
+its own environment, so exporting that variable outside the script is not an
+override:
+
+```bash
+set -o pipefail
+python tools/layerwise_prefill_correctness.py \
+    --rpc-timeout-seconds 3600 2>&1 | tee log.log
+```
+
+`sample_tokens` is vLLM's next-token selection RPC, not tensor subsampling.
+Its deadline starts when it is enqueued, including time waiting for the preceding
+forward pass, CPU tensor copies, file writes and online comparisons. The normal
+300-second deadline can expire during this instrumented workload. A longer
+deadline allows slow work to complete; it cannot resolve a deadlock. Performance
+profile and serving defaults are unchanged.
+
+After warmup, each worker writes its latest progress to
+`off/tensors/rankN/progress.json` or `on/tensors/rankN/progress.json`, refreshed
+every 30 seconds. It records the RPC operation, step, layer, tensor name, current
+phase, phase duration, and completed record/file/byte counts. Phases distinguish
+`compute`, `copy_cpu`, `stats`, `save`, `load_off`, `compare` and `manifest`.
+Rank 0 prints a short `[PFC]` heartbeat; other ranks print only when stalled.
+If one operation remains unchanged for 90 seconds, that rank writes all Python
+thread stacks to `stacks.txt` beside its progress file, once for that operation.
+The file retains the latest such snapshot. This CPU monitor does not touch NPU
+streams or add device synchronization. A Python thread cannot report if another
+thread holds the GIL indefinitely, and Python stacks do not expose native device
+execution details.
+
+Increasing counts/changing layers show forward progress even if the RPC is
+slow. An unchanged phase and its stack locate the next investigation: device
+readback, filesystem I/O, CPU comparison, or model/communication execution.
+Inspect all ranks because a waiting collective on one rank may be caused by
+another rank's slow probe. Completed OFF archives remain reusable when only the
+deadline changes, including archives recorded before this option existed.
+
 ## Results
 
 The launcher prints its result directory. It contains OFF tensor archives,

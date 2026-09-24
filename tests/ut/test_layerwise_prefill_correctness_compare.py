@@ -584,6 +584,24 @@ def test_comparable_environment_rejects_invalid_capacity(value):
         compare.comparable_environment({"LMCACHE_MAX_LOCAL_CPU_SIZE": value})
 
 
+@pytest.mark.parametrize("previous_timeout", [None, "300"])
+def test_completed_comparison_accepts_only_diagnostic_timeout_difference(tmp_path, previous_timeout):
+    root = _fixture(tmp_path)
+    field = "VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS"
+    for case, timeout in (("off", previous_timeout), ("on", "3600")):
+        path = root / case / "environment.json"
+        environment = json.loads(path.read_text())
+        if timeout is not None:
+            environment[field] = timeout
+        _write(path, environment)
+    assert compare.compare_runs(root)["passed"]
+    path = root / "on" / "environment.json"
+    environment = json.loads(path.read_text())
+    environment["VLLM_ASCEND_ENABLE_FLASHCOMM1"] = "0"
+    _write(path, environment)
+    assert not compare.compare_runs(root)["passed"]
+
+
 def test_compare_invalid_reference_reports_failure_without_falling_back(tmp_path):
     _fixture(tmp_path)
     _write(tmp_path / "off_reference.json", {"schema": 2, "off_dir": str((tmp_path / "off").resolve())})

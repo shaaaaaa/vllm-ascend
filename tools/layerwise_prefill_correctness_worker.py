@@ -20,6 +20,7 @@ from layerwise_prefill_correctness_layout import (
     install_local_merged_layout,
     validate_local_merged_engine,
 )
+from layerwise_prefill_correctness_progress import ProgressMonitor
 
 # This extension is selected explicitly by the correctness launcher. Spawned
 # workers need the same layout selection before constructing their engines.
@@ -102,7 +103,7 @@ def rows_from_slots(cache, slots):
 class TensorArchive:
     """One tensor at a time: OFF stores; ON loads OFF and emits numerical stats."""
 
-    def __init__(self, case_dir, rank, save_on_tensors=False, compare=None):
+    def __init__(self, case_dir, rank, save_on_tensors=False, compare=None, progress=None):
         self.root = Path(case_dir)
         if self.root.name not in ("off", "on"):
             raise ValueError("Correctness case directory must be named off or on")
@@ -114,6 +115,7 @@ class TensorArchive:
         self.index = self.index_path.open("x", encoding="utf-8")
         self.baseline = {}
         self.compare = compare
+        self.progress = progress
         self.records = {}
         self.errors = []
         self.archived_bytes = 0
@@ -137,20 +139,23 @@ class TensorArchive:
                 self.index.close()
                 raise
 
+    def phase(self, phase):
+        if self.progress is not None:
+            self.progress.phase(phase)
+
     def record(self, tensor, *, step, layer, kind, name, span, positions=None, valid_rows=None):
         identity = (self.rank, step, layer, kind, name)
-        if identity in self.records:
-            error = f"Duplicate tensor observation: {identity}"
-            self.errors.append(error)
-            raise RuntimeError(error)
-        if not isinstance(tensor, torch.Tensor):
-            error = f"Required observation is not a tensor: {identity}"
-            self.errors.append(error)
-            raise TypeError(error)
+        if self.progress is not None:
+            self.progress.begin_record(step=step, layer=layer, kind=kind, name=name)
         try:
+            if identity in self.records:
+                raise RuntimeError(f"Duplicate tensor observation: {identity}")
+            if not isinstance(tensor, torch.Tensor):
+                raise TypeError(f"Required observation is not a tensor: {identity}")
             # clone orders a snapshot before subsequent operations on this
             # compute stream. No synchronize()/wait_event()/wait_stream().
             cpu = tensor.detach().contiguous().clone().to("cpu")
+            self.phase("stats")
             floating = cpu.is_floating_point() or cpu.is_complex()
             finite_input = cpu.float() if str(cpu.dtype).startswith("torch.float8") else cpu
             record = dict(
@@ -177,7 +182,13 @@ class TensorArchive:
                 comparison_slice=comparison_slice,
                 comparison_shape=list(compared.shape),
                 comparison_numel=compared.numel(),
-                comparison_nonfinite=int((~torch.isfinite(finite_compared)).sum()) if floating else 0,
+                comparison_nonfinite=(
+                    record["nonfinite"]
+                    if comparison_slice is None
+                    else int((~torch.isfinite(finite_compared)).sum())
+                    if floating
+                    else 0
+                ),
             )
             if positions is not None:
                 record.update(positions=list(positions), token_axis=0)
@@ -189,10 +200,12 @@ class TensorArchive:
                     record["comparison"] = dict(comparable=False, reason="OFF valid comparison rows differ")
                 else:
                     try:
+                        self.phase("load_off")
                         source_path = (self.off_root / reference["path"]).resolve()
                         source_path.relative_to(self.off_root)
                         baseline = torch.load(source_path, map_location="cpu", weights_only=True)
                         reference_values = baseline[:valid_rows] if comparison_slice is not None else baseline
+                        self.phase("compare")
                         record["comparison"] = self.compare(reference_values, compared)
                         del reference_values
                         del baseline
@@ -201,6 +214,7 @@ class TensorArchive:
                 if not record["comparison"].get("comparable", False):
                     self.errors.append(f"Cannot compare {identity}: {record['comparison'].get('reason')}")
             if self.save:
+                self.phase("save")
                 path = self.directory / f"{len(self.records):07d}.pt"
                 temporary = path.with_suffix(".pt.tmp")
                 torch.save(cpu, temporary)
@@ -208,16 +222,25 @@ class TensorArchive:
                 record["path"] = path.relative_to(self.root).as_posix()
                 self.archived_bytes += path.stat().st_size
                 self.file_count += 1
+            self.phase("manifest")
             self.index.write(json.dumps(record, allow_nan=False) + "\n")
             self.index.flush()
             self.records[identity] = record
+            if self.progress is not None:
+                self.progress.record_done(len(self.records), self.file_count, self.archived_bytes)
             del cpu
         except BaseException as error:
             self.errors.append(f"Tensor archive failed at {identity}: {error}")
+            if self.progress is not None:
+                self.progress.fail(error, records=len(self.records), files=self.file_count, size=self.archived_bytes)
             raise
 
     def close(self):
-        self.index.close()
+        try:
+            self.index.close()
+        finally:
+            if self.progress is not None:
+                self.progress.stop()
 
 
 def required_roles(decoder_layers, sfa_layers, indexer_layers, index_cache_layers, scale_layers):
@@ -285,6 +308,29 @@ class CorrectnessProbe:
             setattr(owner, name, original)
         self.patches.clear()
 
+    def install_runner_progress(self, runner):
+        """Observe Python call boundaries without changing execution or streams."""
+        progress = self.archive.progress
+        if progress is None:
+            return
+
+        def factory(operation, original):
+            @functools.wraps(original)
+            def call(*args, **kwargs):
+                progress.begin_call(operation)
+                try:
+                    result = original(*args, **kwargs)
+                except BaseException as error:
+                    progress.fail(error)
+                    raise
+                progress.end_call(operation)
+                return result
+
+            return call
+
+        for operation in ("execute_model", "sample_tokens"):
+            self.patch(runner, operation, functools.partial(factory, operation))
+
     def emit(self, tensor, kind, name, *, positions=None):
         if not self.active_sfa:
             raise RuntimeError("Tensor consumer executed outside its observed SFA")
@@ -328,7 +374,7 @@ class CorrectnessProbe:
             previous_end = self.steps[-1]["span"][1] if self.steps else 0
             if span[0] != previous_end:
                 raise RuntimeError("Main prefill steps overlap or leave a logical-token gap")
-            if self.archive.rank == 0 and self.steps:
+            if self.archive.progress is None and self.archive.rank == 0 and self.steps:
                 print(
                     f"[PREFILL_CORRECTNESS] step={self.steps[-1]['step']} "
                     f"files={self.archive.file_count} bytes={self.archive.archived_bytes}",
@@ -504,6 +550,7 @@ class CorrectnessProbe:
         self.patch(connector_module, "_layer_source_memory_objs", source_factory)
 
     def finish(self, engine):
+        self.archive.phase("finish")
         self.restore()
         errors = list(self.archive.errors)
         if not self.steps or self.steps[-1]["span"][1] != self.prompt_len:
@@ -532,6 +579,11 @@ class CorrectnessProbe:
         if self.legacy_sources:
             errors.append("Legacy nonmerged H2D source objects were observed")
         self.archive.close()
+        if self.archive.progress is not None:
+            if errors:
+                self.archive.progress.fail(errors[0])
+            else:
+                self.archive.progress.finish()
         return dict(
             rank=self.archive.rank,
             complete=not errors,
@@ -612,15 +664,23 @@ class PrefillCorrectnessWorker:
         model_config = getattr(config, "hf_text_config", None) or config.hf_config
         model = self.model_runner.model
         layers, implementations = inventory(model, model_config, sfa_v1.AscendSFAImpl)
-        archive = TensorArchive(case_dir, self.rank, save_on_tensors)
-        probe = CorrectnessProbe(archive, prompt_len, layers, implementations, get_forward_context, model_config)
-        self._correctness_probe = probe
-        self._correctness_engine = engine
+        progress = ProgressMonitor(Path(case_dir) / "tensors" / f"rank{self.rank}", self.rank)
+        archive = probe = None
         try:
+            progress.start()
+            archive = TensorArchive(case_dir, self.rank, save_on_tensors, progress=progress)
+            probe = CorrectnessProbe(archive, prompt_len, layers, implementations, get_forward_context, model_config)
+            self._correctness_probe = probe
+            self._correctness_engine = engine
             probe.install(sfa_v1, torch_npu, npu_connectors, LayerPageMemoryObj)
-        except BaseException:
-            probe.restore()
-            archive.close()
+            probe.install_runner_progress(self.model_runner)
+            progress.phase("running", operation="idle")
+        except BaseException as error:
+            progress.fail(error)
+            if probe is not None:
+                probe.restore()
+            if archive is not None:
+                archive.close()
             raise
         return dict(
             rank=int(self.rank),
@@ -633,4 +693,13 @@ class PrefillCorrectnessWorker:
     def finish_correctness_probe(self):
         if not hasattr(self, "_correctness_probe"):
             raise RuntimeError("Correctness probe was not installed")
-        return self._correctness_probe.finish(self._correctness_engine)
+        probe = self._correctness_probe
+        try:
+            return probe.finish(self._correctness_engine)
+        except BaseException as error:
+            if probe.archive.progress is not None:
+                probe.archive.progress.fail(error)
+            raise
+        finally:
+            if probe.archive.progress is not None:
+                probe.archive.progress.stop()

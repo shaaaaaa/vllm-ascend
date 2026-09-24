@@ -21,6 +21,7 @@ def test_off_on_preserve_model_and_storage_layout(monkeypatch):
     monkeypatch.setenv("LMCACHE_REMOTE_URL", "mooncakestore://unrelated:1234/")
     monkeypatch.setenv("LMCACHE_ENABLE_REMOTE_LMCACHE_STORE", "true")
     monkeypatch.setenv("VLLM_ASCEND_SFA_STAGED_GRAPH", "1")
+    monkeypatch.setenv("VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS", "300")
     args = runner.parser().parse_args([])
     assert args.model == "/workspace/models/GLM-5.2-w4a8c8-0723"
     off = runner.correctness_environment(args, "off")
@@ -33,6 +34,7 @@ def test_off_on_preserve_model_and_storage_layout(monkeypatch):
         assert "LMCACHE_ENABLE_REMOTE_LMCACHE_STORE" not in env
         assert "VLLM_ASCEND_SFA_STAGED_GRAPH" not in env
         assert env["VLLM_ASCEND_ENABLE_FLASHCOMM1"] == "1"
+        assert env["VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS"] == "1800"
         extra = json.loads(env["LMCACHE_EXTRA_CONFIG"])
         assert extra["mooncake_layer_merged_page_objects"] is True
         assert extra["mooncake_page_first_multi_buffer"] is True
@@ -44,6 +46,32 @@ def test_off_on_preserve_model_and_storage_layout(monkeypatch):
     assert options["max_num_batched_tokens"] == 4096
     assert "profiler_config" not in options
     assert "num_hidden_layers" not in options
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "1.5"])
+def test_rpc_timeout_rejects_nonpositive_or_fractional_values(value):
+    with pytest.raises(SystemExit):
+        runner.parser().parse_args(["--rpc-timeout-seconds", value])
+
+
+def test_rpc_timeout_reaches_both_child_arguments_and_recorded_environment(tmp_path, monkeypatch):
+    args = runner.parser().parse_args(["--rpc-timeout-seconds", "3600"])
+    monkeypatch.setattr(runner, "check_shm_capacity", lambda *_: None)
+    monkeypatch.setattr(runner, "finish_child", lambda *_: None)
+    launched = []
+
+    def launch(command, env, log_path, case, **kwargs):
+        assert command[command.index("--rpc-timeout-seconds") + 1] == "3600"
+        assert env["VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS"] == "3600"
+        saved = json.loads((tmp_path / case / "environment.json").read_text())
+        assert saved["VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS"] == "3600"
+        runner.write_json(tmp_path / case / "result.json", {"completed": True})
+        launched.append(case)
+        return SimpleNamespace(wait=lambda: 0)
+
+    monkeypatch.setattr(runner, "start_logged_process", launch)
+    runner.run_cases(args, tmp_path)
+    assert launched == ["off", "on"]
 
 
 def test_failed_off_never_launches_on_or_clears_shared_memory(tmp_path, monkeypatch):
@@ -207,6 +235,22 @@ def test_reuse_launches_only_on_with_saved_reference(saved_off, tmp_path, monkey
     assert launches == ["on"] and not (root / "off").exists()
     metadata = json.loads((root / "run.json").read_text())
     assert metadata["cases"] == ["on"] and metadata["devices"] == ["4", "5"]
+    assert metadata["rpc_timeout_seconds"] == 1800
+
+
+@pytest.mark.parametrize("previous_timeout", [None, "300"])
+def test_completed_off_reuse_accepts_new_diagnostic_deadline(saved_off, tmp_path, previous_timeout):
+    environment = saved_off.data["environment"]
+    field = "VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS"
+    if previous_timeout is None:
+        environment.pop(field)
+    else:
+        environment[field] = previous_timeout
+    root = tmp_path / "new"
+    root.mkdir()
+    args = runner.parser().parse_args(["--off-dir", str(saved_off.root), "--rpc-timeout-seconds", "3600"])
+    assert runner.prepare_reused_off(args, root) == len(saved_off.ids)
+    assert runner.correctness_environment(args, "on")[field] == "3600"
 
 
 def test_reuse_fails_before_launch_when_baseline_is_incomplete(saved_off, tmp_path, monkeypatch):

@@ -31,10 +31,13 @@ RECORD_FIELDS = frozenset(
 
 
 def comparable_environment(environment: dict[str, Any]) -> dict[str, Any]:
-    """Normalize equivalent CPU capacity spellings without ignoring capacity."""
+    """Ignore the diagnostic deadline and normalize equivalent CPU capacities."""
     if not isinstance(environment, dict):
         raise ValueError("environment must be an object")
     result = dict(environment)
+    # A deadline only controls when an incomplete RPC fails. Completed OFF
+    # archives remain reusable with a longer budget for ON tensor comparison.
+    result.pop("VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS", None)
     field = "LMCACHE_MAX_LOCAL_CPU_SIZE"
     if field in result:
         try:

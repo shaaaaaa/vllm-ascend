@@ -387,3 +387,114 @@ def test_static_inventory_rejects_missing_tail_and_wrong_shared_producer(worker,
         worker.inventory(model, NS(num_hidden_layers=2, indexer_types=["full", "full"]), cls)
     probe.restore()
     probe.archive.close()
+
+
+def test_archive_progress_tracks_real_off_on_phases_and_completed_work(worker, tmp_path, monkeypatch):
+    kwargs = dict(step=0, layer=1, kind="decoder", name="input", span=(0, 2))
+    observed = {}
+    for case in ("off", "on"):
+        progress = worker.ProgressMonitor(tmp_path / case / "tensors" / "rank1", 1, log=lambda _: None)
+        phases = []
+        original = progress.phase
+
+        def phase(phase_name, original=original, phases=phases, **fields):
+            phases.append(phase_name)
+            original(phase_name, **fields)
+
+        monkeypatch.setattr(progress, "phase", phase)
+        archive = worker.TensorArchive(tmp_path / case, 1, progress=progress)
+        archive.record(torch.ones(2, 3), **kwargs)
+        state = progress.snapshot()
+        assert state["phase"] == "compute" and state["records"] == 1
+        assert state["files"] == (1 if case == "off" else 0)
+        assert state["bytes"] == archive.archived_bytes
+        assert state["layer"] == 1 and state["name"] == "input"
+        observed[case] = phases
+        archive.close()
+        assert progress.snapshot()["status"] == "stopped"
+    assert observed["off"] == ["copy_cpu", "stats", "save", "manifest", "compute"]
+    assert observed["on"] == ["copy_cpu", "stats", "load_off", "compare", "manifest", "compute"]
+
+
+def test_archive_failure_retains_exact_phase_and_stops_monitor(worker, tmp_path, monkeypatch):
+    progress = worker.ProgressMonitor(tmp_path / "off" / "tensors" / "rank1", 1, log=lambda _: None)
+    progress.start()
+    archive = worker.TensorArchive(tmp_path / "off", 1, progress=progress)
+    kwargs = dict(step=0, layer=0, kind="decoder", name="input", span=(0, 2))
+    archive.record(torch.ones(2), **kwargs)
+
+    def fail(*args, **kwargs):
+        assert progress.snapshot()["phase"] == "save"
+        raise OSError("disk full")
+
+    monkeypatch.setattr(torch, "save", fail)
+    with pytest.raises(OSError, match="disk full"):
+        archive.record(torch.ones(2), **dict(kwargs, name="output"))
+    state = json.loads((progress.directory / "progress.json").read_text())
+    assert state["status"] == "failed" and state["phase"] == "save" and state["name"] == "output"
+    assert state["records"] == state["files"] == 1 and state["bytes"] > 0
+    assert not progress._thread.is_alive()
+    archive.close()
+
+
+def test_no_slice_nonfinite_statistics_scan_full_tensor_once(worker, tmp_path, monkeypatch):
+    original = torch.isfinite
+    sizes = []
+
+    def isfinite(tensor):
+        sizes.append(tensor.numel())
+        return original(tensor)
+
+    monkeypatch.setattr(torch, "isfinite", isfinite)
+    archive = worker.TensorArchive(tmp_path / "off", 1)
+    values = torch.tensor([float("nan"), 1.0, 2.0])
+    archive.record(values, step=0, layer=0, kind="decoder", name="input", span=(0, 3))
+    assert sizes == [3]
+    record = next(iter(archive.records.values()))
+    assert record["nonfinite"] == record["comparison_nonfinite"] == 1
+    archive.record(values, step=0, layer=0, kind="decoder", name="output", span=(0, 3), valid_rows=2)
+    assert sizes == [3, 3, 2]
+    archive.close()
+
+
+def test_runner_progress_preserves_results_restores_methods_and_finishes(worker, tmp_path, monkeypatch):
+    probe, run, _, _ = _runtime(worker, monkeypatch, tmp_path / "off")
+    progress = worker.ProgressMonitor(probe.archive.directory, 0, log=lambda _: None)
+    probe.archive.progress = progress
+    runner = NS(execute_model=run, sample_tokens=lambda: "original tokens")
+    execute, sample = runner.execute_model, runner.sample_tokens
+    probe.install_runner_progress(runner)
+    assert runner.execute_model(0, 4) is None
+    assert progress.snapshot()["operation"] == "execute_model_done"
+    assert progress.snapshot()["phase"] == "await_sample"
+    assert runner.sample_tokens() == "original tokens"
+    assert progress.snapshot()["operation"] == "sample_tokens_done"
+    runner.execute_model(4, 8)
+    runner.sample_tokens()
+    summary = probe.finish(NS())
+    assert summary["complete"]
+    assert progress.snapshot()["status"] == "finished"
+    assert progress.snapshot()["records"] == summary["records"]
+    assert runner.execute_model is execute and runner.sample_tokens is sample
+
+
+def test_runner_error_preserves_inner_archive_failure(worker, tmp_path, monkeypatch):
+    probe, run, _, _ = _runtime(worker, monkeypatch, tmp_path / "off")
+    progress = worker.ProgressMonitor(probe.archive.directory, 1, log=lambda _: None)
+    probe.archive.progress = progress
+    runner = NS(execute_model=run, sample_tokens=lambda: None)
+    probe.install_runner_progress(runner)
+
+    def fail(*args, **kwargs):
+        raise OSError("archive failed")
+
+    monkeypatch.setattr(torch, "save", fail)
+    try:
+        with pytest.raises(OSError, match="archive failed"):
+            runner.execute_model(0, 4)
+        state = progress.snapshot()
+        assert state["status"] == "failed" and state["phase"] == "save"
+        assert state["operation"] == "execute_model" and state["kind"] == "decoder"
+    finally:
+        probe.restore()
+        probe.archive.close()

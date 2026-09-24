@@ -48,6 +48,7 @@ PREFIX = "[PREFILL_CORRECTNESS]"
 CASES = ("off", "on")
 DEFAULT_PROMPT_TOKENS = 10000
 MAX_PROMPT_TOKENS = 80000
+DEFAULT_RPC_TIMEOUT_SECONDS = 1800
 SEED = 1024
 DECODE_QUERY_THRESHOLD = 2  # Main model plus the configured single MTP token.
 ENVIRONMENT_PREFIXES = ("LMCACHE_", "VLLM_", "HCCL_", "ASCEND_", "OMP_", "PYTORCH_NPU_")
@@ -71,6 +72,13 @@ class ExplicitOption(argparse.Action):
         namespace.specified_options = getattr(namespace, "specified_options", frozenset()) | {self.dest}
 
 
+def positive_seconds(value):
+    seconds = int(value)
+    if seconds <= 0:
+        raise argparse.ArgumentTypeError("RPC timeout must be a positive number of seconds")
+    return seconds
+
+
 def parser():
     cli = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     cli.add_argument(
@@ -83,6 +91,12 @@ def parser():
     cli.add_argument("--prompt-file", type=Path, help="Fixed source article; tokenized once for both runs")
     cli.add_argument("--prompt-tokens", type=int, default=DEFAULT_PROMPT_TOKENS, action=ExplicitOption)
     cli.add_argument("--cpu-cache-gb", type=float, default=24, action=ExplicitOption)
+    cli.add_argument(
+        "--rpc-timeout-seconds",
+        type=positive_seconds,
+        default=DEFAULT_RPC_TIMEOUT_SECONDS,
+        help="Per-RPC deadline including queued forward and full tensor I/O (default: 1800)",
+    )
     cli.add_argument("--run-dir", type=Path, help="New, empty results directory")
     cli.add_argument("--off-dir", type=Path, help="Previous correctness run or its off/ directory; run ON only")
     cli.add_argument(
@@ -114,6 +128,7 @@ def correctness_environment(args, case):
         sort_keys=True,
     )
     env["HCCL_DETERMINISTIC"] = "strict"
+    env["VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS"] = str(args.rpc_timeout_seconds)
     return env
 
 
@@ -249,6 +264,7 @@ def run_child(args):
     from layerwise_prefill_correctness_layout import install_local_merged_layout
 
     os.environ.pop("LMCACHE_CONFIG_FILE", None)
+    os.environ["VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS"] = str(args.rpc_timeout_seconds)
     install_local_merged_layout()
     from vllm import LLM, SamplingParams
 
@@ -257,6 +273,7 @@ def run_child(args):
     prompt = json.loads((root / "prompt.json").read_text(encoding="utf-8"))
     options = correctness_options(args, prompt["length"])
     write_json(case_dir / "engine_options.json", options)
+    print(f"{PREFIX} {args.child}: model={args.model}; RPC timeout={args.rpc_timeout_seconds}s", flush=True)
     print(f"{PREFIX} {args.child}: loading full model (no capture during warmup)", flush=True)
     llm = LLM(**options)
     report = {
@@ -333,6 +350,8 @@ def run_cases(args, root):
             str(args.cpu_cache_gb),
             "--prompt-tokens",
             str(args.prompt_tokens),
+            "--rpc-timeout-seconds",
+            str(args.rpc_timeout_seconds),
         ]
         if args.save_on_tensors:
             command.append("--save-on-tensors")
@@ -397,6 +416,7 @@ def main(argv=None):
                 "model": args.model,
                 "devices": args.devices.split(","),
                 "compute_chunk_tokens": COMPUTE_CHUNK_TOKENS,
+                "rpc_timeout_seconds": args.rpc_timeout_seconds,
                 "save_on_tensors": args.save_on_tensors,
                 "off_source": str(args.off_dir) if args.off_dir else None,
                 "cases": ["on"] if args.off_dir else list(CASES),
