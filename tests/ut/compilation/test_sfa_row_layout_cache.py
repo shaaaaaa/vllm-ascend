@@ -34,6 +34,7 @@ def builder():
     result._dsa_max_num_rows, result._dsa_max_num_reqs = 32, 8
     result.enable_dsa_cp = False
     result._full_graph_tables = None
+    result._mixed_indexer_metadata = None
     result._dsa_fixed_layout_signature = None
     result._dsa_general_layout_signature = None
     result._dsa_general_decode_rows = 0
@@ -243,3 +244,29 @@ def test_failed_upload_cannot_reuse_the_old_layout_signature():
     expected = fresh.build(0, old)
     for name, value in snapshot(actual).items():
         torch.testing.assert_close(value, snapshot(expected)[name])
+
+
+@pytest.mark.parametrize("full_graph", [False, True])
+def test_mixed_c8_builder_maps_final_padding_and_keeps_addresses(full_graph):
+    path = PATH.parents[1] / "worker/dsa_shared_pool.py"
+    spec = importlib.util.spec_from_file_location("mixed_indexer_layout", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    subject, _ = builder()
+    subject._mixed_indexer_metadata = module.MixedIndexerMetadata(9, 64, 32, torch.device("cpu"))
+    addresses = None
+    for step in range(3):
+        item = common()
+        item.sfa_full_graph = full_graph
+        item.indexer_block_table_tensor = item.block_table_tensor + 10 + step
+        item.indexer_slot_mapping = torch.tensor([126+step,127+step,128+step,129+step,-1,-1])
+        result = subject.build(0,item)
+        assert torch.equal(result.indexer_c8_block_table, result.indexer_block_table * 2)
+        assert result.indexer_c8_block_table.shape[0] == result.seq_lens.shape[0]
+        expected = item.indexer_slot_mapping + torch.div(item.indexer_slot_mapping,128,rounding_mode="trunc")*128
+        assert torch.equal(result.indexer_c8_slot_mapping,expected)
+        current=(result.indexer_c8_block_table.data_ptr(),result.indexer_c8_slot_mapping.data_ptr())
+        assert addresses is None or addresses == current
+        addresses=current
+        if full_graph:
+            assert result.indexer_c8_block_table[-1].eq(0).all()

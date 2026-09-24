@@ -6921,7 +6921,6 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                     impl.enable_mlapo
                     or impl.enable_dsa_cp
                     or impl.enable_dsa_cp_with_o_proj_tp
-                    or impl.use_sparse_c8_indexer
                 ):
                     raise ValueError("shared resident planning requires the ordinary non-CP SFA layout")
             state, workspace = producer._sorted_resident_state, producer._sorted_resident_workspace
@@ -6956,6 +6955,20 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
             owners = [ag for ag in self.attn_groups[0] if group.members[0] in ag.layer_names]
             if len(owners) != 1 or not set(group.members).issubset(owners[0].layer_names):
                 raise ValueError("shared resident members must use one latent metadata builder in KV group 0")
+            producer = group.members[0]
+            indexer_name = producer.rsplit(".", 1)[0] + ".indexer.k_cache"
+            if getattr(self, "use_sparse_c8_indexer", False) and (
+                self._mixed_indexer_c8_names is None or indexer_name in self._mixed_indexer_c8_names
+            ):
+                indexer = kv_caches.get(indexer_name, ())
+                if (len(indexer) != 2 or indexer[0].dtype != torch.int8
+                        or indexer[1].dtype != torch.float16
+                        or indexer[0].ndim != 4
+                        or indexer[0].shape[1:] != (group.block_size, 1, 128)
+                        or indexer[1].shape != (*indexer[0].shape[:3], 1)
+                        or indexer[0].device != indexer[1].device
+                        or not all(t.is_contiguous() for t in indexer)):
+                    raise ValueError("shared resident C8 producer requires paired key/scale storage")
             reference = kv_caches[group.members[0]][:2]
             for name in group.members:
                 caches = kv_caches[name][:2]

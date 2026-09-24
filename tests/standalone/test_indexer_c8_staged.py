@@ -34,6 +34,7 @@ def test_staged_scatter_keeps_key_scale_pair_and_padding(c8, idle):
     ns = dict(
         torch=torch,
         torch_npu=SimpleNamespace(npu_scatter_nd_update_=scatter),
+        get_forward_context=lambda: SimpleNamespace(staged_sfa_graph_key=None),
         get_weight_prefetch_method=lambda: SimpleNamespace(maybe_prefetch_mla_or_sla_weight_in_current_stream=Mock()),
     )
     exec(compile(ast.fix_missing_locations(tree), str(source), "exec"), ns)

@@ -1111,7 +1111,7 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
         self._mixed_indexer_metadata = None
         if getattr(get_ascend_config(), "indexer_c8_shared_block_factor", 1) == 2:
             self._mixed_indexer_metadata = MixedIndexerMetadata(
-                vllm_config.scheduler_config.max_num_seqs,
+                vllm_config.scheduler_config.max_num_seqs + 1,
                 (self.max_blocks + 8) // 9 * 9,
                 vllm_config.scheduler_config.max_num_batched_tokens,
                 device,
@@ -1350,10 +1350,6 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
         if common_attn_metadata.indexer_block_table_tensor is not None:
             indexer_block_table = common_attn_metadata.indexer_block_table_tensor[:num_reqs]
             indexer_slot_mapping = common_attn_metadata.indexer_slot_mapping[:num_input_tokens]
-            if self._mixed_indexer_metadata is not None:
-                indexer_c8_block_table, indexer_c8_slot_mapping = self._mixed_indexer_metadata.update(
-                    indexer_block_table, indexer_slot_mapping
-                )
 
         # DSA shrink-latent: expand per-request prompt lengths to per-row cache
         # boundaries for sparse-index preparation. Decode rows start at the
@@ -1729,6 +1725,13 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
                 )
             block_table, indexer_block_table, cum_query_lens, seq_lens, seq_lens_cpu = self._full_graph_tables.update(
                 block_table, indexer_block_table, cum_query_lens, seq_lens, seq_lens_cpu, num_input_tokens
+            )
+
+        # Full-graph attention adds a zero-KV padding sequence. Map the final
+        # table so its physical C8 view has the same row count and stable layout.
+        if indexer_block_table is not None and self._mixed_indexer_metadata is not None:
+            indexer_c8_block_table, indexer_c8_slot_mapping = self._mixed_indexer_metadata.update(
+                indexer_block_table, indexer_slot_mapping
             )
 
         cos, sin = get_cos_and_sin_mla(input_positions, True)
@@ -3914,7 +3917,11 @@ class AscendSFAImpl(MLAAttentionImpl):
             "decode_union_mapping_workspace", "decode_shard_packed_workspace", "decode_shard_mapping_workspace",
             "decode_shard_counts_workspace", "resident_state_indices", "resident_state_generations",
         )
-        return {name: getattr(metadata, name) for name in fields}
+        inputs = {name: getattr(metadata, name) for name in fields}
+        if getattr(metadata, "indexer_c8_block_table", None) is not None:
+            inputs["indexer_c8_block_table"] = metadata.indexer_c8_block_table
+            inputs["indexer_c8_slot_mapping"] = metadata.indexer_c8_slot_mapping
+        return inputs
 
     def seal_staged_sfa_capture(
         self,
