@@ -155,13 +155,24 @@ def remote_command(args: argparse.Namespace, target: str, remote: list[str]) -> 
         remote = ["docker", "exec", "--", args.container, *remote]
     use_password = target in getattr(args, "_passwords", {})
     command = ["ssh", "-T", "-o", "BatchMode=no" if use_password else "BatchMode=yes"]
+    if getattr(args, "skip_host_key_check", False):
+        command.extend(
+            [
+                "-o",
+                "StrictHostKeyChecking=no",
+                "-o",
+                f"UserKnownHostsFile={os.devnull}",
+                "-o",
+                f"GlobalKnownHostsFile={os.devnull}",
+            ]
+        )
+    elif use_password:
+        command.extend(["-o", "StrictHostKeyChecking=yes"])
     if use_password:
         command.extend(
             [
                 "-o",
                 "NumberOfPasswordPrompts=1",
-                "-o",
-                "StrictHostKeyChecking=yes",
                 "-o",
                 "PreferredAuthentications=password,keyboard-interactive",
             ]
@@ -174,6 +185,11 @@ def remote_command(args: argparse.Namespace, target: str, remote: list[str]) -> 
 
 
 def add_password_arguments(cli: argparse.ArgumentParser) -> None:
+    cli.add_argument(
+        "--skip-host-key-check",
+        action="store_true",
+        help="Skip SSH server identity verification for this command; do not read or update known_hosts",
+    )
     group = cli.add_mutually_exclusive_group()
     group.add_argument("--password", action="store_true", help="Prompt once for the SSH password shared by all hosts")
     group.add_argument(

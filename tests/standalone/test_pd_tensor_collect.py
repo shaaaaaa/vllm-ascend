@@ -329,7 +329,8 @@ def test_password_env_missing_or_empty_prevents_collection(tmp_path, monkeypatch
 
 
 @pytest.mark.parametrize("mode", ["prompt", "environment", "per_host"])
-def test_password_auth_not_in_command_output_or_manifest(tmp_path, monkeypatch, capsys, mode):
+@pytest.mark.parametrize("skip_host_key_check", [False, True])
+def test_password_auth_not_in_command_output_or_manifest(tmp_path, monkeypatch, capsys, mode, skip_host_key_check):
     secret = "test-only-secret-with-$-and-quotes'"
     # No sshpass lookup, import or package installation may be required.
     monkeypatch.setattr(collector.shutil, "which", lambda _: pytest.fail("unexpected dependency lookup"))
@@ -346,6 +347,8 @@ def test_password_auth_not_in_command_output_or_manifest(tmp_path, monkeypatch, 
         "environment": ["--password-env", "TEST_PD_PASSWORD"],
         "per_host": ["--password-per-host"],
     }[mode]
+    if skip_host_key_check:
+        flags.append("--skip-host-key-check")
     commands = []
     helpers = []
     parent_env = dict(os.environ)
@@ -353,7 +356,13 @@ def test_password_auth_not_in_command_output_or_manifest(tmp_path, monkeypatch, 
     def run(command, *, stdout, stderr, check, env, stdin, **kwargs):
         commands.append(command)
         assert command[0] == "ssh"
-        assert "BatchMode=no" in command and "StrictHostKeyChecking=yes" in command
+        assert "BatchMode=no" in command
+        assert [item for item in command if item.startswith("StrictHostKeyChecking=")] == [
+            "StrictHostKeyChecking=no" if skip_host_key_check else "StrictHostKeyChecking=yes"
+        ]
+        if skip_host_key_check:
+            assert f"UserKnownHostsFile={os.devnull}" in command
+            assert f"GlobalKnownHostsFile={os.devnull}" in command
         assert "PreferredAuthentications=password,keyboard-interactive" in command
         assert secret not in " ".join(command)
         assert env[collector.ASKPASS_PASSWORD_ENV] == secret

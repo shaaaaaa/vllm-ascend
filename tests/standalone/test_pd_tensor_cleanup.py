@@ -88,7 +88,10 @@ def test_symlink_target_is_rejected_without_touching_external_data(tmp_path, sco
     assert link.is_symlink()
 
 
-def test_four_hosts_attempted_despite_one_failure_with_same_password(tmp_path, monkeypatch, capsys):
+@pytest.mark.parametrize("skip_host_key_check", [False, True])
+def test_four_hosts_attempted_despite_one_failure_with_same_password(
+    tmp_path, monkeypatch, capsys, skip_host_key_check
+):
     import pd_tensor_collect as collector
 
     monkeypatch.setattr(collector.shutil, "which", lambda _: pytest.fail("unexpected dependency lookup"))
@@ -98,6 +101,9 @@ def test_four_hosts_attempted_despite_one_failure_with_same_password(tmp_path, m
     def run(command, *, stdout, stderr, check, env, stdin, **kwargs):
         calls.append(command)
         assert command[0] == "ssh"
+        assert [item for item in command if item.startswith("StrictHostKeyChecking=")] == [
+            "StrictHostKeyChecking=no" if skip_host_key_check else "StrictHostKeyChecking=yes"
+        ]
         assert "fake-secret" not in " ".join(command)
         assert env[collector.ASKPASS_PASSWORD_ENV] == "fake-secret"
         assert env["SSH_ASKPASS_REQUIRE"] == "force"
@@ -129,6 +135,7 @@ def test_four_hosts_attempted_despite_one_failure_with_same_password(tmp_path, m
                 "--container",
                 "inference",
                 "--password",
+                *(["--skip-host-key-check"] if skip_host_key_check else []),
             ]
         )
         == 1

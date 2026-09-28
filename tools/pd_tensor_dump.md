@@ -188,7 +188,9 @@ python3 tools/pd_tensor_collect.py \
 自动化可用 `--password-env PD_SSH_PASSWORD` 从已有环境变量读取；密码不写入命令行、日志或 collection.json。
 脚本通过 [OpenSSH 原生 SSH_ASKPASS 接口](https://man.openbsd.org/ssh.1#SSH_ASKPASS) 提供密码；临时回调文件不含密码，退出时自动删除。
 Linux 使用 `/bin/sh` 回调，Windows 使用当前 Python；密码只保存在内存及 SSH 子进程环境中，父进程环境不变。
-密码模式要求机器已存在于 SSH known_hosts；第一次连接先用普通 `ssh user@host` 确认主机身份。
+默认密码模式要求机器已存在于 SSH known_hosts；第一次连接先用普通 `ssh user@host` 确认主机身份。
+需要跳过时，collect 或 cleanup 命令追加 `--skip-host-key-check`，本次连接不校验 SSH 服务器身份，
+也不读取或写入 known_hosts；密码参数保持不变，不修改系统 SSH 配置。
 远端（使用 `--container` 时为容器内）需要有 `python3` 和 `tar`。
 
 不会改远端文件。不同机器路径/容器不同时分别运行到不同本地目录，分析脚本支持多个根目录。
