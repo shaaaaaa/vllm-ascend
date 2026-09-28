@@ -91,14 +91,18 @@ def test_symlink_target_is_rejected_without_touching_external_data(tmp_path, sco
 def test_four_hosts_attempted_despite_one_failure_with_same_password(tmp_path, monkeypatch, capsys):
     import pd_tensor_collect as collector
 
-    monkeypatch.setattr(collector.shutil, "which", lambda _: "/usr/bin/sshpass")
+    monkeypatch.setattr(collector.shutil, "which", lambda _: pytest.fail("unexpected dependency lookup"))
     monkeypatch.setattr(collector.getpass, "getpass", lambda _: "fake-secret")
     calls = []
 
-    def run(command, *, stdout, stderr, check, env):
+    def run(command, *, stdout, stderr, check, env, stdin, **kwargs):
         calls.append(command)
+        assert command[0] == "ssh"
         assert "fake-secret" not in " ".join(command)
-        assert env["SSHPASS"] == "fake-secret"
+        assert env[collector.ASKPASS_PASSWORD_ENV] == "fake-secret"
+        assert env["SSH_ASKPASS_REQUIRE"] == "force"
+        assert Path(env["SSH_ASKPASS"]).is_file()
+        assert stdin == subprocess.DEVNULL
         remote_argv = shlex.split(command[-1])
         assert remote_argv[:5] == ["docker", "exec", "--", "inference", "python3"]
         assert remote_argv[-3:] == ["/workspace/repo", "case-on", "0"]

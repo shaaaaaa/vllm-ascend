@@ -31,7 +31,7 @@ import sys
 import tarfile
 import tempfile
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -43,6 +43,9 @@ HOST_MAX_LENGTH = 255
 COMPONENT_MAX_LENGTH = 128
 MISSING_RUN_EXIT = 44
 MISSING_RUN_MARKER = "PD_TENSOR_RUN_ABSENT"
+# Private transport state, only in a short-lived SSH child's environment; this
+# is not an engine setting and is never passed to a vLLM worker or saved on disk.
+ASKPASS_PASSWORD_ENV = "_PD_TENSOR_SSH_PASSWORD"
 # Shared with the cleanup tool. Resolve and validate the dedicated dump directory
 # remotely, including inside docker exec, before reading or removing its children.
 REMOTE_PATH_CHECK = """
@@ -153,13 +156,21 @@ def remote_command(args: argparse.Namespace, target: str, remote: list[str]) -> 
     use_password = target in getattr(args, "_passwords", {})
     command = ["ssh", "-T", "-o", "BatchMode=no" if use_password else "BatchMode=yes"]
     if use_password:
-        command.extend(["-o", "NumberOfPasswordPrompts=1", "-o", "StrictHostKeyChecking=yes"])
+        command.extend(
+            [
+                "-o",
+                "NumberOfPasswordPrompts=1",
+                "-o",
+                "StrictHostKeyChecking=yes",
+                "-o",
+                "PreferredAuthentications=password,keyboard-interactive",
+            ]
+        )
     if args.ssh_port is not None:
         command.extend(["-p", str(args.ssh_port)])
     if args.identity_file is not None:
         command.extend(["-i", str(args.identity_file.expanduser().resolve())])
-    prefix = [args._sshpass, "-e"] if use_password else []
-    return [*prefix, *command, "--", target, shlex.join(remote)]
+    return [*command, "--", target, shlex.join(remote)]
 
 
 def add_password_arguments(cli: argparse.ArgumentParser) -> None:
@@ -173,17 +184,42 @@ def add_password_arguments(cli: argparse.ArgumentParser) -> None:
     )
 
 
+def write_askpass(directory: Path, *, windows: bool) -> Path:
+    """Create OpenSSH's native password callback, containing no credentials.
+
+    Linux needs only /bin/sh; Windows uses the Python already running this tool.
+    Password bytes come from the child environment, never inserted into code.
+    """
+    helper = directory / ("askpass.cmd" if windows else "askpass")
+    if windows:
+        python = sys.executable.replace("%", "%%")
+        callback = (
+            "import os,sys;"
+            "sys.exit(1) if os.environ.get('SSH_ASKPASS_PROMPT') in ('confirm','none') else None;"
+            f"sys.stdout.buffer.write(os.environ[{ASKPASS_PASSWORD_ENV!r}].encode('utf-8')+bytes([10]))"
+        )
+        content = f'@echo off\r\n"{python}" -I -c "{callback}"\r\n'
+    else:
+        content = (
+            '#!/bin/sh\ncase "${SSH_ASKPASS_PROMPT-}" in confirm|none) exit 1 ;; esac\n'
+            f"printf '%s\\n' \"${ASKPASS_PASSWORD_ENV}\"\n"
+        )
+    with helper.open("x", encoding="utf-8", newline="") as stream:
+        stream.write(content)
+    helper.chmod(0o700)
+    return helper
+
+
 @contextmanager
 def password_auth(args: argparse.Namespace) -> Iterator[None]:
-    """Optional sshpass authentication; only child SSH processes receive secrets."""
+    """Keep passwords in memory and provide a temporary native askpass helper."""
     args._passwords = {}
-    try:
-        if args.password or args.password_env or args.password_per_host:
-            args._sshpass = shutil.which("sshpass")
-            if args._sshpass is None:
-                raise RuntimeError(
-                    "password login requires sshpass; install it (apt-get install sshpass / yum install sshpass)"
-                )
+    args._askpass = None
+    with ExitStack() as stack:
+        try:
+            if not (args.password or args.password_env or args.password_per_host):
+                yield
+                return
             if args.password_per_host:
                 args._passwords = {host: getpass.getpass(f"SSH password for {host}: ") for host in args.hosts}
             else:
@@ -193,15 +229,39 @@ def password_auth(args: argparse.Namespace) -> Iterator[None]:
                 args._passwords = dict.fromkeys(args.hosts, password)
             if any(not password for password in args._passwords.values()):
                 raise ValueError("SSH password must not be empty")
-        yield
-    finally:
-        args._passwords.clear()
+            if any(any(c in password for c in "\r\n\0") for password in args._passwords.values()):
+                raise ValueError("SSH askpass passwords must not contain newline or NUL characters")
+            parent = Path(tempfile.gettempdir()).resolve()
+            temporary = stack.enter_context(tempfile.TemporaryDirectory(prefix="pd-tensor-askpass-", dir=parent))
+            directory = Path(temporary).resolve()
+            if directory.parent != parent:
+                raise ValueError("temporary askpass directory escaped its parent")
+            args._askpass = str(write_askpass(directory, windows=os.name == "nt"))
+            yield
+        finally:
+            args._passwords.clear()
+            args._askpass = None
 
 
 def run_ssh(args: argparse.Namespace, target: str, command: list[str], **kwargs: Any) -> subprocess.CompletedProcess:
     passwords = getattr(args, "_passwords", {})
     if target in passwords:
-        kwargs["env"] = dict(os.environ, SSHPASS=passwords[target])
+        kwargs["env"] = dict(os.environ)
+        kwargs["env"].update(
+            {
+                ASKPASS_PASSWORD_ENV: passwords[target],
+                "SSH_ASKPASS": args._askpass,
+                "SSH_ASKPASS_REQUIRE": "force",
+                # Older OpenSSH ignores REQUIRE. A detached session plus DISPLAY
+                # activates askpass there too; the callback does not use a GUI.
+                "DISPLAY": os.environ.get("DISPLAY") or "pd-tensor:0",
+            }
+        )
+        kwargs["stdin"] = subprocess.DEVNULL
+        if os.name == "nt":
+            kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+        else:
+            kwargs["start_new_session"] = True
     return subprocess.run(command, check=False, **kwargs)
 
 

@@ -178,7 +178,7 @@ python3 tools/pd_tensor_collect.py \
 没有本轮目录或目录为空的机器标为 `empty`，下次收集会重试；SSH/容器/权限错误、损坏文件仍报错。
 所有机器都没有数据时返回失败；只有 P 或只有 D、缺 TP rank、重复请求记录时，分析报告明确标为不完整。
 
-密码登录在执行脚本的机器上安装 `sshpass`（Debian/Ubuntu：`apt-get install sshpass`；RPM 系：`yum install sshpass`），然后给命令追加：
+密码登录只需现有的 Python 和系统 OpenSSH，不需要安装 `sshpass`、`paramiko` 或图形界面的 askpass 程序。给命令追加：
 
 ```bash
 --password
@@ -186,6 +186,8 @@ python3 tools/pd_tensor_collect.py \
 
 它会隐藏输入，一次输入供四台机器使用。不同密码用 `--password-per-host` 逐台输入。
 自动化可用 `--password-env PD_SSH_PASSWORD` 从已有环境变量读取；密码不写入命令行、日志或 collection.json。
+脚本通过 [OpenSSH 原生 SSH_ASKPASS 接口](https://man.openbsd.org/ssh.1#SSH_ASKPASS) 提供密码；临时回调文件不含密码，退出时自动删除。
+Linux 使用 `/bin/sh` 回调，Windows 使用当前 Python；密码只保存在内存及 SSH 子进程环境中，父进程环境不变。
 密码模式要求机器已存在于 SSH known_hosts；第一次连接先用普通 `ssh user@host` 确认主机身份。
 远端（使用 `--container` 时为容器内）需要有 `python3` 和 `tar`。
 

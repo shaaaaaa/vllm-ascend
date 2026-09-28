@@ -4,6 +4,7 @@
 import importlib.util
 import io
 import json
+import os
 import shlex
 import subprocess
 import sys
@@ -319,7 +320,6 @@ def test_real_remote_probe_streams_tar_into_safe_extractor(tmp_path):
 
 @pytest.mark.parametrize("value", [None, ""])
 def test_password_env_missing_or_empty_prevents_collection(tmp_path, monkeypatch, value):
-    monkeypatch.setattr(collector.shutil, "which", lambda _: "sshpass")
     if value is None:
         monkeypatch.delenv("TEST_PD_PASSWORD", raising=False)
     else:
@@ -331,7 +331,8 @@ def test_password_env_missing_or_empty_prevents_collection(tmp_path, monkeypatch
 @pytest.mark.parametrize("mode", ["prompt", "environment", "per_host"])
 def test_password_auth_not_in_command_output_or_manifest(tmp_path, monkeypatch, capsys, mode):
     secret = "test-only-secret-with-$-and-quotes'"
-    monkeypatch.setattr(collector.shutil, "which", lambda _: "/usr/bin/sshpass")
+    # No sshpass lookup, import or package installation may be required.
+    monkeypatch.setattr(collector.shutil, "which", lambda _: pytest.fail("unexpected dependency lookup"))
     prompts = []
 
     def prompt(message):
@@ -346,13 +347,29 @@ def test_password_auth_not_in_command_output_or_manifest(tmp_path, monkeypatch, 
         "per_host": ["--password-per-host"],
     }[mode]
     commands = []
+    helpers = []
+    parent_env = dict(os.environ)
 
-    def run(command, *, stdout, stderr, check, env):
+    def run(command, *, stdout, stderr, check, env, stdin, **kwargs):
         commands.append(command)
-        assert command[:2] == ["/usr/bin/sshpass", "-e"]
+        assert command[0] == "ssh"
         assert "BatchMode=no" in command and "StrictHostKeyChecking=yes" in command
+        assert "PreferredAuthentications=password,keyboard-interactive" in command
         assert secret not in " ".join(command)
-        assert env["SSHPASS"] == secret
+        assert env[collector.ASKPASS_PASSWORD_ENV] == secret
+        assert env["SSH_ASKPASS_REQUIRE"] == "force"
+        assert env["DISPLAY"]
+        assert stdin == subprocess.DEVNULL
+        assert kwargs == (
+            {"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {"start_new_session": True}
+        )
+        helper = Path(env["SSH_ASKPASS"])
+        helpers.append(helper)
+        assert helper.is_file()
+        assert secret not in helper.read_text(encoding="utf-8")
+        if os.name != "nt":
+            assert helper.stat().st_mode & 0o777 == 0o700
+            assert helper.parent.stat().st_mode & 0o777 == 0o700
         stdout.write(tar_bytes([("x.pt", b"x")]))
         return subprocess.CompletedProcess(command, 0)
 
@@ -363,24 +380,131 @@ def test_password_auth_not_in_command_output_or_manifest(tmp_path, monkeypatch, 
     assert secret not in json.dumps(read_manifest(tmp_path))
     captured = capsys.readouterr()
     assert secret not in captured.out + captured.err
-    assert "SSHPASS" not in collector.os.environ
+    assert dict(os.environ) == parent_env
+    assert not any(path.exists() or path.parent.exists() for path in helpers)
 
 
-def test_password_requires_dependency_before_prompt_or_network(tmp_path, monkeypatch):
-    monkeypatch.setattr(collector.shutil, "which", lambda _: None)
-    monkeypatch.setattr(collector.getpass, "getpass", lambda _: pytest.fail("unexpected password prompt"))
+@pytest.mark.parametrize("password", ["line\nline", "line\rline", "nul\0byte"])
+def test_password_line_protocol_rejects_invalid_values_before_transport(tmp_path, monkeypatch, password):
+    monkeypatch.setattr(collector.getpass, "getpass", lambda _: password)
     assert collector.main([*argv(tmp_path), "--password"]) == 1
     assert not (tmp_path / "collected").exists()
 
 
-def test_password_state_is_cleared_after_error(tmp_path, monkeypatch):
-    monkeypatch.setattr(collector.shutil, "which", lambda _: "sshpass")
+@pytest.mark.parametrize("error", [RuntimeError("test failure"), KeyboardInterrupt()])
+def test_password_state_is_cleared_after_error(tmp_path, monkeypatch, error):
     monkeypatch.setenv("TEST_PD_PASSWORD", "fake-secret")
     args = collector.parser().parse_args([*argv(tmp_path), "--password-env", "TEST_PD_PASSWORD"])
-    with pytest.raises(RuntimeError, match="test failure"), collector.password_auth(args):
+    with pytest.raises(type(error)), collector.password_auth(args):
         assert args._passwords
-        raise RuntimeError("test failure")
+        helper = Path(args._askpass)
+        assert helper.is_file()
+        raise error
     assert args._passwords == {}
+    assert args._askpass is None
+    assert not helper.parent.exists()
+
+
+def test_each_host_receives_only_its_own_password(tmp_path, monkeypatch):
+    secrets = iter(["password-one", "password-two"])
+    monkeypatch.setattr(collector.getpass, "getpass", lambda _: next(secrets))
+    received = []
+
+    def run(command, *, env, **kwargs):
+        received.append((command[-2], env[collector.ASKPASS_PASSWORD_ENV]))
+        kwargs["stdout"].write(tar_bytes([("x", b"x")]))
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr(collector.subprocess, "run", run)
+    assert collector.main([*argv(tmp_path, ("one", "two")), "--password-per-host"]) == 0
+    assert received == [("one", "password-one"), ("two", "password-two")]
+
+
+def test_password_free_mode_never_creates_helper(tmp_path, monkeypatch):
+    monkeypatch.setattr(collector, "write_askpass", lambda *a, **kw: pytest.fail("unexpected askpass helper"))
+    stub_ssh(monkeypatch, tar_bytes([("x", b"x")]))
+    assert collector.main(argv(tmp_path)) == 0
+
+
+@pytest.mark.parametrize("correct_password", [True, False])
+def test_real_openssh_reads_password_via_native_callback(tmp_path, monkeypatch, correct_password):
+    """Exercise the actual OpenSSH callback without a server or user credentials."""
+    keygen = collector.shutil.which("ssh-keygen")
+    if keygen is None:
+        pytest.skip("OpenSSH ssh-keygen unavailable")
+    secret = "test-only-'\"$%&-Unicode-密码"
+    key = tmp_path / "throwaway-key"
+    result = subprocess.run(
+        [keygen, "-q", "-t", "ed25519", "-N", secret, "-f", str(key)],
+        capture_output=True,
+        timeout=15,
+    )
+    assert result.returncode == 0, result.stderr
+    monkeypatch.setenv("TEST_PD_PASSWORD", secret if correct_password else "incorrect-test-password")
+    args = collector.parser().parse_args([*argv(tmp_path), "--password-env", "TEST_PD_PASSWORD"])
+    with collector.password_auth(args):
+        result = collector.run_ssh(
+            args,
+            args.hosts[0],
+            [keygen, "-y", "-f", str(key)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=15,
+        )
+        helper = Path(args._askpass)
+        assert secret not in helper.read_text(encoding="utf-8")
+    if correct_password:
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.split()[:2] == key.with_suffix(".pub").read_bytes().split()[:2]
+    else:
+        assert result.returncode != 0
+        assert result.stdout == b""
+    assert secret.encode("utf-8") not in result.stdout + result.stderr
+    assert not helper.parent.exists()
+
+
+def test_posix_ssh_detaches_tty_and_overrides_only_child_askpass_environment(monkeypatch):
+    parent_env = {"DISPLAY": "", "SSH_ASKPASS": "/old-helper", "SSH_ASKPASS_REQUIRE": "never"}
+    monkeypatch.setattr(collector, "os", SimpleNamespace(name="posix", environ=parent_env))
+    args = SimpleNamespace(_passwords={"host": "test-password"}, _askpass="/temporary-helper")
+
+    def run(command, *, check, stdin, env, start_new_session):
+        assert command == ["ssh", "host"]
+        assert start_new_session is True
+        assert stdin == subprocess.DEVNULL
+        assert env["DISPLAY"] == "pd-tensor:0"
+        assert env["SSH_ASKPASS"] == "/temporary-helper"
+        assert env["SSH_ASKPASS_REQUIRE"] == "force"
+        assert env[collector.ASKPASS_PASSWORD_ENV] == "test-password"
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr(collector.subprocess, "run", run)
+    assert collector.run_ssh(args, "host", ["ssh", "host"]).returncode == 0
+    assert parent_env == {"DISPLAY": "", "SSH_ASKPASS": "/old-helper", "SSH_ASKPASS_REQUIRE": "never"}
+
+
+@pytest.mark.parametrize("hint", [None, "confirm", "none"])
+def test_posix_callback_returns_literal_password_and_rejects_nonpassword_prompts(tmp_path, hint):
+    shell = collector.shutil.which("sh")
+    if shell is None and os.name == "nt":
+        git = collector.shutil.which("git")
+        candidate = Path(git).resolve().parent.parent / "bin/bash.exe" if git else None
+        shell = str(candidate) if candidate and candidate.is_file() else None
+    if shell is None:
+        pytest.skip("POSIX shell unavailable")
+    helper = collector.write_askpass(tmp_path, windows=False)
+    secret = "space ' quote \" $() `command` %PATH% & back\\slash 密码"
+    env = dict(os.environ, **{collector.ASKPASS_PASSWORD_ENV: secret})
+    env.pop("SSH_ASKPASS_PROMPT", None)
+    if hint is not None:
+        env["SSH_ASKPASS_PROMPT"] = hint
+    result = subprocess.run([shell, str(helper), "password:"], env=env, capture_output=True, timeout=15)
+    if hint is None:
+        assert result.returncode == 0, result.stderr
+        assert result.stdout == secret.encode("utf-8") + b"\n"
+    else:
+        assert result.returncode == 1
+        assert result.stdout == b""
 
 
 def test_transport_exception_is_recorded_and_download_retained(tmp_path, monkeypatch):
