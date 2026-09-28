@@ -169,6 +169,18 @@ def _check_record(record: dict, worker: Worker) -> None:
     )
     axis = record.get("row_axis")
     _require(axis is None or type(axis) is int and axis == 0, "unsupported row axis")
+    if "physical_slots" in record:
+        slots = record["physical_slots"]
+        _require(
+            record["kind"] == "kv_consumed"
+            and axis == 0
+            and _integers(slots)
+            and bool(record["shape"])
+            and len(slots) == record["shape"][0]
+            and isinstance(record.get("positions"), list)
+            and len(slots) == len(record["positions"]),
+            "invalid consumed KV physical slots",
+        )
     if axis is None:
         _require(
             record.get("positions") is None and record.get("token_ids") is None,
@@ -341,6 +353,56 @@ def _record_evidence(worker: Worker, record: dict) -> dict:
         **worker.evidence(),
         **{key: record[key] for key in ("model", "call", "layer", "kind", "name", "path", "tensor_layout")},
     }
+
+
+def _compare_kv_aliases(worker: Worker, side: str, emit) -> None:
+    """Compare every physical copy with the first copy in the SAME call.
+
+    This is independent of P/D or OFF/ON reference selection. In particular,
+    a conflicting OFF alias must not be hidden by selecting its first row.
+    """
+    torch = importlib.import_module("torch")
+    for record in worker.records:
+        if record["kind"] != "kv_consumed" or record["row_axis"] != 0:
+            continue
+        first, baseline_rows, alias_rows = {}, [], []
+        for row, position in enumerate(record["positions"]):
+            if position in first:
+                baseline_rows.append(first[position])
+                alias_rows.append(row)
+            else:
+                first[position] = row
+        if not alias_rows:
+            continue
+        detail = {**_record_evidence(worker, record), "archive": side}
+        try:
+            value = _load_tensor(worker, record)
+            baseline, actual = value[baseline_rows], value[alias_rows]
+            comparison = compare_tensor_values(baseline, actual)
+            _require(comparison.get("comparable", False), "KV aliases cannot be compared")
+            unequal = baseline != actual
+            if baseline.is_floating_point():
+                unequal &= ~(torch.isnan(baseline) & torch.isnan(actual))
+            different = unequal.reshape(len(alias_rows), -1).any(dim=1).tolist()
+            positions = [record["positions"][row] for row in alias_rows]
+            detail.update(
+                status="kv_aliases_different" if comparison["mismatched"] else "kv_aliases_equal",
+                positions=positions,
+                baseline_rows=baseline_rows,
+                alias_rows=alias_rows,
+                alias_comparison=comparison,
+                different_positions=sorted({p for p, d in zip(positions, different) if d}),
+                different_alias_rows=[row for row, d in zip(alias_rows, different) if d],
+            )
+            slots = record.get("physical_slots")
+            if slots is not None:
+                detail.update(
+                    baseline_physical_slots=[slots[row] for row in baseline_rows],
+                    alias_physical_slots=[slots[row] for row in alias_rows],
+                )
+            emit(detail)
+        except Exception as exc:
+            emit({**detail, "status": "invalid_tensor", "reason": str(exc)})
 
 
 def _compatible_context(left: dict, right: dict, position: int | None) -> bool:
@@ -539,6 +601,8 @@ def _compare_worker(reference: Worker, candidate: Worker, mode: str, emit) -> No
                     reference_sources=sources,
                     repeated_reference_choices=choices_count,
                 )
+                if "physical_slots" in record:
+                    detail["physical_slots"] = [record["physical_slots"][row] for row in ordering]
             else:
                 if mode == "pd-kv":
                     emit({**detail, "status": "incomparable_nonrow_kv"})
@@ -619,13 +683,43 @@ def analyze(
     counts: Counter = Counter()
     compared_rows = new_nonfinite = 0
     first_difference = worst_difference = first_output_difference = None
+    first_alias_conflict = None
     inverse = {value: key for key, value in request_map.items()}
     matched_workers = set()
     with (directory / "comparisons.jsonl").open("w", encoding="utf-8") as stream:
 
         def emit(item: dict) -> None:
             nonlocal compared_rows, new_nonfinite, first_difference, worst_difference, first_output_difference
+            nonlocal first_alias_conflict
             counts[item["status"]] += 1
+            if item["status"] == "kv_aliases_different" and first_alias_conflict is None:
+                index = item["alias_rows"].index(item["different_alias_rows"][0])
+                first_alias_conflict = {
+                    key: item[key]
+                    for key in (
+                        "archive",
+                        "request_id",
+                        "role",
+                        "tp_rank",
+                        "call",
+                        "layer",
+                        "name",
+                        "path",
+                        "worker_directory",
+                    )
+                }
+                first_alias_conflict.update(
+                    position=item["positions"][index],
+                    baseline_row=item["baseline_rows"][index],
+                    alias_row=item["alias_rows"][index],
+                    abs_max=item["alias_comparison"]["abs_diff"]["max"],
+                    relative_l2=item["alias_comparison"]["relative_l2"],
+                )
+                if "baseline_physical_slots" in item:
+                    first_alias_conflict.update(
+                        baseline_physical_slot=item["baseline_physical_slots"][index],
+                        alias_physical_slot=item["alias_physical_slots"][index],
+                    )
             if item["status"] == "sampled_outputs_different":
                 marker = {
                     key: item[key]
@@ -664,9 +758,14 @@ def analyze(
                         worst_difference = marker
             stream.write(json.dumps(item, ensure_ascii=False, allow_nan=False) + "\n")
 
+        checked_alias_workers = set()
         for side, archive in (("reference", reference), ("candidate", candidate)):
             for issue in archive.issues:
                 emit({"archive": side, **issue})
+            for worker in archive.workers.values():
+                if worker.directory not in checked_alias_workers:
+                    _compare_kv_aliases(worker, side, emit)
+                    checked_alias_workers.add(worker.directory)
         for key, worker in candidate.workers.items():
             role, request_id, rank = key
             if mode == "pd-kv" and role != "D":
@@ -696,6 +795,8 @@ def analyze(
         "additional_tensor",
         "sampled_outputs_equal",
         "sampled_outputs_different",
+        "kv_aliases_equal",
+        "kv_aliases_different",
     }
     issues = sum(value for key, value in counts.items() if key not in benign)
     comparisons = counts["equal"] + counts["different"]
@@ -736,6 +837,12 @@ def analyze(
             "first_difference": first_output_difference,
         },
         "worst_difference": worst_difference,
+        "kv_aliases": {
+            "scope": "Different physical copies of one logical token within the same worker/call/layer.",
+            "equal_tensors": counts["kv_aliases_equal"],
+            "different_tensors": counts["kv_aliases_different"],
+            "first_conflict": first_alias_conflict,
+        },
         "details": "comparisons.jsonl",
     }
     (directory / "report.json").write_text(

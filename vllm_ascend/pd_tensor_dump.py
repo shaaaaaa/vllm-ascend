@@ -85,7 +85,19 @@ class RequestArchive:
         self.flush()
         return call
 
-    def record(self, tensor, call, layer, kind, name, positions=None, mapping_only=False, tensor_layout="rank_local"):
+    def record(
+        self,
+        tensor,
+        call,
+        layer,
+        kind,
+        name,
+        positions=None,
+        mapping_only=False,
+        tensor_layout="rank_local",
+        *,
+        physical_slots=None,
+    ):
         value = cpu_tensor(tensor)
         context = call["context_token_ids"]
         if positions is not None:
@@ -93,6 +105,9 @@ class RequestArchive:
                 raise ValueError(f"Invalid tensor row mapping: {kind}/{name}")
             if any(p < 0 or p >= len(context) for p in positions):
                 raise ValueError("Tensor logical position is outside its recorded input context")
+        if physical_slots is not None:
+            if positions is None or len(physical_slots) != len(positions) or any(s < 0 for s in physical_slots):
+                raise ValueError("Invalid consumed KV physical slot mapping")
         relative = f"tensors/{self.metadata['records']:08d}.pt"
         temporary = (self.root / relative).with_suffix(".pt.tmp")
         torch.save(value, temporary)
@@ -114,6 +129,8 @@ class RequestArchive:
             mapping_only=mapping_only,
             tensor_layout="mapping" if mapping_only else tensor_layout,
         )
+        if physical_slots is not None:
+            record["physical_slots"] = physical_slots
         with (self.root / "index.jsonl").open("a", encoding="utf-8") as stream:
             stream.write(json.dumps(record, allow_nan=False) + "\n")
         self.metadata["records"] += 1
@@ -339,11 +356,33 @@ class PDTensorDump:
         finally:
             self.active = None
 
-    def record(self, entry, tensor, layer, kind, name, positions=None, mapping_only=False, layout="rank_local"):
+    def record(
+        self,
+        entry,
+        tensor,
+        layer,
+        kind,
+        name,
+        positions=None,
+        mapping_only=False,
+        layout="rank_local",
+        *,
+        physical_slots=None,
+    ):
         key = (layer, kind, name)
         if key in entry["observed"]:
             raise ValueError(f"Duplicate PD tensor observation {key}")
-        entry["archive"].record(tensor, entry["call"], layer, kind, name, positions, mapping_only, layout)
+        entry["archive"].record(
+            tensor,
+            entry["call"],
+            layer,
+            kind,
+            name,
+            positions,
+            mapping_only,
+            layout,
+            physical_slots=physical_slots,
+        )
         entry["observed"].add(key)
 
     def emit(self, tensor, layer, kind, name, meta, *, prefer_local=True, mapping_only=False):
@@ -477,6 +516,7 @@ class PDTensorDump:
         lo, hi = row_window(selected.shape[0], self.active["actual"], cp)
         if logical.shape != selected.shape:
             raise ValueError("Attention selection and indexer output shape differ")
+        self.emit(self.logical_topk, layer, "attention", "logical_topk", meta)
         for entry in self.active["entries"]:
             start, end = max(lo, entry["start"]), min(hi, entry["end"])
             end = max(start, end)
@@ -493,20 +533,38 @@ class PDTensorDump:
             slots = table[owners[:, None], blocks.clamp_max(max(0, table.shape[1] - 1))]
             slots = slots * block_size + physical.clamp_min(0) % block_size
             pairs = torch.unique(torch.stack((original[valid], slots[valid]), dim=1), dim=0, sorted=True)
+            alias_rows = int((pairs[1:, 0] == pairs[:-1, 0]).sum())
+            archive = entry["archive"]
+            if alias_rows and "first_kv_alias" not in archive.metadata:
+                archive.metadata["first_kv_alias"] = dict(
+                    call=entry["call"]["call"], layer=layer, extra_rows=alias_rows
+                )
+                archive.flush()
+                print(
+                    f"[PD_DUMP] {self.role} tp={self.rank_info['tp_rank']} "
+                    f"call={entry['call']['call']} layer={layer} kv_alias_rows={alias_rows}; saved all slots",
+                    flush=True,
+                )
             for key, name in (("key", "nope"), ("key_rope", "rope")):
                 cache = values[key]
                 flat = cache.reshape(-1, *cache.shape[2:])
                 if pairs.numel() and (pairs[:, 1].min() < 0 or pairs[:, 1].max() >= flat.shape[0]):
                     raise ValueError("Attention KV physical slot out of bounds")
                 rows = cpu_tensor(flat.index_select(0, pairs[:, 1].to(cache.device)))
-                keep = torch.ones(len(pairs), dtype=torch.bool)
-                if len(pairs) > 1:
-                    duplicate = pairs[1:, 0] == pairs[:-1, 0]
-                    if duplicate.any() and not torch.equal(rows[1:][duplicate], rows[:-1][duplicate]):
-                        raise ValueError("Logical KV has different contents in aliased physical slots")
-                    keep[1:] = ~duplicate
-                self.record(entry, rows[keep], layer, "kv_consumed", name, pairs[keep, 0].tolist(), layout="replicated")
-        self.emit(self.logical_topk, layer, "attention", "logical_topk", meta)
+                # Numerical disagreement is evidence, not a recorder failure.
+                # Keep every (logical token, physical slot), including NaNs and
+                # conflicting aliases, so offline analysis can compare them
+                # with P and with each other. Never choose one alias silently.
+                self.record(
+                    entry,
+                    rows,
+                    layer,
+                    "kv_consumed",
+                    name,
+                    pairs[:, 0].tolist(),
+                    layout="replicated",
+                    physical_slots=pairs[:, 1].tolist(),
+                )
 
     def kernel_factory(self, kind, tuple_result=False):
         def factory(original):

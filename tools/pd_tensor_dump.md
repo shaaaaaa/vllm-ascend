@@ -262,3 +262,16 @@ python3 tools/pd_tensor_analyze.py \
 OFF/ON 还报告 worker 接受的输出 token 序列及首个分叉位置。`first_observed_difference` 指最早观察到差异的计算位置，不直接等于已确认的根因。
 数值差异与覆盖完整性分开：`analysis_complete` 表示分析完整，不是精度 PASS；`accuracy_verdict` 明确为 `not_assessed`。
 缺 rank、缺文件、未完成、上下文不同会明确列出。先看 P→D KV，再结合 OFF/ON 的最早观察差异与后续误差放大判断位置。
+
+如果同一次 attention 把一个逻辑 token 映射到多个物理槽，探针保存所有槽的原始 KV，
+`kv_consumed` 的 `positions` 可以重复，`physical_slots` 与 tensor 行一一对应。
+每个请求、每个 worker 最多打印一次 `[PD_DUMP] ... kv_alias_rows=...; saved all slots`；
+这只表示存在多个槽，不表示它们内容一定不同。
+探针不因数值差异或 NaN 中止模型；越界、缺失映射等采集错误仍会报错。
+
+离线 `report.json` 的 `kv_aliases` 汇总同一逻辑 token 的多个副本是否相同，
+`first_conflict` 给出请求、TP rank、call、层、位置、物理槽和原始 tensor 文件。
+`comparisons.jsonl` 的 `kv_aliases_different` / `kv_aliases_equal` 包含完整差异与分布统计，
+两边相同位置的 NaN 作为相同非有限值报告，不误称内容差异。
+P→D 比较会核对 D 的每个副本；OFF/ON 也会独立检查 OFF 和 ON 各自的别名冲突，避免只选一个副本掩盖差异。
+发现冲突仍需结合逻辑 top-k、实际 sparse indices 和 P 端 KV 判断是映射、加载还是数据异常，不能直接归因于 Mooncake。

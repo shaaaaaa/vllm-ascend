@@ -315,11 +315,37 @@ def test_consumed_kv_invalid_mapping_fails_closed(module, tmp_path, invalid):
         probe.attention_kv(values, 0, meta)
 
 
-def test_consumed_kv_conflicting_logical_aliases_fail_closed(module, tmp_path):
+@pytest.mark.parametrize("values", [[4.0, 5.0], [4.0, 4.0], [float("nan"), float("nan")]])
+def test_consumed_kv_preserves_every_physical_alias_for_offline_analysis(module, tmp_path, values):
     probe, meta = begin_decode(module, tmp_path)
     probe.logical_topk[0] = torch.tensor([0, 0])
-    with pytest.raises(ValueError, match="aliased physical slots"):
-        probe.attention_kv(attention_inputs(), 0, meta)
+    inputs = attention_inputs()
+    inputs["key"].reshape(-1)[4:6] = torch.tensor(values)
+    probe.attention_kv(inputs, 0, meta)
+    archive = probe.archives["a"]
+    row = record_for(archive, "kv_consumed", "nope")
+    assert row["positions"] == [0, 0]
+    assert row["physical_slots"] == [4, 5]
+    torch.testing.assert_close(
+        value_for(archive, "kv_consumed", "nope").flatten(), torch.tensor(values), equal_nan=True
+    )
+    assert record_for(archive, "attention", "logical_topk")["positions"] == [1]
+    assert manifest(archive)["errors"] == []
+    # Numerical observations must not prevent the remaining forward/sampling.
+    fill_expected(probe, meta)
+    finish_forward(probe, sampled=[[31], [41]])
+    assert manifest(archive)["complete"]
+
+
+def test_consumed_kv_deduplicates_only_the_same_logical_physical_pair(module, tmp_path):
+    probe, meta = begin_decode(module, tmp_path)
+    probe.logical_topk[0] = torch.tensor([0, 0])
+    inputs = attention_inputs()
+    inputs["sparse_indices"][0] = torch.tensor([0, 0])
+    probe.attention_kv(inputs, 0, meta)
+    row = record_for(probe.archives["a"], "kv_consumed", "nope")
+    assert row["positions"] == [0]
+    assert row["physical_slots"] == [4]
 
 
 def test_indexer_kv_reads_history_by_request_table(module, tmp_path):

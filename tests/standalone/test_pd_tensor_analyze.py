@@ -202,6 +202,73 @@ def test_pd_same_collect_root_supports_indexer_and_repeated_full_prefix(tmp_path
     assert "not_consumed" not in report["counts"]
 
 
+def add_physical_aliases(directory, *, different=True, nonfinite=False):
+    record = json.loads((directory / "index.jsonl").read_text())
+    value = torch.load(directory / record["path"], weights_only=True)
+    # Two extra copies of token zero: first is equal, second can conflict.
+    value = torch.cat((value, value[:1], value[:1]), dim=0)
+    if different:
+        value[-1] += 7
+    if nonfinite:
+        value[0] = value[-2] = value[-1] = float("nan")
+    torch.save(value, directory / record["path"])
+    record["positions"] += [0, 0]
+    record["token_ids"] += record["token_ids"][:1] * 2
+    record["shape"] = list(value.shape)
+    record["physical_slots"] = list(range(100, 100 + len(value)))
+    write_records(directory, [record])
+
+
+@pytest.mark.parametrize("different,nonfinite", [(True, False), (False, False), (False, True)])
+def test_pd_analysis_compares_all_physical_copies_and_reports_aliases_once(tmp_path, different, nonfinite):
+    root = tmp_path / "collect"
+    make_worker(root)
+    destination = make_worker(root, role="D", kind="kv_consumed")
+    add_physical_aliases(destination, different=different, nonfinite=nonfinite)
+    report = analyzer.analyze([root], [root], mode="pd-kv", output=tmp_path / "report")
+    assert report["status"] == "analysis_complete"
+    assert report["accuracy_verdict"] == "not_assessed"
+    assert report["compared_rows"] == 7  # No conflicting copy was silently dropped.
+    aliases = report["kv_aliases"]
+    assert aliases["different_tensors"] == int(different)
+    assert aliases["equal_tensors"] == int(not different)
+    detail = next(item for item in details(tmp_path) if "alias_comparison" in item)
+    assert detail["alias_rows"] == [5, 6]
+    assert detail["baseline_physical_slots"] == [100, 100]
+    assert detail["alias_physical_slots"] == [105, 106]
+    if different:
+        assert aliases["first_conflict"]["alias_physical_slot"] == 106
+        assert detail["alias_comparison"]["mismatched"] == 2
+        assert report["counts"]["different"] == 1
+    else:
+        assert aliases["first_conflict"] is None
+    if nonfinite:
+        assert detail["alias_comparison"]["baseline"]["nonfinite"] == 4
+        assert report["new_nonfinite"] == 6
+
+
+def test_conflicting_off_alias_is_reported_even_when_first_copy_matches_on(tmp_path):
+    source = make_worker(tmp_path / "reference", role="D", kind="kv_consumed")
+    make_worker(tmp_path / "candidate", role="D", kind="kv_consumed")
+    add_physical_aliases(source)
+    report = run(tmp_path)
+    assert report["counts"]["equal"] == 1
+    assert report["kv_aliases"]["different_tensors"] == 1
+    assert report["kv_aliases"]["first_conflict"]["archive"] == "reference"
+
+
+@pytest.mark.parametrize("slots", [[-1, 2, 3, 4, 5], [1], "invalid"])
+def test_invalid_physical_slot_evidence_is_not_accepted(tmp_path, slots):
+    make_worker(tmp_path / "reference")
+    destination = make_worker(tmp_path / "candidate", role="D", kind="kv_consumed")
+    record = json.loads((destination / "index.jsonl").read_text())
+    record["physical_slots"] = slots
+    write_records(destination, [record])
+    report = run(tmp_path, mode="pd-kv")
+    assert report["status"] == "incomplete_or_incomparable"
+    assert report["counts"]["invalid_record"] >= 1
+
+
 @pytest.mark.parametrize("missing", [None, "D", "rank"])
 def test_four_host_collection_auto_matches_request_and_tp_with_idle_hosts(tmp_path, monkeypatch, missing):
     import pd_tensor_collect as collector
