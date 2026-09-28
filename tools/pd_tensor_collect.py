@@ -9,15 +9,17 @@ Example:
 
 The remote command only reads ``<repo>/pd-tensor-dump/<run>``. Successful
 collections live under ``<output>/hosts/<safe-host>/`` and are never replaced.
-Rerunning the same command skips successful hosts and retries failed hosts.
+Rerunning the same command skips successful hosts and retries failed/empty hosts.
+Hosts without this run's files are reported as empty; they need not handle a request.
 Interrupted downloads and extraction directories remain in ``partials/``.
 Add ``--analyze-pd`` to compare the collected P and D KV with local CPU PyTorch
-after every host has been collected successfully; reports go to ``report-pd/``.
+after collection (idle hosts may be empty); reports go to ``report-pd/``.
 """
 
 from __future__ import annotations
 
 import argparse
+import getpass
 import hashlib
 import json
 import os
@@ -39,6 +41,37 @@ COPY_BUFFER_BYTES = 1024 * 1024
 STDERR_TAIL_BYTES = 4096
 HOST_MAX_LENGTH = 255
 COMPONENT_MAX_LENGTH = 128
+MISSING_RUN_EXIT = 44
+MISSING_RUN_MARKER = "PD_TENSOR_RUN_ABSENT"
+# Shared with the cleanup tool. Resolve and validate the dedicated dump directory
+# remotely, including inside docker exec, before reading or removing its children.
+REMOTE_PATH_CHECK = """
+import pathlib, shutil, subprocess, sys
+repo = pathlib.Path(sys.argv[1]).resolve(strict=True)
+if not repo.is_dir():
+    raise ValueError('repository is not a directory')
+root = repo / 'pd-tensor-dump'
+def checked_directory(path):
+    if path.is_symlink():
+        raise ValueError('dump directory must not be a symlink: ' + str(path))
+    try:
+        path.stat()
+    except FileNotFoundError:
+        return False
+    if not path.is_dir() or path.resolve(strict=True) != path:
+        raise ValueError('invalid dump directory: ' + str(path))
+    return True
+"""
+REMOTE_COLLECT = (
+    REMOTE_PATH_CHECK
+    + f"""
+run = root / sys.argv[2]
+if not checked_directory(root) or not checked_directory(run):
+    print({MISSING_RUN_MARKER!r}, file=sys.stderr)
+    sys.exit({MISSING_RUN_EXIT})
+sys.exit(subprocess.call(['tar', '-C', str(run), '-cf', '-', '--', '.']))
+"""
+)
 WINDOWS_RESERVED_NAMES = frozenset(
     {"con", "prn", "aux", "nul"} | {f"com{i}" for i in range(1, 10)} | {f"lpt{i}" for i in range(1, 10)}
 )
@@ -106,18 +139,70 @@ def host_directory(target: str) -> str:
 
 
 def ssh_command(args: argparse.Namespace, target: str, remote_source: str) -> list[str]:
-    """Quote the remote argv once; leave SSH host verification unchanged."""
+    """Collect one run, distinguishing an absent run from transport failures."""
+    path = PurePosixPath(remote_source)
+    return remote_command(args, target, ["python3", "-c", REMOTE_COLLECT, str(path.parent.parent), path.name])
+
+
+def remote_command(args: argparse.Namespace, target: str, remote: list[str]) -> list[str]:
+    """Quote remote argv once; passwords never appear in argv or manifests."""
     ssh_target(target)
-    remote = ["tar", "-C", remote_source, "-cf", "-", "--", "."]
     if args.container:
         safe_component(args.container)
         remote = ["docker", "exec", "--", args.container, *remote]
-    command = ["ssh", "-T", "-o", "BatchMode=yes"]
+    use_password = target in getattr(args, "_passwords", {})
+    command = ["ssh", "-T", "-o", "BatchMode=no" if use_password else "BatchMode=yes"]
+    if use_password:
+        command.extend(["-o", "NumberOfPasswordPrompts=1", "-o", "StrictHostKeyChecking=yes"])
     if args.ssh_port is not None:
         command.extend(["-p", str(args.ssh_port)])
     if args.identity_file is not None:
         command.extend(["-i", str(args.identity_file.expanduser().resolve())])
-    return [*command, "--", target, shlex.join(remote)]
+    prefix = [args._sshpass, "-e"] if use_password else []
+    return [*prefix, *command, "--", target, shlex.join(remote)]
+
+
+def add_password_arguments(cli: argparse.ArgumentParser) -> None:
+    group = cli.add_mutually_exclusive_group()
+    group.add_argument("--password", action="store_true", help="Prompt once for the SSH password shared by all hosts")
+    group.add_argument(
+        "--password-env", metavar="NAME", help="Read a shared SSH password from this environment variable"
+    )
+    group.add_argument(
+        "--password-per-host", action="store_true", help="Prompt separately for each host's SSH password"
+    )
+
+
+@contextmanager
+def password_auth(args: argparse.Namespace) -> Iterator[None]:
+    """Optional sshpass authentication; only child SSH processes receive secrets."""
+    args._passwords = {}
+    try:
+        if args.password or args.password_env or args.password_per_host:
+            args._sshpass = shutil.which("sshpass")
+            if args._sshpass is None:
+                raise RuntimeError(
+                    "password login requires sshpass; install it (apt-get install sshpass / yum install sshpass)"
+                )
+            if args.password_per_host:
+                args._passwords = {host: getpass.getpass(f"SSH password for {host}: ") for host in args.hosts}
+            else:
+                password = os.environ.get(args.password_env) if args.password_env else getpass.getpass("SSH password: ")
+                if password is None:
+                    raise ValueError(f"password environment variable is not set: {args.password_env}")
+                args._passwords = dict.fromkeys(args.hosts, password)
+            if any(not password for password in args._passwords.values()):
+                raise ValueError("SSH password must not be empty")
+        yield
+    finally:
+        args._passwords.clear()
+
+
+def run_ssh(args: argparse.Namespace, target: str, command: list[str], **kwargs: Any) -> subprocess.CompletedProcess:
+    passwords = getattr(args, "_passwords", {})
+    if target in passwords:
+        kwargs["env"] = dict(os.environ, SSHPASS=passwords[target])
+    return subprocess.run(command, check=False, **kwargs)
 
 
 def member_path(member: tarfile.TarInfo) -> PurePosixPath:
@@ -178,8 +263,6 @@ def safe_extract(archive_path: Path, destination: Path) -> dict[str, int]:
                 raise ValueError(f"incomplete archive file: {member.name!r}")
             files += 1
             total_bytes += member.size
-    if not files:
-        raise ValueError("archive contains no regular files")
     return {"files": files, "bytes": total_bytes}
 
 
@@ -244,7 +327,7 @@ def load_manifest(root: Path, args: argparse.Namespace, remote_source: str) -> d
         expected_directory = f"hosts/{host_directory(target)}"
         if target in existing or host.get("directory") != expected_directory:
             raise ValueError("invalid or duplicate host directory in existing manifest")
-        if host.get("status") not in ("pending", "running", "success", "failed") or not isinstance(
+        if host.get("status") not in ("pending", "running", "success", "empty", "failed") or not isinstance(
             host.get("attempts"), list
         ):
             raise ValueError("invalid existing host status or attempts")
@@ -288,14 +371,37 @@ def collect_host(root: Path, args: argparse.Namespace, remote_source: str, host:
     host["status"] = "running"
     try:
         with os.fdopen(fd, "wb") as output, stderr_path.open("xb") as errors:
-            result = subprocess.run(ssh_command(args, target, remote_source), stdout=output, stderr=errors, check=False)
+            result = run_ssh(args, target, ssh_command(args, target, remote_source), stdout=output, stderr=errors)
         attempt["ssh_returncode"] = result.returncode
+        if (
+            result.returncode == MISSING_RUN_EXIT
+            and stderr_tail(stderr_path) == MISSING_RUN_MARKER
+            and archive_path.stat().st_size == 0
+        ):
+            attempt["status"] = host["status"] = "empty"
+            attempt["reason"] = host["reason"] = "run directory absent"
+            host.update(files=0, bytes=0)
+            host.pop("error", None)
+            archive_path.unlink()
+            attempt.pop("archive_path")
+            return
         if result.returncode:
             reason = stderr_tail(stderr_path)
             raise RuntimeError(f"SSH/tar exited {result.returncode}: {reason}")
         partial = Path(tempfile.mkdtemp(prefix=prefix, suffix=".extract.partial", dir=root / "partials"))
         attempt["partial_directory"] = partial.relative_to(root).as_posix()
         counts = safe_extract(archive_path, partial)
+        if not counts["files"]:
+            attempt.update(counts)
+            host.update(counts)
+            attempt["status"] = host["status"] = "empty"
+            attempt["reason"] = host["reason"] = "run contains no files"
+            host.pop("error", None)
+            # Keep the empty extraction in partials; do not publish it as a
+            # successful immutable download. A subsequent collect retries it.
+            archive_path.unlink()
+            attempt.pop("archive_path")
+            return
         if destination.exists() or destination.is_symlink():
             raise ValueError(f"refusing to overwrite existing host directory: {destination}")
         partial.rename(destination)
@@ -311,6 +417,7 @@ def collect_host(root: Path, args: argparse.Namespace, remote_source: str, host:
             attempt["cleanup_warning"] = str(error)
         attempt["status"] = host["status"] = "success"
         host.pop("error", None)
+        host.pop("reason", None)
     except (Exception, KeyboardInterrupt) as error:
         attempt["status"] = host["status"] = "failed"
         attempt["error"] = host["error"] = f"{type(error).__name__}: {error}"
@@ -350,9 +457,12 @@ def collect(args: argparse.Namespace) -> int:
                     continue
                 try:
                     collect_host(root, args, remote_source, host)
-                    print(
-                        f"[PD_TENSOR_COLLECT] {host['target']}: files={host['files']} bytes={host['bytes']}", flush=True
+                    detail = (
+                        f"empty ({host['reason']}); will retry on next collect"
+                        if host["status"] == "empty"
+                        else f"files={host['files']} bytes={host['bytes']}"
                     )
+                    print(f"[PD_TENSOR_COLLECT] {host['target']}: {detail}", flush=True)
                 except Exception as error:
                     host["status"] = "failed"
                     host["error"] = f"{type(error).__name__}: {error}"
@@ -361,10 +471,17 @@ def collect(args: argparse.Namespace) -> int:
                     write_json(root / "collection.json", manifest)
         finally:
             manifest["updated_at"] = timestamp()
-            manifest["complete"] = bool(manifest["hosts"]) and all(
-                host["status"] == "success" for host in manifest["hosts"]
+            manifest["complete"] = (
+                bool(manifest["hosts"])
+                and all(host["status"] in ("success", "empty") for host in manifest["hosts"])
+                and any(host["status"] == "success" for host in manifest["hosts"])
             )
+            manifest["has_data"] = any(host["status"] == "success" for host in manifest["hosts"])
             write_json(root / "collection.json", manifest)
+    if not manifest["has_data"]:
+        print(
+            "[PD_TENSOR_COLLECT] no dump data found on any host; check run-id and request completion", file=sys.stderr
+        )
     return 0 if manifest["complete"] else 1
 
 
@@ -388,8 +505,9 @@ def parser() -> argparse.ArgumentParser:
     cli.add_argument(
         "--analyze-pd",
         action="store_true",
-        help="After all hosts succeed, compare P to D KV in report-pd/; requires local CPU PyTorch",
+        help="Match P/D by request ID and TP rank across all hosts; idle hosts may be empty; requires CPU PyTorch",
     )
+    add_password_arguments(cli)
     return cli
 
 
@@ -418,7 +536,8 @@ def analyze_pd(root: Path) -> int:
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     try:
-        status = collect(args)
+        with password_auth(args):
+            status = collect(args)
         if status != 0 or not args.analyze_pd:
             return status
         return analyze_pd(args.output.expanduser().resolve())

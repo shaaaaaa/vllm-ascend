@@ -113,13 +113,11 @@ def test_remote_argv_quotes_paths_and_preserves_ssh_verification(tmp_path):
         "exec",
         "--",
         "inference-1",
-        "tar",
-        "-C",
-        repo + "/pd-tensor-dump/check-001",
-        "-cf",
-        "-",
-        "--",
-        ".",
+        "python3",
+        "-c",
+        collector.REMOTE_COLLECT,
+        repo,
+        "check-001",
     ]
     assert "StrictHostKeyChecking" not in " ".join(command)
     assert "UserKnownHostsFile" not in " ".join(command)
@@ -237,6 +235,152 @@ def test_empty_or_corrupt_archive_is_not_success(tmp_path, monkeypatch, payload)
     stub_ssh(monkeypatch, payload)
     assert collector.main(argv(tmp_path)) == 1
     assert read_manifest(tmp_path)["complete"] is False
+
+
+def test_idle_hosts_are_empty_and_retried_without_redownloading_success(tmp_path, monkeypatch):
+    calls = []
+    ready = False
+
+    def run(command, *, stdout, stderr, check):
+        host = command[-2]
+        calls.append(host)
+        if host == "absent" and not ready:
+            stderr.write(collector.MISSING_RUN_MARKER.encode())
+            return subprocess.CompletedProcess(command, collector.MISSING_RUN_EXIT)
+        stdout.write(tar_bytes([] if host == "empty" and not ready else [("x.pt", b"data")]))
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr(collector.subprocess, "run", run)
+    hosts = ("p-active", "empty", "d-active", "absent")
+    assert collector.main(argv(tmp_path, hosts)) == 0
+    manifest = read_manifest(tmp_path)
+    assert manifest["complete"]
+    assert [h["status"] for h in manifest["hosts"]] == ["success", "empty", "success", "empty"]
+    ready = True
+    assert collector.main(argv(tmp_path, hosts)) == 0
+    assert calls == [*hosts, "empty", "absent"]
+    assert all(h["status"] == "success" for h in read_manifest(tmp_path)["hosts"])
+
+
+@pytest.mark.parametrize(
+    "code,error,payload",
+    [(44, b"docker failed", b""), (255, b"PD_TENSOR_RUN_ABSENT", b""), (44, b"PD_TENSOR_RUN_ABSENT", b"partial")],
+)
+def test_missing_run_requires_unambiguous_remote_result(tmp_path, monkeypatch, code, error, payload):
+    stub_ssh(monkeypatch, payload, returncode=code, error=error)
+    assert collector.main(argv(tmp_path)) == 1
+    assert read_manifest(tmp_path)["hosts"][0]["status"] == "failed"
+
+
+def test_all_hosts_absent_is_not_success_and_does_not_analyze(tmp_path, monkeypatch):
+    stub_ssh(monkeypatch, b"", returncode=44, error=collector.MISSING_RUN_MARKER.encode())
+    monkeypatch.setitem(sys.modules, "pd_tensor_analyze", None)
+    assert collector.main([*argv(tmp_path, ("p1", "p2", "d1", "d2")), "--analyze-pd"]) == 1
+    assert not read_manifest(tmp_path)["complete"]
+    assert not read_manifest(tmp_path)["has_data"]
+
+
+@pytest.mark.parametrize("mode", ["missing_repo", "missing_root", "missing_run", "not_directory"])
+def test_real_remote_probe_distinguishes_missing_run_from_invalid_repository(tmp_path, mode):
+    repo = tmp_path / "repository"
+    if mode != "missing_repo":
+        repo.mkdir()
+    if mode in ("missing_run", "not_directory"):
+        (repo / "pd-tensor-dump").mkdir()
+    if mode == "not_directory":
+        (repo / "pd-tensor-dump/run").write_text("invalid")
+    result = subprocess.run([sys.executable, "-c", collector.REMOTE_COLLECT, str(repo), "run"], capture_output=True)
+    if mode in ("missing_root", "missing_run"):
+        assert result.returncode == collector.MISSING_RUN_EXIT
+        assert result.stderr.decode().strip() == collector.MISSING_RUN_MARKER
+        assert not result.stdout
+    else:
+        assert result.returncode != 0
+        assert collector.MISSING_RUN_MARKER.encode() not in result.stderr
+
+
+def test_real_remote_probe_streams_tar_into_safe_extractor(tmp_path):
+    if collector.shutil.which("tar") is None:
+        pytest.skip("tar unavailable")
+    repo = tmp_path / "repo with spaces"
+    run = repo / "pd-tensor-dump/run/P/request/worker"
+    run.mkdir(parents=True)
+    (run / "tensor.pt").write_bytes(b"inert payload")
+    result = subprocess.run([sys.executable, "-c", collector.REMOTE_COLLECT, str(repo), "run"], capture_output=True)
+    assert result.returncode == 0, result.stderr
+    archive = tmp_path / "archive.tar"
+    archive.write_bytes(result.stdout)
+    destination = tmp_path / "extract"
+    destination.mkdir()
+    counts = collector.safe_extract(archive, destination)
+    assert counts == {"files": 1, "bytes": len(b"inert payload")}
+    assert (destination / "P/request/worker/tensor.pt").read_bytes() == b"inert payload"
+
+
+@pytest.mark.parametrize("value", [None, ""])
+def test_password_env_missing_or_empty_prevents_collection(tmp_path, monkeypatch, value):
+    monkeypatch.setattr(collector.shutil, "which", lambda _: "sshpass")
+    if value is None:
+        monkeypatch.delenv("TEST_PD_PASSWORD", raising=False)
+    else:
+        monkeypatch.setenv("TEST_PD_PASSWORD", value)
+    assert collector.main([*argv(tmp_path), "--password-env", "TEST_PD_PASSWORD"]) == 1
+    assert not (tmp_path / "collected").exists()
+
+
+@pytest.mark.parametrize("mode", ["prompt", "environment", "per_host"])
+def test_password_auth_not_in_command_output_or_manifest(tmp_path, monkeypatch, capsys, mode):
+    secret = "test-only-secret-with-$-and-quotes'"
+    monkeypatch.setattr(collector.shutil, "which", lambda _: "/usr/bin/sshpass")
+    prompts = []
+
+    def prompt(message):
+        prompts.append(message)
+        return secret
+
+    monkeypatch.setattr(collector.getpass, "getpass", prompt)
+    monkeypatch.setenv("TEST_PD_PASSWORD", secret)
+    flags = {
+        "prompt": ["--password"],
+        "environment": ["--password-env", "TEST_PD_PASSWORD"],
+        "per_host": ["--password-per-host"],
+    }[mode]
+    commands = []
+
+    def run(command, *, stdout, stderr, check, env):
+        commands.append(command)
+        assert command[:2] == ["/usr/bin/sshpass", "-e"]
+        assert "BatchMode=no" in command and "StrictHostKeyChecking=yes" in command
+        assert secret not in " ".join(command)
+        assert env["SSHPASS"] == secret
+        stdout.write(tar_bytes([("x.pt", b"x")]))
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr(collector.subprocess, "run", run)
+    assert collector.main([*argv(tmp_path, ("one", "two")), *flags]) == 0
+    assert len(commands) == 2
+    assert len(prompts) == {"prompt": 1, "environment": 0, "per_host": 2}[mode]
+    assert secret not in json.dumps(read_manifest(tmp_path))
+    captured = capsys.readouterr()
+    assert secret not in captured.out + captured.err
+    assert "SSHPASS" not in collector.os.environ
+
+
+def test_password_requires_dependency_before_prompt_or_network(tmp_path, monkeypatch):
+    monkeypatch.setattr(collector.shutil, "which", lambda _: None)
+    monkeypatch.setattr(collector.getpass, "getpass", lambda _: pytest.fail("unexpected password prompt"))
+    assert collector.main([*argv(tmp_path), "--password"]) == 1
+    assert not (tmp_path / "collected").exists()
+
+
+def test_password_state_is_cleared_after_error(tmp_path, monkeypatch):
+    monkeypatch.setattr(collector.shutil, "which", lambda _: "sshpass")
+    monkeypatch.setenv("TEST_PD_PASSWORD", "fake-secret")
+    args = collector.parser().parse_args([*argv(tmp_path), "--password-env", "TEST_PD_PASSWORD"])
+    with pytest.raises(RuntimeError, match="test failure"), collector.password_auth(args):
+        assert args._passwords
+        raise RuntimeError("test failure")
+    assert args._passwords == {}
 
 
 def test_transport_exception_is_recorded_and_download_retained(tmp_path, monkeypatch):

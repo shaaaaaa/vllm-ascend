@@ -173,10 +173,47 @@ python3 tools/pd_tensor_collect.py \
 ```
 
 使用系统 SSH 的密钥/配置和主机校验；可传 `--ssh-port` 和 `--identity-file`。
+四个 IP 直接一起传入，不用先判断哪个 P/哪个 D 接到了请求，也不需要指定机器配对关系。
+脚本从 manifest 识别 P/D，按外部 request ID 和 TP rank 自动匹配，允许 P/D 位于不同 DP。
+没有本轮目录或目录为空的机器标为 `empty`，下次收集会重试；SSH/容器/权限错误、损坏文件仍报错。
+所有机器都没有数据时返回失败；只有 P 或只有 D、缺 TP rank、重复请求记录时，分析报告明确标为不完整。
+
+密码登录在执行脚本的机器上安装 `sshpass`（Debian/Ubuntu：`apt-get install sshpass`；RPM 系：`yum install sshpass`），然后给命令追加：
+
+```bash
+--password
+```
+
+它会隐藏输入，一次输入供四台机器使用。不同密码用 `--password-per-host` 逐台输入。
+自动化可用 `--password-env PD_SSH_PASSWORD` 从已有环境变量读取；密码不写入命令行、日志或 collection.json。
+密码模式要求机器已存在于 SSH known_hosts；第一次连接先用普通 `ssh user@host` 确认主机身份。
+远端（使用 `--container` 时为容器内）需要有 `python3` 和 `tar`。
+
 不会改远端文件。不同机器路径/容器不同时分别运行到不同本地目录，分析脚本支持多个根目录。
-`collection.json` 标明每台机器是否成功；失败返回非零状态，重跑同一命令仅重试未完成项。
-`--analyze-pd` 在成功拉取四机后自动分析 P→D KV，报告写到 `collected-case-on/report-pd`，执行端需要 CPU PyTorch。
+`collection.json` 标明每台机器的状态；失败返回非零状态，重跑同一命令仅重试未完成/空机器。
+`--analyze-pd` 在四机收集完成（允许部分机器为空）后自动分析 P→D KV，报告写到 `collected-case-on/report-pd`，执行端需要 CPU PyTorch。
 只拉文件时去掉该参数，不需要 PyTorch；文件已拉取后加回该参数也不会重复下载。
+
+### 清理四机 dump，复用 template 的目录
+
+等本轮请求结束并收集完成后执行。停止发送请求期间清理，不要与正在写盘的抓取或收集并发：
+
+```bash
+python3 tools/pd_tensor_cleanup.py \
+  --hosts root@7.150.4.174 root@7.150.5.55 root@7.150.5.81 root@7.150.1.46 \
+  --repo-path /workspace/sqh/vllm-ascend \
+  --run-id case-on \
+  --password
+```
+
+与 collect 使用相同的 `--container`、`--ssh-port`、`--identity-file` 和密码选项。
+这会删除四台机器的 `<repo-path>/pd-tensor-dump/case-on`；不存在的目录直接跳过。
+保留 dump 父目录、其他 run、模型、Mooncake 数据和本地已收集文件。
+若要清空整个 dump 目录，把 `--run-id case-on` 替换为 `--all-runs`。
+可追加 `--dry-run` 查看删除范围而不删除。每台机器各输出一行结果，有失败会返回非零状态并继续尝试其他机器。
+
+下一轮继续使用 template 中相同的 `case-on`，新请求会重新创建远端目录。
+**本地 `--output` 每轮换新目录**（如 `./collected-case-on-02`），避免 collector 复用上一轮已成功下载的文件。
 
 ## 4. 不需要 OFF：先检查 P → D 的 KV
 

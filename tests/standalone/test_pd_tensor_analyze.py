@@ -2,9 +2,11 @@
 """CPU tests for real PD raw-tensor analysis; run with --noconftest."""
 
 import importlib.util
+import io
 import json
 import subprocess
 import sys
+import tarfile
 from pathlib import Path
 from urllib.parse import quote
 
@@ -198,6 +200,77 @@ def test_pd_same_collect_root_supports_indexer_and_repeated_full_prefix(tmp_path
     assert report["compared_rows"] == 5
     assert details(tmp_path)[0]["repeated_reference_choices"] == 3
     assert "not_consumed" not in report["counts"]
+
+
+@pytest.mark.parametrize("missing", [None, "D", "rank"])
+def test_four_host_collection_auto_matches_request_and_tp_with_idle_hosts(tmp_path, monkeypatch, missing):
+    import pd_tensor_collect as collector
+
+    payloads = {}
+    # Distinct DP and host identities: P/D must match by external request and TP.
+    for host, role, dp in (("p-used", "P", 0), ("d-used", "D", 1)):
+        root = tmp_path / "remote" / host
+        if role == "D" and missing == "D":
+            continue
+        for rank in range(2):
+            if role == "D" and rank == 1 and missing == "rank":
+                continue
+            for request in ("req/one", "req/two"):
+                make_worker(
+                    root,
+                    role=role,
+                    dp=dp,
+                    tp=2,
+                    rank=rank,
+                    request=request,
+                    name=f"{host}-rank{rank}",
+                    kind="kv_current" if role == "P" else "kv_consumed",
+                    delta=float(rank),
+                    batches=[[0, 1], [2, 3, 4]] if role == "P" else [[0, 1, 2, 3, 4]],
+                )
+        stream = io.BytesIO()
+        with tarfile.open(fileobj=stream, mode="w") as archive:
+            archive.add(root, arcname=".")
+        payloads[host] = stream.getvalue()
+
+    def run_ssh(command, *, stdout, stderr, check):
+        host = command[-2]
+        if host not in payloads:
+            stderr.write(collector.MISSING_RUN_MARKER.encode())
+            return subprocess.CompletedProcess(command, collector.MISSING_RUN_EXIT)
+        stdout.write(payloads[host])
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr(collector.subprocess, "run", run_ssh)
+    monkeypatch.setitem(sys.modules, "pd_tensor_analyze", analyzer)
+    output = tmp_path / "collected"
+    status = collector.main(
+        [
+            "--hosts",
+            "p-used",
+            "p-idle",
+            "d-idle",
+            "d-used",
+            "--repo-path",
+            "/workspace/repo",
+            "--run-id",
+            "case-on",
+            "--output",
+            str(output),
+            "--analyze-pd",
+        ]
+    )
+    report = read(output / "report-pd/report.json")
+    assert read(output / "collection.json")["complete"]
+    if missing:
+        assert status == 2
+        assert report["status"] == "incomplete_or_incomparable"
+        assert report["counts"]["missing_candidate_worker"] > 0
+    else:
+        assert status == 0
+        assert report["status"] == "analysis_complete"
+        assert report["compared_rows"] == 20
+        assert report["counts"].get("different", 0) == 0
 
 
 def test_request_ids_require_explicit_mapping(tmp_path):
