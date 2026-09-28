@@ -659,11 +659,17 @@ def parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Match P/D by request ID and TP rank across all hosts; idle hosts may be empty; requires CPU PyTorch",
     )
+    cli.add_argument(
+        "--analysis-workers",
+        type=int,
+        default=16,
+        help="Concurrent local analysis threads across ranks and layers (default: 16); use 1 for serial analysis",
+    )
     add_password_arguments(cli)
     return cli
 
 
-def analyze_pd(root: Path) -> int:
+def analyze_pd(root: Path, workers: int = 16) -> int:
     """Load the optional tensor dependencies only for an explicit analysis."""
     output = root / "report-pd"
     try:
@@ -671,7 +677,7 @@ def analyze_pd(root: Path) -> int:
         started = time.monotonic()
         from pd_tensor_analyze import analyze
 
-        report = analyze([root], [root], mode="pd-kv", output=output)
+        report = analyze([root], [root], mode="pd-kv", output=output, workers=workers)
         print(f"[PD_TENSOR_COLLECT] local analysis finished in {time.monotonic() - started:.1f}s", flush=True)
         status = report["status"]
         summary = {
@@ -691,11 +697,13 @@ def analyze_pd(root: Path) -> int:
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     try:
+        if args.analysis_workers < 1:
+            raise ValueError("--analysis-workers must be a positive integer")
         with password_auth(args):
             status = collect(args)
         if status != 0 or not args.analyze_pd:
             return status
-        return analyze_pd(args.output.expanduser().resolve())
+        return analyze_pd(args.output.expanduser().resolve(), workers=args.analysis_workers)
     except KeyboardInterrupt:
         print("[PD_TENSOR_COLLECT] interrupted; partial downloads retained", file=sys.stderr)
         return 130

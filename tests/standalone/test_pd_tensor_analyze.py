@@ -7,6 +7,7 @@ import json
 import subprocess
 import sys
 import tarfile
+import threading
 from pathlib import Path
 from urllib.parse import quote
 
@@ -348,6 +349,251 @@ def run(tmp_path, *, mode="off-on", request_map=None):
 
 def details(tmp_path):
     return [json.loads(line) for line in (tmp_path / "report" / "comparisons.jsonl").read_text().splitlines()]
+
+
+def add_rejection_fixture(directory):
+    records = read_records(directory)
+    call = read(directory / "calls/0.json")
+    call["rejection"] = {"mode": "greedy", "num_draft_tokens": 1, "placeholder_token_id": -1, "draft_positions": [4]}
+    for name, value in {
+        "draft_token_ids": torch.tensor([1]),
+        "target_logits": torch.tensor([[0.0, 1.0, -1.0]]),
+        "bonus_token_ids": torch.tensor([2]),
+        "sampler_output": torch.tensor([1, 2]),
+        "kernel_output": torch.tensor([1, 2]),
+    }.items():
+        record = {
+            **records[0],
+            "layer": -1,
+            "kind": "rejection",
+            "name": name,
+            "path": f"tensors/rejection-{name}.pt",
+            "shape": list(value.shape),
+            "dtype": str(value.dtype),
+            "row_axis": None,
+            "positions": None,
+            "token_ids": None,
+        }
+        record.pop("physical_slots", None)
+        records.append(record)
+        call["expected"].append({"layer": -1, "kind": "rejection", "name": name})
+        torch.save(value, directory / record["path"])
+    write(directory / "calls/0.json", call)
+    write_records(directory, records)
+    manifest = read(directory / "manifest.json")
+    manifest["records"] = len(records)
+    write(directory / "manifest.json", manifest)
+
+
+@pytest.mark.parametrize("mode", ["off-on", "pd-kv"])
+@pytest.mark.parametrize("workers", [2, 4])
+def test_parallel_reports_match_serial_bytes_including_aliases_mtp_and_rejection(tmp_path, mode, workers):
+    root = tmp_path / "dumps"
+    for request, model in (("first", "main"), ("second", "mtp")):
+        for rank in range(2):
+            for side in ("reference", "candidate"):
+                directory = make_worker(
+                    root / side,
+                    role="P" if side == "reference" and mode == "pd-kv" else "D",
+                    request=request,
+                    tp=2,
+                    rank=rank,
+                    model=model,
+                    kind="kv_current" if side == "reference" and mode == "pd-kv" else "kv_consumed",
+                    phase="prefill" if side == "reference" else "decode",
+                    delta=0.5 if side == "candidate" else 0.0,
+                )
+                if side == "candidate":
+                    add_physical_aliases(directory)
+                if model == "main":
+                    add_rejection_fixture(directory)
+    reports = []
+    for parallelism in (1, workers):
+        destination = tmp_path / f"report-{parallelism}"
+        report = analyzer.analyze(
+            [root / "reference"], [root / "candidate"], mode=mode, output=destination, workers=parallelism
+        )
+        assert report["rejection_sampling"]["workers"]
+        assert report["counts"]["different"] > 0
+        assert report["kv_aliases"]["different_tensors"] > 0
+        assert report["first_difference_by_model"].keys() == {"main", "mtp"}
+        assert not list(destination.glob(".analysis-*"))
+        reports.append(destination)
+    for name in ("report.json", "comparisons.jsonl", "rejection.jsonl"):
+        assert (reports[0] / name).read_bytes() == (reports[1] / name).read_bytes()
+
+
+def test_parallel_comparisons_actually_overlap_and_preserve_input_order(tmp_path):
+    barrier = threading.Barrier(2, timeout=10)
+    first_written = threading.Event()
+    thread_ids = set()
+    emitted = []
+
+    def compare(value, emit):
+        thread_ids.add(threading.get_ident())
+        assert torch.get_num_threads() == 1
+        barrier.wait()
+        if value == 0:
+            assert first_written.wait(10)
+        emit({"value": value})
+        if value == 1:
+            first_written.set()
+
+    original_threads = torch.get_num_threads()
+    with analyzer._analysis_pool(2) as pool:
+        analyzer._run_comparison_jobs([(compare, (0,)), (compare, (1,))], pool, tmp_path, 2, emitted.append)
+    assert emitted == [{"value": 0}, {"value": 1}]
+    assert len(thread_ids) == 2
+    assert torch.get_num_threads() == original_threads
+    assert not list(tmp_path.glob(".analysis-*"))
+
+
+def add_layers_fixture(directory, layers):
+    original = read_records(directory)
+    records = []
+    for record in original:
+        value = torch.load(directory / record["path"], weights_only=True)
+        for layer in range(layers):
+            path = f"tensors/call-{record['call']}-layer-{layer}.pt"
+            torch.save(value + layer, directory / path)
+            records.append({**record, "layer": layer, "path": path})
+    write_records(directory, records)
+    manifest = read(directory / "manifest.json")
+    manifest.update(records=len(records), num_layers=layers)
+    write(directory / "manifest.json", manifest)
+    for number in manifest["calls"]:
+        call = read(directory / "calls" / f"{number}.json")
+        call["expected"] = [
+            {key: record[key] for key in ("layer", "kind", "name")} for record in records if record["call"] == number
+        ]
+        write(directory / "calls" / f"{number}.json", call)
+
+
+@pytest.mark.parametrize("mode", ["off-on", "pd-kv"])
+@pytest.mark.parametrize("invalid_tensor", [False, True])
+def test_multiple_layers_and_calls_keep_serial_detail_order(tmp_path, mode, invalid_tensor):
+    source = make_worker(tmp_path / "reference", batches=[[0, 1, 2], [0, 1, 2, 3, 4]])
+    destination = make_worker(
+        tmp_path / "candidate",
+        role="D" if mode == "pd-kv" else "P",
+        kind="kv_consumed" if mode == "pd-kv" else "kv_current",
+        batches=[[0, 1], [0, 1, 2, 3]],
+        delta=0.5,
+    )
+    add_layers_fixture(source, 4)
+    add_layers_fixture(destination, 4)
+    if invalid_tensor:
+        (destination / "tensors/call-0-layer-2.pt").write_bytes(b"invalid tensor")
+    for workers in (1, 4):
+        analyzer.analyze(
+            [tmp_path / "reference"],
+            [tmp_path / "candidate"],
+            mode=mode,
+            output=tmp_path / f"report-{workers}",
+            workers=workers,
+        )
+    for name in ("report.json", "comparisons.jsonl", "rejection.jsonl"):
+        assert (tmp_path / "report-1" / name).read_bytes() == (tmp_path / "report-4" / name).read_bytes()
+
+
+def test_one_rank_runs_multiple_layers_concurrently(tmp_path, monkeypatch):
+    for name in ("reference", "candidate"):
+        directory = make_worker(tmp_path / name)
+        add_layers_fixture(directory, 4)
+    barrier = threading.Barrier(4, timeout=10)
+    thread_ids = set()
+    layers = set()
+    original = analyzer._compare_worker
+
+    def compare(reference, candidate, mode, emit):
+        layer = {record["layer"] for record in candidate.records}
+        assert len(layer) == 1
+        thread_ids.add(threading.get_ident())
+        layers.update(layer)
+        barrier.wait()
+        original(reference, candidate, mode, emit)
+
+    monkeypatch.setattr(analyzer, "_compare_worker", compare)
+    monkeypatch.setattr(analyzer.os, "cpu_count", lambda: 4)
+    report = analyzer.analyze(
+        [tmp_path / "reference"],
+        [tmp_path / "candidate"],
+        mode="off-on",
+        output=tmp_path / "report",
+        workers=4,
+    )
+    assert report["status"] == "analysis_complete"
+    assert report["counts"]["equal"] == 4
+    assert len(thread_ids) == 4 and layers == {0, 1, 2, 3}
+
+
+def test_parallel_failure_joins_writers_cleans_files_and_restores_torch_threads(tmp_path):
+    barrier = threading.Barrier(2, timeout=10)
+    finished = threading.Event()
+
+    def compare(value, emit):
+        barrier.wait()
+        if value == 0:
+            raise ValueError("broken comparison")
+        emit({"value": value})
+        finished.set()
+
+    original_threads = torch.get_num_threads()
+    with pytest.raises(ValueError, match="broken comparison"), analyzer._analysis_pool(2) as pool:
+        analyzer._run_comparison_jobs([(compare, (0,)), (compare, (1,))], pool, tmp_path, 2, lambda _: None)
+    assert finished.is_set()
+    assert torch.get_num_threads() == original_threads
+    assert not list(tmp_path.glob(".analysis-*"))
+
+
+@pytest.mark.parametrize("workers", [0, -1, True, 1.5])
+def test_invalid_analysis_worker_count_is_rejected(tmp_path, workers):
+    with pytest.raises(ValueError, match="positive integer"):
+        analyzer.analyze([], [], mode="pd-kv", output=tmp_path / "report", workers=workers)
+    assert not (tmp_path / "report").exists()
+
+
+def test_pd_same_archive_metadata_is_loaded_once(tmp_path, monkeypatch):
+    root = tmp_path / "collect"
+    make_worker(root)
+    make_worker(root, role="D", kind="kv_consumed")
+    original = analyzer.load_archive
+    calls = []
+
+    def load(roots):
+        calls.append(roots)
+        return original(roots)
+
+    monkeypatch.setattr(analyzer, "load_archive", load)
+    report = analyzer.analyze([root], [root], mode="pd-kv", output=tmp_path / "report", workers=2)
+    assert report["status"] == "analysis_complete"
+    assert len(calls) == 1
+
+
+def test_long_prompt_alignment_compares_call_context_once_across_layers(tmp_path):
+    source = make_worker(tmp_path / "reference", context=list(range(4096)))
+    destination = make_worker(tmp_path / "candidate", context=list(range(4096)))
+    source_worker = next(iter(analyzer.load_archive([source]).workers.values()))
+    candidate_worker = next(iter(analyzer.load_archive([destination]).workers.values()))
+    visits = []
+
+    class ContextTokens(list):
+        def __iter__(self):
+            visits.append(len(self))
+            return super().__iter__()
+
+        def __getitem__(self, key):
+            assert not isinstance(key, slice), "per-token prefix slicing regressed"
+            return super().__getitem__(key)
+
+    for worker in (source_worker, candidate_worker):
+        call = worker.calls[0]
+        call["context_token_ids"] = ContextTokens(call["context_token_ids"])
+        worker.records = [{**worker.records[0], "layer": layer} for layer in range(3)]
+    rows = []
+    analyzer._compare_worker(source_worker, candidate_worker, "off-on", rows.append)
+    assert [row["status"] for row in rows] == ["equal"] * 3
+    assert visits == [4096, 4096]
 
 
 def test_off_on_aligns_logical_rows_across_chunks_with_full_statistics(tmp_path):
@@ -730,6 +976,8 @@ def test_cli_writes_report_and_zero_does_not_claim_accuracy(tmp_path):
             str(tmp_path / "candidate"),
             "--output",
             str(tmp_path / "report"),
+            "--workers",
+            "2",
         ],
         check=False,
         capture_output=True,

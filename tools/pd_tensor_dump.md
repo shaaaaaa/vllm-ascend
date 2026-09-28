@@ -265,6 +265,16 @@ Linux 使用 `/bin/sh` 回调，Windows 使用当前 Python；密码只保存在
 `--analyze-pd` 在四机收集完成（允许部分机器为空）后自动分析 P→D KV，报告写到 `collected-case-on/report-pd`，执行端需要 CPU PyTorch。
 只拉文件时去掉该参数，不需要 PyTorch；文件已拉取后加回该参数也不会重复下载。
 
+离线比较默认使用最多 16 个线程（不超过本机逻辑 CPU 数），按“请求 × TP rank × 模型 × 层”并发；
+同一个 rank 的不同层可以同时分析，TP4 也能使用 16 或 32 个线程。
+KV 多物理槽检查按层并发，MTP 接受/拒绝分析按 worker 并发。collect 可追加 `--analysis-workers 32`
+调整并发数，设为 `1` 即串行。并发度受独立任务数限制；增加线程会增加同时读盘和
+tensor 内存的需求。每个分析线程内部的 PyTorch 数值计算限制为 1 个 CPU 线程。
+元数据读取和最终汇总保持串行；同一份 PD 收集目录只解析一次。
+比较结果暂存到报告目录下的临时文件，全部比较完成后按原始串行顺序归并并删除临时文件，
+避免把所有中间结果堆在内存中；
+串行和并发的匹配规则、数值统计及首个差异选择一致。日志显示阶段和已汇总任务数量。
+
 ### 清理四机 dump，复用 template 的目录
 
 等本轮请求结束并收集完成后执行。停止发送请求期间清理，不要与正在写盘的抓取或收集并发：
@@ -295,8 +305,12 @@ python3 tools/pd_tensor_analyze.py \
   --mode pd-kv \
   --reference ./collected-case-on \
   --candidate ./collected-case-on \
-  --output ./report-pd
+  --output ./report-pd \
+  --workers 16
 ```
+
+这里的 `--workers` 对应 collect 的 `--analysis-workers`。已收集的文件可直接重新分析，
+无需访问远端或重新抓取；`--workers 1` 可用于与并发结果对照。
 
 按外部 request ID、相同 TP rank、层和逻辑 token 位置匹配。P/D 的 DP rank 可以不同。
 比较 P 算出的 prompt KV 与 D 实际消费的对应 KV，以及 indexer KV；不拿 P 的 prefill 输出与 D 的不同 token 的 decode 输出硬比。

@@ -13,15 +13,24 @@ TP ranks remain separate; DP rank numbers need not agree between P and D.
 Numerical results describe differences, never an automatic accuracy verdict.
 OFF/ON also compares accepted sampled outputs for the same request prompt and
 TP rank. PD KV mode deliberately does not compare outputs/logits across phases.
+Numerical comparisons run across ranks and layers with up to 16 threads by
+default. Use --workers to adjust concurrency; 1 runs serially. Final reports
+retain serial ordering and comparison semantics.
 """
 
 from __future__ import annotations
 
 import argparse
+import heapq
 import importlib
 import json
+import os
+import sys
+import tempfile
 from collections import Counter, defaultdict
-from dataclasses import dataclass, field
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from contextlib import ExitStack, contextmanager, suppress
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -29,6 +38,7 @@ from layerwise_prefill_correctness_compare import compare_tensor_values
 
 IDENTITY_FIELDS = ("model", "layer", "kind", "name")
 PD_KINDS = {"kv_consumed": "kv_current", "kv_indexer": "kv_indexer"}
+DEFAULT_ANALYSIS_WORKERS = 16
 
 
 def _require(condition: bool, message: str) -> None:
@@ -630,39 +640,47 @@ def _rejection_decisions(worker: Worker):
             yield {**detail, "status": "incomplete", "reason": str(exc)}
 
 
-def _write_rejection_report(reference: Archive, candidate: Archive, directory: Path) -> dict:
+def _rejection_worker(worker: Worker) -> list[dict]:
+    return list(_rejection_decisions(worker))
+
+
+def _write_rejection_report(reference: Archive, candidate: Archive, directory: Path, pool=None) -> dict:
     summaries, seen = [], set()
-    with (directory / "rejection.jsonl").open("w", encoding="utf-8") as stream:
-        for side, archive in (("reference", reference), ("candidate", candidate)):
-            for worker in archive.workers.values():
-                if worker.directory in seen:
-                    continue
+    workers = []
+    for side, archive in (("reference", reference), ("candidate", candidate)):
+        for worker in archive.workers.values():
+            if worker.directory not in seen:
+                workers.append((side, worker))
                 seen.add(worker.directory)
-                decisions = list(_rejection_decisions(worker))
-                if not decisions:
-                    continue
-                for item in decisions:
-                    stream.write(json.dumps({"archive": side, **item}, ensure_ascii=False, allow_nan=False) + "\n")
-                counted = [d for d in decisions if d.get("counted_for_acceptance")]
-                proposed = sum(d["proposed_drafts"] for d in counted)
-                accepted = sum(d["accepted_drafts"] for d in counted)
-                summaries.append(
-                    {
-                        "archive": side,
-                        **worker.evidence(),
-                        "calls": len(decisions),
-                        "incomplete_calls": sum(d["status"] != "recorded" for d in decisions),
-                        "proposed_drafts": proposed,
-                        "accepted_drafts": accepted,
-                        "acceptance_rate": accepted / proposed if proposed else None,
-                        "greedy_inconsistent_calls": sum(
-                            d.get("greedy_decision_consistent") is False for d in decisions
-                        ),
-                        "kernel_output_mismatch_calls": sum(
-                            d.get("kernel_output_matches_sampler") is False for d in decisions
-                        ),
-                    }
-                )
+    results = (
+        map(_rejection_worker, (worker for _, worker in workers))
+        if pool is None
+        else pool.map(_rejection_worker, (worker for _, worker in workers))
+    )
+    with (directory / "rejection.jsonl").open("w", encoding="utf-8") as stream:
+        for (side, worker), decisions in zip(workers, results):
+            if not decisions:
+                continue
+            for item in decisions:
+                stream.write(json.dumps({"archive": side, **item}, ensure_ascii=False, allow_nan=False) + "\n")
+            counted = [d for d in decisions if d.get("counted_for_acceptance")]
+            proposed = sum(d["proposed_drafts"] for d in counted)
+            accepted = sum(d["accepted_drafts"] for d in counted)
+            summaries.append(
+                {
+                    "archive": side,
+                    **worker.evidence(),
+                    "calls": len(decisions),
+                    "incomplete_calls": sum(d["status"] != "recorded" for d in decisions),
+                    "proposed_drafts": proposed,
+                    "accepted_drafts": accepted,
+                    "acceptance_rate": accepted / proposed if proposed else None,
+                    "greedy_inconsistent_calls": sum(d.get("greedy_decision_consistent") is False for d in decisions),
+                    "kernel_output_mismatch_calls": sum(
+                        d.get("kernel_output_matches_sampler") is False for d in decisions
+                    ),
+                }
+            )
     return {
         "scope": (
             "Per worker/request; TP replicas are not summed. Discarded prefill samples are excluded; "
@@ -757,6 +775,21 @@ def _capture_summary(archive):
 
 def _compare_worker(reference: Worker, candidate: Worker, mode: str, emit) -> None:
     torch = importlib.import_module("torch")
+    context_prefixes: dict[tuple[int, int], int] = {}
+
+    def compatible_row_context(reference_call: int, candidate_call: int, position: int) -> bool:
+        # Context is immutable within a call. Comparing its entire prefix for
+        # every token makes long-prompt alignment quadratic in prompt length.
+        key = (reference_call, candidate_call)
+        if key not in context_prefixes:
+            left, right = reference.calls[reference_call], candidate.calls[candidate_call]
+            common = -1
+            if left["context_complete"] and right["context_complete"]:
+                lhs, rhs = left["context_token_ids"], right["context_token_ids"]
+                common = next((i for i, (a, b) in enumerate(zip(lhs, rhs)) if a != b), min(len(lhs), len(rhs)))
+            context_prefixes[key] = common
+        return position < context_prefixes[key]
+
     for key in ("model_id", "num_layers", "tp_size"):
         if reference.manifest[key] != candidate.manifest[key]:
             emit(
@@ -818,7 +851,7 @@ def _compare_worker(reference: Worker, candidate: Worker, mode: str, emit) -> No
                         (index, ref, ref_row)
                         for index, ref, ref_row in options
                         if ref["token_ids"][ref_row] == token
-                        and _compatible_context(reference.calls[ref["call"]], call, position)
+                        and compatible_row_context(ref["call"], record["call"], position)
                     ]
                     if not choices:
                         status = "incomparable_context" if options else "missing_reference_tensor"
@@ -934,6 +967,162 @@ def _compare_worker(reference: Worker, candidate: Worker, mode: str, emit) -> No
             )
 
 
+def _emit_items(items, emit) -> None:
+    for item in items:
+        emit(item)
+
+
+def _compare_pair(reference, candidate, mode, emit) -> None:
+    if mode == "off-on":
+        _compare_sampled(reference, candidate, emit)
+    _compare_worker(reference, candidate, mode, emit)
+
+
+def _init_analysis_thread() -> None:
+    # Each Python worker owns one comparison. Nested OpenMP pools would
+    # otherwise multiply the concurrency and can make small tensors slower.
+    importlib.import_module("torch").set_num_threads(1)
+
+
+@contextmanager
+def _analysis_pool(workers: int):
+    torch = importlib.import_module("torch")
+    previous = torch.get_num_threads()
+    torch.set_num_threads(1)
+    try:
+        if workers == 1:
+            yield None
+        else:
+            with ThreadPoolExecutor(max_workers=workers, initializer=_init_analysis_thread) as pool:
+                yield pool
+    finally:
+        torch.set_num_threads(previous)
+
+
+def _write_comparison_job(path: Path, function, args) -> Path:
+    # Keep potentially large per-token evidence on disk, not in completed
+    # Future objects. Threads never share report streams or mutable counters.
+    with path.open("w", encoding="utf-8") as stream:
+
+        def emit(item):
+            stream.write(json.dumps(item, ensure_ascii=False, allow_nan=False) + "\n")
+
+        function(*args, emit=emit)
+    return path
+
+
+def _layer_workers(worker: Worker, kinds: set[str] | None = None) -> dict[tuple, Worker]:
+    records = defaultdict(list)
+    for record in worker.records:
+        if kinds is None or record["kind"] in kinds:
+            records[record["model"], record["layer"]].append(record)
+    # Calls/manifests are read-only and shared; only each layer's record list
+    # differs. No tensor data is loaded or copied when planning tasks.
+    return {key: replace(worker, records=value) for key, value in records.items()}
+
+
+def _partition_comparison(function, args):
+    """Split rank work across model/layers; retain the original emission order."""
+    if function is _compare_kv_aliases:
+        worker, side = args
+        indices = {(r["call"], *_identity(r)): i for i, r in enumerate(worker.records)}
+        return (
+            [(_compare_kv_aliases, (part, side)) for part in _layer_workers(worker, {"kv_consumed"}).values()],
+            lambda item: indices[item["call"], *_identity(item)],
+        )
+    if function is not _compare_pair:
+        return [(function, args)], None
+    source, candidate, mode = args
+    # These worker-level failures must be emitted once, not once per layer.
+    if any(source.manifest[key] != candidate.manifest[key] for key in ("model_id", "num_layers", "tp_size")) or (
+        mode == "pd-kv" and not any(c["phase"] == "prefill" and c["positions"] for c in source.calls.values())
+    ):
+        return [(function, args)], None
+    left = _layer_workers(source, set(PD_KINDS.values()) if mode == "pd-kv" else None)
+    right = _layer_workers(candidate, set(PD_KINDS) if mode == "pd-kv" else None)
+    keys = dict.fromkeys([*right, *left])
+    empty_left, empty_right = replace(source, records=[]), replace(candidate, records=[])
+    tasks = [(_compare_sampled, (source, candidate))] if mode == "off-on" else []
+    tasks.extend((_compare_worker, (left.get(key, empty_left), right.get(key, empty_right), mode)) for key in keys)
+    left_indices = {(r["call"], *_identity(r)): i for i, r in enumerate(source.records)}
+    right_indices = {(r["call"], *_identity(r)): i for i, r in enumerate(candidate.records)}
+
+    def order(item):
+        if "path" not in item:
+            return (-1, 0)  # Accepted-token comparison precedes tensor details.
+        identity = (item["call"], *_identity(item))
+        if item["status"] in ("not_consumed", "missing_candidate_tensor", "outside_candidate_sample"):
+            return (1, left_indices[identity])
+        return (0, right_indices[identity])
+
+    return tasks, order
+
+
+def _run_comparison_jobs(jobs, pool, directory, workers, emit) -> None:
+    if pool is None:
+        for function, args in jobs:
+            function(*args, emit=emit)
+        return
+    # Bound active tensors, not concurrency by rank count. A single TP rank
+    # can occupy multiple threads when it has multiple layers to compare.
+    groups = [_partition_comparison(function, args) for function, args in jobs]
+    tasks = [
+        (group, part, function, args)
+        for group, (parts, _) in enumerate(groups)
+        for part, (function, args) in enumerate(parts)
+    ]
+    with tempfile.TemporaryDirectory(prefix=".analysis-", dir=directory) as temporary:
+        iterator = iter(tasks)
+        pending = set()
+
+        def submit():
+            job = next(iterator, None)
+            if job is None:
+                return
+            group, part, function, args = job
+            path = Path(temporary) / f"{group}-{part}.jsonl"
+            pending.add(pool.submit(_write_comparison_job, path, function, args))
+
+        try:
+            for _ in range(min(workers, len(tasks))):
+                submit()
+            completed = 0
+            while pending:
+                finished, _ = wait(pending, return_when=FIRST_COMPLETED)
+                for future in finished:
+                    future.result()
+                    pending.remove(future)
+                    submit()
+                    completed += 1
+                    if completed == len(tasks) or completed % max(1, len(tasks) // 20) == 0:
+                        print(
+                            f"[PD_TENSOR_ANALYZE] comparisons: {completed}/{len(tasks)} tasks done",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+            print("[PD_TENSOR_ANALYZE] merging comparison details", file=sys.stderr, flush=True)
+            # Each layer file is already ordered by candidate record, then
+            # unused reference record. Merge one worker group at a time to
+            # recover the serial report order without loading rows into RAM.
+            for group, (parts, order) in enumerate(groups):
+                paths = [Path(temporary) / f"{group}-{part}.jsonl" for part in range(len(parts))]
+                with ExitStack() as stack:
+                    streams = [stack.enter_context(path.open(encoding="utf-8")) for path in paths]
+                    for item in heapq.merge(*(map(json.loads, stream) for stream in streams), key=order):
+                        emit(item)
+                for path in paths:
+                    path.unlink()
+        finally:
+            # Join writers before removing their temporary directory, including
+            # when JSON decoding, disk I/O or a comparison unexpectedly fails.
+            for future in pending:
+                future.cancel()
+            for future in pending:
+                if not future.cancelled():
+                    with suppress(Exception):
+                        future.result()
+
+
 def analyze(
     reference_roots: list[str | Path],
     candidate_roots: list[str | Path],
@@ -941,9 +1130,11 @@ def analyze(
     mode: str,
     output: str | Path,
     request_map: dict[str, str] | None = None,
+    workers: int = DEFAULT_ANALYSIS_WORKERS,
 ) -> dict:
     """Write report.json + comparisons.jsonl; return diagnostic summary."""
     _require(mode in ("off-on", "pd-kv"), "unsupported comparison mode")
+    _require(_integer(workers, 1), "analysis workers must be a positive integer")
     request_map = {} if request_map is None else request_map
     _require(
         isinstance(request_map, dict)
@@ -952,7 +1143,17 @@ def analyze(
     )
     _require(len(set(request_map.values())) == len(request_map), "request map must be one-to-one")
     _require(mode != "pd-kv" or not request_map, "PD KV comparison requires identical request IDs")
-    reference, candidate = load_archive(reference_roots), load_archive(candidate_roots)
+    print("[PD_TENSOR_ANALYZE] loading archive metadata", file=sys.stderr, flush=True)
+    reference = load_archive(reference_roots)
+    candidate = (
+        reference
+        if list(map(Path, reference_roots)) == list(map(Path, candidate_roots))
+        else load_archive(candidate_roots)
+    )
+    workers = min(workers, os.cpu_count() or 1)
+    print(
+        f"[PD_TENSOR_ANALYZE] comparing with {workers} threads; torch threads per task=1", file=sys.stderr, flush=True
+    )
     directory = Path(output)
     directory.mkdir(parents=True, exist_ok=True)
     counts: Counter = Counter()
@@ -963,7 +1164,7 @@ def analyze(
     first_alias_conflict = None
     inverse = {value: key for key, value in request_map.items()}
     matched_workers = set()
-    with (directory / "comparisons.jsonl").open("w", encoding="utf-8") as stream:
+    with _analysis_pool(workers) as pool, (directory / "comparisons.jsonl").open("w", encoding="utf-8") as stream:
 
         def emit(item: dict) -> None:
             nonlocal compared_rows, new_nonfinite, first_difference, worst_difference, first_output_difference
@@ -1041,12 +1242,13 @@ def analyze(
             stream.write(json.dumps(item, ensure_ascii=False, allow_nan=False) + "\n")
 
         checked_alias_workers = set()
+        jobs = []
         for side, archive in (("reference", reference), ("candidate", candidate)):
-            for issue in archive.issues:
-                emit({"archive": side, **issue})
+            if archive.issues:
+                jobs.append((_emit_items, ([{"archive": side, **issue} for issue in archive.issues],)))
             for worker in archive.workers.values():
                 if worker.directory not in checked_alias_workers:
-                    _compare_kv_aliases(worker, side, emit)
+                    jobs.append((_compare_kv_aliases, (worker, side)))
                     checked_alias_workers.add(worker.directory)
         for key, worker in candidate.workers.items():
             role, request_id, rank = key
@@ -1055,18 +1257,24 @@ def analyze(
             source_key = ("P" if mode == "pd-kv" else role, inverse.get(request_id, request_id), rank)
             source = reference.workers.get(source_key)
             if source is None:
-                emit({**worker.evidence(), "status": "missing_reference_worker", "reference_request_id": source_key[1]})
+                missing = {
+                    **worker.evidence(),
+                    "status": "missing_reference_worker",
+                    "reference_request_id": source_key[1],
+                }
+                jobs.append((_emit_items, ([missing],)))
                 continue
             matched_workers.add(source_key)
-            if mode == "off-on":
-                _compare_sampled(source, worker, emit)
-            _compare_worker(source, worker, mode, emit)
+            jobs.append((_compare_pair, (source, worker, mode)))
         for key, worker in reference.workers.items():
             if key in matched_workers or mode == "pd-kv" and key[0] != "P":
                 continue
-            emit({**worker.evidence(), "status": "missing_candidate_worker"})
+            jobs.append((_emit_items, ([{**worker.evidence(), "status": "missing_candidate_worker"}],)))
+        _run_comparison_jobs(jobs, pool, directory, workers, emit)
         if not counts["equal"] and not counts["different"]:
             emit({"status": "no_comparable_tensors"})
+        print("[PD_TENSOR_ANALYZE] analyzing MTP rejection decisions", file=sys.stderr, flush=True)
+        rejection = _write_rejection_report(reference, candidate, directory, pool)
     benign = {
         "equal",
         "different",
@@ -1128,7 +1336,7 @@ def analyze(
             "different_workers": counts["sampled_outputs_different"],
             "first_difference": first_output_difference,
         },
-        "rejection_sampling": _write_rejection_report(reference, candidate, directory),
+        "rejection_sampling": rejection,
         "worst_difference": worst_difference,
         "kv_aliases": {
             "scope": "Different physical copies of one logical token within the same worker/call/layer.",
@@ -1155,6 +1363,12 @@ def main() -> int:
     parser.add_argument("--mode", choices=("off-on", "pd-kv"), required=True)
     parser.add_argument("--output", required=True, help="Directory for report.json and comparisons.jsonl")
     parser.add_argument("--request-map", type=Path, help="JSON object mapping OFF request IDs to ON request IDs")
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=DEFAULT_ANALYSIS_WORKERS,
+        help="Concurrent analysis threads across ranks and layers (default: 16, capped by CPU count); 1 is serial",
+    )
     args = parser.parse_args()
     try:
         report = analyze(
@@ -1163,6 +1377,7 @@ def main() -> int:
             mode=args.mode,
             output=args.output,
             request_map=_read(args.request_map) if args.request_map else None,
+            workers=args.workers,
         )
     except (ValueError, OSError) as exc:
         parser.error(str(exc))

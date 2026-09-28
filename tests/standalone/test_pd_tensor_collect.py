@@ -743,25 +743,27 @@ def test_existing_lock_prevents_concurrent_collection(tmp_path, monkeypatch):
     ("report_status", "expected_exit"),
     [("analysis_complete", 0), ("incomplete_or_incomparable", 2)],
 )
+@pytest.mark.parametrize("workers", [1, 4, 16])
 def test_analyze_pd_runs_after_complete_collection_with_same_roots(
-    tmp_path, monkeypatch, capsys, report_status, expected_exit
+    tmp_path, monkeypatch, capsys, report_status, expected_exit, workers
 ):
     stub_ssh(monkeypatch, tar_bytes([("P/request/worker/value.pt", b"complete")]))
     calls = []
 
-    def analyze(reference, candidate, *, mode, output):
+    def analyze(reference, candidate, *, mode, output, workers):
         manifest = read_manifest(tmp_path)
         assert manifest["complete"] is True
-        calls.append((reference, candidate, mode, output))
+        calls.append((reference, candidate, mode, output, workers))
         output.mkdir()
         report = {"status": report_status, "compared_tensors": 17, "counts": {"different": 1}, "issues": 0}
         (output / "report.json").write_text(json.dumps(report), encoding="utf-8")
         return report
 
     monkeypatch.setitem(sys.modules, "pd_tensor_analyze", SimpleNamespace(analyze=analyze))
-    assert collector.main([*argv(tmp_path), "--analyze-pd"]) == expected_exit
+    flags = [] if workers == 16 else ["--analysis-workers", str(workers)]
+    assert collector.main([*argv(tmp_path), "--analyze-pd", *flags]) == expected_exit
     root = (tmp_path / "collected").resolve()
-    assert calls == [([root], [root], "pd-kv", root / "report-pd")]
+    assert calls == [([root], [root], "pd-kv", root / "report-pd", workers)]
     lines = capsys.readouterr().out.splitlines()
     summary = json.loads(
         next(line.removeprefix("[PD_TENSOR_ANALYZE] ") for line in lines if "PD_TENSOR_ANALYZE" in line)
@@ -781,6 +783,15 @@ def test_download_failure_does_not_import_analyzer(tmp_path, monkeypatch, capsys
     assert collector.main([*argv(tmp_path), "--analyze-pd"]) == 1
     assert "PD_TENSOR_ANALYZE" not in capsys.readouterr().err
     assert not (tmp_path / "collected/report-pd").exists()
+
+
+@pytest.mark.parametrize("workers", [0, -1])
+def test_invalid_analysis_workers_is_rejected_before_ssh(tmp_path, monkeypatch, workers):
+    commands = []
+    stub_ssh(monkeypatch, b"", commands=commands)
+    assert collector.main([*argv(tmp_path), "--analyze-pd", "--analysis-workers", str(workers)]) == 1
+    assert not commands
+    assert not (tmp_path / "collected").exists()
 
 
 def test_default_collection_does_not_import_analyzer(tmp_path, monkeypatch):
