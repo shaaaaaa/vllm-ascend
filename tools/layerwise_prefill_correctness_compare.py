@@ -392,6 +392,9 @@ def _validate_coverage(
     _require(summary.get("records") == len(records), f"rank {rank} record count differs")
     _require(summary.get("prompt_length") == prompt, f"rank {rank} prompt length differs")
     layers = _layer_list(summary.get("decoder_layers"), "decoder_layers")
+    mtp_layers = _layer_list(summary.get("mtp_layers", []), "mtp_layers", allow_empty=True)
+    _require(not set(layers) & set(mtp_layers), "MTP/main layer identities overlap")
+    all_layers = layers + mtp_layers
     hidden = summary.get("model_num_hidden_layers", summary.get("num_hidden_layers"))
     _require(_integer(hidden, 1) and layers == list(range(hidden)), "decoder layers do not cover full model")
     _require(hidden == model_info.get("num_hidden_layers"), "layer count differs from independent model config")
@@ -430,6 +433,11 @@ def _validate_coverage(
         _require(step["span"][0] == frontier, "prefill steps have a gap or overlap")
         frontier = step["span"][1]
     _require(frontier == prompt, "prefill steps do not cover the complete prompt")
+    if mtp_layers:
+        _require(
+            summary.get("mtp_calls") == [dict(step=s["step"], span=s["span"]) for s in steps],
+            "MTP does not cover every prefill chunk",
+        )
     layout = summary.get("layout")
     _require(isinstance(layout, dict) and layout.get("layout") == "merged", "merged layout evidence missing")
     _require("remote_url" in layout and layout["remote_url"] is None, "remote layout backend is not disabled")
@@ -442,10 +450,12 @@ def _validate_coverage(
     declared: set[tuple[str, str, int, str]] = set()
     roles = summary.get("required_roles")
     _require(isinstance(roles, list) and bool(roles), "missing required_roles")
-    for role in roles:
+    mtp_roles = summary.get("mtp_required_roles", [])
+    _require(isinstance(mtp_roles, list), "invalid MTP role inventory")
+    for role in roles + mtp_roles:
         _require(isinstance(role, dict) and role.get("steps") in ("all", "history"), "invalid required role")
         role_layers = _layer_list(role.get("layers"), "role layers", allow_empty=True)
-        _require(set(role_layers) <= set(layers), "required role has an unknown layer")
+        _require(set(role_layers) <= set(all_layers), "required role has an unknown layer")
         _require(all(isinstance(role.get(x), str) and role[x] for x in ("kind", "name")), "invalid required role name")
         for layer in role_layers:
             declared.add((role["kind"], role["name"], layer, role["steps"]))
@@ -468,6 +478,24 @@ def _validate_coverage(
                 _require(
                     (kind, name, layer, selector) in declared, f"required role omitted: {kind}/{name}/layer{layer}"
                 )
+    if mtp_layers:
+        minimum_mtp = (
+            ("decoder", ("input", "positions", "output"), mtp_layers, "all"),
+            ("attention", ("query_nope", "query_rope", "topk", "output"), mtp_layers, "all"),
+            ("kv_current", ("nope", "rope"), mtp_layers, "all"),
+            ("kv_loaded", ("nope", "rope"), mtp_layers, "history"),
+            (
+                "mtp_input",
+                ("input_ids", "positions", "hidden_states", "logical_positions", "sample_indices"),
+                [min(mtp_layers)],
+                "all",
+            ),
+            ("mtp_output", ("hidden_states", "logits_input", "logits", "draft_token_ids"), [min(mtp_layers)], "all"),
+        )
+        for kind, names, role_layers, selector in minimum_mtp:
+            for name in names:
+                for layer in role_layers:
+                    _require((kind, name, layer, selector) in declared, f"MTP role omitted: {kind}/{name}/layer{layer}")
     for kind, name, layer, selector in sorted(declared):
         for step in steps:
             if selector == "history" and step["span"][0] == 0:
@@ -475,7 +503,7 @@ def _validate_coverage(
             key = (rank, step["step"], layer, kind, name)
             _require(key in records, f"required tensor missing: {key}")
     for key, record in records.items():
-        _require(record["layer"] in layers and record["step"] < len(steps), f"unexpected layer/step: {key}")
+        _require(record["layer"] in all_layers and record["step"] < len(steps), f"unexpected layer/step: {key}")
         span = steps[record["step"]]["span"]
         _require(record["span"] == span, f"record span differs from step: {key}")
         if record["kind"] in ("kv_current", "kv_loaded"):
@@ -634,7 +662,17 @@ def compare_runs(root: str | Path) -> dict[str, Any]:
         on_result = {}
     if off_result.get("prompt_token_ids") != on_result.get("prompt_token_ids"):
         differences.append({"type": "structure", "detail": "OFF/ON prompt token IDs differ"})
-    for field in ("steps", "decoder_layers", "sfa_layers", "indexer_layers", "scale_layers", "required_roles"):
+    for field in (
+        "steps",
+        "decoder_layers",
+        "sfa_layers",
+        "indexer_layers",
+        "scale_layers",
+        "required_roles",
+        "mtp_layers",
+        "mtp_required_roles",
+        "mtp_calls",
+    ):
         left = [entry.get(field) for entry in off.get("coverage", []) if isinstance(entry, dict)]
         right = [entry.get(field) for entry in on.get("coverage", []) if isinstance(entry, dict)]
         if left != right:
@@ -727,7 +765,11 @@ def compare_runs(root: str | Path) -> dict[str, Any]:
         "status": status,
         "output_tokens_equal": output_equal,
         "numeric_tolerance_applied": False,
-        "scope": "all recorded main-backbone prefill tensors; MTP/decode tensor internals excluded",
+        "scope": "recorded main and MTP prefill tensors, MTP logits and draft IDs; later decode internals excluded",
+        "mtp_covered": bool(off.get("coverage"))
+        and all(s.get("mtp_layers") for s in off["coverage"])
+        and bool(on.get("coverage"))
+        and all(s.get("mtp_layers") for s in on["coverage"]),
         "counts": {
             **counts,
             "structural_errors": structural_errors,

@@ -143,6 +143,7 @@ def classify(api, *, computed, scheduled, drafts=0, mtp=True):
 def impl(api, *, p_node=True, window=0, shrink=2):
     obj = api.Impl()
     obj._layerwise_prefill_p_node = p_node
+    obj._layerwise_prefill_mtp = True
     obj._first_layerwise_prefill_layer_index = 0
     obj._last_layerwise_prefill_layer_index = 77
     obj.layer_name = None
@@ -213,14 +214,16 @@ def test_one_token_p_tail_flushes_all_target_layers_before_mtp(api, has_indexer)
     assert not any(kind == "legacy_save" for kind, _ in api.events)
 
     # The MTP proposer creates a fresh forward context. Its layer 78 entry
-    # must not inherit target pending saves, and its own P save stays eligible.
-    mtp_context = NS(additional_kwargs={})
+    # must not inherit target pending saves. MTP has no next layer callback;
+    # its save must be submitted before this context is discarded.
+    mtp_context = NS(additional_kwargs={}, is_draft_model=True)
     api.namespace["get_forward_context"] = lambda: mtp_context
     events_before_mtp = list(api.events)
     mtp_names = step(api, obj, state, layer=78, has_indexer=has_indexer, decode_rows=0)
-    assert api.events == events_before_mtp
-    pending = mtp_context.additional_kwargs["sfa_layerwise_prefill_pending"]
-    assert [name for name, _ in pending] == mtp_names
+    assert "sfa_layerwise_prefill_pending" not in mtp_context.additional_kwargs
+    mtp_events = api.events[len(events_before_mtp) :]
+    for kind in ("save", "finish", "post_save", "load"):
+        assert [name for event, name in mtp_events if event == kind] == mtp_names
 
 
 @pytest.mark.parametrize("scheduled,drafts,mtp", [(1, 0, False), (1, 0, True), (2, 1, True)])
@@ -246,6 +249,7 @@ def test_d_does_not_consult_p_transfer_capability_or_move_save_policy_before_pro
     obj = impl(api, p_node=False, window=2048)
     del obj._first_layerwise_prefill_layer_index
     del obj._last_layerwise_prefill_layer_index
+    del obj._layerwise_prefill_mtp
     order = []
     obj.o_proj = lambda value: (order.append("projection") or value,)
     api.namespace["_decode_window_save_window_size"] = lambda: order.append("save_policy") or 2048

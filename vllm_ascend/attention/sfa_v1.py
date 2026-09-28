@@ -1961,6 +1961,9 @@ class AscendSFAImpl(MLAAttentionImpl):
         )
         self.layer_name = kwargs.get("layer_name")
         if self._layerwise_prefill_p_node:
+            self._layerwise_prefill_mtp = bool(
+                speculative_config is not None and speculative_config.method in ("mtp", "deepseek_mtp")
+            )
             layer_start, layer_end = self.vllm_config.model_config.get_layers_start_end_indices(
                 self.vllm_config.parallel_config
             )
@@ -6029,9 +6032,12 @@ class AscendSFAImpl(MLAAttentionImpl):
             and layerwise_prefill_transfer_window_supported()
         )
         is_last_transfer_layer = use_layerwise_transfer_window and (
-            self._last_layerwise_prefill_layer
-            if self.layer_name is not None
-            else f".layers.{self._last_layerwise_prefill_layer_index}." in f".{layer_name}"
+            (
+                self._last_layerwise_prefill_layer
+                if self.layer_name is not None
+                else f".layers.{self._last_layerwise_prefill_layer_index}." in f".{layer_name}"
+            )
+            or (self._layerwise_prefill_mtp and getattr(get_forward_context(), "is_draft_model", False))
         )
 
         if self.enable_dsa_cp_with_o_proj_tp and use_layerwise_transfer_window:
@@ -6040,8 +6046,9 @@ class AscendSFAImpl(MLAAttentionImpl):
                 "the SFA context-parallel o_proj path"
             )
 
-        # The final target layer has no N+1 callback. Flush its transfer here
-        # after SFA, once the previous layer's save has been finished.
+        # The final target layer and each one-layer MTP forward have no N+1
+        # callback in their context. Submit their saves here, instead of leaving
+        # the MTP save in a discarded context and relying on storer drain later.
         final_transfer_names: list[str] = []
         if is_last_transfer_layer:
             if pending_transfers is not None:

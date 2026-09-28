@@ -199,6 +199,7 @@ def saved_off(tmp_path, monkeypatch):
     ids = [7] * 79992
     model_info = {"model": args.model, "num_hidden_layers": 2, "indexer_types": ["full", "shared"]}
     data = {
+        "coverage": [{"rank": rank, "mtp_layers": [2]} for rank in range(2)],
         "result": {"case": "off", "completed": True, "prompt_token_ids": ids, "prompt_length": len(ids)},
         "engine_options": runner.correctness_options(args, len(ids)),
         "environment": runner.recorded_environment(runner.correctness_environment(args, "off")),
@@ -228,6 +229,14 @@ def saved_off(tmp_path, monkeypatch):
     monkeypatch.setattr(comparator, "validate_off_baseline", validate)
     monkeypatch.setattr(runner, "record_model_identity", identity)
     return SimpleNamespace(root=previous, off=off, data=data, ids=ids, calls=calls)
+
+
+def test_old_main_only_baseline_requires_new_mtp_capture(saved_off, tmp_path):
+    saved_off.data["coverage"] = [{"rank": 0}]
+    args = runner.parser().parse_args(["--off-dir", str(saved_off.root)])
+    with pytest.raises(ValueError, match="no MTP tensors"):
+        runner.prepare_reused_off(args, tmp_path / "new")
+    assert saved_off.calls == ["validate"]
 
 
 @pytest.mark.parametrize("direct_case", [False, True])

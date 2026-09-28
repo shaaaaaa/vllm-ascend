@@ -51,6 +51,7 @@ def make_worker(
     phase=None,
     row_axis=0,
     context_complete=True,
+    model="main",
 ):
     context = list(range(10, 15)) if context is None else context
     batches = [list(range(len(context)))] if batches is None else batches
@@ -64,6 +65,7 @@ def make_worker(
             {
                 "schema": 1,
                 "call": number,
+                "model": model,
                 "phase": phase or ("prefill" if role == "P" else "decode"),
                 "positions": positions,
                 "token_ids": [context[p] for p in positions],
@@ -83,7 +85,7 @@ def make_worker(
             {
                 "schema": 1,
                 "request_id": request,
-                "model": "main",
+                "model": model,
                 "call": number,
                 "layer": 0,
                 "kind": kind,
@@ -126,7 +128,12 @@ def make_worker(
     )
     write_records(directory, records)
     write_sampled(
-        directory, [{"after_call": number, "token_ids": [99] if number == len(calls) - 1 else []} for number in calls]
+        directory,
+        [
+            {"after_call": number, "token_ids": [99] if number == len(calls) - 1 else []}
+            for number in calls
+            if model == "main"
+        ],
     )
     return directory
 
@@ -141,6 +148,35 @@ def write_records(directory, records):
 
 def write_sampled(directory, records):
     (directory / "sampled.jsonl").write_text("".join(json.dumps(item) + "\n" for item in records), encoding="utf-8")
+
+
+def test_pd_compares_mtp_prompt_kv_with_shifted_context_and_excludes_generated_boundary(tmp_path):
+    make_worker(tmp_path / "reference", role="P", model="mtp", context=[11, 12, 13, 99], kind="kv_current")
+    make_worker(tmp_path / "candidate", role="D", model="mtp", context=[11, 12, 13, 88], kind="kv_consumed", delta=0.5)
+    report = run(tmp_path, mode="pd-kv")
+    assert report["status"] == "analysis_complete", report
+    assert report["compared_rows"] == 3
+    assert report["counts"]["not_prompt_kv"] == 1
+    assert report["models_observed"] == {"reference": ["mtp"], "candidate": ["mtp"]}
+    assert report["first_difference_by_model"]["mtp"]["kind"] == "kv_consumed"
+    assert report["counts_by_model"]["mtp"]["different"] == 1
+
+
+def test_off_on_reports_mtp_logits_differences_even_without_output_difference(tmp_path):
+    for side, delta in (("reference", 0), ("candidate", 0.5)):
+        make_worker(tmp_path / side, role="D", model="mtp", kind="logits", tensor_name="output", delta=delta)
+    report = run(tmp_path)
+    assert report["status"] == "analysis_complete", report
+    assert report["first_difference_by_model"]["mtp"]["kind"] == "logits"
+
+
+def test_mtp_tensor_cannot_claim_a_main_call(tmp_path):
+    directory = make_worker(tmp_path / "reference", model="mtp")
+    call = read(directory / "calls/0.json")
+    call["model"] = "main"
+    write(directory / "calls/0.json", call)
+    archive = analyzer.load_archive([tmp_path / "reference"])
+    assert any("tensor/call model differs" in issue.get("reason", "") for issue in archive.issues)
 
 
 def run(tmp_path, *, mode="off-on", request_map=None):

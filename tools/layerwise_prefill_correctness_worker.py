@@ -278,6 +278,9 @@ class CorrectnessProbe:
         self.excluded_calls = 0
         self.merged_sources = 0
         self.legacy_sources = 0
+        self.mtp_layers = {}
+        self.mtp_roles = []
+        self.mtp_calls = []
         self.indexer_layers = sorted(
             index for index, module in implementations.values() if module.impl.has_indexer and not module.impl.skip_topk
         )
@@ -403,7 +406,7 @@ class CorrectnessProbe:
                     valid_rows=valid_tensor_rows(
                         metadata[attention.layer_name],
                         tensor,
-                        global_only=name == "positions",
+                        global_only=name == "positions" and layer not in self.mtp_layers,
                         prefer_local=getattr(context, "flash_comm_v1_enabled", None),
                     ),
                 )
@@ -435,8 +438,106 @@ class CorrectnessProbe:
                     ),
                 )
 
+    def install_mtp(self, runner, sfa_class):
+        """Observe the real draft invocation, including decorated model forwards."""
+        drafter = getattr(runner, "drafter", None)
+        if drafter is None:
+            if getattr(runner, "speculative_config", None) is not None:
+                raise ValueError("MTP is configured but its drafter is unavailable")
+            return
+        if getattr(drafter, "method", None) != "mtp" or drafter.num_speculative_tokens != 1:
+            raise ValueError("Prefill correctness currently supports one-token MTP")
+        model = drafter.model
+        if callable(getattr(model, "unwrap", None)):
+            model = model.unwrap()
+        from layerwise_prefill_file_worker import model_inventory
+
+        layers, implementations, _ = model_inventory(model, sfa_class)
+        if set(layers) & set(self.layers):
+            raise ValueError("MTP and main layer identities overlap")
+        self.mtp_layers = layers
+        self.impls.update(implementations)
+        indexers = [i for i, m in implementations.values() if m.impl.has_indexer and not m.impl.skip_topk]
+        caches = [i for i, m in implementations.values() if m.impl.has_indexer]
+        scales = [i for i, m in implementations.values() if m.impl.has_indexer and m.impl.use_sparse_c8_indexer]
+        self.mtp_roles = required_roles(sorted(layers), sorted(layers), indexers, caches, scales)
+        first = min(layers)
+        for kind, names in (
+            ("mtp_input", ("input_ids", "positions", "hidden_states", "logical_positions", "sample_indices")),
+            ("mtp_output", ("hidden_states", "logits_input", "logits", "draft_token_ids")),
+        ):
+            self.mtp_roles.extend(dict(kind=kind, name=name, layers=[first], steps="all") for name in names)
+
+        def record(tensor, kind, name, *, meta=None, prefer_local=True, raw=False):
+            if not self.steps:
+                raise RuntimeError("MTP ran without a preceding main prefill")
+            span = self.steps[-1]["span"]
+            self.archive.record(
+                tensor,
+                step=self.steps[-1]["step"],
+                layer=first,
+                kind=kind,
+                name=name,
+                span=span,
+                valid_rows=None if raw else valid_tensor_rows(meta, tensor, prefer_local=prefer_local),
+            )
+
+        def draft_factory(original):
+            @functools.wraps(original)
+            def draft(model_kwargs, **kwargs):
+                runtime = kwargs["runtime_inputs"]
+                meta = next(iter(kwargs["per_layer_attn_metadata"].values()))
+                span = single_request_span(meta, self.prompt_len)
+                if span is None:
+                    return original(model_kwargs, **kwargs)
+                if list(span) != self.steps[-1]["span"]:
+                    raise RuntimeError("MTP and main prefill spans differ")
+                local = bool(getattr(self.get_context(), "flash_comm_v1_enabled", False))
+                for name in ("input_ids", "positions", "hidden_states"):
+                    record(
+                        model_kwargs[name],
+                        "mtp_input",
+                        name,
+                        meta=meta,
+                        prefer_local=local if name != "input_ids" else False,
+                    )
+                record(
+                    drafter._get_positions(int(runtime["num_input_tokens"])),
+                    "mtp_input",
+                    "logical_positions",
+                    meta=meta,
+                    prefer_local=False,
+                )
+                record(
+                    runtime["token_indices_to_sample"][: int(runtime["batch_size"])],
+                    "mtp_input",
+                    "sample_indices",
+                    raw=True,
+                )
+                result = original(model_kwargs, **kwargs)
+                record(result, "mtp_output", "hidden_states", meta=meta, prefer_local=local)
+                self.mtp_calls.append(dict(step=self.steps[-1]["step"], span=list(span)))
+                return result
+
+            return draft
+
+        def logits_factory(original):
+            @functools.wraps(original)
+            def logits(hidden_states, *args, **kwargs):
+                result = original(hidden_states, *args, **kwargs)
+                # The launcher has one real request. LM-head DP may pad logits.
+                record(hidden_states[:1], "mtp_output", "logits_input", raw=True)
+                record(result[:1], "mtp_output", "logits", raw=True)
+                record(result[:1].argmax(dim=-1), "mtp_output", "draft_token_ids", raw=True)
+                return result
+
+            return logits
+
+        self.patch(drafter, "_run_mtp_draft_layer_with_diagnostics", draft_factory)
+        self.patch(model, "compute_logits", logits_factory)
+
     def install(self, sfa, torch_npu, connector_module, page_type):
-        for layer, module in self.layers.items():
+        for layer, module in (self.layers | self.mtp_layers).items():
             self.handles.append(
                 module.register_forward_pre_hook(functools.partial(self.decoder_pre, layer), with_kwargs=True)
             )
@@ -555,7 +656,7 @@ class CorrectnessProbe:
         errors = list(self.archive.errors)
         if not self.steps or self.steps[-1]["span"][1] != self.prompt_len:
             errors.append("Main prefill observations do not reach the complete prompt")
-        for role in self.roles:
+        for role in self.roles + self.mtp_roles:
             for step in self.steps:
                 if role["steps"] == "history" and step["span"][0] == 0:
                     continue
@@ -565,6 +666,8 @@ class CorrectnessProbe:
                         errors.append(f"Missing required tensor {identity}")
         if self.active_decoder or self.active_sfa:
             errors.append("A probed forward did not finish")
+        if self.mtp_layers and [call["step"] for call in self.mtp_calls] != [step["step"] for step in self.steps]:
+            errors.append("MTP forwards do not cover every main prefill chunk exactly once")
         try:
             layout = validate_local_merged_engine(engine)
         except Exception as error:
@@ -604,6 +707,9 @@ class CorrectnessProbe:
             c8_layers=self.scale_layers,
             steps=self.steps,
             required_roles=self.roles,
+            mtp_layers=sorted(self.mtp_layers),
+            mtp_required_roles=self.mtp_roles,
+            mtp_calls=self.mtp_calls,
             prompt_length=self.prompt_len,
             model_num_hidden_layers=int(self.model_config.num_hidden_layers),
             indexer_types=getattr(self.model_config, "indexer_types", None),
@@ -612,7 +718,7 @@ class CorrectnessProbe:
             merged_load_sources=self.merged_sources,
             legacy_load_sources=self.legacy_sources,
             layout=layout,
-            excluded={"scope": "MTP/drafter and non-prefill execution", "calls": self.excluded_calls},
+            excluded={"scope": "non-prefill execution", "calls": self.excluded_calls},
             observation="actual consumer, current compute stream; no added bank waits",
         )
 
@@ -679,6 +785,7 @@ class PrefillCorrectnessWorker:
             probe = CorrectnessProbe(archive, prompt_len, layers, implementations, get_forward_context, model_config)
             self._correctness_probe = probe
             self._correctness_engine = engine
+            probe.install_mtp(self.model_runner, sfa_v1.AscendSFAImpl)
             probe.install(sfa_v1, torch_npu, npu_connectors, LayerPageMemoryObj)
             probe.install_runner_progress(self.model_runner)
             progress.phase("running", operation="idle")

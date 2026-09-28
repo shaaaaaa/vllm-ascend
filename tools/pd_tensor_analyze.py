@@ -107,6 +107,7 @@ def _load_sampled(worker: Worker, archive: Archive) -> None:
             _require(isinstance(item, dict), "sampled record must be an object")
             number, tokens = item.get("after_call"), item.get("token_ids")
             _require(_integer(number) and number in worker.calls, "sampled record has no valid call")
+            _require(worker.calls[number].get("model", "main") == "main", "accepted samples belong to main calls")
             _require(number >= previous_call, "sampled calls are not ordered")
             _require(_integers(tokens), "sampled outputs must contain accepted nonnegative token IDs")
             _require(number not in seen, "duplicate sampled output for one call")
@@ -118,7 +119,8 @@ def _load_sampled(worker: Worker, archive: Archive) -> None:
             archive.issues.append(
                 {**worker.evidence(), "status": "invalid_sampled_outputs", "line": line_number, "reason": str(exc)}
             )
-    missing = sorted(set(worker.manifest["calls"]) - seen)
+    main_calls = {number for number, call in worker.calls.items() if call.get("model", "main") == "main"}
+    missing = sorted(main_calls - seen)
     if missing:
         valid = False
         archive.issues.append({**worker.evidence(), "status": "missing_sampled_calls", "calls": missing})
@@ -127,6 +129,7 @@ def _load_sampled(worker: Worker, archive: Archive) -> None:
 
 def _check_call(call: dict, number: int) -> None:
     _require(call.get("schema") == 1 and call.get("call") == number, "invalid call schema/id")
+    _require(call.get("model", "main") in ("main", "mtp"), "invalid call model")
     _require(call.get("phase") in ("prefill", "decode"), "invalid call phase")
     positions, tokens, context = (call.get(key) for key in ("positions", "token_ids", "context_token_ids"))
     _require(_integers(positions) and _integers(tokens) and len(positions) == len(tokens), "invalid call rows")
@@ -152,8 +155,9 @@ def _check_call(call: dict, number: int) -> None:
 def _check_record(record: dict, worker: Worker) -> None:
     _require(record.get("schema") == 1, "invalid tensor record schema")
     _require(record.get("request_id") == worker.manifest["request_id"], "record request ID differs from manifest")
-    _require(record.get("model") == "main", "unsupported model scope")
+    _require(record.get("model") in ("main", "mtp"), "unsupported model scope")
     _require(_integer(record.get("call")) and record["call"] in worker.calls, "record has no valid call")
+    _require(record["model"] == worker.calls[record["call"]].get("model", "main"), "tensor/call model differs")
     _require(_integer(record.get("layer"), -1), "invalid layer")
     _require(
         all(isinstance(record.get(key), str) and record[key] for key in ("kind", "name", "dtype")),
@@ -304,6 +308,8 @@ def load_archive(roots: list[str | Path]) -> Archive:
                             }
                         )
             _load_sampled(worker, archive)
+            if manifest.get("mtp_layers") and not any(c.get("model") == "mtp" for c in worker.calls.values()):
+                archive.issues.append({**worker.evidence(), "status": "missing_mtp_calls"})
         except Exception as exc:
             archive.issues.append({"status": "invalid_manifest", "path": str(path), "reason": str(exc)})
     for key, workers in grouped.items():
@@ -547,7 +553,10 @@ def _compare_worker(reference: Worker, candidate: Worker, mode: str, emit) -> No
                             positions[position].append((index, ref, row))
                 unmatched: dict[str, list[int]] = defaultdict(list)
                 for row, (position, token) in enumerate(zip(record["positions"], record["token_ids"])):
-                    if mode == "pd-kv" and position >= prompt_end:
+                    # MTP position p depends on target token p+1. The last
+                    # prompt-position MTP KV already depends on generated output.
+                    boundary = prompt_end - int(record["model"] == "mtp")
+                    if mode == "pd-kv" and position >= boundary:
                         unmatched["not_prompt_kv"].append(position)
                         continue
                     options = positions.get(position, [])
@@ -681,6 +690,8 @@ def analyze(
     directory = Path(output)
     directory.mkdir(parents=True, exist_ok=True)
     counts: Counter = Counter()
+    model_counts: dict[str, Counter] = defaultdict(Counter)
+    first_by_model: dict[str, dict] = {}
     compared_rows = new_nonfinite = 0
     first_difference = worst_difference = first_output_difference = None
     first_alias_conflict = None
@@ -692,6 +703,8 @@ def analyze(
             nonlocal compared_rows, new_nonfinite, first_difference, worst_difference, first_output_difference
             nonlocal first_alias_conflict
             counts[item["status"]] += 1
+            if item.get("model") in ("main", "mtp"):
+                model_counts[item["model"]][item["status"]] += 1
             if item["status"] == "kv_aliases_different" and first_alias_conflict is None:
                 index = item["alias_rows"].index(item["different_alias_rows"][0])
                 first_alias_conflict = {
@@ -754,6 +767,9 @@ def analyze(
                     )
                     if first_difference is None or _observation_order(marker) < _observation_order(first_difference):
                         first_difference = marker
+                    previous = first_by_model.get(marker["model"])
+                    if previous is None or _observation_order(marker) < _observation_order(previous):
+                        first_by_model[marker["model"]] = marker
                     if worst_difference is None or (marker["abs_max"] or 0) > (worst_difference["abs_max"] or 0):
                         worst_difference = marker
             stream.write(json.dumps(item, ensure_ascii=False, allow_nan=False) + "\n")
@@ -806,8 +822,12 @@ def analyze(
         "status": "incomplete_or_incomparable" if issues or not comparisons else "analysis_complete",
         "accuracy_verdict": "not_assessed",
         "scope": (
-            "Archived main-backbone tensors only; MTP internals are excluded. PD mode compares consumed prompt KV only."
+            "Archived main and MTP tensors. PD mode compares consumed prompt KV, excluding the MTP next-token boundary."
         ),
+        "models_observed": {
+            side: sorted({r["model"] for w in archive.workers.values() for r in w.records})
+            for side, archive in (("reference", reference), ("candidate", candidate))
+        },
         "reference_selection": "Earliest observation with the same TP rank, logical token and complete causal context.",
         "numeric_policy": (
             "All CPU elements are compared; differences and distributions are reported "
@@ -820,6 +840,8 @@ def analyze(
         "new_nonfinite": new_nonfinite,
         "issues": issues,
         "counts": dict(sorted(counts.items())),
+        "counts_by_model": {model: dict(value) for model, value in sorted(model_counts.items())},
+        "first_difference_by_model": first_by_model,
         "first_difference": first_difference,
         "first_observed_difference": first_difference,
         "first_difference_interpretation": (

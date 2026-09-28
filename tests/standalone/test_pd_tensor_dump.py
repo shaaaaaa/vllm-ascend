@@ -67,9 +67,123 @@ def batch(meta, rows):
     return torch.tensor(tokens), torch.tensor(positions)
 
 
+@pytest.mark.parametrize("padding_rank", [False, True])
+def test_mtp_real_wrappers_keep_shifted_context_separate_from_main_sampling(module, tmp_path, padding_rank):
+    probe, runner, main_meta = make_probe(module, tmp_path, {"a": [10, 11, 12, 13], "b": [20, 21, 22]})
+    inputs, positions = batch(main_meta, [([3, 4], [13, 99]), ([2], [22])])
+    with probe.forward(inputs, positions):
+        fill_expected(probe, main_meta)
+    cp = NS(local_start=2, local_end=2, local_end_with_pad=3) if padding_rank else None
+    mtp_meta = NS(num_actual_tokens=2, query_start_loc_cpu=[0, 1, 2], dsa_cp_context=cp)
+    context = NS(
+        attn_metadata={"layer0": main_meta, "model.layers.1.attn": mtp_meta}, flash_comm_v1_enabled=padding_rank
+    )
+    probe.get_context = lambda: context
+
+    class Impl:
+        pass
+
+    class TestDecoderLayer(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.attention = torch.nn.Module()
+            self.attention.impl = Impl()
+            self.attention.layer_name = "model.layers.1.attn"
+
+    class Draft(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layers = torch.nn.ModuleDict({"1": TestDecoderLayer()})
+
+        def forward(self, input_ids, positions, hidden_states):
+            for item in probe.expected("mtp"):
+                if item["kind"] in ("model_input", "model_output", "logits", "draft"):
+                    continue
+                probe.emit(torch.ones(2, 3), item["layer"], item["kind"], item["name"], mtp_meta, prefer_local=False)
+            return hidden_states
+
+        def __call__(self, *args, **kwargs):
+            return self.forward(*args, **kwargs)  # Real eager decorator bypasses nn hooks.
+
+        def compute_logits(self, hidden_states):
+            return hidden_states
+
+    model = Draft()
+    runner.drafter = NS(
+        method="mtp",
+        model=model,
+        _get_positions=lambda n: torch.tensor([3, 2])[:n],
+        _run_mtp_draft_layer_with_diagnostics=lambda values, **kwargs: model(**values),
+    )
+    original = model.forward
+    probe.install_mtp(Impl)
+    hidden = torch.ones(1 if padding_rank else 2, 3)
+    actual = runner.drafter._run_mtp_draft_layer_with_diagnostics(
+        dict(
+            input_ids=torch.tensor([99, 199]),
+            positions=torch.tensor([0]) if padding_rank else torch.tensor([3, 2]),
+            hidden_states=hidden,
+        ),
+        runtime_inputs=dict(num_input_tokens=2, batch_size=2, token_indices_to_sample=torch.tensor([0, 1])),
+        draft_step=0,
+    )
+    assert actual is hidden
+    logits = torch.tensor([[0.0, 3.0, 1.0], [9.0, 0.0, 1.0], [999.0, 999.0, 999.0]])
+    assert model.compute_logits(logits) is logits
+    finish_forward(probe, sampled=[[31], [32]])
+    for internal, shifted, token in (("a", [11, 12, 13, 99], 1), ("b", [21, 22, 199], 0)):
+        archive = probe.archives[internal]
+        call = archive.calls[1]
+        assert call["model"] == "mtp" and call["parent_call"] == 0 and call["complete"]
+        assert call["context_token_ids"] == shifted
+        assert value_for(archive, "draft", "token_ids", call=1).tolist() == [token]
+        assert all(row["model"] == "mtp" for row in records(archive) if row["call"] == 1)
+        hidden_record = record_for(archive, "model_input", "hidden_states", call=1)
+        assert hidden_record["positions"] == ([] if padding_rank else [len(shifted) - 1])
+        assert json.loads((archive.root / "sampled.jsonl").read_text())["after_call"] == 0
+        assert archive.metadata["complete"]
+    probe.restore()
+    assert model.forward == original
+
+
 def records(archive):
     path = archive.root / "index.jsonl"
     return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+
+
+def test_mtp_rejected_padding_is_not_archived_as_valid_query_or_current_kv(module, tmp_path):
+    probe, _, main_meta = make_probe(module, tmp_path, {"a": [10, 11], "b": [20, 21]})
+    ids, positions = batch(main_meta, [([1, 2], [11, 999]), ([1, 2], [21, 998])])
+    with probe.forward(ids, positions):
+        fill_expected(probe, main_meta)
+    probe.mtp_layers = {1: object()}
+    probe.attentions[2] = (1, "mtp")
+    meta = NS(
+        num_actual_tokens=4,
+        query_start_loc_cpu=[0, 2, 4],
+        dsa_cp_context=None,
+        slot_mapping=torch.tensor([0, -1, 2, -1]),
+    )
+    probe.get_context = lambda: NS(attn_metadata={"mtp": meta})
+    probe.mtp_runtime = dict(positions=[1, 2, 1, 2], indices=[0, 2], draft_step=0)
+    probe.start_mtp(
+        dict(
+            input_ids=torch.tensor([30, 999, 40, 998]),
+            positions=positions,
+            hidden_states=torch.arange(4).reshape(4, 1),
+        )
+    )
+    cache = torch.arange(4).reshape(2, 2, 1, 1)
+    probe.current_kv([cache, cache], 1, meta)
+    probe.indexer_kv(cache, torch.tensor([[0], [1]]), torch.tensor([3, 3]), 1, "key")
+    for internal, context, kv in (("a", [11, 30], 0), ("b", [21, 40], 2)):
+        archive = probe.archives[internal]
+        assert archive.calls[1]["context_token_ids"] == context
+        assert archive.calls[1]["positions"] == [1]
+        assert archive.calls[1]["rejected_query_rows"] == 1
+        assert value_for(archive, "kv_current", "nope", call=1).flatten().tolist() == [kv]
+        assert value_for(archive, "model_input", "hidden_states", call=1).flatten().tolist() == [kv]
+        assert record_for(archive, "kv_indexer", "key", call=1)["positions"] == [0, 1]
 
 
 def record_for(archive, kind, name, call=0):

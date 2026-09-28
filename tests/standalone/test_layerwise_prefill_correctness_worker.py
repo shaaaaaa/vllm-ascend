@@ -169,6 +169,42 @@ def test_valid_rows_follow_cp_metadata_and_distinguish_global_positions(worker):
         worker.valid_tensor_rows(meta, torch.empty(3, 8))
 
 
+@pytest.mark.parametrize("rank,valid", [(0, 2), (1, 2), (2, 1), (3, 0)])
+def test_mtp_decoder_records_raw_sharded_positions_including_empty_tp_rank(worker, tmp_path, rank, valid):
+    class Decoder(torch.nn.Module):
+        def forward(self, positions, hidden_states):
+            return hidden_states
+
+    meta = NS(
+        num_actual_tokens=5,
+        num_input_tokens=8,
+        seq_lens_cpu=[5],
+        query_start_loc_cpu=[0, 5],
+        dsa_cp_context=NS(
+            num_tokens_pad=8, local_start=rank * 2, local_end=min(rank * 2 + 2, 5), local_end_with_pad=rank * 2 + 2
+        ),
+    )
+    archive = worker.TensorArchive(tmp_path / "off", rank)
+    module = Decoder()
+    probe = worker.CorrectnessProbe(
+        archive,
+        5,
+        {0: object()},
+        {},
+        lambda: NS(attn_metadata={"mtp": meta}, flash_comm_v1_enabled=True),
+        NS(num_hidden_layers=1),
+    )
+    probe.mtp_layers = {1: module}
+    probe.impls[1] = (1, NS(layer_name="mtp"))
+    probe.steps = [dict(step=0, span=[0, 5], phase="prefill")]
+    positions = torch.tensor([rank * 8, rank * 8 + 4])
+    probe.decoder_pre(1, module, (), dict(positions=positions, hidden_states=torch.ones(2, 4)))
+    record = archive.records[(rank, 0, 1, "decoder", "positions")]
+    assert record["comparison_numel"] == valid
+    assert torch.equal(torch.load(archive.root / record["path"], weights_only=True), positions)
+    archive.close()
+
+
 def test_ambiguous_cp_shape_and_decode_classified_prefill_fail_closed(worker):
     meta = NS(
         num_actual_tokens=1,
@@ -187,7 +223,9 @@ def test_ambiguous_cp_shape_and_decode_classified_prefill_fail_closed(worker):
     assert worker.single_request_span(meta, 7) is None
 
 
-def _runtime(worker, monkeypatch, case_dir, *, map_ids=(2, 0), compare=None, h2d_source="merged"):
+def _runtime(
+    worker, monkeypatch, case_dir, *, map_ids=(2, 0), compare=None, h2d_source="merged", mtp=False, mtp_delta=0
+):
     shared = {}
     operations = NS(
         npu_lightning_indexer=lambda **kw: torch.zeros((kw["query"].shape[0], 1, 2), dtype=torch.long),
@@ -251,6 +289,32 @@ def _runtime(worker, monkeypatch, case_dir, *, map_ids=(2, 0), compare=None, h2d
     archive = worker.TensorArchive(case_dir, 0, compare=compare)
     probe = worker.CorrectnessProbe(archive, 8, layers, implementations, lambda: context, config)
     connector = NS(_layer_source_memory_objs=lambda source, layer: source)
+    drafter = None
+    if mtp:
+
+        class DraftModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.layers = torch.nn.ModuleDict({"2": TestDecoderLayer(2)})
+
+            def forward(self, input_ids, positions, hidden_states):
+                return self.layers["2"](positions, hidden_states, None)[0]
+
+            def compute_logits(self, hidden_states):
+                return hidden_states + torch.tensor([[mtp_delta, 0]])
+
+            def __call__(self, *args, **kwargs):
+                return self.forward(*args, **kwargs)  # Compiled-decorator eager dispatch.
+
+        draft_model = DraftModel()
+        drafter = NS(
+            method="mtp",
+            num_speculative_tokens=1,
+            model=draft_model,
+            _get_positions=lambda count: shared["positions"][:count],
+            _run_mtp_draft_layer_with_diagnostics=lambda model_kwargs, **kw: draft_model(**model_kwargs),
+        )
+        probe.install_mtp(NS(drafter=drafter), SFAImpl)
 
     class MergedPage:
         pass
@@ -262,7 +326,10 @@ def _runtime(worker, monkeypatch, case_dir, *, map_ids=(2, 0), compare=None, h2d
         return connector._layer_source_memory_objs([source], 0)
 
     def run(start, end):
-        for layer, module in enumerate(model.layers):
+        cache_layers = list(enumerate(model.layers))
+        if mtp:
+            cache_layers.append((2, draft_model.layers["2"]))
+        for layer, module in cache_layers:
             attention = module.attention
             table = torch.tensor([map_ids])
             all_slots = worker.slots_for_positions(attention.cache[0], table, 0, 8)
@@ -284,6 +351,16 @@ def _runtime(worker, monkeypatch, case_dir, *, map_ids=(2, 0), compare=None, h2d
         hidden = torch.arange((end - start) * 2, dtype=torch.float32).reshape(-1, 2)
         for module in model.layers:
             hidden, _ = module(torch.arange(start, end), hidden, None)
+        if mtp:
+            shared["positions"] = torch.arange(start, end)
+            selected = torch.tensor([end - start - 1])
+            result = drafter._run_mtp_draft_layer_with_diagnostics(
+                dict(input_ids=torch.arange(start + 1, end + 1), positions=shared["positions"], hidden_states=hidden),
+                runtime_inputs=dict(num_input_tokens=end - start, batch_size=1, token_indices_to_sample=selected),
+                per_layer_attn_metadata={"mtp": context.attn_metadata[draft_model.layers["2"].attention.layer_name]},
+                draft_step=0,
+            )
+            draft_model.compute_logits(result[selected])
 
     return probe, run, operations, SFAImpl
 
@@ -316,7 +393,8 @@ def test_real_consumer_hooks_cover_shared_indexer_and_bank_changes(worker, tmp_p
     assert on["file_count"] == 0
 
 
-def test_full_worker_off_on_artifacts_pass_real_comparator(worker, tmp_path, monkeypatch):
+@pytest.mark.parametrize("mtp,delta", [(False, 0), (True, 0), (True, 3)])
+def test_full_worker_off_on_artifacts_pass_real_comparator(worker, tmp_path, monkeypatch, mtp, delta):
     from layerwise_prefill_correctness_compare import compare_runs
 
     def write(path, value):
@@ -332,7 +410,13 @@ def test_full_worker_off_on_artifacts_pass_real_comparator(worker, tmp_path, mon
     )
     for case, mapping in (("off", (2, 0)), ("on", (1, 3))):
         probe, run, _, _ = _runtime(
-            worker, monkeypatch, tmp_path / case, map_ids=mapping, h2d_source="merged" if case == "on" else None
+            worker,
+            monkeypatch,
+            tmp_path / case,
+            map_ids=mapping,
+            h2d_source="merged" if case == "on" else None,
+            mtp=mtp,
+            mtp_delta=delta if case == "on" else 0,
         )
         run(0, 4)
         run(4, 8)
@@ -365,8 +449,14 @@ def test_full_worker_off_on_artifacts_pass_real_comparator(worker, tmp_path, mon
     report = compare_runs(tmp_path)
     assert report["complete"] and report["passed"], report
     assert report["counts"]["compared"] == coverage["records"]
-    assert report["status"] == "equal"
-    assert (tmp_path / "diff.jsonl").read_text() == ""
+    assert report["mtp_covered"] is mtp
+    assert report["output_tokens_equal"]
+    if delta:
+        assert report["counts"]["different"] == 4  # Logits and draft IDs, two chunks.
+        assert report["counts"]["integer_differences"] == 2
+    else:
+        assert report["status"] == "equal"
+        assert (tmp_path / "diff.jsonl").read_text() == ""
 
 
 def test_history_h2d_evidence_required_only_for_on(worker, tmp_path, monkeypatch):

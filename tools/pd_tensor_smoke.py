@@ -332,7 +332,7 @@ def analyze_run(root):
         accuracy_verdict="not_assessed",
         cases={},
         errors=[],
-        scope="Single-host eager P/D with file SDK; new main-backbone recorder, MTP draft internals excluded",
+        scope="Single-host eager P/D with file SDK; main and MTP inputs, KV, intermediates, logits and draft IDs",
     )
     for case in config["cases"]:
         case_root = root / case

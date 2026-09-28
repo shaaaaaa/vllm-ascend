@@ -167,6 +167,11 @@ def prepare_reused_off(args, root):
     previous_root = off_dir.parent
     previous_model = json.loads((previous_root / "model_info.json").read_text(encoding="utf-8"))
     baseline = validate_off_baseline(off_dir, previous_model)
+    if not baseline.get("coverage") or not all(entry.get("mtp_layers") for entry in baseline["coverage"]):
+        raise ValueError(
+            "OFF baseline has no MTP tensors; record a new OFF once to validate MTP "
+            "(old files remain usable for main-only analysis)"
+        )
     saved_prompt_path = previous_root / "prompt.json"
     saved_prompt = json.loads(saved_prompt_path.read_text(encoding="utf-8")) if saved_prompt_path.is_file() else {}
     result = baseline["result"]
@@ -285,7 +290,7 @@ def run_child(args):
         "output_length": 0,
         "token_ids": [],
         "text": "",
-        "scope": "all main-backbone prefill layers and first output token; local merged CPU pages",
+        "scope": "main/MTP prefill layers, MTP logits/draft IDs and first output token; local merged CPU pages",
         "timing_is_performance_data": False,
     }
     try:
@@ -433,7 +438,7 @@ def main(argv=None):
                 "comparison": "OFF full tensors; ON online numerical errors and distributions; output tokens exact",
                 "layout": "tools-only local merged-page selection; real allocator and transfers",
                 "case_differences": ["VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE", "LMCACHE_STORE_ASYNC"],
-                "excluded": ["Mooncake transport", "MTP/decode intermediate tensors"],
+                "excluded": ["Mooncake transport", "later decode intermediate tensors"],
             },
         )
         sequence = "ON only against saved OFF" if args.off_dir else "OFF then ON"

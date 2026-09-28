@@ -148,7 +148,14 @@ pd-tensor-dump/case-on/
 
 按请求切分 batch，TP padding 不参与数值比较。保留逻辑 position 与物理映射证据；不会直接拿 P/D 的物理 block 编号作相等判断。
 共享 indexer 层记录实际共享 top-k，不额外运行 indexer。
-记录覆盖主模型与 MTP target verification，**不覆盖 MTP draft 模型内部**。
+记录覆盖主模型、MTP target verification 和 **MTP draft 模型内部**：输入 token、
+原始 positions、分片前逻辑 positions、输入/输出 hidden states、各层 SFA/indexer、
+当前及实际消费的 KV、采样前 logits 和草稿 token。记录通过 `model=main/mtp` 区分，
+MTP call 的 `parent_call` 指向主模型调用，`sampled.jsonl` 仍只记录主模型接受的输出。
+MTP 被拒绝草稿形成的 padding 按实际采样位置排除，数量记在 call 的 `rejected_query_rows`。
+MTP 位置 p 消费主模型位置 p+1 的 token；PD KV 对比排除依赖生成 token 的最后一个
+prompt 位置。`report.json` 的 `counts_by_model` 和 `first_difference_by_model`
+分别报告主模型和 MTP 的差异。旧 dump 没有 MTP 数据，需要重新抓取才能验证 MTP。
 
 原始 tensor 读回和写盘会明显减速、占用大量磁盘，也可能改变异步竞争的时序。此模式用于数据排查，不能代表性能，也不能排除仅在图回放或原始并发时序下出现的问题。
 

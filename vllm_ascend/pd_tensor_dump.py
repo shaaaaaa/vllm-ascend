@@ -115,7 +115,7 @@ class RequestArchive:
         record = dict(
             schema=1,
             request_id=self.metadata["request_id"],
-            model="main",
+            model=call.get("model", "main"),
             call=call["call"],
             layer=layer,
             kind=kind,
@@ -158,11 +158,7 @@ class RequestArchive:
 
 
 class PDTensorDump:
-    """Capture main-backbone calls, including target verification with MTP enabled.
-
-    MTP draft internals are deliberately distinguished from the main backbone:
-    they are not observed by these hooks or counted as covered by the report.
-    """
+    """Capture main verification and MTP calls under separate model identities."""
 
     def __init__(self, runner, root, role, rank_info, get_context):
         self.runner, self.root, self.role = runner, Path(root), role
@@ -179,6 +175,9 @@ class PDTensorDump:
         self.attentions = {}
         self.logical_topk = None
         self.scheduled = {}
+        self.mtp_layers = {}
+        self.mtp_runtime = None
+        self.mtp_last = None
 
     def observe_scheduler(self, output):
         for req in output.scheduled_new_reqs:
@@ -196,7 +195,8 @@ class PDTensorDump:
         if not isinstance(values, dict):
             return None
         for index, name in self.attentions.values():
-            if layer is None or index == layer:
+            is_mtp = self.active is not None and self.active.get("model") == "mtp"
+            if (layer is not None and index == layer) or (layer is None and (index in self.mtp_layers) == is_mtp):
                 return values.get(name)
         return None
 
@@ -224,7 +224,8 @@ class PDTensorDump:
         config = self.runner.model_config.hf_text_config
         if sorted(self.layers) != list(range(int(config.num_hidden_layers))):
             raise ValueError("PD tensor dump layer inventory differs from model configuration")
-        for layer, module in self.layers.items():
+        self.install_mtp(sfa_class)
+        for layer, module in (self.layers | self.mtp_layers).items():
             self.handles.append(
                 module.register_forward_pre_hook(functools.partial(self.decoder_pre, layer), with_kwargs=True)
             )
@@ -243,13 +244,185 @@ class PDTensorDump:
                 self.patch(owner, name, self.kernel_factory("indexer", tuple_result))
         self.patch(self.runner.model, "compute_logits", self.logits_factory)
 
+    def install_mtp(self, sfa_class):
+        """Install only on an explicitly enabled recorder; preserve draft execution."""
+        drafter = getattr(self.runner, "drafter", None)
+        if drafter is None:
+            if getattr(self.runner, "speculative_config", None) is not None:
+                raise ValueError("MTP is configured but its drafter is unavailable")
+            return
+        if getattr(drafter, "method", None) != "mtp":
+            raise ValueError("PD tensor dump currently supports the MTP drafter")
+        model = drafter.model
+        if callable(getattr(model, "unwrap", None)):
+            model = model.unwrap()
+        for name, module in model.named_modules():
+            match = re.search(r"(?:^|\.)layers\.(\d+)(?:\.|$)", name)
+            if match and "DecoderLayer" in type(module).__name__:
+                layer = int(match[1])
+                if layer in self.layers or layer in self.mtp_layers:
+                    raise ValueError("Ambiguous MTP decoder layer inventory")
+                self.mtp_layers[layer] = module
+            impl = getattr(module, "impl", None)
+            if isinstance(impl, sfa_class):
+                match = re.search(r"(?:^|\.)layers\.(\d+)(?:\.|$)", module.layer_name)
+                if match:
+                    self.attentions[id(impl)] = (int(match[1]), module.layer_name)
+        observed = {i for i, _ in self.attentions.values()} - set(self.layers)
+        if not self.mtp_layers or observed != set(self.mtp_layers):
+            raise ValueError("Incomplete MTP decoder/SFA inventory")
+
+        def draft_factory(original):
+            @functools.wraps(original)
+            def draft(model_kwargs, **kwargs):
+                if self.last is None:
+                    return original(model_kwargs, **kwargs)
+                runtime = kwargs["runtime_inputs"]
+                self.mtp_runtime = dict(
+                    positions=cpu_tensor(drafter._get_positions(int(runtime["num_input_tokens"]))).tolist(),
+                    indices=cpu_tensor(runtime["token_indices_to_sample"])
+                    .long()
+                    .tolist()[: int(runtime["batch_size"])],
+                    draft_step=int(kwargs["draft_step"]),
+                )
+                try:
+                    return original(model_kwargs, **kwargs)
+                finally:
+                    self.mtp_runtime = None
+
+            return draft
+
+        def forward_factory(original):
+            signature = inspect.signature(original)
+
+            @functools.wraps(original)
+            def forward(*args, **kwargs):
+                if self.mtp_runtime is None:
+                    return original(*args, **kwargs)
+                values = signature.bind(*args, **kwargs).arguments
+                previous = self.active, self.logical_topk
+                try:
+                    self.start_mtp(values)
+                    result = original(*args, **kwargs)
+                    outputs = result if isinstance(result, (tuple, list)) else (result,)
+                    for index, tensor in enumerate(outputs):
+                        self.emit(
+                            tensor,
+                            -1,
+                            "model_output",
+                            "hidden_states" if index == 0 else str(index),
+                            self.metadata(),
+                            prefer_local=bool(getattr(self.get_context(), "flash_comm_v1_enabled", False)),
+                        )
+                    return result
+                except BaseException as error:
+                    if self.active:
+                        for entry in self.active["entries"]:
+                            entry["archive"].fail(f"MTP {type(error).__name__}: {error}")
+                    raise
+                finally:
+                    self.active, self.logical_topk = previous
+
+            return forward
+
+        def logits_factory(original):
+            @functools.wraps(original)
+            def logits(hidden_states, *args, **kwargs):
+                result = original(hidden_states, *args, **kwargs)
+                state = self.mtp_last
+                if state is None:
+                    return result
+                indices = state["indices"]
+                for entry in state["entries"]:
+                    rows = [i for i, index in enumerate(indices) if entry["start"] <= index < entry["end"]]
+                    positions = [state["positions"][indices[i]] for i in rows]
+                    selected = torch.tensor(rows, dtype=torch.long, device=result.device)
+                    values = result.index_select(0, selected)
+                    self.record(entry, hidden_states.index_select(0, selected), -1, "logits", "input", positions)
+                    self.record(entry, values, -1, "logits", "output", positions)
+                    self.record(entry, values.argmax(dim=-1), -1, "draft", "token_ids", positions)
+                    entry["archive"].end(entry["call"], entry["observed"])
+                self.mtp_last = None
+                return result
+
+            return logits
+
+        self.patch(drafter, "_run_mtp_draft_layer_with_diagnostics", draft_factory)
+        self.patch(model, "forward", forward_factory)
+        self.patch(model, "compute_logits", logits_factory)
+
+    def start_mtp(self, values):
+        """Map shifted MTP inputs to requests using the actual draft metadata."""
+        if self.mtp_last is not None:
+            raise ValueError("Previous MTP call has no recorded logits")
+        self.active = dict(model="mtp")
+        meta = self.metadata()
+        actual = int(meta.num_actual_tokens)
+        bounds = [int(x) for x in meta.query_start_loc_cpu]
+        ids = cpu_tensor(values["input_ids"]).reshape(-1).tolist()[:actual]
+        positions = self.mtp_runtime["positions"][:actual]
+        if len(ids) != actual or len(positions) != actual:
+            raise ValueError("MTP inputs do not cover its actual query rows")
+        entries = []
+        main_entries = {entry["archive"].metadata["internal_request_id"]: entry for entry in self.last["entries"]}
+        for row, internal in enumerate(self.runner.input_batch.req_ids):
+            start, end = bounds[row : row + 2]
+            if start == end or internal not in main_entries:
+                continue
+            # Padded drafting executes rejected query rows too, but samples the
+            # last accepted row. They are not part of this request's MTP context.
+            scheduled_end = end
+            sample_index = self.mtp_runtime["indices"][row]
+            if not start <= sample_index < end:
+                raise ValueError("MTP sample row is outside its request query")
+            end = sample_index + 1
+            source = main_entries[internal]
+            context = list(source["call"]["context_token_ids"])[1:]
+            query_positions, query_ids = positions[start:end], ids[start:end]
+            needed = max(query_positions) + 1
+            context.extend([None] * max(0, needed - len(context)))
+            for position, token in zip(query_positions, query_ids):
+                context[position] = token
+            context = context[:needed]
+            archive = source["archive"]
+            call = archive.begin(
+                dict(
+                    model="mtp",
+                    parent_call=source["call"]["call"],
+                    draft_step=self.mtp_runtime["draft_step"],
+                    rejected_query_rows=scheduled_end - end,
+                    phase=source["call"]["phase"],
+                    positions=query_positions,
+                    token_ids=query_ids,
+                    context_token_ids=context,
+                    context_complete=all(token is not None for token in context),
+                    position_convention="MTP position p consumes target token p+1 and target hidden state p",
+                ),
+                self.expected("mtp"),
+            )
+            entries.append(dict(archive=archive, call=call, start=start, end=end, row=row, observed=set()))
+        self.active = dict(
+            model="mtp",
+            entries=entries,
+            positions=positions,
+            token_ids=ids,
+            actual=actual,
+            indices=self.mtp_runtime["indices"],
+        )
+        self.mtp_last = self.active
+        self.logical_topk = None
+        local = bool(getattr(self.get_context(), "flash_comm_v1_enabled", False))
+        for name in ("input_ids", "positions", "hidden_states"):
+            self.emit(values[name], -1, "model_input", name, meta, prefer_local=local if name != "input_ids" else False)
+        self.emit(torch.tensor(positions), -1, "model_input", "logical_positions", meta, prefer_local=False)
+
     def restore(self):
         for handle in self.handles:
             handle.remove()
         for owner, name, original in reversed(self.patches):
             setattr(owner, name, original)
 
-    def expected(self):
+    def expected(self, model="main"):
         result = [
             dict(layer=-1, kind=kind, name=name)
             for kind, name in (
@@ -259,7 +432,17 @@ class PDTensorDump:
                 ("logits", "output"),
             )
         ]
-        for layer in self.layers:
+        if model == "mtp":
+            result.extend(
+                dict(layer=-1, kind=kind, name=name)
+                for kind, name in (
+                    ("model_input", "hidden_states"),
+                    ("model_input", "logical_positions"),
+                    ("logits", "input"),
+                    ("draft", "token_ids"),
+                )
+            )
+        for layer in self.mtp_layers if model == "mtp" else self.layers:
             for kind, names in (
                 ("decoder", ("input", "output")),
                 ("sfa", ("input", "output")),
@@ -319,7 +502,8 @@ class PDTensorDump:
                         model_id=str(self.runner.model_config.model),
                         num_layers=len(self.layers),
                         layerwise_prefill=bool(getattr(self.runner, "layerwise_prefill_p_node", False)),
-                        scope="eager main backbone and target verification; MTP draft internals excluded",
+                        scope="eager main backbone, target verification and MTP inputs/KV/logits",
+                        mtp_layers=sorted(self.mtp_layers),
                         sampling_params=str(request.sampling_params),
                         prompt_token_ids=list(request.prompt_token_ids),
                     ),
@@ -327,6 +511,7 @@ class PDTensorDump:
                 self.archives[internal] = archive
             call = archive.begin(
                 dict(
+                    model="main",
                     phase="prefill" if min(query_positions) < len(request.prompt_token_ids) else "decode",
                     positions=query_positions,
                     token_ids=query_ids,
@@ -336,7 +521,7 @@ class PDTensorDump:
                 self.expected(),
             )
             entries.append(dict(archive=archive, call=call, start=start, end=end, row=row, observed=set()))
-        self.active = dict(entries=entries, positions=pos, token_ids=ids, actual=actual)
+        self.active = dict(model="main", entries=entries, positions=pos, token_ids=ids, actual=actual)
         self.last = self.active
         self.logical_topk = None
         self.emit(input_ids, -1, "model_input", "input_ids", meta, prefer_local=False)
@@ -488,6 +673,8 @@ class PDTensorDump:
             # can be zero), so archive the computed global prefix through this
             # chunk's end. D records the prefix its kernel actually consumes.
             prefix = len(entry["call"]["context_token_ids"]) if self.role == "P" else int(lengths[row])
+            if self.active.get("model") == "mtp":
+                prefix = min(prefix, len(entry["call"]["context_token_ids"]))
             positions = torch.arange(prefix, dtype=torch.long)
             if positions.numel() and int(positions[-1]) // block_size >= table.shape[1]:
                 raise ValueError("Indexer block table does not cover prefix")
@@ -651,7 +838,8 @@ class PDTensorDump:
                     continue
                 valid = [int(token) for token in row if 0 <= token < self.runner.input_batch.vocab_size]
                 with (archive.root / "sampled.jsonl").open("a", encoding="utf-8") as stream:
-                    stream.write(json.dumps({"after_call": len(archive.calls) - 1, "token_ids": valid}) + "\n")
+                    entry = next(e for e in self.last["entries"] if e["archive"] is archive)
+                    stream.write(json.dumps({"after_call": entry["call"]["call"], "token_ids": valid}) + "\n")
             for entry in self.last["entries"]:
                 entry["archive"].end(entry["call"], entry["observed"])
         except BaseException as error:

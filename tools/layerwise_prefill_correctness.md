@@ -34,12 +34,15 @@ statistics use only valid token rows, determined from the actual TP context;
 unused padding cannot dominate the error report. KV is saved in logical token
 order, so different physical bank addresses do not count as value differences.
 
-The probes cover every TP rank and main-model prefill layer: decoder inputs and
+The probes cover every TP rank and main/MTP prefill layer: decoder inputs and
 outputs, attention intermediates, logical KV in token order at its consumption
 point, indexer inputs and top-k indices. Producer and shared-indexer layers are
 checked against the actual model configuration. The generated first output
-token is also compared. MTP/decode intermediate tensors and remote Mooncake
-transport are outside this test's scope.
+token is also compared. MTP captures its shifted input IDs, raw model positions,
+logical positions before FlashComm, incoming hidden states, per-layer attention
+and KV, output hidden states, logits and greedy draft IDs for every chunk.
+Later decode intermediate tensors and remote Mooncake transport are outside
+this test's scope. Use the file-PD or four-machine recorder for those stages.
 With MTP1, a final chunk containing only one or two tokens uses decode KV
 remapping. Such prompts are rejected before model loading; choose a different
 `--prompt-tokens` target. Other partial chunks, including TP padding, are covered.
@@ -68,6 +71,9 @@ python tools/layerwise_prefill_correctness.py \
 Only ON is launched. The old ON may have failed or may be absent; only the OFF
 run must have completed with full coverage and all required tensor files.
 This requires a correctness archive, not a performance profile directory.
+An older OFF archive that excluded MTP cannot validate the new MTP observations:
+record a new OFF once. Existing files are preserved and remain available for
+analysis with `--compare-only`; reports state whether `mtp_covered` is true.
 
 The tool reuses the exact saved prompt token IDs without tokenizing again.
 Unspecified model, device list, CPU cache capacity and prompt target inherit
