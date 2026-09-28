@@ -4,6 +4,70 @@
 同时更新 `prefill_layerwise_cache` 分支的 vLLM 和 vLLM-Ascend。
 开关默认为空；未开启时不安装探针、不写文件、不增加 tensor 读回。
 
+## 先做单机预检查
+
+在安装好四个仓库的 Linux Ascend 单机环境中执行，不需要配置文件或 Mooncake 服务：
+
+```bash
+set -o pipefail
+python3 tools/pd_tensor_smoke.py 2>&1 | tee log.log
+```
+
+默认模型是 `/workspace/models/GLM-5.2-w4a8c8-0723`，使用 0–7 卡、TP8/DP1、MTP1，
+约 4608 输入 token、4096 compute chunk、1024 LMCache chunk，D 生成 16 token。
+`max-model-len=16384`、显存利用率 0.97、CPU 缓存 24 GiB，P 的 FlashComm1=1、D=0；两端均 eager。
+模型路径不同时用 `--model /实际模型目录`，例如部署的 GLM-5.3。
+
+默认顺序运行四个独立模型实例：
+
+1. P 关闭 layerwise、开启新抓取开关，运行完整 prefill，保存数据并退出。
+2. D 开启抓取，从上一步文件还原 KV，完成 16 token 输出，然后退出。
+3. P 开启 layerwise 和抓取，重新运行相同 prompt，使用独立的文件存储并退出。
+4. D 从 ON 的文件还原 KV，完成 16 token 输出，然后退出。
+
+本机依次复用同一组卡。仅将 Mooncake SDK 换成已有文件后端，仍走实际 LMCache key/page 和搬运代码。
+抓取来自新的 `VLLM_ASCEND_PD_TENSOR_DUMP_DIR` 生产探针，不安装旧 correctness 探针。
+检查每个 TP 的归档完整性、P 多 chunk 覆盖、D decode 覆盖、D 缓存命中长度 `prompt长度−1`，
+以及两个 DSA group 的实际文件读取；最后自动运行 P→D KV 和 OFF/ON 离线比对。
+它不覆盖真实 Mooncake 网络、多机 DP、图回放或没有读回时的并发竞争。
+
+结果写到新建的 `pd-tensor-smoke-*/`：
+
+```text
+report.json                         # 总体执行/覆盖检查
+off/prefill/server.log              # 各实例原始日志
+off/decode/server.log
+on/prefill/server.log
+on/decode/server.log
+off/capture/P/0/...                 # 按 request ID / TP 保存的新格式原始 tensor
+off/capture/D/0/...
+on/capture/P/0/...
+on/capture/D/0/...
+off/report-pd/report.json           # OFF P→D KV 比较
+on/report-pd/report.json            # ON P→D KV 比较
+report-off-on/report.json           # OFF/ON 逐层比较
+```
+
+`smoke_passed=true` 表示执行、覆盖、传输和输出 token 检查通过，不等于所有浮点 tensor 逐 bit 相等或无并发 bug。
+原始 tensor 占用较多磁盘并且明显减速；没有安装模型/NPU 的机器仅能运行 CPU 回归或 `--dry-run`。
+不会启动后再清理全局 `/dev/shm`；实例退出时仅关闭自己的 LMCache 资源。
+
+可选命令：
+
+```bash
+# 只验证 ON 的 P、D，减少两次模型加载
+python3 tools/pd_tensor_smoke.py --case on 2>&1 | tee log.log
+
+# 很短的 request，用来单独覆盖不足一个 LMCache chunk 的情况
+python3 tools/pd_tensor_smoke.py --case on --prompt '你好，请介绍一下你自己' 2>&1 | tee log.log
+
+# 不加载模型，检查即将使用的参数
+python3 tools/pd_tensor_smoke.py --dry-run
+
+# 重跑已有文件分析，不重新启动模型
+python3 tools/pd_tensor_smoke.py --analyze-only /实际/pd-tensor-smoke-目录
+```
+
 ## 1. 修改现有启动 template
 
 在 `templates/run_vllm_lmcache_tp4_dp4.sh.j4` 的 P/D 公共环境变量部分增加：
