@@ -7,7 +7,9 @@ Example:
         --repo-path /workspace/vllm-ascend --run-id check-001 \
         --container inference --output ./collected-check-001
 
-The remote command only reads ``<repo>/pd-tensor-dump/<run>``. Successful
+Each host first packs ``<repo>/pd-tensor-dump/<run>`` into a temporary gzip
+archive, then sends that archive over SSH. The original dump is never modified.
+Temporary remote archives are cleaned up after transfer. Successful
 collections live under ``<output>/hosts/<safe-host>/`` and are never replaced.
 Rerunning the same command skips successful hosts and retries failed/empty hosts.
 Hosts without this run's files are reported as empty; they need not handle a request.
@@ -20,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import getpass
+import gzip
 import hashlib
 import json
 import os
@@ -30,6 +33,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 from collections.abc import Iterator
 from contextlib import ExitStack, contextmanager
 from datetime import datetime, timezone
@@ -43,6 +47,8 @@ HOST_MAX_LENGTH = 255
 COMPONENT_MAX_LENGTH = 128
 MISSING_RUN_EXIT = 44
 MISSING_RUN_MARKER = "PD_TENSOR_RUN_ABSENT"
+REMOTE_ARCHIVE_MARKER = "PD_TENSOR_ARCHIVE "
+COMPRESSION_THREADS = 4
 # Private transport state, only in a short-lived SSH child's environment; this
 # is not an engine setting and is never passed to a vLLM worker or saved on disk.
 ASKPASS_PASSWORD_ENV = "_PD_TENSOR_SSH_PASSWORD"
@@ -68,11 +74,39 @@ def checked_directory(path):
 REMOTE_COLLECT = (
     REMOTE_PATH_CHECK
     + f"""
+import gzip, json, tempfile, time
 run = root / sys.argv[2]
 if not checked_directory(root) or not checked_directory(run):
     print({MISSING_RUN_MARKER!r}, file=sys.stderr)
     sys.exit({MISSING_RUN_EXIT})
-sys.exit(subprocess.call(['tar', '-C', str(run), '-cf', '-', '--', '.']))
+started = time.monotonic()
+pigz = shutil.which('pigz')
+# Keep the temporary archive outside the dump tree, on the repository disk
+# rather than /dev/shm or a potentially small /tmp. No uncompressed copy.
+with tempfile.TemporaryDirectory(prefix='.pd-tensor-collect-', dir=repo) as temporary:
+    archive = pathlib.Path(temporary) / 'run.tar.gz'
+    with archive.open('xb') as packed:
+        with subprocess.Popen(['tar', '-C', str(run), '-cf', '-', '--', '.'],
+                              stdout=subprocess.PIPE) as tar:
+            try:
+                if pigz:
+                    subprocess.run([pigz, '-1', '-p', '{COMPRESSION_THREADS}'],
+                                   stdin=tar.stdout, stdout=packed, check=True)
+                else:
+                    with gzip.GzipFile(fileobj=packed, mode='wb', compresslevel=1) as compressed:
+                        shutil.copyfileobj(tar.stdout, compressed, length={COPY_BUFFER_BYTES})
+            finally:
+                tar.stdout.close()
+            if tar.wait():
+                raise RuntimeError('remote tar failed; archive will not be sent')
+    metadata = {{'compression': 'pigz' if pigz else 'python-gzip',
+                 'archive_bytes': archive.stat().st_size,
+                 'pack_seconds': round(time.monotonic() - started, 3)}}
+    print({REMOTE_ARCHIVE_MARKER!r} + json.dumps(metadata), file=sys.stderr, flush=True)
+    # Nothing is sent until the complete compressed archive is ready.
+    with archive.open('rb') as source:
+        shutil.copyfileobj(source, sys.stdout.buffer, length={COPY_BUFFER_BYTES})
+    sys.stdout.buffer.flush()
 """
 )
 WINDOWS_RESERVED_NAMES = frozenset(
@@ -314,7 +348,12 @@ def safe_extract(archive_path: Path, destination: Path) -> dict[str, int]:
     root = destination.resolve()
     seen: set[str] = set()
     files = total_bytes = 0
-    with tarfile.open(archive_path, mode="r|*") as archive:
+    with ExitStack() as stack:
+        raw = stack.enter_context(archive_path.open("rb"))
+        is_gzip = raw.read(2) == b"\x1f\x8b"
+        raw.seek(0)
+        stream = stack.enter_context(gzip.GzipFile(fileobj=raw, mode="rb")) if is_gzip else raw
+        archive = stack.enter_context(tarfile.open(fileobj=stream, mode="r|"))
         for member in archive:
             relative = member_path(member)
             if relative == PurePosixPath("."):
@@ -339,6 +378,11 @@ def safe_extract(archive_path: Path, destination: Path) -> dict[str, int]:
                 raise ValueError(f"incomplete archive file: {member.name!r}")
             files += 1
             total_bytes += member.size
+        # Tar ends before the gzip trailer. Drain it to verify CRC and length;
+        # otherwise an interrupted download can be published as successful.
+        if is_gzip:
+            while stream.read(COPY_BUFFER_BYTES):
+                pass
     return {"files": files, "bytes": total_bytes}
 
 
@@ -434,7 +478,7 @@ def collect_host(root: Path, args: argparse.Namespace, remote_source: str, host:
     if destination.exists() or destination.is_symlink():
         raise ValueError(f"refusing to overwrite existing host directory: {destination}")
     prefix = host_directory(target) + "-"
-    fd, archive_name = tempfile.mkstemp(prefix=prefix, suffix=".tar.partial", dir=root / "partials")
+    fd, archive_name = tempfile.mkstemp(prefix=prefix, suffix=".tar.gz.partial", dir=root / "partials")
     archive_path = Path(archive_name)
     stderr_path = archive_path.with_suffix(".stderr")
     attempt: dict[str, Any] = {
@@ -446,8 +490,12 @@ def collect_host(root: Path, args: argparse.Namespace, remote_source: str, host:
     host.setdefault("attempts", []).append(attempt)
     host["status"] = "running"
     try:
+        print(f"[PD_TENSOR_COLLECT] {target}: packing remotely, then downloading .tar.gz", flush=True)
+        started = time.monotonic()
         with os.fdopen(fd, "wb") as output, stderr_path.open("xb") as errors:
             result = run_ssh(args, target, ssh_command(args, target, remote_source), stdout=output, stderr=errors)
+        attempt["pack_download_seconds"] = round(time.monotonic() - started, 3)
+        attempt["archive_bytes"] = archive_path.stat().st_size
         attempt["ssh_returncode"] = result.returncode
         if (
             result.returncode == MISSING_RUN_EXIT
@@ -464,9 +512,27 @@ def collect_host(root: Path, args: argparse.Namespace, remote_source: str, host:
         if result.returncode:
             reason = stderr_tail(stderr_path)
             raise RuntimeError(f"SSH/tar exited {result.returncode}: {reason}")
+        metadata = next(
+            (
+                line.removeprefix(REMOTE_ARCHIVE_MARKER)
+                for line in stderr_tail(stderr_path).splitlines()
+                if line.startswith(REMOTE_ARCHIVE_MARKER)
+            ),
+            None,
+        )
+        if metadata is not None:
+            attempt["remote_archive"] = json.loads(metadata)
+            if attempt["remote_archive"]["archive_bytes"] != attempt["archive_bytes"]:
+                raise ValueError("downloaded archive size differs from remote archive")
+        print(
+            f"[PD_TENSOR_COLLECT] {target}: downloaded {attempt['archive_bytes']} bytes; extracting locally",
+            flush=True,
+        )
         partial = Path(tempfile.mkdtemp(prefix=prefix, suffix=".extract.partial", dir=root / "partials"))
         attempt["partial_directory"] = partial.relative_to(root).as_posix()
+        started = time.monotonic()
         counts = safe_extract(archive_path, partial)
+        attempt["extract_seconds"] = round(time.monotonic() - started, 3)
         if not counts["files"]:
             attempt.update(counts)
             host.update(counts)
@@ -538,6 +604,16 @@ def collect(args: argparse.Namespace) -> int:
                         if host["status"] == "empty"
                         else f"files={host['files']} bytes={host['bytes']}"
                     )
+                    attempt = host["attempts"][-1]
+                    if host["status"] == "success":
+                        detail += (
+                            f" archive_bytes={attempt['archive_bytes']}"
+                            f" pack_download_s={attempt['pack_download_seconds']:.1f}"
+                            f" extract_s={attempt['extract_seconds']:.1f}"
+                        )
+                        if "remote_archive" in attempt:
+                            remote = attempt["remote_archive"]
+                            detail += f" compressor={remote['compression']} pack_s={remote['pack_seconds']:.1f}"
                     print(f"[PD_TENSOR_COLLECT] {host['target']}: {detail}", flush=True)
                 except Exception as error:
                     host["status"] = "failed"
@@ -591,9 +667,12 @@ def analyze_pd(root: Path) -> int:
     """Load the optional tensor dependencies only for an explicit analysis."""
     output = root / "report-pd"
     try:
+        print("[PD_TENSOR_COLLECT] downloads complete; analyzing local tensors", flush=True)
+        started = time.monotonic()
         from pd_tensor_analyze import analyze
 
         report = analyze([root], [root], mode="pd-kv", output=output)
+        print(f"[PD_TENSOR_COLLECT] local analysis finished in {time.monotonic() - started:.1f}s", flush=True)
         status = report["status"]
         summary = {
             "status": status,

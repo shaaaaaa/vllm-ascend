@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """CPU-only collection tests; SSH is mocked and archives contain inert bytes."""
 
+import gzip
 import importlib.util
 import io
 import json
@@ -70,7 +71,8 @@ def test_collect_four_hosts_preserves_role_request_worker_tree(tmp_path, monkeyp
         ("./decode/request-a/rank1/coverage.json", b'{"complete":true}'),
     ]
     commands = []
-    stub_ssh(monkeypatch, tar_bytes(entries), commands=commands)
+    compressed = gzip.compress(tar_bytes(entries), compresslevel=1)
+    stub_ssh(monkeypatch, compressed, commands=commands)
     hosts = tuple(f"user@192.0.2.{i}" for i in range(10, 14))
     assert collector.main(argv(tmp_path, hosts)) == 0
     manifest = read_manifest(tmp_path)
@@ -85,7 +87,8 @@ def test_collect_four_hosts_preserves_role_request_worker_tree(tmp_path, monkeyp
         for relative, payload in entries:
             assert (tmp_path / "collected" / host["directory"] / relative).read_bytes() == payload
         assert "archive_path" not in host["attempts"][0]
-    assert not list((tmp_path / "collected" / "partials").glob("*.tar.partial"))
+        assert host["attempts"][0]["archive_bytes"] == len(compressed)
+    assert not list((tmp_path / "collected" / "partials").glob("*.gz.partial"))
     assert not (tmp_path / "collected" / ".collection.lock").exists()
 
 
@@ -300,7 +303,7 @@ def test_real_remote_probe_distinguishes_missing_run_from_invalid_repository(tmp
         assert collector.MISSING_RUN_MARKER.encode() not in result.stderr
 
 
-def test_real_remote_probe_streams_tar_into_safe_extractor(tmp_path):
+def test_real_remote_probe_sends_gzip_into_safe_extractor_and_cleans_temporary_archive(tmp_path):
     if collector.shutil.which("tar") is None:
         pytest.skip("tar unavailable")
     repo = tmp_path / "repo with spaces"
@@ -309,13 +312,134 @@ def test_real_remote_probe_streams_tar_into_safe_extractor(tmp_path):
     (run / "tensor.pt").write_bytes(b"inert payload")
     result = subprocess.run([sys.executable, "-c", collector.REMOTE_COLLECT, str(repo), "run"], capture_output=True)
     assert result.returncode == 0, result.stderr
-    archive = tmp_path / "archive.tar"
+    assert result.stdout.startswith(b"\x1f\x8b")
+    metadata = json.loads(result.stderr.decode().split(collector.REMOTE_ARCHIVE_MARKER)[1])
+    assert metadata["archive_bytes"] == len(result.stdout)
+    assert metadata["compression"] in ("pigz", "python-gzip")
+    assert metadata["pack_seconds"] >= 0
+    assert not list(repo.glob(".pd-tensor-collect-*"))
+    assert (run / "tensor.pt").read_bytes() == b"inert payload"
+    archive = tmp_path / "archive.tar.gz"
     archive.write_bytes(result.stdout)
     destination = tmp_path / "extract"
     destination.mkdir()
     counts = collector.safe_extract(archive, destination)
     assert counts == {"files": 1, "bytes": len(b"inert payload")}
     assert (destination / "P/request/worker/tensor.pt").read_bytes() == b"inert payload"
+
+
+@pytest.mark.parametrize("damage", ["trailer_missing", "crc", "length", "truncated_payload"])
+def test_compressed_archive_damage_is_rejected_before_publication(tmp_path, monkeypatch, damage):
+    compressed = bytearray(gzip.compress(tar_bytes([("tensor.pt", b"data" * 20000)])))
+    if damage == "trailer_missing":
+        compressed = compressed[:-8]
+    elif damage == "crc":
+        compressed[-8] ^= 1
+    elif damage == "length":
+        compressed[-1] ^= 1
+    else:
+        compressed = compressed[: len(compressed) // 2]
+    stub_ssh(monkeypatch, compressed)
+    assert collector.main(argv(tmp_path)) == 1
+    host = read_manifest(tmp_path)["hosts"][0]
+    assert host["status"] == "failed"
+    assert not (tmp_path / "collected" / host["directory"]).exists()
+    assert (tmp_path / "collected" / host["attempts"][0]["archive_path"]).read_bytes() == compressed
+
+
+def test_remote_archive_size_and_timings_are_recorded(tmp_path, monkeypatch, capsys):
+    compressed = gzip.compress(tar_bytes([("tensor.pt", b"data" * 20000)]), compresslevel=1)
+    metadata = {"compression": "pigz", "archive_bytes": len(compressed), "pack_seconds": 0.1}
+    stub_ssh(monkeypatch, compressed, error=(collector.REMOTE_ARCHIVE_MARKER + json.dumps(metadata)).encode())
+    assert collector.main(argv(tmp_path)) == 0
+    attempt = read_manifest(tmp_path)["hosts"][0]["attempts"][0]
+    assert attempt["remote_archive"] == metadata
+    assert attempt["pack_download_seconds"] >= 0
+    assert attempt["extract_seconds"] >= 0
+    assert "compressor=pigz pack_s=0.1" in capsys.readouterr().out
+
+
+def test_remote_archive_size_mismatch_is_not_published(tmp_path, monkeypatch):
+    compressed = gzip.compress(tar_bytes([("tensor.pt", b"data")]))
+    metadata = {"compression": "pigz", "archive_bytes": len(compressed) + 1, "pack_seconds": 0.1}
+    stub_ssh(monkeypatch, compressed, error=(collector.REMOTE_ARCHIVE_MARKER + json.dumps(metadata)).encode())
+    assert collector.main(argv(tmp_path)) == 1
+    host = read_manifest(tmp_path)["hosts"][0]
+    assert "size differs" in host["error"]
+    assert not (tmp_path / "collected" / host["directory"]).exists()
+
+
+@pytest.mark.parametrize("failure", ["missing_tar", "tar_failed"])
+def test_remote_pack_failure_sends_nothing_and_cleans_temporary_archive(tmp_path, failure):
+    repo = tmp_path / "repository"
+    run = repo / "pd-tensor-dump/run"
+    run.mkdir(parents=True)
+    (run / "tensor.pt").write_bytes(b"keep")
+    # Windows also searches System32 even without PATH. Inject a failed tar
+    # startup/exit into the child process so both failure cases are portable.
+    prelude = f"""
+import subprocess, sys
+real_popen = subprocess.Popen
+def failed_tar(*args, **kwargs):
+    if {failure!r} == 'missing_tar':
+        raise FileNotFoundError('tar unavailable')
+    return real_popen([sys.executable, '-c', 'import sys; sys.exit(7)'], **kwargs)
+subprocess.Popen = failed_tar
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", prelude + collector.REMOTE_COLLECT, str(repo), "run"],
+        capture_output=True,
+        cwd=tmp_path,
+        timeout=30,
+    )
+    assert result.returncode != 0
+    assert not result.stdout
+    assert not list(repo.glob(".pd-tensor-collect-*"))
+    assert (run / "tensor.pt").read_bytes() == b"keep"
+
+
+@pytest.mark.parametrize("use_pigz", [False, True])
+@pytest.mark.parametrize("broken_transfer", [False, True])
+def test_remote_finishes_archive_before_transfer_and_cleans_after_disconnect(
+    tmp_path, monkeypatch, use_pigz, broken_transfer
+):
+    if collector.shutil.which("tar") is None:
+        pytest.skip("tar unavailable")
+    repo = tmp_path / "repository"
+    run = repo / "pd-tensor-dump/run"
+    run.mkdir(parents=True)
+    payload = b"tensor bytes" * 10000
+    (run / "tensor.pt").write_bytes(payload)
+
+    class Receiver(io.BytesIO):
+        def write(self, data):
+            # Inspect the remote temporary file at the first transmitted byte.
+            archives = list(repo.glob(".pd-tensor-collect-*/run.tar.gz"))
+            assert len(archives) == 1
+            assert payload in gzip.decompress(archives[0].read_bytes())
+            if broken_transfer:
+                raise BrokenPipeError("SSH disconnected")
+            return super().write(data)
+
+    def pigz(command, *, stdin, stdout, check):
+        assert command == ["pigz", "-1", "-p", str(collector.COMPRESSION_THREADS)]
+        assert check is True
+        stdout.write(gzip.compress(stdin.read(), compresslevel=1))
+        return subprocess.CompletedProcess(command, 0)
+
+    receiver = Receiver()
+    monkeypatch.setattr(sys, "argv", ["remote", str(repo), "run"])
+    monkeypatch.setattr(sys, "stdout", SimpleNamespace(buffer=receiver))
+    monkeypatch.setattr(collector.shutil, "which", lambda _: "pigz" if use_pigz else None)
+    monkeypatch.setattr(collector.subprocess, "run", pigz)
+    if broken_transfer:
+        with pytest.raises(BrokenPipeError):
+            exec(collector.REMOTE_COLLECT, {})
+    else:
+        exec(collector.REMOTE_COLLECT, {})
+        assert payload in gzip.decompress(receiver.getvalue())
+    assert not list(repo.glob(".pd-tensor-collect-*"))
+    assert (run / "tensor.pt").read_bytes() == payload
 
 
 @pytest.mark.parametrize("value", [None, ""])
