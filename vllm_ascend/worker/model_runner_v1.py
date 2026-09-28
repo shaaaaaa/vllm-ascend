@@ -5561,11 +5561,6 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
             self.update_stream: torch.npu.Stream = torch.npu.Stream()
             self.model = ACLGraphWrapper(self.model, self.vllm_config, runtime_mode=CUDAGraphMode.FULL)
 
-        if envs_ascend.VLLM_ASCEND_PD_TENSOR_DUMP_DIR:
-            from vllm_ascend.pd_tensor_dump import install_pd_tensor_dump
-
-            self._pd_tensor_dump = install_pd_tensor_dump(self, envs_ascend.VLLM_ASCEND_PD_TENSOR_DUMP_DIR)
-
     def _validate_sfa_layerwise_connector_cudagraph_mode(self) -> None:
         """Reject full-model replay that would bypass layerwise retrieval."""
         layerwise_prefill_p_node = bool(
@@ -5780,6 +5775,19 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
 
         if self.model_config.enable_return_routed_experts:
             self.init_routed_experts_capturer()
+
+        if (
+            envs_ascend.VLLM_ASCEND_PD_TENSOR_DUMP_DIR
+            and not self._profiling_cudagraph_memory
+            and getattr(self, "_pd_tensor_dump", None) is None
+        ):
+            # The worker initializes the KV connector before this method.
+            # LMCache-Ascend replaces LMCacheEngineConfig during that import;
+            # reading it at model-load time leaves the config singleton and
+            # imported class aliases referring to different types.
+            from vllm_ascend.pd_tensor_dump import install_pd_tensor_dump
+
+            self._pd_tensor_dump = install_pd_tensor_dump(self, envs_ascend.VLLM_ASCEND_PD_TENSOR_DUMP_DIR)
 
     def _maybe_init_dsa_latent_offload(self) -> None:
         """Build the DSA latent-offload manager (GLM5.1) when enabled.

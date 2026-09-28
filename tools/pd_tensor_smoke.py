@@ -15,6 +15,7 @@ multi-host DP, graph replay or unobserved asynchronous races.
 
 import argparse
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -180,6 +181,15 @@ def wait_capture_finished(root, role, tp_size, request_id, timeout=120):
 
 
 def run_child(args):
+    # Match the profile launcher: every LMCache setting comes from the
+    # script-built child environment, including when --child is invoked directly.
+    os.environ.pop("LMCACHE_CONFIG_FILE", None)
+    print(
+        f"{PREFIX} configuration: inline script options + environment; no config file required; "
+        f"store_async={os.environ.get('LMCACHE_STORE_ASYNC')}; "
+        f"store_async_max_queue_size={os.environ.get('LMCACHE_STORE_ASYNC_MAX_QUEUE_SIZE')}",
+        flush=True,
+    )
     from layerwise_prefill_file_store import install
 
     install()

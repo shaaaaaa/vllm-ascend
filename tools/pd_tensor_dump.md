@@ -27,6 +27,9 @@ python3 tools/pd_tensor_smoke.py 2>&1 | tee log.log
 
 本机依次复用同一组卡。仅将 Mooncake SDK 换成已有文件后端，仍走实际 LMCache key/page 和搬运代码。
 抓取来自新的 `VLLM_ASCEND_PD_TENSOR_DUMP_DIR` 生产探针，不安装旧 correctness 探针。
+单机脚本沿用 profile 的内置参数和环境变量方式，清除继承的 `LMCACHE_CONFIG_FILE`，无需准备 YAML。
+LMCache 的 `No LMCache configuration file is set` 提示表示使用环境变量，并非要求补配置文件。
+探针在 KV connector 初始化后安装，避免提前读取尚未由 LMCache-Ascend 扩展的配置类。
 检查每个 TP 的归档完整性、P 多 chunk 覆盖、D decode 覆盖、D 缓存命中长度 `prompt长度−1`，
 以及两个 DSA group 的实际文件读取；最后自动运行 P→D KV 和 OFF/ON 离线比对。
 它不覆盖真实 Mooncake 网络、多机 DP、图回放或没有读回时的并发竞争。

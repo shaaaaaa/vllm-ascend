@@ -3,6 +3,7 @@
 
 import importlib
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -233,12 +234,15 @@ def test_p_failure_never_starts_d(smoke, tmp_path, monkeypatch, failure, match, 
 
 def fake_llm(smoke, root, stage, monkeypatch, *, fail=None):
     events = []
+    monkeypatch.setenv("LMCACHE_CONFIG_FILE", "/stale/nonexistent-config.yaml")
     failures = {fail} if isinstance(fail, str) else set(fail or [])
     store = importlib.import_module("layerwise_prefill_file_store")
     monkeypatch.setattr(store, "install", lambda: events.append("sdk-install"))
 
     class LLM:
         def __init__(self, **options):
+            # Even the internal entry point must ignore a stale external YAML.
+            assert "LMCACHE_CONFIG_FILE" not in os.environ
             events.append("model-init")
             if "init" in failures:
                 raise RuntimeError("init failure")
