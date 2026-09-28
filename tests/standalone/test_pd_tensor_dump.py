@@ -22,7 +22,7 @@ def module():
     return loaded
 
 
-def make_probe(module, tmp_path, prompts, *, cp=None, external=None):
+def make_probe(module, tmp_path, prompts, *, cp=None, external=None, max_token_rows=64):
     ids = list(prompts)
     requests = {
         key: NS(prompt_token_ids=list(tokens), output_token_ids=[], sampling_params="max_tokens=16")
@@ -41,6 +41,7 @@ def make_probe(module, tmp_path, prompts, *, cp=None, external=None):
         "D",
         dict(host="worker.test", pid=123, tp_rank=1, tp_size=4, dp_rank=2, dp_size=4),
         lambda: NS(attn_metadata={"layer0": meta}),
+        max_token_rows=max_token_rows,
     )
     probe.layers = {0: object()}
     probe.attentions = {1: (0, "layer0")}
@@ -394,7 +395,7 @@ def begin_decode(module, tmp_path):
     probe, _, meta = make_probe(module, tmp_path, {"a": [10, 11], "b": [20, 21]})
     ids, positions = batch(meta, [([1], [11]), ([1], [21])])
     probe.start(ids, positions)
-    probe.logical_topk = torch.tensor([[0, 1], [0, 1]])
+    probe.capture_topk(torch.tensor([[0, 1], [0, 1]]), meta)
     return probe, meta
 
 
@@ -409,6 +410,7 @@ def test_consumed_kv_uses_each_requests_actual_block_table(module, tmp_path):
 def test_empty_tp_query_shard_records_no_padding_kv(module, tmp_path):
     probe, meta = begin_decode(module, tmp_path)
     meta.dsa_cp_context = NS(local_start=2, local_end=2, local_end_with_pad=4)
+    probe.capture_topk(torch.tensor([[0, 1], [0, 1]]), meta)
     values = attention_inputs()
     values["sparse_indices"].fill_(-1)
     probe.attention_kv(values, 0, meta)
@@ -433,7 +435,7 @@ def test_consumed_kv_invalid_mapping_fails_closed(module, tmp_path, invalid):
 @pytest.mark.parametrize("values", [[4.0, 5.0], [4.0, 4.0], [float("nan"), float("nan")]])
 def test_consumed_kv_preserves_every_physical_alias_for_offline_analysis(module, tmp_path, values):
     probe, meta = begin_decode(module, tmp_path)
-    probe.logical_topk[0] = torch.tensor([0, 0])
+    probe.capture_topk(torch.tensor([[0, 0], [0, 1]]), meta)
     inputs = attention_inputs()
     inputs["key"].reshape(-1)[4:6] = torch.tensor(values)
     probe.attention_kv(inputs, 0, meta)
@@ -454,7 +456,7 @@ def test_consumed_kv_preserves_every_physical_alias_for_offline_analysis(module,
 
 def test_consumed_kv_deduplicates_only_the_same_logical_physical_pair(module, tmp_path):
     probe, meta = begin_decode(module, tmp_path)
-    probe.logical_topk[0] = torch.tensor([0, 0])
+    probe.capture_topk(torch.tensor([[0, 0], [0, 1]]), meta)
     inputs = attention_inputs()
     inputs["sparse_indices"][0] = torch.tensor([0, 0])
     probe.attention_kv(inputs, 0, meta)
@@ -469,6 +471,154 @@ def test_indexer_kv_reads_history_by_request_table(module, tmp_path):
     probe.indexer_kv(values["key"], values["block_table"], torch.tensor([2, 1]), 0, "key")
     assert value_for(probe.archives["a"], "kv_indexer", "key").flatten().tolist() == [4, 5]
     assert value_for(probe.archives["b"], "kv_indexer", "key").flatten().tolist() == [0]
+
+
+@pytest.mark.parametrize("limit,expected", [(128, 128), (16, 16), (0, 300)])
+def test_sampling_slices_before_readback_and_preserves_feature_axes(module, tmp_path, monkeypatch, limit, expected):
+    probe, _, meta = make_probe(module, tmp_path, {"a": list(range(300))}, max_token_rows=limit)
+    ids, positions = batch(meta, [(list(range(300)), list(range(300)))])
+    probe.start(ids, positions)
+    copied = []
+    original = module.cpu_tensor
+
+    def observe(value):
+        copied.append(tuple(value.shape))
+        return original(value)
+
+    monkeypatch.setattr(module, "cpu_tensor", observe)
+    value = torch.arange(300 * 2 * 3).reshape(300, 2, 3)
+    probe.emit(value, 0, "decoder", "input", meta)
+    assert copied == [(expected, 2, 3)]
+    archive = probe.archives["a"]
+    record = record_for(archive, "decoder", "input")
+    assert record["positions"] == list(range(expected))
+    assert record["row_capture"]["source_rows"] == 300
+    torch.testing.assert_close(value_for(archive, "decoder", "input"), value[:expected])
+    # Sampling decision evidence has no token-row axis. Even a long vocabulary
+    # or multi-draft vector must remain intact for offline acceptance analysis.
+    entry = probe.active["entries"][0]
+    probe.record(entry, torch.ones(1, 300), -1, "rejection", "target_logits")
+    assert value_for(archive, "rejection", "target_logits").shape == (1, 300)
+
+
+def test_sampling_is_per_request_and_per_tp_shard(module, tmp_path):
+    cp = NS(local_start=100, local_end=400, local_end_with_pad=410)
+    prompts = {"a": list(range(250)), "b": list(range(250))}
+    probe, _, meta = make_probe(module, tmp_path, prompts, cp=cp)
+    inputs, positions = batch(meta, [(list(range(250)), list(range(250)))] * 2)
+    probe.start(inputs, positions)
+    values = torch.arange(310).reshape(-1, 1)
+    probe.emit(values, 0, "sfa", "input", meta)
+    for request, first, source in (("a", 100, 150), ("b", 0, 150)):
+        row = record_for(probe.archives[request], "sfa", "input")
+        assert row["positions"] == list(range(first, first + 64))
+        assert row["row_capture"]["source_rows"] == source
+    assert value_for(probe.archives["b"], "sfa", "input")[0].item() == 150
+
+
+@pytest.mark.parametrize("role", ["P", "D"])
+def test_history_and_current_kv_gather_are_bounded_before_index_select(module, tmp_path, monkeypatch, role):
+    probe, _, meta = make_probe(module, tmp_path, {"a": list(range(8192))})
+    probe.role = role
+    ids, positions = batch(meta, [(list(range(4096, 8192)), list(range(4096, 8192)))])
+    probe.start(ids, positions)
+    meta.slot_mapping = torch.arange(4096, 8192)
+    cache = torch.arange(8192 * 2).reshape(2, 4096, 1, 2)
+    selected_rows = []
+    original = torch.Tensor.index_select
+
+    def select(value, dim, indices):
+        selected_rows.append(len(indices))
+        return original(value, dim, indices)
+
+    monkeypatch.setattr(torch.Tensor, "index_select", select)
+    probe.current_kv([cache, cache], 0, meta)
+    probe.indexer_kv(cache, torch.tensor([[0, 1]]), torch.tensor([8192]), 0, "key")
+    assert selected_rows == [64, 64, 128]
+    archive = probe.archives["a"]
+    assert record_for(archive, "kv_current", "nope")["positions"] == list(range(4096, 4160))
+    history = record_for(archive, "kv_indexer", "key")
+    assert history["positions"] == list(range(64)) + list(range(4096, 4160))
+    assert history["row_capture"]["source_rows"] == 8192
+    assert [s["length"] for s in history["row_capture"]["segments"]] == [4096, 4096]
+
+
+def test_topk_snapshot_is_bounded_and_survives_inplace_remapping(module, tmp_path, monkeypatch):
+    probe, _, meta = make_probe(module, tmp_path, {"a": list(range(300))}, max_token_rows=2)
+    ids, positions = batch(meta, [(list(range(297, 300)), list(range(297, 300)))])
+    probe.start(ids, positions)
+    indices = torch.arange(300).repeat(3, 1)
+    copies, gathered = [], []
+    original_cpu, original_select = module.cpu_tensor, torch.Tensor.index_select
+
+    def cpu(value):
+        copies.append(tuple(value.shape))
+        return original_cpu(value)
+
+    def select(value, dim, index):
+        gathered.append(len(index))
+        return original_select(value, dim, index)
+
+    monkeypatch.setattr(module, "cpu_tensor", cpu)
+    monkeypatch.setattr(torch.Tensor, "index_select", select)
+    probe.sfa_stack.append((0, meta))
+    # Exercise the real wrapper used by layers reusing an indexer result.
+    assert probe.shared_topk_factory(lambda: indices)() is indices
+    assert copies == [(2, 300)]
+    indices[0].zero_()  # Production post-processing may mutate this storage.
+    cache = torch.arange(300).reshape(1, 300, 1, 1)
+    probe.attention_kv(
+        dict(
+            query=torch.zeros(3, 1, 1),
+            sparse_indices=indices,
+            block_table=torch.tensor([[0]]),
+            actual_seq_lengths_kv=torch.tensor([300]),
+            actual_seq_lengths_query=torch.tensor([3]),
+            key=cache,
+            key_rope=cache,
+        ),
+        0,
+        meta,
+    )
+    archive = probe.archives["a"]
+    logical = value_for(archive, "attention", "logical_topk")
+    assert logical.shape == (2, 300) and logical[0, 1].item() == 1
+    assert (3, 300) not in copies
+    assert gathered == [2, 2]
+    consumed = record_for(archive, "kv_consumed", "nope")
+    assert len(consumed["positions"]) == 2
+    assert consumed["row_capture"]["query_rows"]["source_rows"] == 3
+    assert consumed["row_capture"]["query_rows"]["saved_rows"] == 2
+
+
+def test_negative_row_limit_is_rejected_before_install(module, tmp_path):
+    with pytest.raises(ValueError, match="integer in"):
+        make_probe(module, tmp_path, {"a": [1]}, max_token_rows=-1)
+
+
+def test_fixed_chunks_preserve_same_kv_offsets_across_p_and_d_and_partial_tail(module, tmp_path):
+    copied = []
+    for role in ("P", "D"):
+        probe, _, meta = make_probe(module, tmp_path / role, {"a": list(range(8200))})
+        probe.role = role
+        query = list(range(8192, 8200)) if role == "P" else [8199]
+        ids, positions = batch(meta, [(query, query)])
+        probe.start(ids, positions)
+        cache = torch.arange(12288).reshape(3, 4096, 1, 1)
+        # A zero-filled later physical block must never be mistaken for a
+        # complete 4096-token logical tail: only eight positions are live.
+        probe.indexer_kv(cache, torch.tensor([[0, 1, 2]]), torch.tensor([8200]), 0, "key")
+        row = record_for(probe.archives["a"], "kv_indexer", "key")
+        assert row["positions"] == list(range(64)) + list(range(4096, 4160)) + list(range(8192, 8200))
+        assert [s["length"] for s in row["row_capture"]["segments"]] == [4096, 4096, 8]
+        assert row["shape"][0] == 136
+        # Query capture uses visible rows: D's last prompt token must survive
+        # even if it lies outside a fixed KV sample window.
+        assert record_for(probe.archives["a"], "model_input", "positions")["positions"] == query
+        copied.append(value_for(probe.archives["a"], "kv_indexer", "key"))
+    torch.testing.assert_close(*copied)
+    assert module.sample_rows(range(4000, 4096), 64, 4096, aligned=True)[0] == []
+    assert module.sample_rows(range(4000, 4096), 64, 4096)[0] == list(range(4000, 4064))
 
 
 @pytest.mark.parametrize("local_lengths", [[0, 0], [1, 1]])

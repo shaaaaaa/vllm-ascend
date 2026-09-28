@@ -152,6 +152,56 @@ def _check_call(call: dict, number: int) -> None:
         )
 
 
+def _check_row_capture(capture, context_length, saved_rows=None):
+    _require(isinstance(capture, dict), "invalid row capture metadata")
+    source, saved, limit = (capture.get(key) for key in ("source_rows", "saved_rows", "limit"))
+    _require(all(_integer(value) for value in (source, saved, limit)), "invalid row capture counts")
+    _require(capture.get("chunk_size") == 4096 and limit <= 4096, "invalid capture segment size/limit")
+    _require(capture.get("strategy") in ("absolute_chunk_prefix", "visible_chunk_prefix"), "invalid capture strategy")
+    indices = capture.get("source_indices")
+    _require(
+        _integers(indices)
+        and len(indices) == saved
+        and indices == sorted(set(indices))
+        and all(index < source for index in indices),
+        "invalid captured source row indices",
+    )
+    if saved_rows is not None:
+        _require(saved == saved_rows, "row capture count differs from stored shape")
+    segments = capture.get("segments")
+    _require(isinstance(segments, list), "missing capture segment metadata")
+    total_source = total_saved = 0
+    previous = -1
+    for segment in segments:
+        _require(isinstance(segment, dict), "invalid capture segment")
+        base, length = segment.get("start"), segment.get("length")
+        _require(
+            _integer(base)
+            and base % 4096 == 0
+            and base > previous
+            and _integer(length, 1)
+            and length <= min(4096, context_length - base),
+            "invalid capture segment range",
+        )
+        previous = base
+        count, kept = segment.get("source_rows"), segment.get("saved_rows")
+        _require(_integer(count, 1) and _integer(kept) and kept <= count, "invalid capture segment counts")
+        _require(kept <= limit if limit else kept == count, "capture exceeds segment limit")
+        if capture["strategy"] == "visible_chunk_prefix":
+            _require(kept == min(count, limit) if limit else kept == count, "missing visible segment rows")
+        bounds = segment.get("omitted_position_bounds")
+        if count == kept:
+            _require(bounds is None, "complete segment claims omitted rows")
+        else:
+            _require(
+                _integers(bounds) and len(bounds) == 2 and base <= bounds[0] < bounds[1] <= base + length,
+                "invalid omitted logical position bounds",
+            )
+        total_source += count
+        total_saved += kept
+    _require((source, saved) == (total_source, total_saved), "capture totals differ from segment counts")
+
+
 def _check_record(record: dict, worker: Worker) -> None:
     _require(record.get("schema") == 1, "invalid tensor record schema")
     _require(record.get("request_id") == worker.manifest["request_id"], "record request ID differs from manifest")
@@ -173,6 +223,19 @@ def _check_record(record: dict, worker: Worker) -> None:
     )
     axis = record.get("row_axis")
     _require(axis is None or type(axis) is int and axis == 0, "unsupported row axis")
+    if "row_capture" in record:
+        _require(axis == 0 and bool(record["shape"]), "row capture requires a token axis")
+        capture = record["row_capture"]
+        context_length = len(worker.calls[record["call"]]["context_token_ids"])
+        _check_row_capture(capture, context_length, record["shape"][0])
+        if "query_rows" in capture:
+            _require(record["kind"] == "kv_consumed", "query sampling only describes consumed KV")
+            _check_row_capture(capture["query_rows"], context_length)
+        if "logical_chunk_filter" in capture:
+            _require(
+                record["kind"] == "kv_consumed" and type(capture["logical_chunk_filter"]) is bool,
+                "invalid consumed KV sampling filter",
+            )
     if "physical_slots" in record:
         slots = record["physical_slots"]
         _require(
@@ -611,6 +674,50 @@ def _observation_order(marker: dict) -> tuple:
     )
 
 
+def _outside_sample(worker, refs, call, position):
+    """A matching capture may have omitted this row; never claim it was checked."""
+    for ref in refs:
+        if not _compatible_context(worker.calls[ref["call"]], call, position):
+            continue
+        capture = ref.get("row_capture", {})
+        for segment in capture.get("segments", []):
+            bounds = segment.get("omitted_position_bounds")
+            if bounds and bounds[0] <= position < bounds[1]:
+                return True
+        if capture.get("logical_chunk_filter") and position % capture["chunk_size"] >= capture["limit"]:
+            return True
+        # Unobserved attention queries can select any preceding KV position.
+        # We did not inspect those indices, so cannot infer consumed coverage.
+        for segment in capture.get("query_rows", {}).get("segments", []):
+            query_bounds = segment.get("omitted_position_bounds")
+            if query_bounds and 0 <= position < query_bounds[1]:
+                return True
+    return False
+
+
+def _capture_summary(archive):
+    result = dict(sampled_tensors=0, saved_token_rows=0, omitted_token_rows=0, query_limited_tensors=0)
+    for worker in archive.workers.values():
+        for record in worker.records:
+            capture = record.get("row_capture", {})
+            omitted = capture.get("source_rows", 0) - capture.get("saved_rows", 0)
+            query_limited = any(
+                s.get("omitted_position_bounds") for s in capture.get("query_rows", {}).get("segments", [])
+            )
+            result["sampled_tensors"] += int(
+                bool(omitted) or query_limited or capture.get("logical_chunk_filter", False)
+            )
+            result["query_limited_tensors"] += int(query_limited)
+            result["saved_token_rows"] += len(record.get("positions") or [])
+            result["omitted_token_rows"] += omitted
+    result["scope"] = (
+        "Only archived rows are checked; omitted_token_rows excludes KV filtered by logical chunk offset "
+        "or reachable only from unsampled queries. "
+        "Counts sum observations across calls/layers, not unique request tokens."
+    )
+    return result
+
+
 def _compare_worker(reference: Worker, candidate: Worker, mode: str, emit) -> None:
     torch = importlib.import_module("torch")
     for key in ("model_id", "num_layers", "tp_size"):
@@ -678,6 +785,8 @@ def _compare_worker(reference: Worker, candidate: Worker, mode: str, emit) -> No
                     ]
                     if not choices:
                         status = "incomparable_context" if options else "missing_reference_tensor"
+                        if _outside_sample(reference, [ref for _, ref in refs], call, position):
+                            status = "outside_reference_sample"
                         unmatched[status].append(position)
                         continue
                     choices.sort(key=lambda item: (item[1]["call"], item[0], item[2]))
@@ -762,13 +871,15 @@ def _compare_worker(reference: Worker, candidate: Worker, mode: str, emit) -> No
         if record["row_axis"] == 0:
             missing = [position for row, position in enumerate(record["positions"]) if (index, row) not in used]
             if missing:
-                emit(
-                    {
-                        **_record_evidence(reference, record),
-                        "status": "not_consumed" if mode == "pd-kv" else "missing_candidate_tensor",
-                        "positions": missing,
-                    }
-                )
+                statuses = defaultdict(list)
+                refs = [r for r in candidate.records if _identity(r) == _identity(record)]
+                for position in missing:
+                    status = "not_consumed" if mode == "pd-kv" else "missing_candidate_tensor"
+                    if mode != "pd-kv" and _outside_sample(candidate, refs, reference.calls[record["call"]], position):
+                        status = "outside_candidate_sample"
+                    statuses[status].append(position)
+                for status, positions in statuses.items():
+                    emit({**_record_evidence(reference, record), "status": status, "positions": positions})
         elif (index, None) not in used:
             emit(
                 {
@@ -923,6 +1034,8 @@ def analyze(
         "sampled_outputs_different",
         "kv_aliases_equal",
         "kv_aliases_different",
+        "outside_reference_sample",
+        "outside_candidate_sample",
     }
     issues = sum(value for key, value in counts.items() if key not in benign)
     comparisons = counts["equal"] + counts["different"]
@@ -932,8 +1045,10 @@ def analyze(
         "status": "incomplete_or_incomparable" if issues or not comparisons else "analysis_complete",
         "accuracy_verdict": "not_assessed",
         "scope": (
-            "Archived main and MTP tensors. PD mode compares consumed prompt KV, excluding the MTP next-token boundary."
+            "Archived main and MTP tensor rows only; unsaved rows are not assessed. "
+            "PD mode compares consumed prompt KV, excluding the MTP next-token boundary."
         ),
+        "capture_sampling": {"reference": _capture_summary(reference), "candidate": _capture_summary(candidate)},
         "models_observed": {
             side: sorted({r["model"] for w in archive.workers.values() for r in w.records})
             for side, archive in (("reference", reference), ("candidate", candidate))

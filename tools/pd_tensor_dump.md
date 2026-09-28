@@ -78,6 +78,8 @@ python3 tools/pd_tensor_smoke.py --analyze-only /实际/pd-tensor-smoke-目录
 ```bash
 # 四台机器使用相同 run 名；每次新实验换一个目录，避免混入旧请求。
 export VLLM_ASCEND_PD_TENSOR_DUMP_DIR=/workspace/sqh/vllm-ascend/pd-tensor-dump/case-on
+# 默认已是 64，可省略：每个固定 4096-token 段只抓少量行。
+export VLLM_ASCEND_PD_TENSOR_DUMP_MAX_TOKENS=64
 export VLLM_ASCEND_SFA_STAGED_GRAPH=0
 export VLLM_ASCEND_SFA_STAGED_MTP_DRAFT_GRAPH=0
 # 原始 tensor 写盘较慢，诊断期间放宽单次 worker 执行超时。
@@ -142,6 +144,23 @@ pd-tensor-dump/case-on/
 - 每层 decoder/SFA 输入输出、残差、attention query、真实 indexer/top-k、logits。
 - P/D 当前 token 写入的 KV、indexer 读取的 KV/scale，以及 attention 实际消费的 KV。
 - 采样后被接受的 token；未完成 prefill 的丢弃采样和 MTP 的 padding 不计作输出。
+
+默认使用固定位置抽样，避免长 prompt 全量读回/写盘：
+
+- KV 按 **request 内绝对位置**划分 4096-token 段，每段保存前最多 64 行。
+  例如长度 8192 保存 `[0,64)`、`[4096,4160)`；长度 8200 再保存 `[8192,8200)`。
+  P 的当前 KV、历史 indexer KV 和 D 实际消费的 KV 使用同一组位置，跨 chunk 调度也不重新编号。
+  attention 只保存上述位置中实际被选中的 KV；没有消费的位置不会伪造记录。
+- 输入输出/query/top-k 按每个 TP 实际可见的段保存前最多 64 行；D 当前计算的一两行也保留。
+  因此不会因 TP 分片从 1024 开始，或 decode position 不落在 KV 采样窗口内，而完全漏掉模型计算。
+- 截取发生在 KV gather 和 CPU 读回之前；hidden/head/vocab 维度保留完整。
+  完整 token/position/因果上下文等小型逻辑元数据、MTP 接受判断和最终 token 不截断。
+- `index.jsonl` 每条记录的 `row_capture.segments` 给出段起点、实际 `length`、
+  `source_rows`、`saved_rows` 和省略范围；不足 4096 或不足 64 都按实际数量记录。
+  `source_indices` 给出采样行在原始张量中的下标。物理槽别名也受每段行数上限约束。
+- 四台机器默认一致，无需新增参数即可生效；`VLLM_ASCEND_PD_TENSOR_DUMP_MAX_TOKENS=0`
+  才恢复全量。自定义值须在 0–4096，P、D 应保持一致。固定 4096 是诊断分段，
+  不改变模型的调度 chunk，也不改变 LMCache/Mooncake 传输数据。
 
 `sampled.jsonl` 记录 worker 的接受结果，处于引擎最终按 EOS/停止词/长度裁剪之前；MTP 最后一步可能多产生少量接受 token。
 它不是 HTTP 响应文本的副本，服务对外输出仍受上面的 16 token 上限约束。
@@ -287,12 +306,14 @@ python3 tools/pd_tensor_analyze.py \
 
 `report.json` 是简明汇总，`comparisons.jsonl` 给出每项证据。统计均来自原始 tensor，包括原始均值/标准差/RMS、绝对差、RMSE、相对 L2、新增非有限值。
 OFF/ON 还报告 worker 接受的输出 token 序列及首个分叉位置。`first_observed_difference` 指最早观察到差异的计算位置，不直接等于已确认的根因。
-数值差异与覆盖完整性分开：`analysis_complete` 表示分析完整，不是精度 PASS；`accuracy_verdict` 明确为 `not_assessed`。
+数值差异与覆盖完整性分开：`analysis_complete` 表示已采集数据的分析完成，不是全量覆盖或精度 PASS；`accuracy_verdict` 明确为 `not_assessed`。
+`capture_sampling` 汇总抽样范围；`outside_reference_sample` / `outside_candidate_sample`
+表示对应位置未被抽样，不算文件丢失，也不算比较通过。数值统计仅适用于真正对齐并加载的行。
 缺 rank、缺文件、未完成、上下文不同会明确列出。先看 P→D KV，再结合 OFF/ON 的最早观察差异与后续误差放大判断位置。
 
-如果同一次 attention 把一个逻辑 token 映射到多个物理槽，探针保存所有槽的原始 KV，
+如果同一次 attention 把一个逻辑 token 映射到多个物理槽，探针保留采样范围内多个槽的原始 KV，
 `kv_consumed` 的 `positions` 可以重复，`physical_slots` 与 tensor 行一一对应。
-每个请求、每个 worker 最多打印一次 `[PD_DUMP] ... kv_alias_rows=...; saved all slots`；
+每个请求、每个 worker 最多打印一次 `[PD_DUMP] ... kv_alias_rows=...; within captured rows`；
 这只表示存在多个槽，不表示它们内容一定不同。
 探针不因数值差异或 NaN 中止模型；越界、缺失映射等采集错误仍会报错。
 
@@ -300,5 +321,5 @@ OFF/ON 还报告 worker 接受的输出 token 序列及首个分叉位置。`fir
 `first_conflict` 给出请求、TP rank、call、层、位置、物理槽和原始 tensor 文件。
 `comparisons.jsonl` 的 `kv_aliases_different` / `kv_aliases_equal` 包含完整差异与分布统计，
 两边相同位置的 NaN 作为相同非有限值报告，不误称内容差异。
-P→D 比较会核对 D 的每个副本；OFF/ON 也会独立检查 OFF 和 ON 各自的别名冲突，避免只选一个副本掩盖差异。
+P→D 比较会核对 D 已保存的每个副本；OFF/ON 也会独立检查已保存的别名冲突。未保存的行或副本不作正确性结论。
 发现冲突仍需结合逻辑 top-k、实际 sparse indices 和 P 端 KV 判断是映射、加载还是数据异常，不能直接归因于 Mooncake。

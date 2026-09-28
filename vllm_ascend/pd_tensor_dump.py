@@ -9,9 +9,11 @@ contain request data, and incomplete calls remain explicitly incomplete.
 import functools
 import inspect
 import json
+import math
 import os
 import re
 import socket
+from bisect import bisect_left
 from contextlib import contextmanager
 from pathlib import Path
 from urllib.parse import quote
@@ -49,6 +51,54 @@ def row_window(rows, actual, cp=None, prefer_local=True):
     if rows >= actual:
         return 0, actual
     raise ValueError(f"Cannot align {rows} tensor rows with {actual} scheduled query rows")
+
+
+def sample_rows(positions, limit, context_length, *, aligned=False):
+    """Use fixed request-local 4096-token segments, never random selection.
+
+    KV uses absolute offsets 0..63 in each segment, shared by P and D. Query
+    tensors keep the first visible rows per segment so TP shards and one-row
+    decode calls remain observable even outside those KV offsets.
+    """
+    chunk_size = 4096
+    indices, segments = [], []
+    left = 0
+    while left < len(positions):
+        base = positions[left] // chunk_size * chunk_size
+        right = bisect_left(positions, base + chunk_size, lo=left)
+        stop = min(right, left + limit) if limit else right
+        if aligned and limit:
+            stop = min(stop, bisect_left(positions, base + limit, lo=left, hi=right))
+        indices.extend(range(left, stop))
+        segments.append(
+            dict(
+                start=base,
+                length=min(chunk_size, context_length - base),
+                source_rows=right - left,
+                saved_rows=stop - left,
+                omitted_position_bounds=[positions[stop], positions[right - 1] + 1] if stop < right else None,
+            )
+        )
+        left = right
+    capture = dict(
+        strategy="absolute_chunk_prefix" if aligned else "visible_chunk_prefix",
+        chunk_size=chunk_size,
+        limit=limit,
+        source_rows=len(positions),
+        saved_rows=len(indices),
+        source_indices=indices,
+        segments=segments,
+    )
+    return [positions[i] for i in indices], capture
+
+
+def sampled_tensor(tensor, capture):
+    indices = capture["source_indices"]
+    if not indices:
+        return tensor[:0]
+    if indices[-1] - indices[0] + 1 == len(indices):
+        return tensor[indices[0] : indices[-1] + 1]
+    return tensor.index_select(0, torch.tensor(indices, dtype=torch.long, device=tensor.device))
 
 
 class RequestArchive:
@@ -97,17 +147,25 @@ class RequestArchive:
         tensor_layout="rank_local",
         *,
         physical_slots=None,
+        row_capture=None,
     ):
-        value = cpu_tensor(tensor)
         context = call["context_token_ids"]
         if positions is not None:
-            if value.ndim == 0 or value.shape[0] != len(positions):
+            if tensor.ndim == 0 or tensor.shape[0] != len(positions):
                 raise ValueError(f"Invalid tensor row mapping: {kind}/{name}")
             if any(p < 0 or p >= len(context) for p in positions):
                 raise ValueError("Tensor logical position is outside its recorded input context")
         if physical_slots is not None:
             if positions is None or len(physical_slots) != len(positions) or any(s < 0 for s in physical_slots):
                 raise ValueError("Invalid consumed KV physical slot mapping")
+        if positions is not None and row_capture is None:
+            positions, row_capture = sample_rows(positions, self.metadata.get("max_token_rows", 64), len(context))
+            tensor = sampled_tensor(tensor, row_capture)
+            if physical_slots is not None:
+                physical_slots = [physical_slots[i] for i in row_capture["source_indices"]]
+        # Slice on device before readback. In particular, do not truncate the
+        # hidden/head/vocabulary axes or the nonrow rejection-sampler evidence.
+        value = cpu_tensor(tensor)
         relative = f"tensors/{self.metadata['records']:08d}.pt"
         temporary = (self.root / relative).with_suffix(".pt.tmp")
         torch.save(value, temporary)
@@ -131,6 +189,8 @@ class RequestArchive:
         )
         if physical_slots is not None:
             record["physical_slots"] = physical_slots
+        if row_capture is not None:
+            record["row_capture"] = row_capture
         with (self.root / "index.jsonl").open("a", encoding="utf-8") as stream:
             stream.write(json.dumps(record, allow_nan=False) + "\n")
         self.metadata["records"] += 1
@@ -160,7 +220,10 @@ class RequestArchive:
 class PDTensorDump:
     """Capture main verification and MTP calls under separate model identities."""
 
-    def __init__(self, runner, root, role, rank_info, get_context):
+    def __init__(self, runner, root, role, rank_info, get_context, max_token_rows=64):
+        if type(max_token_rows) is not int or not 0 <= max_token_rows <= 4096:
+            raise ValueError("PD tensor dump max token rows must be an integer in [0, 4096] (0 = all)")
+        self.max_token_rows = max_token_rows
         self.runner, self.root, self.role = runner, Path(root), role
         self.rank_info, self.get_context = dict(rank_info), get_context
         self.external_ids = {}
@@ -663,6 +726,7 @@ class PDTensorDump:
                         mtp_layers=sorted(self.mtp_layers),
                         sampling_params=str(request.sampling_params),
                         prompt_token_ids=list(request.prompt_token_ids),
+                        max_token_rows=self.max_token_rows,
                     ),
                 )
                 self.archives[internal] = archive
@@ -710,6 +774,7 @@ class PDTensorDump:
         layout="rank_local",
         *,
         physical_slots=None,
+        row_capture=None,
     ):
         key = (layer, kind, name)
         if key in entry["observed"]:
@@ -724,6 +789,7 @@ class PDTensorDump:
             mapping_only,
             layout,
             physical_slots=physical_slots,
+            row_capture=row_capture,
         )
         entry["observed"].add(key)
 
@@ -788,10 +854,29 @@ class PDTensorDump:
         def shared_topk(*args, **kwargs):
             result = original(*args, **kwargs)
             if self.active and self.sfa_stack:
-                self.logical_topk = cpu_tensor(result)
+                self.capture_topk(result, self.sfa_stack[-1][1])
             return result
 
         return shared_topk
+
+    def capture_topk(self, value, meta):
+        # Post-processing can mutate the top-k tensor in place. Snapshot only
+        # the observed query rows now, before physical-address remapping.
+        cp = getattr(meta, "dsa_cp_context", None)
+        lo, hi = row_window(value.shape[0], self.active["actual"], cp)
+        snapshots = {}
+        for entry in self.active["entries"]:
+            start, end = max(lo, entry["start"]), max(lo, min(hi, entry["end"]))
+            end = max(start, end)
+            positions, capture = sample_rows(
+                self.active["positions"][start:end], self.max_token_rows, len(entry["call"]["context_token_ids"])
+            )
+            snapshots[entry["archive"].root] = (
+                cpu_tensor(sampled_tensor(value[start - lo : end - lo], capture)),
+                positions,
+                capture,
+            )
+        self.logical_topk = dict(shape=tuple(value.shape), snapshots=snapshots)
 
     def current_kv(self, kv_cache, layer, meta):
         # Observe after CP all-gather/cache write, immediately before attention.
@@ -801,8 +886,13 @@ class PDTensorDump:
             raise ValueError("Current KV slot mapping misses scheduled query rows")
         for entry in self.active["entries"]:
             start, end = entry["start"], entry["end"]
-            selected = slots[start:end]
-            positions = self.active["positions"][start:end]
+            positions, capture = sample_rows(
+                self.active["positions"][start:end],
+                self.max_token_rows,
+                len(entry["call"]["context_token_ids"]),
+                aligned=self.role == "P",
+            )
+            selected = sampled_tensor(slots[start:end], capture)
             for cache, name in zip(kv_cache[:2], ("nope", "rope")):
                 flat = cache.reshape(-1, *cache.shape[2:])
                 if selected.numel() and (selected.min() < 0 or selected.max() >= flat.shape[0]):
@@ -815,6 +905,7 @@ class PDTensorDump:
                     name,
                     positions,
                     layout="replicated",
+                    row_capture=capture,
                 )
 
     def indexer_kv(self, tensor, table, lengths, layer, name):
@@ -832,7 +923,8 @@ class PDTensorDump:
             prefix = len(entry["call"]["context_token_ids"]) if self.role == "P" else int(lengths[row])
             if self.active.get("model") == "mtp":
                 prefix = min(prefix, len(entry["call"]["context_token_ids"]))
-            positions = torch.arange(prefix, dtype=torch.long)
+            sampled, capture = sample_rows(range(prefix), self.max_token_rows, prefix, aligned=True)
+            positions = torch.tensor(sampled, dtype=torch.long)
             if positions.numel() and int(positions[-1]) // block_size >= table.shape[1]:
                 raise ValueError("Indexer block table does not cover prefix")
             slots = table[row, positions // block_size] * block_size + positions % block_size
@@ -846,30 +938,48 @@ class PDTensorDump:
                 name,
                 positions.tolist(),
                 layout="replicated",
+                row_capture=capture,
             )
 
     def attention_kv(self, values, layer, meta):
-        selected = cpu_tensor(values["sparse_indices"]).long().reshape(values["query"].shape[0], -1)
+        selected = values["sparse_indices"]
         if self.logical_topk is None:
             raise ValueError("Attention has no observed logical indexer output")
-        logical = self.logical_topk.long().reshape(self.logical_topk.shape[0], -1)
         table = cpu_tensor(values["block_table"]).long()
         lengths = cpu_tensor(values["actual_seq_lengths_kv"]).long().reshape(-1)
         cumulative = cpu_tensor(values["actual_seq_lengths_query"]).long().reshape(-1)
         cp = getattr(meta, "dsa_cp_context", None)
         lo, hi = row_window(selected.shape[0], self.active["actual"], cp)
-        if logical.shape != selected.shape:
+        shape = self.logical_topk["shape"]
+        if shape[0] != selected.shape[0] or math.prod(shape[1:]) != math.prod(selected.shape[1:]):
             raise ValueError("Attention selection and indexer output shape differ")
-        self.emit(self.logical_topk, layer, "attention", "logical_topk", meta)
         for entry in self.active["entries"]:
             start, end = max(lo, entry["start"]), min(hi, entry["end"])
             end = max(start, end)
+            logical, query_positions, query_capture = self.logical_topk["snapshots"][entry["archive"].root]
+            self.record(
+                entry,
+                logical,
+                layer,
+                "attention",
+                "logical_topk",
+                query_positions,
+                layout="sequence_sharded" if cp is not None else "rank_local",
+                row_capture=query_capture,
+            )
             a, b = start - lo, end - lo
-            physical, original = selected[a:b], logical[a:b]
-            owners = torch.bucketize(torch.arange(a, b), cumulative, right=True)
-            positions = torch.tensor(self.active["positions"][start:end], dtype=torch.long)
+            physical = cpu_tensor(sampled_tensor(selected[a:b], query_capture)).long().flatten(start_dim=1)
+            original = logical.long().flatten(start_dim=1)
+            owners = torch.bucketize(
+                torch.tensor(query_capture["source_indices"], dtype=torch.long) + a, cumulative, right=True
+            )
+            positions = torch.tensor(query_positions, dtype=torch.long)
             valid = (physical >= 0) & (original >= 0) & (physical < lengths[owners, None])
             valid &= original <= positions[:, None]
+            # Filter before constructing/gathering KV pairs. P's current-KV
+            # snapshots and D's consumed KV now use identical absolute offsets.
+            if self.max_token_rows:
+                valid &= original.remainder(4096) < self.max_token_rows
             block_size = int(values["key"].shape[1])
             blocks = physical.clamp_min(0) // block_size
             if valid.any() and int(blocks[valid].max()) >= table.shape[1]:
@@ -877,6 +987,14 @@ class PDTensorDump:
             slots = table[owners[:, None], blocks.clamp_max(max(0, table.shape[1] - 1))]
             slots = slots * block_size + physical.clamp_min(0) % block_size
             pairs = torch.unique(torch.stack((original[valid], slots[valid]), dim=1), dim=0, sorted=True)
+            sampled, capture = sample_rows(
+                pairs[:, 0].tolist(), self.max_token_rows, len(entry["call"]["context_token_ids"]), aligned=True
+            )
+            capture["logical_chunk_filter"] = bool(
+                self.max_token_rows and len(entry["call"]["context_token_ids"]) > self.max_token_rows
+            )
+            capture["query_rows"] = query_capture
+            pairs = sampled_tensor(pairs, capture)
             alias_rows = int((pairs[1:, 0] == pairs[:-1, 0]).sum())
             archive = entry["archive"]
             if alias_rows and "first_kv_alias" not in archive.metadata:
@@ -886,7 +1004,7 @@ class PDTensorDump:
                 archive.flush()
                 print(
                     f"[PD_DUMP] {self.role} tp={self.rank_info['tp_rank']} "
-                    f"call={entry['call']['call']} layer={layer} kv_alias_rows={alias_rows}; saved all slots",
+                    f"call={entry['call']['call']} layer={layer} kv_alias_rows={alias_rows}; within captured rows",
                     flush=True,
                 )
             for key, name in (("key", "nope"), ("key_rope", "rope")):
@@ -894,11 +1012,10 @@ class PDTensorDump:
                 flat = cache.reshape(-1, *cache.shape[2:])
                 if pairs.numel() and (pairs[:, 1].min() < 0 or pairs[:, 1].max() >= flat.shape[0]):
                     raise ValueError("Attention KV physical slot out of bounds")
-                rows = cpu_tensor(flat.index_select(0, pairs[:, 1].to(cache.device)))
+                rows = flat.index_select(0, pairs[:, 1].to(cache.device))
                 # Numerical disagreement is evidence, not a recorder failure.
-                # Keep every (logical token, physical slot), including NaNs and
-                # conflicting aliases, so offline analysis can compare them
-                # with P and with each other. Never choose one alias silently.
+                # Preserve physical aliases in the captured rows, including
+                # NaNs. Sampling metadata explicitly marks unobserved rows.
                 self.record(
                     entry,
                     rows,
@@ -908,6 +1025,7 @@ class PDTensorDump:
                     pairs[:, 0].tolist(),
                     layout="replicated",
                     physical_slots=pairs[:, 1].tolist(),
+                    row_capture=capture,
                 )
 
     def kernel_factory(self, kind, tuple_result=False):
@@ -944,7 +1062,7 @@ class PDTensorDump:
                 value = result[0] if tuple_result else result
                 self.emit(value, layer, kind, "topk" if kind == "indexer" else "output", meta)
                 if kind == "indexer":
-                    self.logical_topk = cpu_tensor(value)
+                    self.capture_topk(value, meta)
                 return result
 
             return kernel
@@ -1051,6 +1169,7 @@ def install_pd_tensor_dump(runner, root):
             dp_size=dp.world_size,
         ),
         get_forward_context,
+        max_token_rows=envs.VLLM_ASCEND_PD_TENSOR_DUMP_MAX_TOKENS,
     )
     try:
         probe.install(AscendSFAImpl, torch_npu)

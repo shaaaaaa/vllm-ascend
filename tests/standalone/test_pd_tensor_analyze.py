@@ -150,6 +150,95 @@ def write_sampled(directory, records):
     (directory / "sampled.jsonl").write_text("".join(json.dumps(item) + "\n" for item in records), encoding="utf-8")
 
 
+def sample_worker(directory, limit=64):
+    spec = importlib.util.spec_from_file_location(
+        "_sampling_writer", MODULE.parent.parent / "vllm_ascend/pd_tensor_dump.py"
+    )
+    writer = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(writer)
+    records = read_records(directory)
+    for record in records:
+        call = read(directory / f"calls/{record['call']}.json")
+        value = torch.load(directory / record["path"], weights_only=True)
+        positions, capture = writer.sample_rows(
+            record["positions"], limit, len(call["context_token_ids"]), aligned=True
+        )
+        value = writer.sampled_tensor(value, capture)
+        torch.save(value, directory / record["path"])
+        record.update(
+            positions=positions,
+            token_ids=[call["context_token_ids"][p] for p in positions],
+            shape=list(value.shape),
+            row_capture=capture,
+        )
+    write_records(directory, records)
+
+
+@pytest.mark.parametrize(
+    "sampled_side,status", [("reference", "outside_reference_sample"), ("candidate", "outside_candidate_sample")]
+)
+def test_sampled_scope_does_not_claim_unobserved_rows_are_missing_or_checked(tmp_path, sampled_side, status):
+    for side in ("reference", "candidate"):
+        directory = make_worker(tmp_path / side, context=list(range(8200)))
+        if side == sampled_side:
+            sample_worker(directory)
+    report = run(tmp_path)
+    assert report["status"] == "analysis_complete", report
+    assert report["compared_rows"] == 64 + 64 + 8
+    assert report["counts"][status] == 1
+    capture = report["capture_sampling"][sampled_side]
+    assert capture["sampled_tensors"] == 1
+    assert capture["omitted_token_rows"] == 8200 - 136
+    assert report["accuracy_verdict"] == "not_assessed"
+
+
+def test_pd_comparison_uses_identical_absolute_positions_from_two_chunks(tmp_path):
+    p = make_worker(
+        tmp_path / "reference",
+        role="P",
+        context=list(range(8200)),
+        batches=[list(range(4096)), list(range(4096, 8200))],
+    )
+    d = make_worker(
+        tmp_path / "candidate",
+        role="D",
+        context=list(range(8200)),
+        kind="kv_consumed",
+        batches=[[0, 10, 63, 100, 4096, 4159, 5000, 8195, 8199]],
+        delta=0.25,
+    )
+    sample_worker(p)
+    sample_worker(d)
+    report = run(tmp_path, mode="pd-kv")
+    assert report["status"] == "analysis_complete", report
+    assert report["compared_rows"] == 7
+    assert report["first_difference"]["position"] == 0
+    assert report["issues"] == 0
+
+
+def test_sampling_does_not_hide_missing_tensor_files(tmp_path):
+    p = make_worker(tmp_path / "reference", context=list(range(200)))
+    make_worker(tmp_path / "candidate", context=list(range(200)))
+    sample_worker(p)
+    (p / read_records(p)[0]["path"]).unlink()
+    report = run(tmp_path)
+    assert report["status"] == "incomplete_or_incomparable"
+    assert report["issues"] > 0
+
+
+@pytest.mark.parametrize("field,value", [("saved_rows", 65), ("source_indices", [199] * 64), ("limit", 32)])
+def test_inconsistent_sampling_metadata_is_not_silently_accepted(tmp_path, field, value):
+    for side in ("reference", "candidate"):
+        directory = make_worker(tmp_path / side, context=list(range(200)))
+        sample_worker(directory)
+    records = read_records(directory)
+    records[0]["row_capture"][field] = value
+    write_records(directory, records)
+    report = run(tmp_path)
+    assert report["status"] == "incomplete_or_incomparable"
+    assert report["issues"] > 0
+
+
 def test_pd_compares_mtp_prompt_kv_with_shifted_context_and_excludes_generated_boundary(tmp_path):
     make_worker(tmp_path / "reference", role="P", model="mtp", context=[11, 12, 13, 99], kind="kv_current")
     make_worker(tmp_path / "candidate", role="D", model="mtp", context=[11, 12, 13, 88], kind="kv_consumed", delta=0.5)

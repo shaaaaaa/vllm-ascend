@@ -63,7 +63,9 @@ def _validate_worker(worker, prompt_ids, expected_layerwise, min_prefill_calls, 
     _require(manifest["layerwise_prefill"] is expected_layerwise, "unexpected layerwise_prefill state")
     _require(manifest.get("prompt_token_ids") == prompt_ids, "worker prompt differs from requested prompt")
     _require(bool(worker.calls), "worker recorded no model calls")
-    calls = [worker.calls[number] for number in sorted(worker.calls)]
+    calls = [
+        worker.calls[number] for number in sorted(worker.calls) if worker.calls[number].get("model", "main") == "main"
+    ]
     prefill_calls = [call for call in calls if call["phase"] == "prefill"]
     decode_calls = [call for call in calls if call["phase"] == "decode"]
     required = _required(manifest["num_layers"])
@@ -79,11 +81,16 @@ def _validate_worker(worker, prompt_ids, expected_layerwise, min_prefill_calls, 
             record = next(
                 item for item in current if (item["layer"], item["kind"], item["name"]) == (-1, "model_input", name)
             )
+            capture = record.get("row_capture")
+            indices = list(range(len(call["positions"])))
+            if capture:
+                _require(capture["source_rows"] == len(indices), "model input source row count differs from call")
+                indices = capture["source_indices"]
             _require(
-                record["row_axis"] == 0 and record["positions"] == call["positions"],
+                record["row_axis"] == 0 and record["positions"] == [call["positions"][i] for i in indices],
                 "model input row coverage differs from call",
             )
-            _input_payload(worker, record, expected)
+            _input_payload(worker, record, [expected[i] for i in indices])
         for position, token in zip(call["positions"], call["token_ids"]):
             if position < len(prompt_ids):
                 _require(token == prompt_ids[position], "prefill query token differs from prompt")

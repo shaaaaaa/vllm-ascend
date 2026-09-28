@@ -37,7 +37,18 @@ def mutate_json(path, change):
     write_json(path, data)
 
 
-def make_case(recorder, root, *, layerwise=True, tp_size=2, p_chunks=None, d_chunks=None, extra=False, output_tokens=3):
+def make_case(
+    recorder,
+    root,
+    *,
+    layerwise=True,
+    tp_size=2,
+    p_chunks=None,
+    d_chunks=None,
+    extra=False,
+    output_tokens=3,
+    max_token_rows=64,
+):
     prompt = [10, 11, 12, 13]
     outputs = list(range(100, 100 + output_tokens))
     p_chunks = [[0, 1], [2, 3]] if p_chunks is None else p_chunks
@@ -77,6 +88,7 @@ def make_case(recorder, root, *, layerwise=True, tp_size=2, p_chunks=None, d_chu
                     tp_size=tp_size,
                     dp_rank=0,
                     dp_size=1,
+                    max_token_rows=max_token_rows,
                 ),
             )
             # Use the recorder's real required inventory and writer rather
@@ -147,6 +159,27 @@ def test_actual_recorder_archives_cover_both_p_and_d(recorder, tmp_path, layerwi
     assert report["details"]["roles"]["D"][1]["decode_calls"] == 2
     assert "passed" not in report
     json.dumps(report)
+
+
+def test_sampled_inputs_still_prove_full_execution_metadata_and_mtp_has_own_inventory(recorder, tmp_path):
+    case = make_case(recorder, tmp_path, max_token_rows=1)
+    for archive in case.archives.values():
+        call = archive.begin(
+            dict(
+                model="mtp",
+                phase="decode",
+                positions=[3],
+                token_ids=[100],
+                context_token_ids=[11, 12, 13, 100],
+                context_complete=True,
+            ),
+            [{"layer": 1, "kind": "mtp_input", "name": "hidden_states"}],
+        )
+        archive.record(torch.ones(1, 3), call, 1, "mtp_input", "hidden_states", [3])
+        archive.end(call, {(1, "mtp_input", "hidden_states")})
+    report = validate(case)
+    assert report["complete"], report["errors"]
+    assert report["details"]["roles"]["P"][0]["prefill_calls"] == 2
 
 
 @pytest.mark.parametrize(
