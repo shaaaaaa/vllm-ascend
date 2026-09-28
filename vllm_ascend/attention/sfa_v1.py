@@ -1517,7 +1517,13 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
                 for r in range(n_real):
                     s, e = int(qsl[r]), int(qsl[r + 1])
                     plen = int(plens_cpu[r])
-                    first_decode = max(s, s + plen - int(computed[r]))
+                    # DecodeOnly/SpecDecoding can recompute the last prompt
+                    # token after a dense PD prefix load, without a cold-
+                    # compact marker. Every scheduled query is real in these
+                    # states: a negative owner would make the sparse planner
+                    # zero its top-k as padding. The connector frontier still
+                    # controls retrieval (zero for a fully resident prefix).
+                    first_decode = s if fixed_decode_width else max(s, s + plen - int(computed[r]))
                     if cold_resumes and cold_resumes[r]:
                         cold_ends = getattr(common_attn_metadata.cold_compact_resumes, "computed_ends", ())
                         if cold_ends and len(cold_ends) != n_real:
