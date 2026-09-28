@@ -23,4 +23,7 @@ def test_setup_accepts_non_release_checkouts(result, error, expected):
     ns = {"get_version": get_version, "InvalidVersion": InvalidVersion}
     exec(compile(ast.Module(body=[block], type_ignores=[]), str(path), "exec"), ns)
     assert ns["VERSION"] == expected
-    get_version.assert_called_once_with(write_to="vllm_ascend/_version.py")
+    get_version.assert_called_once_with(
+        write_to="vllm_ascend/_version.py",
+        git_describe_command="git describe --dirty --tags --long --match v[0-9]*",
+    )
