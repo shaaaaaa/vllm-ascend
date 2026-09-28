@@ -178,6 +178,7 @@ class PDTensorDump:
         self.mtp_layers = {}
         self.mtp_runtime = None
         self.mtp_last = None
+        self.rejection_entries = None
 
     def observe_scheduler(self, output):
         for req in output.scheduled_new_reqs:
@@ -243,6 +244,162 @@ class PDTensorDump:
             if hasattr(owner, name):
                 self.patch(owner, name, self.kernel_factory("indexer", tuple_result))
         self.patch(self.runner.model, "compute_logits", self.logits_factory)
+        self.install_rejection()
+
+    def install_rejection(self, ascend_module=None, upstream_module=None):
+        sampler = getattr(self.runner, "rejection_sampler", None)
+        if sampler is None:
+            return
+        if ascend_module is None:
+            from vllm.v1.sample import rejection_sampler as upstream_module
+
+            from vllm_ascend.sample import rejection_sampler as ascend_module
+
+        def forward_factory(original):
+            @functools.wraps(original)
+            def forward(metadata, draft_probs, logits, sampling_metadata):
+                if self.last is None:
+                    return original(metadata, draft_probs, logits, sampling_metadata)
+                entries = []
+                start = 0
+                targets = cpu_tensor(metadata.target_logits_indices).long()
+                bonuses = cpu_tensor(metadata.bonus_logits_indices).long()
+                query_rows = cpu_tensor(metadata.logits_indices).long()
+                captured = {e["archive"].metadata["internal_request_id"]: e for e in self.last["entries"]}
+                for row, internal in enumerate(self.runner.input_batch.req_ids):
+                    count = int(metadata.num_draft_tokens[row])
+                    end = start + count
+                    if internal in captured:
+                        entry = captured[internal]
+                        selected = targets[start:end]
+                        bonus = bonuses[row : row + 1]
+                        context_positions = [self.last["positions"][i] for i in query_rows[selected].tolist()]
+                        options = {}
+                        for name in (
+                            "temperature",
+                            "top_k",
+                            "top_p",
+                            "frequency_penalties",
+                            "presence_penalties",
+                            "repetition_penalties",
+                        ):
+                            value = getattr(sampling_metadata, name, None)
+                            if isinstance(value, torch.Tensor):
+                                options[name] = cpu_tensor(value).reshape(-1)[row].item()
+                        greedy = bool(sampling_metadata.all_greedy) or options.get("temperature") == 0
+                        entry["call"]["rejection"] = dict(
+                            schema=1,
+                            num_draft_tokens=count,
+                            max_spec_len=int(metadata.max_spec_len),
+                            mode="greedy" if greedy else "random",
+                            sampling=options,
+                            draft_probs_present=draft_probs is not None,
+                            placeholder_token_id=int(upstream_module.PLACEHOLDER_TOKEN_ID),
+                            target_context_positions=context_positions,
+                            draft_positions=[p + 1 for p in context_positions],
+                            bonus_context_position=self.last["positions"][int(query_rows[bonus[0]])],
+                            row_axis="per-request draft order; output retains sampler padding",
+                        )
+                        required = [
+                            "draft_token_ids",
+                            "target_logits",
+                            "bonus_token_ids",
+                            "kernel_output",
+                            "sampler_output",
+                        ]
+                        if draft_probs is not None:
+                            required.append("draft_probs")
+                        if not sampling_metadata.all_greedy:
+                            required.extend(("uniform_probs", "target_probs", "recovered_token_ids"))
+                        entry["call"]["expected"].extend(
+                            dict(layer=-1, kind="rejection", name=name) for name in required
+                        )
+                        entries.append((entry, row, start, end))
+                        self.rejection_record(
+                            entry, "raw_target_logits", logits.index_select(0, selected.to(logits.device))
+                        )
+                        self.rejection_record(
+                            entry, "raw_bonus_logits", logits.index_select(0, bonus.to(logits.device))
+                        )
+                        for name, value in (
+                            ("target_logits_indices", selected),
+                            ("bonus_logits_indices", bonus),
+                            ("query_row_indices", query_rows[torch.cat((selected, bonus))]),
+                        ):
+                            self.rejection_record(entry, name, value, mapping=True)
+                        entry["archive"].metadata["rejection_recording"] = True
+                    start = end
+                self.rejection_entries = entries
+                try:
+                    result = original(metadata, draft_probs, logits, sampling_metadata)
+                    for entry, row, _, _ in entries:
+                        self.rejection_record(entry, "sampler_output", result.sampled_token_ids[row])
+                        # Save the added tensor inventory before main sampling ends.
+                        write_json(entry["archive"].root / "calls" / f"{entry['call']['call']}.json", entry["call"])
+                        entry["archive"].flush()
+                    return result
+                except BaseException as error:
+                    for entry, _, _, _ in entries:
+                        entry["archive"].fail(f"rejection {type(error).__name__}: {error}")
+                    raise
+                finally:
+                    self.rejection_entries = None
+
+            return forward
+
+        def kernel_factory(original):
+            signature = inspect.signature(original)
+
+            @functools.wraps(original)
+            def kernel(*args, **kwargs):
+                if self.rejection_entries is None:
+                    return original(*args, **kwargs)
+                values = signature.bind(*args, **kwargs).arguments
+                for entry, row, start, end in self.rejection_entries:
+                    for name in ("draft_token_ids", "draft_probs", "target_logits"):
+                        value = values[name]
+                        if value is not None:
+                            self.rejection_record(entry, name, value[start:end])
+                    self.rejection_record(entry, "bonus_token_ids", values["bonus_token_ids"][row : row + 1])
+                result = original(*args, **kwargs)
+                for entry, row, _, _ in self.rejection_entries:
+                    self.rejection_record(entry, "kernel_output", result[row])
+                return result
+
+            return kernel
+
+        def random_factory(name):
+            def factory(original):
+                signature = inspect.signature(original)
+
+                @functools.wraps(original)
+                def call(*args, **kwargs):
+                    result = original(*args, **kwargs)
+                    if self.rejection_entries is not None:
+                        values = signature.bind(*args, **kwargs).arguments
+                        for entry, _, start, end in self.rejection_entries:
+                            self.rejection_record(entry, name, result[start:end])
+                            if name == "recovered_token_ids":
+                                self.rejection_record(entry, "target_probs", values["target_probs"][start:end])
+                    return result
+
+                return call
+
+            return factory
+
+        self.patch(sampler, "forward", forward_factory)
+        # Upstream.forward and Ascend's existing timing wrapper each reference
+        # their own module binding. Observe either without changing that path.
+        self.patch(upstream_module, "rejection_sample", kernel_factory)
+        self.patch(ascend_module, "rejection_sample", kernel_factory)
+        self.patch(ascend_module, "generate_uniform_probs", random_factory("uniform_probs"))
+        self.patch(ascend_module, "sample_recovered_tokens", random_factory("recovered_token_ids"))
+
+    def rejection_record(self, entry, name, tensor, mapping=False):
+        role = dict(layer=-1, kind="rejection", name=name)
+        if role not in entry["call"]["expected"]:
+            entry["call"]["expected"].append(role)
+        self.record(entry, tensor, -1, "rejection", name, mapping_only=mapping)
 
     def install_mtp(self, sfa_class):
         """Install only on an explicitly enabled recorder; preserve draft execution."""

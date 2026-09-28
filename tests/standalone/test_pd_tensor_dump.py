@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """CPU observations of the real PD recorder, without importing NPU packages."""
 
+import ast
 import importlib.util
 import json
 import sys
@@ -609,3 +610,138 @@ def test_real_archive_can_be_analyzed_after_sample_and_request_finish(module, tm
     assert report["issues"] == 0
     assert report["compared_tensors"] > 0
     assert report["first_difference"] is None
+
+
+@pytest.mark.parametrize("binding", ["upstream", "ascend"])
+@pytest.mark.parametrize("random_sampling,corrupt", [(False, False), (False, True), (True, False)])
+@pytest.mark.parametrize("reject_at", [0, 1, 2])
+def test_rejection_observes_actual_processed_logits_rng_and_outputs(
+    module, tmp_path, monkeypatch, binding, random_sampling, corrupt, reject_at
+):
+    monkeypatch.syspath_prepend(str(ROOT / "tools"))
+    import pd_tensor_analyze as analyzer
+
+    probe, runner, main_meta = make_probe(module, tmp_path, {"a": [10, 11, 12], "b": [20, 21], "c": [30]})
+    probe.rank_info.update(tp_rank=0, tp_size=1, dp_rank=0, dp_size=1)
+    ids, positions = batch(main_meta, [([0, 1, 2], [10, 11, 12]), ([0, 1], [20, 21]), ([0], [30])])
+    with probe.forward(ids, positions):
+        fill_expected(probe, main_meta)
+    metadata = NS(
+        num_draft_tokens=[2, 1, 0],
+        max_spec_len=2,
+        draft_token_ids=torch.tensor([1, 2, 2]),
+        target_logits_indices=torch.tensor([0, 1, 3]),
+        bonus_logits_indices=torch.tensor([2, 4, 5]),
+        logits_indices=torch.arange(6),
+        cu_num_draft_tokens=torch.tensor([2, 3, 3]),
+    )
+    sampling = NS(all_greedy=not random_sampling, temperature=torch.full((3,), 0.7 if random_sampling else 0.0))
+    # Exercise the real CPU greedy rejection implementation, without NPU imports.
+    source = ast.parse((ROOT / "vllm_ascend/sample/rejection_sampler.py").read_text())
+    node = next(
+        n for n in source.body if isinstance(n, ast.FunctionDef) and n.name == "rejection_greedy_sample_pytorch"
+    )
+    namespace = {"torch": torch}
+    exec(compile(ast.Module(body=[node], type_ignores=[]), "rejection_greedy", "exec"), namespace)
+    ascend = NS(
+        generate_uniform_probs=lambda n: torch.rand(n),
+        sample_recovered_tokens=lambda target_probs: target_probs.argmax(dim=-1),
+    )
+    returned = []
+
+    def kernel(
+        draft_token_ids,
+        num_draft_tokens,
+        max_spec_len,
+        cu_num_draft_tokens,
+        draft_probs,
+        target_logits,
+        bonus_token_ids,
+        sampling_metadata,
+    ):
+        if random_sampling:
+            ascend.generate_uniform_probs(len(draft_token_ids))
+            ascend.sample_recovered_tokens(target_probs=target_logits.softmax(dim=-1))
+        output = torch.full((3, 3), -1, dtype=torch.int32)
+        namespace["rejection_greedy_sample_pytorch"](
+            output,
+            cu_num_draft_tokens,
+            draft_token_ids,
+            target_logits.argmax(dim=-1),
+            bonus_token_ids,
+            num_draft_tokens,
+            max_spec_len,
+        )
+        if corrupt:
+            output[0, 0] = 4  # Must be reported offline, not asserted by the probe.
+        returned.append(output)
+        return output
+
+    ascend.rejection_sample = kernel
+    upstream = NS(rejection_sample=kernel, PLACEHOLDER_TOKEN_ID=-1)
+    owner = upstream if binding == "upstream" else ascend
+
+    class Sampler(torch.nn.Module):
+        def forward(self, metadata, draft_probs, logits, sampling_metadata):
+            target = logits[metadata.target_logits_indices].clone()
+            winners = [1, 2, 2]
+            if reject_at < 2:
+                winners[reject_at] = 3
+            target[torch.arange(3), torch.tensor(winners)] += 10  # Actual postprocessor result.
+            result = owner.rejection_sample(
+                metadata.draft_token_ids,
+                metadata.num_draft_tokens,
+                metadata.max_spec_len,
+                metadata.cu_num_draft_tokens,
+                draft_probs,
+                target,
+                torch.tensor([[4], [4], [4]], dtype=torch.int32),
+                sampling_metadata,
+            )
+            return NS(sampled_token_ids=result)
+
+    runner.rejection_sampler = Sampler()
+    logits = torch.zeros(6, 5)
+    rng = torch.get_rng_state()
+    plain = runner.rejection_sampler(metadata, None, logits, sampling)
+    after_plain = torch.get_rng_state()
+    torch.set_rng_state(rng)
+    probe.install_rejection(ascend, upstream)
+    result = runner.rejection_sampler(metadata, None, logits, sampling)
+    assert result.sampled_token_ids is returned[-1]
+    torch.testing.assert_close(result.sampled_token_ids, plain.sampled_token_ids)
+    assert torch.equal(after_plain, torch.get_rng_state())
+    used = [[t for t in row.tolist() if t >= 0] for row in result.sampled_token_ids]
+    used[2] = []  # C is an unfinished prefill row.
+    finish_forward(probe, sampled=used)
+    probe.observe_scheduler(NS(scheduled_new_reqs=[], finished_req_ids={"a", "b", "c"}, num_scheduled_tokens={}))
+    archive = analyzer.load_archive([tmp_path])
+    assert not archive.issues
+    decisions = [d for worker in archive.workers.values() for d in analyzer._rejection_decisions(worker)]
+    by_request = {d["request_id"]: d for d in decisions}
+    assert by_request["external-a"]["accepted_drafts"] == reject_at
+    assert by_request["external-a"]["first_rejected_index"] == (reject_at if reject_at < 2 else None)
+    statuses = ["accepted"] * reject_at + (["rejected"] + ["not_reached"] * (1 - reject_at) if reject_at < 2 else [])
+    assert by_request["external-a"]["draft_status"] == statuses
+    assert by_request["external-b"]["first_rejected_index"] is None
+    assert not by_request["external-c"]["counted_for_acceptance"]
+    if random_sampling:
+        assert by_request["external-a"]["greedy_decision_consistent"] is None
+        assert by_request["external-a"]["random_evidence"] == ["target_probs", "uniform_probs", "recovered_token_ids"]
+    else:
+        assert by_request["external-a"]["greedy_decision_consistent"] is not corrupt
+    worker = next(w for w in archive.workers.values() if w.manifest["request_id"] == "external-a")
+    rejected_records = {r["name"]: r for r in worker.records if r["kind"] == "rejection"}
+    assert analyzer._load_tensor(worker, rejected_records["raw_target_logits"]).sum() == 0
+    assert analyzer._load_tensor(worker, rejected_records["target_logits"]).sum() == 20
+    report_dir = tmp_path / "report"
+    report_dir.mkdir()
+    summary = analyzer._write_rejection_report(archive, archive, report_dir)
+    assert len(summary["workers"]) == 3  # Same collected directory is not counted twice.
+    first = next(w for w in summary["workers"] if w["request_id"] == "external-a")
+    assert first["acceptance_rate"] == reject_at / 2
+    assert first["greedy_inconsistent_calls"] == int(corrupt)
+    worker.records.remove(rejected_records["kernel_output"])
+    assert next(analyzer._rejection_decisions(worker))["status"] == "incomplete"
+    probe.restore()
+    assert upstream.rejection_sample is kernel and ascend.rejection_sample is kernel

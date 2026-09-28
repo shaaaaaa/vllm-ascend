@@ -157,6 +157,24 @@ MTP 位置 p 消费主模型位置 p+1 的 token；PD KV 对比排除依赖生�
 prompt 位置。`report.json` 的 `counts_by_model` 和 `first_difference_by_model`
 分别报告主模型和 MTP 的差异。旧 dump 没有 MTP 数据，需要重新抓取才能验证 MTP。
 
+同一个开关还记录 `AscendRejectionSampler` 的实际输入输出，归在对应主模型 call 的
+`kind=rejection` 下：被验证的草稿 token、处理前 target/bonus logits、应用采样约束后的
+target logits、bonus token、内核输出和 sampler 输出（含原始 padding）。调用元数据保存
+温度等采样参数以及草稿对应的位置。随机采样还记录实际使用的 uniform 随机数、target
+概率、可选 draft 概率和 recovered token；探针不会再执行一遍采样或额外消耗随机数。
+
+收集器的 `--analyze-pd` 和直接运行分析脚本都会生成 `rejection.jsonl`，逐 request/call
+列出草稿、主模型 argmax、接受数量、首个拒绝下标（从 0 开始）、后续未被采用的草稿及
+补回/bonus token。`report.json` 的 `rejection_sampling.workers` 给出各 worker 的接受率；
+同一请求的 TP 副本分别列出，不把多个 rank 累加成多个请求。计数排除未完成 prefill
+而被丢弃的采样，处于 HTTP 的 EOS/长度裁剪之前。
+
+`temperature=0` 时，离线工具还检查输出是否符合“连续接受与 target argmax 相同的草稿，
+首个不同处采用 target token；全部相同则追加 bonus token”，记录
+`greedy_decision_consistent` 和 `greedy_inconsistent_calls`。该判断只在离线进行，不中断
+在线请求。随机采样的原始证据保留，但不套用 greedy 判断。旧 dump 没有这些输入，需
+更新四台机器代码并用原有 dump 开关重新抓取，无需新增环境变量。
+
 原始 tensor 读回和写盘会明显减速、占用大量磁盘，也可能改变异步竞争的时序。此模式用于数据排查，不能代表性能，也不能排除仅在图回放或原始并发时序下出现的问题。
 
 ## 3. 拉取四台机器的文件

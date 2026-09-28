@@ -467,6 +467,116 @@ def _compare_sampled(reference: Worker, candidate: Worker, emit) -> None:
     )
 
 
+def _rejection_decisions(worker: Worker):
+    """Interpret archived sampler results offline, never infer from HTTP tokens."""
+    rows = {(record["call"], record["name"]): record for record in worker.records if record["kind"] == "rejection"}
+    sampled = {item["after_call"]: item["token_ids"] for item in worker.sampled}
+    for number, call in worker.calls.items():
+        metadata = call.get("rejection")
+        if metadata is None:
+            continue
+        detail = {**worker.evidence(), "call": number, "phase": call["phase"]}
+        try:
+
+            def tensor(name, number=number):
+                return _load_tensor(worker, rows[number, name])
+
+            drafts = tensor("draft_token_ids").reshape(-1).tolist()
+            target = tensor("target_logits")
+            bonus = tensor("bonus_token_ids").reshape(-1).tolist()
+            raw_output = tensor("sampler_output").reshape(-1).tolist()
+            kernel_output = tensor("kernel_output").reshape(-1).tolist()
+            count = metadata["num_draft_tokens"]
+            _require(len(drafts) == count == target.shape[0], "rejection draft/target count differs")
+            _require(len(bonus) == 1, "rejection bonus row differs")
+            placeholder = metadata["placeholder_token_id"]
+            output = [t for t in raw_output if t != placeholder]
+            _require(1 <= len(output) <= count + 1, "invalid rejection output length")
+            _require(
+                raw_output == output + [placeholder] * (len(raw_output) - len(output))
+                and all(0 <= token < target.shape[-1] for token in output),
+                "invalid rejection output tokens/padding",
+            )
+            accepted = len(output) - 1
+            argmax = target.argmax(dim=-1).tolist()
+            expected = None
+            if metadata["mode"] == "greedy":
+                first = next((i for i, (d, t) in enumerate(zip(drafts, argmax)) if d != t), count)
+                expected = drafts[:first] + ([argmax[first]] if first < count else bonus)
+            valid_used = bool(sampled.get(number))
+            yield {
+                **detail,
+                "status": "recorded",
+                "mode": metadata["mode"],
+                "draft_positions": metadata["draft_positions"],
+                "draft_token_ids": drafts,
+                "target_argmax_ids": argmax,
+                "bonus_token_id": bonus[0],
+                "sampler_output": raw_output,
+                "accepted_drafts": accepted,
+                "proposed_drafts": count,
+                "first_rejected_index": accepted if accepted < count else None,
+                "draft_status": ["accepted"] * accepted
+                + (["rejected"] + ["not_reached"] * (count - accepted - 1) if accepted < count else []),
+                "terminal_token_kind": "recovered" if accepted < count else "bonus",
+                "terminal_token_id": output[-1],
+                "greedy_expected_output": expected,
+                "greedy_decision_consistent": None if expected is None else output == expected,
+                "kernel_output_matches_sampler": kernel_output == raw_output,
+                "counted_for_acceptance": valid_used and count > 0,
+                "random_evidence": [
+                    name
+                    for name in ("draft_probs", "target_probs", "uniform_probs", "recovered_token_ids")
+                    if (number, name) in rows
+                ],
+            }
+        except Exception as exc:
+            yield {**detail, "status": "incomplete", "reason": str(exc)}
+
+
+def _write_rejection_report(reference: Archive, candidate: Archive, directory: Path) -> dict:
+    summaries, seen = [], set()
+    with (directory / "rejection.jsonl").open("w", encoding="utf-8") as stream:
+        for side, archive in (("reference", reference), ("candidate", candidate)):
+            for worker in archive.workers.values():
+                if worker.directory in seen:
+                    continue
+                seen.add(worker.directory)
+                decisions = list(_rejection_decisions(worker))
+                if not decisions:
+                    continue
+                for item in decisions:
+                    stream.write(json.dumps({"archive": side, **item}, ensure_ascii=False, allow_nan=False) + "\n")
+                counted = [d for d in decisions if d.get("counted_for_acceptance")]
+                proposed = sum(d["proposed_drafts"] for d in counted)
+                accepted = sum(d["accepted_drafts"] for d in counted)
+                summaries.append(
+                    {
+                        "archive": side,
+                        **worker.evidence(),
+                        "calls": len(decisions),
+                        "incomplete_calls": sum(d["status"] != "recorded" for d in decisions),
+                        "proposed_drafts": proposed,
+                        "accepted_drafts": accepted,
+                        "acceptance_rate": accepted / proposed if proposed else None,
+                        "greedy_inconsistent_calls": sum(
+                            d.get("greedy_decision_consistent") is False for d in decisions
+                        ),
+                        "kernel_output_mismatch_calls": sum(
+                            d.get("kernel_output_matches_sampler") is False for d in decisions
+                        ),
+                    }
+                )
+    return {
+        "scope": (
+            "Per worker/request; TP replicas are not summed. Discarded prefill samples are excluded; "
+            "counts are before HTTP stop/length trimming."
+        ),
+        "workers": summaries,
+        "details": "rejection.jsonl",
+    }
+
+
 def _observation_order(marker: dict) -> tuple:
     """Order observations in the main model, not by sentinel layer -1."""
     kind, name, layer = (marker[key] for key in ("kind", "name", "layer"))
@@ -858,6 +968,7 @@ def analyze(
             "different_workers": counts["sampled_outputs_different"],
             "first_difference": first_output_difference,
         },
+        "rejection_sampling": _write_rejection_report(reference, candidate, directory),
         "worst_difference": worst_difference,
         "kv_aliases": {
             "scope": "Different physical copies of one logical token within the same worker/call/layer.",
