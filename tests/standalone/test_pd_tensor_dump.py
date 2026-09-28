@@ -22,7 +22,7 @@ def module():
     return loaded
 
 
-def make_probe(module, tmp_path, prompts, *, cp=None, external=None, max_token_rows=64):
+def make_probe(module, tmp_path, prompts, *, cp=None, external=None, max_token_rows=64, max_features=8):
     ids = list(prompts)
     requests = {
         key: NS(prompt_token_ids=list(tokens), output_token_ids=[], sampling_params="max_tokens=16")
@@ -42,6 +42,7 @@ def make_probe(module, tmp_path, prompts, *, cp=None, external=None, max_token_r
         dict(host="worker.test", pid=123, tp_rank=1, tp_size=4, dp_rank=2, dp_size=4),
         lambda: NS(attn_metadata={"layer0": meta}),
         max_token_rows=max_token_rows,
+        max_features=max_features,
     )
     probe.layers = {0: object()}
     probe.attentions = {1: (0, "layer0")}
@@ -619,6 +620,114 @@ def test_fixed_chunks_preserve_same_kv_offsets_across_p_and_d_and_partial_tail(m
     torch.testing.assert_close(*copied)
     assert module.sample_rows(range(4000, 4096), 64, 4096, aligned=True)[0] == []
     assert module.sample_rows(range(4000, 4096), 64, 4096)[0] == list(range(4000, 4064))
+
+
+@pytest.mark.parametrize("features", [0, 8])
+def test_feature_capture_keeps_all_token_and_head_positions_before_readback(module, tmp_path, monkeypatch, features):
+    probe, _, meta = make_probe(module, tmp_path, {"a": list(range(400))}, max_token_rows=0, max_features=features)
+    ids, positions = batch(meta, [(list(range(400)), list(range(400)))])
+    probe.start(ids, positions)
+    copied = []
+    original = module.cpu_tensor
+
+    def copy(value):
+        copied.append((tuple(value.shape), value.is_contiguous()))
+        return original(value)
+
+    monkeypatch.setattr(module, "cpu_tensor", copy)
+    value = torch.arange(400 * 16 * 32).reshape(400, 16, 32).float()
+    probe.emit(value, 0, "attention", "query_nope", meta)
+    width = features or 32
+    assert copied == [((400, 16, width), True)]
+    archive = probe.archives["a"]
+    row = record_for(archive, "attention", "query_nope")
+    assert row["positions"] == list(range(400))
+    if features:
+        assert row["feature_capture"] == dict(axis=2, start=0, source_size=32, saved_size=8)
+    else:
+        assert "feature_capture" not in row
+    torch.testing.assert_close(value_for(archive, "attention", "query_nope"), value[..., :width])
+
+
+@pytest.mark.parametrize(
+    "kind,name",
+    [
+        ("attention", "logical_topk"),
+        ("indexer", "topk"),
+        ("mapping", "sparse_indices"),
+        ("model_input", "input_ids"),
+        ("model_input", "positions"),
+        ("logits", "output"),
+        ("rejection", "target_logits"),
+        ("rejection", "draft_probs"),
+    ],
+)
+def test_feature_cap_never_changes_routing_or_mtp_acceptance_evidence(module, kind, name):
+    value = torch.arange(64).reshape(2, 32).float()
+    captured, metadata = module.feature_prefix(value, kind, name, 8)
+    assert captured is value and metadata is None
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.int8])
+def test_feature_cap_is_applied_before_kv_gather_and_preserves_quantized_features(module, tmp_path, monkeypatch, dtype):
+    probe, _, meta = make_probe(module, tmp_path, {"a": list(range(200))}, max_token_rows=0)
+    ids, positions = batch(meta, [(list(range(200)), list(range(200)))])
+    probe.start(ids, positions)
+    meta.slot_mapping = torch.arange(200)
+    cache = torch.arange(200 * 16 * 32).reshape(1, 200, 16, 32).to(dtype)
+    original = torch.Tensor.index_select
+    gathered = []
+
+    def select(value, dim, indices):
+        gathered.append((tuple(value.shape), len(indices)))
+        return original(value, dim, indices)
+
+    monkeypatch.setattr(torch.Tensor, "index_select", select)
+    probe.current_kv([cache, cache], 0, meta)
+    probe.indexer_kv(cache, torch.tensor([[0]]), torch.tensor([200]), 0, "key")
+    assert gathered == [((200, 16, 8), 200)] * 3
+    for kind, name in (("kv_current", "nope"), ("kv_indexer", "key")):
+        row = record_for(probe.archives["a"], kind, name)
+        assert row["feature_capture"]["source_size"] == 32
+        torch.testing.assert_close(value_for(probe.archives["a"], kind, name), cache.reshape(200, 16, 32)[..., :8])
+
+
+def test_decode_topk_kv_outside_old_64_row_window_is_captured(module, tmp_path):
+    probe, _, meta = make_probe(module, tmp_path, {"a": list(range(200))}, max_token_rows=0)
+    ids, positions = batch(meta, [([199], [199])])
+    probe.start(ids, positions)
+    topk = torch.tensor([[99, 100, 199]])
+    probe.capture_topk(topk, meta)
+    cache = torch.arange(200 * 16).reshape(1, 200, 1, 16).float()
+    probe.attention_kv(
+        dict(
+            query=torch.zeros(1, 1, 16),
+            sparse_indices=topk,
+            block_table=torch.tensor([[0]]),
+            actual_seq_lengths_kv=torch.tensor([200]),
+            actual_seq_lengths_query=torch.tensor([1]),
+            key=cache,
+            key_rope=cache,
+        ),
+        0,
+        meta,
+    )
+    archive = probe.archives["a"]
+    row = record_for(archive, "kv_consumed", "nope")
+    assert row["positions"] == [99, 100, 199]
+    assert row["physical_slots"] == [99, 100, 199]
+    assert row["feature_capture"]["saved_size"] == 8
+    torch.testing.assert_close(value_for(archive, "kv_consumed", "nope"), cache[0, [99, 100, 199], :, :8])
+
+
+@pytest.mark.parametrize("rows", [0, 1, 10000])
+def test_vectorized_pair_dedup_matches_torch_including_large_addresses(module, rows):
+    generator = torch.Generator().manual_seed(7)
+    positions = torch.randint(0, 100, (rows,), generator=generator, dtype=torch.long)
+    slots = torch.randint(0, 200, (rows,), generator=generator, dtype=torch.long) + 2**62
+    expected = torch.unique(torch.stack((positions, slots), dim=1), dim=0, sorted=True)
+    actual = module.unique_kv_pairs(positions, slots)
+    torch.testing.assert_close(actual, expected)
 
 
 @pytest.mark.parametrize("local_lengths", [[0, 0], [1, 1]])

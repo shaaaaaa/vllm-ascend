@@ -44,9 +44,13 @@ env_variables: dict[str, Callable[[], Any]] = {
     # compilation mode 0 and synchronous scheduling; introduces host readback.
     "VLLM_ASCEND_PD_TENSOR_DUMP_DIR": lambda: os.getenv("VLLM_ASCEND_PD_TENSOR_DUMP_DIR", "").strip(),
     # Non-secret diagnostic row limit per request-local 4096-token segment.
-    # Default 64; integer in [0, 4096]; 0 captures all rows. Only read when
-    # PD_TENSOR_DUMP_DIR enables the probe. Feature/head/vocab axes stay whole.
-    "VLLM_ASCEND_PD_TENSOR_DUMP_MAX_TOKENS": lambda: int(os.getenv("VLLM_ASCEND_PD_TENSOR_DUMP_MAX_TOKENS", "64")),
+    # Default 0 (all tokens); integer in [0, 4096]. Positive values retain the
+    # legacy chunk-prefix sample. Only read when PD_TENSOR_DUMP_DIR is enabled.
+    "VLLM_ASCEND_PD_TENSOR_DUMP_MAX_TOKENS": lambda: int(os.getenv("VLLM_ASCEND_PD_TENSOR_DUMP_MAX_TOKENS", "0")),
+    # Non-secret diagnostic last-feature-axis limit; integer >= 0, default 8.
+    # 0 keeps full features. Token/head axes, IDs, top-k, logits and rejection
+    # evidence stay intact. KV is narrowed before gather and device readback.
+    "VLLM_ASCEND_PD_TENSOR_DUMP_MAX_FEATURES": lambda: int(os.getenv("VLLM_ASCEND_PD_TENSOR_DUMP_MAX_FEATURES", "8")),
     # Shared PD serving performance diagnostics across vLLM and LMCache.
     # Non-sensitive; configure before worker startup. Default 0/off. Values:
     # 1 = host timing, detail = extra host detail, device = opt-in device timing.

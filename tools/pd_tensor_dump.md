@@ -78,12 +78,14 @@ python3 tools/pd_tensor_smoke.py --analyze-only /实际/pd-tensor-smoke-目录
 ```bash
 # 四台机器使用相同 run 名；每次新实验换一个目录，避免混入旧请求。
 export VLLM_ASCEND_PD_TENSOR_DUMP_DIR=/workspace/sqh/vllm-ascend/pd-tensor-dump/case-on
-# 默认已是 64，可省略：每个固定 4096-token 段只抓少量行。
-export VLLM_ASCEND_PD_TENSOR_DUMP_MAX_TOKENS=64
+# 默认值：所有 token 位置保留，特征轴只保留前 8 个分量。
+# 若旧 template 写过 MAX_TOKENS=64，改成 0 才会覆盖全部 token。
+export VLLM_ASCEND_PD_TENSOR_DUMP_MAX_TOKENS=0
+export VLLM_ASCEND_PD_TENSOR_DUMP_MAX_FEATURES=8
 export VLLM_ASCEND_SFA_STAGED_GRAPH=0
 export VLLM_ASCEND_SFA_STAGED_MTP_DRAFT_GRAPH=0
 # 原始 tensor 写盘较慢，诊断期间放宽单次 worker 执行超时。
-export VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=3600
+export VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=7200
 ```
 
 P、D 两条 `vllm serve` 命令均设置以下参数。已有参数直接替换，不要重复追加相冲突的 JSON：
@@ -145,22 +147,31 @@ pd-tensor-dump/case-on/
 - P/D 当前 token 写入的 KV、indexer 读取的 KV/scale，以及 attention 实际消费的 KV。
 - 采样后被接受的 token；未完成 prefill 的丢弃采样和 MTP 的 padding 不计作输出。
 
-默认使用固定位置抽样，避免长 prompt 全量读回/写盘：
+默认保留所有 token，缩小特征轴，避免漏掉 D 的 top-k 选择到的 KV 位置：
 
-- KV 按 **request 内绝对位置**划分 4096-token 段，每段保存前最多 64 行。
-  例如长度 8192 保存 `[0,64)`、`[4096,4160)`；长度 8200 再保存 `[8192,8200)`。
-  P 的当前 KV、历史 indexer KV 和 D 实际消费的 KV 使用同一组位置，跨 chunk 调度也不重新编号。
-  attention 只保存上述位置中实际被选中的 KV；没有消费的位置不会伪造记录。
-- 输入输出/query/top-k 按每个 TP 实际可见的段保存前最多 64 行；D 当前计算的一两行也保留。
-  因此不会因 TP 分片从 1024 开始，或 decode position 不落在 KV 采样窗口内，而完全漏掉模型计算。
-- 截取发生在 KV gather 和 CPU 读回之前；hidden/head/vocab 维度保留完整。
-  完整 token/position/因果上下文等小型逻辑元数据、MTP 接受判断和最终 token 不截断。
-- `index.jsonl` 每条记录的 `row_capture.segments` 给出段起点、实际 `length`、
-  `source_rows`、`saved_rows` 和省略范围；不足 4096 或不足 64 都按实际数量记录。
-  `source_indices` 给出采样行在原始张量中的下标。物理槽别名也受每段行数上限约束。
-- 四台机器默认一致，无需新增参数即可生效；`VLLM_ASCEND_PD_TENSOR_DUMP_MAX_TOKENS=0`
-  才恢复全量。自定义值须在 0–4096，P、D 应保持一致。固定 4096 是诊断分段，
-  不改变模型的调度 chunk，也不改变 LMCache/Mooncake 传输数据。
+- `VLLM_ASCEND_PD_TENSOR_DUMP_MAX_TOKENS=0` 保留每个 TP 所有有效 token 行。
+  `VLLM_ASCEND_PD_TENSOR_DUMP_MAX_FEATURES=8` 把 KV、hidden、query 等数值张量的
+  **最后一个特征轴**截为前 8 个分量，其他轴包括 token 和 head 不截断。
+  例如 `[8192,1,512]` 保存为 `[8192,1,8]`，`[1024,64,512]` 保存为 `[1024,64,8]`。
+  原本不足 8 个分量的保持原样；量化 KV 的 int8 特征也按此截取。
+- token ID、position、物理/逻辑 top-k 索引、最终 token、全部 logits 和 rejection sampler
+  的输入输出/概率保留完整。截断词表维度会破坏离线 argmax 和 MTP 接受判断，所以这些不截。
+- KV 在设备 gather **之前**缩小特征轴；其他张量在设备上截取并整理为紧凑张量，再读回 CPU。
+  attention 仍仅记录真正消费的 KV，保留每个 `(逻辑位置, 物理槽)` 副本；不会伪造未消费的数据。
+- `feature_capture` 记录原始轴长度、保存的长度和起点。离线可比较旧全量文件与新文件的
+  共同特征分量；只有保存下来的分量参与分布、相对 L2 和 NaN 统计，不能代表完整向量正确。
+  `row_capture.segments` 仍记录固定 4096 段的实际长度、原始/保存行数和源下标。
+- 四台机器应使用相同配置。设 `MAX_FEATURES=0` 恢复完整特征；与 `MAX_TOKENS=0`
+  同时设置时才是完整 tensor。之前的 `MAX_TOKENS=64` 模式仍可显式使用：按 request 内
+  绝对位置取每个 4096 段的前最多 64 行 KV，输入输出取本 TP 可见段的前 64 行。
+  这些设置只影响诊断文件，不改变模型计算、调度 chunk 或 LMCache/Mooncake 传输内容。
+
+`VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=7200` 放宽 `execute_model` / `sample_tokens` 的
+worker RPC 等待时间，需要在四台机器启动进程前设置。单机 smoke 可传 `--rpc-timeout-seconds 7200`。
+它不控制 HCCL/设备事件超时。`Timeout (0:01:00)!` 加线程栈可能只是 Python
+`faulthandler.dump_traceback_later` 的定时诊断（默认 `exit=False`）；必须结合主线程和最终
+错误判断是否真退出，不能单凭这个标题认定 CPU 拷贝超时。
+参考 [Python faulthandler](https://docs.python.org/3.11/library/faulthandler.html#dumping-the-tracebacks-after-a-timeout)。
 
 `sampled.jsonl` 记录 worker 的接受结果，处于引擎最终按 EOS/停止词/长度裁剪之前；MTP 最后一步可能多产生少量接受 token。
 它不是 HTTP 响应文本的副本，服务对外输出仍受上面的 16 token 上限约束。

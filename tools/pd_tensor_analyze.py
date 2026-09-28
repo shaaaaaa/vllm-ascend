@@ -214,6 +214,24 @@ def _check_record(record: dict, worker: Worker) -> None:
         "missing tensor identity/dtype",
     )
     _require(_integers(record.get("shape")), "invalid tensor shape")
+    if "feature_capture" in record:
+        capture = record["feature_capture"]
+        shape = record["shape"]
+        _require(
+            isinstance(capture, dict)
+            and len(shape) >= 2
+            and capture.get("axis") == len(shape) - 1
+            and capture.get("start") == 0
+            and _integer(capture.get("source_size"), 1)
+            and _integer(capture.get("saved_size"), 1)
+            and capture["source_size"] > capture["saved_size"] == shape[-1],
+            "invalid feature capture metadata",
+        )
+        _require(
+            record["kind"] not in ("mapping", "rejection", "logits", "draft")
+            and record["name"] not in ("topk", "logical_topk", "input_ids", "positions"),
+            "routing/sampling evidence cannot truncate its feature axis",
+        )
     _local_path(worker.directory, record.get("path"))
     layout = record.get("tensor_layout")
     _require(layout in ("replicated", "sequence_sharded", "rank_local", "mapping"), "invalid tensor layout")
@@ -421,7 +439,22 @@ def _record_evidence(worker: Worker, record: dict) -> dict:
     return {
         **worker.evidence(),
         **{key: record[key] for key in ("model", "call", "layer", "kind", "name", "path", "tensor_layout")},
+        **({"feature_capture": record["feature_capture"]} if "feature_capture" in record else {}),
     }
+
+
+def _align_features(left, right, left_record, right_record):
+    """Compare shared feature coordinates; old full-width archives remain usable."""
+    left_capture = left_record.get("feature_capture")
+    right_capture = right_record.get("feature_capture")
+    if left.ndim < 2 or right.ndim < 2:
+        return left, right
+    _require(left.ndim == right.ndim and left.dtype == right.dtype, "feature tensor rank/dtype differs")
+    left_size = left_capture["source_size"] if left_capture else left_record["shape"][-1]
+    right_size = right_capture["source_size"] if right_capture else right_record["shape"][-1]
+    _require(left_size == right_size, "original feature sizes differ")
+    width = min(left.shape[-1], right.shape[-1])
+    return left[..., :width], right[..., :width]
 
 
 def _compare_kv_aliases(worker: Worker, side: str, emit) -> None:
@@ -696,7 +729,9 @@ def _outside_sample(worker, refs, call, position):
 
 
 def _capture_summary(archive):
-    result = dict(sampled_tensors=0, saved_token_rows=0, omitted_token_rows=0, query_limited_tensors=0)
+    result = dict(
+        sampled_tensors=0, feature_sampled_tensors=0, saved_token_rows=0, omitted_token_rows=0, query_limited_tensors=0
+    )
     for worker in archive.workers.values():
         for record in worker.records:
             capture = record.get("row_capture", {})
@@ -708,11 +743,13 @@ def _capture_summary(archive):
                 bool(omitted) or query_limited or capture.get("logical_chunk_filter", False)
             )
             result["query_limited_tensors"] += int(query_limited)
+            result["feature_sampled_tensors"] += int("feature_capture" in record)
             result["saved_token_rows"] += len(record.get("positions") or [])
             result["omitted_token_rows"] += omitted
     result["scope"] = (
         "Only archived rows are checked; omitted_token_rows excludes KV filtered by logical chunk offset "
         "or reachable only from unsampled queries. "
+        "Feature statistics cover only recorded/common feature components, not full vectors. "
         "Counts sum observations across calls/layers, not unique request tokens."
     )
     return result
@@ -807,6 +844,7 @@ def _compare_worker(reference: Worker, candidate: Worker, mode: str, emit) -> No
                 for index, aligned in pairs.items():
                     ref = references[index]
                     value = _load_tensor(reference, ref)
+                    value, actual = _align_features(value, actual, ref, record)
                     _require(
                         value.dtype == actual.dtype and value.shape[1:] == actual.shape[1:],
                         "aligned tensor trailing shape/dtype differs",
@@ -820,8 +858,14 @@ def _compare_worker(reference: Worker, candidate: Worker, mode: str, emit) -> No
                             "kind": ref["kind"],
                             "tensor_layout": ref["tensor_layout"],
                             "rows": len(aligned),
+                            **({"feature_capture": ref["feature_capture"]} if "feature_capture" in ref else {}),
                         }
                     )
+                # Different reference snapshots may retain different feature
+                # widths; align earlier parts after the narrowest is known.
+                if any("feature_capture" in ref for ref in references.values()) or "feature_capture" in record:
+                    parts = [part[..., : actual.shape[-1]] for part in parts]
+                    detail["compared_feature_size"] = int(actual.shape[-1])
                 baseline = torch.cat(parts, dim=0)
                 actual = actual[ordering]
                 detail.update(
@@ -847,6 +891,7 @@ def _compare_worker(reference: Worker, candidate: Worker, mode: str, emit) -> No
                 index, ref = choices[0]
                 _require(ref["tensor_layout"] == record["tensor_layout"], "tensor layout differs")
                 baseline = _load_tensor(reference, ref)
+                baseline, actual = _align_features(baseline, actual, ref, record)
                 used.update((i, None) for i, _ in choices)
                 detail.update(
                     reference_sources=[{"call": ref["call"], "path": ref["path"]}],
@@ -1045,7 +1090,7 @@ def analyze(
         "status": "incomplete_or_incomparable" if issues or not comparisons else "analysis_complete",
         "accuracy_verdict": "not_assessed",
         "scope": (
-            "Archived main and MTP tensor rows only; unsaved rows are not assessed. "
+            "Archived main and MTP tensor rows/features only; unsaved values are not assessed. "
             "PD mode compares consumed prompt KV, excluding the MTP next-token boundary."
         ),
         "capture_sampling": {"reference": _capture_summary(reference), "candidate": _capture_summary(candidate)},

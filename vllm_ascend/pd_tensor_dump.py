@@ -18,6 +18,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from urllib.parse import quote
 
+import numpy as np
 import torch
 
 
@@ -101,6 +102,38 @@ def sampled_tensor(tensor, capture):
     return tensor.index_select(0, torch.tensor(indices, dtype=torch.long, device=tensor.device))
 
 
+def feature_prefix(tensor, kind, name, limit):
+    # Keep token/head axes and all discrete routing evidence. Quantized KV
+    # contains features too, even when its dtype is int8 rather than floating.
+    eligible = (
+        tensor.ndim >= 2
+        and kind not in ("mapping", "rejection", "logits", "draft")
+        and name not in ("topk", "logical_topk", "input_ids", "positions")
+        and (tensor.is_floating_point() or kind in ("kv_current", "kv_consumed", "kv_indexer"))
+    )
+    if not eligible or not limit or tensor.shape[-1] <= limit:
+        return tensor, None
+    capture = dict(axis=tensor.ndim - 1, start=0, source_size=int(tensor.shape[-1]), saved_size=limit)
+    return tensor[..., :limit], capture
+
+
+def unique_kv_pairs(positions, slots):
+    """Vectorized CPU lexicographic deduplication; retain physical aliases.
+
+    torch.unique(dim=0) compares tiny tensor rows and becomes expensive with
+    a full prefill query-by-top-k matrix. Never pack addresses into arithmetic
+    keys: that can overflow or conflate different (position, slot) pairs.
+    """
+    pairs = np.stack((positions.numpy(), slots.numpy()), axis=1)
+    if not len(pairs):
+        return torch.from_numpy(pairs)
+    pairs = pairs[np.lexsort((pairs[:, 1], pairs[:, 0]))]
+    distinct = np.empty(len(pairs), dtype=np.bool_)
+    distinct[0] = True
+    distinct[1:] = np.any(pairs[1:] != pairs[:-1], axis=1)
+    return torch.from_numpy(pairs[distinct])
+
+
 class RequestArchive:
     def __init__(self, root, metadata):
         self.metadata = dict(metadata)
@@ -148,6 +181,7 @@ class RequestArchive:
         *,
         physical_slots=None,
         row_capture=None,
+        feature_capture=None,
     ):
         context = call["context_token_ids"]
         if positions is not None:
@@ -159,13 +193,15 @@ class RequestArchive:
             if positions is None or len(physical_slots) != len(positions) or any(s < 0 for s in physical_slots):
                 raise ValueError("Invalid consumed KV physical slot mapping")
         if positions is not None and row_capture is None:
-            positions, row_capture = sample_rows(positions, self.metadata.get("max_token_rows", 64), len(context))
+            positions, row_capture = sample_rows(positions, self.metadata.get("max_token_rows", 0), len(context))
             tensor = sampled_tensor(tensor, row_capture)
             if physical_slots is not None:
                 physical_slots = [physical_slots[i] for i in row_capture["source_indices"]]
-        # Slice on device before readback. In particular, do not truncate the
-        # hidden/head/vocabulary axes or the nonrow rejection-sampler evidence.
-        value = cpu_tensor(tensor)
+        if feature_capture is None:
+            tensor, feature_capture = feature_prefix(tensor, kind, name, self.metadata.get("max_features", 8))
+        # Materialize the already narrowed view on device. A strided feature
+        # view must not cause a full-width temporary/readback in the backend.
+        value = cpu_tensor(tensor.contiguous())
         relative = f"tensors/{self.metadata['records']:08d}.pt"
         temporary = (self.root / relative).with_suffix(".pt.tmp")
         torch.save(value, temporary)
@@ -191,6 +227,8 @@ class RequestArchive:
             record["physical_slots"] = physical_slots
         if row_capture is not None:
             record["row_capture"] = row_capture
+        if feature_capture is not None:
+            record["feature_capture"] = feature_capture
         with (self.root / "index.jsonl").open("a", encoding="utf-8") as stream:
             stream.write(json.dumps(record, allow_nan=False) + "\n")
         self.metadata["records"] += 1
@@ -220,10 +258,13 @@ class RequestArchive:
 class PDTensorDump:
     """Capture main verification and MTP calls under separate model identities."""
 
-    def __init__(self, runner, root, role, rank_info, get_context, max_token_rows=64):
+    def __init__(self, runner, root, role, rank_info, get_context, max_token_rows=0, max_features=8):
         if type(max_token_rows) is not int or not 0 <= max_token_rows <= 4096:
             raise ValueError("PD tensor dump max token rows must be an integer in [0, 4096] (0 = all)")
         self.max_token_rows = max_token_rows
+        if type(max_features) is not int or max_features < 0:
+            raise ValueError("PD tensor dump max features must be a nonnegative integer (0 = all)")
+        self.max_features = max_features
         self.runner, self.root, self.role = runner, Path(root), role
         self.rank_info, self.get_context = dict(rank_info), get_context
         self.external_ids = {}
@@ -727,6 +768,7 @@ class PDTensorDump:
                         sampling_params=str(request.sampling_params),
                         prompt_token_ids=list(request.prompt_token_ids),
                         max_token_rows=self.max_token_rows,
+                        max_features=self.max_features,
                     ),
                 )
                 self.archives[internal] = archive
@@ -775,6 +817,7 @@ class PDTensorDump:
         *,
         physical_slots=None,
         row_capture=None,
+        feature_capture=None,
     ):
         key = (layer, kind, name)
         if key in entry["observed"]:
@@ -790,6 +833,7 @@ class PDTensorDump:
             layout,
             physical_slots=physical_slots,
             row_capture=row_capture,
+            feature_capture=feature_capture,
         )
         entry["observed"].add(key)
 
@@ -895,6 +939,7 @@ class PDTensorDump:
             selected = sampled_tensor(slots[start:end], capture)
             for cache, name in zip(kv_cache[:2], ("nope", "rope")):
                 flat = cache.reshape(-1, *cache.shape[2:])
+                flat, features = feature_prefix(flat, "kv_current", name, self.max_features)
                 if selected.numel() and (selected.min() < 0 or selected.max() >= flat.shape[0]):
                     raise ValueError("Current KV slot out of bounds")
                 self.record(
@@ -906,12 +951,14 @@ class PDTensorDump:
                     positions,
                     layout="replicated",
                     row_capture=capture,
+                    feature_capture=features,
                 )
 
     def indexer_kv(self, tensor, table, lengths, layer, name):
         table, lengths = cpu_tensor(table).long(), cpu_tensor(lengths).long().reshape(-1)
         block_size = int(tensor.shape[1])
         flat = tensor.reshape(-1, *tensor.shape[2:])
+        flat, features = feature_prefix(flat, "kv_indexer", name, self.max_features)
         for entry in self.active["entries"]:
             row = entry["row"]
             if row >= len(lengths):
@@ -939,6 +986,7 @@ class PDTensorDump:
                 positions.tolist(),
                 layout="replicated",
                 row_capture=capture,
+                feature_capture=features,
             )
 
     def attention_kv(self, values, layer, meta):
@@ -986,7 +1034,7 @@ class PDTensorDump:
                 raise ValueError("Attention selection exceeds block table")
             slots = table[owners[:, None], blocks.clamp_max(max(0, table.shape[1] - 1))]
             slots = slots * block_size + physical.clamp_min(0) % block_size
-            pairs = torch.unique(torch.stack((original[valid], slots[valid]), dim=1), dim=0, sorted=True)
+            pairs = unique_kv_pairs(original[valid], slots[valid])
             sampled, capture = sample_rows(
                 pairs[:, 0].tolist(), self.max_token_rows, len(entry["call"]["context_token_ids"]), aligned=True
             )
@@ -1010,6 +1058,7 @@ class PDTensorDump:
             for key, name in (("key", "nope"), ("key_rope", "rope")):
                 cache = values[key]
                 flat = cache.reshape(-1, *cache.shape[2:])
+                flat, features = feature_prefix(flat, "kv_consumed", name, self.max_features)
                 if pairs.numel() and (pairs[:, 1].min() < 0 or pairs[:, 1].max() >= flat.shape[0]):
                     raise ValueError("Attention KV physical slot out of bounds")
                 rows = flat.index_select(0, pairs[:, 1].to(cache.device))
@@ -1026,6 +1075,7 @@ class PDTensorDump:
                     layout="replicated",
                     physical_slots=pairs[:, 1].tolist(),
                     row_capture=capture,
+                    feature_capture=features,
                 )
 
     def kernel_factory(self, kind, tuple_result=False):
@@ -1170,6 +1220,7 @@ def install_pd_tensor_dump(runner, root):
         ),
         get_forward_context,
         max_token_rows=envs.VLLM_ASCEND_PD_TENSOR_DUMP_MAX_TOKENS,
+        max_features=envs.VLLM_ASCEND_PD_TENSOR_DUMP_MAX_FEATURES,
     )
     try:
         probe.install(AscendSFAImpl, torch_npu)

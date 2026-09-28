@@ -174,6 +174,74 @@ def sample_worker(directory, limit=64):
     write_records(directory, records)
 
 
+def feature_worker(directory, source_width=16, saved_width=None, delta_index=None):
+    records = read_records(directory)
+    for record in records:
+        value = torch.tensor(record["positions"], dtype=torch.float32)[:, None] + torch.arange(source_width)[None, :]
+        if delta_index is not None:
+            value[0, delta_index] += 1
+        if saved_width is not None:
+            value = value[:, :saved_width].contiguous()
+            record["feature_capture"] = dict(axis=1, start=0, source_size=source_width, saved_size=saved_width)
+        record["shape"] = list(value.shape)
+        torch.save(value, directory / record["path"])
+    write_records(directory, records)
+
+
+@pytest.mark.parametrize("reference_width,candidate_width", [(None, 8), (8, None), (4, 8), (8, 4)])
+def test_feature_samples_align_with_full_archives_without_claiming_full_vectors(
+    tmp_path, reference_width, candidate_width
+):
+    for side, width in (("reference", reference_width), ("candidate", candidate_width)):
+        directory = make_worker(tmp_path / side, context=list(range(200)))
+        feature_worker(directory, saved_width=width)
+    report = run(tmp_path)
+    assert report["status"] == "analysis_complete", report
+    assert report["compared_rows"] == 200
+    assert report["counts"]["equal"] == 1
+    assert report["capture_sampling"]["candidate"]["feature_sampled_tensors"] == int(candidate_width is not None)
+    assert "full vectors" in report["capture_sampling"]["candidate"]["scope"]
+
+
+@pytest.mark.parametrize("delta_index,expected", [(7, "different"), (15, "equal")])
+def test_only_archived_feature_components_are_assessed(tmp_path, delta_index, expected):
+    p = make_worker(tmp_path / "reference", role="P")
+    d = make_worker(tmp_path / "candidate", role="D", kind="kv_consumed")
+    feature_worker(p)
+    feature_worker(d, saved_width=8, delta_index=delta_index)
+    report = run(tmp_path, mode="pd-kv")
+    assert report["status"] == "analysis_complete", report
+    assert report["counts"][expected] == 1
+    assert report["accuracy_verdict"] == "not_assessed"
+
+
+def test_identical_eight_saved_features_cannot_hide_different_original_shapes(tmp_path):
+    p = make_worker(tmp_path / "reference")
+    d = make_worker(tmp_path / "candidate")
+    feature_worker(p, source_width=16, saved_width=8)
+    feature_worker(d, source_width=32, saved_width=8)
+    report = run(tmp_path)
+    assert report["status"] == "incomplete_or_incomparable"
+    assert report["issues"] > 0
+
+
+def test_reference_snapshots_with_mixed_feature_limits_align_to_common_prefix(tmp_path):
+    p = make_worker(tmp_path / "reference", batches=[[0, 1], [2, 3, 4]])
+    d = make_worker(tmp_path / "candidate")
+    feature_worker(p)
+    feature_worker(d)
+    records = read_records(p)
+    first = records[0]
+    value = torch.load(p / first["path"], weights_only=True)[:, :8].contiguous()
+    torch.save(value, p / first["path"])
+    first["feature_capture"] = dict(axis=1, start=0, source_size=16, saved_size=8)
+    first["shape"][-1] = 8
+    write_records(p, records)
+    report = run(tmp_path)
+    assert report["status"] == "analysis_complete", report
+    assert report["compared_rows"] == 5
+
+
 @pytest.mark.parametrize(
     "sampled_side,status", [("reference", "outside_reference_sample"), ("candidate", "outside_candidate_sample")]
 )
