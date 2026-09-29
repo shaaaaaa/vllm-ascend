@@ -106,7 +106,7 @@ def test_builder_does_not_allocate_unused_paired_map(paired, selected):
     mask = Mock(return_value=(selected,))
     mapping = tuple(range(36)) if paired else None
     config = NS(indexer_c8_shared_block_factor=2, indexer_hbm_block_map=mapping, indexer_c8_layer_mask=mask)
-    subject = NS(max_blocks=1391)
+    subject = NS(max_blocks=1391, _layerwise_prefill_p_node=False)
     exec(
         compile(ast.Module(body=init.body[start:end], type_ignores=[]), str(source), "exec"),
         dict(
@@ -143,3 +143,47 @@ def test_paired_metadata_on_npu_matches_host_mapping():
     assert torch.equal(out_table.cpu(), mapping[table.long()])
     expected = torch.where(slots >= 0, mapping[(slots.clamp(min=0) // 128).long()].long() * 128 + slots % 128, -1)
     assert torch.equal(out_slots.cpu(), expected)
+
+
+@pytest.mark.parametrize("width", [1404, 8208])
+@pytest.mark.parametrize("slot_dtype", [torch.int32, torch.int64])
+def test_paired_metadata_long_table_npu_capture(width, slot_dtype):
+    """Isolate the reported mapper fault with 16 requests plus a padding row.
+
+    8208 is the 1Mi-token table rounded to 18-block bundles. Compile and
+    allocate outside capture, then verify eager and captured replay separately.
+    """
+    pytest.importorskip("torch_npu")
+    pytest.importorskip("triton")
+    if not torch.npu.is_available():
+        pytest.skip("Requires NPU")
+    from vllm_ascend.ops.triton.spec_decode.indexer_c8_metadata import map_indexer_metadata
+
+    mapping = block_map(4)
+    table = torch.arange(17 * width, dtype=torch.int32).view(17, width) % len(mapping)
+    table[-1].zero_()
+    slots = torch.arange(32, dtype=slot_dtype) * 128 + 7
+    slots[-1] = -1
+    expected_table = mapping[table.long()]
+    expected_slots = torch.where(
+        slots >= 0, mapping[(slots.clamp(min=0) // 128).long()].long() * 128 + slots % 128, -1,
+    )
+    device_table, device_slots, device_map = table.npu(), slots.npu(), mapping.npu()
+    out_table = torch.empty_like(device_table)
+    out_slots = torch.empty(32, dtype=torch.int64, device="npu")
+
+    def launch():
+        map_indexer_metadata(device_table, device_slots, device_map, out_table, out_slots)
+
+    launch()
+    torch.npu.synchronize()
+    assert torch.equal(out_table.cpu(), expected_table), "eager table"
+    assert torch.equal(out_slots.cpu(), expected_slots), "eager slots"
+    graph = torch.npu.NPUGraph()
+    with torch.npu.graph(graph):
+        launch()
+    for _ in range(2):
+        graph.replay()
+    torch.npu.synchronize()
+    assert torch.equal(out_table.cpu(), expected_table), "captured table"
+    assert torch.equal(out_slots.cpu(), expected_slots), "captured slots"
