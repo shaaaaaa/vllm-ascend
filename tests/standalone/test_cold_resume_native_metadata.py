@@ -3,6 +3,7 @@
 
 import ast
 import importlib.util
+import runpy
 from pathlib import Path
 from types import SimpleNamespace as NS
 
@@ -34,6 +35,7 @@ def api():
         AscendSFAMetadata=NS,
         AttentionMaskBuilder=lambda device: NS(get_attention_mask=lambda config: None),
         enable_dsa_cp=lambda: False,
+        get_ascend_config=lambda: NS(indexer_c8_shared_block_factor=1),
         envs=NS(VLLM_ASCEND_DSA_UNBUNDLE=True, VLLM_ASCEND_DSA_SHRINK_LATENT=2, VLLM_ASCEND_MTP_DW_DEEP_DIAG=False),
         get_cos_and_sin_mla=lambda positions, _: (torch.zeros_like(positions), torch.zeros_like(positions)),
         staged_sfa_connector_supports_sparse_load=lambda: True,
@@ -74,6 +76,7 @@ def builder(api):
     )
     config = NS(
         cache_config=NS(block_size=128),
+        kv_transfer_config=None,
         model_config=model,
         speculative_config=NS(num_speculative_tokens=1),
         scheduler_config=NS(max_num_seqs=16, max_num_batched_tokens=32),
@@ -607,3 +610,51 @@ def test_native_resume_ignores_same_request_save_control(native_api):
     decision = native_api["_staged_sfa_local_route"](runner, **kwargs)
     assert decision.cold_compact_resumes == (True, False)
     assert decision.cold_compact_resumes.computed_ends == (22683, 0)
+
+
+@pytest.mark.parametrize("rank", range(4))
+@pytest.mark.parametrize("widths", [(3, 2), (1, 4)])
+def test_flashcomm_full_build_keeps_each_prefill_bank_physical_metadata(api, monkeypatch, rank, widths):
+    root = Path(__file__).resolve().parents[2]
+    metadata_api = runpy.run_path(str(root / "vllm_ascend/worker/dsa_shared_pool.py"))
+    overrides = {
+        "enable_dsa_cp": lambda: True,
+        "get_ascend_config": lambda: NS(indexer_c8_shared_block_factor=2, indexer_hbm_block_map=None),
+        "get_tp_group": lambda: NS(world_size=4, rank_in_group=rank),
+        "_round_up": lambda a, b: (a + b - 1) // b * b,
+        "DSACPContext": NS,
+        "MixedIndexerMetadata": metadata_api["MixedIndexerMetadata"],
+        "get_cos_and_sin_mla": lambda positions, _: (
+            torch.zeros(len(positions), 1, 1, 64), torch.zeros(len(positions), 1, 1, 64)),
+    }
+    for name, value in overrides.items():
+        monkeypatch.setitem(api, name, value)
+    monkeypatch.setattr(api["envs"], "VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE", True, raising=False)
+    monkeypatch.setattr(api["envs"], "VLLM_ASCEND_DSA_SHRINK_LATENT", 0)
+    config = NS(
+        cache_config=NS(block_size=128),
+        model_config=NS(max_model_len=8192, get_head_size=lambda: 576, hf_config=None,
+                        hf_text_config=NS(qk_rope_head_dim=64, topk_tokens=2048)),
+        speculative_config=NS(num_speculative_tokens=1),
+        scheduler_config=NS(max_num_seqs=16, max_num_batched_tokens=32),
+        kv_transfer_config=NS(is_kv_producer=True),
+    )
+    builder = api["AscendSFAMetadataBuilder"](None, [], config, torch.device("cpu"))
+    held = []
+    for bank in (18, 72, 18):
+        cm = common(api, widths, set(), computed=[0, 0], frontier=[0, 0], state="prefill", padded=8)
+        cm.indexer_block_table_tensor.fill_(bank)
+        cm.block_table_tensor.fill_(bank // 2)
+        cm.indexer_slot_mapping = torch.tensor([bank * 128 + i for i in range(5)] + [-1] * 3)
+        cm.slot_mapping = torch.tensor([bank * 64 + i for i in range(5)] + [-1] * 3)
+        metadata = builder.build(0, cm)
+        held.append(metadata)
+        assert metadata.indexer_c8_slot_mapping.tolist() == [bank * 256 + i for i in range(5)] + [-1] * 3
+        assert metadata.dsa_cp_context.slot_mapping_cp.tolist() == cm.slot_mapping[2 * rank:2 * rank + 2].tolist()
+        assert builder.rebind_layerwise_prefill_metadata(metadata, cm) is None
+    # A shared-indexer consumer cannot inherit the preceding owner's C8 views.
+    cm.indexer_block_table_tensor = cm.indexer_slot_mapping = None
+    consumer = builder.build(0, cm)
+    assert consumer.indexer_c8_block_table is consumer.indexer_c8_slot_mapping is None
+    assert [int(m.indexer_c8_block_table[0, 0]) for m in held] == [36, 144, 36]
+    assert len({m.indexer_c8_slot_mapping.data_ptr() for m in held}) == 3
