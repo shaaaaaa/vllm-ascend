@@ -761,6 +761,20 @@ def layerwise_prefill_transfer_window_supported() -> bool:
     return capability is True and callable(submit_load) and callable(finish_save)
 
 
+def record_layerwise_prefill_bank_use(layer_name: str) -> None:
+    """Record a P bank's final access and order its next DMA after that event."""
+    connector = get_kv_transfer_group()
+    record = getattr(connector, "record_layerwise_prefill_bank_use", None)
+    if not callable(record):
+        raise RuntimeError(
+            "Layerwise prefill requires the bank-use event API; update LMCache "
+            "and LMCache-Ascend together with vllm-ascend"
+        )
+    event = torch.npu.Event()
+    event.record(torch.npu.current_stream())
+    record(layer_name, event)
+
+
 def maybe_submit_layerwise_prefill_load(layer_name: str | int) -> bool:
     """Submit N+2; ``-1`` is the first-layer, load-only trigger."""
     if not has_kv_transfer_group() or not is_v1_kv_transfer_group():

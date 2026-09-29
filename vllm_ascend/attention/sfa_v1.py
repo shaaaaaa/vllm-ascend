@@ -72,6 +72,7 @@ from vllm_ascend.attention.utils import (
     maybe_save_kv_layer_outside_layerwise_prefill_transfer_window,
     maybe_save_kv_layer_to_connector,
     maybe_submit_layerwise_prefill_load,
+    record_layerwise_prefill_bank_use,
     staged_sfa_connector_supports_sparse_load,
     trans_rope_weight,
     transdata,
@@ -5229,10 +5230,18 @@ class AscendSFAImpl(MLAAttentionImpl):
                     actual_seq_lengths_query=actual_seq_lengths_query,
                     actual_seq_lengths_key=actual_seq_lengths_key,
                 )
+                if self._layerwise_prefill_p_node and index_lmcache_enabled:
+                    # The indexer has finished reading its own bank. Record
+                    # before top-k publication and latent SFA are submitted.
+                    record_layerwise_prefill_bank_use(index_layer_name)
                 if self.index_cache_enabled:
                     # Publish this batch's top-k so downstream skip layers
                     # read it from the stable shared buffer.
                     self._update_indexcache_topk_indices(topk_indices)
+            if self._layerwise_prefill_p_node and self.skip_topk and index_lmcache_enabled:
+                # Runtime index-cache skips still scatter this layer's KV;
+                # shared consumers without an indexer own no Group-1 bank.
+                record_layerwise_prefill_bank_use(index_layer_name)
             if content_diagnostics_enabled:
                 queue_selected_topk_fingerprint(
                     req_ids=attn_metadata.req_ids,
@@ -6005,6 +6014,12 @@ class AscendSFAImpl(MLAAttentionImpl):
             # one step per layer-call on the native (user) path so the profiler
             # logs mean ms/layer-call periodically (mirrors the manager path).
             _dsa_prof.step()
+
+        if self._layerwise_prefill_p_node:
+            # All SFA reads of the latent bank are now submitted. The DMA
+            # stream waits on this exact point, excluding v_up/o_proj, FFN,
+            # and the next layer's normalization. Passive TP ranks mark it too.
+            record_layerwise_prefill_bank_use(layer_name)
 
         # Offload to LMCache. Legacy un-bundled connectors save only the
         # latent (k_nope, k_pe). Connectors declaring DSA index LMCache support
