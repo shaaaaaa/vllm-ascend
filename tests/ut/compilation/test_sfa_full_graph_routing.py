@@ -1502,3 +1502,15 @@ def test_live_preparation_groups_current_metadata_and_keeps_all_layer_guards(rou
         assert all(item.decode_remap_boundary_ready for item in items)
     for layer in layers:
         layer.prepare_full_graph_layer.assert_not_called()
+
+
+@pytest.mark.parametrize("connector", [None, SimpleNamespace(supports_layerwise_prefill_transfer_window=False)])
+def test_banked_p_checks_capability_before_full_graph_eager_return(routing, connector):
+    runner, ns, _, _, _ = routing
+    runner.layerwise_prefill_p_node = True
+    runner.model_config.enforce_eager = True
+    ns["staged_sfa_graph_configured"] = lambda _: False
+    ns["has_kv_transfer_group"] = lambda: connector is not None
+    ns["get_kv_transfer_group"] = lambda: connector
+    with pytest.raises(ValueError, match="Layerwise-prefill P nodes require"):
+        runner._validate_sfa_layerwise_connector_cudagraph_mode()

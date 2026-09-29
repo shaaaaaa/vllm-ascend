@@ -116,7 +116,7 @@ def test_mixed_pool_uses_common_ownership_with_c8_physical_block_mapping(api):
         assert torch.all(scale[block * 2] == 0.25)
 
 
-@pytest.mark.parametrize("shared", [False, True, "paired"])
+@pytest.mark.parametrize("shared", [False, True, "paired", "banked"])
 @pytest.mark.parametrize("aligned", [False, True])
 def test_runner_allocates_mixed_indexers_and_shared_consumers(api, monkeypatch, shared, aligned):
     core_path = ROOT.parent / "vllm/vllm/v1/core/dsa_shared_pool.py"
@@ -156,6 +156,10 @@ def test_runner_allocates_mixed_indexers_and_shared_consumers(api, monkeypatch, 
         paired = [name, index_names[i]] if shared and i < 2 else [name]
         size = 3 * 294912 * (2 if shared == "paired" and i == 0 else 1) + (3 * 4608 if shared and i == 1 else 0)
         tensors.append(NS(shared_by=paired, size=size))
+    if shared == "banked":
+        layout = core.dsa_shared_block_layout(latent_spec, index_spec, 2, prefill_child=True)
+        tensors = [NS(shared_by=latent_names + index_names,
+                      size=7 * (layout.bundle_page_size_bytes + layout.scale_bytes_per_bundle))]
     if not shared:
         tensors += [NS(shared_by=[name], size=5 * index_spec.page_size_bytes) for name in index_names]
     config = NS(
@@ -167,6 +171,7 @@ def test_runner_allocates_mixed_indexers_and_shared_consumers(api, monkeypatch, 
     runner = ns["Runner"]()
     runner.kv_cache_config = config
     runner.dsa_shared_pool, runner.dsa_unbundle, runner.use_sparse = shared, True, True
+    runner.layerwise_prefill_p_node = shared == "banked"
     runner.use_sparse_c8_indexer = True
     runner._mixed_indexer_c8_names = frozenset(c8_names)
     runner.vllm_config = NS(kv_transfer_config=object() if aligned else None)
@@ -182,14 +187,28 @@ def test_runner_allocates_mixed_indexers_and_shared_consumers(api, monkeypatch, 
     bf16, c8 = views[index_names[0]], views[index_names[1]]
     assert len(bf16) == 1 and bf16[0].dtype == torch.bfloat16
     assert len(c8) == 2 and [t.dtype for t in c8] == [torch.int8, torch.float16]
-    blocks = 54 if shared == "paired" else 27 if shared else 5
+    blocks = 126 if shared == "banked" else 54 if shared == "paired" else 27 if shared else 5
     assert bf16[0].shape[0] == blocks
-    assert c8[0].shape[0] == c8[1].shape[0] == blocks * (2 if shared is True else 1)
+    assert c8[0].shape[0] == c8[1].shape[0] == blocks * (2 if shared is True or shared == "banked" else 1)
     if shared == "paired":
         assert all(t.shape[0] == 6 and t.is_contiguous() for name in latent_names for t in views[name])
     assert all(len(views[name]) == 2 for name in latent_names)
     storages = {t.untyped_storage().data_ptr(): t.untyped_storage().nbytes() for row in raw.values() for t in row}
-    assert sum(storages.values()) <= sum(t.size for t in tensors) + (len(storages) * 2 * 1024**2 if aligned else 0)
+    assert sum(storages.values()) <= sum(t.size for t in tensors) + (len(storages) * 2 * 1024**2 if aligned or shared == "banked" else 0)
+    if shared == "banked":
+        assert len(storages) == 1
+        assert sum(storages.values()) == tensors[0].size + 2 * 1024**2
+        assert views[latent_names[0]] is views[latent_names[2]]
+        assert bf16[0].data_ptr() == c8[0].data_ptr()
+        # Discontinuous child IDs in two temporal banks preserve null and gaps.
+        for block, value in ((18, 11), (72, 23)):
+            c8[0][2 * block].fill_(value)
+            c8[1][2 * block].fill_(value)
+            logical_bytes = bf16[0][block].view(torch.int8).flatten()
+            assert torch.all(logical_bytes[:16384] == value)
+            assert torch.count_nonzero(logical_bytes[16384:]) == 0
+            assert torch.count_nonzero(c8[1][2 * block + 1]) == 0
+        assert torch.count_nonzero(bf16[0][0]) == 0
     if shared == "paired":
         expected_padding = 4 * 2 * 1024**2 if aligned else 0  # two paired slabs, two consumer planes
         assert sum(storages.values()) == sum(t.size for t in tensors) + expected_padding
@@ -233,3 +252,38 @@ def test_merging_specs_preserves_paired_geometry_and_alignment(api):
     for other in (replace(spec, indexer_paired_banks=False), replace(spec, shared_pool_alignment_bytes=0)):
         with pytest.raises(AssertionError):
             type(spec).merge([spec, other])
+
+
+def test_prefill_rebind_owns_physical_metadata_for_each_bank(api):
+    from copy import copy
+
+    path = ROOT / "vllm_ascend/attention/sfa_v1.py"
+    cls = next(n for n in ast.parse(path.read_text(encoding="utf-8")).body
+               if isinstance(n, ast.ClassDef) and n.name == "AscendSFAMetadataBuilder")
+    method = next(n for n in cls.body if getattr(n, "name", None) == "rebind_layerwise_prefill_metadata")
+    tree = ast.parse("from __future__ import annotations")
+    tree.body.append(method)
+    states = NS(PrefillNoCache=0, PrefillCacheHit=1, ChunkedPrefill=2)
+    ns = dict(copy=copy, AscendAttentionState=states)
+    exec(compile(ast.fix_missing_locations(tree), str(path), "exec"), ns)
+    builder = NS(enable_dsa_cp=False,
+                 _mixed_indexer_metadata=api["MixedIndexerMetadata"](2, 18, 8, torch.device("cpu")))
+    template = NS(attn_state=0, num_decode_tokens=0, indexer_c8_block_table=torch.tensor([999]),
+                  indexer_c8_slot_mapping=torch.tensor([999]))
+    results = []
+    for bank in (18, 72, 18):
+        common = NS(num_reqs=1, num_input_tokens=3,
+                    block_table_tensor=torch.tensor([[bank]], dtype=torch.int32),
+                    slot_mapping=torch.tensor([bank * 128, bank * 128 + 127, -1]),
+                    indexer_block_table_tensor=torch.tensor([[bank]], dtype=torch.int32),
+                    indexer_slot_mapping=torch.tensor([bank * 128, bank * 128 + 127, -1]))
+        metadata = ns[method.name](builder, template, common)
+        results.append(metadata)
+        assert metadata.indexer_c8_block_table.tolist() == [[bank * 2]]
+        assert metadata.indexer_c8_slot_mapping.tolist() == [bank * 256, bank * 256 + 127, -1]
+    assert results[0].indexer_c8_block_table.tolist() == [[36]]
+    assert results[1].indexer_c8_block_table.tolist() == [[144]]
+    assert len({m.indexer_c8_block_table.data_ptr() for m in results}) == 3
+    common.indexer_block_table_tensor = None
+    cleared = ns[method.name](builder, template, common)
+    assert cleared.indexer_c8_block_table is cleared.indexer_c8_slot_mapping is None

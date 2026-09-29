@@ -273,7 +273,8 @@ def setup():
         num_common_prefix_blocks=[0, 0],
         scheduled_spec_decode_tokens={rid: [-1] for rid in ids},
         scheduled_cached_reqs=SimpleNamespace(
-            req_ids=list(ids), new_block_ids=[None] * n, num_computed_tokens=(bases + 2).tolist(), resumed_req_ids=set()
+            req_ids=list(ids), new_block_ids=[None] * n, num_computed_tokens=(bases + 2).tolist(), resumed_req_ids=set(),
+            new_block_ids_by_bank=None, new_block_allocation_modes=None
         ),
         kv_connector_metadata=SimpleNamespace(reason="eligible", frontiers=(4096,) * n, cold=(), requests=[]),
     )
@@ -712,6 +713,8 @@ def test_deferred_update_matches_actual_vllm_request_bookkeeping(setup, monkeypa
     for rid in batch.req_ids:
         req = r.requests[rid]
         req.req_id = rid
+        req.block_allocation_mode = None
+        req.block_ids_by_bank = None
         req.output_token_ids = [-1] * (req.num_computed_tokens - 4096 + 1)
         s.scheduled_cached_reqs.num_output_tokens.append(len(req.output_token_ids) + 1)
     baseline = copy(r)

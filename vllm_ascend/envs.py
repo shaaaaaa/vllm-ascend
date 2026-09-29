@@ -22,18 +22,46 @@ import os
 from collections.abc import Callable
 from typing import Any
 
+
+def _strict_bool_env(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name, "true" if default else "false")
+    normalized = raw.strip().lower()
+    if normalized == "true":
+        return True
+    if normalized == "false":
+        return False
+    raise ValueError(f"{name} must be 'true' or 'false', got {raw!r}")
+
 # The begin-* and end* here are used by the documentation generator
 # to extract the used env vars.
 
 # begin-env-vars-definition
 
 env_variables: dict[str, Callable[[], Any]] = {
+    # Raw tensors for real PD diagnostics. Empty (default) disables all hooks.
+    # Otherwise an absolute run directory, e.g. /repo/pd-tensor-dump/case-on.
+    # Non-secret setting; files contain request/model data. Requires eager,
+    # compilation mode 0 and synchronous scheduling; introduces host readback.
+    "VLLM_ASCEND_PD_TENSOR_DUMP_DIR": lambda: os.getenv("VLLM_ASCEND_PD_TENSOR_DUMP_DIR", "").strip(),
+    # Non-secret diagnostic row limit per request-local 4096-token segment.
+    # Default 0 (all tokens); integer in [0, 4096]. Positive values retain the
+    # legacy chunk-prefix sample. Only read when PD_TENSOR_DUMP_DIR is enabled.
+    "VLLM_ASCEND_PD_TENSOR_DUMP_MAX_TOKENS": lambda: int(os.getenv("VLLM_ASCEND_PD_TENSOR_DUMP_MAX_TOKENS", "0")),
+    # Non-secret diagnostic last-feature-axis limit; integer >= 0, default 8.
+    # 0 keeps full features. Token/head axes, IDs, top-k, logits and rejection
+    # evidence stay intact. KV is narrowed before gather and device readback.
+    "VLLM_ASCEND_PD_TENSOR_DUMP_MAX_FEATURES": lambda: int(os.getenv("VLLM_ASCEND_PD_TENSOR_DUMP_MAX_FEATURES", "8")),
     # Shared PD serving performance diagnostics across vLLM and LMCache.
     # Non-sensitive; configure before worker startup. Default 0/off. Values:
     # 1 = host timing, detail = extra host detail, device = opt-in device timing.
     # Empty/0/false/no/off disable it (case-insensitive). Other nonfalse values
     # retain host timing semantics. Content/crash diagnostics remain separate.
     "PD_SERVING_PERF": lambda: os.getenv("PD_SERVING_PERF", "0").strip().lower(),
+    # Explicit PD prefill-node marker and feature gate for the layerwise DSA
+    # child pool. It is intentionally independent of kv_role/kv_rank.
+    "VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE": lambda: _strict_bool_env(
+        "VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE"
+    ),
     # max compile thread number for package building. Usually, it is set to
     # the number of CPU cores. If not set, the default value is None, which
     # means all number of CPU cores will be used.

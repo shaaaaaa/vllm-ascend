@@ -137,7 +137,8 @@ def test_startup_c8_flags_and_supported_hardware(settings, device, error, enable
 
 @pytest.mark.parametrize("mask", [(True, True), (False, True), (False, False)])
 @pytest.mark.parametrize("shared", [False, True])
-def test_runner_startup_uses_resolved_policy(mask, shared):
+@pytest.mark.parametrize("p_node", [False, True])
+def test_runner_startup_uses_resolved_policy(mask, shared, p_node):
     source = Path(__file__).parents[2] / "vllm_ascend/worker/model_runner_v1.py"
     tree = ast.parse(source.read_text(encoding="utf-8"))
     method = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "get_kv_cache_spec")
@@ -160,6 +161,7 @@ def test_runner_startup_uses_resolved_policy(mask, shared):
         _mixed_indexer_c8_names=None,
         ascend_config=config,
         dsa_shared_pool=shared,
+        layerwise_prefill_p_node=p_node,
         vllm_config=SimpleNamespace(kv_transfer_config=None),
     )
     exec(
@@ -172,3 +174,5 @@ def test_runner_startup_uses_resolved_policy(mask, shared):
     for spec in specs.values():
         assert spec.cache_sparse_c8 == any(mask)
         assert spec.indexer_c8_layer_names == ((names[1],) if mixed else None)
+        if mixed:
+            assert spec.indexer_paired_banks == (shared and not p_node)

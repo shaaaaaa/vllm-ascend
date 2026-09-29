@@ -1,6 +1,7 @@
 import json
 import os
 from contextlib import nullcontext
+from copy import copy
 from dataclasses import dataclass, field
 from functools import lru_cache
 from threading import Lock
@@ -68,7 +69,13 @@ from vllm_ascend.attention.utils import (
     ascend_chunked_prefill_workspace_size,
     enable_cp,
     get_lmcache_sparse_cached_tokens,
+    layerwise_prefill_transfer_window_supported,
+    maybe_finish_layerwise_prefill_save,
+    maybe_save_kv_layer_in_layerwise_prefill_transfer_window,
+    maybe_save_kv_layer_outside_layerwise_prefill_transfer_window,
     maybe_save_kv_layer_to_connector,
+    maybe_submit_layerwise_prefill_load,
+    record_layerwise_prefill_bank_use,
     staged_sfa_connector_supports_sparse_load,
     trans_rope_weight,
     transdata,
@@ -1108,6 +1115,11 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
 
         self.block_size = vllm_config.cache_config.block_size
         self.max_blocks = (vllm_config.model_config.max_model_len + self.block_size - 1) // self.block_size
+        self._layerwise_prefill_p_node = bool(
+            vllm_config.kv_transfer_config is not None
+            and vllm_config.kv_transfer_config.is_kv_producer
+            and envs.VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE
+        )
         self._mixed_indexer_metadata = None
         ascend_config = get_ascend_config()
         if getattr(ascend_config, "indexer_c8_shared_block_factor", 1) == 2 and (
@@ -1116,7 +1128,7 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
         ):
             # A BF16-only draft/consumer builder never uses physical C8 metadata.
             block_map = getattr(ascend_config, "indexer_hbm_block_map", None)
-            blocks_per_bundle = 18 if block_map is not None else 9
+            blocks_per_bundle = 18 if block_map is not None or self._layerwise_prefill_p_node else 9
             self._mixed_indexer_metadata = MixedIndexerMetadata(
                 vllm_config.scheduler_config.max_num_seqs + 1,
                 (self.max_blocks + blocks_per_bundle - 1) // blocks_per_bundle * blocks_per_bundle,
@@ -1590,7 +1602,13 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
                 for r in range(n_real):
                     s, e = int(qsl[r]), int(qsl[r + 1])
                     plen = int(plens_cpu[r])
-                    first_decode = max(s, s + plen - int(computed[r]))
+                    # DecodeOnly/SpecDecoding can recompute the last prompt
+                    # token after a dense PD prefix load, without a cold-
+                    # compact marker. Every scheduled query is real in these
+                    # states: a negative owner would make the sparse planner
+                    # zero its top-k as padding. The connector frontier still
+                    # controls retrieval (zero for a fully resident prefix).
+                    first_decode = s if fixed_decode_width else max(s, s + plen - int(computed[r]))
                     if cold_resumes and cold_resumes[r]:
                         cold_ends = getattr(common_attn_metadata.cold_compact_resumes, "computed_ends", ())
                         if cold_ends and len(cold_ends) != n_real:
@@ -1741,6 +1759,9 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             indexer_c8_block_table, indexer_c8_slot_mapping = self._mixed_indexer_metadata.update(
                 indexer_block_table, indexer_slot_mapping
             )
+            if self._layerwise_prefill_p_node:
+                indexer_c8_block_table = indexer_c8_block_table.clone()
+                indexer_c8_slot_mapping = indexer_c8_slot_mapping.clone()
 
         cos, sin = get_cos_and_sin_mla(input_positions, True)
 
@@ -1899,6 +1920,50 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             num_decode_tokens=num_decode_rows,
         )
 
+    def rebind_layerwise_prefill_metadata(
+        self,
+        template: AscendSFAMetadata,
+        common_attn_metadata: AscendCommonAttentionMetadata,
+    ) -> AscendSFAMetadata | None:
+        """Reuse one group's build within a single P-node prefill forward.
+
+        RoPE, sequence lengths and masks do not depend on the rotating bank.
+        Keep each layer's metadata object separate, and replace *all* bank
+        views, including clearing indexer views on shared-indexer layers.
+        Never cache this template across forwards. CP derives additional slot
+        mappings, and decode has mutable sparse state: use normal build there.
+        """
+        if (
+            self.enable_dsa_cp
+            or template.attn_state not in (
+                AscendAttentionState.PrefillNoCache,
+                AscendAttentionState.PrefillCacheHit,
+                AscendAttentionState.ChunkedPrefill,
+            )
+            or template.num_decode_tokens
+        ):
+            return None
+        metadata = copy(template)
+        num_reqs = common_attn_metadata.num_reqs
+        num_tokens = common_attn_metadata.num_input_tokens
+        metadata.block_table = common_attn_metadata.block_table_tensor[:num_reqs]
+        metadata.slot_mapping = common_attn_metadata.slot_mapping[:num_tokens]
+        metadata.indexer_block_table = None
+        metadata.indexer_slot_mapping = None
+        metadata.indexer_c8_block_table = None
+        metadata.indexer_c8_slot_mapping = None
+        if common_attn_metadata.indexer_block_table_tensor is not None:
+            metadata.indexer_block_table = common_attn_metadata.indexer_block_table_tensor[:num_reqs]
+            metadata.indexer_slot_mapping = common_attn_metadata.indexer_slot_mapping[:num_tokens]
+            if self._mixed_indexer_metadata is not None:
+                table, slots = self._mixed_indexer_metadata.update(
+                    metadata.indexer_block_table, metadata.indexer_slot_mapping,
+                )
+                # A following layer reuses the workspace; retain this bank's views.
+                metadata.indexer_c8_block_table = table.clone()
+                metadata.indexer_c8_slot_mapping = slots.clone()
+        return metadata
+
     def build_for_graph_capture(
         self,
         common_attn_metadata: AscendCommonAttentionMetadata,
@@ -2012,7 +2077,23 @@ class AscendSFAImpl(MLAAttentionImpl):
         self.is_kv_producer = (
             self.vllm_config.kv_transfer_config is not None and self.vllm_config.kv_transfer_config.is_kv_producer
         )
+        self._layerwise_prefill_p_node = bool(
+            self.is_kv_producer and envs.VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE
+        )
         self.layer_name = kwargs.get("layer_name")
+        if self._layerwise_prefill_p_node:
+            self._layerwise_prefill_mtp = bool(
+                speculative_config is not None and speculative_config.method in ("mtp", "deepseek_mtp")
+            )
+            layer_start, layer_end = self.vllm_config.model_config.get_layers_start_end_indices(
+                self.vllm_config.parallel_config
+            )
+            self._first_layerwise_prefill_layer_index = layer_start
+            self._last_layerwise_prefill_layer_index = layer_end - 1
+            self._last_layerwise_prefill_layer = (
+                self.layer_name is not None
+                and f".layers.{self._last_layerwise_prefill_layer_index}." in f".{self.layer_name}"
+            )
 
         # Shared-indexer (GLM-5.2): a layer without a local Indexer must be a
         # skip_topk consumer that reads producer-written top-k indices from the
@@ -2611,6 +2692,32 @@ class AscendSFAImpl(MLAAttentionImpl):
             # # Convert from (N, B, V) to (B, N * V)
             x = x.transpose(0, 1).reshape(-1, self.local_num_heads * self.v_head_dim)
         return x
+
+    def _sfa_preprocess_with_mlapo_after_layerwise_wait(
+        self,
+        layer_name: str,
+        attn_metadata: M,
+        hidden_states: torch.Tensor,
+        kv_cache: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        num_input_tokens: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Fence the current bank before MLAPO writes latent KV into it."""
+        if not (
+            self.dsa_shrink_latent
+            and attn_metadata.num_decode_tokens > 0
+        ):
+            wait_for_kv_layer_from_connector(layer_name)
+        return self._sfa_preprocess_with_mlapo(
+            hidden_states=hidden_states,
+            kv_cache=kv_cache,
+            cos=cos,
+            sin=sin,
+            slot_mapping=slot_mapping,
+            num_input_tokens=num_input_tokens,
+        )
 
     def _sfa_preprocess_with_mlapo(
         self,
@@ -3320,6 +3427,66 @@ class AscendSFAImpl(MLAAttentionImpl):
                     shard_count=resident_shards,
                 )
             )
+
+    def _submit_sfa_transfer_window_save_operations(
+        self,
+        save_operations: list[tuple[str, list[torch.Tensor]]],
+    ) -> None:
+        for layer_name, kv_caches in save_operations:
+            maybe_save_kv_layer_in_layerwise_prefill_transfer_window(
+                layer_name,
+                kv_caches,
+            )
+
+    def _submit_sfa_post_transfer_window_save_operations(
+        self,
+        save_operations: list[tuple[str, list[torch.Tensor]]],
+    ) -> None:
+        for layer_name, kv_caches in save_operations:
+            maybe_save_kv_layer_outside_layerwise_prefill_transfer_window(
+                layer_name,
+                kv_caches,
+            )
+
+    def _submit_sfa_layerwise_transfer_window(
+        self,
+        save_operations: list[tuple[str, list[torch.Tensor]]],
+    ) -> list[str]:
+        """Submit save(N) and load(N+2) for the explicit source layer N."""
+        layer_names = [layer_name for layer_name, _ in save_operations]
+        if len(layer_names) != len(set(layer_names)):
+            raise RuntimeError(
+                "Layerwise-prefill transfer window received duplicate KV "
+                f"groups: {layer_names}"
+            )
+
+        # Normally called on entry to N+1, before its first KV wait/SFA.
+        # The last target layer has no successor and is submitted after its
+        # own SFA instead.
+        self._submit_sfa_transfer_window_save_operations(save_operations)
+        for layer_name in layer_names:
+            if not maybe_submit_layerwise_prefill_load(layer_name):
+                raise RuntimeError(
+                    "The active KV connector stopped supporting the "
+                    "layerwise-prefill transfer window at the next layer"
+                )
+        return layer_names
+
+    def _finish_sfa_layerwise_transfer_window(
+        self,
+        save_operations: list[tuple[str, list[torch.Tensor]]],
+        layer_names: list[str],
+    ) -> None:
+        for layer_name in layer_names:
+            if not maybe_finish_layerwise_prefill_save(layer_name):
+                raise RuntimeError(
+                    "The active KV connector stopped supporting the "
+                    "layerwise-prefill post-projection save hook"
+                )
+        # A MultiConnector can contain legacy children that do not support the
+        # layerwise transfer window. Preserve their original ordering without
+        # saving capable children twice.
+        self._submit_sfa_post_transfer_window_save_operations(save_operations)
 
     def _prepare_sorted_resident_sparse_cache(
         self,
@@ -5047,6 +5214,35 @@ class AscendSFAImpl(MLAAttentionImpl):
                         reach_layer_for_shard_weight_series(layer)
             return output.fill_(0)
 
+        # A layer's KV remains in its bank after its SFA. Submit the prior
+        # layer's save and N+2 load here, before this layer's first connector
+        # wait. The name in save_operations identifies the source layer; no
+        # separate model-layer cursor is needed to choose the transfer.
+        transfer_context = (
+            get_forward_context().additional_kwargs
+            if self._layerwise_prefill_p_node
+            else None
+        )
+        is_first_transfer_layer = transfer_context is not None and (
+            f".layers.{self._first_layerwise_prefill_layer_index}."
+            in f".{layer_name}"
+        )
+        if is_first_transfer_layer:
+            # start_load_kv eagerly submits L1 before model execution so the
+            # first SFA does not block on retriever/storage work.  Keep the
+            # idempotent callback for connectors that prepare the window later.
+            maybe_submit_layerwise_prefill_load(-1)
+        pending_transfers = (
+            transfer_context.pop("sfa_layerwise_prefill_pending", None)
+            if transfer_context is not None
+            else None
+        )
+        pending_transfer_names = (
+            self._submit_sfa_layerwise_transfer_window(pending_transfers)
+            if pending_transfers is not None
+            else []
+        )
+
         _dsa_prof.set_step_kind(attn_metadata.attn_state == AscendAttentionState.DecodeOnly)
         _sfa_t = _dsa_prof.begin("sfa_fwd")
         _is_pure_decode = attn_metadata.attn_state in (
@@ -5144,14 +5340,26 @@ class AscendSFAImpl(MLAAttentionImpl):
 
         # run mlapo ops when dsa-cp is disabled, and ensure that num_tokens satisfies the count limitation
         if self.enable_mlapo and num_input_tokens <= MLAPO_MAX_SUPPORTED_TOKENS:
-            hidden_states, ql_nope, q_pe, q_c = self._sfa_preprocess_with_mlapo(
-                hidden_states=hidden_states,
-                kv_cache=kv_cache,
-                cos=cos,
-                sin=sin,
-                slot_mapping=slot_mapping,
-                num_input_tokens=num_input_tokens,
-            )
+            if self._layerwise_prefill_p_node:
+                hidden_states, ql_nope, q_pe, q_c = self._sfa_preprocess_with_mlapo_after_layerwise_wait(
+                    layer_name=layer_name,
+                    attn_metadata=attn_metadata,
+                    hidden_states=hidden_states,
+                    kv_cache=kv_cache,
+                    cos=cos,
+                    sin=sin,
+                    slot_mapping=slot_mapping,
+                    num_input_tokens=num_input_tokens,
+                )
+            else:
+                hidden_states, ql_nope, q_pe, q_c = self._sfa_preprocess_with_mlapo(
+                    hidden_states=hidden_states,
+                    kv_cache=kv_cache,
+                    cos=cos,
+                    sin=sin,
+                    slot_mapping=slot_mapping,
+                    num_input_tokens=num_input_tokens,
+                )
             if self.has_indexer:
                 k_li, k_li_scale = self.indexer_select_pre_process(x=hidden_states, cos=cos, sin=sin)
             else:
@@ -5465,10 +5673,18 @@ class AscendSFAImpl(MLAAttentionImpl):
                     actual_seq_lengths_query=actual_seq_lengths_query,
                     actual_seq_lengths_key=actual_seq_lengths_key,
                 )
+                if self._layerwise_prefill_p_node and index_lmcache_enabled:
+                    # The indexer has finished reading its own bank. Record
+                    # before top-k publication and latent SFA are submitted.
+                    record_layerwise_prefill_bank_use(index_layer_name)
                 if self.index_cache_enabled:
                     # Publish this batch's top-k so downstream skip layers
                     # read it from the stable shared buffer.
                     self._update_indexcache_topk_indices(topk_indices)
+            if self._layerwise_prefill_p_node and self.skip_topk and index_lmcache_enabled:
+                # Runtime index-cache skips still scatter this layer's KV;
+                # shared consumers without an indexer own no Group-1 bank.
+                record_layerwise_prefill_bank_use(index_layer_name)
             if content_diagnostics_enabled:
                 queue_selected_topk_fingerprint(
                     req_ids=attn_metadata.req_ids,
@@ -6244,6 +6460,66 @@ class AscendSFAImpl(MLAAttentionImpl):
             # logs mean ms/layer-call periodically (mirrors the manager path).
             _dsa_prof.step()
 
+        if self._layerwise_prefill_p_node:
+            # All SFA reads of the latent bank are now submitted. The DMA
+            # stream waits on this exact point, excluding v_up/o_proj, FFN,
+            # and the next layer's normalization. Passive TP ranks mark it too.
+            record_layerwise_prefill_bank_use(layer_name)
+
+        # Offload to LMCache. Legacy un-bundled connectors save only the
+        # latent (k_nope, k_pe). Connectors declaring DSA index LMCache support
+        # also save the sibling indexer layer whenever that path is enabled.
+        # A pure decode step in shrink-latent mode skips this unless decode
+        # window saving is enabled. P-node banks must still save and advance
+        # their load cursor: a one-token prefill tail (and its MTP forward)
+        # can also carry DecodeOnly/SpecDecoding attention metadata.
+        save_operations: list[tuple[str, list[torch.Tensor]]] = []
+        if self._layerwise_prefill_p_node:
+            if self.dsa_offload_unbundle and len(kv_cache) >= 2:
+                save_operations.append((layer_name, [kv_cache[0], kv_cache[1]]))
+                if (
+                    len(kv_cache) >= 3
+                    and index_layer_name is not None
+                    and index_lmcache_enabled
+                ):
+                    save_operations.append((index_layer_name, [kv_cache[2]]))
+            else:
+                save_operations.append((layer_name, list(kv_cache)))
+
+        use_layerwise_transfer_window = (
+            self._layerwise_prefill_p_node
+            and bool(save_operations)
+            and layerwise_prefill_transfer_window_supported()
+        )
+        is_last_transfer_layer = use_layerwise_transfer_window and (
+            (
+                self._last_layerwise_prefill_layer
+                if self.layer_name is not None
+                else f".layers.{self._last_layerwise_prefill_layer_index}." in f".{layer_name}"
+            )
+            or (self._layerwise_prefill_mtp and getattr(get_forward_context(), "is_draft_model", False))
+        )
+
+        if self.enable_dsa_cp_with_o_proj_tp and use_layerwise_transfer_window:
+            raise RuntimeError(
+                "Layerwise-prefill transfer overlap is incompatible with "
+                "the SFA context-parallel o_proj path"
+            )
+
+        # The final target layer and each one-layer MTP forward have no N+1
+        # callback in their context. Submit their saves here, instead of leaving
+        # the MTP save in a discarded context and relying on storer drain later.
+        final_transfer_names: list[str] = []
+        if is_last_transfer_layer:
+            if pending_transfers is not None:
+                self._finish_sfa_layerwise_transfer_window(
+                    pending_transfers, pending_transfer_names
+                )
+                pending_transfers = None
+            final_transfer_names = self._submit_sfa_layerwise_transfer_window(
+                save_operations
+            )
+
         attn_output = self._v_up_proj(attn_output)
         weight_prefetch_method = get_weight_prefetch_method()
         weight_prefetch_method.maybe_prefetch_mla_or_sla_weight_in_current_stream(
@@ -6278,33 +6554,38 @@ class AscendSFAImpl(MLAAttentionImpl):
             attn_output = torch.empty_like(send)
             torch.distributed.all_to_all_single(attn_output, send, group=get_tp_group().device_group)
 
-        output[...] = self.o_proj(attn_output)[0]
-
-        # Offload to LMCache. Legacy un-bundled connectors save only the latent
-        # (k_nope, k_pe). Connectors declaring DSA index LMCache support also
-        # Save the sibling indexer layer whenever the LMCache indexer path is
-        # enabled. Bundled path saves the whole tuple as before.
-        # Shrink-latent: a pure-decode step's latent lives in the resident tail and is
-        # never reloaded from LMCache, so saving it every decode layer is redundant
-        # connector work (scales with batch). Skip save on steps with no prefill tokens
-        # gated per step (num_prefills is shared by all layers), so the layerwise save
-        # generator is never created that step and wait_for_save tolerates its absence.
-        # NOTE: the SFA builder never populates attn_metadata.num_prefills (stays at
-        # its dataclass default 0 on every step, prefill included), so gating on it
-        # skipped the save unconditionally. Gate on attn_state instead, which the
-        # builder does set: pure-decode steps are DecodeOnly/SpecDecoding.
-        _decode_window_save_enabled = _decode_window_save_window_size() > 0
-        _skip_decode_save = bool(self.dsa_shrink_latent) and _is_pure_decode and not _decode_window_save_enabled
-        save_operations: list[tuple[str, list[torch.Tensor]]] = []
-        if not _skip_decode_save:
-            if self.dsa_offload_unbundle and len(kv_cache) >= 2:
-                save_operations.append((layer_name, [kv_cache[0], kv_cache[1]]))
-                if len(kv_cache) >= 3 and index_layer_name is not None and index_lmcache_enabled:
-                    save_operations.append((index_layer_name, [kv_cache[2]]))
+        if use_layerwise_transfer_window:
+            output[...] = self.o_proj(attn_output)[0]
+            if pending_transfers is not None:
+                self._finish_sfa_layerwise_transfer_window(
+                    pending_transfers, pending_transfer_names
+                )
+            if is_last_transfer_layer:
+                self._finish_sfa_layerwise_transfer_window(
+                    save_operations, final_transfer_names
+                )
             else:
-                save_operations.append((layer_name, list(kv_cache)))
-
-        self._submit_sfa_save_operations(save_operations)
+                if transfer_context is None:
+                    transfer_context = get_forward_context().additional_kwargs
+                transfer_context["sfa_layerwise_prefill_pending"] = save_operations
+        else:
+            # Keep legacy/non-P connector ordering unchanged.
+            output[...] = self.o_proj(attn_output)[0]
+            if pending_transfers is not None:
+                self._finish_sfa_layerwise_transfer_window(
+                    pending_transfers, pending_transfer_names
+                )
+            if not self._layerwise_prefill_p_node:
+                _decode_window_save_enabled = _decode_window_save_window_size() > 0
+                _skip_decode_save = bool(self.dsa_shrink_latent) and _is_pure_decode and not _decode_window_save_enabled
+                if not _skip_decode_save:
+                    if self.dsa_offload_unbundle and len(kv_cache) >= 2:
+                        save_operations.append((layer_name, [kv_cache[0], kv_cache[1]]))
+                        if len(kv_cache) >= 3 and index_layer_name is not None and index_lmcache_enabled:
+                            save_operations.append((index_layer_name, [kv_cache[2]]))
+                    else:
+                        save_operations.append((layer_name, list(kv_cache)))
+            self._submit_sfa_save_operations(save_operations)
 
         _dsa_prof.end(_sfa_t)
         return output_padded
