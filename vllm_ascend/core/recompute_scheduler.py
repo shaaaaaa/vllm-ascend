@@ -617,6 +617,20 @@ class RecomputeScheduler(Scheduler):
                 # of local and remote blocks.
                 effective_lookahead_tokens = 0 if request.num_computed_tokens == 0 else self.num_lookahead_tokens
 
+                if (
+                    dsa_compact_external_load
+                    and load_kv_async
+                    and request.num_preemptions == 0
+                    and request.num_computed_tokens == 0
+                    and num_new_local_computed_tokens == 0
+                    and request.num_tokens == request.num_prompt_tokens
+                    and num_external_computed_tokens == request.num_tokens - 1
+                    and request.num_tokens % self.block_size == 1
+                ):
+                    # Match base Scheduler: restore N cached tokens while reusing
+                    # N-1. Reserve the last destination without scheduling compute.
+                    effective_lookahead_tokens = max(effective_lookahead_tokens, 1)
+
                 # Determine if we need to allocate cross-attention blocks.
                 num_encoder_tokens = 0
                 if self.is_encoder_decoder and request.has_encoder_inputs and encoder_inputs_to_schedule:
