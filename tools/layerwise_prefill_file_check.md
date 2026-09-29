@@ -18,7 +18,7 @@ python3 tools/layerwise_prefill_file_check.py --locomo \
 每阶段服务在 `127.0.0.1:8000` 就绪后，Python 用 `subprocess.run` 执行：
 
 ```bash
-python /workspace/dataset/benchmark-new/locomo/test_advanced.py --vllm_port 8000 --vllm_ip 127.0.0.1
+python /workspace/dataset/benchmark-new/locomo/test_advanced.py --vllm_port 8000
 ```
 
 不修改或导入 LoCoMo 的逻辑。它只提供请求，原测试的确定性采样参数保留，

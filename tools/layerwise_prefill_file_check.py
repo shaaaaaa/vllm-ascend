@@ -492,9 +492,9 @@ def run_stages(args, root):
                 from layerwise_prefill_file_request import wait_for_server
 
                 wait_for_server(proc, args.rpc_timeout_seconds)
-                command = [sys.executable, str(LOCOMO_SCRIPT), "--vllm_port", "8000", "--vllm_ip", "127.0.0.1"]
+                command = [sys.executable, str(LOCOMO_SCRIPT), "--vllm_port", "8000"]
                 write_json(stage_dir / "request_command.json", command)
-                print(f"{PREFIX} {stage}: python {LOCOMO_SCRIPT} --vllm_port 8000 --vllm_ip 127.0.0.1", flush=True)
+                print(f"{PREFIX} {stage}: python {LOCOMO_SCRIPT} --vllm_port 8000", flush=True)
                 request_env = dict(os.environ)
                 for key in ("NO_PROXY", "no_proxy"):
                     request_env[key] = ",".join(filter(None, (request_env.get(key), "127.0.0.1", "localhost")))

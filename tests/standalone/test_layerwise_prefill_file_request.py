@@ -36,7 +36,7 @@ def test_locomo_subprocess_runs_after_server_ready_and_preserves_stage_order(tmp
         return NS(pid=1, returncode=0, stage=stage)
 
     def shell(command, **kwargs):
-        assert command == [sys.executable, str(runner.LOCOMO_SCRIPT), "--vllm_port", "8000", "--vllm_ip", "127.0.0.1"]
+        assert command == [sys.executable, str(runner.LOCOMO_SCRIPT), "--vllm_port", "8000"]
         assert kwargs["check"] is True and kwargs["timeout"] == args.stage_timeout_seconds
         assert "127.0.0.1" in kwargs["env"]["no_proxy"]
         stage, last = events[-1]
