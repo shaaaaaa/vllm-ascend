@@ -6164,6 +6164,7 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                 "after graph capture has started; restart the worker to rebuild "
                 "captured addresses."
             )
+        self._validate_dsa_compact_startup_policy(kv_cache_config)
         self._validate_sfa_layerwise_connector_cudagraph_mode()
         kv_cache_config = deepcopy(kv_cache_config)
         self.kv_cache_config = kv_cache_config
@@ -7139,6 +7140,59 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                     else:
                         self.reorder_batch_threshold = reorder_batch_threshold_i  # noqa
 
+    def _get_dsa_compact_startup_policy(self) -> tuple[int, int] | None:
+        """Query configuration without creating the worker connector before sizing."""
+        transfer = self.vllm_config.kv_transfer_config
+        if (
+            not self.use_sparse or not self.dsa_unbundle or not self.dsa_shared_pool
+            or getattr(self, "dsa_shrink_latent", 0) != 2
+            or self.layerwise_prefill_p_node or transfer is None
+            or transfer.kv_role not in ("kv_consumer", "kv_both")
+            or self.cache_config.enable_prefix_caching
+            or any(getattr(self.parallel_config, name, 1) != 1 for name in (
+                "pipeline_parallel_size", "prefill_context_parallel_size", "decode_context_parallel_size",
+            ))
+        ):
+            return None
+        # Loading the configured class installs its config extensions before
+        # its startup probe reads configuration. No service/connector is built.
+        from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
+
+        connector_cls = KVConnectorFactory.get_connector_class(transfer)
+        probe = getattr(connector_cls, "get_dsa_compact_startup_policy", None)
+        policy = probe(self.vllm_config) if callable(probe) else None
+        if policy is not None and (
+            not isinstance(policy, tuple) or len(policy) != 2
+            or any(type(value) is not int for value in policy)
+            or policy[0] <= 0 or policy[1] < 0
+        ):
+            raise ValueError("Connector returned an invalid compact-D startup policy")
+        return policy
+
+    def _validate_dsa_compact_startup_policy(self, kv_cache_config: KVCacheConfig) -> None:
+        # Graph profiling owns an explicit minimal temporary allocation before
+        # the worker connector exists. Final startup always revalidates below.
+        if getattr(self, "_profiling_cudagraph_memory", False):
+            return
+        policies = {
+            (getattr(group.kv_cache_spec, "dsa_compact_startup_scratch_tokens", 0),
+             getattr(group.kv_cache_spec, "dsa_compact_startup_dense_tokens", 0))
+            for group in kv_cache_config.kv_cache_groups
+            if getattr(group.kv_cache_spec, "dsa_compact_startup_scratch_tokens", 0)
+        }
+        if not policies:
+            return
+        if len(policies) != 1 or not has_kv_transfer_group():
+            raise RuntimeError("Compact-D sizing requires one verified active connector policy")
+        connector = get_kv_transfer_group()
+        probe = getattr(connector, "get_dsa_compact_runtime_policy", None)
+        if (
+            not getattr(connector, "supports_dsa_compact_external_load", False)
+            or not getattr(connector, "uses_layerwise_model_callbacks", False)
+            or not callable(probe) or probe(self.vllm_config) != next(iter(policies))
+        ):
+            raise RuntimeError("Active connector disagrees with compact-D startup sizing; refusing KV allocation")
+
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         """
         Generates the KVCacheSpec by parsing the kv cache format from each
@@ -7382,6 +7436,13 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                         f"{len(model_layers)} model layers with a registered "
                         "cache. Shared consumers must still register LATENT."
                     )
+
+        compact_policy = self._get_dsa_compact_startup_policy()
+        if compact_policy is not None:
+            for name, spec in kv_cache_spec.items():
+                if "indexer" not in name and getattr(spec, "sparse_head_dim", None) == tuple(self.sparse_head_dim[:2]):
+                    object.__setattr__(spec, "dsa_compact_startup_scratch_tokens", compact_policy[0])
+                    object.__setattr__(spec, "dsa_compact_startup_dense_tokens", compact_policy[1])
 
         return kv_cache_spec
 
@@ -7815,10 +7876,10 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
             compilation_counter.num_cudagraph_captured
         )
         completed = False
-        self._profiling_cudagraph_memory = True
         if envs_ascend.VLLM_ASCEND_SFA_FULL_GRAPH:
             original_full_graph_pool = self._sfa_full_graph.graph_pool
             self._sfa_full_graph.graph_pool = current_platform.graph_pool_handle()
+        self._profiling_cudagraph_memory = True
         try:
             with (
                 _torch_cuda_wrapper(),

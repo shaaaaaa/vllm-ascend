@@ -46,6 +46,9 @@ class AscendMLAAttentionSpec(MLAAttentionSpec):
 
     indexer_paired_banks: bool = False
     shared_pool_alignment_bytes: int = 0
+    # Verified external compact-D residency policy; latent group only.
+    dsa_compact_startup_scratch_tokens: int = 0
+    dsa_compact_startup_dense_tokens: int = 0
 
     @property
     def shared_indexer_key_dtype(self) -> torch.dtype:
@@ -178,6 +181,8 @@ class AscendMLAAttentionSpec(MLAAttentionSpec):
                         spec.indexer_c8_layer_names,
                         spec.indexer_paired_banks,
                         spec.shared_pool_alignment_bytes,
+                        spec.dsa_compact_startup_scratch_tokens,
+                        spec.dsa_compact_startup_dense_tokens,
                     )
                     for spec in specs
                 }
@@ -195,6 +200,8 @@ class AscendMLAAttentionSpec(MLAAttentionSpec):
             indexer_c8_layer_names=specs[0].indexer_c8_layer_names,
             indexer_paired_banks=specs[0].indexer_paired_banks,
             shared_pool_alignment_bytes=specs[0].shared_pool_alignment_bytes,
+            dsa_compact_startup_scratch_tokens=specs[0].dsa_compact_startup_scratch_tokens,
+            dsa_compact_startup_dense_tokens=specs[0].dsa_compact_startup_dense_tokens,
         )
 
 

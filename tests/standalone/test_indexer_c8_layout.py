@@ -299,7 +299,7 @@ def test_bf16_prefill_spec_charges_retained_alignment(api, monkeypatch, prefill,
     cls = next(n for n in ast.parse(path.read_text(encoding="utf-8")).body
                if isinstance(n, ast.ClassDef) and n.name == "NPUModelRunner")
     methods = [n for n in cls.body if getattr(n, "name", None) in {
-        "get_kv_cache_spec", "_allocate_kv_cache_tensors", "_align_memory"}]
+        "get_kv_cache_spec", "_get_dsa_compact_startup_policy", "_allocate_kv_cache_tensors", "_align_memory"}]
     module = ast.parse("from __future__ import annotations")
     module.body.append(ast.ClassDef(name="Runner", bases=[], keywords=[], body=methods, decorator_list=[]))
     spec_type = api["AscendMLAAttentionSpec"]
@@ -338,3 +338,27 @@ def test_bf16_prefill_spec_charges_retained_alignment(api, monkeypatch, prefill,
     retained_overhead = storage.nbytes() - config.kv_cache_tensors[0].size
     assert retained_overhead == 2 * 1024**2
     assert index.shared_pool_alignment_bytes == retained_overhead
+
+
+def test_compact_startup_markers_stay_on_latent_specs_and_survive_merge(api):
+    from dataclasses import replace
+
+    latent = api["AscendMLAAttentionSpec"](128, 1, 576, torch.bfloat16, sparse_head_dim=(512, 64))
+    indexer = api["AscendMLAAttentionSpec"](128, 1, 128, torch.bfloat16, sparse_head_dim=(128,))
+    source = ROOT / "vllm_ascend/worker/model_runner_v1.py"
+    method = next(n for n in ast.walk(ast.parse(source.read_text(encoding="utf-8")))
+                  if isinstance(n, ast.FunctionDef) and n.name == "get_kv_cache_spec")
+    start = next(i for i, n in enumerate(method.body) if isinstance(n, ast.Assign)
+                 and any(isinstance(t, ast.Name) and t.id == "compact_policy" for t in n.targets))
+    ns = dict(self=NS(_get_dsa_compact_startup_policy=lambda: (4096, 8192), sparse_head_dim=(512, 64, 128)),
+              kv_cache_spec={"model.layers.0.self_attn.attn": latent,
+                             "model.layers.0.self_attn.indexer.k_cache": indexer})
+    exec(compile(ast.Module(body=method.body[start:start + 2], type_ignores=[]), str(source), "exec"), ns)
+    assert (latent.dsa_compact_startup_scratch_tokens, latent.dsa_compact_startup_dense_tokens) == (4096, 8192)
+    assert indexer.dsa_compact_startup_scratch_tokens == indexer.dsa_compact_startup_dense_tokens == 0
+    merged = type(latent).merge([latent, replace(latent)])
+    assert (merged.dsa_compact_startup_scratch_tokens, merged.dsa_compact_startup_dense_tokens) == (4096, 8192)
+    for other in (replace(latent, dsa_compact_startup_scratch_tokens=0),
+                  replace(latent, dsa_compact_startup_dense_tokens=0)):
+        with pytest.raises(AssertionError):
+            type(latent).merge([latent, other])
