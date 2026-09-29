@@ -431,7 +431,11 @@ class custom_install(install):
 
 ROOT_DIR = os.path.dirname(__file__)
 try:
-    VERSION = get_version(write_to="vllm_ascend/_version.py")
+    # Operational/benchmark tags are not package versions.
+    VERSION = get_version(
+        write_to="vllm_ascend/_version.py",
+        git_describe_command="git describe --dirty --tags --long --match v[0-9]*",
+    )
 except LookupError:
     # The checkout action in github action CI does not checkout the tag. It
     # only checks out the commit. In this case, we set a dummy version.
