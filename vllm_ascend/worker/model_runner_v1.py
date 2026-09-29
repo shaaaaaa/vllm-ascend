@@ -211,7 +211,7 @@ from vllm_ascend.utils import (
     staged_sfa_graph_configuration_reasons,
     staged_sfa_graph_configured,
 )
-from vllm_ascend.worker.dsa_shared_pool import reshape_dsa_shared_pool_raw
+from vllm_ascend.worker.dsa_shared_pool import diagnose_indexer_metadata, reshape_dsa_shared_pool_raw
 from vllm_ascend.worker.npu_input_batch import NPUInputBatch
 from vllm_ascend.worker.pcp_utils import PCPManager
 from vllm_ascend.worker.startup_trace import startup_phase
@@ -7756,7 +7756,7 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
         if staged_graph_configured:
             self._staged_sfa_startup_capture_attempted = True
             self._reset_staged_sfa_startup_capture()
-        with _torch_cuda_wrapper(), _replace_gpu_model_runner_function_wrapper(
+        with diagnose_indexer_metadata("capture"), _torch_cuda_wrapper(), _replace_gpu_model_runner_function_wrapper(
             GPUModelRunner.__module__,
         ):
             graph_memory_bytes = GPUModelRunner.capture_model(self)
@@ -7882,6 +7882,7 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
         self._profiling_cudagraph_memory = True
         try:
             with (
+                diagnose_indexer_metadata("profiling"),
                 _torch_cuda_wrapper(),
                 _replace_gpu_model_runner_function_wrapper(
                     GPUModelRunner.__module__,

@@ -1,6 +1,74 @@
 import math
+from contextlib import contextmanager
+from unittest.mock import patch
 
 import torch
+
+
+@contextmanager
+def diagnose_indexer_metadata(phase):
+    """Startup-only interception; device mode adds readbacks and a launch fence."""
+    from vllm_ascend.serving_perf import (
+        cold_perf_device_timing_enabled,
+        cold_perf_enabled,
+        log_cold_perf_process_event,
+    )
+
+    if not cold_perf_enabled():
+        yield
+        return
+    original = MixedIndexerMetadata.update
+    device_checks = cold_perf_device_timing_enabled()
+    call = 0
+
+    def update(self, table, slots):
+        nonlocal call
+        if self.block_map is None or self._map_device_metadata is None:
+            return original(self, table, slots)
+        call += 1
+        capturing = torch.npu.is_current_stream_capturing()
+        fields = dict(phase=phase, call=call, builder=id(self), capturing=capturing,
+                      mapping_length=self.block_map.numel(), device_checks=device_checks)
+        for name, tensor in (("table", table), ("slots", slots), ("mapping", self.block_map),
+                             ("out_table", self.tables), ("out_slots", self.slots)):
+            fields[name] = dict(shape=list(tensor.shape), stride=list(tensor.stride()),
+                                dtype=str(tensor.dtype), device=str(tensor.device), ptr=tensor.data_ptr())
+
+        def emit(stage, **extra):
+            log_cold_perf_process_event("indexer_metadata_startup", stage=stage, **fields, **extra)
+
+        stage = "before_readback" if device_checks and not capturing else "before_launch"
+        emit(stage, bounds_skipped=not device_checks or capturing)
+        try:
+            if device_checks and not capturing:
+                # Log first: a failure here may belong to preceding device work.
+                table_cpu, slots_cpu, mapping_cpu = (x.detach().cpu() for x in (table, slots, self.block_map))
+                size = self.block_map.numel()
+                ranges = {}
+                for name, value in (("table", table_cpu), ("slots", slots_cpu), ("mapping", mapping_cpu)):
+                    ranges[name + "_range"] = [int(value.min()), int(value.max())] if value.numel() else None
+                bad_table = table_cpu >= size
+                bad_slots = slots_cpu >= size * 128
+                bad = bool(bad_table.any() or bad_slots.any())
+                emit("bounds", **ranges, invalid=bad,
+                     bad_table_values=table_cpu[bad_table][:8].tolist(),
+                     bad_slot_values=slots_cpu[bad_slots][:8].tolist())
+                if bad:
+                    raise ValueError("Startup indexer mapper input exceeds mapping capacity; see indexer_metadata_startup")
+            stage = "launch"
+            result = original(self, table, slots)
+            if device_checks and not capturing:
+                stage = "completion"
+                torch.npu.current_stream(table.device).synchronize()
+            emit("complete" if device_checks and not capturing else "submitted")
+            return result
+        except Exception as exc:
+            emit("error", failed_stage=stage, error=str(exc))
+            raise
+
+    # Restored even on startup failure; serving update() has no diagnostic branch.
+    with patch.object(MixedIndexerMetadata, "update", update):
+        yield
 
 
 class MixedIndexerMetadata:
