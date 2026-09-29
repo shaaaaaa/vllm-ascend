@@ -103,7 +103,10 @@ def rows_from_slots(cache, slots):
 class TensorArchive:
     """One tensor at a time: OFF stores; ON loads OFF and emits numerical stats."""
 
-    def __init__(self, case_dir, rank, save_on_tensors=False, compare=None, progress=None):
+    def __init__(self, case_dir, rank, save_on_tensors=False, compare=None, progress=None, max_features=0):
+        if type(max_features) is not int or max_features < 0:
+            raise ValueError("max_features must be a nonnegative integer")
+        self.max_features = max_features
         self.root = Path(case_dir)
         if self.root.name not in ("off", "on"):
             raise ValueError("Correctness case directory must be named off or on")
@@ -152,6 +155,17 @@ class TensorArchive:
                 raise RuntimeError(f"Duplicate tensor observation: {identity}")
             if not isinstance(tensor, torch.Tensor):
                 raise TypeError(f"Required observation is not a tensor: {identity}")
+            source_shape = list(tensor.shape)
+            feature_capture = None
+            if (
+                self.max_features
+                and tensor.ndim >= 2
+                and tensor.shape[-1] > self.max_features
+                and name not in ("topk", "logits", "draft_token_ids", "sample_indices", "input_ids", "positions")
+                and (tensor.is_floating_point() or kind in ("kv_current", "kv_loaded", "kv_indexer"))
+            ):
+                feature_capture = dict(axis=tensor.ndim - 1, start=0, end=self.max_features)
+                tensor = tensor[..., : self.max_features]
             # clone orders a snapshot before subsequent operations on this
             # compute stream. No synchronize()/wait_event()/wait_stream().
             cpu = tensor.detach().contiguous().clone().to("cpu")
@@ -170,6 +184,8 @@ class TensorArchive:
                 numel=cpu.numel(),
                 path=None,
                 nonfinite=int((~torch.isfinite(finite_input)).sum()) if floating else 0,
+                source_shape=source_shape,
+                feature_capture=feature_capture,
             )
             if valid_rows is not None and (cpu.ndim == 0 or not 0 <= valid_rows <= cpu.shape[0]):
                 raise RuntimeError("Invalid tensor comparison row range")
@@ -198,6 +214,10 @@ class TensorArchive:
                     record["comparison"] = dict(comparable=False, reason="OFF identity/span missing")
                 elif reference.get("comparison_slice") != comparison_slice:
                     record["comparison"] = dict(comparable=False, reason="OFF valid comparison rows differ")
+                elif reference.get("feature_capture") != feature_capture:
+                    record["comparison"] = dict(comparable=False, reason="OFF feature capture differs")
+                elif reference.get("source_shape", reference["shape"]) != source_shape:
+                    record["comparison"] = dict(comparable=False, reason="OFF original tensor shape differs")
                 else:
                     try:
                         self.phase("load_off")
@@ -281,6 +301,7 @@ class CorrectnessProbe:
         self.mtp_layers = {}
         self.mtp_roles = []
         self.mtp_calls = []
+        self.capture_mtp_logits = False
         self.indexer_layers = sorted(
             index for index, module in implementations.values() if module.impl.has_indexer and not module.impl.skip_topk
         )
@@ -488,6 +509,7 @@ class CorrectnessProbe:
                 runtime = kwargs["runtime_inputs"]
                 meta = next(iter(kwargs["per_layer_attn_metadata"].values()))
                 span = single_request_span(meta, self.prompt_len)
+                self.capture_mtp_logits = span is not None
                 if span is None:
                     return original(model_kwargs, **kwargs)
                 if list(span) != self.steps[-1]["span"]:
@@ -525,10 +547,13 @@ class CorrectnessProbe:
             @functools.wraps(original)
             def logits(hidden_states, *args, **kwargs):
                 result = original(hidden_states, *args, **kwargs)
+                if not self.capture_mtp_logits:
+                    return result
                 # The launcher has one real request. LM-head DP may pad logits.
                 record(hidden_states[:1], "mtp_output", "logits_input", raw=True)
                 record(result[:1], "mtp_output", "logits", raw=True)
                 record(result[:1].argmax(dim=-1), "mtp_output", "draft_token_ids", raw=True)
+                self.capture_mtp_logits = False
                 return result
 
             return logits
@@ -757,7 +782,7 @@ def inventory(model, model_config, sfa_class):
 
 
 class PrefillCorrectnessWorker:
-    def install_correctness_probe(self, case_dir, prompt_len, save_on_tensors=False):
+    def install_correctness_probe(self, case_dir, prompt_len, save_on_tensors=False, max_features=0):
         import torch_npu
         from lmcache.v1.memory_management import LayerPageMemoryObj
         from lmcache_ascend.v1.npu_connector import npu_connectors
@@ -781,7 +806,7 @@ class PrefillCorrectnessWorker:
         archive = probe = None
         try:
             progress.start()
-            archive = TensorArchive(case_dir, self.rank, save_on_tensors, progress=progress)
+            archive = TensorArchive(case_dir, self.rank, save_on_tensors, progress=progress, max_features=max_features)
             probe = CorrectnessProbe(archive, prompt_len, layers, implementations, get_forward_context, model_config)
             self._correctness_probe = probe
             self._correctness_engine = engine

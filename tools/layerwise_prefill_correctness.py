@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""Save OFF prefill tensors, then compare ON tensors to those files while running.
+"""Run one LoCoMo request with OFF, then ON, comparing raw prefill tensors.
 
 Usage: python tools/layerwise_prefill_correctness.py 2>&1 | tee log.log
 
-Both fresh processes use TP8, FlashComm1, eager execution, MTP1 and one identical
-tokenized prompt. The default 10k prompt spans multiple 4096-token compute chunks
-and a partial LMCache chunk. Use --prompt-tokens 80000 for the long-prefix case.
+Both fresh API servers use TP8, FlashComm1, eager execution, MTP1. Each runs:
+python /workspace/dataset/benchmark-new/locomo/test_advanced.py
+--vllm_port 8000 --vllm_ip 127.0.0.1
+The LoCoMo script supplies one request. ON must have exactly the same prompt IDs.
 There are no stage/dummy shortcuts or external configuration files.
 
 The tools-only layout selector enables the real merged CPU-page allocator in a
@@ -14,8 +15,9 @@ local-only test: no Mooncake service/SDK emulation and no transfer replacement.
 OFF uses synchronous store because its original local path rejects async store;
 ON exercises async store. All computation settings and the page layout match.
 
-Full tensor readback perturbs execution; this is not a performance test or proof
-of race freedom. OFF saves complete tensors, not samples or fingerprints. ON
+Tensor readback perturbs execution; this is not a performance test or proof
+of race freedom. OFF saves all token positions and the first 8 feature components,
+not fingerprints. Routing indices and logits remain complete. ON
 loads each matching file and reports value distributions and numerical error.
 --save-on-tensors additionally keeps ON tensors. OFF archives can be very large.
 Use --off-dir OLD_RUN (or OLD_RUN/off) to reuse a completed OFF archive and run
@@ -35,13 +37,18 @@ from layerwise_prefill_check import DEFAULT_PROMPT_FILE, write_json
 from layerwise_prefill_mooncake_check import finish_child, start_logged_process
 from layerwise_prefill_profile import (
     COMPUTE_CHUNK_TOKENS,
+    DEFAULT_BENCHMARK_SCRIPT,
     DEFAULT_LONG_PROMPT_FILE,
     DEFAULT_MODEL,
     build_prompt,
     case_environment,
+    check_port_available,
     check_shm_capacity,
     engine_options,
     record_model_identity,
+    run_benchmark,
+    server_command,
+    wait_for_server,
 )
 
 PREFIX = "[PREFILL_CORRECTNESS]"
@@ -88,6 +95,13 @@ def parser():
         help="Actual checkpoint directory; defaults to GLM-5.2-w4a8c8-0723",
     )
     cli.add_argument("--devices", default="0,1,2,3,4,5,6,7", action=ExplicitOption)
+    cli.add_argument("--benchmark-script", type=Path, default=DEFAULT_BENCHMARK_SCRIPT)
+    cli.add_argument("--port", type=int, default=8000)
+    cli.add_argument("--startup-timeout", type=positive_seconds, default=1800)
+    cli.add_argument("--benchmark-timeout", type=positive_seconds, default=7200)
+    cli.add_argument(
+        "--max-features", type=int, default=8, action=ExplicitOption, help="Feature width to save; 0 saves all"
+    )
     cli.add_argument("--prompt-file", type=Path, help="Fixed source article; tokenized once for both runs")
     cli.add_argument("--prompt-tokens", type=int, default=DEFAULT_PROMPT_TOKENS, action=ExplicitOption)
     cli.add_argument("--cpu-cache-gb", type=float, default=24, action=ExplicitOption)
@@ -102,7 +116,7 @@ def parser():
     cli.add_argument(
         "--save-on-tensors",
         action="store_true",
-        help="Also save ON tensors; OFF always saves complete tensors",
+        help="Also save ON tensors; OFF always saves tensors at the selected feature width",
     )
     cli.add_argument("--compare-only", type=Path, help="Compare an existing run without loading the model")
     cli.add_argument("--child", choices=CASES, help=argparse.SUPPRESS)
@@ -186,6 +200,7 @@ def prepare_reused_off(args, root):
         "devices": baseline["environment"]["ASCEND_RT_VISIBLE_DEVICES"],
         "cpu_cache_gb": float(baseline["environment"]["LMCACHE_MAX_LOCAL_CPU_SIZE"]),
         "prompt_tokens": saved_prompt.get("target_tokens", length),
+        "max_features": result.get("max_features", 0),
     }
     specified = getattr(args, "specified_options", frozenset())
     for name, value in defaults.items():
@@ -193,6 +208,8 @@ def prepare_reused_off(args, root):
             setattr(args, name, value)
     if args.prompt_tokens != defaults["prompt_tokens"]:
         raise ValueError("--prompt-tokens differs from OFF; reuse uses its exact saved token IDs")
+    if args.max_features != defaults["max_features"]:
+        raise ValueError("--max-features differs from OFF")
     require_matching_settings("engine_options", baseline["engine_options"], correctness_options(args, length))
     require_matching_settings(
         "environment",
@@ -292,11 +309,12 @@ def run_child(args):
         "text": "",
         "scope": "main/MTP prefill layers, MTP logits/draft IDs and first output token; local merged CPU pages",
         "timing_is_performance_data": False,
+        "max_features": args.max_features,
     }
     try:
         installed = llm.collective_rpc(
             "install_correctness_probe",
-            args=(str(case_dir), prompt["length"], args.save_on_tensors),
+            args=(str(case_dir), prompt["length"], args.save_on_tensors, args.max_features),
         )
         write_json(case_dir / "installation.json", installed)
         print(f"{PREFIX} {args.child}: capture {prompt['length']} tokens on every TP rank", flush=True)
@@ -367,6 +385,8 @@ def run_cases(args, root):
             str(args.prompt_tokens),
             "--rpc-timeout-seconds",
             str(args.rpc_timeout_seconds),
+            "--max-features",
+            str(args.max_features),
         ]
         if args.save_on_tensors:
             command.append("--save-on-tensors")
@@ -390,6 +410,108 @@ def run_cases(args, root):
             raise RuntimeError(f"{case} did not complete; refusing to report parity")
 
 
+def run_locomo(args, root):
+    """Replace the generated prompt with the user's one-request benchmark."""
+    from layerwise_prefill_correctness_baseline import normalize_off_directory
+    from layerwise_prefill_correctness_compare import comparable_environment, validate_off_baseline
+
+    if not args.benchmark_script.is_file():
+        raise ValueError(f"LoCoMo script not found: {args.benchmark_script}")
+    if not 0 < args.port < 65536:
+        raise ValueError("--port must be in 1..65535")
+    baseline = None
+    if args.off_dir:
+        args.off_dir = normalize_off_directory(args.off_dir)
+        if root.is_relative_to(args.off_dir):
+            raise ValueError("New run must be outside the OFF archive")
+        previous_model = json.loads((args.off_dir.parent / "model_info.json").read_text(encoding="utf-8"))
+        baseline = validate_off_baseline(args.off_dir, previous_model)
+        if baseline["result"].get("request_source") != "locomo":
+            raise ValueError("Expected a LoCoMo OFF baseline")
+        for name, value in dict(
+            model=baseline["engine_options"]["model"],
+            devices=baseline["environment"]["ASCEND_RT_VISIBLE_DEVICES"],
+            cpu_cache_gb=float(baseline["environment"]["LMCACHE_MAX_LOCAL_CPU_SIZE"]),
+            max_features=baseline["result"]["max_features"],
+        ).items():
+            if name not in getattr(args, "specified_options", ()):
+                setattr(args, name, value)
+        if args.max_features != baseline["result"]["max_features"]:
+            raise ValueError("--max-features differs from OFF")
+        write_json(root / "off_reference.json", dict(schema=1, off_dir=str(args.off_dir)))
+        write_json(
+            root / "prompt.json",
+            dict(
+                length=baseline["result"]["prompt_length"],
+                token_ids=baseline["result"]["prompt_token_ids"],
+                source="locomo",
+            ),
+        )
+    current_model = record_model_identity(args.model, root)
+    if baseline:
+        require_matching_settings("model configuration", previous_model, current_model)
+    write_json(
+        root / "run.json",
+        dict(
+            schema=1,
+            request_source="locomo",
+            max_features=args.max_features,
+            benchmark_script=str(args.benchmark_script.resolve()),
+            cases=["on"] if args.off_dir else list(CASES),
+        ),
+    )
+    print(f"{PREFIX} LoCoMo single request; max_features={args.max_features}; results: {root}", flush=True)
+    for case in ("on",) if args.off_dir else CASES:
+        directory = root / case
+        directory.mkdir()
+        check_port_available(args.port)
+        check_shm_capacity(Path("/dev/shm"), args.cpu_cache_gb)
+        options = correctness_options(args, MAX_PROMPT_TOKENS)
+        options.update(async_scheduling=False, compilation_config={"mode": 0, "cudagraph_mode": "NONE"})
+        options["additional_config"]["enable_npugraph_ex"] = False
+        env = correctness_environment(args, case)
+        if baseline:
+            require_matching_settings("engine_options", baseline["engine_options"], options)
+            require_matching_settings(
+                "environment",
+                comparable_environment(baseline["environment"]),
+                comparable_environment(recorded_environment(correctness_environment(args, "off"))),
+            )
+        write_json(directory / "engine_options.json", options)
+        write_json(directory / "environment.json", recorded_environment(env))
+        write_json(directory / "result.json", dict(case=case, completed=False, request_source="locomo"))
+        env["PYTHONUNBUFFERED"] = "1"
+        for name in ("NO_PROXY", "no_proxy"):
+            env[name] = ",".join(filter(None, (env.get(name), "127.0.0.1", "localhost")))
+        command = [
+            sys.executable,
+            "-u",
+            str(Path(__file__).with_name("layerwise_prefill_correctness_server.py")),
+            "--capture-root",
+            str(root),
+            "--capture-case",
+            case,
+            "--capture-max-features",
+            str(args.max_features),
+            "--capture-timeout",
+            str(args.rpc_timeout_seconds),
+        ]
+        if args.save_on_tensors:
+            command.append("--capture-save-on")
+        command.extend(server_command(args, options)[4:])
+        write_json(directory / "server_command.json", command)
+        proc = start_logged_process(command, env, directory / "server.log", case, prefix=PREFIX)
+        try:
+            wait_for_server(proc, args.port, args.startup_timeout)
+            run_benchmark(args, proc, env, directory)
+        finally:
+            finish_child(proc)
+        result = json.loads((directory / "result.json").read_text(encoding="utf-8"))
+        if not result.get("completed"):
+            raise RuntimeError(f"{case} capture incomplete: {result.get('error', 'no completed LoCoMo request')}")
+    return compare(root)
+
+
 def main(argv=None):
     cli = parser()
     args = cli.parse_args(argv)
@@ -403,6 +525,8 @@ def main(argv=None):
         cli.error(f"--prompt-tokens must be in ({COMPUTE_CHUNK_TOKENS}, {MAX_PROMPT_TOKENS}]")
     if args.cpu_cache_gb <= 0:
         cli.error("--cpu-cache-gb must be positive")
+    if args.max_features < 0:
+        cli.error("--max-features must be nonnegative")
     devices = args.devices.split(",")
     if not devices or any(not item.isdigit() for item in devices) or len(set(devices)) != len(devices):
         cli.error("--devices must contain distinct comma-separated NPU indices")
@@ -423,6 +547,16 @@ def main(argv=None):
     root.mkdir(parents=True, exist_ok=True)
     args.run_dir = root
     try:
+        # Old single-prompt archives remain reusable. The default request source
+        # is now LoCoMo; explicit legacy prompt arguments retain the old entry.
+        locomo = not args.prompt_file and "prompt_tokens" not in getattr(args, "specified_options", ())
+        if args.off_dir:
+            from layerwise_prefill_correctness_baseline import normalize_off_directory
+
+            off = normalize_off_directory(args.off_dir)
+            locomo = json.loads((off / "result.json").read_text(encoding="utf-8")).get("request_source") == "locomo"
+        if locomo:
+            return run_locomo(args, root)
         count = prepare_reused_off(args, root) if args.off_dir else prepare_prompt(args, root)
         write_json(
             root / "run.json",
@@ -435,7 +569,8 @@ def main(argv=None):
                 "save_on_tensors": args.save_on_tensors,
                 "off_source": str(args.off_dir) if args.off_dir else None,
                 "cases": ["on"] if args.off_dir else list(CASES),
-                "comparison": "OFF full tensors; ON online numerical errors and distributions; output tokens exact",
+                "max_features": args.max_features,
+                "comparison": "OFF tensor files; ON online numerical errors and distributions; output tokens exact",
                 "layout": "tools-only local merged-page selection; real allocator and transfers",
                 "case_differences": ["VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE", "LMCACHE_STORE_ASYNC"],
                 "excluded": ["Mooncake transport", "later decode intermediate tensors"],
@@ -443,7 +578,7 @@ def main(argv=None):
         )
         sequence = "ON only against saved OFF" if args.off_dir else "OFF then ON"
         print(f"{PREFIX} {count} tokens; {sequence}; results: {root}", flush=True)
-        print(f"{PREFIX} full tensor probes perturb timing; no performance claims", flush=True)
+        print(f"{PREFIX} tensor probes perturb timing; no performance claims", flush=True)
         run_cases(args, root)
         return compare(root)
     except (Exception, KeyboardInterrupt) as error:
