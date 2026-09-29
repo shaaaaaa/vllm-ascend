@@ -114,7 +114,7 @@ def test_case_launch_uses_isolated_inline_configuration(
 
 
 def test_reuse_log_is_available_before_worker_launch(profile_tool, monkeypatch, tmp_path):
-    args = SimpleNamespace(devices="0,1,2,3,4,5,6,7", cpu_cache_gb=24, model="/models/test")
+    args = profile_tool.parser().parse_args([])
     launched = []
 
     def launch(command, env, server_log, case, **kwargs):
@@ -124,13 +124,83 @@ def test_reuse_log_is_available_before_worker_launch(profile_tool, monkeypatch, 
         assert env["LMCACHE_PREFILL_REUSE_DEBUG_RANK"] == "1"
         assert env["PD_SERVING_PERF"] == env["LMCACHE_PREFILL_START_TIMING"] == "0"
         launched.append(target)
-        return SimpleNamespace(wait=lambda: 0)
+        return SimpleNamespace(poll=lambda: None)
 
     monkeypatch.setattr(profile_tool, "start_logged_process", launch)
     monkeypatch.setattr(profile_tool, "finish_child", lambda _: None)
     monkeypatch.setattr(profile_tool, "analyse_case", lambda _: None)
-    profile_tool.run_cases(args, tmp_path, ("80k_on",))
+    monkeypatch.setattr(profile_tool, "check_port_available", lambda _: None)
+    monkeypatch.setattr(profile_tool, "wait_for_server", lambda *a: None)
+    monkeypatch.setattr(profile_tool, "api_request", lambda *a, **k: None)
+    monkeypatch.setattr(profile_tool, "run_benchmark", lambda *a: None)
+    profile_tool.run_cases(args, tmp_path, ("on",))
     assert len(launched) == 1
+
+
+@pytest.mark.parametrize("fail_benchmark", [False, True])
+def test_locomo_off_on_lifecycle_and_failure_cleanup(profile_tool, monkeypatch, tmp_path, fail_benchmark):
+    args = profile_tool.parser().parse_args([])
+    assert args.case == "all" and args.port == 8000
+    assert profile_tool.benchmark_command(args) == [
+        sys.executable,
+        str(args.benchmark_script.resolve()),
+        "--vllm_port",
+        "8000",
+        "--vllm_ip",
+        "127.0.0.1",
+    ]
+    events = []
+    options = []
+
+    def launch(command, env, log_path, case, **kwargs):
+        assert "vllm.entrypoints.openai.api_server" in command
+        assert "--child" not in command and "--prompt-file" not in command
+        assert env["VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE"] == str(case == "on").lower()
+        assert "LMCACHE_CONFIG_FILE" not in env
+        options.append(json.loads((log_path.parent / "engine_options.json").read_text()))
+        events.append(f"start:{case}")
+        return SimpleNamespace(poll=lambda: None)
+
+    def benchmark(*args):
+        events.append("benchmark")
+        if fail_benchmark:
+            raise RuntimeError("benchmark failed")
+
+    monkeypatch.setattr(profile_tool, "start_logged_process", launch)
+    monkeypatch.setattr(profile_tool, "finish_child", lambda _: events.append("shutdown"))
+    monkeypatch.setattr(profile_tool, "analyse_case", lambda _: events.append("export"))
+    monkeypatch.setattr(profile_tool, "check_port_available", lambda _: None)
+    monkeypatch.setattr(profile_tool, "clear_shm", lambda _: events.append("clear_shm"))
+    monkeypatch.setattr(profile_tool, "wait_for_server", lambda *a: events.append("ready"))
+    monkeypatch.setattr(profile_tool, "api_request", lambda _, path, **kwargs: events.append(path))
+    monkeypatch.setattr(profile_tool, "run_benchmark", benchmark)
+    if fail_benchmark:
+        with pytest.raises(RuntimeError, match="benchmark failed"):
+            profile_tool.run_cases(args, tmp_path, ("off", "on"))
+        assert events == ["start:off", "ready", "/start_profile", "benchmark", "/stop_profile", "shutdown"]
+        assert json.loads((tmp_path / "off/result.json").read_text())["status"] == "failed"
+        assert not (tmp_path / "on").exists()
+    else:
+        profile_tool.run_cases(args, tmp_path, ("off", "on"))
+        assert events == [
+            "start:off",
+            "ready",
+            "/start_profile",
+            "benchmark",
+            "/stop_profile",
+            "shutdown",
+            "export",
+            "clear_shm",
+            "start:on",
+            "ready",
+            "/start_profile",
+            "benchmark",
+            "/stop_profile",
+            "shutdown",
+            "export",
+        ]
+        assert all(o["max_num_batched_tokens"] == 4096 and o["max_model_len"] == 84096 for o in options)
+        assert all(o["gpu_memory_utilization"] == 0.97 for o in options)
 
 
 @pytest.fixture

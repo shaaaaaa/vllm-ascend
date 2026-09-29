@@ -13,6 +13,8 @@ import math
 import os
 import re
 import socket
+import threading
+import time
 from bisect import bisect_left
 from contextlib import contextmanager
 from pathlib import Path
@@ -20,6 +22,48 @@ from urllib.parse import quote
 
 import numpy as np
 import torch
+
+PROGRESS_INTERVAL_SECONDS = 5
+
+
+class CaptureProgress:
+    """Host-only progress; the watchdog never reads or waits for device data."""
+
+    def __init__(self, rank_info):
+        self.label = f"h={rank_info['host']} d={rank_info['dp_rank']} t={rank_info['tp_rank']}"
+        self.current = None
+        self.stop_event = threading.Event()
+        self.thread = None
+
+    def start(self):
+        if self.thread is None:
+            self.stop_event.clear()
+            self.thread = threading.Thread(target=self.watch, daemon=True, name="pd-dump-progress")
+            self.thread.start()
+
+    def set(self, stage, *, announce=False):
+        self.current = (stage, time.monotonic())
+        if announce:
+            print(f"[PD_DUMP] {self.label} {stage}", flush=True)
+
+    def report_wait(self):
+        current = self.current
+        if current is not None:
+            stage, started = current
+            elapsed = time.monotonic() - started
+            if elapsed >= PROGRESS_INTERVAL_SECONDS:
+                print(f"[PD_DUMP] {self.label} {stage} waiting={elapsed:.1f}s", flush=True)
+
+    def watch(self):
+        while not self.stop_event.wait(PROGRESS_INTERVAL_SECONDS):
+            self.report_wait()
+
+    def stop(self):
+        self.current = None
+        self.stop_event.set()
+        if self.thread is not None:
+            self.thread.join(timeout=1)
+            self.thread = None
 
 
 def write_json(path, value):
@@ -135,7 +179,8 @@ def unique_kv_pairs(positions, slots):
 
 
 class RequestArchive:
-    def __init__(self, root, metadata):
+    def __init__(self, root, metadata, progress=None):
+        self.progress = progress
         self.metadata = dict(metadata)
         worker = (
             f"{safe_component(metadata['host'])}-dp{metadata['dp_rank']}-tp{metadata['tp_rank']}-pid{metadata['pid']}"
@@ -201,9 +246,17 @@ class RequestArchive:
             tensor, feature_capture = feature_prefix(tensor, kind, name, self.metadata.get("max_features", 8))
         # Materialize the already narrowed view on device. A strided feature
         # view must not cause a full-width temporary/readback in the backend.
+        label = (
+            f"q={self.metadata['request_id'][-8:]} c={call['call']} "
+            f"m={call.get('model', 'main')} l={layer} {kind}/{name}"
+        )
+        if self.progress is not None:
+            self.progress.set(f"{label} cpu_copy")
         value = cpu_tensor(tensor.contiguous())
         relative = f"tensors/{self.metadata['records']:08d}.pt"
         temporary = (self.root / relative).with_suffix(".pt.tmp")
+        if self.progress is not None:
+            self.progress.set(f"{label} file_write")
         torch.save(value, temporary)
         os.replace(temporary, self.root / relative)
         record = dict(
@@ -232,6 +285,8 @@ class RequestArchive:
         with (self.root / "index.jsonl").open("a", encoding="utf-8") as stream:
             stream.write(json.dumps(record, allow_nan=False) + "\n")
         self.metadata["records"] += 1
+        if self.progress is not None:
+            self.progress.set(f"{label} saved; next_compute_or_capture")
         return record
 
     def end(self, call, observed):
@@ -283,6 +338,15 @@ class PDTensorDump:
         self.mtp_runtime = None
         self.mtp_last = None
         self.rejection_entries = None
+        self.captured_decode = set()
+        self.progress = CaptureProgress(self.rank_info) if role == "D" else None
+
+    def progress_stage(self, stage, layer=-1, *, announce=False):
+        if self.progress is None:
+            return
+        state = self.active or self.last
+        model = state.get("model", "main") if state else "main"
+        self.progress.set(f"m={model} l={layer} {stage}", announce=announce)
 
     def observe_scheduler(self, output):
         for req in output.scheduled_new_reqs:
@@ -292,6 +356,7 @@ class PDTensorDump:
             if archive is not None:
                 archive.finish()
             self.external_ids.pop(internal, None)
+            self.captured_decode.discard(internal)
         self.scheduled = dict(output.num_scheduled_tokens)
 
     def metadata(self, layer=None):
@@ -364,6 +429,7 @@ class PDTensorDump:
             def forward(metadata, draft_probs, logits, sampling_metadata):
                 if self.last is None:
                     return original(metadata, draft_probs, logits, sampling_metadata)
+                self.progress_stage("rejection begin", announce=True)
                 entries = []
                 start = 0
                 targets = cpu_tensor(metadata.target_logits_indices).long()
@@ -538,6 +604,7 @@ class PDTensorDump:
             def draft(model_kwargs, **kwargs):
                 if self.last is None:
                     return original(model_kwargs, **kwargs)
+                self.progress_stage("MTP metadata begin", announce=True)
                 runtime = kwargs["runtime_inputs"]
                 self.mtp_runtime = dict(
                     positions=cpu_tensor(drafter._get_positions(int(runtime["num_input_tokens"]))).tolist(),
@@ -678,6 +745,8 @@ class PDTensorDump:
         self.emit(torch.tensor(positions), -1, "model_input", "logical_positions", meta, prefer_local=False)
 
     def restore(self):
+        if self.progress is not None:
+            self.progress.stop()
         for handle in self.handles:
             handle.remove()
         for owner, name, original in reversed(self.patches):
@@ -721,6 +790,16 @@ class PDTensorDump:
         if meta is None or not self.scheduled:
             return False  # Warmup/EP dummy forward: never assign it to a user request.
         req_ids = list(self.runner.input_batch.req_ids)
+        # Decide on CPU before any tensor readback. A D handoff can include the
+        # last prompt token and an MTP candidate, so phase == decode is NOT a
+        # reliable way to identify its first useful verification call.
+        if self.role == "D" and not any(
+            self.scheduled.get(internal, 0) and internal not in self.captured_decode for internal in req_ids
+        ):
+            return False
+        if self.progress is not None:
+            self.progress.start()
+            self.progress_stage("input_metadata begin", announce=True)
         actual = int(meta.num_actual_tokens)
         bounds = [int(x) for x in meta.query_start_loc_cpu]
         if len(bounds) < len(req_ids) + 1 or bounds[len(req_ids)] != actual:
@@ -732,7 +811,7 @@ class PDTensorDump:
         entries = []
         for row, internal in enumerate(req_ids):
             start, end = bounds[row : row + 2]
-            if start == end:
+            if start == end or (self.role == "D" and internal in self.captured_decode):
                 continue
             external = self.external_ids.get(internal)
             if external is None:
@@ -769,7 +848,9 @@ class PDTensorDump:
                         prompt_token_ids=list(request.prompt_token_ids),
                         max_token_rows=self.max_token_rows,
                         max_features=self.max_features,
+                        capture_policy="first_D_forward" if self.role == "D" else "all_prefill",
                     ),
+                    progress=self.progress,
                 )
                 self.archives[internal] = archive
             call = archive.begin(
@@ -784,6 +865,13 @@ class PDTensorDump:
                 self.expected(),
             )
             entries.append(dict(archive=archive, call=call, start=start, end=end, row=row, observed=set()))
+            if self.role == "D":
+                self.captured_decode.add(internal)
+                self.progress.set(f"q={external[-8:]} c={call['call']} first_D_forward begin", announce=True)
+        if not entries:
+            if self.progress is not None:
+                self.progress.stop()
+            return False
         self.active = dict(model="main", entries=entries, positions=pos, token_ids=ids, actual=actual)
         self.last = self.active
         self.logical_topk = None
@@ -800,6 +888,8 @@ class PDTensorDump:
             if self.active:
                 for entry in self.active["entries"]:
                     entry["archive"].fail(f"{type(error).__name__}: {error}")
+            if self.progress is not None:
+                self.progress.stop()
             raise
         finally:
             self.active = None
@@ -862,6 +952,7 @@ class PDTensorDump:
     def decoder_pre(self, layer, module, args, kwargs):
         if self.active is None:
             return
+        self.progress_stage("layer begin", layer, announce=True)
         values = inspect.signature(module.forward).bind(*args, **kwargs).arguments
         for name, value in (("input", values.get("hidden_states")), ("input_residual", values.get("residual"))):
             if value is not None:
@@ -1087,6 +1178,7 @@ class PDTensorDump:
                 if args:
                     raise ValueError("PD dump sparse kernel requires the known keyword argument schema")
                 layer, meta = self.sfa_stack[-1]
+                self.progress_stage(f"{kind} capture_inputs", layer)
                 if kind == "indexer":
                     for key in ("query", "weights", "query_dequant_scale"):
                         if key in kwargs:
@@ -1108,6 +1200,7 @@ class PDTensorDump:
                     self.emit(kwargs["query_rope"], layer, kind, "query_rope", meta)
                     self.emit(kwargs["sparse_indices"], layer, "mapping", "sparse_indices", meta, mapping_only=True)
                     self.attention_kv(kwargs, layer, meta)
+                self.progress_stage(f"{kind} compute", layer)
                 result = original(*args, **kwargs)
                 value = result[0] if tuple_result else result
                 self.emit(value, layer, kind, "topk" if kind == "indexer" else "output", meta)
@@ -1123,6 +1216,8 @@ class PDTensorDump:
         @functools.wraps(original)
         def logits(*args, **kwargs):
             try:
+                if self.last is not None:
+                    self.progress_stage("logits begin", announce=True)
                 result = original(*args, **kwargs)
                 if self.last is None:
                     return result
@@ -1167,12 +1262,19 @@ class PDTensorDump:
                     stream.write(json.dumps({"after_call": entry["call"]["call"], "token_ids": valid}) + "\n")
             for entry in self.last["entries"]:
                 entry["archive"].end(entry["call"], entry["observed"])
+                if self.progress is not None:
+                    self.progress.set(
+                        f"q={entry['archive'].metadata['request_id'][-8:]} first_D_forward done; later_capture=off",
+                        announce=True,
+                    )
         except BaseException as error:
             for entry in self.last["entries"]:
                 entry["archive"].fail(f"sampling {type(error).__name__}: {error}")
             raise
         finally:
             self.last = None
+            if self.progress is not None:
+                self.progress.stop()
 
 
 def install_pd_tensor_dump(runner, root):

@@ -19,7 +19,10 @@ def module():
     spec = importlib.util.spec_from_file_location("_pd_dump_test", ROOT / "vllm_ascend/pd_tensor_dump.py")
     loaded = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(loaded)
-    return loaded
+    loaded.test_probes = []
+    yield loaded
+    for probe in loaded.test_probes:
+        probe.restore()
 
 
 def make_probe(module, tmp_path, prompts, *, cp=None, external=None, max_token_rows=64, max_features=8):
@@ -45,6 +48,7 @@ def make_probe(module, tmp_path, prompts, *, cp=None, external=None, max_token_r
         max_features=max_features,
     )
     probe.layers = {0: object()}
+    module.test_probes.append(probe)
     probe.attentions = {1: (0, "layer0")}
     probe.observe_scheduler(
         NS(
@@ -261,6 +265,7 @@ def test_tp_padding_and_empty_request_shards(module, tmp_path, local_start, loca
 
 def test_multiple_chunks_and_target_drafts_record_actual_input_context(module, tmp_path):
     probe, runner, meta = make_probe(module, tmp_path, {"a": [10, 11, 12, 13]})
+    probe.role = "P"  # P still archives every compute-prefill chunk.
     for query_positions, query_ids in (([0, 1], [10, 11]), ([2, 3], [12, 13]), ([4, 5, 6], [20, 91, 92])):
         runner.requests["a"].output_token_ids = [20] if query_positions[0] == 4 else []
         ids, positions = batch(meta, [(query_positions, query_ids)])
@@ -274,6 +279,72 @@ def test_multiple_chunks_and_target_drafts_record_actual_input_context(module, t
     assert archive.calls[2]["context_complete"]
     assert runner.requests["a"].output_token_ids == [20]
     assert record_for(archive, "model_input", "input_ids", 2)["token_ids"] == [20, 91, 92]
+
+
+def test_d_captures_first_handoff_call_then_skips_without_readback(module, tmp_path, monkeypatch, capsys):
+    probe, runner, meta = make_probe(module, tmp_path, {"a": [10, 11, 12]})
+    ids, positions = batch(meta, [([2, 3], [12, 30])])
+    with probe.forward(ids, positions):
+        fill_expected(probe, meta)
+    finish_forward(probe, sampled=[[31]])
+    archive = probe.archives["a"]
+    before = records(archive)
+    assert archive.metadata["capture_policy"] == "first_D_forward"
+    assert archive.calls[0]["positions"] == [2, 3]
+    assert archive.calls[0]["phase"] == "prefill"
+    assert "later_capture=off" in capsys.readouterr().out
+
+    def no_readback(_):
+        raise AssertionError("later decode performed a diagnostic CPU copy")
+
+    monkeypatch.setattr(module, "cpu_tensor", no_readback)
+    runner.requests["a"].output_token_ids = [30, 31]
+    ids, positions = batch(meta, [([4], [31])])
+    with probe.forward(ids, positions):
+        assert probe.active is None and probe.last is None
+        result = torch.ones(1, 3)
+        assert probe.kernel_factory("attention")(lambda **kwargs: result)() is result
+    assert probe.logits_factory(lambda: result)() is result
+    probe.sampled(["a"], [[32]])
+    assert records(archive) == before and len(archive.calls) == 1
+    assert probe.progress.thread is None
+    probe.observe_scheduler(NS(scheduled_new_reqs=[], finished_req_ids={"a"}, num_scheduled_tokens={}))
+    assert not probe.captured_decode
+    assert manifest(archive)["request_finished"]
+
+
+def test_new_d_request_in_mixed_batch_keeps_original_row_offsets(module, tmp_path):
+    probe, _, meta = make_probe(module, tmp_path, {"a": [10, 11], "b": [20, 21]})
+    ids, positions = batch(meta, [([1], [11]), ([], [])])
+    with probe.forward(ids, positions):
+        fill_expected(probe, meta)
+    finish_forward(probe, sampled=[[30]])
+    before = records(probe.archives["a"])
+    ids, positions = batch(meta, [([2], [30]), ([1], [21])])
+    with probe.forward(ids, positions):
+        (entry,) = probe.active["entries"]
+        assert entry["row"] == 1 and entry["start"] == 1
+        fill_expected(probe, meta)
+    finish_forward(probe, sampled=[[40]])
+    assert records(probe.archives["a"]) == before
+    assert value_for(probe.archives["b"], "model_input", "input_ids").tolist() == [21]
+
+
+def test_progress_names_blocked_copy_and_write_without_device_access(module, monkeypatch, capsys):
+    now = [0.0]
+    monkeypatch.setattr(module.time, "monotonic", lambda: now[0])
+    progress = module.CaptureProgress(dict(host="test", dp_rank=1, tp_rank=2))
+    progress.set("m=main l=3 kv_consumed/nope cpu_copy")
+    now[0] = 6
+    progress.report_wait()
+    assert "kv_consumed/nope cpu_copy waiting=6.0s" in capsys.readouterr().out
+    progress.set("m=main l=3 kv_consumed/nope file_write")
+    now[0] = 12
+    progress.report_wait()
+    assert "file_write waiting=6.0s" in capsys.readouterr().out
+    progress.stop()
+    progress.report_wait()
+    assert not capsys.readouterr().out
 
 
 def test_unknown_context_gap_cannot_be_reported_complete(module, tmp_path):

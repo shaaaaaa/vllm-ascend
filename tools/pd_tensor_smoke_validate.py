@@ -105,7 +105,11 @@ def _validate_worker(worker, prompt_ids, expected_layerwise, min_prefill_calls, 
             "P model inputs do not cover the prompt exactly once in order",
         )
     else:
-        _require(bool(decode_calls), "D did not execute any main decode call")
+        first_only = manifest.get("capture_policy") == "first_D_forward"
+        if first_only:
+            _require(len(calls) == 1, "first-D-forward capture must contain exactly one main call")
+        else:
+            _require(bool(decode_calls), "D did not execute any main decode call")
         _require(
             min(all_positions) == len(prompt_ids) - 1,
             "D did not start at the final prompt token; prefix may have recomputed",
@@ -113,7 +117,8 @@ def _validate_worker(worker, prompt_ids, expected_layerwise, min_prefill_calls, 
         _require(calls[0]["positions"][0] == len(prompt_ids) - 1, "D first query is not the final prompt token")
         _require(all(position >= len(prompt_ids) - 1 for position in all_positions), "D recomputed cached prompt rows")
         _require(
-            len(prefill_calls) == 1 and prefill_calls[0]["positions"] == [len(prompt_ids) - 1],
+            len(prefill_calls) == 1
+            and [p for p in prefill_calls[0]["positions"] if p < len(prompt_ids)] == [len(prompt_ids) - 1],
             "D prefill must only recompute the final prompt token",
         )
     sampled = [token for item in worker.sampled for token in item["token_ids"]]
@@ -121,8 +126,16 @@ def _validate_worker(worker, prompt_ids, expected_layerwise, min_prefill_calls, 
     api_tokens = output["token_ids"]
     mtp_tokens = output.get("mtp", {}).get("configured_tokens", 0)
     _require(type(mtp_tokens) is int and mtp_tokens >= 0, "invalid configured MTP token count")
-    _require(sampled[: len(api_tokens)] == api_tokens, "worker accepted tokens differ from API output")
+    first_only = role == "D" and manifest.get("capture_policy") == "first_D_forward"
+    if first_only:
+        _require(bool(sampled), "first D call produced no accepted token")
+        overlap = min(len(sampled), len(api_tokens))
+        _require(sampled[:overlap] == api_tokens[:overlap], "first D tokens differ from API output")
+    else:
+        _require(sampled[: len(api_tokens)] == api_tokens, "worker accepted tokens differ from API output")
     excess = len(sampled) - len(api_tokens)
+    if first_only:
+        excess = max(0, excess)
     _require(0 <= excess <= mtp_tokens, "worker accepted token count exceeds the final MTP bonus allowance")
     if excess:
         # The runner observes accepted tokens before the scheduler truncates
@@ -140,6 +153,7 @@ def _validate_worker(worker, prompt_ids, expected_layerwise, min_prefill_calls, 
         "records": len(worker.records),
         "sampled_tokens": len(sampled),
         "api_output_tokens": len(api_tokens),
+        "tensor_capture_scope": "first_D_forward" if first_only else "all_calls",
         "clipped_final_tokens": excess,
         "directory": str(worker.directory),
     }

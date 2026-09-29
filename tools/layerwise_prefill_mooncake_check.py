@@ -437,11 +437,12 @@ def start_child(args, root, stage):
     return start_logged_process(command, child_environment(args, root, stage), root / stage / "server.log", stage)
 
 
-def start_logged_process(command, env, log_path, label, *, prefix="[PREFILL_MOONCAKE]"):
+def start_logged_process(command, env, log_path, label, *, prefix="[PREFILL_MOONCAKE]", cwd=None):
     print(f"{prefix} starting {label}: {log_path}", flush=True)
     proc = subprocess.Popen(
         command,
         env=env,
+        cwd=cwd,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         start_new_session=True,

@@ -139,6 +139,16 @@ def make_case(
     )
 
 
+def test_first_d_forward_policy_accepts_complete_prefix_only_capture(recorder, tmp_path):
+    case = make_case(recorder, tmp_path, d_chunks=[[3]])
+    for (role, _), archive in case.archives.items():
+        if role == "D":
+            archive.metadata["capture_policy"] = "first_D_forward"
+            archive.flush()
+    report = validate(case)
+    assert report["complete"], report
+
+
 def validate(case, **kwargs):
     options = dict(output_tokens=3, expect_layerwise=case.layerwise)
     options.update(kwargs)

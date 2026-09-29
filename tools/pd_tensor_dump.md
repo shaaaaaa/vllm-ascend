@@ -4,6 +4,18 @@
 同时更新 `prefill_layerwise_cache` 分支的 vLLM 和 vLLM-Ascend。
 开关默认为空；未开启时不安装探针、不写文件、不增加 tensor 读回。
 
+D 现在每个请求只记录第一次主模型执行，以及关联的 MTP/接受判断。
+这轮可能包含重算的最后一个 prompt token 和 MTP 候选，因此按“首次 D 执行”判断，
+不依赖 `phase=decode`。后续轮次正常生成，但不再读取、保存中间 tensor。
+P 仍保存每个 chunk prefill。归档会写明 `capture_policy=first_D_forward`；
+离线分析仅比较这部分已记录的数据，不能据此判断后续全部 decode 的内部精度。
+
+D 日志以 `[PD_DUMP]` 开头，包含主机、DP/TP、当前模型与层号。
+每层开始会输出一次；同一阶段持续超过 5 秒会周期性输出 `waiting=...s`，
+并标明张量名和 `cpu_copy`（读回）、`file_write`（写盘）或计算阶段。
+这是后台 CPU 线程报告进度，不新增 NPU synchronize；`waiting` 不是报错。
+首轮完成会输出 `first_D_forward done; later_capture=off`。
+
 ## 先做单机预检查
 
 在安装好四个仓库的 Linux Ascend 单机环境中执行，不需要配置文件或 Mooncake 服务：
@@ -30,7 +42,7 @@ python3 tools/pd_tensor_smoke.py 2>&1 | tee log.log
 单机脚本沿用 profile 的内置参数和环境变量方式，清除继承的 `LMCACHE_CONFIG_FILE`，无需准备 YAML。
 LMCache 的 `No LMCache configuration file is set` 提示表示使用环境变量，并非要求补配置文件。
 探针在 KV connector 初始化后安装，避免提前读取尚未由 LMCache-Ascend 扩展的配置类。
-检查每个 TP 的归档完整性、P 多 chunk 覆盖、D decode 覆盖、D 缓存命中长度 `prompt长度−1`，
+检查每个 TP 的归档完整性、P 多 chunk 覆盖、D 首轮覆盖、D 缓存命中长度 `prompt长度−1`，
 以及两个 DSA group 的实际文件读取；最后自动运行 P→D KV 和 OFF/ON 离线比对。
 它不覆盖真实 Mooncake 网络、多机 DP、图回放或没有读回时的并发竞争。
 
