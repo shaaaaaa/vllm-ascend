@@ -23,6 +23,7 @@ from vllm.v1.executor.multiproc_executor import (
     WorkerProc,
     set_multiprocessing_worker_envs,
 )
+from vllm.v1.outputs import AsyncModelRunnerOutput
 
 from vllm_ascend.serving_perf import (
     cold_perf_enabled,
@@ -42,7 +43,7 @@ _worker_hook_reported = False
 
 def _handle_output(self: WorkerProc, output):
     global _worker_hook_reported
-    if getattr(output, _COLD_PERF_REQUEST_IDS, ()):
+    if isinstance(output, AsyncModelRunnerOutput) and getattr(output, _COLD_PERF_REQUEST_IDS, ()):
         setattr(output, _COLD_PERF_QUEUED_NS, time.perf_counter_ns())
         if not _worker_hook_reported:
             _worker_hook_reported = True
@@ -53,6 +54,10 @@ def _handle_output(self: WorkerProc, output):
 
 
 def _enqueue_output(self: WorkerProc, output):
+    # Diagnostic tags are also attached to synchronous model results. Only the
+    # async wrapper owns get_output(); preserve vLLM's handling of all other RPCs.
+    if not isinstance(output, AsyncModelRunnerOutput):
+        return _worker_enqueue_output(self, output)
     queued_ns = getattr(output, _COLD_PERF_QUEUED_NS, None)
     if queued_ns is None:
         return _worker_enqueue_output(self, output)

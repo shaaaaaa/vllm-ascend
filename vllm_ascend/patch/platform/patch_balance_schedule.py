@@ -545,11 +545,22 @@ class BalanceScheduler(Scheduler):
                 num_common_prefix_blocks = self.kv_cache_manager.get_num_common_prefix_blocks(any_request_id)
 
         # Construct the scheduler output.
+        layerwise_prefill = getattr(
+            getattr(self.kv_cache_manager, "coordinator", None),
+            "layerwise_prefill_p_node",
+            False,
+        )
         if self.use_v2_model_runner:
             scheduled_new_reqs = scheduled_new_reqs + scheduled_resumed_reqs
             scheduled_resumed_reqs = []
             new_reqs_data = [
-                NewRequestData.from_request(
+                self._make_new_request_data(
+                    req,
+                    req_to_new_blocks[req.request_id],
+                    req._all_token_ids,
+                )
+                if layerwise_prefill
+                else NewRequestData.from_request(
                     req,
                     req_to_new_blocks[req.request_id].get_block_ids(),
                     req._all_token_ids,
@@ -558,7 +569,12 @@ class BalanceScheduler(Scheduler):
             ]
         else:
             new_reqs_data = [
-                NewRequestData.from_request(req, req_to_new_blocks[req.request_id].get_block_ids())
+                self._make_new_request_data(
+                    req,
+                    req_to_new_blocks[req.request_id],
+                )
+                if layerwise_prefill
+                else NewRequestData.from_request(req, req_to_new_blocks[req.request_id].get_block_ids())
                 for req in scheduled_new_reqs
             ]
 

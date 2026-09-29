@@ -43,7 +43,14 @@ def api():
         n
         for n in tree.body
         if isinstance(n, (ast.ClassDef, ast.FunctionDef))
-        and n.name in {"AscendSFAMetadataBuilder", "_update_dsa_split_boundary_in_place", "_fixed_staged_decode_mtp"}
+        and n.name
+        in {
+            "AscendSFAMetadataBuilder",
+            "_update_dsa_split_boundary_in_place",
+            "_fixed_staged_decode_mtp",
+            "_dsa_topk_to_2d_indices",
+            "_dsa_mask_padding_sparse_rows",
+        }
     ]
     future = ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0)
     exec(compile(ast.fix_missing_locations(ast.Module(body=[future, *nodes], type_ignores=[])), str(path), "exec"), ns)
@@ -213,6 +220,36 @@ def test_non_speculative_single_row_keeps_fixed_metadata(api, builder):
     assert builder._dsa_fixed_layout_signature is not None
 
 
+@pytest.mark.parametrize("state,width", [("decode", 1), ("spec", 1), ("spec", 2)])
+@pytest.mark.parametrize("padding", [0, 2])
+def test_dense_prompt_tail_keeps_real_topk_and_only_masks_padding(api, builder, state, width, padding):
+    # Dense-prefix PD loads leave the final prompt token to be recomputed.
+    # It has no cold-compact marker, but is a real query, including with MTP.
+    metadata = common(api, [width], set(), computed=[4], state=state, padded=width + padding)
+    metadata.prompt_lens_cpu = [5]
+    metadata.cold_compact_resumes = ()
+    metadata.positions = torch.arange(4, 4 + width + padding)
+    metadata.block_table_tensor.fill_(2)
+    result = builder.build(0, metadata)
+    assert result.num_decode_tokens == width
+    assert result.decode_req_indices.tolist() == [0] * width + [-1] * padding
+    assert result.decode_valid_row_indices.tolist() == list(range(width))
+    assert result.decode_row_offsets.tolist() == list(range(width)) + [0] * padding
+
+    # Full-resident requests resolve to boundary zero: no sparse reload and
+    # no remapping of any real absolute token index is needed.
+    boundary = api["_update_dsa_split_boundary_in_place"](result, [0], 0)
+    assert boundary.tolist() == [0] * (width + padding)
+    original = torch.tensor([[1, 0, 2, 3, 4, -1, -1, -1], [1, 5, 0, 2, 3, 4, -1, -1]], dtype=torch.int32)[:width]
+    topk = torch.cat([original, torch.full((padding, 8), 77, dtype=torch.int32)])
+    masked, _ = api["_dsa_mask_padding_sparse_rows"](topk, result.decode_req_indices)
+    assert torch.equal(masked[:width], original)
+    assert torch.count_nonzero(masked[width:]) == 0
+    # Both queries must address the same physical copy of logical token 1.
+    physical = metadata.block_table_tensor[0, 0] * 128 + masked[:width, 0]
+    assert physical.tolist() == [257] * width
+
+
 @pytest.mark.parametrize("markers,frontiers", [((True,), (22684,)), ((True, False), (22684,))])
 def test_misaligned_proofs_still_fail(api, builder, markers, frontiers):
     metadata = common(api, [1, 2], {0})
@@ -294,6 +331,57 @@ def native_case(ns, widths, computed, prompts, histories, drafts, cold, captures
         prompt_lens=prompts,
     )
     return runner, metadata, kwargs
+
+
+@pytest.mark.parametrize("captures", [(4, 8, 16, 32), ()])
+def test_dense_pd_admission_without_cold_proof_preserves_both_queries(native_api, captures):
+    runner, metadata, kwargs = native_case(native_api, [2], [4], [5], [5], np.array([1]), set(), captures)
+    assert metadata.attn_state == "spec"
+    decision = native_api["_staged_sfa_local_route"](runner, **kwargs)
+    assert decision.action.value == "safe_native"
+    assert not any(decision.cold_compact_resumes)
+    metadata.cold_compact_resumes = decision.cold_compact_resumes
+    result = builder.__wrapped__(native_api).build(0, metadata)
+    assert result.decode_req_indices.tolist() == [0, 0]
+    reason, frontiers, _ = native_api["staged_sfa_metadata_sparse_route"](
+        kwargs["kv_connector_metadata"], metadata.request_ids
+    )
+    assert reason.value == "dense_prefix_hit"
+    assert frontiers == (0,)
+    boundary = native_api["_update_dsa_split_boundary_in_place"](result, list(frontiers), 0)
+    assert boundary.tolist() == [0, 0]
+
+
+def test_dense_tail_and_sparse_decode_reuse_metadata_without_stale_rows(native_api):
+    instance = builder.__wrapped__(native_api)
+    # Prime the reused arrays with a fixed-width two-request decode step.
+    instance.build(0, common(native_api, [2, 2], set(), computed=[22690, 22690]))
+    metadata = common(native_api, [2, 1], set(), computed=[4, 22690], padded=4)
+    metadata.prompt_lens_cpu = [5, 22684]
+    result = instance.build(0, metadata)
+    assert result.decode_req_indices.tolist() == [0, 0, 1, -1]
+    assert result.decode_valid_row_indices.tolist() == [0, 1, 2]
+    assert result.decode_row_offsets.tolist() == [0, 1, 0, 0]
+    boundary = native_api["_update_dsa_split_boundary_in_place"](result, [0, 22684], 0)
+    assert boundary.tolist() == [0, 0, 22684, 0]
+
+    # The following ordinary step must replace the dense-tail and padding
+    # metadata while continuing to use the same backing storage.
+    next_metadata = common(native_api, [2, 2], set(), computed=[6, 22691])
+    next_metadata.prompt_lens_cpu = [5, 22684]
+    next_result = instance.build(0, next_metadata)
+    assert next_result.decode_req_indices.data_ptr() == result.decode_req_indices.data_ptr()
+    assert next_result.decode_req_indices.tolist() == [0, 0, 1, 1]
+
+
+def test_mixed_chunked_prefill_still_excludes_unfinished_prompt_rows(native_api):
+    metadata = common(native_api, [2, 2], set(), computed=[3, 22690], state="chunked", padded=6)
+    metadata.prompt_lens_cpu = [9, 22684]
+    result = builder.__wrapped__(native_api).build(0, metadata)
+    assert result.decode_req_indices.tolist() == [-1, -1, 1, 1, -1, -1]
+    assert result.decode_valid_row_indices.tolist() == [2, 3]
+    boundary = native_api["_update_dsa_split_boundary_in_place"](result, [0, 22684], 0)
+    assert boundary.tolist() == [0, 0, 22684, 22684, 0, 0]
 
 
 @pytest.mark.parametrize("captures", [(4, 8, 16, 32), ()])
@@ -451,7 +539,9 @@ def test_ordinary_native_decode_still_skips_connector_inspection(native_api):
 
 def test_native_markers_follow_completed_load_handoff(native_api):
     root = Path(__file__).resolve().parents[3]
-    source = root / "LMCache-NPU/lmcache/integration/vllm/vllm_v1_adapter.py"
+    adapter_path = Path("lmcache/integration/vllm/vllm_v1_adapter.py")
+    candidates = [root / name / adapter_path for name in ("LMCache", "LMCache-NPU")]
+    source = next((path for path in candidates if path.is_file()), candidates[0])
     tree = ast.parse(source.read_text(encoding="utf-8"))
     method = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "_take_completed_cold_load")
     future = ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0)

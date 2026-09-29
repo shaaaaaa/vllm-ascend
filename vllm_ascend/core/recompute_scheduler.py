@@ -47,13 +47,13 @@ from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.utils import ConstantList, record_function_or_nullcontext
 
 from vllm_ascend.core.mc2_recovery import decoder_recovery_budget
-from vllm_ascend.utils import is_moe_model
 from vllm_ascend.serving_perf import (
     cold_perf_enabled,
     is_cold_perf_request,
     log_cold_perf_event,
     mark_cold_perf_connector_requests,
 )
+from vllm_ascend.utils import is_moe_model
 
 
 # `spec_manager_map` in single_type_kv_cache_manager is a module-level dict
@@ -777,11 +777,22 @@ class RecomputeScheduler(Scheduler):
                 num_common_prefix_blocks = self.kv_cache_manager.get_num_common_prefix_blocks(any_request_id)
 
         # Construct the scheduler output.
+        layerwise_prefill = getattr(
+            getattr(self.kv_cache_manager, "coordinator", None),
+            "layerwise_prefill_p_node",
+            False,
+        )
         if self.use_v2_model_runner:
             scheduled_new_reqs = scheduled_new_reqs + scheduled_resumed_reqs
             scheduled_resumed_reqs = []
             new_reqs_data = [
-                NewRequestData.from_request(
+                self._make_new_request_data(
+                    req,
+                    req_to_new_blocks[req.request_id],
+                    req._all_token_ids,
+                )
+                if layerwise_prefill
+                else NewRequestData.from_request(
                     req,
                     req_to_new_blocks[req.request_id].get_block_ids(),
                     req._all_token_ids,
@@ -790,7 +801,12 @@ class RecomputeScheduler(Scheduler):
             ]
         else:
             new_reqs_data = [
-                NewRequestData.from_request(req, req_to_new_blocks[req.request_id].get_block_ids())
+                self._make_new_request_data(
+                    req,
+                    req_to_new_blocks[req.request_id],
+                )
+                if layerwise_prefill
+                else NewRequestData.from_request(req, req_to_new_blocks[req.request_id].get_block_ids())
                 for req in scheduled_new_reqs
             ]
 
