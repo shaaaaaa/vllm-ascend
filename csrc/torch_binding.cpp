@@ -30,6 +30,7 @@
 #include "acl/acl.h"
 #include "acl/acl_rt.h"
 #include "ops.h"
+#include "kernels/prepare_sparse_indices_limits.h"
 #include "utils.h"
 #include "aclnn_torch_adapter/op_api_common.h"
 #include "add_rms_norm_bias/add_rms_norm_bias_torch_adpt.h"
@@ -2976,6 +2977,11 @@ at::Tensor npu_dsa_prepare_sparse_indices_(
                 "selected payload width must cover one sparse row");
     const int64_t bitmap_words =
         (block_table_width * block_size + 31) / 32;
+    // Windowed in-place remapping must keep scratch ranks below the next
+    // window's absolute-token range. Normal Q1/Q2 capacity is at most 8192.
+    TORCH_CHECK(bitmap_words <= DSA_BITMAP_WINDOW_WORDS ||
+                    scratch_capacity <= DSA_BITMAP_WINDOW_TOKENS,
+                "windowed sparse preparation scratch exceeds token-window capacity");
     TORCH_CHECK(request_block_table.size(1) * block_size >= scratch_capacity,
                 "request block table is too short for the fixed scratch prefix");
 

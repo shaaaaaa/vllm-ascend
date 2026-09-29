@@ -9,6 +9,7 @@
  */
 
 #include "kernel_operator.h"
+#include "prepare_sparse_indices_limits.h"
 
 namespace {
 
@@ -49,7 +50,9 @@ public:
         scratchCapacity_ = scratchCapacity;
         selectedCountStride_ = selectedCountStride;
         bitmapWords_ = bitmapWords;
-        bufferWords_ = ((bitmapWords + 7) / 8) * 8;
+        bufferWords_ = bitmapWords < vllm_ascend::DSA_BITMAP_WINDOW_WORDS
+            ? ((bitmapWords + 7) / 8) * 8
+            : vllm_ascend::DSA_BITMAP_WINDOW_WORDS;
         blockSize_ = blockSize;
         needPacked_ = needPacked != 0;
         clearInvalidRows_ = clearInvalidRows != 0;
@@ -94,6 +97,33 @@ public:
             }
             return;
         }
+        uint32_t uniqueCount = 0;
+        if (bitmapWords_ <= bufferWords_) {
+            ProcessWindow<false>(req, 0, bitmapWords_, uniqueCount);
+        } else {
+            for (uint32_t base = 0; base < bitmapWords_; base += bufferWords_) {
+                if (base != 0) {
+                    // Finish scalar UB reads/writes before the next vector clear.
+                    SyncPipeline<AscendC::HardEvent::S_V>();
+                }
+                const uint32_t remaining = bitmapWords_ - base;
+                ProcessWindow<true>(req, base,
+                    remaining < bufferWords_ ? remaining : bufferWords_, uniqueCount);
+            }
+        }
+        selectedCounts_.SetValue(
+            static_cast<uint64_t>(req) * selectedCountStride_,
+            needPacked_ ? static_cast<int32_t>(uniqueCount) : 0);
+        if (req == 0 && clearInvalidRows_) {
+            ClearInvalidRows();
+        }
+    }
+
+private:
+    template <bool windowed>
+    __aicore__ inline void ProcessWindow(
+        uint32_t req, uint32_t wordBase, uint32_t wordCount, uint32_t &uniqueCount)
+    {
         AscendC::LocalTensor<int32_t> bitmap =
             bitmapBuffer_.Get<int32_t>();
         AscendC::LocalTensor<int32_t> prefix =
@@ -122,7 +152,12 @@ public:
                 if (token < 0 || token >= boundary) {
                     continue;
                 }
-                const uint32_t word = static_cast<uint32_t>(token) >> 5;
+                const uint32_t word = (static_cast<uint32_t>(token) >> 5) - wordBase;
+                if constexpr (windowed) {
+                    if (word >= wordCount) {
+                        continue;
+                    }
+                }
                 const uint32_t bit = static_cast<uint32_t>(token) & 31;
                 const uint32_t value =
                     static_cast<uint32_t>(bitmap.GetValue(word));
@@ -133,8 +168,7 @@ public:
 
         // Prefix popcount gives every selected position a deterministic rank
         // in ascending token-position order.
-        uint32_t uniqueCount = 0;
-        for (uint32_t word = 0; word < bitmapWords_; ++word) {
+        for (uint32_t word = 0; word < wordCount; ++word) {
             prefix.SetValue(word, static_cast<int32_t>(uniqueCount));
             uniqueCount += Popcount32(
                 static_cast<uint32_t>(bitmap.GetValue(word)));
@@ -152,7 +186,14 @@ public:
                 if (token < 0 || token >= boundary) {
                     continue;
                 }
-                const uint32_t word = static_cast<uint32_t>(token) >> 5;
+                const uint32_t word = (static_cast<uint32_t>(token) >> 5) - wordBase;
+                if constexpr (windowed) {
+                    // Earlier windows remapped in place to scratch ranks below
+                    // WINDOW_TOKENS; unsigned subtraction excludes them here.
+                    if (word >= wordCount) {
+                        continue;
+                    }
+                }
                 const uint32_t bit = static_cast<uint32_t>(token) & 31;
                 const uint32_t bitmapValue =
                     static_cast<uint32_t>(bitmap.GetValue(word));
@@ -178,16 +219,8 @@ public:
                 }
             }
         }
-        selectedCounts_.SetValue(
-            static_cast<uint64_t>(req) * selectedCountStride_,
-            needPacked_ ? static_cast<int32_t>(uniqueCount) : 0);
-
-        if (req == 0 && clearInvalidRows_) {
-            ClearInvalidRows();
-        }
     }
 
-private:
     __aicore__ inline void ClearInvalidRows()
     {
         for (uint32_t row = 0; row < rowCount_; ++row) {
