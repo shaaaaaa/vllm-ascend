@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""Run LoCoMo against fresh local OFF/ON API servers and capture NPU profiles.
+"""Capture full-model TP8 prefill profiles for the P/D comparison.
 
-Default workload: python /workspace/dataset/benchmark-new/locomo/test_advanced.py
---vllm_port 8000 --vllm_ip 127.0.0.1. No synthetic requests are submitted.
-TP8/DP1, eager, MTP1, FlashComm1=1, 4096 compute chunk and local LMCache only.
-All model/cache options are inline; no YAML, Mooncake or tensor-dump probes.
-Startup is excluded; all benchmark requests (prefill and decode) are profiled.
-Prompt construction helpers below are also imported by the correctness tools.
+Local LMCache CPU storage only: no Mooncake, file SDK shim or KV probes. The
+``*_off`` case keeps the D-node/original transfer path; ``*_on`` enables the
+P-node layerwise path with ``VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE=true``. Each
+case uses a fresh model process and executes one request through its first
+output token. 80k captures only the first/last three compute-prefill chunks;
+10k captures the whole request. Model startup is outside capture.
+
+Compute/runtime settings follow the serving P node, with single-host TP8/DP1
+and local CPU cache for this benchmark. Keep host IP/NIC settings in the caller
+environment; deployment paths, Mooncake and API-server options are not needed.
+All model and LMCache settings are defined below; no configuration file is read.
 """
 
 import argparse
@@ -15,20 +20,22 @@ import faulthandler
 import json
 import os
 import shutil
-import socket
 import subprocess
 import sys
 import tempfile
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from urllib.error import URLError
-from urllib.request import ProxyHandler, Request, build_opener
 
 from layerwise_prefill_check import DEFAULT_PROMPT_FILE, normalize_prompt_token_ids, write_json
 from layerwise_prefill_mooncake_check import finish_child, start_logged_process
+from layerwise_prefill_profile_worker import (
+    make_capture_plan,
+    validate_capture,
+)
 
-LEGACY_CASES = ("10k_off", "10k_on", "80k_off", "80k_on")
+CASES = ("10k_off", "10k_on", "80k_off", "80k_on")
+LONG_CASES = ("80k_off", "80k_on")
 DEFAULT_LONG_PROMPT_FILE = DEFAULT_PROMPT_FILE.with_name("article_summary_80k.txt")
 MAX_PROMPT_FIT_ATTEMPTS = 3
 MIN_PROMPT_FRACTION = 0.95
@@ -39,7 +46,6 @@ SHORT_MAX_MODEL_LEN = 16384
 LONG_MAX_MODEL_LEN = 80000 + COMPUTE_CHUNK_TOKENS
 PREFIX = "[PREFILL_PROFILE]"
 DEFAULT_MODEL = "/workspace/models/GLM-5.2-w4a8c8-0723"
-DEFAULT_BENCHMARK_SCRIPT = Path("/workspace/dataset/benchmark-new/locomo/test_advanced.py")
 
 
 def clear_shm(shm_dir: Path) -> int:
@@ -94,23 +100,21 @@ def parser():
         help="Checkpoint directory; defaults to GLM-5.2-w4a8c8-0723",
     )
     cli.add_argument("--devices", default="0,1,2,3,4,5,6,7")
-    cli.add_argument("--benchmark-script", type=Path, default=DEFAULT_BENCHMARK_SCRIPT)
-    cli.add_argument("--port", type=int, default=8000)
-    cli.add_argument("--startup-timeout", type=float, default=1800)
-    cli.add_argument("--benchmark-timeout", type=float, default=7200)
+    cli.add_argument("--prompt-file", type=Path, help="Override the fixed 10k/80k example article")
     cli.add_argument("--cpu-cache-gb", type=float, default=24, help="Requires this much free /dev/shm and host RAM")
     selection = cli.add_mutually_exclusive_group()
     selection.add_argument(
         "--case",
-        choices=("all", "off", "on"),
-        default="all",
-        help="Default: LoCoMo OFF then ON, each with a fresh API server",
+        choices=("all", *CASES),
+        default="80k_on",
+        help="Default: 80k ON; all: 80k OFF then ON",
     )
-    selection.add_argument("--include-off", action="store_const", dest="case", const="all", help="Run OFF then ON")
+    selection.add_argument("--include-off", action="store_const", dest="case", const="all", help="Run 80k OFF then ON")
     cli.add_argument("--run-dir", type=Path, help="New, empty results directory")
     cli.add_argument(
         "--analyse-only", type=Path, help="Export an existing run's raw profiles without loading the model"
     )
+    cli.add_argument("--child", choices=CASES, help=argparse.SUPPRESS)
     return cli
 
 
@@ -182,6 +186,34 @@ def record_model_identity(model, root):
     return info
 
 
+def prepare_inputs(args, root, cases):
+    record_model_identity(args.model, root)
+    started = time.perf_counter()
+    print(f"{PREFIX} loading tokenizer: {args.model}", flush=True)
+    from transformers import AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
+    print(f"{PREFIX} tokenizer loaded in {time.perf_counter() - started:.3f}s", flush=True)
+    for name, target in (("10k", 10000), ("80k", 80000)):
+        if not any(case.startswith(name + "_") for case in cases):
+            continue
+        source = args.prompt_file or (DEFAULT_LONG_PROMPT_FILE if name == "80k" else DEFAULT_PROMPT_FILE)
+        article = source.read_text(encoding="utf-8")
+        if not article.strip():
+            raise ValueError(f"Empty article: {source}")
+        (root / f"{name}_article_source.txt").write_text(article, encoding="utf-8")
+        started = time.perf_counter()
+        print(f"{PREFIX} {name}: tokenizing fixed file {source}; chars={len(article)}", flush=True)
+        text, ids = build_prompt(tokenizer, article, target)
+        (root / f"{name}_input.txt").write_text(text, encoding="utf-8")
+        write_json(root / f"{name}_prompt.json", {"target_tokens": target, "length": len(ids), "token_ids": ids})
+        print(
+            f"{PREFIX} {name}: input ready in {time.perf_counter() - started:.3f}s; "
+            f"actual prompt_tokens={len(ids)}; saved text and token IDs",
+            flush=True,
+        )
+
+
 def case_environment(args, case):
     # Never inherit file-shim/debug hooks or another deployment's remote config.
     env = {k: v for k, v in os.environ.items() if not k.startswith(("VLLM_", "LMCACHE_", "MOONCAKE_"))}
@@ -202,7 +234,7 @@ def case_environment(args, case):
             "ASCEND_BUFFER_POOL": "4:8",
             "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
             "VLLM_LOG_STATS_INTERVAL": "1",
-            "VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE": str(case.rsplit("_", 1)[-1] == "on").lower(),
+            "VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE": str(case.endswith("_on")).lower(),
             "VLLM_ASCEND_DSA_UNBUNDLE": "1",
             "VLLM_ASCEND_DSA_TWO_GROUPS": "1",
             "VLLM_ASCEND_DSA_SHARED_POOL": "1",
@@ -235,7 +267,7 @@ def case_environment(args, case):
             "LMCACHE_ENABLE_SPARSE_ATTENTION": "true",
             "LMCACHE_DSA_TWO_GROUPS": "true",
             # The original local layerwise path does not support async stores.
-            "LMCACHE_STORE_ASYNC": str(case.rsplit("_", 1)[-1] == "on").lower(),
+            "LMCACHE_STORE_ASYNC": str(case.endswith("_on")).lower(),
             "LMCACHE_STORE_ASYNC_MAX_QUEUE_SIZE": "2",
             "LMCACHE_ENABLE_ASYNC_LOADING": "false",
             "LMCACHE_SAVE_DECODE_CACHE": "false",
@@ -334,6 +366,95 @@ def trace_request_submission(llm, case, case_dir):
             faulthandler.cancel_dump_traceback_later()
 
 
+def capture_request(llm, token_ids, params, case, case_dir=None):
+    plan = make_capture_plan(len(token_ids), COMPUTE_CHUNK_TOKENS) if case in LONG_CASES else None
+    if plan:
+        plan["startup_diagnostic_dir"] = str((case_dir / "startup-stacks").resolve())
+        write_json(case_dir / "capture_plan.json", plan)
+        print(f"{PREFIX} {case}: capture windows={plan['windows']}; middle chunks still compute", flush=True)
+    print(f"{PREFIX} {case}: profiler start begin", flush=True)
+    if plan:
+        llm.collective_rpc("install_chunk_profile", args=(case, plan))
+    else:
+        llm.start_profile(profile_prefix=case)
+    print(f"{PREFIX} {case}: profiler {'armed' if plan else 'started'}; generate begin", flush=True)
+    try:
+        start = time.perf_counter()
+        with trace_request_submission(llm, case, case_dir):
+            results = llm.generate({"prompt_token_ids": token_ids}, params, use_tqdm=False)
+        elapsed = time.perf_counter() - start
+        print(f"{PREFIX} {case}: generate complete in {elapsed:.3f}s (prefill/first token finished)", flush=True)
+        return results, elapsed
+    finally:
+        error_in_flight = sys.exc_info()[0] is not None
+        stopped = time.perf_counter()
+        print(f"{PREFIX} {case}: profiler stop begin", flush=True)
+        try:
+            if plan:
+                reports = llm.collective_rpc("finish_chunk_profile")
+                write_json(case_dir / "capture_windows.json", {"plan": plan, "workers": reports})
+                if not error_in_flight:
+                    validate_capture(plan, reports)
+            else:
+                llm.stop_profile()
+            print(f"{PREFIX} {case}: profiler stop complete in {time.perf_counter() - stopped:.3f}s", flush=True)
+        except Exception as exc:
+            if not error_in_flight:
+                raise
+            print(f"{PREFIX} profiler stop also failed: {exc}", file=sys.stderr, flush=True)
+
+
+def run_child(args):
+    # The normal launcher already removes every inherited LMCACHE_* setting.
+    # Also reject a file override when this internal entry point is used directly.
+    os.environ.pop("LMCACHE_CONFIG_FILE", None)
+    print(
+        f"{PREFIX} configuration: inline profile.py engine options + environment; "
+        "LMCACHE_CONFIG_FILE unset (LMCache's from-environment warning is expected); "
+        f"store_async={os.environ.get('LMCACHE_STORE_ASYNC')}, "
+        f"store_async_max_queue_size={os.environ.get('LMCACHE_STORE_ASYNC_MAX_QUEUE_SIZE')}",
+        flush=True,
+    )
+    from vllm import LLM, SamplingParams
+
+    case_dir = args.run_dir / args.child
+    prompt = json.loads((args.run_dir / f"{args.child.split('_')[0]}_prompt.json").read_text(encoding="utf-8"))
+    options = engine_options(args, case_dir, prompt["length"])
+    write_json(case_dir / "engine_options.json", options)
+    print(f"{PREFIX} {args.child}: loading full model; capture starts AFTER startup", flush=True)
+    llm = LLM(**options)
+    try:
+        print(f"{PREFIX} {args.child}: capturing {prompt['length']} input tokens -> first output token", flush=True)
+        results, elapsed = capture_request(
+            llm,
+            prompt["token_ids"],
+            SamplingParams(temperature=0, seed=1024, max_tokens=1),
+            args.child,
+            case_dir,
+        )
+        result = results[0]
+        completion = result.outputs[0]
+        report = {
+            "output_valid_for_correctness": True,
+            "case": args.child,
+            "prompt_tokens": prompt["length"],
+            "num_cached_tokens": result.num_cached_tokens,
+            "text": completion.text,
+            "token_ids": list(completion.token_ids),
+            "request_seconds_with_profiler": elapsed,
+            "scope": "local CPU KV offload/reload + P forward incl. MTP + first-token sampling; no remote store",
+        }
+        write_json(case_dir / "result.json", report)
+        # OFF/ON must both compute the whole prompt, never measure a cache hit.
+        if result.num_cached_tokens:
+            raise RuntimeError("Unexpected cache hit; this trace is not a fresh prefill")
+        print(f"{PREFIX} {args.child}: captured; request_seconds_with_profiler={elapsed:.3f}", flush=True)
+    finally:
+        print(f"{PREFIX} {args.child}: model shutdown begin", flush=True)
+        llm.llm_engine.engine_core.shutdown()
+        print(f"{PREFIX} {args.child}: model shutdown complete", flush=True)
+
+
 def analyse_case(case_dir):
     started = time.perf_counter()
     print(f"{PREFIX} exporting {case_dir.name} traces (model has exited)", flush=True)
@@ -370,115 +491,28 @@ def analyse_case(case_dir):
     )
 
 
-def api_request(port, path, *, method="GET", timeout=10):
-    # Local benchmark control must not go through a shell's HTTP proxy.
-    request = Request(f"http://127.0.0.1:{port}{path}", method=method)
-    with build_opener(ProxyHandler({})).open(request, timeout=timeout) as response:
-        return response.read()
-
-
-def check_port_available(port):
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        # Match the server: allow TIME_WAIT sockets from the previous OFF run,
-        # while an existing listener still prevents binding on Linux.
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        sock.bind(("127.0.0.1", port))
-
-
-def wait_for_server(proc, port, timeout):
-    deadline = time.monotonic() + timeout
-    next_notice = time.monotonic() + 30
-    while time.monotonic() < deadline:
-        if proc.poll() is not None:
-            raise RuntimeError(f"API server exited with code {proc.returncode}; see server.log")
-        try:
-            api_request(port, "/health", timeout=2)
-            return
-        except (URLError, TimeoutError, ConnectionError):
-            pass
-        if time.monotonic() >= next_notice:
-            print(f"{PREFIX} waiting for API startup on 127.0.0.1:{port}; see server.log", flush=True)
-            next_notice = time.monotonic() + 30
-        time.sleep(1)
-    raise TimeoutError(f"API server was not ready after {timeout:g}s; see server.log")
-
-
-def server_command(args, options):
-    command = [
-        sys.executable,
-        "-u",
-        "-m",
-        "vllm.entrypoints.openai.api_server",
-        "--host",
-        "127.0.0.1",
-        "--port",
-        str(args.port),
-    ]
-    for name, value in options.items():
-        if value is None:
-            continue
-        flag = "--" + name.replace("_", "-")
-        if isinstance(value, bool):
-            command.append(flag if value else "--no-" + name.replace("_", "-"))
-        else:
-            command.extend((flag, json.dumps(value) if isinstance(value, (dict, list)) else str(value)))
-    return command
-
-
-def benchmark_command(args):
-    return [
-        sys.executable,
-        str(args.benchmark_script.resolve()),
-        "--vllm_port",
-        str(args.port),
-        "--vllm_ip",
-        "127.0.0.1",
-    ]
-
-
-def run_benchmark(args, server, env, case_dir):
-    command = benchmark_command(args)
-    write_json(case_dir / "benchmark_command.json", command)
-    proc = start_logged_process(
-        command,
-        env,
-        case_dir / "benchmark.log",
-        "LoCoMo",
-        prefix=PREFIX,
-        cwd=str(args.benchmark_script.resolve().parent),
-    )
-    deadline = time.monotonic() + args.benchmark_timeout
-    try:
-        while proc.poll() is None:
-            if server.poll() is not None:
-                raise RuntimeError("API server exited during LoCoMo; see server.log")
-            if time.monotonic() >= deadline:
-                raise TimeoutError(f"LoCoMo exceeded {args.benchmark_timeout:g}s; see benchmark.log")
-            time.sleep(1)
-        if proc.returncode:
-            raise RuntimeError(f"LoCoMo exited with code {proc.returncode}; see benchmark.log")
-    finally:
-        finish_child(proc)
-
-
 def run_cases(args, root, cases):
     for index, case in enumerate(cases):
         if index:
             clear_shm(Path("/dev/shm"))
         case_dir = root / case
         case_dir.mkdir()
-        check_port_available(args.port)
-        # Retain the previous long-profile capacity, irrespective of LoCoMo's
-        # request lengths. The external benchmark controls prompts/generation.
-        options = engine_options(args, case_dir, LONG_MAX_MODEL_LEN)
-        options.pop("worker_extension_cls")  # No synthetic head/tail capture plan.
-        command = server_command(args, options)
-        write_json(case_dir / "engine_options.json", options)
-        write_json(case_dir / "server_command.json", command)
+        command = [
+            sys.executable,
+            "-u",
+            str(Path(__file__).resolve()),
+            "--child",
+            case,
+            "--run-dir",
+            str(root),
+            "--model",
+            args.model,
+            "--devices",
+            args.devices,
+            "--cpu-cache-gb",
+            str(args.cpu_cache_gb),
+        ]
         env = case_environment(args, case)
-        env["PYTHONUNBUFFERED"] = "1"
-        for name in ("NO_PROXY", "no_proxy"):
-            env[name] = ",".join(filter(None, (env.get(name), "127.0.0.1", "localhost")))
         reuse_log = case_dir / "reuse.log"
         reuse_log.touch()
         env["LMCACHE_PREFILL_REUSE_DEBUG_FILE"] = str(reuse_log.resolve())
@@ -502,57 +536,22 @@ def run_cases(args, root, cases):
             },
         )
         proc = start_logged_process(command, env, case_dir / "server.log", case, prefix=PREFIX)
-        report = {
-            "case": case,
-            "status": "starting",
-            "workload": "LoCoMo",
-            "scope": "local CPU cache; prefill and decode profiles; no PD transfer",
-        }
-        write_json(case_dir / "result.json", report)
-        profiling = False
-        failure = None
         try:
-            wait_for_server(proc, args.port, args.startup_timeout)
-            print(f"{PREFIX} {case}: server ready; profiler start", flush=True)
-            api_request(args.port, "/start_profile", method="POST", timeout=300)
-            profiling = True
-            started = time.monotonic()
-            print(f"{PREFIX} {case}: running LoCoMo; stdout/stderr -> benchmark.log", flush=True)
-            run_benchmark(args, proc, env, case_dir)
-            report.update(status="benchmark_complete", benchmark_seconds_with_profiler=time.monotonic() - started)
-        except BaseException as error:
-            failure = error
-            report.update(status="failed", error=f"{type(error).__name__}: {error}")
+            if proc.wait():
+                raise RuntimeError(f"{case} failed; see {case_dir / 'server.log'}; remaining cases not run")
         finally:
-            try:
-                if profiling and proc.poll() is None:
-                    print(f"{PREFIX} {case}: profiler stop/export raw data", flush=True)
-                    api_request(args.port, "/stop_profile", method="POST", timeout=1800)
-            except Exception as error:
-                report["profile_stop_error"] = str(error)
-                report["status"] = "failed"
-                if failure is None:
-                    failure = error
-            finally:
-                write_json(case_dir / "result.json", report)
-                finish_child(proc)
-        if failure is not None:
-            raise failure
-        try:
-            analyse_case(case_dir)
-            report["status"] = "complete"
-        except Exception as error:
-            report.update(status="failed", profile_export_error=str(error))
-            raise
-        finally:
-            write_json(case_dir / "result.json", report)
+            finish_child(proc)
+        analyse_case(case_dir)
 
 
 def main(argv=None):
     cli = parser()
     args = cli.parse_args(argv)
+    if args.child:
+        run_child(args)
+        return
     if args.analyse_only:
-        for case in ("off", "on", *LEGACY_CASES):
+        for case in CASES:
             case_dir = args.analyse_only.resolve() / case
             if (case_dir / "engine_options.json").is_file():
                 analyse_case(case_dir)
@@ -562,11 +561,8 @@ def main(argv=None):
     devices = args.devices.split(",")
     if not all(d.isdigit() for d in devices) or len(devices) != len(set(devices)) or args.cpu_cache_gb <= 0:
         cli.error("Specify distinct NPU device IDs and a positive CPU cache size")
-    if not 0 < args.port < 65536 or args.startup_timeout <= 0 or args.benchmark_timeout <= 0:
-        cli.error("Specify a valid port and positive timeouts")
-    if not args.benchmark_script.is_file():
-        cli.error(f"LoCoMo script does not exist: {args.benchmark_script}")
-    check_port_available(args.port)
+    clear_shm(Path("/dev/shm"))
+    check_shm_capacity(Path("/dev/shm"), args.cpu_cache_gb)
     root = (
         args.run_dir.resolve()
         if args.run_dir
@@ -575,14 +571,11 @@ def main(argv=None):
     root.mkdir(parents=True, exist_ok=True)
     if any(root.iterdir()):
         cli.error("--run-dir must be empty (nothing was deleted)")
-    clear_shm(Path("/dev/shm"))
-    check_shm_capacity(Path("/dev/shm"), args.cpu_cache_gb)
-    cases = ("off", "on") if args.case == "all" else (args.case,)
+    cases = LONG_CASES if args.case == "all" else (args.case,)
     print(f"{PREFIX} model: {args.model}", flush=True)
     print(f"{PREFIX} results: {root}; full model, TP={len(devices)}, gpu=0.97, eager P only, MTP1", flush=True)
     print(f"{PREFIX} local CPU cache={args.cpu_cache_gb} GiB; no Mooncake/file shim/KV dumps", flush=True)
-    print(f"{PREFIX} LoCoMo: {' '.join(benchmark_command(args))}", flush=True)
-    record_model_identity(args.model, root)
+    prepare_inputs(args, root, cases)
     run_cases(args, root, cases)
     print(f"{PREFIX} done: {root}", flush=True)
 

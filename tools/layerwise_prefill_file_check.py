@@ -43,6 +43,7 @@ from layerwise_prefill_profile import (
 )
 
 PREFIX = "[PREFILL_FILE]"
+LOCOMO_SCRIPT = Path("/workspace/dataset/benchmark-new/locomo/test_advanced.py")
 STAGES = ("baseline", "prefill", "decode")
 SEED = 1024
 SCHEMA_VERSION = 1
@@ -79,6 +80,7 @@ def parser():
         "--model", default=DEFAULT_MODEL, action=ExplicitOption, help=f"Actual checkpoint; default: {DEFAULT_MODEL}"
     )
     cli.add_argument("--devices", default="0,1,2,3,4,5,6,7", action=ExplicitOption)
+    cli.add_argument("--locomo", action="store_true", help="Use the single request from LoCoMo on localhost:8000")
     prompt = cli.add_mutually_exclusive_group()
     prompt.add_argument("--prompt", help="Literal prompt, e.g. the failing /v1/completions request")
     prompt.add_argument("--prompt-file", type=Path, help="Read a literal prompt from this file")
@@ -132,6 +134,8 @@ def parser():
 
 
 def validate_args(args):
+    if args.locomo and (args.prompt is not None or args.prompt_file or args.prompt_tokens):
+        raise ValueError("--locomo supplies the request; do not combine it with custom prompt arguments")
     devices = args.devices.split(",")
     if not devices or len(devices) != len(set(devices)) or any(not x.isdecimal() for x in devices):
         raise ValueError("--devices must contain distinct numeric device IDs")
@@ -431,6 +435,36 @@ def run_child(args):
 
 
 def child_command(args, root, stage):
+    if args.locomo:
+        options = engine_options(args, stage, args.max_model_len)
+        write_json(root / stage / "engine_options.json", options)
+        command = [
+            sys.executable,
+            "-u",
+            str(Path(__file__).with_name("layerwise_prefill_file_request.py")),
+            "--capture-root",
+            str(root),
+            "--capture-stage",
+            stage,
+            "--capture-output-tokens",
+            str(1 if stage == "prefill" else args.output_tokens),
+            "--capture-rpc-timeout",
+            str(args.rpc_timeout_seconds),
+            "--host",
+            "127.0.0.1",
+            "--port",
+            "8000",
+        ]
+        for key, value in options.items():
+            # This legacy CLI flag uses store_true, not BooleanOptionalAction.
+            if value is None or (key == "disable_log_stats" and value is False):
+                continue
+            flag = "--" + key.replace("_", "-")
+            if isinstance(value, bool):
+                command.append(flag if value else "--no-" + key.replace("_", "-"))
+            else:
+                command.extend([flag, json.dumps(value) if isinstance(value, (dict, list)) else str(value)])
+        return command
     command = [sys.executable, "-u", str(Path(__file__).resolve()), "--child", stage, "--run-dir", str(root)]
     for key in (*RUN_OPTIONS, "rpc_timeout_seconds", "stage_timeout_seconds"):
         command.extend(["--" + key.replace("_", "-"), str(getattr(args, key))])
@@ -446,16 +480,40 @@ def run_stages(args, root):
         check_shm_capacity(Path("/dev/shm"), args.cpu_cache_gb)
         env = child_environment(args, root, stage)
         write_json(stage_dir / "environment.json", recorded_environment(env))
+        if args.locomo:
+            from layerwise_prefill_file_request import check_port
+
+            check_port()
         proc = start_logged_process(
             child_command(args, root, stage), env, stage_dir / "server.log", stage, prefix=PREFIX
         )
         try:
-            try:
-                code = proc.wait(timeout=args.stage_timeout_seconds)
-            except subprocess.TimeoutExpired as exc:
-                raise RuntimeError(f"{stage} exceeded --stage-timeout-seconds; see {stage_dir / 'server.log'}") from exc
-            if code:
-                raise RuntimeError(f"{stage} exited with code {code}; see {stage_dir / 'server.log'}")
+            if args.locomo:
+                from layerwise_prefill_file_request import wait_for_server
+
+                wait_for_server(proc, args.rpc_timeout_seconds)
+                command = [sys.executable, str(LOCOMO_SCRIPT), "--vllm_port", "8000", "--vllm_ip", "127.0.0.1"]
+                write_json(stage_dir / "request_command.json", command)
+                print(f"{PREFIX} {stage}: python {LOCOMO_SCRIPT} --vllm_port 8000 --vllm_ip 127.0.0.1", flush=True)
+                request_env = dict(os.environ)
+                for key in ("NO_PROXY", "no_proxy"):
+                    request_env[key] = ",".join(filter(None, (request_env.get(key), "127.0.0.1", "localhost")))
+                subprocess.run(
+                    command,
+                    check=True,
+                    cwd=str(LOCOMO_SCRIPT.parent),
+                    env=request_env,
+                    timeout=args.stage_timeout_seconds,
+                )
+            else:
+                try:
+                    code = proc.wait(timeout=args.stage_timeout_seconds)
+                except subprocess.TimeoutExpired as exc:
+                    raise RuntimeError(
+                        f"{stage} exceeded --stage-timeout-seconds; see {stage_dir / 'server.log'}"
+                    ) from exc
+                if code:
+                    raise RuntimeError(f"{stage} exited with code {code}; see {stage_dir / 'server.log'}")
         finally:
             finish_child(proc)
         # The child and its engine/TP process group have stopped BEFORE sealing
@@ -510,6 +568,8 @@ def main(argv=None):
         raise ValueError("--run-dir must be new or empty")
     root.mkdir(parents=True, exist_ok=True)
     try:
+        if args.locomo and not LOCOMO_SCRIPT.is_file():
+            raise ValueError(f"LoCoMo script not found: {LOCOMO_SCRIPT}")
         # Run once in the Linux parent, never on worker imports or between P/D.
         print(f"{PREFIX} startup: rm -rf /dev/shm/*", flush=True)
         subprocess.run(["/bin/sh", "-c", "rm -rf /dev/shm/*"], check=True)
@@ -518,7 +578,7 @@ def main(argv=None):
         else:
             validate_args(args)
             record_model_identity(args.model, root)
-            length = prepare_prompt(args, root)
+            length = "LoCoMo" if args.locomo else prepare_prompt(args, root)
         validate_args(args)
         write_json(
             root / "run_config.json",

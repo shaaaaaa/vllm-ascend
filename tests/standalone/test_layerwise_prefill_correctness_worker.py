@@ -75,54 +75,6 @@ def test_archive_counts_nonfinite_without_rejecting_valid_negative_infinity(work
     assert archive.errors == []
 
 
-def test_feature_capture_keeps_every_token_and_compares_last_token(worker, tmp_path):
-    values = torch.ones(8192, 2, 16)
-    kwargs = dict(step=0, layer=0, kind="kv_loaded", name="nope", span=(8192, 8195), positions=(0, 8192))
-    off = worker.TensorArchive(tmp_path / "off", 0, max_features=8)
-    off.record(values, **kwargs)
-    off.close()
-    record = next(iter(off.records.values()))
-    saved = torch.load(off.root / record["path"], weights_only=True)
-    assert saved.shape == (8192, 2, 8) and record["source_shape"] == [8192, 2, 16]
-    assert record["feature_capture"] == dict(axis=2, start=0, end=8)
-    values[-1, 0, 7] = 2
-    values[:, :, 8:] = 999  # Explicitly outside the archived feature width.
-    on = worker.TensorArchive(tmp_path / "on", 0, max_features=8)
-    on.record(values, **kwargs)
-    on.close()
-    comparison = next(iter(on.records.values()))["comparison"]
-    assert comparison["mismatched"] == 1 and comparison["abs_diff"]["max"] == 1
-
-
-@pytest.mark.parametrize(
-    "kind,name,dtype,width",
-    [
-        ("attention", "topk", torch.int32, 16),
-        ("mtp_output", "logits", torch.float32, 16),
-        ("kv_indexer", "key", torch.int8, 8),
-    ],
-)
-def test_feature_capture_preserves_routing_and_logits(worker, tmp_path, kind, name, dtype, width):
-    archive = worker.TensorArchive(tmp_path / "off", 0, max_features=8)
-    archive.record(torch.ones(3, 16, dtype=dtype), step=0, layer=0, kind=kind, name=name, span=(0, 3))
-    archive.close()
-    assert next(iter(archive.records.values()))["shape"] == [3, width]
-
-
-def test_feature_capture_does_not_hide_changed_original_shape(worker, tmp_path):
-    kwargs = dict(step=0, layer=0, kind="decoder", name="input", span=(0, 3))
-    off = worker.TensorArchive(tmp_path / "off", 0, max_features=8)
-    off.record(torch.ones(3, 16), **kwargs)
-    off.close()
-    on = worker.TensorArchive(tmp_path / "on", 0, max_features=8)
-    on.record(torch.ones(3, 20), **kwargs)
-    on.close()
-    assert next(iter(on.records.values()))["comparison"] == {
-        "comparable": False,
-        "reason": "OFF original tensor shape differs",
-    }
-
-
 def test_on_worker_reads_external_off_during_inference_and_keeps_archive_unchanged(worker, tmp_path):
     old = tmp_path / "old"
     identity = dict(step=0, layer=0, kind="decoder", name="input", span=(0, 2))
@@ -410,29 +362,7 @@ def _runtime(
             )
             draft_model.compute_logits(result[selected])
 
-    probe.test_drafter = drafter
     return probe, run, operations, SFAImpl
-
-
-def test_later_decode_mtp_logits_do_not_reuse_prefill_tensor_identity(worker, tmp_path, monkeypatch):
-    probe, run, _, _ = _runtime(worker, monkeypatch, tmp_path / "off", mtp=True)
-    run(0, 4)
-    run(4, 8)
-    before = len(probe.archive.records)
-    drafter = probe.test_drafter
-    runtime = dict(num_input_tokens=2, batch_size=1, token_indices_to_sample=torch.tensor([1]))
-    # The fake draft forward is not needed to validate decode bypass of the
-    # draft-input and LM-head probes; retain the real wrapped draft entry.
-    monkeypatch.setattr(drafter.model, "forward", lambda **kwargs: kwargs["hidden_states"])
-    result = drafter._run_mtp_draft_layer_with_diagnostics(
-        dict(hidden_states=torch.ones(2, 2)),
-        runtime_inputs=runtime,
-        per_layer_attn_metadata={"mtp": NS(seq_lens_cpu=[10], query_start_loc_cpu=[0, 2], num_actual_tokens=2)},
-        draft_step=0,
-    )
-    drafter.model.compute_logits(result[-1:])
-    assert len(probe.archive.records) == before
-    assert probe.finish(NS())["complete"]
 
 
 def test_real_consumer_hooks_cover_shared_indexer_and_bank_changes(worker, tmp_path, monkeypatch):

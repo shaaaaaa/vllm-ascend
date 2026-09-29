@@ -7,6 +7,26 @@
 
 ## 运行
 
+用 LoCoMo 的单条请求运行原来的 OFF → ON-P → ON-D 校验：
+
+```bash
+set -o pipefail
+python3 tools/layerwise_prefill_file_check.py --locomo \
+  --max-model-len 84096 --output-tokens 16 2>&1 | tee log.log
+```
+
+每阶段服务在 `127.0.0.1:8000` 就绪后，Python 用 `subprocess.run` 执行：
+
+```bash
+python /workspace/dataset/benchmark-new/locomo/test_advanced.py --vllm_port 8000 --vllm_ip 127.0.0.1
+```
+
+不修改或导入 LoCoMo 的逻辑。它只提供请求，原测试的确定性采样参数保留，
+OFF/D 使用 `--output-tokens`，P 只生成 1 个 token。原来的 KV 文件存取、
+张量探针、P 退出后启动 D、离线数值比较保持不变。三个阶段实际收到的 prompt
+token IDs 必须一致；`--off-dir` 仍跳过 OFF，P/D 会核对 LoCoMo 与旧 OFF 的输入。
+省略 `--locomo` 时保留原来的固定 prompt 入口。
+
 在安装当前四仓 `prefill_layerwise_cache` 分支的 Linux Ascend 环境运行。
 下面显式指定之前四机服务使用的 GLM-5.3，避免误用其他 checkpoint：
 

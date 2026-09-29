@@ -15,30 +15,21 @@ result and are not expected to run their own lightning indexer.
 
 ## What runs
 
-The launcher starts a fresh API server for OFF, runs the following one-request
-LoCoMo command, stops that server, then repeats for ON:
+The launcher runs the complete model twice in separate processes: OFF first,
+then ON, unless `--off-dir` selects a saved baseline. Both receive exactly the
+same saved prompt token IDs. The default
+10,000-token target crosses multiple 4,096-token prefill chunks, including a
+partial final chunk. It uses TP8, DP1, FlashComm1, eager execution and MTP1, with
+the established profile memory settings. All configuration is in the Python
+launcher; no external LMCache configuration file is loaded.
 
-```bash
-python /workspace/dataset/benchmark-new/locomo/test_advanced.py --vllm_port 8000 --vllm_ip 127.0.0.1
-```
-
-LoCoMo controls the actual prompt and generation parameters. ON must supply
-exactly the same tokenized prompt as OFF. The tool uses TP8, DP1, FlashComm1,
-eager execution, synchronous scheduling and MTP1, with 4,096-token compute chunks
-and the established long-profile memory settings. All configuration is in the
-Python launcher; no external LMCache configuration file is loaded.
-Use `--benchmark-script` or `--port` to override the command's script or port.
-
-OFF saves tensors to files. ON loads the matching OFF tensor at each
+OFF saves complete tensors to files. ON loads the matching OFF tensor at each
 probe during inference, calculates numerical statistics, then releases the CPU
-buffers. By default, every token position is kept and floating-point feature
-axes (and quantized KV) are limited to their first 8 components on the last axis.
-Discrete indices, top-k and logits remain complete. `--max-features 0` restores
-full features; `--save-on-tensors` also archives ON tensors at the selected width.
-Original shapes and feature slices are recorded in each tensor's metadata.
-There are no tensor fingerprints, stage switches or shortened model layers.
+buffers. `--save-on-tensors` also archives complete ON tensors. There are no
+tensor fingerprints, sampled-value comparisons, stage switches, or shortened
+model layers.
 
-Files retain all token rows, including TP padding, at the selected feature width. Numerical
+Files retain the full intermediate tensors, including TP padding. Numerical
 statistics use only valid token rows, determined from the actual TP context;
 unused padding cannot dominate the error report. KV is saved in logical token
 order, so different physical bank addresses do not count as value differences.
@@ -46,16 +37,15 @@ order, so different physical bank addresses do not count as value differences.
 The probes cover every TP rank and main/MTP prefill layer: decoder inputs and
 outputs, attention intermediates, logical KV in token order at its consumption
 point, indexer inputs and top-k indices. Producer and shared-indexer layers are
-checked against the actual model configuration. The complete generated output
-token sequence is also compared. MTP captures its shifted input IDs, raw model positions,
+checked against the actual model configuration. The generated first output
+token is also compared. MTP captures its shifted input IDs, raw model positions,
 logical positions before FlashComm, incoming hidden states, per-layer attention
 and KV, output hidden states, logits and greedy draft IDs for every chunk.
 Later decode intermediate tensors and remote Mooncake transport are outside
 this test's scope. Use the file-PD or four-machine recorder for those stages.
 With MTP1, a final chunk containing only one or two tokens uses decode KV
-remapping. These remain unsupported by this prefill probe and are rejected
-before submitting the request to the model. Prompts must exceed one compute
-chunk. Other partial chunks, including TP padding, are covered.
+remapping. Such prompts are rejected before model loading; choose a different
+`--prompt-tokens` target. Other partial chunks, including TP padding, are covered.
 
 Both cases use the real local shared CPU allocator with merged layer pages.
 Because the production layout predicates normally require a Mooncake URL, an
@@ -85,15 +75,11 @@ An older OFF archive that excluded MTP cannot validate the new MTP observations:
 record a new OFF once. Existing files are preserved and remain available for
 analysis with `--compare-only`; reports state whether `mtp_covered` is true.
 
-For a LoCoMo OFF archive, only ON starts a server and invokes LoCoMo; its actual
-tokenized prompt is checked against the saved OFF IDs. Unspecified model, device
-list, CPU cache capacity and feature width inherit the OFF settings. Explicit
-overrides are checked for compatibility.
-
-Old generated-prompt OFF archives remain reusable through their original entry,
-including their full feature width. Explicit `--prompt-tokens` or `--prompt-file`
-still selects that legacy workload for a new run. `--prompt-file` cannot be
-combined with `--off-dir`.
+The tool reuses the exact saved prompt token IDs without tokenizing again.
+Unspecified model, device list, CPU cache capacity and prompt target inherit
+the OFF settings; an 80k baseline therefore does not need `--prompt-tokens`
+again. Explicit overrides are checked for compatibility. `--prompt-file` cannot
+be combined with `--off-dir`, and a different prompt target requires a new OFF.
 
 Before model loading, it checks the checkpoint configuration, engine options,
 runtime environment, completed OFF result, rank/layer coverage and tensor file
@@ -162,9 +148,7 @@ deadline changes, including archives recorded before this option existed.
 ## Results
 
 The launcher prints its result directory. It contains OFF tensor archives,
-per-case `server.log`, `benchmark.log` and coverage records, and the numerical
-comparison report. `--startup-timeout` defaults to 1800 seconds;
-`--benchmark-timeout` defaults to 7200 seconds per LoCoMo invocation.
+per-case logs and coverage records, and the numerical comparison report.
 Per-tensor statistics describe each run's value distribution and differences:
 mean, standard deviation, range, RMS, absolute errors, RMSE, relative L2 error,
 and error relative to the OFF standard deviation. Nonfinite values and integer

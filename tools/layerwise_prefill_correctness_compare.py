@@ -662,10 +662,6 @@ def compare_runs(root: str | Path) -> dict[str, Any]:
         on_result = {}
     if off_result.get("prompt_token_ids") != on_result.get("prompt_token_ids"):
         differences.append({"type": "structure", "detail": "OFF/ON prompt token IDs differ"})
-    if off_result.get("max_features", 0) != on_result.get("max_features", 0):
-        differences.append({"type": "structure", "detail": "OFF/ON feature capture widths differ"})
-    if off_result.get("sampling_params") != on_result.get("sampling_params"):
-        differences.append({"type": "structure", "detail": "OFF/ON sampling parameters differ"})
     for field in (
         "steps",
         "decoder_layers",
@@ -711,11 +707,8 @@ def compare_runs(root: str | Path) -> dict[str, Any]:
             "comparison_slice",
             "comparison_shape",
             "comparison_numel",
-            "feature_capture",
         )
         changed = [field for field in fields if left.get(field) != right.get(field)]
-        if left.get("source_shape", left["shape"]) != right.get("source_shape", right["shape"]):
-            changed.append("source_shape")
         comparison = right["comparison"]
         if comparison["baseline"].get("nonfinite") != _comparison_metadata(left)[2]:
             changed.append("baseline.nonfinite")
@@ -798,9 +791,8 @@ def compare_runs(root: str | Path) -> dict[str, Any]:
         "interpretation": (
             "passed checks coverage, comparability, new nonfinite values and output tokens; "
             "it is not a float-error tolerance verdict. Valid rows exclude declared TP padding; "
-            "Archives retain all token rows at the selected feature width; routing indices and logits remain full."
+            "OFF archives remain full."
         ),
-        "max_features": off_result.get("max_features", 0),
     }
     root.mkdir(parents=True, exist_ok=True)
     (root / "report.json").write_text(json.dumps(report, indent=2, allow_nan=False) + "\n", encoding="utf-8")
