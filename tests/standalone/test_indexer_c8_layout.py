@@ -287,3 +287,54 @@ def test_prefill_rebind_owns_physical_metadata_for_each_bank(api):
     common.indexer_block_table_tensor = None
     cleared = ns[method.name](builder, template, common)
     assert cleared.indexer_c8_block_table is cleared.indexer_c8_slot_mapping is None
+
+
+@pytest.mark.parametrize("prefill", [False, True])
+@pytest.mark.parametrize("connector", [False, True])
+def test_bf16_prefill_spec_charges_retained_alignment(api, monkeypatch, prefill, connector):
+    from types import ModuleType
+    from unittest.mock import Mock
+
+    path = ROOT / "vllm_ascend/worker/model_runner_v1.py"
+    cls = next(n for n in ast.parse(path.read_text(encoding="utf-8")).body
+               if isinstance(n, ast.ClassDef) and n.name == "NPUModelRunner")
+    methods = [n for n in cls.body if getattr(n, "name", None) in {
+        "get_kv_cache_spec", "_allocate_kv_cache_tensors", "_align_memory"}]
+    module = ast.parse("from __future__ import annotations")
+    module.body.append(ast.ClassDef(name="Runner", bases=[], keywords=[], body=methods, decorator_list=[]))
+    spec_type = api["AscendMLAAttentionSpec"]
+    mla_type = type("MLAAttention", (), {})
+    layers = {"model.layers.0.self_attn.attn": mla_type(),
+              "model.layers.0.self_attn.indexer.k_cache": type("DeepseekV32IndexerCache", (), {})()}
+    interface = ModuleType("vllm.v1.kv_cache_interface")
+    interface.MLAAttentionSpec = spec_type
+    monkeypatch.setitem(sys.modules, interface.__name__, interface)
+    ns = dict(api, has_ec_transfer=lambda: False, get_layers_from_vllm_config=lambda *_: layers,
+              AttentionLayerBase=object, Attention=type("UnusedAttention", (), {}),
+              MLAAttention=mla_type, MLAAttentionSpec=spec_type, AttentionSpec=spec_type,
+              MambaBase=type("UnusedMamba", (), {}), MambaSpec=type("UnusedMambaSpec", (), {}),
+              logger=Mock())
+    exec(compile(ast.fix_missing_locations(module), str(path), "exec"), ns)
+    runner = ns["Runner"]()
+    runner.layerwise_prefill_p_node = prefill
+    runner.use_sparse = runner.dsa_unbundle = runner.dsa_shared_pool = True
+    runner.use_sparse_c8_indexer = runner.dsa_free_paged = False
+    runner.block_size, runner.sparse_head_dim = 128, (512, 64, 128)
+    runner.kv_cache_dtype, runner.device = torch.bfloat16, torch.device("cpu")
+    runner.vllm_config = NS(cache_config=NS(cache_dtype="auto"),
+                            kv_transfer_config=object() if connector else None)
+    runner.model_config = NS(hf_text_config=NS(num_hidden_layers=1))
+    runner.runner_only_attn_layers = set()
+    specs = runner.get_kv_cache_spec()
+    index = specs["model.layers.0.self_attn.indexer.k_cache"]
+    if not prefill:
+        assert index.shared_pool_alignment_bytes == 0  # Keep ordinary/D policy unchanged.
+        return
+    config = NS(kv_cache_tensors=[NS(size=2 * 589824, shared_by=list(specs))],
+                kv_cache_groups=[NS(layer_names=list(specs))])
+    runner._get_layer_kv_cache_specs = lambda _: specs
+    raw = runner._allocate_kv_cache_tensors(config)
+    storage = next(iter(raw.values()))[0].untyped_storage()
+    retained_overhead = storage.nbytes() - config.kv_cache_tensors[0].size
+    assert retained_overhead == 2 * 1024**2
+    assert index.shared_pool_alignment_bytes == retained_overhead

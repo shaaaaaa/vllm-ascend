@@ -7303,6 +7303,11 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                 if isinstance(spec, MLAAttentionSpec) and "indexer" in name
             ]
             if indexer_names:
+                if self.layerwise_prefill_p_node and self.dsa_shared_pool:
+                    # Every P slab retains one aligned backing, including BF16.
+                    # Charge it before core sizing chooses the parent capacity.
+                    for name in indexer_names:
+                        object.__setattr__(kv_cache_spec[name], "shared_pool_alignment_bytes", 2 * 1024 * 1024)
                 if self.use_sparse_c8_indexer:
                     mask = self.ascend_config.indexer_c8_layer_mask(indexer_names)
                     if not any(mask):
@@ -7320,7 +7325,8 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                             )
                             object.__setattr__(kv_cache_spec[name], "shared_pool_alignment_bytes",
                                                2 * 1024 * 1024 if self.dsa_shared_pool
-                                               and self.vllm_config.kv_transfer_config is not None else 0)
+                                               and (self.layerwise_prefill_p_node
+                                                    or self.vllm_config.kv_transfer_config is not None) else 0)
                     self.ascend_config.indexer_c8_shared_block_factor = (
                         2 if self._mixed_indexer_c8_names is not None and self.dsa_shared_pool else 1
                     )
