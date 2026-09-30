@@ -547,6 +547,49 @@ def test_ordinary_native_decode_still_skips_connector_inspection(native_api):
     assert not decision.frontiers and not decision.cold_compact_resumes
 
 
+@pytest.mark.parametrize("mixed_prefill", [False, True])
+def test_resident_cold_prefix_keeps_computed_proof_separate_from_remap(native_api, mixed_prefill):
+    widths = [2, 7] if mixed_prefill else [2, 2]
+    computed = [279, 0] if mixed_prefill else [279, 7165]
+    prompts = [280, 7] if mixed_prefill else [280, 7166]
+    runner, metadata, kwargs = native_case(
+        native_api, widths, computed, prompts, prompts,
+        np.array([1, 0] if mixed_prefill else [1, 1]),
+        {0} if mixed_prefill else {0, 1},
+    )
+    request = kwargs["kv_connector_metadata"].requests[0]
+    request.dsa_nonresident_frontier = 0
+    request.load_spec.dsa_remap_frontier = 0
+    request.load_spec.dsa_committed_end = 280
+    request.load_spec.dsa_cold_resident_load = True
+    request.load_spec.dsa_cold_resume_computed_end = 279
+    decision = native_api["_staged_sfa_local_route"](runner, **kwargs)
+    assert decision.action.value == ("safe_native" if mixed_prefill else "staged")
+    assert decision.frontiers[0] == 0
+    assert decision.cold_compact_resumes.computed_ends[0] == 279
+    metadata.cold_compact_resumes = decision.cold_compact_resumes
+    result = builder.__wrapped__(native_api).build(0, metadata)
+    expected = [0, 0] + ([-1] * 7 if mixed_prefill else [1, 1])
+    assert result.decode_req_indices.tolist() == expected
+    boundary = native_api["_update_dsa_split_boundary_in_place"](result, list(decision.frontiers), 0)
+    assert boundary[:2].tolist() == [0, 0]
+
+
+@pytest.mark.parametrize("invalid", ["remap", "computed", "beyond_cache", "missing", "not_loadable"])
+def test_resident_cold_graph_rejects_invalid_readiness_metadata(native_api, invalid):
+    runner, _, kwargs = native_case(native_api, [2], [279], [280], [280], np.array([1]), {0})
+    request = kwargs["kv_connector_metadata"].requests[0]
+    request.dsa_nonresident_frontier = 0
+    spec = request.load_spec
+    spec.dsa_remap_frontier = 1 if invalid == "remap" else 0
+    spec.dsa_cold_resident_load = True
+    spec.can_load = invalid != "not_loadable"
+    if invalid != "missing":
+        spec.dsa_cold_resume_computed_end = {"computed": 278, "beyond_cache": 281}.get(invalid, 279)
+    decision = native_api["_staged_sfa_local_route"](runner, **kwargs)
+    assert decision.action.value != "staged"
+
+
 def test_native_markers_follow_completed_load_handoff(native_api):
     root = Path(__file__).resolve().parents[3]
     adapter_path = Path("lmcache/integration/vllm/vllm_v1_adapter.py")

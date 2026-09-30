@@ -4942,6 +4942,7 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                 return native(StagedSFARouteReason.NOT_DECODE)
         if is_decode_state:
             if any(cold_resumes):
+                cold_computed_ends = getattr(cold_resumes, "computed_ends", frontiers)
                 computed = (
                     np.asarray(num_computed_tokens).reshape(-1)
                     if num_computed_tokens is not None
@@ -4974,7 +4975,7 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                             marker_failures.append(
                                 f"computed_history_minus_one[{i}]"
                             )
-                        if frontiers[i] != int(computed[i]):
+                        if cold_computed_ends[i] != int(computed[i]):
                             marker_failures.append(
                                 f"frontier_computed[{i}]"
                             )
@@ -4997,7 +4998,7 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                     return native(
                         StagedSFARouteReason.COLD_COMPACT_LAYOUT
                     )
-                cold_resumes = ColdResumeMarkers(cold_resumes, frontiers)
+                cold_resumes = ColdResumeMarkers(cold_resumes, cold_computed_ends)
         if getattr(self, "calculate_kv_scales", False):
             return native(StagedSFARouteReason.RUNTIME_MODE)
         if getattr(self.vllm_config, "lora_config", None) is not None:

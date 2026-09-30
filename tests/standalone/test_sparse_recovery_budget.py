@@ -105,6 +105,9 @@ def scheduler(running=(), waiting=(), width=2, budget=32):
         encoder_cache_manager=NS(get_freed_mm_hashes=lambda: []), finished_req_ids=set(),
         _make_cached_request_data=lambda *args: NS(),
         _is_blocked_waiting_status=lambda _: False,
+        # This fixture's allocator has unlimited capacity; capacity rejection
+        # is exercised separately by the actual admission-guard tests.
+        _reject_impossible_initial_dsa_request=lambda *args, **kwargs: False,
     )
     obj._select_waiting_queue_for_scheduling = lambda: obj.waiting
 

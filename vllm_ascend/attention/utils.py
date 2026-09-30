@@ -519,6 +519,7 @@ def staged_sfa_metadata_sparse_route(
     sparse_request_ids: set[str] = set()
     frontiers: list[int] = []
     cold_resumes: list[bool] = []
+    resident_computed_ends: dict[int, int] | None = None
     for req_id in active_request_ids:
         request = main_by_req[req_id]
         try:
@@ -567,11 +568,27 @@ def staged_sfa_metadata_sparse_route(
         elif current_released > 0 or nonresident > 0:
             return StagedSFARouteReason.SPARSE_LOAD_UNAVAILABLE, (), ()
         frontiers.append(remap_frontier if can_load else 0)
-        cold_resumes.append(
-            bool(getattr(load_spec, "dsa_cold_compact_resume", False))
-        )
+        cold_resume = bool(getattr(load_spec, "dsa_cold_compact_resume", False))
+        if cold_resume and getattr(load_spec, "dsa_cold_resident_load", False):
+            try:
+                computed_end = int(load_spec.dsa_cold_resume_computed_end)
+                resident_remap = int(load_spec.dsa_remap_frontier)
+            except (AttributeError, TypeError, ValueError, OverflowError):
+                return StagedSFARouteReason.INVALID_FRONTIER, (), ()
+            if not can_load or resident_remap != 0 or nonresident != 0 or not 0 < computed_end <= committed:
+                return StagedSFARouteReason.INVALID_FRONTIER, (), ()
+            if resident_computed_ends is None:
+                resident_computed_ends = {}
+            resident_computed_ends[len(cold_resumes)] = computed_end
+        cold_resumes.append(cold_resume)
 
     cold_resume_tuple = tuple(cold_resumes) if any(cold_resumes) else ()
+    if resident_computed_ends is not None:
+        computed_ends = tuple(
+            resident_computed_ends.get(i, frontier)
+            for i, frontier in enumerate(frontiers)
+        )
+        cold_resume_tuple = ColdResumeMarkers(cold_resume_tuple, computed_ends)
     if dense_request_ids and sparse_request_ids:
         return (
             StagedSFARouteReason.MIXED_CONNECTOR_LOAD,
@@ -605,7 +622,7 @@ def native_sfa_cold_resume_layout(
         return (), ()
     # Other prefill rows can legitimately have no connector load/save entry.
     # Validate cold sources with the same resolver used by the graph route.
-    reason, cold_frontiers, _ = staged_sfa_metadata_sparse_route(metadata, ordered_cold_ids)
+    reason, cold_frontiers, cold_markers = staged_sfa_metadata_sparse_route(metadata, ordered_cold_ids)
     if reason != StagedSFARouteReason.ELIGIBLE:
         raise RuntimeError(f"Invalid native cold-resume metadata: {reason.value}")
     if num_computed_tokens is None or len(num_computed_tokens) != len(active_ids):
@@ -613,9 +630,13 @@ def native_sfa_cold_resume_layout(
     by_request = dict(zip(ordered_cold_ids, cold_frontiers))
     frontiers = tuple(by_request.get(req_id, 0) for req_id in active_ids)
     markers = tuple(req_id in by_request for req_id in active_ids)
-    if any(marker and int(num_computed_tokens[i]) != frontiers[i] for i, marker in enumerate(markers)):
+    computed_ends = frontiers
+    if isinstance(cold_markers, ColdResumeMarkers):
+        expected = dict(zip(ordered_cold_ids, cold_markers.computed_ends))
+        computed_ends = tuple(expected.get(req_id, 0) for req_id in active_ids)
+    if any(marker and int(num_computed_tokens[i]) != computed_ends[i] for i, marker in enumerate(markers)):
         raise RuntimeError("Native cold-resume frontier does not match computed tokens")
-    return frontiers, ColdResumeMarkers(markers, frontiers)
+    return frontiers, ColdResumeMarkers(markers, computed_ends)
 
 
 def staged_sfa_metadata_sparse_load(
