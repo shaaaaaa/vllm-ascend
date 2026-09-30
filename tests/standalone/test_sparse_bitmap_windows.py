@@ -25,7 +25,7 @@ def reference():
     return namespace[node.name]
 
 
-def windowed(source, boundaries, rows, table, need_packed, clear):
+def windowed(source, boundaries, rows, table, need_packed, clear, work=None):
     result = source.copy()
     capacity = source.shape[1] * max(1, max(sum(rows == r) for r in range(len(table))))
     assert capacity <= WORDS * 32
@@ -35,20 +35,34 @@ def windowed(source, boundaries, rows, table, need_packed, clear):
     bitmap_words = (table.shape[1] * 128 + 31) // 32
     for req in range(len(table)):
         count = 0
-        for base in range(0, bitmap_words, WORDS):
-            size = min(WORDS, bitmap_words - base)
+        request_rows = np.flatnonzero(rows == req)
+        boundary = max(0, max((int(boundaries[r]) for r in request_rows), default=0))
+        active_words = min(bitmap_words, (boundary + 31) // 32)
+        for base in range(0, active_words, WORDS):
+            size = min(WORDS, active_words - base)
+            if work is not None:
+                work["windows"] = work.get("windows", 0) + 1
+                work["prefix_words"] = work.get("prefix_words", 0) + size
+                work["clear_words"] = work.get("clear_words", 0) + (size + 7) // 8 * 8
             bitmap = [0] * size
-            for row in np.flatnonzero(rows == req):
+            for row in request_rows:
+                if boundaries[row] <= base * 32:
+                    continue
                 for token in result[row]:
                     token = int(token)
                     word = ((token >> 5) - base) & 0xFFFFFFFF
                     if 0 <= token < boundaries[row] and word < size:
                         bitmap[word] |= 1 << (token & 31)
-            prefix = []
-            for bits in bitmap:
-                prefix.append(count)
-                count += bits.bit_count()
-            for row in np.flatnonzero(rows == req):
+            prefix = [None] * size  # Empty words must never read stale prefix data.
+            for word, bits in enumerate(bitmap):
+                if bits:
+                    prefix[word] = count
+                    count += bits.bit_count()
+                    if work is not None:
+                        work["popcounts"] = work.get("popcounts", 0) + 1
+            for row in request_rows:
+                if boundaries[row] <= base * 32:
+                    continue
                 for col, token in enumerate(result[row]):
                     token = int(token)
                     word = ((token >> 5) - base) & 0xFFFFFFFF
@@ -101,3 +115,27 @@ def test_full_q2_scratch_union_spans_both_windows():
     assert actual[2].tolist() == [4096]
     for x, y in zip(expected, actual):
         assert np.array_equal(x.numpy(), y)
+
+
+@pytest.mark.parametrize("boundary", [0, 1, 31, 32, 33, 255, 256, 257, 20000, 524287, 524288, 524289, 1048576])
+@pytest.mark.parametrize("need_packed,clear", [(False, False), (False, True), (True, False), (True, True)])
+def test_short_live_ranges_in_padded_one_million_table(boundary, need_packed, clear):
+    rng = np.random.default_rng(boundary)
+    rows = np.array([0, 1, -1, 0, 1, 0], np.int32)
+    table = rng.integers(1, 100, (3, 8208), dtype=np.int32)  # Third request has no rows.
+    boundaries = np.array([boundary, 20000, 1048576, max(0, boundary - 1), -1, 0], np.int32)
+    source = rng.integers(-1, 1048576, (6, 64), dtype=np.int32)
+    source[:, :10] = [-1, 0, 31, 32, 19999, 20000, max(0, boundary - 1), boundary, 524287, 524288]
+    source[:, 10:20] = source[:, :10]
+    expected = reference()(*(torch.from_numpy(x) for x in (source, boundaries, rows, table)), 128, need_packed, clear)
+    actual = windowed(source, boundaries, rows, table, need_packed, clear)
+    for x, y in zip(expected, actual):
+        assert (x is None and y is None) or np.array_equal(x.numpy(), y)
+
+
+def test_short_request_work_is_independent_of_unused_table_capacity():
+    source = np.array([[0, 31, 19999, 19999, 20000, -1]], np.int32)
+    work = {}
+    actual = windowed(source, np.array([20000]), np.array([0]), np.ones((1, 8208), np.int32), True, True, work)
+    assert actual[2].tolist() == [3]
+    assert work == dict(windows=1, prefix_words=625, clear_words=632, popcounts=2)

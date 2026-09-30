@@ -81,15 +81,14 @@ public:
         if (req >= requestCount_) {
             return;
         }
-        bool hasPositiveBoundary = false;
+        int32_t maxBoundary = 0;
         for (uint32_t row = 0; row < rowCount_; ++row) {
-            if (rowReqIndices_.GetValue(row) == static_cast<int32_t>(req)
-                && splitBoundary_.GetValue(row) > 0) {
-                hasPositiveBoundary = true;
-                break;
+            if (rowReqIndices_.GetValue(row) == static_cast<int32_t>(req)) {
+                const int32_t boundary = splitBoundary_.GetValue(row);
+                maxBoundary = boundary > maxBoundary ? boundary : maxBoundary;
             }
         }
-        if (!hasPositiveBoundary) {
+        if (maxBoundary == 0) {
             selectedCounts_.SetValue(
                 static_cast<uint64_t>(req) * selectedCountStride_, 0);
             if (req == 0 && clearInvalidRows_) {
@@ -97,16 +96,20 @@ public:
             }
             return;
         }
+        // Table columns are capacity, not the live request length. All selected
+        // indices are below their row's boundary; higher bitmap words are empty.
+        const uint32_t boundaryWords = (static_cast<uint32_t>(maxBoundary) + 31) / 32;
+        const uint32_t activeWords = boundaryWords < bitmapWords_ ? boundaryWords : bitmapWords_;
         uint32_t uniqueCount = 0;
-        if (bitmapWords_ <= bufferWords_) {
-            ProcessWindow<false>(req, 0, bitmapWords_, uniqueCount);
+        if (activeWords <= bufferWords_) {
+            ProcessWindow<false>(req, 0, activeWords, uniqueCount);
         } else {
-            for (uint32_t base = 0; base < bitmapWords_; base += bufferWords_) {
+            for (uint32_t base = 0; base < activeWords; base += bufferWords_) {
                 if (base != 0) {
                     // Finish scalar UB reads/writes before the next vector clear.
                     SyncPipeline<AscendC::HardEvent::S_V>();
                 }
-                const uint32_t remaining = bitmapWords_ - base;
+                const uint32_t remaining = activeWords - base;
                 ProcessWindow<true>(req, base,
                     remaining < bufferWords_ ? remaining : bufferWords_, uniqueCount);
             }
@@ -128,7 +131,8 @@ private:
             bitmapBuffer_.Get<int32_t>();
         AscendC::LocalTensor<int32_t> prefix =
             prefixBuffer_.Get<int32_t>();
-        AscendC::Duplicate(bitmap, static_cast<int32_t>(0), bufferWords_);
+        const uint32_t clearWords = ((wordCount + 7) / 8) * 8;
+        AscendC::Duplicate(bitmap, static_cast<int32_t>(0), clearWords);
         // Duplicate runs on the vector pipeline, while the bitmap below is
         // updated through scalar GetValue/SetValue accesses.  Wait for the
         // clear to finish before the scalar pipeline starts modifying it;
@@ -145,6 +149,9 @@ private:
                 continue;
             }
             const int32_t boundary = splitBoundary_.GetValue(row);
+            if (boundary <= static_cast<int32_t>(wordBase * 32)) {
+                continue;
+            }
             const uint64_t rowOffset = static_cast<uint64_t>(row) * rowWidth_;
             for (uint32_t col = 0; col < rowWidth_; ++col) {
                 const uint64_t indexOffset = rowOffset + col;
@@ -169,9 +176,13 @@ private:
         // Prefix popcount gives every selected position a deterministic rank
         // in ascending token-position order.
         for (uint32_t word = 0; word < wordCount; ++word) {
-            prefix.SetValue(word, static_cast<int32_t>(uniqueCount));
-            uniqueCount += Popcount32(
-                static_cast<uint32_t>(bitmap.GetValue(word)));
+            const uint32_t bits = static_cast<uint32_t>(bitmap.GetValue(word));
+            // Remapping only reads words containing selected tokens. Leave
+            // unused prefix entries alone, avoiding their stores and popcounts.
+            if (bits != 0) {
+                prefix.SetValue(word, static_cast<int32_t>(uniqueCount));
+                uniqueCount += Popcount32(bits);
+            }
         }
 
         for (uint32_t row = 0; row < rowCount_; ++row) {
@@ -179,6 +190,9 @@ private:
                 continue;
             }
             const int32_t boundary = splitBoundary_.GetValue(row);
+            if (boundary <= static_cast<int32_t>(wordBase * 32)) {
+                continue;
+            }
             const uint64_t rowOffset = static_cast<uint64_t>(row) * rowWidth_;
             for (uint32_t col = 0; col < rowWidth_; ++col) {
                 const uint64_t indexOffset = rowOffset + col;

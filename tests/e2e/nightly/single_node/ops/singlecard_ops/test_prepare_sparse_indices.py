@@ -1,3 +1,5 @@
+from statistics import median
+
 import pytest
 import torch
 
@@ -81,29 +83,39 @@ def _aligned(values, width=16):
     return result
 
 
-@pytest.mark.parametrize("context", [200192, 524288, 524416, 1048576])
+@pytest.mark.parametrize("context", [200192, 524288, 524416, 1048576, 1050624])
 @pytest.mark.parametrize("need_packed", [False, True])
 @pytest.mark.parametrize("capture_graph", [False, True])
-def test_generic_bitmap_long_context(context, need_packed, capture_graph):
+@pytest.mark.parametrize("clear_invalid", [False, True])
+def test_generic_bitmap_long_context(context, need_packed, capture_graph, clear_invalid):
     """Generic fallback: tile edges, full scratch union and changing replay data."""
     width, capacity, block = 2048, 4096, 128
     source = torch.full((5, width), -1, dtype=torch.int32)
     source[0] = torch.arange(width, dtype=torch.int32)
     source[2] = torch.arange(context - width, context, dtype=torch.int32)
-    points = [-1, 0, 31, 32, min(context - 1, 524287), min(context - 1, 524288), context - 1]
-    source[1, :len(points)] = torch.tensor(points, dtype=torch.int32)
+    points = [-1, 0, 31, 32, 19999, 20000, min(context - 1, 524287), min(context - 1, 524288), context - 1]
+    source[1, : len(points)] = torch.tensor(points, dtype=torch.int32)
     source[3] = 123  # Invalid row must be cleared, not assigned to a request.
     source[4] = source[1]  # Zero boundary leaves this row unchanged.
     rows = torch.tensor([0, 1, 0, -1, 1], dtype=torch.int32)
     boundaries = torch.tensor([context, context // 2, context, 0, 0], dtype=torch.int32)
-    table = torch.arange(2 * (context // block), dtype=torch.int32).view(2, -1) + 3
+    # A third table row has no queries, and must publish a zero count.
+    table = torch.arange(3 * (context // block), dtype=torch.int32).view(3, -1) + 3
     values, device_boundaries, device_rows, device_table = (x.npu() for x in (source, boundaries, rows, table))
-    selected, counts, targets = _buffers(2, capacity)
+    selected, counts, targets = _buffers(3, capacity)
 
     def invoke():
         torch.ops._C_ascend.npu_dsa_prepare_sparse_indices_(
-            values, device_boundaries, device_rows, device_table,
-            selected, counts, targets, block, need_packed, True,
+            values,
+            device_boundaries,
+            device_rows,
+            device_table,
+            selected,
+            counts,
+            targets,
+            block,
+            need_packed,
+            clear_invalid,
         )
 
     invoke()
@@ -114,20 +126,32 @@ def test_generic_bitmap_long_context(context, need_packed, capture_graph):
         graph = torch.npu.NPUGraph()
         with torch.npu.graph(graph):
             invoke()
-    for iteration in range(3):
+    # Reuse graph addresses while changing live ranges independently of table
+    # capacity. Long -> short -> zero -> long must not read stale UB prefixes.
+    live_ranges = [None, None, 20000, 0, 1, 31, 32, 33, 255, 256, 257, 524287, 524288, 524289, context]
+    for iteration, live_range in enumerate(live_ranges):
         current = source.clone()
         current_boundaries = boundaries.clone()
         if iteration == 1:
             current[2] = current[0]  # All duplicates across Q2 rows.
             current_boundaries[1] = context
-        elif iteration == 2:
-            current_boundaries.zero_()
+        elif live_range is not None:
+            boundary = min(context, live_range)
+            current_boundaries[:] = torch.tensor(
+                [boundary, boundary // 2, max(0, boundary - 1), 0, 0], dtype=torch.int32
+            )
         values.copy_(current.npu())
         device_boundaries.copy_(current_boundaries.npu())
         graph.replay() if graph is not None else invoke()
         torch.npu.synchronize()
         expected, packed, expected_counts, expected_targets = _prepare_sparse_indices_torch(
-            current, current_boundaries, rows, table, block, need_packed, True,
+            current,
+            current_boundaries,
+            rows,
+            table,
+            block,
+            need_packed,
+            clear_invalid,
         )
         assert torch.equal(values.cpu(), expected)
         actual_counts = counts[:, 0].cpu()
@@ -138,6 +162,64 @@ def test_generic_bitmap_long_context(context, need_packed, capture_graph):
                 assert torch.equal(targets[req, :count].cpu(), expected_targets[req, :count])
         else:
             assert actual_counts.eq(0).all()
+
+
+@pytest.mark.parametrize("boundary", [20000, 140000, 524288, 1048576])
+def test_generic_bitmap_latency(boundary):
+    """Report comparable operator timing across builds; no hardware-specific SLA."""
+    generator = torch.Generator().manual_seed(73)
+    source = torch.randint(0, 1048576, (6, 2048), generator=generator, dtype=torch.int32)
+    rows = torch.tensor([0, 1, 0, 2, 1, 3], dtype=torch.int32)
+    boundaries = torch.tensor([boundary, boundary // 2, boundary, 0, boundary // 2, boundary], dtype=torch.int32)
+    table = torch.arange(4 * 8208, dtype=torch.int32).view(4, 8208) + 3
+    source_npu, boundaries_npu, rows_npu, table_npu = (x.npu() for x in (source, boundaries, rows, table))
+    values = source_npu.clone()
+    selected, counts, targets = _buffers(4, 4096)
+
+    def invoke():
+        torch.ops._C_ascend.npu_dsa_prepare_sparse_indices_(
+            values,
+            boundaries_npu,
+            rows_npu,
+            table_npu,
+            selected,
+            counts,
+            targets,
+            128,
+            True,
+            False,
+        )
+
+    for _ in range(5):
+        values.copy_(source_npu)
+        invoke()
+    torch.npu.synchronize()
+    events = [(torch.npu.Event(enable_timing=True), torch.npu.Event(enable_timing=True)) for _ in range(40)]
+    for start, end in events:
+        values.copy_(source_npu)  # In-place remapping requires fresh inputs.
+        start.record()
+        invoke()
+        end.record()
+    torch.npu.synchronize()
+    timings = sorted(start.elapsed_time(end) for start, end in events)
+    print(
+        f"generic_bitmap boundary={boundary} table_tokens=1050624 "
+        f"median_ms={median(timings):.4f} p95_ms={timings[37]:.4f}"
+    )
+    expected, packed, expected_counts, expected_targets = _prepare_sparse_indices_torch(
+        source,
+        boundaries,
+        rows,
+        table,
+        128,
+        True,
+        False,
+    )
+    assert torch.equal(values.cpu(), expected)
+    assert torch.equal(counts[:, 0].cpu(), expected_counts)
+    for req, count in enumerate(expected_counts.tolist()):
+        assert torch.equal(selected[req, :count].cpu(), packed[req, :count])
+        assert torch.equal(targets[req, :count].cpu(), expected_targets[req, :count])
 
 
 def _run_production_staged(
