@@ -139,6 +139,20 @@ if TYPE_CHECKING:
 
 # token count limits within bmm_transpose operator
 BMM_TRANS_MAX_SUPPORTED_TOKENS = 1024
+
+# o_proj parameters are split into parameters that are repeated for a full
+# input and parameters whose first dimension is sharded with the TP input.
+# The latter must be gathered; blindly repeating every scale produces an
+# incorrect W4A8 layout after process_weights_after_loading().
+O_PROJ_ACLNN_INPUT_PARAMS = (
+    "aclnn_input_scale",
+    "aclnn_input_scale_reciprocal",
+    "aclnn_input_offset",
+)
+O_PROJ_INPUT_SHARDED_QUANT_PARAMS = (
+    "weight_scale_second",
+    "weight_scale",
+)
 # Fence the first sparse load once in each worker process by default.
 _LMCACHE_SPARSE_WAIT_SYNC_ONCE = os.getenv("VLLM_ASCEND_LMCACHE_SPARSE_WAIT_SYNC_ONCE", "1").lower() in (
     "1",
@@ -1987,8 +2001,9 @@ class AscendSFAImpl(MLAAttentionImpl):
     understand this class
     """
 
-    # Supports forward using the all-gather o_proj weight for decode requests when Sharded CP is enabled.
-    o_proj_full_pool: torch.Tensor | None = None
+    # Reusable temporary full-weight gather buffers for DSA-CP prefill/mixed
+    # requests. The persistent o_proj parameters remain TP-sharded.
+    o_proj_full_pools: dict[tuple[str, int | None, torch.dtype, int, tuple[int, ...]], torch.Tensor] = {}
 
     # q_hadamard and k_hadamard tensor shared when dsa c8 enabled
     q_hadamard: torch.Tensor | None = None
@@ -2247,11 +2262,20 @@ class AscendSFAImpl(MLAAttentionImpl):
         # for o_proj weight for prefill stage.
         self.enable_dsa_cp_with_o_proj_tp = enable_dsa_cp_with_o_proj_tp()
 
+        self.layer_sharding_kwargs = []
         if self.enable_dsa_cp:
             self.local_num_heads = self.num_heads * self.tp_size
+            layer_sharding_names = get_ascend_config().layer_sharding or []
+            # Reject dual ownership before registration can wrap forward or
+            # dispose weights. q_b_proj sharding remains independent of the
+            # TP-resident o_proj full-gather path.
+            if self.enable_dsa_cp_with_o_proj_tp and "o_proj" in layer_sharding_names:
+                raise ValueError(
+                    "DSA-CP o_proj full-gather cannot be combined with "
+                    "layer_sharding containing 'o_proj'; keep o_proj out of layer sharding."
+                )
             if self.enable_dsa_cp_with_layer_shard:
-                self.layer_sharding_kwargs = []
-                for layer_name in get_ascend_config().layer_sharding or []:
+                for layer_name in layer_sharding_names:
                     if layer_name in kwargs:
                         self.layer_sharding_kwargs.append(kwargs[layer_name])
                     else:
@@ -2306,7 +2330,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                 for layer in self.layer_sharding_kwargs or []:
                     if is_hidden_layer(layer):
                         post_process_after_loading_for_shard_weight_series(layer)
-            else:
+            if self.enable_dsa_cp_with_o_proj_tp:
                 self._init_o_proj_tp_full_params()
 
         if self.enable_mlapo:
@@ -2460,43 +2484,91 @@ class AscendSFAImpl(MLAAttentionImpl):
 
     def _init_o_proj_tp_full_params(self):
         """
-        Initialize TP-mode and Full-mode parameters for o_proj weight,
-        preparing for weight switching in PD mix stage.
+        Initialize the TP aliases and temporary full-gather buffers for o_proj.
 
-        For PD mix stage:
-        - Use original TP o_proj weight for decode phase
-        - Need full-gather o_proj weight from all TP ranks for prefill phase
+        The original TP-sharded parameters remain the persistent source of
+        truth.  Prefill/mixed DSA-CP gathers the weight and only the input-
+        sharded quantization parameters, switches the module to those views
+        for one forward, and restores the TP views before returning.
         """
-        if AscendSFAImpl.o_proj_full_pool is None:
-            sample = self.o_proj.weight
-            AscendSFAImpl.o_proj_full_pool = torch.empty(
-                (sample.shape[0] * self.tp_size, sample.shape[1]), dtype=sample.dtype, device=sample.device
+        sample = self.o_proj.weight
+        linear_method = self._get_o_proj_linear_method()
+        self.o_proj_full_weight_gather_dim = 1 if isinstance(linear_method, UnquantizedLinearMethod) else 0
+        if self.o_proj_full_weight_gather_dim == 0:
+            full_shape = (sample.shape[0] * self.tp_size, sample.shape[1])
+            gather_shape = full_shape
+        else:
+            full_shape = (sample.shape[0], sample.shape[1] * self.tp_size)
+            gather_shape = (sample.shape[1] * self.tp_size, sample.shape[0])
+
+        pool_key = (
+            sample.device.type,
+            sample.device.index,
+            sample.dtype,
+            self.o_proj_full_weight_gather_dim,
+            tuple(full_shape),
+        )
+        if pool_key not in AscendSFAImpl.o_proj_full_pools:
+            AscendSFAImpl.o_proj_full_pools[pool_key] = torch.empty(
+                gather_shape, dtype=sample.dtype, device=sample.device
+            )
+        self.o_proj_full_gather_pool = AscendSFAImpl.o_proj_full_pools[pool_key]
+        self.o_proj_full_pool = (
+            self.o_proj_full_gather_pool
+            if self.o_proj_full_weight_gather_dim == 0
+            else self.o_proj_full_gather_pool.transpose(0, 1)
+        )
+
+        self.o_proj_tp_weight = self.o_proj.weight.detach()
+        if self.o_proj_full_weight_gather_dim == 0:
+            self.o_proj_tp_weight_gather_input = self.o_proj_tp_weight
+        else:
+            self.o_proj_tp_weight_gather_input = self.o_proj_tp_weight.transpose(0, 1).contiguous()
+
+        self.o_proj_tp_aclnn_input_params = {}
+        self.o_proj_full_aclnn_input_params = {}
+        for param_name in O_PROJ_ACLNN_INPUT_PARAMS:
+            param = getattr(self.o_proj, param_name, None)
+            if param is None:
+                continue
+            self.o_proj_tp_aclnn_input_params[param_name] = param.detach()
+            self.o_proj_full_aclnn_input_params[param_name] = param.repeat(self.tp_size)
+
+        self.o_proj_tp_input_sharded_quant_params = {}
+        self.o_proj_full_input_sharded_quant_params = {}
+        for param_name in O_PROJ_INPUT_SHARDED_QUANT_PARAMS:
+            param = getattr(self.o_proj, param_name, None)
+            if param is None or getattr(param, "input_dim", None) != 1:
+                continue
+            self.o_proj_tp_input_sharded_quant_params[param_name] = param.detach()
+            self.o_proj_full_input_sharded_quant_params[param_name] = torch.empty(
+                (param.shape[0] * self.tp_size, *param.shape[1:]),
+                dtype=param.dtype,
+                device=param.device,
             )
 
-        # Save TP-mode parameters (original sharded weights)
-        self.o_proj_tp_weight = self.o_proj.weight.clone().detach()
-        self.o_proj_tp_aclnn_input_scale = self.o_proj.aclnn_input_scale.clone().detach()
-        self.o_proj_tp_aclnn_input_scale_reciprocal = self.o_proj.aclnn_input_scale_reciprocal.clone().detach()
-        self.o_proj_tp_aclnn_input_offset = self.o_proj.aclnn_input_offset.clone().detach()
+        self._switch_o_proj_params(self.o_proj_tp_aclnn_input_params)
+        self._switch_o_proj_params(self.o_proj_tp_input_sharded_quant_params)
 
-        # Initially switch to TP mode for graph capture
-        self.o_proj.weight.set_(self.o_proj_tp_weight)
-        self.o_proj.aclnn_input_scale.set_(self.o_proj_tp_aclnn_input_scale)
-        self.o_proj.aclnn_input_scale_reciprocal.set_(self.o_proj_tp_aclnn_input_scale_reciprocal)
-        self.o_proj.aclnn_input_offset.set_(self.o_proj_tp_aclnn_input_offset)
+    def _switch_o_proj_params(self, params: dict[str, torch.Tensor]) -> None:
+        for param_name, param in params.items():
+            getattr(self.o_proj, param_name).set_(param)
 
-        # Precompute Full-mode quantization parameters by repeating TP parameters across all TP ranks
-        self.o_proj_full_aclnn_input_scale = self.o_proj.aclnn_input_scale.repeat(self.tp_size)
-        self.o_proj_full_aclnn_input_scale_reciprocal = self.o_proj.aclnn_input_scale_reciprocal.repeat(self.tp_size)
-        self.o_proj_full_aclnn_input_offset = self.o_proj.aclnn_input_offset.repeat(self.tp_size)
+    def _get_o_proj_linear_method(self):
+        quant_method = self.o_proj.quant_method
+        return getattr(quant_method, "quant_method", quant_method)
+
+    def _apply_o_proj_full_weight(self, attn_output: torch.Tensor) -> torch.Tensor:
+        return self._get_o_proj_linear_method().apply(self.o_proj, attn_output)
 
     def _handle_o_proj_weight_switch_and_forward(
         self,
         attn_output: torch.Tensor,
         output: torch.Tensor,
         o_proj_full_handle: torch.distributed.Work | None,
+        o_proj_full_param_handles: list[torch.distributed.Work | None] | None,
         should_shard_weight: bool,
-    ) -> tuple[torch.Tensor, bool]:
+    ) -> tuple[torch.Tensor, bool, bool]:
         """
         Handle o_proj weight switching between TP-mode and Full-mode, and execute forward computation.
         """
@@ -2505,23 +2577,25 @@ class AscendSFAImpl(MLAAttentionImpl):
             # Wait for the completion of o_proj weight all-gather operation
             if o_proj_full_handle is not None:
                 o_proj_full_handle.wait()
+            for handle in o_proj_full_param_handles or []:
+                if handle is not None:
+                    handle.wait()
 
-            # Switch o_proj to Full-mode (gathered weight from all TP ranks)
-            self.o_proj.weight.set_(AscendSFAImpl.o_proj_full_pool)
-            self.o_proj.aclnn_input_scale.set_(self.o_proj_full_aclnn_input_scale)
-            self.o_proj.aclnn_input_scale_reciprocal.set_(self.o_proj_full_aclnn_input_scale_reciprocal)
-            self.o_proj.aclnn_input_offset.set_(self.o_proj_full_aclnn_input_offset)
+            # Switch to Full-mode (gathered weight and input-sharded quant
+            # parameters) and execute the projection once.
+            self.o_proj.weight.set_(self.o_proj_full_pool)
+            self._switch_o_proj_params(self.o_proj_full_aclnn_input_params)
+            self._switch_o_proj_params(self.o_proj_full_input_sharded_quant_params)
+            try:
+                output[...] = self._apply_o_proj_full_weight(attn_output)
+            finally:
+                # Restore TP-mode even if the quantized projection raises so
+                # the next graph replay cannot observe stale full parameters.
+                self.o_proj.weight.set_(self.o_proj_tp_weight)
+                self._switch_o_proj_params(self.o_proj_tp_aclnn_input_params)
+                self._switch_o_proj_params(self.o_proj_tp_input_sharded_quant_params)
 
-            # Apply quantization method and execute forward computation
-            output[...] = self.o_proj.quant_method.quant_method.apply(self.o_proj, attn_output)
-
-            # Switch o_proj back to TP-mode for subsequent decode operations
-            self.o_proj.weight.set_(self.o_proj_tp_weight)
-            self.o_proj.aclnn_input_scale.set_(self.o_proj_tp_aclnn_input_scale)
-            self.o_proj.aclnn_input_scale_reciprocal.set_(self.o_proj_tp_aclnn_input_scale_reciprocal)
-            self.o_proj.aclnn_input_offset.set_(self.o_proj_tp_aclnn_input_offset)
-
-            return output, False
+            return output, False, False
         else:
             # For decode scenario: perform all-to-all communication on o_proj input activations
             # Reshape for all-to-all: [batch * seq, tp_size, head_dim] -> [tp_size, batch * seq, head_dim]
@@ -2534,7 +2608,7 @@ class AscendSFAImpl(MLAAttentionImpl):
             attn_output = torch.empty_like(send)
             torch.distributed.all_to_all_single(attn_output, send, group=get_tp_group().device_group)
 
-            return attn_output, True
+            return attn_output, True, True
 
     def _get_indexcache_topk_indices(self, num_tokens: int) -> torch.Tensor:
         """Read the current batch's top-k from the producer-written buffer."""
@@ -5329,8 +5403,10 @@ class AscendSFAImpl(MLAAttentionImpl):
         num_input_tokens = attn_metadata.num_input_tokens
         output_padded = output
 
-        # all-gather o_proj weight for prefill stage of PD mix node
+        # All-gather o_proj weight and any input-sharded quantization
+        # parameters for the producer prefill path.
         o_proj_full_handle = None
+        o_proj_full_param_handles: list[torch.distributed.Work | None] | None = None
         # if is PD mix stage, using original TP o_proj weight, and also need to full gather for o_proj
         # weight for prefill stage.
         full_gather_o_proj_enabled = self.enable_dsa_cp_with_o_proj_tp and attn_metadata.attn_state not in {
@@ -5523,10 +5599,20 @@ class AscendSFAImpl(MLAAttentionImpl):
                     for layer in self.layer_sharding_kwargs or []:
                         if is_hidden_layer(layer):
                             reach_layer_for_shard_weight_series(layer)
-                elif full_gather_o_proj_enabled:
+                if full_gather_o_proj_enabled:
                     _, o_proj_full_handle = all_gather_async(
-                        self.o_proj_tp_weight, get_tp_group(), output=AscendSFAImpl.o_proj_full_pool
+                        self.o_proj_tp_weight_gather_input,
+                        get_tp_group(),
+                        output=self.o_proj_full_gather_pool,
                     )
+                    o_proj_full_param_handles = []
+                    for param_name, param in self.o_proj_tp_input_sharded_quant_params.items():
+                        _, param_handle = all_gather_async(
+                            param,
+                            get_tp_group(),
+                            output=self.o_proj_full_input_sharded_quant_params[param_name],
+                        )
+                        o_proj_full_param_handles.append(param_handle)
 
                 if kv_cache is not None:
                     assert fused_kv_no_split is not None
@@ -6500,12 +6586,6 @@ class AscendSFAImpl(MLAAttentionImpl):
             or (self._layerwise_prefill_mtp and getattr(get_forward_context(), "is_draft_model", False))
         )
 
-        if self.enable_dsa_cp_with_o_proj_tp and use_layerwise_transfer_window:
-            raise RuntimeError(
-                "Layerwise-prefill transfer overlap is incompatible with "
-                "the SFA context-parallel o_proj path"
-            )
-
         # The final target layer and each one-layer MTP forward have no N+1
         # callback in their context. Submit their saves here, instead of leaving
         # the MTP save in a discarded context and relying on storer drain later.
@@ -6529,22 +6609,31 @@ class AscendSFAImpl(MLAAttentionImpl):
             linear_layer=self.o_proj,
         )
 
+        full_o_proj_completed = False
+        o_proj_input_already_redistributed = False
         if self.enable_dsa_cp_with_o_proj_tp:
             # When using SFA-CP with pd mixed, o_proj has two cases:
             # 1. prefill: o_proj is a TP weight, we need to all-gather o_proj weight to switch TP=1.
             # 2. decode: all-to-all the hidden_state before the o_proj forward.
-            result, require_o_proj_forward = self._handle_o_proj_weight_switch_and_forward(
-                attn_output=attn_output,
-                output=output,
-                o_proj_full_handle=o_proj_full_handle,
-                should_shard_weight=full_gather_o_proj_enabled,
+            result, require_o_proj_forward, o_proj_input_already_redistributed = (
+                self._handle_o_proj_weight_switch_and_forward(
+                    attn_output=attn_output,
+                    output=output,
+                    o_proj_full_handle=o_proj_full_handle,
+                    o_proj_full_param_handles=o_proj_full_param_handles,
+                    should_shard_weight=full_gather_o_proj_enabled,
+                )
             )
             if not require_o_proj_forward:
-                _dsa_prof.end(_sfa_t)
-                return result
-            attn_output = result
+                full_o_proj_completed = True
+            else:
+                attn_output = result
 
-        if self.enable_dsa_cp_strict_accuracy:
+        if (
+            self.enable_dsa_cp_strict_accuracy
+            and not full_o_proj_completed
+            and not o_proj_input_already_redistributed
+        ):
             send = (
                 attn_output.view(-1, self.tp_size, self.num_heads * self.v_head_dim)
                 .permute(1, 0, 2)
@@ -6555,7 +6644,8 @@ class AscendSFAImpl(MLAAttentionImpl):
             torch.distributed.all_to_all_single(attn_output, send, group=get_tp_group().device_group)
 
         if use_layerwise_transfer_window:
-            output[...] = self.o_proj(attn_output)[0]
+            if not full_o_proj_completed:
+                output[...] = self.o_proj(attn_output)[0]
             if pending_transfers is not None:
                 self._finish_sfa_layerwise_transfer_window(
                     pending_transfers, pending_transfer_names
@@ -6570,7 +6660,8 @@ class AscendSFAImpl(MLAAttentionImpl):
                 transfer_context["sfa_layerwise_prefill_pending"] = save_operations
         else:
             # Keep legacy/non-P connector ordering unchanged.
-            output[...] = self.o_proj(attn_output)[0]
+            if not full_o_proj_completed:
+                output[...] = self.o_proj(attn_output)[0]
             if pending_transfers is not None:
                 self._finish_sfa_layerwise_transfer_window(
                     pending_transfers, pending_transfer_names
@@ -6585,7 +6676,13 @@ class AscendSFAImpl(MLAAttentionImpl):
                             save_operations.append((index_layer_name, [kv_cache[2]]))
                     else:
                         save_operations.append((layer_name, list(kv_cache)))
-            self._submit_sfa_save_operations(save_operations)
+                self._submit_sfa_save_operations(save_operations)
+            elif not use_layerwise_transfer_window:
+                # A producer connector without the split transfer-window API
+                # still needs the ordinary save path.  The window path above
+                # submits the save before projection and finishes it after
+                # projection; this fallback submits it once after projection.
+                self._submit_sfa_save_operations(save_operations)
 
         _dsa_prof.end(_sfa_t)
         return output_padded

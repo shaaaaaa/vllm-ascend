@@ -214,6 +214,59 @@ class TestUtils(TestBase):
 
         self.assertEqual(0, len(test_vllm_config.compilation_config.cudagraph_capture_sizes))
 
+    def test_dsa_cp_o_proj_tp_accepts_producer(self):
+        config = mock.MagicMock()
+        config.kv_transfer_config = mock.MagicMock(
+            is_kv_producer=True,
+            is_kv_consumer=False,
+        )
+        utils.enable_dsa_cp_with_o_proj_tp.cache_clear()
+        with (
+            mock.patch("vllm.config.get_current_vllm_config", return_value=config),
+            mock.patch.object(utils, "enable_dsa_cp", return_value=True),
+        ):
+            self.assertTrue(utils.enable_dsa_cp_with_o_proj_tp())
+        utils.enable_dsa_cp_with_o_proj_tp.cache_clear()
+
+    def test_dsa_cp_o_proj_tp_rejects_consumer_only(self):
+        config = mock.MagicMock()
+        config.kv_transfer_config = mock.MagicMock(
+            is_kv_producer=False,
+            is_kv_consumer=True,
+        )
+        utils.enable_dsa_cp_with_o_proj_tp.cache_clear()
+        with (
+            mock.patch("vllm.config.get_current_vllm_config", return_value=config),
+            mock.patch.object(utils, "enable_dsa_cp", return_value=True),
+        ):
+            self.assertFalse(utils.enable_dsa_cp_with_o_proj_tp())
+        utils.enable_dsa_cp_with_o_proj_tp.cache_clear()
+
+    def test_dsa_cp_o_proj_tp_accepts_kv_both(self):
+        config = mock.MagicMock()
+        config.kv_transfer_config = mock.MagicMock(
+            is_kv_producer=True,
+            is_kv_consumer=True,
+        )
+        utils.enable_dsa_cp_with_o_proj_tp.cache_clear()
+        with (
+            mock.patch("vllm.config.get_current_vllm_config", return_value=config),
+            mock.patch.object(utils, "enable_dsa_cp", return_value=True),
+        ):
+            self.assertTrue(utils.enable_dsa_cp_with_o_proj_tp())
+        utils.enable_dsa_cp_with_o_proj_tp.cache_clear()
+
+    def test_dsa_cp_o_proj_tp_accepts_no_kv_transfer(self):
+        config = mock.MagicMock()
+        config.kv_transfer_config = None
+        utils.enable_dsa_cp_with_o_proj_tp.cache_clear()
+        with (
+            mock.patch("vllm.config.get_current_vllm_config", return_value=config),
+            mock.patch.object(utils, "enable_dsa_cp", return_value=True),
+        ):
+            self.assertTrue(utils.enable_dsa_cp_with_o_proj_tp())
+        utils.enable_dsa_cp_with_o_proj_tp.cache_clear()
+
     def test_staged_sfa_graph_capture_sizes_accepts_exact_q1_batches(self):
         vllm_config = mock.MagicMock()
         vllm_config.scheduler_config.max_num_seqs = 64

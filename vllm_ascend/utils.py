@@ -1475,9 +1475,12 @@ def enable_dsa_cp_with_o_proj_tp() -> bool:
     from vllm.config import get_current_vllm_config
 
     vllm_config = get_current_vllm_config()
-    # if is PD mix stage, using original TP o_proj weight, and also need to
-    # full gather for o_proj weight for prefill stage.
-    return vllm_config.kv_transfer_config is None
+    # DSA-CP prefill produces a full-head attention output on each TP rank.
+    # Keep the persistent o_proj weight TP-sharded and use the temporary
+    # full-gather path on every producer, including a kv_both instance.  A
+    # consumer-only decode instance keeps the normal TP decode path.
+    kv_transfer_config = vllm_config.kv_transfer_config
+    return kv_transfer_config is None or kv_transfer_config.is_kv_producer
 
 
 def check_gdn_layer(vllm_config) -> bool:
