@@ -112,7 +112,7 @@ def main() -> None:
     parser.add_argument(
         "--second-article", type=Path, default=articles / "round2.txt", help="Prewritten second article"
     )
-    parser.add_argument("--max-tokens", type=int, default=256, help="Maximum output tokens per turn")
+    parser.add_argument("--max-tokens", type=int, default=4000, help="Maximum output tokens per turn (default: 4000)")
     parser.add_argument("--timeout", type=float, default=600, help="HTTP timeout in seconds")
     parser.add_argument("--output-dir", type=Path, help="New or empty artifact directory")
     args = parser.parse_args()
