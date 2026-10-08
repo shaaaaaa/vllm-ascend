@@ -95,6 +95,9 @@ def test_two_sequential_requests_preserve_real_history(tmp_path, tokenize):
     assert second["prompt"] == first["prompt"] + first_output + added
     assert "公共交通与城市更新" in first["prompt"]
     assert "城市低碳转型与公共治理" in added
+    articles = Path(__file__).resolve().parents[2] / "tools/two_turn_kv_articles"
+    assert articles.joinpath("round1.txt").read_text(encoding="utf-8") in first["prompt"]
+    assert articles.joinpath("round2.txt").read_text(encoding="utf-8") in added
     for turn, request in enumerate(requests, 1):
         assert json.loads((output_dir / f"round{turn}_request.json").read_text(encoding="utf-8")) == request
         assert (output_dir / f"round{turn}_input.txt").read_bytes().decode("utf-8") == request["prompt"]
@@ -102,15 +105,14 @@ def test_two_sequential_requests_preserve_real_history(tmp_path, tokenize):
     summary = json.loads((output_dir / "summary.json").read_text(encoding="utf-8"))
     assert summary["round2"]["cached_tokens"] == 2816
     if tokenize:
-        assert abs(len(first["prompt"]) - 3000) <= 3000 * 0.08
-        assert abs(len(added) - 8000) <= 8000 * 0.08
+        assert len(tokenizations) == 2
         assert summary["first_input_tokens"] == len(first["prompt"])
         assert summary["second_new_input_tokens"] == len(added)
     else:
         assert len(tokenizations) == 1
         assert summary["first_input_tokens"] is None
         assert summary["second_new_input_tokens"] is None
-        assert "approximate article lengths" in result.stdout
+        assert "keeping the prewritten articles unchanged" in result.stdout
 
 
 def test_empty_first_output_stops_before_second_request(tmp_path):
