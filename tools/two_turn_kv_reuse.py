@@ -7,6 +7,8 @@ Uses only the Python standard library and an already running inference service.
 Reads both prewritten articles from tools/two_turn_kv_articles before sending requests.
 """
 
+from __future__ import annotations
+
 import argparse
 import json
 import time
@@ -19,7 +21,9 @@ from typing import Any
 
 class Client:
     def __init__(self, base_url: str, timeout: float) -> None:
-        self.base_url = base_url.rstrip("/").removesuffix("/v1")
+        self.base_url = base_url.rstrip("/")
+        if self.base_url.endswith("/v1"):
+            self.base_url = self.base_url[: -len("/v1")]
         self.timeout = timeout
         self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         self.tokenize_available = True
@@ -70,7 +74,7 @@ def complete(client: Client, model: str, prompt: str, max_tokens: int, root: Pat
     """Save the exact request and response, including the server's cache usage."""
     payload = {"model": model, "prompt": prompt, "max_tokens": max_tokens, "temperature": 0, "stream": False}
     save_json(root / f"round{turn}_request.json", payload)
-    (root / f"round{turn}_input.txt").write_text(prompt, encoding="utf-8", newline="")
+    (root / f"round{turn}_input.txt").write_bytes(prompt.encode("utf-8"))
     started = time.perf_counter()
     response = client.request("/v1/completions", payload)
     elapsed = time.perf_counter() - started
@@ -79,7 +83,7 @@ def complete(client: Client, model: str, prompt: str, max_tokens: int, root: Pat
     if not choices or not isinstance(choices[0].get("text"), str) or not choices[0]["text"]:
         raise RuntimeError(f"Round {turn} returned no text; inspect round{turn}_response.json")
     output = choices[0]["text"]  # Preserve spaces/newlines exactly for the next prompt.
-    (root / f"round{turn}_output.txt").write_text(output, encoding="utf-8", newline="")
+    (root / f"round{turn}_output.txt").write_bytes(output.encode("utf-8"))
     usage = response.get("usage") or {}
     details = usage.get("prompt_tokens_details") or {}
     stats = {
@@ -135,7 +139,7 @@ def main() -> None:
     second_added = make_input(second_article, 2, run_id)
     first_count = client.count_tokens(model, first_input)
     added_count = client.count_tokens(model, second_added)
-    (root / "round2_added_input.txt").write_text(second_added, encoding="utf-8", newline="")
+    (root / "round2_added_input.txt").write_bytes(second_added.encode("utf-8"))
     print(f"[TWO_TURN] first_input_tokens={first_count} second_new_input_tokens={added_count}", flush=True)
     first = complete(client, model, first_input, args.max_tokens, root, 1)
     second_input = first_input + first["text"] + second_added
