@@ -13,7 +13,7 @@ import pytest
 
 
 @contextmanager
-def mock_service(tokenize=True, first_output=" \n第一轮的真实输出。\r\n\n"):
+def mock_service(tokenize=True, first_output=" \n第一轮的真实输出。\r\n\n", models_available=True):
     completions = []
     tokenizations = []
 
@@ -27,7 +27,7 @@ def mock_service(tokenize=True, first_output=" \n第一轮的真实输出。\r\n
             self.wfile.write(data)
 
         def do_GET(self):
-            if self.path == "/v1/models":
+            if self.path == "/v1/models" and models_available:
                 self.respond({"data": [{"id": "mock-model"}]})
             else:
                 self.respond({"error": "unknown endpoint"}, 404)
@@ -69,10 +69,10 @@ def mock_service(tokenize=True, first_output=" \n第一轮的真实输出。\r\n
             worker.join(timeout=5)
 
 
-def run_client(url, output_dir):
+def run_client(url, output_dir, *extra_args):
     script = Path(__file__).resolve().parents[2] / "tools/two_turn_kv_reuse.py"
     return subprocess.run(
-        [sys.executable, "-X", "utf8", str(script), "--base-url", url, "--output-dir", str(output_dir)],
+        [sys.executable, "-X", "utf8", str(script), "--base-url", url, "--output-dir", str(output_dir), *extra_args],
         capture_output=True,
         text=True,
         encoding="utf-8",
@@ -81,15 +81,23 @@ def run_client(url, output_dir):
 
 
 @pytest.mark.parametrize("tokenize", [True, False])
-def test_two_sequential_requests_preserve_real_history(tmp_path, tokenize):
+@pytest.mark.parametrize("model_option", [None, "--model-name", "--model"])
+def test_two_sequential_requests_preserve_real_history(tmp_path, tokenize, model_option):
     output_dir = tmp_path / "case"
     first_output = " \n第一轮的真实输出。\r\n\n"
-    with mock_service(tokenize=tokenize, first_output=first_output) as (url, requests, tokenizations):
-        result = run_client(url, output_dir)
+    model_name = "mock-model" if model_option is None else "GLM-5.3-falcon"
+    extra_args = [] if model_option is None else [model_option, model_name]
+    with mock_service(tokenize=tokenize, first_output=first_output, models_available=model_option is None) as (
+        url,
+        requests,
+        tokenizations,
+    ):
+        result = run_client(url, output_dir, *extra_args)
     assert result.returncode == 0, result.stderr
     assert len(requests) == 2
     first, second = requests
-    assert first["model"] == second["model"] == "mock-model"
+    assert first["model"] == second["model"] == model_name
+    assert all(request["model"] == model_name for request in tokenizations)
     assert first["temperature"] == second["temperature"] == 0
     added = (output_dir / "round2_added_input.txt").read_bytes().decode("utf-8")
     assert second["prompt"] == first["prompt"] + first_output + added

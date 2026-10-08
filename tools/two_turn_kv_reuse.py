@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Send two article-reading turns with an unchanged first-turn text prefix.
 
-python3 tools/two_turn_kv_reuse.py --base-url http://7.150.4.174:8000
+python3 tools/two_turn_kv_reuse.py --base-url http://7.150.4.174:8000 --model-name GLM-5.3-falcon
 Uses only the Python standard library and an already running inference service.
 Reads both prewritten articles from tools/two_turn_kv_articles before sending requests.
 """
@@ -97,7 +97,12 @@ def complete(client: Client, model: str, prompt: str, max_tokens: int, root: Pat
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base-url", default="http://127.0.0.1:8000", help="Service or PD proxy address")
-    parser.add_argument("--model", help="Default: first model returned by /v1/models")
+    parser.add_argument(
+        "--model-name",
+        "--model",
+        dest="model",
+        help="Served model name, e.g. GLM-5.3-falcon; default: first model returned by /v1/models",
+    )
     articles = Path(__file__).resolve().parent / "two_turn_kv_articles"
     parser.add_argument("--first-article", type=Path, default=articles / "round1.txt", help="Prewritten first article")
     parser.add_argument(
@@ -123,7 +128,7 @@ def main() -> None:
     if model is None:
         models = client.request("/v1/models").get("data", [])
         if not models:
-            raise RuntimeError("No models returned by /v1/models; specify --model")
+            raise RuntimeError("No models returned by /v1/models; specify --model-name")
         model = models[0]["id"]
     print(f"[TWO_TURN] model={model} artifacts={root.resolve()}", flush=True)
     first_input = make_input(first_article, 1, run_id)
