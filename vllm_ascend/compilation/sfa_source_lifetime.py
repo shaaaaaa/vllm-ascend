@@ -26,6 +26,10 @@ class SFASourceLease:
         for source in sources:
             if source is None:
                 continue
+            prepared_owners = getattr(source, "graph_owners", None)
+            if prepared_owners is not None:
+                owners.update((id(owner), owner) for owner in prepared_owners)
+                continue
             for layer in source.layers:
                 if len(layer.memory_objs) != layer.chunk_ptrs_npu.numel():
                     raise RuntimeError("Async full SFA requires an allocator owner for every CPU source chunk")

@@ -333,3 +333,54 @@ def test_finished_binding_cannot_be_replayed_without_rebinding(asynchronous):
     with pytest.raises(RuntimeError, match="bound source batch"):
         a.graph.run(Mock())
     a.graph.entries[Key()].graph.replay.assert_not_called()
+
+
+@pytest.mark.parametrize("failure", [None, "invalid", "retain"])
+def test_prepared_owners_skip_layer_scan_and_preserve_rollback(asynchronous, failure):
+    a = asynchronous
+    first, second = a.owner(), a.owner()
+
+    class Prepared:
+        graph_owners = (first, second)
+
+        @property
+        def layers(self):
+            raise AssertionError("certified source must not rescan layer owners")
+
+    if failure == "invalid":
+        second.freed = True
+    elif failure == "retain":
+        second.ref_count_up = Mock(side_effect=RuntimeError("retain failed"))
+    if failure:
+        with pytest.raises(RuntimeError):
+            a.lease((Prepared(),))
+        assert first.meta.ref_count == second.meta.ref_count == 1
+    else:
+        lease = a.lease((Prepared(), Prepared()))
+        assert first.meta.ref_count == second.meta.ref_count == 2
+        lease.close()
+        lease.close()
+        assert first.meta.ref_count == second.meta.ref_count == 1
+
+
+def test_prepared_owners_keep_completion_lifetime_with_gc_disabled(asynchronous):
+    import gc
+
+    a = asynchronous
+    enabled = gc.isenabled()
+    gc.disable()
+    try:
+        owner = a.owner()
+        source = a.source(owner)
+        source.graph_owners = (owner,)
+        a.bind(source)
+        owner.ref_count_down()
+        a.graph.release_requests({"a"})
+        a.graph.collect_retired_sources()
+        assert not owner.freed
+        a.events[0].ready = True
+        a.graph.collect_retired_sources()
+        assert owner.freed
+    finally:
+        if enabled:
+            gc.enable()
