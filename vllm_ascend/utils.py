@@ -1449,10 +1449,37 @@ def enable_dsa_cp() -> bool:
     from vllm.config import get_current_vllm_config
 
     vllm_config = get_current_vllm_config()
-    is_ds_v32 = hasattr(vllm_config.model_config, "hf_text_config") and hasattr(
+    has_indexer = hasattr(vllm_config.model_config, "hf_text_config") and hasattr(
         vllm_config.model_config.hf_text_config, "index_topk"
     )
-    return bool(is_ds_v32 and enable_sp())
+    if not has_indexer:
+        return False
+
+    additional_config = getattr(vllm_config, "additional_config", None) or {}
+    dsa_cp_enable = bool(additional_config.get("enable_dsa_cp", False))
+    if dsa_cp_enable and not enable_sp():
+        raise ValueError(
+            "DSA CP requires SP to be enabled. Please enable SP "
+            "(VLLM_ASCEND_ENABLE_FLASHCOMM1=1) to use DSA CP."
+        )
+    return dsa_cp_enable and enable_sp()
+
+
+@lru_cache(maxsize=1)
+def enable_dsa_cp_prefill_full_o_proj() -> bool:
+    """Whether to use the experimental producer full-o_proj path.
+
+    This is deliberately independent from DSA-CP's main switch so the
+    original DSA-CP path remains available for A/B correctness and performance
+    comparisons. The optimization has no effect unless DSA-CP itself is on.
+    """
+    if not enable_dsa_cp():
+        return False
+    from vllm.config import get_current_vllm_config
+
+    vllm_config = get_current_vllm_config()
+    additional_config = getattr(vllm_config, "additional_config", None) or {}
+    return bool(additional_config.get("enable_dsa_cp_prefill_full_o_proj", False))
 
 
 @lru_cache(maxsize=1)
@@ -1470,7 +1497,7 @@ def enable_dsa_cp_with_layer_shard() -> bool:
 
 @lru_cache(maxsize=1)
 def enable_dsa_cp_with_o_proj_tp() -> bool:
-    if not enable_dsa_cp():
+    if not enable_dsa_cp_prefill_full_o_proj():
         return False
     from vllm.config import get_current_vllm_config
 

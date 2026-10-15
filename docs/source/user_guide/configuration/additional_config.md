@@ -46,6 +46,8 @@ The following table lists additional configuration options available in vLLM Asc
 | `layer_sharding`                    | dict | `{}`    | Configuration options for Layer Sharding Linear |
 | `enable_sparse_c8`                  | bool | `False` | Whether to enable KV cache C8 in DSA models (e.g., DeepSeekV3.2 and GLM5). Not supported on A5 devices now |
 | `enable_mc2_hierarchy_comm`         | bool | `False` | Enable dispatch/combine op inter-node communication by ROCE. |
+| `enable_dsa_cp`                      | bool | `False` | Explicitly enable DSA context parallelism for DSA/SFA models. Requires FlashComm1/SP to be enabled. |
+| `enable_dsa_cp_prefill_full_o_proj`  | bool | `False` | Experimental: when DSA-CP is enabled, use the P producer prefill/mixed full-`o_proj` gather path. The original DSA-CP path remains active when this option is false. |
 
 The details of each configuration option are as follows:
 

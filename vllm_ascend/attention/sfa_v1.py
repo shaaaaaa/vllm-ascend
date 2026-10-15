@@ -34,7 +34,6 @@ from vllm.v1.attention.backend import (
 from vllm.v1.kv_cache_interface import AttentionSpec
 
 from vllm_ascend import envs
-from vllm_ascend.worker.dsa_shared_pool import MixedIndexerMetadata
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import (
     _EXTRA_CTX,
@@ -126,12 +125,14 @@ from vllm_ascend.utils import (
     enable_dsa_cp,
     enable_dsa_cp_with_layer_shard,
     enable_dsa_cp_with_o_proj_tp,
+    enable_sp,
     get_weight_prefetch_method,
     maybe_trans_nz,
     parse_layer_idx,
     staged_sfa_graph_capture_sizes,
     staged_sfa_graph_configured,
 )
+from vllm_ascend.worker.dsa_shared_pool import MixedIndexerMetadata
 from vllm_ascend.worker.npu_input_batch import NPUInputBatch
 
 if TYPE_CHECKING:
@@ -1165,6 +1166,7 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
         self.attn_mask_builder = AttentionMaskBuilder(self.device)
         self.rope_dim = self.model_config.hf_text_config.qk_rope_head_dim
         self.enable_dsa_cp = enable_dsa_cp()
+        self.enable_sp = enable_sp()
         self.dsa_shrink_latent = int(envs.VLLM_ASCEND_DSA_SHRINK_LATENT) if envs.VLLM_ASCEND_DSA_UNBUNDLE else 0
         if self.dsa_shrink_latent and self.decode_threshold > 2:
             raise ValueError(
@@ -2247,6 +2249,7 @@ class AscendSFAImpl(MLAAttentionImpl):
 
         # Effective in SFA when FlashComm is enabled.
         self.enable_dsa_cp = enable_dsa_cp()
+        self.enable_sp = enable_sp()
 
         # Enable layer sharding via DSA-CP on the P node in the PD-disaggregated setup.
         self.enable_dsa_cp_with_layer_shard = enable_dsa_cp_with_layer_shard()
@@ -5402,6 +5405,14 @@ class AscendSFAImpl(MLAAttentionImpl):
         # Inputs and outputs may be padded for CUDA graphs
         num_input_tokens = attn_metadata.num_input_tokens
         output_padded = output
+
+        # FlashComm/SP can be enabled independently of DSA-CP. In that mode
+        # SFA still receives the globally gathered/unpadded hidden states, but
+        # must not build or use the DSA-CP metadata path.
+        if self.enable_sp and not self.enable_dsa_cp and need_gather_q_kv:
+            hidden_states = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(
+                hidden_states.contiguous(), True
+            )
 
         # All-gather o_proj weight and any input-sharded quantization
         # parameters for the producer prefill path.
