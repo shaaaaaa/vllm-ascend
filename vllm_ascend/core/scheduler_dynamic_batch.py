@@ -376,11 +376,23 @@ class SchedulerDynamicBatch(Scheduler):
                         request.num_external_computed_tokens = (
                             num_external_computed_tokens
                         )
-                        dsa_compact_external_load = load_kv_async and bool(
-                            getattr(
-                                self.connector,
-                                "supports_dsa_compact_external_load",
-                                False,
+                        compact_load_query = (
+                            getattr(self.connector, "is_dsa_cold_compact_load", None)
+                            if load_kv_async else None
+                        )
+                        request_compact_load = (
+                            compact_load_query(request.request_id)
+                            if callable(compact_load_query) else None
+                        )
+                        dsa_compact_external_load = load_kv_async and (
+                            bool(request_compact_load)
+                            if request_compact_load is not None
+                            else bool(
+                                getattr(
+                                    self.connector,
+                                    "supports_dsa_compact_external_load",
+                                    False,
+                                )
                             )
                         )
 
@@ -445,6 +457,21 @@ class SchedulerDynamicBatch(Scheduler):
                 # creates a mismatch between the number
                 # of local and remote blocks.
                 effective_lookahead_tokens = 0 if request.num_computed_tokens == 0 else self.num_lookahead_tokens
+
+                if load_kv_async:
+                    restore_extent_query = getattr(
+                        self.connector, "get_dsa_cold_load_num_tokens", None
+                    )
+                    if callable(restore_extent_query):
+                        # Restore storage may extend beyond the reusable prefix.
+                        # Reserving it must not schedule any model computation.
+                        restore_tokens = int(restore_extent_query(request.request_id))
+                        effective_lookahead_tokens = max(
+                            effective_lookahead_tokens,
+                            restore_tokens
+                            - num_new_local_computed_tokens
+                            - num_external_computed_tokens,
+                        )
 
                 # Determine if we need to allocate cross-attention blocks.
                 if self.is_encoder_decoder and request.has_encoder_inputs:
