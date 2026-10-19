@@ -475,6 +475,12 @@ class NPUWorker(WorkerBase):
         gc.collect()
         torch.npu.empty_cache()
 
+        transfer = self.vllm_config.kv_transfer_config
+        if transfer is not None and transfer.kv_connector == "LMCacheAscendConnectorV1Dynamic":
+            from lmcache.v1.rpc.storage_bootstrap import early_bootstrap_decoder_storage
+
+            self._decoder_storage_bootstrap = early_bootstrap_decoder_storage(self)
+
         # take current memory snapshot
         self.init_snapshot = MemorySnapshot()
         self.requested_memory = self.init_snapshot.total_memory * self.cache_config.gpu_memory_utilization
@@ -1218,6 +1224,9 @@ class NPUWorker(WorkerBase):
     def shutdown(self) -> None:
         self.release_sfa_graph_resources()
         super().shutdown()
+        storage = getattr(self, "_decoder_storage_bootstrap", None)
+        if storage is not None:
+            storage.close()
 
     def check_health(self) -> None:
         self._raise_if_remote_fill_restart_required()
