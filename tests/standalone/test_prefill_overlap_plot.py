@@ -83,3 +83,33 @@ def test_no_matching_logs_is_a_clear_error(tmp_path, capsys):
     path.write_text("ordinary service output")
     assert plot.main([str(path)]) == 2
     assert "No complete" in capsys.readouterr().err
+
+
+def test_figure_shows_timings_per_worker_chunk_without_changing_csv_totals(tmp_path, monkeypatch):
+    pytest.importorskip("matplotlib")
+    from matplotlib.figure import Figure
+
+    second = dict(record(0.3, 3, step=2), dma_ms=40, load_ms=24, save_ms=16, wait_ms=15, interval_ms=80)
+    rows, _ = plot.aggregate_records([record(0.9, 1), second])
+    saved = []
+    original_save = Figure.savefig
+
+    def save(figure, *args, **kwargs):
+        saved.append(figure)
+        return original_save(figure, *args, **kwargs)
+
+    monkeypatch.setattr(Figure, "savefig", save)
+    output = tmp_path / "overlap.png"
+    plot.plot_rows(rows, output)
+    assert output.stat().st_size > 0
+    axes = saved[0].axes
+    assert len(axes) == 6
+    expected = (0.45, 30, 13, 17, 10, 60)
+    for axis, value in zip(axes, expected):
+        assert list(axis.lines[0].get_ydata()) == pytest.approx([value])
+        assert axis.get_xticklabels()[0].get_text() == "0-4,095"
+    assert "save_ms" in axes[2].get_title()
+    assert "load_ms" in axes[3].get_title()
+    assert rows[0]["save_ms"] == 26
+    assert rows[0]["load_ms"] == 34
+    assert rows[0]["worker_steps"] == 2

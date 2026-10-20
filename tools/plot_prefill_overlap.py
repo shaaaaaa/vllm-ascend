@@ -138,7 +138,11 @@ def write_csv(rows: list[dict[str, Any]], output: Path) -> None:
 
 
 def plot_rows(rows: list[dict[str, Any]], output: Path) -> None:
-    """Render a white-background plot; x labels are inclusive token ranges."""
+    """Plot coverage and timing per worker step against actual token ranges.
+
+    CSV timing fields remain sums. Dividing by worker_steps here keeps repeated
+    requests and --aggregate-ranks comparable with individual worker chunks.
+    """
     import matplotlib
 
     matplotlib.use("Agg")
@@ -150,29 +154,58 @@ def plot_rows(rows: list[dict[str, Any]], output: Path) -> None:
     series: dict[tuple, list[dict[str, Any]]] = {}
     for row in rows:
         series.setdefault((row["dp_rank"], row["tp_rank"]), []).append(row)
-    figure, axis = plt.subplots(figsize=(min(22, max(10, len(spans) * 0.8)), 6))
+    figure, axes = plt.subplots(
+        3,
+        2,
+        figsize=(min(26, max(14, len(spans) * 1.4)), 13),
+        sharex=True,
+    )
     figure.set_facecolor("white")
-    axis.set_facecolor("white")
+    panels = (
+        ("coverage", "Mean layer coverage", "Coverage"),
+        ("dma_ms", "Save + load: dma_ms", "ms / worker chunk"),
+        ("save_ms", "NPU to CPU: save_ms", "ms / worker chunk"),
+        ("load_ms", "CPU to NPU: load_ms", "ms / worker chunk"),
+        ("wait_ms", "Bank wait: wait_ms (first layer excluded)", "ms / worker chunk"),
+        ("interval_ms", "Layer start intervals: interval_ms (sum)", "ms / worker chunk"),
+    )
     for (dp, tp), measurements in sorted(series.items()):
         label = "All ranks" if tp is None else f"DP{dp} TP{tp}"
-        axis.plot(
-            [span_indices[(r["token_start"], r["token_end"])] for r in measurements],
-            [r["coverage"] for r in measurements],
-            marker="o",
-            linewidth=1.6,
-            label=label,
-        )
-    axis.set_xticks(range(len(spans)))
-    axis.set_xticklabels([f"{start:,}-{end - 1:,}" for start, end in spans], rotation=35, ha="right")
-    axis.set_xlabel("Prefill token range (request-local, inclusive)")
-    axis.set_ylabel("Mean layer coverage")
-    axis.set_title("Two-bank prefill overlap")
-    axis.yaxis.set_major_formatter(PercentFormatter(1.0))
+        positions = [span_indices[(r["token_start"], r["token_end"])] for r in measurements]
+        for axis, (metric, _, _) in zip(axes.flat, panels):
+            values = [r[metric] if metric == "coverage" else r[metric] / r["worker_steps"] for r in measurements]
+            axis.plot(positions, values, marker="o", linewidth=1.6, label=label)
+    for axis, (metric, title, ylabel) in zip(axes.flat, panels):
+        axis.set_facecolor("white")
+        axis.set_xticks(range(len(spans)))
+        axis.set_xticklabels([f"{start:,}-{end - 1:,}" for start, end in spans], rotation=35, ha="right")
+        axis.tick_params(axis="x", labelbottom=True)
+        axis.set_ylabel(ylabel)
+        axis.set_title(title)
+        axis.grid(axis="y", alpha=0.25)
+        if metric != "coverage":
+            axis.set_ylim(bottom=0)
+    coverage_axis = axes[0, 0]
+    coverage_axis.yaxis.set_major_formatter(PercentFormatter(1.0))
     values = [row["coverage"] for row in rows]
-    axis.set_ylim(min(0.0, min(values) - 0.03), max(1.02, max(values) + 0.03))
-    axis.grid(axis="y", alpha=0.25)
-    axis.legend(ncol=min(4, len(series)), fontsize="small")
-    figure.tight_layout()
+    coverage_axis.set_ylim(min(0.0, min(values) - 0.03), max(1.02, max(values) + 0.03))
+    for axis in axes[-1]:
+        axis.set_xlabel("Prefill token range (request-local, inclusive)")
+    handles, labels = coverage_axis.get_legend_handles_labels()
+    figure.legend(
+        handles,
+        labels,
+        loc="upper center",
+        bbox_to_anchor=(0.5, 0.945),
+        ncol=min(8, len(series)),
+        fontsize="small",
+    )
+    figure.suptitle(
+        "Two-bank prefill overlap and timing\n"
+        "Times: mean per worker/chunk; overlapping bank durations are added, not wall-clock time.",
+        fontsize=13,
+    )
+    figure.tight_layout(rect=(0, 0, 1, 0.91))
     figure.savefig(output, dpi=170, facecolor="white")
     plt.close(figure)
 

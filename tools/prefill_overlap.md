@@ -81,9 +81,14 @@ python3 tools/plot_prefill_overlap.py server.log --output overlap.png
 ```
 
 多个日志可以一起处理，支持带引号的 glob。输出白底图片及同名 CSV。
-横轴是实际 prefill token 区间，纵轴是覆盖率百分比；默认每个 DP/TP rank 一条曲线。
+图包含六个子图：覆盖率、`dma_ms`（save + load）、`save_ms`（卸载）、
+`load_ms`（加载）、`wait_ms`（除首层外的 bank 等待总时间）、
+`interval_ms`（有效相邻层起点间隔之和）。横轴都是实际 prefill token 区间。
+覆盖率纵轴为百分比；耗时纵轴为毫秒，默认每个 DP/TP rank 一条曲线。
 相同 rank、相同 token 区间的多个样本按有效层数合并，仍保持逐层比值的平均口径。
 可使用 `--request-id`、`--tp-rank`、`--dp-rank` 筛选，或者 `--aggregate-ranks` 合成一条曲线。
+图中耗时使用每个 worker/chunk 的平均值（时间总和 / `worker_steps`），
+避免重复请求或合并多个 rank 后，单纯因为样本数量增多而把耗时画大。
 
 ```bash
 python3 tools/plot_prefill_overlap.py 'tp4_dp4_logs/*.log' \
@@ -92,6 +97,7 @@ python3 tools/plot_prefill_overlap.py 'tp4_dp4_logs/*.log' \
 
 图和 CSV 保留真实区间及异常覆盖率；重复日志行会去重。
 CSV 中的耗时为对应样本的总和，覆盖率不从这些时间总和重新计算。
+已有的 `[PREFILL_OVERLAP]` 日志可以直接重新绘图，无需重新采集。
 
 ## 本地 CPU 验证
 
