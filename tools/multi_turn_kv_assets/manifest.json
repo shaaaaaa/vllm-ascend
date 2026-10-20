@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "content": "Original synthetic Harbor City public-service archive; all names, events and figures are fictional.",
+  "prefix_file": "prefix_500k.txt",
+  "prefix_utf8_bytes": 2485389,
+  "prefix_characters": 2484991,
+  "reference_token_count": 499964,
+  "reference_tokenizer": "zai-org/GLM-5 tokenizer.json, downloaded 2026-10-20; add_special_tokens=False",
+  "reference_tokenizer_url": "https://huggingface.co/zai-org/GLM-5/resolve/main/tokenizer.json",
+  "token_count_note": "Reference count only. Actual GLM-5.3 prompt_tokens are reported by the served model; runtime does not resize text.",
+  "questions_file": "questions_50.txt",
+  "followup_questions": 50,
+  "runtime_text_generation": false
+}
