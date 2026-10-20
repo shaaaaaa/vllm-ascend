@@ -62,6 +62,12 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE": lambda: _strict_bool_env(
         "VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE"
     ),
+    # Non-secret P-node two-bank overlap statistics. Default false; accepts
+    # true/false. Records NPU timing events, without host synchronization;
+    # a background collector emits one summary per chunked-prefill step.
+    "VLLM_ASCEND_PREFILL_OVERLAP_STATS": lambda: _strict_bool_env(
+        "VLLM_ASCEND_PREFILL_OVERLAP_STATS"
+    ),
     # max compile thread number for package building. Usually, it is set to
     # the number of CPU cores. If not set, the default value is None, which
     # means all number of CPU cores will be used.
