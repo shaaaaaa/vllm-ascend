@@ -18,10 +18,11 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from plot_prefill_overlap import read_records, write_csv
+from plot_prefill_overlap import WAIT_DETAILS, read_records, wait_details, write_csv
 from prefill_overlap_collect import add_collection_arguments, collect_logs
 
-TIMINGS = ("dma_ms", "save_ms", "load_ms", "wait_ms", "interval_ms")
+CORE_TIMINGS = ("dma_ms", "save_ms", "load_ms", "wait_ms", "interval_ms")
+TIMINGS = (*CORE_TIMINGS, *WAIT_DETAILS)
 
 
 def read_rounds(directory: Path) -> list[dict[str, Any]]:
@@ -104,8 +105,9 @@ def aggregate_rounds(
             continue
         samples = int(record["layer_samples"])
         coverage = float(record["coverage"])
-        times = {name: float(record[name]) for name in TIMINGS}
-        if samples <= 0 or not all(math.isfinite(v) for v in (coverage, *times.values())):
+        times = {name: float(record[name]) for name in CORE_TIMINGS}
+        times.update(wait_details(record))
+        if samples <= 0 or not all(math.isfinite(v) for v in (coverage, *times.values()) if v is not None):
             raise ValueError(f"Non-finite or invalid measurements for {request_id}")
         dp, tp = (None, None) if aggregate_ranks else (record.get("dp_rank"), record.get("tp_rank"))
         key = (turn, dp, tp)
@@ -135,7 +137,7 @@ def aggregate_rounds(
         row["coverage"] += coverage * samples
         row["chunk_records"] += 1
         for name in TIMINGS:
-            row[name] += times[name]
+            row[name] = None if row[name] is None or times[name] is None else row[name] + times[name]
         chunks.append(
             dict(
                 round=turn,
@@ -158,7 +160,8 @@ def aggregate_rounds(
         row["worker_count"] = len(workers[key])
         row["coverage"] /= row["layer_samples"]
         for name in TIMINGS:
-            row[name] /= row["worker_count"]
+            if row[name] is not None:
+                row[name] /= row["worker_count"]
         rows.append(row)
     chunks.sort(key=lambda row: (row["round"], str(row["dp_rank"]), str(row["tp_rank"]), row["token_start"]))
     present = {row["round"] for row in rows}
@@ -170,12 +173,16 @@ def aggregate_rounds(
         dropped_steps=dropped,
         coverage_policy="Mean of recorded per-layer ratios, weighted by layer_samples across chunks/workers.",
         timing_policy="Sum all recorded chunk times per worker/round, then mean over observed workers; not wall time.",
+        first_layer_policy=(
+            "Plot first_layer_wait_ms and all_wait_ms; no preceding-layer ratio exists for the first layer."
+        ),
+        missing_wait_detail_records=sum(any(chunk[name] is None for name in WAIT_DETAILS) for chunk in chunks),
     )
     return rows, chunks, diagnostics
 
 
 def plot_rounds(rows: list[dict[str, Any]], rounds: list[int], output: Path) -> None:
-    """Draw six white-background panels; break curves at missing rounds."""
+    """Draw eight white-background panels, including first-layer and total waits."""
     import matplotlib
 
     matplotlib.use("Agg")
@@ -183,14 +190,16 @@ def plot_rounds(rows: list[dict[str, Any]], rounds: list[int], output: Path) -> 
     from matplotlib.ticker import MaxNLocator, PercentFormatter
 
     panels = (
-        ("coverage", "Mean layer coverage", "Coverage"),
+        ("coverage", "Mean adjacent-layer coverage (first layer has no ratio)", "Coverage"),
         ("dma_ms", "Save + load: dma_ms", "ms / worker / round"),
         ("save_ms", "NPU to CPU: save_ms", "ms / worker / round"),
         ("load_ms", "CPU to NPU: load_ms", "ms / worker / round"),
-        ("wait_ms", "Bank wait: wait_ms (first layer excluded)", "ms / worker / round"),
+        ("all_wait_ms", "Bank wait: ALL layers, including first", "ms / worker / round"),
+        ("first_layer_wait_ms", "First-layer bank wait (sum over chunks)", "ms / worker / round"),
+        ("wait_ms", "Bank wait in adjacent-layer coverage samples", "ms / worker / round"),
         ("interval_ms", "Layer start intervals: interval_ms (sum)", "ms / worker / round"),
     )
-    figure, axes = plt.subplots(3, 2, figsize=(16, 12), sharex=True, facecolor="white")
+    figure, axes = plt.subplots(4, 2, figsize=(16, 15), sharex=True, facecolor="white")
     series: dict[tuple, dict[int, dict[str, Any]]] = {}
     for row in rows:
         series.setdefault((row["dp_rank"], row["tp_rank"]), {})[row["round"]] = row
@@ -199,7 +208,10 @@ def plot_rounds(rows: list[dict[str, Any]], rounds: list[int], output: Path) -> 
         for axis, (metric, _, _) in zip(axes.flat, panels):
             axis.plot(
                 rounds,
-                [values[turn][metric] if turn in values else math.nan for turn in rounds],
+                [
+                    values[turn][metric] if turn in values and values[turn].get(metric) is not None else math.nan
+                    for turn in rounds
+                ],
                 marker="o",
                 markersize=3.5,
                 linewidth=1.5,
@@ -222,10 +234,11 @@ def plot_rounds(rows: list[dict[str, Any]], rounds: list[int], output: Path) -> 
     figure.legend(handles, labels, loc="upper center", bbox_to_anchor=(0.5, 0.94), ncol=min(8, len(series)))
     figure.suptitle(
         "Multi-turn prefill overlap and timing\n"
+        "Times include first-layer wait; absent wait details are left blank.\n"
         "Times sum all measured chunks in a round; bank durations overlap and are not wall-clock time.",
         fontsize=13,
     )
-    figure.tight_layout(rect=(0, 0, 1, 0.9))
+    figure.tight_layout(rect=(0, 0, 1, 0.97))
     figure.savefig(output, dpi=170, facecolor="white")
     plt.close(figure)
 
@@ -296,6 +309,10 @@ def main(argv: list[str] | None = None) -> int:
         print(
             f"[MULTI_TURN_OVERLAP] incomplete/skipped measurements; see {args.output.with_suffix('.json')}",
             file=sys.stderr,
+        )
+    if diagnostics["missing_wait_detail_records"]:
+        print(
+            "[MULTI_TURN_OVERLAP] missing first/all-layer wait data; left blank, never treated as zero", file=sys.stderr
         )
     return 0
 

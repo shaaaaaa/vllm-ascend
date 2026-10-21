@@ -12,11 +12,31 @@ import argparse
 import csv
 import glob
 import json
+import math
 import sys
 from pathlib import Path
 from typing import Any
 
 MARKER = "[PREFILL_OVERLAP]"
+WAIT_DETAILS = ("first_layer_wait_ms", "all_wait_ms")
+
+
+def wait_details(record: dict[str, Any]) -> dict[str, float | None]:
+    """Keep recorded startup/all-layer waits; absent data must not become zero.
+
+    These fields have always been emitted separately from adjacent-layer
+    coverage. Do not infer missing values from wait_ms: it only sums layers
+    with a valid preceding interval, which need not cover every recorded gate.
+    """
+    values = {}
+    for name in WAIT_DETAILS:
+        value = record.get(name)
+        if value is not None:
+            value = float(value)
+            if not math.isfinite(value):
+                raise ValueError(f"Non-finite {name} in overlap record")
+        values[name] = value
+    return values
 
 
 def read_records(paths: list[Path]) -> tuple[list[dict[str, Any]], int]:
@@ -105,6 +125,8 @@ def aggregate_records(
                 save_ms=0.0,
                 wait_ms=0.0,
                 interval_ms=0.0,
+                first_layer_wait_ms=0.0,
+                all_wait_ms=0.0,
             ),
         )
         samples = record["layer_samples"]
@@ -113,6 +135,8 @@ def aggregate_records(
         row["worker_steps"] += 1
         for metric in ("dma_ms", "load_ms", "save_ms", "wait_ms", "interval_ms"):
             row[metric] += record[metric]
+        for metric, value in wait_details(record).items():
+            row[metric] = None if value is None or row[metric] is None else row[metric] + value
     rows = list(buckets.values())
     for row in rows:
         row["coverage"] /= row["layer_samples"]
@@ -155,25 +179,34 @@ def plot_rows(rows: list[dict[str, Any]], output: Path) -> None:
     for row in rows:
         series.setdefault((row["dp_rank"], row["tp_rank"]), []).append(row)
     figure, axes = plt.subplots(
-        3,
+        4,
         2,
-        figsize=(min(26, max(14, len(spans) * 1.4)), 13),
+        figsize=(min(26, max(14, len(spans) * 1.4)), 16),
         sharex=True,
     )
     figure.set_facecolor("white")
     panels = (
-        ("coverage", "Mean layer coverage", "Coverage"),
+        ("coverage", "Mean adjacent-layer coverage (first layer has no ratio)", "Coverage"),
         ("dma_ms", "Save + load: dma_ms", "ms / worker chunk"),
         ("save_ms", "NPU to CPU: save_ms", "ms / worker chunk"),
         ("load_ms", "CPU to NPU: load_ms", "ms / worker chunk"),
-        ("wait_ms", "Bank wait: wait_ms (first layer excluded)", "ms / worker chunk"),
+        ("all_wait_ms", "Bank wait: ALL layers, including first", "ms / worker chunk"),
+        ("first_layer_wait_ms", "First-layer bank wait", "ms / worker chunk"),
+        ("wait_ms", "Bank wait in adjacent-layer coverage samples", "ms / worker chunk"),
         ("interval_ms", "Layer start intervals: interval_ms (sum)", "ms / worker chunk"),
     )
     for (dp, tp), measurements in sorted(series.items()):
         label = "All ranks" if tp is None else f"DP{dp} TP{tp}"
         positions = [span_indices[(r["token_start"], r["token_end"])] for r in measurements]
         for axis, (metric, _, _) in zip(axes.flat, panels):
-            values = [r[metric] if metric == "coverage" else r[metric] / r["worker_steps"] for r in measurements]
+            values = [
+                math.nan
+                if r.get(metric) is None
+                else r[metric]
+                if metric == "coverage"
+                else r[metric] / r["worker_steps"]
+                for r in measurements
+            ]
             axis.plot(positions, values, marker="o", linewidth=1.6, label=label)
     for axis, (metric, title, ylabel) in zip(axes.flat, panels):
         axis.set_facecolor("white")
@@ -202,10 +235,11 @@ def plot_rows(rows: list[dict[str, Any]], output: Path) -> None:
     )
     figure.suptitle(
         "Prefill overlap and timing\n"
+        "Times include first-layer wait; absent wait details are left blank.\n"
         "Times: mean per worker/chunk; overlapping bank durations are added, not wall-clock time.",
         fontsize=13,
     )
-    figure.tight_layout(rect=(0, 0, 1, 0.91))
+    figure.tight_layout(rect=(0, 0, 1, 0.97))
     figure.savefig(output, dpi=170, facecolor="white")
     plt.close(figure)
 

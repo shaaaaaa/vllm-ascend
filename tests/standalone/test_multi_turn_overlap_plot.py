@@ -32,7 +32,7 @@ def rounds():
     ]
 
 
-def record(turn=0, tp=0, step=1, coverage=0.5, samples=2, duration=10):
+def record(turn=0, tp=0, step=1, coverage=0.5, samples=2, duration=10, first=1):
     return dict(
         schema_version=1,
         status="complete",
@@ -46,6 +46,8 @@ def record(turn=0, tp=0, step=1, coverage=0.5, samples=2, duration=10):
         ],
         coverage=coverage,
         layer_samples=samples,
+        first_layer_wait_ms=first,
+        all_wait_ms=duration + first,
         **{name: duration for name in ("dma_ms", "save_ms", "load_ms", "wait_ms", "interval_ms")},
     )
 
@@ -97,6 +99,30 @@ def test_aggregate_ranks_averages_complete_worker_round_totals(plot):
     assert rows[0]["save_ms"] == 300 and rows[0]["tp_rank"] == 1
 
 
+def test_first_layer_waits_are_summed_per_chunk_then_averaged_per_worker(plot):
+    records = [
+        record(tp=0, first=100),
+        record(tp=0, step=2, duration=30, first=200),
+        record(tp=1, duration=100, first=1000),
+        record(tp=1, step=2, duration=200, first=2000),
+    ]
+    rows, chunks, _ = plot.aggregate_rounds(records, rounds(), aggregate_ranks=True)
+    assert rows[0]["first_layer_wait_ms"] == 1650
+    assert rows[0]["all_wait_ms"] == 1820
+    assert rows[0]["wait_ms"] == 170
+    assert rows[0]["coverage"] == 0.5  # Startup has no previous layer; do not invent a ratio.
+    assert [r["first_layer_wait_ms"] for r in chunks] == [100, 200, 1000, 2000]
+
+
+def test_missing_first_layer_wait_data_remains_unknown_instead_of_zero(plot):
+    legacy = record(step=2)
+    del legacy["first_layer_wait_ms"], legacy["all_wait_ms"]
+    rows, _, diagnostic = plot.aggregate_rounds([record(), legacy], rounds())
+    assert rows[0]["first_layer_wait_ms"] is None and rows[0]["all_wait_ms"] is None
+    assert rows[0]["wait_ms"] == 20 and rows[0]["coverage"] == 0.5
+    assert diagnostic["missing_wait_detail_records"] == 1
+
+
 def test_mixed_batches_and_other_requests_are_excluded(plot):
     mixed = record()
     mixed["requests"].append(dict(req_id="another", token_start=0, token_end=4096))
@@ -145,15 +171,20 @@ def test_real_cli_deduplicates_logs_and_exports_rounds_and_chunks(plot, tmp_path
     assert plot.main([str(log), "--run-dir", str(tmp_path), "--output", str(output)]) == 0
     assert output.stat().st_size > 0
     figure = saved[0]
-    assert len(figure.axes) == 6
+    assert len(figure.axes) == 8
     assert list(figure.axes[0].lines[0].get_xdata()) == [0, 1, 2]
     y = figure.axes[2].lines[0].get_ydata()
     assert y[0] == 40 and y[2] == 7
     assert str(y[1]) == "nan"  # Missing round breaks the curve; it is not zero.
+    assert list(figure.axes[4].lines[0].get_ydata())[::2] == [42, 8]
+    assert list(figure.axes[5].lines[0].get_ydata())[::2] == [2, 1]
+    assert "including first" in figure.axes[4].get_title()
     diagnostic = json.loads(output.with_suffix(".json").read_text(encoding="utf-8"))
     assert diagnostic["missing_rounds"] == [1]
     with output.with_suffix(".chunks.csv").open(encoding="utf-8") as source:
-        assert len(list(csv.DictReader(source))) == 3
+        chunk_rows = list(csv.DictReader(source))
+        assert len(chunk_rows) == 3
+        assert [float(row["first_layer_wait_ms"]) for row in chunk_rows] == [1, 1, 1]
     assert (
         plot.main(
             [str(log), "--run-dir", str(tmp_path), "--start-round", "1", "--output", str(tmp_path / "followups.png")]

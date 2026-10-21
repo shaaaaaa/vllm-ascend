@@ -62,6 +62,11 @@ token 区间来自调度器这次实际计算的 `[start, end)`，按 request �
 - 每段覆盖率：所有有效相邻层覆盖率的**算术平均**。首层不参与；
   不是 `1 - sum(wait) / sum(interval)`，也不用 DMA 总耗时作分母。
 
+这个 coverage 衡量逐层起点间隔中的 bank 等待比例，不是直接测得的“DMA 时间有多少
+与计算重叠”，更不代表整个请求没有传输开销。少数长间隔层的等待可能被其他层的高比例
+稀释；首层之前、最后层之后的时间也不在这些间隔内。判断启动等待要同时看
+`first_layer_wait_ms`、`all_wait_ms` 和客户端 TTFT，不能只看 coverage。
+
 load/save 的两端 event 记录在该 bank 原有的 FIFO stream 上，且在已有的计算完成依赖之后。
 因此传输区间不包含传输流等待计算完成的时间。
 `load_ms`、`save_ms`、`dma_ms` 同时输出，按各 bank 区间累加；不同 stream
@@ -104,9 +109,12 @@ python3 tools/plot_prefill_overlap.py server.log --output overlap.png
 ```
 
 多个日志可以一起处理，支持带引号的 glob。输出白底图片及同名 CSV。
-图包含六个子图：覆盖率、`dma_ms`（save + load）、`save_ms`（卸载）、
-`load_ms`（加载）、`wait_ms`（除首层外的 bank 等待总时间）、
+图包含八个子图：覆盖率、`dma_ms`（save + load）、`save_ms`（卸载）、
+`load_ms`（加载）、`all_wait_ms`（包括首层的所有 bank 等待）、
+`first_layer_wait_ms`（首层 bank 等待）、`wait_ms`（有效相邻层的 bank 等待）、
 `interval_ms`（有效相邻层起点间隔之和）。横轴都是实际 prefill token 区间。
+首层等待始终保留在图和 CSV 中；只有相邻层覆盖率因缺少上一层起点而不计算首层比值。
+若旧日志缺少首层或全层等待字段，对应结果留空，不会用零填补。
 覆盖率纵轴为百分比；耗时纵轴为毫秒，默认每个 DP/TP rank 一条曲线。
 相同 rank、相同 token 区间的多个样本按有效层数合并，仍保持逐层比值的平均口径。
 可使用 `--request-id`、`--tp-rank`、`--dp-rank` 筛选，或者 `--aggregate-ranks` 合成一条曲线。

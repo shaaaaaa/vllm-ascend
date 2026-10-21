@@ -161,7 +161,14 @@ python3 tools/plot_multi_turn_overlap.py 'P1_logs/P_dp*.log' 'P2_logs/P_dp*.log'
 不按日志出现顺序猜轮次，也不会把另一组测试的请求混进来。
 
 图为白底，横轴是轮次：0 是初始化长前缀，1–50 是后续追加。
-六个子图分别显示 coverage、save+load、save、load、bank wait、layer start interval。
+八个子图分别显示 coverage、save+load、save、load、含首层的总 bank wait、
+首层 bank wait、参与相邻层覆盖率计算的 bank wait、layer start interval。
+服务日志中原有的 `first_layer_wait_ms`、`all_wait_ms` 现在保留到逐轮 CSV 和逐 chunk CSV。
+`all_wait_ms` 包含首层，`wait_ms` 保持原有相邻层统计口径；首层等待不会被丢弃。
+每个 chunk 都有自己的首层等待，同一轮先累加各 chunk 的首层等待，再按 worker 取平均。
+首层没有上一层起点，因此不能凭空计算相邻层覆盖率，其等待时间单独展示。
+已有服务日志可以直接重新绘图，无需重跑推理；仅有旧版汇总 CSV 无法还原首层等待，
+要读取原始 `[PREFILL_OVERLAP]` 日志。缺失字段留空，不视为零。
 若第 0 轮远大于后续轮次，用同一命令加 `--start-round 1`，只看 50 轮追加；
 也可以用 `--end-round 10` 截取区间。
 

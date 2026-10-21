@@ -30,6 +30,8 @@ def record(coverage=0.5, samples=2, step=1, tp=0, start=0, end=4096):
         save_ms=10,
         wait_ms=5,
         interval_ms=40,
+        first_layer_wait_ms=3,
+        all_wait_ms=8,
     )
 
 
@@ -85,11 +87,30 @@ def test_no_matching_logs_is_a_clear_error(tmp_path, capsys):
     assert "No complete" in capsys.readouterr().err
 
 
+def test_first_layer_and_all_wait_details_are_preserved_without_inventing_missing_values():
+    rows, _ = plot.aggregate_records([record(), record(step=2)])
+    assert rows[0]["first_layer_wait_ms"] == 6 and rows[0]["all_wait_ms"] == 16
+    legacy = record(step=2)
+    del legacy["first_layer_wait_ms"], legacy["all_wait_ms"]
+    rows, _ = plot.aggregate_records([record(), legacy])
+    assert rows[0]["first_layer_wait_ms"] is None and rows[0]["all_wait_ms"] is None
+    assert rows[0]["coverage"] == 0.5
+
+
 def test_figure_shows_timings_per_worker_chunk_without_changing_csv_totals(tmp_path, monkeypatch):
     pytest.importorskip("matplotlib")
     from matplotlib.figure import Figure
 
-    second = dict(record(0.3, 3, step=2), dma_ms=40, load_ms=24, save_ms=16, wait_ms=15, interval_ms=80)
+    second = dict(
+        record(0.3, 3, step=2),
+        dma_ms=40,
+        load_ms=24,
+        save_ms=16,
+        wait_ms=15,
+        interval_ms=80,
+        first_layer_wait_ms=7,
+        all_wait_ms=22,
+    )
     rows, _ = plot.aggregate_records([record(0.9, 1), second])
     saved = []
     original_save = Figure.savefig
@@ -103,8 +124,8 @@ def test_figure_shows_timings_per_worker_chunk_without_changing_csv_totals(tmp_p
     plot.plot_rows(rows, output)
     assert output.stat().st_size > 0
     axes = saved[0].axes
-    assert len(axes) == 6
-    expected = (0.45, 30, 13, 17, 10, 60)
+    assert len(axes) == 8
+    expected = (0.45, 30, 13, 17, 15, 5, 10, 60)
     for axis, value in zip(axes, expected):
         assert list(axis.lines[0].get_ydata()) == pytest.approx([value])
         assert axis.get_xticklabels()[0].get_text() == "0-4,095"
