@@ -49,6 +49,42 @@ def read_rounds(directory: Path) -> list[dict[str, Any]]:
     return sorted(result, key=lambda row: row["round"])
 
 
+def ttft_seconds(row: dict[str, Any]) -> float:
+    """Use client TTFT as measured; CSV blanks are missing, never zero."""
+    value = row.get("ttft_s")
+    if value is None or value == "":
+        return math.nan
+    value = float(value)
+    if not math.isfinite(value) or value < 0:
+        raise ValueError(f"Invalid client TTFT for round {row['round']}")
+    return value
+
+
+def label_points(axis: Any, metric: str, turns: list[int], values: list[float], color: Any) -> None:
+    """Label finite points, staggering adjacent labels to keep small changes visible."""
+    for index, (turn, value) in enumerate(zip(turns, values)):
+        if not math.isfinite(value):
+            continue
+        if metric == "coverage":
+            label = f"{100 * value:.4f}%"
+        elif value != 0 and abs(value) < 1:
+            label = f"{value:.3g}"
+        else:
+            label = f"{value:.2f}"
+        axis.annotate(
+            label,
+            (turn, value),
+            xytext=(0, 6 if index % 2 == 0 else 17),
+            textcoords="offset points",
+            ha="left" if index == 0 else "right" if index == len(turns) - 1 else "center",
+            va="bottom",
+            fontsize=7,
+            color=color,
+            bbox=dict(facecolor="white", edgecolor="none", alpha=0.8, pad=0.3),
+            annotation_clip=False,
+        )
+
+
 def match_round(request_id: str, rounds: list[dict[str, Any]]) -> int | None:
     """Match exact client/response IDs with vLLM prefixes and internal suffixes.
 
@@ -181,8 +217,14 @@ def aggregate_rounds(
     return rows, chunks, diagnostics
 
 
-def plot_rounds(rows: list[dict[str, Any]], rounds: list[int], output: Path) -> None:
-    """Draw eight white-background panels, including first-layer and total waits."""
+def plot_rounds(
+    rows: list[dict[str, Any]],
+    rounds: list[int],
+    output: Path,
+    *,
+    client_rounds: list[dict[str, Any]] | None = None,
+) -> None:
+    """Draw annotated bank metrics and one end-to-end client TTFT curve."""
     import matplotlib
 
     matplotlib.use("Agg")
@@ -197,26 +239,39 @@ def plot_rounds(rows: list[dict[str, Any]], rounds: list[int], output: Path) -> 
         ("all_wait_ms", "Bank wait: ALL layers, including first", "ms / worker / round"),
         ("first_layer_wait_ms", "First-layer bank wait (sum over chunks)", "ms / worker / round"),
         ("wait_ms", "Bank wait in adjacent-layer coverage samples", "ms / worker / round"),
-        ("interval_ms", "Layer start intervals: interval_ms (sum)", "ms / worker / round"),
+        ("ttft_s", "Client TTFT by round", "seconds / request"),
     )
-    figure, axes = plt.subplots(4, 2, figsize=(16, 15), sharex=True, facecolor="white")
+    width = min(36, max(16, len(rounds) * 0.7))
+    figure, axes = plt.subplots(4, 2, figsize=(width, 15), sharex=True, facecolor="white")
     series: dict[tuple, dict[int, dict[str, Any]]] = {}
     for row in rows:
         series.setdefault((row["dp_rank"], row["tp_rank"]), {})[row["round"]] = row
     for (dp, tp), values in series.items():
         label = "Observed workers (mean)" if tp is None else f"DP{dp} TP{tp}"
         for axis, (metric, _, _) in zip(axes.flat, panels):
-            axis.plot(
+            if metric == "ttft_s":
+                continue
+            points = [
+                values[turn][metric] if turn in values and values[turn].get(metric) is not None else math.nan
+                for turn in rounds
+            ]
+            (line,) = axis.plot(
                 rounds,
-                [
-                    values[turn][metric] if turn in values and values[turn].get(metric) is not None else math.nan
-                    for turn in rounds
-                ],
+                points,
                 marker="o",
                 markersize=3.5,
                 linewidth=1.5,
                 label=label,
             )
+            label_points(axis, metric, rounds, points, line.get_color())
+    # TTFT belongs to the client request, not a rank/chunk. Plot it once and
+    # retain completed client rounds even when a server measurement is missing.
+    client = {row["round"]: row for row in (client_rounds if client_rounds is not None else rows)}
+    ttfts = [ttft_seconds(client[turn]) if turn in client else math.nan for turn in rounds]
+    ttft_axis = axes[-1, -1]
+    (line,) = ttft_axis.plot(rounds, ttfts, marker="o", markersize=3.5, color="tab:purple", label="Client TTFT")
+    label_points(ttft_axis, "ttft_s", rounds, ttfts, line.get_color())
+    ttft_axis.legend(loc="upper right", fontsize="small")
     for axis, (metric, title, ylabel) in zip(axes.flat, panels):
         axis.set_facecolor("white")
         axis.set_title(title)
@@ -226,16 +281,17 @@ def plot_rounds(rows: list[dict[str, Any]], rounds: list[int], output: Path) -> 
         axis.tick_params(axis="x", labelbottom=True)
         axis.grid(alpha=0.25)
         if metric != "coverage":
+            axis.margins(y=0.2)
             axis.set_ylim(bottom=0)
     values = [row["coverage"] for row in rows]
     axes[0, 0].yaxis.set_major_formatter(PercentFormatter(1.0))
-    axes[0, 0].set_ylim(min(0.0, min(values) - 0.03), max(1.02, max(values) + 0.03))
+    axes[0, 0].set_ylim(min(0.0, min(values) - 0.03), max(1.12, max(values) + 0.12))
     handles, labels = axes[0, 0].get_legend_handles_labels()
     figure.legend(handles, labels, loc="upper center", bbox_to_anchor=(0.5, 0.94), ncol=min(8, len(series)))
     figure.suptitle(
         "Multi-turn prefill overlap and timing\n"
         "Times include first-layer wait; absent wait details are left blank.\n"
-        "Times sum all measured chunks in a round; bank durations overlap and are not wall-clock time.",
+        "Bank times: ms / worker / round (not wall time). Client TTFT: seconds / request.",
         fontsize=13,
     )
     figure.tight_layout(rect=(0, 0, 1, 0.97))
@@ -295,7 +351,7 @@ def main(argv: list[str] | None = None) -> int:
             json.dumps(diagnostics, ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",
         )
-        plot_rounds(rows, [row["round"] for row in rounds], args.output)
+        plot_rounds(rows, [row["round"] for row in rounds], args.output, client_rounds=rounds)
     except (OSError, ValueError, KeyError, TypeError, ImportError) as error:
         print(f"[MULTI_TURN_OVERLAP] {error}", file=sys.stderr)
         return 2

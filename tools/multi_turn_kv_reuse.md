@@ -162,7 +162,13 @@ python3 tools/plot_multi_turn_overlap.py 'P1_logs/P_dp*.log' 'P2_logs/P_dp*.log'
 
 图为白底，横轴是轮次：0 是初始化长前缀，1–50 是后续追加。
 八个子图分别显示 coverage、save+load、save、load、含首层的总 bank wait、
-首层 bank wait、参与相邻层覆盖率计算的 bank wait、layer start interval。
+首层 bank wait、参与相邻层覆盖率计算的 bank wait、每轮客户端 TTFT。
+不再绘制 layer start interval；`interval_ms` 仍保留在 CSV 中供核查。
+TTFT 从客户端 `summary.json` / `metrics.csv` 的 `ttft_s` 读取，单位为秒，
+每个请求只画一次，不随 TP rank 或 chunk 数重复累计。服务端统计缺失的已完成轮次，
+只要客户端记录了 TTFT，TTFT 子图仍会显示；没有 TTFT 的轮次留空。
+所有子图的数据点旁都标出数值，coverage 标百分比，bank 耗时标毫秒，TTFT 标秒。
+较多轮次时图片自动加宽，标签交错排列，便于保留第 0 轮时读取后续轮次的具体数值。
 服务日志中原有的 `first_layer_wait_ms`、`all_wait_ms` 现在保留到逐轮 CSV 和逐 chunk CSV。
 `all_wait_ms` 包含首层，`wait_ms` 保持原有相邻层统计口径；首层等待不会被丢弃。
 每个 chunk 都有自己的首层等待，同一轮先累加各 chunk 的首层等待，再按 worker 取平均。

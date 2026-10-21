@@ -27,6 +27,7 @@ def rounds():
             request_id=f"multi-run-{i:03d}",
             response_id=f"cmpl-response-{i}",
             prompt_tokens=500000 + i * 128,
+            ttft_s=(271.099606, 26.227285, 23.801610)[i],
         )
         for i in range(3)
     ]
@@ -179,6 +180,16 @@ def test_real_cli_deduplicates_logs_and_exports_rounds_and_chunks(plot, tmp_path
     assert list(figure.axes[4].lines[0].get_ydata())[::2] == [42, 8]
     assert list(figure.axes[5].lines[0].get_ydata())[::2] == [2, 1]
     assert "including first" in figure.axes[4].get_title()
+    assert not any("interval" in axis.get_title().lower() for axis in figure.axes)
+    ttft_axis = figure.axes[7]
+    assert "TTFT" in ttft_axis.get_title()
+    assert len(ttft_axis.lines) == 1
+    assert list(ttft_axis.lines[0].get_ydata()) == pytest.approx([271.099606, 26.227285, 23.801610])
+    assert [text.get_text() for text in ttft_axis.texts] == ["271.10", "26.23", "23.80"]
+    for axis in figure.axes[:7]:
+        assert len(axis.texts) == 2  # Only the observed points, never a label for a missing value.
+    assert [text.get_text() for text in figure.axes[0].texts] == ["45.0000%", "50.0000%"]
+    assert [text.get_text() for text in figure.axes[2].texts] == ["40.00", "7.00"]
     diagnostic = json.loads(output.with_suffix(".json").read_text(encoding="utf-8"))
     assert diagnostic["missing_rounds"] == [1]
     with output.with_suffix(".chunks.csv").open(encoding="utf-8") as source:
@@ -192,6 +203,44 @@ def test_real_cli_deduplicates_logs_and_exports_rounds_and_chunks(plot, tmp_path
         == 0
     )
     assert list(saved[-1].axes[0].lines[0].get_xdata()) == [1, 2]
+    assert [text.get_text() for text in saved[-1].axes[7].texts] == ["26.23", "23.80"]
+
+
+def test_ttft_is_one_client_curve_instead_of_duplicated_rank_or_chunk_times(plot, tmp_path, monkeypatch):
+    pytest.importorskip("matplotlib")
+    from matplotlib.figure import Figure
+
+    saved = []
+    monkeypatch.setattr(Figure, "savefig", lambda figure, *args, **kwargs: saved.append(figure))
+    rows, _, _ = plot.aggregate_rounds([record(), record(step=2), record(tp=1)], rounds())
+    plot.plot_rounds(rows, [0, 1, 2], tmp_path / "ranks.png", client_rounds=rounds())
+    axes = saved[0].axes
+    assert len(axes[0].lines) == 2
+    assert len(axes[7].lines) == 1
+    assert list(axes[7].lines[0].get_ydata()) == pytest.approx([271.099606, 26.227285, 23.801610])
+    assert len(axes[7].texts) == 3
+
+
+def test_csv_ttft_strings_blanks_and_zero_keep_their_meaning_in_the_plot(plot, tmp_path, monkeypatch):
+    pytest.importorskip("matplotlib")
+    from matplotlib.figure import Figure
+
+    saved = []
+    monkeypatch.setattr(Figure, "savefig", lambda figure, *args, **kwargs: saved.append(figure))
+    metadata = rounds()
+    metadata[0]["ttft_s"] = 0
+    metadata[1]["ttft_s"] = ""
+    with (tmp_path / "metrics.csv").open("w", encoding="utf-8", newline="") as output:
+        writer = csv.DictWriter(output, fieldnames=list(metadata[0]))
+        writer.writeheader()
+        writer.writerows(metadata)
+    metadata = plot.read_rounds(tmp_path)
+    rows, _, _ = plot.aggregate_rounds([record(turn=i) for i in range(3)], metadata)
+    plot.plot_rounds(rows, [0, 1, 2], tmp_path / "blanks.png", client_rounds=metadata)
+    axis = saved[0].axes[7]
+    values = list(axis.lines[0].get_ydata())
+    assert values[0] == 0 and str(values[1]) == "nan" and values[2] == pytest.approx(23.801610)
+    assert [text.get_text() for text in axis.texts] == ["0.00", "23.80"]
 
 
 def test_unmatched_logs_fail_clearly(plot, tmp_path, capsys):

@@ -122,7 +122,7 @@ def test_native_password_multi_host_collection_then_round_plot(collect, tmp_path
 
     monkeypatch.setattr(transport.subprocess, "run", ssh)
     rendered = []
-    monkeypatch.setattr(plot, "plot_rounds", lambda rows, rounds, path: rendered.append((rows, rounds)))
+    monkeypatch.setattr(plot, "plot_rounds", lambda rows, rounds, path, **kwargs: rendered.append((rows, rounds)))
     run_dir = tmp_path / "client"
     run_dir.mkdir()
     (run_dir / "summary.json").write_text(
