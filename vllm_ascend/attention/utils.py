@@ -416,6 +416,8 @@ def _dsa_remap_frontier(load_spec: Any) -> int:
     """Derive the operator boundary without changing LMCache commit progress."""
     if load_spec is None:
         return 0
+    if getattr(load_spec, "dsa_full_resident", False):
+        return 0
     cold_compact_resume = bool(
         getattr(load_spec, "dsa_cold_compact_resume", False)
     )
@@ -542,7 +544,10 @@ def staged_sfa_metadata_sparse_route(
         load_spec = getattr(request, "load_spec", None)
         if load_spec is None:
             return StagedSFARouteReason.SPARSE_LOAD_UNAVAILABLE, (), ()
-        can_load = bool(getattr(load_spec, "can_load", False))
+        can_load = bool(
+            getattr(load_spec, "can_load", False)
+            and not getattr(load_spec, "dsa_full_resident", False)
+        )
         try:
             cached = int(getattr(load_spec, "lmcache_cached_tokens", 0) or 0)
             committed_raw = getattr(load_spec, "dsa_committed_end", None)

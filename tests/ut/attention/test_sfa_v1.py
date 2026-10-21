@@ -729,6 +729,28 @@ class TestLMCacheSparseFrontier(TestBase):
             (StagedSFARouteReason.SPARSE_LOAD_UNAVAILABLE, ()),
         )
 
+    def test_full_resident_sparse_metadata_never_becomes_retrieve(self):
+        request = SimpleNamespace(
+            req_id="req-0",
+            is_sparse_decode=True,
+            dsa_current_released_frontier=0,
+            dsa_nonresident_frontier=0,
+            load_spec=SimpleNamespace(
+                can_load=True,
+                lmcache_cached_tokens=256,
+                dsa_full_resident=True,
+            ),
+        )
+        metadata = SimpleNamespace(requests=[request])
+
+        self.assertEqual(
+            attention_utils.staged_sfa_metadata_sparse_load(
+                metadata,
+                ["req-0"],
+            ),
+            (StagedSFARouteReason.ELIGIBLE, (0,)),
+        )
+
     def test_invalid_frontier_invariants_fail_closed(self):
         valid_load = {
             "can_load": True,
