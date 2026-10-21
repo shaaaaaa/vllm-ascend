@@ -258,3 +258,64 @@ def test_unmatched_logs_fail_clearly(plot, tmp_path, capsys):
     log.write_text("ordinary log", encoding="utf-8")
     assert plot.main([str(log), "--run-dir", str(tmp_path)]) == 2
     assert "No overlap records matched" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("source", ["summary.json", "metrics.csv"])
+def test_ttft_only_reads_completed_client_rounds_without_server_access(plot, tmp_path, monkeypatch, source):
+    pytest.importorskip("matplotlib")
+    from matplotlib.figure import Figure
+
+    metadata = rounds()
+    metadata[1]["ttft_s"] = ""
+    if source == "summary.json":
+        (tmp_path / source).write_text(json.dumps(dict(status="interrupted", rounds=metadata)), encoding="utf-8")
+    else:
+        with (tmp_path / source).open("w", encoding="utf-8", newline="") as output:
+            writer = csv.DictWriter(output, fieldnames=list(metadata[0]))
+            writer.writeheader()
+            writer.writerows(metadata)
+
+    def unexpected_server_access(*args, **kwargs):
+        pytest.fail("Client-only TTFT must not access server logs or SSH")
+
+    monkeypatch.setattr(plot, "collect_logs", unexpected_server_access)
+    monkeypatch.setattr(plot, "read_records", unexpected_server_access)
+    saved = []
+    monkeypatch.setattr(Figure, "savefig", lambda figure, *args, **kwargs: saved.append(figure))
+    output = tmp_path / "plots" / "ttft.png"
+    assert (
+        plot.main(
+            [
+                "--run-dir",
+                str(tmp_path),
+                "--ttft-only",
+                "--start-round",
+                "1",
+                "--end-round",
+                "10",
+                "--output",
+                str(output),
+            ]
+        )
+        == 0
+    )
+    assert len(saved[0].axes) == 1
+    axis = saved[0].axes[0]
+    assert list(axis.lines[0].get_xdata()) == [1, 2]
+    values = list(axis.lines[0].get_ydata())
+    assert str(values[0]) == "nan" and values[1] == pytest.approx(23.801610)
+    assert [text.get_text() for text in axis.texts] == ["23.80"]
+    with output.with_suffix(".csv").open(encoding="utf-8", newline="") as source:
+        rows = list(csv.DictReader(source))
+    assert [row["round"] for row in rows] == ["1", "2"]
+    assert rows[0]["ttft_s"] == ""
+    assert float(rows[1]["ttft_s"]) == pytest.approx(23.801610)
+
+
+def test_ttft_only_rejects_absent_client_measurements(plot, tmp_path, capsys):
+    metadata = rounds()
+    for row in metadata:
+        row.pop("ttft_s")
+    (tmp_path / "summary.json").write_text(json.dumps(dict(rounds=metadata)), encoding="utf-8")
+    assert plot.main(["--run-dir", str(tmp_path), "--ttft-only"]) == 2
+    assert "No client TTFT values" in capsys.readouterr().err

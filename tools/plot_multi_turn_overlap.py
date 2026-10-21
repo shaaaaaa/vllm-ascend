@@ -4,6 +4,8 @@
 
 python3 tools/plot_multi_turn_overlap.py server.log --run-dir multi-turn-on \
     --aggregate-ranks --output multi-turn-overlap.png
+python3 tools/plot_multi_turn_overlap.py --run-dir multi-turn-on \
+    --ttft-only --output multi-turn-ttft.png
 Only offline plotting needs matplotlib; no vLLM or NPU imports are required.
 """
 
@@ -312,6 +314,32 @@ def plot_rounds(
     plt.close(figure)
 
 
+def plot_ttft(rounds: list[dict[str, Any]], output: Path) -> None:
+    """Plot client TTFT alone, without server records or rank aggregation."""
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.ticker import MaxNLocator
+
+    turns = [row["round"] for row in rounds]
+    values = [ttft_seconds(row) for row in rounds]
+    figure, axis = plt.subplots(figsize=(min(36, max(10, len(turns) * 0.7)), 5), facecolor="white")
+    axis.set_facecolor("white")
+    (line,) = axis.plot(turns, values, marker="o", color="tab:purple")
+    label_points(axis, "ttft_s", turns, values, line.get_color())
+    axis.set_title("Client TTFT by round")
+    axis.set_xlabel("Dialogue round (0 = initial prefix)")
+    axis.set_ylabel("TTFT (seconds / request)")
+    axis.xaxis.set_major_locator(MaxNLocator(integer=True, nbins=12))
+    axis.grid(alpha=0.25)
+    axis.margins(y=0.2)
+    axis.set_ylim(bottom=0)
+    figure.tight_layout()
+    figure.savefig(output, dpi=170, facecolor="white")
+    plt.close(figure)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("logs", nargs="*", help="Local P-node service logs or quoted glob patterns")
@@ -319,6 +347,7 @@ def main(argv: list[str] | None = None) -> int:
         "--run-dir", type=Path, required=True, help="Client output directory containing summary.json/metrics.csv"
     )
     parser.add_argument("--output", type=Path, default=Path("multi-turn-overlap.png"))
+    parser.add_argument("--ttft-only", action="store_true", help="Plot only client TTFT; no server logs or SSH")
     parser.add_argument("--tp-rank", type=int)
     parser.add_argument("--dp-rank", type=int)
     parser.add_argument("--aggregate-ranks", action="store_true", help="One curve averaging observed workers")
@@ -327,8 +356,6 @@ def main(argv: list[str] | None = None) -> int:
     add_collection_arguments(parser)
     args = parser.parse_args(argv)
     try:
-        if not args.logs and not args.hosts:
-            raise ValueError("Provide local log paths or --hosts for automatic SSH collection")
         rounds = [
             row
             for row in read_rounds(args.run_dir)
@@ -336,6 +363,20 @@ def main(argv: list[str] | None = None) -> int:
         ]
         if not rounds:
             raise ValueError("No client rounds matched the selected range")
+        if args.ttft_only:
+            rows = []
+            for row in rounds:
+                value = ttft_seconds(row)
+                rows.append(dict(round=row["round"], ttft_s=value if math.isfinite(value) else None))
+            if not any(row["ttft_s"] is not None for row in rows):
+                raise ValueError("No client TTFT values in the selected rounds")
+            args.output.parent.mkdir(parents=True, exist_ok=True)
+            plot_ttft(rounds, args.output)
+            write_csv(rows, args.output.with_suffix(".csv"))
+            print(f"[MULTI_TURN_TTFT] rounds={len(rows)} plot={args.output} csv={args.output.with_suffix('.csv')}")
+            return 0
+        if not args.logs and not args.hosts:
+            raise ValueError("Provide local log paths or --hosts for automatic SSH collection, or use --ttft-only")
         paths = sorted({Path(p) for pattern in args.logs for p in (glob.glob(pattern) or [pattern])})
         collected = None
         if args.hosts:

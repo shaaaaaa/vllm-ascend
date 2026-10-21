@@ -99,6 +99,24 @@ python3 -m pytest --confcutdir=tests/standalone \
   tests/standalone/test_multi_turn_kv_reuse.py -q -o addopts= -o log_cli=false
 ```
 
+## 只用客户端数据画 TTFT
+
+不需要服务端日志或 SSH，直接读取已有测试输出目录：
+
+```bash
+python3 tools/plot_multi_turn_overlap.py \
+  --run-dir multi-turn-on \
+  --ttft-only \
+  --output multi-turn-ttft.png
+```
+
+生成白底的逐轮 TTFT 曲线，点旁标注秒数，同时输出同名 `.csv`。
+读取 `summary.json`，没有该文件时读取 `metrics.csv`；仅使用已完成轮次，
+中断的测试也可绘图，缺失 TTFT 留空。可加 `--start-round 1 --end-round 10`
+只看第 1 至 10 轮。TTFT 是从开始发送请求到收到第一个非空文本增量的客户端
+耗时，包含上传、排队、PD 交接和网络时间，不能用它单独拆分服务端各阶段耗时。
+绘图需要 matplotlib，不需要开启服务端 overlap 统计。
+
 ## 按对话轮次画 overlap 图
 
 P 节点启动服务前开启统计，随后按上面的命令运行客户端并保留 `multi-turn-on` 目录：
