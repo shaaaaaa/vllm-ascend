@@ -22,6 +22,8 @@ import os
 from collections.abc import Callable
 from typing import Any
 
+from vllm.v1.core.dsa_shared_pool import layerwise_prefill_bank_count
+
 
 def _strict_bool_env(name: str, default: bool = False) -> bool:
     raw = os.getenv(name, "true" if default else "false")
@@ -62,7 +64,12 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE": lambda: _strict_bool_env(
         "VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE"
     ),
-    # Non-secret P-node two-bank overlap statistics. Default false; accepts
+    # Non-secret P-node bank rotation depth. Positive integer, default 2;
+    # ignored unless the P-node switch above is true. Read before startup.
+    # NUM_BANK is a short alias; the namespaced setting takes precedence.
+    "VLLM_ASCEND_LAYERWISE_PREFILL_NUM_BANKS": layerwise_prefill_bank_count,
+    "NUM_BANK": layerwise_prefill_bank_count,
+    # Non-secret P-node bank overlap statistics. Default false; accepts
     # true/false. Records NPU timing events, without host synchronization;
     # a background collector emits one summary per chunked-prefill step.
     "VLLM_ASCEND_PREFILL_OVERLAP_STATS": lambda: _strict_bool_env(

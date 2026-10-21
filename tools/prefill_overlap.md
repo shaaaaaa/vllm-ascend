@@ -1,8 +1,8 @@
-# Prefill two-bank overlap statistics
+# Prefill bank overlap statistics
 
 四仓 `dev-lmy` 分别基于 fetch 后的 `origin/dsa-two-groups`（vllm）、
 `origin/sparse`（vllm-ascend）及 `origin/dev-qzy`（两个 LMCache 仓）。
-请配套更新四仓；vllm 本次只有分支，没有代码改动。
+请配套更新四仓。
 
 在 **P 节点启动服务之前**设置：
 
@@ -10,6 +10,23 @@
 export VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE=true
 export VLLM_ASCEND_PREFILL_OVERLAP_STATS=true
 ```
+
+bank 数默认是 2，可以在 P 节点启动前设置 `export NUM_BANK=8`。
+完整变量名是 `VLLM_ASCEND_LAYERWISE_PREFILL_NUM_BANKS`，与 `NUM_BANK`
+含义相同，同时设置时以完整变量名为准。合法值为正整数，非敏感配置；
+未开启 P-node 开关时忽略此配置，D 节点保持原路径。
+
+设置为 8 时，每个实际 prefill chunk 的计算开始前，先异步提交各 KV 组的
+前 8 层历史 KV 加载；组内层数不足 8 时只提交存在的层。latent 和 indexer
+各自按组内层序轮转，indexer 的序号不是模型层号。冷请求第一段没有历史
+KV 时无需加载。第 N 层在计算流上等待自己的加载 event；最后一次读取 bank
+后记录计算 event，同一 bank 的 FIFO 依次执行 `save N → load N+8`。
+这些传输与其他 bank 上的层计算重叠，不为增加 bank 数新增主线程同步。
+
+物理 block 分配、block table、跨 chunk 偏移和调度容量估算均使用相同 bank 数。
+总 KV 池仍在启动时预分配，增加 bank 数不会自动扩容；同一长度请求从 2 改为
+8 bank，其轮转 KV block 用量约为原来的 4 倍，可容纳的并发或上下文容量相应下降。
+传输总量不会因预取窗口变大而减少，是否加速需要实机测量。
 
 第二个变量默认 `false`，合法值为 `true` / `false`，不是敏感配置。
 它必须与已有 P-node 开关同时开启才生效。D 节点保持原配置。
