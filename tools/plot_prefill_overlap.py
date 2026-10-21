@@ -18,15 +18,22 @@ from pathlib import Path
 from typing import Any
 
 MARKER = "[PREFILL_OVERLAP]"
-WAIT_DETAILS = ("first_layer_wait_ms", "all_wait_ms")
+COVERAGE_DEFINITION = "same_bank_reuse_v1"
+WAIT_DETAILS = ("first_layer_wait_ms", "all_wait_ms", "initial_bank_wait_ms")
+
+
+def require_bank_reuse_coverage(record: dict[str, Any]) -> None:
+    if record.get("schema_version") != 2 or record.get("coverage_definition") != COVERAGE_DEFINITION:
+        raise ValueError(
+            "Same-bank coverage requires schema 2 logs; old adjacent-layer summaries cannot reconstruct it"
+        )
 
 
 def wait_details(record: dict[str, Any]) -> dict[str, float | None]:
     """Keep recorded startup/all-layer waits; absent data must not become zero.
 
-    These fields have always been emitted separately from adjacent-layer
-    coverage. Do not infer missing values from wait_ms: it only sums layers
-    with a valid preceding interval, which need not cover every recorded gate.
+    Do not infer missing values from wait_ms: first use of each physical bank
+    has no predecessor and therefore is not a same-bank reuse sample.
     """
     values = {}
     for name in WAIT_DETAILS:
@@ -41,7 +48,7 @@ def wait_details(record: dict[str, Any]) -> dict[str, float | None]:
 
 def read_records(paths: list[Path]) -> tuple[list[dict[str, Any]], int]:
     """Read JSON inside prefixed/colored service logs, deduplicating copies."""
-    records, seen, ignored = [], set(), 0
+    records, seen, ignored, legacy = [], set(), 0, 0
     decoder = json.JSONDecoder()
     for path in paths:
         with path.open(encoding="utf-8", errors="replace") as source:
@@ -53,8 +60,11 @@ def read_records(paths: list[Path]) -> tuple[list[dict[str, Any]], int]:
                 except (ValueError, TypeError):
                     ignored += 1
                     continue
+                if record.get("schema_version") == 1 and record.get("status") == "complete":
+                    legacy += 1
                 if (
-                    record.get("schema_version") != 1
+                    record.get("schema_version") != 2
+                    or record.get("coverage_definition") != COVERAGE_DEFINITION
                     or record.get("status") != "complete"
                     or record.get("coverage") is None
                     or not record.get("layer_samples", 0)
@@ -65,6 +75,12 @@ def read_records(paths: list[Path]) -> tuple[list[dict[str, Any]], int]:
                 if key not in seen:
                     seen.add(key)
                     records.append(record)
+    if legacy:
+        print(
+            f"[PREFILL_OVERLAP_PLOT] skipped {legacy} legacy adjacent-layer summaries; "
+            "same-bank coverage requires new server statistics and cannot be reconstructed from old totals",
+            file=sys.stderr,
+        )
     return records, ignored
 
 
@@ -84,6 +100,7 @@ def aggregate_records(
     buckets: dict[tuple, dict[str, Any]] = {}
     mixed = 0
     for record in records:
+        require_bank_reuse_coverage(record)
         if tp_rank is not None and record.get("tp_rank") != tp_rank:
             continue
         if dp_rank is not None and record.get("dp_rank") != dp_rank:
@@ -118,6 +135,7 @@ def aggregate_records(
                 token_start=start,
                 token_end=end,
                 layer_samples=0,
+                coverage_definition=COVERAGE_DEFINITION,
                 worker_steps=0,
                 coverage=0.0,
                 dma_ms=0.0,
@@ -127,6 +145,7 @@ def aggregate_records(
                 interval_ms=0.0,
                 first_layer_wait_ms=0.0,
                 all_wait_ms=0.0,
+                initial_bank_wait_ms=0.0,
             ),
         )
         samples = record["layer_samples"]
@@ -186,14 +205,14 @@ def plot_rows(rows: list[dict[str, Any]], output: Path) -> None:
     )
     figure.set_facecolor("white")
     panels = (
-        ("coverage", "Mean adjacent-layer coverage (first layer has no ratio)", "Coverage"),
+        ("coverage", "Mean same-bank reuse coverage", "Coverage"),
         ("dma_ms", "Save + load: dma_ms", "ms / worker chunk"),
         ("save_ms", "NPU to CPU: save_ms", "ms / worker chunk"),
         ("load_ms", "CPU to NPU: load_ms", "ms / worker chunk"),
         ("all_wait_ms", "Bank wait: ALL layers, including first", "ms / worker chunk"),
         ("first_layer_wait_ms", "First-layer bank wait", "ms / worker chunk"),
-        ("wait_ms", "Bank wait in adjacent-layer coverage samples", "ms / worker chunk"),
-        ("interval_ms", "Layer start intervals: interval_ms (sum)", "ms / worker chunk"),
+        ("wait_ms", "Wait at same-bank reuse", "ms / worker chunk"),
+        ("interval_ms", "Same-bank reuse windows: interval_ms (sum)", "ms / worker chunk"),
     )
     for (dp, tp), measurements in sorted(series.items()):
         label = "All ranks" if tp is None else f"DP{dp} TP{tp}"

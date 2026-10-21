@@ -15,7 +15,8 @@ _SPEC.loader.exec_module(plot)
 
 def record(coverage=0.5, samples=2, step=1, tp=0, start=0, end=4096):
     return dict(
-        schema_version=1,
+        schema_version=2,
+        coverage_definition="same_bank_reuse_v1",
         status="complete",
         step=step,
         host="host",
@@ -32,6 +33,7 @@ def record(coverage=0.5, samples=2, step=1, tp=0, start=0, end=4096):
         interval_ms=40,
         first_layer_wait_ms=3,
         all_wait_ms=8,
+        initial_bank_wait_ms=3,
     )
 
 
@@ -58,6 +60,19 @@ def test_rank_filter_and_weighted_mean_of_layer_ratios():
     assert rows[0]["worker_steps"] == 2
     rows, _ = plot.aggregate_records(records)
     assert len(rows) == 2
+
+
+def test_legacy_adjacent_layer_stats_are_never_relabeled_as_same_bank_coverage(tmp_path, capsys):
+    old = dict(record(0.9999), schema_version=1)
+    old.pop("coverage_definition")
+    current = record(0.4)
+    path = tmp_path / "mixed.log"
+    path.write_text("".join("[PREFILL_OVERLAP] " + json.dumps(row) + "\n" for row in [old, current]), encoding="utf-8")
+    records, ignored = plot.read_records([path])
+    assert records == [current] and ignored == 1
+    assert "cannot be reconstructed" in capsys.readouterr().err
+    with pytest.raises(ValueError, match="old adjacent-layer"):
+        plot.aggregate_records([old])
 
 
 def test_any_multi_request_batch_is_excluded_even_identical_ranges():

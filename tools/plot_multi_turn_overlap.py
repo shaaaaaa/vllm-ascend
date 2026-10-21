@@ -18,7 +18,14 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from plot_prefill_overlap import WAIT_DETAILS, read_records, wait_details, write_csv
+from plot_prefill_overlap import (
+    COVERAGE_DEFINITION,
+    WAIT_DETAILS,
+    read_records,
+    require_bank_reuse_coverage,
+    wait_details,
+    write_csv,
+)
 from prefill_overlap_collect import add_collection_arguments, collect_logs
 
 CORE_TIMINGS = ("dma_ms", "save_ms", "load_ms", "wait_ms", "interval_ms")
@@ -123,6 +130,7 @@ def aggregate_rounds(
     chunks = []
     unmatched, mixed, dropped = set(), 0, 0
     for record in records:
+        require_bank_reuse_coverage(record)
         if tp_rank is not None and record.get("tp_rank") != tp_rank:
             continue
         if dp_rank is not None and record.get("dp_rank") != dp_rank:
@@ -165,6 +173,7 @@ def aggregate_rounds(
                 worker_count=0,
                 chunk_records=0,
                 layer_samples=0,
+                coverage_definition=COVERAGE_DEFINITION,
                 coverage=0.0,
                 **dict.fromkeys(TIMINGS, 0.0),
             ),
@@ -186,6 +195,7 @@ def aggregate_rounds(
                 token_start=request["token_start"],
                 token_end=request["token_end"],
                 layer_samples=samples,
+                coverage_definition=COVERAGE_DEFINITION,
                 coverage=coverage,
                 **times,
             )
@@ -207,10 +217,13 @@ def aggregate_rounds(
         unmatched_request_examples=sorted(unmatched)[:5],
         mixed_request_records=mixed,
         dropped_steps=dropped,
-        coverage_policy="Mean of recorded per-layer ratios, weighted by layer_samples across chunks/workers.",
+        coverage_policy=(
+            "Mean of recorded same-bank reuse layer ratios, weighted by layer_samples across chunks/workers."
+        ),
+        coverage_definition=COVERAGE_DEFINITION,
         timing_policy="Sum all recorded chunk times per worker/round, then mean over observed workers; not wall time.",
         first_layer_policy=(
-            "Plot first_layer_wait_ms and all_wait_ms; no preceding-layer ratio exists for the first layer."
+            "First use of each group/bank has no reuse ratio; retain first-layer, initial-bank and all-layer waits."
         ),
         missing_wait_detail_records=sum(any(chunk[name] is None for name in WAIT_DETAILS) for chunk in chunks),
     )
@@ -232,13 +245,13 @@ def plot_rounds(
     from matplotlib.ticker import MaxNLocator, PercentFormatter
 
     panels = (
-        ("coverage", "Mean adjacent-layer coverage (first layer has no ratio)", "Coverage"),
+        ("coverage", "Mean same-bank reuse coverage", "Coverage"),
         ("dma_ms", "Save + load: dma_ms", "ms / worker / round"),
         ("save_ms", "NPU to CPU: save_ms", "ms / worker / round"),
         ("load_ms", "CPU to NPU: load_ms", "ms / worker / round"),
         ("all_wait_ms", "Bank wait: ALL layers, including first", "ms / worker / round"),
         ("first_layer_wait_ms", "First-layer bank wait (sum over chunks)", "ms / worker / round"),
-        ("wait_ms", "Bank wait in adjacent-layer coverage samples", "ms / worker / round"),
+        ("wait_ms", "Wait at same-bank reuse", "ms / worker / round"),
         ("ttft_s", "Client TTFT by round", "seconds / request"),
     )
     width = min(36, max(16, len(rounds) * 0.7))
@@ -368,7 +381,8 @@ def main(argv: list[str] | None = None) -> int:
         )
     if diagnostics["missing_wait_detail_records"]:
         print(
-            "[MULTI_TURN_OVERLAP] missing first/all-layer wait data; left blank, never treated as zero", file=sys.stderr
+            "[MULTI_TURN_OVERLAP] missing startup/all-layer wait data; left blank, never treated as zero",
+            file=sys.stderr,
         )
     return 0
 

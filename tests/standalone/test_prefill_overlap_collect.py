@@ -37,7 +37,8 @@ def archive_bytes(collect, directory):
 
 def measurement(turn):
     return dict(
-        schema_version=1,
+        schema_version=2,
+        coverage_definition="same_bank_reuse_v1",
         status="complete",
         host=f"node-{turn}",
         pid=10 + turn,

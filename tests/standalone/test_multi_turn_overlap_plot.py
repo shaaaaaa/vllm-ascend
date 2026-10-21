@@ -35,7 +35,8 @@ def rounds():
 
 def record(turn=0, tp=0, step=1, coverage=0.5, samples=2, duration=10, first=1):
     return dict(
-        schema_version=1,
+        schema_version=2,
+        coverage_definition="same_bank_reuse_v1",
         status="complete",
         host="host",
         pid=10 + tp,
@@ -49,6 +50,7 @@ def record(turn=0, tp=0, step=1, coverage=0.5, samples=2, duration=10, first=1):
         layer_samples=samples,
         first_layer_wait_ms=first,
         all_wait_ms=duration + first,
+        initial_bank_wait_ms=first,
         **{name: duration for name in ("dma_ms", "save_ms", "load_ms", "wait_ms", "interval_ms")},
     )
 
@@ -83,6 +85,13 @@ def test_chunk_times_sum_per_round_and_coverage_keeps_mean_of_layer_ratios(plot)
     assert rows[0]["worker_count"] == 1 and rows[0]["chunk_records"] == 2
     assert [r["round"] for r in chunks] == [0, 0, 1]
     assert diagnostics["missing_rounds"] == [2]
+
+
+def test_round_aggregation_rejects_old_coverage_definition(plot):
+    old = dict(record(), schema_version=1)
+    old.pop("coverage_definition")
+    with pytest.raises(ValueError, match="old adjacent-layer"):
+        plot.aggregate_rounds([old], rounds())
 
 
 def test_aggregate_ranks_averages_complete_worker_round_totals(plot):

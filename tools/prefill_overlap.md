@@ -56,16 +56,22 @@ token 区间来自调度器这次实际计算的 `[start, end)`，按 request �
 - `start(N)`：模型第 N 层最后一次 bank 等待结束的 NPU event。
   若该层有 latent 和 indexer 两个等待，取后者的结束点，保证它们都在该起点之前。
   这是 bank 就绪后开始计算的边界，不是 Python 进入 decoder 的主机时间。
-- `wait(N)`：该模型层在计算流上等待 bank 就绪的 NPU 时间之和。
-  indexer 的稀疏组序号会转换为实际模型层号。
-- 每层覆盖率：`1 - wait(N+1) / (start(N+1) - start(N))`。
-- 每段覆盖率：所有有效相邻层覆盖率的**算术平均**。首层不参与；
-  不是 `1 - sum(wait) / sum(interval)`，也不用 DMA 总耗时作分母。
+- 按实际 `(KV group, physical bank)` 找前后两次使用该 bank 的模型层 A、B。
+  latent、indexer 组的 bank 相互独立，chunk 相位偏移也使用实际 bank ID。
+- 每个复用窗口的覆盖率：`1 - wait(group, bank, B) / (start(B) - start(A))`。
+  分子是 B 在这个 bank 的 consumer gate 上等待的 NPU 时间。
+- 4 bank 时，latent 组通常比较 N 和 N+4，而非 N 和 N+1；indexer 组按自己的
+  实际使用顺序比较，稀疏层对应的模型层间隔可能大于 4。
+- 同一模型层有多个有效 bank 比值时先对它们取平均，再对模型层取算术平均，
+  保证有 indexer 的模型层不会重复加权。`layer_samples` 是有效模型层数，
+  `bank_reuse_samples` 是有效 bank 配对数，不用总等待除以总窗口时间重新计算。
+- 每个 chunk 独立配对，不跨 chunk。每个 group/bank 的首次使用没有前驱，
+  该次等待不计算复用比值，但仍计入 `initial_bank_wait_ms` 和 `all_wait_ms`。
+  `first_layer_wait_ms` 继续保留首个模型层的等待。
 
-这个 coverage 衡量逐层起点间隔中的 bank 等待比例，不是直接测得的“DMA 时间有多少
-与计算重叠”，更不代表整个请求没有传输开销。少数长间隔层的等待可能被其他层的高比例
-稀释；首层之前、最后层之后的时间也不在这些间隔内。判断启动等待要同时看
-`first_layer_wait_ms`、`all_wait_ms` 和客户端 TTFT，不能只看 coverage。
+这个 coverage 的窗口与真实 bank 复用关系一致，用于观察下次消费 bank 时仍剩多少等待。
+它不覆盖请求排队等窗口外耗时；启动等待和完整请求时间仍需同时看
+`initial_bank_wait_ms`、`all_wait_ms` 和客户端 TTFT。
 
 load/save 的两端 event 记录在该 bank 原有的 FIFO stream 上，且在已有的计算完成依赖之后。
 因此传输区间不包含传输流等待计算完成的时间。
@@ -75,9 +81,13 @@ load/save 的两端 event 记录在该 bank 原有的 FIFO stream 上，且在�
 event 区间还可能包含主机下发不足时的设备空隙。
 
 每个 TP/DP worker、每段一条 `[PREFILL_OVERLAP]` JSON 日志，包括
-request_id、token 范围、覆盖率、有效层数、等待时间、层间隔总时间、
-首层等待及各 bank 的 load/save 时间。日志异步输出，可能晚于下一批的主机日志。
+request_id、token 范围、覆盖率、有效模型层及 bank 配对数、复用等待、复用窗口累计时间、
+首次使用及全层等待，还有各 bank 的 load/save、配对数及覆盖率。
+日志异步输出，可能晚于下一批的主机日志。
 小于 0 或大于 100% 的异常结果保留原值，`out_of_range_layers` 标记数量，避免隐藏测量问题。
+新口径为 `schema_version=2`、`coverage_definition=same_bank_reuse_v1`。
+旧 schema 1 是相邻模型层统计，不能由旧汇总恢复同 bank 配对的逐层时间，绘图会跳过并提示；
+需要更新 LMCache-Ascend 并重启服务重新统计，不能把旧 coverage 改个名称当作新结果。
 
 ## 开销和完整性
 
@@ -111,9 +121,11 @@ python3 tools/plot_prefill_overlap.py server.log --output overlap.png
 多个日志可以一起处理，支持带引号的 glob。输出白底图片及同名 CSV。
 图包含八个子图：覆盖率、`dma_ms`（save + load）、`save_ms`（卸载）、
 `load_ms`（加载）、`all_wait_ms`（包括首层的所有 bank 等待）、
-`first_layer_wait_ms`（首层 bank 等待）、`wait_ms`（有效相邻层的 bank 等待）、
-`interval_ms`（有效相邻层起点间隔之和）。横轴都是实际 prefill token 区间。
-首层等待始终保留在图和 CSV 中；只有相邻层覆盖率因缺少上一层起点而不计算首层比值。
+`first_layer_wait_ms`（首层 bank 等待）、`wait_ms`（同 bank 有效复用窗口的等待）、
+`interval_ms`（同 bank 复用窗口之和）。横轴都是实际 prefill token 区间。
+这些复用窗口会互相重叠，其总和不是模型墙钟时间。
+首层和全层等待保留在图中，`initial_bank_wait_ms` 另保留在 CSV；
+没有前驱的各 bank 首次使用不计算比值，但不会丢弃等待时间。
 若旧日志缺少首层或全层等待字段，对应结果留空，不会用零填补。
 覆盖率纵轴为百分比；耗时纵轴为毫秒，默认每个 DP/TP rank 一条曲线。
 相同 rank、相同 token 区间的多个样本按有效层数合并，仍保持逐层比值的平均口径。
@@ -128,7 +140,7 @@ python3 tools/plot_prefill_overlap.py 'tp4_dp4_logs/*.log' \
 
 图和 CSV 保留真实区间及异常覆盖率；重复日志行会去重。
 CSV 中的耗时为对应样本的总和，覆盖率不从这些时间总和重新计算。
-已有的 `[PREFILL_OVERLAP]` 日志可以直接重新绘图，无需重新采集。
+已有 schema 2 日志可以直接重新绘图，无需重新采集；schema 1 不能用于新覆盖率。
 
 ## 本地 CPU 验证
 
@@ -145,6 +157,7 @@ python3 -m pytest --confcutdir=tests/standalone \
   tests/standalone/test_prefill_overlap_plot.py
 ```
 
-CPU 测试检查统计公式、首层排除、稀疏组层号、真实调度范围、单请求限制、
+CPU 测试检查 2/4/8 bank 实际复用配对、分组隔离、稀疏组层号、首次使用等待保留、
+按模型层平均、真实调度范围、单请求限制、
 未完成 event 不复用、队列满时不阻塞，以及计时标记不破坏原有 bank FIFO 依赖。
 它们不代替 NPU 性能和硬件计时验证。

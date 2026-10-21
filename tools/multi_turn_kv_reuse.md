@@ -162,7 +162,7 @@ python3 tools/plot_multi_turn_overlap.py 'P1_logs/P_dp*.log' 'P2_logs/P_dp*.log'
 
 图为白底，横轴是轮次：0 是初始化长前缀，1–50 是后续追加。
 八个子图分别显示 coverage、save+load、save、load、含首层的总 bank wait、
-首层 bank wait、参与相邻层覆盖率计算的 bank wait、每轮客户端 TTFT。
+首层 bank wait、同 bank 复用时的 bank wait、每轮客户端 TTFT。
 不再绘制 layer start interval；`interval_ms` 仍保留在 CSV 中供核查。
 TTFT 从客户端 `summary.json` / `metrics.csv` 的 `ttft_s` 读取，单位为秒，
 每个请求只画一次，不随 TP rank 或 chunk 数重复累计。服务端统计缺失的已完成轮次，
@@ -170,11 +170,17 @@ TTFT 从客户端 `summary.json` / `metrics.csv` 的 `ttft_s` 读取，单位为
 所有子图的数据点旁都标出数值，coverage 标百分比，bank 耗时标毫秒，TTFT 标秒。
 较多轮次时图片自动加宽，标签交错排列，便于保留第 0 轮时读取后续轮次的具体数值。
 服务日志中原有的 `first_layer_wait_ms`、`all_wait_ms` 现在保留到逐轮 CSV 和逐 chunk CSV。
-`all_wait_ms` 包含首层，`wait_ms` 保持原有相邻层统计口径；首层等待不会被丢弃。
+`all_wait_ms` 包含所有等待，`wait_ms` 只累计有前驱的同 bank 复用等待。
+`initial_bank_wait_ms` 另保留在 CSV，统计每个 KV 组各 bank 的首次使用等待。
 每个 chunk 都有自己的首层等待，同一轮先累加各 chunk 的首层等待，再按 worker 取平均。
-首层没有上一层起点，因此不能凭空计算相邻层覆盖率，其等待时间单独展示。
-已有服务日志可以直接重新绘图，无需重跑推理；仅有旧版汇总 CSV 无法还原首层等待，
-要读取原始 `[PREFILL_OVERLAP]` 日志。缺失字段留空，不视为零。
+coverage 使用同一个 `(KV group, bank)` 前后两次消费的窗口。4 bank 的 latent 组
+比较 N 与 N+4；indexer 按自身实际 bank 使用顺序配对。每个模型层先平均该层有效 bank
+比值，再对模型层平均，保持所有模型层同权。各 bank 的首次使用没有前驱，不编造比值，
+等待时间仍计入首次使用等待和全层等待。
+新日志为 `schema_version=2`、`coverage_definition=same_bank_reuse_v1`。
+schema 2 原始日志可直接重画；旧 schema 1 按相邻模型层统计，无法恢复同 bank 配对的
+逐层窗口，绘图跳过并提示。要得到新覆盖率，需更新 LMCache-Ascend 后重启服务重新统计。
+仅有旧版汇总 CSV 也无法还原。缺失等待字段留空，不视为零。
 若第 0 轮远大于后续轮次，用同一命令加 `--start-round 1`，只看 50 轮追加；
 也可以用 `--end-round 10` 截取区间。
 
