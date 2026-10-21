@@ -76,7 +76,7 @@ def _write(path, content):
     return path
 
 
-@pytest.mark.parametrize("mode", ["prompt", "env", "per-host"])
+@pytest.mark.parametrize("mode", ["prompt", "env", "per-host", "argument"])
 def test_native_password_multi_host_collection_then_round_plot(collect, tmp_path, monkeypatch, mode, capsys):
     plot = importlib.import_module("plot_multi_turn_overlap")
     transport = importlib.import_module("pd_tensor_collect")
@@ -93,8 +93,14 @@ def test_native_password_multi_host_collection_then_round_plot(collect, tmp_path
         archives[host] = archive_bytes(collect, source)
     secret = "literal-'$-test-password"
     monkeypatch.setenv("TEST_OVERLAP_PASSWORD", secret)
-    monkeypatch.setattr(transport.getpass, "getpass", lambda _: secret)
+
+    def password_prompt(_):
+        assert mode != "argument", "explicit SSH password must never prompt"
+        return secret
+
+    monkeypatch.setattr(transport.getpass, "getpass", password_prompt)
     helpers, commands = [], []
+    source_path = "/custom service/P logs" if mode == "argument" else "/workspace/path with spaces/tp4_dp4_logs"
 
     def ssh(command, *, stdout, stderr, check, env, stdin, timeout, **kwargs):
         assert not check and timeout == 600
@@ -109,7 +115,7 @@ def test_native_password_multi_host_collection_then_round_plot(collect, tmp_path
         assert helper.is_file() and secret not in helper.read_text()
         remote = shlex.split(command[-1])
         assert remote[:6] == ["docker", "exec", "--", "inference", "python3", "-c"]
-        assert remote[-2:] == ["/workspace/path with spaces/tp4_dp4_logs", '["P_dp*.log"]']
+        assert remote[-2:] == [source_path, '["P_dp*.log"]']
         commands.append(command)
         stdout.write(archives[command[-2]])
         return subprocess.CompletedProcess(command, 0)
@@ -126,6 +132,7 @@ def test_native_password_multi_host_collection_then_round_plot(collect, tmp_path
         "prompt": ["--password"],
         "env": ["--password-env", "TEST_OVERLAP_PASSWORD"],
         "per-host": ["--password-per-host"],
+        "argument": ["--ssh-password", secret, "--remote-log-dir", source_path],
     }
     destination = tmp_path / "collected"
     output = tmp_path / "result.png"
@@ -162,10 +169,12 @@ def test_native_password_multi_host_collection_then_round_plot(collect, tmp_path
     manifest = (destination / "collection.json").read_text()
     assert secret not in manifest
     assert all(host["status"] == "success" for host in json.loads(manifest)["hosts"])
+    assert json.loads(manifest)["source_directory"] == source_path
     diagnostic = json.loads(output.with_suffix(".json").read_text())
     assert diagnostic["missing_rounds"] == [] and diagnostic["collection_directory"] == str(destination.resolve())
     captured = capsys.readouterr()
     assert secret not in captured.out + captured.err
+    assert f"remote_log_dir={source_path}" in captured.out
 
 
 @pytest.mark.parametrize("failure", ["ssh", "timeout", "invalid-archive"])

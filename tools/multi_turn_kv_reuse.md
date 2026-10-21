@@ -114,24 +114,27 @@ export VLLM_ASCEND_PREFILL_OVERLAP_STATS=true
 python3 -m pip install matplotlib
 python3 tools/plot_multi_turn_overlap.py \
   --hosts root@7.150.4.174 root@7.150.5.55 \
-  --repo-path /workspace/fsi_lab/sqh/vllm-ascend \
+  --remote-log-dir /workspace/fsi_lab/sqh/vllm-ascend/tp4_dp4_logs \
   --run-dir multi-turn-on \
-  --password \
+  --ssh-password '你的SSH密码' \
   --skip-host-key-check \
   --aggregate-ranks \
   --output multi-turn-overlap.png
 ```
 
-`--hosts` 填所有 P 机器的 IP 或 `user@IP`，脚本并发收集各机器上
-`<repo-path>/tp4_dp4_logs/P_dp*.log`，包括每台机器的两个 DP 日志，按 request ID
-自动匹配轮次。日志目录不同，用 `--remote-log-dir /实际日志目录` 代替 `--repo-path`；
+`--hosts` 填所有 P 机器的 IP 或 `user@IP`，`--remote-log-dir` 填这些机器上日志的
+实际绝对目录。脚本并发收集各机器上该目录中的 `P_dp*.log`，包括每台机器的两个
+DP 日志，按 request ID 自动匹配轮次。开始采集时会打印实际目录和文件名匹配模式。
+也可用 `--repo-path /仓库路径`，但这只是固定取 `<repo-path>/tp4_dp4_logs`，不会自动
+搜索仓库或其他目录；不要把仓库目录当作已经确认的日志目录。
 文件名不同，用 `--log-pattern 'P*.log'`，也可重复指定该参数。
 若日志在容器内而 SSH 登录宿主机，加 `--container 容器名`。
 
-`--password` 提示输入一次各机器共用的 SSH 密码，输入不回显；密码不同改用
+`--ssh-password '密码'` 直接传各机器共用的 SSH 密码，运行中不会再询问密码。
+原有 `--password` 仍可提示输入一次共用密码，输入不回显；密码不同改用
 `--password-per-host`。也可以用 `--password-env PD_SSH_PASSWORD` 从同名环境变量
 读取密码，或不传密码选项，沿用 SSH 密钥。仅使用系统 OpenSSH 和临时 `SSH_ASKPASS`
-回调，不依赖 sshpass；密码不写入命令行、临时脚本或采集结果，完成后删除临时回调。
+回调，不依赖 sshpass；密码不会再写入远端 SSH 命令、临时脚本或采集结果，完成后删除临时回调。
 示例中的 `--skip-host-key-check` 沿用之前跳过主机校验的用法；已有 known_hosts 时可去掉。
 SSH 端口和私钥可通过 `--ssh-port`、`--identity-file` 指定。
 

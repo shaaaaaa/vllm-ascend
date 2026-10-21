@@ -182,7 +182,7 @@ def ssh_command(args: argparse.Namespace, target: str, remote_source: str) -> li
 
 
 def remote_command(args: argparse.Namespace, target: str, remote: list[str]) -> list[str]:
-    """Quote remote argv once; passwords never appear in argv or manifests."""
+    """Quote remote argv once; passwords never appear in SSH argv or manifests."""
     ssh_target(target)
     if args.container:
         safe_component(args.container)
@@ -225,6 +225,7 @@ def add_password_arguments(cli: argparse.ArgumentParser) -> None:
         help="Skip SSH server identity verification for this command; do not read or update known_hosts",
     )
     group = cli.add_mutually_exclusive_group()
+    group.add_argument("--ssh-password", metavar="PASSWORD", help="SSH password shared by all hosts; never prompt")
     group.add_argument("--password", action="store_true", help="Prompt once for the SSH password shared by all hosts")
     group.add_argument(
         "--password-env", metavar="NAME", help="Read a shared SSH password from this environment variable"
@@ -267,13 +268,19 @@ def password_auth(args: argparse.Namespace) -> Iterator[None]:
     args._askpass = None
     with ExitStack() as stack:
         try:
-            if not (args.password or args.password_env or args.password_per_host):
+            supplied_password = getattr(args, "ssh_password", None)
+            if supplied_password is None and not (args.password or args.password_env or args.password_per_host):
                 yield
                 return
             if args.password_per_host:
                 args._passwords = {host: getpass.getpass(f"SSH password for {host}: ") for host in args.hosts}
             else:
-                password = os.environ.get(args.password_env) if args.password_env else getpass.getpass("SSH password: ")
+                if supplied_password is not None:
+                    password = supplied_password
+                elif args.password_env:
+                    password = os.environ.get(args.password_env)
+                else:
+                    password = getpass.getpass("SSH password: ")
                 if password is None:
                     raise ValueError(f"password environment variable is not set: {args.password_env}")
                 args._passwords = dict.fromkeys(args.hosts, password)

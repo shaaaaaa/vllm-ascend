@@ -149,6 +149,7 @@ def collect_logs(args: argparse.Namespace) -> tuple[list[Path], Path]:
         raise ValueError("--log-pattern must be a filename glob without directory separators")
     hosts = list(dict.fromkeys(args.hosts))
     args.hosts = hosts
+    print(f"[OVERLAP_COLLECT] remote_log_dir={source} patterns={args.log_pattern}", flush=True)
     # Always collect a fresh snapshot. A previous run may have collected the same
     # log names before the later dialogue rounds completed.
     args.output.parent.mkdir(parents=True, exist_ok=True)
