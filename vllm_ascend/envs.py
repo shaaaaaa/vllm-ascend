@@ -64,7 +64,7 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE": lambda: _strict_bool_env(
         "VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE"
     ),
-    # Non-secret P-node bank rotation depth. Positive integer, default 2;
+    # Non-secret P-node bank rotation depth. Positive integer, default 4;
     # ignored unless the P-node switch above is true. Read before startup.
     "VLLM_ASCEND_LAYERWISE_PREFILL_NUM_BANKS": layerwise_prefill_bank_count,
     # Non-secret P-node bank overlap statistics. Default false; accepts

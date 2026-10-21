@@ -11,7 +11,7 @@ export VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE=true
 export VLLM_ASCEND_PREFILL_OVERLAP_STATS=true
 ```
 
-bank 数默认是 2，可以在 P 节点启动前设置
+bank 数默认是 4，可以在 P 节点启动前设置
 `export VLLM_ASCEND_LAYERWISE_PREFILL_NUM_BANKS=8`。
 合法值为正整数，非敏感配置；
 未开启 P-node 开关时忽略此配置，D 节点保持原路径。
