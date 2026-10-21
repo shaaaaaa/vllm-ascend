@@ -201,7 +201,7 @@ def plot_rows(rows: list[dict[str, Any]], output: Path) -> None:
         fontsize="small",
     )
     figure.suptitle(
-        "Two-bank prefill overlap and timing\n"
+        "Prefill overlap and timing\n"
         "Times: mean per worker/chunk; overlapping bank durations are added, not wall-clock time.",
         fontsize=13,
     )

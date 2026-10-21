@@ -98,3 +98,46 @@ turns/001/ ... 050/     后续每轮
 python3 -m pytest --confcutdir=tests/standalone \
   tests/standalone/test_multi_turn_kv_reuse.py -q -o addopts= -o log_cli=false
 ```
+
+## 按对话轮次画 overlap 图
+
+P 节点启动服务前开启统计，随后按上面的命令运行客户端并保留 `multi-turn-on` 目录：
+
+```bash
+export VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE=true
+export VLLM_ASCEND_PREFILL_OVERLAP_STATS=true
+```
+
+测试结束后，在绘图机器运行：
+
+```bash
+python3 -m pip install matplotlib
+python3 tools/plot_multi_turn_overlap.py 'tp4_dp4_logs/*.log' \
+  --run-dir multi-turn-on \
+  --aggregate-ranks \
+  --output multi-turn-overlap.png
+```
+
+`logs` 可以传多个 P 节点日志文件或 glob；DP 路由可能把不同轮次发到不同实例，
+应收集所有相关 P 节点的日志。客户端目录只需 `summary.json`，或者没有该文件时
+使用 `metrics.csv`；不需要复制 500k 文本或 tensor dump。脚本使用客户端 request ID
+和响应 ID 匹配服务端内部 ID，接受 vLLM 添加的 `cmpl-` / `chatcmpl-` 前缀及内部后缀。
+不按日志出现顺序猜轮次，也不会把另一组测试的请求混进来。
+
+图为白底，横轴是轮次：0 是初始化长前缀，1–50 是后续追加。
+六个子图分别显示 coverage、save+load、save、load、bank wait、layer start interval。
+若第 0 轮远大于后续轮次，用同一命令加 `--start-round 1`，只看 50 轮追加；
+也可以用 `--end-round 10` 截取区间。
+
+同一轮有多个 prefill chunk 时，先累加它们的耗时。coverage 按 `layer_samples`
+对服务端已计算的逐层覆盖率加权平均，仍然是逐层比例的平均，不改成总等待除以总间隔。
+默认每个 DP/TP worker 一条曲线；`--tp-rank 0` / `--dp-rank 0` 可以筛选。
+`--aggregate-ranks` 合成一条曲线：coverage 平均所有实际观测的层，耗时则对各 worker
+的整轮累计值取平均。图中时间单位为 ms / worker / round，不是每个 chunk 的平均，
+也不是请求墙钟时间；bank 之间重叠的传输时间仍分别相加。
+
+输出同名 `.csv`（逐轮汇总）、`.chunks.csv`（逐 chunk 原始计数/耗时）和 `.json`
+（匹配及缺失情况）。没有统计的轮次留空、曲线断开并给出提示，不会补成 0 或 100%。
+多请求同批仍按服务端既有规则跳过；统计队列丢失、失败或不完整记录不会被当成完整数据。
+某个 worker 缺少部分 chunk 仍可能形成部分汇总，需结合 JSON 提示及 chunks CSV 检查；
+图只代表实际记录到的样本。
