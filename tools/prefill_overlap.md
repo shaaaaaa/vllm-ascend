@@ -11,9 +11,9 @@ export VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE=true
 export VLLM_ASCEND_PREFILL_OVERLAP_STATS=true
 ```
 
-bank 数默认是 2，可以在 P 节点启动前设置 `export NUM_BANK=8`。
-完整变量名是 `VLLM_ASCEND_LAYERWISE_PREFILL_NUM_BANKS`，与 `NUM_BANK`
-含义相同，同时设置时以完整变量名为准。合法值为正整数，非敏感配置；
+bank 数默认是 2，可以在 P 节点启动前设置
+`export VLLM_ASCEND_LAYERWISE_PREFILL_NUM_BANKS=8`。
+合法值为正整数，非敏感配置；
 未开启 P-node 开关时忽略此配置，D 节点保持原路径。
 
 设置为 8 时，每个实际 prefill chunk 的计算开始前，先异步提交各 KV 组的
@@ -27,6 +27,12 @@ KV 时无需加载。第 N 层在计算流上等待自己的加载 event；最�
 总 KV 池仍在启动时预分配，增加 bank 数不会自动扩容；同一长度请求从 2 改为
 8 bank，其轮转 KV block 用量约为原来的 4 倍，可容纳的并发或上下文容量相应下降。
 传输总量不会因预取窗口变大而减少，是否加速需要实机测量。
+
+启动时按 bank 数校验至少一个 `max-model-len` 请求能否放入 NPU KV 池，
+不会强制为 `max-num-seqs` 个满长请求同时保留容量。最终启动日志中的
+`Maximum concurrency for ... tokens per request` 表示按满长计算的池容量；
+`max-num-seqs` 只是运行请求数量上限。运行时仍按实际需求检查 block，
+不足则等待或抢占。LMCache CPU 缓存另行配置，不受这项 NPU 容量校验保障。
 
 第二个变量默认 `false`，合法值为 `true` / `false`，不是敏感配置。
 它必须与已有 P-node 开关同时开启才生效。D 节点保持原配置。

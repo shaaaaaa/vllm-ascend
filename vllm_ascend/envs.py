@@ -66,9 +66,7 @@ env_variables: dict[str, Callable[[], Any]] = {
     ),
     # Non-secret P-node bank rotation depth. Positive integer, default 2;
     # ignored unless the P-node switch above is true. Read before startup.
-    # NUM_BANK is a short alias; the namespaced setting takes precedence.
     "VLLM_ASCEND_LAYERWISE_PREFILL_NUM_BANKS": layerwise_prefill_bank_count,
-    "NUM_BANK": layerwise_prefill_bank_count,
     # Non-secret P-node bank overlap statistics. Default false; accepts
     # true/false. Records NPU timing events, without host synchronization;
     # a background collector emits one summary per chunked-prefill step.
