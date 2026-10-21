@@ -112,10 +112,43 @@ export VLLM_ASCEND_PREFILL_OVERLAP_STATS=true
 
 ```bash
 python3 -m pip install matplotlib
-python3 tools/plot_multi_turn_overlap.py 'tp4_dp4_logs/*.log' \
+python3 tools/plot_multi_turn_overlap.py \
+  --hosts root@7.150.4.174 root@7.150.5.55 \
+  --repo-path /workspace/fsi_lab/sqh/vllm-ascend \
   --run-dir multi-turn-on \
+  --password \
+  --skip-host-key-check \
   --aggregate-ranks \
   --output multi-turn-overlap.png
+```
+
+`--hosts` 填所有 P 机器的 IP 或 `user@IP`，脚本并发收集各机器上
+`<repo-path>/tp4_dp4_logs/P_dp*.log`，包括每台机器的两个 DP 日志，按 request ID
+自动匹配轮次。日志目录不同，用 `--remote-log-dir /实际日志目录` 代替 `--repo-path`；
+文件名不同，用 `--log-pattern 'P*.log'`，也可重复指定该参数。
+若日志在容器内而 SSH 登录宿主机，加 `--container 容器名`。
+
+`--password` 提示输入一次各机器共用的 SSH 密码，输入不回显；密码不同改用
+`--password-per-host`。也可以用 `--password-env PD_SSH_PASSWORD` 从同名环境变量
+读取密码，或不传密码选项，沿用 SSH 密钥。仅使用系统 OpenSSH 和临时 `SSH_ASKPASS`
+回调，不依赖 sshpass；密码不写入命令行、临时脚本或采集结果，完成后删除临时回调。
+示例中的 `--skip-host-key-check` 沿用之前跳过主机校验的用法；已有 known_hosts 时可去掉。
+SSH 端口和私钥可通过 `--ssh-port`、`--identity-file` 指定。
+
+远端只读取匹配日志中的 `[PREFILL_OVERLAP]` 行，先打包压缩，再传回本地，
+不改服务日志、不触发 tensor dump。每次创建新快照，保存在图片旁的
+`multi-turn-overlap-logs-*/`（可用 `--collect-dir` 指定一个尚不存在的目录）；
+各主机分目录保留过滤后的日志、压缩包和采集清单。服务仍写日志时，仅读取打开文件时
+已有的字节，跳过最后未写完的行，建议 50 轮结束后采集。
+默认每台机器最多等待 600 秒，可用 `--ssh-timeout` 调整。任意机器连接、认证或路径
+失败都会保留结果并停止绘图，避免把收集失败当作无数据；正常读取到日志但没有统计行的
+空闲节点允许为空，缺少轮次仍会在绘图诊断中提示。
+
+已有本地日志仍可直接画图：
+
+```bash
+python3 tools/plot_multi_turn_overlap.py 'P1_logs/P_dp*.log' 'P2_logs/P_dp*.log' \
+  --run-dir multi-turn-on --aggregate-ranks --output multi-turn-overlap.png
 ```
 
 `logs` 可以传多个 P 节点日志文件或 glob；DP 路由可能把不同轮次发到不同实例，

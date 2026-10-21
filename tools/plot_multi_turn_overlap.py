@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any
 
 from plot_prefill_overlap import read_records, write_csv
+from prefill_overlap_collect import add_collection_arguments, collect_logs
 
 TIMINGS = ("dma_ms", "save_ms", "load_ms", "wait_ms", "interval_ms")
 
@@ -231,7 +232,7 @@ def plot_rounds(rows: list[dict[str, Any]], rounds: list[int], output: Path) -> 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("logs", nargs="+", help="P-node service logs or quoted glob patterns")
+    parser.add_argument("logs", nargs="*", help="Local P-node service logs or quoted glob patterns")
     parser.add_argument(
         "--run-dir", type=Path, required=True, help="Client output directory containing summary.json/metrics.csv"
     )
@@ -241,8 +242,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--aggregate-ranks", action="store_true", help="One curve averaging observed workers")
     parser.add_argument("--start-round", type=int, default=0, help="Use 1 to exclude the initial long-prefix request")
     parser.add_argument("--end-round", type=int)
+    add_collection_arguments(parser)
     args = parser.parse_args(argv)
     try:
+        if not args.logs and not args.hosts:
+            raise ValueError("Provide local log paths or --hosts for automatic SSH collection")
         rounds = [
             row
             for row in read_rounds(args.run_dir)
@@ -251,6 +255,10 @@ def main(argv: list[str] | None = None) -> int:
         if not rounds:
             raise ValueError("No client rounds matched the selected range")
         paths = sorted({Path(p) for pattern in args.logs for p in (glob.glob(pattern) or [pattern])})
+        collected = None
+        if args.hosts:
+            remote_paths, collected = collect_logs(args)
+            paths.extend(remote_paths)
         records, ignored = read_records(paths)
         rows, chunks, diagnostics = aggregate_rounds(
             records,
@@ -268,6 +276,8 @@ def main(argv: list[str] | None = None) -> int:
         write_csv(rows, args.output.with_suffix(".csv"))
         write_csv(chunks, args.output.with_suffix(".chunks.csv"))
         diagnostics.update(ignored_records=ignored, matched_rounds=len({row["round"] for row in rows}))
+        if collected is not None:
+            diagnostics["collection_directory"] = str(collected)
         args.output.with_suffix(".json").write_text(
             json.dumps(diagnostics, ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",
