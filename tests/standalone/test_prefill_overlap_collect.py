@@ -164,8 +164,8 @@ def test_native_password_multi_host_collection_then_round_plot(collect, tmp_path
     assert len(commands) == 2 and len(set(h.parent for h in helpers)) == 1
     assert not any(helper.exists() or helper.parent.exists() for helper in helpers)
     rows, rounds = rendered[0]
-    assert rounds == [0, 1, 2] and [row["round"] for row in rows] == [0, 1, 2]
-    assert [row["worker_count"] for row in rows] == [1, 1, 1]
+    assert rounds == [1, 2] and [row["round"] for row in rows] == [1, 2]
+    assert [row["worker_count"] for row in rows] == [1, 1]
     assert len(list(destination.glob("host-*/snapshot/logs/*.log"))) == 4
     manifest = (destination / "collection.json").read_text()
     assert secret not in manifest

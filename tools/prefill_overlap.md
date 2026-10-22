@@ -41,9 +41,10 @@ KV 时无需加载。第 N 层在计算流上等待自己的加载 event；最�
 
 ## 统计口径
 
-每次实际 chunked prefill 单独统计，要求整个模型 batch 中只有一个 request。
-同批多个 request 一律跳过，即使它们处于相同 token 区间。
-同时检查 connector metadata 和 attention metadata，避免漏掉无需缓存操作的请求。
+每次实际 chunked prefill 的整个模型 batch 统计一次，支持同批多个 request，
+各请求长度、已处理前缀和轮转相位可以不同。日志保留所有请求的真实 token 区间，
+不把整批耗时分摊或重复累计给各个请求。
+同时检查 connector metadata 和 attention metadata，避免漏掉请求后错误归属计时。
 空跑、无可确认请求范围的 batch 和 decode 不统计。
 
 token 区间来自调度器这次实际计算的 `[start, end)`，按 request 自己的逻辑位置计数。
@@ -58,6 +59,11 @@ token 区间来自调度器这次实际计算的 `[start, end)`，按 request �
   这是 bank 就绪后开始计算的边界，不是 Python 进入 decoder 的主机时间。
 - 按实际 `(KV group, physical bank)` 找前后两次使用该 bank 的模型层 A、B。
   latent、indexer 组的 bank 相互独立，chunk 相位偏移也使用实际 bank ID。
+- 同批不同请求的 bank 相位不同时，整批 consumer gate 会等待多个 bank。
+  此时按 `(KV group, 组内层序号 % bank数)` 配对整批复用窗口；经过完整的 bank
+  轮转周期，各请求才再次使用自己的同一物理 bank。不能因两批 bank 集合有交集
+  就把它们当作相邻层的复用。`batch_rotation_slots` 单独列出这些等待和比值，
+  `banks` 仍按实际物理 bank 列出 DMA 时间。
 - 每个复用窗口的覆盖率：`1 - wait(group, bank, B) / (start(B) - start(A))`。
   分子是 B 在这个 bank 的 consumer gate 上等待的 NPU 时间。
 - 4 bank 时，latent 组通常比较 N 和 N+4，而非 N 和 N+1；indexer 组按自己的
@@ -102,7 +108,7 @@ ACL 动态库也在后台延迟加载，使用标准 CANN 环境中的 `libascen
 
 开启计时仍有 event 记录和 Python 下发开销，不能承诺严格零开销；
 真实影响需要在 NPU 上比较开关前后的吞吐或 profile。
-关闭开关不创建计时 event 或统计线程；被跳过的多请求 batch 也不记录计时 event。
+关闭开关不创建计时 event 或统计线程；空跑及无法确认完整请求范围的 batch 不记录事件。
 待收集队列最多 32 批，event 空闲池最多 4096 个。队列满时丢弃统计、保留正常推理，
 后续日志的 `dropped_steps` 会显示累计丢弃数量。中断批次标为 `incomplete`，
 后台计时错误标为 `collector_error`；绘图排除这些记录。

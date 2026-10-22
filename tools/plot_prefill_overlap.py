@@ -94,8 +94,8 @@ def aggregate_records(
 ) -> tuple[list[dict[str, Any]], int]:
     """Average the layer ratios, preserving real token spans and rank identity.
 
-    Only single-request batches are eligible, including when several requests
-    happen to have exactly the same scheduled token span.
+    A batch is counted once, never once per request. Unequal request spans
+    use their min-start/max-end envelope, not a claimed shared request length.
     """
     buckets: dict[tuple, dict[str, Any]] = {}
     mixed = 0
@@ -106,16 +106,14 @@ def aggregate_records(
         if dp_rank is not None and record.get("dp_rank") != dp_rank:
             continue
         requests = record.get("requests", [])
-        if len(requests) != 1:
+        if not requests:
             mixed += 1
             continue
         if request_id and not any(r["req_id"] == request_id for r in requests):
             continue
         spans = {(r["token_start"], r["token_end"]) for r in requests}
-        if len(spans) != 1:
-            mixed += 1
-            continue
-        start, end = spans.pop()
+        start = min(span[0] for span in spans)
+        end = max(span[1] for span in spans)
         if end <= start:
             continue
         dp, tp = (
@@ -134,6 +132,7 @@ def aggregate_records(
                 tp_rank=tp,
                 token_start=start,
                 token_end=end,
+                span_policy="request_or_batch_envelope",
                 layer_samples=0,
                 coverage_definition=COVERAGE_DEFINITION,
                 worker_steps=0,
@@ -175,6 +174,8 @@ def aggregate_records(
 def write_csv(rows: list[dict[str, Any]], output: Path) -> None:
     """Save the plotted measurements, including all supporting timing totals."""
     with output.open("w", newline="", encoding="utf-8") as target:
+        if not rows:
+            return
         writer = csv.DictWriter(target, fieldnames=list(rows[0]))
         writer.writeheader()
         writer.writerows(rows)

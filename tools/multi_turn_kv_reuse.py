@@ -3,8 +3,9 @@
 """Send a fixed long prefix, then append actual answers and prewritten questions.
 
 python3 tools/multi_turn_kv_reuse.py --base-url http://127.0.0.1:8000 --model-name GLM-5.3-falcon
-Uses Python 3.9+ standard library only; connects to an already running service.
-The default 50 follow-up rounds mean 51 sequential completion requests in total.
+Uses Python 3.9+; optional real-token truncation also needs tokenizers.
+Connects to an already running service.
+Each session warms its prefix before the measured, concurrent follow-up rounds.
 """
 
 from __future__ import annotations
@@ -13,12 +14,14 @@ import argparse
 import csv
 import json
 import math
+import re
 import sys
 import time
 import urllib.error
 import urllib.request
 import uuid
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, BinaryIO
 
@@ -27,6 +30,8 @@ QUESTION_SUFFIX = "\n助手：\n"
 DEFAULT_ROUNDS = 50
 METRIC_FIELDS = (
     "round",
+    "session_id",
+    "concurrency",
     "phase",
     "request_id",
     "response_id",
@@ -46,12 +51,56 @@ METRIC_FIELDS = (
 
 
 def save_json(path: Path, value: Any) -> None:
-    path.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    temporary.replace(path)
 
 
 def read_text(path: Path) -> str:
     """Preserve CR/LF and all answer whitespace, including on Windows."""
     return path.read_bytes().decode("utf-8")
+
+
+def context_token_count(value: str) -> int:
+    """Accept a positive token count, optionally using decimal k/m suffixes."""
+    match = re.fullmatch(r"([1-9][0-9]*)([km]?)", value.strip().lower().replace("_", ""))
+    if match is None:
+        raise argparse.ArgumentTypeError("Use a positive token count, e.g. 200000 or 200k")
+    return int(match[1]) * {"": 1, "k": 1000, "m": 1000000}[match[2]]
+
+
+def truncate_prefix(text: str, count: int | None, tokenizer_path: Path | None) -> tuple[str, dict[str, Any]]:
+    """Take a real-token prefix locally; never download a tokenizer or generate text."""
+    if count is None:
+        return text, {"requested_context_tokens": None}
+    if tokenizer_path is None:
+        raise ValueError(
+            "--context-tokens requires --tokenizer pointing to the served model's tokenizer directory/json"
+        )
+    path = tokenizer_path / "tokenizer.json" if tokenizer_path.is_dir() else tokenizer_path
+    if not path.is_file():
+        raise ValueError(f"Tokenizer JSON does not exist: {path}")
+    from tokenizers import Tokenizer
+
+    tokenizer = Tokenizer.from_file(str(path))
+    tokenizer.no_truncation()
+    tokenizer.no_padding()
+    tokens = tokenizer.encode(text, add_special_tokens=False).ids
+    selected = tokens[:count]
+    result = tokenizer.decode(selected, skip_special_tokens=False) if len(tokens) > count else text
+    # Cutting the article also cuts its original final question. Keep a fixed
+    # reading task so warmup is a useful completion rather than a continuation.
+    if len(tokens) > count:
+        result += "\n\n用户：请解读以上资料，简述主要结论和依据。\n助手：\n"
+    return result, {
+        "requested_context_tokens": count,
+        "source_tokens": len(tokens),
+        "selected_prefix_tokens": len(selected),
+        "tokenizer": str(path.resolve()),
+        "context_note": (
+            "First N article tokens plus session marker/reading task; actual length is server prompt_tokens."
+        ),
+    }
 
 
 def sse_data(response: BinaryIO) -> Iterator[str]:
@@ -179,78 +228,127 @@ def run(args: argparse.Namespace, root: Path, initial_prompt: str, questions: li
         "base_url": client.base_url,
         "model": args.model,
         "followup_rounds": args.rounds,
-        "total_requests": args.rounds + 1,
+        "concurrency": args.concurrency,
+        "total_requests": args.concurrency * (args.rounds + 1),
         "max_tokens": args.max_tokens,
         "initial_prompt_chars": len(initial_prompt),
         "composition": "next_prompt = previous_prompt + previous_actual_output + added_input.txt",
         "timing_scope": "Client stream timing includes HTTP transfer and queueing; token gaps are estimates.",
+        "context": args.context_metadata,
+        "warmups": [],
+        "sessions": [],
+        "completed_followup_rounds": 0,
         "rounds": [],
     }
     save_json(root / "summary.json", summary)
     current_round = None
+    current_session = None
     try:
         model = args.model or client.model_name()
         summary["model"] = model
-        print(f"[MULTI_TURN] model={model} requests={args.rounds + 1} artifacts={root.resolve()}", flush=True)
-        print("[MULTI_TURN] Fixed text is unchanged; actual token count comes from server usage.", flush=True)
+        print(
+            f"[MULTI_TURN] model={model} concurrency={args.concurrency} "
+            f"warmups={args.concurrency} measured={args.concurrency * args.rounds} artifacts={root.resolve()}",
+            flush=True,
+        )
+        print(
+            "[MULTI_TURN] All session warmups finish before round 1; warmup is excluded from metrics.csv.", flush=True
+        )
         print("[MULTI_TURN] cached_tokens=null means not reported; it does not mean a cache miss.", flush=True)
-        history, previous_output, previous_prompt_chars = initial_prompt, "", 0
-        with root.joinpath("metrics.csv").open("w", newline="", encoding="utf-8") as metrics_file:
+        sessions = []
+        for session_id in range(args.concurrency):
+            directory = root if args.concurrency == 1 else root / "sessions" / f"{session_id:03d}"
+            directory.mkdir(parents=True, exist_ok=True)
+            marker = f"session={session_id:04d}; timestamp_ns={time.time_ns()}; run={run_id}\n\n"
+            directory.joinpath("session_prefix.txt").write_bytes(marker.encode("utf-8"))
+            summary["sessions"].append(
+                dict(session_id=session_id, directory=str(directory.relative_to(root)), marker=marker)
+            )
+            sessions.append(
+                dict(
+                    client=Client(args.base_url, args.timeout),
+                    directory=directory,
+                    history=marker + initial_prompt,
+                    previous_output="",
+                    previous_prompt_chars=0,
+                )
+            )
+        with (
+            ThreadPoolExecutor(max_workers=args.concurrency) as executor,
+            root.joinpath("metrics.csv").open("w", newline="", encoding="utf-8") as metrics_file,
+        ):
             metrics = csv.DictWriter(metrics_file, fieldnames=METRIC_FIELDS)
             metrics.writeheader()
             for current_round in range(args.rounds + 1):
+                pending = {}
                 question = questions[current_round - 1] if current_round else ""
                 added = QUESTION_PREFIX + question + QUESTION_SUFFIX if current_round else ""
-                if current_round:
-                    history += previous_output + added
-                directory = root / "turns" / f"{current_round:03d}"
-                directory.mkdir(parents=True)
-                directory.joinpath("added_input.txt").write_bytes(added.encode("utf-8"))
-                request_id = f"multi-{run_id}-{current_round:03d}"
-                payload = {
-                    "model": model,
-                    "prompt": history,
-                    "request_id": request_id,
-                    "max_tokens": args.max_tokens,
-                    "temperature": 0,
-                    "stream": True,
-                    "stream_options": {"include_usage": True},
-                }
-                # The initial prompt is stored once. Each exact later input can
-                # be reconstructed without writing another 500k-token copy.
-                save_json(
-                    directory / "request.json",
-                    {
-                        **{key: value for key, value in payload.items() if key != "prompt"},
-                        "prompt_chars": len(history),
-                        "prompt_source": "summary.json composition",
-                    },
-                )
-                print(
-                    f"[MULTI_TURN] round={current_round:02d} begin request_id={request_id} chars={len(history)}",
-                    flush=True,
-                )
-                previous_output, stats = client.complete(payload, directory)
-                row = {
-                    "round": current_round,
-                    "phase": "followup" if current_round else "initial",
-                    "request_id": request_id,
-                    "question": question,
-                    "prompt_chars": len(history),
-                    "new_input_chars": len(history) - previous_prompt_chars,
-                    **stats,
-                }
-                previous_prompt_chars = len(history)
-                summary["rounds"].append(row)
-                metrics.writerow(row)
-                metrics_file.flush()
-                save_json(root / "summary.json", summary)
-                print("[MULTI_TURN] " + json.dumps(row, ensure_ascii=False), flush=True)
+                for session_id, session in enumerate(sessions):
+                    if current_round:
+                        session["history"] += session["previous_output"] + added
+                    history = session["history"]
+                    directory = session["directory"] / "turns" / f"{current_round:03d}"
+                    directory.mkdir(parents=True)
+                    directory.joinpath("added_input.txt").write_bytes(added.encode("utf-8"))
+                    request_id = f"multi-{run_id}-s{session_id:03d}-{current_round:03d}"
+                    payload = {
+                        "model": model,
+                        "prompt": history,
+                        "request_id": request_id,
+                        "max_tokens": args.max_tokens,
+                        "temperature": 0,
+                        "stream": True,
+                        "stream_options": {"include_usage": True},
+                    }
+                    save_json(
+                        directory / "request.json",
+                        {
+                            **{key: value for key, value in payload.items() if key != "prompt"},
+                            "session_id": session_id,
+                            "round": current_round,
+                            "prompt_chars": len(history),
+                            "prompt_source": "session_prefix.txt + initial_prompt.txt + prior answers/questions",
+                        },
+                    )
+                    print(
+                        f"[MULTI_TURN] round={current_round:02d} session={session_id} "
+                        f"begin request_id={request_id} chars={len(history)}",
+                        flush=True,
+                    )
+                    future = executor.submit(session["client"].complete, payload, directory)
+                    pending[future] = (session_id, request_id)
+                # No session enters round N+1 before every session finishes N.
+                for future in as_completed(pending):
+                    current_session, request_id = pending[future]
+                    session = sessions[current_session]
+                    session["previous_output"], stats = future.result()
+                    row = {
+                        "round": current_round,
+                        "session_id": current_session,
+                        "concurrency": args.concurrency,
+                        "phase": "followup" if current_round else "warmup",
+                        "request_id": request_id,
+                        "question": question,
+                        "prompt_chars": len(session["history"]),
+                        "new_input_chars": len(session["history"]) - session["previous_prompt_chars"],
+                        **stats,
+                    }
+                    session["previous_prompt_chars"] = len(session["history"])
+                    if current_round:
+                        summary["rounds"].append(row)
+                        metrics.writerow(row)
+                        metrics_file.flush()
+                    else:
+                        summary["warmups"].append(row)
+                    save_json(root / "summary.json", summary)
+                    print("[MULTI_TURN] " + json.dumps(row, ensure_ascii=False), flush=True)
+                summary["completed_followup_rounds"] = current_round
         summary["status"] = "complete"
     except BaseException as error:
         summary.update(
             status="interrupted" if isinstance(error, KeyboardInterrupt) else "failed",
             failed_round=current_round,
+            failed_session=current_session,
             error=f"{type(error).__name__}: {error}",
         )
         raise
@@ -266,12 +364,29 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--prefix-file", type=Path, default=assets / "prefix_500k.txt")
     parser.add_argument("--questions-file", type=Path, default=assets / "questions_50.txt")
     parser.add_argument("--rounds", type=int, default=DEFAULT_ROUNDS, help="Follow-ups AFTER the initial request")
+    parser.add_argument(
+        "--concurrency", type=int, default=1, help="Independent sessions; all warm up before measured rounds"
+    )
+    parser.add_argument(
+        "--context-tokens", type=context_token_count, help="Use only the first N prefix tokens, e.g. 200k"
+    )
+    parser.add_argument(
+        "--tokenizer",
+        type=Path,
+        help="Served model's local tokenizer directory or tokenizer.json; needed for truncation",
+    )
     parser.add_argument("--max-tokens", type=int, default=128, help="Maximum answer tokens per request (default: 128)")
     parser.add_argument("--timeout", type=float, default=3600, help="HTTP socket timeout in seconds (default: 3600)")
     parser.add_argument("--output-dir", type=Path, help="New or empty artifact directory")
     args = parser.parse_args(argv)
-    if args.rounds < 0 or args.max_tokens <= 0 or not math.isfinite(args.timeout) or args.timeout <= 0:
-        parser.error("rounds must be nonnegative; max-tokens and timeout must be positive")
+    if (
+        args.rounds < 0
+        or args.concurrency < 1
+        or args.max_tokens <= 0
+        or not math.isfinite(args.timeout)
+        or args.timeout <= 0
+    ):
+        parser.error("rounds must be nonnegative; concurrency, max-tokens and timeout must be positive")
     try:
         initial_prompt = read_text(args.prefix_file)
         questions_text = read_text(args.questions_file)
@@ -280,6 +395,7 @@ def main(argv: list[str] | None = None) -> int:
             raise ValueError("Prefix file is empty")
         if len(questions) < args.rounds:
             raise ValueError(f"Need {args.rounds} prewritten questions, found {len(questions)}")
+        initial_prompt, args.context_metadata = truncate_prefix(initial_prompt, args.context_tokens, args.tokenizer)
         root = args.output_dir or Path(f"multi-turn-kv-{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}")
         root.mkdir(parents=True, exist_ok=True)
         if any(root.iterdir()):
@@ -290,7 +406,7 @@ def main(argv: list[str] | None = None) -> int:
     except urllib.error.HTTPError as error:
         print(f"[MULTI_TURN] HTTP {error.code}: {error.read().decode('utf-8', errors='replace')}", file=sys.stderr)
         return 1
-    except (OSError, ValueError, RuntimeError) as error:
+    except (OSError, ValueError, RuntimeError, ImportError) as error:
         print(f"[MULTI_TURN] FAILED: {error}", file=sys.stderr)
         return 1
     return 0

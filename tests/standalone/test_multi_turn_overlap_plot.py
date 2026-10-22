@@ -140,8 +140,8 @@ def test_mixed_batches_and_other_requests_are_excluded(plot):
     unknown["requests"][0]["req_id"] = "unrelated"
     rows, _, diagnostic = plot.aggregate_rounds([mixed, unknown, record(turn=1)], rounds())
     assert [r["round"] for r in rows] == [1]
-    assert diagnostic["mixed_request_records"] == 1
-    assert diagnostic["unmatched_request_examples"] == ["unrelated"]
+    assert diagnostic["unmatched_request_count"] == 2
+    assert diagnostic["unmatched_request_examples"] == ["another", "unrelated"]
 
 
 def test_read_saved_summary_and_csv_fallback(plot, tmp_path):
@@ -182,29 +182,28 @@ def test_real_cli_deduplicates_logs_and_exports_rounds_and_chunks(plot, tmp_path
     assert output.stat().st_size > 0
     figure = saved[0]
     assert len(figure.axes) == 8
-    assert list(figure.axes[0].lines[0].get_xdata()) == [0, 1, 2]
+    assert list(figure.axes[0].lines[0].get_xdata()) == [1, 2]
     y = figure.axes[2].lines[0].get_ydata()
-    assert y[0] == 40 and y[2] == 7
-    assert str(y[1]) == "nan"  # Missing round breaks the curve; it is not zero.
-    assert list(figure.axes[4].lines[0].get_ydata())[::2] == [42, 8]
-    assert list(figure.axes[5].lines[0].get_ydata())[::2] == [2, 1]
+    assert str(y[0]) == "nan" and y[1] == 7  # Missing round is not zero; warmup is excluded.
+    assert list(figure.axes[4].lines[0].get_ydata())[1] == 8
+    assert list(figure.axes[5].lines[0].get_ydata())[1] == 1
     assert "including first" in figure.axes[4].get_title()
     assert not any("interval" in axis.get_title().lower() for axis in figure.axes)
     ttft_axis = figure.axes[7]
     assert "TTFT" in ttft_axis.get_title()
     assert len(ttft_axis.lines) == 1
-    assert list(ttft_axis.lines[0].get_ydata()) == pytest.approx([271.099606, 26.227285, 23.801610])
-    assert [text.get_text() for text in ttft_axis.texts] == ["271.10", "26.23", "23.80"]
+    assert list(ttft_axis.lines[0].get_ydata()) == pytest.approx([26.227285, 23.801610])
+    assert [text.get_text() for text in ttft_axis.texts] == ["26.23", "23.80"]
     for axis in figure.axes[:7]:
-        assert len(axis.texts) == 2  # Only the observed points, never a label for a missing value.
-    assert [text.get_text() for text in figure.axes[0].texts] == ["45.0000%", "50.0000%"]
-    assert [text.get_text() for text in figure.axes[2].texts] == ["40.00", "7.00"]
+        assert len(axis.texts) == 1  # Only observed follow-up points, never warmup or missing values.
+    assert [text.get_text() for text in figure.axes[0].texts] == ["50.0000%"]
+    assert [text.get_text() for text in figure.axes[2].texts] == ["7.00"]
     diagnostic = json.loads(output.with_suffix(".json").read_text(encoding="utf-8"))
     assert diagnostic["missing_rounds"] == [1]
     with output.with_suffix(".chunks.csv").open(encoding="utf-8") as source:
         chunk_rows = list(csv.DictReader(source))
-        assert len(chunk_rows) == 3
-        assert [float(row["first_layer_wait_ms"]) for row in chunk_rows] == [1, 1, 1]
+        assert len(chunk_rows) == 1
+        assert [float(row["first_layer_wait_ms"]) for row in chunk_rows] == [1]
     assert (
         plot.main(
             [str(log), "--run-dir", str(tmp_path), "--start-round", "1", "--output", str(tmp_path / "followups.png")]
@@ -319,3 +318,59 @@ def test_ttft_only_rejects_absent_client_measurements(plot, tmp_path, capsys):
     (tmp_path / "summary.json").write_text(json.dumps(dict(rounds=metadata)), encoding="utf-8")
     assert plot.main(["--run-dir", str(tmp_path), "--ttft-only"]) == 2
     assert "No client TTFT values" in capsys.readouterr().err
+
+
+def concurrent_rounds():
+    return [
+        dict(
+            round=turn,
+            session_id=session,
+            concurrency=4,
+            phase="followup",
+            request_id=f"multi-run-s{session:03d}-{turn:03d}",
+            ttft_s=10 * (session + 1) + turn,
+        )
+        for turn in (1, 2)
+        for session in range(4)
+    ]
+
+
+def test_concurrent_batch_overlap_is_counted_once_and_unequal_request_spans_are_kept(plot):
+    metadata = concurrent_rounds()
+    item = record(turn=1)
+    item["requests"] = [
+        dict(req_id=row["request_id"], token_start=1000 * i, token_end=1000 * i + 512)
+        for i, row in enumerate(metadata[:4])
+    ]
+    rows, chunks, diagnostics = plot.aggregate_rounds([item], metadata, aggregate_ranks=True)
+    assert len(rows) == len(chunks) == 1
+    assert rows[0]["chunk_records"] == 1 and rows[0]["dma_ms"] == 10
+    assert rows[0]["coverage"] == 0.5
+    assert len(chunks[0]["requests"]) == 4
+    assert rows[0]["ttft_samples"] == 4 and rows[0]["ttft_s"] == 26
+    assert rows[0]["ttft_p50_s"] == 26 and rows[0]["ttft_p99_s"] == pytest.approx(40.7)
+    assert not diagnostics["mixed_request_records"]
+    # A batch spanning different client rounds has no single round coordinate.
+    item["requests"][0]["req_id"] = metadata[4]["request_id"]
+    rows, _, diagnostics = plot.aggregate_rounds([item], metadata)
+    assert not rows and diagnostics["mixed_request_records"] == 1
+
+
+def test_ttft_boxes_use_session_samples_and_report_partial_rounds(plot, tmp_path, monkeypatch):
+    pytest.importorskip("matplotlib")
+    from matplotlib.figure import Figure
+
+    metadata = concurrent_rounds()[:-1]  # Interrupted after three of four responses in round 2.
+    (tmp_path / "summary.json").write_text(json.dumps(dict(concurrency=4, rounds=metadata)), encoding="utf-8")
+    saved = []
+    monkeypatch.setattr(Figure, "savefig", lambda figure, *args, **kwargs: saved.append(figure))
+    output = tmp_path / "ttft.png"
+    assert plot.main(["--run-dir", str(tmp_path), "--ttft-only", "--output", str(output)]) == 0
+    axis = saved[0].axes[0]
+    assert len(axis.patches) == 2  # Boxes, not a mean-only point curve.
+    assert any("p50 26.00" in text.get_text() and "p99 40.70" in text.get_text() for text in axis.texts)
+    assert any("n=3/4" in text.get_text() for text in axis.texts)
+    with output.with_suffix(".csv").open(encoding="utf-8", newline="") as source:
+        rows = list(csv.DictReader(source))
+    assert [row["ttft_samples"] for row in rows] == ["4", "3"]
+    assert [row["round"] for row in rows] == ["1", "2"]

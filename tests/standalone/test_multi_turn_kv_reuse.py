@@ -16,8 +16,10 @@ REPO = Path(__file__).resolve().parents[2]
 
 
 @contextmanager
-def service(initial, questions, failure=None, discover=False, report_cache=True):
-    state = {"requests": [], "get_models": 0, "expected": initial, "outputs": []}
+def service(initial, questions, failure=None, discover=False, report_cache=True, concurrency=1):
+    state = {"requests": [], "get_models": 0, "expected": {}, "outputs": [], "markers": {}, "completed": {}}
+    lock = threading.Lock()
+    barriers = {turn: threading.Barrier(concurrency, timeout=10) for turn in range(len(questions) + 1)}
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *args):
@@ -36,10 +38,21 @@ def service(initial, questions, failure=None, discover=False, report_cache=True)
         def do_POST(self):
             assert self.path == "/v1/completions"
             body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
-            turn = len(state["requests"])
-            state["requests"].append(body)
-            assert body["prompt"] == state["expected"], f"history changed at round {turn}"
-            if failure == "http" and turn == 1:
+            session_id = int(body["request_id"].rsplit("-", 2)[-2][1:])
+            turn = int(body["request_id"].rsplit("-", 1)[-1])
+            with lock:
+                state["requests"].append(body)
+                if not turn:
+                    marker, separator, _ = body["prompt"].partition("\n\n")
+                    assert marker.startswith(f"session={session_id:04d}; timestamp_ns=")
+                    assert separator
+                    state["markers"][session_id] = marker + separator
+                    state["expected"][session_id] = marker + separator + initial
+                else:
+                    assert state["completed"].get(turn - 1) == concurrency, "round started before all prior responses"
+                assert body["prompt"] == state["expected"][session_id], f"history changed at round {turn}"
+            barriers[turn].wait()
+            if (failure == "http" and turn == 1) or (failure == "warmup" and turn == 0 and session_id == 0):
                 data = b'{"error":"service failed"}'
                 self.send_response(503)
                 self.send_header("Content-Type", "application/json")
@@ -57,8 +70,9 @@ def service(initial, questions, failure=None, discover=False, report_cache=True)
                 first, rest = json.dumps(event, ensure_ascii=False).split(",", 1)
                 self.wfile.write(f": keepalive\r\ndata: {first},\r\ndata: {rest}\r\n\r\n".encode())
 
-            answer = "" if failure == "empty" else f" \r\n真实输出 {turn}：保留空白。\n\n"
-            state["outputs"].append(answer)
+            answer = "" if failure == "empty" else f" \r\n真实输出 {session_id}/{turn}：保留空白。\n\n"
+            with lock:
+                state["outputs"].append(answer)
             identifier = "cmpl-" + body["request_id"]
             send({"id": identifier, "choices": [{"index": 0, "text": "", "finish_reason": None}]})
             for text in (answer[:3], answer[3:]):
@@ -71,9 +85,11 @@ def service(initial, questions, failure=None, discover=False, report_cache=True)
             if report_cache:
                 usage["prompt_tokens_details"] = {"cached_tokens": len(initial) if turn else 0}
             send({"id": identifier, "choices": [], "usage": usage})
+            with lock:
+                if turn < len(questions):
+                    state["expected"][session_id] += answer + "\n\n用户：" + questions[turn] + "\n助手：\n"
+                state["completed"][turn] = state["completed"].get(turn, 0) + 1
             self.wfile.write(b"data: [DONE]\r\n\r\n")
-            if turn < len(questions):
-                state["expected"] += answer + "\n\n用户：" + questions[turn] + "\n助手：\n"
 
     with ThreadingHTTPServer(("127.0.0.1", 0), Handler) as server:
         worker = threading.Thread(target=server.serve_forever, daemon=True)
@@ -126,7 +142,7 @@ def test_initial_request_and_50_followups_keep_every_actual_answer(tmp_path):
     assert len(state["requests"]) == 51
     assert state["get_models"] == 0
     assert len({r["request_id"] for r in state["requests"]}) == 51
-    history = initial
+    history = state["markers"][0] + initial
     for turn, body in enumerate(state["requests"]):
         directory = output / "turns" / f"{turn:03d}"
         assert body["model"] == "GLM-5.3-falcon"
@@ -141,11 +157,11 @@ def test_initial_request_and_50_followups_keep_every_actual_answer(tmp_path):
         assert metadata["prompt_chars"] == len(history)
     summary = json.loads(output.joinpath("summary.json").read_text(encoding="utf-8"))
     assert summary["status"] == "complete"
-    assert len(summary["rounds"]) == 51
-    assert summary["rounds"][1]["cached_tokens"] == len(initial)
-    assert summary["rounds"][0]["cached_tokens"] == 0
+    assert len(summary["rounds"]) == 50
+    assert summary["rounds"][0]["cached_tokens"] == len(initial)
+    assert summary["warmups"][0]["cached_tokens"] == 0
     assert summary["rounds"][0]["completion_tokens"] == 8
-    assert summary["rounds"][1]["new_input_chars"] == len(state["outputs"][0]) + len(
+    assert summary["rounds"][0]["new_input_chars"] == len(state["outputs"][0]) + len(
         "\n\n用户：" + questions[0] + "\n助手：\n"
     )
     for row in summary["rounds"]:
@@ -153,7 +169,8 @@ def test_initial_request_and_50_followups_keep_every_actual_answer(tmp_path):
         assert row["generation_s"] >= 0
         assert row["mean_token_gap_ms"] == pytest.approx(row["generation_s"] * 1000 / 7)
     with output.joinpath("metrics.csv").open(encoding="utf-8") as source:
-        assert len(list(csv.DictReader(source))) == 51
+        rows = list(csv.DictReader(source))
+        assert len(rows) == 50 and all(int(row["round"]) > 0 for row in rows)
 
 
 def test_discovery_and_missing_cache_usage_are_supported(tmp_path):
@@ -179,7 +196,7 @@ def test_failed_round_is_not_retried_or_appended(tmp_path, failure):
     summary = json.loads(output.joinpath("summary.json").read_text(encoding="utf-8"))
     assert summary["status"] == "failed"
     assert summary["failed_round"] == 1
-    assert len(summary["rounds"]) == 1
+    assert len(summary["rounds"]) == 0 and len(summary["warmups"]) == 1
     assert not output.joinpath("turns/002").exists()
     if failure == "truncated":
         assert output.joinpath("turns/001/output.txt").read_bytes().decode() == state["outputs"][1]
@@ -248,6 +265,82 @@ def test_default_large_prefix_is_sent_unchanged_without_tokenizer_or_resize(tmp_
         )
     assert result.returncode == 0, result.stdout + result.stderr
     assert len(state["requests"]) == 2
-    assert state["requests"][0]["prompt"] == initial
-    assert state["requests"][1]["prompt"] == initial + state["outputs"][0] + "\n\n用户：" + questions[0] + "\n助手：\n"
+    prefix = state["markers"][0] + initial
+    assert state["requests"][0]["prompt"] == prefix
+    assert state["requests"][1]["prompt"] == prefix + state["outputs"][0] + "\n\n用户：" + questions[0] + "\n助手：\n"
     assert output.joinpath("initial_prompt.txt").read_bytes() == assets.joinpath("prefix_500k.txt").read_bytes()
+
+
+def test_four_sessions_warm_together_then_preserve_separate_histories(tmp_path):
+    initial = "用户：固定前缀\r\n资料。\n助手：\n"
+    questions = ["依据呢？", "结论呢？"]
+    with service(initial, questions, concurrency=4) as (url, state):
+        result, output = invoke(
+            tmp_path, url, questions, "--rounds", "2", "--concurrency", "4", "--model-name", "served"
+        )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert len(state["requests"]) == 12
+    assert len(set(state["markers"].values())) == 4
+    summary = json.loads((output / "summary.json").read_text(encoding="utf-8"))
+    assert summary["completed_followup_rounds"] == 2 and summary["concurrency"] == 4
+    assert len(summary["warmups"]) == 4 and len(summary["rounds"]) == 8
+    assert {row["session_id"] for row in summary["rounds"]} == set(range(4))
+    assert all(row["round"] in (1, 2) for row in summary["rounds"])
+    with (output / "metrics.csv").open(encoding="utf-8", newline="") as source:
+        rows = list(csv.DictReader(source))
+    assert len(rows) == 8 and all(int(row["round"]) > 0 for row in rows)
+    for session_id in range(4):
+        directory = output / "sessions" / f"{session_id:03d}"
+        assert directory.joinpath("session_prefix.txt").read_text() == state["markers"][session_id]
+        assert directory.joinpath("turns/002/response.json").exists()
+
+
+def test_failed_warmup_never_starts_measured_rounds(tmp_path):
+    initial = "用户：固定前缀\r\n资料。\n助手：\n"
+    questions = ["依据呢？"]
+    with service(initial, questions, concurrency=4, failure="warmup") as (url, state):
+        result, output = invoke(
+            tmp_path, url, questions, "--rounds", "1", "--concurrency", "4", "--model-name", "served"
+        )
+    assert result.returncode == 1
+    assert len(state["requests"]) == 4
+    summary = json.loads((output / "summary.json").read_text(encoding="utf-8"))
+    assert summary["status"] == "failed" and summary["failed_round"] == 0
+    assert not summary["rounds"]
+
+
+def test_context_limit_uses_real_token_prefix_not_character_count(tmp_path):
+    tokenizers = pytest.importorskip("tokenizers")
+    words = ["zero", "one", "two", "three", "four", "five", "six", "seven"]
+    tokenizer = tokenizers.Tokenizer(
+        tokenizers.models.WordLevel({"[UNK]": 0, **{w: i + 1 for i, w in enumerate(words)}}, unk_token="[UNK]")
+    )
+    tokenizer.pre_tokenizer = tokenizers.pre_tokenizers.Whitespace()
+    tokenizer.enable_truncation(max_length=3)
+    tokenizer.enable_padding(length=10, pad_id=0, pad_token="[UNK]")
+    tokenizer.save(str(tmp_path / "tokenizer.json"))
+    prefix = tmp_path / "english.txt"
+    prefix.write_text(" ".join(words), encoding="utf-8")
+    expected = "zero one two three four\n\n用户：请解读以上资料，简述主要结论和依据。\n助手：\n"
+    with service(expected, []) as (url, state):
+        result, output = invoke(
+            tmp_path,
+            url,
+            [],
+            "--rounds",
+            "0",
+            "--model-name",
+            "served",
+            "--context-tokens",
+            "5",
+            "--tokenizer",
+            str(tmp_path / "tokenizer.json"),
+            "--prefix-file",
+            str(prefix),
+        )
+    assert result.returncode == 0, result.stderr
+    assert output.joinpath("initial_prompt.txt").read_text(encoding="utf-8") == expected
+    summary = json.loads((output / "summary.json").read_text(encoding="utf-8"))
+    assert summary["context"]["selected_prefix_tokens"] == 5
+    assert summary["context"]["source_tokens"] == 8
+    assert len(state["requests"]) == 1 and not summary["rounds"]

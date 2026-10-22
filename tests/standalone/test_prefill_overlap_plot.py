@@ -75,12 +75,22 @@ def test_legacy_adjacent_layer_stats_are_never_relabeled_as_same_bank_coverage(t
         plot.aggregate_records([old])
 
 
-def test_any_multi_request_batch_is_excluded_even_identical_ranges():
+def test_multi_request_batch_with_same_range_is_counted_once():
     item = record()
     item["requests"].append(dict(req_id="b", token_start=0, token_end=4096))
     rows, skipped = plot.aggregate_records([item])
-    assert rows == []
-    assert skipped == 1
+    assert len(rows) == 1 and skipped == 0
+    assert rows[0]["worker_steps"] == 1 and rows[0]["dma_ms"] == 20
+
+
+def test_multi_request_unequal_spans_use_one_batch_envelope():
+    item = record(start=4096, end=8192)
+    item["requests"].append(dict(req_id="b", token_start=100000, token_end=101024))
+    rows, skipped = plot.aggregate_records([item])
+    assert not skipped and len(rows) == 1
+    assert (rows[0]["token_start"], rows[0]["token_end"]) == (4096, 101024)
+    assert rows[0]["span_policy"] == "request_or_batch_envelope"
+    assert rows[0]["worker_steps"] == 1 and rows[0]["dma_ms"] == 20
 
 
 def test_partial_chunks_and_exact_cache_hit_start_are_not_rebucketed(tmp_path):
