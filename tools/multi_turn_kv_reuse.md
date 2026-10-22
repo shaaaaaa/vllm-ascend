@@ -1,185 +1,222 @@
 # Long-prefix multi-turn KV reuse
 
-向已启动的 vLLM 服务或 PD proxy 发请求。每个独立会话先用固定长文章预热，
-等待所有会话的预热请求完整结束，再并发执行后续轮次。每轮等待全部会话完成后
-才进入下一轮，因此同一轮的 TTFT 可以在相同并发条件下比较。
+本页及原脚本保留单并发版本：`multi_turn_kv_reuse.py` 串行请求，
+`plot_multi_turn_overlap.py` 按对话轮次绘制 overlap 和 TTFT，默认保留第 0 轮。
+并发测试使用独立的 `multi_turn_kv_reuse_concurrent.py` 和
+`plot_multi_turn_overlap_concurrent.py`，详见 [并发测试说明](multi_turn_kv_reuse_concurrent.md)。
 
-每个会话自己的输入始终是：
+向已经启动的 vLLM 服务或 PD proxy 发送一条预先写好的约 500k-token 输入，
+取得真实模型输出，再继续 50 轮短问题。每轮严格使用：
 
 ```text
-本轮输入 = 上轮完整输入 + 上轮实际输出 + 本轮预写问题及角色分隔符
+本轮输入 = 上轮完整输入 + 上轮模型实际输出 + 本轮预先写好的问题及角色分隔符
 ```
 
-会话开头加入固定的 `session=编号; timestamp_ns=时间戳; run=运行编号`。
-不同会话、不同运行的前缀不同，防止互相复用整篇文章的缓存；同一会话的标记
-在所有轮次保持不变，不会为隔离会话而破坏它自己的历史 KV 复用。
-使用 `/v1/completions`，保留回答的原始空白，不重新套 chat template、摘要或截断历史。
+默认是 **1 次初始化 + 50 次追加，共 51 次请求**，全部串行。
+使用 `/v1/completions` 直接追加文本，保留回答中的空格、换行和思考文本，
+不重新构造 chat template，不做摘要、截断、随机采样或运行时补长前缀。
+文本前缀保持不变；重新分词时，拼接边界附近的少量 token 仍可能变化，
+不能仅凭字符相同就断言 token 或服务端缓存命中数完全相同。
+
+## 固定输入
+
+- `tools/multi_turn_kv_assets/prefix_500k.txt`：约 2.49 MB 的原创英文合成城市治理档案，
+  加上中文阅读说明与首轮问题。人物、地点、数字和事件均为虚构。
+- `tools/multi_turn_kv_assets/questions_50.txt`：50 个预先写好的中文短问题，每行一个。
+- `tools/multi_turn_kv_assets/manifest.json`：文件大小与预先测得的参考 token 数。
+
+前缀使用公开 [GLM-5 tokenizer](https://huggingface.co/zai-org/GLM-5/blob/main/tokenizer.json)
+在开发时计数，`add_special_tokens=False` 时为 **499964 token**。
+这个参考计数不代表部署的 GLM-5.3 tokenizer 必然相同。
+脚本运行时直接读取这份完整文本，实际长度以服务端返回的 `usage.prompt_tokens` 为准；
+不下载 tokenizer，不调用模型生成测试资料，也不会为凑长度而改写文件。
 
 ## 运行
+
+在 vllm-ascend 仓库运行，客户端只需要 Python 3.9+ 标准库：
 
 ```bash
 python3 tools/multi_turn_kv_reuse.py \
   --base-url http://7.150.4.174:8000 \
   --model-name GLM-5.3-falcon \
-  --concurrency 4 \
-  --context-tokens 200k \
-  --tokenizer /workspace/models/GLM-5.3-w4a8c8 \
   --rounds 50 \
   --max-tokens 128 \
-  --output-dir multi-turn-c4-200k \
-  2>&1 | tee multi-turn-c4-200k.log
+  --output-dir multi-turn-on \
+  2>&1 | tee multi-turn-on.log
 ```
 
-- `--base-url` 是服务或 PD proxy 地址，末尾带 `/v1` 也可。
-- `--model-name` 对应服务的 `--served-model-name`；省略时通过 `/v1/models` 发现模型。
-- `--concurrency` 默认 1；4 表示 4 个独立会话。默认每个会话先预热一次，再测 50 轮，
-  共发出 `4 × (1 + 50)` 个请求，指标中只有 `4 × 50` 个后续请求。
-- `--context-tokens 200k` 是文章前 200,000 个真实 token，`k` / `m` 使用十进制。
-  需要 `--tokenizer` 指定与服务一致的本地目录或 `tokenizer.json`，以及 Python 的
-  `tokenizers` 包。不下载模型，不加载权重，也不依赖 proxy 提供 `/tokenize` 接口。
-- 截短文章后追加固定阅读问题；会话标记和阅读问题会增加少量 token。
-  真实初始长度以预热响应的 `prompt_tokens` 为准。文章不足目标长度时不补长。
-- 该长度只控制初始文章。后续保留全部历史，随着回答和问题逐轮增长，不反复截断到 200k。
-- 不传 `--context-tokens` 时使用完整预写文章，约 500k token，不需要 tokenizer。
-- `--rounds` 是预热后的测量轮数，默认 50；`--rounds 0` 只预热。
-- `--max-tokens` 默认 128，需要长回答可改为 4000。HTTP socket timeout 默认 3600 秒，
-  可用 `--timeout` 修改。服务上下文上限需容纳文章、所有历史以及当前回答预算。
+`--base-url` 填实际服务地址；若走 PD proxy，填 proxy 的 IP 和端口。
+末尾带 `/v1` 也可以。`--model-name` 对应服务的 `--served-model-name`，
+省略时取 `/v1/models` 返回的第一个模型。
+默认每次最多输出 128 token，适合测试长历史、短增量；需要长回答可改为 `--max-tokens 4000`。
+默认 HTTP socket timeout 为 3600 秒，可通过 `--timeout` 修改。
+服务的 `max-model-len` 必须容纳初始前缀、历轮输出和问题以及当前输出预算。
 
-所有会话共用已提交的 `tools/multi_turn_kv_assets/prefix_500k.txt` 和
-`questions_50.txt`，运行时不生成文章或问题。原始前缀约 2.49 MB，参考 GLM-5
-分词器为 499964 token；GLM-5.3 的实际数量以服务响应为准。
-可用 `--prefix-file`、`--questions-file` 换已有文本；问题不足时发送请求前就报错。
-输出目录必须为空或不存在。请求不自动重试；任何预热失败都不进入测量阶段。
-全部预热完成只保证已完成初始请求，不锁定缓存驻留，也不保证不同后端一定共享缓存；
-检查后续响应的 `cached_tokens`。缺失缓存量记为 null，不能当作 0。
+`--rounds 0` 只发初始化请求，`--rounds 3` 发初始化和前三个固定问题。
+支持 `--prefix-file` 和 `--questions-file` 指定已有文本；不会生成缺失的问题。
+输出目录必须是新的或空的。请求失败后立即停止，不自动重试或跳过该轮。
+第一轮也可能命中先前运行留下的前缀，脚本不主动清理服务端缓存，
+不向固定前缀插入随机 run ID；每轮 request ID 则独立生成并打印，方便关联服务日志。
 
-## 输出和计时
+## 结果
 
-`metrics.csv` 和 `summary.json` 的 `rounds` 只包含已完成的后续请求，轮次为 1–50。
-每条有 `session_id`、并发数、request/response ID、输入输出 token 数、缓存量、TTFT
-和总耗时。每收到一个完整响应就写盘；中断测试可使用已经完成的请求绘图。
-`summary.json` 的 `warmups` 单独保留预热结果用于检查，预热不会计入曲线和分位数。
+每轮开始打印 round 和 request ID，完成后打印一条 JSON 指标，包括：
 
-TTFT 从开始发送 HTTP 请求到收到第一个非空文本增量，包含上传、排队、模型计算、
-PD 交接和网络时间。它不是纯 NPU prefill 时间。平均 token 间隔按首末文本增量间隔
-除以 `completion_tokens - 1` 估计；MTP、流式合并和网络缓冲会影响该估计。
+- 输入、输出 token 数，以及服务报告的 `cached_tokens`；
+- TTFT、请求总耗时和近似平均 token 间隔；
+- 输入字符数、本轮增加的字符数、结束原因。
+
+TTFT 从开始发送 HTTP 请求到收到第一个非空文本增量，包含上传、排队等时间。
+平均 token 间隔按首末文本增量时间差除以 `completion_tokens - 1` 估计；
+MTP 或网络缓冲可能在一个增量里返回多个 token，因此它不是逐 token 的设备计时。
+客户端不把流式消息数当成 token 数。
+若服务或 proxy 没有报告缓存量，对应项为 `null`，不能当作命中数为零。
+准确命中范围仍需结合服务端日志检查。
+
+输出目录包含：
 
 ```text
-initial_prompt.txt           截取后的公共文章/阅读问题，只存一份
-questions.txt                固定问题副本
-summary.json                 状态、配置、会话标记、预热和测量结果
-metrics.csv                  仅后续请求，每条包含 session_id
-sessions/000/                并发大于 1 时，每会话独立目录
-  session_prefix.txt         该会话固定的时间戳/编号标记
-  turns/000/                 预热，仅存档
-  turns/001/ ... 050/        后续轮次
-    added_input.txt          本轮增加的问题
-    output.txt               本轮实际输出
-    request.json             请求元数据，不重复保存整篇文章
-    response.json            完整响应及 usage
-    events.jsonl             原始流式事件
+initial_prompt.txt       初始完整输入，只保存一份
+questions.txt           预写问题的副本
+metrics.csv             逐轮指标
+summary.json            状态、运行参数、全部已完成轮次的指标
+turns/000/              初始化请求
+turns/001/ ... 050/     后续每轮
+  added_input.txt       本轮追加的问题及角色分隔符；初始化为空
+  output.txt            本轮实际输出，保留空白
+  request.json          请求参数、request ID、输入字符数；不重复保存完整前缀
+  response.json         合并后的回答和 usage
+  events.jsonl          服务端原始流式 JSON 事件
 ```
 
-并发为 1 时，`session_prefix.txt`、`turns/` 直接放在输出根目录。
-重建任一会话输入：固定会话标记 + 公共初始文章 + 此会话之前的实际回答和追加问题。
-重新分词时拼接边界附近少量 token 可能变化，字符相同不保证 token 前缀完全相同。
+要重建第 N 轮输入，从 `initial_prompt.txt` 开始，按顺序追加第 0 至 N-1 轮的
+`output.txt` 和其后一轮的 `added_input.txt` 即可。
+初始化轮编号为 0，50 个后续问题编号为 1 至 50。
+失败轮的部分输出和已收到的事件会保留，但不会用于发送下一轮。
+同一份固定前缀与问题可用于分别开启、关闭 layerwise 后运行；
+后续历史使用各自模型的实际输出，因此若回答不同，后续请求也会不同。
 
-## 只画 TTFT，不读服务端日志
+本地 HTTP 模拟测试验证 51 次请求的真实回答累积、原样保存空白、流式 usage、
+服务模型名、失败即停和固定资料文件。实际 NPU 性能与缓存命中需要在目标服务上运行。
+
+```bash
+python3 -m pytest --confcutdir=tests/standalone \
+  tests/standalone/test_multi_turn_kv_reuse.py -q -o addopts= -o log_cli=false
+```
+
+## 只用客户端数据画 TTFT
+
+不需要服务端日志或 SSH，直接读取已有测试输出目录：
 
 ```bash
 python3 tools/plot_multi_turn_overlap.py \
-  --run-dir multi-turn-c4-200k \
+  --run-dir multi-turn-on \
   --ttft-only \
-  --output multi-turn-c4-ttft.png
+  --output multi-turn-ttft.png
 ```
 
-绘图需要 matplotlib，不需要 vLLM、NPU、SSH 或服务端统计开关。
-读取 `summary.json`，不存在时读取 `metrics.csv`。预热轮 0 始终排除。
-并发为 1 时画带数值的曲线；并发大于 1 时，每个后续轮画一个箱体：
-箱体为 P25–P75，中线 P50，须线 P1–P99，菱形是均值；标注均值、P50、P99 和
-有效样本数 `n/并发数`。分位数在已完成会话样本间做线性插值；4 路只有 4 个样本，
-P99 接近最大值，并不代表有大量尾延迟样本。缺失 TTFT 不补 0，不把 TP rank 当作会话。
-输出同名 CSV，含均值 `ttft_s`、P50、P99、样本数等。中断轮可显示例如 `n=3/4`。
+生成白底的逐轮 TTFT 曲线，点旁标注秒数，同时输出同名 `.csv`。
+读取 `summary.json`，没有该文件时读取 `metrics.csv`；仅使用已完成轮次，
+中断的测试也可绘图，缺失 TTFT 留空。可加 `--start-round 1 --end-round 10`
+只看第 1 至 10 轮。TTFT 是从开始发送请求到收到第一个非空文本增量的客户端
+耗时，包含上传、排队、PD 交接和网络时间，不能用它单独拆分服务端各阶段耗时。
+绘图需要 matplotlib，不需要开启服务端 overlap 统计。
 
-截取后续第 1–10 轮，加 `--start-round 1 --end-round 10`。
-只完成 10 轮但参数写 50，不会补出后面没有完成的轮次。
+## 按对话轮次画 overlap 图
 
-## 同时画 overlap
-
-P 节点启动前开启：
+P 节点启动服务前开启统计，随后按上面的命令运行客户端并保留 `multi-turn-on` 目录：
 
 ```bash
 export VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE=true
 export VLLM_ASCEND_PREFILL_OVERLAP_STATS=true
 ```
 
-更新 LMCache-Ascend 后重启 P 服务，多请求 batch 也输出一份整体统计。
-所有请求的真实 token 区间保留在日志 `requests`，不把 batch 时间分摊或重复计给各请求。
-不同请求轮转相位不同时，按组内序号模 bank 数配对整个 batch 的复用窗口；4 bank
-比较前后相隔 4 个组内层的等待门，不能按重叠的物理 bank 集合误配成相邻层。
-每个有效统计 batch 读取一次 CPU 时钟，记录 `batch_start_time_ns` 作为横轴定位，
-表示主线程开始提交此 batch 的时间，不是 NPU 实际开始执行的时间。
-coverage、save、load、wait 的耗时仍取 NPU event；不增加 host synchronize，
-不增加 NPU 计时事件，也不改变传输或计算依赖。多台 P 机器的时钟需要对齐。
+测试结束后，在绘图机器运行：
 
 ```bash
+python3 -m pip install matplotlib
 python3 tools/plot_multi_turn_overlap.py \
   --hosts root@7.150.4.174 root@7.150.5.55 \
   --remote-log-dir /workspace/fsi_lab/sqh/vllm-ascend/tp4_dp4_logs \
-  --run-dir multi-turn-c4-200k \
+  --run-dir multi-turn-on \
   --ssh-password '你的SSH密码' \
   --skip-host-key-check \
   --aggregate-ranks \
-  --time-bin-seconds 1 \
-  --output multi-turn-c4-overlap.png
+  --output multi-turn-overlap.png
 ```
 
-收集所有 P 机器的日志。默认匹配 `P_dp*.log`；用 `--log-pattern` 换文件名，
-也可用 `--container` 从容器内收集。`--repo-path` 只取固定的 `<repo>/tp4_dp4_logs`，
-不是目录搜索。原生 OpenSSH/SSH_ASKPASS，不需要 sshpass；可使用
-`--password-env PD_SSH_PASSWORD` 或密钥替代显式密码。
-远端先过滤统计行再压缩传输，每次保存在图片旁的 `multi-turn-overlap-logs-*/`。
+`--hosts` 填所有 P 机器的 IP 或 `user@IP`，`--remote-log-dir` 填这些机器上日志的
+实际绝对目录。脚本并发收集各机器上该目录中的 `P_dp*.log`，包括每台机器的两个
+DP 日志，按 request ID 自动匹配轮次。开始采集时会打印实际目录和文件名匹配模式。
+也可用 `--repo-path /仓库路径`，但这只是固定取 `<repo-path>/tp4_dp4_logs`，不会自动
+搜索仓库或其他目录；不要把仓库目录当作已经确认的日志目录。
+文件名不同，用 `--log-pattern 'P*.log'`，也可重复指定该参数。
+若日志在容器内而 SSH 登录宿主机，加 `--container 容器名`。
 
-已有本地日志可以直接画图，不再次访问远端：
+`--ssh-password '密码'` 直接传各机器共用的 SSH 密码，运行中不会再询问密码。
+原有 `--password` 仍可提示输入一次共用密码，输入不回显；密码不同改用
+`--password-per-host`。也可以用 `--password-env PD_SSH_PASSWORD` 从同名环境变量
+读取密码，或不传密码选项，沿用 SSH 密钥。仅使用系统 OpenSSH 和临时 `SSH_ASKPASS`
+回调，不依赖 sshpass；密码不会再写入远端 SSH 命令、临时脚本或采集结果，完成后删除临时回调。
+示例中的 `--skip-host-key-check` 沿用之前跳过主机校验的用法；已有 known_hosts 时可去掉。
+SSH 端口和私钥可通过 `--ssh-port`、`--identity-file` 指定。
+
+远端只读取匹配日志中的 `[PREFILL_OVERLAP]` 行，先打包压缩，再传回本地，
+不改服务日志、不触发 tensor dump。每次创建新快照，保存在图片旁的
+`multi-turn-overlap-logs-*/`（可用 `--collect-dir` 指定一个尚不存在的目录）；
+各主机分目录保留过滤后的日志、压缩包和采集清单。服务仍写日志时，仅读取打开文件时
+已有的字节，跳过最后未写完的行，建议 50 轮结束后采集。
+默认每台机器最多等待 600 秒，可用 `--ssh-timeout` 调整。任意机器连接、认证或路径
+失败都会保留结果并停止绘图，避免把收集失败当作无数据；正常读取到日志但没有统计行的
+空闲节点允许为空，缺少轮次仍会在绘图诊断中提示。
+
+已有本地日志仍可直接画图：
 
 ```bash
-python3 tools/plot_multi_turn_overlap.py \
-  'multi-turn-overlap-logs-*/host-*/snapshot/logs/*.log' \
-  --run-dir multi-turn-c4-200k --aggregate-ranks --output multi-turn-c4-overlap.png
+python3 tools/plot_multi_turn_overlap.py 'P1_logs/P_dp*.log' 'P2_logs/P_dp*.log' \
+  --run-dir multi-turn-on --aggregate-ranks --output multi-turn-overlap.png
 ```
 
-overlap 和各 bank 时间的横轴改为时间，以首个匹配的测量 batch 为 0 秒。
-不按对话轮次归类，不标注请求 ID；一个 batch 可以包含任意多个不同轮次的请求。
-只要包含选中测量范围内的任一请求，就保留整个 batch 一次，不把指标分摊给请求，
-也不因跨轮而跳过。混有范围外请求时，整批仍保留并在 JSON 诊断计数。
-只有预热或无关请求的 batch 排除。`--start-round` / `--end-round` 筛选 TTFT 的轮次，
-以及 overlap 所含的测量请求范围；混合 batch 无法进一步拆分。
+`logs` 可以传多个 P 节点日志文件或 glob；DP 路由可能把不同轮次发到不同实例，
+应收集所有相关 P 节点的日志。客户端目录只需 `summary.json`，或者没有该文件时
+使用 `metrics.csv`；不需要复制 500k 文本或 tensor dump。脚本使用客户端 request ID
+和响应 ID 匹配服务端内部 ID，接受 vLLM 添加的 `cmpl-` / `chatcmpl-` 前缀及内部后缀。
+不按日志出现顺序猜轮次，也不会把另一组测试的请求混进来。
 
-不加 `--aggregate-ranks` 时，每个 worker 的每个 batch 是一个时间数据点。
-加上时，在固定时间窗口内汇总所有观测 worker 的 batch，默认每 1 秒一个均值点；
-可用 `--time-bin-seconds 5` 改为 5 秒。coverage 按有效模型层样本数加权平均已有
-逐层比值，不用总等待除以总窗口重新计算。save/load/wait 是该窗口内每个 worker
-batch 的平均耗时；没有数据的窗口不补点，不把整批耗时摊到经过的每一秒。
-不同 stream 的传输时间分别累计，并非墙钟时间。首层 bank 等待仍保留。
+图为白底，横轴是轮次：0 是初始化长前缀，1–50 是后续追加。
+八个子图分别显示 coverage、save+load、save、load、含首层的总 bank wait、
+首层 bank wait、同 bank 复用时的 bank wait、每轮客户端 TTFT。
+不再绘制 layer start interval；`interval_ms` 仍保留在 CSV 中供核查。
+TTFT 从客户端 `summary.json` / `metrics.csv` 的 `ttft_s` 读取，单位为秒，
+每个请求只画一次，不随 TP rank 或 chunk 数重复累计。服务端统计缺失的已完成轮次，
+只要客户端记录了 TTFT，TTFT 子图仍会显示；没有 TTFT 的轮次留空。
+所有子图的数据点旁都标出数值，coverage 标百分比，bank 耗时标毫秒，TTFT 标秒。
+较多轮次时图片自动加宽，标签交错排列，便于保留第 0 轮时读取后续轮次的具体数值。
+服务日志中原有的 `first_layer_wait_ms`、`all_wait_ms` 现在保留到逐轮 CSV 和逐 chunk CSV。
+`all_wait_ms` 包含所有等待，`wait_ms` 只累计有前驱的同 bank 复用等待。
+`initial_bank_wait_ms` 另保留在 CSV，统计每个 KV 组各 bank 的首次使用等待。
+每个 chunk 都有自己的首层等待，同一轮先累加各 chunk 的首层等待，再按 worker 取平均。
+coverage 使用同一个 `(KV group, bank)` 前后两次消费的窗口。4 bank 的 latent 组
+比较 N 与 N+4；indexer 按自身实际 bank 使用顺序配对。每个模型层先平均该层有效 bank
+比值，再对模型层平均，保持所有模型层同权。各 bank 的首次使用没有前驱，不编造比值，
+等待时间仍计入首次使用等待和全层等待。
+新日志为 `schema_version=2`、`coverage_definition=same_bank_reuse_v1`。
+schema 2 原始日志可直接重画；旧 schema 1 按相邻模型层统计，无法恢复同 bank 配对的
+逐层窗口，绘图跳过并提示。要得到新覆盖率，需更新 LMCache-Ascend 后重启服务重新统计。
+仅有旧版汇总 CSV 也无法还原。缺失等待字段留空，不视为零。
+若第 0 轮远大于后续轮次，用同一命令加 `--start-round 1`，只看 50 轮追加；
+也可以用 `--end-round 10` 截取区间。
 
-TTFT 继续单独按对话轮次画，并发大于 1 时画箱体，与 overlap 的时间横轴独立。
+同一轮有多个 prefill chunk 时，先累加它们的耗时。coverage 按 `layer_samples`
+对服务端已计算的逐层覆盖率加权平均，仍然是逐层比例的平均，不改成总等待除以总间隔。
+默认每个 DP/TP worker 一条曲线；`--tp-rank 0` / `--dp-rank 0` 可以筛选。
+`--aggregate-ranks` 合成一条曲线：coverage 平均所有实际观测的层，耗时则对各 worker
+的整轮累计值取平均。图中时间单位为 ms / worker / round，不是每个 chunk 的平均，
+也不是请求墙钟时间；bank 之间重叠的传输时间仍分别相加。
 
-图含 coverage、save+load、save、load、全层 bank wait、首层 bank wait、复用 wait
-及 TTFT。输出时间数据 `.csv`、逐 batch 的 `.chunks.csv`、逐轮 TTFT 的
-`.ttft.csv` 和匹配/缺失情况 `.json`。原始 batch 统计保留，不会被时间窗口均值替代。
-缺失服务端统计留空，不补 0 或 100%；客户端 TTFT 独立使用完整会话样本。
-旧 schema 1 无法恢复同 bank 复用口径，需重新采集。schema 2 旧日志没有 batch 时间戳
-时，可使用日志行里完整的年月日时分秒作为近似横轴，并显式提示这是后台输出时间，
-不能当成 batch 执行时间；需保持日志与分析机器的时区一致。没有任何时间戳则跳过并
-报告缺失，不用 batch 编号或轮次伪造时间。更新 LMCache-Ascend 并重启 P 后使用新时间戳。
-
-## 本地验证
-
-```bash
-python3 -m pytest --confcutdir=tests/standalone \
-  tests/standalone/test_multi_turn_kv_reuse.py \
-  tests/standalone/test_multi_turn_overlap_plot.py -q -o addopts=
-```
-
-本地 HTTP 模拟验证并发、预热屏障、隔离历史、真实 token 截取和失败处理。
-真实 NPU 性能与缓存命中仍需在目标服务测试。
+输出同名 `.csv`（逐轮汇总）、`.chunks.csv`（逐 chunk 原始计数/耗时）和 `.json`
+（匹配及缺失情况）。没有统计的轮次留空、曲线断开并给出提示，不会补成 0 或 100%。
+此单并发绘图入口跳过多请求混批；混批统计使用独立的并发绘图入口。
+统计队列丢失、失败或不完整记录不会被当成完整数据。
+某个 worker 缺少部分 chunk 仍可能形成部分汇总，需结合 JSON 提示及 chunks CSV 检查；
+图只代表实际记录到的样本。

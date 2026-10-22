@@ -79,8 +79,9 @@ def _write(path, content):
 
 
 @pytest.mark.parametrize("mode", ["prompt", "env", "per-host", "argument"])
-def test_native_password_multi_host_collection_then_timeline_plot(collect, tmp_path, monkeypatch, mode, capsys):
-    plot = importlib.import_module("plot_multi_turn_overlap")
+@pytest.mark.parametrize("concurrent", [False, True], ids=["serial-rounds", "concurrent-time"])
+def test_native_password_multi_host_collection_then_plot(collect, tmp_path, monkeypatch, mode, concurrent, capsys):
+    plot = importlib.import_module("plot_multi_turn_overlap_concurrent" if concurrent else "plot_multi_turn_overlap")
     transport = importlib.import_module("pd_tensor_collect")
     hosts = ["root@192.0.2.1", "root@192.0.2.2"]
     archives = {}
@@ -124,7 +125,11 @@ def test_native_password_multi_host_collection_then_timeline_plot(collect, tmp_p
 
     monkeypatch.setattr(transport.subprocess, "run", ssh)
     rendered = []
-    monkeypatch.setattr(plot, "plot_timeline", lambda rows, rounds, path, **kwargs: rendered.append((rows, rounds)))
+    monkeypatch.setattr(
+        plot,
+        "plot_timeline" if concurrent else "plot_rounds",
+        lambda rows, rounds, path, **kwargs: rendered.append((rows, rounds)),
+    )
     run_dir = tmp_path / "client"
     run_dir.mkdir()
     (run_dir / "summary.json").write_text(
@@ -165,9 +170,13 @@ def test_native_password_multi_host_collection_then_timeline_plot(collect, tmp_p
     assert len(commands) == 2 and len(set(h.parent for h in helpers)) == 1
     assert not any(helper.exists() or helper.parent.exists() for helper in helpers)
     rows, rounds = rendered[0]
-    assert [row["round"] for row in rounds] == [1, 2]
-    assert [row["time_s"] for row in rows] == [0.5, 1.5]
-    assert [row["worker_count"] for row in rows] == [1, 1]
+    if concurrent:
+        assert [row["round"] for row in rounds] == [1, 2]
+        assert [row["time_s"] for row in rows] == [0.5, 1.5]
+    else:
+        assert rounds == [0, 1, 2]
+        assert [row["round"] for row in rows] == [0, 1, 2]
+    assert all(row["worker_count"] == 1 for row in rows)
     assert len(list(destination.glob("host-*/snapshot/logs/*.log"))) == 4
     manifest = (destination / "collection.json").read_text()
     assert secret not in manifest
