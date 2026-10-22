@@ -6,6 +6,7 @@ python3 tools/multi_turn_kv_reuse_concurrent.py --base-url http://127.0.0.1:8000
 Uses Python 3.9+; optional real-token truncation also needs tokenizers.
 Connects to an already running service.
 Each session warms its prefix before the measured, concurrent follow-up rounds.
+After all warmups finish, each session advances independently without round barriers.
 Use multi_turn_kv_reuse.py for the original serial run including round 0.
 """
 
@@ -22,7 +23,7 @@ import urllib.error
 import urllib.request
 import uuid
 from collections.abc import Iterator
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 from typing import Any, BinaryIO
 
@@ -230,6 +231,7 @@ def run(args: argparse.Namespace, root: Path, initial_prompt: str, questions: li
         "model": args.model,
         "followup_rounds": args.rounds,
         "concurrency": args.concurrency,
+        "scheduling": "independent_sessions_after_all_warmups",
         "total_requests": args.concurrency * (args.rounds + 1),
         "max_tokens": args.max_tokens,
         "initial_prompt_chars": len(initial_prompt),
@@ -255,6 +257,10 @@ def run(args: argparse.Namespace, root: Path, initial_prompt: str, questions: li
         print(
             "[MULTI_TURN] All session warmups finish before round 1; warmup is excluded from metrics.csv.", flush=True
         )
+        print(
+            "[MULTI_TURN] Follow-up sessions advance independently; there is no cross-session round barrier.",
+            flush=True,
+        )
         print("[MULTI_TURN] cached_tokens=null means not reported; it does not mean a cache miss.", flush=True)
         sessions = []
         for session_id in range(args.concurrency):
@@ -263,7 +269,12 @@ def run(args: argparse.Namespace, root: Path, initial_prompt: str, questions: li
             marker = f"session={session_id:04d}; timestamp_ns={time.time_ns()}; run={run_id}\n\n"
             directory.joinpath("session_prefix.txt").write_bytes(marker.encode("utf-8"))
             summary["sessions"].append(
-                dict(session_id=session_id, directory=str(directory.relative_to(root)), marker=marker)
+                dict(
+                    session_id=session_id,
+                    directory=str(directory.relative_to(root)),
+                    marker=marker,
+                    completed_followup_rounds=0,
+                )
             )
             sessions.append(
                 dict(
@@ -280,70 +291,101 @@ def run(args: argparse.Namespace, root: Path, initial_prompt: str, questions: li
         ):
             metrics = csv.DictWriter(metrics_file, fieldnames=METRIC_FIELDS)
             metrics.writeheader()
-            for current_round in range(args.rounds + 1):
-                pending = {}
-                question = questions[current_round - 1] if current_round else ""
-                added = QUESTION_PREFIX + question + QUESTION_SUFFIX if current_round else ""
-                for session_id, session in enumerate(sessions):
-                    if current_round:
-                        session["history"] += session["previous_output"] + added
-                    history = session["history"]
-                    directory = session["directory"] / "turns" / f"{current_round:03d}"
-                    directory.mkdir(parents=True)
-                    directory.joinpath("added_input.txt").write_bytes(added.encode("utf-8"))
-                    request_id = f"multi-{run_id}-s{session_id:03d}-{current_round:03d}"
-                    payload = {
-                        "model": model,
-                        "prompt": history,
-                        "request_id": request_id,
-                        "max_tokens": args.max_tokens,
-                        "temperature": 0,
-                        "stream": True,
-                        "stream_options": {"include_usage": True},
-                    }
-                    save_json(
-                        directory / "request.json",
-                        {
-                            **{key: value for key, value in payload.items() if key != "prompt"},
-                            "session_id": session_id,
-                            "round": current_round,
-                            "prompt_chars": len(history),
-                            "prompt_source": "session_prefix.txt + initial_prompt.txt + prior answers/questions",
-                        },
-                    )
-                    print(
-                        f"[MULTI_TURN] round={current_round:02d} session={session_id} "
-                        f"begin request_id={request_id} chars={len(history)}",
-                        flush=True,
-                    )
-                    future = executor.submit(session["client"].complete, payload, directory)
-                    pending[future] = (session_id, request_id)
-                # No session enters round N+1 before every session finishes N.
-                for future in as_completed(pending):
-                    current_session, request_id = pending[future]
-                    session = sessions[current_session]
-                    session["previous_output"], stats = future.result()
-                    row = {
-                        "round": current_round,
-                        "session_id": current_session,
+            pending = {}
+
+            def submit_turn(session_id: int, turn: int) -> None:
+                nonlocal current_session, current_round
+                current_session, current_round = session_id, turn
+                session = sessions[session_id]
+                question = questions[turn - 1] if turn else ""
+                added = QUESTION_PREFIX + question + QUESTION_SUFFIX if turn else ""
+                if turn:
+                    session["history"] += session["previous_output"] + added
+                history = session["history"]
+                directory = session["directory"] / "turns" / f"{turn:03d}"
+                directory.mkdir(parents=True)
+                directory.joinpath("added_input.txt").write_bytes(added.encode("utf-8"))
+                request_id = f"multi-{run_id}-s{session_id:03d}-{turn:03d}"
+                payload = {
+                    "model": model,
+                    "prompt": history,
+                    "request_id": request_id,
+                    "max_tokens": args.max_tokens,
+                    "temperature": 0,
+                    "stream": True,
+                    "stream_options": {"include_usage": True},
+                }
+                save_json(
+                    directory / "request.json",
+                    {
+                        **{key: value for key, value in payload.items() if key != "prompt"},
+                        "session_id": session_id,
+                        "round": turn,
+                        "prompt_chars": len(history),
+                        "prompt_source": "session_prefix.txt + initial_prompt.txt + prior answers/questions",
+                    },
+                )
+                print(
+                    f"[MULTI_TURN] round={turn:02d} session={session_id} "
+                    f"begin request_id={request_id} chars={len(history)}",
+                    flush=True,
+                )
+                future = executor.submit(session["client"].complete, payload, directory)
+                pending[future] = (
+                    session_id,
+                    {
+                        "round": turn,
+                        "session_id": session_id,
                         "concurrency": args.concurrency,
-                        "phase": "followup" if current_round else "warmup",
+                        "phase": "followup" if turn else "warmup",
                         "request_id": request_id,
                         "question": question,
-                        "prompt_chars": len(session["history"]),
-                        "new_input_chars": len(session["history"]) - session["previous_prompt_chars"],
-                        **stats,
-                    }
-                    session["previous_prompt_chars"] = len(session["history"])
-                    if current_round:
-                        summary["rounds"].append(row)
-                        metrics.writerow(row)
-                        metrics_file.flush()
-                    else:
-                        summary["warmups"].append(row)
-                    save_json(root / "summary.json", summary)
-                    print("[MULTI_TURN] " + json.dumps(row, ensure_ascii=False), flush=True)
-                summary["completed_followup_rounds"] = current_round
+                        "prompt_chars": len(history),
+                        "new_input_chars": len(history) - session["previous_prompt_chars"],
+                    },
+                )
+
+            # Only warmup has a global barrier. Each measured completion
+            # releases its own session's next turn, regardless of other rounds.
+            for first_turn in (0, 1):
+                if first_turn > args.rounds:
+                    break
+                for session_id in range(args.concurrency):
+                    submit_turn(session_id, first_turn)
+                while pending:
+                    completed, _ = wait(pending, return_when=FIRST_COMPLETED)
+                    ready, failure = [], None
+                    for future in completed:
+                        current_session, base_row = pending.pop(future)
+                        current_round = base_row["round"]
+                        session = sessions[current_session]
+                        try:
+                            session["previous_output"], stats = future.result()
+                        except Exception as error:
+                            if failure is None:
+                                failure = (current_session, current_round, error)
+                            continue
+                        row = {**base_row, **stats}
+                        session["previous_prompt_chars"] = row["prompt_chars"]
+                        if current_round:
+                            summary["rounds"].append(row)
+                            metrics.writerow(row)
+                            metrics_file.flush()
+                            summary["sessions"][current_session]["completed_followup_rounds"] = current_round
+                            summary["completed_followup_rounds"] = min(
+                                item["completed_followup_rounds"] for item in summary["sessions"]
+                            )
+                            if current_round < args.rounds:
+                                ready.append((current_session, current_round + 1))
+                        else:
+                            summary["warmups"].append(row)
+                        save_json(root / "summary.json", summary)
+                        print("[MULTI_TURN] " + json.dumps(row, ensure_ascii=False), flush=True)
+                    if failure is not None:
+                        current_session, current_round, error = failure
+                        raise error
+                    for session_id, turn in ready:
+                        submit_turn(session_id, turn)
         summary["status"] = "complete"
     except BaseException as error:
         summary.update(

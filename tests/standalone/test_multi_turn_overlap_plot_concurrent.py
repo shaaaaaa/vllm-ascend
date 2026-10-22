@@ -399,3 +399,17 @@ def test_ttft_boxes_use_session_samples_and_report_partial_rounds(plot, tmp_path
         rows = list(csv.DictReader(source))
     assert [row["ttft_samples"] for row in rows] == ["4", "3"]
     assert [row["round"] for row in rows] == ["1", "2"]
+
+
+def test_independent_session_progress_keeps_round_distributions_without_a_barrier(plot, tmp_path):
+    metadata = [
+        dict(round=turn, session_id=session, concurrency=2, request_id=f"run-s{session}-{turn}", ttft_s=turn + session)
+        for session, turn in ((1, 1), (1, 2), (1, 3), (0, 1))
+    ]
+    (tmp_path / "summary.json").write_text(
+        json.dumps(dict(status="running", concurrency=2, rounds=metadata)), encoding="utf-8"
+    )
+    rows = plot.ttft_summary(plot.read_rounds(tmp_path))
+    assert [r["round"] for r in rows] == [1, 2, 3]
+    assert [r["ttft_samples"] for r in rows] == [2, 1, 1]
+    assert [r["concurrency"] for r in rows] == [2, 2, 2]

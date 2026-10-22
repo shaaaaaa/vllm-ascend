@@ -5,8 +5,9 @@
 参见 [单并发测试说明](multi_turn_kv_reuse.md)。本页命令全部指向并发版本。
 
 向已启动的 vLLM 服务或 PD proxy 发请求。每个独立会话先用固定长文章预热，
-等待所有会话的预热请求完整结束，再并发执行后续轮次。每轮等待全部会话完成后
-才进入下一轮，因此同一轮的 TTFT 可以在相同并发条件下比较。
+等待所有会话的预热请求完整结束，再开始测量。后续各会话独立推进：一个会话收到
+自己的完整回答，就发送自己的下一轮，不等待其他会话。每个会话最多一个在途请求，
+可同时出现会话 0 在第 2 轮、会话 1 在第 5 轮；只有预热阶段有全局屏障。
 
 每个会话自己的输入始终是：
 
@@ -63,6 +64,8 @@ python3 tools/multi_turn_kv_reuse_concurrent.py \
 每条有 `session_id`、并发数、request/response ID、输入输出 token 数、缓存量、TTFT
 和总耗时。每收到一个完整响应就写盘；中断测试可使用已经完成的请求绘图。
 `summary.json` 的 `warmups` 单独保留预热结果用于检查，预热不会计入曲线和分位数。
+`sessions` 分别记录各会话的 `completed_followup_rounds`；根级同名字段是所有会话
+进度的最小值，只表示大家都已完成到哪一轮，不用于阻止快会话继续发送。
 
 TTFT 从开始发送 HTTP 请求到收到第一个非空文本增量，包含上传、排队、模型计算、
 PD 交接和网络时间。它不是纯 NPU prefill 时间。平均 token 间隔按首末文本增量间隔
@@ -103,6 +106,8 @@ python3 tools/plot_multi_turn_overlap_concurrent.py \
 箱体为 P25–P75，中线 P50，须线 P1–P99，菱形是均值；标注均值、P50、P99 和
 有效样本数 `n/并发数`。分位数在已完成会话样本间做线性插值；4 路只有 4 个样本，
 P99 接近最大值，并不代表有大量尾延迟样本。缺失 TTFT 不补 0，不把 TP rank 当作会话。
+轮次是各会话自己的对话深度，同轮样本可能来自不同墙钟时段，不代表同一同步 batch。
+会话完成全部指定轮次后退出，因此测试收尾阶段的实际在途并发数会降低。
 输出同名 CSV，含均值 `ttft_s`、P50、P99、样本数等。中断轮可显示例如 `n=3/4`。
 
 截取后续第 1–10 轮，加 `--start-round 1 --end-round 10`。
@@ -185,5 +190,5 @@ python3 -m pytest --confcutdir=tests/standalone \
   tests/standalone/test_multi_turn_overlap_plot_concurrent.py -q -o addopts=
 ```
 
-本地 HTTP 模拟验证并发、预热屏障、隔离历史、真实 token 截取和失败处理。
+本地 HTTP 模拟验证并发、仅预热屏障、后续独立推进、隔离历史、真实 token 截取和失败处理。
 真实 NPU 性能与缓存命中仍需在目标服务测试。

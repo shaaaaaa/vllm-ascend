@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Exercise the sequential streaming client over HTTP without a real model."""
+"""Exercise independently advancing streaming sessions over HTTP without a model."""
 
 import csv
 import json
@@ -16,10 +16,29 @@ REPO = Path(__file__).resolve().parents[2]
 
 
 @contextmanager
-def service(initial, questions, failure=None, discover=False, report_cache=True, concurrency=1):
-    state = {"requests": [], "get_models": 0, "expected": {}, "outputs": [], "markers": {}, "completed": {}}
+def service(
+    initial,
+    questions,
+    failure=None,
+    discover=False,
+    report_cache=True,
+    concurrency=1,
+    hold_first_followup=False,
+    progress_path=None,
+):
+    state = {
+        "requests": [],
+        "get_models": 0,
+        "expected": {},
+        "outputs": [],
+        "markers": {},
+        "completed": {},
+        "session_completed": {},
+        "independent_advance_seen": False,
+    }
     lock = threading.Lock()
-    barriers = {turn: threading.Barrier(concurrency, timeout=10) for turn in range(len(questions) + 1)}
+    warmup_barrier = threading.Barrier(concurrency, timeout=10)
+    fast_next_round = threading.Event()
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *args):
@@ -49,9 +68,18 @@ def service(initial, questions, failure=None, discover=False, report_cache=True,
                     state["markers"][session_id] = marker + separator
                     state["expected"][session_id] = marker + separator + initial
                 else:
-                    assert state["completed"].get(turn - 1) == concurrency, "round started before all prior responses"
+                    assert state["completed"].get(0) == concurrency, "followup started before all warmups completed"
+                    assert state["session_completed"].get(session_id) == turn - 1, "session skipped its own response"
                 assert body["prompt"] == state["expected"][session_id], f"history changed at round {turn}"
-            barriers[turn].wait()
+                if hold_first_followup and session_id == 1 and turn == 2:
+                    state["independent_advance_seen"] = state["session_completed"].get(0) == 0
+                    if progress_path is not None:
+                        state["progress_snapshot"] = json.loads(progress_path.read_text(encoding="utf-8"))
+                    fast_next_round.set()
+            if not turn:
+                warmup_barrier.wait()
+            if hold_first_followup and session_id == 0 and turn == 1:
+                assert fast_next_round.wait(timeout=5), "fast session was blocked by a cross-session round barrier"
             if (failure == "http" and turn == 1) or (failure == "warmup" and turn == 0 and session_id == 0):
                 data = b'{"error":"service failed"}'
                 self.send_response(503)
@@ -89,6 +117,7 @@ def service(initial, questions, failure=None, discover=False, report_cache=True,
                 if turn < len(questions):
                     state["expected"][session_id] += answer + "\n\n用户：" + questions[turn] + "\n助手：\n"
                 state["completed"][turn] = state["completed"].get(turn, 0) + 1
+                state["session_completed"][session_id] = turn
             self.wfile.write(b"data: [DONE]\r\n\r\n")
 
     with ThreadingHTTPServer(("127.0.0.1", 0), Handler) as server:
@@ -283,6 +312,7 @@ def test_four_sessions_warm_together_then_preserve_separate_histories(tmp_path):
     assert len(set(state["markers"].values())) == 4
     summary = json.loads((output / "summary.json").read_text(encoding="utf-8"))
     assert summary["completed_followup_rounds"] == 2 and summary["concurrency"] == 4
+    assert summary["scheduling"] == "independent_sessions_after_all_warmups"
     assert len(summary["warmups"]) == 4 and len(summary["rounds"]) == 8
     assert {row["session_id"] for row in summary["rounds"]} == set(range(4))
     assert all(row["round"] in (1, 2) for row in summary["rounds"])
@@ -293,6 +323,42 @@ def test_four_sessions_warm_together_then_preserve_separate_histories(tmp_path):
         directory = output / "sessions" / f"{session_id:03d}"
         assert directory.joinpath("session_prefix.txt").read_text() == state["markers"][session_id]
         assert directory.joinpath("turns/002/response.json").exists()
+
+
+def test_fast_session_advances_while_another_session_is_still_in_its_previous_round(tmp_path):
+    initial = "用户：固定前缀\r\n资料。\n助手：\n"
+    questions = ["依据呢？", "结论呢？", "再解释一下？"]
+    with service(
+        initial,
+        questions,
+        concurrency=2,
+        hold_first_followup=True,
+        progress_path=tmp_path / "artifacts" / "summary.json",
+    ) as (url, state):
+        result, output = invoke(
+            tmp_path, url, questions, "--rounds", "3", "--concurrency", "2", "--model-name", "served"
+        )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert state["independent_advance_seen"]
+    snapshot = state["progress_snapshot"]
+    assert snapshot["completed_followup_rounds"] == 0
+    assert [s["completed_followup_rounds"] for s in snapshot["sessions"]] == [0, 1]
+    assert len(snapshot["warmups"]) == 2
+    assert len(state["requests"]) == 8
+    for session_id in range(2):
+        turns = [
+            int(r["request_id"].rsplit("-", 1)[-1])
+            for r in state["requests"]
+            if f"-s{session_id:03d}-" in r["request_id"]
+        ]
+        assert turns == [0, 1, 2, 3]
+    summary = json.loads((output / "summary.json").read_text(encoding="utf-8"))
+    assert summary["completed_followup_rounds"] == 3
+    assert [s["completed_followup_rounds"] for s in summary["sessions"]] == [3, 3]
+    with (output / "metrics.csv").open(encoding="utf-8", newline="") as source:
+        rows = list(csv.DictReader(source))
+    assert len(rows) == 6
+    assert {(int(r["session_id"]), int(r["round"])) for r in rows} == {(s, r) for s in range(2) for r in (1, 2, 3)}
 
 
 def test_failed_warmup_never_starts_measured_rounds(tmp_path):
