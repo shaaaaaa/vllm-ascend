@@ -520,7 +520,13 @@ class NPUWorker(WorkerBase):
         # binding cpu
         if get_ascend_config().enable_cpu_binding:
             try:
-                bind_cpus(self.local_rank)
+                # Early storage bootstrap has already mapped/registered the
+                # shared slab. Its NUMA placement belongs to the storage owner;
+                # migratepages on an ACL TID would target the worker's whole mm.
+                bind_cpus(
+                    self.local_rank,
+                    migrate_memory=getattr(self, "_decoder_storage_bootstrap", None) is None,
+                )
             except Exception as e:
                 logger.warning(f"Bind cpus failed in rank{self.local_rank}: {e} Skip binding cpu.")
         return device

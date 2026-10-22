@@ -44,6 +44,15 @@ llm = LLM(
 
 ## Dependencies
 
+### LMCache storage-process mode
+
+When an LMCache storage-process slab is attached before CPU binding, vLLM keeps
+thread and IRQ affinity but skips process-wide `migratepages` calls. The shared
+slab retains the NUMA policy selected by LMCache (for example, interleaving across
+nodes), instead of each TP worker requesting a different NUMA destination. This
+is automatic; keep `enable_cpu_binding: true`. Local storage mode retains the
+existing memory-migration behavior.
+
 ### Installation
 
 #### Ubuntu/Debian

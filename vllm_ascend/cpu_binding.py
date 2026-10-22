@@ -145,8 +145,9 @@ class DeviceInfo:
 
 
 class CpuAlloc:
-    def __init__(self, rank_id: int):
+    def __init__(self, rank_id: int, *, migrate_memory: bool = True):
         self.rank_id = rank_id
+        self.migrate_memory = migrate_memory
         self.device_info: DeviceInfo = DeviceInfo()
         self.cpu_node: dict[int, int] = {}
         self.numa_to_cpu_map: dict[int, list[int]] = defaultdict(list)
@@ -372,6 +373,9 @@ class CpuAlloc:
         logger.info(f"NPU{current_npu}: main=[{main}]  acl=[{acl}]  release=[{rel}]")
 
     def bind_memory(self, pid: str, npu: int) -> None:
+        if not self.migrate_memory:
+            return
+
         def _get_npu_numa_node(npu_id: int) -> int | None:
             cpu_pool = self.npu_cpu_pool.get(npu_id, [])
             if not cpu_pool:
@@ -502,9 +506,12 @@ class CpuAlloc:
         self.bind_npu_irq()
 
 
-def bind_cpus(rank_id: int) -> None:
+def bind_cpus(rank_id: int, *, migrate_memory: bool = True) -> None:
+    """Bind CPU/IRQ affinity, optionally migrating existing process memory."""
     if not is_arm_cpu():
         logger.info("CPU binding skipped: non-ARM CPU detected.")
         return
-    binder = CpuAlloc(rank_id)
+    if not migrate_memory:
+        logger.info("Skipping process-wide NUMA migration to preserve registered shared-cache placement.")
+    binder = CpuAlloc(rank_id, migrate_memory=migrate_memory)
     binder.run_all()

@@ -52,7 +52,11 @@ On multi‑socket ARM systems, the OS scheduler may place vLLM threads on CPUs f
    - If /proc/irq is writable, bind SQ/CQ IRQs to the first two CPUs in the pool.
    - irqbalance may be stopped to prevent overrides.
 8. **Memory binding (optional)**:
-   - If migratepages is available, memory for ACL threads is migrated to the NPU’s NUMA node.
+   - If `migratepages` is available, it uses ACL thread IDs to request migration
+     of pages in the worker's shared address space to the NPU's NUMA node.
+   - A worker with an attached LMCache storage-process slab passes
+     `migrate_memory=False`, preserving the storage owner's NUMA placement.
+     Thread and IRQ affinity still run; local mode keeps the default behavior.
 
 ## Allocation plan examples
 
