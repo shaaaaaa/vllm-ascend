@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Match actual dialogue IDs and preserve per-round measurement semantics."""
+"""Keep cross-round batch timelines separate from client TTFT round statistics."""
 
 import csv
 import importlib.util
@@ -43,6 +43,7 @@ def record(turn=0, tp=0, step=1, coverage=0.5, samples=2, duration=10, first=1):
         dp_rank=0,
         tp_rank=tp,
         step=step,
+        batch_start_time_ns=1_700_000_000_000_000_000 + (100 * turn + step + tp) * 100_000_000,
         requests=[
             dict(req_id=f"cmpl-multi-run-{turn:03d}-0-internal", token_start=(step - 1) * 4096, token_end=step * 4096)
         ],
@@ -71,77 +72,93 @@ def test_maps_both_request_and_response_ids_without_round_substring_matches(plot
         plot.match_round("cmpl-response-1-0", bad)
 
 
-def test_chunk_times_sum_per_round_and_coverage_keeps_mean_of_layer_ratios(plot):
+def test_timeline_keeps_every_batch_and_sorts_submission_not_emission_time(plot):
     records = [
         record(coverage=0.9, samples=1),
         record(step=2, coverage=0.3, samples=3, duration=30),
         record(turn=1, duration=7),
     ]
-    rows, chunks, diagnostics = plot.aggregate_rounds(list(reversed(records)), rounds())
-    assert [r["round"] for r in rows] == [0, 1]
-    assert rows[0]["coverage"] == pytest.approx(0.45)
-    assert rows[0]["save_ms"] == 40  # Sum, not mean of the two chunks.
-    assert rows[1]["save_ms"] == 7
-    assert rows[0]["worker_count"] == 1 and rows[0]["chunk_records"] == 2
-    assert [r["round"] for r in chunks] == [0, 0, 1]
-    assert diagnostics["missing_rounds"] == [2]
+    chunks, diagnostic = plot.timeline_records(list(reversed(records)), rounds())
+    assert [r["time_s"] for r in chunks] == [0, 0.1, 10]
+    assert [r["coverage"] for r in chunks] == [0.9, 0.3, 0.5]
+    assert [r["save_ms"] for r in chunks] == [10, 30, 7]
+    assert [r["first_layer_wait_ms"] for r in chunks] == [1, 1, 1]
+    assert diagnostic["missing_rounds"] == [2]
+    assert all(r["time_source"] == "host_batch_submission" for r in chunks)
+    assert not any("round" in r for r in chunks)
 
 
-def test_round_aggregation_rejects_old_coverage_definition(plot):
+def test_timeline_rejects_old_coverage_definition(plot):
     old = dict(record(), schema_version=1)
     old.pop("coverage_definition")
     with pytest.raises(ValueError, match="old adjacent-layer"):
-        plot.aggregate_rounds([old], rounds())
+        plot.timeline_records([old], rounds())
 
 
-def test_aggregate_ranks_averages_complete_worker_round_totals(plot):
-    records = [
-        record(tp=0),
-        record(tp=0, step=2, duration=30),
-        record(tp=1, duration=100),
-        record(tp=1, step=2, duration=200),
-    ]
-    rows, _, _ = plot.aggregate_rounds(records, rounds(), aggregate_ranks=True)
-    assert rows[0]["worker_count"] == 2 and rows[0]["chunk_records"] == 4
-    assert rows[0]["save_ms"] == 170  # ((10 + 30) + (100 + 200)) / 2.
-    assert rows[0]["coverage"] == 0.5
-    rows, _, _ = plot.aggregate_rounds(records, rounds(), tp_rank=1)
-    assert rows[0]["save_ms"] == 300 and rows[0]["tp_rank"] == 1
+def test_time_bins_average_recorded_layer_ratios_without_round_grouping(plot):
+    records = [record(coverage=0.9, samples=1), record(step=2, coverage=0.3, samples=3, duration=30)]
+    records.append(
+        dict(record(turn=2, tp=1, duration=100), batch_start_time_ns=records[0]["batch_start_time_ns"] + 200_000_000)
+    )
+    chunks, _ = plot.timeline_records(records, rounds())
+    rows = plot.aggregate_timeline(chunks, 1.0)
+    assert len(rows) == 1
+    assert rows[0]["coverage"] == pytest.approx((0.9 + 0.3 * 3 + 0.5 * 2) / 6)
+    assert rows[0]["time_s"] == 0.5
+    assert rows[0]["save_ms"] == pytest.approx(140 / 3)
+    assert rows[0]["worker_count"] == 2 and rows[0]["batch_records"] == 3
+    assert rows[0]["first_layer_wait_ms"] == 1
+    assert rows[0]["all_wait_ms"] == pytest.approx(143 / 3)
+    chunks, _ = plot.timeline_records(records, rounds(), tp_rank=1)
+    assert len(chunks) == 1 and chunks[0]["save_ms"] == 100
 
 
-def test_first_layer_waits_are_summed_per_chunk_then_averaged_per_worker(plot):
-    records = [
-        record(tp=0, first=100),
-        record(tp=0, step=2, duration=30, first=200),
-        record(tp=1, duration=100, first=1000),
-        record(tp=1, step=2, duration=200, first=2000),
-    ]
-    rows, chunks, _ = plot.aggregate_rounds(records, rounds(), aggregate_ranks=True)
-    assert rows[0]["first_layer_wait_ms"] == 1650
-    assert rows[0]["all_wait_ms"] == 1820
-    assert rows[0]["wait_ms"] == 170
-    assert rows[0]["coverage"] == 0.5  # Startup has no previous layer; do not invent a ratio.
-    assert [r["first_layer_wait_ms"] for r in chunks] == [100, 200, 1000, 2000]
-
-
-def test_missing_first_layer_wait_data_remains_unknown_instead_of_zero(plot):
-    legacy = record(step=2)
-    del legacy["first_layer_wait_ms"], legacy["all_wait_ms"]
-    rows, _, diagnostic = plot.aggregate_rounds([record(), legacy], rounds())
-    assert rows[0]["first_layer_wait_ms"] is None and rows[0]["all_wait_ms"] is None
-    assert rows[0]["wait_ms"] == 20 and rows[0]["coverage"] == 0.5
+def test_time_bins_leave_gaps_and_missing_waits_unknown(plot):
+    first = record(turn=1)
+    later = dict(record(turn=2), batch_start_time_ns=first["batch_start_time_ns"] + 2_500_000_000)
+    del later["first_layer_wait_ms"], later["all_wait_ms"]
+    chunks, diagnostic = plot.timeline_records([first, later], rounds())
+    rows = plot.aggregate_timeline(chunks, 1.0)
+    assert [r["time_start_s"] for r in rows] == [0, 2]
+    assert rows[1]["first_layer_wait_ms"] is None and rows[1]["all_wait_ms"] is None
+    assert rows[1]["wait_ms"] == 10 and rows[1]["coverage"] == 0.5
     assert diagnostic["missing_wait_detail_records"] == 1
+    rows = plot.aggregate_timeline(chunks, 10.0)
+    assert rows[0]["first_layer_wait_ms"] is None
 
 
-def test_mixed_batches_and_other_requests_are_excluded(plot):
-    mixed = record()
-    mixed["requests"].append(dict(req_id="another", token_start=0, token_end=4096))
+def test_mixed_batch_with_unknown_corequest_is_kept_once(plot):
+    mixed = record(turn=1)
+    mixed["requests"].append(dict(req_id="another", token_start=8000, token_end=8512))
     unknown = record()
     unknown["requests"][0]["req_id"] = "unrelated"
-    rows, _, diagnostic = plot.aggregate_rounds([mixed, unknown, record(turn=1)], rounds())
-    assert [r["round"] for r in rows] == [1]
+    chunks, diagnostic = plot.timeline_records([mixed, unknown], rounds())
+    assert len(chunks) == 1 and chunks[0]["request_count"] == 2
+    assert chunks[0]["dma_ms"] == 10 and chunks[0]["coverage"] == 0.5
     assert diagnostic["unmatched_request_count"] == 2
-    assert diagnostic["unmatched_request_examples"] == ["another", "unrelated"]
+    assert diagnostic["batches_with_other_requests"] == 1
+
+
+def test_missing_timestamp_is_not_replaced_with_batch_order_or_round(plot):
+    item = record(turn=1)
+    del item["batch_start_time_ns"]
+    chunks, diagnostic = plot.timeline_records([item], rounds())
+    assert not chunks and diagnostic["untimed_records"] == 1
+    item["log_time_ns"] = 1_700_000_000_000_000_000
+    chunks, diagnostic = plot.timeline_records([item], rounds())
+    assert chunks[0]["time_s"] == 0
+    assert chunks[0]["time_source"] == "log_emission_approximate"
+    assert diagnostic["approximate_timestamp_records"] == 1
+    item["batch_start_time_ns"] = item["log_time_ns"] - 9_000_000_000
+    chunks, _ = plot.timeline_records([item], rounds())
+    assert chunks[0]["timestamp_ns"] == item["batch_start_time_ns"]
+    assert chunks[0]["time_source"] == "host_batch_submission"
+
+
+@pytest.mark.parametrize("width", [0, -1, float("nan"), float("inf")])
+def test_invalid_time_bin_width_is_rejected(plot, width):
+    with pytest.raises(ValueError, match="finite and positive"):
+        plot.aggregate_timeline([], width)
 
 
 def test_read_saved_summary_and_csv_fallback(plot, tmp_path):
@@ -156,7 +173,7 @@ def test_read_saved_summary_and_csv_fallback(plot, tmp_path):
     assert [r["round"] for r in plot.read_rounds(tmp_path)] == [0, 1, 2]
 
 
-def test_real_cli_deduplicates_logs_and_exports_rounds_and_chunks(plot, tmp_path, monkeypatch):
+def test_real_cli_deduplicates_batches_and_uses_distinct_time_and_round_axes(plot, tmp_path, monkeypatch):
     pytest.importorskip("matplotlib")
     from matplotlib.figure import Figure
 
@@ -169,59 +186,43 @@ def test_real_cli_deduplicates_logs_and_exports_rounds_and_chunks(plot, tmp_path
 
     monkeypatch.setattr(Figure, "savefig", save)
     (tmp_path / "summary.json").write_text(json.dumps(dict(rounds=rounds())), encoding="utf-8")
-    records = [
-        record(coverage=0.9, samples=1),
-        record(step=2, coverage=0.3, samples=3, duration=30),
-        record(turn=2, duration=7),
-    ]
+    records = [record(), record(step=2), record(turn=2, duration=7)]
     log = tmp_path / "server.log"
     line = "\x1b[32m(Worker) [PREFILL_OVERLAP] "
     log.write_text("\n".join(line + json.dumps(r) + "\x1b[0m" for r in records + records), encoding="utf-8")
-    output = tmp_path / "rounds.png"
+    output = tmp_path / "timeline.png"
     assert plot.main([str(log), "--run-dir", str(tmp_path), "--output", str(output)]) == 0
     assert output.stat().st_size > 0
     figure = saved[0]
     assert len(figure.axes) == 8
-    assert list(figure.axes[0].lines[0].get_xdata()) == [1, 2]
-    y = figure.axes[2].lines[0].get_ydata()
-    assert str(y[0]) == "nan" and y[1] == 7  # Missing round is not zero; warmup is excluded.
-    assert list(figure.axes[4].lines[0].get_ydata())[1] == 8
-    assert list(figure.axes[5].lines[0].get_ydata())[1] == 1
-    assert "including first" in figure.axes[4].get_title()
+    assert list(figure.axes[0].lines[0].get_xdata()) == [0]
+    assert list(figure.axes[2].lines[0].get_ydata()) == [7]
+    assert list(figure.axes[4].lines[0].get_ydata()) == [8]
+    assert list(figure.axes[5].lines[0].get_ydata()) == [1]
+    assert "Elapsed time" in figure.axes[0].get_xlabel()
+    assert "round" in figure.axes[7].get_xlabel()
+    assert not figure.axes[0].get_shared_x_axes().joined(figure.axes[0], figure.axes[7])
     assert not any("interval" in axis.get_title().lower() for axis in figure.axes)
-    ttft_axis = figure.axes[7]
-    assert "TTFT" in ttft_axis.get_title()
-    assert len(ttft_axis.lines) == 1
-    assert list(ttft_axis.lines[0].get_ydata()) == pytest.approx([26.227285, 23.801610])
-    assert [text.get_text() for text in ttft_axis.texts] == ["26.23", "23.80"]
-    for axis in figure.axes[:7]:
-        assert len(axis.texts) == 1  # Only observed follow-up points, never warmup or missing values.
-    assert [text.get_text() for text in figure.axes[0].texts] == ["50.0000%"]
-    assert [text.get_text() for text in figure.axes[2].texts] == ["7.00"]
+    assert list(figure.axes[7].lines[0].get_xdata()) == [1, 2]
+    assert [text.get_text() for text in figure.axes[7].texts] == ["26.23", "23.80"]
+    assert not any(axis.texts for axis in figure.axes[:7])  # No per-request labels.
     diagnostic = json.loads(output.with_suffix(".json").read_text(encoding="utf-8"))
     assert diagnostic["missing_rounds"] == [1]
     with output.with_suffix(".chunks.csv").open(encoding="utf-8") as source:
         chunk_rows = list(csv.DictReader(source))
-        assert len(chunk_rows) == 1
-        assert [float(row["first_layer_wait_ms"]) for row in chunk_rows] == [1]
-    assert (
-        plot.main(
-            [str(log), "--run-dir", str(tmp_path), "--start-round", "1", "--output", str(tmp_path / "followups.png")]
-        )
-        == 0
-    )
-    assert list(saved[-1].axes[0].lines[0].get_xdata()) == [1, 2]
-    assert [text.get_text() for text in saved[-1].axes[7].texts] == ["26.23", "23.80"]
+    assert len(chunk_rows) == 1 and json.loads(chunk_rows[0]["requests"])[0]["token_start"] == 0
+    with output.with_suffix(".ttft.csv").open(encoding="utf-8") as source:
+        assert [r["round"] for r in csv.DictReader(source)] == ["1", "2"]
 
 
-def test_ttft_is_one_client_curve_instead_of_duplicated_rank_or_chunk_times(plot, tmp_path, monkeypatch):
+def test_ttft_is_one_unchanged_client_curve_with_multiple_worker_timelines(plot, tmp_path, monkeypatch):
     pytest.importorskip("matplotlib")
     from matplotlib.figure import Figure
 
     saved = []
     monkeypatch.setattr(Figure, "savefig", lambda figure, *args, **kwargs: saved.append(figure))
-    rows, _, _ = plot.aggregate_rounds([record(), record(step=2), record(tp=1)], rounds())
-    plot.plot_rounds(rows, [0, 1, 2], tmp_path / "ranks.png", client_rounds=rounds())
+    chunks, _ = plot.timeline_records([record(), record(step=2), record(tp=1)], rounds())
+    plot.plot_timeline(chunks, rounds(), tmp_path / "ranks.png")
     axes = saved[0].axes
     assert len(axes[0].lines) == 2
     assert len(axes[7].lines) == 1
@@ -243,8 +244,8 @@ def test_csv_ttft_strings_blanks_and_zero_keep_their_meaning_in_the_plot(plot, t
         writer.writeheader()
         writer.writerows(metadata)
     metadata = plot.read_rounds(tmp_path)
-    rows, _, _ = plot.aggregate_rounds([record(turn=i) for i in range(3)], metadata)
-    plot.plot_rounds(rows, [0, 1, 2], tmp_path / "blanks.png", client_rounds=metadata)
+    chunks, _ = plot.timeline_records([record(turn=i) for i in range(3)], metadata)
+    plot.plot_timeline(chunks, metadata, tmp_path / "blanks.png")
     axis = saved[0].axes[7]
     values = list(axis.lines[0].get_ydata())
     assert values[0] == 0 and str(values[1]) == "nan" and values[2] == pytest.approx(23.801610)
@@ -256,7 +257,7 @@ def test_unmatched_logs_fail_clearly(plot, tmp_path, capsys):
     log = tmp_path / "server.log"
     log.write_text("ordinary log", encoding="utf-8")
     assert plot.main([str(log), "--run-dir", str(tmp_path)]) == 2
-    assert "No overlap records matched" in capsys.readouterr().err
+    assert "No timestamped overlap records matched" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize("source", ["summary.json", "metrics.csv"])
@@ -335,25 +336,47 @@ def concurrent_rounds():
     ]
 
 
-def test_concurrent_batch_overlap_is_counted_once_and_unequal_request_spans_are_kept(plot):
-    metadata = concurrent_rounds()
-    item = record(turn=1)
-    item["requests"] = [
-        dict(req_id=row["request_id"], token_start=1000 * i, token_end=1000 * i + 512)
-        for i, row in enumerate(metadata[:4])
+def test_sixteen_request_cross_round_batch_remains_one_unlabelled_time_point(plot, tmp_path, monkeypatch):
+    metadata = [
+        dict(round=2 if i % 2 else 5, session_id=i, concurrency=16, request_id=f"run-s{i:03}", ttft_s=i + 1)
+        for i in range(16)
     ]
-    rows, chunks, diagnostics = plot.aggregate_rounds([item], metadata, aggregate_ranks=True)
-    assert len(rows) == len(chunks) == 1
-    assert rows[0]["chunk_records"] == 1 and rows[0]["dma_ms"] == 10
-    assert rows[0]["coverage"] == 0.5
-    assert len(chunks[0]["requests"]) == 4
-    assert rows[0]["ttft_samples"] == 4 and rows[0]["ttft_s"] == 26
-    assert rows[0]["ttft_p50_s"] == 26 and rows[0]["ttft_p99_s"] == pytest.approx(40.7)
-    assert not diagnostics["mixed_request_records"]
-    # A batch spanning different client rounds has no single round coordinate.
-    item["requests"][0]["req_id"] = metadata[4]["request_id"]
-    rows, _, diagnostics = plot.aggregate_rounds([item], metadata)
-    assert not rows and diagnostics["mixed_request_records"] == 1
+    item = record()
+    item["requests"] = [
+        dict(req_id=row["request_id"], token_start=1000 * i, token_end=1000 * i + 512) for i, row in enumerate(metadata)
+    ]
+    chunks, diagnostic = plot.timeline_records([item], metadata)
+    assert len(chunks) == 1 and chunks[0]["dma_ms"] == 10
+    assert chunks[0]["request_count"] == 16 and chunks[0]["coverage"] == 0.5
+    assert len(chunks[0]["requests"]) == 16
+    assert diagnostic["cross_round_batch_records"] == 1 and diagnostic["missing_rounds"] == []
+    pytest.importorskip("matplotlib")
+    from matplotlib.figure import Figure
+
+    saved = []
+    monkeypatch.setattr(Figure, "savefig", lambda figure, *args, **kwargs: saved.append(figure))
+    plot.plot_timeline(chunks, metadata, tmp_path / "mixed.png")
+    assert list(saved[0].axes[0].lines[0].get_xdata()) == [0]
+    assert not saved[0].axes[0].texts
+    assert len(saved[0].axes[7].patches) == 2
+
+
+def test_legacy_log_timestamps_are_explicitly_approximate_and_new_timestamp_wins(plot, tmp_path, capsys):
+    (tmp_path / "summary.json").write_text(json.dumps(dict(rounds=rounds())), encoding="utf-8")
+    item = record(turn=1)
+    del item["batch_start_time_ns"]
+    log = tmp_path / "legacy.log"
+    log.write_text("(Worker) [2026-10-22 12:00:00,123] INFO [PREFILL_OVERLAP] " + json.dumps(item), encoding="utf-8")
+    records, _ = plot.read_records([log], include_log_time=True)
+    chunks, diagnostic = plot.timeline_records(records, rounds())
+    assert chunks[0]["time_source"] == "log_emission_approximate"
+    assert diagnostic["approximate_timestamp_records"] == 1
+    pytest.importorskip("matplotlib")
+    assert (
+        plot.main([str(log), "--run-dir", str(tmp_path), "--aggregate-ranks", "--output", str(tmp_path / "old.png")])
+        == 0
+    )
+    assert "LOG EMISSION" in capsys.readouterr().err
 
 
 def test_ttft_boxes_use_session_samples_and_report_partial_rounds(plot, tmp_path, monkeypatch):

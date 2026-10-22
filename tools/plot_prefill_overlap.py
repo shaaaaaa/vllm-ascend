@@ -13,13 +13,16 @@ import csv
 import glob
 import json
 import math
+import re
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 MARKER = "[PREFILL_OVERLAP]"
 COVERAGE_DEFINITION = "same_bank_reuse_v1"
 WAIT_DETAILS = ("first_layer_wait_ms", "all_wait_ms", "initial_bank_wait_ms")
+LOG_TIMESTAMP = re.compile(r"\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:[.,]\d+)?")
 
 
 def require_bank_reuse_coverage(record: dict[str, Any]) -> None:
@@ -46,7 +49,7 @@ def wait_details(record: dict[str, Any]) -> dict[str, float | None]:
     return values
 
 
-def read_records(paths: list[Path]) -> tuple[list[dict[str, Any]], int]:
+def read_records(paths: list[Path], *, include_log_time: bool = False) -> tuple[list[dict[str, Any]], int]:
     """Read JSON inside prefixed/colored service logs, deduplicating copies."""
     records, seen, ignored, legacy = [], set(), 0, 0
     decoder = json.JSONDecoder()
@@ -74,6 +77,11 @@ def read_records(paths: list[Path]) -> tuple[list[dict[str, Any]], int]:
                 key = json.dumps(record, sort_keys=True)
                 if key not in seen:
                     seen.add(key)
+                    if include_log_time and not record.get("batch_start_time_ns"):
+                        timestamp = LOG_TIMESTAMP.search(line.split(MARKER, 1)[0])
+                        if timestamp:
+                            parsed = datetime.fromisoformat(timestamp.group().replace(",", "."))
+                            record["log_time_ns"] = int(parsed.timestamp() * 1_000_000_000)
                     records.append(record)
     if legacy:
         print(

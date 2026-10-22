@@ -117,7 +117,10 @@ export VLLM_ASCEND_PREFILL_OVERLAP_STATS=true
 所有请求的真实 token 区间保留在日志 `requests`，不把 batch 时间分摊或重复计给各请求。
 不同请求轮转相位不同时，按组内序号模 bank 数配对整个 batch 的复用窗口；4 bank
 比较前后相隔 4 个组内层的等待门，不能按重叠的物理 bank 集合误配成相邻层。
-不增加 host synchronize，计时事件只服务于后台统计，不改变传输或计算依赖。
+每个有效统计 batch 读取一次 CPU 时钟，记录 `batch_start_time_ns` 作为横轴定位，
+表示主线程开始提交此 batch 的时间，不是 NPU 实际开始执行的时间。
+coverage、save、load、wait 的耗时仍取 NPU event；不增加 host synchronize，
+不增加 NPU 计时事件，也不改变传输或计算依赖。多台 P 机器的时钟需要对齐。
 
 ```bash
 python3 tools/plot_multi_turn_overlap.py \
@@ -127,6 +130,7 @@ python3 tools/plot_multi_turn_overlap.py \
   --ssh-password '你的SSH密码' \
   --skip-host-key-check \
   --aggregate-ranks \
+  --time-bin-seconds 1 \
   --output multi-turn-c4-overlap.png
 ```
 
@@ -144,18 +148,30 @@ python3 tools/plot_multi_turn_overlap.py \
   --run-dir multi-turn-c4-200k --aggregate-ranks --output multi-turn-c4-overlap.png
 ```
 
-overlap 和各 bank 时间保持普通数据点，不因并发变成箱体；只有客户端 TTFT 画箱体。
-一个 batch 的所有请求 ID 必须属于相同对话轮次，才纳入该轮；跨轮或包含未知请求的
-batch 不能明确归属，记录在诊断中。预热请求不会匹配到测量轮次。
-同一轮先累加 worker 实际记录的 batch 时间；`--aggregate-ranks` 再对 worker 取平均。
-coverage 按有效模型层样本数平均已有逐层比值，不用总等待除以总窗口重新计算。
-不同 stream 的传输时间分别累计，并非请求墙钟时间。首层 bank 等待仍是每个后续 batch
-内部的首层等待，与被排除的客户端预热轮不是一回事。
+overlap 和各 bank 时间的横轴改为时间，以首个匹配的测量 batch 为 0 秒。
+不按对话轮次归类，不标注请求 ID；一个 batch 可以包含任意多个不同轮次的请求。
+只要包含选中测量范围内的任一请求，就保留整个 batch 一次，不把指标分摊给请求，
+也不因跨轮而跳过。混有范围外请求时，整批仍保留并在 JSON 诊断计数。
+只有预热或无关请求的 batch 排除。`--start-round` / `--end-round` 筛选 TTFT 的轮次，
+以及 overlap 所含的测量请求范围；混合 batch 无法进一步拆分。
+
+不加 `--aggregate-ranks` 时，每个 worker 的每个 batch 是一个时间数据点。
+加上时，在固定时间窗口内汇总所有观测 worker 的 batch，默认每 1 秒一个均值点；
+可用 `--time-bin-seconds 5` 改为 5 秒。coverage 按有效模型层样本数加权平均已有
+逐层比值，不用总等待除以总窗口重新计算。save/load/wait 是该窗口内每个 worker
+batch 的平均耗时；没有数据的窗口不补点，不把整批耗时摊到经过的每一秒。
+不同 stream 的传输时间分别累计，并非墙钟时间。首层 bank 等待仍保留。
+
+TTFT 继续单独按对话轮次画，并发大于 1 时画箱体，与 overlap 的时间横轴独立。
 
 图含 coverage、save+load、save、load、全层 bank wait、首层 bank wait、复用 wait
-及 TTFT。输出逐轮 CSV、逐 batch 的 `.chunks.csv` 和匹配/缺失情况 `.json`。
+及 TTFT。输出时间数据 `.csv`、逐 batch 的 `.chunks.csv`、逐轮 TTFT 的
+`.ttft.csv` 和匹配/缺失情况 `.json`。原始 batch 统计保留，不会被时间窗口均值替代。
 缺失服务端统计留空，不补 0 或 100%；客户端 TTFT 独立使用完整会话样本。
-旧 schema 1 无法恢复同 bank 复用口径，需重新采集；schema 2 旧的单请求记录仍能读取。
+旧 schema 1 无法恢复同 bank 复用口径，需重新采集。schema 2 旧日志没有 batch 时间戳
+时，可使用日志行里完整的年月日时分秒作为近似横轴，并显式提示这是后台输出时间，
+不能当成 batch 执行时间；需保持日志与分析机器的时区一致。没有任何时间戳则跳过并
+报告缺失，不用 batch 编号或轮次伪造时间。更新 LMCache-Ascend 并重启 P 后使用新时间戳。
 
 ## 本地验证
 

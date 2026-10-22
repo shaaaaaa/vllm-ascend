@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""Plot per-round prefill overlap using multi_turn_kv_reuse.py artifacts.
+"""Plot prefill overlap by time and client TTFT by dialogue round.
 
 python3 tools/plot_multi_turn_overlap.py server.log --run-dir multi-turn-on \
     --aggregate-ranks --output multi-turn-overlap.png
@@ -220,25 +220,22 @@ def match_round(request_id: str, rounds: list[dict[str, Any]]) -> int | None:
     return next(iter(matched), None)
 
 
-def aggregate_rounds(
+def timeline_records(
     records: list[dict[str, Any]],
     rounds: list[dict[str, Any]],
     *,
     tp_rank: int | None = None,
     dp_rank: int | None = None,
-    aggregate_ranks: bool = False,
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
-    """Sum batch times per worker/round and average the recorded layer ratios.
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Keep each measured worker batch once, including cross-round batches.
 
-    With rank aggregation, timing totals are divided by distinct workers,
-    never by chunk/request count. Every request in one batch must map to the
-    same client round. Missing measurements remain absent, not zero.
+    Request IDs only select the client run/range. They do not assign an x
+    coordinate or split the batch measurement among requests. A batch with
+    both selected and other requests remains one indivisible observation.
     """
-    metadata = {row["round"]: row for row in ttft_summary(rounds)}
-    buckets: dict[tuple, dict[str, Any]] = {}
-    workers: dict[tuple, set[tuple]] = {}
     chunks = []
-    unmatched, mixed, dropped = set(), 0, 0
+    unmatched, present = set(), set()
+    mixed, other_requests, untimed, invalid, dropped = 0, 0, 0, 0, 0
     for record in records:
         require_bank_reuse_coverage(record)
         if tp_rank is not None and record.get("tp_rank") != tp_rank:
@@ -247,72 +244,48 @@ def aggregate_rounds(
             continue
         requests = record.get("requests", [])
         if not requests:
-            mixed += 1
+            invalid += 1
             continue
         matched = {match_round(str(request["req_id"]), rounds) for request in requests}
         if None in matched:
             unmatched.update(
                 str(request["req_id"]) for request in requests if match_round(str(request["req_id"]), rounds) is None
             )
+        selected = matched - {None}
+        if not selected:
             continue
-        if len(matched) != 1:
-            mixed += 1
-            continue
-        turn = matched.pop()
-        request_id = ",".join(str(request["req_id"]) for request in requests)
+        mixed += len(selected) > 1
+        other_requests += None in matched
         if any(request["token_end"] <= request["token_start"] for request in requests):
+            invalid += 1
             continue
         samples = int(record["layer_samples"])
         coverage = float(record["coverage"])
         times = {name: float(record[name]) for name in CORE_TIMINGS}
         times.update(wait_details(record))
         if samples <= 0 or not all(math.isfinite(v) for v in (coverage, *times.values()) if v is not None):
-            raise ValueError(f"Non-finite or invalid measurements for {request_id}")
-        dp, tp = (None, None) if aggregate_ranks else (record.get("dp_rank"), record.get("tp_rank"))
-        key = (turn, dp, tp)
-        worker = (record.get("host"), record.get("pid"), record.get("dp_rank"), record.get("tp_rank"))
-        workers.setdefault(key, set()).add(worker)
-        row = buckets.setdefault(
-            key,
-            dict(
-                round=turn,
-                phase="followup" if turn else "initial",
-                request_id=",".join(row["request_id"] for row in rounds if row["round"] == turn),
-                response_id=",".join(row.get("response_id") or "" for row in rounds if row["round"] == turn),
-                dp_rank=dp,
-                tp_rank=tp,
-                prompt_tokens=metadata[turn]["prompt_tokens"],
-                cached_tokens=metadata[turn]["cached_tokens"],
-                ttft_s=metadata[turn].get("ttft_s"),
-                ttft_p50_s=metadata[turn]["ttft_p50_s"],
-                ttft_p99_s=metadata[turn]["ttft_p99_s"],
-                ttft_samples=metadata[turn]["ttft_samples"],
-                concurrency=metadata[turn]["concurrency"],
-                latency_s=metadata[turn]["latency_s"],
-                worker_count=0,
-                chunk_records=0,
-                layer_samples=0,
-                coverage_definition=COVERAGE_DEFINITION,
-                coverage=0.0,
-                **dict.fromkeys(TIMINGS, 0.0),
-            ),
-        )
-        row["layer_samples"] += samples
-        row["coverage"] += coverage * samples
-        row["chunk_records"] += 1
-        for name in TIMINGS:
-            row[name] = None if row[name] is None or times[name] is None else row[name] + times[name]
+            raise ValueError("Non-finite or invalid batch measurements")
+        timestamp = record.get("batch_start_time_ns")
+        time_source = "host_batch_submission"
+        if timestamp is None:
+            timestamp, time_source = record.get("log_time_ns"), "log_emission_approximate"
+        if timestamp is None:
+            untimed += 1
+            continue
+        if int(timestamp) <= 0:
+            raise ValueError("Invalid batch timestamp")
+        present.update(selected)
         chunks.append(
             dict(
-                round=turn,
-                req_id=request_id,
+                time_s=0.0,
+                timestamp_ns=int(timestamp),
+                time_source=time_source,
                 host=record.get("host"),
                 pid=record.get("pid"),
                 dp_rank=record.get("dp_rank"),
                 tp_rank=record.get("tp_rank"),
                 step=record.get("step"),
-                token_start=min(request["token_start"] for request in requests),
-                token_end=max(request["token_end"] for request in requests),
+                request_count=len(requests),
                 requests=requests,
                 layer_samples=samples,
                 coverage_definition=COVERAGE_DEFINITION,
@@ -321,45 +294,83 @@ def aggregate_rounds(
             )
         )
         dropped = max(dropped, int(record.get("dropped_steps", 0)))
-    rows = []
-    for key, row in sorted(buckets.items()):
-        row["worker_count"] = len(workers[key])
-        row["coverage"] /= row["layer_samples"]
-        for name in TIMINGS:
-            if row[name] is not None:
-                row[name] /= row["worker_count"]
-        rows.append(row)
-    chunks.sort(key=lambda row: (row["round"], str(row["dp_rank"]), str(row["tp_rank"]), row["token_start"]))
-    present = {row["round"] for row in rows}
+    chunks.sort(key=lambda row: (row["timestamp_ns"], str(row["host"]), str(row["pid"]), row["step"]))
+    origin = chunks[0]["timestamp_ns"] if chunks else None
+    for row in chunks:
+        row["time_s"] = (row["timestamp_ns"] - origin) / 1_000_000_000
     diagnostics = dict(
-        missing_rounds=sorted(set(metadata) - present),
+        missing_rounds=sorted({row["round"] for row in rounds} - present),
+        matched_rounds=len(present),
         unmatched_request_count=len(unmatched),
         unmatched_request_examples=sorted(unmatched)[:5],
-        mixed_request_records=mixed,
+        cross_round_batch_records=mixed,
+        batches_with_other_requests=other_requests,
+        untimed_records=untimed,
+        invalid_batch_records=invalid,
+        approximate_timestamp_records=sum(row["time_source"] == "log_emission_approximate" for row in chunks),
+        time_origin_ns=origin,
         dropped_steps=dropped,
-        coverage_policy=(
-            "Mean of recorded same-bank reuse layer ratios, weighted by layer_samples across chunks/workers."
-        ),
+        coverage_policy="Recorded batch mean of same-bank reuse layer ratios; no per-request attribution.",
         coverage_definition=COVERAGE_DEFINITION,
-        timing_policy=(
-            "Count each batch once; sum batch times per worker/round, then mean over observed workers; not wall time."
-        ),
+        timing_policy="Count each worker batch once. Stream times are sums within that batch, not wall time.",
+        time_policy="Elapsed host batch-submission time; legacy log emission timestamps are approximate.",
         first_layer_policy=(
             "First use of each group/bank has no reuse ratio; retain first-layer, initial-bank and all-layer waits."
         ),
         missing_wait_detail_records=sum(any(chunk[name] is None for name in WAIT_DETAILS) for chunk in chunks),
     )
-    return rows, chunks, diagnostics
+    return chunks, diagnostics
 
 
-def plot_rounds(
+def aggregate_timeline(chunks: list[dict[str, Any]], time_bin_seconds: float) -> list[dict[str, Any]]:
+    """Average worker-batch points in fixed time bins, with no round grouping.
+
+    Coverage is weighted by recorded layer samples; each timing is the mean
+    per worker batch. Empty bins remain absent. Raw points stay in chunks.csv.
+    """
+    if not math.isfinite(time_bin_seconds) or time_bin_seconds <= 0:
+        raise ValueError("--time-bin-seconds must be finite and positive")
+    buckets: dict[int, list[dict[str, Any]]] = {}
+    for row in chunks:
+        buckets.setdefault(math.floor(row["time_s"] / time_bin_seconds), []).append(row)
+    result = []
+    for index, values in sorted(buckets.items()):
+        samples = sum(row["layer_samples"] for row in values)
+        timings = {}
+        for metric in TIMINGS:
+            timings[metric] = (
+                sum(row[metric] for row in values) / len(values)
+                if all(row.get(metric) is not None for row in values)
+                else None
+            )
+        result.append(
+            dict(
+                time_s=(index + 0.5) * time_bin_seconds,
+                time_start_s=index * time_bin_seconds,
+                time_end_s=(index + 1) * time_bin_seconds,
+                host=None,
+                pid=None,
+                dp_rank=None,
+                tp_rank=None,
+                worker_count=len({(r["host"], r["pid"], r["dp_rank"], r["tp_rank"]) for r in values}),
+                batch_records=len(values),
+                layer_samples=samples,
+                coverage_definition=COVERAGE_DEFINITION,
+                coverage=sum(row["coverage"] * row["layer_samples"] for row in values) / samples,
+                **timings,
+            )
+        )
+    return result
+
+
+def plot_timeline(
     rows: list[dict[str, Any]],
-    rounds: list[int],
+    client_rounds: list[dict[str, Any]],
     output: Path,
     *,
-    client_rounds: list[dict[str, Any]] | None = None,
+    approximate_time: bool = False,
 ) -> None:
-    """Draw annotated bank metrics and one end-to-end client TTFT curve."""
+    """Plot bank measurements on a time axis, and TTFT on its own round axis."""
     import matplotlib
 
     matplotlib.use("Agg")
@@ -368,48 +379,52 @@ def plot_rounds(
 
     panels = (
         ("coverage", "Mean same-bank reuse coverage", "Coverage"),
-        ("dma_ms", "Save + load: dma_ms", "ms / worker / round"),
-        ("save_ms", "NPU to CPU: save_ms", "ms / worker / round"),
-        ("load_ms", "CPU to NPU: load_ms", "ms / worker / round"),
-        ("all_wait_ms", "Bank wait: ALL layers, including first", "ms / worker / round"),
-        ("first_layer_wait_ms", "First-layer bank wait (sum over chunks)", "ms / worker / round"),
-        ("wait_ms", "Wait at same-bank reuse", "ms / worker / round"),
+        ("dma_ms", "Save + load: dma_ms", "ms / worker batch"),
+        ("save_ms", "NPU to CPU: save_ms", "ms / worker batch"),
+        ("load_ms", "CPU to NPU: load_ms", "ms / worker batch"),
+        ("all_wait_ms", "Bank wait: ALL layers, including first", "ms / worker batch"),
+        ("first_layer_wait_ms", "First-layer bank wait", "ms / worker batch"),
+        ("wait_ms", "Wait at same-bank reuse", "ms / worker batch"),
         ("ttft_s", "Client TTFT by round", "seconds / request"),
     )
+    rounds = sorted({row["round"] for row in client_rounds})
     width = min(36, max(16, len(rounds) * 0.7))
-    figure, axes = plt.subplots(4, 2, figsize=(width, 15), sharex=True, facecolor="white")
-    series: dict[tuple, dict[int, dict[str, Any]]] = {}
+    figure, axes = plt.subplots(4, 2, figsize=(width, 15), facecolor="white")
+    series: dict[tuple, list[dict[str, Any]]] = {}
     for row in rows:
-        series.setdefault((row["dp_rank"], row["tp_rank"]), {})[row["round"]] = row
-    for (dp, tp), values in series.items():
-        label = "Observed workers (mean)" if tp is None else f"DP{dp} TP{tp}"
+        series.setdefault((row["host"], row["pid"], row["dp_rank"], row["tp_rank"]), []).append(row)
+    for (host, _, dp, tp), values in series.items():
+        label = (
+            f"Time-bin mean ({values[0]['time_end_s'] - values[0]['time_start_s']:g} s)"
+            if tp is None
+            else f"{host} DP{dp} TP{tp}"
+        )
+        positions = [row["time_s"] for row in values]
         for axis, (metric, _, _) in zip(axes.flat, panels):
             if metric == "ttft_s":
                 continue
-            points = [
-                values[turn][metric] if turn in values and values[turn].get(metric) is not None else math.nan
-                for turn in rounds
-            ]
-            (line,) = axis.plot(
-                rounds,
+            points = [row[metric] if row.get(metric) is not None else math.nan for row in values]
+            axis.plot(
+                positions,
                 points,
                 marker="o",
                 markersize=3.5,
-                linewidth=1.5,
+                linestyle="none",
                 label=label,
             )
-            label_points(axis, metric, rounds, points, line.get_color())
     # TTFT belongs to the client request, not a rank/chunk. Plot it once and
     # retain completed client rounds even when a server measurement is missing.
     ttft_axis = axes[-1, -1]
-    draw_ttft(ttft_axis, client_rounds if client_rounds is not None else rows, rounds)
+    draw_ttft(ttft_axis, client_rounds, rounds)
     for axis, (metric, title, ylabel) in zip(axes.flat, panels):
         axis.set_facecolor("white")
         if metric != "ttft_s" or not ttft_axis.get_title():
             axis.set_title(title)
         axis.set_ylabel(ylabel)
-        axis.set_xlabel("Follow-up dialogue round")
-        axis.xaxis.set_major_locator(MaxNLocator(integer=True, nbins=12))
+        axis.set_xlabel(
+            "Follow-up dialogue round" if metric == "ttft_s" else "Elapsed time from first measured batch (s)"
+        )
+        axis.xaxis.set_major_locator(MaxNLocator(integer=metric == "ttft_s", nbins=12))
         axis.tick_params(axis="x", labelbottom=True)
         axis.grid(alpha=0.25)
         if metric != "coverage":
@@ -421,10 +436,16 @@ def plot_rounds(
     handles, labels = axes[0, 0].get_legend_handles_labels()
     if handles:
         figure.legend(handles, labels, loc="upper center", bbox_to_anchor=(0.5, 0.94), ncol=min(8, len(series)))
+    time_caption = (
+        "Legacy points use approximate log emission timestamps."
+        if approximate_time
+        else "Time axis: host batch submission timestamps."
+    )
     figure.suptitle(
-        "Multi-turn prefill overlap and timing\n"
-        "Times include first-layer wait; absent wait details are left blank.\n"
-        "Bank times: ms / worker / round (not wall time). Client TTFT: seconds / request.",
+        "Prefill overlap by time; client TTFT by dialogue round\n"
+        + time_caption
+        + " Batch measurements are not split among requests.\n"
+        "Bank times: ms / worker batch (not wall time). Client TTFT: seconds / request.",
         fontsize=13,
     )
     figure.tight_layout(rect=(0, 0, 1, 0.97))
@@ -467,7 +488,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--ttft-only", action="store_true", help="Plot only client TTFT; no server logs or SSH")
     parser.add_argument("--tp-rank", type=int)
     parser.add_argument("--dp-rank", type=int)
-    parser.add_argument("--aggregate-ranks", action="store_true", help="One curve averaging observed workers")
+    parser.add_argument(
+        "--aggregate-ranks", action="store_true", help="One curve averaging worker batches in fixed time bins"
+    )
+    parser.add_argument(
+        "--time-bin-seconds", type=float, default=1.0, help="Time-bin width with --aggregate-ranks (default: 1 second)"
+    )
     parser.add_argument(
         "--start-round", type=int, default=1, help="First measured follow-up round; warmup is always excluded"
     )
@@ -500,42 +526,70 @@ def main(argv: list[str] | None = None) -> int:
         if args.hosts:
             remote_paths, collected = collect_logs(args)
             paths.extend(remote_paths)
-        records, ignored = read_records(paths)
-        rows, chunks, diagnostics = aggregate_rounds(
+        records, ignored = read_records(paths, include_log_time=True)
+        chunks, diagnostics = timeline_records(
             records,
             rounds,
             tp_rank=args.tp_rank,
             dp_rank=args.dp_rank,
-            aggregate_ranks=args.aggregate_ranks,
         )
-        if not rows and max(row.get("concurrency", 1) for row in rounds) <= 1:
+        if not chunks:
             raise ValueError(
-                "No overlap records matched client request/response IDs and rank filters; "
-                "check P-node logs and the stats switch"
+                "No timestamped overlap records matched client request/response IDs and rank filters; "
+                "check P-node logs/stats and update LMCache-Ascend for batch timestamps. "
+                "Legacy logs need a full YYYY-MM-DD HH:MM:SS timestamp"
             )
+        rows = aggregate_timeline(chunks, args.time_bin_seconds) if args.aggregate_ranks else chunks
         args.output.parent.mkdir(parents=True, exist_ok=True)
-        write_csv(rows, args.output.with_suffix(".csv"))
-        write_csv(chunks, args.output.with_suffix(".chunks.csv"))
-        diagnostics.update(ignored_records=ignored, matched_rounds=len({row["round"] for row in rows}))
+        for values, suffix in ((rows, ".csv"), (chunks, ".chunks.csv"), (ttft_summary(rounds), ".ttft.csv")):
+            write_csv(
+                [
+                    dict(row, requests=json.dumps(row["requests"], ensure_ascii=False)) if "requests" in row else row
+                    for row in values
+                ],
+                args.output.with_suffix(suffix),
+            )
+        diagnostics.update(
+            ignored_records=ignored,
+            batch_records=len(chunks),
+            plotted_points=len(rows),
+            time_bin_seconds=args.time_bin_seconds if args.aggregate_ranks else None,
+            aggregation_policy=(
+                "Fixed time bins: coverage weighted by layer_samples; timings mean per worker batch."
+                if args.aggregate_ranks
+                else "One point per recorded worker batch."
+            ),
+        )
         if collected is not None:
             diagnostics["collection_directory"] = str(collected)
         args.output.with_suffix(".json").write_text(
             json.dumps(diagnostics, ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",
         )
-        plot_rounds(rows, sorted({row["round"] for row in rounds}), args.output, client_rounds=rounds)
+        plot_timeline(rows, rounds, args.output, approximate_time=bool(diagnostics["approximate_timestamp_records"]))
     except (OSError, ValueError, KeyError, TypeError, ImportError) as error:
         print(f"[MULTI_TURN_OVERLAP] {error}", file=sys.stderr)
         return 2
     print(
-        f"[MULTI_TURN_OVERLAP] rounds={diagnostics['matched_rounds']} "
+        f"[MULTI_TURN_OVERLAP] batches={len(chunks)} points={len(rows)} "
         f"plot={args.output} csv={args.output.with_suffix('.csv')}"
     )
     if diagnostics["missing_rounds"]:
         print(f"[MULTI_TURN_OVERLAP] missing rounds (not zero): {diagnostics['missing_rounds']}", file=sys.stderr)
-    if ignored or diagnostics["mixed_request_records"] or diagnostics["dropped_steps"]:
+    if (
+        ignored
+        or diagnostics["untimed_records"]
+        or diagnostics["invalid_batch_records"]
+        or diagnostics["dropped_steps"]
+    ):
         print(
             f"[MULTI_TURN_OVERLAP] incomplete/skipped measurements; see {args.output.with_suffix('.json')}",
+            file=sys.stderr,
+        )
+    if diagnostics["approximate_timestamp_records"]:
+        print(
+            "[MULTI_TURN_OVERLAP] legacy timestamps use background LOG EMISSION time, not batch execution time; "
+            "update LMCache-Ascend and restart P for batch submission timestamps",
             file=sys.stderr,
         )
     if diagnostics["missing_wait_detail_records"]:

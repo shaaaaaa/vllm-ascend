@@ -45,6 +45,7 @@ def measurement(turn):
         dp_rank=turn,
         tp_rank=0,
         step=1,
+        batch_start_time_ns=1_700_000_000_000_000_000 + turn * 1_000_000_000,
         requests=[dict(req_id=f"cmpl-multi-run-{turn:03d}-0-suffix", token_start=0, token_end=4096)],
         coverage=0.8,
         layer_samples=2,
@@ -78,7 +79,7 @@ def _write(path, content):
 
 
 @pytest.mark.parametrize("mode", ["prompt", "env", "per-host", "argument"])
-def test_native_password_multi_host_collection_then_round_plot(collect, tmp_path, monkeypatch, mode, capsys):
+def test_native_password_multi_host_collection_then_timeline_plot(collect, tmp_path, monkeypatch, mode, capsys):
     plot = importlib.import_module("plot_multi_turn_overlap")
     transport = importlib.import_module("pd_tensor_collect")
     hosts = ["root@192.0.2.1", "root@192.0.2.2"]
@@ -123,7 +124,7 @@ def test_native_password_multi_host_collection_then_round_plot(collect, tmp_path
 
     monkeypatch.setattr(transport.subprocess, "run", ssh)
     rendered = []
-    monkeypatch.setattr(plot, "plot_rounds", lambda rows, rounds, path, **kwargs: rendered.append((rows, rounds)))
+    monkeypatch.setattr(plot, "plot_timeline", lambda rows, rounds, path, **kwargs: rendered.append((rows, rounds)))
     run_dir = tmp_path / "client"
     run_dir.mkdir()
     (run_dir / "summary.json").write_text(
@@ -164,7 +165,8 @@ def test_native_password_multi_host_collection_then_round_plot(collect, tmp_path
     assert len(commands) == 2 and len(set(h.parent for h in helpers)) == 1
     assert not any(helper.exists() or helper.parent.exists() for helper in helpers)
     rows, rounds = rendered[0]
-    assert rounds == [1, 2] and [row["round"] for row in rows] == [1, 2]
+    assert [row["round"] for row in rounds] == [1, 2]
+    assert [row["time_s"] for row in rows] == [0.5, 1.5]
     assert [row["worker_count"] for row in rows] == [1, 1]
     assert len(list(destination.glob("host-*/snapshot/logs/*.log"))) == 4
     manifest = (destination / "collection.json").read_text()
