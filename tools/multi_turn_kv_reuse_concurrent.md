@@ -60,6 +60,12 @@ python3 tools/multi_turn_kv_reuse_concurrent.py \
 
 ## 输出和计时
 
+默认在每条回复完整接收后打印原文，预热和后续轮次都包含，不截断、不逐 token 混排。
+每段以 `[MULTI_TURN_OUTPUT] ... begin` / `end` 包围，标明 `session`、`round`、
+`phase` 和 `request_id`，方便检查乱码和对应请求。上面的 `tee` 命令会一起保存输出。
+打印发生在响应计时结束后；原始回答仍保存在对应轮次的 `output.txt`，
+下一轮使用的历史不受打印格式影响。打印文本便于人工检查，不自动判定精度正确。
+
 `metrics.csv` 和 `summary.json` 的 `rounds` 只包含已完成的后续请求，轮次为 1–50。
 每条有 `session_id`、并发数、request/response ID、输入输出 token 数、缓存量、TTFT
 和总耗时。每收到一个完整响应就写盘；中断测试可使用已经完成的请求绘图。

@@ -316,6 +316,34 @@ def test_four_sessions_warm_together_then_preserve_separate_histories(tmp_path):
     assert len(summary["warmups"]) == 4 and len(summary["rounds"]) == 8
     assert {row["session_id"] for row in summary["rounds"]} == set(range(4))
     assert all(row["round"] in (1, 2) for row in summary["rounds"])
+    # Each completed reply, including warmup, must be readable as a separate
+    # block even when streams from several sessions arrive concurrently.
+    lines = iter(result.stdout.splitlines())
+    printed = []
+    for line in lines:
+        if not line.startswith("[MULTI_TURN_OUTPUT] "):
+            continue
+        assert line.endswith(" begin")
+        label = line.removesuffix(" begin")
+        text = []
+        for body_line in lines:
+            if body_line == label + " end":
+                break
+            assert not body_line.startswith("[MULTI_TURN"), "reply output blocks interleaved"
+            text.append(body_line)
+        else:
+            pytest.fail(f"Unclosed reply output: {label}")
+        printed.append((label, "\n".join(text)))
+    assert len(printed) == 12
+    for row in summary["warmups"] + summary["rounds"]:
+        label = (
+            f"[MULTI_TURN_OUTPUT] round={row['round']:02d} session={row['session_id']} "
+            f"phase={row['phase']} request_id={row['request_id']}"
+        )
+        # splitlines normalizes the test answer's original CR/LF on Windows.
+        assert [(key, text.strip()) for key, text in printed if key == label] == [
+            (label, f"真实输出 {row['session_id']}/{row['round']}：保留空白。")
+        ]
     with (output / "metrics.csv").open(encoding="utf-8", newline="") as source:
         rows = list(csv.DictReader(source))
     assert len(rows) == 8 and all(int(row["round"]) > 0 for row in rows)

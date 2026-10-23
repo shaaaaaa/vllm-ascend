@@ -381,6 +381,18 @@ def run(args: argparse.Namespace, root: Path, initial_prompt: str, questions: li
                             summary["warmups"].append(row)
                         save_json(root / "summary.json", summary)
                         print("[MULTI_TURN] " + json.dumps(row, ensure_ascii=False), flush=True)
+                        output_label = (
+                            f"round={current_round:02d} session={current_session} "
+                            f"phase={row['phase']} request_id={row['request_id']}"
+                        )
+                        # Print complete answers from the coordinator so concurrent
+                        # streams never interleave their text in the terminal/tee log.
+                        print(
+                            f"[MULTI_TURN_OUTPUT] {output_label} begin\n"
+                            f"{session['previous_output']}\n"
+                            f"[MULTI_TURN_OUTPUT] {output_label} end",
+                            flush=True,
+                        )
                     if failure is not None:
                         current_session, current_round, error = failure
                         raise error
