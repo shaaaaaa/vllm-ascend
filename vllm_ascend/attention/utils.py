@@ -798,6 +798,26 @@ def record_layerwise_prefill_bank_use(layer_name: str) -> None:
     record(layer_name, event)
 
 
+def layerwise_kv_trace_enabled() -> bool:
+    """Read the existing hash switch without loading LMCache for other connectors."""
+    if not has_kv_transfer_group():
+        return False
+    # Lazy import avoids loading LMCache for other cache connectors.
+    from lmcache.v1.prefill_kv_hash import kv_hash_enabled
+
+    return kv_hash_enabled()
+
+
+def trace_layerwise_kv(layer_name: str, **kwargs) -> None:
+    """Forward hash-only diagnostics without reading device values on the host."""
+    if not layerwise_kv_trace_enabled():
+        return
+    connector = get_kv_transfer_group()
+    trace = getattr(connector, "trace_attention_kv", None)
+    if callable(trace):
+        trace(layer_name, **kwargs)
+
+
 def maybe_submit_layerwise_prefill_load(layer_name: str | int) -> bool:
     """Submit N+2; ``-1`` is the first-layer, load-only trigger."""
     if not has_kv_transfer_group() or not is_v1_kv_transfer_group():

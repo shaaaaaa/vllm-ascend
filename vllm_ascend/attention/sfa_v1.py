@@ -69,6 +69,7 @@ from vllm_ascend.attention.utils import (
     ascend_chunked_prefill_workspace_size,
     enable_cp,
     get_lmcache_sparse_cached_tokens,
+    layerwise_kv_trace_enabled,
     layerwise_prefill_transfer_window_supported,
     maybe_finish_layerwise_prefill_save,
     maybe_save_kv_layer_in_layerwise_prefill_transfer_window,
@@ -77,6 +78,7 @@ from vllm_ascend.attention.utils import (
     maybe_submit_layerwise_prefill_load,
     record_layerwise_prefill_bank_use,
     staged_sfa_connector_supports_sparse_load,
+    trace_layerwise_kv,
     trans_rope_weight,
     transdata,
     wait_for_kv_layer_from_connector,
@@ -2710,6 +2712,11 @@ class AscendSFAImpl(MLAAttentionImpl):
             and attn_metadata.num_decode_tokens > 0
         ):
             wait_for_kv_layer_from_connector(layer_name)
+        if layerwise_kv_trace_enabled():
+            trace_layerwise_kv(
+                layer_name, group=0, stage="P_LOAD", planes=kv_cache[:2],
+                table=attn_metadata.block_table, metadata=attn_metadata,
+            )
         return self._sfa_preprocess_with_mlapo(
             hidden_states=hidden_states,
             kv_cache=kv_cache,
@@ -5214,6 +5221,8 @@ class AscendSFAImpl(MLAAttentionImpl):
                         reach_layer_for_shard_weight_series(layer)
             return output.fill_(0)
 
+        kv_hash_trace = self._layerwise_prefill_p_node and layerwise_kv_trace_enabled()
+
         # A layer's KV remains in its bank after its SFA. Submit the prior
         # layer's save and N+2 load here, before this layer's first connector
         # wait. The name in save_operations identifies the source layer; no
@@ -5392,6 +5401,12 @@ class AscendSFAImpl(MLAAttentionImpl):
             if not (self.dsa_shrink_latent and attn_metadata.num_decode_tokens > 0):
                 wait_for_kv_layer_from_connector(layer_name)
 
+            if kv_hash_trace and kv_cache is not None:
+                trace_layerwise_kv(
+                    layer_name, group=0, stage="P_LOAD", planes=kv_cache[:2],
+                    table=attn_metadata.block_table, metadata=attn_metadata,
+                )
+
             if self.enable_dsa_cp:
                 assert slot_mapping_cp is not None
                 k_pe, k_nope = self.exec_kv(
@@ -5568,6 +5583,19 @@ class AscendSFAImpl(MLAAttentionImpl):
                 # and does not advance the group-0 latent-layer cursor.
                 with _dsa_prof.section("lmc_index_retrieve"):
                     wait_for_kv_layer_from_connector(index_layer_name)
+            if kv_hash_trace:
+                trace_layerwise_kv(
+                    index_layer_name,
+                    group=1,
+                    stage="P_LOAD",
+                    planes=kv_cache[2:],
+                    table=(
+                        attn_metadata.indexer_c8_block_table
+                        if self.use_sparse_c8_indexer and attn_metadata.indexer_c8_block_table is not None
+                        else attn_metadata.indexer_block_table
+                    ),
+                    metadata=attn_metadata,
+                )
             # Live Group-1 P2P populates the model cache without enabling the
             # persistent LMCache indexer-load path.  Diagnose the exact
             # model-visible rows for both transports, after any required wait
@@ -5676,6 +5704,20 @@ class AscendSFAImpl(MLAAttentionImpl):
                 if self._layerwise_prefill_p_node and index_lmcache_enabled:
                     # The indexer has finished reading its own bank. Record
                     # before top-k publication and latent SFA are submitted.
+                    if kv_hash_trace:
+                        trace_layerwise_kv(
+                            index_layer_name,
+                            group=1,
+                            stage="P_COMPUTE",
+                            planes=kv_cache[2:],
+                            table=(
+                                attn_metadata.indexer_c8_block_table
+                                if self.use_sparse_c8_indexer and attn_metadata.indexer_c8_block_table is not None
+                                else attn_metadata.indexer_block_table
+                            ),
+                            metadata=attn_metadata,
+                            produced=(k_li, k_li_scale) if self.use_sparse_c8_indexer else (k_li,),
+                        )
                     record_layerwise_prefill_bank_use(index_layer_name)
                 if self.index_cache_enabled:
                     # Publish this batch's top-k so downstream skip layers
@@ -5684,6 +5726,20 @@ class AscendSFAImpl(MLAAttentionImpl):
             if self._layerwise_prefill_p_node and self.skip_topk and index_lmcache_enabled:
                 # Runtime index-cache skips still scatter this layer's KV;
                 # shared consumers without an indexer own no Group-1 bank.
+                if kv_hash_trace:
+                    trace_layerwise_kv(
+                        index_layer_name,
+                        group=1,
+                        stage="P_COMPUTE",
+                        planes=kv_cache[2:],
+                        table=(
+                            attn_metadata.indexer_c8_block_table
+                            if self.use_sparse_c8_indexer and attn_metadata.indexer_c8_block_table is not None
+                            else attn_metadata.indexer_block_table
+                        ),
+                        metadata=attn_metadata,
+                        produced=(k_li, k_li_scale) if self.use_sparse_c8_indexer else (k_li,),
+                    )
                 record_layerwise_prefill_bank_use(index_layer_name)
             if content_diagnostics_enabled:
                 queue_selected_topk_fingerprint(
@@ -6464,6 +6520,18 @@ class AscendSFAImpl(MLAAttentionImpl):
             # All SFA reads of the latent bank are now submitted. The DMA
             # stream waits on this exact point, excluding v_up/o_proj, FFN,
             # and the next layer's normalization. Passive TP ranks mark it too.
+            if kv_hash_trace:
+                trace_layerwise_kv(
+                    layer_name,
+                    group=0,
+                    stage="P_COMPUTE",
+                    planes=kv_cache[:2],
+                    table=attn_metadata.block_table,
+                    metadata=attn_metadata,
+                    produced=(None
+                              if self.enable_mlapo and num_input_tokens <= MLAPO_MAX_SUPPORTED_TOKENS
+                              else (k_nope, k_pe)),
+                )
             record_layerwise_prefill_bank_use(layer_name)
 
         # Offload to LMCache. Legacy un-bundled connectors save only the
