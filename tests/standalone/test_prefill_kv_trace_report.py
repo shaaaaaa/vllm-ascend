@@ -30,7 +30,7 @@ def fixture_rows():
         start=0,
         end=4,
         role="P",
-        algorithm="mix32x4-v1",
+        algorithm="sum16x2-v1",
     )
     rows = [
         dict(base, stage="BEGIN", groups=[1]),
@@ -217,10 +217,36 @@ def test_shared_cpu_decode_uses_publisher_rank_not_consumer_rank(tool, tmp_path)
 
 def test_stall_summary_is_informational_and_preserves_waiting_stack(tool, tmp_path):
     rows = fixture_rows()
-    rows.append(dict(rows[0], stage="STALL", blocked_stage="P_CPU_LOAD",
-                     elapsed_s=60.0, main_stack=["model.py:10:forward"],
-                     hash_stack=["stream.py:20:synchronize"]))
+    rows.append(
+        dict(
+            rows[0],
+            stage="STALL",
+            blocked_stage="P_CPU_LOAD",
+            elapsed_s=60.0,
+            main_stack=["model.py:10:forward"],
+            hash_stack=["stream.py:20:synchronize"],
+        )
+    )
     report = run(tool, tmp_path, rows)
     assert report["status"] == "consistent"
     assert report["first_stall"]["blocked_stage"] == "P_CPU_LOAD"
     assert report["first_stall"]["hash_stack"] == ["stream.py:20:synchronize"]
+
+
+def test_mixed_algorithms_cannot_report_data_corruption_or_consistency(tool, tmp_path):
+    rows = fixture_rows()
+    next(row for row in rows if row["stage"] == "D_MIRROR").update(algorithm="mix32x4-v1", hash="c" * 32)
+    report = run(tool, tmp_path, rows)
+    assert report["status"] == "invalid_algorithm"
+    assert report["comparisons"] == 0 and report["different"] == 0
+    assert report["first_error"]["error"] == "incompatible_hash_algorithms"
+
+
+@pytest.mark.parametrize("algorithm", ["sum16x2-v1", "mix32x4-v1"])
+def test_report_identifies_the_actual_algorithm_including_old_logs(tool, tmp_path, algorithm):
+    rows = fixture_rows()
+    for row in rows:
+        row["algorithm"] = algorithm
+    report = run(tool, tmp_path, rows)
+    assert report["status"] == "consistent"
+    assert report["algorithm"] == algorithm

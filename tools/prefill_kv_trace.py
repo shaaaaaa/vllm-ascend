@@ -172,10 +172,13 @@ def analyze(paths, request_id, output):
     """)
     errors, selected, plans, ends, begins, store_diagnostics, count = Findings(), [], [], [], [], [], 0
     calibrations, bad_algorithm = set(), False
+    algorithms = set()
     counts = {}
     stalls = []
     observed_stages = set()
     for row in records(paths, request_id):
+        if row.get("algorithm"):
+            algorithms.add(row["algorithm"])
         stage = row.get("stage", "")
         observed_stages.add(stage)
         counts[stage] = counts.get(stage, 0) + 1
@@ -242,6 +245,16 @@ def analyze(paths, request_id, output):
             count += 1
         db.executemany("INSERT INTO hashes VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", values)
     db.commit()
+    comparable_algorithms = len(algorithms) == 1
+    if not comparable_algorithms:
+        bad_algorithm = True
+        errors.append(
+            dict(
+                stage="ALGORITHM",
+                algorithms=sorted(algorithms),
+                error="incompatible_hash_algorithms" if algorithms else "hash_algorithm_absent",
+            )
+        )
 
     @lru_cache(maxsize=512)
     def frame_payload(frame_id):
@@ -263,6 +276,8 @@ def analyze(paths, request_id, output):
         "D_MIRROR": "D_CPU",
         "D_DIRECT": "P_FINAL",
     }
+    if not comparable_algorithms:
+        chain = {}
     with (output / "comparisons.jsonl").open("w", encoding="utf-8") as detail:
         for stage, reference_stage in chain.items():
             for rank, group, layer, frontier, start, end, component, digest, prefix, frame in db.execute(
@@ -362,7 +377,7 @@ def analyze(paths, request_id, output):
                     )
                     detail.write(json.dumps(result, separators=(",", ":")) + "\n")
                     mismatches.append(result)
-        for row in selected:
+        for row in selected if comparable_algorithms else ():
             comparisons += 1
             if not row.get("match"):
                 detail.write(json.dumps(row, separators=(",", ":")) + "\n")
@@ -501,7 +516,8 @@ def analyze(paths, request_id, output):
         else "incomplete"
         if errors or missing
         else "consistent",
-        algorithm="mix32x4-v1",
+        algorithm=next(iter(algorithms)) if comparable_algorithms else None,
+        algorithms=sorted(algorithms),
         hash_records=count,
         comparisons=comparisons,
         different=mismatches.total,
@@ -576,6 +592,7 @@ def main(argv=None):
                 key: report[key]
                 for key in (
                     "status",
+                    "algorithm",
                     "hash_records",
                     "comparisons",
                     "different",
