@@ -143,7 +143,14 @@ def test_remote_archive_finds_request_directory_and_only_collects_features(tool,
     with tarfile.open(fileobj=io.BytesIO(remote_output.getvalue()), mode="r:gz") as source:
         names = source.getnames()
         assert [json.loads(line) for line in source.extractfile("logs.jsonl").read().splitlines()] == records
-    assert sorted(names) == ["D/features.bin", "D/index.jsonl", "P/features.bin", "P/index.jsonl", "logs.jsonl"]
+    assert sorted(names) == [
+        "D/features.bin",
+        "D/index.jsonl",
+        "P/features.bin",
+        "P/index.jsonl",
+        "collection-status.json",
+        "logs.jsonl",
+    ]
 
 
 def test_passive_rank_compares_with_actual_publisher_and_CPU_source(tool, tmp_path):
@@ -176,13 +183,18 @@ def collection_args(tmp_path):
     )
 
 
-def collection_payload(host):
+def collection_payload(host, *, features=True):
     output = io.BytesIO()
     with tarfile.open(fileobj=output, mode="w:gz") as archive:
         data = json.dumps(dict(host=host)).encode()
         item = tarfile.TarInfo("logs.jsonl")
         item.size = len(data)
         archive.addfile(item, io.BytesIO(data))
+        if features:
+            for name, data in (("worker/index.jsonl", b'{"stage":"END"}\n'), ("worker/features.bin", b"sample")):
+                item = tarfile.TarInfo(name)
+                item.size = len(data)
+                archive.addfile(item, io.BytesIO(data))
     return output.getvalue()
 
 
@@ -231,3 +243,91 @@ def test_failed_collection_can_retry_same_output_and_reuse_success(tool, tmp_pat
     assert directory.is_dir()
     assert tool.collect_host(args, host) == directory
     assert len(calls) == 2
+
+
+def test_logs_only_cache_is_refreshed_on_retry(tool, tmp_path, monkeypatch):
+    args, host, calls = collection_args(tmp_path), "root@7.150.3.11", []
+    monkeypatch.setattr(tool, "remote_command", lambda *args: [])
+
+    def run_ssh(args, host, command, *, stdout, stderr):
+        calls.append(host)
+        stdout.write(collection_payload(host, features=len(calls) > 1))
+        return subprocess.CompletedProcess(command, 0, stderr=b"")
+
+    monkeypatch.setattr(tool, "run_ssh", run_ssh)
+    directory = tool.collect_host(args, host)
+    assert not list(directory.rglob("index.jsonl"))
+    assert tool.collect_host(args, host) == directory
+    assert len(list(directory.rglob("index.jsonl"))) == 1
+    assert len(calls) == 2
+
+
+def test_prior_worker_failure_is_collected_and_reported_for_later_request(tool, tmp_path, monkeypatch):
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    base = dict(host="host", pid=123, rank=0, role="P", tp_size=4)
+    original = dict(base, req="first-request", stage="P_LOAD", error="original_failure")
+    later = dict(base, req="target", stage="END", failed=True)
+    unrelated = dict(base, pid=456, req="unrelated", stage="P_LOAD", error="unrelated_failure")
+    (logs / "P.log").write_text("".join("[KVTRACE] " + json.dumps(row) + "\n" for row in (original, unrelated, later)))
+    remote_output = io.BytesIO()
+    monkeypatch.setattr(sys, "argv", ["remote", str(tmp_path), "target", "120", "logs", ""])
+    monkeypatch.setattr(sys, "stdout", type("Stdout", (), {"buffer": remote_output})())
+    exec(compile(tool.REMOTE, "remote", "exec"), {})
+    compressed = tmp_path / "archive.tar.gz"
+    compressed.write_bytes(remote_output.getvalue())
+    extracted = tmp_path / "collected"
+    extracted.mkdir()
+    tool.safe_extract(compressed, extracted)
+    result = tool.analyze([extracted], "target", tmp_path / "report")
+    assert result["first_error"]["error"] == "original_failure"
+    assert result["first_error"]["req"] == "first-request"
+    assert result["first_error"]["context_for_request"] == "target"
+    assert result["log_stages"] == {"END": 1}
+    assert "unrelated_failure" not in (extracted / "logs.jsonl").read_text()
+
+
+def test_inaccessible_advertised_feature_path_is_not_silently_ignored(tool, tmp_path, monkeypatch):
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    missing = tmp_path / "container-only/target/worker"
+    record = dict(req="target", stage="FEATURE_FILE", directory=str(missing))
+    (logs / "P.log").write_text("[KVTRACE] " + json.dumps(record) + "\n")
+    remote_output = io.BytesIO()
+    monkeypatch.setattr(sys, "argv", ["remote", str(tmp_path), "target", "120", "logs", ""])
+    monkeypatch.setattr(sys, "stdout", type("Stdout", (), {"buffer": remote_output})())
+    exec(compile(tool.REMOTE, "remote", "exec"), {})
+    with tarfile.open(fileobj=io.BytesIO(remote_output.getvalue()), mode="r:gz") as source:
+        status = json.load(source.extractfile("collection-status.json"))
+    assert status["feature_files"] == 0
+    assert str(missing / "index.jsonl") in status["missing_paths"]
+
+
+def test_failed_end_only_logs_report_stopped_recorders_and_real_tp_size(tool, tmp_path):
+    root = tmp_path / "collected"
+    root.mkdir()
+    rows = [
+        dict(
+            req="cmpl-target-0",
+            host=role,
+            pid=100 + rank,
+            role=role,
+            rank=rank,
+            tp_rank=rank,
+            tp_size=4,
+            stage="END",
+            failed=True,
+        )
+        for role in ("P", "D")
+        for rank in range(4)
+    ]
+    # The producer may emit END twice; do not count this as two failed workers.
+    (root / "logs.jsonl").write_text("".join(json.dumps(row) + "\n" for row in rows + rows[:4]))
+    result = tool.analyze([root], "target", tmp_path / "report")
+    assert result["status"] == "incomplete"
+    assert result["observations"] == 0
+    assert result["log_stages"] == {"END": 12}
+    assert result["first_error"]["error"] == "feature_recorder_stopped"
+    assert result["errors"] == 9  # Eight failed recorders plus missing TP data.
+    errors = json.loads((tmp_path / "report/coverage-errors.json").read_text())
+    assert errors[-1]["expected"] == 4

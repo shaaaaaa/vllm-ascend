@@ -49,21 +49,36 @@ roots=[workspace/'kv-feature-dump',workspace/'vllm-ascend'/'kv-feature-dump']
 if configured: roots.insert(0,pathlib.Path(configured))
 if not logdir.is_absolute():
     logdir=next((p for p in [workspace/logdir,workspace/'vllm-ascend'/logdir] if p.is_dir()),workspace/logdir)
-logs=[]; directories=set()
+logs=[]; directories=set(); context={}; matched=0
+def worker_key(record):
+    return tuple(record.get(key) for key in ('host','pid','role','rank'))
 for path in sorted(logdir.glob('*.log')):
+    first_errors={}
     with path.open(errors='replace') as source:
-        for line in source:
-            if '[KVTRACE] ' not in line or wanted not in line: continue
+        for number,line in enumerate(source,1):
+            if '[KVTRACE] ' not in line: continue
             try: record=json.loads(line.split('[KVTRACE] ',1)[1])
             except ValueError: continue
+            key=worker_key(record)
+            if record.get('error') and record.get('pid') is not None:
+                first_errors.setdefault(key,dict(record,source_log=path.name,source_line=number))
+            if wanted not in str(record.get('req','')): continue
+            matched+=1
             logs.append(json.dumps(record,separators=(',',':'))+'\n')
             if record.get('stage')=='FEATURE_FILE': directories.add(pathlib.Path(record['directory']))
+            if record.get('failed') and key in first_errors:
+                error=first_errors[key]
+                if wanted not in str(error.get('req','')):
+                    context[key]=dict(error,context_for_request=wanted)
+for record in context.values():
+    logs.append(json.dumps(record,separators=(',',':'))+'\n')
 for root in roots:
     directories.update(p.parent for p in (root/wanted).glob('*/index.jsonl'))
 deadline=time.monotonic()+wait
-while directories:
+accessible={directory for directory in directories if (directory/'index.jsonl').is_file()}
+while accessible:
     complete=True
-    for directory in directories:
+    for directory in accessible:
         try:
             with (directory/'index.jsonl').open('rb') as source:
                 source.seek(max(0,source.seek(0,2)-2048)); tail=source.read()
@@ -77,14 +92,42 @@ with gzip.GzipFile(fileobj=sys.stdout.buffer,mode='wb',compresslevel=1) as compr
         tarfile.open(fileobj=compressed,mode='w|') as archive:
     payload=''.join(logs).encode(); info=tarfile.TarInfo('logs.jsonl'); info.size=len(payload)
     archive.addfile(info,io.BytesIO(payload))
+    missing=[]; included=0
     for directory in sorted(directories):
-        if directory.is_symlink() or not directory.is_dir(): continue
         # Dedicated feature files only; never descend into arbitrary tensors.
         for name in ('index.jsonl','features.bin'):
             path=directory/name
-            if path.is_file() and not path.is_symlink():
+            if not directory.is_symlink() and path.is_file() and not path.is_symlink():
                 archive.add(path,arcname=directory.name+'/'+name,recursive=False)
+                included+=1
+            else:
+                missing.append(str(path))
+    status=dict(request_id=wanted,matched_log_records=matched,feature_files=included,
+                log_dir=str(logdir),log_dir_exists=logdir.is_dir(),
+                searched_roots=[str(root) for root in roots],missing_paths=missing)
+    payload=json.dumps(status,separators=(',',':')).encode()
+    info=tarfile.TarInfo('collection-status.json'); info.size=len(payload)
+    archive.addfile(info,io.BytesIO(payload))
 """
+
+
+def complete_feature_snapshot(directory):
+    """Only reuse a snapshot that contains finished feature files, not logs alone."""
+    indices = list(directory.rglob("index.jsonl"))
+    if not indices:
+        return False
+    for index in indices:
+        if not (index.parent / "features.bin").is_file():
+            return False
+        try:
+            with index.open("rb") as source:
+                source.seek(max(0, source.seek(0, 2) - 2048))
+                end = json.loads(source.read().splitlines()[-1])
+            if end.get("stage") != "END" or end.get("failed"):
+                return False
+        except (OSError, ValueError, IndexError):
+            return False
+    return True
 
 
 def collect_host(args, host):
@@ -93,13 +136,26 @@ def collect_host(args, host):
     # Dots in an IP are part of the host identity, not a filename extension.
     archive = directory.with_name(directory.name + ".tar.gz")
     archive.parent.mkdir(parents=True, exist_ok=True)
-    identity = dict(schema=1, host=host, request_id=args.request_id)
+    identity = dict(
+        schema=2,
+        host=host,
+        request_id=args.request_id,
+        workspace=args.workspace,
+        container=getattr(args, "container", None),
+        log_dir=args.log_dir,
+        feature_dir=args.feature_dir,
+    )
     if directory.exists():
         marker = directory / "collection.json"
-        if marker.is_file() and json.loads(marker.read_text(encoding="utf-8")) == identity:
+        previous = json.loads(marker.read_text(encoding="utf-8")) if marker.is_file() else {}
+        if directory.is_symlink() or previous.get("host") != host or previous.get("request_id") != args.request_id:
+            raise ValueError(
+                f"output is not this host's completed collection: {directory}; use a new --output or --local"
+            )
+        if previous == identity and complete_feature_snapshot(directory):
             print(f"[KVFEATURE] reusing {host}: {directory}", flush=True)
             return directory
-        raise ValueError(f"output is not a completed collection: {directory}; use a new --output or --local")
+        print(f"[KVFEATURE] refreshing incomplete or changed collection: {host}", flush=True)
     command = remote_command(
         args,
         host,
@@ -132,9 +188,21 @@ def collect_host(args, host):
         counts = safe_extract(download, extracted)
         with (extracted / "collection.json").open("x", encoding="utf-8") as marker:
             json.dump(identity, marker, separators=(",", ":"))
+        previous = staging / "previous"
+        if directory.exists():
+            directory.rename(previous)
+        try:
+            extracted.rename(directory)
+        except Exception:
+            if previous.exists():
+                previous.rename(directory)
+            raise
         download.replace(archive)
-        extracted.rename(directory)
-    print(f"[KVFEATURE] {host}: {counts['files']} files, {counts['bytes']} bytes", flush=True)
+    feature_workers = len(list(directory.rglob("index.jsonl")))
+    print(
+        f"[KVFEATURE] {host}: feature_workers={feature_workers}, {counts['files']} files, {counts['bytes']} bytes",
+        flush=True,
+    )
     return directory
 
 
@@ -204,13 +272,55 @@ def analyze(roots, request_id, output):
                     errors.append(dict(worker=str(path.parent), error="missing_END", last_completed=last_completed))
         except Exception as error:
             errors.append(dict(worker=str(path.parent), error=str(error)))
-    # Include a first probe failure even if it prevented creation of a data file.
+    # A recorder stops after its first failure. That failure may belong to an
+    # earlier request in this worker, leaving only failed END rows for this one.
+    trace_records, log_errors, collection = [], [], []
     for root in roots:
         for path in root.rglob("logs.jsonl"):
             for line in path.open(encoding="utf-8"):
                 row = json.loads(line)
-                if request_id in row.get("req", "") and row.get("error"):
-                    errors.append(row)
+                if request_id in row.get("req", "") or row.get("context_for_request") == request_id:
+                    trace_records.append(row)
+                    if row.get("error"):
+                        log_errors.append(row)
+        for path in root.rglob("collection-status.json"):
+            row = json.loads(path.read_text(encoding="utf-8"))
+            row["collection_directory"] = str(path.parent)
+            collection.append(row)
+            if row.get("missing_paths"):
+                errors.append(
+                    dict(
+                        error="feature_paths_unavailable",
+                        paths=row["missing_paths"][:6],
+                        count=len(row["missing_paths"]),
+                        hint="Check the remote filesystem namespace; use --container for container-only paths.",
+                    )
+                )
+    log_stages = dict(Counter(row.get("stage", "unknown") for row in trace_records if request_id in row.get("req", "")))
+
+    def worker_key(row):
+        return tuple(row.get(key) for key in ("host", "pid", "role", "rank"))
+
+    explained = {worker_key(row) for row in log_errors}
+    for row in trace_records:
+        if row.get("stage") == "END" and row.get("failed") and worker_key(row) not in explained:
+            log_errors.append(
+                dict(
+                    row,
+                    error="feature_recorder_stopped",
+                    hint="The first error may belong to an earlier request; recollect this worker's error context.",
+                )
+            )
+            explained.add(worker_key(row))
+    errors = log_errors + errors
+    if not observations and not errors:
+        errors.append(
+            dict(
+                error="no_feature_files",
+                log_stages=log_stages,
+                hint="Only logs were collected; inspect collection-status.json and FEATURE_FILE paths.",
+            )
+        )
     index = defaultdict(list)
     for obs in observations:
         row = obs.row
@@ -438,7 +548,9 @@ def analyze(roots, request_id, output):
                                 component=component,
                             )
                         )
-    expected_tp = max((m.get("tp_size", 1) for _, m in workers), default=1)
+    expected_tp = max(
+        [m.get("tp_size", 1) for _, m in workers] + [row.get("tp_size", 1) for row in trace_records] + [1]
+    )
     if p_ranks != set(range(expected_tp)) or d_ranks != set(range(expected_tp)):
         errors.append(dict(error="incomplete_PD_ranks", P=sorted(p_ranks), D=sorted(d_ranks), expected=expected_tp))
     first = min(
@@ -456,6 +568,8 @@ def analyze(roots, request_id, output):
         else "sampled_bytes_equal",
         observations=len(observations),
         stages=dict(Counter(obs.row["stage"] for obs in observations)),
+        log_stages=log_stages,
+        collection=collection,
         workers=len(workers),
         **counts,
         errors=len(errors),
@@ -516,7 +630,23 @@ def main(argv=None):
         if report["status"] == "sampled_bytes_equal":
             report["status"] = "incomplete"
         (args.output / "report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
-    print("[KVFEATURE] " + json.dumps(report, separators=(",", ":")), flush=True)
+    summary = {
+        key: report[key]
+        for key in (
+            "request_id",
+            "status",
+            "observations",
+            "workers",
+            "comparisons",
+            "different_bytes",
+            "errors",
+            "log_stages",
+            "first_error",
+            "first_difference",
+            "first_boundary",
+        )
+    }
+    print("[KVFEATURE] " + json.dumps(summary, separators=(",", ":")), flush=True)
     print("[KVFEATURE] report:", args.output / "report.json")
     return 0 if report["status"] == "sampled_bytes_equal" else 1
 
