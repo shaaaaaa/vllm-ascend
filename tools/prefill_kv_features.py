@@ -13,6 +13,7 @@ import argparse
 import json
 import re
 import struct
+import tempfile
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -41,7 +42,7 @@ BOUNDARIES = {
 }
 
 REMOTE = r"""
-import io,json,pathlib,sys,tarfile,time
+import gzip,io,json,pathlib,sys,tarfile,time
 workspace=pathlib.Path(sys.argv[1]); wanted=sys.argv[2]; wait=float(sys.argv[3])
 logdir=pathlib.Path(sys.argv[4]); configured=sys.argv[5]
 roots=[workspace/'kv-feature-dump',workspace/'vllm-ascend'/'kv-feature-dump']
@@ -70,7 +71,10 @@ while directories:
         except OSError: complete=False
     if complete or time.monotonic()>=deadline: break
     time.sleep(1)
-with tarfile.open(fileobj=sys.stdout.buffer,mode='w|gz',compresslevel=1) as archive:
+# Python 3.9's streaming tar API does not accept compresslevel. Compress the
+# plain tar stream with GzipFile, whose compression-level API is stable.
+with gzip.GzipFile(fileobj=sys.stdout.buffer,mode='wb',compresslevel=1) as compressed, \
+        tarfile.open(fileobj=compressed,mode='w|') as archive:
     payload=''.join(logs).encode(); info=tarfile.TarInfo('logs.jsonl'); info.size=len(payload)
     archive.addfile(info,io.BytesIO(payload))
     for directory in sorted(directories):
@@ -84,12 +88,18 @@ with tarfile.open(fileobj=sys.stdout.buffer,mode='w|gz',compresslevel=1) as arch
 
 
 def collect_host(args, host):
-    """Compress each host's small feature archive before native SSH transfer."""
+    """Collect one host atomically; retry failures and reuse completed downloads."""
     directory = args.output / "hosts" / host_directory(host)
-    archive = directory.with_suffix(".tar.gz")
+    # Dots in an IP are part of the host identity, not a filename extension.
+    archive = directory.with_name(directory.name + ".tar.gz")
     archive.parent.mkdir(parents=True, exist_ok=True)
+    identity = dict(schema=1, host=host, request_id=args.request_id)
     if directory.exists():
-        raise ValueError(f"output already exists: {directory}; use --local to reanalyse")
+        marker = directory / "collection.json"
+        if marker.is_file() and json.loads(marker.read_text(encoding="utf-8")) == identity:
+            print(f"[KVFEATURE] reusing {host}: {directory}", flush=True)
+            return directory
+        raise ValueError(f"output is not a completed collection: {directory}; use a new --output or --local")
     command = remote_command(
         args,
         host,
@@ -105,12 +115,25 @@ def collect_host(args, host):
         ],
     )
     print(f"[KVFEATURE] collecting {host}", flush=True)
-    with archive.open("xb") as target:
-        result = run_ssh(args, host, command, stdout=target, stderr=-1)
-    if result.returncode:
-        raise RuntimeError(result.stderr.decode(errors="replace")[-1200:])
-    directory.mkdir()
-    counts = safe_extract(archive, directory)
+    # A failed SSH or truncated tar must not leave the final directory/archive
+    # looking complete, or prevent rerunning the original command.
+    parent = directory.parent.resolve()
+    with tempfile.TemporaryDirectory(prefix=directory.name + ".", dir=parent) as temporary:
+        staging = Path(temporary).resolve()
+        if not staging.is_relative_to(parent):
+            raise ValueError("collection staging directory escapes output")
+        download = staging / "download.tar.gz"
+        with download.open("xb") as target:
+            result = run_ssh(args, host, command, stdout=target, stderr=-1)
+        if result.returncode:
+            raise RuntimeError(result.stderr.decode(errors="replace")[-1200:])
+        extracted = staging / "extracted"
+        extracted.mkdir()
+        counts = safe_extract(download, extracted)
+        with (extracted / "collection.json").open("x", encoding="utf-8") as marker:
+            json.dump(identity, marker, separators=(",", ":"))
+        download.replace(archive)
+        extracted.rename(directory)
     print(f"[KVFEATURE] {host}: {counts['files']} files, {counts['bytes']} bytes", flush=True)
     return directory
 

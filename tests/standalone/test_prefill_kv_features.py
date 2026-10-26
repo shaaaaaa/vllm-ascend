@@ -5,9 +5,12 @@ import importlib.util
 import io
 import json
 import struct
+import subprocess
 import sys
 import tarfile
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -118,13 +121,28 @@ def test_truncated_binary_is_coverage_error(tool, tmp_path):
 
 def test_remote_archive_finds_request_directory_and_only_collects_features(tool, tmp_path, monkeypatch):
     chain(tmp_path / "repo/kv-feature-dump/target")
+    logs = tmp_path / "repo/logs"
+    logs.mkdir()
+    records = [dict(req="cmpl-target-0", stage="BEGIN"), dict(req="cmpl-target-0", stage="END")]
+    (logs / "server.log").write_text("".join("[KVTRACE] " + json.dumps(row) + "\n" for row in records))
     remote_output = io.BytesIO()
     args = ["remote", str(tmp_path / "repo"), "target", "0", "logs", ""]
     monkeypatch.setattr(sys, "argv", args)
     monkeypatch.setattr(sys, "stdout", type("Stdout", (), {"buffer": remote_output})())
+    original_open = tarfile.open
+
+    def legacy_stream_open(*args, **kwargs):
+        # Python 3.9 passes this kwarg through to TarFile.__init__, which rejects
+        # it. Keep this regression effective on newer local Python runtimes.
+        if "|" in kwargs.get("mode", "") and "compresslevel" in kwargs:
+            raise TypeError("__init__() got an unexpected keyword argument 'compresslevel'")
+        return original_open(*args, **kwargs)
+
+    monkeypatch.setattr(tarfile, "open", legacy_stream_open)
     exec(compile(tool.REMOTE, "remote", "exec"), {})
     with tarfile.open(fileobj=io.BytesIO(remote_output.getvalue()), mode="r:gz") as source:
         names = source.getnames()
+        assert [json.loads(line) for line in source.extractfile("logs.jsonl").read().splitlines()] == records
     assert sorted(names) == ["D/features.bin", "D/index.jsonl", "P/features.bin", "P/index.jsonl", "logs.jsonl"]
 
 
@@ -145,3 +163,71 @@ def test_passive_rank_compares_with_actual_publisher_and_CPU_source(tool, tmp_pa
     result = tool.analyze([tmp_path], "target", tmp_path / "report")
     assert result["status"] == "sampled_bytes_equal"
     assert result["different_bytes"] == result["unmatched_ranges"] == 0
+
+
+def collection_args(tmp_path):
+    return SimpleNamespace(
+        output=tmp_path,
+        workspace="/repo",
+        request_id="target",
+        wait_seconds=0,
+        log_dir="logs",
+        feature_dir=None,
+    )
+
+
+def collection_payload(host):
+    output = io.BytesIO()
+    with tarfile.open(fileobj=output, mode="w:gz") as archive:
+        data = json.dumps(dict(host=host)).encode()
+        item = tarfile.TarInfo("logs.jsonl")
+        item.size = len(data)
+        archive.addfile(item, io.BytesIO(data))
+    return output.getvalue()
+
+
+def test_four_concurrent_hosts_keep_distinct_complete_IP_names(tool, tmp_path, monkeypatch):
+    args = collection_args(tmp_path)
+    hosts = ["root@7.150.2.72", "root@7.150.3.11", "root@7.150.3.60", "root@7.150.6.177"]
+    monkeypatch.setattr(tool, "remote_command", lambda *args: [])
+
+    def run_ssh(args, host, command, *, stdout, stderr):
+        stdout.write(collection_payload(host))
+        return subprocess.CompletedProcess(command, 0, stderr=b"")
+
+    monkeypatch.setattr(tool, "run_ssh", run_ssh)
+    # A broken archive left by the previous version must not block the retry.
+    old = tmp_path / "hosts/host-root_7.150.3.tar.gz"
+    old.parent.mkdir()
+    old.write_bytes(b"old failed download")
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        directories = list(pool.map(lambda host: tool.collect_host(args, host), hosts))
+    assert len(set(directories)) == 4
+    for host, directory in zip(hosts, directories):
+        assert json.loads((directory / "logs.jsonl").read_text())["host"] == host
+        archive = directory.with_name(directory.name + ".tar.gz")
+        assert archive.is_file()
+        assert archive.name.startswith(tool.host_directory(host) + ".")
+    assert old.read_bytes() == b"old failed download"
+
+
+@pytest.mark.parametrize("failure", ["ssh", "truncated_archive"])
+def test_failed_collection_can_retry_same_output_and_reuse_success(tool, tmp_path, monkeypatch, failure):
+    args, host, calls = collection_args(tmp_path), "root@7.150.3.11", []
+    monkeypatch.setattr(tool, "remote_command", lambda *args: [])
+
+    def run_ssh(args, host, command, *, stdout, stderr):
+        calls.append(host)
+        payload = collection_payload(host)
+        stdout.write(payload[:-8] if len(calls) == 1 else payload)
+        code = 1 if len(calls) == 1 and failure == "ssh" else 0
+        return subprocess.CompletedProcess(command, code, stderr=b"remote packing failed")
+
+    monkeypatch.setattr(tool, "run_ssh", run_ssh)
+    with pytest.raises((RuntimeError, EOFError)):
+        tool.collect_host(args, host)
+    assert list((tmp_path / "hosts").iterdir()) == []
+    directory = tool.collect_host(args, host)
+    assert directory.is_dir()
+    assert tool.collect_host(args, host) == directory
+    assert len(calls) == 2
