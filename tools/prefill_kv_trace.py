@@ -173,11 +173,16 @@ def analyze(paths, request_id, output):
     errors, selected, plans, ends, begins, store_diagnostics, count = Findings(), [], [], [], [], [], 0
     calibrations, bad_algorithm = set(), False
     counts = {}
+    stalls = []
     observed_stages = set()
     for row in records(paths, request_id):
         stage = row.get("stage", "")
         observed_stages.add(stage)
         counts[stage] = counts.get(stage, 0) + 1
+        if stage == "STALL":
+            if len(stalls) < 16:
+                stalls.append(row)
+            continue
         if row.get("error"):
             errors.append(row)
             continue
@@ -503,6 +508,7 @@ def analyze(paths, request_id, output):
         unmatched=missing.total,
         errors=errors.total,
         sparse_transfer_observed=bool(selected),
+        first_stall=stalls[0] if stalls else None,
         store_diagnostics=store_diagnostics,
         stages=counts,
         first_difference=mismatches[0] if mismatches else None,
@@ -579,6 +585,7 @@ def main(argv=None):
                     "first_boundary",
                     "first_error",
                     "first_unmatched",
+                    "first_stall",
                 )
             },
             ensure_ascii=False,

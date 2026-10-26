@@ -213,3 +213,14 @@ def test_shared_cpu_decode_uses_publisher_rank_not_consumer_rank(tool, tmp_path)
             row.update(rank=1, source_rank=0)
     rows.append(dict(rows[0], stage="P_FINAL", rank=1, final=True, hash="c" * 32))
     assert run(tool, tmp_path, rows)["status"] == "consistent"
+
+
+def test_stall_summary_is_informational_and_preserves_waiting_stack(tool, tmp_path):
+    rows = fixture_rows()
+    rows.append(dict(rows[0], stage="STALL", blocked_stage="P_CPU_LOAD",
+                     elapsed_s=60.0, main_stack=["model.py:10:forward"],
+                     hash_stack=["stream.py:20:synchronize"]))
+    report = run(tool, tmp_path, rows)
+    assert report["status"] == "consistent"
+    assert report["first_stall"]["blocked_stage"] == "P_CPU_LOAD"
+    assert report["first_stall"]["hash_stack"] == ["stream.py:20:synchronize"]

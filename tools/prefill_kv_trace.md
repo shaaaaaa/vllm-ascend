@@ -54,6 +54,9 @@ hash 为 `mix32x4-v1` 的 128 位内容校验值，显示为 32 个十六进制�
 用于检查复制是否保持原始字节，不是密码学 MD5。CPU/NPU 使用相同的算法，
 每个请求先校准两个后端；校准失败会报告 `invalid_algorithm`，不能解释为 KV 损坏。
 同一请求中已租用且不可变的完整 CPU 源块复用首次 hash；实际 NPU bank 每个 chunk 都重新检查。
+P 的 CPU 源 hash 在后台执行，等待该层真实 H2D 完成 event 后才读取源页，
+避免阻塞加载主路径和误读提前发布但尚未完成 D2H 的源数据。
+四路 NPU 校验种子合批处理，算法和日志格式保持 `mix32x4-v1` 不变。
 
 D 在模型首次 decode 前独立逐块加载全部继承的 latent KV，仅用于 hash。
 镜像不写入模型缓存；每次只加载一个存储块，读回的只是每段 16 字节校验值。
@@ -106,3 +109,21 @@ python3 tools/prefill_kv_trace.py \
 检查结果描述最早观测到的差异边界，不把 hash 一致解释为排除了所有时序或模型计算问题。
 本工具的 CPU 测试覆盖原始字节、块表映射、部分块、混合 C8、缺失检查和 SSH 压缩筛选；
 NPU 运行仍需在实际服务器验证。
+
+## DEBUG 运行超时
+
+`RPC call to sample_tokens timed out` 表示 EngineCore 没在执行 RPC 的期限内收到结果。
+异步调度会先提交模型执行再提交采样，超时时 Worker 可能仍在执行前面的模型工作，
+或采样的回读正在等待此前排队的 NPU hash；这条堆栈本身不能证明采样算法出错。
+控制该期限的是 `VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS`，当前默认 300 秒。
+全历史 DEBUG 复现可以在**容器内的服务启动环境**临时设置更长的期限并重启 P：
+
+```bash
+export VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=1800
+```
+
+这只延长等待期限。即便只读回 hash，完整历史仍需要逐层扫描和计算，不能视为零开销。
+同一 DEBUG 开关下，后台 hash 任务连续 60 秒无进展会输出 `stage=STALL`：
+包含等待的阶段、group/layer、队列长度，以及主线程和 hash 线程各最多 8 帧的 Python 栈摘要。
+不安装信号处理器，不额外同步 NPU；每个停滞任务只输出一次。
+分析报告的 `first_stall` 保留首条摘要；任务后来完成时，曾经停滞不等于 hash 不一致。
