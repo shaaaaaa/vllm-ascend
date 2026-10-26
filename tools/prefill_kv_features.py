@@ -253,7 +253,7 @@ def analyze(roots, request_id, output):
                 row = json.loads(line)
                 if row.get("stage") == "FILE_BEGIN":
                     meta = row
-                    if request_id not in row.get("req", ""):
+                    if request_id not in str(row.get("req") or ""):
                         break
                     if row.get("format") != FORMAT:
                         raise ValueError("feature format mismatch")
@@ -266,7 +266,7 @@ def analyze(roots, request_id, output):
                     ended = True
                     if row.get("failed"):
                         errors.append(dict(worker=str(path.parent), error="recorder_failed"))
-            if meta is not None and request_id in meta.get("req", ""):
+            if meta is not None and request_id in str(meta.get("req") or ""):
                 workers.append((path, meta))
                 if not ended:
                     errors.append(dict(worker=str(path.parent), error="missing_END", last_completed=last_completed))
@@ -279,7 +279,7 @@ def analyze(roots, request_id, output):
         for path in root.rglob("logs.jsonl"):
             for line in path.open(encoding="utf-8"):
                 row = json.loads(line)
-                if request_id in row.get("req", "") or row.get("context_for_request") == request_id:
+                if request_id in str(row.get("req") or "") or row.get("context_for_request") == request_id:
                     trace_records.append(row)
                     if row.get("error"):
                         log_errors.append(row)
@@ -296,7 +296,9 @@ def analyze(roots, request_id, output):
                         hint="Check the remote filesystem namespace; use --container for container-only paths.",
                     )
                 )
-    log_stages = dict(Counter(row.get("stage", "unknown") for row in trace_records if request_id in row.get("req", "")))
+    log_stages = dict(
+        Counter(row.get("stage", "unknown") for row in trace_records if request_id in str(row.get("req") or ""))
+    )
 
     def worker_key(row):
         return tuple(row.get(key) for key in ("host", "pid", "role", "rank"))
@@ -304,13 +306,17 @@ def analyze(roots, request_id, output):
     explained = {worker_key(row) for row in log_errors}
     for row in trace_records:
         if row.get("stage") == "END" and row.get("failed") and worker_key(row) not in explained:
-            log_errors.append(
-                dict(
-                    row,
-                    error="feature_recorder_stopped",
-                    hint="The first error may belong to an earlier request; recollect this worker's error context.",
+            cause = row.get("cause")
+            if isinstance(cause, dict) and cause.get("error"):
+                log_errors.append({**row, **cause, "context_for_request": request_id})
+            else:
+                log_errors.append(
+                    dict(
+                        row,
+                        error="feature_recorder_stopped",
+                        hint="The first error may belong to an earlier request; recollect this worker's error context.",
+                    )
                 )
-            )
             explained.add(worker_key(row))
     errors = log_errors + errors
     if not observations and not errors:

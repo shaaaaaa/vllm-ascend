@@ -262,11 +262,12 @@ def test_logs_only_cache_is_refreshed_on_retry(tool, tmp_path, monkeypatch):
     assert len(calls) == 2
 
 
-def test_prior_worker_failure_is_collected_and_reported_for_later_request(tool, tmp_path, monkeypatch):
+@pytest.mark.parametrize("first_request", ["first-request", None])
+def test_prior_worker_failure_is_collected_and_reported_for_later_request(tool, tmp_path, monkeypatch, first_request):
     logs = tmp_path / "logs"
     logs.mkdir()
     base = dict(host="host", pid=123, rank=0, role="P", tp_size=4)
-    original = dict(base, req="first-request", stage="P_LOAD", error="original_failure")
+    original = dict(base, req=first_request, stage="P_LOAD", error="original_failure")
     later = dict(base, req="target", stage="END", failed=True)
     unrelated = dict(base, pid=456, req="unrelated", stage="P_LOAD", error="unrelated_failure")
     (logs / "P.log").write_text("".join("[KVTRACE] " + json.dumps(row) + "\n" for row in (original, unrelated, later)))
@@ -281,7 +282,7 @@ def test_prior_worker_failure_is_collected_and_reported_for_later_request(tool, 
     tool.safe_extract(compressed, extracted)
     result = tool.analyze([extracted], "target", tmp_path / "report")
     assert result["first_error"]["error"] == "original_failure"
-    assert result["first_error"]["req"] == "first-request"
+    assert result["first_error"]["req"] == first_request
     assert result["first_error"]["context_for_request"] == "target"
     assert result["log_stages"] == {"END": 1}
     assert "unrelated_failure" not in (extracted / "logs.jsonl").read_text()
@@ -331,3 +332,16 @@ def test_failed_end_only_logs_report_stopped_recorders_and_real_tp_size(tool, tm
     assert result["errors"] == 9  # Eight failed recorders plus missing TP data.
     errors = json.loads((tmp_path / "report/coverage-errors.json").read_text())
     assert errors[-1]["expected"] == 4
+
+
+def test_end_retains_failure_cause_when_original_log_is_unavailable(tool, tmp_path):
+    cause = dict(req=None, stage="D_SELECTED", error="missing_cpu_reference", layer=78)
+    end = dict(req="target", host="h", pid=123, role="D", rank=0, stage="END", failed=True, cause=cause)
+    root = tmp_path / "collected"
+    root.mkdir()
+    (root / "logs.jsonl").write_text(json.dumps(end) + "\n")
+    result = tool.analyze([root], "target", tmp_path / "report")
+    assert result["status"] == "incomplete"
+    assert result["first_error"]["req"] is None
+    assert result["first_error"]["error"] == "missing_cpu_reference"
+    assert result["first_error"]["layer"] == 78
