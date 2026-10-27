@@ -42,7 +42,7 @@ KV 时无需加载。第 N 层在计算流上等待自己的加载 event；最�
 ## 统计口径
 
 每次实际 chunked prefill 的整个模型 batch 统计一次，支持同批多个 request，
-各请求长度、已处理前缀和轮转相位可以不同。日志保留所有请求的真实 token 区间，
+各请求长度、已处理前缀可以不同。日志保留所有请求的真实 token 区间，
 不把整批耗时分摊或重复累计给各个请求。
 同时检查 connector metadata 和 attention metadata，避免漏掉请求后错误归属计时。
 空跑、无可确认请求范围的 batch 和 decode 不统计。
@@ -58,12 +58,11 @@ token 区间来自调度器这次实际计算的 `[start, end)`，按 request �
   若该层有 latent 和 indexer 两个等待，取后者的结束点，保证它们都在该起点之前。
   这是 bank 就绪后开始计算的边界，不是 Python 进入 decoder 的主机时间。
 - 按实际 `(KV group, physical bank)` 找前后两次使用该 bank 的模型层 A、B。
-  latent、indexer 组的 bank 相互独立，chunk 相位偏移也使用实际 bank ID。
-- 同批不同请求的 bank 相位不同时，整批 consumer gate 会等待多个 bank。
-  此时按 `(KV group, 组内层序号 % bank数)` 配对整批复用窗口；经过完整的 bank
-  轮转周期，各请求才再次使用自己的同一物理 bank。不能因两批 bank 集合有交集
-  就把它们当作相邻层的复用。`batch_rotation_slots` 单独列出这些等待和比值，
-  `banks` 仍按实际物理 bank 列出 DMA 时间。
+  latent、indexer 组的 bank 相互独立，各自从组内序号 0 开始，固定按
+  `组内层序号 % bank数` 选择。前缀长度、chunk 序号不改变 bank。
+- 同批所有请求在同一层使用相同编号的 bank，各自占用独立的物理块。
+  consumer gate 逐个等待各请求的 load 完成事件，整段等待只统计一次。
+  `banks` 按实际 bank 列出等待、复用窗口和 DMA 时间。
 - 每个复用窗口的覆盖率：`1 - wait(group, bank, B) / (start(B) - start(A))`。
   分子是 B 在这个 bank 的 consumer gate 上等待的 NPU 时间。
 - 4 bank 时，latent 组通常比较 N 和 N+4，而非 N 和 N+1；indexer 组按自己的

@@ -1,11 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Execute production bank-table selection on CPU, including mixed phases."""
+"""Execute production bank-table selection on CPU, with fixed per-layer banks."""
 
 import ast
 from pathlib import Path
 from types import SimpleNamespace as NS
 
-import numpy as np
 import pytest
 import torch
 
@@ -47,67 +46,53 @@ def test_all_shadow_bank_tables_follow_request_row_order(banks):
     ]
 
 
-@pytest.mark.parametrize("banks,phases", [(2, [0, 1, 0]), (3, [2, 0, 1]), (8, [0, 7, 3]), (8, [7, 7, 7])])
-def test_mixed_request_phases_select_correct_physical_rows_and_slots(banks, phases):
+@pytest.mark.parametrize("banks", [1, 2, 3, 4, 8])
+def test_unequal_prefixes_use_fixed_bank_and_disjoint_request_slots(banks):
     owner = method("_build_attention_metadata")
     getter = next(
         n for n in ast.walk(owner) if isinstance(n, ast.FunctionDef) and n.name == "_get_block_table_and_slot_mapping"
     )
     wrapper = ast.parse(
-        "def make(self, kv_cache_groups, phase_by_request_cpu, phase_by_token_cpu):\n"
-        "    num_reqs = 3\n"
-        "    num_reqs_padded = 4\n"
-        "    num_tokens = 6\n"
-        "    num_tokens_padded = 8\n"
+        "def make(self, kv_cache_groups):\n"
+        "    num_reqs = 2\n"
+        "    num_reqs_padded = 3\n"
+        "    num_tokens = 4096\n"
+        "    num_tokens_padded = 4100\n"
         "    prefill_bank_views = {}\n"
-        "    mixed_bank_phase = bool(np.any(phase_by_request_cpu != phase_by_request_cpu[0]))\n"
-        "    phase_by_request_device = None\n"
-        "    phase_by_token_device = None\n"
     ).body[0]
     wrapper.body.append(getter)
     wrapper.body.append(ast.parse("return _get_block_table_and_slot_mapping").body[0])
     module = ast.parse("from __future__ import annotations")
     module.body.append(wrapper)
-    namespace = dict(np=np, torch=torch, EncoderOnlyAttentionSpec=type("Unused", (), {}))
+    namespace = dict(torch=torch, EncoderOnlyAttentionSpec=type("Unused", (), {}))
     exec(compile(ast.fix_missing_locations(module), str(SOURCE), "exec"), namespace)
-    tables = []
+    tables, expected = [], {}
     for bank in range(banks):
         groups = []
         for group in range(2):
-            blocks = torch.arange(8).reshape(4, 2) + bank * 100 + group * 10000
-            slots = torch.arange(8) + bank * 1000 + group * 10000
+            base = bank * 100000 + group * 1000000
+            blocks = torch.arange(6).reshape(3, 2) + base
+            # A: prefix 20000 + 2000 new; B: prefix 10000 + 2096 new.
+            # B owns a different physical region even though bank IDs match.
+            slots = torch.cat((torch.arange(20000, 22000),
+                               torch.arange(60000, 62096), torch.zeros(4))).long() + base
+            expected[bank, group] = (blocks.clone(), slots.clone())
             groups.append(NS(get_device_tensor=lambda blocks=blocks: blocks, slot_mapping=NS(gpu=slots)))
         tables.append(tuple(groups))
     obj = NS(
-        layerwise_prefill_p_node=True,
-        layerwise_prefill_bank_count=banks,
+        layerwise_prefill_p_node=True, layerwise_prefill_bank_count=banks,
         input_batch=NS(layerwise_prefill_block_tables=tables, block_table=tables[0]),
-        pcp_size=1,
-        use_cp=False,
-        device="cpu",
+        pcp_size=1, use_cp=False, device="cpu",
         model_config=NS(enable_return_routed_experts=False),
     )
-    request_phases = np.array(phases, dtype=np.int32)
-    token_phases = np.repeat(request_phases, 2)
-    get = namespace["make"](obj, [NS(kv_cache_spec=object())] * 2, request_phases, token_phases)
+    get = namespace["make"](obj, [NS(kv_cache_spec=object())] * 2)
     for group in range(2):
-        for logical_bank in range(banks):
-            blocks, slots = get(group, logical_bank)
-            expected_blocks = torch.tensor(
-                [
-                    [10000 * group + 100 * ((logical_bank + phase) % banks) + row * 2 + col for col in range(2)]
-                    for row, phase in enumerate(phases)
-                ]
-            )
-            expected_slots = torch.tensor(
-                [
-                    10000 * group + 1000 * ((logical_bank + int(phase)) % banks) + row
-                    for row, phase in enumerate(token_phases)
-                ]
-            )
-            assert torch.equal(blocks[:3], expected_blocks)
-            assert torch.equal(slots[:6], expected_slots)
-            assert blocks[3].tolist() == [0, 0]
-            assert slots[6:].tolist() == [-1, -1]
-            cached = get(group, logical_bank)
+        for bank in range(banks):
+            blocks, slots = get(group, bank)
+            want_blocks, want_slots = expected[bank, group]
+            assert torch.equal(blocks[:2], want_blocks[:2])
+            assert torch.equal(slots[:4096], want_slots[:4096])
+            assert blocks[2].tolist() == [0, 0]
+            assert slots[4096:].tolist() == [-1] * 4
+            cached = get(group, bank)
             assert cached[0] is blocks and cached[1] is slots
