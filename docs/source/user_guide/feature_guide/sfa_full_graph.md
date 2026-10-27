@@ -79,6 +79,23 @@ Synthetic warmup/capture sequence lengths are bounded by `max_model_len` and
 both KV groups' logical block-table capacities. The 6144-token workspace
 heuristic is not a minimum context length; live request lengths are unchanged.
 
+The startup stream-budget estimate counts two target root layouts per request
+bucket, plus a captured retrieval stream per layout when shared retrieval overlap
+is enabled. It retains the conservative draft-layer-plus-one allowance, including
+for an eager draft, and the existing communication factors and global reserve.
+The original staged path still uses its per-layer graph estimate. This removes
+the old four-bucket software restriction for the 78-layer MoE/MTP TP4/DP4 setup;
+it does not guarantee that every size admitted by the estimate fits CANN's actual
+stream/event resources or HBM. Graph-memory profiling and capture errors remain
+authoritative. Keep `PIECEWISE` in the compilation configuration.
+
+For `max-num-seqs=16`, eight request buckets `2,4,6,8,10,12,14,16` are a qualification
+candidate, not a new default. With one MTP token they capture 4 through 32 tokens
+and 16 target root graphs. Validate 5, 6 and then 8 buckets on the deployment's
+CANN stack, including every bucket's replay, mixed/idle DP ranks, output parity
+and graph memory. A worker restart is required; this accounting change needs no
+native-extension rebuild.
+
 ## Execution contract
 
 1. Before forward, LMCache resolves the request, acquires source ownership,
