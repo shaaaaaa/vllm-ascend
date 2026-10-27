@@ -151,6 +151,13 @@ class SFARemapBoundaryBuffer:
             else int(frontier)
             for request, frontier in zip(self._requests, frontiers)
         }
+        # A boundary inside the compact scratch reservation would alias live KV.
+        # Fall back to the resident sentinel for those requests, matching
+        # _dsa_remap_frontier and the staged dummy boundary policy.
+        boundaries = {
+            request: (0 if 0 < value < scratch_capacity else value)
+            for request, value in boundaries.items()
+        }
         # Resident rows select no external KV, regardless of query width.
         # Recheck on every frontier change, even when the row layout is cached.
         if self._wide_requests and any(boundaries[r] != 0 for r in self._wide_requests):
@@ -158,7 +165,5 @@ class SFARemapBoundaryBuffer:
         values = tuple(prompts[i] if row < 0 else boundaries[row] for i, row in enumerate(rows))
         if values == self._values:
             return
-        if any(value != 0 and value < scratch_capacity for value in boundaries.values()):
-            raise RuntimeError("SFA request-union scratch would alias live KV positions")
         # A failed/partial copy must not leave the previous cache entry usable.
         self._commit(values)

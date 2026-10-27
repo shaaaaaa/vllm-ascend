@@ -485,6 +485,14 @@ def _update_dsa_split_boundary_in_place(
                 )
             else:
                 request_boundaries[:] = window_starts
+            scratch_capacity = getattr(
+                attn_metadata, "decode_scratch_capacity", None
+            )
+            if scratch_capacity is not None:
+                request_boundaries[
+                    (request_boundaries != 0)
+                    & (request_boundaries < int(scratch_capacity))
+                ] = 0
         boundary_cpu[:num_rows][valid_rows] = request_boundaries[
             row_req_indices[valid_rows]
         ]
@@ -677,6 +685,33 @@ def _prepare_sfa_remap_boundary(
                 row_req_indices_np[rows_with_dynamic_boundary]
             ]
         )
+
+    if is_dummy_run or decode_window_size > 0:
+        # Staged dummy metadata uses a synthetic boundary prepared by the
+        # worker.  A short sequence cannot reserve the complete compact
+        # scratch region, so it must remain resident (boundary 0).  The same
+        # rule applies to a live decode-window boundary: a rounded partial
+        # window inside scratch would alias the live cache.  For example,
+        # MTP=2, index_topk=2048, window=1024, seq_len=4096 produces 3072.
+        scratch_capacity = getattr(attn_metadata, "decode_scratch_capacity", None)
+        if scratch_capacity is not None and int(index_topk) > 0:
+            scratch_capacity = int(scratch_capacity)
+            if is_dummy_run:
+                query_width = max(1, scratch_capacity // int(index_topk))
+                dummy_history_lengths = np.maximum(
+                    seq_lens.astype(np.int64, copy=False) - query_width,
+                    0,
+                )
+                short_requests = dummy_history_lengths < scratch_capacity
+                short_rows = valid_rows.copy()
+                short_rows[valid_rows] = short_requests[
+                    row_req_indices_np[valid_rows]
+                ]
+                boundary_rows[short_rows] = 0
+            else:
+                short_rows = valid_rows & (boundary_rows != 0)
+                short_rows &= boundary_rows < scratch_capacity
+                boundary_rows[short_rows] = 0
 
     _validate_dsa_scratch_capacity(
         boundary_rows,

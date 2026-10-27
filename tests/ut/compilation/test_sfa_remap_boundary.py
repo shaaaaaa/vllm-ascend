@@ -115,6 +115,32 @@ def test_mode_handoff_invalidates_shadow_before_external_write(original):
     assert buffer.upload_count == 2
 
 
+@pytest.mark.parametrize(
+    ("seq_len", "expected"),
+    [(4096, 0), (4097, 0), (4098, 4096), (8194, 8192)],
+)
+def test_short_dummy_window_boundaries_use_resident_sentinel(original, seq_len, expected):
+    prepare, config = original
+    config.window = 1024
+    buffer = remap.SFARemapBoundaryBuffer(torch.zeros(2, dtype=torch.int32))
+    item = metadata([0, 0], [0, 0], [seq_len], buffer)
+
+    prepare(item, None, is_dummy_run=True, index_topk=2048)
+
+    assert item.decode_remap_boundary.tolist() == [expected, expected]
+
+
+def test_live_window_boundary_below_scratch_uses_resident_sentinel(original):
+    prepare, config = original
+    config.window = 1024
+    buffer = remap.SFARemapBoundaryBuffer(torch.zeros(2, dtype=torch.int32))
+    item = metadata([0, 0], [0, 0], [4096], buffer)
+
+    prepare(item, None, is_dummy_run=False, index_topk=2048, cached_tokens=(4096,))
+
+    assert item.decode_remap_boundary.tolist() == [0, 0]
+
+
 def test_frontier_shrink_padding_prompts_and_capacity_switches():
     buffer = remap.SFARemapBoundaryBuffer(torch.zeros(4, dtype=torch.int32))
     buffer.update([0, 0, 1, -1], [10000] * 4, [15000, 17000], (12288, 16384), 256, 2048, 4096)
