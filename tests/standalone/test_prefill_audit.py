@@ -107,3 +107,74 @@ def test_remote_archive_and_refresh_are_limited_to_audit_files(tmp_path, monkeyp
     first = tool.collect_host(args, "root@10.0.0.1")
     second = tool.collect_host(args, "root@10.0.0.1")
     assert first == second and (second / "audit-1.jsonl").read_text() == '{"v":1}\n'
+
+
+def test_batch_checks_normal_and_suspicious_outputs_with_one_index(tmp_path, monkeypatch):
+    write_rows(tmp_path)
+    clients = [
+        dict(request_id="client-1", response_id="request-1", session_id=0, round=1, priority="unflagged"),
+        dict(request_id="client-2", response_id="request-2", session_id=1, round=1, priority="repeated_output"),
+    ]
+    real_index, indexes = tool.AuditEvidence, []
+
+    def once(roots):
+        indexes.append(roots)
+        return real_index(roots)
+
+    monkeypatch.setattr(tool, "AuditEvidence", once)
+    output = tmp_path / "output"
+    output.mkdir()
+    report = tool.analyze_many([tmp_path], clients, [], output)
+    assert len(indexes) == 1
+    assert report["request_count"] == 2
+    assert report["requests"][0]["audit_status"] == "samples_consistent"
+    assert report["requests"][1]["audit_status"] == "incomplete"
+    assert len(list((output / "requests").glob("*.json"))) == 2
+    assert (output / "requests.csv").exists()
+
+
+def test_batch_never_silently_drops_missing_response_id(tmp_path):
+    client = dict(request_id="only-client-id", session_id=0, round=1)
+    report = tool.analyze_many([], [client], [], tmp_path)
+    assert report["request_count"] == 1
+    assert report["requests"][0]["gaps"]["missing_response_id_in_client_log"] == 1
+
+
+def test_shared_direct_readback_index_is_not_consumed_by_previous_report(tmp_path):
+    rows = [
+        dict(kind="payload", stage="put", keys=["key"], samples=[[64, "aaaa"]], host="P", pid=1),
+        dict(kind="direct_npu", req="request", keys=["key"], host="D", pid=2),
+        dict(kind="payload", stage="get_npu", req="request", keys=["key"], samples=[[64, "aaaa"]], host="D", pid=2),
+    ]
+    (tmp_path / "audit-1.jsonl").write_text("\n".join(json.dumps(row) for row in rows))
+    evidence = tool.AuditEvidence([tmp_path])
+    first = tool.analyze([], "request", evidence=evidence)
+    assert first == tool.analyze([], "request", evidence=evidence)
+    assert first["status"] == "samples_consistent"
+
+
+def test_batch_request_matching_includes_multi_request_bank_records(tmp_path):
+    row = dict(kind="protocol", reqs=["client-a", "client-b"], error="wrong_load_wait")
+    (tmp_path / "audit-1.jsonl").write_text(json.dumps(row))
+    report = tool.analyze([tmp_path], "client-b")
+    assert report["first_issue"]["error"] == "wrong_load_wait"
+
+
+def test_batch_cli_keeps_every_request(tmp_path, monkeypatch):
+    write_rows(tmp_path)
+    log = tmp_path / "client.log"
+    log.write_text(
+        "\n".join(
+            "[MULTI_TURN] "
+            + json.dumps(dict(request_id=f"client-{i}", response_id=f"request-{i}", session_id=i, round=1))
+            for i in (1, 2)
+        )
+    )
+    output = tmp_path / "reports"
+    monkeypatch.setattr(
+        sys, "argv", ["prefill_audit.py", "--client-log", str(log), "--local", str(tmp_path), "--output", str(output)]
+    )
+    assert tool.main() == 1  # Request 2 has no captured data, rather than silently passing.
+    report = json.loads((output / "report.json").read_text())
+    assert report["request_count"] == 2
+    assert {row["request_id"] for row in report["requests"]} == {"request-1", "request-2"}
