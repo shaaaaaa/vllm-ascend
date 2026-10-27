@@ -74,13 +74,16 @@ def analyze(roots: list[Path], request_id: str | None = None) -> dict:
         keys = {key for row in rows for key in row.get("keys", ())}
 
     puts, gets = defaultdict(set), defaultdict(set)
+    direct_samples = defaultdict(list)
     for row in rows:
         if row.get("kind") != "payload":
             continue
+        if row["stage"] == "get_npu":
+            direct_samples[row.get("host"), row.get("pid"), row.get("req")].append(set(row["keys"]))
         for key, sample in zip(row["keys"], row["samples"]):
             if row["stage"] == "put":
                 puts[key].add(tuple(sample))
-            elif row["stage"] == "get":
+            elif row["stage"] in ("get", "get_npu"):
                 gets[key].add(tuple(sample))
     issues, gaps = [], Counter()
     compared, stages = 0, Counter()
@@ -102,13 +105,23 @@ def analyze(roots: list[Path], request_id: str | None = None) -> dict:
             )
         if row["kind"] == "coverage":
             gaps[row.get("detail", row.get("error", "unknown"))] += 1
+        if row["kind"] == "direct_npu":
+            observed = direct_samples[row.get("host"), row.get("pid"), row.get("req")]
+            expected_keys = set(row.get("keys", ()))
+            match = next(
+                (i for i, sample in enumerate(observed) if expected_keys and expected_keys.issubset(sample)), None
+            )
+            if match is None:
+                gaps["direct_npu_payload_not_sampled"] += 1
+            else:
+                observed.pop(match)
         if row["kind"] != "payload":
             continue
         stages[row["stage"]] += len(row["keys"])
         for key, sample in zip(row["keys"], row["samples"]):
-            if key not in keys or row["stage"] not in ("get", "cache_read"):
+            if key not in keys or row["stage"] not in ("get", "get_npu", "cache_read"):
                 continue
-            expected = puts[key] if row["stage"] == "get" else (gets[key] or puts[key])
+            expected = puts[key] if row["stage"] in ("get", "get_npu") else (gets[key] or puts[key])
             if not expected:
                 gaps["missing_source_sample"] += 1
                 continue
@@ -141,7 +154,10 @@ def analyze(roots: list[Path], request_id: str | None = None) -> dict:
         first_issue=issues[0] if issues else None,
         gaps=dict(gaps),
         details=issues[:20],
-        scope="Sampled CPU byte streams and host-side bank protocol only; no NPU tensor or graph correctness verdict.",
+        scope=(
+            "Sampled CPU/direct-NPU transfer bytes and host-side bank protocol; "
+            "no model arithmetic or graph correctness verdict."
+        ),
     )
 
 

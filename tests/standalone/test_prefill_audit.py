@@ -63,6 +63,24 @@ def test_missing_and_partial_evidence_is_not_a_pass(tmp_path):
     assert tool.analyze([tmp_path])["gaps"]["incomplete_json_line"] == 1
 
 
+def test_direct_npu_gap_requires_an_actual_matching_readback(tmp_path):
+    rows = [
+        dict(kind="payload", stage="put", keys=["key"], samples=[[64, "aaaa"]], host="P", pid=1),
+        dict(kind="direct_npu", req="request", keys=["key"], host="D", pid=2),
+    ]
+    path = tmp_path / "audit-1.jsonl"
+    path.write_text("\n".join(json.dumps(row) for row in rows))
+    assert tool.analyze([tmp_path], "request")["status"] == "incomplete"
+    rows.append(
+        dict(kind="payload", stage="get_npu", req="request", keys=["key"], samples=[[64, "aaaa"]], host="D", pid=2)
+    )
+    path.write_text("\n".join(json.dumps(row) for row in rows))
+    assert tool.analyze([tmp_path], "request")["status"] == "samples_consistent"
+    rows[-1]["samples"] = [[64, "bbbb"]]
+    path.write_text("\n".join(json.dumps(row) for row in rows))
+    assert tool.analyze([tmp_path], "request")["first_issue"]["stage"] == "get_npu"
+
+
 def test_remote_archive_and_refresh_are_limited_to_audit_files(tmp_path, monkeypatch):
     source = tmp_path / "source"
     source.mkdir()
@@ -71,9 +89,15 @@ def test_remote_archive_and_refresh_are_limited_to_audit_files(tmp_path, monkeyp
     packed = subprocess.check_output([sys.executable, "-c", tool.REMOTE, str(source)])
     with tarfile.open(fileobj=io.BytesIO(packed), mode="r:gz") as archive:
         assert archive.getnames() == ["audit-1.jsonl"]
-    args = SimpleNamespace(output=tmp_path / "output", audit_dir="/logs/audit",
-                           workspace="/work", container=None, ssh_port=None,
-                           identity_file=None, skip_host_key_check=True)
+    args = SimpleNamespace(
+        output=tmp_path / "output",
+        audit_dir="/logs/audit",
+        workspace="/work",
+        container=None,
+        ssh_port=None,
+        identity_file=None,
+        skip_host_key_check=True,
+    )
 
     def run(_args, _host, _command, **kwargs):
         kwargs["stdout"].write(packed)
