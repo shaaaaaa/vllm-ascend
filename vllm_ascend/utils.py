@@ -67,6 +67,7 @@ _MIN_DP_BUFFER_SIZE = 50
 _MAX_ACL_GRAPH_ENTRIES = 1800
 _ACL_COMMUNICATION_STREAM_RESERVE = 40
 _ACL_CONTEXT_PARALLEL_STREAM_RESERVE = 100
+_SFA_FULL_GRAPH_LAYOUTS = 2  # Uniform and bounded; see _staged_sfa_capture_keys.
 
 
 class StagedSFARouteAction(str, Enum):
@@ -749,13 +750,23 @@ def update_aclgraph_sizes(vllm_config: VllmConfig) -> None:
         num_hidden_layers = get_max_hidden_layers(hf_config)
     parallel_config = vllm_config.parallel_config
 
-    # Calculate maximum supported batch sizes considering model architecture
+    staged_sfa_graph_active = staged_sfa_graph_configured(vllm_config)
+    full_sfa_graph_active = staged_sfa_graph_active and sfa_full_graph_enabled(vllm_config)
+    # Full SFA bypasses the per-layer ACL wrappers inside each root capture.
+    # Budget both root layouts and, conservatively, their captured retrieval
+    # streams. Keep the existing communication factors and global headroom.
     resources_per_graph = num_hidden_layers + 1
+    if full_sfa_graph_active:
+        resources_per_graph = _SFA_FULL_GRAPH_LAYOUTS * (
+            1 + int(envs_ascend.VLLM_ASCEND_SFA_SHARED_RETRIEVAL_OVERLAP)
+        )
     # For suffix decoding, use the suffix path when no draft_model_config is provided.
     if (spec := vllm_config.speculative_config) and (draft := spec.draft_model_config):
         # Use get_total_num_hidden_layers() to correctly handle MTP models,
         # which store layer count in num_nextn_predict_layers or
         # mtp_num_hidden_layers (for Qwen3.5) instead of num_hidden_layers.
+        # Retain this conservative reserve even when the draft runs eagerly.
+        # It also covers the optional draft root graph and its update stream.
         resources_per_graph += draft.get_total_num_hidden_layers() + 1
 
     # TODO: Find out whether we need to take into account the pp_size
@@ -772,12 +783,18 @@ def update_aclgraph_sizes(vllm_config: VllmConfig) -> None:
         num_comm_groups,
     )
 
-    staged_sfa_graph_active = staged_sfa_graph_configured(vllm_config)
     staged_sfa_sizes = staged_sfa_graph_capture_sizes(vllm_config)
     if staged_sfa_graph_active:
         required_entries = len(staged_sfa_sizes) * resources_per_graph
         entry_limit = max_num_batch_sizes * resources_per_graph
         if len(staged_sfa_sizes) > max_num_batch_sizes:
+            if full_sfa_graph_active:
+                raise ValueError(
+                    f"Full SFA capture requests {len(staged_sfa_sizes)} sizes, exceeding the "
+                    f"estimated stream budget of {max_num_batch_sizes} sizes "
+                    f"({resources_per_graph} resource units per size before communication factors). "
+                    "Reduce VLLM_ASCEND_SFA_STAGED_GRAPH_CAPTURE_SIZES."
+                )
             raise ValueError(
                 "Staged SFA capture requires "
                 f"{required_entries} outer graph entries for "
@@ -790,6 +807,18 @@ def update_aclgraph_sizes(vllm_config: VllmConfig) -> None:
             vllm_config,
             list(staged_sfa_sizes),
         )
+        if full_sfa_graph_active:
+            logger.info(
+                "Full SFA token capture sizes %s: %d target layouts per size, "
+                "%d resource units per size including retrieval/draft reserves; "
+                "estimated stream budget=%d sizes. CANN capture and graph-memory "
+                "profiling must still succeed.",
+                list(staged_sfa_sizes),
+                _SFA_FULL_GRAPH_LAYOUTS,
+                resources_per_graph,
+                max_num_batch_sizes,
+            )
+            return
         logger.info(
             "Restricted ACL graph batch sizes to cross-layer staged SFA "
             "keys %s (%d/%d graph entries)",
