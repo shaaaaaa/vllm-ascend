@@ -25,7 +25,7 @@ def planner_api():
 @pytest.mark.parametrize("v2", [False, True])
 @pytest.mark.parametrize("mtp", [1, 2])
 @pytest.mark.parametrize("bounded", [False, True])
-def test_ascend_aot_keeps_group_storage_without_clones(planner_api, mtp, v2, bounded):
+def test_ascend_aot_keeps_group_storage_without_clones(planner_api, mtp, v2, bounded, namespace_suffix=""):
     _, (producer, consumer), group, _ = grouped(planner_api, mtp, bounded)
     ns = dict(
         torch=torch,
@@ -52,7 +52,7 @@ def test_ascend_aot_keeps_group_storage_without_clones(planner_api, mtp, v2, bou
 
     producer.cross_layer_graph_pre = consumer.cross_layer_graph_pre = pre
     ns["_mla_runtime_state"] = lambda name: (producer if name == "producer" else consumer, name, (), None)
-    namespace = f"resident_islands_{mtp}_{int(v2)}_{int(bounded)}"
+    namespace = f"resident_islands_{mtp}_{int(v2)}_{int(bounded)}{namespace_suffix}"
     lib = torch.library.Library(namespace, "DEF")
     lib.define(
         "pre" + torch.library.infer_schema(ns["sfa_forward_pre_shared"], mutates_args=["output", "resident_writes"])
@@ -75,6 +75,7 @@ def test_ascend_aot_keeps_group_storage_without_clones(planner_api, mtp, v2, bou
             "compile_fx",
             "fusion_pass_compile",
             "_reuse_shared_resident_buffers",
+            "_shared_resident_clone_policy",
         },
         compiler,
     )
@@ -102,7 +103,8 @@ def test_ascend_aot_keeps_group_storage_without_clones(planner_api, mtp, v2, bou
 
 def test_regular_graph_is_not_rewritten():
     ns = dict(torch=torch)
-    methods("vllm_ascend/compilation/compiler_interface.py", {"_reuse_shared_resident_buffers"}, ns)
+    methods("vllm_ascend/compilation/compiler_interface.py",
+            {"_reuse_shared_resident_buffers", "_shared_resident_clone_policy"}, ns)
     graph = torch.fx.symbolic_trace(lambda x: x.sin() + x)
     before = str(graph.graph)
     assert not ns["_reuse_shared_resident_buffers"](graph)
@@ -125,9 +127,12 @@ def test_tp4_dp4_piecewise_launcher_selects_ascend_fusion_backend():
         compilation_config=compilation,
         ascend_config=ascend,
         staged_sfa_graph_configured=lambda cfg: True,
+        sfa_full_graph_enabled=lambda cfg: True,
+        sfa_npugraph_ex_requested=False,
         update_aclgraph_sizes=Mock(),
         envs_ascend=NS(VLLM_ASCEND_MTP_DRAFT_DEBUG=False),
-        vllm_config=NS(parallel_config=NS(tensor_parallel_size=4, data_parallel_size=4, all2all_backend="naive")),
+        vllm_config=NS(additional_config={"ascend_compilation_config": {}},
+                       parallel_config=NS(tensor_parallel_size=4, data_parallel_size=4, all2all_backend="naive")),
     )
     exec(
         compile(ast.fix_missing_locations(ast.Module(body=branch.body, type_ignores=[])), "piecewise_setup", "exec"), ns

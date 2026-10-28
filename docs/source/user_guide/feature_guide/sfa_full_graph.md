@@ -96,6 +96,45 @@ CANN stack, including every bucket's replay, mixed/idle DP ranks, output parity
 and graph memory. A worker restart is required; this accounting change needs no
 native-extension rebuild.
 
+## Optional npugraph_ex compilation
+
+Full SFA can explicitly opt in to TorchAir FX optimization while retaining the
+existing root capture/replay and `PIECEWISE` compilation setting:
+
+```json
+{"ascend_compilation_config":{"enable_npugraph_ex":true,"enable_static_kernel":false}}
+```
+
+Merge this into `--additional-config`; the setting is nested, not a top-level
+`enable_npugraph_ex` key. It is off by default for full SFA. Ordinary staged,
+eager and native `FULL_DECODE_ONLY` behavior is unchanged. Restart workers when
+changing it. No native-extension rebuild is needed for this integration.
+
+The new path runs the existing configured fusion/SP passes after AOT, lowers
+only the shared-resident SFA mutation wrapper with its existing copy policy,
+then lets TorchAir finish optimization. The target graph manager, transfer
+events, source ownership and replay paths remain unchanged. An enabled runtime
+must provide `CompilerConfig.post_grad_custom_pre_pass`; missing support fails
+compilation explicitly. A distinct compiler hash separates the new route from
+older compiled artifacts. Static kernels are a separate qualification step;
+start with the setting above.
+
+Before serving, run the installed-backend probe in an NPU container:
+
+```bash
+python -m pytest --noconftest -q tests/e2e/singlecard/compile/test_sfa_npugraph_ex_npu.py
+```
+
+This uses synthetic operators with the SFA mutation schema, the real compiler,
+root capture and `RetrievalEdge`. It checks persistent/aliased buffers and late
+prefetch binding; it is not a GLM accuracy or sparse CPU-to-NPU DMA test. A skipped
+probe is not qualification. Then compare full-SFA off/on on the same server
+branch with identical capture sizes, including uniform/bounded profiles,
+idle/mixed TP/DP/EP ranks, source rebinding, cold loads, checkpoint resumption
+and native prefill/recovery. Check outputs, MTP acceptance, graph memory,
+target-forward time, TTFT, TPOT and throughput. CPU tests do not establish a
+hardware speedup or distributed correctness.
+
 ## Execution contract
 
 1. Before forward, LMCache resolves the request, acquires source ownership,
