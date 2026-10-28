@@ -1153,7 +1153,14 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
         self.attn_mask_builder = AttentionMaskBuilder(self.device)
         self.rope_dim = self.model_config.hf_text_config.qk_rope_head_dim
         self.enable_dsa_cp = enable_dsa_cp()
-        self.dsa_shrink_latent = int(envs.VLLM_ASCEND_DSA_SHRINK_LATENT) if envs.VLLM_ASCEND_DSA_UNBUNDLE else 0
+        # P banks contain the complete prefix of the current layer. A short
+        # prefill tail (or P-side MTP) can have decode-shaped metadata, but must
+        # never acquire the D-node compact-scratch ownership/remapping policy.
+        self.dsa_shrink_latent = (
+            int(envs.VLLM_ASCEND_DSA_SHRINK_LATENT)
+            if envs.VLLM_ASCEND_DSA_UNBUNDLE and not self._layerwise_prefill_p_node
+            else 0
+        )
         if self.dsa_shrink_latent and self.decode_threshold > 2:
             raise ValueError(
                 "staged sparse-index preparation only supports MTP=1 or "
@@ -2175,8 +2182,15 @@ class AscendSFAImpl(MLAAttentionImpl):
             envs.VLLM_ASCEND_ENABLE_DSA_LATENT_OFFLOAD and envs.VLLM_ASCEND_DSA_OFFLOAD_FREE_PAGED
         )
         self.dsa_offload_unbundle = bool(envs.VLLM_ASCEND_DSA_UNBUNDLE)
-        # Step B staging (1 = B2 compact-scratch read; 2 = +B1 freeing).
-        self.dsa_shrink_latent = int(envs.VLLM_ASCEND_DSA_SHRINK_LATENT) if self.dsa_offload_unbundle else 0
+        # Step B staging is a D-node layout (1 = compact scratch; 2 = freeing).
+        # P always waits for its full-prefix bank before cache writes/reads,
+        # including one-token tails and MTP. Applying shrink here would skip
+        # that wait and, for kv_both, remap top-k into an unpopulated D scratch.
+        self.dsa_shrink_latent = (
+            int(envs.VLLM_ASCEND_DSA_SHRINK_LATENT)
+            if self.dsa_offload_unbundle and not self._layerwise_prefill_p_node
+            else 0
+        )
         if self.dsa_shrink_latent and self.decode_threshold > 2:
             raise ValueError(
                 "staged sparse-index preparation only supports MTP=1 or "

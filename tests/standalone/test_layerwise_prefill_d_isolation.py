@@ -35,6 +35,117 @@ def calls(node, name):
     )
 
 
+def initialized_shrink(p_node, configured, *, builder=False, unbundle=True):
+    owner = "AscendSFAMetadataBuilder" if builder else "AscendSFAImpl"
+    init = method("attention/sfa_v1.py", owner, "__init__")
+    assignment = next(
+        node
+        for node in init.body
+        if isinstance(node, ast.Assign)
+        and any(isinstance(target, ast.Attribute) and target.attr == "dsa_shrink_latent" for target in node.targets)
+    )
+    obj = NS(_layerwise_prefill_p_node=p_node, dsa_offload_unbundle=unbundle)
+    execute(
+        [assignment],
+        dict(
+            self=obj,
+            envs=NS(
+                VLLM_ASCEND_DSA_UNBUNDLE=unbundle,
+                VLLM_ASCEND_DSA_SHRINK_LATENT=configured,
+            ),
+        ),
+    )
+    return obj
+
+
+@pytest.mark.parametrize("builder", [False, True])
+@pytest.mark.parametrize("p_node", [False, True])
+@pytest.mark.parametrize("unbundle", [False, True])
+@pytest.mark.parametrize("configured", [0, 1, 2, 3])
+def test_compact_scratch_policy_excludes_only_banked_p(builder, p_node, unbundle, configured):
+    obj = initialized_shrink(p_node, configured, builder=builder, unbundle=unbundle)
+    assert obj.dsa_shrink_latent == (configured if unbundle and not p_node else 0)
+
+
+@pytest.mark.parametrize("mlapo", [False, True])
+@pytest.mark.parametrize("decode_rows", [1, 2, 4])
+def test_p_short_tail_waits_before_reading_and_writing_bank(mlapo, decode_rows):
+    # A 500k prompt's last token, or a P-side MTP batch, can be classified as
+    # decode. Inherit the deployment's SHRINK_LATENT=2, with diagnostics off.
+    obj = initialized_shrink(True, 2)
+    metadata = NS(num_decode_tokens=decode_rows)
+    bank = {"history": "stale", "current": "old"}
+    operations = []
+
+    def wait(layer_name):
+        assert layer_name == "layer.4"
+        operations.append("wait_for_load")
+        bank["history"] = "loaded"
+
+    def cache_write_and_read(**kwargs):
+        # Model the consumer after its device dependency has completed.
+        assert bank["history"] == "loaded", "P consumed its bank before H2D completion"
+        bank["current"] = "new"
+        operations.append("cache_write_and_read")
+        return 1, 2, 3, 4
+
+    namespace = dict(
+        self=obj,
+        attn_metadata=metadata,
+        layer_name="layer.4",
+        wait_for_kv_layer_from_connector=wait,
+        layerwise_kv_trace_enabled=lambda: False,
+    )
+    if mlapo:
+        wrapper = method("attention/sfa_v1.py", "AscendSFAImpl", "_sfa_preprocess_with_mlapo_after_layerwise_wait")
+        execute([wrapper], namespace)
+        obj._sfa_preprocess_with_mlapo = cache_write_and_read
+        namespace[wrapper.name](obj, "layer.4", metadata, None, None, None, None, None, decode_rows)
+    else:
+        forward = method("attention/sfa_v1.py", "AscendSFAImpl", "forward")
+        native = next(
+            node for node in forward.body if isinstance(node, ast.If) and "self.enable_mlapo" in ast.unparse(node.test)
+        )
+        wait_gate = next(
+            node
+            for node in native.orelse
+            if isinstance(node, ast.If)
+            and any(isinstance(n, ast.Name) and n.id == "wait_for_kv_layer_from_connector" for n in ast.walk(node))
+        )
+        execute([wait_gate], namespace)
+        cache_write_and_read()
+    assert operations == ["wait_for_load", "cache_write_and_read"]
+    assert bank["current"] == "new"
+
+
+@pytest.mark.parametrize("p_node,remaps", [(False, True), (True, False)])
+def test_p_does_not_remap_full_bank_topk_to_decode_scratch(p_node, remaps):
+    obj = initialized_shrink(p_node, 2)
+    forward = method("attention/sfa_v1.py", "AscendSFAImpl", "forward")
+    compact = next(
+        node
+        for node in forward.body
+        if isinstance(node, ast.If) and "attn_metadata.need_sparse_lmcache_payload" in ast.unparse(node.test)
+    )
+    # Execute the production dispatch condition; no fake NPU remap implementation.
+    branch = deepcopy(compact)
+    branch.body = ast.parse("selected.append('decode_scratch')").body
+    selected = []
+    execute(
+        [branch],
+        dict(
+            self=obj,
+            selected=selected,
+            attn_metadata=NS(
+                split_boundary=object(),
+                num_decode_tokens=2,
+                need_sparse_lmcache_payload=True,
+            ),
+        ),
+    )
+    assert bool(selected) is remaps
+
+
 @pytest.mark.parametrize("p_node", [False, True])
 def test_mlapo_only_p_enters_the_added_bank_wait_wrapper(p_node):
     forward = method("attention/sfa_v1.py", "AscendSFAImpl", "forward")
@@ -140,7 +251,14 @@ def test_shared_pool_only_p_reuses_layer_tensor_objects(p_node):
     )
     execute([function], ns)
     ns["reshape"](
-        NS(dsa_shared_pool=True, layerwise_prefill_p_node=p_node, use_sparse_c8_indexer=False, _mixed_indexer_c8_names=None, kv_cache_config=NS()), ["layer.0.attn", "layer.1.attn", "layer.1.indexer"]
+        NS(
+            dsa_shared_pool=True,
+            layerwise_prefill_p_node=p_node,
+            use_sparse_c8_indexer=False,
+            _mixed_indexer_c8_names=None,
+            kv_cache_config=NS(),
+        ),
+        ["layer.0.attn", "layer.1.attn", "layer.1.indexer"],
     )
     assert [index for index, _ in records] == ([False, True] if p_node else [False, False, True])
     assert (caches["layer.0.attn"] is caches["layer.1.attn"]) is p_node
