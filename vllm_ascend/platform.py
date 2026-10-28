@@ -45,6 +45,7 @@ from vllm_ascend.utils import (
     is_moe_model,
     refresh_block_size,
     staged_sfa_graph_configured,
+    sfa_full_graph_enabled,
     update_aclgraph_sizes,
     update_cudagraph_capture_sizes,
     is_310p,
@@ -252,6 +253,10 @@ class NPUPlatform(Platform):
 
     @classmethod
     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
+        # Read before AscendCompilationConfig expands its default-true field.
+        sfa_npugraph_ex_requested = bool(
+            vllm_config.additional_config.get("ascend_compilation_config", {}).get("enable_npugraph_ex", False)
+        )
         from vllm_ascend.quantization.utils import maybe_auto_detect_quantization
 
         if vllm_config.model_config is not None:
@@ -427,7 +432,15 @@ class NPUPlatform(Platform):
                     "vllm::sfa_target_layer_diag"
                 )
             update_aclgraph_sizes(vllm_config)
-            ascend_config.ascend_compilation_config.enable_npugraph_ex = False
+            full_sfa = cross_layer_sfa and sfa_full_graph_enabled(vllm_config)
+            ascend_config.ascend_compilation_config.enable_npugraph_ex = full_sfa and sfa_npugraph_ex_requested
+            if full_sfa:
+                # Spawned workers must see the effective choice, not a default
+                # inserted above. Normalization must be idempotent.
+                vllm_config.additional_config["ascend_compilation_config"]["enable_npugraph_ex"] = (
+                    ascend_config.ascend_compilation_config.enable_npugraph_ex
+                )
+                logger.info_once("Full SFA npugraph_ex optimization: %s", sfa_npugraph_ex_requested)
         elif (
             compilation_config.cudagraph_mode == CUDAGraphMode.FULL_DECODE_ONLY
             or compilation_config.cudagraph_mode == CUDAGraphMode.FULL

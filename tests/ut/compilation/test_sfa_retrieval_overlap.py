@@ -403,7 +403,7 @@ def test_each_layer_copies_once_with_layer_specific_values(runtime, active):
 
 @pytest.mark.parametrize("v2", [False, True])
 @pytest.mark.parametrize("shared_storage", [False, True])
-def test_aot_resolves_late_destinations_inside_prefetch_operator(v2, shared_storage):
+def test_aot_resolves_late_destinations_inside_prefetch_operator(v2, shared_storage, namespace_suffix=""):
     import functools
     from torch._dynamo.backends.common import aot_autograd
     from torch._inductor import config
@@ -431,7 +431,7 @@ def test_aot_resolves_late_destinations_inside_prefetch_operator(v2, shared_stor
     ns = {"torch": torch, "_mla_runtime_state": lambda name: (impl, "producer", (), NS())}
     op_fn = extract(ROOT / "vllm_ascend/ops/mla.py", "sfa_forward_post_prefetch", ns)
     fake = extract(ROOT / "vllm_ascend/ops/mla.py", "sfa_forward_post_prefetch_fake", {})
-    namespace = f"prefetch_island_{int(v2)}_{int(shared_storage)}"
+    namespace = f"prefetch_island_{int(v2)}_{int(shared_storage)}{namespace_suffix}"
     lib = torch.library.Library(namespace, "DEF")
     lib.define("post" + torch.library.infer_schema(op_fn, mutates_args=["output"]))
     lib.impl("post", op_fn, "CPU")
@@ -442,7 +442,8 @@ def test_aot_resolves_late_destinations_inside_prefetch_operator(v2, shared_stor
                     select_decomp_table=select_decomp_table, COMPILATION_PASS_KEY="passes",
                     torch=NS(ops=NS(vllm=NS(sfa_forward_post_prefetch=op), higher_order=torch.ops.higher_order)))
     source = ROOT / "vllm_ascend/compilation/compiler_interface.py"
-    for name in ("compile_fx", "_reuse_shared_resident_buffers", "fusion_pass_compile"):
+    for name in ("compile_fx", "_shared_resident_clone_policy",
+                 "_reuse_shared_resident_buffers", "fusion_pass_compile"):
         compiler[name] = extract(source, name, compiler)
     def backend(graph, inputs):
         return compiler["fusion_pass_compile"](graph, inputs, {"passes": lambda g: g}, None)[0]
