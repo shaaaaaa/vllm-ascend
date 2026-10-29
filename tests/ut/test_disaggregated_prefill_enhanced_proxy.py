@@ -369,7 +369,7 @@ class TestEnhancedRemoteFillProxy(unittest.TestCase):
                         "/completions", {"prompt": "x"}, 20000, prefix_anchors=(anchor,),
                     )
                     self.assertEqual((info.prefiller_idx, info.decoder_idx),
-                                     (1, 1) if mode == "valid" else (0, 0))
+                                     (1, 1) if mode == "valid" else ((0, 0) if mode == "epoch" else (1, 0)))
                     self.assertEqual(info.reservation.remote_fill["destination_engine_epoch"],
                                      8 if mode == "epoch" else 7)
                     proxy._release_decoder_reservation(info)
@@ -497,6 +497,7 @@ class TestEnhancedRemoteFillProxy(unittest.TestCase):
         self.assertEqual((anchor, record.prefiller_idx, selected), (full, 1, True))
 
         state.prefillers[1].active_tokens = 10000
+        state.prefillers[1].active_prefill_work = 10000
         state._update_prefiller_priority(1)
         self.assertFalse(
             state.resolve_prefix_affinity(
@@ -831,7 +832,7 @@ class TestEnhancedRemoteFillProxy(unittest.TestCase):
 
         asyncio.run(run())
 
-    def test_remote_fill_selects_decoder_first_and_scrubs_capability(self):
+    def test_remote_fill_reserves_both_before_send_and_scrubs_capability(self):
         state = proxy.ProxyState(
             [("prefiller", 8001)],
             [("decoder", 8002)],
@@ -847,9 +848,9 @@ class TestEnhancedRemoteFillProxy(unittest.TestCase):
             order.append("decoder")
             return original_select_decoder(score, preferred_idx, **kwargs)
 
-        def select_prefiller(score, preferred_idx=None):
+        def select_prefiller(score, preferred_idx=None, **kwargs):
             order.append("prefiller")
-            return original_select_prefiller(score, preferred_idx)
+            return original_select_prefiller(score, preferred_idx, **kwargs)
 
         state.select_decoder = select_decoder
         state.select_prefiller = select_prefiller
@@ -888,7 +889,7 @@ class TestEnhancedRemoteFillProxy(unittest.TestCase):
                 )
             )
 
-        self.assertEqual(order, ["decoder", "prefiller", "send"])
+        self.assertEqual(order, ["prefiller", "decoder", "send"])
         self.assertEqual(info.reservation.dp_rank, 0)
         params = req_data["kv_transfer_params"]
         self.assertNotIn("lmcache.remote_fill", params)
@@ -1016,9 +1017,9 @@ class TestEnhancedRemoteFillProxy(unittest.TestCase):
             order.append("decoder")
             return original_select_decoder(score, preferred_idx, **kwargs)
 
-        def select_prefiller(score, preferred_idx=None):
+        def select_prefiller(score, preferred_idx=None, **kwargs):
             order.append("prefiller")
-            return original_select_prefiller(score, preferred_idx)
+            return original_select_prefiller(score, preferred_idx, **kwargs)
 
         async def send(*args, **kwargs):
             order.append("send")
@@ -1073,6 +1074,8 @@ class TestEnhancedRemoteFillProxy(unittest.TestCase):
 
         response._cleanup()
         response._cleanup()
+        self.assertEqual(state.prefillers[0].active_requests, 0)
+        self.assertEqual(state.decoders[0].active_requests, 0)
         self.assertEqual(state.request_num, 0)
         self.assertEqual(state.prefillers[0].active_kv_cache, 0)
         self.assertEqual(state.decoders[0].active_tokens, 0)
@@ -1483,6 +1486,395 @@ class TestEnhancedRemoteFillProxy(unittest.TestCase):
         self.assertEqual(release_kv.call_count, 1)
         self.assertEqual(release_decoder.call_count, 1)
         self.assertEqual(state.request_num, 0)
+
+
+class TestRequestCountRouting(unittest.TestCase):
+    setUp = TestEnhancedRemoteFillProxy.setUp
+    tearDown = TestEnhancedRemoteFillProxy.tearDown
+
+    def make_state(self):
+        state = proxy.ProxyState(
+            [("p0", 7910), ("p1", 7910)], [("d0", 7920), ("d1", 7920)],
+            enable_remote_lmcache_store=True, enable_prefix_affinity_routing=True,
+        )
+        proxy.proxy_state = state
+        for idx in range(2):
+            _prime_remote_fill(state, decoder_idx=idx, segment=f"d{idx}:12345")
+        return state
+
+    def test_skew_overrides_tokens_and_preference_independently(self):
+        state = self.make_state()
+        state.prefillers[0].active_requests = 12
+        state.prefillers[1].active_requests = 4
+        state.prefillers[0].active_prefill_work = 1200
+        state.prefillers[1].active_prefill_work = 400
+        state.decoders[0].active_requests = 4
+        state.decoders[1].active_requests = 12
+        state.prefillers[1].active_tokens = state.decoders[0].active_tokens = 10000
+        state._update_prefiller_priority(1)
+        state._update_decoder_priority(0)
+        p = state.select_prefiller(100, preferred_idx=0)
+        d = state.select_decoder(100, preferred_idx=1, prefiller_idx=p)
+        self.assertEqual((p, d), (1, 0))
+        self.assertEqual(state.prefillers[p].active_requests, 5)
+        self.assertEqual(state.decoders[d].active_requests, 5)
+        state.release_prefiller(p, 100)
+        state.release_prefiller_kv(p, 100)
+        state.release_decoder(d, 100)
+        self.assertEqual(state.prefillers[p].active_requests, 4)
+        self.assertEqual(state.decoders[d].active_requests, 4)
+
+    def test_similar_counts_keep_existing_preference_and_token_scores(self):
+        state = self.make_state()
+        for servers in (state.prefillers, state.decoders):
+            servers[0].active_requests, servers[1].active_requests = 4, 5
+        self.assertEqual(state.select_prefiller(100, preferred_idx=1), 1)
+        self.assertEqual(state.select_decoder(100, preferred_idx=1), 1)
+        state.release_prefiller(1, 100)
+        state.release_decoder(1, 100)
+        state.prefillers[0].active_tokens = state.decoders[0].active_tokens = 10000
+        state.prefillers[0].active_prefill_work = 10000
+        state._update_prefiller_priority(0)
+        state._update_decoder_priority(0)
+        self.assertEqual(state.select_prefiller(100), 1)
+        self.assertEqual(state.select_decoder(100), 1)
+
+    def test_disabled_count_policy_keeps_token_routing(self):
+        state = self.make_state()
+        state.request_count_slack = -1
+        state.prefillers[0].active_requests = state.decoders[0].active_requests = 12
+        self.assertEqual(state.select_prefiller(100, preferred_idx=0), 0)
+        self.assertEqual(state.select_decoder(100, preferred_idx=0), 0)
+
+    def test_priority_updates_keep_minimum_at_heap_root(self):
+        state = proxy.ProxyState([(f"p{i}", 7910) for i in range(3)], [(f"d{i}", 7920) for i in range(3)])
+        proxy.proxy_state = state
+        for name, servers, select in (
+            ("prefiller_heap", state.prefillers, state.select_prefiller),
+            ("decoder_heap", state.decoders, state.select_decoder),
+        ):
+            for server, score in zip(servers, (1, 4, 2)):
+                server.active_tokens = score
+                server.active_prefill_work = score
+            setattr(state, name, [(s.active_tokens, i, i, s) for i, s in enumerate(servers)])
+            self.assertEqual(select(100), 0)
+            heap = getattr(state, name)
+            self.assertEqual(heap[0][0], min(entry[0] for entry in heap))
+
+    def test_tainted_low_count_server_is_not_selected(self):
+        state = self.make_state()
+        state.prefillers[0].active_requests = state.decoders[0].active_requests = 12
+        state._taint_prefillers([state.prefillers[1]])
+        state._taint_decoders([state.decoders[1]])
+        self.assertEqual(state.select_prefiller(100), 0)
+        self.assertEqual(state.select_decoder(100), 0)
+
+    def test_rank_counts_include_zero_score_and_survive_discovery(self):
+        state = self.make_state()
+        d = state.decoders[0]
+        d.decoder_remote_fill[1] = {**d.decoder_remote_fill[0], "api_dp_rank": 1}
+        d.decoder_rank_active_tokens = {0: 0.0, 1: 10000.0}
+        d.decoder_rank_active_requests = {0: 12, 1: 4}
+        idx = state.select_decoder(0, preferred_idx=0)
+        reservation = state.assign_decoder_rank(proxy.DecoderReservation(d, idx, 0), 0)
+        self.assertEqual(reservation.dp_rank, 1)
+        self.assertEqual(d.decoder_rank_active_requests, {0: 12, 1: 5})
+        with patch.object(proxy, "_discover_decoder_remote_fill", return_value={0: d.decoder_remote_fill[0]}):
+            asyncio.run(state._refresh_decoder_remote_fill(d))
+        self.assertEqual(d.decoder_rank_active_requests[1], 5)
+        state.release_decoder(idx, 0, 1)
+        self.assertEqual(d.decoder_rank_active_requests[1], 4)
+
+    def test_readded_endpoint_uses_outstanding_counts(self):
+        state = self.make_state()
+        state.prefillers[0].active_requests = state.decoders[0].active_requests = 12
+        state.prefillers[1].active_requests = state.decoders[1].active_requests = 4
+        state.prefillers[0].active_prefill_work = 1200
+        state.prefillers[1].active_prefill_work = 400
+        state._taint_prefillers([state.prefillers[0]])
+        state._taint_decoders([state.decoders[0]])
+        replacements = [proxy.ServerState("p0", 7910), proxy.ServerState("d0", 7920)]
+        try:
+            state.add_prefillers([replacements[0]])
+            state.add_decoders([replacements[1]])
+            self.assertEqual(state.select_prefiller(100), 1)
+            self.assertEqual(state.select_decoder(100), 1)
+        finally:
+            async def close():
+                await asyncio.gather(*(s.client.aclose() for s in replacements))
+            asyncio.run(close())
+
+    def test_affinity_is_initialized_once_until_epoch_changes(self):
+        state = self.make_state()
+        anchor = proxy.PrefixAffinityAnchor("prefix", 20000)
+        def reservation(idx):
+            return proxy.DecoderReservation(
+                state.decoders[idx], idx, 100, dp_rank=0,
+                preferred_segment=f"d{idx}:12345", remote_fill={"destination_engine_epoch": 7},
+            )
+        state.record_prefix_affinity((anchor,), 20000, 0, reservation(0), 20000)
+        original = state.prefix_affinity[anchor.key]
+        self.assertIsNone(state.record_prefix_affinity((anchor,), 20000, 1, reservation(1), 10000))
+        self.assertIs(state.prefix_affinity[anchor.key], original)
+        state.decoders[0].decoder_remote_fill[0]["destination_engine_epoch"] = 8
+        state.record_prefix_affinity((anchor,), 20000, 1, reservation(1), 10000)
+        self.assertEqual(state.prefix_affinity[anchor.key].decoder_idx, 1)
+
+    def test_prefill_failure_releases_both_roles(self):
+        state = self.make_state()
+        for failure in (RuntimeError("prefill failed"), SimpleNamespace(json=lambda: {})):
+            with self.subTest(failure=failure):
+                send = (AsyncMock(side_effect=failure) if isinstance(failure, Exception)
+                        else AsyncMock(return_value=failure))
+                with patch.object(proxy, "send_request_to_service", send), self.assertRaises(RuntimeError):
+                    asyncio.run(proxy._handle_select_instance("/completions", {"prompt": "x"}, 0))
+                self.assertTrue(all(s.active_requests == 0 for s in state.prefillers + state.decoders))
+                self.assertTrue(all(d.decoder_rank_active_requests.get(0, 0) == 0 for d in state.decoders))
+
+    def test_request_count_slack_cli(self):
+        for value in ("-1", "0", "2"):
+            with self.subTest(value=value), patch("sys.argv", ["proxy", "--request-count-slack", value]):
+                self.assertEqual(proxy.parse_args().request_count_slack, int(value))
+        with patch("sys.argv", ["proxy", "--request-count-slack", "-2"]), self.assertRaises(SystemExit):
+            proxy.parse_args()
+
+    def test_burst_reserves_before_prefill_and_cancellation_releases_counts(self):
+        state = self.make_state()
+        async def run():
+            all_sent, finish = asyncio.Event(), asyncio.Event()
+            choices = []
+            async def send(client, p, *args, **kwargs):
+                choices.append((p, kwargs["remote_fill_handoff"]["control_endpoint"]))
+                if len(choices) == 8:
+                    all_sent.set()
+                await finish.wait()
+                return _prefill_reply(kwargs["remote_fill_handoff"])
+            with patch.object(proxy, "send_request_to_service", side_effect=send):
+                tasks = [asyncio.create_task(proxy._handle_select_instance(
+                    "/completions", {"prompt": "x"}, 100,
+                )) for _ in range(8)]
+                try:
+                    await asyncio.wait_for(all_sent.wait(), 2)
+                    self.assertEqual([p.active_requests for p in state.prefillers], [4, 4])
+                    self.assertEqual([d.active_requests for d in state.decoders], [4, 4])
+                    self.assertEqual([d.decoder_rank_active_requests[0] for d in state.decoders], [4, 4])
+                    for task in tasks:
+                        task.cancel()
+                    results = await asyncio.gather(*tasks, return_exceptions=True)
+                    self.assertTrue(all(isinstance(result, asyncio.CancelledError) for result in results))
+                    self.assertTrue(all(s.active_requests == 0 for s in state.prefillers + state.decoders))
+                    self.assertTrue(all(d.decoder_rank_active_requests[0] == 0 for d in state.decoders))
+                finally:
+                    for task in tasks:
+                        task.cancel()
+                    await asyncio.gather(*tasks, return_exceptions=True)
+        asyncio.run(run())
+
+    def test_affinity_skew_changes_only_overloaded_role_and_keeps_handoff(self):
+        for overloaded in ("p", "d"):
+            with self.subTest(overloaded=overloaded):
+                state = self.make_state()
+                anchor = proxy.PrefixAffinityAnchor("prefix", 20000)
+                original = proxy.DecoderReservation(
+                    state.decoders[0], 0, 100, dp_rank=0, preferred_segment="d0:12345",
+                    remote_fill={"destination_engine_epoch": 7},
+                )
+                state.record_prefix_affinity((anchor,), 20000, 0, original, 20000)
+                servers = state.prefillers if overloaded == "p" else state.decoders
+                servers[0].active_requests, servers[1].active_requests = 12, 4
+                if overloaded == "p":
+                    servers[0].active_prefill_work, servers[1].active_prefill_work = 1200, 400
+                async def send(client, p, *args, overloaded=overloaded, state=state, **kwargs):
+                    expected = 0 if overloaded == "p" else 1
+                    self.assertEqual(kwargs["preferred_mooncake_segment"], f"d{expected}:12345")
+                    self.assertEqual(state.prefillers[p].active_requests, 5 if overloaded == "p" else 1)
+                    return _prefill_reply(kwargs["remote_fill_handoff"], end=20000)
+                with patch.object(proxy, "send_request_to_service", side_effect=send):
+                    info = asyncio.run(proxy._handle_select_instance(
+                        "/completions", {"prompt": "x"}, 20000, prefix_anchors=(anchor,),
+                    ))
+                self.assertEqual((info.prefiller_idx, info.decoder_idx), (1, 0) if overloaded == "p" else (0, 1))
+                self.assertEqual(state.prefix_affinity[anchor.key].decoder_idx, 0)
+                self.assertEqual(info.reservation.preferred_segment, f"d{info.decoder_idx}:12345")
+                proxy._release_decoder_reservation(info)
+                proxy._release_decoder_reservation(info)
+                state.release_prefiller_kv(info.prefiller_idx, info.prefiller_score)
+                self.assertEqual([s.active_requests for s in servers], [12, 4])
+                self.tearDown()
+
+
+class TestPrefillWorkRouting(unittest.TestCase):
+    make_state = TestRequestCountRouting.make_state
+    tearDown = TestEnhancedRemoteFillProxy.tearDown
+
+    def setUp(self):
+        TestEnhancedRemoteFillProxy.setUp(self)
+        proxy.global_args.use_original_lb = False
+        clients = patch.object(proxy.httpx, "AsyncClient",
+                               side_effect=lambda **kwargs: SimpleNamespace(aclose=AsyncMock()))
+        clients.start()
+        self.addCleanup(clients.stop)
+
+    def learn_prefix(self, state, tokens=100000, idx=0):
+        anchor = proxy.PrefixAffinityAnchor("known", tokens)
+        reservation = proxy.DecoderReservation(
+            state.decoders[idx], idx, 100, dp_rank=0, preferred_segment=f"d{idx}:12345",
+            remote_fill={"destination_engine_epoch": 7},
+        )
+        state.record_prefix_affinity((anchor,), tokens, idx, reservation, tokens)
+        return anchor
+
+    def test_idle_prefiller_wins_despite_completed_kv_holds(self):
+        state = self.make_state()
+        score = state.calculate_prefill_scores(100000)
+        for _ in range(5):
+            idx = state.select_prefiller(score, preferred_idx=0)
+            state.release_prefiller(idx, score)
+        state.select_prefiller(score, preferred_idx=1)
+        self.assertEqual([p.active_requests for p in state.prefillers], [0, 1])
+        self.assertEqual(state.select_prefiller(score), 0)
+        self.assertAlmostEqual(state.prefillers[0].active_kv_cache, 6 * score)
+
+    def test_known_prefix_work_is_discounted_before_prefill_send(self):
+        state = self.make_state()
+        anchor = self.learn_prefix(state)
+        full = state.calculate_prefill_scores(100000)
+        async def send(client, idx, *args, **kwargs):
+            server = state.prefillers[idx]
+            self.assertLess(server.active_prefill_work, server.active_tokens)
+            self.assertEqual(server.active_tokens, full)
+            self.assertEqual(server.active_kv_cache, full)
+            return _prefill_reply(kwargs["remote_fill_handoff"], 100000)
+        with patch.object(proxy, "send_request_to_service", side_effect=send):
+            info = asyncio.run(proxy._handle_select_instance(
+                "/completions", {"prompt": "x"}, 100000, prefix_anchors=(anchor,),
+            ))
+        self.assertEqual(state.prefillers[info.prefiller_idx].active_prefill_work, 0)
+        self.assertEqual(state.prefillers[info.prefiller_idx].active_kv_cache, full)
+        proxy._release_decoder_reservation(info)
+        state.release_prefiller_kv(info.prefiller_idx, info.prefiller_score)
+
+    def test_partial_hit_keeps_uncached_suffix_and_fixed_cost(self):
+        state = self.make_state()
+        full = state.calculate_prefill_scores(100000)
+        base = state.calculate_prefill_scores(0)
+        for cached, expected_fraction in ((0, 1), (80000, 0.4), (100000, 0.25), (200000, 0.25)):
+            with self.subTest(cached=cached):
+                self.assertAlmostEqual(state.calculate_prefill_work(full, 100000, cached),
+                                       base + (full - base) * expected_fraction)
+        state.prefill_cache_hit_cost_ratio = 1
+        self.assertEqual(state.calculate_prefill_work(full, 100000, 100000), full)
+
+    def test_cold_work_does_not_prefer_fewer_but_expensive_requests(self):
+        state = self.make_state()
+        full = state.calculate_prefill_scores(100000)
+        hit = state.calculate_prefill_work(full, 100000, 100000)
+        state.select_prefiller(full, 0)
+        for _ in range(3):
+            self.assertEqual(state.select_prefiller(full, 1, work_score=hit), 1)
+        self.assertEqual([p.active_requests for p in state.prefillers], [1, 3])
+        self.assertLess(state.prefillers[1].active_prefill_work, state.prefillers[0].active_prefill_work)
+        self.assertEqual(state.select_prefiller(full), 1)
+
+    def test_prefix_affinity_cannot_hide_large_compute_backlog(self):
+        state = self.make_state()
+        full = state.calculate_prefill_scores(100000)
+        hit = state.calculate_prefill_work(full, 100000, 100000)
+        state.select_prefiller(full, 0)
+        self.assertEqual(state.select_prefiller(full, 0, work_score=hit), 1)
+
+    def test_partial_hit_does_not_queue_a_long_suffix_for_small_reuse_benefit(self):
+        state = self.make_state()
+        full = state.calculate_prefill_scores(100000)
+        partial = state.calculate_prefill_work(full, 100000, 30000)
+        state.select_prefiller(full, 0, work_score=full / 2)
+        self.assertEqual(state.select_prefiller(full, 0, work_score=partial), 1)
+
+    def test_out_of_order_work_release_preserves_other_requests_and_kv(self):
+        state = proxy.ProxyState([("p", 7910)], [("d", 7920)])
+        proxy.proxy_state = state
+        for work in (0.1, 100, 0.2):
+            state.select_prefiller(1000, work_score=work)
+        state.release_prefiller(0, 1000, work_score=100)
+        state.release_prefiller_kv(0, 1000)
+        server = state.prefillers[0]
+        self.assertAlmostEqual(server.active_prefill_work, 0.3)
+        self.assertEqual((server.active_requests, server.active_tokens, server.active_kv_cache), (2, 2000, 2000))
+        state.release_prefiller(0, 1000, work_score=0.1)
+        state.release_prefiller(0, 1000, work_score=0.2)
+        self.assertEqual((server.active_requests, server.active_prefill_work, server.active_kv_cache), (0, 0, 2000))
+
+    def test_prefix_discount_requires_current_known_record_and_token_units(self):
+        state = self.make_state()
+        anchor = self.learn_prefix(state)
+        full = state.calculate_prefill_scores(100000)
+        for mode in ("unknown", "stale", "byte_without_analysis", "byte_with_analysis"):
+            with self.subTest(mode=mode):
+                proxy.global_args.use_original_lb = mode.startswith("byte")
+                state.decoders[0].decoder_remote_fill[0]["destination_engine_epoch"] = 7
+                self.learn_prefix(state)
+                selected_anchor = anchor
+                analysis = None
+                if mode == "unknown":
+                    selected_anchor = proxy.PrefixAffinityAnchor("unknown", 100000)
+                elif mode == "stale":
+                    state.decoders[0].decoder_remote_fill[0]["destination_engine_epoch"] = 8
+                elif mode == "byte_with_analysis":
+                    analysis = SimpleNamespace(prompt_tokens=100000, system_tokens=0, tool_tokens=0,
+                                               total_tokens=100000, analysis_time_ms=0)
+                full = state.calculate_prefill_scores(100000)
+                async def send(client, idx, *args, mode=mode, full=full, **kwargs):
+                    work = state.prefillers[idx].active_prefill_work
+                    if mode == "byte_with_analysis":
+                        self.assertLess(work, full)
+                    else:
+                        self.assertEqual(work, full)
+                    return _prefill_reply(kwargs["remote_fill_handoff"], 100000)
+                with patch.object(proxy, "send_request_to_service", side_effect=send):
+                    info = asyncio.run(proxy._handle_select_instance(
+                        "/completions", {"prompt": "x"}, 100000, analysis=analysis,
+                        prefix_anchors=(selected_anchor,),
+                    ))
+                proxy._release_decoder_reservation(info)
+                state.release_prefiller_kv(info.prefiller_idx, info.prefiller_score)
+
+    def test_discounted_work_cleanup_on_failure_and_cancellation(self):
+        state = self.make_state()
+        anchor = self.learn_prefix(state)
+        async def run():
+            entered = asyncio.Event()
+            async def send(*args, **kwargs):
+                entered.set()
+                await asyncio.Future()
+            with patch.object(proxy, "send_request_to_service", side_effect=send):
+                task = asyncio.create_task(proxy._handle_select_instance(
+                    "/completions", {"prompt": "x"}, 100000, prefix_anchors=(anchor,),
+                ))
+                await entered.wait()
+                task.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+        asyncio.run(run())
+        for failure in (RuntimeError("P failed"), SimpleNamespace(json=lambda: {})):
+            send = AsyncMock(side_effect=failure) if isinstance(failure, Exception) else AsyncMock(return_value=failure)
+            with patch.object(proxy, "send_request_to_service", send), self.assertRaises(RuntimeError):
+                asyncio.run(proxy._handle_select_instance(
+                    "/completions", {"prompt": "x"}, 100000, prefix_anchors=(anchor,),
+                ))
+        self.assertTrue(all(p.active_requests == p.active_tokens == p.active_prefill_work == p.active_kv_cache == 0
+                            for p in state.prefillers))
+        self.assertTrue(all(d.active_requests == 0 for d in state.decoders))
+
+    def test_cache_hit_cost_ratio_validation(self):
+        for value in ("0", "-1", "1.1", "nan", "inf"):
+            with self.subTest(value=value), patch("sys.argv", ["proxy", "--prefill-cache-hit-cost-ratio", value]):
+                with self.assertRaises(SystemExit):
+                    proxy.parse_args()
+                with self.assertRaises(ValueError):
+                    proxy.ProxyState([], [], prefill_cache_hit_cost_ratio=float(value))
+        for value in ("0.25", "1"):
+            with patch("sys.argv", ["proxy", "--prefill-cache-hit-cost-ratio", value]):
+                self.assertEqual(proxy.parse_args().prefill_cache_hit_cost_ratio, float(value))
 
 
 if __name__ == "__main__":

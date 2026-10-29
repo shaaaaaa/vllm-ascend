@@ -150,7 +150,8 @@ class ServerState:
         # Original fields (keep same names as original for priority calculation)
         self.active_tokens = 0
         self.active_kv_cache = 0  # Only for prefiller
-        self.active_requests = 0
+        self.active_requests = 0  # Proxy assignments, including queued/reserved work.
+        self.active_prefill_work = 0.0
         self.aborted_requests = set()
         # Enhanced fields for backend metrics feedback
         self.backend_running = 0
@@ -160,6 +161,7 @@ class ServerState:
         self.decoder_placement_discovered_at = 0.0
         self.decoder_placement_last_attempt_at = 0.0
         self.decoder_rank_active_tokens: dict[int, float] = {}
+        self.decoder_rank_active_requests: dict[int, int] = {}
         self.decoder_placement_task: asyncio.Task[None] | None = None
 
     def __eq__(self, other):
@@ -1182,7 +1184,14 @@ class ProxyState:
                  tokenizer_analyzer=None, metrics_aggregator=None, max_model_len=None,
                  vllm_token_counter=None, default_max_tokens=None, override_max_tokens=None,
                  context_length_margin=None, enable_remote_lmcache_store=False,
-                 enable_prefix_affinity_routing=False):
+                 enable_prefix_affinity_routing=False, request_count_slack=1,
+                 prefill_cache_hit_cost_ratio=0.25):
+        if request_count_slack < -1:
+            raise ValueError("request_count_slack must be -1 or nonnegative")
+        if not 0 < prefill_cache_hit_cost_ratio <= 1:
+            raise ValueError("prefill_cache_hit_cost_ratio must be in (0, 1]")
+        self.request_count_slack = request_count_slack
+        self.prefill_cache_hit_cost_ratio = prefill_cache_hit_cost_ratio
         # Original fields
         self.request_num = 0
         self.tainted_prefillers: list[ServerState] = []
@@ -1232,8 +1241,9 @@ class ProxyState:
     def _update_prefiller_priority(self, server_idx: int):
         with self._state_lock:
             server = self.prefillers[server_idx]
-            priority = server.active_tokens + server.active_kv_cache * 0.3
+            priority = server.active_prefill_work
             self.prefiller_heap = [(p, ts, i, s) for p, ts, i, s in self.prefiller_heap if i != server_idx]
+            heapq.heapify(self.prefiller_heap)
             heapq.heappush(self.prefiller_heap, (priority, self._next_timestamp(), server_idx, server))
     
     def _update_decoder_priority(self, server_idx: int):
@@ -1241,6 +1251,7 @@ class ProxyState:
             server = self.decoders[server_idx]
             priority = server.active_tokens
             self.decoder_heap = [(p, ts, i, s) for p, ts, i, s in self.decoder_heap if i != server_idx]
+            heapq.heapify(self.decoder_heap)
             heapq.heappush(self.decoder_heap, (priority, self._next_timestamp(), server_idx, server))
     
     def abort_prefiller_request(self, server_idx: int, request_id):
@@ -1281,27 +1292,76 @@ class ProxyState:
         else:
             # ENHANCED: scaled to avoid huge scores
             return request_length * 0.1
+
+    def calculate_prefill_work(self, full_score: float, prompt_tokens: int, prefix_tokens: int) -> float:
+        """A placement hint discounts work, never promises an actual cache hit."""
+        if prompt_tokens <= 0 or prefix_tokens <= 0:
+            return full_score
+        cached_fraction = min(prefix_tokens, prompt_tokens) / prompt_tokens
+        fixed_cost = self.calculate_prefill_scores(0)
+        return fixed_cost + (full_score - fixed_cost) * (
+            1 - cached_fraction * (1 - self.prefill_cache_hit_cost_ratio)
+        )
     
-    def select_prefiller(self, token_count, preferred_idx: int | None = None):
-        """Select prefiller based on score. Returns idx."""
+    def _request_count_candidates(self, candidates, count):
+        """Keep the existing policy near balance; otherwise use minimum load."""
+        if self.request_count_slack < 0 or len(candidates) < 2:
+            return candidates
+        loads = [count(item) for item in candidates]
+        lowest = min(loads)
+        if max(loads) - lowest <= self.request_count_slack:
+            return candidates
+        return [item for item, load in zip(candidates, loads) if load == lowest]
+
+    def _request_balanced_heap(self, heap, tainted, servers):
+        if self.request_count_slack < 0:
+            return heap
+        healthy = [entry for entry in heap if entry[3] not in tainted]
+        return self._request_count_candidates(
+            healthy or heap, lambda entry: servers[entry[2]].active_requests,
+        )
+
+    def select_prefiller(self, token_count, preferred_idx: int | None = None, *, work_score: float | None = None):
+        """Reserve unfinished P work separately from full-prompt KV holdings."""
         with self._state_lock:
             if not self.prefiller_heap:
                 raise RuntimeError("No prefiller servers available")
             if preferred_idx is not None and not 0 <= preferred_idx < len(self.prefillers):
                 raise IndexError("Preferred prefiller index is out of range")
-            chosen = preferred_idx
-            if chosen is None:
-                chosen = heapq.heappop(self.prefiller_heap)[2]
+            work_score = token_count if work_score is None else work_score
+            candidates = [entry for entry in self.prefiller_heap if entry[3] not in self.tainted_prefillers]
+            candidates = candidates or self.prefiller_heap
+            best = min(candidates, key=lambda entry: (
+                self.prefillers[entry[2]].active_prefill_work,
+                self.prefillers[entry[2]].active_requests,
+                self.prefillers[entry[2]].active_kv_cache, entry[1], entry[2],
+            ))[2]
+            chosen = best
+            # A large uncached suffix must not grant a large affinity queue
+            # allowance. Bound it by both the estimated reuse benefit and work.
+            affinity_slack = min(work_score, max(0.0, token_count - work_score))
+            if any(entry[2] == preferred_idx for entry in candidates) and (
+                self.prefillers[preferred_idx].active_prefill_work
+                <= self.prefillers[best].active_prefill_work + affinity_slack * _PREFIX_AFFINITY_LOAD_SLACK
+            ):
+                chosen = preferred_idx
+            self.prefillers[chosen].active_requests += 1
+            self.prefillers[chosen].active_prefill_work += work_score
             self.prefillers[chosen].active_tokens += token_count
             self.prefillers[chosen].active_kv_cache += token_count
             self._update_prefiller_priority(chosen)
             return chosen
     
-    def release_prefiller(self, idx: int, token_count):
+    def release_prefiller(self, idx: int, token_count, *, work_score: float | None = None):
         """Release prefill phase (prefill completed)."""
         with self._state_lock:
             if idx >= len(self.prefillers):
                 return
+            self.prefillers[idx].active_requests -= 1
+            server = self.prefillers[idx]
+            server.active_prefill_work = max(
+                0.0, server.active_prefill_work - (token_count if work_score is None else work_score),
+            ) if server.active_requests else 0.0
             if self.prefillers[idx].active_tokens >= token_count:
                 self.prefillers[idx].active_tokens -= token_count
             elif self.prefillers[idx].active_tokens > 0:
@@ -1329,16 +1389,18 @@ class ProxyState:
                 raise IndexError("Preferred decoder index is out of range")
             if prefiller_idx is not None and not 0 <= prefiller_idx < len(self.prefillers):
                 raise IndexError("Prefiller pairing index is out of range")
+            candidates = self._request_balanced_heap(self.decoder_heap, self.tainted_decoders, self.decoders)
             chosen = preferred_idx
-            if chosen is None:
+            if not any(entry[2] == chosen for entry in candidates):
                 if prefiller_idx is None:
-                    chosen = heapq.heappop(self.decoder_heap)[2]
+                    chosen = min(candidates)[2]
                 else:
                     prefiller = self.prefillers[prefiller_idx]
-                    chosen = min(self.decoder_heap, key=lambda entry: (
+                    chosen = min(candidates, key=lambda entry: (
                         entry[0], self._pair_last_used.get((prefiller, entry[3]), 0),
                         entry[1], entry[2],
                     ))[2]
+            self.decoders[chosen].active_requests += 1
             self.decoders[chosen].active_tokens += token_count
             self._update_decoder_priority(chosen)
             if prefiller_idx is not None:
@@ -1351,6 +1413,12 @@ class ProxyState:
             if idx >= len(self.decoders):
                 return
             server = self.decoders[idx]
+            server.active_requests -= 1
+            if dp_rank in server.decoder_rank_active_requests:
+                server.decoder_rank_active_requests[dp_rank] -= 1
+                if (server.decoder_rank_active_requests[dp_rank] == 0
+                        and dp_rank not in server.decoder_remote_fill):
+                    server.decoder_rank_active_requests.pop(dp_rank)
             if dp_rank in server.decoder_rank_active_tokens:
                 server.decoder_rank_active_tokens[dp_rank] = max(
                     0.0,
@@ -1376,12 +1444,19 @@ class ProxyState:
             server = reservation.server
             if not server.decoder_remote_fill:
                 return reservation
-            if preferred_dp_rank not in server.decoder_remote_fill:
+            candidates = self._request_count_candidates(
+                list(server.decoder_remote_fill),
+                lambda rank: server.decoder_rank_active_requests.get(rank, 0),
+            )
+            if preferred_dp_rank not in candidates:
                 preferred_dp_rank = min(
-                    server.decoder_remote_fill,
+                    candidates,
                     key=lambda rank: (server.decoder_rank_active_tokens[rank], rank),
                 )
             dp_rank = preferred_dp_rank
+            server.decoder_rank_active_requests[dp_rank] = (
+                server.decoder_rank_active_requests.get(dp_rank, 0) + 1
+            )
             server.decoder_rank_active_tokens[dp_rank] += reservation.decoder_score
             reservation.dp_rank = dp_rank
             remote_fill = server.decoder_remote_fill.get(dp_rank)
@@ -1447,7 +1522,7 @@ class ProxyState:
                 selected = (
                     prefiller not in self.tainted_prefillers
                     and decoder not in self.tainted_decoders
-                    and prefiller.active_tokens + prefiller.active_kv_cache * 0.3
+                    and prefiller.active_prefill_work
                     <= self.prefiller_heap[0][0]
                     + prefiller_score * _PREFIX_AFFINITY_LOAD_SLACK
                     and decoder.active_tokens
@@ -1484,7 +1559,11 @@ class ProxyState:
         if isinstance(epoch, bool) or not isinstance(epoch, int):
             return None
         with self._state_lock:
+            learned_key = None
             for anchor in valid_anchors:
+                existing = self.prefix_affinity.get(anchor.key)
+                if existing is not None and self._affinity_record_is_current(existing):
+                    continue
                 self.prefix_affinity[anchor.key] = PrefixAffinityRecord(
                     prefiller_idx=prefiller_idx,
                     decoder_idx=reservation.decoder_idx,
@@ -1494,9 +1573,11 @@ class ProxyState:
                     local_tokens=min(max(local_tokens, 0), anchor.token_end),
                 )
                 self.prefix_affinity.move_to_end(anchor.key)
+                if learned_key is None:
+                    learned_key = anchor.key
             while len(self.prefix_affinity) > _PREFIX_AFFINITY_CACHE_SIZE:
                 self.prefix_affinity.popitem(last=False)
-        return valid_anchors[0].key
+        return learned_key
 
     def _decoder_placement_is_fresh(self, server: ServerState, now: float) -> bool:
         if server.decoder_placement_discovered_at:
@@ -1530,7 +1611,11 @@ class ProxyState:
             with self._state_lock:
                 for dp_rank in remote_fill:
                     server.decoder_rank_active_tokens.setdefault(dp_rank, 0.0)
+                    server.decoder_rank_active_requests.setdefault(dp_rank, 0)
                 server.decoder_remote_fill = remote_fill
+                for dp_rank, count in list(server.decoder_rank_active_requests.items()):
+                    if dp_rank not in remote_fill and count == 0:
+                        server.decoder_rank_active_requests.pop(dp_rank)
                 for dp_rank, load in list(
                     server.decoder_rank_active_tokens.items()
                 ):
@@ -1729,12 +1814,16 @@ class ProxyState:
             "decoder_heap_size": len(self.decoder_heap),
             "prefiller_token_load": {
                 str(s): {
+                    "active_requests": s.active_requests,
+                    "active_prefill_work": s.active_prefill_work,
                     "active_tokens": s.active_tokens,
                     "active_kv_cache": s.active_kv_cache,
                 } for s in self.prefillers
             },
             "decoder_token_load": {
                 str(s): {
+                    "active_requests": s.active_requests,
+                    "rank_active_requests": dict(s.decoder_rank_active_requests),
                     "active_tokens": s.active_tokens,
                 } for s in self.decoders
             },
@@ -2029,6 +2118,7 @@ async def _handle_select_instance(
     prefix_anchors: tuple[PrefixAffinityAnchor, ...] = (),
 ):
     prefiller_score = proxy_state.calculate_prefill_scores(request_length)
+    prefiller_work_score = prefiller_score
     decoder_score = proxy_state.calculate_decode_scores(request_length)
     known_anchor, known_affinity, affinity_selected = None, None, False
     request_id = await proxy_state.next_req_id()
@@ -2046,37 +2136,41 @@ async def _handle_select_instance(
                     known_anchor, known_affinity, affinity_selected = proxy_state.resolve_prefix_affinity(
                         prefix_anchors, request_length, prefiller_score, decoder_score,
                     )
-                    if not proxy_state.prefiller_heap:
-                        raise RuntimeError("No prefiller servers available")
-                    prefill_choice = (known_affinity.prefiller_idx if affinity_selected
-                                      else proxy_state.prefiller_heap[0][2])
+                    # Explicit prefix hints use token units; byte-based routing
+                    # without tokenizer analysis cannot safely discount them.
+                    prompt_tokens = (analysis.prompt_tokens if analysis is not None
+                                     else (0 if global_args.use_original_lb else request_length))
+                    prefiller_work_score = proxy_state.calculate_prefill_work(
+                        prefiller_score, prompt_tokens, known_anchor.token_end if known_anchor else 0,
+                    )
+                    prefer_p = bool(known_anchor and known_affinity and proxy_state._affinity_is_meaningful(
+                        known_anchor, known_affinity, max(request_length, prefix_anchors[0].token_end),
+                    ))
+                    prefiller_idx = proxy_state.select_prefiller(
+                        prefiller_score, known_affinity.prefiller_idx if prefer_p else None,
+                        work_score=prefiller_work_score,
+                    )
                     decoder_idx = proxy_state.select_decoder(
                         decoder_score, known_affinity.decoder_idx if affinity_selected else None,
-                        prefiller_idx=prefill_choice,
+                        prefiller_idx=prefiller_idx,
                     )
                     decoder = proxy_state.decoders[decoder_idx]
                     reservation = DecoderReservation(decoder, decoder_idx, decoder_score)
                     proxy_state.assign_decoder_rank(
-                        reservation, known_affinity.dp_rank if affinity_selected else None,
+                        reservation, known_affinity.dp_rank if (
+                            affinity_selected and decoder_idx == known_affinity.decoder_idx
+                        ) else None,
                     )
-                    if affinity_selected and (
-                        reservation.dp_rank != known_affinity.dp_rank
-                        or reservation.preferred_segment != known_affinity.preferred_segment
-                        or reservation.remote_fill is None
-                        or reservation.remote_fill.get("destination_engine_epoch")
-                        != known_affinity.destination_engine_epoch
-                    ):
-                        proxy_state.release_decoder(
-                            reservation.decoder_idx, reservation.decoder_score, reservation.dp_rank,
-                        )
-                        reservation = None
-                        affinity_selected = False
-                        prefill_choice = proxy_state.prefiller_heap[0][2]
-                        decoder_idx = proxy_state.select_decoder(decoder_score, prefiller_idx=prefill_choice)
-                        decoder = proxy_state.decoders[decoder_idx]
-                        reservation = DecoderReservation(decoder, decoder_idx, decoder_score)
-                        proxy_state.assign_decoder_rank(reservation)
-                    prefiller_idx = proxy_state.select_prefiller(prefiller_score, prefill_choice)
+                    # Count balancing can override D independently of P. Only
+                    # the actual reserved destination can retain D locality.
+                    affinity_selected = bool(affinity_selected and (
+                        reservation.decoder_idx == known_affinity.decoder_idx
+                        and reservation.dp_rank == known_affinity.dp_rank
+                        and reservation.preferred_segment == known_affinity.preferred_segment
+                        and reservation.remote_fill is not None
+                        and reservation.remote_fill.get("destination_engine_epoch")
+                        == known_affinity.destination_engine_epoch
+                    ))
                     break
         else:
             prefiller_idx = proxy_state.select_prefiller(prefiller_score)
@@ -2102,7 +2196,7 @@ async def _handle_select_instance(
                 else None
             ),
         )
-        proxy_state.release_prefiller(prefiller_idx, prefiller_score)
+        proxy_state.release_prefiller(prefiller_idx, prefiller_score, work_score=prefiller_work_score)
         prefiller_active_released = True
         response_json = response.json()
         if not isinstance(response_json, dict):
@@ -2247,7 +2341,7 @@ async def _handle_select_instance(
             )
         if prefiller_idx is not None:
             if not prefiller_active_released:
-                proxy_state.release_prefiller(prefiller_idx, prefiller_score)
+                proxy_state.release_prefiller(prefiller_idx, prefiller_score, work_score=prefiller_work_score)
             proxy_state.abort_prefiller_request(prefiller_idx, request_id)
             proxy_state.release_prefiller_kv(prefiller_idx, prefiller_score)
         raise
@@ -2635,7 +2729,7 @@ async def _handle_completions(api: str, request: Request):
 
         if proxy_state.enable_prefix_affinity_routing and not prefix_anchors:
             prefix_anchors = _automatic_prefix_affinity_anchors(
-                req_body, request_length
+                req_body, analysis.prompt_tokens if analysis is not None else request_length
             )
         
         instance_info = await _handle_select_instance(
@@ -3205,6 +3299,17 @@ def parse_args():
         help="Enable decoder RemoteFill discovery and direct remote LMCache storage",
     )
     parser.add_argument(
+        "--request-count-slack", type=int, default=1,
+        help=("Keep D affinity/token routing when active request counts differ by at most this value; "
+              "otherwise choose a least-count decoder. Includes prefill reservations. "
+              "Use -1 to disable D count balancing. P uses estimated unfinished work."),
+    )
+    parser.add_argument(
+        "--prefill-cache-hit-cost-ratio", type=float, default=0.25,
+        help=("Estimated cost of known prefix tokens relative to uncached tokens, in (0, 1]. "
+              "Default 0.25 retains load/miss cost; 1 disables the prefix discount."),
+    )
+    parser.add_argument(
         "--enable-prefix-affinity-routing",
         action="store_true",
         help=(
@@ -3254,6 +3359,10 @@ def parse_args():
                              "reject if computed_length * (1 + margin%%) > max_model_len. "
                              "Default 5%% to account for chat template overhead estimation error.")
     args = parser.parse_args()
+    if args.request_count_slack < -1:
+        parser.error("--request-count-slack must be -1 or nonnegative")
+    if not 0 < args.prefill_cache_hit_cost_ratio <= 1:
+        parser.error("--prefill-cache-hit-cost-ratio must be in (0, 1]")
     if len(args.prefiller_hosts) != len(args.prefiller_ports):
         raise ValueError("Number of prefiller hosts must match number of prefiller ports")
     if len(args.decoder_hosts) != len(args.decoder_ports):
@@ -3394,6 +3503,8 @@ async def lifespan(app: FastAPI):
         enable_prefix_affinity_routing=getattr(
             global_args, "enable_prefix_affinity_routing", False
         ),
+        request_count_slack=getattr(global_args, "request_count_slack", 1),
+        prefill_cache_hit_cost_ratio=getattr(global_args, "prefill_cache_hit_cost_ratio", 0.25),
     )
     
     # Enhanced: set metrics aggregator references
