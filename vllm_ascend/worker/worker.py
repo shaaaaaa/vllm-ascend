@@ -940,7 +940,9 @@ class NPUWorker(WorkerBase):
         ep_group = get_ep_group()
         members = {"members": ep_group.ranks} if ep_group.rank_in_group == 0 else {}
         with startup_phase(self, "ep_barrier", ep=ep_group.rank_in_group, n=ep_group.world_size, **members):
-            ep_group.barrier()
+            from vllm_ascend.worker.sfa_agreement import initialize_single_agreement
+
+            initialize_single_agreement(self.model_runner, ep_group)
         if started is not None:
             log_cold_perf_process_event(
                 "decoder_ep_startup_wait_complete",
@@ -999,6 +1001,9 @@ class NPUWorker(WorkerBase):
         # Reset the seed to ensure that the random state is not affected by
         # the model initialization and profiling.
         set_random_seed(self.model_config.seed)
+        single = getattr(self.model_runner, "_sfa_single_agreement", None)
+        if single is not None:
+            single.activate(self.model_runner._sfa_full_graph.entries)
         return self.vllm_config.compilation_config.compilation_time
 
     def _warm_up_atb(self):

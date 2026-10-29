@@ -236,6 +236,9 @@ env_variables: dict[str, Callable[[], Any]] = {
     # SFA and bounded Q1/Q2 requests, including internal TP/DP/EP. Explicit
     # enforce_eager takes precedence (P nodes). Non-sensitive; restart required.
     "VLLM_ASCEND_SFA_FULL_GRAPH": lambda: bool(int(os.getenv("VLLM_ASCEND_SFA_FULL_GRAPH", "0"))),
+    # Experimental: combine stable target batch and preparation agreements.
+    # 0 (default): existing protocol; 1: qualified MP TP x DP. Non-sensitive; restart required.
+    "VLLM_ASCEND_SFA_SINGLE_AGREEMENT": lambda: bool(int(os.getenv("VLLM_ASCEND_SFA_SINGLE_AGREEMENT", "0"))),
     # Experimental device MTP preparation for unchanged full-SFA decode batches.
     # 0 (default): original runner; 1: launch before CPU count reconciliation.
     # Non-sensitive, requires async MTP=1, PP=PCP=DCP=1 and a worker restart.

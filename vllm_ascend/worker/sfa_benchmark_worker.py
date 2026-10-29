@@ -143,6 +143,13 @@ class SFABenchmarkWorker(NPUWorker):
             graph = self.model_runner._sfa_full_graph
             result["root_replays"] = graph.replay_count - self._decode_timing_root_start
             result["source_binding_updates"] = graph.source_binding_count - self._decode_timing_source_start
+            single = getattr(self.model_runner, "_sfa_single_agreement", None)
+            if single is not None:
+                result["single_agreement_since_startup"] = {
+                    "fast_decisions": single.fast_steps,
+                    "slow_decisions": single.slow_steps,
+                    "rollback_agreements": single.rollback_steps,
+                }
             graph_timing = getattr(self, "_graph_phase_timing", None)
             if graph_timing is not None:
                 result["graph_phases"] = graph_timing.report(

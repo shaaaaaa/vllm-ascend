@@ -196,6 +196,11 @@ class SFAFullGraph:
             raise RuntimeError("Full SFA transfer bundle was not registered at startup")
         return self._transfer_bundles[capacity][0]
 
+    def sources_match(self, capacity: int, request_ids: tuple[str, ...], sources: tuple[Any, ...]) -> bool:
+        """Whether the existing graph lease already owns this exact source batch."""
+        binding = self.source_bindings.get(capacity)
+        return binding is not None and binding.matches(request_ids, sources)
+
     def bind_sources(
         self,
         sources: tuple[Any, ...],

@@ -660,6 +660,7 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
         self._staged_sfa_impls: tuple[tuple[str, Any], ...] = ()
         self._staged_sfa_layer_names: tuple[str, ...] = ()
         self._sfa_full_graph = SFAFullGraph()
+        self._sfa_single_agreement = None
         if envs_ascend.VLLM_ASCEND_SFA_SHARED_RETRIEVAL_OVERLAP:
             if not sfa_full_graph_enabled(vllm_config) or not envs_ascend.VLLM_ASCEND_SFA_SHARED_RESIDENT_PLAN:
                 raise ValueError("shared retrieval overlap requires full graphs and shared resident planning")
@@ -2592,7 +2593,9 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
             )
 
             # update global cos, sin
-            update_cos_sin(positions)
+            single = getattr(self, "_sfa_single_agreement", None)
+            if single is None or single.prepared is None:
+                update_cos_sin(positions)
 
         if cold_perf_req_ids:
             log_cold_perf_event(
@@ -2699,9 +2702,9 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
             )
         with (
             record_function_or_nullcontext("forward"),
-            set_ascend_forward_context(
-                attn_metadata,
-                self.vllm_config,
+            self._sfa_forward_context(
+                attn_metadata=attn_metadata,
+                vllm_config=self.vllm_config,
                 num_tokens=num_tokens_padded,
                 num_tokens_across_dp=num_tokens_across_dp,
                 aclgraph_runtime_mode=cudagraph_mode,
@@ -3833,6 +3836,129 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                 "or a peer worker"
             ) from local_error
 
+    def _sfa_forward_context(self, **kwargs):
+        single = getattr(self, "_sfa_single_agreement", None)
+        if single is not None and single.active and self._sfa_full_graph.sealed:
+            return single.forward_context(kwargs)
+        return set_ascend_forward_context(**kwargs)
+
+    def _prepare_single_agreement(self, idle):
+        single = self._sfa_single_agreement
+        if not idle or single.previous is None or not single.previous[1]:
+            return None
+        metadata = single.context_kwargs["attn_metadata"]
+        return single.prepare(self, metadata, None, (), idle=True)
+
+    @staticmethod
+    def _clear_sfa_idle_metadata(metadata):
+        for field_name in ("slot_mapping", "indexer_slot_mapping", "indexer_c8_slot_mapping"):
+            value = getattr(metadata, field_name, None)
+            if value is not None:
+                value.fill_(-1)
+        # Builder-owned extended tables: do not mutate the live
+        # input batch's block table or cached physical ownership.
+        if getattr(metadata, "decode_remap_boundary", None) is not None:
+            metadata.block_table.zero_()
+            metadata.indexer_block_table.zero_()
+            physical_table = getattr(metadata, "indexer_c8_block_table", None)
+            if physical_table is not None:
+                physical_table.zero_()
+            metadata.seq_lens.zero_()
+
+    def _prepare_sfa_full_graph_call(self, graph_kwargs, num_tokens_padded, *, sources=None, agree=True):
+        """Prepare one full-SFA call without submitting model work."""
+        context = get_forward_context()
+        shared_groups = getattr(self, "_shared_resident_groups", ())
+        graph_inputs = {} if context.staged_sfa_graph_dummy_run and not self._sfa_full_graph.sealed else None
+        prepared_call = None
+        if context.cudagraph_runtime_mode != CUDAGraphMode.NONE:
+            impls = self._staged_sfa_impls or self._collect_staged_sfa_impls()
+            local_error = None
+            try:
+                source = ()
+                request_ids = ()
+                if not context.staged_sfa_graph_dummy_run:
+                    request_ids = tuple(self.input_batch.req_ids[: self.input_batch.num_reqs])
+                    source = sources if sources is not None else get_kv_transfer_group().prepare_sparse_graph_step(
+                        self._staged_sfa_layer_names,
+                        request_ids=request_ids,
+                        frontiers=tuple(context.staged_sfa_route.frontiers),
+                    )
+                capacity = context.staged_sfa_graph_key.request_capacity
+                if graph_inputs is not None:
+                    metadata_checks = {}
+                    for name, impl in impls:
+                        graph_inputs[name] = impl.prepare_full_graph_layer(
+                            name,
+                            self.model_config.max_model_len,
+                            bind_source=False,
+                            metadata_checks=metadata_checks,
+                        )
+                    self._sfa_full_graph.register_transfers(
+                        capacity, tuple(impl._full_graph_transfer for _, impl in impls)
+                    )
+                elif context.staged_sfa_graph_dummy_run:
+                    registered = self._sfa_full_graph.get_transfers(capacity)
+                    if len(registered) != len(impls):
+                        raise RuntimeError("Full SFA transfer bundle changed after startup")
+                    metadata_groups = {}
+                    for (name, impl), transfer in zip(impls, registered):
+                        if impl._staged_sfa_capture_state.runtime is None:
+                            raise RuntimeError(f"Full SFA graph layer was not warmed up: {name}")
+                        if impl._full_graph_transfers.get(capacity) is not transfer:
+                            raise RuntimeError("Full SFA transfer bundle changed after startup")
+                        metadata = context.attn_metadata[name]
+                        if id(metadata) not in metadata_groups:
+                            metadata_groups[id(metadata)] = (metadata, impl, [])
+                        metadata_groups[id(metadata)][2].append(name)
+                    for metadata, impl, names in metadata_groups.values():
+                        self._sfa_full_graph.validate_idle_metadata(
+                            names, impl.full_graph_metadata_inputs(metadata)
+                        )
+                        if not agree:
+                            self._clear_sfa_idle_metadata(metadata)
+                        impl.prepare_full_graph_metadata(metadata, context, reuse_dummy=True)
+                else:
+                    self._sfa_full_graph.get_transfers(capacity)
+                    seen = set()
+                    for name, impl in impls:
+                        if impl._staged_sfa_capture_state.runtime is None:
+                            raise RuntimeError(f"Full SFA graph layer was not warmed up: {name}")
+                        metadata = context.attn_metadata[name]
+                        if id(metadata) not in seen:
+                            impl.prepare_full_graph_metadata(metadata, context)
+                            seen.add(id(metadata))
+                if shared_groups:
+                    self._prepare_shared_resident_plans(num_tokens_padded)
+                    if graph_inputs is not None:
+                        graph_inputs["shared_resident_plans"] = {
+                            group.members[0]: tuple(group.writes) for group in shared_groups
+                        }
+                if graph_inputs is not None and getattr(self._sfa_full_graph, "retrieval_overlap", None) is not None:
+                    from vllm_ascend.attention.sfa_v1 import BMM_TRANS_MAX_SUPPORTED_TOKENS
+
+                    self._sfa_full_graph.retrieval_overlap.prepare(
+                        context.staged_sfa_graph_key, impls, shared_groups, BMM_TRANS_MAX_SUPPORTED_TOKENS,
+                    )
+                self._sfa_full_graph.bind_sources(source, request_ids)
+                prepared_call = self._sfa_full_graph.prepare_run(graph_inputs=graph_inputs, **graph_kwargs)
+            except Exception as exc:
+                local_error = exc
+            if agree:
+                self._coordinate_sfa_full_graph_preparation(local_error, context.staged_sfa_graph_dummy_run)
+            elif local_error is not None:
+                raise local_error
+        elif shared_groups:
+            # Eager startup warmup also runs target collectives. Agree on
+            # validation failures before any rank enters the model.
+            local_error = None
+            try:
+                self._prepare_shared_resident_plans(num_tokens_padded)
+            except Exception as exc:
+                local_error = exc
+            self._coordinate_sfa_full_graph_preparation(local_error, context.staged_sfa_graph_dummy_run)
+        return prepared_call
+
     def _model_forward(
         self,
         num_tokens_padded: int,
@@ -3847,8 +3973,6 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
         try:
             context = get_forward_context()
             if envs_ascend.VLLM_ASCEND_SFA_FULL_GRAPH and getattr(context, "staged_sfa_graph_key", None) is not None:
-                graph_inputs = {} if context.staged_sfa_graph_dummy_run and not self._sfa_full_graph.sealed else None
-                prepared_call = None
                 graph_kwargs = dict(
                     input_ids=input_ids,
                     positions=positions,
@@ -3856,90 +3980,13 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                     inputs_embeds=inputs_embeds,
                     **model_kwargs,
                 )
-                if context.cudagraph_runtime_mode != CUDAGraphMode.NONE:
-                    impls = self._staged_sfa_impls or self._collect_staged_sfa_impls()
-                    local_error = None
-                    try:
-                        source = ()
-                        request_ids = ()
-                        if not context.staged_sfa_graph_dummy_run:
-                            request_ids = tuple(self.input_batch.req_ids[: self.input_batch.num_reqs])
-                            source = get_kv_transfer_group().prepare_sparse_graph_step(
-                                self._staged_sfa_layer_names,
-                                request_ids=request_ids,
-                                frontiers=tuple(context.staged_sfa_route.frontiers),
-                            )
-                        capacity = context.staged_sfa_graph_key.request_capacity
-                        if graph_inputs is not None:
-                            metadata_checks = {}
-                            for name, impl in impls:
-                                graph_inputs[name] = impl.prepare_full_graph_layer(
-                                    name,
-                                    self.model_config.max_model_len,
-                                    bind_source=False,
-                                    metadata_checks=metadata_checks,
-                                )
-                            self._sfa_full_graph.register_transfers(
-                                capacity, tuple(impl._full_graph_transfer for _, impl in impls)
-                            )
-                        elif context.staged_sfa_graph_dummy_run:
-                            registered = self._sfa_full_graph.get_transfers(capacity)
-                            if len(registered) != len(impls):
-                                raise RuntimeError("Full SFA transfer bundle changed after startup")
-                            metadata_groups = {}
-                            for (name, impl), transfer in zip(impls, registered):
-                                if impl._staged_sfa_capture_state.runtime is None:
-                                    raise RuntimeError(f"Full SFA graph layer was not warmed up: {name}")
-                                if impl._full_graph_transfers.get(capacity) is not transfer:
-                                    raise RuntimeError("Full SFA transfer bundle changed after startup")
-                                metadata = context.attn_metadata[name]
-                                if id(metadata) not in metadata_groups:
-                                    metadata_groups[id(metadata)] = (metadata, impl, [])
-                                metadata_groups[id(metadata)][2].append(name)
-                            for metadata, impl, names in metadata_groups.values():
-                                self._sfa_full_graph.validate_idle_metadata(
-                                    names, impl.full_graph_metadata_inputs(metadata)
-                                )
-                                impl.prepare_full_graph_metadata(metadata, context, reuse_dummy=True)
-                        else:
-                            self._sfa_full_graph.get_transfers(capacity)
-                            seen = set()
-                            for name, impl in impls:
-                                if impl._staged_sfa_capture_state.runtime is None:
-                                    raise RuntimeError(f"Full SFA graph layer was not warmed up: {name}")
-                                metadata = context.attn_metadata[name]
-                                if id(metadata) not in seen:
-                                    impl.prepare_full_graph_metadata(metadata, context)
-                                    seen.add(id(metadata))
-                        if shared_groups:
-                            self._prepare_shared_resident_plans(num_tokens_padded)
-                            if graph_inputs is not None:
-                                graph_inputs["shared_resident_plans"] = {
-                                    group.members[0]: tuple(group.writes) for group in shared_groups
-                                }
-                        if graph_inputs is not None and getattr(self._sfa_full_graph, "retrieval_overlap", None) is not None:
-                            from vllm_ascend.attention.sfa_v1 import BMM_TRANS_MAX_SUPPORTED_TOKENS
-
-                            self._sfa_full_graph.retrieval_overlap.prepare(
-                                context.staged_sfa_graph_key, impls, shared_groups, BMM_TRANS_MAX_SUPPORTED_TOKENS,
-                            )
-                        self._sfa_full_graph.bind_sources(source, request_ids)
-                        prepared_call = self._sfa_full_graph.prepare_run(graph_inputs=graph_inputs, **graph_kwargs)
-                    except Exception as exc:
-                        local_error = exc
-                    self._coordinate_sfa_full_graph_preparation(
-                        local_error,
-                        context.staged_sfa_graph_dummy_run,
-                    )
-                elif shared_groups:
-                    # Eager startup warmup also runs target collectives. Agree on
-                    # validation failures before any rank enters the model.
-                    local_error = None
-                    try:
-                        self._prepare_shared_resident_plans(num_tokens_padded)
-                    except Exception as exc:
-                        local_error = exc
-                    self._coordinate_sfa_full_graph_preparation(local_error, context.staged_sfa_graph_dummy_run)
+                single = getattr(self, "_sfa_single_agreement", None)
+                if single is not None and single.prepared is not None:
+                    prepared_call = single.prepared.call
+                    if not single.complete:
+                        self._coordinate_sfa_full_graph_preparation(None, context.staged_sfa_graph_dummy_run)
+                else:
+                    prepared_call = self._prepare_sfa_full_graph_call(graph_kwargs, num_tokens_padded)
                 output = self._sfa_full_graph.run(
                     self._run_sfa_full_graph_target,
                     **({"prepared": prepared_call} if prepared_call is not None else graph_kwargs),
@@ -3953,11 +4000,24 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                         "[SFA full graph] first target replay: key=%s layer_transfer_splits=0",
                         context.staged_sfa_graph_key,
                     )
+                if single is not None and single.active and self._sfa_full_graph.sealed:
+                    single.remember(context, graph_kwargs)
                 return output
-            if envs_ascend.VLLM_ASCEND_SFA_FULL_GRAPH:
-                prepare_native_sparse_boundaries(self._staged_sfa_impls, context.attn_metadata)
-            if shared_groups:
-                self._prepare_shared_resident_plans(num_tokens_padded)
+            single = getattr(self, "_sfa_single_agreement", None)
+            local_error = None
+            try:
+                if envs_ascend.VLLM_ASCEND_SFA_FULL_GRAPH:
+                    prepare_native_sparse_boundaries(self._staged_sfa_impls, context.attn_metadata)
+                if shared_groups:
+                    self._prepare_shared_resident_plans(num_tokens_padded)
+            except Exception as exc:
+                if single is None or not single.native_second:
+                    raise
+                local_error = exc
+            if single is not None:
+                single.previous = None
+                if single.native_second:
+                    self._coordinate_sfa_full_graph_preparation(local_error, False)
             pd_tensor_dump = getattr(self, "_pd_tensor_dump", None)
             if pd_tensor_dump is None:
                 hidden_states = self.model(
@@ -4119,8 +4179,14 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
             )
         if full_layout_protocol:
             tensor[3, self.dp_rank] = int(staged_sfa_bounded_decode)
+        single = getattr(self, "_sfa_single_agreement", None)
         with record_function_or_nullcontext("ascend::dp_layout_agreement"):
-            dist.all_reduce(tensor, group=get_dp_group().cpu_group)
+            if single is not None and single.active and self._sfa_full_graph.sealed:
+                tensor = single.vote(self, tensor[:, self.dp_rank], idle=getattr(self, "_sfa_dp_idle", False))
+                num_tokens_across_dp = single.counts
+                num_tokens_across_dp.copy_(tensor[0])
+            else:
+                dist.all_reduce(tensor, group=get_dp_group().cpu_group)
         if full_layout_protocol:
             self._staged_sfa_dp_bounded_decode = bool(tensor[3].max().item())
 
@@ -5644,7 +5710,10 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
             )
             cudagraph_runtime_mode = CUDAGraphMode.NONE
         # Build attention metadata for dummy_run
-        if (
+        single = getattr(self, "_sfa_single_agreement", None)
+        if single is not None and single.prepared is not None:
+            attn_metadata = single.prepared.context.attn_metadata
+        elif (
             self._should_build_dummy_attn_metadata(
                 force_attention,
                 is_profile,
@@ -5766,19 +5835,7 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                 # Idle participation must not write dummy K/index entries into
                 # physical blocks that may belong to paused/waiting requests.
                 for metadata in {id(value): value for value in attn_metadata.values()}.values():
-                    for field_name in ("slot_mapping", "indexer_slot_mapping", "indexer_c8_slot_mapping"):
-                        value = getattr(metadata, field_name, None)
-                        if value is not None:
-                            value.fill_(-1)
-                    # Builder-owned extended tables: do not mutate the live
-                    # input batch's block table or cached physical ownership.
-                    if getattr(metadata, "decode_remap_boundary", None) is not None:
-                        metadata.block_table.zero_()
-                        metadata.indexer_block_table.zero_()
-                        physical_table = getattr(metadata, "indexer_c8_block_table", None)
-                        if physical_table is not None:
-                            physical_table.zero_()
-                        metadata.seq_lens.zero_()
+                    self._clear_sfa_idle_metadata(metadata)
 
         with self.maybe_dummy_run_with_lora(
             self.lora_config,
@@ -5807,7 +5864,9 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                 positions = self.positions.gpu[:num_tokens_padded]
 
             # update global cos, sin
-            update_cos_sin(positions)
+            single = getattr(self, "_sfa_single_agreement", None)
+            if single is None or single.prepared is None:
+                update_cos_sin(positions)
 
             if get_pp_group().is_first_rank:
                 intermediate_tensors = None
@@ -5849,9 +5908,9 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
             # uploads, before target/draft compute; ExitStack covers errors too.
             if _input_prep is not None:
                 _input_prep.close()
-            with set_ascend_forward_context(
-                attn_metadata,
-                self.vllm_config,
+            with self._sfa_forward_context(
+                attn_metadata=attn_metadata,
+                vllm_config=self.vllm_config,
                 num_tokens=num_tokens_padded,
                 num_tokens_across_dp=num_tokens_across_dp,
                 in_profile_run=is_profile,

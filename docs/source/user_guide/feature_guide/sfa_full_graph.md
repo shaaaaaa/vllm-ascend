@@ -1031,3 +1031,53 @@ result. If the original mismatch disappears only with these probes, investigate
 fusion/timing effects; the original `test_sfa_full_graph_parity.py` must still
 pass separately. CPU regressions test hook ordering, in-place alias isolation,
 fullgraph traceability, failure localization and the unchanged tolerance gate.
+
+## Experimental single agreement for steady decoding
+
+On matching `perf/sfa-dp-sync` branches of vLLM-Ascend, LMCache and
+LMCache-Ascend, enable on **every decoder worker in the EP group**:
+
+```bash
+export VLLM_ASCEND_SFA_SINGLE_AGREEMENT=1
+```
+
+The default is `0`. Restart the workers after updating these Python packages;
+this change does not require rebuilding native extensions. It uses the existing
+full-SFA and async-MTP configuration. Initial eligibility requires the async SFA
+runner and a fixed MP TP-by-DP EP topology with PP=PCP=DCP=1 and no DBO or elastic
+EP. Unqualified configurations retain the existing protocol.
+vLLM batch-size timing also retains the original forward-context scope.
+
+Warm unchanged Q2 steps and repeated idle participation can prepare against the
+previous graph key, then combine batch/layout and preparation-error agreement
+into one EP CPU collective. The current vote still selects the common capacity,
+profile and native fallback. A changed key or an unprepared peer retains a second
+preparation agreement. A TP group falls back together if any member needs ordinary
+source preparation; this preserves TP loader collective participation. Other
+ready TP groups can reuse their preparation when the final key is unchanged.
+
+If any rank must discard early preparation or reconcile a pending async step,
+all EP ranks agree on the rollback outcome **before** ordinary TP source setup.
+This also covers ranks without a prepared graph. Such transitions can use three
+host agreements: batch decision, rollback outcome, then preparation outcome.
+Steady ready steps still use one; slow steps without rollback retain the original
+preparation agreement. A rollback failure rejects further execution on the group
+until worker restart, rather than retrying with partially rebuilt state.
+
+This does not bypass expert dispatch/combine or change MTP's separate metadata
+agreement. Admission/recovery can discard speculative preparation; a transition
+to native execution can require an additional error agreement. Consequently,
+one fewer steady-step collective is not a measured throughput improvement.
+
+Profiler scopes `sfa_single_agreement::prepare`, `sfa_single_agreement::vote`
+and `sfa_single_agreement::rollback_vote` distinguish preparation and agreements.
+The benchmark timing report includes `single_agreement_since_startup` decision
+counters and `rollback_agreements`. Detailed diagnostics add overhead; compare
+throughput in separate clean runs with identical traces, cache state, output
+lengths and MTP acceptance.
+
+CPU regression tests include real subprocess/IPC execution with an emulated
+reduction. The native Gloo case is available on Linux. Distributed NPU TP4/DP4
+qualification remains required, including active/idle transitions, mixed C8,
+preemption/restore misses and injected preparation failures. Keep this option
+off until that qualification and the throughput comparison pass.

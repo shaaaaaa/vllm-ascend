@@ -86,7 +86,7 @@ def test_kv_initialization_keeps_call_order_and_original_exception(trace, failur
 
 
 @pytest.mark.parametrize("fail", [False, True])
-def test_ep_barrier_is_called_once_and_visible_without_perf_flag(trace, fail):
+def test_ep_barrier_is_called_once_and_visible_without_perf_flag(trace, fail, monkeypatch):
     tracing, output = trace
     calls, sentinel = [], TimeoutError("same Gloo timeout")
 
@@ -98,6 +98,9 @@ def test_ep_barrier_is_called_once_and_visible_without_perf_flag(trace, fail):
             raise sentinel
 
     group = NS(rank_in_group=0, world_size=16, ranks=list(range(16)), barrier=barrier)
+    monkeypatch.setitem(
+        sys.modules, "vllm_ascend.worker.sfa_agreement", NS(initialize_single_agreement=lambda runner, ep: ep.barrier())
+    )
     wait = method(
         "worker.py",
         "NPUWorker",
@@ -109,10 +112,14 @@ def test_ep_barrier_is_called_once_and_visible_without_perf_flag(trace, fail):
     )
     if fail:
         with pytest.raises(TimeoutError) as caught:
-            wait(worker())
+            owner = worker()
+            owner.model_runner = NS()
+            wait(owner)
         assert caught.value is sentinel and "ep_barrier error" in output.getvalue()
     else:
-        wait(worker())
+        owner = worker()
+        owner.model_runner = NS()
+        wait(owner)
         assert "ep_barrier end" in output.getvalue()
     assert calls == ["barrier"]
     owner = worker()
@@ -178,6 +185,10 @@ def test_kv_registration_boundary_surrounds_real_connector_call(trace, fail):
             raise sentinel
 
     owner._validate_sfa_layerwise_connector_cudagraph_mode = lambda: None
+    owner._validate_dsa_compact_startup_policy = lambda _: None
+    owner.ascend_config = NS()
+    owner._validate_shared_resident_layout = lambda _: None
+    owner._sfa_full_graph = NS(retrieval_overlap=None)
     owner.may_add_encoder_only_layers_to_kv_cache_config = lambda: None
     owner.maybe_add_kv_sharing_layers_to_kv_cache_groups = lambda _: None
     owner.initialize_attn_backend = lambda _: calls.append("attention")
@@ -199,7 +210,7 @@ def test_kv_registration_boundary_surrounds_real_connector_call(trace, fail):
         MambaSpec=type("MambaSpec", (), {}),
         has_kv_transfer_group=lambda: True,
         get_kv_transfer_group=lambda: NS(register_kv_caches=register),
-        envs_ascend=NS(VLLM_ASCEND_DSA_DISABLE_INDEX_LMCACHE=False),
+        envs_ascend=NS(VLLM_ASCEND_DSA_DISABLE_INDEX_LMCACHE=False, VLLM_ASCEND_PD_TENSOR_DUMP_DIR=""),
     )
     if fail:
         with pytest.raises(RuntimeError) as caught:

@@ -73,6 +73,8 @@ def routing():
         "_determine_batch_execution_and_padding",
         "_coordinate_sfa_full_graph_preparation",
         "_model_forward",
+        "_prepare_sfa_full_graph_call",
+        "_clear_sfa_idle_metadata",
         "_staged_sfa_dummy_seq_len",
         "_prepare_staged_sfa_dummy_block_tables",
         "_staged_sfa_capture_keys",
@@ -877,7 +879,7 @@ def test_dummy_dispatch_passes_idle_status_to_layout_agreement():
 @pytest.mark.parametrize("metadata_groups", [1, 2])
 @pytest.mark.parametrize("c8", [False, True])
 @pytest.mark.parametrize("idle", [False, True])
-def test_idle_clears_shared_metadata_once(metadata_groups, c8, idle):
+def test_idle_clears_shared_metadata_once(routing, metadata_groups, c8, idle):
     path = Path(__file__).resolve().parents[3] / "vllm_ascend/worker/model_runner_v1.py"
     tree = ast.parse(path.read_text(encoding="utf8"))
     dummy = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "_dummy_run")
@@ -902,7 +904,7 @@ def test_idle_clears_shared_metadata_once(metadata_groups, c8, idle):
         dp_idle=idle,
         staged_sfa_graph_dummy_run=True,
         sfa_full_graph_enabled=lambda cfg: True,
-        self=SimpleNamespace(vllm_config=None),
+        self=routing[0],
         attn_metadata={str(i): items[i % metadata_groups] for i in range(78)},
     )
     exec(compile(ast.Module(body=[branch], type_ignores=[]), str(path), "exec"), scope)

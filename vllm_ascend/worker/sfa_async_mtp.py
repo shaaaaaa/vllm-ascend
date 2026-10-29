@@ -129,6 +129,9 @@ class AsyncSFAModelRunner(NPUModelRunner):
             raise
         finally:
             self._async_live_execute = False
+            single = getattr(self, "_sfa_single_agreement", None)
+            if single is not None:
+                single.discard()
 
     @contextmanager
     def synchronize_input_prep(self):
@@ -156,6 +159,11 @@ class AsyncSFAModelRunner(NPUModelRunner):
 
     def _dummy_run(self, *args, **kwargs):
         live, self._async_live_execute = self._async_live_execute, False
+        self._sfa_dp_idle = bool(
+            kwargs.get("uniform_decode", False)
+            and kwargs.get("cudagraph_runtime_mode") is None
+            and getattr(self, "dp_size", 1) > 1
+        )
         self._async_snapshot = self._async_query_layout = None
         try:
             with ExitStack() as input_prep:
@@ -164,6 +172,47 @@ class AsyncSFAModelRunner(NPUModelRunner):
         finally:
             self._async_live_execute = live
             self._async_snapshot = self._async_query_layout = None
+            self._sfa_dp_idle = False
+            single = getattr(self, "_sfa_single_agreement", None)
+            if single is not None:
+                single.discard()
+
+    def _prepare_single_agreement(self, idle):
+        if idle:
+            return super()._prepare_single_agreement(True)
+        single, snapshot = self._sfa_single_agreement, self._async_snapshot
+        if (
+            self._async_pending is None
+            or snapshot is None
+            or single.previous is None
+            or single.previous[0] != snapshot.key
+            or not single.can_prepare(self, False)
+        ):
+            return None
+        from vllm.distributed.kv_transfer import get_kv_transfer_group
+
+        prepare = getattr(get_kv_transfer_group(), "prepare_warm_sparse_graph_step", None)
+        if prepare is None:
+            return None
+        step = prepare(
+            self._async_pending.kv_connector_metadata, self._staged_sfa_layer_names, snapshot.ids, snapshot.frontiers
+        )
+        if step is None:
+            return None
+        prepared = None
+        try:
+            if not self._sfa_full_graph.sources_match(snapshot.key.request_capacity, snapshot.ids, step.sources):
+                return None
+            fields = ("num_tokens", "num_tokens_padded", "num_reqs", "num_reqs_padded", "max_query_len", "full_graph")
+            result = self._build_attention_metadata(**dict(zip(fields, snapshot.shape)))
+            prepared = single.prepare(self, result[0], step, snapshot.frontiers, idle=False)
+            if prepared is None:
+                raise RuntimeError("Warm SFA preparation changed after its eligibility check")
+            prepared.metadata = result
+            return prepared
+        finally:
+            if prepared is None:
+                step.close()
 
     def _pad_query_start_loc_for_fia(
         self, num_tokens_padded, num_reqs_padded, num_reqs,
@@ -344,13 +393,23 @@ class AsyncSFAModelRunner(NPUModelRunner):
     def _apply_staged_sfa_route(self, route):
         key = super()._apply_staged_sfa_route(route)
         if self._async_pending is not None and key != self._async_snapshot.key:
+            self._cancel_single_preparation()
+        return key
+
+    def _cancel_single_preparation(self):
+        """Rebuild from accepted CPU counts, never advance the async kernel twice."""
+        if self._async_pending is not None:
             self._ensure_host_staging_ready()
             scheduled = self._reconcile()
             self._async_snapshot = None
             self._prepare_inputs(scheduled, np.full(self.input_batch.num_reqs, 2, dtype=np.int32))
-        return key
 
     def _build_attention_metadata(self, *args, **kwargs):
+        single = getattr(self, "_sfa_single_agreement", None)
+        if single is not None and single.prepared is not None and single.prepared.metadata is not None:
+            # A peer can need the second vote without changing our graph key.
+            # Reusing this result is essential: the async kernel advances bases.
+            return single.prepared.metadata
         s = self._async_snapshot
         if self._async_pending is None:
             result = super()._build_attention_metadata(*args, **kwargs)
