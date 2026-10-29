@@ -555,10 +555,14 @@ typedef void (*ReleaseHugeMem)(void *, bool);
     TORCH_CHECK(workspace_status == 0,                                        \
                 "call " #aclnn_api " failed, detail:", aclGetRecentErrMsg()); \
     void *workspace_addr = nullptr;                                           \
+    /* Keep ownership through cmd.Run(): releasing before enqueue makes */   \
+    /* the workspace reusable before its consumer is ordered on the stream. */ \
+    /* After enqueue, same-stream allocator ordering protects device use. */ \
+    at::Tensor workspace_tensor;                                              \
     if (workspace_size != 0) {                                                \
       at::TensorOptions options =                                             \
           at::TensorOptions(torch_npu::utils::get_npu_device_type());         \
-      auto workspace_tensor =                                                 \
+      workspace_tensor =                                                      \
           at::empty({workspace_size}, options.dtype(kByte));                  \
       workspace_addr = const_cast<void *>(workspace_tensor.storage().data()); \
     }                                                                         \
