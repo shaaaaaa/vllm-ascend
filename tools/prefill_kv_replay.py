@@ -15,11 +15,13 @@ import gzip
 import json
 import math
 import os
+import socket
 import subprocess
 import sys
 import tempfile
 import time
 import traceback
+import urllib.parse
 import urllib.request
 import uuid
 from contextlib import contextmanager
@@ -33,6 +35,7 @@ from prefill_kv_seed import live_contract, seed, token_digest
 
 REPO = Path(__file__).resolve().parents[1]
 PREFIX = "[PREFILL_REPLAY]"
+PROXY_CONNECT_TIMEOUT_SECONDS = 10
 # Match the serving template's container environment initialization. Arguments
 # remain positional: never interpolate credentials, paths, or plans into shell.
 REMOTE_ENV_BOOTSTRAP = """source ~/.bashrc >/dev/null 2>&1 || true
@@ -100,6 +103,28 @@ def http_json(base: str, path: str, body: dict | None = None, timeout: float = 1
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     with opener.open(request, timeout=timeout) as response:
         return json.load(response)
+
+
+def check_proxy_connection(base_url: str, timeout: float) -> None:
+    """Check the listener before costly injection, without issuing inference.
+
+    Proxy health/models routes differ between deployments. A TCP connection
+    checks this failure mode without requiring any optional HTTP endpoint.
+    It does not promise that P/D are healthy or that the proxy will stay up.
+    """
+    target = urllib.parse.urlsplit(base_url)
+    if target.scheme not in ("http", "https") or not target.hostname:
+        raise ValueError("--base-url must be an http(s) PD proxy URL")
+    port = target.port or (443 if target.scheme == "https" else 80)
+    try:
+        with socket.create_connection((target.hostname, port), timeout=min(timeout, PROXY_CONNECT_TIMEOUT_SECONDS)):
+            pass
+    except OSError as error:
+        raise RuntimeError(
+            f"Cannot connect to PD proxy {target.hostname}:{port}; check --base-url and the proxy listener. "
+            "KV injection has not started."
+        ) from error
+    print(f"{PREFIX} PD proxy TCP reachable: {target.hostname}:{port}", flush=True)
 
 
 def prepare(args, output: Path) -> tuple[dict, dict]:
@@ -362,6 +387,8 @@ def main(argv=None) -> int:
     )
     print(f"{PREFIX} artifacts={output}; using existing P/D; no server startup/restart", flush=True)
     try:
+        if not args.prepare_only:
+            check_proxy_connection(args.base_url, args.timeout)
         restored, plan = prepare(args, output)
         report.update(
             previous=restored["previous"], current=restored["current"], expected_cached_tokens=plan["cached_tokens"]

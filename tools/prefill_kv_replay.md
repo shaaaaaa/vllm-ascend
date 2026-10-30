@@ -72,6 +72,11 @@ python3 tools/prefill_kv_replay.py \
 and `/v1/models`. Tokenizer requests do not run the model. P startup logs default
 to this checkout's `tp4_dp4_logs/P_dp*.log`. They must belong to the current
 deployment; do not mix old logs with different hash roots or layouts.
+Before injection, the tool checks that the proxy TCP listener accepts a
+connection (at most 10 seconds). It sends no inference request and does not
+require `/health` or `/v1/models` on the proxy. This catches a refused connection
+before scanning/copying the snapshots; it does not verify backend readiness or
+prevent the proxy from exiting later. `--prepare-only` skips this proxy check.
 
 If the snapshot machine runs the Python environment **inside Docker**, add
 `--container CONTAINER_NAME`, use the **container's** repository path for

@@ -8,6 +8,7 @@ import json
 import os
 import shlex
 import shutil
+import socket
 import subprocess
 import sys
 import weakref
@@ -642,6 +643,11 @@ def test_existing_pd_orchestration_and_cache_miss_verdict(tmp_path, monkeypatch,
     monkeypatch.setattr(R, "REPO", tmp_path)
     active = []
     calls = []
+    connected = []
+
+    def check_proxy(url, timeout):
+        assert url == "http://proxy:8000"
+        connected.append(url)
 
     def http(url, path, body=None):
         calls.append((url, path))
@@ -651,6 +657,7 @@ def test_existing_pd_orchestration_and_cache_miss_verdict(tmp_path, monkeypatch,
 
     @contextmanager
     def seeded(args, plan, output):
+        assert connected == ["http://proxy:8000"]
         active.append("seed")
         yield NS(poll=lambda: None)
         active.clear()
@@ -671,6 +678,7 @@ def test_existing_pd_orchestration_and_cache_miss_verdict(tmp_path, monkeypatch,
             )
 
     monkeypatch.setattr(R, "http_json", http)
+    monkeypatch.setattr(R, "check_proxy_connection", check_proxy)
     monkeypatch.setattr(R, "seeded", seeded)
     monkeypatch.setattr(R, "Client", Client)
     argv = [
@@ -694,6 +702,39 @@ def test_existing_pd_orchestration_and_cache_miss_verdict(tmp_path, monkeypatch,
     assert report["status"] == ("replay_complete" if cached == 8 else "failed")
     assert report["accuracy_verdict"] == "not_assessed"
     assert calls == [("http://P:7910", p) for p in ("/v1/models", "/tokenize", "/tokenize")]
+
+
+def test_proxy_check_connects_without_sending_a_request():
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen()
+        listener.settimeout(3)
+        R.check_proxy_connection(f"http://127.0.0.1:{listener.getsockname()[1]}/v1", 3)
+        connection, _ = listener.accept()
+        with connection:
+            connection.settimeout(3)
+            assert connection.recv(1) == b""
+
+
+def test_proxy_refusal_prevents_snapshot_injection(tmp_path, monkeypatch):
+    monkeypatch.setattr(R, "REPO", tmp_path)
+    monkeypatch.setattr(R, "prepare", lambda *_: pytest.fail("Prepared snapshots despite proxy refusal"))
+    monkeypatch.setattr(R, "seeded", lambda *_: pytest.fail("Started injection despite proxy refusal"))
+    with socket.socket() as unlistened:
+        unlistened.bind(("127.0.0.1", 0))
+        base = f"http://127.0.0.1:{unlistened.getsockname()[1]}"
+        with pytest.raises(RuntimeError, match="Cannot connect to PD proxy.*KV injection has not started"):
+            R.main(["--run-dir", str(tmp_path), "--base-url", base, "--p-url", "http://P:7910"])
+    (report_path,) = (tmp_path / "prefill-kv-replays").glob("*/report.json")
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert report["status"] == "failed"
+    assert "KV injection has not started" in report["error"]
+
+
+@pytest.mark.parametrize("base", ["", "localhost:8000", "ftp://localhost:8000"])
+def test_proxy_check_rejects_invalid_urls(base):
+    with pytest.raises(ValueError, match="http"):
+        R.check_proxy_connection(base, 3)
 
 
 def test_remote_child_argv_preserves_linux_path_and_quoting(tmp_path):
