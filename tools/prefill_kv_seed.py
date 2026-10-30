@@ -226,7 +226,10 @@ def page_keys(plan: dict, tokens: list[int]):
         end = start + chunk
         if end > len(tokens):
             raise ValueError("Only full historical cache blocks may be seeded")
-        root = hash_fn((root, tuple(tokens[start:end]), ()))
+        # LMCache-Ascend replaces TokenDatabase._hash_tokens. With no extra
+        # keys it hashes a TWO-item tuple, unlike upstream LMCache's canonical
+        # three-item tuple. Even an empty third item changes every page key.
+        root = hash_fn((root, tuple(tokens[start:end])))
         for group, (count, _) in enumerate(schema["runtime_kv_groups"]):
             dtype = (
                 torch.uint8

@@ -20,6 +20,9 @@ when present, its model identity must also agree with the current P server.
 2. Read the **new deployment's P startup logs** for the actual cache layout,
    hash algorithm, hash root, and Mooncake endpoint. Query its model identity and
    tokenizer. Reject incompatible token counts, layouts, or saved model paths.
+   Page hashes follow LMCache-Ascend's patched two-item input tuple
+   `(prefix_hash, token_ids)`, not upstream LMCache's three-item tuple. The same
+   algorithm and root alone do not make those two key namespaces compatible.
 3. On the snapshot host, validate all captured TP copies. The current MLA
    deployment shares the TP0 key namespace, so differing copies are rejected
    rather than silently discarding another rank's data.
@@ -60,7 +63,7 @@ SSH:
 python3 tools/prefill_kv_replay.py \
   --run-dir ./multi-turn-concurrent \
   --session 0 --round 1 \
-  --base-url http://7.150.2.72:8000 \
+  --base-url http://7.150.2.72:8080 \
   --p-url http://7.150.2.72:7910 \
   --p-logs tp4_dp4_logs/P_dp*.log \
   --snapshot-host root@7.150.3.60 \

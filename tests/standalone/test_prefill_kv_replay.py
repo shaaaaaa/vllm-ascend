@@ -296,7 +296,7 @@ def test_incompatible_snapshots_rejected(tmp_path, failure):
         S.validate_snapshot(plan)
 
 
-def test_actual_hash_input_and_lmcache_key_serializer(monkeypatch):
+def test_ascend_hash_input_and_lmcache_key_serializer(monkeypatch):
     calls = []
 
     def hash_fn(value):
@@ -319,7 +319,7 @@ def test_actual_hash_input_and_lmcache_key_serializer(monkeypatch):
     )
     c = contract()
     keys = list(S.page_keys(dict(contract=c, model_path="/model"), list(range(8))))
-    assert calls == [(b"root", (0, 1, 2, 3), ()), (b"hashed\x01", (4, 5, 6, 7), ())]
+    assert calls == [(b"root", (0, 1, 2, 3)), (b"hashed\x01", (4, 5, 6, 7))]
     assert [(g, a, b) for _, g, a, b in keys] == [(0, 0, 4), (1, 0, 4), (0, 4, 8), (1, 4, 8)]
     assert keys[1][0][0][1:3] == (1, 0)
     assert keys[1][0][0][5] == {"layout": c["signature"], "idx": "v2"}
