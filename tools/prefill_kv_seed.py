@@ -114,7 +114,8 @@ def validate_snapshot_model(meta: dict, directory: Path, model_path: str) -> Non
         raise ValueError("Live P model path differs from the saved model; use the same serving weights")
 
 
-def validate_snapshot(plan: dict) -> tuple[list[int], dict]:
+def snapshot_metadata(plan: dict) -> tuple[list[int], dict, list]:
+    """Validate small manifests/layouts without scanning the archived KV bytes."""
     workers = read_workers([Path(plan["snapshot_root"])], plan["previous"])
     meta, tokens, rows = workers[0]
     end = plan["cached_tokens"]
@@ -185,9 +186,13 @@ def validate_snapshot(plan: dict) -> tuple[list[int], dict]:
                 if (row["dtype"], row["row_bytes"]) != (candidate["dtype"], candidate["row_bytes"]):
                     raise ValueError("Snapshot TP wire layouts differ")
                 comparisons.append((path, target, end * row["row_bytes"]))
+    return tokens[:end], rows, comparisons
+
+
+def validate_tp_copies(comparisons: list, workers: int) -> None:
     # The production RemoteFill key namespace collapses both groups to TP0.
     # Do not silently inject TP0 when another captured rank held different KV.
-    with ThreadPoolExecutor(max_workers=plan["workers"]) as pool:
+    with ThreadPoolExecutor(max_workers=workers) as pool:
         for i, equal in enumerate(pool.map(lambda job: same_prefix(*job), comparisons), 1):
             if not equal:
                 raise ValueError("Saved TP copies differ; cannot faithfully inject them into the shared TP0 namespace")
@@ -195,7 +200,12 @@ def validate_snapshot(plan: dict) -> tuple[list[int], dict]:
                 print(
                     PREFIX + json.dumps(dict(status="validating_tp", files=i, total_files=len(comparisons))), flush=True
                 )
-    return tokens[:end], rows
+
+
+def validate_snapshot(plan: dict) -> tuple[list[int], dict]:
+    tokens, rows, comparisons = snapshot_metadata(plan)
+    validate_tp_copies(comparisons, plan["workers"])
+    return tokens, rows
 
 
 def page_keys(plan: dict, tokens: list[int]):
@@ -263,7 +273,7 @@ def seed(plan: dict) -> None:
     list(page_keys(plan, []))
     print(PREFIX + json.dumps(dict(status="runtime_ready")), flush=True)
     print(PREFIX + json.dumps(dict(status="validating", previous=plan["previous"])), flush=True)
-    tokens, rows = validate_snapshot(plan)
+    tokens, rows, comparisons = snapshot_metadata(plan)
     keys = list(page_keys(plan, tokens))
     widths = {g: sum(r["row_bytes"] for (group, _, _), (r, _) in rows.items() if group == g) for g in (0, 1)}
     total = len(tokens) * sum(widths.values())
@@ -295,11 +305,20 @@ def seed(plan: dict) -> None:
         if any(store.batch_is_exist([key for key, *_ in keys])):
             raise ValueError("Historical keys already exist in Mooncake; refusing to overwrite an existing run")
         size = max(widths.values()) * plan["contract"]["schema"]["chunk_size"]
-        source, check = [torch.empty(size, dtype=torch.uint8, device="cpu") for _ in range(2)]
+        # AscendDirect's wildcard registration queries ACL pointer attributes.
+        # Ordinary CPU allocations have no HOST location there. Allocate through
+        # torch_npu's pinned host allocator, and retain both owners until after
+        # unregister/close (including partial registration failures).
+        source, check = [torch.empty(size, dtype=torch.uint8, device="cpu", pin_memory=True) for _ in range(2)]
         for tensor in (source, check):
-            if store.register_buffer(tensor.data_ptr(), tensor.numel()) not in (None, 0):
-                raise RuntimeError("Cannot register seed CPU staging memory")
+            status = store.register_buffer(tensor.data_ptr(), tensor.numel())
+            if status not in (None, 0):
+                raise RuntimeError(f"Cannot register pinned seed CPU staging memory: bytes={size} status={status}")
             registered.append(tensor)
+        print(PREFIX + json.dumps(dict(status="staging_ready", buffers=2, bytes_each=size, pinned=True)), flush=True)
+        # Catch native setup/registration failures BEFORE the expensive raw-file
+        # scan. No historical page is published until every TP copy matches.
+        validate_tp_copies(comparisons, plan["workers"])
         destination = ReplicateConfig()
         destination.replica_num = 1
         destination.preferred_segment = store.get_hostname()
@@ -322,7 +341,12 @@ def seed(plan: dict) -> None:
             if time.monotonic() >= deadline:
                 raise TimeoutError("Seed lease expired before the replay released it")
     finally:
-        for tensor in registered:
-            store.unregister_buffer(tensor.data_ptr())
-        # Close only this tool's segment; never remove keys/replicas owned by P/D.
-        store.close()
+        try:
+            for tensor in registered:
+                status = store.unregister_buffer(tensor.data_ptr())
+                if status not in (None, 0):
+                    raise RuntimeError(f"Cannot unregister seed CPU staging memory: status={status}")
+        finally:
+            # Close only this tool's segment; never remove keys/replicas owned by P/D.
+            # Keep pinned tensors alive until the native transport is closed.
+            store.close()

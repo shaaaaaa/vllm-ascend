@@ -94,6 +94,11 @@ script does for `ascend_transport.so`, preserving existing toolkit paths. This
 is done before starting Python, for both local and remote injection processes.
 Torch, the NPU context, and cache-key dependencies are checked before raw-file scans;
 loader failures retain their underlying exception in both the log and terminal.
+After checking the snapshot metadata, the injector sets up its native store and
+registers two pinned CPU staging buffers (`staging_ready`) before scanning TP
+copies. Ordinary pageable CPU tensors are not accepted by this Ascend transport's
+automatic memory-type detection. The buffers stay alive until transport teardown;
+no historical page is published until the TP-copy validation succeeds.
 The snapshot directory defaults to `WORKSPACE/decode-kv-snapshots`.
 `--snapshot-root PATH` selects a different existing capture directory. Omit
 `--snapshot-host` for local snapshots; in that mode the current Python environment

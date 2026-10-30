@@ -10,6 +10,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import weakref
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace as NS
@@ -323,14 +324,44 @@ def test_actual_hash_input_and_lmcache_key_serializer(monkeypatch):
     assert keys[1][0][0][5] == {"layout": c["signature"], "idx": "v2"}
 
 
-@pytest.mark.parametrize("corrupt", [False, True])
-def test_native_seed_readback_before_ready(tmp_path, monkeypatch, capsys, corrupt):
+@pytest.mark.parametrize("failure", [None, "readback", "register_first", "register_second", "tp_bytes", "unregister"])
+def test_native_seed_readback_before_ready(tmp_path, monkeypatch, capsys, failure):
+    import torch
+
     plan = snapshot(tmp_path)
+    events = []
+    owners = weakref.WeakValueDictionary()
+    real_empty = torch.empty
+
+    def empty(size, *, dtype, device, pin_memory=False):
+        tensor = real_empty(size, dtype=dtype, device=device)
+        # This CPU-only stand-in enforces the native allocator contract: an
+        # ordinary torch.empty CPU pointer is not recognized as ACL HOST memory.
+        if pin_memory:
+            owners[tensor.data_ptr()] = tensor
+        return tensor
+
+    monkeypatch.setattr(torch, "empty", empty)
+    validate_tp_copies = S.validate_tp_copies
+
+    def scan(*args):
+        events.append("scan")
+        return validate_tp_copies(*args)
+
+    monkeypatch.setattr(S, "validate_tp_copies", scan)
+    if failure == "tp_bytes":
+        path = tmp_path / "response-0/rank1/g1-l0-c0.bin"
+        data = bytearray(path.read_bytes())
+        data[1] ^= 1
+        path.write_bytes(data)
 
     class Store:
         def __init__(self):
             self.data = {}
             self.closed = False
+            self.registered = []
+            self.unregistered = []
+            self.attempts = 0
 
         def setup(self, *args):
             return 0
@@ -338,11 +369,23 @@ def test_native_seed_readback_before_ready(tmp_path, monkeypatch, capsys, corrup
         def batch_is_exist(self, keys):
             return [0] * len(keys)
 
-        def register_buffer(self, *args):
+        def register_buffer(self, ptr, size):
+            self.attempts += 1
+            events.append("register")
+            if ptr not in owners:
+                return -1  # Reproduces location:* is not supported.
+            assert owners[ptr].numel() == size
+            if failure == "register_first" or (failure == "register_second" and self.attempts == 2):
+                return -7
+            self.registered.append(ptr)
             return 0
 
-        def unregister_buffer(self, *args):
-            pass
+        def unregister_buffer(self, ptr):
+            events.append("unregister")
+            assert ptr in self.registered
+            assert ptr in owners
+            self.unregistered.append(ptr)
+            return -8 if failure == "unregister" else 0
 
         def get_hostname(self):
             return "seed-owned"
@@ -352,12 +395,15 @@ def test_native_seed_readback_before_ready(tmp_path, monkeypatch, capsys, corrup
             return [NS(is_memory_replica=lambda: True, get_memory_descriptor=lambda: descriptor)]
 
         def batch_put_from_multi_buffers(self, keys, ptrs, sizes, config):
+            events.append("put")
+            assert ptrs[0][0] in self.registered
             self.data[keys[0]] = ctypes.string_at(ptrs[0][0], sizes[0][0])
             return [0]
 
         def batch_get_into_multi_buffers(self, keys, ptrs, sizes):
             data = self.data[keys[0]]
-            if corrupt:
+            assert ptrs[0][0] in self.registered
+            if failure == "readback":
                 data = bytes([data[0] ^ 1]) + data[1:]
             ctypes.memmove(ptrs[0][0], data, len(data))
             if len(self.data) == 4:
@@ -365,6 +411,8 @@ def test_native_seed_readback_before_ready(tmp_path, monkeypatch, capsys, corrup
             return [len(data)]
 
         def close(self):
+            events.append("close")
+            assert all(ptr in owners for ptr in self.registered)
             self.closed = True
 
     store = Store()
@@ -372,14 +420,34 @@ def test_native_seed_readback_before_ready(tmp_path, monkeypatch, capsys, corrup
     monkeypatch.setitem(sys.modules, "torch_npu", NS(npu=NS(set_device=lambda _: None, init=lambda: None)))
     monkeypatch.setattr(S, "page_keys", lambda p, t: [(f"{g}:{i}", g, i, i + 4) for i in (0, 4) for g in (0, 1)])
     monkeypatch.setattr(S.signal, "signal", lambda *_: None)
-    if corrupt:
-        with pytest.raises(RuntimeError, match="readback differs"):
+    errors = {
+        "readback": "readback differs",
+        "register_first": "pinned seed CPU staging memory: bytes=32 status=-7",
+        "register_second": "pinned seed CPU staging memory: bytes=32 status=-7",
+        "tp_bytes": "Saved TP copies differ",
+        "unregister": "unregister seed CPU staging memory: status=-8",
+    }
+    if failure:
+        with pytest.raises((RuntimeError, ValueError), match=errors[failure]):
             S.seed(plan)
     else:
         S.seed(plan)
-    assert ('"status": "ready"' in capsys.readouterr().out) is not corrupt
+    output = capsys.readouterr().out
+    assert ('"status": "ready"' in output) is (failure in (None, "unregister"))
     assert store.closed
-    assert len(store.data["0:0"]) == 32
+    assert events[-1] == "close"
+    if failure != "unregister":
+        assert store.unregistered == store.registered
+    if failure in ("register_first", "register_second"):
+        assert "scan" not in events
+        assert '"status": "staging_ready"' not in output
+    else:
+        assert events[:3] == ["register", "register", "scan"]
+        assert '"status": "staging_ready"' in output
+    if failure in ("register_first", "register_second", "tp_bytes"):
+        assert not store.data
+    else:
+        assert len(store.data["0:0"]) == 32
 
 
 def test_prepare_uses_live_tokenizer_and_does_not_run_inference(tmp_path, monkeypatch):
@@ -708,7 +776,7 @@ def test_runtime_failure_precedes_snapshot_scan(monkeypatch, capsys, failure):
     monkeypatch.setitem(sys.modules, "torch_npu", NS(npu=NS(set_device=lambda _: None, init=init)))
     monkeypatch.setitem(sys.modules, "mooncake.store", NS(MooncakeDistributedStore=NS, ReplicateConfig=NS))
     monkeypatch.setattr(S, "page_keys", keys)
-    monkeypatch.setattr(S, "validate_snapshot", lambda _: pytest.fail("Read raw snapshots before runtime preflight"))
+    monkeypatch.setattr(S, "snapshot_metadata", lambda _: pytest.fail("Read snapshots before runtime preflight"))
     monkeypatch.setattr(builtins, "__import__", import_module)
     with pytest.raises((RuntimeError, ImportError)):
         S.seed(dict(seed_device=0))
