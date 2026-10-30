@@ -691,17 +691,54 @@ def test_existing_pd_orchestration_and_cache_miss_verdict(tmp_path, monkeypatch,
         "--p-url",
         "http://P:7910",
     ]
-    if cached == 8:
-        assert R.main(argv) == 0
+    if cached in (8, None):
+        assert R.main(argv) == (0 if cached == 8 else 2)
         assert not active
     else:
         with pytest.raises(RuntimeError, match="Cache mismatch"):
             R.main(argv)
     (path,) = (tmp_path / "prefill-kv-replays").glob("*/report.json")
     report = json.loads(path.read_text())
-    assert report["status"] == ("replay_complete" if cached == 8 else "failed")
+    expected_status = {8: "replay_complete", 0: "failed", None: "replay_unverified"}[cached]
+    assert report["status"] == expected_status
+    assert report["request_completed"]
+    if cached is None:
+        assert report["count_validation"]["missing"] == ["cached_tokens"]
+        assert report["metrics"]["cached_tokens"] is None
+        assert "error" not in report
     assert report["accuracy_verdict"] == "not_assessed"
     assert calls == [("http://P:7910", p) for p in ("/v1/models", "/tokenize", "/tokenize")]
+
+
+@pytest.mark.parametrize(
+    "prompt,cached,missing",
+    [
+        (14, 8, []),
+        (14, None, ["cached_tokens"]),
+        (None, 8, ["prompt_tokens"]),
+        (None, None, ["prompt_tokens", "cached_tokens"]),
+    ],
+)
+def test_response_count_validation_distinguishes_missing(prompt, cached, missing):
+    metrics = dict(prompt_tokens=prompt, cached_tokens=cached)
+    result = R.validate_response_counts(metrics, 14, 8)
+    assert result == dict(
+        status="unverified" if missing else "matched", missing=missing, expected=dict(prompt_tokens=14, cached_tokens=8)
+    )
+    assert metrics == dict(prompt_tokens=prompt, cached_tokens=cached)
+
+
+@pytest.mark.parametrize(
+    "metrics",
+    [
+        dict(prompt_tokens=15, cached_tokens=None),
+        dict(prompt_tokens=None, cached_tokens=0),
+        dict(prompt_tokens=14, cached_tokens="8"),
+    ],
+)
+def test_response_count_mismatch_still_fails_when_other_count_missing(metrics):
+    with pytest.raises(RuntimeError, match="mismatch"):
+        R.validate_response_counts(metrics, 14, 8)
 
 
 def test_proxy_check_connects_without_sending_a_request():

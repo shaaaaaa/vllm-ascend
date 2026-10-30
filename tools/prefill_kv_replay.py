@@ -127,6 +127,20 @@ def check_proxy_connection(base_url: str, timeout: float) -> None:
     print(f"{PREFIX} PD proxy TCP reachable: {target.hostname}:{port}", flush=True)
 
 
+def validate_response_counts(metrics: dict, prompt_tokens: int, cached_tokens: int) -> dict:
+    """Missing usage is unverified, never a zero cache hit or a matching count."""
+    expected = dict(prompt_tokens=prompt_tokens, cached_tokens=cached_tokens)
+    missing = []
+    for name, value in expected.items():
+        actual = metrics.get(name)
+        if actual is None:
+            missing.append(name)
+        elif type(actual) is not int or actual != value:
+            label = "Cache" if name == "cached_tokens" else "Prompt token count"
+            raise RuntimeError(f"{label} mismatch: got {actual}, expected {value}")
+    return dict(status="unverified" if missing else "matched", missing=missing, expected=expected)
+
+
 def prepare(args, output: Path) -> tuple[dict, dict]:
     restored = restore_turn(args.run_dir.resolve(), args.session, args.round)
     files = sorted({Path(p) for pattern in args.p_logs for p in glob.glob(pattern)})
@@ -402,21 +416,28 @@ def main(argv=None) -> int:
             text, metrics = client.complete(restored["payload"], output)
             if owner.poll() is not None:
                 raise RuntimeError("Seed process exited during the request; replay is invalid")
-            report.update(metrics=metrics, text_equals_original=text == restored["original_output"])
+            report.update(
+                request_completed=True, metrics=metrics, text_equals_original=text == restored["original_output"]
+            )
             print(f"{PREFIX} OUTPUT BEGIN\n{text}\n{PREFIX} OUTPUT END", flush=True)
-            if metrics.get("cached_tokens") != plan["cached_tokens"]:
-                raise RuntimeError(
-                    f"Cache mismatch: got {metrics.get('cached_tokens')}, expected {plan['cached_tokens']}"
-                )
-            if metrics.get("prompt_tokens") != restored["original_metrics"]["prompt_tokens"]:
-                raise RuntimeError("Proxy/P token count differs from the original request")
-            report["status"] = "replay_complete"
+            validation = validate_response_counts(
+                metrics, restored["original_metrics"]["prompt_tokens"], plan["cached_tokens"]
+            )
+            report["count_validation"] = validation
+            report["status"] = "replay_unverified" if validation["missing"] else "replay_complete"
             print(
                 f"{PREFIX} cached={metrics['cached_tokens']} uncached={metrics['uncached_prompt_tokens']} "
                 f"ttft={metrics['ttft_s']:.3f}s response_id={metrics['response_id']}",
                 flush=True,
             )
-        return 0
+            if validation["missing"]:
+                print(
+                    f"{PREFIX} UNVERIFIED: P/D response completed, but usage omitted "
+                    f"{', '.join(validation['missing'])}; inspect this request's P logs to confirm reuse. "
+                    f"Output retained; no inference retry. artifacts={output}",
+                    flush=True,
+                )
+        return 2 if report["status"] == "replay_unverified" else 0
     except BaseException as error:
         report.update(status="failed", error=format_failure(error))
         raise

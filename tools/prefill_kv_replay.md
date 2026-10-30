@@ -30,9 +30,11 @@ when present, its model identity must also agree with the current P server.
 5. Send the reconstructed full prompt through the **existing PD proxy**. P
    retrieves history using normal LMCache/Mooncake lookup, recomputes the tail,
    and transfers the new result to D using the deployed path.
-6. Print the response and require the reported prompt and cached-token counts
-   to match the original request. A missing cache count or cache miss is a
-   failed replay, even if the server returned an answer.
+6. Print the response and compare reported prompt and cached-token counts with
+   the original request. A reported mismatch fails verification. Missing usage
+   is `replay_unverified` (exit code 2), not a cache miss or a successful check.
+   Output and response ID are retained for comparison with P's existing logs;
+   the tool does not retry inference or substitute the expected cache count.
 
 For mixed indexers, the descriptor's `group1_raw_token_dim` is already a byte
 capacity. Per-layer validation uses the precision policy and `head_dim`: a
