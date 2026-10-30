@@ -47,6 +47,7 @@ with gzip.GzipFile(fileobj=sys.stdout.buffer,mode='wb',compresslevel=1) as compr
                     if meta.get('status')=='writing':
                         raise RuntimeError('Snapshot is still being written: '+str(directory))
                     names=['manifest.json','tokens.json']+[r['path'] for r in meta.get('files',[])]
+                    if meta.get('replay_file') == 'replay.json': names.append('replay.json')
                     for name in names:
                         if pathlib.Path(name).name!=name: raise ValueError('Unsafe snapshot filename')
                         path=directory/name
