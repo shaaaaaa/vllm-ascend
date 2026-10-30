@@ -302,7 +302,7 @@ def main(argv=None):
         "--max-diff-mib",
         type=int,
         default=64,
-        help="Max raw differing bytes to fetch across hosts, both copies combined (default: 64 MiB)",
+        help="Max raw cross-host bytes for differences or numeric tails, both copies combined (default: 64 MiB)",
     )
     cli.add_argument("--full-transfer", action="store_true", help="Opt in to downloading complete archives")
     cli.add_argument(

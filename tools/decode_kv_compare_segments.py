@@ -404,25 +404,49 @@ def analyze_remote(args, client=None):
 
 
 def inspect_tails(args, client, entries, before, after, pairs, common):
-    """Get small numeric reports in place, without rehashing or fetching KV."""
+    """Inspect tails in place, fetching only budgeted slices for cross-host pairs."""
     start = args.inspect_start
     end = len(next(iter(after.values()))["tokens"])
     if not 0 <= start < end:
         raise ValueError("inspect-start must fall inside the current received tokens")
     boundary = max(start, common)
     jobs, headers = defaultdict(list), {}
+    cross_jobs, selected_bytes = [], 0
     for rank in sorted(after):
         left, right = before[rank], after[rank]
         ar, br = pairs[rank]
+        layer_names = right["meta"].get("layer_names")
         for key in sorted(br):
             identifier = str(len(headers))
             headers[identifier] = dict(
-                tp_rank=rank, group=key[0], layer=key[1], component=key[2], dtype=br[key]["dtype"]
+                tp_rank=rank,
+                group=key[0],
+                layer=key[1],
+                component=key[2],
+                dtype=br[key]["dtype"],
+                layer_name=layer_names[key[0]][key[1]] if layer_names is not None else None,
             )
             job = dict(id=identifier, entry=right["id"], row=br[key], start=start, common=boundary, end=end)
             if start < common and left["host"] == right["host"]:
                 job.update(previous=left["id"], previous_row=ar[key])
             elif start < common:
+                size = 2 * (common - start) * br[key]["row_bytes"]
+                selected = selected_bytes + size <= args.max_diff_mib * 1024 * 1024
+                if selected:
+                    selected_bytes += size
+                    job["hash_overlap"] = True
+                    cross_jobs.append(
+                        dict(
+                            id=identifier,
+                            left=left["id"],
+                            right=right["id"],
+                            left_path=ar[key]["path"],
+                            right_path=br[key]["path"],
+                            start=start,
+                            end=common,
+                            width=br[key]["row_bytes"],
+                        )
+                    )
                 jobs[left["host"]].append(
                     dict(
                         id=identifier + "-previous",
@@ -431,6 +455,7 @@ def inspect_tails(args, client, entries, before, after, pairs, common):
                         start=start,
                         common=common,
                         end=common,
+                        hash_overlap=selected,
                     )
                 )
             jobs[right["host"]].append(job)
@@ -468,6 +493,27 @@ def inspect_tails(args, client, entries, before, after, pairs, common):
     with ThreadPoolExecutor(max_workers=min(4, len(jobs))) as pool:
         for result in pool.map(inspect_host, jobs.items()):
             data.update(result)
+    for job in cross_jobs:
+        job["left_hash"] = data[job["id"] + "-previous"]["overlap_hash"]
+        job["right_hash"] = data[job["id"]]["overlap_hash"]
+    if cross_jobs:
+        print(
+            f"[D_KV_COMPARE] cross-host numeric slices=[{start},{common}) "
+            f"selected={selected_bytes / 1024**2:.2f} MiB (both copies; gzip transfer)",
+            flush=True,
+        )
+    blocks, reused = fetch_blocks(client, args, entries, cross_jobs)
+    for job in cross_jobs:
+        identifier = job["id"]
+        data[identifier]["comparison"] = worker.numeric_bytes_difference(
+            blocks.pop(identifier + "-left"),
+            blocks.pop(identifier + "-right"),
+            headers[identifier]["dtype"],
+            entries[job["left"]]["meta"]["byteorder"],
+            job["width"],
+            start,
+            common,
+        )
     for host in jobs:
         client.call(
             host,
@@ -492,8 +538,11 @@ def inspect_tails(args, client, entries, before, after, pairs, common):
             record = dict(header, **{k: v for k, v in data[identifier].items() if k != "id"})
             if identifier + "-previous" in data:
                 record["previous"] = data[identifier + "-previous"]["overlap"]
-                record["comparison_unavailable"] = "snapshots_on_different_hosts; distributions_only"
-                counts["cross_host_unpaired_components"] += 1
+                if "comparison" not in record:
+                    record["comparison_unavailable"] = (
+                        "snapshots_on_different_hosts; download_budget; distributions_only"
+                    )
+                    counts["cross_host_unpaired_components"] += 1
             for part in ("overlap", "new"):
                 stats = record[part]
                 if not stats["rows"]:
@@ -549,12 +598,15 @@ def inspect_tails(args, client, entries, before, after, pairs, common):
         first_findings=findings,
         first_numeric_differences=list(first_numeric.values()),
         worst_relative_l2=worst,
-        raw_cross_host_bytes_selected=0,
+        raw_cross_host_bytes_selected=selected_bytes,
+        raw_cached_bytes_reused=reused,
         compressed_response_bytes=client.received_bytes,
         report_file=str(path),
         scope="All selected raw component values; C8 key and scale are separate, not dequantized. "
         "Zero/constant rows are observations, not a correctness verdict. "
-        "Same-host overlap has pointwise numeric comparison; new tokens have no previous reference.",
+        "Same-host overlap is compared in place; cross-host overlap is compared within the download budget. "
+        "Unpaired components are explicitly counted. New tokens have no previous reference. "
+        "First numeric difference is not a correctness verdict or a proven error origin.",
     )
     path.write_text(json.dumps(report, indent=2, allow_nan=False), encoding="utf-8")
     return report

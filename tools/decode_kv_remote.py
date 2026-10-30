@@ -145,14 +145,40 @@ def _range_stats(entry, row, start, end):
 
 
 def _numeric_pair(left, right, arow, brow, start, end):
-    count = new_nonfinite = changed_nonfinite = mismatched = 0
-    error_square = reference_square = candidate_square = abs_sum = dot = max_abs = 0.0
     width = arow["row_bytes"]
     step = max(1, NUMERIC_CHUNK_BYTES // width)
-    for offset in range(start, end, step):
-        stop = min(offset + step, end)
-        a = _values(read_segment(left, arow["path"], offset, stop, width), arow["dtype"], left["meta"]["byteorder"])
-        b = _values(read_segment(right, brow["path"], offset, stop, width), brow["dtype"], right["meta"]["byteorder"])
+
+    def chunks():
+        for offset in range(start, end, step):
+            stop = min(offset + step, end)
+            yield (
+                _values(
+                    read_segment(left, arow["path"], offset, stop, width), arow["dtype"], left["meta"]["byteorder"]
+                ),
+                _values(
+                    read_segment(right, brow["path"], offset, stop, width), brow["dtype"], right["meta"]["byteorder"]
+                ),
+            )
+
+    return _numeric_chunks(chunks(), start, end)
+
+
+def numeric_bytes_difference(left, right, dtype, byteorder, width, start, end):
+    """Use the same numeric reducer for bounded, verified cross-host slices."""
+    if len(left) != len(right) or len(left) != (end - start) * width:
+        raise ValueError("Numeric slice lengths disagree with token range")
+    step = max(1, NUMERIC_CHUNK_BYTES // width) * width
+    chunks = (
+        (_values(left[i : i + step], dtype, byteorder), _values(right[i : i + step], dtype, byteorder))
+        for i in range(0, len(left), step)
+    )
+    return _numeric_chunks(chunks, start, end)
+
+
+def _numeric_chunks(chunks, start, end):
+    count = new_nonfinite = changed_nonfinite = mismatched = 0
+    error_square = reference_square = candidate_square = abs_sum = dot = max_abs = 0.0
+    for a, b in chunks:
         if isinstance(a, list):
             for x, y in zip(a, b):
                 xf, yf = math.isfinite(x), math.isfinite(y)
@@ -221,6 +247,12 @@ def inspect_numeric(payload):
         result = dict(
             id=job["id"], overlap=_range_stats(entry, row, start, common), new=_range_stats(entry, row, common, end)
         )
+        if job.get("hash_overlap"):
+            hasher = hashlib.blake2b(digest_size=16)
+            step = max(1, NUMERIC_CHUNK_BYTES // row["row_bytes"])
+            for offset in range(start, common, step):
+                hasher.update(read_segment(entry, row["path"], offset, min(offset + step, common), row["row_bytes"]))
+            result["overlap_hash"] = hasher.hexdigest()
         if "previous" in job:
             previous = entries[job["previous"]]
             result["previous"] = _range_stats(previous, job["previous_row"], start, common)

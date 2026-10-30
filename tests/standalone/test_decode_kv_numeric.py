@@ -111,6 +111,7 @@ def test_numeric_nonfinite_and_zero_reference_have_no_nan_json(tmp_path):
 def test_cross_host_tail_is_distribution_only_without_unbounded_download(tmp_path):
     args, rpc, _ = setup(tmp_path, count=6)
     args.inspect_start = 4
+    args.max_diff_mib = 0
     report = client.analyze_remote(args, rpc)
     assert report["counts"]["cross_host_unpaired_components"] == 1
     assert report["counts"]["compared_components"] == 0
@@ -119,6 +120,75 @@ def test_cross_host_tail_is_distribution_only_without_unbounded_download(tmp_pat
     assert "comparison" not in detail
     assert "different_hosts" in detail["comparison_unavailable"]
     assert not any(action == "blocks" for _, action in rpc.calls)
+
+
+@pytest.mark.parametrize("stdlib", [False, True])
+def test_cross_host_tail_matches_in_place_numeric_analysis_and_reuses_slices(tmp_path, monkeypatch, stdlib):
+    original = builtins.__import__
+
+    def import_module(name, *args, **kwargs):
+        if stdlib and name == "numpy":
+            raise ImportError("bare host")
+        return original(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", import_module)
+    monkeypatch.setattr(worker, "NUMERIC_CHUNK_BYTES", 4)
+    results = []
+    for same_host in (True, False):
+        root = tmp_path / str(same_host)
+        root.mkdir()
+        args, rpc, after = setup(root, same_host=same_host, count=5, width=4)
+        args.inspect_start = 3
+        before = root / "host-a/decode-kv-snapshots/before/host-tp0"
+        replace_floats(before, [(1, 2)] * 5)
+        replace_floats(after / "host-tp0", [(1, 2)] * 3 + [(2, 4), (math.nan, -1)] + [(0, 0)] * 3)
+        report = client.analyze_remote(args, rpc)
+        results.append(json.loads((args.output / "tail_layers.jsonl").read_text())["comparison"])
+        assert report["counts"]["cross_host_unpaired_components"] == 0
+        assert report["counts"]["compared_components"] == 1
+        assert report["raw_cross_host_bytes_selected"] == (0 if same_host else 16)
+        if not same_host:
+            rpc.calls.clear()
+            again = client.analyze_remote(args, rpc)
+            assert again["raw_cached_bytes_reused"] == 16
+            assert not any(action in ("blocks", "checksums") for _, action in rpc.calls)
+    assert results[0] == results[1]
+
+
+def test_cross_host_numeric_tail_budget_covers_both_copies(tmp_path):
+    args, rpc, _ = setup(tmp_path, count=600000)
+    args.inspect_start = 0
+    args.max_diff_mib = 1
+    report = client.analyze_remote(args, rpc)
+    assert report["raw_cross_host_bytes_selected"] == 0
+    assert report["counts"]["cross_host_unpaired_components"] == 1
+    assert not any(action in ("blocks", "checksums") for _, action in rpc.calls)
+
+
+def test_one_bit_numeric_difference_is_reported_without_failure_verdict(tmp_path):
+    args, rpc, after = setup(tmp_path, count=5, width=4)
+    args.inspect_start = 4
+    before = tmp_path / "host-a/decode-kv-snapshots/before/host-tp0"
+    replace_floats(before, [(1, 1)] * 5)
+    replace_floats(after / "host-tp0", [(1, 1)] * 4 + [(1 + 2**-10, 1)] + [(1, 1)] * 3)
+    report = client.analyze_remote(args, rpc)
+    assert report["status"] == "numeric_analysis_complete"
+    assert report["worst_relative_l2"]["relative_l2"] == pytest.approx(2**-10 / math.sqrt(2))
+    assert "first_error" not in report
+
+
+def test_numeric_report_uses_archived_model_layer_name(tmp_path):
+    args, rpc, after = setup(tmp_path, count=5)
+    args.inspect_start = 4
+    for directory in (tmp_path / "host-a/decode-kv-snapshots/before/host-tp0", after / "host-tp0"):
+        path = directory / "manifest.json"
+        meta = json.loads(path.read_text())
+        meta["layer_names"] = [["model.layers.17.self_attn.attn"]]
+        path.write_text(json.dumps(meta))
+    client.analyze_remote(args, rpc)
+    detail = json.loads((args.output / "tail_layers.jsonl").read_text())
+    assert detail["layer"] == 0
+    assert detail["layer_name"] == "model.layers.17.self_attn.attn"
 
 
 def test_inspect_start_may_select_only_new_rows(tmp_path):
