@@ -73,6 +73,12 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_PREFILL_OVERLAP_STATS": lambda: _strict_bool_env(
         "VLLM_ASCEND_PREFILL_OVERLAP_STATS"
     ),
+    # Host-only batch membership diagnostics; set on P nodes only. Default
+    # false; accepts true/false. Non-secret switch; logs full request IDs and
+    # logical token ranges, never prompt text, tensors, or NPU timing events.
+    "VLLM_ASCEND_PREFILL_BATCH_DEBUG": lambda: _strict_bool_env(
+        "VLLM_ASCEND_PREFILL_BATCH_DEBUG"
+    ),
     # max compile thread number for package building. Usually, it is set to
     # the number of CPU cores. If not set, the default value is None, which
     # means all number of CPU cores will be used.

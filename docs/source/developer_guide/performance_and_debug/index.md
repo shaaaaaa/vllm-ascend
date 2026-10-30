@@ -7,4 +7,5 @@ performance_benchmark
 optimization_and_tuning
 service_profiling_guide
 msprobe_guide
+prefill_batch_debug
 ::::

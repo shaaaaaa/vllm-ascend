@@ -653,6 +653,15 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
         self.max_num_reqs = self.scheduler_config.max_num_seqs
         self.dp_size = vllm_config.parallel_config.data_parallel_size
         self.dp_rank = vllm_config.parallel_config.data_parallel_rank
+        self._prefill_batch_logger = None
+        if envs_ascend.VLLM_ASCEND_PREFILL_BATCH_DEBUG and get_tp_group().rank_in_group == 0:
+            # TP ranks execute the same request batch. Print it once per DP/PP
+            # worker, independently of heavy tensor/fence diagnostic switches.
+            from vllm_ascend.prefill_batch_debug import PrefillBatchLogger
+
+            self._prefill_batch_logger = PrefillBatchLogger(
+                logger.info, dp_rank=self.dp_rank, pp_rank=get_pp_group().rank_in_group
+            )
 
         self.sampler = AscendSampler()
         self.attn_state: AscendAttentionState | None = None
@@ -2777,6 +2786,8 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                     dp_rank=cold_perf_dp_rank,
                 )
             self._cold_perf_forward_interval = None
+            if self._prefill_batch_logger is not None:
+                self._prefill_batch_logger.log(self.input_batch, scheduler_output, ubatch_slices)
             if self._cold_perf_sample_trace_req_ids:
                 self._cold_perf_last_npu_interval = None
                 hidden_states = self._run_cold_perf_npu_stage(
