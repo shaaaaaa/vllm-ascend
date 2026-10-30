@@ -626,7 +626,8 @@ def test_remote_child_argv_preserves_linux_path_and_quoting(tmp_path):
     ]
 
 
-def test_remote_bootstrap_loads_environment_and_preserves_arguments():
+@pytest.mark.parametrize("inherited_libraries", ["", "/opt/test-cann/lib64:/opt/test-mooncake/lib"])
+def test_remote_bootstrap_loads_environment_and_preserves_arguments(inherited_libraries):
     shell = shutil.which("bash")
     if os.name == "nt":
         git = shutil.which("git")
@@ -638,12 +639,16 @@ def test_remote_bootstrap_loads_environment_and_preserves_arguments():
     # Stand in for the sourced file without changing HOME or reading real user
     # settings. Test the actual bootstrap in a child Bash, not a shell mock.
     bootstrap = (
-        """source() { export PREFILL_REPLAY_TEST_ENV=loaded; }
-"""
+        "source() { export PREFILL_REPLAY_TEST_ENV=loaded; export LD_LIBRARY_PATH="
+        + shlex.quote(inherited_libraries)
+        + "; }\n"
         + R.REMOTE_ENV_BOOTSTRAP
     )
     argument = "space ' quote ; $(printf wrong) `printf wrong`"
-    code = "import os,sys,json; print(json.dumps([os.getenv('PREFILL_REPLAY_TEST_ENV'),sys.argv[1:]]))"
+    code = (
+        "import os,sys,json; print(json.dumps([os.getenv('PREFILL_REPLAY_TEST_ENV'),"
+        "sys.argv[1:],os.getenv('LD_LIBRARY_PATH')]))"
+    )
     result = subprocess.run(
         [
             shell,
@@ -662,7 +667,25 @@ def test_remote_bootstrap_loads_environment_and_preserves_arguments():
         timeout=15,
     )
     assert result.returncode == 0, result.stderr
-    assert json.loads(result.stdout) == ["loaded", [argument]]
+    expected_libraries = "/usr/local/lib" + (":" + inherited_libraries if inherited_libraries else "")
+    if os.name == "nt":
+        # Git Bash translates this loader path for a native Windows Python.
+        # Linux children receive the original colon-separated POSIX paths.
+        expected_libraries = ";".join(
+            str(Path(shell).resolve().parent.parent / p.lstrip("/")) for p in expected_libraries.split(":")
+        )
+    assert json.loads(result.stdout) == ["loaded", [argument], expected_libraries]
+
+
+@pytest.mark.parametrize("inherited", [None, "", "/opt/test-cann/lib64"])
+def test_local_child_library_environment_preserves_existing_paths(monkeypatch, inherited):
+    if inherited is None:
+        monkeypatch.delenv("LD_LIBRARY_PATH", raising=False)
+    else:
+        monkeypatch.setenv("LD_LIBRARY_PATH", inherited)
+    env = R.child_environment(NS(snapshot_host=None, _passwords={}))
+    assert env["LD_LIBRARY_PATH"] == "/usr/local/lib" + (":" + inherited if inherited else "")
+    assert os.environ.get("LD_LIBRARY_PATH") == inherited
 
 
 @pytest.mark.parametrize("failure", ["backend_import", "npu_init", "cache_import"])

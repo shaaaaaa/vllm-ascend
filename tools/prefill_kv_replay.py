@@ -37,6 +37,7 @@ PREFIX = "[PREFILL_REPLAY]"
 # remain positional: never interpolate credentials, paths, or plans into shell.
 REMOTE_ENV_BOOTSTRAP = """source ~/.bashrc >/dev/null 2>&1 || true
 case "$1" in */*) export PATH="${1%/*}:$PATH" ;; esac
+export LD_LIBRARY_PATH="/usr/local/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 exec "$@"
 """
 
@@ -185,6 +186,10 @@ def child_argv(args, *parts: str) -> list[str]:
 
 def child_environment(args) -> dict:
     env = dict(os.environ)
+    # The serving launcher exports this after sourcing bashrc. It must be set
+    # before exec, since the ELF loader reads its search path at process start.
+    inherited_libraries = env.get("LD_LIBRARY_PATH", "")
+    env["LD_LIBRARY_PATH"] = "/usr/local/lib" + (":" + inherited_libraries if inherited_libraries else "")
     if args.snapshot_host in args._passwords:
         env.update(
             SSH_ASKPASS=args._askpass,

@@ -88,8 +88,11 @@ Use the container that is currently running; the tool does not start or stop
 containers. Remote children run under `bash -lc` and source `~/.bashrc`, matching
 the serving template, before executing the explicitly selected Python. This
 loads the container's Ascend/library environment instead of assuming a bare
-`docker exec python` inherits the serving process's shell environment. Torch,
-the NPU context, and cache-key dependencies are checked before raw-file scans;
+`docker exec python` inherits the serving process's shell environment.
+The launcher also prepends `/usr/local/lib` to `LD_LIBRARY_PATH`, as the serving
+script does for `ascend_transport.so`, preserving existing toolkit paths. This
+is done before starting Python, for both local and remote injection processes.
+Torch, the NPU context, and cache-key dependencies are checked before raw-file scans;
 loader failures retain their underlying exception in both the log and terminal.
 The snapshot directory defaults to `WORKSPACE/decode-kv-snapshots`.
 `--snapshot-root PATH` selects a different existing capture directory. Omit
