@@ -1,0 +1,511 @@
+# SPDX-License-Identifier: Apache-2.0
+"""CPU validation of exact turn reconstruction and native seed wire bytes."""
+
+import ctypes
+import hashlib
+import json
+import sys
+from contextlib import contextmanager
+from pathlib import Path
+from types import SimpleNamespace as NS
+
+import pytest
+
+TOOLS = Path(__file__).resolve().parents[2] / "tools"
+sys.path.insert(0, str(TOOLS))
+import prefill_kv_replay as R  # noqa: E402
+import prefill_kv_seed as S  # noqa: E402
+
+
+def save(path, data):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data), encoding="utf-8")
+
+
+def make_run(root):
+    prefix, article, answer, added = "unique\r\n", "原文\n", "回答\r\n", "\n用户：问题\n助手：\n"
+    history = prefix + article
+    session = root / "sessions" / "000"
+    session.mkdir(parents=True)
+    (root / "initial_prompt.txt").write_bytes(article.encode())
+    (session / "session_prefix.txt").write_bytes(prefix.encode())
+    rows = []
+    for turn in range(2):
+        folder = session / "turns" / f"{turn:03}"
+        folder.mkdir(parents=True)
+        if turn:
+            history += answer + added
+        (folder / "added_input.txt").write_bytes((added if turn else "").encode())
+        (folder / "output.txt").write_bytes(("坏答案" if turn else answer).encode())
+        payload = dict(
+            model="alias",
+            request_id=f"request-{turn}",
+            temperature=0,
+            max_tokens=128,
+            stream=True,
+            stream_options={"include_usage": True},
+            session_id=0,
+            round=turn,
+            prompt_chars=len(history),
+            prompt_source="pieces",
+        )
+        save(folder / "request.json", payload)
+        rows.append(
+            dict(
+                session_id=0,
+                round=turn,
+                response_id=f"response-{turn}",
+                request_id=f"request-{turn}",
+                prompt_tokens=11 + turn * 3,
+                cached_tokens=8 if turn else None,
+            )
+        )
+    save(
+        root / "summary.json",
+        dict(
+            sessions=[dict(session_id=0, directory="sessions/000")],
+            warmups=rows[:1],
+            rounds=rows[1:],
+        ),
+    )
+    return history
+
+
+def schema():
+    return dict(
+        version=3,
+        use_mla=True,
+        use_layerwise=True,
+        dsa_two_groups=True,
+        page_first_multi_buffer=True,
+        save_chunk_meta=False,
+        chunk_size=4,
+        dtype="torch.bfloat16",
+        group0_raw_token_dim=2,
+        group1_raw_token_dim=2,
+        runtime_kv_groups=[[2, ["l0", "l1"]], [1, ["i0"]]],
+    )
+
+
+def contract():
+    value = schema()
+    signature = hashlib.blake2b(
+        json.dumps(value, sort_keys=True, separators=(",", ":")).encode(), digest_size=8
+    ).hexdigest()
+    return dict(schema=value, signature=signature, algorithm="sha256_cbor", hash_root=repr(b"root"))
+
+
+def log_file(path, hash_root=b"root", pid=1):
+    c = contract()
+    path.write_text(
+        f"(Worker_DP0_TP1_EP1 pid={pid}) Initialized NONE_HASH={hash_root!r} from vLLM (>= PR#20511)\n"
+        f"(Worker_DP0_TP1_EP1 pid={pid}) Using hash algorithm=sha256_cbor; Mooncake payload layout: "
+        f"signature={c['signature']} role=worker rank=1 schema={c['schema']!r} (token_database.py)\n"
+        "Connected to remote storage at mooncakestore://10.0.0.1:50051/\n",
+        encoding="utf-8",
+    )
+
+
+def snapshot(root):
+    tokens = list(range(11))
+    for rank in range(2):
+        folder = root / "response-0" / f"rank{rank}"
+        folder.mkdir(parents=True)
+        save(folder / "tokens.json", tokens)
+        files = []
+        for group, count in enumerate((2, 1)):
+            for layer in range(count):
+                name = f"g{group}-l{layer}-c0.bin"
+                data = bytes((i + group * 30 + layer * 20) % 256 for i in range(44))
+                (folder / name).write_bytes(data)
+                files.append(
+                    dict(
+                        group=group,
+                        layer=layer,
+                        component=0,
+                        row_bytes=4,
+                        dtype="torch.bfloat16",
+                        start=0,
+                        end=11,
+                        bytes=44,
+                        path=name,
+                    )
+                )
+        save(
+            folder / "manifest.json",
+            dict(
+                format="decode-kv-raw-v1",
+                request_id="response-0",
+                status="complete",
+                tp_rank=rank,
+                tp_size=2,
+                byteorder=sys.byteorder,
+                tokens=11,
+                groups=[2, 1],
+                layer_names=[["l0", "l1"], ["i0"]],
+                files=files,
+            ),
+        )
+        save(folder / "replay.json", dict(runtime=dict(engine_options=dict(model="/model"))))
+    return dict(
+        snapshot_root=str(root),
+        previous="response-0",
+        cached_tokens=8,
+        prefix_digest=S.token_digest(tokens[:8]),
+        previous_prompt_tokens=11,
+        previous_prompt_digest=S.token_digest(tokens),
+        model_path="/model",
+        contract=contract(),
+        tp_size=2,
+        workers=2,
+        seed_device=0,
+        release_file=str(root / "lease.release"),
+        hold_seconds=2,
+        local_hostname="127.0.0.1",
+        master="127.0.0.1:50051",
+        store_bytes=1024,
+    )
+
+
+def test_reconstruct_exact_payload_and_no_new_session_prefix(tmp_path):
+    history = make_run(tmp_path)
+    result = R.restore_turn(tmp_path, 0, 1)
+    assert result["payload"]["prompt"] == history
+    assert "\r\n" in history
+    assert result["previous_text"] == "unique\r\n原文\n"
+    assert result["payload"]["temperature"] == 0
+    assert result["payload"]["max_tokens"] == 128
+    assert result["payload"]["request_id"].startswith("replay-")
+    assert "prompt_chars" not in result["payload"]
+    assert result["cached_tokens"] == 8
+
+
+def test_changed_client_files_fail_before_seeding(tmp_path):
+    make_run(tmp_path)
+    (tmp_path / "initial_prompt.txt").write_text("changed")
+    with pytest.raises(ValueError, match="length differs"):
+        R.restore_turn(tmp_path, 0, 1)
+
+
+def test_parse_live_abi_and_conflicting_hash_roots(tmp_path):
+    log_file(tmp_path / "a.log")
+    c = S.live_contract([tmp_path / "a.log"])
+    assert c["hash_root"] == repr(b"root")
+    assert c["master"] == "10.0.0.1:50051"
+    assert c["tp_size"] == 2
+    log_file(tmp_path / "b.log", hash_root=b"other", pid=2)
+    with pytest.raises(ValueError, match="one common"):
+        S.live_contract([tmp_path / "a.log", tmp_path / "b.log"])
+
+
+def test_tail_excluded_and_group_plane_order(tmp_path):
+    plan = snapshot(tmp_path)
+    tokens, rows = S.validate_snapshot(plan)
+    assert tokens == list(range(8))  # Never seed the saved 8..11 tail; it must be recomputed.
+    target = bytearray(32)
+    assert S.fill_page(rows, 0, 4, 8, memoryview(target)) == 32
+    assert target == bytes(range(16, 32)) + bytes(range(36, 52))
+
+
+@pytest.mark.parametrize("failure", ["tokens", "tp_bytes", "layout", "model", "partial"])
+def test_incompatible_snapshots_rejected(tmp_path, failure):
+    plan = snapshot(tmp_path)
+    if failure == "tokens":
+        plan["prefix_digest"] = "wrong"
+    elif failure == "tp_bytes":
+        path = tmp_path / "response-0/rank1/g1-l0-c0.bin"
+        data = bytearray(path.read_bytes())
+        data[1] ^= 1
+        path.write_bytes(data)
+    elif failure == "layout":
+        plan["contract"]["schema"]["runtime_kv_groups"][0][1][0] = "wrong"
+    elif failure == "model":
+        plan["model_path"] = "/wrong"
+    else:
+        plan["cached_tokens"] = 7
+    with pytest.raises(ValueError):
+        S.validate_snapshot(plan)
+
+
+def test_actual_hash_input_and_lmcache_key_serializer(monkeypatch):
+    calls = []
+
+    def hash_fn(value):
+        calls.append(value)
+        return b"hashed" + bytes([len(calls)])
+
+    class Key:
+        def __init__(self, model, world, worker, value, dtype, tags, kv_group):
+            self.identity = model, world, worker, value, dtype, tags, kv_group
+
+    monkeypatch.setitem(sys.modules, "vllm.utils.hashing", NS(get_hash_fn_by_name=lambda _: hash_fn))
+    monkeypatch.setitem(sys.modules, "lmcache.utils", NS(CacheEngineKey=Key))
+    monkeypatch.setitem(
+        sys.modules, "lmcache.v1.token_database", NS(DSA_INDEX_CACHE_SCHEMA="v2", DSA_INDEX_CACHE_SCHEMA_TAG="idx")
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "lmcache.v1.mooncake_layout",
+        NS(MOONCAKE_PAYLOAD_LAYOUT_TAG="layout", mooncake_page_key=lambda k, n: (k.identity, n)),
+    )
+    c = contract()
+    keys = list(S.page_keys(dict(contract=c, model_path="/model"), list(range(8))))
+    assert calls == [(b"root", (0, 1, 2, 3), ()), (b"hashed\x01", (4, 5, 6, 7), ())]
+    assert [(g, a, b) for _, g, a, b in keys] == [(0, 0, 4), (1, 0, 4), (0, 4, 8), (1, 4, 8)]
+    assert keys[1][0][0][1:3] == (1, 0)
+    assert keys[1][0][0][5] == {"layout": c["signature"], "idx": "v2"}
+
+
+@pytest.mark.parametrize("corrupt", [False, True])
+def test_native_seed_readback_before_ready(tmp_path, monkeypatch, capsys, corrupt):
+    plan = snapshot(tmp_path)
+
+    class Store:
+        def __init__(self):
+            self.data = {}
+            self.closed = False
+
+        def setup(self, *args):
+            return 0
+
+        def batch_is_exist(self, keys):
+            return [0] * len(keys)
+
+        def register_buffer(self, *args):
+            return 0
+
+        def unregister_buffer(self, *args):
+            pass
+
+        def get_hostname(self):
+            return "seed-owned"
+
+        def get_replica_desc(self, key):
+            descriptor = NS(buffer_descriptor=NS(transport_endpoint="seed-owned", size=len(self.data[key])))
+            return [NS(is_memory_replica=lambda: True, get_memory_descriptor=lambda: descriptor)]
+
+        def batch_put_from_multi_buffers(self, keys, ptrs, sizes, config):
+            self.data[keys[0]] = ctypes.string_at(ptrs[0][0], sizes[0][0])
+            return [0]
+
+        def batch_get_into_multi_buffers(self, keys, ptrs, sizes):
+            data = self.data[keys[0]]
+            if corrupt:
+                data = bytes([data[0] ^ 1]) + data[1:]
+            ctypes.memmove(ptrs[0][0], data, len(data))
+            if len(self.data) == 4:
+                Path(plan["release_file"]).touch()
+            return [len(data)]
+
+        def close(self):
+            self.closed = True
+
+    store = Store()
+    monkeypatch.setitem(sys.modules, "mooncake.store", NS(MooncakeDistributedStore=lambda: store, ReplicateConfig=NS))
+    monkeypatch.setitem(sys.modules, "torch_npu", NS(npu=NS(set_device=lambda _: None, init=lambda: None)))
+    monkeypatch.setattr(S, "page_keys", lambda p, t: [(f"{g}:{i}", g, i, i + 4) for i in (0, 4) for g in (0, 1)])
+    monkeypatch.setattr(S.signal, "signal", lambda *_: None)
+    if corrupt:
+        with pytest.raises(RuntimeError, match="readback differs"):
+            S.seed(plan)
+    else:
+        S.seed(plan)
+    assert ('"status": "ready"' in capsys.readouterr().out) is not corrupt
+    assert store.closed
+    assert len(store.data["0:0"]) == 32
+
+
+def test_prepare_uses_live_tokenizer_and_does_not_run_inference(tmp_path, monkeypatch):
+    make_run(tmp_path / "run")
+    log_file(tmp_path / "p.log")
+    calls = []
+
+    def http(url, path, body=None):
+        calls.append(path)
+        if path == "/v1/models":
+            return {"data": [{"id": "alias", "root": "/model"}]}
+        return {"tokens": list(range(14 if "问题" in body["prompt"] else 11))}
+
+    monkeypatch.setattr(R, "http_json", http)
+    args = R.parser().parse_args(
+        [
+            "--run-dir",
+            str(tmp_path / "run"),
+            "--base-url",
+            "http://proxy:8000",
+            "--p-url",
+            "http://P:7910",
+            "--p-logs",
+            str(tmp_path / "p.log"),
+        ]
+    )
+    (tmp_path / "out").mkdir()
+    restored, plan = R.prepare(args, tmp_path / "out")
+    assert calls == ["/v1/models", "/tokenize", "/tokenize"]
+    assert plan["cached_tokens"] == 8
+    tail = json.loads((tmp_path / "out/input_tail_tokens.json").read_text())
+    assert tail["token_ids"] == list(range(8, 14))
+    assert "kv_transfer_params" not in restored["payload"]
+
+
+def test_release_cannot_touch_serving_paths(tmp_path, monkeypatch):
+    monkeypatch.setattr(R, "REPO", tmp_path)
+    with pytest.raises(ValueError):
+        R.release_child(str(tmp_path / "tp4_dp4_logs" / "P.log"))
+    path = tmp_path / "prefill-kv-replays/leases" / ("a" * 32 + ".release")
+    R.release_child(str(path))
+    assert path.exists()
+
+
+def test_mixed_indexer_wire_order(tmp_path):
+    plan = snapshot(tmp_path)
+    value = plan["contract"]["schema"]
+    value["group1_raw_token_dim"] = 128
+    value["runtime_kv_groups"][1] = [2, ["i0", "i1"]]
+    value["indexer_execution"] = dict(c8_layers=[True, False])
+    for rank in range(2):
+        folder = tmp_path / f"response-0/rank{rank}"
+        meta = json.loads((folder / "manifest.json").read_text())
+        meta["groups"][1] = 2
+        meta["layer_names"][1] = ["i0", "i1"]
+        meta["files"] = [r for r in meta["files"] if r["group"] == 0]
+        for layer, component, width, dtype, byte in (
+            (0, 0, 128, "torch.int8", 21),
+            (0, 1, 2, "torch.float16", 77),
+            (1, 0, 256, "torch.bfloat16", 109),
+        ):
+            name = f"g1-l{layer}-c{component}.bin"
+            (folder / name).write_bytes(bytes([byte]) * 11 * width)
+            meta["files"].append(
+                dict(
+                    group=1,
+                    layer=layer,
+                    component=component,
+                    row_bytes=width,
+                    dtype=dtype,
+                    start=0,
+                    end=11,
+                    bytes=11 * width,
+                    path=name,
+                )
+            )
+        save(folder / "manifest.json", meta)
+    _, rows = S.validate_snapshot(plan)
+    target = bytearray(4 * (128 + 2 + 256))
+    assert S.fill_page(rows, 1, 4, 8, memoryview(target)) == len(target)
+    assert target == bytes([21]) * (4 * 128) + bytes([77]) * (4 * 2) + bytes([109]) * (4 * 256)
+
+
+def test_real_case_frontier_recomputes_372_not_90(tmp_path, monkeypatch):
+    make_run(tmp_path / "run")
+    summary_path = tmp_path / "run/summary.json"
+    summary = json.loads(summary_path.read_text())
+    summary["warmups"][0]["prompt_tokens"] = 499994
+    summary["rounds"][0].update(prompt_tokens=500084, cached_tokens=499712)
+    save(summary_path, summary)
+    log_file(tmp_path / "p.log")
+
+    def http(url, path, body=None):
+        if path == "/v1/models":
+            return {"data": [{"id": "alias", "root": "/model"}]}
+        return {"tokens": list(range(500084 if "问题" in body["prompt"] else 499994))}
+
+    monkeypatch.setattr(R, "http_json", http)
+    args = R.parser().parse_args(["--run-dir", str(tmp_path / "run"), "--p-logs", str(tmp_path / "p.log")])
+    out = tmp_path / "out"
+    out.mkdir()
+    _, plan = R.prepare(args, out)
+    tail = json.loads((out / "input_tail_tokens.json").read_text())
+    assert plan["cached_tokens"] == 499712
+    assert tail["token_ids"] == list(range(499712, 500084))
+    assert len(tail["token_ids"]) == 372
+
+
+@pytest.mark.parametrize("cached", [8, 0, None])
+def test_existing_pd_orchestration_and_cache_miss_verdict(tmp_path, monkeypatch, cached):
+    make_run(tmp_path / "run")
+    log_file(tmp_path / "p.log")
+    monkeypatch.setattr(R, "REPO", tmp_path)
+    active = []
+    calls = []
+
+    def http(url, path, body=None):
+        calls.append((url, path))
+        if path == "/v1/models":
+            return {"data": [{"id": "alias", "root": "/model"}]}
+        return {"tokens": list(range(14 if "问题" in body["prompt"] else 11))}
+
+    @contextmanager
+    def seeded(args, plan, output):
+        active.append("seed")
+        yield NS(poll=lambda: None)
+        active.clear()
+
+    class Client:
+        def __init__(self, url, timeout):
+            assert url == "http://proxy:8000"
+
+        def complete(self, payload, output):
+            assert active == ["seed"]
+            assert payload["prompt"].startswith("unique\r\n原文")
+            return "回放回答", dict(
+                cached_tokens=cached,
+                prompt_tokens=14,
+                uncached_prompt_tokens=6,
+                ttft_s=0.1,
+                response_id="replay-response",
+            )
+
+    monkeypatch.setattr(R, "http_json", http)
+    monkeypatch.setattr(R, "seeded", seeded)
+    monkeypatch.setattr(R, "Client", Client)
+    argv = [
+        "--run-dir",
+        str(tmp_path / "run"),
+        "--p-logs",
+        str(tmp_path / "p.log"),
+        "--base-url",
+        "http://proxy:8000",
+        "--p-url",
+        "http://P:7910",
+    ]
+    if cached == 8:
+        assert R.main(argv) == 0
+        assert not active
+    else:
+        with pytest.raises(RuntimeError, match="Cache mismatch"):
+            R.main(argv)
+    (path,) = (tmp_path / "prefill-kv-replays").glob("*/report.json")
+    report = json.loads(path.read_text())
+    assert report["status"] == ("replay_complete" if cached == 8 else "failed")
+    assert report["accuracy_verdict"] == "not_assessed"
+    assert calls == [("http://P:7910", p) for p in ("/v1/models", "/tokenize", "/tokenize")]
+
+
+def test_remote_child_argv_preserves_linux_path_and_quoting(tmp_path):
+    import shlex
+
+    args = R.parser().parse_args(
+        [
+            "--snapshot-host",
+            "root@host",
+            "--workspace",
+            "/work space/repo",
+            "--container",
+            "serving",
+            "--remote-python",
+            "/usr/bin/python3",
+        ]
+    )
+    command = R.child_argv(args, "--release-child", "/work space/repo/leases/test.release")
+    assert command[:2] == ["ssh", "-T"]
+    assert shlex.split(command[-1]) == [
+        "docker",
+        "exec",
+        "--",
+        "serving",
+        "/usr/bin/python3",
+        "/work space/repo/tools/prefill_kv_replay.py",
+        "--release-child",
+        "/work space/repo/leases/test.release",
+    ]
