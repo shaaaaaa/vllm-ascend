@@ -34,6 +34,11 @@ when present, its model identity must also agree with the current P server.
    to match the original request. A missing cache count or cache miss is a
    failed replay, even if the server returned an answer.
 
+For mixed indexers, the descriptor's `group1_raw_token_dim` is already a byte
+capacity. Per-layer validation uses the precision policy and `head_dim`: a
+128-element BF16 key is 256 bytes; C8 uses 128 key bytes plus a 2-byte FP16 scale.
+An incompatible snapshot reports both the actual and expected plane layouts.
+
 For session 0 in the reported case, round 0 has 499994 prompt tokens and round 1
 has 500084. The script seeds `[0, 499712)` and P recomputes
 `[499712, 500084)`: **372 tokens**, comprising the 282-token old tail and 90 new

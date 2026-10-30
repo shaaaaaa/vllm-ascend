@@ -419,23 +419,38 @@ def test_release_cannot_touch_serving_paths(tmp_path, monkeypatch):
     assert path.exists()
 
 
-def test_mixed_indexer_wire_order(tmp_path):
+def indexer_snapshot(tmp_path, policy):
     plan = snapshot(tmp_path)
     value = plan["contract"]["schema"]
-    value["group1_raw_token_dim"] = 128
-    value["runtime_kv_groups"][1] = [2, ["i0", "i1"]]
-    value["indexer_execution"] = dict(c8_layers=[True, False])
+    # Production resolve_mooncake_dsa_raw_token_dims returns max packet BYTES
+    # for C8, including mixed precision. It does not return head_dim here.
+    value["group1_raw_token_dim"] = 130 if all(policy) else 256
+    names = [f"i{i}" for i in range(len(policy))]
+    value["runtime_kv_groups"][1] = [len(policy), names]
+    value["indexer_execution"] = dict(
+        layout="dsa-index-c8-planar-v1" if all(policy) else "dsa-index-mixed-planar-v1",
+        quantization="hadamard128-dynamic-int8-fp16-scale-v1",
+        head_dim=128,
+        key_dtype="int8" if all(policy) else "per-layer-int8-or-model-dtype",
+        scale_dtype="float16",
+        storage_dtype="uint8",
+    )
+    if not all(policy):
+        value["indexer_execution"]["c8_layers"] = list(policy)
+    components = []
+    for layer, c8 in enumerate(policy):
+        if c8:
+            components.extend([(layer, 0, 128, "torch.int8", 21), (layer, 1, 2, "torch.float16", 77)])
+        else:
+            components.append((layer, 0, 256, "torch.bfloat16", 109))
     for rank in range(2):
         folder = tmp_path / f"response-0/rank{rank}"
+        (folder / "replay.json").unlink()  # The reported failure used legacy snapshots.
         meta = json.loads((folder / "manifest.json").read_text())
-        meta["groups"][1] = 2
-        meta["layer_names"][1] = ["i0", "i1"]
+        meta["groups"][1] = len(policy)
+        meta["layer_names"][1] = names
         meta["files"] = [r for r in meta["files"] if r["group"] == 0]
-        for layer, component, width, dtype, byte in (
-            (0, 0, 128, "torch.int8", 21),
-            (0, 1, 2, "torch.float16", 77),
-            (1, 0, 256, "torch.bfloat16", 109),
-        ):
+        for layer, component, width, dtype, byte in components:
             name = f"g1-l{layer}-c{component}.bin"
             (folder / name).write_bytes(bytes([byte]) * 11 * width)
             meta["files"].append(
@@ -452,10 +467,41 @@ def test_mixed_indexer_wire_order(tmp_path):
                 )
             )
         save(folder / "manifest.json", meta)
+    return plan, components
+
+
+@pytest.mark.parametrize(
+    "policy",
+    [(False, True), (True, False), (True, True), (False, False), (False,) * 3 + (True,) * 16 + (False,) * 3],
+)
+def test_mixed_indexer_wire_order(tmp_path, policy):
+    plan, components = indexer_snapshot(tmp_path, policy)
     _, rows = S.validate_snapshot(plan)
-    target = bytearray(4 * (128 + 2 + 256))
+    target = bytearray(4 * sum(width for _, _, width, _, _ in components))
     assert S.fill_page(rows, 1, 4, 8, memoryview(target)) == len(target)
-    assert target == bytes([21]) * (4 * 128) + bytes([77]) * (4 * 2) + bytes([109]) * (4 * 256)
+    assert target == b"".join(bytes([byte]) * (4 * width) for _, _, width, _, byte in components)
+
+
+@pytest.mark.parametrize(
+    "layer,component,dtype,width",
+    [
+        (0, 0, "torch.bfloat16", 512),
+        (1, 0, "torch.int8", 256),
+        (1, 1, "torch.float32", 4),
+    ],
+)
+def test_mixed_indexer_still_rejects_wrong_planes(tmp_path, layer, component, dtype, width):
+    plan, _ = indexer_snapshot(tmp_path, (False, True))
+    folder = tmp_path / "response-0/rank0"
+    path = folder / "manifest.json"
+    meta = json.loads(path.read_text())
+    for row in meta["files"]:
+        if (row["group"], row["layer"], row["component"]) == (1, layer, component):
+            row.update(dtype=dtype, row_bytes=width, bytes=11 * width)
+            (folder / row["path"]).write_bytes(bytes(11 * width))
+    save(path, meta)
+    with pytest.raises(ValueError, match="actual=.*expected="):
+        S.validate_snapshot(plan)
 
 
 def test_real_case_frontier_recomputes_372_not_90(tmp_path, monkeypatch):

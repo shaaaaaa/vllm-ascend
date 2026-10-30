@@ -140,21 +140,38 @@ def validate_snapshot(plan: dict) -> tuple[list[int], dict]:
     size = {"torch.bfloat16": 2, "torch.float16": 2, "torch.float32": 4}.get(schema["dtype"])
     if not size:
         raise ValueError("Unsupported live model dtype")
+    if c8 and c8.get("head_dim") != 128:
+        raise ValueError("Unsupported C8 indexer head dimension")
     for group, layers in enumerate(meta["groups"]):
         for layer in range(layers):
             parts = [row for (g, idx, _), (row, _) in sorted(rows.items()) if (g, idx) == (group, layer)]
             if [p["component"] for p in parts] != list(range(len(parts))):
                 raise ValueError("Non-contiguous snapshot components")
+            actual = [(p["dtype"], p["row_bytes"]) for p in parts]
             if group == 0:
-                valid = sum(p["row_bytes"] for p in parts) == schema["group0_raw_token_dim"] * size
+                expected_bytes = schema["group0_raw_token_dim"] * size
+                expected = f"dtype={schema['dtype']} total_row_bytes={expected_bytes}"
+                valid = sum(p["row_bytes"] for p in parts) == expected_bytes
                 valid = valid and all(p["dtype"] == schema["dtype"] for p in parts)
-            elif c8 and (not c8.get("c8_layers") or c8["c8_layers"][layer]):
-                valid = [(p["dtype"], p["row_bytes"]) for p in parts] == [("torch.int8", 128), ("torch.float16", 2)]
             else:
-                valid = len(parts) == 1 and parts[0]["dtype"] == schema["dtype"]
-                valid = valid and parts[0]["row_bytes"] == schema["group1_raw_token_dim"] * size
+                if c8:
+                    # Under C8/mixed storage group1_raw_token_dim is already
+                    # the MAX packet width in BYTES (130 or 256), not a head
+                    # dimension. Reconstruct each layer from its head/policy.
+                    quantized = not c8.get("c8_layers") or c8["c8_layers"][layer]
+                    expected = (
+                        [("torch.int8", c8["head_dim"]), ("torch.float16", 2)]
+                        if quantized
+                        else [(schema["dtype"], c8["head_dim"] * size)]
+                    )
+                else:
+                    expected = [(schema["dtype"], schema["group1_raw_token_dim"] * size)]
+                valid = actual == expected
             if not valid:
-                raise ValueError(f"Saved wire layout disagrees with live P: group={group} layer={layer}")
+                raise ValueError(
+                    f"Saved wire layout disagrees with live P: group={group} layer={layer} "
+                    f"actual={actual} expected={expected}"
+                )
     comparisons = []
     for rank, (other, other_tokens, other_rows) in workers.items():
         validate_snapshot_model(other, next(iter(other_rows.values()))[1].parent, plan["model_path"])
