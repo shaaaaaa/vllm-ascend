@@ -1,6 +1,6 @@
 # 比较两轮 D 端收到的完整 KV
 
-在 D 的服务启动环境设置 `LMCACHE_DECODE_KV_SNAPSHOT_DIR`，例如 `/workspace/fsi_lab/sqh/vllm-ascend/decode-kv-snapshots`。P 不开启。使用正常图模式，关闭旧 STORE_DEBUG、FENCE_DEBUG、AUDIT 后运行多轮测试。等待两个请求各 TP rank 的 `[D_KV_SNAPSHOT] ... complete`。
+在 D 的服务启动环境设置 `LMCACHE_DECODE_KV_SNAPSHOT=1`。无需配置保存目录，会自动在实际加载的 vllm-ascend 根目录下创建 `decode-kv-snapshots`，不受启动命令工作目录影响。P 不开启。使用正常图模式，关闭旧 STORE_DEBUG、FENCE_DEBUG、AUDIT 后运行多轮测试。等待两个请求各 TP rank 的 `[D_KV_SNAPSHOT] ... complete`。
 
 ## 从两台 D 收集并比较
 
@@ -18,7 +18,7 @@ python3 tools/decode_kv_compare.py \
   --output ./decode-kv-check
 ```
 
-保存目录不在 workspace 下时加 `--snapshot-dir /实际绝对路径`；目录只在容器中可见时加 `--container 容器名`。密码也可用 `--password-env 环境变量名`。使用系统 OpenSSH/SSH_ASKPASS，不需要 sshpass。密码不会写进收集清单。
+收集脚本自动在 workspace 或其 `vllm-ascend` 子目录下寻找 `decode-kv-snapshots`，不需要传 `--snapshot-dir`。目录只在容器中可见时加 `--container 容器名`。密码也可用 `--password-env 环境变量名`。使用系统 OpenSSH/SSH_ASKPASS，不需要 sshpass。密码不会写进收集清单。
 
 远端通过 gzip level 1 压缩流传输；本地下载完成后解包，自动删除临时压缩包。解包期间需要同时容纳压缩包和原始文件。一次收集可以复用；不要在文件仍写入时收集。
 
