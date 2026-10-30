@@ -1,9 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 """CPU validation of exact turn reconstruction and native seed wire bytes."""
 
+import builtins
 import ctypes
 import hashlib
 import json
+import os
+import shlex
+import shutil
+import subprocess
 import sys
 from contextlib import contextmanager
 from pathlib import Path
@@ -591,8 +596,6 @@ def test_existing_pd_orchestration_and_cache_miss_verdict(tmp_path, monkeypatch,
 
 
 def test_remote_child_argv_preserves_linux_path_and_quoting(tmp_path):
-    import shlex
-
     args = R.parser().parse_args(
         [
             "--snapshot-host",
@@ -612,8 +615,91 @@ def test_remote_child_argv_preserves_linux_path_and_quoting(tmp_path):
         "exec",
         "--",
         "serving",
+        "bash",
+        "-lc",
+        R.REMOTE_ENV_BOOTSTRAP,
+        "prefill-kv-replay",
         "/usr/bin/python3",
         "/work space/repo/tools/prefill_kv_replay.py",
         "--release-child",
         "/work space/repo/leases/test.release",
     ]
+
+
+def test_remote_bootstrap_loads_environment_and_preserves_arguments():
+    shell = shutil.which("bash")
+    if os.name == "nt":
+        git = shutil.which("git")
+        candidate = Path(git).resolve().parent.parent / "bin/bash.exe" if git else None
+        if candidate and candidate.is_file():
+            shell = str(candidate)
+    if shell is None:
+        pytest.skip("Bash unavailable")
+    # Stand in for the sourced file without changing HOME or reading real user
+    # settings. Test the actual bootstrap in a child Bash, not a shell mock.
+    bootstrap = (
+        """source() { export PREFILL_REPLAY_TEST_ENV=loaded; }
+"""
+        + R.REMOTE_ENV_BOOTSTRAP
+    )
+    argument = "space ' quote ; $(printf wrong) `printf wrong`"
+    code = "import os,sys,json; print(json.dumps([os.getenv('PREFILL_REPLAY_TEST_ENV'),sys.argv[1:]]))"
+    result = subprocess.run(
+        [
+            shell,
+            "--noprofile",
+            "--norc",
+            "-c",
+            bootstrap,
+            "prefill-kv-replay",
+            sys.executable.replace("\\", "/"),
+            "-c",
+            code,
+            argument,
+        ],
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == ["loaded", [argument]]
+
+
+@pytest.mark.parametrize("failure", ["backend_import", "npu_init", "cache_import"])
+def test_runtime_failure_precedes_snapshot_scan(monkeypatch, capsys, failure):
+    real_import = builtins.__import__
+
+    def import_module(name, *args, **kwargs):
+        if failure == "backend_import" and name == "torch":
+            raise RuntimeError("Failed to load backend torch_npu") from ImportError("test missing native library")
+        return real_import(name, *args, **kwargs)
+
+    def init():
+        if failure == "npu_init":
+            raise RuntimeError("test NPU init failure")
+
+    def keys(plan, tokens):
+        assert not tokens
+        raise ImportError("test cache dependency unavailable")
+
+    monkeypatch.setitem(sys.modules, "torch_npu", NS(npu=NS(set_device=lambda _: None, init=init)))
+    monkeypatch.setitem(sys.modules, "mooncake.store", NS(MooncakeDistributedStore=NS, ReplicateConfig=NS))
+    monkeypatch.setattr(S, "page_keys", keys)
+    monkeypatch.setattr(S, "validate_snapshot", lambda _: pytest.fail("Read raw snapshots before runtime preflight"))
+    monkeypatch.setattr(builtins, "__import__", import_module)
+    with pytest.raises((RuntimeError, ImportError)):
+        S.seed(dict(seed_device=0))
+    output = capsys.readouterr().out
+    assert '"status": "runtime_check"' in output
+    assert '"status": "validating"' not in output
+
+
+def test_failure_message_preserves_extension_loader_cause():
+    try:
+        raise RuntimeError("Failed to load backend torch_npu") from ImportError(
+            "test_native.so: cannot open shared object"
+        )
+    except RuntimeError as error:
+        message = R.format_failure(error)
+    assert "RuntimeError: Failed to load backend torch_npu" in message
+    assert "ImportError: test_native.so: cannot open shared object" in message

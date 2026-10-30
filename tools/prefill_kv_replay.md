@@ -85,7 +85,13 @@ container these arguments are:
 ```
 
 Use the container that is currently running; the tool does not start or stop
-containers. The snapshot directory defaults to `WORKSPACE/decode-kv-snapshots`.
+containers. Remote children run under `bash -lc` and source `~/.bashrc`, matching
+the serving template, before executing the explicitly selected Python. This
+loads the container's Ascend/library environment instead of assuming a bare
+`docker exec python` inherits the serving process's shell environment. Torch,
+the NPU context, and cache-key dependencies are checked before raw-file scans;
+loader failures retain their underlying exception in both the log and terminal.
+The snapshot directory defaults to `WORKSPACE/decode-kv-snapshots`.
 `--snapshot-root PATH` selects a different existing capture directory. Omit
 `--snapshot-host` for local snapshots; in that mode the current Python environment
 runs the temporary native client.

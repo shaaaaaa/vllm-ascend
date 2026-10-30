@@ -19,6 +19,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import traceback
 import urllib.request
 import uuid
 from contextlib import contextmanager
@@ -32,6 +33,12 @@ from prefill_kv_seed import live_contract, seed, token_digest
 
 REPO = Path(__file__).resolve().parents[1]
 PREFIX = "[PREFILL_REPLAY]"
+# Match the serving template's container environment initialization. Arguments
+# remain positional: never interpolate credentials, paths, or plans into shell.
+REMOTE_ENV_BOOTSTRAP = """source ~/.bashrc >/dev/null 2>&1 || true
+case "$1" in */*) export PATH="${1%/*}:$PATH" ;; esac
+exec "$@"
+"""
 
 
 def restore_turn(root: Path, session: int, turn: int) -> dict:
@@ -164,6 +171,10 @@ def child_argv(args, *parts: str) -> list[str]:
             args,
             args.snapshot_host,
             [
+                "bash",
+                "-lc",
+                REMOTE_ENV_BOOTSTRAP,
+                "prefill-kv-replay",
                 args.remote_python,
                 str(PurePosixPath(args.workspace) / "tools" / "prefill_kv_replay.py"),
                 *parts,
@@ -255,6 +266,17 @@ def release_child(path: str) -> None:
         raise ValueError("Invalid seed release path")
     parent.mkdir(parents=True, exist_ok=True)
     target.touch()
+
+
+def format_failure(error: BaseException) -> str:
+    """Keep the loader's underlying cause in the parent's compact error line."""
+    chain, seen = [], set()
+    while error is not None and id(error) not in seen and len(chain) < 4:
+        seen.add(id(error))
+        message = " ".join(str(error).splitlines())[:1200]
+        chain.append(f"{type(error).__name__}: {message}")
+        error = error.__cause__ or (None if error.__suppress_context__ else error.__context__)
+    return " <- ".join(chain)
 
 
 def parser() -> argparse.ArgumentParser:
@@ -364,7 +386,7 @@ def main(argv=None) -> int:
             )
         return 0
     except BaseException as error:
-        report.update(status="failed", error=f"{type(error).__name__}: {error}")
+        report.update(status="failed", error=format_failure(error))
         raise
     finally:
         save_json(output / "report.json", report)
@@ -373,6 +395,7 @@ def main(argv=None) -> int:
 if __name__ == "__main__":
     try:
         raise SystemExit(main())
-    except (OSError, ValueError, RuntimeError, KeyError) as error:
-        print(f"{PREFIX} FAILED: {error}", file=sys.stderr)
+    except Exception as error:
+        traceback.print_exception(type(error), error, error.__traceback__)
+        print(f"{PREFIX} FAILED: {format_failure(error)}", file=sys.stderr, flush=True)
         raise SystemExit(1)

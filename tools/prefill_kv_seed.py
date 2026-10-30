@@ -249,8 +249,7 @@ def seed(plan: dict) -> None:
     """Run on the snapshot host, using real native SDK transfers and replicas."""
     import threading
 
-    print(PREFIX + json.dumps(dict(status="validating", previous=plan["previous"])), flush=True)
-    tokens, rows = validate_snapshot(plan)
+    print(PREFIX + json.dumps(dict(status="runtime_check", python=sys.executable)), flush=True)
     import torch
     import torch_npu
     from layerwise_prefill_mooncake_check import detect_local_hostname
@@ -259,6 +258,12 @@ def seed(plan: dict) -> None:
 
     torch_npu.npu.set_device(plan["seed_device"])
     torch_npu.npu.init()
+    # Resolve the same key/hash dependencies as injection, before scanning
+    # hundreds of GB of archived TP copies. Empty input creates no cache keys.
+    list(page_keys(plan, []))
+    print(PREFIX + json.dumps(dict(status="runtime_ready")), flush=True)
+    print(PREFIX + json.dumps(dict(status="validating", previous=plan["previous"])), flush=True)
+    tokens, rows = validate_snapshot(plan)
     keys = list(page_keys(plan, tokens))
     widths = {g: sum(r["row_bytes"] for (group, _, _), (r, _) in rows.items() if group == g) for g in (0, 1)}
     total = len(tokens) * sum(widths.values())
