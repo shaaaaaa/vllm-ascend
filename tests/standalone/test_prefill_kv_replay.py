@@ -136,6 +136,7 @@ def snapshot(root):
             dict(
                 format="decode-kv-raw-v1",
                 request_id="response-0",
+                model="/model",
                 status="complete",
                 tp_rank=rank,
                 tp_size=2,
@@ -205,6 +206,67 @@ def test_tail_excluded_and_group_plane_order(tmp_path):
     target = bytearray(32)
     assert S.fill_page(rows, 0, 4, 8, memoryview(target)) == 32
     assert target == bytes(range(16, 32)) + bytes(range(36, 52))
+
+
+def test_legacy_manifest_without_replay_metadata(tmp_path):
+    plan = snapshot(tmp_path)
+    for path in tmp_path.rglob("replay.json"):
+        path.unlink()
+    tokens, rows = S.validate_snapshot(plan)
+    assert tokens == list(range(8))
+    assert len(rows) == 3
+
+
+@pytest.mark.parametrize("runtime", [None, {"error": "old metadata capture failed"}])
+def test_manifest_does_not_require_d_launch_metadata(tmp_path, runtime):
+    plan = snapshot(tmp_path)
+    for path in tmp_path.rglob("replay.json"):
+        save(path, dict(runtime=runtime))
+    assert S.validate_snapshot(plan)[0] == list(range(8))
+
+
+@pytest.mark.parametrize("failure", ["missing_model", "manifest_conflict", "replay_conflict", "layout", "tokens"])
+def test_legacy_compatibility_keeps_model_and_payload_checks(tmp_path, failure):
+    plan = snapshot(tmp_path)
+    for path in tmp_path.rglob("replay.json"):
+        path.unlink()
+    # Check TP1 as well: its identity must not be discarded when injecting TP0.
+    directory = tmp_path / "response-0/rank1"
+    path = directory / "manifest.json"
+    meta = json.loads(path.read_text())
+    if failure == "missing_model":
+        meta.pop("model")
+    elif failure == "manifest_conflict":
+        meta["model"] = "/different-model"
+        save(directory / "replay.json", dict(runtime=dict(engine_options=dict(model="/model"))))
+    elif failure == "replay_conflict":
+        save(directory / "replay.json", dict(runtime=dict(engine_options=dict(model="/different-model"))))
+    elif failure == "layout":
+        meta["files"][0]["dtype"] = "torch.float16"
+    else:
+        plan["prefix_digest"] = "wrong"
+    save(path, meta)
+    with pytest.raises(ValueError):
+        S.validate_snapshot(plan)
+
+
+def test_replay_model_remains_a_supported_identity_source(tmp_path):
+    plan = snapshot(tmp_path)
+    for path in tmp_path.rglob("manifest.json"):
+        meta = json.loads(path.read_text())
+        meta.pop("model")
+        save(path, meta)
+    assert S.validate_snapshot(plan)[0] == list(range(8))
+
+
+def test_child_failure_message_reaches_caller(tmp_path):
+    log = tmp_path / "seed.log"
+    log.write_text(
+        S.PREFIX + '{"status": "validating"}\n' + R.PREFIX + " FAILED: source model differs\n", encoding="utf-8"
+    )
+    process = NS(poll=lambda: 1, returncode=1)
+    with pytest.raises(RuntimeError, match="Seed failed: source model differs"):
+        R.wait_seed(process, log, 1)
 
 
 @pytest.mark.parametrize("failure", ["tokens", "tp_bytes", "layout", "model", "partial"])

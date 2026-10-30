@@ -7,6 +7,10 @@ It does not modify serving code or enable `p_use`, tensor dumps, or eager mode.
 
 The input is the original `multi-turn-concurrent` directory **and** the raw
 round-0 `decode-kv-snapshots` files. Client logs alone do not contain KV.
+Legacy snapshots without `replay.json` are supported: their `manifest.json`
+already records the source model, layer inventory, and raw file layouts.
+The standalone D launch/sampling metadata in `replay.json` is optional here;
+when present, its model identity must also agree with the current P server.
 
 ## What runs
 

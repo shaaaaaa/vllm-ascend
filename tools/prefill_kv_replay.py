@@ -186,6 +186,7 @@ def child_environment(args) -> dict:
 
 def wait_seed(process, path: Path, timeout: float) -> dict:
     deadline = time.monotonic() + timeout
+    failure = None
     with path.open(encoding="utf-8", errors="replace") as stream:
         while time.monotonic() < deadline:
             line = stream.readline()
@@ -197,8 +198,12 @@ def wait_seed(process, path: Path, timeout: float) -> dict:
                         if process.poll() is not None:
                             raise RuntimeError("Seed process exited before request submission")
                         return item
+                elif line.startswith(PREFIX + " FAILED: "):
+                    failure = line.removeprefix(PREFIX + " FAILED: ").strip()
                 continue
             if process.poll() is not None:
+                if failure:
+                    raise RuntimeError(f"Seed failed: {failure}; log: {path}")
                 raise RuntimeError(f"Seed process exited ({process.returncode}); inspect {path}")
             time.sleep(0.25)
     raise TimeoutError(f"Seed setup timed out; inspect {path}")

@@ -91,6 +91,29 @@ def same_prefix(left: Path, right: Path, count: int) -> bool:
     return True
 
 
+def validate_snapshot_model(meta: dict, directory: Path, model_path: str) -> None:
+    """Legacy raw snapshots already record their model in manifest.json.
+
+    replay.json adds launch/sampling metadata for standalone D replay. Injecting
+    history into an existing PD server does not need those launch settings.
+    When both model identities exist, neither may contradict the live server.
+    """
+    models = []
+    if meta.get("model"):
+        models.append(meta["model"])
+    replay = directory / "replay.json"
+    if replay.is_file():
+        recorded = json.loads(replay.read_text(encoding="utf-8"))
+        runtime = recorded.get("runtime") or {}
+        options = runtime.get("engine_options") or {}
+        if options.get("model"):
+            models.append(options["model"])
+    if not models:
+        raise ValueError("Snapshot lacks source model identity in manifest.json or replay.json")
+    if any(model != model_path for model in models):
+        raise ValueError("Live P model path differs from the saved model; use the same serving weights")
+
+
 def validate_snapshot(plan: dict) -> tuple[list[int], dict]:
     workers = read_workers([Path(plan["snapshot_root"])], plan["previous"])
     meta, tokens, rows = workers[0]
@@ -104,12 +127,6 @@ def validate_snapshot(plan: dict) -> tuple[list[int], dict]:
     previous_count = plan["previous_prompt_tokens"]
     if len(tokens) >= previous_count and token_digest(tokens[:previous_count]) != plan["previous_prompt_digest"]:
         raise ValueError("Previous request token IDs changed under the live tokenizer")
-    metadata_path = next(iter(rows.values()))[1].parent / "replay.json"
-    if not metadata_path.is_file():
-        raise ValueError("Snapshot lacks replay.json needed to verify the source model")
-    recorded = json.loads(metadata_path.read_text(encoding="utf-8"))
-    if recorded.get("runtime", {}).get("engine_options", {}).get("model") != plan["model_path"]:
-        raise ValueError("Live P model path differs from the saved model; use the same serving weights")
     names = schema.get("runtime_kv_groups")
     if names != [[n, layers] for n, layers in zip(meta["groups"], meta["layer_names"])]:
         raise ValueError("Live P and saved snapshot have different layer inventories/order")
@@ -140,6 +157,7 @@ def validate_snapshot(plan: dict) -> tuple[list[int], dict]:
                 raise ValueError(f"Saved wire layout disagrees with live P: group={group} layer={layer}")
     comparisons = []
     for rank, (other, other_tokens, other_rows) in workers.items():
+        validate_snapshot_model(other, next(iter(other_rows.values()))[1].parent, plan["model_path"])
         if other_tokens != tokens or other["groups"] != meta["groups"] or other["layer_names"] != meta["layer_names"]:
             raise ValueError(f"Snapshot TP {rank} token/layer metadata differs")
         if other_rows.keys() != rows.keys():
