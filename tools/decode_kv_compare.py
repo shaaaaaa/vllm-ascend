@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""Collect full D receive archives and compare two rounds' common token prefix.
+"""Compare D receive archives across rounds, using offline remote checksums.
 
-No hashes, sampling, torch or accelerator runtime required for comparison.
-Run after both requests have completed. Only the D hosts need to be supplied.
+Remote mode transfers manifests/checksums and bounded differing segments only.
+Local mode compares full archives exactly. No accelerator runtime is required.
+Run after both requests have completed; only the D hosts need to be supplied.
 """
 
 from __future__ import annotations
@@ -296,18 +297,35 @@ def main(argv=None):
     cli.add_argument("--identity-file", type=Path)
     cli.add_argument("--local", nargs="+", type=Path, help="Reuse prior collections or D snapshot roots")
     cli.add_argument("--workers", type=int, default=4, help="Parallel component readers")
+    cli.add_argument("--segment-tokens", type=int, default=4096, help="Tokens per offline checksum segment")
+    cli.add_argument(
+        "--max-diff-mib",
+        type=int,
+        default=64,
+        help="Max raw differing bytes to fetch across hosts, both copies combined (default: 64 MiB)",
+    )
+    cli.add_argument("--full-transfer", action="store_true", help="Opt in to downloading complete archives")
     cli.add_argument("--output", type=Path, default=Path("decode-kv-comparison"))
     args = cli.parse_args(argv)
     args.password = args.password_per_host = False
-    if args.previous == args.current or args.workers < 1:
-        cli.error("Supply two different requests and a positive worker count")
+    if args.previous == args.current or args.workers < 1 or args.segment_tokens < 1 or args.max_diff_mib < 0:
+        cli.error("Supply different requests, positive workers/segment size, and a nonnegative transfer budget")
+    if args.hosts and args.local and not args.full_transfer:
+        cli.error("Use --hosts for remote checksum comparison or --local for existing full archives")
     args.output.mkdir(parents=True, exist_ok=True)
     roots = list(args.local or [])
     try:
-        if args.hosts:
+        if args.hosts and not args.full_transfer:
+            from decode_kv_compare_segments import analyze_remote
+
+            with password_auth(args):
+                report = analyze_remote(args)
+        elif args.hosts:
             with password_auth(args), ThreadPoolExecutor(max_workers=min(4, len(args.hosts))) as pool:
                 roots.extend(pool.map(lambda host: collect(args, host), args.hosts))
-        report = analyze(roots, args.previous, args.current, args.output, args.workers)
+            report = analyze(roots, args.previous, args.current, args.output, args.workers)
+        else:
+            report = analyze(roots, args.previous, args.current, args.output, args.workers)
     except Exception as error:
         report = dict(status="incomplete", error=str(error))
         (args.output / "report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
