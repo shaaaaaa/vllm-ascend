@@ -324,7 +324,19 @@ def test_actual_hash_input_and_lmcache_key_serializer(monkeypatch):
     assert keys[1][0][0][5] == {"layout": c["signature"], "idx": "v2"}
 
 
-@pytest.mark.parametrize("failure", [None, "readback", "register_first", "register_second", "tp_bytes", "unregister"])
+@pytest.mark.parametrize(
+    "failure",
+    [
+        None,
+        "readback",
+        "register_first",
+        "register_second",
+        "tp_bytes",
+        "unregister",
+        "wrong_endpoint",
+        "transport_init",
+    ],
+)
 def test_native_seed_readback_before_ready(tmp_path, monkeypatch, capsys, failure):
     import torch
 
@@ -355,6 +367,19 @@ def test_native_seed_readback_before_ready(tmp_path, monkeypatch, capsys, failur
         data[1] ^= 1
         path.write_bytes(data)
 
+    native_engine = object()
+
+    class Transport:
+        def initialize(self, host, metadata, protocol, device):
+            assert (host, metadata, protocol, device) == ("127.0.0.1", "P2PHANDSHAKE", "ascend", "")
+            return -9 if failure == "transport_init" else 0
+
+        def get_rpc_port(self):
+            return 16935
+
+        def get_engine(self):
+            return native_engine
+
     class Store:
         def __init__(self):
             self.data = {}
@@ -364,6 +389,7 @@ def test_native_seed_readback_before_ready(tmp_path, monkeypatch, capsys, failur
             self.attempts = 0
 
         def setup(self, *args):
+            assert args[-1] is native_engine
             return 0
 
         def batch_is_exist(self, keys):
@@ -388,14 +414,18 @@ def test_native_seed_readback_before_ready(tmp_path, monkeypatch, capsys, failur
             return -8 if failure == "unregister" else 0
 
         def get_hostname(self):
-            return "seed-owned"
+            return "127.0.0.1:12962"
 
         def get_replica_desc(self, key):
-            descriptor = NS(buffer_descriptor=NS(transport_endpoint="seed-owned", size=len(self.data[key])))
+            # Same host with a different port is NOT sufficient evidence of
+            # ownership. A different process on this node must still fail.
+            endpoint = "127.0.0.1:16936" if failure == "wrong_endpoint" else "127.0.0.1:16935"
+            descriptor = NS(buffer_descriptor=NS(transport_endpoint=endpoint, size=len(self.data[key])))
             return [NS(is_memory_replica=lambda: True, get_memory_descriptor=lambda: descriptor)]
 
         def batch_put_from_multi_buffers(self, keys, ptrs, sizes, config):
             events.append("put")
+            assert config.preferred_segment == self.get_hostname()
             assert ptrs[0][0] in self.registered
             self.data[keys[0]] = ctypes.string_at(ptrs[0][0], sizes[0][0])
             return [0]
@@ -416,6 +446,7 @@ def test_native_seed_readback_before_ready(tmp_path, monkeypatch, capsys, failur
             self.closed = True
 
     store = Store()
+    monkeypatch.setitem(sys.modules, "mooncake.engine", NS(TransferEngine=Transport))
     monkeypatch.setitem(sys.modules, "mooncake.store", NS(MooncakeDistributedStore=lambda: store, ReplicateConfig=NS))
     monkeypatch.setitem(sys.modules, "torch_npu", NS(npu=NS(set_device=lambda _: None, init=lambda: None)))
     monkeypatch.setattr(S, "page_keys", lambda p, t: [(f"{g}:{i}", g, i, i + 4) for i in (0, 4) for g in (0, 1)])
@@ -426,6 +457,8 @@ def test_native_seed_readback_before_ready(tmp_path, monkeypatch, capsys, failur
         "register_second": "pinned seed CPU staging memory: bytes=32 status=-7",
         "tp_bytes": "Saved TP copies differ",
         "unregister": "unregister seed CPU staging memory: status=-8",
+        "wrong_endpoint": "Unexpected Mooncake placement",
+        "transport_init": "TransferEngine initialization failed: -9",
     }
     if failure:
         with pytest.raises((RuntimeError, ValueError), match=errors[failure]):
@@ -438,13 +471,13 @@ def test_native_seed_readback_before_ready(tmp_path, monkeypatch, capsys, failur
     assert events[-1] == "close"
     if failure != "unregister":
         assert store.unregistered == store.registered
-    if failure in ("register_first", "register_second"):
+    if failure in ("register_first", "register_second", "transport_init"):
         assert "scan" not in events
         assert '"status": "staging_ready"' not in output
     else:
         assert events[:3] == ["register", "register", "scan"]
         assert '"status": "staging_ready"' in output
-    if failure in ("register_first", "register_second", "tp_bytes"):
+    if failure in ("register_first", "register_second", "tp_bytes", "transport_init"):
         assert not store.data
     else:
         assert len(store.data["0:0"]) == 32
@@ -774,6 +807,7 @@ def test_runtime_failure_precedes_snapshot_scan(monkeypatch, capsys, failure):
         raise ImportError("test cache dependency unavailable")
 
     monkeypatch.setitem(sys.modules, "torch_npu", NS(npu=NS(set_device=lambda _: None, init=init)))
+    monkeypatch.setitem(sys.modules, "mooncake.engine", NS(TransferEngine=NS))
     monkeypatch.setitem(sys.modules, "mooncake.store", NS(MooncakeDistributedStore=NS, ReplicateConfig=NS))
     monkeypatch.setattr(S, "page_keys", keys)
     monkeypatch.setattr(S, "snapshot_metadata", lambda _: pytest.fail("Read snapshots before runtime preflight"))

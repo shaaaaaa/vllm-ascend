@@ -264,6 +264,7 @@ def seed(plan: dict) -> None:
     import torch_npu
     from layerwise_prefill_mooncake_check import detect_local_hostname
     from layerwise_prefill_mooncake_routing import require_placement
+    from mooncake.engine import TransferEngine
     from mooncake.store import MooncakeDistributedStore, ReplicateConfig
 
     torch_npu.npu.set_device(plan["seed_device"])
@@ -288,12 +289,26 @@ def seed(plan: dict) -> None:
     signal.signal(signal.SIGTERM, lambda *_: stopped.set())
     signal.signal(signal.SIGINT, lambda *_: stopped.set())
     store = MooncakeDistributedStore()
+    # Own the engine explicitly so its actual P2P endpoint is available. The
+    # store's logical segment name (get_hostname) may use a DIFFERENT port.
+    # Keep this owner alive through store.close(), as in the serving connector.
+    transport = TransferEngine()
     registered = []
     try:
         host = plan.get("local_hostname") or detect_local_hostname(plan["master"])
-        status = store.setup(host, "P2PHANDSHAKE", capacity, 0, "ascend", "", plan["master"])
+        status = transport.initialize(host, "P2PHANDSHAKE", "ascend", "")
+        if status != 0:
+            raise RuntimeError(f"Native seed TransferEngine initialization failed: {status}")
+        transport_endpoint = f"{host}:{transport.get_rpc_port()}"
+        status = store.setup(host, "P2PHANDSHAKE", capacity, 0, "ascend", "", plan["master"], transport.get_engine())
         if status not in (None, 0):
             raise RuntimeError(f"Native Mooncake setup failed: {status}")
+        segment_name = store.get_hostname()
+        print(
+            PREFIX
+            + json.dumps(dict(status="store_ready", segment=segment_name, transport_endpoint=transport_endpoint)),
+            flush=True,
+        )
         required = (
             "batch_is_exist",
             "batch_put_from_multi_buffers",
@@ -321,7 +336,7 @@ def seed(plan: dict) -> None:
         validate_tp_copies(comparisons, plan["workers"])
         destination = ReplicateConfig()
         destination.replica_num = 1
-        destination.preferred_segment = store.get_hostname()
+        destination.preferred_segment = segment_name
         source_view = memoryview(source.numpy()).cast("B")
         for i, (key, group, start, end) in enumerate(keys, 1):
             if stopped.is_set() or release.exists():
@@ -329,7 +344,9 @@ def seed(plan: dict) -> None:
             count = fill_page(rows, group, start, end, source_view)
             if store.batch_put_from_multi_buffers([key], [[source.data_ptr()]], [[count]], destination) != [0]:
                 raise RuntimeError(f"Native seed put failed: group={group} range={start}:{end}")
-            require_placement(store, key, store.get_hostname(), count)
+            # ReplicateConfig selects by logical segment name; the returned
+            # buffer descriptor identifies its actual transport endpoint.
+            require_placement(store, key, transport_endpoint, count)
             got = store.batch_get_into_multi_buffers([key], [[check.data_ptr()]], [[count]])
             if got != [count] or not torch.equal(source[:count], check[:count]):
                 raise RuntimeError(f"Native seed readback differs: group={group} range={start}:{end}")

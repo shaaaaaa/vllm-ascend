@@ -99,6 +99,11 @@ registers two pinned CPU staging buffers (`staging_ready`) before scanning TP
 copies. Ordinary pageable CPU tensors are not accepted by this Ascend transport's
 automatic memory-type detection. The buffers stay alive until transport teardown;
 no historical page is published until the TP-copy validation succeeds.
+The injector owns one explicit TransferEngine and passes it to the native store.
+`store_ready` reports both its logical segment name and actual P2P transport
+endpoint: these can use different ports. Placement requests use the segment
+name; returned replica descriptors are checked against the transport endpoint,
+including its port. Merely matching the host IP is not sufficient.
 The snapshot directory defaults to `WORKSPACE/decode-kv-snapshots`.
 `--snapshot-root PATH` selects a different existing capture directory. Omit
 `--snapshot-host` for local snapshots; in that mode the current Python environment
