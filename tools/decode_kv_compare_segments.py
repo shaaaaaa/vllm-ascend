@@ -236,6 +236,9 @@ def analyze_remote(args, client=None):
                 raise ValueError(f"TP {rank} {key}: incompatible layout")
         pairs[rank] = ar, br
 
+    if getattr(args, "inspect_start", None) is not None:
+        return inspect_tails(args, client, entries, before, after, pairs, common)
+
     with ThreadPoolExecutor(max_workers=min(4, len(entries))) as pool:
         checksums = dict(zip(entries, pool.map(lambda e: checksum_entry(client, args, e, common), entries.values())))
     jobs, layers = [], []
@@ -397,4 +400,161 @@ def analyze_remote(args, client=None):
         "the new suffix and later NPU computation are not validated.",
     )
     (args.output / "report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
+    return report
+
+
+def inspect_tails(args, client, entries, before, after, pairs, common):
+    """Get small numeric reports in place, without rehashing or fetching KV."""
+    start = args.inspect_start
+    end = len(next(iter(after.values()))["tokens"])
+    if not 0 <= start < end:
+        raise ValueError("inspect-start must fall inside the current received tokens")
+    boundary = max(start, common)
+    jobs, headers = defaultdict(list), {}
+    for rank in sorted(after):
+        left, right = before[rank], after[rank]
+        ar, br = pairs[rank]
+        for key in sorted(br):
+            identifier = str(len(headers))
+            headers[identifier] = dict(
+                tp_rank=rank, group=key[0], layer=key[1], component=key[2], dtype=br[key]["dtype"]
+            )
+            job = dict(id=identifier, entry=right["id"], row=br[key], start=start, common=boundary, end=end)
+            if start < common and left["host"] == right["host"]:
+                job.update(previous=left["id"], previous_row=ar[key])
+            elif start < common:
+                jobs[left["host"]].append(
+                    dict(
+                        id=identifier + "-previous",
+                        entry=left["id"],
+                        row=ar[key],
+                        start=start,
+                        common=common,
+                        end=common,
+                    )
+                )
+            jobs[right["host"]].append(job)
+
+    def inspect_host(item):
+        host, host_jobs = item
+        print(f"[D_KV_COMPARE] numeric tail {host}: [{start},{end}), components={len(host_jobs)}", flush=True)
+        results = {}
+        for offset in range(0, len(host_jobs), 64):
+            batch = host_jobs[offset : offset + 64]
+            source_entries = {}
+            for job in batch:
+                sources = [(job["entry"], job["row"])]
+                if "previous" in job:
+                    sources.append((job["previous"], job["previous_row"]))
+                for identifier, row in sources:
+                    source = entries[identifier]
+                    target = source_entries.setdefault(
+                        identifier,
+                        dict(
+                            directory=source["directory"], meta=dict(byteorder=source["meta"]["byteorder"]), stamps={}
+                        ),
+                    )
+                    for name in ("manifest.json", "tokens.json", row["path"]):
+                        target["stamps"][name] = source["stamps"][name]
+            response = client.call(
+                host, dict(action="inspect", entries=source_entries, jobs=batch, workers=args.workers)
+            )
+            if len(response) != len(batch) or {r["id"] for r in response} != {j["id"] for j in batch}:
+                raise ValueError("Incomplete numeric inspection response")
+            results.update((r["id"], r) for r in response)
+        return results
+
+    data = {}
+    with ThreadPoolExecutor(max_workers=min(4, len(jobs))) as pool:
+        for result in pool.map(inspect_host, jobs.items()):
+            data.update(result)
+    for host in jobs:
+        client.call(
+            host,
+            dict(
+                action="verify",
+                entries=[{k: e[k] for k in ("directory", "stamps")} for e in entries.values() if e["host"] == host],
+            ),
+        )
+    counts = dict(
+        all_zero_parts=0,
+        constant_multirow_parts=0,
+        zero_component_rows=0,
+        nonfinite_values=0,
+        compared_components=0,
+        new_nonfinite_in_overlap=0,
+        cross_host_unpaired_components=0,
+    )
+    findings, first_numeric = [], {}
+    worst = None
+    with (args.output / "tail_layers.jsonl").open("w", encoding="utf-8") as stream:
+        for identifier, header in headers.items():
+            record = dict(header, **{k: v for k, v in data[identifier].items() if k != "id"})
+            if identifier + "-previous" in data:
+                record["previous"] = data[identifier + "-previous"]["overlap"]
+                record["comparison_unavailable"] = "snapshots_on_different_hosts; distributions_only"
+                counts["cross_host_unpaired_components"] += 1
+            for part in ("overlap", "new"):
+                stats = record[part]
+                if not stats["rows"]:
+                    continue
+                counts["zero_component_rows"] += stats["zero_rows"]
+                nonfinite = stats["nan"] + stats["posinf"] + stats["neginf"]
+                counts["nonfinite_values"] += nonfinite
+                counts["all_zero_parts"] += stats["all_values_zero"]
+                constant = stats["rows"] > 1 and stats["all_rows_equal"]
+                counts["constant_multirow_parts"] += constant
+                if len(findings) < 8 and (nonfinite or constant or stats["all_values_zero"]):
+                    findings.append(
+                        dict(
+                            header,
+                            part=part,
+                            nonfinite=nonfinite,
+                            all_zero=stats["all_values_zero"],
+                            all_rows_equal=constant,
+                        )
+                    )
+            comparison = record.get("comparison")
+            if comparison is not None:
+                counts["compared_components"] += 1
+                counts["new_nonfinite_in_overlap"] += comparison["new_nonfinite"]
+                key = (header["tp_rank"], header["group"])
+                if key not in first_numeric and (
+                    comparison["finite_mismatches"] or comparison["changed_nonfinite_pattern"]
+                ):
+                    first_numeric[key] = dict(
+                        header,
+                        comparison=comparison,
+                        previous_rms=record["previous"]["rms"],
+                        current_rms=record["overlap"]["rms"],
+                    )
+                relative = comparison["relative_l2"]
+                if relative is not None and (worst is None or relative > worst["relative_l2"]):
+                    worst = dict(
+                        header, relative_l2=relative, rmse=comparison["rmse"], max_abs_diff=comparison["max_abs_diff"]
+                    )
+            stream.write(json.dumps(record, allow_nan=False, separators=(",", ":")) + "\n")
+    path = args.output / "tail_report.json"
+    report = dict(
+        format=worker.FORMAT,
+        mode="tail_numeric",
+        status="numeric_analysis_complete",
+        previous=args.previous,
+        current=args.current,
+        current_range=[start, end],
+        comparable_range=[start, boundary],
+        new_range=[boundary, end],
+        components=len(headers),
+        counts=counts,
+        first_findings=findings,
+        first_numeric_differences=list(first_numeric.values()),
+        worst_relative_l2=worst,
+        raw_cross_host_bytes_selected=0,
+        compressed_response_bytes=client.received_bytes,
+        report_file=str(path),
+        scope="All selected raw component values; C8 key and scale are separate, not dequantized. "
+        "Zero/constant rows are observations, not a correctness verdict. "
+        "Same-host overlap has pointwise numeric comparison; new tokens have no previous reference.",
+    )
+    path.write_text(json.dumps(report, indent=2, allow_nan=False), encoding="utf-8")
     return report

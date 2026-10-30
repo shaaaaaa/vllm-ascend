@@ -305,6 +305,9 @@ def main(argv=None):
         help="Max raw differing bytes to fetch across hosts, both copies combined (default: 64 MiB)",
     )
     cli.add_argument("--full-transfer", action="store_true", help="Opt in to downloading complete archives")
+    cli.add_argument(
+        "--inspect-start", type=int, help="Inspect numeric tail from this token on D; skip whole-prefix checksum scan"
+    )
     cli.add_argument("--output", type=Path, default=Path("decode-kv-comparison"))
     args = cli.parse_args(argv)
     args.password = args.password_per_host = False
@@ -312,6 +315,8 @@ def main(argv=None):
         cli.error("Supply different requests, positive workers/segment size, and a nonnegative transfer budget")
     if args.hosts and args.local and not args.full_transfer:
         cli.error("Use --hosts for remote checksum comparison or --local for existing full archives")
+    if args.inspect_start is not None and (not args.hosts or args.full_transfer or args.inspect_start < 0):
+        cli.error("--inspect-start requires --hosts, a nonnegative token index, and no --full-transfer")
     args.output.mkdir(parents=True, exist_ok=True)
     roots = list(args.local or [])
     try:
@@ -328,13 +333,25 @@ def main(argv=None):
             report = analyze(roots, args.previous, args.current, args.output, args.workers)
     except Exception as error:
         report = dict(status="incomplete", error=str(error))
-        (args.output / "report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
-    brief = {k: v for k, v in report.items() if k not in ("first_differences", "scope")}
+        path = args.output / ("tail_report.json" if args.inspect_start is not None else "report.json")
+        report["report_file"] = str(path)
+        path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+    brief = {k: v for k, v in report.items() if k not in ("first_differences", "first_numeric_differences", "scope")}
     if report.get("first_differences"):
         first = report["first_differences"][0]
         brief["first_difference"] = {k: first[k] for k in ("tp_rank", "group", "layer", "component", "first")}
+    if report.get("first_numeric_differences"):
+        brief["first_numeric_differences"] = [
+            dict(
+                {k: r[k] for k in ("tp_rank", "group", "layer", "component", "previous_rms", "current_rms")},
+                relative_l2=r["comparison"]["relative_l2"],
+                rmse=r["comparison"]["rmse"],
+            )
+            for r in report["first_numeric_differences"]
+        ]
+        brief["first_findings"] = report["first_findings"][:4]
     print("[D_KV_COMPARE] " + json.dumps(brief, ensure_ascii=False))
-    print(f"[D_KV_COMPARE] report: {args.output / 'report.json'}")
+    print(f"[D_KV_COMPARE] report: {report.get('report_file', args.output / 'report.json')}")
     return 1 if report["status"] == "incomplete" else 0
 
 

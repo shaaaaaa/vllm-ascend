@@ -70,3 +70,28 @@ python3 tools/decode_kv_compare.py \
 `current_uncompared_range` 是当前轮未与旧快照对比的范围；其浮点非有限值/零字节统计只是线索。不同会话、不同前缀或不同模型不适合作为两轮对照。脚本不会把新增 KV 没有旧参考值解释为正确。
 
 `compressed_response_bytes` 是本次接收的压缩响应内容总量，不包括 SSH 协议本身的开销。远端模式的 `checksummed_bytes_per_snapshot` 是每份快照参与比较的原始字节量，不是网络传输量。`difference_counts_complete` 仅表示所有校验值不同的段是否均已完成逐字节比较。
+
+## 只检查重新计算尾部的数值
+
+知道当前轮的外部缓存命中结束位置时，可以直接指定 `--inspect-start`。例如命中 499712 tokens、当前 prompt 为 500084 tokens，则检查末尾的 372 tokens：
+
+```bash
+python3 tools/decode_kv_compare.py \
+  --previous dce27753-310a-445c-8ac1-7c42aa22a67a \
+  --current 21c69b01-12a2-4976-89ba-144a6270aad0 \
+  --hosts root@7.150.3.60 root@7.150.6.177 \
+  --workspace /workspace/fsi_lab/sqh/vllm-ascend \
+  --password '你的密码' --skip-host-key-check \
+  --workers 8 --inspect-start 499712 \
+  --output ./compare-s0-r0-r1
+```
+
+这个模式只读取选中的尾部，不重新计算整个 500k 前缀的校验值，也不下载原始 KV。它需要 `--hosts`，不能与 `--full-transfer` 混用。不覆盖已有的 `report.json`、`layers.jsonl` 和校验清单，而是写入 `tail_report.json`、`tail_layers.jsonl`。
+
+所有 rank、层、组件分别统计零值比例、全零行、NaN/正负 Inf、均值、标准差、RMS、最小/最大值、相邻相同行数及是否所有行相同。统计根据文件 dtype 和端序解码，支持 BF16、FP16、FP32、FP64、int8 和 uint8；C8 key 和 scale 分别统计，不做反量化。读文件按块进行，内存不会随检查范围无限增长。
+
+两轮共同 token 区间和真正新增的区间单独统计。例如旧轮共 499994 tokens，则 `[499712,499994)` 的 282 tokens 有旧参考，`[499994,500084)` 的 90 tokens 没有。两份快照在同一台 D 时，还在 D 上对相同 token 计算 RMSE、相对 L2、最大/平均绝对误差、余弦相似度及新出现的非有限值；如果分处不同 D，仍返回两边的分布，但明确标记没有逐元素数值对比，不自动传输大块数据。
+
+相对 L2 是差值的 L2 范数除以旧参考的 L2 范数；旧参考范数为零时记为 `null`。非有限值单独计数，误差指标只使用两边都有限的位置。不设置数值误差通过阈值；全零、重复行等是定位线索，未必单独构成错误。正常分布也不能证明 attention、索引映射或模型输出正确。
+
+终端摘要包含首次出现数值差异的层及 RMS/相对 L2，以及最大全局相对 L2。完整逐组件统计保存在 `tail_layers.jsonl`，无需把整个文件贴回。
