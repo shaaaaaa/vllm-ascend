@@ -205,7 +205,7 @@ def prepare(args, output: Path) -> tuple[dict, dict]:
     return restored, plan
 
 
-def child_argv(args, *parts: str) -> list[str]:
+def child_argv(args, *parts: str, script_name: str = "prefill_kv_replay.py") -> list[str]:
     if args.snapshot_host:
         return remote_command(
             args,
@@ -216,11 +216,11 @@ def child_argv(args, *parts: str) -> list[str]:
                 REMOTE_ENV_BOOTSTRAP,
                 "prefill-kv-replay",
                 args.remote_python,
-                str(PurePosixPath(args.workspace) / "tools" / "prefill_kv_replay.py"),
+                str(PurePosixPath(args.workspace) / "tools" / script_name),
                 *parts,
             ],
         )
-    return [sys.executable, str(Path(__file__).resolve()), *parts]
+    return [sys.executable, str(Path(__file__).resolve().with_name(script_name)), *parts]
 
 
 def child_environment(args) -> dict:

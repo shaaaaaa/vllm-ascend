@@ -121,7 +121,8 @@ def snapshot_metadata(plan: dict) -> tuple[list[int], dict, list]:
     end = plan["cached_tokens"]
     schema = plan["contract"]["schema"]
     chunk = schema["chunk_size"]
-    if not 0 < end <= len(tokens) or end % chunk:
+    complete_receive = plan.get("seed_mode") == "decode_receive" and end == len(tokens)
+    if not 0 < end <= len(tokens) or (end % chunk and not complete_receive):
         raise ValueError("Cached frontier must be a full cache-block boundary inside the previous snapshot")
     if token_digest(tokens[:end]) != plan["prefix_digest"]:
         raise ValueError("Previous snapshot tokens do not match the live-tokenized replay prefix")
@@ -223,8 +224,8 @@ def page_keys(plan: dict, tokens: list[int]):
     schema = contract["schema"]
     chunk = schema["chunk_size"]
     for start in range(0, len(tokens), chunk):
-        end = start + chunk
-        if end > len(tokens):
+        end = min(start + chunk, len(tokens))
+        if end - start != chunk and plan.get("seed_mode") != "decode_receive":
             raise ValueError("Only full historical cache blocks may be seeded")
         # LMCache-Ascend replaces TokenDatabase._hash_tokens. With no extra
         # keys it hashes a TWO-item tuple, unlike upstream LMCache's canonical
@@ -237,6 +238,12 @@ def page_keys(plan: dict, tokens: list[int]):
                 else getattr(torch, schema["dtype"].split(".")[-1])
             )
             tags = {MOONCAKE_PAYLOAD_LAYOUT_TAG: contract["signature"]}
+            if plan.get("replay_tag"):
+                tags["lmcache.tag.decode_replay"] = plan["replay_tag"]
+            if end - start != chunk:
+                from lmcache.v1.mooncake_layout import MOONCAKE_VALID_TOKENS_TAG
+
+                tags[MOONCAKE_VALID_TOKENS_TAG] = end - start
             if group == 1:
                 tags[DSA_INDEX_CACHE_SCHEMA_TAG] = DSA_INDEX_CACHE_SCHEMA
             key = CacheEngineKey(plan["model_path"], 1, 0, root, dtype, tags, kv_group=group)

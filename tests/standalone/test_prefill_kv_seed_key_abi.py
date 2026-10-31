@@ -54,7 +54,14 @@ def serving(monkeypatch):
     tree = ast.parse("from __future__ import annotations")
     tree.body.extend(definitions(lmcache / "utils.py", {"CacheEngineKey", "TORCH_DTYPE_TO_STR_DTYPE"}))
     tree.body.extend(
-        definitions(lmcache / "v1/mooncake_layout.py", {"mooncake_page_key", "MOONCAKE_PAYLOAD_LAYOUT_TAG"})
+        definitions(
+            lmcache / "v1/mooncake_layout.py",
+            {
+                "mooncake_page_key",
+                "MOONCAKE_PAYLOAD_LAYOUT_TAG",
+                "MOONCAKE_VALID_TOKENS_TAG",
+            },
+        )
     )
     tree.body.extend(
         definitions(lmcache / "v1/token_database.py", {"DSA_INDEX_CACHE_SCHEMA_TAG", "DSA_INDEX_CACHE_SCHEMA"})
@@ -80,18 +87,19 @@ def serving(monkeypatch):
 
 @pytest.mark.parametrize("algorithm", ["sha256", "sha256_cbor", "sha256_cbor_64bit", "xxhash", "xxhash_cbor"])
 @pytest.mark.parametrize("mixed_c8", [False, True])
-def test_500k_seed_matches_real_ascend_lookup_and_old_keys_miss(serving, algorithm, mixed_c8):
+@pytest.mark.parametrize("decode_receive", [False, True])
+def test_500k_seed_matches_real_ascend_lookup_and_old_keys_miss(serving, algorithm, mixed_c8, decode_receive):
     api, hashing = serving
     hash_fn = hashing.get_hash_fn_by_name(algorithm.replace("sha256_cbor_64bit", "sha256_cbor"))
     api.NONE_HASH = b"serving-root"
     chunk = 1024
-    tokens = [i % 100003 for i in range(499712)]
+    tokens = [i % 100003 for i in range(500095 if decode_receive else 499712)]
     dtypes = (torch.bfloat16, torch.uint8 if mixed_c8 else torch.bfloat16)
     counts = (79, 22)
     signature = "a1b2c3d4e5f67890"
     db = api.Database()
     db.hash_func = hash_fn
-    db.config = SimpleNamespace(chunk_size=chunk, save_unfull_chunk=False, dsa_two_groups=True)
+    db.config = SimpleNamespace(chunk_size=chunk, save_unfull_chunk=decode_receive, dsa_two_groups=True)
     db.chunk_size = chunk
     db.mooncake_payload_layout = signature
     db.save_only_first_rank = True
@@ -110,14 +118,28 @@ def test_500k_seed_matches_real_ascend_lookup_and_old_keys_miss(serving, algorit
             ),
         ),
     )
+    request_configs = None
+    if decode_receive:
+        plan.update(seed_mode="decode_receive", replay_tag="fresh-D-replay")
+        request_configs = {"lmcache.tag.decode_replay": plan["replay_tag"]}
     injected = {key: (group, start, end) for key, group, start, end in seed.page_keys(plan, tokens)}
     looked_up = {
         api.mooncake_page_key(key, counts[group]): (group, start, end)
         for group in (0, 1)
-        for start, end, key in db.process_tokens(tokens=tokens, kv_group=group)
+        for start, end, key in db.process_tokens(tokens=tokens, kv_group=group, request_configs=request_configs)
     }
-    assert len(injected) == 976
+    assert len(injected) == (978 if decode_receive else 976)
     assert injected == looked_up
+    if decode_receive:
+        assert (0, 499712, 500095) in injected.values()
+        assert all("@decode_replay%fresh-D-replay" in key for key in injected)
+        assert sum("@internal.valid_tokens%383" in key for key in injected) == 2
+        untagged = {
+            api.mooncake_page_key(key, counts[group])
+            for group in (0, 1)
+            for _, _, key in db.process_tokens(tokens=tokens, kv_group=group)
+        }
+        assert untagged.isdisjoint(injected)
 
     # Reproduce the original failure: native put/get could agree on all of
     # these wrong keys, yet the actual P lookup misses starting at page zero.

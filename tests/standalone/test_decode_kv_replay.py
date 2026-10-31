@@ -191,18 +191,16 @@ def test_missing_replay_metadata_and_tp_disagreement_fail(tmp_path):
         R.build_plan([tmp_path], "request", tmp_path / "out")
 
 
-def test_500k_prefix_and_config_never_retokenizes_or_calls_P(tmp_path):
-    path, plan = make_plan(tmp_path / "data", tmp_path / "out", count=500000)
-    args = NS(devices=None, cpu_cache_gb=None, timeout=7200, model=None, gpu_memory_utilization=0.9, eager=False)
-    options, env = R.configure(plan, args)
+def test_500k_prefix_preserves_actual_d_input(tmp_path):
+    from decode_kv_live_replay import request_payload
+
+    _, plan = make_plan(tmp_path / "data", tmp_path / "out", count=500000)
+    payload = request_payload(plan["request"], "served-model", "new-replay", 128)
     assert len(plan["received_tokens"]) == 500000
-    assert options["enforce_eager"] is False
-    assert options["kv_transfer_config"]["kv_role"] == "kv_consumer"
-    assert options["kv_transfer_config"]["kv_connector_extra_config"] == {"skip_last_n_tokens": 1}
-    assert options["data_parallel_size"] == 1
-    assert env["VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE"] == "false"
-    assert "LMCACHE_DECODE_KV_SNAPSHOT" not in env
-    assert json.loads(env["LMCACHE_EXTRA_CONFIG"])["decode_snapshot_replay"]["plan"] == str(path)
+    assert payload["prompt"] == list(range(500000)) + [99]
+    assert payload["max_tokens"] == 128
+    assert payload["temperature"] == 0
+    assert payload["model"] == "served-model"
 
 
 def test_bind_hook_applies_to_first_connector(tmp_path, monkeypatch):
