@@ -18,6 +18,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from decode_kv_compare import read_workers
+from kv_replay_transport import apply_transport_environment
 
 PREFIX = "[PREFILL_REPLAY_SEED] "
 COPY_BYTES = 4 * 1024 * 1024
@@ -269,6 +270,9 @@ def seed(plan: dict) -> None:
     """Run on the snapshot host, using real native SDK transfers and replicas."""
     import threading
 
+    if "transport" in plan:
+        actual = apply_transport_environment(plan["transport"], plan["seed_device"])
+        print(PREFIX + json.dumps(dict(status="transport_config", **actual)), flush=True)
     print(PREFIX + json.dumps(dict(status="runtime_check", python=sys.executable)), flush=True)
     import torch
     import torch_npu

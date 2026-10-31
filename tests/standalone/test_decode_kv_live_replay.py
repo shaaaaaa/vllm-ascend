@@ -19,6 +19,12 @@ def source(tmp_path, tail_token=False):
     p = snapshot(tmp_path / "snapshots")
     log = tmp_path / "D_dp0.log"
     log_file(log)
+    proc_root = tmp_path / "proc"
+    (proc_root / "1").mkdir(parents=True)
+    (proc_root / "1/environ").write_bytes(
+        b"HCCL_INTRA_ROCE_ENABLE=1\0ASCEND_BUFFER_POOL=4:8\0"
+        b"HCCL_IF_IP=7.150.3.60\0HCCL_SOCKET_IFNAME=enp67s0f5\0ASCEND_RT_VISIBLE_DEVICES=0,1,2,3\0"
+    )
     with log.open("a") as stream:
         stream.write(f"kv_connector_extra_config={{'skip_last_n_tokens': {int(tail_token)}}}\n")
     for path in (tmp_path / "snapshots").glob("*/rank*/replay.json"):
@@ -38,7 +44,7 @@ def source(tmp_path, tail_token=False):
         row = json.loads(manifest.read_text())
         row["replay_file"] = "replay.json"
         manifest.write_text(json.dumps(row))
-    return dict(request_id="response-0", snapshot_root=p["snapshot_root"], d_logs=[str(log)])
+    return dict(request_id="response-0", snapshot_root=p["snapshot_root"], d_logs=[str(log)], proc_root=str(proc_root))
 
 
 def legacy_source(tmp_path):
@@ -108,6 +114,9 @@ def test_metadata_prepare_uses_complete_receive_and_isolated_keys(tmp_path, monk
     payload, plan, cached = R.prepare(cli, meta, models, tmp_path)
     assert plan["cached_tokens"] == 11  # not rounded down to eight!
     assert plan["seed_mode"] == "decode_receive"
+    assert plan["transport"]["environment"]["HCCL_INTRA_ROCE_ENABLE"] == "1"
+    assert plan["transport"]["environment"]["ASCEND_BUFFER_POOL"] == "4:8"
+    assert plan["transport"]["source_pids"] == [1]
     assert cached == (11 if tail_token else 10)
     assert payload["prompt"] == list(range(11)) + ([99] if tail_token else [])
     assert payload["kv_transfer_params"] == {"lmcache.tag.decode_replay": plan["replay_tag"]}
@@ -501,6 +510,7 @@ def test_replay_client_modules_parse_as_python39():
         "decode_kv_compare",
         "prefill_kv_replay",
         "prefill_kv_seed",
+        "kv_replay_transport",
         "pd_tensor_collect",
         "multi_turn_kv_reuse_concurrent",
     ):
@@ -514,3 +524,19 @@ def test_replay_client_modules_parse_as_python39():
             and any(alias.name == "annotations" for alias in node.names)
             for node in tree.body
         ), name
+
+
+def test_default_log_selection_uses_target_d_port(tmp_path, monkeypatch):
+    captured = []
+
+    def metadata(options):
+        captured.append(options)
+        return {}
+
+    monkeypatch.setattr(R, "metadata", metadata)
+    cli = args(tmp_path)
+    R.collect_metadata(cli, tmp_path)
+    assert captured[0]["d_logs"] == [str(tmp_path / "tp4_dp4_logs/D_dp*_port7920.log")]
+    cli.d_logs = ["/custom/current-D.log"]
+    R.collect_metadata(cli, tmp_path)
+    assert captured[1]["d_logs"] == cli.d_logs

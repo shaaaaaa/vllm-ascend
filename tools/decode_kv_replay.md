@@ -15,6 +15,7 @@ python3 tools/decode_kv_replay.py \
   --container vllm-ascend-v0.18.0rc1-lmcache-ascend-v0.4.3-fsi-sqh \
   --workspace /workspace/sqh/vllm-ascend \
   --remote-python /usr/local/python3.11.14/bin/python3 \
+  --seed-device 4 \
   --password-env PD_SSH_PASSWORD \
   --skip-host-key-check \
   2>&1 | tee decode-replay.log
@@ -24,7 +25,8 @@ python3 tools/decode_kv_replay.py \
 sshpass or interactive prompt is used. Update the tools on both the client
 and snapshot host. `--workspace` is the path **inside** the container when
 `--container` is present. By default, the script reads that workspace's
-`decode-kv-snapshots` and current `tp4_dp4_logs/D_dp*.log`. `--snapshot-root`
+`decode-kv-snapshots` and current `tp4_dp4_logs/D_dp*_port7920.log` (the port
+comes from `--d-url`). `--snapshot-root`
 and `--d-logs` override those paths **on the snapshot host**, not the client.
 The D logs must belong to the service selected by `--d-url` and contain its
 startup cache layout/hash-root records. The selected D must use the same
@@ -73,6 +75,27 @@ buffers and its own CPU Mooncake segment; it is not another model instance.
 Its bytes travel over the native Mooncake transport. The segment stays alive
 until the D response finishes, then the script releases its owner. The
 default `--seed-device 0` is for transport initialization, not model loading.
+Choose a device outside the target D instance: in the TP4 example above,
+D port 7920 uses physical devices 0–3, so seed uses device 4. Independent
+AscendDirect processes must not attempt a same-device ADXL connection. The
+tool checks the selected device against the target workers' device visibility
+before loading the native runtime or scanning the large archive.
+
+Before injection, metadata collection finds the current worker PIDs in the
+selected D logs and reads their `/proc/<pid>/environ` inside the serving
+container. It copies an allowlist of HCCL/Ascend transport settings into the
+seed plan, including `HCCL_INTRA_ROCE_ENABLE`, `ASCEND_BUFFER_POOL`,
+`HCCL_IF_IP` and `HCCL_SOCKET_IFNAME`. Seed applies these **before importing
+torch_npu or initializing Mooncake**. Settings absent on D are also unset
+on seed. Worker rank, device visibility, model/debug flags and credentials
+are not copied. This fixes seed silently using shell defaults while the
+server uses RDMA and a Host-memory transfer buffer pool.
+
+The first seed status line, `transport_config`, reports the source worker
+PIDs, the seed device and the effective transport settings. An unavailable
+worker environment or conflicting D configurations stops before injection.
+Update the client and snapshot-host tools together; custom log names require
+`--d-logs` pointing to the target D instance's current log.
 
 A fresh `lmcache.tag.decode_replay` namespace distinguishes each replay's
 LMCache keys. A fresh vLLM `cache_salt` prevents an existing NPU prefix-cache
@@ -116,6 +139,8 @@ D replay calls the same `prefill_kv_replay` process/environment helpers and
 | BF16/C8 indexer width interpreted in the wrong units | Use the shared per-layer wire validator and planar packer, including partial D receive blocks. |
 | `torch_npu` or `ascend_transport.so` cannot load | Use the shared shell bootstrap and loader path before starting Python. Runtime/import checks precede the large raw-file scan. |
 | Ordinary CPU staging memory rejected by Ascend transport | Use pinned allocations, register both buffers, and retain their owners until native transport cleanup. |
+| Seed does not inherit the server launch script's communication settings | Read an allowlist from live D worker environments and apply it before native imports; preserve seed's separate device selection. |
+| Same-process seed readback hides a same-device ADXL connection conflict | Reject a seed device within the target D's visible device set before injection; the example uses device 4 for D devices 0–3. |
 | Store segment name confused with the transfer endpoint | Select replicas by segment name and validate placement against the separate engine endpoint. |
 | Wrong HTTP port discovered after copying the archive | Check the supplied D API before metadata collection and injection; no hard-coded proxy port. |
 | Native readback passes but serving lookup uses different keys | Compare injection keys with the actual Ascend hash and LMCache serializer for both token-based retrieval and hash/offset lookup RPCs. Tests include the request-config extraction and a 500095-token mixed-C8 receive with a 383-token tail. |

@@ -14,8 +14,10 @@ import sys
 import tempfile
 import uuid
 from pathlib import Path, PurePosixPath
+from urllib.parse import urlsplit
 
 from decode_kv_compare import request_key
+from kv_replay_transport import read_transport_environment
 from multi_turn_kv_reuse_concurrent import Client, save_json
 from pd_tensor_collect import password_auth, run_ssh
 from prefill_kv_replay import child_argv, format_failure, http_json, seeded, validate_response_counts
@@ -69,6 +71,7 @@ def metadata(options: dict) -> dict:
             skip_counts.update(int(v) for v in re.findall(r"skip_last_n_tokens[\"']?\s*[:=]\s*(\d+)", line))
     if len(skip_counts) > 1:
         raise ValueError("D logs contain different skip_last_n_tokens settings; select the current D logs")
+    transport = read_transport_environment(paths, Path(options.get("proc_root", "/proc")))
     # The connector's default is zero when the extra setting is omitted.
     return dict(
         request=plan["request"],
@@ -79,15 +82,18 @@ def metadata(options: dict) -> dict:
         skip_last_n_tokens=next(iter(skip_counts), 0),
         logs=[str(p.resolve()) for p in paths],
         replay_metadata_source=plan["replay_metadata_source"],
+        transport=transport,
     )
 
 
 def collect_metadata(args, output: Path) -> dict:
     remote_repo = PurePosixPath(args.workspace) if args.snapshot_host else Path(args.workspace).resolve()
+    target = urlsplit(args.d_url)
+    port = target.port or (443 if target.scheme == "https" else 80)
     options = dict(
         request_id=request_key(args.request_id),
         snapshot_root=args.snapshot_root or str(remote_repo / "decode-kv-snapshots"),
-        d_logs=args.d_logs or [str(remote_repo / "tp4_dp4_logs" / "D_dp*.log")],
+        d_logs=args.d_logs or [str(remote_repo / "tp4_dp4_logs" / f"D_dp*_port{port}.log")],
     )
     if not args.snapshot_host:
         result = metadata(options)
@@ -276,6 +282,7 @@ def prepare(args, meta: dict, models: dict, output: Path) -> tuple[dict, dict, i
         snapshot_root=meta["snapshot_root"],
         workers=args.workers,
         seed_device=args.seed_device,
+        transport=meta["transport"],
         local_hostname=args.local_hostname,
         store_bytes=None if args.store_gb is None else int(args.store_gb * 1024**3),
         release_file=str(remote_repo / "prefill-kv-replays" / "leases" / (tag + ".release")),
@@ -301,7 +308,9 @@ def parser() -> argparse.ArgumentParser:
     cli.add_argument("--snapshot-host", help="SSH host containing the snapshot and current D startup logs")
     cli.add_argument("--snapshot-root", help="Defaults to WORKSPACE/decode-kv-snapshots on snapshot host")
     cli.add_argument("--workspace", default=str(REPO), help="vllm-ascend root inside the snapshot host/container")
-    cli.add_argument("--d-logs", nargs="+", help="Current D log globs on snapshot host; default tp4_dp4_logs/D_dp*.log")
+    cli.add_argument(
+        "--d-logs", nargs="+", help="Current D log globs on snapshot host; default D_dp*_port<d-url port>.log"
+    )
     cli.add_argument("--container")
     cli.add_argument("--remote-python", default=sys.executable)
     cli.add_argument("--master", help="Infer Mooncake master from current D logs")
