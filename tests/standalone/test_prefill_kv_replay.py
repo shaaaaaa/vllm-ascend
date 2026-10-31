@@ -533,9 +533,43 @@ def test_prepare_uses_live_tokenizer_and_does_not_run_inference(tmp_path, monkey
     restored, plan = R.prepare(args, tmp_path / "out")
     assert calls == ["/v1/models", "/tokenize", "/tokenize"]
     assert plan["cached_tokens"] == 8
+    assert plan["seed_transport_logs"] == [str(R.REPO / "tp4_dp4_logs" / "[PD]_dp*.log")]
     tail = json.loads((tmp_path / "out/input_tail_tokens.json").read_text())
     assert tail["token_ids"] == list(range(8, 14))
     assert "kv_transfer_params" not in restored["payload"]
+
+
+def test_prefill_seed_log_paths_belong_to_remote_container(tmp_path, monkeypatch):
+    make_run(tmp_path / "run")
+    log_file(tmp_path / "p.log")
+
+    def http(url, path, body=None):
+        if path == "/v1/models":
+            return {"data": [{"id": "alias", "root": "/model"}]}
+        return {"tokens": list(range(14 if "问题" in body["prompt"] else 11))}
+
+    monkeypatch.setattr(R, "http_json", http)
+    args = R.parser().parse_args(
+        [
+            "--run-dir",
+            str(tmp_path / "run"),
+            "--p-url",
+            "http://P:7910",
+            "--p-logs",
+            str(tmp_path / "p.log"),
+            "--snapshot-host",
+            "root@D",
+            "--workspace",
+            "/workspace/sqh/vllm-ascend",
+        ]
+    )
+    (tmp_path / "out").mkdir()
+    _, plan = R.prepare(args, tmp_path / "out")
+    assert plan["seed_transport_logs"] == ["/workspace/sqh/vllm-ascend/tp4_dp4_logs/[PD]_dp*.log"]
+    assert "transport" not in plan  # Never reuse the client's P-local IP/interface.
+    args.seed_logs = ["/custom/D-current.log"]
+    _, plan = R.prepare(args, tmp_path / "out")
+    assert plan["seed_transport_logs"] == args.seed_logs
 
 
 def test_release_cannot_touch_serving_paths(tmp_path, monkeypatch):

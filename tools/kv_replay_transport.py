@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Copy only transport settings from the live D workers to the replay seed."""
+"""Copy only transport settings from live local workers to the replay seed."""
 
 from __future__ import annotations
 
+import glob
 import os
 import re
 from pathlib import Path
@@ -31,7 +32,9 @@ TRANSPORT_ENV_KEYS = (
 )
 
 
-def read_transport_environment(paths: list[Path], proc_root: Path = Path("/proc")) -> dict:
+def read_transport_environment(
+    paths: list[Path], proc_root: Path = Path("/proc"), *, skip_stopped: bool = False
+) -> dict:
     """Find the last cache-initializing worker per rank in the selected D logs.
 
     Read /proc inside the same host/container as those logs. The source is the
@@ -46,34 +49,56 @@ def read_transport_environment(paths: list[Path], proc_root: Path = Path("/proc"
             if match:
                 workers[(str(path), match[1])] = int(match[2])
     if not workers:
-        raise ValueError("Cannot locate live D worker PIDs in --d-logs; use the current D startup logs")
+        raise ValueError("Cannot locate live service worker PIDs in transport logs; use the current startup logs")
     settings = None
     visible_devices = set()
-    pids = sorted(set(workers.values()))
-    for pid in pids:
+    pids = []
+    for pid in sorted(set(workers.values())):
         try:
             raw = (proc_root / str(pid) / "environ").read_bytes()
+        except FileNotFoundError as error:
+            if skip_stopped:
+                continue
+            raise ValueError(
+                f"Cannot read live service worker {pid} environment; use the current startup logs"
+            ) from error
         except OSError as error:
             raise ValueError(
-                f"Cannot read live D worker {pid} environment; select current --d-logs "
+                f"Cannot read live service worker {pid} environment; select current transport logs "
                 "and run metadata collection in the serving container"
             ) from error
         env = dict(item.split("=", 1) for item in raw.decode(errors="surrogateescape").split("\0") if "=" in item)
         current = {key: env.get(key) for key in TRANSPORT_ENV_KEYS}
         if settings is not None and current != settings:
             different = [key for key in TRANSPORT_ENV_KEYS if current[key] != settings[key]]
-            raise ValueError(f"D workers disagree on transport settings: {different}; select the target D's --d-logs")
+            raise ValueError(
+                f"Service workers disagree on transport settings: {different}; select matching transport logs"
+            )
         settings = current
+        pids.append(pid)
         visible = env.get("ASCEND_RT_VISIBLE_DEVICES")
         if visible:
             try:
                 visible_devices.update(int(value.strip()) for value in visible.split(","))
             except ValueError as error:
                 raise ValueError(f"Unsupported D device visibility: {visible!r}") from error
+    if not pids:
+        raise ValueError("Cannot locate live service workers in transport logs; run seed in the serving container")
     return dict(environment=settings, source_pids=pids, d_visible_devices=sorted(visible_devices))
 
 
-def apply_transport_environment(config: dict, seed_device: int) -> dict:
+def read_prefill_seed_transport(patterns: list[str]) -> dict:
+    """Read seed-host settings, not the remote P host's IP/interface settings.
+
+    P replay is launched on the client but its seed runs beside the snapshots.
+    Logs copied from other hosts must not be supplied here. Ignore stopped
+    workers left in old local logs, while checking all remaining live workers.
+    """
+    paths = sorted({Path(path) for pattern in patterns for path in glob.glob(pattern)})
+    return read_transport_environment(paths, skip_stopped=True)
+
+
+def apply_transport_environment(config: dict, seed_device: int, *, check_device_overlap: bool = True) -> dict:
     """Apply the captured values before importing torch_npu or native Mooncake.
 
     Null means unset on D: remove a stale shell value on seed as well. Preserve
@@ -94,7 +119,10 @@ def apply_transport_environment(config: dict, seed_device: int) -> dict:
             physical_device = int(visible.split(",")[seed_device].strip())
         except (ValueError, IndexError) as error:
             raise ValueError(f"seed-device {seed_device} is outside seed visibility {visible!r}") from error
-    if physical_device in config["d_visible_devices"]:
+    # D replay reads from a known co-located D endpoint. P replay gets settings
+    # from local workers but they are not necessarily its consuming P/D workers;
+    # their visibility is not a valid device exclusion list for that route.
+    if check_device_overlap and physical_device in config["d_visible_devices"]:
         raise ValueError(
             f"Seed physical device {physical_device} overlaps target D devices {config['d_visible_devices']}; "
             "set --seed-device to a different visible device for cross-process ADXL transfer"

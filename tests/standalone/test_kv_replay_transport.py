@@ -114,3 +114,72 @@ def test_rejects_arbitrary_environment_in_plan():
     value["environment"]["LD_PRELOAD"] = "bad"
     with pytest.raises(ValueError, match="Invalid captured"):
         T.apply_transport_environment(value, 4)
+
+
+def test_prefill_discovery_ignores_stopped_workers_but_requires_live_source(tmp_path):
+    log = tmp_path / "D.log"
+    log.write_text(
+        "(Worker_DP0_TP0_EP0 pid=20) Mooncake payload layout: current\n"
+        "(Worker_DP1_TP0_EP4 pid=30) Mooncake payload layout: stopped\n"
+    )
+    worker(tmp_path, 20, dict(HCCL_INTRA_ROCE_ENABLE="1"))
+    result = T.read_transport_environment([log], tmp_path / "proc", skip_stopped=True)
+    assert result["source_pids"] == [20]
+    (tmp_path / "proc/20/environ").unlink()
+    with pytest.raises(ValueError, match="Cannot locate live"):
+        T.read_transport_environment([log], tmp_path / "proc", skip_stopped=True)
+
+
+@pytest.mark.parametrize("live", [True, False])
+def test_prefill_seed_inherits_on_snapshot_host_before_native_import(tmp_path, live):
+    (tmp_path / "torch.py").write_text("raise RuntimeError('stop at native import')\n")
+    log = tmp_path / "D_dp0_port7920.log"
+    log.write_text("(Worker_DP0_TP0_EP0 pid=20) Mooncake payload layout: current\n")
+    if live:
+        worker(
+            tmp_path,
+            20,
+            dict(
+                HCCL_INTRA_ROCE_ENABLE="1",
+                ASCEND_BUFFER_POOL="4:8",
+                HCCL_IF_IP="7.150.3.60",
+                HCCL_SOCKET_IFNAME="enp67s0f5",
+                ASCEND_RT_VISIBLE_DEVICES="0,1,2,3",
+                LMCACHE_PREFILL_STORE_DEBUG="1",
+            ),
+        )
+    plan = dict(seed_transport_logs=[str(log)], seed_device=0)
+    env = dict(os.environ, PYTHONPATH=str(tmp_path) + os.pathsep + str(TOOLS))
+    env.pop("ASCEND_RT_VISIBLE_DEVICES", None)
+    env["HCCL_IF_IP"] = "7.150.2.72"  # A client's address must not survive.
+    env.pop("LMCACHE_PREFILL_STORE_DEBUG", None)
+    script = (
+        "import json,sys,functools; from pathlib import Path; import kv_replay_transport as t; "
+        "t.read_transport_environment=functools.partial(t.read_transport_environment,proc_root=Path(sys.argv[2])); "
+        "from prefill_kv_seed import seed; seed(json.loads(sys.argv[1]))"
+    )
+    child = subprocess.run(
+        [sys.executable, "-c", script, json.dumps(plan), str(tmp_path / "proc")],
+        env=env,
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+    )
+    assert child.returncode != 0
+    assert '"status": "validating"' not in child.stdout
+    if not live:
+        assert "Cannot locate live" in child.stderr
+        assert "stop at native import" not in child.stderr
+        return
+    assert "stop at native import" in child.stderr
+    line = next(line for line in child.stdout.splitlines() if '"status": "transport_config"' in line)
+    actual = json.loads(line.split("] ", 1)[1])
+    assert actual["source_pids"] == [20]
+    assert actual["environment"] == dict(
+        HCCL_INTRA_ROCE_ENABLE="1",
+        ASCEND_BUFFER_POOL="4:8",
+        HCCL_IF_IP="7.150.3.60",
+        HCCL_SOCKET_IFNAME="enp67s0f5",
+    )
+    assert actual["seed_physical_device"] == 0
+    assert actual["seed_visibility"] is None

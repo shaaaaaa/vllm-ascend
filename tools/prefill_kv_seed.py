@@ -18,7 +18,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from decode_kv_compare import read_workers
-from kv_replay_transport import apply_transport_environment
+from kv_replay_transport import apply_transport_environment, read_prefill_seed_transport
 
 PREFIX = "[PREFILL_REPLAY_SEED] "
 COPY_BYTES = 4 * 1024 * 1024
@@ -272,6 +272,10 @@ def seed(plan: dict) -> None:
 
     if "transport" in plan:
         actual = apply_transport_environment(plan["transport"], plan["seed_device"])
+        print(PREFIX + json.dumps(dict(status="transport_config", **actual)), flush=True)
+    elif "seed_transport_logs" in plan:
+        config = read_prefill_seed_transport(plan["seed_transport_logs"])
+        actual = apply_transport_environment(config, plan["seed_device"], check_device_overlap=False)
         print(PREFIX + json.dumps(dict(status="transport_config", **actual)), flush=True)
     print(PREFIX + json.dumps(dict(status="runtime_check", python=sys.executable)), flush=True)
     import torch

@@ -191,6 +191,7 @@ def prepare(args, output: Path) -> tuple[dict, dict]:
         snapshot_root=snapshot_root,
         workers=args.workers,
         seed_device=args.seed_device,
+        seed_transport_logs=args.seed_logs or [str(remote_repo / "tp4_dp4_logs" / "[PD]_dp*.log")],
         local_hostname=args.local_hostname,
         store_bytes=None if args.store_gb is None else int(args.store_gb * 1024**3),
         release_file=str(remote_repo / "prefill-kv-replays" / "leases" / (lease + ".release")),
@@ -334,6 +335,11 @@ def parser() -> argparse.ArgumentParser:
     cli.add_argument("--master", help="Existing Mooncake master HOST:PORT; infer from P logs when available")
     cli.add_argument("--snapshot-host", help="SSH host containing the raw previous D snapshot; omit for local files")
     cli.add_argument("--snapshot-root", help="Snapshot root on its host; default: WORKSPACE/decode-kv-snapshots")
+    cli.add_argument(
+        "--seed-logs",
+        nargs="+",
+        help="Live local service logs on seed host; default WORKSPACE/tp4_dp4_logs/[PD]_dp*.log",
+    )
     cli.add_argument("--workspace", default=str(REPO), help="vllm-ascend path on the snapshot host/container")
     cli.add_argument("--container", help="Optional Docker container on the snapshot host")
     cli.add_argument(

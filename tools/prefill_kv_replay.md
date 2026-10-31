@@ -104,6 +104,18 @@ script does for `ascend_transport.so`, preserving existing toolkit paths. This
 is done before starting Python, for both local and remote injection processes.
 Torch, the NPU context, and cache-key dependencies are checked before raw-file scans;
 loader failures retain their underlying exception in both the log and terminal.
+Before importing the native libraries, P replay also reads live worker environments
+on the **snapshot/seed host** from `WORKSPACE/tp4_dp4_logs/[PD]_dp*.log`. It copies
+the transport allowlist (including `HCCL_INTRA_ROCE_ENABLE`, `ASCEND_BUFFER_POOL`,
+and that host's `HCCL_IF_IP`/`HCCL_SOCKET_IFNAME`) and prints `transport_config`.
+It does not copy the remote P host's network address, rank, device visibility,
+credentials, or debug flags. Stopped workers in old logs are ignored; no live
+source or conflicting settings fails before scanning/injecting KV.
+Use `--seed-logs` only for a nonstandard log location on the snapshot host.
+This configures the seed; its local readback does not test a cross-process or
+cross-host connection from a serving worker. D-only replay retains its separate
+same-physical-device check against the explicitly selected D endpoint. P replay
+does not infer a D route from local workers' device visibility.
 After checking the snapshot metadata, the injector sets up its native store and
 registers two pinned CPU staging buffers (`staging_ready`) before scanning TP
 copies. Ordinary pageable CPU tensors are not accepted by this Ascend transport's
