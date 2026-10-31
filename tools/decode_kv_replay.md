@@ -104,3 +104,24 @@ not reproduce the original concurrent batch or prove deterministic output.
 CPU tests cover partial-page layout/keys, metadata, HTTP request construction,
 seed lifetime and validation failures. Native transport/model execution
 requires the deployed Ascend environment.
+
+## Regression audit against P replay failures
+
+D replay calls the same `prefill_kv_replay` process/environment helpers and
+`prefill_kv_seed` injector used by P replay. The regression checks cover:
+
+| Prior failure | D replay behavior and check |
+| --- | --- |
+| Legacy snapshot has no `replay.json` | Recover API settings from the matching client response; retain the snapshot's exact token IDs. Both metadata-child and HTTP tests cover this path. |
+| BF16/C8 indexer width interpreted in the wrong units | Use the shared per-layer wire validator and planar packer, including partial D receive blocks. |
+| `torch_npu` or `ascend_transport.so` cannot load | Use the shared shell bootstrap and loader path before starting Python. Runtime/import checks precede the large raw-file scan. |
+| Ordinary CPU staging memory rejected by Ascend transport | Use pinned allocations, register both buffers, and retain their owners until native transport cleanup. |
+| Store segment name confused with the transfer endpoint | Select replicas by segment name and validate placement against the separate engine endpoint. |
+| Wrong HTTP port discovered after copying the archive | Check the supplied D API before metadata collection and injection; no hard-coded proxy port. |
+| Native readback passes but serving lookup uses different keys | Compare injection keys with the actual Ascend hash and LMCache serializer for both token-based retrieval and hash/offset lookup RPCs. Tests include the request-config extraction and a 500095-token mixed-C8 receive with a 383-token tail. |
+| Missing cache-usage fields treated as a cache miss | Preserve output and report `replay_unverified`; an actual numeric mismatch still fails. |
+| Python 3.9 evaluates unsupported union annotations | Client modules postpone annotation evaluation; grammar and import checks cover the client entry point. The native remote runtime remains the supplied Python. |
+
+The tests also check that an injection failure prevents the D request and that
+the seed remains alive until the SSE response completes. They do not substitute
+for running the installed Ascend/Mooncake binaries on the serving machines.

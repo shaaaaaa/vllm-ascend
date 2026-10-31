@@ -417,3 +417,100 @@ def test_legacy_missing_client_data_gives_existing_data_instruction(tmp_path):
     options, _ = legacy_source(tmp_path)
     with pytest.raises(ValueError, match="set --run-dir to the original"):
         R.restore_legacy_request(R.metadata(options), tmp_path / "not-the-run", "response-0")
+
+
+def test_d_refusal_prevents_metadata_scan_and_seed(tmp_path, monkeypatch):
+    monkeypatch.setattr(R, "REPO", tmp_path)
+
+    def unavailable(*_args, **_kwargs):
+        raise ConnectionRefusedError("D listener is absent")
+
+    monkeypatch.setattr(R, "http_json", unavailable)
+    monkeypatch.setattr(R, "collect_metadata", lambda *_: pytest.fail("scanned before checking D"))
+    monkeypatch.setattr(R, "seeded", lambda *_: pytest.fail("injected before checking D"))
+    with pytest.raises(ConnectionRefusedError):
+        R.main(["--request-id", "response-0", "--d-url", "http://D:7920"])
+    report = next((tmp_path / "decode-kv-replays").glob("*/report.json"))
+    assert json.loads(report.read_text())["status"] == "failed"
+
+
+def test_remote_metadata_uses_p_environment_and_preserves_failure(tmp_path, monkeypatch):
+    import shlex
+
+    import prefill_kv_replay as P
+
+    cli = R.parser().parse_args(
+        [
+            "--request-id",
+            "response-0",
+            "--d-url",
+            "http://D:7920",
+            "--snapshot-host",
+            "root@D",
+            "--container",
+            "serving",
+            "--workspace",
+            "/work space/vllm-ascend",
+            "--remote-python",
+            "/usr/local/python3.11.14/bin/python3",
+        ]
+    )
+
+    def ssh(args, host, command, *, stdout, stderr, timeout):
+        assert host == "root@D"
+        words = shlex.split(command[-1])
+        assert words[:6] == ["docker", "exec", "--", "serving", "bash", "-lc"]
+        assert words[6] == P.REMOTE_ENV_BOOTSTRAP
+        assert words[8:11] == [
+            "/usr/local/python3.11.14/bin/python3",
+            "/work space/vllm-ascend/tools/decode_kv_replay.py",
+            "--metadata-child",
+        ]
+        stderr.write(b"[D_KV_REPLAY] FAILED: ValueError: missing TP rank 3\n")
+        return NS(returncode=1)
+
+    monkeypatch.setattr(R, "run_ssh", ssh)
+    with pytest.raises(RuntimeError, match="missing TP rank 3"):
+        R.collect_metadata(cli, tmp_path)
+
+
+def test_failed_seed_never_submits_decode(tmp_path, monkeypatch):
+    options = source(tmp_path)
+    meta = dict(R.metadata(options), snapshot_root=options["snapshot_root"])
+    monkeypatch.setattr(R, "REPO", tmp_path)
+    monkeypatch.setattr(R, "http_json", lambda *_a, **_k: {"data": [{"id": "glm", "root": "/model"}]})
+    monkeypatch.setattr(R, "collect_metadata", lambda *_: meta)
+    monkeypatch.setattr(R, "Client", lambda *_: pytest.fail("submitted after failed injection"))
+
+    @contextmanager
+    def failed_seed(*_):
+        raise RuntimeError("Native seed readback differs")
+        yield  # pragma: no cover - retain contextmanager protocol
+
+    monkeypatch.setattr(R, "seeded", failed_seed)
+    with pytest.raises(RuntimeError, match="readback differs"):
+        R.main(["--request-id", "response-0", "--d-url", "http://D:7920"])
+
+
+def test_replay_client_modules_parse_as_python39():
+    import ast
+
+    for name in (
+        "decode_kv_replay",
+        "decode_kv_live_replay",
+        "decode_kv_compare",
+        "prefill_kv_replay",
+        "prefill_kv_seed",
+        "pd_tensor_collect",
+        "multi_turn_kv_reuse_concurrent",
+    ):
+        path = R.REPO / "tools" / (name + ".py")
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path), feature_version=(3, 9))
+        # The 3.9 grammar permits A | None as an expression, but evaluating it
+        # in an annotation fails. Every client module must postpone evaluation.
+        assert any(
+            isinstance(node, ast.ImportFrom)
+            and node.module == "__future__"
+            and any(alias.name == "annotations" for alias in node.names)
+            for node in tree.body
+        ), name

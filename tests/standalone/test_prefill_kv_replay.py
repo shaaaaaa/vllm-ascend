@@ -338,10 +338,14 @@ def test_ascend_hash_input_and_lmcache_key_serializer(monkeypatch):
         "transport_init",
     ],
 )
-def test_native_seed_readback_before_ready(tmp_path, monkeypatch, capsys, failure):
+@pytest.mark.parametrize("decode_receive", [False, True])
+def test_native_seed_readback_before_ready(tmp_path, monkeypatch, capsys, failure, decode_receive):
     import torch
 
     plan = snapshot(tmp_path)
+    if decode_receive:
+        plan.update(seed_mode="decode_receive", cached_tokens=11, prefix_digest=S.token_digest(list(range(11))))
+    page_count = 6 if decode_receive else 4
     events = []
     owners = weakref.WeakValueDictionary()
     real_empty = torch.empty
@@ -437,7 +441,7 @@ def test_native_seed_readback_before_ready(tmp_path, monkeypatch, capsys, failur
             if failure == "readback":
                 data = bytes([data[0] ^ 1]) + data[1:]
             ctypes.memmove(ptrs[0][0], data, len(data))
-            if len(self.data) == 4:
+            if len(self.data) == page_count:
                 Path(plan["release_file"]).touch()
             return [len(data)]
 
@@ -450,7 +454,11 @@ def test_native_seed_readback_before_ready(tmp_path, monkeypatch, capsys, failur
     monkeypatch.setitem(sys.modules, "mooncake.engine", NS(TransferEngine=Transport))
     monkeypatch.setitem(sys.modules, "mooncake.store", NS(MooncakeDistributedStore=lambda: store, ReplicateConfig=NS))
     monkeypatch.setitem(sys.modules, "torch_npu", NS(npu=NS(set_device=lambda _: None, init=lambda: None)))
-    monkeypatch.setattr(S, "page_keys", lambda p, t: [(f"{g}:{i}", g, i, i + 4) for i in (0, 4) for g in (0, 1)])
+    monkeypatch.setattr(
+        S,
+        "page_keys",
+        lambda p, t: [(f"{g}:{i}", g, i, min(i + 4, len(t))) for i in range(0, len(t), 4) for g in (0, 1)],
+    )
     monkeypatch.setattr(S.signal, "signal", lambda *_: None)
     errors = {
         "readback": "readback differs",
@@ -482,6 +490,19 @@ def test_native_seed_readback_before_ready(tmp_path, monkeypatch, capsys, failur
         assert not store.data
     else:
         assert len(store.data["0:0"]) == 32
+    if failure is None:
+        assert len(store.data) == page_count
+        if decode_receive:
+            # Full D receives must retain the final three tokens in BOTH
+            # groups, packed layer-major; P history still stops before them.
+            _, rows, _ = S.snapshot_metadata(plan)
+            for group in (0, 1):
+                expected = b"".join(
+                    path.read_bytes()[8 * row["row_bytes"] : 11 * row["row_bytes"]]
+                    for (g, _, _), (row, path) in sorted(rows.items())
+                    if g == group
+                )
+                assert store.data[f"{group}:8"] == expected
 
 
 def test_prepare_uses_live_tokenizer_and_does_not_run_inference(tmp_path, monkeypatch):

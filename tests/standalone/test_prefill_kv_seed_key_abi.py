@@ -8,6 +8,7 @@ The serving hash input, key construction and serialization are not mocked.
 import ast
 import dataclasses
 import importlib.util
+import json
 import sys
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -66,6 +67,7 @@ def serving(monkeypatch):
     tree.body.extend(
         definitions(lmcache / "v1/token_database.py", {"DSA_INDEX_CACHE_SCHEMA_TAG", "DSA_INDEX_CACHE_SCHEMA"})
     )
+    tree.body.extend(definitions(lmcache / "integration/vllm/vllm_v1_adapter.py", {"extract_request_configs"}))
     classes = definitions(lmcache / "v1/token_database.py", {"TokenDatabase", "ChunkedTokenDatabase"})
     methods = {"_make_key_by_hash", "_get_init_hash", "_chunk_tokens", "_prefix_hash", "process_tokens"}
     # Use the concrete process_tokens, not the abstract base declaration.
@@ -120,8 +122,20 @@ def test_500k_seed_matches_real_ascend_lookup_and_old_keys_miss(serving, algorit
     )
     request_configs = None
     if decode_receive:
+        from decode_kv_live_replay import request_payload
+
         plan.update(seed_mode="decode_receive", replay_tag="fresh-D-replay")
-        request_configs = {"lmcache.tag.decode_replay": plan["replay_tag"]}
+        payload = request_payload(
+            dict(prompt_token_ids=tokens, sampling=dict(max_tokens=128, temperature=0)),
+            "GLM-5.3-falcon",
+            plan["replay_tag"],
+            None,
+        )
+        # Exercise the real adapter's extraction from the HTTP transfer field,
+        # rather than assuming the replay namespace reaches the lookup worker.
+        request_configs = api.extract_request_configs(
+            SimpleNamespace(extra_args=dict(kv_transfer_params=payload["kv_transfer_params"]))
+        )
     injected = {key: (group, start, end) for key, group, start, end in seed.page_keys(plan, tokens)}
     looked_up = {
         api.mooncake_page_key(key, counts[group]): (group, start, end)
@@ -130,6 +144,21 @@ def test_500k_seed_matches_real_ascend_lookup_and_old_keys_miss(serving, algorit
     }
     assert len(injected) == (978 if decode_receive else 976)
     assert injected == looked_up
+    # The scheduler's lookup RPC sends hashes/lengths, not token IDs. Its JSON
+    # request config and partial-chunk offset must produce the same page keys
+    # as the worker's subsequent retrieve(tokens=...) path.
+    chunks = list(db.process_tokens(tokens=tokens, make_key=False))
+    rpc_lookup = {
+        api.mooncake_page_key(key, counts[group]): (group, start, end)
+        for group in (0, 1)
+        for start, end, key in db.process_tokens(
+            hashes=[digest for _, _, digest in chunks],
+            offsets=[end - start for start, end, _ in chunks],
+            kv_group=group,
+            request_configs=json.loads(json.dumps(request_configs)),
+        )
+    }
+    assert injected == rpc_lookup
     if decode_receive:
         assert (0, 499712, 500095) in injected.values()
         assert all("@decode_replay%fresh-D-replay" in key for key in injected)
