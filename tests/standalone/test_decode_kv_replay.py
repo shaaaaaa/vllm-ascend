@@ -187,7 +187,8 @@ def test_missing_replay_metadata_and_tp_disagreement_fail(tmp_path):
     meta = json.loads((first / "manifest.json").read_text())
     meta.pop("replay_file")
     (first / "manifest.json").write_text(json.dumps(meta))
-    with pytest.raises(ValueError, match="predates replay"):
+    (first / "replay.json").unlink()
+    with pytest.raises(ValueError, match="matching client request"):
         R.build_plan([tmp_path], "request", tmp_path / "out")
 
 

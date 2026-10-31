@@ -40,10 +40,27 @@ explicitly changes the output limit.
 ## Data and execution
 
 The capture must include the complete TP ranks, full raw KV/indexer planes,
-`tokens.json`, and `replay.json`. The latter preserves the **actual D input
-token IDs**, sampling parameters, and any `bootstrap_final_hidden` payload
-for MTP. Tokens appended by the original proxy remain in that input; the
-script neither tokenizes text nor synthesizes a new first token.
+and `tokens.json`. When present, `replay.json` preserves the **actual D input
+token IDs**, sampling parameters, and any `bootstrap_final_hidden` payload.
+Tokens appended by the original proxy remain in that input; the script
+neither tokenizes text nor synthesizes a new first token.
+
+Older captures without `replay.json` are supported using the original client
+run, defaulting to `./multi-turn-concurrent` on the machine running the command.
+Use `--run-dir PATH` if that directory was moved. The script locates the unique
+`response.json` matching `--request-id` and reads its sibling `request.json`
+for sampling parameters. It checks the request against `summary.json` when
+available. The model identity comes from the raw snapshot's manifest, and
+the actual input IDs come from its `tokens.json`, not a new tokenization.
+
+Legacy reconstruction requires a full client prompt receive: the saved
+response's prompt-token count must equal the captured token count, and the
+current D must use `skip_last_n_tokens=0`. It never guesses a missing
+proxy-appended token. Optional final-hidden bootstrap was not recorded in
+these captures: replay explicitly uses normal D cold decode, and records
+this limitation in `source.json`/`report.json`. Unspecified API sampling
+defaults come from the current D service. The original snapshot is not edited
+and does not need to be captured again.
 
 Only compressed metadata travels to the client. A temporary seed process
 reads raw files on the snapshot host, checks that the TP copies agree, packs

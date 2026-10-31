@@ -41,6 +41,48 @@ def source(tmp_path, tail_token=False):
     return dict(request_id="response-0", snapshot_root=p["snapshot_root"], d_logs=[str(log)])
 
 
+def legacy_source(tmp_path):
+    options = source(tmp_path)
+    for path in (tmp_path / "snapshots").glob("*/rank*/replay.json"):
+        path.unlink()
+        manifest = path.with_name("manifest.json")
+        row = json.loads(manifest.read_text())
+        row.pop("replay_file")
+        manifest.write_text(json.dumps(row))
+    root = tmp_path / "multi-turn-concurrent"
+    directory = root / "sessions" / "011" / "turns" / "001"
+    directory.mkdir(parents=True)
+    request = dict(
+        model="glm",
+        request_id="client-11-r1",
+        session_id=11,
+        round=1,
+        prompt_chars=123,
+        prompt_source="session_prefix.txt + initial_prompt.txt + prior answers/questions",
+        max_tokens=128,
+        temperature=0,
+        stream=True,
+        stream_options=dict(include_usage=True),
+    )
+    response = dict(
+        id="response-0",
+        usage=dict(prompt_tokens=11),
+        stream_done=True,
+        choices=[dict(index=0, text="old output", finish_reason="length")],
+    )
+    (directory / "request.json").write_text(json.dumps(request))
+    (directory / "response.json").write_text(json.dumps(response))
+    (root / "summary.json").write_text(
+        json.dumps(
+            dict(
+                warmups=[],
+                rounds=[dict(request_id="client-11-r1", response_id="response-0", session_id=11, round=1)],
+            )
+        )
+    )
+    return options, directory
+
+
 def args(tmp_path):
     return R.parser().parse_args(
         [
@@ -233,11 +275,12 @@ def test_entrypoint_does_not_import_accelerator_or_vllm():
     subprocess.run([sys.executable, "-c", code], check=True)
 
 
-def test_metadata_child_binary_protocol(tmp_path):
+@pytest.mark.parametrize("legacy", [False, True])
+def test_metadata_child_binary_protocol(tmp_path, legacy):
     import base64
     import gzip
 
-    options = source(tmp_path)
+    options = legacy_source(tmp_path)[0] if legacy else source(tmp_path)
     result = subprocess.run(
         [
             sys.executable,
@@ -252,13 +295,17 @@ def test_metadata_child_binary_protocol(tmp_path):
     assert value["received_tokens"] == list(range(11))
     assert value["contract"]["master"] == "10.0.0.1:50051"
     assert value["skip_last_n_tokens"] == 0
+    assert (value["request"] is None) == legacy
+    assert value["runtime"]["engine_options"]["model"] == "/model"
 
 
-def test_real_http_single_request_retains_seed_until_done(tmp_path, monkeypatch):
+@pytest.mark.parametrize("legacy", [False, True])
+def test_real_http_single_request_retains_seed_until_done(tmp_path, monkeypatch, legacy):
     import threading
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-    options = source(tmp_path)
+    options = legacy_source(tmp_path)[0] if legacy else source(tmp_path)
+    monkeypatch.chdir(tmp_path)
     meta = dict(R.metadata(options), snapshot_root=options["snapshot_root"])
     monkeypatch.setattr(R, "REPO", tmp_path)
     monkeypatch.setattr(R, "collect_metadata", lambda *_: meta)
@@ -266,6 +313,9 @@ def test_real_http_single_request_retains_seed_until_done(tmp_path, monkeypatch)
 
     @contextmanager
     def seed(args, plan, output):
+        # The full main path must hand the legacy raw snapshot to the native
+        # seed's real metadata/layout validator, including the partial tail.
+        assert S.snapshot_metadata(plan)[0] == list(range(11))
         active.append(plan["replay_tag"])
         try:
             yield NS(poll=lambda: None)
@@ -325,3 +375,45 @@ def test_real_http_single_request_retains_seed_until_done(tmp_path, monkeypatch)
     assert not failures and not active
     response = next((tmp_path / "decode-kv-replays").glob("*/response.json"))
     assert json.loads(response.read_text())["choices"][0]["text"] == "test output"
+    report = json.loads(response.with_name("report.json").read_text())
+    if legacy:
+        assert report["request_reconstruction"]["session_id"] == 11
+        assert report["request_reconstruction"]["round"] == 1
+        assert report["request_reconstruction"]["input_token_ids"] == "snapshot:tokens.json"
+    assert not list((tmp_path / "snapshots").rglob("replay.json")) if legacy else True
+
+
+@pytest.mark.parametrize("problem", ["wrong_request", "wrong_length", "model_missing", "tail_missing", "duplicate"])
+def test_legacy_rejects_mismatched_evidence_without_guessing(tmp_path, problem):
+    options, directory = legacy_source(tmp_path)
+    if problem == "model_missing":
+        manifest = next((tmp_path / "snapshots").glob("*/rank*/manifest.json"))
+        data = json.loads(manifest.read_text())
+        data.pop("model")
+        manifest.write_text(json.dumps(data))
+        with pytest.raises(ValueError, match="model identity"):
+            R.metadata(options)
+        return
+    meta = R.metadata(options)
+    if problem == "wrong_request":
+        path = directory / "request.json"
+        data = json.loads(path.read_text())
+        data["request_id"] = "different-request"
+        path.write_text(json.dumps(data))
+    elif problem == "wrong_length":
+        path = directory / "response.json"
+        data = json.loads(path.read_text())
+        data["usage"]["prompt_tokens"] = 12
+        path.write_text(json.dumps(data))
+    elif problem == "tail_missing":
+        meta["skip_last_n_tokens"] = 1
+    else:
+        (tmp_path / "multi-turn-concurrent" / "response.json").write_bytes((directory / "response.json").read_bytes())
+    with pytest.raises(ValueError):
+        R.restore_legacy_request(meta, tmp_path / "multi-turn-concurrent", "response-0")
+
+
+def test_legacy_missing_client_data_gives_existing_data_instruction(tmp_path):
+    options, _ = legacy_source(tmp_path)
+    with pytest.raises(ValueError, match="set --run-dir to the original"):
+        R.restore_legacy_request(R.metadata(options), tmp_path / "not-the-run", "response-0")

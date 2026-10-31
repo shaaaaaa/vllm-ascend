@@ -56,7 +56,9 @@ def metadata(options: dict) -> dict:
     """Read only manifests and startup logs on the snapshot host; no device imports."""
     from decode_kv_replay import build_plan
 
-    plan = build_plan([Path(options["snapshot_root"])], options["request_id"], Path("."), validate_bytes=False)
+    plan = build_plan(
+        [Path(options["snapshot_root"])], options["request_id"], Path("."), validate_bytes=False, allow_legacy=True
+    )
     paths = sorted({Path(p) for pattern in options["d_logs"] for p in glob.glob(pattern)})
     if not paths:
         raise ValueError("No current D startup logs found; set --d-logs to paths on the snapshot host/container")
@@ -76,6 +78,7 @@ def metadata(options: dict) -> dict:
         contract=contract,
         skip_last_n_tokens=next(iter(skip_counts), 0),
         logs=[str(p.resolve()) for p in paths],
+        replay_metadata_source=plan["replay_metadata_source"],
     )
 
 
@@ -95,10 +98,92 @@ def collect_metadata(args, output: Path) -> dict:
         with target.open("wb") as stream, (output / "metadata.log").open("wb") as errors:
             child = run_ssh(args, args.snapshot_host, command, stdout=stream, stderr=errors, timeout=args.seed_timeout)
         if child.returncode:
-            raise RuntimeError(f"Cannot read snapshot/D metadata; inspect {output / 'metadata.log'}")
+            lines = (output / "metadata.log").read_text(encoding="utf-8", errors="replace").splitlines()
+            cause = next((line for line in reversed(lines) if "[D_KV_REPLAY] FAILED:" in line), None)
+            raise RuntimeError(
+                f"Cannot read snapshot/D metadata: {cause or 'remote command failed'}; log: {output / 'metadata.log'}"
+            )
         result = json.loads(gzip.decompress(target.read_bytes()))
     result["snapshot_root"] = options["snapshot_root"]
     return result
+
+
+def restore_legacy_request(meta: dict, run_dir: Path, request_id: str) -> dict:
+    """Old snapshots already have exact input IDs; recover only API settings locally.
+
+    The raw receive cannot tell us an unrecorded proxy-appended token or final
+    hidden state. Only a full, unmodified client prompt is supported here.
+    Missing optional bootstrap uses the ordinary D cold-decode path explicitly.
+    """
+    root = run_dir.resolve()
+    matches = []
+    for path in sorted(root.rglob("response.json")):
+        response = json.loads(path.read_text(encoding="utf-8"))
+        if response.get("id") and request_key(response["id"]) == request_key(request_id):
+            matches.append((path, response))
+    if len(matches) != 1:
+        raise ValueError(
+            f"Legacy snapshot: expected one matching response for {request_id} in {root}, found {len(matches)}; "
+            "set --run-dir to the original multi-turn-concurrent directory"
+        )
+    path, response = matches[0]
+    request_path = path.with_name("request.json")
+    original = json.loads(request_path.read_text(encoding="utf-8"))
+    tokens = meta["received_tokens"]
+    count = (response.get("usage") or {}).get("prompt_tokens")
+    if type(count) is not int or count != len(tokens) or meta["skip_last_n_tokens"] != 0:
+        raise ValueError(
+            f"Legacy D input cannot be reconstructed without guessing: client_prompt_tokens={count}, "
+            f"received_tokens={len(tokens)}, live_skip_last_n_tokens={meta['skip_last_n_tokens']}"
+        )
+    if original.get("n", 1) != 1 or not original.get("request_id") or not original.get("model"):
+        raise ValueError("Legacy client request lacks model/request identity or uses multiple outputs")
+    if response.get("stream_done") is False or len(response.get("choices", [])) != 1:
+        raise ValueError("Legacy client response is incomplete or has multiple choices")
+    # Verify the request/response association independently when a summary exists.
+    summary_path = root / "summary.json"
+    if summary_path.exists():
+        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        rows = [
+            r
+            for r in summary.get("warmups", []) + summary.get("rounds", [])
+            if r.get("response_id") and request_key(r["response_id"]) == request_key(request_id)
+        ]
+        if len(rows) != 1 or any(rows[0].get(k) != original.get(k) for k in ("request_id", "session_id", "round")):
+            raise ValueError("Legacy client request/response disagrees with the run summary")
+    metadata_fields = {
+        "model",
+        "request_id",
+        "stream",
+        "stream_options",
+        "session_id",
+        "round",
+        "prompt_chars",
+        "prompt_source",
+        "cache_salt",
+        "prompt",
+    }
+    unexpected = original.keys() - SAMPLING_FIELDS - metadata_fields
+    if unexpected:
+        raise ValueError(f"Unsupported legacy client fields: {sorted(unexpected)}")
+    if "prompt" in original and original["prompt"] != tokens:
+        raise ValueError("Legacy client prompt is not the captured token-ID prompt")
+    sampling = {k: v for k, v in original.items() if k in SAMPLING_FIELDS}
+    if type(sampling.get("max_tokens")) is not int or sampling["max_tokens"] < 1:
+        raise ValueError("Legacy client request lacks a positive max_tokens limit")
+    meta["request"] = dict(schema=1, prompt_token_ids=tokens, sampling=sampling, cache_salt=original.get("cache_salt"))
+    meta["request_reconstruction"] = dict(
+        source="legacy_snapshot_plus_client_request",
+        request_file=str(request_path),
+        response_file=str(path),
+        session_id=original.get("session_id"),
+        round=original.get("round"),
+        input_token_ids="snapshot:tokens.json",
+        bootstrap="unrecorded; normal D cold-decode path",
+        sampling_defaults="current D service",
+        original_output=response["choices"][0].get("text", ""),
+    )
+    return meta
 
 
 def request_payload(record: dict, model: str, tag: str, output_tokens: int | None) -> dict:
@@ -141,6 +226,14 @@ def request_payload(record: dict, model: str, tag: str, output_tokens: int | Non
 
 
 def prepare(args, meta: dict, models: dict, output: Path) -> tuple[dict, dict, int]:
+    if meta["request"] is None:
+        meta = restore_legacy_request(meta, args.run_dir, args.request_id)
+        restored = meta["request_reconstruction"]
+        print(
+            f"{PREFIX} legacy snapshot: request restored from {restored['request_file']}; "
+            f"tokens={len(meta['received_tokens'])}; bootstrap=normal_cold_decode",
+            flush=True,
+        )
     saved_model = meta["runtime"]["engine_options"]["model"]
     candidates = [m for m in models["data"] if m.get("root") == saved_model]
     if args.model_name:
@@ -197,6 +290,12 @@ def prepare(args, meta: dict, models: dict, output: Path) -> tuple[dict, dict, i
 def parser() -> argparse.ArgumentParser:
     cli = argparse.ArgumentParser(description=__doc__)
     cli.add_argument("--request-id")
+    cli.add_argument(
+        "--run-dir",
+        type=Path,
+        default=Path("multi-turn-concurrent"),
+        help="Original client run for snapshots without replay.json; match response ID automatically",
+    )
     cli.add_argument("--d-url", help="Already-running D API URL; not the PD proxy or P URL")
     cli.add_argument("--model-name", help="Served model alias; auto-select the alias for the saved model")
     cli.add_argument("--snapshot-host", help="SSH host containing the snapshot and current D startup logs")
@@ -258,6 +357,8 @@ def main(argv=None) -> int:
             meta = collect_metadata(args, output)
             payload, plan, expected = prepare(args, meta, models, output)
             report.update(expected_cached_tokens=expected, request_id=payload["request_id"])
+            if meta.get("request_reconstruction"):
+                report["request_reconstruction"] = meta["request_reconstruction"]
             print(
                 f"{PREFIX} prompt={len(payload['prompt'])} received={plan['cached_tokens']} "
                 f"expected_cached={expected}; direct D={args.d_url}",
