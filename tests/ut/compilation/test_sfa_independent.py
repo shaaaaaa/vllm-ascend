@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """CPU tests of independent routing; device/transport behavior is not mocked into a pass."""
 
+import gc
 import importlib.util
 import sys
 from enum import IntEnum
@@ -307,6 +308,8 @@ def test_native_identity_uses_mapped_file_identity_and_detects_replacement(tmp_p
     # Synthetic mappings test the actual file verifier, not loaded NPU binaries.
     monkeypatch.setattr(independent.os, "major", lambda device: 0, raising=False)
     monkeypatch.setattr(independent.os, "minor", lambda device: 1, raising=False)
+    backing = Mock(return_value=(0, 1, -1))
+    monkeypatch.setattr(independent, "_mapped_file_identity", backing, raising=False)
     lines = []
     for name in ("libtorch_npu.so", "libhccl.so", "libruntime.so", "vllm_ascend_C.so"):
         library = tmp_path / name
@@ -316,9 +319,87 @@ def test_native_identity_uses_mapped_file_identity_and_detects_replacement(tmp_p
     maps.write_text("\n".join(lines))
     identities = independent._native_identity(maps)
     assert len(identities) == 4 and len(set(identities.values())) == 4
+    backing.assert_not_called()
     maps.write_text("\n".join(lines).replace("00:01", "00:02"))
     with pytest.raises(ValueError, match="replaced"):
         independent._native_identity(maps)
+
+
+@pytest.mark.parametrize("replacement", [None, "device", "inode"])
+def test_native_identity_accepts_overlay_only_when_backing_identity_matches(tmp_path, monkeypatch, replacement):
+    # Reproduce the container's fstat=00:33 versus maps=08:02 discrepancy.
+    monkeypatch.setattr(independent.os, "major", lambda device: 0, raising=False)
+    monkeypatch.setattr(independent.os, "minor", lambda device: 0x33, raising=False)
+    lines = []
+    for name in ("libtorch_npu.so", "libhccl.so", "libruntime.so", "vllm_ascend_C.so"):
+        library = tmp_path / name
+        library.write_bytes(name.encode())
+        lines.append(f"1-2 r-xp 0000 08:02 {library.stat().st_ino} {library}")
+    maps = tmp_path / "maps"
+    maps.write_text("\n".join(lines))
+    backing = Mock(side_effect=lambda fd: (
+        9 if replacement == "device" else 8, 2,
+        independent.os.fstat(fd).st_ino + int(replacement == "inode"),
+    ))
+    monkeypatch.setattr(independent, "_mapped_file_identity", backing, raising=False)
+    if replacement is None:
+        assert len(independent._native_identity(maps)) == 4
+        assert backing.call_count == 4
+    else:
+        with pytest.raises(ValueError, match="replaced"):
+            independent._native_identity(maps)
+
+
+@pytest.mark.parametrize("failure", [None, "missing", "unreadable"])
+def test_backing_identity_probe_closes_real_mapping_without_gc(tmp_path, monkeypatch, failure):
+    library = tmp_path / "native.so"
+    library.write_bytes(b"unchanged native bytes")
+    mappings = []
+    mmap_file, read_text = independent.mmap.mmap, Path.read_text
+
+    def mapping(*args, **kwargs):
+        value = mmap_file(*args, **kwargs)
+        mappings.append(value)
+        return value
+
+    def maps(path, *args, **kwargs):
+        if path != Path("/proc/self/maps"):
+            return read_text(path, *args, **kwargs)
+        if failure == "unreadable":
+            raise PermissionError("maps unavailable")
+        address = independent.ctypes.addressof(independent.ctypes.c_char.from_buffer(mappings[-1]))
+        address += int(failure == "missing")
+        return f"{address:x}-{address + 1:x} rw-p 0000 08:02 15620327 /native.so"
+
+    monkeypatch.setattr(independent.mmap, "mmap", mapping)
+    monkeypatch.setattr(Path, "read_text", maps)
+    enabled = gc.isenabled()
+    gc.disable()
+    try:
+        with library.open("rb") as file:
+            if failure:
+                with pytest.raises(PermissionError if failure == "unreadable" else ValueError):
+                    independent._mapped_file_identity(file.fileno())
+            else:
+                assert independent._mapped_file_identity(file.fileno()) == (8, 2, 15620327)
+        assert len(mappings) == 1 and mappings[0].closed
+        assert library.read_bytes() == b"unchanged native bytes"
+    finally:
+        if enabled:
+            gc.enable()
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Requires real Linux /proc mappings")
+def test_backing_identity_tracks_open_file_across_path_replacement(tmp_path):
+    library, replacement = tmp_path / "native.so", tmp_path / "replacement.so"
+    library.write_bytes(b"original")
+    replacement.write_bytes(b"replacement")
+    with library.open("rb") as old:
+        identity = independent._mapped_file_identity(old.fileno())
+        replacement.replace(library)
+        assert independent._mapped_file_identity(old.fileno()) == identity
+        with library.open("rb") as new:
+            assert independent._mapped_file_identity(new.fileno()) != identity
 
 
 @pytest.mark.parametrize("entry", ["idle", "graph", "native"])

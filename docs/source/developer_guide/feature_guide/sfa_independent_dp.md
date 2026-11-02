@@ -42,8 +42,10 @@ recorded and tested together.
 
 Startup compares the loaded dispatcher, Python sources and content fingerprints
 of mapped torch-npu, HCCL, runtime and custom-op libraries. File device/inode checks
-reject a replaced mapping. Unavailable identity selects the common legacy path;
-differing identities fail activation. Hashing runs once after capture and reads
+reject a replaced mapping. If OverlayFS reports different `fstat` identities,
+a temporary private mapping verifies the opened file's backing device/inode
+before hashing; no file bytes are written. Unavailable identity selects the common
+legacy path; differing identities fail activation. Hashing runs once after capture and reads
 the native files on each worker, so it adds startup I/O. It does not hash weights
 or run during decoding, and it does not prove driver or NPU-kernel compatibility.
 

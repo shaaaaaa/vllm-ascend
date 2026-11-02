@@ -2,15 +2,31 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Startup contract and TP-local routing for independent full-SFA DP execution."""
 
+import ctypes
 import hashlib
 import json
 import math
+import mmap
 import os
 from pathlib import Path
 from typing import Any
 
 import torch
 import torch.distributed as dist
+
+
+def _mapped_file_identity(fd: int) -> tuple[int, int, int]:
+    """Read the opened file's backing identity without relying on overlay stat IDs."""
+    # ACCESS_COPY provides an addressable private buffer; no file bytes are written.
+    with mmap.mmap(fd, 1, access=mmap.ACCESS_COPY) as probe:
+        address = ctypes.addressof(ctypes.c_char.from_buffer(probe))
+        for line in Path("/proc/self/maps").read_text().splitlines():
+            columns = line.split(maxsplit=5)
+            start, end = (int(value, 16) for value in columns[0].split("-"))
+            if start <= address < end:
+                major, minor = (int(value, 16) for value in columns[3].split(":"))
+                return major, minor, int(columns[4])
+    raise ValueError("Cannot identify the opened native file's backing mapping")
 
 
 def _native_identity(maps: Path = Path("/proc/self/maps")) -> dict[str, str]:
@@ -28,9 +44,11 @@ def _native_identity(maps: Path = Path("/proc/self/maps")) -> dict[str, str]:
             continue
         with path.open("rb") as file:
             before = os.fstat(file.fileno())
-            device = f"{os.major(before.st_dev):02x}:{os.minor(before.st_dev):02x}"
-            if before.st_ino != int(columns[4]) or device != columns[3]:
-                raise ValueError("Mapped native file was replaced")
+            major, minor = (int(value, 16) for value in columns[3].split(":"))
+            expected = (major, minor, int(columns[4]))
+            actual = (os.major(before.st_dev), os.minor(before.st_dev), before.st_ino)
+            if actual != expected and _mapped_file_identity(file.fileno()) != expected:
+                raise ValueError(f"Mapped native file was replaced: {path}")
             digest = hashlib.sha256()
             for block in iter(lambda: file.read(1024 * 1024), b""):
                 digest.update(block)
