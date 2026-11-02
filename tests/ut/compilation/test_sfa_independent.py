@@ -3,6 +3,7 @@
 
 import importlib.util
 import sys
+from enum import IntEnum
 from pathlib import Path
 from types import SimpleNamespace as NS
 from unittest.mock import Mock
@@ -10,6 +11,7 @@ from unittest.mock import Mock
 import pytest
 import torch
 from sfa_test_support import extract
+from test_sfa_full_graph_routing import routing
 
 ROOT = Path(__file__).resolve().parents[3]
 SOURCE = ROOT / "vllm_ascend/worker/sfa_independent.py"
@@ -40,6 +42,60 @@ def test_target_uses_its_local_bucket_and_layout(monkeypatch):
         assert result[2:] == (1, "graph")
         assert runner._staged_sfa_dp_bounded_decode == bounded
     assert calls == ["tp"] * 3
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize(
+    "idle,query_width,native", [(False, 1, False), (False, 2, False), (True, 2, False), (False, 1, True)]
+)
+def test_dispatch_only_reads_peer_padding_for_coordinated_modes(monkeypatch, enabled, idle, query_width, native):
+    runner, ns, *_ = routing.__wrapped__()
+    mode = IntEnum("Mode", dict(NONE=0, PIECEWISE=1, FULL=2))
+    instance, calls = policy(monkeypatch)
+    runner._sfa_independent = instance if enabled else None
+    runner.dp_size, runner.dp_rank = 4, 0
+    runner._dp_batch_sync_buffers = {}
+    runner._skip_all_reduce_across_dp_group = lambda: False
+    runner.parallel_config.data_parallel_rank = 0
+    runner.model_config.is_encoder_decoder = False
+    runner.uniform_decode_query_len = 2
+    runner.input_batch = NS(num_computed_tokens_cpu=torch.ones(2).numpy(), num_reqs=2, lora_id_to_lora_request={})
+    runner._pad_for_sequence_parallelism = lambda value: value
+    runner.vllm_config.observability_config = NS(cudagraph_metrics=False)
+    runner.cudagraph_dispatcher = NS(dispatch=Mock(
+        side_effect=lambda **kw: (mode.PIECEWISE, NS(num_tokens=max(8, kw["num_tokens"])))
+    ))
+
+    def peer_growth(packet, *, group):
+        calls.append(group)
+        packet.copy_(packet[:, :1].expand_as(packet).clone())
+        packet[0].fill_(16)
+
+    ns.update(
+        CUDAGraphMode=mode, enable_sp=lambda _: False, torch=torch,
+        dist=NS(all_reduce=peer_growth), get_dp_group=lambda: NS(cpu_group="dp"),
+        _post_process_cudagraph_mode=lambda tensor: int(tensor[1].min()),
+    )
+    ns["_STAGED_SFA_ROUTE_ACTIONS"] = tuple(ns["StagedSFARouteAction"])
+    reads = Mock(wraps=torch.Tensor.item)
+    monkeypatch.setattr(torch.Tensor, "item", lambda tensor: reads(tensor))
+
+    result = runner._determine_batch_execution_and_padding(
+        2 * query_width, 2, [query_width] * 2, query_width, False,
+        staged_sfa_route_action=ns["StagedSFARouteAction"].SAFE_NATIVE if native else ns["StagedSFARouteAction"].STAGED,
+        staged_sfa_dp_idle=idle, force_eager=native,
+    )
+
+    capacity = (2 * query_width if native else 8) if enabled else 16
+    assert result[0] == (mode.NONE if native else mode.PIECEWISE)
+    assert result[1].num_tokens == capacity and result[3].tolist() == [capacity] * 4
+    assert runner._staged_sfa_dp_bounded_decode == (idle or query_width == 1)
+    assert calls == ["tp" if enabled else "dp"]
+    assert runner.cudagraph_dispatcher.dispatch.call_count == (0 if native else 1 if enabled else 2)
+    if enabled:
+        reads.assert_not_called()
+    else:
+        reads.assert_called()
 
 
 def test_draft_and_idle_metadata_do_not_enter_dp_vote(monkeypatch):

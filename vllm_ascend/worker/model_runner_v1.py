@@ -4332,8 +4332,8 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                 staged_sfa_bounded_decode=staged_sfa_dp_idle or not uniform_decode,
             )
 
-            # Extract DP padding if there is any
-            if num_tokens_across_dp is not None:
+            # Independent mode returns synthetic local counts; its route is final.
+            if num_tokens_across_dp is not None and getattr(self, "_sfa_independent", None) is None:
                 dp_rank = self.parallel_config.data_parallel_rank
                 agreed_num_tokens = int(num_tokens_across_dp[dp_rank].item())
                 if (
