@@ -228,10 +228,17 @@ class IndependentDP:
     """One preallocated TP-only proposal check; no healthy cross-DP host vote."""
 
     def __init__(self, tp: Any, dp_size: int, capacity: int):
-        self.group, self.rank, self.width = tp.cpu_group, tp.rank_in_group, tp.world_size
+        self.rank, self.width = tp.rank_in_group, tp.world_size
         self.capacity, self.sequence = capacity, 0
         self.packet = torch.zeros((7, self.width), dtype=torch.int64, device="cpu")
         self.counts = [torch.empty(dp_size, dtype=torch.int32, device="cpu") for _ in range(2)]
+        # LMCache uses tp.cpu_group from background threads. Routing needs its
+        # own sequence domain, created once before serving, with only TP peers.
+        # WorkerProc's distributed teardown destroys this registered group too.
+        self.group = dist.new_group(
+            ranks=tp.ranks, backend="gloo", use_local_synchronization=True,
+            group_desc="sfa_independent_tp",
+        ) if self.width > 1 else None
 
     def agree(
         self, tokens: int, mode: int, route: int, bounded: bool, *, draft: bool = False, requests: int = 0

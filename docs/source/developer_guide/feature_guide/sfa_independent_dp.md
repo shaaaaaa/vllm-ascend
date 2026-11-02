@@ -5,6 +5,11 @@ from live target and draft forwards. Each DP selects its own existing graph buck
 or compatible native MC2 path. TP-local checks, EP dispatch/combine, startup capture
 coordination and the EngineCore finish check every 32 steps remain.
 
+The TP route check uses a dedicated Gloo process group, created once during
+activation and destroyed by the existing worker distributed teardown. It does
+not share collective sequencing with LMCache's background TP broadcasts and
+readiness reductions. No additional per-step collective is introduced.
+
 It is default off. It does not establish that a slower DP can no longer delay
 peers inside expert communication, or guarantee a throughput improvement.
 
@@ -80,6 +85,15 @@ device fencing service.
 Desktop CPU tests cover the actual control protocol, subprocess/TCP lifecycle,
 selected runner methods and failure ordering. They do not qualify CANN graph
 replay, DMA, full-server correctness or performance.
+
+Before NPU qualification, run the CPU Gloo overlap regression on Linux. It uses
+four local CPU processes to exercise two independent TP groups alongside cache
+broadcasts and readiness reductions:
+
+```bash
+TORCH_DEVICE_BACKEND_AUTOLOAD=0 python -m pytest --noconftest -q \
+  tests/ut/compilation/test_sfa_independent_collectives.py
+```
 
 On both test hosts, run the installed-library probe on otherwise available NPUs:
 

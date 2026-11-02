@@ -30,7 +30,9 @@ def policy(monkeypatch):
         packet.copy_(packet[:, :1].expand_as(packet).clone())
 
     monkeypatch.setattr(independent.dist, "all_reduce", all_reduce)
-    return independent.IndependentDP(NS(cpu_group="tp", rank_in_group=0, world_size=4), 4, 32), calls
+    monkeypatch.setattr(independent.dist, "new_group", Mock(return_value="tp"))
+    tp = NS(cpu_group="cache-tp", ranks=list(range(4)), rank_in_group=0, world_size=4)
+    return independent.IndependentDP(tp, 4, 32), calls
 
 
 def test_target_uses_its_local_bucket_and_layout(monkeypatch):
@@ -262,10 +264,13 @@ def test_unqualified_runner_can_install_common_fallback(contract_runner, monkeyp
     monkeypatch.setitem(sys.modules, "vllm_ascend.worker.sfa_independent", independent)
     activate = extract(ROOT / "vllm_ascend/worker/worker.py", "activate_independent_dp", {})
     guard = Mock()
+    create = Mock()
+    monkeypatch.setattr(independent.dist, "new_group", create)
     worker = NS(model_runner=NS(), dp_guardian=guard)
     activate(worker, False)
     guard.close.assert_called_once()
     assert worker.dp_guardian is None
+    create.assert_not_called()
 
 
 @pytest.mark.parametrize("field,value", [("global_bs", 64), ("enable_dispatch_v2", False), ("need_comm_alg", True)])
