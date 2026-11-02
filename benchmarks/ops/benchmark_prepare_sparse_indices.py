@@ -1197,10 +1197,8 @@ def main(
         torch.npu.synchronize()
         if resident_union_workspace.miss_counts[:, 0].cpu().tolist() != [resident_expected_misses] * request_batch:
             raise AssertionError("resident 90%-hit finalize emitted an incorrect miss count")
-        resident_selected_evicts = min(
-            resident_expected_misses,
-            capacity - resident_hit_count,
-        )
+        resident_old_count = int(resident_union_workspace.shard_counts[0, :, 3].sum().cpu())
+        resident_selected_evicts = max(0, resident_expected_misses - (capacity - resident_old_count))
         selected_evicts = resident_union_workspace.shard_counts[:, :, 4].sum(dim=1).cpu().tolist()
         if selected_evicts != [resident_selected_evicts] * request_batch:
             raise AssertionError(

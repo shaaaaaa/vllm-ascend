@@ -1715,7 +1715,6 @@ private:
         uint32_t missEnd = 0;
         uint32_t evictableEnd = 0;
         uint32_t totalMissCount = 0;
-        uint32_t totalEvictableCount = 0;
         uint32_t totalOldCount = 0;
         for (uint32_t shard = 0; shard < shardCount_; ++shard) {
             const uint64_t countOffset =
@@ -1771,7 +1770,6 @@ private:
             priorEnd = priorOffset + currentCount;
             missEnd = missOffset + shardMissCount;
             totalMissCount += shardMissCount;
-            totalEvictableCount += evictableCount;
             totalOldCount += oldCount;
         }
 
@@ -1800,13 +1798,17 @@ private:
                 {});
         }
 
-        // Finalize consumes evictable slots shard-major. Only copy the
-        // prefix that can actually be paired with a miss. Each UB segment
+        // Occupied logical slots form a dense prefix. Use its free tail
+        // before replacing resident KV that may be reused by a later step.
+        const uint32_t freeCount = capacity_ - totalOldCount;
+        const uint32_t appendCount = totalMissCount < freeCount
+            ? totalMissCount : freeCount;
+        const uint32_t totalSelectedEvictCount = totalMissCount - appendCount;
+        // Consume only the required eviction prefix, in shard-major order.
+        // Publish that same prefix length for state update. Each UB segment
         // remains 32-byte aligned for DataCopy/DataCopyPad; the small gaps
         // are covered by packedElements' per-shard padding allowance.
-        uint32_t remainingEvictions = totalMissCount < totalEvictableCount
-            ? totalMissCount
-            : totalEvictableCount;
+        uint32_t remainingEvictions = totalSelectedEvictCount;
         for (uint32_t shard = 0; shard < shardCount_; ++shard) {
             const uint32_t selectedCount =
                 evictableCounts[shard] < remainingEvictions
@@ -1837,10 +1839,6 @@ private:
             evictableEnd = evictableOffset + selectedCount;
             remainingEvictions -= selectedCount;
         }
-        const uint32_t totalSelectedEvictCount =
-            totalMissCount < totalEvictableCount
-            ? totalMissCount
-            : totalEvictableCount;
         Sync<AscendC::HardEvent::MTE2_S>();
         Sync<AscendC::HardEvent::V_S>();
 
@@ -1857,7 +1855,9 @@ private:
                      localMiss < shardMissCount;
                      ++localMiss) {
                     int16_t slot;
-                    if (globalMiss < totalSelectedEvictCount) {
+                    if (globalMiss < appendCount) {
+                        slot = static_cast<int16_t>(totalOldCount + globalMiss);
+                    } else {
                         while (
                             evictableShard < shardCount_ &&
                             evictableIndex >=
@@ -1869,17 +1869,6 @@ private:
                             evictableOffsets[evictableShard]
                                 + evictableIndex);
                         ++evictableIndex;
-                    } else {
-                        // Resident allocation preserves a dense occupied
-                        // prefix. Every old entry not present in the current
-                        // union is emitted above as an evictable slot; after
-                        // pooling all shards, any remaining miss grows the
-                        // prefix from totalOldCount. Therefore the global
-                        // candidate count is always capacity - hitCount.
-                        slot = static_cast<int16_t>(
-                            totalOldCount
-                            + globalMiss
-                            - totalSelectedEvictCount);
                     }
                     const uint32_t position = static_cast<uint32_t>(
                         missPositions.GetValue(

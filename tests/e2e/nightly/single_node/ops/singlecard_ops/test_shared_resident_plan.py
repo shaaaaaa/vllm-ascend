@@ -13,14 +13,22 @@ from vllm_ascend.distributed.kv_transfer.sparse_offload.resident_sorted_cache im
     SharedResidentPlan,
     allocate_sorted_resident_state,
     allocate_sorted_resident_workspace,
+    configure_resident_kernels,
 )
 from vllm_ascend.utils import enable_custom_op
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _load_shared_resident_ops():
+    assert enable_custom_op()
+    # Also select explicitly when this module is run on its own. The test
+    # constructs implementations without calling the serving constructor.
+    configure_resident_kernels()
 
 
 @pytest.mark.parametrize("mtp", [1, 2])
 @pytest.mark.parametrize("captured", [False, True])
 def test_shared_plan_matches_independent_layers_and_reaches_own_kv(mtp, captured, monkeypatch):
-    assert enable_custom_op()
     monkeypatch.setenv("VLLM_ASCEND_MTP_DRAFT_DEBUG", "0")
     requests, members, block_size = 2, 3, 128
     capacity = mtp * 2048
@@ -121,7 +129,10 @@ def test_shared_plan_matches_independent_layers_and_reaches_own_kv(mtp, captured
         group.state.generations.fill_(-1)
         torch.npu.synchronize()
 
-    for offset in (0, 512, 0, 0):
+    old_residents = [set() for _ in range(requests)]
+    # MTP=2 first leaves free slots, then fills them without evicting earlier
+    # KV, returns to that KV, and finally crosses into real eviction.
+    for offset in (0, 512, 0, 0, 2048, 2048, 0):
         raw.copy_(source(offset))
         reference = [run(impl, raw.clone()) for impl in baseline]
         if captured:
@@ -133,6 +144,24 @@ def test_shared_plan_matches_independent_layers_and_reaches_own_kv(mtp, captured
                 shared_step()
                 assert union.call_count == 1
         actual = bridges
+        state_counts = group.state.counts[:requests, :, 0].cpu()
+        state_tokens = group.state.tokens[:requests].cpu()
+        raw_cpu = raw.cpu()
+        for request in range(requests):
+            selected = set(raw_cpu[request * mtp:(request + 1) * mtp].reshape(-1).tolist())
+            old = old_residents[request]
+            missing = selected - old
+            current = {
+                token
+                for shard in range(state_counts.shape[1])
+                for token in state_tokens[request, shard, :int(state_counts[request, shard])].tolist()
+            }
+            assert int(actual[0][2][request].cpu()) == len(missing)
+            assert len(current) == min(capacity, len(old) + len(missing))
+            assert selected <= current
+            if len(old) + len(missing) <= capacity:
+                assert old <= current
+            old_residents[request] = current
         for layer, (expected, result) in enumerate(zip(reference, actual)):
             assert torch.equal(expected[0], result[0])
             assert torch.equal(expected[2], result[2])

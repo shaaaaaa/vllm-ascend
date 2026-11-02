@@ -141,12 +141,14 @@ public:
         __gm__ int32_t* missCounts,
         uint32_t requestCount,
         uint32_t shardCount,
+        uint32_t capacity,
         uint32_t shardCountStride,
         uint32_t shardCountRequestStride,
         uint32_t missCountStride)
     {
         requestCount_ = requestCount;
         shardCount_ = shardCount;
+        capacity_ = capacity;
         shardCountStride_ = shardCountStride;
         shardCountRequestStride_ = shardCountRequestStride;
         missCountStride_ = missCountStride;
@@ -175,7 +177,6 @@ public:
         uint32_t missCounts[kMaxResidentShards] = {};
         uint32_t evictableCounts[kMaxResidentShards] = {};
         uint32_t totalMissCount = 0;
-        uint32_t totalEvictableCount = 0;
         uint32_t totalOldCount = 0;
         for (uint32_t shard = 0; shard < shardCount_; ++shard) {
             const uint64_t countOffset =
@@ -192,16 +193,15 @@ public:
                 shardCounts_.GetValue(
                     countOffset + kShardEvictableCount));
             totalMissCount += missCounts[shard];
-            totalEvictableCount += evictableCounts[shard];
             totalOldCount += static_cast<uint32_t>(
                 shardCounts_.GetValue(
                     countOffset + kShardOldCount));
         }
 
-        const uint32_t totalSelectedEvictCount =
-            totalMissCount < totalEvictableCount
-            ? totalMissCount
-            : totalEvictableCount;
+        const uint32_t freeCount = capacity_ - totalOldCount;
+        const uint32_t appendCount = totalMissCount < freeCount
+            ? totalMissCount : freeCount;
+        const uint32_t totalSelectedEvictCount = totalMissCount - appendCount;
         uint32_t missPrefix = 0;
         uint32_t selectedEvictPrefix = 0;
         uint32_t remainingEvictions = totalSelectedEvictCount;
@@ -248,6 +248,7 @@ private:
     AscendC::GlobalTensor<int32_t> missCounts_;
     uint32_t requestCount_ = 0;
     uint32_t shardCount_ = 0;
+    uint32_t capacity_ = 0;
     uint32_t shardCountStride_ = 0;
     uint32_t shardCountRequestStride_ = 0;
     uint32_t missCountStride_ = 0;
@@ -370,7 +371,6 @@ public:
         uint32_t missPrefixes[kMaxResidentShards] = {};
         uint32_t missOffsets[kMaxResidentShards] = {};
         uint32_t totalMissCount = 0;
-        uint32_t totalEvictableCount = 0;
         uint32_t totalOldCount = 0;
         for (uint32_t shard = 0; shard < shardCount_; ++shard) {
             const uint64_t countOffset =
@@ -389,15 +389,14 @@ public:
                     countOffset + kShardEvictableCount));
             missPrefixes[shard] = totalMissCount;
             totalMissCount += missCounts[shard];
-            totalEvictableCount += evictableCounts[shard];
             totalOldCount += static_cast<uint32_t>(
                 shardCounts_.GetValue(
                     countOffset + kShardOldCount));
         }
-        const uint32_t totalSelectedEvictCount =
-            totalMissCount < totalEvictableCount
-            ? totalMissCount
-            : totalEvictableCount;
+        const uint32_t freeCount = capacity_ - totalOldCount;
+        const uint32_t appendCount = totalMissCount < freeCount
+            ? totalMissCount : freeCount;
+        const uint32_t totalSelectedEvictCount = totalMissCount - appendCount;
         uint32_t selectedEvictPrefix = 0;
         uint32_t remainingEvictions = totalSelectedEvictCount;
         for (uint32_t shard = 0; shard < shardCount_; ++shard) {
@@ -518,7 +517,7 @@ public:
                 missPrefixes[ownerShard] + localMiss;
             const int16_t slot = ResolveSlot(
                 globalMiss,
-                totalSelectedEvictCount,
+                appendCount,
                 totalOldCount,
                 packedEvictSlots);
             const uint32_t position = static_cast<uint32_t>(
@@ -565,7 +564,7 @@ public:
                     missOffsets[sourceShard] + sourceIndex));
             const int16_t slot = ResolveSlot(
                 globalMiss,
-                totalSelectedEvictCount,
+                appendCount,
                 totalOldCount,
                 packedEvictSlots);
             const uint32_t logicalSlot = static_cast<uint32_t>(slot);
@@ -609,26 +608,25 @@ public:
 private:
     __aicore__ inline int16_t ResolveSlot(
         uint32_t globalMiss,
-        uint32_t totalSelectedEvictCount,
+        uint32_t appendCount,
         uint32_t totalOldCount,
         AscendC::LocalTensor<int16_t> packedEvictSlots)
     {
-        if (globalMiss >= totalSelectedEvictCount) {
-            return static_cast<int16_t>(
-                totalOldCount + globalMiss
-                - totalSelectedEvictCount);
+        if (globalMiss < appendCount) {
+            return static_cast<int16_t>(totalOldCount + globalMiss);
         }
+        const uint32_t evictionIndex = globalMiss - appendCount;
         uint32_t evictShard = 0;
         while (
             evictShard + 1 < shardCount_ &&
-            globalMiss >=
+            evictionIndex >=
                 selectedEvictPrefixes_[evictShard]
                     + selectedEvictCounts_[evictShard]) {
             ++evictShard;
         }
         return packedEvictSlots.GetValue(
             evictOffsets_[evictShard]
-                + globalMiss
+                + evictionIndex
                 - selectedEvictPrefixes_[evictShard]);
     }
 
@@ -669,6 +667,7 @@ dsa_resident_finalize_coordinator_kernel(
     __gm__ int32_t* missCounts,
     uint32_t requestCount,
     uint32_t shardCount,
+    uint32_t capacity,
     uint32_t shardCountStride,
     uint32_t shardCountRequestStride,
     uint32_t missCountStride)
@@ -676,7 +675,7 @@ dsa_resident_finalize_coordinator_kernel(
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
     DSAResidentFinalizeCoordinatorKernel op;
     op.Init(
-        shardCounts, missCounts, requestCount, shardCount,
+        shardCounts, missCounts, requestCount, shardCount, capacity,
         shardCountStride, shardCountRequestStride, missCountStride);
     op.Process();
 }
@@ -737,6 +736,7 @@ void dsa_resident_finalize_coordinator_impl(
     void* missCounts,
     uint32_t requestCount,
     uint32_t shardCount,
+    uint32_t capacity,
     uint32_t shardCountStride,
     uint32_t shardCountRequestStride,
     uint32_t missCountStride,
@@ -747,7 +747,7 @@ void dsa_resident_finalize_coordinator_impl(
         nullptr, stream>>>(
         static_cast<int32_t*>(shardCounts),
         static_cast<int32_t*>(missCounts),
-        requestCount, shardCount, shardCountStride,
+        requestCount, shardCount, capacity, shardCountStride,
         shardCountRequestStride, missCountStride);
 }
 

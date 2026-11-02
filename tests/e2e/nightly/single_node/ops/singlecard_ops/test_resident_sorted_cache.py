@@ -10,8 +10,12 @@ from vllm_ascend.distributed.kv_transfer.sparse_offload.resident_sorted_cache im
     RESIDENT_READ_PROBE_DEBUG_INTS,
     allocate_sorted_resident_state,
     allocate_sorted_resident_workspace,
+    configure_resident_kernels,
+    coordinate_sorted_resident_finalize_,
     debug_sorted_resident_finalize_only_,
     prepare_resident_sharded_union_,
+    prepare_sorted_resident_cache_,
+    prepare_sorted_resident_cache_coordinated_,
     prepare_sorted_resident_cache_fused_,
     prepare_sorted_resident_cache_no_remap_,
     probe_sorted_resident_reads_,
@@ -35,6 +39,9 @@ def _load_sorted_resident_ops():
     ):
         if not hasattr(torch.ops._C_ascend, name):
             pytest.fail(f"vllm_ascend_C does not contain {name}")
+    # Select the requested scalar/vectorized implementation before the first
+    # kernel launch; the C++ dispatcher freezes that choice for graph replay.
+    configure_resident_kernels()
 
 
 def _source(mtp: int, offset: int, requests: int = 1) -> torch.Tensor:
@@ -1127,8 +1134,11 @@ def _reference_step(
     capacity: int,
 ) -> tuple[dict[int, int], list[int], list[int]]:
     occupied = set(resident.values())
+    assert len(occupied) == len(resident) <= capacity
     assert occupied == set(range(len(occupied)))
     current = {token for shard in shards for token in shard}
+    assert len(current) <= capacity
+    free_count = capacity - len(occupied)
     shard_count = len(shards)
     evictable_slots = []
     for shard in range(shard_count):
@@ -1147,10 +1157,10 @@ def _reference_step(
                 assigned[token] = resident[token]
             else:
                 miss_index = len(misses)
-                if miss_index < len(evictable_slots):
-                    slot = evictable_slots[miss_index]
+                if miss_index < free_count:
+                    slot = len(occupied) + miss_index
                 else:
-                    slot = len(occupied) + miss_index - len(evictable_slots)
+                    slot = evictable_slots[miss_index - free_count]
                 assert slot < capacity
                 assigned[token] = slot
                 misses.append(token)
@@ -1181,6 +1191,111 @@ def _state_dict(state, state_index: int, shard_count: int) -> dict[int, int]:
             )
         )
     return result
+
+
+@pytest.mark.parametrize("mtp", [1, 2])
+@pytest.mark.parametrize("captured", [False, True])
+@pytest.mark.parametrize("planner", ["fused", "split", "coordinated"])
+@pytest.mark.parametrize("skewed", [False, True])
+def test_resident_free_first_allocation_and_replay(mtp, captured, planner, skewed):
+    """Exercise free/mixed/full allocation with fixed graph input addresses."""
+    capacity, block_size, boundary = mtp * INDEX_TOPK, 128, 100_000
+    shard_count = resident_shard_count(mtp)
+    token_stride = shard_count if skewed else 1
+    state = allocate_sorted_resident_state(1, 1, mtp, device=torch.device("npu"))
+    workspace = allocate_sorted_resident_workspace(1, mtp, device=torch.device("npu"))
+    values = torch.empty((mtp, 1, INDEX_TOPK), dtype=torch.int32, device="npu")
+    boundaries = torch.full((mtp,), boundary, dtype=torch.int32, device="npu")
+    rows = torch.zeros(mtp, dtype=torch.int32, device="npu")
+    states = torch.zeros(1, dtype=torch.int32, device="npu")
+    generations = torch.ones(1, dtype=torch.int64, device="npu")
+    table_cpu = torch.randperm(capacity // block_size, generator=torch.Generator().manual_seed(23)).int().reshape(1, -1)
+    table = table_cpu.npu()
+    coordinator_counts = torch.empty_like(workspace.shard_counts)
+    plan = {
+        "fused": prepare_sorted_resident_cache_fused_,
+        "split": prepare_sorted_resident_cache_,
+        "coordinated": prepare_sorted_resident_cache_coordinated_,
+    }[planner]
+
+    def source(selected):
+        # Recent-window entries remain outside resident allocation. Both MTP
+        # rows select the same historical tokens in different orders.
+        raw = torch.arange(capacity, dtype=torch.int32).reshape(mtp, 1, INDEX_TOPK) + boundary
+        for lane in range(mtp):
+            tokens = selected if lane == 0 else list(reversed(selected))
+            raw[lane, 0, :len(tokens)] = torch.tensor(tokens, dtype=torch.int32)
+        return raw
+
+    def run():
+        prepare_resident_sharded_union_(values, boundaries, rows, states, generations, state, workspace, mtp=mtp)
+        if planner == "coordinated":
+            coordinate_sorted_resident_finalize_(workspace)
+            coordinator_counts.copy_(workspace.shard_counts)
+        plan(values, table, states, generations, state, workspace, block_size=block_size)
+
+    values.copy_(source([6, 9]).npu())
+    if captured:
+        run()
+        torch.npu.synchronize()
+        values.copy_(source([6, 9]).npu())
+        graph = torch.npu.NPUGraph()
+        with torch.npu.graph(graph):
+            run()
+        torch.npu.synchronize()
+
+    def seed(resident):
+        old_shards = [sorted(t for t in resident if t % shard_count == s) for s in range(shard_count)]
+        _seed_resident_state(state, state_index=0, generation=1, shards=old_shards, resident=resident)
+
+    # A small initial resident set; the next request must preserve KV2 even
+    # though it was not selected in the first step.
+    resident = {2 * token_stride: 0, 6 * token_stride: 1, 7 * token_stride: 2}
+    seed(resident)
+    steps = ([6, 9], [2, 9], [6, capacity + 9, capacity + 12],
+             [6, capacity + 9, capacity + 12], [7, capacity + 15], [6, 9])
+    for step, selected in enumerate(steps):
+        selected = [token * token_stride for token in selected]
+        if step == 2:
+            # One free slot and two distinct misses: exactly one eviction.
+            resident = {token * token_stride: token for token in range(capacity - 1)}
+            seed(resident)
+        if step == 5:
+            # A reused request row must not resurrect previous residency.
+            generations.add_(1)
+            resident = {}
+        before = resident.copy()
+        raw = source(selected)
+        shards = _expected_shards(raw, boundaries.cpu(), 1, mtp, shard_count)[0]
+        resident, misses, slots = _reference_step(shards, before, capacity)
+        values.copy_(raw.npu())
+        if captured:
+            graph.replay()
+        else:
+            run()
+        torch.npu.synchronize()
+
+        count = int(workspace.miss_counts[0, 0].cpu())
+        assert count == len(misses) == len(set(selected) - before.keys())
+        assert workspace.miss_tokens[0, :count].cpu().tolist() == misses
+        expected_targets = [int(table_cpu[0, slot // block_size]) * block_size + slot % block_size for slot in slots]
+        assert workspace.target_slots[0, :count].cpu().tolist() == expected_targets
+        assert len(set(expected_targets)) == count
+        assert _state_dict(state, 0, shard_count) == resident
+        evicted = before.keys() - resident.keys()
+        expected_evictions = [sum(t % shard_count == s for t in evicted) for s in range(shard_count)]
+        assert workspace.shard_counts[0, :, 4].cpu().tolist() == expected_evictions
+        if planner == "coordinated":
+            assert coordinator_counts[0, :, 4].cpu().tolist() == expected_evictions
+        expected_remap = [resident[t] if t < boundary else t for t in raw.reshape(-1).tolist()]
+        assert values.reshape(-1).cpu().tolist() == expected_remap
+        assert set(resident.values()) == set(range(len(resident)))
+        if step == 0:
+            assert resident[2 * token_stride] == 0 and resident[9 * token_stride] == 3
+        if step == 2:
+            assert len(evicted) == 1 and slots[0] == capacity - 1
+        if step == 3:
+            assert count == 0 and not evicted  # Clear the previous eviction decisions.
 
 
 @pytest.mark.parametrize("mtp", [1, 2])
@@ -1330,7 +1445,8 @@ def test_sorted_resident_grows_contiguous_slot_tail_before_reuse(mtp):
 
 
 @pytest.mark.parametrize("mtp", [1, 2])
-def test_sorted_resident_pools_evict_slots_across_shards(mtp):
+@pytest.mark.parametrize("full", [False, True])
+def test_sorted_resident_uses_free_slots_before_cross_shard_eviction(mtp, full):
     requests = 1
     shard_count = resident_shard_count(mtp)
     capacity = mtp * 2048
@@ -1361,6 +1477,12 @@ def test_sorted_resident_pools_evict_slots_across_shards(mtp):
         source[0, 0, : len(selected)] = torch.tensor(selected, dtype=torch.int32)
         return source
 
+    if full:
+        # Fill the complete resident region; eviction must not depend on the
+        # request's old/current tokens belonging to the same record shard.
+        old = {token: slot for slot, token in enumerate([0, 1, 2, 3, 4] + list(range(1000, 1000 + capacity - 5)))}
+        old_shards = [sorted(t for t in old if t % shard_count == s) for s in range(shard_count)]
+        _seed_resident_state(state, state_index=0, generation=1, shards=old_shards, resident=old)
     first = make_source([0, 1, 2, 3, 4])
     first_values = first.npu()
     prepare_resident_sharded_union_(
@@ -1412,15 +1534,16 @@ def test_sorted_resident_pools_evict_slots_across_shards(mtp):
     assert 0 % shard_count != 5 % shard_count
     assert int(workspace.miss_counts[0, 0].cpu()) == 1
     assert int(workspace.miss_tokens[0, 0].cpu()) == 5
-    assert int(workspace.target_slots[0, 0].cpu()) == evicted_slot
+    expected_slot = evicted_slot if full else len(first_resident)
+    assert int(workspace.target_slots[0, 0].cpu()) == expected_slot
     selected_evict_counts = workspace.shard_counts[0, :, 4].cpu().tolist()
-    assert sum(selected_evict_counts) == 1
-    assert selected_evict_counts[0 % shard_count] == 1
+    assert sum(selected_evict_counts) == int(full)
+    assert selected_evict_counts[0 % shard_count] == int(full)
     assert selected_evict_counts[5 % shard_count] == 0
     second_resident = _state_dict(state, 0, shard_count)
-    assert 0 not in second_resident
+    assert (0 not in second_resident) == full
     assert second_resident[4] == first_resident[4]
-    assert second_resident[5] == evicted_slot
+    assert second_resident[5] == expected_slot
 
 
 @pytest.mark.parametrize("mtp", [1, 2])

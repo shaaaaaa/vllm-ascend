@@ -372,6 +372,7 @@ namespace vllm_ascend {
     void* miss_counts,
     uint32_t request_count,
     uint32_t shard_count,
+    uint32_t capacity,
     uint32_t shard_count_stride,
     uint32_t shard_count_request_stride,
     uint32_t miss_count_stride,

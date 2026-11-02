@@ -2035,7 +2035,8 @@ at::Tensor npu_dsa_resident_sorted_plan_no_remap_(
 
 at::Tensor npu_dsa_resident_finalize_coordinator_(
     at::Tensor &shard_counts,
-    at::Tensor &miss_counts)
+    at::Tensor &miss_counts,
+    int64_t capacity)
 {
     const auto device = shard_counts.device();
     TORCH_CHECK(
@@ -2066,6 +2067,8 @@ at::Tensor npu_dsa_resident_finalize_coordinator_(
             miss_counts.size(0) == request_count &&
             miss_count_stride >= 16 && miss_count_stride % 16 == 0,
         "resident finalize coordinator shapes are invalid");
+    TORCH_CHECK(capacity > 0 && capacity < 32768,
+        "resident finalize coordinator capacity must fit int16 slots");
     TORCH_CHECK(
         reinterpret_cast<std::uintptr_t>(
             shard_counts.data_ptr()) % 64 == 0 &&
@@ -2083,13 +2086,14 @@ at::Tensor npu_dsa_resident_finalize_coordinator_(
     cmd.Name("npu_dsa_resident_finalize_coordinator_");
     cmd.SetCustomHandler([
         stream, shard_count_ptr, miss_count_ptr,
-        request_count, shard_count, shard_count_stride,
+        request_count, shard_count, capacity, shard_count_stride,
         shard_count_request_stride, miss_count_stride,
         core_count]() -> int {
         dsa_resident_finalize_coordinator_impl(
             stream, shard_count_ptr, miss_count_ptr,
             static_cast<uint32_t>(request_count),
             static_cast<uint32_t>(shard_count),
+            static_cast<uint32_t>(capacity),
             static_cast<uint32_t>(shard_count_stride),
             static_cast<uint32_t>(shard_count_request_stride),
             static_cast<uint32_t>(miss_count_stride),
@@ -3994,7 +3998,7 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         &vllm_ascend::npu_dsa_resident_sorted_plan_no_remap_);
     ops.def(
         "npu_dsa_resident_finalize_coordinator_("
-        "Tensor(a!) shard_counts, Tensor(b!) miss_counts) -> Tensor(b!)");
+        "Tensor(a!) shard_counts, Tensor(b!) miss_counts, int capacity) -> Tensor(b!)");
     ops.impl(
         "npu_dsa_resident_finalize_coordinator_",
         torch::kPrivateUse1,

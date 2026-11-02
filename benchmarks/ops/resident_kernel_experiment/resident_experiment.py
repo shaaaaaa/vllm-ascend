@@ -257,8 +257,9 @@ def reference(case: Case) -> tuple[Case, dict]:
                 result["topk"][i].zero_()
         order = lambda token: (token % case.shards, token)
         misses = sorted(selected - old.keys(), key=order)
-        evicted = sorted(old.keys() - selected, key=order)[: len(misses)]
-        targets = [old[t] for t in evicted] + list(range(len(old), len(old) + len(misses) - len(evicted)))
+        append_count = min(len(misses), case.capacity - len(old))
+        evicted = sorted(old.keys() - selected, key=order)[: len(misses) - append_count]
+        targets = list(range(len(old), len(old) + append_count)) + [old[t] for t in evicted]
         evicted_set = set(evicted)
         updated = {t: slot for t, slot in old.items() if t not in evicted_set}
         updated.update(zip(misses, targets, strict=True))

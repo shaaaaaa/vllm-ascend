@@ -474,7 +474,8 @@ def coordinate_sorted_resident_finalize_(
         raise RuntimeError(
             "vllm_ascend_C does not expose the resident finalize coordinator; rebuild the extension"
         ) from error
-    op(workspace.shard_counts, workspace.miss_counts)
+    # Capacity is fixed tensor geometry, not a device scalar readback.
+    op(workspace.shard_counts, workspace.miss_counts, workspace.miss_tokens.shape[1])
 
 
 def run_sharded_resident_finalize_(
