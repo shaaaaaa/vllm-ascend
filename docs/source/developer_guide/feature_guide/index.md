@@ -16,4 +16,5 @@ add_custom_aclnn_op
 context_parallel
 quantization
 npugraph_ex
+sfa_independent_dp
 :::

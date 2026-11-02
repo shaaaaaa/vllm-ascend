@@ -593,6 +593,22 @@ class NPUPlatform(Platform):
                 "Please disable VLLM_ASCEND_ENABLE_FUSED_MC2 by setting it to 0."
             )
 
+        requested = envs_ascend.VLLM_ASCEND_SFA_INDEPENDENT_DP
+        reason = ""
+        if requested:
+            from vllm_ascend.worker.sfa_independent import topology_reason
+
+            reason = topology_reason(vllm_config)
+        lease = envs_ascend.VLLM_ASCEND_SFA_GUARD_TIMEOUT_S
+        vllm_config._sfa_independent_options = dict(
+            requested=requested,
+            single=envs_ascend.VLLM_ASCEND_SFA_SINGLE_AGREEMENT,
+            eligible=not reason,
+            reason=reason,
+            lease=lease,
+            valid_lease=math.isfinite(lease) and 2 <= lease <= 86400,
+        )
+
     @classmethod
     def import_kernels(cls) -> None:
         # Directly importing vllm_ascend_C prevents ASCEND_RT_VISIBLE_DEVICES

@@ -661,6 +661,7 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
         self._staged_sfa_layer_names: tuple[str, ...] = ()
         self._sfa_full_graph = SFAFullGraph()
         self._sfa_single_agreement = None
+        self._sfa_independent = None
         if envs_ascend.VLLM_ASCEND_SFA_SHARED_RETRIEVAL_OVERLAP:
             if not sfa_full_graph_enabled(vllm_config) or not envs_ascend.VLLM_ASCEND_SFA_SHARED_RESIDENT_PLAN:
                 raise ValueError("shared retrieval overlap requires full graphs and shared resident planning")
@@ -1218,6 +1219,14 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
         # immediately once the other two flags are no longer needed.
         if self.dp_size == 1:
             return num_tokens, None, with_prefill
+
+        independent = getattr(self, "_sfa_independent", None)
+        if independent is not None:
+            counts = independent.agree(
+                num_tokens, int(with_prefill), 0, False, draft=is_draft_model,
+                requests=self.input_batch.num_reqs,
+            )
+            return num_tokens, counts, with_prefill
 
         if self._skip_all_reduce_across_dp_group(is_draft_model):
             num_tokens_after_padding = torch.tensor([num_tokens] * self.dp_size, device="cpu", dtype=torch.int32)
@@ -3797,6 +3806,10 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
         dummy_run: bool,
     ) -> None:
         """Propagate graph-preparation failure before target collectives."""
+        if getattr(self, "_sfa_independent", None) is not None:
+            if local_error is not None:
+                raise local_error  # WorkerProc fails the guarded epoch, including idle peers.
+            return
         if not dummy_run and uses_local_sfa_fail_stop(
             self.vllm_config.parallel_config
         ):
@@ -3986,7 +3999,9 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                     if not single.complete:
                         self._coordinate_sfa_full_graph_preparation(None, context.staged_sfa_graph_dummy_run)
                 else:
-                    prepared_call = self._prepare_sfa_full_graph_call(graph_kwargs, num_tokens_padded)
+                    prepared_call = self._prepare_sfa_full_graph_call(
+                        graph_kwargs, num_tokens_padded, agree=getattr(self, "_sfa_independent", None) is None,
+                    )
                 output = self._sfa_full_graph.run(
                     self._run_sfa_full_graph_target,
                     **({"prepared": prepared_call} if prepared_call is not None else graph_kwargs),
@@ -4141,6 +4156,19 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
         self._staged_sfa_dp_bounded_decode = True
         if self.dp_size == 1:
             return False, None, cudagraph_mode, staged_sfa_route_action
+
+        independent = getattr(self, "_sfa_independent", None)
+        if independent is not None:
+            route = (
+                _STAGED_SFA_ROUTE_ACTIONS.index(staged_sfa_route_action)
+                if staged_sfa_route_action is not None else -1
+            )
+            counts = independent.agree(
+                num_tokens_padded, cudagraph_mode, route, staged_sfa_bounded_decode,
+                requests=self.input_batch.num_reqs,
+            )
+            self._staged_sfa_dp_bounded_decode = staged_sfa_bounded_decode
+            return False, counts, cudagraph_mode, staged_sfa_route_action
 
         # Collective shape is a wire protocol and must match on every DP rank.
         # A neutral/bootstrap rank may have no local route while its peer uses

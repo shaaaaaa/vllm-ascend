@@ -1006,6 +1006,44 @@ class NPUWorker(WorkerBase):
             single.activate(self.model_runner._sfa_full_graph.entries)
         return self.vllm_config.compilation_config.compilation_time
 
+    def independent_dp_contract(self) -> dict:
+        """Validate the loaded/captured path before the supervisor activates it."""
+        from vllm_ascend.worker.sfa_independent import execution_contract
+
+        self._independent_dp_contract = execution_contract(self.model_runner)
+        return self._independent_dp_contract
+
+    def activate_independent_dp(self, enabled: bool) -> None:
+        """Select a startup-agreed mode; no live switch back to DP votes is allowed."""
+        from vllm.distributed import get_tp_group
+
+        from vllm_ascend.worker.sfa_independent import IndependentDP
+
+        if getattr(self.model_runner, "_sfa_independent", None) is not None:
+            raise RuntimeError("Independent DP execution is already active")
+        if enabled:
+            contract = self._independent_dp_contract
+            if not contract.get("digest") or getattr(self, "dp_guardian", None) is None:
+                raise RuntimeError("Independent DP has no qualified supervised contract")
+            self.model_runner._sfa_independent = IndependentDP(
+                get_tp_group(),
+                self.parallel_config.data_parallel_size,
+                contract["capacity"],
+            )
+        else:
+            self.dp_guardian.close()
+            self.dp_guardian = None
+
+    def drain_independent_dp(self) -> None:
+        """Drain existing resource owners only after group-wide model quiescence."""
+        from vllm.distributed.kv_transfer import ensure_kv_transfer_shutdown
+
+        self.release_sfa_graph_resources()
+        ensure_kv_transfer_shutdown()
+        storage = getattr(self, "_decoder_storage_bootstrap", None)
+        if storage is not None:
+            storage.close()
+
     def _warm_up_atb(self):
         x = torch.rand((2, 4), dtype=torch.float16).npu()
         weight = torch.rand((2, 4), dtype=torch.float16).npu()

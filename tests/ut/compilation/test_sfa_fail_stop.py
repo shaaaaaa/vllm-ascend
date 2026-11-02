@@ -34,7 +34,7 @@ def executor_methods():
     path = Path(__file__).resolve().parents[4] / "vllm/vllm/v1/executor/multiproc_executor.py"
     if not path.is_file():
         pytest.skip("Requires the matching sibling vllm checkout")
-    wanted = {"start_worker_monitor", "_ensure_worker_termination", "worker_busy_loop"}
+    wanted = {"start_worker_monitor", "_ensure_worker_termination", "worker_busy_loop", "_handle_worker_failure"}
     methods = [
         node
         for node in ast.walk(ast.parse(path.read_text(encoding="utf-8")))
@@ -192,6 +192,8 @@ def test_real_supervisor_stops_owned_blocked_peers_on_nonzero_rank_failure(worke
         shutting_down = False
         is_failed = False
         failure_callback = staticmethod(stopped.set)
+        _handle_worker_failure = methods["_handle_worker_failure"]
+        _failure_lock = threading.Lock()
 
         def shutdown(self):
             self.shutting_down = True

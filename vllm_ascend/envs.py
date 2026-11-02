@@ -239,6 +239,13 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Experimental: combine stable target batch and preparation agreements.
     # 0 (default): existing protocol; 1: qualified MP TP x DP. Non-sensitive; restart required.
     "VLLM_ASCEND_SFA_SINGLE_AGREEMENT": lambda: bool(int(os.getenv("VLLM_ASCEND_SFA_SINGLE_AGREEMENT", "0"))),
+    # Experimental independent DP graph buckets with CPU guardian supervision.
+    # 0 (default): unchanged path; 1: qualified MC2 full-SFA MP cohorts only.
+    # Mutually exclusive with SINGLE_AGREEMENT; non-sensitive, restart required.
+    "VLLM_ASCEND_SFA_INDEPENDENT_DP": lambda: bool(int(os.getenv("VLLM_ASCEND_SFA_INDEPENDENT_DP", "0"))),
+    # Guardian liveness lease in seconds, [2, 86400]; default 30. This is
+    # independent of forward and startup timeouts. Non-sensitive; restart required.
+    "VLLM_ASCEND_SFA_GUARD_TIMEOUT_S": lambda: float(os.getenv("VLLM_ASCEND_SFA_GUARD_TIMEOUT_S", "30")),
     # Experimental device MTP preparation for unchanged full-SFA decode batches.
     # 0 (default): original runner; 1: launch before CPU count reconciliation.
     # Non-sensitive, requires async MTP=1, PP=PCP=DCP=1 and a worker restart.
