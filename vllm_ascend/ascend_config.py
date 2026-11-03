@@ -70,6 +70,12 @@ class AscendConfig:
         if self.enable_shared_expert_dp:
             assert enable_sp(vllm_config=vllm_config, enable_shared_expert_dp=True)
 
+        # FC1 historically replicated shared weights. Keep that default while
+        # allowing their placement to be selected independently of token layout.
+        self.enable_shared_expert_dp = self.enable_shared_expert_dp or (
+            enable_sp(vllm_config) and additional_config.get("enable_shared_expert_dp", True)
+        )
+
         if vllm_config.parallel_config.prefill_context_parallel_size > 1 and enable_sp(vllm_config=vllm_config):
             tp_pcp_size = (
                 vllm_config.parallel_config.tensor_parallel_size

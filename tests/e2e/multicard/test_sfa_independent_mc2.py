@@ -3,6 +3,8 @@
 
 Launch pytest under torchrun on both hosts; see sfa_independent_dp.md. This is an
 operator/graph contract test, NOT a full-SFA server, KV lifetime or throughput test.
+The FC1 variant adds TP4 gather/unpad, row-parallel projection and reduce-scatter;
+it includes communication padding and zero-input idle-like participation.
 """
 
 import os
@@ -16,7 +18,8 @@ torch_npu = pytest.importorskip("torch_npu")
 
 
 @torch.inference_mode()
-def test_unequal_mc2_inputs_with_independent_native_and_graph_routes():
+@pytest.mark.parametrize("flashcomm1", [False, True], ids=["ordinary", "flashcomm1"])
+def test_unequal_mc2_inputs_with_independent_native_and_graph_routes(flashcomm1):
     assert int(os.environ.get("WORLD_SIZE", "1")) == 16, "Launch this qualification probe with 16 torchrun ranks"
     torch.npu.set_device(int(os.environ["LOCAL_RANK"]))
     dist.init_process_group("hccl", timeout=timedelta(seconds=120))
@@ -24,8 +27,24 @@ def test_unequal_mc2_inputs_with_independent_native_and_graph_routes():
     # The operator documentation requires a domain dedicated to this pair.
     mc2 = dist.new_group(backend="hccl", timeout=timedelta(seconds=120))
     group = mc2._get_backend(torch.device("npu")).get_hccl_comm_name(rank)
-    capacities, hidden = (1, 2, 4, 8), 2048
-    global_bs = max(capacities) * world
+    tp_size, hidden = 4, 2048
+    capacities = (2, 4, 6, 8, 10, 12, 24) if flashcomm1 else (1, 2, 4, 8)
+
+    def local_count(tokens):
+        return (tokens + tp_size - 1) // tp_size if flashcomm1 else tokens
+
+    global_bs = local_count(max(capacities)) * world
+    if flashcomm1:
+        # Create TP domains in the same global order; never reuse MC2's domain.
+        for start in range(0, world, tp_size):
+            subgroup = dist.new_group(
+                list(range(start, start + tp_size)), backend="hccl", timeout=timedelta(seconds=120)
+            )
+            if start <= rank < start + tp_size:
+                tp = subgroup
+        begin = (rank % tp_size) * (hidden // tp_size)
+        columns = slice(begin, begin + hidden // tp_size)
+        weight = torch.eye(hidden, dtype=torch.bfloat16, device="npu")[columns].contiguous()
     assert hasattr(torch_npu, "npu_moe_distribute_dispatch_v2")
     assert hasattr(torch_npu, "npu_moe_distribute_combine_v2")
 
@@ -72,10 +91,29 @@ def test_unequal_mc2_inputs_with_independent_native_and_graph_routes():
             global_bs=global_bs,
         )
 
+    def layer(x, ids, weights, quant, tokens):
+        if flashcomm1:
+            gathered = torch.empty((x.shape[0] * tp_size, hidden), dtype=x.dtype, device=x.device)
+            dist.all_gather_into_tensor(gathered, x, group=tp)
+            # Each TP rank contributes disjoint hidden columns; RS reconstructs
+            # the identity projection and returns the original local token rows.
+            partial = gathered[:tokens, columns].contiguous() @ weight
+            partial = torch.nn.functional.pad(partial, (0, 0, 0, gathered.shape[0] - tokens))
+            x = torch.empty_like(x)
+            dist.reduce_scatter_tensor(x, partial, group=tp)
+        return transfer(x, ids, weights, quant)
+
+    def step(x, ids, weights, quant, tokens):
+        # Two target-like layers and one draft-like layer, in every route.
+        for _ in range(3):
+            x = layer(x, ids, weights, quant, tokens)
+        return x
+
     try:
         for quant in (0, 2):
             captures = {}
-            for size in capacities:
+            for tokens in capacities:
+                size = local_count(tokens)
                 x = torch.zeros((size, hidden), dtype=torch.bfloat16, device="npu")
                 ids = (
                     torch.arange(size, device="npu", dtype=torch.int32)[:, None]
@@ -83,27 +121,27 @@ def test_unequal_mc2_inputs_with_independent_native_and_graph_routes():
                 ) % world
                 weights = torch.full((size, 2), 0.5, dtype=torch.float32, device="npu")
                 for _ in range(2):
-                    transfer(x, ids, weights, quant)
+                    step(x, ids, weights, quant, tokens)
                 torch.npu.synchronize()
                 graph = torch.npu.NPUGraph()
                 with torch.npu.graph(graph):
-                    # Two target-like coupled layers, followed by one draft-like
-                    # layer. All routes must preserve this same phase sequence.
-                    value = transfer(x, ids, weights, quant)
-                    value = transfer(value, ids, weights, quant)
-                    result = transfer(value, ids, weights, quant)
-                captures[size] = (graph, x, ids, weights, result)
+                    result = step(x, ids, weights, quant, tokens)
+                captures[tokens] = (graph, x, ids, weights, result)
                 torch.npu.synchronize()
-            for iteration in range(8):
+            for iteration in range(2 * len(capacities)):
                 dp = rank // 4
-                size = capacities[(dp + iteration) % len(capacities)]
-                graph, x, ids, weights, result = captures[size]
+                tokens = capacities[(dp + iteration) % len(capacities)]
+                size = local_count(tokens)
+                graph, x, ids, weights, result = captures[tokens]
                 values = torch.arange(size * hidden, device="npu", dtype=torch.float32).reshape(size, hidden)
                 x.copy_(torch.sin(values * 0.17 + rank * 0.71 + iteration * 0.3).to(x.dtype))
+                if flashcomm1:
+                    valid = max(0, min(size, tokens - (rank % tp_size) * size))
+                    x[valid:].zero_()
+                    if (dp + iteration) % 5 == 0:
+                        x.zero_()  # All TP peers still execute all three phases.
                 if (dp + iteration) % 2:
-                    value = transfer(x, ids, weights, quant)
-                    value = transfer(value, ids, weights, quant)
-                    observed = transfer(value, ids, weights, quant)
+                    observed = step(x, ids, weights, quant, tokens)
                 else:
                     graph.replay()
                     observed = result

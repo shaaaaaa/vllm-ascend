@@ -72,6 +72,7 @@ from vllm_ascend.spec_decode.mtp_draft_diagnostics import (
     snapshot_cache_components,
 )
 from vllm_ascend.utils import (
+    enable_dsa_cp,
     enable_sp,
     lmhead_tp_enable,
     shared_expert_dp_enabled,
@@ -115,16 +116,18 @@ def _maybe_eager_context(vllm_config):
 
 
 # split hidden states along dimension of sequence
-def split_inputs_tp_to_sp(hidden_states, out):
+def split_inputs_tp_to_sp(hidden_states, out=None):
     # tp and sp share the same group
     group = get_tp_group()
 
     world_size = group.world_size
-    rank = group.rank
+    rank = group.rank_in_group
 
     num_tokens = hidden_states.shape[0]
     # the size per rank after padded
     padded_num_tokens_per_rank = (num_tokens + world_size - 1) // world_size
+    if out is None:
+        out = hidden_states.new_zeros((padded_num_tokens_per_rank, *hidden_states.shape[1:]))
     # compute the start and end of slice
     start = padded_num_tokens_per_rank * rank
     end = padded_num_tokens_per_rank * (rank + 1)
@@ -2709,6 +2712,9 @@ class SpecDecodeBaseProposer(EagleProposer):
             return hidden_states, positions
         if self.method == "mtp":
             if _EXTRA_CTX.flash_comm_v1_enabled:
+                if not enable_dsa_cp():
+                    # Target states and positions are already replicated, not partial sums.
+                    return split_inputs_tp_to_sp(hidden_states), split_inputs_tp_to_sp(positions)
                 hidden_states = torch.ops.vllm.maybe_pad_and_reduce(hidden_states)
                 positions = positions.unsqueeze(-1)
                 positions = torch.ops.vllm.maybe_pad_and_reduce(positions)
@@ -2725,7 +2731,7 @@ class SpecDecodeBaseProposer(EagleProposer):
         hidden_states: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         if self.method == "mtp":
-            if self.enable_shared_expert_dp:
+            if _EXTRA_CTX.flash_comm_v1_enabled:
                 last_hidden_states = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(
                     last_hidden_states.contiguous(), True
                 )

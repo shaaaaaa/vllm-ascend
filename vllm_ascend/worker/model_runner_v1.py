@@ -196,6 +196,7 @@ from vllm_ascend.utils import (
     StagedSFARouteReason,
     calc_split_factor,
     check_gdn_layer,
+    enable_dsa_cp,
     enable_sp,
     enable_sp_by_pass,
     global_stream,
@@ -4101,7 +4102,11 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
         # Pad tokens to multiple of tensor_parallel_size when
         # enabled collective fusion for SP
         tp_size = self.vllm_config.parallel_config.tensor_parallel_size
-        if enable_sp(self.vllm_config) or enable_sp_by_pass():
+        flashcomm1 = enable_sp(self.vllm_config)
+        if flashcomm1 or enable_sp_by_pass():
+            if flashcomm1 and self._staged_sfa_graph_capture_sizes and not enable_dsa_cp():
+                # Keep request/KV graph rows unchanged; FC1 pads only its collectives.
+                return num_scheduled_tokens
             return round_up(num_scheduled_tokens, tp_size)
         return num_scheduled_tokens
 
@@ -4309,7 +4314,7 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
         cudagraph_mode, batch_descriptor = dispatch_cudagraph(num_tokens_padded, use_cascade_attn or has_encoder_output)
         num_tokens_padded = batch_descriptor.num_tokens
         if enable_sp(self.vllm_config):
-            assert batch_descriptor.num_tokens % self.vllm_config.parallel_config.tensor_parallel_size == 0, (
+            assert batch_descriptor.num_tokens == self._pad_for_sequence_parallelism(batch_descriptor.num_tokens), (
                 "Sequence parallelism requires num_tokens to be a multiple of tensor parallel size"
             )
         # Extra coordination when running data-parallel since we need to coordinate

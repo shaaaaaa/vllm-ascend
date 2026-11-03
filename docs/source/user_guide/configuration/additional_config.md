@@ -34,7 +34,9 @@ The following table lists additional configuration options available in vLLM Asc
 | `refresh`                           | bool | `false` | Whether to refresh global Ascend configuration content. This is usually used by rlhf or ut/e2e test case. |
 | `dump_config_path`                  | str  | `None`  | Configuration file path for msprobe dump(eager mode).                                                     |
 | `enable_async_exponential`          | bool | `False` | Whether to enable asynchronous exponential overlap. To enable asynchronous exponential, set this config to True.        |
-| `enable_shared_expert_dp`           | bool | `False` | When the expert is shared in DP, it delivers better performance but consumes more memory. Currently only DeepSeek series models are supported. |
+| `enable_flashcomm1`                 | bool | Environment switches | Overrides the existing FlashComm1 environment switches when specified. |
+| `enable_dsa_cp`                     | bool | FlashComm1 on indexer models | Explicit `false` enables FlashComm1 without DSA-CP. Omission preserves legacy prefiller behavior; `true` requires FlashComm1. |
+| `enable_shared_expert_dp`           | bool | Replicated with FlashComm1 | Replicates shared-expert weights for local token computation. Explicit `false` retains TP-sharded weights, using gather/reduce-scatter under FlashComm1. Memory/performance depend on the model and workload. |
 | `multistream_overlap_shared_expert` | bool | `False` | Whether to enable multi-stream shared expert. This option only takes effect on MoE models with shared experts. |
 | `multistream_overlap_gate`          | bool | `False` | Whether to enable multi-stream overlap gate. This option only takes effect on MoE models with shared experts.  |
 | `recompute_scheduler_enable`        | bool | `False` | Whether to enable recompute scheduler.                                                                    |

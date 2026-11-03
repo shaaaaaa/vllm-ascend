@@ -431,6 +431,19 @@ class AscendFusedMoE(FusedMoE):
             router_logits,
         )
 
+    def _prepare_shared_expert_input(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if _EXTRA_CTX.flash_comm_v1_enabled and not shared_expert_dp_enabled():
+            return torch.ops.vllm.maybe_all_gather_and_maybe_unpad(hidden_states, True)
+        return hidden_states
+
+    def _finalize_shared_expert_output(self, shared_out: torch.Tensor) -> torch.Tensor:
+        if not shared_expert_dp_enabled():
+            if _EXTRA_CTX.flash_comm_v1_enabled:
+                return torch.ops.vllm.maybe_pad_and_reduce(shared_out)
+            if _EXTRA_CTX.moe_comm_type in {MoECommType.ALLTOALL, MoECommType.MC2, MoECommType.FUSED_MC2}:
+                return tensor_model_parallel_all_reduce(shared_out)
+        return shared_out
+
     def forward_impl(  # type: ignore[override]
         self, hidden_states: torch.Tensor, router_logits: torch.Tensor, return_with_event: bool = False
     ) -> torch.Tensor | FusedMoEResult:
@@ -457,14 +470,8 @@ class AscendFusedMoE(FusedMoE):
             with npu_stream_switch(AscendFusedMoE.gate_stream, enabled=self.multistream_overlap_gate):
                 # share_expert
                 assert fc3_context.shared_experts is not None
-                shared_out = fc3_context.shared_experts(hidden_states)
-                # NOTE: This is exactly the opposite of `maybe_all_reduce_tensor_model_parallel`
-                moe_comm_type = _EXTRA_CTX.moe_comm_type
-                if (
-                    moe_comm_type in {MoECommType.ALLTOALL, MoECommType.MC2, MoECommType.FUSED_MC2}
-                    and not shared_expert_dp_enabled()
-                ):
-                    shared_out = tensor_model_parallel_all_reduce(shared_out)
+                shared_hidden_states = self._prepare_shared_expert_input(hidden_states)
+                shared_out = self._finalize_shared_expert_output(fc3_context.shared_experts(shared_hidden_states))
                 set_flash_common3_context(shared_out=shared_out)
 
                 topk_weights, topk_ids = select_experts(
@@ -586,7 +593,7 @@ class AscendSharedFusedMoE(SharedFusedMoE, AscendFusedMoE):
             ascend_config.multistream_overlap_shared_expert and self._shared_experts is not None
         )
         self.multistream_overlap_gate = ascend_config.multistream_overlap_gate and self._shared_experts is not None
-        if enable_sp():
+        if enable_sp() and shared_expert_dp_enabled():
             logger.info_once("Sequence parallelism is enabled, shared experts are replicated for best performance.")
 
         self._gate = gate
@@ -693,6 +700,7 @@ class AscendSharedFusedMoE(SharedFusedMoE, AscendFusedMoE):
         with npu_stream_switch(shared_experts_calculation_stream(), enabled=self.multistream_overlap_shared_expert):
             # Ensure the shared experts wait for hidden_states to be ready.
             torch.npu.current_stream().wait_event(fused_moe_evts.before_routed_experts)
+            hidden_states = self._prepare_shared_expert_input(hidden_states)
             # Execute the gate projection and activation concurrently with the
             # dispatch communication.
             maybe_wait_event(fused_moe_evts.before_dispatch)
@@ -707,15 +715,7 @@ class AscendSharedFusedMoE(SharedFusedMoE, AscendFusedMoE):
         if self.multistream_overlap_shared_expert:
             torch.npu.current_stream().wait_stream(shared_experts_calculation_stream())
 
-        # NOTE: This is exactly the opposite of
-        # `maybe_all_reduce_tensor_model_parallel`
-        moe_comm_type = _EXTRA_CTX.moe_comm_type
-        if (
-            moe_comm_type in {MoECommType.ALLTOALL, MoECommType.MC2, MoECommType.FUSED_MC2}
-            and not shared_expert_dp_enabled()
-        ):
-            shared_out = tensor_model_parallel_all_reduce(shared_out)
-        return shared_out
+        return self._finalize_shared_expert_output(shared_out)
 
     def forward_impl(  # type: ignore[override]
         self, hidden_states: torch.Tensor, router_logits: torch.Tensor

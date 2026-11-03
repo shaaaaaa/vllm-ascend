@@ -109,11 +109,14 @@ def execution_contract(runner: Any) -> dict[str, Any]:
     from vllm_ascend.ops.fused_moe.moe_comm_method import get_moe_comm_method
     from vllm_ascend.utils import (
         AscendDeviceType,
+        enable_dsa_cp,
+        enable_sp,
         get_ascend_device_type,
         is_drafter_moe_model,
         is_hierarchical_communication_enabled,
         is_moe_model,
         sfa_full_graph_enabled,
+        shared_expert_dp_enabled,
     )
 
     config = runner.vllm_config
@@ -182,6 +185,12 @@ def execution_contract(runner: Any) -> dict[str, Any]:
         Path(__file__).with_name("model_runner_v1.py"),
         Path(__file__).with_name("sfa_async_mtp.py"),
         Path(__file__).parents[1] / "ascend_forward_context.py",
+        Path(__file__).parents[1] / "ascend_config.py",
+        Path(__file__).parents[1] / "utils.py",
+        Path(__file__).parents[1] / "attention/sfa_v1.py",
+        Path(__file__).parents[1] / "ops/register_custom_ops.py",
+        Path(__file__).parents[1] / "spec_decode/eagle_proposer.py",
+        Path(__file__).parents[1] / "ops/fused_moe/fused_moe.py",
         Path(__file__).parents[1] / "ops/fused_moe/token_dispatcher.py",
         Path(__file__).parents[1] / "ops/fused_moe/prepare_finalize.py",
     ):
@@ -214,6 +223,7 @@ def execution_contract(runner: Any) -> dict[str, Any]:
         recovery=getattr(config.scheduler_config, "mc2_recovery_token_budget", None),
         async_scheduling=config.scheduler_config.async_scheduling,
         additional_config=config.additional_config,
+        token_layout=(enable_sp(config), enable_dsa_cp(), shared_expert_dp_enabled()),
         hccl_buffer_mb=int(os.environ.get("HCCL_BUFFSIZE", "200")),
         mc2_abi="dispatch/combine_v2;common_global_bs;no_active_mask;default_comm_alg",
     )

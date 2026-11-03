@@ -67,8 +67,9 @@ def test_eager_failure_stops_before_graph_and_propagates_exit_status(driver, tmp
 
 
 @pytest.mark.parametrize("trace_residual", [False, True])
+@pytest.mark.parametrize("flashcomm1", [False, True])
 def test_pair_checks_coverage_not_identical_cache_allocation_counts(
-    driver, tmp_path, monkeypatch, capsys, trace_residual
+    driver, tmp_path, monkeypatch, capsys, trace_residual, flashcomm1
 ):
     (tmp_path / "config.json").write_text("{}")
     launches = []
@@ -80,6 +81,8 @@ def test_pair_checks_coverage_not_identical_cache_allocation_counts(
         assert argv[argv.index("--devices") + 1] == "0,1,2,3,4,5,6,7"
         assert env["ASCEND_RT_VISIBLE_DEVICES"] == "0,1,2,3,4,5,6,7"
         assert ("--trace-residual" in argv) == trace_residual
+        assert ("--flashcomm1" in argv) == flashcomm1
+        assert env["VLLM_ASCEND_ENABLE_FLASHCOMM1"] == str(int(flashcomm1))
         if mode == "preflight":
             assert env["VLLM_ASCEND_SFA_FULL_GRAPH"] == "1"
             return
@@ -104,7 +107,7 @@ def test_pair_checks_coverage_not_identical_cache_allocation_counts(
         (directory / f"{mode}-summary.json").write_text(json.dumps(summary))
 
     monkeypatch.setattr(driver.subprocess, "run", launch)
-    driver.run_pair(str(tmp_path), trace_residual=trace_residual)
+    driver.run_pair(str(tmp_path), trace_residual=trace_residual, flashcomm1=flashcomm1)
     assert launches == ["preflight", "eager", "graph"]
     assert ("DIAGNOSTIC PASS" in capsys.readouterr().out) == trace_residual
 
@@ -372,3 +375,37 @@ def test_residual_trace_cli_is_forwarded_to_pair(driver, monkeypatch):
     monkeypatch.setattr(sys, "argv", ["driver", "--trace-residual"])
     driver.main()
     assert run.call_args.kwargs["trace_residual"] is True
+
+
+@pytest.mark.parametrize("mode", ["eager", "graph"])
+@pytest.mark.parametrize("flashcomm1", [False, True])
+def test_flashcomm_only_options_keep_fixture_and_compiler_paths(driver, mode, flashcomm1):
+    options = driver.engine_options(
+        SimpleNamespace(
+            child=mode,
+            devices="0,1,2,3",
+            model="fixture",
+            reference="reference",
+            atol=0,
+            rtol=0,
+            flashcomm1=flashcomm1,
+        )
+    )
+    config = options["additional_config"]
+    assert options["tensor_parallel_size"] == 4
+    assert options["data_parallel_size"] == 1
+    assert options["compilation_config"]["cudagraph_mode"] == ("PIECEWISE" if mode == "graph" else "NONE")
+    assert config["sfa_parity"]["mode"] == mode
+    if flashcomm1:
+        assert config["enable_flashcomm1"] is True and config["enable_dsa_cp"] is False
+    else:
+        assert "enable_flashcomm1" not in config and "enable_dsa_cp" not in config
+    assert not config.get("multistream_overlap_shared_expert", False)
+
+
+def test_flashcomm_cli_is_forwarded_to_pair(driver, monkeypatch):
+    run = Mock()
+    monkeypatch.setattr(driver, "run_pair", run)
+    monkeypatch.setattr(sys, "argv", ["driver", "--flashcomm1"])
+    driver.main()
+    assert run.call_args.kwargs["flashcomm1"] is True

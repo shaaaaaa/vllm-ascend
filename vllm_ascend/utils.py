@@ -1087,12 +1087,14 @@ def enable_sp(vllm_config=None, enable_shared_expert_dp: bool = False) -> bool:
             from vllm.config import get_current_vllm_config
 
             vllm_config = get_current_vllm_config()
-        _ENABLE_SP = (
-            envs_ascend.VLLM_ASCEND_ENABLE_FLASHCOMM1
-            # Flash comm 1 should be enabled by env VLLM_ASCEND_ENABLE_FLASHCOMM1
-            # We retain the env VLLM_ASCEND_ENABLE_FLASHCOMM here for backward compatibility.
-            or bool(int(os.getenv("VLLM_ASCEND_ENABLE_FLASHCOMM", "0")))
-        )
+        additional_config = vllm_config.additional_config or {}
+        if "enable_flashcomm1" in additional_config:
+            _ENABLE_SP = bool(additional_config["enable_flashcomm1"])
+        else:
+            _ENABLE_SP = (
+                envs_ascend.VLLM_ASCEND_ENABLE_FLASHCOMM1
+                or bool(int(os.getenv("VLLM_ASCEND_ENABLE_FLASHCOMM", "0")))
+            )
 
         if not _ENABLE_SP and enable_shared_expert_dp:
             _ENABLE_SP = True
@@ -1103,7 +1105,7 @@ def enable_sp(vllm_config=None, enable_shared_expert_dp: bool = False) -> bool:
 
 # TODO remove it after vllm has this func
 def shared_expert_dp_enabled() -> bool:
-    return get_ascend_config().enable_shared_expert_dp or enable_sp() or enable_sp_by_pass()
+    return get_ascend_config().enable_shared_expert_dp or enable_sp_by_pass()
 
 
 def prefill_context_parallel_enable() -> bool:
@@ -1471,8 +1473,6 @@ def singleton(cls):
     return get_instance
 
 
-# TODO: Temporarily use enable_sp to enable the dsa_cp feature of ds32.
-# and subsequent updates will introduce new interfaces. --zzhx1
 @lru_cache(maxsize=1)
 def enable_dsa_cp() -> bool:
     from vllm.config import get_current_vllm_config
@@ -1481,7 +1481,13 @@ def enable_dsa_cp() -> bool:
     is_ds_v32 = hasattr(vllm_config.model_config, "hf_text_config") and hasattr(
         vllm_config.model_config.hf_text_config, "index_topk"
     )
-    return bool(is_ds_v32 and enable_sp())
+    if not is_ds_v32:
+        return False
+    # Preserve existing P deployments; explicit false opts into FC1-only.
+    enabled = bool((vllm_config.additional_config or {}).get("enable_dsa_cp", enable_sp()))
+    if enabled and not enable_sp():
+        raise ValueError("DSA CP requires FlashComm1 to be enabled")
+    return enabled
 
 
 @lru_cache(maxsize=1)

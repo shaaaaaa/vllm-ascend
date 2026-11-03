@@ -17,7 +17,7 @@ from vllm_ascend.ascend_forward_context import _EXTRA_CTX, MoECommType
 from vllm_ascend.ops.rotary_embedding import rope_forward_oot
 from vllm_ascend.ops.triton.muls_add import muls_add_triton
 from vllm_ascend.ops.weight_prefetch import maybe_npu_prefetch
-from vllm_ascend.utils import enable_sp_by_pass, is_vl_model, npu_stream_switch, prefetch_stream
+from vllm_ascend.utils import enable_dsa_cp, enable_sp_by_pass, is_vl_model, npu_stream_switch, prefetch_stream
 
 
 def _maybe_chunk_residual_impl(x: torch.Tensor, residual: torch.Tensor) -> torch.Tensor:
@@ -107,18 +107,18 @@ def _maybe_pad_and_reduce_impl(x: torch.Tensor, is_ep_comm: bool = False) -> tor
 
 def _maybe_all_gather_and_maybe_unpad_fake(x: torch.Tensor, label: bool, is_ep_comm: bool = False) -> torch.Tensor:
     if _EXTRA_CTX.flash_comm_v1_enabled and label:
-        return torch.empty(
-            (x.shape[0] * get_tensor_model_parallel_world_size(), *x.shape[1:]), device=x.device, dtype=x.dtype
-        )
+        pad_size = _EXTRA_CTX.pad_size if not is_ep_comm or get_forward_context().dp_metadata is None else 0
+        rows = x.shape[0] * get_tensor_model_parallel_world_size() - pad_size
+        return torch.empty((rows, *x.shape[1:]), device=x.device, dtype=x.dtype)
 
     return x
 
 
 def _maybe_pad_and_reduce_fake(x: torch.Tensor, is_ep_comm: bool = False) -> torch.Tensor:
     if _EXTRA_CTX.flash_comm_v1_enabled or enable_sp_by_pass():
-        return torch.empty(
-            (x.shape[0] // get_tensor_model_parallel_world_size(), *x.shape[1:]), device=x.device, dtype=x.dtype
-        )
+        pad_size = _EXTRA_CTX.pad_size if not is_ep_comm or get_forward_context().dp_metadata is None else 0
+        rows = (x.shape[0] + pad_size) // get_tensor_model_parallel_world_size()
+        return torch.empty((rows, *x.shape[1:]), device=x.device, dtype=x.dtype)
 
     return x
 
@@ -171,6 +171,8 @@ def _matmul_and_reduce_impl_fake(input_parallel: torch.Tensor, layer_name: str) 
     self = forward_context.no_compile_layers[layer_name]
     num_tokens = input_parallel.size(0)
     if _EXTRA_CTX.flash_comm_v1_enabled:
+        if _EXTRA_CTX.pad_size > 0 and not (enable_dsa_cp() and "o_proj" in self.prefix):
+            num_tokens += _EXTRA_CTX.pad_size
         num_tokens = num_tokens // self.tp_size
     output = torch.empty(
         size=(num_tokens, self.output_size_per_partition), device=input_parallel.device, dtype=input_parallel.dtype

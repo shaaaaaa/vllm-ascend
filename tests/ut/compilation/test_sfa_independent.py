@@ -216,6 +216,9 @@ def contract_runner(monkeypatch):
         ),
         "vllm_ascend.utils": NS(
             AscendDeviceType=NS(A2="A2", A3="A3"),
+            enable_sp=lambda config: False,
+            enable_dsa_cp=lambda: False,
+            shared_expert_dp_enabled=lambda: False,
             get_ascend_device_type=lambda: "A3",
             is_drafter_moe_model=lambda config: True,
             is_moe_model=lambda config: True,
@@ -288,6 +291,25 @@ def test_native_build_change_changes_execution_contract(contract_runner, monkeyp
     runner, _, _ = contract_runner
     before = independent.execution_contract(runner)
     monkeypatch.setattr(independent, "_native_identity", lambda: {"mock-native.so": "b" * 64})
+    assert independent.execution_contract(runner)["digest"] != before["digest"]
+
+
+@pytest.mark.parametrize("flag", ["enable_sp", "enable_dsa_cp", "shared_expert_dp_enabled"])
+def test_effective_layout_changes_contract_even_with_same_additional_config(contract_runner, flag):
+    runner, modules, _ = contract_runner
+    before = independent.execution_contract(runner)
+    setattr(modules["vllm_ascend.utils"], flag, lambda *args: True)
+    assert independent.execution_contract(runner)["digest"] != before["digest"]
+
+
+@pytest.mark.parametrize("filename", ["eagle_proposer.py", "sfa_v1.py", "fused_moe.py", "register_custom_ops.py"])
+def test_fc1_source_changes_fail_startup_contract(contract_runner, monkeypatch, filename):
+    runner, _, _ = contract_runner
+    before = independent.execution_contract(runner)
+    original = Path.read_bytes
+    monkeypatch.setattr(
+        Path, "read_bytes", lambda path: b"different build" if path.name == filename else original(path)
+    )
     assert independent.execution_contract(runner)["digest"] != before["digest"]
 
 

@@ -126,6 +126,7 @@ from vllm_ascend.utils import (
     enable_dsa_cp,
     enable_dsa_cp_with_layer_shard,
     enable_dsa_cp_with_o_proj_tp,
+    enable_sp,
     get_weight_prefetch_method,
     maybe_trans_nz,
     parse_layer_idx,
@@ -4262,6 +4263,8 @@ class AscendSFAImpl(MLAAttentionImpl):
         route = getattr(context, "staged_sfa_route", None)
         if route is None or route.action != StagedSFARouteAction.STAGED or route.graph_key != graph_key:
             raise RuntimeError(f"[SFA_ROUTE] action=fatal reason={StagedSFARouteReason.RUNNER_LAYER_MISMATCH.value}")
+        if need_gather_q_kv and not self.enable_dsa_cp:
+            hidden_states = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(hidden_states.contiguous(), True)
         reason = self._cross_layer_ineligible_reason(hidden_states, kv_cache, attn_metadata)
         if reason is not None:
             raise RuntimeError(
@@ -5131,7 +5134,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         )
         if self._staged_graph_content_diagnostic_enabled(layer_name):
             state = self._staged_sfa_capture_state
-            diagnostic_rows = min(rows, 4)
+            diagnostic_rows = min(int(output.shape[0]), 4)
             diagnostic_output = output[:diagnostic_rows].reshape(
                 diagnostic_rows, -1
             )[:, :256]
@@ -5164,16 +5167,19 @@ class AscendSFAImpl(MLAAttentionImpl):
         )
         if snapshot is None:
             return
-        actual_rows = min(
-            int(metadata.num_actual_tokens),
-            int(snapshot.shape[0]),
-        )
+        row_owners = metadata.decode_req_indices_cpu
+        actual_rows = min(int(metadata.num_actual_tokens), int(snapshot.shape[0]))
+        if enable_sp():
+            local_rows = (graph_key.token_capacity + self.tp_size - 1) // self.tp_size
+            row_start = self.tp_rank * local_rows
+            actual_rows = min(int(snapshot.shape[0]), max(graph_key.token_capacity - row_start, 0))
+            row_owners = row_owners[row_start : row_start + actual_rows]
         queue_staged_graph_stage_fingerprint(
             req_ids=metadata.decode_request_ids_compact,
             layer_name=layer_name,
             stage="after_graph_post",
             components={"attention_output": snapshot[:actual_rows]},
-            row_request_indices=metadata.decode_req_indices_cpu,
+            row_request_indices=row_owners,
             seq_lens_cpu=metadata.seq_lens_cpu,
             num_decode_tokens=metadata.num_decode_tokens,
             num_actual_tokens=metadata.num_actual_tokens,
@@ -5337,6 +5343,9 @@ class AscendSFAImpl(MLAAttentionImpl):
             AscendAttentionState.DecodeOnly,
             AscendAttentionState.SpecDecoding,
         }
+
+        if need_gather_q_kv and not self.enable_dsa_cp:
+            hidden_states = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(hidden_states.contiguous(), True)
 
         # run mlapo ops when dsa-cp is disabled, and ensure that num_tokens satisfies the count limitation
         if self.enable_mlapo and num_input_tokens <= MLAPO_MAX_SUPPORTED_TOKENS:
