@@ -198,7 +198,14 @@ def set_ascend_forward_context(
 
         from vllm_ascend.ops.fused_moe.moe_comm_method import get_moe_comm_method
 
-        max_num_tokens = int(num_tokens_across_dp.max().item()) if num_tokens_across_dp is not None else num_tokens
+        dp_metadata = forward_context.dp_metadata
+        max_tokens_across_dp = dp_metadata.max_tokens_across_dp_cpu.item() if dp_metadata is not None else None
+        if num_tokens_across_dp is None:
+            max_num_tokens = num_tokens
+        elif dp_metadata is not None:
+            max_num_tokens = max_tokens_across_dp
+        else:
+            max_num_tokens = int(num_tokens_across_dp.max().item())
         moe_comm_type = select_moe_comm_method(max_num_tokens, vllm_config, is_draft_model)
 
         forward_context.moe_comm_type = moe_comm_type
@@ -262,8 +269,7 @@ def set_ascend_forward_context(
             num_tokens = attn_metadata.num_actual_tokens
 
         dp_world_size = get_dp_group().world_size
-        if dp_world_size > 1 and forward_context.dp_metadata is not None:
-            max_tokens_across_dp = forward_context.dp_metadata.max_tokens_across_dp_cpu.item()
+        if dp_world_size > 1 and dp_metadata is not None:
             if forward_context.flash_comm_v1_enabled or forward_context.flashcomm_v2_enabled:
                 padded_length = (max_tokens_across_dp + tp_world_size - 1) // tp_world_size * tp_world_size
                 pad_size = padded_length - num_tokens
@@ -275,13 +281,14 @@ def set_ascend_forward_context(
         forward_context.max_tokens_across_dp = max_tokens_across_dp
         forward_context.max_tokens_across_pcp = max_tokens_across_pcp
 
+        forward_context.mc2_mask = None
         if num_tokens is not None:
             if num_actual_tokens is None:
                 num_actual_tokens = num_tokens
             # NOTE: token num which need to pad to when mc2
             forward_context.padded_num_tokens = math.ceil(max_tokens_across_dp / tp_world_size) * tp_world_size
             reserved_mc2_mask = get_mc2_mask()
-            if reserved_mc2_mask is not None:
+            if reserved_mc2_mask is not None and getattr(forward_context.moe_comm_method, "requires_mc2_mask", True):
                 mc2_mask = reserved_mc2_mask[: forward_context.padded_num_tokens]
                 mc2_mask[:num_actual_tokens] = True
                 mc2_mask[num_actual_tokens:] = False

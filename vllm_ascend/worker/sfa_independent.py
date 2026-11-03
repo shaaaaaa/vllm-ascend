@@ -231,6 +231,9 @@ class IndependentDP:
         self.rank, self.width = tp.rank_in_group, tp.world_size
         self.capacity, self.sequence = capacity, 0
         self.packet = torch.zeros((7, self.width), dtype=torch.int64, device="cpu")
+        # Stable CPU views avoid scalar Torch dispatch on every target/draft vote.
+        self.proposal = self.packet[:, self.rank].numpy()
+        self.reference = self.packet[:, :1].expand_as(self.packet)
         self.counts = [torch.empty(dp_size, dtype=torch.int32, device="cpu") for _ in range(2)]
         # LMCache uses tp.cpu_group from background threads. Routing needs its
         # own sequence domain, created once before serving, with only TP peers.
@@ -248,11 +251,10 @@ class IndependentDP:
             raise ValueError("Local SFA extent exceeds the fixed MC2 contract")
         self.sequence += 1
         self.packet.zero_()
-        for index, value in enumerate((tokens, mode, route, int(bounded), int(draft), self.sequence, requests)):
-            self.packet[index, self.rank] = value
+        self.proposal[:] = (tokens, mode, route, int(bounded), int(draft), self.sequence, requests)
         if self.width > 1:
             dist.all_reduce(self.packet, group=self.group)
-            if not torch.equal(self.packet, self.packet[:, :1].expand_as(self.packet)):
+            if not torch.equal(self.packet, self.reference):
                 raise RuntimeError("Independent SFA proposal/phase differs within TP")
         counts = self.counts[int(draft)]
         counts.fill_(tokens)  # Local API compatibility, not observed peer counts.

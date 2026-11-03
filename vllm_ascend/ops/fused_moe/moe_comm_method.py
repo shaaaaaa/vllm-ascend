@@ -209,6 +209,9 @@ class MC2CommImpl(MoECommMethod):
     Communication and Computation parallelism on Ascend devices.
     """
 
+    # TokenDispatcherWithMC2 passes neither dispatch nor combine a token mask.
+    requires_mc2_mask = False
+
     def _get_token_dispatcher(self):
         return TokenDispatcherWithMC2()
 

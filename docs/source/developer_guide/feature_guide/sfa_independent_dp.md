@@ -10,6 +10,13 @@ activation and destroyed by the existing worker distributed teardown. It does
 not share collective sequencing with LMCache's background TP broadcasts and
 readiness reductions. No additional per-step collective is introduced.
 
+The proposal uses cached CPU storage views, retaining the same packet checks and
+target/draft sequence. Forward contexts reuse the existing CPU token maximum.
+Regular MC2 omits the optional token mask because its dispatcher does not consume
+it; other communication methods retain their mask behavior. These optimizations
+need no additional configuration or native rebuild. CPU timings do not establish
+NPU serving speedups; qualify the installed stack after restarting the decoders.
+
 It is default off. It does not establish that a slower DP can no longer delay
 peers inside expert communication, or guarantee a throughput improvement.
 

@@ -215,7 +215,7 @@ class PrepareAndFinalizeWithMC2(PrepareAndFinalizeWithAll2All):
     MoE communication strategy using MC2, which is based on All2All. Hence, it inherits
     All2All and share the same finalize method.
     Designed for Ascend or environments requiring explicit padding and slicing control.
-    Relies on `mc2_mask` and `padded_num_tokens` from forward_context for alignment.
+    Uses `padded_num_tokens` and an optional `mc2_mask` from forward_context.
     """
 
     def __init__(self, moe_config: FusedMoEConfig):
@@ -254,7 +254,7 @@ class PrepareAndFinalizeWithMC2(PrepareAndFinalizeWithAll2All):
         self.replace_allreduce = replace_allreduce
         self.enable_shared_expert_dp = enable_shared_expert_dp
         mc2_mask = _EXTRA_CTX.mc2_mask
-        if self.tp_size > 1:
+        if self.tp_size > 1 and mc2_mask is not None:
             # Also slice mc2_mask
             split_mc2_mask = torch.tensor_split(mc2_mask, self.tp_size, dim=0)
             mc2_mask = split_mc2_mask[self.tp_rank]
