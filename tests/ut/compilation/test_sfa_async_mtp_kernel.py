@@ -10,7 +10,7 @@ from test_sfa_async_mtp import Kernel
 @pytest.mark.parametrize("n", [0, 1, 14, 31, 32, 33, 64])
 @pytest.mark.parametrize("mixed", ["none", "paired", "table"])
 @pytest.mark.parametrize("pad", [False, True])
-@pytest.mark.parametrize("check", ["table_reads", "output_stores"])
+@pytest.mark.parametrize("check", ["table_reads", "output_stores", "ub_layout"])
 def test_ascend_mask_lowering_stays_within_allocations(n, mixed, pad, check, monkeypatch):
     # The reported 28-token .ttadapter reads all table lanes before selecting
     # masked values, and expands stride-2 stores into unmasked 64-element RMWs.
@@ -43,8 +43,16 @@ def test_ascend_mask_lowering_stays_within_allocations(n, mixed, pad, check, mon
             assert torch.all(torch.diff(ptr.offset) == 1), "masked stride-2 store expands beyond output capacity"
         store(ptr, value, mask)
 
+    def checked_reshape(value, shape):
+        # CANN 8.5.1 pads a narrow UB row to 32 bytes; collapsing it as if
+        # contiguous is rejected (reported memref<32x2xi32> compile failure).
+        if check == "ub_layout" and value.ndim > 1 and len(shape) == 1:
+            assert value.shape[-1] * value.element_size() % 32 == 0, "cannot collapse padded UB rows"
+        return torch.reshape(value, shape)
+
     monkeypatch.setattr(kernel.tl, "load", lowered_load)
     monkeypatch.setattr(kernel.tl, "store", checked_store)
+    monkeypatch.setattr(kernel.tl, "reshape", checked_reshape, raising=False)
     mixed_args = {} if mixed == "none" else {"slots_c8": slots[2], "MIXED_C8": True}
     if mixed == "table":
         mixed_args.update(table_c8=tables[2], stride_c8=8224)

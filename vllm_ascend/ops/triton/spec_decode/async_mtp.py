@@ -44,7 +44,9 @@ def prepare_async_mtp_kernel(
     token = tl.program_id(0) * (2 * BLOCK) + tl.arange(0, 2 * BLOCK)
     token_row = token // 2
     active_token = token_row < num_reqs
-    position = tl.reshape(current[:, None] + tl.arange(0, 2)[None, :], (2 * BLOCK,))
+    # Keep the Q2 expansion one-dimensional: CANN 8.5.1 cannot flatten a
+    # [BLOCK, 2] UB temporary after its short rows receive alignment padding.
+    position = tl.gather(current, tl.arange(0, 2 * BLOCK) // 2, 0) + token % 2
     # The installed scalar-gather lowering loads before applying a mask. Give
     # inactive lanes a valid address and use unmasked loads so the address
     # selection cannot be discarded as redundant with a load mask. Tables are
