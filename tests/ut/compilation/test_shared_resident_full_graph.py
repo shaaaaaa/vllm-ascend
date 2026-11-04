@@ -32,6 +32,7 @@ def test_bounded_group_packs_and_restores_once_per_invocation(explicit, c8):
     frame = {}
     producer.use_sparse_c8_indexer = c8
     for layer, obj in enumerate((producer, consumer)):
+        obj.dsa_cp_decoder = False
         obj._cross_layer_pre_compute = MethodType(ns["_cross_layer_pre_compute"], obj)
         obj.fused_qkv_a_proj = Mock(
             side_effect=lambda hidden, layer=layer: (torch.full((hidden.shape[0], 4), float(layer)),)

@@ -24,7 +24,9 @@ def test_shared_consumer_probe_reads_the_actual_topk_source(worker, skip_topk):
         _prepare_decode_sparse_indices=lambda *args: None,
         _execute_sparse_flash_attention_process=lambda *args: None,
     )
-    subject = SimpleNamespace(probes={"topk": SimpleNamespace(write=lambda value: recorded.append(value.clone()))})
+    subject = SimpleNamespace(
+        decoder_cp=False, probes={"topk": SimpleNamespace(write=lambda value: recorded.append(value.clone()))}
+    )
     worker.LayerSnapshots.install_sfa_probes(subject, impl)
     result = impl._get_indexcache_topk_indices() if skip_topk else impl.indexer_select_post_process()
     assert result is raw
@@ -45,7 +47,7 @@ def test_bounded_shared_consumer_probes_survive_planner_bypass(worker):
         _execute_sparse_flash_attention_process=Mock(),
         _cross_layer_pre_compute=lambda hidden_states, remap_boundary: outputs,
     )
-    subject = SimpleNamespace(probes={name: Mock() for name in
+    subject = SimpleNamespace(decoder_cp=False, probes={name: Mock() for name in
         ("topk", "boundary", "miss_count", "miss_tokens", "target_slots")})
     worker.LayerSnapshots.install_sfa_probes(subject, impl)
     assert impl._cross_layer_pre_compute(torch.zeros(2, 4), torch.tensor([4096, 0])) is outputs
@@ -473,6 +475,7 @@ class TinyResidualDecoder(torch.nn.Module):
 
 def fake_impl():
     return SimpleNamespace(
+        dsa_cp_decoder=False,
         index_topk=2,
         local_num_heads=1,
         kv_lora_rank=3,
@@ -649,6 +652,38 @@ def test_attention_probes_capture_current_kv_and_mask_planner_tail(worker):
     assert tensors["layer=0 kv_nope"][0].tolist() == [[0, 1, 2], [3, 4, 5]]
     assert "layer=0 physical_slots" in addresses
     assert "layer=0 physical_slots" not in tensors
+
+
+@pytest.mark.parametrize("graph", [False, True])
+def test_decoder_cp_probes_compare_global_real_rows(worker, monkeypatch, graph):
+    from unittest.mock import Mock
+
+    layer, impl = TinyDecoder(), fake_impl()
+    impl.dsa_cp_decoder, impl.skip_topk, impl.layer_name = True, False, "layer"
+    raw = torch.tensor([[[0, 1]]] * 4, dtype=torch.int32)
+    impl._cp_global_topk = lambda *a: raw
+    attention = impl._execute_sparse_flash_attention_process = Mock(side_effect=lambda q, *a, **kw: q)
+    monkeypatch.setattr(worker, "get_tp_group", lambda: SimpleNamespace(
+        all_gather=lambda value, dim=0: torch.cat([value] * 4, dim=dim)))
+    metadata = SimpleNamespace(block_table=torch.tensor([[0], [0]]), cum_query_lens=torch.tensor([2, 4]))
+    monkeypatch.setattr(worker, "get_forward_context", lambda: SimpleNamespace(attn_metadata={"layer": metadata}))
+    probes = worker.LayerSnapshots(layer, impl, 0, 4, torch.device("cpu"))
+    layer(torch.arange(1), torch.ones(1, 4), None)
+    indices = impl._cp_global_topk()
+    impl._prepare_decode_sparse_indices(indices, torch.tensor([256] * 4))
+    topk = raw[:1] if graph else raw
+    q = torch.ones(1, 1, 3)
+    assert impl._execute_sparse_flash_attention_process(
+        q, torch.ones(1, 1, 2),
+        (torch.arange(6.).reshape(1, 2, 1, 3), torch.arange(4.).reshape(1, 2, 1, 2)),
+        topk, None if graph else metadata, torch.tensor([1, 1]), torch.tensor([2, 0]),
+        block_table_override=metadata.block_table,
+    ) is q
+    tensors, _ = probes.read(2, decode=True)
+    assert tensors["layer=0 q_nope"].shape == (2, 1, 3)
+    assert tensors["layer=0 topk"].shape == (2, 2)
+    assert tensors["layer=0 input.hidden"].shape == (2, 4)
+    assert attention.call_args.args[0] is q and attention.call_args.args[3] is topk
 
 
 def test_dummy_integer_weights_and_fingerprint_are_deterministic(worker):

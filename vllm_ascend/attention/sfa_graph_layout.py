@@ -5,6 +5,24 @@
 import torch
 
 
+def cp_slice(tensor, rank, world_size, value=0):
+    """Select TP-local query rows, initializing communication-only padding."""
+    padding = (-tensor.shape[0]) % world_size
+    if padding:
+        tensor = torch.nn.functional.pad(tensor, (0, 0) * (tensor.ndim - 1) + (0, padding), value=value)
+    width = tensor.shape[0] // world_size
+    return tensor[rank * width : (rank + 1) * width]
+
+
+def cp_sequence_lengths(query_ends, seq_lens, start, width, query_out, key_out):
+    """Clip causal query intervals on device; zero-KV dummy rows remain empty."""
+    local_ends = (query_ends - start).clamp(0, width)
+    local_starts = torch.cat((local_ends.new_zeros(1), local_ends[:-1]))
+    offset = (query_ends - (start + width)).clamp_min(0)
+    query_out.copy_(local_ends)
+    key_out.copy_(torch.where((local_ends > local_starts) & (seq_lens != 0), seq_lens - offset, 0))
+
+
 class FullGraphAttentionBuffers:
     """Stable attention inputs with one separate, zero-KV padding sequence."""
 

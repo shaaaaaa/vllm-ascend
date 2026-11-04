@@ -67,6 +67,7 @@ class LayerSnapshots:
     ) -> None:
         self.index = index
         self.trace_residual = trace_residual
+        self.decoder_cp = impl.dsa_cp_decoder
         # The first parameter may be packed INT4 weights; activations follow RMSNorm.
         dtype = layer.input_layernorm.weight.dtype
         hidden = layer.input_layernorm.weight.numel()
@@ -116,25 +117,32 @@ class LayerSnapshots:
             layer.post_attention_layernorm.register_forward_hook(self.after_post_norm)
         self.install_sfa_probes(impl)
 
+    def _activation_rows(self, value):
+        # This one-request harness compares global real rows. Test-only gathers
+        # make CP padding unobservable; these probes are not performance runs.
+        if self.decoder_cp and value.shape[0] < QUERY_WIDTH:
+            return get_tp_group().all_gather(value.contiguous(), dim=0)[:QUERY_WIDTH]
+        return value
+
     def before_layer(self, module, args, kwargs) -> None:
         hidden = kwargs["hidden_states"] if "hidden_states" in kwargs else args[1]
         residual = kwargs["residual"] if "residual" in kwargs else args[2]
-        self.probes["input.hidden"].write(hidden)
+        self.probes["input.hidden"].write(self._activation_rows(hidden))
         if residual is None:
             self.probes["input.residual"].write_absent()
         else:
-            self.probes["input.residual"].write(residual)
+            self.probes["input.residual"].write(self._activation_rows(residual))
 
     def after_layer(self, module, args, output) -> None:
         hidden, residual = output
-        self.probes["output.hidden"].write(hidden)
-        self.probes["output.residual"].write(residual)
+        self.probes["output.hidden"].write(self._activation_rows(hidden))
+        self.probes["output.residual"].write(self._activation_rows(residual))
 
     def _write_trace(self, name, value) -> None:
         probe = self.probes[name]
         if value.ndim != 2 or value.dtype != probe.value.dtype:
             raise ParityError(f"Residual probe {name} requires a 2D activation of dtype {probe.value.dtype}")
-        probe.write(value)
+        probe.write(self._activation_rows(value))
 
     def after_input_norm(self, module, args, output) -> None:
         if isinstance(output, tuple):
@@ -164,18 +172,22 @@ class LayerSnapshots:
         topk_method = (
             "_get_indexcache_topk_indices" if getattr(impl, "skip_topk", False) else "indexer_select_post_process"
         )
+        if self.decoder_cp and not impl.skip_topk:
+            topk_method = "_cp_global_topk"
         indexer = getattr(impl, topk_method)
         planner = impl._prepare_decode_sparse_indices
         attention = impl._execute_sparse_flash_attention_process
 
         def indexer_with_probe(*args, **kwargs):
             result = indexer(*args, **kwargs)
-            if result.shape[0] <= QUERY_WIDTH:
+            if self.decoder_cp:
+                self.probes["topk"].write(result[:QUERY_WIDTH].reshape(-1, impl.index_topk))
+            elif result.shape[0] <= QUERY_WIDTH:
                 self.probes["topk"].write(result.reshape(result.shape[0], -1))
             return result
 
         def record_plan(topk, boundary, result):
-            if topk.shape[0] <= QUERY_WIDTH:
+            if self.decoder_cp or topk.shape[0] <= QUERY_WIDTH:
                 self.probes["boundary"].write(boundary.reshape(-1).to(torch.long))
                 _, tokens, counts, slots = result
                 if tokens is not None and counts is not None and slots is not None:
@@ -192,22 +204,30 @@ class LayerSnapshots:
 
         def attention_with_probe(q, q_pe, kv, topk, metadata, query_ends, seq_lens, **kwargs):
             if q.shape[0] <= QUERY_WIDTH:
+                probe_q, probe_pe, probe_topk, probe_ends = q, q_pe, topk, query_ends
+                if self.decoder_cp:
+                    probe_q, probe_pe = self._activation_rows(q), self._activation_rows(q_pe)
+                    if metadata is None:
+                        probe_topk = get_tp_group().all_gather(topk.contiguous(), dim=0)
+                    probe_topk = probe_topk[:QUERY_WIDTH]
+                    global_metadata = metadata or get_forward_context().attn_metadata[impl.layer_name]
+                    probe_ends = global_metadata.cum_query_lens
                 table = kwargs.get("block_table_override")
                 if table is None:
                     table = metadata.block_table
                 if kwargs.get("kv_override") is not None:
                     raise ParityError("Parity worker requires the native SHRINK_LATENT=2 attention path")
-                nope, valid, invalid, slots = gather_sparse_kv(kv[0], topk, table, query_ends)
-                pe, _, _, _ = gather_sparse_kv(kv[1], topk, table, query_ends)
+                nope, valid, invalid, slots = gather_sparse_kv(kv[0], probe_topk, table, probe_ends)
+                pe, _, _, _ = gather_sparse_kv(kv[1], probe_topk, table, probe_ends)
                 for name, value in (
-                    ("q_nope", q),
-                    ("q_pe", q_pe),
+                    ("q_nope", probe_q),
+                    ("q_pe", probe_pe),
                     ("kv_nope", nope),
                     ("kv_pe", pe),
                     ("valid", valid),
                     ("invalid_address", invalid),
                     ("physical_slots", slots),
-                    ("remapped_topk", topk.reshape(topk.shape[0], -1)),
+                    ("remapped_topk", probe_topk.reshape(probe_topk.shape[0], -1)),
                 ):
                     self.probes[name].write(value)
             return attention(q, q_pe, kv, topk, metadata, query_ends, seq_lens, **kwargs)

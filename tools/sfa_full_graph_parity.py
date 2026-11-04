@@ -269,7 +269,11 @@ def engine_options(args: argparse.Namespace) -> dict:
             "kv_connector_module_path": "lmcache_ascend.integration.vllm.lmcache_ascend_connector_v1",
         },
         additional_config={
-            **({"enable_flashcomm1": True, "enable_dsa_cp": False} if getattr(args, "flashcomm1", False) else {}),
+            **(
+                {"enable_flashcomm1": True, "enable_dsa_cp": getattr(args, "dsa_cp", False)}
+                if getattr(args, "flashcomm1", False) or getattr(args, "dsa_cp", False)
+                else {}
+            ),
             "sfa_parity": {
                 "mode": args.child,
                 "reference": args.reference,
@@ -445,6 +449,7 @@ def run_pair(
     trace_residual: bool = False,
     compare_output: bool = False,
     flashcomm1: bool = False,
+    dsa_cp: bool = False,
 ) -> None:
     """Start two sequential fresh engines, sharing weights across selected NPUs."""
     if not Path(model, "config.json").is_file():
@@ -453,7 +458,7 @@ def run_pair(
         raise ValueError("Tolerances must be finite and nonnegative")
     tp_size = len(parse_devices(devices))
     print(
-        f"[SFA_PARITY] scope=target_decode; flashcomm1_only={flashcomm1}; "
+        f"[SFA_PARITY] scope=target_decode; flashcomm1={flashcomm1 or dsa_cp}; dsa_cp={dsa_cp}; "
         "prefill computes ONCE; graph imports target+MTP checkpoints",
         flush=True,
     )
@@ -484,8 +489,11 @@ def run_pair(
                     *(["--trace-residual"] if trace_residual else []),
                     *(["--compare-output"] if compare_output else []),
                     *(["--flashcomm1"] if flashcomm1 else []),
+                    *(["--dsa-cp"] if dsa_cp else []),
                 ],
-                env=child_environment("graph" if mode == "preflight" else mode, devices, flashcomm1=flashcomm1),
+                env=child_environment(
+                    "graph" if mode == "preflight" else mode, devices, flashcomm1=flashcomm1 or dsa_cp
+                ),
                 check=True,
             )
         eager = json.loads(Path(directory, "eager-summary.json").read_text())
@@ -533,6 +541,9 @@ def main() -> None:
         "--flashcomm1", action="store_true", help="Test FC1-only eager/graph parity with DSA-CP disabled"
     )
     parser.add_argument(
+        "--dsa-cp", action="store_true", help="Test decoder DSA-CP eager/graph parity; implies FlashComm1"
+    )
+    parser.add_argument(
         "--compare-output",
         action="store_true",
         help="Finish both greedy generations, compare tokens/text and report absolute stage statistics",
@@ -555,6 +566,7 @@ def main() -> None:
             trace_residual=args.trace_residual,
             compare_output=args.compare_output,
             flashcomm1=args.flashcomm1,
+            dsa_cp=args.dsa_cp,
         )
 
 

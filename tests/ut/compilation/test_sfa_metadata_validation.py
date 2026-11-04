@@ -33,7 +33,7 @@ class GraphKey:
 @pytest.fixture
 def checks():
     path = Path(__file__).resolve().parents[3] / "vllm_ascend/attention/sfa_v1.py"
-    names = ("_cross_layer_ineligible_reason", "_cross_layer_metadata_ineligible_reason")
+    names = ("_cross_layer_ineligible_reason", "_cross_layer_metadata_ineligible_reason", "_cp_query_rows")
     context = SimpleNamespace(
         staged_sfa_graph_key=GraphKey(),
         cudagraph_runtime_mode="piecewise",
@@ -66,6 +66,9 @@ def checks():
             dsa_shrink_latent=2,
             enable_mlapo=False,
             enable_dsa_cp=False,
+            dsa_cp_decoder=False,
+            tp_size=4,
+            tp_rank=0,
             enable_dsa_cp_with_o_proj_tp=False,
             use_sparse_c8_indexer=False,
             dsa_offload_free_paged=False,
@@ -317,7 +320,7 @@ def test_shared_checker_depends_on_no_unkeyed_layer_attributes(checks):
         for n in ast.walk(method)
         if isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name) and n.value.id == "self"
     }
-    assert attributes == {"dsa_resident_cache"}
+    assert attributes == {"dsa_resident_cache", "dsa_cp_decoder", "tp_rank", "_cp_query_rows"}
 
 
 @pytest.mark.parametrize("dummy", [False, True])
@@ -342,6 +345,7 @@ def test_full_graph_static_checks_only_run_at_startup(dummy):
         _cross_layer_ineligible_reason=Mock(return_value="static failure"),
         _full_graph_transfers={1: transfer},
         index_topk=2048,
+        _cp_query_rows=lambda n: n,
     )
     impl.prepare_full_graph_metadata = lambda metadata, ctx: namespace["prepare_full_graph_metadata"](
         impl, metadata, ctx

@@ -110,6 +110,7 @@ def execution_contract(runner: Any) -> dict[str, Any]:
     from vllm_ascend.utils import (
         AscendDeviceType,
         enable_dsa_cp,
+        enable_dsa_cp_decoder,
         enable_sp,
         get_ascend_device_type,
         is_drafter_moe_model,
@@ -223,7 +224,7 @@ def execution_contract(runner: Any) -> dict[str, Any]:
         recovery=getattr(config.scheduler_config, "mc2_recovery_token_budget", None),
         async_scheduling=config.scheduler_config.async_scheduling,
         additional_config=config.additional_config,
-        token_layout=(enable_sp(config), enable_dsa_cp(), shared_expert_dp_enabled()),
+        token_layout=(enable_sp(config), enable_dsa_cp(), shared_expert_dp_enabled(), enable_dsa_cp_decoder()),
         hccl_buffer_mb=int(os.environ.get("HCCL_BUFFSIZE", "200")),
         mc2_abi="dispatch/combine_v2;common_global_bs;no_active_mask;default_comm_alg",
     )

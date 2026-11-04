@@ -1491,8 +1491,26 @@ def enable_dsa_cp() -> bool:
 
 
 @lru_cache(maxsize=1)
+def enable_dsa_cp_decoder() -> bool:
+    """Explicit consumer opt-in; kv_both alone does not identify a P node."""
+    from vllm.config import get_current_vllm_config
+
+    return dsa_cp_decoder_configured(get_current_vllm_config()) and enable_dsa_cp()
+
+
+def dsa_cp_decoder_configured(config) -> bool:
+    """Role selection also used before the platform installs the config context."""
+    return bool(
+        (config.additional_config or {}).get("enable_dsa_cp", False)
+        and config.kv_transfer_config is not None
+        and config.kv_transfer_config.is_kv_consumer
+        and not envs_ascend.VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE
+    )
+
+
+@lru_cache(maxsize=1)
 def enable_dsa_cp_with_layer_shard() -> bool:
-    if not enable_dsa_cp():
+    if not enable_dsa_cp() or enable_dsa_cp_decoder():
         return False
     from vllm.config import get_current_vllm_config
 
@@ -1512,7 +1530,7 @@ def enable_dsa_cp_with_o_proj_tp() -> bool:
     vllm_config = get_current_vllm_config()
     # if is PD mix stage, using original TP o_proj weight, and also need to
     # full gather for o_proj weight for prefill stage.
-    return vllm_config.kv_transfer_config is None
+    return vllm_config.kv_transfer_config is None or enable_dsa_cp_decoder()
 
 
 def check_gdn_layer(vllm_config) -> bool:

@@ -140,6 +140,7 @@ def test_only_fc_staged_preserves_logical_capacities(fc, cp, staged, pass_sp):
         enable_sp=lambda _: fc,
         enable_sp_by_pass=lambda: pass_sp,
         enable_dsa_cp=lambda: cp,
+        enable_dsa_cp_decoder=lambda: False,
         round_up=lambda n, m: (n + m - 1) // m * m,
     )
     pad = extract(ROOT / "vllm_ascend/worker/model_runner_v1.py", "_pad_for_sequence_parallelism", ns)
@@ -203,7 +204,8 @@ def test_existing_mtp_paths_preserve_preparation_behavior(monkeypatch, cp, fc, m
     fn = extract(
         ROOT / "vllm_ascend/spec_decode/eagle_proposer.py",
         "maybe_pad_and_reduce",
-        dict(torch=torch, _EXTRA_CTX=NS(flash_comm_v1_enabled=fc), enable_dsa_cp=lambda: cp),
+        dict(torch=torch, _EXTRA_CTX=NS(flash_comm_v1_enabled=fc), enable_dsa_cp=lambda: cp,
+             enable_dsa_cp_decoder=lambda: False),
     )
     x, positions = torch.ones(4, 3), torch.arange(4)
     out, pos = fn(NS(method="mtp", is_multimodal_model=multimodal), x, positions)
@@ -262,6 +264,7 @@ def attention(monkeypatch):
         dsa_offload_unbundle=False,
         has_indexer=True,
         enable_dsa_cp=False,
+        dsa_cp_decoder=False,
         enable_dsa_cp_with_o_proj_tp=False,
         enable_mlapo=True,
         use_sparse_c8_indexer=False,
@@ -343,6 +346,8 @@ def test_post_attention_keeps_global_queries_and_local_diagnostic_owners(rank, t
         tp_size=4,
         tp_rank=rank,
         diagnostic_num_cache_layers=78,
+        dsa_cp_decoder=False,
+        _cp_query_rows=lambda n: n,
         _cross_layer_kv_cache=lambda *args: (args[1], None, False),
         _cross_layer_post_compute=compute,
         _staged_graph_content_diagnostic_enabled=lambda _: True,

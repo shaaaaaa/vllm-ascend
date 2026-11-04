@@ -18,11 +18,12 @@ from vllm.logger import logger
 from vllm.triton_utils import HAS_TRITON, triton
 
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
+from vllm_ascend.attention.sfa_graph_layout import cp_sequence_lengths, cp_slice
 from vllm_ascend.attention.sfa_v1 import _decode_window_save_window_size
 from vllm_ascend.attention.utils import staged_sfa_metadata_sparse_route
 from vllm_ascend.ops.rotary_embedding import get_cos_and_sin_mla
 from vllm_ascend.ops.triton.spec_decode.async_mtp import prepare_async_mtp_kernel, prepare_async_mtp_tokens_kernel
-from vllm_ascend.utils import StagedSFARouteReason, lmhead_tp_enable, sfa_full_graph_enabled
+from vllm_ascend.utils import StagedSFARouteReason, enable_dsa_cp_decoder, lmhead_tp_enable, sfa_full_graph_enabled
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner, _mtp_dw_diag_enabled, npu_content_diagnostics_enabled
 
 
@@ -460,6 +461,20 @@ class AsyncSFAModelRunner(NPUModelRunner):
             # The boundary is proven unchanged, so no host read/upload is needed.
             item.decode_remap_boundary_ready = True
             item.cos, item.sin = get_cos_and_sin_mla(self.positions.gpu[:capacity].long(), True)
+            if item.dsa_cp_context is not None:
+                cp = item.dsa_cp_context
+                width = cp.local_end_with_pad - cp.local_start
+                cp_sequence_lengths(
+                    item.cum_query_lens,
+                    item.seq_lens,
+                    cp.local_start,
+                    width,
+                    cp.actual_seq_lengths_query,
+                    cp.actual_seq_lengths_key,
+                )
+                cp.slot_mapping_cp.copy_(
+                    cp_slice(item.slot_mapping, cp.local_start // width, cp.num_tokens_pad // width, -1)
+                )
             result = metadata, common
         self._async_built = (result, _shape(kwargs))
         return result
@@ -507,7 +522,7 @@ class AsyncSFAModelRunner(NPUModelRunner):
         groups = self.input_batch.block_table.block_tables
         if (
             shape[0] != 2 * len(ids)
-            or item.dsa_cp_context is not None
+            or (item.dsa_cp_context is not None and not enable_dsa_cp_decoder())
             or len(groups) != 2
             or item.indexer_slot_mapping is None
             or item.decode_remap_boundary_buffer is None

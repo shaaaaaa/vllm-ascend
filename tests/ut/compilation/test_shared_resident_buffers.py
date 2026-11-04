@@ -25,10 +25,16 @@ def planner_api():
 @pytest.mark.parametrize("v2", [False, True])
 @pytest.mark.parametrize("mtp", [1, 2])
 @pytest.mark.parametrize("bounded", [False, True])
-def test_ascend_aot_keeps_group_storage_without_clones(planner_api, mtp, v2, bounded, namespace_suffix=""):
+@pytest.mark.parametrize("decoder_cp", [False, True])
+def test_ascend_aot_keeps_group_storage_without_clones(
+    planner_api, mtp, v2, bounded, decoder_cp, namespace_suffix=""
+):
+    torch._dynamo.reset()  # Each case represents a fresh worker/configuration.
     _, (producer, consumer), group, _ = grouped(planner_api, mtp, bounded)
     ns = dict(
         torch=torch,
+        enable_dsa_cp_decoder=lambda: decoder_cp,
+        get_tensor_model_parallel_world_size=lambda: 4,
         StagedSFABridge=tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
     )
     methods(
@@ -46,13 +52,14 @@ def test_ascend_aot_keeps_group_storage_without_clones(planner_api, mtp, v2, bou
         current = producer if layer == "producer" else consumer
         if resident_writes:
             observed_writes.append(tuple(t.data_ptr() for t in resident_writes))
-        raw = hidden[:, :1].to(torch.int32).expand(-1, 2048).unsqueeze(1)
+        full_rows = hidden.repeat(4, 1)[:mtp] if decoder_cp else hidden
+        raw = full_rows[:, :1].to(torch.int32).expand(-1, 2048).unsqueeze(1)
         values = plan(current, raw, writes=resident_writes, reads=resident_reads)
         return (hidden[:, None, :].clone(), hidden[:, None, :2].clone(), *(t.clone() for t in values))
 
     producer.cross_layer_graph_pre = consumer.cross_layer_graph_pre = pre
     ns["_mla_runtime_state"] = lambda name: (producer if name == "producer" else consumer, name, (), None)
-    namespace = f"resident_islands_{mtp}_{int(v2)}_{int(bounded)}{namespace_suffix}"
+    namespace = f"resident_islands_{mtp}_{int(v2)}_{int(bounded)}_{int(decoder_cp)}{namespace_suffix}"
     lib = torch.library.Library(namespace, "DEF")
     lib.define(
         "pre" + torch.library.infer_schema(ns["sfa_forward_pre_shared"], mutates_args=["output", "resident_writes"])
@@ -94,7 +101,7 @@ def test_ascend_aot_keeps_group_storage_without_clones(planner_api, mtp, v2, bou
         write_compiled = torch.compile(write, backend=backend, fullgraph=True, dynamic=False)
         read_compiled = torch.compile(read, backend=backend, fullgraph=True, dynamic=False)
         for value in (1, 7):
-            first = write_compiled(torch.full((mtp, 4), float(value)), group.writes)
+            first = write_compiled(torch.full((1 if decoder_cp else mtp, 4), float(value)), group.writes)
             second = read_compiled(first[0][:, 0], group.reads)
             assert torch.equal(first[2], second[2]) and second[2].eq(value + 100).all()
             assert torch.equal(first[4], second[4])

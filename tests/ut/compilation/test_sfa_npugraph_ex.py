@@ -355,8 +355,9 @@ def test_real_aot_pipeline_preserves_sources_and_unrelated_mutation(compiler, mo
 @pytest.mark.parametrize("v2", [False, True])
 @pytest.mark.parametrize("mtp", [1, 2])
 @pytest.mark.parametrize("bounded", [False, True])
+@pytest.mark.parametrize("decoder_cp", [False, True])
 @torch.inference_mode()
-def test_existing_sfa_planner_contract_through_new_backend(compiler, monkeypatch, v2, mtp, bounded):
+def test_existing_sfa_planner_contract_through_new_backend(compiler, monkeypatch, v2, mtp, bounded, decoder_cp):
     from tests.ut.compilation import test_shared_resident_buffers as existing
 
     module, state = compiler
@@ -381,7 +382,7 @@ def test_existing_sfa_planner_contract_through_new_backend(compiler, monkeypatch
 
     monkeypatch.setattr(existing, "methods", load_methods)
     existing.test_ascend_aot_keeps_group_storage_without_clones(
-        existing.resident_api.__wrapped__(), mtp, v2, bounded, namespace_suffix="_npugraph"
+        existing.resident_api.__wrapped__(), mtp, v2, bounded, namespace_suffix="_npugraph", decoder_cp=decoder_cp
     )
     assert state.identity_copy_counts and not any(state.identity_copy_counts)
 

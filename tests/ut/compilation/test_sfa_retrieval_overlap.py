@@ -252,6 +252,7 @@ def test_actual_post_starts_prefetch_between_attention_and_value_projection():
     post = extract(SOURCE, "_cross_layer_post_compute", ns)
     proj = Mock(side_effect=lambda x: (log.append("output") or x,))
     impl = NS(_execute_sparse_flash_attention_process=lambda *a, **kw: log.append("sfa") or value,
+              dsa_cp_decoder=False,
               _v_up_proj=lambda x: log.append("cube") or x, o_proj=proj)
     edge = NS(launch=lambda *args: log.append("prefetch"))
     post(impl, value, value, value, value, value, value, value, value, torch.empty_like(value),

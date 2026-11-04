@@ -24,6 +24,7 @@ def config(max_requests, speculative=1, *, cp=False, flashcomm=True, staged=True
         ),
         staged=staged,
         flashcomm=flashcomm,
+        kv_transfer_config=None,
     )
     maximum = extract(PLATFORM, "_get_default_max_cudagraph_capture_size", {})(None, cfg)
     cfg.compilation_config.max_cudagraph_capture_size = maximum
@@ -46,9 +47,13 @@ def size_namespace(request_sizes, capacity=100):
             VLLM_ASCEND_SFA_STAGED_GRAPH_CAPTURE_SIZES=request_sizes,
             VLLM_ASCEND_SFA_FULL_GRAPH=True,
             VLLM_ASCEND_SFA_SHARED_RETRIEVAL_OVERLAP=True,
+            VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE=False,
         ),
     )
-    for name in ("update_cudagraph_capture_sizes", "staged_sfa_graph_capture_sizes", "update_aclgraph_sizes"):
+    for name in (
+        "dsa_cp_decoder_configured", "update_cudagraph_capture_sizes",
+        "staged_sfa_graph_capture_sizes", "update_aclgraph_sizes",
+    ):
         extract(UTILS, name, ns)
     return ns
 
@@ -76,6 +81,15 @@ def test_fc_only_staged_sizes_survive_initial_platform_filter(requests, speculat
     expected = [int(size) * (1 + speculative) for size in sizes.split(",")]
     assert cfg.compilation_config.cudagraph_capture_sizes == expected
     assert cfg.compilation_config.max_cudagraph_capture_size == max(expected)
+
+
+@pytest.mark.parametrize("requests,speculative,sizes", [(1, 0, "1"), (1, 1, "1"), (12, 1, "2,4,6,8,10,12")])
+def test_decoder_cp_preserves_logical_capture_buckets(requests, speculative, sizes):
+    cfg, ns = config(requests, speculative, cp=True), size_namespace(sizes)
+    cfg.kv_transfer_config = NS(is_kv_consumer=True, is_kv_producer=True)
+    run_platform_filter(cfg, ns)
+    ns["update_aclgraph_sizes"](cfg)
+    assert cfg.compilation_config.cudagraph_capture_sizes == [int(s) * (1 + speculative) for s in sizes.split(",")]
 
 
 @pytest.mark.parametrize("cp,staged", [(True, True), (None, True), (False, False)])

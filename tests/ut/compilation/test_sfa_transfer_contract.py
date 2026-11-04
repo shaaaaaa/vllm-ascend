@@ -43,7 +43,7 @@ def contract(monkeypatch):
     def load(name, path):
         return load_module(path, name, monkeypatch)
 
-    module("lmcache.v1.memory_management", MemoryObj=object)
+    module("lmcache.v1.memory_management", MemoryObj=object, TensorMemoryObj=type("TensorMemoryObj", (), {}))
     module("lmcache.logging", init_logger=logging.getLogger)
     source = load("lmcache.v1.gpu_connector.sparse", lmcache / "v1/gpu_connector/sparse.py")
     load("lmcache_ascend.v1.kv_format", ascend / "v1/kv_format.py")
@@ -89,7 +89,9 @@ def contract(monkeypatch):
     namespace = {"get_forward_context": lambda: context, "torch": torch}
     path = root / "vllm_ascend/attention/sfa_v1.py"
     extract(path, {"_prepare_sfa_remap_boundary"}, namespace)
-    methods = ("prepare_full_graph_layer", "prepare_full_graph_metadata", "full_graph_metadata_inputs")
+    methods = (
+        "prepare_full_graph_layer", "prepare_full_graph_metadata", "full_graph_metadata_inputs", "_cp_query_rows"
+    )
     extract(path, set(methods), namespace, class_name="AscendSFAImpl")
     namespace["dataclass"] = dataclass
     namespace["SFASourceLease"] = lambda sources: SimpleNamespace(close=Mock())
@@ -151,6 +153,7 @@ def make_layer(contract, request_capacity):
         reshape_cache_event=object(),
     )
     impl = contract.impl_type()
+    impl.dsa_cp_decoder = False
     impl.index_topk = 4
     impl._staged_sfa_capture_state = SimpleNamespace(runtime=(None, caches))
     impl._staged_sfa_bridge_buffers = (torch.zeros(request_capacity * 2, 1),)

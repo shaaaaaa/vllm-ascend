@@ -379,7 +379,8 @@ def test_residual_trace_cli_is_forwarded_to_pair(driver, monkeypatch):
 
 @pytest.mark.parametrize("mode", ["eager", "graph"])
 @pytest.mark.parametrize("flashcomm1", [False, True])
-def test_flashcomm_only_options_keep_fixture_and_compiler_paths(driver, mode, flashcomm1):
+@pytest.mark.parametrize("dsa_cp", [False, True])
+def test_flashcomm_only_options_keep_fixture_and_compiler_paths(driver, mode, flashcomm1, dsa_cp):
     options = driver.engine_options(
         SimpleNamespace(
             child=mode,
@@ -389,6 +390,7 @@ def test_flashcomm_only_options_keep_fixture_and_compiler_paths(driver, mode, fl
             atol=0,
             rtol=0,
             flashcomm1=flashcomm1,
+            dsa_cp=dsa_cp,
         )
     )
     config = options["additional_config"]
@@ -396,8 +398,8 @@ def test_flashcomm_only_options_keep_fixture_and_compiler_paths(driver, mode, fl
     assert options["data_parallel_size"] == 1
     assert options["compilation_config"]["cudagraph_mode"] == ("PIECEWISE" if mode == "graph" else "NONE")
     assert config["sfa_parity"]["mode"] == mode
-    if flashcomm1:
-        assert config["enable_flashcomm1"] is True and config["enable_dsa_cp"] is False
+    if flashcomm1 or dsa_cp:
+        assert config["enable_flashcomm1"] is True and config["enable_dsa_cp"] is dsa_cp
     else:
         assert "enable_flashcomm1" not in config and "enable_dsa_cp" not in config
     assert not config.get("multistream_overlap_shared_expert", False)
@@ -409,3 +411,11 @@ def test_flashcomm_cli_is_forwarded_to_pair(driver, monkeypatch):
     monkeypatch.setattr(sys, "argv", ["driver", "--flashcomm1"])
     driver.main()
     assert run.call_args.kwargs["flashcomm1"] is True
+
+
+def test_decoder_cp_cli_is_forwarded_to_pair(driver, monkeypatch):
+    run = Mock()
+    monkeypatch.setattr(driver, "run_pair", run)
+    monkeypatch.setattr(sys, "argv", ["driver", "--dsa-cp"])
+    driver.main()
+    assert run.call_args.kwargs["dsa_cp"] is True

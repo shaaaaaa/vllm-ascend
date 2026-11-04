@@ -51,7 +51,13 @@ from vllm_ascend.attention.mtp_dw_diag import (
     scratch_live_slot_aliases,
     scratch_target_safety,
 )
-from vllm_ascend.attention.sfa_graph_layout import FullGraphAttentionBuffers, pack_decode_lanes, unpack_decode_lanes
+from vllm_ascend.attention.sfa_graph_layout import (
+    FullGraphAttentionBuffers,
+    cp_sequence_lengths,
+    cp_slice,
+    pack_decode_lanes,
+    unpack_decode_lanes,
+)
 from vllm_ascend.attention.sfa_remap_boundary import SFARemapBoundaryBuffer
 from vllm_ascend.attention.target_sfa_diagnostics import (
     TARGET_SFA_DIAG_SCHEMA_VERSION,
@@ -124,6 +130,7 @@ from vllm_ascend.utils import (
     _round_up,
     dispose_layer,
     enable_dsa_cp,
+    enable_dsa_cp_decoder,
     enable_dsa_cp_with_layer_shard,
     enable_dsa_cp_with_o_proj_tp,
     enable_sp,
@@ -1152,6 +1159,7 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
         self.attn_mask_builder = AttentionMaskBuilder(self.device)
         self.rope_dim = self.model_config.hf_text_config.qk_rope_head_dim
         self.enable_dsa_cp = enable_dsa_cp()
+        self.dsa_cp_decoder = enable_dsa_cp_decoder()
         self.dsa_shrink_latent = int(envs.VLLM_ASCEND_DSA_SHRINK_LATENT) if envs.VLLM_ASCEND_DSA_UNBUNDLE else 0
         if self.dsa_shrink_latent and self.decode_threshold > 2:
             raise ValueError(
@@ -1474,7 +1482,7 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
                 qsl = None
                 fixed_query_starts = None
             fixed_width_decode = (
-                not self.enable_dsa_cp
+                (not self.enable_dsa_cp or self.dsa_cp_decoder)
                 and fixed_decode_width in (1, 2)
                 and num_input_tokens
                 == num_reqs * fixed_decode_width
@@ -1498,7 +1506,7 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
                 fixed_width_decode = np.all(computed_layout)
             general_signature = None
             if (
-                not fixed_width_decode and not self.enable_dsa_cp
+                not fixed_width_decode and (not self.enable_dsa_cp or self.dsa_cp_decoder)
                 and current_positions is None and qsl is not None
                 and not any(cold_resumes) and np.all(computed >= plens_cpu[:n_real])
             ):
@@ -1776,63 +1784,32 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             local_end_with_pad = local_start + num_tokens_per_device
             local_end = min(local_end_with_pad, num_actual_tokens)
 
-            pad_size = num_tokens_pad - cos.shape[0]
             assert cos.shape == sin.shape, f"cos.shape must be equal to sin.shape, got {cos.shape} and {sin.shape}"
-
-            if pad_size > 0:
-                cos = nn.functional.pad(cos, (0, 0, 0, 0, 0, 0, 0, pad_size))
-                sin = nn.functional.pad(sin, (0, 0, 0, 0, 0, 0, 0, pad_size))
-
-            pad_size_slot = num_tokens_pad - slot_mapping.shape[0]
-            if pad_size_slot > 0:
-                slot_mapping = nn.functional.pad(slot_mapping, (0, pad_size_slot), value=-1)
+            if not self.dsa_cp_decoder:
+                cos = cp_slice(cos[:num_tokens], get_tp_group().rank_in_group, global_tp_size)
+                sin = cp_slice(sin[:num_tokens], get_tp_group().rank_in_group, global_tp_size)
+                if num_tokens_pad > slot_mapping.shape[0]:
+                    slot_mapping = nn.functional.pad(
+                        slot_mapping, (0, num_tokens_pad - slot_mapping.shape[0]), value=-1
+                    )
+                else:
+                    slot_mapping = slot_mapping[:num_tokens_pad]
+                slot_mapping_cp = slot_mapping[local_start:local_end_with_pad]
+                assert cos.shape[0] == num_tokens_per_device
             else:
-                slot_mapping = slot_mapping[:num_tokens_pad]
-            slot_mapping_cp = slot_mapping[local_start:local_end_with_pad]
-
-            cos = cos[local_start:local_end_with_pad]
-            sin = sin[local_start:local_end_with_pad]
-
-            assert cos.shape[0] == num_tokens_per_device, (
-                f"cos.shape[0] must be equal to num_tokens_per_device, \
-                    got {cos.shape[0]} and {num_tokens_per_device}"
-            )
-            assert slot_mapping_cp.shape[0] == num_tokens_per_device, (
-                f"slot_mapping_cp.shape[0] must be equal to num_tokens_per_device, \
-                    got {slot_mapping_cp.shape[0]} and {num_tokens_per_device}"
-            )
-            assert slot_mapping.shape[0] == num_tokens_pad, (
-                f"slot_mapping.shape[0] must be equal to num_tokens_pad, \
-                    got {slot_mapping.shape[0]} and {num_tokens_pad}"
-            )
+                slot_mapping_cp = cp_slice(slot_mapping[:num_tokens], get_tp_group().rank_in_group, global_tp_size, -1)
+            assert slot_mapping_cp.shape[0] == num_tokens_per_device
 
             actual_seq_lengths_query = self.actual_seq_lengths_query
             actual_seq_lengths_key = self.actual_seq_lengths_key
 
             num_segs = cum_query_lens.shape[0]
-            last_token = 0
-            cum = 0
-            for i in range(0, num_segs):
-                global_start = last_token
-                global_end = cum_query_lens[i].item()
-                last_token = global_end
-
-                req_local_start = max(global_start, local_start)
-                req_local_end = min(global_end, local_end_with_pad)
-                num_local_tokens = req_local_end - req_local_start
-
-                if num_local_tokens > 0:
-                    cum += num_local_tokens
-                    actual_seq_lengths_query[i] = cum
-
-                    offset = global_end - req_local_end
-                    actual_seq_lengths_key[i] = seq_lens[i].item() - offset
-                else:
-                    actual_seq_lengths_query[i] = cum
-                    actual_seq_lengths_key[i] = 0
-
-            actual_seq_lengths_query = actual_seq_lengths_query[:num_reqs]
-            actual_seq_lengths_key = actual_seq_lengths_key[:num_reqs]
+            actual_seq_lengths_query = actual_seq_lengths_query[:num_segs]
+            actual_seq_lengths_key = actual_seq_lengths_key[:num_segs]
+            cp_sequence_lengths(
+                cum_query_lens, seq_lens, local_start, num_tokens_per_device,
+                actual_seq_lengths_query, actual_seq_lengths_key,
+            )
 
             dsa_cp_context = DSACPContext(
                 num_tokens=num_tokens,
@@ -2233,6 +2210,7 @@ class AscendSFAImpl(MLAAttentionImpl):
 
         # Effective in SFA when FlashComm is enabled.
         self.enable_dsa_cp = enable_dsa_cp()
+        self.dsa_cp_decoder = enable_dsa_cp_decoder()
 
         # Enable layer sharding via DSA-CP on the P node in the PD-disaggregated setup.
         self.enable_dsa_cp_with_layer_shard = enable_dsa_cp_with_layer_shard()
@@ -2307,7 +2285,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                 for layer in self.layer_sharding_kwargs or []:
                     if is_hidden_layer(layer):
                         post_process_after_loading_for_shard_weight_series(layer)
-            else:
+            elif not self.dsa_cp_decoder:
                 self._init_o_proj_tp_full_params()
 
         if self.enable_mlapo:
@@ -2555,6 +2533,16 @@ class AscendSFAImpl(MLAAttentionImpl):
         if topk_indices.dim() == 2:
             topk_indices = topk_indices.unsqueeze(1)
         return topk_indices
+
+    def _cp_query_rows(self, tokens: int) -> int:
+        return (tokens + self.tp_size - 1) // self.tp_size if self.dsa_cp_decoder else tokens
+
+    def _cp_local(self, tensor: torch.Tensor, value=0) -> torch.Tensor:
+        return cp_slice(tensor, self.tp_rank, self.tp_size, value)
+
+    def _cp_global_topk(self, topk: torch.Tensor, tokens: int) -> torch.Tensor:
+        # Keep the existing global request union and shared-consumer contract.
+        return get_tp_group().all_gather(topk.contiguous(), dim=0)[:tokens]
 
     def _update_indexcache_topk_indices(self, topk_indices: torch.Tensor) -> None:
         """Publish this producer layer's top-k into the shared buffer.
@@ -3019,6 +3007,8 @@ class AscendSFAImpl(MLAAttentionImpl):
                     f"{tuple(decode_req_indices.shape) if decode_req_indices is not None else None} "
                     f"decode_req_indices_sample={decode_req_indices_sample}"
                 )
+        if self.dsa_cp_decoder and attn_metadata is not None:
+            topk_indices = self._cp_local(topk_indices, -1)
         attn_output = torch.ops._C_ascend.npu_sparse_flash_attention(
             query=ql_nope,
             key=kv,
@@ -3035,6 +3025,15 @@ class AscendSFAImpl(MLAAttentionImpl):
             layout_kv="PA_BSND",
             sparse_mode=3,
         )
+        if self.dsa_cp_decoder:
+            # TND kernels visit declared query intervals, not the extra TP
+            # communication rows. Initialize that suffix before o_proj/EP.
+            tokens = (attn_metadata.num_input_tokens if attn_metadata is not None
+                      else get_forward_context().staged_sfa_graph_key.token_capacity)
+            rows = attn_output.shape[0]
+            valid = max(0, min(rows, tokens - self.tp_rank * rows))
+            if valid < rows:
+                attn_output[valid:].zero_()
         return attn_output
 
     def _cross_layer_ineligible_reason(
@@ -3062,7 +3061,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         if runtime_mode != CUDAGraphMode.PIECEWISE and not (staged_dummy_run and runtime_mode == CUDAGraphMode.NONE):
             return "the runtime graph mode is not PIECEWISE"
 
-        token_capacity = int(hidden_states.shape[0])
+        token_capacity = int(attn_metadata.num_input_tokens) if self.dsa_cp_decoder else int(hidden_states.shape[0])
         if getattr(self, "_staged_sfa_graph_capture_sizes", None) is None:
             # Compatibility for lightweight test/downstream implementations.
             staged_sfa_graph_capture_sizes(self.vllm_config)
@@ -3073,6 +3072,8 @@ class AscendSFAImpl(MLAAttentionImpl):
         )
         if authorized_key is None or authorized_key.token_capacity != token_capacity:
             return "the runner did not authorize this staged SFA token capacity"
+        if self.dsa_cp_decoder and int(hidden_states.shape[0]) != self._cp_query_rows(token_capacity):
+            return "the CP query rows do not match the authorized global token capacity"
         graph_key = authorized_key
         bounded_decode = graph_key.query_profile == StagedSFAQueryProfile.DECODE_BOUNDED
         if graph_key.max_query_len > 2:
@@ -3119,9 +3120,9 @@ class AscendSFAImpl(MLAAttentionImpl):
         weight_prefetch_method = get_weight_prefetch_method()
         if weight_prefetch_method is not None and weight_prefetch_method.mla_sfa_prefetch_enable:
             return "weight prefetch is enabled"
-        if self.enable_dsa_cp:
+        if self.enable_dsa_cp and not self.dsa_cp_decoder:
             return "DSA context parallelism is enabled"
-        if self.enable_dsa_cp_with_o_proj_tp:
+        if self.enable_dsa_cp_with_o_proj_tp and not self.dsa_cp_decoder:
             return "DSA o_proj tensor parallelism is enabled"
         if self.dsa_offload_free_paged:
             return "the free-paged offload path is enabled"
@@ -3189,7 +3190,10 @@ class AscendSFAImpl(MLAAttentionImpl):
         # The runner passes a NEW memo for each forward. Retain the metadata
         # object as well as its id, and include every layer-specific policy
         # used by the shared checker. Do not skip the layer/KV checks above.
-        check_key = (type(self), id(attn_metadata), graph_key, bool(self.dsa_resident_cache), staged_dummy_run)
+        check_key = (
+            type(self), id(attn_metadata), graph_key, bool(self.dsa_resident_cache), staged_dummy_run,
+            self.dsa_cp_decoder, self.tp_size if self.dsa_cp_decoder else 1, self.tp_rank if self.dsa_cp_decoder else 0,
+        )
         if metadata_checks is not None and check_key in metadata_checks:
             checked_metadata, reason = metadata_checks[check_key]
             if checked_metadata is attn_metadata:
@@ -3212,6 +3216,16 @@ class AscendSFAImpl(MLAAttentionImpl):
         token_capacity = graph_key.token_capacity
         bounded_decode = graph_key.query_profile == StagedSFAQueryProfile.DECODE_BOUNDED
         attention_capacity = graph_key.request_capacity + int(bounded_decode)
+        if self.dsa_cp_decoder:
+            cp = attn_metadata.dsa_cp_context
+            if (
+                cp is None or cp.num_tokens != token_capacity
+                or cp.local_start != self.tp_rank * self._cp_query_rows(token_capacity)
+                or cp.local_end_with_pad - cp.local_start != self._cp_query_rows(token_capacity)
+                or cp.actual_seq_lengths_query.shape != (attention_capacity,)
+                or cp.actual_seq_lengths_key.shape != (attention_capacity,)
+            ):
+                return "the CP attention metadata does not match the graph key"
         expected_state = (
             AscendAttentionState.DecodeOnly
             if graph_key.query_profile == StagedSFAQueryProfile.DECODE_Q1
@@ -3669,6 +3683,8 @@ class AscendSFAImpl(MLAAttentionImpl):
         resident_reads: list[torch.Tensor] | None = None,
         resident_writes: list[torch.Tensor] | None = None,
         indexer_scale_cache: torch.Tensor | None = None,
+        cp_query_lens: torch.Tensor | None = None,
+        cp_key_lens: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, ...]:
         """Pre-retrieval compute captured by the outer PIECEWISE graph.
 
@@ -3683,6 +3699,9 @@ class AscendSFAImpl(MLAAttentionImpl):
         assert self.fused_qkv_a_proj is not None
         assert self.q_lora_rank is not None
         assert self.q_a_layernorm is not None
+
+        if self.dsa_cp_decoder:
+            cos, sin = self._cp_local(cos), self._cp_local(sin)
 
         weight_prefetch_method = get_weight_prefetch_method()
         weight_prefetch_method.maybe_prefetch_mla_or_sla_weight_in_current_stream(
@@ -3712,14 +3731,40 @@ class AscendSFAImpl(MLAAttentionImpl):
             k_li = None
             assert indexer_cache is None
             kv_cache = (kv_cache_nope, kv_cache_pe)
-        self.exec_kv(
+        current_kv = self.exec_kv(
             kv_no_split,
             cos,
             sin,
             kv_cache,
-            slot_mapping,
+            self._cp_local(slot_mapping, -1) if self.dsa_cp_decoder else slot_mapping,
             None,
         )
+        if self.dsa_cp_decoder:
+            # Match native CP publication, including BF16/C8 indexer producers.
+            k_pe, k_nope = current_kv
+            pieces = [k_pe.flatten(1), k_nope.flatten(1)]
+            if k_li is not None and not self.use_sparse_c8_indexer:
+                pieces.append(k_li.flatten(1))
+            gathered = get_tp_group().all_gather(torch.cat(pieces, dim=-1), dim=0)[:slot_mapping.shape[0]]
+            widths = [piece.shape[-1] for piece in pieces]
+            parts = gathered.split(widths, dim=-1)
+            current = []
+            for values, cache in zip((parts[1], parts[0]), (kv_cache_nope, kv_cache_pe)):
+                flat = cache.view(-1, values.shape[-1])
+                slots, updates = self._mask_staged_index_scatter_padding(slot_mapping, values, row_req_indices, flat)
+                current.append(updates.unsqueeze(1))
+            DeviceOperator.reshape_and_cache(
+                key=current[0], value=current[1], key_cache=kv_cache_nope, value_cache=kv_cache_pe, slot_mapping=slots
+            )
+            if self.has_indexer:
+                if self.use_sparse_c8_indexer:
+                    k_li = get_tp_group().all_gather(k_li.contiguous(), dim=0)[:slot_mapping.shape[0]]
+                    k_li_scale = get_tp_group().all_gather(k_li_scale.contiguous(), dim=0)[:slot_mapping.shape[0]]
+                else:
+                    k_li = parts[2]
+        # Non-CP previously discarded these fresh KV outputs at the call site.
+        # Do not extend their storage lifetime through query/indexer planning.
+        del current_kv
 
         ql_nope, q_pe = self._q_proj_and_k_up_proj(q_c)
         q_pe = self.rope_single(q_pe, cos, sin)
@@ -3757,12 +3802,12 @@ class AscendSFAImpl(MLAAttentionImpl):
             # Query/current KV are layer-local. Selection, packing, planning
             # and row restoration were already done by this group's producer.
             return (ql_nope, q_pe, *group.attention_plan(
-                graph_key.request_capacity, int(hidden_states.shape[0]), resident_reads
+                graph_key.request_capacity, int(slot_mapping.shape[0]), resident_reads
             ))
         if self.skip_topk:
             # Reuse the current batch's top-k from the shared buffer
             # (GLM-5.2 shared consumers and runtime IndexCache skip layers).
-            topk_indices = self._get_indexcache_topk_indices(hidden_states.shape[0])
+            topk_indices = self._get_indexcache_topk_indices(slot_mapping.shape[0])
         else:
             if not self.has_indexer:
                 raise RuntimeError(
@@ -3776,10 +3821,12 @@ class AscendSFAImpl(MLAAttentionImpl):
                 attn_metadata=None,
                 cos=cos,
                 sin=sin,
-                actual_seq_lengths_query=actual_seq_lengths_query,
-                actual_seq_lengths_key=actual_seq_lengths_key,
+                actual_seq_lengths_query=cp_query_lens if self.dsa_cp_decoder else actual_seq_lengths_query,
+                actual_seq_lengths_key=cp_key_lens if self.dsa_cp_decoder else actual_seq_lengths_key,
                 indexer_block_table_override=indexer_block_table,
             )
+            if self.dsa_cp_decoder:
+                topk_indices = self._cp_global_topk(topk_indices, slot_mapping.shape[0])
             if self.index_cache_enabled:
                 # Publish this batch's raw top-k BEFORE the remap so downstream
                 # skip-layer graph As in the same step read fresh indices from
@@ -3940,6 +3987,8 @@ class AscendSFAImpl(MLAAttentionImpl):
             edge, selected, counts, slots, destinations = prefetch
             edge.launch(selected, counts, slots, destinations)
         attn_output = self._v_up_proj(attn_output)
+        if self.dsa_cp_decoder:
+            attn_output, _ = self._handle_o_proj_weight_switch_and_forward(attn_output, output, None, False)
         weight_prefetch_method = get_weight_prefetch_method()
         weight_prefetch_method.maybe_prefetch_mla_or_sla_weight_in_current_stream(
             inputs=self.o_proj.weight,
@@ -4063,7 +4112,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         metadata = context.attn_metadata[layer_name]
         if context.staged_sfa_graph_dummy_run:
             reason = self._cross_layer_ineligible_reason(
-                self._staged_sfa_bridge_buffers[0][:context.staged_sfa_graph_key.token_capacity],
+                self._staged_sfa_bridge_buffers[0][:self._cp_query_rows(context.staged_sfa_graph_key.token_capacity)],
                 state.runtime[1],
                 metadata,
                 metadata_checks=metadata_checks,
@@ -4117,6 +4166,9 @@ class AscendSFAImpl(MLAAttentionImpl):
         if getattr(metadata, "indexer_c8_block_table", None) is not None:
             inputs["indexer_c8_block_table"] = metadata.indexer_c8_block_table
             inputs["indexer_c8_slot_mapping"] = metadata.indexer_c8_slot_mapping
+        if getattr(metadata, "dsa_cp_context", None) is not None:
+            inputs["cp_query_lens"] = metadata.dsa_cp_context.actual_seq_lengths_query
+            inputs["cp_key_lens"] = metadata.dsa_cp_context.actual_seq_lengths_key
         return inputs
 
     def seal_staged_sfa_capture(
@@ -4146,14 +4198,14 @@ class AscendSFAImpl(MLAAttentionImpl):
             buffers = (
                 hidden_states.new_empty(
                     (
-                        max_tokens,
+                        self._cp_query_rows(max_tokens),
                         self.local_num_heads,
                         self.kv_lora_rank,
                     )
                 ),
                 hidden_states.new_empty(
                     (
-                        max_tokens,
+                        self._cp_query_rows(max_tokens),
                         self.local_num_heads,
                         self.qk_rope_head_dim,
                     )
@@ -4274,7 +4326,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         is_dummy = bool(getattr(context, "staged_sfa_graph_dummy_run", False))
         state = self._staged_sfa_capture_state
         if self._staged_graph_content_diagnostic_enabled(layer_name):
-            diagnostic_rows = min(graph_key.token_capacity, 4)
+            diagnostic_rows = min(int(hidden_states.shape[0]), 4)
             diagnostic_input = hidden_states[:diagnostic_rows].reshape(
                 diagnostic_rows, -1
             )[:, :256]
@@ -4398,6 +4450,8 @@ class AscendSFAImpl(MLAAttentionImpl):
             resident_reads=resident_reads,
             resident_writes=resident_writes,
             indexer_scale_cache=kv_cache[3] if self.has_indexer and self.use_sparse_c8_indexer else None,
+            cp_query_lens=(attn_metadata.dsa_cp_context.actual_seq_lengths_query if self.dsa_cp_decoder else None),
+            cp_key_lens=(attn_metadata.dsa_cp_context.actual_seq_lengths_key if self.dsa_cp_decoder else None),
         )
         outputs = self._copy_to_staged_sfa_bridge(
             hidden_states,
@@ -4641,9 +4695,11 @@ class AscendSFAImpl(MLAAttentionImpl):
                 "target SFA diagnostics require initialized bridge buffers"
             )
         actual_rows = min(
-            int(getattr(attn_metadata, "num_actual_tokens", bridge[0].shape[0])),
-            int(bridge[0].shape[0]),
+            int(getattr(attn_metadata, "num_actual_tokens", bridge[2].shape[0])),
+            int(bridge[2].shape[0]),
         )
+        cp = getattr(attn_metadata, "dsa_cp_context", None)
+        query_rows = actual_rows if cp is None else max(0, min(cp.local_end_with_pad, actual_rows) - cp.local_start)
         block_ids = topk_physical_block_ids(
             bridge[2],
             attn_metadata.decode_req_indices,
@@ -4681,8 +4737,8 @@ class AscendSFAImpl(MLAAttentionImpl):
                 if stable_boundary is not None
                 else None
             ),
-            "ql_nope": bridge[0][:actual_rows].detach().cpu().clone(),
-            "q_pe": bridge[1][:actual_rows].detach().cpu().clone(),
+            "ql_nope": bridge[0][:query_rows].detach().cpu().clone(),
+            "q_pe": bridge[1][:query_rows].detach().cpu().clone(),
             "topk_indices": bridge[2][:actual_rows].detach().cpu().clone(),
             "selected_packed": (
                 selected_packed[:request_count].detach().cpu().clone()
@@ -4885,6 +4941,13 @@ class AscendSFAImpl(MLAAttentionImpl):
                     "slot_mapping": attn_metadata.slot_mapping[: graph_key.token_capacity],
                     "indexer_slot_mapping": (diagnostic_index_slots[: graph_key.token_capacity]),
                 }
+                if self.dsa_cp_decoder:
+                    query_rows = min(self._cp_query_rows(graph_key.token_capacity), diagnostic_rows)
+                    pre_components["ql_nope"] = bridge[0][:query_rows]
+                    pre_components["q_pe"] = bridge[1][:query_rows]
+                    pre_components["query_row_req_indices"] = self._cp_local(
+                        attn_metadata.decode_req_indices, -1
+                    )[:query_rows]
                 input_snapshot = state.input_diagnostic_buffers.get(
                     graph_key
                 )
@@ -5117,16 +5180,19 @@ class AscendSFAImpl(MLAAttentionImpl):
         graph_key = getattr(get_forward_context(), "staged_sfa_graph_key", None)
         if attn_metadata is None or graph_key is None:
             return
-        rows = graph_key.token_capacity
+        rows = self._cp_query_rows(graph_key.token_capacity)
         kv_cache, _, _ = self._cross_layer_kv_cache(layer_name, kv_cache)
         self._cross_layer_post_compute(
             ql_nope[:rows],
             q_pe[:rows],
-            topk_indices[:rows],
+            (self._cp_local(topk_indices[:graph_key.token_capacity], -1)
+             if self.dsa_cp_decoder else topk_indices[:rows]),
             kv_cache[0],
             kv_cache[1],
-            attn_metadata.cum_query_lens,
-            attn_metadata.seq_lens,
+            (attn_metadata.dsa_cp_context.actual_seq_lengths_query
+             if self.dsa_cp_decoder else attn_metadata.cum_query_lens),
+            (attn_metadata.dsa_cp_context.actual_seq_lengths_key
+             if self.dsa_cp_decoder else attn_metadata.seq_lens),
             attn_metadata.block_table,
             output,
             trace_label="cross_layer",
@@ -5294,6 +5360,8 @@ class AscendSFAImpl(MLAAttentionImpl):
 
         cos = attn_metadata.cos
         sin = attn_metadata.sin
+        if self.dsa_cp_decoder:
+            cos, sin = self._cp_local(cos), self._cp_local(sin)
         slot_mapping = attn_metadata.slot_mapping
         # Once LMCache exposes an unbundled DSA index group, its block ids are
         # independent from the latent group's ids.  Falling back to latent
@@ -5339,10 +5407,10 @@ class AscendSFAImpl(MLAAttentionImpl):
         o_proj_full_handle = None
         # if is PD mix stage, using original TP o_proj weight, and also need to full gather for o_proj
         # weight for prefill stage.
-        full_gather_o_proj_enabled = self.enable_dsa_cp_with_o_proj_tp and attn_metadata.attn_state not in {
-            AscendAttentionState.DecodeOnly,
-            AscendAttentionState.SpecDecoding,
-        }
+        full_gather_o_proj_enabled = (
+            self.enable_dsa_cp_with_o_proj_tp and not self.dsa_cp_decoder
+            and attn_metadata.attn_state not in {AscendAttentionState.DecodeOnly, AscendAttentionState.SpecDecoding}
+        )
 
         if need_gather_q_kv and not self.enable_dsa_cp:
             hidden_states = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(hidden_states.contiguous(), True)
@@ -5664,7 +5732,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                 # GLM-5.2 shared consumers (no local Indexer) and runtime
                 # IndexCache skip layers (GLM-5.1, indexer still present).
                 topk_indices = self._get_indexcache_topk_indices(
-                    hidden_states.shape[0]
+                    attn_metadata.num_input_tokens if self.dsa_cp_decoder else hidden_states.shape[0]
                 )
             else:
                 if not self.has_indexer:
@@ -5682,6 +5750,8 @@ class AscendSFAImpl(MLAAttentionImpl):
                     actual_seq_lengths_query=actual_seq_lengths_query,
                     actual_seq_lengths_key=actual_seq_lengths_key,
                 )
+                if self.dsa_cp_decoder:
+                    topk_indices = self._cp_global_topk(topk_indices, attn_metadata.num_input_tokens)
                 if self._layerwise_prefill_p_node and index_lmcache_enabled:
                     # The indexer has finished reading its own bank. Record
                     # before top-k publication and latent SFA are submitted.

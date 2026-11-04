@@ -92,6 +92,7 @@ def handoff():
         register=Mock(),
     )
     impl = SimpleNamespace(
+        dsa_cp_decoder=False,
         _staged_sfa_capture_state=state,
         _staged_sfa_bridge_buffers=bridge,
         _staged_graph_content_diagnostic_enabled=Mock(return_value=False),

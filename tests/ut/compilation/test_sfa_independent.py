@@ -218,6 +218,7 @@ def contract_runner(monkeypatch):
             AscendDeviceType=NS(A2="A2", A3="A3"),
             enable_sp=lambda config: False,
             enable_dsa_cp=lambda: False,
+            enable_dsa_cp_decoder=lambda: False,
             shared_expert_dp_enabled=lambda: False,
             get_ascend_device_type=lambda: "A3",
             is_drafter_moe_model=lambda config: True,
@@ -294,7 +295,7 @@ def test_native_build_change_changes_execution_contract(contract_runner, monkeyp
     assert independent.execution_contract(runner)["digest"] != before["digest"]
 
 
-@pytest.mark.parametrize("flag", ["enable_sp", "enable_dsa_cp", "shared_expert_dp_enabled"])
+@pytest.mark.parametrize("flag", ["enable_sp", "enable_dsa_cp", "shared_expert_dp_enabled", "enable_dsa_cp_decoder"])
 def test_effective_layout_changes_contract_even_with_same_additional_config(contract_runner, flag):
     runner, modules, _ = contract_runner
     before = independent.execution_contract(runner)

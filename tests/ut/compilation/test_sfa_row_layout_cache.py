@@ -33,6 +33,8 @@ def builder():
     result.dsa_shrink_latent, result.decode_threshold, result.scratch_capacity = 2, 2, 16
     result._dsa_max_num_rows, result._dsa_max_num_reqs = 32, 8
     result.enable_dsa_cp = False
+    result.dsa_cp_decoder = False
+    result._layerwise_prefill_p_node = False
     result._full_graph_tables = None
     result._mixed_indexer_metadata = None
     result._dsa_fixed_layout_signature = None

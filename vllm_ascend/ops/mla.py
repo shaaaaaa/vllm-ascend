@@ -36,7 +36,7 @@ from vllm.v1.attention.backend import AttentionMetadata  # type: ignore
 from vllm_ascend import envs as envs_ascend
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
-from vllm_ascend.utils import is_vl_model, parse_layer_idx, vllm_version_is
+from vllm_ascend.utils import enable_dsa_cp_decoder, is_vl_model, parse_layer_idx, vllm_version_is
 
 
 class IndexerWrapper(nn.Module):
@@ -365,9 +365,13 @@ def sfa_forward_pre_fake(
     request_capacity: int,
     scratch_capacity: int,
 ) -> StagedSFABridge:
+    query_capacity = token_capacity
+    if enable_dsa_cp_decoder():
+        tp = get_tensor_model_parallel_world_size()
+        query_capacity = (token_capacity + tp - 1) // tp
     return (
-        hidden_states.new_empty((token_capacity, local_num_heads, kv_lora_rank)),
-        hidden_states.new_empty((token_capacity, local_num_heads, qk_rope_head_dim)),
+        hidden_states.new_empty((query_capacity, local_num_heads, kv_lora_rank)),
+        hidden_states.new_empty((query_capacity, local_num_heads, qk_rope_head_dim)),
         torch.empty(
             (token_capacity, 1, index_topk),
             dtype=torch.int32,

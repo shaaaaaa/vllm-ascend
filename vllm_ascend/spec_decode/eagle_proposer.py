@@ -73,6 +73,7 @@ from vllm_ascend.spec_decode.mtp_draft_diagnostics import (
 )
 from vllm_ascend.utils import (
     enable_dsa_cp,
+    enable_dsa_cp_decoder,
     enable_sp,
     lmhead_tp_enable,
     shared_expert_dp_enabled,
@@ -2712,7 +2713,7 @@ class SpecDecodeBaseProposer(EagleProposer):
             return hidden_states, positions
         if self.method == "mtp":
             if _EXTRA_CTX.flash_comm_v1_enabled:
-                if not enable_dsa_cp():
+                if not enable_dsa_cp() or enable_dsa_cp_decoder():
                     # Target states and positions are already replicated, not partial sums.
                     return split_inputs_tp_to_sp(hidden_states), split_inputs_tp_to_sp(positions)
                 hidden_states = torch.ops.vllm.maybe_pad_and_reduce(hidden_states)

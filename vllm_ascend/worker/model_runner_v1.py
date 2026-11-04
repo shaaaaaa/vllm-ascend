@@ -197,6 +197,7 @@ from vllm_ascend.utils import (
     calc_split_factor,
     check_gdn_layer,
     enable_dsa_cp,
+    enable_dsa_cp_decoder,
     enable_sp,
     enable_sp_by_pass,
     global_stream,
@@ -3878,6 +3879,9 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
             if physical_table is not None:
                 physical_table.zero_()
             metadata.seq_lens.zero_()
+            if getattr(metadata, "dsa_cp_context", None) is not None:
+                metadata.dsa_cp_context.actual_seq_lengths_key.zero_()
+                metadata.dsa_cp_context.slot_mapping_cp.fill_(-1)
 
     def _prepare_sfa_full_graph_call(self, graph_kwargs, num_tokens_padded, *, sources=None, agree=True):
         """Prepare one full-SFA call without submitting model work."""
@@ -4104,7 +4108,7 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
         tp_size = self.vllm_config.parallel_config.tensor_parallel_size
         flashcomm1 = enable_sp(self.vllm_config)
         if flashcomm1 or enable_sp_by_pass():
-            if flashcomm1 and self._staged_sfa_graph_capture_sizes and not enable_dsa_cp():
+            if flashcomm1 and self._staged_sfa_graph_capture_sizes and (not enable_dsa_cp() or enable_dsa_cp_decoder()):
                 # Keep request/KV graph rows unchanged; FC1 pads only its collectives.
                 return num_scheduled_tokens
             return round_up(num_scheduled_tokens, tp_size)
@@ -7613,10 +7617,12 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                     raise ValueError("shared resident planner geometry or raw publication buffer differs")
                 if (
                     impl.enable_mlapo
-                    or impl.enable_dsa_cp
-                    or impl.enable_dsa_cp_with_o_proj_tp
+                    or (impl.enable_dsa_cp and not impl.dsa_cp_decoder)
+                    or (impl.enable_dsa_cp_with_o_proj_tp and not impl.dsa_cp_decoder)
                 ):
-                    raise ValueError("shared resident planning requires the ordinary non-CP SFA layout")
+                    raise ValueError(
+                        "shared resident planning requires ordinary SFA or decoder CP with global cache rows"
+                    )
             state, workspace = producer._sorted_resident_state, producer._sorted_resident_workspace
             assert state is not None and workspace is not None
             group = SharedResidentPlan(

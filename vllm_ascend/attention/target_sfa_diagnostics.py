@@ -116,6 +116,7 @@ def target_metadata_snapshot(metadata: Any) -> dict[str, Any]:
         "decode_scratch_capacity",
         "resident_state_indices",
         "resident_state_generations",
+        "dsa_cp_context",
     )
     return {
         name: cpu_snapshot(getattr(metadata, name, None))
