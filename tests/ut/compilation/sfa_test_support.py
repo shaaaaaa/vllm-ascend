@@ -60,10 +60,12 @@ class Pointer:
 
 class HostTL:
     int32 = torch.int32
+    float32 = torch.float32
     range = staticmethod(range)
     arange = staticmethod(torch.arange)
     where = staticmethod(torch.where)
     gather = staticmethod(lambda value, indices, axis: torch.gather(value, axis, indices.long()))
+    cast = staticmethod(lambda value, dtype, bitcast=False: value.view(dtype) if bitcast else value.to(dtype))
     full = staticmethod(lambda shape, value, dtype: torch.full(shape, value, dtype=dtype))
 
     def program_id(self, axis):

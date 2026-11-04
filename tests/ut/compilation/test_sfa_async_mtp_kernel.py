@@ -10,7 +10,7 @@ from test_sfa_async_mtp import Kernel
 @pytest.mark.parametrize("n", [0, 1, 14, 31, 32, 33, 64])
 @pytest.mark.parametrize("mixed", ["none", "paired", "table"])
 @pytest.mark.parametrize("pad", [False, True])
-@pytest.mark.parametrize("check", ["table_reads", "output_stores", "ub_layout"])
+@pytest.mark.parametrize("check", ["table_reads", "output_stores", "ub_layout", "gather_dtype"])
 def test_ascend_mask_lowering_stays_within_allocations(n, mixed, pad, check, monkeypatch):
     # The reported 28-token .ttadapter reads all table lanes before selecting
     # masked values, and expands stride-2 stores into unmasked 64-element RMWs.
@@ -30,6 +30,13 @@ def test_ascend_mask_lowering_stays_within_allocations(n, mixed, pad, check, mon
     output_addresses = {t.data_ptr() for t in (positions, *slots)}
     kernel = Kernel([])
     load, store = kernel.tl.load, kernel.tl.store
+    gather = kernel.tl.gather
+
+    def checked_gather(value, indices, axis):
+        if check == "gather_dtype":
+            # Match Triton-Ascend 3.2.0 semantic.gather's actual dtype gate.
+            assert value.dtype in (torch.float16, torch.float32, torch.bfloat16, torch.int8)
+        return gather(value, indices, axis)
 
     def lowered_load(ptr, mask, other):
         if check == "table_reads" and ptr.data.data_ptr() in table_addresses:
@@ -53,6 +60,7 @@ def test_ascend_mask_lowering_stays_within_allocations(n, mixed, pad, check, mon
     monkeypatch.setattr(kernel.tl, "load", lowered_load)
     monkeypatch.setattr(kernel.tl, "store", checked_store)
     monkeypatch.setattr(kernel.tl, "reshape", checked_reshape, raising=False)
+    monkeypatch.setattr(kernel.tl, "gather", checked_gather)
     mixed_args = {} if mixed == "none" else {"slots_c8": slots[2], "MIXED_C8": True}
     if mixed == "table":
         mixed_args.update(table_c8=tables[2], stride_c8=8224)
@@ -103,6 +111,36 @@ def test_padding_address_selection_does_not_clamp_active_indices():
     slots = [torch.empty(2, dtype=torch.int32) for _ in range(2)]
     with pytest.raises(IndexError):
         kernel[(1,)](bases, counts, positions, *lengths, *tables, *slots, 1, 2, 1, 2, 1, 1, 128, 128, BLOCK=32)
+
+
+def test_metadata_gather_preserves_integer_bits(monkeypatch):
+    # Include FP32 subnormal/NaN bit patterns and integers beyond exact FP32
+    # numeric precision. Gather is data movement, never float arithmetic.
+    current = torch.tensor([1, 1048575, 2**24 + 3, 2**30 + 3, 0x7FC01234], dtype=torch.int32)
+    n = len(current)
+    bases = current - 1
+    counts = torch.ones(n, dtype=torch.int64)
+    positions = torch.empty(2 * n, dtype=torch.int64)
+    lengths = [torch.empty(size, dtype=torch.int32) for size in (n, n + 1)]
+    tables = [torch.zeros((n, 2), dtype=torch.int32) for _ in range(2)]
+    slots = [torch.empty(2 * n, dtype=torch.int32) for _ in range(2)]
+    kernel = Kernel([])
+    gather = kernel.tl.gather
+
+    def check_words(value, indices, axis):
+        assert value.dtype == torch.float32
+        torch.testing.assert_close(value.view(torch.int32)[:n], current, rtol=0, atol=0)
+        return gather(value, indices, axis)
+
+    monkeypatch.setattr(kernel.tl, "gather", check_words)
+    kernel[(1,)](bases, counts, positions, *lengths, *tables, *slots, n, 2 * n, n, n + 1, 2, 2, 2**30, 2**30, BLOCK=32)
+    expected = (current[:, None].long() + torch.arange(2)).flatten()
+    torch.testing.assert_close(positions, expected, rtol=0, atol=0)
+    torch.testing.assert_close(bases, current, rtol=0, atol=0)
+    torch.testing.assert_close(lengths[0], current + 2, rtol=0, atol=0)
+    assert lengths[1][-1] == 0
+    for slot in slots:
+        torch.testing.assert_close(slot, (expected % 2**30).int(), rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("n,capacity", [(1, 8), (3, 8), (16, 32), (32, 64), (33, 80), (63, 128)])

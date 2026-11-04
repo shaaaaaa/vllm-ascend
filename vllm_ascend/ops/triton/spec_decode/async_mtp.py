@@ -46,7 +46,14 @@ def prepare_async_mtp_kernel(
     active_token = token_row < num_reqs
     # Keep the Q2 expansion one-dimensional: CANN 8.5.1 cannot flatten a
     # [BLOCK, 2] UB temporary after its short rows receive alignment padding.
-    position = tl.gather(current, tl.arange(0, 2 * BLOCK) // 2, 0) + token % 2
+    # Triton-Ascend 3.2.0 gather rejects int32. Move the same 32-bit words
+    # through its FP32 path, then restore integers before any arithmetic.
+    # Numeric float conversion would lose position bits above 2**24.
+    position = tl.cast(
+        tl.gather(tl.cast(current, tl.float32, bitcast=True), tl.arange(0, 2 * BLOCK) // 2, 0),
+        tl.int32,
+        bitcast=True,
+    ) + token % 2
     # The installed scalar-gather lowering loads before applying a mask. Give
     # inactive lanes a valid address and use unmasked loads so the address
     # selection cannot be discarded as redundant with a load mask. Tables are
