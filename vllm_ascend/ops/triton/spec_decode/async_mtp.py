@@ -39,29 +39,38 @@ def prepare_async_mtp_kernel(
     length = tl.where(active, current + 2, 0)
     tl.store(seq_common + rows, length, rows < common_capacity)
     tl.store(seq_target + rows, length, rows < target_capacity)
-    for column in tl.static_range(2):
-        token = rows * 2 + column
-        position = current + column
-        block_id0 = tl.load(table0 + rows * stride0 + position // block0, active, other=0)
-        block_id1 = tl.load(table1 + rows * stride1 + position // block1, active, other=0)
-        tl.store(positions + token, tl.where(active, position, 0), token < token_capacity)
-        tl.store(slots0 + token, tl.where(active, block_id0 * block0 + position % block0, -1), token < token_capacity)
-        tl.store(slots1 + token, tl.where(active, block_id1 * block1 + position % block1, -1), token < token_capacity)
-        if MIXED_C8:
-            physical = (
-                block_id1 * 2
-                if table_c8 is None
-                else tl.load(
-                    table_c8 + rows * stride_c8 + position // block1,
-                    active,
-                    other=0,
-                )
+    # As in token packing below, contiguous stores avoid Ascend lowering paired
+    # masked stride-2 stores into unmasked reads/writes of the entire tile.
+    token = tl.program_id(0) * (2 * BLOCK) + tl.arange(0, 2 * BLOCK)
+    token_row = token // 2
+    active_token = token_row < num_reqs
+    position = tl.reshape(current[:, None] + tl.arange(0, 2)[None, :], (2 * BLOCK,))
+    # The installed scalar-gather lowering loads before applying a mask. Give
+    # inactive lanes a valid address and use unmasked loads so the address
+    # selection cannot be discarded as redundant with a load mask. Tables are
+    # allocated even for padding-only programs; active addresses are unchanged.
+    offset0 = tl.where(active_token, token_row * stride0 + position // block0, 0)
+    offset1 = tl.where(active_token, token_row * stride1 + position // block1, 0)
+    block_id0 = tl.load(table0 + offset0, True, other=0)
+    block_id1 = tl.load(table1 + offset1, True, other=0)
+    tl.store(positions + token, tl.where(active_token, position, 0), token < token_capacity)
+    tl.store(slots0 + token, tl.where(active_token, block_id0 * block0 + position % block0, -1), token < token_capacity)
+    tl.store(slots1 + token, tl.where(active_token, block_id1 * block1 + position % block1, -1), token < token_capacity)
+    if MIXED_C8:
+        physical = (
+            block_id1 * 2
+            if table_c8 is None
+            else tl.load(
+                table_c8 + tl.where(active_token, token_row * stride_c8 + position // block1, 0),
+                True,
+                other=0,
             )
-            tl.store(
-                slots_c8 + token,
-                tl.where(active, physical * block1 + position % block1, -1),
-                token < token_capacity,
-            )
+        )
+        tl.store(
+            slots_c8 + token,
+            tl.where(active_token, physical * block1 + position % block1, -1),
+            token < token_capacity,
+        )
 
 
 @triton.jit(do_not_specialize=["num_reqs"])

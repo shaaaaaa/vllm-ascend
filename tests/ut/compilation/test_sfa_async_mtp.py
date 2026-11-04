@@ -789,23 +789,26 @@ def test_actual_npu_metadata_kernel_matches_cpu_slots_and_padding(monkeypatch, m
         pytest.skip("Requires NPU")
     module = load_module(KERNEL, "async_mtp_metadata_npu", monkeypatch)
     held = []
-    index_block = 128 if mixed else 64
-    for n, capacity in ((1, 8), (3, 8), (4, 8), (16, 32)):
+    for n, capacity in ((1, 8), (3, 8), (4, 8), (14, 28), (16, 32), (32, 64), (33, 80)):
         common_capacity = capacity // 2
-        bases = torch.arange(n, dtype=torch.int32) * 127 + 4095
+        # Include the reported startup specialization: 14 rows, 28 output tokens,
+        # and the actual unequal block-table strides of a 1M context deployment.
+        strides = (8192, 8208) if n == 14 else (128, 128)
+        index_block = 128 if mixed or n == 14 else 64
+        bases = torch.zeros(n, dtype=torch.int32) if n == 14 else torch.arange(n, dtype=torch.int32) * 127 + 4095
         actual_base = bases.to("npu")
         seq_common = torch.full((common_capacity,), -77, dtype=torch.int32, device="npu")
         seq_target = torch.full((common_capacity + 1,), -77, dtype=torch.int32, device="npu")
         positions = torch.full((capacity,), -77, dtype=torch.int64, device="npu")
         tables = [
-            torch.arange(common_capacity * 128, dtype=torch.int32).view(common_capacity, 128) + shift
-            for shift in (100, 900)
+            torch.arange(common_capacity * stride, dtype=torch.int32).view(common_capacity, stride) + shift
+            for stride, shift in zip(strides, (100, 900))
         ]
         device_tables = [t.to("npu") for t in tables]
         physical_table = (tables[1] * 3 + 7).npu() if mixed else None
         slots = [torch.full((capacity,), -77, dtype=torch.int32, device="npu") for _ in range(3 if mixed else 2)]
         for step in range(4):
-            counts = (torch.arange(n) + step) % 2 + 1
+            counts = torch.ones(n, dtype=torch.int64) if n == 14 and step == 0 else (torch.arange(n) + step) % 2 + 1
             module.prepare_async_mtp_kernel[((common_capacity + 32) // 32,)](
                 actual_base,
                 counts.to("npu"),
@@ -818,13 +821,12 @@ def test_actual_npu_metadata_kernel_matches_cpu_slots_and_padding(monkeypatch, m
                 capacity,
                 common_capacity,
                 common_capacity + 1,
-                128,
-                128,
+                *strides,
                 128,
                 index_block,
                 BLOCK=32,
                 **(
-                    {"slots_c8": slots[2], "MIXED_C8": True, "table_c8": physical_table, "stride_c8": 128}
+                    {"slots_c8": slots[2], "MIXED_C8": True, "table_c8": physical_table, "stride_c8": strides[1]}
                     if mixed
                     else {}
                 ),

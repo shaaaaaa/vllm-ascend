@@ -63,6 +63,7 @@ class HostTL:
     range = staticmethod(range)
     arange = staticmethod(torch.arange)
     where = staticmethod(torch.where)
+    reshape = staticmethod(torch.reshape)
     full = staticmethod(lambda shape, value, dtype: torch.full(shape, value, dtype=dtype))
 
     def program_id(self, axis):
