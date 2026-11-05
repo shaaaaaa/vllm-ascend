@@ -18,13 +18,22 @@ def _map_indexer_metadata(
     TABLE_STRIDE: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-    b = tl.load(table + (i // TABLE_WIDTH) * TABLE_STRIDE + i % TABLE_WIDTH, i < TABLE_SIZE, other=-1)
-    physical = tl.load(mapping + b, (i < TABLE_SIZE) & (b >= 0), other=-1)
-    tl.store(out_table + i, physical, i < TABLE_SIZE)
-    s = tl.load(slots + i, i < SLOT_SIZE, other=-1)
-    physical = tl.load(mapping + s // 128, (i < SLOT_SIZE) & (s >= 0), other=-1)
-    tl.store(out_slots + i, tl.where(s >= 0, physical * 128 + s % 128, -1), i < SLOT_SIZE)
+    start = tl.program_id(0) * BLOCK
+    i = start + tl.arange(0, BLOCK)
+    if start < TABLE_SIZE:
+        if TABLE_WIDTH == TABLE_STRIDE:
+            b = tl.load(table + i, i < TABLE_SIZE, other=0)
+        else:
+            # Ascend can issue discrete reads before applying a load mask.
+            # Select a valid address before each gather, including tail lanes.
+            j = tl.where(i < TABLE_SIZE, i, 0)
+            b = tl.load(table + (j // TABLE_WIDTH) * TABLE_STRIDE + j % TABLE_WIDTH, True, other=0)
+        physical = tl.load(mapping + tl.where(b >= 0, b, 0), True, other=0)
+        tl.store(out_table + i, tl.where(b >= 0, physical, -1), i < TABLE_SIZE)
+    if start < SLOT_SIZE:
+        s = tl.load(slots + i, i < SLOT_SIZE, other=0)
+        physical = tl.load(mapping + tl.where(s >= 0, s, 0) // 128, True, other=0)
+        tl.store(out_slots + i, tl.where(s >= 0, physical * 128 + s % 128, -1), i < SLOT_SIZE)
 
 
 def map_indexer_metadata(

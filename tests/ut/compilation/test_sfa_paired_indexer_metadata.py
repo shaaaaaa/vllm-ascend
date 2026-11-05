@@ -55,6 +55,48 @@ def test_fused_metadata_kernel_matches_builder_and_keeps_padding(monkeypatch, wi
     assert tuple(t.data_ptr() for t in builder.update(table, slots)) == pointers
 
 
+@pytest.mark.parametrize("rows,width,extra_stride,slot_count", [(8, 8208, 0, 16), (8, 8208, 16, 32), (1, 17, 0, 300)])
+def test_mapper_discrete_loads_stay_in_bounds_in_partial_tile(rows, width, extra_stride, slot_count):
+    # The Ascend lowering reads discrete addresses BEFORE applying tl.load's mask.
+    # Ordinary contiguous DMA loads and stores still honor the active extent.
+    block = 256
+    stride = width + extra_stride
+    mapping = block_map(4)
+    backing = torch.arange(rows * stride, dtype=torch.int32).reshape(rows, stride) % len(mapping)
+    table = backing[:, :width]
+    table[-1, -1] = -1
+    slots = (torch.arange(slot_count, dtype=torch.int32) % len(mapping)) * 128 + 7
+    slots[-1] = -1
+    out_table = torch.full((table.numel() + 8,), -77, dtype=torch.int32)
+    out_slots = torch.full((slot_count + 8,), -77, dtype=torch.int64)
+    pointers = tuple(Pointer(t) for t in (table, slots, mapping, out_table, out_slots))
+    discrete = {mapping.data_ptr()}
+    if extra_stride:
+        discrete.add(table.data_ptr())
+    tl = HostTL()
+    load = tl.load
+
+    def lowered_load(ptr, mask, other):
+        if ptr.data.data_ptr() in discrete:
+            offsets = torch.as_tensor(ptr.offset)
+            assert torch.all((offsets >= 0) & (offsets < ptr.data.numel())), "discrete read outside allocation"
+        return load(ptr, mask, other)
+
+    tl.load = lowered_load
+    kernel = extract(
+        ROOT / "vllm_ascend/ops/triton/spec_decode/indexer_c8_metadata.py", "_map_indexer_metadata", {"tl": tl}
+    )
+    # Exercise the reported faulting tile (blk=256) first.
+    for pid in reversed(range((max(table.numel(), slots.numel()) + block - 1) // block)):
+        tl.pid = pid
+        kernel(*pointers, table.numel(), slots.numel(), width, stride, block)
+    expected_table = torch.where(table >= 0, mapping[table.long()], -1)
+    expected_slots = torch.where(slots >= 0, mapping[slots.clamp_min(0).long() // 128].long() * 128 + slots % 128, -1)
+    assert torch.equal(out_table[:-8].view_as(table), expected_table)
+    assert torch.equal(out_slots[:-8], expected_slots)
+    assert out_table[-8:].eq(-77).all() and out_slots[-8:].eq(-77).all()
+
+
 @pytest.mark.parametrize("accepted", [1, 2])
 def test_async_mtp_uses_physical_table_not_legacy_double_mapping(setup, accepted):
     r, s, shape, events, _ = setup
@@ -145,10 +187,13 @@ def test_paired_metadata_on_npu_matches_host_mapping():
     assert torch.equal(out_slots.cpu(), expected)
 
 
-@pytest.mark.parametrize("width", [1404, 8208])
+@pytest.mark.parametrize(
+    "rows,width,extra_stride,slot_count",
+    [(17, 1404, 0, 32), (17, 8208, 0, 32), (8, 8208, 0, 16), (8, 8208, 0, 32), (8, 8208, 16, 32)],
+)
 @pytest.mark.parametrize("slot_dtype", [torch.int32, torch.int64])
-def test_paired_metadata_long_table_npu_capture(width, slot_dtype):
-    """Isolate the reported mapper fault with 16 requests plus a padding row.
+def test_paired_metadata_long_table_npu_capture(rows, width, extra_stride, slot_count, slot_dtype):
+    """Cover a padding row and the 257-program startup launch.
 
     8208 is the 1Mi-token table rounded to 18-block bundles. Compile and
     allocate outside capture, then verify eager and captured replay separately.
@@ -160,17 +205,22 @@ def test_paired_metadata_long_table_npu_capture(width, slot_dtype):
     from vllm_ascend.ops.triton.spec_decode.indexer_c8_metadata import map_indexer_metadata
 
     mapping = block_map(4)
-    table = torch.arange(17 * width, dtype=torch.int32).view(17, width) % len(mapping)
+    table = torch.arange(rows * width, dtype=torch.int32).view(rows, width) % len(mapping)
     table[-1].zero_()
-    slots = torch.arange(32, dtype=slot_dtype) * 128 + 7
+    table[0, -1] = -1
+    slots = torch.arange(slot_count, dtype=slot_dtype) * 128 + 7
     slots[-1] = -1
-    expected_table = mapping[table.long()]
+    expected_table = torch.where(table >= 0, mapping[table.long()], -1)
     expected_slots = torch.where(
-        slots >= 0, mapping[(slots.clamp(min=0) // 128).long()].long() * 128 + slots % 128, -1,
+        slots >= 0,
+        mapping[(slots.clamp(min=0) // 128).long()].long() * 128 + slots % 128,
+        -1,
     )
-    device_table, device_slots, device_map = table.npu(), slots.npu(), mapping.npu()
-    out_table = torch.empty_like(device_table)
-    out_slots = torch.empty(32, dtype=torch.int64, device="npu")
+    device_table = torch.empty((rows, width + extra_stride), dtype=table.dtype, device="npu")[:, :width]
+    device_table.copy_(table)
+    device_slots, device_map = slots.npu(), mapping.npu()
+    out_table = torch.empty((rows, width), dtype=table.dtype, device="npu")
+    out_slots = torch.empty(slot_count, dtype=torch.int64, device="npu")
 
     def launch():
         map_indexer_metadata(device_table, device_slots, device_map, out_table, out_slots)
@@ -182,8 +232,10 @@ def test_paired_metadata_long_table_npu_capture(width, slot_dtype):
     graph = torch.npu.NPUGraph()
     with torch.npu.graph(graph):
         launch()
-    for _ in range(2):
+    for logical in (32, 64):
+        device_table.fill_(logical)
+        device_slots.fill_(logical * 128 + 9)
         graph.replay()
-    torch.npu.synchronize()
-    assert torch.equal(out_table.cpu(), expected_table), "captured table"
-    assert torch.equal(out_slots.cpu(), expected_slots), "captured slots"
+        torch.npu.synchronize()
+        assert out_table.cpu().eq(mapping[logical]).all(), "captured table"
+        assert out_slots.cpu().eq(int(mapping[logical]) * 128 + 9).all(), "captured slots"
