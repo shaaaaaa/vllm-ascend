@@ -476,8 +476,8 @@ public:
             // Sort32/MrgSort4 carry the payload as opaque uint32 bits.
             // Encoding the one-hot tag as an exact float avoids an integer
             // conversion after extracting the odd (payload) lanes.
-            AscendC::Duplicate(indices.ReinterpretCast<float>(),
-                static_cast<float>(1U << mtpRow), rowWidth_);
+            const float queryTag = mtpRow == 0 ? 1.0F : 2.0F;
+            AscendC::Duplicate(indices.ReinterpretCast<float>(), queryTag, rowWidth_);
 #else
             AscendC::CreateVecIndex(
                 indices,
