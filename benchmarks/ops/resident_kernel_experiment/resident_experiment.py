@@ -42,7 +42,9 @@ NAMES = (
 STAGES = {"full": 0, "union": 1, "finalize": 2, "update": 3, "union_sort": 4, "union_dedup": 5,
           "state_update": 6, "remap": 7}
 VARIANTS = {"baseline": 0, "optimized": 1, "compact_remap": 2, "sharded_finalize": 3, "combined": 4,
-            "vector_union": 5, "vector_intersection": 6, "vector_state_update": 7, "exact_combined": 8}
+            "vector_union": 5, "vector_intersection": 6, "vector_state_update": 7, "exact_combined": 8,
+            "query_membership": 9}
+MEMBERSHIP_VARIANTS = ("exact_combined", "query_membership")
 SOURCE_FILES = (
     ROOT / "csrc/kernels/resident_sorted_cache.cpp",
     ROOT / "csrc/kernels/resident_sorted_cache_coordinated.cpp",
@@ -139,7 +141,7 @@ def _put_state(case: Case, row: int, values: dict[int, int]) -> None:
 
 
 def make_case(requests=2, mtp=2, shards_per_row=4, hit_rate=1.0, scenario="normal", seed=17,
-              block_size=128, overlap=1024) -> Case:
+              block_size=128, overlap=1024, live_tokens=0) -> Case:
     """Build valid CPU state, including adversarial padding/generation cases."""
     if requests < 1 or mtp not in (1, 2) or shards_per_row not in (1, 2, 4):
         raise ValueError("invalid requests/query width/shards")
@@ -147,6 +149,10 @@ def make_case(requests=2, mtp=2, shards_per_row=4, hit_rate=1.0, scenario="norma
         raise ValueError("invalid hit rate/block size")
     if not 0 <= overlap <= 2048:
         raise ValueError("overlap must be between 0 and 2048")
+    if not 0 <= live_tokens <= 2048:
+        raise ValueError("live tokens per row must be between 0 and 2048")
+    if live_tokens and scenario in ("zero_boundary", "subset"):
+        raise ValueError("live_tokens cannot be combined with a scenario that overrides the boundary")
     shards, capacity, dummy = mtp * shards_per_row, mtp * 2048, requests + 2
     shape = (requests, shards, capacity)
     state_shape = (dummy + requests, shards, capacity)
@@ -188,16 +194,23 @@ def make_case(requests=2, mtp=2, shards_per_row=4, hit_rate=1.0, scenario="norma
     ]
     case = Case(tensors, dummy, block_size)
     rng = random.Random(seed)
+    history = 2048 - live_tokens
     for r in range(requests):
         base = 10000 * (r + 1)
+        boundary = base + 2 * 2048 * shards
+        current = set()
         for q in range(mtp):
-            shift = q * (2048 - overlap)
-            tokens = list(range(base + shift, base + shift + 2048))
+            shift = q * (history - min(overlap, history))
+            tokens = list(range(base + shift, base + shift + history))
             if scenario == "skewed":
-                tokens = [base + (shift + i) * shards for i in range(2048)]
+                tokens = [base + (shift + i) * shards for i in range(history)]
+            current.update(tokens)
+            if live_tokens:
+                case["boundary"][r * mtp + q] = boundary
+                tokens.extend(range(boundary, boundary + live_tokens))
             rng.shuffle(tokens)
             case["topk"][r * mtp + q, 0] = torch.tensor(tokens, dtype=i32)
-        current = sorted(set(case["topk"][r * mtp : (r + 1) * mtp].flatten().tolist()))
+        current = sorted(current)
         hit_count = int(len(current) * hit_rate)
         old = set(rng.sample(current, hit_count))
         if scenario == "one_shard_miss":
@@ -304,7 +317,47 @@ def reference(case: Case) -> tuple[Case, dict]:
     return result, stats
 
 
-def assert_result(actual: Case, expected: Case) -> None:
+def membership_reference(case: Case, position_reference: Case) -> Case:
+    """Build the bitmap and row output from the oracle's position-wise remap."""
+    result = position_reference.clone()
+    width = case["topk"].shape[-1]
+    for request in range(case.requests):
+        histories: list[set[int]] = []
+        for query in range(case.mtp):
+            row = request * case.mtp + query
+            history: set[int] = set()
+            histories.append(history)
+            if int(case["row_requests"][row]) != request:
+                continue
+            original = case["topk"][row, 0].tolist()
+            valid = original.index(-1) if -1 in original else width
+            prefix = original[:valid]
+            if any(t < 0 for t in prefix) or any(t != -1 for t in original[valid:]):
+                raise ValueError("query_membership requires a nonnegative prefix followed by -1 padding")
+            if len(set(prefix)) != valid:
+                raise ValueError("query_membership requires unique top-k tokens per row")
+            boundary = int(case["boundary"][row])
+            remapped = position_reference["topk"][row, 0, :valid].tolist()
+            historical_slots = []
+            live = []
+            for token, slot in zip(prefix, remapped, strict=True):
+                if token < boundary:
+                    history.add(token)
+                    historical_slots.append((token % case.shards, token, slot))
+                else:
+                    live.append(token)
+            assembled = [slot for _, _, slot in sorted(historical_slots)] + live
+            result["topk"][row, 0] = torch.tensor(assembled + [-1] * (width - valid), dtype=torch.int32)
+        for shard in range(case.shards):
+            count = int(result["shard_counts"][request, shard, 0])
+            tokens = result["packed"][request, shard, :count].tolist()
+            bits = [sum(1 << query for query, history in enumerate(histories) if token in history)
+                    for token in tokens]
+            result["mapping"][request, shard, :count] = torch.tensor(bits, dtype=torch.int16)
+    return result
+
+
+def assert_result(actual: Case, expected: Case, *, membership: bool = False) -> None:
     actual = actual.clone("cpu")
     assert torch.equal(actual["topk"], expected["topk"]), "remapped top-k differs"
     assert torch.equal(actual["state_counts"], expected["state_counts"]), "state counts/padding differ"
@@ -321,18 +374,24 @@ def assert_result(actual: Case, expected: Case) -> None:
             count = int(expected["shard_counts"][r, shard, 0])
             for name in ("packed", "prior_slots"):
                 assert torch.equal(actual[name][r, shard, :count], expected[name][r, shard, :count]), name
+            if membership:
+                assert torch.equal(
+                    actual["mapping"][r, shard, :count], expected["mapping"][r, shard, :count]
+                ), "query membership differs"
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("build_dir", type=Path)
     parser.add_argument("soc")
+    parser.add_argument("--profile", choices=("full", "membership"), default="full")
     args = parser.parse_args()
     (args.build_dir / "build-info.json").write_text(
         json.dumps(
             {
                 "source_sha256": source_digest(),
                 "soc": args.soc,
+                "profile": args.profile,
                 "torch": torch.__version__,
             },
             indent=2,

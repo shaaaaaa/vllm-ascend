@@ -18,7 +18,14 @@ void run(at::TensorList tensors, int64_t dummyBase, int64_t blockSize,
     const auto device = tensors[0].device();
     TORCH_CHECK(tensors[0].is_privateuseone(), "resident experiment requires NPU tensors");
     TORCH_CHECK(stage >= 0 && stage <= 7, "stage must be 0..7");
-    TORCH_CHECK(variant >= 0 && variant <= 8, "variant must be 0..8");
+    TORCH_CHECK(variant >= 0 && variant <= kQueryMembershipVariant, "variant must be 0..9");
+#ifdef RESIDENT_EXPERIMENT_MEMBERSHIP_ONLY
+    TORCH_CHECK(
+        (variant == kExactCombinedVariant || variant == kQueryMembershipVariant) && stage <= 3,
+        "membership build supports only exact_combined/query_membership and full/union/finalize/update");
+#endif
+    TORCH_CHECK(variant != kQueryMembershipVariant || stage <= 3,
+                "query_membership requires the matching union/update and cannot use legacy remap probes");
     TORCH_CHECK(stage < 4 || stage > 5 || variant == 0 || variant == 5,
                 "union prefix diagnostics support baseline/vector_union only");
     TORCH_CHECK(stage < 6 || variant == 0 || variant >= 6,

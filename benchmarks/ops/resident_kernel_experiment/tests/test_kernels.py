@@ -4,7 +4,14 @@ import itertools
 
 import pytest
 import torch
-from resident_experiment import VARIANTS, assert_result, make_case, reference
+from resident_experiment import VARIANTS, assert_result, make_case, membership_reference, reference
+
+
+def expected_for_variant(case, variant):
+    expected, stats = reference(case)
+    if variant == "query_membership":
+        expected = membership_reference(case, expected)
+    return expected, stats
 
 
 @pytest.mark.parametrize("mtp,shards", tuple(itertools.product((1, 2), (1, 2, 4))))
@@ -25,12 +32,14 @@ from resident_experiment import VARIANTS, assert_result, make_case, reference
     ),
 )
 def test_old_and_new_match_oracle(native, mtp, shards, scenario, variant):
+    if variant == "query_membership" and scenario == "invalid_indices":
+        pytest.skip("legacy fixture has negative holes and violates the membership input contract")
     initial = make_case(2, mtp, shards, 0.9, scenario)
-    expected, _ = reference(initial)
+    expected, _ = expected_for_variant(initial, variant)
     device_case = initial.clone(native)
     device_case.run(variant)
     torch.npu.synchronize()
-    assert_result(device_case, expected)
+    assert_result(device_case, expected, membership=variant == "query_membership")
 
 
 @pytest.mark.parametrize("mtp,shards", [(1, 1), (1, 4), (2, 1), (2, 4)])
@@ -43,7 +52,9 @@ def test_all_hit_full_set_uses_fast_paths(native, mtp, shards):
         case = initial.clone(native)
         case.run(optimized)
         torch.npu.synchronize()
-        assert_result(case, expected)
+        membership = optimized == "query_membership"
+        assert_result(case, membership_reference(initial, expected) if membership else expected,
+                      membership=membership)
 
 
 @pytest.mark.parametrize("optimized", tuple(VARIANTS))
@@ -73,14 +84,14 @@ def test_graph_replay_changes_generation_and_padding_without_host_fences(native,
             cpu["request_states"].fill_(-1)
         for name in ("topk", "request_generations", "row_requests", "request_states"):
             case[name].copy_(cpu[name].to(native))
-        expected, _ = reference(cpu)
+        expected, _ = expected_for_variant(cpu, optimized)
         graph.replay()
         pending.append((case.clone(), expected))
         # Keep the saved expected result immutable while preparing the next input.
         cpu = expected.clone()
     torch.npu.synchronize()
     for actual, expected in pending:
-        assert_result(actual, expected)
+        assert_result(actual, expected, membership=optimized == "query_membership")
 
 
 @pytest.mark.parametrize("requests,block_size", [(17, 16), (33, 128), (2, 127)])
@@ -91,7 +102,9 @@ def test_grid_stride_and_fragmented_physical_blocks(native, requests, block_size
         case = initial.clone(native)
         case.run(optimized)
         torch.npu.synchronize()
-        assert_result(case, expected)
+        membership = optimized == "query_membership"
+        assert_result(case, membership_reference(initial, expected) if membership else expected,
+                      membership=membership)
 
 
 @pytest.mark.parametrize("fault", ["dtype", "shape", "alias", "alignment", "block_size", "stage"])
@@ -121,8 +134,8 @@ def test_invalid_launch_rejected_before_kernel(native, fault):
 @pytest.mark.parametrize("shards", [1, 4])
 def test_extreme_mtp_overlap(native, variant, overlap, shards):
     initial = make_case(2, 2, shards, 0.9, overlap=overlap)
-    expected, _ = reference(initial)
+    expected, _ = expected_for_variant(initial, variant)
     case = initial.clone(native)
     case.run(variant)
     torch.npu.synchronize()
-    assert_result(case, expected)
+    assert_result(case, expected, membership=variant == "query_membership")

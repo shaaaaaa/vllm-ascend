@@ -9,8 +9,8 @@ LMCache imports. Do not use this benchmark to claim a serving TPOT/TTFT gain.
 
 ## What changes
 
-The union/intersection algorithm is identical in all variants. Select variants
-with `--variants`; `baseline` is always included for comparison.
+Select variants with `--variants` and a reference with `--compare-to`. The full
+build defaults to the original baseline comparison.
 
 | Variant | Finalize | Update/remap |
 |---|---|---|
@@ -23,6 +23,62 @@ with `--variants`; `baseline` is always included for comparison.
 | `vector_intersection` | Original | Original sorting/dedup; exact vector resident intersection only |
 | `vector_state_update` | Original | Exact vector state merge; original union/finalize/remap |
 | `exact_combined` | Original | Vector intersection and vector state merge; original finalize/remap |
+| `query_membership` | Original | Exact intersection/state merge; vector union tags and row assembly |
+
+## Fast query membership comparison
+
+On the 910B3 host, activate the deployment's Torch/Torch-NPU environment and
+source its CANN `set_env.sh`. Use the same SoC value as the serving build.
+
+```bash
+EXP=benchmarks/ops/resident_kernel_experiment
+BUILD="$EXP/build-membership"
+bash "$EXP/build.sh" ascend910b3 "$BUILD" membership
+python3 "$EXP/benchmark.py" --build-dir "$BUILD" --requests 1 8 16 \
+  --mtp 2 --hit-rates 0.9 1 --live-tokens 64 --json "$BUILD/results.json"
+```
+
+The `membership` profile builds five AIV entry points (two unions, two updates,
+and one shared finalize) and the small Torch-NPU binding. It does not build or
+install vLLM-Ascend, LMCache, or the model's attention kernels. Rerun the same
+build command for an incremental rebuild. The optional last argument `full`
+builds the older experimental variants as well.
+
+The fast profile defaults to `exact_combined` vs. `query_membership`. It checks
+both against the CPU oracle before timing. The default `--stage full --mode
+profile` reports individual Union/Finalize/Update device times, their sum, and
+the span across the three launches. Use `--stage update` for an isolated Update
+comparison; each variant's workspace is prepared by its own Union and Finalize.
+Try `--overlap 0`, `--overlap 2048`, and `--scenario skewed` to test disjoint
+rows, high overlap, and one heavily loaded shard. The hit fraction in the JSON
+is computed from the historical union; live entries are not cache requests.
+
+```bash
+python3 -m pytest --confcutdir="$EXP/tests" -o addopts= -q \
+  "$EXP/tests/test_query_membership.py" "$EXP/tests/test_kernels.py" \
+  --resident-build-dir "$BUILD" -k membership
+```
+
+The new path sorts the same shard-local candidates, carrying a one-hot query tag
+instead of the original column. Adjacent comparisons compact the union and the
+OR of each pair's tags. The active prefix of the existing int16 mapping
+allocation now holds one tag per unique token. Finalize does not read that
+allocation. Update retains one state task per shard and adds one task per query
+row within the same launch. Row tasks read finalized slots, compact aligned UB
+segments, and write a single fixed-width row. They do not read the state that
+sibling tasks are updating. No scan over original Top-K positions or extra
+kernel launch is needed.
+
+The experiment accepts the existing unique-row contract for one or two query
+rows: valid indices occupy a contiguous nonnegative prefix, followed by `-1`;
+invalid graph rows are zeroed separately. It returns shard-ordered historical
+slots followed by the original live indices. A stage-only caller must pair
+matching workspace producers and consumers; the new tags are not position
+ranks. Legacy remap/state probes are unavailable for the membership variant.
+
+These timings cover the planner, not H2D retrieval, sparse attention, or TPOT.
+Before serving integration, compare actual attention outputs and timings for
+the reordered indices, and check model output and MTP acceptance on NPU.
 
 `vector_union` changes only the union kernel. Sorting, the subsequent scalar
 resident intersection, allocation policy, finalize and update remain baseline.

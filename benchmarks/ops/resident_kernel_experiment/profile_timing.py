@@ -25,6 +25,12 @@ def kernel_names(variant):
         union = "intersection"
     if variant in ('vector_state_update', 'exact_combined'):
         update = 'state'
+    if variant == "query_membership":
+        return {
+            "union": "dsa_resident_sharded_union_kernel_membership",
+            "finalize": finalize,
+            "update": "dsa_resident_sorted_membership_update_kernel_membership",
+        }
     return {"union": f"dsa_resident_sharded_union_kernel_{union}",
             "finalize": finalize, "update": f"dsa_resident_sorted_update_kernel_{update}"}
 

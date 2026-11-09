@@ -1,8 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "launch.h"
 
-void resident_experiment_baseline_union(void*, const ResidentLaunch&);
 void resident_experiment_baseline_finalize(void*, const ResidentLaunch&);
+void resident_experiment_intersection_union(void*, const ResidentLaunch&);
+void resident_experiment_state_update(void*, const ResidentLaunch&);
+void resident_experiment_membership_union(void*, const ResidentLaunch&);
+void resident_experiment_membership_update(void*, const ResidentLaunch&);
+
+#ifndef RESIDENT_EXPERIMENT_MEMBERSHIP_ONLY
+void resident_experiment_baseline_union(void*, const ResidentLaunch&);
 void resident_experiment_baseline_update(void*, const ResidentLaunch&);
 void resident_experiment_optimized_union(void*, const ResidentLaunch&);
 void resident_experiment_optimized_finalize(void*, const ResidentLaunch&);
@@ -10,8 +16,6 @@ void resident_experiment_optimized_update(void*, const ResidentLaunch&);
 void resident_experiment_compact_update(void*, const ResidentLaunch&);
 void resident_experiment_sharded_finalize(void*, const ResidentLaunch&);
 void resident_experiment_vector_union(void*, const ResidentLaunch&);
-void resident_experiment_intersection_union(void*, const ResidentLaunch&);
-void resident_experiment_state_update(void*, const ResidentLaunch&);
 void resident_experiment_baseline_state_update(void*, const ResidentLaunch&);
 void resident_experiment_state_state_update(void*, const ResidentLaunch&);
 void resident_experiment_baseline_remap(void*, const ResidentLaunch&);
@@ -33,20 +37,34 @@ void resident_experiment_run_optimized(void* stream, const ResidentLaunch& args,
     if (stage == 0 || stage == 2) resident_experiment_optimized_finalize(stream, args);
     if (stage == 0 || stage == 3) resident_experiment_optimized_update(stream, args);
 }
+#endif
 
 void resident_experiment_run_variant(void* stream, const ResidentLaunch& args, int variant, int stage)
 {
+#ifndef RESIDENT_EXPERIMENT_MEMBERSHIP_ONLY
     if (stage == 6) {
-        if (variant == 7 || variant == 8) resident_experiment_state_state_update(stream, args);
+        if (variant == 7 || variant == kExactCombinedVariant) resident_experiment_state_state_update(stream, args);
         else resident_experiment_baseline_state_update(stream, args);
         return;
     }
     if (stage == 7) { resident_experiment_baseline_remap(stream, args); return; }
-    if (variant == 7 || variant == 8) {
+#endif
+    if (variant == kExactCombinedVariant || variant == kQueryMembershipVariant) {
+        const bool membership = variant == kQueryMembershipVariant;
         if (stage == 0 || stage == 1) {
-            if (variant == 8) resident_experiment_intersection_union(stream, args);
-            else resident_experiment_baseline_union(stream, args);
+            if (membership) resident_experiment_membership_union(stream, args);
+            else resident_experiment_intersection_union(stream, args);
         }
+        if (stage == 0 || stage == 2) resident_experiment_baseline_finalize(stream, args);
+        if (stage == 0 || stage == 3) {
+            if (membership) resident_experiment_membership_update(stream, args);
+            else resident_experiment_state_update(stream, args);
+        }
+        return;
+    }
+#ifndef RESIDENT_EXPERIMENT_MEMBERSHIP_ONLY
+    if (variant == 7) {
+        if (stage == 0 || stage == 1) resident_experiment_baseline_union(stream, args);
         if (stage == 0 || stage == 2) resident_experiment_baseline_finalize(stream, args);
         if (stage == 0 || stage == 3) resident_experiment_state_update(stream, args);
         return;
@@ -83,4 +101,5 @@ void resident_experiment_run_variant(void* stream, const ResidentLaunch& args, i
         if (variant == 2 || variant == 4) resident_experiment_compact_update(stream, args);
         else resident_experiment_baseline_update(stream, args);
     }
+#endif
 }

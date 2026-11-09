@@ -8,6 +8,9 @@ struct ResidentLaunch {
     uint32_t blockSize, blockTableWidth, cores;
 };
 
+constexpr int kExactCombinedVariant = 8;
+constexpr int kQueryMembershipVariant = 9;
+
 void resident_experiment_run(void* stream, const ResidentLaunch& args, int stage);
 void resident_experiment_run_optimized(
     void* stream, const ResidentLaunch& args, int stage);

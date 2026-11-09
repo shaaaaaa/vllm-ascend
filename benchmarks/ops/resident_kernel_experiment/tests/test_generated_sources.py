@@ -3,7 +3,7 @@ import re
 from pathlib import Path
 
 import pytest
-from generate_sources import HERE, KERNELS, SHARDED_SOURCE, SOURCE, generate
+from generate_sources import HERE, KERNELS, SHARDED_SOURCE, SOURCE, build_sources, generate
 
 
 @pytest.fixture
@@ -80,3 +80,22 @@ def test_vector_union_and_probes_have_distinct_entry_names():
             assert f"#define RESIDENT_EXPERIMENT_VECTOR_UNION {int(variant == 'vector')}" in content
             symbols += entries
     assert len(set(symbols)) == 6
+
+
+def test_membership_fast_build_only_emits_the_five_comparison_entries():
+    built = build_sources("membership")
+    assert set(built) == {
+        "intersection_union.cpp", "baseline_finalize.cpp", "state_update.cpp",
+        "membership_union.cpp", "membership_update.cpp",
+    }
+    full = build_sources("full")
+    for name, source in built.items():
+        assert source == full[name]
+        assert source.count('extern "C" __global__ __aicore__ void') == 1
+        assert f"#define RESIDENT_EXPERIMENT_QUERY_MEMBERSHIP {int(name.startswith('membership_'))}" in source
+
+    # A row task requires the original row's split boundary and validity,
+    # which are not passed to the position-wise Update entry point.
+    launch = built["membership_update.cpp"].split("void resident_experiment_membership_update", 1)[1]
+    assert list(map(int, re.findall(r"a\.tensors\[(\d+)\]", launch))) == [0, 1, 2, 3, 4, 5, 12, 6, 7, 8, 9, 10, 11]
+    assert "logicalBlocks = a.requests * (a.shards + a.mtp);" in launch

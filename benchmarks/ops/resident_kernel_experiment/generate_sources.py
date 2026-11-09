@@ -15,6 +15,11 @@ KERNELS = {
     "finalize": "dsa_resident_sorted_finalize_kernel",
     "update": "dsa_resident_sorted_update_kernel",
 }
+MEMBERSHIP_KERNELS = {
+    "union": KERNELS["union"],
+    "update": "dsa_resident_sorted_membership_update_kernel",
+}
+BUILD_PROFILES = ("full", "membership")
 POINTERS = dict(zip((
     "topkIndices", "splitBoundary", "rowReqIndices", "shardPacked", "shardMapping",
     "shardCounts", "requestStateIndices", "requestStateGenerations", "stateTokens",
@@ -35,7 +40,7 @@ SCALARS = {
 
 def generate(source: str, header: Path, *, variants=(("baseline", 0), ("optimized", 1)), kernels=None,
              compact=False, sharded=False, vector_union=False, union_stop=0, vector_intersection=False,
-             vector_state=False) -> dict[str, str]:
+             vector_state=False, query_membership=False) -> dict[str, str]:
     marker = 'extern "C" __global__ __aicore__ void\n'
     classes, separator, _ = source.partition(marker)
     if not separator:
@@ -63,6 +68,8 @@ def generate(source: str, header: Path, *, variants=(("baseline", 0), ("optimize
                 kernel_name += "_" + stage.removeprefix("union_")
             entry = match[0].replace(name, kernel_name, 1)
             logical_blocks = "a.requests" if stage == "finalize" and not sharded else "a.requests * a.shards"
+            if query_membership and stage == "update":
+                logical_blocks = "a.requests * (a.shards + a.mtp)"
             launch = (
                 f'\n}}  // namespace\n#include "{header.resolve().as_posix()}"\n\n'
                 f"void resident_experiment_{variant}_{stage}(void* stream, const ResidentLaunch& a)\n{{\n"
@@ -78,18 +85,30 @@ def generate(source: str, header: Path, *, variants=(("baseline", 0), ("optimize
                 f"#define RESIDENT_EXPERIMENT_VECTOR_INTERSECTION {int(vector_intersection)}\n"
                 f"#define RESIDENT_EXPERIMENT_VECTOR_STATE {int(vector_state)}\n"
                 f"#define RESIDENT_EXPERIMENT_UNION_STOP {union_stop}\n"
+                f"#define RESIDENT_EXPERIMENT_QUERY_MEMBERSHIP {int(query_membership)}\n"
                 + classes + entry + launch
             )
     return output
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("output", type=Path)
-    args = parser.parse_args()
-    args.output.mkdir(parents=True, exist_ok=True)
+def build_sources(profile: str) -> dict[str, str]:
+    if profile not in BUILD_PROFILES:
+        raise ValueError(f"Unsupported resident build profile: {profile}")
     source = SOURCE.read_text(encoding="utf-8")
-    output = generate(source, HERE / "launch.h")
+    header = HERE / "launch.h"
+    output = generate(source, header, variants=(("baseline", 0),),
+                      kernels={"finalize": KERNELS["finalize"]})
+    output.update(generate(source, header, variants=(("intersection", 0),),
+                           kernels={"union": KERNELS["union"]}, vector_intersection=True))
+    output.update(generate(source, header, variants=(("state", 0),),
+                           kernels={"update": KERNELS["update"]}, vector_state=True))
+    output.update(generate(source, header, variants=(("membership", 0),),
+                           kernels=MEMBERSHIP_KERNELS, vector_intersection=True,
+                           vector_state=True, query_membership=True))
+    if profile == "membership":
+        return output
+
+    output.update(generate(source, header))
     output.update(generate(source, HERE / "launch.h", variants=(("compact", 0),),
                            kernels={"update": KERNELS["update"]}, compact=True))
     output.update(generate(SHARDED_SOURCE.read_text(encoding="utf-8"), HERE / "launch.h",
@@ -97,10 +116,6 @@ def main() -> None:
                            kernels={"finalize": "dsa_resident_sharded_finalize_worker_kernel"}))
     output.update(generate(source, HERE / "launch.h", variants=(("vector", 0),),
                            kernels={"union": KERNELS["union"]}, vector_union=True))
-    output.update(generate(source, HERE / "launch.h", variants=(("intersection", 0),),
-                           kernels={"union": KERNELS["union"]}, vector_intersection=True))
-    output.update(generate(source, HERE / "launch.h", variants=(("state", 0),),
-                           kernels={"update": KERNELS["update"]}, vector_state=True))
     for variant in ('baseline', 'state'):
         output.update(generate(source, HERE / 'launch.h', variants=((variant, 0),),
                                kernels={'state_update': 'dsa_resident_sorted_state_update_kernel'},
@@ -112,6 +127,16 @@ def main() -> None:
             output.update(generate(source, HERE / "launch.h", variants=((variant, 0),),
                                    kernels={f"union_{phase}": KERNELS["union"]},
                                    vector_union=variant == "vector", union_stop=stop))
+    return output
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("output", type=Path)
+    parser.add_argument("--profile", choices=BUILD_PROFILES, default="full")
+    args = parser.parse_args()
+    args.output.mkdir(parents=True, exist_ok=True)
+    output = build_sources(args.profile)
     for name, content in output.items():
         path = args.output / name
         if not path.exists() or path.read_text(encoding="utf-8") != content:
