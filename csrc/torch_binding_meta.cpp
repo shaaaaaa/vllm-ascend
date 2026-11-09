@@ -1018,7 +1018,13 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
         "npu_dsa_resident_sharded_union_",
         &vllm_ascend::meta::npu_dsa_resident_sharded_union_meta);
     ops.impl(
+        "npu_dsa_resident_membership_union_",
+        &vllm_ascend::meta::npu_dsa_resident_sharded_union_meta);
+    ops.impl(
         "npu_dsa_resident_sorted_plan_",
+        &vllm_ascend::meta::npu_dsa_resident_sorted_plan_meta);
+    ops.impl(
+        "npu_dsa_resident_membership_plan_",
         &vllm_ascend::meta::npu_dsa_resident_sorted_plan_meta);
     ops.impl(
         "npu_dsa_resident_sorted_plan_no_remap_",

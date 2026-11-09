@@ -1765,7 +1765,8 @@ def test_sorted_resident_keeps_multiple_request_states_isolated(mtp):
 
 
 @pytest.mark.parametrize("mtp", [1, 2])
-def test_sorted_resident_zeroes_staged_graph_padding_rows(mtp):
+@pytest.mark.parametrize("query_membership", [False, True])
+def test_sorted_resident_zeroes_staged_graph_padding_rows(mtp, query_membership):
     requests = 2
     capacity = mtp * INDEX_TOPK
     source = torch.cat((_source(mtp, 0), _source(mtp, 5000)), dim=0)
@@ -1804,6 +1805,7 @@ def test_sorted_resident_zeroes_staged_graph_padding_rows(mtp):
         state,
         workspace,
         mtp=mtp,
+        query_membership=query_membership,
     )
     prepare_sorted_resident_cache_fused_(
         values,
@@ -1813,6 +1815,7 @@ def test_sorted_resident_zeroes_staged_graph_padding_rows(mtp):
         state,
         workspace,
         block_size=128,
+        query_membership=query_membership,
     )
     torch.npu.synchronize()
 
@@ -1872,7 +1875,8 @@ def test_sorted_resident_negative_state_uses_request_private_dummy_row(mtp):
 
 
 @pytest.mark.parametrize("mtp", [1, 2])
-def test_sorted_resident_full_path_supports_graph_replay(mtp):
+@pytest.mark.parametrize("query_membership", [False, True])
+def test_sorted_resident_full_path_supports_graph_replay(mtp, query_membership):
     requests = 1
     capacity = mtp * 2048
     source = _source(mtp, 0)
@@ -1923,6 +1927,7 @@ def test_sorted_resident_full_path_supports_graph_replay(mtp):
             state,
             workspace,
             mtp=mtp,
+            query_membership=query_membership,
         )
         prepare_sorted_resident_cache_fused_(
             values,
@@ -1932,6 +1937,7 @@ def test_sorted_resident_full_path_supports_graph_replay(mtp):
             state,
             workspace,
             block_size=128,
+            query_membership=query_membership,
         )
 
     values.copy_(source.npu())
@@ -1941,7 +1947,19 @@ def test_sorted_resident_full_path_supports_graph_replay(mtp):
     torch.npu.synchronize()
     expected_count = 1948 if mtp == 1 else 2972
     assert int(workspace.miss_counts[0, 0].cpu()) == expected_count
-    _assert_union_outputs(source, boundaries.cpu(), workspace, mtp=mtp)
+    if query_membership:
+        row_boundaries = boundaries.cpu().tolist()
+        assert workspace.shard_counts[0, 0, 5:5 + 1 + mtp].cpu().tolist() == [(1 << mtp) - 1, *row_boundaries]
+        row_history = [set(row.flatten().tolist()) for row in source]
+        for shard, tokens in enumerate(expected_shards):
+            assert int(workspace.shard_counts[0, shard, 0].cpu()) == len(tokens)
+            assert workspace.shard_packed[0, shard, :len(tokens)].cpu().tolist() == tokens
+            assert workspace.shard_mapping[0, shard, :len(tokens)].cpu().tolist() == [
+                sum(1 << q for q in range(mtp) if token < row_boundaries[q] and token in row_history[q])
+                for token in tokens
+            ]
+    else:
+        _assert_union_outputs(source, boundaries.cpu(), workspace, mtp=mtp)
     assert workspace.miss_tokens[0, :expected_count].cpu().tolist() == (
         expected_misses
     )
@@ -1964,6 +1982,59 @@ def test_sorted_resident_full_path_supports_graph_replay(mtp):
     torch.npu.synchronize()
     assert int(workspace.miss_counts[0, 0].cpu()) == expected_count
     assert _state_dict(state, 0, shard_count) == expected_state
+
+
+@pytest.mark.parametrize("mtp", [1, 2])
+def test_resident_query_membership_matches_sparse_attention(mtp):
+    """Run the actual serving planner and sparse attention with identical KV."""
+    device = torch.device("npu")
+    block_size = 128
+    capacity = mtp * INDEX_TOPK
+    source = _source(mtp, 0).to(device)
+    # Different boundaries for the two rows also exercise per-row live tails.
+    boundaries = torch.tensor([1948] if mtp == 1 else [2700, 2900], dtype=torch.int32, device=device)
+    rows = torch.zeros(mtp, dtype=torch.int32, device=device)
+    indices = torch.zeros(1, dtype=torch.int32, device=device)
+    generations = torch.ones(1, dtype=torch.int64, device=device)
+    table = torch.arange(capacity // block_size + 1, dtype=torch.int32, device=device).view(1, -1)
+    results = []
+    for membership in (False, True):
+        topk = source.clone()
+        state = allocate_sorted_resident_state(1, 1, mtp, device=device)
+        workspace = allocate_sorted_resident_workspace(1, mtp, device=device)
+        prepare_resident_sharded_union_(
+            topk, boundaries, rows, indices, generations, state, workspace,
+            mtp=mtp, query_membership=membership,
+        )
+        misses, counts, slots = prepare_sorted_resident_cache_fused_(
+            topk, table, indices, generations, state, workspace, block_size=block_size, query_membership=membership,
+        )
+        torch.npu.synchronize()
+        count = int(counts[0].cpu())
+        results.append((topk, misses[0, :count].cpu().tolist(), slots[0, :count].cpu().tolist()))
+    exact, bitmap = results
+    assert exact[1] == bitmap[1] and exact[2] == bitmap[2]
+    assert not torch.equal(exact[0].cpu(), bitmap[0].cpu())
+    assert torch.equal(exact[0].cpu().sort().values, bitmap[0].cpu().sort().values)
+
+    # Each plan accesses the same scratch addresses. A common synthetic KV
+    # payload is sufficient to isolate the effect of the index order on SFA.
+    dtype = torch.bfloat16
+    query = torch.randn((mtp, 32, 512), device=device, dtype=dtype)
+    query_rope = torch.randn((mtp, 32, 64), device=device, dtype=dtype)
+    kv = torch.randn((table.numel(), block_size, 1, 512), device=device, dtype=dtype)
+    key_rope = torch.randn((table.numel(), block_size, 1, 64), device=device, dtype=dtype)
+    q_len = torch.tensor([mtp], dtype=torch.int32, device=device)
+    kv_len = torch.tensor([table.numel() * block_size], dtype=torch.int32, device=device)
+    outputs = [
+        torch.ops._C_ascend.npu_sparse_flash_attention(
+            query=query, key=kv, value=kv, sparse_indices=result[0], scale_value=576**-0.5,
+            sparse_block_size=1, block_table=table, actual_seq_lengths_query=q_len, actual_seq_lengths_kv=kv_len,
+            query_rope=query_rope, key_rope=key_rope, layout_query="TND", layout_kv="PA_BSND", sparse_mode=3,
+        )
+        for result in results
+    ]
+    torch.testing.assert_close(outputs[0].cpu(), outputs[1].cpu(), atol=2e-3, rtol=1e-2)
 
 
 @pytest.mark.parametrize(

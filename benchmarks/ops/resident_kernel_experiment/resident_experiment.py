@@ -323,6 +323,8 @@ def membership_reference(case: Case, position_reference: Case) -> Case:
     width = case["topk"].shape[-1]
     for request in range(case.requests):
         histories: list[set[int]] = []
+        valid_rows = 0
+        boundaries = [0, 0]
         for query in range(case.mtp):
             row = request * case.mtp + query
             history: set[int] = set()
@@ -337,6 +339,8 @@ def membership_reference(case: Case, position_reference: Case) -> Case:
             if len(set(prefix)) != valid:
                 raise ValueError("query_membership requires unique top-k tokens per row")
             boundary = int(case["boundary"][row])
+            valid_rows |= 1 << query
+            boundaries[query] = boundary
             remapped = position_reference["topk"][row, 0, :valid].tolist()
             historical_slots = []
             live = []
@@ -348,6 +352,7 @@ def membership_reference(case: Case, position_reference: Case) -> Case:
                     live.append(token)
             assembled = [slot for _, _, slot in sorted(historical_slots)] + live
             result["topk"][row, 0] = torch.tensor(assembled + [-1] * (width - valid), dtype=torch.int32)
+        result["shard_counts"][request, 0, 5:8] = torch.tensor([valid_rows, *boundaries], dtype=torch.int32)
         for shard in range(case.shards):
             count = int(result["shard_counts"][request, shard, 0])
             tokens = result["packed"][request, shard, :count].tolist()
@@ -363,6 +368,10 @@ def assert_result(actual: Case, expected: Case, *, membership: bool = False) -> 
     assert torch.equal(actual["state_counts"], expected["state_counts"]), "state counts/padding differ"
     assert torch.equal(actual["state_generations"], expected["state_generations"]), "generation differs"
     assert torch.equal(actual["shard_counts"][:, :, :5], expected["shard_counts"][:, :, :5]), "shard accounting differs"
+    if membership:
+        assert torch.equal(
+            actual["shard_counts"][:, 0, 5:8], expected["shard_counts"][:, 0, 5:8]
+        ), "membership row metadata differs"
     for row in range(actual["state_tokens"].shape[0]):
         assert _state(actual, row) == _state(expected, row), f"resident row {row} differs"
     for r in range(actual.requests):

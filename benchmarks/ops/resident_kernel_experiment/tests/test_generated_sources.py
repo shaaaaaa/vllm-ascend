@@ -94,8 +94,8 @@ def test_membership_fast_build_only_emits_the_five_comparison_entries():
         assert source.count('extern "C" __global__ __aicore__ void') == 1
         assert f"#define RESIDENT_EXPERIMENT_QUERY_MEMBERSHIP {int(name.startswith('membership_'))}" in source
 
-    # A row task requires the original row's split boundary and validity,
-    # which are not passed to the position-wise Update entry point.
+    # The bitmap update consumes row metadata published in shard zero's count
+    # record, so it shares the position-wise launch's pointer layout.
     launch = built["membership_update.cpp"].split("void resident_experiment_membership_update", 1)[1]
-    assert list(map(int, re.findall(r"a\.tensors\[(\d+)\]", launch))) == [0, 1, 2, 3, 4, 5, 12, 6, 7, 8, 9, 10, 11]
+    assert list(map(int, re.findall(r"a\.tensors\[(\d+)\]", launch))) == [0, 3, 4, 5, 12, 6, 7, 8, 9, 10, 11]
     assert "logicalBlocks = a.requests * (a.shards + a.mtp);" in launch

@@ -1148,6 +1148,7 @@ class TestLMCacheSparseFrontier(TestBase):
 def test_sorted_resident_helper_uses_active_fixed_address_prefix(mtp):
     impl = AscendSFAImpl.__new__(AscendSFAImpl)
     impl.block_size = 128
+    impl._resident_query_membership = False
     impl._sorted_resident_state = MagicMock()
     impl._sorted_resident_workspace = (
         sfa_v1.allocate_sorted_resident_workspace(

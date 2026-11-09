@@ -2176,8 +2176,9 @@ class AscendSFAImpl(MLAAttentionImpl):
             int, SortedResidentWorkspace
         ] = {}
         self.dsa_resident_shards_per_row: int | None = None
+        self._resident_query_membership = False
         if self.dsa_resident_cache:
-            configure_resident_kernels()
+            self._resident_query_membership = configure_resident_kernels()
         self.shared_resident_plan: SharedResidentPlan | None = None
         layer_index = (
             parse_layer_idx(self.layer_name)
@@ -3553,6 +3554,7 @@ class AscendSFAImpl(MLAAttentionImpl):
             state,
             workspace,
             mtp=mtp,
+            query_membership=self._resident_query_membership,
         )
         miss_tokens, miss_counts, target_slots = (
             prepare_sorted_resident_cache_fused_(
@@ -3563,6 +3565,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                 state,
                 workspace,
                 block_size=self.block_size,
+                query_membership=self._resident_query_membership,
             )
         )
         return (

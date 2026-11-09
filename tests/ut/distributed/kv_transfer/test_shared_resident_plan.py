@@ -85,6 +85,7 @@ def impl(api, index, raw, *, shared=False, mtp=1):
         shared_resident_candidate=True,
         shared_resident_plan=None,
         dsa_resident_cache=True,
+        _resident_query_membership=False,
         decode_threshold=mtp,
         index_topk=2048,
         block_size=128,
@@ -182,8 +183,10 @@ def plan(layer, raw, *, requests=1, writes=None, reads=None, packed=True):
 
 
 @pytest.mark.parametrize("mtp", [1, 2])
-def test_one_plan_raw_publication_and_capacity_views(api, mtp):
+@pytest.mark.parametrize("query_membership", [False, True])
+def test_one_plan_raw_publication_and_capacity_views(api, mtp, query_membership):
     _, (producer, consumer), group, _ = grouped(api, mtp)
+    producer._resident_query_membership = query_membership
     state = group.state
     for requests in (1, 2, 1):
         raw = torch.full((requests * mtp, 1, 2048), requests, dtype=torch.int32)
@@ -200,6 +203,8 @@ def test_one_plan_raw_publication_and_capacity_views(api, mtp):
         assert group.state is state
     assert api[1]["prepare_resident_sharded_union_"].call_count == 3
     assert api[1]["prepare_sorted_resident_cache_fused_"].call_count == 3
+    for stage in ("prepare_resident_sharded_union_", "prepare_sorted_resident_cache_fused_"):
+        assert all(call.kwargs["query_membership"] is query_membership for call in api[1][stage].call_args_list)
     api[1]["prepare_sparse_indices"].assert_not_called()
 
 
@@ -465,6 +470,7 @@ def test_preemption_with_recycled_block_ids_changes_shared_generation(enabled):
 def test_shared_operator_schema_preserves_old_api_and_declares_writes():
     ns = dict(
         torch=torch,
+        enable_dsa_cp_decoder=lambda: False,
         StagedSFABridge=tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
     )
     methods(
@@ -490,10 +496,13 @@ def test_shared_operator_schema_preserves_old_api_and_declares_writes():
 
 
 @pytest.mark.parametrize("mtp", [1, 2])
-def test_compiled_producer_consumer_observe_explicit_mutation(api, mtp):
+@pytest.mark.parametrize("query_membership", [False, True])
+def test_compiled_producer_consumer_observe_explicit_mutation(api, mtp, query_membership):
     _, (producer, consumer), group, _ = grouped(api, mtp)
+    producer._resident_query_membership = query_membership
     ns = dict(
         torch=torch,
+        enable_dsa_cp_decoder=lambda: False,
         StagedSFABridge=tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
     )
     methods(
@@ -518,7 +527,7 @@ def test_compiled_producer_consumer_observe_explicit_mutation(api, mtp):
     ns["_mla_runtime_state"] = lambda name: (producer if name == "producer" else consumer, name, (), None)
     # Dynamo retains operator handles after the local library is destroyed.
     # Keep parameterized cases in separate namespaces, as separate workers are.
-    namespace = f"shared_resident_compile_test_{mtp}"
+    namespace = f"shared_resident_compile_test_{mtp}_{int(query_membership)}"
     lib = torch.library.Library(namespace, "DEF")
     lib.define(
         "pre" + torch.library.infer_schema(ns["sfa_forward_pre_shared"], mutates_args=["output", "resident_writes"])

@@ -63,8 +63,9 @@ The new path sorts the same shard-local candidates, carrying a one-hot query tag
 instead of the original column. Adjacent comparisons compact the union and the
 OR of each pair's tags. The active prefix of the existing int16 mapping
 allocation now holds one tag per unique token. Finalize does not read that
-allocation. Update retains one state task per shard and adds one task per query
-row within the same launch. Row tasks read finalized slots, compact aligned UB
+allocation. Union also publishes row validity and split boundaries in unused
+fields of shard zero's count record. Update retains one state task per shard
+and adds one task per query row in the same launch. Row tasks read finalized slots, compact aligned UB
 segments, and write a single fixed-width row. They do not read the state that
 sibling tasks are updating. No scan over original Top-K positions or extra
 kernel launch is needed.
@@ -411,28 +412,40 @@ The new variants target partial hits but can lose performance from extra index
 arithmetic or duplicated reads. No speedup is claimed until these measurements
 pass correctness and run on the target hardware.
 
-## Serving selection (this feature branch)
+## Serving selection
 
-The normal serving extension now compiles baseline and `exact_combined` together.
-`VLLM_ASCEND_DSA_RESIDENT_EXACT_KERNELS=1` (the default) selects exact vector
-intersection and vector state update; `0` selects the original kernels.
-Set it before starting **every worker**, and restart to change it. Selection is
-cached before graph capture and cannot change within a worker. Graph replay has
-no environment lookup or device-side selection branch. Eager enqueue reads the
-frozen launcher table; retrieval, operator schemas, allocation and remap semantics
-are unchanged. Unsupported vector geometries retain their existing scalar fallback.
+The serving extension builds the baseline, exact, and query membership planners.
+`VLLM_ASCEND_DSA_RESIDENT_QUERY_MEMBERSHIP=0` (default) keeps the existing
+`VLLM_ASCEND_DSA_RESIDENT_EXACT_KERNELS` selection: `1` for exact, `0` for baseline.
+Set `VLLM_ASCEND_DSA_RESIDENT_QUERY_MEMBERSHIP=1` on the decoder workers to use
+the bitmap planner on the existing fused sorted-resident decode route. The
+bitmap variant uses exact resident matching and state update regardless of
+the legacy selector. Split remap and diagnostic operators still use position
+ranks. Nonresident execution retains its existing path.
+
+The worker selects the matching Union and Finalize/Update operators before
+capture. Shared planner consumers still reuse the producer's plan. There is no
+extra tensor, kernel launch, environment read on replay, or change to LMCache
+miss transfers. Output indices for a valid row may be reordered.
 
 Rebuild the **serving** extension once (the standalone experiment build is insufficient):
 
 ```bash
 SOC_VERSION=ascend910b3 COMPILE_CUSTOM_KERNELS=1 python -m pip install -e . --no-build-isolation --no-deps
-export VLLM_ASCEND_DSA_RESIDENT_EXACT_KERNELS=1  # or 0 for the baseline A/B run
-# Launch the existing deployment, propagating this variable to all workers.
+export VLLM_ASCEND_DSA_RESIDENT_QUERY_MEMBERSHIP=1
+# Launch the existing decoder deployment with the flag on all workers.
 ```
 
-Use your deployment's actual SOC_VERSION. No LMCache YAML or graph-size change
-is needed. Missing rebuilt operators fail at initialization, before capture.
-The feature branch descends from production `sparse` commit `58cbdbbc` and now
-includes production through `6fc30da6` (GLM compatibility, recovery/capacity fixes
-and staged event handoff). Serving qualification must include both settings,
-graph replay and preemption/reuse correctness on NPU.
+Use your deployment's actual `SOC_VERSION`. Restart the decoder workers and
+recapture their graphs after changing the flag. Missing bitmap operators fail
+at initialization when enabled. No LMCache YAML or graph-size change is needed.
+
+For a device check of the rebuilt extension:
+
+```bash
+python -m pytest -q tests/e2e/nightly/single_node/ops/singlecard_ops/test_resident_sorted_cache.py \
+  -k 'query_membership or full_path_supports_graph_replay or zeroes_staged_graph_padding'
+```
+
+For a serving A/B, keep the exact selector at `1` and toggle only membership.
+The standalone planner speedup does not measure attention, TPOT, or throughput.

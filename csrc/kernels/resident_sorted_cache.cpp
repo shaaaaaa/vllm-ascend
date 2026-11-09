@@ -60,6 +60,10 @@ constexpr uint32_t kShardOldCount = 3;
 constexpr uint32_t kShardSelectedEvictCount = 4;
 
 #if RESIDENT_EXPERIMENT_QUERY_MEMBERSHIP
+// Only shard zero publishes the per-request row metadata. Finalize updates
+// the eviction field in this cacheline and preserves these three fields.
+constexpr uint32_t kMembershipValidRows = 5;
+constexpr uint32_t kMembershipBoundary = 6;
 // Compare works on whole 256-byte vector repeats. Align assembly segments to
 // one uint32 mask word so a row owner can publish their masks independently.
 constexpr uint32_t kMembershipCompareLanes = 64;
@@ -371,6 +375,10 @@ public:
         gatherParams.src1RepeatStride = 8;
         uint32_t compactEnd = 0;
         uint32_t selectedElements = 0;
+#if RESIDENT_EXPERIMENT_QUERY_MEMBERSHIP
+        uint32_t validRows = 0;
+        int32_t boundaries[2] = {};
+#endif
         bool paddingZeroReady = false;
         bool paddingWritePending = false;
         for (uint32_t mtpRow = 0; mtpRow < rowsPerRequest_; ++mtpRow) {
@@ -413,6 +421,12 @@ public:
                 + static_cast<uint64_t>(mtpRow) * rowWidth_;
             const int32_t boundary =
                 ReadGlobalScalarFresh(splitBoundary_, row);
+#if RESIDENT_EXPERIMENT_QUERY_MEMBERSHIP
+            if (shard == 0) {
+                validRows |= 1U << mtpRow;
+                boundaries[mtpRow] = boundary;
+            }
+#endif
             AscendC::DataCopy(
                 input, topkIndices_[inputOffset], rowWidth_);
             Sync<AscendC::HardEvent::MTE2_V>();
@@ -756,6 +770,13 @@ public:
         shardCounts_.SetValue(
             countOffset + kShardOldCount,
             static_cast<int32_t>(oldCount));
+#if RESIDENT_EXPERIMENT_QUERY_MEMBERSHIP
+        if (shard == 0) {
+            shardCounts_.SetValue(countOffset + kMembershipValidRows, static_cast<int32_t>(validRows));
+            shardCounts_.SetValue(countOffset + kMembershipBoundary, boundaries[0]);
+            shardCounts_.SetValue(countOffset + kMembershipBoundary + 1, boundaries[1]);
+        }
+#endif
         // SetValue updates the per-core DCache first. Publish the completed
         // cacheline so finalize blocks on other cores observe this launch.
         PublishGlobalCacheLine(shardCounts_, countOffset);
@@ -2299,13 +2320,10 @@ public:
     }
 
 #if RESIDENT_EXPERIMENT_QUERY_MEMBERSHIP
-    __aicore__ inline void ProcessMembership(
-        __gm__ int32_t* splitBoundary, __gm__ int32_t* rowReqIndices)
+    __aicore__ inline void ProcessMembership()
     {
         const uint32_t stateBlocks = requestCount_ * shardCount_;
         const uint32_t rowBlocks = requestCount_ * rowsPerRequest_;
-        splitBoundary_.SetGlobalBuffer(splitBoundary, rowBlocks);
-        rowReqIndices_.SetGlobalBuffer(rowReqIndices, rowBlocks);
         const uint32_t physicalBlocks = AscendC::GetBlockNum();
         for (uint32_t block = AscendC::GetBlockIdx();
              block < stateBlocks + rowBlocks; block += physicalBlocks) {
@@ -2334,16 +2352,18 @@ public:
     __aicore__ inline void AssembleQueryRow(uint32_t row)
     {
         const uint32_t request = row / rowsPerRequest_;
-        if (ReadGlobalScalarFresh(rowReqIndices_, row) != static_cast<int32_t>(request)) {
+        const uint32_t query = row % rowsPerRequest_;
+        const uint64_t countBase = static_cast<uint64_t>(request) * shardCountRequestStride_;
+        const uint32_t firstCount = static_cast<uint32_t>(ReadGlobalScalarFresh(shardCounts_, countBase));
+        const uint32_t validRows = static_cast<uint32_t>(shardCounts_.GetValue(countBase + kMembershipValidRows));
+        if ((validRows & (1U << query)) == 0) {
             // The union's shard zero already cleared the padding row.
             return;
         }
-        const uint32_t query = row % rowsPerRequest_;
         const uint64_t rowOffset = static_cast<uint64_t>(row) * rowWidth_;
         const uint64_t requestShardBase =
             static_cast<uint64_t>(request) * shardCount_ * capacity_;
-        const uint64_t countBase = static_cast<uint64_t>(request) * shardCountRequestStride_;
-        const int32_t boundary = ReadGlobalScalarFresh(splitBoundary_, row);
+        const int32_t boundary = shardCounts_.GetValue(countBase + kMembershipBoundary + query);
 
         // These buffers are private to the AIV. This task does not read any
         // resident state written by sibling tasks in the same launch.
@@ -2365,7 +2385,7 @@ public:
             AscendC::PipeBarrier<PIPE_V>();
         }
         for (uint32_t shard = 0; shard < shardCount_; ++shard) {
-            const uint32_t count = static_cast<uint32_t>(
+            const uint32_t count = shard == 0 ? firstCount : static_cast<uint32_t>(
                 ReadGlobalScalarFresh(shardCounts_, countBase + shard * shardCountStride_));
             if (count == 0) {
                 continue;
@@ -3235,10 +3255,6 @@ private:
     }
 
     AscendC::GlobalTensor<int32_t> topkIndices_;
-#if RESIDENT_EXPERIMENT_QUERY_MEMBERSHIP
-    AscendC::GlobalTensor<int32_t> splitBoundary_;
-    AscendC::GlobalTensor<int32_t> rowReqIndices_;
-#endif
     AscendC::GlobalTensor<int32_t> shardPacked_;
     AscendC::GlobalTensor<int16_t> shardMapping_;
     AscendC::GlobalTensor<int32_t> shardCounts_;
@@ -3570,6 +3586,7 @@ dsa_resident_sharded_union_kernel(
     op.Process();
 }
 
+#if !RESIDENT_EXPERIMENT_QUERY_MEMBERSHIP
 extern "C" __global__ __aicore__ void
 dsa_resident_sorted_read_probe_kernel(
     __gm__ int32_t* shardCounts,
@@ -3590,6 +3607,7 @@ dsa_resident_sorted_read_probe_kernel(
         shardCountStride, shardCountRequestStride);
     op.Process();
 }
+#endif
 
 extern "C" __global__ __aicore__ void
 dsa_resident_sorted_finalize_kernel(
@@ -3627,6 +3645,7 @@ dsa_resident_sorted_finalize_kernel(
     op.Process();
 }
 
+#if !RESIDENT_EXPERIMENT_QUERY_MEMBERSHIP
 extern "C" __global__ __aicore__ void
 dsa_resident_sorted_update_kernel(
     __gm__ int32_t* topkIndices,
@@ -3665,12 +3684,10 @@ dsa_resident_sorted_update_kernel(
     op.Process();
 }
 
-#if RESIDENT_EXPERIMENT_QUERY_MEMBERSHIP
+#else
 extern "C" __global__ __aicore__ void
 dsa_resident_sorted_membership_update_kernel(
     __gm__ int32_t* topkIndices,
-    __gm__ int32_t* splitBoundary,
-    __gm__ int32_t* rowReqIndices,
     __gm__ int32_t* shardPacked,
     __gm__ int16_t* shardMapping,
     __gm__ int32_t* shardCounts,
@@ -3701,10 +3718,11 @@ dsa_resident_sorted_membership_update_kernel(
         requestCount, stateRowCount, dummyStateBase, rowsPerRequest,
         rowWidth, shardCount, capacity, shardCountStride,
         shardCountRequestStride, generationStride);
-    op.ProcessMembership(splitBoundary, rowReqIndices);
+    op.ProcessMembership();
 }
 #endif
 
+#if !RESIDENT_EXPERIMENT_QUERY_MEMBERSHIP
 extern "C" __global__ __aicore__ void
 dsa_resident_sorted_state_update_kernel(
     __gm__ int32_t* topkIndices,
@@ -3765,6 +3783,7 @@ dsa_resident_sorted_remap_kernel(
         capacity, shardCountStride, shardCountRequestStride);
     op.Process();
 }
+#endif
 
 }  // namespace
 
@@ -3890,8 +3909,13 @@ void dsa_resident_sorted_plan_impl(
         requestCount, shardCount, capacity, shardCountStride,
         shardCountRequestStride, missCountStride,
         blockTableWidth, blockSize, 0);
+#if RESIDENT_EXPERIMENT_QUERY_MEMBERSHIP
+    const uint32_t logicalBlockCount = requestCount * (shardCount + rowsPerRequest);
+    dsa_resident_sorted_membership_update_kernel<<<
+#else
     const uint32_t logicalBlockCount = requestCount * shardCount;
     dsa_resident_sorted_update_kernel<<<
+#endif
         ResidentPhysicalBlockCount(logicalBlockCount, coreCount),
         nullptr, stream>>>(
         static_cast<int32_t*>(topkIndices),
@@ -3911,6 +3935,7 @@ void dsa_resident_sorted_plan_impl(
         generationStride);
 }
 
+#if !RESIDENT_EXPERIMENT_QUERY_MEMBERSHIP
 void dsa_resident_sorted_update_debug_impl(
     void* stream,
     void* topkIndices,
@@ -4125,5 +4150,7 @@ void dsa_resident_sorted_finalize_debug_impl(
         shardCountRequestStride, missCountStride,
         blockTableWidth, blockSize, debugStage);
 }
+
+#endif
 
 }  // namespace vllm_ascend

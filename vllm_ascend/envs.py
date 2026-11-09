@@ -217,6 +217,13 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_DSA_RESIDENT_EXACT_KERNELS": lambda: bool(
         int(os.getenv("VLLM_ASCEND_DSA_RESIDENT_EXACT_KERNELS", "1"))
     ),
+    # Fused sorted-resident serving planner. 0 (default) keeps the existing
+    # exact/baseline selection; 1 uses query membership and exact state matching
+    # on eligible resident decode. Non-sensitive; read before capture. Restart
+    # workers to change it.
+    "VLLM_ASCEND_DSA_RESIDENT_QUERY_MEMBERSHIP": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_DSA_RESIDENT_QUERY_MEMBERSHIP", "0"))
+    ),
     # Value shards assigned to each MTP row by the sorted resident planner.
     # The request-wide shard count is MTP * shards_per_row. The value must be
     # a power of two in [1, 4]. Read once during model initialization so graph

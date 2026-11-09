@@ -18,6 +18,7 @@
 #include <atomic>
 #include <cstdint>
 #include <limits>
+#include <string>
 #include <torch/extension.h>
 #include <torch/library.h>
 #include <torch/version.h>
@@ -59,6 +60,11 @@ extern decltype(::vllm_ascend::dsa_resident_sharded_union_impl) dsa_resident_sha
 extern decltype(::vllm_ascend::dsa_resident_sorted_plan_impl) dsa_resident_sorted_plan_impl;
 extern decltype(::vllm_ascend::dsa_resident_sorted_plan_no_remap_impl) dsa_resident_sorted_plan_no_remap_impl;
 extern decltype(::vllm_ascend::dsa_resident_sorted_update_debug_impl) dsa_resident_sorted_update_debug_impl;
+}
+
+namespace resident_membership {
+extern decltype(::vllm_ascend::dsa_resident_sharded_union_impl) dsa_resident_sharded_union_impl;
+extern decltype(::vllm_ascend::dsa_resident_sorted_plan_impl) dsa_resident_sorted_plan_impl;
 }
 
 namespace {
@@ -1445,6 +1451,7 @@ uint32_t resident_vector_core_count(const at::Tensor &tensor)
     return static_cast<uint32_t>(cached_aiv_count);
 }
 
+template <bool QueryMembership>
 at::Tensor resident_sharded_union_common_(
     const at::Tensor &topk_indices,
     const at::Tensor &split_boundary,
@@ -1638,8 +1645,10 @@ at::Tensor resident_sharded_union_common_(
     void* shard_miss_position_ptr = shard_miss_positions.data_ptr();
     void* shard_evictable_slot_ptr = shard_evictable_slots.data_ptr();
     at_npu::native::OpCommand cmd;
-    cmd.Name("npu_dsa_resident_sharded_union_");
-    auto launch = ResidentKernels().union_launch;
+    cmd.Name(QueryMembership ? "npu_dsa_resident_membership_union_" : "npu_dsa_resident_sharded_union_");
+    auto launch = QueryMembership
+        ? &resident_membership::dsa_resident_sharded_union_impl
+        : ResidentKernels().union_launch;
     cmd.SetCustomHandler([launch,
         stream, topk_ptr, boundary_ptr, row_request_ptr,
         packed_ptr, mapping_ptr, count_ptr, request_state_ptr,
@@ -1677,6 +1686,7 @@ at::Tensor resident_sharded_union_common_(
 
 }  // namespace
 
+template <bool QueryMembership>
 at::Tensor npu_dsa_resident_sharded_union_(
     const at::Tensor &topk_indices,
     const at::Tensor &split_boundary,
@@ -1697,7 +1707,7 @@ at::Tensor npu_dsa_resident_sharded_union_(
     int64_t mtp,
     int64_t dummy_state_base)
 {
-    return resident_sharded_union_common_(
+    return resident_sharded_union_common_<QueryMembership>(
         topk_indices, split_boundary, row_req_indices,
         shard_packed, shard_mapping, shard_counts,
         request_state_indices, request_state_generations,
@@ -1706,6 +1716,7 @@ at::Tensor npu_dsa_resident_sharded_union_(
         shard_evictable_slots, mtp, dummy_state_base);
 }
 
+template <bool QueryMembership = false>
 static at::Tensor resident_sorted_plan_common_(
     at::Tensor &topk_indices,
     const at::Tensor &shard_packed,
@@ -1920,12 +1931,16 @@ static at::Tensor resident_sorted_plan_common_(
     void* miss_count_ptr = miss_counts.data_ptr();
     void* target_ptr = target_slots.data_ptr();
     at_npu::native::OpCommand cmd;
-    cmd.Name(
-        fused_remap
+    cmd.Name(QueryMembership
+        ? "npu_dsa_resident_membership_plan_"
+        : (fused_remap
             ? "npu_dsa_resident_sorted_plan_"
-            : "npu_dsa_resident_sorted_plan_no_remap_");
-    const auto& kernels = ResidentKernels();
-    auto impl = fused_remap ? kernels.plan : kernels.plan_no_remap;
+            : "npu_dsa_resident_sorted_plan_no_remap_"));
+    auto impl = &resident_membership::dsa_resident_sorted_plan_impl;
+    if constexpr (!QueryMembership) {
+        const auto& kernels = ResidentKernels();
+        impl = fused_remap ? kernels.plan : kernels.plan_no_remap;
+    }
     cmd.SetCustomHandler([impl,
         stream, topk_ptr, packed_ptr, mapping_ptr,
         shard_count_ptr, block_table_ptr, request_state_ptr,
@@ -1969,6 +1984,7 @@ static at::Tensor resident_sorted_plan_common_(
     return miss_counts;
 }
 
+template <bool QueryMembership>
 at::Tensor npu_dsa_resident_sorted_plan_(
     at::Tensor &topk_indices,
     const at::Tensor &shard_packed,
@@ -1991,7 +2007,7 @@ at::Tensor npu_dsa_resident_sorted_plan_(
     int64_t block_size,
     int64_t dummy_state_base)
 {
-    return resident_sorted_plan_common_(
+    return resident_sorted_plan_common_<QueryMembership>(
         topk_indices, shard_packed, shard_mapping, shard_counts,
         request_block_table, request_state_indices,
         request_state_generations, state_tokens, state_slots,
@@ -3941,8 +3957,7 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "npu_dsa_resident_finalize_rows_",
         torch::kPrivateUse1,
         &vllm_ascend::npu_dsa_resident_finalize_rows_);
-    ops.def(
-        "npu_dsa_resident_sharded_union_(Tensor topk_indices, "
+    const std::string resident_union_args =
         "Tensor split_boundary, Tensor row_req_indices, "
         "Tensor(a!) shard_packed, Tensor(b!) shard_mapping, "
         "Tensor(c!) shard_counts, Tensor request_state_indices, "
@@ -3952,13 +3967,19 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "Tensor(f!) shard_miss_tokens, "
         "Tensor(g!) shard_miss_positions, "
         "Tensor(h!) shard_evictable_slots, "
-        "int mtp, int dummy_state_base) -> Tensor(c!)");
+        "int mtp, int dummy_state_base) -> Tensor(c!)";
+    ops.def(("npu_dsa_resident_sharded_union_(Tensor topk_indices, " + resident_union_args).c_str());
     ops.impl(
         "npu_dsa_resident_sharded_union_",
         torch::kPrivateUse1,
-        &vllm_ascend::npu_dsa_resident_sharded_union_);
-    ops.def(
-        "npu_dsa_resident_sorted_plan_(Tensor(a!) topk_indices, "
+        &vllm_ascend::npu_dsa_resident_sharded_union_<false>);
+    ops.def(("npu_dsa_resident_membership_union_(Tensor(i!) topk_indices, " + resident_union_args).c_str());
+    ops.impl(
+        "npu_dsa_resident_membership_union_",
+        torch::kPrivateUse1,
+        &vllm_ascend::npu_dsa_resident_sharded_union_<true>);
+    const std::string resident_plan_args =
+        "(Tensor(a!) topk_indices, "
         "Tensor shard_packed, Tensor shard_mapping, "
         "Tensor(j!) shard_counts, Tensor request_block_table, "
         "Tensor request_state_indices, "
@@ -3969,11 +3990,17 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "Tensor shard_miss_positions, Tensor shard_evictable_slots, "
         "Tensor(g!) miss_tokens, Tensor(h!) miss_counts, "
         "Tensor(i!) target_slots, int block_size, "
-        "int dummy_state_base) -> Tensor(h!)");
+        "int dummy_state_base) -> Tensor(h!)";
+    ops.def(("npu_dsa_resident_sorted_plan_" + resident_plan_args).c_str());
     ops.impl(
         "npu_dsa_resident_sorted_plan_",
         torch::kPrivateUse1,
-        &vllm_ascend::npu_dsa_resident_sorted_plan_);
+        &vllm_ascend::npu_dsa_resident_sorted_plan_<false>);
+    ops.def(("npu_dsa_resident_membership_plan_" + resident_plan_args).c_str());
+    ops.impl(
+        "npu_dsa_resident_membership_plan_",
+        torch::kPrivateUse1,
+        &vllm_ascend::npu_dsa_resident_sorted_plan_<true>);
     ops.def(
         "npu_dsa_resident_sorted_plan_no_remap_("
         "Tensor(a!) topk_indices, "

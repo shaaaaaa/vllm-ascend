@@ -92,11 +92,11 @@ if(SOC_VERSION MATCHES "ascend950")
     list(REMOVE_ITEM VLLM_ASCEND_CUSTOM_OP ${VLLM_ASCEND_CUSTOM_OP_EXCLUDE_ASCEND950})
 endif()
 
-# Compile the qualified exact algorithms alongside the untouched baseline.
+# Compile the exact and opt-in membership algorithms alongside the baseline.
 # Generate explicit entrypoints: the AscendC scanner must see kernel definitions.
 if(NOT SOC_VERSION MATCHES "ascend310p.*")
     include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/resident_exact.cmake)
-    list(APPEND VLLM_ASCEND_CUSTOM_OP ${RESIDENT_EXACT_SOURCE})
+    list(APPEND VLLM_ASCEND_CUSTOM_OP ${RESIDENT_EXACT_SOURCE} ${RESIDENT_MEMBERSHIP_SOURCE})
 endif()
 
 ascendc_library(vllm_ascend_kernels SHARED
