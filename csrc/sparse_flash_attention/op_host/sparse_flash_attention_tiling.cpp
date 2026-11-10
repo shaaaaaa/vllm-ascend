@@ -1842,4 +1842,7 @@ ge::graphStatus SFAInfoParser::Parse(SFATilingInfo &sfaInfo)
 IMPL_OP_OPTILING(SparseFlashAttention)
     .Tiling(TilingSparseFlashAttention)
     .TilingParse<SparseFlashAttentionCompileInfo>(TilingPrepareForSparseFlashAttention);
+IMPL_OP_OPTILING(SparseFlashAttentionDcp)
+    .Tiling(TilingSparseFlashAttention)
+    .TilingParse<SparseFlashAttentionCompileInfo>(TilingPrepareForSparseFlashAttention);
 } // namespace optiling

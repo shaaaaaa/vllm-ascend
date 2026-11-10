@@ -175,6 +175,7 @@ TILING_DATA_FIELD_DEF_STRUCT(SparseFlashAttentionSingleCoreTensorSizeMla, single
 TILING_DATA_FIELD_DEF_STRUCT(SparseFlashAttentionInnerSplitParams, innerSplitParams);
 END_TILING_DATA_DEF
 REGISTER_TILING_DATA_CLASS(SparseFlashAttention, SparseFlashAttentionTilingDataMla)
+REGISTER_TILING_DATA_CLASS(SparseFlashAttentionDcp, SparseFlashAttentionTilingDataMla)
 
 template <typename T> inline T Align(T num, T rnd)
 {

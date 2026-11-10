@@ -182,6 +182,7 @@ at::Tensor npu_dsa_resident_finalize_rows_meta(
     return selected_count;
 }
 
+template <typename... LayoutArgs>
 at::Tensor npu_dsa_resident_sharded_union_meta(
     const at::Tensor &topk_indices,
     const at::Tensor &split_boundary,
@@ -200,7 +201,7 @@ at::Tensor npu_dsa_resident_sharded_union_meta(
     at::Tensor &shard_miss_positions,
     at::Tensor &shard_evictable_slots,
     int64_t mtp,
-    int64_t dummy_state_base)
+    int64_t dummy_state_base, LayoutArgs...)
 {
     (void)topk_indices;
     (void)split_boundary;
@@ -222,6 +223,7 @@ at::Tensor npu_dsa_resident_sharded_union_meta(
     return shard_counts;
 }
 
+template <typename... LayoutArgs>
 at::Tensor npu_dsa_resident_sorted_plan_meta(
     at::Tensor &topk_indices,
     const at::Tensor &shard_packed,
@@ -242,7 +244,7 @@ at::Tensor npu_dsa_resident_sorted_plan_meta(
     at::Tensor &miss_counts,
     at::Tensor &target_slots,
     int64_t block_size,
-    int64_t dummy_state_base)
+    int64_t dummy_state_base, LayoutArgs...)
 {
     (void)topk_indices;
     (void)shard_packed;
@@ -658,6 +660,18 @@ at::Tensor npu_sparse_flash_attention_meta(
     at::Tensor output = at::empty(query.sizes(), query.options().dtype(query.dtype()));
     return output;
 }
+std::tuple<at::Tensor, at::Tensor, at::Tensor> npu_sparse_flash_attention_dcp_meta(
+    const at::Tensor &query, const at::Tensor &query_rope,
+    const at::Tensor &key, const at::Tensor &key_rope,
+    const at::Tensor &sparse_indices, const at::Tensor &selected_counts,
+    const at::Tensor &block_table, const at::Tensor &actual_seq_lengths_query,
+    const at::Tensor &actual_seq_lengths_kv, double scale_value)
+{
+    auto options = query.options().dtype(at::kFloat);
+    auto stats = at::empty_symint({query.sym_size(0), query.sym_size(1)}, options);
+    return {at::empty_symint(query.sym_sizes(), query.options()), stats, at::empty_like(stats)};
+}
+
 std::tuple<at::Tensor, at::Tensor> matmul_allreduce_add_rmsnorm_meta(
     const at::Tensor &x1,
     const at::Tensor &x2,
@@ -1016,19 +1030,25 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
         &vllm_ascend::meta::npu_dsa_resident_finalize_rows_meta);
     ops.impl(
         "npu_dsa_resident_sharded_union_",
-        &vllm_ascend::meta::npu_dsa_resident_sharded_union_meta);
+        &vllm_ascend::meta::npu_dsa_resident_sharded_union_meta<>);
     ops.impl(
         "npu_dsa_resident_membership_union_",
-        &vllm_ascend::meta::npu_dsa_resident_sharded_union_meta);
+        &vllm_ascend::meta::npu_dsa_resident_sharded_union_meta<>);
+    ops.impl(
+        "npu_dsa_resident_dcp_union_",
+        &vllm_ascend::meta::npu_dsa_resident_sharded_union_meta<int64_t, int64_t>);
     ops.impl(
         "npu_dsa_resident_sorted_plan_",
-        &vllm_ascend::meta::npu_dsa_resident_sorted_plan_meta);
+        &vllm_ascend::meta::npu_dsa_resident_sorted_plan_meta<>);
     ops.impl(
         "npu_dsa_resident_membership_plan_",
-        &vllm_ascend::meta::npu_dsa_resident_sorted_plan_meta);
+        &vllm_ascend::meta::npu_dsa_resident_sorted_plan_meta<>);
+    ops.impl(
+        "npu_dsa_resident_dcp_plan_",
+        &vllm_ascend::meta::npu_dsa_resident_sorted_plan_meta<bool, const at::Tensor&, at::Tensor, int64_t, int64_t>);
     ops.impl(
         "npu_dsa_resident_sorted_plan_no_remap_",
-        &vllm_ascend::meta::npu_dsa_resident_sorted_plan_meta);
+        &vllm_ascend::meta::npu_dsa_resident_sorted_plan_meta<>);
     ops.impl(
         "npu_dsa_resident_finalize_coordinator_",
         &vllm_ascend::meta::npu_dsa_resident_finalize_coordinator_meta);
@@ -1065,6 +1085,7 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
     ops.impl("npu_lightning_indexer", &vllm_ascend::meta::npu_lightning_indexer_meta);
     // Sparse flash attention
     ops.impl("npu_sparse_flash_attention", &vllm_ascend::meta::npu_sparse_flash_attention_meta);
+    ops.impl("npu_sparse_flash_attention_dcp", &vllm_ascend::meta::npu_sparse_flash_attention_dcp_meta);
     // MoE dispatch-ffn-combine
     ops.impl("dispatch_ffn_combine", &vllm_ascend::meta::dispatch_ffn_combine_meta);
     // matmul allreduce add rmsnorm

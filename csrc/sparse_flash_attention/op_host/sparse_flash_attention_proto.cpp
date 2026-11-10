@@ -44,5 +44,40 @@ ge::graphStatus InferDataTypeSparseFlashAttention(gert::InferDataTypeContext *co
 }
 
 IMPL_OP(SparseFlashAttention).InferShape(InferShapeSparseFlashAttention).InferDataType(InferDataTypeSparseFlashAttention);
+
+ge::graphStatus InferShapeSparseFlashAttentionDcp(gert::InferShapeContext *context)
+{
+    if (InferShapeSparseFlashAttention(context) != ge::GRAPH_SUCCESS) {
+        return ge::GRAPH_FAILED;
+    }
+    const auto *query = context->GetInputShape(QUERY_INPUT_INDEX);
+    if (query->GetDimNum() != 3) {
+        return ge::GRAPH_FAILED;
+    }
+    for (size_t i = 1; i <= 2; ++i) {
+        auto *shape = context->GetOutputShape(i);
+        if (shape == nullptr) {
+            return ge::GRAPH_FAILED;
+        }
+        shape->SetDimNum(2);
+        shape->SetDim(0, query->GetDim(0));
+        shape->SetDim(1, query->GetDim(1));
+    }
+    return ge::GRAPH_SUCCESS;
+}
+
+ge::graphStatus InferDataTypeSparseFlashAttentionDcp(gert::InferDataTypeContext *context)
+{
+    if (InferDataTypeSparseFlashAttention(context) != ge::GRAPH_SUCCESS) {
+        return ge::GRAPH_FAILED;
+    }
+    context->SetOutputDataType(1, ge::DT_FLOAT);
+    context->SetOutputDataType(2, ge::DT_FLOAT);
+    return ge::GRAPH_SUCCESS;
+}
+
+IMPL_OP(SparseFlashAttentionDcp)
+    .InferShape(InferShapeSparseFlashAttentionDcp)
+    .InferDataType(InferDataTypeSparseFlashAttentionDcp);
 } // namespace ops
   

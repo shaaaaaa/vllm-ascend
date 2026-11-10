@@ -33,6 +33,54 @@ registry = load_source(
 )
 
 
+@pytest.mark.parametrize("mode", ["baseline", "membership", "dcp"])
+def test_resident_dispatch_keeps_selected_counts_separate_from_misses(monkeypatch, mode):
+    union_name = {
+        "baseline": "npu_dsa_resident_sharded_union_",
+        "membership": "npu_dsa_resident_membership_union_",
+        "dcp": "npu_dsa_resident_dcp_union_",
+    }[mode]
+    plan_name = {
+        "baseline": "npu_dsa_resident_sorted_plan_",
+        "membership": "npu_dsa_resident_membership_plan_",
+        "dcp": "npu_dsa_resident_dcp_plan_",
+    }[mode]
+    union, plan = Mock(), Mock()
+    monkeypatch.setattr(torch.ops._C_ascend, union_name, union, raising=False)
+    monkeypatch.setattr(torch.ops._C_ascend, plan_name, plan, raising=False)
+    topk = torch.zeros((2, 1, 2048), dtype=torch.int32)
+    table = torch.ones((1, 33), dtype=torch.int32)
+    indices = torch.zeros(1, dtype=torch.int32)
+    generations = torch.ones(1, dtype=torch.int64)
+    state = resident.allocate_sorted_resident_state(1, 1, 2, device=topk.device)
+    workspace = resident.allocate_sorted_resident_workspace(1, 2, device=topk.device)
+    counts = torch.empty((2, 16), dtype=torch.int32)
+    origins = torch.tensor([4096], dtype=torch.int32)
+    dcp = resident.ResidentDcpLayout(4, 2, origins, counts) if mode == "dcp" else None
+    resident.prepare_resident_sharded_union_(
+        topk, topk[:, 0, 0], topk[:, 0, 0], indices, generations, state, workspace,
+        mtp=2, query_membership=mode == "membership", dcp=dcp,
+    )
+    tokens, misses, slots = resident.prepare_sorted_resident_cache_fused_(
+        topk, table, indices, generations, state, workspace,
+        block_size=128, query_membership=mode == "membership", dcp=dcp,
+    )
+    assert tokens is workspace.miss_tokens and slots is workspace.target_slots
+    assert misses.data_ptr() == workspace.miss_counts.data_ptr()
+    union.assert_called_once()
+    plan.assert_called_once()
+    assert union.call_args.args[-2:] == (2, state.dummy_state_base)
+    assert plan.call_args.args[-2:] == (128, state.dummy_state_base)
+    assert union.call_args.kwargs == ({"dcp_size": 4, "dcp_rank": 2} if dcp is not None else {})
+    if dcp is None:
+        assert not plan.call_args.kwargs
+    else:
+        options = plan.call_args.kwargs
+        assert options["fused_remap"] is True
+        assert options["live_origins"] is origins and options["selected_counts"] is counts
+        assert (options["dcp_size"], options["dcp_rank"]) == (4, 2)
+
+
 def methods(path, names, namespace):
     tree = ast.parse((ROOT / path).read_text(encoding="utf-8"))
     nodes = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name in names]

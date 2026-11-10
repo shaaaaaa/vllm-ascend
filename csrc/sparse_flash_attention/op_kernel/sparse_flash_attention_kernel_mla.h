@@ -71,6 +71,10 @@ public:
 				                __gm__ uint8_t *gmTiling, TPipe *tPipe);
 
     __aicore__ inline void Process();
+#ifdef SFA_DCP_STATS
+    __aicore__ inline void InitDcpOutputs(
+        GM_ADDR selectedCounts, GM_ADDR softmaxMax, GM_ADDR softmaxSum);
+#endif
 
 private:
     static constexpr bool PAGE_ATTENTION = SFAT::pageAttention;
@@ -158,6 +162,13 @@ private:
     GlobalTensor<T> accumOutGm;
     GlobalTensor<T> lseSumFdGm;
     GlobalTensor<T> lseMaxFdGm;
+#ifdef SFA_DCP_STATS
+    GlobalTensor<int32_t> selectedCountsGm;
+    GlobalTensor<T> softmaxMaxGm;
+    GlobalTensor<T> softmaxSumGm;
+
+    __aicore__ inline void InitDcpZeroRow(uint64_t row);
+#endif
 
     // ================================Init functions===================================
     __aicore__ inline void InitTilingData();
@@ -252,6 +263,12 @@ SparseFlashAttentionMla<SFAT>::InitActualSeqLen(__gm__ uint8_t *actualSeqLengths
 template <typename SFAT>
 __aicore__ inline void SparseFlashAttentionMla<SFAT>::InitAllZeroOutput(uint32_t bIdx, uint32_t s1Idx, uint32_t n2Idx)
 {
+#ifdef SFA_DCP_STATS
+    if (tmpBlockIdx % 2 == 0) {
+        uint64_t tBase = bIdx == 0 ? 0 : actualSeqLengthsQGm.GetValue(bIdx - 1);
+        InitDcpZeroRow(tBase + s1Idx);
+    }
+#else
     if (constInfo.outputLayout == SFA_LAYOUT::TND) {
         uint32_t tBase = bIdx == 0 ? 0 : actualSeqLengthsQGm.GetValue(bIdx - 1);
         uint32_t s1Count = tempLoopInfo.actS1Size;
@@ -265,7 +282,36 @@ __aicore__ inline void SparseFlashAttentionMla<SFAT>::InitAllZeroOutput(uint32_t
                                     n2Idx * constInfo.gSize * headDim;
         matmul::InitOutput<OUT_T>(attentionOutGm[attenOutOffset], constInfo.gSize * headDim, 0);
     }
+#endif
 }
+
+#ifdef SFA_DCP_STATS
+template <typename SFAT>
+__aicore__ inline void SparseFlashAttentionMla<SFAT>::InitDcpZeroRow(uint64_t row)
+{
+    uint64_t offset = row * constInfo.qHeadNum;
+    matmul::InitOutput<OUT_T>(attentionOutGm[offset * headDim], constInfo.qHeadNum * headDim, 0);
+    matmul::InitOutput<T>(softmaxMaxGm[offset], constInfo.qHeadNum, 0);
+    matmul::InitOutput<T>(softmaxSumGm[offset], constInfo.qHeadNum, 0);
+}
+
+template <typename SFAT>
+__aicore__ inline void SparseFlashAttentionMla<SFAT>::InitDcpOutputs(
+    GM_ADDR selectedCounts, GM_ADDR softmaxMax, GM_ADDR softmaxSum)
+{
+    selectedCountsGm.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t *>(selectedCounts));
+    if ASCEND_IS_AIV {
+        softmaxMaxGm.SetGlobalBuffer(reinterpret_cast<__gm__ T *>(softmaxMax));
+        softmaxSumGm.SetGlobalBuffer(reinterpret_cast<__gm__ T *>(softmaxSum));
+        vectorService.InitDcpStats(softmaxMaxGm, softmaxSumGm);
+        uint32_t activeRows = actualSeqLengthsQGm.GetValue(constInfo.batchSize - 1);
+        for (uint64_t row = static_cast<uint64_t>(activeRows) + tmpBlockIdx;
+             row < constInfo.qSeqSize; row += 2 * GetBlockNum()) {
+            InitDcpZeroRow(row);
+        }
+    }
+}
+#endif
 
 template <typename SFAT>
 __aicore__ inline void SparseFlashAttentionMla<SFAT>::InitOutputSingleCore()
@@ -294,6 +340,16 @@ template <typename SFAT>
 __aicore__ inline void SparseFlashAttentionMla<SFAT>::GetSparseActualSeqLen(uint32_t bIdx, uint32_t s1Idx,
                                                                             uint32_t n2Idx)
 {
+#ifdef SFA_DCP_STATS
+    // TND, one KV head and one query row per M tile. Addressing still uses
+    // the local KV span, while the S2 loop uses the compacted selection size.
+    uint64_t start = bIdx == 0 ? 0 : actualSeqLengthsQGm.GetValue(bIdx - 1);
+    // Each row owner publishes a separate cacheline.
+    int32_t count = selectedCountsGm.GetValue((start + s1Idx) * 16);
+    ASSERT(count >= 0 && static_cast<uint32_t>(count) <= constInfo.sparseBlockCount &&
+           count <= tempLoopInfo.curActualSeqLenOri);
+    tempLoopInfo.curActualSeqLen = count;
+#else
     if (tempLoopInfo.nextTokensPerBatch < 0 && s1Idx < (-tempLoopInfo.nextTokensPerBatch)) {
         tempLoopInfo.curActualSeqLen = 0;
         return;
@@ -306,6 +362,7 @@ __aicore__ inline void SparseFlashAttentionMla<SFAT>::GetSparseActualSeqLen(uint
     tempLoopInfo.curActualSeqLen = (constInfo.sparseBlockCount * constInfo.sparseBlockSize > threshold) ?
                                            threshold :
                                            constInfo.sparseBlockCount * constInfo.sparseBlockSize;
+#endif
 }
 
 template <typename SFAT>
@@ -810,7 +867,13 @@ SparseFlashAttentionMla<SFAT>::PreloadPipeline(uint32_t loop, uint64_t s2Start, 
     RunInfo &extraInfo1 = extraInfo[(loop + 1) % SFA_PRELOAD_TASK_CACHE_SIZE];
 
     CalcParams(loop, s2Start, s2LoopIdx, extraInfo0);
+#ifdef SFA_DCP_STATS
+    if (extraInfo0.isValid) {
+        CalcSinnerTopKBegin(extraInfo0, curTopKIdx, curOffsetInSparseBlock);
+    }
+#else
     CalcSinnerTopKBegin(extraInfo0, curTopKIdx, curOffsetInSparseBlock);
+#endif
 
     if (extraInfo0.isValid) {
         if ASCEND_IS_AIC {

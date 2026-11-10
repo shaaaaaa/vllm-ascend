@@ -54,6 +54,13 @@ public:
     __aicore__ inline void AllocEventID();
     __aicore__ inline void FreeEventID();
     __aicore__ inline void InitSoftmaxDefaultBuffer();
+#ifdef SFA_DCP_STATS
+    __aicore__ inline void InitDcpStats(GlobalTensor<T> max, GlobalTensor<T> sum)
+    {
+        dcpMaxGm = max;
+        dcpSumGm = sum;
+    }
+#endif
     // ================================Base Vector==========================================
     __aicore__ inline void RowDivs(LocalTensor<float> dstUb, LocalTensor<float> src0Ub, LocalTensor<float> src1Ub,
                                    uint32_t dealRowCount, uint32_t columnCount, uint32_t actualColumnCount);
@@ -63,8 +70,8 @@ public:
     __aicore__ inline void MergeKv(const RunInfo &runInfo);
     __aicore__ inline int64_t GetKeyGmOffset(int64_t realS2Idx, const RunInfo &runInfo, int64_t s2IdLimit);
     __aicore__ inline int64_t GetKeyRopeGmOffset(int64_t realS2Idx, const RunInfo &runInfo, int64_t s2IdLimit);
-    __aicore__ inline void GetRealS2Idx(int64_t s2GmOffset, int64_t &realS2Idx, int64_t topkGmBaseOffset,
-                                        const RunInfo &runInfo);
+    __aicore__ inline void GetRealS2Idx(int64_t s2Offset, int64_t &realS2Idx, int64_t topkGmBaseOffset,
+                                        int64_t topkIndexEnd);
     __aicore__ inline void CopyInKv(int64_t &mte2Size, int64_t mte3Size, int64_t mergeMte3Idx, int64_t realS2Idx1,
                                     int64_t realS2Idx2, const RunInfo &runInfo);
     __aicore__ inline void CopyOutMrgeResult(int64_t mte2Size, int64_t mte3Size, int64_t s2StartGmOffset,
@@ -150,6 +157,12 @@ private:
     GlobalTensor<KV_T> vec1ResGm;
     GlobalTensor<T> lseSumFdGm;
     GlobalTensor<T> lseMaxFdGm;
+#ifdef SFA_DCP_STATS
+    GlobalTensor<T> dcpMaxGm;
+    GlobalTensor<T> dcpSumGm;
+
+    __aicore__ inline void CopyDcpStat(GlobalTensor<T> dst, LocalTensor<T> src, uint32_t rows);
+#endif
 
     GlobalTensor<int32_t> actualSeqLengthsQGm;
     GlobalTensor<int32_t> actualSeqLengthsKVGm;
@@ -709,16 +722,16 @@ __aicore__ inline void SFAVectorService<SFAT>::ProcessVec1SingleBuf(const RunInf
 }
 
 template <typename SFAT>
-__aicore__ inline void SFAVectorService<SFAT>::GetRealS2Idx(int64_t s2GmOffset, int64_t &realS2Idx,
-                                                            int64_t topkGmBaseOffset, const RunInfo &runInfo)
+__aicore__ inline void SFAVectorService<SFAT>::GetRealS2Idx(int64_t s2Offset, int64_t &realS2Idx,
+                                                            int64_t topkGmBaseOffset, int64_t topkIndexEnd)
 {
-    int64_t topkGmIdx = (s2GmOffset + runInfo.s2Idx * constInfo.s2BaseSize) / constInfo.sparseBlockSize;
-    if (unlikely(topkGmIdx >= constInfo.sparseBlockCount)) {
+    int64_t topkGmIdx = s2Offset / constInfo.sparseBlockSize;
+    if (unlikely(topkGmIdx >= topkIndexEnd)) {
         realS2Idx = -1;
         return;
     }
     realS2Idx = topkGm_.GetValue(topkGmBaseOffset + topkGmIdx) * static_cast<int64_t>(constInfo.sparseBlockSize) +
-                static_cast<int64_t>((s2GmOffset + runInfo.s2Idx * constInfo.s2BaseSize) % constInfo.sparseBlockSize);
+                s2Offset % constInfo.sparseBlockSize;
 }
 
 template <typename SFAT>
@@ -877,6 +890,13 @@ __aicore__ inline void SFAVectorService<SFAT>::MergeKv(const RunInfo &runInfo)
 {
     int64_t s2ProcessSize = runInfo.actualSingleProcessSInnerSize;
     int64_t s2Pair = CeilDiv(s2ProcessSize, 2L * constInfo.sparseBlockSize);
+    const int64_t s2TileStart = static_cast<int64_t>(runInfo.s2Idx) * constInfo.s2BaseSize;
+    int64_t topkIndexEnd = constInfo.sparseBlockCount;
+#ifdef SFA_DCP_STATS
+    // The final pair can straddle the counted prefix of a packed row.
+    topkIndexEnd = Min(topkIndexEnd, CeilDiv(s2TileStart + s2ProcessSize,
+        static_cast<int64_t>(constInfo.sparseBlockSize)));
+#endif
     int64_t topkGmBaseOffset = 0;
 
     if constexpr (LAYOUT_T == SFA_LAYOUT::TND) {
@@ -905,14 +925,15 @@ __aicore__ inline void SFAVectorService<SFAT>::MergeKv(const RunInfo &runInfo)
             WaitFlag<AscendC::HardEvent::MTE3_MTE2>(mergeMte3Idx % 2);
             needWaitMte3ToMte2 = false;
         }
-        GetRealS2Idx(s2GmOffsetArray, s2IdxArray0, topkGmBaseOffset, runInfo);
+        GetRealS2Idx(s2TileStart + s2GmOffsetArray, s2IdxArray0, topkGmBaseOffset, topkIndexEnd);
         if (unlikely(s2IdxArray0 < 0)) {
             CopyOutMrgeResult(mte2Size, mte3Size, s2GmStartOffset, mergeMte3Idx, runInfo);
             SetFlag<AscendC::HardEvent::MTE3_MTE2>(mergeMte3Idx % 2);
             mergeMte3Idx++;
             break;
         }
-        GetRealS2Idx(s2GmOffsetArray + constInfo.sparseBlockSize, s2IdxArray1, topkGmBaseOffset, runInfo);
+        GetRealS2Idx(s2TileStart + s2GmOffsetArray + constInfo.sparseBlockSize,
+            s2IdxArray1, topkGmBaseOffset, topkIndexEnd);
         CopyInKv(mte2Size, mte3Size, mergeMte3Idx, s2IdxArray0, s2IdxArray1, runInfo);
         if ((mte2Size - mte3Size + 2 * constInfo.sparseBlockSize > 32) ||
             s2GmOffsetArray + 2 * constInfo.sparseBlockSize >= s2GmLimit) {
@@ -965,6 +986,22 @@ __aicore__ inline void SFAVectorService<SFAT>::MergeKv(const RunInfo &runInfo)
     return;
 }
 
+#ifdef SFA_DCP_STATS
+template <typename SFAT>
+__aicore__ inline void SFAVectorService<SFAT>::CopyDcpStat(
+    GlobalTensor<T> dst, LocalTensor<T> src, uint32_t rows)
+{
+    auto buffer = outputBuff2.Get<T>();
+    WaitFlag<AscendC::HardEvent::MTE3_V>(SYNC_OUTPUT_BUF2_FLAG);
+    DataCopy(buffer, src, SFAAlign(rows, FP32_BLOCK_ELEMENT_NUM));
+    SetFlag<AscendC::HardEvent::V_MTE3>(SYNC_OUTPUT_BUF2_FLAG);
+    WaitFlag<AscendC::HardEvent::V_MTE3>(SYNC_OUTPUT_BUF2_FLAG);
+    DataCopyExtParams params{1, static_cast<uint32_t>(rows * sizeof(T)), 0, 0, 0};
+    DataCopyPad(dst, buffer, params);
+    SetFlag<AscendC::HardEvent::MTE3_V>(SYNC_OUTPUT_BUF2_FLAG);
+}
+#endif
+
 template <typename SFAT>
 __aicore__ inline void SFAVectorService<SFAT>::ProcessVec1L(const RunInfo &info)
 {
@@ -995,6 +1032,16 @@ __aicore__ inline void SFAVectorService<SFAT>::ProcessVec1L(const RunInfo &info)
             CrossCoreSetFlag<ConstInfo::SFA_SYNC_MODE2, PIPE_MTE3>(constInfo.syncV1NupdateC2);
         }
         // move lse for flash decode
+#ifdef SFA_DCP_STATS
+        if (info.isLastS2Loop && mSplitInfo.vecDealM != 0) {
+            uint64_t dst = info.attenOutOffset / constInfo.headDim +
+                mSplitInfo.nBufferStartM + mSplitInfo.vecStartM;
+            uint32_t src = (info.loop % constInfo.preLoadNum) *
+                SOFTMAX_TMP_BUFFER_OFFSET / sizeof(T) + mSplitInfo.nBufferStartM / 2;
+            CopyDcpStat(dcpMaxGm[dst], softmaxMaxUb[src], mSplitInfo.vecDealM);
+            CopyDcpStat(dcpSumGm[dst], softmaxSumUb[src], mSplitInfo.vecDealM);
+        }
+#endif
         if (info.s2Idx == info.curSInnerLoopTimes - 1) {
             if (info.tndIsS2SplitCore) {
                 if constexpr (FLASH_DECODE) {

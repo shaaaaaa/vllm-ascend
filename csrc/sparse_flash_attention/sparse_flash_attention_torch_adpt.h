@@ -59,6 +59,43 @@ at::Tensor npu_sparse_flash_attention(
         sparse_mode,
         output);
     return output;
-}    
+}
+
+std::tuple<at::Tensor, at::Tensor, at::Tensor> npu_sparse_flash_attention_dcp(
+    const at::Tensor &query, const at::Tensor &query_rope,
+    const at::Tensor &key, const at::Tensor &key_rope,
+    const at::Tensor &sparse_indices, const at::Tensor &selected_counts,
+    const at::Tensor &block_table, const at::Tensor &actual_seq_lengths_query,
+    const at::Tensor &actual_seq_lengths_kv, double scale_value)
+{
+    TORCH_CHECK(query.dim() == 3 && query.numel() > 0 && query.size(1) % 8 == 0 &&
+                    key.dim() == 4 && key.size(2) == 1,
+                "DCP SFA requires TND queries with aligned heads and one paged KV head");
+    TORCH_CHECK(sparse_indices.dim() == 3 && sparse_indices.size(0) == query.size(0) &&
+                    sparse_indices.size(1) == 1 && selected_counts.dim() == 2 &&
+                    selected_counts.size(0) == query.size(0) &&
+                    selected_counts.size(1) == 16 &&
+                    selected_counts.scalar_type() == at::kInt,
+                "DCP SFA requires cacheline-separated int32 counts for packed sparse rows");
+    TORCH_CHECK(block_table.dim() == 2 && block_table.size(0) > 0 &&
+                    actual_seq_lengths_query.dim() == 1 && actual_seq_lengths_kv.dim() == 1 &&
+                    actual_seq_lengths_query.size(0) == block_table.size(0) &&
+                    actual_seq_lengths_kv.size(0) == block_table.size(0),
+                "DCP SFA requires one query boundary and local KV extent per block table row");
+    auto output = at::empty(query.sizes(), query.options());
+    auto stats_options = query.options().dtype(at::kFloat);
+    auto softmax_max = at::empty({query.size(0), query.size(1)}, stats_options);
+    auto softmax_sum = at::empty_like(softmax_max);
+    char tnd[] = "TND";
+    char paged[] = "PA_BSND";
+    char *layout_query = tnd;
+    char *layout_kv = paged;
+    EXEC_NPU_CMD(
+        aclnnSparseFlashAttentionDcp, query, key, key, sparse_indices, block_table,
+        actual_seq_lengths_query, actual_seq_lengths_kv, query_rope, key_rope,
+        selected_counts, scale_value, int64_t{1}, layout_query, layout_kv,
+        int64_t{0}, output, softmax_max, softmax_sum);
+    return {output, softmax_max, softmax_sum};
+}
 }
 #endif
