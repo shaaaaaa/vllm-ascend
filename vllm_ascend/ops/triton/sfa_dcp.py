@@ -9,6 +9,67 @@ from vllm_ascend.ops.triton.triton_utils import get_element, get_vectorcore_num,
 
 
 @triton.jit
+def _prepare_topk(raw, positions, output, counts, row_requests, rows: tl.constexpr,
+                  width: tl.constexpr, actual_rows, world: tl.constexpr,
+                  rank: tl.constexpr, block: tl.constexpr, local: tl.constexpr):
+    col = tl.arange(0, width)
+    for row in range(tl.program_id(0), rows, tl.num_programs(0)):
+        token = tl.load(raw + row * width + col)
+        position = tl.where(row < actual_rows, tl.load(positions + row), -1)
+        valid = (token >= 0) & (token <= position)
+        if row_requests is None:
+            local_row = local
+        else:
+            owner = tl.load(row_requests + tl.where(row < actual_rows, row, 0))
+            local_row = (row >= actual_rows) | (owner < 0)
+        if local_row:
+            stripe = token // block
+            valid = valid & (stripe % world == rank)
+            prefix = tl.cumsum(valid.to(tl.int32), axis=0)
+            count = tl.sum(valid.to(tl.int32), axis=0)
+            # The two partitions together address each output column once.
+            dst = tl.where(valid, prefix - 1, count + col - prefix)
+            value = (stripe // world) * block + token % block
+            tl.store(counts + row * 16, count)
+        else:
+            dst, value = col, token
+        tl.store(output + row * width + dst, tl.where(valid, value, -1))
+
+
+def prepare_sfa_dcp_topk(
+    topk: torch.Tensor, positions: torch.Tensor, output: torch.Tensor,
+    counts: torch.Tensor, actual_rows: int, world: int, rank: int, block: int,
+    *, local: bool, row_requests: torch.Tensor | None = None,
+) -> None:
+    """Keep causal global IDs for the planner and compact dense rows locally."""
+    rows, width = topk.shape[0], topk.shape[-1]
+    init_device_properties_triton()
+    _prepare_topk[(min(rows, get_vectorcore_num()),)](
+        topk, positions, output, counts, row_requests, rows, width, actual_rows, world, rank, block, local
+    )
+
+
+def execute_sfa_dcp(
+    query: torch.Tensor, rope: torch.Tensor, kv_cache: tuple[torch.Tensor, ...],
+    topk: torch.Tensor, counts: torch.Tensor, block_table: torch.Tensor,
+    query_ends: torch.Tensor, local_seq_lens: torch.Tensor, scale: float, group,
+    *, prefetch: tuple | None = None,
+) -> torch.Tensor:
+    """Gather only query heads, then return the merged output for this head owner."""
+    packed = group.all_gather(torch.cat((query, rope), dim=-1), dim=1)
+    query, rope = packed.split((query.shape[-1], rope.shape[-1]), dim=-1)
+    requests = local_seq_lens.shape[0]
+    partial = torch.ops._C_ascend.npu_sparse_flash_attention_dcp(
+        query.contiguous(), rope.contiguous(), kv_cache[0], kv_cache[1], topk, counts,
+        block_table[:requests], query_ends[:requests], local_seq_lens, scale,
+    )
+    if prefetch is not None:
+        edge, selected, miss_counts, slots, destinations = prefetch
+        edge.launch(selected, miss_counts, slots, destinations)
+    return merge_sfa_dcp(*partial, group.device_group)
+
+
+@triton.jit
 def _pack(partial, maximum, total, send, rows: tl.constexpr, heads: tl.constexpr,
           local_heads: tl.constexpr, value_dim: tl.constexpr):
     features = tl.arange(0, value_dim)

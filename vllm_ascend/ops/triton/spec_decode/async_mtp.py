@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Device metadata for unchanged, request-major Q2 batches (no CP)."""
+"""Device metadata for unchanged, request-major Q2 batches."""
 
 from vllm.triton_utils import tl, triton
 
 
-@triton.jit(do_not_specialize=["num_reqs", "common_capacity", "target_capacity"])
+@triton.jit(do_not_specialize=["num_reqs", "common_capacity", "target_capacity", "local_capacity"])
 def prepare_async_mtp_kernel(
     bases,
     counts,
@@ -29,6 +29,11 @@ def prepare_async_mtp_kernel(
     MIXED_C8: tl.constexpr = False,
     table_c8=None,
     stride_c8: tl.constexpr = 0,
+    live_origins=None,
+    seq_local=None,
+    local_capacity=0,
+    DCP_WORLD: tl.constexpr = 1,
+    DCP_RANK: tl.constexpr = 0,
 ):
     rows = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     active = rows < num_reqs
@@ -39,6 +44,13 @@ def prepare_async_mtp_kernel(
     length = tl.where(active, current + 2, 0)
     tl.store(seq_common + rows, length, rows < common_capacity)
     tl.store(seq_target + rows, length, rows < target_capacity)
+    if DCP_WORLD > 1:
+        # The scratch prefix is already measured in rank-local slots.
+        origins = tl.load(live_origins + tl.where(active, rows, 0), True, other=0).to(tl.int32)
+        span = block0 * DCP_WORLD
+        tail = tl.minimum(block0, tl.maximum(0, length % span - DCP_RANK * block0))
+        local_length = origins + length // span * block0 + tail
+        tl.store(seq_local + rows, tl.where(active, local_length, 0), rows < local_capacity)
     # As in token packing below, contiguous stores avoid Ascend lowering paired
     # masked stride-2 stores into unmasked reads/writes of the entire tile.
     token = tl.program_id(0) * (2 * BLOCK) + tl.arange(0, 2 * BLOCK)
@@ -49,8 +61,9 @@ def prepare_async_mtp_kernel(
     # Triton-Ascend 3.2.0 gather rejects int32. Move the same 32-bit words
     # through its FP32 path, then restore integers before any arithmetic.
     # Numeric float conversion would lose position bits above 2**24.
+    lane = tl.arange(0, 2 * BLOCK) // 2
     position = tl.cast(
-        tl.gather(tl.cast(current, tl.float32, bitcast=True), tl.arange(0, 2 * BLOCK) // 2, 0),
+        tl.gather(tl.cast(current, tl.float32, bitcast=True), lane, 0),
         tl.int32,
         bitcast=True,
     ) + token % 2
@@ -58,12 +71,22 @@ def prepare_async_mtp_kernel(
     # inactive lanes a valid address and use unmasked loads so the address
     # selection cannot be discarded as redundant with a load mask. Tables are
     # allocated even for padding-only programs; active addresses are unchanged.
-    offset0 = tl.where(active_token, token_row * stride0 + position // block0, 0)
+    column0 = position // block0
+    owns_token = active_token
+    if DCP_WORLD > 1:
+        origin = tl.cast(
+            tl.gather(tl.cast(origins, tl.float32, bitcast=True), lane, 0),
+            tl.int32,
+            bitcast=True,
+        )
+        owns_token = active_token & (column0 % DCP_WORLD == DCP_RANK)
+        column0 = column0 // DCP_WORLD + origin // block0
+    offset0 = tl.where(owns_token, token_row * stride0 + column0, 0)
     offset1 = tl.where(active_token, token_row * stride1 + position // block1, 0)
     block_id0 = tl.load(table0 + offset0, True, other=0)
     block_id1 = tl.load(table1 + offset1, True, other=0)
     tl.store(positions + token, tl.where(active_token, position, 0), token < token_capacity)
-    tl.store(slots0 + token, tl.where(active_token, block_id0 * block0 + position % block0, -1), token < token_capacity)
+    tl.store(slots0 + token, tl.where(owns_token, block_id0 * block0 + position % block0, -1), token < token_capacity)
     tl.store(slots1 + token, tl.where(active_token, block_id1 * block1 + position % block1, -1), token < token_capacity)
     if MIXED_C8:
         physical = (

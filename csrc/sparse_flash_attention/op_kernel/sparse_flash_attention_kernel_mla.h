@@ -552,6 +552,8 @@ template <typename SFAT> __aicore__ inline void SparseFlashAttentionMla<SFAT>::I
     uint32_t avgBaseNum = 1;
     if (totalBaseNum > coreNum) {
         avgBaseNum = (totalBaseNum + coreNum - 1) / coreNum;
+        // Rounded tiles can leave trailing cores without a query row.
+        usedCoreNum = (totalBaseNum + avgBaseNum - 1) / avgBaseNum;
     }else {
         usedCoreNum = totalBaseNum;
     }

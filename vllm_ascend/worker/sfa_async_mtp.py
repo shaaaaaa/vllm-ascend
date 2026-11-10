@@ -69,7 +69,7 @@ class AsyncSFAModelRunner(NPUModelRunner):
             and self.parallel_config.pipeline_parallel_size == 1
             and not self.use_cp
         ):
-            raise ValueError("SFA async MTP preparation requires full SFA graphs, async MTP=1 and PP=PCP=DCP=1")
+            raise ValueError("SFA async MTP preparation requires full SFA graphs, async MTP=1, PP=PCP=1 and a supported KV layout")
         self._async_bases = torch.empty(self.max_num_reqs, dtype=torch.int32, device=self.device)
         self._async_snapshot = self._async_pending = self._async_built = None
         self._async_counts = None
@@ -86,12 +86,25 @@ class AsyncSFAModelRunner(NPUModelRunner):
         if len(groups) == 2 and self._sfa_full_graph is not None:
             tables = [group.block_table.gpu for group in groups]
             counts = torch.ones(self.max_num_reqs, dtype=torch.int64, device=self.device)
+            dcp = getattr(self, "dsa_decoder_dcp", False)
+            origins = self._async_bases.new_zeros(self.max_num_reqs) if dcp else None
             for key in self._sfa_full_graph.entries:
                 n, capacity = key.request_capacity, key.token_capacity
                 self._async_bases.zero_()
                 positions = self.positions.gpu.new_empty(capacity)
                 lengths = [self.seq_lens.gpu.new_empty(n + extra) for extra in (0, 1)]
                 slots = [group.slot_mapping.gpu.new_empty(capacity) for group in groups]
+                layout = {}
+                if dcp:
+                    layout.update(
+                        live_origins=origins, seq_local=lengths[1].new_empty(n + 1),
+                        local_capacity=n + 1, DCP_WORLD=self.dcp_size, DCP_RANK=self.dcp_rank,
+                    )
+                    if self._mixed_indexer_c8_names:
+                        layout.update(
+                            slots_c8=slots[1].new_empty(capacity, dtype=torch.long), MIXED_C8=True,
+                            table_c8=tables[1], stride_c8=tables[1].stride(0),
+                        )
                 prepare_async_mtp_kernel[(triton.cdiv(max(capacity // 2, n + 1), 32),)](
                     self._async_bases,
                     counts,
@@ -108,6 +121,7 @@ class AsyncSFAModelRunner(NPUModelRunner):
                     groups[0].block_size,
                     groups[1].block_size,
                     BLOCK=32,
+                    **layout,
                 )
             # Private token buffers: compile both supported proposal dtypes.
             tokens = self.input_ids.gpu.new_zeros(2 * self.max_num_reqs)
@@ -316,12 +330,22 @@ class AsyncSFAModelRunner(NPUModelRunner):
         high = s.bases + 2
         if np.any(high + 2 > self.max_model_len):
             return False
-        for group in batch.block_table.block_tables:
+        dcp = getattr(s.metadata[s.target_name], "sfa_dcp", None)
+        if dcp is not None:
+            origins = self._dsa_dcp_live_origins[:len(ids)]
+            compact = scheduled.dsa_dcp_compact_req_ids
+            if compact is None or any((req in compact) != bool(origin) for req, origin in zip(ids, origins)):
+                return False
+        for index, group in enumerate(batch.block_table.block_tables):
+            last_column = (high + 1) // group.block_size
+            if dcp is not None and index == 0:
+                # Check the full possible stripe extent identically on all TP ranks.
+                last_column = last_column // dcp.layout.world_size + origins // group.block_size
             if (
                 group._block_table_dirty
                 or not group.kernel_sizes
                 or group.block_size != group.kernel_sizes[0]
-                or np.any((high + 1) // group.block_size >= group.num_blocks_per_row[: len(ids)])
+                or np.any(last_column >= group.num_blocks_per_row[:len(ids)])
             ):
                 return False
         reason, frontiers, cold = staged_sfa_metadata_sparse_route(scheduled.kv_connector_metadata, ids)
@@ -426,7 +450,22 @@ class AsyncSFAModelRunner(NPUModelRunner):
             common.cold_compact_resumes = ()
             n, capacity = len(s.ids), s.key.token_capacity
             groups = self.input_batch.block_table.block_tables
-            prepare_async_mtp_kernel[(triton.cdiv(max(capacity // 2, item.seq_lens.numel()), 32),)](
+            dcp = getattr(item, "sfa_dcp", None)
+            local_capacity = 0
+            layout = {}
+            if getattr(item, "indexer_c8_slot_mapping", None) is not None:
+                layout.update(
+                    slots_c8=item.indexer_c8_slot_mapping, MIXED_C8=True,
+                    table_c8=item.indexer_c8_block_table, stride_c8=item.indexer_c8_block_table.stride(0),
+                )
+            if dcp is not None:
+                local_capacity = dcp.local_seq_lens.numel()
+                layout.update(
+                    live_origins=dcp.layout.live_origins, seq_local=dcp.local_seq_lens,
+                    local_capacity=local_capacity, DCP_WORLD=dcp.layout.world_size, DCP_RANK=dcp.layout.rank,
+                )
+            rows = max(capacity // 2, item.seq_lens.numel(), local_capacity)
+            prepare_async_mtp_kernel[(triton.cdiv(rows, 32),)](
                 self._async_bases,
                 self._async_counts,
                 self.positions.gpu,
@@ -445,16 +484,7 @@ class AsyncSFAModelRunner(NPUModelRunner):
                 groups[0].block_size,
                 groups[1].block_size,
                 BLOCK=32,
-                **(
-                    {
-                        "slots_c8": item.indexer_c8_slot_mapping,
-                        "MIXED_C8": True,
-                        "table_c8": item.indexer_c8_block_table,
-                        "stride_c8": item.indexer_c8_block_table.stride(0),
-                    }
-                    if getattr(item, "indexer_c8_slot_mapping", None) is not None
-                    else {}
-                ),
+                **layout,
             )
             common.seq_lens_cpu = common.num_computed_tokens_cpu = None
             item.seq_lens_cpu = None

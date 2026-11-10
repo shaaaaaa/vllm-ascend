@@ -2,12 +2,17 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import torch
 import vllm.v1.kv_cache_interface
 from typing_extensions import Self
+from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import get_dtype_size
 from vllm.v1.kv_cache_interface import MLAAttentionSpec
+
+if TYPE_CHECKING:
+    from vllm.config import VllmConfig
 
 
 @dataclass(frozen=True)
@@ -49,6 +54,15 @@ class AscendMLAAttentionSpec(MLAAttentionSpec):
     # Verified external compact-D residency policy; latent group only.
     dsa_compact_startup_scratch_tokens: int = 0
     dsa_compact_startup_dense_tokens: int = 0
+    # Qualified two-group decoder layout. The indexer has one full replica.
+    dsa_dcp_size: int | None = None
+
+    def max_memory_usage_bytes(self, vllm_config: "VllmConfig") -> int:
+        if self.dsa_dcp_size is None:
+            return super().max_memory_usage_bytes(vllm_config)
+        return cdiv(
+            vllm_config.model_config.max_model_len, self.block_size * self.dsa_dcp_size
+        ) * self.page_size_bytes
 
     @property
     def shared_indexer_key_dtype(self) -> torch.dtype:
@@ -183,12 +197,13 @@ class AscendMLAAttentionSpec(MLAAttentionSpec):
                         spec.shared_pool_alignment_bytes,
                         spec.dsa_compact_startup_scratch_tokens,
                         spec.dsa_compact_startup_dense_tokens,
+                        spec.dsa_dcp_size,
                     )
                     for spec in specs
                 }
             )
             == 1
-        ), "All layers in a KV group must share one indexer precision policy."
+        ), "All layers in a KV group must share one layout and precision policy."
         return cls(
             block_size=specs[0].block_size,
             num_kv_heads=specs[0].num_kv_heads,
@@ -202,6 +217,7 @@ class AscendMLAAttentionSpec(MLAAttentionSpec):
             shared_pool_alignment_bytes=specs[0].shared_pool_alignment_bytes,
             dsa_compact_startup_scratch_tokens=specs[0].dsa_compact_startup_scratch_tokens,
             dsa_compact_startup_dense_tokens=specs[0].dsa_compact_startup_dense_tokens,
+            dsa_dcp_size=specs[0].dsa_dcp_size,
         )
 
 

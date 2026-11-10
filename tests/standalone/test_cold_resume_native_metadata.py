@@ -35,18 +35,19 @@ def api():
         AscendSFAMetadata=NS,
         AttentionMaskBuilder=lambda device: NS(get_attention_mask=lambda config: None),
         enable_dsa_cp=lambda: False,
+        enable_dsa_cp_decoder=lambda: False,
         get_ascend_config=lambda: NS(indexer_c8_shared_block_factor=1),
         envs=NS(VLLM_ASCEND_DSA_UNBUNDLE=True, VLLM_ASCEND_DSA_SHRINK_LATENT=2, VLLM_ASCEND_MTP_DW_DEEP_DIAG=False),
         get_cos_and_sin_mla=lambda positions, _: (torch.zeros_like(positions), torch.zeros_like(positions)),
         staged_sfa_connector_supports_sparse_load=lambda: True,
     )
     path = Path(__file__).resolve().parents[2] / "vllm_ascend/attention/sfa_v1.py"
-    for filename, name in (("sfa_remap_boundary.py", "SFARemapBoundaryBuffer"),
-                           ("sfa_graph_layout.py", "FullGraphAttentionBuffers")):
-        spec = importlib.util.spec_from_file_location(name, path.with_name(filename))
+    for filename, names in (("sfa_remap_boundary.py", ("SFARemapBoundaryBuffer",)),
+                            ("sfa_graph_layout.py", ("FullGraphAttentionBuffers", "cp_slice", "cp_sequence_lengths"))):
+        spec = importlib.util.spec_from_file_location(Path(filename).stem, path.with_name(filename))
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
-        ns[name] = getattr(module, name)
+        ns.update({name: getattr(module, name) for name in names})
     tree = ast.parse(path.read_text(encoding="utf-8"))
     nodes = [
         n
@@ -112,6 +113,15 @@ def common(api, widths, cold_indices, *, computed=None, frontier=None, state="sp
         attn_state=state,
         cold_compact_resumes=markers,
     )
+
+
+def test_native_builder_carries_rank_local_geometry_without_changing_indexer_slots(builder, api):
+    cm = common(api, [1], [], state="decode")
+    cm.sfa_dcp = object()
+    metadata = builder.build(0, cm)
+    assert metadata.sfa_dcp is cm.sfa_dcp
+    assert metadata.indexer_slot_mapping.equal(cm.indexer_slot_mapping)
+    assert metadata.seq_lens.equal(cm.seq_lens)
 
 
 def route(api, metadata, widths):

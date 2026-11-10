@@ -584,8 +584,21 @@ def staged_sfa_graph_configuration_reasons(
         reasons.append(StagedSFAConfigReason.PIPELINE_PARALLEL)
     prefill_context_parallel_size = getattr(parallel_config, "prefill_context_parallel_size", 1)
     decode_context_parallel_size = getattr(parallel_config, "decode_context_parallel_size", 1)
-    if any(
-        isinstance(size, int) and size != 1 for size in (prefill_context_parallel_size, decode_context_parallel_size)
+    transfer = getattr(vllm_config, "kv_transfer_config", None)
+    # The platform selects graph sizes before the worker proves the cache
+    # layout and operator availability. Other CP backends keep their guard.
+    decoder_dcp_graph = (
+        decode_context_parallel_size in (2, 4, 8)
+        and decode_context_parallel_size == getattr(parallel_config, "tensor_parallel_size", 1)
+        and getattr(transfer, "kv_connector", None) == "LMCacheAscendConnectorV1Dynamic"
+        and getattr(transfer, "is_kv_consumer", False)
+        and not envs_ascend.VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE
+        and envs_ascend.VLLM_ASCEND_SFA_FULL_GRAPH
+    )
+    if (
+        (isinstance(prefill_context_parallel_size, int) and prefill_context_parallel_size != 1)
+        or (isinstance(decode_context_parallel_size, int) and decode_context_parallel_size != 1
+            and not decoder_dcp_graph)
     ):
         reasons.append(StagedSFAConfigReason.CONTEXT_PARALLEL)
     if envs_ascend.VLLM_ASCEND_ENABLE_DSA_LATENT_OFFLOAD:
@@ -777,6 +790,8 @@ def update_aclgraph_sizes(vllm_config: VllmConfig) -> None:
             parallel_config.tensor_parallel_size,
         ]
     )
+    if full_sfa_graph_active and getattr(parallel_config, "decode_context_parallel_size", 1) > 1:
+        num_comm_groups += 1
     max_num_batch_sizes = _max_aclgraph_keys(
         vllm_config,
         resources_per_graph,

@@ -1,12 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 """Execute bounded producer/consumer pre-compute with real CPU layout helpers."""
 
-from types import MethodType
+import sys
+from types import MethodType, ModuleType
 from types import SimpleNamespace as NS
 from unittest.mock import Mock
 
 import pytest
 import torch
+from test_sfa_dcp_forward import prepare_topk as host_prepare_topk
 
 from tests.ut.distributed.kv_transfer.test_shared_resident_plan import api as resident_api
 from tests.ut.distributed.kv_transfer.test_shared_resident_plan import grouped, load_source, methods
@@ -14,7 +16,8 @@ from tests.ut.distributed.kv_transfer.test_shared_resident_plan import grouped, 
 
 @pytest.mark.parametrize("explicit", [False, True])
 @pytest.mark.parametrize("c8", [False, True])
-def test_bounded_group_packs_and_restores_once_per_invocation(explicit, c8):
+@pytest.mark.parametrize("dcp_enabled", [False, True])
+def test_bounded_group_packs_and_restores_once_per_invocation(explicit, c8, dcp_enabled, monkeypatch):
     api = resident_api.__wrapped__()
     _, (producer, consumer), group, _ = grouped(api, mtp=2, bounded=True)
     layout = load_source("vllm_ascend/attention/sfa_graph_layout.py", "shared_bounded_layout")
@@ -29,6 +32,21 @@ def test_bounded_group_packs_and_restores_once_per_invocation(explicit, c8):
         unpack_decode_lanes=Mock(wraps=layout.unpack_decode_lanes),
     )
     methods("vllm_ascend/attention/sfa_v1.py", {"_cross_layer_pre_compute"}, ns)
+    if dcp_enabled:
+        ops = ModuleType("vllm_ascend.ops.triton.sfa_dcp")
+        ops.prepare_sfa_dcp_topk = Mock(side_effect=host_prepare_topk.__wrapped__())
+        monkeypatch.setitem(sys.modules, ops.__name__, ops)
+        resident_plan = api[1]["prepare_sorted_resident_cache_fused_"]
+        finalize = resident_plan.side_effect
+
+        def counted_finalize(topk, *args, dcp, **kwargs):
+            valid = (topk >= 0) & (topk // 128 % 4 == 1)
+            dcp.selected_counts[:, 0].copy_(valid.flatten(1).sum(1))
+            result = finalize(topk, *args, dcp=dcp, **kwargs)
+            topk.masked_fill_(~valid, -1)
+            return result
+
+        resident_plan.side_effect = counted_finalize
     frame = {}
     producer.use_sparse_c8_indexer = c8
     for layer, obj in enumerate((producer, consumer)):
@@ -63,6 +81,17 @@ def test_bounded_group_packs_and_restores_once_per_invocation(explicit, c8):
         ends = torch.tensor(widths).cumsum(0)
         rows = torch.tensor([r for r, width in enumerate(widths) for _ in range(width)] + [-1] * (tokens - sum(widths)))
         frame["raw"] = torch.arange(tokens * 2048, dtype=torch.int32).view(tokens, 1, 2048) + step * 10
+        dcp = None
+        if dcp_enabled:
+            counts = torch.full((tokens, 16), -77, dtype=torch.int32)
+            dcp = NS(
+                layout=api[1]["ResidentDcpLayout"](4, 1, torch.zeros(len(widths), dtype=torch.int32), counts.clone()),
+                positions=frame["raw"][:, 0, 0] + torch.arange(1, tokens + 1) * 113,
+                topk=torch.empty_like(frame["raw"]),
+                counts=counts,
+                row_requests=rows,
+                split_boundary=torch.where(rows >= 0, 10000, 0),
+            )
         kwargs = dict(
             hidden_states=torch.empty(tokens, 4),
             kv_cache_nope=torch.empty(1),
@@ -86,6 +115,7 @@ def test_bounded_group_packs_and_restores_once_per_invocation(explicit, c8):
             shard_counts_workspace=None,
             request_state_indices=torch.arange(len(widths)),
             request_state_generations=torch.ones(len(widths), dtype=torch.int64),
+            dcp=dcp,
         )
         first = producer._cross_layer_pre_compute(
             indexer_cache=torch.empty(tokens, 4, dtype=torch.int8 if c8 else torch.bfloat16),
@@ -94,7 +124,13 @@ def test_bounded_group_packs_and_restores_once_per_invocation(explicit, c8):
             **kwargs,
         )
         second = consumer._cross_layer_pre_compute(indexer_cache=None, resident_reads=reads, **kwargs)
-        expected = torch.where((rows >= 0)[:, None, None], frame["raw"] + 100, -1)
+        valid = (rows >= 0)[:, None, None]
+        if dcp is not None:
+            valid = valid & (frame["raw"] <= dcp.positions[:, None, None]) & (frame["raw"] // 128 % 4 == 1)
+            assert torch.equal(dcp.counts[:, 0], valid.flatten(1).sum(1).int())
+            assert (dcp.counts[:, 1:] == -77).all()
+            assert ops.prepare_sfa_dcp_topk.call_count == step
+        expected = torch.where(valid, frame["raw"] + 100, -1)
         assert torch.equal(first[2], expected) and torch.equal(second[2], expected)
         assert torch.equal(producer.topk_indices_buffer[:tokens], frame["raw"].squeeze(1))
         assert first[2].data_ptr() == (writes[-1] if explicit else group.attention_topk).data_ptr()
@@ -104,7 +140,8 @@ def test_bounded_group_packs_and_restores_once_per_invocation(explicit, c8):
         assert len(producer.indexer_select_post_process.call_args.kwargs["kv_cache"]) == (4 if c8 else 3)
         assert ns["torch_npu"].npu_scatter_nd_update_.call_count == step * (2 if c8 else 1)
         assert not torch.equal(first[0], second[0])  # Queries remain layer-local.
-        assert ns["pack_decode_lanes"].call_count == ns["unpack_decode_lanes"].call_count == step
+        assert ns["pack_decode_lanes"].call_count == step
+        assert ns["unpack_decode_lanes"].call_count == step * (2 if dcp_enabled else 1)
         assert api[1]["prepare_resident_sharded_union_"].call_count == step
     consumer.indexer_select_pre_process.assert_not_called()
     consumer.indexer_select_post_process.assert_not_called()

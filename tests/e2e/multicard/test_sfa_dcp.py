@@ -3,6 +3,7 @@
 
 import os
 from datetime import timedelta
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -17,7 +18,7 @@ def test_counted_sfa_dcp_collectives_replay():
     if world not in (4, 8):
         pytest.skip("launch with torchrun and 4 or 8 local NPU ranks")
     import vllm_ascend.vllm_ascend_C  # noqa: F401
-    from vllm_ascend.ops.triton.sfa_dcp import merge_sfa_dcp
+    from vllm_ascend.ops.triton.sfa_dcp import execute_sfa_dcp
 
     torch.npu.set_device(int(os.environ["LOCAL_RANK"]))
     dist.init_process_group("hccl", timeout=timedelta(seconds=120))
@@ -30,7 +31,7 @@ def test_counted_sfa_dcp_collectives_replay():
         rng = torch.Generator().manual_seed(174)
         all_q = torch.randn((rows, heads, 576), generator=rng, dtype=torch.bfloat16)
         cache = torch.randn((world, 128, 576), generator=rng, dtype=torch.bfloat16)
-        q = all_q[:, owned].transpose(0, 1).contiguous().npu()
+        nope, rope = all_q[:, owned].npu().split((512, 64), dim=-1)
         k = cache[rank, :, :512].contiguous().view(1, 128, 1, 512).npu()
         pe = cache[rank, :, 512:].contiguous().view(1, 128, 1, 64).npu()
         table = torch.tensor([[0]], dtype=torch.int32, device="npu")
@@ -40,14 +41,16 @@ def test_counted_sfa_dcp_collectives_replay():
         counts = torch.zeros((rows, 16), dtype=torch.int32, device="npu")
         scale = 576**-0.5
 
+        def all_gather(packet, *, dim):
+            head_major = packet.movedim(dim, 0).contiguous()
+            gathered = head_major.new_empty((heads, rows, 576))
+            dist.all_gather_into_tensor(gathered, head_major)
+            return gathered.movedim(0, dim)
+
+        group = SimpleNamespace(all_gather=all_gather, device_group=dist.group.WORLD)
+
         def forward():
-            gathered = torch.empty((heads, rows, 576), dtype=q.dtype, device=q.device)
-            dist.all_gather_into_tensor(gathered, q)
-            nope, rope = gathered.transpose(0, 1).split((512, 64), dim=-1)
-            result = torch.ops._C_ascend.npu_sparse_flash_attention_dcp(
-                nope.contiguous(), rope.contiguous(), k, pe, indices, counts, table, q_lens, kv_lens, scale
-            )
-            return merge_sfa_dcp(*result, dist.group.WORLD)
+            return execute_sfa_dcp(nope, rope, (k, pe), indices, counts, table, q_lens, kv_lens, scale, group)
 
         forward()
         torch.npu.synchronize()

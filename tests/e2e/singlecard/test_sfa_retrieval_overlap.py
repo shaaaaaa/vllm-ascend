@@ -111,6 +111,50 @@ def test_counted_sfa_replay_ignores_stale_pair_tail():
         graph.reset()
 
 
+@torch.inference_mode()
+@pytest.mark.parametrize("mixed", [False, True])
+def test_native_dcp_topk_filters_causal_rows_on_npu(mixed):
+    from vllm_ascend.ops.triton.sfa_dcp import prepare_sfa_dcp_topk
+
+    torch.npu.set_device(0)
+    topk = torch.full((3, 1, 2048), -1, dtype=torch.int32, device="npu")
+    topk[:, 0, :5] = torch.tensor([127, 128, 129, 256, 640], dtype=torch.int32, device="npu")
+    positions = torch.tensor([128, 640, 700], dtype=torch.int64, device="npu")
+    output = torch.empty_like(topk)
+    counts = torch.empty((3, 16), dtype=torch.int32, device="npu")
+    rows = torch.tensor([0, -1, -1], dtype=torch.int32, device="npu") if mixed else None
+    prepare_sfa_dcp_topk(topk, positions, output, counts, 2, 4, 1, 128, local=not mixed, row_requests=rows)
+    expected_first = [127, 128, -1, -1] if mixed else [0, -1, -1, -1]
+    assert output[:, 0, :4].cpu().tolist() == [expected_first, [0, 1, 128, -1], [-1, -1, -1, -1]]
+    assert counts[(1 if mixed else 0):, 0].cpu().tolist() == ([3, 0] if mixed else [1, 3, 0])
+    assert output[:, :, 4:].cpu().eq(-1).all()
+
+
+@torch.inference_mode()
+def test_dcp_draft_tail_mask_handles_ragged_request_boundaries_on_npu():
+    from vllm_ascend.ops.triton.spec_decode.utils import prepare_dcp_mtp_draft_kernel
+
+    torch.npu.set_device(0)
+    starts = torch.tensor([0, 1, 3, 5, 8], dtype=torch.int32, device="npu")
+    ends = torch.tensor([128, 130, 513, 1048576], dtype=torch.int32, device="npu")
+    rejected = torch.tensor([0, 1, 0, 0], dtype=torch.int32, device="npu")
+    origins = torch.tensor([0, 4096, 4096, 0], dtype=torch.int32, device="npu")
+    positions = torch.tensor([127, 128, 129, 511, 512, 1048573, 1048574, 1048575], device="npu")
+    slots0 = torch.tensor([-1, 1280, 1281, -1, -1, -1, -1, -1], device="npu")
+    slots1 = torch.arange(8, device="npu") + 4096
+    outputs = [torch.empty(8, dtype=torch.int32, device="npu") for _ in range(3)]
+    lengths = torch.empty_like(ends)
+    prepare_dcp_mtp_draft_kernel[(2,)](
+        starts, ends, rejected, origins, positions, slots0, slots1, *outputs, lengths, 4,
+        WORLD=4, RANK=1, BLOCK_SIZE=128, TILE=64,
+    )
+    for src, dst in zip((positions, slots0, slots1), outputs):
+        expected = src.cpu().int()
+        expected[2] = -1
+        torch.testing.assert_close(dst.cpu(), expected)
+    assert lengths.cpu().tolist() == [0, 4097, 4224, 262144]
+
+
 @pytest.mark.parametrize("world,rank", [(4, 0), (4, 3), (8, 7)])
 def test_dcp_planner_replays_owned_misses_into_counted_attention(world, rank):
     root = Path(os.environ.get("LMCACHE_ASCEND_SOURCE_DIR", str(ROOT.parent / "LMCache-Ascend")))

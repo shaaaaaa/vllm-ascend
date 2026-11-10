@@ -143,6 +143,64 @@ def test_metadata_gather_preserves_integer_bits(monkeypatch):
         torch.testing.assert_close(slot, (expected % 2**30).int(), rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("world,rank", [(2, 0), (2, 1), (4, 1), (4, 3), (8, 0), (8, 7)])
+@pytest.mark.parametrize("n", [0, 3, 33])
+def test_dcp_accepted_positions_keep_replicated_indexer_slots(world, rank, n, monkeypatch):
+    capacity = 2 * (n + 3)
+    rows = torch.arange(n, dtype=torch.int32)
+    bases = 1048576 - 128 * (rows + 1) - 2
+    counts = rows.long() % 2 + 1
+    current = bases + counts.int()
+    origins = torch.where(rows % 2 == 0, 4096, 0)
+    positions = torch.full((capacity + 1,), -77, dtype=torch.int64)
+    local = torch.full((n + 4,), -77, dtype=torch.int32)
+    lengths = [torch.empty(size, dtype=torch.int32) for size in (n, n + 1)]
+    slots = [torch.full((capacity + 1,), -77, dtype=torch.int64) for _ in range(3)]
+    tables = [
+        torch.arange(max(n, 1) * stride, dtype=torch.int32).view(-1, stride) + 1
+        for stride in (8192 // world + 32, 8192, 8200)
+    ]
+    kernel = Kernel([])
+    load = kernel.tl.load
+    indexed = {table.data_ptr() for table in tables} | {origins.data_ptr()}
+
+    def checked_load(ptr, mask, other):
+        if ptr.data.numel() and ptr.data.data_ptr() in indexed:
+            load(ptr, True, other)  # Ascend gathers can read before applying the mask.
+        return load(ptr, mask, other)
+
+    monkeypatch.setattr(kernel.tl, "load", checked_load)
+    # Even an idle graph has preallocated origin and table storage.
+    origin_storage = origins if n else torch.zeros(1, dtype=torch.int32)
+    kernel[((n + 3 + 31) // 32,)](
+        bases, counts, positions, *lengths, *tables[:2], *slots[:2],
+        n, capacity, n, n + 1, tables[0].stride(0), tables[1].stride(0),
+        128, 128, BLOCK=32, slots_c8=slots[2], MIXED_C8=True, table_c8=tables[2],
+        stride_c8=tables[2].stride(0), live_origins=origin_storage, seq_local=local,
+        local_capacity=n + 3, DCP_WORLD=world, DCP_RANK=rank,
+    )
+    end = current + 2
+    torch.testing.assert_close(bases, current)
+    torch.testing.assert_close(lengths[0], end)
+    assert lengths[1].tolist() == [*end, 0]
+    assert local.tolist() == [
+        *(int(o) + (int(t) // (128 * world)) * 128 + min(128, max(0, int(t) % (128 * world) - rank * 128))
+          for t, o in zip(end, origins)),
+        0, 0, 0, -77,
+    ]
+    expected = [[], [], []]
+    for row, (base, origin) in enumerate(zip(current.tolist(), origins.tolist())):
+        for position in (base, base + 1):
+            stripe, offset = divmod(position, 128)
+            slot = int(tables[0][row, origin // 128 + stripe // world]) * 128 + offset
+            expected[0].append(slot if stripe % world == rank else -1)
+            for group in (1, 2):
+                expected[group].append(int(tables[group][row, stripe]) * 128 + offset)
+    assert positions.tolist() == [*(int(base) + j for base in current for j in (0, 1)), *([0] * 6), -77]
+    for actual, wanted in zip(slots, expected):
+        assert actual.tolist() == [*wanted, *([-1] * 6), -77]
+
+
 @pytest.mark.parametrize("n,capacity", [(1, 8), (3, 8), (16, 32), (32, 64), (33, 80), (63, 128)])
 @pytest.mark.parametrize("alias_lengths", [False, True])
 def test_separate_group_strides_and_padding(n, capacity, alias_lengths):

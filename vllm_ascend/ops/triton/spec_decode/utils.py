@@ -104,3 +104,27 @@ def pack_mtp_tokens_positions_kernel(tokens, positions, out_tokens, out_position
     tl.store(out_tokens + rows, shifted, rows + 1 < num_tokens)
     position = tl.load(positions + rows, rows < num_tokens, other=0)
     tl.store(out_positions + rows, position, rows < num_tokens)
+
+
+@triton.jit(do_not_specialize=["num_reqs"])
+def prepare_dcp_mtp_draft_kernel(
+    query_starts, seq_lens, rejected, origins, positions, slots0, slots1,
+    out_positions, out_slots0, out_slots1, local_lengths, num_reqs,
+    WORLD: tl.constexpr, RANK: tl.constexpr, BLOCK_SIZE: tl.constexpr, TILE: tl.constexpr,
+):
+    """Mask the rejected tail of the existing padded draft layout."""
+    for req in tl.range(tl.program_id(0), num_reqs, tl.num_programs(0)):
+        start = tl.load(query_starts + req)
+        end = tl.load(query_starts + req + 1)
+        reject = 0 if rejected is None else tl.load(rejected + req)
+        visible_end = tl.load(seq_lens + req) - reject
+        span = WORLD * BLOCK_SIZE
+        tail = tl.minimum(tl.maximum(visible_end % span - RANK * BLOCK_SIZE, 0), BLOCK_SIZE)
+        tl.store(local_lengths + req, tl.load(origins + req) + visible_end // span * BLOCK_SIZE + tail)
+        for begin in tl.range(start, end, TILE):
+            row = begin + tl.arange(0, TILE)
+            active = row < end
+            keep = row < end - reject
+            tl.store(out_positions + row, tl.load(positions + row, keep, other=-1), active)
+            tl.store(out_slots0 + row, tl.load(slots0 + row, keep, other=-1), active)
+            tl.store(out_slots1 + row, tl.load(slots1 + row, keep, other=-1), active)

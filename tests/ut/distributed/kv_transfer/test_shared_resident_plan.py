@@ -189,6 +189,7 @@ def runner_api(implementations, kinds):
         parallel_config=NS(enable_dbo=False),
     )
     runner.dsa_resident_cache = True
+    runner.dsa_decoder_dcp = False
     runner.max_num_reqs = 2
     runner._shared_resident_groups = []
     runner._shared_resident_failed = False
@@ -406,6 +407,23 @@ def test_preflight_rejects_separate_metadata_before_model_execution(api):
     ns["get_forward_context"] = lambda: NS(attn_metadata={name: metadata(group) for name in group.members})
     with pytest.raises(ValueError, match="same live"):
         runner._prepare_shared_resident_plans(1)
+
+
+def test_dcp_mixed_forward_preserves_shared_resident_generation(api):
+    runner, _, group, ns = grouped(api)
+    common = metadata(group)
+    common.attn_state = 3  # One dense row alongside a compact decode row.
+    common.req_ids = ["r", "dense"]
+    common.sfa_dcp = NS(row_requests=torch.tensor([0, -1]))
+    ns["get_forward_context"] = lambda: NS(attn_metadata=dict.fromkeys(group.members, common))
+    registry = runner._resident_state_registry
+    _, before = registry.bind(["r"], [(2, 1)])
+    runner._prepare_shared_resident_plans(2)
+    _, after = registry.bind(["r"], [(2, 1)])
+    np.testing.assert_array_equal(after, before)
+    common.resident_state_generations = None
+    with pytest.raises(RuntimeError, match="request state"):
+        runner._prepare_shared_resident_plans(2)
 
 
 @pytest.mark.parametrize("fault", [None, "builder", "block_size", "stride", "dtype"])

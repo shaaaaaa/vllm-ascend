@@ -876,6 +876,18 @@ def test_dummy_dispatch_passes_idle_status_to_layout_agreement():
     assert isinstance(vote, ast.Name) and vote.id == "dp_idle"
 
 
+@pytest.mark.parametrize("method,key", [("execute_model", "staged_sfa_graph_key"), ("_dummy_run", "staged_dummy_key")])
+def test_dcp_graph_key_is_passed_to_metadata_construction(method, key):
+    path = Path(__file__).resolve().parents[3] / "vllm_ascend/worker/model_runner_v1.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    forward = next(node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef) and node.name == method)
+    calls = [node for node in ast.walk(forward) if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)]
+    [(target, keyword)] = [
+        (call.func.attr, kw) for call in calls for kw in call.keywords if kw.arg == "dsa_dcp_graph_key"
+    ]
+    assert target == "_build_attention_metadata" and isinstance(keyword.value, ast.Name) and keyword.value.id == key
+
+
 @pytest.mark.parametrize("metadata_groups", [1, 2])
 @pytest.mark.parametrize("c8", [False, True])
 @pytest.mark.parametrize("idle", [False, True])

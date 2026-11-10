@@ -8,6 +8,7 @@ from types import SimpleNamespace as NS
 
 import numpy as np
 import pytest
+import torch
 
 ROOT = Path(__file__).resolve().parents[2] / "vllm_ascend"
 
@@ -89,10 +90,11 @@ def test_input_preparation_uses_single_legacy_table_on_d(p_node):
         )
 
     primary, shadow = table("primary"), table("shadow")
-    obj = NS(layerwise_prefill_p_node=p_node, input_batch=NS(block_table=primary))
+    obj = NS(layerwise_prefill_p_node=p_node, dsa_decoder_dcp=False, input_batch=NS(block_table=primary))
     if p_node:
         obj._refresh_layerwise_prefill_block_tables = lambda: (primary, shadow)
-    execute(nodes, dict(self=obj, num_reqs=1, req_indices="req", positions_np="pos", total_num_scheduled_tokens=3))
+    execute(nodes, dict(self=obj, num_reqs=1, req_indices="req", positions_np="pos",
+                        total_num_scheduled_tokens=3, scheduler_output=NS(dsa_dcp_compact_req_ids=None)))
     assert seen == (
         [
             ("primary", "blocks", 1),
@@ -105,6 +107,53 @@ def test_input_preparation_uses_single_legacy_table_on_d(p_node):
         if p_node
         else [("primary", "blocks", 1), ("primary", "slots", "req", "pos"), ("primary", "commit", 3)]
     )
+
+
+@pytest.mark.parametrize("dcp_size", [4, 8])
+@pytest.mark.parametrize("rank", [0, 1])
+def test_dcp_slot_mapping_keeps_indexer_replicated_and_shifts_only_compact_rows(dcp_size, rank):
+    def buffer(*shape, **kwargs):
+        return NS(np=np.zeros(shape, dtype=np.int32), copy_to_gpu=lambda count: None)
+
+    scope = dict(
+        np=np, torch=torch, CpuGpuBuffer=buffer, cdiv=lambda a, b: (a + b - 1) // b,
+        get_dcp_group=lambda: NS(world_size=dcp_size, rank_in_group=rank),
+        get_pcp_group=lambda: NS(world_size=1, rank_in_group=0),
+    )
+    tree = ast.parse((ROOT / "worker/block_table.py").read_text(encoding="utf-8"))
+    execute([n for n in tree.body if isinstance(n, ast.ClassDef)], scope)
+    tables = scope["MultiGroupBlockTable"](
+        2, 2048, 4, False, torch.device("cpu"), [128, 128],
+        num_speculative_tokens=1, max_num_blocks=[40, 16], kernel_sizes=[[128], [128]],
+        cp_kv_cache_interleave_size=128, dsa_dcp_sizes=[dcp_size, 1],
+    )
+    tables.add_row(([7], list(range(20, 36))), 1)
+    tables.add_row((list(range(1, 33)) + [0, 51], list(range(40, 56))), 0)
+    prepare = method("worker/model_runner_v1.py", "NPUModelRunner", "_prepare_inputs")
+    mapping = next(n for n in prepare.body if isinstance(n, ast.If)
+                   and ast.unparse(n.test) == "self.layerwise_prefill_p_node"
+                   and calls(n, "compute_slot_mapping"))
+    positions = np.array([127, 128, 128 * dcp_size, 128 * (dcp_size + 1)])
+    runner = NS(
+        layerwise_prefill_p_node=False, dsa_decoder_dcp=True,
+        input_batch=NS(block_table=tables, req_ids=["compact", "dense"]),
+        _dsa_dcp_scratch_origin=4096,
+        _dsa_dcp_live_origins=np.zeros(2, dtype=np.int32),
+    )
+    inputs = dict(self=runner, num_reqs=2, req_indices=np.array([1, 1, 0, 0]),
+                  positions_np=positions, total_num_scheduled_tokens=4,
+                  scheduler_output=NS(dsa_dcp_compact_req_ids=None))
+    with pytest.raises(RuntimeError, match="missing the compact table layout"):
+        execute([mapping], inputs)
+    inputs["scheduler_output"].dsa_dcp_compact_req_ids = {"compact"}
+    execute([mapping], inputs)
+    assert tables[0].block_table.np.shape == (2, 40)
+    assert tables[0].slot_mapping.np[:4].tolist() == (
+        [7 * 128 + 127, -1, 51 * 128, -1] if rank == 0 else [-1, 7 * 128, -1, 51 * 128]
+    )
+    assert tables[1].slot_mapping.np[:4].tolist() == [
+        20 * 128 + 127, 21 * 128, (40 + dcp_size) * 128, (41 + dcp_size) * 128,
+    ]
 
 
 @pytest.mark.parametrize("p_node", [False, True])
