@@ -90,11 +90,13 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> npu_sparse_flash_attention_dcp(
     char paged[] = "PA_BSND";
     char *layout_query = tnd;
     char *layout_kv = paged;
+    const int64_t sparse_block_size = 1;
+    const int64_t sparse_mode = 0;
     EXEC_NPU_CMD(
         aclnnSparseFlashAttentionDcp, query, key, key, sparse_indices, block_table,
         actual_seq_lengths_query, actual_seq_lengths_kv, query_rope, key_rope,
-        selected_counts, scale_value, int64_t{1}, layout_query, layout_kv,
-        int64_t{0}, output, softmax_max, softmax_sum);
+        selected_counts, scale_value, sparse_block_size, layout_query, layout_kv,
+        sparse_mode, output, softmax_max, softmax_sum);
     return {output, softmax_max, softmax_sum};
 }
 }

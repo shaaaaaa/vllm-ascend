@@ -1,10 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Verify the native build's ACLNN source selection without a CANN SDK."""
+"""Verify ACLNN source selection and host binding arguments without a CANN SDK."""
 
+import os
+import shlex
 import shutil
 import subprocess
+from pathlib import Path
 
 import pytest
+import torch
 from sfa_test_support import ROOT
 
 
@@ -49,3 +53,52 @@ file(WRITE "${{CMAKE_BINARY_DIR}}/aclnn_sources.txt" "${{generate_aclnn_srcs}}")
     assert result.returncode == 0, result.stderr
     sources = (out / "aclnn_sources.txt").read_text(encoding="utf-8").split(";")
     assert sources == [f"autogen/aclnn_{op}.cpp" for op in selected]
+
+
+def test_sfa_torch_adapter_arguments_compile(tmp_path):
+    compiler = shlex.split(os.environ.get("CXX", "c++"))
+    if not compiler or not shutil.which(compiler[0]):
+        pytest.skip("requires a host C++ compiler")
+
+    native = ROOT / "csrc"
+    bridge = (native / "aclnn_torch_adapter/op_api_common.h").read_text(encoding="utf-8")
+    start = bridge.index("template <typename... Ts>\nconstexpr auto ConvertTypes(")
+    converter = bridge[start : bridge.index("\n}", start) + 2]
+    source = tmp_path / "sfa_adapter.cpp"
+    # Keep the real Torch types and ConvertTypes contract in the launch stub.
+    source.write_text(
+        f"""#include <ATen/Tensor.h>
+#include <ATen/ops/empty.h>
+#include <ATen/ops/empty_like.h>
+#include <c10/util/Optional.h>
+#include <c10/util/string_view.h>
+#include <tuple>
+
+template <typename T>
+T ConvertType(T value) {{ return value; }}
+
+{converter}
+
+#define EXEC_NPU_CMD(op, ...) static_cast<void>(ConvertTypes(__VA_ARGS__))
+#include "sparse_flash_attention_torch_adpt.h"
+""",
+        encoding="utf-8",
+    )
+    result = subprocess.run(
+        [
+            *compiler,
+            "-std=c++17",
+            "-c",
+            "-I",
+            str(Path(torch.__file__).resolve().parent / "include"),
+            "-I",
+            str(native / "sparse_flash_attention"),
+            str(source),
+            "-o",
+            str(tmp_path / "sfa_adapter.o"),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stderr
