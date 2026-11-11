@@ -141,26 +141,61 @@ class CaptureProbe:
             torch.mm(self.matrix, self.matrix, out=self.product)
             self.edge.join()
             self.observed.copy_(self.dest)
-        parity_failed = False
+        failures = []
+        rank = 0 if self.dcp_group is None else self.dcp_group.rank_in_group
+        world = 1 if self.dcp_group is None else self.dcp_group.world_size
         for value in (1, 7, 2):
-            rank = 0 if self.dcp_group is None else self.dcp_group.rank_in_group
             self.source.fill_(value + rank)
             self.graph.replay()
-            expected = torch.full((64,), float(value))
+            expected = torch.full((64,), float(value), dtype=self.source.dtype, device="cpu")
             if self.dcp_group is not None:
-                world = self.dcp_group.world_size
                 expected.fill_(world * value + world * (world-1) / 2)
                 expected[rank+1:] = 0
-            if not torch.equal(self.observed.cpu(), expected):
+            observed = self.observed.cpu()
+            if not torch.equal(observed, expected):
+                # Only a failed startup probe pays for these extra readbacks.
+                # Snapshot before the next replay overwrites the evidence. These
+                # are observations, not proof that one particular stream caused
+                # the mismatch: a broken join can still have work in flight.
+                snapshots = [
+                    ("observed", observed, expected),
+                    ("source", self.source, torch.full_like(expected, float(value + rank))),
+                    ("destination", self.dest, expected),
+                ]
+                if self.dcp_group is not None:
+                    gathered_expected = (
+                        torch.arange(world, dtype=expected.dtype, device="cpu") + value
+                    ).repeat_interleave(64)
+                    snapshots.extend((
+                        ("gathered", gathered, gathered_expected),
+                        ("selected", self.selected, expected),
+                        ("exchange", self.exchange, torch.full_like(gathered_expected, float(value + rank))),
+                    ))
+                details = []
+                for name, actual, wanted in snapshots:
+                    try:
+                        actual, wanted = actual.cpu().flatten(), wanted.flatten()
+                        bad = (actual != wanted).nonzero().flatten()
+                        sample = bad[:8]
+                        details.append(
+                            f"{name}: mismatches={bad.numel()} indices={sample.tolist()} "
+                            f"actual={actual[sample].tolist()} expected={wanted[sample].tolist()}"
+                        )
+                    except Exception as error:
+                        # Optional diagnostics must not abandon peer replays.
+                        details.append(f"{name}: diagnostic readback failed: {type(error).__name__}: {error}")
+                failures.append(f"replay={value}; " + "; ".join(details))
                 if self.dcp_group is None:
-                    raise RuntimeError("shared retrieval multi-stream capture probe failed")
+                    raise RuntimeError("shared retrieval multi-stream capture probe failed: " + failures[-1])
                 # A local parity mismatch must not skip collectives that peers
                 # will replay. The enclosing preparation agreement propagates
                 # this failure after every participant finishes the probe.
-                parity_failed = True
         torch.npu.synchronize()
-        if parity_failed:
-            raise RuntimeError("shared retrieval multi-stream capture probe failed")
+        if failures:
+            raise RuntimeError(
+                f"shared retrieval multi-stream capture probe failed: rank={rank} world_size={world}; "
+                + " | ".join(failures)
+            )
 
 
 class SharedRetrievalOverlap:

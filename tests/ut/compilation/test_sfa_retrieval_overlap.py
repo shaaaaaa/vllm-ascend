@@ -31,7 +31,8 @@ def test_runner_constructor_reads_module_environment_without_local_shadowing():
     assert table.lookup("envs_ascend").is_imported()
 
 
-def test_dcp_probe_parity_failure_does_not_abandon_peer_replays(monkeypatch):
+@pytest.mark.parametrize("readback_failure", [False, True])
+def test_dcp_probe_parity_failure_does_not_abandon_peer_replays(monkeypatch, readback_failure):
     source = ROOT / "vllm_ascend/compilation/sfa_retrieval_overlap.py"
     tree = ast.parse(source.read_text(encoding="utf-8"))
     cls = next(n for n in tree.body if getattr(n, "name", "") == "CaptureProbe")
@@ -52,11 +53,59 @@ def test_dcp_probe_parity_failure_does_not_abandon_peer_replays(monkeypatch):
         # still enter all three captured HCCL sequences before outer agreement.
         probe.observed[0] = -1 if len(replays) == 1 else 2*probe.source[0]+1
     probe.graph = NS(replay=replay)
+    if readback_failure:
+        original_cpu = torch.Tensor.cpu
+
+        def cpu(tensor, *args, **kwargs):
+            if tensor is probe.dest:
+                raise RuntimeError("injected readback failure")
+            return original_cpu(tensor, *args, **kwargs)
+
+        monkeypatch.setattr(torch.Tensor, "cpu", cpu)
     monkeypatch.setattr(torch, "npu", NS(synchronize=lambda: None, graph=lambda _: nullcontext()), raising=False)
     monkeypatch.setattr(torch.distributed, "all_to_all_single", lambda *args, **kwargs: None)
-    with pytest.raises(RuntimeError, match="capture probe failed"):
+    with pytest.raises(RuntimeError, match="capture probe failed") as error:
         ns["verify"](probe)
     assert replays == [1, 7, 2]
+    message = str(error.value)
+    assert "rank=0 world_size=2" in message
+    assert "replay=1" in message
+    assert "observed" in message and "expected" in message
+    assert "gathered" in message and "selected" in message and "destination" in message
+    # Preserve the original failed value, not the later successful replay.
+    assert "actual=[-1.0]" in message
+    if readback_failure:
+        assert "destination: diagnostic readback failed: RuntimeError: injected readback failure" in message
+
+
+@pytest.mark.parametrize("world,rank", [(1, 0), (2, 1), (4, 3), (8, 7)])
+def test_capture_probe_success_keeps_one_readback_per_replay(monkeypatch, world, rank):
+    source = ROOT / "vllm_ascend/compilation/sfa_retrieval_overlap.py"
+    verify = extract(source, "verify", {"torch": torch})
+    observed = torch.empty(64)
+    observed_cpu = Mock(side_effect=lambda: observed)
+    probe = NS(source=torch.zeros(64), selected=torch.zeros(64), mask=torch.arange(64) < rank + 1,
+               dest=torch.empty(64), observed=NS(copy_=observed.copy_, cpu=observed_cpu),
+               exchange=torch.empty(64 * world), matrix=torch.ones(16, 16), product=torch.empty(16, 16),
+               edge=NS(launch=lambda *args: None, join=lambda: None), dcp_group=None)
+    if world > 1:
+        probe.dcp_group = NS(rank_in_group=rank, world_size=world, device_group=object(),
+                             all_gather=lambda tensor, dim: tensor.repeat(world))
+    replays = []
+
+    def replay():
+        value = float(probe.source[0]) - rank
+        replays.append(value)
+        observed.fill_(value if world == 1 else world * value + world * (world - 1) / 2)
+        if world > 1:
+            observed[rank + 1:] = 0
+
+    probe.graph = NS(replay=replay)
+    monkeypatch.setattr(torch, "npu", NS(synchronize=lambda: None, graph=lambda _: nullcontext()), raising=False)
+    monkeypatch.setattr(torch.distributed, "all_to_all_single", lambda *args, **kwargs: None)
+    verify(probe)
+    assert replays == [1, 7, 2]
+    assert observed_cpu.call_count == 3
 
 
 @pytest.fixture
