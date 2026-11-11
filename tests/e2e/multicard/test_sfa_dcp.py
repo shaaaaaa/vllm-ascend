@@ -12,6 +12,37 @@ import torch.distributed as dist
 torch_npu = pytest.importorskip("torch_npu")
 
 
+def _use_variable_dcp_exchange(monkeypatch):
+    """Select HcclAlltoAllV without changing packet bytes or completion policy."""
+    exchange = dist.all_to_all_single
+
+    def all_to_all(output, input, output_split_sizes=None, input_split_sizes=None,
+                   group=None, async_op=False):
+        world = dist.get_world_size(group)
+        # Splits count dimension-zero rows, not elements: the startup probe is
+        # 1D, while native SFA exchanges [world, rows, heads, packet_width].
+        if not output_split_sizes:
+            assert output.shape[0] % world == 0
+            output_split_sizes = [output.shape[0] // world] * world
+        if not input_split_sizes:
+            assert input.shape[0] % world == 0
+            input_split_sizes = [input.shape[0] // world] * world
+        return exchange(output, input, output_split_sizes, input_split_sizes,
+                        group=group, async_op=async_op)
+
+    monkeypatch.setattr(dist, "all_to_all_single", all_to_all)
+
+
+def _dcp_test_group(mode):
+    options = torch_npu._C._distributed_c10d.ProcessGroupHCCL.Options()
+    config = {"hccl_buffer_size": 200}  # Match the production DCP group.
+    if mode == "group-host":
+        config["hccl_op_expansion_mode"] = 1
+    # The pybind getter returns a copy; assign the complete options dictionary.
+    options.hccl_config = config
+    return dist.new_group(backend="hccl", pg_options=options, timeout=timedelta(seconds=120))
+
+
 def _verify_dcp_probe(probe):
     error = None
     try:
@@ -100,15 +131,40 @@ def dcp_world():
         dist.destroy_process_group()
 
 
+@pytest.fixture
+def dcp_transport(request, monkeypatch, dcp_world):
+    """Keep workaround experiments out of production and out of other cases."""
+    mode = request.param
+    if dist.get_rank() == 0:
+        print(f"DCP diagnostic transport: variant={mode} "
+              f"global_mode={os.getenv('HCCL_OP_EXPANSION_MODE')} "
+              f"task_queue={os.getenv('TASK_QUEUE_ENABLE')}", flush=True)
+    if mode == "alltoallv":
+        _use_variable_dcp_exchange(monkeypatch)
+    group = _dcp_test_group(mode) if mode in ("group-inherit", "group-host") else dist.group.WORLD
+    try:
+        yield group
+    finally:
+        if group is not dist.group.WORLD:
+            dist.destroy_process_group(group)
+
+
 @torch.inference_mode()
-@pytest.mark.parametrize("overlap,trace_stages,verify_probe", [
-    pytest.param(False, False, False, id="False"),
-    pytest.param(True, False, True, id="True"),
-    pytest.param(True, True, True, id="True-trace"),
-    pytest.param(False, True, True, id="serial-after-probe"),
-    pytest.param(True, True, False, id="overlap-without-probe"),
-])
-def test_counted_sfa_dcp_collectives_replay(overlap, trace_stages, verify_probe, monkeypatch, dcp_world):
+@pytest.mark.parametrize("overlap,trace_stages,verify_probe,dcp_transport", [
+    pytest.param(False, False, False, "fixed", id="False"),
+    pytest.param(True, False, True, "fixed", id="True"),
+    pytest.param(True, True, True, "fixed", id="True-trace"),
+    pytest.param(False, True, True, "fixed", id="serial-after-probe"),
+    pytest.param(True, True, False, "fixed", id="overlap-without-probe"),
+    pytest.param(True, True, True, "alltoallv", id="True-trace-alltoallv"),
+    pytest.param(True, False, True, "alltoallv", id="True-alltoallv"),
+    # Pair the HOST candidate with an otherwise identical separate group. A
+    # WORLD-versus-HOST comparison alone also changes communicator placement.
+    pytest.param(True, True, True, "group-inherit", id="True-trace-dcp-inherit"),
+    pytest.param(True, True, True, "group-host", id="True-trace-dcp-host"),
+    pytest.param(True, False, True, "group-host", id="True-dcp-host"),
+], indirect=["dcp_transport"])
+def test_counted_sfa_dcp_collectives_replay(overlap, trace_stages, verify_probe, monkeypatch, dcp_world, dcp_transport):
     world = dcp_world
     import vllm_ascend.vllm_ascend_C  # noqa: F401
     from vllm_ascend.ops.triton import sfa_dcp
@@ -142,7 +198,7 @@ def test_counted_sfa_dcp_collectives_replay(overlap, trace_stages, verify_probe,
 
         from vllm.distributed.device_communicators.base_device_communicator import DeviceCommunicatorBase
 
-        group = SimpleNamespace(device_group=dist.group.WORLD, rank_in_group=rank, world_size=world)
+        group = SimpleNamespace(device_group=dcp_transport, rank_in_group=rank, world_size=world)
         group.all_gather = lambda packet, dim: DeviceCommunicatorBase.all_gather(group, packet, dim)
         edge = None
         if overlap or verify_probe:
