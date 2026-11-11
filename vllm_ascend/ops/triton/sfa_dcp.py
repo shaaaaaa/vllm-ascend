@@ -81,10 +81,13 @@ def _pack(partial, maximum, total, send, rows: tl.constexpr, heads: tl.constexpr
         tl.store(send + dest + features, tl.load(partial + row * value_dim + features))
         exp_sum = tl.load(total + row)
         max_logit = tl.where(exp_sum > 0, tl.load(maximum + row), -float("inf"))
-        max_bits = tl.cast(max_logit, tl.uint32, bitcast=True)
-        sum_bits = tl.cast(tl.where(exp_sum > 0, exp_sum, 0.0), tl.uint32, bitcast=True)
+        max_bits = tl.cast(max_logit, tl.int32, bitcast=True)
+        sum_bits = tl.cast(tl.where(exp_sum > 0, exp_sum, 0.0), tl.int32, bitcast=True)
         # Keep both FP32 statistics in the existing aligned BF16/FP16 packet.
         # Adding log(exp_sum) to max_logit here can round away the local mass.
+        # CANN 8.5.1 cannot lower the uint32 -> float conversion at the store.
+        # Signed shifts preserve each byte after masking, and 0..255 is exact
+        # in both packet dtypes. Use signed conversion on unpack as well.
         bits = tl.where(bytes_ < 4, max_bits, sum_bits)
         digits = (bits >> (8 * (bytes_ % 4))) & 255
         tl.store(send + dest + value_dim + bytes_, tl.where(bytes_ < 8, digits, 0))
@@ -92,9 +95,9 @@ def _pack(partial, maximum, total, send, rows: tl.constexpr, heads: tl.constexpr
 
 @triton.jit
 def _unpack_stat(ptr):
-    bits = tl.load(ptr).to(tl.uint32)
+    bits = tl.load(ptr).to(tl.int32)
     for byte in tl.static_range(1, 4):
-        bits |= tl.load(ptr + byte).to(tl.uint32) << (8 * byte)
+        bits |= tl.load(ptr + byte).to(tl.int32) << (8 * byte)
     return tl.cast(bits, tl.float32, bitcast=True)
 
 

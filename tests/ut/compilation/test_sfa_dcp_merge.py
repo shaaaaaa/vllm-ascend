@@ -7,8 +7,9 @@ from sfa_test_support import ROOT, HostTL, Pointer, extract
 
 
 class DcpTL(HostTL):
-    # Signed int32 has the same byte lanes after the packing mask.
-    uint32 = torch.int32
+    # Preserve signedness; this shim still does not compile device code.
+    uint32 = torch.uint32
+    arange = staticmethod(lambda start, end: torch.arange(start, end, dtype=torch.int32))
     static_range = staticmethod(range)
     exp = staticmethod(torch.exp)
     zeros = staticmethod(lambda shape, dtype: torch.zeros(shape, dtype=dtype))
@@ -22,6 +23,33 @@ class DcpTL(HostTL):
     @staticmethod
     def store(ptr, value):
         HostTL.store(ptr, value, True)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_dcp_stat_packet_preserves_each_byte_and_sign_bit(dtype):
+    tl = DcpTL()
+    ns = {"tl": tl}
+    path = ROOT / "vllm_ascend/ops/triton/sfa_dcp.py"
+    for name in ("_pack", "_unpack_stat"):
+        extract(path, name, ns)
+    # Exercise every byte value at each position, including a set sign bit.
+    bits = (torch.arange(256, dtype=torch.int32)[:, None] << (8 * torch.arange(4))).flatten().to(torch.int32)
+    raw = bits.view(torch.float32)
+    # The packer's nonempty max-logit input is finite. Empty shards exercise -inf.
+    maximum = raw[torch.isfinite(raw)].contiguous().view(-1, 1)
+    rows = maximum.numel()
+    partial = torch.zeros((rows, 1, 512), dtype=dtype)
+    total = torch.ones_like(maximum)
+    send = torch.full((1, rows, 1, 528), -99, dtype=dtype)
+    tl.pid, tl.programs = 0, 1
+    ns["_pack"](Pointer(partial), Pointer(maximum), Pointer(total), Pointer(send), rows, 1, 1, 512)
+    for stat, expected in ((0, maximum), (4, total)):
+        lanes = send[0, :, 0, 512 + stat:516 + stat].to(torch.int32)
+        expected_bytes = (expected.view(torch.int32) >> (8 * torch.arange(4))) & 255
+        assert torch.equal(lanes, expected_bytes)
+        restored = ns["_unpack_stat"](Pointer(send, torch.arange(rows) * 528 + 512 + stat))
+        assert torch.equal(restored.view(torch.int32), expected.view(torch.int32).flatten())
+    assert not send[..., 520:].any()
 
 
 @pytest.mark.parametrize("world", [2, 4, 8])
