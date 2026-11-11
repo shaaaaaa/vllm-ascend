@@ -6415,6 +6415,7 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
         if self._sfa_full_graph.retrieval_overlap is not None:
             self._sfa_full_graph.retrieval_overlap.configure(
                 self._collect_staged_sfa_impls(), self._shared_resident_groups, kv_caches,
+                dcp_group=get_dcp_group() if self.dsa_decoder_dcp else None,
             )
         # TODO: refactor the logic of attention
         # Initialize drafter attention group initialization

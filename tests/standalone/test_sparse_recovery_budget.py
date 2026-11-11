@@ -93,6 +93,7 @@ def scheduler(running=(), waiting=(), width=2, budget=32):
     manager.allocate_slots = allocate
     obj = NS(
         running=list(running), waiting=Queue(waiting), skipped_waiting=Queue(),
+        _dsa_dcp=False,
         max_num_scheduled_tokens=budget, max_num_encoder_input_tokens=0,
         _pause_state="unpaused", _dsa_query_rows=width, max_model_len=140000,
         scheduler_config=NS(long_prefill_token_threshold=0, enable_chunked_prefill=True),
@@ -251,6 +252,7 @@ def test_actual_async_counters_do_not_generate_tokens_during_history_replay():
                  "async_counter_chain", "exec"), namespace)
     updater = namespace["Async"]()
     updater.requests = {"r": req}
+    updater._dsa_dcp = obj._dsa_dcp
     updater._spec_token_placeholders = [-1]
     obj._update_after_schedule = updater._update_after_schedule
     while req.num_computed_tokens < req.num_tokens:

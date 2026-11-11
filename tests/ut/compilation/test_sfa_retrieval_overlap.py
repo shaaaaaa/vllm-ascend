@@ -31,6 +31,34 @@ def test_runner_constructor_reads_module_environment_without_local_shadowing():
     assert table.lookup("envs_ascend").is_imported()
 
 
+def test_dcp_probe_parity_failure_does_not_abandon_peer_replays(monkeypatch):
+    source = ROOT / "vllm_ascend/compilation/sfa_retrieval_overlap.py"
+    tree = ast.parse(source.read_text(encoding="utf-8"))
+    cls = next(n for n in tree.body if getattr(n, "name", "") == "CaptureProbe")
+    method = next(n for n in cls.body if getattr(n, "name", "") == "verify")
+    ns = {"torch": torch}
+    exec(compile(ast.Module(body=[method], type_ignores=[]), str(source), "exec"), ns)
+    replays = []
+    probe = NS(source=torch.zeros(64), selected=torch.zeros(64), mask=torch.arange(64) < 1,
+               dest=torch.empty(64), observed=torch.empty(64), exchange=torch.empty(128),
+               matrix=torch.ones(16, 16), product=torch.empty(16, 16),
+               edge=NS(launch=lambda *args: None, join=lambda: None),
+               dcp_group=NS(rank_in_group=0, world_size=2, device_group=object(),
+                            all_gather=lambda tensor, dim: tensor.repeat(2)))
+    def replay():
+        replays.append(float(probe.source[0]))
+        probe.observed.zero_()
+        # Only this rank sees a numerical mismatch on the first replay. Peers
+        # still enter all three captured HCCL sequences before outer agreement.
+        probe.observed[0] = -1 if len(replays) == 1 else 2*probe.source[0]+1
+    probe.graph = NS(replay=replay)
+    monkeypatch.setattr(torch, "npu", NS(synchronize=lambda: None, graph=lambda _: nullcontext()), raising=False)
+    monkeypatch.setattr(torch.distributed, "all_to_all_single", lambda *args, **kwargs: None)
+    with pytest.raises(RuntimeError, match="capture probe failed"):
+        ns["verify"](probe)
+    assert replays == [1, 7, 2]
+
+
 @pytest.fixture
 def graph_module(monkeypatch):
     return graph_fixture.__wrapped__(monkeypatch)

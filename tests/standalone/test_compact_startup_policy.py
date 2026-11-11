@@ -287,9 +287,7 @@ def test_decoder_dcp_selects_split_backend_before_storage_and_rechecks_live_poli
     ("parallel_config", "tensor_parallel_size", 8, "local DCP=TP"),
     ("parallel_config", "cp_kv_cache_interleave_size", 64, "128-token interleave"),
     ("envs", "VLLM_ASCEND_SFA_ASYNC_MTP_PREP", True, "requires full SFA graphs"),
-    ("envs", "VLLM_ASCEND_SFA_SHARED_RETRIEVAL_OVERLAP", True, "without retrieval overlap"),
     ("envs", "VLLM_ASCEND_SFA_INDEPENDENT_DP", True, "coordinated"),
-    ("config", "decode_preemption_checkpoint", True, "cooperative"),
     ("config", "decoder_storage_mode", "local", "async process storage"),
     ("config", "enable_async_loading", False, "async process storage"),
     ("ops", "npu_sparse_flash_attention_dcp", None, "Rebuild vllm-ascend"),
@@ -315,7 +313,19 @@ def test_decoder_dcp_requires_effective_shared_cpu_strictness(decoder_dcp):
     assert "storage" not in ctx.events
 
 
-@pytest.mark.parametrize("variant", ["full", "full_async", "staged_only", "other_cp", "other_connector"])
+@pytest.mark.parametrize("world", [2, 4, 8])
+@pytest.mark.parametrize("checkpoint", [False, True])
+def test_decoder_dcp_allows_cooperative_kv_both_policy(decoder_dcp, world, checkpoint):
+    ctx = decoder_dcp
+    ctx.vllm.kv_transfer_config.kv_role = "kv_both"
+    for field in ("decode_context_parallel_size", "tensor_parallel_size", "local_world_size"):
+        setattr(ctx.vllm.parallel_config, field, world)
+    ctx.config.decode_preemption_checkpoint = checkpoint
+    ctx.worker._configure_dsa_decoder_dcp()
+    assert ctx.vllm._dsa_decoder_dcp_policy == (2048, 0)
+
+
+@pytest.mark.parametrize("variant", ["full", "full_async", "full_overlap", "staged_only", "other_cp", "other_connector"])
 def test_decoder_dcp_full_graph_policy_is_available_before_worker_selection(decoder_dcp, monkeypatch, variant):
     ctx = decoder_dcp
     config = ModuleType("vllm.config")
@@ -328,6 +338,8 @@ def test_decoder_dcp_full_graph_policy_is_available_before_worker_selection(deco
     ctx.vllm.speculative_config = None
     ctx.envs.VLLM_ASCEND_SFA_STAGED_GRAPH = True
     ctx.envs.VLLM_ASCEND_SFA_FULL_GRAPH = variant != "staged_only"
+    ctx.envs.VLLM_ASCEND_SFA_SHARED_RETRIEVAL_OVERLAP = variant == "full_overlap"
+    ctx.envs.VLLM_ASCEND_SFA_SHARED_RESIDENT_PLAN = True
     ctx.ns["StagedSFAConfigReason"] = NS(CONTEXT_PARALLEL="cp")
     definitions(ROOT / "vllm_ascend/utils.py",
                 {"staged_sfa_graph_configuration_reasons", "staged_sfa_graph_configured"}, ctx.ns)
@@ -335,15 +347,21 @@ def test_decoder_dcp_full_graph_policy_is_available_before_worker_selection(deco
         ctx.vllm.parallel_config.prefill_context_parallel_size = 2
     if variant == "other_connector":
         ctx.vllm.kv_transfer_config.kv_connector = "DifferentConnector"
-    if variant == "full_async":
+    if variant == "full_overlap":
+        ctx.vllm.kv_transfer_config.kv_role = "kv_both"
+        ctx.config.decode_preemption_checkpoint = True
+        for field in ("tensor_parallel_size", "decode_context_parallel_size", "local_world_size"):
+            setattr(ctx.vllm.parallel_config, field, 8)
+    if variant in ("full_async", "full_overlap"):
         ctx.envs.VLLM_ASCEND_SFA_ASYNC_MTP_PREP = True
         ctx.vllm.num_speculative_tokens = 1
         ctx.vllm.model_config.uses_mrope, ctx.vllm.model_config.uses_xdrope_dim = False, 0
         ctx.worker.speculative_config = ctx.vllm.speculative_config = NS(
-            method="mtp", num_speculative_tokens=1, draft_tensor_parallel_size=4, parallel_drafting=False,
+            method="mtp", num_speculative_tokens=1,
+            draft_tensor_parallel_size=ctx.vllm.parallel_config.tensor_parallel_size, parallel_drafting=False,
             disable_padded_drafter_batch=False, draft_model_config=ctx.vllm.model_config,
         )
-    eligible = variant in ("full", "full_async")
+    eligible = variant in ("full", "full_async", "full_overlap")
     assert ctx.ns["staged_sfa_graph_configured"](ctx.vllm) is eligible
     if eligible:
         ctx.worker._configure_dsa_decoder_dcp()

@@ -13,7 +13,8 @@ pytest.importorskip("torch_npu")
 
 
 @torch.inference_mode()
-def test_counted_sfa_dcp_collectives_replay():
+@pytest.mark.parametrize("overlap", [False, True])
+def test_counted_sfa_dcp_collectives_replay(overlap):
     world = int(os.environ.get("WORLD_SIZE", "1"))
     if world not in (4, 8):
         pytest.skip("launch with torchrun and 4 or 8 local NPU ranks")
@@ -42,15 +43,35 @@ def test_counted_sfa_dcp_collectives_replay():
         scale = 576**-0.5
 
         def all_gather(packet, *, dim):
+            if packet.ndim == 1:
+                gathered = packet.new_empty(packet.numel()*world)
+                dist.all_gather_into_tensor(gathered, packet)
+                return gathered
             head_major = packet.movedim(dim, 0).contiguous()
             gathered = head_major.new_empty((heads, rows, 576))
             dist.all_gather_into_tensor(gathered, head_major)
             return gathered.movedim(0, dim)
 
-        group = SimpleNamespace(all_gather=all_gather, device_group=dist.group.WORLD)
+        group = SimpleNamespace(all_gather=all_gather, device_group=dist.group.WORLD,
+                                rank_in_group=rank, world_size=world)
+        edge = None
+        if overlap:
+            from vllm_ascend.compilation.sfa_retrieval_overlap import CaptureProbe, ProbeCopy, RetrievalEdge
+
+            stream = torch.npu.Stream()
+            CaptureProbe(stream, "npu", group).verify()
+            source = torch.zeros(64, device="npu")
+            destination = torch.empty_like(source)
+            observed = torch.empty_like(source)
+            edge = RetrievalEdge(stream, ProbeCopy(destination), (destination,))
 
         def forward():
-            return execute_sfa_dcp(nope, rope, (k, pe), indices, counts, table, q_lens, kv_lens, scale, group)
+            output = execute_sfa_dcp(nope, rope, (k, pe), indices, counts, table, q_lens, kv_lens, scale, group,
+                                     prefetch=(edge, source, counts, None, (destination,)) if edge else None)
+            if edge:
+                edge.join()
+                observed.copy_(destination)
+            return output
 
         forward()
         torch.npu.synchronize()
@@ -66,6 +87,8 @@ def test_counted_sfa_dcp_collectives_replay():
             counts[:, 0].copy_(torch.tensor(sizes[rank], dtype=torch.int32))
             for row, count in enumerate(sizes[rank]):
                 indices[row, 0, :count] = torch.arange(count, dtype=torch.int32, device="npu")
+            if edge:
+                source.fill_(sizes[rank][0])
             graph.replay()
             reference = torch.zeros((rows, local_heads, 512), dtype=torch.float32)
             for row in range(rows):
@@ -74,6 +97,8 @@ def test_counted_sfa_dcp_collectives_replay():
                     weights = (all_q[row, owned].float() @ keys.T * scale).softmax(dim=-1)
                     reference[row] = weights @ keys[:, :512]
             comparisons.append((output.cpu(), reference.bfloat16()))
+            if edge:
+                comparisons.append((observed.cpu(), torch.full((64,), float(sizes[rank][0]))))
         torch.npu.synchronize()
         graph.reset()
     finally:

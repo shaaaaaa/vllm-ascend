@@ -502,8 +502,12 @@ class NPUWorker(WorkerBase):
             not model.enforce_eager and envs_ascend.VLLM_ASCEND_SFA_FULL_GRAPH
             and staged_sfa_graph_configured(config)
         )
-        if not (eager or full_graph) or envs_ascend.VLLM_ASCEND_SFA_SHARED_RETRIEVAL_OVERLAP:
-            raise ValueError("Decoder DCP requires eager execution or a full SFA graph without retrieval overlap")
+        if not (eager or full_graph):
+            raise ValueError("Decoder DCP requires eager execution or a full SFA graph")
+        if envs_ascend.VLLM_ASCEND_SFA_SHARED_RETRIEVAL_OVERLAP and (
+            not full_graph or not envs_ascend.VLLM_ASCEND_SFA_SHARED_RESIDENT_PLAN
+        ):
+            raise ValueError("Decoder DCP retrieval overlap requires full SFA graphs with shared resident plans")
         if envs_ascend.VLLM_ASCEND_SFA_ASYNC_MTP_PREP and (not full_graph or spec is None):
             raise ValueError("Decoder DCP async MTP preparation requires full SFA graphs and one MTP draft token")
         if envs_ascend.VLLM_ASCEND_SFA_INDEPENDENT_DP or (
