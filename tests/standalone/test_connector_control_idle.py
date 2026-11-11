@@ -116,6 +116,9 @@ def scheduler_type(request):
         ns,
     )
     cls = ns[request.param]
+    # Lifecycle output is exercised by the dedicated diagnostics tests; this
+    # extracted MRO fixture focuses on ownership and checkpoint invalidation.
+    cls._log_request_transition = lambda *args, **kwargs: None
     assert cls.has_requests is ns["RecomputeScheduler"].has_requests
     assert cls._preempt_request is ns["RecomputeScheduler"]._preempt_request
     assert cls._update_waiting_for_remote_kv is ns["RecomputeScheduler"]._update_waiting_for_remote_kv

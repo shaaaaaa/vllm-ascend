@@ -132,6 +132,8 @@ class StagedSFARouteDecision:
     cold_compact_resumes: tuple[bool, ...] = ()
     # CPU scheduler verdict; 0 means not the configured uniform query width.
     uniform_query_len: int = 0
+    # Failed host-side checks, populated only on rejection (no device reads).
+    failed_checks: tuple[str, ...] = ()
 
 
 _DYNAMIC_EPLB_BUFFER_SIZE = 100

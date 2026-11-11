@@ -1081,3 +1081,93 @@ reduction. The native Gloo case is available on Linux. Distributed NPU TP4/DP4
 qualification remains required, including active/idle transitions, mixed C8,
 preemption/restore misses and injected preparation failures. Keep this option
 off until that qualification and the throughput comparison pass.
+
+## Native-route and preemption diagnostics
+
+On `perf/decoder-tpot-optimization`, `[SFA_ROUTE]` and
+`[REQUEST_LIFECYCLE]` are INFO logs independent of `PD_SERVING_PERF`.
+Keep the normal logger at INFO (`VLLM_LOGGING_LEVEL=INFO`); no new diagnostic
+switch is needed. Update both vLLM and vLLM-Ascend Python sources and restart
+the workers. No native rebuild or LMCache change is required.
+
+`[SFA_ROUTE] action=... reason=...` is followed by JSON. Every worker reports
+its own decision; retain all DP/TP logs. The fields include host, PID, DP rank,
+wall time, request IDs, local action/reason, DP-agreed action, failed checks,
+attention state, dispatched graph mode, token capacities and per-request CPU
+operands. Rows show scheduled target/draft widths, computed/prompt/history
+lengths, new/resumed membership, retained connector cold-resume markers and
+raw connector load/frontier fields. A retained marker does not mean the runner
+accepted its layout: inspect `failed_checks`, especially `cold_compact_layout`.
+A null retained frontier does not prove
+that KV is missing. No token contents, KV payloads or device tensors are logged.
+
+Events distinguish `native_route_selected`, `route_rejected` (execution raises)
+and `graph_route_restored`. Selection is not proof of successful execution or
+graph replay. Each worker numbers consecutive non-staged episodes, logs changed
+reasons/batches immediately, and summarizes unchanged decisions at most once
+per five seconds. Summaries and recovery include elapsed host time, total
+non-staged decisions and suppressed repeats. A later recurrence of the same
+reason starts a new episode; it is no longer suppressed for the worker's entire
+lifetime. Dummy/idle decisions have `origin=dummy_run` and no real request rows.
+
+The runner's rejection sites are:
+
+| Reason | Distinguishing evidence |
+| --- | --- |
+| `not_decode` | `computed_before_prompt_without_validated_cold_resume` identifies an unfinished prompt/recovery row, even if attention state says decode. `attention_state_not_decode` identifies the separate attention-state guard. |
+| `cold_compact_layout` | Exact failed marker invariants, including row indices; compare computed/history lengths and retained resume frontier. |
+| `runtime_mode` | `calculate_kv_scales` versus `dispatcher_mode_not_piecewise`. |
+| `lora`, `speculative_decode`, `cascade` | LoRA configured, unsupported query width, or cascade attention. |
+| `unsupported_batch`, `non_q1` | Local token/request capacity or scheduled query shape/width; compare capture **token** sizes and row widths. |
+| `dense_prefix_hit`, `mixed_connector_load` | Staged-only mode rejects these metadata combinations; full SFA keeps its existing eligibility rules. |
+| `runtime_parallelism` | A DP-agreed non-staged action overrode local eligibility, or a dummy batch could not use a staged key. When an existing DP agreement selected this route, `dp_peer_votes` records the per-DP actions, graph modes and counts before padding. Find the local rejecting check in the contributing DP rank's log. No collective or wire field is added. |
+| `ubatch`, `padded_batch`, `batch_descriptor` | Microbatching, padding/query-width/capture-capacity incompatibility, or descriptor/key mismatch (including exact mismatched descriptor fields). |
+| Connector/frontier errors | Missing/duplicate request metadata, invalid or unavailable sparse ranges, inconsistent frontiers, or a frontier smaller than scratch capacity cause fatal rejection when reached. Raw row operands are included. If the earlier `not_decode` guard wins, a failed connector validation is also retained in `failed_checks`. |
+
+With full SFA, many native candidates are rejected by the existing fail-closed
+guard instead of executing outside the graph. Layer-level authorization,
+source preparation and replay errors still raise; they are not silent native
+fallbacks. Explicitly unconfigured SFA (`not_configured`) does not create an
+episode. These diagnostics do not force eligibility or remove recovery work.
+
+`[REQUEST_LIFECYCLE]` uses request ID, DP rank and `preemption_count` to link
+`preemption_trigger` (allocation failure or forced cache reset),
+`request_preempted`, `resume_load_started`, `resume_load_completed`, and
+`request_resumed`. Asynchronous load admission/completion is **not** RUNNING
+admission. `resume_retry` records an Ascend checkpoint restore miss and its preemption/load generations;
+`recompute_redirect` records the pure KV consumer's proxy handoff rather than
+an in-process resume. Request resumption is logged only after allocation and
+admission succeed, before optimistic async counters advance. A streaming-input
+continuation with an old preemption count is not reannounced as a new resume. Queue time can be
+derived from the timestamps. The scheduler's counters and compact flag are
+host metadata, not a measurement of physically reclaimed memory.
+
+To diagnose a specific episode, locate its request row with
+`computed_before_prompt_without_retained_marker=true`, then join that request's
+lifecycle events and connector frontiers. For `runtime_parallelism`, compare
+local versus agreed action and `dp_peer_votes` across peers. Vote arrays are
+indexed by DP rank; `staged_or_neutral` denotes the existing zero vote, which
+does not distinguish a staged participant from a neutral/bootstrap participant.
+The votes name contributing DP ranks, but do not contain their local reasons;
+use those workers' records to complete the chain. Independent DP performs no DP
+agreement and leaves this field null. Saved votes are detached CPU scalars and
+are cleared before every agreement, including independent/disabled paths. Keep host clocks
+synchronized for cross-host comparison. A preemption alone does not prove the
+cause of a later fallback.
+
+Healthy graph selection performs no diagnostic serialization, metadata scan,
+clock call, device readback or extra collective. Transition logging has a host
+formatting/I/O cost; unchanged native episodes are throttled. CPU tests cover
+the real route methods and scheduler hooks with device imports isolated, plus
+INFO output at `PD_SERVING_PERF=0`. Distributed NPU qualification remains
+required for production timing and replay behavior.
+
+These records prove the route decision and its host operands, not every possible
+upstream storage or hardware failure. For example, a preempted request admitted
+with `computed_tokens < prompt_tokens` and no retained cold marker explains why
+`not_decode` selected native execution. Its lifecycle and connector fields show
+whether this followed reload/retry; explaining *why* a remote payload or
+checkpoint was unavailable can still require the connector/storage logs. Do not
+infer data loss, a backend fault, or an NPU fault from `not_decode` alone.
+Malformed scalar fields are printed as type placeholders, and malformed CPU
+row shapes print null instead of masking the original route rejection.

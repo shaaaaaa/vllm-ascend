@@ -110,6 +110,8 @@ def scheduler(running=(), waiting=(), width=2, budget=32):
         _reject_impossible_initial_dsa_request=lambda *args, **kwargs: False,
     )
     obj._select_waiting_queue_for_scheduling = lambda: obj.waiting
+    obj.transitions = []
+    obj._log_request_transition = lambda event, req, **fields: obj.transitions.append((event, req.request_id, fields))
 
     def advance(output):
         for req in obj.running:
@@ -134,6 +136,7 @@ def test_reported_22_row_resume_is_capped_before_allocating(queue):
     assert output.scheduled_spec_decode_tokens == dict.fromkeys(map(str, range(5)), [-1])
     assert allocated[-1] == ("resumed", 131614, 2)
     assert resumed.num_computed_tokens == 131616
+    assert [event for event, _, _ in obj.transitions] == (["request_resumed"] if queue == "waiting" else [])
 
 
 @pytest.mark.parametrize("width", [1, 2])
@@ -174,6 +177,13 @@ def test_checkpoint_full_hit_preserves_target_and_draft_admission():
     assert allocated == [("r", 132324, 2)]
 
 
+def test_new_streaming_input_with_old_preemption_count_is_not_a_new_resume():
+    req = request("stream", computed=131614, end=131615, status="WAITING")
+    obj, _ = scheduler(waiting=[req])
+    obj.schedule()
+    assert not obj.transitions
+
+
 def test_async_restore_reserves_no_query_work_then_applies_sparse_budget():
     req = request("r", computed=0, compact=False, status="PREEMPTED")
     obj, allocated = scheduler(waiting=[req])
@@ -190,12 +200,14 @@ def test_async_restore_reserves_no_query_work_then_applies_sparse_budget():
     assert obj.schedule().num_scheduled_tokens == {}
     assert req.status == "remote" and req.dsa_compact_allocated
     assert allocated == [("r", 0, 0)]
+    assert [event for event, _, _ in obj.transitions] == ["resume_load_started"]
     # The connector has completed; scheduler promotion re-admits the request.
     obj.skipped_waiting.clear()
     req.status = "PREEMPTED"
     obj.waiting.append(req)
     assert obj.schedule().num_scheduled_tokens == {"r": 2}
     assert allocated[-1] == ("r", 131614, 2)
+    assert [event for event, _, _ in obj.transitions] == ["resume_load_started", "request_resumed"]
 
 
 def test_preemption_drops_old_compact_allocation_before_dense_cache_miss():
@@ -226,6 +238,8 @@ def test_preemption_drops_old_compact_allocation_before_dense_cache_miss():
     derived._preempt_request(req, 0.0)
     assert freed == ["r"] and req.num_computed_tokens == 0
     assert req.kv_resume_checkpoint is None
+    assert obj.transitions[0][0] == "request_preempted"
+    assert obj.transitions[0][2]["previous_computed_tokens"] == 131614
     # No external hit: reallocate densely, without the old two-row restriction.
     assert obj.schedule().num_scheduled_tokens == {"r": 32}
     assert not req.dsa_compact_allocated

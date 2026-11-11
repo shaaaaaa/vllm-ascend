@@ -216,6 +216,7 @@ from vllm_ascend.utils import (
 from vllm_ascend.worker.dsa_shared_pool import diagnose_indexer_metadata, reshape_dsa_shared_pool_raw
 from vllm_ascend.worker.npu_input_batch import NPUInputBatch
 from vllm_ascend.worker.pcp_utils import PCPManager
+from vllm_ascend.worker.sfa_route_diagnostics import apply_sfa_route_with_diagnostics
 from vllm_ascend.worker.startup_trace import startup_phase
 
 from vllm_ascend.ascend_forward_context import (  # isort: skip
@@ -2443,9 +2444,29 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                     should_ubatch=should_ubatch,
                 )
                 dispatched_cudagraph_mode = cudagraph_mode
-                staged_sfa_graph_key = self._apply_staged_sfa_route(
-                    staged_sfa_route
-                )
+                if (self._staged_sfa_graph_capture_sizes
+                        and staged_sfa_route.action != StagedSFARouteAction.STAGED):
+                    staged_sfa_graph_key = apply_sfa_route_with_diagnostics(
+                        self, staged_sfa_route, local_route=staged_sfa_local_route,
+                        dp_route_action=dp_route_action, scheduler_output=scheduler_output,
+                        num_reqs=num_reqs, scheduled=num_scheduled_tokens_np,
+                        origin="execute_model", dispatched_mode=str(cudagraph_mode),
+                        descriptor_tokens=batch_desc.num_tokens,
+                        descriptor_requests=batch_desc.num_reqs,
+                        descriptor_uniform=batch_desc.uniform,
+                        descriptor_has_lora=batch_desc.has_lora,
+                        descriptor_num_active_loras=batch_desc.num_active_loras,
+                        num_tokens_unpadded=num_tokens_unpadded,
+                        num_tokens_padded=num_tokens_padded, should_ubatch=should_ubatch,
+                        cascade_attention=cascade_attn_prefix_lens is not None,
+                        enforce_eager=self.model_config.enforce_eager,
+                        full_graph_enabled=sfa_full_graph_enabled(self.vllm_config),
+                    )
+                else:
+                    staged_sfa_graph_key = self._apply_staged_sfa_route(staged_sfa_route)
+                    diagnostics = getattr(self, "_sfa_route_diagnostics", None)
+                    if staged_sfa_graph_key is not None and diagnostics is not None and diagnostics.active:
+                        diagnostics.restored()
                 if (
                     self._staged_sfa_graph_capture_sizes
                     and staged_sfa_graph_key is None
@@ -4163,6 +4184,7 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
 
         # Never reuse a previous step's layout agreement.
         self._staged_sfa_dp_bounded_decode = True
+        self._staged_sfa_diagnostic_peer_votes = None
         if self.dp_size == 1:
             return False, None, cudagraph_mode, staged_sfa_route_action
 
@@ -4234,6 +4256,24 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
             else None
         )
 
+        # Reuse the completed CPU agreement for exceptional-route attribution.
+        # Snapshot before padding overwrites token counts, and never retain the
+        # tensor: both ordinary and combined agreement buffers are reused.
+        synced_cudagraph_mode = _post_process_cudagraph_mode(tensor)
+        if staged_route_protocol and (
+            (synced_route_action is not None and synced_route_action != StagedSFARouteAction.STAGED)
+            or synced_cudagraph_mode != cudagraph_mode
+        ):
+            self._staged_sfa_diagnostic_peer_votes = {
+                "tokens_before_padding": tensor[0].tolist(),
+                "graph_modes": tensor[1].tolist(),
+                "actions": [
+                    "staged_or_neutral" if value == 0 else _STAGED_SFA_ROUTE_ACTIONS[value].value
+                    for value in tensor[2].tolist()
+                ],
+                "bounded_decode": tensor[3].tolist() if full_layout_protocol else None,
+            }
+
         if allow_dp_padding or (
             sfa_full_graph_enabled(self.vllm_config) and staged_sfa_route_action is not None
         ):
@@ -4242,8 +4282,6 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
             # sides even when the group chooses the native route.
             num_tokens_across_dp.fill_(max_num_tokens)
 
-        # Synchronize cudagraph_mode across ranks (take min)
-        synced_cudagraph_mode = _post_process_cudagraph_mode(tensor)
         return (
             False,
             num_tokens_across_dp,
@@ -5022,16 +5060,25 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
             frontiers = ()
             cold_resumes = ()
 
-        def native(reason):
+        def native(reason, *failed_checks):
+            # The computed-before-prompt guard can take precedence over a
+            # connector rejection. Preserve that cause without validating twice.
+            if is_decode_state and graph_configured and metadata_reason not in (
+                StagedSFARouteReason.ELIGIBLE,
+                StagedSFARouteReason.DENSE_PREFIX_HIT,
+                StagedSFARouteReason.MIXED_CONNECTOR_LOAD,
+            ):
+                failed_checks += (f"connector_validation:{metadata_reason.value}",)
             return StagedSFARouteDecision(
                 StagedSFARouteAction.SAFE_NATIVE,
                 reason,
                 frontiers=frontiers if cold_resumes else (),
                 cold_compact_resumes=cold_resumes,
+                failed_checks=failed_checks,
             )
 
         if not graph_configured:
-            return native(StagedSFARouteReason.NOT_CONFIGURED)
+            return native(StagedSFARouteReason.NOT_CONFIGURED, "no_capture_token_sizes")
         if full_graph and num_computed_tokens is not None and prompt_lens is not None:
             computed = np.asarray(num_computed_tokens).reshape(-1)
             prompts = np.asarray(prompt_lens).reshape(-1)
@@ -5042,7 +5089,7 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                 and not (i < len(cold_resumes) and cold_resumes[i])
                 for i in range(num_reqs)
             ):
-                return native(StagedSFARouteReason.NOT_DECODE)
+                return native(StagedSFARouteReason.NOT_DECODE, "computed_before_prompt_without_validated_cold_resume")
         if is_decode_state:
             if any(cold_resumes):
                 cold_computed_ends = getattr(cold_resumes, "computed_ends", frontiers)
@@ -5099,19 +5146,19 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                             remap_frontiers=list(frontiers),
                         )
                     return native(
-                        StagedSFARouteReason.COLD_COMPACT_LAYOUT
+                        StagedSFARouteReason.COLD_COMPACT_LAYOUT, *marker_failures
                     )
                 cold_resumes = ColdResumeMarkers(cold_resumes, cold_computed_ends)
         if getattr(self, "calculate_kv_scales", False):
-            return native(StagedSFARouteReason.RUNTIME_MODE)
+            return native(StagedSFARouteReason.RUNTIME_MODE, "calculate_kv_scales")
         if getattr(self.vllm_config, "lora_config", None) is not None:
-            return native(StagedSFARouteReason.LORA)
+            return native(StagedSFARouteReason.LORA, "lora_configured")
         if not is_decode_state:
-            return native(StagedSFARouteReason.NOT_DECODE)
+            return native(StagedSFARouteReason.NOT_DECODE, "attention_state_not_decode")
         if query_width not in (1, 2):
-            return native(StagedSFARouteReason.SPECULATIVE_DECODE)
+            return native(StagedSFARouteReason.SPECULATIVE_DECODE, "query_width_not_one_or_two")
         if has_cascade_attention:
-            return native(StagedSFARouteReason.CASCADE)
+            return native(StagedSFARouteReason.CASCADE, "cascade_attention")
         batch_size = int(num_tokens_unpadded)
         capture_sizes = self._staged_sfa_graph_capture_sizes
         if (
@@ -5121,7 +5168,7 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
             or (not full_graph and num_reqs * query_width != batch_size)
             or (full_graph and num_reqs * query_width > capture_sizes[-1])
         ):
-            return native(StagedSFARouteReason.UNSUPPORTED_BATCH)
+            return native(StagedSFARouteReason.UNSUPPORTED_BATCH, "local_batch_capacity_or_shape")
         scheduled = np.asarray(num_scheduled_tokens).reshape(-1)
         uniform_query_len = (
             query_width if scheduled.shape == (num_reqs,) and np.all(scheduled == query_width) else 0
@@ -5129,7 +5176,7 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
         if scheduled.shape != (num_reqs,) or (
             not uniform_query_len and (not full_graph or not np.all((scheduled >= 1) & (scheduled <= query_width)))
         ):
-            return native(StagedSFARouteReason.NON_Q1)
+            return native(StagedSFARouteReason.NON_Q1, "scheduled_query_shape_or_width")
         if not full_graph and metadata_reason in (
             StagedSFARouteReason.DENSE_PREFIX_HIT,
             StagedSFARouteReason.MIXED_CONNECTOR_LOAD,
@@ -5171,7 +5218,7 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                         remap_frontiers=list(frontiers),
                     )
                 return native(
-                    StagedSFARouteReason.COLD_COMPACT_LAYOUT,
+                    StagedSFARouteReason.COLD_COMPACT_LAYOUT, *layout_failures
                 )
         scratch_capacity = query_width * index_topk
         if any(
@@ -5263,12 +5310,13 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
         should_ubatch: bool,
     ) -> StagedSFARouteDecision:
         """Bind a DP-agreed local route to one captured graph capacity."""
-        def native(reason: StagedSFARouteReason) -> StagedSFARouteDecision:
+        def native(reason: StagedSFARouteReason, check: str, *details: str) -> StagedSFARouteDecision:
             return StagedSFARouteDecision(
                 StagedSFARouteAction.SAFE_NATIVE,
                 reason,
                 frontiers=local_route.frontiers,
                 cold_compact_resumes=local_route.cold_compact_resumes,
+                failed_checks=(check, *details),
             )
 
         if (
@@ -5280,20 +5328,21 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
             return StagedSFARouteDecision(
                 dp_route_action,
                 StagedSFARouteReason.RUNTIME_PARALLELISM,
+                failed_checks=("dp_agreed_non_staged_action",),
                 frontiers=local_route.frontiers,
                 cold_compact_resumes=local_route.cold_compact_resumes,
             )
         if local_route.action != StagedSFARouteAction.STAGED:
             return local_route
         if cudagraph_mode != CUDAGraphMode.PIECEWISE:
-            return native(StagedSFARouteReason.RUNTIME_MODE)
+            return native(StagedSFARouteReason.RUNTIME_MODE, "dispatcher_mode_not_piecewise")
         if should_ubatch:
-            return native(StagedSFARouteReason.UBATCH)
+            return native(StagedSFARouteReason.UBATCH, "microbatching")
         batch_size = int(num_tokens_unpadded)
         capacity = int(num_tokens_padded)
         query_width = self.decode_threshold
         if capacity % query_width:
-            return native(StagedSFARouteReason.PADDED_BATCH)
+            return native(StagedSFARouteReason.PADDED_BATCH, "padded_capacity_not_multiple_of_query_width")
         graph_key = (
             StagedSFAGraphKey.bounded_decode(capacity // query_width, query_width)
             if sfa_full_graph_enabled(self.vllm_config) and (
@@ -5318,9 +5367,15 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
             or capacity
             not in self._staged_sfa_graph_capture_sizes
         ):
-            return native(StagedSFARouteReason.PADDED_BATCH)
-        if batch_descriptor != graph_key.to_legacy_batch_descriptor():
-            return native(StagedSFARouteReason.BATCH_DESCRIPTOR)
+            return native(StagedSFARouteReason.PADDED_BATCH, "padding_capacity_or_capture_bucket")
+        expected_descriptor = graph_key.to_legacy_batch_descriptor()
+        if batch_descriptor != expected_descriptor:
+            return native(
+                StagedSFARouteReason.BATCH_DESCRIPTOR, "descriptor_does_not_match_graph_key",
+                *(f"descriptor_field:{name}" for name in (
+                    "num_tokens", "num_reqs", "uniform", "has_lora", "num_active_loras"
+                ) if getattr(batch_descriptor, name, None) != getattr(expected_descriptor, name, None)),
+            )
         return StagedSFARouteDecision(
             StagedSFARouteAction.STAGED,
             StagedSFARouteReason.ELIGIBLE,
@@ -5356,12 +5411,7 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
             StagedSFARouteAction.FATAL,
         ):
             raise RuntimeError(message)
-        logged = getattr(self, "_staged_sfa_logged_routes", None)
-        if logged is None:
-            logged = self._staged_sfa_logged_routes = set()
-        if route.reason not in logged and route.reason != StagedSFARouteReason.NOT_CONFIGURED:
-            logged.add(route.reason)
-            logger.info(message)
+        # Serving and idle callers report route episodes with their CPU context.
         return None
 
     @staticmethod
@@ -5739,13 +5789,27 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                 if dp_route_action != StagedSFARouteAction.STAGED
                 else StagedSFARouteAction.SAFE_NATIVE
             )
-            self._apply_staged_sfa_route(
-                StagedSFARouteDecision(
-                    fallback_action,
-                    StagedSFARouteReason.RUNTIME_PARALLELISM,
-                )
+            apply_sfa_route_with_diagnostics(
+                self, StagedSFARouteDecision(
+                    fallback_action, StagedSFARouteReason.RUNTIME_PARALLELISM,
+                    failed_checks=("dummy_batch_not_staged",),
+                ),
+                dp_route_action=dp_route_action, origin="dummy_run",
+                dp_idle=dp_idle, is_profile=is_profile, synthetic_num_reqs=num_reqs,
+                requested_dummy_tokens=num_tokens, scheduled=num_scheduled_tokens,
+                allow_eager=staged_capture, num_active_loras=num_active_loras,
+                descriptor_tokens=batch_desc.num_tokens, descriptor_requests=batch_desc.num_reqs,
+                descriptor_uniform=batch_desc.uniform, descriptor_has_lora=batch_desc.has_lora,
+                descriptor_num_active_loras=batch_desc.num_active_loras,
+                full_graph_enabled=sfa_full_graph_enabled(self.vllm_config),
+                dispatched_mode=str(cudagraph_runtime_mode),
+                num_tokens_unpadded=num_tokens_unpadded, num_tokens_padded=num_tokens_padded,
             )
             cudagraph_runtime_mode = CUDAGraphMode.NONE
+        elif staged_sfa_graph_dummy_run:
+            diagnostics = getattr(self, "_sfa_route_diagnostics", None)
+            if diagnostics is not None and diagnostics.active:
+                diagnostics.restored()
         # Build attention metadata for dummy_run
         single = getattr(self, "_sfa_single_agreement", None)
         if single is not None and single.prepared is not None:
