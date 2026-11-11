@@ -313,6 +313,42 @@ def test_decoder_dcp_requires_effective_shared_cpu_strictness(decoder_dcp):
     assert "storage" not in ctx.events
 
 
+@pytest.mark.parametrize("field,value,expected", [
+    ("pd_role", None, "receiver"),
+    ("pd_role", "sender", "receiver"),
+    ("dsa_group1_load_mode", "persistent_serial", "persistent_direct_hbm"),
+    ("enable_dsa_cold_compact_load", False, "True"),
+    ("enable_sparse_attention", False, "True"),
+    ("dsa_two_groups", False, "True"),
+    ("enable_shared_cpu_cache", False, "True"),
+    ("use_layerwise", False, "True"),
+])
+def test_decoder_dcp_reports_rejected_effective_lmcache_policy(decoder_dcp, field, value, expected):
+    ctx = decoder_dcp
+    before = deepcopy(vars(ctx.config))
+    ctx.vllm.kv_transfer_config.kv_connector_extra_config = {"lmcache." + field: value}
+    with pytest.raises(ValueError) as error:
+        ctx.worker._init_device()
+    assert field in str(error.value)
+    assert repr(value) in str(error.value)
+    assert expected in str(error.value)
+    assert vars(ctx.config) == before
+    assert "storage" not in ctx.events and "distributed" not in ctx.events
+    assert not hasattr(ctx.vllm, "_dsa_decoder_dcp_policy")
+
+
+def test_decoder_dcp_reports_all_common_policy_rejections(decoder_dcp):
+    ctx = decoder_dcp
+    ctx.vllm.kv_transfer_config.kv_load_failure_policy = "recompute"
+    ctx.vllm.cache_config.enable_prefix_caching = True
+    ctx.config.extra_config["enable_shared_cpu_cache"] = False
+    with pytest.raises(ValueError) as error:
+        ctx.worker._init_device()
+    for field in ("kv_load_failure_policy", "enable_prefix_caching", "enable_shared_cpu_cache"):
+        assert field in str(error.value)
+    assert "storage" not in ctx.events
+
+
 @pytest.mark.parametrize("world", [2, 4, 8])
 @pytest.mark.parametrize("checkpoint", [False, True])
 def test_decoder_dcp_allows_cooperative_kv_both_policy(decoder_dcp, world, checkpoint):
