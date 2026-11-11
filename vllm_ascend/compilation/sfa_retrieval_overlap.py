@@ -73,18 +73,9 @@ class RetrievalEdge:
         # reads it. These Python statements run at capture, never at replay.
         if self.payload is None:
             self.payload = payload
-        capturing = torch.npu.is_current_stream_capturing()
         self.start.record(torch.npu.current_stream())
         with torch.npu.stream(self.stream):
             self.stream.wait_event(self.start)
-            if capturing:
-                # Older Torch-NPU queues event waits without propagating the
-                # runtime capture state before subsequent workspace allocation.
-                # Reading the handle drains host submissions (NPUStream::stream),
-                # not device execution. Python runs here only at capture/warmup,
-                # never during replay; do not add a device synchronize.
-                if not self.stream.npu_stream:
-                    raise RuntimeError("failed to submit retrieval capture fork wait")
             if self.max_aiv_cores:
                 self.transfer.load(selected, counts, slots, max_aiv_cores=self.max_aiv_cores)
             else:
@@ -97,12 +88,7 @@ class RetrievalEdge:
         # event outside capture is NOT proof of a record inside this graph.
         if not self.pending_capture_launch:
             raise RuntimeError("consumer prefetch wait has no producer launch in this capture")
-        main = torch.npu.current_stream()
-        capturing = torch.npu.is_current_stream_capturing()
-        main.wait_event(self.done)
-        if capturing:
-            if not main.npu_stream:
-                raise RuntimeError("failed to submit retrieval capture join wait")
+        torch.npu.current_stream().wait_event(self.done)
         self.pending_capture_launch = False
 
 
