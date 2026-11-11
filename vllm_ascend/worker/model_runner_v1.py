@@ -174,6 +174,7 @@ from vllm_ascend.live_source_handoff import (
     LIVE_SOURCE_EVENT_HANDOFF_KEY,
 )
 from vllm_ascend.serving_perf import (
+    cold_perf_device_timing_enabled,
     cold_perf_enabled,
     is_cold_perf_request,
     log_cold_perf_event,
@@ -2424,6 +2425,8 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
             with self.synchronize_input_prep():
                 # Update persistent batch states.
                 self._update_states(scheduler_output)
+                if cold_perf_active:
+                    self._arm_cold_perf_decode_trace(scheduler_output)
                 if self.layerwise_prefill_p_node:
                     self._capture_layerwise_prefill_bank_offsets(scheduler_output)
 
@@ -3723,7 +3726,9 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
 
         if lmhead_tp_enable() and logits is not None:
             logits = logits[: len(spec_decode_metadata.logits_indices)]
-        if not request_ids:
+        # Host summaries already time the complete sampler call. Preserve the
+        # normal rejection forward; sub-stage recording is explicit device profiling.
+        if not request_ids or not cold_perf_device_timing_enabled():
             return self.rejection_sampler(spec_decode_metadata, None, logits, sampling_metadata)
 
         def record_rejection_stage(name, operation, args, kwargs):

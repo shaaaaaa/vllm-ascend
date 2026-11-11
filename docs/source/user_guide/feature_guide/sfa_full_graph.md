@@ -171,6 +171,24 @@ log explicitly reports their omission. Connector/window boundary diagnostics
 and the existing `MTP_DW_DIAG` / `MTP_DW_DEEP_DIAG` settings remain available.
 The separate `VLLM_ASCEND_MTP_DRAFT_DEBUG=1` mode is rejected for this path.
 
+### First-decode stall timing
+
+Set `PD_SERVING_PERF=1` before starting the server for host timing. Up to two
+early decode sampling calls get a fresh trace budget after chunked prefill.
+Fast calls emit no additional logs. A sample taking at least 500 ms emits
+`decoder_sample_invocation_slow`, with total wall/CPU time, top-level phase
+timings and at most three longest sub-stages in `slow_substages_ms`.
+Sub-stages collect wall time only; they do not log individually. Host mode
+keeps the normal rejection-sampler forward and reports its total sampling
+time; rejection sub-stage instrumentation requires explicit `device` mode.
+
+The existing `decoder_async_output_slow` threshold is 100 ms. Its
+`queue_wait_ms` and `get_output_ms` distinguish output queue time from the
+existing copy-completion wait and CPU parsing. No extra waits, device queries,
+events or readbacks are introduced in host mode, and operation/exception order
+is preserved. `PD_SERVING_PERF=0` disables this timing; `detail` uses the same
+bounded summaries. Explicit `device` mode retains its separate event timing.
+
 ## Server validation
 
 Install the matching repos using your normal environment. This batched extension
