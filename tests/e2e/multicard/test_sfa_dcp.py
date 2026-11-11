@@ -97,11 +97,11 @@ def test_counted_sfa_dcp_collectives_replay(overlap):
         graph = torch.npu.NPUGraph()
         with torch.npu.graph(graph):
             output = forward()
-        for sizes in (
+        for step, sizes in enumerate((
             [(0 if peer == 0 else 19 + peer, 11 * peer) for peer in range(world)],
             [(0, 0) for _ in range(world)],
             [(128 - peer, 128) for peer in range(world)],
-        ):
+        )):
             indices.fill_(-1)
             counts[:, 0].copy_(torch.tensor(sizes[rank], dtype=torch.int32))
             for row, count in enumerate(sizes[rank]):
@@ -115,13 +115,16 @@ def test_counted_sfa_dcp_collectives_replay(overlap):
                 if keys.numel():
                     weights = (all_q[row, owned].float() @ keys.T * scale).softmax(dim=-1)
                     reference[row] = weights @ keys[:, :512]
-            comparisons.append((output.cpu(), reference.bfloat16()))
+            label = f"rank={rank} replay={step} local_counts={sizes[rank]}"
+            comparisons.append((label + " kind=attention", output.cpu(), reference.bfloat16()))
             if edge:
-                comparisons.append((observed.cpu(), torch.full((64,), float(sizes[rank][0]))))
+                comparisons.append((label + " kind=prefetch", observed.cpu(),
+                                    torch.full((64,), float(sizes[rank][0]))))
         torch.npu.synchronize()
         graph.reset()
     finally:
         dist.destroy_process_group()
     # A rank-local parity failure must never strand peers in a later replay.
-    for actual, expected in comparisons:
-        torch.testing.assert_close(actual, expected, rtol=3e-2, atol=2e-2)
+    for label, actual, expected in comparisons:
+        torch.testing.assert_close(actual, expected, rtol=3e-2, atol=2e-2,
+                                   msg=lambda message, label=label: f"DCP parity {label}\n{message}")

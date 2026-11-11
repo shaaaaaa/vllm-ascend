@@ -155,10 +155,18 @@ def runtime(monkeypatch):
     class Stream:
         def __init__(self, device=None, name="transfer"):
             self.name = name
+            self.queued_wait = False
 
         def wait_event(self, event):
             assert event.recorded, "waiting on an unrecorded event"
+            self.queued_wait = True
             log.append(("wait", self.name))
+
+        @property
+        def npu_stream(self):
+            self.queued_wait = False
+            log.append(("submit", self.name))
+            return 1
 
     main = Stream(name="main")
     current = [main]
@@ -173,7 +181,8 @@ def runtime(monkeypatch):
             current[0] = previous
 
     monkeypatch.setattr(torch, "npu", NS(Event=Event, Stream=Stream, stream=switch,
-                                        current_stream=lambda: current[0]), raising=False)
+                                        current_stream=lambda: current[0],
+                                        is_current_stream_capturing=lambda: False), raising=False)
     module = load_module(ROOT / "vllm_ascend/compilation/sfa_retrieval_overlap.py", "overlap_test", monkeypatch)
     monkeypatch.setattr(module, "CaptureProbe", Mock(return_value=NS(verify=Mock())))
     monkeypatch.setattr(torch.ops._C_ascend, "batch_matmul_transpose", Mock(), raising=False)
@@ -299,6 +308,46 @@ def test_edge_uses_explicit_payload_and_refuses_substituted_destination(runtime)
     with pytest.raises(RuntimeError, match="payload storage changed"):
         edge.launch(selected.clone(), counts, slots, (destination,))
     assert transfer.load.call_count == 1
+
+
+def test_capture_submits_wait_before_transfer_and_after_join(runtime, monkeypatch):
+    module, log = runtime
+    side = torch.npu.Stream()
+
+    def load(*args):
+        # Old Torch-NPU queues the wait without updating runtime capture state.
+        # Tensor/native workspace allocation must see the joined capture first.
+        assert not side.queued_wait, "side-stream work reached an unsubmitted capture wait"
+        log.append(("load", side.name))
+
+    edge = module.RetrievalEdge(side, NS(load=load), (torch.zeros(4),))
+    monkeypatch.setattr(torch.npu, "is_current_stream_capturing", lambda: True)
+    log.clear()
+    edge.launch(torch.ones(4), None, None, edge.destinations)
+    edge.join()
+    assert not torch.npu.current_stream().queued_wait
+    assert log == [
+        ("record", "main"), ("wait", "transfer"), ("submit", "transfer"),
+        ("load", "transfer"), ("record", "transfer"), ("wait", "main"), ("submit", "main"),
+    ]
+
+
+@pytest.mark.parametrize("phase", ["fork", "join"])
+def test_capture_queue_submission_failure_cannot_mark_edge_complete(runtime, monkeypatch, phase):
+    module, _ = runtime
+    side = torch.npu.Stream()
+    transfer = NS(load=Mock())
+    edge = module.RetrievalEdge(side, transfer, (torch.zeros(4),))
+    monkeypatch.setattr(torch.npu, "is_current_stream_capturing", lambda: True)
+    fail_stream = side if phase == "fork" else torch.npu.current_stream()
+    original = type(side).npu_stream.fget
+    monkeypatch.setattr(type(side), "npu_stream", property(
+        lambda stream: 0 if stream is fail_stream else original(stream)))
+    with pytest.raises(RuntimeError, match=f"failed to submit retrieval capture {phase} wait"):
+        edge.launch(torch.ones(4), None, None, edge.destinations)
+        edge.join()
+    assert transfer.load.call_count == int(phase == "join")
+    assert edge.pending_capture_launch is (phase == "join")
 
 
 def test_edge_retains_actual_payload_until_cleanup(runtime):
