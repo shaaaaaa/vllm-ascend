@@ -12,6 +12,25 @@ import torch.distributed as dist
 pytest.importorskip("torch_npu")
 
 
+def _verify_dcp_probe(probe):
+    error = None
+    try:
+        probe.verify()
+    except RuntimeError as caught:
+        if not str(caught).startswith("shared retrieval multi-stream capture probe failed"):
+            raise
+        error = caught
+    # Like server startup, agree after every probe replay and before entering
+    # another captured collective. A rank-local parity failure must not leave
+    # successful peers waiting in the attention test's next all-gather.
+    failed = torch.tensor([int(error is not None)], dtype=torch.int32, device="npu")
+    dist.all_reduce(failed)
+    if failed.item():
+        if error is not None:
+            raise error
+        raise RuntimeError("DCP retrieval capture probe failed on a peer")
+
+
 @torch.inference_mode()
 @pytest.mark.parametrize("overlap", [False, True])
 def test_counted_sfa_dcp_collectives_replay(overlap):
@@ -59,7 +78,7 @@ def test_counted_sfa_dcp_collectives_replay(overlap):
             from vllm_ascend.compilation.sfa_retrieval_overlap import CaptureProbe, ProbeCopy, RetrievalEdge
 
             stream = torch.npu.Stream()
-            CaptureProbe(stream, "npu", group).verify()
+            _verify_dcp_probe(CaptureProbe(stream, "npu", group))
             source = torch.zeros(64, device="npu")
             destination = torch.empty_like(source)
             observed = torch.empty_like(source)

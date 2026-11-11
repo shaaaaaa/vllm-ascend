@@ -108,6 +108,32 @@ def test_capture_probe_success_keeps_one_readback_per_replay(monkeypatch, world,
     assert observed_cpu.call_count == 3
 
 
+@pytest.mark.parametrize("local_failed,peer_failed", [(False, False), (False, True), (True, False), (True, True)])
+def test_multicard_probe_agrees_before_next_attention_collective(local_failed, peer_failed):
+    events = []
+    failure = RuntimeError("shared retrieval multi-stream capture probe failed: local evidence")
+
+    def verify():
+        events.append("probe")
+        if local_failed:
+            raise failure
+
+    def all_reduce(value):
+        events.append("agreement")
+        value.add_(int(peer_failed))
+
+    torch_cpu = NS(tensor=lambda values, **kw: torch.tensor(values), int32=torch.int32)
+    run = extract(ROOT / "tests/e2e/multicard/test_sfa_dcp.py", "_verify_dcp_probe",
+                  {"torch": torch_cpu, "dist": NS(all_reduce=all_reduce)})
+    if local_failed or peer_failed:
+        with pytest.raises(RuntimeError, match="capture probe failed") as error:
+            run(NS(verify=verify))
+        assert (error.value is failure) == local_failed
+    else:
+        run(NS(verify=verify))
+    assert events == ["probe", "agreement"]
+
+
 @pytest.fixture
 def graph_module(monkeypatch):
     return graph_fixture.__wrapped__(monkeypatch)
