@@ -245,6 +245,11 @@ env_variables: dict[str, Callable[[], Any]] = {
     # SFA and bounded Q1/Q2 requests, including internal TP/DP/EP. Explicit
     # enforce_eager takes precedence (P nodes). Non-sensitive; restart required.
     "VLLM_ASCEND_SFA_FULL_GRAPH": lambda: bool(int(os.getenv("VLLM_ASCEND_SFA_FULL_GRAPH", "0"))),
+    # DCP communicator workaround for captured AIV exchange corruption.
+    # 0 (default): inherit HCCL_OP_EXPANSION_MODE; 1: force HOST for DCP only.
+    # TP/EP/DP/MC2 keep their existing settings. Non-sensitive; startup-only,
+    # requires worker restart and reserves HOST communication graph streams.
+    "VLLM_ASCEND_DCP_HCCL_HOST": lambda: bool(int(os.getenv("VLLM_ASCEND_DCP_HCCL_HOST", "0"))),
     # Experimental: combine stable target batch and preparation agreements.
     # 0 (default): existing protocol; 1: qualified MP TP x DP. Non-sensitive; restart required.
     "VLLM_ASCEND_SFA_SINGLE_AGREEMENT": lambda: bool(int(os.getenv("VLLM_ASCEND_SFA_SINGLE_AGREEMENT", "0"))),

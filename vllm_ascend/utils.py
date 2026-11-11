@@ -63,6 +63,7 @@ _SHARED_EXPERTS_CALCULATION_STREAM = None
 _CP_CHUNKEDPREFILL_COMM_STREAM = None
 _ASCEND_CUSTOMOP_IS_REIGISTERED = False
 _DEFAULT_BUFFER_SIZE = 200
+_HCCL_OP_EXPANSION_MODE_HOST = 1
 _MIN_DP_BUFFER_SIZE = 50
 _MAX_ACL_GRAPH_ENTRIES = 1800
 _ACL_COMMUNICATION_STREAM_RESERVE = 40
@@ -721,6 +722,11 @@ def _max_aclgraph_keys(
             + int(parallel_config.enable_expert_parallel)
             + int(vllm_config.additional_config.get("multistream_overlap_shared_expert", False))
         )
+        if envs_ascend.VLLM_ASCEND_DCP_HCCL_HOST and parallel_config.decode_context_parallel_size > 1:
+            # DCP is included in num_comm_groups. Replace its one AIV stream
+            # unit with two HOST units, retaining the existing HOST reserves.
+            parallel_factor += 1
+            max_capture_size -= _ACL_CONTEXT_PARALLEL_STREAM_RESERVE + _ACL_COMMUNICATION_STREAM_RESERVE
         if is_moe_model(vllm_config):
             parallel_factor += parallel_config.data_parallel_size > 1
         else:
@@ -790,7 +796,10 @@ def update_aclgraph_sizes(vllm_config: VllmConfig) -> None:
             parallel_config.tensor_parallel_size,
         ]
     )
-    if full_sfa_graph_active and getattr(parallel_config, "decode_context_parallel_size", 1) > 1:
+    if getattr(parallel_config, "decode_context_parallel_size", 1) > 1 and (
+        full_sfa_graph_active
+        or (envs_ascend.VLLM_ASCEND_DCP_HCCL_HOST and os.getenv("HCCL_OP_EXPANSION_MODE") == "AIV")
+    ):
         num_comm_groups += 1
     max_num_batch_sizes = _max_aclgraph_keys(
         vllm_config,
@@ -1295,7 +1304,14 @@ def get_hccl_config_for_pg_options(group_name: str) -> dict | None:
         "dp": {"hccl_buffer_size": calculate_dp_buffer_size()},
         "dynamic_eplb": {"hccl_buffer_size": _DYNAMIC_EPLB_BUFFER_SIZE},
     }
-    return hccl_config_map.get(group_name, get_default_buffer_config())
+    config = hccl_config_map.get(group_name, get_default_buffer_config())
+    if group_name == "dcp" and envs_ascend.VLLM_ASCEND_DCP_HCCL_HOST:
+        config["hccl_op_expansion_mode"] = _HCCL_OP_EXPANSION_MODE_HOST
+        logger.info(
+            "DCP HCCL expansion mode override: HOST (global=%s, buffer=%d MiB)",
+            os.getenv("HCCL_OP_EXPANSION_MODE", "unset"), config["hccl_buffer_size"],
+        )
+    return config
 
 
 def get_default_buffer_config() -> dict:
