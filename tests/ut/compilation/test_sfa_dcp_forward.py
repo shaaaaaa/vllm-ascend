@@ -9,12 +9,73 @@ from unittest.mock import Mock
 import numpy as np
 import pytest
 import torch
-from sfa_test_support import ROOT, Pointer, definitions, extract, load_module
+from sfa_test_support import ROOT, HostTL, Pointer, definitions, extract, load_module
 from test_sfa_dcp_merge import DcpTL
 
 RUNNER = ROOT / "vllm_ascend/worker/model_runner_v1.py"
 SFA = ROOT / "vllm_ascend/attention/sfa_v1.py"
 OPS = ROOT / "vllm_ascend/ops/triton/sfa_dcp.py"
+
+
+@pytest.fixture
+def gather_queries():
+    tl = HostTL()
+    kernel = extract(OPS, "_unpack_queries", {"tl": tl})
+
+    class Launch:
+        def __getitem__(self, grid):
+            def run(packed, query, rope, *args):
+                tl.programs = grid[0]
+                for pid in range(tl.programs):
+                    tl.pid = pid
+                    kernel(Pointer(packed), Pointer(query), Pointer(rope), *args)
+            return run
+
+    return extract(OPS, "_gather_sfa_dcp_queries", {
+        "torch": torch, "_unpack_queries": Launch(),
+        "init_device_properties_triton": lambda: None, "get_vectorcore_num": lambda: 7,
+        "triton": SimpleNamespace(next_power_of_2=lambda n: 1 << (n - 1).bit_length()),
+    })
+
+
+@pytest.mark.parametrize("world", [2, 4, 8])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("rows,heads", [(1, 8), (2, 8), (3, 1), (8, 8), (32, 1), (3, 16)])
+@pytest.mark.parametrize("strided", [False, True])
+def test_gather_query_unpack_preserves_rank_row_head_and_bits(gather_queries, world, dtype, rows, heads, strided):
+    packets, inputs = [], []
+    for rank in range(world):
+        bits = ((torch.arange(rows * heads * 1152) + rank * 1103) % 65536 - 32768).to(torch.int16)
+        values = bits.view(dtype).reshape(rows, heads, 1152)
+        query, rope = values[..., :1024:2], values[..., 1024::2]
+        if not strided:
+            query, rope = query.contiguous(), rope.contiguous()
+        inputs.append((query, rope))
+        packets.append(torch.cat((query, rope), -1))
+    snapshots = [value.view(torch.int16).clone() for value in inputs[0]]
+    calls = []
+    raw = torch.cat(packets, dim=0)
+
+    def collective(output, packet, group):
+        calls.append((packet.shape, packet.dtype, packet.numel()))
+        assert torch.equal(packet.view(torch.int16), packets[0].view(torch.int16))
+        output.copy_(raw)
+
+    # Use the actual rank-major communicator layout, not a head-major test double.
+    all_gather = extract(
+        ROOT.parent / "vllm/vllm/distributed/device_communicators/base_device_communicator.py",
+        "all_gather", {"torch": torch, "dist": SimpleNamespace(all_gather_into_tensor=collective)},
+    )
+    group = SimpleNamespace(world_size=world, device_group=object())
+    group.all_gather = lambda packet, dim: all_gather(group, packet, dim)
+    actual = gather_queries(*inputs[0], group)
+    expected = torch.cat(packets, dim=1).split((512, 64), dim=-1)
+    for result, reference in zip(actual, expected):
+        assert result.is_contiguous() and result.dtype == dtype
+        assert torch.equal(result.view(torch.int16), reference.contiguous().view(torch.int16))
+    for value, snapshot in zip(inputs[0], snapshots):
+        assert torch.equal(value.view(torch.int16), snapshot)
+    assert calls == [(packets[0].shape, dtype, packets[0].numel())]
 
 
 class TopkTL(DcpTL):
@@ -256,15 +317,15 @@ def test_native_dcp_mixed_rows_reuse_one_shared_plan_and_copy_each_layer(monkeyp
 
 
 @pytest.mark.parametrize("staged", [False, True])
-def test_native_dcp_attention_gathers_heads_then_merges_local_outputs(monkeypatch, staged):
-    query, rope = torch.ones((3, 2, 512)), torch.ones((3, 2, 64))
+def test_native_dcp_attention_gathers_heads_then_merges_local_outputs(monkeypatch, staged, gather_queries):
+    query, rope = torch.ones((3, 2, 512), dtype=torch.bfloat16), torch.ones((3, 2, 64), dtype=torch.bfloat16)
     kv = (torch.empty(1), torch.empty(2))
     counts, topk = torch.empty((3, 16)), torch.empty((3, 1, 8))
     table, query_ends, local_lens = torch.zeros((3, 2)), torch.tensor([2, 3, 3]), torch.tensor([0, 19])
     sequence = []
 
     def gather(packet, *, dim):
-        assert packet.shape == (3, 2, 576) and dim == 1
+        assert packet.shape == (3, 2, 576) and dim == 0
         sequence.append("gather")
         return torch.cat((packet, packet * 2), dim=dim)
 
@@ -282,8 +343,10 @@ def test_native_dcp_attention_gathers_heads_then_merges_local_outputs(monkeypatc
         return partial[:, :2]
 
     monkeypatch.setattr(torch.ops._C_ascend, "npu_sparse_flash_attention_dcp", local, raising=False)
-    run = extract(OPS, "execute_sfa_dcp", {"torch": torch, "merge_sfa_dcp": merge})
-    group = SimpleNamespace(all_gather=gather, device_group="dcp")
+    run = extract(OPS, "execute_sfa_dcp", {
+        "torch": torch, "merge_sfa_dcp": merge, "_gather_sfa_dcp_queries": gather_queries,
+    })
+    group = SimpleNamespace(all_gather=gather, device_group="dcp", world_size=2)
     if staged:
         ops = ModuleType("vllm_ascend.ops.triton.sfa_dcp")
         ops.execute_sfa_dcp = run

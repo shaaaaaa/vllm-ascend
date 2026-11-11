@@ -1,10 +1,44 @@
 # SPDX-License-Identifier: Apache-2.0
 """Compile and replay DCP exchange kernels on one NPU, without HCCL peers."""
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
 pytest.importorskip("torch_npu")
+
+
+@torch.inference_mode()
+@pytest.mark.parametrize("world", [2, 4, 8])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_query_unpack_bit_exact_capture_without_hccl(world, dtype):
+    from vllm_ascend.ops.triton.sfa_dcp import _gather_sfa_dcp_queries
+
+    # Isolate Triton compilation from HCCL. The multicard benchmark qualifies
+    # the real collective separately with the same helper and strided inputs.
+    for rows, heads in ((1, 8), (3, 1), (8, 8)):
+        raw = torch.empty((world, rows, heads, 576), dtype=dtype, device="npu")
+        group = SimpleNamespace(world_size=world, all_gather=lambda packet, dim, raw=raw: raw.flatten(0, 1))
+        query, rope = raw[0].split((512, 64), dim=-1)
+        raw.zero_()
+        _gather_sfa_dcp_queries(query, rope, group)
+        torch.npu.synchronize()
+        graph = torch.npu.NPUGraph()
+        with torch.npu.graph(graph):
+            outputs = _gather_sfa_dcp_queries(query, rope, group)
+        try:
+            for step in range(3):
+                bits = (torch.arange(raw.numel(), dtype=torch.int32) + step * 7919) % 65536 - 32768
+                bits = bits.to(torch.int16).reshape(raw.shape)
+                raw.view(torch.int16).copy_(bits)
+                graph.replay()
+                expected = bits.permute(1, 0, 2, 3).reshape(rows, world * heads, 576).split((512, 64), dim=-1)
+                for actual, wanted in zip(outputs, expected):
+                    assert torch.equal(actual.view(torch.int16).cpu(), wanted)
+        finally:
+            torch.npu.synchronize()
+            graph.reset()
 
 
 @torch.inference_mode()

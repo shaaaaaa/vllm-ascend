@@ -140,18 +140,10 @@ def test_counted_sfa_dcp_collectives_replay(overlap, trace_stages, verify_probe,
         counts = torch.zeros((rows, 16), dtype=torch.int32, device="npu")
         scale = 576**-0.5
 
-        def all_gather(packet, *, dim):
-            if packet.ndim == 1:
-                gathered = packet.new_empty(packet.numel()*world)
-                dist.all_gather_into_tensor(gathered, packet)
-                return gathered
-            head_major = packet.movedim(dim, 0).contiguous()
-            gathered = head_major.new_empty((heads, rows, 576))
-            dist.all_gather_into_tensor(gathered, head_major)
-            return gathered.movedim(0, dim)
+        from vllm.distributed.device_communicators.base_device_communicator import DeviceCommunicatorBase
 
-        group = SimpleNamespace(all_gather=all_gather, device_group=dist.group.WORLD,
-                                rank_in_group=rank, world_size=world)
+        group = SimpleNamespace(device_group=dist.group.WORLD, rank_in_group=rank, world_size=world)
+        group.all_gather = lambda packet, dim: DeviceCommunicatorBase.all_gather(group, packet, dim)
         edge = None
         if overlap or verify_probe:
             from vllm_ascend.compilation.sfa_retrieval_overlap import CaptureProbe, ProbeCopy, RetrievalEdge

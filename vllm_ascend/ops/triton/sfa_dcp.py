@@ -49,6 +49,38 @@ def prepare_sfa_dcp_topk(
     )
 
 
+@triton.jit
+def _unpack_queries(packed, query, rope, rows: tl.constexpr, heads: tl.constexpr,
+                    world: tl.constexpr, query_dim: tl.constexpr, rope_dim: tl.constexpr,
+                    query_block: tl.constexpr, rope_block: tl.constexpr):
+    q_col = tl.arange(0, query_block)
+    r_col = tl.arange(0, rope_block)
+    for item in range(tl.program_id(0), rows * heads * world, tl.num_programs(0)):
+        token, head = item // (heads * world), item % (heads * world)
+        source = ((head // heads * rows + token) * heads + head % heads) * (query_dim + rope_dim)
+        tl.store(query + item * query_dim + q_col,
+                 tl.load(packed + source + q_col, q_col < query_dim, 0), q_col < query_dim)
+        tl.store(rope + item * rope_dim + r_col,
+                 tl.load(packed + source + query_dim + r_col, r_col < rope_dim, 0), r_col < rope_dim)
+
+
+def _gather_sfa_dcp_queries(query: torch.Tensor, rope: torch.Tensor, group) -> tuple[torch.Tensor, torch.Tensor]:
+    """Unpack rank-major collective storage into contiguous TND query planes."""
+    rows, heads, query_dim = query.shape
+    rope_dim, world = rope.shape[-1], group.world_size
+    packed = group.all_gather(torch.cat((query, rope), dim=-1), dim=0)
+    query = packed.new_empty((rows, heads * world, query_dim))
+    rope = packed.new_empty((rows, heads * world, rope_dim))
+    init_device_properties_triton()
+    # Copy raw halfwords so BF16/FP16 NaN payloads and signed zero stay intact.
+    _unpack_queries[(min(rows * heads * world, get_vectorcore_num()),)](
+        packed.view(torch.int16), query.view(torch.int16), rope.view(torch.int16),
+        rows, heads, world, query_dim, rope_dim,
+        triton.next_power_of_2(query_dim), triton.next_power_of_2(rope_dim),
+    )
+    return query, rope
+
+
 def execute_sfa_dcp(
     query: torch.Tensor, rope: torch.Tensor, kv_cache: tuple[torch.Tensor, ...],
     topk: torch.Tensor, counts: torch.Tensor, block_table: torch.Tensor,
@@ -56,11 +88,10 @@ def execute_sfa_dcp(
     *, prefetch: tuple | None = None,
 ) -> torch.Tensor:
     """Gather only query heads, then return the merged output for this head owner."""
-    packed = group.all_gather(torch.cat((query, rope), dim=-1), dim=1)
-    query, rope = packed.split((query.shape[-1], rope.shape[-1]), dim=-1)
+    query, rope = _gather_sfa_dcp_queries(query, rope, group)
     requests = local_seq_lens.shape[0]
     partial = torch.ops._C_ascend.npu_sparse_flash_attention_dcp(
-        query.contiguous(), rope.contiguous(), kv_cache[0], kv_cache[1], topk, counts,
+        query, rope, kv_cache[0], kv_cache[1], topk, counts,
         block_table[:requests], query_ends[:requests], local_seq_lens, scale,
     )
     if prefetch is not None:
