@@ -1,6 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """CPU checks for test-only DCP stage observation and failure reporting."""
 
+import ast
+import os
+import subprocess
+import sys
+from textwrap import dedent
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -9,6 +14,48 @@ import torch
 from sfa_test_support import ROOT, extract
 
 SOURCE = ROOT / "tests/e2e/multicard/test_sfa_dcp.py"
+
+
+def test_pytest_reuses_process_group_after_a_case_failure(tmp_path):
+    # Exercise pytest's real fixture scope/teardown with the production test
+    # fixture. This validates harness lifecycle, not native HCCL behavior.
+    fixture = next(node for node in ast.parse(SOURCE.read_text(encoding="utf-8")).body
+                   if getattr(node, "name", "") == "dcp_world")
+    script = dedent('''
+        import os
+        from datetime import timedelta
+        from types import SimpleNamespace as NS
+        import pytest
+        os.environ.update(WORLD_SIZE="8", LOCAL_RANK="0")
+        events = []
+        def init(backend, timeout):
+            assert events == ["device"]
+            assert backend == "hccl" and timeout == timedelta(seconds=120)
+            events.append("init")
+        def destroy():
+            assert events == ["device", "init", 0, 1, 2]
+            events.append("destroy")
+        torch = NS(npu=NS(set_device=lambda device: events.append("device")))
+        dist = NS(init_process_group=init, destroy_process_group=destroy)
+    ''') + ast.unparse(fixture) + '\n' + dedent('''
+        @pytest.mark.parametrize("case", [0, 1, 2])
+        def test_case(case, dcp_world):
+            assert dcp_world == 8 and events.count("init") == 1
+            assert "destroy" not in events
+            events.append(case)
+            if case == 1:
+                pytest.xfail("simulated rank-local numerical failure")
+    ''')
+    path = tmp_path / "test_group_lifetime.py"
+    path.write_text(script, encoding="utf-8")
+    result = subprocess.run(
+        [sys.executable, "-B", "-m", "pytest", "--noconftest", "-o", "addopts=",
+         "-p", "no:cacheprovider", "-q", str(path)],
+        cwd=tmp_path, env={**os.environ, "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1"},
+        capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "2 passed, 1 xfailed" in result.stdout
 
 
 def test_stage_observer_preserves_calls_and_original_tensor_identity(monkeypatch):

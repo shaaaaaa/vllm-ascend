@@ -52,6 +52,7 @@ def test_dcp_probe_parity_failure_does_not_abandon_peer_replays(monkeypatch, rea
         # Only this rank sees a numerical mismatch on the first replay. Peers
         # still enter all three captured HCCL sequences before outer agreement.
         probe.observed[0] = -1 if len(replays) == 1 else 2*probe.source[0]+1
+        probe.exchange.fill_(float(probe.source[0]))
     probe.graph = NS(replay=replay)
     if readback_failure:
         original_cpu = torch.Tensor.cpu
@@ -79,14 +80,17 @@ def test_dcp_probe_parity_failure_does_not_abandon_peer_replays(monkeypatch, rea
 
 
 @pytest.mark.parametrize("world,rank", [(1, 0), (2, 1), (4, 3), (8, 7)])
-def test_capture_probe_success_keeps_one_readback_per_replay(monkeypatch, world, rank):
+def test_capture_probe_success_reads_only_required_results(monkeypatch, world, rank):
     source = ROOT / "vllm_ascend/compilation/sfa_retrieval_overlap.py"
     verify = extract(source, "verify", {"torch": torch})
     observed = torch.empty(64)
     observed_cpu = Mock(side_effect=lambda: observed)
+    exchange = torch.empty(64 * world)
+    exchange_cpu = Mock(side_effect=lambda: exchange)
     probe = NS(source=torch.zeros(64), selected=torch.zeros(64), mask=torch.arange(64) < rank + 1,
                dest=torch.empty(64), observed=NS(copy_=observed.copy_, cpu=observed_cpu),
-               exchange=torch.empty(64 * world), matrix=torch.ones(16, 16), product=torch.empty(16, 16),
+               exchange=NS(cpu=exchange_cpu, fill_=exchange.fill_),
+               matrix=torch.ones(16, 16), product=torch.empty(16, 16),
                edge=NS(launch=lambda *args: None, join=lambda: None), dcp_group=None)
     if world > 1:
         probe.dcp_group = NS(rank_in_group=rank, world_size=world, device_group=object(),
@@ -99,6 +103,7 @@ def test_capture_probe_success_keeps_one_readback_per_replay(monkeypatch, world,
         observed.fill_(value if world == 1 else world * value + world * (world - 1) / 2)
         if world > 1:
             observed[rank + 1:] = 0
+            probe.exchange.fill_(float(probe.source[0]))
 
     probe.graph = NS(replay=replay)
     monkeypatch.setattr(torch, "npu", NS(synchronize=lambda: None, graph=lambda _: nullcontext()), raising=False)
@@ -106,6 +111,37 @@ def test_capture_probe_success_keeps_one_readback_per_replay(monkeypatch, world,
     verify(probe)
     assert replays == [1, 7, 2]
     assert observed_cpu.call_count == 3
+    assert exchange_cpu.call_count == (3 if world > 1 else 0)
+
+
+def test_dcp_capture_probe_rejects_bad_exchange_with_correct_prefetch(monkeypatch):
+    source = ROOT / "vllm_ascend/compilation/sfa_retrieval_overlap.py"
+    verify = extract(source, "verify", {"torch": torch})
+    probe = NS(source=torch.zeros(64), selected=torch.zeros(64), mask=torch.arange(64) < 1,
+               dest=torch.zeros(64), observed=torch.zeros(64), exchange=torch.zeros(128),
+               matrix=torch.ones(16, 16), product=torch.empty(16, 16),
+               edge=NS(launch=lambda *args: None, join=lambda: None),
+               dcp_group=NS(rank_in_group=0, world_size=2, device_group=object(),
+                            all_gather=lambda tensor, dim: tensor.repeat(2)))
+    replays = []
+
+    def replay():
+        value = float(probe.source[0])
+        replays.append(value)
+        probe.observed.zero_()
+        probe.observed[0] = 2 * value + 1  # Local prefetch is correct.
+        probe.exchange.fill_(value)
+        if len(replays) == 2:
+            probe.exchange[64:] = 1  # A peer's old packet survived replay.
+
+    probe.graph = NS(replay=replay)
+    monkeypatch.setattr(torch, "npu", NS(synchronize=lambda: None, graph=lambda _: nullcontext()), raising=False)
+    monkeypatch.setattr(torch.distributed, "all_to_all_single", lambda *args, **kwargs: None)
+    with pytest.raises(RuntimeError, match="capture probe failed") as error:
+        verify(probe)
+    assert replays == [1, 7, 2]  # Do not strand peers after the local mismatch.
+    assert "exchange: mismatches=64" in str(error.value)
+    assert "replay=7" in str(error.value)
 
 
 @pytest.mark.parametrize("local_failed,peer_failed", [(False, False), (False, True), (True, False), (True, True)])

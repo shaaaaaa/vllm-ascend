@@ -152,7 +152,15 @@ class CaptureProbe:
                 expected.fill_(world * value + world * (world-1) / 2)
                 expected[rank+1:] = 0
             observed = self.observed.cpu()
-            if not torch.equal(observed, expected):
+            mismatch = not torch.equal(observed, expected)
+            if self.dcp_group is not None:
+                # Prefetch correctness does not prove that the following HCCL
+                # exchange replayed correctly. Check its result independently;
+                # these small readbacks run only in the startup probe.
+                exchange_observed = self.exchange.cpu()
+                exchange_expected = torch.full_like(exchange_observed, float(value + rank))
+                mismatch = mismatch or not torch.equal(exchange_observed, exchange_expected)
+            if mismatch:
                 # Only a failed startup probe pays for these extra readbacks.
                 # Snapshot before the next replay overwrites the evidence. These
                 # are observations, not proof that one particular stream caused
@@ -169,7 +177,7 @@ class CaptureProbe:
                     snapshots.extend((
                         ("gathered", gathered, gathered_expected),
                         ("selected", self.selected, expected),
-                        ("exchange", self.exchange, torch.full_like(gathered_expected, float(value + rank))),
+                        ("exchange", exchange_observed, exchange_expected),
                     ))
                 details = []
                 for name, actual, wanted in snapshots:

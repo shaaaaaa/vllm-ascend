@@ -85,22 +85,36 @@ def _assert_dcp_comparisons(comparisons):
         raise AssertionError("\n\n".join(failures))
 
 
-@torch.inference_mode()
-@pytest.mark.parametrize("overlap,trace_stages", [
-    pytest.param(False, False, id="False"),
-    pytest.param(True, False, id="True"),
-    pytest.param(True, True, id="True-trace"),
-])
-def test_counted_sfa_dcp_collectives_replay(overlap, trace_stages, monkeypatch):
+@pytest.fixture(scope="module")
+def dcp_world():
     world = int(os.environ.get("WORLD_SIZE", "1"))
     if world not in (4, 8):
         pytest.skip("launch with torchrun and 4 or 8 local NPU ranks")
+    torch.npu.set_device(int(os.environ["LOCAL_RANK"]))
+    dist.init_process_group("hccl", timeout=timedelta(seconds=120))
+    try:
+        # Reinitializing HCCL between parametrized cases is not reliable on the
+        # reported runtime. Keep the same group until all cases have finished.
+        yield world
+    finally:
+        dist.destroy_process_group()
+
+
+@torch.inference_mode()
+@pytest.mark.parametrize("overlap,trace_stages,verify_probe", [
+    pytest.param(False, False, False, id="False"),
+    pytest.param(True, False, True, id="True"),
+    pytest.param(True, True, True, id="True-trace"),
+    pytest.param(False, True, True, id="serial-after-probe"),
+    pytest.param(True, True, False, id="overlap-without-probe"),
+])
+def test_counted_sfa_dcp_collectives_replay(overlap, trace_stages, verify_probe, monkeypatch, dcp_world):
+    world = dcp_world
     import vllm_ascend.vllm_ascend_C  # noqa: F401
     from vllm_ascend.ops.triton import sfa_dcp
 
-    torch.npu.set_device(int(os.environ["LOCAL_RANK"]))
-    dist.init_process_group("hccl", timeout=timedelta(seconds=120))
     comparisons = []
+    graph = None
     try:
         rank = dist.get_rank()
         if trace_stages and rank == 0:
@@ -139,11 +153,13 @@ def test_counted_sfa_dcp_collectives_replay(overlap, trace_stages, monkeypatch):
         group = SimpleNamespace(all_gather=all_gather, device_group=dist.group.WORLD,
                                 rank_in_group=rank, world_size=world)
         edge = None
-        if overlap:
+        if overlap or verify_probe:
             from vllm_ascend.compilation.sfa_retrieval_overlap import CaptureProbe, ProbeCopy, RetrievalEdge
 
             stream = torch.npu.Stream()
+        if verify_probe:
             _verify_dcp_probe(CaptureProbe(stream, "npu", group))
+        if overlap:
             source = torch.zeros(64, device="npu")
             destination = torch.empty_like(source)
             observed = torch.empty_like(source)
@@ -185,7 +201,10 @@ def test_counted_sfa_dcp_collectives_replay(overlap, trace_stages, monkeypatch):
                 if keys.numel():
                     weights = (all_q[row, owned].float() @ keys.T * scale).softmax(dim=-1)
                     reference[row] = weights @ keys[:, :512]
-            label = f"rank={rank} replay={step} local_counts={sizes[rank]} traced={trace_stages}"
+            label = (
+                f"rank={rank} replay={step} local_counts={sizes[rank]} traced={trace_stages} "
+                f"overlap={overlap} probe={verify_probe}"
+            )
             comparisons.append((label + " kind=attention", output.cpu(), reference.bfloat16()))
             if edge:
                 comparisons.append((label + " kind=prefetch", observed.cpu(),
@@ -194,9 +213,9 @@ def test_counted_sfa_dcp_collectives_replay(overlap, trace_stages, monkeypatch):
                 comparisons.append((label + " kind=counts", counts[:, 0].cpu(),
                                     torch.tensor(sizes[rank], dtype=torch.int32)))
                 comparisons.extend(_empty_dcp_stage_comparisons(stages, label))
-        torch.npu.synchronize()
-        graph.reset()
     finally:
-        dist.destroy_process_group()
+        if graph is not None:
+            torch.npu.synchronize()
+            graph.reset()
     # A rank-local parity failure must never strand peers in a later replay.
     _assert_dcp_comparisons(comparisons)
