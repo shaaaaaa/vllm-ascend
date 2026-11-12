@@ -9,15 +9,11 @@ Select raw directory: python tools/summarize_prefill_profile.py /path/to/profile
 Compare ranks without reading traces: python tools/summarize_prefill_profile.py 5
 Include detailed trace summaries: python tools/summarize_prefill_profile.py 5 --full
 Locate late-rank submission delays: python tools/summarize_prefill_profile.py 5 --locate
-Print an existing fragment as text: python tools/summarize_prefill_profile.py --base64 /path/to/fragment.json.gz
 PID_timestamp selects exactly one raw directory. Legacy run-number selection is also supported.
 By default, reads communication.json only. Full mode also streams trace_view.json with bounded memory.
 """
 
 import argparse
-import base64
-import gzip
-import hashlib
 import heapq
 import json
 import math
@@ -30,7 +26,6 @@ from pathlib import Path
 DEFAULT_PROFILE_DIRECTORY = Path(__file__).resolve().parents[1] / "vllm_profile" / "P_dp0"
 TRACE_TIMESTAMP_TOLERANCE_US = 1.0
 TRACE_SLICE_MARGIN_US = 100.0
-BASE64_CHUNK_CHARS = 6000
 
 
 def number(value):
@@ -276,11 +271,11 @@ def collective_alignment(summaries, top):
 
 
 def trace_dependencies(path, connections, trace_slice=None):
-    """Read selected Host APIs and optionally export a compressed trace window."""
+    """Read selected Host APIs and optionally export a JSON trace window."""
     launches = {}
     count = 0
     output, start_us, end_us = trace_slice if trace_slice else (None, 0, 0)
-    with gzip.open(output, "wt", encoding="utf-8") if output else nullcontext() as stream:
+    with output.open("w", encoding="utf-8") if output else nullcontext() as stream:
         if stream is not None:
             stream.write('{"traceEvents":[')
         for event in complete_events(path):
@@ -319,41 +314,10 @@ def trace_dependencies(path, connections, trace_slice=None):
             "start_us": start_us,
             "end_us": end_us,
             "events": count,
-            "compressed_bytes": output.stat().st_size,
+            "bytes": output.stat().st_size,
             "includes_linked_context": True,
         }
     return launches, artifact
-
-
-def print_base64_parts(path, chunk_chars=BASE64_CHUNK_CHARS, part=None):
-    """Emit independently decodable text blocks with a whole-file checksum."""
-    if chunk_chars < 4 or chunk_chars % 4:
-        raise ValueError("--chunk-chars must be a positive multiple of 4")
-    size = path.stat().st_size
-    bytes_per_part = chunk_chars // 4 * 3
-    parts = max(1, (size + bytes_per_part - 1) // bytes_per_part)
-    if part is not None and not 1 <= part <= parts:
-        raise ValueError(f"--part must be between 1 and {parts}")
-    with path.open("rb") as stream:
-        digest = hashlib.sha256()
-        for block in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(block)
-        indices = range(1, parts + 1) if part is None else (part,)
-        for index in indices:
-            stream.seek((index - 1) * bytes_per_part)
-            encoded = base64.b64encode(stream.read(bytes_per_part)).decode("ascii")
-            header = {
-                "file": path.name,
-                "encoding": "base64",
-                "bytes": size,
-                "chars": len(encoded),
-                "sha256": digest.hexdigest(),
-                "part": index,
-                "parts": parts,
-            }
-            print("PROFILE_BASE64_BEGIN " + json.dumps(header, ensure_ascii=False, separators=(",", ":")))
-            print(encoded)
-            print("PROFILE_BASE64_END")
 
 
 def collective_delay_details(alignments, communication_files, top, trace_slice_dir=None):
@@ -449,7 +413,7 @@ def collective_delay_details(alignments, communication_files, top, trace_slice_d
             worker = next(
                 (parent.name for parent in path.parents if parent.name.endswith("_ascend_pt")), path.parent.name
             )
-            output = trace_slice_dir / f"prefill-delay-{worker}.json.gz"
+            output = trace_slice_dir / f"prefill-delay-{worker}.json"
             trace_slice = (output, start - TRACE_SLICE_MARGIN_US, end + TRACE_SLICE_MARGIN_US)
         launches, artifact = trace_dependencies(path, connections, trace_slice)
         if artifact is not None:
@@ -653,11 +617,6 @@ def main(argv=None):
     cli.add_argument(
         "--output", type=Path, help="Summary file; interactive/default-directory selection uses ./profile-summary.json"
     )
-    cli.add_argument("--base64", type=Path, metavar="FILE", help="Print an existing fragment as numbered Base64 blocks")
-    cli.add_argument(
-        "--chunk-chars", type=int, default=BASE64_CHUNK_CHARS, help="Base64 characters per block (default 6000)"
-    )
-    cli.add_argument("--part", type=int, help="Print only this Base64 block number")
     cli.add_argument(
         "--top", type=int, default=3, help="Slowest collective instances, or events of each kind in full mode"
     )
@@ -670,25 +629,11 @@ def main(argv=None):
     mode.add_argument(
         "--locate",
         action="store_true",
-        help="Locate late-rank delays and print the compressed trace window as numbered Base64 blocks",
+        help="Locate late-rank delays and export the relevant trace window as JSON",
     )
     args = cli.parse_args(argv)
     if args.top < 1:
         cli.error("--top must be positive")
-    if args.chunk_chars < 4 or args.chunk_chars % 4:
-        cli.error("--chunk-chars must be a positive multiple of 4")
-    if args.part is not None and not (args.base64 or args.locate):
-        cli.error("--part requires --base64 or --locate")
-    if args.part is not None and args.part < 1:
-        cli.error("--part must be positive")
-    if args.base64 is not None:
-        if args.paths or args.run or args.list or args.interactive or args.full or args.locate:
-            cli.error("Use --base64 FILE separately from profile selection")
-        try:
-            print_base64_parts(args.base64, args.chunk_chars, args.part)
-        except (OSError, ValueError) as error:
-            cli.error(str(error))
-        return
     default_directory = not args.paths or (
         len(args.paths) == 1
         and (
@@ -793,12 +738,9 @@ def main(argv=None):
         args.output.write_text(summary + "\n", encoding="utf-8")
         print(f"摘要已保存到 {args.output.resolve()}")
     if args.locate:
-        try:
-            for detail in report["collective_delay_details"]:
-                if "trace_slice" in detail:
-                    print_base64_parts(Path(detail["trace_slice"]["file"]), args.chunk_chars, args.part)
-        except (OSError, ValueError) as error:
-            cli.error(str(error))
+        for detail in report["collective_delay_details"]:
+            if "trace_slice" in detail:
+                print(f"诊断片段已保存到 {detail['trace_slice']['file']}")
 
 
 if __name__ == "__main__":

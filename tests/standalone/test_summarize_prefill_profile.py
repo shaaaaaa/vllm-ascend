@@ -1,8 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 
-import base64
-import gzip
-import hashlib
 import importlib.util
 import json
 import shutil
@@ -293,69 +290,26 @@ def test_locate_cli_uses_selected_capture(tool, tmp_path, monkeypatch, capsys):
     tool.main([str(profile_root), "1", "--locate"])
     printed = capsys.readouterr().out
     report = json.loads((tmp_path / "profile-summary.json").read_text())
-    assert "PROFILE_BASE64_BEGIN" in printed
     detail = report["collective_delay_details"][0]
     assert detail["rank"] == 1
     assert detail["status"] == "matched"
     assert detail["launch_end_to_device_start_ms"] == 0.9
     assert "traces" not in report
     artifact = detail["trace_slice"]
-    with gzip.open(artifact["file"], "rt", encoding="utf-8") as stream:
-        fragment = json.load(stream)
+    fragment_path = Path(artifact["file"])
+    fragment = json.loads(fragment_path.read_text(encoding="utf-8"))
     assert len(fragment["traceEvents"]) == artifact["events"] == 2
-    assert artifact["compressed_bytes"] > 0
-
-
-@pytest.mark.parametrize("chunk_chars", [4, 64, 6000])
-def test_base64_parts_round_trip(tool, tmp_path, capsys, chunk_chars):
-    path = tmp_path / "trace.json.gz"
-    original = gzip.compress(bytes(range(256)) * 4)
-    path.write_bytes(original)
-    tool.print_base64_parts(path, chunk_chars)
-    lines = capsys.readouterr().out.splitlines()
-    restored = bytearray()
-    expected_parts = len(lines) // 3
-    for index in range(expected_parts):
-        header_line, payload, end = lines[index * 3 : index * 3 + 3]
-        assert header_line.startswith("PROFILE_BASE64_BEGIN ")
-        header = json.loads(header_line.removeprefix("PROFILE_BASE64_BEGIN "))
-        assert header["part"] == index + 1
-        assert header["parts"] == expected_parts
-        assert header["bytes"] == len(original)
-        assert header["chars"] == len(payload) <= chunk_chars
-        assert header["sha256"] == hashlib.sha256(original).hexdigest()
-        assert end == "PROFILE_BASE64_END"
-        restored.extend(base64.b64decode(payload, validate=True))
-    assert bytes(restored) == original
-    assert gzip.decompress(restored) == bytes(range(256)) * 4
-
-
-def test_base64_existing_file_can_select_one_part_without_reading_profiles(tool, tmp_path, capsys, monkeypatch):
-    path = tmp_path / "trace.json.gz"
-    path.write_bytes(bytes(range(100)))
-    monkeypatch.setattr(tool, "discover_runs", lambda *args: pytest.fail("Encoding read profiles"))
-    tool.main(["--base64", str(path), "--chunk-chars", "16", "--part", "2"])
-    header_line, payload, _ = capsys.readouterr().out.splitlines()
-    assert json.loads(header_line.removeprefix("PROFILE_BASE64_BEGIN "))["part"] == 2
-    assert base64.b64decode(payload, validate=True) == bytes(range(12, 24))
-
-
-@pytest.mark.parametrize("chunk_chars", [0, 3, 6])
-def test_base64_invalid_chunk_length(tool, tmp_path, chunk_chars):
-    with pytest.raises(ValueError, match="multiple of 4"):
-        tool.print_base64_parts(tmp_path / "missing.gz", chunk_chars)
-
-
-def test_base64_invalid_part(tool, tmp_path):
-    path = tmp_path / "trace.gz"
-    path.write_bytes(b"abc")
-    with pytest.raises(ValueError, match="between 1 and 1"):
-        tool.print_base64_parts(path, part=2)
+    assert fragment_path.suffix == ".json"
+    assert artifact["bytes"] == fragment_path.stat().st_size
+    assert printed.splitlines() == [
+        f"摘要已保存到 {(tmp_path / 'profile-summary.json').resolve()}",
+        f"诊断片段已保存到 {fragment_path}",
+    ]
 
 
 def test_trace_slice_preserves_metadata_spanning_ranges_and_flow_events(tool, tmp_path):
     path = tmp_path / "trace_view.json"
-    output = tmp_path / "fragment.json.gz"
+    output = tmp_path / "fragment.json"
     rows = [
         dict(name="process_name", ph="M", pid=1, args={"name": "CANN"}),
         dict(name="outside", ph="X", ts=10, dur=20),
@@ -370,8 +324,7 @@ def test_trace_slice_preserves_metadata_spanning_ranges_and_flow_events(tool, tm
     path.write_text(json.dumps(rows))
     hosts, artifact = tool.trace_dependencies(path, {"7"}, (output, 100, 300))
     assert [event["name"] for event in hosts["7"]] == ["Runtime@record", "Runtime@launch"]
-    with gzip.open(output, "rt", encoding="utf-8") as stream:
-        fragment = json.load(stream)["traceEvents"]
+    fragment = json.loads(output.read_text(encoding="utf-8"))["traceEvents"]
     assert [row["name"] for row in fragment] == [
         "process_name",
         "Runtime@record",
