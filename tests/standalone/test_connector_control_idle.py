@@ -152,6 +152,7 @@ def test_both_ascend_schedulers_dispatch_and_drain_idle_control(scheduler_type):
 @pytest.mark.parametrize("old_proof", [None, (1, 15, 14)])
 def test_proof_is_lazy_and_cleared_before_base_preemption(scheduler_type, forced_reset, old_proof):
     scheduler = scheduler_type()
+    scheduler._dsa_dcp = False
     request = NS(
         status="running", num_computed_tokens=15, num_preemptions=1, spec_token_ids=[-1], num_output_placeholders=2
     )

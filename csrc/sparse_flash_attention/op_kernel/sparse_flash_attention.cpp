@@ -19,6 +19,12 @@
 
 using namespace AscendC;
 
+#ifdef SFA_DCP_STATS
+#define SFA_INIT_DCP_OUTPUTS op.InitDcpOutputs(selectedCounts, softmaxMax, softmaxSum)
+#else
+#define SFA_INIT_DCP_OUTPUTS
+#endif
+
 #define SFA_OP_IMPL(templateClass, tilingdataClass, ...)                                          \
     do {                                                                                          \
         templateClass<SFAType<__VA_ARGS__>> op;                                                   \
@@ -26,6 +32,7 @@ using namespace AscendC;
         const tilingdataClass *__restrict tiling_data = &tiling_data_in;                          \
         op.Init(query, key, value, sparseIndices, actualSeqLengthsQuery, actualSeqLengthsKV,      \
 	    blocktable, queryRope, keyRope, attentionOut, user, tiling_data, tiling, &tPipe);         \
+        SFA_INIT_DCP_OUTPUTS;                                                                     \
         op.Process();                                                                             \
     } while (0)
 
@@ -35,7 +42,13 @@ sparse_flash_attention(__gm__ uint8_t *query, __gm__ uint8_t *key, __gm__ uint8_
                        __gm__ uint8_t *sparseIndices, __gm__ uint8_t *blocktable,
                        __gm__ uint8_t *actualSeqLengthsQuery, __gm__ uint8_t *actualSeqLengthsKV,
                        __gm__ uint8_t* queryRope, __gm__ uint8_t* keyRope,
-                       __gm__ uint8_t *attentionOut, __gm__ uint8_t *workspace, __gm__ uint8_t *tiling)
+#ifdef SFA_DCP_STATS
+                       __gm__ uint8_t *selectedCounts,
+                       __gm__ uint8_t *attentionOut, __gm__ uint8_t *softmaxMax, __gm__ uint8_t *softmaxSum,
+#else
+                       __gm__ uint8_t *attentionOut,
+#endif
+                       __gm__ uint8_t *workspace, __gm__ uint8_t *tiling)
 {
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
 

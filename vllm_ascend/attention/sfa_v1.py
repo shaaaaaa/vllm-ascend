@@ -15,7 +15,7 @@ import torch_npu
 import vllm.envs as envs_vllm
 from torch import nn
 from vllm.config import CUDAGraphMode, VllmConfig, get_current_vllm_config
-from vllm.distributed import get_tensor_model_parallel_world_size, get_tp_group
+from vllm.distributed import get_dcp_group, get_tensor_model_parallel_world_size, get_tp_group
 from vllm.distributed.kv_transfer import (
     get_kv_transfer_group,
     has_kv_transfer_group,
@@ -72,6 +72,7 @@ from vllm_ascend.attention.target_sfa_diagnostics import (
 )
 from vllm_ascend.attention.utils import (
     AscendCommonAttentionMetadata,
+    DcpSFABatch,
     ascend_chunked_prefill_workspace_size,
     enable_cp,
     get_lmcache_sparse_cached_tokens,
@@ -95,6 +96,8 @@ from vllm_ascend.distributed.kv_transfer.sparse_offload.prepare_sparse_indices i
 from vllm_ascend.distributed.kv_transfer.sparse_offload.resident_sorted_cache import (
     INDEX_TOPK,
     MAX_INT16_SCRATCH_CAPACITY,
+    RESIDENT_COUNT_CACHELINE_INTS,
+    ResidentDcpLayout,
     SharedResidentPlan,
     SortedResidentState,
     SortedResidentWorkspace,
@@ -970,7 +973,7 @@ class AscendSFABackend(AttentionBackend):
 
     @staticmethod
     def get_builder_cls():
-        if enable_cp():
+        if enable_cp() and getattr(get_current_vllm_config(), "_dsa_decoder_dcp_policy", None) is None:
             from vllm_ascend.attention.context_parallel.sfa_cp import AscendSFACPMetadataBuilder
 
             return AscendSFACPMetadataBuilder
@@ -982,7 +985,7 @@ class AscendSFABackend(AttentionBackend):
 
     @staticmethod
     def get_impl_cls() -> type["AscendSFAImpl"]:
-        if enable_cp():
+        if enable_cp() and getattr(get_current_vllm_config(), "_dsa_decoder_dcp_policy", None) is None:
             from vllm_ascend.attention.context_parallel.sfa_cp import AscendSFACPImpl
 
             return AscendSFACPImpl
@@ -1092,6 +1095,7 @@ class AscendSFAMetadata:
     decode_remap_boundary: torch.Tensor | None = None
     decode_remap_boundary_ready: bool = False
     decode_remap_boundary_buffer: SFARemapBoundaryBuffer | None = None
+    sfa_dcp: DcpSFABatch | None = None
 
 
 M = TypeVar("M", bound=AscendSFAMetadata)
@@ -1843,6 +1847,7 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             indexer_slot_mapping=indexer_slot_mapping,
             indexer_c8_block_table=indexer_c8_block_table,
             indexer_c8_slot_mapping=indexer_c8_slot_mapping,
+            sfa_dcp=getattr(common_attn_metadata, "sfa_dcp", None),
             # DSA latent offload: best-effort; getattr -> None when not threaded in yet
             # (harmless unless the feature is enabled). HW-VERIFY the real source.
             req_ids=getattr(common_attn_metadata, "request_ids", None),
@@ -3217,6 +3222,19 @@ class AscendSFAImpl(MLAAttentionImpl):
         token_capacity = graph_key.token_capacity
         bounded_decode = graph_key.query_profile == StagedSFAQueryProfile.DECODE_BOUNDED
         attention_capacity = graph_key.request_capacity + int(bounded_decode)
+        dcp = getattr(attn_metadata, "sfa_dcp", None)
+        if dcp is not None and (
+            dcp.local_seq_lens.shape != (graph_key.request_capacity,)
+            or dcp.layout.live_origins.shape != (graph_key.request_capacity,)
+            or dcp.row_requests is None
+            or dcp.row_requests.shape != (token_capacity,)
+            or dcp.split_boundary is None
+            or dcp.split_boundary.shape != (token_capacity,)
+            or dcp.positions.shape != (token_capacity,)
+            or dcp.counts.shape != (token_capacity, RESIDENT_COUNT_CACHELINE_INTS)
+            or dcp.layout.selected_counts.shape != dcp.counts.shape
+        ):
+            return "the DCP attention metadata does not match the graph key"
         if self.dsa_cp_decoder:
             cp = attn_metadata.dsa_cp_context
             if (
@@ -3515,6 +3533,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         *,
         mtp: int,
         resident_writes: list[torch.Tensor] | None = None,
+        dcp: ResidentDcpLayout | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         if (
             request_state_indices is None
@@ -3555,6 +3574,7 @@ class AscendSFAImpl(MLAAttentionImpl):
             workspace,
             mtp=mtp,
             query_membership=self._resident_query_membership,
+            dcp=dcp,
         )
         miss_tokens, miss_counts, target_slots = (
             prepare_sorted_resident_cache_fused_(
@@ -3566,6 +3586,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                 workspace,
                 block_size=self.block_size,
                 query_membership=self._resident_query_membership,
+                dcp=dcp,
             )
         )
         return (
@@ -3573,6 +3594,71 @@ class AscendSFAImpl(MLAAttentionImpl):
             miss_tokens,
             miss_counts,
             target_slots,
+        )
+
+    def _plan_native_dcp_topk(
+        self, topk: torch.Tensor, metadata: M,
+        dcp: DcpSFABatch,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        from vllm_ascend.ops.triton.sfa_dcp import prepare_sfa_dcp_topk
+
+        layout = dcp.layout
+        output_topk = dcp.topk
+        rows = dcp.row_requests
+        if topk.numel() != output_topk.numel() or not topk.is_contiguous():
+            raise RuntimeError("DCP SFA requires contiguous global Top-K rows at the scheduled capacity")
+        requests = dcp.local_seq_lens.shape[0]
+        compact_rows = dcp.compact_rows
+        prepare_sfa_dcp_topk(
+            topk, dcp.positions, output_topk, dcp.counts, metadata.num_actual_tokens,
+            layout.world_size, layout.rank, self.block_size, local=rows is None,
+            row_requests=rows if compact_rows is not None else None,
+        )
+        if rows is None:
+            return dcp.empty_payload
+        width = self.decode_threshold
+        bounds = dcp.split_boundary
+        assert bounds is not None
+        actual = metadata.num_actual_tokens
+        planned, bounds, rows = output_topk[:actual], bounds[:actual], rows[:actual]
+        if compact_rows is not None:
+            planned, bounds, rows, inverse = pack_decode_lanes(
+                planned, bounds, rows, metadata.cum_query_lens[:requests], width
+            )
+        _, misses, miss_counts, slots = self._prepare_sorted_resident_sparse_cache(
+            planned, bounds, rows, metadata.block_table[:requests],
+            metadata.resident_state_indices, metadata.resident_state_generations,
+            mtp=width, dcp=layout,
+        )
+        if compact_rows is not None:
+            packed_rows = inverse.index_select(0, compact_rows)
+            output_topk.index_copy_(0, compact_rows, planned.index_select(0, packed_rows))
+            dcp.counts.index_copy_(0, compact_rows, layout.selected_counts.index_select(0, packed_rows))
+        return misses, miss_counts, slots
+
+    def _execute_native_dcp_attention(
+        self, layer_name: str, query: torch.Tensor, rope: torch.Tensor,
+        kv_cache: tuple[torch.Tensor, ...], topk: torch.Tensor, metadata: M,
+        dcp: DcpSFABatch,
+    ) -> torch.Tensor:
+        from vllm_ascend.ops.triton.sfa_dcp import execute_sfa_dcp
+
+        shared = self.shared_resident_plan
+        if shared is not None and self.skip_topk:
+            if dcp.last_plan is None or dcp.last_plan[0] is not shared:
+                raise RuntimeError("DCP shared indexer consumer has no matching resident plan")
+            payload = dcp.last_plan[1]
+        else:
+            payload = self._plan_native_dcp_topk(topk, metadata, dcp)
+            dcp.last_plan = (shared, payload) if shared is not None else None
+        misses, miss_counts, slots = payload
+        wait_for_kv_layer_from_connector(
+            layer_name, selected_tokens=misses, request_ids=metadata.req_ids,
+            target_slot_mapping=slots, selected_token_counts=miss_counts,
+        )
+        return execute_sfa_dcp(
+            query, rope, kv_cache, dcp.topk, dcp.counts, metadata.block_table,
+            metadata.cum_query_lens, dcp.local_seq_lens, self.scale, get_dcp_group(),
         )
 
     def _prepare_decode_sparse_indices(
@@ -3596,6 +3682,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         clear_invalid_rows: bool,
         resident_reads: list[torch.Tensor] | None = None,
         resident_writes: list[torch.Tensor] | None = None,
+        dcp: ResidentDcpLayout | None = None,
     ) -> tuple[
         torch.Tensor,
         torch.Tensor | None,
@@ -3639,6 +3726,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                 request_state_generations,
                 mtp=staged_mtp,
                 resident_writes=resident_writes,
+                dcp=dcp,
             )
         return prepare_sparse_indices(
             topk_indices,
@@ -3688,6 +3776,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         indexer_scale_cache: torch.Tensor | None = None,
         cp_query_lens: torch.Tensor | None = None,
         cp_key_lens: torch.Tensor | None = None,
+        dcp: DcpSFABatch | None = None,
     ) -> tuple[torch.Tensor, ...]:
         """Pre-retrieval compute captured by the outer PIECEWISE graph.
 
@@ -3703,6 +3792,9 @@ class AscendSFAImpl(MLAAttentionImpl):
         assert self.q_lora_rank is not None
         assert self.q_a_layernorm is not None
 
+        if dcp is not None:
+            row_req_indices, remap_boundary = dcp.row_requests, dcp.split_boundary
+            assert row_req_indices is not None and remap_boundary is not None
         if self.dsa_cp_decoder:
             cos, sin = self._cp_local(cos), self._cp_local(sin)
 
@@ -3807,6 +3899,10 @@ class AscendSFAImpl(MLAAttentionImpl):
             return (ql_nope, q_pe, *group.attention_plan(
                 graph_key.request_capacity, int(slot_mapping.shape[0]), resident_reads
             ))
+        if dcp is not None and group is not None and group.active and self.skip_topk:
+            reads = group.reads if resident_reads is None else resident_reads
+            return (ql_nope, q_pe, reads[0][:slot_mapping.shape[0]],
+                    *(t[:graph_key.request_capacity] for t in reads[1:4]))
         if self.skip_topk:
             # Reuse the current batch's top-k from the shared buffer
             # (GLM-5.2 shared consumers and runtime IndexCache skip layers).
@@ -3835,6 +3931,16 @@ class AscendSFAImpl(MLAAttentionImpl):
                 # skip-layer graph As in the same step read fresh indices from
                 # the stable shared buffer.
                 self._update_indexcache_topk_indices(topk_indices)
+        if dcp is not None:
+            from vllm_ascend.ops.triton.sfa_dcp import prepare_sfa_dcp_topk
+
+            # The graph's planner rows, including idle rows, are device
+            # metadata. Capture only the capacity, never the live row count.
+            prepare_sfa_dcp_topk(
+                topk_indices, dcp.positions, dcp.topk, dcp.counts, dcp.topk.shape[0],
+                dcp.layout.world_size, dcp.layout.rank, self.block_size, local=False,
+            )
+            topk_indices = dcp.topk
         if bounded_decode:
             original_requests = row_req_indices
             request_block_table = request_block_table[: graph_key.request_capacity]
@@ -3873,12 +3979,17 @@ class AscendSFAImpl(MLAAttentionImpl):
             clear_invalid_rows=True,
             resident_reads=resident_reads,
             resident_writes=resident_writes,
+            **({"dcp": dcp.layout} if dcp is not None else {}),
         )
         assert selected_packed is not None
         assert selected_count_values is not None
         assert target_slot_mapping is not None
         if bounded_decode:
             topk_indices = unpack_decode_lanes(topk_indices, inverse, original_requests)
+            if dcp is not None:
+                dcp.counts[:, 0].copy_(unpack_decode_lanes(
+                    dcp.layout.selected_counts[:, 0], inverse, original_requests, fill_value=0,
+                ))
             if group is not None and group.active:
                 # Use the explicit writable argument under functionalization.
                 storage = group.attention_topk if resident_writes is None else resident_writes[-1]
@@ -3973,22 +4084,24 @@ class AscendSFAImpl(MLAAttentionImpl):
         *,
         trace_label: str,
         prefetch: tuple | None = None,
+        dcp: DcpSFABatch | None = None,
     ) -> torch.Tensor:
         kv_cache = (kv_cache_nope, kv_cache_pe)
-        attn_output = self._execute_sparse_flash_attention_process(
-            ql_nope,
-            q_pe,
-            kv_cache,
-            topk_indices,
-            None,
-            actual_seq_lengths_query,
-            actual_seq_lengths_key,
-            block_table_override=block_table,
-            trace_label=trace_label,
-        )
-        if prefetch is not None:
-            edge, selected, counts, slots, destinations = prefetch
-            edge.launch(selected, counts, slots, destinations)
+        if dcp is not None:
+            from vllm_ascend.ops.triton.sfa_dcp import execute_sfa_dcp
+
+            attn_output = execute_sfa_dcp(
+                ql_nope, q_pe, kv_cache, topk_indices, dcp.counts, block_table,
+                actual_seq_lengths_query, dcp.local_seq_lens, self.scale, get_dcp_group(), prefetch=prefetch,
+            )
+        else:
+            attn_output = self._execute_sparse_flash_attention_process(
+                ql_nope, q_pe, kv_cache, topk_indices, None, actual_seq_lengths_query, actual_seq_lengths_key,
+                block_table_override=block_table, trace_label=trace_label,
+            )
+            if prefetch is not None:
+                edge, selected, counts, slots, destinations = prefetch
+                edge.launch(selected, counts, slots, destinations)
         attn_output = self._v_up_proj(attn_output)
         if self.dsa_cp_decoder:
             attn_output, _ = self._handle_o_proj_weight_switch_and_forward(attn_output, output, None, False)
@@ -4172,6 +4285,12 @@ class AscendSFAImpl(MLAAttentionImpl):
         if getattr(metadata, "dsa_cp_context", None) is not None:
             inputs["cp_query_lens"] = metadata.dsa_cp_context.actual_seq_lengths_query
             inputs["cp_key_lens"] = metadata.dsa_cp_context.actual_seq_lengths_key
+        dcp = getattr(metadata, "sfa_dcp", None)
+        if dcp is not None:
+            inputs["dcp"] = (
+                dcp.layout.world_size, dcp.layout.rank, dcp.layout.live_origins, dcp.layout.selected_counts,
+                dcp.local_seq_lens, dcp.positions, dcp.topk, dcp.counts, dcp.row_requests, dcp.split_boundary,
+            )
         return inputs
 
     def seal_staged_sfa_capture(
@@ -4455,6 +4574,7 @@ class AscendSFAImpl(MLAAttentionImpl):
             indexer_scale_cache=kv_cache[3] if self.has_indexer and self.use_sparse_c8_indexer else None,
             cp_query_lens=(attn_metadata.dsa_cp_context.actual_seq_lengths_query if self.dsa_cp_decoder else None),
             cp_key_lens=(attn_metadata.dsa_cp_context.actual_seq_lengths_key if self.dsa_cp_decoder else None),
+            dcp=getattr(attn_metadata, "sfa_dcp", None),
         )
         outputs = self._copy_to_staged_sfa_bridge(
             hidden_states,
@@ -5200,6 +5320,7 @@ class AscendSFAImpl(MLAAttentionImpl):
             output,
             trace_label="cross_layer",
             prefetch=prefetch,
+            dcp=getattr(attn_metadata, "sfa_dcp", None),
         )
         if self._staged_graph_content_diagnostic_enabled(layer_name):
             state = self._staged_sfa_capture_state
@@ -5324,6 +5445,7 @@ class AscendSFAImpl(MLAAttentionImpl):
             AscendAttentionState.DecodeOnly,
             AscendAttentionState.SpecDecoding,
         )
+        dcp = getattr(attn_metadata, "sfa_dcp", None)
         _sparse_indices_padding_zeroed = False
         # Shared-indexer consumers have no sibling indexer cache registered;
         # only producer layers can resolve (and later save) the sibling name.
@@ -5469,7 +5591,7 @@ class AscendSFAImpl(MLAAttentionImpl):
             # would advance the per-request layerwise retriever TWICE per layer
             # (this one with a dense arange) and desync it — skip whenever the
             # batch has decode rows (mixed steps included).
-            if not (self.dsa_shrink_latent and attn_metadata.num_decode_tokens > 0):
+            if dcp is None and not (self.dsa_shrink_latent and attn_metadata.num_decode_tokens > 0):
                 wait_for_kv_layer_from_connector(layer_name)
 
             if self.enable_dsa_cp:
@@ -5699,18 +5821,32 @@ class AscendSFAImpl(MLAAttentionImpl):
             # may be -1 or stale graph-buffer values, so they must never reach
             # the persistent model-visible indexer cache.
             actual_tokens = attn_metadata.num_actual_tokens
+            index_slots = idx_slot_mapping[:actual_tokens]
+            keys = k_li[:actual_tokens].view(-1, k_li.shape[-1])
+            key_cache = kv_cache[2].view(-1, keys.shape[-1])
+            key_slots = index_slots
+            mask_indexer_writes = dcp is not None and dcp.mask_indexer_writes
+            if mask_indexer_writes:
+                # Draft rejection leaves -1 slots. ScatterNdUpdate requires
+                # in-bounds indices, so alias them with idempotent writes.
+                key_slots, keys = self._mask_staged_index_scatter_padding(
+                    index_slots, keys, index_slots, key_cache,
+                )
             torch_npu.npu_scatter_nd_update_(
-                kv_cache[2].view(-1, k_li.shape[-1]),
-                idx_slot_mapping[:actual_tokens].view(-1, 1),
-                k_li[:actual_tokens].view(-1, k_li.shape[-1]),
+                key_cache, key_slots.view(-1, 1), keys,
             )  # b, s, n, d
             if self.use_sparse_c8_indexer:
                 assert len(kv_cache) == 4
                 assert k_li_scale is not None
+                scales = k_li_scale[:actual_tokens].view(-1, k_li_scale.shape[-1])
+                scale_cache = kv_cache[3].view(-1, scales.shape[-1])
+                scale_slots = index_slots
+                if mask_indexer_writes:
+                    scale_slots, scales = self._mask_staged_index_scatter_padding(
+                        index_slots, scales, index_slots, scale_cache,
+                    )
                 torch_npu.npu_scatter_nd_update_(
-                    kv_cache[3].view(-1, k_li_scale.shape[-1]),
-                    idx_slot_mapping[:actual_tokens].view(-1, 1),
-                    k_li_scale[:actual_tokens].view(-1, k_li_scale.shape[-1]),
+                    scale_cache, scale_slots.view(-1, 1), scales,
                 )
             if self.is_kv_producer:
                 attn_metadata.reshape_cache_event.record()
@@ -5792,7 +5928,8 @@ class AscendSFAImpl(MLAAttentionImpl):
         # cache boundary instead of prompt_len.
         # All fixed-shape device math — no D2H sync. No-op without a connector.
         if (
-            self.dsa_shrink_latent
+            dcp is None
+            and self.dsa_shrink_latent
             and attn_metadata.split_boundary is not None
             and attn_metadata.num_decode_tokens > 0
             and (attn_metadata.need_sparse_lmcache_payload or self.dsa_shrink_latent == 3)
@@ -6338,7 +6475,13 @@ class AscendSFAImpl(MLAAttentionImpl):
             )
 
         attn_output = None
-        if _adapter_supported:
+        if dcp is not None:
+            with _dsa_prof.section("fa"):
+                attn_output = self._execute_native_dcp_attention(
+                    layer_name, ql_nope, q_pe, kv_cache, topk_indices, attn_metadata, dcp
+                )
+            _dsa_prof.step()
+        elif _adapter_supported:
             # Adapter-backed latent hot cache: FA reads the resident pool in place
             # (zero-copy), the adapter owns residency (hit/miss) + eviction.
             _ac = _dsa_adapter

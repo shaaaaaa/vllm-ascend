@@ -59,6 +59,37 @@ constexpr uint32_t kShardEvictableCount = 2;
 constexpr uint32_t kShardOldCount = 3;
 constexpr uint32_t kShardSelectedEvictCount = 4;
 
+#ifdef RESIDENT_DCP_SHARDING
+constexpr uint32_t kDcpBlockBits = 7;
+constexpr uint32_t kDcpBlockSize = 1U << kDcpBlockBits;
+constexpr uint32_t kDcpCountStride = 16;
+
+__aicore__ inline void KeepDcpOwner(
+    AscendC::LocalTensor<uint8_t> selected,
+    AscendC::LocalTensor<uint8_t> ownerMask,
+    AscendC::LocalTensor<int32_t> tokens,
+    AscendC::LocalTensor<int32_t> blocks,
+    AscendC::LocalTensor<int32_t> scratch,
+    uint32_t bits, uint32_t rank, uint32_t width)
+{
+    AscendC::ShiftRight(blocks, tokens, static_cast<int32_t>(kDcpBlockBits), width);
+    AscendC::PipeBarrier<PIPE_V>();
+    AscendC::ShiftRight(scratch, blocks, static_cast<int32_t>(bits), width);
+    AscendC::PipeBarrier<PIPE_V>();
+    AscendC::Muls(scratch, scratch, static_cast<int32_t>(1U << bits), width);
+    AscendC::PipeBarrier<PIPE_V>();
+    AscendC::Sub(blocks, blocks, scratch, width);
+    AscendC::PipeBarrier<PIPE_V>();
+    AscendC::Duplicate(scratch, static_cast<int32_t>(rank), width);
+    AscendC::PipeBarrier<PIPE_V>();
+    AscendC::Compare(ownerMask, blocks, scratch, AscendC::CMPMODE::EQ, width);
+    AscendC::PipeBarrier<PIPE_V>();
+    AscendC::And(selected.ReinterpretCast<uint16_t>(), selected.ReinterpretCast<uint16_t>(),
+        ownerMask.ReinterpretCast<uint16_t>(), width / 16);
+    AscendC::PipeBarrier<PIPE_V>();
+}
+#endif
+
 #if RESIDENT_EXPERIMENT_QUERY_MEMBERSHIP
 // Only shard zero publishes the per-request row metadata. Finalize updates
 // the eviction field in this cacheline and preserves these three fields.
@@ -186,6 +217,13 @@ __aicore__ inline void CopyGlobalToLocalExact(
 // to one shard-local union entry.
 class DSAResidentShardedUnionKernel {
 public:
+#ifdef RESIDENT_DCP_SHARDING
+    __aicore__ inline void InitDcp(uint32_t bits, uint32_t rank)
+    {
+        dcpBits_ = bits;
+        dcpRank_ = rank;
+    }
+#endif
     __aicore__ inline void Init(
         __gm__ int32_t* topkIndices,
         __gm__ int32_t* splitBoundary,
@@ -486,6 +524,10 @@ public:
                 beforeBoundaryMask.ReinterpretCast<uint16_t>(),
                 rowWidth_ / 16);
             AscendC::PipeBarrier<PIPE_V>();
+#ifdef RESIDENT_DCP_SHARDING
+            KeepDcpOwner(selectedMask, shardMask, input, work, indices,
+                dcpBits_, dcpRank_, rowWidth_);
+#endif
 #if RESIDENT_EXPERIMENT_QUERY_MEMBERSHIP
             // Sort32/MrgSort4 carry the payload as opaque uint32 bits.
             // Encoding the one-hot tag as an exact float avoids an integer
@@ -1282,6 +1324,10 @@ private:
     uint32_t shardCountRequestStride_ = 0;
     uint32_t generationStride_ = 0;
     uint32_t shardBits_ = 0;
+#ifdef RESIDENT_DCP_SHARDING
+    uint32_t dcpBits_ = 0;
+    uint32_t dcpRank_ = 0;
+#endif
     bool deduplicate_ = false;
 };
 
@@ -2183,6 +2229,16 @@ private:
 
 class DSAResidentSortedUpdateKernel {
 public:
+#ifdef RESIDENT_DCP_SHARDING
+    __aicore__ inline void InitDcp(uint32_t bits, uint32_t rank,
+        __gm__ int32_t* origins, __gm__ int32_t* counts)
+    {
+        dcpBits_ = bits;
+        dcpRank_ = rank;
+        liveOrigins_.SetGlobalBuffer(origins);
+        selectedCounts_.SetGlobalBuffer(counts);
+    }
+#endif
     __aicore__ inline void Init(
         __gm__ int32_t* topkIndices,
         __gm__ int32_t* shardPacked,
@@ -2358,6 +2414,9 @@ public:
         const uint32_t validRows = static_cast<uint32_t>(shardCounts_.GetValue(countBase + kMembershipValidRows));
         if ((validRows & (1U << query)) == 0) {
             // The union's shard zero already cleared the padding row.
+#ifdef RESIDENT_DCP_SHARDING
+            WriteGlobalScalarVisible(selectedCounts_, static_cast<uint64_t>(row) * kDcpCountStride, 0);
+#endif
             return;
         }
         const uint64_t rowOffset = static_cast<uint64_t>(row) * rowWidth_;
@@ -2440,6 +2499,23 @@ public:
         AscendC::PipeBarrier<PIPE_V>();
         AscendC::Not(predicate.ReinterpretCast<uint16_t>(), predicate.ReinterpretCast<uint16_t>(), rowWidth_ / 16);
         AscendC::PipeBarrier<PIPE_V>();
+#ifdef RESIDENT_DCP_SHARDING
+        KeepDcpOwner(predicate, priorSlotBuf_.Get<uint8_t>(), input, clamped, output,
+            dcpBits_, dcpRank_, rowWidth_);
+        // Only live entries are translated. Miss source IDs stay global.
+        AscendC::ShiftRight(clamped, input, static_cast<int32_t>(kDcpBlockBits), rowWidth_);
+        AscendC::ShiftRight(output, input, static_cast<int32_t>(kDcpBlockBits + dcpBits_), rowWidth_);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Muls(clamped, clamped, static_cast<int32_t>(kDcpBlockSize), rowWidth_);
+        AscendC::Muls(output, output, static_cast<int32_t>(kDcpBlockSize), rowWidth_);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Sub(input, input, clamped, rowWidth_);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Add(input, input, output, rowWidth_);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Adds(input, input, ReadGlobalScalarFresh(liveOrigins_, request), rowWidth_);
+        AscendC::PipeBarrier<PIPE_V>();
+#endif
         uint64_t live = 0;
         AscendC::GatherMask(output, input, predicate.ReinterpretCast<uint32_t>(),
             true, rowWidth_, params, live);
@@ -2473,6 +2549,10 @@ public:
         Sync<AscendC::HardEvent::V_MTE3>();
         AscendC::DataCopy(topkIndices_[rowOffset], output, rowWidth_);
         Sync<AscendC::HardEvent::MTE3_S>();
+#ifdef RESIDENT_DCP_SHARDING
+        WriteGlobalScalarVisible(selectedCounts_, static_cast<uint64_t>(row) * kDcpCountStride,
+            static_cast<int32_t>(kept));
+#endif
     }
 #endif
 
@@ -2833,6 +2913,12 @@ public:
     }
 
 private:
+#ifdef RESIDENT_DCP_SHARDING
+    AscendC::GlobalTensor<int32_t> liveOrigins_;
+    AscendC::GlobalTensor<int32_t> selectedCounts_;
+    uint32_t dcpBits_ = 0;
+    uint32_t dcpRank_ = 0;
+#endif
 #if RESIDENT_EXPERIMENT_VECTOR_STATE
     static constexpr uint32_t kStateWidth = 2048;
     AscendC::TBuf<AscendC::TPosition::VECCALC> vectorStateBuf_;
@@ -3569,7 +3655,11 @@ dsa_resident_sharded_union_kernel(
     uint32_t shardCapacity,
     uint32_t shardCountStride,
     uint32_t shardCountRequestStride,
-    uint32_t generationStride)
+    uint32_t generationStride
+#ifdef RESIDENT_DCP_SHARDING
+    , uint32_t dcpBits, uint32_t dcpRank
+#endif
+    )
 {
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
     DSAResidentShardedUnionKernel op;
@@ -3583,6 +3673,9 @@ dsa_resident_sharded_union_kernel(
         requestCount, stateRowCount, dummyStateBase,
         rowsPerRequest, rowWidth, shardCount, shardCapacity,
         shardCountStride, shardCountRequestStride, generationStride);
+#ifdef RESIDENT_DCP_SHARDING
+    op.InitDcp(dcpBits, dcpRank);
+#endif
     op.Process();
 }
 
@@ -3707,7 +3800,12 @@ dsa_resident_sorted_membership_update_kernel(
     uint32_t capacity,
     uint32_t shardCountStride,
     uint32_t shardCountRequestStride,
-    uint32_t generationStride)
+    uint32_t generationStride
+#ifdef RESIDENT_DCP_SHARDING
+    , uint32_t dcpBits, uint32_t dcpRank,
+    __gm__ int32_t* liveOrigins, __gm__ int32_t* selectedCounts
+#endif
+    )
 {
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
     DSAResidentSortedUpdateKernel op;
@@ -3718,6 +3816,9 @@ dsa_resident_sorted_membership_update_kernel(
         requestCount, stateRowCount, dummyStateBase, rowsPerRequest,
         rowWidth, shardCount, capacity, shardCountStride,
         shardCountRequestStride, generationStride);
+#ifdef RESIDENT_DCP_SHARDING
+    op.InitDcp(dcpBits, dcpRank, liveOrigins, selectedCounts);
+#endif
     op.ProcessMembership();
 }
 #endif
@@ -3830,7 +3931,7 @@ void dsa_resident_sharded_union_impl(
     uint32_t shardCountStride,
     uint32_t shardCountRequestStride,
     uint32_t generationStride,
-    uint32_t coreCount)
+    uint32_t coreCount, [[maybe_unused]] uint32_t dcpBits, [[maybe_unused]] uint32_t dcpRank)
 {
     const uint32_t logicalBlockCount = requestCount * shardCount;
     dsa_resident_sharded_union_kernel<<<
@@ -3854,7 +3955,11 @@ void dsa_resident_sharded_union_impl(
         static_cast<int16_t*>(shardEvictableSlots),
         requestCount, stateRowCount, dummyStateBase, rowsPerRequest,
         rowWidth, shardCount, shardCapacity, shardCountStride,
-        shardCountRequestStride, generationStride);
+        shardCountRequestStride, generationStride
+#ifdef RESIDENT_DCP_SHARDING
+        , dcpBits, dcpRank
+#endif
+        );
 }
 
 void dsa_resident_sorted_plan_impl(
@@ -3890,7 +3995,8 @@ void dsa_resident_sorted_plan_impl(
     uint32_t generationStride,
     uint32_t blockTableWidth,
     uint32_t blockSize,
-    uint32_t coreCount)
+    uint32_t coreCount, [[maybe_unused]] uint32_t dcpBits, [[maybe_unused]] uint32_t dcpRank,
+    [[maybe_unused]] void* liveOrigins, [[maybe_unused]] void* selectedCounts)
 {
     dsa_resident_sorted_finalize_kernel<<<
         ResidentPhysicalBlockCount(requestCount, coreCount),
@@ -3932,7 +4038,11 @@ void dsa_resident_sorted_plan_impl(
         requestCount, stateRowCount, dummyStateBase,
         rowsPerRequest, rowWidth, shardCount, capacity,
         shardCountStride, shardCountRequestStride,
-        generationStride);
+        generationStride
+#ifdef RESIDENT_DCP_SHARDING
+        , dcpBits, dcpRank, static_cast<int32_t*>(liveOrigins), static_cast<int32_t*>(selectedCounts)
+#endif
+        );
 }
 
 #if !RESIDENT_EXPERIMENT_QUERY_MEMBERSHIP
@@ -4015,7 +4125,7 @@ void dsa_resident_sorted_plan_no_remap_impl(
     uint32_t generationStride,
     uint32_t blockTableWidth,
     uint32_t blockSize,
-    uint32_t coreCount)
+    uint32_t coreCount, uint32_t, uint32_t, void*, void*)
 {
     dsa_resident_sorted_finalize_kernel<<<
         ResidentPhysicalBlockCount(requestCount, coreCount),

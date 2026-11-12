@@ -16,6 +16,7 @@ import torch
 
 from vllm_ascend.serving_perf import (
     cold_perf_device_timing_enabled,
+    cold_perf_enabled,
     log_cold_perf_event,
 )
 
@@ -30,6 +31,28 @@ _COLD_PERF_SLOW_NPU_INTERVAL_MS = 100.0
 
 
 _COLD_PERF_MAX_PENDING_NPU_INTERVALS = 32
+_COLD_PERF_SAMPLE_DETAIL_LIMIT = 3
+
+_SAMPLE_TOP_LEVEL_STAGES = (
+    "grammar_ms",
+    "target_sampling_ms",
+    "bookkeeping_ms",
+    "mtp_draft_ms",
+    "connector_finalize_ms",
+    "output_build_ms",
+    "state_update_ms",
+    "content_diagnostics_ms",
+    "async_output_build_ms",
+)
+
+_SAMPLE_CONTAINER_STAGES = (
+    "ordinary_sampler",
+    "rejection_total",
+    "mtp_draft",
+    "bookkeeping",
+    "connector_finalize",
+    "state_update",
+)
 
 
 @dataclass
@@ -57,6 +80,21 @@ def _log_slow_sample_invocation(
 ) -> None:
     if elapsed_ms < _COLD_PERF_SLOW_SAMPLE_MS:
         return
+    # Build detail only for slow calls. Parent stages are already represented
+    # by the top-level timings; retain at most three distinct sub-stages.
+    details = dict(
+        sorted(
+            (
+                (name.removesuffix("_wall_ms"), round(value, 3))
+                for name, value in stages.items()
+                if name.endswith("_wall_ms")
+                and value > 0
+                and name.removesuffix("_wall_ms") not in _SAMPLE_CONTAINER_STAGES
+            ),
+            key=lambda item: item[1],
+            reverse=True,
+        )[:_COLD_PERF_SAMPLE_DETAIL_LIMIT]
+    )
     log_cold_perf_event(
         "decoder_sample_invocation_slow",
         request_ids=request_ids,
@@ -64,8 +102,12 @@ def _log_slow_sample_invocation(
         total_wall_ms=round(elapsed_ms, 3),
         total_thread_cpu_ms=round(thread_cpu_ms, 3),
         total_process_cpu_ms=round(process_cpu_ms, 3),
-        unattributed_wall_ms=round(max(0.0, elapsed_ms - sum(stages.values())), 3),
-        **{name: round(value, 3) for name, value in stages.items()},
+        # Sub-stages and CPU counters overlap the top-level wall intervals.
+        unattributed_wall_ms=round(
+            max(0.0, elapsed_ms - sum(stages.get(name, 0.0) for name in _SAMPLE_TOP_LEVEL_STAGES)), 3
+        ),
+        **{name: round(stages[name], 3) for name in _SAMPLE_TOP_LEVEL_STAGES if name in stages},
+        **({"slow_substages_ms": details} if details else {}),
     )
 
 
@@ -95,6 +137,30 @@ def _log_prefill_sample(scheduler_output: Any, marks: list[float], async_schedul
 class ServingPerfMixin:
     """Optional device timing methods shared by model-runner trace sites."""
 
+    def _arm_cold_perf_decode_trace(self, scheduler_output) -> None:
+        """Give live decode its own bounded trace after chunked prefill.
+
+        Called after request state updates; these lengths are host metadata.
+        Remember completed budgets across batch changes until request finish.
+        """
+        if not cold_perf_enabled():
+            return
+        seen = self.__dict__.setdefault("_cold_perf_decode_traced_requests", set())
+        seen.difference_update(scheduler_output.finished_req_ids)
+        budget = self._cold_perf_sample_trace_budget
+        for req_id, count in scheduler_output.num_scheduled_tokens.items():
+            if count <= 0 or req_id in seen:
+                continue
+            request = self.requests.get(req_id)
+            if request is not None and request.num_computed_tokens >= request.num_prompt_tokens:
+                seen.add(req_id)
+                budget[req_id] = _COLD_PERF_SAMPLE_TRACE_CALLS
+        self._cold_perf_sample_trace_req_ids = tuple(
+            req_id
+            for req_id, count in scheduler_output.num_scheduled_tokens.items()
+            if count > 0 and budget.get(req_id, 0) > 0
+        )
+
     def _cold_perf_npu_error(self, interval, operation: str, exc: Exception) -> None:
         request_ids, stage = (
             (interval.request_ids, interval.stage) if isinstance(interval, _ColdPerfNPUInterval) else interval
@@ -118,13 +184,19 @@ class ServingPerfMixin:
         metrics: dict[str, float] | None = None,
         **kwargs,
     ):
-        # The ordinary cold-perf knob must not create device events. Optional
-        # device diagnostics are also bounded when completion is delayed.
+        # Host mode collects wall time into the bounded sample's summary.
+        # No per-stage logging, CPU counters or device-event objects.
         if (
             not cold_perf_device_timing_enabled()
             or len(getattr(self, "_cold_perf_pending_npu_intervals", ())) >= _COLD_PERF_MAX_PENDING_NPU_INTERVALS
         ):
-            return operation(*args, **kwargs)
+            if not request_ids or metrics is None or not cold_perf_enabled():
+                return operation(*args, **kwargs)
+            started = time.perf_counter()
+            try:
+                return operation(*args, **kwargs)
+            finally:
+                metrics[f"{stage}_wall_ms"] = (time.perf_counter() - started) * 1000
         try:
             start_event = torch.npu.Event(enable_timing=True)
             end_event = torch.npu.Event(enable_timing=True)

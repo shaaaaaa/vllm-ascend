@@ -294,7 +294,7 @@ namespace vllm_ascend {
     uint32_t shard_count_stride,
     uint32_t shard_count_request_stride,
     uint32_t generation_stride,
-    uint32_t core_count);
+    uint32_t core_count, uint32_t dcp_bits, uint32_t dcp_rank);
 
   extern void dsa_resident_sorted_plan_impl(
     void* stream,
@@ -329,7 +329,8 @@ namespace vllm_ascend {
     uint32_t generation_stride,
     uint32_t block_table_width,
     uint32_t block_size,
-    uint32_t core_count);
+    uint32_t core_count, uint32_t dcp_bits, uint32_t dcp_rank,
+    void* live_origins, void* selected_counts);
 
   extern void dsa_resident_sorted_plan_no_remap_impl(
     void* stream,
@@ -364,7 +365,8 @@ namespace vllm_ascend {
     uint32_t generation_stride,
     uint32_t block_table_width,
     uint32_t block_size,
-    uint32_t core_count);
+    uint32_t core_count, uint32_t dcp_bits, uint32_t dcp_rank,
+    void* live_origins, void* selected_counts);
 
   extern void dsa_resident_finalize_coordinator_impl(
     void* stream,

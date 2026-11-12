@@ -49,6 +49,7 @@ class NPUInputBatch(InputBatch):
         is_pooling_model: bool = False,
         num_speculative_tokens: int = 0,
         cp_kv_cache_interleave_size: int = 1,
+        dsa_dcp_sizes: list[int | None] | None = None,
     ):
         self.is_pooling_model = is_pooling_model
         self.is_spec_decode = is_spec_decode
@@ -104,6 +105,7 @@ class NPUInputBatch(InputBatch):
             num_speculative_tokens=num_speculative_tokens,
             kernel_sizes=kernel_block_sizes,
             cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
+            dsa_dcp_sizes=dsa_dcp_sizes,
         )
         self.layerwise_prefill_block_tables = (self.block_table,)
         if envs_ascend.VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE:

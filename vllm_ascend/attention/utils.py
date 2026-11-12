@@ -1,7 +1,8 @@
 from dataclasses import dataclass, field
 from functools import lru_cache
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from vllm.config import VllmConfig, get_current_vllm_config
@@ -17,6 +18,12 @@ from vllm_ascend.utils import (
     get_ascend_config,
     get_ascend_device_type,
 )
+
+if TYPE_CHECKING:
+    from vllm_ascend.distributed.kv_transfer.sparse_offload.resident_sorted_cache import (
+        ResidentDcpLayout,
+        SharedResidentPlan,
+    )
 
 logger = init_logger(__name__)
 
@@ -191,6 +198,29 @@ class AscendPrefillContextParallelMetadata:
     pcp_padded_tokens_fla: int = 0
 
 
+@dataclass(slots=True)
+class DcpSFABatch:
+    """Native SFA addresses in the Group-0 shard and reusable planner storage."""
+
+    layout: "ResidentDcpLayout"
+    local_seq_lens: torch.Tensor
+    positions: torch.Tensor
+    topk: torch.Tensor
+    counts: torch.Tensor
+    empty_payload: tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+    row_requests: torch.Tensor | None
+    split_boundary: torch.Tensor | None
+    compact_rows: torch.Tensor | None
+    last_plan: "tuple[SharedResidentPlan, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] | None" = None
+    mask_indexer_writes: bool = False
+
+
+def dcp_local_seq_lens(ends: np.ndarray, origins: np.ndarray, block: int, world: int, rank: int) -> np.ndarray:
+    """Bound the local table, including the compact scratch prefix if present."""
+    columns, tail = np.divmod(ends, block * world)
+    return origins + columns * block + np.clip(tail - rank * block, 0, block)
+
+
 @dataclass
 class AscendCommonAttentionMetadata(CommonAttentionMetadata):
     """
@@ -251,6 +281,7 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
     resident_state_generations: torch.Tensor | None = None
     resident_state_indices_cpu: Any = None
     resident_state_generations_cpu: Any = None
+    sfa_dcp: DcpSFABatch | None = None
 
     # TODO: Remove it when vLLM no longer uses this function.
     def unpadded(self, num_actual_tokens: int, num_actual_reqs: int) -> "AscendCommonAttentionMetadata":
@@ -276,6 +307,7 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
             # converted to its unpadded view.
             indexer_block_table_tensor=self.indexer_block_table_tensor,
             indexer_slot_mapping=self.indexer_slot_mapping,
+            sfa_dcp=self.sfa_dcp,
             causal=self.causal,
             actual_seq_lengths_q=self.actual_seq_lengths_q[:num_actual_tokens],
             positions=self.positions,

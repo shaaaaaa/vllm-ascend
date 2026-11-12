@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 from enum import Enum, auto
 from pathlib import Path
 from queue import Queue
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from typing import ClassVar
 
 import pytest
@@ -206,3 +206,52 @@ def test_other_rpc_results_keep_original_success_or_failure_handling(monkeypatch
         assert status is worker.ResponseStatus.SUCCESS
         assert result is output
     assert not events
+
+
+@pytest.mark.parametrize("failure", [False, True])
+def test_async_completion_wait_is_timed_without_changing_delivery(monkeypatch, failure):
+    worker, ns, events = load_worker(monkeypatch, scheduling=True)
+    output, payload = runner_output(ns, wrapped=True, trace=True)
+    clock = SimpleNamespace(now=10_000_000_000, cpu=0)
+    ns["time"] = SimpleNamespace(perf_counter_ns=lambda: clock.now, thread_time_ns=lambda: clock.cpu)
+    setattr(output, ns["_COLD_PERF_SAMPLE_RETURN_NS"], clock.now)
+    worker.handle_output(output)
+    assert output.calls == 0
+    events.clear()  # The pre-existing hook announcement is startup-only.
+    clock.now += 1_000_000_000
+    original = output.get_output
+    error = RuntimeError("completion failure")
+
+    def complete():
+        assert not events
+        clock.now += 16_000_000_000
+        clock.cpu += 2_000_000
+        if failure:
+            raise error
+        return original()
+
+    output.get_output = complete
+    if failure:
+        with pytest.raises(RuntimeError) as caught:
+            worker.enqueue_output(worker.async_output_queue.get_nowait())
+        assert caught.value is error
+        assert worker.worker_response_mq.empty()
+        assert not events
+    else:
+        worker.enqueue_output(worker.async_output_queue.get_nowait())
+        assert worker.worker_response_mq.get_nowait() == (worker.ResponseStatus.SUCCESS, payload)
+        assert output.calls == 1
+        assert events[-1][0] == "decoder_async_output_slow"
+        assert events[-1][1]["queue_wait_ms"] == 1000
+        assert events[-1][1]["get_output_thread_cpu_ms"] == 2
+        assert getattr(payload, ns["_COLD_PERF_SAMPLE_RETURN_NS"]) == 10_000_000_000
+        assert events[-1][1]["get_output_ms"] == 16000
+
+
+def test_fast_traced_async_completion_has_no_per_output_log(monkeypatch):
+    worker, ns, events = load_worker(monkeypatch)
+    output, _ = runner_output(ns, wrapped=True, trace=True)
+    ns["time"] = SimpleNamespace(perf_counter_ns=lambda: 100, thread_time_ns=lambda: 0)
+    setattr(output, ns["_COLD_PERF_SAMPLE_RETURN_NS"], 100)
+    deliver(worker, output)
+    assert [event for event, _ in events] == ["decoder_async_output_hook_active"]

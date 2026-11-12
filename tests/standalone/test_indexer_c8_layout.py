@@ -24,7 +24,13 @@ def api():
         dtype: torch.dtype
         cache_dtype_str: str = "auto"
 
-    ns = dict(torch=torch, dataclass=dataclass, MLAAttentionSpec=BaseSpec, get_dtype_size=lambda dtype: dtype.itemsize)
+    ns = dict(
+        torch=torch,
+        dataclass=dataclass,
+        MLAAttentionSpec=BaseSpec,
+        get_dtype_size=lambda dtype: dtype.itemsize,
+        cdiv=lambda a, b: (a + b - 1) // b,
+    )
     source = ROOT / "vllm_ascend/patch/platform/patch_kv_cache_interface.py"
     node = next(
         n
@@ -44,6 +50,15 @@ def test_unbundled_indexer_spec_counts_keys_and_scales(api, c8, expected):
     spec = api["AscendMLAAttentionSpec"](128, 1, 128, torch.bfloat16, sparse_head_dim=(128,), cache_sparse_c8=c8)
     assert spec.page_size_bytes == expected
     assert spec.indexer_scale_page_size_bytes == (256 if c8 else 0)
+
+
+def test_dcp_group_specs_size_latent_and_indexer_separately(api):
+    spec = api["AscendMLAAttentionSpec"]
+    latent = spec(128, 1, 576, torch.bfloat16, dsa_dcp_size=4)
+    indexer = spec(128, 1, 128, torch.bfloat16, dsa_dcp_size=1)
+    config = NS(model_config=NS(max_model_len=8193))
+    assert spec.merge([latent, latent]).max_memory_usage_bytes(config) == 17 * latent.page_size_bytes
+    assert spec.merge([indexer, indexer]).max_memory_usage_bytes(config) == 65 * indexer.page_size_bytes
 
 
 @pytest.mark.parametrize("c8", [False, True])
@@ -289,9 +304,11 @@ def test_prefill_rebind_owns_physical_metadata_for_each_bank(api):
     assert cleared.indexer_c8_block_table is cleared.indexer_c8_slot_mapping is None
 
 
-@pytest.mark.parametrize("prefill", [False, True])
-@pytest.mark.parametrize("connector", [False, True])
-def test_bf16_prefill_spec_charges_retained_alignment(api, monkeypatch, prefill, connector):
+@pytest.mark.parametrize("prefill,connector,dcp", [
+    (False, False, None), (False, True, None), (True, False, None), (True, True, None),
+    (False, True, 4),
+])
+def test_runner_specs_charge_retained_alignment_and_select_dcp(api, monkeypatch, prefill, connector, dcp):
     from types import ModuleType
     from unittest.mock import Mock
 
@@ -306,6 +323,8 @@ def test_bf16_prefill_spec_charges_retained_alignment(api, monkeypatch, prefill,
     mla_type = type("MLAAttention", (), {})
     layers = {"model.layers.0.self_attn.attn": mla_type(),
               "model.layers.0.self_attn.indexer.k_cache": type("DeepseekV32IndexerCache", (), {})()}
+    if dcp:
+        layers.update({name.replace(".0.", ".1."): type(layer)() for name, layer in tuple(layers.items())})
     interface = ModuleType("vllm.v1.kv_cache_interface")
     interface.MLAAttentionSpec = spec_type
     monkeypatch.setitem(sys.modules, interface.__name__, interface)
@@ -325,8 +344,29 @@ def test_bf16_prefill_spec_charges_retained_alignment(api, monkeypatch, prefill,
                             kv_transfer_config=object() if connector else None)
     runner.model_config = NS(hf_text_config=NS(num_hidden_layers=1))
     runner.runner_only_attn_layers = set()
+    if dcp:
+        runner.dcp_size = dcp
+        runner.parallel_config = NS(decode_context_parallel_size=dcp)
+        runner.model_config.hf_text_config.num_hidden_layers = 2
+        runner.use_sparse_c8_indexer = True
+        runner.ascend_config = NS(indexer_c8_layer_mask=lambda names: [False, True])
+        runner.vllm_config._dsa_decoder_dcp_policy = (2048, 0)
+    else:
+        runner.parallel_config = NS(decode_context_parallel_size=1)
     specs = runner.get_kv_cache_spec()
+    latent = specs["model.layers.0.self_attn.attn"]
     index = specs["model.layers.0.self_attn.indexer.k_cache"]
+    assert latent.dsa_dcp_size == dcp
+    assert index.dsa_dcp_size == (1 if dcp else None)
+    if dcp:
+        assert latent.dsa_compact_startup_scratch_tokens == 2048
+        assert index.dsa_compact_startup_scratch_tokens == 0
+        assert index.indexer_c8_layer_names == ("model.layers.1.self_attn.indexer.k_cache",)
+        assert index.indexer_paired_banks and index.shared_pool_alignment_bytes == 2 * 1024**2
+        del runner.vllm_config._dsa_decoder_dcp_policy
+        with pytest.raises(ValueError, match="indexer C8 does not support"):
+            runner.get_kv_cache_spec()
+        return
     if not prefill:
         assert index.shared_pool_alignment_bytes == 0  # Keep ordinary/D policy unchanged.
         return

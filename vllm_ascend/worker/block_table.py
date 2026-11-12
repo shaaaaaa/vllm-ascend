@@ -18,6 +18,7 @@ class BlockTable:
         kernel_sizes: list[int] | None = None,
         cp_kv_cache_interleave_size: int = 1,
         num_speculative_tokens: int = 0,
+        dsa_dcp_size: int | None = None,
     ):
         self.max_num_reqs = max_num_reqs
         self.max_num_blocks_per_req = max_num_blocks_per_req
@@ -37,6 +38,11 @@ class BlockTable:
             self.dcp_rank = 0
             self.pcp_world_size = 1
             self.pcp_rank = 0
+
+        if dsa_dcp_size is not None:
+            if self.pcp_world_size != 1 or dsa_dcp_size not in (1, self.dcp_world_size):
+                raise ValueError("DSA block-table layout disagrees with the DCP group")
+            self.dcp_world_size = dsa_dcp_size
 
         # If kernel_sizes is None or [0], use physical block size (no splitting)
         if kernel_sizes is None or kernel_sizes == [0]:
@@ -72,7 +78,7 @@ class BlockTable:
             logical_table_size = max_num_blocks_per_req
 
         duplicate_size = 1
-        if self.pcp_world_size * self.dcp_world_size > 1:
+        if dsa_dcp_size is None and self.pcp_world_size * self.dcp_world_size > 1:
             duplicate_size += num_speculative_tokens
         self.block_table = self._make_buffer(max_num_reqs * duplicate_size, logical_table_size, dtype=torch.int32)
         self._block_table_dirty = True
@@ -122,7 +128,12 @@ class BlockTable:
         self.block_table.np[[src, tgt]] = self.block_table.np[[tgt, src]]
         self._block_table_dirty = True
 
-    def compute_slot_mapping(self, req_indices: np.ndarray, positions: np.ndarray) -> None:
+    def compute_slot_mapping(
+        self,
+        req_indices: np.ndarray,
+        positions: np.ndarray,
+        live_origins: np.ndarray | None = None,
+    ) -> None:
         # E.g., [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]
         # -> [0, 0, K, K, K + 1, K + 1, K + 2, 2 * K, 2 * K, 2 * K + 1]
         # where K is the max_num_blocks_per_req and the block size is 2.
@@ -142,6 +153,8 @@ class BlockTable:
             # IMPORTANT: In hybrid mode, positions are in logical block space,
             # but we need to map them to the correct logical block table indices
             logical_block_idx = positions // virtual_block_size
+            if live_origins is not None:
+                logical_block_idx += live_origins[req_indices] // self.block_size
 
             # Account for the expanded logical table
             # (always needed with unified tensor)
@@ -252,6 +265,7 @@ class MultiGroupBlockTable:
         max_num_blocks: list[int] | None = None,
         kernel_sizes: list[list[int]] | None = None,
         cp_kv_cache_interleave_size: int = 1,
+        dsa_dcp_sizes: list[int | None] | None = None,
     ) -> None:
         if kernel_sizes is None:
             kernel_sizes = [[0]] * len(block_sizes)
@@ -263,13 +277,18 @@ class MultiGroupBlockTable:
                 f"kernel_sizes length ({len(kernel_sizes)}) must match block_sizes length ({len(block_sizes)})"
             )
 
+        if dsa_dcp_sizes is None:
+            dsa_dcp_sizes = [None] * len(block_sizes)
         if max_num_blocks is None:
             # Note(hc): each dcp rank only store
             # (max_model_len//dcp_world_size) tokens in kvcache,
             # so the block_size which used for calc max_num_blocks_per_req
             # must be multiplied by dcp_world_size.
             total_cp_world_size = get_total_cp_world_size()
-            max_num_blocks = [cdiv(max_model_len, block_size * total_cp_world_size) for block_size in block_sizes]
+            max_num_blocks = [
+                cdiv(max_model_len, block_size * (dcp_size or total_cp_world_size))
+                for block_size, dcp_size in zip(block_sizes, dsa_dcp_sizes, strict=True)
+            ]
 
         if len(max_num_blocks) != len(block_sizes):
             raise ValueError(
@@ -288,8 +307,11 @@ class MultiGroupBlockTable:
                 kernel_size_list,
                 cp_kv_cache_interleave_size,
                 num_speculative_tokens,
+                dsa_dcp_size,
             )
-            for block_size, kernel_size_list, max_num_blocks_per_req in zip(block_sizes, kernel_sizes, max_num_blocks)
+            for block_size, kernel_size_list, max_num_blocks_per_req, dsa_dcp_size in zip(
+                block_sizes, kernel_sizes, max_num_blocks, dsa_dcp_sizes, strict=True
+            )
         ]
 
     def append_row(self, block_ids: tuple[list[int], ...], row_idx: int) -> None:

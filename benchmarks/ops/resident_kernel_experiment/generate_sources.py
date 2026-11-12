@@ -53,7 +53,10 @@ def generate(source: str, header: Path, *, variants=(("baseline", 0), ("optimize
             raise ValueError(f"Expected exactly one definition of {name}")
         match = matches[0]
         arguments = []
-        for parameter in match[1].split(","):
+        # These standalone variants compile with DCP disabled. Parse only
+        # their active parameters and keep the copied device source verbatim.
+        parameters = re.sub(r"(?ms)^#ifdef RESIDENT_DCP_SHARDING\n.*?^#endif\n", "", match[1])
+        for parameter in parameters.split(","):
             pointer = re.fullmatch(r"\s*__gm__\s+(int(?:16|32|64)_t)\*\s+(\w+)\s*", parameter)
             if pointer:
                 arguments.append(f"static_cast<{pointer[1]}*>(a.tensors[{POINTERS[pointer[2]]}])")

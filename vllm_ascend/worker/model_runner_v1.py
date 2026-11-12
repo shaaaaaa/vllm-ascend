@@ -71,9 +71,11 @@ from vllm.v1.core.dsa_shared_pool import (
     DSABlockAllocationMode,
     PrefillLayerRef,
     build_prefill_layer_refs,
+    dsa_scratch_blocks_for_topk,
+    dsa_shared_block_layout,
+    paired_bank_indexer_block_map,
 )
 from vllm.v1.core.sched.output import SchedulerOutput
-from vllm.v1.core.dsa_shared_pool import dsa_shared_block_layout, paired_bank_indexer_block_map
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     EncoderOnlyAttentionSpec,
@@ -129,6 +131,8 @@ from vllm_ascend.attention.target_sfa_diagnostics import (
 from vllm_ascend.attention.utils import (
     AscendCommonAttentionMetadata,
     ColdResumeMarkers,
+    DcpSFABatch,
+    dcp_local_seq_lens,
     get_lmcache_sparse_cached_tokens,
     native_sfa_cold_resume_layout,
     staged_sfa_connector_supports_sparse_load,
@@ -152,7 +156,11 @@ from vllm_ascend.compilation.sfa_fail_stop import (
     uses_local_sfa_fail_stop,
 )
 from vllm_ascend.compilation.sfa_full_graph import SFAFullGraph
-from vllm_ascend.distributed.kv_transfer.sparse_offload.resident_sorted_cache import SharedResidentPlan
+from vllm_ascend.distributed.kv_transfer.sparse_offload.resident_sorted_cache import (
+    RESIDENT_COUNT_CACHELINE_INTS,
+    ResidentDcpLayout,
+    SharedResidentPlan,
+)
 from vllm_ascend.distributed.kv_transfer.sparse_offload.resident_sparse_cache import (
     MAX_INT16_SCRATCH_CAPACITY,
     ResidentRequestStateRegistry,
@@ -166,6 +174,7 @@ from vllm_ascend.live_source_handoff import (
     LIVE_SOURCE_EVENT_HANDOFF_KEY,
 )
 from vllm_ascend.serving_perf import (
+    cold_perf_device_timing_enabled,
     cold_perf_enabled,
     is_cold_perf_request,
     log_cold_perf_event,
@@ -623,6 +632,7 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
             logger.exception("Failed to abort deferred KV connector metadata")
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
+        self.dsa_decoder_dcp = getattr(vllm_config, "_dsa_decoder_dcp_policy", None) is not None
         # TODO(qcs): These manual pad and unpad for GPUModelRunner are
         # used to expand some buffers, which need to be reverted after
         # the following PR is merged:
@@ -804,7 +814,15 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
         if self.pcp_size > 1:
             self.model_config.max_model_len += 2 * self.pcp_size * self.max_num_reqs
         max_buffer_num_tokens = self.max_num_tokens
-        if self.pcp_size * self.dcp_size > 1:
+        if self.dsa_decoder_dcp:
+            dcp = get_dcp_group()
+            if self.dcp_size != self.parallel_config.decode_context_parallel_size or dcp.ranks != get_tp_group().ranks:
+                raise RuntimeError("Decoder DCP and TP must use the same ordered local ranks")
+            logger.info(
+                "Decoder DCP cache: ranks=%s rank=%d block=%d latent_span=%d indexer_span=%d",
+                dcp.ranks, self.dcp_rank, self.block_size, self.block_size * self.dcp_size, self.block_size,
+            )
+        if self.use_cp:
             max_buffer_num_tokens = self.max_num_tokens + self.max_num_reqs * 2 * self.pcp_size
             self.pcp_manager = PCPManager(
                 self.pcp_size,
@@ -990,7 +1008,7 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
 
     @property
     def use_cp(self) -> bool:
-        return self.pcp_size * self.dcp_size > 1
+        return self.pcp_size * self.dcp_size > 1 and not self.dsa_decoder_dcp
 
     def _init_device_properties(self) -> None:
         self.num_sms = None
@@ -1013,6 +1031,82 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
     def _reject_work_after_preemption_failure(self, *args, **kwargs):
         """Poison queued execution only after a capture/drain failure."""
         raise RuntimeError("A prior preemption failed; refusing queued model work before block reuse")
+
+    def _prepare_sfa_dcp_batch(
+        self, num_reqs: int, num_tokens: int, padded_tokens: int,
+        scheduler_output: SchedulerOutput | None,
+        *, graph_key: StagedSFAGraphKey | None = None,
+        graph_frontiers: tuple[int, ...] | None = None,
+    ) -> tuple[DcpSFABatch, tuple[int, ...]]:
+        lengths = self._dsa_dcp_seq_lens
+        origins = self._dsa_dcp_origins
+        requests = self.input_batch.req_ids[:num_reqs]
+        compact = scheduler_output.dsa_dcp_compact_req_ids if scheduler_output is not None else None
+        request_capacity = graph_key.request_capacity if graph_key is not None else num_reqs
+        if scheduler_output is None:
+            origins.np[:num_reqs].fill(0)
+        origins.np[num_reqs:request_capacity].fill(0)
+        origin_view = origins.copy_to_gpu(request_capacity)
+        lengths.np[:num_reqs] = dcp_local_seq_lens(
+            self.seq_lens.np[:num_reqs], origins.np[:num_reqs],
+            self.block_size, self.dcp_size, self.dcp_rank,
+        )
+        lengths.np[num_reqs:request_capacity].fill(0)
+        counts = self._dsa_dcp_counts[:padded_tokens]
+        planner_counts = counts
+        rows = boundary = packed_rows = None
+        frontiers = [0] * num_reqs
+        compact_ids = [req for req in requests if compact and req in compact]
+        if graph_frontiers is not None:
+            by_id = dict(zip(requests, graph_frontiers, strict=True))
+            compact_set = set(compact_ids)
+            if any((end > 0) != (req in compact_set) for req, end in by_id.items()):
+                raise RuntimeError("DCP graph source coverage disagrees with its table layout")
+        elif compact_ids:
+            metadata = unwrap_staged_sfa_connector_metadata(scheduler_output.kv_connector_metadata)
+            reason, proved, _ = staged_sfa_metadata_sparse_route(metadata, compact_ids)
+            if reason != StagedSFARouteReason.ELIGIBLE or any(end <= 0 for end in proved):
+                raise RuntimeError(f"DCP compact source coverage is unavailable: {reason.value}")
+            by_id = dict(zip(compact_ids, proved, strict=True))
+        else:
+            by_id = {}
+        if graph_key is not None or compact_ids:
+            qsl = self.query_start_loc.np[:num_reqs + 1]
+            width = self.decode_threshold
+            uniform = num_tokens == padded_tokens and np.all(np.diff(qsl) == width)
+            row_cpu = self._dsa_dcp_rows.np[:padded_tokens]
+            split_cpu = self._dsa_dcp_boundaries.np[:padded_tokens]
+            row_cpu.fill(-1)
+            split_cpu.fill(0)
+            compact_rows = []
+            for row in range(num_reqs):
+                start, end = int(qsl[row]), int(qsl[row + 1])
+                frontier = frontiers[row] = by_id.get(requests[row], 0) if by_id else 0
+                if frontier and not 0 < end - start <= width:
+                    raise RuntimeError("DCP compact requests exceed the resident planner width")
+                if graph_key is not None or uniform or frontier:
+                    row_cpu[start:end] = row
+                    split_cpu[start:end] = frontier
+                if (graph_key is not None or frontier) and not uniform:
+                    compact_rows.extend(range(start, end))
+            rows = self._dsa_dcp_rows.copy_to_gpu(padded_tokens)
+            boundary = self._dsa_dcp_boundaries.copy_to_gpu(padded_tokens)
+            if not uniform:
+                self._dsa_dcp_compact_rows.np[:len(compact_rows)] = compact_rows
+                packed_rows = self._dsa_dcp_compact_rows.copy_to_gpu(len(compact_rows))
+            if (
+                (graph_key is None and not uniform)
+                or (graph_key is not None and graph_key.query_profile == StagedSFAQueryProfile.DECODE_BOUNDED)
+            ):
+                planner_counts = self._dsa_dcp_planner_counts[:request_capacity * width]
+        return DcpSFABatch(
+            ResidentDcpLayout(self.dcp_size, self.dcp_rank, origin_view, planner_counts),
+            lengths.copy_to_gpu(request_capacity), self.positions.gpu[:padded_tokens],
+            self._dsa_dcp_topk[:padded_tokens], counts,
+            (self._dsa_dcp_topk[:num_reqs, 0, :0],
+             self._dsa_dcp_zero_counts[:num_reqs], self._dsa_dcp_empty_slots[:num_reqs]),
+            rows, boundary, packed_rows,
+        ), tuple(frontiers)
 
     def _prepare_resident_request_state(
         self,
@@ -1562,6 +1656,17 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
             for block_table in block_tables_by_bank:
                 block_table.compute_slot_mapping(req_indices, positions_np)
                 block_table.commit_slot_mapping(total_num_scheduled_tokens)
+        elif self.dsa_decoder_dcp:
+            compact_requests = scheduler_output.dsa_dcp_compact_req_ids
+            if compact_requests is None:
+                raise RuntimeError("Decoder DCP scheduler output is missing the compact table layout")
+            tables = self.input_batch.block_table
+            origins = self._dsa_dcp_live_origins
+            for row, req_id in enumerate(self.input_batch.req_ids[:num_reqs]):
+                origins[row] = self._dsa_dcp_scratch_origin if req_id in compact_requests else 0
+            tables[0].compute_slot_mapping(req_indices, positions_np, origins)
+            tables[1].compute_slot_mapping(req_indices, positions_np)
+            tables.commit_slot_mapping(total_num_scheduled_tokens)
         else:
             self.input_batch.block_table.compute_slot_mapping(req_indices, positions_np)
             self.input_batch.block_table.commit_slot_mapping(total_num_scheduled_tokens)
@@ -2321,6 +2426,8 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
             with self.synchronize_input_prep():
                 # Update persistent batch states.
                 self._update_states(scheduler_output)
+                if cold_perf_active:
+                    self._arm_cold_perf_decode_trace(scheduler_output)
                 if self.layerwise_prefill_p_node:
                     self._capture_layerwise_prefill_bank_offsets(scheduler_output)
 
@@ -2600,6 +2707,8 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                         staged_sfa_graph_key is not None
                         and staged_sfa_graph_key.query_profile == StagedSFAQueryProfile.DECODE_BOUNDED
                     ),
+                    dsa_dcp_scheduler_output=scheduler_output,
+                    dsa_dcp_graph_key=staged_sfa_graph_key,
                 )
 
                 self._sanitize_placeholder_input_ids_for_forward(
@@ -3638,7 +3747,9 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
 
         if lmhead_tp_enable() and logits is not None:
             logits = logits[: len(spec_decode_metadata.logits_indices)]
-        if not request_ids:
+        # Host summaries already time the complete sampler call. Preserve the
+        # normal rejection forward; sub-stage recording is explicit device profiling.
+        if not request_ids or not cold_perf_device_timing_enabled():
             return self.rejection_sampler(spec_decode_metadata, None, logits, sampling_metadata)
 
         def record_rejection_stage(name, operation, args, kwargs):
@@ -3893,6 +4004,10 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                 value.fill_(-1)
         # Builder-owned extended tables: do not mutate the live
         # input batch's block table or cached physical ownership.
+        dcp = getattr(metadata, "sfa_dcp", None)
+        if dcp is not None:
+            dcp.local_seq_lens.zero_()
+            dcp.row_requests.fill_(-1)
         if getattr(metadata, "decode_remap_boundary", None) is not None:
             metadata.block_table.zero_()
             metadata.indexer_block_table.zero_()
@@ -4430,6 +4545,8 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
         cold_compact_resumes: tuple[bool, ...] = (),
         resident_remap_frontiers: tuple[int, ...] | None = None,
         full_graph: bool = False,
+        dsa_dcp_scheduler_output: SchedulerOutput | None = None,
+        dsa_dcp_graph_key: StagedSFAGraphKey | None = None,
     ) -> tuple[PerLayerAttnMetadata, CommonAttentionMetadata | None]:
         """
         :return: tuple[attn_metadata, spec_decode_common_attn_metadata]
@@ -4658,8 +4775,16 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                 num_reqs
             )
 
+        dcp_batch = None
+        if getattr(self, "_dsa_dcp_origins", None) is not None:
+            dcp_batch, resident_remap_frontiers = self._prepare_sfa_dcp_batch(
+                num_reqs, num_tokens, num_tokens_padded, dsa_dcp_scheduler_output,
+                graph_key=dsa_dcp_graph_key,
+                graph_frontiers=resident_remap_frontiers if dsa_dcp_graph_key is not None else None,
+            )
         resident_compatible = (
-            not resident_state_enabled
+            dcp_batch is not None
+            or not resident_state_enabled
             or staged_sfa_graph_dummy_run
             or (
                 self.attn_state
@@ -4729,6 +4854,7 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
             resident_state_indices_cpu=resident_state_indices_cpu,
             resident_state_generations_cpu=resident_state_generations_cpu,
             sfa_full_graph=full_graph,
+            sfa_dcp=dcp_batch,
         )
 
         if logits_indices is not None and self.cache_config.kv_sharing_fast_prefill:
@@ -5606,14 +5732,22 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
             block_table.commit_slot_mapping(positions.size)
 
             slots = block_table.slot_mapping.np[: positions.size]
+            if getattr(self, "dsa_decoder_dcp", False) and group_index == 0:
+                owned = positions // logical_block_size % self.dcp_size == self.dcp_rank
+                if np.any(slots[~owned] != -1):
+                    raise RuntimeError("DCP dummy Group-0 mapping wrote an unowned slot")
+                slots = slots[owned]
             if (
                 np.any(slots < 0)
-                or np.unique(slots).size != positions.size
+                or np.unique(slots).size != slots.size
             ):
                 raise RuntimeError(
                     'The staged SFA dummy slot mapping aliases requests in '
                     f'KV group {group_index}: slots={slots.tolist()}.'
                 )
+        if getattr(self, "dsa_decoder_dcp", False):
+            self.positions.np[:positions.size] = positions
+            self.positions.copy_to_gpu(positions.size)
     @torch.inference_mode()
     def _dummy_run(
         self,
@@ -5930,6 +6064,7 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                 num_scheduled_tokens_np=num_scheduled_tokens,
                 staged_sfa_graph_dummy_run=staged_sfa_graph_dummy_run,
                 full_graph=bounded_dummy_layout,
+                dsa_dcp_graph_key=staged_dummy_key,
             )
 
             if dp_idle and staged_sfa_graph_dummy_run and sfa_full_graph_enabled(self.vllm_config):
@@ -6349,6 +6484,7 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
         if self._sfa_full_graph.retrieval_overlap is not None:
             self._sfa_full_graph.retrieval_overlap.configure(
                 self._collect_staged_sfa_impls(), self._shared_resident_groups, kv_caches,
+                dcp_group=get_dcp_group() if self.dsa_decoder_dcp else None,
             )
         # TODO: refactor the logic of attention
         # Initialize drafter attention group initialization
@@ -7145,6 +7281,7 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                 self.kernel_block_sizes.append([0])
 
         max_num_blocks = []
+        dsa_dcp_sizes = []
         max_model_len = max(self.max_model_len, self.max_encoder_len)
         shared_layout = None
         if self.dsa_shared_pool:
@@ -7162,7 +7299,11 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
         for i, kv_cache_group in enumerate(kv_cache_config.kv_cache_groups):
             if isinstance(kv_cache_group.kv_cache_spec, EncoderOnlyAttentionSpec):
                 continue
-            max_num_blocks_per_req = cdiv(max_model_len, block_sizes[i] * get_total_cp_world_size())
+            dsa_dcp_size = getattr(kv_cache_group.kv_cache_spec, "dsa_dcp_size", None)
+            dsa_dcp_sizes.append(dsa_dcp_size)
+            max_num_blocks_per_req = cdiv(
+                max_model_len, block_sizes[i] * (dsa_dcp_size or get_total_cp_world_size())
+            )
             if self.dsa_shared_pool and isinstance(kv_cache_group.kv_cache_spec, AttentionSpec):
                 if kv_cache_group.kv_cache_spec.head_size > self.sparse_head_dim[-1]:
                     blocks_per_bundle = shared_layout.latent_blocks_per_bundle
@@ -7171,6 +7312,33 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                 max_num_blocks_per_req = cdiv(
                     max_num_blocks_per_req, blocks_per_bundle
                 ) * blocks_per_bundle
+                if dsa_dcp_size is not None and dsa_dcp_size > 1:
+                    assert kv_cache_config.dsa_index_topk is not None
+                    scratch = dsa_scratch_blocks_for_topk(
+                        kv_cache_config.dsa_index_topk,
+                        block_sizes[i],
+                        kv_cache_config.dsa_num_speculative_tokens + 1,
+                    )
+                    scratch_blocks = cdiv(scratch, blocks_per_bundle) * blocks_per_bundle
+                    max_num_blocks_per_req += scratch_blocks
+                    self._dsa_dcp_scratch_origin = scratch_blocks * block_sizes[i]
+                    self._dsa_dcp_origins = self._make_buffer(self.max_num_reqs, dtype=torch.int32)
+                    self._dsa_dcp_live_origins = self._dsa_dcp_origins.np
+                    self._dsa_dcp_seq_lens = self._make_buffer(self.max_num_reqs, dtype=torch.int32)
+                    self._dsa_dcp_rows = self._make_buffer(self.max_num_tokens, dtype=torch.int32)
+                    self._dsa_dcp_boundaries = self._make_buffer(self.max_num_tokens, dtype=torch.int32)
+                    self._dsa_dcp_compact_rows = self._make_buffer(self.max_num_reqs * self.decode_threshold, dtype=torch.int64)
+                    self._dsa_dcp_topk = torch.empty(
+                        (self.max_num_tokens, 1, self.dsa_index_topk), dtype=torch.int32, device=self.device
+                    )
+                    self._dsa_dcp_counts = self._dsa_dcp_topk.new_empty(
+                        (self.max_num_tokens, RESIDENT_COUNT_CACHELINE_INTS)
+                    )
+                    self._dsa_dcp_zero_counts = self._dsa_dcp_topk.new_zeros((self.max_num_reqs,))
+                    self._dsa_dcp_empty_slots = torch.empty((self.max_num_reqs, 0), dtype=torch.int64, device=self.device)
+                    self._dsa_dcp_planner_counts = self._dsa_dcp_topk.new_empty(
+                        (self.max_num_reqs * self.decode_threshold, RESIDENT_COUNT_CACHELINE_INTS)
+                    )
             if isinstance(kv_cache_group.kv_cache_spec, MambaSpec):
                 mamba_blocks_per_req = (
                     max_num_blocks_per_req if self.cache_config.enable_prefix_caching else 1
@@ -7179,7 +7347,12 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                 max_num_blocks_per_req = max(max_num_blocks_per_req, mamba_blocks_per_req)
             max_num_blocks.append(max_num_blocks_per_req)
 
-        if block_sizes != [self.cache_config.block_size] or self.kernel_block_sizes != [[self.cache_config.block_size]]:
+        dsa_dcp = any(size is not None for size in dsa_dcp_sizes)
+        if (
+            dsa_dcp
+            or block_sizes != [self.cache_config.block_size]
+            or self.kernel_block_sizes != [[self.cache_config.block_size]]
+        ):
             assert self.offload_config.uva.cpu_offload_gb == 0, (
                 "Cannot re-initialize the input batch when CPU weight "
                 "offloading is enabled. See https://github.com/vllm-project/vllm/pull/18298 "  # noqa: E501
@@ -7203,6 +7376,8 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                 ),
                 kernel_block_sizes=self.kernel_block_sizes,
                 max_num_blocks_per_req=max_num_blocks,
+                dsa_dcp_sizes=dsa_dcp_sizes if dsa_dcp else None,
+                cp_kv_cache_interleave_size=self.parallel_config.cp_kv_cache_interleave_size if dsa_dcp else 1,
             )
 
     def initialize_attn_backend(self, kv_cache_config: KVCacheConfig) -> None:
@@ -7303,6 +7478,9 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
 
     def _get_dsa_compact_startup_policy(self) -> tuple[int, int] | None:
         """Query configuration without creating the worker connector before sizing."""
+        dcp_policy = getattr(self.vllm_config, "_dsa_decoder_dcp_policy", None)
+        if dcp_policy is not None:
+            return dcp_policy
         transfer = self.vllm_config.kv_transfer_config
         if (
             not self.use_sparse or not self.dsa_unbundle or not self.dsa_shared_pool
@@ -7341,6 +7519,13 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
             for group in kv_cache_config.kv_cache_groups
             if getattr(group.kv_cache_spec, "dsa_compact_startup_scratch_tokens", 0)
         }
+        dcp_policy = getattr(self.vllm_config, "_dsa_decoder_dcp_policy", None)
+        if dcp_policy is not None and (
+            policies != {dcp_policy}
+            or tuple(getattr(group.kv_cache_spec, "dsa_dcp_size", None)
+                     for group in kv_cache_config.kv_cache_groups) != (self.dcp_size, 1)
+        ):
+            raise RuntimeError("Decoder DCP KV groups disagree with the startup layout")
         if not policies:
             return
         if len(policies) != 1 or not has_kv_transfer_group():
@@ -7366,6 +7551,7 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
         if has_ec_transfer() and get_ec_transfer().is_producer:
             return {}
 
+        dcp = self.dcp_size if getattr(self.vllm_config, "_dsa_decoder_dcp_policy", None) is not None else None
         kv_cache_spec: dict[str, KVCacheSpec] = {}
         attn_layers = get_layers_from_vllm_config(self.vllm_config, AttentionLayerBase)
         # NOTE: Must process Attention/MLAAttention before MambaBase to maintain
@@ -7410,6 +7596,7 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                             dtype=self.kv_cache_dtype,
                             cache_dtype_str=self.vllm_config.cache_config.cache_dtype,
                             cache_sparse_c8=False,
+                            dsa_dcp_size=dcp,
                         )
                     elif self.dsa_free_paged:
                         # DSA offload (M-B): paged cache holds ONLY the indexer key;
@@ -7484,6 +7671,7 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                     dtype=self.kv_cache_dtype,
                     cache_dtype_str=self.vllm_config.cache_config.cache_dtype,
                     cache_sparse_c8=self.use_sparse_c8_indexer,
+                    dsa_dcp_size=1 if dcp is not None else None,
                 )
 
             elif isinstance(attn_module, MambaBase):
@@ -7517,6 +7705,10 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                 for name, spec in kv_cache_spec.items()
                 if isinstance(spec, MLAAttentionSpec) and "indexer" in name
             ]
+            if dcp is not None and (
+                not latent_names or not indexer_names or len(latent_names) + len(indexer_names) != len(kv_cache_spec)
+            ):
+                raise ValueError("Decoder DCP requires exactly the latent and indexer cache layouts")
             if indexer_names:
                 if self.layerwise_prefill_p_node and self.dsa_shared_pool:
                     # Every P slab retains one aligned backing, including BF16.
@@ -7548,11 +7740,11 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                 if self.use_sparse_c8_indexer:
                     if self.layerwise_prefill_p_node and self._mixed_indexer_c8_names is None:
                         raise ValueError("Banked P C8 requires mixed BF16/C8 owners; ordinary uniform C8 remains supported")
+                    unsharded_dims = ("pipeline_parallel_size", "prefill_context_parallel_size")
+                    if dcp is None:
+                        unsharded_dims += ("decode_context_parallel_size",)
                     if self.dsa_free_paged or any(
-                        getattr(self.parallel_config, name, 1) != 1 for name in (
-                            "pipeline_parallel_size", "decode_context_parallel_size",
-                            "prefill_context_parallel_size",
-                        )
+                        getattr(self.parallel_config, name, 1) != 1 for name in unsharded_dims
                     ):
                         raise ValueError("Two-group indexer C8 does not support free-paged cache, PP or CP")
                     if any(
@@ -7646,6 +7838,8 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
         reasons = staged_sfa_graph_configuration_reasons(config)
         if config.compilation_config.cudagraph_mode == CUDAGraphMode.NONE:
             reasons = tuple(r for r in reasons if r != StagedSFAConfigReason.CUDAGRAPH_MODE)
+        if self.dsa_decoder_dcp:
+            reasons = tuple(r for r in reasons if r != StagedSFAConfigReason.CONTEXT_PARALLEL)
         if reasons or not self.dsa_resident_cache or getattr(config.parallel_config, "enable_dbo", False):
             raise ValueError(f"shared resident planning requires serialized compact-scratch decode: {reasons}")
         layers = get_layers_from_vllm_config(config, AttentionLayerBase)
@@ -7764,6 +7958,15 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
             common = metadata[group.members[0]]
             if any(metadata[name] is not common for name in group.members):
                 raise ValueError("shared resident members must use the same live attention metadata")
+            dcp = getattr(common, "sfa_dcp", None)
+            if dcp is not None:
+                # The DCP planner also maintains scratch in ragged mixed batches.
+                if dcp.row_requests is not None and (
+                    common.resident_state_indices is None or common.resident_state_generations is None
+                ):
+                    raise RuntimeError("shared resident request state is unavailable")
+                group.active = staged
+                continue
             # Identity of the metadata guarantees identical table views, rows,
             # boundaries and request generations without device comparisons.
             group.active = staged or bool(

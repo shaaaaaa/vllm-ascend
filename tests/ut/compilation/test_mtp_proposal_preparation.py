@@ -79,7 +79,8 @@ def selection():
 @pytest.mark.parametrize("n", [1, 4, 16])
 @pytest.mark.parametrize("accepted", [1, 2])
 @pytest.mark.parametrize("strided", [False, True])
-def test_padded_identity_selection_matches_gather_and_draft_owned_outputs(n, accepted, strided):
+@pytest.mark.parametrize("dcp_size", [1, 4])
+def test_padded_identity_selection_matches_gather_and_draft_owned_outputs(n, accepted, strided, dcp_size):
     prepare = extract(
         PROPOSER,
         "prepare_inputs_padded",
@@ -107,6 +108,7 @@ def test_padded_identity_selection_matches_gather_and_draft_owned_outputs(n, acc
         slot_mapping=torch.arange(total),
         positions=positions,
         num_computed_tokens_cpu=torch.full((n,), 98),
+        sfa_dcp=object() if dcp_size > 1 else None,
     )
     proposer = SimpleNamespace(
         arange=torch.arange(total + 8),
@@ -119,6 +121,7 @@ def test_padded_identity_selection_matches_gather_and_draft_owned_outputs(n, acc
         SimpleNamespace(cu_num_draft_tokens=torch.arange(1, n + 1)),
         torch.full((n,), accepted, dtype=torch.int64),
     )
+    assert cad.sfa_dcp is common.sfa_dcp
     runner = SimpleNamespace(
         drafter=SimpleNamespace(method="mtp", needs_extra_input_slots=False),
         num_spec_tokens=1,
@@ -136,9 +139,9 @@ def test_padded_identity_selection_matches_gather_and_draft_owned_outputs(n, acc
     for inputs in ((ids[indices], positions[indices], hidden[indices]), selected):
         worker = SimpleNamespace(
             needs_extra_input_slots=False,
-            runner=object(),
+            runner=SimpleNamespace(use_cp=False),
             pcp_size=1,
-            dcp_size=1,
+            dcp_size=dcp_size,
             uses_xdrope_dim=0,
             input_ids=torch.full_like(ids, -9),
             positions=torch.full_like(positions, -9),

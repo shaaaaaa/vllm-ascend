@@ -92,58 +92,19 @@ class RetrievalEdge:
         self.pending_capture_launch = False
 
 
-@dataclass
-class ProbeCopy:
-    destination: torch.Tensor
-
-    def load(self, selected, counts, slots) -> None:
-        self.destination.copy_(selected)
-
-
-class CaptureProbe:
-    """Fail startup if this runtime cannot replay the required fork/join.
-
-    Retained by the owner on failure, including after uncertain submission.
-    This is a dependency probe, not a retrieval performance benchmark.
-    """
-
-    def __init__(self, stream, device) -> None:
-        self.source = torch.zeros(64, device=device)
-        self.dest = torch.empty_like(self.source)
-        self.observed = torch.empty_like(self.source)
-        self.matrix = torch.ones((16, 16), device=device, dtype=torch.float16)
-        self.product = torch.empty_like(self.matrix)
-        self.edge = RetrievalEdge(stream, ProbeCopy(self.dest), (self.dest,))
-        self.graph = torch.npu.NPUGraph()
-
-    def verify(self) -> None:
-        torch.mm(self.matrix, self.matrix, out=self.product)
-        torch.npu.synchronize()
-        with torch.npu.graph(self.graph):
-            self.edge.launch(self.source, None, None, (self.dest,))
-            torch.mm(self.matrix, self.matrix, out=self.product)
-            self.edge.join()
-            self.observed.copy_(self.dest)
-        for value in (1, 7, 2):
-            self.source.fill_(value)
-            self.graph.replay()
-            if not torch.equal(self.observed.cpu(), torch.full((64,), float(value))):
-                raise RuntimeError("shared retrieval multi-stream capture probe failed")
-        torch.npu.synchronize()
-
-
 class SharedRetrievalOverlap:
     """One stream per worker, immutable per-key edges after startup setup."""
 
     def __init__(self) -> None:
         self.stream = None
-        self.probe = None
         self.pairs: dict[str, tuple[str, tuple]] = {}
         self.incoming: dict[Any, dict[str, RetrievalEdge]] = {}
         self.outgoing: dict[Any, dict[str, RetrievalEdge]] = {}
         self.failed = False
 
-    def configure(self, impls, groups, kv_caches) -> None:
+    def configure(self, impls, groups, kv_caches, *, dcp_group=None) -> None:
+        # Keep dcp_group accepted for existing callers. Synthetic collective
+        # qualification lives in tests; startup prepares only the real edges.
         if self.stream is not None or self.incoming:
             raise RuntimeError("cannot replace overlap layout after capture setup")
         by_name = dict(impls)
@@ -193,9 +154,6 @@ class SharedRetrievalOverlap:
                     if self.stream is None:
                         device = destinations[0].device
                         self.stream = torch.npu.Stream(device=device)
-                        self.probe = CaptureProbe(self.stream, device)
-                        self.probe.verify()
-                        self.probe = None
                     edge = RetrievalEdge(self.stream, transfer, destinations, max_aiv_cores=12)
                     incoming[following] = outgoing[current] = edge
             except BaseException:
@@ -211,7 +169,6 @@ class SharedRetrievalOverlap:
         # Called only AFTER the root owner synchronizes, including on failure.
         self.incoming.clear()
         self.outgoing.clear()
-        self.probe = None
         self.stream = None
         self.failed = False
         # Layer cache references remain valid across graph-only recapture. KV

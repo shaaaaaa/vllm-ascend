@@ -82,6 +82,7 @@ def _enqueue_output(self: WorkerProc, output):
         ),
     }
     setattr(output, _COLD_PERF_REQUEST_IDS, request_ids)
+    setattr(output, _COLD_PERF_SAMPLE_RETURN_NS, sample_return_ns)
     setattr(output, _COLD_PERF_WORKER_TIMING, worker_timing)
     _worker_enqueue_output(self, output)
     completed_ns = time.perf_counter_ns()

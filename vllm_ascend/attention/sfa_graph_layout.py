@@ -81,8 +81,8 @@ def pack_decode_lanes(topk, boundaries, row_requests, query_ends, width):
     return packed, packed_boundary, packed_requests, inverse
 
 
-def unpack_decode_lanes(planned_topk, inverse, row_requests):
+def unpack_decode_lanes(planned_topk, inverse, row_requests, *, fill_value=-1):
     """Restore packed token order after remapping request-major planner lanes."""
     selected = planned_topk[inverse]
     valid = (row_requests >= 0).reshape(-1, *([1] * (selected.ndim - 1)))
-    return torch.where(valid, selected, -1)
+    return torch.where(valid, selected, fill_value)
