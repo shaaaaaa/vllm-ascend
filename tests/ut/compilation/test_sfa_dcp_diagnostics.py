@@ -17,6 +17,100 @@ from sfa_test_support import ROOT, extract
 SOURCE = ROOT / "tests/e2e/multicard/test_sfa_dcp.py"
 
 
+@pytest.mark.parametrize("mode", ["off", "control", "local", "gloo"])
+@pytest.mark.parametrize("failed", [False, True])
+def test_replay_fence_group_lifetime_and_disabled_path(mode, failed):
+    control, finish = object(), Mock()
+    dist = SimpleNamespace(new_group=Mock(return_value=control), destroy_process_group=Mock(), get_rank=lambda: 0)
+    fixture = extract(SOURCE, "dcp_replay_fence", {
+        "dist": dist, "timedelta": timedelta, "_finish_dcp_replay": finish,
+    })
+    session = fixture(SimpleNamespace(param=mode), 8)
+    fence = next(session)
+    if mode == "off":
+        assert fence is None
+        dist.new_group.assert_not_called()
+    else:
+        dist.new_group.assert_called_once_with(backend="gloo", timeout=timedelta(seconds=60))
+        fence()
+        finish.assert_called_once_with(mode, control)
+    if failed:
+        with pytest.raises(RuntimeError, match="native failed"):
+            session.throw(RuntimeError("native failed"))
+    else:
+        with pytest.raises(StopIteration):
+            next(session)
+    if mode == "off":
+        dist.destroy_process_group.assert_not_called()
+    else:
+        dist.destroy_process_group.assert_called_once_with(control)
+
+
+@pytest.mark.parametrize("failure", ["synchronize", "barrier"])
+def test_replay_fence_propagates_failure(failure):
+    sync, barrier = Mock(), Mock()
+    (sync if failure == "synchronize" else barrier).side_effect = RuntimeError("fence failed")
+    finish = extract(SOURCE, "_finish_dcp_replay", {
+        "torch": SimpleNamespace(npu=SimpleNamespace(synchronize=sync)),
+        "dist": SimpleNamespace(monitored_barrier=barrier), "timedelta": timedelta,
+    })
+    with pytest.raises(RuntimeError, match="fence failed"):
+        finish("gloo", object())
+    assert barrier.call_count == int(failure == "barrier")
+
+
+@pytest.mark.parametrize("mode", ["off", "control", "local", "gloo"])
+def test_actual_replay_loop_fences_after_readback_before_next_write(mode):
+    # Execute the native test's actual host loop with CPU tensors. This checks
+    # experiment placement/order only, not NPU/HCCL execution or correctness.
+    events, control = [], object()
+    host_torch = SimpleNamespace(
+        tensor=torch.tensor, zeros=torch.zeros, cat=torch.cat,
+        arange=lambda count, **kwargs: torch.arange(count, dtype=kwargs["dtype"]),
+        int32=torch.int32, float32=torch.float32,
+        npu=SimpleNamespace(synchronize=lambda: events.append("synchronize")),
+    )
+
+    def barrier(*, group, timeout, wait_all_ranks):
+        assert group is control and timeout == timedelta(seconds=60) and wait_all_ranks
+        events.append("barrier")
+
+    finish = extract(SOURCE, "_finish_dcp_replay", {
+        "torch": host_torch, "dist": SimpleNamespace(monitored_barrier=barrier), "timedelta": timedelta,
+    })
+
+    class Indices:
+        def fill_(self, value):
+            events.append("write_inputs")
+
+        def __setitem__(self, key, value):
+            pass
+
+    def snapshot():
+        events.append("readback")
+        return torch.zeros(2, 1, 512, dtype=torch.bfloat16)
+
+    namespace = dict(
+        torch=host_torch, world=2, rank=0, rows=2, local_heads=1,
+        all_q=torch.zeros(2, 2, 576), cache=torch.zeros(2, 128, 576), owned=slice(0, 1), scale=1.0,
+        indices=Indices(), counts=torch.zeros(2, 16, dtype=torch.int32), edge=None,
+        graph=SimpleNamespace(replay=lambda: events.append("replay")),
+        output=SimpleNamespace(cpu=snapshot), trace_stages=False, overlap=False, verify_probe=False,
+        comparisons=[], dcp_replay_fence=None if mode == "off" else lambda: finish(mode, control),
+    )
+    tree = ast.parse(SOURCE.read_text(encoding="utf-8"))
+    loop = next(node for node in ast.walk(tree)
+                if isinstance(node, ast.For) and ast.unparse(node.target) == "(step, sizes)")
+    exec(compile(ast.Module(body=[loop], type_ignores=[]), str(SOURCE), "exec"), namespace)
+    per_replay = ["write_inputs", "replay", "readback"]
+    if mode in ("local", "gloo"):
+        per_replay.append("synchronize")
+    if mode == "gloo":
+        per_replay.append("barrier")
+    assert events == per_replay * 3
+    assert len(namespace["comparisons"]) == 3
+
+
 @pytest.mark.parametrize("world", [2, 4, 8])
 @pytest.mark.parametrize("shape", ["probe", "attention"])
 @pytest.mark.parametrize("async_op", [False, True])

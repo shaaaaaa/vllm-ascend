@@ -149,22 +149,61 @@ def dcp_transport(request, monkeypatch, dcp_world):
             dist.destroy_process_group(group)
 
 
+def _finish_dcp_replay(mode, control):
+    """Fence after readbacks, before any rank can overwrite the next inputs.
+
+    This runs on the host outside capture. Holding graph tensors does not
+    prevent a later replay from overwriting storage still read by a peer.
+    """
+    if mode != "control":
+        torch.npu.synchronize()
+    if mode == "gloo":
+        dist.monitored_barrier(group=control, timeout=timedelta(seconds=60), wait_all_ranks=True)
+
+
+@pytest.fixture
+def dcp_replay_fence(request, dcp_world):
+    mode = request.param
+    if mode == "off":
+        yield None
+        return
+    # Create the same CPU group in all experiment arms. This avoids attributing
+    # a group-creation/timing effect to the between-replay fence itself.
+    control = dist.new_group(backend="gloo", timeout=timedelta(seconds=60))
+    try:
+        if dist.get_rank() == 0:
+            print(f"DCP diagnostic replay fence: mode={mode} placement=after_readbacks", flush=True)
+        yield lambda: _finish_dcp_replay(mode, control)
+    finally:
+        dist.destroy_process_group(control)
+
+
 @torch.inference_mode()
-@pytest.mark.parametrize("overlap,trace_stages,verify_probe,dcp_transport", [
-    pytest.param(False, False, False, "fixed", id="False"),
-    pytest.param(True, False, True, "fixed", id="True"),
-    pytest.param(True, True, True, "fixed", id="True-trace"),
-    pytest.param(False, True, True, "fixed", id="serial-after-probe"),
-    pytest.param(True, True, False, "fixed", id="overlap-without-probe"),
-    pytest.param(True, True, True, "alltoallv", id="True-trace-alltoallv"),
-    pytest.param(True, False, True, "alltoallv", id="True-alltoallv"),
+@pytest.mark.parametrize("overlap,trace_stages,verify_probe,dcp_transport,dcp_replay_fence", [
+    pytest.param(False, False, False, "fixed", "off", id="False"),
+    pytest.param(True, False, True, "fixed", "off", id="True"),
+    pytest.param(True, True, True, "fixed", "off", id="True-trace"),
+    pytest.param(False, True, True, "fixed", "off", id="serial-after-probe"),
+    pytest.param(True, True, False, "fixed", "off", id="overlap-without-probe"),
+    pytest.param(True, True, True, "alltoallv", "off", id="True-trace-alltoallv"),
+    pytest.param(True, False, True, "alltoallv", "off", id="True-alltoallv"),
     # Pair the HOST candidate with an otherwise identical separate group. A
     # WORLD-versus-HOST comparison alone also changes communicator placement.
-    pytest.param(True, True, True, "group-inherit", id="True-trace-dcp-inherit"),
-    pytest.param(True, True, True, "group-host", id="True-trace-dcp-host"),
-    pytest.param(True, False, True, "group-host", id="True-dcp-host"),
-], indirect=["dcp_transport"])
-def test_counted_sfa_dcp_collectives_replay(overlap, trace_stages, verify_probe, monkeypatch, dcp_world, dcp_transport):
+    pytest.param(True, True, True, "group-inherit", "off", id="True-trace-dcp-inherit"),
+    pytest.param(True, True, True, "group-host", "off", id="True-trace-dcp-host"),
+    pytest.param(True, False, True, "group-host", "off", id="True-dcp-host"),
+    pytest.param(True, True, True, "fixed", "control", id="True-trace-replay-control"),
+    pytest.param(True, True, True, "fixed", "local", id="True-trace-replay-local"),
+    pytest.param(True, True, True, "fixed", "gloo", id="True-trace-replay-gloo"),
+    pytest.param(True, False, True, "fixed", "gloo", id="True-replay-gloo"),
+    # If CaptureProbe fails first, use BOTH no-probe arms to isolate native
+    # replay. Never swallow a startup probe failure and call it a native pass.
+    pytest.param(True, True, False, "fixed", "control", id="without-probe-replay-control"),
+    pytest.param(True, True, False, "fixed", "gloo", id="without-probe-replay-gloo"),
+], indirect=["dcp_transport", "dcp_replay_fence"])
+def test_counted_sfa_dcp_collectives_replay(
+    overlap, trace_stages, verify_probe, monkeypatch, dcp_world, dcp_transport, dcp_replay_fence,
+):
     world = dcp_world
     import vllm_ascend.vllm_ascend_C  # noqa: F401
     from vllm_ascend.ops.triton import sfa_dcp
@@ -261,6 +300,11 @@ def test_counted_sfa_dcp_collectives_replay(overlap, trace_stages, verify_probe,
                 comparisons.append((label + " kind=counts", counts[:, 0].cpu(),
                                     torch.tensor(sizes[rank], dtype=torch.int32)))
                 comparisons.extend(_empty_dcp_stage_comparisons(stages, label))
+            # Do not change the captured forward, input sequence, or readback
+            # ordering. This fence prevents the NEXT replay (and final teardown)
+            # from overtaking peers still executing/snapshotting this replay.
+            if dcp_replay_fence is not None:
+                dcp_replay_fence()
     finally:
         if graph is not None:
             torch.npu.synchronize()
