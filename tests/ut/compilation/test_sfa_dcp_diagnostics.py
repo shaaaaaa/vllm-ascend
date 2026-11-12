@@ -5,6 +5,7 @@ import ast
 import os
 import subprocess
 import sys
+import weakref
 from datetime import timedelta
 from textwrap import dedent
 from types import SimpleNamespace
@@ -15,6 +16,104 @@ import torch
 from sfa_test_support import ROOT, extract
 
 SOURCE = ROOT / "tests/e2e/multicard/test_sfa_dcp.py"
+
+
+@pytest.mark.parametrize("mode", ["release", "retain", "group-control", "group-isolated"])
+@pytest.mark.parametrize("failed", [False, True])
+def test_probe_variant_group_selection_and_lifetime(mode, failed):
+    native, separate = object(), object()
+    create, destroy = Mock(return_value=separate), Mock()
+    fixture = extract(SOURCE, "probe_variant", {
+        "_dcp_test_group": create, "dist": SimpleNamespace(destroy_process_group=destroy),
+        "SimpleNamespace": SimpleNamespace,
+    })
+    session = fixture(SimpleNamespace(param=mode), native)
+    variant = next(session)
+    assert variant.mode == mode
+    assert variant.group is (separate if mode == "group-isolated" else native)
+    if mode.startswith("group-"):
+        create.assert_called_once_with("group-inherit")
+    else:
+        create.assert_not_called()
+    destroy.assert_not_called()
+    if failed:
+        with pytest.raises(RuntimeError, match="native failed"):
+            session.throw(RuntimeError("native failed"))
+    else:
+        with pytest.raises(StopIteration):
+            next(session)
+    assert destroy.call_count == int(mode.startswith("group-"))
+    if destroy.call_count:
+        destroy.assert_called_once_with(separate)
+
+
+@pytest.mark.parametrize("mode", ["release", "retain", "group-control", "group-isolated"])
+@pytest.mark.parametrize("failure", [None, "probe", "native", "synchronize"])
+def test_actual_probe_setup_and_graph_cleanup(mode, failure):
+    # Execute the actual setup and finally clauses, substituting the native
+    # tensor/graph work. Weak references detect an accidentally retained probe
+    # in the control, or an early release in the retained arm.
+    events, probes = [], []
+    native_group, probe_group, stream = object(), object(), object()
+    selected = probe_group if mode == "group-isolated" else native_group
+
+    class Probe:
+        def __init__(self, actual_stream, device, group):
+            assert actual_stream is stream and device == "npu"
+            assert group.device_group is selected
+            assert group.all_gather("packet", dim=0) == (selected, "packet", 0)
+            self.graph = SimpleNamespace(reset=lambda: events.append("probe_reset"))
+            probes.append(weakref.ref(self))
+
+    def verify(probe):
+        events.append("verify")
+        if failure == "probe":
+            raise RuntimeError("probe")
+
+    def native():
+        assert namespace["group"].device_group is native_group
+        assert (probes[0]() is not None) == (mode == "retain")
+        events.append("native")
+        namespace["graph"] = SimpleNamespace(reset=lambda: events.append("native_reset"))
+        if failure == "native":
+            raise RuntimeError("native")
+
+    def sync():
+        events.append("synchronize")
+        if failure == "synchronize":
+            raise RuntimeError("synchronize")
+
+    namespace = dict(
+        SimpleNamespace=SimpleNamespace, world=8, rank=0, stream=stream,
+        dcp_transport=native_group, probe_variant=SimpleNamespace(mode=mode, group=selected),
+        DeviceCommunicatorBase=SimpleNamespace(all_gather=lambda group, packet, dim: (group.device_group, packet, dim)),
+        CaptureProbe=Probe, _verify_dcp_probe=verify, verify_probe=True,
+        torch=SimpleNamespace(npu=SimpleNamespace(synchronize=sync)),
+        probe=None, graph=None, native=native,
+    )
+    tree = ast.parse(SOURCE.read_text(encoding="utf-8"))
+    test = next(node for node in tree.body if getattr(node, "name", "") == "test_counted_sfa_dcp_collectives_replay")
+    scope = next(node for node in test.body if isinstance(node, ast.Try))
+    setup = [node for node in scope.body if (
+        isinstance(node, ast.FunctionDef) and node.name == "wrap_group"
+        or isinstance(node, ast.Assign) and ast.unparse(node.targets[0]) == "group"
+        or isinstance(node, ast.If) and ast.unparse(node.test) == "verify_probe"
+    )]
+    assert len(setup) == 3
+    body = ast.Try(body=setup + ast.parse("native()").body, handlers=[], orelse=[], finalbody=scope.finalbody)
+    code = compile(ast.fix_missing_locations(ast.Module(body=[body], type_ignores=[])), str(SOURCE), "exec")
+    if failure:
+        with pytest.raises(RuntimeError, match=failure):
+            exec(code, namespace)
+    else:
+        exec(code, namespace)
+    expected = ["verify"] + ([] if failure == "probe" else ["native"]) + ["synchronize"]
+    if failure != "synchronize":
+        if failure != "probe":
+            expected.append("native_reset")
+        if mode == "retain" or failure == "probe":
+            expected.append("probe_reset")
+    assert events == expected
 
 
 @pytest.mark.parametrize("mode", ["off", "control", "local", "gloo"])

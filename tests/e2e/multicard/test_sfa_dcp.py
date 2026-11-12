@@ -178,31 +178,50 @@ def dcp_replay_fence(request, dcp_world):
         dist.destroy_process_group(control)
 
 
+@pytest.fixture
+def probe_variant(request, dcp_transport):
+    mode = request.param
+    # Keep creation and lifetime of the extra group identical in these two
+    # arms; only the probe's gather/exchange communicator changes. The failure
+    # agreement still uses WORLD, and the native graph uses dcp_transport.
+    separate = _dcp_test_group("group-inherit") if mode in ("group-control", "group-isolated") else None
+    try:
+        yield SimpleNamespace(mode=mode, group=separate if mode == "group-isolated" else dcp_transport)
+    finally:
+        if separate is not None:
+            dist.destroy_process_group(separate)
+
+
 @torch.inference_mode()
-@pytest.mark.parametrize("overlap,trace_stages,verify_probe,dcp_transport,dcp_replay_fence", [
-    pytest.param(False, False, False, "fixed", "off", id="False"),
-    pytest.param(True, False, True, "fixed", "off", id="True"),
-    pytest.param(True, True, True, "fixed", "off", id="True-trace"),
-    pytest.param(False, True, True, "fixed", "off", id="serial-after-probe"),
-    pytest.param(True, True, False, "fixed", "off", id="overlap-without-probe"),
-    pytest.param(True, True, True, "alltoallv", "off", id="True-trace-alltoallv"),
-    pytest.param(True, False, True, "alltoallv", "off", id="True-alltoallv"),
+@pytest.mark.parametrize("overlap,trace_stages,verify_probe,dcp_transport,dcp_replay_fence,probe_variant", [
+    pytest.param(False, False, False, "fixed", "off", "release", id="False"),
+    pytest.param(True, False, True, "fixed", "off", "release", id="True"),
+    pytest.param(True, True, True, "fixed", "off", "release", id="True-trace"),
+    pytest.param(False, True, True, "fixed", "off", "release", id="serial-after-probe"),
+    pytest.param(True, True, False, "fixed", "off", "release", id="overlap-without-probe"),
+    pytest.param(True, True, True, "alltoallv", "off", "release", id="True-trace-alltoallv"),
+    pytest.param(True, False, True, "alltoallv", "off", "release", id="True-alltoallv"),
     # Pair the HOST candidate with an otherwise identical separate group. A
     # WORLD-versus-HOST comparison alone also changes communicator placement.
-    pytest.param(True, True, True, "group-inherit", "off", id="True-trace-dcp-inherit"),
-    pytest.param(True, True, True, "group-host", "off", id="True-trace-dcp-host"),
-    pytest.param(True, False, True, "group-host", "off", id="True-dcp-host"),
-    pytest.param(True, True, True, "fixed", "control", id="True-trace-replay-control"),
-    pytest.param(True, True, True, "fixed", "local", id="True-trace-replay-local"),
-    pytest.param(True, True, True, "fixed", "gloo", id="True-trace-replay-gloo"),
-    pytest.param(True, False, True, "fixed", "gloo", id="True-replay-gloo"),
+    pytest.param(True, True, True, "group-inherit", "off", "release", id="True-trace-dcp-inherit"),
+    pytest.param(True, True, True, "group-host", "off", "release", id="True-trace-dcp-host"),
+    pytest.param(True, False, True, "group-host", "off", "release", id="True-dcp-host"),
+    pytest.param(True, True, True, "fixed", "control", "release", id="True-trace-replay-control"),
+    pytest.param(True, True, True, "fixed", "local", "release", id="True-trace-replay-local"),
+    pytest.param(True, True, True, "fixed", "gloo", "release", id="True-trace-replay-gloo"),
+    pytest.param(True, False, True, "fixed", "gloo", "release", id="True-replay-gloo"),
     # If CaptureProbe fails first, use BOTH no-probe arms to isolate native
     # replay. Never swallow a startup probe failure and call it a native pass.
-    pytest.param(True, True, False, "fixed", "control", id="without-probe-replay-control"),
-    pytest.param(True, True, False, "fixed", "gloo", id="without-probe-replay-gloo"),
-], indirect=["dcp_transport", "dcp_replay_fence"])
+    pytest.param(True, True, False, "fixed", "control", "release", id="without-probe-replay-control"),
+    pytest.param(True, True, False, "fixed", "gloo", "release", id="without-probe-replay-gloo"),
+    # Isolate the earlier probe from retrieval overlap in the native graph.
+    pytest.param(False, True, False, "fixed", "off", "release", id="serial-without-probe"),
+    pytest.param(False, True, True, "fixed", "off", "retain", id="serial-retained-probe"),
+    pytest.param(False, True, True, "fixed", "off", "group-control", id="serial-probe-group-control"),
+    pytest.param(False, True, True, "fixed", "off", "group-isolated", id="serial-probe-group-isolated"),
+], indirect=["dcp_transport", "dcp_replay_fence", "probe_variant"])
 def test_counted_sfa_dcp_collectives_replay(
-    overlap, trace_stages, verify_probe, monkeypatch, dcp_world, dcp_transport, dcp_replay_fence,
+    overlap, trace_stages, verify_probe, monkeypatch, dcp_world, dcp_transport, dcp_replay_fence, probe_variant,
 ):
     world = dcp_world
     import vllm_ascend.vllm_ascend_C  # noqa: F401
@@ -210,13 +229,15 @@ def test_counted_sfa_dcp_collectives_replay(
 
     comparisons = []
     graph = None
+    probe = None
     try:
         rank = dist.get_rank()
         if trace_stages and rank == 0:
             print(
                 f"DCP diagnostic runtime: torch={torch.__version__} "
                 f"torch_npu={torch_npu.__version__} "
-                f"git={getattr(getattr(torch_npu, 'version', None), 'git_version', 'unknown')}",
+                f"git={getattr(getattr(torch_npu, 'version', None), 'git_version', 'unknown')} "
+                f"probe_variant={probe_variant.mode}",
                 flush=True,
             )
         rows, heads = 2, 64
@@ -237,15 +258,22 @@ def test_counted_sfa_dcp_collectives_replay(
 
         from vllm.distributed.device_communicators.base_device_communicator import DeviceCommunicatorBase
 
-        group = SimpleNamespace(device_group=dcp_transport, rank_in_group=rank, world_size=world)
-        group.all_gather = lambda packet, dim: DeviceCommunicatorBase.all_gather(group, packet, dim)
+        def wrap_group(device_group):
+            group = SimpleNamespace(device_group=device_group, rank_in_group=rank, world_size=world)
+            group.all_gather = lambda packet, dim: DeviceCommunicatorBase.all_gather(group, packet, dim)
+            return group
+
+        group = wrap_group(dcp_transport)
         edge = None
         if overlap or verify_probe:
             from vllm_ascend.compilation.sfa_retrieval_overlap import CaptureProbe, ProbeCopy, RetrievalEdge
 
             stream = torch.npu.Stream()
         if verify_probe:
-            _verify_dcp_probe(CaptureProbe(stream, "npu", group))
+            probe = CaptureProbe(stream, "npu", wrap_group(probe_variant.group))
+            _verify_dcp_probe(probe)
+            if probe_variant.mode != "retain":
+                probe = None
         if overlap:
             source = torch.zeros(64, device="npu")
             destination = torch.empty_like(source)
@@ -306,8 +334,13 @@ def test_counted_sfa_dcp_collectives_replay(
             if dcp_replay_fence is not None:
                 dcp_replay_fence()
     finally:
-        if graph is not None:
+        if graph is not None or probe is not None:
             torch.npu.synchronize()
+        if graph is not None:
             graph.reset()
+        if probe is not None:
+            # Retain every probe operand and its graph until native replay and
+            # readbacks finish. Reset before the fixture destroys its group.
+            probe.graph.reset()
     # A rank-local parity failure must never strand peers in a later replay.
     _assert_dcp_comparisons(comparisons)
