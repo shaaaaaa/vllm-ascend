@@ -51,7 +51,7 @@ def _verify_dcp_probe(probe):
         if not str(caught).startswith("shared retrieval multi-stream capture probe failed"):
             raise
         error = caught
-    # Like server startup, agree after every probe replay and before entering
+    # Agree after all diagnostic probe replays and before entering
     # another captured collective. A rank-local parity failure must not leave
     # successful peers waiting in the attention test's next all-gather.
     failed = torch.tensor([int(error is not None)], dtype=torch.int32, device="npu")
@@ -266,7 +266,8 @@ def test_counted_sfa_dcp_collectives_replay(
         group = wrap_group(dcp_transport)
         edge = None
         if overlap or verify_probe:
-            from vllm_ascend.compilation.sfa_retrieval_overlap import CaptureProbe, ProbeCopy, RetrievalEdge
+            from tests.sfa_capture_probe import CaptureProbe, ProbeCopy
+            from vllm_ascend.compilation.sfa_retrieval_overlap import RetrievalEdge
 
             stream = torch.npu.Stream()
         if verify_probe:

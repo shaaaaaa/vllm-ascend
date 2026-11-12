@@ -15,7 +15,7 @@ sys.path.insert(0, str(ROOT))
 
 
 def test_native_capture_contract():
-    from vllm_ascend.compilation.sfa_retrieval_overlap import CaptureProbe
+    from tests.sfa_capture_probe import CaptureProbe
     torch.npu.set_device(0)
     stream = torch.npu.Stream()
     probes = [CaptureProbe(stream, torch.device("npu:0")) for _ in range(2)]
