@@ -39,6 +39,9 @@
 #ifndef RESIDENT_EXPERIMENT_QUERY_MEMBERSHIP
 #define RESIDENT_EXPERIMENT_QUERY_MEMBERSHIP 0
 #endif
+#ifndef RESIDENT_FREE_SLOT_FIRST
+#define RESIDENT_FREE_SLOT_FIRST 0
+#endif
 
 namespace {
 
@@ -2018,9 +2021,18 @@ private:
         // prefix that can actually be paired with a miss. Each UB segment
         // remains 32-byte aligned for DataCopy/DataCopyPad; the small gaps
         // are covered by packedElements' per-shard padding allowance.
+#if RESIDENT_FREE_SLOT_FIRST
+        ASSERT(totalOldCount <= capacity_);
+        const uint32_t unused = capacity_ - totalOldCount;
+        const uint32_t freshCount = totalMissCount < unused ? totalMissCount : unused;
+        const uint32_t evictionCount = totalMissCount - freshCount;
+        ASSERT(evictionCount <= totalEvictableCount);
+        uint32_t remainingEvictions = evictionCount;
+#else
         uint32_t remainingEvictions = totalMissCount < totalEvictableCount
             ? totalMissCount
             : totalEvictableCount;
+#endif
         for (uint32_t shard = 0; shard < shardCount_; ++shard) {
             const uint32_t selectedCount =
                 evictableCounts[shard] < remainingEvictions
@@ -2051,10 +2063,12 @@ private:
             evictableEnd = evictableOffset + selectedCount;
             remainingEvictions -= selectedCount;
         }
+#if !RESIDENT_FREE_SLOT_FIRST
         const uint32_t totalSelectedEvictCount =
             totalMissCount < totalEvictableCount
             ? totalMissCount
             : totalEvictableCount;
+#endif
         Sync<AscendC::HardEvent::MTE2_S>();
         Sync<AscendC::HardEvent::V_S>();
 
@@ -2071,7 +2085,11 @@ private:
                      localMiss < shardMissCount;
                      ++localMiss) {
                     int16_t slot;
+#if RESIDENT_FREE_SLOT_FIRST
+                    if (globalMiss >= freshCount) {
+#else
                     if (globalMiss < totalSelectedEvictCount) {
+#endif
                         while (
                             evictableShard < shardCount_ &&
                             evictableIndex >=
@@ -2084,6 +2102,11 @@ private:
                                 + evictableIndex);
                         ++evictableIndex;
                     } else {
+#if RESIDENT_FREE_SLOT_FIRST
+                        // Consume the unused dense-prefix tail before replacing
+                        // old tokens. Hit slots and miss ordering are unchanged.
+                        slot = static_cast<int16_t>(totalOldCount + globalMiss);
+#else
                         // Resident allocation preserves a dense occupied
                         // prefix. Every old entry not present in the current
                         // union is emitted above as an evictable slot; after
@@ -2094,6 +2117,7 @@ private:
                             totalOldCount
                             + globalMiss
                             - totalSelectedEvictCount);
+#endif
                     }
                     const uint32_t position = static_cast<uint32_t>(
                         missPositions.GetValue(

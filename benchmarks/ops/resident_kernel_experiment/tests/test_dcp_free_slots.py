@@ -8,7 +8,7 @@ import benchmark_dcp as benchmark
 import pytest
 import torch
 from dcp_workload import CAPACITY, TOPK, cold_case, dcp_reference, make_trace, trace_metadata
-from generate_sources import SOURCE, build_sources, free_slot_first
+from generate_sources import SOURCE, build_sources
 from resident_experiment import Case, _put_state, _state, assert_result
 
 
@@ -31,13 +31,13 @@ def test_dcp_build_changes_only_finalize_and_keeps_safety_guards():
         assert "#define RESIDENT_EXPERIMENT_SKIP_UNCHANGED 0" in source
         for feature in ("VECTOR_INTERSECTION", "VECTOR_STATE", "QUERY_MEMBERSHIP"):
             assert f"#define RESIDENT_EXPERIMENT_{feature} 1" in source
-        assert (free_slot_first(classes) if name == "dcp_new_finalize.cpp" else classes) in source
+        assert classes in source
+        free_first = int(name == "dcp_new_finalize.cpp")
+        assert f"#define RESIDENT_FREE_SLOT_FIRST {free_first}" in source
         assert "oldCount + currentCount <= kStateWidth" in source
     launch = sources["dcp_update.cpp"].split("void resident_experiment_dcp_update", 1)[1]
     assert list(map(int, re.findall(r"a\.tensors\[(\d+)\]", launch))) == [0, 3, 4, 5, 12, 6, 7, 8, 9, 10, 11, 20, 21]
     assert "a.dcpBits,\n        a.dcpRank" in launch
-    with pytest.raises(ValueError, match="no longer matches"):
-        free_slot_first(original.replace("if (globalMiss < totalSelectedEvictCount)", "if (changed)"))
 
 
 @pytest.mark.parametrize("overlap", [0, 0.333, 0.9, 1])

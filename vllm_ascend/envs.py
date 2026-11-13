@@ -226,6 +226,12 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_DSA_RESIDENT_QUERY_MEMBERSHIP": lambda: bool(
         int(os.getenv("VLLM_ASCEND_DSA_RESIDENT_QUERY_MEMBERSHIP", "0"))
     ),
+    # DCP compact resident slots: 0 (default) evicts unselected old tokens first;
+    # 1 fills unused slots first. Does not affect DCP=1 or resident-only loads.
+    # Non-sensitive; fixed before capture. Rebuild native ops and restart workers.
+    "VLLM_ASCEND_DSA_DCP_FREE_SLOT_FIRST": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_DSA_DCP_FREE_SLOT_FIRST", "0"))
+    ),
     # Value shards assigned to each MTP row by the sorted resident planner.
     # The request-wide shard count is MTP * shards_per_row. The value must be
     # a power of two in [1, 4]. Read once during model initialization so graph

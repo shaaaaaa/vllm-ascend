@@ -96,7 +96,8 @@ endif()
 # Generate explicit entrypoints: the AscendC scanner must see kernel definitions.
 if(NOT SOC_VERSION MATCHES "ascend310p.*")
     include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/resident_exact.cmake)
-    list(APPEND VLLM_ASCEND_CUSTOM_OP ${RESIDENT_EXACT_SOURCE} ${RESIDENT_MEMBERSHIP_SOURCE} ${RESIDENT_DCP_SOURCE})
+    list(APPEND VLLM_ASCEND_CUSTOM_OP ${RESIDENT_EXACT_SOURCE} ${RESIDENT_MEMBERSHIP_SOURCE}
+        ${RESIDENT_DCP_SOURCE} ${RESIDENT_DCP_FREE_SLOTS_SOURCE})
 endif()
 
 ascendc_library(vllm_ascend_kernels SHARED

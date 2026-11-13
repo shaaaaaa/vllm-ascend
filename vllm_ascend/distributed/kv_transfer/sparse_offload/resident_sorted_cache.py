@@ -43,6 +43,12 @@ def configure_resident_kernels() -> bool:
     ):
         raise RuntimeError("Rebuild the vLLM-Ascend serving extension to use resident query membership")
     configure(envs.VLLM_ASCEND_DSA_RESIDENT_EXACT_KERNELS)
+    configure_dcp = getattr(torch.ops._C_ascend, "configure_dsa_resident_dcp_free_slots", None)
+    free_slots = envs.VLLM_ASCEND_DSA_DCP_FREE_SLOT_FIRST
+    if configure_dcp is not None:
+        configure_dcp(free_slots)
+    elif free_slots:
+        raise RuntimeError("Rebuild the vLLM-Ascend serving extension to use DCP free-slot-first residency")
     return query_membership
 
 

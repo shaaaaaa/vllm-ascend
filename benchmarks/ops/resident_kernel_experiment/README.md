@@ -9,12 +9,13 @@ LMCache imports. Do not use this benchmark to claim a serving TPOT/TTFT gain.
 
 ## DCP free-slot-first comparison
 
-This separate experiment is based on `feat/decoder-dcp-sharded-h2d` at
-`451b4571b`. It leaves production sources and serving dispatch unchanged.
+This experiment is based on `feat/decoder-dcp-sharded-h2d` at `451b4571b`.
+The standalone executable does not change serving configuration.
 The `dcp` build profile generates four entry points from the production source:
 the existing DCP union and membership update, the original finalizer, and a
 finalizer that consumes unused slots before evicting unselected residents.
-Source substitutions must match exactly; source drift stops generation.
+Both the benchmark and serving extension compile the same policy using
+`RESIDENT_FREE_SLOT_FIRST`; there is no separately maintained kernel copy.
 Existing vector limits and scalar fallbacks are preserved.
 
 Both policies use **4,096 scratch slots per request per simulated DCP rank**,
@@ -99,7 +100,46 @@ python3 "$EXP/benchmark_dcp.py" --cpu-only --requests 1 --steps 128 \
 
 CPU results contain no kernel timings and do not qualify native correctness or
 performance. Run the native checks and benchmark on the target NPU before
-considering integration.
+enabling the policy in serving.
+
+### Optional serving integration
+
+The serving extension now includes this policy behind a **default-off** switch:
+
+```bash
+export VLLM_ASCEND_DSA_DCP_FREE_SLOT_FIRST=1
+```
+
+Rebuild/install the **vLLM-Ascend serving native extension** using the deployment's
+usual build procedure, then restart all decoder workers with the same setting.
+Building only `build-dcp` above does not update the serving extension. Enabling
+the switch against an older extension produces a rebuild error at initialization.
+Use `0` or unset the variable to retain the old policy. Selection is frozen
+before capture; changing it requires a worker restart.
+
+The switch affects DCP compact-resident planning in both eager and graph paths,
+including shared resident plans and retrieval overlap. It does not change
+DCP=1, full resident loads, scratch size, global Top-K selection, DCP ownership,
+live-tail mapping, generation invalidation, or the H2D API. The existing loader
+receives the resulting miss IDs/counts/destination slots. All three planner
+stages remain; retained history can increase union/update cost. No collective,
+device readback or synchronization is added to graph replay. Eager dispatch
+resolves a frozen native function pointer; environment lookup is startup-only.
+
+Run actual serving-extension regressions in separate processes for both policies
+(using an idle NPU, after rebuilding):
+
+```bash
+TEST=tests/e2e/nightly/single_node/ops/singlecard_ops/test_dcp_free_slots_serving.py
+VLLM_ASCEND_DSA_DCP_FREE_SLOT_FIRST=0 python3 -m pytest --noconftest -o addopts= -q "$TEST"
+VLLM_ASCEND_DSA_DCP_FREE_SLOT_FIRST=1 python3 -m pytest --noconftest -o addopts= -q "$TEST"
+```
+
+These exercise serving wrappers, stateful graph replay, DCP 2/4/8, skewed
+occupancy, mixed free allocation/eviction, generation reset, padding, live
+indices, and unchanged DCP=1 behavior. They do not replace distributed serving
+qualification. Compare identical requests under `0` and `1`, keeping HCCL mode,
+graphs, cache warm state and sampling fixed; measure actual H2D and TPOT together.
 
 ## What changes
 

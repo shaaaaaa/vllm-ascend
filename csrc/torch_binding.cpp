@@ -70,6 +70,9 @@ namespace resident_dcp {
 extern decltype(::vllm_ascend::dsa_resident_sharded_union_impl) dsa_resident_sharded_union_impl;
 extern decltype(::vllm_ascend::dsa_resident_sorted_plan_impl) dsa_resident_sorted_plan_impl;
 }
+namespace resident_dcp_free_slots {
+extern decltype(::vllm_ascend::dsa_resident_sorted_plan_impl) dsa_resident_sorted_plan_impl;
+}
 
 namespace {
 struct ResidentLaunchers {
@@ -93,6 +96,16 @@ const ResidentLaunchers exact_resident_launchers = {
 // Frozen before capture; eager launches capture a function pointer, graph replay
 // contains only the selected device kernels. No environment access in decode.
 std::atomic<const ResidentLaunchers*> resident_launchers{nullptr};
+using ResidentPlan = decltype(&dsa_resident_sorted_plan_impl);
+std::atomic<ResidentPlan> dcp_resident_plan{nullptr};
+ResidentPlan DcpResidentPlan() {
+    auto selected = dcp_resident_plan.load(std::memory_order_acquire);
+    if (!selected) {
+        dcp_resident_plan.compare_exchange_strong(selected, &resident_dcp::dsa_resident_sorted_plan_impl);
+        if (!selected) selected = &resident_dcp::dsa_resident_sorted_plan_impl;
+    }
+    return selected;
+}
 const ResidentLaunchers& ResidentKernels() {
     auto* selected = resident_launchers.load(std::memory_order_acquire);
     if (!selected) {
@@ -109,6 +122,15 @@ void configure_dsa_resident_exact_kernels(bool enabled) {
     const bool configured = resident_launchers.compare_exchange_strong(previous, desired);
     TORCH_CHECK(configured || previous == desired,
                 "Resident kernel selection is frozen; restart the worker to change it");
+}
+
+void configure_dsa_resident_dcp_free_slots(bool enabled) {
+    const auto desired = enabled ? &resident_dcp_free_slots::dsa_resident_sorted_plan_impl
+                                 : &resident_dcp::dsa_resident_sorted_plan_impl;
+    ResidentPlan previous = nullptr;
+    const bool configured = dcp_resident_plan.compare_exchange_strong(previous, desired);
+    TORCH_CHECK(configured || previous == desired,
+                "DCP resident slot policy is frozen; restart the worker to change it");
 }
 
 void swap_blocks_impl(torch::Tensor& src, torch::Tensor& dst,
@@ -1967,7 +1989,7 @@ static at::Tensor resident_sorted_plan_common_(
         : (fused_remap
             ? "npu_dsa_resident_sorted_plan_"
             : "npu_dsa_resident_sorted_plan_no_remap_")));
-    auto impl = Dcp ? &resident_dcp::dsa_resident_sorted_plan_impl :
+    auto impl = Dcp ? DcpResidentPlan() :
         &resident_membership::dsa_resident_sorted_plan_impl;
     if constexpr (!QueryMembership) {
         const auto& kernels = ResidentKernels();
@@ -3838,6 +3860,8 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
 {
     ops.def("configure_dsa_resident_exact_kernels(bool enabled) -> ()",
             &vllm_ascend::configure_dsa_resident_exact_kernels);
+    ops.def("configure_dsa_resident_dcp_free_slots(bool enabled) -> ()",
+            &vllm_ascend::configure_dsa_resident_dcp_free_slots);
 
     // vLLM-Ascend custom ops
     // Gemma RmsNorm

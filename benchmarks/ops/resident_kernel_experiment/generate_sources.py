@@ -40,50 +40,11 @@ SCALARS = {
 }
 
 
-def free_slot_first(source: str) -> str:
-    """Change only standalone finalize policy; fail closed on source drift."""
-    replacements = (
-        ("""        uint32_t remainingEvictions = totalMissCount < totalEvictableCount
-            ? totalMissCount
-            : totalEvictableCount;""", """        ASSERT(totalOldCount <= capacity_);
-        const uint32_t unused = capacity_ - totalOldCount;
-        const uint32_t freshCount = totalMissCount < unused ? totalMissCount : unused;
-        const uint32_t evictionCount = totalMissCount - freshCount;
-        ASSERT(evictionCount <= totalEvictableCount);
-        uint32_t remainingEvictions = evictionCount;"""),
-        ("""        const uint32_t totalSelectedEvictCount =
-            totalMissCount < totalEvictableCount
-            ? totalMissCount
-            : totalEvictableCount;""", ""),
-        ("if (globalMiss < totalSelectedEvictCount)", "if (globalMiss >= freshCount)"),
-        ("""                        // Resident allocation preserves a dense occupied
-                        // prefix. Every old entry not present in the current
-                        // union is emitted above as an evictable slot; after
-                        // pooling all shards, any remaining miss grows the
-                        // prefix from totalOldCount. Therefore the global
-                        // candidate count is always capacity - hitCount.
-                        slot = static_cast<int16_t>(
-                            totalOldCount
-                            + globalMiss
-                            - totalSelectedEvictCount);""",
-         """                        // Consume the unused dense-prefix tail before replacing
-                        // old tokens. Hit slots and miss ordering are unchanged.
-                        slot = static_cast<int16_t>(totalOldCount + globalMiss);"""),
-    )
-    for old, new in replacements:
-        if source.count(old) != 1:
-            raise ValueError("Standalone free-slot policy no longer matches production finalize")
-        source = source.replace(old, new)
-    return source
-
-
 def generate(source: str, header: Path, *, variants=(("baseline", 0), ("optimized", 1)), kernels=None,
              compact=False, sharded=False, vector_union=False, union_stop=0, vector_intersection=False,
              vector_state=False, query_membership=False, dcp=False, free_first=False) -> dict[str, str]:
-    if free_first:
-        if not dcp:
-            raise ValueError("free-slot-first is an isolated DCP experiment")
-        source = free_slot_first(source)
+    if free_first and not dcp:
+        raise ValueError("free-slot-first requires the DCP variant")
     marker = 'extern "C" __global__ __aicore__ void\n'
     classes, separator, _ = source.partition(marker)
     if not separator:
@@ -124,6 +85,7 @@ def generate(source: str, header: Path, *, variants=(("baseline", 0), ("optimize
             )
             output[f"{variant}_{stage}.cpp"] = (
                 "// Generated; do not edit. Kernel algorithm is copied verbatim.\n"
+                f"#define RESIDENT_FREE_SLOT_FIRST {int(free_first)}\n"
                 f"#define RESIDENT_EXPERIMENT_SKIP_UNCHANGED {enabled}\n"
                 f"#define RESIDENT_EXPERIMENT_COMPACT_REMAP {int(compact)}\n"
                 f"#define RESIDENT_EXPERIMENT_VECTOR_UNION {int(vector_union)}\n"
