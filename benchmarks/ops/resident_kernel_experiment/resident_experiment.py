@@ -249,7 +249,7 @@ def make_case(requests=2, mtp=2, shards_per_row=4, hit_rate=1.0, scenario="norma
     return case
 
 
-def reference(case: Case) -> tuple[Case, dict]:
+def reference(case: Case, *, free_first: bool = False) -> tuple[Case, dict]:
     """Set/dictionary oracle; independent of the AscendC merge implementation."""
     if case["topk"].device.type != "cpu":
         raise ValueError("reference expects CPU tensors")
@@ -270,8 +270,12 @@ def reference(case: Case) -> tuple[Case, dict]:
                 result["topk"][i].zero_()
         order = lambda token: (token % case.shards, token)
         misses = sorted(selected - old.keys(), key=order)
-        evicted = sorted(old.keys() - selected, key=order)[: len(misses)]
-        targets = [old[t] for t in evicted] + list(range(len(old), len(old) + len(misses) - len(evicted)))
+        fresh = min(len(misses), case.capacity - len(old)) if free_first else 0
+        evicted = sorted(old.keys() - selected, key=order)[: len(misses) - fresh]
+        if free_first:
+            targets = list(range(len(old), len(old) + fresh)) + [old[t] for t in evicted]
+        else:
+            targets = [old[t] for t in evicted] + list(range(len(old), len(old) + len(misses) - len(evicted)))
         evicted_set = set(evicted)
         updated = {t: slot for t, slot in old.items() if t not in evicted_set}
         updated.update(zip(misses, targets, strict=True))
@@ -393,7 +397,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("build_dir", type=Path)
     parser.add_argument("soc")
-    parser.add_argument("--profile", choices=("full", "membership"), default="full")
+    parser.add_argument("--profile", choices=("full", "membership", "dcp"), default="full")
     args = parser.parse_args()
     (args.build_dir / "build-info.json").write_text(
         json.dumps(

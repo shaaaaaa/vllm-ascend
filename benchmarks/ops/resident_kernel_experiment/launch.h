@@ -3,9 +3,10 @@
 #include <cstdint>
 
 struct ResidentLaunch {
-    void* tensors[20];
+    void* tensors[22];
     uint32_t requests, stateRows, dummyBase, mtp, shards, capacity;
     uint32_t blockSize, blockTableWidth, cores;
+    uint32_t dcpBits, dcpRank;
 };
 
 constexpr int kExactCombinedVariant = 8;

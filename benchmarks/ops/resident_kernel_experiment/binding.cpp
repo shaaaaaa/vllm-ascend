@@ -12,9 +12,18 @@
 
 namespace {
 void run(at::TensorList tensors, int64_t dummyBase, int64_t blockSize,
-         int64_t variant, int64_t stage)
+         int64_t variant, int64_t stage, int64_t dcpSize = 1, int64_t dcpRank = 0)
 {
-    TORCH_CHECK(tensors.size() == 20, "expected 20 resident tensors");
+    const bool dcp = dcpSize != 1;
+    TORCH_CHECK(tensors.size() == (dcp ? 22 : 20), "unexpected resident tensor count");
+#ifdef RESIDENT_EXPERIMENT_DCP_ONLY
+    TORCH_CHECK((dcpSize == 2 || dcpSize == 4 || dcpSize == 8) &&
+                dcpRank >= 0 && dcpRank < dcpSize && blockSize == 128 &&
+                variant >= 0 && variant <= 1 && stage >= 0 && stage <= 3,
+                "DCP profile requires size 2/4/8, a valid rank, block 128, policy 0/1 and stage 0..3");
+#else
+    TORCH_CHECK(!dcp, "rebuild with the dcp profile for run_dcp_");
+#endif
     const auto device = tensors[0].device();
     TORCH_CHECK(tensors[0].is_privateuseone(), "resident experiment requires NPU tensors");
     TORCH_CHECK(stage >= 0 && stage <= 7, "stage must be 0..7");
@@ -55,7 +64,7 @@ void run(at::TensorList tensors, int64_t dummyBase, int64_t blockSize,
         at::kInt, at::kInt, at::kInt, at::kInt, at::kShort, at::kInt,
         at::kInt, at::kLong, at::kInt, at::kShort, at::kInt, at::kLong,
         at::kShort, at::kInt, at::kShort, at::kShort, at::kInt, at::kInt,
-        at::kLong, at::kInt};
+        at::kLong, at::kInt, at::kInt, at::kInt};
     ResidentLaunch a{};
     for (size_t i = 0; i < tensors.size(); ++i) {
         TORCH_CHECK(tensors[i].device() == device && tensors[i].is_contiguous() &&
@@ -78,6 +87,9 @@ void run(at::TensorList tensors, int64_t dummyBase, int64_t blockSize,
     shape(10, {stateRows, shards, 16}); shape(11, {stateRows, 8});
     shape(16, {requests, capacity}); shape(17, {requests, 16});
     shape(18, {requests, capacity}); shape(19, {requests, tableWidth});
+    if (dcp) {
+        shape(20, {requests}); shape(21, {requests * mtp, 16});
+    }
     // The harness requires separate buffers. Reject aliases that could let one
     // stage overwrite another's input or defeat cross-core single-writer rules.
     for (size_t i = 0; i < tensors.size(); ++i) {
@@ -96,6 +108,8 @@ void run(at::TensorList tensors, int64_t dummyBase, int64_t blockSize,
     a.requests = requests; a.stateRows = stateRows; a.dummyBase = dummyBase;
     a.mtp = mtp; a.shards = shards; a.capacity = capacity;
     a.blockSize = blockSize; a.blockTableWidth = tableWidth; a.cores = cores;
+    for (int64_t size = dcpSize; size > 1; size >>= 1) ++a.dcpBits;
+    a.dcpRank = dcpRank;
     auto stream = c10_npu::getCurrentNPUStream().stream();
     // Use the same task-queue/stream path as production. A raw ctypes launch
     // could overtake queued torch-npu copies even if it uses the same stream.
@@ -113,7 +127,16 @@ void run(at::TensorList tensors, int64_t dummyBase, int64_t blockSize,
 TORCH_LIBRARY(resident_experiment, m) {
     m.def("run_(Tensor(a!)[] tensors, int dummy_base, int block_size, "
           "int variant=0, int stage=0) -> ()");
+    m.def("run_dcp_(Tensor(a!)[] tensors, int dummy_base, int dcp_size, int dcp_rank, "
+          "int variant=0, int stage=0) -> ()");
 }
 TORCH_LIBRARY_IMPL(resident_experiment, PrivateUse1, m) {
-    m.impl("run_", &run);
+    m.impl("run_", [](at::TensorList tensors, int64_t dummy, int64_t block, int64_t variant, int64_t stage) {
+        run(tensors, dummy, block, variant, stage);
+    });
+    m.impl("run_dcp_", [](at::TensorList tensors, int64_t dummy, int64_t world, int64_t rank,
+                          int64_t variant, int64_t stage) {
+        TORCH_CHECK(world > 1, "run_dcp_ requires DCP > 1");
+        run(tensors, dummy, 128, variant, stage, world, rank);
+    });
 }

@@ -18,7 +18,7 @@ def trace(variant, iterations=3):
 
 @pytest.mark.parametrize("variant", [
     "baseline", "optimized", "compact_remap", "sharded_finalize", "combined", "vector_union",
-    "exact_combined", "query_membership",
+    "exact_combined", "query_membership", "dcp_old", "dcp_new",
 ])
 def test_device_durations_exclude_host_floor(variant):
     result = parse_trace(trace(variant), variant, "full", 3)

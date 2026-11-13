@@ -1,6 +1,22 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "launch.h"
 
+#ifdef RESIDENT_EXPERIMENT_DCP_ONLY
+void resident_experiment_dcp_union(void*, const ResidentLaunch&);
+void resident_experiment_dcp_update(void*, const ResidentLaunch&);
+void resident_experiment_dcp_old_finalize(void*, const ResidentLaunch&);
+void resident_experiment_dcp_new_finalize(void*, const ResidentLaunch&);
+
+void resident_experiment_run_variant(void* stream, const ResidentLaunch& args, int variant, int stage)
+{
+    if (stage == 0 || stage == 1) resident_experiment_dcp_union(stream, args);
+    if (stage == 0 || stage == 2) {
+        if (variant == 0) resident_experiment_dcp_old_finalize(stream, args);
+        else resident_experiment_dcp_new_finalize(stream, args);
+    }
+    if (stage == 0 || stage == 3) resident_experiment_dcp_update(stream, args);
+}
+#else
 void resident_experiment_baseline_finalize(void*, const ResidentLaunch&);
 void resident_experiment_intersection_union(void*, const ResidentLaunch&);
 void resident_experiment_state_update(void*, const ResidentLaunch&);
@@ -103,3 +119,4 @@ void resident_experiment_run_variant(void* stream, const ResidentLaunch& args, i
     }
 #endif
 }
+#endif

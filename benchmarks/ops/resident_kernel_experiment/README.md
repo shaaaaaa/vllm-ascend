@@ -7,6 +7,100 @@ This is an isolated old/new kernel comparison. It does not enable a new serving
 path, change the serving operator registry, or require model weights, vLLM, or
 LMCache imports. Do not use this benchmark to claim a serving TPOT/TTFT gain.
 
+## DCP free-slot-first comparison
+
+This separate experiment is based on `feat/decoder-dcp-sharded-h2d` at
+`451b4571b`. It leaves production sources and serving dispatch unchanged.
+The `dcp` build profile generates four entry points from the production source:
+the existing DCP union and membership update, the original finalizer, and a
+finalizer that consumes unused slots before evicting unselected residents.
+Source substitutions must match exactly; source drift stops generation.
+Existing vector limits and scalar fallbacks are preserved.
+
+Both policies use **4,096 scratch slots per request per simulated DCP rank**,
+two query rows, Top-K 2,048, block/interleave size 128, and eight internal shards.
+The candidate preserves current hits, grows the dense occupied prefix using
+unused slots, then uses the existing shard-major eviction order when full.
+It adds no planner kernel, workspace, or extra KV capacity. It can make the
+existing union/update more expensive by retaining more history.
+
+Build only the standalone extension, with the same SoC and Python/CANN
+environment as the serving build (for example `ascend910b3` on the 910B3 host):
+
+```bash
+EXP=benchmarks/ops/resident_kernel_experiment
+BUILD="$EXP/build-dcp"
+bash "$EXP/build.sh" "$SOC_VERSION" "$BUILD" dcp
+python3 -m pytest --confcutdir="$EXP/tests" -o addopts= -q \
+  "$EXP/tests/test_dcp_free_slots.py" --resident-build-dir "$BUILD"
+python3 "$EXP/benchmark_dcp.py" --build-dir "$BUILD" \
+  --requests 1 2 4 8 --steps 128 --overlap 0.9 --query-overlap 0.5 \
+  --dcp-size 8 --ranks 0 --output "$BUILD/temporal-0.9.json"
+```
+
+Use an idle NPU. This runs sequentially on one device, without `torchrun`, HCCL,
+model weights, or a server. `--device` selects that NPU; `--ranks 0 1 2 3 4 5 6 7`
+simulates all DCP ranks sequentially. The rank ownership predicate is
+`(global_token // 128) % dcp_size`. Uniform traces are identical across ranks
+and both policies. DCP sizes 2, 4 and 8 are supported.
+
+`--overlap` accepts any value in `[0, 1]` and controls the intersection of each
+query's consecutive Top-K selections. The default `0.9` retains
+`floor(2048 * 0.9) = 1843` tokens per query per step. It is **not** the cache hit
+rate. `--query-overlap` independently controls overlap between target/MTP rows
+within each step. The JSON reports realized global and rank-local overlap,
+trace hashes, miss counts, occupancy and maximum internal-shard occupancy at
+every step. Input token order is shuffled. Non-null block-table pages are
+deliberately reordered.
+
+The default `reuse` workload draws from a fixed `--working-set 32768` within
+`--history 65536`, allowing previously dropped selections to return. Identical
+input traces go to both policies. A `--workload fresh` control never reintroduces
+a dropped token; it can reveal increased metadata cost without miss savings.
+Increase `--history` when a long fresh trace would exhaust unique tokens.
+Invalid or impossible inputs fail explicitly.
+
+For skew and boundary stress, use `--distribution owner-skew` to put all
+selections on the simulated rank, or `--distribution shard-skew` to put them in
+internal shard zero. Both need a sufficiently large eligible working set, e.g.
+`--history 262144 --working-set 32768`. Native regressions additionally cover
+2,047/2,048/2,049 resident entries in one shard, full 4,096-entry state/union,
+mixed fresh allocation plus eviction, generation reset, and padded rows.
+
+Correctness validation captures an instrumented multi-step graph, checks each
+step's remapped queries/miss destinations/counts against the CPU oracle, and
+checks the complete final resident map. Timing uses separate graphs without
+those diagnostic copies. Each policy starts cold; state persists across all
+`--steps` in a trace. State resets happen outside timing, once per replay of the
+whole trace. `--repeats` defaults to 10, `--warmup` to 2; timing order alternates.
+Reported event time is microseconds per **batch planner step**, including the
+input D2D copy needed to restore the in-place Top-K input.
+
+For actual Union/Finalize/Update device-task times, add
+`--profile-dir "$BUILD/profiles-0.9"`. The parser requires exactly one device
+task per stage per step and refuses to substitute host spans. Profiling and
+correctness work are excluded from event timing. Use new output/trace paths
+for another run; existing results are not overwritten.
+
+This measures the **three-kernel planner**, not H2D, attention or serving TPOT.
+It reserves the same BF16 latent-plus-RoPE scratch allocation for both policies,
+but performs no KV transfer. Estimated H2D bytes use misses × 576 × 2 for one
+latent layer; these are not measured bandwidth or transfer savings. The trace
+covers historical scratch selections; live-tail attention integration is
+outside this standalone benchmark. No serving configuration change or package
+installation is needed.
+
+The workload and oracle can also run on a CPU-only development host:
+
+```bash
+python3 "$EXP/benchmark_dcp.py" --cpu-only --requests 1 --steps 128 \
+  --overlap 0.9 --output cpu-reference.json
+```
+
+CPU results contain no kernel timings and do not qualify native correctness or
+performance. Run the native checks and benchmark on the target NPU before
+considering integration.
+
 ## What changes
 
 Select variants with `--variants` and a reference with `--compare-to`. The full

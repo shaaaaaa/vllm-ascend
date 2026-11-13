@@ -14,6 +14,10 @@ def summary(samples):
 
 
 def kernel_names(variant):
+    if variant in ("dcp_old", "dcp_new"):
+        return {"union": "dsa_resident_sharded_union_kernel_dcp",
+                "finalize": f"dsa_resident_sorted_finalize_kernel_{variant}",
+                "update": "dsa_resident_sorted_membership_update_kernel_dcp"}
     union = "optimized" if variant == "optimized" else "baseline"
     finalize = ("dsa_resident_sharded_finalize_worker_kernel_sharded"
                 if variant in ("sharded_finalize", "combined")

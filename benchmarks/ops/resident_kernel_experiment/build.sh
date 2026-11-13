@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 if [[ $# -lt 1 || $# -gt 3 ]]; then
-    echo "Usage: bash $0 SOC_VERSION [BUILD_DIR] [full|membership]" >&2
+    echo "Usage: bash $0 SOC_VERSION [BUILD_DIR] [full|membership|dcp]" >&2
     echo "Use the same SOC_VERSION as your existing vLLM-Ascend build." >&2
     exit 2
 fi
 profile="${3:-full}"
-if [[ "$profile" != full && "$profile" != membership ]]; then
-    echo "Unknown build profile: $profile (choose full or membership)" >&2
+if [[ "$profile" != full && "$profile" != membership && "$profile" != dcp ]]; then
+    echo "Unknown build profile: $profile (choose full, membership or dcp)" >&2
     exit 2
 fi
 : "${ASCEND_HOME_PATH:?Source the installed CANN set_env.sh first}"
