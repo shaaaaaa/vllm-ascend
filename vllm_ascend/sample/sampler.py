@@ -4,6 +4,7 @@ from vllm.triton_utils import HAS_TRITON
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.ops.topk_topp_sampler import TopKTopPSampler
 from vllm.v1.sample.sampler import Sampler
+from vllm.v1.utils import record_function_or_nullcontext
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.sample.penalties import apply_all_penalties
@@ -113,7 +114,8 @@ class AscendTopKTopPSampler(TopKTopPSampler):
         probs = logits.softmax(dim=-1, dtype=torch.float32)
         if get_ascend_config().enable_async_exponential:
             # Add synchronize to prevent synchronize error.
-            self.async_event.synchronize()
+            with record_function_or_nullcontext("decode_wait::sampler_random"):
+                self.async_event.synchronize()
             return probs.div_(self.q).argmax(dim=-1).view(-1), logits_to_return
         return random_sample(probs, generators), logits_to_return
 

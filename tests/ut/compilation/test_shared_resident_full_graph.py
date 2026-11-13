@@ -32,10 +32,12 @@ def test_bounded_group_packs_and_restores_once_per_invocation(explicit, c8, dcp_
         unpack_decode_lanes=Mock(wraps=layout.unpack_decode_lanes),
     )
     methods("vllm_ascend/attention/sfa_v1.py", {"_cross_layer_pre_compute"}, ns)
+    ops = ModuleType("vllm_ascend.ops.triton.sfa_dcp")
+    ops.prepare_sfa_dcp_topk = Mock(side_effect=(
+        host_prepare_topk.__wrapped__() if dcp_enabled else AssertionError("non-DCP must not add Top-K preparation")
+    ))
+    monkeypatch.setitem(sys.modules, ops.__name__, ops)
     if dcp_enabled:
-        ops = ModuleType("vllm_ascend.ops.triton.sfa_dcp")
-        ops.prepare_sfa_dcp_topk = Mock(side_effect=host_prepare_topk.__wrapped__())
-        monkeypatch.setitem(sys.modules, ops.__name__, ops)
         resident_plan = api[1]["prepare_sorted_resident_cache_fused_"]
         finalize = resident_plan.side_effect
 
@@ -130,6 +132,8 @@ def test_bounded_group_packs_and_restores_once_per_invocation(explicit, c8, dcp_
             assert torch.equal(dcp.counts[:, 0], valid.flatten(1).sum(1).int())
             assert (dcp.counts[:, 1:] == -77).all()
             assert ops.prepare_sfa_dcp_topk.call_count == step
+        else:
+            ops.prepare_sfa_dcp_topk.assert_not_called()
         expected = torch.where(valid, frame["raw"] + 100, -1)
         assert torch.equal(first[2], expected) and torch.equal(second[2], expected)
         assert torch.equal(producer.topk_indices_buffer[:tokens], frame["raw"].squeeze(1))

@@ -16,6 +16,7 @@ import torch
 from vllm.forward_context import get_forward_context
 from vllm.logger import logger
 from vllm.triton_utils import HAS_TRITON, triton
+from vllm.v1.utils import record_function_or_nullcontext
 
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.sfa_graph_layout import cp_sequence_lengths, cp_slice
@@ -169,7 +170,8 @@ class AsyncSFAModelRunner(NPUModelRunner):
         # host-source protection. Every ordinary writer enters through here.
         if self._async_host_write is False:
             if self.prepare_inputs_event is not None:
-                self.prepare_inputs_event.synchronize()
+                with record_function_or_nullcontext("decode_wait::input_staging"):
+                    self.prepare_inputs_event.synchronize()
             self._async_host_write = True
 
     def _dummy_run(self, *args, **kwargs):

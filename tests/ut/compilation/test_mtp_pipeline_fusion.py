@@ -35,7 +35,7 @@ class Kernel:
         return launch
 
 
-def owner(n, width=2, position_dtype=torch.int64):
+def owner(n, width=2, position_dtype=torch.int64, dcp=1):
     calls = []
     ns = dict(
         torch=torch,
@@ -48,6 +48,8 @@ def owner(n, width=2, position_dtype=torch.int64):
     for name in ("prepare_next_mtp_tokens_kernel", "prepare_inputs_padded_kernel", "pack_mtp_tokens_positions_kernel"):
         ns[name] = Kernel(name, calls)
     runner = NS(
+        dsa_decoder_dcp=dcp > 1,
+        use_cp=False,
         _fixed_mtp_metadata=(torch.arange(1, n + 1, dtype=torch.int32),),
         actual_seq_lengths_q=list(range(2, 2 * n + 1, 2)),
         attn_state="spec",
@@ -61,7 +63,7 @@ def owner(n, width=2, position_dtype=torch.int64):
         _fixed_mtp_pipeline_ready=True,
         needs_extra_input_slots=False,
         pcp_size=1,
-        dcp_size=1,
+        dcp_size=dcp,
         uses_mrope=False,
         uses_xdrope_dim=0,
         vllm_config=NS(model_config=NS(uses_mrope=False)),
@@ -120,8 +122,9 @@ def prepare(case, fused=True):
 @pytest.mark.parametrize("n", [1, 3, 16, 33])
 @pytest.mark.parametrize("width", [1, 2])
 @pytest.mark.parametrize("position_dtype", [torch.int32, torch.int64])
-def test_fused_preparation_and_packing_match_general_path(n, width, position_dtype):
-    new, old = owner(n, width, position_dtype), owner(n, width, position_dtype)
+@pytest.mark.parametrize("dcp", [1, 2, 4, 8])
+def test_fused_preparation_and_packing_match_general_path(n, width, position_dtype, dcp):
+    new, old = owner(n, width, position_dtype, dcp), owner(n, width, position_dtype, dcp)
     actual, expected = prepare(new), prepare(old, False)
     for i in (0, 1, 3, 4, 5):
         torch.testing.assert_close(actual[i], expected[i])
@@ -153,7 +156,8 @@ def test_fused_preparation_and_packing_match_general_path(n, width, position_dty
 
 @pytest.mark.parametrize(
     "change",
-    ["not_warmed", "async", "cp", "extra_slots", "width", "padded_rows", "foreign_drafts", "strided_sample", "discard"],
+    ["not_warmed", "async", "cp", "dcp_other", "dcp_cp", "extra_slots", "width",
+     "padded_rows", "foreign_drafts", "strided_sample", "discard"],
 )
 def test_unproven_layout_does_not_fuse(change):
     obj, common, spec, batch, requests, sampled, calls, ns = owner(3)
@@ -164,6 +168,10 @@ def test_unproven_layout_does_not_fuse(change):
         obj.use_async_scheduling = False
     elif change == "cp":
         obj.pcp_size = 2
+    elif change in ("dcp_other", "dcp_cp"):
+        obj.dcp_size = 8
+        obj.runner.dsa_decoder_dcp = change == "dcp_cp"
+        obj.runner.use_cp = change == "dcp_cp"
     elif change == "extra_slots":
         obj.needs_extra_input_slots = True
     elif change == "width":
@@ -236,8 +244,9 @@ def test_warmup_compiles_fixed_and_general_variants_without_touching_serving_buf
         torch.testing.assert_close(actual, expected)
 
 
-def test_fixed_cpu_layout_avoids_scalar_readback_and_preserves_handoff_failure(monkeypatch):
-    obj, common, spec, batch, requests, sampled, calls, _ = owner(3)
+@pytest.mark.parametrize("dcp", [1, 8])
+def test_fixed_cpu_layout_avoids_scalar_readback_and_preserves_handoff_failure(monkeypatch, dcp):
+    obj, common, spec, batch, requests, sampled, calls, _ = owner(3, dcp=dcp)
     next_ids, counts = obj.prepare_next_token_ids_padded(common, sampled, requests, batch, torch.empty(0), 0, spec)
 
     def forbidden(*args, **kwargs):
@@ -293,7 +302,8 @@ def test_sampling_index_staging_skips_only_exact_prefix_alias(kind):
     assert (obj.token_indices_to_sample._version == version) == (kind == "same")
 
 
-def test_npu_pipeline_matches_cpu_reference_and_preserves_queued_outputs(monkeypatch):
+@pytest.mark.parametrize("dcp", [1, 8])
+def test_npu_pipeline_matches_cpu_reference_and_preserves_queued_outputs(monkeypatch, dcp):
     pytest.importorskip("torch_npu")
     pytest.importorskip("triton")
     if not torch.npu.is_available():
@@ -302,7 +312,7 @@ def test_npu_pipeline_matches_cpu_reference_and_preserves_queued_outputs(monkeyp
     held = []
     for n in (1, 3, 17):
         for width in (1, 2):
-            case, reference = owner(n, width), owner(n, width)
+            case, reference = owner(n, width, dcp=dcp), owner(n, width, dcp=dcp)
             obj, common, spec, batch, requests, sampled, _, ns = case
             for name in (
                 "prepare_next_mtp_tokens_kernel",

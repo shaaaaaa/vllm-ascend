@@ -4,7 +4,7 @@
 
 import ast
 import sys
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, contextmanager, nullcontext
 from copy import copy, deepcopy
 from dataclasses import dataclass
 from pathlib import Path
@@ -60,7 +60,7 @@ def setup():
     events = []
     context = SimpleNamespace(staged_sfa_graph_dummy_run=False)
     source = ROOT.parent / "vllm/vllm/v1/worker/gpu_model_runner.py"
-    getter = extract(source, "_get_valid_sampled_token_count", {})
+    getter = extract(source, "_get_valid_sampled_token_count", {"record_function_or_nullcontext": nullcontext})
 
     class Base:
         _get_valid_sampled_token_count = getter
@@ -131,6 +131,7 @@ def setup():
         copy=copy,
         contextmanager=contextmanager,
         ExitStack=ExitStack,
+        record_function_or_nullcontext=nullcontext,
         dataclass=dataclass,
         Any=Any,
         NPUModelRunner=Base,

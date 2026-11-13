@@ -9,6 +9,19 @@ from vllm_ascend.ops.triton.triton_utils import get_element, get_vectorcore_num,
 
 
 @triton.jit
+def _mask_topk(raw, positions, output, rows: tl.constexpr, width: tl.constexpr,
+               actual_rows, TILE: tl.constexpr):
+    col = tl.arange(0, TILE)
+    for start in range(tl.program_id(0) * TILE, rows * width, tl.num_programs(0) * TILE):
+        offset = start + col
+        row = offset // width
+        token = tl.load(raw + offset, offset < rows * width, -1)
+        position = tl.load(positions + row, (row < rows) & (row < actual_rows), -1)
+        tl.store(output + offset, tl.where((token >= 0) & (token <= position), token, -1),
+                 offset < rows * width)
+
+
+@triton.jit
 def _prepare_topk(raw, positions, output, counts, row_requests, rows: tl.constexpr,
                   width: tl.constexpr, actual_rows, world: tl.constexpr,
                   rank: tl.constexpr, block: tl.constexpr, local: tl.constexpr):
@@ -44,6 +57,14 @@ def prepare_sfa_dcp_topk(
     """Keep causal global IDs for the planner and compact dense rows locally."""
     rows, width = topk.shape[0], topk.shape[-1]
     init_device_properties_triton()
+    if not local and row_requests is None:
+        # Graph planners need causal global IDs, not row-wise compaction.
+        tile = 256
+        if rows:
+            _mask_topk[(min(triton.cdiv(rows * width, tile), get_vectorcore_num()),)](
+                topk, positions, output, rows, width, actual_rows, tile,
+            )
+        return
     _prepare_topk[(min(rows, get_vectorcore_num()),)](
         topk, positions, output, counts, row_requests, rows, width, actual_rows, world, rank, block, local
     )

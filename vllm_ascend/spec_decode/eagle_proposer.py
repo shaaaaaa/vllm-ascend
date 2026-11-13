@@ -1908,7 +1908,9 @@ class SpecDecodeBaseProposer(EagleProposer):
             packed = (
                 HAS_TRITON and getattr(self, "_fixed_mtp_pipeline_ready", False)
                 and self.method == "mtp" and self.num_speculative_tokens == 1
-                and self.pcp_size == self.dcp_size == 1 and not self.uses_mrope and not self.uses_xdrope_dim
+                and self.pcp_size == 1
+                and (self.dcp_size == 1 or (getattr(self.runner, "dsa_decoder_dcp", False) and not self.runner.use_cp))
+                and not self.uses_mrope and not self.uses_xdrope_dim
                 and not self.vllm_config.model_config.uses_mrope
                 and token_indices_to_sample.data_ptr() == self.token_indices_to_sample.data_ptr()
                 and target_positions.ndim == target_token_ids.ndim == 1
@@ -2329,7 +2331,9 @@ class SpecDecodeBaseProposer(EagleProposer):
             fixed = getattr(self.runner, "_fixed_mtp_metadata", None) if spec_decode_metadata is not None else None
             fixed_q2 = (
                 fixed is not None and getattr(self, "_fixed_mtp_pipeline_ready", False) and self.use_async_scheduling
-                and self.pcp_size == self.dcp_size == 1 and not self.needs_extra_input_slots
+                and self.pcp_size == 1
+                and (self.dcp_size == 1 or (getattr(self.runner, "dsa_decoder_dcp", False) and not self.runner.use_cp))
+                and not self.needs_extra_input_slots
                 and sampled_token_ids.stride() == (sampled_token_ids.shape[1], 1)
                 and common_attn_metadata.num_reqs == num_reqs
                 and common_attn_metadata.num_actual_tokens == 2 * num_reqs and common_attn_metadata.max_query_len == 2

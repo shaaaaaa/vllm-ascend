@@ -10,6 +10,61 @@ pytest.importorskip("torch_npu")
 
 
 @torch.inference_mode()
+@pytest.mark.parametrize("rows", [1, 2, 8, 32])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("dcp_size", [1, 8])
+def test_sfa_preparation_replay_preserves_causal_ids_and_query_bits(rows, dtype, dcp_size):
+    from vllm_ascend.ops.triton.sfa_dcp import prepare_sfa_dcp_topk
+    from vllm_ascend.ops.triton.sfa_query import copy_sfa_query_bridge
+
+    heads = 8
+    raw_cpu = (torch.arange(rows * 2048, dtype=torch.int32) % 4097 - 2).reshape(rows, 1, 2048)
+    raw = raw_cpu.npu()
+    positions = torch.empty(rows, dtype=torch.int64, device="npu")
+    counts = torch.full((rows, 16), -77, dtype=torch.int32, device="npu")
+    topk = torch.empty_like(raw)
+    q_storage = torch.zeros(heads, rows + 2, 512, dtype=dtype, device="npu")
+    r_storage = torch.zeros(rows + 1, heads, 576, dtype=dtype, device="npu")
+    query, rope = q_storage[:, 1:rows + 1].transpose(0, 1), r_storage[1:, :, 512:]
+    destinations = [torch.full((rows + 3, heads, d), 7, dtype=dtype, device="npu") for d in (512, 64)]
+
+    def forward():
+        if dcp_size > 1:
+            prepare_sfa_dcp_topk(raw, positions, topk, counts, rows, dcp_size, 0, 128, local=False)
+        copy_sfa_query_bridge(query, rope, *destinations)
+
+    positions.fill_(-1)
+    forward()
+    torch.npu.synchronize()
+    graph = torch.npu.NPUGraph()
+    try:
+        with torch.npu.graph(graph):
+            forward()
+        for step, active in enumerate((0, rows - 1, rows)):
+            pos_cpu = torch.arange(rows, dtype=torch.int64) * 128
+            pos_cpu[active:] = -1
+            positions.copy_(pos_cpu)
+            bits = []
+            for storage in (q_storage, r_storage):
+                value = ((torch.arange(storage.numel()) * 97 + step * 7919) % 65536 - 32768)
+                value = value.to(torch.int16).reshape(storage.shape)
+                storage.view(torch.int16).copy_(value)
+                bits.append(value)
+            graph.replay()
+            expected = torch.where((raw_cpu >= 0) & (raw_cpu <= pos_cpu[:, None, None]), raw_cpu, -1)
+            if dcp_size > 1:
+                assert torch.equal(topk.cpu(), expected)
+            expected_queries = (bits[0][:, 1:rows + 1].transpose(0, 1), bits[1][1:, :, 512:])
+            for actual, expected_bits in zip(destinations, expected_queries):
+                assert torch.equal(actual[:rows].view(torch.int16).cpu(), expected_bits)
+                assert torch.all(actual[rows:].cpu() == 7)
+            assert torch.all(counts.cpu() == -77)
+    finally:
+        torch.npu.synchronize()
+        graph.reset()
+
+
+@torch.inference_mode()
 @pytest.mark.parametrize("world", [2, 4, 8])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_query_unpack_bit_exact_capture_without_hccl(world, dtype):

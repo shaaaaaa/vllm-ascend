@@ -21,7 +21,7 @@ def staging(request, monkeypatch):
         synchronize=lambda: events.append("staging_wait"), record=lambda: events.append("staging_record")
     )
     source = ROOT.parent / "vllm/vllm/v1/worker/gpu_model_runner.py"
-    guard = extract(source, "synchronize_input_prep", {})
+    guard = extract(source, "synchronize_input_prep", {"record_function_or_nullcontext": nullcontext})
     monkeypatch.setattr(ns["NPUModelRunner"], "synchronize_input_prep", contextmanager(guard), raising=False)
     padding = extract(
         ROOT / "vllm_ascend/worker/model_runner_v1.py",

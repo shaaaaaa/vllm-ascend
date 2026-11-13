@@ -4375,7 +4375,16 @@ class AscendSFAImpl(MLAAttentionImpl):
                 "staged SFA pre returned an unexpected bridge arity: "
                 f"{len(outputs)}"
             )
-        for source, destination in zip(outputs, buffers, strict=True):
+        fuse_queries = (
+            HAS_TRITON
+            and outputs[0].ndim == outputs[1].ndim == 3
+            and outputs[0].shape[:2] == outputs[1].shape[:2]
+            and outputs[0].dtype in (torch.float16, torch.bfloat16)
+            and all(t.dtype == outputs[0].dtype and t.device == outputs[0].device
+                    for t in (*outputs[:2], *buffers[:2]))
+            and all(t.is_contiguous() for t in buffers[:2])
+        )
+        for index, (source, destination) in enumerate(zip(outputs, buffers, strict=True)):
             rows = int(source.shape[0])
             if (
                 rows > int(destination.shape[0])
@@ -4387,7 +4396,13 @@ class AscendSFAImpl(MLAAttentionImpl):
                     f"source={tuple(source.shape)}, "
                     f"destination={tuple(destination.shape)}"
                 )
-            destination[:rows].copy_(source)
+            if fuse_queries and index < 2:
+                if index == 1:
+                    from vllm_ascend.ops.triton.sfa_query import copy_sfa_query_bridge
+
+                    copy_sfa_query_bridge(*outputs[:2], *buffers[:2])
+            else:
+                destination[:rows].copy_(source)
         return buffers
 
     def cross_layer_graph_pre(
