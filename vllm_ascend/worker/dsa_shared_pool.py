@@ -2,6 +2,8 @@ import math
 
 import torch
 
+from vllm_ascend.worker.packed_c8_shared_views import packed_c8_prefill_mixed_shared_views
+
 
 class MixedIndexerMetadata:
     """Stable C8 physical views over the mixed pool's common logical IDs."""
@@ -107,3 +109,48 @@ def reshape_dsa_shared_pool_raw(
         qk_rope_head_dim,
     )
     return k_nope, k_pe
+
+
+def reshape_packed_dsa_shared_pool_raw(
+    raw_tensors: dict[str, tuple[torch.Tensor, ...]],
+    main_names: list[str],
+    indexer_names: list[str],
+    c8_owners: frozenset[str],
+    capacity: int,
+    device: torch.device,
+    backing_alignment: int,
+) -> dict[str, tuple[torch.Tensor, ...]]:
+    """Adapt the Runner's shared raw tuples to explicitly packed layer views."""
+    if set(raw_tensors) != set(main_names) | set(indexer_names):
+        raise ValueError("Packed main C8 raw tensors must cover the configured layer groups")
+    shared_raw = shared_scale = None
+    for name in (*main_names, *indexer_names):
+        regions = raw_tensors[name]
+        has_scale = name in c8_owners
+        if (
+            not isinstance(regions, tuple)
+            or len(regions) != (2 if has_scale else 1)
+            or any(not isinstance(region, torch.Tensor) or region.device != device for region in regions)
+        ):
+            raise ValueError(f"Invalid packed main C8 raw tensors for {name}")
+        if shared_raw is not None and regions[0] is not shared_raw:
+            raise ValueError("Packed main C8 requires one shared raw tensor")
+        shared_raw = regions[0]
+        if has_scale:
+            if shared_scale is not None and regions[1] is not shared_scale:
+                raise ValueError("Packed main C8 requires one shared scale sidecar")
+            shared_scale = regions[1]
+    if shared_raw is None or shared_scale is None:
+        raise ValueError("Packed main C8 requires raw storage and a scale sidecar")
+
+    main, c8_keys, c8_scales, bf16_keys = packed_c8_prefill_mixed_shared_views(shared_raw, shared_scale, capacity)
+    if (
+        shared_scale.untyped_storage().data_ptr() != shared_raw.untyped_storage().data_ptr()
+        or shared_scale.storage_offset() != shared_raw.storage_offset() + shared_raw.numel()
+        or (backing_alignment and shared_raw.data_ptr() % backing_alignment)
+    ):
+        raise ValueError("Packed main C8 requires adjacent raw and scale slices of one aligned backing")
+    return {
+        **dict.fromkeys(main_names, (main,)),
+        **{name: (c8_keys, c8_scales) if name in c8_owners else (bf16_keys,) for name in indexer_names},
+    }

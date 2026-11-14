@@ -19,6 +19,8 @@ from typing import TYPE_CHECKING
 from vllm.logger import logger
 from vllm.utils.math_utils import cdiv
 
+from vllm_ascend.attention.selected_prefill_policy import selected_prefill_requested
+
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
@@ -31,6 +33,8 @@ class AscendConfig:
     def __init__(self, vllm_config: "VllmConfig"):
         self.vllm_config = vllm_config
         additional_config = vllm_config.additional_config if vllm_config.additional_config is not None else {}
+
+        self.enable_selected_prefill = selected_prefill_requested(additional_config)
 
         xlite_graph_config = additional_config.get("xlite_graph_config", {})
         self.xlite_graph_config = XliteGraphConfig(xlite_graph_config, vllm_config)

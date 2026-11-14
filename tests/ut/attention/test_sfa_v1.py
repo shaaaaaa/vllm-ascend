@@ -3042,12 +3042,24 @@ class TestAscendSFAMetadataBuilder(TestBase):
         )
         self.parent_init_patcher.start()
 
+        self.ascend_config = SimpleNamespace(
+            indexer_hbm_block_map=None,
+            indexer_c8_shared_block_factor=1,
+            indexer_c8_layer_mask=lambda names: [False] * len(names),
+        )
+        self.ascend_config_patcher = patch(
+            "vllm_ascend.attention.sfa_v1.get_ascend_config",
+            return_value=self.ascend_config,
+        )
+        self.ascend_config_patcher.start()
+
         if hasattr(enable_dsa_cp, "cache_clear"):
             enable_dsa_cp.cache_clear()
 
     def tearDown(self):
         self.patcher.stop()
         self.parent_init_patcher.stop()
+        self.ascend_config_patcher.stop()
 
     @patch("vllm_ascend.attention.sfa_v1.is_v1_kv_transfer_group")
     @patch("vllm_ascend.attention.sfa_v1.has_kv_transfer_group")
@@ -3069,6 +3081,7 @@ class TestAscendSFAMetadataBuilder(TestBase):
         )
 
         kv_cache_spec = MagicMock()
+        kv_cache_spec.cache_sparse_sfa_c8 = False
         vllm_config = MagicMock()
         vllm_config.cache_config.block_size = 16
         vllm_config.model_config.max_model_len = 1024
@@ -3326,6 +3339,7 @@ class TestAscendSFAMetadataBuilder(TestBase):
     @patch_distributed_groups(dcp_size=2, pcp_size=2, needs_mocks=False)
     def test_ascend_sfa_metadata_builder_default(self):
         kv_cache_spec = MagicMock()
+        kv_cache_spec.cache_sparse_sfa_c8 = False
         layer_names = ["layer1", "layer2"]
         vllm_config = MagicMock()
         vllm_config.cache_config.block_size = 16
@@ -3345,6 +3359,18 @@ class TestAscendSFAMetadataBuilder(TestBase):
         assert builder.device == device
         assert builder.vllm_config == vllm_config
 
+    def test_packed_main_marker_must_be_boolean(self):
+        kv_cache_spec = MagicMock()
+        kv_cache_spec.cache_sparse_sfa_c8 = "packed"
+
+        with self.assertRaisesRegex(ValueError, "marker must be a boolean"):
+            AscendSFAMetadataBuilder(
+                kv_cache_spec=kv_cache_spec,
+                layer_names=["layer1"],
+                vllm_config=MagicMock(),
+                device=torch.device("cpu"),
+            )
+
     @patch("vllm_ascend.attention.sfa_v1.get_current_vllm_config")
     @patch("vllm_ascend.attention.sfa_v1.get_cos_and_sin_mla")
     @patch("vllm_ascend.attention.sfa_v1.enable_dsa_cp")
@@ -3363,6 +3389,7 @@ class TestAscendSFAMetadataBuilder(TestBase):
 
         mock_get_current_vllm_config.return_value = cfg
         kv_cache_spec = MagicMock()
+        kv_cache_spec.cache_sparse_sfa_c8 = False
         layer_names = ["layer1", "layer2"]
         vllm_config = MagicMock()
         vllm_config.cache_config.block_size = 16
@@ -3393,6 +3420,7 @@ class TestAscendSFAMetadataBuilder(TestBase):
         common_attn_metadata.cos = None
         common_attn_metadata.sin = None
         common_attn_metadata.num_input_tokens = 100
+        common_attn_metadata.sfa_full_graph = False
 
         mock_get_cos_and_sin_mla.return_value = (torch.randn(100), torch.randn(100))
 
@@ -3418,6 +3446,7 @@ class TestAscendSFAMetadataBuilder(TestBase):
         mock_get_current_vllm_config.return_value = cfg
 
         kv_cache_spec = MagicMock()
+        kv_cache_spec.cache_sparse_sfa_c8 = False
         layer_names = ["layer1", "layer2"]
         vllm_config = MagicMock()
         vllm_config.cache_config.block_size = 16
@@ -3448,6 +3477,7 @@ class TestAscendSFAMetadataBuilder(TestBase):
         common_attn_metadata.cos = None
         common_attn_metadata.sin = None
         common_attn_metadata.num_input_tokens = 100
+        common_attn_metadata.sfa_full_graph = False
 
         mock_get_cos_and_sin_mla.return_value = (torch.randn(100), torch.randn(100))
 
@@ -3480,7 +3510,7 @@ class TestAscendSFAMetadataBuilder(TestBase):
             },
         ):
             builder = AscendSFAMetadataBuilder(
-                kv_cache_spec=MagicMock(),
+                kv_cache_spec=MagicMock(cache_sparse_sfa_c8=False),
                 layer_names=["layer1"],
                 vllm_config=vllm_config,
                 device=torch.device("cpu"),
@@ -3504,6 +3534,7 @@ class TestAscendSFAMetadataBuilder(TestBase):
         common.seq_lens = torch.tensor([129, 257, 0, 0], dtype=torch.int32)
         common.seq_lens_cpu = common.seq_lens.cpu()
         common.attn_state = AscendAttentionState.DecodeOnly
+        common.sfa_full_graph = False
         mock_get_cos_and_sin_mla.return_value = (
             torch.zeros((4, 1)),
             torch.zeros((4, 1)),
@@ -3595,7 +3626,7 @@ class TestAscendSFAMetadataBuilder(TestBase):
             },
         ):
             builder = AscendSFAMetadataBuilder(
-                kv_cache_spec=MagicMock(),
+                kv_cache_spec=MagicMock(cache_sparse_sfa_c8=False),
                 layer_names=["layer1"],
                 vllm_config=vllm_config,
                 device=torch.device("cpu"),
@@ -3622,6 +3653,7 @@ class TestAscendSFAMetadataBuilder(TestBase):
         common.seq_lens = torch.tensor([130, 0], dtype=torch.int32)
         common.seq_lens_cpu = common.seq_lens.cpu()
         common.attn_state = AscendAttentionState.SpecDecoding
+        common.sfa_full_graph = False
         mock_get_cos_and_sin_mla.return_value = (
             torch.zeros((4, 1)),
             torch.zeros((4, 1)),

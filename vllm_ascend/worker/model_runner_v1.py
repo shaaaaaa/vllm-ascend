@@ -113,8 +113,9 @@ import vllm_ascend.envs as envs_ascend
 # yapf: enable
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
+from vllm_ascend.attention.selected_prefill_policy import packed_main_c8_enabled
 from vllm_ascend.attention.sfa_remap_boundary import prepare_native_sparse_boundaries
-from vllm_ascend.attention.sfa_v1 import _fixed_staged_decode_mtp, _get_indexer_types
+from vllm_ascend.attention.sfa_v1 import AscendSFAMetadataBuilder, _fixed_staged_decode_mtp, _get_indexer_types
 from vllm_ascend.attention.utils import (
     AscendCommonAttentionMetadata,
     ColdResumeMarkers,
@@ -187,7 +188,7 @@ from vllm_ascend.utils import (
     staged_sfa_graph_configuration_reasons,
     staged_sfa_graph_configured,
 )
-from vllm_ascend.worker.dsa_shared_pool import reshape_dsa_shared_pool_raw
+from vllm_ascend.worker.dsa_shared_pool import reshape_dsa_shared_pool_raw, reshape_packed_dsa_shared_pool_raw
 from vllm_ascend.worker.npu_input_batch import NPUInputBatch
 from vllm_ascend.worker.pcp_utils import PCPManager
 
@@ -5100,6 +5101,13 @@ class NPUModelRunner(GPUModelRunner):
                 "after graph capture has started; restart the worker to rebuild "
                 "captured addresses."
             )
+        for group in kv_cache_config.kv_cache_groups:
+            spec = group.kv_cache_spec
+            layer_specs = spec.kv_cache_specs.values() if isinstance(spec, UniformTypeKVCacheSpecs) else (spec,)
+            for layer_spec in layer_specs:
+                packed_main = packed_main_c8_enabled(layer_spec)
+                if packed_main:
+                    raise ValueError("Packed main C8 KV cache is not enabled in the production runner.")
         self._validate_dsa_compact_startup_policy(kv_cache_config)
         self._validate_sfa_layerwise_connector_cudagraph_mode()
         kv_cache_config = deepcopy(kv_cache_config)
@@ -5565,6 +5573,72 @@ class NPUModelRunner(GPUModelRunner):
 
         return kv_cache_raw_tensors
 
+    def _reshape_packed_dsa_shared_pool(
+        self,
+        kv_cache_config: KVCacheConfig,
+        kv_cache_raw_tensors: dict[str, tuple[torch.Tensor, ...]],
+    ) -> dict[str, tuple[torch.Tensor, ...]]:
+        """Build component views; production initialization still rejects this format."""
+        groups = kv_cache_config.kv_cache_groups
+        if not (
+            self.layerwise_prefill_p_node
+            and self.use_sparse
+            and self.dsa_unbundle
+            and self.dsa_shared_pool
+            and self.use_sparse_c8_indexer
+            and len(groups) == 2
+            and not kv_cache_config.dsa_paired_bank_slots
+        ):
+            raise ValueError("Packed main C8 requires two layerwise prefill shared-pool groups")
+        packed_groups = [
+            group for group in groups if getattr(group.kv_cache_spec, "cache_sparse_sfa_c8", False) is True
+        ]
+        if len(packed_groups) != 1:
+            raise ValueError("Packed main C8 requires one explicitly packed main group")
+        main_group = packed_groups[0]
+        indexer_group = groups[1] if groups[0] is main_group else groups[0]
+        main_spec, indexer_spec = main_group.kv_cache_spec, indexer_group.kv_cache_spec
+        if not isinstance(main_spec, MLAAttentionSpec) or not isinstance(indexer_spec, MLAAttentionSpec):
+            raise ValueError("Packed main C8 requires MLA group specs")
+
+        main_names, indexer_names = main_group.layer_names, indexer_group.layer_names
+        names = set(main_names) | set(indexer_names)
+        c8_owners = self._mixed_indexer_c8_names
+        if (
+            not main_names
+            or len(names) != len(main_names) + len(indexer_names)
+            or self.runner_only_attn_layers.intersection(names)
+            or not c8_owners
+            or not c8_owners < set(indexer_names)
+            or c8_owners != set(indexer_spec.indexer_c8_layer_names or ())
+            or indexer_spec.dtype != torch.bfloat16
+        ):
+            raise ValueError("Packed main C8 requires distinct main layers and mixed BF16/C8 indexer owners")
+
+        parent_capacity = kv_cache_config.num_blocks
+        if type(parent_capacity) is not int or parent_capacity <= 0:
+            raise ValueError("Packed main C8 requires a positive parent pool capacity")
+        # A parent bundle has one child per main layer, including followers.
+        layout = dsa_shared_block_layout(main_spec, indexer_spec, parent_capacity * len(main_names), prefill_child=True)
+        tensors = kv_cache_config.kv_cache_tensors
+        if (
+            len(tensors) != 1
+            or len(tensors[0].shared_by) != len(names)
+            or set(tensors[0].shared_by) != names
+            or tensors[0].size != layout.slot_count * (layout.bundle_page_size_bytes + layout.scale_bytes_per_bundle)
+        ):
+            raise ValueError("Packed main C8 requires one global raw and scale allocation")
+
+        return reshape_packed_dsa_shared_pool_raw(
+            kv_cache_raw_tensors,
+            main_names,
+            indexer_names,
+            c8_owners,
+            layout.capacity_bundles,
+            self.device,
+            layout.backing_alignment_bytes,
+        )
+
     def _reshape_kv_cache_tensors(
         self,
         kv_cache_config: KVCacheConfig,
@@ -5583,6 +5657,8 @@ class NPUModelRunner(GPUModelRunner):
         """
         kv_caches: dict[str, torch.Tensor] = {}
         layer_kv_cache_spec = self._get_layer_kv_cache_specs(kv_cache_config)
+        if any(getattr(spec, "cache_sparse_sfa_c8", False) is not False for spec in layer_kv_cache_spec.values()):
+            return self._reshape_packed_dsa_shared_pool(kv_cache_config, kv_cache_raw_tensors)
         dsa_shared_views: dict[tuple[int, bool, bool], tuple[torch.Tensor, ...]] = {}
         for group in self._kv_cache_spec_attn_group_iterator():
             attn_backend = group.backend
@@ -5992,17 +6068,23 @@ class NPUModelRunner(GPUModelRunner):
         ) -> list[AttentionGroup]:
             attn_groups: list[AttentionGroup] = []
             for (attn_backend, kv_cache_spec), layer_names in attn_backends_map.items():
-                attn_metadata_builders = []
-                attn_metadata_builders.append(
-                    attn_backend.get_builder_cls()(
+                builder_cls = attn_backend.get_builder_cls()
+                if shared_pool_layout is not None and kv_cache_group_id in (packed_group_id, indexer_group_id):
+                    # CP and other builders with their own constructor retain
+                    # their existing contract until they support packed prefill.
+                    if builder_cls.__init__ is not AscendSFAMetadataBuilder.__init__:
+                        raise ValueError("Packed main C8 requires a compatible SFA metadata builder")
+                    builder = builder_cls(
                         kv_cache_spec,
                         layer_names,
                         self.vllm_config,
                         self.device,
+                        shared_pool_layout=shared_pool_layout,
                     )
-                )
+                else:
+                    builder = builder_cls(kv_cache_spec, layer_names, self.vllm_config, self.device)
                 attn_group = AttentionGroup(
-                    attn_backend, layer_names, kv_cache_spec, kv_cache_group_id, attn_metadata_builders
+                    attn_backend, layer_names, kv_cache_spec, kv_cache_group_id, [builder]
                 )
                 attn_groups.append(attn_group)
             return attn_groups
@@ -6013,6 +6095,39 @@ class NPUModelRunner(GPUModelRunner):
             attn_backends = get_attn_backends_for_group(kv_cache_group_spec)
             attention_backend_maps.append(attn_backends[0])
             attention_backend_list.append(attn_backends[1])
+
+        shared_pool_layout = None
+        packed_group_id = None
+        indexer_group_id = None
+        packed_group_ids = [
+            group_id
+            for group_id, backends in enumerate(attention_backend_maps)
+            if any(getattr(key.kv_cache_spec, "cache_sparse_sfa_c8", False) is not False for key in backends)
+        ]
+        if packed_group_ids:
+            groups = kv_cache_config.kv_cache_groups
+            if (
+                not self.dsa_shared_pool
+                or not self.layerwise_prefill_p_node
+                or len(groups) != 2
+                or len(packed_group_ids) != 1
+            ):
+                raise ValueError("Packed main C8 requires two layerwise prefill shared-pool groups")
+            packed_group_id = packed_group_ids[0]
+            main_spec = groups[packed_group_id].kv_cache_spec
+            indexer_group = groups[1 - packed_group_id]
+            indexer_group_id = 1 - packed_group_id
+            indexer_spec = indexer_group.kv_cache_spec
+            if (
+                not isinstance(main_spec, MLAAttentionSpec)
+                or not isinstance(indexer_spec, MLAAttentionSpec)
+                or getattr(main_spec, "cache_sparse_sfa_c8", False) is not True
+            ):
+                raise ValueError("Packed main C8 requires one packed MLA group and one indexer MLA group")
+            shared_pool_layout = dsa_shared_block_layout(main_spec, indexer_spec, prefill_child=True)
+            c8_owners = getattr(indexer_spec, "indexer_c8_layer_names", None)
+            if c8_owners is None or not set(c8_owners) < set(indexer_group.layer_names):
+                raise ValueError("Packed main C8 requires mixed BF16/C8 indexer owners from the indexer group")
 
         self._check_and_update_cudagraph_mode(attention_backend_list, kv_cache_config.kv_cache_groups)
 

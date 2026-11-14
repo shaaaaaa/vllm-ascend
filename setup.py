@@ -45,6 +45,21 @@ ROOT_DIR = os.path.dirname(__file__)
 logger = logging.getLogger(__name__)
 
 
+def is_editable_build(build_ext_cmd) -> bool:
+    """Return whether the build must install directly into the source tree."""
+    commands = getattr(build_ext_cmd.distribution, "commands", ())
+    return bool(build_ext_cmd.inplace or getattr(build_ext_cmd, "editable_mode", False) or "develop" in commands)
+
+
+def get_cmake_install_paths(build_ext_cmd, root_dir: str) -> tuple[str, str]:
+    """Return the CMake install prefix and the matching package path."""
+    if is_editable_build(build_ext_cmd):
+        package_path = os.path.join(root_dir, "vllm_ascend")
+        return package_path, package_path
+    install_path = os.path.join(root_dir, build_ext_cmd.build_lib)
+    return install_path, os.path.join(install_path, "vllm_ascend")
+
+
 def check_or_set_default_env(cmake_args, env_name, env_variable, default_path=""):
     if env_variable is None:
         logging.warning(
@@ -292,11 +307,12 @@ class cmake_build_ext(build_ext):
             # else specify pybind11 path installed from source code on CI container
             raise RuntimeError(f"CMake configuration failed: {e}")
 
-        install_path = os.path.join(ROOT_DIR, self.build_lib)
-        if isinstance(self.distribution.get_command_obj("develop"), develop):
-            install_path = os.path.join(ROOT_DIR, "vllm_ascend")
+        install_path, package_path = get_cmake_install_paths(self, ROOT_DIR)
         # add CMAKE_INSTALL_PATH
         cmake_args += [f"-DCMAKE_INSTALL_PREFIX={install_path}"]
+        cmake_args += [f"-DVLLM_ASCEND_PACKAGE_PATH={package_path}"]
+        if os.getenv("VLLM_ASCEND_BUILD_SELECTED_KV") == "1":
+            cmake_args += ["-DVLLM_ASCEND_BUILD_SELECTED_KV=ON"]
 
         cmake_args += [f"-DCMAKE_PREFIX_PATH={pybind11_cmake_path}"]
 

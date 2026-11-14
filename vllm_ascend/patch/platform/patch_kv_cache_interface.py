@@ -9,6 +9,8 @@ from typing_extensions import Self
 from vllm.utils.torch_utils import get_dtype_size
 from vllm.v1.kv_cache_interface import MLAAttentionSpec
 
+from vllm_ascend.attention.selected_prefill_policy import packed_main_c8_enabled
+
 
 @dataclass(frozen=True)
 class AscendMLAAttentionSpec(MLAAttentionSpec):
@@ -49,6 +51,8 @@ class AscendMLAAttentionSpec(MLAAttentionSpec):
     # Verified external compact-D residency policy; latent group only.
     dsa_compact_startup_scratch_tokens: int = 0
     dsa_compact_startup_dense_tokens: int = 0
+    # Main KV has one packed row with NOPE, RoPE and scales inline.
+    cache_sparse_sfa_c8: bool = False
 
     @property
     def shared_indexer_key_dtype(self) -> torch.dtype:
@@ -71,8 +75,39 @@ class AscendMLAAttentionSpec(MLAAttentionSpec):
             return factor * self.block_size * self.num_kv_heads * get_dtype_size(self.c8_k_scale_cache_dtype)
         return 0
 
+    def _packed_main_c8_enabled(self) -> bool:
+        return packed_main_c8_enabled(self)
+
     @property
     def page_size_bytes(self) -> int:
+        if self._packed_main_c8_enabled():
+            packed_block_size = 128
+            packed_row_bytes = 656
+            if (
+                self.block_size != packed_block_size
+                or self.num_kv_heads != 1
+                or self.head_size != packed_row_bytes
+                or self.dtype != torch.int8
+                or self.sparse_head_dim != (512, 64)
+            ):
+                raise ValueError(
+                    "Packed main C8 requires 128-token blocks, one KV head, "
+                    "656-byte INT8 rows, and NOPE/RoPE dimensions (512, 64)."
+                )
+            if (
+                self.page_size_padded is not None
+                or self.cache_sparse_c8
+                or self.indexer_c8_layer_names is not None
+                or self.indexer_paired_banks
+                or self.dsa_compact_startup_scratch_tokens
+                or self.dsa_compact_startup_dense_tokens
+            ):
+                raise ValueError(
+                    "Packed main C8 does not support padded pages, indexer "
+                    "C8 layout flags, paired banks, or compact-D residency."
+                )
+            return packed_block_size * packed_row_bytes
+
         if self.cache_sparse_c8:
             assert self.sparse_head_dim is not None
             if len(self.sparse_head_dim) == 1:
@@ -114,6 +149,8 @@ class AscendMLAAttentionSpec(MLAAttentionSpec):
             - kv_cache[3] (None if Sparse C8 is disabled)
         """
 
+        if self._packed_main_c8_enabled():
+            raise ValueError("Packed main C8 has no split KV cache ratio.")
         assert self.sparse_head_dim is not None
 
         def get_sparse_head_dim_virtual() -> tuple[int, int, int, int]:
@@ -158,6 +195,7 @@ class AscendMLAAttentionSpec(MLAAttentionSpec):
         assert all(isinstance(spec, MLAAttentionSpec) for spec in specs), (
             "All attention layers in the same KV cache group must be MLAAttentionSpec."
         )
+        packed_formats = {spec._packed_main_c8_enabled() for spec in specs}
         cache_dtype_str_set = set(spec.cache_dtype_str for spec in specs)
         assert len(cache_dtype_str_set) == 1, (
             "All attention layers in the same KV cache group must use the same quantization method."
@@ -189,6 +227,14 @@ class AscendMLAAttentionSpec(MLAAttentionSpec):
             )
             == 1
         ), "All layers in a KV group must share one indexer precision policy."
+        assert len(packed_formats) == 1, (
+            "All layers in a KV group must share the same packed main C8 format."
+        )
+        packed_main = packed_formats.pop()
+        if packed_main:
+            # Validate each packed member before reconstructing the merged spec.
+            for spec in specs:
+                _ = spec.page_size_bytes
         return cls(
             block_size=specs[0].block_size,
             num_kv_heads=specs[0].num_kv_heads,
@@ -197,6 +243,7 @@ class AscendMLAAttentionSpec(MLAAttentionSpec):
             dtype=specs[0].dtype,
             cache_dtype_str=cache_dtype_str_set.pop(),
             cache_sparse_c8=specs[0].cache_sparse_c8,
+            cache_sparse_sfa_c8=packed_main,
             indexer_c8_layer_names=specs[0].indexer_c8_layer_names,
             indexer_paired_banks=specs[0].indexer_paired_banks,
             shared_pool_alignment_bytes=specs[0].shared_pool_alignment_bytes,
