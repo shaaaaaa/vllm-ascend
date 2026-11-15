@@ -5030,6 +5030,16 @@ class NPUModelRunner(GPUModelRunner):
             )
             if callable(transfer_window_supported):
                 transfer_window_supported = transfer_window_supported()
+            engine = getattr(connector, "_lmcache_engine", None)
+            lazy_layerwise = bool(
+                engine is not None and getattr(engine, "use_layerwise", False)
+            )
+            if transfer_window_supported is not True and lazy_layerwise:
+                # The LMCache engine is created lazily after connector
+                # construction. The configured layerwise mode is the
+                # capability signal available at this point; the actual
+                # transfer-window methods are exercised on the first request.
+                transfer_window_supported = True
             if transfer_window_supported is not True:
                 raise ValueError(
                     "Layerwise-prefill P nodes require a layerwise, "
@@ -5039,17 +5049,28 @@ class NPUModelRunner(GPUModelRunner):
             index_lmcache_supported = bool(
                 getattr(connector, "supports_dsa_index_lmcache", False)
             )
-            complete_protocol_supported = getattr(
-                connector,
-                "supports_layerwise_prefill_dsa_index_transfer_window",
-                None,
-            )
-            if callable(complete_protocol_supported):
-                complete_protocol_supported = complete_protocol_supported()
+            try:
+                complete_protocol_supported = getattr(
+                    connector,
+                    "supports_layerwise_prefill_dsa_index_transfer_window",
+                    None,
+                )
+                if callable(complete_protocol_supported):
+                    complete_protocol_supported = complete_protocol_supported()
+            except AttributeError:
+                # The LMCache engine is lazy; its index capability is not
+                # queryable until the first connector registration.
+                complete_protocol_supported = None
             if complete_protocol_supported is None:
                 complete_protocol_supported = bool(
                     transfer_window_supported and index_lmcache_supported
                 )
+            if (
+                complete_protocol_supported is not True
+                and lazy_layerwise
+                and index_lmcache_supported
+            ):
+                complete_protocol_supported = True
             if (
                 envs_ascend.VLLM_ASCEND_DSA_DISABLE_INDEX_LMCACHE
                 or not index_lmcache_supported

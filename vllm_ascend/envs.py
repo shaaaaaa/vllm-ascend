@@ -46,6 +46,11 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Non-secret P-node bank rotation depth. Positive integer, default 4;
     # ignored unless the P-node switch above is true. Read before startup.
     "VLLM_ASCEND_LAYERWISE_PREFILL_NUM_BANKS": layerwise_prefill_bank_count,
+    # LMCache-Ascend 0.4.3 reads this P-node overlap statistic switch. The
+    # target PR does not use the statistic, but the connector imports it.
+    "VLLM_ASCEND_PREFILL_OVERLAP_STATS": lambda: _strict_bool_env(
+        "VLLM_ASCEND_PREFILL_OVERLAP_STATS"
+    ),
     "MAX_JOBS": lambda: os.getenv("MAX_JOBS", None),
     # The build type of the package. It can be one of the following values:
     # Release, Debug, RelWithDebugInfo. If not set, the default value is Release.
