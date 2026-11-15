@@ -150,6 +150,23 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_LAYERWISE_PREFILL_LOCAL_ONLY": lambda: bool(
         int(os.getenv("VLLM_ASCEND_LAYERWISE_PREFILL_LOCAL_ONLY", "0"))
     ),
+    # Test-only selected-prefill performance harness. Source pages live in an
+    # ACL-mapped host arena; this does not enable the production connector path.
+    "VLLM_ASCEND_SELECTED_PREFILL_TEST": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_SELECTED_PREFILL_TEST", "0"))
+    ),
+    "VLLM_ASCEND_SELECTED_PREFILL_TEST_ARM": lambda: os.getenv(
+        "VLLM_ASCEND_SELECTED_PREFILL_TEST_ARM", "selected"
+    ),
+    "VLLM_ASCEND_SELECTED_PREFILL_TEST_HISTORY": lambda: int(
+        os.getenv("VLLM_ASCEND_SELECTED_PREFILL_TEST_HISTORY", "0")
+    ),
+    "VLLM_ASCEND_SELECTED_PREFILL_TEST_QUERY": lambda: int(
+        os.getenv("VLLM_ASCEND_SELECTED_PREFILL_TEST_QUERY", "100")
+    ),
+    "VLLM_ASCEND_SELECTED_PREFILL_TEST_MAX_PAGES": lambda: int(
+        os.getenv("VLLM_ASCEND_SELECTED_PREFILL_TEST_MAX_PAGES", "1024")
+    ),
     # DSA shared bundle pool. Requires DSA_UNBUNDLE=1 and DSA_TWO_GROUPS=1.
     # vLLM owns one physical bundle allocator while exposing two logical block
     # tables: latent (k_nope+k_pe) and indexer. vLLM-Ascend backs sibling latent

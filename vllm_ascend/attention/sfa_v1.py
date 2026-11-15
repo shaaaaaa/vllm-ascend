@@ -1048,6 +1048,7 @@ class AscendSFAMetadata:
     decode_remap_boundary: torch.Tensor | None = None
     decode_remap_boundary_ready: bool = False
     decode_remap_boundary_buffer: SFARemapBoundaryBuffer | None = None
+    selected_kv: Any = None
 
 
 M = TypeVar("M", bound=AscendSFAMetadata)
@@ -2906,7 +2907,19 @@ class AscendSFAImpl(MLAAttentionImpl):
             block_table = attn_metadata.block_table
 
         if self._packed_main_cache is not None and kv_override is None:
-            return packed_c8_sparse_flash_attention(
+            selected = (
+                getattr(attn_metadata, "selected_kv", None)
+                if attn_metadata is not None
+                else None
+            )
+            if selected is not None and layer_name is not None:
+                selected.load(
+                    layer_name,
+                    topk_indices,
+                    (self._packed_main_cache,),
+                    attn_metadata,
+                )
+            out = packed_c8_sparse_flash_attention(
                 ql_nope,
                 q_pe,
                 self._packed_main_cache,
@@ -2916,6 +2929,9 @@ class AscendSFAImpl(MLAAttentionImpl):
                 actual_seq_lengths_query=actual_seq_lengths_query,
                 actual_seq_lengths_kv=actual_seq_lengths_key,
             )
+            if selected is not None and layer_name is not None:
+                selected.prefetch_next(layer_name)
+            return out
 
         if kv_override is not None:
             kv = kv_override

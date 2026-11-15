@@ -666,6 +666,14 @@ class NPUModelRunner(GPUModelRunner):
             self.use_sparse and self.ascend_config.enable_sparse_sfa_c8
         )
         self._mixed_indexer_c8_names = None
+        self.selected_kv_runtime = None
+        self._selected_test_store = None
+        self._selected_test_packed_gid = None
+        self._selected_test_names = []
+        self._selected_test_captured = False
+        self._selected_test_arm = "none"
+        self._selected_test_history = 0
+        self._selected_test_query = 100
         if self.use_sparse_c8_indexer:
             self.c8_k_cache_dtype = torch.int8
             self.c8_k_scale_cache_dtype = torch.float16
@@ -2406,9 +2414,20 @@ class NPUModelRunner(GPUModelRunner):
             if staged_sfa_graph_key is not None and not envs_ascend.VLLM_ASCEND_SFA_FULL_GRAPH:
                 first_layer_name, first_impl = self._staged_sfa_impls[0]
                 first_impl.bootstrap_cross_layer(first_layer_name)
-            hidden_states = self._model_forward(
-                num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
+            from vllm_ascend.distributed.kv_transfer.sparse_offload.selected_prefill_test_binding import (
+                bind_selected_test,
+                capture_selected_history,
+                finish_selected_test,
             )
+
+            bind_selected_test(self, attn_metadata)
+            try:
+                hidden_states = self._model_forward(
+                    num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
+                )
+            finally:
+                finish_selected_test(self)
+                capture_selected_history(self, attn_metadata)
             if staged_sfa_graph_key is not None:
                 for _, impl in self._staged_sfa_impls:
                     impl.submit_cross_layer_save()
@@ -5157,6 +5176,11 @@ class NPUModelRunner(GPUModelRunner):
         self._validate_selected_prefill_eligibility(kv_cache_config)
         kv_caches = self.initialize_kv_cache_tensors(kv_cache_config)
         self._validate_shared_resident_layout(kv_caches)
+        from vllm_ascend.distributed.kv_transfer.sparse_offload.selected_prefill_test_binding import (
+            initialize_selected_test,
+        )
+
+        initialize_selected_test(self, kv_cache_config, kv_caches)
         if self._sfa_full_graph.retrieval_overlap is not None:
             self._sfa_full_graph.retrieval_overlap.configure(
                 self._collect_staged_sfa_impls(), self._shared_resident_groups, kv_caches,
