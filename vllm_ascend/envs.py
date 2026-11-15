@@ -177,6 +177,12 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_SELECTED_PREFILL_LMCACHE": lambda: bool(
         int(os.getenv("VLLM_ASCEND_SELECTED_PREFILL_LMCACHE", "0"))
     ),
+    # Selected prefill is a long-history/short-suffix optimization. Keep the
+    # default 512-token cap so 8192-token history chunks do not each trigger a
+    # selected restore during chunked prefill.
+    "VLLM_ASCEND_SELECTED_PREFILL_LMCACHE_MAX_QUERY": lambda: int(
+        os.getenv("VLLM_ASCEND_SELECTED_PREFILL_LMCACHE_MAX_QUERY", "512")
+    ),
     # DSA shared bundle pool. Requires DSA_UNBUNDLE=1 and DSA_TWO_GROUPS=1.
     # vLLM owns one physical bundle allocator while exposing two logical block
     # tables: latent (k_nope+k_pe) and indexer. vLLM-Ascend backs sibling latent

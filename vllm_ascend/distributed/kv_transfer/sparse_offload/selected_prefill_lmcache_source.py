@@ -50,12 +50,40 @@ if TYPE_CHECKING:
     from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
 
 SELECTED_LMCACHE_ENV = "VLLM_ASCEND_SELECTED_PREFILL_LMCACHE"
+SELECTED_LMCACHE_MAX_QUERY_ENV = (
+    "VLLM_ASCEND_SELECTED_PREFILL_LMCACHE_MAX_QUERY"
+)
+DEFAULT_SELECTED_LMCACHE_MAX_QUERY = 512
 logger = init_logger(__name__)
 
 
 def selected_lmcache_enabled() -> bool:
     """Explicit opt-in for the real-LMCache native selected source."""
     return os.getenv(SELECTED_LMCACHE_ENV, "0") == "1"
+
+
+def selected_lmcache_max_query() -> int:
+    """Largest query chunk that may use the selected source.
+
+    Selected prefill is a long-history/short-suffix optimization. Without
+    this cap, every 8192-token history chunk in a chunked prefill would run
+    its own selected restore and make the request slower.
+    """
+    raw = os.getenv(
+        SELECTED_LMCACHE_MAX_QUERY_ENV,
+        str(DEFAULT_SELECTED_LMCACHE_MAX_QUERY),
+    )
+    try:
+        value = int(raw)
+    except ValueError as error:
+        raise ValueError(
+            f"{SELECTED_LMCACHE_MAX_QUERY_ENV} must be an integer, got {raw!r}"
+        ) from error
+    if value < 2:
+        raise ValueError(
+            f"{SELECTED_LMCACHE_MAX_QUERY_ENV} must be at least 2, got {value}"
+        )
+    return value
 
 
 def lmcache_selected_supported(connector: object) -> bool:
@@ -724,7 +752,7 @@ def runner_selected_prefill(runner: NPUModelRunner) -> PendingSelectedPrefill | 
         return None
     starts = runner.query_start_loc.np[:2]
     query = int(starts[1] - starts[0])
-    if query < 2:
+    if query < 2 or query > selected_lmcache_max_query():
         return None
     pending = build_selected_prefill_step(str(batch.req_ids[0]), history, query)
     return pending

@@ -19,6 +19,7 @@ from vllm_ascend.distributed.kv_transfer.sparse_offload.selected_prefill_lmcache
     native_block_size,
     native_part_widths,
     scatter_native_rows,
+    selected_lmcache_max_query,
 )
 from vllm_ascend.distributed.kv_transfer.sparse_offload.prefill_selected_workspace import (
     MIN_HISTORY_TOKENS,
@@ -219,6 +220,18 @@ def test_selected_adapter_rejects_unknown_layers():
 class FakeStep:
     def __init__(self, requests) -> None:
         self.requests = requests
+
+
+def test_selected_lmcache_max_query_env(monkeypatch):
+    name = "VLLM_ASCEND_SELECTED_PREFILL_LMCACHE_MAX_QUERY"
+    monkeypatch.setenv(name, "128")
+    assert selected_lmcache_max_query() == 128
+    monkeypatch.setenv(name, "1")
+    with pytest.raises(ValueError, match="at least 2"):
+        selected_lmcache_max_query()
+    monkeypatch.setenv(name, "not-an-int")
+    with pytest.raises(ValueError, match="must be an integer"):
+        selected_lmcache_max_query()
 
 
 def test_builder_requires_the_minimum_history(monkeypatch):
