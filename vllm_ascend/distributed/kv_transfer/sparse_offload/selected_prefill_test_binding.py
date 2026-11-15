@@ -122,7 +122,9 @@ def prepare_selected_test(
         return None
     starts = runner.query_start_loc.np[:2]
     query = int(starts[1] - starts[0])
-    if query <= 0:
+    # Q=1 currently selects a much slower path in the fused planner; keep the
+    # one-token tail on the native path.
+    if query < 2:
         return None
     pages = _history_pages(history)
     table = runner.input_batch.block_table[runner._selected_test_packed_gid]
@@ -153,7 +155,7 @@ def bind_selected_test(runner: "NPUModelRunner", attn_metadata) -> None:
     history = int(runner.input_batch.num_computed_tokens_cpu[0])
     starts = runner.query_start_loc.np[:2]
     query = int(starts[1] - starts[0])
-    if history < MIN_HISTORY_TOKENS or query <= 0:
+    if history < MIN_HISTORY_TOKENS or query < 2:
         return
     runner._selected_test_metric = {
         "arm": runner._selected_test_arm,
