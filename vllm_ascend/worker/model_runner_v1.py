@@ -146,6 +146,9 @@ from vllm_ascend.distributed.kv_transfer.sparse_offload.resident_sparse_cache im
     MAX_INT16_SCRATCH_CAPACITY,
     ResidentRequestStateRegistry,
 )
+from vllm_ascend.distributed.kv_transfer.sparse_offload.selected_prefill_lmcache_source import (
+    runner_selected_prefill,
+)
 from vllm_ascend.eplb.adaptor.vllm_adaptor import VllmEplbAdaptor
 from vllm_ascend.eplb.core.eplb_device_transfer_loader import D2DExpertWeightLoader
 from vllm_ascend.eplb.core.eplb_worker import EplbProcess
@@ -421,6 +424,8 @@ class NPUModelRunner(GPUModelRunner):
     def maybe_get_kv_connector_output(
         scheduler_output: SchedulerOutput,
         defer_finalize: bool = False,
+        selected_prefill_step: object | None = None,
+        selected_runner: object | None = None,
     ) -> Iterator[KVConnectorOutput | None]:
         """Defer worker metadata and cleanup until post-draft finalization."""
         if not has_kv_transfer_group():
@@ -437,7 +442,28 @@ class NPUModelRunner(GPUModelRunner):
 
         defer_clear = defer_finalize
         try:
-            connector.start_load_kv(get_forward_context())
+            if selected_prefill_step is not None:
+                connector.start_load_kv(
+                    get_forward_context(),
+                    selected_prefill_step=getattr(
+                        selected_prefill_step, "step", selected_prefill_step
+                    ),
+                )
+            else:
+                connector.start_load_kv(get_forward_context())
+            if selected_runner is not None:
+                from vllm_ascend.distributed.kv_transfer.sparse_offload.selected_prefill_lmcache_source import (
+                    bind_acquired_selected,
+                    clear_selected_binding,
+                )
+
+                attention_metadata = get_forward_context().attn_metadata
+                if selected_prefill_step is not None:
+                    bind_acquired_selected(
+                        selected_runner, selected_prefill_step, attention_metadata
+                    )
+                else:
+                    clear_selected_binding(selected_runner, attention_metadata)
             try:
                 yield output
             finally:
@@ -667,6 +693,9 @@ class NPUModelRunner(GPUModelRunner):
         )
         self._mixed_indexer_c8_names = None
         self.selected_kv_runtime = None
+        self._selected_lmcache_runtime = None
+        self._selected_lmcache_active = None
+        self._selected_lmcache_connector_ready = False
         self._selected_test_store = None
         self._selected_test_packed_gid = None
         self._selected_test_names = []
@@ -2375,6 +2404,11 @@ class NPUModelRunner(GPUModelRunner):
 
         # Run forward pass
         clear_kv_metadata = self.speculative_config is None
+        selected_prefill_step = (
+            runner_selected_prefill(self)
+            if self.selected_kv_runtime is not None
+            else None
+        )
         with (
             record_function_or_nullcontext("forward"),
             set_ascend_forward_context(
@@ -2400,6 +2434,8 @@ class NPUModelRunner(GPUModelRunner):
                 **(
                     {"defer_finalize": not clear_kv_metadata}
                 ),
+                selected_prefill_step=selected_prefill_step,
+                selected_runner=self,
             ) as kv_connector_output,
         ):
             # Connector metadata is bound by maybe_get_kv_connector_output's
@@ -2421,12 +2457,19 @@ class NPUModelRunner(GPUModelRunner):
             )
 
             bind_selected_test(self, attn_metadata)
+            from vllm_ascend.distributed.kv_transfer.sparse_offload.selected_prefill_lmcache_source import (
+                finish_selected_lmcache,
+            )
+
+            forward_failed = True
             try:
                 hidden_states = self._model_forward(
                     num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
                 )
+                forward_failed = False
             finally:
                 finish_selected_test(self)
+                finish_selected_lmcache(self, failed=forward_failed)
                 capture_selected_history(self, attn_metadata)
             if staged_sfa_graph_key is not None:
                 for _, impl in self._staged_sfa_impls:
@@ -5200,8 +5243,19 @@ class NPUModelRunner(GPUModelRunner):
         from vllm_ascend.distributed.kv_transfer.sparse_offload.selected_prefill_test_binding import (
             initialize_selected_test,
         )
+        from vllm_ascend.distributed.kv_transfer.sparse_offload.selected_prefill_lmcache_source import (
+            initialize_selected_lmcache,
+            selected_lmcache_enabled,
+        )
 
-        initialize_selected_test(self, kv_cache_config, kv_caches)
+        if selected_lmcache_enabled():
+            if envs_ascend.VLLM_ASCEND_SELECTED_PREFILL_TEST:
+                raise ValueError(
+                    "Selected LMCache source cannot share the host-arena test runtime"
+                )
+            initialize_selected_lmcache(self, kv_cache_config, kv_caches)
+        else:
+            initialize_selected_test(self, kv_cache_config, kv_caches)
         if self._sfa_full_graph.retrieval_overlap is not None:
             self._sfa_full_graph.retrieval_overlap.configure(
                 self._collect_staged_sfa_impls(), self._shared_resident_groups, kv_caches,

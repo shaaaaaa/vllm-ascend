@@ -2933,6 +2933,31 @@ class AscendSFAImpl(MLAAttentionImpl):
                 selected.prefetch_next(layer_name)
             return out
 
+        elif kv_override is None:
+            # Real-LMCache selected source: fill only the selected history rows
+            # of the native MLA pages before the unchanged whole-batch SFA.
+            selected = (
+                getattr(attn_metadata, "selected_kv", None)
+                if attn_metadata is not None
+                else None
+            )
+            if (
+                selected is not None
+                and layer_name is not None
+                and getattr(selected.runtime, "native_latent", False)
+            ):
+                native_cache = (
+                    (kv_cache[0], kv_cache[1])
+                    if isinstance(kv_cache, (tuple, list)) and len(kv_cache) >= 2
+                    else kv_cache
+                )
+                selected.load(
+                    layer_name,
+                    topk_indices,
+                    native_cache,
+                    attn_metadata,
+                )
+
         if kv_override is not None:
             kv = kv_override
             key_rope = key_rope_override

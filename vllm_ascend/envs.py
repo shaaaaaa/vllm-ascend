@@ -172,6 +172,11 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_SELECTED_PREFILL_TEST_MAX_PAGES": lambda: int(
         os.getenv("VLLM_ASCEND_SELECTED_PREFILL_TEST_MAX_PAGES", "1024")
     ),
+    # Real-LMCache selected source: copy only the indexer's selected history
+    # rows out of the connector's acquired host pages into the native MLA KV.
+    "VLLM_ASCEND_SELECTED_PREFILL_LMCACHE": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_SELECTED_PREFILL_LMCACHE", "0"))
+    ),
     # DSA shared bundle pool. Requires DSA_UNBUNDLE=1 and DSA_TWO_GROUPS=1.
     # vLLM owns one physical bundle allocator while exposing two logical block
     # tables: latent (k_nope+k_pe) and indexer. vLLM-Ascend backs sibling latent
