@@ -121,7 +121,7 @@ def execute_sfa_dcp(
     query: torch.Tensor, rope: torch.Tensor, kv_cache: tuple[torch.Tensor, ...],
     topk: torch.Tensor, counts: torch.Tensor, block_table: torch.Tensor,
     query_ends: torch.Tensor, local_seq_lens: torch.Tensor, scale: float, group,
-    *, prefetch: tuple | None = None,
+    *, prefetch: tuple | None = None, _direct_exchange: bool = False,
 ) -> torch.Tensor:
     """Gather only query heads, then return the merged output for this head owner."""
     query, rope = _gather_sfa_dcp_queries(query, rope, group)
@@ -133,6 +133,8 @@ def execute_sfa_dcp(
     if prefetch is not None:
         edge, selected, miss_counts, slots, destinations = prefetch
         edge.launch(selected, miss_counts, slots, destinations)
+    if _direct_exchange:
+        return merge_sfa_dcp(*partial, group.device_group, _direct=True)
     return merge_sfa_dcp(*partial, group.device_group)
 
 
@@ -169,14 +171,22 @@ def _unpack_stat(ptr):
 
 
 @triton.jit
-def _combine(recv, output, local_rows: tl.constexpr, world: tl.constexpr, value_dim: tl.constexpr):
+def _combine(recv, output, local_rows: tl.constexpr, world: tl.constexpr, value_dim: tl.constexpr,
+             maximum=None, exp_sums=None, local_heads: tl.constexpr = 0):
     features = tl.arange(0, value_dim)
     peers = tl.arange(0, world)
     stride = value_dim + 16
     for row in range(tl.program_id(0), local_rows, tl.num_programs(0)):
-        stats = recv + (peers * local_rows + row) * stride + value_dim
-        maxima = _unpack_stat(stats)
-        sums = _unpack_stat(stats + 4)
+        if maximum is None:
+            stats = recv + (peers * local_rows + row) * stride + value_dim
+            maxima = _unpack_stat(stats)
+            sums = _unpack_stat(stats + 4)
+        else:
+            # Direct exchange writes [token, source_rank, local_head] planes.
+            offsets = (row // local_heads * world + peers) * local_heads + row % local_heads
+            sums = tl.load(exp_sums + offsets)
+            maxima = tl.where(sums > 0, tl.load(maximum + offsets), -float("inf"))
+            sums = tl.where(sums > 0, sums, 0.0)
         best = tl.max(maxima, axis=0)
         best = tl.where(best == -float("inf"), 0.0, best)
         weights = sums * tl.exp(maxima - best)
@@ -185,7 +195,10 @@ def _combine(recv, output, local_rows: tl.constexpr, world: tl.constexpr, value_
         weights = weights / tl.where(total > 0, total, 1.0)
         result = tl.zeros((value_dim,), tl.float32)
         for peer in tl.static_range(world):
-            offset = (peer * local_rows + row) * stride
+            if maximum is None:
+                offset = (peer * local_rows + row) * stride
+            else:
+                offset = ((row // local_heads * world + peer) * local_heads + row % local_heads) * value_dim
             partial = tl.load(recv + offset + features).to(tl.float32)
             result += get_element(weights, (peer,)) * partial
         tl.store(output + row * value_dim + features, result)
@@ -196,6 +209,7 @@ def merge_sfa_dcp(
     maximum: torch.Tensor,
     total: torch.Tensor,
     group: dist.ProcessGroup,
+    *, _direct: bool = False,
 ) -> torch.Tensor:
     """Exchange only the partials needed by each TP head owner."""
     rows, heads, value_dim = partial.shape
@@ -213,6 +227,22 @@ def merge_sfa_dcp(
     ):
         raise ValueError("DCP attention requires contiguous partials and FP32 statistics")
     local_heads = heads // world
+    if _direct:
+        # Experimental, benchmark-only path: each native row already contains
+        # consecutive head-owner slices. HCCL cannot send several disjoint
+        # segments to the same peer in one BatchSendRecv. Use 3*rows ordinary
+        # exchanges, preserving the FP32 statistics without encoding/copies.
+        received = tuple(torch.empty_like(t) for t in (partial, maximum, total))
+        for row in range(rows):
+            for source, dest in zip((partial, maximum, total), received):
+                dist.all_to_all_single(dest[row], source[row], group=group)
+        output = partial.new_empty((rows, local_heads, value_dim))
+        init_device_properties_triton()
+        _combine[(min(rows * local_heads, get_vectorcore_num()),)](
+            received[0], output, rows * local_heads, world, value_dim,
+            received[1], received[2], local_heads,
+        )
+        return output
     send = partial.new_empty((world, rows, local_heads, value_dim + 16))
     recv = torch.empty_like(send)
     output = partial.new_empty((rows, local_heads, value_dim))
