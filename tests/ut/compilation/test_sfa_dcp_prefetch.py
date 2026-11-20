@@ -89,6 +89,7 @@ def test_merge_releases_copy_after_pack_before_exchange_wait(runtime, failure):
         },
     )
     partial = torch.zeros(2, 64, 512, dtype=torch.bfloat16)
+    extract(OPS, "_exchange_sfa_dcp_packet", merge.__globals__)
     stats = torch.ones(2, 64)
     payload = (
         edge,

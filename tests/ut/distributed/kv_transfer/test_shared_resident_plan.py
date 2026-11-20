@@ -336,7 +336,8 @@ def test_dcp_unpack_stream_bound_once_to_selected_layers(api, monkeypatch, mode,
     runner, ns = runner_api(layers, ["full", "shared", "full", "shared", "full"])
     runner.dsa_decoder_dcp = True
     ns["envs_ascend"] = NS(VLLM_ASCEND_SFA_FULL_GRAPH=True, VLLM_ASCEND_SFA_DCP_EARLY_GATHER=True,
-                            VLLM_ASCEND_SFA_DCP_EARLY_UNPACK=mode, VLLM_ASCEND_SFA_DCP_UNPACK_CORES=6)
+                            VLLM_ASCEND_SFA_DCP_EARLY_UNPACK=mode, VLLM_ASCEND_SFA_DCP_UNPACK_CORES=6,
+                            VLLM_ASCEND_SFA_DCP_PACKET_IO="off")
     for layer in layers:
         layer._dcp_query_first = q_first
     stream = Mock()

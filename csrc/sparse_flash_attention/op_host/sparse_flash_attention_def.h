@@ -20,7 +20,7 @@
 namespace ops {
 class SparseFlashAttention : public OpDef {
 public:
-    explicit SparseFlashAttention(const char *name, bool dcp = false) : OpDef(name)
+    explicit SparseFlashAttention(const char *name, bool dcp = false, bool packet = false) : OpDef(name)
     {
         this->Input("query")
             .ParamType(REQUIRED)
@@ -78,7 +78,7 @@ public:
             .ParamType(REQUIRED)
             .DataType({ge::DT_FLOAT16, ge::DT_BF16})
             .Format({ge::FORMAT_ND, ge::FORMAT_ND});
-        if (dcp) {
+        if (dcp && !packet) {
             for (const char *output : {"softmax_max", "softmax_sum"}) {
                 this->Output(output)
                     .ParamType(REQUIRED)
@@ -91,6 +91,9 @@ public:
         this->Attr("layout_query").AttrType(OPTIONAL).String("BSND");
         this->Attr("layout_kv").AttrType(OPTIONAL).String("BSND");
         this->Attr("sparse_mode").AttrType(OPTIONAL).Int(3);
+        if (packet) {
+            this->Attr("local_heads").AttrType(REQUIRED).Int();
+        }
         OpAICoreConfig aicore_config;
         aicore_config.DynamicCompileStaticFlag(true)
             .DynamicFormatFlag(true)

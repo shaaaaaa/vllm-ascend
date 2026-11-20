@@ -531,6 +531,11 @@ class NPUWorker(WorkerBase):
             )
         ):
             raise ValueError("Rebuild vllm-ascend with the decoder DCP custom operators")
+        packet_mode = envs_ascend.VLLM_ASCEND_SFA_DCP_PACKET_IO
+        if packet_mode not in ("off", "output", "direct", "fused"):
+            raise ValueError("VLLM_ASCEND_SFA_DCP_PACKET_IO must be off, output, direct or fused")
+        if packet_mode != "off" and not hasattr(torch.ops._C_ascend, "npu_sparse_flash_attention_dcp_packet"):
+            raise ValueError("Rebuild vllm-ascend with SparseFlashAttentionDcpPacket for DCP packet I/O")
 
         from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
 

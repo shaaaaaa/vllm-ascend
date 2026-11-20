@@ -102,6 +102,9 @@ __aicore__ inline void DataCopyPA(LocalTensor<T> &dstTensor,  //l1
 
 template <typename SFAT> class SFAMatmulService {
 public:
+#ifdef SFA_DCP_PACKET
+    DcpPacketLayout packet;
+#endif
     using T = float;
     using Q_T = typename SFAT::queryType;
     using KV_T = typename SFAT::kvType;
@@ -216,7 +219,21 @@ private:
     }
 
     __aicore__ inline void CopyGmToL1(LocalTensor<KV_T> &l1Tensor, GlobalTensor<KV_T> &gmSrcTensor, uint32_t srcN,
-                                      uint32_t srcD, uint32_t srcDstride);
+                                      uint32_t srcD, uint32_t srcDstride, uint32_t dstRows = 0);
+#ifdef SFA_DCP_PACKET
+    __aicore__ inline void CopyPacketToL1(LocalTensor<KV_T> dst, uint64_t logical, uint32_t rows,
+                                          uint32_t width, uint32_t feature)
+    {
+        for (uint32_t i = 0; i < rows;) {
+            uint32_t count = packet.PacketRun(logical + i, rows - i);
+            auto src = queryGm[packet.PacketRow(logical + i) * packet.queryWidth + feature];
+            // Each head owns one 32-byte C0 block in every column of the full NZ tile.
+            auto segment = dst[i * 16];
+            CopyGmToL1(segment, src, count, width, packet.queryWidth, rows);
+            i += count;
+        }
+    }
+#endif
     __aicore__ inline void CopyInMm1AToL1(LocalTensor<KV_T> &aL1Tensor, const RunInfo &info, uint32_t mSeqIdx,
                                           uint32_t mSizeAct, uint32_t headSize, uint32_t headOffset);
     __aicore__ inline void CopyInMm1ARopeToL1(LocalTensor<KV_T> &aL1Tensor, const RunInfo &info, uint32_t mSeqIdx,
@@ -339,14 +356,14 @@ template <typename SFAT> __aicore__ inline void SFAMatmulService<SFAT>::FreeEven
 template <typename SFAT>
 __aicore__ inline void SFAMatmulService<SFAT>::CopyGmToL1(LocalTensor<KV_T> &l1Tensor,
                                                                  GlobalTensor<KV_T> &gmSrcTensor, uint32_t srcN,
-                                                                 uint32_t srcD, uint32_t srcDstride)
+                                                                 uint32_t srcD, uint32_t srcDstride, uint32_t dstRows)
 {
     Nd2NzParams nd2nzPara;
     nd2nzPara.ndNum = 1;
     nd2nzPara.nValue = srcN;
     nd2nzPara.dValue = srcD;
     nd2nzPara.srcDValue = srcDstride;
-    nd2nzPara.dstNzC0Stride = (srcN + 15) / 16 * 16;
+    nd2nzPara.dstNzC0Stride = SFAAlign(dstRows == 0 ? srcN : dstRows, 16U);
     nd2nzPara.dstNzNStride = 1;
     nd2nzPara.srcNdMatrixStride = 0;
     nd2nzPara.dstNzMatrixStride = 0;
@@ -358,6 +375,12 @@ __aicore__ inline void SFAMatmulService<SFAT>::CopyInMm1AToL1(LocalTensor<KV_T> 
                                                                      uint32_t mSeqIdx, uint32_t mSizeAct,
                                                                      uint32_t headSize, uint32_t headOffset)
 {
+#ifdef SFA_DCP_PACKET
+    if (packet.packedQuery) {
+        CopyPacketToL1(l1Tensor, info.tensorAOffset / constInfo.headDim + mSeqIdx, mSizeAct, headSize, headOffset);
+        return;
+    }
+#endif
     auto srcGm = queryGm[info.tensorAOffset + mSeqIdx * constInfo.headDim + headOffset];
     CopyGmToL1(l1Tensor, srcGm, mSizeAct, headSize, constInfo.headDim);
 }
@@ -367,6 +390,12 @@ __aicore__ inline void SFAMatmulService<SFAT>::CopyInMm1ARopeToL1(LocalTensor<KV
                                                                          const RunInfo &info, uint32_t mSeqIdx,
                                                                          uint32_t mSizeAct)
 {
+#ifdef SFA_DCP_PACKET
+    if (packet.packedQuery) {
+        CopyPacketToL1(l1Tensor, info.tensorAOffset / constInfo.headDim + mSeqIdx, mSizeAct, packet.rope, packet.latent);
+        return;
+    }
+#endif
     auto srcGm = qRopeGm[info.tensorARopeOffset + mSeqIdx * constInfo.headDimRope];
     CopyGmToL1(l1Tensor, srcGm, mSizeAct, constInfo.headDimRope, constInfo.headDimRope);
 }

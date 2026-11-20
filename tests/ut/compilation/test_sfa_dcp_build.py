@@ -19,7 +19,7 @@ def test_sfa_aclnn_sources_match_selected_operators(tmp_path, dcp):
         pytest.skip("requires CMake and Ninja")
 
     native = ROOT / "csrc"
-    ops = ["sparse_flash_attention", "sparse_flash_attention_dcp"]
+    ops = ["sparse_flash_attention", "sparse_flash_attention_dcp", "sparse_flash_attention_dcp_packet"]
     for op in ops:
         shutil.copytree(native / op / "op_host", tmp_path / op / "op_host")
     selected = ops if dcp else ops[:1]
@@ -64,6 +64,9 @@ def test_sfa_torch_adapter_arguments_compile(tmp_path):
     bridge = (native / "aclnn_torch_adapter/op_api_common.h").read_text(encoding="utf-8")
     start = bridge.index("template <typename... Ts>\nconstexpr auto ConvertTypes(")
     converter = bridge[start : bridge.index("\n}", start) + 2]
+    meta = (native / "torch_binding_meta.cpp").read_text(encoding="utf-8")
+    start = meta.index("at::Tensor npu_sparse_flash_attention_dcp_packet_meta(")
+    packet_meta = meta[start : meta.index("\n}", start) + 2]
     source = tmp_path / "sfa_adapter.cpp"
     # Keep the real Torch types and ConvertTypes contract in the launch stub.
     source.write_text(
@@ -81,6 +84,7 @@ T ConvertType(T value) {{ return value; }}
 
 #define EXEC_NPU_CMD(op, ...) static_cast<void>(ConvertTypes(__VA_ARGS__))
 #include "sparse_flash_attention_torch_adpt.h"
+{packet_meta}
 """,
         encoding="utf-8",
     )

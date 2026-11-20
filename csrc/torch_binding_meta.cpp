@@ -672,6 +672,17 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> npu_sparse_flash_attention_dcp_me
     return {at::empty_symint(query.sym_sizes(), query.options()), stats, at::empty_like(stats)};
 }
 
+at::Tensor npu_sparse_flash_attention_dcp_packet_meta(
+    const at::Tensor &q, const c10::optional<at::Tensor> &rope, const at::Tensor &, const at::Tensor &,
+    const at::Tensor &, const at::Tensor &, const at::Tensor &, const at::Tensor &, const at::Tensor &, double, int64_t world)
+{
+    TORCH_CHECK((world == 2 || world == 4 || world == 8) && q.dim() == (rope.has_value() ? 3 : 4),
+                "invalid DCP packet geometry");
+    auto rows = rope.has_value() ? q.sym_size(0) : q.sym_size(1);
+    auto local = rope.has_value() ? q.sym_size(1) / world : q.sym_size(2);
+    return at::empty_symint({world, rows, local, 528}, q.options());
+}
+
 std::tuple<at::Tensor, at::Tensor> matmul_allreduce_add_rmsnorm_meta(
     const at::Tensor &x1,
     const at::Tensor &x2,
@@ -1086,6 +1097,7 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
     // Sparse flash attention
     ops.impl("npu_sparse_flash_attention", &vllm_ascend::meta::npu_sparse_flash_attention_meta);
     ops.impl("npu_sparse_flash_attention_dcp", &vllm_ascend::meta::npu_sparse_flash_attention_dcp_meta);
+    ops.impl("npu_sparse_flash_attention_dcp_packet", &vllm_ascend::meta::npu_sparse_flash_attention_dcp_packet_meta);
     // MoE dispatch-ffn-combine
     ops.impl("dispatch_ffn_combine", &vllm_ascend::meta::dispatch_ffn_combine_meta);
     // matmul allreduce add rmsnorm

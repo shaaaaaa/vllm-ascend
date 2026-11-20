@@ -43,6 +43,9 @@ def query_first_world():
         ("prefetch-after-pack", False),
         ("prefetch-after-pack", True),
         ("early-unpack", True),
+        ("output", True),
+        ("direct", True),
+        ("fused", True),
     ],
 )
 def test_query_first_group_replay(
@@ -51,6 +54,7 @@ def test_query_first_group_replay(
     monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[3] / "benchmarks/ops"))
     from benchmark_sfa_copy_reduction import measure_case
     from benchmark_sfa_dcp_early_unpack import UnpackPipeline
+    from benchmark_sfa_dcp_packet_io import packet_pipeline
     from benchmark_sfa_dcp_prefetch import prefetch_pipeline
     from benchmark_sfa_dcp_query_first import QueryFirstPipeline
 
@@ -82,6 +86,8 @@ def test_query_first_group_replay(
         qk_nope=128,
         value_dim=128,
         query_first=query_first,
+        stage=comparison,
+        reference_stage="off",
         unpack_placement="both",
         unpack_cores=6,
         indexer="c8",
@@ -93,6 +99,9 @@ def test_query_first_group_replay(
         "query-first": QueryFirstPipeline,
         "prefetch-after-pack": prefetch_pipeline,
         "early-unpack": UnpackPipeline,
+        "output": packet_pipeline,
+        "direct": packet_pipeline,
+        "fused": packet_pipeline,
     }[comparison]
     result = measure_case(args, control, pipeline_factory=factory)
     assert result["parity"] == "passed"

@@ -339,6 +339,8 @@ void SFAMlaTiling::FillTilingBaseParamsMla()
     tilingData_.baseParams.set_sparseMode(sfaInfo_->sparseMode);
     tilingData_.baseParams.set_sparseBlockSize(sfaInfo_->sparseBlockSize);
     tilingData_.baseParams.set_sparseBlockCount(sfaInfo_->sparseBlockCount);
+    tilingData_.set_packetLocalHeads(sfaInfo_->packetLocalHeads);
+    tilingData_.set_packetQuery(sfaInfo_->packetQuery);
 }
 
 // for flash decode
@@ -459,10 +461,11 @@ ge::graphStatus SFAMlaTiling::DoOpTiling(SFATilingInfo *sfaInfo)
     return ge::GRAPH_SUCCESS;
 }
 
+template<bool Packet = false>
 ge::graphStatus TilingSparseFlashAttention(gert::TilingContext *context)
 {
     SFATilingInfo sfaInfo;
-    SFAInfoParser sfaInfoParser(context);
+    SFAInfoParser sfaInfoParser(context, Packet);
     if (sfaInfoParser.Parse(sfaInfo) != ge::GRAPH_SUCCESS) {
         return ge::GRAPH_FAILED;
     }
@@ -860,6 +863,13 @@ void SFATilingCheck::SetSFAShapeCompare()
     attenOutShapeCmp_ = opParamInfo_.attenOut.shape->GetStorageShape();
     queryRopeShapeCmp_ = opParamInfo_.queryRope.tensor->GetStorageShape();
     keyRopeShapeCmp_ = opParamInfo_.keyRope.tensor->GetStorageShape();
+    if (sfaInfo_.packetLocalHeads != 0) {
+        // Physical widths were validated by the packet parser. Reuse the
+        // original SFA geometry checks and tiling for the logical planes.
+        attenOutShapeCmp_.SetDim(2, 512);
+        queryShapeCmp_.SetDim(2, 512);
+        queryRopeShapeCmp_.SetDim(2, 64);
+    }
 }
 
 ge::graphStatus SFATilingCheck::CheckBlockTable() const
@@ -1815,6 +1825,34 @@ ge::graphStatus SFAInfoParser::Parse(SFATilingInfo &sfaInfo)
     }
 
     SetSFAShape();
+    if (packet_) {
+        const auto *local = context_->GetAttrs()->GetAttrPointer<int64_t>(DCP_LOCAL_HEADS_ATTR_INDEX);
+        const auto &out = opParamInfo_.attenOut.shape->GetStorageShape();
+        const auto *counts = context_->GetInputShape(DCP_COUNTS_INPUT_INDEX);
+        if (local == nullptr || *local <= 0 || qLayout_ != SFALayout::TND || kvLayout_ != SFALayout::PA_BSND ||
+            queryShape_.GetDimNum() != 3 || queryRopeShape_.GetDimNum() != 3 || out.GetDimNum() != 3 ||
+            counts == nullptr || counts->GetStorageShape().GetDimNum() != 2 || keyShape_.GetDimNum() != 4 ||
+            opParamInfo_.actualSeqLengthsQ.tensor == nullptr || opParamInfo_.actualSeqLengths.tensor == nullptr ||
+            *opParamInfo_.sparseBlockSize != 1 || *opParamInfo_.sparseMode != 0) {
+            OPS_LOG_E(opName_, "DCP packet attention requires counted TND queries, paged KV and positive local_heads.");
+            return ge::GRAPH_FAILED;
+        }
+        const auto rows = queryShape_.GetDim(0), heads = queryShape_.GetDim(1), width = queryShape_.GetDim(2);
+        const auto world = heads / *local;
+        if (rows <= 0 || heads <= 0 || heads % 8 || heads % *local || (world != 2 && world != 4 && world != 8) ||
+            (width != 512 && width != 576) || queryRopeShape_.GetDim(2) != (width == 576 ? 576 : 64) ||
+            queryRopeShape_.GetDim(0) != rows || queryRopeShape_.GetDim(1) != heads ||
+            out.GetDim(0) != rows || out.GetDim(1) != heads ||
+            out.GetDim(2) != 528 || counts->GetStorageShape().GetDim(0) != rows ||
+            counts->GetStorageShape().GetDim(1) != 16 || keyShape_.GetDim(2) != 1) {
+            OPS_LOG_E(opName_, "Incompatible DCP packet query, output, group or selected-count geometry.");
+            return ge::GRAPH_FAILED;
+        }
+        sfaInfo.packetLocalHeads = static_cast<uint32_t>(*local);
+        sfaInfo.packetQuery = width == 576;
+        queryShape_.SetDim(2, 512);
+        queryRopeShape_.SetDim(2, 64);
+    }
     if (
         ge::GRAPH_SUCCESS != GetN1Size() ||
         ge::GRAPH_SUCCESS != GetN2Size() ||
@@ -1840,9 +1878,12 @@ ge::graphStatus SFAInfoParser::Parse(SFATilingInfo &sfaInfo)
 }
 
 IMPL_OP_OPTILING(SparseFlashAttention)
-    .Tiling(TilingSparseFlashAttention)
+    .Tiling(TilingSparseFlashAttention<>)
     .TilingParse<SparseFlashAttentionCompileInfo>(TilingPrepareForSparseFlashAttention);
 IMPL_OP_OPTILING(SparseFlashAttentionDcp)
-    .Tiling(TilingSparseFlashAttention)
+    .Tiling(TilingSparseFlashAttention<>)
+    .TilingParse<SparseFlashAttentionCompileInfo>(TilingPrepareForSparseFlashAttention);
+IMPL_OP_OPTILING(SparseFlashAttentionDcpPacket)
+    .Tiling(TilingSparseFlashAttention<true>)
     .TilingParse<SparseFlashAttentionCompileInfo>(TilingPrepareForSparseFlashAttention);
 } // namespace optiling

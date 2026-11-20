@@ -68,6 +68,8 @@ extend-ignore-words-re = []
 extend-ignore-re = []
 
 [type.cpp.extend-identifiers]
+Nd2NzParams = "Nd2NzParams"
+srcNdMatrixStride = "srcNdMatrixStride"
 countr_one = "countr_one"
 
 [type.cpp.extend-words]

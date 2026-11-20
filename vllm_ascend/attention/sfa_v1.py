@@ -1998,6 +1998,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         self.kv_cache_dtype = kv_cache_dtype
 
         self._dcp_early_gather = envs.VLLM_ASCEND_SFA_DCP_EARLY_GATHER
+        self._dcp_packet_io = envs.VLLM_ASCEND_SFA_DCP_PACKET_IO
         self._dcp_query_first = envs.VLLM_ASCEND_SFA_DCP_QUERY_FIRST
         self._dcp_prefetch_after_pack = envs.VLLM_ASCEND_SFA_DCP_PREFETCH_AFTER_PACK
 
@@ -3783,6 +3784,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         dcp: DcpSFABatch | None = None,
         query_ready=None,
         query_first: bool = False,
+        packet_rope=None,
     ) -> tuple[torch.Tensor, ...]:
         """Pre-retrieval compute captured by the outer PIECEWISE graph.
 
@@ -3835,7 +3837,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         if query_first:
             assert not self.has_indexer and not self.dsa_cp_decoder and query_ready is not None
             ql_nope, q_pe = self._q_proj_and_k_up_proj(q_c)
-            q_pe = self.rope_single(q_pe, cos, sin)
+            q_pe = self.rope_single(q_pe, cos, sin) if packet_rope is None else packet_rope(ql_nope, q_pe, cos, sin)
             # Submit Q exchange, then join any incoming retrieval before the
             # first cache access below. Q projection itself never reads KV.
             query_ready(ql_nope, q_pe)
@@ -3876,7 +3878,7 @@ class AscendSFAImpl(MLAAttentionImpl):
 
         if not query_first:
             ql_nope, q_pe = self._q_proj_and_k_up_proj(q_c)
-            q_pe = self.rope_single(q_pe, cos, sin)
+            q_pe = self.rope_single(q_pe, cos, sin) if packet_rope is None else packet_rope(ql_nope, q_pe, cos, sin)
             if query_ready is not None:
                 query_ready(ql_nope, q_pe)
 
@@ -4452,6 +4454,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         copy_bridge: bool = True,
         query_ready=None,
         query_first: bool = False,
+        packet_rope=None,
     ) -> tuple[torch.Tensor, ...]:
         """Run graph A, or the complete native path outside staged replay."""
         context = get_forward_context()
@@ -4638,6 +4641,7 @@ class AscendSFAImpl(MLAAttentionImpl):
             dcp=getattr(attn_metadata, "sfa_dcp", None),
             **({"query_ready": query_ready} if query_ready is not None else {}),
             **({"query_first": True} if query_first else {}),
+            **({"packet_rope": packet_rope} if packet_rope is not None else {}),
         )
         if copy_bridge or getattr(attn_metadata, "sfa_dcp", None) is None:
             # Ordinary SFA still needs contiguous query planes. A DCP full

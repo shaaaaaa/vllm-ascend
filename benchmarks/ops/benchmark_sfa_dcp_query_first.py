@@ -12,6 +12,7 @@ import os
 import statistics
 import sys
 from datetime import timedelta
+from itertools import product
 from pathlib import Path
 from types import MethodType, SimpleNamespace
 
@@ -92,7 +93,8 @@ class QueryFirstPipeline(AttentionPipeline):
             active = torch.nonzero(rows >= 0).flatten().to(self.device)
             raw[active, 0, -1] = positions.index_select(0, active).int()
             angles = pos.float()[:, None] / (10000 ** (torch.arange(ROPE // 2).float() / (ROPE // 2)))
-            angles = angles.repeat_interleave(2, dim=-1).reshape(self.tokens, 1, 1, ROPE)
+            # InterleaveRope maps the real/imaginary samples to two feature halves.
+            angles = angles.repeat(1, 2).reshape(self.tokens, 1, 1, ROPE)
             self.frame_inputs[raw.data_ptr()] = (
                 tensor(self.tokens, args.hidden_size),
                 angles.cos().to(self.device, torch.bfloat16),
@@ -100,6 +102,15 @@ class QueryFirstPipeline(AttentionPipeline):
                 slots.to(self.device),
             )
         self.rms_norm = torch_npu.npu_rms_norm
+
+    def _project_queries(self, impl, q_c, cos, sin, mode):
+        q, r = impl._q_proj_and_k_up_proj(q_c)
+        if mode == "fused":
+            from vllm_ascend.ops.triton.sfa_query import rope_sfa_dcp_query_packet
+
+            packet = rope_sfa_dcp_query_packet(q, r, cos, sin)
+            return q, packet[..., LATENT:], packet
+        return q, impl.rope_single(r, cos, sin), None
 
     def step(self, frame):
         from vllm_ascend.ops.triton.sfa_dcp import execute_sfa_dcp, start_sfa_dcp_query_gather
@@ -113,10 +124,12 @@ class QueryFirstPipeline(AttentionPipeline):
             if edge is not None and not query_first:
                 edge.join()
             pending = None
+            mode = getattr(self, "packet_mode", "off")
 
-            def query_ready(q, r, edge=edge, layer=layer):
+            def query_ready(q, r, packet, edge=edge, layer=layer, mode=mode):
                 nonlocal pending
-                pending = start_sfa_dcp_query_gather(q, r, self.group)
+                options = {"packet": packet, "packet_mode": mode} if mode != "off" else {}
+                pending = start_sfa_dcp_query_gather(q, r, self.group, **options)
                 if edge is not None and edge.pending_capture_launch:
                     edge.join()
                 if getattr(self, "unpack_placement", "off") in ("both", "consumer" if layer else "producer"):
@@ -126,18 +139,16 @@ class QueryFirstPipeline(AttentionPipeline):
                 q_c, kv = impl.qkv(hidden)[0].split([self.args.q_rank, LATENT + ROPE], dim=-1)
                 q_c = self.rms_norm(q_c, self.norm_weight, epsilon=1e-6)[0]
                 if query_first:
-                    q, r = impl._q_proj_and_k_up_proj(q_c)
-                    r = impl.rope_single(r, cos, sin)
-                    query_ready(q, r)
+                    q, r, packet = self._project_queries(impl, q_c, cos, sin, mode)
+                    query_ready(q, r, packet)
                 current = impl.exec_kv(kv, cos, sin, self.layer_caches[layer], slots, None)
                 # Validation retains the real op's returned current KV, outside
                 # timed verification; both arms have the same storage lifetime.
                 self.current_writes.append((slots, current))
                 if not query_first:
-                    q, r = impl._q_proj_and_k_up_proj(q_c)
-                    r = impl.rope_single(r, cos, sin)
+                    q, r, packet = self._project_queries(impl, q_c, cos, sin, mode)
                     if not layer or not self.edges:
-                        query_ready(q, r)
+                        query_ready(q, r, packet)
                 if not layer:
                     prepared = self.prepare(frame)
                 self._attend_layer(
@@ -185,8 +196,12 @@ class QueryFirstPipeline(AttentionPipeline):
 @torch.inference_mode()
 def main(*, comparison="query-first", pipeline_factory=QueryFirstPipeline, description=__doc__):
     parser = argparse.ArgumentParser(description=description)
-    if comparison == "early-unpack":
-        parser.add_argument("--unpack-placement", choices=("consumer", "producer", "both"), default="producer")
+    if comparison in ("early-unpack", "packet-io"):
+        parser.add_argument(
+            "--unpack-placement",
+            choices=("off", "consumer", "producer", "both"),
+            default="off" if comparison == "packet-io" else "producer",
+        )
         parser.add_argument("--unpack-cores", type=int, default=12)
         parser.add_argument(
             "--indexer",
@@ -195,6 +210,11 @@ def main(*, comparison="query-first", pipeline_factory=QueryFirstPipeline, descr
             help="run the native C8 Lightning Indexer or use controlled --overlap Top-K fixtures",
         )
         parser.add_argument("--prefetch-after-pack", action="store_true")
+    if comparison == "packet-io":
+        parser.add_argument("--reference-stage", choices=("off", "output", "direct", "fused"), default="off")
+        parser.add_argument(
+            "--stages", nargs="+", choices=("output", "direct", "fused"), default=["output", "direct", "fused"]
+        )
     if comparison == "prefetch-after-pack":
         parser.add_argument(
             "--query-first",
@@ -225,7 +245,7 @@ def main(*, comparison="query-first", pipeline_factory=QueryFirstPipeline, descr
     parser.add_argument("--profile-dir", type=Path)
     parser.add_argument("--json", type=Path, default=Path(f"sfa-dcp-{comparison}.json"))
     args = parser.parse_args()
-    if comparison == "early-unpack" and args.unpack_cores < 1:
+    if comparison in ("early-unpack", "packet-io") and args.unpack_cores < 1:
         parser.error("--unpack-cores must be positive")
     if comparison == "early-unpack" and args.unpack_placement == "consumer" and args.layers == 1:
         parser.error("consumer placement requires at least two layers")
@@ -255,6 +275,8 @@ def main(*, comparison="query-first", pipeline_factory=QueryFirstPipeline, descr
     torch.npu.set_device(args.device)
     if not enable_custom_op():
         raise RuntimeError("vLLM-Ascend native operators are unavailable")
+    if comparison == "packet-io" and not hasattr(torch.ops._C_ascend, "npu_sparse_flash_attention_dcp_packet"):
+        raise RuntimeError("Rebuild vLLM-Ascend with SparseFlashAttentionDcpPacket before running this benchmark")
     dist.init_process_group("hccl", timeout=timedelta(seconds=120))
     control = dist.new_group(backend="gloo", timeout=timedelta(seconds=120))
     results = {
@@ -271,28 +293,33 @@ def main(*, comparison="query-first", pipeline_factory=QueryFirstPipeline, descr
         "configuration": {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
         "cases": [],
     }
-    if comparison == "early-unpack" and args.indexer == "c8":
+    if comparison in ("early-unpack", "packet-io") and args.indexer == "c8":
         results["scope"] += ", native C8 Lightning Indexer with synthetic paged keys and query inputs"
         results["excludes"] = (
             "indexer input projections/cache updates, quantized projections, TP reduction, MoE, serving"
         )
     try:
-        for layout in args.layouts:
+        for layout, stage in product(args.layouts, getattr(args, "stages", [comparison])):
+            variant = f"{args.reference_stage}-to-{stage}" if comparison == "packet-io" else stage
             for requests in args.requests:
                 case_args = SimpleNamespace(
                     **{
                         **vars(args),
                         "layout": layout,
+                        "stage": stage,
+                        "profile_dir": args.profile_dir / variant
+                        if comparison == "packet-io" and args.profile_dir
+                        else args.profile_dir,
                         "requests": requests,
                         "shared_plan": True,
                         "heads": args.heads // args.dcp_size,
                     }
                 )
                 if not args.rank:
-                    print(f"Starting {comparison} {layout} batch={requests} DCP={args.dcp_size}", flush=True)
+                    print(f"Starting {variant} {layout} batch={requests} DCP={args.dcp_size}", flush=True)
                 case = measure_case(case_args, control, pipeline_factory=pipeline_factory)
                 case.update(
-                    variant=comparison,
+                    variant=variant,
                     slowest_rank_mean={
                         name: statistics.mean(
                             max(rank[name][i] for rank in case["per_rank_samples"])

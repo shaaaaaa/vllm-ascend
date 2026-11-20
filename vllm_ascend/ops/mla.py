@@ -493,7 +493,13 @@ def sfa_forward_full(
         and not impl._staged_graph_content_diagnostic_enabled(attn_layer_name)
     )
     pending = []
-    early = direct and getattr(impl, "_dcp_early_gather", False) and getattr(metadata, "sfa_dcp", None) is not None
+    dcp_direct = direct and getattr(metadata, "sfa_dcp", None) is not None
+    packet_mode = (
+        getattr(impl, "_dcp_packet_io", "off")
+        if dcp_direct and getattr(context, "staged_sfa_graph_key", None) is not None else "off"
+    )
+    packet = None
+    early = dcp_direct and getattr(impl, "_dcp_early_gather", False)
     query_first = (
         early and getattr(impl, "_dcp_query_first", False) and impl.skip_topk
         and not impl.has_indexer and not impl.dsa_cp_decoder
@@ -512,15 +518,23 @@ def sfa_forward_full(
         if incoming_edge is not None and incoming_edge.pending_capture_launch:
             incoming_edge.join()
 
+    def packet_rope(query, rope, cos, sin):
+        nonlocal packet
+        from vllm_ascend.ops.triton.sfa_query import rope_sfa_dcp_query_packet
+
+        packet = rope_sfa_dcp_query_packet(query, rope, cos, sin)
+        return packet[..., query.shape[-1]:]
+
     def query_ready(query, rope):
         from vllm_ascend.ops.triton.sfa_dcp import start_sfa_dcp_query_gather
 
         if pending:
             raise RuntimeError("DCP query gather submitted twice in one attention call")
-        pending.append(start_sfa_dcp_query_gather(query, rope, get_dcp_group()))
+        options = {"packet_mode": packet_mode, "packet": packet} if packet_mode != "off" else {}
+        pending.append(start_sfa_dcp_query_gather(query, rope, get_dcp_group(), **options))
         join_incoming()
         unpack = getattr(impl, "_dcp_early_unpack", None)
-        if unpack is not None and (query_first or not impl.skip_topk):
+        if unpack is not None and packet_mode in ("off", "output") and (query_first or not impl.skip_topk):
             # A prefetched consumer forks after its H2D wait and before current-KV work.
             pending[0].start_unpack(query.shape[-1], *unpack)
 
@@ -530,6 +544,7 @@ def sfa_forward_full(
             resident_reads=resident_reads or None, resident_writes=resident_writes or None,
             copy_bridge=not direct, **({"query_ready": query_ready} if early else {}),
             **({"query_first": True} if query_first else {}),
+            **({"packet_rope": packet_rope} if packet_mode == "fused" else {}),
         )
         impl.cross_layer_lmcache_retrieve(
             attn_layer_name, next_layer_name, selected, counts, slots, metadata, context,
@@ -540,6 +555,8 @@ def sfa_forward_full(
         if edge is not None:
             capacity = edge.transfer.request_capacity
             prefetch = (edge, selected[:capacity], counts[:capacity], slots[:capacity], edge.destinations)
+        if not early and packet_mode != "off":
+            query_ready(query, rope)
         impl.cross_layer_graph_post(
             attn_layer_name, query, rope, topk, kv_cache, metadata, output, prefetch=prefetch,
             **({"query_gather": pending[0]} if pending else {}),

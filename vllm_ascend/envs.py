@@ -272,6 +272,10 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_SFA_DCP_EARLY_UNPACK": lambda: os.getenv("VLLM_ASCEND_SFA_DCP_EARLY_UNPACK", "off").strip().lower(),
     # Positive vector-program cap for side-stream unpack only. Default 12; startup-only, non-sensitive.
     "VLLM_ASCEND_SFA_DCP_UNPACK_CORES": lambda: int(os.getenv("VLLM_ASCEND_SFA_DCP_UNPACK_CORES", "12")),
+    # Experimental full target DCP graphs. off (default), output (native send packet),
+    # direct (also consume gathered Q), fused (also fuse query RoPE and gather packing).
+    # Non-sensitive; identical on participating workers; restart required.
+    "VLLM_ASCEND_SFA_DCP_PACKET_IO": lambda: os.getenv("VLLM_ASCEND_SFA_DCP_PACKET_IO", "off").strip().lower(),
     # 0 (default): prefetch after SFA; 1: release next-layer H2D after output
     # packing, alongside async all-to-all. Requires full target DCP graphs and
     # SHARED_RETRIEVAL_OVERLAP. Non-sensitive; restart required. Benchmark AIV

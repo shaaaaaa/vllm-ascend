@@ -177,10 +177,14 @@ def execution_contract(runner: Any) -> dict[str, Any]:
             shared_plan=envs.VLLM_ASCEND_SFA_SHARED_RESIDENT_PLAN,
             retrieval_overlap=envs.VLLM_ASCEND_SFA_SHARED_RETRIEVAL_OVERLAP,
         )
-        if dcp_layout["early_gather"] and envs.VLLM_ASCEND_SFA_DCP_EARLY_UNPACK != "off":
+        packet_mode = envs.VLLM_ASCEND_SFA_DCP_PACKET_IO
+        if (packet_mode in ("off", "output") and dcp_layout["early_gather"]
+                and envs.VLLM_ASCEND_SFA_DCP_EARLY_UNPACK != "off"):
             dcp_layout.update(
                 early_unpack=envs.VLLM_ASCEND_SFA_DCP_EARLY_UNPACK, unpack_cores=envs.VLLM_ASCEND_SFA_DCP_UNPACK_CORES
             )
+        if packet_mode != "off":
+            dcp_layout["packet_io"] = packet_mode
     dispatcher = getattr(get_moe_comm_method(MoECommType.MC2), "token_dispatcher", None)
     global_bs = math.ceil(capacity / tp.world_size) * ep.world_size
     if (

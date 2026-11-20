@@ -27,7 +27,9 @@
 #define C_TEMPLATE 0
 #define V_TEMPLATE 1
 
-#ifdef SFA_DCP_STATS
+#if defined(SFA_DCP_PACKET)
+#define SFA_OP_NAME SparseFlashAttentionDcpPacket
+#elif defined(SFA_DCP_STATS)
 #define SFA_OP_NAME SparseFlashAttentionDcp
 #else
 #define SFA_OP_NAME SparseFlashAttention

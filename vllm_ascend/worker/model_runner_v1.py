@@ -7866,6 +7866,7 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
             self.dsa_decoder_dcp
             and envs_ascend.VLLM_ASCEND_SFA_FULL_GRAPH
             and envs_ascend.VLLM_ASCEND_SFA_DCP_EARLY_GATHER
+            and envs_ascend.VLLM_ASCEND_SFA_DCP_PACKET_IO in ("off", "output")
         ):
             unpack_mode = envs_ascend.VLLM_ASCEND_SFA_DCP_EARLY_UNPACK
             if unpack_mode not in ("off", "consumer", "producer", "both"):

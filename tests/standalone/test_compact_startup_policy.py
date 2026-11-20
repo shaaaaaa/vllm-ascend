@@ -202,6 +202,7 @@ def decoder_dcp(policy, monkeypatch):
     ops = NS(npu_sparse_flash_attention_dcp=True, npu_dsa_resident_dcp_union_=True, npu_dsa_resident_dcp_plan_=True)
     ns = policy.ns
     envs = NS(
+        VLLM_ASCEND_SFA_DCP_PACKET_IO="off",
         VLLM_ASCEND_DSA_UNBUNDLE=True, VLLM_ASCEND_DSA_TWO_GROUPS=True,
         VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE=False, VLLM_ASCEND_SFA_ASYNC_MTP_PREP=False,
         VLLM_ASCEND_SFA_FULL_GRAPH=False,
@@ -290,6 +291,8 @@ def test_decoder_dcp_selects_split_backend_before_storage_and_rechecks_live_poli
     ("config", "decoder_storage_mode", "local", "async process storage"),
     ("config", "enable_async_loading", False, "async process storage"),
     ("ops", "npu_sparse_flash_attention_dcp", None, "Rebuild vllm-ascend"),
+    ("envs", "VLLM_ASCEND_SFA_DCP_PACKET_IO", "unknown", "must be off, output, direct or fused"),
+    ("envs", "VLLM_ASCEND_SFA_DCP_PACKET_IO", "fused", "Rebuild vllm-ascend with SparseFlashAttentionDcpPacket"),
 ])
 def test_decoder_dcp_refuses_incompatible_routes_before_storage(decoder_dcp, owner, field, value, message):
     ctx = decoder_dcp
