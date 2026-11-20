@@ -264,6 +264,10 @@ env_variables: dict[str, Callable[[], Any]] = {
         0,
     ),
     "VLLM_ASCEND_DSA_LMCACHE_CPU_GB": lambda: float(os.getenv("VLLM_ASCEND_DSA_LMCACHE_CPU_GB", "0")),
+    # Opt-in ondemand-selected prefill for supported eager A2/A3 P-node deployments.
+    # Default false; accepts true/false (case-insensitive); not sensitive.
+    # See user_guide/feature_guide/selected_kv_prefill.md for deployment limits.
+    "VLLM_ASCEND_ENABLE_SELECTED_KV_PREFILL": lambda: _strict_bool_env("VLLM_ASCEND_ENABLE_SELECTED_KV_PREFILL"),
 }
 
 # end-env-vars-definition

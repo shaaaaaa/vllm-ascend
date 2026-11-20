@@ -178,6 +178,10 @@ class AscendConfig:
         # Enable dispatch/combine op inter-node communication by ROCE
         self.enable_mc2_hierarchy_comm = additional_config.get("enable_mc2_hierarchy_comm", False)
 
+        from vllm_ascend.core.selected_kv import init_selected_kv_config
+
+        self.selected_kv_config = init_selected_kv_config(additional_config, vllm_config)
+
     @staticmethod
     def _get_compile_ranges(compilation_config):
         return compilation_config.compile_ranges_endpoints or []

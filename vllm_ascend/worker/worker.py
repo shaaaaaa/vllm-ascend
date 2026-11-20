@@ -447,6 +447,12 @@ class NPUWorker(WorkerBase):
                     scope="local",
                 )
 
+        from vllm_ascend.core.selected_kv import reserve_selected_kv_workspace
+
+        self.available_kv_cache_memory_bytes = reserve_selected_kv_workspace(
+            self, int(self.available_kv_cache_memory_bytes)
+        )
+
         logger.debug(profile_result)
         logger.info_once(
             "Available KV cache memory: %.2f GiB", GiB(self.available_kv_cache_memory_bytes), scope="local"
@@ -863,8 +869,13 @@ class NPUWorker(WorkerBase):
             graph.clear()
 
     def shutdown(self) -> None:
-        self.release_sfa_graph_resources()
-        super().shutdown()
+        from vllm_ascend.core.selected_kv import close_selected_kv_worker
+
+        try:
+            close_selected_kv_worker(self)
+        finally:
+            self.release_sfa_graph_resources()
+            super().shutdown()
 
     def check_health(self) -> None:
         self._raise_if_remote_fill_restart_required()

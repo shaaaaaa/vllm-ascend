@@ -140,6 +140,7 @@ from vllm_ascend.compilation.sfa_fail_stop import (
     uses_local_sfa_fail_stop,
 )
 from vllm_ascend.compilation.sfa_full_graph import SFAFullGraph
+from vllm_ascend.core import selected_kv as skv
 from vllm_ascend.distributed.kv_transfer.sparse_offload.resident_sorted_cache import SharedResidentPlan
 from vllm_ascend.distributed.kv_transfer.sparse_offload.resident_sparse_cache import (
     MAX_INT16_SCRATCH_CAPACITY,
@@ -475,6 +476,7 @@ class NPUModelRunner(GPUModelRunner):
         finished_req_ids: set[str] | None = None,
     ) -> KVConnectorOutput:
         """Finalize a deferred connector lifecycle into one complete output."""
+        skv.abort_active_selected_kv_steps(deferred_only=True)
         output = KVConnectorOutput()
         if not has_kv_transfer_group():
             return output
@@ -506,6 +508,7 @@ class NPUModelRunner(GPUModelRunner):
     @staticmethod
     def abort_kv_connector_finalize() -> None:
         """Clear a deferred connector binding after model execution fails."""
+        skv.abort_active_selected_kv_steps()
         if not has_kv_transfer_group():
             return
         try:
@@ -653,6 +656,7 @@ class NPUModelRunner(GPUModelRunner):
                 "Layerwise-prefill P node enabled: %d-bank global DSA slab.",
                 self.layerwise_prefill_bank_count,
             )
+        self.selected_kv_runtime = self._selected_kv_budget = None
         # Step B staging (1 = B2 compact-scratch decode read; 2 = +B1 freeing).
         self.dsa_shrink_latent = (
             int(envs_ascend.VLLM_ASCEND_DSA_SHRINK_LATENT) if self.dsa_two_groups else 0
@@ -2057,6 +2061,7 @@ class NPUModelRunner(GPUModelRunner):
                 self._update_states(scheduler_output)
 
                 if has_ec_transfer() and get_ec_transfer().is_producer:
+                    skv.retire_selected_kv_if_idle(self)
                     with self.maybe_get_ec_connector_output(
                         scheduler_output,
                         encoder_cache=self.encoder_cache,
@@ -2065,6 +2070,7 @@ class NPUModelRunner(GPUModelRunner):
                         return make_empty_encoder_model_runner_output(scheduler_output)
 
                 if not num_scheduled_tokens:
+                    skv.retire_selected_kv_if_idle(self)
                     if (
                         self.parallel_config.distributed_executor_backend == "external_launcher"
                         and self.parallel_config.data_parallel_size > 1
@@ -2366,12 +2372,14 @@ class NPUModelRunner(GPUModelRunner):
                 staged_sfa_route=staged_sfa_route,
                 staged_sfa_graph_key=staged_sfa_graph_key,
             ),
+            skv.selected_kv_prepare_context(self, scheduler_output, attn_metadata),
             self.maybe_get_kv_connector_output(
                 scheduler_output,
                 **(
                     {"defer_finalize": not clear_kv_metadata}
                 ),
             ) as kv_connector_output,
+            skv.selected_kv_forward(self, scheduler_output, attn_metadata, defer_finish=not clear_kv_metadata),
         ):
             # Connector metadata is bound by maybe_get_kv_connector_output's
             # __enter__. Sample committed frontiers only after that point so the
@@ -2559,21 +2567,23 @@ class NPUModelRunner(GPUModelRunner):
 
         def propose_draft_token_ids(sampled_token_ids):
             assert spec_decode_common_attn_metadata is not None
-            self._draft_token_ids = self.propose_draft_token_ids(
-                sampled_token_ids,
-                self.input_batch.sampling_metadata,
-                scheduler_output,
-                spec_decode_metadata,
-                spec_decode_common_attn_metadata,
-                positions,
-                scheduler_output.total_num_scheduled_tokens,
-                hidden_states,
-                aux_hidden_states,
-                sample_hidden_states,
-                batch_desc,
-                staged_sfa_graph_key,
-            )
+            with skv.selected_kv_draft_forward(self):
+                self._draft_token_ids = self.propose_draft_token_ids(
+                    sampled_token_ids,
+                    self.input_batch.sampling_metadata,
+                    scheduler_output,
+                    spec_decode_metadata,
+                    spec_decode_common_attn_metadata,
+                    positions,
+                    scheduler_output.total_num_scheduled_tokens,
+                    hidden_states,
+                    aux_hidden_states,
+                    sample_hidden_states,
+                    batch_desc,
+                    staged_sfa_graph_key,
+                )
             self._copy_draft_token_ids_to_cpu(scheduler_output)
+
         bookkeeping_args = (
             scheduler_output,
             sampler_output,
@@ -3546,7 +3556,7 @@ class NPUModelRunner(GPUModelRunner):
                 if staged_dummy_request_ids is not None
                 else (
                     self.input_batch.req_ids[:num_reqs]
-                    if self.dsa_shrink_latent
+                    if (self.dsa_shrink_latent or self.ascend_config.selected_kv_config.enabled)
                     else None
                 )
             ),
@@ -5184,6 +5194,7 @@ class NPUModelRunner(GPUModelRunner):
                     disable_dsa_index_lmcache,
                 )
             kv_transfer_group.register_kv_caches(kv_caches_to_register)
+            skv.initialize_selected_kv(self, kv_cache_config, kv_caches)
         self._maybe_init_dsa_latent_offload()
 
         if self.model_config.enable_return_routed_experts:

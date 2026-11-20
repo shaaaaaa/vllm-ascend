@@ -1042,6 +1042,8 @@ class AscendSFAMetadata:
     decode_remap_boundary: torch.Tensor | None = None
     decode_remap_boundary_ready: bool = False
     decode_remap_boundary_buffer: SFARemapBoundaryBuffer | None = None
+    block_size: int = 128
+    selected_kv: Any = None
 
 
 M = TypeVar("M", bound=AscendSFAMetadata)
@@ -1878,6 +1880,7 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             decode_remap_boundary_ready=False,
             decode_remap_boundary_buffer=self.decode_remap_boundary_buffer,
             num_decode_tokens=num_decode_rows,
+            block_size=self.block_size,
         )
 
     def rebind_layerwise_prefill_metadata(
@@ -5123,6 +5126,8 @@ class AscendSFAImpl(MLAAttentionImpl):
                 attn_output = pool_out
 
         if attn_output is None:
+            if attn_metadata.selected_kv is not None:
+                attn_metadata.selected_kv.load(layer_name, topk_indices, kv_cache, attn_metadata)
             with _dsa_prof.section("fa"):
                 attn_output = self._execute_sparse_flash_attention_process(
                     ql_nope,
@@ -5142,6 +5147,8 @@ class AscendSFAImpl(MLAAttentionImpl):
 
         if self._layerwise_prefill_p_node:
             record_layerwise_prefill_bank_use(layer_name)
+        if attn_metadata.selected_kv is not None:
+            attn_metadata.selected_kv.prefetch_next(layer_name, attn_metadata)
 
         # Offload to LMCache. Legacy un-bundled connectors save only the
         # latent (k_nope, k_pe). Connectors declaring DSA index LMCache support

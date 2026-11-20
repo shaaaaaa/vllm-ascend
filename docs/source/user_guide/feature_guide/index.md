@@ -31,4 +31,5 @@ sequence_parallelism
 batch_invariance
 lmcache_ascend_deployment
 sfa_full_graph
+selected_kv_prefill
 :::

@@ -1020,6 +1020,9 @@ class SpecDecodeBaseProposer(EagleProposer):
         # The first step of speculative.
         for layer_name in self.attn_layer_names:
             per_layer_attn_metadata[layer_name] = attn_metadata
+        from vllm_ascend.core.selected_kv import bind_selected_kv_draft_metadata
+
+        bind_selected_kv_draft_metadata(self.runner, per_layer_attn_metadata, common_attn_metadata)
         multi_steps_attn_metadata = [per_layer_attn_metadata]
 
         # Copy the old attn_metadata and update

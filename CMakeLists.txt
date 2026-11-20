@@ -125,6 +125,10 @@ set(
 
 pybind11_add_module(vllm_ascend_C ${VLLM_ASCEND_SRC})
 
+if(SOC_VERSION MATCHES "^(ascend910_93|ascend910b).*")
+  include(${CMAKE_CURRENT_SOURCE_DIR}/csrc/sparse_prefill_native/CMakeLists.txt)
+endif()
+
 target_link_directories(
   vllm_ascend_C
   PRIVATE
