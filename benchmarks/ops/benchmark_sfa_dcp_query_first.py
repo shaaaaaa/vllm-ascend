@@ -114,11 +114,13 @@ class QueryFirstPipeline(AttentionPipeline):
                 edge.join()
             pending = None
 
-            def query_ready(q, r, edge=edge):
+            def query_ready(q, r, edge=edge, layer=layer):
                 nonlocal pending
                 pending = start_sfa_dcp_query_gather(q, r, self.group)
                 if edge is not None and edge.pending_capture_launch:
                     edge.join()
+                if getattr(self, "unpack_placement", "off") in ("both", "consumer" if layer else "producer"):
+                    pending.start_unpack(q.shape[-1], self.unpack_stream, self.args.unpack_cores)
 
             try:
                 q_c, kv = impl.qkv(hidden)[0].split([self.args.q_rank, LATENT + ROPE], dim=-1)
@@ -183,6 +185,16 @@ class QueryFirstPipeline(AttentionPipeline):
 @torch.inference_mode()
 def main(*, comparison="query-first", pipeline_factory=QueryFirstPipeline, description=__doc__):
     parser = argparse.ArgumentParser(description=description)
+    if comparison == "early-unpack":
+        parser.add_argument("--unpack-placement", choices=("consumer", "producer", "both"), default="producer")
+        parser.add_argument("--unpack-cores", type=int, default=12)
+        parser.add_argument(
+            "--indexer",
+            choices=("c8", "precomputed"),
+            default="c8",
+            help="run the native C8 Lightning Indexer or use controlled --overlap Top-K fixtures",
+        )
+        parser.add_argument("--prefetch-after-pack", action="store_true")
     if comparison == "prefetch-after-pack":
         parser.add_argument(
             "--query-first",
@@ -213,6 +225,10 @@ def main(*, comparison="query-first", pipeline_factory=QueryFirstPipeline, descr
     parser.add_argument("--profile-dir", type=Path)
     parser.add_argument("--json", type=Path, default=Path(f"sfa-dcp-{comparison}.json"))
     args = parser.parse_args()
+    if comparison == "early-unpack" and args.unpack_cores < 1:
+        parser.error("--unpack-cores must be positive")
+    if comparison == "early-unpack" and args.unpack_placement == "consumer" and args.layers == 1:
+        parser.error("consumer placement requires at least two layers")
     args.dcp_size, args.rank, args.device = (int(os.environ[name]) for name in ("WORLD_SIZE", "RANK", "LOCAL_RANK"))
     if (
         args.dcp_size not in (2, 4, 8)
@@ -255,6 +271,11 @@ def main(*, comparison="query-first", pipeline_factory=QueryFirstPipeline, descr
         "configuration": {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
         "cases": [],
     }
+    if comparison == "early-unpack" and args.indexer == "c8":
+        results["scope"] += ", native C8 Lightning Indexer with synthetic paged keys and query inputs"
+        results["excludes"] = (
+            "indexer input projections/cache updates, quantized projections, TP reduction, MoE, serving"
+        )
     try:
         for layout in args.layouts:
             for requests in args.requests:

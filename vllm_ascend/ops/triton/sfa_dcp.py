@@ -120,12 +120,19 @@ def _sfa_dcp_query_packet(query: torch.Tensor, rope: torch.Tensor) -> torch.Tens
     return pack_sfa_dcp_queries(query, rope)
 
 
-def _unpack_sfa_dcp_queries(packed, rows, heads, query_dim, rope_dim, world):
-    query = packed.new_empty((rows, heads * world, query_dim))
-    rope = packed.new_empty((rows, heads * world, rope_dim))
+def _unpack_sfa_dcp_queries(packed, rows, heads, query_dim, rope_dim, world, *, outputs=None, max_cores=None):
+    if outputs is None:
+        outputs = (
+            packed.new_empty((rows, heads * world, query_dim)),
+            packed.new_empty((rows, heads * world, rope_dim)),
+        )
+    query, rope = outputs
     init_device_properties_triton()
     # Copy raw halfwords so BF16/FP16 NaN payloads and signed zero stay intact.
-    _unpack_queries[(min(rows * heads * world, get_vectorcore_num()),)](
+    cores = min(rows * heads * world, get_vectorcore_num())
+    if max_cores is not None:
+        cores = min(cores, max_cores)
+    _unpack_queries[(cores,)](
         packed.view(torch.int16), query.view(torch.int16), rope.view(torch.int16),
         rows, heads, world, query_dim, rope_dim,
         triton.next_power_of_2(query_dim), triton.next_power_of_2(rope_dim),
@@ -148,11 +155,39 @@ class SfaDcpQueryGather:
     gathered: torch.Tensor
     work: Any
     group: Any
+    planes: tuple[torch.Tensor, torch.Tensor] | None = None
+    unpack_done: Any = None
+
+    def start_unpack(self, query_dim: int, stream, max_cores: int) -> None:
+        """Fork after the current stream's dependencies and the HCCL gather."""
+        if self.work is None:
+            raise RuntimeError("DCP query gather was already joined")
+        rows, heads, width = self.packet.shape
+        world, rope_dim = self.gathered.shape[0] // rows, width - query_dim
+        # Allocate on the attention stream. The fork orders allocator reuse and
+        # the join orders consumption and release, including on launch failure.
+        self.planes = tuple(self.gathered.new_empty((rows, heads * world, dim)) for dim in (query_dim, rope_dim))
+        main = torch.npu.current_stream()
+        stream.wait_stream(main)
+        try:
+            with torch.npu.stream(stream):
+                self.work.wait()
+                self.work = None
+                _unpack_sfa_dcp_queries(
+                    self.gathered, rows, heads, query_dim, rope_dim, world, outputs=self.planes, max_cores=max_cores
+                )
+                self.unpack_done = stream.record_event()
+        except BaseException:
+            main.wait_stream(stream)
+            raise
 
     def wait(self) -> None:
         if self.work is not None:
             self.work.wait()
             self.work = None
+        if self.unpack_done is not None:
+            torch.npu.current_stream().wait_event(self.unpack_done)
+            self.unpack_done = None
 
 
 def start_sfa_dcp_query_gather(query: torch.Tensor, rope: torch.Tensor, group) -> SfaDcpQueryGather:
@@ -175,12 +210,16 @@ def execute_sfa_dcp(
         query, rope = _gather_sfa_dcp_queries(query, rope, group)
     else:
         query_gather.wait()
-        if (query_gather.group is not group.device_group
-                or query_gather.packet.shape != (*query.shape[:2], query.shape[-1] + rope.shape[-1])):
+        if (
+            query_gather.group is not group.device_group
+            or query_gather.packet.shape != (*query.shape[:2], query.shape[-1] + rope.shape[-1])
+            or (query_gather.planes is not None and query_gather.planes[0].shape[-1] != query.shape[-1])
+        ):
             raise ValueError("DCP query gather does not match this attention call")
-        query, rope = _unpack_sfa_dcp_queries(
-            query_gather.gathered, *query.shape, rope.shape[-1], group.world_size,
-        )
+        if query_gather.planes is None:
+            query, rope = _unpack_sfa_dcp_queries(query_gather.gathered, *query.shape, rope.shape[-1], group.world_size)
+        else:
+            query, rope = query_gather.planes
     requests = local_seq_lens.shape[0]
     partial = torch.ops._C_ascend.npu_sparse_flash_attention_dcp(
         query, rope, kv_cache[0], kv_cache[1], topk, counts,

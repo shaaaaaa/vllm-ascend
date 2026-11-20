@@ -304,6 +304,20 @@ def test_dcp_communication_schedule_changes_contract(dcp_contract_runner, monkey
     assert independent.execution_contract(runner)["digest"] != first["digest"]
 
 
+def test_dcp_unpack_contract_matches_active_schedule(dcp_contract_runner, monkeypatch):
+    runner, *_ = dcp_contract_runner
+    monkeypatch.setenv("VLLM_ASCEND_SFA_DCP_EARLY_GATHER", "1")
+    monkeypatch.setenv("VLLM_ASCEND_SFA_DCP_EARLY_UNPACK", "off")
+    first = independent.execution_contract(runner)["digest"]
+    monkeypatch.setenv("VLLM_ASCEND_SFA_DCP_UNPACK_CORES", "1")
+    assert independent.execution_contract(runner)["digest"] == first
+    monkeypatch.setenv("VLLM_ASCEND_SFA_DCP_EARLY_UNPACK", "producer")
+    second = independent.execution_contract(runner)["digest"]
+    assert second != first
+    monkeypatch.setenv("VLLM_ASCEND_SFA_DCP_UNPACK_CORES", "12")
+    assert independent.execution_contract(runner)["digest"] != second
+
+
 @pytest.mark.parametrize(
     "name,before,after", [("HCCL_OP_EXPANSION_MODE", "AIV", "HOST"), ("TASK_QUEUE_ENABLE", "1", "0")]
 )

@@ -326,6 +326,27 @@ def test_no_group_keeps_independent_planner(api):
     api[1]["prepare_resident_sharded_union_"].assert_called_once()
 
 
+@pytest.mark.parametrize("mode,q_first,selected", [
+    ("off", True, ()), ("producer", False, (0, 2)), ("consumer", False, ()),
+    ("consumer", True, (1, 3)), ("both", True, (0, 1, 2, 3)),
+])
+def test_dcp_unpack_stream_bound_once_to_selected_layers(api, monkeypatch, mode, q_first, selected):
+    raw = torch.zeros((4, 2048), dtype=torch.int32)
+    layers = [impl(api, i, raw, shared=i in (1, 3)) for i in range(5)]
+    runner, ns = runner_api(layers, ["full", "shared", "full", "shared", "full"])
+    runner.dsa_decoder_dcp = True
+    ns["envs_ascend"] = NS(VLLM_ASCEND_SFA_FULL_GRAPH=True, VLLM_ASCEND_SFA_DCP_EARLY_GATHER=True,
+                            VLLM_ASCEND_SFA_DCP_EARLY_UNPACK=mode, VLLM_ASCEND_SFA_DCP_UNPACK_CORES=6)
+    for layer in layers:
+        layer._dcp_query_first = q_first
+    stream = Mock()
+    monkeypatch.setattr(torch, "npu", NS(Stream=stream), raising=False)
+    runner._bind_shared_resident_plans()
+    assert stream.call_count == bool(selected)
+    assert tuple(i for i, layer in enumerate(layers) if hasattr(layer, "_dcp_early_unpack")) == selected
+    assert all(layers[i]._dcp_early_unpack == (stream.return_value, 6) for i in selected)
+
+
 @pytest.mark.parametrize("outer_config", [False, True])
 def test_topology_uses_order_not_reused_buffer_and_excludes_draft(api, outer_config):
     raw = torch.zeros((4, 2048), dtype=torch.int32)

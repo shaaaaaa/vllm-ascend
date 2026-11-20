@@ -519,6 +519,10 @@ def sfa_forward_full(
             raise RuntimeError("DCP query gather submitted twice in one attention call")
         pending.append(start_sfa_dcp_query_gather(query, rope, get_dcp_group()))
         join_incoming()
+        unpack = getattr(impl, "_dcp_early_unpack", None)
+        if unpack is not None and (query_first or not impl.skip_topk):
+            # A prefetched consumer forks after its H2D wait and before current-KV work.
+            pending[0].start_unpack(query.shape[-1], *unpack)
 
     try:
         query, rope, topk, selected, counts, slots = impl.cross_layer_graph_pre(

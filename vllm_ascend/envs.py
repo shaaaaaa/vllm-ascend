@@ -267,6 +267,11 @@ env_variables: dict[str, Callable[[], Any]] = {
     # access. Requires EARLY_GATHER and full target DCP graphs. Non-sensitive;
     # restart required. Experimental: qualify AIV contention on the target NPU.
     "VLLM_ASCEND_SFA_DCP_QUERY_FIRST": lambda: bool(int(os.getenv("VLLM_ASCEND_SFA_DCP_QUERY_FIRST", "0"))),
+    # Startup-only, non-sensitive. off (default), consumer, producer or both.
+    # Requires full DCP target graphs and EARLY_GATHER. Consumers also require QUERY_FIRST.
+    "VLLM_ASCEND_SFA_DCP_EARLY_UNPACK": lambda: os.getenv("VLLM_ASCEND_SFA_DCP_EARLY_UNPACK", "off").strip().lower(),
+    # Positive vector-program cap for side-stream unpack only. Default 12; startup-only, non-sensitive.
+    "VLLM_ASCEND_SFA_DCP_UNPACK_CORES": lambda: int(os.getenv("VLLM_ASCEND_SFA_DCP_UNPACK_CORES", "12")),
     # 0 (default): prefetch after SFA; 1: release next-layer H2D after output
     # packing, alongside async all-to-all. Requires full target DCP graphs and
     # SHARED_RETRIEVAL_OVERLAP. Non-sensitive; restart required. Benchmark AIV
