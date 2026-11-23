@@ -554,12 +554,16 @@ class NPUModelRunner(GPUModelRunner):
         self._staged_sfa_impls: tuple[tuple[str, Any], ...] = ()
         self._staged_sfa_layer_names: tuple[str, ...] = ()
         self._sfa_full_graph = SFAFullGraph()
+        prefetch_pieces = envs_ascend.VLLM_ASCEND_SFA_PREFETCH_PIECES
+        prefetch_low_priority = envs_ascend.VLLM_ASCEND_SFA_PREFETCH_LOW_PRIORITY
         if envs_ascend.VLLM_ASCEND_SFA_SHARED_RETRIEVAL_OVERLAP:
             if not sfa_full_graph_enabled(vllm_config) or not envs_ascend.VLLM_ASCEND_SFA_SHARED_RESIDENT_PLAN:
                 raise ValueError("shared retrieval overlap requires full graphs and shared resident planning")
             from vllm_ascend.compilation.sfa_retrieval_overlap import SharedRetrievalOverlap
 
-            self._sfa_full_graph.retrieval_overlap = SharedRetrievalOverlap()
+            self._sfa_full_graph.retrieval_overlap = SharedRetrievalOverlap(prefetch_pieces, prefetch_low_priority)
+        elif prefetch_pieces != 1 or prefetch_low_priority:
+            raise ValueError("SFA prefetch scheduling requires VLLM_ASCEND_SFA_SHARED_RETRIEVAL_OVERLAP=1")
         self._sfa_preparation_groups = (
             preparation_error_groups(
                 self.parallel_config, is_moe=is_moe_model(vllm_config),

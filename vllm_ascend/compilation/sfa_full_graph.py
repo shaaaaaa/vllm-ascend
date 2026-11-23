@@ -393,7 +393,11 @@ class SFAFullGraph:
             try:
                 pool = self.graph_pool if self.graph_pool is not None else current_platform.get_global_graph_pool()
                 with torch.npu.graph(graph, pool=pool):
+                    owner = self.retrieval_overlap
+                    tracker = owner.begin_priority_capture(key) if getattr(owner, "low_priority", False) else None
                     output = runnable(**kwargs)
+                if tracker is not None:
+                    owner.finish_priority_capture(key, tracker)
             except BaseException:
                 if self.retrieval_overlap is not None:
                     self._submission_failed = True

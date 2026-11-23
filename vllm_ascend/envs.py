@@ -188,6 +188,14 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_SFA_SHARED_RETRIEVAL_OVERLAP": lambda: bool(
         int(os.getenv("VLLM_ASCEND_SFA_SHARED_RETRIEVAL_OVERLAP", "0"))
     ),
+    # Experiment knobs (non-sensitive, D only). One task by default. Valid
+    # piece counts run from 1 to the graph's packed token capacity.
+    "VLLM_ASCEND_SFA_PREFETCH_PIECES": lambda: int(os.getenv("VLLM_ASCEND_SFA_PREFETCH_PIECES", "1")),
+    # 0 keeps the existing priority; 1 sets and reads back the graph-owned
+    # prefetch queue's lowest device priority at startup (CANN 9.1).
+    "VLLM_ASCEND_SFA_PREFETCH_LOW_PRIORITY": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_SFA_PREFETCH_LOW_PRIORITY", "0"))
+    ),
     # Exact resident union/state-update kernels. 1 (default) enables, 0 selects
     # baseline. Non-sensitive; read before graph capture, worker restart required.
     "VLLM_ASCEND_DSA_RESIDENT_EXACT_KERNELS": lambda: bool(

@@ -99,6 +99,57 @@ def topology(lengths=(4,), dtype=torch.bfloat16):
     return groups, impls, caches
 
 
+def test_prefetch_pieces_only_split_the_side_transfer(runtime):
+    module, _ = runtime
+    groups, impls, caches = topology((3,))
+    owner = module.SharedRetrievalOverlap(pieces=16)
+    owner.configure(tuple(impls.items()), groups, caches)
+    key = Key()
+    owner.prepare(key, tuple(impls.items()), groups, 4)
+    first = owner.outgoing[key]["g0l0"]
+    selected = torch.zeros((2, 4), dtype=torch.int32)
+    counts = torch.ones(2, dtype=torch.int32)
+    slots = torch.zeros((2, 4), dtype=torch.int64)
+    first.launch(selected, counts, slots, first.destinations)
+    first.join()
+    first.transfer.load.assert_called_once_with(selected, counts, slots, max_aiv_cores=12, pieces=16)
+    impls["g0l0"]._full_graph_transfers[2].load.assert_not_called()
+
+
+def test_priority_identifies_only_one_new_queue_and_verifies_piece_count(monkeypatch):
+    path = ROOT / "vllm_ascend/compilation/sfa_copy_priority.py"
+    module = load_module(path, "copy_priority_test", monkeypatch)
+    tracker = module.CapturedCopyPriority.__new__(module.CapturedCopyPriority)
+    tracker.main, tracker.side, tracker.graph = 60, None, 900
+    queues, levels = [60, 77], {60: 0, 77: 0}
+    tracker.handles = lambda api, obj: queues if api == "aclmdlRIGetStreams" else [2, 4, 3, 5]
+    tracker.capture = lambda stream: 900
+    tracker.priority = levels.__getitem__
+    tracker.stream_id = lambda stream: stream
+
+    def call(api, *args):
+        if api == "aclmdlRITaskGetType":
+            args[1]._obj.value = 1 if args[0] in (3, 5) else 3
+        elif api == "aclrtDeviceGetStreamPriorityRange":
+            args[0]._obj.value, args[1]._obj.value = 7, 0
+        elif api == "aclrtSetStreamAttribute":
+            levels[args[0]] = args[2]._obj.priority
+        else:
+            raise AssertionError(api)
+
+    tracker.call = call
+    queues.append(78)
+    with pytest.raises(RuntimeError, match="uniquely identify"):
+        tracker.after_first_fork(object(), {60})
+    queues.pop()
+    tracker.after_first_fork(object(), {60})
+    with pytest.raises(RuntimeError, match="expected 4"):
+        tracker.finish(2, 2)
+    assert levels == {60: 0, 77: 0}
+    tracker.finish(1, 2)
+    assert levels == {60: 0, 77: 7}
+
+
 @pytest.mark.parametrize("lengths", [(1,), (2,), (4,), (2, 3)])
 def test_edges_never_cross_groups_and_keep_one_stream(runtime, lengths):
     module, log = runtime

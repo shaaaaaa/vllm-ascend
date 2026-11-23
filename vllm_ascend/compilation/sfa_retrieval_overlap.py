@@ -36,6 +36,8 @@ class RetrievalEdge:
     transfer: Any
     destinations: tuple
     max_aiv_cores: int = 0
+    pieces: int = 1
+    capture_priority: Any = None
 
     def __post_init__(self) -> None:
         self.payload = None
@@ -74,14 +76,21 @@ class RetrievalEdge:
         # reads it. These Python statements run at capture, never at replay.
         if self.payload is None:
             self.payload = payload
-        self.start.record(torch.npu.current_stream())
+        main = torch.npu.current_stream()
+        self.start.record(main)
+        tracker = self.capture_priority
+        before = tracker.before_first_fork(main) if tracker is not None and tracker.side is None else None
         with torch.npu.stream(self.stream):
             self.stream.wait_event(self.start)
-            if self.max_aiv_cores:
+            if self.pieces != 1:
+                self.transfer.load(selected, counts, slots, max_aiv_cores=self.max_aiv_cores, pieces=self.pieces)
+            elif self.max_aiv_cores:
                 self.transfer.load(selected, counts, slots, max_aiv_cores=self.max_aiv_cores)
             else:
                 self.transfer.load(selected, counts, slots)
             self.done.record(self.stream)
+            if before is not None:
+                tracker.after_first_fork(self.stream, before)
         self.pending_capture_launch = True
 
     def join(self) -> None:
@@ -136,7 +145,11 @@ class CaptureProbe:
 class SharedRetrievalOverlap:
     """One stream per worker, immutable per-key edges after startup setup."""
 
-    def __init__(self) -> None:
+    def __init__(self, pieces: int = 1, low_priority: bool = False) -> None:
+        self.pieces = pieces
+        self.low_priority = low_priority
+        if self.pieces < 1:
+            raise ValueError("VLLM_ASCEND_SFA_PREFETCH_PIECES must be positive")
         self.stream = None
         self.probe = None
         self.pairs: dict[str, tuple[str, tuple]] = {}
@@ -197,11 +210,28 @@ class SharedRetrievalOverlap:
                         self.probe = CaptureProbe(self.stream, device)
                         self.probe.verify()
                         self.probe = None
-                    edge = RetrievalEdge(self.stream, transfer, destinations, max_aiv_cores=12)
+                    edge = RetrievalEdge(self.stream, transfer, destinations, max_aiv_cores=12, pieces=self.pieces)
                     incoming[following] = outgoing[current] = edge
             except BaseException:
                 self.failed = True
                 raise
+
+    def begin_priority_capture(self, key):
+        edges = self.outgoing.get(key, {})
+        if not edges:
+            return None
+        from vllm_ascend.compilation.sfa_copy_priority import CapturedCopyPriority
+
+        tracker = CapturedCopyPriority(torch.npu.current_stream())
+        for edge in edges.values():
+            edge.capture_priority = tracker
+        return tracker
+
+    def finish_priority_capture(self, key, tracker):
+        edges = self.outgoing[key]
+        tracker.finish(len(edges), self.pieces)
+        for edge in edges.values():
+            edge.capture_priority = None
 
     def edges(self, key):
         if self.failed or key not in self.incoming:
