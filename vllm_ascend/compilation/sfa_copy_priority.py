@@ -16,7 +16,7 @@ ACL_MODEL_RI_TASK_KERNEL = 1
 
 
 class StreamAttr(c.Union):
-    _fields_ = [("priority", UInt32), ("reserved", UInt32 * 4)]
+    _fields_ = [("priority", UInt32), ("failure_mode", c.c_uint64), ("reserved", UInt32 * 4)]
 
 
 class CapturedCopyPriority:
@@ -49,10 +49,11 @@ class CapturedCopyPriority:
         self.main = initial[0]
         self.side = None
 
-    def call(self, name, *args):
+    def call(self, name, *args, operation=None):
         rc = self.functions[name](*args)
         if rc:
-            raise RuntimeError(f"SFA prefetch priority: {name} rc={rc}")
+            where = f" ({operation})" if operation else ""
+            raise RuntimeError(f"SFA prefetch priority: {name}{where} rc={rc}")
 
     def capture(self, stream):
         status, graph = Int32(), Handle()
@@ -83,9 +84,9 @@ class CapturedCopyPriority:
             raise RuntimeError(f"could not uniquely identify SFA side queue, new queues={len(added)}")
         self.side = added.pop()
 
-    def priority(self, stream):
+    def priority(self, stream, role):
         attr = StreamAttr()
-        self.call("aclrtGetStreamAttribute", stream, ACL_STREAM_ATTR_PRIORITY, c.byref(attr))
+        self.call("aclrtGetStreamAttribute", stream, ACL_STREAM_ATTR_PRIORITY, c.byref(attr), operation=role)
         return Int32(attr.priority).value
 
     def stream_id(self, stream):
@@ -107,20 +108,23 @@ class CapturedCopyPriority:
             raise RuntimeError(f"SFA side queue contains {kernels} kernels, expected {transfers * pieces}")
         least, greatest = Int32(), Int32()
         self.call("aclrtDeviceGetStreamPriorityRange", c.byref(least), c.byref(greatest))
-        foreground = self.priority(self.main)
-        if least.value == greatest.value or foreground == least.value:
-            raise RuntimeError(f"no lower priority for SFA: main={foreground}, least={least.value}")
+        if least.value == greatest.value:
+            raise RuntimeError(f"no lower priority for SFA: least=greatest={least.value}")
         attr = StreamAttr(priority=UInt32(least.value).value)
-        self.call("aclrtSetStreamAttribute", self.side, ACL_STREAM_ATTR_PRIORITY, c.byref(attr))
-        if self.priority(self.side) != least.value or self.priority(self.main) != foreground:
-            raise RuntimeError("captured SFA/compute queue priority readback failed")
+        self.call("aclrtSetStreamAttribute", self.side, ACL_STREAM_ATTR_PRIORITY, c.byref(attr), operation="set copy")
+        foreground = self.priority(self.main, "read main after copy set")
+        copy = self.priority(self.side, "read copy after set")
+        if copy != least.value or not greatest.value <= foreground < copy:
+            raise RuntimeError(
+                f"SFA graph priority readback mismatch: main={foreground}, copy={copy}, requested={least.value}"
+            )
         logger.info(
             "SFA prefetch graph main_stream=%d priority=%d copy_stream=%d priority=%d "
             "transfers=%d pieces=%d kernels=%d",
             self.stream_id(self.main),
             foreground,
             self.stream_id(self.side),
-            least.value,
+            copy,
             transfers,
             pieces,
             kernels,

@@ -11,6 +11,7 @@ import ctypes as C
 import json
 import sys
 from contextlib import suppress
+from pathlib import Path
 
 Ptr = C.c_void_p
 U32 = C.c_uint32
@@ -23,7 +24,7 @@ H2D, D2H, D2D = 1, 2, 3
 
 
 class StreamAttribute(C.Union):
-    _fields_ = [("priority", U32), ("reserve", U32 * 4)]
+    _fields_ = [("priority", U32), ("failure_mode", C.c_uint64), ("reserve", U32 * 4)]
 
 
 class Runtime:
@@ -36,8 +37,11 @@ class Runtime:
             "aclFinalize": [],
             "aclrtSetDevice": [I32],
             "aclrtResetDevice": [I32],
+            "aclrtGetSocName": [],
             "aclrtDeviceGetStreamPriorityRange": [Ref(I32), Ref(I32)],
             "aclrtCreateStream": [Ref(Ptr)],
+            "aclrtCreateStreamWithConfig": [Ref(Ptr), U32, U32],
+            "aclrtStreamGetPriority": [Ptr, Ref(U32)],
             "aclrtDestroyStream": [Ptr],
             "aclrtCreateEventExWithFlag": [Ref(Ptr), U32],
             "aclrtDestroyEvent": [Ptr],
@@ -65,7 +69,8 @@ class Runtime:
             f = next((getattr(lib, name) for lib in self.libs if hasattr(lib, name)), None)
             if f is None:
                 raise RuntimeError(f"loaded CANN runtime lacks {name}")
-            f.argtypes, f.restype = args, I32
+            f.argtypes = args
+            f.restype = C.c_char_p if name == "aclrtGetSocName" else I32
             self.functions[name] = f
 
     def call(self, name, *args):
@@ -87,17 +92,44 @@ class Runtime:
         self.call("aclmdlRIGetStreams", graph, handles, C.byref(n))
         return set(handles[: n.value])
 
-    def priority(self, stream):
-        # Read the device attribute updated by the setter. StreamGetPriority
-        # may report the priority used on creation on some runtime versions.
+    def device_priority(self, stream):
         value = StreamAttribute()
-        self.call("aclrtGetStreamAttribute", stream, PRIORITY, C.byref(value))
-        return I32(value.priority).value
+        rc = self.functions["aclrtGetStreamAttribute"](stream, PRIORITY, C.byref(value))
+        return {"rc": rc, "priority": value.priority} if rc == 0 else {"rc": rc}
 
-    def describe(self, stream):
+    def set_priority(self, stream, priority):
+        value = StreamAttribute(priority=priority)
+        rc = self.functions["aclrtSetStreamAttribute"](stream, PRIORITY, C.byref(value))
+        return {"requested": priority, "rc": rc}
+
+    def stream_id(self, stream):
         stream_id = I32()
-        self.call("aclrtStreamGetId", stream, C.byref(stream_id))
-        return {"id": stream_id.value, "priority": self.priority(stream)}
+        rc = self.functions["aclrtStreamGetId"](stream, C.byref(stream_id))
+        return {"rc": rc} if rc else stream_id.value
+
+    def ordinary_controls(self, original_side, least):
+        # Capture has ended and the graph has been destroyed. Use its original
+        # ordinary stream for the same update as the graph's internal copy queue.
+        controls = {
+            "id": self.stream_id(original_side),
+            "set_side": self.set_priority(original_side, least),
+            "after_set": self.device_priority(original_side),
+        }
+        stream = Ptr()
+        rc = self.functions["aclrtCreateStreamWithConfig"](C.byref(stream), least, 0)
+        created = {"requested": least, "rc": rc}
+        controls["create_low"] = created
+        if rc == 0:
+            try:
+                # StreamGetPriority reports the creation field in CANN 9.1.
+                # Only GetStreamAttribute queries the device-side scheduler.
+                priority = U32()
+                rc = self.functions["aclrtStreamGetPriority"](stream, C.byref(priority))
+                created["creation_field"] = {"rc": rc, "priority": priority.value} if rc == 0 else {"rc": rc}
+                created["device_read"] = self.device_priority(stream)
+            finally:
+                self.call("aclrtDestroyStream", stream)
+        return controls
 
 
 def one(handles, what):
@@ -106,11 +138,53 @@ def one(handles, what):
     return next(iter(handles))
 
 
+def check_graph_queues(rt, main, side, least, greatest, report, replay):
+    # Match the D worker: change only the graph-owned copy queue. Record each
+    # driver result separately so a failed query cannot hide the update result.
+    report["set_side"] = rt.set_priority(side, least)
+    report["queues"] = {"main": rt.stream_id(main), "side": rt.stream_id(side)}
+
+    def read_queues():
+        return {"main": rt.device_priority(main), "side": rt.device_priority(side)}
+
+    report["after_set"] = read_queues()
+    report["verified_replays"] = 0
+    for value in (1, 7, 2):
+        try:
+            replay(value)
+        except RuntimeError as exc:
+            report["replay_error"] = str(exc)
+            return "graph_replay_failed"
+        report["verified_replays"] += 1
+    report["after_replay"] = read_queues()
+
+    if report["set_side"]["rc"]:
+        return "graph_priority_set_failed"
+    for snapshot in (report["after_set"], report["after_replay"]):
+        main_read, side_read = snapshot["main"], snapshot["side"]
+        if main_read["rc"] or side_read["rc"]:
+            return "graph_priority_readback_failed"
+        if side_read["priority"] != least or not greatest <= main_read["priority"] < least:
+            return "graph_priority_mismatch"
+    return "graph_priority_verified"
+
+
 def run(rt, device, report):
     size = 256
     call = rt.call
     call("aclInit", None)
     call("aclrtSetDevice", device)
+    soc = rt.functions["aclrtGetSocName"]()
+    if soc:
+        report["soc"] = soc.decode(errors="replace")
+    for package in ("driver", "firmware"):
+        version_file = Path("/usr/local/Ascend") / package / "version.info"
+        with suppress(OSError):
+            for line in version_file.read_text(encoding="utf-8", errors="replace").splitlines():
+                name, sep, version = line.partition("=")
+                if sep and name.strip().lower() == "version":
+                    report[f"{package}_version"] = version.strip()
+                    break
     low, high = I32(), I32()
     call("aclrtDeviceGetStreamPriorityRange", C.byref(low), C.byref(high))
     report["range"] = {"least": low.value, "greatest": high.value}
@@ -141,20 +215,7 @@ def run(rt, device, report):
     if graph.value != live.value or not {main_queue, side_queue} <= rt.streams(graph):
         raise RuntimeError("captured queue ownership changed on capture end")
 
-    report["before"] = {"main": rt.describe(main_queue), "side": rt.describe(side_queue)}
-    for queue, requested in ((main_queue, high), (side_queue, low)):
-        attr = StreamAttribute(priority=U32(requested.value).value)
-        call("aclrtSetStreamAttribute", queue, PRIORITY, C.byref(attr))
-
-    def check():
-        actual = {"main": rt.describe(main_queue), "side": rt.describe(side_queue)}
-        if [actual["main"]["priority"], actual["side"]["priority"]] != [high.value, low.value]:
-            raise RuntimeError(f"graph priority readback mismatch: {actual}")
-        return actual
-
-    report["after_set"] = check()
-
-    for value in (1, 7, 2):
+    def replay(value):
         C.memset(host_in, value, size)
         C.memset(host_out, 0, size)
         call("aclrtMemcpy", src, size, host_in, size, H2D)
@@ -162,9 +223,11 @@ def run(rt, device, report):
         call("aclrtSynchronizeStream", root)
         if C.string_at(host_out, size) != bytes([value]) * size:
             raise RuntimeError(f"incorrect fork/join replay result for byte {value}")
-    report["after_replay"] = check()
-    report["verified_replays"] = 3
+
+    verdict = check_graph_queues(rt, main_queue, side_queue, low.value, high.value, report, replay)
     call("aclmdlRIDestroy", graph)
+    if verdict != "graph_priority_verified":
+        report["ordinary"] = rt.ordinary_controls(side, low.value)
     for event in (join, fork):
         call("aclrtDestroyEvent", event)
     for stream in (side, root):
@@ -175,6 +238,7 @@ def run(rt, device, report):
         call("aclrtFreeHost", buf)
     call("aclrtResetDevice", device)
     call("aclFinalize")
+    return verdict
 
 
 def main():
@@ -183,12 +247,11 @@ def main():
     args = cli.parse_args()
     report = {"device": args.device, "status": "failed"}
     try:
-        run(Runtime(), args.device, report)
-        report["status"] = "graph_priority_verified"
+        report["status"] = run(Runtime(), args.device, report)
     except (OSError, RuntimeError) as exc:
         report["error"] = str(exc)
     print("[GRAPH_PRIORITY]", json.dumps(report), flush=True)
-    return int(report["status"] == "failed")
+    return int(report["status"] != "graph_priority_verified")
 
 
 if __name__ == "__main__":

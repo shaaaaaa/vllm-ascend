@@ -124,16 +124,20 @@ def test_priority_identifies_only_one_new_queue_and_verifies_piece_count(monkeyp
     queues, levels = [60, 77], {60: 0, 77: 0}
     tracker.handles = lambda api, obj: queues if api == "aclmdlRIGetStreams" else [2, 4, 3, 5]
     tracker.capture = lambda stream: 900
-    tracker.priority = levels.__getitem__
     tracker.stream_id = lambda stream: stream
+    priority_calls = []
 
-    def call(api, *args):
+    def call(api, *args, operation=None):
         if api == "aclmdlRITaskGetType":
             args[1]._obj.value = 1 if args[0] in (3, 5) else 3
         elif api == "aclrtDeviceGetStreamPriorityRange":
             args[0]._obj.value, args[1]._obj.value = 7, 0
         elif api == "aclrtSetStreamAttribute":
+            priority_calls.append((operation, args[0]))
             levels[args[0]] = args[2]._obj.priority
+        elif api == "aclrtGetStreamAttribute":
+            priority_calls.append((operation, args[0]))
+            args[2]._obj.priority = levels[args[0]]
         else:
             raise AssertionError(api)
 
@@ -146,8 +150,41 @@ def test_priority_identifies_only_one_new_queue_and_verifies_piece_count(monkeyp
     with pytest.raises(RuntimeError, match="expected 4"):
         tracker.finish(2, 2)
     assert levels == {60: 0, 77: 0}
+    assert not priority_calls
     tracker.finish(1, 2)
     assert levels == {60: 0, 77: 7}
+    assert priority_calls == [("set copy", 77), ("read main after copy set", 60), ("read copy after set", 77)]
+
+
+@pytest.mark.parametrize("failure", ["set copy", "read main after copy set", "read copy after set"])
+def test_graph_worker_names_the_driver_operation_that_failed(monkeypatch, failure):
+    module = load_module(ROOT / "vllm_ascend/compilation/sfa_copy_priority.py", "priority_error_test", monkeypatch)
+    tracker = module.CapturedCopyPriority.__new__(module.CapturedCopyPriority)
+    tracker.main, tracker.side, tracker.graph = 60, 77, 900
+    tracker.handles = lambda api, obj: [60, 77] if api == "aclmdlRIGetStreams" else [1]
+
+    def task_type(task, result):
+        result._obj.value = module.ACL_MODEL_RI_TASK_KERNEL
+        return 0
+
+    def priority_range(least, greatest):
+        least._obj.value, greatest._obj.value = 7, 0
+        return 0
+
+    def read(stream, attribute, result):
+        result._obj.priority = 0 if stream == 60 else 7
+        role = "read main after copy set" if stream == 60 else "read copy after set"
+        return 507899 if role == failure else 0
+
+    tracker.functions = {
+        "aclmdlRITaskGetType": task_type,
+        "aclrtDeviceGetStreamPriorityRange": priority_range,
+        "aclrtSetStreamAttribute": lambda *args: 507899 if failure == "set copy" else 0,
+        "aclrtGetStreamAttribute": read,
+    }
+    with pytest.raises(RuntimeError) as exc:
+        tracker.finish(1, 1)
+    assert f"({failure}) rc=507899" in str(exc.value)
 
 
 @pytest.mark.parametrize("lengths", [(1,), (2,), (4,), (2, 3)])
