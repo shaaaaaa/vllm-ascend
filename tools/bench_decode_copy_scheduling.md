@@ -4,17 +4,19 @@ Use the matching vllm-ascend and LMCache-Ascend branches. The D worker runs a fu
 
 ## Verify on a D worker
 
-Run the priority probe inside the CANN container. It verifies the settings on the two queues owned by a captured graph and checks the output of three replays.
+Run the priority probe inside the CANN container. One initial replay binds the physical submission queues on CANN graphs that allocate them lazily. The probe then sets the copy queue's priority and checks three more replays.
 
 ```bash
 python tools/check_decode_graph_priority.py --device 0
 ```
 
-Look for `graph_priority_verified`. The JSON records the copy queue's update in `set_side.rc`, device readbacks for both graph queues in `after_set` and `after_replay`, and the number of data-checked replays in `verified_replays`. A successful run has update and readback codes of zero, a lower scheduling priority for the copy queue, and three correct replays.
+Look for `graph_priority_verified`. The JSON records the initial replay in `binding_replay_verified`, the copy queue's update in `set_side.rc`, device readbacks for both graph queues in `after_set` and `after_replay`, and the three subsequent data-checked replays in `verified_replays`.
 
 If the probe reports a failure, it also runs controls on ordinary streams. Compare `set_side` with `ordinary.set_side` for updates, and the graph readbacks with `ordinary.after_set` for queries. `ordinary.create_low.creation_field` reports the priority recorded at stream creation. `ordinary.create_low.device_read` queries the scheduler. The probe includes the SoC name and the installed driver and firmware versions when their version files are visible in the container.
 
-Once verified, build LMCache-Ascend and run its registered-host-memory transfer test from that checkout with the same Python environment as the D worker.
+When both ordinary and graph priority controls return a driver error, check the host firmware version and kernel task-scheduler messages before benchmarking. The current D worker applies priority at capture end. A deployment that binds hardware queues on first replay needs a post-binding configuration in the D worker before running case C.
+
+To validate split-copy correctness, build LMCache-Ascend and run its registered-host-memory transfer test from that checkout with the same Python environment as the D worker.
 
 ```bash
 python -m pytest -q --confcutdir=tests/v1 tests/v1/test_sparse_graph_transfer_npu.py -k prefetch_pieces

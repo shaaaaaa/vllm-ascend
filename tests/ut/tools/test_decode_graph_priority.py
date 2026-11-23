@@ -31,10 +31,11 @@ def probe(monkeypatch):
 )
 def test_graph_set_and_both_device_reads_are_independent(probe, set_rc, main_reads, side_reads, expected):
     rt = probe.Runtime.__new__(probe.Runtime)
-    operations = []
+    operations, replays = [], []
     values = {11: iter(main_reads), 22: iter(side_reads)}
 
     def set_priority(stream, attribute, value):
+        assert replays == [0xA5], "the graph must acquire its hardware queues first"
         assert attribute == probe.PRIORITY
         operations.append(("set", stream, value._obj.priority))
         return set_rc
@@ -50,11 +51,12 @@ def test_graph_set_and_both_device_reads_are_independent(probe, set_rc, main_rea
 
     rt.functions = {"aclrtSetStreamAttribute": set_priority, "aclrtGetStreamAttribute": get_priority}
     rt.stream_id = lambda stream: stream
-    report, replays = {}, []
+    report = {}
     assert probe.check_graph_queues(rt, 11, 22, 7, 0, report, replays.append) == expected
     assert operations == [("set", 22, 7), ("get", 11), ("get", 22), ("get", 11), ("get", 22)]
     assert report["set_side"] == {"requested": 7, "rc": set_rc}
-    assert report["verified_replays"] == 3 and replays == [1, 7, 2]
+    assert report["binding_replay_verified"]
+    assert report["verified_replays"] == 3 and replays == [0xA5, 1, 7, 2]
     for stage, main, side in zip(("after_set", "after_replay"), main_reads, side_reads):
         for role, result in (("main", main), ("side", side)):
             assert report[stage][role] == ({"rc": 507899} if result == 507899 else {"rc": 0, "priority": result})
@@ -107,6 +109,17 @@ def test_incomplete_replay_preserves_set_and_read_results(probe):
     assert report["set_side"]["rc"] == 0 and report["after_set"]["side"]["priority"] == 7
     assert report["verified_replays"] == 1
     assert report["replay_error"] == "incorrect replay output"
+
+
+def test_failed_binding_replay_skips_priority_update(probe):
+    def failed_replay(value):
+        raise RuntimeError("binding replay failed")
+
+    report = {}
+    assert probe.check_graph_queues(object(), 11, 22, 7, 0, report, failed_replay) == "graph_binding_replay_failed"
+    assert report["binding_replay_verified"] is False and report["verified_replays"] == 0
+    assert report["replay_error"] == "binding replay failed"
+    assert "set_side" not in report
 
 
 @pytest.mark.parametrize(

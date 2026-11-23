@@ -139,8 +139,16 @@ def one(handles, what):
 
 
 def check_graph_queues(rt, main, side, least, greatest, report, replay):
-    # Match the D worker: change only the graph-owned copy queue. Record each
-    # driver result separately so a failed query cannot hide the update result.
+    # Software-SQ graphs acquire the physical submission queues on first
+    # execution. Complete one data-checked replay before addressing those SQs.
+    report["binding_replay_verified"] = False
+    report["verified_replays"] = 0
+    try:
+        replay(0xA5)
+    except RuntimeError as exc:
+        report["replay_error"] = str(exc)
+        return "graph_binding_replay_failed"
+    report["binding_replay_verified"] = True
     report["set_side"] = rt.set_priority(side, least)
     report["queues"] = {"main": rt.stream_id(main), "side": rt.stream_id(side)}
 
@@ -148,7 +156,6 @@ def check_graph_queues(rt, main, side, least, greatest, report, replay):
         return {"main": rt.device_priority(main), "side": rt.device_priority(side)}
 
     report["after_set"] = read_queues()
-    report["verified_replays"] = 0
     for value in (1, 7, 2):
         try:
             replay(value)
