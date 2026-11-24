@@ -4,7 +4,24 @@ Use the matching vllm-ascend and LMCache-Ascend branches. The D worker runs a fu
 
 ## Verify on a D worker
 
-Run the priority probe inside the CANN container. One initial replay binds the physical submission queues on CANN graphs that allocate them lazily. The probe then sets the copy queue's priority and checks three more replays.
+### Ascend 910B3 with CANN 9.1 and HDK 25.5.2
+
+Use one idle NPU in the D container. The following command both runs the short scheduling test and captures a MindStudio profile. It needs the installed CANN math operators. It runs independently of the P/D service.
+
+```bash
+msprof --output="$PWD/priority-profile-$(date +%Y%m%d-%H%M%S)" \
+  python tools/check_decode_creation_priority.py --device 0
+```
+
+The probe explicitly binds two persistent streams as heads of one ACL model. Each stream executes 48 identical FP16 Abs operations. It tries priorities A/B of 0/0, 0/7 and 7/0, then repeats with the creation, binding and enqueue order reversed. For each graph it warms up once and checks the replay outputs and two device-side completion timestamps on five measured iterations. The JSON field `b_minus_a_us` is positive when A finishes first. The six model names and stream IDs in `[CREATE_PRIORITY]` identify the lanes in MindStudio.
+
+`creation_priority_effect_observed` means the higher-priority lane finished first on at least four of five replays in both directions and both creation orders, beyond the equal-priority lead and jitter. `no_clear_creation_priority_effect` reports a completed measurement with its six sets of timings. `failed` identifies a setup, replay or data-check error.
+
+On this 910B3, changing an existing queue's priority returned device status 4. The released 910B TS dispatchers in HDK 25.5.2, 26.0.RC1, 26.1.1 and 26.2.RC1 return 4 for the same update/query commands (14/15). The 25.5.2 queue creation path programs the requested three-bit priority. In stock CANN 9.1, automatic ACL graph capture creates internal streams at priority 0, and the graph queue pool also allocates at 0. Keep `VLLM_ASCEND_SFA_PREFETCH_LOW_PRIORITY=0` for the current 910B3 worker. A positive explicit-model result motivates propagating priority to the queues used by serving capture and then measuring TPOT. [Capture stream creation](https://github.com/hicann/runtime/blob/v9.1.0/src/runtime/feature/aclgraph/context_aclgraph.cc#L170) and [graph queue pool](https://github.com/hicann/runtime/blob/v9.1.0/src/runtime/core/src/device/device_sq_cq_pool.cc#L76).
+
+### Verify dynamic priority on a deployment using updates after capture
+
+Run the dynamic priority probe inside the CANN container. One initial replay binds the physical submission queues on CANN graphs that allocate them lazily. The probe then sets the copy queue's priority and checks three more replays.
 
 ```bash
 python tools/check_decode_graph_priority.py --device 0
@@ -14,7 +31,7 @@ Look for `graph_priority_verified`. The JSON records the initial replay in `bind
 
 If the probe reports a failure, it also runs controls on ordinary streams. Compare `set_side` with `ordinary.set_side` for updates, and the graph readbacks with `ordinary.after_set` for queries. `ordinary.create_low.creation_field` reports the priority recorded at stream creation. `ordinary.create_low.device_read` queries the scheduler. The probe includes the SoC name and the installed driver and firmware versions when their version files are visible in the container.
 
-When both ordinary and graph priority controls return a driver error, check the host firmware version and kernel task-scheduler messages before benchmarking. The current D worker applies priority at capture end. A deployment that binds hardware queues on first replay needs a post-binding configuration in the D worker before running case C.
+The current D worker applies priority at capture end. A deployment that binds hardware queues on first replay needs a post-binding configuration in the D worker before running case C. Run case C after verifying dynamic priority on the actual capture path of that deployment.
 
 To validate split-copy correctness, build LMCache-Ascend and run its registered-host-memory transfer test from that checkout with the same Python environment as the D worker.
 

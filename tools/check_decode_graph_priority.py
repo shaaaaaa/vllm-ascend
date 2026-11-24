@@ -28,7 +28,7 @@ class StreamAttribute(C.Union):
 
 
 class Runtime:
-    def __init__(self):
+    def __init__(self, *, capture_functions=True):
         self.libs = [C.CDLL("libascendcl.so", mode=C.RTLD_GLOBAL)]
         with suppress(OSError):
             self.libs.append(C.CDLL("libacl_rt.so", mode=C.RTLD_GLOBAL))
@@ -41,7 +41,6 @@ class Runtime:
             "aclrtDeviceGetStreamPriorityRange": [Ref(I32), Ref(I32)],
             "aclrtCreateStream": [Ref(Ptr)],
             "aclrtCreateStreamWithConfig": [Ref(Ptr), U32, U32],
-            "aclrtStreamGetPriority": [Ptr, Ref(U32)],
             "aclrtDestroyStream": [Ptr],
             "aclrtCreateEventExWithFlag": [Ref(Ptr), U32],
             "aclrtDestroyEvent": [Ptr],
@@ -50,27 +49,36 @@ class Runtime:
             "aclrtMallocHost": [Ref(Ptr), Size],
             "aclrtFreeHost": [Ptr],
             "aclrtMemcpy": [Ptr, Size, Ptr, Size, I32],
-            "aclrtMemcpyAsync": [Ptr, Size, Ptr, Size, I32, Ptr],
             "aclrtRecordEvent": [Ptr, Ptr],
-            "aclrtStreamWaitEvent": [Ptr, Ptr],
-            "aclmdlRICaptureBegin": [Ptr, I32],
-            "aclmdlRICaptureEnd": [Ptr, Ref(Ptr)],
-            "aclmdlRICaptureGetInfo": [Ptr, Ref(I32), Ref(Ptr)],
-            "aclmdlRIGetStreams": [Ptr, Ref(Ptr), Ref(U32)],
             "aclrtStreamGetId": [Ptr, Ref(I32)],
-            "aclrtSetStreamAttribute": [Ptr, I32, Ref(StreamAttribute)],
-            "aclrtGetStreamAttribute": [Ptr, I32, Ref(StreamAttribute)],
             "aclmdlRIExecuteAsync": [Ptr, Ptr],
-            "aclrtSynchronizeStream": [Ptr],
             "aclmdlRIDestroy": [Ptr],
         }
+        if capture_functions:
+            signatures.update(
+                {
+                    "aclrtStreamGetPriority": [Ptr, Ref(U32)],
+                    "aclrtMemcpyAsync": [Ptr, Size, Ptr, Size, I32, Ptr],
+                    "aclrtStreamWaitEvent": [Ptr, Ptr],
+                    "aclmdlRICaptureBegin": [Ptr, I32],
+                    "aclmdlRICaptureEnd": [Ptr, Ref(Ptr)],
+                    "aclmdlRICaptureGetInfo": [Ptr, Ref(I32), Ref(Ptr)],
+                    "aclmdlRIGetStreams": [Ptr, Ref(Ptr), Ref(U32)],
+                    "aclrtSetStreamAttribute": [Ptr, I32, Ref(StreamAttribute)],
+                    "aclrtGetStreamAttribute": [Ptr, I32, Ref(StreamAttribute)],
+                    "aclrtSynchronizeStream": [Ptr],
+                }
+            )
         self.functions = {}
+        self.bind(signatures, {"aclrtGetSocName": C.c_char_p})
+
+    def bind(self, signatures, return_types=None):
         for name, args in signatures.items():
             f = next((getattr(lib, name) for lib in self.libs if hasattr(lib, name)), None)
             if f is None:
                 raise RuntimeError(f"loaded CANN runtime lacks {name}")
             f.argtypes = args
-            f.restype = C.c_char_p if name == "aclrtGetSocName" else I32
+            f.restype = (return_types or {}).get(name, I32)
             self.functions[name] = f
 
     def call(self, name, *args):
