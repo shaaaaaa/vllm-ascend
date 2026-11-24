@@ -97,10 +97,11 @@ def toolkit():
     raise RuntimeError("ascendc.cmake was not found under the active CANN toolkit; source its set_env.sh")
 
 
-def build_kernel(rt, stack, soc, build):
+def prepare_kernel(rt, stack, soc, build, *, gate_probe=False):
     base, cmake = toolkit()
     source = Path(__file__).with_name("stream_priority_unit")
-    print(f"[STREAM_PRIORITY] building one AIV kernel for {soc}", flush=True)
+    label = "AIV_GATE" if gate_probe else "STREAM_PRIORITY"
+    print(f"[{label}] building one AIV kernel for {soc}", flush=True)
     for cmd in (
         [
             "cmake",
@@ -113,6 +114,7 @@ def build_kernel(rt, stack, soc, build):
             f"-DCMAKE_INSTALL_PREFIX={build}",
             f"-DASCEND_CANN_PACKAGE_PATH={base}",
             f"-DASCENDC_CMAKE_DIR={cmake}",
+            *(["-DBUILD_AIV_GATE_PROBE=ON"] if gate_probe else []),
         ],
         ["cmake", "--build", str(build), "--parallel", "2"],
     ):
@@ -126,6 +128,11 @@ def build_kernel(rt, stack, soc, build):
     rt.call("aclrtBinaryLoadFromFile", os.fsencode(binary), None, C.byref(handle))
     stack.callback(rt.call, "aclrtBinaryUnLoad", handle)
     rt.call("aclrtBinaryGetFunction", handle, b"stream_priority_pulse_kernel", C.byref(kernel))
+    return kernel
+
+
+def build_kernel(rt, stack, soc, build):
+    kernel = prepare_kernel(rt, stack, soc, build)
     lib = C.CDLL(str(build / "libstream_priority_host.so"), mode=C.RTLD_GLOBAL)
     submit = lib.stream_priority_submit
     submit.argtypes, submit.restype = [Ptr, U32, Ptr, Ptr, U32, C.c_uint64], I32
