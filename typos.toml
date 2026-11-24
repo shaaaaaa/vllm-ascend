@@ -69,6 +69,9 @@ extend-ignore-re = []
 
 [type.cpp.extend-identifiers]
 countr_one = "countr_one"
+# Public aclrtLaunchKernelCfg identifiers in the CANN headers.
+ACL_RT_LAUNCH_KERNEL_ATTR_SCHEM_MODE = "ACL_RT_LAUNCH_KERNEL_ATTR_SCHEM_MODE"
+schemMode = "schemMode"
 
 [type.cpp.extend-words]
 

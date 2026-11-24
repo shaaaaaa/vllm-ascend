@@ -14,6 +14,7 @@ import sys
 import tempfile
 import time
 from contextlib import ExitStack, suppress
+from functools import partial
 from pathlib import Path
 from statistics import median
 
@@ -37,6 +38,9 @@ class Runtime:
             "aclrtResetDevice": [I32],
             "aclrtGetSocName": [],
             "aclrtGetDeviceInfo": [U32, I32, C.POINTER(C.c_int64)],
+            "aclrtBinaryLoadFromFile": [C.c_char_p, Ptr, C.POINTER(Ptr)],
+            "aclrtBinaryGetFunction": [Ptr, C.c_char_p, C.POINTER(Ptr)],
+            "aclrtBinaryUnLoad": [Ptr],
             "aclrtDeviceGetStreamPriorityRange": [C.POINTER(I32), C.POINTER(I32)],
             "aclrtCreateStreamWithConfig": [C.POINTER(Ptr), U32, U32],
             "aclrtStreamGetPriority": [Ptr, C.POINTER(U32)],
@@ -93,7 +97,7 @@ def toolkit():
     raise RuntimeError("ascendc.cmake was not found under the active CANN toolkit; source its set_env.sh")
 
 
-def build_kernel(soc, build):
+def build_kernel(rt, stack, soc, build):
     base, cmake = toolkit()
     source = Path(__file__).with_name("stream_priority_unit")
     print(f"[STREAM_PRIORITY] building one AIV kernel for {soc}", flush=True)
@@ -106,6 +110,7 @@ def build_kernel(soc, build):
             str(build),
             f"-DSOC_VERSION={soc}",
             "-DCMAKE_BUILD_TYPE=Release",
+            f"-DCMAKE_INSTALL_PREFIX={build}",
             f"-DASCEND_CANN_PACKAGE_PATH={base}",
             f"-DASCENDC_CMAKE_DIR={cmake}",
         ],
@@ -114,17 +119,17 @@ def build_kernel(soc, build):
         proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace")
         if proc.returncode:
             raise RuntimeError(f"building the standalone kernel failed\n{proc.stdout[-4500:]}")
-    name = "libstream_priority_pulse.so"
-    direct = build / name
-    if not direct.is_file():
-        matches = sorted({p.resolve() for p in build.rglob(name)})
-        if len(matches) != 1:
-            raise RuntimeError(f"expected one built {name}, found {matches}")
-        direct = matches[0]
-    lib = C.CDLL(str(direct), mode=C.RTLD_GLOBAL)
+    binary = build / "fatbin" / "stream_priority_pulse" / "stream_priority_pulse.o"
+    if not binary.is_file():
+        raise RuntimeError(f"CANN build did not produce {binary}")
+    handle, kernel = Ptr(), Ptr()
+    rt.call("aclrtBinaryLoadFromFile", os.fsencode(binary), None, C.byref(handle))
+    stack.callback(rt.call, "aclrtBinaryUnLoad", handle)
+    rt.call("aclrtBinaryGetFunction", handle, b"stream_priority_pulse_kernel", C.byref(kernel))
+    lib = C.CDLL(str(build / "libstream_priority_host.so"), mode=C.RTLD_GLOBAL)
     submit = lib.stream_priority_submit
-    submit.argtypes, submit.restype = [U32, Ptr, Ptr, U32, C.c_uint64], I32
-    return submit
+    submit.argtypes, submit.restype = [Ptr, U32, Ptr, Ptr, U32, C.c_uint64], I32
+    return partial(submit, kernel)
 
 
 def enqueue_train(short_batch, long_task, unit_ns, clock=time.monotonic_ns, sleep=time.sleep):
@@ -205,12 +210,21 @@ class Work:
             duration = self.ticks * (LONG_UNITS if i == SHORTS else 1)
             if any(not a or b < a + duration for a, b in rows):
                 raise RuntimeError(f"task {i} has a missing or invalid per-block timestamp")
-            tasks.append((min(a for a, _ in rows) * TICK_NS, max(b for _, b in rows) * TICK_NS))
+            tasks.append([(a * TICK_NS, b * TICK_NS) for a, b in rows])
         return timing(tasks, host_times, offset, self.unit_ns)
 
 
 def timing(tasks, host_times, offset, unit_ns):
-    short, (entry, end) = tasks[:-1], tasks[-1]
+    spans, full_width_ns = [], []
+    for blocks in tasks:
+        starts, ends = zip(*blocks)
+        spans.append((min(starts), max(ends)))
+        # Intersection of the per-block device intervals, independent of host clock alignment.
+        full_width_ns.append(max(0, min(ends) - max(starts)))
+    short, (entry, end) = spans[:-1], spans[-1]
+    cross_stream_overlaps = sum(a < end and entry < b for a, b in short)
+    short_stream_overlaps = sum(prev_end > start for (_, prev_end), (start, _) in zip(short, short[1:]))
+    full_width_tasks = sum(ns > 0 for ns in full_width_ns)
     t0, queued, submitted, returned = host_times
     low, high = offset
     start_low, start_high = entry + low, entry + high
@@ -238,11 +252,18 @@ def timing(tasks, host_times, offset, unit_ns):
         "shorts_running_at_long_start": SHORTS - finished - pending,
         "shorts_queued_at_long_start": pending,
         "min_shorts_queued_at_long_submit": pending_at_submit,
+        "full_width_tasks": full_width_tasks,
+        "min_full_width_us": min(full_width_ns) / 1000,
+        "shorts_overlapping_long": cross_stream_overlaps,
+        "adjacent_shorts_overlapping": short_stream_overlaps,
+        "resource_check_passed": full_width_tasks == SHORTS + 1 and cross_stream_overlaps == short_stream_overlaps == 0,
         "issues": issues,
     }
 
 
 def verdict(pairs, unit_ms):
+    if any(not r["resource_check_passed"] for pair in pairs for r in pair.values()):
+        return "inconclusive_full_grid_contention"
     if any(r["issues"] for pair in pairs for r in pair.values()):
         return "inconclusive_arrival_or_timing"
     high = [p["S1_high"] for p in pairs]
@@ -282,10 +303,10 @@ def measure(args):
             raise RuntimeError(f"invalid AIV count or priority range: {blocks.value}, {greatest.value}..{least.value}")
         tmp = stack.enter_context(tempfile.TemporaryDirectory(prefix="stream-priority-"))
         ticks = round(args.unit_ms * 1e6 / TICK_NS)
-        work = Work(rt, stack, build_kernel(soc, Path(tmp)), blocks.value, ticks)
+        work = Work(rt, stack, build_kernel(rt, stack, soc, Path(tmp)), blocks.value, ticks)
         unit_ms = work.unit_ns / 1e6
         print(
-            f"[STREAM_PRIORITY] {soc}, {blocks.value} AIV, high={greatest.value} low={least.value}; "
+            f"[STREAM_PRIORITY] {soc}, {blocks.value} AIV, batch mode, high={greatest.value} low={least.value}; "
             f"S2 queues {SHORTS} x {unit_ms:g} ms at t=0; S1 submits 1 x {LONG_UNITS * unit_ms:g} ms "
             f"at {DELAY_UNITS * unit_ms:g} ms",
             flush=True,
@@ -309,6 +330,16 @@ def measure(args):
                     pair[high_role + "_high"] = dict(work.run(streams["S1"], streams["S2"]), created_first=roles[0])
             pairs.append(pair)
         status = verdict(pairs, unit_ms)
+        trials = [r for pair in pairs for r in pair.values()]
+        resource_check = "pass" if all(r["resource_check_passed"] for r in trials) else "failed"
+        print(
+            f"[STREAM_PRIORITY] resource_check={resource_check}, "
+            f"all {blocks.value} AIV active together in at least {min(r['full_width_tasks'] for r in trials)}"
+            f"/{SHORTS + 1} tasks per trial "
+            f"(shortest shared interval {min(r['min_full_width_us'] for r in trials):.2f} us), "
+            f"max shorts overlapping S1={max(r['shorts_overlapping_long'] for r in trials)}, "
+            f"max adjacent S2 overlaps={max(r['adjacent_shorts_overlapping'] for r in trials)}"
+        )
         for label in ("S1_high", "S2_high"):
             rows = [p[label] for p in pairs]
             starts = [r["long_started_ms"] for r in rows]
@@ -329,6 +360,8 @@ def measure(args):
                 json.dumps(
                     dict(
                         status=status,
+                        resource_check=resource_check,
+                        scheduling_mode="batch",
                         soc=soc,
                         aiv=blocks.value,
                         unit_ms=unit_ms,
