@@ -17,6 +17,14 @@ The probe explicitly binds two persistent streams as heads of one ACL model. Eac
 
 `creation_priority_effect_observed` means the higher-priority lane finished first on at least four of five replays in both directions and both creation orders, beyond the equal-priority lead and jitter. `no_clear_creation_priority_effect` reports a completed measurement with its six sets of timings. `failed` identifies a setup, replay or data-check error.
 
+To inspect progress inside each replay, use its existing msprof export and the two stream IDs printed in the first case. This example uses a capture that reused streams 76 and 75 in creation order.
+
+```bash
+python tools/summarize_creation_priority.py priority-profile-20261124-061758 --streams 76 75
+```
+
+The summary measures device Abs tasks directly. It validates 48 kernels on each lane for each of 36 replays, identifies cases chronologically even when model IDs repeat, and omits the warm-up in each case. `ready_start_counts` counts which lane starts the next kernel when both still have work and both preceding kernels have ended, summed over the five measured replays. It skips initial branch activation and counts equal timestamps as ties. Positive `b_minus_a_half_us` and `b_minus_a_last_us` indicate that A finished its 24th and 48th kernels earlier. `a_lead_at_half_kernels` gives the difference in completed kernels when either lane reaches 24. `interval_overlap_pct` is the fraction of the shorter lane's cumulative device task time that intersects tasks from the other lane. These four progress measurements are reported as medians across the five replays.
+
 On this 910B3, changing an existing queue's priority returned device status 4. The released 910B TS dispatchers in HDK 25.5.2, 26.0.RC1, 26.1.1 and 26.2.RC1 return 4 for the same update/query commands (14/15). The 25.5.2 queue creation path programs the requested three-bit priority. In stock CANN 9.1, automatic ACL graph capture creates internal streams at priority 0, and the graph queue pool also allocates at 0. Keep `VLLM_ASCEND_SFA_PREFETCH_LOW_PRIORITY=0` for the current 910B3 worker. A positive explicit-model result motivates propagating priority to the queues used by serving capture and then measuring TPOT. [Capture stream creation](https://github.com/hicann/runtime/blob/v9.1.0/src/runtime/feature/aclgraph/context_aclgraph.cc#L170) and [graph queue pool](https://github.com/hicann/runtime/blob/v9.1.0/src/runtime/core/src/device/device_sq_cq_pool.cc#L76).
 
 ### Verify dynamic priority on a deployment using updates after capture
