@@ -51,7 +51,8 @@ class CpuRuntime:
         stack.callback(self.resources.pop, handle)
         return handle
 
-    def tensor(self, stack, address):
+    def tensor(self, stack, address, elements):
+        assert elements == self.probe.ELEMENTS
         return address
 
     def stream_id(self, stream):

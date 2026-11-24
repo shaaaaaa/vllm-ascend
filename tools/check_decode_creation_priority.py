@@ -30,8 +30,8 @@ NOTIFY_TIMEOUT_S = 15
 
 
 class CreationRuntime(Runtime):
-    def __init__(self):
-        super().__init__(capture_functions=False)
+    def __init__(self, *, capture_functions=False):
+        super().__init__(capture_functions=capture_functions)
         for library in ("libnnopbase.so", "libopapi_math.so", "libopapi.so"):
             with suppress(OSError):
                 self.libs.append(C.CDLL(library, mode=C.RTLD_GLOBAL))
@@ -64,8 +64,8 @@ class CreationRuntime(Runtime):
         stack.callback(self.call, destroy, handle)
         return handle
 
-    def tensor(self, stack, address):
-        shape, stride = (I64 * 1)(ELEMENTS), (I64 * 1)(1)
+    def tensor(self, stack, address, elements=ELEMENTS):
+        shape, stride = (I64 * 1)(elements), (I64 * 1)(1)
         tensor = self.functions["aclCreateTensor"](shape, 1, FLOAT16, stride, 0, FORMAT_ND, shape, 1, address)
         if not tensor:
             raise RuntimeError("aclCreateTensor returned a null handle")
@@ -74,13 +74,14 @@ class CreationRuntime(Runtime):
 
 
 class AbsWork:
-    def __init__(self, rt, stack, byte, warmup_stream):
+    def __init__(self, rt, stack, byte, warmup_stream, elements=None):
         self.rt = rt
-        self.nbytes = ELEMENTS * 2
+        elements = ELEMENTS if elements is None else elements
+        self.nbytes = elements * 2
         self.byte = byte
         src, self.output = (rt.manage(stack, "aclrtMalloc", "aclrtFree", self.nbytes, 2) for _ in range(2))
         rt.call("aclrtMemset", src, self.nbytes, byte, self.nbytes)
-        self.src, self.dst = (rt.tensor(stack, pointer) for pointer in (src, self.output))
+        self.src, self.dst = (rt.tensor(stack, pointer, elements) for pointer in (src, self.output))
         self.capacity, executor = self.plan()
         self.workspace = rt.manage(stack, "aclrtMalloc", "aclrtFree", self.capacity, 2) if self.capacity else None
         rt.call("aclnnAbs", self.workspace, self.capacity, executor, warmup_stream)
