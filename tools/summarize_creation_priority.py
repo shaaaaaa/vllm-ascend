@@ -32,9 +32,10 @@ def csv_abs(path):
         if not all(k in columns for k in required) or not ({"opname", "optype"} & columns.keys()):
             raise ValueError(f"{path.name} lacks per-operator stream, name or device timing columns")
         stream, start, duration = (columns[k] for k in required)
+        blocks = columns.get("blockdim", columns.get("blocknum"))
         for row in reader:
             if is_abs(row.get(columns.get("opname"))) or is_abs(row.get(columns.get("optype"))):
-                yield row[stream], row[start], row[duration], row.get(columns.get("blockdim"))
+                yield row[stream], row[start], row[duration], row.get(blocks)
 
 
 def timeline_abs(path, requested):

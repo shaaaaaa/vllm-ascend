@@ -29,11 +29,11 @@ def fixture_rows(mod):
                     yield stream, f"{start_ns // 1000}.{start_ns % 1000:03d}", "1.000", index
 
 
-def make_csv(path, rows):
+def make_csv(path, rows, block_column="Block Dim"):
     with path.open("w", newline="", encoding="utf-8-sig") as out:
         writer = csv.writer(out)
         writer.writerow(
-            ["Model ID", "Stream ID", "OP Type", "Op Name", "Task Start Time(us)", "Task Duration(us)", "Block Dim"]
+            ["Model ID", "Stream ID", "OP Type", "Op Name", "Task Start Time(us)", "Task Duration(us)", block_column]
         )
         writer.writerow([0, 87, "Abs", "abs_warm", "1.001", 5, 8])
         for stream, start, length, index in rows:
@@ -59,12 +59,13 @@ def test_start_counts_follow_device_timestamps_after_both_predecessors_end(analy
     assert counts == {"a": 2, "b": 3, "tie": 0}
 
 
-def test_split_csv_slices_reused_model_streams_and_warmup(analyzer, tmp_path):
+@pytest.mark.parametrize("block_column", ["Block Dim", "Block Num"])
+def test_split_csv_slices_reused_model_streams_and_warmup(analyzer, tmp_path, block_column):
     export = tmp_path / "PROF_000001" / "mindstudio_profiler_output"
     export.mkdir(parents=True)
     rows = list(fixture_rows(analyzer))
-    make_csv(export / "op_summary_1.csv", rows[:1700])
-    make_csv(export / "op_summary_2.csv", rows[1699:])
+    make_csv(export / "op_summary_1.csv", rows[:1700], block_column)
+    make_csv(export / "op_summary_2.csv", rows[1699:], block_column)
     check_cases(analyzer.analyze(tmp_path, ["76", "75"]))
 
 
