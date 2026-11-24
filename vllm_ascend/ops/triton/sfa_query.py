@@ -92,7 +92,8 @@ def _rope_query_packet(q, r, cos, sin, bits_out, values_out, items, heads: tl.co
         even = tl.load(base + pair).to(tl.float32)
         odd = tl.load(base + pair + 1).to(tl.float32)
         x = tl.where(col < 32, even, odd)
-        rotated = tl.where(col < 32, -odd, even)
+        # InterleaveRope multiplies by -1. Triton 3.2 lowers unary minus to 0 - x, which keeps +0 positive.
+        rotated = tl.where(col < 32, odd * -1.0, even)
         c = tl.load(cos + row * cs + col).to(tl.float32)
         s = tl.load(sin + row * ss + col).to(tl.float32)
         value = x * c + rotated * s

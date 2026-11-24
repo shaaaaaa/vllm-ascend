@@ -28,6 +28,10 @@ def test_packet_io_replay(world, dtype):
     q = data(heads, rows, 512).transpose(0, 1)
     raw = data(rows, heads, 192)[..., -64:]
     cos, sin = (data(rows, 1, 1, 64) for _ in range(2))
+    # Force both signs of zero in the rotated output, independently of the random inputs.
+    raw[0, 0, :4].zero_()
+    cos[0, 0, 0, :2].fill_(-1)
+    sin[0, 0, 0, :2] = sin.new_tensor([1, -1])
     k, kr = (data(2 * pages, 128, 1, dim) for dim in (512, 64))
     table = torch.arange(2 * pages, dtype=torch.int32, device="npu").view(2, pages)
     ends = table.new_tensor([2, 4])
