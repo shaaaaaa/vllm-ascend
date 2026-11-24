@@ -404,31 +404,12 @@ def unwrap_staged_sfa_connector_metadata(metadata: Any) -> Any:
     return unwrap(metadata) if callable(unwrap) else metadata
 
 
-def _dsa_remap_frontier(load_spec: Any) -> int:
-    """Derive the operator boundary without changing LMCache commit progress."""
-    if load_spec is None:
-        return 0
-    cold_compact_resume = bool(
-        getattr(load_spec, "dsa_cold_compact_resume", False)
-    )
-    if not getattr(load_spec, "can_load", False) and not cold_compact_resume:
-        return 0
+def _dsa_remap_frontier(load_spec: Any, source_end: int) -> int:
+    """Apply the remap override and scratch floor to a load or cold resume."""
     remap_value = getattr(load_spec, "dsa_remap_frontier", None)
-    committed_value = (
-        remap_value
-        if remap_value is not None
-        else getattr(load_spec, "dsa_committed_end", None)
-    )
-    committed_value = (
-        committed_value
-        if committed_value is not None
-        else getattr(load_spec, "lmcache_cached_tokens", 0)
-    )
-    committed_end = int(committed_value or 0)
+    end = source_end if remap_value is None else int(remap_value or 0)
     scratch_capacity = getattr(load_spec, "dsa_scratch_capacity", None)
-    if scratch_capacity is not None and committed_end < int(scratch_capacity):
-        return 0
-    return committed_end
+    return 0 if scratch_capacity is not None and end < int(scratch_capacity) else end
 
 
 def get_lmcache_sparse_cached_tokens(request_ids: Any) -> list[int]:
@@ -466,11 +447,7 @@ def get_lmcache_sparse_cached_tokens(request_ids: Any) -> list[int]:
         metadata,
         normalized_request_ids,
     )
-    if reason not in (
-        StagedSFARouteReason.ELIGIBLE,
-        StagedSFARouteReason.DENSE_PREFIX_HIT,
-        StagedSFARouteReason.MIXED_CONNECTOR_LOAD,
-    ):
+    if not reason.has_valid_frontiers:
         raise RuntimeError(
             "[SFA sparse remap] connector frontier validation failed: "
             f"{reason.value}."
@@ -507,8 +484,8 @@ def staged_sfa_metadata_sparse_route(
     if set(main_by_req) != active_request_id_set:
         return StagedSFARouteReason.MISSING_CONNECTOR_METADATA, (), ()
 
-    dense_request_ids: set[str] = set()
-    sparse_request_ids: set[str] = set()
+    dense_rows = 0
+    ordinary_restore = False
     frontiers: list[int] = []
     cold_resumes: list[bool] = []
     resident_computed_ends: dict[int, int] | None = None
@@ -522,28 +499,31 @@ def staged_sfa_metadata_sparse_route(
         if current_released < 0 or nonresident < 0 or current_released > nonresident:
             return StagedSFARouteReason.INVALID_FRONTIER, (), ()
 
+        load_spec = getattr(request, "load_spec", None)
+        full_resident = getattr(load_spec, "dsa_full_resident", False)
+        can_load = not full_resident and getattr(load_spec, "can_load", False)
         if not getattr(request, "is_sparse_decode", False):
             if current_released != 0 or nonresident != 0:
                 return StagedSFARouteReason.DENSE_PREFIX_NOT_RESIDENT, (), ()
-            dense_request_ids.add(req_id)
+            # Only a still-pending restore needs native per-layer callbacks.
+            if can_load and getattr(request, "resumed_from_preemption", False):
+                ordinary_restore |= not getattr(load_spec, "process_ordinary_resume", False)
+            dense_rows += 1
             frontiers.append(0)
             cold_resumes.append(False)
             continue
 
-        sparse_request_ids.add(req_id)
-        load_spec = getattr(request, "load_spec", None)
         if load_spec is None:
             return StagedSFARouteReason.SPARSE_LOAD_UNAVAILABLE, (), ()
-        can_load = bool(getattr(load_spec, "can_load", False))
+        cold_resume = bool(getattr(load_spec, "dsa_cold_compact_resume", False))
         try:
             cached = int(getattr(load_spec, "lmcache_cached_tokens", 0) or 0)
             committed_raw = getattr(load_spec, "dsa_committed_end", None)
-            committed = int(
-                committed_raw
-                if committed_raw is not None
-                else (cached if can_load else 0)
+            source_end = cached if committed_raw is None else int(committed_raw)
+            committed = source_end if can_load or committed_raw is not None else 0
+            remap_frontier = (
+                _dsa_remap_frontier(load_spec, source_end) if can_load or (cold_resume and not full_resident) else 0
             )
-            remap_frontier = _dsa_remap_frontier(load_spec)
         except (TypeError, ValueError, OverflowError):
             return StagedSFARouteReason.INVALID_FRONTIER, (), ()
         if (
@@ -560,7 +540,6 @@ def staged_sfa_metadata_sparse_route(
         elif current_released > 0 or nonresident > 0:
             return StagedSFARouteReason.SPARSE_LOAD_UNAVAILABLE, (), ()
         frontiers.append(remap_frontier if can_load else 0)
-        cold_resume = bool(getattr(load_spec, "dsa_cold_compact_resume", False))
         if cold_resume and getattr(load_spec, "dsa_cold_resident_load", False):
             try:
                 computed_end = int(load_spec.dsa_cold_resume_computed_end)
@@ -581,19 +560,15 @@ def staged_sfa_metadata_sparse_route(
             for i, frontier in enumerate(frontiers)
         )
         cold_resume_tuple = ColdResumeMarkers(cold_resume_tuple, computed_ends)
-    if dense_request_ids and sparse_request_ids:
-        return (
-            StagedSFARouteReason.MIXED_CONNECTOR_LOAD,
-            tuple(frontiers),
-            cold_resume_tuple,
-        )
-    if sparse_request_ids:
-        return (
-            StagedSFARouteReason.ELIGIBLE,
-            tuple(frontiers),
-            cold_resume_tuple,
-        )
-    return StagedSFARouteReason.DENSE_PREFIX_HIT, tuple(frontiers), ()
+    if ordinary_restore:
+        reason = StagedSFARouteReason.ORDINARY_RESTORE
+    elif dense_rows == 0:
+        reason = StagedSFARouteReason.ELIGIBLE
+    elif dense_rows == len(frontiers):
+        reason = StagedSFARouteReason.DENSE_PREFIX_HIT
+    else:
+        reason = StagedSFARouteReason.MIXED_CONNECTOR_LOAD
+    return reason, tuple(frontiers), cold_resume_tuple
 
 
 def native_sfa_cold_resume_layout(

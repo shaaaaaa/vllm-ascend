@@ -2,10 +2,12 @@
 """Execute the real runner/SFA transfer control flow without torch or an NPU."""
 
 import ast
+from collections import namedtuple
 from copy import deepcopy
 from enum import Enum
 from pathlib import Path
 from types import SimpleNamespace as NS
+from unittest.mock import Mock
 
 import numpy as np
 import pytest
@@ -46,7 +48,8 @@ def api():
     prepare_end = next(i for i, n in enumerate(prepare.body) if assigns(n, "attn_state"))
     runner_class = ast.ClassDef(name="Runner", bases=[], keywords=[], body=[classify], decorator_list=[])
 
-    sfa = source_class("attention/sfa_v1.py", "AscendSFAImpl")
+    sfa_module = ast.parse((ROOT / "attention/sfa_v1.py").read_text(encoding="utf-8"))
+    sfa = next(n for n in sfa_module.body if getattr(n, "name", None) == "AscendSFAImpl")
     forward = next(n for n in sfa.body if getattr(n, "name", None) == "forward")
     entry_start = next(i for i, n in enumerate(forward.body) if assigns(n, "transfer_context"))
     entry_end = next(i for i, n in enumerate(forward.body) if assigns(n, "pending_transfer_names"))
@@ -79,6 +82,7 @@ def api():
         tail,
     ]
     helper_names = {
+        "submit_cross_layer_save",
         "_submit_sfa_save_operations",
         "_submit_sfa_transfer_window_save_operations",
         "_submit_sfa_post_transfer_window_save_operations",
@@ -103,13 +107,21 @@ def api():
         sfa_full_graph_enabled=lambda config: False,
         Enum=Enum,
         get_forward_context=lambda: context,
+        has_kv_transfer_group=lambda: False,
+        is_v1_kv_transfer_group=lambda: True,
+        MultiKVConnectorMetadata=namedtuple("MultiKVConnectorMetadata", ["metadata"]),
         maybe_save_kv_layer_to_connector=record("legacy_save"),
         maybe_save_kv_layer_in_layerwise_prefill_transfer_window=record("save"),
         maybe_save_kv_layer_outside_layerwise_prefill_transfer_window=record("post_save"),
         maybe_submit_layerwise_prefill_load=record("load"),
         maybe_finish_layerwise_prefill_save=record("finish"),
     )
-    execute([state, runner_class, impl_class], namespace)
+    save_policy = [
+        node
+        for node in sfa_module.body
+        if getattr(node, "name", None) in {"_metadata_has_scheduled_save", "_decode_step_needs_save"}
+    ]
+    execute([state, runner_class, *save_policy, impl_class], namespace)
     return NS(
         namespace=namespace,
         states=namespace["AscendAttentionState"],
@@ -245,6 +257,45 @@ def test_d_without_shrink_still_saves(api):
     obj = impl(api, p_node=False, shrink=0)
     names = step(api, obj, state, decode_rows=1)
     assert api.events == [("legacy_save", name) for name in names]
+
+
+@pytest.mark.parametrize("staged", [False, True])
+@pytest.mark.parametrize("wrapped", [False, True])
+def test_window_disabled_honors_scheduled_saves_per_forward(api, staged, wrapped):
+    obj = impl(api, p_node=False, window=0)
+    connector = NS(has_connector_metadata=lambda: True, _get_connector_metadata=Mock())
+    api.namespace.update(has_kv_transfer_group=lambda: True, get_kv_transfer_group=lambda: connector)
+    for can_save in (True, False, True):
+        api.namespace["get_forward_context"] = Mock(return_value=NS(additional_kwargs={}))
+        metadata = NS(requests=[NS(save_spec=None), NS(save_spec=NS(can_save=can_save, ordinary_decode_save=True))])
+        if wrapped:
+            metadata = api.namespace["MultiKVConnectorMetadata"]((NS(), metadata))
+        connector._get_connector_metadata.return_value = metadata
+        connector._get_connector_metadata.reset_mock()
+        api.events.clear()
+        expected = []
+        for layer in range(2):
+            if staged:
+                names = [f"latent.{layer}", f"indexer.{layer}"]
+                obj._staged_sfa_capture_state = NS(runtime=(names[0], (1, 2, 3), names[1], True))
+                obj.submit_cross_layer_save()
+            else:
+                names = step(api, obj, api.states.DecodeOnly, layer=layer, decode_rows=1)
+            if can_save:
+                expected.extend(("legacy_save", name) for name in names)
+        assert api.events == expected
+        connector._get_connector_metadata.assert_called_once_with()
+
+
+@pytest.mark.parametrize("bound,dummy", [(False, False), (True, True)])
+def test_unbound_or_dummy_decode_does_not_submit_a_save(api, bound, dummy):
+    obj = impl(api, p_node=False, window=0)
+    connector = NS(has_connector_metadata=lambda: bound, _get_connector_metadata=Mock())
+    api.namespace.update(has_kv_transfer_group=lambda: True, get_kv_transfer_group=lambda: connector)
+    api.context.staged_sfa_graph_dummy_run = dummy
+    step(api, obj, api.states.DecodeOnly, decode_rows=1)
+    assert api.events == []
+    connector._get_connector_metadata.assert_not_called()
 
 
 def test_d_does_not_consult_p_transfer_capability_or_move_save_policy_before_projection(api):

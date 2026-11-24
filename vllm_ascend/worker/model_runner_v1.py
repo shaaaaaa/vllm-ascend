@@ -4773,11 +4773,7 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
         def native(reason, *failed_checks):
             # The computed-before-prompt guard can take precedence over a
             # connector rejection. Preserve that cause without validating twice.
-            if is_decode_state and graph_configured and metadata_reason not in (
-                StagedSFARouteReason.ELIGIBLE,
-                StagedSFARouteReason.DENSE_PREFIX_HIT,
-                StagedSFARouteReason.MIXED_CONNECTOR_LOAD,
-            ):
+            if is_decode_state and graph_configured and not metadata_reason.has_valid_frontiers:
                 failed_checks += (f"connector_validation:{metadata_reason.value}",)
             return StagedSFARouteDecision(
                 StagedSFARouteAction.SAFE_NATIVE,
@@ -4859,6 +4855,8 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                         StagedSFARouteReason.COLD_COMPACT_LAYOUT, *marker_failures
                     )
                 cold_resumes = ColdResumeMarkers(cold_resumes, cold_computed_ends)
+        if is_decode_state and metadata_reason == StagedSFARouteReason.ORDINARY_RESTORE:
+            return native(metadata_reason)
         if getattr(self, "calculate_kv_scales", False):
             return native(StagedSFARouteReason.RUNTIME_MODE, "calculate_kv_scales")
         if getattr(self.vllm_config, "lora_config", None) is not None:
@@ -4892,11 +4890,7 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
             StagedSFARouteReason.MIXED_CONNECTOR_LOAD,
         ):
             return native(metadata_reason)
-        if metadata_reason not in (
-            StagedSFARouteReason.ELIGIBLE,
-            StagedSFARouteReason.DENSE_PREFIX_HIT,
-            StagedSFARouteReason.MIXED_CONNECTOR_LOAD,
-        ):
+        if not metadata_reason.has_valid_frontiers:
             return StagedSFARouteDecision(
                 StagedSFARouteAction.FATAL,
                 metadata_reason,
@@ -5104,7 +5098,7 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
         if (
             sfa_full_graph_enabled(self.vllm_config)
             and self.attn_state in (AscendAttentionState.DecodeOnly, AscendAttentionState.SpecDecoding)
-            and route.reason != StagedSFARouteReason.NOT_DECODE
+            and route.reason not in (StagedSFARouteReason.NOT_DECODE, StagedSFARouteReason.ORDINARY_RESTORE)
             and not (route.action == StagedSFARouteAction.SAFE_NATIVE
                      and route.reason == StagedSFARouteReason.RUNTIME_PARALLELISM
                      and self.parallel_config.data_parallel_size > 1)

@@ -3452,6 +3452,39 @@ class SelectedKVUnitTest(unittest.TestCase):
             self.assertEqual(s_skip[-1], frozenset())
             self._close_src(h.src)
 
+    def test_resident_row_with_stale_can_load_keeps_selected_prefill(self) -> None:
+        history = 49152
+        with _fake_npu():
+            fixture = self._mk_src()
+            metadata = self._cm("prefill", ("resident", history, True, True, 0))
+            resident = metadata.requests[1]
+            resident.load_spec.dsa_full_resident = True
+            fixture.cm_box[0] = metadata
+            page = self._sh_obj(0x9000, history, 4)
+
+            def load_prefill(_context: Any) -> None:
+                next(fixture.gc.batched_to_gpu([0], [history], req_id="prefill", kv_group=0))
+                fixture.eng._prepare_shared_prefill_sources(
+                    [self._LayerSrc((page,), layer) for layer in range(4)], 0, {"req_id": "prefill"}
+                )
+
+            fixture.hook[0] = load_prefill
+            blocks = history // skv.PAGE_ROWS + 1
+            tables = np.arange(2 * blocks, dtype=np.int32).reshape(2, blocks)
+            try:
+                # Even a prefill-shaped row must not load full-resident KV.
+                for sparse_decode in (True, False):
+                    resident.is_sparse_decode = sparse_decode
+                    fixture.src.begin_runner_step(
+                        metadata, ("prefill", "resident"), (history, history), (0, 8, 9), (tables, tables)
+                    )
+                    fixture.impl.start_load_kv(None)
+                    self.assertIsNotNone(fixture.src.step)
+                    self.assertEqual(fixture.src.step.selected_request_ids, {"prefill"})
+                    fixture.src.step.finish(completion=torch.npu.Event())
+            finally:
+                self._close_src(fixture.src)
+
     def test_recompute_fallback_bs1_cancel_unused_and_next_step(self) -> None:
         with _fake_npu():
             pst, o_r0 = {"rc": 1}, self._sh_obj(0x9000, 49152, 4)

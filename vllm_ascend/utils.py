@@ -111,6 +111,7 @@ class StagedSFARouteReason(str, Enum):
     BATCH_DESCRIPTOR = "batch_descriptor"
     INVALID_REQUEST_IDS = "invalid_request_ids"
     DENSE_PREFIX_HIT = "dense_prefix_hit"
+    ORDINARY_RESTORE = "ordinary_restore"
     MIXED_CONNECTOR_LOAD = "mixed_connector_load"
     MISSING_CONNECTOR_METADATA = "missing_connector_metadata"
     SPARSE_LOAD_UNAVAILABLE = "sparse_load_unavailable"
@@ -122,6 +123,16 @@ class StagedSFARouteReason(str, Enum):
     DENSE_PREFIX_NOT_RESIDENT = "dense_prefix_not_resident"
     COLD_COMPACT_LAYOUT = "cold_compact_layout"
     RUNNER_LAYER_MISMATCH = "runner_layer_mismatch"
+
+    @property
+    def has_valid_frontiers(self) -> bool:
+        """The connector proved every lane's boundary, even for a native restore."""
+        return self in (
+            StagedSFARouteReason.ELIGIBLE,
+            StagedSFARouteReason.DENSE_PREFIX_HIT,
+            StagedSFARouteReason.MIXED_CONNECTOR_LOAD,
+            StagedSFARouteReason.ORDINARY_RESTORE,
+        )
 
 
 @dataclass(frozen=True, slots=True)

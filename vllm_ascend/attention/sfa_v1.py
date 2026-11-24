@@ -19,6 +19,7 @@ from vllm.distributed.kv_transfer import (
     has_kv_transfer_group,
     is_v1_kv_transfer_group,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import MultiKVConnectorMetadata
 from vllm.forward_context import get_forward_context
 from vllm.logger import logger
 from vllm.model_executor.layers.attention.mla_attention import MLACommonMetadataBuilder
@@ -349,6 +350,33 @@ def _decode_window_save_window_size() -> int:
         return max(0, int(value or 0))
     except ValueError:
         return 0
+
+
+def _metadata_has_scheduled_save(metadata: Any) -> bool:
+    """Read the scheduler's save intent for a direct or wrapped connector."""
+    if isinstance(metadata, MultiKVConnectorMetadata):
+        return any(_metadata_has_scheduled_save(child) for child in metadata.metadata)
+    return any(
+        getattr(getattr(request, "save_spec", None), "can_save", False) for request in getattr(metadata, "requests", ())
+    )
+
+
+def _decode_step_needs_save() -> bool:
+    """Keep window callbacks and honor explicit saves on ordinary decode rows."""
+    if _decode_window_save_window_size() > 0:
+        return True
+    context = get_forward_context()
+    requested = getattr(context, "sfa_decode_save_requested", None)
+    if requested is None:
+        if not has_kv_transfer_group() or not is_v1_kv_transfer_group():
+            return False
+        connector = get_kv_transfer_group()
+        if not connector.has_connector_metadata() or getattr(context, "staged_sfa_graph_dummy_run", False):
+            return False
+        # All layers in this forward share one scheduler decision.
+        requested = _metadata_has_scheduled_save(connector._get_connector_metadata())
+        context.sfa_decode_save_requested = requested
+    return requested
 
 
 def _update_dsa_split_boundary_in_place(
@@ -4847,7 +4875,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         if runtime is None:
             return
         layer_name, kv_cache, index_layer_name, index_enabled = runtime
-        if bool(self.dsa_shrink_latent) and _decode_window_save_window_size() == 0:
+        if self.dsa_shrink_latent and not _decode_step_needs_save():
             return
         maybe_save_kv_layer_to_connector(layer_name, [kv_cache[0], kv_cache[1]])
         if index_layer_name is not None and index_enabled:
@@ -5612,8 +5640,8 @@ class AscendSFAImpl(MLAAttentionImpl):
         # Offload to LMCache. Legacy un-bundled connectors save only the
         # latent (k_nope, k_pe). Connectors declaring DSA index LMCache support
         # also save the sibling indexer layer whenever that path is enabled.
-        # A pure decode step in shrink-latent mode skips this unless decode
-        # window saving is enabled. P-node banks must still save and advance
+        # Shrink-latent decode skips callbacks when neither a window nor an
+        # explicit save needs them. P-node banks must still save and advance
         # their load cursor: a one-token prefill tail (and its MTP forward)
         # can also carry DecodeOnly/SpecDecoding attention metadata.
         save_operations: list[tuple[str, list[torch.Tensor]]] = []
@@ -5719,8 +5747,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                     pending_transfers, pending_transfer_names
                 )
             if not self._layerwise_prefill_p_node:
-                _decode_window_save_enabled = _decode_window_save_window_size() > 0
-                _skip_decode_save = bool(self.dsa_shrink_latent) and _is_pure_decode and not _decode_window_save_enabled
+                _skip_decode_save = self.dsa_shrink_latent and _is_pure_decode and not _decode_step_needs_save()
                 if not _skip_decode_save:
                     if self.dsa_offload_unbundle and len(kv_cache) >= 2:
                         save_operations.append((layer_name, [kv_cache[0], kv_cache[1]]))

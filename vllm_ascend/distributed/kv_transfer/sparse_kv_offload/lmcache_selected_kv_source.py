@@ -74,6 +74,11 @@ def _unwrap_storer_starts(storer: Any) -> Any:
     return None
 
 
+def _requires_retrieve(load_spec: Any) -> bool:
+    """A full-resident row needs no transfer, even with a stale can_load."""
+    return bool(_ga(load_spec, "can_load", False)) and not _ga(load_spec, "dsa_full_resident", False)
+
+
 def classify_lmcache_request(
     request_id: str,
     history_tokens: object,
@@ -97,7 +102,7 @@ def classify_lmcache_request(
         and hist + query <= skv.MAX_TOTAL_TOKENS
         and chunk_size > 0
         and query * QUERY_TOTAL_RATIO_DEN < (hist + query) * QUERY_TOTAL_RATIO_NUM
-        and bool(getattr(load_spec, "can_load", False))
+        and _requires_retrieve(load_spec)
         and int(getattr(load_spec, "vllm_cached_tokens", 0) or 0) == 0
         and getattr(req_meta, "block_allocation_mode", None) == "prefill_child"
         and not any(getattr(req_meta, flag, False) for flag in disallowed)
@@ -1148,7 +1153,7 @@ class LMCacheSelectedKVSource:
             req_meta
             for req_meta in meta.requests
             if not getattr(req_meta, "is_decode_window_save", False)
-            and bool(_ga(req_meta, "load_spec.can_load", False))
+            and _requires_retrieve(_ga(req_meta, "load_spec"))
         ]
         deferred_ok = (
             bool(getattr(self.impl, "use_layerwise", True))

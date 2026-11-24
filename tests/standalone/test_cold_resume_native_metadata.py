@@ -294,7 +294,10 @@ def native_api():
     names = {"_dsa_remap_frontier", "staged_sfa_metadata_sparse_route", "native_sfa_cold_resume_layout"}
     nodes = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in names]
     tree = ast.parse((root / "vllm_ascend/worker/model_runner_v1.py").read_text(encoding="utf-8"))
-    nodes.append(next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "_build_attn_state"))
+    nodes.extend(
+        n for n in ast.walk(tree)
+        if isinstance(n, ast.FunctionDef) and n.name in {"_build_attn_state", "_apply_staged_sfa_route"}
+    )
     future = ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0)
     exec(
         compile(ast.fix_missing_locations(ast.Module(body=[future, *nodes], type_ignores=[])), "native_route", "exec"),
@@ -370,6 +373,45 @@ def test_dense_pd_admission_without_cold_proof_preserves_both_queries(native_api
     assert frontiers == (0,)
     boundary = native_api["_update_dsa_split_boundary_in_place"](result, list(frontiers), 0)
     assert boundary.tolist() == [0, 0]
+
+
+def test_ordinary_restore_requires_native_layer_callbacks_even_with_full_graph(native_api):
+    native_api["sfa_full_graph_enabled"] = lambda _: True
+    runner, _, kwargs = native_case(
+        native_api, [2, 2], [300, 8192], [300, 8192], [301, 8193],
+        np.array([1, 1]), set(),
+    )
+    restore, managed = kwargs["kv_connector_metadata"].requests
+    restore.resumed_from_preemption = True
+    restore.load_spec = NS(can_load=True, lmcache_cached_tokens=300)
+    managed.is_sparse_decode = True
+    managed.dsa_nonresident_frontier = 8192
+    managed.load_spec = NS(can_load=True, lmcache_cached_tokens=8192)
+    route = native_api["_staged_sfa_local_route"]
+    pending = route(runner, **kwargs)
+    assert (pending.action.value, pending.reason.value) == ("safe_native", "ordinary_restore")
+    assert native_api["_apply_staged_sfa_route"](runner, pending) is None
+    # A completed ordinary restore consumes a fence before forward; unlike a
+    # layerwise load it does not need per-layer Python callbacks.
+    restore.load_spec = NS(can_load=False, process_ordinary_resume=True)
+    ready = route(runner, **kwargs)
+    assert ready.action.value == "staged" and ready.frontiers == (0, 8192)
+
+
+def test_resident_and_managed_decode_share_the_staged_route(native_api):
+    runner, _, kwargs = native_case(
+        native_api, [2, 2], [300, 8192], [300, 8192], [301, 8193],
+        np.array([1, 1]), set(),
+    )
+    resident, managed = kwargs["kv_connector_metadata"].requests
+    resident.is_sparse_decode = managed.is_sparse_decode = True
+    resident.load_spec = NS(can_load=True, lmcache_cached_tokens=256, dsa_full_resident=True)
+    managed.load_spec = NS(can_load=True, lmcache_cached_tokens=8192)
+    managed.dsa_nonresident_frontier = 8192
+    kwargs["kv_connector_metadata"].requests.reverse()
+    decision = native_api["_staged_sfa_local_route"](runner, **kwargs)
+    assert decision.action.value == "staged" and decision.reason.value == "eligible"
+    assert decision.frontiers == (0, 8192) and not decision.cold_compact_resumes
 
 
 def test_dense_tail_and_sparse_decode_reuse_metadata_without_stale_rows(native_api):
