@@ -139,13 +139,16 @@ def test_sampling_warms_small_and_large_tiles_and_optional_inputs(warmup, spec_t
         (False, False, True, 0),
     ],
 )
-def test_common_startup_selects_used_paths_without_optimization_flags(warmup, monkeypatch, dcp, sparse, pooling, spec):
+@pytest.mark.parametrize("packet_mode", ["direct", "fused", "fused_contiguous"])
+def test_common_startup_selects_used_paths_without_optimization_flags(
+    warmup, monkeypatch, dcp, sparse, pooling, spec, packet_mode
+):
     module, calls = warmup
 
     class Impl:
         local_num_heads, kv_lora_rank, qk_rope_head_dim, qk_head_dim = 16, 512, 64, 192
         has_indexer, n_head, head_dim, is_rope_neox_style = True, 64, 128, False
-        _dcp_packet_io = "fused"
+        _dcp_packet_io = packet_mode
 
     monkeypatch.setitem(sys.modules, "vllm_ascend.attention.sfa_v1", NS(AscendSFAImpl=Impl))
     monkeypatch.setitem(sys.modules, "vllm.model_executor.layers.attention_layer_base", NS(AttentionLayerBase=object))
@@ -181,7 +184,8 @@ def test_common_startup_selects_used_paths_without_optimization_flags(warmup, mo
     module.warmup_decode_kernels(runner)
     names = [name for name, _ in calls]
     assert ("_pack" in names) == dcp
-    assert names.count("_rope_query_packet") == int(dcp and sparse)
+    writers = [args["CONTIGUOUS"] for name, args in calls if name == "_rope_query_packet"]
+    assert writers == ([packet_mode == "fused_contiguous"] if dcp and sparse and packet_mode != "direct" else [])
     assert ("_copy_query_bridge" in names) == sparse
     assert ("apply_all_penalties_kernel" in names) != pooling
     assert ("prepare_next_mtp_tokens_kernel" in names) == bool(spec)

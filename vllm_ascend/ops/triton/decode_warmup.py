@@ -276,13 +276,15 @@ def warmup_decode_kernels(runner):
         geometry = (impl.local_num_heads, impl.kv_lora_rank, impl.qk_rope_head_dim, impl.qk_head_dim)
         if geometry not in seen_queries:
             warmup_query(*geometry)
-            if runner.dsa_decoder_dcp and getattr(impl, "_dcp_packet_io", "off") == "fused":
+            mode = getattr(impl, "_dcp_packet_io", "off")
+            if runner.dsa_decoder_dcp and mode in ("fused", "fused_contiguous"):
                 from vllm_ascend.ops.triton.sfa_query import _rope_query_packet
 
                 heads, dim, rope_dim, projected = geometry
                 dtype = runner.dtype
                 _compile(_rope_query_packet, torch.int16, dtype, dtype, dtype, torch.int16, dtype,
-                         1, heads, dim, dim, heads * projected, projected, rope_dim, rope_dim, enable_fp_fusion=False)
+                         1, heads, dim, dim, heads * projected, projected, rope_dim, rope_dim,
+                         CONTIGUOUS=mode == "fused_contiguous", enable_fp_fusion=False)
             seen_queries.add(geometry)
         if impl.has_indexer:
             for heads in {1, impl.n_head}:

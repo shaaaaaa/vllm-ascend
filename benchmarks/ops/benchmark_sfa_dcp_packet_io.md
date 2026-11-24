@@ -12,6 +12,7 @@ existing Cube L1 tile.
 | `output` | Same as baseline | Native send packet |
 | `direct` | Native RoPE, packet construction, gather, direct L1 load | Native send packet |
 | `fused` | One RoPE/packet writer, gather, direct L1 load | Native send packet |
+| `fused_contiguous` | Same writer with one contiguous 64-element RoPE read per head and two on-chip permutations | Native send packet |
 
 ## Build and check packet parity
 
@@ -36,7 +37,7 @@ Top-K, and changed inputs across graph replays.
 ## Measure complete decoder layer groups
 
 Use eight idle local NPUs for DCP8, or four processes on four NPUs for DCP4.
-This smoke run compares the original chain against all three candidates.
+This smoke run compares the original chain against the output, direct and fused stages.
 
 ```bash
 export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
@@ -61,6 +62,26 @@ To isolate the loader, use `--reference-stage output --stages direct`.
 To isolate bridge fusion on the same communicator and inputs, use
 `--reference-stage direct --stages fused`.
 
+### Trials with 12-AIV prefetch
+
+Use the eight-rank command above with one of these sets of arguments. Both
+arms use the same replay inputs and separate registered KV pages for each layer.
+The source data occupies about `requests × layers × history × 1,152` bytes per rank.
+Each eligible side-stream prefetch uses at most 12 AIVs in both arms.
+
+| Trial | Arguments to append | What varies |
+|---|---|---|
+| Critical-path copy | `--reference-stage fused --stages fused --serial-aiv-cores 12 --json serial-aiv.json` | Only the serial H2D grid changes from automatic to 12 |
+| Contiguous RoPE | `--reference-stage fused --stages fused_contiguous --json contiguous-rope.json` | Only the raw RoPE load and in-kernel lane permutation change |
+
+The automatic serial grid uses all hardware AIVs up to the selected tensor's
+capacity. The kernel partitions actual misses on the device. For the same
+live-service comparison, restart with `VLLM_ASCEND_SFA_DCP_SERIAL_AIV_CORES=0`
+(default), then `12`. To hold the serial cap at 12 during the bridge comparison,
+pass both `--reference-serial-aiv-cores 12` and `--serial-aiv-cores 12`.
+Add `--profile-dir` with a separate directory per trial to
+compare the producer copy, prefetch, bridge and slowest-rank layer-group time.
+
 By default both arms use early gathering and query-first consumers. The group
 includes the native C8 Lightning Indexer on the producer, real sparse H2D, KV
 updates, DCP attention, exchange, combine and local output projection. Indexer
@@ -78,9 +99,12 @@ to inspect the final chain and native SFA duration.
 ## Serving
 
 The startup setting `VLLM_ASCEND_SFA_DCP_PACKET_IO` defaults to `off`. After
-qualification, set it to `output`, `direct` or `fused` on all decoder ranks and
+qualification, set it to `output`, `direct`, `fused` or `fused_contiguous` on all decoder ranks and
 restart. It applies to full target DCP graphs using a shared resident plan.
 The existing gather and H2D settings still select when communication starts.
 The fused bridge combines latent packing with the documented
 [InterleaveRope](https://gitcode.com/cann/ops-transformer/tree/9.0.0-beta.1/posembedding/interleave_rope)
 arithmetic and preserves the original FP32 multiply/add rounding sequence.
+The contiguous trial reuses the existing native packet operator. An editable
+installation with the native packet build needs updated Python sources and a
+worker restart for the new Triton specialization.

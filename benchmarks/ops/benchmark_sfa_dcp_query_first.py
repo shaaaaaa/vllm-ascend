@@ -105,10 +105,10 @@ class QueryFirstPipeline(AttentionPipeline):
 
     def _project_queries(self, impl, q_c, cos, sin, mode):
         q, r = impl._q_proj_and_k_up_proj(q_c)
-        if mode == "fused":
+        if mode in ("fused", "fused_contiguous"):
             from vllm_ascend.ops.triton.sfa_query import rope_sfa_dcp_query_packet
 
-            packet = rope_sfa_dcp_query_packet(q, r, cos, sin)
+            packet = rope_sfa_dcp_query_packet(q, r, cos, sin, contiguous=mode == "fused_contiguous")
             return q, packet[..., LATENT:], packet
         return q, impl.rope_single(r, cos, sin), None
 
@@ -174,8 +174,8 @@ class QueryFirstPipeline(AttentionPipeline):
                         pending.wait()
         self.projected_output = hidden
 
-    def check_transfer(self, *, caches=None):
-        misses = super().check_transfer(caches=caches)
+    def check_transfer(self, *, caches=None, layer=0):
+        misses = super().check_transfer(caches=caches, layer=layer)
         if caches is None:
             # Also check current writes, including ranks with no owned tokens.
             for dest, (slots, (rope, latent)) in zip(self.layer_caches, self.current_writes):
@@ -211,10 +211,14 @@ def main(*, comparison="query-first", pipeline_factory=QueryFirstPipeline, descr
         )
         parser.add_argument("--prefetch-after-pack", action="store_true")
     if comparison == "packet-io":
-        parser.add_argument("--reference-stage", choices=("off", "output", "direct", "fused"), default="off")
+        stages = ("output", "direct", "fused", "fused_contiguous")
+        parser.add_argument("--reference-stage", choices=("off", *stages), default="off")
+        parser.add_argument("--stages", nargs="+", choices=stages, default=["output", "direct", "fused"])
         parser.add_argument(
-            "--stages", nargs="+", choices=("output", "direct", "fused"), default=["output", "direct", "fused"]
+            "--serial-aiv-cores", type=int, default=0,
+            help="candidate serial H2D cap (0 = automatic); prefetch stays capped at 12",
         )
+        parser.add_argument("--reference-serial-aiv-cores", type=int, default=0, help="reference serial H2D cap")
     if comparison == "prefetch-after-pack":
         parser.add_argument(
             "--query-first",
@@ -245,6 +249,10 @@ def main(*, comparison="query-first", pipeline_factory=QueryFirstPipeline, descr
     parser.add_argument("--profile-dir", type=Path)
     parser.add_argument("--json", type=Path, default=Path(f"sfa-dcp-{comparison}.json"))
     args = parser.parse_args()
+    if comparison == "packet-io" and not all(
+        0 <= n < 2**32 for n in (args.serial_aiv_cores, args.reference_serial_aiv_cores)
+    ):
+        parser.error("serial AIV core limits must be unsigned 32-bit integers")
     if comparison in ("early-unpack", "packet-io") and args.unpack_cores < 1:
         parser.error("--unpack-cores must be positive")
     if comparison == "early-unpack" and args.unpack_placement == "consumer" and args.layers == 1:
@@ -301,6 +309,9 @@ def main(*, comparison="query-first", pipeline_factory=QueryFirstPipeline, descr
     try:
         for layout, stage in product(args.layouts, getattr(args, "stages", [comparison])):
             variant = f"{args.reference_stage}-to-{stage}" if comparison == "packet-io" else stage
+            if comparison == "packet-io" and (args.reference_serial_aiv_cores or args.serial_aiv_cores):
+                ref_grid = args.reference_serial_aiv_cores or "auto"
+                variant += f"-serial-aiv-{ref_grid}-to-{args.serial_aiv_cores or 'auto'}"
             for requests in args.requests:
                 case_args = SimpleNamespace(
                     **{

@@ -185,6 +185,8 @@ def execution_contract(runner: Any) -> dict[str, Any]:
             )
         if packet_mode != "off":
             dcp_layout["packet_io"] = packet_mode
+        if envs.VLLM_ASCEND_SFA_DCP_SERIAL_AIV_CORES:
+            dcp_layout["serial_aiv_cores"] = envs.VLLM_ASCEND_SFA_DCP_SERIAL_AIV_CORES
     dispatcher = getattr(get_moe_comm_method(MoECommType.MC2), "token_dispatcher", None)
     global_bs = math.ceil(capacity / tp.world_size) * ep.world_size
     if (

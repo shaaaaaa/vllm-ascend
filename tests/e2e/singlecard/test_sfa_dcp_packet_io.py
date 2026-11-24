@@ -45,11 +45,13 @@ def test_packet_io_replay(world, dtype):
         assert out.shape == (world, rows, local, 528) and out.dtype == dtype
 
     def run():
-        packets = []
+        packets, contiguous_packets = [], []
         for peer in range(world):
             part = slice(peer * local, (peer + 1) * local)
             packets.append(rope_sfa_dcp_query_packet(q[:, part], raw[:, part], cos, sin))
+            contiguous_packets.append(rope_sfa_dcp_query_packet(q[:, part], raw[:, part], cos, sin, contiguous=True))
         wire = torch.stack(packets)
+        contiguous_wire = torch.stack(contiguous_packets)
         r = torch_npu.npu_interleave_rope(raw.unsqueeze(2).contiguous(), cos, sin).squeeze(2)
         expected_q = torch.cat((q, r), -1).reshape(rows, world, local, 576).transpose(0, 1).contiguous()
         meta = (k, kr, indices, counts, table, ends, lengths, 576**-0.5)
@@ -59,14 +61,15 @@ def test_packet_io_replay(world, dtype):
         output_only = ops.npu_sparse_flash_attention_dcp_packet(q.contiguous(), r, *meta, world)
         direct = ops.npu_sparse_flash_attention_dcp_packet(expected_q, None, *meta, world)
         fused = ops.npu_sparse_flash_attention_dcp_packet(wire, None, *meta, world)
-        return wire, expected_q, expected, output_only, direct, fused
+        fused_contiguous = ops.npu_sparse_flash_attention_dcp_packet(contiguous_wire, None, *meta, world)
+        return wire, contiguous_wire, expected_q, expected, output_only, direct, fused, fused_contiguous
 
     run()
     torch.npu.synchronize()
     graph = torch.npu.NPUGraph()
     try:
         with torch.npu.graph(graph):
-            wire, expected_q, expected, *sends = run()
+            wire, contiguous_wire, expected_q, expected, *sends = run()
         for sizes, active_end, first_length in (
             ([1, 513, 0, 2048, 0], 4, 2048),
             ([0] * rows, 0, 2048),
@@ -83,7 +86,8 @@ def test_packet_io_replay(world, dtype):
             raw.neg_()
             graph.replay()
             torch.npu.synchronize()
-            assert torch.equal(wire.cpu().view(torch.int16), expected_q.cpu().view(torch.int16))
+            for query_packet in (wire, contiguous_wire):
+                assert torch.equal(query_packet.cpu().view(torch.int16), expected_q.cpu().view(torch.int16))
             for send in sends:
                 assert torch.equal(send.cpu().view(torch.int16), expected.cpu().view(torch.int16))
     finally:

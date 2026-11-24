@@ -195,7 +195,7 @@ def start_sfa_dcp_query_gather(
     query: torch.Tensor, rope: torch.Tensor, group, *, packet=None, packet_mode="off"
 ) -> SfaDcpQueryGather:
     """Submit the existing single gather without joining the current stream."""
-    if packet_mode == "fused" and packet is None:
+    if packet_mode in ("fused", "fused_contiguous") and packet is None:
         raise ValueError("fused DCP gather requires a RoPE packet")
     if packet is None:
         packet = _sfa_dcp_query_packet(query, rope)
@@ -227,7 +227,7 @@ def execute_sfa_dcp(
             or (query_gather.planes is not None and query_gather.planes[0].shape[-1] != query.shape[-1])
         ):
             raise ValueError("DCP query gather does not match this attention call")
-        if query_gather.packet_mode in ("direct", "fused"):
+        if query_gather.packet_mode in ("direct", "fused", "fused_contiguous"):
             query, rope = query_gather.gathered.view(group.world_size, *query_gather.packet.shape), None
         elif query_gather.planes is None:
             query, rope = _unpack_sfa_dcp_queries(query_gather.gathered, *query.shape, rope.shape[-1], group.world_size)

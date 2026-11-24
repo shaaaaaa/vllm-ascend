@@ -532,8 +532,10 @@ class NPUWorker(WorkerBase):
         ):
             raise ValueError("Rebuild vllm-ascend with the decoder DCP custom operators")
         packet_mode = envs_ascend.VLLM_ASCEND_SFA_DCP_PACKET_IO
-        if packet_mode not in ("off", "output", "direct", "fused"):
-            raise ValueError("VLLM_ASCEND_SFA_DCP_PACKET_IO must be off, output, direct or fused")
+        if not 0 <= envs_ascend.VLLM_ASCEND_SFA_DCP_SERIAL_AIV_CORES < 2**32:
+            raise ValueError("VLLM_ASCEND_SFA_DCP_SERIAL_AIV_CORES must be an unsigned 32-bit integer")
+        if packet_mode not in ("off", "output", "direct", "fused", "fused_contiguous"):
+            raise ValueError("VLLM_ASCEND_SFA_DCP_PACKET_IO must be off, output, direct, fused or fused_contiguous")
         if packet_mode != "off" and not hasattr(torch.ops._C_ascend, "npu_sparse_flash_attention_dcp_packet"):
             raise ValueError("Rebuild vllm-ascend with SparseFlashAttentionDcpPacket for DCP packet I/O")
 

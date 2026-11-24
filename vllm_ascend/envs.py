@@ -273,9 +273,13 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Positive vector-program cap for side-stream unpack only. Default 12; startup-only, non-sensitive.
     "VLLM_ASCEND_SFA_DCP_UNPACK_CORES": lambda: int(os.getenv("VLLM_ASCEND_SFA_DCP_UNPACK_CORES", "12")),
     # Experimental full target DCP graphs. off (default), output (native send packet),
-    # direct (also consume gathered Q), fused (also fuse query RoPE and gather packing).
+    # direct (also consume gathered Q), fused (also fuse query RoPE and gather packing),
+    # fused_contiguous (fused with one contiguous raw RoPE load per head).
     # Non-sensitive; identical on participating workers; restart required.
     "VLLM_ASCEND_SFA_DCP_PACKET_IO": lambda: os.getenv("VLLM_ASCEND_SFA_DCP_PACKET_IO", "off").strip().lower(),
+    # Full DCP graph serial H2D only. 0 (default) uses the automatic grid; a positive uint32 caps AIVs.
+    # Overlapped prefetch keeps its 12-AIV cap. Non-sensitive, restart required.
+    "VLLM_ASCEND_SFA_DCP_SERIAL_AIV_CORES": lambda: int(os.getenv("VLLM_ASCEND_SFA_DCP_SERIAL_AIV_CORES", "0")),
     # 0 (default): prefetch after SFA; 1: release next-layer H2D after output
     # packing, alongside async all-to-all. Requires full target DCP graphs and
     # SHARED_RETRIEVAL_OVERLAP. Non-sensitive; restart required. Benchmark AIV

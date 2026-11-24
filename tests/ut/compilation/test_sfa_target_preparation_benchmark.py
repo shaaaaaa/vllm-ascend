@@ -17,6 +17,20 @@ def benchmark(monkeypatch):
     return load_module(ROOT / "benchmarks/ops/benchmark_sfa_target_preparation.py", "target_prep_bench", monkeypatch)
 
 
+def test_transfer_check_detects_reused_host_layer(benchmark):
+    p = benchmark.Pipeline.__new__(benchmark.Pipeline)
+    p.args = NS(history=1025, dcp_size=8, rank=0)
+    selected, slots = torch.tensor([[0, 1024]]), torch.tensor([[2, 1]])
+    p.bridge = (None, None, None, selected, torch.tensor([2]), slots)
+    p.caches = [torch.zeros(3, width, dtype=torch.bfloat16) for width in (512, 64)]
+    for plane, cache in enumerate(p.caches):
+        values = benchmark.source_values(selected[0], 0, layer=1) + 32 * plane
+        cache[slots[0]] = values.to(cache.dtype)[:, None].expand(-1, cache.shape[-1])
+    assert p.check_transfer(layer=1) == [2]
+    with pytest.raises(AssertionError):
+        p.check_transfer(layer=0)
+
+
 @pytest.mark.parametrize("free_first", [False, True])
 def test_benchmark_selects_serving_policy_before_replay(benchmark, monkeypatch, free_first):
     resident = "vllm_ascend.distributed.kv_transfer.sparse_offload.resident_sorted_cache"

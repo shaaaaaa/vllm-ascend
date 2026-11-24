@@ -420,20 +420,23 @@ def test_pre_joins_before_any_consumer_cache_access():
     assert log == ["join", "cache"]
 
 
-def test_serial_retrieve_suppressed_only_for_incoming_full_graph_edge():
+@pytest.mark.parametrize("dcp,cap", [(False, 12), (True, 0), (True, 12)])
+def test_serial_retrieve_suppressed_only_for_incoming_full_graph_edge(dcp, cap):
     context = NS(staged_sfa_graph_key=Key(), sfa_full_graph_active=True)
     retrieve = extract(SOURCE, "cross_layer_lmcache_retrieve",
                        {"_staged_sfa_profile_scope": lambda _: nullcontext()})
     load = Mock()
     impl = NS(_retrieval_overlap=object(), _shared_retrieval_edges=lambda: ({"consumer": object()}, {}),
-              _full_graph_transfer=NS(load=load))
+              _full_graph_transfer=NS(load=load), _dcp_serial_aiv_cores=cap)
     data = torch.ones(2, 4)
-    retrieve(impl, "producer", "consumer", data, data, data, NS(), context)
-    retrieve(impl, "consumer", "", data, data, data, NS(), context)
+    metadata = NS(sfa_dcp=object() if dcp else None)
+    retrieve(impl, "producer", "consumer", data, data, data, metadata, context)
+    retrieve(impl, "consumer", "", data, data, data, metadata, context)
     assert load.call_count == 1
     impl._retrieval_overlap = None
-    retrieve(impl, "consumer", "", data, data, data, NS(), context)
+    retrieve(impl, "consumer", "", data, data, data, metadata, context)
     assert load.call_count == 2
+    assert all(call.kwargs == ({"max_aiv_cores": cap} if dcp and cap else {}) for call in load.call_args_list)
 
 
 @pytest.mark.parametrize("active", [False, True])

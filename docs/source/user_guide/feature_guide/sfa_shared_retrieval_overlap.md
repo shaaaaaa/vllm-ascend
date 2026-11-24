@@ -31,8 +31,10 @@ AIV policy requires updating both vLLM-Ascend and LMCache-Ascend on
 restarting workers. It adds an optional native `max_aiv_cores` argument; the
 vLLM-Ascend native extension does not change for this policy.
 
-Serial/critical-path retrieval uses the automatic hardware/payload-bounded grid.
-Only side-stream prefetch requests `max_aiv_cores=12`. This is a per-launch
+Serial/critical-path retrieval defaults to the automatic hardware/payload-bounded grid.
+For full decoder DCP graphs, `VLLM_ASCEND_SFA_DCP_SERIAL_AIV_CORES=12` caps the
+serial copy for comparison. Use `0` to restore automatic sizing and restart the
+workers after a change. Side-stream prefetch always requests `max_aiv_cores=12`. This is a per-launch
 argument, not mutable transfer state, so graph keys sharing a transfer object
 cannot accidentally cap a serial fallback. The graph captures the chosen grid;
 there is no device readback or replay-time Python core selection. This replaces

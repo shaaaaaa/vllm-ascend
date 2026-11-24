@@ -1999,6 +1999,7 @@ class AscendSFAImpl(MLAAttentionImpl):
 
         self._dcp_early_gather = envs.VLLM_ASCEND_SFA_DCP_EARLY_GATHER
         self._dcp_packet_io = envs.VLLM_ASCEND_SFA_DCP_PACKET_IO
+        self._dcp_serial_aiv_cores = envs.VLLM_ASCEND_SFA_DCP_SERIAL_AIV_CORES
         self._dcp_query_first = envs.VLLM_ASCEND_SFA_DCP_QUERY_FIRST
         self._dcp_prefetch_after_pack = envs.VLLM_ASCEND_SFA_DCP_PREFETCH_AFTER_PACK
 
@@ -5056,8 +5057,10 @@ class AscendSFAImpl(MLAAttentionImpl):
                     if layer_name in incoming:
                         return  # Joined before this consumer's current-KV writes.
                 capacity = graph_key.request_capacity
+                cap = self._dcp_serial_aiv_cores if getattr(attn_metadata, "sfa_dcp", None) is not None else 0
                 self._full_graph_transfer.load(
-                    selected_packed[:capacity], selected_counts[:capacity], target_slots[:capacity]
+                    selected_packed[:capacity], selected_counts[:capacity], target_slots[:capacity],
+                    **({"max_aiv_cores": cap} if cap else {}),
                 )
                 return
             if getattr(context, "staged_sfa_graph_dummy_run", False):
