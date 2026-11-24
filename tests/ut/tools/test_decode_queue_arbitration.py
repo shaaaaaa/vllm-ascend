@@ -16,10 +16,17 @@ def probe(monkeypatch):
 
 @pytest.mark.parametrize("mode", ["capture", "explicit"])
 @pytest.mark.parametrize("root", ["foreground", "background"])
-def test_device_gate_replay_and_graph_stream_fields(probe, mode, root):
+@pytest.mark.parametrize("short", [False, True], ids=["original", "two-sq-unit"])
+def test_device_gate_replay_and_graph_stream_fields(probe, mode, root, short):
     ids, programs, closed, counts, priorities = [], defaultdict(list), [], defaultdict(int), {}
     graph, offset = 999, 100
     fg, bg = probe.ROLES
+    kernels, lead, replays = probe.KERNELS, probe.LEAD_IN, probe.REPLAYS
+    if short:
+        import check_decode_sq_priority as unit
+
+        kernels, lead, replays = unit.KERNELS, unit.LEAD_IN, unit.REPLAYS
+    bindings = []
 
     class Runtime:
         @staticmethod
@@ -61,7 +68,7 @@ def test_device_gate_replay_and_graph_stream_fields(probe, mode, root):
                     op, arg = programs[s][pos[s]]
                     if op == "kernel":
                         if arg == fg:
-                            assert counts[bg] >= probe.LEAD_IN
+                            assert counts[bg] >= lead
                         counts[arg] += 1
                     elif op == "signal":
                         signals.add(arg)
@@ -86,7 +93,7 @@ def test_device_gate_replay_and_graph_stream_fields(probe, mode, root):
 
     def make_work(role):
         def check(host):
-            assert counts[role] == probe.KERNELS[role]
+            assert counts[role] == kernels[role]
 
         return SimpleNamespace(
             output=role, nbytes=32, check=check, enqueue=lambda stream: programs[stream].append(("kernel", role))
@@ -100,10 +107,15 @@ def test_device_gate_replay_and_graph_stream_fields(probe, mode, root):
         22,
         root,
         {fg: 0, bg: 7},
+        kernels=kernels,
+        lead_in=lead,
+        replays=replays,
+        on_bound=lambda streams: bindings.append((streams.copy(), counts.copy())),
     )
     assert case["source_ids"][root] == 1
     assert priorities == {case["source_ids"][fg]: 0, case["source_ids"][bg]: 7}
     assert case["graph_stream_creation_fields"] == {fg: 0, bg: 7 if mode == "explicit" else 0}
+    assert bindings == [(case["logical_ids"], kernels)] * replays
     assert len(closed) == len(ids)
 
 

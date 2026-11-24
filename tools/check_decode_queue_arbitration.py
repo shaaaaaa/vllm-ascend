@@ -34,7 +34,20 @@ KERNELS = {FOREGROUND: 12, BACKGROUND: 64}
 REPLAYS = 6  # First replay binds the SQs; analyze the following five.
 
 
-def capture_case(rt, mode, execution, work, host, root, priorities):
+def capture_case(
+    rt,
+    mode,
+    execution,
+    work,
+    host,
+    root,
+    priorities,
+    *,
+    kernels=KERNELS,
+    lead_in=LEAD_IN,
+    replays=REPLAYS,
+    on_bound=None,
+):
     other = next(role for role in ROLES if role != root)
     order = (root, other)
     with ExitStack() as stack:
@@ -74,11 +87,11 @@ def capture_case(rt, mode, execution, work, host, root, priorities):
 
         # A graph dependency makes foreground arrive after background has already started.
         # All foreground kernels after its first are consecutive, with no wait in between.
-        for _ in range(LEAD_IN):
+        for _ in range(lead_in):
             work[BACKGROUND].enqueue(streams[BACKGROUND])
         signal(gate, BACKGROUND, FOREGROUND)
         for role in ROLES:
-            count = KERNELS[role] - (LEAD_IN if role == BACKGROUND else 0)
+            count = kernels[role] - (lead_in if role == BACKGROUND else 0)
             for _ in range(count):
                 work[role].enqueue(streams[role])
         signal(join, other, root)
@@ -102,11 +115,13 @@ def capture_case(rt, mode, execution, work, host, root, priorities):
             priority = U32()
             rt.call("aclrtStreamGetPriority", queue, C.byref(priority))
             creation_fields[role] = priority.value
-        for _ in range(REPLAYS):
+        for _ in range(replays):
             for op in work.values():
                 rt.call("aclrtMemset", op.output, op.nbytes, 0, op.nbytes)
             rt.call("aclmdlRIExecuteAsync", graph, execution)
             rt.call("aclrtSynchronizeStreamWithTimeout", execution, SYNC_TIMEOUT_MS)
+            if on_bound is not None:
+                on_bound(logical)
             for op in work.values():
                 op.check(host)
         return {
@@ -164,7 +179,7 @@ def read_rows(path):
     return sorted(result)
 
 
-def replay_gaps(fg, bg):
+def replay_gaps(fg, bg, lead_in=LEAD_IN):
     # A completed foreground predecessor is a device-side readiness marker. At least one
     # background kernel must still be queued. An already started kernel is allowed to finish.
     gaps, ahead = [], []
@@ -174,22 +189,22 @@ def replay_gaps(fg, bg):
         gaps.append(start - ready)
         ahead.append(sum(ready < bg_start < start for bg_start, _ in bg))
     # Initial arrival includes the event/notify handoff. Keep it out of the arbitration verdict.
-    gate_latency = fg[0][0] - bg[LEAD_IN - 1][1]
+    gate_latency = fg[0][0] - bg[lead_in - 1][1]
     if gate_latency < 0:
         raise ValueError("foreground started before the background gate")
     return gaps, ahead, gate_latency
 
 
-def analyze(rows, report):
+def analyze(rows, report, *, kernels=KERNELS, lead_in=LEAD_IN, replays=REPLAYS):
     warmup = report["warmup_stream"]
     if [(r[2], r[3]) for r in rows[:2]] != [(r, warmup) for r in ROLES]:
         raise ValueError("missing or out-of-order eager warm-up tasks")
-    cursor, width = 2, sum(KERNELS.values())
+    cursor, width = 2, sum(kernels.values())
     result = []
     for case in report["cases"]:
         all_gaps, all_ahead, arrivals = [], [], []
         eligible_replays, overtaken_replays, drained_before_foreground = 0, 0, 0
-        for replay in range(REPLAYS):
+        for replay in range(replays):
             lanes = defaultdict(list)
             for start, end, role, stream in rows[cursor : cursor + width]:
                 valid_ids = {case["logical_ids"][role], case["source_ids"][role]}
@@ -197,9 +212,9 @@ def analyze(rows, report):
                     raise ValueError(f"unexpected profiled stream {stream} for {role}; expected {sorted(valid_ids)}")
                 lanes[role].append((start, end))
             cursor += width
-            if any(len(lanes[r]) != KERNELS[r] for r in ROLES):
+            if any(len(lanes[r]) != kernels[r] for r in ROLES):
                 raise ValueError(f"incomplete replay for {case['case']}")
-            gaps, ahead, latency = replay_gaps(lanes[FOREGROUND], lanes[BACKGROUND])
+            gaps, ahead, latency = replay_gaps(lanes[FOREGROUND], lanes[BACKGROUND], lead_in)
             if replay:
                 all_gaps.extend(gaps)
                 all_ahead.extend(ahead)
@@ -209,8 +224,8 @@ def analyze(rows, report):
                 # With the background lane preferred, its entire tail can start before
                 # foreground enters. Then there is no contested gap inside the foreground
                 # burst. Keep this handoff observation separate from overtakes of ready work.
-                gate_end = lanes[BACKGROUND][LEAD_IN - 1][1]
-                tail = lanes[BACKGROUND][LEAD_IN:]
+                gate_end = lanes[BACKGROUND][lead_in - 1][1]
+                tail = lanes[BACKGROUND][lead_in:]
                 first_fg = lanes[FOREGROUND][0][0]
                 if tail[-1][0] < first_fg and sum(gate_end < t < first_fg for t, _ in tail) > len(tail) // 2:
                     drained_before_foreground += 1
