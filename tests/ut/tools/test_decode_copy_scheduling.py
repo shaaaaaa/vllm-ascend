@@ -21,6 +21,44 @@ def data(ids, request="req"):
     return b"data: " + json.dumps(message).encode() + b"\n"
 
 
+def test_grouped_copy_layer_times_count_device_work_and_inter_piece_gaps(clients, tmp_path):
+    _, gaps = clients
+    schedule = (12, 24, 12)
+    events = []
+
+    def task(start, duration, name, stream):
+        return {
+            "ph": "X", "pid": 8, "tid": stream, "ts": str(start), "dur": duration, "name": name,
+            "args": {"Task Type": "AI_VECTOR_CORE", "Physic Stream Id": stream},
+        }
+
+    for replay, (limit, unit) in enumerate(zip(schedule, (2, 10, 4))):
+        start = 1000 * replay
+        events.append(task(start, unit, "sfa_copy_i32_s64_155", limit))
+        for layer in (1, 2, 3):
+            start += 100
+            duration = layer * unit
+            for ts in (start, start + duration + 3 * layer):
+                events.append(task(ts, duration, "sfa_copy_piece_i32_s64_156", limit + 1))
+    trace = tmp_path / "grouped.json"
+    cpu_op = {"ph": "X", "pid": 3, "tid": 4, "ts": "10", "dur": 90, "name": "sfa_copy_i32_s64"}
+    trace.write_text(json.dumps({"traceEvents": [cpu_op, *reversed(events)]}))
+    timings = gaps.grouped_copy_layer_times(trace, schedule, layers=4, pieces=2)
+    for limit, median_unit in ((12, 3), (24, 10)):
+        assert timings[limit, 0] == (median_unit, median_unit)
+        for layer in (1, 2, 3):
+            active = 2 * layer * median_unit
+            assert timings[limit, layer] == (active, active + 3 * layer)
+
+    trace.write_text(json.dumps(events[:-1]))
+    with pytest.raises(ValueError, match="expected 21 device copy tasks"):
+        gaps.grouped_copy_layer_times(trace, schedule, layers=4, pieces=2)
+    events[2] = task(110, 1, "sfa_copy_piece_i32_s64", 99)
+    trace.write_text(json.dumps(events))
+    with pytest.raises(ValueError, match="main/side copy schedule"):
+        gaps.grouped_copy_layer_times(trace, schedule, layers=4, pieces=2)
+
+
 def test_tpot_uses_tokens_after_the_first_chunk(clients, monkeypatch):
     bench, _ = clients
     clock = iter((2.0, 2.05, 2.08, 2.1))

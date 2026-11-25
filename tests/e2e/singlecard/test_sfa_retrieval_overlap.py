@@ -7,6 +7,7 @@ import os
 import statistics
 import sys
 from contextlib import contextmanager
+from itertools import permutations
 from pathlib import Path
 
 import pytest
@@ -363,6 +364,48 @@ def test_sfa_copy_core_limit(request, monkeypatch):
                           f"paired_saved_us={timing['paired_saved_us']:+.1f} "
                           f"candidate_faster_pairs={timing['candidate_faster_pairs']}/{timing['pairs']}{rate}",
                           flush=True)
+
+
+def test_grouped_layer_copy_times_410(request, tmp_path):
+    """Measure each layer's actual device kernels in the 1+3 graph at 410 misses per request."""
+    from analyze_decode_layer_gaps import grouped_copy_layer_times
+
+    misses = 410
+    limits = (12, 24, 0)
+    orders = list(permutations(limits))
+    trace = tmp_path / "grouped-410.json"
+    with glm_group_workload(request) as w:
+        graphs = {}
+        w.set_payload(misses, 43)
+        for limit in limits:
+            w.set_copy_core_limit(limit)
+            graphs[limit] = w.capture(True, multi_layer=True)
+            tokens = w.set_payload(misses, 43)
+            graphs[limit].replay()
+            for layer in range(w.layers):
+                w.check_copied_layer(layer, tokens, misses)
+        torch.npu.synchronize()
+        profiler = torch_npu.profiler
+        with profiler.profile(activities=[profiler.ProfilerActivity.CPU, profiler.ProfilerActivity.NPU]) as prof:
+            for i, order in enumerate(orders):
+                w.set_payload(misses, 43 + 613 * i)
+                for limit in order:
+                    graphs[limit].replay()
+            torch.npu.synchronize()
+        prof.export_chrome_trace(str(trace))
+        pieces = w.group.edges[0].pieces
+        layers = w.layers
+
+    schedule = [limit for order in orders for limit in order]
+    times = grouped_copy_layer_times(trace, schedule, layers, pieces)
+    print(f"[SFA_LAYER_COPY] misses_per_request={misses} requests=16 replays_per_limit={len(orders)} trace={trace}")
+    print("[SFA_LAYER_COPY] layer  kernels  12-core kernel/span_us  24-core kernel/span_us  auto kernel/span_us")
+    for layer, name in enumerate(("0(indexer)", "1(A)", "2(B)", "3(C)")):
+        cells = []
+        for limit in limits:
+            active, span = times[limit, layer]
+            cells.append(f"{active:.2f}/{span:.2f}")
+        print(f"[SFA_LAYER_COPY] {name:<10} {1 if layer == 0 else pieces:>2}  " + "  ".join(cells))
 
 
 @pytest.mark.parametrize("requests,main_gate", [(1, False), (8, False), (16, False), (8, True)])

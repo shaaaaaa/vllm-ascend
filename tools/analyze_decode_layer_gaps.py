@@ -95,6 +95,48 @@ def is_copy(row):
     return "sfacopy" in row.name.lower().replace("_", "")
 
 
+def grouped_copy_layer_times(path, replay_limits, layers, pieces):
+    """Median kernel execution and first-to-last span (us) per layer of the gated benchmark."""
+    if layers < 2 or pieces < 2 or not replay_limits:
+        raise ValueError("expected a sharded prefetch group and at least one replay")
+    devices, _ = read_tasks(path)
+    copies_by_device = [[task for task in tasks if is_copy(task)] for tasks in devices.values()]
+    captures = [tasks for tasks in copies_by_device if tasks]
+    if len(captures) != 1:
+        raise ValueError(f"{path}: expected SFA copy tasks on one device, found {len(captures)}")
+    copies = sorted(captures[0], key=lambda task: task.start)
+    tasks_per_replay = 1 + (layers - 1) * pieces
+    expected = len(replay_limits) * tasks_per_replay
+    if len(copies) != expected:
+        raise ValueError(f"{path}: expected {expected} device copy tasks in the timed replays, found {len(copies)}")
+
+    samples = defaultdict(list)
+    for replay, limit in enumerate(replay_limits):
+        offset = replay * tasks_per_replay
+        root = copies[offset]
+        side = copies[offset + 1 : offset + tasks_per_replay]
+        # L0 is a single main-stream kernel. Its V-up opens the gate. A, B and C
+        # each submit their pieces in order on one FIFO, with a join before the next replay.
+        if (
+            "piece" in root.name.lower()
+            or any("piece" not in t.name.lower() for t in side)
+            or len({t.stream for t in side}) != 1
+            or side[0].stream == root.stream
+        ):
+            raise ValueError(f"{path}: replay {replay} does not match the main/side copy schedule")
+        samples[limit, 0].append((root.stop - root.start, root.stop - root.start))
+        for layer in range(1, layers):
+            batch = side[(layer - 1) * pieces : layer * pieces]
+            active = sum(task.stop - task.start for task in batch)
+            span = batch[-1].stop - batch[0].start
+            samples[limit, layer].append((active, span))
+    medians = {}
+    for key, values in samples.items():
+        active_ns, span_ns = zip(*values)
+        medians[key] = statistics.median(active_ns) / 1000, statistics.median(span_ns) / 1000
+    return medians
+
+
 def cube_window_type(row):
     if row.kind == "AI_CORE":
         name = row.name.lower().replace("_", "")
