@@ -56,9 +56,11 @@ logger = logging.getLogger(__name__)
 
 
 if __package__:
+    from .decoder_routing import DecoderRouter, parse_gauges, routing_key
     from .remote_fill_placement import validate_remote_fill_placement
     from .pd_serving_perf import serving_perf_detailed_enabled as _serving_perf_enabled
 else:
+    from decoder_routing import DecoderRouter, parse_gauges, routing_key
     from remote_fill_placement import validate_remote_fill_placement
     from pd_serving_perf import serving_perf_detailed_enabled as _serving_perf_enabled
 
@@ -197,6 +199,8 @@ class DecoderReservation:
     api_dp_rank: int | None = None
     preferred_segment: str | None = None
     remote_fill: dict[str, Any] | None = None
+    route_pending: bool = False
+    route_key: bytes | None = None
 
 
 @dataclass(frozen=True)
@@ -1191,6 +1195,8 @@ class ProxyState:
         if not 0 < prefill_cache_hit_cost_ratio <= 1:
             raise ValueError("prefill_cache_hit_cost_ratio must be in (0, 1]")
         self.request_count_slack = request_count_slack
+        self.router = None
+        self.route_decisions = 0
         self.prefill_cache_hit_cost_ratio = prefill_cache_hit_cost_ratio
         # Original fields
         self.request_num = 0
@@ -1380,7 +1386,7 @@ class ProxyState:
             self._update_prefiller_priority(idx)
     
     def select_decoder(self, token_count, preferred_idx: int | None = None,
-                       prefiller_idx: int | None = None):
+                       prefiller_idx: int | None = None, *, route_hint=(None, "missing"), affinity_idx=None):
         """Select by load, then least-recent P/D pairing when loads tie."""
         with self._state_lock:
             if not self.decoder_heap:
@@ -1400,12 +1406,50 @@ class ProxyState:
                         entry[0], self._pair_last_used.get((prefiller, entry[3]), 0),
                         entry[1], entry[2],
                     ))[2]
+            if self.router is not None:
+                legacy_choice = chosen
+                healthy = [i for _, _, i, s in self.decoder_heap if s not in self.tainted_decoders]
+                epochs = [self._route_epoch(s) for s in self.decoders]
+                decision = self.router.choose(route_hint[0], healthy, affinity_idx, epochs,
+                                              [s.active_requests for s in self.decoders],
+                                              [s.active_tokens for s in self.decoders], time.monotonic())
+                if decision.chosen is not None:
+                    chosen = decision.chosen
+                self.router.count_decision(decision, chosen, route_hint[1])
+                if self.route_sample_every and self.route_decisions % self.route_sample_every == 0:
+                    logger.info("ROUTE_DECISION %s", json.dumps(dict(ts=time.time(), source=route_hint[1],
+                        pair=decision.pair, warm=decision.warm, legacy=legacy_choice, chosen=chosen,
+                        reason=decision.reason, loads=decision.loads)))
+                self.route_decisions += 1
+                self.router.pending[chosen] += 1
             self.decoders[chosen].active_requests += 1
             self.decoders[chosen].active_tokens += token_count
             self._update_decoder_priority(chosen)
             if prefiller_idx is not None:
                 self._pair_last_used[self.prefillers[prefiller_idx], self.decoders[chosen]] = self._timestamp_counter
             return chosen
+
+    @staticmethod
+    def _route_epoch(server):
+        if len(server.decoder_remote_fill) != 1:
+            return None
+        placement = next(iter(server.decoder_remote_fill.values()))
+        return placement.get("destination_engine_epoch")
+
+    def route_handoff(self, reservation, *, send):
+        if self.router is not None and reservation is not None and reservation.route_pending:
+            reservation.route_pending = False
+            idx = reservation.decoder_idx
+            self.router.pending[idx] -= 1
+            if send:
+                self.router.handoffs[idx] += 1
+
+    def route_success(self, info, arrived):
+        r = info.reservation
+        if self.router is not None and r is not None:
+            self.router.remember(r.route_key, r.decoder_idx, (r.remote_fill or {}).get("destination_engine_epoch"),
+                                 time.monotonic())
+            logger.info("ROUTE_COMPLETE %s", json.dumps(dict(ts=time.time(), arrived=arrived, dp=r.decoder_idx)))
     
     def release_decoder(self, idx: int, token_count, dp_rank: int | None = None):
         """Release decode phase (decode completed)."""
@@ -2116,6 +2160,7 @@ async def _handle_select_instance(
     analysis=None,
     original_request_id=None,
     prefix_anchors: tuple[PrefixAffinityAnchor, ...] = (),
+    route_hint=(None, "missing"),
 ):
     prefiller_score = proxy_state.calculate_prefill_scores(request_length)
     prefiller_work_score = prefiller_score
@@ -2153,9 +2198,11 @@ async def _handle_select_instance(
                     decoder_idx = proxy_state.select_decoder(
                         decoder_score, known_affinity.decoder_idx if affinity_selected else None,
                         prefiller_idx=prefiller_idx,
+                        route_hint=route_hint, affinity_idx=known_affinity.decoder_idx if prefer_p else None,
                     )
                     decoder = proxy_state.decoders[decoder_idx]
-                    reservation = DecoderReservation(decoder, decoder_idx, decoder_score)
+                    reservation = DecoderReservation(decoder, decoder_idx, decoder_score,
+                                                     route_pending=proxy_state.router is not None, route_key=route_hint[0])
                     proxy_state.assign_decoder_rank(
                         reservation, known_affinity.dp_rank if (
                             affinity_selected and decoder_idx == known_affinity.decoder_idx
@@ -2334,6 +2381,7 @@ async def _handle_select_instance(
         )
     except BaseException:
         if reservation is not None:
+            proxy_state.route_handoff(reservation, send=False)
             proxy_state.release_decoder(
                 reservation.decoder_idx,
                 reservation.decoder_score,
@@ -2352,6 +2400,7 @@ def _release_decoder_reservation(instance_info: InstanceInfo) -> None:
     if reservation is None:
         return
     instance_info.reservation = None
+    proxy_state.route_handoff(reservation, send=False)
     proxy_state.release_decoder(
         reservation.decoder_idx,
         reservation.decoder_score,
@@ -2377,6 +2426,7 @@ class _CleanupStreamingResponse(StreamingResponse):
 
 
 async def _handle_completions(api: str, request: Request):
+    arrived = time.time()
     instance_info = None
     response_owns_cleanup = False
     request_count_released = False
@@ -2415,6 +2465,10 @@ async def _handle_completions(api: str, request: Request):
         prefix_anchors = _parse_prefix_affinity_header(
             getattr(request, "headers", {}).get(_PREFIX_AFFINITY_HEADER)
         )
+        route_options = {}
+        if proxy_state.router is not None:
+            route_options["route_hint"] = routing_key(getattr(request, "headers", {}), req_data, prefix_anchors,
+                                                     global_args.model_name)
         
         # Normalize tool_calls[].function.arguments: dict → JSON string
         # OpenAI API spec requires arguments to be a JSON string, but some
@@ -2738,6 +2792,7 @@ async def _handle_completions(api: str, request: Request):
             request_length,
             analysis,
             prefix_anchors=prefix_anchors,
+            **route_options,
         )
         released_kv = False
         
@@ -2752,6 +2807,7 @@ async def _handle_completions(api: str, request: Request):
                     if instance_info.reservation
                     else None
                 )
+                proxy_state.route_handoff(instance_info.reservation, send=True)
                 response = await asyncio.wait_for(
                     instance_info.decoder.client.post(
                         api,
@@ -2781,6 +2837,8 @@ async def _handle_completions(api: str, request: Request):
                 choice = choices[0] if choices and isinstance(choices[0], dict) else {}
                 stop_reason = choice.get("stop_reason") or choice.get("finish_reason")
                 if stop_reason not in {"recomputed", "force_free_recomputed"}:
+                    if choices and not response_json.get("error"):
+                        proxy_state.route_success(instance_info, arrived)
                     content_type = response.headers.get("content-type", "application/json")
                     return Response(
                         content=response.content,
@@ -2802,6 +2860,7 @@ async def _handle_completions(api: str, request: Request):
                     analysis,
                     original_request_id=original_request_id,
                     prefix_anchors=prefix_anchors,
+                    **route_options,
                 )
                 released_kv = False
         
@@ -2822,6 +2881,7 @@ async def _handle_completions(api: str, request: Request):
             try:
                 while retry:
                     retry = False
+                    proxy_state.route_handoff(instance_info.reservation, send=True)
                     decoder_events = stream_decoder_response(
                         instance_info.decoder.client,
                         api,
@@ -2850,6 +2910,8 @@ async def _handle_completions(api: str, request: Request):
                         if chunk_str.startswith("data: "):
                             chunk_str = chunk_str[len("data: ") :]
                         if chunk_str == "[DONE]":
+                            if final_stop_reason:
+                                proxy_state.route_success(instance_info, arrived)
                             attempt_event_forwarded = True
                             yield chunk
                             continue
@@ -2964,6 +3026,7 @@ async def _handle_completions(api: str, request: Request):
                                 analysis,
                                 original_request_id=original_request_id,
                                 prefix_anchors=prefix_anchors,
+                                **route_options,
                             )
                             released_kv = False
                             logger.info(
@@ -3293,6 +3356,15 @@ def parse_args():
     parser.add_argument("--prefiller-ports", type=int, nargs="+", default=[8001])
     parser.add_argument("--decoder-hosts", type=str, nargs="+", default=["localhost"])
     parser.add_argument("--decoder-ports", type=int, nargs="+", default=[8002])
+    parser.add_argument("--decoder-route-policy", choices=("legacy", "global", "dual-home"), default="legacy",
+                        help="D policy; global and dual-home enable dedicated live D metrics polling")
+    parser.add_argument("--decoder-route-monitor", action="store_true",
+                        help="Collect identical routing diagnostics for the legacy baseline")
+    parser.add_argument("--decoder-route-capacity", type=int, default=16, help="Actual max-num-seqs per D endpoint")
+    parser.add_argument("--decoder-route-poll-seconds", type=float, default=2.0)
+    parser.add_argument("--decoder-route-max-age", type=float, default=6.0, help="Maximum D snapshot age, seconds")
+    parser.add_argument("--decoder-route-kv-limit", type=float, default=0.95, help="KV high-water fraction (0,1]")
+    parser.add_argument("--decoder-route-log-every", type=int, default=10, help="Sample 1 in N decisions; 0 disables detail")
     parser.add_argument(
         "--enable-remote-lmcache-store",
         action="store_true",
@@ -3359,6 +3431,11 @@ def parse_args():
                              "reject if computed_length * (1 + margin%%) > max_model_len. "
                              "Default 5%% to account for chat template overhead estimation error.")
     args = parser.parse_args()
+    if args.decoder_route_policy != "legacy" or args.decoder_route_monitor:
+        if not args.enable_remote_lmcache_store:
+            parser.error("live D routing needs fixed RemoteFill placement topology")
+        if args.decoder_route_log_every < 0:
+            parser.error("--decoder-route-log-every must be nonnegative")
     if args.request_count_slack < -1:
         parser.error("--request-count-slack must be -1 or nonnegative")
     if not 0 < args.prefill_cache_hit_cost_ratio <= 1:
@@ -3416,6 +3493,32 @@ def with_cancellation(handler_func):
             await handler_task
         return None
     return wrapper
+
+
+async def _poll_route_metrics(state):
+    """Dedicated concurrent scrape: /stats reads and the generic poller's cached zeroes are not observations."""
+    router = state.router
+    async with httpx.AsyncClient(trust_env=False, timeout=min(router.interval, 2.0)) as client:
+        async def read_one(server):
+            try:
+                response = await client.get(server.url.removesuffix("/v1") + "/metrics")
+                response.raise_for_status()
+                return parse_gauges(response.text)
+            except (httpx.HTTPError, ValueError):
+                return None
+
+        while True:
+            started = time.monotonic()
+            handoffs = router.handoffs.copy()
+            results = await asyncio.gather(*(read_one(d) for d in state.decoders))
+            with state._state_lock:
+                for i, gauges in enumerate(results):
+                    router.observe(i, gauges, started, handoffs[i])
+                router.tick(time.monotonic())
+                record = router.flush(time.time())
+                if record is not None:
+                    logger.info("ROUTE_WINDOW %s", json.dumps(record))
+            await asyncio.sleep(max(0, router.interval - (time.monotonic() - started)))
 
 
 @asynccontextmanager
@@ -3530,15 +3633,31 @@ async def lifespan(app: FastAPI):
         else:
             logger.info("[INFO] Exact tokenizer analysis disabled; using character estimate")
     
-    yield
-    
-    # Cleanup
-    if metrics_aggregator:
-        metrics_aggregator.stop()
-    for p in proxy_state.prefillers:
-        await p.client.aclose()
-    for d in proxy_state.decoders:
-        await d.client.aclose()
+    poll_task = None
+    try:
+        policy = getattr(global_args, "decoder_route_policy", "legacy")
+        if policy != "legacy" or getattr(global_args, "decoder_route_monitor", False):
+            router = DecoderRouter(global_args.decoder_instances, policy, global_args.decoder_route_capacity,
+                                   global_args.decoder_route_poll_seconds, global_args.decoder_route_max_age,
+                                   global_args.decoder_route_kv_limit)
+            proxy_state.route_sample_every = global_args.decoder_route_log_every
+            proxy_state.router = router
+            logger.info("ROUTE_RUN %s", json.dumps(dict(version=1, ts=time.time(), policy=policy, hosts=router.groups,
+                capacity=router.capacity, kv_limit=router.kv_limit, interval=router.interval, max_age=router.max_age,
+                slack=proxy_state.request_count_slack, log_every=proxy_state.route_sample_every)))
+            router.tick(time.monotonic())
+            poll_task = asyncio.create_task(_poll_route_metrics(proxy_state))
+        yield
+    finally:
+        if poll_task is not None:
+            poll_task.cancel()
+            await asyncio.gather(poll_task, return_exceptions=True)
+            router.tick(time.monotonic())
+            logger.info("ROUTE_WINDOW %s", json.dumps(router.flush(time.time(), force=True)))
+        if metrics_aggregator:
+            metrics_aggregator.stop()
+        for server in proxy_state.prefillers + proxy_state.decoders:
+            await server.client.aclose()
 
 
 app = FastAPI(lifespan=lifespan)

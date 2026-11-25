@@ -924,6 +924,50 @@ class TestEnhancedRemoteFillProxy(unittest.TestCase):
         self.assertEqual(state.prefillers[0].active_kv_cache, 0)
         self.assertEqual(state.decoders[0].active_tokens, 0)
 
+    def test_dual_home_reservation_lifecycle_with_prefill_cancel(self):
+        endpoints = [("a", 1), ("a", 2), ("b", 1), ("b", 2)]
+        state = proxy.ProxyState([("p", 3)], endpoints, enable_remote_lmcache_store=True)
+        proxy.proxy_state = state
+        router = state.router = proxy.DecoderRouter(endpoints, "dual-home", 16, 2, 6, .95)
+        state.route_sample_every = 1
+        key = (b"opaque", "session")
+        for i in range(4):
+            _prime_remote_fill(state, i, api_dp_rank=0, decoder_idx=i)
+            router.observe(i, (0, 0, .3), time.monotonic(), 0)
+
+        async def run():
+            inflight = asyncio.Event()
+            async def blocked(*args, **kwargs):
+                inflight.set()
+                await asyncio.Future()
+
+            with patch.object(proxy, "send_request_to_service", side_effect=blocked):
+                task = asyncio.create_task(proxy._handle_select_instance("/completions", {}, 10, route_hint=key))
+                await inflight.wait()
+                self.assertEqual(sum(router.pending), 1)
+                task.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+            self.assertEqual(sum(router.pending), 0)
+            self.assertEqual(sum(d.active_requests for d in state.decoders), 0)
+
+            async def sent(*args, **kw):
+                return _prefill_reply(kw["remote_fill_handoff"])
+            with patch.object(proxy, "send_request_to_service", side_effect=sent):
+                info = await proxy._handle_select_instance("/completions", {}, 10, route_hint=key)
+            idx = info.decoder_idx
+            self.assertIn(idx, router.pair(key[0]))
+            self.assertEqual(info.reservation.remote_fill["destination_dp_rank"], idx)
+            state.route_handoff(info.reservation, send=True)
+            state.route_handoff(info.reservation, send=True)
+            state.route_success(info, time.time())
+            proxy._release_decoder_reservation(info)
+            self.assertEqual(router.handoffs[idx], 1)
+            self.assertEqual(sum(router.pending), 0)
+            self.assertIn((key[0], idx), router.history)
+            self.assertEqual(state.decoders[idx].active_requests, 0)
+        asyncio.run(run())
+
     def test_first_request_lazily_discovers_remote_fill(self):
         state = proxy.ProxyState(
             [("prefiller", 8001)],
