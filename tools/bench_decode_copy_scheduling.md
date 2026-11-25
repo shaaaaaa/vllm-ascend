@@ -58,6 +58,15 @@ gate queues one train per edge. Its default 16 pieces share the V-up GEMM,
 the FP32 router GEMM if present, and the final drain. The startup line
 `SFA main-path gate captured` reports the capture's edge and GEMM counts.
 
+For the shared-indexer comparison, keep the main gate and piece count fixed
+and switch `VLLM_ASCEND_SFA_PREFETCH_MULTI_LAYER` from 0 to 1 on D.
+The layer CSV's `indexer_layer_for_next` identifies the layer that queued
+each consumer. The trace summary pairs side-stream completion records with
+individual consumer waits, including when several layers finish in one window.
+The `qkv` piece histogram covers the grant from the consumer's wait through
+its fused projection. `copy_overlap_qkv` counts the overlap with the QKV
+device kernels within that grant.
+
 This short standalone test replays the same graph with different readiness
 inputs. One replay forces all eight pieces through the router window, one
 requires at least four through V-up, and one defers all eight to the tail.

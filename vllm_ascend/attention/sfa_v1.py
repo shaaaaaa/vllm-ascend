@@ -3549,6 +3549,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         resident_reads: list[torch.Tensor] | None = None,
         resident_writes: list[torch.Tensor] | None = None,
         indexer_scale_cache: torch.Tensor | None = None,
+        qkv_prefetch=None,
     ) -> tuple[torch.Tensor, ...]:
         """Pre-retrieval compute captured by the outer PIECEWISE graph.
 
@@ -3569,7 +3570,12 @@ class AscendSFAImpl(MLAAttentionImpl):
             inputs=self.fused_qkv_a_proj.weight,
             dependency=hidden_states,
         )
-        qkv_lora = self.fused_qkv_a_proj(hidden_states)[0]
+        if qkv_prefetch is not None:
+            # Its own completion releases QKV; later layers keep copying through
+            # this fused projection. Close before layernorm, RoPE and SFA.
+            qkv_lora = qkv_prefetch.join(self.fused_qkv_a_proj, hidden_states)[0]
+        else:
+            qkv_lora = self.fused_qkv_a_proj(hidden_states)[0]
         q_c, kv_no_split = qkv_lora.split(
             [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
             dim=-1,
@@ -3819,7 +3825,11 @@ class AscendSFAImpl(MLAAttentionImpl):
         edge = None
         if prefetch is not None:
             edge, selected, counts, slots, destinations = prefetch
-            edge.launch(selected, counts, slots, destinations)
+            if edge.from_indexer:
+                if not edge.pending_join:
+                    raise RuntimeError("shared-layer prefetch was not queued by its indexer")
+            else:
+                edge.launch(selected, counts, slots, destinations)
         if edge is not None and edge.gate is not None:
             attn_output = self._v_up_proj(attn_output, copy_edge=edge)
         else:
@@ -4099,10 +4109,15 @@ class AscendSFAImpl(MLAAttentionImpl):
     ) -> tuple[torch.Tensor, ...]:
         """Run graph A, or the complete native path outside staged replay."""
         context = get_forward_context()
+        qkv_prefetch = None
         if getattr(self, "_retrieval_overlap", None) is not None:
             incoming, _ = self._shared_retrieval_edges()
             if layer_name in incoming:
-                incoming[layer_name].join()
+                edge = incoming[layer_name]
+                if edge.from_indexer:
+                    qkv_prefetch = edge
+                else:
+                    edge.join()
         if attn_metadata is None:
             self.forward(
                 layer_name,
@@ -4153,6 +4168,8 @@ class AscendSFAImpl(MLAAttentionImpl):
             state.producer_event = producer_event
         initialized_capacity = state.initialized_cache_capacity
         if is_dummy and graph_key.request_capacity > initialized_capacity:
+            if qkv_prefetch is not None:
+                raise RuntimeError("shared prefetch destination was not initialized before its indexer fork")
             for cache in kv_cache:
                 cache[initialized_capacity : graph_key.request_capacity].zero_()
             state.initialized_cache_capacity = graph_key.request_capacity
@@ -4246,11 +4263,20 @@ class AscendSFAImpl(MLAAttentionImpl):
             resident_reads=resident_reads,
             resident_writes=resident_writes,
             indexer_scale_cache=kv_cache[3] if self.has_indexer and self.use_sparse_c8_indexer else None,
+            qkv_prefetch=qkv_prefetch,
         )
         outputs = self._copy_to_staged_sfa_bridge(
             hidden_states,
             outputs,
         )
+        # The producer's compact misses, counts and slots are now in its
+        # stable bridge. Fork before its own serial KV retrieval and SFA.
+        if getattr(context, "sfa_full_graph_active", False) and not self.skip_topk:
+            owner = getattr(self, "_retrieval_overlap", None)
+            if owner is not None and owner.multi_layer:
+                prefetch_group = owner.indexer_groups[graph_key].get(layer_name)
+                if prefetch_group is not None:
+                    prefetch_group.launch(*outputs[3:])
         state.runtime = (
             layer_name,
             kv_cache,

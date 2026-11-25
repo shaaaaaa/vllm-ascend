@@ -43,7 +43,7 @@ def contract(monkeypatch):
     def load(name, path):
         return load_module(path, name, monkeypatch)
 
-    module("lmcache.v1.memory_management", MemoryObj=object)
+    module("lmcache.v1.memory_management", MemoryObj=object, TensorMemoryObj=object)
     module("lmcache.logging", init_logger=logging.getLogger)
     source = load("lmcache.v1.gpu_connector.sparse", lmcache / "v1/gpu_connector/sparse.py")
     load("lmcache_ascend.v1.kv_format", ascend / "v1/kv_format.py")

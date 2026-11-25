@@ -400,8 +400,8 @@ class SFAFullGraph:
                         context.sfa_router_copy_edges = owner.edges(key)[1]
                     tracker = owner.begin_priority_capture(key) if getattr(owner, "low_priority", False) else None
                     output = runnable(**kwargs)
-                if gated:
-                    owner.finish_gate_capture(key)
+                if gated or getattr(owner, "multi_layer", False):
+                    owner.finish_capture(key)
                 if tracker is not None:
                     owner.finish_priority_capture(key, tracker)
             except BaseException:

@@ -168,3 +168,87 @@ def test_dynamic_windows_report_actual_piece_counts_and_protected_overlap(client
     assert layers[0]["router_pieces_mean"] == router
     assert samples[0]["copy_overlap_protected_main_compute"] == 1000 * stray
     assert summary["pieces_outside_or_ambiguous_window"] == stray
+
+
+@pytest.mark.parametrize("gated", [True, False])
+@pytest.mark.parametrize("placement", ["producer_vup", "first_qkv", "per_consumer"])
+def test_three_prefetch_completions_match_three_consumers_even_in_one_window(clients, tmp_path, gated, placement):
+    _, gaps = clients
+    events, cubes, joins, qkvs = [], [], [], []
+    tick = 0
+    root_task = 0
+
+    def emit(name, kind, start, duration, ordinal, stream):
+        events.append(dict(ph="X", name=name, pid=8, tid=stream, ts=start, dur=duration,
+                           args={"Physic Stream Id": stream, "Model Id": 9, "Task Id": ordinal, "Task Type": kind}))
+
+    def main(name, kind, duration=2):
+        nonlocal tick, root_task
+        start = tick
+        emit(name, kind, start, duration, root_task, 3)
+        tick += duration
+        root_task += 1
+        return start
+
+    for layer in range(4):
+        main("RmsNorm_input" if layer == 0 else "AddRmsNormBias_input", "AI_VECTOR_CORE")
+        if layer:
+            if gated:
+                main("open", "MEM_WRITE_VALUE")
+                main("release", "NOTIFY_RECORD")
+            joins.append(main("join", "CAPTURE_WAIT", 20))
+            qkvs.append(main("FusedQKVGemm", "MIX_AIC", 48))
+            if gated:
+                main("close", "MEM_WRITE_VALUE")
+                main("take", "NOTIFY_WAIT")
+        main("KvRmsNormRopeCache", "AI_VECTOR_CORE")
+        if layer == 0:
+            main("indexer plan", "AI_VECTOR_CORE")
+            main("fork", "CAPTURE_RECORD")
+            main("sfa_copy_i32_s64", "AI_VECTOR_CORE")
+        main("SparseFlashAttention", "MIX_AIC")
+        if gated and layer < 3:
+            main("open", "MEM_WRITE_VALUE")
+            main("release", "NOTIFY_RECORD")
+        cubes.append(main("batch_matmul_transpose", "AI_CORE", 48))
+        if gated and layer < 3:
+            main("close", "MEM_WRITE_VALUE")
+            main("take", "NOTIFY_WAIT")
+        main("SwiGlu", "AI_VECTOR_CORE")
+    main("AddRmsNormBias_final", "AI_VECTOR_CORE")
+    ordinal = 1
+    for i in range(3):
+        if placement == "producer_vup":
+            begin = cubes[0] + 2 + 12 * i
+        elif placement == "first_qkv" and i:
+            begin = qkvs[0] + 2 + 12 * i
+        else:
+            begin = joins[i] + 2
+        for piece in range(2):
+            emit("sfa_copy_piece", "AI_VECTOR_CORE", begin + 4 * piece, 2, ordinal, 7)
+            ordinal += 1
+            if gated:
+                emit("give", "NOTIFY_RECORD", begin + 4 * piece + 2, 1, ordinal, 7)
+                ordinal += 3 if piece == 0 else 1  # Next piece waits on the word and the token.
+        emit("done", "CAPTURE_RECORD", begin + 7, 1, ordinal, 7)
+        ordinal += 3 if gated else 1
+    trace = tmp_path / "group.json"
+    trace.write_text(json.dumps(events))
+    summary, layers, samples = gaps.analyze(trace, expected=4)
+    assert summary["indexer_fork_layers_zero_based"] == [0]
+    assert summary["indexer_prefetch_edges"] == 3 and summary["copy_pieces_per_edge"] == {2: 3}
+    assert [row["indexer_layer_for_next"] for row in layers] == [0, 0, 0, None]
+    assert [s["consumer_layer"] for s in samples[:-1]] == [1, 2, 3]
+    assert all(s["copy_overlap_vup"] == (4000 if placement == "producer_vup" else 0) for s in samples[:-1])
+    if gated:
+        assert summary["pieces_outside_or_ambiguous_window"] == 0
+        assert summary["pieces_per_window_histogram"]["vup"] == {2 if placement == "producer_vup" else 0: 3}
+        assert summary["pieces_per_window_histogram"]["qkv"] == {0 if placement == "producer_vup" else 2: 3}
+        expected = [0, 4000, 4000] if placement == "first_qkv" else [0, 0, 0]
+        assert [s["copy_overlap_qkv"] for s in samples[:-1]] == expected
+        assert summary["edges_overlapping_protected_main_compute"] == 0
+    # Dropping a completion must never attribute the two merged trains to one consumer.
+    events.remove(next(e for e in events if e["name"] == "done"))
+    trace.write_text(json.dumps(events))
+    with pytest.raises(ValueError, match="layer trains"):
+        gaps.analyze(trace, expected=4)

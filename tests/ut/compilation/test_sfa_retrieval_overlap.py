@@ -7,6 +7,7 @@ import sys
 import weakref
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from types import SimpleNamespace as NS
 from unittest.mock import Mock
@@ -98,7 +99,7 @@ def topology(lengths=(4,), dtype=torch.bfloat16):
             impls[name] = NS(skip_topk=i > 0, shared_resident_plan=group,
                              _full_graph_transfers={2: NS(load=Mock(), request_capacity=2)},
                              _staged_sfa_bridge_buffers=(torch.empty(1, dtype=dtype),),
-                             _staged_sfa_capture_state=NS(runtime=(None, caches[name])))
+                             _staged_sfa_capture_state=NS(runtime=(None, caches[name]), initialized_cache_capacity=2))
     return groups, impls, caches
 
 
@@ -139,8 +140,8 @@ def test_main_gate_captures_one_train_shared_across_windows(runtime, pieces, win
         log.clear()
         edge.launch(data, data, data, edge.destinations)
         assert log == [("record", "main"), ("wait", "transfer"), ("whole train", "transfer"), ("record", "transfer")]
-        with pytest.raises(RuntimeError, match="missing a gated producer/consumer pair"):
-            owner.finish_gate_capture(key)
+        with pytest.raises(RuntimeError, match="missing a prefetch launch or consumer wait"):
+            owner.finish_capture(key)
         log.clear()
         for window in windows:
             with edge.cube_window(window):
@@ -153,8 +154,8 @@ def test_main_gate_captures_one_train_shared_across_windows(runtime, pieces, win
                                                    max_aiv_cores=0, admission=edge.gate.native)
         assert edge.windows_used == set(windows) and not edge.gate.pending
     assert gates[0] is gates[1]
-    owner.finish_gate_capture(key)
-    owner.finish_gate_capture(large)
+    owner.finish_capture(key)
+    owner.finish_capture(large)
 
 
 def test_gate_rejects_overlapping_edges_duplicate_and_nested_windows(runtime):
@@ -179,6 +180,193 @@ def test_gate_rejects_overlapping_edges_duplicate_and_nested_windows(runtime):
     second.join()
 
 
+@pytest.mark.parametrize("gated", [False, True])
+@pytest.mark.parametrize("key", [Key(), Key(query_profile="fixed")])
+def test_indexer_group_forks_once_and_waits_for_each_consumers_own_kv(runtime, gated, key):
+    module, log = runtime
+    groups, impls, caches = topology((1, 4, 2, 3))
+    owner = module.SharedRetrievalOverlap(main_gate=gated, multi_layer=True, pieces=4)
+    owner.configure(tuple(impls.items()), groups, caches)
+    owner.prepare(key, tuple(impls.items()), groups, 4)
+    incoming, outgoing = owner.edges(key)
+    batches = owner.indexer_groups[key]
+    assert set(batches) == {"g1l0", "g2l0", "g3l0"}
+    selected = torch.tensor([[0, 3, 5, 7], [2, 4, 6, 1], [-1] * 4], dtype=torch.int32)
+    slots = torch.tensor([[0, 2, 4, 5], [6, 7, 8, 9], [-1] * 4], dtype=torch.int64)
+    counts = torch.tensor([3, 0, 0], dtype=torch.int32)
+    main = torch.npu.current_stream()
+    main.wait_event = Mock(wraps=main.wait_event)
+    for group in groups[1:]:
+        producer, *consumers = group.members
+        batch = batches[producer]
+        assert batch.edges == tuple(incoming[name] for name in consumers)
+        assert producer not in incoming and consumers[-1] not in outgoing
+        payloads = []
+        for index, (name, edge) in enumerate(zip(consumers, batch.edges)):
+            # Each destination must use its own layer's source. Verify shifts, idle lanes and unchanged slots.
+            for plane in caches[name]:
+                plane.fill_(-1)
+
+            def load(tokens, numbers, targets, *, cache=caches[name], layer=index, seen=payloads, **kw):
+                seen.append((tokens, numbers, targets))
+                for lane, n in enumerate(numbers.tolist()):
+                    for p, plane in enumerate(cache):
+                        flat = plane.view(-1, plane.shape[-1])
+                        flat[targets[lane, :n]] = (100 * layer + 10 * p + tokens[lane, :n].float())[:, None].to(flat)
+            edge.transfer.load.side_effect = load
+
+        log.clear()
+        batch.launch(selected, counts, slots)
+        assert log == [("record", "main"), ("wait", "transfer")] + [("record", "transfer")] * len(consumers)
+        assert all(e.pending_join for e in batch.edges)
+        assert len(payloads) == len(consumers)
+        assert all(t.data_ptr() == source.data_ptr() and t.shape[0] == key.request_capacity
+                   for args in payloads for t, source in zip(args, (selected, counts, slots)))
+        for index, edge in enumerate(batch.edges):
+            if gated:
+                transitions = []
+                edge.gate.native.set_open = transitions.append
+                with edge.cube_window("vup"):
+                    assert transitions == [True]
+                assert transitions == [True, False]
+                transitions.clear()
+            main.wait_event.reset_mock()
+            def project(x, completed=edge.done, gated=gated, native_log=transitions if gated else None):
+                main.wait_event.assert_called_once_with(completed)
+                if gated:
+                    assert native_log == [True]
+                return x
+            assert edge.join(project, counts) is counts
+            main.wait_event.assert_called_once_with(edge.done)
+            if gated:
+                assert transitions == [True, False] and edge.gate.pending == len(consumers) - index - 1
+            assert all(e.pending_join for e in batch.edges[index + 1:])
+            for p, plane in enumerate(caches[consumers[index]]):
+                actual = plane.view(-1, plane.shape[-1])[:, 0]
+                expected = torch.full_like(actual, -1)
+                expected[slots[0, :3]] = (100 * index + 10 * p + selected[0, :3]).to(expected)
+                torch.testing.assert_close(actual, expected)
+        impls[producer]._full_graph_transfers[key.request_capacity].load.assert_not_called()
+    owner.finish_capture(key)
+    if gated:
+        assert len({e.gate for e in incoming.values()}) == 1
+    owner.clear()
+    assert not owner.indexer_groups
+
+
+def test_indexer_lookahead_keeps_partially_eligible_groups_on_adjacent_schedule(runtime):
+    module, _ = runtime
+    groups, impls, caches = topology((4, 4))
+    impls["g0l1"]._staged_sfa_bridge_buffers = (torch.empty(1, dtype=torch.float32),)
+    owner = module.SharedRetrievalOverlap(main_gate=True, multi_layer=True)
+    owner.configure(tuple(impls.items()), groups, caches)
+    owner.prepare(Key(), tuple(impls.items()), groups, 4)
+    incoming, _ = owner.edges(Key())
+    assert set(owner.indexer_groups[Key()]) == {"g1l0"}
+    assert "g0l2" not in incoming and not incoming["g0l3"].from_indexer
+    assert all(incoming[n].from_indexer for n in groups[1].members[1:])
+
+
+def test_prepare_initializes_only_unwarmed_kv_before_the_indexer_can_write(runtime):
+    module, _ = runtime
+    groups, impls, caches = topology((4,))
+    state = impls["g0l3"]._staged_sfa_capture_state
+    state.initialized_cache_capacity = 1
+    for plane in caches["g0l3"]:
+        plane.fill_(7)
+    owner = module.SharedRetrievalOverlap(main_gate=True, multi_layer=True)
+    owner.configure(tuple(impls.items()), groups, caches)
+    owner.prepare(Key(), tuple(impls.items()), groups, 4)
+    assert state.initialized_cache_capacity == 2
+    for plane in caches["g0l3"]:
+        assert torch.all(plane[0] == 7) and torch.all(plane[1] == 0)
+
+
+def test_three_layer_device_commands_allow_futures_to_finish_during_first_qkv(runtime):
+    module, _ = runtime
+    groups, impls, caches = topology((4,))
+    owner = module.SharedRetrievalOverlap(main_gate=True, multi_layer=True, pieces=2)
+    owner.configure(tuple(impls.items()), groups, caches)
+    owner.prepare(Key(), tuple(impls.items()), groups, 4)
+    batch = owner.indexer_groups[Key()]["g0l0"]
+    root, side = [], []
+    for i, edge in enumerate(batch.edges):
+        # Expand the native CANN value/Notify commands in their production order.
+        edge.transfer.load.side_effect = lambda *a, pieces, i=i, **kw: side.extend(
+            [("check", i), ("take", i), ("copy", i), ("give", i)] * pieces
+        )
+        edge.done.record = lambda stream, i=i: side.append(("done", i))
+    event_layers = {e.done: i for i, e in enumerate(batch.edges)}
+    torch.npu.current_stream().wait_event = lambda e: root.append(("join", event_layers[e]))
+    batch.edges[0].gate.native.set_open = lambda value: root.extend(
+        [("open", 0), ("give", 0)] if value else [("close", 0), ("take", 0)]
+    )
+    data = torch.ones(2, 2)
+    batch.launch(data, data, data)
+    for i, edge in enumerate(batch.edges):
+        root.append(("protected", i))
+        with edge.cube_window("vup"):
+            root.append(("gemm", i))
+        root.append(("protected", i))
+        with edge.cube_window("router"):
+            root.append(("gemm", i))
+        root.append(("protected", i))
+        edge.join(lambda i=i: root.extend([("qkv begin", i), ("qkv end", i)]))
+    root.append(("protected", 3))
+    first_qkv_counts = set()
+    done_pc = {i: pc for pc, (command, i) in enumerate(side) if command == "done"}
+    copy_count = [sum(op == "copy" for op, _ in side[:pc]) for pc in range(len(side) + 1)]
+
+    @lru_cache(None)
+    def explore(front, back, words, free_tokens, side_owner, at_qkv_start):
+        if front == len(root) and back == len(side):
+            assert words == free_tokens == 0 and side_owner == at_qkv_start == -1
+            return
+        advanced = False
+        for foreground, queue, pc in ((True, root, front), (False, side, back)):
+            if pc == len(queue):
+                continue
+            op, layer = queue[pc]
+            w, t, holder, qkv_count = words, free_tokens, side_owner, at_qkv_start
+            if op == "open":
+                w = 1
+            elif op == "close":
+                w = 0
+            elif op == "check" and not w:
+                continue
+            elif op == "take":
+                if not t:
+                    continue
+                t = 0
+                if not foreground:
+                    assert holder == -1
+                    holder = layer
+            elif op == "give":
+                assert not t and holder == (-1 if foreground else layer)
+                t = 1
+                if not foreground:
+                    holder = -1
+            elif op == "copy":
+                assert holder == layer
+            elif op == "join" and back <= done_pc[layer]:
+                continue
+            elif op == "protected":
+                assert w == t == 0 and holder == -1
+            elif op == "qkv begin":
+                assert w and back > done_pc[layer]
+                if layer == 0:
+                    qkv_count = copy_count[back]
+            elif op == "qkv end" and layer == 0:
+                first_qkv_counts.add((qkv_count, copy_count[back]))
+                qkv_count = -1
+            advanced = True
+            explore(front + int(foreground), back + int(not foreground), w, t, holder, qkv_count)
+        assert advanced, "device queues deadlocked"
+
+    explore(0, 0, 0, 0, -1, -1)
+    assert first_qkv_counts == {(start, end) for start in range(2, 7) for end in range(start, 7)}
+
+
 def test_failed_copy_never_submits_a_consumer_wait_on_an_unrecorded_done(runtime):
     module, log = runtime
     dst = torch.zeros(4)
@@ -200,7 +388,7 @@ def test_target_validates_main_gate_only_after_successful_capture(graph_module, 
     outbound = {"layer": object()}
     previous = {"unrelated": object()}
     context.sfa_router_copy_edges = previous
-    wrapper.retrieval_overlap = NS(main_gate=True, finish_gate_capture=finish, edges=lambda key: ({}, outbound))
+    wrapper.retrieval_overlap = NS(main_gate=True, finish_capture=finish, edges=lambda key: ({}, outbound))
 
     def run_target(**kwargs):
         assert context.sfa_router_copy_edges is outbound
@@ -228,6 +416,14 @@ def test_main_gate_configuration(runtime, monkeypatch):
     module, _ = runtime
     monkeypatch.setitem(sys.modules, "vllm.v1.core.dsa_shared_pool", NS(layerwise_prefill_bank_count=lambda: 4))
     env = load_module(ROOT / "vllm_ascend/envs.py", "sfa_gate_envs", monkeypatch)
+    name = "VLLM_ASCEND_SFA_PREFETCH_MULTI_LAYER"
+    monkeypatch.delenv(name, raising=False)
+    assert not env.VLLM_ASCEND_SFA_PREFETCH_MULTI_LAYER
+    monkeypatch.setenv(name, "1")
+    assert env.VLLM_ASCEND_SFA_PREFETCH_MULTI_LAYER
+    monkeypatch.setenv(name, "2")
+    with pytest.raises(ValueError, match="0 or 1"):
+        _ = env.VLLM_ASCEND_SFA_PREFETCH_MULTI_LAYER
     for name in ("PIECES", "MAIN_GATE", "MOE_GATE"):
         monkeypatch.delenv("VLLM_ASCEND_SFA_PREFETCH_" + name, raising=False)
     assert not env.VLLM_ASCEND_SFA_PREFETCH_MAIN_GATE
@@ -465,7 +661,8 @@ def test_no_owner_cycle_with_gc_disabled(runtime):
 
 
 @pytest.mark.parametrize("gated", [False, True])
-def test_actual_post_starts_prefetch_between_attention_and_value_projection(gated):
+@pytest.mark.parametrize("already_queued", [False, True])
+def test_post_forks_only_adjacent_transfers_and_preserves_vup_window(gated, already_queued):
     log = []
     value = torch.ones(2)
     ns = dict(torch=torch, get_weight_prefetch_method=lambda: NS(
@@ -474,10 +671,12 @@ def test_actual_post_starts_prefetch_between_attention_and_value_projection(gate
     proj = Mock(side_effect=lambda x: (log.append("output") or x,))
     impl = NS(_execute_sparse_flash_attention_process=lambda *a, **kw: log.append("sfa") or value,
               _v_up_proj=lambda x, **kw: log.append(("cube", kw)) or x, o_proj=proj)
-    edge = NS(gate=object() if gated else None, launch=lambda *args: log.append("prefetch"))
+    edge = NS(gate=object() if gated else None, from_indexer=already_queued, pending_join=already_queued,
+              launch=lambda *args: log.append("prefetch"))
     post(impl, value, value, value, value, value, value, value, value, torch.empty_like(value),
          trace_label="test", prefetch=(edge, value, value, value, (value,)))
-    assert log == ["sfa", "prefetch", ("cube", {"copy_edge": edge} if gated else {}), "output"]
+    assert log == ["sfa", *([] if already_queued else ["prefetch"]), ("cube", {"copy_edge": edge} if gated else {}),
+                   "output"]
 
 
 def test_compiled_fp32_router_resolves_current_layer_at_capture():
@@ -524,8 +723,8 @@ def test_pre_joins_before_any_consumer_cache_access():
     def cache(*args):
         log.append("cache")
         raise RuntimeError("stop after first access")
-    impl = NS(_retrieval_overlap=object(),
-              _shared_retrieval_edges=lambda: ({"consumer": NS(join=lambda: log.append("join"))}, {}),
+    edge = NS(from_indexer=False, join=lambda: log.append("join"))
+    impl = NS(_retrieval_overlap=object(), _shared_retrieval_edges=lambda: ({"consumer": edge}, {}),
               _cross_layer_kv_cache=cache)
     with pytest.raises(RuntimeError, match="first access"):
         pre(impl, "consumer", torch.ones(1), (), NS(), False, torch.empty(1))

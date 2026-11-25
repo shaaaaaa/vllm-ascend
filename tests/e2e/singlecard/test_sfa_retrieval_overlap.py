@@ -107,6 +107,112 @@ def test_dynamic_copy_windows_same_graph():
         print(f"[SFA_COPY_WINDOWS] {label} vup={first // 8} router={(second - first) // 8} tail={(64 - second) // 8}")
 
 
+@pytest.mark.parametrize("gated", [False, True], ids=["ordinary", "main_gate"])
+def test_shared_indexer_prefetch_joins_only_its_layer(gated):
+    """A later transfer waits for an earlier consumer to run. A whole-FIFO join would deadlock."""
+    from lmcache_ascend.v1.npu_connector.sparse_graph import SparseGraphTransfer
+
+    from vllm_ascend.compilation.sfa_retrieval_overlap import CopyGate, RetrievalEdge, SharedPrefetchGroup
+
+    torch.npu.set_device(0)
+    device = torch.device("npu:0")
+    side = torch.npu.Stream(device=device)
+    acl = ctypes.CDLL("libacl_rt.so")
+    for fn in (acl.aclrtValueWait, acl.aclrtValueWrite):
+        fn.argtypes = [ctypes.c_void_p, ctypes.c_uint64, ctypes.c_uint32, ctypes.c_void_p]
+        fn.restype = ctypes.c_int
+    ready = torch.ones(3, dtype=torch.int64, device=device)
+    all_done = torch.ones(1, dtype=torch.int64, device=device)
+    qkv_started = torch.ones_like(all_done)
+    x = torch.ones((4, 512), device=device, dtype=torch.float16)
+    weight = torch.ones((512, 128), device=device, dtype=torch.float16)
+    qkv = x.new_empty((4, 128))
+    selected = torch.arange(64, dtype=torch.int32, device=device).view(1, 64)
+    slots = selected.long()
+    counts = torch.full((1,), 64, dtype=torch.int32, device=device)
+    source, edges, snapshots = [], [], []
+
+    def signal(word):
+        assert acl.aclrtValueWrite(word.data_ptr(), 1, 0, torch.npu.current_stream().npu_stream) == 0
+
+    def wait(word):
+        assert acl.aclrtValueWait(word.data_ptr(), 1, 1, torch.npu.current_stream().npu_stream) == 0
+
+    class DelayedTransfer:
+        request_capacity = 1
+
+        def __init__(self, layer, transfer):
+            self.layer, self.transfer = layer, transfer
+
+        def load(self, *args, **kwargs):
+            if self.layer:
+                wait(qkv_started)
+            wait(ready[self.layer])
+            self.transfer.load(*args, **kwargs)
+            if self.layer == 2:
+                signal(all_done)
+
+    gate = CopyGate(device) if gated else None
+    for i in range(3):
+        values = torch.arange(64, dtype=torch.float16, device=device).view(1, 64, 1, 1)
+        planes = tuple((values + 256 * i + 64 * p).expand(-1, -1, -1, w).contiguous()
+                       for p, w in enumerate((32, 16)))
+        source.append(planes)
+        dest = tuple(torch.empty_like(plane) for plane in planes)
+        real = SparseGraphTransfer(dest, slots, 64, 64, request_capacity=1)
+        for p, plane in enumerate(planes):
+            real.ptrs[p].fill_(plane.data_ptr())
+        real.valid_tokens.fill_(64)
+        edges.append(RetrievalEdge(side, DelayedTransfer(i, real), dest, pieces=4, gate=gate))
+        snapshots.append(tuple(torch.empty_like(plane) for plane in dest))
+    group = SharedPrefetchGroup(tuple(edges))
+    first_boundary = torch.empty_like(edges[2].destinations[0])
+    graph = torch.npu.NPUGraph()
+    torch.npu.synchronize()
+
+    def project(layer):
+        # The two later transfers cannot begin before the first QKV callback.
+        # In the fast case, hold this test window until both have finished.
+        if layer == 0:
+            signal(qkv_started)
+        torch.mm(x, weight, out=qkv)
+        for plane, observed in zip(edges[layer].destinations, snapshots[layer]):
+            observed.copy_(plane)
+        if layer == 0:
+            wait(all_done)
+            first_boundary.copy_(edges[2].destinations[0])
+
+    with torch.npu.graph(graph):
+        group.launch(selected, counts, slots)
+        for i, edge in enumerate(edges):
+            if i:
+                signal(ready[i])
+            edge.join(project, i)
+
+    # The fast replay must finish layers 2/3 within layer 1's QKV window.
+    # The slow replay withholds each later transfer until the preceding QKV returns.
+    for early, shift, count in ((True, 5, 64), (False, 11, 29), (True, 7, 1), (False, 3, 0)) * 2:
+        ready.fill_(int(early))
+        ready[0].fill_(1)
+        all_done.fill_(int(not early))
+        qkv_started.zero_()
+        ids = (torch.arange(64, dtype=torch.int32) + shift) % 64
+        selected.copy_(ids.view_as(selected))
+        counts.fill_(count)
+        for edge in edges:
+            for plane in edge.destinations:
+                plane.fill_(-1)
+        graph.replay()
+        for i, pair in enumerate(snapshots):
+            for p, observed in enumerate(pair):
+                expected = torch.full(observed.shape, -1, dtype=torch.float16)
+                expected[:, :count] = source[i][p].cpu()[:, ids[:count].long()]
+                torch.testing.assert_close(observed.cpu(), expected, rtol=0, atol=0)
+                if i == 2 and p == 0:
+                    boundary = expected if early else torch.full_like(expected, -1)
+                    torch.testing.assert_close(first_boundary.cpu(), boundary, rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("requests,main_gate", [(1, False), (8, False), (16, False), (8, True)])
 @pytest.mark.parametrize("query_rows", [1, 2])
 def test_registered_sources_consumer_boundary_and_replay(requests, query_rows, main_gate):
@@ -115,11 +221,12 @@ def test_registered_sources_consumer_boundary_and_replay(requests, query_rows, m
         pytest.fail("set LMCACHE_ASCEND_SOURCE_DIR to the matching LMCache-Ascend source checkout")
     sys.path.insert(0, str(ROOT / "tools"))
     from sfa_retrieval_overlap_benchmark import Workload
-    workload = Workload(root, requests, query_rows, main_gate=main_gate)
+    workload = Workload(root, requests, query_rows, main_gate=main_gate, multi_layer=True)
     was_enabled = gc.isenabled()
     gc.disable()
     try:
         graphs = [workload.capture(mode, observe=True) for mode in (False, True)]
+        graphs.append(workload.capture(True, observe=True, multi_layer=True))
         for active, shift in ((0, 0), (1, 4096), (410, 3), (4096, 17), (37, 299), (0, 0)):
             for graph in graphs:
                 tokens = workload.set_payload(active, shift, idle=requests > 1)

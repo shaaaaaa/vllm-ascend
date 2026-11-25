@@ -14,7 +14,8 @@ from tests.ut.distributed.kv_transfer.test_shared_resident_plan import grouped, 
 
 @pytest.mark.parametrize("explicit", [False, True])
 @pytest.mark.parametrize("c8", [False, True])
-def test_bounded_group_packs_and_restores_once_per_invocation(explicit, c8):
+@pytest.mark.parametrize("lookahead", [False, True])
+def test_bounded_group_packs_and_restores_once_per_invocation(explicit, c8, lookahead):
     api = resident_api.__wrapped__()
     _, (producer, consumer), group, _ = grouped(api, mtp=2, bounded=True)
     layout = load_source("vllm_ascend/attention/sfa_graph_layout.py", "shared_bounded_layout")
@@ -52,6 +53,15 @@ def test_bounded_group_packs_and_restores_once_per_invocation(explicit, c8):
         obj._mask_staged_index_scatter_padding = lambda slots, values, *args: (slots, values)
         obj.indexer_select_post_process = Mock(side_effect=lambda **kwargs: frame["raw"].clone())
     consumer._get_indexcache_topk_indices = Mock(side_effect=AssertionError("consumer staged raw top-k"))
+    consumer_order = []
+    def wait_and_project(projection, hidden):
+        assert projection is consumer.fused_qkv_a_proj
+        consumer_order.append("wait own KV")
+        output = projection(hidden)
+        consumer_order.append("close after QKV")
+        return output
+    edge = NS(join=wait_and_project) if lookahead else None
+    consumer.q_a_layernorm = lambda x: consumer_order.append("norm") or x
     writes = [t.clone() for t in group.writes] if explicit else None
     reads = [writes[0], writes[-4], writes[-3][:, 0], writes[-2], writes[-1]] if explicit else None
 
@@ -92,7 +102,11 @@ def test_bounded_group_packs_and_restores_once_per_invocation(explicit, c8):
             resident_writes=writes,
             **kwargs,
         )
-        second = consumer._cross_layer_pre_compute(indexer_cache=None, resident_reads=reads, **kwargs)
+        second = consumer._cross_layer_pre_compute(
+            indexer_cache=None, resident_reads=reads, qkv_prefetch=edge, **kwargs
+        )
+        assert consumer_order == (["wait own KV", "close after QKV", "norm"] if lookahead else ["norm"])
+        consumer_order.clear()
         expected = torch.where((rows >= 0)[:, None, None], frame["raw"] + 100, -1)
         assert torch.equal(first[2], expected) and torch.equal(second[2], expected)
         assert torch.equal(producer.topk_indices_buffer[:tokens], frame["raw"].squeeze(1))

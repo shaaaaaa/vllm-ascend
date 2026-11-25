@@ -46,8 +46,6 @@ def handoff():
         CUDAGraphMode=SimpleNamespace(NONE=0, PIECEWISE=1),
         StagedSFARouteAction=SimpleNamespace(STAGED="staged"),
         _prepare_sfa_remap_boundary=Mock(),
-        queue_selected_topk_fingerprint=Mock(),
-        queue_staged_graph_stage_fingerprint=Mock(),
         _LMCACHE_SPARSE_WAIT_SYNC_ONCE=False,
     )
     cls = next(
@@ -87,22 +85,18 @@ def handoff():
         producer_event=Event(),
         runtime=(None, (torch.zeros(2, 4, 1, 2),) * 3, None, False),
         remap_boundary=None,
-        input_diagnostic_buffers={},
         initialized_cache_capacity=2,
         register=Mock(),
     )
     impl = SimpleNamespace(
         _staged_sfa_capture_state=state,
         _staged_sfa_bridge_buffers=bridge,
-        _staged_graph_content_diagnostic_enabled=Mock(return_value=False),
-        _target_sfa_diag_pre_retrieve=Mock(),
-        _target_sfa_diag_post_retrieve=Mock(),
         _cross_layer_kv_cache=Mock(return_value=(state.runtime[1], None, False)),
         _cross_layer_ineligible_reason=Mock(return_value=None),
         _cross_layer_pre_compute=Mock(return_value=bridge),
         _copy_to_staged_sfa_bridge=lambda *args: bridge,
         index_topk=4,
-        diagnostic_num_cache_layers=2,
+        skip_topk=False,
         has_indexer=True,
         use_sparse_c8_indexer=False,
         index_cache_enabled=False,
@@ -128,19 +122,16 @@ def handoff():
     return SimpleNamespace(**locals())
 
 
-@pytest.mark.parametrize("diagnostics", [False, True])
-def test_every_replay_records_before_all_consumers(handoff, diagnostics):
+@pytest.mark.parametrize("capacities", [(2, 2, 2, 2), (2, 4, 2, 4)])
+def test_every_staged_replay_records_before_connector_wait(handoff, capacities):
     h = handoff
-    h.impl._staged_graph_content_diagnostic_enabled.return_value = diagnostics
     event = h.state.producer_event
-    for generation in range(1, 5):
+    for generation, capacity in enumerate(capacities, start=1):
         h.device.generation = generation  # Replay does not call Python graph_pre.
-        capacity = 2 if diagnostics or generation % 2 else 4
         h.context.staged_sfa_graph_key = type(h.key)(capacity, capacity)
         h.retrieve()
         assert h.state.producer_event is event
-    expected = ["record", "wait", "wait", "connector"] if diagnostics else ["record", "wait", "connector"]
-    assert h.operations == expected * 4
+    assert h.operations == ["record", "wait", "connector"] * len(capacities)
     h.npu.Event.assert_not_called()
 
 
@@ -154,7 +145,7 @@ def test_failed_handoff_does_not_consume_payload(handoff, failure):
     with pytest.raises(RuntimeError, match="warmup|record failed"):
         h.retrieve()
     h.namespace["wait_for_kv_layer_from_connector"].assert_not_called()
-    h.impl._target_sfa_diag_pre_retrieve.assert_not_called()
+    assert h.operations == []
 
 
 def test_dummy_does_not_record_or_load(handoff):
@@ -245,6 +236,29 @@ def test_shared_indexer_prefetch_order_is_preserved(handoff, has_next_indexer):
     h.namespace["_prepare_sfa_remap_boundary"].assert_called_once()
 
 
+@pytest.mark.parametrize("full,consumer,enabled", [(True, False, True), (False, False, True),
+                                                    (True, True, True), (True, False, False)])
+def test_indexer_launches_from_its_fixed_bridge_before_own_retrieval(handoff, full, consumer, enabled):
+    h = handoff
+    h.context.sfa_full_graph_active = full
+    h.impl.skip_topk = consumer
+    h.impl._shared_retrieval_edges = lambda: ({}, {})
+    h.impl._cross_layer_pre_compute.side_effect = lambda *a, **kw: h.operations.append("index plan") or h.bridge
+    h.impl._copy_to_staged_sfa_bridge = lambda *a: h.operations.append("publish bridge") or h.bridge
+    group = SimpleNamespace(launch=Mock(side_effect=lambda *a: h.operations.append("queue consumers")))
+    h.impl._retrieval_overlap = SimpleNamespace(
+        multi_layer=enabled, indexer_groups={h.context.staged_sfa_graph_key: {"layer": group}}
+    )
+    h.impl._full_graph_transfer = SimpleNamespace(load=lambda *a: h.operations.append("own KV"))
+    h.pre()
+    if full and not consumer and enabled:
+        group.launch.assert_called_once_with(*h.bridge[3:])
+        h.retrieve()
+        assert h.operations == ["index plan", "publish bridge", "queue consumers", "own KV"]
+    else:
+        group.launch.assert_not_called()
+
+
 def test_native_fallback_does_not_touch_staged_event(handoff):
     h = handoff
     h.context.staged_sfa_graph_key = None
@@ -254,6 +268,21 @@ def test_native_fallback_does_not_touch_staged_event(handoff):
     h.impl.forward.assert_called_once()
     assert h.operations == []
     h.npu.Event.assert_not_called()
+
+
+def test_group_consumer_carries_its_own_event_into_the_fused_qkv(handoff):
+    h = handoff
+    edge = SimpleNamespace(from_indexer=True, join=Mock())
+    h.context.sfa_full_graph_active = True
+    h.impl.skip_topk = True
+    h.impl._retrieval_overlap = SimpleNamespace(multi_layer=True)
+    h.impl._shared_retrieval_edges = lambda: ({"layer": edge}, {})
+    h.pre()
+    edge.join.assert_not_called()
+    assert h.impl._cross_layer_pre_compute.call_args.kwargs["qkv_prefetch"] is edge
+    h.impl._full_graph_transfer = SimpleNamespace(load=Mock())
+    h.retrieve()
+    h.impl._full_graph_transfer.load.assert_not_called()
 
 
 def test_connector_failure_does_not_advance_to_next_layer(handoff):

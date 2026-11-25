@@ -105,13 +105,22 @@ def cube_window_type(row):
     return None
 
 
-def copy_window_controls(cubes, events, norm):
+def copy_window_controls(cubes, events, norm, consumer_sfa):
     """Find device open/close pairs. Empty windows are valid on any replay."""
     tail_open = events.get(("NOTIFY_RECORD", norm.task + 2))
     join = events.get(("CAPTURE_WAIT", norm.task + 3))
     if not tail_open or not join:
         return {}, None
     windows = {"tail": (tail_open[0], join[1], join[0])}
+    # Group capture holds the same FIFO grant across the wait and the fused QKV.
+    # The adjacent-layer tail closes immediately after the wait.
+    for tid in range(norm.task + 4, consumer_sfa.task):
+        close = events.get(("MEM_WRITE_VALUE", tid))
+        acquired = events.get(("NOTIFY_WAIT", tid + 1))
+        if close and acquired:
+            if tid > norm.task + 4:
+                windows = {"qkv": (tail_open[0], acquired[1], close[0])}
+            break
     for name, op in cubes:
         grant = events.get(("NOTIFY_RECORD", op.task - 1))
         close = events.get(("MEM_WRITE_VALUE", op.task + 1))
@@ -121,10 +130,10 @@ def copy_window_controls(cubes, events, norm):
     return windows, join
 
 
-def window_piece_counts(parts, windows):
-    counts = dict.fromkeys(windows, 0)
+def window_piece_counts(parts, intervals):
+    counts = dict.fromkeys((name for name, _ in intervals), 0)
     for part in parts:
-        matches = [name for name, (start, stop, _) in windows.items()
+        matches = [name for name, (start, stop, _) in intervals
                    if start - 1000 <= part.start and part.stop <= stop + 1000]
         if len(matches) == 1:
             counts[matches[0]] += 1
@@ -210,28 +219,85 @@ class Timeline:
         return sum(r.stop - r.start - sum(self.gaps(r.start, r.stop)) for r in parts)
 
 
-def read_controls(path, pid, stream, stages, wanted):
+def read_controls(path, pid, stream, stages, wanted, copy_streams):
     starts = [s[0] for s in stages]
     result = defaultdict(dict)
+    done_records = defaultdict(dict)
     for ev in complete_events(path):
         if ev.get("ph") != "X" or str(ev.get("pid")) != pid:
             continue
         a = ev.get("args") or {}
         kind = a.get("Task Type")
-        if kind not in CONTROL or int(a.get("Physic Stream Id", ev["tid"])) != stream:
+        queue = int(a.get("Physic Stream Id", ev["tid"]))
+        side_done = kind == "CAPTURE_RECORD" and queue in copy_streams
+        if kind not in CONTROL or (queue != stream and not side_done):
             continue
         task = int(a.get("Task Id", -1))
-        if (kind, task) not in wanted:
+        if not side_done and (kind, task) not in wanted and kind not in {
+            "CAPTURE_RECORD", "MEM_WRITE_VALUE", "NOTIFY_WAIT", "NOTIFY_RECORD",
+        }:
             continue
         start = ns(ev["ts"])
         step = bisect.bisect_right(starts, start) - 1
         if step < 0 or start >= stages[step][1]:
             continue
         stop = start + ns(ev.get("dur", 0))
-        key = kind, task
-        previous = result[step].get(key)
-        result[step][key] = (min(start, previous[0]), max(stop, previous[1])) if previous else (start, stop)
-    return result
+        bucket = done_records[step] if side_done else result[step]
+        key = (queue, task) if side_done else (kind, task)
+        previous = bucket.get(key)
+        bucket[key] = (min(start, previous[0]), max(stop, previous[1])) if previous else (start, stop)
+    return result, done_records
+
+
+def indexer_trains(norms, sfas, root_copies, side_copies, events, done_records, windows):
+    """Pair device FIFO completion records with consuming layers, even when several finish in one window."""
+    joins, forks = {}, {}
+    for i, (sfa, norm) in enumerate(zip(sfas, norms[1:])):
+        _, window_join = windows[i]
+        join = window_join or events.get(("CAPTURE_WAIT", norm.task + 1))
+        if join is None:
+            continue
+        joins[i] = join
+        if ("CAPTURE_RECORD", sfa.task + 1) in events:  # Adjacent post-SFA fork.
+            continue
+        own = next((r for r in root_copies if norms[i].stop <= r.start < sfa.start), None)
+        if own is not None:
+            # The indexer forks after publishing the bridge, before retrieving
+            # its own KV. Bound the search to this producer's pre-compute.
+            records = [stop for (kind, tid), (_, stop) in events.items()
+                       if kind == "CAPTURE_RECORD" and tid < own.task and norms[i].stop <= stop <= own.start + 1000]
+            if records:
+                forks[i] = max(records)
+    if not forks:
+        return {}
+    if len({r.stream for r in side_copies}) != 1:
+        raise ValueError("shared indexer trace requires one copy FIFO for this replay")
+    record_distance = 2 if any(window_join for _, window_join in windows.values()) else 1
+    trains, pieces = [], []
+    for copy in side_copies:
+        pieces.append(copy)
+        # The ungated record follows the kernel. A gated kernel first returns the Notify.
+        done = done_records.get((copy.stream, copy.task + record_distance))
+        if done and copy.stop <= done[1] + 1000:
+            trains.append((pieces, done))
+            pieces = []
+    if pieces or len(trains) != len(joins):
+        raise ValueError(
+            f"shared indexer trace has {len(trains)} complete layer trains for {len(joins)} consumer waits"
+        )
+    edges = {}
+    origin = None
+    for (i, join), (parts, done) in zip(joins.items(), trains):
+        if i in forks:
+            origin, ready = i, forks[i]
+        elif release := events.get(("CAPTURE_RECORD", sfas[i].task + 1)):
+            origin, ready = i, release[1]
+        elif i - 1 not in edges or origin not in forks:
+            raise ValueError(f"shared consumer layer {i + 1} has no indexer fork")
+        if ready > parts[0].start + 1000 or done[1] > join[1] + 1000 or join[0] < norms[i + 1].stop:
+            raise ValueError(f"shared consumer layer {i + 1} disagrees with its device fork or completion record")
+        edges[i] = (origin, origin in forks, ready, join[0], parts)
+    return edges
 
 
 def percentile(sorted_values, fraction):
@@ -308,12 +374,35 @@ def analyze(path, wanted_pid=None, wanted_model=None, wanted_stream=None, expect
         file=sys.stderr,
         flush=True,
     )
-    controls = read_controls(path, pid, stream, stages, wanted)
     copies = [r for r in tasks if r.stream != stream and is_copy(r)]
     copy_times = [r.start for r in copies]
+    controls, done_records = read_controls(path, pid, stream, stages, wanted, {r.stream for r in copies})
+    main_copies = [r for r in main if is_copy(r)]
+    main_copy_times = [r.start for r in main_copies]
     by_edge, background = {}, set()
-    for step, (_, _, norms, sfas, final) in enumerate(stages):
+    origin_layers, layer_windows, qkv_ops = {}, {}, {}
+    for step, (start, end, norms, sfas, final) in enumerate(stages):
         events = controls[step]
+        control_windows = {i: copy_window_controls(cube_tasks[step, i], events, norm, sfas[i + 1])
+                           for i, norm in enumerate(norms[1:])}
+        for i, (windows, join) in control_windows.items():
+            layer_windows[step, i] = windows
+            if "qkv" in windows:
+                close = windows["qkv"][2]
+                qkv_ops[step, i] = main[bisect.bisect_left(times, join[1]):bisect.bisect_left(times, close)]
+        group_edges = indexer_trains(
+            norms, sfas,
+            main_copies[bisect.bisect_left(main_copy_times, start):bisect.bisect_left(main_copy_times, end)],
+            copies[bisect.bisect_left(copy_times, start):bisect.bisect_left(copy_times, end)],
+            events, done_records[step], control_windows,
+        )
+        if group_edges:
+            for i, (origin, from_indexer, ready, deadline, parts) in group_edges.items():
+                by_edge[step, i] = ready, deadline, parts, False, layer_windows[step, i]
+                if from_indexer:
+                    origin_layers[step, i] = origin
+                background.update(parts)
+            continue
         for i, sfa in enumerate(sfas[:-1]):
             a = bisect.bisect_left(copy_times, sfa.stop)
             b = bisect.bisect_left(copy_times, sfas[i + 1].start)
@@ -322,7 +411,7 @@ def analyze(path, wanted_pid=None, wanted_model=None, wanted_stream=None, expect
             late_release = events.get(("CAPTURE_RECORD", next_norm.task + 1))
             late_join = events.get(("CAPTURE_WAIT", next_norm.task + 2))
             at_consumer = bool(parts) and late_release is not None and late_join is not None
-            windows, window_join = copy_window_controls(cube_tasks[step, i], events, next_norm)
+            windows, window_join = control_windows[i]
             if windows:
                 release, join = events.get(("CAPTURE_RECORD", sfa.task + 1)), window_join
                 at_consumer = False
@@ -380,16 +469,28 @@ def analyze(path, wanted_pid=None, wanted_model=None, wanted_stream=None, expect
                 ready, deadline, parts, at_consumer, windows = edge
                 lengths = vector.gaps(ready, deadline)
                 copy = sum(r.stop - r.start for r in parts)
+                origin = origin_layers.get((step, i), i)
+                if (step, i) in origin_layers:
+                    s["indexer_layer"] = origin
+                s["consumer_layer"] = i + 1
                 cube_overlaps = {
                     name: Timeline(
-                        (op.start, op.stop) for kind, op in cube_tasks[step, i] if kind == name and
-                        (not windows or (name in windows and windows[name][0] <= op.start <= windows[name][1]))
+                        (op.start, op.stop) for layer in range(origin, i + 1) for kind, op in cube_tasks[step, layer]
+                        if kind == name and (not windows or (name in layer_windows[step, layer] and
+                            layer_windows[step, layer][name][0] <= op.start <= layer_windows[step, layer][name][1]))
                     ).overlap(parts)
                     for name in ("vup", "router")
                 }
                 root_overlap = root_core.overlap(parts)
+                qkv_overlap = Timeline(
+                    (op.start, op.stop) for layer in range(origin, i + 1) for op in qkv_ops.get((step, layer), ())
+                ).overlap(parts)
                 if windows:
-                    counts = window_piece_counts(parts, windows)
+                    # A later transfer may use an earlier consumer's QKV grant
+                    # while that consumer waits or computes.
+                    allowed = [(name, span) for layer in range(origin, i + 1)
+                               for name, span in layer_windows[step, layer].items() if name != "tail" or layer == i]
+                    counts = window_piece_counts(parts, allowed)
                     s["window_pieces"] = counts
                     s["unassigned_pieces"] = len(parts) - sum(counts.values())
                     for name, (_, acquired, close) in windows.items():
@@ -410,8 +511,9 @@ def analyze(path, wanted_pid=None, wanted_model=None, wanted_stream=None, expect
                     copy_overlap_main_compute=root_overlap,
                     copy_overlap_vup=cube_overlaps["vup"],
                     copy_overlap_router=cube_overlaps["router"],
-                    copy_overlap_protected_main_compute=root_overlap - sum(cube_overlaps.values()),
-                    cube_windows=[name for name in windows if name != "tail"],
+                    copy_overlap_qkv=qkv_overlap,
+                    copy_overlap_protected_main_compute=root_overlap - sum(cube_overlaps.values()) - qkv_overlap,
+                    cube_windows=[name for name in windows if name in {"vup", "router"}],
                     copy_overlap_comm_aiv=comm_aiv.overlap(parts),
                     copy_overlap_other_device_compute=other_compute.overlap(parts),
                     copy_before_consumer_norm_end=sum(
@@ -488,19 +590,24 @@ def analyze(path, wanted_pid=None, wanted_model=None, wanted_stream=None, expect
         "join_wait_for_copy",
     ]
     layers = []
+    window_names = ("vup", "router", "tail")
+    if qkv_ops:
+        window_names += ("qkv",)
+        edge_fields.extend(["copy_overlap_qkv", "qkv_close_to_acquire"])
     for i in range(expected):
         group = [s for s in samples if s["layer"] == i]
         row = {
             "layer": i,
             "replays": len(group),
             "async_to_next": sum("fit" in s for s in group),
+            "indexer_layer_for_next": next((s["indexer_layer"] for s in group if "indexer_layer" in s), None),
             "released_at_consumer": sum(s.get("released_at_consumer", False) for s in group),
             "fits_total_gap": sum(s.get("fit", False) for s in group),
         }
         for name in layer_fields + edge_fields:
             st = sample_summary(group, name)
             row[name + "_mean_us"], row[name + "_p50_us"] = st.get("mean_us"), st.get("p50_us")
-        for name in ("vup", "router", "tail"):
+        for name in window_names:
             counts = [s["window_pieces"][name] for s in group if name in s.get("window_pieces", {})]
             row[name + "_pieces_mean"] = round(statistics.mean(counts), 2) if counts else None
         layers.append(row)
@@ -517,11 +624,13 @@ def analyze(path, wanted_pid=None, wanted_model=None, wanted_stream=None, expect
         "prefetch_layers_zero_based": [r["layer"] for r in layers if r["async_to_next"]],
         "side_streams": sorted({s["side_stream"] for s in edge_samples}),
         "edges": len(edge_samples),
+        "indexer_prefetch_edges": len(origin_layers),
+        "indexer_fork_layers_zero_based": sorted(set(origin_layers.values())),
         "consumer_release_edges": sum(s["released_at_consumer"] for s in edge_samples),
         "cube_windows": dict(Counter(name for s in edge_samples for name in s["cube_windows"])),
         "pieces_per_window_histogram": {
             name: dict(Counter(s["window_pieces"][name] for s in edge_samples if name in s.get("window_pieces", {})))
-            for name in ("vup", "router", "tail")
+            for name in window_names
         },
         "pieces_outside_or_ambiguous_window": sum(s.get("unassigned_pieces", 0) for s in edge_samples),
         "edges_overlapping_protected_main_compute": sum(

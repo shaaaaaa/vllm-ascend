@@ -35,14 +35,18 @@ def _strict_bool_env(name: str, default: bool = False) -> bool:
     raise ValueError(f"{name} must be 'true' or 'false', got {raw!r}")
 
 
-def _sfa_prefetch_main_gate() -> bool:
-    name = "VLLM_ASCEND_SFA_PREFETCH_MAIN_GATE"
-    if name not in os.environ:
-        name = "VLLM_ASCEND_SFA_PREFETCH_MOE_GATE"
+def _strict_binary_env(name: str) -> bool:
     value = os.getenv(name, "0")
     if value not in {"0", "1"}:
         raise ValueError(f"{name} must be 0 or 1")
     return value == "1"
+
+
+def _sfa_prefetch_main_gate() -> bool:
+    name = "VLLM_ASCEND_SFA_PREFETCH_MAIN_GATE"
+    if name not in os.environ:
+        name = "VLLM_ASCEND_SFA_PREFETCH_MOE_GATE"
+    return _strict_binary_env(name)
 
 
 # The begin-* and end* here are used by the documentation generator
@@ -199,11 +203,14 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_SFA_SHARED_RETRIEVAL_OVERLAP": lambda: bool(
         int(os.getenv("VLLM_ASCEND_SFA_SHARED_RETRIEVAL_OVERLAP", "0"))
     ),
+    # D only, non-sensitive. 0 (default) queues one layer ahead. 1 queues
+    # all eligible shared consumers at their indexer. Requires overlap and restart.
+    "VLLM_ASCEND_SFA_PREFETCH_MULTI_LAYER": lambda: _strict_binary_env("VLLM_ASCEND_SFA_PREFETCH_MULTI_LAYER"),
     # Number of pieces in one whole layer transfer, shared across its windows.
     "VLLM_ASCEND_SFA_PREFETCH_PIECES": lambda: int(
         os.getenv("VLLM_ASCEND_SFA_PREFETCH_PIECES", "16" if _sfa_prefetch_main_gate() else "1")
     ),
-    # D only. Open during eligible V-up/router GEMMs and drain before next QKV.
+    # D only. Open during eligible V-up/router GEMMs and, in multi-layer mode, through consumer QKV.
     "VLLM_ASCEND_SFA_PREFETCH_MAIN_GATE": _sfa_prefetch_main_gate,
     # Compatibility spelling. An explicit MAIN_GATE value takes precedence.
     "VLLM_ASCEND_SFA_PREFETCH_MOE_GATE": _sfa_prefetch_main_gate,

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Startup-owned, one-layer-ahead transfers inside the target ACL graph.
+"""Startup-owned shared-indexer KV transfers inside the target ACL graph.
 
 No request scheduling or storage policy lives here. Each edge joins before the
 consumer touches its KV, so the root completion event still protects all sources.
@@ -15,7 +15,7 @@ import torch_npu
 
 
 class CopyGate:
-    """One device admission word and one consumable Notify per target graph key."""
+    """One device admission word and one consumable Notify for the graph's copy FIFO."""
 
     def __init__(self, device) -> None:
         try:
@@ -23,7 +23,7 @@ class CopyGate:
         except ImportError as error:
             raise RuntimeError("Rebuild LMCache-Ascend on dev-lmy to use the SFA copy windows") from error
         self.native = SparsePrefetchGate(torch.zeros(1, dtype=torch.int64, device=device))
-        self.pending = False  # Capture-time guard for edges sharing the device token.
+        self.pending = 0  # Capture-time number of consumers still using this grant.
 
 
 def validate_destinations(caches: dict[str, tuple], destinations: set[str]) -> None:
@@ -57,6 +57,7 @@ class RetrievalEdge:
     def __post_init__(self) -> None:
         self.payload = None
         self.pending_join = False
+        self.from_indexer = False
         self.windows_used: set[str] = set()
         self.window_open = False
         self.start = torch.npu.Event(enable_timing=False)
@@ -70,6 +71,10 @@ class RetrievalEdge:
 
     def launch(self, selected, counts, slots, destinations) -> None:
         """Capture the entire copy train once, after SFA has produced its inputs."""
+        self.bind_payload((selected, counts, slots), destinations)
+        _submit_transfers((self,))
+
+    def bind_payload(self, payload, destinations) -> None:
         if self.pending_join or (self.gate is not None and self.gate.pending):
             raise RuntimeError("prefetch launched twice without a consumer join")
         # The native transfer owns fixed destinations. Reject substitutions,
@@ -81,7 +86,6 @@ class RetrievalEdge:
             for actual, expected in zip(destinations, self.destinations)
         ):
             raise RuntimeError("prefetch destination changed after startup")
-        payload = (selected, counts, slots)
         if self.payload is not None and any(
             (actual is None) != (previous is None) or (
                 actual is not None and (actual.data_ptr() != previous.data_ptr()
@@ -96,31 +100,20 @@ class RetrievalEdge:
         if self.payload is None:
             self.payload = payload
         self.windows_used.clear()
-        if self.gate is not None:
-            self.gate.pending = True
-        self._submit_copy(payload)
-        self.pending_join = True
 
-    def _submit_copy(self, payload) -> None:
-        selected, counts, slots = payload
-        main = torch.npu.current_stream()
-        self.start.record(main)
-        tracker = self.capture_priority
-        before = tracker.before_first_fork(main) if tracker is not None and tracker.side is None else None
-        with torch.npu.stream(self.stream):
-            self.stream.wait_event(self.start)
-            if self.gate is not None:
-                self.transfer.load(selected, counts, slots, max_aiv_cores=self.max_aiv_cores,
-                                   pieces=min(self.pieces, selected.numel()), admission=self.gate.native)
-            elif self.pieces != 1:
-                self.transfer.load(selected, counts, slots, max_aiv_cores=self.max_aiv_cores, pieces=self.pieces)
-            elif self.max_aiv_cores:
-                self.transfer.load(selected, counts, slots, max_aiv_cores=self.max_aiv_cores)
-            else:
-                self.transfer.load(selected, counts, slots)
-            self.done.record(self.stream)
-            if before is not None:
-                tracker.after_first_fork(self.stream, before)
+    def enqueue_on_side(self) -> None:
+        selected, counts, slots = self.payload
+        if self.gate is not None:
+            self.transfer.load(selected, counts, slots, max_aiv_cores=self.max_aiv_cores,
+                               pieces=min(self.pieces, selected.numel()), admission=self.gate.native)
+        elif self.pieces != 1:
+            self.transfer.load(selected, counts, slots, max_aiv_cores=self.max_aiv_cores, pieces=self.pieces)
+        elif self.max_aiv_cores:
+            self.transfer.load(selected, counts, slots, max_aiv_cores=self.max_aiv_cores)
+        else:
+            self.transfer.load(selected, counts, slots)
+        self.done.record(self.stream)
+        self.pending_join = True
 
     @contextmanager
     def cube_window(self, name: str):
@@ -133,22 +126,72 @@ class RetrievalEdge:
         try:
             yield
         finally:
-            # Device wait for ownership, independent of how many pieces ran.
             self.gate.native.set_open(False)
             self.window_open = False
 
-    def join(self) -> None:
+    def join(self, qkv_projection=None, *projection_args):
+        """Wait only for this layer. A grouped QKV projection keeps the entire FIFO admitted."""
         # Python executes only at capture/warmup, not graph replay. Priming an
         # event outside capture is NOT proof of a record inside this graph.
         if not self.pending_join or self.window_open:
             raise RuntimeError("consumer prefetch wait has no producer launch in this capture")
         if self.gate is not None:
             self.gate.native.set_open(True)
-        torch.npu.current_stream().wait_event(self.done)
-        if self.gate is not None:
-            self.gate.native.set_open(False)
-            self.gate.pending = False
-        self.pending_join = False
+        self.window_open = True
+        try:
+            torch.npu.current_stream().wait_event(self.done)
+            if qkv_projection is not None:
+                if self.gate is not None:
+                    self.windows_used.add("qkv")
+                return qkv_projection(*projection_args)
+        finally:
+            if self.gate is not None:
+                self.gate.native.set_open(False)
+                self.gate.pending -= 1
+            self.window_open = False
+            self.pending_join = False
+
+
+def _submit_transfers(edges) -> None:
+    """One graph fork, with a distinct side-stream completion record after each layer."""
+    first = edges[0]
+    if first.gate is not None:
+        first.gate.pending = len(edges)
+    main = torch.npu.current_stream()
+    first.start.record(main)
+    tracker = first.capture_priority
+    before = tracker.before_first_fork(main) if tracker is not None and tracker.side is None else None
+    with torch.npu.stream(first.stream):
+        first.stream.wait_event(first.start)
+        for edge in edges:
+            edge.enqueue_on_side()
+        if before is not None:
+            tracker.after_first_fork(first.stream, before)
+
+
+class SharedPrefetchGroup:
+    """One producer payload, one background FIFO, independently joined consumers."""
+
+    def __init__(self, edges: tuple[RetrievalEdge, ...]) -> None:
+        if not edges:
+            raise ValueError("shared prefetch group requires at least one consumer")
+        self.edges = edges
+        self.capacity = edges[0].transfer.request_capacity
+        if any(edge.stream is not edges[0].stream or edge.transfer.request_capacity != self.capacity
+               for edge in edges):
+            raise ValueError("shared prefetch requires one stream and one request capacity")
+        if any(edge.gate is not edges[0].gate for edge in edges):
+            raise ValueError("all consumers of an indexer must share the copy FIFO's admission token")
+        for edge in edges:
+            edge.from_indexer = True
+
+    def launch(self, selected, counts, slots) -> None:
+        # These are fixed, producer-owned bridge buffers. Other layers have their
+        # own bridges and KV planes. The first fork orders all three plan writes.
+        payload = (selected[:self.capacity], counts[:self.capacity], slots[:self.capacity])
+        for edge in self.edges:
+            edge.bind_payload(payload, edge.destinations)
+        _submit_transfers(self.edges)
 
 
 @dataclass
@@ -228,10 +271,12 @@ class CaptureProbe:
 class SharedRetrievalOverlap:
     """One stream per worker, immutable per-key edges after startup setup."""
 
-    def __init__(self, pieces: int = 1, low_priority: bool = False, *, main_gate: bool = False) -> None:
+    def __init__(self, pieces: int = 1, low_priority: bool = False, *, main_gate: bool = False,
+                 multi_layer: bool = False) -> None:
         self.pieces = pieces
         self.low_priority = low_priority
         self.main_gate = main_gate
+        self.multi_layer = multi_layer
         if self.pieces < 1:
             raise ValueError("VLLM_ASCEND_SFA_PREFETCH_PIECES must be positive")
         if main_gate and low_priority:
@@ -241,6 +286,7 @@ class SharedRetrievalOverlap:
         self.pairs: dict[str, tuple[str, tuple]] = {}
         self.incoming: dict[Any, dict[str, RetrievalEdge]] = {}
         self.outgoing: dict[Any, dict[str, RetrievalEdge]] = {}
+        self.indexer_groups: dict[Any, dict[str, SharedPrefetchGroup]] = {}
         self.failed = False
 
     def configure(self, impls, groups, kv_caches) -> None:
@@ -249,6 +295,8 @@ class SharedRetrievalOverlap:
         by_name = dict(impls)
         pairs = {}
         for group in groups:
+            if by_name[group.members[0]].skip_topk:
+                raise ValueError("shared retrieval group must start with an indexer producer")
             for current, following in zip(group.members, group.members[1:]):
                 producer, consumer = by_name[current], by_name[following]
                 if not consumer.skip_topk or producer.shared_resident_plan is not consumer.shared_resident_plan:
@@ -274,7 +322,9 @@ class SharedRetrievalOverlap:
             raise RuntimeError("shared retrieval requires active resident plans")
         incoming, outgoing = {}, {}
         gate = None
+        indexer_groups = {}
         self.incoming[key], self.outgoing[key] = incoming, outgoing
+        self.indexer_groups[key] = indexer_groups
         # Oversized keys keep serial retrieval; this is a startup shape decision.
         if key.token_capacity <= max_cube_tokens and self.pairs:
             try:
@@ -306,18 +356,36 @@ class SharedRetrievalOverlap:
                         pieces=self.pieces, gate=gate,
                     )
                     incoming[following] = outgoing[current] = edge
+                if self.multi_layer:
+                    for group in groups:
+                        consumers = group.members[1:]
+                        if consumers and all(name in incoming for name in consumers):
+                            edges = tuple(incoming[name] for name in consumers)
+                            # This is startup dummy preparation. Move any outstanding
+                            # KV zero-fill ahead of capture and all background writes.
+                            for name, edge in zip(consumers, edges):
+                                state = by_name[name]._staged_sfa_capture_state
+                                if state.initialized_cache_capacity < key.request_capacity:
+                                    for plane in edge.destinations:
+                                        plane[state.initialized_cache_capacity:key.request_capacity].zero_()
+                                    state.initialized_cache_capacity = key.request_capacity
+                            indexer_groups[group.members[0]] = SharedPrefetchGroup(edges)
             except BaseException:
                 self.failed = True
                 raise
 
-    def finish_gate_capture(self, key) -> None:
+    def finish_capture(self, key) -> None:
         edges = self.outgoing[key].values()
         if any(edge.payload is None or edge.pending_join for edge in edges):
-            raise RuntimeError("target graph is missing a gated producer/consumer pair")
+            raise RuntimeError("target graph is missing a prefetch launch or consumer wait")
+        groups = self.indexer_groups[key].values()
         logging.getLogger("vllm.sfa_retrieval_overlap").info(
-            "SFA main-path gate captured for %s: edges=%d vup=%d router=%d pieces_per_transfer=%d",
-            key, len(edges), sum("vup" in e.windows_used for e in edges),
-            sum("router" in e.windows_used for e in edges), self.pieces,
+            "SFA %s captured for %s: edges=%d vup=%d router=%d pieces_per_transfer=%d "
+            "indexer_groups=%d max_consumers_per_indexer=%d qkv_windows=%d",
+            "main-path gate" if self.main_gate else "shared-group prefetch", key, len(edges),
+            sum("vup" in e.windows_used for e in edges), sum("router" in e.windows_used for e in edges),
+            self.pieces, len(groups), max((len(g.edges) for g in groups), default=0),
+            sum("qkv" in e.windows_used for e in edges),
         )
 
     def begin_priority_capture(self, key):
@@ -346,6 +414,7 @@ class SharedRetrievalOverlap:
         # Called only AFTER the root owner synchronizes, including on failure.
         self.incoming.clear()
         self.outgoing.clear()
+        self.indexer_groups.clear()
         self.probe = None
         self.stream = None
         self.failed = False

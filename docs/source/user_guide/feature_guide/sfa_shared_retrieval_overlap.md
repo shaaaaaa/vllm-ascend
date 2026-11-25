@@ -53,7 +53,7 @@ vLLM-Ascend and LMCache-Ascend on `dev-lmy`, rebuild the LMCache-Ascend
 native extension and restart D. The gate uses CANN 8.5.1 stream values and
 a single-consumer Notify.
 
-After producer SFA, the graph forks once. The transfer submits its entire
+In the default one-layer schedule, the graph forks after producer SFA. The transfer submits its entire
 ordered list of K/PE kernels in one native call at capture. Each replay
 balances the current batch's live misses across that list. With the main
 gate enabled, the default is 16 pieces per transfer, configurable with
@@ -85,6 +85,58 @@ and overlap with protected foreground and HCCL AIV tasks. See the
 [decode benchmark](../../../../tools/bench_decode_copy_scheduling.md).
 
 ### Producer and consumer
+
+To queue all shared consumers as soon as their indexer has produced the
+resident plan, add this setting to the D worker's existing overlap configuration
+and restart D.
+
+```bash
+export VLLM_ASCEND_SFA_PREFETCH_MULTI_LAYER=1
+```
+
+The target graph reads the checkpoint's groups of consecutive shared consumers.
+For a producer P followed by A, B and C, it captures this device schedule.
+
+```text
+main    P publishes plan → fork → compute P → wait A → QKV A → … → wait B → QKV B → … → wait C → QKV C
+copy                        └── A(K,PE) → done A → B(K,PE) → done B → C(K,PE) → done C
+```
+
+Each transfer uses the producer's fixed selection buffers and the destination
+layer's own source pointers and KV planes. Each layer waits on its own event
+before its first QKV write. The next full indexer starts a new group. Each
+eligible decode step replays one captured target graph.
+
+With `VLLM_ASCEND_SFA_PREFETCH_MAIN_GATE=1`, V-up, router and the shared
+consumer's fused QKV projection each release the entire copy FIFO. At A's
+QKV entry the main stream opens the gate and waits only for `done A`.
+B and C keep their grant throughout A's projection. A slow B allows A
+to compute immediately once A's KV is ready. A sufficiently fast B and C
+can both finish within A's QKV window. The gate closes before Q layernorm,
+RoPE, SFA and MoE. A close can wait for the residual of one admitted piece.
+The entire FIFO shares one admission word and one Notify per graph key,
+with one open and one close per window at every group depth. Each layer
+uses its existing persistent KV planes.
+Partially eligible groups keep their existing adjacent-layer schedule.
+Setting `VLLM_ASCEND_SFA_PREFETCH_MULTI_LAYER=0` selects that comparison
+for all groups. This switch defaults to 0.
+
+The capture log reports `indexer_groups`, `max_consumers_per_indexer` and `qkv_windows`.
+To check early completion and isolated per-layer waits on one card, run
+the following in the vLLM-Ascend checkout.
+
+```bash
+timeout -k 5s 90s python -m pytest -q --confcutdir=tests/e2e/singlecard -o addopts= \
+  tests/e2e/singlecard/test_sfa_retrieval_overlap.py -k shared_indexer_prefetch_joins_only_its_layer
+```
+
+The registered-host benchmark compares serial, adjacent-layer and group
+prefetch on the same payload and can export their separate MindStudio traces.
+
+```bash
+python tools/sfa_retrieval_overlap_benchmark.py --lmcache-ascend-dir ../LMCache-Ascend \
+  --main-gate --multi-layer --profile-dir group-prefetch-profile
+```
 
 For an eligible edge `L0 -> L1` in the ordinary overlapping schedule:
 
