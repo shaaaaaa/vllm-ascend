@@ -94,6 +94,21 @@ def test_dcp_warms_dense_mixed_exchange_and_draft_variants(warmup, world, dtype)
     }
 
 
+@pytest.mark.parametrize("draft", [False, True])
+def test_owner_warmup_covers_live_signatures(warmup, draft):
+    module, calls = warmup
+    buffers = ((None, (0, 1)), (torch.int32, (4096, 2)))
+    for pub, strides in buffers:
+        module.warmup_owner_topk(2048, pub, strides, torch.int64, draft)
+    expected = {(None, False, False), (torch.int64, True, False)}
+    if draft:
+        expected.update(((torch.int32, True, False), (torch.int32, True, True), (torch.int32, False, True)))
+    for pub, strides in buffers:
+        assert {(a["positions"], a["CAUSAL"], a["REJECT"]) for n, a in calls
+                if n == "_restore_owner_topk" and a["published"] == pub
+                and (a["RAW_STRIDE"], a["RAW_COL_STRIDE"]) == strides} == expected
+
+
 def test_query_and_mapping_cover_real_layouts(warmup):
     module, calls = warmup
     module.warmup_query(8, 512, 64, 192)
@@ -194,6 +209,7 @@ def test_common_startup_selects_used_paths_without_optimization_flags(warmup, mo
 def test_batch_and_history_extents_are_not_specialized():
     parameters = {
         "sfa_dcp.py": {
+            "_restore_owner_topk": {"rows", "actual_rows", "inverse_rows"},
             "_prepare_topk": {"rows", "actual_rows"},
             "_unpack_queries": {"rows"},
             "_pack": {"rows"},

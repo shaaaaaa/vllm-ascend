@@ -22,12 +22,10 @@ def test_target_caller_elides_only_proven_masks(monkeypatch, bounded, shared, so
     path = ROOT / "vllm_ascend/attention/sfa_v1.py"
     tree = ast.parse(path.read_text(encoding="utf-8"))
     method = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "_cross_layer_pre_compute")
-    branch = next(
-        n
-        for n in method.body
-        if isinstance(n, ast.If)
-        and any(isinstance(c, ast.Assign) and ast.unparse(c.targets[0]) == "causal_topk" for c in n.body)
-    )
+    eligibility = next(n for n in method.body
+                       if isinstance(n, ast.Assign) and ast.unparse(n.targets[0]) == "causal_topk")
+    branch = next(n for n in method.body if isinstance(n, ast.If)
+                  and any(isinstance(c, ast.ImportFrom) and c.names[0].name == "prepare_sfa_dcp_topk" for c in n.body))
     qualified = source in ("c8", "local_bf16")
     raw = torch.tensor([[[0, 127, 128, -1]], [[0, 127, 128, -1]]], dtype=torch.int32)
     positions = torch.tensor([128, 128 if qualified else -1])
@@ -52,8 +50,9 @@ def test_target_caller_elides_only_proven_masks(monkeypatch, bounded, shared, so
         topk_indices=raw,
         bounded_decode=bounded,
         group=NS(active=True) if shared else None,
+        owner_rows=None,
     )
-    exec(compile(ast.Module(body=[branch], type_ignores=[]), str(path), "exec"), ns)
+    exec(compile(ast.Module(body=[eligibility, branch], type_ignores=[]), str(path), "exec"), ns)
     assert torch.equal(raw, original) and dcp.counts.eq(-77).all()
     if qualified:
         assert calls == []

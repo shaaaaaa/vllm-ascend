@@ -2736,6 +2736,8 @@ class AscendSFAImpl(MLAAttentionImpl):
         owner_rows=None,
         model_tokens: int = 0,
         dcp_group=None,
+        owner_output: torch.Tensor | None = None,
+        owner_positions: torch.Tensor | None = None,
     ):
         if not self.has_indexer:
             raise RuntimeError(
@@ -2845,10 +2847,21 @@ class AscendSFAImpl(MLAAttentionImpl):
                 sparse_mode=3,
             )
         if owner_rows is not None:
-            topk_indices = owner_rows.restore(topk_indices, dcp_group or get_dcp_group(), model_tokens)
-            draft = getattr(attn_metadata, "sfa_dcp", None)
-            if draft is not None and draft.mask_indexer_writes:
-                topk_indices = torch.where((draft.positions[:model_tokens] >= 0).view(-1, 1, 1), topk_indices, -1)
+            actual_rows = model_tokens
+            reject = False
+            if attn_metadata is not None:
+                owner_dcp = attn_metadata.sfa_dcp
+                actual_rows = attn_metadata.num_actual_tokens
+                owner_positions, reject = owner_dcp.positions, owner_dcp.mask_indexer_writes
+                # Dense and mixed native batches still need local-stripe compaction.
+                if owner_dcp.row_requests is not None and owner_dcp.compact_rows is None:
+                    owner_output = owner_dcp.topk
+            return owner_rows.restore(
+                topk_indices, dcp_group or get_dcp_group(), model_tokens, output=owner_output,
+                positions=owner_positions, actual_rows=actual_rows,
+                published=self.topk_indices_buffer if self.index_cache_enabled else None,
+                reject=reject,
+            )
         return topk_indices
 
     def _execute_sparse_flash_attention_process(
@@ -3522,11 +3535,12 @@ class AscendSFAImpl(MLAAttentionImpl):
             raise RuntimeError("DCP SFA requires contiguous global Top-K rows at the scheduled capacity")
         requests = dcp.local_seq_lens.shape[0]
         compact_rows = dcp.compact_rows
-        prepare_sfa_dcp_topk(
-            topk, dcp.positions, output_topk, dcp.counts, metadata.num_actual_tokens,
-            layout.world_size, layout.rank, self.block_size, local=rows is None,
-            row_requests=rows if compact_rows is not None else None,
-        )
+        if topk is not output_topk:  # A sharded producer can write prepared global IDs directly.
+            prepare_sfa_dcp_topk(
+                topk, dcp.positions, output_topk, dcp.counts, metadata.num_actual_tokens,
+                layout.world_size, layout.rank, self.block_size, local=rows is None,
+                row_requests=rows if compact_rows is not None else None,
+            )
         if rows is None:
             return dcp.empty_payload
         width = self.decode_threshold
@@ -3596,6 +3610,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         resident_reads: list[torch.Tensor] | None = None,
         resident_writes: list[torch.Tensor] | None = None,
         dcp: ResidentDcpLayout | None = None,
+        shared_topk_ready: bool = False,
     ) -> tuple[
         torch.Tensor,
         torch.Tensor | None,
@@ -3613,9 +3628,10 @@ class AscendSFAImpl(MLAAttentionImpl):
                     return plan
                 rows, requests = int(topk_indices.shape[0]), int(request_block_table.shape[0])
                 return (resident_reads[0][:rows], *(t[:requests] for t in resident_reads[1:4]))
-            remapped = plan[0] if resident_writes is None else resident_writes[0][:topk_indices.shape[0]]
-            remapped.copy_(topk_indices.reshape_as(remapped))
-            topk_indices = remapped
+            if not shared_topk_ready:
+                remapped = plan[0] if resident_writes is None else resident_writes[0][:topk_indices.shape[0]]
+                remapped.copy_(topk_indices.reshape_as(remapped))
+                topk_indices = remapped
         if (
             self.dsa_resident_cache
             and need_packed
@@ -3822,6 +3838,14 @@ class AscendSFAImpl(MLAAttentionImpl):
             reads = group.reads if resident_reads is None else resident_reads
             return (ql_nope, q_pe, reads[0][:slot_mapping.shape[0]],
                     *(t[:graph_key.request_capacity] for t in reads[1:4]))
+        # Local target indexers already enforce -1 or ID <= L-Q+j. Draft,
+        # alternate CP and external backends still need the position check.
+        causal_topk = (
+            dcp is not None and self.has_indexer and not self.skip_topk and not self.dsa_cp_decoder
+            and (self.use_sparse_c8_indexer or not self.use_torch_npu_lightning_indexer)
+            and not dcp.mask_indexer_writes
+        )
+        shared_topk_ready = owner_rows is not None and not bounded_decode and group is not None and group.active
         if self.skip_topk:
             # Reuse the current batch's top-k from the shared buffer
             # (GLM-5.2 shared consumers and runtime IndexCache skip layers).
@@ -3832,31 +3856,31 @@ class AscendSFAImpl(MLAAttentionImpl):
                     "skip_topk is False but indexer is None. "
                     f"layer_name={self.layer_name}."
                 )
+            owner_output = None
+            if owner_rows is not None:
+                owner_output = dcp.topk
+                if shared_topk_ready:
+                    storage = group.topk if resident_writes is None else resident_writes[0]
+                    owner_output = storage[:hidden_states.shape[0]]
             topk_indices = self.indexer_select_post_process(
                 x=ix, q_c=q_c, kv_cache=kv_cache, attn_metadata=None,
                 cos=ic, sin=isn, owner_rows=owner_rows, model_tokens=hidden_states.shape[0],
                 actual_seq_lengths_query=cp_query_lens if self.dsa_cp_decoder else actual_seq_lengths_query,
                 actual_seq_lengths_key=cp_key_lens if self.dsa_cp_decoder else actual_seq_lengths_key,
                 indexer_block_table_override=indexer_block_table,
+                **({"owner_output": owner_output, "owner_positions": None if causal_topk else dcp.positions}
+                   if owner_rows is not None else {}),
             )
             if self.dsa_cp_decoder:
                 topk_indices = self._cp_global_topk(topk_indices, slot_mapping.shape[0])
-            if self.index_cache_enabled:
+            if self.index_cache_enabled and owner_rows is None:
                 # Publish this batch's raw top-k BEFORE the remap so downstream
                 # skip-layer graph As in the same step read fresh indices from
                 # the stable shared buffer.
                 self._update_indexcache_topk_indices(topk_indices)
-        if dcp is not None:
+        if dcp is not None and (self.skip_topk or owner_rows is None):
             from vllm_ascend.ops.triton.sfa_dcp import prepare_sfa_dcp_topk
 
-            # Local target indexers emit only -1 or IDs <= L-Q+j, exactly
-            # the target position. Keep draft, alternate CP and unqualified
-            # shared/backend paths on the existing mask contract.
-            causal_topk = (
-                self.has_indexer and not self.skip_topk and not self.dsa_cp_decoder
-                and (self.use_sparse_c8_indexer or not self.use_torch_npu_lightning_indexer)
-                and not dcp.mask_indexer_writes
-            )
             # Packing and the shared producer both own a copy before remapping.
             if not (causal_topk and (bounded_decode or (group is not None and group.active))):
                 prepare_sfa_dcp_topk(
@@ -3903,7 +3927,7 @@ class AscendSFAImpl(MLAAttentionImpl):
             clear_invalid_rows=True,
             resident_reads=resident_reads,
             resident_writes=resident_writes,
-            **({"dcp": dcp.layout} if dcp is not None else {}),
+            **({"dcp": dcp.layout, "shared_topk_ready": shared_topk_ready} if dcp is not None else {}),
         )
         assert selected_packed is not None
         assert selected_count_values is not None
@@ -5120,7 +5144,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                     topk_indices = self._cp_global_topk(topk_indices, attn_metadata.num_input_tokens)
                 if self._layerwise_prefill_p_node and index_lmcache_enabled:
                     record_layerwise_prefill_bank_use(index_layer_name)
-                if self.index_cache_enabled:
+                if self.index_cache_enabled and owner_rows is None:
                     # Publish this batch's top-k so downstream skip layers
                     # read it from the stable shared buffer.
                     self._update_indexcache_topk_indices(topk_indices)

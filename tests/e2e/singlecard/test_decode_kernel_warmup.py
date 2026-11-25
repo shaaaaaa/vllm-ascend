@@ -27,6 +27,42 @@ def device():
     torch.npu.synchronize()
 
 
+@torch.inference_mode()
+def test_owner_topk_replay_changes_owners_and_rejected_rows(monkeypatch):
+    from vllm_ascend.ops.triton import sfa_dcp as ops
+    from vllm_ascend.ops.triton.decode_warmup import warmup_owner_topk
+
+    width, rows = 2048, 6
+    warmup_owner_topk(width, torch.int32, (width, 1), torch.int64, draft=True)
+    guard(monkeypatch, ops._restore_owner_topk)
+    packets = (torch.arange(8 * width, dtype=torch.int32).reshape(8, 1, width) % 2063 - 2).npu()
+    inverse = torch.zeros(rows - 1, dtype=torch.int64, device="npu")
+    positions = torch.zeros(rows, dtype=torch.int32, device="npu")
+    private = torch.empty_like(packets[:rows])
+    raw = torch.empty_like(private[:, 0])
+    graph = torch.npu.NPUGraph()
+    try:
+        with torch.npu.graph(graph):
+            ops.restore_owner_topk(packets, inverse, private, positions, rows - 2, raw, causal=True, reject=True)
+        for owners, pos in (([4, -1, 3, 1, 7], [74, 0, -1, 19, 600, -1]),
+                            ([7, 0, -1, 2, 1], [-1, 500, 30, 7, 350, 10])):
+            inverse.copy_(torch.tensor(owners))
+            positions.copy_(torch.tensor(pos, dtype=torch.int32))
+            graph.replay()
+            expected = torch.full(private.shape, -1, dtype=torch.int32)
+            cpu_packets = packets.cpu()
+            for row, src in enumerate(owners):
+                if src >= 0 and pos[row] >= 0:
+                    expected[row] = cpu_packets[src]
+            torch.testing.assert_close(raw.cpu(), expected[:, 0])
+            expected[(expected < 0) | (expected > torch.tensor(pos)[:, None, None])] = -1
+            expected[rows - 2:] = -1
+            torch.testing.assert_close(private.cpu(), expected)
+    finally:
+        torch.npu.synchronize()
+        graph.reset()
+
+
 @pytest.mark.parametrize("world", [2, 4, 8])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @torch.inference_mode()

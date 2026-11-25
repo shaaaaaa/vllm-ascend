@@ -37,6 +37,53 @@ def store_owner_keys(take, valid, slots, keys, scales, cache):
     )
 
 
+@triton.jit(do_not_specialize=["rows", "inverse_rows", "actual_rows"])
+def _restore_owner_topk(gathered, inverse, positions, output, published, rows, inverse_rows,
+                        actual_rows, WIDTH: tl.constexpr, RAW_STRIDE: tl.constexpr,
+                        RAW_COL_STRIDE: tl.constexpr, CAUSAL: tl.constexpr, REJECT: tl.constexpr, TILE: tl.constexpr):
+    tiles = (WIDTH + TILE - 1) // TILE
+    for item in range(tl.program_id(0), rows * tiles, tl.num_programs(0)):
+        row = item // tiles
+        col = item % tiles * TILE + tl.arange(0, TILE)
+        in_row = True if WIDTH % TILE == 0 else col < WIDTH
+        src = tl.load(inverse + row, row < inverse_rows, -1)
+        # Each tile reads a contiguous slice of one owner's packet.
+        token = tl.load(gathered + tl.where(src >= 0, src, 0) * WIDTH + col, (src >= 0) & in_row, -1)
+        if CAUSAL or REJECT:
+            position = tl.load(positions + row, (row < actual_rows) | REJECT, -1)
+            if REJECT:
+                token = tl.where(position >= 0, token, -1)
+        if published is not None:
+            # Shared consumers need global IDs even after the planner remaps its own copy.
+            tl.store(published + row * RAW_STRIDE + col * RAW_COL_STRIDE, token, in_row)
+        if CAUSAL:
+            token = tl.where((row < actual_rows) & (token >= 0) & (token <= position), token, -1)
+        tl.store(output + row * WIDTH + col, token, in_row)
+
+
+def restore_owner_topk(gathered, inverse, output, positions, actual_rows, published, *, causal, reject):
+    rows, width = output.shape[0], gathered.shape[-1]
+    if output.shape != (rows, 1, width) or not output.is_contiguous():
+        raise ValueError("DCP planner Top-K must have contiguous [rows, 1, K] storage")
+    if causal or reject:
+        needed = rows if reject else min(rows, actual_rows)
+        if positions is None or positions.ndim != 1 or positions.numel() < needed or positions.stride(0) != 1:
+            raise ValueError("DCP Top-K is missing causal positions")
+    if published is not None and (
+        published.ndim not in (2, 3) or (published.ndim == 3 and published.shape[1] != 1)
+        or published.shape[0] < rows or published.shape[-1] < width
+    ):
+        raise ValueError("IndexCache buffer must hold a complete Top-K row per model token")
+    if rows:
+        tile = 256
+        init_device_properties_triton()
+        _restore_owner_topk[(min(rows * triton.cdiv(width, tile), get_vectorcore_num()),)](
+            gathered, inverse, positions, output, published, rows, inverse.numel(), actual_rows,
+            width, published.stride(0) if published is not None else 0,
+            published.stride(-1) if published is not None else 1, causal, reject, tile,
+        )
+
+
 @triton.jit(do_not_specialize=["rows", "actual_rows"])
 def _mask_topk(raw, positions, output, rows, width: tl.constexpr,
                actual_rows, TILE: tl.constexpr):

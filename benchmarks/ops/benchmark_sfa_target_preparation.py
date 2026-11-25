@@ -215,15 +215,16 @@ class Pipeline:
         for cache in self.caches:
             cache.fill_(-7)
 
-    def prepare(self, frame):
+    def prepare(self, frame, *, owner_prepared=False):
         from vllm_ascend.attention.sfa_graph_layout import pack_decode_lanes, unpack_decode_lanes
         from vllm_ascend.ops.triton.sfa_dcp import prepare_sfa_dcp_topk
 
         raw, positions = frame
-        self.published.copy_(raw)  # Producer's raw IndexCache publication.
+        if not owner_prepared:
+            self.published.copy_(raw)
         bounded = self.args.layout != "uniform"
         topk = raw
-        if not (self.optimized and (bounded or self.args.shared_plan)):
+        if not owner_prepared and not (self.optimized and (bounded or self.args.shared_plan)):
             prepare_sfa_dcp_topk(
                 raw,
                 positions,
@@ -259,6 +260,7 @@ class Pipeline:
             need_packed=True,
             clear_invalid_rows=True,
             dcp=self.dcp.layout,
+            shared_topk_ready=owner_prepared and not bounded and self.args.shared_plan,
         )
         if bounded:
             planned = unpack_decode_lanes(planned, inverse, self.rows)

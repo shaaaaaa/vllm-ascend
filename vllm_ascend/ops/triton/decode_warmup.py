@@ -16,6 +16,18 @@ def _compile(kernel, *args, **kwargs):
     kernel.warmup(*args, grid=(1,), **kwargs)
 
 
+def warmup_owner_topk(width, publication, strides, target_position, draft):
+    from vllm_ascend.ops.triton.sfa_dcp import _restore_owner_topk
+
+    i32 = torch.int32
+    variants = {(None, False, False), (target_position, True, False)}
+    if draft:  # The eager MTP builder uses private int32 causal positions.
+        variants.update(((i32, True, False), (i32, True, True), (i32, False, True)))
+    for position, causal, reject in variants:
+        _compile(_restore_owner_topk, i32, torch.int64, position, i32, publication, 1, 1, 1,
+                 width, *strides, causal, reject, 256)
+
+
 def warmup_dcp(width, heads, dtype, world, rank, block, *, draft=False):
     from vllm_ascend.ops.triton.sfa_dcp import _combine, _mask_topk, _pack, _prepare_topk, _unpack_queries
     from vllm_ascend.ops.triton.spec_decode.utils import prepare_dcp_mtp_draft_kernel
@@ -269,6 +281,7 @@ def warmup_decode_kernels(runner):
     from vllm_ascend.attention.sfa_v1 import AscendSFAImpl
 
     seen_queries, seen_rope, seen_owner_keys = set(), set(), set()
+    owner_publications = set()
     for layer in get_layers_from_vllm_config(runner.vllm_config, AttentionLayerBase).values():
         impl = getattr(layer, "impl", None)
         if not isinstance(impl, AscendSFAImpl):
@@ -281,6 +294,9 @@ def warmup_decode_kernels(runner):
             if getattr(runner, "_dcp_indexer_workspace", None) is not None:
                 from vllm_ascend.ops.triton.sfa_dcp import _store_owner_keys
 
+                raw = impl.topk_indices_buffer if impl.index_cache_enabled else None
+                signature = (raw.dtype, (raw.stride(0), raw.stride(-1))) if raw is not None else (None, (0, 1))
+                owner_publications.add((impl.index_topk, *signature))
                 key = impl.c8_k_cache_dtype if impl.use_sparse_c8_indexer else runner.dtype
                 scale = impl.c8_k_scale_cache_dtype if impl.use_sparse_c8_indexer else None
                 if (key, scale, impl.head_dim) not in seen_owner_keys:
@@ -293,6 +309,8 @@ def warmup_decode_kernels(runner):
                 if geometry not in seen_rope:
                     warmup_indexer_rope(*geometry)
                     seen_rope.add(geometry)
+    for width, publication, strides in owner_publications:
+        warmup_owner_topk(width, publication, strides, runner.positions.gpu.dtype, bool(spec_tokens))
     if runner.ascend_config.indexer_hbm_block_map is not None:
         table = runner.input_batch.block_table[1].get_device_tensor()
         warmup_indexer_metadata(table.shape[1], table.stride(0))

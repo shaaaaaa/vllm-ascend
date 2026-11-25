@@ -98,19 +98,29 @@ class OwnerRows:
         local = self.tables[-1 if c8 else 0] if self.tables else table.index_select(0, self.seq)
         return (local, self.ends, torch.where(self.present, lengths.index_select(0, self.seq), 0))
 
-    def restore(self, topk, group, model_tokens):
+    def restore(self, topk, group, model_tokens, *, output=None, positions=None,
+                actual_rows=None, published=None, reject=False):
+        """Publish ordered raw IDs and fill the private planner output in one pass.
+
+        Native dense/mixed batches request raw rows for subsequent local-stripe compaction.
+        """
         import torch.distributed as dist
+
+        from vllm_ascend.ops.triton.sfa_dcp import restore_owner_topk
 
         packet = topk.contiguous()
         gathered = packet.new_empty((group.world_size * packet.shape[0], *packet.shape[1:]))
         dist.all_gather_into_tensor(gathered, packet, group=group.device_group)
-        # Draft running eagerly can have a different padded extent from its target.
-        inverse = self.inverse[:model_tokens]
-        rows = gathered.index_select(0, inverse.clamp_min(0))
-        rows = torch.where((inverse >= 0).view(-1, 1, 1), rows, -1)
-        if rows.shape[0] < model_tokens:
-            rows = torch.nn.functional.pad(rows, (0, 0, 0, 0, 0, model_tokens - rows.shape[0]), value=-1)
-        return rows
+        causal = output is not None and positions is not None
+        if output is None:
+            output = packet.new_empty((model_tokens, *packet.shape[1:]))
+        elif output.shape[0] != model_tokens:
+            raise ValueError("DCP planner and model disagree on the Top-K row count")
+        restore_owner_topk(
+            gathered, self.inverse, output, positions if causal or reject else None,
+            model_tokens if actual_rows is None else actual_rows, published, causal=causal, reject=reject,
+        )
+        return output
 
 
 class OwnerWorkspace:

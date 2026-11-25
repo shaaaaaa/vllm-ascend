@@ -60,6 +60,8 @@ class IndexerPipeline(QueryFirstPipeline):
             c8_k_scale_cache_dtype=torch.float16,
             is_rope_neox_style=False,
             index_topk=TOPK,
+            index_cache_enabled=True,
+            topk_indices_buffer=self.published,
             _mask_staged_index_scatter_padding=AscendSFAImpl._mask_staged_index_scatter_padding,
         )
         for method in ("indexer_select_pre_process", "indexer_select_post_process"):
@@ -115,6 +117,10 @@ class IndexerPipeline(QueryFirstPipeline):
                 )
         else:
             owner.store(slots, keys, scales, self.idx_cache)
+        out = None
+        if owner is not None:
+            out = (self.impl.shared_resident_plan.plans[self.capacity][0]
+                   if self.args.layout == "uniform" and self.args.shared_plan else self.dcp.topk)
         ids = self.indexer.indexer_select_post_process(
             ix,
             q_c,
@@ -128,9 +134,12 @@ class IndexerPipeline(QueryFirstPipeline):
             owner_rows=owner,
             model_tokens=self.tokens,
             dcp_group=self.group,
+            owner_output=out,
         )
-        ids = torch.where((self.rows >= 0).view(-1, 1, 1), ids, -1)
-        return self.prepare((ids, pos))
+        if owner is None:
+            ids = torch.where((self.rows >= 0).view(-1, 1, 1), ids, -1)
+            return self.prepare((ids, pos))
+        return self.prepare((ids, pos), owner_prepared=True)
 
     def snapshot(self, *, include_cache=True):
         slots = self.current_index_slots.index_select(0, self.owned_lanes)
