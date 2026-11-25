@@ -49,15 +49,14 @@ python -m pytest -q --confcutdir=tests/v1 tests/v1/test_sparse_graph_transfer_np
 
 ## Compare serving configurations
 
-### Compare the CANN 8.5.1 MoE gate
+### Compare the CANN 8.5.1 main-path gate
 
-Use the existing 8.5.1 D workers with full target graphs, shared resident
-planning and shared retrieval overlap. Build LMCache-Ascend from the matching
-branch. Set `VLLM_ASCEND_SFA_PREFETCH_MOE_GATE=1` and restart D. With the
-piece count unset this captures eight pieces per eligible background transfer.
-The startup line containing `SFA MoE gate captured` reports the number of
-protected fused MoE calls. A real-data replay smoke test in LMCache-Ascend is
-available with `python -m pytest -q --confcutdir=tests/v1 tests/v1/test_sparse_graph_transfer_npu.py -k moe_gate`.
+Use the existing D workers with full target graphs, shared resident planning
+and shared retrieval overlap. Set `VLLM_ASCEND_SFA_PREFETCH_MAIN_GATE=1`
+and restart D. One copy kernel is the default. The startup line containing
+`SFA main-path gate captured` reports the number of consumer release/join
+windows. The graph protects every operator between producer SFA and consumer
+input norm, including HCCL AIV child work.
 
 Run from the selected D instance's container with its serving Python.
 
@@ -65,15 +64,20 @@ Run from the selected D instance's container with its serving Python.
 python tools/bench_decode_copy_scheduling.py \
   --base-url "$PROXY_URL" --target-d-url "$D_URL" --model "$SERVED_MODEL" \
   --concurrency 16 --prefix-tokens 8192 --output-tokens 128 \
-  --rounds 1 --capture --profile-dir auto --output "results/moe-gate-$(date +%s)"
+  --rounds 1 --capture --profile-dir auto --output "results/main-gate-$(date +%s)"
 ```
 
-To compare against an existing run of the same workload and round count,
-add `--reference results/ungated/metrics.json`. To collect that reference,
-use `VLLM_ASCEND_SFA_PREFETCH_MOE_GATE=0` on D, the deployment's original
-piece count and `--output results/ungated`. Read TPOT and batch makespan
-from the unprofiled rounds and compare `dispatch_to_combine_copy_overlap`
-and `join_wait_for_copy` from the exported per-rank JSON.
+For the main-path policy, `consumer_release_edges` should equal `edges` on
+a trace with participating transfers. Both `edges_overlapping_main_compute`
+and `edges_overlapping_comm_aiv` should be zero. `copy_before_consumer_norm_end`,
+`copy_overlap_main_compute` and `copy_overlap_comm_aiv` give the measured
+device overlap in microseconds. `copy_overlap_other_device_compute` measures
+remaining device compute on other streams. MindStudio shows the root release,
+each side-stream copy and the consumer join.
+
+Use `VLLM_ASCEND_SFA_PREFETCH_MAIN_GATE=0` for the ordinary overlapped
+schedule. To compare timing against an existing run of the same workload,
+add `--reference results/ungated/metrics.json`.
 
 ### Compare native stream priority
 

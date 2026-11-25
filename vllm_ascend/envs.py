@@ -35,10 +35,13 @@ def _strict_bool_env(name: str, default: bool = False) -> bool:
     raise ValueError(f"{name} must be 'true' or 'false', got {raw!r}")
 
 
-def _sfa_prefetch_moe_gate() -> bool:
-    value = os.getenv("VLLM_ASCEND_SFA_PREFETCH_MOE_GATE", "0")
+def _sfa_prefetch_main_gate() -> bool:
+    name = "VLLM_ASCEND_SFA_PREFETCH_MAIN_GATE"
+    if name not in os.environ:
+        name = "VLLM_ASCEND_SFA_PREFETCH_MOE_GATE"
+    value = os.getenv(name, "0")
     if value not in {"0", "1"}:
-        raise ValueError("VLLM_ASCEND_SFA_PREFETCH_MOE_GATE must be 0 or 1")
+        raise ValueError(f"{name} must be 0 or 1")
     return value == "1"
 
 
@@ -196,14 +199,14 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_SFA_SHARED_RETRIEVAL_OVERLAP": lambda: bool(
         int(os.getenv("VLLM_ASCEND_SFA_SHARED_RETRIEVAL_OVERLAP", "0"))
     ),
-    # D only, non-sensitive, restart to recapture. With the MoE gate enabled
-    # use eight pieces by default; an explicit count must be >=2 for this mode.
-    "VLLM_ASCEND_SFA_PREFETCH_PIECES": lambda: int(os.getenv(
-        "VLLM_ASCEND_SFA_PREFETCH_PIECES", "8" if _sfa_prefetch_moe_gate() else "1"
-    )),
-    # 0 (default) or 1. Pause background pieces during fused MoE in the
-    # target decode graph. Non-sensitive; restart D workers after changing.
-    "VLLM_ASCEND_SFA_PREFETCH_MOE_GATE": _sfa_prefetch_moe_gate,
+    # D only, non-sensitive. Positive number of pieces per prefetch, default 1.
+    # Restart to recapture. The exclusive transfer window needs one launch by default.
+    "VLLM_ASCEND_SFA_PREFETCH_PIECES": lambda: int(os.getenv("VLLM_ASCEND_SFA_PREFETCH_PIECES", "1")),
+    # 0 (default) or 1. Release the copy at the consumer after its input norm,
+    # then join before attention. D only, non-sensitive; restart to recapture.
+    "VLLM_ASCEND_SFA_PREFETCH_MAIN_GATE": _sfa_prefetch_main_gate,
+    # Compatibility spelling. An explicit MAIN_GATE value takes precedence.
+    "VLLM_ASCEND_SFA_PREFETCH_MOE_GATE": _sfa_prefetch_main_gate,
     # 0 keeps the existing priority; 1 sets and reads back the graph-owned
     # prefetch queue's lowest device priority at startup (CANN 9.1).
     "VLLM_ASCEND_SFA_PREFETCH_LOW_PRIORITY": lambda: bool(

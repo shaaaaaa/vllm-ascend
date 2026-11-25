@@ -170,6 +170,9 @@ class Timeline:
             gaps.append(stop - cursor)
         return gaps
 
+    def overlap(self, parts):
+        return sum(r.stop - r.start - sum(self.gaps(r.start, r.stop)) for r in parts)
+
 
 def read_controls(path, pid, stream, stages, wanted):
     starts = [s[0] for s in stages]
@@ -225,8 +228,8 @@ def analyze(path, wanted_pid=None, wanted_model=None, wanted_stream=None, expect
     tasks = sorted(devices[pid])
     main = [r for r in tasks if r.stream == stream]
     times = [r.start for r in main]
-    # A gated graph starts with a stream-value write. Choose each model's
-    # first compute task among the retained device rows, also for adjacent graphs.
+    # Graphs may start with stream-control tasks. Anchor each model on its
+    # first compute task, also for adjacent graphs.
     first_task = {}
     for r in main:
         if r.task >= 0 and r.model not in (-1, 4294967295):
@@ -252,6 +255,8 @@ def analyze(path, wanted_pid=None, wanted_model=None, wanted_stream=None, expect
             continue
         norms, sfas, final = valid
         wanted.update(("CAPTURE_WAIT", n.task + 1) for n in norms[1:])
+        wanted.update(("CAPTURE_RECORD", n.task + 1) for n in norms[1:])
+        wanted.update(("CAPTURE_WAIT", n.task + 2) for n in norms[1:])
         wanted.update(("CAPTURE_RECORD", r.task + 1) for r in sfas[:-1])
         stages.append((start, end, norms, sfas, final))
     if not stages:
@@ -268,24 +273,30 @@ def analyze(path, wanted_pid=None, wanted_model=None, wanted_stream=None, expect
     for step, (_, _, norms, sfas, final) in enumerate(stages):
         events = controls[step]
         for i, sfa in enumerate(sfas[:-1]):
-            release = events.get(("CAPTURE_RECORD", sfa.task + 1))
-            join = events.get(("CAPTURE_WAIT", norms[i + 1].task + 1))
-            if not release or not join:
-                # Some layers use main-stream retrieval. A side copy without
-                # a matched fork/join means this graph needs a different mapping.
-                a = bisect.bisect_left(copy_times, sfa.stop)
-                b = bisect.bisect_left(copy_times, sfas[i + 1].start)
-                if a != b:
-                    raise ValueError(f"unmapped asynchronous copy in replay {step} layer {i}")
-                continue
-            ready, deadline = release[1], join[0]
-            if not sfa.stop <= ready <= deadline or deadline < norms[i + 1].stop:
-                raise ValueError(f"inconsistent fork/join timestamps in replay {step} layer {i}")
-            # MindStudio streams can differ by a few timestamp ticks at the fork/join.
-            # Pair by the surrounding SFA interval, then check the control timestamps.
             a = bisect.bisect_left(copy_times, sfa.stop)
             b = bisect.bisect_left(copy_times, sfas[i + 1].start)
             parts = copies[a:b]
+            next_norm = norms[i + 1]
+            late_release = events.get(("CAPTURE_RECORD", next_norm.task + 1))
+            late_join = events.get(("CAPTURE_WAIT", next_norm.task + 2))
+            at_consumer = bool(parts) and late_release is not None and late_join is not None
+            if at_consumer:
+                release, join = late_release, late_join
+            else:
+                release = events.get(("CAPTURE_RECORD", sfa.task + 1))
+                join = events.get(("CAPTURE_WAIT", next_norm.task + 1))
+            if not release or not join:
+                # Some layers use main-stream retrieval. A side copy without
+                # a matched fork/join means this graph needs a different mapping.
+                if parts:
+                    raise ValueError(f"unmapped asynchronous copy in replay {step} layer {i}")
+                continue
+            ready, deadline = release[1], join[0]
+            predecessor = next_norm.stop if at_consumer else sfa.stop
+            if not predecessor <= ready <= deadline or deadline < next_norm.stop:
+                raise ValueError(f"inconsistent fork/join timestamps in replay {step} layer {i}")
+            # MindStudio streams can differ by a few timestamp ticks at the fork/join.
+            # Pair by the surrounding SFA interval, then check the control timestamps.
             if (
                 not parts
                 or len({r.stream for r in parts}) != 1
@@ -293,13 +304,18 @@ def analyze(path, wanted_pid=None, wanted_model=None, wanted_stream=None, expect
                 or max(r.stop for r in parts) > join[1] + 1000
             ):
                 raise ValueError(f"side copy disagrees with the fork/join in replay {step} layer {i}")
-            by_edge[step, i] = ready, deadline, parts
+            by_edge[step, i] = ready, deadline, parts, at_consumer
             background.update(parts)
     rtypes = {r: resource(r.kind, r.name) for r in tasks}
     all_busy = Timeline((r.start, r.stop) for r in tasks)
     foreground = [r for r in tasks if r not in background]
     core = Timeline((r.start, r.stop) for r in foreground)
     vector = Timeline((r.start, r.stop) for r in foreground if rtypes[r] != "cube_matmul")
+    root_core = Timeline((r.start, r.stop) for r in main)
+    side_compute = [r for r in foreground if r.stream != stream]
+    comm_tasks = {r for r in side_compute if r.kind == "COMMUNICATION" and "aivkernel" in r.name.lower()}
+    comm_aiv = Timeline((r.start, r.stop) for r in comm_tasks)
+    other_compute = Timeline((r.start, r.stop) for r in side_compute if r not in comm_tasks)
     dispatch = Timeline((r.start, r.stop) for r in moe)
     samples = []
     for step, (_, _, norms, sfas, final) in enumerate(stages):
@@ -315,10 +331,9 @@ def analyze(path, wanted_pid=None, wanted_model=None, wanted_stream=None, expect
             }
             edge = by_edge.get((step, i))
             if edge:
-                ready, deadline, parts = edge
+                ready, deadline, parts, at_consumer = edge
                 lengths = vector.gaps(ready, deadline)
                 copy = sum(r.stop - r.start for r in parts)
-                dispatch_overlap = sum(r.stop - r.start - sum(dispatch.gaps(r.start, r.stop)) for r in parts)
                 s.update(
                     edge_window=deadline - ready,
                     edge_no_foreground_ai=sum(core.gaps(ready, deadline)),
@@ -330,13 +345,22 @@ def analyze(path, wanted_pid=None, wanted_model=None, wanted_stream=None, expect
                     copy_span=max(r.stop for r in parts) - parts[0].start,
                     join_wait_for_copy=max(0, max(r.stop for r in parts) - deadline),
                     uncovered_if_only_aiv_gaps=max(0, copy - sum(lengths)),
-                    dispatch_overlap=dispatch_overlap,
+                    dispatch_overlap=dispatch.overlap(parts),
+                    copy_overlap_main_compute=root_core.overlap(parts),
+                    copy_overlap_comm_aiv=comm_aiv.overlap(parts),
+                    copy_overlap_other_device_compute=other_compute.overlap(parts),
+                    copy_before_consumer_norm_end=sum(
+                        max(0, min(r.stop, norms[i + 1].stop) - r.start) for r in parts
+                    ),
+                    released_at_consumer=at_consumer,
                     pieces=len(parts),
                     side_stream=parts[0].stream,
                     fit=copy <= sum(lengths),
                     fit_contiguous=copy <= max(lengths, default=0),
                 )
-                ds = moe[bisect.bisect_left(moe_times, ready) : bisect.bisect_left(moe_times, deadline)]
+                # The protected layer still contains MoE when the actual fork
+                # has moved past it. Report zero overlap for those dispatches.
+                ds = moe[bisect.bisect_left(moe_times, sfas[i].stop) : bisect.bisect_left(moe_times, deadline)]
                 if len(ds) == 1:
                     d = ds[0]
                     s["dispatch_device"] = d.stop - d.start
@@ -352,10 +376,11 @@ def analyze(path, wanted_pid=None, wanted_model=None, wanted_stream=None, expect
                             max(0, min(r.stop, end) - max(r.start, d.start)) for r in parts
                         )
                         s["pieces_started_dispatch_to_combine"] = sum(d.start <= r.start < end for r in parts)
-                        s["fork_to_dispatch"] = d.start - ready
                         s["combine_to_join_arrival"] = deadline - end
-                        outside = s["fork_to_dispatch"] + s["combine_to_join_arrival"]
-                        s["copy_excess_outside_dispatch_to_combine"] = max(0, copy - outside)
+                        if not at_consumer:
+                            s["fork_to_dispatch"] = d.start - ready
+                            outside = s["fork_to_dispatch"] + s["combine_to_join_arrival"]
+                            s["copy_excess_outside_dispatch_to_combine"] = max(0, copy - outside)
                     preceding_notify = controls[step].get(("NOTIFY_WAIT", d.task - 1)) or controls[step].get(
                         ("NOTIFY_RECORD", d.task - 1)
                     )
@@ -374,6 +399,10 @@ def analyze(path, wanted_pid=None, wanted_model=None, wanted_stream=None, expect
         "edge_no_foreground_aiv",
         "longest_aiv_gap",
         "copy_device",
+        "copy_overlap_main_compute",
+        "copy_overlap_comm_aiv",
+        "copy_overlap_other_device_compute",
+        "copy_before_consumer_norm_end",
         "margin_to_join",
         "uncovered_if_only_aiv_gaps",
         "dispatch_overlap",
@@ -395,6 +424,7 @@ def analyze(path, wanted_pid=None, wanted_model=None, wanted_stream=None, expect
             "layer": i,
             "replays": len(group),
             "async_to_next": sum("fit" in s for s in group),
+            "released_at_consumer": sum(s.get("released_at_consumer", False) for s in group),
             "fits_total_gap": sum(s.get("fit", False) for s in group),
         }
         for name in layer_fields + edge_fields:
@@ -414,6 +444,9 @@ def analyze(path, wanted_pid=None, wanted_model=None, wanted_stream=None, expect
         "prefetch_layers_zero_based": [r["layer"] for r in layers if r["async_to_next"]],
         "side_streams": sorted({s["side_stream"] for s in edge_samples}),
         "edges": len(edge_samples),
+        "consumer_release_edges": sum(s["released_at_consumer"] for s in edge_samples),
+        "edges_overlapping_main_compute": sum(s["copy_overlap_main_compute"] > 0 for s in edge_samples),
+        "edges_overlapping_comm_aiv": sum(s["copy_overlap_comm_aiv"] > 0 for s in edge_samples),
         "fit_total_aiv_gap": sum(s["fit"] for s in edge_samples),
         "fit_largest_aiv_gap": sum(s["fit_contiguous"] for s in edge_samples),
         "copy_pieces_per_edge": dict(Counter(s["pieces"] for s in edge_samples)),

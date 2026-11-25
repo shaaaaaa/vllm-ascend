@@ -14,7 +14,7 @@ from unittest.mock import Mock
 import pytest
 import torch
 
-from sfa_test_support import definitions, extract, load_module
+from sfa_test_support import extract, load_module
 from test_sfa_full_graph import graph_module as graph_fixture
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -116,104 +116,146 @@ def test_prefetch_pieces_only_split_the_side_transfer(runtime):
     impls["g0l0"]._full_graph_transfers[2].load.assert_not_called()
 
 
-def test_moe_gate_tracks_one_prefetch_and_reopens_before_join(runtime, monkeypatch):
+@pytest.mark.parametrize("pieces", [1, 8])
+def test_main_gate_records_only_consumer_windows(runtime, pieces):
     module, log = runtime
-    def write(word, allowed):
-        log.append(("gate", torch.npu.current_stream().name, word.data_ptr(), allowed))
-
-    monkeypatch.setitem(sys.modules, "lmcache_ascend.c_ops", NS(set_sparse_graph_prefetch_allowed=write))
     groups, impls, caches = topology((3,))
-    owner = module.SharedRetrievalOverlap(pieces=8, moe_gate=True)
+    owner = module.SharedRetrievalOverlap(pieces=pieces, main_gate=True)
     owner.configure(tuple(impls.items()), groups, caches)
-    a, b, large = Key(), Key(query_profile="fixed"), Key(token_capacity=9)
-    for key in (a, b, large):
-        owner.prepare(key, tuple(impls.items()), groups, 4)
-    assert large not in owner.gates
-    gate = owner.gates[a]
-    first, second = owner.outgoing[a].values()
-    assert first.gate is second.gate is gate
-    assert gate.word.data_ptr() != owner.gates[b].word.data_ptr()
-    context = NS(sfa_moe_prefetch_gate=gate)
-    ns = {"get_forward_context": lambda: context}
-    definitions(ROOT / "vllm_ascend/ops/fused_moe/fused_moe.py", ["forward_impl"], ns, class_name="AscendMoERunner")
-    layer = NS(forward_impl=lambda x, logits: log.append(("experts and child join",)) or (x, logits))
+    key, other, large = Key(), Key(query_profile="fixed"), Key(token_capacity=9)
+    for shape in (key, other, large):
+        owner.prepare(shape, tuple(impls.items()), groups, 4)
+    assert not owner.outgoing[large]
     data = torch.zeros((1, 4), dtype=torch.int32)
-    def moe():
-        return ns["forward_impl"](None, layer, data, data, None)
+    for name, edge in owner.outgoing[key].items():
+        assert edge.release_at_consumer and edge.max_aiv_cores == 0
+        assert edge.start is not owner.outgoing[other][name].start
+        edge.transfer.load.side_effect = lambda *a, **kw: log.append(("copy", torch.npu.current_stream().name))
+        log.clear()
+        edge.launch(data, data, data, edge.destinations)
+        assert log == []
+        with pytest.raises(RuntimeError, match="missing a gated producer/consumer pair"):
+            owner.finish_gate_capture(key)
+        # Includes a foreground child stream joined by the model. Neither the
+        # producer nor any intermediate operator has released the copy.
+        log.extend([("V-up",), ("O projection and HCCL join",), ("FFN",), ("next input norm",)])
+        edge.join()
+        log.append(("consumer attention",))
+        assert log == [
+            ("V-up",), ("O projection and HCCL join",), ("FFN",), ("next input norm",),
+            ("record", "main"), ("wait", "transfer"), ("copy", "transfer"),
+            ("record", "transfer"), ("wait", "main"), ("consumer attention",),
+        ]
+        kwargs = {"pieces": 4, "max_aiv_cores": 0} if pieces > 1 else {}
+        edge.transfer.load.assert_called_once_with(data, data, data, **kwargs)
+    owner.finish_gate_capture(key)
+    owner.finish_gate_capture(large)
+    assert all(edge.payload is None for edge in owner.outgoing[other].values())
 
+
+@pytest.mark.parametrize("comm_us,copy_us,side_ready_us", [(3, 500, 0), (500, 3, 0), (25, 100, 800)])
+def test_main_gate_orders_child_work_and_last_piece_by_event(runtime, monkeypatch, comm_us, copy_us, side_ready_us):
+    module, _ = runtime
+    root = torch.npu.current_stream()
+    side, comm = torch.npu.Stream(), torch.npu.Stream(name="HCCL")
+    data = torch.zeros(4)
+    transfer = NS(load=Mock())
+    edge = module.RetrievalEdge(side, transfer, (data,), pieces=2, release_at_consumer=True)
+    clock = {root: 0, side: side_ready_us, comm: 0}
+    records, spans = {}, {}
+
+    # Start a fresh capture. A wait can name only an event recorded in this graph.
+    def record(event, stream):
+        records[event] = clock[stream]
+
+    def wait(stream, event):
+        clock[stream] = max(clock[stream], records[event])
+
+    def task(stream, name, duration):
+        start = clock[stream]
+        clock[stream] += duration
+        spans[name] = (start, clock[stream])
+
+    def load(*args, pieces, max_aiv_cores):
+        assert torch.npu.current_stream() is side and pieces == 2
+        task(side, "first copy piece", copy_us)
+        task(side, "last copy piece", copy_us)
+
+    transfer.load.side_effect = load
+    monkeypatch.setattr(torch.npu.Event, "record", record)
+    monkeypatch.setattr(torch.npu.Stream, "wait_event", wait)
+    task(root, "SFA", 60)
+    edge.launch(data, data, data, (data,))
+    task(root, "projection", 25)
+    begin, end = (torch.npu.Event(enable_timing=False) for _ in range(2))
+    begin.record(root)
+    comm.wait_event(begin)
+    task(comm, "HCCL AIV", comm_us)
+    end.record(comm)
+    root.wait_event(end)
+    task(root, "next input norm", 4)
+    edge.join()
+    task(root, "next attention", 60)
+
+    assert spans["next input norm"][0] == spans["HCCL AIV"][1]
+    assert spans["first copy piece"][0] == max(spans["next input norm"][1], side_ready_us)
+    assert spans["next attention"][0] == spans["last copy piece"][1]
+
+
+def test_failed_copy_never_submits_a_consumer_wait_on_an_unrecorded_done(runtime):
+    module, log = runtime
+    dst = torch.zeros(4)
+    transfer = NS(load=Mock(side_effect=RuntimeError("copy capture failed")))
+    edge = module.RetrievalEdge(torch.npu.Stream(), transfer, (dst,), release_at_consumer=True)
     log.clear()
-    assert moe() == (data, data)
-    assert log == [("experts and child join",)]
-    first.launch(data, data, data, first.destinations)
-    first.transfer.load.assert_called_once_with(data, data, data, max_aiv_cores=12, pieces=4, gate_word=gate.word)
-    with pytest.raises(RuntimeError, match="two prefetch edges"):
-        second.launch(data, data, data, second.destinations)
-    with pytest.raises(RuntimeError, match="missing its consumer join"):
-        owner.finish_gate_capture(a, gate)
-    log.clear()
-    assert moe() == (data, data)
-    layer.forward_impl = Mock(side_effect=ValueError("MoE capture failed"))
-    with pytest.raises(ValueError, match="MoE capture failed"):
-        moe()
-    first.join()
-    closed, opened = (("gate", "main", gate.word.data_ptr(), value) for value in (False, True))
-    assert log == [closed, ("experts and child join",), opened, closed, opened, ("wait", "main")]
-    assert gate.protected_moes == 2 and not owner.gates[b].pending
-    owner.finish_gate_capture(a, gate)
-    owner.clear()
-    assert not owner.gates
+    edge.launch(dst, dst, dst, (dst,))
+    with pytest.raises(RuntimeError, match="copy capture failed"):
+        edge.join()
+    assert log == [("record", "main"), ("wait", "transfer")]
+    assert edge.pending_join
 
 
 @pytest.mark.parametrize("fail", [False, True])
-def test_target_capture_initializes_private_moe_gate_and_restores_context(graph_module, fail):
+def test_target_validates_main_gate_only_after_successful_capture(graph_module, fail):
     module, context, captures, _ = graph_module
     wrapper = module.SFAFullGraph()
-    order = []
-    previous = object()
-    context.sfa_moe_prefetch_gate = previous
-    gate = NS(set_allowed=lambda state: order.append(("write", state)))
-    wrapper.retrieval_overlap = NS(moe_gate=True, gates={"q2": gate},
-                                   finish_gate_capture=lambda *args: order.append(("finish",)))
-    def target(input_ids):
-        assert context.sfa_moe_prefetch_gate is gate
-        order.append(("model",))
-        if fail:
-            raise ValueError("capture aborted")
-        return input_ids
-
+    finish = Mock()
+    wrapper.retrieval_overlap = NS(main_gate=True, finish_gate_capture=finish)
+    target = Mock(side_effect=ValueError("capture aborted") if fail else None)
     data = torch.ones(1)
     if fail:
         with pytest.raises(ValueError, match="capture aborted"):
             wrapper.run(target, input_ids=data)
-        assert order == [("write", True), ("model",)]
+        finish.assert_not_called()
     else:
         wrapper.run(target, input_ids=data)
         wrapper.seal(("q2",))
         context.staged_sfa_graph_dummy_run = False
         wrapper.run(target, input_ids=data)
-        assert captures[0][0].replay.call_count == 1
-        assert order == [("write", True), ("model",), ("finish",)]
-    assert context.sfa_moe_prefetch_gate is previous
+        finish.assert_called_once_with("q2")
+        assert target.call_count == 1 and captures[0][0].replay.call_count == 1
 
 
-def test_moe_gate_configuration(runtime, monkeypatch):
+def test_main_gate_configuration(runtime, monkeypatch):
     module, _ = runtime
     monkeypatch.setitem(sys.modules, "vllm.v1.core.dsa_shared_pool", NS(layerwise_prefill_bank_count=lambda: 4))
     env = load_module(ROOT / "vllm_ascend/envs.py", "sfa_gate_envs", monkeypatch)
-    monkeypatch.delenv("VLLM_ASCEND_SFA_PREFETCH_PIECES", raising=False)
-    monkeypatch.delenv("VLLM_ASCEND_SFA_PREFETCH_MOE_GATE", raising=False)
-    assert not env.VLLM_ASCEND_SFA_PREFETCH_MOE_GATE and env.VLLM_ASCEND_SFA_PREFETCH_PIECES == 1
+    for name in ("PIECES", "MAIN_GATE", "MOE_GATE"):
+        monkeypatch.delenv("VLLM_ASCEND_SFA_PREFETCH_" + name, raising=False)
+    assert not env.VLLM_ASCEND_SFA_PREFETCH_MAIN_GATE
     monkeypatch.setenv("VLLM_ASCEND_SFA_PREFETCH_MOE_GATE", "1")
-    assert env.VLLM_ASCEND_SFA_PREFETCH_MOE_GATE and env.VLLM_ASCEND_SFA_PREFETCH_PIECES == 8
+    assert env.VLLM_ASCEND_SFA_PREFETCH_MAIN_GATE and env.VLLM_ASCEND_SFA_PREFETCH_PIECES == 1
+    monkeypatch.setenv("VLLM_ASCEND_SFA_PREFETCH_MAIN_GATE", "0")
+    assert not env.VLLM_ASCEND_SFA_PREFETCH_MAIN_GATE
+    monkeypatch.setenv("VLLM_ASCEND_SFA_PREFETCH_MAIN_GATE", "1")
+    assert env.VLLM_ASCEND_SFA_PREFETCH_MOE_GATE
     monkeypatch.setenv("VLLM_ASCEND_SFA_PREFETCH_PIECES", "4")
     assert env.VLLM_ASCEND_SFA_PREFETCH_PIECES == 4
-    with pytest.raises(ValueError, match="two prefetch pieces"):
-        module.SharedRetrievalOverlap(1, moe_gate=True)
     with pytest.raises(ValueError, match="LOW_PRIORITY=0"):
-        module.SharedRetrievalOverlap(4, True, moe_gate=True)
-    monkeypatch.setenv("VLLM_ASCEND_SFA_PREFETCH_MOE_GATE", "2")
+        module.SharedRetrievalOverlap(4, True, main_gate=True)
+    monkeypatch.setenv("VLLM_ASCEND_SFA_PREFETCH_MAIN_GATE", "2")
     with pytest.raises(ValueError, match="0 or 1"):
-        _ = env.VLLM_ASCEND_SFA_PREFETCH_MOE_GATE
+        _ = env.VLLM_ASCEND_SFA_PREFETCH_MAIN_GATE
 
 
 def test_priority_identifies_only_one_new_queue_and_verifies_piece_count(monkeypatch):

@@ -277,16 +277,7 @@ class AscendMoERunner(DefaultMoERunner):
         This delegates to the layer's forward_impl method which contains the
         Ascend-specific MoE computation logic.
         """
-        gate = getattr(get_forward_context(), "sfa_moe_prefetch_gate", None)
-        if gate is None or not gate.pending:
-            return layer.forward_impl(hidden_states, router_logits)
-        # Inside the opaque MoE op, so capture records writes around the actual
-        # routed and shared expert streams. The layer joins its child streams.
-        gate.set_allowed(False)
-        try:
-            return layer.forward_impl(hidden_states, router_logits)
-        finally:
-            gate.set_allowed(True)
+        return layer.forward_impl(hidden_states, router_logits)
 
 
 class AscendFusedMoE(FusedMoE):

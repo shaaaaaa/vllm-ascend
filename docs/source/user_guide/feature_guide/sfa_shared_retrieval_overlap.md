@@ -29,7 +29,7 @@ restarting workers. It adds an optional native `max_aiv_cores` argument; the
 vLLM-Ascend native extension does not change for this policy.
 
 Serial/critical-path retrieval uses the automatic hardware/payload-bounded grid.
-Only side-stream prefetch requests `max_aiv_cores=12`. This is a per-launch
+The overlapping side-stream schedule requests `max_aiv_cores=12`. This is a per-launch
 argument, not mutable transfer state, so graph keys sharing a transfer object
 cannot accidentally cap a serial fallback. The graph captures the chosen grid;
 there is no device readback or replay-time Python core selection. This replaces
@@ -38,43 +38,52 @@ latency from about 80 to 140 microseconds in the reported workload.
 
 ## Schedule and integration
 
-### Pause background copy during fused MoE on CANN 8.5.1
+### Give the main decode path priority on CANN 8.5.1
 
-With full graphs, shared resident planning and retrieval overlap enabled on D,
-set the following in each D worker's launch environment and restart it.
+Enable this setting on D with full target graphs, shared resident planning
+and shared retrieval overlap. Restart D to capture the new schedule.
 
 ```bash
-export VLLM_ASCEND_SFA_PREFETCH_MOE_GATE=1
+export VLLM_ASCEND_SFA_PREFETCH_MAIN_GATE=1
 ```
 
-The gate defaults to off. Enabling it selects eight pieces per eligible
-background transfer by default. `VLLM_ASCEND_SFA_PREFETCH_PIECES` overrides
-that count with a value of at least two. Small packed inputs use at most one
-piece per available slot. Leave `VLLM_ASCEND_SFA_PREFETCH_LOW_PRIORITY` at
-its default of zero. Update both Ascend repositories and rebuild the
-LMCache-Ascend native extension before starting the workers.
+The earlier `VLLM_ASCEND_SFA_PREFETCH_MOE_GATE=1` spelling also selects this
+schedule. An explicit `MAIN_GATE` value takes precedence. The default of
+`VLLM_ASCEND_SFA_PREFETCH_PIECES` is one. Explicit piece counts run inside
+the same exclusive window. The transfer uses the native hardware/payload
+grid. A deployment with the preceding LMCache-Ascend extension already built
+only needs the updated vLLM-Ascend Python code and a D worker restart.
 
-The target graph opens a private 64-bit device word before its first fork.
-After SFA, the copy stream checks that word before each piece and can run
-alongside V-up and output projection. At a layer with an outstanding
-prefetch, the main stream closes the word on entry to the fused MoE operator
-and reopens it after expert dispatch, grouped matmul, combine and any shared
-expert stream join. One previously admitted piece can finish in that interval.
-Outer router-logit projection and model-level output processing can overlap
-copy. The next attention layer waits for all pieces before accessing its KV.
-Replay performs the waits and writes on the device. The capture log reports
-the graph key, prefetch edge count, piece limit and number of protected MoEs.
+The target graph records a pair of events per participating edge. On layer
+N, `sfa_forward_post_prefetch` retains the selected token, count and slot
+tensors after sparse attention. At the start of layer N+1's attention,
+`cross_layer_graph_pre` records the release after the input norm. The side
+stream waits for that event, loads K/PE and records completion. The main
+stream waits for completion before QKV, indexer or attention can proceed.
+All these dependencies replay on device. At startup the worker verifies that
+a sentinel destination still has its old value before release and its new
+value after the join.
 
-Use the existing serving benchmark to compare unprofiled TPOT and batch
-makespan, then export a separate MindStudio batch. The per-rank summary
-includes `dispatch_to_combine_copy_overlap`, `pieces_started_dispatch_to_combine_histogram`
-and `join_wait_for_copy`. The first two use the visible dispatch and combine
-kernels as boundaries. The last estimates the exposed copy tail at the next
-attention layer. See the [decode benchmark](../../../../tools/bench_decode_copy_scheduling.md).
+The existing GLM-5.3 rank-0 trace contains 36 complete 78-layer replays.
+Each replay has 57 such edges. Source layer 2 uses dense FFN and the other
+56 use MoE. Both schedules protect V-up, O quantization/projection, the
+HCCL AIV AllReduce and the consumer input norm. Dense layers also protect
+the FFN quantized matmuls, SwiGLU and output AllReduce. MoE layers protect
+the outer router, top-k, dispatch, grouped matmuls and SwiGLU, combine,
+HCCL AIV AllGather, shared-expert projections, output AllReduce and residual
+merge. The single main-stream SDMA output copy in each edge has a median
+duration of 1.24 microseconds and stays in the protected interval.
+
+The capture log reports `SFA main-path gate captured` and the actual window
+count. The per-rank profile summary reports `consumer_release_edges`,
+`copy_before_consumer_norm_end`, `copy_overlap_main_compute` and
+`copy_overlap_comm_aiv`. The first is a count, the others measure device
+time. `copy_overlap_other_device_compute` also includes independent work on
+the profiled NPU. See the [decode benchmark](../../../../tools/bench_decode_copy_scheduling.md).
 
 ### Producer and consumer
 
-For an eligible edge `L0 -> L1` in an active shared resident group:
+For an eligible edge `L0 -> L1` in the ordinary overlapping schedule:
 
 ```text
 main:      retrieve L0 -> SFA L0 -> record start -> V projection/O projection/MLP -> wait done -> pre L1

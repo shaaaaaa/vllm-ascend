@@ -14,35 +14,44 @@ ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT))
 
 
-def test_native_capture_contract():
+@pytest.mark.parametrize("main_gate", [False, True], ids=["early_fork", "consumer_gate"])
+def test_native_capture_contract(main_gate):
     from vllm_ascend.compilation.sfa_retrieval_overlap import CaptureProbe
     torch.npu.set_device(0)
     stream = torch.npu.Stream()
-    probes = [CaptureProbe(stream, torch.device("npu:0")) for _ in range(2)]
+    probes = [CaptureProbe(stream, torch.device("npu:0"), release_at_consumer=main_gate) for _ in range(2)]
     try:
         for probe in probes:
             probe.verify()
         for iteration in range(32):
             probe = probes[iteration % 2]
             probe.source.fill_(iteration)
+            if main_gate:
+                probe.dest.fill_(-iteration - 2)
             probe.graph.replay()
             done = torch.npu.Event()
             done.record()
             done.synchronize()  # Main completion must cover side-stream work.
             assert torch.equal(probe.observed.cpu(), torch.full((64,), float(iteration)))
+            if main_gate:
+                assert torch.equal(probe.before_release.cpu(), torch.full((64,), float(-iteration - 2)))
     finally:
         torch.npu.synchronize()
 
 
-@pytest.mark.parametrize("requests", [1, 8, 16])
+@pytest.mark.parametrize("requests,main_gate", [(1, False), (8, False), (16, False), (8, True)])
 @pytest.mark.parametrize("query_rows", [1, 2])
-def test_registered_sources_consumer_boundary_and_replay(requests, query_rows):
+def test_registered_sources_consumer_boundary_and_replay(requests, query_rows, main_gate):
     root = Path(os.environ.get("LMCACHE_ASCEND_SOURCE_DIR", str(ROOT.parent / "LMCache-Ascend")))
     if not (root / "benchmark/v1/kv_transfer/load_benchmark_utils.py").exists():
         pytest.fail("set LMCACHE_ASCEND_SOURCE_DIR to the matching LMCache-Ascend source checkout")
     sys.path.insert(0, str(ROOT / "tools"))
     from sfa_retrieval_overlap_benchmark import Workload
     workload = Workload(root, requests, query_rows)
+    if main_gate:
+        for edge in workload.edges:
+            edge.release_at_consumer = True
+            edge.max_aiv_cores = 0
     was_enabled = gc.isenabled()
     gc.disable()
     try:

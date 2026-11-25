@@ -389,20 +389,15 @@ class SFAFullGraph:
             graph = torch.npu.NPUGraph()
             previous_capturing = context.capturing
             owner = self.retrieval_overlap
-            gate = owner.gates.get(key) if getattr(owner, "moe_gate", False) else None
-            previous_gate = getattr(context, "sfa_moe_prefetch_gate", None)
             context.sfa_full_graph_active = True
             context.capturing = True
             try:
                 pool = self.graph_pool if self.graph_pool is not None else current_platform.get_global_graph_pool()
                 with torch.npu.graph(graph, pool=pool):
                     tracker = owner.begin_priority_capture(key) if getattr(owner, "low_priority", False) else None
-                    if gate is not None:
-                        context.sfa_moe_prefetch_gate = gate
-                        gate.set_allowed(True)  # Root initialization precedes every side-stream fork.
                     output = runnable(**kwargs)
-                if gate is not None:
-                    owner.finish_gate_capture(key, gate)
+                if getattr(owner, "main_gate", False):
+                    owner.finish_gate_capture(key)
                 if tracker is not None:
                     owner.finish_priority_capture(key, tracker)
             except BaseException:
@@ -410,8 +405,6 @@ class SFAFullGraph:
                     self._submission_failed = True
                 raise
             finally:
-                if gate is not None:
-                    context.sfa_moe_prefetch_gate = previous_gate
                 context.sfa_full_graph_active = False
                 context.capturing = previous_capturing
             self.entries[key] = SFAFullGraphEntry(graph, output, signature)
