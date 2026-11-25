@@ -533,7 +533,7 @@ class CorrectnessProbe:
 
             return logits
 
-        self.patch(drafter, "_run_mtp_draft_layer_with_diagnostics", draft_factory)
+        self.patch(drafter, "_run_mtp_draft_layer", draft_factory)
         self.patch(model, "compute_logits", logits_factory)
 
     def install(self, sfa, torch_npu, connector_module, page_type):

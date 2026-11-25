@@ -3,6 +3,7 @@
 import ast
 import gc
 import symtable
+import sys
 import weakref
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
@@ -212,8 +213,8 @@ def runtime(monkeypatch):
                                         current_stream=lambda: current[0],
                                         NPUGraph=Mock(side_effect=AssertionError("synthetic startup graph"))),
                         raising=False)
+    monkeypatch.setitem(sys.modules, "torch_npu", NS(npu_transpose_batchmatmul=Mock()))
     module = load_module(ROOT / "vllm_ascend/compilation/sfa_retrieval_overlap.py", "overlap_test", monkeypatch)
-    monkeypatch.setattr(torch.ops._C_ascend, "batch_matmul_transpose", Mock(), raising=False)
     return module, log
 
 
@@ -763,3 +764,14 @@ def test_compile_before_kv_initialization_keeps_prefetch_dispatch(full_graph):
     impl._retrieval_overlap = NS()
     # Execute the already-compiled callable, as the no-guards runner does.
     torch.testing.assert_close(compiled(x), x + 2)
+
+
+def test_native_projection_capability_controls_overlap(runtime, monkeypatch):
+    module, log = runtime
+    monkeypatch.delattr(module.torch_npu, "npu_transpose_batchmatmul")
+    groups, impls, caches = topology()
+    owner = module.SharedRetrievalOverlap()
+    owner.configure(tuple(impls.items()), groups, caches)
+    owner.prepare(Key(), tuple(impls.items()), groups, 1024)
+    assert owner.edges(Key()) == ({}, {})
+    assert owner.stream is None and not log

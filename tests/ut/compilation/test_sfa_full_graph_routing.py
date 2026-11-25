@@ -41,7 +41,7 @@ def routing():
         AscendAttentionState=states,
         staged_sfa_graph_configured=lambda _: True,
         has_kv_transfer_group=lambda: False,
-        cold_perf_enabled=lambda: False,
+        cold_perf_detailed_enabled=lambda: False,
         parent_process=lambda: object(),  # Fixture represents a worker child.
         record_function_or_nullcontext=lambda name: nullcontext(),
     )

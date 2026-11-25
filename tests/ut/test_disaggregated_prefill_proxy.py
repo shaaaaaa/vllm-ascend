@@ -368,6 +368,7 @@ class TestProxyColdPerfLogging(unittest.TestCase):
         )
         self.assertEqual(decoder.decoder_rank_active_tokens, {3: 0.0})
 
+    @patch.object(proxy, "_proxy_cold_perf_enabled", new=lambda: True)
     def test_decoder_placement_discovery_failure_retries(self):
         decoder = SimpleNamespace(
             url="http://decoder:8002/v1",
@@ -701,6 +702,7 @@ class TestProxyColdPerfLogging(unittest.TestCase):
         )
         self.assertNotIn("kv_transfer_params", request_data)
 
+    @patch.object(proxy, "_proxy_cold_perf_enabled", new=lambda: True)
     def test_instance_selection_logs_handoff_boundaries(self):
         request_id = "request-uuid"
         prefiller = SimpleNamespace(
@@ -1051,6 +1053,7 @@ class TestProxyColdPerfLogging(unittest.TestCase):
         )
         state.release_prefiller_kv.assert_called_once_with(0, 100.0)
 
+    @patch.object(proxy, "_proxy_cold_perf_enabled", new=lambda: True)
     def test_affinity_reserves_decoder_before_prefill_and_strips_hint(self):
         request_id = "request-uuid"
         order = []
@@ -1326,6 +1329,7 @@ class TestProxyColdPerfLogging(unittest.TestCase):
         state.release_decoder_reservation.assert_called_once_with(reservation)
         self.assertIsNone(instance_info.reservation)
 
+    @patch.object(proxy, "_proxy_cold_perf_enabled", new=lambda: True)
     def test_decoder_stream_logs_actual_send_start(self):
         class Response:
             @staticmethod
@@ -1494,6 +1498,7 @@ class TestProxyColdPerfLogging(unittest.TestCase):
             "3",
         )
 
+    @patch.object(proxy, "_proxy_cold_perf_enabled", new=lambda: True)
     def test_streaming_response_logs_lazy_generator_entry(self):
         request = SimpleNamespace(
             json=AsyncMock(return_value={"prompt": "hello", "stream": True}),

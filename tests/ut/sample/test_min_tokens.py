@@ -25,9 +25,8 @@ def modules(monkeypatch):
         spec.loader.exec_module(module)
         return module
 
-    diagnostics = load("vllm_ascend.sample.rejection_diagnostics", "vllm_ascend/sample/rejection_diagnostics.py")
     masks = load("tested_ascend_min_tokens", "vllm_ascend/sample/min_tokens.py")
-    return masks, diagnostics
+    return masks, None
 
 
 def processor(min_toks):
@@ -237,35 +236,6 @@ def test_cache_is_not_consumed_on_another_stream_or_device(modules, monkeypatch,
     assert owner._ascend_spec_mask_indices is not previous
     assert backend.uploads == 2
     backend.drain()
-
-
-def test_stages_split_upload_and_mask_and_leave_normal_path_untimed(modules):
-    masks, diagnostics = modules
-    stages = []
-
-    def record(name, operation, args, kwargs):
-        stages.append(name)
-        return operation(*args, **kwargs)
-
-    owner = processor({0: (4, [], {1})})
-    token = diagnostics.set_stage_recorder(record)
-    try:
-        masks.apply_with_spec_decode(owner, torch.zeros(1, 7), [1])
-        assert stages == [
-            "min_tokens.layout",
-            "min_tokens.allocate",
-            "min_tokens.fill",
-            "min_tokens.h2d",
-            "min_tokens.mask",
-        ]
-        stages.clear()
-        masks.apply_with_spec_decode(owner, torch.zeros(1, 7), [1])
-        assert stages == ["min_tokens.layout", "min_tokens.mask"]
-    finally:
-        diagnostics.reset_stage_recorder(token)
-    stages.clear()
-    masks.apply_with_spec_decode(owner, torch.zeros(1, 7), [1])
-    assert not stages
 
 
 def test_failed_upload_is_propagated_without_publishing_bad_cache(modules, monkeypatch):

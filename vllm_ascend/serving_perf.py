@@ -51,6 +51,10 @@ def cold_perf_enabled() -> bool:
     return _COLD_PERF_ENABLED
 
 
+def cold_perf_detailed_enabled() -> bool:
+    return _COLD_PERF_MODE in ("detail", "device")
+
+
 def cold_perf_device_timing_enabled() -> bool:
     """Whether explicit device-event diagnostics were selected at startup."""
     return _COLD_PERF_DEVICE_TIMING_ENABLED
@@ -63,7 +67,7 @@ def _non_json_field(_value: Any) -> str:
 
 
 def mark_cold_perf_requests(request_ids: Any) -> None:
-    if not cold_perf_enabled():
+    if not cold_perf_detailed_enabled():
         return
     if isinstance(request_ids, str):
         _cold_perf_request_ids.add(request_ids)
@@ -73,7 +77,7 @@ def mark_cold_perf_requests(request_ids: Any) -> None:
 
 def mark_cold_perf_connector_requests(metadata: Any) -> None:
     """Mark LMCache cold-compact resumes carried by connector metadata."""
-    if not cold_perf_enabled():
+    if not cold_perf_detailed_enabled():
         return
     mark_cold_perf_requests(
         request.req_id
@@ -108,6 +112,8 @@ def log_cold_perf_event(
 ) -> None:
     if not cold_perf_enabled():
         return
+    if not cold_perf_detailed_enabled() and not event.endswith(("_slow", "_error")):
+        return
     ids = [request_id] if request_id is not None else list(request_ids or ())
     ids = [str(req_id) for req_id in ids if req_id is not None]
     if require_active:
@@ -138,6 +144,8 @@ def log_cold_perf_event(
 
 def log_cold_perf_process_event(event: str, **fields: Any) -> None:
     """Log a process-level anomaly that is not tied to a marked request."""
+    if not cold_perf_detailed_enabled() and not (event.endswith("_slow") or event == "decoder_submission_gap"):
+        return
     if not cold_perf_enabled():
         return
     payload = {

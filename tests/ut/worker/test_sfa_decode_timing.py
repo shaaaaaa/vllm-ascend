@@ -539,49 +539,6 @@ def test_sampling_device_event_stride_does_not_change_host_coverage(timing_modul
     assert timing.detail_device_sample is expected
 
 
-@pytest.mark.parametrize("failure", [False, True])
-def test_sampling_hooks_use_real_scoped_recorder_and_restore_on_failure(timing_module, monkeypatch, failure):
-    path = ROOT / "vllm_ascend/sample/rejection_diagnostics.py"
-    name = "vllm_ascend.sample.rejection_diagnostics"
-    spec = importlib.util.spec_from_file_location(name, path)
-    recorder = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(recorder)
-    monkeypatch.setitem(sys.modules, name, recorder)
-    sampler = SimpleNamespace(
-        **{
-            method: Mock(side_effect=lambda value: value + 1)
-            for method in ("apply_logits_processors", "sample", "gather_logprobs")
-        }
-    )
-    original_method = sampler.sample
-
-    def sample(value):
-        output = recorder.record_stage("bonus_sampler", sampler.sample, value)
-        if failure:
-            raise ValueError("original sample error")
-        return output
-
-    runner = SimpleNamespace(_sample=sample, sampler=sampler)
-    timing = timing_module.DecodeTiming(event_factory=Mock(side_effect=AssertionError("Unsampled step")))
-    timing.decode_steps = 5  # Host-only sample: no event allocation.
-    timing_module.install_sampling_timing(runner, timing)
-    try:
-        for active in (False, True):
-            timing.active = active
-            if failure:
-                with pytest.raises(ValueError, match="original sample error"):
-                    runner._sample(8)
-            else:
-                assert runner._sample(8) == 9
-            assert not recorder.stage_recorder_active()
-            if not active:
-                assert not timing.scopes
-        assert timing.report()["stages"]["sampling.bonus_sampler"]["wall"]["count"] == 1
-        assert timing.report()["stages"]["sampling.sampler.sample"]["wall"]["count"] == 1
-        assert original_method.call_count == 2  # Never sample twice for a probe.
-    finally:
-        timing.close()
-    assert runner._sample is sample and sampler.sample is original_method
 
 
 @pytest.mark.parametrize("supported", [False, True])

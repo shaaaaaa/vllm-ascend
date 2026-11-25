@@ -243,69 +243,12 @@ def test_reference_snapshots_with_mixed_feature_limits_align_to_common_prefix(tm
     assert report["compared_rows"] == 5
 
 
-@pytest.mark.parametrize(
-    "sampled_side,status", [("reference", "outside_reference_sample"), ("candidate", "outside_candidate_sample")]
-)
-def test_sampled_scope_does_not_claim_unobserved_rows_are_missing_or_checked(tmp_path, sampled_side, status):
-    for side in ("reference", "candidate"):
-        directory = make_worker(tmp_path / side, context=list(range(8200)))
-        if side == sampled_side:
-            sample_worker(directory)
-    report = run(tmp_path)
-    assert report["status"] == "analysis_complete", report
-    assert report["compared_rows"] == 64 + 64 + 8
-    assert report["counts"][status] == 1
-    capture = report["capture_sampling"][sampled_side]
-    assert capture["sampled_tensors"] == 1
-    assert capture["omitted_token_rows"] == 8200 - 136
-    assert report["accuracy_verdict"] == "not_assessed"
 
 
-def test_pd_comparison_uses_identical_absolute_positions_from_two_chunks(tmp_path):
-    p = make_worker(
-        tmp_path / "reference",
-        role="P",
-        context=list(range(8200)),
-        batches=[list(range(4096)), list(range(4096, 8200))],
-    )
-    d = make_worker(
-        tmp_path / "candidate",
-        role="D",
-        context=list(range(8200)),
-        kind="kv_consumed",
-        batches=[[0, 10, 63, 100, 4096, 4159, 5000, 8195, 8199]],
-        delta=0.25,
-    )
-    sample_worker(p)
-    sample_worker(d)
-    report = run(tmp_path, mode="pd-kv")
-    assert report["status"] == "analysis_complete", report
-    assert report["compared_rows"] == 7
-    assert report["first_difference"]["position"] == 0
-    assert report["issues"] == 0
 
 
-def test_sampling_does_not_hide_missing_tensor_files(tmp_path):
-    p = make_worker(tmp_path / "reference", context=list(range(200)))
-    make_worker(tmp_path / "candidate", context=list(range(200)))
-    sample_worker(p)
-    (p / read_records(p)[0]["path"]).unlink()
-    report = run(tmp_path)
-    assert report["status"] == "incomplete_or_incomparable"
-    assert report["issues"] > 0
 
 
-@pytest.mark.parametrize("field,value", [("saved_rows", 65), ("source_indices", [199] * 64), ("limit", 32)])
-def test_inconsistent_sampling_metadata_is_not_silently_accepted(tmp_path, field, value):
-    for side in ("reference", "candidate"):
-        directory = make_worker(tmp_path / side, context=list(range(200)))
-        sample_worker(directory)
-    records = read_records(directory)
-    records[0]["row_capture"][field] = value
-    write_records(directory, records)
-    report = run(tmp_path)
-    assert report["status"] == "incomplete_or_incomparable"
-    assert report["issues"] > 0
 
 
 def test_pd_compares_mtp_prompt_kv_with_shifted_context_and_excludes_generated_boundary(tmp_path):
@@ -1016,47 +959,6 @@ def test_additional_optional_tensors_are_compared(tmp_path):
     assert report["status"] == "analysis_complete"
 
 
-def test_real_request_archive_schema_roundtrip(tmp_path):
-    module_path = MODULE.parents[1] / "vllm_ascend" / "pd_tensor_dump.py"
-    spec = importlib.util.spec_from_file_location("pd_dump_for_analyzer_test", module_path)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    for name, role, kind in (("reference", "P", "kv_current"), ("candidate", "D", "kv_consumed")):
-        archive = module.RequestArchive(
-            tmp_path / name,
-            dict(
-                host="host",
-                pid=1,
-                tp_rank=0,
-                tp_size=1,
-                dp_rank=0,
-                dp_size=1,
-                role=role,
-                request_id="真实/request",
-                internal_request_id="internal",
-                model_id="glm",
-                num_layers=1,
-                layerwise_prefill=role == "P",
-                prompt_token_ids=[10, 11],
-            ),
-        )
-        call = archive.begin(
-            dict(
-                phase="prefill" if role == "P" else "decode",
-                positions=[0, 1],
-                token_ids=[10, 11],
-                context_token_ids=[10, 11],
-                context_complete=True,
-            ),
-            [dict(layer=0, kind=kind, name="nope")],
-        )
-        archive.record(torch.arange(4).reshape(2, 2), call, 0, kind, "nope", [0, 1])
-        write_sampled(archive.root, [{"after_call": 0, "token_ids": [99]}])
-        archive.end(call, {(0, kind, "nope")})
-        archive.finish()
-    report = run(tmp_path, mode="pd-kv")
-    assert report["status"] == "analysis_complete"
-    assert report["counts"]["equal"] == 1
 
 
 def test_accepted_outputs_align_by_token_order_not_sampling_batch(tmp_path):

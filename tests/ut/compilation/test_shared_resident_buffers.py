@@ -65,7 +65,6 @@ def test_ascend_aot_keeps_group_storage_without_clones(
     producer.cross_layer_graph_pre = consumer.cross_layer_graph_pre = pre
     ns["get_forward_context"] = lambda: NS(sfa_full_graph_active=True)
     for impl in (producer, consumer):
-        impl._staged_graph_content_diagnostic_enabled = lambda _: False
         impl._shared_retrieval_edges = lambda: ({}, {})
         impl.cross_layer_lmcache_retrieve = lambda *args: None
 

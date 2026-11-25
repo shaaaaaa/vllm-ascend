@@ -285,7 +285,7 @@ def install_dummy_prefill_store(stage=0):
             sync=sync,
             deferred_layerwise_put=True,
             layerwise_prefill_incremental=True,
-            layerwise_prefill_bank_count=2,
+            layerwise_prefill_bank_count=self._layerwise_prefill_bank_count,
             **dma_kwargs,
             req_id=request.req_id,
             **store_kwargs,

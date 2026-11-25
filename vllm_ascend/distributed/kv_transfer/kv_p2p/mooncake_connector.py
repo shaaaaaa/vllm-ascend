@@ -75,16 +75,6 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.live_split_protocol import (
 )
 from vllm_ascend.distributed.kv_transfer.utils.mooncake_transfer_engine import global_te
 from vllm_ascend.distributed.kv_transfer.utils.utils import get_transfer_timeout_value
-from vllm_ascend.serving_perf import (
-    cold_perf_enabled,
-    log_cold_perf_process_event,
-    mark_cold_perf_requests,
-)
-from vllm_ascend.lmcache_diagnostics import (
-    fingerprint_compact_group1,
-    npu_content_diagnostics_enabled,
-    register_group1_source_fingerprint,
-)
 from vllm_ascend.utils import enable_custom_op, is_vl_model
 
 # isort: off
@@ -109,70 +99,6 @@ MAX_SPLIT_TRANSFER_ID_LENGTH = 64
 SPLIT_DONE_MAX_ATTEMPTS = 3
 CONTROL_ACK_MAX_ATTEMPTS = 3
 THREAD_SHUTDOWN_TIMEOUT = 30.0
-def _cold_live_log(event: str, **fields: Any) -> None:
-    if not cold_perf_enabled():
-        return
-    request_ids = fields.get("request_ids")
-    request_id = fields.get("req_id")
-    if request_id is not None:
-        mark_cold_perf_requests((request_id,))
-    if request_ids:
-        mark_cold_perf_requests(request_ids)
-    log_cold_perf_process_event(event, **fields)
-
-
-def _fingerprint_live_group1_destination(
-    *,
-    req_id: str,
-    transfer_id: str | None,
-    tp_rank: int,
-    dp_rank: int,
-    kv_caches: dict[str, Any],
-    layout: "SplitCompactLayout | None",
-    expected: dict[str, Any] | None,
-) -> None:
-    """Call the optional LMCache-Ascend diagnostic after synchronous DMA."""
-    if (
-        layout is None
-        or expected is None
-        or not npu_content_diagnostics_enabled()
-    ):
-        return
-    try:
-        owners: list[torch.Tensor] = []
-        for cache_or_caches in kv_caches.values():
-            if isinstance(cache_or_caches, torch.Tensor):
-                owners.append(cache_or_caches)
-            else:
-                owners.extend(
-                    cache
-                    for cache in cache_or_caches
-                    if isinstance(cache, torch.Tensor)
-                )
-        fingerprint_compact_group1(
-            event="group1_destination_fingerprint",
-            req_id=req_id,
-            transfer_id=transfer_id,
-            owners=owners,
-            layers=layout.layers,
-            runs=layout.runs,
-            token_count=layout.token_count,
-            chunk_size=0,
-            tp_rank=tp_rank,
-            dp_rank=dp_rank,
-            sample_layer_ids=expected["sample_layer_ids"],
-            sample_logical_tokens=expected["sample_logical_tokens"],
-            expected=expected,
-        )
-        register_group1_source_fingerprint(req_id, expected)
-    except Exception:
-        # Diagnostics must never turn a successful transfer into a fallback or
-        # failed request.  The content module emits detailed errors for normal
-        # fingerprint failures; this catches import/integration errors.
-        logger.warning(
-            "Failed to emit optional Group-1 destination fingerprint",
-            exc_info=True,
-        )
 
 
 class RemotePortInfo(TypedDict):
@@ -911,7 +837,6 @@ class KVCacheRecvingThread(threading.Thread):
 
     def _transfer_kv_cache(self, req_meta: dict[str, Any]):
         """Handle a KV cache transfer request."""
-        remote_request_id = req_meta["remote_request_id"]
         remote_block_ids = req_meta["remote_block_ids"]
         local_block_ids = req_meta["local_block_ids"]
         remote_engine_id = req_meta["remote_engine_id"]
@@ -951,7 +876,6 @@ class KVCacheRecvingThread(threading.Thread):
             remote_block_ids = list(map(lambda x: [x], remote_block_ids))
             local_block_ids = list(map(lambda x: [x], local_block_ids))
             grouped_remote_block_ids, grouped_local_block_ids = remote_block_ids, local_block_ids
-        num_transfer_groups = len(grouped_remote_block_ids)
         # tp_num_need_pulls: number of KV caches each Decode node needs to pull from each PP stage
         # Due to GQA, different KV heads are distributed across different ranks, so there are offsets
         # indicating which KV head to pull
@@ -985,11 +909,7 @@ class KVCacheRecvingThread(threading.Thread):
         ]
         logger.debug(f"transfer kv cache first_layer_index:{first_layer_index} , end_layer_index:{end_layer_index}")
         remote_transfer_port = self.remote_te_port[remote_engine_id][remote_handshake_port]
-        num_blocks = len(local_block_ids)
         session_id = f"{remote_host}:{remote_transfer_port}"
-
-        perf_enabled = cold_perf_enabled()
-        req_start_time = time.perf_counter() if perf_enabled else 0.0
         src_list, dst_list, length_list = [], [], []
         block_length = len(self.block_len)
         for k, (src_layer_base_addr, dst_layer_base_addr) in enumerate(
@@ -1009,21 +929,6 @@ class KVCacheRecvingThread(threading.Thread):
         if ret < 0:
             logger.error("Mooncake transfer failed for request %s", req_meta["remote_request_id"])
             raise RuntimeError(f"Mooncake transfer failed, ret: {ret}")
-
-        if perf_enabled:
-            req_end_time = time.perf_counter()
-            req_transfer_elapsed = (req_end_time - req_start_time) * 1000
-            logger.info(
-                "KV cache transfer for request %s took %.2f ms (%d groups,"
-                " %d blocks). local_ip %s local_device_id %s remote_session_id %s",
-                remote_request_id,
-                req_transfer_elapsed,
-                num_transfer_groups,
-                num_blocks,
-                get_ip(),
-                self.tp_rank,
-                session_id,
-            )
 
         # Determine if the current position is the offset position at the end of
         # the KV transmission.
@@ -1104,12 +1009,8 @@ class KVCacheRecvingThread(threading.Thread):
     def _transfer_split_destinations(
         self, req_meta: dict[str, Any], plan: SplitTransferPlan
     ) -> None:
-        perf_enabled = cold_perf_enabled()
-        transfer_started = time.perf_counter() if perf_enabled else 0.0
         compact = plan.compact_source is not None
         latent = plan.latent_source is not None
-        diagnostic_destination = plan.compact_destination
-        content_diagnostics = plan.content_diagnostics
         local_dp_rank = int(
             getattr(
                 self.vllm_config.parallel_config,
@@ -1166,11 +1067,6 @@ class KVCacheRecvingThread(threading.Thread):
                 for left, right in zip(page_ranges, page_ranges[1:])
             ):
                 raise RuntimeError("Latent destination pages overlap")
-        if perf_enabled:
-            compact_source_runs = len(plan.compact_source.runs) if plan.compact_source is not None else 0
-            compact_destination_runs = len(plan.compact_destination.runs) if plan.compact_destination is not None else 0
-            latent_layer_count = len(plan.latent_source.layers) if plan.latent_source is not None else 0
-            latent_page_count = len(plan.latent_destination_pages) if plan.latent_source is not None else 0
         remote_host = req_meta["remote_host"]
         remote_port = req_meta["remote_handshake_port"]
         remote_engine_id = req_meta["remote_engine_id"]
@@ -1236,22 +1132,6 @@ class KVCacheRecvingThread(threading.Thread):
             or latent
         ):
             plan = self._expand_compact_split_plan(plan)
-        expanded_at = time.perf_counter() if perf_enabled else 0.0
-        if perf_enabled:
-            _cold_live_log(
-                "live_source_native_transfer_entry",
-                req_id=req_meta.get("request_id"),
-                transfer_id=req_meta.get("split_transfer_id"),
-                segment_count=len(plan.segments),
-                requested_groups=plan.requested_groups,
-                group_byte_totals=plan.group_byte_totals,
-                compact=compact,
-                compact_source_runs=compact_source_runs,
-                compact_destination_runs=compact_destination_runs,
-                latent=latent,
-                latent_layer_count=latent_layer_count,
-                latent_page_count=latent_page_count,
-            )
         totals = [0, 0]
         split_native_groups = len(requested_groups) > 1
         native_segments_by_group: dict[int, list[SplitTransferSegment]] = (
@@ -1372,7 +1252,6 @@ class KVCacheRecvingThread(threading.Thread):
         registration_ptrs, registration_sizes = map(
             list, zip(*registration_regions, strict=True)
         )
-        native_group_ms = {} if perf_enabled else None
         native_failure: tuple[int, int] | None = None
         with global_te.temporary_registration(
             registration_ptrs,
@@ -1380,9 +1259,7 @@ class KVCacheRecvingThread(threading.Thread):
             require_existing=latent,
             adopted_only=latent,
         ):
-            registered_at = time.perf_counter() if perf_enabled else 0.0
             for group_id, segments in native_batches:
-                batch_started = time.perf_counter() if perf_enabled else 0.0
                 ret = self.engine.batch_transfer_sync_read(
                     session_id,
                     [segment.destination_address for segment in segments],
@@ -1393,43 +1270,15 @@ class KVCacheRecvingThread(threading.Thread):
                     ],
                     [segment.length for segment in segments],
                 )
-                if native_group_ms is not None:
-                    native_group_ms[str(group_id)] = round((time.perf_counter() - batch_started) * 1000, 3)
                 if ret < 0:
                     native_failure = (group_id, ret)
                     break
-            native_done_at = time.perf_counter() if perf_enabled else 0.0
-        released_at = time.perf_counter() if perf_enabled else 0.0
         if native_failure is not None:
             failed_group, failure_code = native_failure
             raise RuntimeError(
                 "Mooncake split transfer failed for group "
                 f"{failed_group}, ret: {failure_code}"
             )
-        if perf_enabled:
-            _cold_live_log(
-                "live_source_native_transfer_complete",
-                req_id=req_meta.get("request_id"),
-                transfer_id=req_meta.get("split_transfer_id"),
-                vector_count=len(plan.segments),
-                native_batch_count=len(native_batches),
-                native_group_ms=native_group_ms,
-                registration_region_count=len(registration_regions),
-                expand_ms=round((expanded_at - transfer_started) * 1000, 3),
-                registration_ms=round((registered_at - expanded_at) * 1000, 3),
-                native_ms=round((native_done_at - registered_at) * 1000, 3),
-                unregister_ms=round((released_at - native_done_at) * 1000, 3),
-                elapsed_ms=round((released_at - transfer_started) * 1000, 3),
-            )
-        _fingerprint_live_group1_destination(
-            req_id=str(req_meta.get("request_id", "")),
-            transfer_id=req_meta.get("split_transfer_id"),
-            tp_rank=int(self.tp_rank),
-            dp_rank=local_dp_rank,
-            kv_caches=self.kv_caches,
-            layout=diagnostic_destination,
-            expected=content_diagnostics,
-        )
 
     _expand_compact_split_plan = staticmethod(expand_compact_split_plan)
 
@@ -1845,16 +1694,6 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
             split_source = None
             split_source_invalid = True
         split_transfer_id = kv_transfer_params.get("live_split_transfer_id")
-        if cold_perf_enabled():
-            _cold_live_log(
-                "live_source_decoder_ingest",
-                req_id=request_id,
-                source_present=LIVE_SPLIT_SOURCE_DESCRIPTOR in kv_transfer_params,
-                source_valid=split_source is not None,
-                split_negotiated=split_negotiated,
-                transfer_id_present=isinstance(split_transfer_id, str),
-                transfer_param_keys=sorted(kv_transfer_params),
-            )
         if split_negotiated and not self.live_split_topology_supported:
             split_plan = None
             split_source_invalid = True
@@ -1915,14 +1754,6 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
             if meta.split_source_invalid:
                 meta.split_fallback = True
                 continue
-            if cold_perf_enabled():
-                _cold_live_log(
-                    "live_source_late_plan_entry",
-                    req_id=request_id,
-                    source_present=meta.split_source is not None,
-                    destination_present=request_id in plans,
-                    supported_groups=supported_groups,
-                )
             try:
                 raw_plan = plans.get(request_id)
                 if isinstance(raw_plan, dict) and meta.split_source is None:
@@ -1995,8 +1826,7 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
                         ),
                         source_tp_rank=plan.source_tp_rank,
                         source_dp_rank=plan.source_dp_rank,
-                        content_diagnostics=plan.content_diagnostics,
-                    )
+                        )
                 meta.split_plan = plan
             except (KeyError, TypeError, ValueError) as error:
                 logger.warning(
@@ -2457,15 +2287,6 @@ class MooncakeConnectorScheduler:
             transfer_params["live_split_capabilities"] = tuple(capabilities)
             transfer_params["live_split_transfer_id"] = split_transfer_id
             source_descriptor = params.get(LIVE_SPLIT_SOURCE_DESCRIPTOR)
-            if cold_perf_enabled():
-                _cold_live_log(
-                    "live_source_mooncake_input",
-                    req_id=request.request_id,
-                    request_live_split=True,
-                    source_present=source_descriptor is not None,
-                    topology_supported=True,
-                    request_param_keys=sorted(params),
-                )
             if source_descriptor is not None:
                 # This descriptor is created by the prefiller-side compact
                 # provider, which owns the registered source layout.  The
@@ -2487,13 +2308,6 @@ class MooncakeConnectorScheduler:
                         request.request_id,
                         exc_info=True,
                     )
-            if cold_perf_enabled():
-                _cold_live_log(
-                    "live_source_mooncake_emit",
-                    req_id=request.request_id,
-                    source_present=(LIVE_SPLIT_SOURCE_DESCRIPTOR in transfer_params),
-                    transfer_param_keys=sorted(transfer_params),
-                )
         return delay_free_blocks, transfer_params
 
     def set_xfer_handshake_metadata(self, metadata: dict[int, KVConnectorHandshakeMetadata]) -> None:
@@ -3166,13 +2980,6 @@ class MooncakeConnectorWorker:
 
     def start_load_kv(self, metadata: MooncakeConnectorMetadata):
         """Start loading KV blocks from remote engine."""
-        if metadata.requests:
-            if cold_perf_enabled():
-                _cold_live_log(
-                    "live_source_worker_load_entry",
-                    request_ids=sorted(metadata.requests),
-                    split_requests=[req_id for req_id, meta in metadata.requests.items() if meta.split_negotiated],
-                )
         if self.kv_recv_thread is not None:
             for req_id, request_meta in metadata.requests.items():
                 self.kv_recv_thread.task_tracker.add_req_to_process(

@@ -11,7 +11,6 @@ from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
-from vllm.logger import logger
 
 MAX_WIRE_INTEGER = (1 << 63) - 1
 
@@ -36,72 +35,6 @@ def wire_int(value: Any, field: str) -> int:
     if not -MAX_WIRE_INTEGER <= parsed <= MAX_WIRE_INTEGER:
         raise ValueError(f"{field} is outside the supported integer range")
     return parsed
-
-
-def sanitize_content_diagnostics(raw: Any, *, token_count: int, layer_ids: tuple[int, ...]) -> dict[str, Any] | None:
-    """Validate optional debug metadata without making P2P depend on it."""
-    if raw is None:
-        return None
-    try:
-        if not isinstance(raw, dict):
-            raise ValueError("content diagnostics must be a mapping")
-        if wire_int(raw.get("schema"), "diagnostic.schema") != 1:
-            raise ValueError("unknown content diagnostic schema")
-        if raw.get("algorithm") != CONTENT_DIAGNOSTIC_ALGORITHM:
-            raise ValueError("unknown content diagnostic algorithm")
-        layers = [wire_int(value, "diagnostic.layer_id") for value in raw.get("sample_layer_ids", ())]
-        valid_layer_ids = set(layer_ids)
-        tokens = [wire_int(value, "diagnostic.logical_token") for value in raw.get("sample_logical_tokens", ())]
-        if (
-            not layers
-            or len(layers) > MAX_CONTENT_DIAGNOSTIC_LAYERS
-            or layers != sorted(set(layers))
-            or any(value not in valid_layer_ids for value in layers)
-        ):
-            raise ValueError("invalid diagnostic layer samples")
-        if (
-            not tokens
-            or len(tokens) > MAX_CONTENT_DIAGNOSTIC_TOKENS
-            or tokens != sorted(set(tokens))
-            or any(not 0 <= value < token_count for value in tokens)
-        ):
-            raise ValueError("invalid diagnostic token samples")
-
-        def hashes(name: str, limit: int) -> dict[str, str]:
-            values = raw.get(name, {})
-            if not isinstance(values, dict) or len(values) > limit:
-                raise ValueError(f"invalid diagnostic {name}")
-            result = {str(key): str(value) for key, value in values.items()}
-            if any(
-                len(value) != 32 or any(character not in "0123456789abcdef" for character in value)
-                for value in result.values()
-            ):
-                raise ValueError(f"invalid diagnostic {name} hash")
-            return result
-
-        row_hashes = hashes("row_hashes", len(layers) * len(tokens))
-        layer_hashes = hashes("layer_hashes", len(layers))
-        expected_row_keys = {f"{layer_id}:{logical_token}" for layer_id in layers for logical_token in tokens}
-        if set(row_hashes) != expected_row_keys:
-            raise ValueError("diagnostic row hashes do not match samples")
-        if set(layer_hashes) != {str(layer_id) for layer_id in layers}:
-            raise ValueError("diagnostic layer hashes do not match samples")
-        combined_hash = str(raw.get("combined_hash", ""))
-        if len(combined_hash) != 32 or any(character not in "0123456789abcdef" for character in combined_hash):
-            raise ValueError("invalid diagnostic combined hash")
-        return {
-            "schema": CONTENT_DIAGNOSTIC_SCHEMA,
-            "algorithm": CONTENT_DIAGNOSTIC_ALGORITHM,
-            "sample_layer_ids": layers,
-            "sample_logical_tokens": tokens,
-            "row_hashes": row_hashes,
-            "layer_hashes": layer_hashes,
-            "combined_hash": combined_hash,
-            "readback_may_synchronize": bool(raw.get("readback_may_synchronize", True)),
-        }
-    except (KeyError, TypeError, ValueError) as error:
-        logger.warning("Ignoring invalid optional NPU content diagnostics: %s", error)
-        return None
 
 
 @dataclass(frozen=True)
@@ -189,7 +122,6 @@ class SplitSourceDescriptor:
     dp_rank: int
     compact_layout: SplitCompactLayout | None = None
     latent_layout: SplitLatentLayout | None = None
-    content_diagnostics: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -205,7 +137,6 @@ class SplitTransferPlan:
     latent_destination_pages: tuple[SplitLatentDestinationPage, ...] = ()
     source_tp_rank: int | None = None
     source_dp_rank: int | None = None
-    content_diagnostics: dict[str, Any] | None = None
 
     @property
     def source_rank(self) -> tuple[int, int]:
@@ -413,10 +344,6 @@ def parse_source_descriptor(
         for raw in raw_descriptors:
             latent_layout = parse_latent_layout(raw.get("latent_layout"))
             compact_layout = parse_compact_layout(raw.get("compact_layout"))
-            diagnostic_token_count = compact_layout.token_count if compact_layout is not None else 0
-            diagnostic_layer_ids = (
-                tuple(layer.layer_id for layer in compact_layout.layers) if compact_layout is not None else ()
-            )
             parsed_descriptors.append(
                 SplitSourceDescriptor(
                     segments=tuple(
@@ -443,12 +370,7 @@ def parse_source_descriptor(
                     dp_rank=wire_int(raw["dp_rank"], "source.dp_rank"),
                     compact_layout=compact_layout,
                     latent_layout=latent_layout,
-                    content_diagnostics=sanitize_content_diagnostics(
-                        raw.get("content_diagnostics"),
-                        token_count=diagnostic_token_count,
-                        layer_ids=diagnostic_layer_ids,
-                    ),
-                )
+                    )
             )
         descriptors = tuple(parsed_descriptors)
     identities: set[tuple[int, int]] = set()
@@ -551,29 +473,7 @@ def parse_split_plan(plan: Any) -> SplitTransferPlan | None:
             source_dp_rank=(
                 None if plan.get("source_dp_rank") is None else wire_int(plan["source_dp_rank"], "plan.source_dp_rank")
             ),
-            content_diagnostics=sanitize_content_diagnostics(
-                plan.get("content_diagnostics"),
-                token_count=(
-                    wire_int(
-                        plan["compact_layout"]["token_count"],
-                        "plan.compact.token_count",
-                    )
-                    if plan.get("compact_layout") is not None
-                    else 0
-                ),
-                layer_ids=(
-                    tuple(
-                        wire_int(
-                            layer["layer_id"],
-                            "plan.compact.layer_id",
-                        )
-                        for layer in plan["compact_layout"].get("layers", ())
-                    )
-                    if plan.get("compact_layout") is not None
-                    else ()
-                ),
-            ),
-        )
+            )
     if len(parsed.group_byte_totals) != 2:
         raise ValueError("Live split byte totals require exactly two groups")
     return parsed

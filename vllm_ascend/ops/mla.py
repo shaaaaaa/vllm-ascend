@@ -170,13 +170,7 @@ class AscendMultiHeadLatentAttention(MultiHeadLatentAttentionWrapper):
         # Model profiling compiles before KV allocation. Select the operator
         # from startup configuration, never from a late-created cache tensor.
         self.use_retrieval_overlap = bool(envs_ascend.VLLM_ASCEND_SFA_SHARED_RETRIEVAL_OVERLAP)
-        self.target_sfa_debug = bool(
-            self.use_cross_layer_sfa
-            and envs_ascend.VLLM_ASCEND_MTP_DRAFT_DEBUG
-        )
-        self.use_full_graph_sfa = bool(
-            self.use_cross_layer_sfa and sfa_full_graph_enabled(vllm_config) and not self.target_sfa_debug
-        )
+        self.use_full_graph_sfa = self.use_cross_layer_sfa and sfa_full_graph_enabled(vllm_config)
 
         compilation_config = vllm_config.compilation_config
         if prefix in compilation_config.static_forward_context:
@@ -210,12 +204,6 @@ class AscendMultiHeadLatentAttention(MultiHeadLatentAttentionWrapper):
             )
         elif self.use_cross_layer_sfa:
             impl = self.mla_attn.impl
-            if self.target_sfa_debug:
-                torch.ops.vllm.sfa_target_layer_diag(
-                    hidden_states,
-                    self.prefix,
-                    "input",
-                )
             group = impl.shared_resident_plan
             pre_op = torch.ops.vllm.sfa_forward_pre_shared if group is not None else torch.ops.vllm.sfa_forward_pre
             resident_args = (
@@ -268,12 +256,6 @@ class AscendMultiHeadLatentAttention(MultiHeadLatentAttentionWrapper):
                     target_slots,
                     output,
                     self.prefix,
-                )
-            if self.target_sfa_debug:
-                torch.ops.vllm.sfa_target_layer_diag(
-                    output,
-                    self.prefix,
-                    "output",
                 )
         else:
             torch.ops.vllm.mla_forward(hidden_states, need_gather_q_kv, output, self.prefix)
@@ -487,11 +469,7 @@ def sfa_forward_full(
     context = get_forward_context()
     impl, attn_layer_name, kv_cache, metadata = _mla_runtime_state(layer_name)
     group = impl.shared_resident_plan
-    direct = (
-        getattr(context, "sfa_full_graph_active", False)
-        and group is not None and group.active
-        and not impl._staged_graph_content_diagnostic_enabled(attn_layer_name)
-    )
+    direct = getattr(context, "sfa_full_graph_active", False) and group is not None and group.active
     pending = []
     dcp_direct = direct and getattr(metadata, "sfa_dcp", None) is not None
     packet_mode = (
@@ -686,29 +664,6 @@ def sfa_forward_post_fake(
     return
 
 
-def sfa_target_layer_diag(
-    tensor: torch.Tensor,
-    layer_name: str,
-    phase: str,
-) -> None:
-    context, layer, attn_metadata = _mla_runtime_metadata(layer_name)
-    layer.mla_attn.impl.target_sfa_diagnostic_boundary(
-        layer.mla_attn.layer_name,
-        phase,
-        tensor,
-        attn_metadata,
-        context,
-    )
-
-
-def sfa_target_layer_diag_fake(
-    tensor: torch.Tensor,
-    layer_name: str,
-    phase: str,
-) -> None:
-    return
-
-
 direct_register_custom_op(
     op_name="sfa_forward_full",
     op_func=sfa_forward_full,
@@ -751,12 +706,5 @@ direct_register_custom_op(
     op_func=sfa_forward_post,
     mutates_args=["output"],
     fake_impl=sfa_forward_post_fake,
-    dispatch_key="PrivateUse1",
-)
-direct_register_custom_op(
-    op_name="sfa_target_layer_diag",
-    op_func=sfa_target_layer_diag,
-    mutates_args=["tensor"],
-    fake_impl=sfa_target_layer_diag_fake,
     dispatch_key="PrivateUse1",
 )

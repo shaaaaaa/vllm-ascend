@@ -22,6 +22,8 @@ import os
 from collections.abc import Callable
 from typing import Any
 
+from vllm.v1.core.dsa_shared_pool import layerwise_prefill_bank_count
+
 
 def _strict_bool_env(name: str, default: bool = False) -> bool:
     raw = os.getenv(name, "true" if default else "false")
@@ -38,35 +40,13 @@ def _strict_bool_env(name: str, default: bool = False) -> bool:
 # begin-env-vars-definition
 
 env_variables: dict[str, Callable[[], Any]] = {
-    # Raw tensors for real PD diagnostics. Empty (default) disables all hooks.
-    # Otherwise an absolute run directory, e.g. /repo/pd-tensor-dump/case-on.
-    # Non-secret setting; files contain request/model data. Requires eager,
-    # compilation mode 0 and synchronous scheduling; introduces host readback.
-    "VLLM_ASCEND_PD_TENSOR_DUMP_DIR": lambda: os.getenv("VLLM_ASCEND_PD_TENSOR_DUMP_DIR", "").strip(),
-    # Non-secret diagnostic row limit per request-local 4096-token segment.
-    # Default 0 (all tokens); integer in [0, 4096]. Positive values retain the
-    # legacy chunk-prefix sample. Only read when PD_TENSOR_DUMP_DIR is enabled.
-    "VLLM_ASCEND_PD_TENSOR_DUMP_MAX_TOKENS": lambda: int(os.getenv("VLLM_ASCEND_PD_TENSOR_DUMP_MAX_TOKENS", "0")),
-    # Non-secret diagnostic last-feature-axis limit; integer >= 0, default 8.
-    # 0 keeps full features. Token/head axes, IDs, top-k, logits and rejection
-    # evidence stay intact. KV is narrowed before gather and device readback.
-    "VLLM_ASCEND_PD_TENSOR_DUMP_MAX_FEATURES": lambda: int(os.getenv("VLLM_ASCEND_PD_TENSOR_DUMP_MAX_FEATURES", "8")),
-    # Shared PD serving performance diagnostics across vLLM and LMCache.
-    # Non-sensitive; configure before worker startup. Default 0/off. Values:
-    # 1 = host timing, detail = extra host detail, device = opt-in device timing.
-    # Host timing includes bounded slow-call summaries for early decode and
-    # async output waits, with no added device events or synchronization.
-    # Empty/0/false/no/off disable it (case-insensitive). Other nonfalse values
-    # retain host timing semantics. Content/crash diagnostics remain separate.
     "PD_SERVING_PERF": lambda: os.getenv("PD_SERVING_PERF", "0").strip().lower(),
-    # Explicit PD prefill-node marker and feature gate for the layerwise DSA
-    # child pool. It is intentionally independent of kv_role/kv_rank.
     "VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE": lambda: _strict_bool_env(
         "VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE"
     ),
-    # max compile thread number for package building. Usually, it is set to
-    # the number of CPU cores. If not set, the default value is None, which
-    # means all number of CPU cores will be used.
+    # Non-secret P-node bank rotation depth. Positive integer, default 4;
+    # ignored unless the P-node switch above is true. Read before startup.
+    "VLLM_ASCEND_LAYERWISE_PREFILL_NUM_BANKS": layerwise_prefill_bank_count,
     "MAX_JOBS": lambda: os.getenv("MAX_JOBS", None),
     # The build type of the package. It can be one of the following values:
     # Release, Debug, RelWithDebugInfo. If not set, the default value is Release.
@@ -158,11 +138,6 @@ env_variables: dict[str, Callable[[], Any]] = {
     # the scratch-gather and the native paged sparse attention and logs/asserts their
     # outputs match. Use during Step 2 of bring-up; disable in production (it doubles
     # the attention cost). Default 0.
-    "VLLM_ASCEND_DSA_OFFLOAD_ASSERT_PARITY": lambda: bool(int(os.getenv("VLLM_ASCEND_DSA_OFFLOAD_ASSERT_PARITY", "0"))),
-    # DSA un-bundle (proper route P1). When 1, the SFA KV cache is split into TWO
-    # vLLM-managed KV cache groups: the MLA latent (k_nope+k_pe) and the indexer key,
-    # instead of the bundled 3-tuple. This is the prerequisite for freeing the latent
-    # blocks after prefill (P2) in a graph-compatible way. Default 0 (bundled path).
     "VLLM_ASCEND_DSA_UNBUNDLE": lambda: bool(int(os.getenv("VLLM_ASCEND_DSA_UNBUNDLE", "0"))),
     # DSA Step A: latent and indexer become two REAL KV cache groups with separate
     # block tables and per-group block pools (the vLLM fork gates its side on the
@@ -340,33 +315,6 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_DSA_USE_LMCACHE_BACKEND": lambda: bool(int(os.getenv("VLLM_ASCEND_DSA_USE_LMCACHE_BACKEND", "0"))),
     # DSA/LMCache trace logging. Default OFF because tensor summaries can force
     # NPU->CPU synchronization on the decode hot path.
-    "VLLM_ASCEND_DSA_LMCACHE_TRACE": lambda: bool(
-        int(os.getenv("VLLM_ASCEND_DSA_LMCACHE_TRACE", "0"))
-    ),
-    # Emit the per-layer sparse LMCache miss-token ratio about once per second.
-    # The denominator is index_topk * decode rows (including MTP rows). Default
-    # off because each emitted sample intentionally synchronizes one scalar from
-    # NPU to CPU. Non-sensitive; read during model initialization.
-    "VLLM_ASCEND_DSA_LMCACHE_LOAD_STAT": lambda: bool(
-        int(os.getenv("VLLM_ASCEND_DSA_LMCACHE_LOAD_STAT", "0"))
-    ),
-    # Fence every live target-SFA phase plus the target/MTP-drafter boundary,
-    # and persist rolling target-layer and draft-layer tensor snapshots for
-    # crash diagnosis. Default off because the fences serialize NPU work and
-    # the snapshots copy substantial tensor data to CPU/disk. Non-sensitive;
-    # changing it requires restart because it also changes graph partitions.
-    "VLLM_ASCEND_MTP_DRAFT_DEBUG": lambda: bool(
-        int(os.getenv("VLLM_ASCEND_MTP_DRAFT_DEBUG", "0"))
-    ),
-    # Emit bounded diagnostics for MTP and LMCache decode-window interaction.
-    # Default off because sampled tensor summaries can synchronize NPU and CPU.
-    "VLLM_ASCEND_MTP_DW_DIAG": lambda: bool(
-        int(os.getenv("VLLM_ASCEND_MTP_DW_DIAG", "0"))
-    ),
-    # Keep this many completed decode-window saves pending before publishing
-    # them to the scheduler. The scheduler uses the published frontier for
-    # both the next DSA split boundary and saved-block release, so both lag
-    # together. Only active when LMCache decode-window save is enabled.
     "VLLM_ASCEND_LMCACHE_DECODE_WINDOW_SAVE_COMMIT_DELAY_WINDOWS": lambda: max(
         int(
             os.getenv(
@@ -376,16 +324,6 @@ env_variables: dict[str, Callable[[], Any]] = {
         ),
         0,
     ),
-    # Emit one CPU-synchronized, first-post-commit mapping diagnostic for the
-    # SHRINK_LATENT=2 compact-scratch path. Requires MTP_DW_DIAG. Default off;
-    # diagnostic only, with no inference fallback or output changes.
-    "VLLM_ASCEND_MTP_DW_DEEP_DIAG": lambda: bool(
-        int(os.getenv("VLLM_ASCEND_MTP_DW_DIAG", "0"))
-        and int(os.getenv("VLLM_ASCEND_MTP_DW_DEEP_DIAG", "0"))
-    ),
-    # Host CPU budget (GiB) PER LAYER for the LMCache adapter backend. 0 (default) =
-    # auto-size from the per-layer pinned-bundle need (num_logical_blocks * bundle,
-    # with headroom); set >0 to override. Total host = this x number of MLA layers.
     "VLLM_ASCEND_DSA_LMCACHE_CPU_GB": lambda: float(os.getenv("VLLM_ASCEND_DSA_LMCACHE_CPU_GB", "0")),
 }
 

@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch
+import torch_npu
 
 
 def validate_destinations(caches: dict[str, tuple], destinations: set[str]) -> None:
@@ -116,7 +117,7 @@ class SharedRetrievalOverlap:
                     raise ValueError("invalid shared retrieval topology")
                 if kv_caches[current][0].dtype not in (torch.float16, torch.bfloat16):
                     continue
-                if not hasattr(torch.ops._C_ascend, "batch_matmul_transpose"):
+                if not hasattr(torch_npu, "npu_transpose_batchmatmul"):
                     continue
                 pairs[current] = (following, tuple(kv_caches[following][:2]))
         if pairs:

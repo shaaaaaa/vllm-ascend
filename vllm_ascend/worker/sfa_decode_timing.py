@@ -213,39 +213,6 @@ def install_route_timing(runner, timing: DecodeTiming) -> None:
     timing.patches.enter_context(patch.object(runner, "_staged_sfa_live_route", route))
 
 
-def install_sampling_timing(runner, timing: DecodeTiming) -> None:
-    from vllm_ascend.sample.rejection_diagnostics import reset_stage_recorder, set_stage_recorder
-
-    original = runner._sample
-
-    def record(name, operation, args, kwargs):
-        with timing.scope(f"sampling.{name}", device=timing.detail_device_sample):
-            return operation(*args, **kwargs)
-
-    @wraps(original)
-    def sample(*args, **kwargs):
-        if not timing.recording:
-            return original(*args, **kwargs)
-        token = set_stage_recorder(record)
-        try:
-            return original(*args, **kwargs)
-        finally:
-            reset_stage_recorder(token)
-
-    timing.patches.enter_context(patch.object(runner, "_sample", sample))
-    # Keep the original sampler implementations and tensor values. Do not
-    # duplicate sampling, force readiness, inspect logits, or call .cpu().
-    sampler = runner.sampler
-    for method in ("apply_logits_processors", "sample", "gather_logprobs"):
-        original_method = getattr(sampler, method)
-
-        def observed(*args, _original=original_method, _name=method, **kwargs):
-            with timing.scope(f"sampling.sampler.{_name}", device=timing.detail_device_sample):
-                return _original(*args, **kwargs)
-
-        timing.patches.enter_context(patch.object(sampler, method, observed))
-
-
 def install_decode_timing(worker, connector, *, prompt_tokens: int, event_factory=None) -> DecodeTiming:
     """Install for the diagnostic request; restore everything on stop/error."""
     runner = worker.model_runner
@@ -292,8 +259,6 @@ def install_decode_timing(worker, connector, *, prompt_tokens: int, event_factor
             ("finalize_kv_connector", "kv.finalize", False),
         ):
             timing.observe(runner, method, stage, device=device)
-        if hasattr(runner, "rejection_sampler"):
-            install_sampling_timing(runner, timing)
         if hasattr(runner, "model"):
             timing.observe(runner.model, "compute_logits", "target.compute_logits", device=True)
         for method, stage in (

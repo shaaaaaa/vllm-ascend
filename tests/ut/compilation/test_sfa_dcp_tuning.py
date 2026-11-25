@@ -218,7 +218,6 @@ def test_full_operator_owns_early_gather_through_failure_cleanup(monkeypatch, fa
         shared_resident_plan=NS(active=True),
         skip_topk=consumer,
         _dcp_early_gather=True,
-        _staged_graph_content_diagnostic_enabled=lambda _: False,
         cross_layer_graph_pre=pre,
         cross_layer_lmcache_retrieve=retrieve,
         cross_layer_graph_post=post,

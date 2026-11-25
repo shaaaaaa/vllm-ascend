@@ -1,11 +1,9 @@
-import json
 import os
 from contextlib import nullcontext
 from copy import copy
 from dataclasses import dataclass, field
 from functools import lru_cache
 from threading import Lock
-from time import monotonic
 from typing import TYPE_CHECKING, Any, TypeVar
 
 import numpy as np
@@ -44,12 +42,6 @@ from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.context_parallel.common_cp import AscendPCPMetadata
 from vllm_ascend.attention.mla_v1 import MAX_O_PROJ_PREFETCH_SIZE, MLAPO_MAX_SUPPORTED_TOKENS
-from vllm_ascend.attention.mtp_dw_diag import (
-    diagnostic_int_checksum,
-    diagnostic_values_to_list,
-    scratch_live_slot_aliases,
-    scratch_target_safety,
-)
 from vllm_ascend.attention.sfa_graph_layout import (
     FullGraphAttentionBuffers,
     cp_sequence_lengths,
@@ -58,17 +50,6 @@ from vllm_ascend.attention.sfa_graph_layout import (
     unpack_decode_lanes,
 )
 from vllm_ascend.attention.sfa_remap_boundary import SFARemapBoundaryBuffer
-from vllm_ascend.attention.target_sfa_diagnostics import (
-    TARGET_SFA_DIAG_SCHEMA_VERSION,
-    active_resident_state_snapshot,
-    atomic_torch_save,
-    cpu_snapshot,
-    target_cache_snapshot,
-    target_metadata_snapshot,
-    target_sfa_path,
-    target_sfa_session,
-    topk_physical_block_ids,
-)
 from vllm_ascend.attention.utils import (
     AscendCommonAttentionMetadata,
     DcpSFABatch,
@@ -85,8 +66,7 @@ from vllm_ascend.attention.utils import (
     staged_sfa_connector_supports_sparse_load,
     trans_rope_weight,
     transdata,
-    wait_for_kv_layer_from_connector,
-)
+    wait_for_kv_layer_from_connector)
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.distributed.kv_transfer.sparse_offload import _prof as _dsa_prof
 from vllm_ascend.distributed.kv_transfer.sparse_offload.prepare_sparse_indices import (
@@ -109,13 +89,6 @@ from vllm_ascend.distributed.kv_transfer.sparse_offload.resident_sorted_cache im
     sorted_resident_workspace_prefix,
 )
 from vllm_ascend.distributed.utils import all_gather_async
-from vllm_ascend.lmcache_diagnostics import (
-    npu_content_diagnostics_enabled,
-    queue_cache_tail_fingerprint,
-    queue_group1_first_consume,
-    queue_selected_topk_fingerprint,
-    queue_staged_graph_stage_fingerprint,
-)
 from vllm_ascend.ops.layer_shard_linear import (
     is_hidden_layer,
     post_process_after_loading_for_shard_weight_series,
@@ -135,7 +108,6 @@ from vllm_ascend.utils import (
     enable_dsa_cp_decoder,
     enable_dsa_cp_with_layer_shard,
     enable_dsa_cp_with_o_proj_tp,
-    enable_sp,
     get_weight_prefetch_method,
     maybe_trans_nz,
     parse_layer_idx,
@@ -148,8 +120,10 @@ from vllm_ascend.worker.npu_input_batch import NPUInputBatch
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
 
-# token count limits within bmm_transpose operator
-BMM_TRANS_MAX_SUPPORTED_TOKENS = 1024
+# Older ACLNN TransposeBatchMatMul binaries require operand dimensions < 65536.
+TRANSPOSE_BMM_MAX_SUPPORTED_DIM = 65536
+# Bound shared-retrieval overlap independently of native V-up's supported shapes.
+SHARED_RETRIEVAL_MAX_CUBE_TOKENS = 1024
 # Fence the first sparse load once in each worker process by default.
 _LMCACHE_SPARSE_WAIT_SYNC_ONCE = os.getenv("VLLM_ASCEND_LMCACHE_SPARSE_WAIT_SYNC_ONCE", "1").lower() in (
     "1",
@@ -159,19 +133,6 @@ _LMCACHE_SPARSE_WAIT_SYNC_ONCE = os.getenv("VLLM_ASCEND_LMCACHE_SPARSE_WAIT_SYNC
 )
 _lmcache_sparse_wait_sync_once_done = False
 _lmcache_sparse_wait_sync_once_lock = Lock()
-_LMCACHE_LOAD_STAT_INTERVAL_S = 1.0
-
-
-def _mtp_dw_diag_enabled() -> bool:
-    return envs.VLLM_ASCEND_MTP_DW_DIAG
-
-
-def _mtp_dw_event(stage: str, **fields: Any) -> None:
-    if not _mtp_dw_diag_enabled():
-        return
-    payload = {"schema": 1, "stage": stage, "owner": "vllm_ascend_sfa"}
-    payload.update(fields)
-    logger.info("[MTP_DW] %s", json.dumps(payload, separators=(",", ":")))
 
 
 def _staged_sfa_profile_scope(name: str):
@@ -292,12 +253,6 @@ class _StagedSFACaptureState:
     remap_boundary: torch.Tensor | None = None
     runtime: tuple[Any, ...] | None = None
     initialized_cache_capacity: int = 0
-    input_diagnostic_buffers: dict[
-        StagedSFAGraphKey, torch.Tensor
-    ] = field(default_factory=dict)
-    post_diagnostic_buffers: dict[StagedSFAGraphKey, torch.Tensor] = field(
-        default_factory=dict,
-    )
     bindings: dict[StagedSFAGraphKey, _StagedSFALayerBinding] = field(
         default_factory=dict,
     )
@@ -359,6 +314,7 @@ class _StagedSFACaptureState:
                 f"unexpected_keys={tuple(key.request_capacity for key in unexpected)}"
             )
 
+
 def _sync_compute_stream_after_lmcache_sparse_wait() -> None:
     global _lmcache_sparse_wait_sync_once_done
 
@@ -373,6 +329,7 @@ def _sync_compute_stream_after_lmcache_sparse_wait() -> None:
 
         torch.npu.current_stream().synchronize()
         _lmcache_sparse_wait_sync_once_done = True
+
 
 
 def _dsa_topk_to_2d_indices(topk_indices: torch.Tensor) -> torch.Tensor:
@@ -1164,7 +1121,14 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
         self.rope_dim = self.model_config.hf_text_config.qk_rope_head_dim
         self.enable_dsa_cp = enable_dsa_cp()
         self.dsa_cp_decoder = enable_dsa_cp_decoder()
-        self.dsa_shrink_latent = int(envs.VLLM_ASCEND_DSA_SHRINK_LATENT) if envs.VLLM_ASCEND_DSA_UNBUNDLE else 0
+        # P banks contain the complete prefix of the current layer. A short
+        # prefill tail (or P-side MTP) can have decode-shaped metadata, but must
+        # never acquire the D-node compact-scratch ownership/remapping policy.
+        self.dsa_shrink_latent = (
+            int(envs.VLLM_ASCEND_DSA_SHRINK_LATENT)
+            if envs.VLLM_ASCEND_DSA_UNBUNDLE and not self._layerwise_prefill_p_node
+            else 0
+        )
         if self.dsa_shrink_latent and self.decode_threshold > 2:
             raise ValueError(
                 "staged sparse-index preparation only supports MTP=1 or "
@@ -1443,11 +1407,7 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             compact_req_indices = self._dsa_compact_req_indices_cpu[
                 :num_input_tokens
             ]
-            current_positions = (
-                self._dsa_current_positions_cpu[:num_input_tokens]
-                if envs.VLLM_ASCEND_MTP_DW_DEEP_DIAG and self.dsa_shrink_latent == 2
-                else None
-            )
+            current_positions = None
             if current_positions is not None:
                 current_positions.fill(0)
             n_real = min(len(plens_cpu), num_reqs)
@@ -1719,8 +1679,7 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
                     :num_decode_rows
                 ]
             need_sparse_lmcache_payload = (
-                self.dsa_shrink_latent != 3
-                and staged_sfa_connector_supports_sparse_load()
+                staged_sfa_connector_supports_sparse_load()
             )
             if num_decode_rows:
                 assert self._dsa_target_slots is not None
@@ -2036,28 +1995,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         self.local_num_heads = self.num_heads
         self.vllm_config = get_current_vllm_config()
         self.block_size = self.vllm_config.cache_config.block_size
-        diagnostic_model_layers = int(
-            self.vllm_config.model_config.get_num_layers(
-                self.vllm_config.parallel_config
-            )
-        )
-        self.diagnostic_num_hidden_layers = diagnostic_model_layers
-        self.diagnostic_num_cache_layers = diagnostic_model_layers
-        self._staged_graph_diagnostic_layer_ids = frozenset(
-            (0, diagnostic_model_layers // 2, diagnostic_model_layers - 1)
-        )
         speculative_config = self.vllm_config.speculative_config
-        if (
-            speculative_config is not None
-            and speculative_config.method in ("deepseek_mtp", "mtp")
-        ):
-            self.diagnostic_num_hidden_layers += int(
-                getattr(
-                    self.vllm_config.model_config.hf_config,
-                    "num_nextn_predict_layers",
-                    0,
-                )
-            )
         self.decode_threshold = 1 + (
             speculative_config.num_speculative_tokens
             if speculative_config is not None
@@ -2141,14 +2079,6 @@ class AscendSFAImpl(MLAAttentionImpl):
             self.wk = None
             self.weights_proj = None
             self.k_norm = None
-        self._lmcache_load_stat_enabled = bool(
-            envs.VLLM_ASCEND_DSA_LMCACHE_LOAD_STAT
-        )
-        self._lmcache_load_stat_tokens: torch.Tensor | None = None
-        self._lmcache_load_stat_denominator = 0
-        self._lmcache_load_stat_rows = 0
-        self._lmcache_load_stat_calls = 0
-        self._lmcache_load_stat_last_log = monotonic()
         self.cp_size = 1
         self.is_rope_neox_style = True
         self.use_torch_npu_lightning_indexer = False
@@ -2162,8 +2092,15 @@ class AscendSFAImpl(MLAAttentionImpl):
             envs.VLLM_ASCEND_ENABLE_DSA_LATENT_OFFLOAD and envs.VLLM_ASCEND_DSA_OFFLOAD_FREE_PAGED
         )
         self.dsa_offload_unbundle = bool(envs.VLLM_ASCEND_DSA_UNBUNDLE)
-        # Step B staging (1 = B2 compact-scratch read; 2 = +B1 freeing).
-        self.dsa_shrink_latent = int(envs.VLLM_ASCEND_DSA_SHRINK_LATENT) if self.dsa_offload_unbundle else 0
+        # Step B staging is a D-node layout (1 = compact scratch; 2 = freeing).
+        # P always waits for its full-prefix bank before cache writes/reads,
+        # including one-token tails and MTP. Applying shrink here would skip
+        # that wait and, for kv_both, remap top-k into an unpopulated D scratch.
+        self.dsa_shrink_latent = (
+            int(envs.VLLM_ASCEND_DSA_SHRINK_LATENT)
+            if self.dsa_offload_unbundle and not self._layerwise_prefill_p_node
+            else 0
+        )
         if self.dsa_shrink_latent and self.decode_threshold > 2:
             raise ValueError(
                 "staged sparse-index preparation only supports MTP=1 or "
@@ -2286,9 +2223,6 @@ class AscendSFAImpl(MLAAttentionImpl):
         else:
             self.W_UV.copy_(W_UV.transpose(0, 1).contiguous())
             self.W_UK_T.copy_(W_UK.permute(1, 2, 0).contiguous())
-
-        # TODO(zzzzwwjj): Currently, torch.ops._C_ascend.batch_matmul_transpose cannot support weight nz
-        # self.W_UV = maybe_trans_nz(self.W_UV)
 
         # Dispose kv_b_proj since it is replaced by W_UV and W_UK_T to save memory
         dispose_layer(self.kv_b_proj)
@@ -2582,34 +2516,13 @@ class AscendSFAImpl(MLAAttentionImpl):
         kv_cache: tuple,
         slots: torch.Tensor,
         attn_metadata: M,
-        diagnostic_layer_name: str | None = None,
-    ):
+        ):
         B = kv_no_split.shape[0]
         N = self.num_kv_heads
         S = 1
         # npu_kv_rmsnorm_rope_cache needs [B, N, S, D]
         kv_no_split = kv_no_split.view(B, N, S, self.kv_lora_rank + self.qk_rope_head_dim)
         cache_mode = "PA"
-
-        diagnose_cache_tail = (
-            attn_metadata is not None
-            and diagnostic_layer_name is not None
-            and not self.enable_dsa_cp
-            and bool(attn_metadata.req_ids)
-        )
-        if diagnose_cache_tail:
-            queue_cache_tail_fingerprint(
-                req_ids=attn_metadata.req_ids,
-                layer_name=diagnostic_layer_name,
-                kv_group=0,
-                stage="group0_after_load_before_current_scatter",
-                cache_parts={"nope": kv_cache[0], "pe": kv_cache[1]},
-                slot_mapping=slots,
-                query_start_loc_cpu=attn_metadata.query_start_loc_cpu,
-                seq_lens_cpu=attn_metadata.seq_lens_cpu,
-                num_actual_tokens=attn_metadata.num_actual_tokens,
-                attn_state=attn_metadata.attn_state,
-            )
 
         if self.enable_dsa_cp:
             _, _, k_pe, k_nope = torch_npu.npu_kv_rmsnorm_rope_cache(
@@ -2643,20 +2556,6 @@ class AscendSFAImpl(MLAAttentionImpl):
                 cache_mode=cache_mode,
                 is_output_kv=True,
             )
-            if diagnose_cache_tail:
-                queue_cache_tail_fingerprint(
-                    req_ids=attn_metadata.req_ids,
-                    layer_name=diagnostic_layer_name,
-                    kv_group=0,
-                    stage="group0_after_current_scatter",
-                    cache_parts={"nope": kv_cache[0], "pe": kv_cache[1]},
-                    produced_parts={"nope": k_nope, "pe": k_pe},
-                    slot_mapping=slots,
-                    query_start_loc_cpu=attn_metadata.query_start_loc_cpu,
-                    seq_lens_cpu=attn_metadata.seq_lens_cpu,
-                    num_actual_tokens=attn_metadata.num_actual_tokens,
-                    attn_state=attn_metadata.attn_state,
-                )
             return k_pe, k_nope
 
     # Return `ql_nope`, `q_pe`
@@ -2675,50 +2574,38 @@ class AscendSFAImpl(MLAAttentionImpl):
         return ql_nope.transpose(0, 1), q_pe
 
     def _v_up_proj(self, x):
-        num_input_tokens, _, _ = x.shape
-        if (
-            x.dtype in [torch.float16, torch.bfloat16]
-            and hasattr(torch.ops._C_ascend, "batch_matmul_transpose")
-            and num_input_tokens <= BMM_TRANS_MAX_SUPPORTED_TOKENS
-        ):
-            x = x.view(-1, self.local_num_heads, self.kv_lora_rank)
-            res = torch.empty((num_input_tokens, self.local_num_heads, self.v_head_dim), dtype=x.dtype, device=x.device)
-            torch.ops._C_ascend.batch_matmul_transpose(x, self.W_UV, res)
-            x = res.reshape(-1, self.local_num_heads * self.v_head_dim)
+        if x.dtype in (torch.float16, torch.bfloat16) and hasattr(torch_npu, "npu_transpose_batchmatmul"):
+            # Backport vllm-project/vllm-ascend#17141. Older CANN binaries
+            # require heads * rank < 65536 for the internal transpose.
+            # Explicitly transpose otherwise, keeping W_UV in (heads, rank, V).
+            if self.local_num_heads * self.kv_lora_rank < TRANSPOSE_BMM_MAX_SUPPORTED_DIM:
+                x = x.view(-1, self.local_num_heads, self.kv_lora_rank)
+                if not torch.compiler.is_compiling():
+                    logger.info_once(
+                        "[SFA_VUP] branch=npu_transpose_batchmatmul input_transpose=internal",
+                        scope="process",
+                    )
+                x = torch_npu.npu_transpose_batchmatmul(x, self.W_UV, perm_x1=(1, 0, 2), perm_y=(1, 0, 2))
+            else:
+                x = x.view(-1, self.local_num_heads, self.kv_lora_rank).transpose(0, 1).contiguous()
+                if not torch.compiler.is_compiling():
+                    logger.info_once(
+                        "[SFA_VUP] branch=npu_transpose_batchmatmul input_transpose=explicit",
+                        scope="process",
+                    )
+                x = torch_npu.npu_transpose_batchmatmul(x, self.W_UV, perm_x1=(0, 1, 2), perm_y=(1, 0, 2))
+            x = x.reshape(-1, self.local_num_heads * self.v_head_dim)
         else:
-            # Convert from (B, N, L) to (N, B, L)
+            if not torch.compiler.is_compiling():
+                reason = "unsupported_dtype" if x.dtype not in (torch.float16, torch.bfloat16) else "missing_native_api"
+                logger.info_once("[SFA_VUP] branch=torch.bmm reason=%s", reason, scope="process")
+            # (B, N, L) -> (N, B, L)
             x = x.view(-1, self.local_num_heads, self.kv_lora_rank).transpose(0, 1)
-            # # Multiply (N, B, L) x (N, L, V) -> (N, B, V)
+            # (N, B, L) x (N, L, V) -> (N, B, V)
             x = torch.bmm(x, self.W_UV)
-            # # Convert from (N, B, V) to (B, N * V)
+            # (N, B, V) -> (B, N * V)
             x = x.transpose(0, 1).reshape(-1, self.local_num_heads * self.v_head_dim)
         return x
-
-    def _sfa_preprocess_with_mlapo_after_layerwise_wait(
-        self,
-        layer_name: str,
-        attn_metadata: M,
-        hidden_states: torch.Tensor,
-        kv_cache: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
-        cos: torch.Tensor,
-        sin: torch.Tensor,
-        slot_mapping: torch.Tensor,
-        num_input_tokens: int,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Fence the current bank before MLAPO writes latent KV into it."""
-        if not (
-            self.dsa_shrink_latent
-            and attn_metadata.num_decode_tokens > 0
-        ):
-            wait_for_kv_layer_from_connector(layer_name)
-        return self._sfa_preprocess_with_mlapo(
-            hidden_states=hidden_states,
-            kv_cache=kv_cache,
-            cos=cos,
-            sin=sin,
-            slot_mapping=slot_mapping,
-            num_input_tokens=num_input_tokens,
-        )
 
     def _sfa_preprocess_with_mlapo(
         self,
@@ -3138,8 +3025,6 @@ class AscendSFAImpl(MLAAttentionImpl):
             return "DSA o_proj tensor parallelism is enabled"
         if self.dsa_offload_free_paged:
             return "the free-paged offload path is enabled"
-        if envs.VLLM_ASCEND_DSA_OFFLOAD_ASSERT_PARITY:
-            return "the DSA parity path is enabled"
         if getattr(forward_context, "dsa_offload_manager", None) is not None:
             return "the DSA offload manager is active"
         if getattr(forward_context, "dsa_adapter_cache", None) is not None:
@@ -3715,14 +3600,6 @@ class AscendSFAImpl(MLAAttentionImpl):
             and staged_mtp == self.decode_threshold
             and (group is None or group.active)
         ):
-            if envs.VLLM_ASCEND_MTP_DRAFT_DEBUG:
-                if local_to_union_workspace is None:
-                    raise RuntimeError(
-                        "target SFA diagnostics require raw top-k workspace"
-                    )
-                local_to_union_workspace.copy_(
-                    topk_indices.reshape_as(local_to_union_workspace)
-                )
             return self._prepare_sorted_resident_sparse_cache(
                 topk_indices,
                 split_boundary,
@@ -4185,21 +4062,6 @@ class AscendSFAImpl(MLAAttentionImpl):
     ) -> tuple[torch.Tensor, ...]:
         return self._ensure_staged_sfa_bridge_buffers(hidden_states)
 
-    def _staged_graph_content_diagnostic_enabled(
-        self,
-        layer_name: str,
-    ) -> bool:
-        if not npu_content_diagnostics_enabled():
-            return False
-        marker = ".layers."
-        try:
-            layer_id = int(
-                str(layer_name).split(marker, 1)[1].split(".", 1)[0]
-            )
-        except (IndexError, ValueError):
-            return False
-        return layer_id in self._staged_graph_diagnostic_layer_ids
-
     def reset_staged_sfa_capture(self) -> None:
         self._staged_sfa_capture_state = _StagedSFACaptureState()
         self._dsa_idx_cache_t = None
@@ -4213,7 +4075,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         if (
             not self.dsa_shrink_latent or metadata is None
             or metadata.split_boundary is None or metadata.num_decode_tokens <= 0
-            or not (metadata.need_sparse_lmcache_payload or self.dsa_shrink_latent == 3)
+            or not metadata.need_sparse_lmcache_payload
             or metadata.decode_remap_boundary_buffer is None
         ):
             return
@@ -4505,25 +4367,6 @@ class AscendSFAImpl(MLAAttentionImpl):
 
         is_dummy = bool(getattr(context, "staged_sfa_graph_dummy_run", False))
         state = self._staged_sfa_capture_state
-        if self._staged_graph_content_diagnostic_enabled(layer_name):
-            diagnostic_rows = min(int(hidden_states.shape[0]), 4)
-            diagnostic_input = hidden_states[:diagnostic_rows].reshape(
-                diagnostic_rows, -1
-            )[:, :256]
-            snapshot = state.input_diagnostic_buffers.get(graph_key)
-            if snapshot is None:
-                if context.cudagraph_runtime_mode != CUDAGraphMode.NONE:
-                    raise RuntimeError(
-                        "staged SFA input diagnostic buffer was not created "
-                        "by eager warmup"
-                    )
-                snapshot = torch.empty_like(diagnostic_input)
-                state.input_diagnostic_buffers[graph_key] = snapshot
-            if tuple(snapshot.shape) != tuple(diagnostic_input.shape):
-                raise RuntimeError(
-                    "staged SFA input diagnostic buffer shape changed"
-                )
-            snapshot.copy_(diagnostic_input)
         producer_event = state.producer_event
         if producer_event is None:
             if context.cudagraph_runtime_mode != CUDAGraphMode.NONE:
@@ -4674,356 +4517,6 @@ class AscendSFAImpl(MLAAttentionImpl):
             )
         return outputs
 
-    def _record_lmcache_load_stat(
-        self,
-        layer_name: str,
-        selected_counts: torch.Tensor,
-        *,
-        request_count: int,
-        decode_rows: int,
-    ) -> None:
-        """Accumulate actual sparse LMCache misses and periodically report."""
-        if not getattr(self, "_lmcache_load_stat_enabled", False):
-            return
-        request_count = int(request_count)
-        decode_rows = int(decode_rows)
-        if request_count <= 0 or decode_rows <= 0:
-            return
-
-        counts = selected_counts[:request_count]
-        if counts.ndim > 1:
-            counts = counts[..., 0]
-        loaded_tokens = counts.sum(dtype=torch.int64)
-        accumulator = self._lmcache_load_stat_tokens
-        if accumulator is None:
-            self._lmcache_load_stat_tokens = loaded_tokens.detach().clone()
-        else:
-            accumulator.add_(loaded_tokens)
-
-        self._lmcache_load_stat_rows += decode_rows
-        self._lmcache_load_stat_denominator += self.index_topk * decode_rows
-        self._lmcache_load_stat_calls += 1
-
-        now = monotonic()
-        elapsed = now - self._lmcache_load_stat_last_log
-        if elapsed < _LMCACHE_LOAD_STAT_INTERVAL_S:
-            return
-
-        # Diagnostic-only: one deliberate device-to-host scalar sync per layer
-        # and reporting interval. The disabled path never executes a reduction.
-        loaded = int(self._lmcache_load_stat_tokens.item())
-        denominator = self._lmcache_load_stat_denominator
-        logger.info(
-            "[DSA_LMCACHE_LOAD_STAT] layer=%s interval_s=%.3f "
-            "loaded_tokens=%d topk=%d decode_rows=%d topk_tokens=%d "
-            "load_ratio=%.6f calls=%d",
-            layer_name,
-            elapsed,
-            loaded,
-            self.index_topk,
-            self._lmcache_load_stat_rows,
-            denominator,
-            loaded / denominator if denominator else 0.0,
-            self._lmcache_load_stat_calls,
-        )
-        self._lmcache_load_stat_tokens.zero_()
-        self._lmcache_load_stat_denominator = 0
-        self._lmcache_load_stat_rows = 0
-        self._lmcache_load_stat_calls = 0
-        self._lmcache_load_stat_last_log = now
-
-    @staticmethod
-    def _target_sfa_debug_is_live(context: Any) -> bool:
-        if (
-            not envs.VLLM_ASCEND_MTP_DRAFT_DEBUG
-            or getattr(context, "staged_sfa_graph_dummy_run", False)
-            or getattr(context, "staged_sfa_graph_key", None) is None
-        ):
-            return False
-        try:
-            return not torch.npu.is_current_stream_capturing()
-        except (AttributeError, RuntimeError):
-            return True
-
-    def _target_sfa_diag_failure(
-        self,
-        session: Any,
-        layer: int,
-        phase: str,
-        error: Exception,
-    ) -> None:
-        payload = {
-            "schema_version": TARGET_SFA_DIAG_SCHEMA_VERSION,
-            "step_id": session.step_id,
-            "rank": session.rank,
-            "pid": os.getpid(),
-            "layer": layer,
-            "phase": phase,
-            "error_type": type(error).__qualname__,
-            "error": str(error),
-        }
-        atomic_torch_save(
-            payload,
-            target_sfa_path(session, layer, f"{phase}_failure"),
-        )
-        atomic_torch_save(
-            payload,
-            session.output_dir.parent / "latest_failure.pt",
-        )
-
-    def target_sfa_diagnostic_boundary(
-        self,
-        layer_name: str,
-        phase: str,
-        tensor: torch.Tensor,
-        attn_metadata: Any,
-        context: Any,
-    ) -> None:
-        """Synchronize and save the graph-external input/output boundary."""
-        if not self._target_sfa_debug_is_live(context):
-            return
-        session, layer = target_sfa_session(
-            context,
-            layer_name,
-            self.tp_rank,
-            begin=phase == "input",
-        )
-        logger.warning(
-            "[TARGET_SFA_DIAG] step=%d layer=%d phase=%s sync started",
-            session.step_id,
-            layer,
-            phase,
-        )
-        try:
-            torch.npu.synchronize()
-        except Exception as error:
-            self._target_sfa_diag_failure(
-                session,
-                layer,
-                phase,
-                error,
-            )
-            logger.exception(
-                "[TARGET_SFA_DIAG] step=%d layer=%d phase=%s sync failed",
-                session.step_id,
-                layer,
-                phase,
-            )
-            raise
-
-        actual_rows = min(
-            int(getattr(attn_metadata, "num_actual_tokens", tensor.shape[0])),
-            int(tensor.shape[0]),
-        )
-        payload = {
-            "schema_version": TARGET_SFA_DIAG_SCHEMA_VERSION,
-            "step_id": session.step_id,
-            "rank": session.rank,
-            "pid": os.getpid(),
-            "layer": layer,
-            "layer_name": layer_name,
-            "phase": phase,
-            "tensor": tensor[:actual_rows].detach().cpu().clone(),
-        }
-        if phase == "input":
-            payload["metadata"] = target_metadata_snapshot(attn_metadata)
-            payload["resident_state_before"] = (
-                active_resident_state_snapshot(
-                    self._sorted_resident_state,
-                    attn_metadata,
-                )
-            )
-        path = target_sfa_path(session, layer, phase)
-        atomic_torch_save(payload, path)
-        logger.warning(
-            "[TARGET_SFA_DIAG] step=%d layer=%d phase=%s sync passed; saved=%s",
-            session.step_id,
-            layer,
-            phase,
-            path,
-        )
-
-    def _target_sfa_diag_pre_retrieve(
-        self,
-        layer_name: str,
-        selected_packed: torch.Tensor,
-        selected_counts: torch.Tensor,
-        target_slots: torch.Tensor,
-        attn_metadata: Any,
-        context: Any,
-        request_count: int,
-    ) -> tuple[Any, int, list[int]] | None:
-        if not self._target_sfa_debug_is_live(context):
-            return None
-        session, layer = target_sfa_session(
-            context,
-            layer_name,
-            self.tp_rank,
-        )
-        phase = "pre"
-        logger.warning(
-            "[TARGET_SFA_DIAG] step=%d layer=%d phase=%s sync started",
-            session.step_id,
-            layer,
-            phase,
-        )
-        try:
-            torch.npu.synchronize()
-        except Exception as error:
-            self._target_sfa_diag_failure(
-                session,
-                layer,
-                phase,
-                error,
-            )
-            logger.exception(
-                "[TARGET_SFA_DIAG] step=%d layer=%d phase=%s sync failed",
-                session.step_id,
-                layer,
-                phase,
-            )
-            raise
-
-        bridge = self._staged_sfa_bridge_buffers
-        if bridge is None:
-            raise RuntimeError(
-                "target SFA diagnostics require initialized bridge buffers"
-            )
-        actual_rows = min(
-            int(getattr(attn_metadata, "num_actual_tokens", bridge[2].shape[0])),
-            int(bridge[2].shape[0]),
-        )
-        cp = getattr(attn_metadata, "dsa_cp_context", None)
-        query_rows = actual_rows if cp is None else max(0, min(cp.local_end_with_pad, actual_rows) - cp.local_start)
-        block_ids = topk_physical_block_ids(
-            bridge[2],
-            attn_metadata.decode_req_indices,
-            attn_metadata.block_table,
-            target_slots,
-            block_size=self.block_size,
-            actual_rows=actual_rows,
-            request_count=request_count,
-        )
-        runtime = self._staged_sfa_capture_state.runtime
-        kv_cache = runtime[1] if runtime is not None else None
-        workspace = self._sorted_resident_workspace_views.get(request_count)
-        raw_topk = attn_metadata.decode_union_mapping_workspace
-        stable_boundary = self._staged_sfa_capture_state.remap_boundary
-        payload = {
-            "schema_version": TARGET_SFA_DIAG_SCHEMA_VERSION,
-            "step_id": session.step_id,
-            "rank": session.rank,
-            "pid": os.getpid(),
-            "layer": layer,
-            "layer_name": layer_name,
-            "phase": phase,
-            "block_size": self.block_size,
-            "raw_topk": (
-                raw_topk[:request_count]
-                .reshape(actual_rows, 1, self.index_topk)
-                .detach()
-                .cpu()
-                .clone()
-                if raw_topk is not None
-                else None
-            ),
-            "remap_boundary": (
-                stable_boundary[:actual_rows].detach().cpu().clone()
-                if stable_boundary is not None
-                else None
-            ),
-            "ql_nope": bridge[0][:query_rows].detach().cpu().clone(),
-            "q_pe": bridge[1][:query_rows].detach().cpu().clone(),
-            "topk_indices": bridge[2][:actual_rows].detach().cpu().clone(),
-            "selected_packed": (
-                selected_packed[:request_count].detach().cpu().clone()
-            ),
-            "selected_counts": (
-                selected_counts[:request_count].detach().cpu().clone()
-            ),
-            "target_slots": (
-                target_slots[:request_count].detach().cpu().clone()
-            ),
-            "metadata": target_metadata_snapshot(attn_metadata),
-            "resident_state_after": active_resident_state_snapshot(
-                self._sorted_resident_state,
-                attn_metadata,
-            ),
-            "resident_workspace": cpu_snapshot(workspace),
-            "physical_block_ids": block_ids,
-            "cache_before_lmcache": (
-                target_cache_snapshot(kv_cache, block_ids)
-                if kv_cache is not None
-                else None
-            ),
-        }
-        path = target_sfa_path(session, layer, phase)
-        atomic_torch_save(payload, path)
-        logger.warning(
-            "[TARGET_SFA_DIAG] step=%d layer=%d phase=%s sync passed; saved=%s",
-            session.step_id,
-            layer,
-            phase,
-            path,
-        )
-        return session, layer, block_ids
-
-    def _target_sfa_diag_post_retrieve(
-        self,
-        diagnostic: tuple[Any, int, list[int]] | None,
-    ) -> None:
-        if diagnostic is None:
-            return
-        session, layer, block_ids = diagnostic
-        phase = "lmcache"
-        logger.warning(
-            "[TARGET_SFA_DIAG] step=%d layer=%d phase=%s sync started",
-            session.step_id,
-            layer,
-            phase,
-        )
-        try:
-            torch.npu.synchronize()
-        except Exception as error:
-            self._target_sfa_diag_failure(
-                session,
-                layer,
-                phase,
-                error,
-            )
-            logger.exception(
-                "[TARGET_SFA_DIAG] step=%d layer=%d phase=%s sync failed",
-                session.step_id,
-                layer,
-                phase,
-            )
-            raise
-        runtime = self._staged_sfa_capture_state.runtime
-        kv_cache = runtime[1] if runtime is not None else None
-        payload = {
-            "schema_version": TARGET_SFA_DIAG_SCHEMA_VERSION,
-            "step_id": session.step_id,
-            "rank": session.rank,
-            "pid": os.getpid(),
-            "layer": layer,
-            "phase": phase,
-            "physical_block_ids": block_ids,
-            "cache_after_lmcache": (
-                target_cache_snapshot(kv_cache, block_ids)
-                if kv_cache is not None
-                else None
-            ),
-        }
-        path = target_sfa_path(session, layer, phase)
-        atomic_torch_save(payload, path)
-        logger.warning(
-            "[TARGET_SFA_DIAG] step=%d layer=%d phase=%s sync passed; saved=%s",
-            session.step_id,
-            layer,
-            phase,
-            path,
-        )
-
     @staticmethod
     def _layer_has_indexer_by_name(
         context: Any,
@@ -5088,126 +4581,7 @@ class AscendSFAImpl(MLAAttentionImpl):
             if request_ids is None:
                 raise RuntimeError("staged SFA request ids are unavailable")
             request_count = len(request_ids)
-            content_diagnostic = (
-                self._staged_graph_content_diagnostic_enabled(layer_name)
-            )
             graph_key = context.staged_sfa_graph_key
-            actual_rows = min(
-                int(attn_metadata.num_actual_tokens),
-                int(graph_key.token_capacity),
-            )
-            diagnostic_rows = min(actual_rows, 4)
-            diagnostic_width = 8
-            bridge = self._staged_sfa_bridge_buffers
-            if content_diagnostic and bridge is not None:
-                if producer_event is not None:
-                    # Match the production LMCache dependency before reading
-                    # Graph-A bridge buffers. This is a device-side stream
-                    # wait, not a host synchronization.
-                    torch.npu.current_stream().wait_event(producer_event)
-                queue_selected_topk_fingerprint(
-                    req_ids=request_ids,
-                    layer_name=layer_name,
-                    topk_indices=bridge[2][: graph_key.token_capacity],
-                    row_request_indices=attn_metadata.decode_req_indices_cpu,
-                    seq_lens_cpu=attn_metadata.seq_lens_cpu,
-                    num_decode_tokens=attn_metadata.num_decode_tokens,
-                    num_actual_tokens=attn_metadata.num_actual_tokens,
-                    attn_state=attn_metadata.attn_state,
-                    decode_valid_rows_all=(
-                        attn_metadata.decode_valid_rows_all
-                    ),
-                    num_hidden_layers=self.diagnostic_num_cache_layers,
-                )
-                runtime = state.runtime
-                diagnostic_index_slots = (
-                    attn_metadata.indexer_c8_slot_mapping
-                    if self.use_sparse_c8_indexer and attn_metadata.indexer_c8_slot_mapping is not None
-                    else attn_metadata.indexer_slot_mapping
-                )
-                pre_components = {
-                    "ql_nope": bridge[0][:diagnostic_rows],
-                    "q_pe": bridge[1][:diagnostic_rows],
-                    "raw_topk_sample": bridge[2][:diagnostic_rows].reshape(diagnostic_rows, -1)[:, :diagnostic_width],
-                    "selected_packed_sample": selected_packed[:request_count, :diagnostic_width],
-                    "selected_counts": selected_counts[:request_count],
-                    "target_slots_sample": target_slots[:request_count, :diagnostic_width],
-                    "row_req_indices": attn_metadata.decode_req_indices[: graph_key.token_capacity],
-                    "cum_query_lens": attn_metadata.cum_query_lens,
-                    "seq_lens": attn_metadata.seq_lens,
-                    "slot_mapping": attn_metadata.slot_mapping[: graph_key.token_capacity],
-                    "indexer_slot_mapping": (diagnostic_index_slots[: graph_key.token_capacity]),
-                }
-                if self.dsa_cp_decoder:
-                    query_rows = min(self._cp_query_rows(graph_key.token_capacity), diagnostic_rows)
-                    pre_components["ql_nope"] = bridge[0][:query_rows]
-                    pre_components["q_pe"] = bridge[1][:query_rows]
-                    pre_components["query_row_req_indices"] = self._cp_local(
-                        attn_metadata.decode_req_indices, -1
-                    )[:query_rows]
-                input_snapshot = state.input_diagnostic_buffers.get(
-                    graph_key
-                )
-                if input_snapshot is not None:
-                    pre_components["hidden_input_sample"] = (
-                        input_snapshot[:diagnostic_rows]
-                    )
-                if actual_rows < graph_key.token_capacity:
-                    pre_components["padding_topk_sample"] = bridge[2][
-                        actual_rows : graph_key.token_capacity
-                    ].reshape(
-                        graph_key.token_capacity - actual_rows, -1
-                    )[:, :diagnostic_width]
-                if runtime is not None and diagnostic_rows and len(runtime[1]) > 2:
-                    kv_cache = runtime[1]
-                    flat_index = kv_cache[2].reshape(
-                        -1, *kv_cache[2].shape[2:]
-                    )
-                    current_index_slots = (
-                        diagnostic_index_slots[:diagnostic_rows]
-                        .clamp(
-                            min=0,
-                            max=int(flat_index.shape[0]) - 1,
-                        )
-                        .long()
-                    )
-                    pre_components.update(
-                        {
-                            "current_index": flat_index.index_select(
-                                0, current_index_slots
-                            ),
-                        }
-                    )
-                    if self.use_sparse_c8_indexer:
-                        pre_components["current_index_scale"] = (
-                            kv_cache[3].reshape(-1, 1).index_select(0, current_index_slots)
-                        )
-                if state.remap_boundary is not None:
-                    pre_components["remap_boundary"] = (
-                        state.remap_boundary[:actual_rows]
-                    )
-                queue_staged_graph_stage_fingerprint(
-                    req_ids=request_ids,
-                    layer_name=layer_name,
-                    stage="after_graph_pre_before_retrieve",
-                    components=pre_components,
-                    row_request_indices=attn_metadata.decode_req_indices_cpu,
-                    seq_lens_cpu=attn_metadata.seq_lens_cpu,
-                    num_decode_tokens=attn_metadata.num_decode_tokens,
-                    num_actual_tokens=attn_metadata.num_actual_tokens,
-                    attn_state=attn_metadata.attn_state,
-                    num_hidden_layers=self.diagnostic_num_cache_layers,
-                    graph_key=graph_key,
-                )
-            target_diagnostic = self._target_sfa_diag_pre_retrieve(
-                layer_name,
-                selected_packed,
-                selected_counts,
-                target_slots,
-                attn_metadata,
-                context,
-                request_count,
-            )
             wait_for_kv_layer_from_connector(
                 layer_name,
                 selected_tokens=selected_packed[:request_count],
@@ -5217,65 +4591,6 @@ class AscendSFAImpl(MLAAttentionImpl):
                 selected_token_counts=selected_counts[:request_count],
                 payload_event=producer_event,
             )
-            self._target_sfa_diag_post_retrieve(target_diagnostic)
-            if content_diagnostic and request_count:
-                sample_width = min(8, int(target_slots.shape[-1]))
-                sampled_slots = target_slots[
-                    :request_count, :sample_width
-                ].reshape(-1)
-                runtime = state.runtime
-                if runtime is not None:
-                    kv_cache = runtime[1]
-                    flat_nope = kv_cache[0].reshape(
-                        -1, *kv_cache[0].shape[2:]
-                    )
-                    flat_pe = kv_cache[1].reshape(
-                        -1, *kv_cache[1].shape[2:]
-                    )
-                    safe_slots = sampled_slots.clamp(
-                        min=0,
-                        max=min(
-                            int(flat_nope.shape[0]),
-                            int(flat_pe.shape[0]),
-                        )
-                        - 1,
-                    ).long()
-                    queue_staged_graph_stage_fingerprint(
-                        req_ids=request_ids,
-                        layer_name=layer_name,
-                        stage="after_selective_retrieve_before_graph_post",
-                        components={
-                            "selected_counts": selected_counts[
-                                :request_count
-                            ],
-                            "selected_packed_sample": selected_packed[
-                                :request_count, :sample_width
-                            ],
-                            "target_slots_sample": sampled_slots,
-                            "retrieved_nope_sample": flat_nope.index_select(
-                                0, safe_slots
-                            ),
-                            "retrieved_pe_sample": flat_pe.index_select(
-                                0, safe_slots
-                            ),
-                        },
-                        row_request_indices=(
-                            attn_metadata.decode_req_indices_cpu
-                        ),
-                        seq_lens_cpu=attn_metadata.seq_lens_cpu,
-                        num_decode_tokens=attn_metadata.num_decode_tokens,
-                        num_actual_tokens=attn_metadata.num_actual_tokens,
-                        attn_state=attn_metadata.attn_state,
-                        num_hidden_layers=self.diagnostic_num_cache_layers,
-                        graph_key=graph_key,
-                    )
-            if getattr(self, "_lmcache_load_stat_enabled", False):
-                self._record_lmcache_load_stat(
-                    layer_name,
-                    selected_counts,
-                    request_count=request_count,
-                    decode_rows=request_count * self.decode_threshold,
-                )
             if _LMCACHE_SPARSE_WAIT_SYNC_ONCE and not _lmcache_sparse_wait_sync_once_done:
                 _sync_compute_stream_after_lmcache_sparse_wait()
             if next_layer_name:
@@ -5313,54 +4628,8 @@ class AscendSFAImpl(MLAAttentionImpl):
                 ),
             )
             runtime = self._staged_sfa_capture_state.runtime
-            graph_key = getattr(context, "staged_sfa_graph_key", None)
             if not is_dummy and runtime and runtime[2] is not None and runtime[3]:
                 wait_for_kv_layer_from_connector(runtime[2])
-            if (
-                not is_dummy
-                and graph_key is not None
-                and runtime is not None
-                and self._staged_graph_content_diagnostic_enabled(layer_name)
-                and len(runtime[1]) > 2
-            ):
-                kv_cache = runtime[1]
-                diagnostic_index_slots = (
-                    metadata.indexer_c8_slot_mapping
-                    if self.use_sparse_c8_indexer and metadata.indexer_c8_slot_mapping is not None
-                    else metadata.indexer_slot_mapping
-                )
-                flat_index = kv_cache[2].reshape(
-                    -1, *kv_cache[2].shape[2:]
-                )
-                actual_rows = min(
-                    int(metadata.num_actual_tokens),
-                    int(graph_key.token_capacity),
-                )
-                current_slots = (
-                    diagnostic_index_slots[:actual_rows].clamp(min=0, max=int(flat_index.shape[0]) - 1).long()
-                )
-                queue_staged_graph_stage_fingerprint(
-                    req_ids=metadata.decode_request_ids_compact,
-                    layer_name=layer_name,
-                    stage="before_graph_pre",
-                    components={
-                        "slot_mapping": metadata.slot_mapping[: graph_key.token_capacity],
-                        "indexer_slot_mapping": (diagnostic_index_slots[: graph_key.token_capacity]),
-                        "current_index": flat_index.index_select(0, current_slots),
-                        **(
-                            {"current_index_scale": kv_cache[3].reshape(-1, 1).index_select(0, current_slots)}
-                            if self.use_sparse_c8_indexer
-                            else {}
-                        ),
-                    },
-                    row_request_indices=metadata.decode_req_indices_cpu,
-                    seq_lens_cpu=metadata.seq_lens_cpu,
-                    num_decode_tokens=metadata.num_decode_tokens,
-                    num_actual_tokens=metadata.num_actual_tokens,
-                    attn_state=metadata.attn_state,
-                    num_hidden_layers=self.diagnostic_num_cache_layers,
-                    graph_key=graph_key,
-                )
 
     def cross_layer_graph_post(
         self,
@@ -5397,61 +4666,6 @@ class AscendSFAImpl(MLAAttentionImpl):
             prefetch=prefetch,
             dcp=getattr(attn_metadata, "sfa_dcp", None),
             **({"query_gather": query_gather} if query_gather is not None else {}),
-        )
-        if self._staged_graph_content_diagnostic_enabled(layer_name):
-            state = self._staged_sfa_capture_state
-            diagnostic_rows = min(int(output.shape[0]), 4)
-            diagnostic_output = output[:diagnostic_rows].reshape(
-                diagnostic_rows, -1
-            )[:, :256]
-            snapshot = state.post_diagnostic_buffers.get(graph_key)
-            if snapshot is None:
-                if get_forward_context().cudagraph_runtime_mode != CUDAGraphMode.NONE:
-                    raise RuntimeError(
-                        "staged SFA output diagnostic buffer was not created "
-                        "by eager warmup"
-                    )
-                snapshot = torch.empty_like(diagnostic_output)
-                state.post_diagnostic_buffers[graph_key] = snapshot
-            if tuple(snapshot.shape) != tuple(diagnostic_output.shape):
-                raise RuntimeError(
-                    "staged SFA output diagnostic buffer shape changed"
-                )
-            snapshot.copy_(diagnostic_output)
-
-    def queue_staged_graph_post_diagnostic(
-        self,
-        layer_name: str,
-        graph_key: StagedSFAGraphKey,
-        metadata: AscendSFAMetadata,
-    ) -> None:
-        """Queue the graph-captured post output after replay has completed."""
-        if not self._staged_graph_content_diagnostic_enabled(layer_name):
-            return
-        snapshot = self._staged_sfa_capture_state.post_diagnostic_buffers.get(
-            graph_key
-        )
-        if snapshot is None:
-            return
-        row_owners = metadata.decode_req_indices_cpu
-        actual_rows = min(int(metadata.num_actual_tokens), int(snapshot.shape[0]))
-        if enable_sp():
-            local_rows = (graph_key.token_capacity + self.tp_size - 1) // self.tp_size
-            row_start = self.tp_rank * local_rows
-            actual_rows = min(int(snapshot.shape[0]), max(graph_key.token_capacity - row_start, 0))
-            row_owners = row_owners[row_start : row_start + actual_rows]
-        queue_staged_graph_stage_fingerprint(
-            req_ids=metadata.decode_request_ids_compact,
-            layer_name=layer_name,
-            stage="after_graph_post",
-            components={"attention_output": snapshot[:actual_rows]},
-            row_request_indices=row_owners,
-            seq_lens_cpu=metadata.seq_lens_cpu,
-            num_decode_tokens=metadata.num_decode_tokens,
-            num_actual_tokens=metadata.num_actual_tokens,
-            attn_state=metadata.attn_state,
-            num_hidden_layers=self.diagnostic_num_cache_layers,
-            graph_key=graph_key,
         )
 
     def submit_cross_layer_save(self) -> None:
@@ -5586,10 +4800,6 @@ class AscendSFAImpl(MLAAttentionImpl):
         )
         if self.use_sparse_c8_indexer and attn_metadata.indexer_c8_slot_mapping is not None:
             idx_slot_mapping = attn_metadata.indexer_c8_slot_mapping
-        content_diagnostics_enabled = (
-            bool(attn_metadata.req_ids)
-            and npu_content_diagnostics_enabled()
-        )
         slot_mapping_cp = None
         if self.enable_dsa_cp:
             assert attn_metadata.dsa_cp_context is not None
@@ -5618,26 +4828,17 @@ class AscendSFAImpl(MLAAttentionImpl):
 
         # run mlapo ops when dsa-cp is disabled, and ensure that num_tokens satisfies the count limitation
         if self.enable_mlapo and num_input_tokens <= MLAPO_MAX_SUPPORTED_TOKENS:
+            # MLAPO writes latent KV inside the fused projection.
             if self._layerwise_prefill_p_node:
-                hidden_states, ql_nope, q_pe, q_c = self._sfa_preprocess_with_mlapo_after_layerwise_wait(
-                    layer_name=layer_name,
-                    attn_metadata=attn_metadata,
-                    hidden_states=hidden_states,
-                    kv_cache=kv_cache,
-                    cos=cos,
-                    sin=sin,
-                    slot_mapping=slot_mapping,
-                    num_input_tokens=num_input_tokens,
-                )
-            else:
-                hidden_states, ql_nope, q_pe, q_c = self._sfa_preprocess_with_mlapo(
-                    hidden_states=hidden_states,
-                    kv_cache=kv_cache,
-                    cos=cos,
-                    sin=sin,
-                    slot_mapping=slot_mapping,
-                    num_input_tokens=num_input_tokens,
-                )
+                wait_for_kv_layer_from_connector(layer_name)
+            hidden_states, ql_nope, q_pe, q_c = self._sfa_preprocess_with_mlapo(
+                hidden_states=hidden_states,
+                kv_cache=kv_cache,
+                cos=cos,
+                sin=sin,
+                slot_mapping=slot_mapping,
+                num_input_tokens=num_input_tokens,
+            )
             if self.has_indexer:
                 k_li, k_li_scale = self.indexer_select_pre_process(x=hidden_states, cos=cos, sin=sin)
             else:
@@ -5679,10 +4880,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                     kv_cache,
                     slot_mapping_cp,
                     attn_metadata,
-                    diagnostic_layer_name=(
-                        layer_name if content_diagnostics_enabled else None
-                    ),
-                )
+                    )
             else:
                 _fc = get_forward_context()
                 _dsa_mgr_xkv = getattr(_fc, "dsa_offload_manager", None)
@@ -5710,12 +4908,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                             (_pknope, _pkpe),
                             _pslots,
                             attn_metadata,
-                            diagnostic_layer_name=(
-                                layer_name
-                                if content_diagnostics_enabled
-                                else None
-                            ),
-                        )
+                            )
                 else:
                     with _dsa_prof.section("exec_kv"):
                         k_pe, k_nope = self.exec_kv(
@@ -5725,12 +4918,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                             kv_cache,
                             slot_mapping,
                             attn_metadata,
-                            diagnostic_layer_name=(
-                                layer_name
-                                if content_diagnostics_enabled
-                                else None
-                            ),
-                        )
+                            )
 
             if self.enable_dsa_cp:
                 assert k_pe is not None
@@ -5846,50 +5034,6 @@ class AscendSFAImpl(MLAAttentionImpl):
                 # and does not advance the group-0 latent-layer cursor.
                 with _dsa_prof.section("lmc_index_retrieve"):
                     wait_for_kv_layer_from_connector(index_layer_name)
-            # Live Group-1 P2P populates the model cache without enabling the
-            # persistent LMCache indexer-load path.  Diagnose the exact
-            # model-visible rows for both transports, after any required wait
-            # and before this step scatters the current token into the cache.
-            if content_diagnostics_enabled:
-                queue_group1_first_consume(
-                    req_ids=attn_metadata.req_ids,
-                    layer_name=index_layer_name,
-                    indexer_cache=kv_cache[2],
-                    indexer_block_table=(
-                        attn_metadata.indexer_c8_block_table
-                        if self.use_sparse_c8_indexer and attn_metadata.indexer_c8_block_table is not None
-                        else attn_metadata.indexer_block_table
-                    ),
-                    seq_lens_cpu=attn_metadata.seq_lens_cpu,
-                    block_size=self.block_size,
-                    row_request_indices=attn_metadata.decode_req_indices_cpu,
-                    num_decode_tokens=attn_metadata.num_decode_tokens,
-                    num_actual_tokens=attn_metadata.num_actual_tokens,
-                    attn_state=attn_metadata.attn_state,
-                    decode_valid_rows_all=(attn_metadata.decode_valid_rows_all),
-                    group1_connector_wait_called=index_lmcache_enabled,
-                    num_hidden_layers=self.diagnostic_num_hidden_layers,
-                )
-                group1_cache_parts = {"index": kv_cache[2]}
-                group1_produced_parts = {"index": k_li}
-                if self.use_sparse_c8_indexer:
-                    assert len(kv_cache) == 4
-                    assert k_li_scale is not None
-                    group1_cache_parts["scale"] = kv_cache[3]
-                    group1_produced_parts["scale"] = k_li_scale
-                queue_cache_tail_fingerprint(
-                    req_ids=attn_metadata.req_ids,
-                    layer_name=index_layer_name or layer_name,
-                    kv_group=1,
-                    stage="group1_after_load_before_current_scatter",
-                    cache_parts=group1_cache_parts,
-                    produced_parts=group1_produced_parts,
-                    slot_mapping=idx_slot_mapping,
-                    query_start_loc_cpu=attn_metadata.query_start_loc_cpu,
-                    seq_lens_cpu=attn_metadata.seq_lens_cpu,
-                    num_actual_tokens=attn_metadata.num_actual_tokens,
-                    attn_state=attn_metadata.attn_state,
-                )
 
             # Match the latent-group write above: graph/speculative batches
             # may pad both ``k_li`` and ``indexer_slot_mapping`` to
@@ -5926,20 +5070,6 @@ class AscendSFAImpl(MLAAttentionImpl):
                 )
             if self.is_kv_producer:
                 attn_metadata.reshape_cache_event.record()
-            if content_diagnostics_enabled:
-                queue_cache_tail_fingerprint(
-                    req_ids=attn_metadata.req_ids,
-                    layer_name=index_layer_name or layer_name,
-                    kv_group=1,
-                    stage="group1_after_current_scatter",
-                    cache_parts=group1_cache_parts,
-                    produced_parts=group1_produced_parts,
-                    slot_mapping=idx_slot_mapping,
-                    query_start_loc_cpu=attn_metadata.query_start_loc_cpu,
-                    seq_lens_cpu=attn_metadata.seq_lens_cpu,
-                    num_actual_tokens=attn_metadata.num_actual_tokens,
-                    attn_state=attn_metadata.attn_state,
-                )
 
         with _dsa_prof.section("indexer"):
             if self.skip_topk:
@@ -5968,32 +5098,13 @@ class AscendSFAImpl(MLAAttentionImpl):
                 if self.dsa_cp_decoder:
                     topk_indices = self._cp_global_topk(topk_indices, attn_metadata.num_input_tokens)
                 if self._layerwise_prefill_p_node and index_lmcache_enabled:
-                    # The indexer has finished reading its own bank. Record
-                    # before top-k publication and latent SFA are submitted.
                     record_layerwise_prefill_bank_use(index_layer_name)
                 if self.index_cache_enabled:
                     # Publish this batch's top-k so downstream skip layers
                     # read it from the stable shared buffer.
                     self._update_indexcache_topk_indices(topk_indices)
             if self._layerwise_prefill_p_node and self.skip_topk and index_lmcache_enabled:
-                # Runtime index-cache skips still scatter this layer's KV;
-                # shared consumers without an indexer own no Group-1 bank.
                 record_layerwise_prefill_bank_use(index_layer_name)
-            if content_diagnostics_enabled:
-                queue_selected_topk_fingerprint(
-                    req_ids=attn_metadata.req_ids,
-                    layer_name=index_layer_name or layer_name,
-                    topk_indices=topk_indices,
-                    row_request_indices=attn_metadata.decode_req_indices_cpu,
-                    seq_lens_cpu=attn_metadata.seq_lens_cpu,
-                    num_decode_tokens=attn_metadata.num_decode_tokens,
-                    num_actual_tokens=attn_metadata.num_actual_tokens,
-                    attn_state=attn_metadata.attn_state,
-                    decode_valid_rows_all=(
-                        attn_metadata.decode_valid_rows_all
-                    ),
-                    num_hidden_layers=self.diagnostic_num_hidden_layers,
-                )
 
         # DSA Step B2 (compact-scratch decode): the indexer just produced topk.
         # Remap LMCache-selected entries to compact scratch rows [0..n_ret)
@@ -6008,7 +5119,7 @@ class AscendSFAImpl(MLAAttentionImpl):
             and self.dsa_shrink_latent
             and attn_metadata.split_boundary is not None
             and attn_metadata.num_decode_tokens > 0
-            and (attn_metadata.need_sparse_lmcache_payload or self.dsa_shrink_latent == 3)
+            and attn_metadata.need_sparse_lmcache_payload
         ):
             # _split_boundary is per row. Decode rows start at prompt length by
             # default; decode-window mode replaces it with current_window_start.
@@ -6021,9 +5132,6 @@ class AscendSFAImpl(MLAAttentionImpl):
             _topk_rows = int(topk_indices.shape[0])
             _split_boundary = attn_metadata.split_boundary
             _decode_window_size = _decode_window_save_window_size()
-            _diag_remap_build = False
-            _diag_current_window_start = None
-            _diag_committed_end = None
             _cached_split_boundary = attn_metadata.decode_split_boundary
             if (
                 _cached_split_boundary is not None
@@ -6054,21 +5162,10 @@ class AscendSFAImpl(MLAAttentionImpl):
                         _lmcache_cached_tokens,
                         _decode_window_size,
                     )
-                    if _decode_window_size > 0 and _mtp_dw_diag_enabled():
-                        # Diagnostics only; these host values are intentionally
-                        # outside the production allocation-free contract.
-                        _diag_current_window_start = [
-                            max(int(seq_len) - 1, 0) // _decode_window_size * _decode_window_size
-                            for seq_len in attn_metadata.seq_lens_cpu
-                        ]
-                    if _lmcache_cached_tokens is not None:
-                        _diag_committed_end = _lmcache_cached_tokens
                 else:
                     # Connector frontier expansion is step metadata, not layer
                     # data. Reuse it for every remaining SFA layer in this step.
                     attn_metadata.decode_split_boundary = _split_boundary
-                _diag_remap_build = True
-            _absolute_topk_for_diag = topk_indices
             _row_req_indices = attn_metadata.decode_req_indices
             if _row_req_indices is None:
                 raise RuntimeError("DSA union remap requires row request indices")
@@ -6122,377 +5219,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                     resident_writes=resident_writes,
                 )
             _sparse_indices_padding_zeroed = _is_pure_decode
-            _diag_context = get_forward_context() if _mtp_dw_diag_enabled() and _diag_remap_build else None
-            if _diag_context is not None and getattr(_diag_context, "mtp_dw_diag_req_ids", None):
-                _diag_req_ids = getattr(_diag_context, "dsa_req_ids", None)
-                _diag_sampled_req_ids = getattr(_diag_context, "mtp_dw_diag_req_ids", set())
-                _diag_row_req_indices = getattr(attn_metadata, "decode_req_indices_cpu", None)
-                if _diag_row_req_indices is None:
-                    _diag_row_req_indices = getattr(attn_metadata, "decode_req_indices", None)
-                _diag_row_req_indices_list = diagnostic_values_to_list(_diag_row_req_indices)
-                _diag_positions = (attn_metadata.seq_lens.to(torch.long) - 1).detach().cpu().tolist()
-                _diag_boundaries = _split_boundary.detach().cpu().tolist()
-                _diag_prompt_lens = (
-                    _diag_context.dsa_prompt_lens.detach().cpu().tolist()
-                    if getattr(_diag_context, "dsa_prompt_lens", None) is not None
-                    else []
-                )
-                _diag_windows = (
-                    diagnostic_values_to_list(_diag_current_window_start)
-                    if _diag_current_window_start is not None
-                    else []
-                )
-                _diag_committed = (
-                    diagnostic_values_to_list(_diag_committed_end) if _diag_committed_end is not None else []
-                )
-                _diag_scratch = []
-                _diag_absolute = _absolute_topk_for_diag.detach().cpu()
-                _diag_packed = _sel_packed.detach().cpu() if _sel_packed is not None else None
-                _diag_deep_req_ids = (
-                    (getattr(_diag_context, "mtp_dw_deep_diag_req_ids", None) or set())
-                    if envs.VLLM_ASCEND_MTP_DW_DEEP_DIAG and self.dsa_shrink_latent == 2
-                    else set()
-                )
-                _diag_deep_emitted_req_ids = getattr(_diag_context, "mtp_dw_deep_diag_emitted_req_ids", None)
-                if _diag_deep_req_ids:
-                    if _diag_deep_emitted_req_ids is None:
-                        _diag_deep_emitted_req_ids = set()
-                        _diag_context.mtp_dw_deep_diag_emitted_req_ids = _diag_deep_emitted_req_ids
-                    _diag_deep_req_ids = _diag_deep_req_ids - _diag_deep_emitted_req_ids
-                _diag_row_offsets = (
-                    diagnostic_values_to_list(getattr(attn_metadata, "decode_row_offsets", None))
-                    if _diag_deep_req_ids
-                    else []
-                )
-                _diag_current_positions = (
-                    diagnostic_values_to_list(getattr(attn_metadata, "decode_current_positions_cpu", None))
-                    if _diag_deep_req_ids
-                    else []
-                )
-                _diag_target_slots = (
-                    diagnostic_values_to_list(getattr(attn_metadata, "decode_target_slot_mapping", None))
-                    if _diag_deep_req_ids
-                    else []
-                )
-                _diag_selected_counts = (
-                    _selected_token_counts.detach().cpu().tolist()
-                    if _diag_deep_req_ids and _selected_token_counts is not None
-                    else []
-                )
-                _diag_compact_row = (
-                    {
-                        source_row: int(req_index)
-                        for source_row, req_index in enumerate(_diag_row_req_indices_list)
-                        if int(req_index) >= 0
-                    }
-                    if _diag_deep_req_ids
-                    else {}
-                )
-                _diag_deep_emitted_this_layer: set[str] = set()
-                _diag_deep_payloads: dict[str, dict[str, Any]] = {}
-                seen_scratch: dict[str, set[int]] = {}
-                for row, req_index in enumerate(_diag_row_req_indices_list):
-                    if req_index < 0 or row >= len(_diag_boundaries):
-                        continue
-                    req_id = (
-                        str(_diag_req_ids[req_index])
-                        if _diag_req_ids is not None and req_index < len(_diag_req_ids)
-                        else None
-                    )
-                    if req_id not in _diag_sampled_req_ids:
-                        continue
-                    boundary = int(_diag_boundaries[row])
-                    absolute_row = _diag_absolute[row].reshape(-1)
-                    selected_absolute = absolute_row[(absolute_row >= 0) & (absolute_row < boundary)]
-                    packed_row = (
-                        _diag_packed[int(req_index)].reshape(-1)
-                        if _diag_packed is not None and int(req_index) < _diag_packed.shape[0]
-                        else torch.empty(0, dtype=torch.long)
-                    )
-                    scratch_base = int(_diag_scratch[row]) if row < len(_diag_scratch) else None
-                    current_position = (
-                        int(_diag_current_positions[row])
-                        if row < len(_diag_current_positions)
-                        else int(_diag_positions[req_index])
-                        if req_index < len(_diag_positions)
-                        else 0
-                    )
-                    prompt_len = int(_diag_prompt_lens[row]) if row < len(_diag_prompt_lens) else current_position
-                    distance = min(
-                        current_position % _decode_window_size,
-                        (-current_position) % _decode_window_size,
-                    )
-                    sample_row = current_position - prompt_len < 3 or distance <= 4
-                    _post_commit_req_ids = getattr(
-                        _diag_context,
-                        "mtp_dw_diag_post_commit_req_ids",
-                        None,
-                    )
-                    if _post_commit_req_ids is not None and req_id in _post_commit_req_ids:
-                        sample_row = True
-                    committed = int(_diag_committed[req_index]) if req_index < len(_diag_committed) else None
-                    current_window = int(_diag_windows[req_index]) if req_index < len(_diag_windows) else None
-                    if req_id in _diag_deep_req_ids:
-                        _diag_deep_emitted_this_layer.add(req_id)
-                        row_offset = int(_diag_row_offsets[row]) if row < len(_diag_row_offsets) else 0
-                        effective_scratch_base = scratch_base or 0
-                        compact_row = _diag_compact_row.get(row)
-                        selected_count = (
-                            int(_diag_selected_counts[compact_row])
-                            if compact_row is not None and compact_row < len(_diag_selected_counts)
-                            else int(selected_absolute.numel())
-                        )
-                        packed_values = packed_row.tolist()
-                        absolute_values = absolute_row.tolist()
-                        selected_absolute_values = selected_absolute.tolist()
-                        payload_width = len(packed_values)
-                        block_size = int(kv_cache[0].shape[1])
-                        block_table_row = attn_metadata.block_table[int(req_index)].detach().cpu().tolist()
-                        scratch_safety = scratch_target_safety(
-                            block_table_row,
-                            effective_scratch_base,
-                            selected_count,
-                            boundary,
-                            current_position,
-                            block_size,
-                        )
-                        actual_target_slots = (
-                            [int(value) for value in _diag_target_slots[compact_row]]
-                            if compact_row is not None and compact_row < len(_diag_target_slots)
-                            else None
-                        )
-                        if actual_target_slots is not None:
-                            consumed_target_slots = actual_target_slots[:selected_count]
-                            actual_aliases = sorted(
-                                set(consumed_target_slots).intersection(scratch_safety["live_slots"])
-                            )
-                        else:
-                            consumed_target_slots = []
-                            actual_aliases = []
-                        try:
-                            derived_target_slots, live_slots, _ = scratch_live_slot_aliases(
-                                block_table_row,
-                                range(
-                                    effective_scratch_base,
-                                    effective_scratch_base + payload_width,
-                                ),
-                                boundary,
-                                current_position,
-                                block_size,
-                            )
-                            target_slots = actual_target_slots or derived_target_slots
-                            consumed_target_slots = target_slots[:selected_count]
-                            aliases = sorted(set(consumed_target_slots).intersection(live_slots))
-                            if target_slots != derived_target_slots:
-                                _mtp_dw_event(
-                                    "fail",
-                                    invariant="deep_target_slot_mapping",
-                                    tp_rank=self.tp_rank,
-                                    tp_world=self.tp_size,
-                                    req=req_id,
-                                    row=row,
-                                    req_index=int(req_index),
-                                    derived_sample=derived_target_slots[:8],
-                                    actual_sample=target_slots[:8],
-                                )
-                        except ValueError as error:
-                            _mtp_dw_event(
-                                "fail",
-                                invariant="deep_physical_slot_mapping",
-                                tp_rank=self.tp_rank,
-                                tp_world=self.tp_size,
-                                req=req_id,
-                                row=row,
-                                req_index=int(req_index),
-                                row_offset=row_offset,
-                                scratch_base=effective_scratch_base,
-                                current_position=current_position,
-                                prompt_len=prompt_len,
-                                committed_end=committed,
-                                boundary=boundary,
-                                detail=str(error),
-                            )
-                            target_slots = actual_target_slots or []
-                            live_slots = scratch_safety["live_slots"]
-                            aliases = actual_aliases
-                        deep_common = {
-                            "tp_rank": self.tp_rank,
-                            "tp_world": self.tp_size,
-                            "worker_rank": self.tp_rank,
-                            "layer": layer_name,
-                            "req": req_id,
-                            "frontier": current_position,
-                            "window_start": current_window,
-                            "window_end": committed,
-                            "kv_group": 0,
-                            "row": row,
-                            "req_index": int(req_index),
-                            "row_offset": row_offset,
-                            "scratch_base": effective_scratch_base,
-                            "current_position": current_position,
-                            "prompt_len": prompt_len,
-                            "committed_end": committed,
-                            "boundary": boundary,
-                        }
-                        _mtp_dw_event(
-                            "deep",
-                            event="row_mapping",
-                            **deep_common,
-                            selection_width=len(absolute_values),
-                            lmcache_selected_count=selected_count,
-                            selected_absolute_sample=selected_absolute_values[:8],
-                            selected_absolute_checksum=diagnostic_int_checksum(selected_absolute_values),
-                            live_physical_count=len(live_slots),
-                            live_physical_sample=live_slots[:8],
-                            live_physical_checksum=diagnostic_int_checksum(live_slots),
-                            checksum_scope="first32",
-                        )
-                        _mtp_dw_event(
-                            "deep",
-                            event="scratch_target_safety",
-                            **deep_common,
-                            selected_count=selected_count,
-                            target_logical_start=scratch_safety["target_logical_start"],
-                            target_logical_end=scratch_safety["target_logical_end"],
-                            target_block_start=scratch_safety["target_block_start"],
-                            target_block_end=scratch_safety["target_block_end"],
-                            target_block_values=scratch_safety["target_block_values"][:8],
-                            target_block_checksum=diagnostic_int_checksum(
-                                value for value in scratch_safety["target_block_values"] if value is not None
-                            ),
-                            valid_logical_end=scratch_safety["valid_logical_end"],
-                            target_within_committed=scratch_safety["target_within_committed"],
-                            target_beyond_current_sequence=scratch_safety["target_beyond_current_sequence"],
-                            target_unmapped_count=scratch_safety["target_unmapped_count"],
-                            target_live_intersection_count=len(scratch_safety["target_live_intersection"]),
-                            target_live_intersection_sample=scratch_safety["target_live_intersection"][:8],
-                            actual_target_live_intersection_count=len(aliases),
-                            actual_target_live_intersection_sample=aliases[:8],
-                        )
-                        payload = _diag_deep_payloads.setdefault(
-                            req_id,
-                            {
-                                "common": {
-                                    "tp_rank": self.tp_rank,
-                                    "tp_world": self.tp_size,
-                                    "worker_rank": self.tp_rank,
-                                    "layer": layer_name,
-                                    "req": req_id,
-                                    "frontier": committed,
-                                    "window_start": (
-                                        max(0, committed - _decode_window_size) if committed is not None else None
-                                    ),
-                                    "window_end": committed,
-                                    "kv_group": 0,
-                                    "committed_end": committed,
-                                    "boundary": boundary,
-                                },
-                                "selection": [],
-                                "slots": [],
-                                "payload_count": 0,
-                                "target_count": 0,
-                                "selected_count": 0,
-                                "aliases": set(),
-                                "rows": [],
-                            },
-                        )
-                        remaining = max(0, 32 - len(payload["selection"]))
-                        consumed_packed_values = packed_values[:selected_count]
-                        payload["selection"].extend(consumed_packed_values[:remaining])
-                        payload["slots"].extend(consumed_target_slots[:remaining])
-                        payload["payload_count"] += len(consumed_packed_values)
-                        payload["target_count"] += len(consumed_target_slots)
-                        payload["selected_count"] += selected_count
-                        payload["aliases"].update(aliases)
-                        payload["rows"].append(row)
-                        if aliases:
-                            _mtp_dw_event(
-                                "fail",
-                                invariant="scratch_live_slot_alias",
-                                **deep_common,
-                                intersection_count=len(aliases),
-                                intersection_sample=aliases[:8],
-                            )
-                    if req_id is not None and scratch_base is not None:
-                        bases = seen_scratch.setdefault(req_id, set())
-                        if scratch_base in bases:
-                            _mtp_dw_event(
-                                "fail",
-                                req=req_id,
-                                frontier=current_position,
-                                invariant="distinct_mtp_scratch_bases",
-                                row=row,
-                                scratch_base=scratch_base,
-                            )
-                        bases.add(scratch_base)
-                    if (
-                        committed is not None
-                        and current_window is not None
-                        and boundary != min(current_window, committed)
-                    ):
-                        _mtp_dw_event(
-                            "fail",
-                            req=req_id,
-                            frontier=current_position,
-                            invariant="remap_boundary",
-                            current_window_start=current_window,
-                            committed_end=committed,
-                            remap_boundary=boundary,
-                        )
-                    if not sample_row:
-                        continue
-                    _mtp_dw_event(
-                        "remap",
-                        req=req_id,
-                        frontier=current_position,
-                        row=row,
-                        req_index=int(req_index),
-                        current_position=current_position,
-                        window_start=(int(_diag_windows[req_index]) if req_index < len(_diag_windows) else None),
-                        window_end=None,
-                        committed_end=(int(_diag_committed[req_index]) if req_index < len(_diag_committed) else None),
-                        remap_boundary=boundary,
-                        scratch_base=scratch_base,
-                        selected_absolute_count=int(selected_absolute.numel()),
-                        selected_absolute_min=(int(selected_absolute.min()) if selected_absolute.numel() else None),
-                        selected_absolute_max=(int(selected_absolute.max()) if selected_absolute.numel() else None),
-                        selected_absolute_sample=selected_absolute[:8].tolist(),
-                        selected_packed_count=int(selected_absolute.numel()),
-                        selected_packed_min=(
-                            int(packed_row[: selected_absolute.numel()].min()) if selected_absolute.numel() else None
-                        ),
-                        selected_packed_max=(
-                            int(packed_row[: selected_absolute.numel()].max()) if selected_absolute.numel() else None
-                        ),
-                        selected_packed_sample=packed_row[: min(8, selected_absolute.numel())].tolist(),
-                    )
-                for payload in _diag_deep_payloads.values():
-                    packed_values = payload["selection"]
-                    target_slots = payload["slots"]
-                    aliases = sorted(payload["aliases"])
-                    _mtp_dw_event(
-                        "deep",
-                        event="connector_payload",
-                        **payload["common"],
-                        rows=payload["rows"],
-                        row_count=len(payload["rows"]),
-                        payload_count=payload["payload_count"],
-                        lmcache_selected_count=payload["selected_count"],
-                        selection_sample=packed_values[:8],
-                        selection_checksum=diagnostic_int_checksum(packed_values),
-                        target_physical_count=payload["target_count"],
-                        target_slot_sample=target_slots[:8],
-                        target_slot_checksum=diagnostic_int_checksum(target_slots),
-                        checksum_scope="first32",
-                        live_slot_intersection_count=len(aliases),
-                        live_slot_intersection_sample=aliases[:8],
-                    )
-                if _diag_deep_emitted_req_ids is not None and _diag_deep_emitted_this_layer:
-                    _diag_deep_emitted_req_ids.update(_diag_deep_emitted_this_layer)
-            # Stage 3 = isolation diagnostic: remap + FA on (garbage) scratch but
-            # NO LMCache call. Output is expected wrong; only crash/no-crash
-            # matters (crash => our remap/FA, clean => LMCache transfer kernel).
-            if self.dsa_shrink_latent != 3 and _sel_packed is not None:
+            if _sel_packed is not None:
                 _selected_for_wait = _sel_packed
                 _target_slot_mapping_for_wait = _target_slot_mapping
                 _request_ids_for_wait = attn_metadata.decode_request_ids_compact
@@ -6505,16 +5232,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                         request_ids=_request_ids_for_wait,
                         selected_token_counts=_selected_token_counts,
                     )
-                if (
-                    _request_ids_for_wait is not None
-                    and getattr(self, "_lmcache_load_stat_enabled", False)
-                ):
-                    self._record_lmcache_load_stat(
-                        layer_name,
-                        _selected_token_counts,
-                        request_count=len(_request_ids_for_wait),
-                        decode_rows=attn_metadata.num_decode_tokens,
-                    )
+
                 if _LMCACHE_SPARSE_WAIT_SYNC_ONCE and not _lmcache_sparse_wait_sync_once_done:
                     _sync_compute_stream_after_lmcache_sparse_wait()
 
@@ -6610,24 +5328,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                 with _dsa_prof.section("ad_release"):
                     _ac.release_after_fa(layer_name, _res_a.loaded_ids)
                 _dsa_prof.step()
-                if envs.VLLM_ASCEND_DSA_OFFLOAD_ASSERT_PARITY:
-                    native_out = self._execute_sparse_flash_attention_process(
-                        ql_nope,
-                        q_pe,
-                        kv_cache,
-                        topk_indices,
-                        attn_metadata,
-                        actual_seq_lengths_query,
-                        actual_seq_lengths_key,
-                        layer_name=layer_name,
-                        trace_label="adapter_parity_native",
-                        padding_rows_zeroed=_sparse_indices_padding_zeroed,
-                    )
-                    diff = (native_out.float() - adapter_out.float()).abs().max()
-                    logger.info("[DSA-ADAPTER-PARITY] layer=%s max_abs_diff=%s", layer_name, float(diff))
-                    attn_output = native_out  # generation uses the native result
-                else:
-                    attn_output = adapter_out
+                attn_output = adapter_out
             else:
                 # prefill: store this layer's prompt latent into the adapter backend so
                 # decode-time retrieve can fetch prefill-selected blocks; attention
@@ -6679,24 +5380,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                         trace_label="lmcache_scratch",
                     )
                 _dsa_prof.step()
-                if envs.VLLM_ASCEND_DSA_OFFLOAD_ASSERT_PARITY and not self.dsa_offload_free_paged:
-                    native_out = self._execute_sparse_flash_attention_process(
-                        ql_nope,
-                        q_pe,
-                        kv_cache,
-                        topk_indices,
-                        attn_metadata,
-                        actual_seq_lengths_query,
-                        actual_seq_lengths_key,
-                        layer_name=layer_name,
-                        trace_label="lmcache_parity_native",
-                        padding_rows_zeroed=_sparse_indices_padding_zeroed,
-                    )
-                    diff = (native_out.float() - scratch_out.float()).abs().max()
-                    logger.info("[DSA-PARITY] layer=%s max_abs_diff=%s", layer_name, float(diff))
-                    attn_output = native_out  # safe: generation uses the native result
-                else:
-                    attn_output = scratch_out
+                attn_output = scratch_out
             else:
                 # prefill: (1) offload prompt latent to LMCache; (2) ALSO scatter it into
                 # the self-managed PagedLatentPool and run prefill attention from the pool
@@ -6724,24 +5408,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                     trace_label="pool_prefill",
                     padding_rows_zeroed=_sparse_indices_padding_zeroed,
                 )
-                if envs.VLLM_ASCEND_DSA_OFFLOAD_ASSERT_PARITY and not self.dsa_offload_free_paged:
-                    native_out = self._execute_sparse_flash_attention_process(
-                        ql_nope,
-                        q_pe,
-                        kv_cache,
-                        topk_indices,
-                        attn_metadata,
-                        actual_seq_lengths_query,
-                        actual_seq_lengths_key,
-                        layer_name=layer_name,
-                        trace_label="pool_prefill_parity_native",
-                        padding_rows_zeroed=_sparse_indices_padding_zeroed,
-                    )
-                    diff = (native_out.float() - pool_out.float()).abs().max()
-                    logger.info("[DSA-PARITY-PREFILL] layer=%s max_abs_diff=%s", layer_name, float(diff))
-                    attn_output = native_out  # safe: generation uses the native result
-                else:
-                    attn_output = pool_out
+                attn_output = pool_out
 
         if attn_output is None:
             with _dsa_prof.section("fa"):
@@ -6762,9 +5429,6 @@ class AscendSFAImpl(MLAAttentionImpl):
             _dsa_prof.step()
 
         if self._layerwise_prefill_p_node:
-            # All SFA reads of the latent bank are now submitted. The DMA
-            # stream waits on this exact point, excluding v_up/o_proj, FFN,
-            # and the next layer's normalization. Passive TP ranks mark it too.
             record_layerwise_prefill_bank_use(layer_name)
 
         # Offload to LMCache. Legacy un-bundled connectors save only the

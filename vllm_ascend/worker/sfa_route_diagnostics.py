@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Exceptional SFA route diagnostics, independent of PD_SERVING_PERF.
+"""Exceptional SFA route diagnostics for production and detailed traces.
 
 Only the native/rejected route calls the snapshot builder. Healthy graph
 selection checks an existing episode flag, without clocks or metadata scans.
@@ -9,13 +9,22 @@ Nothing here revalidates a route, reads device data or changes eligibility.
 import json
 import math
 import os
+import re
 import time
 
 import numpy as np
 from vllm.logger import logger
 
 from vllm_ascend.attention.utils import unwrap_staged_sfa_connector_metadata
-from vllm_ascend.serving_perf import _non_json_field, cold_perf_clock_fields
+from vllm_ascend.serving_perf import (
+    _non_json_field,
+    cold_perf_clock_fields,
+    cold_perf_detailed_enabled,
+    cold_perf_enabled,
+)
+
+
+_FAILED_ROW = re.compile(r"\[(\d+)\]$")
 
 
 def _name(value):
@@ -49,7 +58,8 @@ def _cpu_row_int(values, index):
 
 
 def _emit(action, reason, **fields):
-    logger.info(
+    emit = logger.error if fields.get("error") or action == "fatal" else logger.info
+    emit(
         "[SFA_ROUTE] action=%s reason=%s %s",
         action,
         reason,
@@ -79,7 +89,7 @@ class SFARouteDiagnostics:
             self.signature = None
         self.steps += 1
         changed = signature != self.signature
-        due = changed or now - self.last_report >= 5.0
+        due = changed or now - self.last_report >= (5.0 if cold_perf_detailed_enabled() else 60.0)
         if due:
             self.signature = signature
             self.last_report = now
@@ -122,6 +132,73 @@ class SFARouteDiagnostics:
         self.active = False
         self.signature = None
         self.request_ids = ()
+
+
+def _check_signature(checks, detailed):
+    # Most fallbacks carry a single batch-wide guard. A cold-resume row may move.
+    if detailed or not checks or (len(checks) == 1 and not checks[0].endswith("]")):
+        return checks
+    return frozenset(_FAILED_ROW.sub("", check) for check in checks)
+
+
+def _compact_snapshot(runner, route, local_route, request_ids, scheduled, scheduler_output, **context):
+    """Use the local guard's offending row when available, or identify a representative row."""
+    batch = getattr(runner, "input_batch", None)
+    sample = {}
+    prompt_guard = "computed_before_prompt_without_validated_cold_resume"
+    checks = local_route.failed_checks
+    candidates = range(len(request_ids)) if prompt_guard in checks else range(min(1, len(request_ids)))
+    basis = "batch_sample"
+    for check in checks:
+        match = _FAILED_ROW.search(check)
+        if match and (row := int(match[1])) < len(request_ids):
+            candidates = range(row, row + 1)
+            basis = check
+            break
+    for i in candidates:
+        computed = _cpu_row_int(getattr(batch, "num_computed_tokens_cpu", ()), i)
+        prompt = _cpu_row_int(getattr(batch, "num_prompt_tokens", ()), i)
+        cold = i < len(local_route.cold_compact_resumes) and local_route.cold_compact_resumes[i]
+        before_prompt = (
+            prompt_guard in checks and computed is not None and prompt is not None and computed < prompt and not cold
+        )
+        if not sample or before_prompt:
+            sample = dict(
+                request_ids=[request_ids[i]],
+                row=i,
+                row_reason=prompt_guard if before_prompt else basis,
+                computed_tokens=computed,
+                prompt_tokens=prompt,
+                history_tokens=_cpu_row_int(getattr(batch, "num_tokens_no_spec", ()), i),
+                scheduled_tokens=scheduled[i] if i < len(scheduled) else None,
+            )
+        if before_prompt:
+            break
+    metadata = unwrap_staged_sfa_connector_metadata(getattr(scheduler_output, "kv_connector_metadata", None))
+    items = getattr(metadata, "requests", None)
+    if sample and isinstance(items, (list, tuple)):
+        for item in items:
+            if getattr(item, "req_id", None) == sample["request_ids"][0] and not getattr(
+                item, "is_decode_window_save", False
+            ):
+                load = getattr(item, "load_spec", None)
+                sample["cached_tokens"] = _host_scalar(getattr(load, "lmcache_cached_tokens", None))
+                sample["can_load"] = _host_scalar(getattr(load, "can_load", None))
+                break
+    sample.setdefault("request_ids", [])
+    return dict(
+        **sample,
+        dp_rank=getattr(runner, "dp_rank", None),
+        origin=context.get("origin"),
+        num_reqs=context["num_reqs"],
+        attention_state=_name(runner.attn_state),
+        local_action=local_route.action.value,
+        local_reason=local_route.reason.value,
+        local_failed_checks=local_route.failed_checks,
+        failed_checks=route.failed_checks,
+        dp_action=context.get("dp_action"),
+        dp_peer_votes=getattr(runner, "_staged_sfa_diagnostic_peer_votes", None),
+    )
 
 
 def _snapshot(runner, route, local_route, request_ids, scheduled, scheduler_output, **context):
@@ -243,41 +320,68 @@ def apply_sfa_route_with_diagnostics(
     **context,
 ):
     """Snapshot before async reconciliation, then report selection or rejection."""
+    if not cold_perf_enabled() and route.action.value != "fatal":
+        try:
+            return runner._apply_staged_sfa_route(route)
+        except Exception as exc:
+            _emit(
+                route.action.value,
+                route.reason.value,
+                event="route_rejected",
+                dp_rank=getattr(runner, "dp_rank", None),
+                origin=context.get("origin"),
+                failed_checks=route.failed_checks,
+                error={"type": type(exc).__name__, "message": str(exc)[:256]},
+            )
+            raise
     diagnostics = getattr(runner, "_sfa_route_diagnostics", None)
     if diagnostics is None:
         diagnostics = runner._sfa_route_diagnostics = SFARouteDiagnostics()
     local_route = local_route or route
-    request_ids = tuple(runner.input_batch.req_ids[:num_reqs]) if num_reqs else ()
-    scheduled = tuple(int(value) for value in scheduled)
     context["num_reqs"] = num_reqs
     dp_action = _name(dp_route_action)
+    detailed = cold_perf_detailed_enabled()
+
     signature = (
         route.action,
         route.reason,
-        route.failed_checks,
+        _check_signature(route.failed_checks, detailed),
         local_route.action,
         local_route.reason,
-        local_route.failed_checks,
-        request_ids,
-        scheduled,
+        _check_signature(local_route.failed_checks, detailed),
         dp_action,
         getattr(runner, "_staged_sfa_diagnostic_peer_votes", None),
         _name(runner.attn_state),
-        tuple(context.items()),
+        context.get("origin"),
     )
+
+    def snapshot():
+        ids = tuple(runner.input_batch.req_ids[:num_reqs]) if num_reqs else ()
+        build = _snapshot if detailed else _compact_snapshot
+        return build(
+            runner,
+            route,
+            local_route,
+            ids,
+            tuple(map(int, scheduled)),
+            scheduler_output,
+            dp_action=dp_action,
+            **context,
+        )
+
+    if detailed:
+        signature += (
+            tuple(runner.input_batch.req_ids[:num_reqs]) if num_reqs else (),
+            tuple(map(int, scheduled)),
+            tuple(context.items()),
+        )
     due, now = diagnostics.prepare(signature)
-    details = (
-        _snapshot(runner, route, local_route, request_ids, scheduled, scheduler_output, dp_action=dp_action, **context)
-        if due
-        else None
-    )
+    details = snapshot() if due else None
     try:
         key = runner._apply_staged_sfa_route(route)
-    except Exception as exc:
+    except (Exception, SystemExit) as exc:
         if details is None:
-            details = _snapshot(
-                runner, route, local_route, request_ids, scheduled, scheduler_output, dp_action=dp_action, **context
-            )
+            details = snapshot()
         diagnostics.record(
             route.action.value,
             route.reason.value,

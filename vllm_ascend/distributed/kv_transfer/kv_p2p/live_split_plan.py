@@ -18,9 +18,7 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.live_split_protocol import (
     SplitTransferSegment,
     parse_compact_layout,
     parse_latent_layout,
-    sanitize_content_diagnostics,
-    wire_int,
-)
+    wire_int)
 
 
 class SourceHandshake(Protocol):
@@ -130,8 +128,7 @@ def expand_compact_split_plan(
         requested_groups=plan.requested_groups,
         source_tp_rank=plan.source_tp_rank,
         source_dp_rank=plan.source_dp_rank,
-        content_diagnostics=plan.content_diagnostics,
-    )
+        )
 
 
 def merge_source_and_destinations(
@@ -261,8 +258,7 @@ def merge_source_and_destinations(
             compact_destination=compact_destination,
             latent_source=source.latent_layout if hybrid else None,
             latent_destination_pages=latent_pages if hybrid else (),
-            content_diagnostics=source.content_diagnostics,
-        )
+            )
     destinations = plan["segments"]
     merged: list[SplitTransferSegment] = []
     for group_id in requested_groups:
@@ -314,8 +310,7 @@ def merge_source_and_destinations(
         source_tp_rank=source.tp_rank,
         source_dp_rank=source.dp_rank,
         requested_groups=requested_groups,
-        content_diagnostics=source.content_diagnostics,
-    )
+        )
 
 
 def canonicalize_source_descriptor(
@@ -450,13 +445,6 @@ def canonicalize_source_descriptor(
             )
             if not (compact_only_valid or extension_valid or legacy_hybrid_valid):
                 raise ValueError("Compact live split byte total differs")
-            content_diagnostics = sanitize_content_diagnostics(
-                raw.get("content_diagnostics"),
-                token_count=(parsed_compact.token_count if parsed_compact is not None else 0),
-                layer_ids=(
-                    tuple(layer.layer_id for layer in parsed_compact.layers) if parsed_compact is not None else ()
-                ),
-            )
             normalized_descriptor = {
                 **raw,
                 # Preserve the established group-1 carrier on the wire.
@@ -466,10 +454,7 @@ def canonicalize_source_descriptor(
                 "compact_layout": compact,
                 "latent_layout": latent,
             }
-            if content_diagnostics is None:
-                normalized_descriptor.pop("content_diagnostics", None)
-            else:
-                normalized_descriptor["content_diagnostics"] = content_diagnostics
+            normalized_descriptor.pop("content_diagnostics", None)
             normalized.append(normalized_descriptor)
             continue
         segments = []

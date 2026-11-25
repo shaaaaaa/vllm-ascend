@@ -7,8 +7,6 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 
-from vllm_ascend.sample.rejection_diagnostics import record_stage
-
 
 @dataclass
 class _MaskIndices:
@@ -73,7 +71,7 @@ def apply_with_spec_decode(self, logits: torch.Tensor, num_draft_tokens: list[in
         self._ascend_spec_mask_indices = None
         return logits
 
-    layout = record_stage("min_tokens.layout", _mask_layout, self.min_toks, num_draft_tokens)
+    layout = _mask_layout(self.min_toks, num_draft_tokens)
     if not layout:
         self._ascend_spec_mask_indices = None
         return logits
@@ -84,11 +82,11 @@ def apply_with_spec_decode(self, logits: torch.Tensor, num_draft_tokens: list[in
     stream_id = None if device.type == "cpu" else torch.npu.current_stream(device).npu_stream
     cached = getattr(self, "_ascend_spec_mask_indices", None)
     if cached is None or (cached.layout, cached.device, cached.stream_id) != (layout, device, stream_id):
-        host, indices = record_stage("min_tokens.allocate", _allocate_indices, layout, device)
-        record_stage("min_tokens.fill", _fill_indices, host, layout)
-        record_stage("min_tokens.h2d", indices.copy_, host, non_blocking=True)
+        host, indices = _allocate_indices(layout, device)
+        _fill_indices(host, layout)
+        indices.copy_(host, non_blocking=True)
         cached = _MaskIndices(layout, device, stream_id, host, indices)
         self._ascend_spec_mask_indices = cached
 
-    record_stage("min_tokens.mask", logits.index_put_, (cached.indices[0], cached.indices[1]), self.neg_inf_tensor)
+    logits.index_put_((cached.indices[0], cached.indices[1]), self.neg_inf_tensor)
     return logits

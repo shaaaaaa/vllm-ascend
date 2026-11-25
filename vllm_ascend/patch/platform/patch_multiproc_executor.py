@@ -26,7 +26,7 @@ from vllm.v1.executor.multiproc_executor import (
 from vllm.v1.outputs import AsyncModelRunnerOutput
 
 from vllm_ascend.serving_perf import (
-    cold_perf_enabled,
+    cold_perf_detailed_enabled,
     log_cold_perf_event,
     log_cold_perf_process_event,
 )
@@ -340,7 +340,7 @@ class AscendWorkerProc(WorkerProc):
         return UnreadyWorkerProcHandle(proc, rank, ready_reader, death_writer)
 
 
-if cold_perf_enabled():
+if cold_perf_detailed_enabled():
     WorkerProc.handle_output = _handle_output
     WorkerProc.enqueue_output = _enqueue_output
     FutureWrapper.wait_for_response = _wait_for_response

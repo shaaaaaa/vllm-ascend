@@ -629,7 +629,7 @@ class FileProbe:
 
         if "mtp" in self.models:
             drafter = getattr(self.runner, "drafter", None)
-            if not callable(getattr(drafter, "_run_mtp_draft_layer_with_diagnostics", None)):
+            if not callable(getattr(drafter, "_run_mtp_draft_layer", None)):
                 raise RuntimeError("MTP proposer does not expose its actual logits selection")
             if not callable(getattr(drafter, "_get_positions", None)):
                 raise RuntimeError("MTP proposer does not expose its unsharded positions")
@@ -653,7 +653,7 @@ class FileProbe:
 
                 return draft
 
-            self.patch(drafter, "_run_mtp_draft_layer_with_diagnostics", draft_factory)
+            self.patch(drafter, "_run_mtp_draft_layer", draft_factory)
 
         for model_name, model in self.models.items():
             self.inventories[model_name] = model_inventory(model, sfa.AscendSFAImpl)

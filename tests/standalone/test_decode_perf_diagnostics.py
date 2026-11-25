@@ -241,7 +241,8 @@ def test_worker_rpc_carries_decode_trace_to_async_output(perf, traced, duration)
     if not traced:
         module.time.perf_counter = forbidden
         module.time.perf_counter_ns = forbidden
-    ns = dict(time=module.time, log_cold_perf_event=module.log_cold_perf_event)
+    ns = dict(time=module.time, log_cold_perf_event=module.log_cold_perf_event,
+              cold_perf_enabled=lambda: traced, cold_perf_detailed_enabled=lambda: traced)
     future = ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0)
     extracted = ast.fix_missing_locations(ast.Module(body=[future, *constants, method], type_ignores=[]))
     exec(compile(extracted, str(path), "exec"), ns)

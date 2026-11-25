@@ -452,7 +452,7 @@ def test_password_env_missing_or_empty_prevents_collection(tmp_path, monkeypatch
     assert not (tmp_path / "collected").exists()
 
 
-@pytest.mark.parametrize("mode", ["prompt", "environment", "per_host"])
+@pytest.mark.parametrize("mode", ["prompt", "environment", "per_host", "argument"])
 @pytest.mark.parametrize("skip_host_key_check", [False, True])
 def test_password_auth_not_in_command_output_or_manifest(tmp_path, monkeypatch, capsys, mode, skip_host_key_check):
     secret = "test-only-secret-with-$-and-quotes'"
@@ -470,6 +470,7 @@ def test_password_auth_not_in_command_output_or_manifest(tmp_path, monkeypatch, 
         "prompt": ["--password"],
         "environment": ["--password-env", "TEST_PD_PASSWORD"],
         "per_host": ["--password-per-host"],
+        "argument": ["--ssh-password", secret],
     }[mode]
     if skip_host_key_check:
         flags.append("--skip-host-key-check")
@@ -509,7 +510,7 @@ def test_password_auth_not_in_command_output_or_manifest(tmp_path, monkeypatch, 
     monkeypatch.setattr(collector.subprocess, "run", run)
     assert collector.main([*argv(tmp_path, ("one", "two")), *flags]) == 0
     assert len(commands) == 2
-    assert len(prompts) == {"prompt": 1, "environment": 0, "per_host": 2}[mode]
+    assert len(prompts) == {"prompt": 1, "environment": 0, "per_host": 2, "argument": 0}[mode]
     assert secret not in json.dumps(read_manifest(tmp_path))
     captured = capsys.readouterr()
     assert secret not in captured.out + captured.err
@@ -517,10 +518,16 @@ def test_password_auth_not_in_command_output_or_manifest(tmp_path, monkeypatch, 
     assert not any(path.exists() or path.parent.exists() for path in helpers)
 
 
-@pytest.mark.parametrize("password", ["line\nline", "line\rline", "nul\0byte"])
-def test_password_line_protocol_rejects_invalid_values_before_transport(tmp_path, monkeypatch, password):
-    monkeypatch.setattr(collector.getpass, "getpass", lambda _: password)
-    assert collector.main([*argv(tmp_path), "--password"]) == 1
+@pytest.mark.parametrize("mode", ["prompt", "argument"])
+@pytest.mark.parametrize("password", ["", "line\nline", "line\rline", "nul\0byte"])
+def test_password_line_protocol_rejects_invalid_values_before_transport(tmp_path, monkeypatch, password, mode):
+    def prompt(_):
+        assert mode != "argument", "explicit SSH password must never prompt"
+        return password
+
+    monkeypatch.setattr(collector.getpass, "getpass", prompt)
+    flags = ["--ssh-password", password] if mode == "argument" else ["--password"]
+    assert collector.main([*argv(tmp_path), *flags]) == 1
     assert not (tmp_path / "collected").exists()
 
 
@@ -560,7 +567,8 @@ def test_password_free_mode_never_creates_helper(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize("correct_password", [True, False])
-def test_real_openssh_reads_password_via_native_callback(tmp_path, monkeypatch, correct_password):
+@pytest.mark.parametrize("mode", ["environment", "argument"])
+def test_real_openssh_reads_password_via_native_callback(tmp_path, monkeypatch, correct_password, mode):
     """Exercise the actual OpenSSH callback without a server or user credentials."""
     keygen = collector.shutil.which("ssh-keygen")
     if keygen is None:
@@ -573,8 +581,10 @@ def test_real_openssh_reads_password_via_native_callback(tmp_path, monkeypatch, 
         timeout=15,
     )
     assert result.returncode == 0, result.stderr
-    monkeypatch.setenv("TEST_PD_PASSWORD", secret if correct_password else "incorrect-test-password")
-    args = collector.parser().parse_args([*argv(tmp_path), "--password-env", "TEST_PD_PASSWORD"])
+    password = secret if correct_password else "incorrect-test-password"
+    monkeypatch.setenv("TEST_PD_PASSWORD", password)
+    flags = ["--ssh-password", password] if mode == "argument" else ["--password-env", "TEST_PD_PASSWORD"]
+    args = collector.parser().parse_args([*argv(tmp_path), *flags])
     with collector.password_auth(args):
         result = collector.run_ssh(
             args,

@@ -25,18 +25,18 @@ ROOT = Path(__file__).resolve().parents[3]
 def diagnostics(monkeypatch, caplog):
     log = logging.getLogger("test.sfa_route")
     caplog.set_level(logging.INFO, logger=log.name)
-    monkeypatch.setenv("PD_SERVING_PERF", "0")
+    monkeypatch.setenv("PD_SERVING_PERF", "detail")
     monkeypatch.setitem(sys.modules, "vllm.logger", NS(logger=log))
-    monkeypatch.setitem(sys.modules, "vllm_ascend", NS(envs=NS(PD_SERVING_PERF="0")))
+    monkeypatch.setitem(sys.modules, "vllm_ascend", NS(envs=NS(PD_SERVING_PERF="detail")))
     perf = load_module(ROOT / "vllm_ascend/serving_perf.py", "vllm_ascend.serving_perf", monkeypatch)
-    assert not perf.cold_perf_enabled()
+    assert perf.cold_perf_detailed_enabled()
     # Unwrapping is a connector operation, independently covered by route tests.
     monkeypatch.setitem(
         sys.modules, "vllm_ascend.attention.utils", NS(unwrap_staged_sfa_connector_metadata=lambda value: value)
     )
     module = load_module(ROOT / "vllm_ascend/worker/sfa_route_diagnostics.py", "route_diagnostics", monkeypatch)
     now = [100.0]
-    monkeypatch.setattr(module, "time", NS(monotonic=lambda: now[0]))
+    monkeypatch.setattr(module, "time", NS(monotonic=lambda: now[0], time_ns=module.time.time_ns))
     return (
         module,
         now,
@@ -102,7 +102,7 @@ def apply(module, runner, route, output, **kwargs):
     )
 
 
-def test_perf_zero_logs_actual_offending_row_and_cold_marker(diagnostics, routing):
+def test_detail_logs_actual_offending_row_and_cold_marker(diagnostics, routing):
     module, _, records = diagnostics
     runner, _, route, output = batch(routing)
     assert apply(module, runner, route, output) is None
@@ -381,7 +381,7 @@ def test_malformed_scheduled_shape_and_duplicate_metadata_still_log(diagnostics,
         ("width", "non_q1", "scheduled_query_shape_or_width"),
     ],
 )
-def test_local_rejecting_checks_are_visible_at_perf_zero(diagnostics, routing, case, reason, check):
+def test_local_rejecting_checks_are_visible_in_detail(diagnostics, routing, case, reason, check):
     module, _, records = diagnostics
     runner, ns, _, output = batch(routing, computed=4097)
     runner.calculate_kv_scales = case == "scales"
@@ -419,7 +419,7 @@ def test_local_rejecting_checks_are_visible_at_perf_zero(diagnostics, routing, c
         ("bucket", "padding_capacity_or_capture_bucket"),
     ],
 )
-def test_live_rejecting_checks_are_visible_at_perf_zero(diagnostics, routing, case, check):
+def test_live_rejecting_checks_are_visible_in_detail(diagnostics, routing, case, check):
     module, _, records = diagnostics
     runner, ns, local, output = batch(routing, computed=4097)
     route = runner._staged_sfa_live_route(
@@ -535,3 +535,74 @@ def test_dummy_call_has_no_stale_request_rows(diagnostics, routing):
     assert event["scheduled_query_lengths"] == [2, 2, 2, 2]
     assert event["allow_eager"] is False and event["num_active_loras"] == 0
     assert event["descriptor_uniform"] is True
+
+
+@pytest.mark.parametrize("mode,count", [("0", 0), ("1", 1)])
+def test_quiet_and_production_fallback(diagnostics, routing, monkeypatch, mode, count):
+    module, now, records = diagnostics
+    monkeypatch.setattr(module, "cold_perf_enabled", lambda: mode == "1")
+    monkeypatch.setattr(module, "cold_perf_detailed_enabled", lambda: False)
+    runner, _, route, output = batch(routing)
+    for req_id in ("first", "next", "last"):
+        runner.input_batch.req_ids = [req_id]
+        apply(module, runner, route, output)
+        now[0] += 5
+    assert len(records()) == count
+    if count:
+        assert records()[0]["reason"] == "not_decode"
+        assert records()[0]["computed_tokens"] == 4096
+        assert "rows" not in records()[0]
+        runner._sfa_route_diagnostics.restored()
+        assert records()[-1]["event"] == "graph_route_restored"
+
+def test_production_fallback_tracks_failed_row_across_reordering(diagnostics, routing, monkeypatch):
+    module, now, records = diagnostics
+    monkeypatch.setattr(module, "cold_perf_detailed_enabled", lambda: False)
+    runner, ns, env, _, states = routing
+    # The staged-only route permits native fallback on a bad resume marker.
+    env.VLLM_ASCEND_SFA_FULL_GRAPH = False
+    runner.attn_state = states.SpecDecoding
+    runner.dp_rank = 1
+    runner._staged_sfa_graph_capture_sizes = (4,)
+    metadata = NS(requests=[])
+    debug = Mock()
+    ns.update(cold_perf_enabled=lambda: True, cold_perf_detailed_enabled=lambda: False, log_cold_perf_event=debug)
+    for bad_row in (1, 0, 1):
+        ids = ["good", "good"]
+        ids[bad_row] = "bad-resume"
+        computed = np.array([4096, 4096])
+        history = np.array([4097, 4097])
+        history[bad_row] += 1
+        runner.input_batch = NS(
+            req_ids=ids, num_computed_tokens_cpu=computed, num_prompt_tokens=computed, num_tokens_no_spec=history
+        )
+        markers = ns["ColdResumeMarkers"]((True, True), tuple(computed))
+        route = runner._staged_sfa_local_route(
+            num_tokens_unpadded=4,
+            num_reqs=2,
+            num_scheduled_tokens=np.array([2, 2]),
+            index_topk=2048,
+            has_cascade_attention=False,
+            request_ids=ids,
+            kv_connector_metadata=metadata,
+            num_computed_tokens=computed,
+            prompt_lens=computed,
+            _validated_sparse_route=(metadata, (ns["StagedSFARouteReason"].ELIGIBLE, tuple(computed), markers)),
+        )
+        assert route.failed_checks == (f"computed_history_minus_one[{bad_row}]",)
+        assert (
+            module.apply_sfa_route_with_diagnostics(
+                runner,
+                route,
+                scheduler_output=NS(kv_connector_metadata=metadata),
+                num_reqs=2,
+                scheduled=(2, 2),
+                origin="execute_model",
+            )
+            is None
+        )
+        now[0] += 1
+    assert records()[0]["request_ids"] == ["bad-resume"]
+    assert records()[0]["history_tokens"] == 4098
+    assert len(records()) == 1
+    debug.assert_not_called()

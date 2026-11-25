@@ -52,6 +52,7 @@ def test_producer_publishes_raw_topk_before_pack_and_consumer_has_no_indexer(bou
         return topk, boundary, rows, torch.arange(2)
 
     owner = NS(has_indexer=True, skip_topk=False, index_cache_enabled=shared_model,
+               use_sparse_c8_indexer=False,
                topk_indices_buffer=shared, _indexcache_topk_staging=torch.empty_like(shared),
                _mask_staged_index_scatter_padding=lambda slots, keys, *a: (slots, keys),
                indexer_select_post_process=select)

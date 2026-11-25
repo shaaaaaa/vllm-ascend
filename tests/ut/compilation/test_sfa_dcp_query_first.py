@@ -130,7 +130,6 @@ def test_full_operator_defers_prefetch_and_cleans_up(monkeypatch, failure, prefe
         skip_topk=True,
         has_indexer=False,
         dsa_cp_decoder=False,
-        _staged_graph_content_diagnostic_enabled=lambda _: False,
         _shared_retrieval_edges=lambda: ({"layer": edge} if prefetched else {}, {}),
         cross_layer_graph_pre=pre,
         cross_layer_lmcache_retrieve=lambda *args: None,
@@ -170,7 +169,7 @@ def test_full_operator_defers_prefetch_and_cleans_up(monkeypatch, failure, prefe
 
 
 @pytest.mark.parametrize(
-    "disabled", ["knob", "early", "dcp", "full", "shared", "producer", "indexer", "cp", "key", "diagnostics"]
+    "disabled", ["knob", "early", "dcp", "full", "shared", "producer", "indexer", "cp", "key"]
 )
 def test_query_first_remains_scoped_to_qualified_consumers(monkeypatch, disabled):
     # Fail before any tensor execution; inspect the production dispatch decision.
@@ -182,7 +181,6 @@ def test_query_first_remains_scoped_to_qualified_consumers(monkeypatch, disabled
         skip_topk=disabled != "producer",
         has_indexer=disabled == "indexer",
         dsa_cp_decoder=disabled == "cp",
-        _staged_graph_content_diagnostic_enabled=lambda _: disabled == "diagnostics",
         _shared_retrieval_edges=lambda: ({}, {}),
     )
 

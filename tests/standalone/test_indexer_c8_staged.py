@@ -39,6 +39,7 @@ def test_staged_scatter_keeps_key_scale_pair_and_padding(c8, idle):
     )
     exec(compile(ast.fix_missing_locations(tree), str(source), "exec"), ns)
     impl = ns["Impl"]()
+    impl.dsa_cp_decoder = False
     impl.use_sparse_c8_indexer = c8
     impl.has_indexer = True
     impl.skip_topk = False
@@ -125,24 +126,6 @@ def test_unbundled_staged_binding_retains_scales(c8, producer):
     assert get_context.call_count == int(producer)
 
 
-@pytest.mark.parametrize("c8", [False, True])
-def test_first_consume_diagnostic_uses_physical_indexer_table(c8):
-    source = Path(__file__).parents[2] / "vllm_ascend/attention/sfa_v1.py"
-    tree = ast.parse(source.read_text(encoding="utf-8"))
-    call = next(
-        n
-        for n in ast.walk(tree)
-        if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "queue_group1_first_consume"
-    )
-    expression = next(k.value for k in call.keywords if k.arg == "indexer_block_table")
-    logical = torch.tensor([[0, 1, 2]], dtype=torch.int32)
-    physical = logical * 2
-    ns = dict(
-        self=SimpleNamespace(use_sparse_c8_indexer=c8),
-        attn_metadata=SimpleNamespace(indexer_block_table=logical, indexer_c8_block_table=physical),
-    )
-    actual = eval(compile(ast.Expression(body=expression), str(source), "eval"), ns)
-    assert actual is (physical if c8 else logical)
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])

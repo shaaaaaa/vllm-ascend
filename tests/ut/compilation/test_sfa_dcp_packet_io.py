@@ -29,7 +29,6 @@ def test_full_operator_preserves_gather_placement_and_packet_lifetime(monkeypatc
         skip_topk=False,
         _dcp_packet_io=mode,
         _dcp_early_gather=early,
-        _staged_graph_content_diagnostic_enabled=lambda _: False,
         _shared_retrieval_edges=lambda: ({}, {}),
     )
 

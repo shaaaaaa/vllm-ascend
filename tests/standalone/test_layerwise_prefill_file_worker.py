@@ -214,7 +214,7 @@ def test_installed_mtp_probe_uses_proposer_positions_and_keeps_raw_sum(worker, t
     monkeypatch.setattr(torch.ops, "_C_ascend", NS(npu_sparse_flash_attention=lambda: None))
     drafter = NS(
         _get_positions=lambda count: source[:count],
-        _run_mtp_draft_layer_with_diagnostics=lambda model_kwargs, **kwargs: model(**model_kwargs),
+        _run_mtp_draft_layer=lambda model_kwargs, **kwargs: model(**model_kwargs),
     )
     runner = NS(drafter=drafter, parallel_config=NS(tensor_parallel_size=8))
     archive = worker.FileTensorArchive(tmp_path / "decode", rank)
@@ -225,11 +225,11 @@ def test_installed_mtp_probe_uses_proposer_positions_and_keeps_raw_sum(worker, t
         lambda: NS(attn_metadata={layer_name: meta}, flash_comm_v1_enabled=True),
     )
     probe.models["mtp"] = model
-    original_draft = drafter._run_mtp_draft_layer_with_diagnostics
+    original_draft = drafter._run_mtp_draft_layer
     probe.install(NS(AscendSFAImpl=Impl), NS(), NS())
     raw_positions = torch.tensor([24 if rank == 0 else 0])
     runtime = dict(num_input_tokens=1, batch_size=1, token_indices_to_sample=torch.tensor([0]))
-    drafter._run_mtp_draft_layer_with_diagnostics(
+    drafter._run_mtp_draft_layer(
         dict(input_ids=torch.tensor([99]), positions=raw_positions, hidden_states=torch.ones(1, 4)),
         runtime_inputs=runtime,
     )
@@ -238,7 +238,7 @@ def test_installed_mtp_probe_uses_proposer_positions_and_keeps_raw_sum(worker, t
     model.compute_logits(torch.ones(1, 4))
     summary = probe.finish()
     assert summary["complete"], summary["errors"]
-    assert drafter._run_mtp_draft_layer_with_diagnostics is original_draft
+    assert drafter._run_mtp_draft_layer is original_draft
     assert summary["calls"][0]["positions"] == [3]
     assert summary["calls"][0]["context_token_ids"] == [11, 12, 13, 99]
     records = [json.loads(line) for line in (archive.directory / "index.jsonl").read_text().splitlines()]

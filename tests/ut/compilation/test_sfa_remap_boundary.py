@@ -401,7 +401,7 @@ def test_draft_hook_prepares_each_step_before_native_model_only(mode, enabled):
         "CUDAGraphMode": SimpleNamespace(FULL="FULL"),
         "prepare_native_sparse_boundaries": remap.prepare_native_sparse_boundaries,
     }
-    run_draft = extract(path, "_run_mtp_draft_layer_with_diagnostics", ns)
+    run_draft = extract(path, "_run_mtp_draft_layer", ns)
     impl = SimpleNamespace(prepare_native_sparse_boundary=lambda item: calls.append(("prepare", item)))
     runner = SimpleNamespace(
         method="mtp",
@@ -409,9 +409,7 @@ def test_draft_hook_prepares_each_step_before_native_model_only(mode, enabled):
         model=lambda **kwargs: calls.append(("model", kwargs["step"])),
     )
     for step in (0, 1):
-        run_draft(
-            runner, {"step": step}, draft_step=step, per_layer_attn_metadata={"draft": step}, runtime_inputs={}
-        )
+        run_draft(runner, {"step": step}, per_layer_attn_metadata={"draft": step})
     expected = [("prepare", 0), ("model", 0), ("prepare", 1), ("model", 1)]
     assert calls == (expected if enabled and mode != "FULL" else [("model", 0), ("model", 1)])
 

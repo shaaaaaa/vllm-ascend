@@ -38,6 +38,7 @@ def test_unknown_fields_are_not_stringified(monkeypatch):
         __repr__ = __str__
 
     records = []
+    monkeypatch.setattr(cold_perf, "_COLD_PERF_MODE", "detail")
     monkeypatch.setattr(cold_perf, "_COLD_PERF_ENABLED", True)
     monkeypatch.setattr(
         cold_perf,
@@ -53,6 +54,7 @@ def test_forget_only_removes_one_requests_once_records(monkeypatch):
         def __iter__(self):
             raise AssertionError("retirement must not scan all requests")
 
+    monkeypatch.setattr(cold_perf, "_COLD_PERF_MODE", "detail")
     monkeypatch.setattr(cold_perf, "_COLD_PERF_ENABLED", True)
     monkeypatch.setattr(cold_perf, "_cold_perf_request_ids", {"one", "two"})
     emitted = NoScan(one={"ready"}, two={"ready"})
@@ -68,6 +70,7 @@ def test_uses_configured_vllm_logger():
 
 
 def test_marks_only_lmcache_cold_compact_resumes(monkeypatch):
+    monkeypatch.setattr(cold_perf, "_COLD_PERF_MODE", "detail")
     monkeypatch.setattr(cold_perf, "_COLD_PERF_ENABLED", True)
     cold_perf._cold_perf_request_ids.clear()
     metadata = SimpleNamespace(
@@ -94,6 +97,7 @@ def test_marks_only_lmcache_cold_compact_resumes(monkeypatch):
 
 def test_process_event_does_not_require_a_marked_request(monkeypatch):
     records = []
+    monkeypatch.setattr(cold_perf, "_COLD_PERF_MODE", "detail")
     monkeypatch.setattr(cold_perf, "_COLD_PERF_ENABLED", True)
     monkeypatch.setattr(
         cold_perf,
@@ -109,6 +113,7 @@ def test_process_event_does_not_require_a_marked_request(monkeypatch):
 
 def test_late_request_event_uses_captured_request_id(monkeypatch):
     records = []
+    monkeypatch.setattr(cold_perf, "_COLD_PERF_MODE", "detail")
     monkeypatch.setattr(cold_perf, "_COLD_PERF_ENABLED", True)
     cold_perf._cold_perf_request_ids.clear()
     monkeypatch.setattr(

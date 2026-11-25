@@ -219,7 +219,7 @@ The separate `VLLM_ASCEND_MTP_DRAFT_DEBUG=1` mode is rejected for this path.
 
 ### First-decode stall timing
 
-Set `PD_SERVING_PERF=1` before starting the server for host timing. Up to two
+Set `PD_SERVING_PERF=detail` for first-decode host tracing. Up to two
 early decode sampling calls get a fresh trace budget after chunked prefill.
 Fast calls emit no additional logs. A sample taking at least 500 ms emits
 `decoder_sample_invocation_slow`, with total wall/CPU time, top-level phase
@@ -232,7 +232,7 @@ The existing `decoder_async_output_slow` threshold is 100 ms. Its
 `queue_wait_ms` and `get_output_ms` distinguish output queue time from the
 existing copy-completion wait and CPU parsing. No extra waits, device queries,
 events or readbacks are introduced in host mode, and operation/exception order
-is preserved. `PD_SERVING_PERF=0` disables this timing; `detail` uses the same
+is preserved. `PD_SERVING_PERF=0` disables this timing. Detailed tracing uses
 bounded summaries. Explicit `device` mode retains its separate event timing.
 
 ## Server validation
@@ -1148,11 +1148,13 @@ off until that qualification and the throughput comparison pass.
 
 ## Native-route and preemption diagnostics
 
-On `perf/decoder-tpot-optimization`, `[SFA_ROUTE]` and
-`[REQUEST_LIFECYCLE]` are INFO logs independent of `PD_SERVING_PERF`.
-Keep the normal logger at INFO (`VLLM_LOGGING_LEVEL=INFO`); no new diagnostic
-switch is needed. Update both vLLM and vLLM-Ascend Python sources and restart
-the workers. No native rebuild or LMCache change is required.
+At `PD_SERVING_PERF=1`, `[SFA_ROUTE]` names the failing request when a local guard identifies
+its row. Other decisions label the example row `batch_sample`. The record includes
+cached, computed, prompt and history token counts when available.
+Persistent fallback reports at most once per minute for an unchanged reason
+per worker. Recovery and scheduler `[REQUEST_LIFECYCLE]` transitions remain
+visible. Level `0` skips routine fallback snapshots. Fatal route decisions
+retain diagnostic context. Set `detail` for the full records described below.
 
 `[SFA_ROUTE] action=... reason=...` is followed by JSON. Every worker reports
 its own decision; retain all DP/TP logs. The fields include host, PID, DP rank,
@@ -1223,7 +1225,7 @@ Healthy graph selection performs no diagnostic serialization, metadata scan,
 clock call, device readback or extra collective. Transition logging has a host
 formatting/I/O cost; unchanged native episodes are throttled. CPU tests cover
 the real route methods and scheduler hooks with device imports isolated, plus
-INFO output at `PD_SERVING_PERF=0`. Distributed NPU qualification remains
+per-mode output and suppression of routine fallback at `PD_SERVING_PERF=0`. Distributed NPU qualification remains
 required for production timing and replay behavior.
 
 These records prove the route decision and its host operands, not every possible

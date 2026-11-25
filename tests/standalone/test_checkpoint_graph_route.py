@@ -31,7 +31,7 @@ def route_api(full_graph=False):
     method = next(n for n in ast.walk(source) if isinstance(n, ast.FunctionDef) and n.name == "_staged_sfa_local_route")
     ns.update(
         sfa_full_graph_enabled=lambda _: full_graph,
-        cold_perf_enabled=lambda: False,
+        cold_perf_detailed_enabled=lambda: False,
         AscendAttentionState=NS(DecodeOnly="decode", SpecDecoding="spec"),
         unwrap_staged_sfa_connector_metadata=lambda x: x,
         staged_sfa_metadata_sparse_route=lambda meta, ids: (ns["StagedSFARouteReason"].ELIGIBLE, meta[0], meta[1]),

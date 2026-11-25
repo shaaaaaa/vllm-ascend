@@ -1,7 +1,10 @@
+# SPDX-License-Identifier: Apache-2.0
 from collections.abc import Callable
 from contextvars import ContextVar, Token
 from functools import wraps
 from typing import Any
+
+from vllm_ascend.serving_perf import cold_perf_device_timing_enabled
 
 StageRecorder = Callable[[str, Callable[..., Any], tuple[Any, ...], dict[str, Any]], Any]
 _active_recorder: ContextVar[StageRecorder | None] = ContextVar("ascend_rejection_stage_recorder", default=None)
@@ -16,7 +19,7 @@ def reset_stage_recorder(token: Token) -> None:
 
 
 def stage_recorder_active() -> bool:
-    return _active_recorder.get() is not None
+    return cold_perf_device_timing_enabled() and _active_recorder.get() is not None
 
 
 def record_stage(name: str, operation: Callable[..., Any], *args, **kwargs):
@@ -28,6 +31,9 @@ def record_stage(name: str, operation: Callable[..., Any], *args, **kwargs):
 
 def diagnostic_stage(name: str):
     def decorate(operation):
+        if not cold_perf_device_timing_enabled():
+            return operation
+
         @wraps(operation)
         def wrapped(*args, **kwargs):
             return record_stage(name, operation, *args, **kwargs)

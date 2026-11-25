@@ -555,10 +555,13 @@ typedef void (*ReleaseHugeMem)(void *, bool);
     TORCH_CHECK(workspace_status == 0,                                        \
                 "call " #aclnn_api " failed, detail:", aclGetRecentErrMsg()); \
     void *workspace_addr = nullptr;                                           \
+    /* Keep ownership until the consumer is queued on the allocation stream. */ \
+    /* Subsequent same-stream reuse is then ordered after this operation. */ \
+    at::Tensor workspace_tensor;                                              \
     if (workspace_size != 0) {                                                \
       at::TensorOptions options =                                             \
           at::TensorOptions(torch_npu::utils::get_npu_device_type());         \
-      auto workspace_tensor =                                                 \
+      workspace_tensor =                                                      \
           at::empty({workspace_size}, options.dtype(kByte));                  \
       workspace_addr = const_cast<void *>(workspace_tensor.storage().data()); \
     }                                                                         \

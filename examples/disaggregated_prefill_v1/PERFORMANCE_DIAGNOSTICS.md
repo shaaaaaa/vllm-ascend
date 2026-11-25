@@ -6,18 +6,56 @@ the environment of an already running process is not supported.
 
 | Value | Performance capability |
 | --- | --- |
-| Unset, empty, `0`, `false`, `no`, `off` | Optional performance timing disabled |
-| `1` | Host timing and request/transfer/graph-route correlation |
-| `detail` | Host timing plus additional per-layer detail where implemented |
+| Unset, empty, `0`, `false`, `no`, `off` | Optional timing is disabled. Fatal serving errors and failed requests still identify the affected operation. |
+| `1` | Production anomalies, request transitions and recovery. |
+| `detail` | Full host tracing, routine statistics, graph operands and available per-layer details. |
 | `device` | Detail plus explicit NPU event timing where implemented |
 
 Values ignore surrounding whitespace and case. Other nonfalse values retain
 host timing behavior. Use the documented modes in deployments.
 
-`PD_SERVING_PERF` replaces `LMCACHE_COLD_START_PERF`; the old environment variable
-is no longer read. Update all four repositories together, rebuild the changed
-native extensions, and update every launcher or container environment. The
-standalone proxy and tokenizer use a device-independent local gate.
+`PD_SERVING_PERF` replaces `LMCACHE_COLD_START_PERF`. Set it on P and D.
+At every PD level, vLLM reports prompt and generation throughput at
+`VLLM_LOG_STATS_INTERVAL` when its native statistics are enabled.
+HTTP access logs, including successful `/health` and `/metrics` requests,
+follow the server's access-log settings. At PD levels `0` and `1`, the
+launcher defaults Mooncake's separate `MC_LOG_LEVEL` to `WARNING` unless set explicitly.
+
+On a generation engine with vLLM statistics enabled and one API frontend per
+engine, level `1` can report
+a stall while the worker is still executing. Search for `[DECODE_PROGRESS]`.
+Two consecutive windows of at least 10 seconds below 20 tokens/s for a single
+running request or 10 tokens/s per request for a larger batch trigger an alert.
+Each alert reports generated tokens, request-seconds, scheduler updates, output
+batches and last token age. Linux hosts also report CPU, memory and I/O pressure
+where available. Repeated alerts for an ongoing slowdown are limited to one per
+minute per DP. First tokens from prefill alone do not establish slow decode or
+decode recovery. The layerwise P-node marker disables this decoder monitor on P,
+including deployments where both roles use `kv_both`.
+
+Match slow worker, storage and guardian records by timestamp, rank, request ID
+and operation or transfer ID. With independent DP active, `[EXECUTOR_RPC_PENDING]`
+reports the oldest outstanding worker RPC after 10 seconds and at most once per
+minute per DP. `storage_operation_pending` identifies an outstanding lookup,
+prepare, native read or checkpoint reservation/commit after 10 seconds and
+distinguishes queued work from an executing handler.
+`storage_service_timing` splits its duration into queue time, the native call
+and remaining handler time for timed prepares and native reads, and names the longest. Linux reports the calling
+thread's major faults and involuntary switches when available.
+`storage_worker_load` identifies the phase that raised an exception. Failed
+checkpoint acknowledgements and failed RemoteFill commits are visible at ERROR
+and WARNING, respectively, at every performance logging level. A recoverable
+zero lookup or checkpoint retry is logged at level `1` and above. A decoder admission
+rejection or an unsafe transfer still reports the request at level `0`. A guardian
+failure reports its last heartbeat age and oldest outstanding RPC. A long native
+call locates the wait inside the SDK. Identifying a device or link fault requires
+corresponding runtime evidence.
+
+To see the last 40 diagnostic records from an affected decoder, run
+
+```bash
+rg 'DECODE_PROGRESS|EXECUTOR_RPC_PENDING|SFA_ROUTE|REQUEST_LIFECYCLE|ENGINE_STEP_TIMING|CHECKPOINT_FAILED|LMCACHE_LOOKUP_ZERO|remote_fill_local_commit|storage_operation_pending|storage_service_timing|storage_worker_load|epoch failed' "$LOG" | tail -n 40
+```
 
 Existing log markers such as `[LMCACHE_COLD_PERF]` and `[ENGINE_STEP_TIMING]`,
 event names and fields are preserved for existing extraction tools. A
@@ -42,29 +80,15 @@ batches; ordinary decoder batches are excluded. It can also describe actual
 prefill recomputation on a decoder. `sample_started_monotonic_ms` locates the
 call relative to the worker's execution-return timestamp.
 
-The existing `remote_fill_producer_fence_decision` event also reports
-`pending_sync_wait_ms`, the nested wait for pending synchronous stores. Correlate
-it by request and time; do not add it to the encompassing connector interval.
-
-Content fingerprints (`enable_npu_content_diagnostics`), MTP/target crash dumps
-and existing tensor-trace controls remain separate. They can read device data,
-write files or intentionally fence execution, so they are not throughput runs.
-Operational warnings, fatal ownership diagnostics, admission accounting and
-native timeout enforcement remain active when performance tracing is disabled.
-
-The implementation keeps timing/configuration helpers local to each package.
-The vLLM-Ascend content callback bridge avoids importing LMCache into model
-modules. Shared crash snapshot helpers live in `vllm_ascend/diagnostic_utils.py`;
-model-runner device timing lives in `vllm_ascend/worker/serving_perf.py`. Serving
-operations and the locations of timing measurements remain in the runner.
+Worker timing lives in `vllm_ascend/worker/serving_perf.py`. Storage operations and
+Mooncake transfers share the LMCache timing context so their summaries carry
+the same request and transfer identifiers.
 
 When adding an event, guard diagnostic payload construction at the call site.
 The logger's internal guard cannot prevent Python from first building keyword
 arguments, scanning request/page collections or taking a metrics snapshot.
 Keep diagnostic clocks and temporary containers behind the same startup gate.
 Do not gate required synchronization, capacity accounting, deadlines or cleanup.
-If content diagnostics also need a timing value, collect it when either mode
-is enabled. Test both modes independently, including failure cleanup.
 
 ## Enhanced proxy workload balancing
 

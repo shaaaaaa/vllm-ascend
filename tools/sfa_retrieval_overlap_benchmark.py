@@ -12,6 +12,7 @@ import time
 from pathlib import Path
 
 import torch
+import torch_npu
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from tests.sfa_capture_probe import CaptureProbe
@@ -20,7 +21,6 @@ from vllm_ascend.compilation.sfa_retrieval_overlap import RetrievalEdge
 
 class Workload:
     def __init__(self, root, requests=8, query_rows=2, layers=4, width=4096, history=4097, chunk=1024):
-        import torch_npu  # noqa: F401
         import vllm_ascend.vllm_ascend_C  # noqa: F401
 
         sys.path.insert(0, str(Path(root) / "benchmark/v1/kv_transfer"))
@@ -70,8 +70,7 @@ class Workload:
             self.edges = [RetrievalEdge(self.stream, self.transfers[i], self.caches[i], max_aiv_cores=12) for i in range(1, layers)]
             self.x = torch.ones((requests * query_rows, 16, 512), dtype=torch.bfloat16, device=self.device)
             self.weight = torch.ones((16, 512, 128), dtype=torch.bfloat16, device=self.device)
-            self.products = [torch.empty((requests * query_rows, 16, 128), dtype=torch.bfloat16, device=self.device)
-                             for _ in range(layers)]
+            self.products = [None] * layers
             self.observed = [tuple(torch.empty((requests, width), dtype=torch.bfloat16, device=self.device)
                                    for _ in range(2)) for _ in range(layers)]
         except BaseException:
@@ -105,7 +104,9 @@ class Workload:
                     dst.copy_(plane.view(-1, plane.shape[-1])[:self.requests * self.width, 0].view_as(dst))
             if overlap and layer + 1 < self.layers:
                 self.edges[layer].launch(self.selected, self.counts, self.slots, self.caches[layer + 1])
-            torch.ops._C_ascend.batch_matmul_transpose(self.x, self.weight, self.products[layer])
+            self.products[layer] = torch_npu.npu_transpose_batchmatmul(
+                self.x, self.weight, perm_x1=(1, 0, 2), perm_y=(1, 0, 2)
+            )
 
     def capture(self, overlap, observe=False):
         self.chain(overlap, observe)

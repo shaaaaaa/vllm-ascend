@@ -580,13 +580,6 @@ std::tuple<at::Tensor, at::Tensor> dispatch_gmm_combine_decode_meta(
     return {output, expert_token_nums};
 }
 
-void batch_matmul_transpose(const at::Tensor &tensor_a, const at::Tensor &tensor_b, at::Tensor &tensor_c,
-                                    c10::optional<c10::string_view> format_mode,
-                                    c10::optional<c10::string_view> quant_mode)
-{
-    return;
-}
-
 std::tuple<at::Tensor&, at::Tensor&> dispatch_ffn_combine_meta(
     const at::Tensor& x,
     const at::TensorList& weight1,
@@ -1090,8 +1083,6 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
     ops.impl("grouped_matmul_swiglu_quant_weight_nz_tensor_list", &vllm_ascend::meta::grouped_matmul_swiglu_quant_weight_nz_tensor_list_meta);
     // dispatch_gmm_combine_decode meta implementation
     ops.impl("dispatch_gmm_combine_decode", &vllm_ascend::meta::dispatch_gmm_combine_decode_meta);
-    // batch_matmul_transpose
-    ops.impl("batch_matmul_transpose", &vllm_ascend::meta::batch_matmul_transpose);
     // Lightning indexer
     ops.impl("npu_lightning_indexer", &vllm_ascend::meta::npu_lightning_indexer_meta);
     // Sparse flash attention

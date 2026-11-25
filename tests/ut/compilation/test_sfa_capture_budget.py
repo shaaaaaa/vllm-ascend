@@ -6,6 +6,7 @@ import logging
 import sys
 from dataclasses import dataclass
 from enum import Enum
+from importlib.machinery import PathFinder
 from types import ModuleType
 from types import SimpleNamespace as NS
 from unittest.mock import Mock
@@ -24,7 +25,12 @@ class CUDAGraphMode(Enum):
 def sizing(monkeypatch):
     # Only unavailable import dependencies are replaced. Configuration gates,
     # environment parsing, resource accounting and size updates are all real.
+    vllm_spec = PathFinder.find_spec("vllm")
+    assert vllm_spec is not None and vllm_spec.submodule_search_locations
     modules = {
+        # Load the real, CPU-only bank configuration through a namespace package
+        # without running vLLM's accelerator-oriented package initializer.
+        "vllm": {"__path__": list(vllm_spec.submodule_search_locations)},
         "torch_npu": {},
         "vllm.logger": {"logger": logging.getLogger(__name__)},
         "vllm.sequence": {"IntermediateTensors": object},

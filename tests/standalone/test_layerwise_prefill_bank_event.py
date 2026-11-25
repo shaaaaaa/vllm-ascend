@@ -54,6 +54,7 @@ def test_indexer_handoff_precedes_topk_publication_and_latent_attention(p_node, 
     namespace.update(
         self=NS(
             _layerwise_prefill_p_node=p_node,
+            dsa_cp_decoder=False,
             skip_topk=skip_topk,
             has_indexer=has_indexer,
             index_cache_enabled=True,
@@ -72,6 +73,7 @@ def test_indexer_handoff_precedes_topk_publication_and_latent_attention(p_node, 
         index_lmcache_enabled=has_indexer,
         index_layer_name="indexer",
         content_diagnostics_enabled=False,
+        kv_hash_trace=False,
         _dsa_prof=NS(section=lambda name: nullcontext()),
     )
     compile_nodes([indexer], namespace)
@@ -112,6 +114,7 @@ def test_latent_handoff_follows_sfa_before_projection(p_node, layer_name):
         actual_seq_lengths_key=None,
         layer_name=layer_name,
         _sparse_indices_padding_zeroed=False,
+        kv_hash_trace=False,
         _dsa_prof=NS(section=lambda name: nullcontext(), step=lambda: None),
     )
     compile_nodes(forward.body[index : index + 2], namespace)

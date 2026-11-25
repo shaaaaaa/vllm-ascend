@@ -56,11 +56,13 @@ logger = logging.getLogger(__name__)
 
 
 if __package__:
+    from .pd_serving_perf import serving_perf_detailed_enabled as _serving_perf_enabled
+    from .profile_routes import ProfileRequest, profile_capabilities, profile_response, profile_route
     from .remote_fill_placement import validate_remote_fill_placement
-    from .pd_serving_perf import serving_perf_enabled as _serving_perf_enabled
 else:
+    from pd_serving_perf import serving_perf_detailed_enabled as _serving_perf_enabled
+    from profile_routes import ProfileRequest, profile_capabilities, profile_response, profile_route
     from remote_fill_placement import validate_remote_fill_placement
-    from pd_serving_perf import serving_perf_enabled as _serving_perf_enabled
 
 MAX_RECOMPUTE_RETRIES = 3
 _DECODER_PLACEMENT_DISCOVERY_TIMEOUT_SECONDS = 2.0
@@ -567,6 +569,8 @@ class TokenizerAnalyzer:
         if isinstance(prompt, str):
             return len(self.tokenizer.encode(prompt, add_special_tokens=True))
         elif isinstance(prompt, list):
+            if all(type(token) is int for token in prompt):
+                return len(prompt)
             if all(isinstance(p, str) for p in prompt):
                 return sum(len(self.tokenizer.encode(p, add_special_tokens=True)) for p in prompt)
             elif all(isinstance(p, dict) for p in prompt):
@@ -1380,18 +1384,18 @@ class ProxyState:
             self._update_prefiller_priority(idx)
     
     def select_decoder(self, token_count, preferred_idx: int | None = None,
-                       prefiller_idx: int | None = None):
+                       prefiller_idx: int | None = None, *, target_idx: int | None = None):
         """Select by load, then least-recent P/D pairing when loads tie."""
         with self._state_lock:
             if not self.decoder_heap:
                 raise RuntimeError("No decoder servers available")
-            if preferred_idx is not None and not 0 <= preferred_idx < len(self.decoders):
+            chosen = target_idx if target_idx is not None else preferred_idx
+            if chosen is not None and not 0 <= chosen < len(self.decoders):
                 raise IndexError("Preferred decoder index is out of range")
             if prefiller_idx is not None and not 0 <= prefiller_idx < len(self.prefillers):
                 raise IndexError("Prefiller pairing index is out of range")
             candidates = self._request_balanced_heap(self.decoder_heap, self.tainted_decoders, self.decoders)
-            chosen = preferred_idx
-            if not any(entry[2] == chosen for entry in candidates):
+            if target_idx is None and not any(entry[2] == chosen for entry in candidates):
                 if prefiller_idx is None:
                     chosen = min(candidates)[2]
                 else:
@@ -2029,6 +2033,7 @@ async def send_request_to_service(
 ):
     aborted_requests = proxy_state.acquire_aborted_prefiller_requests(prefiller_id)
     req_data = req_data.copy()
+    file_replay = (req_data.get("kv_transfer_params") or {}).get("lmcache.tag.file_replay")
     req_data["kv_transfer_params"] = {
         "do_remote_decode": True,
         "do_remote_prefill": False,
@@ -2046,6 +2051,8 @@ async def send_request_to_service(
             req_data["kv_transfer_params"][
                 "lmcache.mooncake_preferred_segment"
             ] = preferred_mooncake_segment
+    if file_replay is not None:
+        req_data["kv_transfer_params"]["lmcache.tag.file_replay"] = file_replay
     req_data["stream"] = False
     req_data["max_tokens"] = 1
     req_data["min_tokens"] = 1
@@ -2116,6 +2123,7 @@ async def _handle_select_instance(
     analysis=None,
     original_request_id=None,
     prefix_anchors: tuple[PrefixAffinityAnchor, ...] = (),
+    target_decoder_idx: int | None = None,
 ):
     prefiller_score = proxy_state.calculate_prefill_scores(request_length)
     prefiller_work_score = prefiller_score
@@ -2133,9 +2141,10 @@ async def _handle_select_instance(
                 with proxy_state._state_lock:
                     if not proxy_state.decoder_placements_ready():
                         continue
-                    known_anchor, known_affinity, affinity_selected = proxy_state.resolve_prefix_affinity(
-                        prefix_anchors, request_length, prefiller_score, decoder_score,
-                    )
+                    if target_decoder_idx is None:
+                        known_anchor, known_affinity, affinity_selected = proxy_state.resolve_prefix_affinity(
+                            prefix_anchors, request_length, prefiller_score, decoder_score,
+                        )
                     # Explicit prefix hints use token units; byte-based routing
                     # without tokenizer analysis cannot safely discount them.
                     prompt_tokens = (analysis.prompt_tokens if analysis is not None
@@ -2152,7 +2161,7 @@ async def _handle_select_instance(
                     )
                     decoder_idx = proxy_state.select_decoder(
                         decoder_score, known_affinity.decoder_idx if affinity_selected else None,
-                        prefiller_idx=prefiller_idx,
+                        prefiller_idx=prefiller_idx, target_idx=target_decoder_idx,
                     )
                     decoder = proxy_state.decoders[decoder_idx]
                     reservation = DecoderReservation(decoder, decoder_idx, decoder_score)
@@ -2267,6 +2276,10 @@ async def _handle_select_instance(
                 )
         kv_transfer_params.pop("lmcache.mooncake_preferred_segment", None)
         kv_transfer_params.pop("lmcache.mooncake_preferred_kv_group", None)
+        # Preserve the explicit snapshot source for the selected decoder, too.
+        file_replay = (req_data.get("kv_transfer_params") or {}).get("lmcache.tag.file_replay")
+        if file_replay is not None:
+            kv_transfer_params["lmcache.tag.file_replay"] = file_replay
         req_data["kv_transfer_params"] = kv_transfer_params
         if kv_transfer_params:
             logger.debug(f"[{request_id}] KV transfer params received from P-node: "
@@ -2281,7 +2294,11 @@ async def _handle_select_instance(
                            f"P-node: {prefiller}")
 
         if reservation is None:
-            decoder_idx = proxy_state.select_decoder(decoder_score)
+            decoder_idx = (
+                proxy_state.select_decoder(decoder_score)
+                if target_decoder_idx is None
+                else proxy_state.select_decoder(decoder_score, target_idx=target_decoder_idx)
+            )
             decoder = proxy_state.decoders[decoder_idx]
             reservation = DecoderReservation(decoder, decoder_idx, decoder_score)
 
@@ -2380,6 +2397,7 @@ async def _handle_completions(api: str, request: Request):
     instance_info = None
     response_owns_cleanup = False
     request_count_released = False
+    profiling_request = None
     released_kv = True
 
     def release_request_count() -> None:
@@ -2412,6 +2430,7 @@ async def _handle_completions(api: str, request: Request):
     try:
         proxy_state.request_num += 1
         req_data = await request.json()
+        profiling_request = ProfileRequest(request, proxy_state)
         prefix_anchors = _parse_prefix_affinity_header(
             getattr(request, "headers", {}).get(_PREFIX_AFFINITY_HEADER)
         )
@@ -2706,6 +2725,12 @@ async def _handle_completions(api: str, request: Request):
         else:
             if analysis:
                 request_length = analysis.prompt_tokens
+            elif isinstance(req_data.get("prompt"), list) and all(
+                type(token) is int for token in req_data["prompt"]
+            ):
+                # Token IDs from native chat rendering already have an exact
+                # length, even with tokenizer analysis disabled.
+                request_length = len(req_data["prompt"])
             else:
                 # Rough estimate: character count / 4 for text content
                 # This is much closer to token count than raw byte length
@@ -2738,11 +2763,18 @@ async def _handle_completions(api: str, request: Request):
             request_length,
             analysis,
             prefix_anchors=prefix_anchors,
+            target_decoder_idx=profiling_request.target_decoder_idx,
         )
         released_kv = False
+        await profiling_request.prefill_ready()
         
         original_request_id = instance_info.request_id
         stream_flag = bool(req_data.get("stream", False))
+        profile_routes = (
+            [profile_route(instance_info, profiling_request)]
+            if not stream_flag and getattr(request, "headers", {}).get("x-vllm-profile-routes") == "1"
+            else None
+        )
 
         if not stream_flag:
             retry_count = 0
@@ -2782,8 +2814,11 @@ async def _handle_completions(api: str, request: Request):
                 stop_reason = choice.get("stop_reason") or choice.get("finish_reason")
                 if stop_reason not in {"recomputed", "force_free_recomputed"}:
                     content_type = response.headers.get("content-type", "application/json")
+                    content = response.content
+                    if profile_routes is not None:
+                        content = profile_response(content, profile_routes)
                     return Response(
-                        content=response.content,
+                        content=content,
                         status_code=response.status_code,
                         headers={"content-type": content_type},
                     )
@@ -2802,7 +2837,10 @@ async def _handle_completions(api: str, request: Request):
                     analysis,
                     original_request_id=original_request_id,
                     prefix_anchors=prefix_anchors,
+                    target_decoder_idx=profiling_request.target_decoder_idx,
                 )
+                if profile_routes is not None:
+                    profile_routes.append(profile_route(instance_info, profiling_request))
                 released_kv = False
         
         async def generate_stream():
@@ -2964,6 +3002,7 @@ async def _handle_completions(api: str, request: Request):
                                 analysis,
                                 original_request_id=original_request_id,
                                 prefix_anchors=prefix_anchors,
+                                target_decoder_idx=profiling_request.target_decoder_idx,
                             )
                             released_kv = False
                             logger.info(
@@ -3220,6 +3259,8 @@ async def _handle_completions(api: str, request: Request):
             media_type="application/json"
         )
     finally:
+        if profiling_request is not None:
+            profiling_request.close()
         if not response_owns_cleanup:
             cleanup_current_request()
 
@@ -3558,6 +3599,11 @@ async def handle_completions(request: Request):
 @with_cancellation
 async def handle_chat_completions(request: Request):
     return await _handle_completions("/chat/completions", request)
+
+
+@app.get("/profile_routes")
+async def get_profile_routes():
+    return profile_capabilities(proxy_state)
 
 
 @app.get("/healthcheck")

@@ -54,7 +54,7 @@ def load_worker(monkeypatch, *, perf=True, scheduling=False, rank=0):
         suppress=suppress,
         InvalidStateError=InvalidStateError,
         FutureWrapper=type("FutureWrapper", (Future,), {"wait_for_response": lambda *args: None}),
-        cold_perf_enabled=lambda: perf,
+        cold_perf_detailed_enabled=lambda: perf,
         log_cold_perf_event=lambda event, **fields: events.append((event, fields)),
         log_cold_perf_process_event=lambda event, **fields: events.append((event, fields)),
     )
@@ -101,7 +101,7 @@ def load_worker(monkeypatch, *, perf=True, scheduling=False, rank=0):
                 "_wait_for_response",
             )
             or isinstance(node, ast.If)
-            and ast.unparse(node.test) == "cold_perf_enabled()"
+            and ast.unparse(node.test) == "cold_perf_detailed_enabled()"
         ):
             selected.append(node)
     compile_nodes(selected, PATCH, ns)

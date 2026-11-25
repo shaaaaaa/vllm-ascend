@@ -60,6 +60,7 @@ from vllm_ascend.distributed.kv_transfer.sparse_offload.resident_sorted_cache im
     RESIDENT_COUNT_CACHELINE_INTS,
 )
 from vllm_ascend.serving_perf import (
+    cold_perf_detailed_enabled,
     cold_perf_enabled,
     forget_cold_perf_request,
     is_cold_perf_request,
@@ -79,7 +80,6 @@ from vllm_ascend.utils import (
     staged_sfa_graph_configured,
 )
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
-from vllm_ascend.worker.startup_trace import startup_phase, startup_stage
 
 torch._dynamo.trace_rules.clear_lru_cache()  # noqa: E402
 from torch._dynamo.variables import TorchInGraphFunctionVariable  # noqa: E402
@@ -115,6 +115,17 @@ def _cold_perf_watchdog_rank_and_timeout() -> tuple[int, int]:
     )
 
 
+def _report_worker_delay(worker, event, **fields):
+    # Independent per worker so a slow non-output TP rank stays visible.
+    if not cold_perf_detailed_enabled():
+        reports = worker.__dict__.setdefault("_slow_phase_reported_at", {})
+        now = time.monotonic()
+        if now - reports.get(event, -float("inf")) < 60:
+            return
+        reports[event] = now
+    log_cold_perf_process_event(event, worker_rank=getattr(worker, "rank", None), **fields)
+
+
 def _trace_first_cold_perf_execute(method):
     """Trace the first non-empty batch and every marked cold resume."""
 
@@ -142,12 +153,12 @@ def _trace_first_cold_perf_execute(method):
         previous_requests = getattr(
             self, "_cold_perf_last_execute_requests", frozenset()
         )
-        overlap = previous_requests.intersection(scheduled)
-        if previous_return is not None and overlap:
+        if previous_return is not None:
             gap_ms = (entry_started - previous_return) * 1000
-            if gap_ms >= _COLD_PERF_SLOW_EXECUTE_MS:
+            if gap_ms >= _COLD_PERF_SLOW_EXECUTE_MS and (overlap := set(previous_requests).intersection(scheduled)):
                 tp_rank, _ = _cold_perf_watchdog_rank_and_timeout()
-                log_cold_perf_process_event(
+                _report_worker_delay(
+                    self,
                     "decoder_submission_gap",
                     tp_rank=tp_rank,
                     gap_ms=round(gap_ms, 3),
@@ -157,8 +168,7 @@ def _trace_first_cold_perf_execute(method):
                     current_batch_size=len(scheduled),
                     process_cpu_ms=(
                         round(
-                            (entry_process_cpu_ns - previous_process_cpu_ns)
-                            / 1_000_000,
+                            (entry_process_cpu_ns - previous_process_cpu_ns) / 1_000_000,
                             3,
                         )
                         if previous_process_cpu_ns is not None
@@ -166,8 +176,7 @@ def _trace_first_cold_perf_execute(method):
                     ),
                     main_thread_cpu_ms=(
                         round(
-                            (entry_thread_cpu_ns - previous_thread_cpu_ns)
-                            / 1_000_000,
+                            (entry_thread_cpu_ns - previous_thread_cpu_ns) / 1_000_000,
                             3,
                         )
                         if previous_thread_cpu_ns is not None
@@ -182,28 +191,32 @@ def _trace_first_cold_perf_execute(method):
             elapsed_ms = (completed - entry_started) * 1000
             if scheduled and elapsed_ms >= _COLD_PERF_SLOW_EXECUTE_MS:
                 tp_rank, _ = _cold_perf_watchdog_rank_and_timeout()
-                log_cold_perf_process_event(
+                _report_worker_delay(
+                    self,
                     "decoder_execute_slow",
                     tp_rank=tp_rank,
                     elapsed_ms=round(elapsed_ms, 3),
                     batch_size=len(scheduled),
                     request_ids=list(scheduled[:8]),
                     process_cpu_ms=round(
-                        (completed_process_cpu_ns - entry_process_cpu_ns)
-                        / 1_000_000,
+                        (completed_process_cpu_ns - entry_process_cpu_ns) / 1_000_000,
                         3,
                     ),
                     main_thread_cpu_ms=round(
-                        (completed_thread_cpu_ns - entry_thread_cpu_ns)
-                        / 1_000_000,
+                        (completed_thread_cpu_ns - entry_thread_cpu_ns) / 1_000_000,
                         3,
                     ),
                 )
             self._cold_perf_last_execute_return = completed
             self._cold_perf_last_execute_process_cpu_ns = completed_process_cpu_ns
             self._cold_perf_last_execute_thread_cpu_ns = completed_thread_cpu_ns
-            self._cold_perf_last_execute_requests = frozenset(scheduled)
+            self._cold_perf_last_execute_requests = scheduled
 
+        if not cold_perf_detailed_enabled():
+            try:
+                return method(self, scheduler_output, *args, **kwargs)
+            finally:
+                record_finish()
         mark_cold_perf_connector_requests(
             getattr(scheduler_output, "kv_connector_metadata", None)
         )
@@ -625,7 +638,6 @@ class NPUWorker(WorkerBase):
                 logger.warning(f"Bind cpus failed in rank{self.local_rank}: {e} Skip binding cpu.")
         return device
 
-    @startup_stage("device_init")
     def init_device(self):
         # NOTE: KEEP device the member of `NPUWorker`, as it will be checked
         # in ray scenario. see https://github.com/vllm-project/vllm/pull/26845
@@ -670,7 +682,6 @@ class NPUWorker(WorkerBase):
         )
         torch.npu.synchronize()
 
-    @startup_stage("memory_profile")
     @torch.inference_mode()
     def determine_available_memory(self) -> int:
         """Profiles the peak memory usage of the model to determine how much
@@ -919,7 +930,10 @@ class NPUWorker(WorkerBase):
                 )
             )
         )
-        rpc_started = time.perf_counter() if request_ids else 0.0
+        production = cold_perf_enabled() and not cold_perf_detailed_enabled()
+        if production:
+            self.model_runner._slow_sample_phases = None
+        rpc_started = time.perf_counter() if request_ids or production else 0.0
         diagnostic_active = bool(active_request_ids)
         watchdog_armed = False
         if diagnostic_active:
@@ -962,6 +976,19 @@ class NPUWorker(WorkerBase):
                     self._raise_if_remote_fill_restart_required()
                 raise
             self._raise_if_remote_fill_restart_required()
+            if production:
+                elapsed_ms = (time.perf_counter() - rpc_started) * 1000
+                if elapsed_ms >= _COLD_PERF_SLOW_EXECUTE_MS:
+                    phases = self.model_runner._slow_sample_phases or {}
+                    _report_worker_delay(
+                        self,
+                        "decoder_sample_rpc_slow",
+                        elapsed_ms=round(elapsed_ms, 3),
+                        request_ids=list(getattr(self, "_cold_perf_last_execute_requests", ()))[:8],
+                        dominant_phase=max(phases, key=phases.__getitem__).removesuffix("_wall_ms") if phases else None,
+                        **phases,
+                    )
+                return output
             if request_ids:
                 sample_return_ns = time.perf_counter_ns()
                 rpc_elapsed_ms = (time.perf_counter() - rpc_started) * 1000
@@ -1027,7 +1054,6 @@ class NPUWorker(WorkerBase):
             for request_id in active_request_ids:
                 forget_cold_perf_request(request_id)
 
-    @startup_stage("model_load")
     def load_model(self) -> None:
         if self.vllm_config.model_config.enable_sleep_mode:
             allocator = CaMemAllocator.get_instance()
@@ -1053,28 +1079,11 @@ class NPUWorker(WorkerBase):
             or parallel_config.enable_elastic_ep
         ):
             return
-
-        # Each DP executor waits only for its own TP workers to initialize KV
-        # caches. A peer DP may still be registering its shared CPU slab when
-        # we reach warmup. Wait on the EP CPU group before launching any model
-        # collectives, whose device timeout would otherwise include that wait.
-        # Elastic EP has a separate startup/reconfiguration protocol.
-        started = time.perf_counter() if cold_perf_enabled() else None
-        if started is not None:
-            log_cold_perf_process_event("decoder_ep_startup_wait_start")
         ep_group = get_ep_group()
-        members = {"members": ep_group.ranks} if ep_group.rank_in_group == 0 else {}
-        with startup_phase(self, "ep_barrier", ep=ep_group.rank_in_group, n=ep_group.world_size, **members):
-            from vllm_ascend.worker.sfa_agreement import initialize_single_agreement
+        from vllm_ascend.worker.sfa_agreement import initialize_single_agreement
 
-            initialize_single_agreement(self.model_runner, ep_group)
-        if started is not None:
-            log_cold_perf_process_event(
-                "decoder_ep_startup_wait_complete",
-                elapsed_ms=round((time.perf_counter() - started) * 1000, 3),
-            )
+        initialize_single_agreement(self.model_runner, ep_group)
 
-    @startup_stage("warmup")
     def compile_or_warm_up_model(self) -> float:
         self._wait_for_decoder_ep_startup()
         # Note: need to adapt for graph mode.
@@ -1095,39 +1104,19 @@ class NPUWorker(WorkerBase):
             for compile_range in compile_ranges:
                 if not any(x in compile_range for x in all_sizes):
                     warmup_sizes.append(compile_range.end)
-
-        with startup_phase(self, "warmup_dummy", sizes=len(warmup_sizes)):
-            for size in sorted(warmup_sizes, reverse=True):
-                logger.info("Compile and warming up model for size %d", size)
-                self.model_runner._dummy_run(size)
+        for size in sorted(warmup_sizes, reverse=True):
+            logger.info("Compile and warming up model for size %d", size)
+            self.model_runner._dummy_run(size)
         if not self.model_config.enforce_eager:
-            capture_started = time.perf_counter() if cold_perf_enabled() else None
-            if capture_started is not None:
-                log_cold_perf_process_event(
-                    "decoder_graph_capture_start",
-                    staged_sfa=staged_sfa_graph_configured(self.vllm_config),
-                    capture_sizes=self.vllm_config.compilation_config.cudagraph_capture_sizes,
-                )
-            with startup_phase(self, "graph_capture"):
-                self.model_runner.capture_model()
-            if capture_started is not None:
-                log_cold_perf_process_event(
-                    "decoder_graph_capture_complete",
-                    elapsed_ms=round(
-                        (time.perf_counter() - capture_started) * 1000,
-                        3,
-                    ),
-                )
+            self.model_runner.capture_model()
         # Call ATB matmul to warm up; otherwise, the first operation (ReshapeAndCache)
         # may cause performance degradation at runtime.
         if get_ascend_device_type() != AscendDeviceType.A5:
-            with startup_phase(self, "atb_warmup"):
-                self._warm_up_atb()
+            self._warm_up_atb()
         if not getattr(self, "use_v2_model_runner", False):
             from vllm_ascend.ops.triton.decode_warmup import warmup_decode_kernels
 
-            with startup_phase(self, "decode_kernel_warmup"):
-                warmup_decode_kernels(self.model_runner)
+            warmup_decode_kernels(self.model_runner)
         # Reset the seed to ensure that the random state is not affected by
         # the model initialization and profiling.
         set_random_seed(self.model_config.seed)
@@ -1271,11 +1260,9 @@ class NPUWorker(WorkerBase):
             self.model_runner.update_max_model_len(max_model_len)
         logger.debug("Updated max_model_len to %d", max_model_len)
 
-    @startup_stage("kv_init")
     def initialize_from_config(self, kv_cache_config: KVCacheConfig) -> None:
         """Allocate NPU KV cache with the specified kv_cache_config."""
-        with startup_phase(self, "kv_connector", p_node=int(envs_ascend.VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE)):
-            ensure_kv_transfer_initialized(self.vllm_config, kv_cache_config)
+        ensure_kv_transfer_initialized(self.vllm_config, kv_cache_config)
         if self.vllm_config.model_config.enable_sleep_mode:
             allocator = CaMemAllocator.get_instance()
             context = allocator.use_memory_pool(tag="kv_cache")
@@ -1332,9 +1319,13 @@ class NPUWorker(WorkerBase):
         self.model_runner.reset_encoder_cache()
 
     def execute_dummy_batch(self) -> None:
+        started = time.perf_counter() if cold_perf_enabled() else None
         self.model_runner._dummy_run(num_tokens=self.model_runner.decode_token_per_req, uniform_decode=True)
+        if started is not None:
+            elapsed_ms = (time.perf_counter() - started) * 1000
+            if elapsed_ms >= _COLD_PERF_SLOW_EXECUTE_MS:
+                _report_worker_delay(self, "decoder_dummy_slow", elapsed_ms=round(elapsed_ms, 3))
 
-    @startup_stage("dist_init")
     def _init_worker_distributed_environment(self) -> None:
         """Initialize the distributed environment."""
         init_batch_invariance()

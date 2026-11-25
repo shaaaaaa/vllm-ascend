@@ -14,3 +14,8 @@ _ENABLED = _MODE not in ("", "0", "false", "no", "off")
 def serving_perf_enabled() -> bool:
     """Return the host timing gate selected before process startup."""
     return _ENABLED
+
+
+def serving_perf_detailed_enabled() -> bool:
+    """Whether to emit routine request and tokenizer timings."""
+    return _MODE in ("detail", "device")

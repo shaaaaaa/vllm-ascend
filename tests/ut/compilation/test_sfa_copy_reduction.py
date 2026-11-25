@@ -13,27 +13,28 @@ from test_sfa_dcp_prepare import ops
 
 
 @pytest.mark.parametrize(
-    "active,group_active,diagnostic",
+    "active,plan,copy_bridge",
     [
-        (True, True, False),
-        (False, True, False),
-        (True, False, False),
-        (True, True, True),
+        (True, NS(active=True), False),
+        (False, NS(active=True), True),
+        (True, NS(active=False), True),
+        (True, None, True),
     ],
 )
 @pytest.mark.parametrize("failure", [None, "pre", "retrieve"])
-def test_full_operator_preserves_aliases_and_stage_order(active, group_active, diagnostic, failure):
+def test_full_operator_preserves_aliases_and_stage_order(active, plan, copy_bridge, failure):
     context = NS(sfa_full_graph_active=active)
     query, rope = torch.ones(2, 8, 512), torch.ones(2, 8, 64)
     topk, selected, slots = torch.zeros(2, 1, 2048), torch.zeros(1, 4096), torch.zeros(1, 4096)
     counts = torch.zeros(1, 16, dtype=torch.int32)[:, 0]
-    writes, reads, events = [topk, selected, slots], [], []
+    writes = [topk, selected, slots] if plan is not None else []
+    reads, events = [], []
     edge = NS(transfer=NS(request_capacity=1), destinations=object())
 
     def pre(*args, **kwargs):
         events.append("pre")
-        assert kwargs["resident_writes"] is writes and kwargs["resident_reads"] is None
-        assert kwargs["copy_bridge"] is not (active and group_active and not diagnostic)
+        assert kwargs["resident_writes"] is (writes or None) and kwargs["resident_reads"] is None
+        assert kwargs["copy_bridge"] is copy_bridge
         if failure == "pre":
             raise RuntimeError("pre")
         return query, rope, topk, selected, counts, slots
@@ -52,8 +53,7 @@ def test_full_operator_preserves_aliases_and_stage_order(active, group_active, d
         assert all(a.data_ptr() == b.data_ptr() for a, b in zip(prefetch[1:4], (selected, counts, slots)))
 
     impl = NS(
-        shared_resident_plan=NS(active=group_active),
-        _staged_graph_content_diagnostic_enabled=lambda _: diagnostic,
+        shared_resident_plan=plan,
         cross_layer_graph_pre=pre,
         cross_layer_lmcache_retrieve=retrieve,
         cross_layer_graph_post=post,

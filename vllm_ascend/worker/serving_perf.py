@@ -111,6 +111,17 @@ def _log_slow_sample_invocation(
     )
 
 
+def _sample_phase_times(marks: list[float], ended: float) -> dict[str, float]:
+    """Wall times at existing host boundaries. These can include waits for device work."""
+    return {
+        "grammar_sampling_wall_ms": round((marks[1] - marks[0]) * 1000, 3),
+        "bookkeeping_wall_ms": round((marks[2] - marks[1]) * 1000, 3),
+        "mtp_proposal_readback_wall_ms": round((marks[3] - marks[2]) * 1000, 3),
+        "connector_finalize_wall_ms": round((marks[4] - marks[3]) * 1000, 3),
+        "output_tail_wall_ms": round((ended - marks[4]) * 1000, 3),
+    }
+
+
 def _log_prefill_sample(scheduler_output: Any, marks: list[float], async_scheduling: bool) -> None:
     """Emit one slow host-only sample; adjacent intervals include device waits."""
     ended = time.perf_counter()
@@ -123,11 +134,7 @@ def _log_prefill_sample(scheduler_output: Any, marks: list[float], async_schedul
         require_active=False,
         sample_started_monotonic_ms=round(marks[0] * 1000, 3),
         total_wall_ms=round(elapsed_ms, 3),
-        grammar_sampling_wall_ms=round((marks[1] - marks[0]) * 1000, 3),
-        bookkeeping_wall_ms=round((marks[2] - marks[1]) * 1000, 3),
-        mtp_proposal_readback_wall_ms=round((marks[3] - marks[2]) * 1000, 3),
-        connector_finalize_wall_ms=round((marks[4] - marks[3]) * 1000, 3),
-        output_tail_wall_ms=round((ended - marks[4]) * 1000, 3),
+        **_sample_phase_times(marks, ended),
         num_scheduled_tokens=scheduler_output.total_num_scheduled_tokens,
         num_reqs=len(scheduler_output.num_scheduled_tokens),
         async_scheduling=async_scheduling,

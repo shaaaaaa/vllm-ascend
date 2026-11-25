@@ -126,7 +126,7 @@ python tools/sfa_retrieval_overlap_benchmark.py \
 
 This alternates serial/overlap measurement order, first checks exact transfer
 contents, and measures four layers of the real graph retrieval plus the serving
-`batch_matmul_transpose` cube projection. It reports median/p95 chain durations,
+`npu_transpose_batchmatmul` cube projection. It reports median/p95 chain durations,
 copied bytes and host enqueue time including timing events. It is **not** a
 full-forward or serving benchmark: SFA, O-projection, normalization and MoE are
 absent. Event timings may include launch starvation; inspect the exported trace

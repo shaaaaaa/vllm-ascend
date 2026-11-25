@@ -1,8 +1,6 @@
 import inspect
 import os
 import sys
-from pathlib import Path
-from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -25,7 +23,6 @@ if "torch_npu._inductor" not in sys.modules:
     sys.modules["torch_npu._inductor"] = MagicMock()
 
 import vllm_ascend.attention.sfa_v1 as sfa_v1
-import vllm_ascend.attention.target_sfa_diagnostics as target_diag
 import vllm_ascend.attention.utils as attention_utils
 from vllm_ascend.attention.sfa_v1 import (
     AscendSFABackend,
@@ -110,223 +107,6 @@ def test_sparse_boundary_short_frontier_preserves_zero_pad_semantics():
     )
 
     assert actual.tolist() == [8, 0]
-
-
-def test_lmcache_load_stat_aggregates_mtp_rows_and_resets():
-    impl = AscendSFAImpl.__new__(AscendSFAImpl)
-    impl.index_topk = 4
-    impl._lmcache_load_stat_enabled = True
-    impl._lmcache_load_stat_tokens = None
-    impl._lmcache_load_stat_denominator = 0
-    impl._lmcache_load_stat_rows = 0
-    impl._lmcache_load_stat_calls = 0
-    impl._lmcache_load_stat_last_log = 10.0
-
-    with (
-        patch.object(sfa_v1, "monotonic", side_effect=[10.5, 11.2]),
-        patch.object(sfa_v1.logger, "info") as log,
-    ):
-        impl._record_lmcache_load_stat(
-            "model.layers.78.self_attn",
-            torch.tensor([[1, 99], [2, 99]], dtype=torch.int32),
-            request_count=2,
-            decode_rows=4,
-        )
-        impl._record_lmcache_load_stat(
-            "model.layers.78.self_attn",
-            torch.tensor([[3, 99], [4, 99]], dtype=torch.int32),
-            request_count=2,
-            decode_rows=4,
-        )
-
-    log.assert_called_once()
-    args = log.call_args.args
-    assert args[1:] == (
-        "model.layers.78.self_attn",
-        pytest.approx(1.2),
-        10,
-        4,
-        8,
-        32,
-        pytest.approx(10 / 32),
-        2,
-    )
-    assert impl._lmcache_load_stat_tokens.item() == 0
-    assert impl._lmcache_load_stat_denominator == 0
-    assert impl._lmcache_load_stat_rows == 0
-    assert impl._lmcache_load_stat_calls == 0
-    assert impl._lmcache_load_stat_last_log == pytest.approx(11.2)
-
-
-def test_lmcache_load_stat_disabled_does_not_touch_tensor_or_clock():
-    impl = AscendSFAImpl.__new__(AscendSFAImpl)
-    impl._lmcache_load_stat_enabled = False
-    impl._lmcache_load_stat_tokens = None
-
-    with patch.object(sfa_v1, "monotonic") as clock:
-        impl._record_lmcache_load_stat(
-            "model.layers.0.self_attn",
-            torch.tensor([3], dtype=torch.int32),
-            request_count=1,
-            decode_rows=1,
-        )
-
-    clock.assert_not_called()
-    assert impl._lmcache_load_stat_tokens is None
-
-
-def test_target_sfa_diagnostics_save_layer_io_and_retrieve_state():
-    impl = AscendSFAImpl.__new__(AscendSFAImpl)
-    impl.tp_rank = 3
-    impl.block_size = 4
-    impl._sorted_resident_state = None
-    impl._sorted_resident_workspace_views = {}
-    impl.index_topk = 2
-    impl._staged_sfa_bridge_buffers = (
-        torch.arange(8, dtype=torch.float32).reshape(2, 1, 4),
-        torch.arange(4, dtype=torch.float32).reshape(2, 1, 2),
-        torch.tensor([[[0, 5]], [[1, 6]]], dtype=torch.int32),
-        torch.tensor([[0, 1, 5, 6]], dtype=torch.int32),
-        torch.tensor([4], dtype=torch.int32),
-        torch.tensor([[12, 13, 14, 15]], dtype=torch.long),
-    )
-    kv_cache = (
-        torch.arange(20 * 4 * 2, dtype=torch.float32).reshape(20, 4, 1, 2),
-        torch.arange(20 * 4, dtype=torch.float32).reshape(20, 4, 1, 1),
-        torch.empty(20, 4, 1, 1),
-    )
-    impl._staged_sfa_capture_state = SimpleNamespace(
-        runtime=("model.layers.0.self_attn.attn", kv_cache, None, False),
-        remap_boundary=torch.tensor([4, 4], dtype=torch.int32),
-    )
-    raw_topk = torch.tensor([[2, 3, 5, 6]], dtype=torch.int32)
-    metadata = SimpleNamespace(
-        num_actual_tokens=2,
-        num_decode_tokens=2,
-        req_ids=["request-0"],
-        decode_request_ids_compact=["request-0"],
-        decode_req_indices=torch.tensor([0, 0], dtype=torch.int32),
-        block_table=torch.tensor([[10, 11, 12, 13]], dtype=torch.int32),
-        resident_state_indices=None,
-        decode_union_mapping_workspace=raw_topk,
-    )
-    context = SimpleNamespace(
-        staged_sfa_graph_key=object(),
-        staged_sfa_graph_dummy_run=False,
-    )
-
-    with (
-        TemporaryDirectory() as temp_dir,
-        patch.dict(
-            os.environ,
-            {"VLLM_ASCEND_MTP_DRAFT_DEBUG": "1"},
-        ),
-        patch.object(
-            target_diag,
-            "MTP_DRAFT_DIAG_ROOT",
-            Path(temp_dir),
-        ),
-        patch.object(
-            sfa_v1.torch.npu,
-            "is_current_stream_capturing",
-            return_value=False,
-        ),
-        patch.object(sfa_v1.torch.npu, "synchronize"),
-    ):
-        input_tensor = torch.arange(6, dtype=torch.float32).reshape(2, 3)
-        impl.target_sfa_diagnostic_boundary(
-            "model.layers.0.self_attn.attn",
-            "input",
-            input_tensor,
-            metadata,
-            context,
-        )
-        diagnostic = impl._target_sfa_diag_pre_retrieve(
-            "model.layers.0.self_attn.attn",
-            impl._staged_sfa_bridge_buffers[3],
-            impl._staged_sfa_bridge_buffers[4],
-            impl._staged_sfa_bridge_buffers[5],
-            metadata,
-            context,
-            1,
-        )
-        impl._target_sfa_diag_post_retrieve(diagnostic)
-        output_tensor = input_tensor + 1
-        impl.target_sfa_diagnostic_boundary(
-            "model.layers.0.self_attn.attn",
-            "output",
-            output_tensor,
-            metadata,
-            context,
-        )
-        target_diag.target_tail_boundary(
-            context._target_sfa_diag_session,
-            "model_forward",
-            output_tensor + 1,
-        )
-
-        session = context._target_sfa_diag_session
-        saved_input = torch.load(
-            target_diag.target_sfa_path(session, 0, "input"),
-            weights_only=True,
-        )
-        saved_pre = torch.load(
-            target_diag.target_sfa_path(session, 0, "pre"),
-            weights_only=True,
-        )
-        saved_lmcache = torch.load(
-            target_diag.target_sfa_path(session, 0, "lmcache"),
-            weights_only=True,
-        )
-        saved_output = torch.load(
-            target_diag.target_sfa_path(session, 0, "output"),
-            weights_only=True,
-        )
-        saved_model_output = torch.load(
-            session.output_dir / "target_model_forward.pt",
-            weights_only=True,
-        )
-
-    assert torch.equal(saved_input["tensor"], input_tensor)
-    assert saved_input["metadata"]["req_ids"] == ["request-0"]
-    assert saved_pre["physical_block_ids"] == [3, 10, 11]
-    assert torch.equal(
-        saved_pre["topk_indices"],
-        impl._staged_sfa_bridge_buffers[2],
-    )
-    assert torch.equal(saved_pre["raw_topk"], raw_topk.reshape(2, 1, 2))
-    assert torch.equal(
-        saved_pre["remap_boundary"],
-        impl._staged_sfa_capture_state.remap_boundary,
-    )
-    assert saved_pre["cache_before_lmcache"][0]["physical_block_ids"] == [3, 10, 11]
-    assert saved_lmcache["cache_after_lmcache"][0]["physical_block_ids"] == [3, 10, 11]
-    assert torch.equal(saved_output["tensor"], output_tensor)
-    assert torch.equal(saved_model_output["value"], output_tensor + 1)
-
-
-def test_target_sfa_diagnostics_skip_dummy_graph_capture():
-    impl = AscendSFAImpl.__new__(AscendSFAImpl)
-    context = SimpleNamespace(
-        staged_sfa_graph_key=object(),
-        staged_sfa_graph_dummy_run=True,
-    )
-    with (
-        patch.dict(
-            os.environ,
-            {"VLLM_ASCEND_MTP_DRAFT_DEBUG": "1"},
-        ),
-        patch.object(sfa_v1.torch.npu, "synchronize") as synchronize,
-    ):
-        impl.target_sfa_diagnostic_boundary(
-            "model.layers.0.self_attn.attn",
-            "input",
-            torch.ones(1, 2),
-            SimpleNamespace(),
-            context,
-        )
-
-    synchronize.assert_not_called()
 
 
 def test_sparse_boundary_gathers_by_request_for_mtp_rows():
@@ -530,6 +310,8 @@ def _staged_route(frontiers=(4096,), cold_compact_resumes=()):
     )
 
 
+
+
 class TestLMCacheSparseWaitSync(TestBase):
     def setUp(self):
         self.original_once_done = sfa_v1._lmcache_sparse_wait_sync_once_done
@@ -580,6 +362,7 @@ class TestLMCacheSparseWaitSync(TestBase):
             sfa_v1._sync_compute_stream_after_lmcache_sparse_wait()
 
         self.assertFalse(sfa_v1._lmcache_sparse_wait_sync_once_done)
+
 
 
 class TestDSASparsePadding(TestBase):
@@ -2126,214 +1909,6 @@ class TestStagedSFAGraphPoc(TestBase):
         args = impl._cross_layer_post_compute.call_args.args
         self.assertEqual([tensor.shape[0] for tensor in args[:3]], [1] * 3)
 
-    def test_graph_post_diagnostic_is_captured_and_queued_after_replay(self):
-        impl = self._make_eligible_impl()
-        impl.decode_threshold = 2
-        kv_cache = self._make_eligible_kv_cache()
-        impl._cross_layer_kv_cache = MagicMock(
-            return_value=(kv_cache, "index-0", True)
-        )
-        impl._cross_layer_post_compute = MagicMock()
-        graph_key = StagedSFAGraphKey.fixed_spec(1, 2)
-        metadata = self._make_decode_metadata(2)
-        metadata.decode_request_ids_compact = ["req-0"]
-        metadata.req_ids = ["req-0"]
-        metadata.decode_req_indices_cpu = [0, 0]
-        metadata.seq_lens_cpu = [9]
-        metadata.seq_lens = torch.tensor([9], dtype=torch.int32)
-        layer_name = "model.layers.0.self_attn.attn"
-        context = SimpleNamespace(
-            staged_sfa_graph_key=graph_key,
-            cudagraph_runtime_mode=CUDAGraphMode.NONE,
-            attn_metadata={layer_name: metadata},
-        )
-        output = torch.arange(2 * 512, dtype=torch.float32).reshape(2, 512)
-
-        with (
-            patch.object(sfa_v1, "get_forward_context", return_value=context),
-            patch.object(
-                sfa_v1,
-                "npu_content_diagnostics_enabled",
-                return_value=True,
-            ),
-            patch.object(
-                sfa_v1,
-                "queue_staged_graph_stage_fingerprint",
-            ) as queue_stage,
-        ):
-            impl.cross_layer_graph_post(
-                layer_name,
-                torch.empty(2, 2, 4),
-                torch.empty(2, 2, 2),
-                torch.empty(2, 1, 16, dtype=torch.int32),
-                kv_cache,
-                metadata,
-                output,
-            )
-            context.cudagraph_runtime_mode = CUDAGraphMode.PIECEWISE
-            impl.queue_staged_graph_post_diagnostic(
-                layer_name,
-                graph_key,
-                metadata,
-            )
-
-        snapshot = impl._staged_sfa_capture_state.post_diagnostic_buffers[
-            graph_key
-        ]
-        self.assertEqual(tuple(snapshot.shape), (2, 256))
-        self.assertTrue(torch.equal(snapshot, output[:, :256]))
-        queue_stage.assert_called_once()
-        kwargs = queue_stage.call_args.kwargs
-        self.assertEqual(kwargs["stage"], "after_graph_post")
-        self.assertEqual(
-            kwargs["components"]["attention_output"].data_ptr(),
-            snapshot.data_ptr(),
-        )
-
-    def test_graph_pre_diagnostic_captures_hidden_input(self):
-        impl = self._make_eligible_impl()
-        kv_cache = self._make_eligible_kv_cache()
-        impl._staged_sfa_capture_state.initialized_cache_capacity = 1
-        impl._staged_sfa_capture_state.producer_event = MagicMock()
-        impl._cross_layer_kv_cache = MagicMock(
-            return_value=(kv_cache, "index-0", True)
-        )
-        impl._cross_layer_ineligible_reason = MagicMock(return_value=None)
-        impl._cross_layer_pre_compute = MagicMock(
-            return_value=self._make_pre_outputs(2)
-        )
-        graph_key = StagedSFAGraphKey.fixed_spec(1, 2)
-        metadata = self._make_decode_metadata(2)
-        metadata.decode_req_indices.fill_(0)
-        metadata.decode_req_indices_cpu = [0, 0]
-        metadata.seq_lens = metadata.seq_lens[:1]
-        metadata.seq_lens_cpu = metadata.seq_lens_cpu[:1]
-        metadata.decode_request_ids_compact = ["req-0"]
-        metadata.req_ids = ["req-0"]
-        layer_name = "model.layers.0.self_attn.attn"
-        context = SimpleNamespace(
-            staged_sfa_graph_dummy_run=True,
-            staged_sfa_graph_key=graph_key,
-            staged_sfa_route=StagedSFARouteDecision(
-                StagedSFARouteAction.STAGED,
-                StagedSFARouteReason.ELIGIBLE,
-                graph_key,
-                (8,),
-            ),
-            cudagraph_runtime_mode=CUDAGraphMode.NONE,
-        )
-        hidden = torch.arange(2 * 512, dtype=torch.float32).reshape(
-            2, 512
-        )
-
-        with (
-            patch.object(sfa_v1, "get_forward_context", return_value=context),
-            patch.object(
-                sfa_v1,
-                "npu_content_diagnostics_enabled",
-                return_value=True,
-            ),
-        ):
-            impl.cross_layer_graph_pre(
-                layer_name,
-                hidden,
-                kv_cache,
-                metadata,
-                False,
-                torch.empty_like(hidden),
-            )
-
-        snapshot = impl._staged_sfa_capture_state.input_diagnostic_buffers[
-            graph_key
-        ]
-        self.assertEqual(tuple(snapshot.shape), (2, 256))
-        self.assertTrue(torch.equal(snapshot, hidden[:, :256]))
-
-    def test_graph_pre_diagnostic_waits_for_producer_event(self):
-        source = inspect.getsource(
-            sfa_v1.AscendSFAImpl.cross_layer_lmcache_retrieve
-        )
-
-        wait = source.index(
-            "torch.npu.current_stream().wait_event(producer_event)"
-        )
-        snapshot = source.index("queue_selected_topk_fingerprint(")
-        connector = source.index("wait_for_kv_layer_from_connector(")
-        self.assertLess(wait, snapshot)
-        self.assertLess(snapshot, connector)
-
-    def test_graph_post_diagnostic_buffer_is_updated_in_piecewise_replay(self):
-        impl = self._make_eligible_impl()
-        impl.decode_threshold = 2
-        kv_cache = self._make_eligible_kv_cache()
-        impl._cross_layer_kv_cache = MagicMock(
-            return_value=(kv_cache, "index-0", True)
-        )
-        impl._cross_layer_post_compute = MagicMock()
-        graph_key = StagedSFAGraphKey.fixed_spec(1, 2)
-        metadata = self._make_decode_metadata(2)
-        metadata.decode_request_ids_compact = ["req-0"]
-        metadata.decode_req_indices_cpu = [0, 0]
-        metadata.seq_lens_cpu = [9]
-        layer_name = "model.layers.0.self_attn.attn"
-        context = SimpleNamespace(
-            staged_sfa_graph_key=graph_key,
-            cudagraph_runtime_mode=CUDAGraphMode.NONE,
-        )
-        eager_output = torch.zeros(2, 512)
-        replay_output = torch.arange(
-            2 * 512, dtype=torch.float32
-        ).reshape(2, 512)
-
-        with (
-            patch.object(sfa_v1, "get_forward_context", return_value=context),
-            patch.object(
-                sfa_v1,
-                "npu_content_diagnostics_enabled",
-                return_value=True,
-            ),
-            patch.object(
-                sfa_v1,
-                "queue_staged_graph_stage_fingerprint",
-            ) as queue_stage,
-        ):
-            # Eager warmup owns the stable buffer subsequently written by the
-            # captured PIECEWISE graph.
-            impl.cross_layer_graph_post(
-                layer_name,
-                torch.empty(2, 2, 4),
-                torch.empty(2, 2, 2),
-                torch.empty(2, 1, 16, dtype=torch.int32),
-                kv_cache,
-                metadata,
-                eager_output,
-            )
-            context.cudagraph_runtime_mode = CUDAGraphMode.PIECEWISE
-            impl.cross_layer_graph_post(
-                layer_name,
-                torch.empty(2, 2, 4),
-                torch.empty(2, 2, 2),
-                torch.empty(2, 1, 16, dtype=torch.int32),
-                kv_cache,
-                metadata,
-                replay_output,
-            )
-            impl.queue_staged_graph_post_diagnostic(
-                layer_name,
-                graph_key,
-                metadata,
-            )
-
-        snapshot = impl._staged_sfa_capture_state.post_diagnostic_buffers[
-            graph_key
-        ]
-        self.assertTrue(torch.equal(snapshot, replay_output[:, :256]))
-        queue_stage.assert_called_once()
-        self.assertEqual(
-            queue_stage.call_args.kwargs["stage"],
-            "after_graph_post",
-        )
-
     def test_cross_layer_bootstrap_prepares_boundary_before_index_wait(self):
         impl = self._make_eligible_impl()
         impl.decode_threshold = 2
@@ -2704,11 +2279,7 @@ class TestStagedSFAGraphPoc(TestBase):
                 "get_weight_prefetch_method",
                 return_value=None,
             ),
-            patch.object(
-                sfa_v1.envs,
-                "VLLM_ASCEND_DSA_OFFLOAD_ASSERT_PARITY",
-                False,
-            ),
+
         ):
             for dtype in (torch.float16, torch.bfloat16):
                 with self.subTest(dtype=dtype):
@@ -2786,11 +2357,7 @@ class TestStagedSFAGraphPoc(TestBase):
                 "get_weight_prefetch_method",
                 return_value=None,
             ),
-            patch.object(
-                sfa_v1.envs,
-                "VLLM_ASCEND_DSA_OFFLOAD_ASSERT_PARITY",
-                False,
-            ),
+
         ):
             reason = impl._cross_layer_ineligible_reason(
                 torch.empty(1, 4, dtype=torch.bfloat16),
@@ -2825,11 +2392,7 @@ class TestStagedSFAGraphPoc(TestBase):
                 "get_weight_prefetch_method",
                 return_value=None,
             ),
-            patch.object(
-                sfa_v1.envs,
-                "VLLM_ASCEND_DSA_OFFLOAD_ASSERT_PARITY",
-                False,
-            ),
+
         ):
             reason = impl._cross_layer_ineligible_reason(
                 torch.empty(1, 4, dtype=torch.bfloat16),
@@ -2857,11 +2420,7 @@ class TestStagedSFAGraphPoc(TestBase):
                 "get_weight_prefetch_method",
                 return_value=None,
             ),
-            patch.object(
-                sfa_v1.envs,
-                "VLLM_ASCEND_DSA_OFFLOAD_ASSERT_PARITY",
-                False,
-            ),
+
         ):
             reason = impl._cross_layer_ineligible_reason(
                 torch.empty(1, 4, dtype=torch.bfloat16),
@@ -3041,11 +2600,7 @@ class TestStagedSFAGraphPoc(TestBase):
         with (
             patch.object(sfa_v1, "get_forward_context", return_value=forward_context),
             patch.object(sfa_v1, "get_weight_prefetch_method", return_value=None),
-            patch.object(
-                sfa_v1.envs,
-                "VLLM_ASCEND_DSA_OFFLOAD_ASSERT_PARITY",
-                False,
-            ),
+
         ):
             reason = impl._cross_layer_ineligible_reason(
                 torch.empty(batch_size, 4, dtype=torch.bfloat16),
@@ -3122,11 +2677,7 @@ class TestStagedSFAGraphPoc(TestBase):
                 "get_weight_prefetch_method",
                 return_value=None,
             ),
-            patch.object(
-                sfa_v1.envs,
-                "VLLM_ASCEND_DSA_OFFLOAD_ASSERT_PARITY",
-                False,
-            ),
+
         ):
             reason = impl._cross_layer_ineligible_reason(
                 torch.empty(4, 4, dtype=torch.bfloat16),
@@ -3239,11 +2790,7 @@ class TestStagedSFAGraphPoc(TestBase):
                 "get_weight_prefetch_method",
                 return_value=None,
             ),
-            patch.object(
-                sfa_v1.envs,
-                "VLLM_ASCEND_DSA_OFFLOAD_ASSERT_PARITY",
-                False,
-            ),
+
         ):
             for name, kv_cache, expected_reason in invalid_contracts:
                 with self.subTest(name=name):
@@ -3282,11 +2829,7 @@ class TestStagedSFAGraphPoc(TestBase):
                 "get_weight_prefetch_method",
                 return_value=weight_prefetch_method,
             ),
-            patch.object(
-                sfa_v1.envs,
-                "VLLM_ASCEND_DSA_OFFLOAD_ASSERT_PARITY",
-                False,
-            ),
+
         ):
             reason = impl._cross_layer_ineligible_reason(
                 torch.empty(1, 4),
@@ -3323,11 +2866,6 @@ class TestStagedSFAGraphPoc(TestBase):
                 sfa_v1,
                 "get_weight_prefetch_method",
                 return_value=None,
-            ),
-            patch.object(
-                sfa_v1.envs,
-                "VLLM_ASCEND_DSA_OFFLOAD_ASSERT_PARITY",
-                False,
             ),
             patch.object(
                 sfa_v1,
@@ -3382,11 +2920,7 @@ class TestStagedSFAGraphPoc(TestBase):
                 "get_weight_prefetch_method",
                 return_value=None,
             ),
-            patch.object(
-                sfa_v1.envs,
-                "VLLM_ASCEND_DSA_OFFLOAD_ASSERT_PARITY",
-                False,
-            ),
+
         ):
             reason = impl._cross_layer_ineligible_reason(
                 torch.empty(capacity, 4, dtype=torch.bfloat16),

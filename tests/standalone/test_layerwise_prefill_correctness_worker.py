@@ -312,7 +312,7 @@ def _runtime(
             num_speculative_tokens=1,
             model=draft_model,
             _get_positions=lambda count: shared["positions"][:count],
-            _run_mtp_draft_layer_with_diagnostics=lambda model_kwargs, **kw: draft_model(**model_kwargs),
+            _run_mtp_draft_layer=lambda model_kwargs, **kw: draft_model(**model_kwargs),
         )
         probe.install_mtp(NS(drafter=drafter), SFAImpl)
 
@@ -354,7 +354,7 @@ def _runtime(
         if mtp:
             shared["positions"] = torch.arange(start, end)
             selected = torch.tensor([end - start - 1])
-            result = drafter._run_mtp_draft_layer_with_diagnostics(
+            result = drafter._run_mtp_draft_layer(
                 dict(input_ids=torch.arange(start + 1, end + 1), positions=shared["positions"], hidden_states=hidden),
                 runtime_inputs=dict(num_input_tokens=end - start, batch_size=1, token_indices_to_sample=selected),
                 per_layer_attn_metadata={"mtp": context.attn_metadata[draft_model.layers["2"].attention.layer_name]},

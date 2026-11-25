@@ -17,9 +17,7 @@
 # Adapted from vllm-project/vllm/vllm/worker/gpu_model_runner.py
 #
 
-import json
 import math
-import os
 import sys
 import time
 from collections import defaultdict
@@ -67,7 +65,6 @@ from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
 from vllm.v1.attention.selector import get_attn_backend  # type: ignore
 from vllm.v1.core.dsa_shared_pool import (
-    LAYERWISE_PREFILL_BANK_COUNT,
     DSABlockAllocationMode,
     PrefillLayerRef,
     build_prefill_layer_refs,
@@ -119,21 +116,13 @@ import vllm_ascend.envs as envs_ascend
 # yapf: enable
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
-from vllm_ascend.attention.mtp_dw_diag import (
-    post_commit_sample_requests,
-    scheduled_decode_requests,
-)
 from vllm_ascend.attention.sfa_remap_boundary import prepare_native_sparse_boundaries
 from vllm_ascend.attention.sfa_v1 import _fixed_staged_decode_mtp, _get_indexer_types
-from vllm_ascend.attention.target_sfa_diagnostics import (
-    target_tail_boundary,
-)
 from vllm_ascend.attention.utils import (
     AscendCommonAttentionMetadata,
     ColdResumeMarkers,
     DcpSFABatch,
     dcp_local_seq_lens,
-    get_lmcache_sparse_cached_tokens,
     native_sfa_cold_resume_layout,
     staged_sfa_connector_supports_sparse_load,
     staged_sfa_metadata_sparse_route,
@@ -174,16 +163,12 @@ from vllm_ascend.live_source_handoff import (
     LIVE_SOURCE_EVENT_HANDOFF_KEY,
 )
 from vllm_ascend.serving_perf import (
+    cold_perf_detailed_enabled,
     cold_perf_device_timing_enabled,
     cold_perf_enabled,
     is_cold_perf_request,
     log_cold_perf_event,
     mark_cold_perf_connector_requests,
-)
-from vllm_ascend.lmcache_diagnostics import (
-    begin_deferred_diagnostic_step,
-    flush_deferred_diagnostics,
-    npu_content_diagnostics_enabled,
 )
 from vllm_ascend.ops.rotary_embedding import set_cos_and_sin, update_cos_sin
 from vllm_ascend.patch.worker.patch_draft_quarot import patch_load_weights
@@ -222,11 +207,10 @@ from vllm_ascend.utils import (
     staged_sfa_graph_configuration_reasons,
     staged_sfa_graph_configured,
 )
-from vllm_ascend.worker.dsa_shared_pool import diagnose_indexer_metadata, reshape_dsa_shared_pool_raw
+from vllm_ascend.worker.dsa_shared_pool import reshape_dsa_shared_pool_raw
 from vllm_ascend.worker.npu_input_batch import NPUInputBatch
 from vllm_ascend.worker.pcp_utils import PCPManager
 from vllm_ascend.worker.sfa_route_diagnostics import apply_sfa_route_with_diagnostics
-from vllm_ascend.worker.startup_trace import startup_phase
 
 from vllm_ascend.ascend_forward_context import (  # isort: skip
     MoECommType,
@@ -246,6 +230,7 @@ from vllm_ascend.worker.serving_perf import (
     _COLD_PERF_SLOW_SAMPLE_MS,
     _PREFILL_PERF_INTERVAL_SECONDS,
     _log_prefill_sample,
+    _sample_phase_times,
     _log_slow_sample_invocation,
     _record_sample_stage,
 )
@@ -304,77 +289,6 @@ def _staged_sfa_dummy_remap_boundaries(
     scratch_capacity = int(query_width) * int(index_topk)
     boundaries[boundaries < scratch_capacity] = 0
     return boundaries
-
-
-def _mtp_dw_diag_enabled() -> bool:
-    return envs_ascend.VLLM_ASCEND_MTP_DW_DIAG
-
-
-def _mtp_dw_window_size() -> int:
-    try:
-        return max(
-            int(os.getenv("LMCACHE_DECODE_WINDOW_SAVE_WINDOW_SIZE", "0")), 0
-        )
-    except ValueError:
-        return 0
-
-
-def _mtp_dw_event(stage: str, **fields: Any) -> None:
-    if not _mtp_dw_diag_enabled():
-        return
-    payload = {"schema": 1, "stage": stage, "owner": "vllm_ascend_runner"}
-    payload.update(fields)
-    logger.info("[MTP_DW] %s", json.dumps(payload, separators=(",", ":")))
-
-
-def _mtp_dw_for_requests(
-    owner: Any,
-    scheduler_output: SchedulerOutput,
-    stage: str,
-    event: str,
-    req_ids: set[str] | None = None,
-    **fields: Any,
-) -> None:
-    if not _mtp_dw_diag_enabled():
-        return
-    for req_id in scheduler_output.num_scheduled_tokens:
-        if req_ids is not None and req_id not in req_ids:
-            continue
-        frontier = getattr(owner, "_mtp_dw_diag_current_frontiers", {}).get(
-            req_id
-        )
-        _mtp_dw_event(
-            stage, req=req_id, event=event, frontier=frontier, **fields
-        )
-
-
-def _mtp_dw_sample_requests(
-    owner: Any, scheduler_output: SchedulerOutput
-) -> set[str]:
-    if not _mtp_dw_diag_enabled():
-        return set()
-    counts = getattr(owner, "_mtp_dw_diag_step_counts", None)
-    if counts is None:
-        counts = {}
-        owner._mtp_dw_diag_step_counts = counts
-    window_size = max(_mtp_dw_window_size(), 1)
-    sampled: set[str] = set()
-    frontiers: dict[str, int] = {}
-    for req_id, scheduled in scheduler_output.num_scheduled_tokens.items():
-        req_index = owner.input_batch.req_id_to_index.get(req_id)
-        if req_index is None:
-            continue
-        frontier = int(
-            owner.input_batch.num_computed_tokens_cpu[req_index] + scheduled
-        )
-        frontiers[req_id] = frontier
-        step = counts.get(req_id, 0)
-        counts[req_id] = step + 1
-        distance = min(frontier % window_size, (-frontier) % window_size)
-        if step < 3 or distance <= 4:
-            sampled.add(req_id)
-    owner._mtp_dw_diag_current_frontiers = frontiers
-    return sampled
 
 
 # if true, allow tensor initialization and casting with internal format (e.g., NZ)
@@ -763,13 +677,7 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
         self.layerwise_prefill_p_node = bool(
             envs_ascend.VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE
         )
-        # Chunk phase is carried by LMCache connector metadata.  Keep the
-        # request and token masks for this forward so mixed-phase batches can
-        # select the correct physical bank without rebuilding Python-side
-        # pointer tables.
-        self._layerwise_prefill_bank_offsets_by_req: dict[str, int] = {}
-        self._layerwise_prefill_bank_phase_by_request_cpu: np.ndarray | None = None
-        self._layerwise_prefill_bank_phase_by_token_cpu: np.ndarray | None = None
+        self.layerwise_prefill_bank_count = envs_ascend.VLLM_ASCEND_LAYERWISE_PREFILL_NUM_BANKS
         if self.layerwise_prefill_p_node and not self.dsa_shared_pool:
             raise ValueError(
                 "Layerwise-prefill P nodes require DSA unbundle, two groups, "
@@ -777,7 +685,8 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
             )
         if self.layerwise_prefill_p_node:
             logger.info(
-                "Layerwise-prefill P node enabled: two-bank global DSA slab."
+                "Layerwise-prefill P node enabled: %d-bank global DSA slab.",
+                self.layerwise_prefill_bank_count,
             )
         # Step B staging (1 = B2 compact-scratch decode read; 2 = +B1 freeing).
         self.dsa_shrink_latent = (
@@ -849,6 +758,7 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
         if vllm_config.kv_transfer_config is not None:
             self.is_kv_producer = vllm_config.kv_transfer_config.is_kv_producer
             self.is_kv_consumer = vllm_config.kv_transfer_config.is_kv_consumer
+        self._production_sample_perf = cold_perf_enabled() and not cold_perf_detailed_enabled()
         self._prefill_sample_perf = (
             cold_perf_enabled() and self.is_kv_producer and get_tp_group().rank_in_group == 0
         )
@@ -1427,9 +1337,9 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
         )
         if not self.layerwise_prefill_p_node:
             return tables
-        if len(tables) != LAYERWISE_PREFILL_BANK_COUNT:
+        if len(tables) != self.layerwise_prefill_bank_count:
             raise RuntimeError(
-                "Layerwise-prefill P node requires exactly two block tables"
+                "Layerwise-prefill block table count differs from the configured bank count"
             )
 
         for req_index, req_id in enumerate(self.input_batch.req_ids):
@@ -1446,10 +1356,10 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
             bank_ids = request.block_ids_by_bank
             if (
                 bank_ids is None
-                or len(bank_ids) != LAYERWISE_PREFILL_BANK_COUNT
+                or len(bank_ids) != self.layerwise_prefill_bank_count
             ):
                 raise RuntimeError(
-                    "Layerwise-prefill request is missing its two physical "
+                    "Layerwise-prefill request is missing its configured physical "
                     f"block banks: request_id={req_id}"
                 )
             if bank_ids[0] != request.block_ids:
@@ -1457,7 +1367,8 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                     "Layerwise-prefill primary block table differs from bank 0: "
                     f"request_id={req_id}"
                 )
-            tables[1].add_row(bank_ids[1], req_index)
+            for bank in range(1, self.layerwise_prefill_bank_count):
+                tables[bank].add_row(bank_ids[bank], req_index)
         return tables
 
     def _layerwise_prefill_refs(self) -> dict[str, PrefillLayerRef]:
@@ -1479,55 +1390,11 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
             build_prefill_layer_refs(
                 latent_group.layer_names,
                 indexer_group.layer_names,
+                bank_count=self.layerwise_prefill_bank_count,
             )
         )
         self._lp_layer_refs = refs
         return refs
-
-    def _capture_layerwise_prefill_bank_offsets(
-        self, scheduler_output: "SchedulerOutput"
-    ) -> None:
-        """Capture the connector's per-request chunk bank phase.
-
-        LMCache computes this phase from the same local chunk frontier that
-        drives its DMA generators.  Reading it from connector metadata keeps
-        remote-prefix requests aligned even when vLLM's local computed-token
-        count is still zero.
-        """
-        if not self.layerwise_prefill_p_node:
-            self._layerwise_prefill_bank_offsets_by_req.clear()
-            return
-        metadata = getattr(scheduler_output, "kv_connector_metadata", None)
-        requests = getattr(metadata, "requests", ()) if metadata is not None else ()
-        self._layerwise_prefill_bank_offsets_by_req = {
-            str(request.req_id): int(
-                getattr(request, "layerwise_prefill_bank_offset", 0)
-            ) & 1
-            for request in requests
-        }
-
-    def _prepare_layerwise_prefill_bank_phase_masks(
-        self,
-        req_indices: np.ndarray,
-        num_reqs: int,
-    ) -> None:
-        if not self.layerwise_prefill_p_node:
-            self._layerwise_prefill_bank_phase_by_request_cpu = None
-            self._layerwise_prefill_bank_phase_by_token_cpu = None
-            return
-        request_phases = np.zeros(num_reqs, dtype=np.int8)
-        for req_index, req_id in enumerate(self.input_batch.req_ids[:num_reqs]):
-            request_phases[req_index] = self._layerwise_prefill_bank_offsets_by_req.get(
-                str(req_id), 0
-            )
-        self._layerwise_prefill_bank_phase_by_request_cpu = request_phases
-        if self.pcp_size == 1:
-            token_indices = np.asarray(req_indices, dtype=np.int64)
-            self._layerwise_prefill_bank_phase_by_token_cpu = request_phases[
-                token_indices
-            ]
-        else:
-            self._layerwise_prefill_bank_phase_by_token_cpu = None
 
     def _layerwise_prefill_common_attn_metadata(
         self,
@@ -1898,9 +1765,6 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
         if lmhead_tp_enable():
             max_num_reqs_across_dp = self.max_num_reqs * self.uniform_decode_query_len
             logits_indices = nn.functional.pad(logits_indices, (0, max_num_reqs_across_dp - logits_indices.shape[0]))
-
-        if self.layerwise_prefill_p_node:
-            self._prepare_layerwise_prefill_bank_phase_masks(req_indices, num_reqs)
 
         return (
             logits_indices,
@@ -2336,9 +2200,6 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: IntermediateTensors | None = None,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
-        pd_tensor_dump = getattr(self, "_pd_tensor_dump", None)
-        if pd_tensor_dump is not None:
-            pd_tensor_dump.observe_scheduler(scheduler_output)
         if self.vllm_config.model_config.enable_return_routed_experts:
             capturer = RoutedExpertsCapturer.get_instance()
             if capturer is not None:
@@ -2376,7 +2237,7 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
         ):
             scheduler_output = deepcopy(scheduler_output)
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
-        cold_perf_active = cold_perf_enabled()
+        cold_perf_active = cold_perf_detailed_enabled()
         if cold_perf_active:
             mark_cold_perf_connector_requests(
                 getattr(scheduler_output, "kv_connector_metadata", None)
@@ -2428,8 +2289,6 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                 self._update_states(scheduler_output)
                 if cold_perf_active:
                     self._arm_cold_perf_decode_trace(scheduler_output)
-                if self.layerwise_prefill_p_node:
-                    self._capture_layerwise_prefill_bank_offsets(scheduler_output)
 
                 if has_ec_transfer() and get_ec_transfer().is_producer:
                     with self.maybe_get_ec_connector_output(
@@ -2798,49 +2657,6 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
 
         # Run forward pass
         clear_kv_metadata = self.speculative_config is None
-        diag_enabled = _mtp_dw_diag_enabled()
-        diag_req_ids: set[str] | None = None
-        diag_post_commit_req_ids: set[str] | None = None
-        diag_deep_req_ids: set[str] | None = None
-        if diag_enabled:
-            diag_req_ids = _mtp_dw_sample_requests(self, scheduler_output)
-            previous_frontiers = getattr(
-                self, "_mtp_dw_diag_committed_frontiers", None
-            )
-            active_req_ids = (
-                {str(req_id) for req_id in dsa_req_ids}
-                if dsa_req_ids is not None
-                else set()
-            )
-            if previous_frontiers is not None:
-                for req_id in set(previous_frontiers) - active_req_ids:
-                    previous_frontiers.pop(req_id, None)
-            self._mtp_dw_diag_current_req_ids = diag_req_ids
-            _mtp_dw_for_requests(
-                self,
-                scheduler_output,
-                "config",
-                "target_forward",
-                req_ids=diag_req_ids,
-                mtp_enabled=self.speculative_config is not None,
-                decode_window_size=_mtp_dw_window_size(),
-                diag_enabled=True,
-            )
-            _mtp_dw_for_requests(
-                self,
-                scheduler_output,
-                "finalize",
-                "target_forward",
-                req_ids=diag_req_ids,
-                deferred=not clear_kv_metadata,
-                order=0,
-            )
-        if cold_perf_req_ids:
-            log_cold_perf_event(
-                "decoder_connector_load_start",
-                request_ids=cold_perf_req_ids,
-                once=True,
-            )
         with (
             record_function_or_nullcontext("forward"),
             self._sfa_forward_context(
@@ -2858,9 +2674,6 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                 dsa_req_ids=dsa_req_ids,
                 dsa_prompt_lens=dsa_prompt_lens,
                 dsa_adapter_cache=dsa_adapter_cache,
-                mtp_dw_diag_req_ids=diag_req_ids,
-                mtp_dw_diag_post_commit_req_ids=diag_post_commit_req_ids,
-                mtp_dw_deep_diag_req_ids=diag_deep_req_ids,
                 staged_sfa_route=staged_sfa_route,
                 staged_sfa_graph_key=staged_sfa_graph_key,
             ),
@@ -2898,55 +2711,6 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                         request_ids=cold_perf_req_ids,
                         once=True,
                     )
-            if diag_enabled and dsa_req_ids is not None:
-                decode_requests = scheduled_decode_requests(
-                    dsa_req_ids,
-                    scheduler_output.num_scheduled_tokens,
-                    self.input_batch.num_computed_tokens_cpu,
-                    self.input_batch.num_prompt_tokens,
-                )
-                decode_req_ids = [
-                    req_id for _, req_id in decode_requests
-                ]
-                committed_frontiers = (
-                    get_lmcache_sparse_cached_tokens(decode_req_ids)
-                    if decode_req_ids
-                    else None
-                )
-                if committed_frontiers is not None:
-                    decode_committed_frontiers = [
-                        int(committed) for committed in committed_frontiers
-                    ]
-                    if decode_req_ids:
-                        if previous_frontiers is None:
-                            previous_frontiers = {}
-                            self._mtp_dw_diag_committed_frontiers = (
-                                previous_frontiers
-                            )
-                        diag_post_commit_req_ids = post_commit_sample_requests(
-                            previous_frontiers,
-                            decode_req_ids,
-                            decode_committed_frontiers,
-                        )
-                        if envs_ascend.VLLM_ASCEND_MTP_DW_DEEP_DIAG:
-                            # Sample every committed-window advance. The connector
-                            # keys content probes by frontier, so this preserves one
-                            # bounded probe per group and window.
-                            diag_deep_req_ids = diag_post_commit_req_ids
-                        diag_req_ids.update(diag_post_commit_req_ids)
-                        forward_context = get_forward_context()
-                        forward_context.mtp_dw_diag_req_ids = diag_req_ids
-                        forward_context.mtp_dw_diag_post_commit_req_ids = (
-                            diag_post_commit_req_ids
-                        )
-                        forward_context.mtp_dw_deep_diag_req_ids = (
-                            diag_deep_req_ids
-                        )
-            content_diagnostics_enabled = (
-                npu_content_diagnostics_enabled()
-            )
-            if content_diagnostics_enabled:
-                begin_deferred_diagnostic_step()
             if staged_sfa_graph_key is not None and not envs_ascend.VLLM_ASCEND_SFA_FULL_GRAPH:
                 first_layer_name, first_impl = self._staged_sfa_impls[0]
                 first_impl.bootstrap_cross_layer(first_layer_name)
@@ -3024,18 +2788,6 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                             3,
                         ),
                     )
-            target_diag_session = getattr(
-                get_forward_context(),
-                "_target_sfa_diag_session",
-                None,
-            )
-            if envs_ascend.VLLM_ASCEND_MTP_DRAFT_DEBUG:
-                target_tail_boundary(
-                    target_diag_session,
-                    "model_forward",
-                    hidden_states,
-                )
-            self._target_sfa_diag_session = target_diag_session
             if staged_sfa_graph_key is not None:
                 for _, impl in self._staged_sfa_impls:
                     impl.submit_cross_layer_save()
@@ -3077,8 +2829,6 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                     if self.debugger is not None:
                         self.debugger.stop()
                         self.debugger.step()
-                    if content_diagnostics_enabled:
-                        flush_deferred_diagnostics()
                     return hidden_states
                 if self.is_pooling_model:
                     # Return the pooling output.
@@ -3102,8 +2852,6 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                     if self.debugger is not None:
                         self.debugger.stop()
                         self.debugger.step()
-                    if content_diagnostics_enabled:
-                        flush_deferred_diagnostics()
                     return output
 
                 sample_hidden_states = self._select_sample_hidden_states(hidden_states, logits_indices)
@@ -3128,13 +2876,6 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                 )
                 assert broadcasted is not None
                 logits = broadcasted["logits"]
-
-            if envs_ascend.VLLM_ASCEND_MTP_DRAFT_DEBUG:
-                target_tail_boundary(
-                    getattr(self, "_target_sfa_diag_session", None),
-                    "logits",
-                    logits,
-                )
 
             # Apply structured output bitmasks if present
             self.execute_model_state = ExecuteModelState(
@@ -3238,10 +2979,15 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
         # Clear ephemeral state.
         self.execute_model_state = None
 
-        # Both P and D use kv_both: sample prefill shapes, never ordinary decode.
-        # Keep this independent of cold-resume marking and device-event timing.
+        # Reuse the same host phase boundaries for production decode and sampled prefill.
         prefill_marks = None
-        if self._prefill_sample_perf and (
+        production_decode = self._production_sample_perf and (
+            scheduler_output.total_num_scheduled_tokens
+            <= len(scheduler_output.num_scheduled_tokens) * self.uniform_decode_query_len
+        )
+        if production_decode:
+            prefill_marks = [time.perf_counter()]
+        elif self._prefill_sample_perf and (
             scheduler_output.total_num_scheduled_tokens
             > len(scheduler_output.num_scheduled_tokens) * self.uniform_decode_query_len
         ):
@@ -3285,12 +3031,6 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                     (time.perf_counter() - cold_perf_sample_start) * 1000, 3
                 ),
             )
-        if envs_ascend.VLLM_ASCEND_MTP_DRAFT_DEBUG:
-            target_tail_boundary(
-                getattr(self, "_target_sfa_diag_session", None),
-                "sampling",
-                sampler_output,
-            )
 
         if self.need_accepted_tokens:
             if self.sampling_done_event is None:
@@ -3301,26 +3041,20 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
 
         def propose_draft_token_ids(sampled_token_ids):
             assert spec_decode_common_attn_metadata is not None
-            draft_diag_scope = (
-                self.drafter.mtp_draft_diagnostic_scope()
-                if getattr(self.drafter, "method", None) == "mtp"
-                else nullcontext()
+            self._draft_token_ids = self.propose_draft_token_ids(
+                sampled_token_ids,
+                self.input_batch.sampling_metadata,
+                scheduler_output,
+                spec_decode_metadata,
+                spec_decode_common_attn_metadata,
+                positions,
+                scheduler_output.total_num_scheduled_tokens,
+                hidden_states,
+                aux_hidden_states,
+                sample_hidden_states,
+                batch_desc,
+                staged_sfa_graph_key,
             )
-            with draft_diag_scope:
-                self._draft_token_ids = self.propose_draft_token_ids(
-                    sampled_token_ids,
-                    self.input_batch.sampling_metadata,
-                    scheduler_output,
-                    spec_decode_metadata,
-                    spec_decode_common_attn_metadata,
-                    positions,
-                    scheduler_output.total_num_scheduled_tokens,
-                    hidden_states,
-                    aux_hidden_states,
-                    sample_hidden_states,
-                    batch_desc,
-                    staged_sfa_graph_key,
-                )
             if sample_trace_req_ids:
                 self._run_cold_perf_npu_stage(
                     "mtp_readback",
@@ -3382,15 +3116,6 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                 ),
                 output_request_count=len(req_ids_output_copy),
             )
-        _mtp_dw_for_requests(
-            self,
-            scheduler_output,
-            "finalize",
-            "bookkeeping",
-            req_ids=getattr(self, "_mtp_dw_diag_current_req_ids", set()),
-            deferred=self.speculative_config is not None,
-            order=1,
-        )
 
         with record_function_or_nullcontext("draft_token"):
             if self.speculative_config:
@@ -3452,35 +3177,6 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                         draft_method=getattr(self.drafter, "method", None),
                     )
 
-                if _mtp_dw_diag_enabled():
-                    draft_counts = {}
-                    if self._draft_token_ids is not None:
-                        for index, req_id in enumerate(
-                            scheduler_output.num_scheduled_tokens
-                        ):
-                            try:
-                                draft_counts[req_id] = len(
-                                    self._draft_token_ids[index]
-                                )
-                            except (IndexError, TypeError):
-                                draft_counts[req_id] = None
-                    diag_req_ids = getattr(
-                        self, "_mtp_dw_diag_current_req_ids", set()
-                    )
-                    for req_id in scheduler_output.num_scheduled_tokens:
-                        if req_id not in diag_req_ids:
-                            continue
-                        _mtp_dw_event(
-                            "finalize",
-                            req=req_id,
-                            frontier=self._mtp_dw_diag_current_frontiers.get(
-                                req_id
-                            ),
-                            event="draft_proposal",
-                            deferred=True,
-                            order=2,
-                            draft_count=draft_counts.get(req_id),
-                        )
 
             if prefill_marks is not None:
                 prefill_marks.append(time.perf_counter())
@@ -3521,25 +3217,6 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                                 (time.perf_counter() - cold_perf_sample_start)
                                 * 1000,
                                 3,
-                            ),
-                        )
-                    diag_req_ids = getattr(
-                        self, "_mtp_dw_diag_current_req_ids", set()
-                    )
-                    for req_id in scheduler_output.num_scheduled_tokens:
-                        if req_id not in diag_req_ids:
-                            continue
-                        _mtp_dw_event(
-                            "finalize",
-                            req=req_id,
-                            frontier=self._mtp_dw_diag_current_frontiers.get(
-                                req_id
-                            ),
-                            event="connector_finalize",
-                            deferred=True,
-                            order=3,
-                            completed_window_end=(
-                                finalized.completed_decode_window_saves.get(req_id)
                             ),
                         )
                     if not finalized.is_empty():
@@ -3634,32 +3311,6 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
             if pp.world_size > 1 and pp.is_last_rank:
                 self._pp_broadcast_prev_sampled_token_ids(sampler_output.sampled_token_ids)
 
-        # Host readback can synchronize the device.  Keep it after sampling,
-        # MTP draft proposal, connector finalization, async state update, and
-        # PP broadcast so diagnostics cannot repair a production ordering bug.
-        stage_started = time.perf_counter() if sample_trace_req_ids else 0.0
-        if npu_content_diagnostics_enabled():
-            if staged_sfa_graph_key is not None:
-                for layer_name, impl in self._staged_sfa_impls:
-                    metadata = attn_metadata.get(layer_name)
-                    if metadata is None:
-                        continue
-                    impl.queue_staged_graph_post_diagnostic(
-                        layer_name,
-                        staged_sfa_graph_key,
-                        metadata,
-                    )
-            flush_deferred_diagnostics()
-        pd_tensor_dump = getattr(self, "_pd_tensor_dump", None)
-        if pd_tensor_dump is not None:
-            pd_tensor_dump.sampled(req_ids_output_copy, valid_sampled_token_ids)
-        if sample_trace_req_ids:
-            _record_sample_stage(
-                cold_perf_sample_stages,
-                "content_diagnostics_ms",
-                stage_started,
-            )
-
         if cold_perf_req_ids:
             log_cold_perf_event(
                 "decoder_sample_complete",
@@ -3718,7 +3369,11 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
             )
             self._drain_cold_perf_npu_intervals()
         self._cold_perf_current_sample_npu_intervals = None
-        if prefill_marks is not None:
+        if production_decode:
+            ended = time.perf_counter()
+            if (ended - prefill_marks[0]) * 1000 >= _COLD_PERF_SLOW_SAMPLE_MS:
+                self._slow_sample_phases = _sample_phase_times(prefill_marks, ended)
+        elif prefill_marks is not None:
             _log_prefill_sample(scheduler_output, prefill_marks, self.use_async_scheduling)
         return output
 
@@ -4089,10 +3744,10 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                             group.members[0]: tuple(group.writes) for group in shared_groups
                         }
                 if graph_inputs is not None and getattr(self._sfa_full_graph, "retrieval_overlap", None) is not None:
-                    from vllm_ascend.attention.sfa_v1 import BMM_TRANS_MAX_SUPPORTED_TOKENS
+                    from vllm_ascend.attention.sfa_v1 import SHARED_RETRIEVAL_MAX_CUBE_TOKENS
 
                     self._sfa_full_graph.retrieval_overlap.prepare(
-                        context.staged_sfa_graph_key, impls, shared_groups, BMM_TRANS_MAX_SUPPORTED_TOKENS,
+                        context.staged_sfa_graph_key, impls, shared_groups, SHARED_RETRIEVAL_MAX_CUBE_TOKENS,
                     )
                 self._sfa_full_graph.bind_sources(source, request_ids)
                 prepared_call = self._sfa_full_graph.prepare_run(graph_inputs=graph_inputs, **graph_kwargs)
@@ -4152,10 +3807,6 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                     and not context.staged_sfa_graph_dummy_run
                 ):
                     self._sfa_full_graph_live_replay_logged = True
-                    logger.info(
-                        "[SFA full graph] first target replay: key=%s layer_transfer_splits=0",
-                        context.staged_sfa_graph_key,
-                    )
                 if single is not None and single.active and self._sfa_full_graph.sealed:
                     single.remember(context, graph_kwargs)
                 return output
@@ -4174,33 +3825,13 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                 single.previous = None
                 if single.native_second:
                     self._coordinate_sfa_full_graph_preparation(local_error, False)
-            pd_tensor_dump = getattr(self, "_pd_tensor_dump", None)
-            if pd_tensor_dump is None:
-                hidden_states = self.model(
-                    input_ids=input_ids,
-                    positions=positions,
-                    intermediate_tensors=intermediate_tensors,
-                    inputs_embeds=inputs_embeds,
-                    **model_kwargs,
-                )
-            else:
-                with pd_tensor_dump.forward(input_ids, positions):
-                    hidden_states = self.model(
-                        input_ids=input_ids,
-                        positions=positions,
-                        intermediate_tensors=intermediate_tensors,
-                        inputs_embeds=inputs_embeds,
-                        **model_kwargs,
-                    )
-                    values = hidden_states if isinstance(hidden_states, tuple) else (hidden_states,)
-                    for index, value in enumerate(values):
-                        if isinstance(value, torch.Tensor):
-                            pd_tensor_dump.emit(
-                                value, -1, "model_output",
-                                "hidden_states" if index == 0 else f"hidden_states_{index}",
-                                pd_tensor_dump.metadata(),
-                                prefer_local=bool(get_forward_context().flash_comm_v1_enabled),
-                            )
+            hidden_states = self.model(
+                input_ids=input_ids,
+                positions=positions,
+                intermediate_tensors=intermediate_tensors,
+                inputs_embeds=inputs_embeds,
+                **model_kwargs,
+            )
             forward_context = get_forward_context()
             assert forward_context is not None
             # Export the already-recorded post-forward dependency for an explicitly
@@ -4586,7 +4217,7 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                 num_reqs,
             )
 
-        # P layers revisit the same four (KV group, bank) views. Prepare their
+        # P layers revisit the same (KV group, bank) views. Prepare their
         # padding once per forward, not once per layer. Keep CP and routed-expert
         # side effects on their existing path.
         prefill_bank_views = (
@@ -4595,30 +4226,12 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
             and not self.model_config.enable_return_routed_experts
             else None
         )
-        phase_by_request_cpu = self._layerwise_prefill_bank_phase_by_request_cpu
-        phase_by_token_cpu = self._layerwise_prefill_bank_phase_by_token_cpu
-        mixed_bank_phase = bool(
-            self.layerwise_prefill_p_node
-            and phase_by_request_cpu is not None
-            and np.any(phase_by_request_cpu != phase_by_request_cpu[0])
-        )
-        phase_by_request_device: torch.Tensor | None = None
-        phase_by_token_device: torch.Tensor | None = None
-
         def _get_block_table_and_slot_mapping(
             kv_cache_gid: int,
             bank: int = 0,
         ):
             if self.layerwise_prefill_p_node:
-                phase_value = (
-                    int(phase_by_request_cpu[0])
-                    if phase_by_request_cpu is not None
-                    and len(phase_by_request_cpu)
-                    and not mixed_bank_phase
-                    else 0
-                )
-                physical_bank = bank ^ phase_value
-                cache_key = (kv_cache_gid, bank, phase_value, mixed_bank_phase)
+                cache_key = (kv_cache_gid, bank)
                 if prefill_bank_views is not None:
                     cached_views = prefill_bank_views.get(cache_key)
                     if cached_views is not None:
@@ -4657,7 +4270,7 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                         raise RuntimeError(
                             f"invalid layerwise-prefill bank {bank}"
                         )
-                    blk_table = block_tables_by_bank[physical_bank][kv_cache_gid]
+                    blk_table = block_tables_by_bank[bank][kv_cache_gid]
                 else:
                     blk_table = self.input_batch.block_table[kv_cache_gid]
                 slot_mapping = blk_table.slot_mapping.gpu[:maybe_pcp_full_tokens]
@@ -4671,45 +4284,6 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                         slot_mapping[num_tokens:num_tokens_padded].fill_(-1)
                     if num_reqs < num_reqs_padded:
                         blk_table_tensor[num_reqs:num_reqs_padded].fill_(0)
-                if mixed_bank_phase and phase_by_token_cpu is not None:
-                    other_bank = physical_bank ^ 1
-                    other_table = block_tables_by_bank[other_bank][kv_cache_gid]
-                    nonlocal phase_by_request_device, phase_by_token_device
-                    if phase_by_request_device is None:
-                        padded_request_phase = np.zeros(
-                            maybe_num_reqs_padded, dtype=np.bool_
-                        )
-                        padded_request_phase[:num_reqs] = (
-                            phase_by_request_cpu.astype(np.bool_)
-                        )
-                        phase_by_request_device = torch.from_numpy(
-                            padded_request_phase
-                        ).to(self.device, non_blocking=True)
-                    if phase_by_token_device is None:
-                        padded_token_phase = np.zeros(
-                            maybe_pcp_full_tokens, dtype=np.bool_
-                        )
-                        token_count = min(
-                            len(phase_by_token_cpu), maybe_pcp_full_tokens
-                        )
-                        padded_token_phase[:token_count] = (
-                            phase_by_token_cpu[:token_count].astype(np.bool_)
-                        )
-                        phase_by_token_device = torch.from_numpy(
-                            padded_token_phase
-                        ).to(self.device, non_blocking=True)
-                    other_table_tensor = other_table.get_device_tensor()[:maybe_num_reqs_padded]
-                    other_slot_mapping = other_table.slot_mapping.gpu[:maybe_pcp_full_tokens]
-                    blk_table_tensor = torch.where(
-                        phase_by_request_device[:, None],
-                        other_table_tensor,
-                        blk_table_tensor,
-                    )
-                    slot_mapping = torch.where(
-                        phase_by_token_device,
-                        other_slot_mapping,
-                        slot_mapping,
-                    )
             if self.pcp_size > 1:
                 slot_mapping = self.pcp_manager.get_padded_slot_mapping(
                     num_tokens,
@@ -5256,7 +4830,7 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                                 f"frontier_computed[{i}]"
                             )
                 if marker_failures:
-                    if cold_perf_enabled():
+                    if cold_perf_detailed_enabled():
                         log_cold_perf_event(
                             "decoder_cold_compact_graph_reject",
                             request_ids=request_ids,
@@ -5328,7 +4902,7 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                 if not resume and int(computed[i]) < int(prompts[i]):
                     layout_failures.append(f"computed_prompt[{i}]")
             if layout_failures:
-                if cold_perf_enabled():
+                if cold_perf_detailed_enabled():
                     log_cold_perf_event(
                         "decoder_cold_compact_graph_reject",
                         request_ids=request_ids,
@@ -6373,7 +5947,6 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                     "transfer-window connector."
                 )
         if envs_ascend.VLLM_ASCEND_SFA_FULL_GRAPH and self.model_config.enforce_eager:
-            logger.info("[SFA full graph] disabled on this worker by --enforce-eager (P-node mode)")
             return
         staged_graph_configured = staged_sfa_graph_configured(
             self.vllm_config
@@ -6384,8 +5957,6 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                 if not envs_ascend.VLLM_ASCEND_SFA_STAGED_GRAPH:
                     errors.insert(0, "VLLM_ASCEND_SFA_STAGED_GRAPH must be 1")
                 raise ValueError("SFA_FULL_GRAPH configuration: " + "; ".join(errors))
-            if envs_ascend.VLLM_ASCEND_MTP_DRAFT_DEBUG:
-                raise ValueError("SFA_FULL_GRAPH cannot capture host-side MTP_DRAFT_DEBUG tensor probes")
             if not self._profiling_cudagraph_memory and not callable(
                 getattr(get_kv_transfer_group(), "prepare_sparse_graph_step", None)
             ):
@@ -6469,9 +6040,7 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
         self._mamba_copy_bufs = None
         self.may_add_encoder_only_layers_to_kv_cache_config()
         self.maybe_add_kv_sharing_layers_to_kv_cache_groups(kv_cache_config)
-        # NOTE(cmq): initialize_attn_backend must before using self.attn_groups
-        with startup_phase(self, "attn_backend", groups=len(kv_cache_config.kv_cache_groups)):
-            self.initialize_attn_backend(kv_cache_config)
+        self.initialize_attn_backend(kv_cache_config)
         self.use_hybrid_blocks = len(self.attn_groups) > 1
         # NOTE: Currently, we determine whether we need `num_accepted_tokens` through `MambaSpec`.
         self.need_accepted_tokens = any(
@@ -6494,8 +6063,7 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
             assert isinstance(self.drafter, AscendEagleProposer | AscendDraftModelProposer)
             block_size = (self.kernel_block_sizes[0] if isinstance(
             self.kernel_block_sizes, list) else self.kernel_block_sizes)
-            with startup_phase(self, "draft_attn"):
-                self.drafter.initialize_attn_backend(kv_cache_config, block_size)
+            self.drafter.initialize_attn_backend(kv_cache_config, block_size)
 
         if has_kv_transfer_group() and not self._profiling_cudagraph_memory:
             kv_transfer_group = get_kv_transfer_group()
@@ -6547,27 +6115,11 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                     supports_dsa_index_lmcache,
                     disable_dsa_index_lmcache,
                 )
-            with startup_phase(self, "kv_register", layers=len(kv_caches_to_register)):
-                kv_transfer_group.register_kv_caches(kv_caches_to_register)
-
-        with startup_phase(self, "latent_init"):
-            self._maybe_init_dsa_latent_offload()
+            kv_transfer_group.register_kv_caches(kv_caches_to_register)
+        self._maybe_init_dsa_latent_offload()
 
         if self.model_config.enable_return_routed_experts:
             self.init_routed_experts_capturer()
-
-        if (
-            envs_ascend.VLLM_ASCEND_PD_TENSOR_DUMP_DIR
-            and not self._profiling_cudagraph_memory
-            and getattr(self, "_pd_tensor_dump", None) is None
-        ):
-            # The worker initializes the KV connector before this method.
-            # LMCache-Ascend replaces LMCacheEngineConfig during that import;
-            # reading it at model-load time leaves the config singleton and
-            # imported class aliases referring to different types.
-            from vllm_ascend.pd_tensor_dump import install_pd_tensor_dump
-
-            self._pd_tensor_dump = install_pd_tensor_dump(self, envs_ascend.VLLM_ASCEND_PD_TENSOR_DUMP_DIR)
 
     def _maybe_init_dsa_latent_offload(self) -> None:
         """Build the DSA latent-offload manager (GLM5.1) when enabled.
@@ -6637,17 +6189,8 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
             Dict[str, torch.Tensor]: A map between layer names to their
             corresponding memory buffer for KV cache.
         """
-        # Initialize the memory buffer for KV cache
-        with startup_phase(
-            self,
-            "kv_alloc",
-            buffers=len(kv_cache_config.kv_cache_tensors),
-            bytes=sum(tensor.size for tensor in kv_cache_config.kv_cache_tensors),
-        ):
-            kv_cache_raw_tensors = self._allocate_kv_cache_tensors(kv_cache_config)
-        # Change the memory buffer to the desired shape
-        with startup_phase(self, "kv_reshape"):
-            kv_caches = self._reshape_kv_cache_tensors(kv_cache_config, kv_cache_raw_tensors)
+        kv_cache_raw_tensors = self._allocate_kv_cache_tensors(kv_cache_config)
+        kv_caches = self._reshape_kv_cache_tensors(kv_cache_config, kv_cache_raw_tensors)
 
         # Set up cross-layer KV cache sharing
         for layer_name, target_layer_name in self.shared_kv_cache_layers.items():
@@ -7923,9 +7466,6 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                 impl._sorted_resident_workspace = group.workspace
                 impl._sorted_resident_workspace_views = group.workspace_views
                 impl.dsa_resident_shards_per_row = producer.dsa_resident_shards_per_row
-            logger.info(
-                "[SFA_SHARED_PLAN] producer=%s members=%s address_mode=COMMON_SLOT_MAP", group.members[0], group.members
-            )
 
     def _validate_shared_resident_layout(self, kv_caches) -> None:
         """Qualify the actual layer-local destination tensors before capture."""
@@ -8040,14 +7580,6 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                 and layer_index is not None
                 and layer_index >= target_layer_count
             ):
-                logger.info(
-                    "[SFA cross-layer graph] excluding non-target attention "
-                    "from the target capture registry: layer=%s index=%d "
-                    "target_layers=%d",
-                    canonical_name,
-                    layer_index,
-                    target_layer_count,
-                )
                 continue
             staged_impls.setdefault(
                 id(impl),
@@ -8142,7 +7674,7 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
         if staged_graph_configured:
             self._staged_sfa_startup_capture_attempted = True
             self._reset_staged_sfa_startup_capture()
-        with diagnose_indexer_metadata("capture"), _torch_cuda_wrapper(), _replace_gpu_model_runner_function_wrapper(
+        with _torch_cuda_wrapper(), _replace_gpu_model_runner_function_wrapper(
             GPUModelRunner.__module__,
         ):
             graph_memory_bytes = GPUModelRunner.capture_model(self)
@@ -8196,16 +7728,8 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
             # two additional islands per layer.  Keep the exact-count check so
             # a genuinely incomplete debug capture still fails at startup.
             expected_outer_islands = len(self._staged_sfa_impls) + 1
-            if envs_ascend.VLLM_ASCEND_MTP_DRAFT_DEBUG:
-                expected_outer_islands += 2 * len(self._staged_sfa_impls)
             if envs_ascend.VLLM_ASCEND_SFA_FULL_GRAPH:
                 graph_entry_count = self._sfa_full_graph.seal(graph_keys)
-                logger.info(
-                    "[SFA full graph] target_layers=%d keys=%d graphs_per_forward=1 "
-                    "layer_transfer_splits=0; target per-layer host diagnostics are omitted "
-                    "during replay (connector/window boundary diagnostics remain enabled)",
-                    len(self._staged_sfa_impls), len(graph_keys),
-                )
             else:
                 graph_entry_count = ACLGraphWrapper.seal_staged_entries(
                     graph_keys,
@@ -8268,11 +7792,10 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
         self._profiling_cudagraph_memory = True
         try:
             with (
-                diagnose_indexer_metadata("profiling"),
                 _torch_cuda_wrapper(),
                 _replace_gpu_model_runner_function_wrapper(
                     GPUModelRunner.__module__,
-                ),
+                )
             ):
                 result = GPUModelRunner.profile_cudagraph_memory(self)
                 completed = True
@@ -8375,7 +7898,6 @@ def _torch_cuda_wrapper():
     finally:
         # if anything goes wrong, just patch it with a placeholder
         torch.cuda.Event = _EventPlaceholder
-        torch.cuda.Stream = torch.cuda.Stream
         torch.cuda.default_stream = torch.npu.default_stream
         torch.cuda.current_stream = torch.npu.current_stream
         torch.cuda.stream = torch.npu.stream
