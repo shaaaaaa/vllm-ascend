@@ -14,7 +14,6 @@ from unittest.mock import Mock
 
 import pytest
 import torch
-
 from sfa_test_support import extract, load_module
 from test_sfa_full_graph import graph_module as graph_fixture
 
@@ -80,6 +79,128 @@ def runtime(monkeypatch):
     module = load_module(ROOT / "vllm_ascend/compilation/sfa_retrieval_overlap.py", "overlap_test", monkeypatch)
     monkeypatch.setattr(module, "CaptureProbe", Mock(return_value=NS(verify=Mock())))
     return module, log
+
+
+@pytest.fixture
+def bench(runtime, monkeypatch):
+    monkeypatch.setattr(sys, "path", sys.path.copy())
+    monkeypatch.setitem(sys.modules, "vllm_ascend.compilation.sfa_retrieval_overlap", runtime[0])
+    return load_module(ROOT / "tools/sfa_retrieval_overlap_benchmark.py", "prefetch_bench", monkeypatch)
+
+
+def test_shared_prefetch_benchmark_compares_the_same_distinct_host_rows(bench):
+    for history in (4097, 8192):
+        order = bench.scattered_token_order(4096, history)
+        assert order.dtype == torch.int32 and order.unique().numel() == 4096
+        for shift in (0, 199):
+            tokens = (order + shift) % history
+            assert tokens.min() >= 0 and tokens.max() < history and tokens.unique().numel() == 4096
+        torch.testing.assert_close(order, bench.scattered_token_order(4096, history))
+
+
+@pytest.mark.parametrize("grouped", [False, True])
+def test_shared_prefetch_benchmark_observes_at_first_join(bench, grouped):
+    w = bench.Workload.__new__(bench.Workload)
+    w.requests, w.layers, w.width, w.history = 2, 4, 8, 19
+    w.selected = torch.empty((2, 8), dtype=torch.int32)
+    w.slots = torch.arange(16).view(2, 8)
+    w.counts = torch.empty(2, dtype=torch.int32)
+    w.token_order = bench.scattered_token_order(8, 19)
+    w.caches = [tuple(torch.empty((2, 8, 1, d), dtype=torch.bfloat16) for d in (32, 16)) for _ in range(4)]
+    w.observed = [tuple(torch.empty((2, 8), dtype=torch.bfloat16) for _ in range(2)) for _ in range(4)]
+    w.x = torch.ones(1)
+    w.vup_weights = [w.x] * 4
+    w.products = [None] * 4
+    w.router_x = torch.ones(1, 1)
+    w.router_weights = [w.router_x] * 4
+    qkv_calls = []
+    w.qkv_projections = [lambda i=i: qkv_calls.append(i) for i in range(4)]
+
+    def transfer(layer):
+        def load(selected, counts, slots, **kwargs):
+            for lane, n in enumerate(counts.tolist()):
+                values = w.values(selected[lane, :n], lane, layer).bfloat16()[:, None]
+                for p, plane in enumerate(w.caches[layer]):
+                    plane.view(16, -1)[slots[lane, :n]] = values + 32 * p
+        return NS(load=load, request_capacity=2)
+
+    w.transfers = [transfer(i) for i in range(4)]
+    stream, gate = torch.npu.Stream(), bench.CopyGate("cpu")
+    w.edges = [bench.RetrievalEdge(stream, w.transfers[i], w.caches[i], pieces=2, gate=gate) for i in range(1, 4)]
+    w.group = bench.SharedPrefetchGroup(tuple(w.edges)) if grouped else None
+    early = [tuple(torch.empty_like(t) for t in pair) for pair in w.observed[2:]]
+
+    def sample():
+        assert qkv_calls == [0, 1]
+        for i, targets in enumerate(early, 2):
+            w.snapshot_layer(i, targets)
+
+    for n, shift in ((0, 1), (1, 3), (5, 7), (8, 11)):
+        qkv_calls.clear()
+        tokens = w.set_payload(n, shift)
+        w.chain(True, observe=True, multi_layer=grouped, after_first_qkv=sample)
+        assert qkv_calls == [0, 1, 2, 3]
+        w.check(tokens, n)
+        ready = [bench.ready_rows(pair, ref) for pair, ref in zip(early, w.observed[2:])]
+        assert ready == [2 * n if grouped else 0] * 2
+    early[0][1][0, 0] += 2
+    with pytest.raises(AssertionError):
+        bench.ready_rows(early[0], w.observed[2])
+
+
+@pytest.mark.parametrize("durations", [(10, 7), (7, 10), (7, 7)])
+def test_shared_prefetch_benchmark_pairs_device_times(bench, monkeypatch, durations):
+    now = 0
+    calls = []
+
+    class Event:
+        def __init__(self, enable_timing):
+            assert enable_timing
+
+        def record(self):
+            self.timestamp = now
+
+        def elapsed_time(self, end):
+            return (end.timestamp - self.timestamp) / 1000
+
+    def replay(mode):
+        nonlocal now
+        calls.append(mode)
+        now += durations[mode]
+
+    monkeypatch.setattr(torch.npu, "Event", Event)
+    monkeypatch.setattr(torch.npu, "synchronize", lambda: None, raising=False)
+    graphs = [NS(replay=lambda i=i: replay(i)) for i in (0, 1)]
+    result = bench.paired_graph_times(*graphs, pairs=4, replays=2)
+    assert calls == [0, 0, 1, 1] + [0, 0, 1, 1, 1, 1, 0, 0] * 2
+    assert result == dict(adjacent_us=durations[0], grouped_us=durations[1],
+                          paired_saved_us=durations[0] - durations[1],
+                          grouped_faster_pairs=4 * int(durations[1] < durations[0]), pairs=4)
+
+
+def test_shared_prefetch_benchmark_uses_the_serving_quantized_qkv_shapes(bench, monkeypatch):
+    native = sys.modules["torch_npu"]
+    native.npu_dynamic_quant = lambda x: (x.to(torch.int8), torch.ones(x.shape[0]))
+    native.npu_quant_matmul = lambda x, w, scale, *, pertoken_scale, bias, output_dtype: (
+        (x.float() @ w.float()) * scale * pertoken_scale[:, None]
+    ).to(output_dtype)
+    scheme = type("CpuLinear", (), {"apply": extract(
+        ROOT / "vllm_ascend/quantization/methods/w8a8_dynamic.py", "apply", {"torch_npu": native, "torch": torch}
+    )})
+    monkeypatch.setitem(sys.modules, "vllm_ascend.quantization.methods.w8a8_dynamic",
+                        NS(AscendW8A8DynamicLinearMethod=scheme))
+    monkeypatch.setitem(sys.modules, "vllm_ascend.utils", NS(maybe_trans_nz=lambda w: w))
+    w = bench.Workload.__new__(bench.Workload)
+    w.device, w.layers, w.x = torch.device("cpu"), 4, torch.ones((2, 1), dtype=torch.bfloat16)
+    config = dict(hidden_size=16, q_lora_rank=32, kv_lora_rank=512, qk_rope_head_dim=64,
+                  num_attention_heads=8, v_head_dim=16, n_routed_experts=4)
+    w.use_glm_projections(config, tp=4)
+    assert all(weight.shape == (2, 512, 16) for weight in w.vup_weights)
+    assert all(weight.shape == (4, 16) for weight in w.router_weights)
+    assert all(len({tensor.data_ptr() for tensor in weights}) == 4 for weights in (w.vup_weights, w.router_weights))
+    assert len({projection.args[0].weight.data_ptr() for projection in w.qkv_projections}) == 4
+    for projection in w.qkv_projections:
+        torch.testing.assert_close(projection(), torch.full((2, 32 + 512 + 64), 16, dtype=torch.bfloat16))
 
 
 @dataclass(frozen=True)
@@ -862,6 +983,7 @@ def test_each_layer_copies_once_with_layer_specific_values(runtime, active):
 @pytest.mark.parametrize("shared_storage", [False, True])
 def test_aot_resolves_late_destinations_inside_prefetch_operator(v2, shared_storage):
     import functools
+
     from torch._dynamo.backends.common import aot_autograd
     from torch._inductor import config
     from torch._inductor.compile_fx import graph_returns_tuple, make_graph_return_tuple

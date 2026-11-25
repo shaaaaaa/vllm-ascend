@@ -2,14 +2,16 @@
 """Native fork/join and real registered-CPU transfer qualification."""
 import ctypes
 import gc
+import json
 import os
+import statistics
 import sys
 from pathlib import Path
 
 import pytest
 import torch
 
-pytest.importorskip("torch_npu")
+torch_npu = pytest.importorskip("torch_npu")
 pytestmark = pytest.mark.skipif(not torch.npu.is_available(), reason="requires an NPU")
 ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT))
@@ -211,6 +213,75 @@ def test_shared_indexer_prefetch_joins_only_its_layer(gated):
                 if i == 2 and p == 0:
                     boundary = expected if early else torch.full_like(expected, -1)
                     torch.testing.assert_close(first_boundary.cpu(), boundary, rtol=0, atol=0)
+    print(f"[SHARED_PREFETCH_ORDER] gated={gated} first_QKV_started_with_BC_pending=pass "
+          "BC_finished_inside_one_first_QKV_window=pass replays=8")
+
+
+def test_shared_indexer_prefetch_effect(request):
+    """Measure the 1+3 group on registered host KV. Observe the first consumer in a separate graph."""
+    root = Path(os.environ.get("LMCACHE_ASCEND_SOURCE_DIR", str(ROOT.parent / "LMCache-Ascend")))
+    sys.path.insert(0, str(ROOT / "tools"))
+    from sfa_retrieval_overlap_benchmark import Workload, paired_graph_times, ready_rows
+
+    path = Path("/workspace/models/GLM-5.3-w4a8c8/config.json")
+    if path.is_file():
+        config = json.loads(path.read_text(encoding="utf-8"))
+        config = config.get("text_config") or config
+        shape_source = str(path)
+    else:
+        config = dict(hidden_size=6144, q_lora_rank=2048, kv_lora_rank=512, qk_rope_head_dim=64,
+                      num_attention_heads=64, v_head_dim=256, n_routed_experts=256)
+        shape_source = "GLM reference shape"
+    print(f"[SHARED_PREFETCH_SETUP] NPU=0 TP=4 requests=16 query_rows=2 width=4096 "
+          f"QKV=W8A8_dynamic hidden={config['hidden_size']} shape_source={shape_source}", flush=True)
+    # Keep CPU fixture fills and small reference comparisons off the host thread pool.
+    threads = torch.get_num_threads()
+    request.addfinalizer(lambda: torch.set_num_threads(threads))
+    torch.set_num_threads(1)
+    # The 8.5 torch_npu property only has a setter. Save the configured value directly.
+    previous_format = torch_npu._C._npu_getOption("ALLOW_INTERNAL_FORMAT")
+    if previous_format in (b"enable", b"disable"):
+        request.addfinalizer(lambda: setattr(torch.npu.config, "allow_internal_format", previous_format == b"enable"))
+    torch.npu.config.allow_internal_format = True
+    w = Workload(root, requests=16, query_rows=2, history=8192, main_gate=True, multi_layer=True)
+    try:
+        w.use_glm_projections(config, tp=4)
+        # A is the first consumer (layer 1); B/C have their own destinations (layers 2/3).
+        snapshots = [tuple(torch.empty_like(t) for t in targets) for targets in w.observed[2:]]
+
+        def observe_after_a():
+            for layer, targets in enumerate(snapshots, 2):
+                w.snapshot_layer(layer, targets)
+
+        w.set_payload(1)
+        checks = [w.capture(True, multi_layer=grouped, after_first_qkv=observe_after_a) for grouped in (False, True)]
+        timed = [w.capture(True, multi_layer=grouped) for grouped in (False, True)]
+        for misses in (1, 410, 4096):
+            progress = []
+            for grouped, graph in zip((False, True), checks):
+                for shift in (5, 43, 199):
+                    tokens = w.set_payload(misses, shift)  # Clear all destinations before every observation.
+                    assert len(tokens[:misses].unique()) == misses
+                    graph.replay()
+                    for layer, targets in enumerate(w.observed):
+                        w.snapshot_layer(layer, targets)
+                    w.check(tokens, misses)
+                    b_rows, c_rows = (ready_rows(early, final) for early, final in zip(snapshots, w.observed[2:]))
+                    if grouped:
+                        assert c_rows == 0 or b_rows == w.requests * misses  # B precedes C on one FIFO.
+                        progress.append((b_rows, c_rows))
+                    else:
+                        assert (b_rows, c_rows) == (0, 0)  # Neither transfer has been submitted at A's QKV.
+            w.set_payload(misses, 43)
+            timing = paired_graph_times(*timed)
+            b, c = (int(statistics.median(column)) for column in zip(*progress))
+            print(f"[SHARED_PREFETCH_EFFECT] misses_per_request={misses} "
+                  f"B_ready_at_A_close={b}/{w.requests * misses} C_ready_at_A_close={c}/{w.requests * misses} "
+                  f"adjacent_us={timing['adjacent_us']:.1f} grouped_us={timing['grouped_us']:.1f} "
+                  f"paired_saved_us={timing['paired_saved_us']:+.1f} "
+                  f"grouped_faster_pairs={timing['grouped_faster_pairs']}/{timing['pairs']}", flush=True)
+    finally:
+        w.close()
 
 
 @pytest.mark.parametrize("requests,main_gate", [(1, False), (8, False), (16, False), (8, True)])

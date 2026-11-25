@@ -12,6 +12,7 @@ import time
 from contextlib import nullcontext
 from functools import partial
 from pathlib import Path
+from types import SimpleNamespace
 
 import torch
 import torch_npu
@@ -20,21 +21,33 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from vllm_ascend.compilation.sfa_retrieval_overlap import CaptureProbe, CopyGate, RetrievalEdge, SharedPrefetchGroup
 
 
+def scattered_token_order(width, history):
+    # A stride of 17 modulo 4097 only visits 241 host rows. A seeded
+    # permutation visits each row once before wrapping at the history length.
+    order = torch.randperm(history, generator=torch.Generator().manual_seed(17), dtype=torch.int32)
+    return order[torch.arange(width) % history]
+
+
 class Workload:
     def __init__(self, root, requests=8, query_rows=2, layers=4, width=4096, history=4097, chunk=1024, *,
                  main_gate=False, pieces=None, multi_layer=False):
         import vllm_ascend.vllm_ascend_C  # noqa: F401
 
-        sys.path.insert(0, str(Path(root) / "benchmark/v1/kv_transfer"))
+        helpers = Path(root) / "benchmark/v1/kv_transfer"
+        if not (helpers / "load_benchmark_utils.py").is_file():
+            raise FileNotFoundError(f"LMCache-Ascend benchmark helpers missing under {helpers}")
+        sys.path.insert(0, str(helpers))
         from load_benchmark_utils import build_chunk_ptrs_npu, ensure_ascend_host_memory_registered
+
+        ensure_ascend_host_memory_registered()
         from lmcache.v1.gpu_connector.sparse import PreparedSparseSource, PreparedSparseSourceLayer
         from lmcache.v1.memory_management import PinMemoryAllocator
         from lmcache_ascend.v1.npu_connector.sparse_graph import SparseGraphTransfer
 
-        ensure_ascend_host_memory_registered()
         self.device = torch.device("npu:0")
         torch.npu.set_device(self.device)
         self.requests, self.layers, self.width, self.history = requests, layers, width, history
+        self.token_order = scattered_token_order(width, history)
         self.owners, self.sources, self.transfers, self.graphs = [], [], [], []
         self.stream = torch.npu.Stream(device=self.device)
         self.probe = CaptureProbe(self.stream, self.device, main_gate=main_gate)
@@ -62,7 +75,9 @@ class Workload:
                         obj.tensor[:count * 512].view(count, 512).copy_(values[:, None].expand(-1, 512))
                         obj.tensor[count * 512:].view(count, 64).copy_((values + 32)[:, None].expand(-1, 64))
                         chunks.append(obj.tensor)
-                    plane_layers.append(PreparedSparseSourceLayer(tuple(chunks), build_chunk_ptrs_npu(chunks, self.device)))
+                    plane_layers.append(
+                        PreparedSparseSourceLayer(tuple(chunks), build_chunk_ptrs_npu(chunks, self.device))
+                    )
                 self.sources.append(PreparedSparseSource(layers=tuple(plane_layers), total_tokens=history,
                                     chunk_token_counts=sizes, pointer_device=self.device))
             for layer, cache in enumerate(self.caches):
@@ -84,14 +99,17 @@ class Workload:
                 ))
             self.router_x = torch.ones((requests * query_rows, 16), dtype=torch.float32,
                                        device=self.device) if main_gate else None
-            self.router_weight = torch.ones((8, 16), dtype=torch.float32, device=self.device) if main_gate else None
+            router_weight = torch.ones((8, 16), dtype=torch.float32, device=self.device) if main_gate else None
+            self.router_weights = [router_weight] * layers
             self.x = torch.ones((requests * query_rows, 16, 512), dtype=torch.bfloat16, device=self.device)
-            self.weight = torch.ones((16, 512, 128), dtype=torch.bfloat16, device=self.device)
-            self.project_qkv = None
+            weight = torch.ones((16, 512, 128), dtype=torch.bfloat16, device=self.device)
+            self.vup_weights = [weight] * layers
+            self.qkv_projections = [None] * layers
             if multi_layer:
                 # Use the same BF16 projection on all three benchmark schedules.
-                self.project_qkv = partial(torch.mm, self.x[:, 0, :].contiguous(), self.weight[0],
-                                           out=self.x.new_empty((requests * query_rows, 128)))
+                qkv = partial(torch.mm, self.x[:, 0, :].contiguous(), weight[0],
+                              out=self.x.new_empty((requests * query_rows, 128)))
+                self.qkv_projections = [qkv] * layers
             self.products = [None] * layers
             self.observed = [tuple(torch.empty((requests, width), dtype=torch.bfloat16, device=self.device)
                                    for _ in range(2)) for _ in range(layers)]
@@ -104,7 +122,7 @@ class Workload:
         return ((tokens + request * 7 + layer * 11) % 127).float() / 8
 
     def set_payload(self, active, shift=0, idle=False):
-        tokens = ((torch.arange(self.width) * 17 + shift) % self.history).int()
+        tokens = (self.token_order + shift) % self.history
         self.selected.copy_(tokens.expand(self.requests, -1))
         self.counts.fill_(active)
         if idle:
@@ -114,45 +132,81 @@ class Workload:
                 plane.fill_(-7)
         return tokens
 
-    def chain(self, overlap, observe, *, multi_layer=False):
+    def use_glm_projections(self, config, tp):
+        """Set up the W8A8 dynamic QKV, BF16 V-up and FP32 router of one TP rank."""
+        from vllm_ascend.quantization.methods.w8a8_dynamic import AscendW8A8DynamicLinearMethod
+        from vllm_ascend.utils import maybe_trans_nz
+
+        hidden, kv, rope = config["hidden_size"], config["kv_lora_rank"], config["qk_rope_head_dim"]
+        heads = config["num_attention_heads"]
+        if (kv, rope) != (512, 64) or tp < 1 or heads % tp:
+            raise ValueError("this KV fixture requires K=512, PE=64 and attention heads divisible by TP")
+        width = config["q_lora_rank"] + kv + rope  # The fused A projection is replicated across TP.
+        rows = self.x.shape[0]
+        x = self.x.new_ones((rows, hidden))
+        scheme = AscendW8A8DynamicLinearMethod()
+        self.qkv_projections = []
+        for _ in range(self.layers):
+            layer = SimpleNamespace(
+                weight=maybe_trans_nz(torch.ones((hidden, width), dtype=torch.int8, device=self.device)),
+                weight_scale=x.new_ones((width,)),
+            )
+            self.qkv_projections.append(partial(scheme.apply, layer, x))
+        self.x = x.new_ones((rows, heads // tp, kv))
+        self.vup_weights = [x.new_ones((heads // tp, kv, config["v_head_dim"])) for _ in range(self.layers)]
+        self.router_x = torch.ones((rows, hidden), dtype=torch.float32, device=self.device)
+        self.router_weights = [self.router_x.new_ones((config["n_routed_experts"], hidden)) for _ in range(self.layers)]
+
+    def snapshot_layer(self, layer, targets):
+        for plane, target in zip(self.caches[layer], targets):
+            rows = plane.view(-1, plane.shape[-1])[:self.requests * self.width, 0]
+            target.copy_(rows.view_as(target))
+
+    def chain(self, overlap, observe, *, multi_layer=False, after_first_qkv=None):
         edges = self.group.edges if multi_layer else self.edges
         for layer, transfer in enumerate(self.transfers):
+            qkv = self.qkv_projections[layer]
             if overlap and layer:
                 if multi_layer:
-                    edges[layer - 1].join(self.project_qkv)
+                    edges[layer - 1].join(qkv)
                 else:
                     edges[layer - 1].join()
-                    if self.project_qkv is not None:
-                        self.project_qkv()
+                    if qkv is not None:
+                        qkv()
             else:
-                if self.project_qkv is not None:
-                    self.project_qkv()
+                if qkv is not None:
+                    qkv()
                 if multi_layer and layer == 0:
                     self.group.launch(self.selected, self.counts, self.slots)
                 transfer.load(self.selected, self.counts, self.slots)
+            if layer == 1 and after_first_qkv is not None:
+                # The gate has taken its token back. Later copies cannot change a
+                # destination while this optional observation reads it.
+                after_first_qkv()
             if observe:
                 # Read at the consumer boundary, not merely after the whole graph.
-                for plane, dst in zip(self.caches[layer], self.observed[layer]):
-                    dst.copy_(plane.view(-1, plane.shape[-1])[:self.requests * self.width, 0].view_as(dst))
+                self.snapshot_layer(layer, self.observed[layer])
             edge = edges[layer] if overlap and layer + 1 < self.layers else None
             if edge is not None and not multi_layer:
                 edge.launch(self.selected, self.counts, self.slots, self.caches[layer + 1])
             gated = edge is not None and edge.gate is not None
             with edge.cube_window("vup") if gated else nullcontext():
                 self.products[layer] = torch_npu.npu_transpose_batchmatmul(
-                    self.x, self.weight, perm_x1=(1, 0, 2), perm_y=(1, 0, 2)
+                    self.x, self.vup_weights[layer], perm_x1=(1, 0, 2), perm_y=(1, 0, 2)
                 )
             if self.router_x is not None:
                 with edge.cube_window("router") if gated else nullcontext():
-                    torch.nn.functional.linear(self.router_x, self.router_weight)
+                    torch.nn.functional.linear(self.router_x, self.router_weights[layer])
 
-    def capture(self, overlap, observe=False, *, multi_layer=False):
-        self.chain(overlap, observe, multi_layer=multi_layer)
+    def capture(self, overlap, observe=False, *, multi_layer=False, after_first_qkv=None):
+        if after_first_qkv is not None and (not overlap or self.edges[0].gate is None):
+            raise ValueError("a stable first-QKV snapshot requires gated overlap")
+        self.chain(overlap, observe, multi_layer=multi_layer, after_first_qkv=after_first_qkv)
         torch.npu.synchronize()
         graph = torch.npu.NPUGraph()
         self.graphs.append(graph)  # Retain even on a partial capture failure.
         with torch.npu.graph(graph):
-            self.chain(overlap, observe, multi_layer=multi_layer)
+            self.chain(overlap, observe, multi_layer=multi_layer, after_first_qkv=after_first_qkv)
         return graph
 
     def check(self, tokens, active, idle=False):
@@ -173,6 +227,49 @@ class Workload:
         self.owners.clear()
 
 
+def ready_rows(snapshot, expected):
+    """Count rows whose K and PE match the verified destination at its own join."""
+    k, pe = (t.cpu() for t in snapshot)
+    mask = k != -7
+    for observed, reference in zip((k, pe), expected):
+        torch.testing.assert_close(observed, torch.where(mask, reference.cpu(), -7), rtol=0, atol=0)
+    return int(mask.sum())
+
+
+def paired_graph_times(adjacent, grouped, *, pairs=8, replays=4):
+    """Paired device timings in us per replay. Keep setup and observations outside the measurement."""
+    graphs = (adjacent, grouped)
+    timers = [[(torch.npu.Event(enable_timing=True), torch.npu.Event(enable_timing=True)) for _ in graphs]
+              for _ in range(pairs)]
+    for graph in graphs:
+        for _ in range(replays):
+            graph.replay()
+    for pair in timers:
+        for start, end in pair:
+            start.record()
+            end.record()
+    torch.npu.synchronize()
+    for i, pair in enumerate(timers):
+        for mode in ((0, 1) if i % 2 == 0 else (1, 0)):
+            start, end = pair[mode]
+            start.record()
+            for _ in range(replays):
+                graphs[mode].replay()
+            end.record()
+    torch.npu.synchronize()
+    elapsed = [[start.elapsed_time(end) * 1000 / replays for start, end in pair] for pair in timers]
+    if any(t <= 0 for pair in elapsed for t in pair):
+        raise RuntimeError(f"invalid device timing in {elapsed!r}")
+    gains = [old - new for old, new in elapsed]
+    return {
+        "adjacent_us": statistics.median(old for old, _ in elapsed),
+        "grouped_us": statistics.median(new for _, new in elapsed),
+        "paired_saved_us": statistics.median(gains),
+        "grouped_faster_pairs": sum(gain > 0 for gain in gains),
+        "pairs": pairs,
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--lmcache-ascend-dir", type=Path, required=True)
@@ -181,6 +278,8 @@ def main():
     parser.add_argument("--misses", type=int, default=410)
     parser.add_argument("--main-gate", action="store_true", help="Open the V-up and FP32 router windows")
     parser.add_argument("--multi-layer", action="store_true", help="Also measure queuing all three consumers together")
+    parser.add_argument("--model-config", type=Path, help="Use GLM dimensions and W8A8 dynamic QKV from config.json")
+    parser.add_argument("--tp-size", type=int, default=4, help="TP degree for the per-rank V-up projection")
     parser.add_argument("--pieces", type=int, help="Total pieces per prefetch (gated default 16, ordinary default 1)")
     parser.add_argument("--iterations", type=int, default=100)
     parser.add_argument("--repeats", type=int, default=6)
@@ -193,9 +292,14 @@ def main():
         parser.error("iterations must be positive and repeats >= 2")
     if args.pieces is not None and not 1 <= args.pieces <= args.requests * 4096:
         parser.error("pieces must be in [1, packed token capacity]")
+    if args.model_config:
+        torch.npu.config.allow_internal_format = True
     workload = Workload(args.lmcache_ascend_dir, args.requests, args.query_rows, main_gate=args.main_gate,
                         pieces=args.pieces, multi_layer=args.multi_layer)
     try:
+        if args.model_config:
+            config = json.loads(args.model_config.read_text(encoding="utf-8"))
+            workload.use_glm_projections(config.get("text_config") or config, args.tp_size)
         modes = ("serial", "overlap", "multi_layer") if args.multi_layer else ("serial", "overlap")
         checks = [workload.capture(m != "serial", observe=True, multi_layer=m == "multi_layer") for m in modes]
         for active, shift in ((0, 0), (args.misses, 3), (4096, 4096)):
