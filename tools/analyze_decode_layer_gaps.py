@@ -147,6 +147,23 @@ def grouped_copy_layer_times(path, replay_limits, layers, pieces):
     return medians
 
 
+def _coalesce_capture_waits(main):
+    """Fold profiler polling records into the hardware wait instruction on this replay's main stream."""
+    ordered = []
+    positions = {}
+    for task in main:
+        if task.kind in {"CAPTURE_WAIT", "EVENT_WAIT"} and 0 <= task.task < 0xFFFFFFFF:
+            key = (task.model, task.task, task.kind)
+            index = positions.get(key)
+            if index is not None:
+                first = ordered[index]
+                ordered[index] = first._replace(stop=max(first.stop, task.stop))
+                continue
+            positions[key] = len(ordered)
+        ordered.append(task)
+    return ordered
+
+
 def grouped_copy_waits(path, replay_limits, layers, pieces):
     """Pair consumer wait arrival with its own final copy on the side FIFO, per replay (ns)."""
     devices, _ = read_tasks(path, include_controls=True)
@@ -156,6 +173,7 @@ def grouped_copy_waits(path, replay_limits, layers, pieces):
             (t for t in devices[pid] if t.stream == root.stream and root.start <= t.start < end),
             key=lambda t: (t.start, t.task),
         )
+        main = _coalesce_capture_waits(main)
         all_waits = [t for t in main if t.kind in {"CAPTURE_WAIT", "EVENT_WAIT"}]
         # Each consumer opens the gate (write word, record Notify) immediately before its wait.
         # Capture infrastructure may add other waits on this same stream.

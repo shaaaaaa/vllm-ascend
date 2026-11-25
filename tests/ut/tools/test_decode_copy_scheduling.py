@@ -60,15 +60,18 @@ def test_grouped_copy_layer_times_count_device_work_and_inter_piece_gaps(clients
 
 
 @pytest.mark.parametrize("wait_kind", ["CAPTURE_WAIT", "EVENT_WAIT"])
-def test_grouped_copy_waits_pair_with_consumer_arrival(clients, tmp_path, wait_kind):
+@pytest.mark.parametrize("fragmented", [False, True])
+def test_grouped_copy_waits_pair_with_consumer_arrival(clients, tmp_path, wait_kind, fragmented):
     _, gaps = clients
     events = []
     schedule = (12, 24, 12)
 
-    def task(start, duration, name, kind, stream):
+    def task(start, duration, name, kind, stream, task_id=None):
         events.append({
             "ph": "X", "pid": 8, "tid": stream, "ts": str(start), "dur": duration, "name": name,
-            "args": {"Task Type": kind, "Physic Stream Id": stream, "Task Id": len(events)},
+            "args": {
+                "Task Type": kind, "Physic Stream Id": stream, "Task Id": len(events) if task_id is None else task_id,
+            },
         })
 
     for i, limit in enumerate(schedule):
@@ -77,10 +80,14 @@ def test_grouped_copy_waits_pair_with_consumer_arrival(clients, tmp_path, wait_k
         task(ts + 3, 0.2, "other wait", wait_kind, limit)
         for tick in (10, 14, 20, 24, 39, 43):
             task(ts + tick, 1, "sfa_copy_piece_i32_s64", "AI_VECTOR_CORE", limit + 1)
-        for begin, duration in ((8, 12), (35, 0.4), (40, 5)):
+        for index, (begin, duration) in enumerate(((8, 12), (35, 0.4), (40, 5))):
             task(ts + begin - 2, 0.2, "gate", "MEM_WRITE_VALUE", limit)
             task(ts + begin - 1, 0.1, "give", "NOTIFY_RECORD", limit)
-            task(ts + begin, duration, "consumer", wait_kind, limit)
+            if fragmented and duration > 1:
+                task(ts + begin, 0.25, "consumer", wait_kind, limit, 100 + index)
+                task(ts + begin + 1, duration - 1, "consumer", wait_kind, limit, 100 + index)
+            else:
+                task(ts + begin, duration, "consumer", wait_kind, limit, 100 + index)
     trace = tmp_path / "grouped.json"
     trace.write_text(json.dumps(events[::-1]))
     waits = gaps.grouped_copy_waits(trace, schedule, layers=4, pieces=2)
@@ -88,7 +95,7 @@ def test_grouped_copy_waits_pair_with_consumer_arrival(clients, tmp_path, wait_k
         for layer, sample in enumerate(((7000, 12000), (0, 400), (4000, 5000)), 1):
             assert waits[limit, layer] == [sample] * schedule.count(limit)
 
-    events[:] = [e for e in events if (e["name"], e["ts"]) != ("consumer", "8")]
+    events[:] = [e for e in events if not (e["args"]["Task Id"] == 100 and float(e["ts"]) < 100)]
     trace.write_text(json.dumps(events))
     with pytest.raises(ValueError, match="consumer waits"):
         gaps.grouped_copy_waits(trace, schedule, layers=4, pieces=2)
