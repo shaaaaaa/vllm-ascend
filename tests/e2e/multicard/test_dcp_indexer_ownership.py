@@ -15,8 +15,11 @@ from test_sfa_dcp_query_first_npu import query_first_world  # noqa: F401
 
 @pytest.mark.parametrize("placement,layout,padding", [("balanced", "uniform", 0), ("skewed", "mixed", 1)])
 @pytest.mark.parametrize("baseline", ["replicated", "restore"])
+@pytest.mark.parametrize("packet_mode", ["off", "fused"])
 @torch.inference_mode()
-def test_owner_cache_group_replay(query_first_world, monkeypatch, placement, layout, padding, baseline):  # noqa: F811
+def test_owner_cache_group_replay(
+    query_first_world, monkeypatch, placement, layout, padding, baseline, packet_mode  # noqa: F811
+):
     monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[3] / "benchmarks/ops"))
     from benchmark_sfa_copy_reduction import measure_case
     from benchmark_sfa_dcp_indexer_sharding import IndexerPipeline
@@ -50,6 +53,7 @@ def test_owner_cache_group_replay(query_first_world, monkeypatch, placement, lay
         value_dim=128,
         owner_layout=placement,
         owner_baseline=baseline,
+        packet_mode=packet_mode,
         skew_history=True,
         replicate_owner_storage=False,
     )

@@ -7445,6 +7445,17 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
             if kind == "full":
                 groups.append([])
             groups[-1].append(impl)
+        unpack = None
+        unpack_mode = "off"
+        if (
+            self.dsa_decoder_dcp
+            and envs_ascend.VLLM_ASCEND_SFA_FULL_GRAPH
+            and envs_ascend.VLLM_ASCEND_SFA_DCP_EARLY_GATHER
+            and envs_ascend.VLLM_ASCEND_SFA_DCP_PACKET_IO in ("off", "output")
+        ):
+            unpack_mode = envs_ascend.VLLM_ASCEND_SFA_DCP_EARLY_UNPACK
+            if unpack_mode not in ("off", "consumer", "producer", "both"):
+                raise ValueError("DCP early unpack must be off, consumer, producer or both")
         for members in groups:
             producer = members[0]
             producer.initialize_sorted_resident_cache()
@@ -7483,6 +7494,15 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
             )
             self._shared_resident_groups.append(group)
             for impl in members:
+                if unpack_mode in ("both", "consumer" if impl.skip_topk else "producer") and (
+                    not impl.skip_topk or impl._dcp_query_first
+                ):
+                    if unpack is None:
+                        cores = envs_ascend.VLLM_ASCEND_SFA_DCP_UNPACK_CORES
+                        if cores < 1:
+                            raise ValueError("DCP unpack core cap must be positive")
+                        unpack = torch.npu.Stream(device=state.tokens.device), cores
+                    impl._dcp_early_unpack = unpack
                 impl.shared_resident_plan = group
                 impl._sorted_resident_state = group.state
                 impl._sorted_resident_workspace = group.workspace

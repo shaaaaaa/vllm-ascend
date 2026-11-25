@@ -4,6 +4,7 @@
 import gc
 import sys
 import weakref
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from types import ModuleType
 from types import SimpleNamespace as NS
@@ -60,12 +61,80 @@ def test_early_gather_retains_dma_operands_and_waits_once(gather_queries):
     assert torch.equal(context.gathered, context.packet.repeat(2, 1, 1))
 
 
-def test_early_attention_uses_one_gather_and_keeps_prefetch_order(gather_queries, monkeypatch):
+@pytest.mark.parametrize("failure", [None, "gather", "unpack"])
+def test_early_unpack_orders_streams_and_joins_once(gather_queries, monkeypatch, failure):
+    events = []
+    ns = async_ops(gather_queries, events)
+    done = object()
+    main = NS(wait_event=lambda event: events.append(event), wait_stream=lambda stream: events.append("drain"))
+    side = NS(wait_stream=lambda stream: events.append("fork"), record_event=lambda: events.append("record") or done)
+    current = main
+
+    @contextmanager
+    def use(stream):
+        nonlocal current
+        current = stream
+        try:
+            yield
+        finally:
+            current = main
+
+    monkeypatch.setattr(torch, "npu", NS(current_stream=lambda: current, stream=use), raising=False)
+    bits = torch.arange(2 * 3 * 576, dtype=torch.int16).reshape(2, 3, 576)
+    bits[0, 0, :4] = torch.tensor([-32768, 32767, -1, 0], dtype=torch.int16)
+    q, r = bits.view(torch.bfloat16).split((512, 64), dim=-1)
+    ctx = ns["start_sfa_dcp_query_gather"](q, r, NS(device_group="dcp", world_size=2))
+    wait = ctx.work.wait
+
+    def wait_gather():
+        if current is side and failure == "gather":
+            events.append("gather_error")
+            raise RuntimeError("gather failed")
+        assert current is (main if failure == "gather" else side)
+        wait()
+
+    ctx.work.wait = wait_gather
+    unpack = ns["_unpack_sfa_dcp_queries"]
+
+    def launch(*args, **kwargs):
+        events.append("unpack")
+        assert kwargs["outputs"] is ctx.planes and kwargs["max_cores"] == 1
+        assert current is side
+        if failure == "unpack":
+            raise RuntimeError("launch failed")
+        return unpack(*args, **kwargs)
+
+    ns["_unpack_sfa_dcp_queries"] = launch
+    with pytest.raises(RuntimeError, match="failed") if failure else nullcontext():
+        ctx.start_unpack(q.shape[-1], side, 1)
+    ctx.wait()
+    ctx.wait()
+    with pytest.raises(RuntimeError, match="already joined"):
+        ctx.start_unpack(q.shape[-1], side, 1)
+    if failure == "gather":
+        assert events == ["submit", "fork", "gather_error", "drain", "wait"]
+        return
+    assert events == ["submit", "fork", "wait", "unpack"] + (["drain"] if failure else ["record", done])
+    if not failure:
+        for plane, source in zip(ctx.planes, (q, r)):
+            assert torch.equal(plane.view(torch.int16), source.view(torch.int16).repeat(1, 2, 1))
+
+
+@pytest.mark.parametrize("early_unpack", [False, True])
+def test_early_attention_uses_one_gather_and_keeps_prefetch_order(gather_queries, monkeypatch, early_unpack):
     events = []
     namespace = async_ops(gather_queries, events)
     group = NS(device_group="dcp", world_size=2)
     query, rope = torch.ones(2, 8, 512, dtype=torch.bfloat16), torch.ones(2, 8, 64, dtype=torch.bfloat16)
     context = namespace["start_sfa_dcp_query_gather"](query, rope, group)
+    if early_unpack:
+        stream = NS(wait_stream=lambda main: None, record_event=lambda: "unpacked")
+        main = NS(wait_event=lambda event: events.append(event))
+        monkeypatch.setattr(
+            torch, "npu", NS(current_stream=lambda: main, stream=lambda s: nullcontext()), raising=False
+        )
+        context.start_unpack(512, stream, 1)
+        namespace["_unpack_sfa_dcp_queries"] = lambda *args, **kwargs: pytest.fail("unpacked twice")
     events.append("independent_prepare")
 
     def native(q, r, *args):
@@ -101,7 +170,8 @@ def test_early_attention_uses_one_gather_and_keeps_prefetch_order(gather_queries
         == "output"
     )
     context.wait()
-    assert events == ["submit", "independent_prepare", "wait", "attention", "prefetch", "merge"]
+    order = ["wait", "independent_prepare", "unpacked"] if early_unpack else ["independent_prepare", "wait"]
+    assert events == ["submit", *order, "attention", "prefetch", "merge"]
 
 
 @pytest.mark.parametrize("failure", [None, "prepare", "retrieve", "post"])

@@ -57,14 +57,14 @@ def make_inputs(requests, steps, history, live, overlap, layout, padding=0, seed
     return frames, rows, ends
 
 
-def source_values(tokens, lane):
-    return ((tokens + lane * 7) % 127).float() / 8
+def source_values(tokens, lane, layer=0):
+    return ((tokens + lane * 7 + layer * 11) % 127).float() / 8
 
 
 class Sources:
     """Own registered host pages until every graph referencing them is gone."""
 
-    def __init__(self, root, requests, history, device):
+    def __init__(self, root, requests, history, device, *, layers=1):
         sys.path.insert(0, str(root / "benchmark/v1/kv_transfer"))
         import lmcache_ascend.c_ops  # noqa: F401 -- require real host registration, never a CUDA fallback
         from lmcache.v1.gpu_connector.sparse import PreparedSparseSource, PreparedSparseSourceLayer
@@ -74,24 +74,26 @@ class Sources:
         ensure_ascend_host_memory_registered()
         self.owners, self.sources = [], []
         self.chunk = 1024
-        self.allocator = PinMemoryAllocator(requests * history * (LATENT + ROPE) * 2 + 16 * 1024**2)
+        self.allocator = PinMemoryAllocator(requests * layers * history * (LATENT + ROPE) * 2 + 16 * 1024**2)
         try:
             sizes = tuple(min(self.chunk, history - start) for start in range(0, history, self.chunk))
             for lane in range(requests):
-                chunks = []
-                for start, count in zip(range(0, history, self.chunk), sizes):
-                    obj = self.allocator.allocate(torch.Size([count * (LATENT + ROPE)]), torch.bfloat16)
-                    if obj is None or obj.tensor is None:
-                        raise RuntimeError("registered host allocation failed")
-                    self.owners.append(obj)
-                    values = source_values(torch.arange(start, start + count), lane)
-                    obj.tensor[: count * LATENT].view(count, LATENT).copy_(values[:, None].expand(-1, LATENT))
-                    obj.tensor[count * LATENT :].view(count, ROPE).copy_((values + 32)[:, None].expand(-1, ROPE))
-                    chunks.append(obj.tensor)
-                layer = PreparedSparseSourceLayer(tuple(chunks), build_chunk_ptrs_npu(chunks, device))
+                source_layers = []
+                for layer in range(layers):
+                    chunks = []
+                    for start, count in zip(range(0, history, self.chunk), sizes):
+                        obj = self.allocator.allocate(torch.Size([count * (LATENT + ROPE)]), torch.bfloat16)
+                        if obj is None or obj.tensor is None:
+                            raise RuntimeError("registered host allocation failed")
+                        self.owners.append(obj)
+                        values = source_values(torch.arange(start, start + count), lane, layer)
+                        obj.tensor[: count * LATENT].view(count, LATENT).copy_(values[:, None].expand(-1, LATENT))
+                        obj.tensor[count * LATENT :].view(count, ROPE).copy_((values + 32)[:, None].expand(-1, ROPE))
+                        chunks.append(obj.tensor)
+                    source_layers.append(PreparedSparseSourceLayer(tuple(chunks), build_chunk_ptrs_npu(chunks, device)))
                 self.sources.append(
                     PreparedSparseSource(
-                        layers=(layer,),
+                        layers=tuple(source_layers),
                         total_tokens=history,
                         chunk_token_counts=sizes,
                         pointer_device=device,
@@ -305,7 +307,7 @@ class Pipeline:
             result += [selected[lane, :count], slots[lane, :count]]
         return result
 
-    def check_transfer(self, *, caches=None):
+    def check_transfer(self, *, caches=None, layer=0):
         bridge = getattr(self, "current_outputs", self.bridge)
         selected, counts, slots = (value.cpu() for value in bridge[3:])
         caches = [cache.view(-1, cache.shape[-1]) for cache in (self.caches if caches is None else caches)]
@@ -318,7 +320,7 @@ class Pipeline:
             assert bool((tokens // BLOCK % self.args.dcp_size == self.args.rank).all())
             assert bool(((destinations >= 0) & (destinations < caches[0].shape[0])).all())
             for plane, cache in enumerate(caches):
-                expected = (source_values(tokens, lane) + plane * 32).to(cache.dtype)
+                expected = (source_values(tokens, lane, layer) + plane * 32).to(cache.dtype)
                 actual = cache.index_select(0, bridge[-1][lane, :count]).cpu()
                 torch.testing.assert_close(actual, expected[:, None].expand(-1, cache.shape[-1]), rtol=0, atol=0)
         return counts.tolist()

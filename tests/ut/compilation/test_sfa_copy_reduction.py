@@ -84,13 +84,16 @@ def benchmark(monkeypatch):
 @pytest.mark.parametrize("world", [1, 8])
 @pytest.mark.parametrize("direct", [False, True])
 @pytest.mark.parametrize("overlap", [False, True])
-def test_complete_benchmark_uses_real_layouts_and_preserves_overlap(benchmark, monkeypatch, world, direct, overlap):
+@pytest.mark.parametrize("serial_cap", [0, 12])
+def test_complete_benchmark_uses_real_layouts_and_preserves_overlap(
+    benchmark, monkeypatch, world, direct, overlap, serial_cap
+):
     _, copy_queries, calls = ops.__wrapped__()
     query_module = ModuleType("vllm_ascend.ops.triton.sfa_query")
     query_module.copy_sfa_query_bridge = copy_queries
     monkeypatch.setitem(sys.modules, query_module.__name__, query_module)
     p = benchmark.AttentionPipeline.__new__(benchmark.AttentionPipeline)
-    p.args, p.direct, p.group = NS(dcp_size=world), direct, object()
+    p.args, p.direct, p.group = NS(dcp_size=world, serial_aiv_cores=serial_cap), direct, object()
     q = torch.ones(8, 2, 512, dtype=torch.bfloat16).transpose(0, 1)
     r = torch.ones(2, 8, 64, dtype=q.dtype)
     topk = torch.zeros(2, 1, 2048, dtype=torch.int32)
@@ -109,7 +112,10 @@ def test_complete_benchmark_uses_real_layouts_and_preserves_overlap(benchmark, m
     )
     events = []
 
-    def transfer(tokens, misses, destinations):
+    caps = []
+
+    def transfer(tokens, misses, destinations, *, max_aiv_cores=0):
+        caps.append(max_aiv_cores)
         events.append("transfer")
         assert all(torch.equal(a, b) for a, b in zip((tokens, misses, destinations), original[3:]))
         assert (misses.stride() == (16,)) is direct
@@ -118,7 +124,7 @@ def test_complete_benchmark_uses_real_layouts_and_preserves_overlap(benchmark, m
 
     def launch(*args):
         events.append("prefetch")
-        transfer(*args[:3])
+        transfer(*args[:3], max_aiv_cores=12)
 
     p.edges = [NS(join=lambda: events.append("join"), launch=launch, destinations=object())] if overlap else []
     p.counts = torch.zeros(2, 16, dtype=torch.int32)
@@ -145,6 +151,7 @@ def test_complete_benchmark_uses_real_layouts_and_preserves_overlap(benchmark, m
     p.step(object())
     assert p.prepare.call_count == 1  # The consumer must reuse the producer plan.
     assert events.count("attention") == events.count("transfer") == 2
+    assert caps == [serial_cap, 12 if overlap else serial_cap]
     if overlap:
         assert events.index("prefetch") < events.index("join")
         assert events.index("join") < len(events) - 1

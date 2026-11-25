@@ -54,7 +54,7 @@ class AttentionPipeline(Pipeline):
                 bridge = tuple(torch.empty_like(t) for t in self.bridge)
                 self.bridges.append(bridge)
                 transfer = SparseGraphTransfer(caches, bridge[-1], sources.chunk, args.history, self.capacity)
-                transfer.bind_batch([None] * args.requests if args.resident else sources.sources, 0)
+                transfer.bind_batch([None] * args.requests if args.resident else sources.sources, layer)
                 self.transfers.append(transfer)
         # Give graph padding its own zero-KV request, as the serving builder does.
         self.attention_table = torch.cat((self.table, torch.zeros_like(self.table[:1])))
@@ -112,7 +112,8 @@ class AttentionPipeline(Pipeline):
             outputs = self.copy_bridge(owner, queries[0], outputs, copy_payload=not self.direct)
         query, rope, topk, selected, counts, slots = outputs
         if not layer or not self.edges:
-            transfer.load(selected, counts, slots)
+            cap = getattr(self.args, "serial_aiv_cores", 0)
+            transfer.load(selected, counts, slots, **({"max_aiv_cores": cap} if cap else {}))
         prefetch = None
         if layer < len(self.edges):
             edge = self.edges[layer]
@@ -175,8 +176,8 @@ def verify(pipelines, control, golden=None, *, phase="eager"):
         assert left == right
         misses = left
         for i, pipeline in enumerate(pipelines):
-            for caches in pipeline.layer_caches[1:]:
-                assert pipeline.check_transfer(caches=caches) == left
+            for layer, caches in enumerate(pipeline.layer_caches[1:], 1):
+                assert pipeline.check_transfer(caches=caches, layer=layer) == left
             if golden is not None:
                 assert_snapshots(golden[i][0], pipeline.snapshot(include_cache=False))
                 assert_snapshots(golden[i][1], [t.cpu() for t in pipeline.attention_outputs])
@@ -215,7 +216,7 @@ def measure_case(args, control, *, pipeline_factory=AttentionPipeline):
     inputs = frames, rows.to(device), ends.to(device)
     sources, pipelines = None, []
     try:
-        sources = Sources(args.lmcache_ascend_dir, args.requests, args.history, device)
+        sources = Sources(args.lmcache_ascend_dir, args.requests, args.history, device, layers=args.layers)
         for direct in (False, True):
             pipelines.append(pipeline_factory(args, inputs, sources, group, direct))
         misses = []

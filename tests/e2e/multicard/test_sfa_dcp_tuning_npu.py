@@ -31,7 +31,8 @@ def tuning_world():
 
 @torch.inference_mode()
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-def test_native_dcp_early_gather_replay(tuning_world, dtype):
+@pytest.mark.parametrize("early_unpack", [False, True])
+def test_native_dcp_early_gather_replay(tuning_world, dtype, early_unpack):
     from vllm.distributed.device_communicators.base_device_communicator import DeviceCommunicatorBase
 
     from vllm_ascend.ops.triton.sfa_dcp import execute_sfa_dcp, start_sfa_dcp_query_gather
@@ -60,10 +61,13 @@ def test_native_dcp_early_gather_replay(tuning_world, dtype):
     ends = torch.tensor([rows], dtype=torch.int32, device="npu")
     lengths = torch.tensor([128], dtype=torch.int32, device="npu")
     graphs, outputs = [], []
+    unpack_stream = torch.npu.Stream(device=query.device) if early_unpack else None
 
     def forward(candidate):
         pending = start_sfa_dcp_query_gather(query, rope, group) if candidate else None
         try:
+            if pending is not None and unpack_stream is not None:
+                pending.start_unpack(query.shape[-1], unpack_stream, 12)
             # Real data dependency: attention must see the latest counts while
             # query gathering can execute independently of their publication.
             counts.copy_(count_input)

@@ -15,11 +15,16 @@
 
 #include "kernel_operator.h"
 #include "sparse_flash_attention_template_tiling_key.h"
+#ifdef SFA_DCP_PACKET
+#include "sparse_flash_attention_packet_layout.h"
+#endif
 #include "sparse_flash_attention_kernel_mla.h"
 
 using namespace AscendC;
 
-#ifdef SFA_DCP_STATS
+#if defined(SFA_DCP_PACKET)
+#define SFA_INIT_DCP_OUTPUTS op.InitDcpOutputs(selectedCounts)
+#elif defined(SFA_DCP_STATS)
 #define SFA_INIT_DCP_OUTPUTS op.InitDcpOutputs(selectedCounts, softmaxMax, softmaxSum)
 #else
 #define SFA_INIT_DCP_OUTPUTS
@@ -42,7 +47,9 @@ sparse_flash_attention(__gm__ uint8_t *query, __gm__ uint8_t *key, __gm__ uint8_
                        __gm__ uint8_t *sparseIndices, __gm__ uint8_t *blocktable,
                        __gm__ uint8_t *actualSeqLengthsQuery, __gm__ uint8_t *actualSeqLengthsKV,
                        __gm__ uint8_t* queryRope, __gm__ uint8_t* keyRope,
-#ifdef SFA_DCP_STATS
+#if defined(SFA_DCP_PACKET)
+                       __gm__ uint8_t *selectedCounts, __gm__ uint8_t *attentionOut,
+#elif defined(SFA_DCP_STATS)
                        __gm__ uint8_t *selectedCounts,
                        __gm__ uint8_t *attentionOut, __gm__ uint8_t *softmaxMax, __gm__ uint8_t *softmaxSum,
 #else

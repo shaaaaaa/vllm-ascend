@@ -295,13 +295,42 @@ def test_dcp_contract_rejects_unvalidated_or_misaligned_layout(dcp_contract_runn
 
 
 @pytest.mark.parametrize(
-    "name", ["DCP_HCCL_HOST", "SFA_DCP_EARLY_GATHER", "SFA_DCP_QUERY_FIRST", "SFA_DCP_PREFETCH_AFTER_PACK"]
+    "name", ["DCP_HCCL_HOST", "SFA_DCP_EARLY_GATHER", "SFA_DCP_QUERY_FIRST",
+             "SFA_DCP_PREFETCH_AFTER_PACK", "SFA_DCP_SERIAL_AIV_CORES"]
 )
 def test_dcp_communication_schedule_changes_contract(dcp_contract_runner, monkeypatch, name):
     runner, *_ = dcp_contract_runner
     first = independent.execution_contract(runner)
     monkeypatch.setenv("VLLM_ASCEND_" + name, "1")
     assert independent.execution_contract(runner)["digest"] != first["digest"]
+
+
+def test_dcp_unpack_contract_matches_active_schedule(dcp_contract_runner, monkeypatch):
+    runner, *_ = dcp_contract_runner
+    monkeypatch.setenv("VLLM_ASCEND_SFA_DCP_EARLY_GATHER", "1")
+    monkeypatch.setenv("VLLM_ASCEND_SFA_DCP_EARLY_UNPACK", "off")
+    first = independent.execution_contract(runner)["digest"]
+    monkeypatch.setenv("VLLM_ASCEND_SFA_DCP_UNPACK_CORES", "1")
+    assert independent.execution_contract(runner)["digest"] == first
+    monkeypatch.setenv("VLLM_ASCEND_SFA_DCP_EARLY_UNPACK", "producer")
+    second = independent.execution_contract(runner)["digest"]
+    assert second != first
+    monkeypatch.setenv("VLLM_ASCEND_SFA_DCP_UNPACK_CORES", "12")
+    assert independent.execution_contract(runner)["digest"] != second
+
+
+def test_dcp_packet_contract_records_native_io_mode(dcp_contract_runner, monkeypatch):
+    runner, *_ = dcp_contract_runner
+    monkeypatch.setenv("VLLM_ASCEND_SFA_DCP_EARLY_GATHER", "1")
+    monkeypatch.setenv("VLLM_ASCEND_SFA_DCP_EARLY_UNPACK", "producer")
+    digests = set()
+    for mode in ("off", "output", "direct", "fused"):
+        monkeypatch.setenv("VLLM_ASCEND_SFA_DCP_PACKET_IO", mode)
+        digests.add(independent.execution_contract(runner)["digest"])
+    assert len(digests) == 4
+    before = independent.execution_contract(runner)["digest"]
+    monkeypatch.setenv("VLLM_ASCEND_SFA_DCP_UNPACK_CORES", "3")
+    assert independent.execution_contract(runner)["digest"] == before
 
 
 @pytest.mark.parametrize(

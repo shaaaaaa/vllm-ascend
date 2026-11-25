@@ -79,5 +79,22 @@ ge::graphStatus InferDataTypeSparseFlashAttentionDcp(gert::InferDataTypeContext 
 IMPL_OP(SparseFlashAttentionDcp)
     .InferShape(InferShapeSparseFlashAttentionDcp)
     .InferDataType(InferDataTypeSparseFlashAttentionDcp);
+
+ge::graphStatus InferShapeSparseFlashAttentionDcpPacket(gert::InferShapeContext *context)
+{
+    if (InferShapeSparseFlashAttention(context) != ge::GRAPH_SUCCESS) {
+        return ge::GRAPH_FAILED;
+    }
+    auto *out = context->GetOutputShape(0);
+    if (out->GetDimNum() != 3) {
+        return ge::GRAPH_FAILED;
+    }
+    out->SetDim(2, 528);
+    return ge::GRAPH_SUCCESS;
+}
+
+IMPL_OP(SparseFlashAttentionDcpPacket)
+    .InferShape(InferShapeSparseFlashAttentionDcpPacket)
+    .InferDataType(InferDataTypeSparseFlashAttention);
 } // namespace ops
   

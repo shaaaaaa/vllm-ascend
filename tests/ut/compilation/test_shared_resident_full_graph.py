@@ -17,14 +17,15 @@ from tests.ut.distributed.kv_transfer.test_shared_resident_plan import grouped, 
 
 @pytest.mark.parametrize("explicit", [False, True])
 @pytest.mark.parametrize("c8", [False, True])
-@pytest.mark.parametrize("dcp_enabled", [False, True, "owner"])
+@pytest.mark.parametrize("dcp_enabled", [False, True, "owner", "owner_fused"])
 @pytest.mark.parametrize("qualified", [False, True])
 def test_bounded_group_packs_and_restores_once_per_invocation(explicit, c8, dcp_enabled, qualified, monkeypatch):
     api = resident_api.__wrapped__()
     _, (producer, consumer), group, _ = grouped(api, mtp=2, bounded=True)
     layout = load_source("vllm_ascend/attention/sfa_graph_layout.py", "shared_bounded_layout")
     key = NS(query_profile="bounded", request_capacity=2, max_query_len=2)
-    sharded = dcp_enabled == "owner"
+    fused = dcp_enabled == "owner_fused"
+    sharded = dcp_enabled == "owner" or fused
     ns = dict(
         torch=torch,
         replace=replace,
@@ -145,13 +146,30 @@ def test_bounded_group_packs_and_restores_once_per_invocation(explicit, c8, dcp_
             request_state_generations=torch.ones(len(widths), dtype=torch.int64),
             dcp=dcp,
         )
+        if fused:
+            angles = torch.arange(tokens)[:, None]
+            dcp.owner_rows.pack = lambda value: value[-1:]
+            ready = Mock()
+
+            def packet_rope(query, rope, cos, sin, angles=angles):
+                assert cos is angles and sin is angles and query.shape[0] == angles.shape[0]
+                return rope + 1
+
+            kwargs.update(cos=angles, sin=angles, packet_rope=packet_rope, query_ready=ready)
         first = producer._cross_layer_pre_compute(
             indexer_cache=torch.empty(tokens, 4, dtype=torch.int8 if c8 else torch.bfloat16),
             indexer_scale_cache=torch.empty(tokens, 1, dtype=torch.float16) if c8 else None,
             resident_writes=writes,
             **kwargs,
         )
-        second = consumer._cross_layer_pre_compute(indexer_cache=None, resident_reads=reads, **kwargs)
+        second = consumer._cross_layer_pre_compute(
+            indexer_cache=None, resident_reads=reads, query_first=fused, **kwargs
+        )
+        if fused:
+            assert producer.indexer_select_pre_process.call_args.kwargs["x"].shape[0] == 1
+            assert len(ready.call_args_list) == 2
+            for sent, result in zip(ready.call_args_list, (first, second)):
+                assert sent.args[0] is result[0] and sent.args[1] is result[1]
         valid = (rows >= 0)[:, None, None]
         if dcp is not None:
             valid = valid & (frame["raw"] <= dcp.positions[:, None, None]) & (frame["raw"] // 128 % 4 == 1)

@@ -99,5 +99,49 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> npu_sparse_flash_attention_dcp(
         sparse_mode, output, softmax_max, softmax_sum);
     return {output, softmax_max, softmax_sum};
 }
+
+// The ACLNN descriptor spans the full allocation. Its first two dimensions
+// describe logical TND geometry; the packet kernel computes physical ownership.
+at::Tensor npu_sparse_flash_attention_dcp_packet(
+    const at::Tensor &q, const c10::optional<at::Tensor> &rope, const at::Tensor &key, const at::Tensor &key_rope,
+    const at::Tensor &indices, const at::Tensor &counts, const at::Tensor &table, const at::Tensor &ends,
+    const at::Tensor &lengths, double scale, int64_t world)
+{
+    TORCH_CHECK(world == 2 || world == 4 || world == 8, "invalid DCP packet group size");
+    const bool packed = !rope.has_value();
+    TORCH_CHECK(q.dim() == (packed ? 4 : 3) && q.is_contiguous() &&
+                (q.scalar_type() == at::kHalf || q.scalar_type() == at::kBFloat16),
+                "DCP packet attention requires contiguous BF16/FP16 queries");
+    const int64_t rows = q.size(packed ? 1 : 0);
+    const int64_t heads = packed ? q.size(2) * world : q.size(1);
+    const int64_t local = heads / world;
+    TORCH_CHECK(rows > 0 && local > 0 && heads % world == 0 && heads % 8 == 0 &&
+                q.size(-1) == (packed ? 576 : 512) && (!packed || q.size(0) == world),
+                "invalid DCP query packet geometry");
+    auto query = q.view({rows, heads, q.size(-1)});
+    const auto &query_rope = packed ? query : *rope;
+    TORCH_CHECK(packed || (query_rope.sizes() == at::IntArrayRef({rows, heads, 64}) &&
+                query_rope.is_contiguous() && query_rope.scalar_type() == q.scalar_type()), "invalid DCP RoPE plane");
+    TORCH_CHECK(key.dim() == 4 && key.size(2) == 1 && key.size(-1) == 512 &&
+                key_rope.sizes() == at::IntArrayRef({key.size(0), key.size(1), 1, 64}) &&
+                key.scalar_type() == q.scalar_type() && key_rope.scalar_type() == q.scalar_type(),
+                "invalid DCP packet KV geometry");
+    TORCH_CHECK(indices.dim() == 3 && indices.size(0) == rows && indices.size(1) == 1 &&
+                counts.sizes() == at::IntArrayRef({rows, 16}) && table.dim() == 2 && table.size(0) > 0 &&
+                ends.dim() == 1 && ends.size(0) == table.size(0) && lengths.sizes() == ends.sizes(),
+                "invalid DCP packet row metadata");
+    for (const auto *tensor : {&indices, &counts, &table, &ends, &lengths}) {
+        TORCH_CHECK(tensor->scalar_type() == at::kInt && tensor->device() == q.device(), "invalid DCP metadata");
+    }
+    TORCH_CHECK(query_rope.device() == q.device() && key.device() == q.device() && key_rope.device() == q.device(),
+                "DCP packet inputs must share a device");
+    auto output = at::empty({rows, heads, 528}, q.options());
+    const int64_t sparse_block_size = 1, sparse_mode = 0;
+    char tnd[] = "TND", paged[] = "PA_BSND";
+    char *layout_query = tnd, *layout_kv = paged;
+    EXEC_NPU_CMD(aclnnSparseFlashAttentionDcpPacket, query, key, key, indices, table, ends, lengths,
+                 query_rope, key_rope, counts, scale, sparse_block_size, layout_query, layout_kv, sparse_mode, local, output);
+    return output.view({world, rows, local, 528});
+}
 }
 #endif

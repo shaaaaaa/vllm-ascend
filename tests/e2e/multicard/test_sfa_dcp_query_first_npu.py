@@ -42,6 +42,11 @@ def query_first_world():
         ("query-first", False),
         ("prefetch-after-pack", False),
         ("prefetch-after-pack", True),
+        ("early-unpack", True),
+        ("output", True),
+        ("direct", True),
+        ("fused", True),
+        ("serial-12-aiv", True),
     ],
 )
 def test_query_first_group_replay(
@@ -49,6 +54,8 @@ def test_query_first_group_replay(
 ):
     monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[3] / "benchmarks/ops"))
     from benchmark_sfa_copy_reduction import measure_case
+    from benchmark_sfa_dcp_early_unpack import UnpackPipeline
+    from benchmark_sfa_dcp_packet_io import packet_pipeline
     from benchmark_sfa_dcp_prefetch import prefetch_pipeline
     from benchmark_sfa_dcp_query_first import QueryFirstPipeline
 
@@ -80,10 +87,26 @@ def test_query_first_group_replay(
         qk_nope=128,
         value_dim=128,
         query_first=query_first,
+        stage="fused" if comparison == "serial-12-aiv" else comparison,
+        reference_stage="fused" if comparison == "serial-12-aiv" else "off",
+        serial_aiv_cores=12 if comparison == "serial-12-aiv" else 0,
+        reference_serial_aiv_cores=0,
+        unpack_placement="both",
+        unpack_cores=6,
+        indexer="c8",
+        prefetch_after_pack=True,
     )
     # measure_case checks eager and three reset/replay cycles, exact planner,
     # retrieved/current KV, attention and local output-projection parity.
-    factory = QueryFirstPipeline if comparison == "query-first" else prefetch_pipeline
+    factory = {
+        "query-first": QueryFirstPipeline,
+        "prefetch-after-pack": prefetch_pipeline,
+        "early-unpack": UnpackPipeline,
+        "output": packet_pipeline,
+        "direct": packet_pipeline,
+        "fused": packet_pipeline,
+        "serial-12-aiv": packet_pipeline,
+    }[comparison]
     result = measure_case(args, control, pipeline_factory=factory)
     assert result["parity"] == "passed"
     assert all(value > 0 for value in result["slowest_rank_median"].values())

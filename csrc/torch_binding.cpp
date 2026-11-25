@@ -4346,6 +4346,10 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         " -> (Tensor output, Tensor softmax_max, Tensor softmax_sum)"
     );
     ops.impl("npu_sparse_flash_attention_dcp", torch::kPrivateUse1, &vllm_ascend::npu_sparse_flash_attention_dcp);
+    ops.def("npu_sparse_flash_attention_dcp_packet(Tensor query, Tensor? query_rope, Tensor key, Tensor key_rope,"
+            " Tensor sparse_indices, Tensor selected_counts, Tensor block_table, Tensor actual_seq_lengths_query,"
+            " Tensor actual_seq_lengths_kv, float scale_value, int world) -> Tensor");
+    ops.impl("npu_sparse_flash_attention_dcp_packet", torch::kPrivateUse1, &vllm_ascend::npu_sparse_flash_attention_dcp_packet);
 
     ops.def(
         "dispatch_ffn_combine(Tensor x, Tensor[] weight1, Tensor[] weight2, Tensor expert_idx,"

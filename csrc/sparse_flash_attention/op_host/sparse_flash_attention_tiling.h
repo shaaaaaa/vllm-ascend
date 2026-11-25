@@ -33,6 +33,7 @@ constexpr uint32_t ACT_SEQ_LEN_Q_INPUT_INDEX = 5;
 constexpr uint32_t ACT_SEQ_LEN_KV_INPUT_INDEX = 6;
 constexpr uint32_t QUERY_ROPE_INPUT_INDEX = 7;
 constexpr uint32_t KEY_ROPE_INPUT_INDEX = 8;
+constexpr uint32_t DCP_COUNTS_INPUT_INDEX = 9;
 // Outputs Index
 constexpr uint32_t OUTPUT_INDEX = 0;
 // Attributes Index
@@ -41,6 +42,7 @@ constexpr uint32_t SPARSE_BLOCK_SIZE_ATTR_INDEX = 1;
 constexpr uint32_t LAYOUT_QUERY_ATTR_INDEX = 2;
 constexpr uint32_t LAYOUT_KV_ATTR_INDEX = 3;
 constexpr uint32_t SPARSE_MODE_ATTR_INDEX = 4;
+constexpr uint32_t DCP_LOCAL_HEADS_ATTR_INDEX = 5;
 // Dim Num
 constexpr size_t DIM_NUM_TWO = 2;
 constexpr size_t DIM_NUM_THREE = 3;
@@ -173,9 +175,12 @@ TILING_DATA_FIELD_DEF_STRUCT(SparseFlashAttentionSplitKVParamsMla, splitKVParams
 TILING_DATA_FIELD_DEF_STRUCT(SparseFlashAttentionSingleCoreParamsMla, singleCoreParams);
 TILING_DATA_FIELD_DEF_STRUCT(SparseFlashAttentionSingleCoreTensorSizeMla, singleCoreTensorSize);
 TILING_DATA_FIELD_DEF_STRUCT(SparseFlashAttentionInnerSplitParams, innerSplitParams);
+TILING_DATA_FIELD_DEF(uint32_t, packetLocalHeads)
+TILING_DATA_FIELD_DEF(uint32_t, packetQuery)
 END_TILING_DATA_DEF
 REGISTER_TILING_DATA_CLASS(SparseFlashAttention, SparseFlashAttentionTilingDataMla)
 REGISTER_TILING_DATA_CLASS(SparseFlashAttentionDcp, SparseFlashAttentionTilingDataMla)
+REGISTER_TILING_DATA_CLASS(SparseFlashAttentionDcpPacket, SparseFlashAttentionTilingDataMla)
 
 template <typename T> inline T Align(T num, T rnd)
 {
@@ -204,6 +209,8 @@ std::string SFADebugTilingContext(const gert::TilingContext *context);
 std::string SFALayoutToSerialString(SFALayout layout);
 
 struct SFATilingInfo {
+    uint32_t packetLocalHeads = 0;
+    bool packetQuery = false;
     const char *opName = nullptr;
     fe::PlatFormInfos *platformInfo = nullptr;
     SFAParaInfo opParamInfo;
@@ -477,7 +484,7 @@ private:
 
 class SFAInfoParser {
 public:
-    explicit SFAInfoParser(const gert::TilingContext *context) : context_(context) {}
+    explicit SFAInfoParser(const gert::TilingContext *context, bool packet = false) : context_(context), packet_(packet) {}
     ~SFAInfoParser() = default;
 
     ge::graphStatus CheckRequiredInOutExistence() const;
@@ -528,6 +535,7 @@ public:
     uint32_t GetAxisNum(const gert::Shape &shape, const SFAAxis &axis,const SFALayout &layout) const;
 
     const gert::TilingContext *context_ = nullptr;
+    bool packet_ = false;
 
     const char *opName_;
     fe::PlatFormInfos *platformInfo_;

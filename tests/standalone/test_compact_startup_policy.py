@@ -203,6 +203,8 @@ def decoder_dcp(policy, monkeypatch):
              npu_dsa_resident_dcp_owner_union_=True, npu_dsa_resident_dcp_owner_plan_=True)
     ns = policy.ns
     envs = NS(
+        VLLM_ASCEND_SFA_DCP_PACKET_IO="off",
+        VLLM_ASCEND_SFA_DCP_SERIAL_AIV_CORES=0,
         VLLM_ASCEND_DSA_UNBUNDLE=True, VLLM_ASCEND_DSA_TWO_GROUPS=True,
         VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE=False, VLLM_ASCEND_SFA_ASYNC_MTP_PREP=False,
         VLLM_ASCEND_SFA_FULL_GRAPH=False,
@@ -291,6 +293,11 @@ def test_decoder_dcp_selects_split_backend_before_storage_and_rechecks_live_poli
     ("config", "decoder_storage_mode", "local", "async process storage"),
     ("config", "enable_async_loading", False, "async process storage"),
     ("ops", "npu_sparse_flash_attention_dcp", None, "Rebuild vllm-ascend"),
+    ("envs", "VLLM_ASCEND_SFA_DCP_PACKET_IO", "unknown", "must be off, output, direct or fused"),
+    ("envs", "VLLM_ASCEND_SFA_DCP_PACKET_IO", "fused", "Rebuild vllm-ascend with SparseFlashAttentionDcpPacket"),
+    ("envs", "VLLM_ASCEND_SFA_DCP_PACKET_IO", "fused_contiguous", "must be off, output, direct or fused"),
+    ("envs", "VLLM_ASCEND_SFA_DCP_SERIAL_AIV_CORES", -1, "unsigned 32-bit"),
+    ("envs", "VLLM_ASCEND_SFA_DCP_SERIAL_AIV_CORES", 2**32, "unsigned 32-bit"),
 ])
 def test_decoder_dcp_refuses_incompatible_routes_before_storage(decoder_dcp, owner, field, value, message):
     ctx = decoder_dcp
@@ -303,6 +310,15 @@ def test_decoder_dcp_refuses_incompatible_routes_before_storage(decoder_dcp, own
         ctx.worker._init_device()
     assert "storage" not in ctx.events and "distributed" not in ctx.events
     assert not hasattr(ctx.vllm, "_dsa_decoder_dcp_policy")
+
+
+def test_decoder_dcp_accepts_fused_packet_and_serial_cap(decoder_dcp):
+    ctx = decoder_dcp
+    ctx.envs.VLLM_ASCEND_SFA_DCP_PACKET_IO = "fused"
+    ctx.envs.VLLM_ASCEND_SFA_DCP_SERIAL_AIV_CORES = 12
+    ctx.ops.npu_sparse_flash_attention_dcp_packet = object()
+    ctx.worker._configure_dsa_decoder_dcp()
+    assert ctx.vllm._dsa_decoder_dcp_policy == (2048, 0)
 
 
 @pytest.mark.parametrize("dp", [1, 4])
@@ -512,9 +528,14 @@ def test_only_request_sharding_requires_owner_native_kernels(decoder_dcp):
 @pytest.mark.parametrize("reader,version,success", [
     ("persistent_direct_hbm", 1, True), ("p2p_preferred", 1, False), ("persistent_direct_hbm", 0, False),
 ])
-def test_request_sharding_checks_reader_and_protocol_before_storage(decoder_dcp, monkeypatch, reader, version, success):
+@pytest.mark.parametrize("packet_mode", ["off", "fused"])
+def test_request_sharding_checks_reader_and_protocol_before_storage(
+    decoder_dcp, monkeypatch, reader, version, success, packet_mode
+):
     ctx = decoder_dcp
     ctx.envs.VLLM_ASCEND_DSA_DCP_INDEXER_REQUEST_SHARDING = True
+    ctx.envs.VLLM_ASCEND_SFA_DCP_PACKET_IO = packet_mode
+    ctx.ops.npu_sparse_flash_attention_dcp_packet = object()
     ctx.config.dsa_group1_load_mode = reader
     ctx.cls.dcp_indexer_placement_version = version
     monkeypatch.setattr(sys.modules["vllm.triton_utils"], "HAS_TRITON", True)

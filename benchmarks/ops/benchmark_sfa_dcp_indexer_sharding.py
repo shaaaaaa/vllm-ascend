@@ -18,6 +18,7 @@ class IndexerPipeline(QueryFirstPipeline):
         delta = torch.tensor(history, device=rows.device)[rows.clamp_min(0).long()] - args.history
         frames = [(raw.clone(), pos + delta) for raw, pos in frames]
         super().__init__(args, (frames, rows, ends), sources, group, True)
+        self.packet_mode = getattr(args, "packet_mode", "off")
         if not args.resident:
             self.boundaries = self.boundaries + delta.int()
         owners = [

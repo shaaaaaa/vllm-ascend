@@ -39,6 +39,7 @@ def test_staged_scatter_keeps_key_scale_pair_and_padding(c8, idle):
     )
     exec(compile(ast.fix_missing_locations(tree), str(source), "exec"), ns)
     impl = ns["Impl"]()
+    impl.dsa_cp_decoder = False
     impl.use_sparse_c8_indexer = c8
     impl.has_indexer = True
     impl.dsa_cp_decoder = False

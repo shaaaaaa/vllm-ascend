@@ -227,12 +227,19 @@ def _sfa_dcp_query_packet(query: torch.Tensor, rope: torch.Tensor) -> torch.Tens
     return pack_sfa_dcp_queries(query, rope)
 
 
-def _unpack_sfa_dcp_queries(packed, rows, heads, query_dim, rope_dim, world):
-    query = packed.new_empty((rows, heads * world, query_dim))
-    rope = packed.new_empty((rows, heads * world, rope_dim))
+def _unpack_sfa_dcp_queries(packed, rows, heads, query_dim, rope_dim, world, *, outputs=None, max_cores=None):
+    if outputs is None:
+        outputs = (
+            packed.new_empty((rows, heads * world, query_dim)),
+            packed.new_empty((rows, heads * world, rope_dim)),
+        )
+    query, rope = outputs
     init_device_properties_triton()
     # Copy raw halfwords so BF16/FP16 NaN payloads and signed zero stay intact.
-    _unpack_queries[(min(rows * heads * world, get_vectorcore_num()),)](
+    cores = min(rows * heads * world, get_vectorcore_num())
+    if max_cores is not None:
+        cores = min(cores, max_cores)
+    _unpack_queries[(cores,)](
         packed.view(torch.int16), query.view(torch.int16), rope.view(torch.int16),
         rows, heads, world, query_dim, rope_dim,
         triton.next_power_of_2(query_dim), triton.next_power_of_2(rope_dim),
@@ -255,19 +262,58 @@ class SfaDcpQueryGather:
     gathered: torch.Tensor
     work: Any
     group: Any
+    planes: tuple[torch.Tensor, torch.Tensor] | None = None
+    unpack_done: Any = None
+    packet_mode: str = "off"
+
+    def start_unpack(self, query_dim: int, stream, max_cores: int) -> None:
+        """Fork after the current stream's dependencies and the HCCL gather."""
+        if self.work is None:
+            raise RuntimeError("DCP query gather was already joined")
+        rows, heads, width = self.packet.shape
+        world, rope_dim = self.gathered.shape[0] // rows, width - query_dim
+        # Allocate on the attention stream. The fork orders allocator reuse and
+        # the join orders consumption and release, including on launch failure.
+        self.planes = tuple(self.gathered.new_empty((rows, heads * world, dim)) for dim in (query_dim, rope_dim))
+        main = torch.npu.current_stream()
+        stream.wait_stream(main)
+        try:
+            with torch.npu.stream(stream):
+                self.work.wait()
+                self.work = None
+                _unpack_sfa_dcp_queries(
+                    self.gathered, rows, heads, query_dim, rope_dim, world, outputs=self.planes, max_cores=max_cores
+                )
+                self.unpack_done = stream.record_event()
+        except BaseException:
+            main.wait_stream(stream)
+            raise
 
     def wait(self) -> None:
         if self.work is not None:
             self.work.wait()
             self.work = None
+        if self.unpack_done is not None:
+            torch.npu.current_stream().wait_event(self.unpack_done)
+            self.unpack_done = None
 
 
-def start_sfa_dcp_query_gather(query: torch.Tensor, rope: torch.Tensor, group) -> SfaDcpQueryGather:
+def start_sfa_dcp_query_gather(
+    query: torch.Tensor, rope: torch.Tensor, group, *, packet=None, packet_mode="off"
+) -> SfaDcpQueryGather:
     """Submit the existing single gather without joining the current stream."""
-    packet = _sfa_dcp_query_packet(query, rope)
+    if packet_mode == "fused" and packet is None:
+        raise ValueError("fused DCP gather requires a RoPE packet")
+    if packet is None:
+        packet = _sfa_dcp_query_packet(query, rope)
+    elif (
+        packet.shape != (*query.shape[:2], query.shape[-1] + rope.shape[-1]) or not packet.is_contiguous()
+        or packet.device != query.device or packet.dtype != query.dtype
+    ):
+        raise ValueError("invalid prebuilt DCP query packet")
     gathered = packet.new_empty((packet.shape[0] * group.world_size, *packet.shape[1:]))
     work = dist.all_gather_into_tensor(gathered, packet, group=group.device_group, async_op=True)
-    return SfaDcpQueryGather(packet, gathered, work, group.device_group)
+    return SfaDcpQueryGather(packet, gathered, work, group.device_group, packet_mode=packet_mode)
 
 
 def execute_sfa_dcp(
@@ -282,13 +328,29 @@ def execute_sfa_dcp(
         query, rope = _gather_sfa_dcp_queries(query, rope, group)
     else:
         query_gather.wait()
-        if (query_gather.group is not group.device_group
-                or query_gather.packet.shape != (*query.shape[:2], query.shape[-1] + rope.shape[-1])):
+        if (
+            query_gather.group is not group.device_group
+            or query_gather.packet.shape != (*query.shape[:2], query.shape[-1] + rope.shape[-1])
+            or (query_gather.planes is not None and query_gather.planes[0].shape[-1] != query.shape[-1])
+        ):
             raise ValueError("DCP query gather does not match this attention call")
-        query, rope = _unpack_sfa_dcp_queries(
-            query_gather.gathered, *query.shape, rope.shape[-1], group.world_size,
-        )
+        if query_gather.packet_mode in ("direct", "fused"):
+            query, rope = query_gather.gathered.view(group.world_size, *query_gather.packet.shape), None
+        elif query_gather.planes is None:
+            query, rope = _unpack_sfa_dcp_queries(query_gather.gathered, *query.shape, rope.shape[-1], group.world_size)
+        else:
+            query, rope = query_gather.planes
     requests = local_seq_lens.shape[0]
+    if query_gather is not None and query_gather.packet_mode != "off":
+        send = torch.ops._C_ascend.npu_sparse_flash_attention_dcp_packet(
+            query, rope, kv_cache[0], kv_cache[1], topk, counts, block_table[:requests],
+            query_ends[:requests], local_seq_lens, scale, group.world_size,
+        )
+        if prefetch is not None and not prefetch_after_pack:
+            prefetch[0].launch(*prefetch[1:])
+            prefetch = None
+        init_device_properties_triton()
+        return _exchange_sfa_dcp_packet(send, group.device_group, prefetch)
     partial = torch.ops._C_ascend.npu_sparse_flash_attention_dcp(
         query, rope, kv_cache[0], kv_cache[1], topk, counts,
         block_table[:requests], query_ends[:requests], local_seq_lens, scale,
@@ -380,11 +442,17 @@ def merge_sfa_dcp(
         raise ValueError("DCP attention requires contiguous partials and FP32 statistics")
     local_heads = heads // world
     send = partial.new_empty((world, rows, local_heads, value_dim + 16))
-    recv = torch.empty_like(send)
-    output = partial.new_empty((rows, local_heads, value_dim))
     init_device_properties_triton()
-    cores = get_vectorcore_num()
-    _pack[(min(rows * heads, cores),)](partial, maximum, total, send, rows, heads, local_heads, value_dim)
+    grid = (min(rows * heads, get_vectorcore_num()),)
+    _pack[grid](partial, maximum, total, send, rows, heads, local_heads, value_dim)
+    return _exchange_sfa_dcp_packet(send, group, prefetch)
+
+
+def _exchange_sfa_dcp_packet(send, group, prefetch):
+    world, rows, local_heads, stride = send.shape
+    value_dim = stride - 16
+    recv = torch.empty_like(send)
+    output = send.new_empty((rows, local_heads, value_dim))
     if prefetch is None:
         dist.all_to_all_single(recv, send, group=group)
     else:
@@ -398,5 +466,5 @@ def merge_sfa_dcp(
             # Keep both packet buffers alive and order _combine, also if the
             # transfer launch fails. This is the HCCL stream dependency.
             work.wait()
-    _combine[(min(rows * local_heads, cores),)](recv, output, rows * local_heads, world, value_dim)
+    _combine[(min(rows * local_heads, get_vectorcore_num()),)](recv, output, rows * local_heads, world, value_dim)
     return output

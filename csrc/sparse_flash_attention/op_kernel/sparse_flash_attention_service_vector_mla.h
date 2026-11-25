@@ -54,7 +54,20 @@ public:
     __aicore__ inline void AllocEventID();
     __aicore__ inline void FreeEventID();
     __aicore__ inline void InitSoftmaxDefaultBuffer();
-#ifdef SFA_DCP_STATS
+#if defined(SFA_DCP_PACKET)
+    DcpPacketLayout packet;
+    __aicore__ inline void ZeroPacketRow(uint64_t row);
+    __aicore__ inline void ZeroPacketTail(uint64_t first, uint32_t stride)
+    {
+        // This runs before the ordinary per-core event allocation in Process().
+        SetFlag<HardEvent::MTE3_V>(SYNC_OUTPUT_BUF2_FLAG);
+        for (uint64_t row = first; row < packet.qSeqSize; row += stride) {
+            ZeroPacketRow(row);
+        }
+        WaitFlag<HardEvent::MTE3_V>(SYNC_OUTPUT_BUF2_FLAG);
+    }
+    __aicore__ inline void WritePacketStats(uint64_t logical, uint32_t src, uint32_t rows);
+#elif defined(SFA_DCP_STATS)
     __aicore__ inline void InitDcpStats(GlobalTensor<T> max, GlobalTensor<T> sum)
     {
         dcpMaxGm = max;
@@ -157,7 +170,7 @@ private:
     GlobalTensor<KV_T> vec1ResGm;
     GlobalTensor<T> lseSumFdGm;
     GlobalTensor<T> lseMaxFdGm;
-#ifdef SFA_DCP_STATS
+#if defined(SFA_DCP_STATS) && !defined(SFA_DCP_PACKET)
     GlobalTensor<T> dcpMaxGm;
     GlobalTensor<T> dcpSumGm;
 
@@ -986,7 +999,78 @@ __aicore__ inline void SFAVectorService<SFAT>::MergeKv(const RunInfo &runInfo)
     return;
 }
 
-#ifdef SFA_DCP_STATS
+#if defined(SFA_DCP_PACKET)
+template <typename SFAT>
+__aicore__ inline void SFAVectorService<SFAT>::ZeroPacketRow(uint64_t row)
+{
+    auto record = outputBuff2.Get<uint16_t>();
+    WaitFlag<HardEvent::MTE3_V>(SYNC_OUTPUT_BUF2_FLAG);
+    Duplicate(record, uint16_t(0), packet.sendWidth);
+    SetFlag<HardEvent::V_S>(0);
+    WaitFlag<HardEvent::V_S>(0);
+    // Bytes 2 and 3 of FP32 -inf are 128 and 255, encoded as exact half/BF16 values.
+    record.SetValue(packet.latent + 2, IsSameType<OUT_T, half>::value ? 0x5800 : 0x4300);
+    record.SetValue(packet.latent + 3, IsSameType<OUT_T, half>::value ? 0x5bf8 : 0x437f);
+    SetFlag<HardEvent::S_MTE3>(0);
+    WaitFlag<HardEvent::S_MTE3>(0);
+    auto out = record.template ReinterpretCast<OUT_T>();
+    for (uint32_t h = 0; h < constInfo.qHeadNum; ++h) {
+        DataCopy(attentionOutGm[packet.PacketRow(row * constInfo.qHeadNum + h) * packet.sendWidth], out, packet.sendWidth);
+    }
+    SetFlag<HardEvent::MTE3_V>(SYNC_OUTPUT_BUF2_FLAG);
+}
+
+template <typename SFAT>
+__aicore__ inline void SFAVectorService<SFAT>::WritePacketStats(uint64_t logical, uint32_t src, uint32_t rows)
+{
+    // Use the existing 4 KiB output buffer for 32 headers. The half and BF16
+    // views share a region after the last read of half; floats stay disjoint.
+    auto words = outputBuff2.Get<uint32_t>();
+    auto bytes = words.template ReinterpretCast<uint8_t>();
+    auto halves = outputBuff2.Get<half>()[256];
+    auto floats = outputBuff2.Get<float>()[384];
+    auto maxBits = softmaxMaxUb.template ReinterpretCast<uint32_t>();
+    auto sumBits = softmaxSumUb.template ReinterpretCast<uint32_t>();
+    for (uint32_t i = 0; i < rows;) {
+        uint32_t n = Min(32U, rows - i);
+        WaitFlag<HardEvent::MTE3_V>(SYNC_OUTPUT_BUF2_FLAG);
+        SetFlag<HardEvent::V_S>(0);
+        WaitFlag<HardEvent::V_S>(0);
+        for (uint32_t j = 0; j < n; ++j) {
+            uint32_t k = src + i + j;
+            bool valid = softmaxSumUb.GetValue(k) > 0;
+            words.SetValue(4 * j, valid ? maxBits.GetValue(k) : 0xff800000U);
+            words.SetValue(4 * j + 1, valid ? sumBits.GetValue(k) : 0U);
+            words.SetValue(4 * j + 2, 0U);
+            words.SetValue(4 * j + 3, 0U);
+        }
+        SetFlag<HardEvent::S_V>(0);
+        WaitFlag<HardEvent::S_V>(0);
+        Cast(halves, bytes, RoundMode::CAST_NONE, n * 16);
+        auto lanes = halves.template ReinterpretCast<OUT_T>();
+        if constexpr (IsSameType<OUT_T, bfloat16_t>::value) {
+            PipeBarrier<PIPE_V>();
+            Cast(floats, halves, RoundMode::CAST_NONE, n * 16);
+            PipeBarrier<PIPE_V>();
+            Cast(lanes, floats, RoundMode::CAST_RINT, n * 16);
+        }
+        SetFlag<HardEvent::V_MTE3>(SYNC_OUTPUT_BUF2_FLAG);
+        WaitFlag<HardEvent::V_MTE3>(SYNC_OUTPUT_BUF2_FLAG);
+        for (uint32_t j = 0; j < n;) {
+            uint32_t span = packet.PacketRun(logical + i + j, n - j);
+            DataCopyExtParams params{static_cast<uint16_t>(span), DcpPacketLayout::header * sizeof(OUT_T), 0,
+                                     DcpPacketLayout::latent * sizeof(OUT_T), 0};
+            uint64_t dst = packet.PacketRow(logical + i + j) * packet.sendWidth + packet.latent;
+            DataCopyPad(attentionOutGm[dst], lanes[j * packet.header], params);
+            j += span;
+        }
+        SetFlag<HardEvent::MTE3_V>(SYNC_OUTPUT_BUF2_FLAG);
+        i += n;
+    }
+}
+#endif
+
+#if defined(SFA_DCP_STATS) && !defined(SFA_DCP_PACKET)
 template <typename SFAT>
 __aicore__ inline void SFAVectorService<SFAT>::CopyDcpStat(
     GlobalTensor<T> dst, LocalTensor<T> src, uint32_t rows)
@@ -1038,8 +1122,12 @@ __aicore__ inline void SFAVectorService<SFAT>::ProcessVec1L(const RunInfo &info)
                 mSplitInfo.nBufferStartM + mSplitInfo.vecStartM;
             uint32_t src = (info.loop % constInfo.preLoadNum) *
                 SOFTMAX_TMP_BUFFER_OFFSET / sizeof(T) + mSplitInfo.nBufferStartM / 2;
+#ifdef SFA_DCP_PACKET
+            WritePacketStats(dst, src, mSplitInfo.vecDealM);
+#else
             CopyDcpStat(dcpMaxGm[dst], softmaxMaxUb[src], mSplitInfo.vecDealM);
             CopyDcpStat(dcpSumGm[dst], softmaxSumUb[src], mSplitInfo.vecDealM);
+#endif
         }
 #endif
         if (info.s2Idx == info.curSInnerLoopTimes - 1) {
@@ -1180,8 +1268,21 @@ SFAVectorService<SFAT>::Bmm2DataCopyOutTrans(const RunInfo &info, LocalTensor<OU
     dataCopyParams.blockCount = dealRowCount;
     dataCopyParams.blockLen = actualColumnCount * sizeof(OUT_T);
     dataCopyParams.srcStride = (columnCount - actualColumnCount) / (BYTE_BLOCK / sizeof(OUT_T));
+#ifdef SFA_DCP_PACKET
+    // attenOutOffset is always the logical TND offset, even for packet input.
+    uint64_t logical = info.attenOutOffset / constInfo.headDim + wsMStart;
+    dataCopyParams.dstStride = packet.header * sizeof(OUT_T);
+    for (uint32_t i = 0; i < dealRowCount;) {
+        auto n = packet.PacketRun(logical + i, dealRowCount - i);
+        dataCopyParams.blockCount = n;
+        DataCopyPad(attentionOutGm[packet.PacketRow(logical + i) * packet.sendWidth],
+                    attenOutUb[i * columnCount], dataCopyParams);
+        i += n;
+    }
+#else
     dataCopyParams.dstStride = 0;
-    DataCopyPad(attentionOutGm[info.attenOutOffset + wsMStart * actualColumnCount], attenOutUb, dataCopyParams);    
+    DataCopyPad(attentionOutGm[info.attenOutOffset + wsMStart * actualColumnCount], attenOutUb, dataCopyParams);
+#endif
     return;
 }
 

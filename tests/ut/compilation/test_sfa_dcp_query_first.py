@@ -85,7 +85,8 @@ def test_real_precompute_moves_query_and_rope_before_cache_write(query_first):
     [(failure, prefetched) for failure in (None, "before_query", "after_query", "post") for prefetched in (False, True)]
     + [("join", True), ("no pending", True)],
 )
-def test_full_operator_defers_prefetch_and_cleans_up(monkeypatch, failure, prefetched):
+@pytest.mark.parametrize("early_unpack", [False, True])
+def test_full_operator_defers_prefetch_and_cleans_up(monkeypatch, failure, prefetched, early_unpack):
     events = []
     edge = NS(pending_capture_launch=prefetched and failure != "no pending")
 
@@ -99,7 +100,7 @@ def test_full_operator_defers_prefetch_and_cleans_up(monkeypatch, failure, prefe
     edge.join = join
     module = ModuleType("vllm_ascend.ops.triton.sfa_dcp")
     module.start_sfa_dcp_query_gather = lambda *args: events.append("gather") or NS(
-        wait=lambda: events.append("gather_join")
+        start_unpack=lambda *args: events.append("unpack"), wait=lambda: events.append("gather_join")
     )
     monkeypatch.setitem(sys.modules, module.__name__, module)
     tensor = torch.zeros(1)
@@ -125,6 +126,7 @@ def test_full_operator_defers_prefetch_and_cleans_up(monkeypatch, failure, prefe
         shared_resident_plan=NS(active=True),
         _dcp_early_gather=True,
         _dcp_query_first=True,
+        _dcp_early_unpack=(object(), 12) if early_unpack else None,
         skip_topk=True,
         has_indexer=False,
         dsa_cp_decoder=False,
@@ -152,10 +154,16 @@ def test_full_operator_defers_prefetch_and_cleans_up(monkeypatch, failure, prefe
         return
     if failure == "join":
         assert events[-1] == "gather_join"  # a broken prefetch wait cannot leak the query DMA operands
+        assert "unpack" not in events
         return
     assert not edge.pending_capture_launch
     assert events.count("h2d_join") == int(prefetched)
     assert events.count("gather_join") == int(failure != "before_query")
+    assert events.count("unpack") == int(early_unpack and failure != "before_query")
+    if "unpack" in events:
+        assert events.index("h2d_join" if prefetched else "gather") < events.index("unpack")
+        if "kv_write" in events:
+            assert events.index("unpack") < events.index("kv_write") < events.index("attention")
     if prefetched and failure != "before_query":
         assert events.index("gather") < events.index("h2d_join")
 
@@ -277,16 +285,21 @@ def test_benchmark_current_slots_have_exactly_one_owner(bench, world, origin):
     assert torch.equal(torch.stack(owned).sum(0), (rows >= 0).long())
 
 
-@pytest.mark.parametrize("candidate", [False, True])
+@pytest.mark.parametrize(
+    "candidate,placement", [(False, "off"), (True, "off"), (True, "producer"), (True, "consumer"), (True, "both")]
+)
 @pytest.mark.parametrize("prefetched", [False, True])
-def test_benchmark_measures_projections_current_kv_and_completed_attention(bench, monkeypatch, candidate, prefetched):
+def test_benchmark_measures_projections_current_kv_and_completed_attention(
+    bench, monkeypatch, candidate, placement, prefetched
+):
     events = []
     pipeline = bench.QueryFirstPipeline.__new__(bench.QueryFirstPipeline)
     tensor = torch.zeros(2, 8, 512)
     frame = (torch.zeros(2, 1, 2048), None)
     pipeline.frame_inputs = {frame[0].data_ptr(): (torch.ones(2, 1), None, None, torch.zeros(2))}
     pipeline.query_first = candidate
-    pipeline.args = NS(q_rank=1, dcp_size=8)
+    pipeline.args = NS(q_rank=1, dcp_size=8, unpack_cores=12)
+    pipeline.unpack_placement, pipeline.unpack_stream = placement, object()
     pipeline.tokens, pipeline.group, pipeline.direct = 2, object(), True
     pipeline.norm_weight = None
     pipeline.rms_norm = lambda *args, **kwargs: events.append("q_norm") or (args[0],)
@@ -320,7 +333,9 @@ def test_benchmark_measures_projections_current_kv_and_completed_attention(bench
     pipeline.edges = [edge] if prefetched else []
     pipeline.prepare = lambda _: events.append("plan") or (tensor,) * 6
     module = ModuleType("vllm_ascend.ops.triton.sfa_dcp")
-    module.start_sfa_dcp_query_gather = lambda *args: events.append("gather") or NS(wait=lambda: None)
+    module.start_sfa_dcp_query_gather = lambda *args: events.append("gather") or NS(
+        start_unpack=lambda *args: events.append("unpack"), wait=lambda: None
+    )
 
     def execute(*args, query_gather=None, prefetch=None, **kwargs):
         events.append("gather_join" if query_gather else "late_gather")
@@ -333,11 +348,13 @@ def test_benchmark_measures_projections_current_kv_and_completed_attention(bench
     module.execute_sfa_dcp = execute
     monkeypatch.setitem(sys.modules, module.__name__, module)
     pipeline.step(frame)
-    assert events[:7] == ["qkv", "q_norm", "kv", "q", "rope", "gather", "plan"]
+    producer = ["unpack"] if placement in ("producer", "both") else []
+    consumer = ["unpack"] if placement in ("consumer", "both") else []
+    assert events[: 7 + len(producer)] == ["qkv", "q_norm", "kv", "q", "rope", "gather", *producer, "plan"]
     tail = events[events.index("o") + 1 :]
     if candidate:
         assert tail == ["qkv", "q_norm", "q", "rope", "gather"] + (
-            ["h2d_join", "kv"] if prefetched else ["kv", "h2d"]
+            ["h2d_join", *consumer, "kv"] if prefetched else [*consumer, "kv", "h2d"]
         ) + ["gather_join", "sfa", "merge", "o"]
     else:
         assert tail == (["h2d_join"] if prefetched else []) + ["qkv", "q_norm", "kv", "q", "rope"] + (
@@ -345,6 +362,42 @@ def test_benchmark_measures_projections_current_kv_and_completed_attention(bench
         ) + ["sfa", "merge", "o"]
     assert not edge.pending_capture_launch
     assert torch.equal(pipeline.projected_output, torch.ones(2, 1))
+
+
+@pytest.mark.parametrize("layout,padding", [("uniform", 0), ("mixed", 1)])
+def test_unpack_benchmark_feeds_real_indexer_results_to_planner(bench, monkeypatch, layout, padding):
+    from benchmark_sfa_dcp_early_unpack import UnpackPipeline
+    from benchmark_sfa_dcp_query_first import QueryFirstPipeline
+
+    def make():
+        p = UnpackPipeline.__new__(UnpackPipeline)
+        p.args = NS(indexer="c8", requests=2, history=4096, live_tokens=128, seed=4)
+        p.frames, p.rows, p.ends = bench.make_inputs(2, 3, 4096, 128, 0.9, layout, padding)
+        p.device, p.tokens = p.rows.device, len(p.rows)
+        p._setup_indexer()
+        return p
+
+    pipeline, other = make(), make()
+    fake_topk = torch.empty_like(pipeline.frames[0][0])
+    monkeypatch.setattr(QueryFirstPipeline, "prepare", lambda self, frame: frame)
+    for (raw, pos), (raw2, _) in zip(pipeline.frames, other.frames):
+        query, lengths = pipeline.index_frames[raw.data_ptr()]
+        assert torch.equal(query, other.index_frames[raw2.data_ptr()][0])
+        ends = pipeline.index_inputs["actual_seq_lengths_query"]
+        assert int(ends[-1]) == pipeline.tokens
+        assert lengths[:2].tolist() == [int(pos[pipeline.rows == lane].max()) + 1 for lane in (0, 1)]
+        assert len(lengths) == len(ends) == pipeline.index_inputs["block_table"].shape[0]
+        assert lengths[2:].eq(0).all()
+        assert lengths.max() <= pipeline.index_inputs["block_table"].shape[1] * 128
+
+        def indexer(expected_q=query, expected_lens=lengths, **kwargs):
+            assert kwargs["query"] is expected_q and kwargs["actual_seq_lengths_key"] is expected_lens
+            assert kwargs["sparse_mode"] == 3 and kwargs["key"].dtype == expected_q.dtype == torch.int8
+            return fake_topk
+
+        monkeypatch.setattr(torch.ops._C_ascend, "npu_lightning_indexer_quant", indexer, raising=False)
+        actual, positions = pipeline.prepare((raw, pos))
+        assert actual is fake_topk and positions is pos
 
 
 @pytest.mark.parametrize("corrupt", [False, True])

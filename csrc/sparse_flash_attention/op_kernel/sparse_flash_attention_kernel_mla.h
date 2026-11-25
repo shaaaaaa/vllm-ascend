@@ -71,7 +71,24 @@ public:
 				                __gm__ uint8_t *gmTiling, TPipe *tPipe);
 
     __aicore__ inline void Process();
-#ifdef SFA_DCP_STATS
+#if defined(SFA_DCP_PACKET)
+    __aicore__ inline void InitDcpOutputs(GM_ADDR counts)
+    {
+        selectedCountsGm.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t *>(counts));
+        DcpPacketLayout layout{constInfo.qHeadNum, constInfo.qSeqSize, tilingData->packetLocalHeads,
+                               tilingData->packetQuery != 0};
+        if ASCEND_IS_AIV {
+            vectorService.packet = layout;
+            uint64_t first = uint64_t(actualSeqLengthsQGm.GetValue(constInfo.batchSize - 1)) + tmpBlockIdx;
+            if (first < constInfo.qSeqSize) {
+                // Even an all-padding capture (usedCoreNum == 0) owes a complete send buffer.
+                vectorService.ZeroPacketTail(first, 2 * GetBlockNum());
+            }
+        } else {
+            matmulService.packet = layout;
+        }
+    }
+#elif defined(SFA_DCP_STATS)
     __aicore__ inline void InitDcpOutputs(
         GM_ADDR selectedCounts, GM_ADDR softmaxMax, GM_ADDR softmaxSum);
 #endif
@@ -164,8 +181,10 @@ private:
     GlobalTensor<T> lseMaxFdGm;
 #ifdef SFA_DCP_STATS
     GlobalTensor<int32_t> selectedCountsGm;
+#ifndef SFA_DCP_PACKET
     GlobalTensor<T> softmaxMaxGm;
     GlobalTensor<T> softmaxSumGm;
+#endif
 
     __aicore__ inline void InitDcpZeroRow(uint64_t row);
 #endif
@@ -289,12 +308,17 @@ __aicore__ inline void SparseFlashAttentionMla<SFAT>::InitAllZeroOutput(uint32_t
 template <typename SFAT>
 __aicore__ inline void SparseFlashAttentionMla<SFAT>::InitDcpZeroRow(uint64_t row)
 {
+#ifdef SFA_DCP_PACKET
+    vectorService.ZeroPacketRow(row);
+#else
     uint64_t offset = row * constInfo.qHeadNum;
     matmul::InitOutput<OUT_T>(attentionOutGm[offset * headDim], constInfo.qHeadNum * headDim, 0);
     matmul::InitOutput<T>(softmaxMaxGm[offset], constInfo.qHeadNum, 0);
     matmul::InitOutput<T>(softmaxSumGm[offset], constInfo.qHeadNum, 0);
+#endif
 }
 
+#ifndef SFA_DCP_PACKET
 template <typename SFAT>
 __aicore__ inline void SparseFlashAttentionMla<SFAT>::InitDcpOutputs(
     GM_ADDR selectedCounts, GM_ADDR softmaxMax, GM_ADDR softmaxSum)
@@ -311,6 +335,7 @@ __aicore__ inline void SparseFlashAttentionMla<SFAT>::InitDcpOutputs(
         }
     }
 }
+#endif
 #endif
 
 template <typename SFAT>
