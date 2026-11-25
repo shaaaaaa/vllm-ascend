@@ -46,7 +46,9 @@ extern "C" __attribute__((visibility("default"))) aclError aiv_probe_pulses(cons
     return ACL_ERROR_INVALID_PARAM;
 }
 
+#if AIV_GATE_HAS_TASK_PARAMS
 extern "C" __attribute__((visibility("default"))) uint32_t aiv_probe_kernel_width(aclmdlRITask task,
                                                                                   uint32_t capacity) {
     return aiv_gate_kernel_width(task, capacity);
 }
+#endif

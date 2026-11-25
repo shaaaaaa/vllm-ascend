@@ -48,8 +48,10 @@ class Probe:
         self.lib.aiv_probe_initialize.restype = I32
         self.lib.aiv_probe_pulses.argtypes = [Ref(Gate), Ptr, I32, U32, Ref(Batch)]
         self.lib.aiv_probe_pulses.restype = I32
-        self.lib.aiv_probe_kernel_width.argtypes = [Ptr, U32]
-        self.lib.aiv_probe_kernel_width.restype = U32
+        self.read_kernel_width = getattr(self.lib, "aiv_probe_kernel_width", None)
+        if self.read_kernel_width is not None:
+            self.read_kernel_width.argtypes = [Ptr, U32]
+            self.read_kernel_width.restype = U32
 
     def initialize(self, stream):
         rc = self.lib.aiv_probe_initialize(C.byref(self.gate), stream)
@@ -136,6 +138,15 @@ def assess(case, raw):
 
 
 def kernel_widths(rt, probe, graph):
+    if probe.read_kernel_width is None:
+        return None
+    rt.bind(
+        {
+            "aclmdlRIGetStreams": [Ptr, Ref(Ptr), Ref(U32)],
+            "aclmdlRIGetTasksByStream": [Ptr, Ref(Ptr), Ref(U32)],
+            "aclmdlRITaskGetType": [Ptr, Ref(I32)],
+        }
+    )
     widths = []
     streams = rt.streams(graph)
     if len(streams) < 2:
@@ -151,7 +162,7 @@ def kernel_widths(rt, probe, graph):
             kind = I32()
             rt.call("aclmdlRITaskGetType", task, C.byref(kind))
             if kind.value == 1:  # ACL_MODEL_RI_TASK_KERNEL
-                widths.append(probe.lib.aiv_probe_kernel_width(task, CAPACITY))
+                widths.append(probe.read_kernel_width(task, CAPACITY))
     return sorted(widths)
 
 
@@ -189,8 +200,11 @@ def run_case(rt, probe, host, case, replays):
         if case == "allow_12":
             try:
                 widths = kernel_widths(rt, probe, graph)
-                status = "verified" if widths == [12, 28] else "use_explicit_widths"
-                print(f"[AIV_GATE] captured_kernel_widths={widths} {status}", flush=True)
+                if widths is None:
+                    print("[AIV_GATE] kernel_width_source=launch", flush=True)
+                else:
+                    status = "verified" if widths == [12, 28] else "use_explicit_widths"
+                    print(f"[AIV_GATE] captured_kernel_widths={widths} {status}", flush=True)
             except RuntimeError as exc:
                 # The workload uses explicit block counts; check metadata independently of scheduling.
                 print(f"[AIV_GATE] captured_kernel_widths=unavailable use_explicit_widths ({exc})", flush=True)
@@ -216,17 +230,18 @@ def run_case(rt, probe, host, case, replays):
 
 
 def measure(device, replays):
-    rt = Runtime()
+    rt = Runtime(capture_functions=False)
     rt.bind(
         {
+            "aclrtStreamWaitEvent": [Ptr, Ptr],
+            "aclmdlRICaptureBegin": [Ptr, I32],
+            "aclmdlRICaptureEnd": [Ptr, Ref(Ptr)],
             "aclrtGetDeviceInfo": [U32, I32, Ref(C.c_int64)],
             "aclrtBinaryLoadFromFile": [C.c_char_p, Ptr, Ref(Ptr)],
             "aclrtBinaryGetFunction": [Ptr, C.c_char_p, Ref(Ptr)],
             "aclrtBinaryUnLoad": [Ptr],
             "aclrtMemset": [Ptr, C.c_size_t, I32, C.c_size_t],
             "aclrtSynchronizeStreamWithTimeout": [Ptr, I32],
-            "aclmdlRIGetTasksByStream": [Ptr, Ref(Ptr), Ref(U32)],
-            "aclmdlRITaskGetType": [Ptr, Ref(I32)],
         }
     )
     failed, durations = [], {}

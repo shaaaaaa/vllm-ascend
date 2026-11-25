@@ -76,7 +76,12 @@ class Runtime:
 def toolkit():
     explicit = os.environ.get("ASCENDC_CMAKE_DIR")
     roots = [os.environ.get(k) for k in ("ASCEND_HOME_PATH", "ASCEND_INSTALL_PATH", "ASCEND_CANN_PACKAGE_PATH")]
-    roots += ["/usr/local/Ascend/cann", "/usr/local/Ascend/cann-9.1.0", "/usr/local/Ascend/ascend-toolkit/latest"]
+    roots += [
+        "/usr/local/Ascend/cann",
+        "/usr/local/Ascend/ascend-toolkit/latest",
+        "/usr/local/Ascend/cann-9.1.0",
+        "/usr/local/Ascend/cann-8.5.1",
+    ]
     for location in filter(None, roots):
         base = Path(location)
         paths = [

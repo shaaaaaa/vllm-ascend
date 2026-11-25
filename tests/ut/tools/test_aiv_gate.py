@@ -148,12 +148,14 @@ def test_identical_partial_geometry_charged_12_vs_13(tool):
     assert ("wait_value", 12) in allow[2] and ("wait_value", 13) in defer[2]
 
 
-def test_native_bridge_argument_layout_and_error_reporting(tool, monkeypatch, tmp_path):
-    native = SimpleNamespace(
-        aiv_probe_initialize=Mock(return_value=0), aiv_probe_kernel_width=Mock(), aiv_probe_pulses=Mock(return_value=0)
-    )
+@pytest.mark.parametrize("has_task_query", [False, True])
+def test_native_bridge_argument_layout_and_error_reporting(tool, monkeypatch, tmp_path, has_task_query):
+    native = SimpleNamespace(aiv_probe_initialize=Mock(return_value=0), aiv_probe_pulses=Mock(return_value=0))
+    if has_task_query:
+        native.aiv_probe_kernel_width = Mock()
     monkeypatch.setattr(tool.C, "CDLL", lambda *a, **kw: native)
     probe = tool.Probe(tmp_path, tool.Ptr(77), 88, 99)
+    assert (probe.read_kernel_width is not None) == has_task_query
     probe.initialize(11)
     probe.pulse(11, 3, 12, 555, mode=tool.PIECE, charge=13)
     gate, stream, mode, charge, batch = native.aiv_probe_pulses.call_args.args
@@ -189,8 +191,8 @@ def test_reads_widths_only_for_captured_kernels(tool):
                 assert count._obj.value > 0
                 tasks[:] = per_stream[first]
 
-    rt = SimpleNamespace(call=call, streams=lambda g: list(per_stream))
-    probe = SimpleNamespace(lib=SimpleNamespace(aiv_probe_kernel_width=lambda task, cap: widths[task]))
+    rt = SimpleNamespace(call=call, bind=Mock(), streams=lambda g: list(per_stream))
+    probe = SimpleNamespace(read_kernel_width=lambda task, cap: widths[task])
     assert tool.kernel_widths(rt, probe, 123) == [12, 28]
 
 
@@ -256,7 +258,8 @@ def test_replays_one_capture_with_fresh_buffers_and_detects_missing_restore(tool
     assert errors == ["replay 3: foreground allowance was not restored"]
 
 
-def test_full_command_runs_all_graphs_and_releases_allocations(tool, monkeypatch, capfd):
+@pytest.mark.parametrize("has_task_query", [False, True], ids=["acl-8.5.1", "acl-9.1"])
+def test_full_command_runs_all_graphs_and_releases_allocations(tool, monkeypatch, capfd, has_task_query):
     graph = GraphModel(tool)
     buffers, streams, captured, replayed = {}, [], [], []
     event_ids = iter(range(20, 34))
@@ -264,8 +267,19 @@ def test_full_command_runs_all_graphs_and_releases_allocations(tool, monkeypatch
     class Runtime:
         functions = {"aclrtGetSocName": lambda: b"Ascend910B3"}
 
+        def __init__(self, *, capture_functions):
+            assert not capture_functions
+
         def bind(self, signatures):
-            assert "aclrtSynchronizeStreamWithTimeout" in signatures
+            metadata = {"aclmdlRIGetStreams", "aclmdlRIGetTasksByStream", "aclmdlRITaskGetType"}
+            if "aclrtSynchronizeStreamWithTimeout" in signatures:
+                assert metadata.isdisjoint(signatures)
+            else:
+                assert has_task_query and set(signatures) == metadata
+
+        def streams(self, model):
+            assert has_task_query
+            return streams
 
         def new(self, name, *args):
             if name in ("aclrtMalloc", "aclrtMallocHost"):
@@ -287,6 +301,14 @@ def test_full_command_runs_all_graphs_and_releases_allocations(tool, monkeypatch
                 captured.append(args[0])
             elif name == "aclmdlRICaptureEnd":
                 args[1]._obj.value = len(captured)
+            elif name == "aclmdlRIGetTasksByStream":
+                stream, tasks, count = args
+                if tasks is None:
+                    count._obj.value = 1
+                else:
+                    tasks[0] = 41 if stream == streams[0] else 42
+            elif name == "aclmdlRITaskGetType":
+                args[1]._obj.value = 1
             elif name in ("aclrtRecordEvent", "aclrtStreamWaitEvent"):
                 graph.call(name, *args)
             elif name == "aclmdlRIExecuteAsync":
@@ -317,19 +339,21 @@ def test_full_command_runs_all_graphs_and_releases_allocations(tool, monkeypatch
 
     def make_probe(build, kernel, word, stamps):
         graph.gate, graph.stamps = tool.Gate(word, tool.CAPACITY), stamps
+        graph.read_kernel_width = (lambda task, cap: {41: 28, 42: 12}[task]) if has_task_query else None
         return graph
 
     prepare = Mock(return_value=33)
     monkeypatch.setattr(tool, "Runtime", Runtime)
     monkeypatch.setattr(tool, "Probe", make_probe)
     monkeypatch.setattr(tool, "prepare_kernel", prepare)
-    monkeypatch.setattr(tool, "kernel_widths", lambda *args: [12, 28])
     monkeypatch.setattr(tool.sys, "argv", ["check_aiv_gate.py", "--device", "0"])
     assert tool.main() == 0
     assert captured == [10] * 7 and replayed == [n for n in range(1, 8) for _ in range(3)]
     assert prepare.call_args.kwargs == {"gate_probe": True}
     assert not buffers and not streams
     out = capfd.readouterr().out
+    expected_widths = "captured_kernel_widths=[12, 28] verified" if has_task_query else "kernel_width_source=launch"
+    assert expected_widths in out
     for result in ("long_start_ms=", "all_40_overlap_ms=", "open_train_minus_raw_ms=", "defer_13_minus_allow_12_ms="):
         assert result in out
     assert out.rstrip().endswith("[AIV_GATE] gate_graph_verified")

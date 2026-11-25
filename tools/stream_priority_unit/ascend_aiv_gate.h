@@ -31,6 +31,17 @@ static inline aclError aiv_gate_initialize(const aiv_gate *gate, aclrtStream str
     return aclrtValueWrite(gate->device_word, gate->capacity, 0, stream);
 }
 
+// CMake checks the task-query declaration. Standalone users of this header
+// can also match the graph-debug SDK or override the feature explicitly.
+#ifndef AIV_GATE_HAS_TASK_PARAMS
+#ifdef ACL_MDLRI_DEBUG_JSON_PRINT_SUMMARY
+#define AIV_GATE_HAS_TASK_PARAMS 1
+#else
+#define AIV_GATE_HAS_TASK_PARAMS 0
+#endif
+#endif
+
+#if AIV_GATE_HAS_TASK_PARAMS
 // Upper bound from an already captured kernel. numBlocks describes a pure
 // vector launch. Mixed, missing or opaque kernel metadata uses the full width.
 // For a compound operation account for every child stream through its join.
@@ -55,6 +66,7 @@ static inline uint32_t aiv_gate_kernel_width(aclmdlRITask task, uint32_t capacit
     }
     return params.kernelTaskParams.numBlocks < capacity ? params.kernelTaskParams.numBlocks : capacity;
 }
+#endif
 
 // Submit contiguous foreground work independent of pieces it will block.
 // Publish its AIV demand only after its inputs are ready. Restore the allowance
