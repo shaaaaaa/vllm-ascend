@@ -15,6 +15,7 @@ import sys
 from collections import Counter, defaultdict, namedtuple
 from decimal import Decimal
 from functools import lru_cache
+from itertools import permutations
 from pathlib import Path
 
 from summarize_prefill_profile import complete_events
@@ -56,7 +57,7 @@ def resource(kind, name):
     return "unknown"
 
 
-def read_tasks(path):
+def read_tasks(path, *, include_controls=False):
     devices, labels, unknown = defaultdict(list), {}, defaultdict(Counter)
     for ev in complete_events(path):
         a = ev.get("args") or {}
@@ -65,11 +66,12 @@ def read_tasks(path):
             labels[pid] = a.get("name")
         if ev.get("ph") != "X" or ("Physic Stream Id" not in a and labels.get(pid) != "Ascend Hardware"):
             continue
-        kind, name = a.get("Task Type", ""), ev.get("name", "")
-        if kind in CONTROL or kind in NONCORE:
+        name = ev.get("name", "")
+        kind = a.get("Task Type") or (name if name in CONTROL else "")
+        if (kind in CONTROL and not include_controls) or kind in NONCORE:
             continue
         width = ns(ev.get("dur", 0))
-        if width <= 0:
+        if width < 0 or (width == 0 and kind not in CONTROL):
             continue
         t = ns(ev["ts"])
         row = Task(
@@ -95,22 +97,20 @@ def is_copy(row):
     return "sfacopy" in row.name.lower().replace("_", "")
 
 
-def grouped_copy_layer_times(path, replay_limits, layers, pieces):
-    """Median kernel execution and first-to-last span (us) per layer of the gated benchmark."""
+def _grouped_copy_replays(path, devices, replay_limits, layers, pieces):
     if layers < 2 or pieces < 2 or not replay_limits:
         raise ValueError("expected a sharded prefetch group and at least one replay")
-    devices, _ = read_tasks(path)
-    copies_by_device = [[task for task in tasks if is_copy(task)] for tasks in devices.values()]
-    captures = [tasks for tasks in copies_by_device if tasks]
+    copies_by_device = {pid: [task for task in tasks if is_copy(task)] for pid, tasks in devices.items()}
+    captures = [(pid, tasks) for pid, tasks in copies_by_device.items() if tasks]
     if len(captures) != 1:
         raise ValueError(f"{path}: expected SFA copy tasks on one device, found {len(captures)}")
-    copies = sorted(captures[0], key=lambda task: task.start)
+    pid, tasks = captures[0]
+    copies = sorted(tasks, key=lambda task: task.start)
     tasks_per_replay = 1 + (layers - 1) * pieces
     expected = len(replay_limits) * tasks_per_replay
     if len(copies) != expected:
         raise ValueError(f"{path}: expected {expected} device copy tasks in the timed replays, found {len(copies)}")
 
-    samples = defaultdict(list)
     for replay, limit in enumerate(replay_limits):
         offset = replay * tasks_per_replay
         root = copies[offset]
@@ -124,9 +124,19 @@ def grouped_copy_layer_times(path, replay_limits, layers, pieces):
             or side[0].stream == root.stream
         ):
             raise ValueError(f"{path}: replay {replay} does not match the main/side copy schedule")
+        next_offset = offset + tasks_per_replay
+        end = copies[next_offset].start if next_offset < len(copies) else float("inf")
+        batches = [side[start : start + pieces] for start in range(0, len(side), pieces)]
+        yield pid, limit, root, batches, end
+
+
+def grouped_copy_layer_times(path, replay_limits, layers, pieces):
+    """Median kernel execution and first-to-last span (us) per layer of the gated benchmark."""
+    devices, _ = read_tasks(path)
+    samples = defaultdict(list)
+    for _, limit, root, batches, _ in _grouped_copy_replays(path, devices, replay_limits, layers, pieces):
         samples[limit, 0].append((root.stop - root.start, root.stop - root.start))
-        for layer in range(1, layers):
-            batch = side[(layer - 1) * pieces : layer * pieces]
+        for layer, batch in enumerate(batches, 1):
             active = sum(task.stop - task.start for task in batch)
             span = batch[-1].stop - batch[0].start
             samples[limit, layer].append((active, span))
@@ -135,6 +145,36 @@ def grouped_copy_layer_times(path, replay_limits, layers, pieces):
         active_ns, span_ns = zip(*values)
         medians[key] = statistics.median(active_ns) / 1000, statistics.median(span_ns) / 1000
     return medians
+
+
+def grouped_copy_waits(path, replay_limits, layers, pieces):
+    """Pair consumer wait arrival with its own final copy on the side FIFO, per replay (ns)."""
+    devices, _ = read_tasks(path, include_controls=True)
+    samples = defaultdict(list)
+    for pid, limit, root, batches, end in _grouped_copy_replays(path, devices, replay_limits, layers, pieces):
+        main = sorted(
+            (t for t in devices[pid] if t.stream == root.stream and root.start <= t.start < end),
+            key=lambda t: (t.start, t.task),
+        )
+        all_waits = [t for t in main if t.kind in {"CAPTURE_WAIT", "EVENT_WAIT"}]
+        # Each consumer opens the gate (write word, record Notify) immediately before its wait.
+        # Capture infrastructure may add other waits on this same stream.
+        gated = [
+            t for write, signal, t in zip(main, main[1:], main[2:])
+            if write.kind == "MEM_WRITE_VALUE" and signal.kind == "NOTIFY_RECORD"
+            and t.kind in {"CAPTURE_WAIT", "EVENT_WAIT"}
+        ]
+        waits = gated or all_waits
+        if len(waits) != len(batches):
+            raise ValueError(f"{path}: expected {len(batches)} consumer waits, found {len(all_waits)} wait tasks "
+                             f"and {len(gated)} matched gate openings on stream {root.stream}")
+        for layer, (batch, wait) in enumerate(zip(batches, waits), 1):
+            finished = batch[-1].stop
+            if finished > wait.stop + 1000:  # Allow up to 1 us of cross-stream profiling skew.
+                raise ValueError(f"{path}: final copy for consumer {layer} falls past its wait")
+            remaining = max(0, min(finished, wait.stop) - wait.start)
+            samples[limit, layer].append((remaining, wait.stop - wait.start))
+    return samples
 
 
 def cube_window_type(row):
@@ -715,6 +755,8 @@ def analyze(path, wanted_pid=None, wanted_model=None, wanted_stream=None, expect
 def main():
     cli = argparse.ArgumentParser(description=__doc__)
     cli.add_argument("trace", type=Path)
+    cli.add_argument("--grouped-410-waits", action="store_true",
+                     help="Read the saved test_grouped_layer_copy_times_410 trace and print consumer waits")
     cli.add_argument("--pid")
     cli.add_argument("--model-id", type=int)
     cli.add_argument("--stream", type=int)
@@ -722,6 +764,17 @@ def main():
     cli.add_argument("--csv", type=Path, default=Path("decode-layer-gaps.csv"))
     cli.add_argument("--summary", type=Path, help="Also save the short JSON printed to stdout")
     args = cli.parse_args()
+    if args.grouped_410_waits:
+        limits = (12, 24, 0)
+        schedule = [limit for order in permutations(limits) for limit in order]
+        waits = grouped_copy_waits(args.trace, schedule, layers=4, pieces=16)
+        print("consumer  cores  copy_wait_p50_us  wait_task_p50_us  ready_at_arrival/replays")
+        for layer, name in enumerate(("A", "B", "C"), 1):
+            for limit in limits:
+                pending, elapsed = zip(*waits[limit, layer])
+                print(f"{name:>8}  {str(limit or 'auto'):>5}  {statistics.median(pending) / 1000:>16.2f}"
+                      f"  {statistics.median(elapsed) / 1000:>16.2f}  {pending.count(0)}/{len(pending)}")
+        return
     before = args.trace.stat()
     summary, layers, _ = analyze(args.trace, args.pid, args.model_id, args.stream, args.layers)
     after = args.trace.stat()

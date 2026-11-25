@@ -59,6 +59,41 @@ def test_grouped_copy_layer_times_count_device_work_and_inter_piece_gaps(clients
         gaps.grouped_copy_layer_times(trace, schedule, layers=4, pieces=2)
 
 
+@pytest.mark.parametrize("wait_kind", ["CAPTURE_WAIT", "EVENT_WAIT"])
+def test_grouped_copy_waits_pair_with_consumer_arrival(clients, tmp_path, wait_kind):
+    _, gaps = clients
+    events = []
+    schedule = (12, 24, 12)
+
+    def task(start, duration, name, kind, stream):
+        events.append({
+            "ph": "X", "pid": 8, "tid": stream, "ts": str(start), "dur": duration, "name": name,
+            "args": {"Task Type": kind, "Physic Stream Id": stream, "Task Id": len(events)},
+        })
+
+    for i, limit in enumerate(schedule):
+        ts = 100 * i
+        task(ts, 2, "sfa_copy_i32_s64", "AI_VECTOR_CORE", limit)
+        task(ts + 3, 0.2, "other wait", wait_kind, limit)
+        for tick in (10, 14, 20, 24, 39, 43):
+            task(ts + tick, 1, "sfa_copy_piece_i32_s64", "AI_VECTOR_CORE", limit + 1)
+        for begin, duration in ((8, 12), (35, 0.4), (40, 5)):
+            task(ts + begin - 2, 0.2, "gate", "MEM_WRITE_VALUE", limit)
+            task(ts + begin - 1, 0.1, "give", "NOTIFY_RECORD", limit)
+            task(ts + begin, duration, "consumer", wait_kind, limit)
+    trace = tmp_path / "grouped.json"
+    trace.write_text(json.dumps(events[::-1]))
+    waits = gaps.grouped_copy_waits(trace, schedule, layers=4, pieces=2)
+    for limit in (12, 24):
+        for layer, sample in enumerate(((7000, 12000), (0, 400), (4000, 5000)), 1):
+            assert waits[limit, layer] == [sample] * schedule.count(limit)
+
+    events[:] = [e for e in events if (e["name"], e["ts"]) != ("consumer", "8")]
+    trace.write_text(json.dumps(events))
+    with pytest.raises(ValueError, match="consumer waits"):
+        gaps.grouped_copy_waits(trace, schedule, layers=4, pieces=2)
+
+
 def test_tpot_uses_tokens_after_the_first_chunk(clients, monkeypatch):
     bench, _ = clients
     clock = iter((2.0, 2.05, 2.08, 2.1))
