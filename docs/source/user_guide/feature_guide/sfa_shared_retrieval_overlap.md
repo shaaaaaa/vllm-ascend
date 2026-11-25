@@ -22,19 +22,30 @@ workers between settings; capture topology cannot change in a running worker.
 Keep `VLLM_ASCEND_DSA_RESIDENT_EXACT_KERNELS`, model, TP/DP, capture sizes, GC,
 performance logging and request workload identical between runs.
 
-The original overlap scheduling change was Python-only. The later selective
-AIV policy requires updating both vLLM-Ascend and LMCache-Ascend on
-`dev-lmy`, then rebuilding **LMCache-Ascend** and
-restarting workers. It adds an optional native `max_aiv_cores` argument; the
-vLLM-Ascend native extension does not change for this policy.
+By default, target decode full-graph copies use the automatic AIV grid. The native
+launcher bounds each kernel by the device's vector-core count and its row capacity.
+To cap each copy at 12 AIV cores, set `VLLM_ASCEND_SFA_COPY_MAX_AIV_CORES=12` on D.
+A positive unsigned 32-bit integer applies to serial retrieval, adjacent prefetch
+and grouped prefetch. Unsetting the variable, zero, or text such as `auto`
+selects the automatic grid. Restart D after changing the setting. Each graph
+records the grid during capture. This setting uses the existing `max_aiv_cores`
+argument in the `dev-lmy` LMCache-Ascend extension. Updating vLLM-Ascend Python
+is sufficient when that extension is already installed.
 
-Serial/critical-path retrieval uses the automatic hardware/payload-bounded grid.
-The overlapping side-stream schedule requests `max_aiv_cores=12`. This is a per-launch
-argument, not mutable transfer state, so graph keys sharing a transfer object
-cannot accidentally cap a serial fallback. The graph captures the chosen grid;
-there is no device readback or replay-time Python core selection. This replaces
-the earlier blanket 12-AIV cap, which increased measured serial retrieval
-latency from about 80 to 140 microseconds in the reported workload.
+On one idle NPU, compare the 12-core limit against 24 cores and the automatic grid.
+The test uses 16 requests, two query rows per request, 16 pieces per prefetch and
+1, 410 or 4,096 distinct misses per request. Each pair replays the same KV rows
+in alternating order and checks the copied K and PE values outside the timers.
+
+```bash
+python -m pytest -q -s --confcutdir=tests/e2e/singlecard -o addopts= \
+  tests/e2e/singlecard/test_sfa_retrieval_overlap.py::test_sfa_copy_core_limit
+```
+
+`copy_only` measures one layer's gated copy through its join and reports payload GB/s.
+`group_1plus3` measures a four-layer graph with registered-host KV and GLM QKV,
+V-up and router projections. Positive `paired_saved_us` means the larger grid
+finished sooner. `candidate_faster_pairs` counts the eight pairwise comparisons.
 
 ## Schedule and integration
 

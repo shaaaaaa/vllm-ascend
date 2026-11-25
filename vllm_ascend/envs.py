@@ -49,6 +49,17 @@ def _sfa_prefetch_main_gate() -> bool:
     return _strict_binary_env(name)
 
 
+def _sfa_copy_max_aiv_cores() -> int:
+    name = "VLLM_ASCEND_SFA_COPY_MAX_AIV_CORES"
+    try:
+        limit = int(os.getenv(name, "0"))
+    except ValueError:
+        return 0
+    if not 0 <= limit <= 0xFFFFFFFF:
+        raise ValueError(f"{name} must fit an unsigned 32-bit integer, got {limit}")
+    return limit
+
+
 # The begin-* and end* here are used by the documentation generator
 # to extract the used env vars.
 
@@ -203,6 +214,10 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_SFA_SHARED_RETRIEVAL_OVERLAP": lambda: bool(
         int(os.getenv("VLLM_ASCEND_SFA_SHARED_RETRIEVAL_OVERLAP", "0"))
     ),
+    # D target full-graph KV copy, serial and prefetched. Non-sensitive. Positive uint32
+    # caps AIVs per kernel. Unset (default), zero, or text selects the automatic grid.
+    # Read at model initialization. Restart D to capture a different grid.
+    "VLLM_ASCEND_SFA_COPY_MAX_AIV_CORES": _sfa_copy_max_aiv_cores,
     # D only, non-sensitive. 0 (default) queues one layer ahead. 1 queues
     # all eligible shared consumers at their indexer. Requires overlap and restart.
     "VLLM_ASCEND_SFA_PREFETCH_MULTI_LAYER": lambda: _strict_binary_env("VLLM_ASCEND_SFA_PREFETCH_MULTI_LAYER"),

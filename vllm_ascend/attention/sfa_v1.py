@@ -2139,6 +2139,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         if self.dsa_resident_cache:
             configure_resident_kernels()
         self.shared_resident_plan: SharedResidentPlan | None = None
+        self.sfa_copy_max_aiv_cores = envs.VLLM_ASCEND_SFA_COPY_MAX_AIV_CORES
         layer_index = (
             parse_layer_idx(self.layer_name)
             if envs.VLLM_ASCEND_SFA_SHARED_RESIDENT_PLAN and self.index_cache_enabled and self.layer_name
@@ -4333,7 +4334,8 @@ class AscendSFAImpl(MLAAttentionImpl):
                         return  # Joined before this consumer's current-KV writes.
                 capacity = graph_key.request_capacity
                 self._full_graph_transfer.load(
-                    selected_packed[:capacity], selected_counts[:capacity], target_slots[:capacity]
+                    selected_packed[:capacity], selected_counts[:capacity], target_slots[:capacity],
+                    max_aiv_cores=self.sfa_copy_max_aiv_cores,
                 )
                 return
             if getattr(context, "staged_sfa_graph_dummy_run", False):

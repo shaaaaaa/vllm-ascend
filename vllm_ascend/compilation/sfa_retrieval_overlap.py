@@ -352,7 +352,7 @@ class SharedRetrievalOverlap:
                     if self.main_gate and gate is None:
                         gate = CopyGate(destinations[0].device)
                     edge = RetrievalEdge(
-                        self.stream, transfer, destinations, max_aiv_cores=0 if self.main_gate else 12,
+                        self.stream, transfer, destinations, max_aiv_cores=by_name[following].sfa_copy_max_aiv_cores,
                         pieces=self.pieces, gate=gate,
                     )
                     incoming[following] = outgoing[current] = edge

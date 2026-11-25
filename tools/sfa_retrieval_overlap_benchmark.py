@@ -32,6 +32,7 @@ class Workload:
     def __init__(self, root, requests=8, query_rows=2, layers=4, width=4096, history=4097, chunk=1024, *,
                  main_gate=False, pieces=None, multi_layer=False):
         import vllm_ascend.vllm_ascend_C  # noqa: F401
+        from vllm_ascend import envs
 
         helpers = Path(root) / "benchmark/v1/kv_transfer"
         if not (helpers / "load_benchmark_utils.py").is_file():
@@ -86,17 +87,16 @@ class Workload:
                 self.transfers.append(transfer)
             gate = CopyGate(self.device) if main_gate else None
             copy_pieces = (16 if main_gate else 1) if pieces is None else pieces
-            self.edges = [RetrievalEdge(self.stream, self.transfers[i], self.caches[i],
-                                        max_aiv_cores=0 if main_gate else 12, pieces=copy_pieces, gate=gate)
+            self.edges = [RetrievalEdge(self.stream, self.transfers[i], self.caches[i], pieces=copy_pieces, gate=gate)
                           for i in range(1, layers)]
             self.group = None
             if multi_layer:
                 group_gate = CopyGate(self.device) if main_gate else None
                 self.group = SharedPrefetchGroup(tuple(
-                    RetrievalEdge(self.stream, e.transfer, e.destinations, max_aiv_cores=e.max_aiv_cores,
-                                  pieces=e.pieces, gate=group_gate)
+                    RetrievalEdge(self.stream, e.transfer, e.destinations, pieces=e.pieces, gate=group_gate)
                     for e in self.edges
                 ))
+            self.set_copy_core_limit(envs.VLLM_ASCEND_SFA_COPY_MAX_AIV_CORES)
             self.router_x = torch.ones((requests * query_rows, 16), dtype=torch.float32,
                                        device=self.device) if main_gate else None
             router_weight = torch.ones((8, 16), dtype=torch.float32, device=self.device) if main_gate else None
@@ -162,6 +162,13 @@ class Workload:
             rows = plane.view(-1, plane.shape[-1])[:self.requests * self.width, 0]
             target.copy_(rows.view_as(target))
 
+    def set_copy_core_limit(self, limit):
+        """Select the launch grid for subsequent captures on the same host KV and slots."""
+        self.max_aiv_cores = limit
+        group_edges = self.group.edges if self.group is not None else ()
+        for edge in (*self.edges, *group_edges):
+            edge.max_aiv_cores = limit
+
     def chain(self, overlap, observe, *, multi_layer=False, after_first_qkv=None):
         edges = self.group.edges if multi_layer else self.edges
         for layer, transfer in enumerate(self.transfers):
@@ -178,7 +185,7 @@ class Workload:
                     qkv()
                 if multi_layer and layer == 0:
                     self.group.launch(self.selected, self.counts, self.slots)
-                transfer.load(self.selected, self.counts, self.slots)
+                transfer.load(self.selected, self.counts, self.slots, max_aiv_cores=self.max_aiv_cores)
             if layer == 1 and after_first_qkv is not None:
                 # The gate has taken its token back. Later copies cannot change a
                 # destination while this optional observation reads it.
@@ -201,13 +208,39 @@ class Workload:
     def capture(self, overlap, observe=False, *, multi_layer=False, after_first_qkv=None):
         if after_first_qkv is not None and (not overlap or self.edges[0].gate is None):
             raise ValueError("a stable first-QKV snapshot requires gated overlap")
-        self.chain(overlap, observe, multi_layer=multi_layer, after_first_qkv=after_first_qkv)
+        return self._capture(partial(
+            self.chain, overlap, observe, multi_layer=multi_layer, after_first_qkv=after_first_qkv
+        ))
+
+    def capture_copy(self):
+        """One real layer transfer with the same gate, piece count and stream join as serving."""
+        edge = self.edges[0]
+
+        def enqueue():
+            edge.launch(self.selected, self.counts, self.slots, edge.destinations)
+            edge.join()
+
+        return self._capture(enqueue)
+
+    def _capture(self, enqueue):
+        enqueue()
         torch.npu.synchronize()
         graph = torch.npu.NPUGraph()
         self.graphs.append(graph)  # Retain even on a partial capture failure.
         with torch.npu.graph(graph):
-            self.chain(overlap, observe, multi_layer=multi_layer, after_first_qkv=after_first_qkv)
+            enqueue()
         return graph
+
+    def check_copied_layer(self, layer, tokens, active):
+        """Check every K/PE element and the unused slots after an untimed replay."""
+        lanes = torch.arange(self.requests)[:, None]
+        for index, plane in enumerate(self.caches[layer]):
+            expected = torch.full((self.requests, self.width), -7, dtype=plane.dtype)
+            expected[:, :active] = self.values(tokens[:active], lanes, layer) + 32 * index
+            rows = plane.view(-1, plane.shape[-1])[:self.requests * self.width]
+            rows = rows.view(self.requests, self.width, -1).cpu()
+            if not torch.equal(rows, expected.unsqueeze(-1).expand_as(rows)):
+                raise AssertionError(f"incorrect KV copy in layer {layer}, plane {index}, misses {active}")
 
     def check(self, tokens, active, idle=False):
         for layer in range(self.layers):
@@ -236,9 +269,9 @@ def ready_rows(snapshot, expected):
     return int(mask.sum())
 
 
-def paired_graph_times(adjacent, grouped, *, pairs=8, replays=4):
+def paired_graph_times(first, second, *, names=("adjacent", "grouped"), pairs=8, replays=4, prepare_pair=None):
     """Paired device timings in us per replay. Keep setup and observations outside the measurement."""
-    graphs = (adjacent, grouped)
+    graphs = (first, second)
     timers = [[(torch.npu.Event(enable_timing=True), torch.npu.Event(enable_timing=True)) for _ in graphs]
               for _ in range(pairs)]
     for graph in graphs:
@@ -250,6 +283,8 @@ def paired_graph_times(adjacent, grouped, *, pairs=8, replays=4):
             end.record()
     torch.npu.synchronize()
     for i, pair in enumerate(timers):
+        if prepare_pair is not None:
+            prepare_pair(i)
         for mode in ((0, 1) if i % 2 == 0 else (1, 0)):
             start, end = pair[mode]
             start.record()
@@ -262,10 +297,10 @@ def paired_graph_times(adjacent, grouped, *, pairs=8, replays=4):
         raise RuntimeError(f"invalid device timing in {elapsed!r}")
     gains = [old - new for old, new in elapsed]
     return {
-        "adjacent_us": statistics.median(old for old, _ in elapsed),
-        "grouped_us": statistics.median(new for _, new in elapsed),
+        f"{names[0]}_us": statistics.median(old for old, _ in elapsed),
+        f"{names[1]}_us": statistics.median(new for _, new in elapsed),
         "paired_saved_us": statistics.median(gains),
-        "grouped_faster_pairs": sum(gain > 0 for gain in gains),
+        f"{names[1]}_faster_pairs": sum(gain > 0 for gain in gains),
         "pairs": pairs,
     }
 
@@ -334,6 +369,7 @@ def main():
         result = {"scope": "registered-CPU retrieval plus projection microbenchmark",
                   "requests": args.requests, "query_rows": args.query_rows,
                   "main_gate": args.main_gate, "pieces": workload.edges[0].pieces,
+                  "max_aiv_cores": workload.max_aiv_cores,
                   "copied_bytes_per_chain": args.requests * args.misses * 576 * 2 * 4,
                   "methods": {}}
         for mode, name in enumerate(modes):

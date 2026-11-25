@@ -249,11 +249,13 @@ def test_indexer_launches_from_its_fixed_bridge_before_own_retrieval(handoff, fu
     h.impl._retrieval_overlap = SimpleNamespace(
         multi_layer=enabled, indexer_groups={h.context.staged_sfa_graph_key: {"layer": group}}
     )
-    h.impl._full_graph_transfer = SimpleNamespace(load=lambda *a: h.operations.append("own KV"))
+    h.impl.sfa_copy_max_aiv_cores = 12
+    h.impl._full_graph_transfer = SimpleNamespace(load=Mock(side_effect=lambda *a, **kw: h.operations.append("own KV")))
     h.pre()
     if full and not consumer and enabled:
         group.launch.assert_called_once_with(*h.bridge[3:])
         h.retrieve()
+        assert h.impl._full_graph_transfer.load.call_args.kwargs == {"max_aiv_cores": 12}
         assert h.operations == ["index plan", "publish bridge", "queue consumers", "own KV"]
     else:
         group.launch.assert_not_called()

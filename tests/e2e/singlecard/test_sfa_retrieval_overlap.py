@@ -6,6 +6,7 @@ import json
 import os
 import statistics
 import sys
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -15,6 +16,7 @@ torch_npu = pytest.importorskip("torch_npu")
 pytestmark = pytest.mark.skipif(not torch.npu.is_available(), reason="requires an NPU")
 ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / "tools"))
 
 
 @pytest.mark.parametrize("main_gate", [False, True], ids=["early_fork", "cube_windows"])
@@ -217,11 +219,10 @@ def test_shared_indexer_prefetch_joins_only_its_layer(gated):
           "BC_finished_inside_one_first_QKV_window=pass replays=8")
 
 
-def test_shared_indexer_prefetch_effect(request):
-    """Measure the 1+3 group on registered host KV. Observe the first consumer in a separate graph."""
+@contextmanager
+def glm_group_workload(request):
     root = Path(os.environ.get("LMCACHE_ASCEND_SOURCE_DIR", str(ROOT.parent / "LMCache-Ascend")))
-    sys.path.insert(0, str(ROOT / "tools"))
-    from sfa_retrieval_overlap_benchmark import Workload, paired_graph_times, ready_rows
+    from sfa_retrieval_overlap_benchmark import Workload
 
     path = Path("/workspace/models/GLM-5.3-w4a8c8/config.json")
     if path.is_file():
@@ -246,6 +247,16 @@ def test_shared_indexer_prefetch_effect(request):
     w = Workload(root, requests=16, query_rows=2, history=8192, main_gate=True, multi_layer=True)
     try:
         w.use_glm_projections(config, tp=4)
+        yield w
+    finally:
+        w.close()
+
+
+def test_shared_indexer_prefetch_effect(request):
+    """Measure the 1+3 group on registered host KV. Observe the first consumer in a separate graph."""
+    from sfa_retrieval_overlap_benchmark import paired_graph_times, ready_rows
+
+    with glm_group_workload(request) as w:
         # A is the first consumer (layer 1); B/C have their own destinations (layers 2/3).
         snapshots = [tuple(torch.empty_like(t) for t in targets) for targets in w.observed[2:]]
 
@@ -280,8 +291,72 @@ def test_shared_indexer_prefetch_effect(request):
                   f"adjacent_us={timing['adjacent_us']:.1f} grouped_us={timing['grouped_us']:.1f} "
                   f"paired_saved_us={timing['paired_saved_us']:+.1f} "
                   f"grouped_faster_pairs={timing['grouped_faster_pairs']}/{timing['pairs']}", flush=True)
-    finally:
-        w.close()
+
+
+def test_sfa_copy_core_limit(request, monkeypatch):
+    """Compare the same scatter, gate and captures at 12, 24 and the device's automatic grid."""
+    from sfa_retrieval_overlap_benchmark import paired_graph_times
+
+    from vllm_ascend import envs
+
+    torch.npu.set_device(0)
+    try:
+        query = ctypes.CDLL("libascendcl.so").aclrtGetDeviceInfo
+    except AttributeError:
+        query = ctypes.CDLL("libacl_rt.so").aclrtGetDeviceInfo
+    query.argtypes = [ctypes.c_uint32, ctypes.c_int32, ctypes.POINTER(ctypes.c_int64)]
+    query.restype = ctypes.c_int32
+    cores = ctypes.c_int64()
+    assert query(0, 201, ctypes.byref(cores)) == 0  # ACL_DEV_ATTR_VECTOR_CORE_NUM
+    if cores.value <= 12:
+        pytest.skip(f"hardware has {cores.value} AIV cores, comparison requires more than 12")
+    limits = (12, 24, 0) if cores.value > 24 else (12, 0)
+    variable = "VLLM_ASCEND_SFA_COPY_MAX_AIV_CORES"
+    monkeypatch.delenv(variable, raising=False)
+    with glm_group_workload(request) as w:
+        graphs = {"copy_only": {}, "group_1plus3": {}}
+        w.set_payload(1)
+        for cap in limits:
+            if cap:
+                monkeypatch.setenv(variable, str(cap))
+            else:
+                monkeypatch.delenv(variable)
+            w.set_copy_core_limit(envs.VLLM_ASCEND_SFA_COPY_MAX_AIV_CORES)
+            assert w.max_aiv_cores == cap
+            graphs["copy_only"][cap] = w.capture_copy()
+            graphs["group_1plus3"][cap] = w.capture(True, multi_layer=True)
+        side_pieces = w.edges[0].pieces
+        capacity_per_piece = (w.selected.numel() + side_pieces - 1) // side_pieces
+        assert capacity_per_piece >= cores.value
+        print(f"[SFA_COPY_CORES] device_AIV={cores.value} pieces_per_prefetch={side_pieces} "
+              f"auto_launch_grid={cores.value} requests={w.requests}", flush=True)
+        for misses in (1, 410, 4096):
+            for scope, variants in graphs.items():
+                for graph in variants.values():
+                    tokens = w.set_payload(misses, 43)
+                    graph.replay()
+                    for layer in ((1,) if scope == "copy_only" else range(w.layers)):
+                        w.check_copied_layer(layer, tokens, misses)
+                for cap in limits[1:]:
+                    # Both widths see the same rows in each pair. Change the selection between pairs.
+                    timing = paired_graph_times(
+                        variants[12], variants[cap], names=("cap12", "candidate"), pairs=8, replays=2,
+                        prepare_pair=lambda i, n=misses: w.set_payload(n, 43 + 613 * i),
+                    )
+                    base, candidate = timing["cap12_us"], timing["candidate_us"]
+                    rate = ""
+                    if scope == "copy_only":
+                        bytes_per_row = sum(p.shape[-1] * p.element_size() for p in w.caches[1])
+                        nbytes = w.requests * misses * bytes_per_row
+                        rate = (f" rows_per_piece={w.requests * misses // side_pieces} payload_bytes={nbytes}"
+                                f" effective_GB_s_12={nbytes / base / 1000:.2f}"
+                                f" effective_GB_s_candidate={nbytes / candidate / 1000:.2f}")
+                    print(f"[SFA_COPY_CORES] {scope} misses_per_request={misses} "
+                          f"candidate={cap or 'auto'} candidate_grid={cap or cores.value} "
+                          f"cap12_us={base:.1f} candidate_us={candidate:.1f} "
+                          f"paired_saved_us={timing['paired_saved_us']:+.1f} "
+                          f"candidate_faster_pairs={timing['candidate_faster_pairs']}/{timing['pairs']}{rate}",
+                          flush=True)
 
 
 @pytest.mark.parametrize("requests,main_gate", [(1, False), (8, False), (16, False), (8, True)])
@@ -290,7 +365,6 @@ def test_registered_sources_consumer_boundary_and_replay(requests, query_rows, m
     root = Path(os.environ.get("LMCACHE_ASCEND_SOURCE_DIR", str(ROOT.parent / "LMCache-Ascend")))
     if not (root / "benchmark/v1/kv_transfer/load_benchmark_utils.py").exists():
         pytest.fail("set LMCACHE_ASCEND_SOURCE_DIR to the matching LMCache-Ascend source checkout")
-    sys.path.insert(0, str(ROOT / "tools"))
     from sfa_retrieval_overlap_benchmark import Workload
     workload = Workload(root, requests, query_rows, main_gate=main_gate, multi_layer=True)
     was_enabled = gc.isenabled()

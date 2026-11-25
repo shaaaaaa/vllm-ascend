@@ -98,6 +98,28 @@ def test_shared_prefetch_benchmark_compares_the_same_distinct_host_rows(bench):
         torch.testing.assert_close(order, bench.scattered_token_order(4096, history))
 
 
+def test_copy_only_benchmark_captures_the_selected_grid_and_joins(bench, monkeypatch):
+    w = bench.Workload.__new__(bench.Workload)
+    w.selected = torch.zeros((2, 8), dtype=torch.int32)
+    w.slots, w.counts = w.selected.long(), torch.ones(2, dtype=torch.int32)
+    stream, gate = torch.npu.Stream(), bench.CopyGate("cpu")
+    transfer = NS(load=Mock(), request_capacity=2)
+    w.edges = [bench.RetrievalEdge(stream, transfer, (torch.zeros(2),), gate=gate, pieces=16)]
+    w.group = None
+    w.graphs = []
+    monkeypatch.setattr(torch.npu, "NPUGraph", object, raising=False)
+    monkeypatch.setattr(torch.npu, "graph", lambda _: nullcontext(), raising=False)
+    monkeypatch.setattr(torch.npu, "synchronize", lambda: None, raising=False)
+    for limit in (12, 24, 0):
+        w.set_copy_core_limit(limit)
+        graph = w.capture_copy()
+        assert w.graphs[-1] is graph and not w.edges[0].pending_join and gate.pending == 0
+        assert transfer.load.call_count == 2  # Warmup and capture.
+        for call in transfer.load.call_args_list:
+            assert call.kwargs == {"max_aiv_cores": limit, "pieces": 16, "admission": gate.native}
+        transfer.load.reset_mock()
+
+
 @pytest.mark.parametrize("grouped", [False, True])
 def test_shared_prefetch_benchmark_observes_at_first_join(bench, grouped):
     w = bench.Workload.__new__(bench.Workload)
@@ -118,6 +140,7 @@ def test_shared_prefetch_benchmark_observes_at_first_join(bench, grouped):
 
     def transfer(layer):
         def load(selected, counts, slots, **kwargs):
+            assert kwargs["max_aiv_cores"] == 24
             for lane, n in enumerate(counts.tolist()):
                 values = w.values(selected[lane, :n], lane, layer).bfloat16()[:, None]
                 for p, plane in enumerate(w.caches[layer]):
@@ -128,6 +151,7 @@ def test_shared_prefetch_benchmark_observes_at_first_join(bench, grouped):
     stream, gate = torch.npu.Stream(), bench.CopyGate("cpu")
     w.edges = [bench.RetrievalEdge(stream, w.transfers[i], w.caches[i], pieces=2, gate=gate) for i in range(1, 4)]
     w.group = bench.SharedPrefetchGroup(tuple(w.edges)) if grouped else None
+    w.set_copy_core_limit(24)
     early = [tuple(torch.empty_like(t) for t in pair) for pair in w.observed[2:]]
 
     def sample():
@@ -141,11 +165,16 @@ def test_shared_prefetch_benchmark_observes_at_first_join(bench, grouped):
         w.chain(True, observe=True, multi_layer=grouped, after_first_qkv=sample)
         assert qkv_calls == [0, 1, 2, 3]
         w.check(tokens, n)
+        for layer in range(w.layers):
+            w.check_copied_layer(layer, tokens, n)
         ready = [bench.ready_rows(pair, ref) for pair, ref in zip(early, w.observed[2:])]
         assert ready == [2 * n if grouped else 0] * 2
     early[0][1][0, 0] += 2
     with pytest.raises(AssertionError):
         bench.ready_rows(early[0], w.observed[2])
+    w.caches[2][1][0, 0, 0, -1] += 1
+    with pytest.raises(AssertionError, match="layer 2, plane 1"):
+        w.check_copied_layer(2, tokens, n)
 
 
 @pytest.mark.parametrize("durations", [(10, 7), (7, 10), (7, 7)])
@@ -171,11 +200,14 @@ def test_shared_prefetch_benchmark_pairs_device_times(bench, monkeypatch, durati
     monkeypatch.setattr(torch.npu, "Event", Event)
     monkeypatch.setattr(torch.npu, "synchronize", lambda: None, raising=False)
     graphs = [NS(replay=lambda i=i: replay(i)) for i in (0, 1)]
-    result = bench.paired_graph_times(*graphs, pairs=4, replays=2)
+    prepared = []
+    result = bench.paired_graph_times(*graphs, names=("cap12", "auto"), pairs=4, replays=2,
+                                      prepare_pair=lambda i: prepared.append((i, len(calls))))
     assert calls == [0, 0, 1, 1] + [0, 0, 1, 1, 1, 1, 0, 0] * 2
-    assert result == dict(adjacent_us=durations[0], grouped_us=durations[1],
+    assert prepared == [(0, 4), (1, 8), (2, 12), (3, 16)]
+    assert result == dict(cap12_us=durations[0], auto_us=durations[1],
                           paired_saved_us=durations[0] - durations[1],
-                          grouped_faster_pairs=4 * int(durations[1] < durations[0]), pairs=4)
+                          auto_faster_pairs=4 * int(durations[1] < durations[0]), pairs=4)
 
 
 def test_shared_prefetch_benchmark_uses_the_serving_quantized_qkv_shapes(bench, monkeypatch):
@@ -210,23 +242,24 @@ class Key:
     query_profile: str = "bounded"
 
 
-def topology(lengths=(4,), dtype=torch.bfloat16):
+def topology(lengths=(4,), dtype=torch.bfloat16, *, max_aiv_cores=0):
     groups, impls, caches = [], {}, {}
     for g, length in enumerate(lengths):
         group = NS(members=tuple(f"g{g}l{i}" for i in range(length)), active=True)
         groups.append(group)
         for i, name in enumerate(group.members):
             caches[name] = (torch.empty((2, 8, 1, 4), dtype=dtype), torch.empty((2, 8, 1, 2), dtype=dtype))
-            impls[name] = NS(skip_topk=i > 0, shared_resident_plan=group,
+            impls[name] = NS(skip_topk=i > 0, shared_resident_plan=group, sfa_copy_max_aiv_cores=max_aiv_cores,
                              _full_graph_transfers={2: NS(load=Mock(), request_capacity=2)},
                              _staged_sfa_bridge_buffers=(torch.empty(1, dtype=dtype),),
                              _staged_sfa_capture_state=NS(runtime=(None, caches[name]), initialized_cache_capacity=2))
     return groups, impls, caches
 
 
-def test_prefetch_pieces_only_split_the_side_transfer(runtime):
+@pytest.mark.parametrize("limit", [0, 12, 24, 40])
+def test_prefetch_pieces_only_split_the_side_transfer(runtime, limit):
     module, _ = runtime
-    groups, impls, caches = topology((3,))
+    groups, impls, caches = topology((3,), max_aiv_cores=limit)
     owner = module.SharedRetrievalOverlap(pieces=16)
     owner.configure(tuple(impls.items()), groups, caches)
     key = Key()
@@ -237,7 +270,7 @@ def test_prefetch_pieces_only_split_the_side_transfer(runtime):
     slots = torch.zeros((2, 4), dtype=torch.int64)
     first.launch(selected, counts, slots, first.destinations)
     first.join()
-    first.transfer.load.assert_called_once_with(selected, counts, slots, max_aiv_cores=12, pieces=16)
+    first.transfer.load.assert_called_once_with(selected, counts, slots, max_aiv_cores=limit, pieces=16)
     impls["g0l0"]._full_graph_transfers[2].load.assert_not_called()
 
 
@@ -303,9 +336,10 @@ def test_gate_rejects_overlapping_edges_duplicate_and_nested_windows(runtime):
 
 @pytest.mark.parametrize("gated", [False, True])
 @pytest.mark.parametrize("key", [Key(), Key(query_profile="fixed")])
-def test_indexer_group_forks_once_and_waits_for_each_consumers_own_kv(runtime, gated, key):
+@pytest.mark.parametrize("limit", [0, 24])
+def test_indexer_group_forks_once_and_waits_for_each_consumers_own_kv(runtime, gated, key, limit):
     module, log = runtime
-    groups, impls, caches = topology((1, 4, 2, 3))
+    groups, impls, caches = topology((1, 4, 2, 3), max_aiv_cores=limit)
     owner = module.SharedRetrievalOverlap(main_gate=gated, multi_layer=True, pieces=4)
     owner.configure(tuple(impls.items()), groups, caches)
     owner.prepare(key, tuple(impls.items()), groups, 4)
@@ -329,6 +363,7 @@ def test_indexer_group_forks_once_and_waits_for_each_consumers_own_kv(runtime, g
                 plane.fill_(-1)
 
             def load(tokens, numbers, targets, *, cache=caches[name], layer=index, seen=payloads, **kw):
+                assert kw["max_aiv_cores"] == limit
                 seen.append((tokens, numbers, targets))
                 for lane, n in enumerate(numbers.tolist()):
                     for p, plane in enumerate(cache):
@@ -562,6 +597,26 @@ def test_main_gate_configuration(runtime, monkeypatch):
     monkeypatch.setenv("VLLM_ASCEND_SFA_PREFETCH_MAIN_GATE", "2")
     with pytest.raises(ValueError, match="0 or 1"):
         _ = env.VLLM_ASCEND_SFA_PREFETCH_MAIN_GATE
+
+
+@pytest.mark.parametrize(("raw", "expected"), [
+    (None, 0), ("", 0), ("auto", 0), ("default", 0), ("0", 0), ("12", 12),
+    (" 24 ", 24), ("40", 40), ("4294967295", 4294967295), ("-1", None), ("4294967296", None),
+])
+def test_decode_copy_core_configuration(monkeypatch, raw, expected):
+    monkeypatch.setitem(sys.modules, "vllm.v1.core.dsa_shared_pool", NS(layerwise_prefill_bank_count=lambda: 4))
+    env = load_module(ROOT / "vllm_ascend/envs.py", "copy_core_envs", monkeypatch)
+    name = "VLLM_ASCEND_SFA_COPY_MAX_AIV_CORES"
+    if raw is None:
+        monkeypatch.delenv(name, raising=False)
+    else:
+        monkeypatch.setenv(name, raw)
+    if expected is None:
+        with pytest.raises(ValueError, match=name):
+            _ = env.VLLM_ASCEND_SFA_COPY_MAX_AIV_CORES
+    else:
+        actual = env.VLLM_ASCEND_SFA_COPY_MAX_AIV_CORES
+        assert actual == expected
 
 
 def test_priority_identifies_only_one_new_queue_and_verifies_piece_count(monkeypatch):
@@ -852,12 +907,14 @@ def test_pre_joins_before_any_consumer_cache_access():
     assert log == ["join", "cache"]
 
 
-def test_serial_retrieve_suppressed_only_for_incoming_full_graph_edge():
+@pytest.mark.parametrize("limit", [0, 12, 24, 40])
+def test_serial_retrieve_suppressed_only_for_incoming_full_graph_edge(limit):
     context = NS(staged_sfa_graph_key=Key(), sfa_full_graph_active=True)
     retrieve = extract(SOURCE, "cross_layer_lmcache_retrieve",
                        {"_staged_sfa_profile_scope": lambda _: nullcontext()})
     load = Mock()
-    impl = NS(_retrieval_overlap=object(), _shared_retrieval_edges=lambda: ({"consumer": object()}, {}),
+    impl = NS(_retrieval_overlap=object(), sfa_copy_max_aiv_cores=limit,
+              _shared_retrieval_edges=lambda: ({"consumer": object()}, {}),
               _full_graph_transfer=NS(load=load))
     data = torch.ones(2, 4)
     retrieve(impl, "producer", "consumer", data, data, data, NS(), context)
@@ -866,6 +923,7 @@ def test_serial_retrieve_suppressed_only_for_incoming_full_graph_edge():
     impl._retrieval_overlap = None
     retrieve(impl, "consumer", "", data, data, data, NS(), context)
     assert load.call_count == 2
+    assert all(call.kwargs == {"max_aiv_cores": limit} for call in load.call_args_list)
 
 
 @pytest.mark.parametrize("active", [False, True])
@@ -954,7 +1012,7 @@ def test_each_layer_copies_once_with_layer_specific_values(runtime, active):
     copies = []
     for layer, name in enumerate(groups[0].members):
         def load(indices, lengths, destinations, *, layer=layer, name=name, max_aiv_cores=0):
-            assert max_aiv_cores == (0 if layer == 0 else 12)
+            assert max_aiv_cores == 0
             copies.append(name)
             for p, tensor in enumerate(caches[name]):
                 tensor.view(-1, tensor.shape[-1])[:active].fill_(layer + p + 1)
