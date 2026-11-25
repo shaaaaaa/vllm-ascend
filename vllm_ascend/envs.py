@@ -34,6 +34,14 @@ def _strict_bool_env(name: str, default: bool = False) -> bool:
         return False
     raise ValueError(f"{name} must be 'true' or 'false', got {raw!r}")
 
+
+def _sfa_prefetch_moe_gate() -> bool:
+    value = os.getenv("VLLM_ASCEND_SFA_PREFETCH_MOE_GATE", "0")
+    if value not in {"0", "1"}:
+        raise ValueError("VLLM_ASCEND_SFA_PREFETCH_MOE_GATE must be 0 or 1")
+    return value == "1"
+
+
 # The begin-* and end* here are used by the documentation generator
 # to extract the used env vars.
 
@@ -188,9 +196,14 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_SFA_SHARED_RETRIEVAL_OVERLAP": lambda: bool(
         int(os.getenv("VLLM_ASCEND_SFA_SHARED_RETRIEVAL_OVERLAP", "0"))
     ),
-    # Experiment knobs (non-sensitive, D only). One task by default. Valid
-    # piece counts run from 1 to the graph's packed token capacity.
-    "VLLM_ASCEND_SFA_PREFETCH_PIECES": lambda: int(os.getenv("VLLM_ASCEND_SFA_PREFETCH_PIECES", "1")),
+    # D only, non-sensitive, restart to recapture. With the MoE gate enabled
+    # use eight pieces by default; an explicit count must be >=2 for this mode.
+    "VLLM_ASCEND_SFA_PREFETCH_PIECES": lambda: int(os.getenv(
+        "VLLM_ASCEND_SFA_PREFETCH_PIECES", "8" if _sfa_prefetch_moe_gate() else "1"
+    )),
+    # 0 (default) or 1. Pause background pieces during fused MoE in the
+    # target decode graph. Non-sensitive; restart D workers after changing.
+    "VLLM_ASCEND_SFA_PREFETCH_MOE_GATE": _sfa_prefetch_moe_gate,
     # 0 keeps the existing priority; 1 sets and reads back the graph-owned
     # prefetch queue's lowest device priority at startup (CANN 9.1).
     "VLLM_ASCEND_SFA_PREFETCH_LOW_PRIORITY": lambda: bool(

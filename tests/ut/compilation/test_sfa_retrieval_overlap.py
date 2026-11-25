@@ -14,7 +14,7 @@ from unittest.mock import Mock
 import pytest
 import torch
 
-from sfa_test_support import extract, load_module
+from sfa_test_support import definitions, extract, load_module
 from test_sfa_full_graph import graph_module as graph_fixture
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -114,6 +114,106 @@ def test_prefetch_pieces_only_split_the_side_transfer(runtime):
     first.join()
     first.transfer.load.assert_called_once_with(selected, counts, slots, max_aiv_cores=12, pieces=16)
     impls["g0l0"]._full_graph_transfers[2].load.assert_not_called()
+
+
+def test_moe_gate_tracks_one_prefetch_and_reopens_before_join(runtime, monkeypatch):
+    module, log = runtime
+    def write(word, allowed):
+        log.append(("gate", torch.npu.current_stream().name, word.data_ptr(), allowed))
+
+    monkeypatch.setitem(sys.modules, "lmcache_ascend.c_ops", NS(set_sparse_graph_prefetch_allowed=write))
+    groups, impls, caches = topology((3,))
+    owner = module.SharedRetrievalOverlap(pieces=8, moe_gate=True)
+    owner.configure(tuple(impls.items()), groups, caches)
+    a, b, large = Key(), Key(query_profile="fixed"), Key(token_capacity=9)
+    for key in (a, b, large):
+        owner.prepare(key, tuple(impls.items()), groups, 4)
+    assert large not in owner.gates
+    gate = owner.gates[a]
+    first, second = owner.outgoing[a].values()
+    assert first.gate is second.gate is gate
+    assert gate.word.data_ptr() != owner.gates[b].word.data_ptr()
+    context = NS(sfa_moe_prefetch_gate=gate)
+    ns = {"get_forward_context": lambda: context}
+    definitions(ROOT / "vllm_ascend/ops/fused_moe/fused_moe.py", ["forward_impl"], ns, class_name="AscendMoERunner")
+    layer = NS(forward_impl=lambda x, logits: log.append(("experts and child join",)) or (x, logits))
+    data = torch.zeros((1, 4), dtype=torch.int32)
+    def moe():
+        return ns["forward_impl"](None, layer, data, data, None)
+
+    log.clear()
+    assert moe() == (data, data)
+    assert log == [("experts and child join",)]
+    first.launch(data, data, data, first.destinations)
+    first.transfer.load.assert_called_once_with(data, data, data, max_aiv_cores=12, pieces=4, gate_word=gate.word)
+    with pytest.raises(RuntimeError, match="two prefetch edges"):
+        second.launch(data, data, data, second.destinations)
+    with pytest.raises(RuntimeError, match="missing its consumer join"):
+        owner.finish_gate_capture(a, gate)
+    log.clear()
+    assert moe() == (data, data)
+    layer.forward_impl = Mock(side_effect=ValueError("MoE capture failed"))
+    with pytest.raises(ValueError, match="MoE capture failed"):
+        moe()
+    first.join()
+    closed, opened = (("gate", "main", gate.word.data_ptr(), value) for value in (False, True))
+    assert log == [closed, ("experts and child join",), opened, closed, opened, ("wait", "main")]
+    assert gate.protected_moes == 2 and not owner.gates[b].pending
+    owner.finish_gate_capture(a, gate)
+    owner.clear()
+    assert not owner.gates
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_target_capture_initializes_private_moe_gate_and_restores_context(graph_module, fail):
+    module, context, captures, _ = graph_module
+    wrapper = module.SFAFullGraph()
+    order = []
+    previous = object()
+    context.sfa_moe_prefetch_gate = previous
+    gate = NS(set_allowed=lambda state: order.append(("write", state)))
+    wrapper.retrieval_overlap = NS(moe_gate=True, gates={"q2": gate},
+                                   finish_gate_capture=lambda *args: order.append(("finish",)))
+    def target(input_ids):
+        assert context.sfa_moe_prefetch_gate is gate
+        order.append(("model",))
+        if fail:
+            raise ValueError("capture aborted")
+        return input_ids
+
+    data = torch.ones(1)
+    if fail:
+        with pytest.raises(ValueError, match="capture aborted"):
+            wrapper.run(target, input_ids=data)
+        assert order == [("write", True), ("model",)]
+    else:
+        wrapper.run(target, input_ids=data)
+        wrapper.seal(("q2",))
+        context.staged_sfa_graph_dummy_run = False
+        wrapper.run(target, input_ids=data)
+        assert captures[0][0].replay.call_count == 1
+        assert order == [("write", True), ("model",), ("finish",)]
+    assert context.sfa_moe_prefetch_gate is previous
+
+
+def test_moe_gate_configuration(runtime, monkeypatch):
+    module, _ = runtime
+    monkeypatch.setitem(sys.modules, "vllm.v1.core.dsa_shared_pool", NS(layerwise_prefill_bank_count=lambda: 4))
+    env = load_module(ROOT / "vllm_ascend/envs.py", "sfa_gate_envs", monkeypatch)
+    monkeypatch.delenv("VLLM_ASCEND_SFA_PREFETCH_PIECES", raising=False)
+    monkeypatch.delenv("VLLM_ASCEND_SFA_PREFETCH_MOE_GATE", raising=False)
+    assert not env.VLLM_ASCEND_SFA_PREFETCH_MOE_GATE and env.VLLM_ASCEND_SFA_PREFETCH_PIECES == 1
+    monkeypatch.setenv("VLLM_ASCEND_SFA_PREFETCH_MOE_GATE", "1")
+    assert env.VLLM_ASCEND_SFA_PREFETCH_MOE_GATE and env.VLLM_ASCEND_SFA_PREFETCH_PIECES == 8
+    monkeypatch.setenv("VLLM_ASCEND_SFA_PREFETCH_PIECES", "4")
+    assert env.VLLM_ASCEND_SFA_PREFETCH_PIECES == 4
+    with pytest.raises(ValueError, match="two prefetch pieces"):
+        module.SharedRetrievalOverlap(1, moe_gate=True)
+    with pytest.raises(ValueError, match="LOW_PRIORITY=0"):
+        module.SharedRetrievalOverlap(4, True, moe_gate=True)
+    monkeypatch.setenv("VLLM_ASCEND_SFA_PREFETCH_MOE_GATE", "2")
+    with pytest.raises(ValueError, match="0 or 1"):
+        _ = env.VLLM_ASCEND_SFA_PREFETCH_MOE_GATE
 
 
 def test_priority_identifies_only_one_new_queue_and_verifies_piece_count(monkeypatch):

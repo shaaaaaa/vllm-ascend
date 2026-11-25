@@ -1,10 +1,7 @@
 # Experimental shared-layer retrieval overlap
 
-Branch: `feat/shared-layer-retrieval-overlap`, based on
-`integration/decode-full-graph-production` at `1611dc8f`.
-
-This is a **default-off Python scheduling experiment**, not a new KV transfer
-kernel. It retrieves the next shared-indexer layer's historical Group-0 misses
+On `dev-lmy`, the optional overlap schedule retrieves the next
+shared-indexer layer's historical Group-0 misses
 while the current layer runs value/output projections and MLP. Newly generated
 KV still comes from that layer's ordinary pre-compute. Top-k, resident eviction,
 Group-1 loading, Mooncake placement and request admission are unchanged.
@@ -27,7 +24,7 @@ performance logging and request workload identical between runs.
 
 The original overlap scheduling change was Python-only. The later selective
 AIV policy requires updating both vLLM-Ascend and LMCache-Ascend on
-`feat/shared-layer-retrieval-overlap`, then rebuilding **LMCache-Ascend** and
+`dev-lmy`, then rebuilding **LMCache-Ascend** and
 restarting workers. It adds an optional native `max_aiv_cores` argument; the
 vLLM-Ascend native extension does not change for this policy.
 
@@ -40,6 +37,42 @@ the earlier blanket 12-AIV cap, which increased measured serial retrieval
 latency from about 80 to 140 microseconds in the reported workload.
 
 ## Schedule and integration
+
+### Pause background copy during fused MoE on CANN 8.5.1
+
+With full graphs, shared resident planning and retrieval overlap enabled on D,
+set the following in each D worker's launch environment and restart it.
+
+```bash
+export VLLM_ASCEND_SFA_PREFETCH_MOE_GATE=1
+```
+
+The gate defaults to off. Enabling it selects eight pieces per eligible
+background transfer by default. `VLLM_ASCEND_SFA_PREFETCH_PIECES` overrides
+that count with a value of at least two. Small packed inputs use at most one
+piece per available slot. Leave `VLLM_ASCEND_SFA_PREFETCH_LOW_PRIORITY` at
+its default of zero. Update both Ascend repositories and rebuild the
+LMCache-Ascend native extension before starting the workers.
+
+The target graph opens a private 64-bit device word before its first fork.
+After SFA, the copy stream checks that word before each piece and can run
+alongside V-up and output projection. At a layer with an outstanding
+prefetch, the main stream closes the word on entry to the fused MoE operator
+and reopens it after expert dispatch, grouped matmul, combine and any shared
+expert stream join. One previously admitted piece can finish in that interval.
+Outer router-logit projection and model-level output processing can overlap
+copy. The next attention layer waits for all pieces before accessing its KV.
+Replay performs the waits and writes on the device. The capture log reports
+the graph key, prefetch edge count, piece limit and number of protected MoEs.
+
+Use the existing serving benchmark to compare unprofiled TPOT and batch
+makespan, then export a separate MindStudio batch. The per-rank summary
+includes `dispatch_to_combine_copy_overlap`, `pieces_started_dispatch_to_combine_histogram`
+and `join_wait_for_copy`. The first two use the visible dispatch and combine
+kernels as boundaries. The last estimates the exposed copy tail at the next
+attention layer. See the [decode benchmark](../../../../tools/bench_decode_copy_scheduling.md).
+
+### Producer and consumer
 
 For an eligible edge `L0 -> L1` in an active shared resident group:
 

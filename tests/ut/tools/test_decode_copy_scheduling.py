@@ -41,7 +41,8 @@ def test_failed_streams_are_excluded(clients, chunks):
         bench.receive(chunks, 0, 2)
 
 
-def test_copy_pieces_match_the_graph_fork_and_consumer_join(clients, tmp_path):
+@pytest.mark.parametrize("opens_with_gate", [False, True])
+def test_copy_pieces_match_the_graph_fork_and_consumer_join(clients, tmp_path, opens_with_gate):
     _, gaps = clients
     events = [{"ph": "M", "name": "process_name", "pid": 8, "args": {"name": "Ascend Hardware"}}]
 
@@ -58,19 +59,23 @@ def test_copy_pieces_match_the_graph_fork_and_consumer_join(clients, tmp_path):
             }
         )
 
-    task(0, 1, "Cast", "AI_VECTOR_CORE", 0)
+    if opens_with_gate:
+        task(0, 1, "MEM_WRITE_VALUE", "MEM_WRITE_VALUE", 0)
+    else:
+        task(0, 1, "Cast", "AI_VECTOR_CORE", 0)
     task(1, 1, "RmsNorm_input", "AI_VECTOR_CORE", 1)
     task(2, 1, "KvRmsNormRopeCache", "AI_VECTOR_CORE", 2)
     task(3, 3, "SparseFlashAttention", "MIX_AIC", 3)
     task(6, 1, "CAPTURE_RECORD", "CAPTURE_RECORD", 4)
     task(8, 1, "NOTIFY_RECORD", "NOTIFY_RECORD", 5)
     task(10, 6, "MoeDistributeDispatch", "MIX_AIV", 6)
-    task(20, 1, "AddRmsNormBias_input", "AI_VECTOR_CORE", 7)
-    task(22, 1, "CAPTURE_WAIT", "CAPTURE_WAIT", 8)
-    task(24, 1, "KvRmsNormRopeCache", "AI_VECTOR_CORE", 9)
-    task(25, 2, "SparseFlashAttention", "MIX_AIC", 10)
-    task(28, 1, "SwiGlu", "AI_VECTOR_CORE", 11)
-    task(30, 1, "AddRmsNormBias_final", "AI_VECTOR_CORE", 12)
+    task(17, 2, "MoeDistributeCombine", "MIX_AIV", 7)
+    task(20, 1, "AddRmsNormBias_input", "AI_VECTOR_CORE", 8)
+    task(22, 1, "CAPTURE_WAIT", "CAPTURE_WAIT", 9)
+    task(24, 1, "KvRmsNormRopeCache", "AI_VECTOR_CORE", 10)
+    task(25, 2, "SparseFlashAttention", "MIX_AIC", 11)
+    task(28, 1, "SwiGlu", "AI_VECTOR_CORE", 12)
+    task(30, 1, "AddRmsNormBias_final", "AI_VECTOR_CORE", 13)
     for index, (start, duration) in enumerate(((7.2, 2.2), (9.6, 2), (13, 1), (21.4, 1.1))):
         task(start, duration, "sfa_copy_piece_i32_s64", "AI_VECTOR_CORE", 30 + index, stream=7)
     trace = tmp_path / "trace.json"
@@ -82,4 +87,10 @@ def test_copy_pieces_match_the_graph_fork_and_consumer_join(clients, tmp_path):
     assert samples[0]["join_wait_for_copy"] == 500
     assert samples[0]["pieces_started_after_notify_before_dispatch"] == 1
     assert samples[0]["pieces_started_during_dispatch"] == 1
+    assert summary["pieces_started_dispatch_to_combine_histogram"] == {1: 1}
+    assert samples[0]["dispatch_to_combine_copy_overlap"] == 2600
+    assert samples[0]["fork_to_dispatch"] == 3000
+    assert samples[0]["combine_to_join_arrival"] == 3000
+    assert samples[0]["copy_excess_outside_dispatch_to_combine"] == 300
+    assert summary["copy_fits_outside_dispatch_to_combine"] == 0
     assert layers[1]["async_to_next"] == 0

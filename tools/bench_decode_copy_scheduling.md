@@ -47,7 +47,35 @@ To validate split-copy correctness, build LMCache-Ascend and run its registered-
 python -m pytest -q --confcutdir=tests/v1 tests/v1/test_sparse_graph_transfer_npu.py -k prefetch_pieces
 ```
 
-## Compare three serving configurations
+## Compare serving configurations
+
+### Compare the CANN 8.5.1 MoE gate
+
+Use the existing 8.5.1 D workers with full target graphs, shared resident
+planning and shared retrieval overlap. Build LMCache-Ascend from the matching
+branch. Set `VLLM_ASCEND_SFA_PREFETCH_MOE_GATE=1` and restart D. With the
+piece count unset this captures eight pieces per eligible background transfer.
+The startup line containing `SFA MoE gate captured` reports the number of
+protected fused MoE calls. A real-data replay smoke test in LMCache-Ascend is
+available with `python -m pytest -q --confcutdir=tests/v1 tests/v1/test_sparse_graph_transfer_npu.py -k moe_gate`.
+
+Run from the selected D instance's container with its serving Python.
+
+```bash
+python tools/bench_decode_copy_scheduling.py \
+  --base-url "$PROXY_URL" --target-d-url "$D_URL" --model "$SERVED_MODEL" \
+  --concurrency 16 --prefix-tokens 8192 --output-tokens 128 \
+  --rounds 1 --capture --profile-dir auto --output "results/moe-gate-$(date +%s)"
+```
+
+To compare against an existing run of the same workload and round count,
+add `--reference results/ungated/metrics.json`. To collect that reference,
+use `VLLM_ASCEND_SFA_PREFETCH_MOE_GATE=0` on D, the deployment's original
+piece count and `--output results/ungated`. Read TPOT and batch makespan
+from the unprofiled rounds and compare `dispatch_to_combine_copy_overlap`
+and `join_wait_for_copy` from the exported per-rank JSON.
+
+### Compare native stream priority
 
 Set the variables in the D worker launch environment. Restart the participating D workers between configurations so each uses the corresponding captured graph.
 

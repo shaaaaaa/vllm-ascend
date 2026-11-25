@@ -225,13 +225,21 @@ def analyze(path, wanted_pid=None, wanted_model=None, wanted_stream=None, expect
     tasks = sorted(devices[pid])
     main = [r for r in tasks if r.stream == stream]
     times = [r.start for r in main]
-    anchors = [(r.start, r.model) for r in main if r.task == 0 and r.model not in (-1, 4294967295)]
+    # A gated graph starts with a stream-value write. Choose each model's
+    # first compute task among the retained device rows, also for adjacent graphs.
+    first_task = {}
+    for r in main:
+        if r.task >= 0 and r.model not in (-1, 4294967295):
+            first_task[r.model] = min(first_task.get(r.model, r.task), r.task)
+    anchors = [(r.start, r.model) for r in main if first_task.get(r.model) == r.task]
     if not anchors:
-        raise ValueError("target replay task 0 is absent")
+        raise ValueError("target replay has no device task anchor")
     stages, wanted = [], set()
     incomplete = 0
     moe = [r for r in main if "moedistributedispatch" in r.name.lower()]
     moe_times = [r.start for r in moe]
+    combines = [r for r in main if "moedistributecombine" in r.name.lower()]
+    combine_times = [r.start for r in combines]
     wanted.update((kind, r.task - 1) for r in moe if r.model == model for kind in ("NOTIFY_WAIT", "NOTIFY_RECORD"))
     for i, (start, m) in enumerate(anchors):
         if m != model:
@@ -336,6 +344,18 @@ def analyze(path, wanted_pid=None, wanted_model=None, wanted_stream=None, expect
                         (r.stop - d.start for r in parts if r.start <= d.start < r.stop), default=0
                     )
                     s["pieces_started_during_dispatch"] = sum(d.start <= r.start < d.stop for r in parts)
+                    first = bisect.bisect_left(combine_times, d.stop)
+                    last = bisect.bisect_left(combine_times, deadline)
+                    if last == first + 1 and combines[first].stop <= deadline:
+                        end = combines[first].stop
+                        s["dispatch_to_combine_copy_overlap"] = sum(
+                            max(0, min(r.stop, end) - max(r.start, d.start)) for r in parts
+                        )
+                        s["pieces_started_dispatch_to_combine"] = sum(d.start <= r.start < end for r in parts)
+                        s["fork_to_dispatch"] = d.start - ready
+                        s["combine_to_join_arrival"] = deadline - end
+                        outside = s["fork_to_dispatch"] + s["combine_to_join_arrival"]
+                        s["copy_excess_outside_dispatch_to_combine"] = max(0, copy - outside)
                     preceding_notify = controls[step].get(("NOTIFY_WAIT", d.task - 1)) or controls[step].get(
                         ("NOTIFY_RECORD", d.task - 1)
                     )
@@ -357,6 +377,10 @@ def analyze(path, wanted_pid=None, wanted_model=None, wanted_stream=None, expect
         "margin_to_join",
         "uncovered_if_only_aiv_gaps",
         "dispatch_overlap",
+        "dispatch_to_combine_copy_overlap",
+        "fork_to_dispatch",
+        "combine_to_join_arrival",
+        "copy_excess_outside_dispatch_to_combine",
         "dispatch_device",
         "copy_left_at_dispatch_start",
         "notify_end_to_dispatch_start",
@@ -393,9 +417,19 @@ def analyze(path, wanted_pid=None, wanted_model=None, wanted_stream=None, expect
         "fit_total_aiv_gap": sum(s["fit"] for s in edge_samples),
         "fit_largest_aiv_gap": sum(s["fit_contiguous"] for s in edge_samples),
         "copy_pieces_per_edge": dict(Counter(s["pieces"] for s in edge_samples)),
+        "copy_fits_outside_dispatch_to_combine": sum(
+            s.get("copy_excess_outside_dispatch_to_combine") == 0 for s in edge_samples
+        ),
         "individual_copy_piece": sample_summary([{"duration": r.stop - r.start} for r in background], "duration"),
         "pieces_started_during_dispatch_histogram": dict(
             Counter(s["pieces_started_during_dispatch"] for s in edge_samples if "pieces_started_during_dispatch" in s)
+        ),
+        "pieces_started_dispatch_to_combine_histogram": dict(
+            Counter(
+                s["pieces_started_dispatch_to_combine"]
+                for s in edge_samples
+                if "pieces_started_dispatch_to_combine" in s
+            )
         ),
         "pieces_started_after_notify_before_dispatch_histogram": dict(
             Counter(
