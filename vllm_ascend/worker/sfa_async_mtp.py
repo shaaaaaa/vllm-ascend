@@ -270,6 +270,7 @@ class AsyncSFAModelRunner(NPUModelRunner):
             or scheduled.finished_req_ids
             or scheduled.scheduled_cached_reqs.resumed_req_ids
             or scheduled.new_block_ids_to_zero
+            or getattr(scheduled, "dcp_indexer_placements", None)
             or scheduled.scheduled_encoder_inputs
             or scheduled.free_encoder_mm_hashes
             or self.num_discarded_requests

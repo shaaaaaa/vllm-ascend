@@ -56,6 +56,7 @@ class AscendMLAAttentionSpec(MLAAttentionSpec):
     dsa_compact_startup_dense_tokens: int = 0
     # Qualified two-group decoder layout. The indexer has one full replica.
     dsa_dcp_size: int | None = None
+    dcp_request_sharding: bool = False
 
     def max_memory_usage_bytes(self, vllm_config: "VllmConfig") -> int:
         if self.dsa_dcp_size is None:
@@ -198,6 +199,7 @@ class AscendMLAAttentionSpec(MLAAttentionSpec):
                         spec.dsa_compact_startup_scratch_tokens,
                         spec.dsa_compact_startup_dense_tokens,
                         spec.dsa_dcp_size,
+                        spec.dcp_request_sharding,
                     )
                     for spec in specs
                 }
@@ -218,6 +220,7 @@ class AscendMLAAttentionSpec(MLAAttentionSpec):
             dsa_compact_startup_scratch_tokens=specs[0].dsa_compact_startup_scratch_tokens,
             dsa_compact_startup_dense_tokens=specs[0].dsa_compact_startup_dense_tokens,
             dsa_dcp_size=specs[0].dsa_dcp_size,
+            dcp_request_sharding=specs[0].dcp_request_sharding,
         )
 
 

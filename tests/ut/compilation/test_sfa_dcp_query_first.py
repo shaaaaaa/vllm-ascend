@@ -365,3 +365,36 @@ def test_benchmark_detects_missing_current_kv_writes(bench, monkeypatch, corrupt
             pipeline.check_transfer()
     else:
         assert pipeline.check_transfer() == [3]
+
+
+def test_indexer_benchmark_replicated_padding_preserves_null_page(monkeypatch):
+    monkeypatch.syspath_prepend(str(ROOT / "benchmarks/ops"))
+    from benchmark_sfa_dcp_indexer_sharding import IndexerPipeline
+
+    def scatter(cache, slots, values):
+        cache.index_copy_(0, slots.flatten(), values)
+
+    monkeypatch.setitem(sys.modules, "torch_npu", NS(npu_scatter_nd_update_=scatter))
+    mask = extract(ROOT / "vllm_ascend/attention/sfa_v1.py", "_mask_staged_index_scatter_padding", {"torch": torch})
+    rows = torch.tensor([0, -1])
+    key_cache, scale_cache = torch.zeros(2, 4), torch.ones(2, 1)
+    keys, scales = torch.tensor([[1.0] * 4, [9.0] * 4]), torch.tensor([[3.0], [7.0]])
+    pipeline = NS(
+        rows=rows,
+        tokens=2,
+        group=None,
+        owner_rows=None,
+        attention_ends=None,
+        idx_table=None,
+        idx_cache=(None, None, key_cache, scale_cache),
+        idx_frames={rows.data_ptr(): (rows, None, torch.tensor([1, 0]))},
+        prepare=lambda result: result,
+        indexer=NS(
+            _mask_staged_index_scatter_padding=mask,
+            indexer_select_pre_process=lambda *a: (keys, scales),
+            indexer_select_post_process=lambda *a, **kw: rows.view(2, 1, 1),
+        ),
+    )
+    IndexerPipeline.prepare_producer(pipeline, (rows, rows), None, None, None, None)
+    assert torch.equal(key_cache[1], keys[0]) and torch.equal(scale_cache[1], scales[0])
+    assert key_cache[0].eq(0).all() and scale_cache[0].eq(1).all()

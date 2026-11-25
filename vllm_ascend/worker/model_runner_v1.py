@@ -24,7 +24,7 @@ from collections import defaultdict
 from collections.abc import Iterator
 from contextlib import contextmanager, nullcontext
 from copy import copy, deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from multiprocessing import Manager
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeAlias
 
@@ -477,6 +477,8 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                 output.finished_sending, output.finished_recving = (
                     connector.get_finished(scheduler_output.finished_req_ids)
                 )
+                if output.finished_recving and hasattr(connector, "take_dcp_received"):
+                    output.dcp_received = connector.take_dcp_received()
                 output.invalid_block_ids = (
                     connector.get_block_ids_with_load_errors()
                 )
@@ -516,6 +518,8 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
             output.finished_sending, output.finished_recving = (
                 connector.get_finished(finished_req_ids or set())
             )
+            if output.finished_recving and hasattr(connector, "take_dcp_received"):
+                output.dcp_received = connector.take_dcp_received()
             output.invalid_block_ids = (
                 connector.get_block_ids_with_load_errors()
             )
@@ -936,6 +940,12 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                 # A resumed request can receive the same block IDs with new
                 # contents. The allocation signature alone cannot detect that.
                 registry.invalidate(scheduler_output.preempted_req_ids)
+        placements = getattr(scheduler_output, "dcp_indexer_placements", None)
+        if placements is not None:
+            from vllm_ascend.worker.dcp_indexer import bind_block_tables
+            bind_block_tables(scheduler_output, self._dcp_indexer_owners, self.dcp_rank)
+            if placements:
+                self._dcp_indexer_workspace.signature = None
         super()._update_states(scheduler_output)
 
     def _reject_work_after_preemption_failure(self, *args, **kwargs):
@@ -1009,13 +1019,31 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                 or (graph_key is not None and graph_key.query_profile == StagedSFAQueryProfile.DECODE_BOUNDED)
             ):
                 planner_counts = self._dsa_dcp_planner_counts[:request_capacity * width]
+        owner_rows = None
+        workspace = getattr(self, "_dcp_indexer_workspace", None)
+        if workspace is not None:
+            owners = ([self._dcp_indexer_owners[req][0] for req in requests]
+                      if scheduler_output is not None else [])
+            starts = self.query_start_loc.np[:num_reqs + 1]
+            if graph_key is None:
+                loads = [0] * self.dcp_size
+                for owner, width in zip(owners, np.diff(starts)):
+                    loads[owner] += int(width)
+                packed_tokens = max(1, max(loads))
+                packed_requests = max(1, max((owners.count(r) for r in range(self.dcp_size))))
+            else:
+                packed_requests = graph_key.owner_capacity or request_capacity
+                packed_tokens = packed_requests * graph_key.max_query_len
+            owner_rows = workspace.update(owners, starts, self.dcp_rank, self.dcp_size,
+                                          packed_requests, packed_tokens, padded_tokens,
+                                          requests if scheduler_output is not None else ())
         return DcpSFABatch(
             ResidentDcpLayout(self.dcp_size, self.dcp_rank, origin_view, planner_counts),
             lengths.copy_to_gpu(request_capacity), self.positions.gpu[:padded_tokens],
             self._dsa_dcp_topk[:padded_tokens], counts,
             (self._dsa_dcp_topk[:num_reqs, 0, :0],
              self._dsa_dcp_zero_counts[:num_reqs], self._dsa_dcp_empty_slots[:num_reqs]),
-            rows, boundary, packed_rows,
+            rows, boundary, packed_rows, owner_rows=owner_rows,
         ), tuple(frontiers)
 
     def _prepare_resident_request_state(
@@ -5068,6 +5096,13 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
             not in self._staged_sfa_graph_capture_sizes
         ):
             return native(StagedSFARouteReason.PADDED_BATCH, "padding_capacity_or_capture_bucket")
+        if getattr(self, "_dcp_indexer_workspace", None) is not None and (
+            self.parallel_config.data_parallel_size == 1 or self._sfa_independent is not None
+        ):
+            per_owner = cdiv(graph_key.request_capacity, self.dcp_size)
+            owners = [self._dcp_indexer_owners[r][0] for r in self.input_batch.req_ids[:num_reqs]]
+            if per_owner < graph_key.request_capacity and max(owners.count(i) for i in range(self.dcp_size)) <= per_owner:
+                graph_key = replace(graph_key, owner_capacity=per_owner)
         expected_descriptor = graph_key.to_legacy_batch_descriptor()
         if batch_descriptor != expected_descriptor:
             return native(
@@ -6865,6 +6900,10 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                     scratch_blocks = cdiv(scratch, blocks_per_bundle) * blocks_per_bundle
                     max_num_blocks_per_req += scratch_blocks
                     self._dsa_dcp_scratch_origin = scratch_blocks * block_sizes[i]
+                    if getattr(kv_cache_config.kv_cache_groups[1].kv_cache_spec, "dcp_request_sharding", False):
+                        from vllm_ascend.worker.dcp_indexer import OwnerWorkspace
+                        self._dcp_indexer_owners = {}
+                        self._dcp_indexer_workspace = OwnerWorkspace(self)
                     self._dsa_dcp_origins = self._make_buffer(self.max_num_reqs, dtype=torch.int32)
                     self._dsa_dcp_live_origins = self._dsa_dcp_origins.np
                     self._dsa_dcp_seq_lens = self._make_buffer(self.max_num_reqs, dtype=torch.int32)
@@ -7215,6 +7254,7 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                     cache_dtype_str=self.vllm_config.cache_config.cache_dtype,
                     cache_sparse_c8=self.use_sparse_c8_indexer,
                     dsa_dcp_size=1 if dcp is not None else None,
+                    dcp_request_sharding=bool(dcp and getattr(self.vllm_config, "_dsa_decoder_indexer_sharding", False)),
                 )
 
             elif isinstance(attn_module, MambaBase):
@@ -7593,7 +7633,12 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
         if not sfa_full_graph_enabled(self.vllm_config):
             return (uniform,)
         # Keep the bounded variant for mixed/Q1 MTP batches and idle DP peers.
-        return (uniform, StagedSFAGraphKey.bounded_decode(token_capacity // width, width))
+        keys = (uniform, StagedSFAGraphKey.bounded_decode(token_capacity // width, width))
+        if getattr(self, "_dcp_indexer_workspace", None) is not None:
+            per_owner = cdiv(uniform.request_capacity, self.dcp_size)
+            if per_owner < uniform.request_capacity:
+                keys += tuple(replace(key, owner_capacity=per_owner) for key in keys)
+        return keys
 
     def _staged_sfa_dummy_graph_key(self, token_capacity: int | None, *, dp_idle: bool) -> StagedSFAGraphKey | None:
         if token_capacity is None:
@@ -7605,7 +7650,8 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
             return capture_key
         # Idle EP participants require private zero-length attention tables;
         # do not zero the live block tables used by the uniform graph.
-        return self._staged_sfa_capture_keys(token_capacity)[-1]
+        keys = self._staged_sfa_capture_keys(token_capacity)
+        return next((key for key in keys if key.general_for(True)), keys[0])
 
     def _warmup_and_capture(
         self,

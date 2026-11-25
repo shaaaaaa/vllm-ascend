@@ -111,13 +111,9 @@ def test_dcp_draft_group1_scatter_uses_in_bounds_slots(quantized, slots, masked)
     tree = ast.parse(SFA.read_text(encoding="utf8"))
     impl = next(node for node in tree.body if getattr(node, "name", None) == "AscendSFAImpl")
     forward = next(node for node in impl.body if getattr(node, "name", None) == "forward")
-    scatter = next(node for node in forward.body if isinstance(node, ast.If)
+    scatter = next(node.orelse for node in ast.walk(forward) if isinstance(node, ast.If)
                    and any(isinstance(stmt, ast.Assign)
-                           and ast.unparse(stmt.targets[0]) == "actual_tokens" for stmt in node.body))
-    start = next(i for i, stmt in enumerate(scatter.body)
-                 if isinstance(stmt, ast.Assign) and ast.unparse(stmt.targets[0]) == "actual_tokens")
-    end = next(i for i, stmt in enumerate(scatter.body[start:], start)
-               if isinstance(stmt, ast.If) and ast.unparse(stmt.test) == "self.is_kv_producer")
+                           and ast.unparse(stmt.targets[0]) == "actual_tokens" for stmt in node.orelse))
     launches = []
 
     def strict_scatter(cache, indices, values):
@@ -143,7 +139,7 @@ def test_dcp_draft_group1_scatter_uses_in_bounds_slots(quantized, slots, masked)
         kv_cache=(None, None, key_cache, scale_cache),
         torch_npu=NS(npu_scatter_nd_update_=strict_scatter),
     )
-    exec(compile(ast.Module(body=scatter.body[start:end], type_ignores=[]), str(SFA), "exec"), namespace)
+    exec(compile(ast.Module(body=scatter, type_ignores=[]), str(SFA), "exec"), namespace)
     torch.testing.assert_close(key_cache, reference_keys)
     assert len(launches) == (2 if quantized else 1)
     if quantized:

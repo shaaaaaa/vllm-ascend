@@ -778,7 +778,9 @@ def update_aclgraph_sizes(vllm_config: VllmConfig) -> None:
     # streams. Keep the existing communication factors and global headroom.
     resources_per_graph = num_hidden_layers + 1
     if full_sfa_graph_active:
-        resources_per_graph = _SFA_FULL_GRAPH_LAYOUTS * (
+        owner_buckets = 2 if (getattr(parallel_config, "decode_context_parallel_size", 1) > 1
+                              and envs_ascend.VLLM_ASCEND_DSA_DCP_INDEXER_REQUEST_SHARDING) else 1
+        resources_per_graph = owner_buckets * _SFA_FULL_GRAPH_LAYOUTS * (
             1 + int(envs_ascend.VLLM_ASCEND_SFA_SHARED_RETRIEVAL_OVERLAP)
         )
     # For suffix decoding, use the suffix path when no draft_model_config is provided.

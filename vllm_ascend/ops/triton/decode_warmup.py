@@ -268,7 +268,7 @@ def warmup_decode_kernels(runner):
         return
     from vllm_ascend.attention.sfa_v1 import AscendSFAImpl
 
-    seen_queries, seen_rope = set(), set()
+    seen_queries, seen_rope, seen_owner_keys = set(), set(), set()
     for layer in get_layers_from_vllm_config(runner.vllm_config, AttentionLayerBase).values():
         impl = getattr(layer, "impl", None)
         if not isinstance(impl, AscendSFAImpl):
@@ -278,6 +278,16 @@ def warmup_decode_kernels(runner):
             warmup_query(*geometry)
             seen_queries.add(geometry)
         if impl.has_indexer:
+            if getattr(runner, "_dcp_indexer_workspace", None) is not None:
+                from vllm_ascend.ops.triton.sfa_dcp import _store_owner_keys
+
+                key = impl.c8_k_cache_dtype if impl.use_sparse_c8_indexer else runner.dtype
+                scale = impl.c8_k_scale_cache_dtype if impl.use_sparse_c8_indexer else None
+                if (key, scale, impl.head_dim) not in seen_owner_keys:
+                    for slots in (torch.int32, torch.int64):
+                        _compile(_store_owner_keys, torch.int64, torch.bool, slots, key, scale, key, scale,
+                                 1, impl.head_dim, impl.head_dim, 1, 1)
+                    seen_owner_keys.add((key, scale, impl.head_dim))
             for heads in {1, impl.n_head}:
                 geometry = (heads, impl.head_dim, impl.qk_rope_head_dim, impl.is_rope_neox_style, runner.dtype)
                 if geometry not in seen_rope:

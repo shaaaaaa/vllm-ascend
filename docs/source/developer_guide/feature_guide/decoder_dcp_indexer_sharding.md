@@ -6,6 +6,24 @@ orphan: true
 
 **Design proposal for `feat/decoder-dcp-indexer-sharding`.** Give each decoder request one Group-1 owner in its local DCP group. That rank holds every position of the request's indexer keys and scales and computes its Lightning Indexer rows. All DCP ranks receive the ordered global token IDs. Each rank then retrieves and attends to its own Group-0 latent/RoPE stripes. Ownership lasts for one allocation generation, irrespective of the request's batch row.
 
+## Running the experiment
+
+Set `VLLM_ASCEND_DSA_DCP_INDEXER_REQUEST_SHARDING=1` in the **decoder** launch environment and restart the decoder workers. The default is `0`. Use the matching feature checkout in all four repositories. The production receiver uses process storage, asynchronous loading, a persistent direct-HBM Group-1 reader and a shared two-group pool. Startup checks compare the KV spec across TP ranks before allocating the slabs. Existing Mooncake pages can be restored by a new owner.
+
+The following command runs the replicated and owner-sharded C8 paths on the same four test NPUs. Both arms include current cache writes, the resident planner, registered-host H2D, native sparse attention and DCP output exchange across four layers. The result includes replay parity, slowest-rank timing and indexer key/scale storage bytes. Those bytes describe the benchmark tensors. The server retains its configured HBM slab budget.
+
+```bash
+cd /workspace/sqh/vllm-ascend
+HCCL_OP_EXPANSION_MODE=AIV TASK_QUEUE_ENABLE=1 python3 -m torch.distributed.run \
+  --nnodes=1 --nproc-per-node=4 --master-addr=127.0.0.1 --master-port=29571 \
+  benchmarks/ops/benchmark_sfa_dcp_indexer_sharding.py \
+  --lmcache-ascend-dir /workspace/qzy/LMCache-Ascend --requests 1 2 4 8 \
+  --history 16384 --layers 4 --steps 4 --trials 3 --iterations 3 \
+  --json dcp-indexer-balanced.json
+```
+
+Use `--owner-layout skewed --skew-history` to exercise a nonzero owner and empty peers. Use `--replicate-owner-storage` to measure owner computation with replicated history. Both modes use the same shared-index consumer chain.
+
 ## Deployment and memory contract
 
 The supplied GLM-5.3 launcher uses TP4/DCP4 per decoder instance, DP/EP across instances, 128-token blocks and interleave, one MTP draft token, up to 16 requests and 256 scheduled tokens. It enables mixed-capable C8 indexing, full SFA graphs, async MTP preparation, shared plans, retrieval overlap and early query gathering. Its request capture sizes are 2, 4, 8, 12, 14 and 16. The playbook allows 1,048,576 tokens. P uses four-bank prefill and both roles use `kv_both`.

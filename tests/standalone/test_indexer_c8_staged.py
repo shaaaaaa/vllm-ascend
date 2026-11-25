@@ -41,6 +41,7 @@ def test_staged_scatter_keeps_key_scale_pair_and_padding(c8, idle):
     impl = ns["Impl"]()
     impl.use_sparse_c8_indexer = c8
     impl.has_indexer = True
+    impl.dsa_cp_decoder = False
     impl.skip_topk = False
     impl.q_lora_rank = impl.kv_lora_rank = impl.qk_rope_head_dim = 1
     impl.q_a_layernorm = lambda x: x

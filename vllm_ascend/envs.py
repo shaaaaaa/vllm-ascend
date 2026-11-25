@@ -204,6 +204,9 @@ env_variables: dict[str, Callable[[], Any]] = {
     # DCP compact resident slots: 0 (default) evicts unselected old tokens first;
     # 1 fills unused slots first. Does not affect DCP=1 or resident-only loads.
     # Non-sensitive; fixed before capture. Rebuild native ops and restart workers.
+    "VLLM_ASCEND_DSA_DCP_INDEXER_REQUEST_SHARDING": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_DSA_DCP_INDEXER_REQUEST_SHARDING", "0"))
+    ),
     "VLLM_ASCEND_DSA_DCP_FREE_SLOT_FIRST": lambda: bool(
         int(os.getenv("VLLM_ASCEND_DSA_DCP_FREE_SLOT_FIRST", "0"))
     ),

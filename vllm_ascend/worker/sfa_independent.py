@@ -200,7 +200,7 @@ def execution_contract(runner: Any) -> dict[str, Any]:
             if any(select_moe_comm_method(n, config, draft) != MoECommType.MC2 for n in range(1, capacity + 1)):
                 return dict(reason="a legal local extent changes MC2 operator family")
     keys = sorted(
-        (key.token_capacity, key.request_capacity, key.query_profile.value, key.max_query_len) for key in graph.entries
+        (key.token_capacity, key.request_capacity, key.query_profile.value, key.max_query_len, getattr(key, "owner_capacity", 0)) for key in graph.entries
     )
     if not keys or any(key[0] > capacity for key in keys):
         return dict(reason="captured graph capacity exceeds MC2 allocation")
@@ -235,6 +235,7 @@ def execution_contract(runner: Any) -> dict[str, Any]:
                 for path in (
                     "core/mc2_recovery.py",
                     "ops/triton/sfa_dcp.py",
+                    "worker/dcp_indexer.py",
                     "ops/triton/sfa_query.py",
                     "compilation/sfa_retrieval_overlap.py",
                 )

@@ -135,3 +135,23 @@ def test_full_chain_with_real_cpu_sources(layout, padding, tmp_path):
         )
     )
     assert result["parity"] == "passed" and result["copied_bytes"] > 0
+
+
+@pytest.mark.parametrize("quantized", [False, True])
+@torch.inference_mode()
+def test_owner_scatter_masks_foreign_padding_and_rejected_draft_rows(quantized):
+    from vllm_ascend.ops.triton.sfa_dcp import store_owner_keys
+
+    dtype = torch.int8 if quantized else torch.bfloat16
+    keys = torch.arange(4).to("npu", dtype)[:, None].expand(-1, 128).contiguous()
+    scales = torch.arange(4, device="npu", dtype=torch.float16) if quantized else None
+    cache = torch.full((8, 128), 71, device="npu", dtype=dtype)
+    scale_cache = torch.full((8,), -3, device="npu", dtype=torch.float16)
+    take = torch.tensor([3, 0, 1, 2], device="npu")
+    valid = torch.tensor([True, True, True, False], device="npu")
+    slots = torch.tensor([-1, 4, 7, 2], device="npu")
+    planes = (None, None, cache, scale_cache) if quantized else (None, None, cache)
+    store_owner_keys(take, valid, slots, keys, scales, planes)
+    assert cache[:, 0].cpu().tolist() == [71, 71, 0, 71, 2, 71, 71, 71]
+    if quantized:
+        assert scale_cache.cpu().tolist() == [-3, -3, 0, -3, 2, -3, -3, -3]

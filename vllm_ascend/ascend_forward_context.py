@@ -54,6 +54,7 @@ class StagedSFAGraphKey:
     request_capacity: int
     query_profile: StagedSFAQueryProfile
     max_query_len: int
+    owner_capacity: int = 0  # Zero selects the general request capacity.
 
     def __post_init__(self) -> None:
         if self.token_capacity <= 0 or self.request_capacity <= 0 or self.max_query_len <= 0:
@@ -110,6 +111,9 @@ class StagedSFAGraphKey:
             query_profile=StagedSFAQueryProfile.SPEC_FIXED,
             max_query_len=query_width,
         )
+
+    def general_for(self, bounded: bool) -> bool:
+        return self.owner_capacity == 0 and (self.query_profile == StagedSFAQueryProfile.DECODE_BOUNDED) == bounded
 
     def to_legacy_batch_descriptor(self) -> BatchDescriptor:
         """Adapt the structural key to normalized PIECEWISE dispatch."""

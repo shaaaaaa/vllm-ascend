@@ -76,7 +76,7 @@ class SingleAgreement:
         """All ranks finish startup capture before changing the live protocol."""
         signatures = [None] * self.wire.shape[1]
         signature = sorted(
-            (key.token_capacity, key.request_capacity, key.query_profile.value, key.max_query_len) for key in keys
+            (key.token_capacity, key.request_capacity, key.query_profile.value, key.max_query_len, getattr(key, "owner_capacity", 0)) for key in keys
         )
         dist.all_gather_object(signatures, signature, group=self.group)
         if not signature or any(value != signature for value in signatures):
@@ -175,7 +175,10 @@ class SingleAgreement:
         graph = int(batch[1].min()) == CUDAGraphMode.PIECEWISE.value and int(batch[2].max()) == ACTIONS.index(
             StagedSFARouteAction.STAGED
         )
-        key = runner._staged_sfa_capture_keys(int(batch[0].max()))[int(bool(batch[3].max()))] if graph else None
+        key = None
+        if graph:
+            bounded = bool(batch[3].max())
+            key = next(k for k in runner._staged_sfa_capture_keys(int(batch[0].max())) if k.general_for(bounded))
         expected = None
         if key is not None:
             expected = self.expected

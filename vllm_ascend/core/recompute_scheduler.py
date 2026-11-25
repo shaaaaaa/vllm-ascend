@@ -316,6 +316,7 @@ class RecomputeScheduler(Scheduler):
                 continue
 
             # Schedule newly needed KV blocks for the request.
+            defer_growth = False
             with record_function_or_nullcontext("schedule: allocate_slots"):
                 while True:
                     new_blocks = self.kv_cache_manager.allocate_slots(
@@ -332,9 +333,13 @@ class RecomputeScheduler(Scheduler):
                     # Preempt the lowest-priority request.
                     # NOTE: We add the preempted_req to recomputed_reqs in kv_consumer to
                     # drop the request to PD proxy.
+                    candidates = self._kv_preemption_candidates(request, req_index)
+                    if not candidates:
+                        defer_growth = True
+                        break
                     transfer_config = self.vllm_config.kv_transfer_config
                     if transfer_config is not None and not transfer_config.is_kv_producer:
-                        recomputed_req = self.running.pop()
+                        recomputed_req = self._pop_kv_victim(candidates)
                         self._log_request_transition(
                             "recompute_redirect", recomputed_req,
                             cause="kv_allocation_failed", trigger_request_id=request.request_id,
@@ -351,7 +356,7 @@ class RecomputeScheduler(Scheduler):
                     else:
                         if self.policy == SchedulingPolicy.PRIORITY:
                             preempted_req = max(
-                                self.running,
+                                candidates,
                                 key=lambda r: (r.priority, r.arrival_time),
                             )
                             self.running.remove(preempted_req)
@@ -371,7 +376,7 @@ class RecomputeScheduler(Scheduler):
                                     encoder_compute_budget += num_embeds_to_restore
                                 req_index -= 1
                         else:
-                            preempted_req = self.running.pop()
+                            preempted_req = self._pop_kv_victim(candidates)
 
                         if self._checkpoint_capture_enabled and preempted_req.num_output_tokens > 0:
                             self.connector.prepare_preemption_checkpoint((
@@ -394,6 +399,9 @@ class RecomputeScheduler(Scheduler):
                             # No more request to preempt. Cannot schedule this request.
                             break
 
+            if defer_growth:
+                req_index += 1
+                continue
             if new_blocks is None:
                 # Cannot schedule this request.
                 break
@@ -900,6 +908,9 @@ class RecomputeScheduler(Scheduler):
         # 1. Plan the KV cache store
         # 2. Wrap up all the KV cache load / save ops into an opaque object
         # 3. Clear the internal states of the connector
+        dcp_pool = getattr(self.kv_cache_manager.coordinator, "dcp_request_pool", None)
+        if dcp_pool is not None:
+            dcp_pool.prepare_output(scheduler_output)
         if self.connector is not None:
             meta: KVConnectorMetadata = self.connector.build_connector_meta(scheduler_output)
             scheduler_output.kv_connector_metadata = meta

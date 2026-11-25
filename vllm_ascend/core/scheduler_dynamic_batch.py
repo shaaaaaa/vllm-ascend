@@ -227,6 +227,7 @@ class SchedulerDynamicBatch(Scheduler):
                 req_index += 1
                 break
 
+            defer_growth = False
             while True:
                 new_blocks = self.kv_cache_manager.allocate_slots(
                     request, num_new_tokens, num_lookahead_tokens=self.num_lookahead_tokens
@@ -234,16 +235,21 @@ class SchedulerDynamicBatch(Scheduler):
                 if new_blocks is None:
                     # The request cannot be scheduled.
                     # Preempt the lowest-priority request.
+                    candidates = self._kv_preemption_candidates(request, req_index)
+                    if not candidates:
+                        defer_growth = True
+                        can_schedule = False
+                        break
                     if self.policy == SchedulingPolicy.PRIORITY:
                         preempted_req = max(
-                            self.running,
+                            candidates,
                             key=lambda r: (r.priority, r.arrival_time),
                         )
                         self.running.remove(preempted_req)
                         if preempted_req in scheduled_running_reqs:
                             scheduled_running_reqs.remove(preempted_req)
                     else:
-                        preempted_req = self.running.pop()
+                        preempted_req = self._pop_kv_victim(candidates)
 
                     self.kv_cache_manager.free(preempted_req)
                     self.encoder_cache_manager.free(preempted_req)
@@ -262,6 +268,9 @@ class SchedulerDynamicBatch(Scheduler):
                     # The request can be scheduled.
                     can_schedule = True
                     break
+            if defer_growth:
+                req_index += 1
+                continue
             if not can_schedule:
                 break
             assert new_blocks is not None
@@ -616,6 +625,9 @@ class SchedulerDynamicBatch(Scheduler):
         # 1. Plan the KV cache store
         # 2. Wrap up all the KV cache load / save ops into an opaque object
         # 3. Clear the internal states of the connector
+        dcp_pool = getattr(self.kv_cache_manager.coordinator, "dcp_request_pool", None)
+        if dcp_pool is not None:
+            dcp_pool.prepare_output(scheduler_output)
         if self.connector is not None:
             meta = self.connector.build_connector_meta(scheduler_output)
             scheduler_output.kv_connector_metadata = meta

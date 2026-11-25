@@ -485,6 +485,12 @@ class NPUWorker(WorkerBase):
         hf = model.hf_text_config
         transfer = config.kv_transfer_config
         dcp = parallel.decode_context_parallel_size
+        request_sharding = getattr(envs_ascend, "VLLM_ASCEND_DSA_DCP_INDEXER_REQUEST_SHARDING", False)
+        if (dcp > 1 and transfer.is_kv_consumer and not envs_ascend.VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE
+                and request_sharding
+                and not (model.use_mla and hasattr(hf, "index_topk") and envs_ascend.VLLM_ASCEND_DSA_UNBUNDLE
+                         and envs_ascend.VLLM_ASCEND_DSA_TWO_GROUPS)):
+            raise ValueError("Request-owned DCP indexer requires the two-group sparse decoder")
         if (
             dcp == 1 or not transfer.is_kv_consumer or not model.use_mla
             or not hasattr(hf, "index_topk")
@@ -549,6 +555,15 @@ class NPUWorker(WorkerBase):
 
         connector = KVConnectorFactory.get_connector_class(transfer)
         probe = getattr(connector, "get_dsa_compact_startup_policy", None)
+        if request_sharding:
+            from vllm.triton_utils import HAS_TRITON
+            from vllm.v1.core.dcp_indexer_pool import DCP_INDEXER_PLACEMENT_VERSION
+
+            if not HAS_TRITON or DCP_INDEXER_PLACEMENT_VERSION != 1 or getattr(
+                connector, "dcp_indexer_placement_version", 0
+            ) != 1:
+                raise ValueError("Request-owned indexer requires Triton and matching DCP placement support in all four repos")
+        config._dsa_decoder_indexer_sharding = request_sharding
         policy = probe(config) if callable(probe) else None
         if (
             not isinstance(policy, tuple) or len(policy) != 2

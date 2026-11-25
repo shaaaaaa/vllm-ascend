@@ -101,6 +101,9 @@ class QueryFirstPipeline(AttentionPipeline):
             )
         self.rms_norm = torch_npu.npu_rms_norm
 
+    def prepare_producer(self, frame, hidden, q_c, cos, sin):
+        return self.prepare(frame)
+
     def step(self, frame):
         from vllm_ascend.ops.triton.sfa_dcp import execute_sfa_dcp, start_sfa_dcp_query_gather
 
@@ -137,7 +140,7 @@ class QueryFirstPipeline(AttentionPipeline):
                     if not layer or not self.edges:
                         query_ready(q, r)
                 if not layer:
-                    prepared = self.prepare(frame)
+                    prepared = self.prepare_producer(frame, hidden, q_c, cos, sin)
                 self._attend_layer(
                     layer,
                     (q, r),
@@ -183,6 +186,11 @@ class QueryFirstPipeline(AttentionPipeline):
 @torch.inference_mode()
 def main(*, comparison="query-first", pipeline_factory=QueryFirstPipeline, description=__doc__):
     parser = argparse.ArgumentParser(description=description)
+    if comparison == "indexer-sharding":
+        parser.add_argument("--owner-layout", choices=("balanced", "skewed"), default="balanced")
+        parser.add_argument("--skew-history", action="store_true")
+        parser.add_argument("--replicate-owner-storage", action="store_true",
+                            help="isolate owner compute while retaining replicated history in the candidate")
     if comparison == "prefetch-after-pack":
         parser.add_argument(
             "--query-first",
@@ -255,6 +263,9 @@ def main(*, comparison="query-first", pipeline_factory=QueryFirstPipeline, descr
         "configuration": {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
         "cases": [],
     }
+    if comparison == "indexer-sharding":
+        results["scope"] += ", real C8 Lightning Indexer, current key/scale writes, owner ID gather/inverse"
+        results["excludes"] = "quantized projection weights, TP output reduction, MoE, sampling and server scheduling"
     try:
         for layout in args.layouts:
             for requests in args.requests:

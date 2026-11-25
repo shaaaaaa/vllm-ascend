@@ -1,7 +1,7 @@
 import os
 from contextlib import nullcontext
 from copy import copy
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from functools import lru_cache
 from threading import Lock
 from typing import TYPE_CHECKING, Any, TypeVar
@@ -1735,6 +1735,17 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
                 indexer_c8_block_table = indexer_c8_block_table.clone()
                 indexer_c8_slot_mapping = indexer_c8_slot_mapping.clone()
 
+        dcp_batch = getattr(common_attn_metadata, "sfa_dcp", None)
+        owner = getattr(dcp_batch, "owner_rows", None)
+        if owner is not None:
+            if getattr(self, "_indexer_owner_input", None) is not owner:
+                if not hasattr(self, "_indexer_owner_tables"):
+                    self._indexer_owner_tables = []
+                self._indexer_owner_view = owner.bind_tables(
+                    self._indexer_owner_tables, indexer_block_table, indexer_c8_block_table, self._dsa_max_num_reqs
+                )
+                self._indexer_owner_input = owner
+            dcp_batch = replace(dcp_batch, owner_rows=self._indexer_owner_view)
         cos, sin = get_cos_and_sin_mla(input_positions, True)
 
         dsa_cp_context = None
@@ -1806,7 +1817,7 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             indexer_slot_mapping=indexer_slot_mapping,
             indexer_c8_block_table=indexer_c8_block_table,
             indexer_c8_slot_mapping=indexer_c8_slot_mapping,
-            sfa_dcp=getattr(common_attn_metadata, "sfa_dcp", None),
+            sfa_dcp=dcp_batch,
             # DSA latent offload: best-effort; getattr -> None when not threaded in yet
             # (harmless unless the feature is enabled). HW-VERIFY the real source.
             req_ids=getattr(common_attn_metadata, "request_ids", None),
@@ -2722,6 +2733,9 @@ class AscendSFAImpl(MLAAttentionImpl):
         actual_seq_lengths_query: torch.Tensor,
         actual_seq_lengths_key: torch.Tensor,
         indexer_block_table_override: torch.Tensor | None = None,
+        owner_rows=None,
+        model_tokens: int = 0,
+        dcp_group=None,
     ):
         if not self.has_indexer:
             raise RuntimeError(
@@ -2753,6 +2767,11 @@ class AscendSFAImpl(MLAAttentionImpl):
             )
             if self.use_sparse_c8_indexer and attn_metadata.indexer_c8_block_table is not None:
                 indexer_block_table = attn_metadata.indexer_c8_block_table
+        if owner_rows is not None:
+            q_c = owner_rows.pack(q_c)
+            indexer_block_table, actual_seq_lengths_query, actual_seq_lengths_key = owner_rows.score_inputs(
+                indexer_block_table, actual_seq_lengths_key, self.use_sparse_c8_indexer
+            )
         weights, _ = self.weights_proj(x)
 
         q_li, _ = self.wq_b(q_c)  # [b,s,1536] @ [1536,64*128] = [b,s,64*128]
@@ -2825,6 +2844,11 @@ class AscendSFAImpl(MLAAttentionImpl):
                 sparse_count=self.index_topk,
                 sparse_mode=3,
             )
+        if owner_rows is not None:
+            topk_indices = owner_rows.restore(topk_indices, dcp_group or get_dcp_group(), model_tokens)
+            draft = getattr(attn_metadata, "sfa_dcp", None)
+            if draft is not None and draft.mask_indexer_writes:
+                topk_indices = torch.where((draft.positions[:model_tokens] >= 0).view(-1, 1, 1), topk_indices, -1)
         return topk_indices
 
     def _execute_sparse_flash_attention_process(
@@ -3692,12 +3716,12 @@ class AscendSFAImpl(MLAAttentionImpl):
             dim=-1,
         )
         q_c = self.q_a_layernorm(q_c)
+        owner_rows = getattr(dcp, "owner_rows", None)
+        ix, ic, isn = hidden_states, cos, sin
         if self.has_indexer:
-            k_li, k_li_scale = self.indexer_select_pre_process(
-                x=hidden_states,
-                cos=cos,
-                sin=sin,
-            )
+            if owner_rows is not None:
+                ix, ic, isn = (owner_rows.pack(t) for t in (ix, ic, isn))
+            k_li, k_li_scale = self.indexer_select_pre_process(x=ix, cos=ic, sin=isn)
             assert indexer_cache is not None
             kv_cache = (kv_cache_nope, kv_cache_pe, indexer_cache)
             if self.use_sparse_c8_indexer:
@@ -3757,7 +3781,9 @@ class AscendSFAImpl(MLAAttentionImpl):
             if query_ready is not None:
                 query_ready(ql_nope, q_pe)
 
-        if self.has_indexer:
+        if self.has_indexer and owner_rows is not None:
+            owner_rows.store(indexer_slot_mapping, k_li, k_li_scale, kv_cache)
+        elif self.has_indexer:
             if self.use_sparse_c8_indexer:
                 scale_slots, scale_updates = self._mask_staged_index_scatter_padding(
                     indexer_slot_mapping,
@@ -3807,12 +3833,8 @@ class AscendSFAImpl(MLAAttentionImpl):
                     f"layer_name={self.layer_name}."
                 )
             topk_indices = self.indexer_select_post_process(
-                x=hidden_states,
-                q_c=q_c,
-                kv_cache=kv_cache,
-                attn_metadata=None,
-                cos=cos,
-                sin=sin,
+                x=ix, q_c=q_c, kv_cache=kv_cache, attn_metadata=None,
+                cos=ic, sin=isn, owner_rows=owner_rows, model_tokens=hidden_states.shape[0],
                 actual_seq_lengths_query=cp_query_lens if self.dsa_cp_decoder else actual_seq_lengths_query,
                 actual_seq_lengths_key=cp_key_lens if self.dsa_cp_decoder else actual_seq_lengths_key,
                 indexer_block_table_override=indexer_block_table,
@@ -4178,6 +4200,8 @@ class AscendSFAImpl(MLAAttentionImpl):
             inputs["cp_key_lens"] = metadata.dsa_cp_context.actual_seq_lengths_key
         dcp = getattr(metadata, "sfa_dcp", None)
         if dcp is not None:
+            if getattr(dcp, "owner_rows", None) is not None:
+                inputs["owner_rows"] = tuple(vars(dcp.owner_rows).values())
             inputs["dcp"] = (
                 dcp.layout.world_size, dcp.layout.rank, dcp.layout.live_origins, dcp.layout.selected_counts,
                 dcp.local_seq_lens, dcp.positions, dcp.topk, dcp.counts, dcp.row_requests, dcp.split_boundary,
@@ -4819,6 +4843,11 @@ class AscendSFAImpl(MLAAttentionImpl):
         if need_gather_q_kv and not self.enable_dsa_cp:
             hidden_states = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(hidden_states.contiguous(), True)
 
+        owner_rows = getattr(dcp, "owner_rows", None)
+        ix, ic, isn = hidden_states, cos, sin
+        if self.has_indexer and owner_rows is not None:
+            ix, ic, isn = (owner_rows.pack(t) for t in (ix, ic, isn))
+
         # run mlapo ops when dsa-cp is disabled, and ensure that num_tokens satisfies the count limitation
         if self.enable_mlapo and num_input_tokens <= MLAPO_MAX_SUPPORTED_TOKENS:
             # MLAPO writes latent KV inside the fused projection.
@@ -4833,7 +4862,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                 num_input_tokens=num_input_tokens,
             )
             if self.has_indexer:
-                k_li, k_li_scale = self.indexer_select_pre_process(x=hidden_states, cos=cos, sin=sin)
+                k_li, k_li_scale = self.indexer_select_pre_process(x=ix, cos=ic, sin=isn)
             else:
                 k_li, k_li_scale = None, None
         # native
@@ -4852,7 +4881,7 @@ class AscendSFAImpl(MLAAttentionImpl):
             q_c = self.q_a_layernorm(q_c)
 
             if self.has_indexer:
-                k_li, k_li_scale = self.indexer_select_pre_process(x=hidden_states, cos=cos, sin=sin)
+                k_li, k_li_scale = self.indexer_select_pre_process(x=ix, cos=ic, sin=isn)
             else:
                 k_li, k_li_scale = None, None
 
@@ -5033,34 +5062,37 @@ class AscendSFAImpl(MLAAttentionImpl):
             # ``num_input_tokens``.  Padding slots are not cache ownership and
             # may be -1 or stale graph-buffer values, so they must never reach
             # the persistent model-visible indexer cache.
-            actual_tokens = attn_metadata.num_actual_tokens
-            index_slots = idx_slot_mapping[:actual_tokens]
-            keys = k_li[:actual_tokens].view(-1, k_li.shape[-1])
-            key_cache = kv_cache[2].view(-1, keys.shape[-1])
-            key_slots = index_slots
-            mask_indexer_writes = dcp is not None and dcp.mask_indexer_writes
-            if mask_indexer_writes:
-                # Draft rejection leaves -1 slots. ScatterNdUpdate requires
-                # in-bounds indices, so alias them with idempotent writes.
-                key_slots, keys = self._mask_staged_index_scatter_padding(
-                    index_slots, keys, index_slots, key_cache,
-                )
-            torch_npu.npu_scatter_nd_update_(
-                key_cache, key_slots.view(-1, 1), keys,
-            )  # b, s, n, d
-            if self.use_sparse_c8_indexer:
-                assert len(kv_cache) == 4
-                assert k_li_scale is not None
-                scales = k_li_scale[:actual_tokens].view(-1, k_li_scale.shape[-1])
-                scale_cache = kv_cache[3].view(-1, scales.shape[-1])
-                scale_slots = index_slots
+            if owner_rows is not None:
+                owner_rows.store(idx_slot_mapping, k_li, k_li_scale, kv_cache)
+            else:
+                actual_tokens = attn_metadata.num_actual_tokens
+                index_slots = idx_slot_mapping[:actual_tokens]
+                keys = k_li[:actual_tokens].view(-1, k_li.shape[-1])
+                key_cache = kv_cache[2].view(-1, keys.shape[-1])
+                key_slots = index_slots
+                mask_indexer_writes = dcp is not None and dcp.mask_indexer_writes
                 if mask_indexer_writes:
-                    scale_slots, scales = self._mask_staged_index_scatter_padding(
-                        index_slots, scales, index_slots, scale_cache,
+                    # Draft rejection leaves -1 slots. ScatterNdUpdate requires
+                    # in-bounds indices, so alias them with idempotent writes.
+                    key_slots, keys = self._mask_staged_index_scatter_padding(
+                        index_slots, keys, index_slots, key_cache,
                     )
                 torch_npu.npu_scatter_nd_update_(
-                    scale_cache, scale_slots.view(-1, 1), scales,
-                )
+                    key_cache, key_slots.view(-1, 1), keys,
+                )  # b, s, n, d
+                if self.use_sparse_c8_indexer:
+                    assert len(kv_cache) == 4
+                    assert k_li_scale is not None
+                    scales = k_li_scale[:actual_tokens].view(-1, k_li_scale.shape[-1])
+                    scale_cache = kv_cache[3].view(-1, scales.shape[-1])
+                    scale_slots = index_slots
+                    if mask_indexer_writes:
+                        scale_slots, scales = self._mask_staged_index_scatter_padding(
+                            index_slots, scales, index_slots, scale_cache,
+                        )
+                    torch_npu.npu_scatter_nd_update_(
+                        scale_cache, scale_slots.view(-1, 1), scales,
+                    )
             if self.is_kv_producer:
                 attn_metadata.reshape_cache_event.record()
 
@@ -5079,12 +5111,8 @@ class AscendSFAImpl(MLAAttentionImpl):
                         f"layer_name={self.layer_name}."
                     )
                 topk_indices = self.indexer_select_post_process(
-                    x=hidden_states,
-                    q_c=q_c,
-                    kv_cache=kv_cache,
-                    attn_metadata=attn_metadata,
-                    cos=cos,
-                    sin=sin,
+                    x=ix, q_c=q_c, kv_cache=kv_cache, attn_metadata=attn_metadata,
+                    cos=ic, sin=isn, owner_rows=owner_rows, model_tokens=hidden_states.shape[0],
                     actual_seq_lengths_query=actual_seq_lengths_query,
                     actual_seq_lengths_key=actual_seq_lengths_key,
                 )

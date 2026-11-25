@@ -20,6 +20,7 @@ from vllm_ascend.utils import (
 )
 
 if TYPE_CHECKING:
+    from vllm_ascend.worker.dcp_indexer import OwnerRows
     from vllm_ascend.distributed.kv_transfer.sparse_offload.resident_sorted_cache import (
         ResidentDcpLayout,
         SharedResidentPlan,
@@ -173,6 +174,7 @@ class DcpSFABatch:
     compact_rows: torch.Tensor | None
     last_plan: "tuple[SharedResidentPlan, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] | None" = None
     mask_indexer_writes: bool = False
+    owner_rows: "OwnerRows | None" = None
 
 
 def dcp_local_seq_lens(ends: np.ndarray, origins: np.ndarray, block: int, world: int, rank: int) -> np.ndarray:

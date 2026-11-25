@@ -76,6 +76,8 @@ def test_indexer_handoff_precedes_topk_publication_and_latent_attention(p_node, 
         kv_hash_trace=False,
         _dsa_prof=NS(section=lambda name: nullcontext()),
     )
+    # The extracted section starts after forward binds the unsharded indexer inputs.
+    namespace.update(ix=namespace["hidden_states"], ic=namespace["cos"], isn=namespace["sin"], owner_rows=None)
     compile_nodes([indexer], namespace)
     operations.append("latent SFA")
     assert len(events) == int(p_node and has_indexer)

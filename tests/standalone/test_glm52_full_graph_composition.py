@@ -19,7 +19,7 @@ def test_producer_publishes_raw_topk_before_pack_and_consumer_has_no_indexer(bou
                                                            for t in c.targets) for c in n.body)
                   and "npu_scatter_nd_update_" in ast.unparse(n))
     start = next(i for i, n in enumerate(method.body) if isinstance(n, ast.If)
-                 and ast.unparse(n.test) == "self.has_indexer" and "npu_scatter_nd_update_" in ast.unparse(n))
+                 and "indexer_cache.view" in ast.unparse(n) and "npu_scatter_nd_update_" in ast.unparse(n))
     stop = next(i for i, n in enumerate(method.body) if isinstance(n, ast.Assign)
                 and any(isinstance(t, ast.Name) and t.id == "staged_mtp" for t in n.targets))
     class LegacyOnly(ast.NodeTransformer):
@@ -51,7 +51,7 @@ def test_producer_publishes_raw_topk_before_pack_and_consumer_has_no_indexer(bou
         topk.add_(100)  # Deliberately destructive: shared raw indices must survive.
         return topk, boundary, rows, torch.arange(2)
 
-    owner = NS(has_indexer=True, skip_topk=False, index_cache_enabled=shared_model,
+    owner = NS(has_indexer=True, dsa_cp_decoder=False, skip_topk=False, index_cache_enabled=shared_model,
                use_sparse_c8_indexer=False,
                topk_indices_buffer=shared, _indexcache_topk_staging=torch.empty_like(shared),
                _mask_staged_index_scatter_padding=lambda slots, keys, *a: (slots, keys),
@@ -72,7 +72,8 @@ def test_producer_publishes_raw_topk_before_pack_and_consumer_has_no_indexer(bou
     ns = dict(self=owner, torch_npu=NS(npu_scatter_nd_update_=lambda *a: events.append("scatter")),
               indexer_slot_mapping=torch.arange(2), k_li=torch.zeros(2, 4), indexer_cache=torch.zeros(2, 4),
               row_req_indices=torch.arange(2), hidden_states=hidden, q_c=query, kv_cache=None,
-              cos=None, sin=None, actual_seq_lengths_query=torch.tensor([1, 3]), actual_seq_lengths_key=None,
+              ix=hidden, ic=None, isn=None, owner_rows=None, dcp=None, slot_mapping=torch.arange(2),
+              actual_seq_lengths_query=torch.tensor([1, 3]), actual_seq_lengths_key=None,
               indexer_block_table=None, get_forward_context=lambda: NS(staged_sfa_graph_key=key),
               StagedSFAQueryProfile=NS(DECODE_BOUNDED="bounded"), pack_decode_lanes=pack,
               request_block_table=torch.zeros(2, 3), remap_boundary=torch.zeros(2))

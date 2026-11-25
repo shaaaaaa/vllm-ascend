@@ -496,3 +496,24 @@ def test_decoder_dcp_charges_measured_attention_peak_before_kv_sizing(decoder_dc
     assert profiler.determine_available_memory() == (5200 if marked else 6100)
     assert calls == (["model", "sfa"] if marked else ["model"])
     assert sync.call_count == int(marked)
+
+
+@pytest.mark.parametrize("reader,version,success", [
+    ("persistent_direct_hbm", 1, True), ("p2p_preferred", 1, False), ("persistent_direct_hbm", 0, False),
+])
+def test_request_sharding_checks_reader_and_protocol_before_storage(decoder_dcp, monkeypatch, reader, version, success):
+    ctx = decoder_dcp
+    ctx.envs.VLLM_ASCEND_DSA_DCP_INDEXER_REQUEST_SHARDING = True
+    ctx.config.dsa_group1_load_mode = reader
+    ctx.cls.dcp_indexer_placement_version = version
+    monkeypatch.setattr(sys.modules["vllm.triton_utils"], "HAS_TRITON", True)
+    wire = ModuleType("vllm.v1.core.dcp_indexer_pool")
+    wire.DCP_INDEXER_PLACEMENT_VERSION = 1
+    monkeypatch.setitem(sys.modules, wire.__name__, wire)
+    if success:
+        ctx.worker._configure_dsa_decoder_dcp()
+        assert ctx.vllm._dsa_decoder_indexer_sharding
+    else:
+        with pytest.raises(ValueError, match="persistent_direct_hbm|matching DCP placement"):
+            ctx.worker._configure_dsa_decoder_dcp()
+        assert "storage" not in ctx.events

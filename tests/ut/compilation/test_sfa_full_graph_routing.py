@@ -4,7 +4,7 @@
 
 import ast
 from contextlib import nullcontext
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum, IntEnum
 from pathlib import Path
 from types import SimpleNamespace
@@ -33,6 +33,8 @@ def routing():
         np=np,
         dataclass=dataclass,
         field=field,
+        replace=replace,
+        cdiv=lambda a, b: (a + b - 1) // b,
         Enum=Enum,
         IntEnum=IntEnum,
         BatchDescriptor=BatchDescriptor,
@@ -1542,3 +1544,27 @@ def test_banked_p_checks_capability_before_full_graph_eager_return(routing, conn
     ns["get_kv_transfer_group"] = lambda: connector
     with pytest.raises(ValueError, match="Layerwise-prefill P nodes require"):
         runner._validate_sfa_layerwise_connector_cudagraph_mode()
+
+
+@pytest.mark.parametrize("owners,independent,expected", [
+    ([0, 1, 2, 3], True, 1), ([2, 0, 2, 2], True, 0), ([0, 1, 2, 3], False, 0)
+])
+def test_owner_skew_selects_a_preexisting_graph(routing, owners, independent, expected):
+    runner, ns, _, modes, _ = routing
+    runner.dcp_size = 4
+    runner._sfa_independent = object() if independent else None
+    runner._dcp_indexer_workspace = object()
+    runner._staged_sfa_graph_capture_sizes = (8,)
+    ids = ["r3", "r0", "r2", "r1"]
+    runner.input_batch = SimpleNamespace(req_ids=ids)
+    runner._dcp_indexer_owners = dict(zip(ids, zip(owners, range(4))))
+    keys = runner._staged_sfa_capture_keys(8)
+    assert len(set(keys)) == 4
+    local = ns["StagedSFARouteDecision"](
+        ns["StagedSFARouteAction"].STAGED, ns["StagedSFARouteReason"].ELIGIBLE, uniform_query_len=2,
+    )
+    route = runner._staged_sfa_live_route(local_route=local, dp_route_action=local.action,
+        cudagraph_mode=modes.PIECEWISE, batch_descriptor=BatchDescriptor(8),
+        num_tokens_unpadded=8, num_tokens_padded=8, num_reqs=4, should_ubatch=False)
+    assert route.graph_key in keys and route.graph_key.owner_capacity == expected
+    assert runner._staged_sfa_dummy_graph_key(8, dp_idle=True).owner_capacity == 0

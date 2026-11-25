@@ -11,6 +11,32 @@ from vllm.triton_utils import tl, triton
 from vllm_ascend.ops.triton.triton_utils import get_element, get_vectorcore_num, init_device_properties_triton
 
 
+@triton.jit(do_not_specialize=["rows"])
+def _store_owner_keys(take, valid, slots, keys, scales, cache, scale_cache, rows,
+                      DIM: tl.constexpr, ROW_STRIDE: tl.constexpr, COL_STRIDE: tl.constexpr, SCALE_STRIDE: tl.constexpr):
+    col = tl.arange(0, DIM)
+    for row in range(tl.program_id(0), rows, tl.num_programs(0)):
+        if tl.load(valid + row):
+            index = tl.load(take + row)
+            slot = tl.load(slots + index).to(tl.int64)
+            if slot >= 0:
+                tl.store(cache + slot * ROW_STRIDE + col * COL_STRIDE, tl.load(keys + row * DIM + col))
+                if scales is not None:
+                    tl.store(scale_cache + slot * SCALE_STRIDE, tl.load(scales + row))
+
+
+def store_owner_keys(take, valid, slots, keys, scales, cache):
+    rows = take.numel()
+    init_device_properties_triton()
+    key_cache = cache[2].view(-1, keys.shape[-1])
+    scale_cache = cache[3].view(-1) if scales is not None else None
+    _store_owner_keys[(min(rows, get_vectorcore_num()),)](
+        take, valid, slots, keys.contiguous(), scales, key_cache, scale_cache, rows,
+        DIM=keys.shape[-1], ROW_STRIDE=key_cache.stride(0), COL_STRIDE=key_cache.stride(1),
+        SCALE_STRIDE=scale_cache.stride(0) if scale_cache is not None else 1,
+    )
+
+
 @triton.jit(do_not_specialize=["rows", "actual_rows"])
 def _mask_topk(raw, positions, output, rows, width: tl.constexpr,
                actual_rows, TILE: tl.constexpr):

@@ -226,13 +226,18 @@ def measure_case(args, control, *, pipeline_factory=AttentionPipeline):
             misses.append(verify(pipelines, control, phase=f"eager_step_{step}"))
         golden = [(p.snapshot(include_cache=False), [t.cpu() for t in p.attention_outputs]) for p in pipelines]
         graphs = []
+        graph_bytes = [] if hasattr(pipelines[0], "indexer_bytes") else None
         # Both variants' real graphs stay alive throughout parity and timing.
         for index, pipeline in enumerate(pipelines):
             if not args.rank:
                 print(f"Capturing {'candidate' if index else 'baseline'} layer group", flush=True)
+            if graph_bytes is not None:
+                before = torch.npu.memory_allocated(), torch.npu.memory_reserved()
             warm = pipeline.capture(frames[: args.warmup_steps])
             timed = pipeline.capture(frames[args.warmup_steps :])
             graphs.append((warm, timed))
+            if graph_bytes is not None:
+                graph_bytes.append((torch.npu.memory_allocated() - before[0], torch.npu.memory_reserved() - before[1]))
         for replay in range(3):
             for pipeline, (warm, timed) in zip(pipelines, graphs):
                 pipeline.reset()
@@ -279,6 +284,15 @@ def measure_case(args, control, *, pipeline_factory=AttentionPipeline):
         slowest = {
             name: [max(rank[name][i] for rank in all_samples) for i in range(len(samples[name]))] for name in samples
         }
+        memory = {}
+        if hasattr(pipelines[0], "indexer_bytes"):
+            local = tuple(p.indexer_bytes for p in pipelines), graph_bytes
+            ranked = [None] * args.dcp_size
+            dist.all_gather_object(ranked, local, group=control)
+            cache_bytes, capture_bytes = zip(*ranked)
+            memory = {"indexer_key_and_scale_bytes_per_rank": cache_bytes,
+                      "indexer_key_and_scale_bytes_total": list(map(sum, zip(*cache_bytes))),
+                      "capture_allocated_and_reserved_byte_deltas_per_rank": capture_bytes}
         return {
             "requests": args.requests,
             "layout": args.layout,
@@ -292,6 +306,7 @@ def measure_case(args, control, *, pipeline_factory=AttentionPipeline):
             "slowest_rank_median": {name: statistics.median(values) for name, values in slowest.items()},
             "per_rank_samples": all_samples,
             "rank0_misses_per_step": misses[args.warmup_steps :],
+            **memory,
         }
     finally:
         for pipeline in pipelines:

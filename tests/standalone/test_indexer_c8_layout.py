@@ -308,7 +308,8 @@ def test_prefill_rebind_owns_physical_metadata_for_each_bank(api):
     (False, False, None), (False, True, None), (True, False, None), (True, True, None),
     (False, True, 4),
 ])
-def test_runner_specs_charge_retained_alignment_and_select_dcp(api, monkeypatch, prefill, connector, dcp):
+@pytest.mark.parametrize("shard", [False, True])
+def test_runner_specs_charge_retained_alignment_and_select_dcp(api, monkeypatch, prefill, connector, dcp, shard):
     from types import ModuleType
     from unittest.mock import Mock
 
@@ -353,9 +354,12 @@ def test_runner_specs_charge_retained_alignment_and_select_dcp(api, monkeypatch,
         runner.vllm_config._dsa_decoder_dcp_policy = (2048, 0)
     else:
         runner.parallel_config = NS(decode_context_parallel_size=1)
+    runner.vllm_config._dsa_decoder_indexer_sharding = shard
     specs = runner.get_kv_cache_spec()
     latent = specs["model.layers.0.self_attn.attn"]
     index = specs["model.layers.0.self_attn.indexer.k_cache"]
+    assert index.dcp_request_sharding == bool(dcp and shard)
+    assert not latent.dcp_request_sharding
     assert latent.dsa_dcp_size == dcp
     assert index.dsa_dcp_size == (1 if dcp else None)
     if dcp:
