@@ -124,6 +124,18 @@ def test_query_and_mapping_cover_real_layouts(warmup):
     assert calls[-1][1]["USE_COS_SIN"] is False
 
 
+def test_owner_compaction_warms_real_inputs_and_uses_no_dummy_query_map(warmup):
+    module, calls = warmup
+    module.warmup_owner_topk(2048, None, (0, 1), torch.int64, True, layout=(8, 3, 128))
+    compact = [a for name, a in calls if name == "_prepare_topk"]
+    assert len(compact) == 9 and all(a["inverse"] == torch.int64 and a["gathered_rows"] == 1 for a in compact)
+    assert {(a["local"], a["row_requests"]) for a in compact} == {(True, None), (False, torch.int32), (False, None)}
+    assert all(a["published"] is None for a in compact)
+    calls.clear()
+    module.warmup_dcp(2048, 8, torch.bfloat16, 8, 3, 128)
+    assert all(a["inverse"] is None and a["gathered_rows"] is None for name, a in calls if name == "_prepare_topk")
+
+
 @pytest.mark.parametrize("spec_tokens", [0, 1, 3])
 def test_sampling_warms_small_and_large_tiles_and_optional_inputs(warmup, spec_tokens):
     module, calls = warmup
@@ -209,8 +221,8 @@ def test_common_startup_selects_used_paths_without_optimization_flags(warmup, mo
 def test_batch_and_history_extents_are_not_specialized():
     parameters = {
         "sfa_dcp.py": {
-            "_restore_owner_topk": {"rows", "actual_rows", "inverse_rows"},
-            "_prepare_topk": {"rows", "actual_rows"},
+            "_restore_owner_topk": {"rows", "actual_rows", "inverse_rows", "gathered_rows"},
+            "_prepare_topk": {"rows", "actual_rows", "inverse_rows", "gathered_rows"},
             "_unpack_queries": {"rows"},
             "_pack": {"rows"},
             "_combine": {"local_rows"},

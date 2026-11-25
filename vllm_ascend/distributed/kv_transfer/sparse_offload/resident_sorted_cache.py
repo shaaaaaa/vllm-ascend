@@ -308,11 +308,19 @@ def prepare_resident_sharded_union_(
     mtp: int,
     query_membership: bool = False,
     dcp: ResidentDcpLayout | None = None,
+    owner_topk=None,
 ) -> None:
     """Create sorted shards and intersect them with resident state."""
     resident_shard_count(mtp)
     try:
-        if dcp is not None:
+        if owner_topk is not None:
+            op = partial(
+                torch.ops._C_ascend.npu_dsa_resident_dcp_owner_union_,
+                dcp_size=dcp.world_size, dcp_rank=dcp.rank, gathered=owner_topk.gathered, inverse=owner_topk.inverse,
+                lanes=owner_topk.lanes, positions=owner_topk.positions, published=owner_topk.published,
+                actual_rows=owner_topk.actual_rows, reject=owner_topk.reject,
+            )
+        elif dcp is not None:
             op = partial(
                 torch.ops._C_ascend.npu_dsa_resident_dcp_union_,
                 dcp_size=dcp.world_size,
@@ -475,10 +483,17 @@ def prepare_sorted_resident_cache_fused_(
     block_size: int,
     query_membership: bool = False,
     dcp: ResidentDcpLayout | None = None,
+    owner_topk=None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Run the production fused state update and top-k remap."""
     try:
-        if dcp is not None:
+        if owner_topk is not None:
+            op = partial(
+                torch.ops._C_ascend.npu_dsa_resident_dcp_owner_plan_,
+                fused_remap=True, live_origins=dcp.live_origins, selected_counts=dcp.selected_counts,
+                dcp_size=dcp.world_size, dcp_rank=dcp.rank, gathered=owner_topk.gathered,
+            )
+        elif dcp is not None:
             op = partial(
                 torch.ops._C_ascend.npu_dsa_resident_dcp_plan_,
                 fused_remap=True,

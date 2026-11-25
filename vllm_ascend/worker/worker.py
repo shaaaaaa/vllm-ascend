@@ -544,11 +544,10 @@ class NPUWorker(WorkerBase):
             or (config.additional_config or {}).get("enable_dsa_cp", False) or enable_sp(config)
         ):
             raise ValueError("Decoder DCP requires the two-group resident SFA layout with 128-token interleave")
-        if not enable_custom_op() or not all(
-            hasattr(torch.ops._C_ascend, name) for name in (
-                "npu_sparse_flash_attention_dcp", "npu_dsa_resident_dcp_union_", "npu_dsa_resident_dcp_plan_"
-            )
-        ):
+        required_ops = ("npu_sparse_flash_attention_dcp", "npu_dsa_resident_dcp_union_", "npu_dsa_resident_dcp_plan_")
+        if request_sharding:
+            required_ops += ("npu_dsa_resident_dcp_owner_union_", "npu_dsa_resident_dcp_owner_plan_")
+        if not enable_custom_op() or not all(hasattr(torch.ops._C_ascend, name) for name in required_ops):
             raise ValueError("Rebuild vllm-ascend with the decoder DCP custom operators")
 
         from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory

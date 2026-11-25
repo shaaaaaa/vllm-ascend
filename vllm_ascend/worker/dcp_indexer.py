@@ -59,6 +59,44 @@ def owner_rows(owners, starts, rank, world, requests, tokens, model_tokens, row_
     return take, valid, seq, present, ends, inverse
 
 
+def planner_owner_rows(starts, inverse, width):
+    """One scalar read per bounded lane: high word = model row, low word = packet row + 1."""
+    tokens = len(inverse)
+    if width not in (1, 2) or tokens % width or len(starts) == 0 or starts[0] != 0 or starts[-1] > tokens:
+        raise ValueError("Invalid bounded DCP owner query extents")
+    lanes = np.full(tokens, -1, np.int64)
+    for req, (start, end) in enumerate(zip(starts[:-1], starts[1:])):
+        if not 0 <= end - start <= width or req * width + width > tokens:
+            raise ValueError("DCP owner query rows exceed the bounded planner bucket")
+        lanes[req * width:req * width + end - start] = np.arange(start, end)
+    lanes[lanes < 0] = np.arange(starts[-1], tokens)
+    return (lanes << 32) | (inverse[lanes] + 1)
+
+
+@dataclass
+class GatheredTopk:
+    gathered: torch.Tensor
+    inverse: torch.Tensor
+    positions: torch.Tensor | None
+    published: torch.Tensor | None
+    actual_rows: int
+    reject: bool
+    lanes: torch.Tensor | None
+
+    def supports_native_publication(self):
+        # The native writer transfers contiguous blocks of int32 IDs from UB.
+        raw = self.published
+        return raw is None or (raw.dtype == torch.int32 and raw.stride(-1) == 1
+                               and raw.stride(0) >= self.gathered.shape[-1] and raw.stride(0) % 8 == 0
+                               and raw.storage_offset() % 8 == 0)
+
+    def materialize(self, output):
+        from vllm_ascend.ops.triton.sfa_dcp import restore_owner_topk
+
+        restore_owner_topk(self.gathered, self.inverse, output, self.positions, self.actual_rows,
+                           self.published, causal=self.positions is not None, reject=self.reject)
+
+
 @dataclass
 class OwnerRows:
     take: torch.Tensor
@@ -68,6 +106,7 @@ class OwnerRows:
     ends: torch.Tensor
     inverse: torch.Tensor
     tables: tuple[torch.Tensor, ...] = ()
+    planner_lanes: torch.Tensor | None = None
 
     def pack(self, value):
         rows = value.index_select(0, self.take)
@@ -98,22 +137,27 @@ class OwnerRows:
         local = self.tables[-1 if c8 else 0] if self.tables else table.index_select(0, self.seq)
         return (local, self.ends, torch.where(self.present, lengths.index_select(0, self.seq), 0))
 
+    @staticmethod
+    def gather(topk, group):
+        import torch.distributed as dist
+
+        packet = topk.contiguous()
+        gathered = packet.new_empty((group.world_size * packet.shape[0], *packet.shape[1:]))
+        dist.all_gather_into_tensor(gathered, packet, group=group.device_group)
+        return gathered
+
     def restore(self, topk, group, model_tokens, *, output=None, positions=None,
                 actual_rows=None, published=None, reject=False):
         """Publish ordered raw IDs and fill the private planner output in one pass.
 
         Native dense/mixed batches request raw rows for subsequent local-stripe compaction.
         """
-        import torch.distributed as dist
-
         from vllm_ascend.ops.triton.sfa_dcp import restore_owner_topk
 
-        packet = topk.contiguous()
-        gathered = packet.new_empty((group.world_size * packet.shape[0], *packet.shape[1:]))
-        dist.all_gather_into_tensor(gathered, packet, group=group.device_group)
+        gathered = self.gather(topk, group)
         causal = output is not None and positions is not None
         if output is None:
-            output = packet.new_empty((model_tokens, *packet.shape[1:]))
+            output = topk.new_empty((model_tokens, *topk.shape[1:]))
         elif output.shape[0] != model_tokens:
             raise ValueError("DCP planner and model disagree on the Top-K row count")
         restore_owner_topk(
@@ -136,19 +180,28 @@ class OwnerWorkspace:
                 (r, torch.int64),
                 (r, torch.bool),
                 (r, torch.int32),
-                (t, torch.int64),
+                (t + min(t, runner.max_num_reqs * runner.decode_threshold), torch.int64),
             )
         )
 
-    def update(self, owners, starts, rank, world, requests, tokens, model_tokens, row_ids=()):
-        signature = (tuple(row_ids), tuple(owners), tuple(starts) if owners else (), requests, tokens, model_tokens)
+    def update(self, owners, starts, rank, world, requests, tokens, model_tokens, row_ids=(), bounded_width=0):
+        signature = (tuple(row_ids), tuple(owners), tuple(starts) if owners else (), requests, tokens, model_tokens,
+                     bounded_width)
         if signature == self.signature:
             return self.view
         arrays = owner_rows(owners, starts, rank, world, requests, tokens, model_tokens, row_ids)
+        if bounded_width:
+            # Transfer the two maps together. Fixed decode only sends the inverse.
+            lanes = planner_owner_rows(starts[:len(owners) + 1], arrays[-1], bounded_width)
+            arrays = (*arrays[:-1], np.concatenate((arrays[-1], lanes)))
         views = []
         for buffer, array in zip(self.buffers, arrays, strict=True):
             buffer.np[: len(array)] = array
             views.append(buffer.copy_to_gpu(len(array)))
-        self.view = OwnerRows(*views)
+        if bounded_width:
+            combined = views[-1]
+            self.view = OwnerRows(*views[:-1], combined[:model_tokens], planner_lanes=combined[model_tokens:])
+        else:
+            self.view = OwnerRows(*views)
         self.signature = signature
         return self.view

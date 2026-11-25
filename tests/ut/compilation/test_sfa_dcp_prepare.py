@@ -175,6 +175,32 @@ def test_local_and_mixed_rows_keep_existing_compaction(ops, local, mixed):
     assert counts[0, 0] == 2 and torch.all(counts[:, 1:] == -77)
 
 
+@pytest.mark.parametrize("local,mixed", [(True, False), (False, True), (False, False)])
+@pytest.mark.parametrize("reject", [False, True])
+def test_owner_compaction_reads_the_packet_in_the_existing_native_prep_launch(ops, local, mixed, reject):
+    prepare, _, calls = ops
+    packet = (torch.arange(8 * 2048, dtype=torch.int32).view(8, 1, 2048) + 17) % 4059 - 3
+    saved = packet.clone()
+    inverse = torch.tensor([7, 0, len(packet), 5, -1])
+    positions = torch.tensor([701, -1, 300, 1400, 69, 8], dtype=torch.int32)
+    rows = torch.tensor([-1, 0, -1, 1, -1, -1], dtype=torch.int32) if mixed else None
+    ordered = torch.full((6, 1, 2048), -1, dtype=torch.int32)
+    for i, src in enumerate(inverse.tolist()):
+        if 0 <= src < len(packet) and not (reject and positions[i] < 0):
+            ordered[i] = packet[src]
+    raw = torch.empty(6, 4096, dtype=torch.int32)[:, ::2]
+    owner = SimpleNamespace(inverse=inverse, published=raw, reject=reject)
+    expected, result = torch.empty_like(ordered), torch.empty_like(ordered)
+    counts = torch.full((6, 16), -47, dtype=torch.int32)
+    reference = counts.clone()
+    prepare(ordered, positions, expected, reference, 4, 8, 1, 128, local=local, row_requests=rows)
+    calls.clear()
+    prepare(packet, positions, result, counts, 4, 8, 1, 128, local=local, row_requests=rows, owner=owner)
+    assert calls == [("_prepare_topk", (6,))]
+    assert torch.equal(raw, ordered[:, 0]) and torch.equal(saved, packet)
+    assert torch.equal(result, expected) and torch.equal(counts, reference)
+
+
 @pytest.mark.parametrize("rows", [0, 1, 2, 9])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("strided", [False, True])

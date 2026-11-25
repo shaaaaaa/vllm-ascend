@@ -215,7 +215,9 @@ class Pipeline:
         for cache in self.caches:
             cache.fill_(-7)
 
-    def prepare(self, frame, *, owner_prepared=False):
+    def prepare(self, frame, *, owner_prepared=False, owner_source=None):
+        from dataclasses import replace
+
         from vllm_ascend.attention.sfa_graph_layout import pack_decode_lanes, unpack_decode_lanes
         from vllm_ascend.ops.triton.sfa_dcp import prepare_sfa_dcp_topk
 
@@ -239,7 +241,7 @@ class Pipeline:
             )
             topk = self.dcp.topk
         boundary, rows = self.boundaries, self.rows
-        if bounded:
+        if bounded and owner_source is None:
             topk, boundary, rows, inverse = pack_decode_lanes(topk, boundary, rows, self.ends, QUERY_ROWS)
         planned, selected, counts, slots = self.plan(
             self.impl,
@@ -259,10 +261,12 @@ class Pipeline:
             staged_mtp=QUERY_ROWS,
             need_packed=True,
             clear_invalid_rows=True,
-            dcp=self.dcp.layout,
-            shared_topk_ready=owner_prepared and not bounded and self.args.shared_plan,
+            dcp=replace(self.dcp.layout, selected_counts=self.counts) if bounded and owner_source is not None
+                else self.dcp.layout,
+            shared_topk_ready=owner_prepared and (not bounded or owner_source is not None) and self.args.shared_plan,
+            **({"owner_topk": owner_source} if owner_source is not None else {}),
         )
-        if bounded:
+        if bounded and owner_source is None:
             planned = unpack_decode_lanes(planned, inverse, self.rows)
             self.counts[:, 0].copy_(
                 unpack_decode_lanes(

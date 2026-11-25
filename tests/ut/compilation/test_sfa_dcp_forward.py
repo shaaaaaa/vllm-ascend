@@ -1,7 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """Exercise native DCP metadata and forward ordering with host device shims."""
 
+import ast
 import sys
+import weakref
+from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock
@@ -15,6 +18,49 @@ from test_sfa_dcp_merge import DcpTL
 RUNNER = ROOT / "vllm_ascend/worker/model_runner_v1.py"
 SFA = ROOT / "vllm_ascend/attention/sfa_v1.py"
 OPS = ROOT / "vllm_ascend/ops/triton/sfa_dcp.py"
+
+
+def native_forward(namespace):
+    """Execute the DCP arm of forward with the same locals and lifetimes as the worker."""
+    impl = next(n for n in ast.parse(SFA.read_text(encoding="utf8")).body
+                if isinstance(n, ast.ClassDef) and n.name == "AscendSFAImpl")
+    forward = next(n for n in impl.body if isinstance(n, ast.FunctionDef) and n.name == "forward")
+    branch = next(n for n in forward.body if isinstance(n, ast.If) and ast.unparse(n.test) == "dcp is not None"
+                  and isinstance(n.body[0], ast.With))
+    wrapper = ast.parse(
+        "def run(self, layer_name, ql_nope, q_pe, kv_cache, select, attn_metadata, dcp): topk_indices = select()"
+    )
+    wrapper.body[0].body.extend([*branch.body, ast.Return(value=ast.Name(id="attn_output", ctx=ast.Load()))])
+    namespace["_dsa_prof"] = SimpleNamespace(section=lambda _: nullcontext(), step=lambda: None)
+    exec(compile(ast.fix_missing_locations(wrapper), str(SFA), "exec"), namespace)
+    return namespace["run"]
+
+
+def test_owner_packet_released_before_native_retrieval_and_attention(monkeypatch):
+    packet_ref = []
+
+    def select():
+        gathered = torch.empty(8, 16, 2048, dtype=torch.int32)
+        packet_ref.append(weakref.ref(gathered))
+        return SimpleNamespace(gathered=gathered)
+
+    def plan(source, *args):
+        assert packet_ref[0]() is source.gathered
+        return (None, None, None)
+
+    def wait(*args, **kwargs):
+        assert packet_ref[0]() is None, "the eager layer still holds the all-gather packet"
+
+    ops = ModuleType("vllm_ascend.ops.triton.sfa_dcp")
+    ops.execute_sfa_dcp = lambda query, *args: query
+    monkeypatch.setitem(sys.modules, ops.__name__, ops)
+    ns = {"wait_for_kv_layer_from_connector": wait, "get_dcp_group": lambda: None}
+    engine = SimpleNamespace(shared_resident_plan=None, skip_topk=False, scale=1, _plan_native_dcp_topk=plan)
+    payload = extract(SFA, "_native_dcp_payload", ns)
+    engine._native_dcp_payload = lambda *args: payload(engine, *args)
+    meta = SimpleNamespace(req_ids=["r"], block_table=None, cum_query_lens=None)
+    batch = SimpleNamespace(topk=None, counts=None, local_seq_lens=None)
+    assert native_forward(ns)(engine, "producer", 1, None, (), select, meta, batch) == 1
 
 
 @pytest.fixture
@@ -94,13 +140,19 @@ class TopkTL(DcpTL):
     cumsum = staticmethod(torch.cumsum)
     where = staticmethod(lambda mask, yes, no: torch.where(torch.as_tensor(mask), yes, no))
 
+    @staticmethod
+    def load(ptr, mask=True, other=0):
+        return HostTL.load(ptr, mask, other)
+
 
 @pytest.fixture
 def prepare_topk():
     tl = TopkTL()
     kernel = extract(OPS, "_prepare_topk", {"tl": tl})
 
-    def prepare(raw, positions, output, counts, actual_rows, world, rank, block, *, local, row_requests=None):
+    def prepare(raw, positions, output, counts, actual_rows, world, rank, block, *,
+                local, row_requests=None, owner=None):
+        assert owner is None
         tl.programs = 2
         for pid in range(tl.programs):
             tl.pid = pid
@@ -276,7 +328,8 @@ def test_native_dcp_mixed_rows_reuse_one_shared_plan_and_copy_each_layer(monkeyp
     slots = torch.tensor([[2432, 2433, 2434], [-1, -1, -1]])
     counts = torch.tensor([3, 0], dtype=torch.int32)
 
-    def planner(topk, split, rows, table, state, generations, *, mtp, dcp):
+    def planner(topk, split, rows, table, state, generations, *, mtp, dcp, owner_topk):
+        assert owner_topk is None
         assert mtp == 2 and table.equal(block_table)
         assert state.tolist() == [8, -1] and generations.tolist() == [4, -1]
         assert rows.tolist() == [0, -1, -1, -1]
@@ -314,16 +367,18 @@ def test_native_dcp_mixed_rows_reuse_one_shared_plan_and_copy_each_layer(monkeyp
         "get_dcp_group": lambda: object(),
     }
     plan = extract(SFA, "_plan_native_dcp_topk", namespace)
-    forward = extract(SFA, "_execute_native_dcp_attention", namespace)
+    payload = extract(SFA, "_native_dcp_payload", namespace)
+    forward = native_forward(namespace)
     impl = SimpleNamespace(
         shared_resident_plan=object(), skip_topk=False, block_size=128,
         decode_threshold=2, scale=0.25, _prepare_sorted_resident_sparse_cache=planner,
     )
     impl._plan_native_dcp_topk = lambda *args: plan(impl, *args)
+    impl._native_dcp_payload = lambda *args: payload(impl, *args)
     query = torch.empty((4, 2, 512))
-    forward(impl, "producer", query, None, (), raw, metadata, dcp)
+    forward(impl, "producer", query, None, (), lambda: raw, metadata, dcp)
     impl.skip_topk = True
-    forward(impl, "consumer", query, None, (), raw, metadata, dcp)
+    forward(impl, "consumer", query, None, (), lambda: raw, metadata, dcp)
     assert raw.equal(snapshot)
     assert trace == ["prepare", "plan", "load:producer", "attention", "load:consumer", "attention"]
 
@@ -400,7 +455,8 @@ def test_dcp_draft_dp_padding_is_excluded_from_the_fixed_width_planner(monkeypat
     ops.prepare_sfa_dcp_topk = prepare_topk
     monkeypatch.setitem(sys.modules, ops.__name__, ops)
 
-    def planner(topk, boundary, rows, *args, mtp, dcp):
+    def planner(topk, boundary, rows, *args, mtp, dcp, owner_topk):
+        assert owner_topk is None
         assert mtp == 2 and topk.shape[0] == rows.numel() == boundary.numel() == 2
         assert topk[:, 0].tolist() == [[3, 2, 1, -1], [-1, -1, -1, -1]]
         return topk, None, None, None

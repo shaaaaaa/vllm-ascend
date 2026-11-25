@@ -1036,7 +1036,9 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                 packed_tokens = packed_requests * graph_key.max_query_len
             owner_rows = workspace.update(owners, starts, self.dcp_rank, self.dcp_size,
                                           packed_requests, packed_tokens, padded_tokens,
-                                          requests if scheduler_output is not None else ())
+                                          requests if scheduler_output is not None else (),
+                                          graph_key.max_query_len if graph_key is not None and
+                                          graph_key.query_profile == StagedSFAQueryProfile.DECODE_BOUNDED else 0)
         return DcpSFABatch(
             ResidentDcpLayout(self.dcp_size, self.dcp_rank, origin_view, planner_counts),
             lengths.copy_to_gpu(request_capacity), self.positions.gpu[:padded_tokens],

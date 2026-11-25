@@ -37,9 +37,9 @@ def store_owner_keys(take, valid, slots, keys, scales, cache):
     )
 
 
-@triton.jit(do_not_specialize=["rows", "inverse_rows", "actual_rows"])
+@triton.jit(do_not_specialize=["rows", "inverse_rows", "actual_rows", "gathered_rows"])
 def _restore_owner_topk(gathered, inverse, positions, output, published, rows, inverse_rows,
-                        actual_rows, WIDTH: tl.constexpr, RAW_STRIDE: tl.constexpr,
+                        actual_rows, gathered_rows, WIDTH: tl.constexpr, RAW_STRIDE: tl.constexpr,
                         RAW_COL_STRIDE: tl.constexpr, CAUSAL: tl.constexpr, REJECT: tl.constexpr, TILE: tl.constexpr):
     tiles = (WIDTH + TILE - 1) // TILE
     for item in range(tl.program_id(0), rows * tiles, tl.num_programs(0)):
@@ -48,7 +48,8 @@ def _restore_owner_topk(gathered, inverse, positions, output, published, rows, i
         in_row = True if WIDTH % TILE == 0 else col < WIDTH
         src = tl.load(inverse + row, row < inverse_rows, -1)
         # Each tile reads a contiguous slice of one owner's packet.
-        token = tl.load(gathered + tl.where(src >= 0, src, 0) * WIDTH + col, (src >= 0) & in_row, -1)
+        valid_source = (src >= 0) & (src < gathered_rows)
+        token = tl.load(gathered + tl.where(valid_source, src, 0) * WIDTH + col, valid_source & in_row, -1)
         if CAUSAL or REJECT:
             position = tl.load(positions + row, (row < actual_rows) | REJECT, -1)
             if REJECT:
@@ -78,7 +79,7 @@ def restore_owner_topk(gathered, inverse, output, positions, actual_rows, publis
         tile = 256
         init_device_properties_triton()
         _restore_owner_topk[(min(rows * triton.cdiv(width, tile), get_vectorcore_num()),)](
-            gathered, inverse, positions, output, published, rows, inverse.numel(), actual_rows,
+            gathered, inverse, positions, output, published, rows, inverse.numel(), actual_rows, gathered.shape[0],
             width, published.stride(0) if published is not None else 0,
             published.stride(-1) if published is not None else 1, causal, reject, tile,
         )
@@ -97,14 +98,27 @@ def _mask_topk(raw, positions, output, rows, width: tl.constexpr,
                  offset < rows * width)
 
 
-@triton.jit(do_not_specialize=["rows", "actual_rows"])
+@triton.jit(do_not_specialize=["rows", "actual_rows", "inverse_rows", "gathered_rows"])
 def _prepare_topk(raw, positions, output, counts, row_requests, rows,
                   width: tl.constexpr, actual_rows, world: tl.constexpr,
-                  rank: tl.constexpr, block: tl.constexpr, local: tl.constexpr):
+                  rank: tl.constexpr, block: tl.constexpr, local: tl.constexpr,
+                  inverse=None, inverse_rows=0, gathered_rows=None, published=None, RAW_STRIDE: tl.constexpr = 0,
+                  RAW_COL_STRIDE: tl.constexpr = 1, REJECT: tl.constexpr = False):
     col = tl.arange(0, width)
     for row in range(tl.program_id(0), rows, tl.num_programs(0)):
-        token = tl.load(raw + row * width + col)
-        position = tl.where(row < actual_rows, tl.load(positions + row), -1)
+        if inverse is None:
+            token = tl.load(raw + row * width + col)
+            position = tl.where(row < actual_rows, tl.load(positions + row), -1)
+        else:
+            source = tl.load(inverse + row, row < inverse_rows, -1)
+            valid_source = (source >= 0) & (source < gathered_rows)
+            token = tl.load(raw + tl.where(valid_source, source, 0) * width + col, valid_source, -1)
+            position = tl.load(positions + row, (row < actual_rows) | REJECT, -1)
+            if REJECT:
+                token = tl.where(position >= 0, token, -1)
+            if published is not None:
+                tl.store(published + row * RAW_STRIDE + col * RAW_COL_STRIDE, token)
+            position = tl.where(row < actual_rows, position, -1)
         valid = (token >= 0) & (token <= position)
         if row_requests is None:
             local_row = local
@@ -129,13 +143,33 @@ def prepare_sfa_dcp_topk(
     topk: torch.Tensor, positions: torch.Tensor, output: torch.Tensor,
     counts: torch.Tensor, actual_rows: int, world: int, rank: int, block: int,
     *, local: bool, row_requests: torch.Tensor | None = None,
-    _causal_global_ids: bool = False,
+    _causal_global_ids: bool = False, owner=None,
 ) -> None:
     """Keep causal global IDs for the planner and compact dense rows locally.
 
     Only audited target indexer callers may assert ``_causal_global_ids``.
     Draft rejection can invalidate rows beyond the indexer's causal mask.
     """
+    if owner is not None:
+        # Dense/mixed native attention already needs this compaction pass.
+        # Read the owner packet in that pass, including on ranks with no owned requests.
+        rows, width = output.shape[0], output.shape[-1]
+        init_device_properties_triton()
+        raw = owner.published
+        if (not output.is_contiguous() or output.shape != (rows, 1, width) or topk.shape[1:] != (1, width)
+                or positions.ndim != 1 or positions.stride(0) != 1
+                or positions.numel() < (rows if owner.reject else min(actual_rows, rows))):
+            raise ValueError("Invalid DCP owner packet, positions or compaction output")
+        if raw is not None and (raw.ndim not in (2, 3) or (raw.ndim == 3 and raw.shape[1] != 1)
+                                or raw.shape[0] < rows or raw.shape[-1] < width):
+            raise ValueError("IndexCache buffer must hold one complete raw Top-K row per model token")
+        if rows:
+            _prepare_topk[(min(rows, get_vectorcore_num()),)](
+                topk, positions, output, counts, row_requests, rows, width, actual_rows, world, rank, block, local,
+                owner.inverse, owner.inverse.numel(), topk.shape[0], raw, raw.stride(0) if raw is not None else 0,
+                raw.stride(-1) if raw is not None else 1, owner.reject,
+            )
+        return
     rows, width = topk.shape[0], topk.shape[-1]
     if not local and row_requests is None:
         if _causal_global_ids:

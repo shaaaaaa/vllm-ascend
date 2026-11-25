@@ -2,6 +2,7 @@
 """Execute bounded producer/consumer pre-compute with real CPU layout helpers."""
 
 import sys
+from dataclasses import replace
 from types import MethodType, ModuleType
 from types import SimpleNamespace as NS
 from unittest.mock import Mock
@@ -16,15 +17,17 @@ from tests.ut.distributed.kv_transfer.test_shared_resident_plan import grouped, 
 
 @pytest.mark.parametrize("explicit", [False, True])
 @pytest.mark.parametrize("c8", [False, True])
-@pytest.mark.parametrize("dcp_enabled", [False, True])
+@pytest.mark.parametrize("dcp_enabled", [False, True, "owner"])
 @pytest.mark.parametrize("qualified", [False, True])
 def test_bounded_group_packs_and_restores_once_per_invocation(explicit, c8, dcp_enabled, qualified, monkeypatch):
     api = resident_api.__wrapped__()
     _, (producer, consumer), group, _ = grouped(api, mtp=2, bounded=True)
     layout = load_source("vllm_ascend/attention/sfa_graph_layout.py", "shared_bounded_layout")
     key = NS(query_profile="bounded", request_capacity=2, max_query_len=2)
+    sharded = dcp_enabled == "owner"
     ns = dict(
         torch=torch,
+        replace=replace,
         get_forward_context=lambda: NS(staged_sfa_graph_key=key),
         StagedSFAQueryProfile=NS(DECODE_BOUNDED="bounded"),
         get_weight_prefetch_method=lambda: NS(maybe_prefetch_mla_or_sla_weight_in_current_stream=Mock()),
@@ -46,7 +49,13 @@ def test_bounded_group_packs_and_restores_once_per_invocation(explicit, c8, dcp_
         resident_plan = api[1]["prepare_sorted_resident_cache_fused_"]
         finalize = resident_plan.side_effect
 
-        def counted_finalize(topk, *args, dcp, **kwargs):
+        def counted_finalize(topk, *args, dcp, owner_topk=None, **kwargs):
+            if sharded:
+                assert owner_topk is frame["source"]
+                assert api[1]["prepare_resident_sharded_union_"].call_args.kwargs["owner_topk"] is owner_topk
+                assert dcp.selected_counts is frame["counts"]
+                producer.topk_indices_buffer[:len(topk)].copy_(frame["raw"][:, 0])
+                topk.copy_(torch.where(frame["raw"] <= frame["positions"][:, None, None], frame["raw"], -1))
             valid = (topk >= 0) & (topk // 128 % 4 == 1)
             dcp.selected_counts[:, 0].copy_(valid.flatten(1).sum(1))
             result = finalize(topk, *args, dcp=dcp, **kwargs)
@@ -77,7 +86,8 @@ def test_bounded_group_packs_and_restores_once_per_invocation(explicit, c8, dcp_
             )
         )
         obj._mask_staged_index_scatter_padding = lambda slots, values, *args: (slots, values)
-        obj.indexer_select_post_process = Mock(side_effect=lambda **kwargs: frame["raw"].clone())
+        obj.indexer_select_post_process = Mock(side_effect=lambda **kw: frame["source"] if kw.get("gather_for_planner")
+                                              else frame["raw"].clone())
     consumer._get_indexcache_topk_indices = Mock(side_effect=AssertionError("consumer staged raw top-k"))
     writes = [t.clone() for t in group.writes] if explicit else None
     reads = [writes[0], writes[-4], writes[-3][:, 0], writes[-2], writes[-1]] if explicit else None
@@ -105,6 +115,11 @@ def test_bounded_group_packs_and_restores_once_per_invocation(explicit, c8, dcp_
                 # A real target producer already emits causal IDs. Keep
                 # adversarial future IDs on the unqualified fallback cases.
                 frame["raw"].masked_fill_(frame["raw"] > dcp.positions[:, None, None], -1)
+            if sharded:
+                dcp.owner_rows = NS(pack=lambda x: x, store=Mock())
+                frame["raw"][rows < 0] = -1
+                frame.update(source=NS(lanes=ends, supports_native_publication=lambda: True),
+                             counts=counts, positions=dcp.positions)
         kwargs = dict(
             hidden_states=torch.empty(tokens, 4),
             kv_cache_nope=torch.empty(1),
@@ -142,7 +157,7 @@ def test_bounded_group_packs_and_restores_once_per_invocation(explicit, c8, dcp_
             valid = valid & (frame["raw"] <= dcp.positions[:, None, None]) & (frame["raw"] // 128 % 4 == 1)
             assert torch.equal(dcp.counts[:, 0], valid.flatten(1).sum(1).int())
             assert (dcp.counts[:, 1:] == -77).all()
-            assert ops.prepare_sfa_dcp_topk.call_count == (0 if qualified else step)
+            assert ops.prepare_sfa_dcp_topk.call_count == (0 if qualified or sharded else step)
         else:
             ops.prepare_sfa_dcp_topk.assert_not_called()
         expected = torch.where(valid, frame["raw"] + 100, -1)
@@ -153,10 +168,10 @@ def test_bounded_group_packs_and_restores_once_per_invocation(explicit, c8, dcp_
         assert first[4].stride() == (16,)
         assert producer.exec_kv.call_count == consumer.exec_kv.call_count == step
         assert len(producer.indexer_select_post_process.call_args.kwargs["kv_cache"]) == (4 if c8 else 3)
-        assert ns["torch_npu"].npu_scatter_nd_update_.call_count == step * (2 if c8 else 1)
+        assert ns["torch_npu"].npu_scatter_nd_update_.call_count == (0 if sharded else step * (2 if c8 else 1))
         assert not torch.equal(first[0], second[0])  # Queries remain layer-local.
-        assert ns["pack_decode_lanes"].call_count == step
-        assert ns["unpack_decode_lanes"].call_count == step * (2 if dcp_enabled else 1)
+        assert ns["pack_decode_lanes"].call_count == (0 if sharded else step)
+        assert ns["unpack_decode_lanes"].call_count == (0 if sharded else step * (2 if dcp_enabled else 1))
         assert api[1]["prepare_resident_sharded_union_"].call_count == step
     consumer.indexer_select_pre_process.assert_not_called()
     consumer.indexer_select_post_process.assert_not_called()

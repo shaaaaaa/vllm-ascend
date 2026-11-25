@@ -19,6 +19,8 @@
 #include <cstdint>
 #include <limits>
 #include <string>
+#include <tuple>
+#include <type_traits>
 #include <torch/extension.h>
 #include <torch/library.h>
 #include <torch/version.h>
@@ -32,6 +34,7 @@
 #include "acl/acl_rt.h"
 #include "ops.h"
 #include "kernels/prepare_sparse_indices_limits.h"
+#include "kernels/resident_owner_rows.h"
 #include "utils.h"
 #include "aclnn_torch_adapter/op_api_common.h"
 #include "add_rms_norm_bias/add_rms_norm_bias_torch_adpt.h"
@@ -71,6 +74,20 @@ extern decltype(::vllm_ascend::dsa_resident_sorted_plan_impl) dsa_resident_sorte
 }
 namespace resident_dcp_free_slots {
 extern decltype(::vllm_ascend::dsa_resident_sorted_plan_impl) dsa_resident_sorted_plan_impl;
+}
+
+// Extend only the owner launchers. Replicated callers keep the original ABI.
+template <class... Tail, class... Args>
+auto resident_owner_signature(void (*)(Args...)) -> void (&)(Args..., Tail...);
+using OwnerUnion = std::remove_reference_t<decltype(resident_owner_signature<const ResidentOwnerRows&>(
+    &dsa_resident_sharded_union_impl))>;
+using OwnerPlan = std::remove_reference_t<decltype(resident_owner_signature<void*, uint32_t>(&dsa_resident_sorted_plan_impl))>;
+namespace resident_dcp_owner {
+extern OwnerUnion dsa_resident_sharded_union_impl;
+extern OwnerPlan dsa_resident_sorted_plan_impl;
+}
+namespace resident_dcp_owner_free_slots {
+extern OwnerPlan dsa_resident_sorted_plan_impl;
 }
 
 namespace {
@@ -1485,7 +1502,47 @@ uint32_t resident_dcp_bits(int64_t size, int64_t rank)
     return size == 2 ? 1 : size == 4 ? 2 : 3;
 }
 
-template <bool QueryMembership, bool Dcp = false>
+using OwnerTensor = const c10::optional<at::Tensor>&;
+
+void check_gathered_topk(const at::Tensor& output, const at::Tensor& gathered) {
+    TORCH_CHECK(gathered.device() == output.device() && gathered.scalar_type() == at::kInt &&
+                gathered.dim() == 3 && gathered.size(0) > 0 && gathered.size(0) <= INT32_MAX &&
+                gathered.size(1) == 1 && gathered.size(2) == output.size(-1) && gathered.is_contiguous() &&
+                !output.is_alias_of(gathered), "owner Top-K needs a separate contiguous int32 gather packet");
+}
+
+ResidentOwnerRows resident_owner_rows(const at::Tensor& output, const at::Tensor& gathered,
+    const at::Tensor& inverse, OwnerTensor lanes, OwnerTensor positions, OwnerTensor published,
+    int64_t actual, bool reject) {
+    check_gathered_topk(output, gathered);
+    const auto rows = output.size(0);
+    const auto device = output.device();
+    TORCH_CHECK(rows <= INT32_MAX && actual >= 0 && actual <= rows && inverse.device() == device &&
+                inverse.scalar_type() == at::kLong && inverse.dim() == 1 && inverse.is_contiguous() &&
+                inverse.numel() <= INT32_MAX, "invalid DCP owner inverse row map or active extent");
+    TORCH_CHECK(!lanes || (lanes->device() == device && lanes->scalar_type() == at::kLong && lanes->dim() == 1 &&
+                lanes->numel() == rows && lanes->is_contiguous()), "invalid DCP bounded planner lanes");
+    TORCH_CHECK((!reject || positions) && (!positions || (positions->device() == device &&
+                (positions->scalar_type() == at::kInt || positions->scalar_type() == at::kLong) &&
+                positions->dim() == 1 && positions->numel() >= (reject ? rows : actual) &&
+                positions->is_contiguous())), "invalid DCP owner causal positions");
+    TORCH_CHECK(!published || (published->device() == device && published->scalar_type() == at::kInt &&
+                (published->dim() == 2 || (published->dim() == 3 && published->size(1) == 1)) &&
+                published->size(0) >= rows && published->size(-1) >= output.size(-1) &&
+                published->stride(-1) == 1 && published->stride(0) >= output.size(-1) &&
+                published->stride(0) <= INT32_MAX && published->stride(0) % 8 == 0 &&
+                reinterpret_cast<std::uintptr_t>(published->data_ptr()) % 32 == 0 &&
+                !published->is_alias_of(output) && !published->is_alias_of(gathered)),
+                "invalid raw DCP owner publication buffer");
+    return {gathered.data_ptr(), inverse.data_ptr(), lanes ? lanes->data_ptr() : nullptr,
+            positions ? positions->data_ptr() : nullptr, published ? published->data_ptr() : nullptr,
+            static_cast<uint32_t>(gathered.size(0)), static_cast<uint32_t>(inverse.numel()),
+            static_cast<uint32_t>(rows), static_cast<uint32_t>(actual),
+            positions ? static_cast<uint32_t>(positions->element_size()) : 0U,
+            published ? static_cast<uint32_t>(published->stride(0)) : 0U, static_cast<uint32_t>(reject)};
+}
+
+template <bool QueryMembership, bool Dcp = false, typename... OwnerArgs>
 at::Tensor resident_sharded_union_common_(
     const at::Tensor &topk_indices,
     const at::Tensor &split_boundary,
@@ -1504,7 +1561,7 @@ at::Tensor resident_sharded_union_common_(
     at::Tensor &shard_miss_positions,
     at::Tensor &shard_evictable_slots,
     int64_t mtp,
-    int64_t dummy_state_base, int64_t dcp_size = 1, int64_t dcp_rank = 0)
+    int64_t dummy_state_base, int64_t dcp_size = 1, int64_t dcp_rank = 0, OwnerArgs... owner_args)
 {
     const auto dcp_bits = Dcp ? resident_dcp_bits(dcp_size, dcp_rank) : 0;
     const auto device = topk_indices.device();
@@ -1680,10 +1737,17 @@ at::Tensor resident_sharded_union_common_(
     void* shard_miss_position_ptr = shard_miss_positions.data_ptr();
     void* shard_evictable_slot_ptr = shard_evictable_slots.data_ptr();
     at_npu::native::OpCommand cmd;
-    cmd.Name(Dcp ? "npu_dsa_resident_dcp_union_" :
+    cmd.Name(sizeof...(OwnerArgs) ? "npu_dsa_resident_dcp_owner_union_" : Dcp ? "npu_dsa_resident_dcp_union_" :
         (QueryMembership ? "npu_dsa_resident_membership_union_" : "npu_dsa_resident_sharded_union_"));
-    auto launch = Dcp ? &resident_dcp::dsa_resident_sharded_union_impl :
-        (QueryMembership ? &resident_membership::dsa_resident_sharded_union_impl : ResidentKernels().union_launch);
+    auto launch = [&]() {
+        if constexpr (sizeof...(OwnerArgs) != 0) {
+            auto owner = resident_owner_rows(topk_indices, owner_args...);
+            return [owner](auto... args) { resident_dcp_owner::dsa_resident_sharded_union_impl(args..., owner); };
+        } else {
+            return Dcp ? &resident_dcp::dsa_resident_sharded_union_impl :
+                (QueryMembership ? &resident_membership::dsa_resident_sharded_union_impl : ResidentKernels().union_launch);
+        }
+    }();
     cmd.SetCustomHandler([launch,
         stream, topk_ptr, boundary_ptr, row_request_ptr,
         packed_ptr, mapping_ptr, count_ptr, request_state_ptr,
@@ -1751,7 +1815,7 @@ at::Tensor npu_dsa_resident_sharded_union_(
         shard_evictable_slots, mtp, dummy_state_base);
 }
 
-template <bool QueryMembership = false, bool Dcp = false>
+template <bool QueryMembership = false, bool Dcp = false, typename... OwnerArgs>
 static at::Tensor resident_sorted_plan_common_(
     at::Tensor &topk_indices,
     const at::Tensor &shard_packed,
@@ -1776,7 +1840,7 @@ static at::Tensor resident_sorted_plan_common_(
     bool fused_remap,
     const at::Tensor &live_origins = {},
     at::Tensor selected_counts = {},
-    int64_t dcp_size = 1, int64_t dcp_rank = 0)
+    int64_t dcp_size = 1, int64_t dcp_rank = 0, OwnerArgs... owner_args)
 {
     const auto device = topk_indices.device();
     const auto dcp_bits = Dcp ? resident_dcp_bits(dcp_size, dcp_rank) : 0;
@@ -1985,17 +2049,30 @@ static at::Tensor resident_sorted_plan_common_(
     void* miss_count_ptr = miss_counts.data_ptr();
     void* target_ptr = target_slots.data_ptr();
     at_npu::native::OpCommand cmd;
-    cmd.Name(Dcp ? "npu_dsa_resident_dcp_plan_" : (QueryMembership
+    cmd.Name(sizeof...(OwnerArgs) ? "npu_dsa_resident_dcp_owner_plan_" : Dcp ? "npu_dsa_resident_dcp_plan_" : (QueryMembership
         ? "npu_dsa_resident_membership_plan_"
         : (fused_remap
             ? "npu_dsa_resident_sorted_plan_"
             : "npu_dsa_resident_sorted_plan_no_remap_")));
-    auto impl = Dcp ? DcpResidentPlan() :
-        &resident_membership::dsa_resident_sorted_plan_impl;
-    if constexpr (!QueryMembership) {
-        const auto& kernels = ResidentKernels();
-        impl = fused_remap ? kernels.plan : kernels.plan_no_remap;
-    }
+    auto impl = [&]() {
+        if constexpr (sizeof...(OwnerArgs) != 0) {
+            const at::Tensor& gathered = std::get<0>(std::tie(owner_args...));
+            check_gathered_topk(topk_indices, gathered);
+            auto plan = DcpResidentPlan() == &resident_dcp::dsa_resident_sorted_plan_impl
+                ? &resident_dcp_owner::dsa_resident_sorted_plan_impl
+                : &resident_dcp_owner_free_slots::dsa_resident_sorted_plan_impl;
+            return [plan, packet = gathered.data_ptr(), rows = static_cast<uint32_t>(gathered.size(0))](auto... args) {
+                plan(args..., packet, rows);
+            };
+        } else if constexpr (Dcp) {
+            return DcpResidentPlan();
+        } else if constexpr (QueryMembership) {
+            return &resident_membership::dsa_resident_sorted_plan_impl;
+        } else {
+            const auto& kernels = ResidentKernels();
+            return fused_remap ? kernels.plan : kernels.plan_no_remap;
+        }
+    }();
     cmd.SetCustomHandler([impl,
         stream, topk_ptr, packed_ptr, mapping_ptr,
         shard_count_ptr, block_table_ptr, request_state_ptr,
@@ -4042,6 +4119,14 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
              resident_union_args + ", int dcp_size, int dcp_rank) -> Tensor(c!)").c_str());
     ops.impl("npu_dsa_resident_dcp_union_", torch::kPrivateUse1,
         &vllm_ascend::resident_sharded_union_common_<true, true>);
+#ifdef VLLM_ASCEND_HAS_DCP_OWNER_TOPK
+    ops.def(("npu_dsa_resident_dcp_owner_union_(Tensor(i!) topk_indices, " + resident_union_args +
+             ", int dcp_size, int dcp_rank, Tensor gathered, Tensor inverse, Tensor? lanes, Tensor? positions,"
+             " Tensor(j!)? published, int actual_rows, bool reject) -> Tensor(c!)").c_str());
+    ops.impl("npu_dsa_resident_dcp_owner_union_", torch::kPrivateUse1,
+        &vllm_ascend::resident_sharded_union_common_<true, true, const at::Tensor&, const at::Tensor&,
+            vllm_ascend::OwnerTensor, vllm_ascend::OwnerTensor, vllm_ascend::OwnerTensor, int64_t, bool>);
+#endif
     const std::string resident_plan_args =
         "(Tensor(a!) topk_indices, "
         "Tensor shard_packed, Tensor shard_mapping, "
@@ -4070,6 +4155,13 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
              " int dcp_size, int dcp_rank) -> Tensor(h!)").c_str());
     ops.impl("npu_dsa_resident_dcp_plan_", torch::kPrivateUse1,
         &vllm_ascend::resident_sorted_plan_common_<true, true>);
+#ifdef VLLM_ASCEND_HAS_DCP_OWNER_TOPK
+    ops.def(("npu_dsa_resident_dcp_owner_plan_" + resident_plan_args +
+             ", bool fused_remap, Tensor live_origins, Tensor(k!) selected_counts, int dcp_size, int dcp_rank,"
+             " Tensor gathered) -> Tensor(h!)").c_str());
+    ops.impl("npu_dsa_resident_dcp_owner_plan_", torch::kPrivateUse1,
+        &vllm_ascend::resident_sorted_plan_common_<true, true, const at::Tensor&>);
+#endif
     ops.def(
         "npu_dsa_resident_sorted_plan_no_remap_("
         "Tensor(a!) topk_indices, "

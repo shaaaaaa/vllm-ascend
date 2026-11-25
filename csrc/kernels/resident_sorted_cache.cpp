@@ -15,6 +15,9 @@
  */
 
 #include "kernel_operator.h"
+#ifdef RESIDENT_OWNER_TOPK
+#include "resident_owner_rows.h"
+#endif
 
 // Only the isolated experimental translation unit enables these fast paths.
 // The serving build keeps the original kernels without runtime flag checks.
@@ -98,6 +101,15 @@ __aicore__ inline void KeepDcpOwner(
 // the eviction field in this cacheline and preserves these three fields.
 constexpr uint32_t kMembershipValidRows = 5;
 constexpr uint32_t kMembershipBoundary = 6;
+#ifdef RESIDENT_OWNER_TOPK
+// MTP has at most two rows. Finalize preserves these words in shard zero's
+// existing 16-word record for the membership update.
+constexpr uint32_t kOwnerSourceRow = 8;
+constexpr uint32_t kOwnerCausalEnd = 10;
+constexpr uint32_t kOwnerModelRow = 12;
+constexpr int32_t kAllTokenIds = 0x7fffffff;
+struct OwnerRow { int32_t model, source, end; };
+#endif
 // Compare works on whole 256-byte vector repeats. Align assembly segments to
 // one uint32 mask word so a row owner can publish their masks independently.
 constexpr uint32_t kMembershipCompareLanes = 64;
@@ -220,6 +232,28 @@ __aicore__ inline void CopyGlobalToLocalExact(
 // to one shard-local union entry.
 class DSAResidentShardedUnionKernel {
 public:
+#ifdef RESIDENT_OWNER_TOPK
+    __aicore__ inline void InitOwner(__gm__ int32_t* gathered, __gm__ int64_t* inverse,
+        __gm__ int64_t* lanes, __gm__ int32_t* positions, __gm__ int32_t* published,
+        uint32_t gatheredRows, uint32_t inverseRows, uint32_t modelRows, uint32_t actualRows,
+        uint32_t positionBytes, uint32_t publishedStride, uint32_t reject)
+    {
+        gathered_.SetGlobalBuffer(gathered);
+        bounded_ = lanes != nullptr;
+        rowMap_.SetGlobalBuffer(bounded_ ? lanes : inverse);
+        if (positionBytes == 4) positions32_.SetGlobalBuffer(positions);
+        if (positionBytes == 8) positions64_.SetGlobalBuffer(reinterpret_cast<__gm__ int64_t*>(positions));
+        publish_ = published != nullptr;
+        if (publish_) published_.SetGlobalBuffer(published);
+        gatheredRows_ = gatheredRows;
+        inverseRows_ = inverseRows;
+        modelRows_ = modelRows;
+        actualRows_ = actualRows;
+        positionBytes_ = positionBytes;
+        publishedStride_ = publishedStride;
+        reject_ = reject != 0;
+    }
+#endif
 #ifdef RESIDENT_DCP_SHARDING
     __aicore__ inline void InitDcp(uint32_t bits, uint32_t rank)
     {
@@ -420,12 +454,41 @@ public:
         uint32_t validRows = 0;
         int32_t boundaries[2] = {};
 #endif
+#ifdef RESIDENT_OWNER_TOPK
+        OwnerRow owners[2];
+#endif
         bool paddingZeroReady = false;
         bool paddingWritePending = false;
         for (uint32_t mtpRow = 0; mtpRow < rowsPerRequest_; ++mtpRow) {
             const uint32_t row = request * rowsPerRequest_ + mtpRow;
+#ifdef RESIDENT_OWNER_TOPK
+            if (paddingWritePending) {
+                Sync<AscendC::HardEvent::MTE3_MTE2>();
+                Sync<AscendC::HardEvent::MTE3_V>();
+                paddingWritePending = false;
+            }
+            const OwnerRow owner = ResolveOwnerRow(row);
+            owners[mtpRow] = owner;
+            const bool validRequest = owner.model >= 0 &&
+                ReadGlobalScalarFresh(rowReqIndices_, owner.model) == static_cast<int32_t>(request);
+            const bool publish = publish_ && shard == 0 && owner.model >= 0;
+            if (validRequest || publish) {
+                LoadOwnerRow(input, owner, publish);
+                paddingZeroReady = false;
+                // Publication and the vector union can read the same UB row concurrently.
+                // Join before the next overwrite, including an immediate padding fill.
+                paddingWritePending = publish;
+                if (publish && !validRequest) {
+                    // A bounded padding lane needs the same -1 row for both stores.
+                    paddingZeroReady = bounded_ && owner.source < 0;
+                    if (!paddingZeroReady) Sync<AscendC::HardEvent::MTE3_V>();
+                }
+            }
+            if (!validRequest) {
+#else
             if (ReadGlobalScalarFresh(rowReqIndices_, row) !=
                 static_cast<int32_t>(request)) {
+#endif
                 // The standalone planner clears graph-padding rows.  Keep
                 // the resident planner's contract identical: its remapper
                 // deliberately preserves positions that were not selected,
@@ -433,22 +496,36 @@ public:
                 // indexer output into sparse attention.  Shard zero is the
                 // sole writer; sibling shards already skip this row.
                 if (shard == 0) {
+#ifdef RESIDENT_OWNER_TOPK
+                    if (owner.model < 0) continue;
+#endif
                     if (!paddingZeroReady) {
                         AscendC::Duplicate(
-                            input, static_cast<int32_t>(0), rowWidth_);
+                            input,
+#ifdef RESIDENT_OWNER_TOPK
+                            bounded_ ? -1 : 0,
+#else
+                            static_cast<int32_t>(0),
+#endif
+                            rowWidth_);
                         AscendC::PipeBarrier<PIPE_V>();
                         Sync<AscendC::HardEvent::V_MTE3>();
                         paddingZeroReady = true;
                     }
                     const uint64_t paddingOffset =
+#ifdef RESIDENT_OWNER_TOPK
+                        static_cast<uint64_t>(owner.model) * rowWidth_;
+#else
                         static_cast<uint64_t>(request) * requestWidth_
                         + static_cast<uint64_t>(mtpRow) * rowWidth_;
+#endif
                     CopyLocalToGlobalExact(
                         topkIndices_[paddingOffset], input, rowWidth_);
                     paddingWritePending = true;
                 }
                 continue;
             }
+#ifndef RESIDENT_OWNER_TOPK
             if (paddingWritePending) {
                 // A later valid MTP row reuses ``input`` as its MTE2
                 // destination.  Do not overwrite the zero source until all
@@ -456,21 +533,30 @@ public:
                 Sync<AscendC::HardEvent::MTE3_MTE2>();
                 paddingWritePending = false;
             }
+#endif
             paddingZeroReady = false;
+#ifndef RESIDENT_OWNER_TOPK
             const uint64_t inputOffset =
                 static_cast<uint64_t>(request) * requestWidth_
                 + static_cast<uint64_t>(mtpRow) * rowWidth_;
+#endif
             const int32_t boundary =
+#ifdef RESIDENT_OWNER_TOPK
+                ReadGlobalScalarFresh(splitBoundary_, owner.model);
+#else
                 ReadGlobalScalarFresh(splitBoundary_, row);
+#endif
 #if RESIDENT_EXPERIMENT_QUERY_MEMBERSHIP
             if (shard == 0) {
                 validRows |= 1U << mtpRow;
                 boundaries[mtpRow] = boundary;
             }
 #endif
+#ifndef RESIDENT_OWNER_TOPK
             AscendC::DataCopy(
                 input, topkIndices_[inputOffset], rowWidth_);
             Sync<AscendC::HardEvent::MTE2_V>();
+#endif
 
             // shard = token % shardCount. shardCount is a host-validated
             // power of two, but vector shift/multiply keeps this path valid
@@ -506,7 +592,13 @@ public:
                 rowWidth_);
             AscendC::PipeBarrier<PIPE_V>();
             AscendC::Mins(
-                clamped, input, boundary - 1, rowWidth_);
+                clamped, input,
+#ifdef RESIDENT_OWNER_TOPK
+                owner.end < boundary - 1 ? owner.end : boundary - 1,
+#else
+                boundary - 1,
+#endif
+                rowWidth_);
             AscendC::PipeBarrier<PIPE_V>();
             AscendC::Compare(
                 beforeBoundaryMask,
@@ -820,6 +912,13 @@ public:
             shardCounts_.SetValue(countOffset + kMembershipValidRows, static_cast<int32_t>(validRows));
             shardCounts_.SetValue(countOffset + kMembershipBoundary, boundaries[0]);
             shardCounts_.SetValue(countOffset + kMembershipBoundary + 1, boundaries[1]);
+#ifdef RESIDENT_OWNER_TOPK
+            for (uint32_t q = 0; q < rowsPerRequest_; ++q) {
+                shardCounts_.SetValue(countOffset + kOwnerSourceRow + q, owners[q].source);
+                shardCounts_.SetValue(countOffset + kOwnerCausalEnd + q, owners[q].end);
+                shardCounts_.SetValue(countOffset + kOwnerModelRow + q, owners[q].model);
+            }
+#endif
         }
 #endif
         // SetValue updates the per-core DCache first. Publish the completed
@@ -1332,6 +1431,44 @@ private:
     uint32_t dcpRank_ = 0;
 #endif
     bool deduplicate_ = false;
+#ifdef RESIDENT_OWNER_TOPK
+    __aicore__ inline OwnerRow ResolveOwnerRow(uint32_t lane)
+    {
+        const int64_t entry = bounded_ || lane < inverseRows_ ? ReadGlobalScalarFresh(rowMap_, lane) : -1;
+        const int64_t model = bounded_ ? entry >> 32 : static_cast<int64_t>(lane);
+        if (model < 0 || model >= modelRows_) return {-1, -1, -1};
+        const int64_t source = bounded_ ? static_cast<int64_t>(static_cast<uint32_t>(entry)) - 1 : entry;
+        int64_t position = kAllTokenIds;
+        if (model < actualRows_ || reject_) {
+            if (positionBytes_ == 4) position = ReadGlobalScalarFresh(positions32_, model);
+            if (positionBytes_ == 8) position = ReadGlobalScalarFresh(positions64_, model);
+        }
+        const int32_t end = model < actualRows_ && position >= 0
+            ? static_cast<int32_t>(position < kAllTokenIds ? position : kAllTokenIds) : -1;
+        return {static_cast<int32_t>(model),
+                source >= 0 && source < gatheredRows_ && !(reject_ && position < 0) ? static_cast<int32_t>(source) : -1,
+                end};
+    }
+
+    __aicore__ inline void LoadOwnerRow(AscendC::LocalTensor<int32_t> input, OwnerRow owner, bool publish)
+    {
+        if (owner.source >= 0) {
+            AscendC::DataCopy(input, gathered_[static_cast<uint64_t>(owner.source) * rowWidth_], rowWidth_);
+            Sync<AscendC::HardEvent::MTE2_V>();
+            if (publish) Sync<AscendC::HardEvent::MTE2_MTE3>();
+        } else {
+            AscendC::Duplicate(input, static_cast<int32_t>(-1), rowWidth_);
+            AscendC::PipeBarrier<PIPE_V>();
+            if (publish) Sync<AscendC::HardEvent::V_MTE3>();
+        }
+        if (publish) AscendC::DataCopy(published_[static_cast<uint64_t>(owner.model) * publishedStride_], input, rowWidth_);
+    }
+
+    AscendC::GlobalTensor<int32_t> gathered_, positions32_, published_;
+    AscendC::GlobalTensor<int64_t> rowMap_, positions64_;
+    uint32_t gatheredRows_, inverseRows_, modelRows_, actualRows_, positionBytes_, publishedStride_;
+    bool bounded_, publish_, reject_;
+#endif
 };
 
 // Test-only read probe. It never mutates resident state. For every shard it
@@ -2253,6 +2390,12 @@ private:
 
 class DSAResidentSortedUpdateKernel {
 public:
+#ifdef RESIDENT_OWNER_TOPK
+    __aicore__ inline void InitOwner(__gm__ int32_t* gathered, uint32_t rows) {
+        gathered_.SetGlobalBuffer(gathered);
+        gatheredRows_ = rows;
+    }
+#endif
 #ifdef RESIDENT_DCP_SHARDING
     __aicore__ inline void InitDcp(uint32_t bits, uint32_t rank,
         __gm__ int32_t* origins, __gm__ int32_t* counts)
@@ -2435,6 +2578,11 @@ public:
         const uint32_t query = row % rowsPerRequest_;
         const uint64_t countBase = static_cast<uint64_t>(request) * shardCountRequestStride_;
         const uint32_t firstCount = static_cast<uint32_t>(ReadGlobalScalarFresh(shardCounts_, countBase));
+#ifdef RESIDENT_OWNER_TOPK
+        const int32_t modelRow = shardCounts_.GetValue(countBase + kOwnerModelRow + query);
+        if (modelRow < 0 || static_cast<uint32_t>(modelRow) >= requestCount_ * rowsPerRequest_) return;
+        row = static_cast<uint32_t>(modelRow);
+#endif
         const uint32_t validRows = static_cast<uint32_t>(shardCounts_.GetValue(countBase + kMembershipValidRows));
         if ((validRows & (1U << query)) == 0) {
             // The union's shard zero already cleared the padding row.
@@ -2515,14 +2663,38 @@ public:
         // qualify; valid input rows have a contiguous prefix and -1 tail.
         auto input = oldTokenBuf_.Get<int32_t>();
         auto clamped = currentTokenBuf_.Get<int32_t>();
+#ifdef RESIDENT_OWNER_TOPK
+        const int32_t source = shardCounts_.GetValue(countBase + kOwnerSourceRow + query);
+        const int32_t endPosition = shardCounts_.GetValue(countBase + kOwnerCausalEnd + query);
+        if (source >= 0 && static_cast<uint32_t>(source) < gatheredRows_ && endPosition >= 0) {
+            AscendC::DataCopy(input, gathered_[static_cast<uint64_t>(source) * rowWidth_], rowWidth_);
+            Sync<AscendC::HardEvent::MTE2_V>();
+        } else {
+            AscendC::Duplicate(input, static_cast<int32_t>(-1), rowWidth_);
+            AscendC::PipeBarrier<PIPE_V>();
+        }
+#else
         AscendC::DataCopy(input, topkIndices_[rowOffset], rowWidth_);
         Sync<AscendC::HardEvent::MTE2_V>();
+#endif
         AscendC::Mins(clamped, input, boundary > 0 ? boundary - 1 : -1, rowWidth_);
         AscendC::PipeBarrier<PIPE_V>();
         AscendC::Compare(predicate, clamped, input, AscendC::CMPMODE::EQ, rowWidth_);
         AscendC::PipeBarrier<PIPE_V>();
         AscendC::Not(predicate.ReinterpretCast<uint16_t>(), predicate.ReinterpretCast<uint16_t>(), rowWidth_ / 16);
         AscendC::PipeBarrier<PIPE_V>();
+#ifdef RESIDENT_OWNER_TOPK
+        if (endPosition != kAllTokenIds) {
+            auto causal = priorSlotBuf_.Get<uint8_t>();
+            AscendC::Mins(clamped, input, endPosition, rowWidth_);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Compare(causal, clamped, input, AscendC::CMPMODE::EQ, rowWidth_);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::And(predicate.ReinterpretCast<uint16_t>(), predicate.ReinterpretCast<uint16_t>(),
+                         causal.ReinterpretCast<uint16_t>(), rowWidth_ / 16);
+            AscendC::PipeBarrier<PIPE_V>();
+        }
+#endif
 #ifdef RESIDENT_DCP_SHARDING
         KeepDcpOwner(predicate, priorSlotBuf_.Get<uint8_t>(), input, clamped, output,
             dcpBits_, dcpRank_, rowWidth_);
@@ -2942,6 +3114,10 @@ private:
     AscendC::GlobalTensor<int32_t> selectedCounts_;
     uint32_t dcpBits_ = 0;
     uint32_t dcpRank_ = 0;
+#endif
+#ifdef RESIDENT_OWNER_TOPK
+    AscendC::GlobalTensor<int32_t> gathered_;
+    uint32_t gatheredRows_;
 #endif
 #if RESIDENT_EXPERIMENT_VECTOR_STATE
     static constexpr uint32_t kStateWidth = 2048;
@@ -3683,6 +3859,12 @@ dsa_resident_sharded_union_kernel(
 #ifdef RESIDENT_DCP_SHARDING
     , uint32_t dcpBits, uint32_t dcpRank
 #endif
+#ifdef RESIDENT_OWNER_TOPK
+    , __gm__ int32_t* gathered, __gm__ int64_t* inverse, __gm__ int64_t* lanes,
+    __gm__ int32_t* positions, __gm__ int32_t* published, uint32_t gatheredRows,
+    uint32_t inverseRows, uint32_t modelRows, uint32_t actualRows, uint32_t positionBytes,
+    uint32_t publishedStride, uint32_t reject
+#endif
     )
 {
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
@@ -3699,6 +3881,10 @@ dsa_resident_sharded_union_kernel(
         shardCountStride, shardCountRequestStride, generationStride);
 #ifdef RESIDENT_DCP_SHARDING
     op.InitDcp(dcpBits, dcpRank);
+#endif
+#ifdef RESIDENT_OWNER_TOPK
+    op.InitOwner(gathered, inverse, lanes, positions, published, gatheredRows,
+                 inverseRows, modelRows, actualRows, positionBytes, publishedStride, reject);
 #endif
     op.Process();
 }
@@ -3829,6 +4015,9 @@ dsa_resident_sorted_membership_update_kernel(
     , uint32_t dcpBits, uint32_t dcpRank,
     __gm__ int32_t* liveOrigins, __gm__ int32_t* selectedCounts
 #endif
+#ifdef RESIDENT_OWNER_TOPK
+    , __gm__ int32_t* gathered, uint32_t gatheredRows
+#endif
     )
 {
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
@@ -3842,6 +4031,9 @@ dsa_resident_sorted_membership_update_kernel(
         shardCountRequestStride, generationStride);
 #ifdef RESIDENT_DCP_SHARDING
     op.InitDcp(dcpBits, dcpRank, liveOrigins, selectedCounts);
+#endif
+#ifdef RESIDENT_OWNER_TOPK
+    op.InitOwner(gathered, gatheredRows);
 #endif
     op.ProcessMembership();
 }
@@ -3955,7 +4147,11 @@ void dsa_resident_sharded_union_impl(
     uint32_t shardCountStride,
     uint32_t shardCountRequestStride,
     uint32_t generationStride,
-    uint32_t coreCount, [[maybe_unused]] uint32_t dcpBits, [[maybe_unused]] uint32_t dcpRank)
+    uint32_t coreCount, [[maybe_unused]] uint32_t dcpBits, [[maybe_unused]] uint32_t dcpRank
+#ifdef RESIDENT_OWNER_TOPK
+    , const ResidentOwnerRows& owner
+#endif
+    )
 {
     const uint32_t logicalBlockCount = requestCount * shardCount;
     dsa_resident_sharded_union_kernel<<<
@@ -3982,6 +4178,12 @@ void dsa_resident_sharded_union_impl(
         shardCountRequestStride, generationStride
 #ifdef RESIDENT_DCP_SHARDING
         , dcpBits, dcpRank
+#endif
+#ifdef RESIDENT_OWNER_TOPK
+        , static_cast<int32_t*>(owner.gathered), static_cast<int64_t*>(owner.inverse),
+        static_cast<int64_t*>(owner.lanes), static_cast<int32_t*>(owner.positions),
+        static_cast<int32_t*>(owner.published), owner.gatheredRows, owner.inverseRows,
+        owner.modelRows, owner.actualRows, owner.positionBytes, owner.publishedStride, owner.reject
 #endif
         );
 }
@@ -4020,7 +4222,11 @@ void dsa_resident_sorted_plan_impl(
     uint32_t blockTableWidth,
     uint32_t blockSize,
     uint32_t coreCount, [[maybe_unused]] uint32_t dcpBits, [[maybe_unused]] uint32_t dcpRank,
-    [[maybe_unused]] void* liveOrigins, [[maybe_unused]] void* selectedCounts)
+    [[maybe_unused]] void* liveOrigins, [[maybe_unused]] void* selectedCounts
+#ifdef RESIDENT_OWNER_TOPK
+    , void* gathered, uint32_t gatheredRows
+#endif
+    )
 {
     dsa_resident_sorted_finalize_kernel<<<
         ResidentPhysicalBlockCount(requestCount, coreCount),
@@ -4065,6 +4271,9 @@ void dsa_resident_sorted_plan_impl(
         generationStride
 #ifdef RESIDENT_DCP_SHARDING
         , dcpBits, dcpRank, static_cast<int32_t*>(liveOrigins), static_cast<int32_t*>(selectedCounts)
+#endif
+#ifdef RESIDENT_OWNER_TOPK
+        , static_cast<int32_t*>(gathered), gatheredRows
 #endif
         );
 }

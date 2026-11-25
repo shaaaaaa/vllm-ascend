@@ -16,16 +16,24 @@ def _compile(kernel, *args, **kwargs):
     kernel.warmup(*args, grid=(1,), **kwargs)
 
 
-def warmup_owner_topk(width, publication, strides, target_position, draft):
-    from vllm_ascend.ops.triton.sfa_dcp import _restore_owner_topk
+def warmup_owner_topk(width, publication, strides, target_position, draft, *, layout=None):
+    from vllm_ascend.ops.triton.sfa_dcp import _prepare_topk, _restore_owner_topk
 
     i32 = torch.int32
     variants = {(None, False, False), (target_position, True, False)}
-    if draft:  # The eager MTP builder uses private int32 causal positions.
+    if draft and layout is None:  # Standalone restore reference. Live MTP is prepared by the planner below.
         variants.update(((i32, True, False), (i32, True, True), (i32, False, True)))
     for position, causal, reject in variants:
-        _compile(_restore_owner_topk, i32, torch.int64, position, i32, publication, 1, 1, 1,
+        _compile(_restore_owner_topk, i32, torch.int64, position, i32, publication, 1, 1, 1, 1,
                  width, *strides, causal, reject, 256)
+    if layout is not None:
+        native_positions = {(target_position, False)}
+        if draft:
+            native_positions.update(((i32, False), (i32, True)))
+        for position, reject in native_positions:
+            for local, requests in ((True, None), (False, i32), (False, None)):
+                _compile(_prepare_topk, i32, position, i32, i32, requests, 1, width, 1, *layout, local,
+                         torch.int64, 1, 1, publication, *strides, reject)
 
 
 def warmup_dcp(width, heads, dtype, world, rank, block, *, draft=False):
@@ -310,7 +318,8 @@ def warmup_decode_kernels(runner):
                     warmup_indexer_rope(*geometry)
                     seen_rope.add(geometry)
     for width, publication, strides in owner_publications:
-        warmup_owner_topk(width, publication, strides, runner.positions.gpu.dtype, bool(spec_tokens))
+        warmup_owner_topk(width, publication, strides, runner.positions.gpu.dtype, bool(spec_tokens),
+                          layout=(runner.dcp_size, runner.dcp_rank, runner.block_size))
     if runner.ascend_config.indexer_hbm_block_map is not None:
         table = runner.input_batch.block_table[1].get_device_tensor()
         warmup_indexer_metadata(table.shape[1], table.stride(0))

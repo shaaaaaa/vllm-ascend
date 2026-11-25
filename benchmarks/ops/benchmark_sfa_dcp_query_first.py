@@ -187,6 +187,8 @@ class QueryFirstPipeline(AttentionPipeline):
 def main(*, comparison="query-first", pipeline_factory=QueryFirstPipeline, description=__doc__):
     parser = argparse.ArgumentParser(description=description)
     if comparison == "indexer-sharding":
+        parser.add_argument("--owner-baseline", choices=("replicated", "restore"), default="replicated",
+                            help="use restore to time the former sharded chain against direct planning")
         parser.add_argument("--owner-layout", choices=("balanced", "skewed"), default="balanced")
         parser.add_argument("--skew-history", action="store_true")
         parser.add_argument("--replicate-owner-storage", action="store_true",
@@ -264,7 +266,8 @@ def main(*, comparison="query-first", pipeline_factory=QueryFirstPipeline, descr
         "cases": [],
     }
     if comparison == "indexer-sharding":
-        results["scope"] += ", real C8 Lightning Indexer, current key/scale writes, owner ID gather/inverse"
+        results["scope"] += ", real C8 Lightning Indexer, key/scale writes, DCP owner gather and resident planning"
+        results["baseline_indexer"] = args.owner_baseline
         results["excludes"] = "quantized projection weights, TP output reduction, MoE, sampling and server scheduling"
     try:
         for layout in args.layouts:

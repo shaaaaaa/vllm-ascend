@@ -33,17 +33,19 @@ registry = load_source(
 )
 
 
-@pytest.mark.parametrize("mode", ["baseline", "membership", "dcp"])
+@pytest.mark.parametrize("mode", ["baseline", "membership", "dcp", "owner"])
 def test_resident_dispatch_keeps_selected_counts_separate_from_misses(monkeypatch, mode):
     union_name = {
         "baseline": "npu_dsa_resident_sharded_union_",
         "membership": "npu_dsa_resident_membership_union_",
         "dcp": "npu_dsa_resident_dcp_union_",
+        "owner": "npu_dsa_resident_dcp_owner_union_",
     }[mode]
     plan_name = {
         "baseline": "npu_dsa_resident_sorted_plan_",
         "membership": "npu_dsa_resident_membership_plan_",
         "dcp": "npu_dsa_resident_dcp_plan_",
+        "owner": "npu_dsa_resident_dcp_owner_plan_",
     }[mode]
     union, plan = Mock(), Mock()
     monkeypatch.setattr(torch.ops._C_ascend, union_name, union, raising=False)
@@ -56,14 +58,17 @@ def test_resident_dispatch_keeps_selected_counts_separate_from_misses(monkeypatc
     workspace = resident.allocate_sorted_resident_workspace(1, 2, device=topk.device)
     counts = torch.empty((2, 16), dtype=torch.int32)
     origins = torch.tensor([4096], dtype=torch.int32)
-    dcp = resident.ResidentDcpLayout(4, 2, origins, counts) if mode == "dcp" else None
+    dcp = resident.ResidentDcpLayout(4, 2, origins, counts) if mode in ("dcp", "owner") else None
+    extra = dict(gathered=torch.empty(4, 1, 2048, dtype=torch.int32), inverse=torch.tensor([3, 0]),
+                 lanes=None, positions=None, published=None, actual_rows=2, reject=False) if mode == "owner" else {}
+    owner = NS(**extra) if extra else None
     resident.prepare_resident_sharded_union_(
         topk, topk[:, 0, 0], topk[:, 0, 0], indices, generations, state, workspace,
-        mtp=2, query_membership=mode == "membership", dcp=dcp,
+        mtp=2, query_membership=mode == "membership", dcp=dcp, owner_topk=owner,
     )
     tokens, misses, slots = resident.prepare_sorted_resident_cache_fused_(
         topk, table, indices, generations, state, workspace,
-        block_size=128, query_membership=mode == "membership", dcp=dcp,
+        block_size=128, query_membership=mode == "membership", dcp=dcp, owner_topk=owner,
     )
     assert tokens is workspace.miss_tokens and slots is workspace.target_slots
     assert misses.data_ptr() == workspace.miss_counts.data_ptr()
@@ -71,7 +76,8 @@ def test_resident_dispatch_keeps_selected_counts_separate_from_misses(monkeypatc
     plan.assert_called_once()
     assert union.call_args.args[-2:] == (2, state.dummy_state_base)
     assert plan.call_args.args[-2:] == (128, state.dummy_state_base)
-    assert union.call_args.kwargs == ({"dcp_size": 4, "dcp_rank": 2} if dcp is not None else {})
+    assert union.call_args.kwargs == ({"dcp_size": 4, "dcp_rank": 2, **extra} if dcp is not None else {})
+    assert plan.call_args.kwargs.get("gathered") is extra.get("gathered")
     if dcp is None:
         assert not plan.call_args.kwargs
     else:

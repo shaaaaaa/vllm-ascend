@@ -1030,6 +1030,12 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
     ops.impl(
         "npu_dsa_resident_dcp_union_",
         &vllm_ascend::meta::npu_dsa_resident_sharded_union_meta<int64_t, int64_t>);
+#ifdef VLLM_ASCEND_HAS_DCP_OWNER_TOPK
+    using OwnerTensor = const c10::optional<at::Tensor>&;
+    ops.impl("npu_dsa_resident_dcp_owner_union_",
+        &vllm_ascend::meta::npu_dsa_resident_sharded_union_meta<int64_t, int64_t, const at::Tensor&,
+            const at::Tensor&, OwnerTensor, OwnerTensor, OwnerTensor, int64_t, bool>);
+#endif
     ops.impl(
         "npu_dsa_resident_sorted_plan_",
         &vllm_ascend::meta::npu_dsa_resident_sorted_plan_meta<>);
@@ -1039,6 +1045,11 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
     ops.impl(
         "npu_dsa_resident_dcp_plan_",
         &vllm_ascend::meta::npu_dsa_resident_sorted_plan_meta<bool, const at::Tensor&, at::Tensor, int64_t, int64_t>);
+#ifdef VLLM_ASCEND_HAS_DCP_OWNER_TOPK
+    ops.impl("npu_dsa_resident_dcp_owner_plan_",
+        &vllm_ascend::meta::npu_dsa_resident_sorted_plan_meta<bool, const at::Tensor&, at::Tensor,
+            int64_t, int64_t, const at::Tensor&>);
+#endif
     ops.impl(
         "npu_dsa_resident_sorted_plan_no_remap_",
         &vllm_ascend::meta::npu_dsa_resident_sorted_plan_meta<>);

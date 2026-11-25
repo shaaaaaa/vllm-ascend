@@ -57,8 +57,9 @@ def generate(source: str, header: Path, *, variants=(("baseline", 0), ("optimize
             raise ValueError(f"Expected exactly one definition of {name}")
         match = matches[0]
         arguments = []
+        parameters = re.sub(r"(?ms)^#ifdef RESIDENT_OWNER_TOPK\n.*?^#endif\n", "", match[1])
         parameters = re.sub(r"(?ms)^#ifdef RESIDENT_DCP_SHARDING\n(.*?)^#endif\n",
-                            r"\1" if dcp else "", match[1])
+                            r"\1" if dcp else "", parameters)
         for parameter in parameters.split(","):
             pointer = re.fullmatch(r"\s*__gm__\s+(int(?:16|32|64)_t)\*\s+(\w+)\s*", parameter)
             if pointer:

@@ -199,7 +199,8 @@ def decoder_dcp(policy, monkeypatch):
         data_parallel_size=1, distributed_executor_backend="mp",
     )
     vllm.additional_config = {}
-    ops = NS(npu_sparse_flash_attention_dcp=True, npu_dsa_resident_dcp_union_=True, npu_dsa_resident_dcp_plan_=True)
+    ops = NS(npu_sparse_flash_attention_dcp=True, npu_dsa_resident_dcp_union_=True, npu_dsa_resident_dcp_plan_=True,
+             npu_dsa_resident_dcp_owner_union_=True, npu_dsa_resident_dcp_owner_plan_=True)
     ns = policy.ns
     envs = NS(
         VLLM_ASCEND_DSA_UNBUNDLE=True, VLLM_ASCEND_DSA_TWO_GROUPS=True,
@@ -496,6 +497,16 @@ def test_decoder_dcp_charges_measured_attention_peak_before_kv_sizing(decoder_dc
     assert profiler.determine_available_memory() == (5200 if marked else 6100)
     assert calls == (["model", "sfa"] if marked else ["model"])
     assert sync.call_count == int(marked)
+
+
+def test_only_request_sharding_requires_owner_native_kernels(decoder_dcp):
+    ctx = decoder_dcp
+    del ctx.ops.npu_dsa_resident_dcp_owner_union_
+    ctx.envs.VLLM_ASCEND_DSA_DCP_INDEXER_REQUEST_SHARDING = False
+    ctx.worker._configure_dsa_decoder_dcp()
+    ctx.envs.VLLM_ASCEND_DSA_DCP_INDEXER_REQUEST_SHARDING = True
+    with pytest.raises(ValueError, match="Rebuild vllm-ascend"):
+        ctx.worker._configure_dsa_decoder_dcp()
 
 
 @pytest.mark.parametrize("reader,version,success", [

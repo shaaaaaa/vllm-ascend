@@ -7,7 +7,43 @@ import pytest
 import torch
 
 from tests.ut.compilation.sfa_test_support import ROOT, HostTL, Pointer, extract
-from vllm_ascend.worker.dcp_indexer import OwnerRows, bind_block_tables, owner_rows
+from vllm_ascend.worker.dcp_indexer import OwnerRows, OwnerWorkspace, bind_block_tables, owner_rows, planner_owner_rows
+
+
+@pytest.mark.parametrize("lengths", [(2, 2, 2), (1, 2, 1), (0, 1, 2), (), (0, 0, 0)])
+def test_bounded_owner_lanes_are_a_bijection_including_graph_padding(lengths):
+    starts = np.cumsum((0, *lengths))
+    inverse = np.array([5, -1, 3, 0, 11, -1], np.int64)
+    packed = planner_owner_rows(starts, inverse, 2)
+    lanes = packed >> 32
+    assert sorted(lanes.tolist()) == list(range(6))
+    np.testing.assert_array_equal((packed & 0xffffffff) - 1, inverse[lanes])
+    for req, width in enumerate(lengths):
+        assert lanes[2 * req:2 * req + width].tolist() == list(range(starts[req], starts[req + 1]))
+        assert np.all(lanes[2 * req + width:2 * req + 2] >= starts[-1])
+
+
+def test_owner_workspace_refreshes_bounded_lanes_without_allocating_on_replay():
+    copies = []
+    def make(n, *, dtype):
+        host = torch.zeros(n, dtype=dtype)
+        device = torch.empty_like(host)
+        def copy(rows):
+            copies.append(rows)
+            return device[:rows].copy_(host[:rows])
+        return NS(np=host.numpy(), copy_to_gpu=copy)
+
+    ws = OwnerWorkspace(NS(max_num_tokens=8, max_num_reqs=4, decode_threshold=2, _make_buffer=make))
+    def update(lengths, bounded):
+        return ws.update([1, 0, 1], np.cumsum((0, *lengths)), 0, 2, 3, 6, 6, ("b", "c", "a"), bounded)
+
+    first = update((1, 2, 1), 2)
+    assert (first.planner_lanes >> 32).tolist() == [0, 4, 1, 2, 3, 5]
+    assert len(copies) == 6 and update((1, 2, 1), 2) is first and len(copies) == 6
+    second = update((2, 1, 2), 2)
+    assert second.planner_lanes.data_ptr() == first.planner_lanes.data_ptr()
+    assert (second.planner_lanes >> 32).tolist() == [0, 1, 2, 5, 3, 4]
+    assert update((2, 2, 2), 0).planner_lanes is None and copies[-1] == 6
 
 
 @pytest.fixture
@@ -128,7 +164,7 @@ def test_different_worker_orders_restore_the_same_request_values(monkeypatch, re
                                                   (True, True, True), (False, True, False)])
 def test_one_owner_launch_publishes_raw_and_prepares_private_topk(extent, width, causal, reject, private,
                                                                 monkeypatch, restore_launches):
-    inverse = torch.tensor([4, 1, -1, 3, 0])
+    inverse = torch.tensor([4, 1, -1, 3, 6])
     rows = OwnerRows(None, None, None, None, None, inverse)
     packets = (torch.arange(6 * width, dtype=torch.int32).view(6, 1, width) % 541) - 4
     gathers = []
@@ -148,7 +184,7 @@ def test_one_owner_launch_publishes_raw_and_prepares_private_topk(extent, width,
                           published=published, reject=reject)
     raw = torch.full_like(result, -1)
     for i, src in enumerate(inverse[:extent].tolist()):
-        if src >= 0 and (not reject or pos[i] >= 0):
+        if 0 <= src < packets.size(0) and (not reject or pos[i] >= 0):
             raw[i] = packets[src]
     expected = raw.clone()
     if causal:
@@ -202,6 +238,11 @@ def test_sharded_indexer_chooses_private_planner_only_for_global_rows(native, la
         assert result is not dcp.topk and torch.equal(result, raw)
     assert len(restore_launches) == 1
 
+    deferred = select(impl, seq, seq, (None, None, None), metadata, None, None, seq, seq, seq, owner, n,
+                      NS(world_size=1, device_group=None), owner_positions=None if native else pos,
+                      gather_for_planner=True)
+    assert torch.equal(deferred.gathered, packet) and deferred.inverse is owner.inverse
+    assert deferred.published is impl.topk_indices_buffer and len(restore_launches) == 1
     if native and layout == "uniform":
         def unexpected_prepare(*args, **kwargs):
             pytest.fail("the native planner launched a second global mask")
@@ -212,4 +253,11 @@ def test_sharded_indexer_chooses_private_planner_only_for_global_rows(native, la
         metadata.block_table, metadata.resident_state_indices, metadata.resident_state_generations = seq, seq, seq
         impl.decode_threshold = 1
         impl._prepare_sorted_resident_sparse_cache = lambda t, *args, **kwargs: (t, None, None, None)
-        extract(sfa, "_plan_native_dcp_topk", {})(impl, result, metadata, dcp)
+        plan = extract(sfa, "_plan_native_dcp_topk", {})
+        plan(impl, result, metadata, dcp)
+        metadata.num_actual_tokens = deferred.actual_rows = n
+        def direct(topk, *args, owner_topk, **kwargs):
+            assert topk.data_ptr() == dcp.topk.data_ptr() and owner_topk is deferred
+            return topk, 1, 2, 3
+        impl._prepare_sorted_resident_sparse_cache = direct
+        assert plan(impl, deferred, metadata, dcp) == (1, 2, 3)

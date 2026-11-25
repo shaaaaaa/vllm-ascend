@@ -113,6 +113,8 @@ def test_uniform_planner_bypasses_pack_and_matches_bounded(requests, padded, wid
             self=SimpleNamespace(_prepare_decode_sparse_indices=plan),
             topk_indices=topk,
             dcp=None,
+            owner_source=None,
+            shared_topk_ready=False,
             resident_reads=None,
             resident_writes=None,
             remap_boundary=boundary,

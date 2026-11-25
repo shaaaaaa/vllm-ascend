@@ -11,7 +11,7 @@ from benchmark_sfa_target_preparation import BLOCK, QUERY_ROWS, TOPK
 class IndexerPipeline(QueryFirstPipeline):
     def __init__(self, args, inputs, sources, group, candidate):
         from vllm_ascend.attention.sfa_v1 import AscendSFAImpl
-        from vllm_ascend.worker.dcp_indexer import OwnerRows, owner_rows
+        from vllm_ascend.worker.dcp_indexer import OwnerRows, owner_rows, planner_owner_rows
 
         frames, rows, ends = inputs
         history = [args.history // 2 if args.skew_history and i % 2 else args.history for i in range(args.requests)]
@@ -29,10 +29,18 @@ class IndexerPipeline(QueryFirstPipeline):
             device=self.device,
             dtype=torch.long,
         )
-        packed = max(owners.count(r) for r in range(args.dcp_size))
         starts = [0, *ends.cpu().tolist()[: args.requests]]
-        arrays = owner_rows(owners, starts, args.rank, args.dcp_size, packed, packed * QUERY_ROWS, len(rows))
-        self.owner_rows = OwnerRows(*(torch.from_numpy(a).to(self.device) for a in arrays)) if candidate else None
+        self.direct_owner = candidate
+        sharded = candidate or getattr(args, "owner_baseline", "replicated") == "restore"
+        self.owner_rows = None
+        if sharded:
+            packed = max(owners.count(r) for r in range(args.dcp_size))
+            arrays = owner_rows(owners, starts, args.rank, args.dcp_size, packed, packed * QUERY_ROWS, len(rows))
+            self.owner_rows = OwnerRows(*(torch.from_numpy(a).to(self.device) for a in arrays))
+        if candidate and args.layout != "uniform":
+            self.owner_rows.planner_lanes = torch.from_numpy(
+                planner_owner_rows(starts, arrays[-1], QUERY_ROWS)
+            ).to(self.device)
 
         g = torch.Generator().manual_seed(args.seed + 193)
 
@@ -73,7 +81,7 @@ class IndexerPipeline(QueryFirstPipeline):
         scales = [torch.ones(1, BLOCK, 1, 1, dtype=torch.float16)]
         cursor = 1
         for i, n in enumerate(pages):
-            if candidate and not args.replicate_owner_storage and owners[i] != args.rank:
+            if sharded and not args.replicate_owner_storage and owners[i] != args.rank:
                 continue
             rng = torch.Generator().manual_seed(args.seed + 313 + i)
             table[i, :n] = torch.arange(cursor, cursor + n)
@@ -119,8 +127,12 @@ class IndexerPipeline(QueryFirstPipeline):
             owner.store(slots, keys, scales, self.idx_cache)
         out = None
         if owner is not None:
-            out = (self.impl.shared_resident_plan.plans[self.capacity][0]
-                   if self.args.layout == "uniform" and self.args.shared_plan else self.dcp.topk)
+            out = self.dcp.topk
+            if self.args.shared_plan:
+                if self.args.layout == "uniform":
+                    out = self.impl.shared_resident_plan.plans[self.capacity][0]
+                elif self.direct_owner:
+                    out = self.impl.shared_resident_plan.attention_topk
         ids = self.indexer.indexer_select_post_process(
             ix,
             q_c,
@@ -135,10 +147,13 @@ class IndexerPipeline(QueryFirstPipeline):
             model_tokens=self.tokens,
             dcp_group=self.group,
             owner_output=out,
+            gather_for_planner=owner is not None and self.direct_owner,
         )
         if owner is None:
             ids = torch.where((self.rows >= 0).view(-1, 1, 1), ids, -1)
             return self.prepare((ids, pos))
+        if self.direct_owner:
+            return self.prepare((out, pos), owner_prepared=True, owner_source=ids)
         return self.prepare((ids, pos), owner_prepared=True)
 
     def snapshot(self, *, include_cache=True):
