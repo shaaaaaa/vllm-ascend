@@ -105,10 +105,10 @@ class QueryFirstPipeline(AttentionPipeline):
 
     def _project_queries(self, impl, q_c, cos, sin, mode):
         q, r = impl._q_proj_and_k_up_proj(q_c)
-        if mode in ("fused", "fused_contiguous"):
+        if mode == "fused":
             from vllm_ascend.ops.triton.sfa_query import rope_sfa_dcp_query_packet
 
-            packet = rope_sfa_dcp_query_packet(q, r, cos, sin, contiguous=mode == "fused_contiguous")
+            packet = rope_sfa_dcp_query_packet(q, r, cos, sin)
             return q, packet[..., LATENT:], packet
         return q, impl.rope_single(r, cos, sin), None
 
@@ -211,9 +211,9 @@ def main(*, comparison="query-first", pipeline_factory=QueryFirstPipeline, descr
         )
         parser.add_argument("--prefetch-after-pack", action="store_true")
     if comparison == "packet-io":
-        stages = ("output", "direct", "fused", "fused_contiguous")
+        stages = ("output", "direct", "fused")
         parser.add_argument("--reference-stage", choices=("off", *stages), default="off")
-        parser.add_argument("--stages", nargs="+", choices=stages, default=["output", "direct", "fused"])
+        parser.add_argument("--stages", nargs="+", choices=stages, default=list(stages))
         parser.add_argument(
             "--serial-aiv-cores", type=int, default=0,
             help="candidate serial H2D cap (0 = automatic); prefetch stays capped at 12",

@@ -12,7 +12,6 @@ existing Cube L1 tile.
 | `output` | Same as baseline | Native send packet |
 | `direct` | Native RoPE, packet construction, gather, direct L1 load | Native send packet |
 | `fused` | One RoPE/packet writer, gather, direct L1 load | Native send packet |
-| `fused_contiguous` | Same writer with one contiguous 64-element RoPE read per head and two on-chip permutations | Native send packet |
 
 ## Build and check packet parity
 
@@ -59,8 +58,6 @@ slowest-rank median in microseconds per whole four-layer group and its percentag
 reduction. Positive values mean the candidate ran faster.
 
 To isolate the loader, use `--reference-stage output --stages direct`.
-To isolate bridge fusion on the same communicator and inputs, use
-`--reference-stage direct --stages fused`.
 
 ### Trials with 12-AIV prefetch
 
@@ -72,7 +69,7 @@ Each eligible side-stream prefetch uses at most 12 AIVs in both arms.
 | Trial | Arguments to append | What varies |
 |---|---|---|
 | Critical-path copy | `--reference-stage fused --stages fused --serial-aiv-cores 12 --json serial-aiv.json` | Only the serial H2D grid changes from automatic to 12 |
-| Contiguous RoPE | `--reference-stage fused --stages fused_contiguous --json contiguous-rope.json` | Only the raw RoPE load and in-kernel lane permutation change |
+| Fused query RoPE | `--reference-stage direct --stages fused --json fused-rope.json` | Native query RoPE plus a packet copy versus the fused writer |
 
 The automatic serial grid uses all hardware AIVs up to the selected tensor's
 capacity. The kernel partitions actual misses on the device. For the same
@@ -99,12 +96,9 @@ to inspect the final chain and native SFA duration.
 ## Serving
 
 The startup setting `VLLM_ASCEND_SFA_DCP_PACKET_IO` defaults to `off`. After
-qualification, set it to `output`, `direct`, `fused` or `fused_contiguous` on all decoder ranks and
+qualification, set it to `output`, `direct` or `fused` on all decoder ranks and
 restart. It applies to full target DCP graphs using a shared resident plan.
 The existing gather and H2D settings still select when communication starts.
 The fused bridge combines latent packing with the documented
 [InterleaveRope](https://gitcode.com/cann/ops-transformer/tree/9.0.0-beta.1/posembedding/interleave_rope)
 arithmetic and preserves the original FP32 multiply/add rounding sequence.
-The contiguous trial reuses the existing native packet operator. An editable
-installation with the native packet build needs updated Python sources and a
-worker restart for the new Triton specialization.

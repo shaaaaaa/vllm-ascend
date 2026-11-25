@@ -46,7 +46,6 @@ def query_first_world():
         ("output", True),
         ("direct", True),
         ("fused", True),
-        ("fused_contiguous", True),
         ("serial-12-aiv", True),
     ],
 )
@@ -89,7 +88,7 @@ def test_query_first_group_replay(
         value_dim=128,
         query_first=query_first,
         stage="fused" if comparison == "serial-12-aiv" else comparison,
-        reference_stage="fused" if comparison in ("serial-12-aiv", "fused_contiguous") else "off",
+        reference_stage="fused" if comparison == "serial-12-aiv" else "off",
         serial_aiv_cores=12 if comparison == "serial-12-aiv" else 0,
         reference_serial_aiv_cores=0,
         unpack_placement="both",
@@ -106,7 +105,6 @@ def test_query_first_group_replay(
         "output": packet_pipeline,
         "direct": packet_pipeline,
         "fused": packet_pipeline,
-        "fused_contiguous": packet_pipeline,
         "serial-12-aiv": packet_pipeline,
     }[comparison]
     result = measure_case(args, control, pipeline_factory=factory)

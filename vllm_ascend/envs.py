@@ -273,8 +273,7 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Positive vector-program cap for side-stream unpack only. Default 12; startup-only, non-sensitive.
     "VLLM_ASCEND_SFA_DCP_UNPACK_CORES": lambda: int(os.getenv("VLLM_ASCEND_SFA_DCP_UNPACK_CORES", "12")),
     # Experimental full target DCP graphs. off (default), output (native send packet),
-    # direct (also consume gathered Q), fused (also fuse query RoPE and gather packing),
-    # fused_contiguous (fused with one contiguous raw RoPE load per head).
+    # direct (also consume gathered Q), fused (also fuse query RoPE and gather packing).
     # Non-sensitive; identical on participating workers; restart required.
     "VLLM_ASCEND_SFA_DCP_PACKET_IO": lambda: os.getenv("VLLM_ASCEND_SFA_DCP_PACKET_IO", "off").strip().lower(),
     # Full DCP graph serial H2D only. 0 (default) uses the automatic grid; a positive uint32 caps AIVs.

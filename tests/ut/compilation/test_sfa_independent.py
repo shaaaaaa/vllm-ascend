@@ -324,10 +324,10 @@ def test_dcp_packet_contract_records_native_io_mode(dcp_contract_runner, monkeyp
     monkeypatch.setenv("VLLM_ASCEND_SFA_DCP_EARLY_GATHER", "1")
     monkeypatch.setenv("VLLM_ASCEND_SFA_DCP_EARLY_UNPACK", "producer")
     digests = set()
-    for mode in ("off", "output", "direct", "fused", "fused_contiguous"):
+    for mode in ("off", "output", "direct", "fused"):
         monkeypatch.setenv("VLLM_ASCEND_SFA_DCP_PACKET_IO", mode)
         digests.add(independent.execution_contract(runner)["digest"])
-    assert len(digests) == 5
+    assert len(digests) == 4
     before = independent.execution_contract(runner)["digest"]
     monkeypatch.setenv("VLLM_ASCEND_SFA_DCP_UNPACK_CORES", "3")
     assert independent.execution_contract(runner)["digest"] == before

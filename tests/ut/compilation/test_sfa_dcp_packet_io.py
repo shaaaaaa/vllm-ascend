@@ -17,11 +17,7 @@ from test_sfa_dcp_tuning import async_ops, gather_queries  # noqa: F401
 
 
 @pytest.mark.parametrize("early", [False, True])
-@pytest.mark.parametrize(
-    "active,mode",
-    [(True, "output"), (True, "direct"), (True, "fused"), (True, "fused_contiguous"),
-     (False, "fused"), (False, "fused_contiguous")],
-)
+@pytest.mark.parametrize("active,mode", [(True, "output"), (True, "direct"), (True, "fused"), (False, "fused")])
 def test_full_operator_preserves_gather_placement_and_packet_lifetime(monkeypatch, early, active, mode):
     events = []
     q, r = (torch.zeros(2, 8, n) for n in (512, 64))
@@ -37,15 +33,14 @@ def test_full_operator_preserves_gather_placement_and_packet_lifetime(monkeypatc
         _shared_retrieval_edges=lambda: ({}, {}),
     )
 
-    def fused(q_in, r_in, cos, sin, *, contiguous):
+    def fused(q_in, r_in, cos, sin):
         assert q_in is q and r_in is r
-        assert contiguous == (mode == "fused_contiguous")
         events.append("rope_packet")
         return packet
 
     def submit(q_in, r_in, group, *, packet_mode, packet=None):
         assert packet_mode == mode and q_in is q
-        if mode in ("fused", "fused_contiguous"):
+        if mode == "fused":
             assert r_in.data_ptr() == packet[..., 512:].data_ptr()
         else:
             assert packet is None
@@ -78,7 +73,7 @@ def test_full_operator_preserves_gather_placement_and_packet_lifetime(monkeypatc
         },
     )
     run(q, False, q, "layer", "", [], [])
-    expected = ["rope_packet"] if active and mode in ("fused", "fused_contiguous") else []
+    expected = ["rope_packet"] if active and mode == "fused" else []
     if active and early:
         expected.append("gather")
     assert events == expected + ["plan", "retrieve"] + (["gather"] if active and not early else []) + ["attention"] + (
@@ -88,8 +83,7 @@ def test_full_operator_preserves_gather_placement_and_packet_lifetime(monkeypatc
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("rows,heads", [(1, 1), (2, 8), (7, 16)])
-@pytest.mark.parametrize("contiguous", [False, True])
-def test_fused_packet_preserves_latent_bits_and_interleave_rope(dtype, rows, heads, contiguous):
+def test_fused_packet_preserves_latent_bits_and_interleave_rope(dtype, rows, heads):
     rng = torch.Generator().manual_seed(9)
     bits = torch.randint(-32768, 32768, (heads, rows, 512), generator=rng, dtype=torch.int16).transpose(0, 1)
     r = torch.randn((rows, heads, 192), generator=rng, dtype=dtype)[..., 128:]
@@ -99,14 +93,6 @@ def test_fused_packet_preserves_latent_bits_and_interleave_rope(dtype, rows, hea
     s[0, :2] = s.new_tensor([1, -1])
     out = torch.empty(rows, heads, 576, dtype=dtype)
     tl = DcpTL()
-    raw_reads = []
-
-    def load(ptr):
-        if ptr.data.data_ptr() == r.data_ptr():
-            raw_reads.append(ptr.offset)
-        return DcpTL.load(ptr)
-
-    tl.load = load
     kernel = extract(ROOT / "vllm_ascend/ops/triton/sfa_query.py", "_rope_query_packet", {"tl": tl})
     tl.programs = 3
     for pid in range(tl.programs):
@@ -119,18 +105,14 @@ def test_fused_packet_preserves_latent_bits_and_interleave_rope(dtype, rows, hea
             *r.stride()[:2],
             c.stride(0),
             s.stride(0),
-            CONTIGUOUS=contiguous,
         )
-    assert len(raw_reads) == rows * heads * (1 if contiguous else 2)
-    if contiguous:
-        assert all(torch.equal(offset, offset[0] + torch.arange(64)) for offset in raw_reads)
     even, odd = r.float()[..., ::2], r.float()[..., 1::2]
     ref = torch.cat((even, odd), -1) * c.float()[:, None] + torch.cat((-odd, even), -1) * s.float()[:, None]
     assert torch.equal(out[..., :512].view(torch.int16), bits)
     assert torch.equal(out[..., 512:].view(torch.int16), ref.to(dtype).view(torch.int16))
 
 
-@pytest.mark.parametrize("mode", ["output", "direct", "fused", "fused_contiguous"])
+@pytest.mark.parametrize("mode", ["output", "direct", "fused"])
 @pytest.mark.parametrize("after_pack", [False, True])
 def test_candidate_consumes_one_gather_and_one_send(request, monkeypatch, mode, after_pack):
     events = []
@@ -139,7 +121,7 @@ def test_candidate_consumes_one_gather_and_one_send(request, monkeypatch, mode, 
     group = NS(device_group="dcp", world_size=2)
     packet = torch.cat((q, rope), -1)
     gather = ns["start_sfa_dcp_query_gather"](
-        q, rope, group, packet=packet if mode in ("fused", "fused_contiguous") else None, packet_mode=mode
+        q, rope, group, packet=packet if mode == "fused" else None, packet_mode=mode
     )
     if mode != "output":
         ns["_unpack_sfa_dcp_queries"] = lambda *a: pytest.fail("unexpected query unpack")
@@ -190,7 +172,7 @@ def test_candidate_consumes_one_gather_and_one_send(request, monkeypatch, mode, 
 
 @pytest.mark.parametrize(
     "reference,stage",
-    [("off", "output"), ("off", "direct"), ("direct", "fused"), ("fused", "fused_contiguous"), ("fused", "fused")],
+    [("off", "output"), ("off", "direct"), ("direct", "fused"), ("fused", "fused")],
 )
 @pytest.mark.parametrize("ref_cap,cap", [(0, 0), (0, 12), (12, 0), (12, 12)])
 def test_benchmark_selects_reference_and_candidate(monkeypatch, reference, stage, ref_cap, cap):

@@ -522,7 +522,7 @@ def sfa_forward_full(
         nonlocal packet
         from vllm_ascend.ops.triton.sfa_query import rope_sfa_dcp_query_packet
 
-        packet = rope_sfa_dcp_query_packet(query, rope, cos, sin, contiguous=packet_mode == "fused_contiguous")
+        packet = rope_sfa_dcp_query_packet(query, rope, cos, sin)
         return packet[..., query.shape[-1]:]
 
     def query_ready(query, rope):
@@ -544,7 +544,7 @@ def sfa_forward_full(
             resident_reads=resident_reads or None, resident_writes=resident_writes or None,
             copy_bridge=not direct, **({"query_ready": query_ready} if early else {}),
             **({"query_first": True} if query_first else {}),
-            **({"packet_rope": packet_rope} if packet_mode in ("fused", "fused_contiguous") else {}),
+            **({"packet_rope": packet_rope} if packet_mode == "fused" else {}),
         )
         impl.cross_layer_lmcache_retrieve(
             attn_layer_name, next_layer_name, selected, counts, slots, metadata, context,
