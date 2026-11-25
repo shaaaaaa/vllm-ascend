@@ -2573,7 +2573,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         # Convert from (N, B, L) to (B, N, L)
         return ql_nope.transpose(0, 1), q_pe
 
-    def _v_up_proj(self, x):
+    def _v_up_proj(self, x, *, copy_edge=None):
         if x.dtype in (torch.float16, torch.bfloat16) and hasattr(torch_npu, "npu_transpose_batchmatmul"):
             # Backport vllm-project/vllm-ascend#17141. Older CANN binaries
             # require heads * rank < 65536 for the internal transpose.
@@ -2585,7 +2585,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                         "[SFA_VUP] branch=npu_transpose_batchmatmul input_transpose=internal",
                         scope="process",
                     )
-                x = torch_npu.npu_transpose_batchmatmul(x, self.W_UV, perm_x1=(1, 0, 2), perm_y=(1, 0, 2))
+                perm_x1 = (1, 0, 2)
             else:
                 x = x.view(-1, self.local_num_heads, self.kv_lora_rank).transpose(0, 1).contiguous()
                 if not torch.compiler.is_compiling():
@@ -2593,7 +2593,10 @@ class AscendSFAImpl(MLAAttentionImpl):
                         "[SFA_VUP] branch=npu_transpose_batchmatmul input_transpose=explicit",
                         scope="process",
                     )
-                x = torch_npu.npu_transpose_batchmatmul(x, self.W_UV, perm_x1=(0, 1, 2), perm_y=(1, 0, 2))
+                perm_x1 = (0, 1, 2)
+            window = copy_edge is not None and x.is_contiguous() and self.W_UV.is_contiguous()
+            with copy_edge.cube_window("vup") if window else nullcontext():
+                x = torch_npu.npu_transpose_batchmatmul(x, self.W_UV, perm_x1=perm_x1, perm_y=(1, 0, 2))
             x = x.reshape(-1, self.local_num_heads * self.v_head_dim)
         else:
             if not torch.compiler.is_compiling():
@@ -3813,10 +3816,14 @@ class AscendSFAImpl(MLAAttentionImpl):
             block_table_override=block_table,
             trace_label=trace_label,
         )
+        edge = None
         if prefetch is not None:
             edge, selected, counts, slots, destinations = prefetch
             edge.launch(selected, counts, slots, destinations)
-        attn_output = self._v_up_proj(attn_output)
+        if edge is not None and edge.gate is not None:
+            attn_output = self._v_up_proj(attn_output, copy_edge=edge)
+        else:
+            attn_output = self._v_up_proj(attn_output)
         weight_prefetch_method = get_weight_prefetch_method()
         weight_prefetch_method.maybe_prefetch_mla_or_sla_weight_in_current_stream(
             inputs=self.o_proj.weight,

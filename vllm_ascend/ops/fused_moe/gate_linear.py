@@ -20,8 +20,11 @@ from __future__ import annotations
 import torch
 from torch.nn.parameter import Parameter
 from vllm.logger import logger
+from vllm.model_executor.layers.batch_invariant import vllm_is_batch_invariant
 from vllm.model_executor.layers.fused_moe.router.gate_linear import GateLinear
 from vllm.model_executor.layers.linear import ReplicatedLinear
+
+from vllm_ascend import envs
 
 
 class AscendGateLinear(GateLinear):
@@ -46,6 +49,16 @@ class AscendGateLinear(GateLinear):
             force_fp32_compute=True,
             prefix=prefix,
         )
+        # Tag only the bias-free FP32 router of this decoder layer. The tag
+        # survives compilation before KV layout/graph keys exist.
+        self.sfa_router_attention_name = None
+        if (
+            envs.VLLM_ASCEND_SFA_PREFETCH_MAIN_GATE
+            and not bias
+            and prefix.endswith(".mlp.gate")
+            and not vllm_is_batch_invariant()
+        ):
+            self.sfa_router_attention_name = prefix.removesuffix(".mlp.gate") + ".self_attn.attn"
         logger.info_once(
             "[FP32_ROUTER_CHECK] impl=%s weight=%s configured_out=%s",
             type(self).__name__,

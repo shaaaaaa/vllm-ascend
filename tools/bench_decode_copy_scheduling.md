@@ -53,10 +53,19 @@ python -m pytest -q --confcutdir=tests/v1 tests/v1/test_sparse_graph_transfer_np
 
 Use the existing D workers with full target graphs, shared resident planning
 and shared retrieval overlap. Set `VLLM_ASCEND_SFA_PREFETCH_MAIN_GATE=1`
-and restart D. One copy kernel is the default. The startup line containing
-`SFA main-path gate captured` reports the number of consumer release/join
-windows. The graph protects every operator between producer SFA and consumer
-input norm, including HCCL AIV child work.
+and restart D after rebuilding the matching LMCache-Ascend extension. The
+gate queues one train per edge. Its default 16 pieces share the V-up GEMM,
+the FP32 router GEMM if present, and the final drain. The startup line
+`SFA main-path gate captured` reports the capture's edge and GEMM counts.
+
+This short standalone test replays the same graph with different readiness
+inputs. One replay forces all eight pieces through the router window, one
+requires at least four through V-up, and one defers all eight to the tail.
+
+```bash
+timeout 90s python -m pytest -q -s --confcutdir=tests/e2e/singlecard -o addopts= \
+  tests/e2e/singlecard/test_sfa_retrieval_overlap.py -k dynamic_copy_windows_same_graph
+```
 
 Run from the selected D instance's container with its serving Python.
 
@@ -67,13 +76,15 @@ python tools/bench_decode_copy_scheduling.py \
   --rounds 1 --capture --profile-dir auto --output "results/main-gate-$(date +%s)"
 ```
 
-For the main-path policy, `consumer_release_edges` should equal `edges` on
-a trace with participating transfers. Both `edges_overlapping_main_compute`
-and `edges_overlapping_comm_aiv` should be zero. `copy_before_consumer_norm_end`,
-`copy_overlap_main_compute` and `copy_overlap_comm_aiv` give the measured
-device overlap in microseconds. `copy_overlap_other_device_compute` measures
-remaining device compute on other streams. MindStudio shows the root release,
-each side-stream copy and the consumer join.
+Read `pieces_per_window_histogram` for V-up, router and tail. For example,
+a router entry of `"3": 100` means 100 layer/replay samples ran three
+copy kernels in that window. A piece with zero live rows also counts as a
+kernel launch. `vup_close_to_acquire` and `router_close_to_acquire`
+measure the time from closing the admission word to reacquiring the token.
+The protected main-compute and HCCL AIV overlap counters should both be
+zero. `pieces_outside_or_ambiguous_window` flags kernel spans that do not
+map uniquely to the captured device controls. Per-layer CSVs include mean
+piece counts for each window.
 
 Use `VLLM_ASCEND_SFA_PREFETCH_MAIN_GATE=0` for the ordinary overlapped
 schedule. To compare timing against an existing run of the same workload,

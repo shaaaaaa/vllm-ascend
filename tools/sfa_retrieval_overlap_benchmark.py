@@ -9,17 +9,19 @@ import json
 import statistics
 import sys
 import time
+from contextlib import nullcontext
 from pathlib import Path
 
 import torch
 import torch_npu
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from vllm_ascend.compilation.sfa_retrieval_overlap import CaptureProbe, RetrievalEdge
+from vllm_ascend.compilation.sfa_retrieval_overlap import CaptureProbe, CopyGate, RetrievalEdge
 
 
 class Workload:
-    def __init__(self, root, requests=8, query_rows=2, layers=4, width=4096, history=4097, chunk=1024):
+    def __init__(self, root, requests=8, query_rows=2, layers=4, width=4096, history=4097, chunk=1024, *,
+                 main_gate=False, pieces=None):
         import vllm_ascend.vllm_ascend_C  # noqa: F401
 
         sys.path.insert(0, str(Path(root) / "benchmark/v1/kv_transfer"))
@@ -34,7 +36,7 @@ class Workload:
         self.requests, self.layers, self.width, self.history = requests, layers, width, history
         self.owners, self.sources, self.transfers, self.graphs = [], [], [], []
         self.stream = torch.npu.Stream(device=self.device)
-        self.probe = CaptureProbe(self.stream, self.device)
+        self.probe = CaptureProbe(self.stream, self.device, main_gate=main_gate)
         self.probe.verify()
         self.allocator = PinMemoryAllocator(requests * layers * history * 576 * 2 + 16 * 1024 * 1024)
         self.selected = torch.zeros((requests, width), dtype=torch.int32, device=self.device)
@@ -66,7 +68,14 @@ class Workload:
                 transfer = SparseGraphTransfer(cache, self.slots, chunk, history, request_capacity=requests)
                 transfer.bind_batch(self.sources, layer)
                 self.transfers.append(transfer)
-            self.edges = [RetrievalEdge(self.stream, self.transfers[i], self.caches[i], max_aiv_cores=12) for i in range(1, layers)]
+            gate = CopyGate(self.device) if main_gate else None
+            copy_pieces = (16 if main_gate else 1) if pieces is None else pieces
+            self.edges = [RetrievalEdge(self.stream, self.transfers[i], self.caches[i],
+                                        max_aiv_cores=0 if main_gate else 12, pieces=copy_pieces, gate=gate)
+                          for i in range(1, layers)]
+            self.router_x = torch.ones((requests * query_rows, 16), dtype=torch.float32,
+                                       device=self.device) if main_gate else None
+            self.router_weight = torch.ones((8, 16), dtype=torch.float32, device=self.device) if main_gate else None
             self.x = torch.ones((requests * query_rows, 16, 512), dtype=torch.bfloat16, device=self.device)
             self.weight = torch.ones((16, 512, 128), dtype=torch.bfloat16, device=self.device)
             self.products = [None] * layers
@@ -101,11 +110,17 @@ class Workload:
                 # Read at the consumer boundary, not merely after the whole graph.
                 for plane, dst in zip(self.caches[layer], self.observed[layer]):
                     dst.copy_(plane.view(-1, plane.shape[-1])[:self.requests * self.width, 0].view_as(dst))
-            if overlap and layer + 1 < self.layers:
-                self.edges[layer].launch(self.selected, self.counts, self.slots, self.caches[layer + 1])
-            self.products[layer] = torch_npu.npu_transpose_batchmatmul(
-                self.x, self.weight, perm_x1=(1, 0, 2), perm_y=(1, 0, 2)
-            )
+            edge = self.edges[layer] if overlap and layer + 1 < self.layers else None
+            if edge is not None:
+                edge.launch(self.selected, self.counts, self.slots, self.caches[layer + 1])
+            gated = edge is not None and edge.gate is not None
+            with edge.cube_window("vup") if gated else nullcontext():
+                self.products[layer] = torch_npu.npu_transpose_batchmatmul(
+                    self.x, self.weight, perm_x1=(1, 0, 2), perm_y=(1, 0, 2)
+                )
+            if self.router_x is not None:
+                with edge.cube_window("router") if gated else nullcontext():
+                    torch.nn.functional.linear(self.router_x, self.router_weight)
 
     def capture(self, overlap, observe=False):
         self.chain(overlap, observe)
@@ -140,6 +155,8 @@ def main():
     parser.add_argument("--requests", type=int, default=8)
     parser.add_argument("--query-rows", type=int, choices=(1, 2), default=2)
     parser.add_argument("--misses", type=int, default=410)
+    parser.add_argument("--main-gate", action="store_true", help="Open the V-up and FP32 router windows")
+    parser.add_argument("--pieces", type=int, help="Total pieces per prefetch (gated default 16, ordinary default 1)")
     parser.add_argument("--iterations", type=int, default=100)
     parser.add_argument("--repeats", type=int, default=6)
     parser.add_argument("--profile-dir", type=Path)
@@ -149,7 +166,10 @@ def main():
         parser.error("invalid request count or misses (0..4096)")
     if args.iterations <= 0 or args.repeats < 2:
         parser.error("iterations must be positive and repeats >= 2")
-    workload = Workload(args.lmcache_ascend_dir, args.requests, args.query_rows)
+    if args.pieces is not None and not 1 <= args.pieces <= args.requests * 4096:
+        parser.error("pieces must be in [1, packed token capacity]")
+    workload = Workload(args.lmcache_ascend_dir, args.requests, args.query_rows, main_gate=args.main_gate,
+                        pieces=args.pieces)
     try:
         checks = [workload.capture(mode, observe=True) for mode in (False, True)]
         for active, shift in ((0, 0), (args.misses, 3), (4096, 4096)):
@@ -180,8 +200,9 @@ def main():
                 host[mode].append((time.perf_counter() - begin) * 1e6 / args.iterations)
                 timers[-1][1].synchronize()
                 samples[mode].extend(start.elapsed_time(end) * 1000 for start, end in timers)
-        result = {"scope": "registered-CPU retrieval plus cube projection; excludes SFA/O-proj/MoE",
+        result = {"scope": "registered-CPU retrieval plus projection microbenchmark",
                   "requests": args.requests, "query_rows": args.query_rows,
+                  "main_gate": args.main_gate, "pieces": workload.edges[0].pieces,
                   "copied_bytes_per_chain": args.requests * args.misses * 576 * 2 * 4,
                   "methods": {}}
         for mode, name in enumerate(("serial", "overlap")):

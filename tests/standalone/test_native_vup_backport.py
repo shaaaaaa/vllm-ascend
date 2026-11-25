@@ -3,6 +3,7 @@
 
 import ast
 import sys
+from contextlib import contextmanager, nullcontext
 from functools import lru_cache
 from pathlib import Path
 from types import ModuleType
@@ -42,12 +43,41 @@ def serving_projection(native_available=True, native_error=False):
     # Deliberately expose only the allowed math operations. Accessing the
     # retired custom op or a synchronization call fails the test immediately.
     namespace = {
+        "nullcontext": nullcontext,
         "torch": NS(float16=torch.float16, bfloat16=torch.bfloat16, bmm=bmm, compiler=torch.compiler),
         "torch_npu": NS(npu_transpose_batchmatmul=native) if native_available else NS(),
         "logger": NS(info_once=Mock()),
     }
     exec(compile(ast.Module(body=[limit, method], type_ignores=[]), "<serving-vup>", "exec"), namespace)
     return namespace["_v_up_proj"], calls
+
+
+@pytest.mark.parametrize("heads,rank,permutation", [(2, 32, (1, 0, 2)), (128, 512, (0, 1, 2))])
+def test_only_native_vup_is_inside_copy_window(heads, rank, permutation):
+    projection, calls = serving_projection()
+    x = torch.ones((3, heads, rank), dtype=torch.bfloat16)
+    impl = NS(local_num_heads=heads, kv_lora_rank=rank, v_head_dim=2,
+              W_UV=torch.ones((heads, rank, 2), dtype=x.dtype))
+
+    @contextmanager
+    def window(name):
+        calls.append(("open", name))
+        yield
+        calls.append(("close", name))
+
+    result = projection(impl, x, copy_edge=NS(cube_window=window))
+    assert calls == [("open", "vup"), (permutation, (1, 0, 2), True), ("close", "vup")]
+    assert result.shape == (3, heads * 2) and torch.all(result == rank)
+
+
+def test_strided_native_vup_stays_in_the_protected_path():
+    projection, calls = serving_projection()
+    x = torch.ones((3, 2, 8), dtype=torch.float16)[..., ::2]
+    state = NS(local_num_heads=2, kv_lora_rank=4, v_head_dim=4,
+               W_UV=torch.eye(4, dtype=x.dtype).repeat(2, 1, 1))
+    edge = NS(cube_window=Mock(side_effect=AssertionError("strided input opened a Cube window")))
+    torch.testing.assert_close(projection(state, x, copy_edge=edge), x.reshape(3, 8))
+    assert calls == [((1, 0, 2), (1, 0, 2), False)]
 
 
 @pytest.mark.parametrize(

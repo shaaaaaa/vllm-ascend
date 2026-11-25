@@ -73,6 +73,9 @@ def runtime(monkeypatch):
     monkeypatch.setattr(torch, "npu", NS(Event=Event, Stream=Stream, stream=switch,
                                         current_stream=lambda: current[0]), raising=False)
     monkeypatch.setitem(sys.modules, "torch_npu", NS(npu_transpose_batchmatmul=Mock()))
+    monkeypatch.setitem(sys.modules, "lmcache_ascend.c_ops", NS(
+        SparsePrefetchGate=lambda word: NS(set_open=lambda value: log.append(("gate", value)))
+    ))
     module = load_module(ROOT / "vllm_ascend/compilation/sfa_retrieval_overlap.py", "overlap_test", monkeypatch)
     monkeypatch.setattr(module, "CaptureProbe", Mock(return_value=NS(verify=Mock())))
     return module, log
@@ -117,7 +120,8 @@ def test_prefetch_pieces_only_split_the_side_transfer(runtime):
 
 
 @pytest.mark.parametrize("pieces", [1, 8])
-def test_main_gate_records_only_consumer_windows(runtime, pieces):
+@pytest.mark.parametrize("windows", [(), ("vup",), ("router",), ("vup", "router")])
+def test_main_gate_captures_one_train_shared_across_windows(runtime, pieces, windows):
     module, log = runtime
     groups, impls, caches = topology((3,))
     owner = module.SharedRetrievalOverlap(pieces=pieces, main_gate=True)
@@ -127,92 +131,65 @@ def test_main_gate_records_only_consumer_windows(runtime, pieces):
         owner.prepare(shape, tuple(impls.items()), groups, 4)
     assert not owner.outgoing[large]
     data = torch.zeros((1, 4), dtype=torch.int32)
+    gates = []
     for name, edge in owner.outgoing[key].items():
-        assert edge.release_at_consumer and edge.max_aiv_cores == 0
-        assert edge.start is not owner.outgoing[other][name].start
-        edge.transfer.load.side_effect = lambda *a, **kw: log.append(("copy", torch.npu.current_stream().name))
+        assert edge.gate is not owner.outgoing[other][name].gate
+        gates.append(edge.gate)
+        edge.transfer.load.side_effect = lambda *a, **kw: log.append(("whole train", torch.npu.current_stream().name))
         log.clear()
         edge.launch(data, data, data, edge.destinations)
-        assert log == []
+        assert log == [("record", "main"), ("wait", "transfer"), ("whole train", "transfer"), ("record", "transfer")]
         with pytest.raises(RuntimeError, match="missing a gated producer/consumer pair"):
             owner.finish_gate_capture(key)
-        # Includes a foreground child stream joined by the model. Neither the
-        # producer nor any intermediate operator has released the copy.
-        log.extend([("V-up",), ("O projection and HCCL join",), ("FFN",), ("next input norm",)])
+        log.clear()
+        for window in windows:
+            with edge.cube_window(window):
+                log.append(("compute", window))
         edge.join()
-        log.append(("consumer attention",))
-        assert log == [
-            ("V-up",), ("O projection and HCCL join",), ("FFN",), ("next input norm",),
-            ("record", "main"), ("wait", "transfer"), ("copy", "transfer"),
-            ("record", "transfer"), ("wait", "main"), ("consumer attention",),
+        assert log == [entry for w in windows for entry in (("gate", True), ("compute", w), ("gate", False))] + [
+            ("gate", True), ("wait", "main"), ("gate", False),
         ]
-        kwargs = {"pieces": 4, "max_aiv_cores": 0} if pieces > 1 else {}
-        edge.transfer.load.assert_called_once_with(data, data, data, **kwargs)
+        edge.transfer.load.assert_called_once_with(data, data, data, pieces=min(pieces, data.numel()),
+                                                   max_aiv_cores=0, admission=edge.gate.native)
+        assert edge.windows_used == set(windows) and not edge.gate.pending
+    assert gates[0] is gates[1]
     owner.finish_gate_capture(key)
     owner.finish_gate_capture(large)
-    assert all(edge.payload is None for edge in owner.outgoing[other].values())
 
 
-@pytest.mark.parametrize("comm_us,copy_us,side_ready_us", [(3, 500, 0), (500, 3, 0), (25, 100, 800)])
-def test_main_gate_orders_child_work_and_last_piece_by_event(runtime, monkeypatch, comm_us, copy_us, side_ready_us):
+def test_gate_rejects_overlapping_edges_duplicate_and_nested_windows(runtime):
     module, _ = runtime
-    root = torch.npu.current_stream()
-    side, comm = torch.npu.Stream(), torch.npu.Stream(name="HCCL")
-    data = torch.zeros(4)
-    transfer = NS(load=Mock())
-    edge = module.RetrievalEdge(side, transfer, (data,), pieces=2, release_at_consumer=True)
-    clock = {root: 0, side: side_ready_us, comm: 0}
-    records, spans = {}, {}
-
-    # Start a fresh capture. A wait can name only an event recorded in this graph.
-    def record(event, stream):
-        records[event] = clock[stream]
-
-    def wait(stream, event):
-        clock[stream] = max(clock[stream], records[event])
-
-    def task(stream, name, duration):
-        start = clock[stream]
-        clock[stream] += duration
-        spans[name] = (start, clock[stream])
-
-    def load(*args, pieces, max_aiv_cores):
-        assert torch.npu.current_stream() is side and pieces == 2
-        task(side, "first copy piece", copy_us)
-        task(side, "last copy piece", copy_us)
-
-    transfer.load.side_effect = load
-    monkeypatch.setattr(torch.npu.Event, "record", record)
-    monkeypatch.setattr(torch.npu.Stream, "wait_event", wait)
-    task(root, "SFA", 60)
-    edge.launch(data, data, data, (data,))
-    task(root, "projection", 25)
-    begin, end = (torch.npu.Event(enable_timing=False) for _ in range(2))
-    begin.record(root)
-    comm.wait_event(begin)
-    task(comm, "HCCL AIV", comm_us)
-    end.record(comm)
-    root.wait_event(end)
-    task(root, "next input norm", 4)
-    edge.join()
-    task(root, "next attention", 60)
-
-    assert spans["next input norm"][0] == spans["HCCL AIV"][1]
-    assert spans["first copy piece"][0] == max(spans["next input norm"][1], side_ready_us)
-    assert spans["next attention"][0] == spans["last copy piece"][1]
+    data = torch.zeros(8)
+    gate = module.CopyGate(data.device)
+    edges = [module.RetrievalEdge(torch.npu.Stream(), NS(load=Mock()), (data,), pieces=4, gate=gate) for _ in range(2)]
+    first, second = edges
+    first.launch(data, data, data, (data,))
+    with pytest.raises(RuntimeError, match="twice"):
+        second.launch(data, data, data, (data,))
+    with first.cube_window("router"):
+        with pytest.raises(RuntimeError, match="unexpected"), first.cube_window("vup"):
+            pytest.fail("nested window")
+        with pytest.raises(RuntimeError, match="no producer"):
+            first.join()
+    for invalid in ("router", "vup", "moe"):
+        with pytest.raises(RuntimeError, match="unexpected"), first.cube_window(invalid):
+            pytest.fail("duplicate or out-of-order window")
+    first.join()
+    second.launch(data, data, data, (data,))
+    second.join()
 
 
 def test_failed_copy_never_submits_a_consumer_wait_on_an_unrecorded_done(runtime):
     module, log = runtime
     dst = torch.zeros(4)
     transfer = NS(load=Mock(side_effect=RuntimeError("copy capture failed")))
-    edge = module.RetrievalEdge(torch.npu.Stream(), transfer, (dst,), release_at_consumer=True)
+    edge = module.RetrievalEdge(torch.npu.Stream(), transfer, (dst,), gate=module.CopyGate(dst.device))
     log.clear()
-    edge.launch(dst, dst, dst, (dst,))
     with pytest.raises(RuntimeError, match="copy capture failed"):
+        edge.launch(dst, dst, dst, (dst,))
+    with pytest.raises(RuntimeError, match="no producer"):
         edge.join()
     assert log == [("record", "main"), ("wait", "transfer")]
-    assert edge.pending_join
 
 
 @pytest.mark.parametrize("fail", [False, True])
@@ -220,8 +197,18 @@ def test_target_validates_main_gate_only_after_successful_capture(graph_module, 
     module, context, captures, _ = graph_module
     wrapper = module.SFAFullGraph()
     finish = Mock()
-    wrapper.retrieval_overlap = NS(main_gate=True, finish_gate_capture=finish)
-    target = Mock(side_effect=ValueError("capture aborted") if fail else None)
+    outbound = {"layer": object()}
+    previous = {"unrelated": object()}
+    context.sfa_router_copy_edges = previous
+    wrapper.retrieval_overlap = NS(main_gate=True, finish_gate_capture=finish, edges=lambda key: ({}, outbound))
+
+    def run_target(**kwargs):
+        assert context.sfa_router_copy_edges is outbound
+        if fail:
+            raise ValueError("capture aborted")
+        return kwargs["input_ids"]
+
+    target = Mock(side_effect=run_target)
     data = torch.ones(1)
     if fail:
         with pytest.raises(ValueError, match="capture aborted"):
@@ -234,6 +221,7 @@ def test_target_validates_main_gate_only_after_successful_capture(graph_module, 
         wrapper.run(target, input_ids=data)
         finish.assert_called_once_with("q2")
         assert target.call_count == 1 and captures[0][0].replay.call_count == 1
+    assert context.sfa_router_copy_edges is previous
 
 
 def test_main_gate_configuration(runtime, monkeypatch):
@@ -243,8 +231,9 @@ def test_main_gate_configuration(runtime, monkeypatch):
     for name in ("PIECES", "MAIN_GATE", "MOE_GATE"):
         monkeypatch.delenv("VLLM_ASCEND_SFA_PREFETCH_" + name, raising=False)
     assert not env.VLLM_ASCEND_SFA_PREFETCH_MAIN_GATE
+    assert env.VLLM_ASCEND_SFA_PREFETCH_PIECES == 1
     monkeypatch.setenv("VLLM_ASCEND_SFA_PREFETCH_MOE_GATE", "1")
-    assert env.VLLM_ASCEND_SFA_PREFETCH_MAIN_GATE and env.VLLM_ASCEND_SFA_PREFETCH_PIECES == 1
+    assert env.VLLM_ASCEND_SFA_PREFETCH_MAIN_GATE and env.VLLM_ASCEND_SFA_PREFETCH_PIECES == 16
     monkeypatch.setenv("VLLM_ASCEND_SFA_PREFETCH_MAIN_GATE", "0")
     assert not env.VLLM_ASCEND_SFA_PREFETCH_MAIN_GATE
     monkeypatch.setenv("VLLM_ASCEND_SFA_PREFETCH_MAIN_GATE", "1")
@@ -475,7 +464,8 @@ def test_no_owner_cycle_with_gc_disabled(runtime):
             gc.enable()
 
 
-def test_actual_post_starts_prefetch_between_attention_and_value_projection():
+@pytest.mark.parametrize("gated", [False, True])
+def test_actual_post_starts_prefetch_between_attention_and_value_projection(gated):
     log = []
     value = torch.ones(2)
     ns = dict(torch=torch, get_weight_prefetch_method=lambda: NS(
@@ -483,11 +473,48 @@ def test_actual_post_starts_prefetch_between_attention_and_value_projection():
     post = extract(SOURCE, "_cross_layer_post_compute", ns)
     proj = Mock(side_effect=lambda x: (log.append("output") or x,))
     impl = NS(_execute_sparse_flash_attention_process=lambda *a, **kw: log.append("sfa") or value,
-              _v_up_proj=lambda x: log.append("cube") or x, o_proj=proj)
-    edge = NS(launch=lambda *args: log.append("prefetch"))
+              _v_up_proj=lambda x, **kw: log.append(("cube", kw)) or x, o_proj=proj)
+    edge = NS(gate=object() if gated else None, launch=lambda *args: log.append("prefetch"))
     post(impl, value, value, value, value, value, value, value, value, torch.empty_like(value),
          trace_label="test", prefetch=(edge, value, value, value, (value,)))
-    assert log == ["sfa", "prefetch", "cube", "output"]
+    assert log == ["sfa", "prefetch", ("cube", {"copy_edge": edge} if gated else {}), "output"]
+
+
+def test_compiled_fp32_router_resolves_current_layer_at_capture():
+    from torch.fx.experimental.proxy_tensor import make_fx
+
+    source = ROOT / "vllm_ascend/patch/worker/patch_unquantized_gemm.py"
+    context = NS()
+    visits = []
+
+    @contextmanager
+    def window(name):
+        visits.append(("open", name))
+        yield
+        visits.append(("close", name))
+
+    def linear(x, weight):
+        assert x.dtype == weight.dtype == torch.float32
+        visits.append("fp32 linear")
+        return torch.nn.functional.linear(x, weight)
+
+    routed = extract(source, "sfa_router_gemm", dict(torch=torch, is_forward_context_available=lambda: True,
+                     get_forward_context=lambda: context, unquantized_gemm=linear))
+    tagged = torch.library.custom_op("test_sfa_windows::router", mutates_args=())(routed)
+    tagged.register_fake(extract(source, "sfa_router_gemm_fake", dict(torch=torch,
+                         unquantized_gemm_fake=lambda x, weight: x.new_empty((x.shape[0], weight.shape[0])))))
+    x = torch.ones((3, 4), dtype=torch.bfloat16)
+    weight = torch.arange(24, dtype=torch.float32).view(6, 4)
+    model = make_fx(lambda a, b: tagged(a.float(), b, "layer0").bfloat16(), tracing_mode="fake")(x, weight)
+    for key in ("layer1", "layer0"):
+        context.sfa_router_copy_edges = {key: NS(cube_window=window)}
+        visits.clear()
+        torch.testing.assert_close(model(x, weight), torch.nn.functional.linear(x.float(), weight).bfloat16())
+        expected = [("open", "router"), "fp32 linear", ("close", "router")] if key == "layer0" else ["fp32 linear"]
+        assert visits == expected
+    visits.clear()
+    routed(torch.ones((3, 8))[:, ::2], weight, "layer0")
+    assert visits == ["fp32 linear"]
 
 
 def test_pre_joins_before_any_consumer_cache_access():

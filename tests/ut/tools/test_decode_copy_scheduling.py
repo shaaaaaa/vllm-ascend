@@ -124,3 +124,47 @@ def test_copy_pieces_match_the_graph_fork_and_consumer_join(clients, tmp_path, o
     assert samples[0]["combine_to_join_arrival"] == 3000
     assert samples[0]["copy_excess_outside_dispatch_to_combine"] == 300
     assert summary["copy_fits_outside_dispatch_to_combine"] == 0
+
+
+@pytest.mark.parametrize("vup,router,stray", [(0, 0, 0), (0, 4, 0), (3, 2, 0), (5, 0, 0), (1, 1, 1)])
+def test_dynamic_windows_report_actual_piece_counts_and_protected_overlap(clients, tmp_path, vup, router, stray):
+    _, gaps = clients
+    events = []
+
+    def emit(name, kind, tick, duration, ordinal, stream=3):
+        events.append(dict(ph="X", name=name, pid=8, tid=stream, ts=tick, dur=duration,
+                           args={"Physic Stream Id": stream, "Model Id": 9, "Task Id": ordinal, "Task Type": kind}))
+
+    tasks = [
+        ("RmsNorm_input", "AI_VECTOR_CORE", 1, 1), ("KvRmsNormRopeCache", "AI_VECTOR_CORE", 3, 1),
+        ("SparseFlashAttention", "MIX_AIC", 5, 2), ("CAPTURE_RECORD", "CAPTURE_RECORD", 8, 1),
+        ("open", "MEM_WRITE_VALUE", 10, 1), ("release", "NOTIFY_RECORD", 11, 1),
+        ("batch_matmul_transpose", "AI_CORE", 13, 20), ("close", "MEM_WRITE_VALUE", 33, 1),
+        ("take", "NOTIFY_WAIT", 34, 3), ("DynamicQuant", "AI_VECTOR_CORE", 38, 5),
+        ("Cast", "AI_VECTOR_CORE", 45, 2), ("open", "MEM_WRITE_VALUE", 48, 1),
+        ("release", "NOTIFY_RECORD", 49, 1), ("MatMulV2_router", "AI_CORE", 51, 20),
+        ("close", "MEM_WRITE_VALUE", 71, 1), ("take", "NOTIFY_WAIT", 72, 1),
+        ("Cast", "AI_VECTOR_CORE", 74, 1), ("MoeDistributeDispatch", "MIX_AIV", 76, 4),
+        ("MoeDistributeCombine", "MIX_AIV", 81, 4), ("AddRmsNormBias_input", "AI_VECTOR_CORE", 86, 2),
+        ("open", "MEM_WRITE_VALUE", 88, 1), ("release", "NOTIFY_RECORD", 89, 1),
+        ("join", "CAPTURE_WAIT", 91, 16), ("close", "MEM_WRITE_VALUE", 108, 1),
+        ("take", "NOTIFY_WAIT", 109, 1), ("KvRmsNormRopeCache", "AI_VECTOR_CORE", 111, 1),
+        ("SparseFlashAttention", "MIX_AIC", 113, 2), ("SwiGlu", "AI_VECTOR_CORE", 116, 1),
+        ("AddRmsNormBias_final", "AI_VECTOR_CORE", 118, 1),
+    ]
+    for i, row in enumerate(tasks):
+        emit(*row, i)
+    for i, tick in enumerate([14 + 3*j for j in range(vup)] + [52 + 3*j for j in range(router)] +
+                             [40]*stray + [92 + 2*j for j in range(6-vup-router-stray)]):
+        emit("sfa_copy_piece_i32_s64", "AI_VECTOR_CORE", tick, 1, 101 + i, 7)
+    trace = tmp_path / "dynamic.json"
+    trace.write_text(json.dumps(events))
+    summary, layers, samples = gaps.analyze(trace, expected=2)
+    assert summary["cube_windows"] == {"vup": 1, "router": 1}
+    assert summary["pieces_per_window_histogram"] == {
+        "vup": {vup: 1}, "router": {router: 1}, "tail": {6 - vup - router - stray: 1},
+    }
+    assert samples[0]["vup_close_to_acquire"] == 4000 and samples[0]["router_close_to_acquire"] == 2000
+    assert layers[0]["router_pieces_mean"] == router
+    assert samples[0]["copy_overlap_protected_main_compute"] == 1000 * stray
+    assert summary["pieces_outside_or_ambiguous_window"] == stray

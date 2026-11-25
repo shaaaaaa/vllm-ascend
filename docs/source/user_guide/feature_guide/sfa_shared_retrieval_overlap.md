@@ -48,38 +48,41 @@ export VLLM_ASCEND_SFA_PREFETCH_MAIN_GATE=1
 ```
 
 The earlier `VLLM_ASCEND_SFA_PREFETCH_MOE_GATE=1` spelling also selects this
-schedule. An explicit `MAIN_GATE` value takes precedence. The default of
-`VLLM_ASCEND_SFA_PREFETCH_PIECES` is one. Explicit piece counts run inside
-the same exclusive window. The transfer uses the native hardware/payload
-grid. A deployment with the preceding LMCache-Ascend extension already built
-only needs the updated vLLM-Ascend Python code and a D worker restart.
+schedule. An explicit `MAIN_GATE` value takes precedence. Update both
+vLLM-Ascend and LMCache-Ascend on `dev-lmy`, rebuild the LMCache-Ascend
+native extension and restart D. The gate uses CANN 8.5.1 stream values and
+a single-consumer Notify.
 
-The target graph records a pair of events per participating edge. On layer
-N, `sfa_forward_post_prefetch` retains the selected token, count and slot
-tensors after sparse attention. At the start of layer N+1's attention,
-`cross_layer_graph_pre` records the release after the input norm. The side
-stream waits for that event, loads K/PE and records completion. The main
-stream waits for completion before QKV, indexer or attention can proceed.
-All these dependencies replay on device. At startup the worker verifies that
-a sentinel destination still has its old value before release and its new
-value after the join.
+After producer SFA, the graph forks once. The transfer submits its entire
+ordered list of K/PE kernels in one native call at capture. Each replay
+balances the current batch's live misses across that list. With the main
+gate enabled, the default is 16 pieces per transfer, configurable with
+`VLLM_ASCEND_SFA_PREFETCH_PIECES`. An explicit value of 1 selects one
+indivisible kernel. The default for ordinary overlap is one.
 
-The existing GLM-5.3 rank-0 trace contains 36 complete 78-layer replays.
-Each replay has 57 such edges. Source layer 2 uses dense FFN and the other
-56 use MoE. Both schedules protect V-up, O quantization/projection, the
-HCCL AIV AllReduce and the consumer input norm. Dense layers also protect
-the FFN quantized matmuls, SwiGLU and output AllReduce. MoE layers protect
-the outer router, top-k, dispatch, grouped matmuls and SwiGLU, combine,
-HCCL AIV AllGather, shared-expert projections, output AllReduce and residual
-merge. The single main-stream SDMA output copy in each edge has a median
-duration of 1.24 microseconds and stays in the protected interval.
+The main queue releases the device token around the native V-up GEMM, after
+any explicit input transpose and before O-projection quantization. A tagged
+FP32 MoE router opens a second window around its bias-free GEMM, after the
+input Cast and before any output Cast or top-k. A dense FFN has only the V-up
+window. Other paths drain whatever remains at the next layer's consumer,
+after its input norm and before its first KV access.
 
-The capture log reports `SFA main-path gate captured` and the actual window
-count. The per-rank profile summary reports `consumer_release_edges`,
-`copy_before_consumer_norm_end`, `copy_overlap_main_compute` and
-`copy_overlap_comm_aiv`. The first is a count, the others measure device
-time. `copy_overlap_other_device_compute` also includes independent work on
-the profiled NPU. See the [decode benchmark](../../../../tools/bench_decode_copy_scheduling.md).
+Each side kernel waits for an open word and takes the Notify token before
+starting. Completion returns that token to the device. A long window can use
+many consecutive pieces. The main stream closes the word and reacquires
+the token before starting protected compute. Even a piece that already
+passed the word check must own the token to start. Closing can wait for
+the residual of one admitted piece. At the consumer, the main stream opens
+the gate and joins the whole train. The final close restores the initial
+state for the next edge or replay. All admission checks execute on device.
+
+The previously captured GLM-5.3 rank-0 trace has 36 complete 78-layer
+replays and 57 outgoing edges per replay, including 56 MoE layers and one
+dense layer. It identifies the Cube GEMMs that can overlap copy. The capture
+log reports the actual window counts on the running model. The profile
+summary reports how many side kernels ran in each window, close latency
+and overlap with protected foreground and HCCL AIV tasks. See the
+[decode benchmark](../../../../tools/bench_decode_copy_scheduling.md).
 
 ### Producer and consumer
 

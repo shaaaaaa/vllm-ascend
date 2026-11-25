@@ -199,11 +199,11 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_SFA_SHARED_RETRIEVAL_OVERLAP": lambda: bool(
         int(os.getenv("VLLM_ASCEND_SFA_SHARED_RETRIEVAL_OVERLAP", "0"))
     ),
-    # D only, non-sensitive. Positive number of pieces per prefetch, default 1.
-    # Restart to recapture. The exclusive transfer window needs one launch by default.
-    "VLLM_ASCEND_SFA_PREFETCH_PIECES": lambda: int(os.getenv("VLLM_ASCEND_SFA_PREFETCH_PIECES", "1")),
-    # 0 (default) or 1. Release the copy at the consumer after its input norm,
-    # then join before attention. D only, non-sensitive; restart to recapture.
+    # Number of pieces in one whole layer transfer, shared across its windows.
+    "VLLM_ASCEND_SFA_PREFETCH_PIECES": lambda: int(
+        os.getenv("VLLM_ASCEND_SFA_PREFETCH_PIECES", "16" if _sfa_prefetch_main_gate() else "1")
+    ),
+    # D only. Open during eligible V-up/router GEMMs and drain before next QKV.
     "VLLM_ASCEND_SFA_PREFETCH_MAIN_GATE": _sfa_prefetch_main_gate,
     # Compatibility spelling. An explicit MAIN_GATE value takes precedence.
     "VLLM_ASCEND_SFA_PREFETCH_MOE_GATE": _sfa_prefetch_main_gate,

@@ -389,14 +389,18 @@ class SFAFullGraph:
             graph = torch.npu.NPUGraph()
             previous_capturing = context.capturing
             owner = self.retrieval_overlap
+            gated = getattr(owner, "main_gate", False)
+            previous_router_edges = getattr(context, "sfa_router_copy_edges", None)
             context.sfa_full_graph_active = True
             context.capturing = True
             try:
                 pool = self.graph_pool if self.graph_pool is not None else current_platform.get_global_graph_pool()
                 with torch.npu.graph(graph, pool=pool):
+                    if gated:
+                        context.sfa_router_copy_edges = owner.edges(key)[1]
                     tracker = owner.begin_priority_capture(key) if getattr(owner, "low_priority", False) else None
                     output = runnable(**kwargs)
-                if getattr(owner, "main_gate", False):
+                if gated:
                     owner.finish_gate_capture(key)
                 if tracker is not None:
                     owner.finish_priority_capture(key, tracker)
@@ -405,6 +409,8 @@ class SFAFullGraph:
                     self._submission_failed = True
                 raise
             finally:
+                if gated:
+                    context.sfa_router_copy_edges = previous_router_edges
                 context.sfa_full_graph_active = False
                 context.capturing = previous_capturing
             self.entries[key] = SFAFullGraphEntry(graph, output, signature)

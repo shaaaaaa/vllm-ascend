@@ -49,7 +49,7 @@ def ns(value):
 def resource(kind, name):
     if kind in {"AI_VECTOR_CORE", "MIX_AIC", "MIX_AIV"} or name.lower().startswith("aivkernel"):
         return "vector_or_mixed"
-    if kind == "AI_CORE" and any(s in name.lower() for s in ("matmul", "batch_matmul", "aclnnmm")):
+    if kind == "AI_CORE" and any(s in name.lower().replace("_", "") for s in ("matmul", "aclnnmm")):
         return "cube_matmul"
     if kind in NONCORE or kind in CONTROL:
         return "noncore"
@@ -93,6 +93,42 @@ def is_sfa(row):
 
 def is_copy(row):
     return "sfacopy" in row.name.lower().replace("_", "")
+
+
+def cube_window_type(row):
+    if row.kind == "AI_CORE":
+        name = row.name.lower().replace("_", "")
+        if name.startswith(("batchmatmultranspose", "transposebatchmatmul")):
+            return "vup"
+        if name.startswith("matmulv2"):
+            return "router"
+    return None
+
+
+def copy_window_controls(cubes, events, norm):
+    """Find device open/close pairs. Empty windows are valid on any replay."""
+    tail_open = events.get(("NOTIFY_RECORD", norm.task + 2))
+    join = events.get(("CAPTURE_WAIT", norm.task + 3))
+    if not tail_open or not join:
+        return {}, None
+    windows = {"tail": (tail_open[0], join[1], join[0])}
+    for name, op in cubes:
+        grant = events.get(("NOTIFY_RECORD", op.task - 1))
+        close = events.get(("MEM_WRITE_VALUE", op.task + 1))
+        acquired = events.get(("NOTIFY_WAIT", op.task + 2))
+        if grant and acquired:
+            windows[name] = (grant[0], acquired[1], close[0] if close else None)
+    return windows, join
+
+
+def window_piece_counts(parts, windows):
+    counts = dict.fromkeys(windows, 0)
+    for part in parts:
+        matches = [name for name, (start, stop, _) in windows.items()
+                   if start - 1000 <= part.start and part.stop <= stop + 1000]
+        if len(matches) == 1:
+            counts[matches[0]] += 1
+    return counts
 
 
 def graph_choice(devices, wanted_pid, wanted_model, wanted_stream):
@@ -182,10 +218,7 @@ def read_controls(path, pid, stream, stages, wanted):
             continue
         a = ev.get("args") or {}
         kind = a.get("Task Type")
-        if (
-            kind not in {"CAPTURE_WAIT", "CAPTURE_RECORD", "NOTIFY_WAIT", "NOTIFY_RECORD"}
-            or int(a.get("Physic Stream Id", ev["tid"])) != stream
-        ):
+        if kind not in CONTROL or int(a.get("Physic Stream Id", ev["tid"])) != stream:
             continue
         task = int(a.get("Task Id", -1))
         if (kind, task) not in wanted:
@@ -237,7 +270,7 @@ def analyze(path, wanted_pid=None, wanted_model=None, wanted_stream=None, expect
     anchors = [(r.start, r.model) for r in main if first_task.get(r.model) == r.task]
     if not anchors:
         raise ValueError("target replay has no device task anchor")
-    stages, wanted = [], set()
+    stages, wanted, cube_tasks = [], set(), {}
     incomplete = 0
     moe = [r for r in main if "moedistributedispatch" in r.name.lower()]
     moe_times = [r.start for r in moe]
@@ -254,9 +287,18 @@ def analyze(path, wanted_pid=None, wanted_model=None, wanted_stream=None, expect
             incomplete += 1
             continue
         norms, sfas, final = valid
+        for layer, (sfa, norm) in enumerate(zip(sfas[:-1], norms[1:])):
+            lo, hi = bisect.bisect_left(times, sfa.stop), bisect.bisect_left(times, norm.start)
+            cubes = [(kind, op) for op in main[lo:hi] if (kind := cube_window_type(op))]
+            cube_tasks[len(stages), layer] = cubes
+            for _, op in cubes:
+                wanted.update((("NOTIFY_RECORD", op.task - 1), ("MEM_WRITE_VALUE", op.task + 1),
+                               ("NOTIFY_WAIT", op.task + 2)))
         wanted.update(("CAPTURE_WAIT", n.task + 1) for n in norms[1:])
         wanted.update(("CAPTURE_RECORD", n.task + 1) for n in norms[1:])
         wanted.update(("CAPTURE_WAIT", n.task + 2) for n in norms[1:])
+        wanted.update(("NOTIFY_RECORD", n.task + 2) for n in norms[1:])
+        wanted.update(("CAPTURE_WAIT", n.task + 3) for n in norms[1:])
         wanted.update(("CAPTURE_RECORD", r.task + 1) for r in sfas[:-1])
         stages.append((start, end, norms, sfas, final))
     if not stages:
@@ -280,7 +322,11 @@ def analyze(path, wanted_pid=None, wanted_model=None, wanted_stream=None, expect
             late_release = events.get(("CAPTURE_RECORD", next_norm.task + 1))
             late_join = events.get(("CAPTURE_WAIT", next_norm.task + 2))
             at_consumer = bool(parts) and late_release is not None and late_join is not None
-            if at_consumer:
+            windows, window_join = copy_window_controls(cube_tasks[step, i], events, next_norm)
+            if windows:
+                release, join = events.get(("CAPTURE_RECORD", sfa.task + 1)), window_join
+                at_consumer = False
+            elif at_consumer:
                 release, join = late_release, late_join
             else:
                 release = events.get(("CAPTURE_RECORD", sfa.task + 1))
@@ -304,7 +350,7 @@ def analyze(path, wanted_pid=None, wanted_model=None, wanted_stream=None, expect
                 or max(r.stop for r in parts) > join[1] + 1000
             ):
                 raise ValueError(f"side copy disagrees with the fork/join in replay {step} layer {i}")
-            by_edge[step, i] = ready, deadline, parts, at_consumer
+            by_edge[step, i] = ready, deadline, parts, at_consumer, windows
             background.update(parts)
     rtypes = {r: resource(r.kind, r.name) for r in tasks}
     all_busy = Timeline((r.start, r.stop) for r in tasks)
@@ -331,9 +377,24 @@ def analyze(path, wanted_pid=None, wanted_model=None, wanted_stream=None, expect
             }
             edge = by_edge.get((step, i))
             if edge:
-                ready, deadline, parts, at_consumer = edge
+                ready, deadline, parts, at_consumer, windows = edge
                 lengths = vector.gaps(ready, deadline)
                 copy = sum(r.stop - r.start for r in parts)
+                cube_overlaps = {
+                    name: Timeline(
+                        (op.start, op.stop) for kind, op in cube_tasks[step, i] if kind == name and
+                        (not windows or (name in windows and windows[name][0] <= op.start <= windows[name][1]))
+                    ).overlap(parts)
+                    for name in ("vup", "router")
+                }
+                root_overlap = root_core.overlap(parts)
+                if windows:
+                    counts = window_piece_counts(parts, windows)
+                    s["window_pieces"] = counts
+                    s["unassigned_pieces"] = len(parts) - sum(counts.values())
+                    for name, (_, acquired, close) in windows.items():
+                        if name != "tail" and close is not None:
+                            s[f"{name}_close_to_acquire"] = acquired - close
                 s.update(
                     edge_window=deadline - ready,
                     edge_no_foreground_ai=sum(core.gaps(ready, deadline)),
@@ -346,7 +407,11 @@ def analyze(path, wanted_pid=None, wanted_model=None, wanted_stream=None, expect
                     join_wait_for_copy=max(0, max(r.stop for r in parts) - deadline),
                     uncovered_if_only_aiv_gaps=max(0, copy - sum(lengths)),
                     dispatch_overlap=dispatch.overlap(parts),
-                    copy_overlap_main_compute=root_core.overlap(parts),
+                    copy_overlap_main_compute=root_overlap,
+                    copy_overlap_vup=cube_overlaps["vup"],
+                    copy_overlap_router=cube_overlaps["router"],
+                    copy_overlap_protected_main_compute=root_overlap - sum(cube_overlaps.values()),
+                    cube_windows=[name for name in windows if name != "tail"],
                     copy_overlap_comm_aiv=comm_aiv.overlap(parts),
                     copy_overlap_other_device_compute=other_compute.overlap(parts),
                     copy_before_consumer_norm_end=sum(
@@ -377,7 +442,7 @@ def analyze(path, wanted_pid=None, wanted_model=None, wanted_stream=None, expect
                         )
                         s["pieces_started_dispatch_to_combine"] = sum(d.start <= r.start < end for r in parts)
                         s["combine_to_join_arrival"] = deadline - end
-                        if not at_consumer:
+                        if not at_consumer and not windows:
                             s["fork_to_dispatch"] = d.start - ready
                             outside = s["fork_to_dispatch"] + s["combine_to_join_arrival"]
                             s["copy_excess_outside_dispatch_to_combine"] = max(0, copy - outside)
@@ -400,6 +465,11 @@ def analyze(path, wanted_pid=None, wanted_model=None, wanted_stream=None, expect
         "longest_aiv_gap",
         "copy_device",
         "copy_overlap_main_compute",
+        "copy_overlap_vup",
+        "copy_overlap_router",
+        "copy_overlap_protected_main_compute",
+        "vup_close_to_acquire",
+        "router_close_to_acquire",
         "copy_overlap_comm_aiv",
         "copy_overlap_other_device_compute",
         "copy_before_consumer_norm_end",
@@ -430,6 +500,9 @@ def analyze(path, wanted_pid=None, wanted_model=None, wanted_stream=None, expect
         for name in layer_fields + edge_fields:
             st = sample_summary(group, name)
             row[name + "_mean_us"], row[name + "_p50_us"] = st.get("mean_us"), st.get("p50_us")
+        for name in ("vup", "router", "tail"):
+            counts = [s["window_pieces"][name] for s in group if name in s.get("window_pieces", {})]
+            row[name + "_pieces_mean"] = round(statistics.mean(counts), 2) if counts else None
         layers.append(row)
     edge_samples = [s for s in samples if "fit" in s]
     summary = {
@@ -445,6 +518,15 @@ def analyze(path, wanted_pid=None, wanted_model=None, wanted_stream=None, expect
         "side_streams": sorted({s["side_stream"] for s in edge_samples}),
         "edges": len(edge_samples),
         "consumer_release_edges": sum(s["released_at_consumer"] for s in edge_samples),
+        "cube_windows": dict(Counter(name for s in edge_samples for name in s["cube_windows"])),
+        "pieces_per_window_histogram": {
+            name: dict(Counter(s["window_pieces"][name] for s in edge_samples if name in s.get("window_pieces", {})))
+            for name in ("vup", "router", "tail")
+        },
+        "pieces_outside_or_ambiguous_window": sum(s.get("unassigned_pieces", 0) for s in edge_samples),
+        "edges_overlapping_protected_main_compute": sum(
+            s["copy_overlap_protected_main_compute"] > 0 for s in edge_samples
+        ),
         "edges_overlapping_main_compute": sum(s["copy_overlap_main_compute"] > 0 for s in edge_samples),
         "edges_overlapping_comm_aiv": sum(s["copy_overlap_comm_aiv"] > 0 for s in edge_samples),
         "fit_total_aiv_gap": sum(s["fit"] for s in edge_samples),

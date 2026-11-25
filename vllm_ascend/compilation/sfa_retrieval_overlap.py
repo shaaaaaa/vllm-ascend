@@ -6,11 +6,24 @@ consumer touches its KV, so the root completion event still protects all sources
 """
 
 import logging
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
 
 import torch
 import torch_npu
+
+
+class CopyGate:
+    """One device admission word and one consumable Notify per target graph key."""
+
+    def __init__(self, device) -> None:
+        try:
+            from lmcache_ascend.c_ops import SparsePrefetchGate
+        except ImportError as error:
+            raise RuntimeError("Rebuild LMCache-Ascend on dev-lmy to use the SFA copy windows") from error
+        self.native = SparsePrefetchGate(torch.zeros(1, dtype=torch.int64, device=device))
+        self.pending = False  # Capture-time guard for edges sharing the device token.
 
 
 def validate_destinations(caches: dict[str, tuple], destinations: set[str]) -> None:
@@ -39,11 +52,13 @@ class RetrievalEdge:
     max_aiv_cores: int = 0
     pieces: int = 1
     capture_priority: Any = None
-    release_at_consumer: bool = False
+    gate: CopyGate | None = None
 
     def __post_init__(self) -> None:
         self.payload = None
         self.pending_join = False
+        self.windows_used: set[str] = set()
+        self.window_open = False
         self.start = torch.npu.Event(enable_timing=False)
         self.done = torch.npu.Event(enable_timing=False)
         # Initialize event resources outside capture; also join initialization.
@@ -54,8 +69,8 @@ class RetrievalEdge:
         main.wait_event(self.done)
 
     def launch(self, selected, counts, slots, destinations) -> None:
-        """Retain the producer's graph inputs and fork here only for early prefetch."""
-        if self.pending_join:
+        """Capture the entire copy train once, after SFA has produced its inputs."""
+        if self.pending_join or (self.gate is not None and self.gate.pending):
             raise RuntimeError("prefetch launched twice without a consumer join")
         # The native transfer owns fixed destinations. Reject substitutions,
         # including functionalized copies, rather than writing hidden storage.
@@ -80,8 +95,10 @@ class RetrievalEdge:
         # reads it. These Python statements run at capture, never at replay.
         if self.payload is None:
             self.payload = payload
-        if not self.release_at_consumer:
-            self._submit_copy(payload)
+        self.windows_used.clear()
+        if self.gate is not None:
+            self.gate.pending = True
+        self._submit_copy(payload)
         self.pending_join = True
 
     def _submit_copy(self, payload) -> None:
@@ -92,9 +109,11 @@ class RetrievalEdge:
         before = tracker.before_first_fork(main) if tracker is not None and tracker.side is None else None
         with torch.npu.stream(self.stream):
             self.stream.wait_event(self.start)
-            pieces = min(self.pieces, selected.numel()) if self.release_at_consumer else self.pieces
-            if pieces != 1:
-                self.transfer.load(selected, counts, slots, max_aiv_cores=self.max_aiv_cores, pieces=pieces)
+            if self.gate is not None:
+                self.transfer.load(selected, counts, slots, max_aiv_cores=self.max_aiv_cores,
+                                   pieces=min(self.pieces, selected.numel()), admission=self.gate.native)
+            elif self.pieces != 1:
+                self.transfer.load(selected, counts, slots, max_aiv_cores=self.max_aiv_cores, pieces=self.pieces)
             elif self.max_aiv_cores:
                 self.transfer.load(selected, counts, slots, max_aiv_cores=self.max_aiv_cores)
             else:
@@ -103,16 +122,32 @@ class RetrievalEdge:
             if before is not None:
                 tracker.after_first_fork(self.stream, before)
 
+    @contextmanager
+    def cube_window(self, name: str):
+        if (self.gate is None or not self.pending_join or self.window_open or name not in {"vup", "router"}
+                or name in self.windows_used or (name == "vup" and "router" in self.windows_used)):
+            raise RuntimeError(f"unexpected SFA copy window {name!r} in this capture")
+        self.windows_used.add(name)
+        self.window_open = True
+        self.gate.native.set_open(True)
+        try:
+            yield
+        finally:
+            # Device wait for ownership, independent of how many pieces ran.
+            self.gate.native.set_open(False)
+            self.window_open = False
+
     def join(self) -> None:
         # Python executes only at capture/warmup, not graph replay. Priming an
         # event outside capture is NOT proof of a record inside this graph.
-        if not self.pending_join:
+        if not self.pending_join or self.window_open:
             raise RuntimeError("consumer prefetch wait has no producer launch in this capture")
-        if self.release_at_consumer:
-            # Record the release AFTER the consumer input norm and all joined
-            # foreground streams. Only this fork/join interval admits the copy.
-            self._submit_copy(self.payload)
+        if self.gate is not None:
+            self.gate.native.set_open(True)
         torch.npu.current_stream().wait_event(self.done)
+        if self.gate is not None:
+            self.gate.native.set_open(False)
+            self.gate.pending = False
         self.pending_join = False
 
 
@@ -131,24 +166,48 @@ class CaptureProbe:
     This is a dependency probe, not a retrieval performance benchmark.
     """
 
-    def __init__(self, stream, device, *, release_at_consumer=False) -> None:
-        self.source = torch.zeros(64, device=device)
+    def __init__(self, stream, device, *, main_gate=False) -> None:
+        shape = (1, 64, 1, 16) if main_gate else (64,)
+        self.source = torch.zeros(shape, device=device, dtype=torch.float16)
         self.dest = torch.empty_like(self.source)
         self.observed = torch.empty_like(self.source)
-        self.before_release = torch.empty_like(self.source) if release_at_consumer else None
+        self.before_release = torch.empty_like(self.source) if main_gate else None
+        self.after_close = torch.empty_like(self.source) if main_gate else None
+        self.before_reopen = torch.empty_like(self.source) if main_gate else None
         self.matrix = torch.ones((16, 16), device=device, dtype=torch.float16)
         self.product = torch.empty_like(self.matrix)
-        self.edge = RetrievalEdge(stream, ProbeCopy(self.dest), (self.dest,), release_at_consumer=release_at_consumer)
+        self.payload = (self.source, None, None)
+        if main_gate:
+            from lmcache_ascend.v1.npu_connector.sparse_graph import SparseGraphTransfer
+
+            slots = torch.arange(64, device=device, dtype=torch.int32).view(1, 64)
+            self.payload = (slots, torch.full((1,), 64, device=device, dtype=torch.int32), slots)
+            planes = (self.dest, torch.empty_like(self.dest))
+            transfer = SparseGraphTransfer(planes, slots, 64, 64)
+            # The startup probe uses HBM sources and the real gated K/PE kernels.
+            transfer.ptrs.fill_(self.source.data_ptr())
+            transfer.valid_tokens.fill_(64)
+            self.edge = RetrievalEdge(stream, transfer, planes, pieces=8, gate=CopyGate(device))
+        else:
+            self.edge = RetrievalEdge(stream, ProbeCopy(self.dest), (self.dest,))
         self.graph = torch.npu.NPUGraph()
 
     def verify(self) -> None:
         torch.mm(self.matrix, self.matrix, out=self.product)
         torch.npu.synchronize()
         with torch.npu.graph(self.graph):
-            self.edge.launch(self.source, None, None, (self.dest,))
-            torch.mm(self.matrix, self.matrix, out=self.product)
+            self.edge.launch(*self.payload, self.edge.destinations)
             if self.before_release is not None:
                 self.before_release.copy_(self.dest)
+                with self.edge.cube_window("vup"):
+                    torch.mm(self.matrix, self.matrix, out=self.product)
+                self.after_close.copy_(self.dest)
+                torch.mm(self.matrix, self.matrix, out=self.product)
+                self.before_reopen.copy_(self.dest)
+                with self.edge.cube_window("router"):
+                    torch.mm(self.matrix, self.matrix, out=self.product)
+            else:
+                torch.mm(self.matrix, self.matrix, out=self.product)
             self.edge.join()
             self.observed.copy_(self.dest)
         for value in (1, 7, 2):
@@ -156,12 +215,13 @@ class CaptureProbe:
             if self.before_release is not None:
                 self.dest.fill_(-value)
             self.graph.replay()
-            if not torch.equal(self.observed.cpu(), torch.full((64,), float(value))):
+            if not torch.equal(self.observed.cpu(), torch.full(self.source.shape, float(value))):
                 raise RuntimeError("shared retrieval multi-stream capture probe failed")
-            if self.before_release is not None and not torch.equal(
-                self.before_release.cpu(), torch.full((64,), float(-value))
-            ):
-                raise RuntimeError("prefetch wrote the destination before the consumer release")
+            if self.before_release is not None:
+                if not torch.equal(self.before_release.cpu(), torch.full(self.source.shape, float(-value))):
+                    raise RuntimeError("prefetch wrote the destination before its first window")
+                if not torch.equal(self.after_close.cpu(), self.before_reopen.cpu()):
+                    raise RuntimeError("prefetch wrote the destination inside a protected interval")
         torch.npu.synchronize()
 
 
@@ -213,6 +273,7 @@ class SharedRetrievalOverlap:
         if any(not group.active for group in groups):
             raise RuntimeError("shared retrieval requires active resident plans")
         incoming, outgoing = {}, {}
+        gate = None
         self.incoming[key], self.outgoing[key] = incoming, outgoing
         # Oversized keys keep serial retrieval; this is a startup shape decision.
         if key.token_capacity <= max_cube_tokens and self.pairs:
@@ -235,12 +296,14 @@ class SharedRetrievalOverlap:
                     if self.stream is None:
                         device = destinations[0].device
                         self.stream = torch.npu.Stream(device=device)
-                        self.probe = CaptureProbe(self.stream, device, release_at_consumer=self.main_gate)
+                        self.probe = CaptureProbe(self.stream, device, main_gate=self.main_gate)
                         self.probe.verify()
                         self.probe = None
+                    if self.main_gate and gate is None:
+                        gate = CopyGate(destinations[0].device)
                     edge = RetrievalEdge(
                         self.stream, transfer, destinations, max_aiv_cores=0 if self.main_gate else 12,
-                        pieces=self.pieces, release_at_consumer=self.main_gate,
+                        pieces=self.pieces, gate=gate,
                     )
                     incoming[following] = outgoing[current] = edge
             except BaseException:
@@ -252,8 +315,9 @@ class SharedRetrievalOverlap:
         if any(edge.payload is None or edge.pending_join for edge in edges):
             raise RuntimeError("target graph is missing a gated producer/consumer pair")
         logging.getLogger("vllm.sfa_retrieval_overlap").info(
-            "SFA main-path gate captured for %s: %d consumer release/join windows, up to %d pieces per transfer",
-            key, len(edges), self.pieces,
+            "SFA main-path gate captured for %s: edges=%d vup=%d router=%d pieces_per_transfer=%d",
+            key, len(edges), sum("vup" in e.windows_used for e in edges),
+            sum("router" in e.windows_used for e in edges), self.pieces,
         )
 
     def begin_priority_capture(self, key):
