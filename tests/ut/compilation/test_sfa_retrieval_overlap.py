@@ -38,7 +38,7 @@ def graph_module(monkeypatch):
 
 
 @pytest.fixture
-def runtime(monkeypatch):
+def capture_runtime(monkeypatch):
     log = []
 
     class Event:
@@ -77,8 +77,33 @@ def runtime(monkeypatch):
         SparsePrefetchGate=lambda word: NS(set_open=lambda value: log.append(("gate", value)))
     ))
     module = load_module(ROOT / "vllm_ascend/compilation/sfa_retrieval_overlap.py", "overlap_test", monkeypatch)
+    return module, log
+
+
+@pytest.fixture
+def runtime(capture_runtime, monkeypatch):
+    module, log = capture_runtime
     monkeypatch.setattr(module, "CaptureProbe", Mock(return_value=NS(verify=Mock())))
     return module, log
+
+
+def test_gated_startup_probe_binds_both_mla_planes(capture_runtime, monkeypatch):
+    module, _ = capture_runtime
+    transfer = NS(ptrs=torch.zeros((2, 1), dtype=torch.int64), valid_tokens=torch.zeros((1, 1), dtype=torch.int32))
+    make_transfer = Mock(return_value=transfer)
+    monkeypatch.setitem(sys.modules, "lmcache_ascend.v1.npu_connector.sparse_graph",
+                        NS(SparseGraphTransfer=make_transfer))
+    monkeypatch.setattr(torch.npu, "NPUGraph", object, raising=False)
+    probe = module.CaptureProbe(torch.npu.Stream(), "cpu", main_gate=True)
+    planes, slots, chunk_size, max_tokens = make_transfer.call_args.args
+    assert [tuple(plane.shape) for plane in planes] == [(1, 64, 1, 512), (1, 64, 1, 64)]
+    assert (chunk_size, max_tokens, transfer.valid_tokens.item()) == (64, 64, 64)
+    assert torch.equal(slots, torch.arange(64, dtype=torch.int32).view(1, 64))
+    sources = (probe.source, probe.pe_source)
+    for table_row, source, dest in zip(transfer.ptrs, sources, planes):
+        assert table_row.item() == source.data_ptr()
+        assert source.shape == dest.shape and source.dtype == dest.dtype == torch.float16
+    assert len({t.data_ptr() for t in (*sources, *planes)}) == 4
 
 
 @pytest.fixture

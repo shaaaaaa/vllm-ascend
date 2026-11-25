@@ -210,8 +210,9 @@ class CaptureProbe:
     """
 
     def __init__(self, stream, device, *, main_gate=False) -> None:
-        shape = (1, 64, 1, 16) if main_gate else (64,)
+        shape = (1, 64, 1, 512) if main_gate else (64,)
         self.source = torch.zeros(shape, device=device, dtype=torch.float16)
+        self.pe_source = self.source.new_zeros((1, 64, 1, 64)) if main_gate else None
         self.dest = torch.empty_like(self.source)
         self.observed = torch.empty_like(self.source)
         self.before_release = torch.empty_like(self.source) if main_gate else None
@@ -220,15 +221,16 @@ class CaptureProbe:
         self.matrix = torch.ones((16, 16), device=device, dtype=torch.float16)
         self.product = torch.empty_like(self.matrix)
         self.payload = (self.source, None, None)
-        if main_gate:
+        if self.pe_source is not None:
             from lmcache_ascend.v1.npu_connector.sparse_graph import SparseGraphTransfer
 
             slots = torch.arange(64, device=device, dtype=torch.int32).view(1, 64)
             self.payload = (slots, torch.full((1,), 64, device=device, dtype=torch.int32), slots)
-            planes = (self.dest, torch.empty_like(self.dest))
+            planes = (self.dest, torch.empty_like(self.pe_source))
             transfer = SparseGraphTransfer(planes, slots, 64, 64)
-            # The startup probe uses HBM sources and the real gated K/PE kernels.
-            transfer.ptrs.fill_(self.source.data_ptr())
+            # The native kernel uses each plane's byte stride and stores only raw source addresses.
+            transfer.ptrs[0].fill_(self.source.data_ptr())
+            transfer.ptrs[1].fill_(self.pe_source.data_ptr())
             transfer.valid_tokens.fill_(64)
             self.edge = RetrievalEdge(stream, transfer, planes, pieces=8, gate=CopyGate(device))
         else:
@@ -255,12 +257,16 @@ class CaptureProbe:
             self.observed.copy_(self.dest)
         for value in (1, 7, 2):
             self.source.fill_(value)
-            if self.before_release is not None:
+            if self.pe_source is not None:
                 self.dest.fill_(-value)
+                self.pe_source.fill_(-value)
+                self.edge.destinations[1].zero_()
             self.graph.replay()
             if not torch.equal(self.observed.cpu(), torch.full(self.source.shape, float(value))):
                 raise RuntimeError("shared retrieval multi-stream capture probe failed")
             if self.before_release is not None:
+                if not torch.all(self.edge.destinations[1].cpu() == -value):
+                    raise RuntimeError("shared retrieval multi-stream capture probe copied incorrect PE data")
                 if not torch.equal(self.before_release.cpu(), torch.full(self.source.shape, float(-value))):
                     raise RuntimeError("prefetch wrote the destination before its first window")
                 if not torch.equal(self.after_close.cpu(), self.before_reopen.cpu()):
