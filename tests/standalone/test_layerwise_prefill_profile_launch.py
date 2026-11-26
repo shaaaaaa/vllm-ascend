@@ -279,3 +279,47 @@ def test_banked_dcp_benchmark_keeps_sender_configuration_identical(profile_tool,
     assert options["max_num_batched_tokens"] == 16384
     assert options["cp_kv_cache_interleave_size"] == options["block_size"] == 128
     assert options["additional_config"]["enable_sparse_li_c8"]
+
+
+def test_timing_only_uses_real_sender_without_profiling_or_cleanup(profile_tool, tmp_path, monkeypatch):
+    args = profile_tool.parser().parse_args(["--prefill-dcp", "8", "--timing-only"])
+    options = profile_tool.engine_options(args, tmp_path, 80000)
+    assert options["decode_context_parallel_size"] == 8
+    assert "profiler_config" not in options and "worker_extension_cls" not in options
+    for name in ("clear_shm", "analyse_case"):
+        monkeypatch.setattr(profile_tool, name, Mock(side_effect=AssertionError(name)))
+    launched = []
+
+    def launch(command, env, *args, **kwargs):
+        assert "--timing-only" in command
+        assert "LMCACHE_PREFILL_REUSE_DEBUG_FILE" not in env
+        assert env["VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE"] == "true"
+        launched.append(command)
+        return SimpleNamespace(wait=lambda: 0)
+
+    monkeypatch.setattr(profile_tool, "start_logged_process", launch)
+    monkeypatch.setattr(profile_tool, "finish_child", lambda _: None)
+    profile_tool.run_cases(args, tmp_path, ("10k_on", "80k_on"))
+    assert len(launched) == 2
+
+
+@pytest.mark.parametrize("cached,ids,ok", [(0, [12], True), (1024, [12], False), (0, [], False)])
+def test_timing_only_cold_first_token(profile_tool, tmp_path, monkeypatch, cached, ids, ok):
+    args = profile_tool.parser().parse_args(
+        ["--prefill-dcp", "8", "--timing-only", "--run-dir", str(tmp_path), "--child", "80k_on"]
+    )
+    (tmp_path / "80k_on").mkdir()
+    (tmp_path / "80k_prompt.json").write_text(json.dumps({"length": 2, "token_ids": [1, 2]}))
+    engine = SimpleNamespace(shutdown=Mock())
+    result = SimpleNamespace(num_cached_tokens=cached, outputs=[SimpleNamespace(text="x", token_ids=ids)])
+    model = SimpleNamespace(llm_engine=SimpleNamespace(engine_core=engine), generate=Mock(return_value=[result]))
+    monkeypatch.setitem(sys.modules, "vllm", SimpleNamespace(LLM=lambda **kw: model, SamplingParams=SimpleNamespace))
+    if ok:
+        profile_tool.run_child(args)
+        report = json.loads((tmp_path / "80k_on/result.json").read_text())
+        assert report["prefill_to_first_token_seconds"] >= 0 and report["token_ids"] == [12]
+        assert "request_seconds_with_profiler" not in report
+    else:
+        with pytest.raises(RuntimeError, match="cold prompt"):
+            profile_tool.run_child(args)
+    engine.shutdown.assert_called_once_with()

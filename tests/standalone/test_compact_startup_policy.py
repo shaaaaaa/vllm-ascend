@@ -273,7 +273,7 @@ def test_decoder_dcp_selects_split_backend_before_storage_and_rechecks_live_poli
     monkeypatch.setitem(sys.modules, cp.__name__, cp)
     builder, impl = object(), object()
     ctx.ns.update(
-        enable_cp=lambda: True, get_current_vllm_config=lambda: ctx.vllm,
+        envs=ctx.envs, enable_cp=lambda: True, get_current_vllm_config=lambda: ctx.vllm,
         AscendSFAMetadataBuilder=builder, AscendSFAImpl=impl,
     )
     definitions(ROOT / "vllm_ascend/attention/sfa_v1.py", {"get_builder_cls", "get_impl_cls"},
@@ -284,6 +284,9 @@ def test_decoder_dcp_selects_split_backend_before_storage_and_rechecks_live_poli
     del ctx.vllm._dsa_decoder_dcp_policy
     assert backend.get_builder_cls() is cp.AscendSFACPMetadataBuilder
     assert backend.get_impl_cls() is cp.AscendSFACPImpl
+    ctx.envs.VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE = True
+    assert backend.get_builder_cls() is builder
+    assert backend.get_impl_cls() is impl
 
 
 @pytest.mark.parametrize(("owner", "field", "value", "message"), [

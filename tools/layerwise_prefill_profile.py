@@ -85,7 +85,7 @@ def check_shm_capacity(shm_dir: Path, cache_gb: float) -> None:
     )
     if free_bytes < required_bytes:
         raise RuntimeError(
-            "Not enough /dev/shm after stale LMCache cleanup: "
+            "Not enough free /dev/shm: "
             f"free={free_bytes / 1024**3:.2f} GiB, required={cache_gb:g} GiB. "
             "Increase the container's /dev/shm capacity; deleting files cannot "
             "fix a mount whose total size is too small."
@@ -104,6 +104,8 @@ def parser():
     cli.add_argument("--cpu-cache-gb", type=float, default=24, help="Requires this much free /dev/shm and host RAM")
     cli.add_argument("--prefill-dcp", type=int, choices=(1, 2, 4, 8),
                      help="Profile an eager four-bank sender with 16K compute chunks (use an _on case)")
+    cli.add_argument("--timing-only", action="store_true",
+                     help="Time a fresh request through the first sampled token without profiler or worker probes")
     selection = cli.add_mutually_exclusive_group()
     selection.add_argument(
         "--case",
@@ -345,6 +347,8 @@ def engine_options(args, case_dir, prompt_len):
         options.update(decode_context_parallel_size=args.prefill_dcp, block_size=128,
                        cp_kv_cache_interleave_size=128, max_num_batched_tokens=16384)
         options["additional_config"].update(enable_sparse_li_c8=True, enable_sparse_sfa_c8=False)
+    if getattr(args, "timing_only", False):
+        del options["profiler_config"], options["worker_extension_cls"]
     return options
 
 
@@ -430,20 +434,25 @@ def run_child(args):
     prompt = json.loads((args.run_dir / f"{args.child.split('_')[0]}_prompt.json").read_text(encoding="utf-8"))
     options = engine_options(args, case_dir, prompt["length"])
     write_json(case_dir / "engine_options.json", options)
-    print(f"{PREFIX} {args.child}: loading full model; capture starts AFTER startup", flush=True)
+    print(f"{PREFIX} {args.child}: loading full model before measurement", flush=True)
     llm = LLM(**options)
     try:
-        print(f"{PREFIX} {args.child}: capturing {prompt['length']} input tokens -> first output token", flush=True)
-        results, elapsed = capture_request(
-            llm,
-            prompt["token_ids"],
-            SamplingParams(temperature=0, seed=1024, max_tokens=1),
-            args.child,
-            case_dir,
-            chunk_tokens=options["max_num_batched_tokens"],
-        )
+        print(f"{PREFIX} {args.child}: {prompt['length']} input tokens through first output token", flush=True)
+        params = SamplingParams(temperature=0, seed=1024, max_tokens=1)
+        if args.timing_only:
+            start = time.perf_counter()
+            results = llm.generate({"prompt_token_ids": prompt["token_ids"]}, params, use_tqdm=False)
+            elapsed = time.perf_counter() - start
+            timing_field = "prefill_to_first_token_seconds"
+        else:
+            results, elapsed = capture_request(
+                llm, prompt["token_ids"], params, args.child, case_dir, options["max_num_batched_tokens"]
+            )
+            timing_field = "request_seconds_with_profiler"
         result = results[0]
         completion = result.outputs[0]
+        if args.timing_only and (result.num_cached_tokens != 0 or len(completion.token_ids) != 1):
+            raise RuntimeError("Timing requires a cold prompt and exactly one sampled token")
         report = {
             "output_valid_for_correctness": True,
             "case": args.child,
@@ -451,14 +460,14 @@ def run_child(args):
             "num_cached_tokens": result.num_cached_tokens,
             "text": completion.text,
             "token_ids": list(completion.token_ids),
-            "request_seconds_with_profiler": elapsed,
+            timing_field: elapsed,
             "scope": "local CPU KV offload/reload + P forward incl. MTP + first-token sampling; no remote store",
         }
         write_json(case_dir / "result.json", report)
         # OFF/ON must both compute the whole prompt, never measure a cache hit.
         if result.num_cached_tokens:
             raise RuntimeError("Unexpected cache hit; this trace is not a fresh prefill")
-        print(f"{PREFIX} {args.child}: captured; request_seconds_with_profiler={elapsed:.3f}", flush=True)
+        print(f"{PREFIX} {args.child}: {timing_field}={elapsed:.3f}", flush=True)
     finally:
         print(f"{PREFIX} {args.child}: model shutdown begin", flush=True)
         llm.llm_engine.engine_core.shutdown()
@@ -503,7 +512,7 @@ def analyse_case(case_dir):
 
 def run_cases(args, root, cases):
     for index, case in enumerate(cases):
-        if index:
+        if index and not getattr(args, "timing_only", False):
             clear_shm(Path("/dev/shm"))
         case_dir = root / case
         case_dir.mkdir()
@@ -525,9 +534,13 @@ def run_cases(args, root, cases):
         if getattr(args, "prefill_dcp", None) is not None:
             command.extend(("--prefill-dcp", str(args.prefill_dcp)))
         env = case_environment(args, case)
-        reuse_log = case_dir / "reuse.log"
-        reuse_log.touch()
-        env["LMCACHE_PREFILL_REUSE_DEBUG_FILE"] = str(reuse_log.resolve())
+        if getattr(args, "timing_only", False):
+            command.append("--timing-only")
+            env.pop("LMCACHE_PREFILL_REUSE_DEBUG_RANK", None)
+        else:
+            reuse_log = case_dir / "reuse.log"
+            reuse_log.touch()
+            env["LMCACHE_PREFILL_REUSE_DEBUG_FILE"] = str(reuse_log.resolve())
         write_json(
             case_dir / "environment.json",
             {
@@ -553,7 +566,8 @@ def run_cases(args, root, cases):
                 raise RuntimeError(f"{case} failed; see {case_dir / 'server.log'}; remaining cases not run")
         finally:
             finish_child(proc)
-        analyse_case(case_dir)
+        if not getattr(args, "timing_only", False):
+            analyse_case(case_dir)
 
 
 def main(argv=None):
@@ -565,7 +579,8 @@ def main(argv=None):
     if args.analyse_only:
         for case in CASES:
             case_dir = args.analyse_only.resolve() / case
-            if (case_dir / "engine_options.json").is_file():
+            options_file = case_dir / "engine_options.json"
+            if options_file.is_file() and "profiler_config" in json.loads(options_file.read_text(encoding="utf-8")):
                 analyse_case(case_dir)
         return
     if os.name != "posix":
@@ -576,7 +591,7 @@ def main(argv=None):
     if args.prefill_dcp is not None:
         if not args.case.endswith("_on") or args.prefill_dcp not in (1, len(devices)):
             cli.error("--prefill-dcp requires an _on case and DCP=1 or DCP=TP")
-    else:
+    elif not args.timing_only:
         clear_shm(Path("/dev/shm"))
     check_shm_capacity(Path("/dev/shm"), args.cpu_cache_gb)
     root = (

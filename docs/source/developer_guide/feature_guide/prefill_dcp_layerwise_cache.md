@@ -29,6 +29,42 @@ python3 tools/layerwise_prefill_profile.py --model /workspace/models/GLM-5.3-w4a
   --case 80k_on --prefill-dcp 8 --run-dir profile-p-dcp8
 ```
 
+## One-host qualification
+
+The banked sender and compact decoder currently require separate vLLM engines. On eight idle A2 devices the colocated launcher assigns four to each TP group. Both engines stay loaded for the entire request. The proxy uses the production Mooncake handoff. This measures TP4/DCP4 on each side. A TP8 sender and TP8 decoder with this topology need two disjoint sets of eight devices.
+
+The single-engine boundary is cache ownership. `KVCacheCoordinator` instantiates either `PrefillLayerBundlePool` (rotating physical pages) or `DcpRequestPool` (per-request owner and per-rank block tables). P uses FlashComm1 and an eager forward to save every layer before bank reuse. D captures persistent per-layer addresses and admits a compact request from a validated external prefix. Sampling P’s first token creates neither a D allocation nor a leased graph source. A single-engine implementation would need to budget both arenas, dispatch the appropriate query projection and cache views for each phase, fence target and MTP stores, bind the complete BF16 or C8 indexer on its owner, and promote the same request with a new allocation epoch before allowing replay. A one-token prefill tail is still prefill. Aborts, preemption and queued steps must respect the same ownership boundary.
+
+Use the matching four checkouts, the installed native extensions, and a reachable Mooncake master. Start with P and D YAMLs rendered for this host’s routable Ascend NIC and the same master. P needs `pd_role: sender`. D needs `pd_role: receiver`, async process storage and `persistent_direct_hbm`. Keep the production page format and strict shared CPU cache. The launcher sizes LocalCPU and Mooncake at 32 GiB **each per role**, configurable with `CPU_GIB_PER_ROLE` and `STORE_GIB_PER_ROLE`. Allow room for the two shared slabs, Mooncake segments, model startup and the OS. Use the normal HCCL NIC environment. The HTTP services and qualification RPC listen on loopback.
+
+```bash
+export MODEL=/workspace/models/GLM-5.3-w4a8c8
+export PREFILL_CONFIG=/path/to/rendered-prefiller.yaml
+export DECODE_CONFIG=/path/to/rendered-decoder.yaml
+
+# From vllm-ascend, in three shells with the exports above.
+bash tools/serve_colocated_banked_dcp.sh prefill
+bash tools/serve_colocated_banked_dcp.sh decode
+bash tools/serve_colocated_banked_dcp.sh proxy
+
+# Once both engines are ready, from a fourth shell.
+python3 tools/check_banked_dcp_handoff.py --url http://127.0.0.1:8080 \
+  --prefiller http://127.0.0.1:7910 --decoder http://127.0.0.1:7920 --model glm
+```
+
+The check sends one 60,000-token cold prompt and requests 16 generated tokens. It correlates the backend request IDs, checks cold and continuation chunks on every P rank, and requires repeated target-graph replay on every D rank, with a positive compact frontier, stable request owner and a computed position past the end of the prompt. This excludes a native fallback and the fully resident short-prefix path. The output includes generated IDs. For a matched-input correctness comparison add `--seed 17` and use a fresh store for each arm. The qualification hook is removed before benchmarking.
+
+For the control, restart P with `PREFILL_DCP=1` and run the check with `--prefill-dcp 1`. Keep D, device assignments, model, prompt IDs and compute-chunk size identical. Compare client TTFT and TPOT with the existing `vllm bench serve` against port 8080. Use fresh cache contents for each arm so the control and candidate both compute the full input. The supplied launcher qualifies one active request at a time.
+
+```bash
+vllm bench serve --backend vllm --host 127.0.0.1 --port 8080 --endpoint /v1/completions \
+  --model "$MODEL" --served-model-name glm --dataset-name random --random-input-len 60000 \
+  --random-output-len 64 --random-range-ratio 0 --num-prompts 10 --max-concurrency 1 --ignore-eos --seed 17 \
+  --ready-check-timeout-sec 0 --num-warmups 0
+```
+
+To isolate P on all eight NPUs, use the two `layerwise_prefill_profile.py` commands above with `--timing-only` and distinct run directories. Read `prefill_to_first_token_seconds` from each case’s `result.json`. This times local offload, reload and sampling through the first token after startup. The colocated run additionally exercises P/D transfer and iterative decode.
+
 ## Implementation audit
 
 The audit compared `feat/prefill-dcp-layerwise-cache` with the following `feat/decoder-dcp-indexer-sharding` baseline in each repository.
