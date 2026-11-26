@@ -213,7 +213,7 @@ def w8a8_with_gate(gate, x, weight, scale, token_scale, name, reduce):
     # Finish the admitted copy piece before launching the dependent HCCL task.
     if reduce:
         output = tensor_model_parallel_all_reduce(output)
-        return output
+    return output
 
 
 def sfa_decode_w8a8_fake(

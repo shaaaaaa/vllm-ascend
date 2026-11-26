@@ -227,23 +227,27 @@ def test_glm_projection_shapes_and_collective_boundary(decoder):
     assert w.projection_name("model.layers.4.mlp.experts.1.down_proj") is None
 
 
-def test_compiler_keeps_custom_op_until_capture(decoder):
+@pytest.mark.parametrize(
+    ("projection", "reduce", "expected_value"), [("o_proj", True, 512.0), ("q_b", False, 128.0)]
+)
+def test_compiler_keeps_custom_op_until_capture(decoder, projection, reduce, expected_value):
     from torch.fx.experimental.proxy_tensor import make_fx
 
     w, gate, calls, _ = decoder
-    op = torch.library.custom_op("test_sfa_windows::w8a8_with_tp", mutates_args=())(w.sfa_decode_w8a8)
+    op = torch.library.custom_op(f"test_sfa_windows::w8a8_{projection}", mutates_args=())(w.sfa_decode_w8a8)
     op.register_fake(w.sfa_decode_w8a8_fake)
     x = torch.ones((28, 128), dtype=torch.bfloat16)
     weight = torch.ones((128, 64), dtype=torch.int8)
     scale = torch.ones(64, dtype=torch.bfloat16)
-    model = make_fx(lambda a, b, c: op(a, b, c, None, "o_proj", True), tracing_mode="fake")(x, weight, scale)
+    model = make_fx(lambda a, b, c: op(a, b, c, None, projection, reduce), tracing_mode="fake")(x, weight, scale)
     assert not calls
-    expected = torch.full((28, 64), 512.0, dtype=torch.bfloat16)
+    expected = torch.full((28, 64), expected_value, dtype=torch.bfloat16)
     for pending in (0, 3, 0):
         gate.pending = pending
         calls.clear()
         torch.testing.assert_close(model(x, weight, scale), expected)
-        assert ("matmul", bool(pending)) in calls and ("reduce", False) in calls
+        assert ("matmul", bool(pending)) in calls
+        assert (("reduce", False) in calls) == reduce
 
 
 def test_fifo_grant_survives_first_consumer_join(decoder, capture_runtime):  # noqa: F811
