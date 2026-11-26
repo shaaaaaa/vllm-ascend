@@ -116,7 +116,7 @@ def row_parallel_with_prefill_transfer(
 
 
 def sfa_tp_projection(layer, x, bias):
-    """The ordinary local W8A8 GEMM and its TP AllReduce share one admission."""
+    """Capture the local W8A8 projection followed by its TP AllReduce."""
     from vllm_ascend.compilation.sfa_copy_windows import current_gate, tagged_projection, w8a8_projection
 
     # Keep AllReduce visible to sequence-parallel compiler passes. Inside an

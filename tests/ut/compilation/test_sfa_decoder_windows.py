@@ -54,21 +54,22 @@ def decoder(capture_runtime, monkeypatch):  # noqa: F811
 @pytest.mark.parametrize(
     ("rows", "cap", "local", "events"),
     [
-        (16, 20, True, [True, ("quant", True), ("matmul", True), ("reduce", True), False]),
-        (20, 20, True, [True, ("quant", True), ("matmul", True), ("reduce", True), False]),
-        (21, 20, True, [("quant", False), True, ("matmul", True), ("reduce", True), False]),
+        (16, 20, True, [True, ("quant", True), ("matmul", True), False, ("reduce", False)]),
+        (20, 20, True, [True, ("quant", True), ("matmul", True), False, ("reduce", False)]),
+        (21, 20, True, [("quant", False), True, ("matmul", True), False, ("reduce", False)]),
         (32, 20, False, [("quant", False), True, ("matmul", True), False, ("reduce", False)]),
-        (16, 24, True, [True, ("quant", True), False, ("matmul", False), True, ("reduce", True), False]),
+        (16, 24, True, [True, ("quant", True), False, ("matmul", False), ("reduce", False)]),
         (28, 40, True, [("quant", False), ("matmul", False), ("reduce", False)]),
     ],
 )
-def test_projection_and_reduction_use_one_grant_when_adjacent(decoder, rows, cap, local, events):
+@pytest.mark.parametrize("projection", ["o_proj", "dense_down", "shared_down"])
+def test_projection_closes_copy_window_before_allreduce(decoder, rows, cap, local, events, projection):
     w, gate, calls, _ = decoder
     gate.free_aiv, gate.local_tp4 = 40 - cap, local
     x = torch.arange(rows * 128).reshape(rows, 128).remainder(5).bfloat16()
     weight = torch.arange(128 * 64).reshape(128, 64).remainder(7).to(torch.int8)
     scale = torch.ones(64, dtype=torch.bfloat16)
-    value = w.sfa_decode_w8a8(x, weight, scale, None, "o_proj", True)
+    value = w.sfa_decode_w8a8(x, weight, scale, None, projection, True)
     assert [entry[1] if entry[0] == "gate" else entry for entry in calls] == events
     torch.testing.assert_close(value, (x.float() @ weight.float()).bfloat16() * 4)
     assert not gate.open
@@ -195,7 +196,6 @@ def test_shared_experts_apply_one_tp_reduction_after_the_optional_gate(decoder, 
         tagged_projection=w.tagged_projection,
         tp_fits=w.tp_fits,
         current_gate=w.current_gate,
-        tp_window=w.tp_window,
         w8a8_projection=projection,
         tensor_model_parallel_all_reduce=w.tensor_model_parallel_all_reduce,
     )
@@ -209,7 +209,7 @@ def test_shared_experts_apply_one_tp_reduction_after_the_optional_gate(decoder, 
     evts = NS(before_routed_experts=NS(recorded=True), before_dispatch=None, before_combine=None)
     out = scope["_forward_shared_experts"](ctx, hidden, evts)
     torch.testing.assert_close(out, hidden * (8 if combined else 4))
-    assert ("combined", False) in calls if combined else ("reduce", True) in calls
+    assert ("combined", False) in calls if combined else ("reduce", False) in calls
     assert sum(op[0] in {"combined", "reduce"} for op in calls) == 1
 
 
@@ -243,11 +243,11 @@ def test_compiler_keeps_custom_op_until_capture(decoder):
         gate.pending = pending
         calls.clear()
         torch.testing.assert_close(model(x, weight, scale), expected)
-        assert ("matmul", bool(pending)) in calls and ("reduce", bool(pending)) in calls
+        assert ("matmul", bool(pending)) in calls and ("reduce", False) in calls
 
 
 def test_fifo_grant_survives_first_consumer_join(decoder, capture_runtime):  # noqa: F811
-    w, gate, calls, _ = decoder
+    w, gate, _, native = decoder
     module, _ = capture_runtime
     gate.pending = 0
     side = torch.npu.Stream()
@@ -262,12 +262,38 @@ def test_fifo_grant_survives_first_consumer_join(decoder, capture_runtime):  # n
     group.launch(data, data, data)
     assert [e.transfer.load.call_count for e in edges] == [1] * 3
     assert gate.free_aiv == 20
+    activation = torch.ones((1, 512), dtype=torch.bfloat16)
+    observed = []
+
+    def activate(x):
+        observed.append(gate.open)
+        return x.chunk(2, dim=-1)[0]
+
+    native.npu_swiglu = activate
     for index, edge in enumerate(edges):
         edge.join()
         assert gate.pending == 2 - index
         assert (w.current_gate() is gate) == (index < 2)
-        with w.tp_window("tp_allreduce", data.bfloat16()):
-            assert gate.open == (index < 2)
+        w.sfa_decode_swiglu(activation)
+        assert not gate.open
+    assert observed == [True, True, False]
+
+
+@pytest.mark.parametrize("is_ep_comm", [False, True])
+def test_maybe_pad_and_reduce_executes_once_with_the_copy_window_closed(decoder, is_ep_comm):
+    w, _, calls, _ = decoder
+    reduce_op = extract(
+        ROOT / "vllm_ascend/ops/register_custom_ops.py",
+        "_maybe_pad_and_reduce_impl",
+        {
+            "get_forward_context": lambda: NS(flash_comm_v1_enabled=False),
+            "enable_sp_by_pass": lambda: False,
+            "tensor_model_parallel_all_reduce": w.tensor_model_parallel_all_reduce,
+        },
+    )
+    x = torch.ones((16, 128), dtype=torch.bfloat16)
+    torch.testing.assert_close(reduce_op(x, is_ep_comm), x * 4)
+    assert calls == [("reduce", False)]
 
 
 @pytest.mark.parametrize(

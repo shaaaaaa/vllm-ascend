@@ -19,7 +19,6 @@ from vllm_ascend.compilation.sfa_copy_windows import (
     sfa_decode_swiglu_fake,
     sfa_decode_w8a8,
     sfa_decode_w8a8_fake,
-    tp_window,
 )
 from vllm_ascend.ops.rotary_embedding import rope_forward_oot
 from vllm_ascend.ops.triton.muls_add import muls_add_triton
@@ -88,9 +87,6 @@ def _maybe_pad_and_reduce_impl(x: torch.Tensor, is_ep_comm: bool = False) -> tor
     )
 
     if not flash_comm_v1_enabled or (forward_context.is_draft_model and is_vl_model()):
-        if not is_ep_comm:
-            with tp_window("tp_allreduce", x):
-                return tensor_model_parallel_all_reduce(x)
         return tensor_model_parallel_all_reduce(x)
 
     dp_metadata = forward_context.dp_metadata

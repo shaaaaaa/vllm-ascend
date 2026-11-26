@@ -30,17 +30,6 @@ def tp_fits(gate, byte_count):
     return gate is not None and gate.local_tp4 and gate.free_aiv >= 8 and 0 < byte_count < 1024 * 1024
 
 
-def tp_window(name, tensor):
-    gate = current_gate()
-    if (
-        tp_fits(gate, tensor.numel() * tensor.element_size())
-        and tensor.is_contiguous()
-        and tensor.dtype in (torch.float16, torch.bfloat16)
-    ):
-        return gate.window(name)
-    return nullcontext()
-
-
 def projection_name(prefix):
     for suffix, name in (
         (".self_attn.fused_qkv_a_proj", "qkv"),
@@ -221,9 +210,9 @@ def w8a8_with_gate(gate, x, weight, scale, token_scale, name, reduce):
         output = torch_npu.npu_quant_matmul(
             x, weight, scale, pertoken_scale=token_scale, bias=None, output_dtype=torch.bfloat16
         )
-        if reduce:
-            select("tp_allreduce", tp_fits(gate, output.numel() * output.element_size()) and output.is_contiguous())
-            output = tensor_model_parallel_all_reduce(output)
+    # Finish the admitted copy piece before launching the dependent HCCL task.
+    if reduce:
+        output = tensor_model_parallel_all_reduce(output)
         return output
 
 

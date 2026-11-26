@@ -40,7 +40,6 @@ from vllm_ascend.compilation.sfa_copy_windows import (
     current_gate,
     tagged_projection,
     tp_fits,
-    tp_window,
     w8a8_projection,
 )
 from vllm_ascend.distributed.parallel_state import get_mc2_group
@@ -627,8 +626,7 @@ class AscendSharedFusedMoE(SharedFusedMoE, AscendFusedMoE):
             gate_out, _ = self._shared_experts.expert_gate(hidden_states)  # type: ignore
             shared_out = F.sigmoid(gate_out) * shared_out
         if tp_reduce:
-            with tp_window("tp_allreduce", shared_out):
-                shared_out = tensor_model_parallel_all_reduce(shared_out)
+            shared_out = tensor_model_parallel_all_reduce(shared_out)
         return shared_out
 
     def _validate_shared_expert_consistency(self):
@@ -731,8 +729,7 @@ class AscendSharedFusedMoE(SharedFusedMoE, AscendFusedMoE):
         # NOTE: This is exactly the opposite of
         # `maybe_all_reduce_tensor_model_parallel`
         if reduce and not combined:
-            with tp_window("tp_allreduce", shared_out):
-                shared_out = tensor_model_parallel_all_reduce(shared_out)
+            shared_out = tensor_model_parallel_all_reduce(shared_out)
         return shared_out
 
     def forward_impl(  # type: ignore[override]

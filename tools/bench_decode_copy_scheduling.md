@@ -66,10 +66,10 @@ The mixed W8A8 decoder kernel uses up to 20 AIVs. DynamicQuant is admitted when
 the actual padded row count fits the remaining AIV budget. SwiGlu uses its
 column-tile bound, RMSNorm uses its row bound and the residual `muls_add`
 uses its actual Triton launch grid. Layout conversion runs before K-up.
-Small intra-host TP4 AllReduce and post-Combine AllGather may share with copy.
-The ordinary O/shared-down projection and its adjacent eligible AllReduce use one
-grant. An admitted piece finishes before execution enters sparse attention,
-routed Dispatch, expert GMM or Combine. [CANN W8A8 tiling](https://github.com/hicann/ops-nn/blob/9f8a66e795ef1842c2118cf5bbadfe3624bdd1ef/matmul/quant_batch_matmul_v3/op_host/op_tiling/quant_batch_matmul_v3_basic_tiling.cpp) · [CANN SwiGlu tiling](https://github.com/hicann/ops-nn/blob/9f8a66e795ef1842c2118cf5bbadfe3624bdd1ef/activation/swi_glu/op_host/swi_glu_tiling.cpp) · [HCCL small AllReduce](https://github.com/hicann/hcomm/blob/2981ffa77fd5a7bfe7e64055eb3ec4fe762c0b9f/src/algorithm/impl/coll_executor/coll_all_reduce/coll_all_reduce_mesh_aiv_smallcount_executor.cc)
+Small intra-host TP4 post-Combine AllGather may share with copy. The O and
+MLP projections close their copy windows before TP AllReduce. An admitted
+piece finishes before the main stream enters the reduction, sparse attention,
+routed Dispatch, expert GMM or Combine. [CANN W8A8 tiling](https://github.com/hicann/ops-nn/blob/9f8a66e795ef1842c2118cf5bbadfe3624bdd1ef/matmul/quant_batch_matmul_v3/op_host/op_tiling/quant_batch_matmul_v3_basic_tiling.cpp) · [CANN SwiGlu tiling](https://github.com/hicann/ops-nn/blob/9f8a66e795ef1842c2118cf5bbadfe3624bdd1ef/activation/swi_glu/op_host/swi_glu_tiling.cpp)
 
 For the shared-indexer comparison, keep the main gate and piece count fixed
 and switch `VLLM_ASCEND_SFA_PREFETCH_MULTI_LAYER` from 0 to 1 on D.
