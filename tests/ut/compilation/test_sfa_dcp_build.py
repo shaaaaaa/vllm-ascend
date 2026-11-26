@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Verify ACLNN source selection and host binding arguments without a CANN SDK."""
+"""Verify resident launch signatures, ACLNN source selection and host bindings without a CANN SDK."""
 
 import os
 import shlex
@@ -8,8 +8,46 @@ import subprocess
 from pathlib import Path
 
 import pytest
+import regex as re
 import torch
 from sfa_test_support import ROOT
+
+
+def test_resident_launch_signatures_survive_preprocessing(tmp_path):
+    cmake = shutil.which("cmake")
+    compiler = shlex.split(os.environ.get("CXX", "c++"))
+    if not cmake or not shutil.which(compiler[0]):
+        pytest.skip("requires CMake and a C++ preprocessor")
+
+    script = tmp_path / "generate.cmake"
+    script.write_text(f'include("{(ROOT / "cmake/resident_exact.cmake").as_posix()}")\n', encoding="utf-8")
+    subprocess.run([cmake, "-P", str(script)], cwd=tmp_path, check=True, timeout=30)
+    (tmp_path / "kernel_operator.h").touch()  # Only preprocessing is needed for launch signatures.
+    owner_union = [
+        "gathered", "inverse", "lanes", "positions", "published", "gatheredRows",
+        "inverseRows", "modelRows", "actualRows", "positionBytes", "publishedStride", "reject",
+    ]
+    entry = re.compile(r'extern "C"\s+__global__\s+__aicore__\s+void\s+(\w+)\s*\((.*?)\)\s*\{', re.S)
+    for variant in ("", "exact", "membership", "dcp", "dcp_free_slots", "dcp_owner", "dcp_owner_free_slots"):
+        suffix = f"_{variant}" if variant else ""
+        source = (tmp_path if variant else ROOT / "csrc/kernels") / f"resident_sorted_cache{suffix}.cpp"
+        # AscendC flattens each declaration, including any preprocessor line markers within it.
+        code = subprocess.check_output([*compiler, "-E", "-I", str(tmp_path), str(source)], text=True, timeout=30)
+        signatures = dict(entry.findall(code))
+        for name, signature in signatures.items():
+            assert "#" not in signature, f"{name}: {signature}"
+        dcp = variant.startswith("dcp")
+        owner = variant.startswith("dcp_owner")
+        rank = ["dcpBits", "dcpRank"] if dcp else []
+        expected = {f"dsa_resident_sharded_union{suffix}_kernel": rank + (owner_union if owner else [])}
+        if dcp or variant == "membership":
+            update = f"dsa_resident_sorted_membership_update{suffix if dcp else ''}_kernel"
+            expected[update] = rank + (["liveOrigins", "selectedCounts"] if dcp else []) + (
+                ["gathered", "gatheredRows"] if owner else []
+            )
+        for name, tail in expected.items():
+            names = [arg.split()[-1] for arg in signatures[name].split(",")]
+            assert names[names.index("generationStride") + 1 :] == tail
 
 
 @pytest.mark.parametrize("dcp", [False, True], ids=["original", "a2-with-dcp"])

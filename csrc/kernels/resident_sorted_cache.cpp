@@ -3828,6 +3828,25 @@ private:
     uint32_t shardCountRequestStride_ = 0;
 };
 
+// AscendC flattens preprocessed kernel declarations into host launch stubs.
+// Keep conditional blocks outside the parameter lists so #line markers cannot enter them.
+#ifdef RESIDENT_DCP_SHARDING
+#define RESIDENT_DCP_PARAMS(...) , __VA_ARGS__
+#else
+#define RESIDENT_DCP_PARAMS(...)
+#endif
+#ifdef RESIDENT_OWNER_TOPK
+#define RESIDENT_OWNER_UNION_PARAMS \
+    , __gm__ int32_t* gathered, __gm__ int64_t* inverse, __gm__ int64_t* lanes, \
+    __gm__ int32_t* positions, __gm__ int32_t* published, uint32_t gatheredRows, \
+    uint32_t inverseRows, uint32_t modelRows, uint32_t actualRows, uint32_t positionBytes, \
+    uint32_t publishedStride, uint32_t reject
+#define RESIDENT_OWNER_UPDATE_PARAMS , __gm__ int32_t* gathered, uint32_t gatheredRows
+#else
+#define RESIDENT_OWNER_UNION_PARAMS
+#define RESIDENT_OWNER_UPDATE_PARAMS
+#endif
+
 extern "C" __global__ __aicore__ void
 dsa_resident_sharded_union_kernel(
     __gm__ int32_t* topkIndices,
@@ -3856,16 +3875,7 @@ dsa_resident_sharded_union_kernel(
     uint32_t shardCountStride,
     uint32_t shardCountRequestStride,
     uint32_t generationStride
-#ifdef RESIDENT_DCP_SHARDING
-    , uint32_t dcpBits, uint32_t dcpRank
-#endif
-#ifdef RESIDENT_OWNER_TOPK
-    , __gm__ int32_t* gathered, __gm__ int64_t* inverse, __gm__ int64_t* lanes,
-    __gm__ int32_t* positions, __gm__ int32_t* published, uint32_t gatheredRows,
-    uint32_t inverseRows, uint32_t modelRows, uint32_t actualRows, uint32_t positionBytes,
-    uint32_t publishedStride, uint32_t reject
-#endif
-    )
+    RESIDENT_DCP_PARAMS(uint32_t dcpBits, uint32_t dcpRank) RESIDENT_OWNER_UNION_PARAMS)
 {
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
     DSAResidentShardedUnionKernel op;
@@ -4011,14 +4021,9 @@ dsa_resident_sorted_membership_update_kernel(
     uint32_t shardCountStride,
     uint32_t shardCountRequestStride,
     uint32_t generationStride
-#ifdef RESIDENT_DCP_SHARDING
-    , uint32_t dcpBits, uint32_t dcpRank,
-    __gm__ int32_t* liveOrigins, __gm__ int32_t* selectedCounts
-#endif
-#ifdef RESIDENT_OWNER_TOPK
-    , __gm__ int32_t* gathered, uint32_t gatheredRows
-#endif
-    )
+    RESIDENT_DCP_PARAMS(uint32_t dcpBits, uint32_t dcpRank,
+                        __gm__ int32_t* liveOrigins, __gm__ int32_t* selectedCounts)
+    RESIDENT_OWNER_UPDATE_PARAMS)
 {
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
     DSAResidentSortedUpdateKernel op;
