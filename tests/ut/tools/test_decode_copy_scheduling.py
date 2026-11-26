@@ -21,6 +21,19 @@ def data(ids, request="req"):
     return b"data: " + json.dumps(message).encode() + b"\n"
 
 
+@pytest.mark.parametrize("split_at", [6, 13, 15])
+def test_offline_trace_events_header_across_read_boundary(clients, tmp_path, split_at):
+    import analyze_decode_moe_copy
+
+    prefix = '{"label":"traceEvents","padding":"'
+    closing = '",'
+    padding = "x" * ((1 << 20) - len(prefix) - len(closing) - split_at)
+    trace = tmp_path / "wrapped.json"
+    header = '"traceEvents"  :  '
+    trace.write_text(prefix + padding + closing + header + '[{"name":"kernel"}]}', encoding="utf-8-sig")
+    assert list(analyze_decode_moe_copy.events(trace)) == [{"name": "kernel"}]
+
+
 def test_grouped_copy_layer_times_count_device_work_and_inter_piece_gaps(clients, tmp_path):
     _, gaps = clients
     schedule = (12, 24, 12)
@@ -124,6 +137,8 @@ def test_failed_streams_are_excluded(clients, chunks):
 @pytest.mark.parametrize("opens_with_gate", [False, True])
 @pytest.mark.parametrize("at_consumer", [False, True])
 def test_copy_pieces_match_the_graph_fork_and_consumer_join(clients, tmp_path, opens_with_gate, at_consumer):
+    import analyze_decode_moe_copy
+
     _, gaps = clients
     events = [{"ph": "M", "name": "process_name", "pid": 8, "args": {"name": "Ascend Hardware"}}]
 
@@ -172,6 +187,12 @@ def test_copy_pieces_match_the_graph_fork_and_consumer_join(clients, tmp_path, o
         task(start, duration, "sfa_copy_piece_i32_s64", "AI_VECTOR_CORE", 30 + index, stream=7)
     trace = tmp_path / "trace.json"
     trace.write_text(json.dumps(events))
+    offline, _ = analyze_decode_moe_copy.analyze(trace, threshold=5_000, layers=2, top=1)
+    device = offline["devices"][0]
+    assert device["dispatch"]["target_first"]["long_n"] == 1
+    assert device["dispatch"]["target_regular"]["n"] == 0
+    assert device["slowest_dispatch"]["target_first"][0]["copy_overlap_us"] == (0 if at_consumer else 2.6)
+    assert device["moe_stage_wall"]["dispatch_to_combine_wall_first"]["max_us"] == 9
     summary, layers, samples = gaps.analyze(trace, expected=2)
     assert summary["copy_pieces_per_edge"] == {4: 1}
     assert summary["consumer_release_edges"] == int(at_consumer)
@@ -253,6 +274,8 @@ def test_dynamic_windows_report_actual_piece_counts_and_protected_overlap(client
 @pytest.mark.parametrize("gated", [True, False])
 @pytest.mark.parametrize("placement", ["producer_vup", "first_qkv", "per_consumer"])
 def test_three_prefetch_completions_match_three_consumers_even_in_one_window(clients, tmp_path, gated, placement):
+    import analyze_decode_moe_copy
+
     _, gaps = clients
     events, cubes, joins, qkvs = [], [], [], []
     tick = 0
@@ -314,6 +337,12 @@ def test_three_prefetch_completions_match_three_consumers_even_in_one_window(cli
         ordinal += 3 if gated else 1
     trace = tmp_path / "group.json"
     trace.write_text(json.dumps(events))
+    offline, per_layer = analyze_decode_moe_copy.analyze(trace, threshold=200_000, layers=4, top=1)
+    device = offline["devices"][0]
+    assert device["consumer_wait"]["joined_layers"] == 3
+    stalls = {"producer_vup": [0, 0, 0], "first_qkv": [8, 0, 0], "per_consumer": [8, 8, 8]}
+    assert [row["wait_p50_us"] for row in per_layer if row["matched_joins"]] == stalls[placement]
+    assert device["overlap"]["overlap_us"] == {"producer_vup": 12, "first_qkv": 8, "per_consumer": 0}[placement]
     summary, layers, samples = gaps.analyze(trace, expected=4)
     assert summary["indexer_fork_layers_zero_based"] == [0]
     assert summary["indexer_prefetch_edges"] == 3 and summary["copy_pieces_per_edge"] == {2: 3}
@@ -332,3 +361,7 @@ def test_three_prefetch_completions_match_three_consumers_even_in_one_window(cli
     trace.write_text(json.dumps(events))
     with pytest.raises(ValueError, match="layer trains"):
         gaps.analyze(trace, expected=4)
+    incomplete, _ = analyze_decode_moe_copy.analyze(trace, threshold=200_000, layers=4, top=1)
+    waits = incomplete["devices"][0]["consumer_wait"]
+    assert waits["status"] == "unavailable"
+    assert waits["copy_stall_sum_per_replay"]["sum_us"] is None
