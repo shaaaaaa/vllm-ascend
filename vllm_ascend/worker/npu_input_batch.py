@@ -121,9 +121,8 @@ class NPUInputBatch(InputBatch):
                         max_num_blocks=max_num_blocks_per_req,
                         num_speculative_tokens=num_speculative_tokens,
                         kernel_sizes=kernel_block_sizes,
-                        cp_kv_cache_interleave_size=(
-                            cp_kv_cache_interleave_size
-                        ),
+                        cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
+                        dsa_dcp_sizes=dsa_dcp_sizes,
                     )
                     for _ in range(envs_ascend.VLLM_ASCEND_LAYERWISE_PREFILL_NUM_BANKS - 1)
                 ),

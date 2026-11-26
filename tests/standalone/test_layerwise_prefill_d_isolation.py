@@ -136,7 +136,7 @@ def test_bank_waits_follow_native_qkv_and_protect_cache_writes(p_node, mlapo, ha
     obj.indexer_select_pre_process = indexer_preprocess
     namespace = dict(
         self=obj,
-        dcp=None,
+        dcp=None, prefill=None, owner_rows=None, ix=value, ic=value, isn=value,
         attn_metadata=NS(num_decode_tokens=decode_rows, num_actual_tokens=4),
         layer_name="latent",
         index_layer_name="indexer",
@@ -231,8 +231,8 @@ def test_mlapo_waits_only_for_its_latent_bank_before_cache_write(p_node):
     assert "layer_name" not in seen[-1][1]
 
 
-@pytest.mark.parametrize("p_node", [False, True])
-def test_input_preparation_uses_single_legacy_table_on_d(p_node):
+@pytest.mark.parametrize("p_node,sharded", [(False, False), (True, False), (True, True)])
+def test_input_preparation_uses_single_legacy_table_on_d(p_node, sharded):
     prepare = method("worker/model_runner_v1.py", "NPUModelRunner", "_prepare_inputs")
     nodes = [
         node
@@ -252,9 +252,12 @@ def test_input_preparation_uses_single_legacy_table_on_d(p_node):
         )
 
     primary, shadow = table("primary"), table("shadow")
-    obj = NS(layerwise_prefill_p_node=p_node, dsa_decoder_dcp=False, input_batch=NS(block_table=primary))
+    obj = NS(layerwise_prefill_p_node=p_node, dsa_decoder_dcp=False, dsa_prefill_dcp=sharded,
+             input_batch=NS(block_table=primary))
     if p_node:
-        obj._refresh_layerwise_prefill_block_tables = lambda: (primary, shadow)
+        obj._refresh_layerwise_prefill_block_tables = (
+            lambda: ((None, primary), (None, shadow)) if sharded else (primary, shadow)
+        )
     execute(nodes, dict(self=obj, num_reqs=1, req_indices="req", positions_np="pos",
                         total_num_scheduled_tokens=3, scheduler_output=NS(dsa_dcp_compact_req_ids=None)))
     assert seen == (

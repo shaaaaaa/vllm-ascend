@@ -306,7 +306,7 @@ def test_prefill_rebind_owns_physical_metadata_for_each_bank(api):
 
 @pytest.mark.parametrize("prefill,connector,dcp", [
     (False, False, None), (False, True, None), (True, False, None), (True, True, None),
-    (False, True, 4),
+    (False, True, 4), (True, True, 4),
 ])
 @pytest.mark.parametrize("shard", [False, True])
 def test_runner_specs_charge_retained_alignment_and_select_dcp(api, monkeypatch, prefill, connector, dcp, shard):
@@ -351,17 +351,23 @@ def test_runner_specs_charge_retained_alignment_and_select_dcp(api, monkeypatch,
         runner.model_config.hf_text_config.num_hidden_layers = 2
         runner.use_sparse_c8_indexer = True
         runner.ascend_config = NS(indexer_c8_layer_mask=lambda names: [False, True])
-        runner.vllm_config._dsa_decoder_dcp_policy = (2048, 0)
+        if not prefill:
+            runner.vllm_config._dsa_decoder_dcp_policy = (2048, 0)
+        runner.dsa_prefill_dcp = prefill
     else:
         runner.parallel_config = NS(decode_context_parallel_size=1)
-    runner.vllm_config._dsa_decoder_indexer_sharding = shard
+    runner.vllm_config._dsa_decoder_indexer_sharding = shard and not prefill
     specs = runner.get_kv_cache_spec()
     latent = specs["model.layers.0.self_attn.attn"]
     index = specs["model.layers.0.self_attn.indexer.k_cache"]
-    assert index.dcp_request_sharding == bool(dcp and shard)
+    assert index.dcp_request_sharding == bool(dcp and shard and not prefill)
     assert not latent.dcp_request_sharding
     assert latent.dsa_dcp_size == dcp
     assert index.dsa_dcp_size == (1 if dcp else None)
+    if dcp and prefill:
+        assert not index.indexer_paired_banks and not latent.dsa_compact_startup_scratch_tokens
+        assert index.indexer_c8_layer_names == ("model.layers.1.self_attn.indexer.k_cache",)
+        return
     if dcp:
         assert latent.dsa_compact_startup_scratch_tokens == 2048
         assert index.dsa_compact_startup_scratch_tokens == 0

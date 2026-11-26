@@ -102,6 +102,8 @@ def parser():
     cli.add_argument("--devices", default="0,1,2,3,4,5,6,7")
     cli.add_argument("--prompt-file", type=Path, help="Override the fixed 10k/80k example article")
     cli.add_argument("--cpu-cache-gb", type=float, default=24, help="Requires this much free /dev/shm and host RAM")
+    cli.add_argument("--prefill-dcp", type=int, choices=(1, 2, 4, 8),
+                     help="Profile an eager four-bank sender with 16K compute chunks (use an _on case)")
     selection = cli.add_mutually_exclusive_group()
     selection.add_argument(
         "--case",
@@ -287,6 +289,8 @@ def case_environment(args, case):
     # The P-node marker is the single switch for the new path.  Do not add the
     # obsolete LMCACHE_LAYERWISE_PREFILL_DMA variable: D must retain the
     # original single-layer paged transfer path when this marker is false.
+    if getattr(args, "prefill_dcp", None) is not None:
+        env.update(VLLM_ASCEND_LAYERWISE_PREFILL_NUM_BANKS="4", LMCACHE_PD_ROLE="sender")
     return env
 
 
@@ -294,7 +298,7 @@ def engine_options(args, case_dir, prompt_len):
     # The 80k input cases reserve another 4k tokens of sequence length.
     # Keep the OFF/ON capacity identical even if the tokenized input is a little short.
     max_len = LONG_MAX_MODEL_LEN if prompt_len > SHORT_MAX_MODEL_LEN else SHORT_MAX_MODEL_LEN
-    return {
+    options = {
         "model": args.model,
         "trust_remote_code": True,
         "load_format": "safetensors",
@@ -337,6 +341,11 @@ def engine_options(args, case_dir, prompt_len):
             "torch_profiler_record_shapes": False,
         },
     }
+    if getattr(args, "prefill_dcp", None) is not None:
+        options.update(decode_context_parallel_size=args.prefill_dcp, block_size=128,
+                       cp_kv_cache_interleave_size=128, max_num_batched_tokens=16384)
+        options["additional_config"].update(enable_sparse_li_c8=True, enable_sparse_sfa_c8=False)
+    return options
 
 
 @contextmanager
@@ -366,8 +375,8 @@ def trace_request_submission(llm, case, case_dir):
             faulthandler.cancel_dump_traceback_later()
 
 
-def capture_request(llm, token_ids, params, case, case_dir=None):
-    plan = make_capture_plan(len(token_ids), COMPUTE_CHUNK_TOKENS) if case in LONG_CASES else None
+def capture_request(llm, token_ids, params, case, case_dir=None, chunk_tokens=COMPUTE_CHUNK_TOKENS):
+    plan = make_capture_plan(len(token_ids), chunk_tokens) if case in LONG_CASES else None
     if plan:
         plan["startup_diagnostic_dir"] = str((case_dir / "startup-stacks").resolve())
         write_json(case_dir / "capture_plan.json", plan)
@@ -431,6 +440,7 @@ def run_child(args):
             SamplingParams(temperature=0, seed=1024, max_tokens=1),
             args.child,
             case_dir,
+            chunk_tokens=options["max_num_batched_tokens"],
         )
         result = results[0]
         completion = result.outputs[0]
@@ -512,6 +522,8 @@ def run_cases(args, root, cases):
             "--cpu-cache-gb",
             str(args.cpu_cache_gb),
         ]
+        if getattr(args, "prefill_dcp", None) is not None:
+            command.extend(("--prefill-dcp", str(args.prefill_dcp)))
         env = case_environment(args, case)
         reuse_log = case_dir / "reuse.log"
         reuse_log.touch()
@@ -561,7 +573,11 @@ def main(argv=None):
     devices = args.devices.split(",")
     if not all(d.isdigit() for d in devices) or len(devices) != len(set(devices)) or args.cpu_cache_gb <= 0:
         cli.error("Specify distinct NPU device IDs and a positive CPU cache size")
-    clear_shm(Path("/dev/shm"))
+    if args.prefill_dcp is not None:
+        if not args.case.endswith("_on") or args.prefill_dcp not in (1, len(devices)):
+            cli.error("--prefill-dcp requires an _on case and DCP=1 or DCP=TP")
+    else:
+        clear_shm(Path("/dev/shm"))
     check_shm_capacity(Path("/dev/shm"), args.cpu_cache_gb)
     root = (
         args.run_dir.resolve()

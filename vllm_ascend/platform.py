@@ -300,11 +300,16 @@ class NPUPlatform(Platform):
                 raise ValueError(
                     f"{role} node mode requires prefill_context_parallel_size == 1"
                 )
-            if parallel_config.decode_context_parallel_size != 1:
-                raise ValueError(
-                    f"{role} node mode requires decode_context_parallel_size == 1 "
-                    "(no DCP; each rank restores the full history)"
-                )
+            dcp = parallel_config.decode_context_parallel_size
+            if dcp > 1 and not (
+                dcp == parallel_config.tensor_parallel_size
+                and model_config.enforce_eager and enable_sp(vllm_config)
+                and vllm_config.additional_config.get("enable_dsa_cp", True)
+                and not parallel_config.enable_dbo
+                and not envs_ascend.VLLM_ASCEND_DSA_DCP_INDEXER_REQUEST_SHARDING
+            ):
+                raise ValueError("Banked prefill DCP requires eager DCP=TP with FlashComm1, "
+                                 "DSA query parallelism and a replicated indexer, without DBO")
         if layerwise_prefill_p_node and envs_ascend.VLLM_ASCEND_ENABLE_MATMUL_ALLREDUCE:
             raise ValueError(
                 "VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE=true requires "

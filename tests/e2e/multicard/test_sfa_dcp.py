@@ -345,3 +345,79 @@ def test_counted_sfa_dcp_collectives_replay(
             probe.graph.reset()
     # A rank-local parity failure must never strand peers in a later replay.
     _assert_dcp_comparisons(comparisons)
+
+
+@pytest.mark.parametrize("history_case", ["cold", "aligned", "partial"])
+def test_banked_prefill_dcp_roundtrip(dcp_world, history_case):
+    """Exercise stripe DMA, the real HCCL/pack path, fresh scatter and async rank-0 D2H."""
+    import numpy as np
+    from lmcache.integration.vllm.dcp import DcpWriteLayout
+    from lmcache_ascend import c_ops
+
+    from vllm_ascend.worker.prefill_dcp import PrefillDcpBatch, PrefillDcpWorkspace
+
+    world, rank, block = dcp_world, dist.get_rank(), 128
+    runner = SimpleNamespace(block_size=block, max_model_len=2048, max_num_reqs=2,
+                             layerwise_prefill_bank_count=4, kv_cache_dtype=torch.bfloat16,
+                             sparse_head_dim=(512, 64), device="npu")
+    group = SimpleNamespace(world_size=world, rank_in_group=rank, device_group=dist.group.WORLD)
+    ws = PrefillDcpWorkspace(runner, group, None)
+    banks = [np.array([[5, 2], [3, 4]], dtype=np.int32) + 6*b for b in range(4)]
+    # The aligned case uses the contiguous HCCL input on every rank.
+    history = np.array({"cold": (0, 0), "aligned": (world * block, 0),
+                        "partial": (world * block + 17, 1)}[history_case])
+    ends = history + [3, 5]
+    refs = {str(i): SimpleNamespace(bank=i%4) for i in range(6)}
+    physical = tuple(torch.empty((32, block, 1, w), dtype=torch.bfloat16, device="npu") for w in (512,64))
+    ws.bind_banks([physical])
+    batch = PrefillDcpBatch.build(ws, ("a", "b"), history, ends, [(b, [2, 2]) for b in banks], refs, 2, 8)
+    streams = [torch.npu.Stream() for _ in banks]
+    main = torch.npu.current_stream()
+    expected, snapshots, keepalive = [], [], []
+    for layer, ref in refs.items():
+        bank, stream = ref.bank, streams[ref.bank]
+        plan, save, fresh = [], [], [[], []]
+        for i, req in enumerate(("a","b")):
+            blocks = DcpWriteLayout(world, block, tuple(map(int, banks[bank][i])))
+            for plane, width in enumerate((512,64)):
+                values = (torch.arange(ends[i]) + 17*i + 23*plane + 11*int(layer)) % 251
+                src = values[:, None].expand(-1,width).to(torch.bfloat16).contiguous().pin_memory()
+                keepalive.append(src)
+                size = 2*width
+                for pos, slot, n in blocks.runs(0, int(history[i]), rank):
+                    plan.append((physical[plane].data_ptr()+slot*size, src.data_ptr()+pos*size, n*size))
+                fresh[plane].append(src[history[i]:])
+                if rank == 0:
+                    dst = torch.empty_like(src, pin_memory=True)
+                    for b, addr in enumerate(batch.save_blocks[req]):
+                        pos = b*block
+                        save.append((dst.data_ptr()+pos*size, ws.planes[plane].data_ptr()+int(addr)*block*size,
+                                     min(block,int(ends[i])-pos)*size))
+                    expected.append(src)
+                    snapshots.append(dst)
+        with torch.npu.stream(stream):
+            c_ops.layerwise_prefill_dma_copy(plan, False)
+            load_done = stream.record_event()
+        writes, reads = batch.start(layer, physical, lambda _: torch.npu.current_stream().wait_event(load_done))
+        if not batch.count:
+            main.wait_event(load_done)
+        batch.wait_for_writes(writes)
+        packet = torch.cat([torch.cat(fresh[1]), torch.cat(fresh[0])], dim=1).npu()
+        batch.store(layer, packet, batch.slots, physical)
+        for i, req in enumerate(("a", "b")):
+            owned = DcpWriteLayout(world, block, tuple(map(int, banks[bank][i])))
+            for pos, slot, n in owned.runs(int(history[i]), int(ends[i]), rank):
+                for plane, width in enumerate((512, 64)):
+                    snapshots.append(physical[plane].view(-1, width)[slot:slot+n].clone())
+                    expected.append(fresh[plane][i][pos-history[i]:pos-history[i]+n])
+        if reads is not None:
+            main.wait_event(reads)
+        ws.last_read = main.record_event()
+        with torch.npu.stream(stream):
+            stream.wait_event(ws.last_read)
+            if rank == 0:
+                c_ops.layerwise_prefill_dma_copy(save, True)
+                ws.save_events[bank] = stream.record_event()
+    torch.npu.synchronize()
+    for actual, reference in zip(snapshots, expected):
+        torch.testing.assert_close(actual.cpu(), reference, rtol=0, atol=0)

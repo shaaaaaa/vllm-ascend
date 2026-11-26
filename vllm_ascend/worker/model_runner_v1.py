@@ -551,6 +551,9 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         self.dsa_decoder_dcp = getattr(vllm_config, "_dsa_decoder_dcp_policy", None) is not None
+        self.dsa_prefill_dcp = (envs_ascend.VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE
+                               and vllm_config.parallel_config.decode_context_parallel_size > 1)
+        self.prefill_dcp_workspace = None
         # TODO(qcs): These manual pad and unpad for GPUModelRunner are
         # used to expand some buffers, which need to be reverted after
         # the following PR is merged:
@@ -727,12 +730,12 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
         if self.pcp_size > 1:
             self.model_config.max_model_len += 2 * self.pcp_size * self.max_num_reqs
         max_buffer_num_tokens = self.max_num_tokens
-        if self.dsa_decoder_dcp:
+        if self.dsa_decoder_dcp or self.dsa_prefill_dcp:
             dcp = get_dcp_group()
             if self.dcp_size != self.parallel_config.decode_context_parallel_size or dcp.ranks != get_tp_group().ranks:
-                raise RuntimeError("Decoder DCP and TP must use the same ordered local ranks")
+                raise RuntimeError("DSA DCP and TP must use the same ordered local ranks")
             logger.info(
-                "Decoder DCP cache: ranks=%s rank=%d block=%d latent_span=%d indexer_span=%d",
+                "DSA DCP cache: ranks=%s rank=%d block=%d latent_span=%d indexer_span=%d",
                 dcp.ranks, self.dcp_rank, self.block_size, self.block_size * self.dcp_size, self.block_size,
             )
         if self.use_cp:
@@ -922,7 +925,7 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
 
     @property
     def use_cp(self) -> bool:
-        return self.pcp_size * self.dcp_size > 1 and not self.dsa_decoder_dcp
+        return self.pcp_size * self.dcp_size > 1 and not (self.dsa_decoder_dcp or self.dsa_prefill_dcp)
 
     def _init_device_properties(self) -> None:
         self.num_sms = None
@@ -1478,8 +1481,10 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
         # This way, we can overlap the copy with the following CPU operations.
         if self.layerwise_prefill_p_node:
             block_tables_by_bank = self._refresh_layerwise_prefill_block_tables()
-            for block_table in block_tables_by_bank:
-                block_table.commit_block_table(num_reqs)
+            for bank in block_tables_by_bank:
+                # The sharded sender builds one dense G0 attention table from CPU block IDs.
+                table = bank[1] if self.dsa_prefill_dcp else bank
+                table.commit_block_table(num_reqs)
         else:
             self.input_batch.block_table.commit_block_table(num_reqs)
 
@@ -1550,9 +1555,10 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
             np.add(self.input_batch.num_computed_tokens_cpu[req_indices], arange, out=positions_np)
 
         if self.layerwise_prefill_p_node:
-            for block_table in block_tables_by_bank:
-                block_table.compute_slot_mapping(req_indices, positions_np)
-                block_table.commit_slot_mapping(total_num_scheduled_tokens)
+            for bank in block_tables_by_bank:
+                table = bank[1] if self.dsa_prefill_dcp else bank
+                table.compute_slot_mapping(req_indices, positions_np)
+                table.commit_slot_mapping(total_num_scheduled_tokens)
         elif self.dsa_decoder_dcp:
             compact_requests = scheduler_output.dsa_dcp_compact_req_ids
             if compact_requests is None:
@@ -4326,6 +4332,21 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                 prefill_bank_views[cache_key] = blk_table_tensor, slot_mapping
             return blk_table_tensor, slot_mapping
 
+        prefill_dcp = None
+        if self.dsa_prefill_dcp and num_scheduled_tokens is not None:
+            from vllm_ascend.worker.prefill_dcp import PrefillDcpBatch
+
+            prefill_dcp = PrefillDcpBatch.build(
+                self.prefill_dcp_workspace, self.input_batch.req_ids[:num_reqs],
+                self.input_batch.num_computed_tokens_cpu[:num_reqs], self.seq_lens.np[:num_reqs],
+                [(bank[0].get_numpy_array(), bank[0].num_blocks_per_row)
+                 for bank in self.input_batch.layerwise_prefill_block_tables],
+                self._layerwise_prefill_refs(), num_reqs_padded, num_tokens_padded,
+            )
+            # CP excludes routed-expert tracing. The same dense G0 view serves every SFA layer.
+            assert prefill_bank_views is not None
+            for bank in range(self.layerwise_prefill_bank_count):
+                prefill_bank_views[0, bank] = prefill_dcp.table, prefill_dcp.slots
         block_table_gid_0, slot_mapping_gid_0 = _get_block_table_and_slot_mapping(0)
         self.long_seq_metadata, block_table_gid_0 = _get_pcp_metadata(block_table_gid_0)
 
@@ -4459,6 +4480,7 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
             resident_state_generations_cpu=resident_state_generations_cpu,
             sfa_full_graph=full_graph,
             sfa_dcp=dcp_batch,
+            prefill_dcp=prefill_dcp,
         )
 
         if logits_indices is not None and self.cache_config.kv_sharing_fast_prefill:
@@ -5865,6 +5887,13 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
         output = self.model.compute_logits(hidden_states)
         return output
 
+    def prepare_prefill_dcp_workspace(self, budget=None):
+        if self.dsa_prefill_dcp and self.prefill_dcp_workspace is None:
+            from vllm_ascend.worker.prefill_dcp import PrefillDcpWorkspace
+
+            self.prefill_dcp_workspace = PrefillDcpWorkspace(self, get_dcp_group(), budget)
+            self.prefill_dcp_workspace.warmup()
+
     def profile_run(self) -> None:
         self.eplb_warmup()
         mc2_tokens_capacity = get_mc2_tokens_capacity()
@@ -6058,6 +6087,7 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
             kv_cache_config: Configuration for the KV cache, including the KV
             cache size of each layer
         """
+        self.prepare_prefill_dcp_workspace()
         if staged_sfa_graph_configured(self.vllm_config) and getattr(
             self,
             "_staged_sfa_startup_capture_attempted",
@@ -6086,6 +6116,8 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
 
         self.may_reinitialize_input_batch(kv_cache_config)
         kv_caches = self.initialize_kv_cache_tensors(kv_cache_config)
+        if self.dsa_prefill_dcp:
+            self.prefill_dcp_workspace.bind_banks(kv_caches[name] for name in kv_cache_config.kv_cache_groups[0].layer_names)
         self._validate_shared_resident_layout(kv_caches)
         if self._sfa_full_graph.retrieval_overlap is not None:
             self._sfa_full_graph.retrieval_overlap.configure(
@@ -6892,7 +6924,7 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
                 max_num_blocks_per_req = cdiv(
                     max_num_blocks_per_req, blocks_per_bundle
                 ) * blocks_per_bundle
-                if dsa_dcp_size is not None and dsa_dcp_size > 1:
+                if not self.layerwise_prefill_p_node and dsa_dcp_size is not None and dsa_dcp_size > 1:
                     assert kv_cache_config.dsa_index_topk is not None
                     scratch = dsa_scratch_blocks_for_topk(
                         kv_cache_config.dsa_index_topk,
@@ -7135,7 +7167,8 @@ class NPUModelRunner(ServingPerfMixin, GPUModelRunner):
         if has_ec_transfer() and get_ec_transfer().is_producer:
             return {}
 
-        dcp = self.dcp_size if getattr(self.vllm_config, "_dsa_decoder_dcp_policy", None) is not None else None
+        dcp = self.dcp_size if (getattr(self.vllm_config, "_dsa_decoder_dcp_policy", None) is not None
+                                or getattr(self, "dsa_prefill_dcp", False)) else None
         kv_cache_spec: dict[str, KVCacheSpec] = {}
         attn_layers = get_layers_from_vllm_config(self.vllm_config, AttentionLayerBase)
         # NOTE: Must process Attention/MLAAttention before MambaBase to maintain

@@ -716,6 +716,10 @@ class NPUWorker(WorkerBase):
             self.init_snapshot,
             weights_memory=int(self.model_runner.model_memory_usage),
         ) as profile_result:
+            if getattr(self.model_runner, "dsa_prefill_dcp", False):
+                self.model_runner.prepare_prefill_dcp_workspace(
+                    int(self.requested_memory - self.model_runner.model_memory_usage)
+                )
             self.model_runner.profile_run()
             if staged_sfa_graph:
                 profile_torch_peak = torch.accelerator.memory_stats(

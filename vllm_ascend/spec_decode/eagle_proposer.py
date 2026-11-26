@@ -139,7 +139,8 @@ class SpecDecodeBaseProposer(EagleProposer):
         self.enable_shared_expert_dp = shared_expert_dp_enabled()
 
         self.pcp_size = self.runner.pcp_size
-        self.dcp_size = self.runner.dcp_size
+        # Banked P drafts consume the same gathered table as the target.
+        self.dcp_size = 1 if getattr(self.runner, "dsa_prefill_dcp", False) else self.runner.dcp_size
         self.pcp_rank = self.runner.pcp_rank
         self.dcp_rank = self.runner.dcp_rank
         dsa_decoder_dcp = getattr(self.runner, "dsa_decoder_dcp", False)
@@ -2087,6 +2088,7 @@ class SpecDecodeBaseProposer(EagleProposer):
                 None,
             ),
             request_ids=getattr(common_attn_metadata, "request_ids", None),
+            prefill_dcp=getattr(common_attn_metadata, "prefill_dcp", None),
             cold_compact_resumes=getattr(
                 common_attn_metadata,
                 "cold_compact_resumes",
@@ -2216,6 +2218,7 @@ class SpecDecodeBaseProposer(EagleProposer):
                 None,
             ),
             request_ids=getattr(common_attn_metadata, "request_ids", None),
+            prefill_dcp=getattr(common_attn_metadata, "prefill_dcp", None),
             cold_compact_resumes=getattr(
                 common_attn_metadata,
                 "cold_compact_resumes",

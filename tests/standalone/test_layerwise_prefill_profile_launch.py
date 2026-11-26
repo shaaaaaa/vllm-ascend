@@ -266,3 +266,16 @@ def test_submission_error_restores_method_cancels_watchdog_and_closes_log(
     assert stack_file.closed
     submission_watchdog.cancel_dump_traceback_later.assert_called_with()
     assert original.call_count == (0 if failure_point == "preprocessing" else 1)
+
+
+@pytest.mark.parametrize("world", [1, 8])
+def test_banked_dcp_benchmark_keeps_sender_configuration_identical(profile_tool, tmp_path, world):
+    args = profile_tool.parser().parse_args(["--prefill-dcp", str(world)])
+    options = profile_tool.engine_options(args, tmp_path, 80000)
+    env = profile_tool.case_environment(args, "80k_on")
+    assert env["LMCACHE_PD_ROLE"] == "sender"
+    assert env["VLLM_ASCEND_LAYERWISE_PREFILL_NUM_BANKS"] == "4"
+    assert options["decode_context_parallel_size"] == world
+    assert options["max_num_batched_tokens"] == 16384
+    assert options["cp_kv_cache_interleave_size"] == options["block_size"] == 128
+    assert options["additional_config"]["enable_sparse_li_c8"]

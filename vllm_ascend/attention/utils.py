@@ -21,6 +21,7 @@ from vllm_ascend.utils import (
 
 if TYPE_CHECKING:
     from vllm_ascend.worker.dcp_indexer import OwnerRows
+    from vllm_ascend.worker.prefill_dcp import PrefillDcpBatch
     from vllm_ascend.distributed.kv_transfer.sparse_offload.resident_sorted_cache import (
         ResidentDcpLayout,
         SharedResidentPlan,
@@ -244,6 +245,7 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
     resident_state_indices_cpu: Any = None
     resident_state_generations_cpu: Any = None
     sfa_dcp: DcpSFABatch | None = None
+    prefill_dcp: "PrefillDcpBatch | None" = None
 
     # TODO: Remove it when vLLM no longer uses this function.
     def unpadded(self, num_actual_tokens: int, num_actual_reqs: int) -> "AscendCommonAttentionMetadata":
@@ -270,6 +272,7 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
             indexer_block_table_tensor=self.indexer_block_table_tensor,
             indexer_slot_mapping=self.indexer_slot_mapping,
             sfa_dcp=self.sfa_dcp,
+            prefill_dcp=self.prefill_dcp,
             causal=self.causal,
             actual_seq_lengths_q=self.actual_seq_lengths_q[:num_actual_tokens],
             positions=self.positions,

@@ -11,6 +11,76 @@ from vllm.triton_utils import tl, triton
 from vllm_ascend.ops.triton.triton_utils import get_element, get_vectorcore_num, init_device_properties_triton
 
 
+@triton.jit(do_not_specialize=["rows", "stride", "count"])
+def _store_prefill_rows(packet, slots, blocks, dense_l, dense_r, local_l, local_r,
+                        rows, stride, count, RANK: tl.constexpr, WORLD: tl.constexpr,
+                        B: tl.constexpr, L: tl.constexpr, R: tl.constexpr, TILE: tl.constexpr,
+                        XL: tl.constexpr, XR: tl.constexpr):
+    for tile in range(tl.program_id(0), tl.cdiv(rows, TILE), tl.num_programs(0)):
+        row = tile * TILE + tl.arange(0, TILE)
+        slot = tl.load(slots + row, row < rows, -1).to(tl.int64)
+        valid = slot >= B  # Block zero is reserved.
+        slot = tl.maximum(slot, 0)
+        page = tl.maximum(slot // B - 1, 0)
+        hist = page < WORLD * count
+        span = tl.maximum(count, 1)
+        index = tl.where(hist, page % span, page - (WORLD - 1) * count)
+        owner = valid & (~hist | (page // span == RANK))
+        physical = tl.load(blocks + index, owner, 0).to(tl.int64)
+        local = physical * B + slot % B
+        # The TP packet contains [RoPE, latent, optional BF16 index key].
+        x = tl.arange(0, XL)[None, :]
+        y = tl.arange(0, XR)[None, :]
+        src = packet + row[:, None].to(tl.int64) * stride
+        latent = tl.load(src + R + x, (row < rows)[:, None] & (x < L), 0)
+        rope = tl.load(src + y, (row < rows)[:, None] & (y < R), 0)
+        tl.store(dense_l + slot[:, None] * L + x, latent, valid[:, None] & (x < L))
+        tl.store(dense_r + slot[:, None] * R + y, rope, valid[:, None] & (y < R))
+        tl.store(local_l + local[:, None] * L + x, latent, (physical > 0)[:, None] & (x < L))
+        tl.store(local_r + local[:, None] * R + y, rope, (physical > 0)[:, None] & (y < R))
+
+
+def store_prefill_rows(packet, slots, blocks, planes, cache, count, rank, world):
+    """Write the existing TP packet to native attention and the owning bank in one pass."""
+    rows = slots.numel()
+    if rows:
+        init_device_properties_triton()
+        tile = 8
+        _store_prefill_rows[(min(triton.cdiv(rows, tile), get_vectorcore_num()),)](
+            packet, slots, blocks, *planes, *cache[:2], rows, packet.stride(0), count,
+            rank, world, cache[0].shape[1], cache[0].shape[-1], cache[1].shape[-1], tile,
+            triton.next_power_of_2(cache[0].shape[-1]), triton.next_power_of_2(cache[1].shape[-1]),
+        )
+
+
+@triton.jit(do_not_specialize=["tiles"])
+def _pack_prefill_history(latent, rope, ids, out_latent, out_rope, tiles,
+                          BLOCK: tl.constexpr, LATENT: tl.constexpr, ROPE: tl.constexpr,
+                          ROWS: tl.constexpr, XL: tl.constexpr, XR: tl.constexpr):
+    for tile in range(tl.program_id(0), tiles, tl.num_programs(0)):
+        page = tl.load(ids + tile // (BLOCK // ROWS)).to(tl.int64)
+        row = page * BLOCK + tile % (BLOCK // ROWS) * ROWS
+        dst = tile.to(tl.int64) * ROWS
+        x = tl.arange(0, XL)
+        y = tl.arange(0, XR)
+        l = tl.load(latent + row * LATENT + x, (page > 0) & (x < ROWS * LATENT), 0)
+        r = tl.load(rope + row * ROPE + y, (page > 0) & (y < ROWS * ROPE), 0)
+        tl.store(out_latent + dst * LATENT + x, l, x < ROWS * LATENT)
+        tl.store(out_rope + dst * ROPE + y, r, y < ROWS * ROPE)
+
+
+def pack_prefill_history(cache, ids, out):
+    """Compact both paged KV planes in one launch, zeroing missing rank slots."""
+    block, _, latent = cache[0].shape[1:]
+    rows = 8
+    tiles = ids.numel() * (block // rows)
+    init_device_properties_triton()
+    _pack_prefill_history[(min(tiles, get_vectorcore_num()),)](
+        cache[0], cache[1], ids, *out, tiles, block, latent, cache[1].shape[-1], rows,
+        triton.next_power_of_2(rows * latent), triton.next_power_of_2(rows * cache[1].shape[-1]),
+    )
+
+
 @triton.jit(do_not_specialize=["rows"])
 def _store_owner_keys(take, valid, slots, keys, scales, cache, scale_cache, rows,
                       DIM: tl.constexpr, ROW_STRIDE: tl.constexpr, COL_STRIDE: tl.constexpr, SCALE_STRIDE: tl.constexpr):

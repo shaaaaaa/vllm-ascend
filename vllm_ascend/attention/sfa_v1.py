@@ -121,6 +121,7 @@ if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
 
     from vllm_ascend.worker.dcp_indexer import GatheredTopk
+    from vllm_ascend.worker.prefill_dcp import PrefillDcpBatch
 
 # Older ACLNN TransposeBatchMatMul binaries require operand dimensions < 65536.
 TRANSPOSE_BMM_MAX_SUPPORTED_DIM = 65536
@@ -932,7 +933,8 @@ class AscendSFABackend(AttentionBackend):
 
     @staticmethod
     def get_builder_cls():
-        if enable_cp() and getattr(get_current_vllm_config(), "_dsa_decoder_dcp_policy", None) is None:
+        if (enable_cp() and not envs.VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE
+                and getattr(get_current_vllm_config(), "_dsa_decoder_dcp_policy", None) is None):
             from vllm_ascend.attention.context_parallel.sfa_cp import AscendSFACPMetadataBuilder
 
             return AscendSFACPMetadataBuilder
@@ -944,7 +946,8 @@ class AscendSFABackend(AttentionBackend):
 
     @staticmethod
     def get_impl_cls() -> type["AscendSFAImpl"]:
-        if enable_cp() and getattr(get_current_vllm_config(), "_dsa_decoder_dcp_policy", None) is None:
+        if (enable_cp() and not envs.VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE
+                and getattr(get_current_vllm_config(), "_dsa_decoder_dcp_policy", None) is None):
             from vllm_ascend.attention.context_parallel.sfa_cp import AscendSFACPImpl
 
             return AscendSFACPImpl
@@ -1055,6 +1058,7 @@ class AscendSFAMetadata:
     decode_remap_boundary_ready: bool = False
     decode_remap_boundary_buffer: SFARemapBoundaryBuffer | None = None
     sfa_dcp: DcpSFABatch | None = None
+    prefill_dcp: "PrefillDcpBatch | None" = None
 
 
 M = TypeVar("M", bound=AscendSFAMetadata)
@@ -1296,6 +1300,9 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
 
     @staticmethod
     def determine_chunked_prefill_workspace_size(vllm_config: VllmConfig) -> int:
+        if envs.VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE and vllm_config.parallel_config.decode_context_parallel_size > 1:
+            # Banked SFA uses the runner's profiled dense views for every layer.
+            return 0
         return ascend_chunked_prefill_workspace_size(vllm_config)
 
     @classmethod
@@ -1820,6 +1827,7 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             indexer_c8_block_table=indexer_c8_block_table,
             indexer_c8_slot_mapping=indexer_c8_slot_mapping,
             sfa_dcp=dcp_batch,
+            prefill_dcp=getattr(common_attn_metadata, "prefill_dcp", None),
             # DSA latent offload: best-effort; getattr -> None when not threaded in yet
             # (harmless unless the feature is enabled). HW-VERIFY the real source.
             req_ids=getattr(common_attn_metadata, "request_ids", None),
@@ -1889,7 +1897,7 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
         mappings, and decode has mutable sparse state: use normal build there.
         """
         if (
-            self.enable_dsa_cp
+            (self.enable_dsa_cp and getattr(template, "prefill_dcp", None) is None)
             or template.attn_state not in (
                 AscendAttentionState.PrefillNoCache,
                 AscendAttentionState.PrefillCacheHit,
@@ -4814,6 +4822,11 @@ class AscendSFAImpl(MLAAttentionImpl):
             AscendAttentionState.SpecDecoding,
         )
         dcp = getattr(attn_metadata, "sfa_dcp", None)
+        prefill = getattr(attn_metadata, "prefill_dcp", None) if self._layerwise_prefill_p_node else None
+        if prefill is not None:
+            shard_cache = kv_cache
+            write_waits, history_ready = prefill.start(layer_name, shard_cache, wait_for_kv_layer_from_connector)
+            kv_cache = (*prefill.workspace.planes, *kv_cache[2:])
         _sparse_indices_padding_zeroed = False
         # Shared-indexer consumers have no sibling indexer cache registered;
         # only producer layers can resolve (and later save) the sibling name.
@@ -4951,7 +4964,11 @@ class AscendSFAImpl(MLAAttentionImpl):
             # would advance the per-request layerwise retriever TWICE per layer
             # (this one with a dense arange) and desync it — skip whenever the
             # batch has decode rows (mixed steps included).
-            if dcp is None and not (self.dsa_shrink_latent and attn_metadata.num_decode_tokens > 0):
+            if prefill is not None:
+                if not prefill.count:
+                    wait_for_kv_layer_from_connector(layer_name)
+                prefill.wait_for_writes(write_waits)
+            elif dcp is None and not (self.dsa_shrink_latent and attn_metadata.num_decode_tokens > 0):
                 wait_for_kv_layer_from_connector(layer_name)
 
             if self.enable_dsa_cp:
@@ -5079,25 +5096,25 @@ class AscendSFAImpl(MLAAttentionImpl):
 
                 if kv_cache is not None:
                     assert fused_kv_no_split is not None
-                    if not self.has_indexer:
-                        k_pe, k_nope = fused_kv_no_split.split(
-                            [self.qk_rope_head_dim, self.kv_lora_rank], dim=-1
-                        )
-                    elif not self.use_sparse_c8_indexer:
-                        k_pe, k_nope, k_li = fused_kv_no_split.split(
-                            [self.qk_rope_head_dim, self.kv_lora_rank, self.head_dim], dim=-1
-                        )
+                    slots = slot_mapping[: attn_metadata.num_actual_tokens]
+                    if prefill is not None:
+                        if self.has_indexer and not self.use_sparse_c8_indexer:
+                            k_li = fused_kv_no_split[..., self.qk_rope_head_dim + self.kv_lora_rank:]
+                        prefill.store(layer_name, fused_kv_no_split, slots, shard_cache)
                     else:
-                        k_pe, k_nope = fused_kv_no_split.split([self.qk_rope_head_dim, self.kv_lora_rank], dim=-1)
-                    k_nope = k_nope.view(k_nope.shape[0], 1, -1)
-                    k_pe = k_pe.view(k_pe.shape[0], 1, -1)
-                    DeviceOperator.reshape_and_cache(
-                        key=k_nope[: attn_metadata.num_actual_tokens],
-                        value=k_pe[: attn_metadata.num_actual_tokens],
-                        key_cache=kv_cache[0],
-                        value_cache=kv_cache[1],
-                        slot_mapping=slot_mapping[: attn_metadata.num_actual_tokens],
-                    )
+                        if self.has_indexer and not self.use_sparse_c8_indexer:
+                            k_pe, k_nope, k_li = fused_kv_no_split.split(
+                                [self.qk_rope_head_dim, self.kv_lora_rank, self.head_dim], dim=-1
+                            )
+                        else:
+                            k_pe, k_nope = fused_kv_no_split.split([self.qk_rope_head_dim, self.kv_lora_rank], dim=-1)
+                        k_nope = k_nope.view(k_nope.shape[0], 1, -1)
+                        k_pe = k_pe.view(k_pe.shape[0], 1, -1)
+                        DeviceOperator.reshape_and_cache(
+                            key=k_nope[: attn_metadata.num_actual_tokens],
+                            value=k_pe[: attn_metadata.num_actual_tokens],
+                            key_cache=kv_cache[0], value_cache=kv_cache[1], slot_mapping=slots,
+                        )
 
             if self.has_indexer:
                 assert k_li is not None
@@ -5188,6 +5205,9 @@ class AscendSFAImpl(MLAAttentionImpl):
                     self._update_indexcache_topk_indices(topk_indices)
             if self._layerwise_prefill_p_node and self.skip_topk and index_lmcache_enabled:
                 record_layerwise_prefill_bank_use(index_layer_name)
+
+        if prefill is not None and history_ready is not None:
+            torch.npu.current_stream().wait_event(history_ready)
 
         # DSA Step B2 (compact-scratch decode): the indexer just produced topk.
         # Remap LMCache-selected entries to compact scratch rows [0..n_ret)
@@ -5522,6 +5542,8 @@ class AscendSFAImpl(MLAAttentionImpl):
 
         if self._layerwise_prefill_p_node:
             record_layerwise_prefill_bank_use(layer_name)
+        if prefill is not None:
+            kv_cache = (*shard_cache[:2], *kv_cache[2:])
 
         # Offload to LMCache. Legacy un-bundled connectors save only the
         # latent (k_nope, k_pe). Connectors declaring DSA index LMCache support
