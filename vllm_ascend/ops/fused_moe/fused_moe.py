@@ -36,6 +36,13 @@ from vllm.model_executor.layers.fused_moe.shared_fused_moe import SharedFusedMoE
 import vllm_ascend.envs as envs_ascend
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX, MoECommType
+from vllm_ascend.compilation.sfa_copy_windows import (
+    current_gate,
+    tagged_projection,
+    tp_fits,
+    tp_window,
+    w8a8_projection,
+)
 from vllm_ascend.distributed.parallel_state import get_mc2_group
 from vllm_ascend.eplb.core.eplb_utils import init_eplb_config
 from vllm_ascend.flash_common3_context import get_flash_common3_context, set_flash_common3_context
@@ -609,14 +616,19 @@ class AscendSharedFusedMoE(SharedFusedMoE, AscendFusedMoE):
         shared_gate_up, _ = self._shared_experts.gate_up_proj(hidden_states)  # type: ignore
         return shared_gate_up
 
-    def _shared_experts_part2(self, hidden_states: torch.Tensor, shared_gate_up: torch.Tensor):
+    def _shared_experts_part2(self, hidden_states: torch.Tensor, shared_gate_up: torch.Tensor, *, tp_reduce=False):
         shared_act = self._shared_experts.act_fn(shared_gate_up)  # type: ignore
+        if tp_reduce and tagged_projection(self._shared_experts.down_proj, shared_act, None):
+            return w8a8_projection(self._shared_experts.down_proj, shared_act, reduce=True)
         shared_out, _ = self._shared_experts.down_proj(shared_act)  # type: ignore
 
         # Qwen3-Next specific gating mechanism
         if hasattr(self._shared_experts, "expert_gate") and self._shared_experts.expert_gate is not None:
             gate_out, _ = self._shared_experts.expert_gate(hidden_states)  # type: ignore
             shared_out = F.sigmoid(gate_out) * shared_out
+        if tp_reduce:
+            with tp_window("tp_allreduce", shared_out):
+                shared_out = tensor_model_parallel_all_reduce(shared_out)
         return shared_out
 
     def _validate_shared_expert_consistency(self):
@@ -686,6 +698,19 @@ class AscendSharedFusedMoE(SharedFusedMoE, AscendFusedMoE):
             if evt is not None:
                 torch.npu.current_stream().wait_event(evt)
 
+        reduce = (_EXTRA_CTX.moe_comm_type in {MoECommType.ALLTOALL, MoECommType.MC2, MoECommType.FUSED_MC2}
+                  and not shared_expert_dp_enabled())
+        down = self._shared_experts.down_proj
+        # Only the ordinary GLM shared MLP has an uninterrupted GEMM -> TP
+        # reduction here. Keep auxiliary streams and optional expert gates scoped separately.
+        combined = (reduce and not self.multistream_overlap_shared_expert
+                    and type(down).__name__ == "AscendRowParallelLinear"
+                    and getattr(self._shared_experts, "expert_gate", None) is None
+                    and down.custom_op is None and down.input_is_parallel and not down.reduce_results
+                    and down.tp_size == 4 and down.bias is None
+                    and not down._forward_hooks and not down._forward_pre_hooks
+                    and tagged_projection(down, hidden_states, None)
+                    and tp_fits(current_gate(), hidden_states.numel() * hidden_states.element_size()))
         with npu_stream_switch(shared_experts_calculation_stream(), enabled=self.multistream_overlap_shared_expert):
             # Ensure the shared experts wait for hidden_states to be ready.
             torch.npu.current_stream().wait_event(fused_moe_evts.before_routed_experts)
@@ -696,7 +721,7 @@ class AscendSharedFusedMoE(SharedFusedMoE, AscendFusedMoE):
             # Execute the down projection concurrently with the combine
             # communication.
             maybe_wait_event(fused_moe_evts.before_combine)
-            shared_out = self._shared_experts_part2(hidden_states, part1_out)
+            shared_out = self._shared_experts_part2(hidden_states, part1_out, tp_reduce=combined)
 
         # Make sure the default stream waits for the shared experts stream to
         # finish.
@@ -705,12 +730,9 @@ class AscendSharedFusedMoE(SharedFusedMoE, AscendFusedMoE):
 
         # NOTE: This is exactly the opposite of
         # `maybe_all_reduce_tensor_model_parallel`
-        moe_comm_type = _EXTRA_CTX.moe_comm_type
-        if (
-            moe_comm_type in {MoECommType.ALLTOALL, MoECommType.MC2, MoECommType.FUSED_MC2}
-            and not shared_expert_dp_enabled()
-        ):
-            shared_out = tensor_model_parallel_all_reduce(shared_out)
+        if reduce and not combined:
+            with tp_window("tp_allreduce", shared_out):
+                shared_out = tensor_model_parallel_all_reduce(shared_out)
         return shared_out
 
     def forward_impl(  # type: ignore[override]

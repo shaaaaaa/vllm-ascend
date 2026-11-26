@@ -566,13 +566,15 @@ def test_target_validates_main_gate_only_after_successful_capture(graph_module, 
     module, context, captures, _ = graph_module
     wrapper = module.SFAFullGraph()
     finish = Mock()
-    outbound = {"layer": object()}
+    gate = object()
+    outbound = {"layer": NS(gate=gate)}
     previous = {"unrelated": object()}
     context.sfa_router_copy_edges = previous
     wrapper.retrieval_overlap = NS(main_gate=True, finish_capture=finish, edges=lambda key: ({}, outbound))
 
     def run_target(**kwargs):
         assert context.sfa_router_copy_edges is outbound
+        assert context.sfa_copy_gate is gate
         if fail:
             raise ValueError("capture aborted")
         return kwargs["input_ids"]
@@ -591,6 +593,7 @@ def test_target_validates_main_gate_only_after_successful_capture(graph_module, 
         finish.assert_called_once_with("q2")
         assert target.call_count == 1 and captures[0][0].replay.call_count == 1
     assert context.sfa_router_copy_edges is previous
+    assert context.sfa_copy_gate is None
 
 
 def test_main_gate_configuration(runtime, monkeypatch):
@@ -625,7 +628,7 @@ def test_main_gate_configuration(runtime, monkeypatch):
 
 
 @pytest.mark.parametrize(("raw", "expected"), [
-    (None, 0), ("", 0), ("auto", 0), ("default", 0), ("0", 0), ("12", 12),
+    (None, 20), ("", 0), ("auto", 0), ("default", 0), ("0", 0), ("12", 12), ("20", 20),
     (" 24 ", 24), ("40", 40), ("4294967295", 4294967295), ("-1", None), ("4294967296", None),
 ])
 def test_decode_copy_core_configuration(monkeypatch, raw, expected):

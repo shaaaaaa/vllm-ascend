@@ -115,6 +115,18 @@ def row_parallel_with_prefill_transfer(
     return output, layer.bias if layer.skip_bias_add else None
 
 
+def sfa_tp_projection(layer, x, bias):
+    """The ordinary local W8A8 GEMM and its TP AllReduce share one admission."""
+    from vllm_ascend.compilation.sfa_copy_windows import current_gate, tagged_projection, w8a8_projection
+
+    # Keep AllReduce visible to sequence-parallel compiler passes. Inside an
+    # opaque attention/matmul_and_reduce capture the actual collective is already selected.
+    if (not torch.compiler.is_compiling() and layer.tp_size == 4 and tagged_projection(layer, x, bias)
+            and current_gate() is not None):
+        return w8a8_projection(layer, x, reduce=True)
+    return None
+
+
 class CustomLinearOp:
     def __init__(self, layer):
         self.layer = layer
@@ -541,6 +553,10 @@ class SequenceRowParallelOp(CustomRowParallelOp):
         x = input_parallel
 
         if not flash_comm_v1_enabled:
+            if getattr(self.layer, "sfa_copy_projection", None):
+                combined = sfa_tp_projection(self.layer, x, bias_)
+                if combined is not None:
+                    return combined
             output_parallel = self.layer.quant_method.apply(self.layer, x, bias=bias_)
             return tensor_model_parallel_all_reduce(output_parallel)
 

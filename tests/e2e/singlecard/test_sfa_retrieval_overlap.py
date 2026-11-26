@@ -9,6 +9,7 @@ import sys
 from contextlib import contextmanager
 from itertools import permutations
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -47,6 +48,57 @@ def test_native_capture_contract(main_gate):
                 assert torch.equal(probe.after_close.cpu(), probe.before_reopen.cpu())
     finally:
         torch.npu.synchronize()
+
+
+@pytest.mark.parametrize("rows", [16, 32])
+def test_20_aiv_decoder_projection_capture(rows, monkeypatch, request):
+    """Replay real 20-AIV copy, BF16/INT8 projection and SwiGlu with changing inputs."""
+    import vllm_ascend.ops.register_custom_ops  # noqa: F401
+    from vllm_ascend.compilation import sfa_copy_windows as windows
+    from vllm_ascend.compilation.sfa_retrieval_overlap import CaptureProbe
+
+    torch.npu.set_device(0)
+    device = torch.device("npu:0")
+    probe = CaptureProbe(torch.npu.Stream(), device, main_gate=True)
+    edge = probe.edge
+    gate = edge.gate
+    if not gate.supports_decoder_windows:
+        pytest.skip(f"qualified tiling requires 910B3 / CANN 8.5.1, found {gate.soc} / {gate.cann}")
+    monkeypatch.setattr(windows, "is_forward_context_available", lambda: True)
+    monkeypatch.setattr(windows, "get_forward_context", lambda: SimpleNamespace(sfa_copy_gate=gate))
+    edge.max_aiv_cores = 20
+    previous_format = torch_npu._C._npu_getOption("ALLOW_INTERNAL_FORMAT")
+    request.addfinalizer(lambda: setattr(torch.npu.config, "allow_internal_format", previous_format == b"enable"))
+    torch.npu.config.allow_internal_format = True
+    x = torch.randn(rows, 1536, device=device, dtype=torch.bfloat16)
+    weight = torch_npu.npu_format_cast(torch.randint(-4, 5, (1536, 1024), device=device, dtype=torch.int8), 29)
+    scale = torch.full((1024,), 0.01, device=device, dtype=torch.bfloat16)
+
+    def reference():
+        q, s = torch_npu.npu_dynamic_quant(x)
+        out = torch_npu.npu_quant_matmul(q, weight, scale, pertoken_scale=s, bias=None, output_dtype=x.dtype)
+        return torch_npu.npu_swiglu(out)
+
+    reference()  # Materialize the real operators before capture.
+    torch.npu.synchronize()
+    with torch.npu.graph(probe.graph):
+        edge.launch(*probe.payload, edge.destinations)
+        projected = torch.ops.vllm.sfa_decode_w8a8(x, weight, scale, None, "q_b", False)
+        activated = torch.ops.vllm.sfa_decode_swiglu(projected)
+        edge.join()
+        probe.observed.copy_(probe.dest)
+    assert gate.counts["q_b"] == gate.counts["swiglu"] == 1
+    assert gate.counts["dynamic_quant"] == int(rows <= 20)
+    for value in (1, 3, 7):
+        x.normal_(mean=value / 8)
+        expected = reference()
+        probe.source.fill_(value)
+        probe.pe_source.fill_(-value)
+        probe.dest.zero_()
+        probe.graph.replay()
+        torch.testing.assert_close(activated.cpu(), expected.cpu(), rtol=0, atol=0)
+        torch.testing.assert_close(probe.observed.cpu(), torch.full_like(probe.source.cpu(), value))
+        assert torch.all(edge.destinations[1].cpu() == -value)
 
 
 def test_dynamic_copy_windows_same_graph():
@@ -324,10 +376,7 @@ def test_sfa_copy_core_limit(request, monkeypatch):
         graphs = {"copy_only": {}, "group_1plus3": {}}
         w.set_payload(1)
         for cap in limits:
-            if cap:
-                monkeypatch.setenv(variable, str(cap))
-            else:
-                monkeypatch.delenv(variable)
+            monkeypatch.setenv(variable, str(cap))
             w.set_copy_core_limit(envs.VLLM_ASCEND_SFA_COPY_MAX_AIV_CORES)
             assert w.max_aiv_cores == cap
             graphs["copy_only"][cap] = w.capture_copy()

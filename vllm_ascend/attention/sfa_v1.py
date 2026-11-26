@@ -60,6 +60,7 @@ from vllm_ascend.attention.utils import (
     trans_rope_weight,
     transdata,
     wait_for_kv_layer_from_connector)
+from vllm_ascend.compilation.sfa_copy_windows import current_gate, join_through_qkv
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.distributed.kv_transfer.sparse_offload import _prof as _dsa_prof
 from vllm_ascend.distributed.kv_transfer.sparse_offload.prepare_sparse_indices import (
@@ -2560,7 +2561,7 @@ class AscendSFAImpl(MLAAttentionImpl):
             return k_pe, k_nope
 
     # Return `ql_nope`, `q_pe`
-    def _q_proj_and_k_up_proj(self, x):
+    def _q_proj_and_k_up_proj(self, x, *, prefetch_pending=False):
         q_nope, q_pe = (
             self.q_proj(x)[0]
             .view(-1, self.local_num_heads, self.qk_head_dim)
@@ -2570,7 +2571,17 @@ class AscendSFAImpl(MLAAttentionImpl):
         # Convert from (B, N, P) to (N, B, P)
         q_nope = q_nope.transpose(0, 1)
         # Multiply (N, B, P) x (N, P, L) -> (N, B, L)
-        ql_nope = torch.bmm(q_nope, self.W_UK_T)
+        gate = current_gate() if prefetch_pending else None
+        k_up_window = (gate is not None and q_nope.dtype in (torch.float16, torch.bfloat16)
+                       and q_nope.dtype == self.W_UK_T.dtype and q_nope.size(1) <= 64
+                       and self.W_UK_T.size(-1) == 512 and self.W_UK_T.is_contiguous()
+                       and torch_npu.get_npu_format(q_nope) == 2 and torch_npu.get_npu_format(self.W_UK_T) == 2)
+        if k_up_window:
+            # The strided head slice launches an AIV layout kernel in torch.bmm.
+            # Materialize that same input before admitting copy to the Cube GEMM.
+            q_nope = q_nope.contiguous()
+        with gate.window("k_up") if k_up_window else nullcontext():
+            ql_nope = torch.bmm(q_nope, self.W_UK_T)
         # Convert from (N, B, L) to (B, N, L)
         return ql_nope.transpose(0, 1), q_pe
 
@@ -3571,11 +3582,12 @@ class AscendSFAImpl(MLAAttentionImpl):
             inputs=self.fused_qkv_a_proj.weight,
             dependency=hidden_states,
         )
-        if qkv_prefetch is not None:
-            # Its own completion releases QKV; later layers keep copying through
-            # this fused projection. Close before layernorm, RoPE and SFA.
+        if (qkv_prefetch is not None and getattr(self.fused_qkv_a_proj, "sfa_copy_projection", None) == "qkv"
+                and join_through_qkv(self.fused_qkv_a_proj, hidden_states)):
             qkv_lora = qkv_prefetch.join(self.fused_qkv_a_proj, hidden_states)[0]
         else:
+            if qkv_prefetch is not None:
+                qkv_prefetch.join()
             qkv_lora = self.fused_qkv_a_proj(hidden_states)[0]
         q_c, kv_no_split = qkv_lora.split(
             [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
@@ -3608,7 +3620,10 @@ class AscendSFAImpl(MLAAttentionImpl):
             None,
         )
 
-        ql_nope, q_pe = self._q_proj_and_k_up_proj(q_c)
+        if qkv_prefetch is not None:
+            ql_nope, q_pe = self._q_proj_and_k_up_proj(q_c, prefetch_pending=True)
+        else:
+            ql_nope, q_pe = self._q_proj_and_k_up_proj(q_c)
         q_pe = self.rope_single(q_pe, cos, sin)
 
         if self.has_indexer:

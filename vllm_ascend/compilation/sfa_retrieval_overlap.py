@@ -6,12 +6,36 @@ consumer touches its KV, so the root completion event still protects all sources
 """
 
 import logging
-from contextlib import contextmanager
+import os
+import platform
+import re
+from collections import Counter
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import torch
 import torch_npu
+
+
+def _cann_version():
+    query = getattr(torch.npu, "get_cann_version", None)
+    if query is not None:
+        for args in ((), ("RUNTIME",)):
+            try:
+                version = str(query(*args) or "").strip()
+            except (RuntimeError, TypeError):
+                continue
+            if re.match(r"^\d+\.\d+", version):
+                return version
+    toolkit = Path(os.environ.get("ASCEND_HOME_PATH") or "/usr/local/Ascend/ascend-toolkit/latest")
+    info = toolkit / (platform.machine() + "-linux") / "ascend_toolkit_install.info"
+    try:
+        match = re.search(r"(?mi)^\s*version\s*=\s*(\S+)", info.read_text(encoding="utf-8"))
+    except OSError:
+        return ""
+    return match.group(1) if match else ""
 
 
 class CopyGate:
@@ -24,6 +48,33 @@ class CopyGate:
             raise RuntimeError("Rebuild LMCache-Ascend on dev-lmy to use the SFA copy windows") from error
         self.native = SparsePrefetchGate(torch.zeros(1, dtype=torch.int64, device=device))
         self.pending = 0  # Capture-time number of consumers still using this grant.
+        self.main_stream = None
+        self.open = False
+        self.free_aiv = 0
+        self.local_tp4 = False
+        self.counts: Counter[str] = Counter()
+        self.soc = self.cann = ""
+        if torch.device(device).type == "npu":
+            self.soc = torch.npu.get_device_name(device)
+            self.cann = _cann_version()
+
+    @property
+    def supports_decoder_windows(self):
+        return self.soc == "Ascend910B3" and re.match(r"^8\.5\.1(?:\D|$)", self.cann) is not None
+
+    @contextmanager
+    def window(self, *kernels):
+        # Closing reacquires the FIFO token before the next protected kernel.
+        if self.open:
+            raise RuntimeError("nested SFA copy admission on the main stream")
+        self.native.set_open(True)
+        self.open = True
+        self.counts.update(kernels)
+        try:
+            yield
+        finally:
+            self.native.set_open(False)
+            self.open = False
 
 
 def validate_destinations(caches: dict[str, tuple], destinations: set[str]) -> None:
@@ -122,11 +173,10 @@ class RetrievalEdge:
             raise RuntimeError(f"unexpected SFA copy window {name!r} in this capture")
         self.windows_used.add(name)
         self.window_open = True
-        self.gate.native.set_open(True)
         try:
-            yield
+            with self.gate.window(name):
+                yield
         finally:
-            self.gate.native.set_open(False)
             self.window_open = False
 
     def join(self, qkv_projection=None, *projection_args):
@@ -135,18 +185,17 @@ class RetrievalEdge:
         # event outside capture is NOT proof of a record inside this graph.
         if not self.pending_join or self.window_open:
             raise RuntimeError("consumer prefetch wait has no producer launch in this capture")
-        if self.gate is not None:
-            self.gate.native.set_open(True)
         self.window_open = True
         try:
-            torch.npu.current_stream().wait_event(self.done)
-            if qkv_projection is not None:
-                if self.gate is not None:
-                    self.windows_used.add("qkv")
-                return qkv_projection(*projection_args)
+            with self.gate.window("drain") if self.gate is not None else nullcontext():
+                torch.npu.current_stream().wait_event(self.done)
+                if qkv_projection is not None:
+                    if self.gate is not None:
+                        self.windows_used.add("qkv")
+                        self.gate.counts["qkv"] += 1
+                    return qkv_projection(*projection_args)
         finally:
             if self.gate is not None:
-                self.gate.native.set_open(False)
                 self.gate.pending -= 1
             self.window_open = False
             self.pending_join = False
@@ -155,9 +204,12 @@ class RetrievalEdge:
 def _submit_transfers(edges) -> None:
     """One graph fork, with a distinct side-stream completion record after each layer."""
     first = edges[0]
+    main = torch.npu.current_stream()
     if first.gate is not None:
         first.gate.pending = len(edges)
-    main = torch.npu.current_stream()
+        first.gate.main_stream = main
+        # Zero selects the native automatic grid, which may use all 40 AIVs.
+        first.gate.free_aiv = max(0, 40 - max(edge.max_aiv_cores or 40 for edge in edges))
     first.start.record(main)
     tracker = first.capture_priority
     before = tracker.before_first_fork(main) if tracker is not None and tracker.side is None else None
@@ -278,11 +330,12 @@ class SharedRetrievalOverlap:
     """One stream per worker, immutable per-key edges after startup setup."""
 
     def __init__(self, pieces: int = 1, low_priority: bool = False, *, main_gate: bool = False,
-                 multi_layer: bool = False) -> None:
+                 multi_layer: bool = False, local_tp4: bool = False) -> None:
         self.pieces = pieces
         self.low_priority = low_priority
         self.main_gate = main_gate
         self.multi_layer = multi_layer
+        self.local_tp4 = local_tp4
         if self.pieces < 1:
             raise ValueError("VLLM_ASCEND_SFA_PREFETCH_PIECES must be positive")
         if main_gate and low_priority:
@@ -357,6 +410,7 @@ class SharedRetrievalOverlap:
                         self.probe = None
                     if self.main_gate and gate is None:
                         gate = CopyGate(destinations[0].device)
+                        gate.local_tp4 = self.local_tp4
                     edge = RetrievalEdge(
                         self.stream, transfer, destinations, max_aiv_cores=by_name[following].sfa_copy_max_aiv_cores,
                         pieces=self.pieces, gate=gate,
@@ -385,13 +439,16 @@ class SharedRetrievalOverlap:
         if any(edge.payload is None or edge.pending_join for edge in edges):
             raise RuntimeError("target graph is missing a prefetch launch or consumer wait")
         groups = self.indexer_groups[key].values()
+        gate = next((e.gate for e in edges if e.gate is not None), None)
         logging.getLogger("vllm.sfa_retrieval_overlap").info(
             "SFA %s captured for %s: edges=%d vup=%d router=%d pieces_per_transfer=%d "
-            "indexer_groups=%d max_consumers_per_indexer=%d qkv_windows=%d",
+            "indexer_groups=%d max_consumers_per_indexer=%d qkv_windows=%d "
+            "copy_aiv_limit=%s soc=%s cann=%s windows=%s",
             "main-path gate" if self.main_gate else "shared-group prefetch", key, len(edges),
             sum("vup" in e.windows_used for e in edges), sum("router" in e.windows_used for e in edges),
             self.pieces, len(groups), max((len(g.edges) for g in groups), default=0),
-            sum("qkv" in e.windows_used for e in edges),
+            gate.counts["qkv"] if gate else 0, next((e.max_aiv_cores for e in edges), None),
+            gate.soc if gate else "", gate.cann if gate else "", dict(gate.counts) if gate else {},
         )
 
     def begin_priority_capture(self, key):

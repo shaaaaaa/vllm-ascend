@@ -207,18 +207,21 @@ def cube_window_type(row):
 
 def copy_window_controls(cubes, events, norm, consumer_sfa):
     """Find device open/close pairs. Empty windows are valid on any replay."""
-    tail_open = events.get(("NOTIFY_RECORD", norm.task + 2))
-    join = events.get(("CAPTURE_WAIT", norm.task + 3))
+    t = norm.task
+    if ("MEM_WRITE_VALUE", t + 1) in events and ("NOTIFY_WAIT", t + 2) in events:
+        t += 2  # Close the input norm's own admission before the consumer drain.
+    tail_open = events.get(("NOTIFY_RECORD", t + 2))
+    join = events.get(("CAPTURE_WAIT", t + 3))
     if not tail_open or not join:
         return {}, None
     windows = {"tail": (tail_open[0], join[1], join[0])}
     # Group capture holds the same FIFO grant across the wait and the fused QKV.
     # The adjacent-layer tail closes immediately after the wait.
-    for tid in range(norm.task + 4, consumer_sfa.task):
+    for tid in range(t + 4, consumer_sfa.task):
         close = events.get(("MEM_WRITE_VALUE", tid))
         acquired = events.get(("NOTIFY_WAIT", tid + 1))
         if close and acquired:
-            if tid > norm.task + 4:
+            if tid > t + 4:
                 windows = {"qkv": (tail_open[0], acquired[1], close[0])}
             break
     for name, op in cubes:
@@ -228,6 +231,22 @@ def copy_window_controls(cubes, events, norm, consumer_sfa):
         if grant and acquired:
             windows[name] = (grant[0], acquired[1], close[0] if close else None)
     return windows, join
+
+
+def additional_grants(events, known_starts):
+    """Match the main stream's gate writes and consumable Notifies in task order."""
+    begin = None
+    extra = []
+    for tid in sorted(task for kind, task in events if kind == "MEM_WRITE_VALUE"):
+        grant = events.get(("NOTIFY_RECORD", tid + 1))
+        acquire = events.get(("NOTIFY_WAIT", tid + 1))
+        if grant:
+            begin = grant[0]
+        elif acquire and begin is not None:
+            if begin not in known_starts:
+                extra.append((begin, acquire[1], events["MEM_WRITE_VALUE", tid][0]))
+            begin = None
+    return sorted(extra)
 
 
 def window_piece_counts(parts, intervals):
@@ -465,6 +484,7 @@ def analyze(path, wanted_pid=None, wanted_model=None, wanted_stream=None, expect
         wanted.update(("CAPTURE_WAIT", n.task + 2) for n in norms[1:])
         wanted.update(("NOTIFY_RECORD", n.task + 2) for n in norms[1:])
         wanted.update(("CAPTURE_WAIT", n.task + 3) for n in norms[1:])
+        wanted.update(("CAPTURE_WAIT", n.task + 5) for n in norms[1:])
         wanted.update(("CAPTURE_RECORD", r.task + 1) for r in sfas[:-1])
         stages.append((start, end, norms, sfas, final))
     if not stages:
@@ -480,7 +500,7 @@ def analyze(path, wanted_pid=None, wanted_model=None, wanted_stream=None, expect
     main_copies = [r for r in main if is_copy(r)]
     main_copy_times = [r.start for r in main_copies]
     by_edge, background = {}, set()
-    origin_layers, layer_windows, qkv_ops = {}, {}, {}
+    origin_layers, layer_windows, qkv_ops, extra_windows = {}, {}, {}, {}
     for step, (start, end, norms, sfas, final) in enumerate(stages):
         events = controls[step]
         control_windows = {i: copy_window_controls(cube_tasks[step, i], events, norm, sfas[i + 1])
@@ -490,6 +510,11 @@ def analyze(path, wanted_pid=None, wanted_model=None, wanted_stream=None, expect
             if "qkv" in windows:
                 close = windows["qkv"][2]
                 qkv_ops[step, i] = main[bisect.bisect_left(times, join[1]):bisect.bisect_left(times, close)]
+        known_starts = {span[0] for windows, _ in control_windows.values() for span in windows.values()}
+        spans = additional_grants(events, known_starts)
+        extra_core = Timeline((op.start, op.stop) for grant, _, close in spans
+                              for op in main[bisect.bisect_left(times, grant):bisect.bisect_left(times, close)])
+        extra_windows[step] = spans, [s[1] for s in spans], [s[0] for s in spans], extra_core
         group_edges = indexer_trains(
             norms, sfas,
             main_copies[bisect.bisect_left(main_copy_times, start):bisect.bisect_left(main_copy_times, end)],
@@ -585,11 +610,16 @@ def analyze(path, wanted_pid=None, wanted_model=None, wanted_stream=None, expect
                 qkv_overlap = Timeline(
                     (op.start, op.stop) for layer in range(origin, i + 1) for op in qkv_ops.get((step, layer), ())
                 ).overlap(parts)
+                spans, span_ends, span_starts, extra_core = extra_windows[step]
+                extra_overlap = extra_core.overlap(parts)
                 if windows:
                     # A later transfer may use an earlier consumer's QKV grant
                     # while that consumer waits or computes.
                     allowed = [(name, span) for layer in range(origin, i + 1)
                                for name, span in layer_windows[step, layer].items() if name != "tail" or layer == i]
+                    begin = bisect.bisect_left(span_ends, ready)
+                    end = bisect.bisect_right(span_starts, max(deadline, parts[-1].stop))
+                    allowed.extend(("additional", span) for span in spans[begin:end])
                     counts = window_piece_counts(parts, allowed)
                     s["window_pieces"] = counts
                     s["unassigned_pieces"] = len(parts) - sum(counts.values())
@@ -612,7 +642,10 @@ def analyze(path, wanted_pid=None, wanted_model=None, wanted_stream=None, expect
                     copy_overlap_vup=cube_overlaps["vup"],
                     copy_overlap_router=cube_overlaps["router"],
                     copy_overlap_qkv=qkv_overlap,
-                    copy_overlap_protected_main_compute=root_overlap - sum(cube_overlaps.values()) - qkv_overlap,
+                    copy_overlap_additional_windows=extra_overlap,
+                    copy_overlap_protected_main_compute=max(
+                        0, root_overlap - sum(cube_overlaps.values()) - qkv_overlap - extra_overlap
+                    ),
                     cube_windows=[name for name in windows if name in {"vup", "router"}],
                     copy_overlap_comm_aiv=comm_aiv.overlap(parts),
                     copy_overlap_other_device_compute=other_compute.overlap(parts),
@@ -691,6 +724,9 @@ def analyze(path, wanted_pid=None, wanted_model=None, wanted_stream=None, expect
     ]
     layers = []
     window_names = ("vup", "router", "tail")
+    if any(spans for spans, *_ in extra_windows.values()):
+        window_names += ("additional",)
+        edge_fields.append("copy_overlap_additional_windows")
     if qkv_ops:
         window_names += ("qkv",)
         edge_fields.extend(["copy_overlap_qkv", "qkv_close_to_acquire"])

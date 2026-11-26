@@ -52,7 +52,7 @@ def _sfa_prefetch_main_gate() -> bool:
 def _sfa_copy_max_aiv_cores() -> int:
     name = "VLLM_ASCEND_SFA_COPY_MAX_AIV_CORES"
     try:
-        limit = int(os.getenv(name, "0"))
+        limit = int(os.getenv(name, "20"))
     except ValueError:
         return 0
     if not 0 <= limit <= 0xFFFFFFFF:
@@ -215,7 +215,7 @@ env_variables: dict[str, Callable[[], Any]] = {
         int(os.getenv("VLLM_ASCEND_SFA_SHARED_RETRIEVAL_OVERLAP", "0"))
     ),
     # D target full-graph KV copy, serial and prefetched. Non-sensitive. Positive uint32
-    # caps AIVs per kernel. Unset (default), zero, or text selects the automatic grid.
+    # caps AIVs per kernel. Default 20. Explicit zero or text selects the automatic grid.
     # Read at model initialization. Restart D to capture a different grid.
     "VLLM_ASCEND_SFA_COPY_MAX_AIV_CORES": _sfa_copy_max_aiv_cores,
     # D only, non-sensitive. 0 (default) queues one layer ahead. 1 queues
@@ -225,7 +225,7 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_SFA_PREFETCH_PIECES": lambda: int(
         os.getenv("VLLM_ASCEND_SFA_PREFETCH_PIECES", "16" if _sfa_prefetch_main_gate() else "1")
     ),
-    # D only. Open during eligible V-up/router GEMMs and, in multi-layer mode, through consumer QKV.
+    # D only. Admit the copy FIFO during qualified decoder kernels and small TP collectives.
     "VLLM_ASCEND_SFA_PREFETCH_MAIN_GATE": _sfa_prefetch_main_gate,
     # Compatibility spelling. An explicit MAIN_GATE value takes precedence.
     "VLLM_ASCEND_SFA_PREFETCH_MOE_GATE": _sfa_prefetch_main_gate,

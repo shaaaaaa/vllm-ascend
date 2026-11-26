@@ -1,6 +1,9 @@
+from contextlib import nullcontext
+
 import torch
 from vllm.triton_utils import tl, triton
 
+from vllm_ascend.compilation.sfa_copy_windows import current_gate
 from vllm_ascend.ops.triton.triton_utils import get_vectorcore_num
 
 
@@ -44,14 +47,10 @@ def muls_add_triton(x: torch.Tensor, y: torch.Tensor, scale: float) -> torch.Ten
     num_programs = min(num_blocks, num_cores)
 
     # Launch the Triton kernel
-    muls_add_kernel[(num_programs,)](
-        x,
-        y,
-        output,
-        scale,
-        n_elements,
-        num_blocks,
-        BLOCK_SIZE=BLOCK_SIZE,
-    )
+    gate = current_gate()
+    with gate.window("muls_add") if gate is not None and num_programs <= gate.free_aiv else nullcontext():
+        muls_add_kernel[(num_programs,)](
+            x, y, output, scale, n_elements, num_blocks, BLOCK_SIZE=BLOCK_SIZE,
+        )
 
     return output

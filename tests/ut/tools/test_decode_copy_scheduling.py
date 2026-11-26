@@ -227,8 +227,12 @@ def test_copy_pieces_match_the_graph_fork_and_consumer_join(clients, tmp_path, o
     assert summary["copy_fits_outside_dispatch_to_combine"] == 0
 
 
-@pytest.mark.parametrize("vup,router,stray", [(0, 0, 0), (0, 4, 0), (3, 2, 0), (5, 0, 0), (1, 1, 1)])
-def test_dynamic_windows_report_actual_piece_counts_and_protected_overlap(clients, tmp_path, vup, router, stray):
+@pytest.mark.parametrize("vup,router,stray,quant_open",
+                         [(0, 0, 0, False), (0, 4, 0, False), (3, 2, 0, False), (5, 0, 0, False),
+                          (1, 1, 1, False), (1, 1, 1, True)])
+def test_dynamic_windows_report_actual_piece_counts_and_protected_overlap(
+    clients, tmp_path, vup, router, stray, quant_open
+):
     _, gaps = clients
     events = []
 
@@ -253,6 +257,12 @@ def test_dynamic_windows_report_actual_piece_counts_and_protected_overlap(client
         ("SparseFlashAttention", "MIX_AIC", 113, 2), ("SwiGlu", "AI_VECTOR_CORE", 116, 1),
         ("AddRmsNormBias_final", "AI_VECTOR_CORE", 118, 1),
     ]
+    if quant_open:
+        index = next(i for i, row in enumerate(tasks) if row[0] == "DynamicQuant")
+        tasks[index:index + 1] = [
+            ("open quant", "MEM_WRITE_VALUE", 37, 0.4), ("give quant", "NOTIFY_RECORD", 37.5, 0.4),
+            tasks[index], ("close quant", "MEM_WRITE_VALUE", 43, 0.4), ("take quant", "NOTIFY_WAIT", 43.5, 0.4),
+        ]
     for i, row in enumerate(tasks):
         emit(*row, i)
     for i, tick in enumerate([14 + 3*j for j in range(vup)] + [52 + 3*j for j in range(router)] +
@@ -264,16 +274,20 @@ def test_dynamic_windows_report_actual_piece_counts_and_protected_overlap(client
     assert summary["cube_windows"] == {"vup": 1, "router": 1}
     assert summary["pieces_per_window_histogram"] == {
         "vup": {vup: 1}, "router": {router: 1}, "tail": {6 - vup - router - stray: 1},
+        **({"additional": {stray: 1}} if quant_open else {}),
     }
     assert samples[0]["vup_close_to_acquire"] == 4000 and samples[0]["router_close_to_acquire"] == 2000
     assert layers[0]["router_pieces_mean"] == router
-    assert samples[0]["copy_overlap_protected_main_compute"] == 1000 * stray
-    assert summary["pieces_outside_or_ambiguous_window"] == stray
+    assert samples[0]["copy_overlap_additional_windows"] == 1000 * (stray if quant_open else 0)
+    assert samples[0]["copy_overlap_protected_main_compute"] == 1000 * (0 if quant_open else stray)
+    assert summary["pieces_outside_or_ambiguous_window"] == (0 if quant_open else stray)
 
 
-@pytest.mark.parametrize("gated", [True, False])
+@pytest.mark.parametrize(("gated", "extra"), [(True, False), (False, False), (True, True)])
 @pytest.mark.parametrize("placement", ["producer_vup", "first_qkv", "per_consumer"])
-def test_three_prefetch_completions_match_three_consumers_even_in_one_window(clients, tmp_path, gated, placement):
+def test_three_prefetch_completions_match_three_consumers_even_in_one_window(
+    clients, tmp_path, gated, placement, extra
+):
     import analyze_decode_moe_copy
 
     _, gaps = clients
@@ -294,8 +308,14 @@ def test_three_prefetch_completions_match_three_consumers_even_in_one_window(cli
         return start
 
     for layer in range(4):
+        if extra and layer:
+            main("open norm", "MEM_WRITE_VALUE")
+            main("give norm", "NOTIFY_RECORD")
         main("RmsNorm_input" if layer == 0 else "AddRmsNormBias_input", "AI_VECTOR_CORE")
         if layer:
+            if extra:
+                main("close norm", "MEM_WRITE_VALUE")
+                main("take norm", "NOTIFY_WAIT")
             if gated:
                 main("open", "MEM_WRITE_VALUE")
                 main("release", "NOTIFY_RECORD")
@@ -351,6 +371,7 @@ def test_three_prefetch_completions_match_three_consumers_even_in_one_window(cli
     assert all(s["copy_overlap_vup"] == (4000 if placement == "producer_vup" else 0) for s in samples[:-1])
     if gated:
         assert summary["pieces_outside_or_ambiguous_window"] == 0
+        assert ("additional" in summary["pieces_per_window_histogram"]) == extra
         assert summary["pieces_per_window_histogram"]["vup"] == {2 if placement == "producer_vup" else 0: 3}
         assert summary["pieces_per_window_histogram"]["qkv"] == {0 if placement == "producer_vup" else 2: 3}
         expected = [0, 4000, 4000] if placement == "first_qkv" else [0, 0, 0]

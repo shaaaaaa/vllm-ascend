@@ -565,6 +565,9 @@ class NPUModelRunner(GPUModelRunner):
 
             self._sfa_full_graph.retrieval_overlap = SharedRetrievalOverlap(
                 prefetch_pieces, prefetch_low_priority, main_gate=prefetch_main_gate, multi_layer=prefetch_multi_layer,
+                local_tp4=(self.parallel_config.tensor_parallel_size == 4
+                           and self.parallel_config.nnodes_within_dp == 1
+                           and self.parallel_config.distributed_executor_backend == "mp"),
             )
         elif prefetch_pieces != 1 or prefetch_low_priority or prefetch_main_gate or prefetch_multi_layer:
             raise ValueError("SFA prefetch scheduling requires VLLM_ASCEND_SFA_SHARED_RETRIEVAL_OVERLAP=1")

@@ -16,11 +16,14 @@
 #
 
 
+from contextlib import nullcontext
+
 import torch
 from torch import nn
 from vllm.config import get_current_vllm_config
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm, RMSNorm, RMSNormGated
 
+from vllm_ascend.compilation.sfa_copy_windows import current_gate
 from vllm_ascend.ops.triton.layernorm_gated import layer_norm_fwd_npu
 from vllm_ascend.utils import enable_custom_op, get_weight_prefetch_method
 
@@ -67,19 +70,33 @@ class AscendRMSNorm(RMSNorm):
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         import torch_npu
 
+        # Leave traced norm/quant patterns available to the fusion pass.
+        gate = None if torch.compiler.is_compiling() else current_gate()
+        eligible = (gate is not None and x.ndim == 2 and 0 < x.size(0) <= gate.free_aiv
+                    and x.dtype == self.weight.dtype == torch.bfloat16 and 0 < x.size(1) <= 8192 and x.size(1) % 16 == 0
+                    and self.weight.shape == (x.size(1),) and self.weight.is_contiguous()
+                    and torch_npu.get_npu_format(x) == 2)
         if residual is not None:
             residual = torch.ops.vllm.maybe_chunk_residual(x, residual)
-            if enable_custom_op():
-                x, _, residual = torch.ops._C_ascend.npu_add_rms_norm_bias(
-                    x, residual, self.weight, self.bias, self.variance_epsilon
-                )
-            else:
-                x, _, residual = torch_npu.npu_add_rms_norm(x, residual, self.weight, self.variance_epsilon)
-                if self.bias is not None:
-                    x.add_(self.bias)
+            custom = enable_custom_op()
+            eligible = (eligible and x.is_contiguous() and residual.is_contiguous() and residual.shape == x.shape
+                        and residual.dtype == x.dtype and torch_npu.get_npu_format(residual) == 2
+                        and (self.bias is None or self.bias.is_contiguous()))
+            with gate.window("add_rms_norm") if eligible else nullcontext():
+                if custom:
+                    x, _, residual = torch.ops._C_ascend.npu_add_rms_norm_bias(
+                        x, residual, self.weight, self.bias, self.variance_epsilon
+                    )
+                else:
+                    x, _, residual = torch_npu.npu_add_rms_norm(x, residual, self.weight, self.variance_epsilon)
+            if not custom and self.bias is not None:
+                x.add_(self.bias)
             return x, residual
 
-        x, residual = torch_npu.npu_rms_norm(x, self.weight, self.variance_epsilon)
+        if eligible:
+            x = x.contiguous()
+        with gate.window("rms_norm") if eligible else nullcontext():
+            x, residual = torch_npu.npu_rms_norm(x, self.weight, self.variance_epsilon)
         if self.bias_loaded:
             x.add_(self.bias)
 

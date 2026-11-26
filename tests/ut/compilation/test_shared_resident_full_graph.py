@@ -40,7 +40,7 @@ def test_bounded_group_packs_and_restores_once_per_invocation(explicit, c8, look
         obj.fused_qkv_a_proj.weight = torch.empty(1)
         obj.q_lora_rank, obj.kv_lora_rank, obj.qk_rope_head_dim = 2, 1, 1
         obj.q_a_layernorm = lambda x: x
-        obj._q_proj_and_k_up_proj = lambda q: (q, q)
+        obj._q_proj_and_k_up_proj = lambda q, **kwargs: (q, q)
         obj.rope_single = lambda q, *args: q
         obj.exec_kv = Mock()
         obj.index_cache_enabled = True
@@ -54,13 +54,9 @@ def test_bounded_group_packs_and_restores_once_per_invocation(explicit, c8, look
         obj.indexer_select_post_process = Mock(side_effect=lambda **kwargs: frame["raw"].clone())
     consumer._get_indexcache_topk_indices = Mock(side_effect=AssertionError("consumer staged raw top-k"))
     consumer_order = []
-    def wait_and_project(projection, hidden):
-        assert projection is consumer.fused_qkv_a_proj
-        consumer_order.append("wait own KV")
-        output = projection(hidden)
-        consumer_order.append("close after QKV")
-        return output
-    edge = NS(join=wait_and_project) if lookahead else None
+    project = consumer.fused_qkv_a_proj.side_effect
+    consumer.fused_qkv_a_proj.side_effect = lambda x: consumer_order.append("QKV") or project(x)
+    edge = NS(join=lambda: consumer_order.append("wait own KV")) if lookahead else None
     consumer.q_a_layernorm = lambda x: consumer_order.append("norm") or x
     writes = [t.clone() for t in group.writes] if explicit else None
     reads = [writes[0], writes[-4], writes[-3][:, 0], writes[-2], writes[-1]] if explicit else None
@@ -105,7 +101,7 @@ def test_bounded_group_packs_and_restores_once_per_invocation(explicit, c8, look
         second = consumer._cross_layer_pre_compute(
             indexer_cache=None, resident_reads=reads, qkv_prefetch=edge, **kwargs
         )
-        assert consumer_order == (["wait own KV", "close after QKV", "norm"] if lookahead else ["norm"])
+        assert consumer_order == (["wait own KV", "QKV", "norm"] if lookahead else ["QKV", "norm"])
         consumer_order.clear()
         expected = torch.where((rows >= 0)[:, None, None], frame["raw"] + 100, -1)
         assert torch.equal(first[2], expected) and torch.equal(second[2], expected)

@@ -39,7 +39,7 @@ from vllm.model_executor.layers.linear import (  # noqa
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.model_executor.utils import set_weight_attrs
 
-from vllm_ascend.ops.linear_op import get_parallel_op, get_replicated_op
+from vllm_ascend.ops.linear_op import get_parallel_op, get_replicated_op, sfa_tp_projection
 from vllm_ascend.utils import enable_sp, maybe_trans_nz
 
 
@@ -312,6 +312,11 @@ class AscendRowParallelLinear(RowParallelLinear):
         if self.custom_op is not None:
             return self.custom_op.apply(input_)
 
+        if getattr(self, "sfa_copy_projection", None) and self.input_is_parallel and self.reduce_results:
+            bias = None if self.tp_rank > 0 or self.skip_bias_add else self.bias
+            combined = sfa_tp_projection(self, input_, bias)
+            if combined is not None:
+                return (combined, self.bias if self.skip_bias_add else None) if self.return_bias else combined
         return super().forward(input_)
 
 

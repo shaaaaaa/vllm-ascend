@@ -14,6 +14,13 @@ from vllm.forward_context import get_forward_context
 from vllm.utils.torch_utils import direct_register_custom_op
 
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX, MoECommType
+from vllm_ascend.compilation.sfa_copy_windows import (
+    sfa_decode_swiglu,
+    sfa_decode_swiglu_fake,
+    sfa_decode_w8a8,
+    sfa_decode_w8a8_fake,
+    tp_window,
+)
 from vllm_ascend.ops.rotary_embedding import rope_forward_oot
 from vllm_ascend.ops.triton.muls_add import muls_add_triton
 from vllm_ascend.ops.weight_prefetch import maybe_npu_prefetch
@@ -81,6 +88,9 @@ def _maybe_pad_and_reduce_impl(x: torch.Tensor, is_ep_comm: bool = False) -> tor
     )
 
     if not flash_comm_v1_enabled or (forward_context.is_draft_model and is_vl_model()):
+        if not is_ep_comm:
+            with tp_window("tp_allreduce", x):
+                return tensor_model_parallel_all_reduce(x)
         return tensor_model_parallel_all_reduce(x)
 
     dp_metadata = forward_context.dp_metadata
@@ -221,6 +231,22 @@ direct_register_custom_op(
     op_name="maybe_chunk_residual",
     op_func=_maybe_chunk_residual_impl,
     fake_impl=lambda x, residual: torch.empty_like(x),
+    mutates_args=[],
+    dispatch_key="PrivateUse1",
+)
+
+direct_register_custom_op(
+    op_name="sfa_decode_swiglu",
+    op_func=sfa_decode_swiglu,
+    fake_impl=sfa_decode_swiglu_fake,
+    mutates_args=[],
+    dispatch_key="PrivateUse1",
+)
+
+direct_register_custom_op(
+    op_name="sfa_decode_w8a8",
+    op_func=sfa_decode_w8a8,
+    fake_impl=sfa_decode_w8a8_fake,
     mutates_args=[],
     dispatch_key="PrivateUse1",
 )

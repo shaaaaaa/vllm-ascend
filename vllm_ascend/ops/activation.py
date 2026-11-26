@@ -18,6 +18,7 @@
 import torch
 from vllm.model_executor.layers.activation import QuickGELU, SiluAndMul, SwigluOAIAndMul
 
+from vllm_ascend import envs
 from vllm_ascend.utils import get_weight_prefetch_method
 
 
@@ -35,7 +36,10 @@ class AscendSiluAndMul(SiluAndMul):
 
         weight_prefetch_method = get_weight_prefetch_method()
         weight_prefetch_method.maybe_prefetch_mlp_weight_preprocess(weight_prefetch_method.MLP_DOWN, x)
-        out = torch_npu.npu_swiglu(x)
+        if envs.VLLM_ASCEND_SFA_PREFETCH_MAIN_GATE and x.dtype == torch.bfloat16 and x.ndim == 2:
+            out = torch.ops.vllm.sfa_decode_swiglu(x)
+        else:
+            out = torch_npu.npu_swiglu(x)
         weight_prefetch_method.maybe_prefetch_mlp_weight_postprocess(out)
         return out
 

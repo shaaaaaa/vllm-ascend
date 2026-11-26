@@ -26,6 +26,7 @@ from vllm.distributed import get_ep_group
 import vllm_ascend.envs as envs_ascend
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX, MoECommType
+from vllm_ascend.compilation.sfa_copy_windows import projection_name, w8a8_projection
 from vllm_ascend.distributed.parallel_state import get_mc2_group
 from vllm_ascend.flash_common3_context import get_flash_common3_context
 from vllm_ascend.ops.fused_moe.experts_selector import select_experts, zero_experts_compute
@@ -78,6 +79,9 @@ class AscendW8A8DynamicLinearMethod(AscendLinearScheme):
         bias: torch.Tensor | None = None,
         tp_rank: int | None = 0,
     ) -> torch.Tensor:
+        if (getattr(layer, "sfa_copy_projection", None) is not None and bias is None
+                and x.ndim == 2 and x.dtype == torch.bfloat16):
+            return w8a8_projection(layer, x)
         quantized_x, pertoken_scale = torch_npu.npu_dynamic_quant(x)
         need_unsqz = False
         if pertoken_scale.dim() == 2:
@@ -103,6 +107,14 @@ class AscendW8A8DynamicLinearMethod(AscendLinearScheme):
         layer.weight_scale.data = layer.weight_scale.data.flatten()
         layer.weight_scale_fp32 = layer.weight_scale.data.to(torch.float32)
         layer.weight_offset.data = layer.weight_offset.data.flatten()
+        # Resolve the physical weight layout once, before compilation. Other
+        # quantization schemes and routed expert GMMs retain their normal path.
+        layer.sfa_copy_projection = None
+        if (envs_ascend.VLLM_ASCEND_SFA_PREFETCH_MAIN_GATE and layer.weight.device.type == "npu"
+                and layer.weight.dtype == torch.int8 and layer.weight_scale.dtype == torch.bfloat16
+                and layer.weight_scale.is_contiguous()
+                and torch_npu.get_npu_format(layer.weight) == ACL_FORMAT_FRACTAL_NZ):
+            layer.sfa_copy_projection = projection_name(layer.prefix)
 
 
 @register_scheme("W8A8_DYNAMIC", "moe")

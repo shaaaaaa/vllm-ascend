@@ -30,6 +30,7 @@ from vllm.model_executor.layers.fused_moe import FusedMoEConfig
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
+from vllm_ascend.compilation.sfa_copy_windows import current_gate, tp_fits
 from vllm_ascend.distributed.utils import fc3_all_gather_and_maybe_unpad_impl
 from vllm_ascend.ops.fused_moe.moe_runtime_args import MoEPrepareOutput
 from vllm_ascend.quantization.quant_type import QuantType
@@ -200,8 +201,21 @@ class PrepareAndFinalizeWithAll2All(PrepareAndFinalize):
                 gathered_hidden_states = torch.empty(
                     padded_hidden_states_shape, device=hidden_states.device, dtype=hidden_states.dtype
                 )
-                split_hidden_states = torch.tensor_split(gathered_hidden_states, self.tp_size, dim=0)
-                dist.all_gather(list(split_hidden_states), hidden_states, self.moe_config.tp_group.device_group)
+                gate = current_gate()
+                equal_chunks = hidden_states.size(0) * self.tp_size == gathered_hidden_states.size(0)
+                if (self.tp_size == 4 and equal_chunks and hidden_states.is_contiguous()
+                        and hidden_states.dtype in (torch.bfloat16, torch.float16)
+                        and tp_fits(gate, gathered_hidden_states.numel() * gathered_hidden_states.element_size())
+                        and not get_ascend_config().multistream_overlap_shared_expert
+                        and not get_ascend_config().multistream_overlap_gate):
+                    # One flat output on the same TP group. Avoid the list API's
+                    # unpack copies and close after HCCL rejoins the main stream.
+                    with gate.window("tp_allgather"):
+                        dist.all_gather_into_tensor(gathered_hidden_states, hidden_states,
+                                                    group=self.moe_config.tp_group.device_group)
+                else:
+                    split_hidden_states = torch.tensor_split(gathered_hidden_states, self.tp_size, dim=0)
+                    dist.all_gather(list(split_hidden_states), hidden_states, self.moe_config.tp_group.device_group)
                 hidden_states = gathered_hidden_states
 
             if self.num_tokens < hidden_states.shape[0]:

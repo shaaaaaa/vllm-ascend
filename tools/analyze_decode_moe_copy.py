@@ -195,6 +195,12 @@ def operator(name):
         return "v_up"
     if n.startswith("matmulv2") and "fp32" in n:
         return "fp32_matmul"
+    if n.startswith("batchmatmulv2"):
+        return "batch_matmul"
+    if n.startswith("swiglu") and "quant" not in n:
+        return "swiglu"
+    if n.startswith("mulsadd"):
+        return "muls_add"
     if "quantbatchmatmul" in n:
         return "quant_matmul"
     if "dynamicquant" in n:
@@ -456,6 +462,10 @@ def joins(rep):
         if any(r.op in COPY and r.start >= norm.end for r in before):
             continue  # This layer loads its KV directly on the main stream.
         t = norm.task
+        # A small input AddRmsNorm has its own grant, which closes before
+        # opening the independent FIFO drain for this consumer.
+        if (main, t + 1, "write") in controls and (main, t + 2, "take") in controls:
+            t += 2
         wait = None
         if (main, t + 1, "write") in controls and (main, t + 2, "give") in controls:
             wait = controls.get((main, t + 3, "wait"))

@@ -105,6 +105,7 @@ class Workload:
             weight = torch.ones((16, 512, 128), dtype=torch.bfloat16, device=self.device)
             self.vup_weights = [weight] * layers
             self.qkv_projections = [None] * layers
+            self.glm_qkv = None
             if multi_layer:
                 # Use the same BF16 projection on all three benchmark schedules.
                 qkv = partial(torch.mm, self.x[:, 0, :].contiguous(), weight[0],
@@ -146,12 +147,14 @@ class Workload:
         x = self.x.new_ones((rows, hidden))
         scheme = AscendW8A8DynamicLinearMethod()
         self.qkv_projections = []
+        self.glm_qkv = (x, [])
         for _ in range(self.layers):
             layer = SimpleNamespace(
                 weight=maybe_trans_nz(torch.ones((hidden, width), dtype=torch.int8, device=self.device)),
                 weight_scale=x.new_ones((width,)),
             )
             self.qkv_projections.append(partial(scheme.apply, layer, x))
+            self.glm_qkv[1].append(layer)
         self.x = x.new_ones((rows, heads // tp, kv))
         self.vup_weights = [x.new_ones((heads // tp, kv, config["v_head_dim"])) for _ in range(self.layers)]
         self.router_x = torch.ones((rows, hidden), dtype=torch.float32, device=self.device)
@@ -174,10 +177,23 @@ class Workload:
         for layer, transfer in enumerate(self.transfers):
             qkv = self.qkv_projections[layer]
             if overlap and layer:
-                if multi_layer:
-                    edges[layer - 1].join(qkv)
+                edge = edges[layer - 1]
+                join_projection = multi_layer
+                if getattr(self, "glm_qkv", None) is not None and edge.gate is not None:
+                    from vllm_ascend.compilation.sfa_copy_windows import qkv_grant_fits, w8a8_with_gate
+
+                    x, weights = self.glm_qkv
+                    gate = edge.gate if edge.gate.supports_decoder_windows else None
+                    projection = weights[layer]
+                    join_projection = multi_layer and qkv_grant_fits(gate, x, projection.weight)
+                    if not join_projection and gate is not None:
+                        # After the consumer joins, only the next layer(s) can still have work.
+                        qkv = partial(w8a8_with_gate, gate if gate.pending > 1 else None, x,
+                                      projection.weight, projection.weight_scale, None, "qkv", False)
+                if join_projection:
+                    edge.join(qkv)
                 else:
-                    edges[layer - 1].join()
+                    edge.join()
                     if qkv is not None:
                         qkv()
             else:
