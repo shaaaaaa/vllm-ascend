@@ -2989,6 +2989,12 @@ class AscendSFAImpl(MLAAttentionImpl):
             valid = max(0, min(rows, tokens - self.tp_rank * rows))
             if valid < rows:
                 attn_output[valid:].zero_()
+        elif self._layerwise_prefill_p_node and attn_metadata is not None:
+            cp = attn_metadata.dsa_cp_context
+            if cp is not None and cp.local_end < cp.local_end_with_pad:
+                # TND leaves these TP padding rows unwritten; MoE can route them.
+                valid = max(0, cp.local_end - cp.local_start)
+                attn_output[valid:].zero_()
         return attn_output
 
     def _cross_layer_ineligible_reason(

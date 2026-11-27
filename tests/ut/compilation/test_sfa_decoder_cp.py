@@ -271,6 +271,37 @@ def test_attention_initializes_undeclared_tp_padding(monkeypatch, layout, rank, 
     assert output[valid:].eq(0).all()
 
 
+@pytest.mark.parametrize("world,tokens,padded", [(8, 1, 8), (8, 13, 16), (8, 8, 32), (8, 16, 16), (1, 8, 8)])
+def test_banked_prefill_clears_only_unwritten_tp_rows(monkeypatch, layout, world, tokens, padded):
+    execute = extract(
+        ROOT / "vllm_ascend/attention/sfa_v1.py", "_execute_sparse_flash_attention_process", {"torch": torch}
+    )
+    impl = NS(_layerwise_prefill_p_node=True, dsa_cp_decoder=False, dsa_shrink_latent=0, scale=1.0)
+    ends, lengths = torch.tensor([tokens]), torch.tensor([23_000])
+    kernel = Mock()
+    monkeypatch.setattr(torch.ops._C_ascend, "npu_sparse_flash_attention", kernel, raising=False)
+    width = padded // world
+    for start in range(0, padded, width):
+        q, k = torch.empty_like(ends), torch.empty_like(lengths)
+        layout.cp_sequence_lengths(ends, lengths, start, width, q, k)
+        # TND writes only the declared queries. Poison exposes any padding that escapes to MoE.
+        valid = q.item()
+        native = kernel.return_value = torch.full((width, 1, 2), torch.nan)
+        native[:valid].fill_(7)
+        version = native._version
+        cp = NS(local_start=start, local_end=min(start + width, tokens), local_end_with_pad=start + width)
+        metadata = NS(
+            block_table=None,
+            dsa_cp_context=cp if world > 1 else None,
+            num_actual_tokens=tokens,
+            num_input_tokens=padded,
+        )
+        output = execute(impl, None, None, (None, None), None, metadata, q, k)
+        assert output is native
+        assert output[:valid].eq(7).all() and output[valid:].eq(0).all()
+        assert output._version == version + int(valid < width)
+
+
 @pytest.mark.parametrize("explicit", [None, False, True])
 @pytest.mark.parametrize("role", ["producer", "consumer", "both", "none"])
 @pytest.mark.parametrize("p_node", [False, True])
