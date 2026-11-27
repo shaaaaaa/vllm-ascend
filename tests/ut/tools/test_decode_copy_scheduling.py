@@ -72,6 +72,34 @@ def test_grouped_copy_layer_times_count_device_work_and_inter_piece_gaps(clients
         gaps.grouped_copy_layer_times(trace, schedule, layers=4, pieces=2)
 
 
+def test_shared_plan_report_pairs_kernel_sums_and_counts_one_publisher(clients, tmp_path):
+    _, gaps = clients
+    orders = (("legacy", "planned"), ("planned", "legacy"), ("legacy", "planned"))
+    schedule = [("mixed", pair, mode) for pair, order in enumerate(orders) for mode in order]
+    events = []
+
+    def task(name, t, duration, stream):
+        events.append({"ph": "X", "pid": 8, "tid": stream, "ts": t, "dur": duration, "name": name,
+                       "args": {"Task Type": "AI_VECTOR_CORE", "Physic Stream Id": stream}})
+
+    for replay, (_, pair, mode) in enumerate(schedule):
+        start = replay * 1000
+        piece = "planned_piece" if mode == "planned" else "piece"
+        if mode == "planned":
+            task("sparse_publish_slice_plan", start, 3 + pair, 4)
+        task("sfa_copy_i32_s64", start + 9, 1, 4)
+        duration = 10 if mode == "legacy" else (8, 8, 2)[pair]
+        for i in range(6):
+            task("sfa_copy_" + piece + "_i32_s64", start + 20 + 40 * i, duration, 5)
+    trace = tmp_path / "shared-plan.json"
+    trace.write_text(json.dumps(events[::-1]))
+    assert gaps.compare_shared_plan_kernels(trace, schedule, 4, 2)["mixed"] == dict(
+        groups=3, legacy_ms=0.180, planned_ms=0.108, saved_ms=0.072, publisher_us=4.0)
+    trace.write_text(json.dumps([e for e in events if e["name"] != "sparse_publish_slice_plan"]))
+    with pytest.raises(ValueError, match="device plan publishers"):
+        gaps.compare_shared_plan_kernels(trace, schedule, 4, 2)
+
+
 @pytest.mark.parametrize("wait_kind", ["CAPTURE_WAIT", "EVENT_WAIT"])
 @pytest.mark.parametrize("fragmented", [False, True])
 def test_grouped_copy_waits_pair_with_consumer_arrival(clients, tmp_path, wait_kind, fragmented):

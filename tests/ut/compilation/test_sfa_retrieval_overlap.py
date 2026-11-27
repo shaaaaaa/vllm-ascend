@@ -203,7 +203,8 @@ def test_shared_prefetch_benchmark_observes_at_first_join(bench, grouped):
 
 
 @pytest.mark.parametrize("durations", [(10, 7), (7, 10), (7, 7)])
-def test_shared_prefetch_benchmark_pairs_device_times(bench, monkeypatch, durations):
+@pytest.mark.parametrize("include_means", [True, False])
+def test_shared_prefetch_benchmark_pairs_device_times(bench, monkeypatch, durations, include_means):
     now = 0
     calls = []
 
@@ -226,13 +227,18 @@ def test_shared_prefetch_benchmark_pairs_device_times(bench, monkeypatch, durati
     monkeypatch.setattr(torch.npu, "synchronize", lambda: None, raising=False)
     graphs = [NS(replay=lambda i=i: replay(i)) for i in (0, 1)]
     prepared = []
-    result = bench.paired_graph_times(*graphs, names=("cap12", "auto"), pairs=4, replays=2,
-                                      prepare_pair=lambda i: prepared.append((i, len(calls))))
+    result = bench.paired_graph_times(
+        *graphs, names=("cap12", "auto"), pairs=4, replays=2,
+        prepare_pair=lambda i: prepared.append((i, len(calls))), include_means=include_means,
+    )
     assert calls == [0, 0, 1, 1] + [0, 0, 1, 1, 1, 1, 0, 0] * 2
     assert prepared == [(0, 4), (1, 8), (2, 12), (3, 16)]
-    assert result == dict(cap12_us=durations[0], auto_us=durations[1],
-                          paired_saved_us=durations[0] - durations[1],
-                          auto_faster_pairs=4 * int(durations[1] < durations[0]), pairs=4)
+    expected = dict(cap12_us=durations[0], auto_us=durations[1], paired_saved_us=durations[0] - durations[1],
+                    auto_faster_pairs=4 * int(durations[1] < durations[0]), pairs=4)
+    if include_means:
+        expected.update(cap12_mean_us=durations[0], auto_mean_us=durations[1],
+                        paired_mean_saved_us=durations[0] - durations[1])
+    assert result == expected
 
 
 def test_shared_prefetch_benchmark_uses_the_serving_quantized_qkv_shapes(bench, monkeypatch):
@@ -275,10 +281,66 @@ def topology(lengths=(4,), dtype=torch.bfloat16, *, max_aiv_cores=0):
         for i, name in enumerate(group.members):
             caches[name] = (torch.empty((2, 8, 1, 4), dtype=dtype), torch.empty((2, 8, 1, 2), dtype=dtype))
             impls[name] = NS(skip_topk=i > 0, shared_resident_plan=group, sfa_copy_max_aiv_cores=max_aiv_cores,
-                             _full_graph_transfers={2: NS(load=Mock(), request_capacity=2)},
-                             _staged_sfa_bridge_buffers=(torch.empty(1, dtype=dtype),),
+                             _full_graph_transfers={2: NS(load=Mock(), request_capacity=2,
+                                                         allocate_copy_plan=lambda n: torch.empty(2 + 4 * n,
+                                                                                                 dtype=torch.int32),
+                                                         publish_copy_plan=Mock())},
+                             _staged_sfa_bridge_buffers=(torch.empty(1, dtype=dtype), None, None,
+                                                         torch.empty((2, 4), dtype=torch.int32)),
                              _staged_sfa_capture_state=NS(runtime=(None, caches[name]), initialized_cache_capacity=2))
     return groups, impls, caches
+
+
+def test_indexer_publishes_one_shared_schedule_before_the_fork(runtime):
+    module, events = runtime
+    groups, impls, caches = topology(max_aiv_cores=20)
+    key = Key()
+    owner = module.SharedRetrievalOverlap(pieces=4, main_gate=True, multi_layer=True)
+    owner.configure(tuple(impls.items()), groups, caches)
+    owner.prepare(key, tuple(impls.items()), groups, 4)
+    group = owner.indexer_groups[key]["g0l0"]
+    selected = torch.arange(12, dtype=torch.int32).view(3, 4)
+    slots = selected.long()
+    bridge = torch.full((3,), -1, dtype=torch.int32)
+    source = torch.tensor([[2, -1], [1, -1]], dtype=torch.int32)[:, 0]
+
+    def publish(src, dest, plan, width, pieces, cores):
+        assert (src.stride(), width, pieces, cores) == ((2,), 4, 4, 20)
+        assert plan is group.copy_plan and dest.data_ptr() == bridge.data_ptr()
+        dest.copy_(src)
+        events.append(("plan", torch.npu.current_stream().name))
+
+    producer = group.edges[0].transfer
+    producer.publish_copy_plan.side_effect = publish
+    events.clear()
+    group.launch(selected, bridge, slots, producer_counts=source)
+    assert events[:3] == [("plan", "main"), ("record", "main"), ("wait", "transfer")]
+    assert bridge.tolist() == [2, 1, -1]
+    for edge in group.edges:
+        args, kwargs = edge.transfer.load.call_args
+        assert args[0].shape == (2, 4) and args[1].data_ptr() == bridge.data_ptr()
+        assert kwargs["copy_plan"] is group.copy_plan
+        edge.join()
+    producer.publish_copy_plan.assert_called_once()
+    for edge in group.edges[1:]:
+        edge.transfer.publish_copy_plan.assert_not_called()
+    # Already-published bridge callers keep their original transfer schedule.
+    group.launch(selected, bridge, slots)
+    for edge in group.edges:
+        assert "copy_plan" not in edge.transfer.load.call_args.kwargs
+        edge.join()
+
+
+@pytest.mark.parametrize("defer_counts", [True, False])
+def test_staging_defers_only_the_active_counts_prefix(defer_counts):
+    stage = extract(ROOT / "vllm_ascend/attention/sfa_v1.py", "_copy_to_staged_sfa_bridge", {"torch": torch})
+    sources = tuple(torch.full((2, 3) if i != 4 else (2,), i, dtype=torch.int32) for i in range(6))
+    buffers = tuple(s.new_full((4, *s.shape[1:]), -7) for s in sources)
+    obj = NS(_ensure_staged_sfa_bridge_buffers=lambda _: buffers)
+    assert stage(obj, torch.empty(1), sources, defer_counts) is buffers
+    for i, (src, dest) in enumerate(zip(sources, buffers)):
+        assert torch.equal(dest[:2], torch.full_like(src, -7) if defer_counts and i == 4 else src)
+        assert torch.all(dest[2:] == -7)
 
 
 @pytest.mark.parametrize("limit", [0, 12, 24, 40])

@@ -457,6 +457,124 @@ def test_grouped_layer_copy_times_410(request, tmp_path):
         print(f"[SFA_LAYER_COPY] {name:<10} {1 if layer == 0 else pieces:>2}  " + "  ".join(cells))
 
 
+def _row_signature(w, tokens, request_ids, layer, plane):
+    # Three exactly-representable BF16 integers distinguish the plane, layer,
+    # request and all 8192 source tokens, including rows with the same fill value.
+    ids = ((request_ids * w.layers + layer) * w.history + tokens) * 2 + plane
+    return torch.stack([ids & 255, (ids >> 8) & 255, ids >> 16], dim=-1).bfloat16()
+
+
+def _tag_registered_rows(w):
+    for request_id, source in enumerate(w.sources):
+        for layer, storage in enumerate(source.layers):
+            start = 0
+            for chunk, count in zip(storage.tensors, source.chunk_token_counts, strict=True):
+                tokens = torch.arange(start, start + count)
+                for plane, data in enumerate(chunk.split((count * 512, count * 64))):
+                    data.view(count, -1)[:, -3:].copy_(_row_signature(w, tokens, request_id, layer, plane))
+                start += count
+
+
+def test_shared_slice_plan_real_io_and_latency(request, tmp_path):
+    """Compare the two serving schedules with identical registered pages, gates, and 20 AIVs."""
+    from analyze_decode_layer_gaps import compare_shared_plan_kernels
+    from sfa_retrieval_overlap_benchmark import paired_graph_times
+
+    from vllm_ascend.compilation.sfa_retrieval_overlap import SharedPrefetchGroup
+
+    cases = {"one_each": [1] * 16, "410_each": [410] * 16, "skew_6560": [4096, 2000, 464] + [0] * 13}
+    groups_per_round, reference_ms = 19, 4.207
+    trace = tmp_path / "shared-slice-plan.json"
+    schedule = []
+    with glm_group_workload(request) as w:
+        _tag_registered_rows(w)
+        w.set_copy_core_limit(20)
+        dense = torch.empty_like(w.counts, memory_format=torch.contiguous_format)
+        assert dense.is_contiguous() and w.counts.stride() == (16,)
+        w.set_payload(410)
+        legacy = w.capture(True, multi_layer=True, bridge_counts=dense)
+        w.group = SharedPrefetchGroup(w.group.edges, packed_width=w.width)
+        assert w.group.copy_plan is not None and w.group.pieces == 16
+        planned = w.capture(True, multi_layer=True, bridge_counts=dense)
+        observed = w.capture(True, observe=True, multi_layer=True, bridge_counts=dense)
+        graphs = {"legacy": legacy, "planned": planned}
+        lanes, columns = torch.arange(w.requests)[:, None], torch.arange(w.width)[None, :]
+
+        def set_inputs(counts, shift):
+            tokens = ((w.token_order[None, :] + lanes * 97 + shift) % w.history).int()
+            # Different request pages and scatter destinations. 73 is coprime to 4096.
+            local_slots = (columns * 73 + lanes * 11 + shift) % w.width
+            w.selected.copy_(tokens)
+            w.slots.copy_(local_slots + lanes * w.width)
+            w.counts.copy_(torch.tensor(counts, dtype=torch.int32))
+            return tokens, local_slots
+
+        scenarios = [cases["410_each"], cases["skew_6560"], [0] * 16, [4096] * 16, cases["one_each"]]
+        for iteration, counts in enumerate(scenarios):
+            # One positive-count unbound lane also tests the source-validity mask.
+            unbound = 1 if iteration == 1 else None
+            sources = [None if i == unbound else s for i, s in enumerate(w.sources)]
+            for layer, transfer in enumerate(w.transfers):
+                transfer.bind_batch(sources, layer)
+            tokens, local_slots = set_inputs(counts, 37 * iteration)
+            live = (columns < torch.tensor(counts)[:, None]) & (lanes != (-1 if unbound is None else unbound))
+            for graph in (legacy, planned, observed):
+                dense.fill_(-123)
+                for cache in w.caches:
+                    for plane in cache:
+                        plane.fill_(-7)
+                graph.replay()
+                assert dense.cpu().tolist() == counts
+                for layer, cache in enumerate(w.caches):
+                    for p, plane in enumerate(cache):
+                        expected = torch.full((w.requests, w.width), -7, dtype=plane.dtype)
+                        values = (w.values(tokens, lanes, layer) + 32 * p).to(plane.dtype)
+                        expected.scatter_(1, local_slots, torch.where(live, values, -7))
+                        rows = plane.view(w.requests, w.width, -1).cpu()
+                        fill = rows[..., :-3]
+                        assert torch.equal(fill, expected.unsqueeze(-1).expand_as(fill)), (iteration, layer, p)
+                        tags = _row_signature(w, tokens, lanes, layer, p)
+                        expected_tags = torch.full_like(tags, -7)
+                        expected_tags.scatter_(1, local_slots.unsqueeze(-1).expand_as(tags),
+                                               torch.where(live.unsqueeze(-1), tags, -7))
+                        assert torch.equal(rows[..., -3:], expected_tags), (iteration, layer, p)
+                        if graph is observed:
+                            assert torch.equal(w.observed[layer][p].cpu(), expected), (iteration, layer, p, "join")
+
+        # Use the identical, observation-free graphs both for timing and for the
+        # trace. All inputs, synchronization and host oracle work are outside the timers.
+        print(f"[SFA_PLAN] correctness=pass cases={len(scenarios)} registered_K_PE=512/64", flush=True)
+        print(f"[SFA_PLAN] old_profile_extra_side_copy_ms={reference_ms} groups={groups_per_round} "
+              "side_layers=57 graph_batch=19_replays_of_one_indexer_plus_ABC foreground=QKV,Vup,router single_rank")
+        for case, counts in cases.items():
+            set_inputs(counts, 43)
+            t = paired_graph_times(legacy, planned, names=("legacy", "planned"), pairs=8,
+                                   replays=groups_per_round, include_means=True,
+                                   prepare_pair=lambda i, n=counts: set_inputs(n, 43 + 613 * i))
+            scale = groups_per_round / 1000
+            print(f"[SFA_PLAN] {case} graph_batch_mean_ms={t['legacy_mean_us'] * scale:.3f}->"
+                  f"{t['planned_mean_us'] * scale:.3f} paired_graph_saved_ms={t['paired_mean_saved_us'] * scale:+.3f} "
+                  f"planned_faster_pairs={t['planned_faster_pairs']}/{t['pairs']}", flush=True)
+        profiler = torch_npu.profiler
+        torch.npu.synchronize()
+        with profiler.profile(activities=[profiler.ProfilerActivity.CPU, profiler.ProfilerActivity.NPU]) as prof:
+            for case, counts in cases.items():
+                for pair in range(groups_per_round):
+                    set_inputs(counts, 43 + 613 * pair)
+                    for mode in (("planned", "legacy") if pair % 2 else ("legacy", "planned")):
+                        schedule.append((case, pair, mode))
+                        graphs[mode].replay()
+            torch.npu.synchronize()
+        prof.export_chrome_trace(str(trace))
+    print(f"[SFA_PLAN] trace={trace}", flush=True)
+    kernels = compare_shared_plan_kernels(trace, schedule)
+    for case, k in kernels.items():
+        assert k["groups"] == groups_per_round
+        print(f"[SFA_PLAN] {case} side_copy_ms_57_layers={k['legacy_ms']:.3f}->{k['planned_ms']:.3f} "
+              f"publisher_us={k['publisher_us']:.2f} side_saved_ms_57_layers={k['saved_ms']:+.3f} "
+              f"remaining_to_4.207ms={reference_ms - k['saved_ms']:+.3f}", flush=True)
+
+
 @pytest.mark.parametrize("requests,main_gate", [(1, False), (8, False), (16, False), (8, True)])
 @pytest.mark.parametrize("query_rows", [1, 2])
 def test_registered_sources_consumer_boundary_and_replay(requests, query_rows, main_gate):

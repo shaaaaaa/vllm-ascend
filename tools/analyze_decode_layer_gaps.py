@@ -147,6 +147,43 @@ def grouped_copy_layer_times(path, replay_limits, layers, pieces):
     return medians
 
 
+def compare_shared_plan_kernels(path, schedule, layers=4, pieces=16):
+    """Pair the actual A/B/C kernel sums. Keep the main-stream publisher separate."""
+    devices, _ = read_tasks(path)
+    samples = {}
+    publishers = [
+        t for rows in devices.values() for t in rows if "sparsepublishsliceplan" in t.name.lower().replace("_", "")
+    ]
+    previous_join = -1
+    for _, key, root, batches, _ in _grouped_copy_replays(path, devices, schedule, layers, pieces):
+        case, pair, mode = key
+        planned = mode == "planned"
+        if any(("plannedpiece" in t.name.lower().replace("_", "")) != planned for batch in batches for t in batch):
+            raise ValueError(f"{key}: unexpected device copy kernel")
+        # Every prior group's C must have finished before this publisher; the
+        # inline indexer copy is ordered after the publisher on the same stream.
+        published = [t for t in publishers if previous_join <= t.start and t.stop <= root.start]
+        if len(published) != int(planned) or any(t.stream != root.stream for t in published):
+            raise ValueError(f"{key}: expected {int(planned)} device plan publishers, found {len(published)}")
+        previous_join = batches[-1][-1].stop
+        active = [sum(t.stop - t.start for t in batch) / 1000 for batch in batches]
+        samples[case, pair, mode] = (sum(active), sum(t.stop - t.start for t in published) / 1000)
+    results = {}
+    for case in dict.fromkeys(key[0] for key in schedule):
+        pairs = sorted({pair for name, pair, _ in schedule if name == case})
+        old = [samples[case, pair, "legacy"][0] for pair in pairs]
+        new = [samples[case, pair, "planned"][0] for pair in pairs]
+        # Graph 47's 4.207 ms reference is a difference of arithmetic means.
+        results[case] = {
+            "groups": len(pairs),
+            "legacy_ms": sum(old) / 1000,
+            "planned_ms": sum(new) / 1000,
+            "saved_ms": sum(a - b for a, b in zip(old, new)) / 1000,
+            "publisher_us": statistics.mean(samples[case, pair, "planned"][1] for pair in pairs),
+        }
+    return results
+
+
 def _coalesce_capture_waits(main):
     """Fold profiler polling records into the hardware wait instruction on this replay's main stream."""
     ordered = []

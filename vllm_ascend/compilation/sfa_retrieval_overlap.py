@@ -152,11 +152,12 @@ class RetrievalEdge:
             self.payload = payload
         self.windows_used.clear()
 
-    def enqueue_on_side(self) -> None:
+    def enqueue_on_side(self, copy_plan=None) -> None:
         selected, counts, slots = self.payload
         if self.gate is not None:
             self.transfer.load(selected, counts, slots, max_aiv_cores=self.max_aiv_cores,
-                               pieces=min(self.pieces, selected.numel()), admission=self.gate.native)
+                               pieces=min(self.pieces, selected.numel()), admission=self.gate.native,
+                               **({"copy_plan": copy_plan} if copy_plan is not None else {}))
         elif self.pieces != 1:
             self.transfer.load(selected, counts, slots, max_aiv_cores=self.max_aiv_cores, pieces=self.pieces)
         elif self.max_aiv_cores:
@@ -201,7 +202,7 @@ class RetrievalEdge:
             self.pending_join = False
 
 
-def _submit_transfers(edges) -> None:
+def _submit_transfers(edges, copy_plan=None) -> None:
     """One graph fork, with a distinct side-stream completion record after each layer."""
     first = edges[0]
     main = torch.npu.current_stream()
@@ -216,7 +217,7 @@ def _submit_transfers(edges) -> None:
     with torch.npu.stream(first.stream):
         first.stream.wait_event(first.start)
         for edge in edges:
-            edge.enqueue_on_side()
+            edge.enqueue_on_side(copy_plan)
         if before is not None:
             tracker.after_first_fork(first.stream, before)
 
@@ -224,7 +225,7 @@ def _submit_transfers(edges) -> None:
 class SharedPrefetchGroup:
     """One producer payload, one background FIFO, independently joined consumers."""
 
-    def __init__(self, edges: tuple[RetrievalEdge, ...]) -> None:
+    def __init__(self, edges: tuple[RetrievalEdge, ...], packed_width: int | None = None) -> None:
         if not edges:
             raise ValueError("shared prefetch group requires at least one consumer")
         self.edges = edges
@@ -234,16 +235,39 @@ class SharedPrefetchGroup:
             raise ValueError("shared prefetch requires one stream and one request capacity")
         if any(edge.gate is not edges[0].gate for edge in edges):
             raise ValueError("all consumers of an indexer must share the copy FIFO's admission token")
+        self.copy_plan = None
+        self.packed_width = packed_width
+        first = edges[0]
+        self.pieces = first.pieces
+        if packed_width is not None and first.gate is not None and all(
+            (edge.pieces, edge.max_aiv_cores) == (first.pieces, first.max_aiv_cores) for edge in edges
+        ):
+            self.pieces = min(first.pieces, self.capacity * packed_width)
+            if self.pieces > 1:
+                self.copy_plan = first.transfer.allocate_copy_plan(self.pieces)
         for edge in edges:
             edge.from_indexer = True
 
-    def launch(self, selected, counts, slots) -> None:
-        # These are fixed, producer-owned bridge buffers. Other layers have their
-        # own bridges and KV planes. The first fork orders all three plan writes.
+    def launch(self, selected, counts, slots, *, producer_counts=None) -> None:
         payload = (selected[:self.capacity], counts[:self.capacity], slots[:self.capacity])
         for edge in self.edges:
             edge.bind_payload(payload, edge.destinations)
-        _submit_transfers(self.edges)
+        plan = None
+        if producer_counts is not None:
+            if producer_counts.shape != payload[1].shape:
+                raise ValueError("indexer miss counts and the capture capacity differ")
+            plan = self.copy_plan
+            if plan is None:
+                payload[1].copy_(producer_counts)
+            else:
+                if selected.shape[1] != self.packed_width:
+                    raise ValueError("indexer packed width changed after the shared plan was allocated")
+                first = self.edges[0]
+                # Replaces the bridge's ordinary counts copy. The fork orders both
+                # dense counts and the slice table before any of the side consumers.
+                first.transfer.publish_copy_plan(producer_counts, payload[1], plan, self.packed_width,
+                                                 self.pieces, first.max_aiv_cores)
+        _submit_transfers(self.edges, plan)
 
 
 @dataclass
@@ -429,7 +453,9 @@ class SharedRetrievalOverlap:
                                     for plane in edge.destinations:
                                         plane[state.initialized_cache_capacity:key.request_capacity].zero_()
                                     state.initialized_cache_capacity = key.request_capacity
-                            indexer_groups[group.members[0]] = SharedPrefetchGroup(edges)
+                            producer = by_name[group.members[0]]
+                            width = producer._staged_sfa_bridge_buffers[3].shape[1] if gate is not None else None
+                            indexer_groups[group.members[0]] = SharedPrefetchGroup(edges, width)
             except BaseException:
                 self.failed = True
                 raise

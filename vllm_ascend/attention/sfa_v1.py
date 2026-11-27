@@ -4089,6 +4089,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         self,
         hidden_states: torch.Tensor,
         outputs: tuple[torch.Tensor, ...],
+        defer_counts: bool = False,
     ) -> tuple[torch.Tensor, ...]:
         buffers = self._ensure_staged_sfa_bridge_buffers(hidden_states)
         if len(outputs) != len(buffers):
@@ -4096,7 +4097,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                 "staged SFA pre returned an unexpected bridge arity: "
                 f"{len(outputs)}"
             )
-        for source, destination in zip(outputs, buffers, strict=True):
+        for index, (source, destination) in enumerate(zip(outputs, buffers, strict=True)):
             rows = int(source.shape[0])
             if (
                 rows > int(destination.shape[0])
@@ -4108,7 +4109,8 @@ class AscendSFAImpl(MLAAttentionImpl):
                     f"source={tuple(source.shape)}, "
                     f"destination={tuple(destination.shape)}"
                 )
-            destination[:rows].copy_(source)
+            if index != 4 or not defer_counts:
+                destination[:rows].copy_(source)
         return buffers
 
     def cross_layer_graph_pre(
@@ -4281,18 +4283,18 @@ class AscendSFAImpl(MLAAttentionImpl):
             indexer_scale_cache=kv_cache[3] if self.has_indexer and self.use_sparse_c8_indexer else None,
             qkv_prefetch=qkv_prefetch,
         )
-        outputs = self._copy_to_staged_sfa_bridge(
-            hidden_states,
-            outputs,
-        )
-        # The producer's compact misses, counts and slots are now in its
-        # stable bridge. Fork before its own serial KV retrieval and SFA.
+        prefetch_group = None
         if getattr(context, "sfa_full_graph_active", False) and not self.skip_topk:
             owner = getattr(self, "_retrieval_overlap", None)
             if owner is not None and owner.multi_layer:
                 prefetch_group = owner.indexer_groups[graph_key].get(layer_name)
-                if prefetch_group is not None:
-                    prefetch_group.launch(*outputs[3:])
+        producer_counts = None
+        if (prefetch_group is not None and prefetch_group.copy_plan is not None
+                and outputs[4].shape == (prefetch_group.capacity,)):
+            producer_counts = outputs[4]
+        outputs = self._copy_to_staged_sfa_bridge(hidden_states, outputs, producer_counts is not None)
+        if prefetch_group is not None:
+            prefetch_group.launch(*outputs[3:], producer_counts=producer_counts)
         state.runtime = (
             layer_name,
             kv_cache,

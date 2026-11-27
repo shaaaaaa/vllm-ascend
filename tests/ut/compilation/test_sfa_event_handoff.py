@@ -245,7 +245,9 @@ def test_indexer_launches_from_its_fixed_bridge_before_own_retrieval(handoff, fu
     h.impl._shared_retrieval_edges = lambda: ({}, {})
     h.impl._cross_layer_pre_compute.side_effect = lambda *a, **kw: h.operations.append("index plan") or h.bridge
     h.impl._copy_to_staged_sfa_bridge = lambda *a: h.operations.append("publish bridge") or h.bridge
-    group = SimpleNamespace(launch=Mock(side_effect=lambda *a: h.operations.append("queue consumers")))
+    group = SimpleNamespace(
+        copy_plan=None, launch=Mock(side_effect=lambda *a, **kw: h.operations.append("queue consumers"))
+    )
     h.impl._retrieval_overlap = SimpleNamespace(
         multi_layer=enabled, indexer_groups={h.context.staged_sfa_graph_key: {"layer": group}}
     )
@@ -253,12 +255,29 @@ def test_indexer_launches_from_its_fixed_bridge_before_own_retrieval(handoff, fu
     h.impl._full_graph_transfer = SimpleNamespace(load=Mock(side_effect=lambda *a, **kw: h.operations.append("own KV")))
     h.pre()
     if full and not consumer and enabled:
-        group.launch.assert_called_once_with(*h.bridge[3:])
+        group.launch.assert_called_once_with(*h.bridge[3:], producer_counts=None)
         h.retrieve()
         assert h.impl._full_graph_transfer.load.call_args.kwargs == {"max_aiv_cores": 12}
         assert h.operations == ["index plan", "publish bridge", "queue consumers", "own KV"]
     else:
         group.launch.assert_not_called()
+
+
+def test_indexer_replaces_only_counts_publication_with_the_device_plan(handoff):
+    h = handoff
+    h.context.sfa_full_graph_active = True
+    h.impl._shared_retrieval_edges = lambda: ({}, {})
+    counts = torch.tensor([[1, -1], [0, -1]], dtype=torch.int32)[:, 0]
+    raw = (*h.bridge[:4], counts, h.bridge[5])
+    h.impl._cross_layer_pre_compute.return_value = raw
+    h.impl._copy_to_staged_sfa_bridge = Mock(return_value=h.bridge)
+    group = SimpleNamespace(copy_plan=torch.empty(18), capacity=2, launch=Mock())
+    h.impl._retrieval_overlap = SimpleNamespace(
+        multi_layer=True, indexer_groups={h.context.staged_sfa_graph_key: {"layer": group}}
+    )
+    h.pre()
+    assert h.impl._copy_to_staged_sfa_bridge.call_args.args[1:] == (raw, True)
+    group.launch.assert_called_once_with(*h.bridge[3:], producer_counts=counts)
 
 
 def test_native_fallback_does_not_touch_staged_event(handoff):

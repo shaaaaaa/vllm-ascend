@@ -172,7 +172,7 @@ class Workload:
         for edge in (*self.edges, *group_edges):
             edge.max_aiv_cores = limit
 
-    def chain(self, overlap, observe, *, multi_layer=False, after_first_qkv=None):
+    def chain(self, overlap, observe, *, multi_layer=False, after_first_qkv=None, bridge_counts=None):
         edges = self.group.edges if multi_layer else self.edges
         for layer, transfer in enumerate(self.transfers):
             qkv = self.qkv_projections[layer]
@@ -200,8 +200,12 @@ class Workload:
                 if qkv is not None:
                     qkv()
                 if multi_layer and layer == 0:
-                    self.group.launch(self.selected, self.counts, self.slots)
-                transfer.load(self.selected, self.counts, self.slots, max_aiv_cores=self.max_aiv_cores)
+                    if bridge_counts is None:
+                        self.group.launch(self.selected, self.counts, self.slots)
+                    else:
+                        self.group.launch(self.selected, bridge_counts, self.slots, producer_counts=self.counts)
+                counts = self.counts if bridge_counts is None else bridge_counts
+                transfer.load(self.selected, counts, self.slots, max_aiv_cores=self.max_aiv_cores)
             if layer == 1 and after_first_qkv is not None:
                 # The gate has taken its token back. Later copies cannot change a
                 # destination while this optional observation reads it.
@@ -221,11 +225,12 @@ class Workload:
                 with edge.cube_window("router") if gated else nullcontext():
                     torch.nn.functional.linear(self.router_x, self.router_weights[layer])
 
-    def capture(self, overlap, observe=False, *, multi_layer=False, after_first_qkv=None):
+    def capture(self, overlap, observe=False, *, multi_layer=False, after_first_qkv=None, bridge_counts=None):
         if after_first_qkv is not None and (not overlap or self.edges[0].gate is None):
             raise ValueError("a stable first-QKV snapshot requires gated overlap")
         return self._capture(partial(
-            self.chain, overlap, observe, multi_layer=multi_layer, after_first_qkv=after_first_qkv
+            self.chain, overlap, observe, multi_layer=multi_layer, after_first_qkv=after_first_qkv,
+            bridge_counts=bridge_counts,
         ))
 
     def capture_copy(self):
@@ -285,7 +290,8 @@ def ready_rows(snapshot, expected):
     return int(mask.sum())
 
 
-def paired_graph_times(first, second, *, names=("adjacent", "grouped"), pairs=8, replays=4, prepare_pair=None):
+def paired_graph_times(first, second, *, names=("adjacent", "grouped"), pairs=8, replays=4, prepare_pair=None,
+                       include_means=False):
     """Paired device timings in us per replay. Keep setup and observations outside the measurement."""
     graphs = (first, second)
     timers = [[(torch.npu.Event(enable_timing=True), torch.npu.Event(enable_timing=True)) for _ in graphs]
@@ -312,13 +318,18 @@ def paired_graph_times(first, second, *, names=("adjacent", "grouped"), pairs=8,
     if any(t <= 0 for pair in elapsed for t in pair):
         raise RuntimeError(f"invalid device timing in {elapsed!r}")
     gains = [old - new for old, new in elapsed]
-    return {
+    result = {
         f"{names[0]}_us": statistics.median(old for old, _ in elapsed),
         f"{names[1]}_us": statistics.median(new for _, new in elapsed),
         "paired_saved_us": statistics.median(gains),
         f"{names[1]}_faster_pairs": sum(gain > 0 for gain in gains),
         "pairs": pairs,
     }
+    if include_means:
+        result[f"{names[0]}_mean_us"] = statistics.mean(old for old, _ in elapsed)
+        result[f"{names[1]}_mean_us"] = statistics.mean(new for _, new in elapsed)
+        result["paired_mean_saved_us"] = statistics.mean(gains)
+    return result
 
 
 def main():
