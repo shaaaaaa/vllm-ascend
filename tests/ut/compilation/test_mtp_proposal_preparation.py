@@ -3,8 +3,10 @@
 """Source-derived checks of proposal selection, ownership and startup warmup."""
 
 import ast
+from contextlib import nullcontext
 from copy import deepcopy
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -13,6 +15,49 @@ from torch.utils._python_dispatch import TorchDispatchMode
 
 PROPOSER = ROOT / "vllm_ascend/spec_decode/eagle_proposer.py"
 RUNNER = ROOT / "vllm_ascend/worker/model_runner_v1.py"
+
+
+@pytest.mark.parametrize(
+    "requests,peer_tokens,profile,staged,sampled",
+    [
+        (1, 16384, False, False, 1),
+        (4, 32768, False, False, 4),
+        (0, 16384, False, False, 8),
+        (1, 16384, True, False, 8),
+        (4, 8, False, False, 4),
+        (8, 8, False, True, 8),
+    ],
+)
+def test_dummy_mtp_logits_rows_with_dp_padding(requests, peer_tokens, profile, staged, sampled):
+    modes = SimpleNamespace(NONE="none", FULL="full")
+    context = SimpleNamespace(cudagraph_runtime_mode=modes.NONE)
+    dummy_run = extract(
+        PROPOSER,
+        "dummy_run",
+        {
+            "CUDAGraphMode": modes,
+            "get_forward_context": lambda: context,
+            "set_ascend_forward_context": lambda *args, **kwargs: nullcontext(),
+        },
+    )
+    proposer = SimpleNamespace(
+        method="mtp",
+        num_speculative_tokens=1,
+        extra_slots_per_request=1,
+        use_cuda_graph=staged,
+        runner=SimpleNamespace(max_num_reqs=8, _sync_metadata_across_dp=lambda *a, **kw: (peer_tokens, None, False)),
+        supports_mm_inputs=False,
+        vllm_config=None,
+        token_indices_to_sample=torch.zeros(peer_tokens, dtype=torch.int32),
+        _get_positions=lambda count: torch.arange(count),
+        _runnable=Mock(),
+    )
+    local_tokens = requests if staged else max(1, requests) * 2
+    dummy_run(proposer, local_tokens, num_reqs=requests, is_profile=profile, staged_mtp_draft_graph=staged)
+    proposer._runnable.assert_called_once()
+    call = proposer._runnable.call_args.kwargs
+    assert call["num_input_tokens"] == call["num_tokens"] == peer_tokens
+    assert call["batch_size"] == call["token_indices_to_sample"].numel() == sampled
 
 
 def compile_body(body, args, namespace):

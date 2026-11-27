@@ -820,6 +820,10 @@ class SpecDecodeBaseProposer(EagleProposer):
         batch_size = num_tokens if staged_mtp_draft_graph else max(num_tokens // (self.num_speculative_tokens + 1), 1)
         if is_profile:
             batch_size = min(batch_size, self.runner.max_num_reqs)
+        elif self.method == "mtp" and not staged_mtp_draft_graph:
+            # A peer's prefill can pad the draft forward to thousands of tokens.
+            # The LM head only needs rows for requests in the local TP group.
+            batch_size = min(batch_size, num_reqs or self.runner.max_num_reqs)
 
         if self.supports_mm_inputs:
             mm_embeds, is_mm_embed = (None, None)
